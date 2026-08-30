@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LocalFold kernel diagnostic</title>
+    <link rel="stylesheet" href="./web/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>LocalFold <em>kernel diagnostic</em></h1>
+        <p>Runs the differential TriangleMultiplicationOutgoing test in this browser's WebGPU, against the CPU reference. No model weights needed. Not part of the demo — <a href="./">the folding page is here</a>.</p>
+      </header>
+
+      <form id="controls">
+        <div class="grid">
+          <label>Length<input id="length" type="number" min="1" max="512" value="8" /></label>
+          <label>Pair channels<input id="cz" type="number" min="1" value="16" /></label>
+          <label>Hidden channels<input id="hidden" type="number" min="1" value="16" /></label>
+          <label>Precision<select id="precision"><option value="f32">FP32</option><option value="f16">FP16</option></select></label>
+        </div>
+        <button class="primary" type="submit">Run kernel</button>
+      </form>
+
+      <p id="status" class="status" data-state="idle">Ready</p>
+      <pre id="result">Waiting for a run.</pre>
+    </main>
+
+    <script type="module" src="./web/dev.js"></script>
+  </body>
+</html>

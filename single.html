@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#071512" />
+    <meta name="description" content="Fold a single protein sequence in your browser with AlphaFold2 and WebGPU, mutate a residue, and watch the structure resolve across recycles." />
+    <title>LocalFold · single sequence</title>
+    <link rel="stylesheet" href="./web/style.css" />
+  </head>
+  <body>
+    <main>
+      <!-- The title and the one action, on one line. The button lives outside
+           the form and reaches it by `form=` so it can sit up here without the
+           layout having to bend around it. -->
+      <header>
+        <h1><a href="./">LocalFold</a> <em>single sequence</em></h1>
+        <button id="predict" class="primary" type="submit" form="prediction-form">Fold</button>
+      </header>
+
+      <form id="prediction-form">
+        <textarea id="sequence" rows="3" spellcheck="false" aria-label="Protein sequence"
+          >PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+        <span id="sequence-length" class="count">59 residues</span>
+      </form>
+
+      <!-- THE VIEWER IS NOT PART OF #results, and the status line is not either.
+           Both have to be visible while the model is still loading - which is
+           the longest and least reassuring part of a first visit - so only the
+           things that need a finished prediction are inside the hidden section.
+           Frames are appended as each recycle lands, so the structure appears
+           while the remaining passes are still running. -->
+      <!-- The orient button is a SIBLING of the viewer inside this wrapper, not
+           a child of it: every fold calls replaceChildren() on #viewer to build
+           its canvas, and anything inside would go with it. -->
+      <div class="viewer-wrap">
+        <div id="viewer"><p class="viewer-empty">Press Fold to predict a structure.</p></div>
+        <button id="orient" class="overlay-button" type="button" title="Best view" hidden>Orient</button>
+      </div>
+      <!-- The mutation panel mounts here: a sibling of the viewer, not a child.
+           Every fold empties the viewer box to rebuild it, and a panel inside
+           would go with it. Out here it also stays clear of py2Dmol's play bar. -->
+      <div id="mutate-host"></div>
+      <p id="status" class="status" data-state="idle">Ready</p>
+      <progress id="progress" max="1" value="0" hidden></progress>
+
+      <div class="options">
+          <label class="inline">Recycles
+            <select id="recycles">
+              <option value="0" selected>0</option>
+              <option value="1">1</option>
+              <option value="3">3</option>
+              <option value="6">6</option>
+            </select>
+          </label>
+      </div>
+
+      <section id="results" hidden>
+        <div class="scores">
+          <div><span>Mean pLDDT</span><strong id="mean-plddt">—</strong></div>
+          <div><span>pTM</span><strong id="ptm">—</strong></div>
+          <div><span>Passes</span><strong id="recycle-count">—</strong></div>
+        </div>
+
+        <p class="legend-title">pLDDT</p>
+        <p id="legend-plddt" class="legend"></p>
+        <p class="legend-title">Hydropathy</p>
+        <p id="legend-hydro" class="legend"></p>
+
+        <canvas id="plddt-plot" width="720" height="220"></canvas>
+
+        <p class="row">
+          <button id="download-pdb" class="quiet" type="button">Download PDB</button>
+          <button id="download-scores" class="quiet" type="button">Download scores</button>
+        </p>
+      </section>
+
+      <footer>
+        <a href="./">Full version, with MSAs</a>
+        <a href="https://github.com/sokrypton/localfold">Source</a>
+        <span>AlphaFold2 by <a href="https://doi.org/10.1038/s41586-021-03819-2">Jumper et al. 2021</a> · parameters CC BY 4.0 · viewer <a href="https://github.com/sokrypton/py2Dmol">py2Dmol</a></span>
+        <span id="gpu-summary" data-state="checking">Checking WebGPU…</span>
+      </footer>
+    </main>
+
+    <!-- py2Dmol first: a classic script that installs window.py2Dmol.
+         Vendored, not fetched, so the page draws with no network. -->
+    <script src="./web/vendor/py2Dmol.embed.min.js"></script>
+    <script type="module" src="./web/main.js"></script>
+  </body>
+</html>

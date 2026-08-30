@@ -1,16 +1,28 @@
 {
+  "//": [
+    "OPTIONAL. Nothing in this repository needs a compiler - the browser and node",
+    "both load src/**/*.js as written. This file exists so `npm run typecheck` can",
+    "still read the JSDoc on the public surface and catch a typo or a wrong arity.",
+    "",
+    "`strict` is off deliberately. With checkJs and strict together, every one of",
+    "the 7,600 lines that used to carry an inline annotation reports an implicit",
+    "any, and a check that reports 2,000 things reports nothing. What is left still",
+    "catches the mistakes that actually happen here: a misspelled property, a call",
+    "with the wrong number of arguments, a typedef that has drifted from its call."
+  ],
   "compilerOptions": {
     "target": "ES2023",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "lib": ["ES2023", "DOM"],
-    "types": ["node", "@webgpu/types"],
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
+    "types": ["@webgpu/types"],
+    "allowJs": true,
+    "checkJs": true,
     "noEmit": true,
-    "verbatimModuleSyntax": true,
+    "strict": false,
+    "noImplicitAny": false,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "tools/**/*.ts", "web/**/*.ts", "*.config.ts"]
+  "include": ["src/**/*.js", "web/**/*.js"],
+  "exclude": ["web/vendor"]
 }

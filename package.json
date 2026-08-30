@@ -1,37 +1,33 @@
 {
-  "name": "afwebgpu",
+  "name": "localfold",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Differentially tested WebGPU kernels for AlphaFold 2 inference",
+  "//": "Nothing here is required to run the demo or the CPU tests - see README. This file exists for `type: module` and for the two optional lanes below, which genuinely need packages: headless GPU tests (Dawn) and browser tests (Playwright).",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "build:web": "vite build --config vite.browser.config.ts",
-    "export:web-model": "tsx tools/export-web-model.ts",
-    "build:web:standalone": "npm run build:web && npm run export:web-model",
-    "dev": "vite --config vite.browser.config.ts",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:gpu": "AFWEBGPU_GPU_TESTS=1 vitest run test/*.gpu.test.ts",
-    "test:gpu:f16": "AFWEBGPU_GPU_TESTS=1 AFWEBGPU_ADAPTER=llvmpipe vitest run test/*.gpu.test.ts",
+    "test": "node --test --test-concurrency=1 $(ls test/*.test.js | grep -v '\\.gpu\\.')",
+    "test:gpu": "LOCALFOLD_GPU_TESTS=1 node --test --test-concurrency=1 test/*.gpu.test.js",
     "test:browser": "playwright test",
-    "bench": "tsx tools/benchmark-triangle.ts",
-    "bench:attention": "tsx tools/benchmark-attention.ts",
-    "bench:a3m-stack": "tsx tools/benchmark-a3m-stack.ts",
-    "bench:a3m-model": "tsx tools/benchmark-a3m-model.ts",
-    "check": "npm run build && npm run build:web && npm run test"
+    "serve": "python3 -m http.server 4173",
+    "build:site": "python3 tools/build_site.py",
+    "build:offline": "python3 tools/bundle.py",
+    "export:web-model": "node tools/export-web-model.js",
+    "export:js-weights": "python3 tools/export-js-weights.py",
+    "typecheck": "tsc -p tsconfig.json",
+    "bench": "node tools/benchmark-triangle.js",
+    "bench:attention": "node tools/benchmark-attention.js",
+    "bench:a3m-stack": "node tools/benchmark-a3m-stack.js",
+    "bench:a3m-model": "node tools/benchmark-a3m-model.js"
   },
   "engines": {
     "node": ">=22"
   },
+  "optionalDependencies": {},
   "devDependencies": {
     "@playwright/test": "1.62.1",
-    "@types/node": "26.4.0",
     "@webgpu/types": "0.1.72",
-    "tsx": "4.20.6",
     "typescript": "7.0.2",
-    "vite": "8.2.2",
-    "vitest": "4.1.11",
     "webgpu": "0.6.0"
   }
 }

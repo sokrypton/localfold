@@ -1,0 +1,138 @@
+/*
+ * What LocalFold adds to py2Dmol's page, and nothing more.
+ *
+ * 🔴 NOT web/style.css. That one dresses LocalFold's own standalone pages: it
+ * sets `body { background: #07110f }` and restyles `textarea, input, select`
+ * globally for a dark theme. Loaded over py2Dmol's light application it wins on
+ * both - the page keeps its own layout while every text box turns black - which
+ * is exactly what it did before this file existed. Nothing here sets a bare
+ * element selector for that reason; every rule is anchored to an id or a class
+ * this project introduced.
+ */
+
+/* THE SEQUENCE BOX IS THE FETCH BOX, one line taller. py2Dmol's #fetch-id is
+   the shape a reader already associates with "the thing you type into", so this
+   copies it rather than inventing a second look: same border, radius, focus
+   colour and flex-grow, with the height and the monospace a sequence needs. */
+#sequence {
+  /* ...BORDER-BOX, because these carry padding and a border and are sized
+     against their container. Without it a width:100% box is its padding wider
+     than the panel it sits in, and overflows by exactly that much. */
+  box-sizing: border-box;
+  flex-grow: 1;
+  min-width: 0;
+  height: 58px;
+  padding: 8px 16px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  letter-spacing: .02em;
+  resize: vertical;
+  background: #fff;
+  color: #111827;
+}
+
+#sequence:hover { border-color: #9ca3af; }
+#sequence:focus { outline: none; border-color: #3b82f6; }
+
+/* ...and the alignment box, on its own full-width line inside the options so
+   the option columns beside it keep their measure. */
+.fold-option-wide { flex-basis: 100%; }
+.fold-option-wide:not(:has(> *:not([hidden]))) { display: none; }
+
+#msa-text {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 64px;
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: #fff;
+  color: #111827;
+  resize: vertical;
+}
+#msa-text:focus { outline: none; border-color: #3b82f6; }
+
+/* THE OPTION SELECTS WEAR py2Dmol'S INPUT, at the size the groups are built
+   for. A browser-default select beside their bordered, rounded controls is the
+   one thing in the panel that looks bolted on. */
+#foldOptions select {
+  height: 28px;
+  padding: 0 24px 0 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  color: #111827;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, #6b7280 50%),
+                    linear-gradient(135deg, #6b7280 50%, transparent 50%);
+  background-position: calc(100% - 13px) 12px, calc(100% - 8px) 12px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+#foldOptions select:hover { border-color: #9ca3af; }
+#foldOptions select:focus { outline: none; border-color: #3b82f6; }
+
+/* ...the caret turns when the panel opens, the same way theirs does, so the
+   button says which way it goes. In CSS off aria-expanded rather than by
+   swapping the glyph in script: one source of truth for "is it open". */
+#foldOptionsButton[aria-expanded="true"] #foldOptionsCaret {
+  display: inline-block;
+  transform: rotate(180deg);
+}
+
+/* EVERYTHING THAT ACTS ON THE SEQUENCE STACKS TO ITS RIGHT, so the panel is
+   two rows tall instead of four. The column does not grow or shrink: the box
+   beside it takes whatever is left, which is what makes the row reflow
+   sensibly at narrower widths. */
+.fold-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.fold-action-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* Progress sits under the row, the width of the panel, quiet until it moves. */
+#fold-panel progress {
+  width: 100%;
+  height: 3px;
+  margin-top: 8px;
+  border: 0;
+  background: #e5e7eb;
+}
+#fold-panel progress::-webkit-progress-bar { background: #e5e7eb; }
+#fold-panel progress::-webkit-progress-value { background: #3b82f6; }
+
+/* ...an indeterminate bar for the stretch with nothing to count: the trunk
+   queues its blocks and then waits, and a bar frozen at a number reads as a
+   hang where one that is visibly moving reads as work. */
+#fold-panel progress:not([value]) {
+  background: linear-gradient(90deg, #e5e7eb 25%, #3b82f6 50%, #e5e7eb 75%) 0 0 / 250% 100%;
+  animation: localfold-sweep 1.2s linear infinite;
+}
+#fold-panel progress:not([value])::-webkit-progress-bar { background: transparent; }
+@keyframes localfold-sweep {
+  from { background-position: 125% 0; }
+  to { background-position: -125% 0; }
+}
+
+/* The download pair sits under the PAE panel, matching the panels around it. */
+#downloads {
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+}

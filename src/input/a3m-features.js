@@ -1,0 +1,148 @@
+import { parseA3m } from "./a3m.js";
+import { makeQueryOnlyFeatures } from "./query-only-features.js";
+
+/**
+ * @typedef {object} A3mFeatureOptions
+ * @property {number} [recycles]           extra passes after the first; default 0
+ * @property {number} [randomSeed]         seeds the application PRNG; default 0
+ * @property {number} [maxMsaSequences]    clustered rows kept; default 508
+ * @property {number} [maxExtraSequences]  extra-MSA rows kept; default 1024
+ *   Both defaults are explained at MAX_MSA_CLUSTERS below - the second is a
+ *   deliberate reduction from AlphaFold's own model_1 value, not a copy of it.
+ */
+
+const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
+const INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
+
+function generator(seed) {
+  let state = seed >>> 0;
+  return () => { state = (state + 0x6d2b79f5) >>> 0; let value = state;
+    value = Math.imul(value ^ value >>> 15, value | 1); value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+    return ((value ^ value >>> 14) >>> 0) / 4294967296; };
+}
+
+function shuffle(values, random) {
+  for (let index = values.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1)); [values[index], values[other]] = [values[other], values[index]];
+  }
+}
+
+function deletionValue(value) { return Math.atan(value / 3) * 2 / Math.PI; }
+
+/**
+ * HOW DEEP AN ALIGNMENT THE MODEL ACTUALLY SEES.
+ *
+ * 🔴 508, NOT 512. AlphaFold's monomer config asks for 512 MSA clusters and
+ * then gives four of those rows to templates, so a templated model_1 - which is
+ * what this repository runs, with mock templates - reads 508. ColabFold's
+ * `--max-msa 512:1024` names the same pair of knobs.
+ *
+ * 🔴 1024 EXTRA ROWS IS A DELIBERATE REDUCTION, not AlphaFold's own default.
+ * AlphaFold's model_1 sets `max_extra_msa: 5120`; 1024 is the value its
+ * template-free models use, and the one ColabFold's 512:1024 preset selects to
+ * make a run cheaper. It is kept here because the extra-MSA stack is the most
+ * expensive thing in an A3M fold - profiling puts `extra.msa-row-attention.flash`
+ * at about 1.2 s per block - so 5120 would cost roughly five times that stack.
+ *
+ * WHAT THE REDUCTION COSTS, measured: on the 8,076-row `test.a3m` the JS
+ * clustering at 508/1024 reaches 96.8 pLDDT against the captured AlphaFold
+ * reference's 96.625 at the same recycle. That is a shallow alignment of a
+ * 59-residue protein, which is where a smaller `max_extra_msa` is least likely
+ * to bite; a deep alignment of a large protein is where it would.
+ */
+const MAX_MSA_CLUSTERS = 508;
+const MAX_EXTRA_SEQUENCES = 1024;
+
+/** CPU feature preprocessing for A3M text. Neural inference remains entirely on WebGPU. */
+export function makeA3mFeatures(a3mText, tables,
+  options = {}) {
+  const alignment = parseA3m(a3mText);
+  const length = alignment.length; const depth = alignment.depth;
+  const encoded = new Uint8Array(depth * length);
+  for (let row = 0; row < depth; row += 1) for (let residue = 0; residue < length; residue += 1) {
+    const symbol = alignment.sequences[row] [residue];
+    encoded[row * length + residue] = symbol === "-" ? 21 : (INDEX.get(symbol) ?? 20);
+  }
+  const base = makeQueryOnlyFeatures(alignment.query, tables, { recycles: 0, maskedMsaCodes: [
+    Float32Array.from(encoded.subarray(0, length)),
+  ] })[0];
+  const recycles = options.recycles ?? 3;
+  const maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth);
+  const maxExtra = options.maxExtraSequences ?? MAX_EXTRA_SEQUENCES;
+  const results = [];
+  for (let recycle = 0; recycle <= recycles; recycle += 1) {
+    const random = generator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
+    const remainder = Array.from({ length: depth - 1 }, (_, index) => index + 1); shuffle(remainder, random);
+    const centers = [0, ...remainder.slice(0, Math.max(0, maxMsa - 1))];
+    const extraPool = remainder.slice(Math.max(0, maxMsa - 1)); shuffle(extraPool, random);
+    const extras = extraPool.slice(0, maxExtra);
+    const centerCodes = new Uint8Array(centers.length * length);
+    for (let center = 0; center < centers.length; center += 1) {
+      centerCodes.set(encoded.subarray(centers[center] * length, (centers[center] + 1) * length), center * length);
+    }
+    for (let index = 0; index < centerCodes.length; index += 1) {
+      if (random() >= 0.15) continue;
+      const original = centerCodes[index]; const draw = random();
+      if (draw < 0.7) centerCodes[index] = 22;
+      else if (draw >= 0.9) centerCodes[index] = Math.floor(random() * 20);
+      else centerCodes[index] = original;
+    }
+    const assignments = new Uint16Array(extras.length);
+    for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
+      const extraRow = extras[extraIndex]; let best = 0; let bestScore = -1;
+      for (let center = 0; center < centers.length; center += 1) {
+        let score = 0;
+        for (let residue = 0; residue < length; residue += 1) {
+          const code = centerCodes[center * length + residue];
+          if (code <= 20 && code === encoded[extraRow * length + residue]) score += 1;
+        }
+        if (score > bestScore) { bestScore = score; best = center; }
+      }
+      assignments[extraIndex] = best;
+    }
+    const profile = new Float32Array(centers.length * length * 23);
+    const deletionSums = new Float32Array(centers.length * length);
+    const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
+    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
+      profile[(center * length + residue) * 23 + centerCodes[center * length + residue]] = 1;
+      deletionSums[center * length + residue] = alignment.deletionMatrix[centers[center]] [residue];
+    }
+    for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
+      const row = extras[extraIndex]; const center = assignments[extraIndex];
+      for (let residue = 0; residue < length; residue += 1) {
+        const slot = center * length + residue; counts[slot] = counts[slot] + 1;
+        const profileSlot = slot * 23 + encoded[row * length + residue];
+        profile[profileSlot] = profile[profileSlot] + 1;
+        deletionSums[slot] = deletionSums[slot] + alignment.deletionMatrix[row] [residue];
+      }
+    }
+    const msaFeatures = new Float32Array(centers.length * length * 49);
+    for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
+      const slot = center * length + residue; const output = slot * 49;
+      msaFeatures[output + centerCodes[slot]] = 1;
+      const deletion = alignment.deletionMatrix[centers[center]] [residue];
+      msaFeatures[output + 23] = Math.min(deletion, 1); msaFeatures[output + 24] = deletionValue(deletion);
+      for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code] / counts[slot];
+      msaFeatures[output + 48] = deletionValue(deletionSums[slot] / counts[slot]);
+    }
+    const extraSequences = Math.max(1, extras.length);
+    const extraMsa = new Float32Array(extraSequences * length);
+    const extraHasDeletion = new Float32Array(extraSequences * length);
+    const extraDeletionValue = new Float32Array(extraSequences * length);
+    const extraMsaMask = new Float32Array(extraSequences * length);
+    for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) for (let residue = 0; residue < length; residue += 1) {
+      const slot = extraIndex * length + residue; const row = extras[extraIndex];
+      const deletion = alignment.deletionMatrix[row] [residue];
+      extraMsa[slot] = encoded[row * length + residue]; extraHasDeletion[slot] = Math.min(deletion, 1);
+      extraDeletionValue[slot] = deletionValue(deletion); extraMsaMask[slot] = 1;
+    }
+    results.push({
+      targetFeatures: base.targetFeatures.slice(), msaFeatures, msaMask: new Float32Array(centers.length * length).fill(1),
+      extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
+      residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
+      atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
+      msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
+    });
+  }
+  return results;
+}

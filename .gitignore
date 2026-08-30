@@ -1,5 +1,9 @@
 node_modules/
 dist/
+# The exported browser weights, written by tools/export-web-model.js.
+model/
+# The self-contained offline page, written by tools/bundle.py.
+localfold-local.html
 coverage/
 artifacts/
 test-results/
@@ -9,3 +13,8 @@ playwright-report/
 # Full-model captures are local development assets. The publish branch retains
 # only a small subset needed by the default unit tests.
 test/fixtures/evoformer/
+
+# Benchmark and diagnostic pages written during optimisation work.
+.scratch/
+# The float32 master the quantiser reads; model/ above is its int8 output.
+model.f32-backup/

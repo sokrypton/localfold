@@ -19,23 +19,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build:web
+
+      # No node, no npm, no install step: the page loads src/**/*.js as written,
+      # so assembling the site is a copy with an allow-list. python3 is already
+      # on the runner.
+      - name: Assemble the site
+        run: python3 tools/build_site.py
+
+      # GitHub Pages is public even when its source repository is private, so
+      # the parameters ship only when the repository variable says so.
       - name: Add the single model-1 PTM release bundle
-        if: ${{ vars.AFWEBGPU_INCLUDE_MODEL == 'true' }}
+        if: ${{ vars.LOCALFOLD_INCLUDE_MODEL == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download model1-ptm --pattern afwebgpu-model1-ptm.tar.gz
-          tar -xzf afwebgpu-model1-ptm.tar.gz -C dist/web
+          gh release download model1-ptm --pattern localfold-model1-ptm.tar.gz
+          tar -xzf localfold-model1-ptm.tar.gz -C dist
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dist/web
+          path: dist
           include-hidden-files: true
 
   deploy:
