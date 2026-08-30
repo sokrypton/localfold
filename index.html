@@ -146,18 +146,22 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group">
                 <span class="fetch-option-title">Alignment</span>
                 <select id="msa-mode">
-                  <option value="single" selected>None</option>
+                  <option value="search" selected>Search (remote)</option>
+                  <option value="single">None</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
-                  <option value="search">Search (remote)</option>
                 </select>
               </div>
               <div class="fetch-option-group">
                 <span class="fetch-option-title">Recycles</span>
                 <select id="recycles">
                   <option value="0">0</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
                   <option value="3" selected>3</option>
                   <option value="6">6</option>
+                  <option value="12">12</option>
+                  <option value="24">24</option>
                 </select>
               </div>
               <div class="fold-option-wide">
@@ -1013,17 +1017,29 @@ AI Context: STANDALONE WEB APP ENTRY POINT
     <footer style="margin-top: var(--container-gap); padding: 0; color: #6b7280; font-size: 13px;">
         <div
             style="width: 948px; margin: 0 auto; padding: 10px 0 0 0; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center; gap: 20px; flex-wrap: wrap;">
-            <div style="flex: 0 0 auto; display: flex; align-items: center; gap: 12px;">
-                <a href="https://github.com/sokrypton/py2Dmol" target="_blank" rel="noopener noreferrer"
+            <div style="flex: 1 1 auto; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
+                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer"
                     style="color: #3b82f6; text-decoration: none;">
-                    <i class="fab fa-github" style="margin-right: 6px;"></i>View on GitHub
+                    <i class="fab fa-github" style="margin-right: 6px;"></i>LocalFold
                 </a>
+                <span style="font-size: 12px;">
+                    forked from <a href="https://github.com/martin-steinegger/alphafold2-webgpu" target="_blank"
+                        rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Martin Steinegger's
+                        alphafold2-webgpu</a>
+                    · viewer by <a href="https://github.com/sokrypton/py2Dmol" target="_blank"
+                        rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">py2Dmol</a>
+                    · method by <a href="https://github.com/google-deepmind/alphafold" target="_blank"
+                        rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">AlphaFold 2</a>
+                </span>
             </div>
-            <div style="flex: 0 0 auto; font-size: 12px;">
-                <i class="fa-solid fa-shield-halved" style="margin-right: 6px; color: #10b981;"></i>
-                <strong>Privacy:</strong> All processing is performed locally in your browser. No data is uploaded to a
-                server.
-            </div>
+            <!-- 🔴 THIS LINE HAS TO TRACK THE ALIGNMENT MODE. It used to read "All
+                 processing is performed locally... No data is uploaded to a server",
+                 which stopped being true the moment remote MSA search became the
+                 default: that mode sends the sequence to api.colabfold.com. The
+                 fold itself never leaves the machine in any mode, so the honest
+                 statement depends on which one is selected - web/app.js rewrites
+                 it from syncMode(). -->
+            <div id="privacy-note" style="flex: 0 0 auto; font-size: 12px;"></div>
         </div>
     </footer>
 

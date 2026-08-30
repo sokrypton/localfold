@@ -300,9 +300,33 @@ optionsButton.addEventListener("click", () => {
 });
 
 const modeSelect = element("msa-mode");
+
+// 🔴 THE FOOTER'S PRIVACY LINE IS NOT A CONSTANT. It read "All processing is
+// performed locally in your browser. No data is uploaded to a server", which
+// was true while "None" was the default alignment mode and false the moment
+// remote search became it - that mode posts the sequence to the public
+// ColabFold MMseqs2 server. The fold itself never leaves the machine either
+// way, so the accurate claim depends on the mode, and a page that states the
+// stronger one while doing the weaker thing is worse than one that says
+// nothing. Written from here so the two cannot drift apart.
+const PRIVACY_NOTE = {
+  search: ['<i class="fa-solid fa-cloud-arrow-up" style="margin-right: 6px; color: #f59e0b;"></i>',
+    "<strong>Privacy:</strong> folding runs in your browser; MSA search sends your sequence to ",
+    '<a href="https://colabfold.com" target="_blank" rel="noopener noreferrer"',
+    ' style="color: #3b82f6; text-decoration: none;">api.colabfold.com</a>.'].join(""),
+  local: ['<i class="fa-solid fa-shield-halved" style="margin-right: 6px; color: #10b981;"></i>',
+    "<strong>Privacy:</strong> everything runs locally in your browser. Nothing is uploaded."].join(""),
+};
+
 const syncMode = () => {
   element("msa-text").hidden = modeSelect.value !== "paste";
   element("msa-file").hidden = modeSelect.value !== "upload";
+  // ...getElementById rather than element(), which throws on a missing id: the
+  // note is index.html's and this file should not require it to exist.
+  const note = document.getElementById("privacy-note");
+  if (note !== null) {
+    note.innerHTML = modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
+  }
 };
 modeSelect.addEventListener("change", syncMode);
 syncMode();
