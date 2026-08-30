@@ -22,3 +22,6 @@ test/fixtures/evoformer/
 .scratch/
 # The float32 master the quantiser reads; /model/ above is its int8 output.
 /model.f32-backup/
+
+# Written whenever tools/build_site.py imports a sibling.
+__pycache__/
