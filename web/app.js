@@ -56,10 +56,28 @@ function status(text, isError = false) {
   node.style.color = isError ? "#b91c1c" : "";
 }
 
+/**
+ * Drive the bar under the status line.
+ *
+ * 🔴 NEVER HIDES IT. The bar is a permanent part of the status block, because
+ * laying it out only while a fold runs moved everything below it twice a run -
+ * see the note in web/localfold.css. `null` means idle, which is a look, not a
+ * removal; a fraction fills it; "waiting" sweeps for the stretches that have
+ * nothing to count.
+ */
 function progress(fraction) {
   const bar = element("progress");
-  bar.hidden = fraction === null;
-  if (fraction !== null) bar.value = fraction;
+  if (fraction === null) {
+    bar.dataset.state = "idle";
+    bar.value = 0;
+    return;
+  }
+  if (fraction === "waiting") {
+    bar.dataset.state = "waiting";
+    return;
+  }
+  bar.dataset.state = "running";
+  bar.value = fraction;
 }
 
 // --- the alignment ---------------------------------------------------------

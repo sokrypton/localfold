@@ -171,7 +171,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
             </div>
 
-            <progress id="progress" max="1" value="0" hidden></progress>
           </div>
         </div>
         <div id="upload-options-container" class="container-box" style="width: 948px; margin-bottom: 10px;">
@@ -324,8 +323,18 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 </div>
             </div>
 
-            <!-- Status message below the panel -->
-            <div id="status-message" style="margin-top: 8px;"></div>
+            <!-- STATUS AND PROGRESS ARE ONE BLOCK, AND IT NEVER CHANGES HEIGHT.
+                 The bar used to live at the foot of the fold panel with a
+                 `hidden` attribute, so every fold grew that panel by 11px and
+                 shoved the viewer, the sequence strip and the panels below it
+                 down - then pulled them back up on completion. It is a
+                 permanent 3px rule under the status line now: flat and grey
+                 when there is nothing to report, filled while a fold runs. The
+                 element is always laid out, so nothing below it ever moves. -->
+            <div id="status-row" style="margin-top: 8px;">
+                <div id="status-message"></div>
+                <progress id="progress" max="1" value="0" data-state="idle"></progress>
+            </div>
         </div>
 
         <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;">

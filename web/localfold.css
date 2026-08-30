@@ -105,25 +105,49 @@
   align-items: center;
 }
 
-/* Progress sits under the row, the width of the panel, quiet until it moves. */
-#fold-panel progress {
+/* PROGRESS IS PART OF THE STATUS BLOCK AND IS ALWAYS THERE.
+   🔴 It used to sit at the foot of #fold-panel carrying `hidden`, so it was
+   laid out only while a fold ran - and that panel grew 11px at the start of
+   every fold and shrank again at the end, moving the viewer and every panel
+   below it twice per run. Reserving the space permanently is the whole fix;
+   `data-state` changes how it LOOKS, never whether it occupies room. */
+#status-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#status-row progress {
   width: 100%;
   height: 3px;
-  margin-top: 8px;
   border: 0;
+  border-radius: 2px;
+  appearance: none;
   background: #e5e7eb;
+  transition: opacity .2s ease;
 }
-#fold-panel progress::-webkit-progress-bar { background: #e5e7eb; }
-#fold-panel progress::-webkit-progress-value { background: #3b82f6; }
+#status-row progress::-webkit-progress-bar { background: #e5e7eb; border-radius: 2px; }
+#status-row progress::-webkit-progress-value { background: #3b82f6; border-radius: 2px; }
+#status-row progress::-moz-progress-bar { background: #3b82f6; border-radius: 2px; }
 
-/* ...an indeterminate bar for the stretch with nothing to count: the trunk
-   queues its blocks and then waits, and a bar frozen at a number reads as a
-   hang where one that is visibly moving reads as work. */
-#fold-panel progress:not([value]) {
+/* ...idle reads as a rule under the status line rather than an empty gauge:
+   still 3px tall, still in the layout, just fainter and with no fill. */
+#status-row progress[data-state="idle"] {
+  opacity: .5;
+}
+#status-row progress[data-state="idle"]::-webkit-progress-value { background: transparent; }
+#status-row progress[data-state="idle"]::-moz-progress-bar { background: transparent; }
+
+/* ...and an indeterminate sweep for the stretch with nothing to count: the
+   trunk queues its blocks and then waits, and a bar frozen at a number reads
+   as a hang where one that is visibly moving reads as work. */
+#status-row progress[data-state="waiting"] {
   background: linear-gradient(90deg, #e5e7eb 25%, #3b82f6 50%, #e5e7eb 75%) 0 0 / 250% 100%;
   animation: localfold-sweep 1.2s linear infinite;
 }
-#fold-panel progress:not([value])::-webkit-progress-bar { background: transparent; }
+#status-row progress[data-state="waiting"]::-webkit-progress-bar { background: transparent; }
+#status-row progress[data-state="waiting"]::-webkit-progress-value { background: transparent; }
+#status-row progress[data-state="waiting"]::-moz-progress-bar { background: transparent; }
 @keyframes localfold-sweep {
   from { background-position: 125% 0; }
   to { background-position: -125% 0; }
