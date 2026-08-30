@@ -1,7 +1,11 @@
 node_modules/
 dist/
 # The exported browser weights, written by tools/export-web-model.js.
-model/
+# 🔴 ANCHORED. Written as `model/` this matched ANY directory of that name at
+# any depth, so it silently swallowed src/model/ - monomer.js and query-only.js
+# were never committed, and the deployed site 404'd on both while every local
+# checkout worked. A leading slash keeps it to the one at the root.
+/model/
 # The self-contained offline page, written by tools/bundle.py.
 localfold-local.html
 coverage/
@@ -16,5 +20,5 @@ test/fixtures/evoformer/
 
 # Benchmark and diagnostic pages written during optimisation work.
 .scratch/
-# The float32 master the quantiser reads; model/ above is its int8 output.
-model.f32-backup/
+# The float32 master the quantiser reads; /model/ above is its int8 output.
+/model.f32-backup/

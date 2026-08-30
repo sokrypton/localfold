@@ -21,6 +21,7 @@ flattening any of that would mean rewriting import paths, and rewriting import
 paths is the build step this repository just got rid of.
 """
 import argparse
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -35,6 +36,48 @@ DIRECTORIES = ["web", "src"]
 
 # ...and never these, wherever they appear.
 IGNORE = shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map")
+
+
+
+# WHY THE BUILD RESOLVES THE MODULE GRAPH.
+#
+# 🔴 A DEPLOY ONCE 404'd ON TWO MODULES THAT EVERY CHECKOUT HAD. .gitignore said
+# `model/` for the exported weights, and an unanchored pattern matches a
+# directory of that name at ANY depth - so src/model/ was silently untracked,
+# the files existed locally, the site built, and the published page failed to
+# load web/app.js with no error anyone would see. Copying is not enough: a
+# build has to answer "does what I just assembled actually load", and for ES
+# modules that means every relative specifier resolving to a file in dist/.
+IMPORT = re.compile(
+    r"""(?:^|[\s;}])(?:import|export)\s+(?:[^'"]*?\sfrom\s+)?["']([^"']+)["']""",
+    re.MULTILINE,
+)
+SCRIPT_SRC = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
+
+
+def unresolved_imports(root: Path) -> list[str]:
+    """Every relative import under root that does not point at a file."""
+    problems = []
+    sources = list(root.rglob("*.js")) + list(root.glob("*.html"))
+    for path in sources:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        specifiers = IMPORT.findall(text)
+        if path.suffix == ".html":
+            specifiers += SCRIPT_SRC.findall(text)
+        for specifier in specifiers:
+            if specifier.startswith(("http://", "https://", "//", "data:")):
+                continue
+            target = specifier.split("?", 1)[0].split("#", 1)[0]
+            if not target.startswith("."):
+                # bare or absolute: absolute is resolved against the site root
+                if not target.startswith("/"):
+                    continue
+                resolved = root / target.lstrip("/")
+            else:
+                resolved = (path.parent / target).resolve()
+            if not resolved.is_file():
+                problems.append(f"{path.relative_to(root)} -> {specifier}")
+    return sorted(problems)
 
 
 def build(include_model: bool) -> int:
@@ -73,6 +116,15 @@ def build(include_model: bool) -> int:
         shutil.copytree(model, OUT / "model",
                         ignore=shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store",
                                                       "*.map", "weights-*.js", "manifest.js"))
+
+    problems = unresolved_imports(OUT)
+    if problems:
+        print(f"{len(problems)} import(s) do not resolve inside dist/:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        print("the site would load in a checkout and 404 once deployed;"
+              " check .gitignore is not swallowing a source directory", file=sys.stderr)
+        return 1
 
     total = sum(path.stat().st_size for path in OUT.rglob("*") if path.is_file())
     count = sum(1 for path in OUT.rglob("*") if path.is_file())
