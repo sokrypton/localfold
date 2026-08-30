@@ -143,6 +143,15 @@ fn main(
   // contraction below walks one h at a time, so this is the layout that decides
   // whether it runs or crawls - see the note on its k loop. Writing it here
   // costs this pass a scattered store; it saved the contraction 14x at L=256.
+  //
+  // 🔴 STAGING THE TILE THROUGH WORKGROUP MEMORY TO COALESCE THIS WAS TRIED AND
+  // WAS SLOWER. The store does put PAIRS floats between the lanes of a
+  // subgroup, so parking the 16x16 tile in `var<workgroup>` and writing it back
+  // indexed by row looks like the obvious fix. Measured interleaved against
+  // this version, bitwise-identical output, it lost at every length:
+  //   L=64 0.92x   L=128 0.88x   L=192 0.95x   L=256 0.93x   (and 0.74x
+  // incoming at 64). Two more arrays of 256 floats cost occupancy, and the
+  // extra barrier and indexed writeback cost more than the coalescing bought.
   if (row < PAIRS && h < CH) {
     let index = h * PAIRS + row; let pair_mask = mask[row];
     a[index] = pair_mask * ap_00 * logistic(ag_00); b[index] = pair_mask * bp_00 * logistic(bg_00);
