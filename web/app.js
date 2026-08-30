@@ -310,12 +310,12 @@ const modeSelect = element("msa-mode");
 // stronger one while doing the weaker thing is worse than one that says
 // nothing. Written from here so the two cannot drift apart.
 const PRIVACY_NOTE = {
-  search: ['<i class="fa-solid fa-cloud-arrow-up" style="margin-right: 6px; color: #f59e0b;"></i>',
-    "<strong>Privacy:</strong> folding runs in your browser; MSA search sends your sequence to ",
+  search: ['<i class="fa-solid fa-cloud-arrow-up" style="margin-right: 5px; color: #f59e0b;"></i>',
+    "folds locally · MSA via ",
     '<a href="https://colabfold.com" target="_blank" rel="noopener noreferrer"',
-    ' style="color: #3b82f6; text-decoration: none;">api.colabfold.com</a>.'].join(""),
-  local: ['<i class="fa-solid fa-shield-halved" style="margin-right: 6px; color: #10b981;"></i>',
-    "<strong>Privacy:</strong> everything runs locally in your browser. Nothing is uploaded."].join(""),
+    ' style="color: #3b82f6; text-decoration: none;">colabfold.com</a>'].join(""),
+  local: ['<i class="fa-solid fa-shield-halved" style="margin-right: 5px; color: #10b981;"></i>',
+    "everything runs locally"].join(""),
 };
 
 const syncMode = () => {
