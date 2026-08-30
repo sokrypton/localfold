@@ -146,7 +146,7 @@ fn main(
   //
   // 🔴 STAGING THE TILE THROUGH WORKGROUP MEMORY TO COALESCE THIS WAS TRIED AND
   // WAS SLOWER. The store does put PAIRS floats between the lanes of a
-  // subgroup, so parking the 16x16 tile in `var<workgroup>` and writing it back
+  // subgroup, so parking the 16x16 tile in workgroup memory and writing it back
   // indexed by row looks like the obvious fix. Measured interleaved against
   // this version, bitwise-identical output, it lost at every length:
   //   L=64 0.92x   L=128 0.88x   L=192 0.95x   L=256 0.93x   (and 0.74x
