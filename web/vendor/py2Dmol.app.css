@@ -1793,8 +1793,15 @@ table.layout-table td {
     overflow: hidden;
     min-width: 200px;
     min-height: 200px;
-    width: 974px;
-    /* Default starting width (match main layout width) */
+    /* 🔴 BORDER-BOX, for the same reason .container-box is - see the note on
+       .py2dmol-app above. This block states 948 and drew 974: its own 12px of
+       padding on each side and 1px of border went on top of the stated width,
+       and 2*12 + 2*1 is exactly the 26px it hung past the sequence strip above
+       it and the panels below. The width is set inline by createCanvasContainer
+       from MIN_CANVAS_WIDTH, which was already 948 - the number was never
+       wrong, the box model was. */
+    box-sizing: border-box;
+    width: 948px;
     margin-top: var(--container-gap);
     background: #ffffff;
     border: 1px solid var(--color-gray-200);
