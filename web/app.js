@@ -108,6 +108,22 @@ function progress(fraction) {
   bar.value = fraction;
 }
 
+/**
+ * The complex-construction switches that are turned OFF, for the status line.
+ *
+ * 🔴 A FLAG THAT IS NOT WIRED READS EXACTLY LIKE A CHANGE THAT DOES NOTHING.
+ * `?pairing=off` was compared against the default before it existed, and the
+ * two runs agreeing looked like evidence rather than a typo. Naming the active
+ * ablations where the fold reports itself makes that failure visible instead.
+ * Only shown for a complex; none of these reach a single chain.
+ */
+function activeAblations(chainCount) {
+  if (chainCount < 2) return "";
+  const query = new URLSearchParams(location.search);
+  const off = ["pairing", "perchain", "covmask"].filter((name) => query.get(name) === "off");
+  return off.length === 0 ? " · default" : ` · ${off.map((name) => `${name}=off`).join(" ")}`;
+}
+
 // --- the alignment ---------------------------------------------------------
 
 /**
@@ -542,7 +558,8 @@ async function fold(event) {
         return;
       }
       progress(Math.min(1, completed / total));
-      status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`);
+      status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`
+        + activeAblations(chains.length));
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
