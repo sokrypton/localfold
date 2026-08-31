@@ -4,23 +4,31 @@
     python3 tools/deploy.py --dry-run    # say what it would do
     python3 tools/deploy.py --verify     # just check what is live now
 
-🔴 THIS REPOSITORY IS A FORK, AND A FORK DOES NOT RUN ITS WORKFLOWS ON PUSH.
-GitHub disables Actions on forks; `workflow_dispatch` still works, because that
-is an explicit request, but a push fires nothing. Scheduled triggers are
-disabled on forks too, so this cannot be fixed inside the workflow file.
+🔴 A PUSH MAY NOT DEPLOY, AND SAYS NOTHING WHEN IT DOES NOT. For most of this
+repository's life it did not: it began as a fork, GitHub disables automatic
+workflow triggers on forks, and the first 17 workflow runs here were every one
+of them "manually run". `workflow_dispatch` kept working the whole time, because
+that is an explicit request, so the Actions tab showed green runs while pushes
+fired nothing.
 
-The consequence was an hour of confusion: `git push` reported success, the
-Actions tab showed a green run from earlier, and the site served the previous
-build. Every deploy that did land today was dispatched by hand without anyone
-realising that was load-bearing. Worse, while GitHub Pages was still on its
-legacy branch build, a push DID republish the site - without the weights, which
-are not in the repository - so pushing appeared to work and quietly removed the
-model.
+That state is stored per repository and OUTLIVES ITS CAUSE. Detaching the fork
+did not clear it - only "Enable Actions on this repository", on the Actions tab,
+did. It is also invisible from the API that looks like it would say:
+`/actions/permissions` reports `enabled: true` throughout, because that field is
+the allowed-actions policy and not this switch.
 
-So deploying is one command, and it ends by reading the deployed site back:
-tools/build_site.py writes dist/build.json carrying the commit it built, and
-this polls the live copy until that commit is the one being served. "Live" is
-then a fact with a timestamp on it, not an impression.
+Meanwhile the failure was silent and convincing: the push succeeded, a green run
+from earlier sat at the top of the Actions tab, and the site served the previous
+build. Worse, while GitHub Pages was still on its legacy branch build, a push DID
+republish the site - without the weights, which are not in the repository - so
+pushing appeared to work while quietly removing the model.
+
+Dispatching explicitly costs nothing and cannot be silently switched off, so this
+does it either way. What matters more is the last step: it ends by reading the
+deployed site back. tools/build_site.py writes dist/build.json carrying the
+commit it built, and this polls the live copy until that commit is the one being
+served. "Live" is then a fact with a timestamp on it, not an impression - which
+is the part worth keeping however GitHub is feeling about triggers.
 """
 import argparse
 import json
@@ -130,7 +138,10 @@ def main() -> int:
     print(f"pushing {head[:8]}…")
     subprocess.run(["git", "push", "origin", BRANCH], check=True)
 
-    # ...dispatched EXPLICITLY, because the push did not do it and will not.
+    # ...dispatched EXPLICITLY. It may now be redundant - automatic triggers
+    # were enabled after this tool was written - but a dispatch is idempotent
+    # here (the deploy is a full rebuild) and it cannot be quietly turned off
+    # the way the trigger was.
     print(f"dispatching {WORKFLOW!r}…")
     subprocess.run(["gh", "workflow", "run", WORKFLOW, "-R", name, "--ref", BRANCH],
                    check=True)
