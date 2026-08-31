@@ -1,0 +1,152 @@
+<!doctype html><meta charset="utf-8"><title>toy oracle: AF2-multimer vs LocalFold</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * GROUND TRUTH, ON THE MODEL'S OWN INPUTS.
+ *
+ * .scratch/oracle_dump.py runs real AF2-multimer on CPU over a 2 x 8 toy
+ * complex and saves the input dict the forward actually saw, plus what it
+ * produced. Feeding LocalFold those exact tensors takes featurisation out of
+ * the comparison: whatever differs afterwards is the forward pass.
+ *
+ * Bisecting folds got as far as "multimer breaks the backbone at 354 residues
+ * with an MSA and the monomer does not" and no further, because every run
+ * answered a yes/no question and there were too many left.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice } = await src('web/model.js');
+const { HttpTensorStore } = await src('src/reference/http-tensor-store.js');
+const { AlphaFoldFixture } = await src('src/reference/alphafold-fixture.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+
+try {
+  const o = await fetch('./toy-oracle.json').then((r) => r.json());
+  const L = o.length;
+  log(`toy complex: ${o.copies} chains x ${o.chainLength} = ${L} residues\n`);
+
+  const f32 = (name) => Float32Array.from(o[name]);
+  // their target_feat is 20 wide (one-hot over the amino acids); ours is 22
+  // with the restype at 1 + aa, which is the convention the leading-zero pad on
+  // the multimer weights lines up with.
+  const target = f32('target_feat');
+  const aatype = new Float32Array(L);
+  const targetFeatures = new Float32Array(L * 22);
+  for (let r = 0; r < L; r += 1) {
+    let best = 0;
+    for (let c = 1; c < 20; c += 1) if (target[r * 20 + c] > target[r * 20 + best]) best = c;
+    aatype[r] = best;
+    targetFeatures[r * 22 + 1 + best] = 1;
+  }
+  // extra_msa arrives one-hot; our shader wants the integer code
+  const extraOneHot = f32('extra_msa');
+  const extraMsa = new Float32Array(L);
+  for (let r = 0; r < L; r += 1) {
+    let best = 0;
+    for (let c = 1; c < 23; c += 1) if (extraOneHot[r * 23 + c] > extraOneHot[r * 23 + best]) best = c;
+    extraMsa[r] = best;
+  }
+
+  const features = [{
+    targetFeatures, aatype,
+    msaFeatures: f32('msa_feat'), msaMask: f32('msa_mask'),
+    extraMsa, extraHasDeletion: f32('extra_has_deletion'),
+    extraDeletionValue: f32('extra_deletion_value'), extraMsaMask: f32('extra_msa_mask'),
+    residueIndex: f32('residue_index'), seqMask: f32('seq_mask'),
+    asymId: f32('asym_id'), entityId: f32('entity_id'), symId: f32('sym_id'),
+    atom37ToAtom14: f32('residx_atom37_to_atom14'), atom37Mask: f32('atom37_atom_exists'),
+    msaSequences: 1, extraSequences: 1, targetChannels: 22, msaFeatureChannels: 49,
+  }];
+
+  log('loading multimer weights…');
+  const manifest = await fetch('./model-multimer/manifest.json').then((r) => r.json());
+  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest('./model-multimer/', manifest));
+  const [embedding, extraStack, mainStack, structure, confidence, geometry, paeBreaks] =
+    await Promise.all([
+      fixture.embeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
+      fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(),
+      fixture.tensor('confidencePaeBreaks'),
+    ]);
+  const weights = { embedding, extraStack, mainStack, structure,
+    lddt: confidence.lddt, pae: confidence.pae, geometry };
+
+  const device = await getDevice();
+  const prediction = await new AlphaFoldUnifiedGpu(device).predict(
+    features, weights, paeBreaks, undefined, undefined,
+    { outerProductMeanFirst: true, positionScale: 20, templates: false,
+      chainLengths: [o.chainLength, o.chainLength] });
+
+  const ours = prediction.final.structure.atom37;
+  const theirs = Float64Array.from(o.ca);
+  const ca = (r) => [ours[(r * 37 + 1) * 3], ours[(r * 37 + 1) * 3 + 1], ours[(r * 37 + 1) * 3 + 2]];
+  const bond = (get) => {
+    const d = [];
+    for (let r = 1; r < o.chainLength; r += 1) {
+      const a = get(r - 1), b = get(r);
+      d.push(Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]));
+    }
+    return d;
+  };
+  log('');
+  log(`  AF2-multimer CA-CA: ${bond((r) => [theirs[r * 3], theirs[r * 3 + 1], theirs[r * 3 + 2]]).map((v) => v.toFixed(2)).join(' ')}`);
+  log(`  LocalFold    CA-CA: ${bond(ca).map((v) => v.toFixed(2)).join(' ')}`);
+  log('');
+  // pLDDT logits are a direct comparison; CA positions differ by a global rigid
+  // motion, so their bond lengths are the comparable thing.
+  // 🔴 BOND LENGTHS ARE A WEAK CHECK. A completely wrong structure still has
+  // ~3.8 A bonds, because they come from the ideal geometry rather than from
+  // the model being right. Superposed RMSD is the real comparison.
+  const A = [], B = [];
+  for (let r = 0; r < L; r += 1) { A.push(ca(r)); B.push([theirs[r*3], theirs[r*3+1], theirs[r*3+2]]); }
+  const centre = (P) => { const c = [0,1,2].map((k) => P.reduce((s,p) => s+p[k], 0)/P.length);
+    return P.map((p) => p.map((v,k) => v - c[k])); };
+  const a = centre(A), b = centre(B);
+  // Kabsch: the optimal rotation is the one that maximises trace(R H), and the
+  // residual RMSD follows from the singular values of the covariance H.
+  const H = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i = 0; i < L; i += 1) for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) H[r][c] += a[i][r]*b[i][c];
+  // singular values via the eigenvalues of H^T H, by cyclic Jacobi on 3x3
+  const M = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) for (let k = 0; k < 3; k += 1) M[r][c] += H[k][r]*H[k][c];
+  let T = M.map((row) => row.slice());
+  for (let sweep = 0; sweep < 40; sweep += 1) {
+    for (const [p_, q_] of [[0,1],[0,2],[1,2]]) {
+      if (Math.abs(T[p_][q_]) < 1e-12) continue;
+      const theta = 0.5*Math.atan2(2*T[p_][q_], T[q_][q_]-T[p_][p_]);
+      const cth = Math.cos(theta), sth = Math.sin(theta);
+      const R = [[1,0,0],[0,1,0],[0,0,1]];
+      R[p_][p_] = cth; R[q_][q_] = cth; R[p_][q_] = sth; R[q_][p_] = -sth;
+      const N = [[0,0,0],[0,0,0],[0,0,0]];
+      for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1)
+        for (let k = 0; k < 3; k += 1) for (let l = 0; l < 3; l += 1) N[r][c] += R[k][r]*T[k][l]*R[l][c];
+      T = N;
+    }
+  }
+  const sv = [T[0][0], T[1][1], T[2][2]].map((v) => Math.sqrt(Math.max(v, 0)));
+  const det = H[0][0]*(H[1][1]*H[2][2]-H[1][2]*H[2][1]) - H[0][1]*(H[1][0]*H[2][2]-H[1][2]*H[2][0])
+    + H[0][2]*(H[1][0]*H[2][1]-H[1][1]*H[2][0]);
+  sv.sort((x, y) => y - x);
+  const trace = sv[0] + sv[1] + (det < 0 ? -sv[2] : sv[2]);
+  let sq = 0;
+  for (let i = 0; i < L; i += 1) for (let k = 0; k < 3; k += 1) sq += a[i][k]*a[i][k] + b[i][k]*b[i][k];
+  const rmsd = Math.sqrt(Math.max(0, (sq - 2*trace)) / L);
+  log(`  superposed CA RMSD  ${rmsd.toFixed(3)} A   over ${L} residues`);
+
+  const pl = Float64Array.from(o.plddt_logits);
+  const oursLddt = prediction.final.confidence.lddtLogits;
+  let maxabs = 0, sumsq = 0, refsq = 0;
+  for (let i = 0; i < pl.length; i += 1) {
+    const d = pl[i] - oursLddt[i];
+    maxabs = Math.max(maxabs, Math.abs(d)); sumsq += d*d; refsq += pl[i]*pl[i];
+  }
+  const span = Math.max(...pl) - Math.min(...pl);
+  log(`  pLDDT logits  maxabs ${maxabs.toFixed(3)}  relRMS ${(Math.sqrt(sumsq/refsq)).toExponential(2)}`
+    + `  (they span ${span.toFixed(1)})`);
+} catch (error) {
+  log(`FAILED: ${error.message}`);
+  log((error.stack ?? '').split('\n').slice(0, 6).join('\n'));
+}
+</script>

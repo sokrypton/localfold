@@ -1,0 +1,83 @@
+<!doctype html><meta charset="utf-8"><title>MSA vs single sequence, by depth</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * Single sequence folds a complex fine; an MSA distorts it. Both use the same
+ * graph and the same weights, so the difference is whatever the MSA track does
+ * - and it should appear as depth is raised from one row.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice, loadModel } = await src('web/model.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { mergeChainA3ms } = await src('src/input/chains.js');
+const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+const COPIES = Number(new URLSearchParams(location.search).get('copies') ?? 3);
+const ATOMS = 37, CA = 1;
+const chains = Array(COPIES).fill(CHAIN);
+const lengths = chains.map((c) => c.length);
+
+/** Cα-Cα bond length is 3.80 A in any real protein: a fold-free geometry check. */
+function bond(atom37) {
+  let total = 0, n = 0, broken = 0;
+  let start = 0;
+  for (const len of lengths) {
+    for (let r = start + 1; r < start + len; r += 1) {
+      const a = ((r - 1) * ATOMS + CA) * 3, b = (r * ATOMS + CA) * 3;
+      const d = Math.hypot(atom37[b] - atom37[a], atom37[b + 1] - atom37[a + 1], atom37[b + 2] - atom37[a + 2]);
+      total += d; n += 1;
+      if (d < 3.0 || d > 4.6) broken += 1;
+    }
+    start += len;
+  }
+  return { mean: total / n, broken, n };
+}
+
+try {
+  const device = await getDevice();
+  const a3m = await fetch('/test.a3m').then((r) => r.text());
+  const full = mergeChainA3ms(Array(COPIES).fill(a3m));
+  const single = mergeChainA3ms(Array(COPIES).fill(`>q\n${CHAIN}\n`));
+  const model = await loadModel('msa', () => {}, undefined, 'multimer');
+  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues, no recycles\n`);
+  log('  depth          plddt   CA-CA    bonds outside 3.0-4.6 A');
+  const only = new URLSearchParams(location.search).get('only');
+  const all = [
+    ['single seq', single, [1, 1]],
+    ['8:16', full, [8, 16]],
+    ['32:64', full, [32, 64]],
+    ['128:256', full, [128, 256]],
+    ['508:1024', full, [508, 1024]],
+  ];
+  for (const [label, text, depth] of (only ? all.filter(([l]) => only.split(',').includes(l)) : all)) {
+    let last;
+    await new AlphaFoldUnifiedGpu(device).predictA3m(
+      text, model.weights, model.featureTables,
+      { recycles: 0, randomSeed: 0, chainLengths: lengths,
+        maxMsaSequences: depth[0], maxExtraSequences: depth[1],
+        outerProductMeanFirst: true, positionScale: 20, templates: false,
+        chainAware: true, chainSequences: chains },
+      model.paeBreaks, (r) => { last = r; });
+    const b = bond(last.structure.atom37);
+    const centres = [];
+    let at = 0;
+    for (const len of lengths) {
+      let c = [0, 0, 0];
+      for (let r = at; r < at + len; r += 1) {
+        const q = (r * ATOMS + CA) * 3;
+        c = [c[0] + last.structure.atom37[q], c[1] + last.structure.atom37[q + 1], c[2] + last.structure.atom37[q + 2]];
+      }
+      centres.push(c.map((v) => v / len)); at += len;
+    }
+    let closest = Infinity;
+    for (let i = 0; i < centres.length; i += 1) for (let j = i + 1; j < centres.length; j += 1) {
+      closest = Math.min(closest, Math.hypot(...centres[i].map((v, k) => v - centres[j][k])));
+    }
+    log(`  ${label.padEnd(13)} ${(last.confidence.meanPlddt / 100).toFixed(3)}`
+      + `   ${b.mean.toFixed(2)} A   ${b.broken} of ${b.n}   closest chains ${closest.toFixed(1)} A`);
+  }
+} catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }
+</script>

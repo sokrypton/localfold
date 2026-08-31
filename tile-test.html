@@ -1,0 +1,63 @@
+<!doctype html><meta charset="utf-8"><title>does the tile size break it?</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * Six copies with an MSA shatters the backbone; three copies does not, and six
+ * copies without an MSA does not. The one buffer that only exists in the broken
+ * case is the tiled outer-product intermediate at 32 sequences x 354 residues:
+ * 185.6 MB, against 92.8 MB at three copies. Shrinking the tile shrinks that
+ * buffer without changing the arithmetic, so if the tile size is the fault the
+ * geometry comes back.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const q = new URLSearchParams(location.search);
+const cap = Number(q.get('cap') ?? 32);
+const [MSA, EXTRA] = (q.get('depth') ?? '32:64').split(':').map(Number);
+globalThis.__OPM_TILE_CAP__ = cap;
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice, loadModel } = await src('web/model.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { mergeChainA3ms } = await src('src/input/chains.js');
+const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+const COPIES = Number(new URLSearchParams(location.search).get('copies') ?? 6);
+const ATOMS = 37, CA = 1;
+const chains = Array(COPIES).fill(CHAIN);
+const lengths = chains.map((c) => c.length);
+const device = await getDevice();
+log(`${COPIES} copies, L=${COPIES*59}, ${MSA}:${EXTRA}, ${q.get('family') ?? 'multimer'}`
+  + `, opm ${q.get('opm') !== 'off'}, scale ${q.get('scale') ?? 20}, chainaware ${q.get('chainaware') !== 'off'}`);
+log(`device maxStorageBufferBindingSize ${(device.limits.maxStorageBufferBindingSize / 1048576).toFixed(0)} MB\n`);
+try {
+  const a3m = await fetch('/test.a3m').then((r) => r.text());
+  const family = q.get('family') ?? 'multimer';
+  const model = await loadModel('msa', () => {}, undefined, family);
+  let last;
+  await new AlphaFoldUnifiedGpu(device).predictA3m(
+    mergeChainA3ms(Array(COPIES).fill(a3m)), model.weights, model.featureTables,
+    { recycles: 0, randomSeed: 0, chainLengths: lengths,
+      maxMsaSequences: MSA, maxExtraSequences: EXTRA,
+      ...(family === 'multimer'
+        ? { outerProductMeanFirst: q.get('opm') !== 'off',
+            positionScale: Number(q.get('scale') ?? 20),
+            templates: false,
+            chainAware: q.get('chainaware') !== 'off', chainSequences: chains }
+        : {}) },
+    model.paeBreaks, (r) => { last = r; });
+  let broken = 0, total = 0, sum = 0, start = 0;
+  for (const len of lengths) {
+    for (let r = start + 1; r < start + len; r += 1) {
+      const a = ((r - 1) * ATOMS + CA) * 3, b = (r * ATOMS + CA) * 3;
+      const d = Math.hypot(last.structure.atom37[b] - last.structure.atom37[a],
+        last.structure.atom37[b + 1] - last.structure.atom37[a + 1],
+        last.structure.atom37[b + 2] - last.structure.atom37[a + 2]);
+      sum += d; total += 1; if (d < 3.0 || d > 4.6) broken += 1;
+    }
+    start += len;
+  }
+  log(`plddt ${(last.confidence.meanPlddt / 100).toFixed(3)}  CA-CA ${(sum / total).toFixed(2)} A`
+    + `  broken ${broken} of ${total}`);
+} catch (error) { log(`FAILED: ${error.message}`); }
+</script>

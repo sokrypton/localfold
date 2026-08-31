@@ -23,7 +23,10 @@ export function outerProductMeanTileCapacity(input, maxStorageBufferBindingSize)
   if (capacity < 1) {
     throw new RangeError("WebGPU storage binding is too small for one outer-product sequence tile");
   }
-  return Math.min(input.sequences, OUTER_PRODUCT_MEAN_TILE_SEQUENCES, capacity);
+  const ceiling = (typeof globalThis !== "undefined"
+    && Number.isFinite(globalThis.__OPM_TILE_CAP__))
+    ? globalThis.__OPM_TILE_CAP__ : OUTER_PRODUCT_MEAN_TILE_SEQUENCES;
+  return Math.min(input.sequences, ceiling, capacity);
 }
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
 
