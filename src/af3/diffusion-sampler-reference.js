@@ -162,8 +162,26 @@ export function sample(denoise, options) {
       noisy[index] = positions[index] + injected * normal();
     }
 
-    positions = samplerStep(noisy, denoise(noisy, tHat), tHat, level, { stepScale });
+    const denoised = denoise(noisy, tHat);
+    positions = samplerStep(noisy, denoised, tHat, level, { stepScale });
     previous = level;
+
+    // 🔴 `denoised` IS THE ONE WORTH WATCHING, NOT `positions`. It is the
+    // model's current guess at the finished structure, so it goes from blob to
+    // fold; `positions` is that guess plus the noise still left at this level,
+    // which at step 1 of 200 is a cloud 2560 A across. Both are passed because
+    // only one of them is the honest trajectory.
+    //
+    // 🔴 AND NEITHER IS IN A STABLE FRAME. randomAugmentation applies a fresh
+    // random rotation and translation at the top of EVERY step, so consecutive
+    // frames are in unrelated coordinate systems - an animation built from them
+    // tumbles wildly whatever the structure is doing. Superimpose each frame on
+    // the one before it before showing them.
+    options.onStep?.({
+      step, steps, noiseLevel: level, tHat,
+      positions: Float32Array.from(positions),
+      denoised: Float32Array.from(denoised),
+    });
   }
   return positions;
 }

@@ -11,7 +11,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  noiseLevels, noiseSchedule, randomAugmentation, randomRotation, samplerStep,
+  noiseLevels, noiseSchedule, randomAugmentation, randomRotation, sample, samplerStep,
 } from "../src/af3/diffusion-sampler-reference.js";
 
 /** A deterministic gaussian, so a failure is reproducible. */
@@ -117,5 +117,77 @@ describe("AF3 random augmentation", () => {
     assert.ok(Math.abs(moved[3] - 1) < 1e-4, `second atom at ${moved[3]}`);
     // ...and padded slots stay exactly zero.
     for (let index = 6; index < 12; index += 1) assert.equal(moved[index], 0);
+  });
+});
+
+describe("AF3 sampler trajectory", () => {
+  const atoms = 4;
+  const target = Float32Array.from([0, 0, 0, 3, 0, 0, 0, 3, 0, 0, 0, 3]);
+  const mask = Float32Array.from([1, 1, 1, 1]);
+  // A denoiser that always names the same answer, so the trajectory's shape is
+  // the sampler's doing and not the model's.
+  const denoise = () => target;
+
+  const collect = (steps) => {
+    const frames = [];
+    const final = sample(denoise, {
+      atoms, mask, steps, normal: gaussians(5),
+      onStep: (event) => frames.push(event),
+    });
+    return { frames, final };
+  };
+
+  it("reports one frame per step, numbered from one", () => {
+    const { frames } = collect(12);
+    assert.equal(frames.length, 12);
+    assert.deepEqual(frames.map((frame) => frame.step),
+                     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    for (const frame of frames) assert.equal(frame.steps, 12);
+  });
+
+  it("descends in noise level, so a frame index is a progress bar", () => {
+    const { frames } = collect(12);
+    for (let index = 1; index < frames.length; index += 1) {
+      assert.ok(frames[index].noiseLevel < frames[index - 1].noiseLevel,
+                `frame ${index} did not descend`);
+    }
+  });
+
+  it("hands out copies, not views of the live buffer", () => {
+    // 🔴 THE BUG THIS EXISTS FOR. Passing the sampler's own arrays would make
+    // every frame alias the same memory: the animation would replay the FINAL
+    // structure `steps` times and look like a still. Nothing about that reads
+    // as a bug in the viewer.
+    const { frames } = collect(6);
+    for (let index = 1; index < frames.length; index += 1) {
+      assert.notEqual(frames[index].positions, frames[index - 1].positions,
+                      "consecutive frames share a buffer");
+    }
+    const early = frames[0].positions;
+    const snapshot = Float32Array.from(early);
+    collect(6);
+    assert.deepEqual(early, snapshot, "an earlier frame was mutated later");
+  });
+
+  it("converges on the denoiser's answer, which is what makes it watchable", () => {
+    // The last frame's guess is the target; the first is dominated by noise.
+    const { frames, final } = collect(40);
+    const spread = (positions) => {
+      let total = 0;
+      for (let index = 0; index < positions.length; index += 1) {
+        const difference = positions[index] - target[index];
+        total += difference * difference;
+      }
+      return Math.sqrt(total / positions.length);
+    };
+    assert.ok(spread(frames[0].positions) > spread(final),
+              "the trajectory did not move toward the answer");
+    // ...and `denoised` is the target exactly, every frame, since that is what
+    // this denoiser returns. That is the frame an animation should show.
+    for (const frame of frames) assert.deepEqual(frame.denoised, target);
+  });
+
+  it("runs without an onStep, which is the normal path", () => {
+    assert.doesNotThrow(() => sample(denoise, { atoms, mask, steps: 5, normal: gaussians(2) }));
   });
 });
