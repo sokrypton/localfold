@@ -65,8 +65,14 @@ export class ScriptTensorStore {
     if (globals?.manifest === undefined) {
       throw new Error(`${baseUrl}manifest.js did not define a model manifest`);
     }
-    if (globals.manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
-    const store = new ScriptTensorStore(baseUrl, globals.manifest, globals.scripts ?? {}, onProgress);
+    return this.fromManifest(baseUrl, globals.manifest, onProgress);
+  }
+
+  static fromManifest(baseValue, manifest, onProgress = undefined) {
+    const baseUrl = baseValue.endsWith("/") ? baseValue : `${baseValue}/`;
+    if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
+    const globals = globalThis.__afWeights;
+    const store = new ScriptTensorStore(baseUrl, manifest, globals?.scripts ?? {}, onProgress);
     store.#reportProgress();
     return store;
   }

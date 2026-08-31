@@ -120,9 +120,17 @@ export class HttpTensorStore {
   }
   static async open(manifestUrlValue,
     onProgress) {
-    const manifestUrl = typeof manifestUrlValue === "string" ? new URL(manifestUrlValue, location.href) : manifestUrlValue;
+    const manifestUrl = manifestUrlValue instanceof URL
+      ? manifestUrlValue
+      : new URL(manifestUrlValue, typeof location !== "undefined" ? location.href : "http://localhost/");
     const response = await fetchWithRetry(manifestUrl, "model manifest");
     const manifest = await response.json();
+    return this.fromManifest(manifestUrl, manifest, onProgress);
+  }
+  static async fromManifest(manifestUrlValue, manifest, onProgress = undefined) {
+    const manifestUrl = manifestUrlValue instanceof URL
+      ? manifestUrlValue
+      : new URL(manifestUrlValue, typeof location !== "undefined" ? location.href : "http://localhost/");
     if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
     const store = new HttpTensorStore(manifestUrl, manifest, onProgress, await openShardCache(manifest));
     store.#reportProgress();

@@ -18,8 +18,11 @@
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
+import { DEFAULT_MANIFEST } from "../src/reference/manifest.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { withAbort } from "../src/runtime/abort.js";
+
+let storePromise = undefined;
 
 /**
  * The tensor store this origin can actually use.
@@ -35,8 +38,9 @@ import { withAbort } from "../src/runtime/abort.js";
 export function openStore(onProgress) {
   const override = new URLSearchParams(location.search).get("model");
   if (override !== null) return HttpTensorStore.open(override, onProgress);
-  if (location.protocol === "file:") return ScriptTensorStore.open("./model/", onProgress);
-  return HttpTensorStore.open("./model/manifest.json", onProgress);
+  if (location.protocol === "file:") return ScriptTensorStore.fromManifest("./model/", DEFAULT_MANIFEST, onProgress);
+  storePromise ??= HttpTensorStore.fromManifest("./model/", DEFAULT_MANIFEST, onProgress);
+  return storePromise;
 }
 
 let devicePromise;

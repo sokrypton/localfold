@@ -47,6 +47,7 @@ export { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "./input/mmseqs2-a
 export { AlphaFoldFixture } from "./reference/alphafold-fixture.js";
 
 export { HttpTensorStore } from "./reference/http-tensor-store.js";
+export { DEFAULT_MANIFEST } from "./reference/manifest.js";
 export { AlphaFoldQueryOnlyGpu } from "./model/query-only.js";
 
 export { AlphaFoldMonomerGpu } from "./model/monomer.js";

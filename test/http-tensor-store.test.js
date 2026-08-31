@@ -58,4 +58,22 @@ describe("HttpTensorStore", () => {
     expect(Array.from(second)).toEqual([3, 4]);
     expect(downloads).toBe(1);
   });
+
+  it("loads tensors directly from manifest object with fromManifest without fetching manifest URL", async() => {
+    const shard = new Float32Array([10, 20]);
+    vi.stubGlobal("fetch", vi.fn(async(input) => {
+      const url = String(input);
+      if (url.endsWith("manifest.json")) throw new Error("should not fetch manifest.json");
+      return new Response(shard);
+    }));
+    const manifest = {
+      formatVersion: 1,
+      tensors: {
+        item: { file: "weights.bin", dtype: "float32", shape: [2], byteOffset: 0 },
+      },
+    };
+    const store = await HttpTensorStore.fromManifest("https://example.test/model/", manifest);
+    const item = await store.tensor("item");
+    expect(Array.from(item)).toEqual([10, 20]);
+  });
 });

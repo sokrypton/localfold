@@ -41,10 +41,16 @@ MANIFEST_TEMPLATE = ('window.__afWeights = window.__afWeights || {{ shards: {{}}
 
 def build(model: pathlib.Path, check: bool) -> int:
     manifest_path = model / "manifest.json"
-    if not manifest_path.is_file():
-        print(f"no manifest at {manifest_path}", file=sys.stderr)
-        return 1
-    manifest = json.loads(manifest_path.read_text())
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+    else:
+        ref_path = pathlib.Path(__file__).resolve().parent.parent / "src" / "reference" / "manifest.js"
+        if not ref_path.is_file():
+            print(f"no manifest found at {manifest_path} or {ref_path}", file=sys.stderr)
+            return 1
+        raw_text = ref_path.read_text()
+        json_text = raw_text.split("=", 1)[1].rsplit(";", 1)[0].strip()
+        manifest = json.loads(json_text)
     shards = sorted({record["file"] for record in manifest["tensors"].values()})
 
     scripts = {}
