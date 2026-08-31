@@ -6,6 +6,7 @@ import {
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { WebGpuExecution } from "../runtime/execution.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
+import { DeferredValidation } from "../runtime/validation.js";
 import { StructureModuleGpu } from "../structure/module.js";
 import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
@@ -89,9 +90,15 @@ export class AlphaFoldMonomerGpu {
       completed += 1;
       onProgress?.({ completed, total: totalSteps, waiting: false });
     };
+    // 🔴 THE SCOPE OPENS AT THE ENCODER, NOT HERE. Validation errors are raised
+    // as commands are encoded far more often than when a buffer is submitted,
+    // and a scope pushed at submit time covers only the rarer half.
+    const encode = (label) => {
+      this.device.pushErrorScope("validation");
+      return this.device.createCommandEncoder({ label });
+    };
     const submit = async(encoder, label) => {
       execution.endComputePass(encoder);
-      this.device.pushErrorScope("validation");
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU ${label} failed: ${error.message}`);
@@ -114,7 +121,7 @@ export class AlphaFoldMonomerGpu {
         const recycleStart = performance.now();
         const msaMask = execution.upload(`monomer.msa-mask-${recycle}`, features.msaMask);
         const extraMsaMask = execution.upload(`monomer.extra-msa-mask-${recycle}`, features.extraMsaMask);
-        const embeddingEncoder = this.device.createCommandEncoder({ label: `monomer.embedding-${recycle}` });
+        const embeddingEncoder = encode(`monomer.embedding-${recycle}`);
         const embedding = await encodeInputEmbedder(execution, embeddingEncoder, {
           ...features,
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
@@ -135,17 +142,20 @@ export class AlphaFoldMonomerGpu {
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };
         const windowSize = signal !== undefined ? 8 : weights.mainStack.length;
+        const validation = new DeferredValidation(this.device, `recycle ${recycle}`);
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
           const encoder = this.device.createCommandEncoder({ label: `monomer.extra-${recycle}-${block}` });
+          validation.begin();
           await encodeExtraMsaBlock(execution, encoder, extraShape, weights.extraStack[block],
             embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
           execution.endComputePass(encoder);
           this.device.queue.submit([encoder.finish()]);
+          validation.end(`extra-MSA block ${block}`);
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.extraStack.length;
-          if (endOfWindow && signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
           void this.device.queue.onSubmittedWorkDone().then(() => step());
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
@@ -160,18 +170,21 @@ export class AlphaFoldMonomerGpu {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
           const encoder = this.device.createCommandEncoder({ label: `monomer.main-${recycle}-${block}` });
+          validation.begin();
           await encodeEvoformerBlock(execution, encoder, {
             ...mainDescriptor, weights: weights.mainStack[block],
           }, embedding.msa, embedding.pairWithoutTemplates, msaMask, pairMaskTensor);
           execution.endComputePass(encoder);
           this.device.queue.submit([encoder.finish()]);
+          validation.end(`main Evoformer block ${block}`);
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.mainStack.length;
-          if (endOfWindow && signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
           void this.device.queue.onSubmittedWorkDone().then(() => step());
         }
 
-        const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
+        await validation.settle();
+        const readbackEncoder = encode(`monomer.readback-${recycle}`);
         const msaFirstRowTensor = execution.allocate(
           `monomer.msa-first-row-readback-${recycle}`, length * 256,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,

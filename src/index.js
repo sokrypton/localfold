@@ -16,6 +16,7 @@ export { QueryOnlyTemplateGpu } from "./evoformer/template.js";
 export { ElementwiseAddGpu } from "./runtime/elementwise.js";
 export { requestAlphaFoldDevice } from "./runtime/device.js";
 export { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "./runtime/abort.js";
+export { DeferredValidation } from "./runtime/validation.js";
 export { InvariantPointAttentionGpu } from "./structure/ipa.js";
 
 export { StructurePostAttentionGpu } from "./structure/iteration.js";
