@@ -102,19 +102,24 @@ export function paeMatrix(values, length) {
 }
 
 export function confidenceJson(sequence, confidence) {
-  return JSON.stringify({
+  const result = {
     sequence,
     plddt: Array.from(confidence.plddt),
     mean_plddt: confidence.meanPlddt,
     ptm: confidence.ptm,
-    // 🔴 A NESTED L x L MATRIX, NOT A FLAT ARRAY. This is what AlphaFold and
-    // ColabFold write, and what every consumer expects - py2Dmol's PAE panel
-    // reads a nested array as angstroms and scales it by 8 into its byte
-    // encoding, but reads a FLAT array as bytes that are already scaled. Handed
-    // flat angstroms it draws a matrix eight times too small, silently.
-    predicted_aligned_error: paeMatrix(confidence.predictedAlignedError, sequence.length),
-    max_predicted_aligned_error: confidence.maxPredictedAlignedError,
-  }, null, 2);
+  };
+  if (confidence.iptm !== undefined) {
+    result.iptm = confidence.iptm;
+    result.ranking_confidence = confidence.multimerScore ?? (0.8 * confidence.iptm + 0.2 * confidence.ptm);
+  }
+  // 🔴 A NESTED L x L MATRIX, NOT A FLAT ARRAY. This is what AlphaFold and
+  // ColabFold write, and what every consumer expects - py2Dmol's PAE panel
+  // reads a nested array as angstroms and scales it by 8 into its byte
+  // encoding, but reads a FLAT array as bytes that are already scaled. Handed
+  // flat angstroms it draws a matrix eight times too small, silently.
+  result.predicted_aligned_error = paeMatrix(confidence.predictedAlignedError, sequence.length);
+  result.max_predicted_aligned_error = confidence.maxPredictedAlignedError;
+  return JSON.stringify(result, null, 2);
 }
 
 export function safeJobName(value) {

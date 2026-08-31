@@ -51,7 +51,7 @@ export class AlphaFoldQueryOnlyGpu {
     onProgress,
   ) {
     return this.predict(makeQueryOnlyFeatures(sequence, featureTables, options), weights,
-      paeBreaks, onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal });
+      paeBreaks, onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths });
   }
 
   /**
@@ -209,6 +209,7 @@ export class AlphaFoldQueryOnlyGpu {
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.mainStack,
           signal,
+          profileBlock: recycle === 0 && this.device.features.has("timestamp-query") ? 0 : undefined,
           // ...WHEN THE DEVICE FINISHES A BLOCK, not when one is queued. The stack
           // queues all 48 ahead, so anything counted at encode time arrives in
           // the first moment and tells the reader nothing.
@@ -235,6 +236,7 @@ export class AlphaFoldQueryOnlyGpu {
           structure.finalRepresentation, trunk.pair, length, weights.lddt, weights.pae, paeBreaks,
           () => step(),
           signal,
+          recycleOptions.chainLengths,
         ), signal);
         throwIfAborted(signal);
         const recycleDistance = recycleConvergenceDistance(

@@ -27,6 +27,10 @@ const randomMasking = () => {
   const input = document.getElementById("random-masking");
   return input ? input.checked : false;
 };
+const blockOpmEnabled = () => {
+  const select = document.getElementById("block-opm");
+  return select ? select.value !== "off" : true;
+};
 
 let currentPdb = "";
 let currentScores = "";
@@ -241,7 +245,8 @@ viewerContainer.addEventListener("click", (event) => {
 });
 
 function showRecycle(sequence, recycle, index, total, chainLengths = undefined) {
-  status(`Pass ${index + 1} of ${total} · Mean pLDDT ${recycle.confidence.meanPlddt.toFixed(1)} · pTM ${recycle.confidence.ptm.toFixed(3)}`);
+  const iptmText = recycle.confidence.iptm !== undefined ? ` · ipTM ${recycle.confidence.iptm.toFixed(3)}` : "";
+  status(`Pass ${index + 1} of ${total} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)} · pTM ${recycle.confidence.ptm.toFixed(3)}${iptmText}`);
   pushFrame(sequence, recycle, chainLengths);
 }
 
@@ -325,6 +330,7 @@ async function fold(event) {
         randomSeed: seed,
         randomMasking: randomMasking(),
         chainLengths,
+        blockOpm: blockOpmEnabled(),
         signal,
       },
       modelData.paeBreaks,
@@ -358,9 +364,10 @@ async function fold(event) {
       ? ` · converged at ${prediction.final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`
       : "";
     const morphed = morphedThisRun ? " — showing what moved" : "";
-    const plddt = ` · Mean pLDDT ${prediction.final.confidence.meanPlddt.toFixed(1)}`;
+    const plddt = ` · pLDDT ${prediction.final.confidence.meanPlddt.toFixed(1)}`;
     const ptm = ` · pTM ${prediction.final.confidence.ptm.toFixed(3)}`;
-    status(`Done in ${took}${plddt}${ptm}${converged}${morphed}`);
+    const iptm = prediction.final.confidence.iptm !== undefined ? ` · ipTM ${prediction.final.confidence.iptm.toFixed(3)}` : "";
+    status(`Done in ${took}${plddt}${ptm}${iptm}${converged}${morphed}`);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");

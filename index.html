@@ -882,6 +882,38 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          MODEL produced: the structure and its scores. Different
                          things, so they are not the same button, and this is
                          where a reader looking at pLDDT and PAE already is. -->
+                    <!-- Prediction scores card -->
+                    <div id="predictionScoresBox" class="container-box" style="display: none;">
+                        <div class="scores-card-header">
+                            <span class="scores-card-title">Prediction Quality</span>
+                            <span id="scoresPassBadge" class="scores-pass-badge"></span>
+                        </div>
+                        <div class="scores-card-grid" id="scoresCardGrid">
+                            <div class="score-metric-cell">
+                                <div class="score-metric-label">pLDDT</div>
+                                <div id="metricMeanPlddt" class="score-metric-value">-</div>
+                            </div>
+                            <div class="score-metric-cell">
+                                <div class="score-metric-label">pTM</div>
+                                <div id="metricPtm" class="score-metric-value">-</div>
+                            </div>
+                            <div id="metricIptmCell" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">ipTM</div>
+                                <div id="metricIptm" class="score-metric-value">-</div>
+                            </div>
+                            <div id="metricMultimerCell" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">Ranking</div>
+                                <div id="metricMultimer" class="score-metric-value">-</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- THE RAW PREDICTION, under the confidence it describes.
+                         py2Dmol's own Save writes a session - the view, the
+                         selections, what is on screen. These two write what the
+                         MODEL produced: the structure and its scores. Different
+                         things, so they are not the same button, and this is
+                         where a reader looking at pLDDT and PAE already is. -->
                     <div id="downloads" class="container-box" style="display: none;">
                         <button id="download-pdb" class="btn btn-secondary"
                             title="Download the predicted structure, one model per recycle">

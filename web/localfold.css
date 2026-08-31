@@ -290,12 +290,17 @@
   to { background-position: -125% 0; }
 }
 
-/* The download pair sits under the PAE panel, matching the panels around it. */
+/* The download pair sits under the score card, matching the panels around it. */
 #downloads {
-  gap: 6px;
+  width: 340px;
+  display: flex;
+  gap: 8px;
   align-items: center;
-  justify-content: center;
-  padding: 8px;
+  justify-content: stretch;
+  padding: 8px 12px;
+}
+#downloads button {
+  flex: 1;
 }
 
 /* Legend & swatches */
@@ -335,3 +340,51 @@
   display: flex; align-items: center; justify-content: center;
 }
 .mutate-close:hover { color: #0f172a; background: #f1f5f9; }
+
+/* --- Prediction scores card --- */
+#predictionScoresBox {
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px;
+}
+.scores-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.scores-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #374151;
+}
+.scores-pass-badge {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 500;
+}
+.scores-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 6px;
+}
+.score-metric-cell {
+  background: #f9fafb;
+  padding: 6px 4px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  text-align: center;
+}
+.score-metric-label {
+  font-size: 11px;
+  color: #6b7280;
+  font-weight: 500;
+  margin-bottom: 2px;
+}
+.score-metric-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: #111827;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

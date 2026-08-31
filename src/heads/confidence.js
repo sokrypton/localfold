@@ -55,16 +55,34 @@ function paeCenters(breaks) {
   return centers;
 }
 
-export function predictedTmScore(logits, length, breaks) {
+export function computeTmScores(logits, length, breaks, chainLengths = undefined) {
   const bins = breaks.length + 1;
   if (logits.length !== length * length * bins) throw new RangeError("invalid PAE logits shape");
   const centers = paeCenters(breaks);
   const effectiveLength = Math.max(length, 19);
   const d0 = 1.24 * Math.cbrt(effectiveLength - 15) - 1.8;
   const tmPerBin = centers.map((center) => 1 / (1 + center * center / (d0 * d0)));
-  let score = 0;
+
+  const isMultiChain = Array.isArray(chainLengths) && chainLengths.length > 1;
+  let chainIndices = null;
+  if (isMultiChain) {
+    chainIndices = new Uint32Array(length);
+    let offset = 0;
+    chainLengths.forEach((chainLen, chainIdx) => {
+      chainIndices.fill(chainIdx, offset, offset + chainLen);
+      offset += chainLen;
+    });
+  }
+
+  let ptm = 0;
+  let iptm = isMultiChain ? 0 : undefined;
+
   for (let anchor = 0; anchor < length; anchor += 1) {
-    let alignment = 0;
+    const anchorChain = chainIndices ? chainIndices[anchor] : 0;
+    let fullAlignment = 0;
+    let interfaceAlignment = 0;
+    let interfaceResidueCount = 0;
+
     for (let residue = 0; residue < length; residue += 1) {
       const base = (anchor * length + residue) * bins;
       let maximum = -Infinity;
@@ -76,11 +94,31 @@ export function predictedTmScore(logits, length, breaks) {
         denominator += probability;
         numerator += probability * tmPerBin[bin];
       }
-      alignment += numerator / denominator;
+      const pairTm = numerator / denominator;
+      fullAlignment += pairTm;
+
+      if (isMultiChain && chainIndices[residue] !== anchorChain) {
+        interfaceAlignment += pairTm;
+        interfaceResidueCount += 1;
+      }
     }
-    score = Math.max(score, alignment / length);
+
+    ptm = Math.max(ptm, fullAlignment / length);
+    if (isMultiChain && interfaceResidueCount > 0) {
+      iptm = Math.max(iptm, interfaceAlignment / interfaceResidueCount);
+    }
   }
-  return score;
+
+  const multimerScore = isMultiChain && iptm !== undefined ? (0.8 * iptm + 0.2 * ptm) : undefined;
+  return { ptm, iptm, multimerScore };
+}
+
+export function predictedTmScore(logits, length, breaks) {
+  return computeTmScores(logits, length, breaks).ptm;
+}
+
+export function predictedInterfaceTmScore(logits, length, breaks, chainLengths) {
+  return computeTmScores(logits, length, breaks, chainLengths).iptm;
 }
 
 export class ConfidenceHeadsGpu {
@@ -103,6 +141,7 @@ export class ConfidenceHeadsGpu {
     breaks = Float32Array.from({ length: 63 }, (_, index) => index * 0.5),
     onStage,
     signal = undefined,
+    chainLengths = undefined,
   ) {
     throwIfAborted(signal);
     const structureChannels = structureRepresentation.length / length;
@@ -199,12 +238,15 @@ export class ConfidenceHeadsGpu {
       // actually is before the thread is taken.
       onStage?.("scoring");
       await new Promise((resolve) => setTimeout(resolve, 0));
+      const tmScores = computeTmScores(paeLogitValues, length, breaks, chainLengths);
       return {
         lddtLogits: lddtLogitValues, plddt,
         meanPlddt: plddt.reduce((sum, value) => sum + value, 0) / length,
         paeLogits: paeLogitValues, predictedAlignedError,
         maxPredictedAlignedError: centers[paeBins - 1],
-        ptm: predictedTmScore(paeLogitValues, length, breaks),
+        ptm: tmScores.ptm,
+        iptm: tmScores.iptm,
+        multimerScore: tmScores.multimerScore,
       };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index] .release();

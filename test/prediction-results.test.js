@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { predictionToPdb, recyclesToPdb, safeJobName } from "../web/prediction-results.js";
+import { confidenceJson, predictionToPdb, recyclesToPdb, safeJobName } from "../web/prediction-results.js";
 
 describe("browser prediction result formatting", () => {
   it("writes only present atom37 coordinates and pLDDT B-factors", () => {
@@ -50,5 +50,55 @@ describe("browser prediction result formatting", () => {
   it("makes download names safe", () => {
     expect(safeJobName(" ../../my fold ")).toBe("my_fold");
     expect(safeJobName("***")).toBe("prediction");
+  });
+
+  it("formats confidence JSON with pLDDT, pTM, and multi-chain ipTM", () => {
+    const plddt = Float32Array.of(90, 85);
+    const pae = Float32Array.of(1, 5, 5, 1);
+    const jsonStr = confidenceJson("AC", {
+      plddt,
+      meanPlddt: 87.5,
+      ptm: 0.82,
+      iptm: 0.75,
+      multimerScore: 0.764,
+      predictedAlignedError: pae,
+      maxPredictedAlignedError: 31.75,
+    });
+    const parsed = JSON.parse(jsonStr);
+    expect(parsed.mean_plddt).toBe(87.5);
+    expect(parsed.ptm).toBe(0.82);
+    expect(parsed.iptm).toBe(0.75);
+    expect(parsed.ranking_confidence).toBeCloseTo(0.764, 3);
+    expect(parsed.predicted_aligned_error).toEqual([[1, 5], [5, 1]]);
+  });
+});
+
+describe("TM and interface TM score calculation", () => {
+  it("computes pTM and multi-chain ipTM from PAE logits", async() => {
+    const { computeTmScores } = await import("../src/heads/confidence.js");
+    const length = 20;
+    const bins = 64;
+    const breaks = Float32Array.from({ length: 63 }, (_, i) => i * 0.5);
+    const logits = new Float32Array(length * length * bins);
+
+    // Make diagonal/intra-chain pairs (0..9, 0..9 and 10..19, 10..19) have high confidence in low PAE bin 0
+    // Make cross-chain pairs have confidence in bin 6
+    for (let i = 0; i < length; i++) {
+      for (let j = 0; j < length; j++) {
+        const isSame = (i < 10 && j < 10) || (i >= 10 && j >= 10);
+        const preferredBin = isSame ? 0 : 6;
+        logits[(i * length + j) * bins + preferredBin] = 10.0;
+      }
+    }
+
+    const monomerScores = computeTmScores(logits, length, breaks);
+    expect(monomerScores.ptm).toBeGreaterThan(0.2);
+    expect(monomerScores.iptm).toBe(undefined);
+
+    const multimerScores = computeTmScores(logits, length, breaks, [10, 10]);
+    expect(multimerScores.ptm).toBeCloseTo(monomerScores.ptm, 4);
+    expect(typeof multimerScores.iptm).toBe("number");
+    expect(multimerScores.iptm).toBeGreaterThan(0.005);
+    expect(multimerScores.multimerScore).toBeCloseTo(0.8 * multimerScores.iptm + 0.2 * multimerScores.ptm, 4);
   });
 });

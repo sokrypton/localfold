@@ -170,13 +170,16 @@ async function alignmentText(chains, signal) {
  * The alignment is passed only when there is one - handing the app an A3M for a
  * single-sequence fold would draw a one-row MSA panel that says nothing.
  */
-async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, length }) {
+async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, length, confidence }) {
   const load = window.py2dmolLoadFiles;
   if (typeof load !== "function") {
     throw new Error("this py2Dmol bundle has no py2dmolLoadFiles; it needs the `full` build");
   }
   const file = (name, text) => ({ name, readAsync: () => Promise.resolve(text) });
-  const files = [file(`${stem}.pdb`, pdb), file(`${stem}_scores.json`, scores)];
+  const files = [
+    file(`${stem}.pdb`, pdb),
+    file(`${stem}_scores.json`, typeof scores === "string" ? scores : JSON.stringify(scores, null, 2)),
+  ];
   if (a3m != null) {
     const alignments = chainLengths?.length > 1
       ? splitComplexA3mByChain(a3m, chainLengths)
@@ -189,6 +192,30 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, lengt
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
+  if (viewer !== undefined) {
+    if (typeof viewer.setColorScheme === "function") {
+      viewer.setColorScheme("plddt");
+    } else if (typeof viewer.colorBy === "function") {
+      viewer.colorBy("plddt");
+    }
+  }
+  if (viewer !== undefined && !viewer._scoresHookAttached) {
+    viewer._scoresHookAttached = true;
+    const origSetFrame = viewer.setFrame.bind(viewer);
+    viewer.setFrame = function(frameIndex) {
+      const res = origSetFrame(frameIndex);
+      syncScoresCardToActiveFrame(frameIndex);
+      return res;
+    };
+    const origRender = viewer.render ? viewer.render.bind(viewer) : null;
+    if (origRender) {
+      viewer.render = function(...args) {
+        const res = origRender(...args);
+        syncScoresCardToActiveFrame();
+        return res;
+      };
+    }
+  }
   // 🔴 THE FIRST FRAME NEEDS ITS PAE ON THE FRAME, not only on the renderer.
   // Ingestion sets the panel up, but py2Dmol reads `frame.pae` when the frame
   // CHANGES - so without this, scrubbing the play bar back to the first pass
@@ -199,10 +226,108 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, lengt
       frame.name = "recycle_0";
       frame.label = "recycle_0";
       frame.title = "recycle_0";
+      if (confidence !== undefined) frame.confidence = confidence;
       if (pae !== undefined) { frame.pae = pae; frame.pae_n = length; }
     }
   }
   return stats;
+}
+
+let lastReportedFrameIdx = -1;
+
+function getActiveFrameConfidence(frameIndex) {
+  try {
+    if (!viewer) return null;
+    const objName = viewerObject ?? viewer.currentObjectName;
+    const obj = viewer.objects?.find((entry) => entry.name === objName);
+    const objData = viewer.objectsData?.[objName];
+    const frames = objData?.frames ?? obj?.frames;
+    const idx = frameIndex !== undefined
+      ? frameIndex
+      : (obj?.currentFrame ?? objData?.currentFrame ?? viewer.currentFrame ?? 0);
+    const targetFrame = frames?.[idx];
+    const pred = (objName ? predictions.get(objName) : null) ?? lastPrediction;
+    const conf = targetFrame?.confidence ?? pred?.recycles?.[idx]?.confidence;
+    return { confidence: conf, index: idx };
+  } catch (err) {
+    return null;
+  }
+}
+
+function syncScoresCardToActiveFrame(frameIndex) {
+  const result = getActiveFrameConfidence(frameIndex);
+  if (result && result.confidence) {
+    lastReportedFrameIdx = result.index;
+    updateScoresCard(result.confidence, `Pass ${result.index + 1}`);
+  }
+}
+
+// Watch for animation playback changes (py2Dmol play button loop)
+setInterval(() => {
+  try {
+    if (!viewer) return;
+    const objName = viewerObject ?? viewer.currentObjectName;
+    const obj = viewer.objects?.find((entry) => entry.name === objName);
+    const objData = viewer.objectsData?.[objName];
+    const idx = obj?.currentFrame ?? objData?.currentFrame ?? viewer.currentFrame;
+    if (idx !== undefined && idx !== lastReportedFrameIdx) {
+      syncScoresCardToActiveFrame(idx);
+    }
+  } catch (e) {}
+}, 50);
+
+function updateScoresCard(confidence, passBadge = "") {
+  const box = document.getElementById("predictionScoresBox");
+  if (!box) return;
+  if (!confidence) {
+    box.style.display = "none";
+    return;
+  }
+  box.style.display = "flex";
+
+  const badge = document.getElementById("scoresPassBadge");
+  if (badge) badge.textContent = passBadge;
+
+  const meanPlddt = document.getElementById("metricMeanPlddt");
+  if (meanPlddt) {
+    meanPlddt.textContent = confidence.meanPlddt !== undefined
+      ? Number(confidence.meanPlddt).toFixed(1)
+      : "-";
+  }
+
+  const ptm = document.getElementById("metricPtm");
+  if (ptm) {
+    ptm.textContent = confidence.ptm !== undefined
+      ? Number(confidence.ptm).toFixed(3)
+      : "-";
+  }
+
+  const iptmCell = document.getElementById("metricIptmCell");
+  const iptm = document.getElementById("metricIptm");
+  if (iptmCell && iptm) {
+    if (confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm))) {
+      iptmCell.style.display = "block";
+      iptm.textContent = Number(confidence.iptm).toFixed(3);
+    } else {
+      iptmCell.style.display = "none";
+    }
+  }
+
+  const multimerCell = document.getElementById("metricMultimerCell");
+  const multimer = document.getElementById("metricMultimer");
+  if (multimerCell && multimer) {
+    const multimerScore = confidence.multimerScore ?? (
+      confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm)) && confidence.ptm !== undefined
+        ? 0.8 * Number(confidence.iptm) + 0.2 * Number(confidence.ptm)
+        : undefined
+    );
+    if (multimerScore !== undefined && !Number.isNaN(Number(multimerScore))) {
+      multimerCell.style.display = "block";
+      multimer.textContent = Number(multimerScore).toFixed(3);
+    } else {
+      multimerCell.style.display = "none";
+    }
+  }
 }
 
 let previousFold = undefined;
@@ -255,6 +380,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   frame.name = `recycle_${index}`;
   frame.label = `recycle_${index}`;
   frame.title = `recycle_${index}`;
+  frame.confidence = recycle.confidence;
   frame.pae = paeMatrix(recycle.confidence.predictedAlignedError, sequence.length);
   frame.pae_n = sequence.length;
   frame.align = true;
@@ -360,13 +486,17 @@ async function fold(event) {
     // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
     // first builds the object and the panels; the rest are frames on it.
     let firstPassLanded = undefined;
+    let initialLoadPromise = undefined;
     const onRecycle = (recycle, index) => {
       if (signal.aborted) return;
       const distance = index === 0 ? "" : ` · Δ ${recycle.recycleDistance.toFixed(2)} Å`;
-      status(`Pass ${index + 1} of ${passes}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}`);
+      const passText = `Pass ${index + 1} of ${passes}`;
+      const iptmText = recycle.confidence.iptm !== undefined ? ` · ipTM ${Number(recycle.confidence.iptm).toFixed(3)}` : "";
+      status(`${passText}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}${iptmText}`);
+      updateScoresCard(recycle.confidence, `${passText}${distance}`);
       if (index === 0) {
         firstPassLanded = alignedToPrevious(sequence, recycle.structure);
-        void loadIntoViewer({
+        initialLoadPromise = loadIntoViewer({
           stem,
           pdb: predictionToPdb(sequence, firstPassLanded, recycle.confidence.plddt, chainLengths),
           scores: confidenceJson(sequence, recycle.confidence),
@@ -374,6 +504,7 @@ async function fold(event) {
           chainLengths,
           pae: paeMatrix(recycle.confidence.predictedAlignedError, sequence.length),
           length: sequence.length,
+          confidence: recycle.confidence,
         });
       } else {
         appendPass(sequence, chainLengths, recycle, index, firstPassLanded);
@@ -419,23 +550,38 @@ async function fold(event) {
       scores: confidenceJson(sequence, final.confidence),
       a3m: alignment,
       chainLengths,
+      recycles: alignedRecycles,
     };
     predictions.set(stem, lastPrediction);
     // 🔴 A SAFETY NET, because the failure it catches is invisible. onRecycle is
     // optional the whole way down, so a model path that accepts the callback and
     // never calls it would produce a finished fold, a "Done" status and an empty
     // page. If nothing drew while the passes ran, draw them all now.
-    let stats;
-    if (viewer === undefined) stats = await loadIntoViewer(lastPrediction);
+    if (initialLoadPromise !== undefined) {
+      await initialLoadPromise;
+    } else if (viewer === undefined) {
+      await loadIntoViewer({
+        stem,
+        pdb: lastPrediction.pdb,
+        scores: lastPrediction.scores,
+        a3m: lastPrediction.a3m,
+        chainLengths: lastPrediction.chainLengths,
+        pae: paeMatrix(final.confidence.predictedAlignedError, sequence.length),
+        length: sequence.length,
+        confidence: final.confidence,
+      });
+    }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
+    updateScoresCard(final.confidence, `Final (Pass ${prediction.recycles.length})`);
     const took = ((performance.now() - started) / 1000).toFixed(1);
     const paired = viewer?.paeRenderer?.n > 0 ? " · PAE paired" : "";
     const converged = prediction.recycles.length < passes
       ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`
       : "";
+    const finalIptmText = final.confidence.iptm !== undefined ? ` · ipTM ${Number(final.confidence.iptm).toFixed(3)}` : "";
     status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`
-      + ` · pTM ${final.confidence.ptm.toFixed(3)}${converged}${paired}`);
+      + ` · pTM ${final.confidence.ptm.toFixed(3)}${finalIptmText}${converged}${paired}`);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");

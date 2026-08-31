@@ -44,3 +44,4 @@ describe("A3M model feature preprocessing", () => {
     expect(f64.extraMsa.length).toBe(128 * 59);
   }, 30_000);
 });
+
