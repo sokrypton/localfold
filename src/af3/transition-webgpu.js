@@ -61,6 +61,12 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
     let d = input[base + c] - mean;
     centered_total += d * d;
   }
+  // 🔴 A BARRIER BEFORE REUSING THE REDUCTION BUFFER. Every invocation has
+  // just read reduce_a[0] for the mean; writing reduce_a[local] without a
+  // barrier lets a fast lane clobber slot 0 while a slow one is still reading
+  // it. The result is a WRONG MEAN in some rows, some of the time - which
+  // reads as a numerical problem, not a race.
+  workgroupBarrier();
   reduce_a[local] = centered_total;
   workgroupBarrier();
   for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {

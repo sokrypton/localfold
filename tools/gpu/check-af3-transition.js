@@ -79,8 +79,15 @@ export async function main(device, args) {
     const input = deterministic(rows * channels, 31337 + channels);
     for (let index = 0; index < input.length; index += 1) input[index] *= scale;
     const expected = transition(input, rows, channels, weights, 4);
+    // 🔴 BOTH VARIANCE FORMULAS. The trunk uses "fast" and the diffusion and
+    // atom stacks use "two-pass", and for a long time only "fast" was checked -
+    // which is how a missing workgroupBarrier in the two-pass reduction went
+    // unnoticed until the diffusion conditioning tripped over it. An untested
+    // branch is an untested branch even when the tested one shares 90% of the
+    // shader.
+    const variance = option(args, "variance", "fast");
     const { output, elapsedMilliseconds, memory } = await runner.run(
-      input, { rows, channels, factor: 4 }, weights);
+      input, { rows, channels, factor: 4 }, weights, { variance });
     const relRms = relativeRms(output, expected);
     worst = Math.max(worst, relRms);
     results[track] = { relRms, ms: Number(elapsedMilliseconds.toFixed(2)),
