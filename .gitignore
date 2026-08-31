@@ -43,3 +43,6 @@ __pycache__/
 /toy-oracle-truncated-notmpl.json
 /toy-template.json
 /toy-triangle.json
+
+# The AF3 trunk oracle's dumps, written by tools/oracle/dump_af3_trunk.py.
+/af3-oracle*.json
