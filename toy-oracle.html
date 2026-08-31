@@ -24,7 +24,12 @@ const { AlphaFoldFixture } = await src('src/reference/alphafold-fixture.js');
 const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
 
 try {
-  const o = await fetch('./toy-oracle.json').then((r) => r.json());
+  const q = new URLSearchParams(location.search);
+  // ...the monomer control uses the monomer export and the monomer regime, so
+  // the same page answers "is this multimer's fault or ours in general?"
+  const family = q.get('family') ?? 'multimer';
+  const o = await fetch(family === 'monomer' ? './toy-oracle-monomer.json' : './toy-oracle.json')
+    .then((r) => r.json());
   const L = o.length;
   log(`toy complex: ${o.copies} chains x ${o.chainLength} = ${L} residues\n`);
 
@@ -61,9 +66,17 @@ try {
     msaSequences: 1, extraSequences: 1, targetChannels: 22, msaFeatureChannels: 49,
   }];
 
-  log('loading multimer weights…');
-  const manifest = await fetch('./model-multimer/manifest.json').then((r) => r.json());
-  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest('./model-multimer/', manifest));
+  // 🔴 int8 OR float32. The shipped weights are int8 with a float16 scale per
+  // 64, and the oracle ran float32 - so a few percent of difference could be
+  // quantisation rather than a bug, and that has to be ruled out before any of
+  // it is chased.
+  const dir = family === 'monomer' ? './model/'
+    : (q.get('weights') === 'f32' ? './model-multimer-f32/' : './model-multimer/');
+  log(`loading multimer weights from ${dir}…`);
+  const { DEFAULT_MANIFEST } = await src('src/reference/manifest.js');
+  const manifest = family === 'monomer' ? DEFAULT_MANIFEST
+    : await fetch(`${dir}manifest.json`).then((r) => r.json());
+  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(dir, manifest));
   const [embedding, extraStack, mainStack, structure, confidence, geometry, paeBreaks] =
     await Promise.all([
       fixture.embeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
@@ -76,8 +89,10 @@ try {
   const device = await getDevice();
   const prediction = await new AlphaFoldUnifiedGpu(device).predict(
     features, weights, paeBreaks, undefined, undefined,
-    { outerProductMeanFirst: true, positionScale: 20, templates: false,
-      chainLengths: [o.chainLength, o.chainLength] });
+    family === 'monomer'
+      ? { templates: false }
+      : { outerProductMeanFirst: true, positionScale: 20, templates: false,
+          chainLengths: [o.chainLength, o.chainLength] });
 
   const ours = prediction.final.structure.atom37;
   const theirs = Float64Array.from(o.ca);
@@ -96,6 +111,24 @@ try {
   log('');
   // pLDDT logits are a direct comparison; CA positions differ by a global rigid
   // motion, so their bond lengths are the comparable thing.
+  // BRACKET THE TRUNK FIRST. `pair` and `msa_first_row` are what the evoformer
+  // hands the structure module, so if they match, everything before them is
+  // right and the difference is downstream - and if they do not, nothing after
+  // them is worth looking at yet.
+  const compareRep = (name, theirsArr, oursArr) => {
+    let maxabs = 0, sumsq = 0, refsq = 0;
+    for (let i = 0; i < theirsArr.length; i += 1) {
+      const d = theirsArr[i] - oursArr[i];
+      maxabs = Math.max(maxabs, Math.abs(d)); sumsq += d * d; refsq += theirsArr[i] * theirsArr[i];
+    }
+    log(`  ${name.padEnd(22)} n=${String(theirsArr.length).padStart(6)}`
+      + `  maxabs ${maxabs.toExponential(3)}  relRMS ${Math.sqrt(sumsq / refsq).toExponential(2)}`);
+  };
+  log('the trunk, before the structure module:');
+  compareRep('pair', Float64Array.from(o.rep_pair), prediction.final.pair);
+  compareRep('msa first row', Float64Array.from(o.rep_msa_first_row), prediction.final.msaFirstRow);
+  log('');
+
   // 🔴 BOND LENGTHS ARE A WEAK CHECK. A completely wrong structure still has
   // ~3.8 A bonds, because they come from the ideal geometry rather than from
   // the model being right. Superposed RMSD is the real comparison.

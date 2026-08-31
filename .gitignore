@@ -32,3 +32,5 @@ __pycache__/
 
 # The toy oracle's dumped tensors, written by tools/oracle/dump_toy_multimer.py.
 /toy-oracle.json
+/model-multimer-f32
+/toy-oracle-monomer.json

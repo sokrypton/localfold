@@ -16,8 +16,13 @@ register_losses()
 from colabdesign2.af2.runner import AF2Runner
 
 PARAMS = "/Users/mini/Documents/GitHub/af-params/oracle"
-LENGTH = 8          # residues per chain - small enough to run on a CPU
-COPIES = 2
+LENGTH = int(os.environ.get("ORACLE_LENGTH", 8))   # small enough to run on a CPU
+COPIES = int(os.environ.get("ORACLE_COPIES", 2))
+# ...the same harness serves as the MONOMER control. If our monomer trunk
+# differs from JAX by as much as the multimer one does, the fault is in shared
+# code and has been there all along.
+MODEL = os.environ.get("ORACLE_MODEL", "alphafold2_multimer_v3")
+NAME = os.environ.get("ORACLE_NAME", "model_1_multimer_v3")
 
 spec = parse_contigs(":".join([str(LENGTH)] * COPIES)).resolve()
 inputs = featurize(spec, chain_break=None)
@@ -27,8 +32,8 @@ inputs["opt"] = {"weights": {}, "alpha": 2.0, "temp": 1.0, "soft": 1.0,
                  "con": {"num": 2, "cutoff": 14.0, "binary": False,
                          "seqsep": 9, "num_pos": float("inf")}}
 
-runner = AF2Runner(model_type="alphafold2_multimer_v3", data_dir=PARAMS,
-                   model_names=["model_1_multimer_v3"], use_bfloat16=False)
+runner = AF2Runner(model_type=MODEL, data_dir=PARAMS,
+                   model_names=[NAME], use_bfloat16=False)
 
 rng = np.random.default_rng(0)
 seq = np.zeros((1, LENGTH * COPIES, 20), np.float32)
@@ -38,6 +43,7 @@ for i in range(LENGTH * COPIES):
 out = runner.apply({"seq": jax.numpy.asarray(seq)}, inputs, jax.random.PRNGKey(0))
 
 print("output keys:", sorted(out.keys()))
+print("representations:", {k: np.asarray(v).shape for k, v in out["representations"].items()})
 model_inputs = out["inputs"]
 print("\nMODEL INPUTS the forward actually saw:")
 def walk(d, prefix=""):
@@ -72,11 +78,17 @@ wanted = ["msa_feat", "target_feat", "extra_msa_feat", "extra_msa", "extra_has_d
 payload = {"length": LENGTH * COPIES, "copies": COPIES, "chainLength": LENGTH}
 for name in wanted:
     payload[name] = np.asarray(model_inputs[name]).astype(np.float64).ravel().tolist()
+# ...the trunk's own outputs, which bracket it from the structure module.
+reps = out["representations"]
+payload["rep_pair"] = np.asarray(reps["pair"], np.float64).ravel().tolist()
+payload["rep_msa_first_row"] = np.asarray(reps["msa_first_row"], np.float64).ravel().tolist()
+payload["rep_single"] = np.asarray(reps["single"], np.float64).ravel().tolist()
 payload["distogram"] = dg.astype(np.float64).ravel().tolist()
 payload["plddt_logits"] = pl.astype(np.float64).ravel().tolist()
 payload["ca"] = ca.astype(np.float64).ravel().tolist()
 payload["shapes"] = {n: list(np.asarray(model_inputs[n]).shape) for n in wanted}
-out_path = "/Users/mini/Documents/GitHub/alphafold2-webgpu/toy-oracle.json"
+out_path = os.environ.get("ORACLE_OUT",
+    "/Users/mini/Documents/GitHub/alphafold2-webgpu/toy-oracle.json")
 with open(out_path, "w") as fh:
     json.dump(payload, fh)
 print("saved toy_multimer.npz and", out_path)
