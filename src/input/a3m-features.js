@@ -72,6 +72,29 @@ export function makeA3mFeatures(a3mText, tables,
     recycles: 0, chainLengths: options.chainLengths,
     maskedMsaCodes: [Float32Array.from(encoded.subarray(0, length))],
   })[0];
+  // 🔴 THE PROFILE OVER THE WHOLE ALIGNMENT, which BERT masking draws from.
+  // AF2 replaces a masked position from 0.1 uniform + 0.1 * msa_profile +
+  // 0.1 same + 0.7 mask, and the profile is taken over EVERY sequence, before
+  // any subsampling - so it is computed once here rather than per recycle.
+  const msaProfile = new Float32Array(length * 23);
+  for (let row = 0; row < depth; row += 1) {
+    for (let residue = 0; residue < length; residue += 1) {
+      msaProfile[residue * 23 + encoded[row * length + residue]] += 1;
+    }
+  }
+  for (let residue = 0; residue < length; residue += 1) {
+    for (let code = 0; code < 23; code += 1) msaProfile[residue * 23 + code] /= depth;
+  }
+  /** Draw a residue code from the alignment's profile at this position. */
+  const sampleProfile = (residue, uniform) => {
+    let cumulative = 0;
+    for (let code = 0; code < 23; code += 1) {
+      cumulative += msaProfile[residue * 23 + code];
+      if (uniform < cumulative) return code;
+    }
+    return 20;
+  };
+
   const recycles = options.recycles ?? 3;
   const maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth);
   const maxExtra = options.maxExtraSequences ?? MAX_EXTRA_SEQUENCES;
@@ -88,10 +111,16 @@ export function makeA3mFeatures(a3mText, tables,
     }
     for (let index = 0; index < centerCodes.length; index += 1) {
       if (random() >= 0.15) continue;
+      // 🔴 FOUR OUTCOMES, NOT THREE. This used to be 70% mask, 20% keep, 10%
+      // uniform - the profile draw was missing and its share had been folded
+      // into "keep", so a masked position was twice as likely to be left alone
+      // as AlphaFold leaves it, and never took a residue the alignment thought
+      // likely. AF2's own weights: 0.7 mask, 0.1 profile, 0.1 same, 0.1 uniform.
       const original = centerCodes[index]; const draw = random();
       if (draw < 0.7) centerCodes[index] = 22;
-      else if (draw >= 0.9) centerCodes[index] = Math.floor(random() * 20);
-      else centerCodes[index] = original;
+      else if (draw < 0.8) centerCodes[index] = sampleProfile(index % length, random());
+      else if (draw < 0.9) centerCodes[index] = original;
+      else centerCodes[index] = Math.floor(random() * 20);
     }
     const assignments = new Uint16Array(extras.length);
     for (let extraIndex = 0; extraIndex < extras.length; extraIndex += 1) {
