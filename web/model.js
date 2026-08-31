@@ -43,6 +43,30 @@ export function openStore(onProgress) {
   return storePromise;
 }
 
+let multimerStorePromise;
+
+/**
+ * The AF2-multimer weights, which are a separate download.
+ *
+ * 🔴 THEY ARE NOT PART OF THE SITE. model-multimer/ is written by
+ * tools/export_multimer_model.py and is another 97 MiB, so it is not deployed
+ * alongside the monomer weights - a checkout that has not built it gets a clear
+ * failure here rather than a page that half works. Its manifest is fetched
+ * rather than compiled in, because unlike the monomer's it is not a fixed
+ * artefact of this repository.
+ */
+export function openMultimerStore(onProgress) {
+  multimerStorePromise ??= (async () => {
+    const response = await fetch("./model-multimer/manifest.json");
+    if (!response.ok) {
+      throw new Error("No multimer weights: build them with tools/export_multimer_model.py"
+        + " and tools/quantize_model.py, then serve them at ./model-multimer/");
+    }
+    return HttpTensorStore.fromManifest("./model-multimer/", await response.json(), onProgress);
+  })();
+  return multimerStorePromise;
+}
+
 let devicePromise;
 
 /** The WebGPU device, with the optional features the fast paths look for. */
@@ -87,20 +111,28 @@ const loaded = new Map();
  * @param {"single"|"msa"} variant which inference path the weights are for
  * @param {(p: {loadedBytes: number, totalBytes: number}) => void} [onProgress]
  */
-export function loadModel(variant, onProgress, signal = undefined) {
+export function loadModel(variant, onProgress, signal = undefined, family = "monomer") {
   if (variant !== "single" && variant !== "msa") {
     throw new RangeError(`unknown model variant ${variant}: expected "single" or "msa"`);
   }
-  const cached = loaded.get(variant);
+  if (family !== "monomer" && family !== "multimer") {
+    throw new RangeError(`unknown model family ${family}: expected "monomer" or "multimer"`);
+  }
+  const key = `${family}:${variant}`;
+  const cached = loaded.get(key);
   if (cached !== undefined) return withAbort(cached, signal);
   const pending = (async () => {
-    const store = await openStore(onProgress);
+    const multimer = family === "multimer";
+    const store = await (multimer ? openMultimerStore(onProgress) : openStore(onProgress));
     const fixture = AlphaFoldFixture.fromStore(store);
     const extraStackWeights = variant === "msa"
       ? fixture.extraStackWeights() : fixture.extraPairStackWeights();
+    // ...no template embedder in a multimer export: multimer's is architecturally
+    // different from the monomer's, so the fold runs template-free.
+    const templateWeights = multimer ? Promise.resolve(undefined) : fixture.templateWeights();
     const [embedding, template, extraStack, mainStack, structure, confidence, geometry,
       featureTables, paeBreaks] = await Promise.all([
-      fixture.embeddingWeights(), fixture.templateWeights(), extraStackWeights,
+      fixture.embeddingWeights(), templateWeights, extraStackWeights,
       fixture.mainStackWeights(), fixture.structureWeights(), fixture.confidenceWeights(),
       fixture.geometryTables(), fixture.queryOnlyFeatureTables(), fixture.tensor("confidencePaeBreaks"),
     ]);
@@ -113,6 +145,6 @@ export function loadModel(variant, onProgress, signal = undefined) {
       },
     };
   })();
-  loaded.set(variant, pending);
+  loaded.set(key, pending);
   return withAbort(pending, signal);
 }

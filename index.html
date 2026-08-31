@@ -141,6 +141,19 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   title="Random seed for MSA subsampling and masking (0 is default)">
               </div>
 
+              <!-- WHICH SET OF WEIGHTS. Auto picks multimer as soon as the
+                   sequence has more than one chain, which is the only thing
+                   that distinguishes the two cases in practice; the explicit
+                   settings are there to fold the same input both ways. -->
+              <div class="fetch-option-group">
+                <span class="fetch-option-title">Model</span>
+                <select id="model-family" title="AlphaFold weights: monomer, or multimer for complexes">
+                  <option value="auto" selected>Auto</option>
+                  <option value="monomer">Monomer</option>
+                  <option value="multimer">Multimer</option>
+                </select>
+              </div>
+
               <!-- MSA options on the right of the row -->
               <div class="fetch-option-group" id="msaModeGroup" hidden>
                 <span class="fetch-option-title">Alignment</span>

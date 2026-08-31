@@ -57,6 +57,20 @@ const maxMsaConfig = () => {
   const maxExtraSequences = Number.isFinite(extraPart) && extraPart >= 0 ? extraPart : 1024;
   return { maxMsaSequences, maxExtraSequences };
 };
+/**
+ * Which weights to fold with: monomer, multimer, or let the sequence decide.
+ *
+ * Auto is chain count and nothing else. That is the whole distinction in
+ * practice - a single chain has no interface to predict, and a complex is what
+ * multimer was trained for - and the explicit settings exist to fold the same
+ * input both ways rather than to be reached for routinely.
+ */
+const modelFamily = (chainCount) => {
+  const choice = document.getElementById("model-family")?.value ?? "auto";
+  if (choice === "monomer" || choice === "multimer") return choice;
+  return chainCount > 1 ? "multimer" : "monomer";
+};
+
 const msaMode = () => {
   const msaToggle = document.getElementById("useMsaToggle");
   if (msaToggle !== null && !msaToggle.checked) return "single";
@@ -500,13 +514,19 @@ async function fold(event) {
     status("Starting WebGPU");
     const device = await getDevice();
     throwIfAborted(signal);
-    const variant = alignment === null ? "single" : "msa";
+    const family = modelFamily(chains.length);
+    // 🔴 MULTIMER ALWAYS TAKES THE A3M DRIVER, even with no alignment. The
+    // query-only path is a separate graph that knows nothing about the multimer
+    // regime, so selecting multimer there loaded the right weights and ran the
+    // WRONG graph - silently, with a plausible number at the end of it. A
+    // single sequence becomes a one-row alignment instead.
+    const variant = alignment === null && family !== "multimer" ? "single" : "msa";
     const model = await loadModel(variant, (value) => {
       if (signal.aborted) return;
       progress(value.totalBytes === 0 ? 0 : value.loadedBytes / value.totalBytes);
       status(`Loading model · ${(value.loadedBytes / 1048576).toFixed(0)}`
         + ` / ${(value.totalBytes / 1048576).toFixed(0)} MiB`);
-    }, signal);
+    }, signal, family);
     throwIfAborted(signal);
     progress(null);
     const recycles = recycleCount();
@@ -531,7 +551,7 @@ async function fold(event) {
     viewer = undefined;
     viewerObject = undefined;
     status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
-      + ` · ${passes} pass${passes === 1 ? "" : "es"}`);
+      + ` · ${passes} pass${passes === 1 ? "" : "es"} · ${family}`);
 
     // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
     // first builds the object and the panels; the rest are frames on it.
@@ -584,19 +604,32 @@ async function fold(event) {
     // matters once per-chain sampling has put two proteins in one row.
     const maskRowAttentionAcrossChains =
       new URLSearchParams(location.search).get("rowmask") === "on";
-    const prediction = alignment === null
+    // 🔴 THE MULTIMER REGIME IS THREE FACTS, and they travel together. Multimer
+    // runs the outer product mean at the top of each block, works in units of
+    // 20 angstroms rather than 10, and reads chain identity - asym, entity and
+    // symmetry - where the monomer reads only a residue index. Its export
+    // carries no template embedder, so the residual is skipped too.
+    const multimer = family === "multimer";
+    const regime = multimer
+      ? { outerProductMeanFirst: true, positionScale: 20, templates: false,
+        chainAware: true, chainSequences: chains }
+      : {};
+    // ...?graph=unified runs the MONOMER weights through src/multimer/ instead.
+    // With its switches off that graph reproduces the monomer one bit for bit,
+    // which is the check that the superset is right; a difference is a graph
+    // bug rather than a weights bug.
+    const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
+    const alignmentForDriver = alignment === null && multimer
+      ? `>query\n${sequence}\n` : alignmentForModel;
+    const prediction = alignment === null && !multimer
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
         { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress)
-      // 🔴 ?graph=unified RUNS THE SAME WEIGHTS THROUGH src/multimer/. With its
-      // switches off that graph must reproduce this one exactly - which is the
-      // check that says the superset is right before any multimer weight
-      // exists. A difference here is a graph bug, not a weights bug.
-      : await new (new URLSearchParams(location.search).get("graph") === "unified"
-        ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
-        alignmentForModel, model.weights, model.featureTables,
+      : await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
+        alignmentForDriver, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress);
+          maskInterChainCovariance, maskRowAttentionAcrossChains, ...regime },
+        model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;
