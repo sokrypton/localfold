@@ -70,7 +70,13 @@ export async function main(device, args) {
     outputProjection: await layer("single_attention_transition2/weights"),
   };
 
+  // 🔴 THE SINGLE REPRESENTATION IS NOT ORDER 1 IN A REAL RUN. It reaches
+  // ~19,000 after four pairformer blocks and ~169,000 through the trunk, so a
+  // kernel checked only at order 1 is checked in a regime the model never
+  // occupies.
+  const scale = Number(option(args, "scale", "1"));
   const single = deterministic(n * CHANNELS, 5150 + n);
+  for (let index = 0; index < single.length; index += 1) single[index] *= scale;
   const pairLogits = deterministic(HEADS * n * n, 77 + n);
   // 🔴 RAGGED. The mask term is additive and finite here; with an all-ones mask
   // it vanishes and a kernel that drops it entirely still passes.

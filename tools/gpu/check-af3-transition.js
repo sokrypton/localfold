@@ -73,7 +73,11 @@ export async function main(device, args) {
       transition1: await layer(`${leaf}/transition1/weights`),
       transition2: await layer(`${leaf}/transition2/weights`),
     };
+    // The single track reaches ~19,000 after four blocks and ~169,000 through
+    // the trunk, so check the transition in that regime too, not only at order 1.
+    const scale = Number(option(args, "scale", "1"));
     const input = deterministic(rows * channels, 31337 + channels);
+    for (let index = 0; index < input.length; index += 1) input[index] *= scale;
     const expected = transition(input, rows, channels, weights, 4);
     const { output, elapsedMilliseconds, memory } = await runner.run(
       input, { rows, channels, factor: 4 }, weights);

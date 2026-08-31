@@ -15,6 +15,8 @@ const MSA_STACK = `${EVO}/__layer_stack_no_per_layer/msa_stack`;
 const PAIRFORMER = `${EVO}/__layer_stack_no_per_layer_1/trunk_pairformer`;
 const TEMPLATE = `${EVO}/template_embedding`;
 const TEMPLATE_SINGLE = `${TEMPLATE}/single_template_embedding`;
+const CONFIDENCE = "diffuser/confidence_head";
+const CONFIDENCE_STACK = `${CONFIDENCE}/__layer_stack_no_per_layer/confidence_pairformer`;
 const TEMPLATE_STACK =
   `${TEMPLATE_SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
 
@@ -177,6 +179,56 @@ export async function pairformerBlockWeights(store, index) {
 
 export async function distogramWeights(store) {
   return { halfLogits: await store.tensor("diffuser/distogram_head/half_logits/weights") };
+}
+
+export async function confidenceWeights(store) {
+  const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
+  const blocks = [];
+  for (let index = 0; index < 4; index += 1) {
+    const at = (leaf) => layer(store, `${CONFIDENCE_STACK}/${leaf}`, index);
+    blocks.push({
+      pairChannels: 128, singleChannels: 384,
+      ...(await pairTrack(store, CONFIDENCE_STACK, index, 4, 32)),
+      singlePairLogitsNormScale: await at("single_pair_logits_norm/scale"),
+      singlePairLogitsNormOffset: await at("single_pair_logits_norm/offset"),
+      singlePairLogitsProjection: await at("single_pair_logits_projection/weights"),
+      singleAttention: {
+        heads: 16, dimension: 24,
+        layerNormScale: await at("single_attention_layer_norm/scale"),
+        layerNormOffset: await at("single_attention_layer_norm/offset"),
+        qProjection: await at("single_attention_q_projection/weights"),
+        qBias: await at("single_attention_q_projection/bias"),
+        kProjection: await at("single_attention_k_projection/weights"),
+        vProjection: await at("single_attention_v_projection/weights"),
+        gatingQuery: await at("single_attention_gating_query/weights"),
+        outputProjection: await at("single_attention_transition2/weights"),
+      },
+      singleTransition: {
+        inputLayerNormScale: await at("single_transition/input_layer_norm/scale"),
+        inputLayerNormOffset: await at("single_transition/input_layer_norm/offset"),
+        transition1: await at("single_transition/transition1/weights"),
+        transition2: await at("single_transition/transition2/weights"),
+      },
+    });
+  }
+  return {
+    pairChannels: 128, singleChannels: 384, targetFeatWidth: 447, blocks,
+    leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
+    rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
+    distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
+    logitsLnScale: await T("logits_ln/scale"),
+    logitsLnOffset: await T("logits_ln/offset"),
+    leftHalfDistanceLogits: await T("left_half_distance_logits/weights"),
+    paeLogitsLnScale: await T("pae_logits_ln/scale"),
+    paeLogitsLnOffset: await T("pae_logits_ln/offset"),
+    paeLogits: await T("pae_logits/weights"),
+    plddtLnScale: await T("plddt_logits_ln/scale"),
+    plddtLnOffset: await T("plddt_logits_ln/offset"),
+    plddtLogits: await T("plddt_logits/weights"),
+    resolvedLnScale: await T("experimentally_resolved_ln/scale"),
+    resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
+    experimentallyResolvedLogits: await T("experimentally_resolved_logits/weights"),
+  };
 }
 
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */

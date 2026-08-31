@@ -130,9 +130,14 @@ export async function main(device, args) {
   for (let i = 0; i < n; i += 1) {
     for (let j = 0; j < n; j += 1) pairMask[i * n + j] = sequence[i] * sequence[j];
   }
+  // The confidence head feeds this stack a pair of std ~6 rather than ~0.6, so
+  // the scale is a knob here too.
+  const pairScale = Number(option(args, "pair-scale", "1"));
+  const scaledPair = deterministic(n * n * 128, 4242 + n);
+  for (let index = 0; index < scaledPair.length; index += 1) scaledPair[index] *= pairScale;
   const state = {
     tokens: n,
-    pair: deterministic(n * n * 128, 4242 + n),
+    pair: scaledPair,
     single: deterministic(n * 384, 8484 + n),
     pairMask, seqMask: sequence,
   };
