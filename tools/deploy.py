@@ -30,10 +30,8 @@ import time
 import urllib.error
 import urllib.request
 
-REPOSITORY = "sokrypton/localfold"
 WORKFLOW = "Deploy WebGPU demo"
 BRANCH = "main"
-SITE = "https://sokrypton.github.io/localfold"
 # Pages serves from a CDN that holds a build briefly after it is published.
 POLL_SECONDS = 10
 DEPLOY_TIMEOUT_SECONDS = 900
@@ -44,10 +42,26 @@ def run(command: list[str], **kwargs) -> str:
     return result.stdout.strip()
 
 
-def live_build() -> dict | None:
+def repository() -> str:
+    """owner/name, from the origin remote rather than a constant.
+
+    A hardcoded owner is wrong in every clone but one, and wrong quietly: it
+    would push here and then poll someone else's site for the commit.
+    """
+    url = run(["git", "remote", "get-url", "origin"])
+    path = url.split("github.com", 1)[-1].lstrip(":/")
+    return path.removesuffix(".git")
+
+
+def site(owner_and_name: str) -> str:
+    owner, name = owner_and_name.split("/", 1)
+    return f"https://{owner}.github.io/{name}"
+
+
+def live_build(site_url: str) -> dict | None:
     """What the deployed site says it is, or None if it does not say."""
     request = urllib.request.Request(
-        f"{SITE}/build.json?t={int(time.time())}",
+        f"{site_url}/build.json?t={int(time.time())}",
         headers={"Cache-Control": "no-cache"},
     )
     try:
@@ -57,10 +71,10 @@ def live_build() -> dict | None:
         return None
 
 
-def report_live() -> int:
-    build = live_build()
+def report_live(site_url: str) -> int:
+    build = live_build(site_url)
     if build is None:
-        print(f"{SITE}/build.json is not being served."
+        print(f"{site_url}/build.json is not being served."
               " Either the site predates the build stamp, or nothing is deployed.")
         return 1
     print(f"live: {build['commit'][:8]}  built {build.get('builtAt', 'at an unknown time')}")
@@ -83,8 +97,10 @@ def main() -> int:
                         help="report what the site is serving and stop")
     arguments = parser.parse_args()
 
+    name = repository()
+    site_url = site(name)
     if arguments.verify:
-        return report_live()
+        return report_live(site_url)
 
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
     if branch != BRANCH:
@@ -96,31 +112,31 @@ def main() -> int:
     head = run(["git", "rev-parse", "HEAD"])
 
     if arguments.dry_run:
-        print(f"would push {head[:8]} to origin/{BRANCH},"
-              f" dispatch {WORKFLOW!r}, and wait for {SITE} to serve it")
-        return report_live()
+        print(f"would push {head[:8]} to origin/{BRANCH} ({name}),"
+              f" dispatch {WORKFLOW!r}, and wait for {site_url} to serve it")
+        return report_live(site_url)
 
     print(f"pushing {head[:8]}…")
     subprocess.run(["git", "push", "origin", BRANCH], check=True)
 
     # ...dispatched EXPLICITLY, because the push did not do it and will not.
     print(f"dispatching {WORKFLOW!r}…")
-    subprocess.run(["gh", "workflow", "run", WORKFLOW, "-R", REPOSITORY, "--ref", BRANCH],
+    subprocess.run(["gh", "workflow", "run", WORKFLOW, "-R", name, "--ref", BRANCH],
                    check=True)
 
     print("waiting for the site to serve it…")
     deadline = time.monotonic() + DEPLOY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        build = live_build()
+        build = live_build(site_url)
         if build is not None and build["commit"] == head:
             print(f"live: {head[:8]}  built {build.get('builtAt')}")
             return 0
         time.sleep(POLL_SECONDS)
 
-    print(f"{DEPLOY_TIMEOUT_SECONDS}s passed and {SITE} is still not serving {head[:8]}.",
-          file=sys.stderr)
-    report_live()
-    print(f"check the run: gh run list -R {REPOSITORY}", file=sys.stderr)
+    print(f"{DEPLOY_TIMEOUT_SECONDS}s passed and {site_url} is still not serving"
+          f" {head[:8]}.", file=sys.stderr)
+    report_live(site_url)
+    print(f"check the run: gh run list -R {name}", file=sys.stderr)
     return 1
 
 
