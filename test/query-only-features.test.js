@@ -45,4 +45,21 @@ describe("query-only feature construction", () => {
       expect(errorMetrics(actual.atom37Mask, await fixture.tensor(`feature_atom37_atom_exists_recycle${recycle}`)).maxAbsoluteError).toBe(0);
     }
   });
+
+  it("leaves residues unmasked when randomMasking is disabled", async() => {
+    const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open(MANIFEST));
+    const generated = makeQueryOnlyFeatures("ACDEF", await fixture.queryOnlyFeatureTables(), {
+      recycles: 2, randomMasking: false,
+    });
+    expect(generated.length).toBe(3);
+    for (const pass of generated) {
+      // Residues A, C, D, E, F correspond to aatypes 0, 4, 3, 6, 13
+      const expectedAatype = [0, 4, 3, 6, 13];
+      for (let r = 0; r < 5; r += 1) {
+        const code = expectedAatype[r];
+        expect(pass.msaFeatures[r * 49 + code]).toBe(1);
+        expect(pass.msaFeatures[r * 49 + 22]).toBe(0); // mask token 22 is never set
+      }
+    }
+  });
 });

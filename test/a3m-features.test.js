@@ -26,4 +26,21 @@ describe("A3M model feature preprocessing", () => {
     expect(features.msaMask.every((value) => value === 1)).toBe(true);
     expect(features.extraMsaMask.every((value) => value === 1)).toBe(true);
   }, 30_000);
+
+  it("subsamples MSA depth to user-specified cluster and extra limits", async() => {
+    const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open("test/fixtures/evoformer/model1-query-59-stack/manifest.json"));
+    const text = await readFile("test.a3m", "utf8");
+    const tables = await fixture.queryOnlyFeatureTables();
+    const f256 = makeA3mFeatures(text, tables, { recycles: 0, maxMsaSequences: 256, maxExtraSequences: 512 })[0];
+    expect(f256.msaSequences).toBe(256);
+    expect(f256.extraSequences).toBe(512);
+    expect(f256.msaFeatures.length).toBe(256 * 59 * 49);
+    expect(f256.extraMsa.length).toBe(512 * 59);
+
+    const f64 = makeA3mFeatures(text, tables, { recycles: 0, maxMsaSequences: 64, maxExtraSequences: 128 })[0];
+    expect(f64.msaSequences).toBe(64);
+    expect(f64.extraSequences).toBe(128);
+    expect(f64.msaFeatures.length).toBe(64 * 59 * 49);
+    expect(f64.extraMsa.length).toBe(128 * 59);
+  }, 30_000);
 });

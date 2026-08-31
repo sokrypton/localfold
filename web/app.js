@@ -28,6 +28,8 @@ import { splitComplexA3mByChain } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { getDevice, loadModel } from "./model.js";
+import { correspondence } from "./align.js";
+import { superposeOnto } from "./morph.js";
 import { confidenceJson, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName } from "./prediction-results.js";
 import { cleanSequence, complexSequenceProblem, extractFastaHeader, sequenceChains } from "./sequence.js";
 
@@ -46,7 +48,19 @@ const randomSeed = () => {
   const parsed = Number(input.value);
   return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
 };
-const msaMode = () => element("msa-mode").value;
+const maxMsaConfig = () => {
+  const select = document.getElementById("max-msa");
+  const value = select ? select.value : "512:1024";
+  const [msaPart, extraPart] = value.split(":").map((part) => Number(part.trim()));
+  const maxMsaSequences = Number.isFinite(msaPart) && msaPart > 0 ? (msaPart === 512 ? 508 : msaPart) : 508;
+  const maxExtraSequences = Number.isFinite(extraPart) && extraPart >= 0 ? extraPart : 1024;
+  return { maxMsaSequences, maxExtraSequences };
+};
+const msaMode = () => {
+  const msaToggle = document.getElementById("useMsaToggle");
+  if (msaToggle !== null && !msaToggle.checked) return "single";
+  return element("msa-mode").value;
+};
 
 let uploadedA3m = "";
 let predictionCount = 0;
@@ -191,6 +205,32 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, lengt
   return stats;
 }
 
+let previousFold = undefined;
+
+function alignedToPrevious(sequence, structure) {
+  const api = window.py2Dmol;
+  if (api?.superpose === undefined || previousFold === undefined) return structure;
+  try {
+    const pairing = correspondence(sequence, previousFold.sequence);
+    if (pairing.from.length < 3) return structure;
+    return superposeOnto(api, structure, previousFold.structure, sequence.length, pairing);
+  } catch (error) {
+    console.warn("superposition skipped:", error);
+    return structure;
+  }
+}
+
+function alignedToFirstPass(sequence, structure, firstPassStructure) {
+  const api = window.py2Dmol;
+  if (api?.superpose === undefined || firstPassStructure === undefined) return structure;
+  try {
+    return superposeOnto(api, structure, firstPassStructure, sequence.length);
+  } catch (error) {
+    console.warn("recycle superposition skipped:", error);
+    return structure;
+  }
+}
+
 /**
  * Append one finished pass to the structure already on screen.
  *
@@ -205,10 +245,11 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, lengt
  * The per-pass PAE rides on the frame, which is where py2Dmol looks for it
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
-function appendPass(sequence, chainLengths, recycle, recycleIndex) {
+function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined) {
   const api = window.py2Dmol;
   if (viewer === undefined || viewerObject === undefined || api?.frameFromText === undefined) return;
-  const pdb = predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt, chainLengths);
+  const aligned = alignedToFirstPass(sequence, recycle.structure, firstPassStructure);
+  const pdb = predictionToPdb(sequence, aligned, recycle.confidence.plddt, chainLengths);
   const frame = api.frameFromText(pdb);
   const index = recycleIndex ?? (viewer?.objectsData?.[viewerObject]?.frames?.length ?? 1);
   frame.name = `recycle_${index}`;
@@ -216,6 +257,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex) {
   frame.title = `recycle_${index}`;
   frame.pae = paeMatrix(recycle.confidence.predictedAlignedError, sequence.length);
   frame.pae_n = sequence.length;
+  frame.align = true;
   viewer.addFrame(frame, viewerObject);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
@@ -317,14 +359,16 @@ async function fold(event) {
 
     // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
     // first builds the object and the panels; the rest are frames on it.
+    let firstPassLanded = undefined;
     const onRecycle = (recycle, index) => {
       if (signal.aborted) return;
       const distance = index === 0 ? "" : ` · Δ ${recycle.recycleDistance.toFixed(2)} Å`;
       status(`Pass ${index + 1} of ${passes}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}`);
       if (index === 0) {
+        firstPassLanded = alignedToPrevious(sequence, recycle.structure);
         void loadIntoViewer({
           stem,
-          pdb: predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt, chainLengths),
+          pdb: predictionToPdb(sequence, firstPassLanded, recycle.confidence.plddt, chainLengths),
           scores: confidenceJson(sequence, recycle.confidence),
           a3m: alignment,
           chainLengths,
@@ -332,7 +376,7 @@ async function fold(event) {
           length: sequence.length,
         });
       } else {
-        appendPass(sequence, chainLengths, recycle, index);
+        appendPass(sequence, chainLengths, recycle, index, firstPassLanded);
       }
     };
     const runProgress = ({ completed, total, waiting }) => {
@@ -348,19 +392,30 @@ async function fold(event) {
       status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`);
     };
 
+    const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
     const prediction = alignment === null
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
         { recycles, randomSeed: seed, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress)
       : await new AlphaFoldMonomerGpu(device).predictA3m(
         alignment, model.weights, model.featureTables,
-        { recycles, randomSeed: seed, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress);
+        { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;
+    const alignedRecycles = prediction.recycles.map((r, i) => ({
+      structure: i === 0 ? (firstPassLanded ?? r.structure) : alignedToFirstPass(sequence, r.structure, firstPassLanded),
+      confidence: r.confidence,
+      recycleDistance: r.recycleDistance,
+    }));
+    const finalLanded = alignedRecycles[alignedRecycles.length - 1].structure;
+    previousFold = {
+      sequence,
+      structure: finalLanded,
+    };
     lastPrediction = {
       stem,
-      pdb: recyclesToPdb(sequence, prediction.recycles, chainLengths),
+      pdb: recyclesToPdb(sequence, alignedRecycles, chainLengths),
       scores: confidenceJson(sequence, final.confidence),
       a3m: alignment,
       chainLengths,
@@ -438,31 +493,30 @@ const PRIVACY_NOTE = {
 };
 
 const syncMode = () => {
-  element("msa-text").hidden = modeSelect.value !== "paste";
-  element("msa-file").hidden = modeSelect.value !== "upload";
   const msaToggle = document.getElementById("useMsaToggle");
-  if (msaToggle !== null) {
-    msaToggle.checked = modeSelect.value !== "single";
+  const isMsa = msaToggle !== null ? msaToggle.checked : true;
+  const msaModeGroup = document.getElementById("msaModeGroup");
+  if (msaModeGroup !== null) {
+    msaModeGroup.hidden = !isMsa;
   }
+  const maxMsaGroup = document.getElementById("maxMsaGroup");
+  if (maxMsaGroup !== null) {
+    maxMsaGroup.hidden = !isMsa;
+  }
+  element("msa-text").hidden = !isMsa || modeSelect.value !== "paste";
+  element("msa-file").hidden = !isMsa || modeSelect.value !== "upload";
   // ...getElementById rather than element(), which throws on a missing id: the
   // note is index.html's and this file should not require it to exist.
   const note = document.getElementById("privacy-note");
   if (note !== null) {
-    note.innerHTML = modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
+    note.innerHTML = isMsa && modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
   }
 };
 modeSelect.addEventListener("change", syncMode);
 
 const msaToggle = document.getElementById("useMsaToggle");
 if (msaToggle !== null) {
-  msaToggle.addEventListener("change", () => {
-    if (msaToggle.checked) {
-      if (modeSelect.value === "single") modeSelect.value = "search";
-    } else {
-      modeSelect.value = "single";
-    }
-    syncMode();
-  });
+  msaToggle.addEventListener("change", syncMode);
 }
 syncMode();
 

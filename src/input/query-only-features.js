@@ -32,8 +32,8 @@ function maskedCodes(aatype, recycle, seed) {
  * Construct model-1 query-only tensors directly from an amino-acid sequence.
  * @param {string} sequenceValue concatenated chain sequences
  * @param {{atom37ToAtom14: Float32Array, atom37Mask: Float32Array}} tables
- * @param {{recycles?: number, randomSeed?: number, maskedMsaCodes?: readonly Float32Array[],
- *   chainLengths?: readonly number[], tolerance?: number}} [options]
+ * @param {{recycles?: number, randomSeed?: number, randomMasking?: boolean, masking?: boolean,
+ *   maskedMsaCodes?: readonly Float32Array[], chainLengths?: readonly number[], tolerance?: number}} [options]
  */
 export function makeQueryOnlyFeatures(
   sequenceValue,
@@ -66,9 +66,11 @@ export function makeQueryOnlyFeatures(
   if (options.maskedMsaCodes !== undefined && options.maskedMsaCodes.length !== recycles + 1) {
     throw new RangeError("maskedMsaCodes must contain one row per recycling iteration");
   }
+  const useMasking = options.randomMasking ?? options.masking ?? true;
   const result = [];
   for (let recycle = 0; recycle <= recycles; recycle += 1) {
-    const codes = options.maskedMsaCodes?.[recycle] ?? maskedCodes(aatype, recycle, options.randomSeed ?? 0);
+    const codes = options.maskedMsaCodes?.[recycle]
+      ?? (useMasking ? maskedCodes(aatype, recycle, options.randomSeed ?? 0) : aatype);
     if (codes.length !== length) throw new RangeError(`masked MSA row ${recycle} has the wrong length`);
     const msaFeatures = new Float32Array(length * 49);
     for (let residue = 0; residue < length; residue += 1) {

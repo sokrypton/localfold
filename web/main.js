@@ -23,6 +23,10 @@ const randomSeed = () => {
   const parsed = Number(input.value);
   return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
 };
+const randomMasking = () => {
+  const input = document.getElementById("random-masking");
+  return input ? input.checked : false;
+};
 
 let currentPdb = "";
 let currentScores = "";
@@ -319,6 +323,7 @@ async function fold(event) {
         recycles: recycleCount(),
         tolerance,
         randomSeed: seed,
+        randomMasking: randomMasking(),
         chainLengths,
         signal,
       },
@@ -348,7 +353,6 @@ async function fold(event) {
     currentPdb = recyclesToPdb(sequence, prediction.recycles, chainLengths);
     currentScores = confidenceJson(sequence, prediction.final.confidence);
     restoreSelection();
-
     const took = `${((performance.now() - started) / 1000).toFixed(1)} s`;
     const converged = prediction.recycles.length < passes
       ? ` · converged at ${prediction.final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`

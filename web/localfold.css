@@ -42,6 +42,20 @@
 .fold-option-wide { flex-basis: 100%; }
 .fold-option-wide:not(:has(> *:not([hidden]))) { display: none; }
 
+/* Keep option groups in a single row; push MSA options to the right */
+#foldOptions > .fetch-option-group {
+  flex-shrink: 0;
+}
+
+#msaModeGroup {
+  margin-left: auto;
+  border-left: 1px solid #e5e7eb;
+  padding-left: 16px;
+}
+#msaModeGroup[hidden], #maxMsaGroup[hidden] {
+  display: none !important;
+}
+
 #msa-text {
   box-sizing: border-box;
   width: 100%;
