@@ -129,19 +129,27 @@ export class HttpTensorStore {
     return this.fromManifest(manifestUrl, manifest, onProgress);
   }
   /**
-   * @param {string} [shardQuery] a `?v=...` appended to every shard URL. The
-   *   manifest is small enough to cache-bust on every load, the shards are not,
-   *   and a re-export that pairs fresh manifest with a browser-cached shard
-   *   fails as "invalid byte length" - which names neither half. Dev harnesses
-   *   pass a token here; the shipped page leaves it empty so the shards cache.
+   * 🔴 SHARD URLS CARRY THE EXPORT'S IDENTITY. A manifest is small enough to
+   * fetch fresh every load; a shard is not, and lives in the browser's cache
+   * for as long as its headers allow. Re-export the model and the two disagree
+   * - a fresh manifest against a cached shard - which surfaces as
+   * "<file> has an invalid byte length", naming neither half. Three separate
+   * hours have gone into that message.
+   *
+   * The token is the same one the shard Cache is keyed on, so the URL changes
+   * exactly when the export changes: still cached across loads, never stale
+   * across exports. Pass "" to address the bare filenames.
+   *
+   * @param {string} [shardQuery]
    */
-  static async fromManifest(manifestUrlValue, manifest, onProgress = undefined, shardQuery = "") {
+  static async fromManifest(manifestUrlValue, manifest, onProgress = undefined,
+    shardQuery = undefined) {
     const manifestUrl = manifestUrlValue instanceof URL
       ? manifestUrlValue
       : new URL(manifestUrlValue, typeof location !== "undefined" ? location.href : "http://localhost/");
     if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
     const store = new HttpTensorStore(manifestUrl, manifest, onProgress,
-      await openShardCache(manifest), shardQuery);
+      await openShardCache(manifest), shardQuery ?? `?v=${cacheToken(manifest)}`);
     store.#reportProgress();
     return store;
   }

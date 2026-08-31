@@ -84,11 +84,7 @@ try {
   // with fresh shards fails as "invalid byte length", which names neither.
   const manifest = family === 'monomer' ? DEFAULT_MANIFEST
     : await fetch(`${dir}manifest.json?v=${Date.now()}`).then((r) => r.json());
-  // ...and the shards are busted on the export's identity, so re-exporting
-  // cannot pair a fresh manifest with a browser-cached shard.
-  const shardQuery = `?v=${manifest.bundle?.bytes ?? 0}-${Object.keys(manifest.tensors).length}`;
-  const fixture = AlphaFoldFixture.fromStore(
-    await HttpTensorStore.fromManifest(dir, manifest, undefined, shardQuery));
+  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(dir, manifest));
   const [embedding, extraStack, mainStack, structure, confidence, geometry, paeBreaks] =
     await Promise.all([
       fixture.embeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
