@@ -1,0 +1,74 @@
+<!doctype html><meta charset="utf-8"><title>chain geometry</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * ARE THE COPIES ACTUALLY SEPARATE OBJECTS?
+ *
+ * A complex whose chains sit on top of each other is a model that was never
+ * told they were different chains. Scores hide that - a collapsed assembly can
+ * still report a middling pLDDT - so this measures the geometry directly:
+ * where each chain's centre of mass is, how far apart they are, and how big
+ * each chain is. Chains that overlap have centre distances near zero while
+ * their own radii are ~15 A.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice, loadModel } = await src('web/model.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { mergeChainA3ms } = await src('src/input/chains.js');
+const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+const COPIES = Number(new URLSearchParams(location.search).get('copies') ?? 3);
+
+const CA = 1, ATOMS = 37;
+function chainStats(atom37, lengths) {
+  const stats = [];
+  let start = 0;
+  for (const n of lengths) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let r = start; r < start + n; r += 1) {
+      const b = (r * ATOMS + CA) * 3;
+      cx += atom37[b]; cy += atom37[b + 1]; cz += atom37[b + 2];
+    }
+    cx /= n; cy /= n; cz /= n;
+    let radius = 0;
+    for (let r = start; r < start + n; r += 1) {
+      const b = (r * ATOMS + CA) * 3;
+      radius = Math.max(radius, Math.hypot(atom37[b] - cx, atom37[b + 1] - cy, atom37[b + 2] - cz));
+    }
+    stats.push({ centre: [cx, cy, cz], radius });
+    start += n;
+  }
+  return stats;
+}
+
+try {
+  const device = await getDevice();
+  const a3m = await fetch('/test.a3m').then((r) => r.text());
+  const model = await loadModel('msa', () => {}, undefined, 'multimer');
+  const chains = Array(COPIES).fill(CHAIN);
+  const lengths = chains.map((c) => c.length);
+  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues\n`);
+  await new AlphaFoldUnifiedGpu(device).predictA3m(
+    COPIES === 1 ? a3m : mergeChainA3ms(Array(COPIES).fill(a3m)),
+    model.weights, model.featureTables,
+    { recycles: 1, randomSeed: 0, chainLengths: lengths,
+      maxMsaSequences: 32, maxExtraSequences: 64,
+      outerProductMeanFirst: true, positionScale: 20, templates: false,
+      chainAware: COPIES > 1, chainSequences: chains },
+    model.paeBreaks,
+    (result, recycle) => {
+      const s = chainStats(result.structure.atom37, lengths);
+      log(`recycle ${recycle}  plddt ${(result.confidence.meanPlddt / 100).toFixed(3)}`);
+      log(`  chain radii: ${s.map((c) => c.radius.toFixed(1)).join(', ')} A`);
+      const gaps = [];
+      for (let i = 0; i < s.length; i += 1) for (let j = i + 1; j < s.length; j += 1) {
+        gaps.push(Math.hypot(...s[i].centre.map((v, k) => v - s[j].centre[k])));
+      }
+      log(`  centre-to-centre: ${gaps.map((g) => g.toFixed(1)).join(', ')} A`);
+      log(`  ${Math.min(...gaps) < 5 ? '🔴 CHAINS ARE ON TOP OF EACH OTHER' : 'chains are separated'}`);
+    });
+} catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }
+</script>

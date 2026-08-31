@@ -27,6 +27,8 @@ const { mergeChainA3ms } = await src('src/input/chains.js');
 const COPIES = Number(new URLSearchParams(location.search).get('copies') ?? 6);
 const RECYCLES = Number(new URLSearchParams(location.search).get('recycles') ?? 4);
 const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+const [MAX_MSA, MAX_EXTRA] = (new URLSearchParams(location.search).get('maxmsa') ?? '32:64')
+  .split(':').map(Number);
 
 try {
   const device = await getDevice();
@@ -34,12 +36,16 @@ try {
   const chains = Array(COPIES).fill(CHAIN);
   const merged = mergeChainA3ms(Array(COPIES).fill(a3m));
   const lengths = chains.map((c) => c.length);
-  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues, ${RECYCLES} recycles\n`);
+  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues, ${RECYCLES} recycles, ${MAX_MSA}:${MAX_EXTRA}\n`);
   const model = await loadModel('msa', () => {}, undefined, 'multimer');
   const started = performance.now();
+  // ...per pass AND cumulative. Reporting only the elapsed total made a flat
+  // 112s/116s look like a runtime that grew with every recycle.
+  let previous = started;
   await new AlphaFoldUnifiedGpu(device).predictA3m(
     merged, model.weights, model.featureTables,
     { recycles: RECYCLES, randomSeed: 0, chainLengths: lengths,
+      maxMsaSequences: MAX_MSA, maxExtraSequences: MAX_EXTRA,
       outerProductMeanFirst: true, positionScale: 20, templates: false,
       chainAware: true, chainSequences: chains },
     model.paeBreaks,
@@ -49,7 +55,10 @@ try {
       log(`  recycle ${recycle}  plddt ${(c.meanPlddt / 100).toFixed(3)}`
         + `  ptm ${c.ptm.toFixed(3)}  iptm ${(c.iptm ?? NaN).toFixed(3)}`
         + `  multi ${multi.toFixed(3)}`
-        + `  ${((performance.now() - started) / 1000).toFixed(0)}s`);
+        + `  rmsd_tol ${result.recycleDistance === undefined ? 'n/a' : result.recycleDistance.toFixed(3)}`
+        + `  ${((performance.now() - previous) / 1000).toFixed(0)}s this pass`
+        + `, ${((performance.now() - started) / 1000).toFixed(0)}s total`);
+      previous = performance.now();
     });
 } catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,5).join('\n')); }
 </script>

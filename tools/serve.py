@@ -23,11 +23,21 @@ import socketserver
 import sys
 
 
+# 🔴 THE WEIGHTS ARE EXEMPT. no-store on everything means a 97 MiB model is
+# re-fetched on every reload, which turned a twelve-second experiment into a
+# two-minute one and made the page look hung. Weight shards are content that
+# never changes without its manifest changing, so they cache; the code does not.
+CACHEABLE = ("/model/", "/model-multimer/")
+
+
 class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
-        self.send_header("Cache-Control", "no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.send_header("Expires", "0")
+        if any(self.path.startswith(prefix) for prefix in CACHEABLE):
+            self.send_header("Cache-Control", "public, max-age=3600")
+        else:
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
         super().end_headers()
 
     def log_message(self, fmt, *args):
