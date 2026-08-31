@@ -1,4 +1,4 @@
-import { residueIndexWithChainBreaks } from "./chains.js";
+import { chainIdentity, residueIndexPerChain, residueIndexWithChainBreaks } from "./chains.js";
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
 const RESTYPE_INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
@@ -52,7 +52,31 @@ export function makeQueryOnlyFeatures(
   const targetFeatures = new Float32Array(length * 22);
   const seqMask = new Float32Array(length).fill(1);
   const msaMask = new Float32Array(length).fill(1);
-  const residueIndex = residueIndexWithChainBreaks(length, options.chainLengths);
+  // 🔴 HOW THE CHAINS ARE DESCRIBED IS A FEATURE, and belongs here with the
+  // rest of them. It used to be half here and half in the multimer driver -
+  // this built a +200 residue index and the driver then overwrote it and bolted
+  // on asym/entity/sym - which is the same split that produced three silent
+  // bugs elsewhere today, and did produce one here: the numbering override
+  // rode on the identity switch, so a control meant to test one of them tested
+  // neither.
+  //
+  // chainAware is what AF2-multimer does: number each chain from zero and tell
+  // the model which chain is which. Without it, the monomer's +200 break stands
+  // in, pushing cross-chain pairs past the +/-32 window of a graph that has no
+  // idea chains exist.
+  const chainAware = options.chainAware === true
+    && options.chainLengths !== undefined && options.chainLengths.length > 1;
+  // ...forcePerChainNumbering exists only so a test can reach "no identity AND
+  // no offset", the state that must collapse the copies onto each other. It is
+  // not a configuration anything should fold with.
+  const perChainNumbering = (chainAware && options.legacyBreaks !== true)
+    || options.forcePerChainNumbering === true;
+  const residueIndex = perChainNumbering
+    ? residueIndexPerChain(length, options.chainLengths)
+    : residueIndexWithChainBreaks(length, options.chainLengths);
+  const identity = chainAware
+    ? chainIdentity(length, options.chainLengths, options.chainSequences)
+    : {};
   const atom37ToAtom14 = new Float32Array(length * 37);
   const atom37Mask = new Float32Array(length * 37);
   for (let residue = 0; residue < length; residue += 1) {
@@ -81,6 +105,9 @@ export function makeQueryOnlyFeatures(
     }
     result.push({
       targetFeatures: targetFeatures.slice(), msaFeatures, msaMask: msaMask.slice(),
+      ...(chainAware
+        ? { asymId: identity.asymId.slice(), entityId: identity.entityId.slice(),
+          symId: identity.symId.slice() } : {}),
       extraMsa: new Float32Array(length), extraHasDeletion: new Float32Array(length),
       extraDeletionValue: new Float32Array(length), extraMsaMask: new Float32Array(length),
       residueIndex: residueIndex.slice(), aatype: aatype.slice(), seqMask: seqMask.slice(),

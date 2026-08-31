@@ -23,7 +23,6 @@ import {
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
-import { chainIdentity, residueIndexPerChain } from "../input/chains.js";
 import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
@@ -87,36 +86,17 @@ export class AlphaFoldUnifiedGpu {
     // the remaining work is weights, not graph.
     const outerProductMeanFirst = recycleOptions.outerProductMeanFirst === true;
     const positionScale = recycleOptions.positionScale ?? MONOMER_POSITION_SCALE;
-    // 🔴 CHAIN IDENTITY IS FOR MULTIMER WEIGHTS ONLY, and is off unless asked.
-    // Supplying it sends every cross-chain pair to the relative encoding's
-    // "different chain" bin - row 65 - which multimer weights were trained for
-    // and a converted monomer's are ZERO in. So a monomer run must keep the
-    // +200 residue-index offsets it already carries and leave these lanes at
-    // zero, which is also what makes this graph reproduce the monomer one.
-    const identity = recycleOptions.chainAware === true
-        && recycleOptions.chainLengths !== undefined
-        && recycleOptions.chainLengths.length > 1
-      ? chainIdentity(length, recycleOptions.chainLengths, recycleOptions.chainSequences)
-      : {};
-    // 🔴 THE RESIDUE NUMBERING IS ITS OWN SWITCH, not a rider on chainAware.
-    // Multimer numbers each chain from zero and separates chains by asym_id;
-    // the monomer's +200 break instead pushes cross-chain pairs into the
-    // saturated end bins, which separates them WITHOUT any chain identity. Tied
-    // together, turning the identity off also restored the offset, so the two
-    // could never be told apart - and an ablation of chainAware measured
-    // nothing. Independent, "no identity and no offset" is a real state, and it
-    // is the one that must collapse if the identity is doing its job.
-    // ...and per-chain numbering is what a chain-aware run gets by default, now
-    // that the identity is shown to do the separating on its own: with it on
-    // and the offset removed the copies sit 9.9/18.2/17.2 A apart, and with the
-    // identity off and the offset removed they land exactly on top of each
-    // other, 0.0/0.0/0.0. chainBreakOffset: true restores the monomer trick.
-    const perChainNumbering = recycleOptions.chainLengths !== undefined
-      && recycleOptions.chainLengths.length > 1
-      && recycleOptions.chainAware === true
-      && recycleOptions.chainBreakOffset !== true;
-    const residueIndexOverride = perChainNumbering
-      ? residueIndexPerChain(length, recycleOptions.chainLengths) : undefined;
+    // 🔴 THE CHAIN FEATURES COME FROM THE FEATURE BUILDER, not from here.
+    // makeA3mFeatures emits asym/entity/sym and the per-chain residue numbering
+    // when it is given chainAware; this used to assemble them and then overwrite
+    // the residue index the builder had just produced, describing a complex in
+    // two places at once.
+    //
+    // chainAware stays off unless asked, because it is for multimer WEIGHTS:
+    // it sends cross-chain pairs to the relative encoding's "different chain"
+    // bin, row 65, which multimer was trained for and a converted monomer's
+    // weights are zero in. A monomer run keeps the +200 offsets instead, which
+    // is also what lets this graph reproduce the monomer one exactly.
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
@@ -192,8 +172,6 @@ export class AlphaFoldUnifiedGpu {
         const embeddingEncoder = encode(`monomer.embedding-${recycle}`);
         const embedding = await encodeInputEmbedder(execution, embeddingEncoder, {
           ...features,
-          ...identity,
-          ...(residueIndexOverride === undefined ? {} : { residueIndex: residueIndexOverride }),
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,

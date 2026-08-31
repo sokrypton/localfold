@@ -65,10 +65,10 @@ try {
       + `  chain centres ${gaps.map((g) => g.toFixed(1)).join('/')} A`);
   };
   log('3 copies, 32:64, one recycle:\n');
-  await run('identity ON,  per-chain numbering', { ...BASE, chainAware: true, chainBreakOffset: false });
-  await run('identity OFF, per-chain numbering', { ...BASE, chainAware: false, chainBreakOffset: false });
-  await run('identity ON,  +200 breaks', { ...BASE, chainAware: true, chainBreakOffset: true });
-  await run('identity OFF, +200 breaks', { ...BASE, chainAware: false, chainBreakOffset: true });
+  await run('identity ON,  per-chain numbering', { ...BASE, chainAware: true });
+  await run('identity OFF, per-chain numbering', { ...BASE, chainAware: false, forcePerChainNumbering: true });
+  await run('identity ON,  +200 breaks', { ...BASE, chainAware: true, legacyBreaks: true });
+  await run('identity OFF, +200 breaks', { ...BASE, chainAware: false });
   log('\nidentity OFF with per-chain numbering has nothing left to separate the');
   log('copies, so it must collapse. If it does not, the identity is not reaching.');
 } catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }

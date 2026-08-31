@@ -70,6 +70,8 @@ export function makeA3mFeatures(a3mText, tables,
   }
   const base = makeQueryOnlyFeatures(alignment.query, tables, {
     recycles: 0, chainLengths: options.chainLengths,
+    chainAware: options.chainAware, chainSequences: options.chainSequences,
+    legacyBreaks: options.legacyBreaks, forcePerChainNumbering: options.forcePerChainNumbering,
     maskedMsaCodes: [Float32Array.from(encoded.subarray(0, length))],
   })[0];
   // 🔴 THE PROFILE OVER THE WHOLE ALIGNMENT, which BERT masking draws from.
@@ -189,6 +191,11 @@ export function makeA3mFeatures(a3mText, tables,
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
       atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
+      // ...present only for a chain-aware complex, and carried through rather
+      // than rebuilt, so there is one place that decides what the chains are.
+      ...(base.asymId === undefined ? {} : {
+        asymId: base.asymId.slice(), entityId: base.entityId.slice(), symId: base.symId.slice(),
+      }),
       msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
     });
   }
