@@ -45,10 +45,18 @@ class TriangleMultiplicationGpu {
     const { length, cZ, cHidden } = input.shape;
     const pairCount = length * length;
     const packedWeights = packWeights(input.weights, precision);
+    // "two-pass" is AF2's formula and stays the default; AF3's trunk asks for
+    // "fast". See varianceCode in shaders.js.
+    const variance = options.variance ?? "two-pass";
     const shaders = createTriangleShaders(
       input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
+      variance,
     );
-    const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}:${input.epsilon ?? 1e-5}`;
+    // 🔴 `variance` BELONGS IN THE KEY. It changes the generated WGSL, so
+    // leaving it out would hand an AF3 call the AF2 pipeline compiled earlier
+    // at the same shape - silently, and only when both models run in one page.
+    const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}`
+      + `:${input.epsilon ?? 1e-5}:${variance}`;
     const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
       this.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
       this.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),

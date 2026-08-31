@@ -22,13 +22,50 @@ fn logistic(value: f32) -> f32 {
 `;
 }
 
+/**
+ * The two LayerNorm variance formulas, which are equal in algebra and not in
+ * floating point.
+ *
+ * 🔴 AF2 AND AF3 DISAGREE HERE AND NEITHER IS WRONG. AF2 takes a second pass to
+ * average `(x - mean)^2`. AF3's trunk sets `use_fast_variance=True`, which is
+ * `E[x^2] - E[x]^2` in one pass; its atom and diffusion stacks set it False and
+ * take AF2's route. So the formula is a property of the CALLER, not of this
+ * file, and it cannot be a constant. Picking the wrong one still returns
+ * plausible numbers - the gap is ~1e-7, far under AF3's own bfloat16 floor -
+ * which is exactly why it has to be chosen explicitly rather than inherited.
+ *
+ * @param {"two-pass"|"fast"} variance
+ * @param {string} count loop bound, "CZ" or "CH"
+ * @param {(index: string) => string} at how to read element `index`
+ */
+function varianceCode(variance, count, at) {
+  if (variance === "fast") {
+    return `var sum_squares = 0.0;
+  for (var c = 0u; c < ${count}; c += 1u) {
+    let value = ${at("c")};
+    sum_squares += value * value;
+  }
+  let variance = sum_squares / f32(${count}) - mean * mean;`;
+  }
+  return `var variance = 0.0;
+  for (var c = 0u; c < ${count}; c += 1u) {
+    let centered = ${at("c")} - mean;
+    variance += centered * centered;
+  }
+  variance /= f32(${count});`;
+}
+
 export function createTriangleShaders(
   shape,
   precision,
   offsets,
   epsilon = 1e-5,
   direction = "outgoing",
+  variance = "two-pass",
 ) {
+  if (variance !== "two-pass" && variance !== "fast") {
+    throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
+  }
   const common = prelude(shape, precision, offsets, epsilon);
   const t = scalar(precision);
 
@@ -47,12 +84,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     mean += ${read(precision, "source[base + c]")};
   }
   mean /= f32(CZ);
-  var variance = 0.0;
-  for (var c = 0u; c < CZ; c += 1u) {
-    let centered = ${read(precision, "source[base + c]")} - mean;
-    variance += centered * centered;
-  }
-  let inverse_std = inverseSqrt(variance / f32(CZ) + EPSILON);
+  ${varianceCode(variance, "CZ", (index) => read(precision, `source[base + ${index}]`))}
+  let inverse_std = inverseSqrt(variance + EPSILON);
   for (var c = 0u; c < CZ; c += 1u) {
     var value = (${read(precision, "source[base + c]")} - mean) * inverse_std;
     value = value * ${read(precision, "weights[W_LAYERNORMINWEIGHT + c]")}
@@ -250,12 +283,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var mean = 0.0;
   for (var h = 0u; h < CH; h += 1u) { mean += source[h * PAIRS + row]; }
   mean /= f32(CH);
-  var variance = 0.0;
-  for (var h = 0u; h < CH; h += 1u) {
-    let centered = source[h * PAIRS + row] - mean;
-    variance += centered * centered;
-  }
-  let inverse_std = inverseSqrt(variance / f32(CH) + EPSILON);
+  ${varianceCode(variance, "CH", (index) => `source[${index} * PAIRS + row]`)}
+  let inverse_std = inverseSqrt(variance + EPSILON);
   for (var h = 0u; h < CH; h += 1u) {
     var value = (source[h * PAIRS + row] - mean) * inverse_std;
     value = value * ${read(precision, "weights[W_LAYERNORMOUTWEIGHT + h]")}
