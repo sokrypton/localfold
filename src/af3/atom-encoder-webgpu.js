@@ -82,7 +82,12 @@ export function packAtomPairWeights(weights) {
   return { data, offsets };
 }
 
-export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
+/**
+ * The constant preamble every atom shader shares. Exported because the DECODER
+ * runs the same cross-attention blocks over the same layout - only its weights
+ * and its two end passes differ.
+ */
+export function createAtomCommon(shape, pairOffsets, blockOffsets) {
   const { tokens, dense, subsets, queries, keys, channels, pairChannels,
           heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
           blocks } = shape;
@@ -92,7 +97,7 @@ export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
   const pairRows = subsets * queries * keys;
   const intermediate = channels * 2;
 
-  const common = `
+  return `
 const TOKENS: u32 = ${tokens}u;
 const DENSE: u32 = ${dense}u;
 const SUBSETS: u32 = ${subsets}u;
@@ -138,6 +143,18 @@ const G_QTA_MASK: u32 = ${4 * queryRows + 4 * keyRows + tokens * dense}u;
 const G_QSPACE: u32 = ${4 * queryRows + 4 * keyRows + 2 * tokens * dense}u;
 const G_KSPACE: u32 = ${5 * queryRows + 4 * keyRows + 2 * tokens * dense}u;
 `;
+}
+
+export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
+  const { tokens, dense, subsets, queries, keys, channels, pairChannels,
+          heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
+          blocks } = shape;
+  const width = heads * dimension;
+  const queryRows = subsets * queries;
+  const keyRows = subsets * keys;
+  const pairRows = subsets * queries * keys;
+  const intermediate = channels * 2;
+  const common = createAtomCommon(shape, pairOffsets, blockOffsets);
 
   // The trunk's single conditioning, per token: LayerNorm then project to 128.
   const trunkSingle = `${common}
@@ -414,7 +431,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /** The three cross-attention blocks. */
-function createAtomBlockShaders(common, shape) {
+export function createAtomBlockShaders(common, shape) {
   const { channels, keys } = shape;
   const intermediate = channels * 2;
 
