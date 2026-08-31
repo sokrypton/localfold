@@ -86,6 +86,17 @@ def float32_names(manifest):
     for name in manifest["tensors"]:
         if name.startswith("geometry") or name == "confidencePaeBreaks":
             keep.add(name)
+    # ...and whatever the export itself named. The rules above are the AF2
+    # graph's, written when there was one graph; AF3 has no structure module and
+    # no residue-geometry tables, and the tensors it must not quantise (every
+    # LayerNorm scale and offset) are only identifiable to the exporter that
+    # laid them out. An export that declares nothing is unaffected.
+    for name in manifest.get("float32Tensors", []):
+        if name not in known:
+            print(f"float32Tensors names {name!r}, which is not in this export",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        keep.add(name)
     return keep
 
 

@@ -48,6 +48,14 @@ BUNDLES = {
         "module": "src/reference/manifests/multimer.js",
         "model": "model_1_multimer_v3",
     },
+    # AF3's trunk under the OpenFold3 dialect, written by
+    # tools/export_af3_model.py. The diffusion and confidence heads are not in
+    # it - see that file - so this bundle folds nothing on its own yet.
+    "af3": {
+        "export": "model-af3",
+        "module": "src/reference/manifests/af3.js",
+        "model": "openfold3",
+    },
 }
 
 

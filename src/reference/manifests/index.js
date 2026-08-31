@@ -34,6 +34,18 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
     load: () => import("./multimer.js"),
   },
+  // AF3's trunk, under the OpenFold3 dialect and OpenFold3's Apache-2.0
+  // weights. INCOMPLETE BY DESIGN: the diffusion and confidence heads are not
+  // exported yet, so this bundle carries a trunk and a distogram head and
+  // cannot produce coordinates. tools/export_af3_model.py records the omission
+  // in the manifest's `coverage`.
+  af3: {
+    model: "openfold3",
+    directory: "./model-af3/",
+    release: "openfold3-trunk",
+    variable: "LOCALFOLD_INCLUDE_AF3_MODEL",
+    load: () => import("./af3.js"),
+  },
 };
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */

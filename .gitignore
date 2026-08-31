@@ -46,3 +46,8 @@ __pycache__/
 
 # The AF3 trunk oracle's dumps, written by tools/oracle/dump_af3_trunk.py.
 /af3-oracle*.json
+
+# The AF3 trunk export, written by tools/export_af3_model.py: the float32 master
+# and tools/quantize_model.py's int8 output.
+/model-af3
+/model-af3-f32
