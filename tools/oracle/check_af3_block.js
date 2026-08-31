@@ -28,48 +28,12 @@
  * Both inputs are gitignored artefacts, so this is a script rather than a test:
  * it needs a 150 MiB export and a JAX run that no checkout has by default.
  */
-import { readFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 
-import { readTensor } from "../../src/reference/dtype.js";
 import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
+import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";
-
-/** Every tensor of a model directory, by name, already widened to float32. */
-async function loadTensors(directory) {
-  const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
-  const shards = new Map();
-  const tensors = new Map();
-  for (const [name, record] of Object.entries(manifest.tensors)) {
-    if (!shards.has(record.file)) {
-      const bytes = await readFile(join(directory, record.file));
-      shards.set(record.file,
-                 bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-    }
-    tensors.set(name, {
-      shape: record.shape,
-      data: readTensor(record, shards.get(record.file), record.byteOffset, true),
-    });
-  }
-  return { manifest, tensors };
-}
-
-/**
- * One layer out of a stacked tensor.
- *
- * 🔴 THE STACK AXIS IS FIRST, so layer `index` is a contiguous slice - but only
- * because the export keeps AF3's own (num_layer, ...) layout. Reading it as the
- * last axis would still produce a correctly shaped tensor of the wrong numbers.
- */
-function layer(tensors, name, index) {
-  const tensor = tensors.get(name);
-  if (tensor === undefined) throw new Error(`no tensor named ${name}`);
-  const stride = tensor.data.length / tensor.shape[0];
-  return tensor.data.subarray(index * stride, (index + 1) * stride);
-}
 
 /** The block's tensors, named as the reference expects them. */
 function blockWeights(tensors, index) {
@@ -133,28 +97,6 @@ function blockWeights(tensors, index) {
   };
 }
 
-/** Relative RMS of a difference, and the reference's own RMS beside it.
- *
- * 🔴 A RELATIVE ERROR IS UNREADABLE WITHOUT ITS DENOMINATOR. The multimer work
- * lost an afternoon to a block that looked four times worse than its neighbour
- * and was not: its reference values were four times smaller.
- */
-function compare(reference, ours) {
-  let error = 0;
-  let magnitude = 0;
-  let worst = 0;
-  for (let index = 0; index < reference.length; index += 1) {
-    const difference = ours[index] - reference[index];
-    error += difference * difference;
-    magnitude += reference[index] * reference[index];
-    if (Math.abs(difference) > worst) worst = Math.abs(difference);
-  }
-  const rms = Math.sqrt(magnitude / reference.length);
-  return { relative: Math.sqrt(error / magnitude), rms, worst };
-}
-
-const load = async(name) => JSON.parse(await readFile(join(ROOT, name), "utf8"));
-
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3";
@@ -164,7 +106,7 @@ async function main() {
   // percent wrong, and this block measured 4.2e-3 against it while being exact.
   // Dump it with --float32 --blocks 2. That run is not what the model does; it
   // is the only thing that can hold a reimplementation to account.
-  const dump = await load(process.argv.includes("--bfloat16")
+  const dump = await loadDump(process.argv.includes("--bfloat16")
     ? "af3-oracle-2block.json" : "af3-oracle-2block-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   if (manifest.model.name !== dump.model) {
@@ -174,15 +116,10 @@ async function main() {
   // Block `index` reads what block `index - 1` wrote, so the dump must go at
   // least one block deeper than the block being checked.
   const index = 1;
-  const captured = (which, call) => {
-    const key = `trunk_pairformer/__call__:[${which}]#${call}`;
-    const record = dump.outputs[key];
-    if (record === undefined) {
-      throw new Error(`${key} is not in the dump; re-run dump_af3_trunk.py with`
-        + ` --blocks ${index + 1} --capture 'trunk_pairformer/__call__$'`);
-    }
-    return Float32Array.from(record.data);
-  };
+  const at = captures(dump, `dump_af3_trunk.py --blocks ${index + 1} --float32`
+    + " --capture 'trunk_pairformer/__call__$' --out af3-oracle-2block-f32.json");
+  const captured = (which, call) =>
+    at(`trunk_pairformer/__call__:[${which}]#${call}`);
 
   const tokens = dump.tokens;
   const seqMask = Float32Array.from(dump.inputs.seq_mask.data);
@@ -206,10 +143,7 @@ async function main() {
     + ` weights from ${model}/ (${manifest.bundle.encoding})`);
   for (const [name, which, ours] of [["pair", 0, result.pair],
                                      ["single", 1, result.single]]) {
-    const reference = captured(which, index);
-    const { relative, rms, worst } = compare(reference, ours);
-    console.log(`  ${name.padEnd(7)} relRMS ${relative.toExponential(3)}`
-      + `   worst ${worst.toExponential(2)}   reference RMS ${rms.toFixed(3)}`);
+    report(name, captured(which, index), ours);
   }
 }
 
