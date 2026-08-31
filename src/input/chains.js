@@ -81,6 +81,34 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * Residue indices numbered WITHIN each chain, which is what multimer wants.
+ *
+ * 🔴 THE +200 BREAK IS A MONOMER WORKAROUND AND MULTIMER MUST NOT HAVE IT.
+ * residueIndexWithChainBreaks pushes each chain past the model's +/-32 window so
+ * that a graph with no notion of chains reads cross-chain pairs as "very far
+ * apart". Multimer is TOLD which chain is which, by asym_id, and numbers each
+ * chain from zero.
+ *
+ * Leaving the offset in is not merely redundant: it hides whether the chain
+ * identity works at all. With the offset, cross-chain pairs land in the
+ * saturated end bins even when asym_id is not supplied, so turning chain
+ * awareness off changes almost nothing and a broken encoding looks fine.
+ *
+ * @param {number} totalLength
+ * @param {readonly number[] | undefined} chainLengths
+ * @returns {Float32Array} shape [totalLength]
+ */
+export function residueIndexPerChain(totalLength, chainLengths) {
+  const lengths = validatedChainLengths(totalLength, chainLengths);
+  const result = new Float32Array(totalLength);
+  let residue = 0;
+  for (const length of lengths) {
+    for (let within = 0; within < length; within += 1) result[residue++] = within;
+  }
+  return result;
+}
+
+/**
  * AlphaFold-multimer's per-residue chain identity: asym, entity and symmetry.
  *
  * These are what the multimer relative encoding reads, and between them they say

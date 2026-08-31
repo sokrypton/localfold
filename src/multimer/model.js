@@ -23,7 +23,7 @@ import {
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
-import { chainIdentity } from "../input/chains.js";
+import { chainIdentity, residueIndexPerChain } from "../input/chains.js";
 import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
@@ -98,6 +98,25 @@ export class AlphaFoldUnifiedGpu {
         && recycleOptions.chainLengths.length > 1
       ? chainIdentity(length, recycleOptions.chainLengths, recycleOptions.chainSequences)
       : {};
+    // 🔴 THE RESIDUE NUMBERING IS ITS OWN SWITCH, not a rider on chainAware.
+    // Multimer numbers each chain from zero and separates chains by asym_id;
+    // the monomer's +200 break instead pushes cross-chain pairs into the
+    // saturated end bins, which separates them WITHOUT any chain identity. Tied
+    // together, turning the identity off also restored the offset, so the two
+    // could never be told apart - and an ablation of chainAware measured
+    // nothing. Independent, "no identity and no offset" is a real state, and it
+    // is the one that must collapse if the identity is doing its job.
+    // ...and per-chain numbering is what a chain-aware run gets by default, now
+    // that the identity is shown to do the separating on its own: with it on
+    // and the offset removed the copies sit 9.9/18.2/17.2 A apart, and with the
+    // identity off and the offset removed they land exactly on top of each
+    // other, 0.0/0.0/0.0. chainBreakOffset: true restores the monomer trick.
+    const perChainNumbering = recycleOptions.chainLengths !== undefined
+      && recycleOptions.chainLengths.length > 1
+      && recycleOptions.chainAware === true
+      && recycleOptions.chainBreakOffset !== true;
+    const residueIndexOverride = perChainNumbering
+      ? residueIndexPerChain(length, recycleOptions.chainLengths) : undefined;
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
@@ -174,6 +193,7 @@ export class AlphaFoldUnifiedGpu {
         const embedding = await encodeInputEmbedder(execution, embeddingEncoder, {
           ...features,
           ...identity,
+          ...(residueIndexOverride === undefined ? {} : { residueIndex: residueIndexOverride }),
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,

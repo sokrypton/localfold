@@ -1,0 +1,75 @@
+<!doctype html><meta charset="utf-8"><title>is chain identity doing anything?</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * DOES THE CHAIN IDENTITY ACTUALLY SEPARATE THE COPIES?
+ *
+ * Turning chainAware off barely changed the result, which should be impossible
+ * - asym/entity/sym is the only thing telling multimer that the copies are
+ * different chains. The suspect is the monomer's +200 residue break, still in
+ * the features: it pushes cross-chain pairs into the saturated end bins on its
+ * own, so the copies stay separated even when the identity is switched off.
+ *
+ * With the offset removed, chainAware off leaves NOTHING to separate the
+ * chains, so it must collapse. If it does not, the identity is not reaching the
+ * model and the earlier ablation was measuring the offset all along.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice, loadModel } = await src('web/model.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { mergeChainA3ms } = await src('src/input/chains.js');
+const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+const COPIES = 3, ATOMS = 37, CA = 1;
+const chains = Array(COPIES).fill(CHAIN);
+const lengths = chains.map((c) => c.length);
+const BASE = { outerProductMeanFirst: true, positionScale: 20, templates: false,
+  chainSequences: chains };
+
+function separation(atom37) {
+  const centres = [];
+  let start = 0;
+  for (const n of lengths) {
+    let c = [0, 0, 0];
+    for (let r = start; r < start + n; r += 1) {
+      const b = (r * ATOMS + CA) * 3;
+      c = [c[0] + atom37[b], c[1] + atom37[b + 1], c[2] + atom37[b + 2]];
+    }
+    centres.push(c.map((v) => v / n));
+    start += n;
+  }
+  const gaps = [];
+  for (let i = 0; i < centres.length; i += 1) for (let j = i + 1; j < centres.length; j += 1) {
+    gaps.push(Math.hypot(...centres[i].map((v, k) => v - centres[j][k])));
+  }
+  return gaps;
+}
+
+try {
+  const device = await getDevice();
+  const a3m = await fetch('/test.a3m').then((r) => r.text());
+  const merged = mergeChainA3ms(Array(COPIES).fill(a3m));
+  const model = await loadModel('msa', () => {}, undefined, 'multimer');
+  const run = async (label, regime) => {
+    let last;
+    await new AlphaFoldUnifiedGpu(device).predictA3m(
+      merged, model.weights, model.featureTables,
+      { recycles: 1, randomSeed: 0, chainLengths: lengths,
+        maxMsaSequences: 32, maxExtraSequences: 64, ...regime },
+      model.paeBreaks, (r) => { last = r; });
+    const gaps = separation(last.structure.atom37);
+    log(`  ${label.padEnd(38)} plddt ${(last.confidence.meanPlddt / 100).toFixed(3)}`
+      + `  chain centres ${gaps.map((g) => g.toFixed(1)).join('/')} A`);
+  };
+  log('3 copies, 32:64, one recycle:\n');
+  await run('identity ON,  per-chain numbering', { ...BASE, chainAware: true, chainBreakOffset: false });
+  await run('identity OFF, per-chain numbering', { ...BASE, chainAware: false, chainBreakOffset: false });
+  await run('identity ON,  +200 breaks', { ...BASE, chainAware: true, chainBreakOffset: true });
+  await run('identity OFF, +200 breaks', { ...BASE, chainAware: false, chainBreakOffset: true });
+  log('\nidentity OFF with per-chain numbering has nothing left to separate the');
+  log('copies, so it must collapse. If it does not, the identity is not reaching.');
+} catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }
+</script>

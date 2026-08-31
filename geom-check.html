@@ -21,6 +21,8 @@ const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
 const { mergeChainA3ms } = await src('src/input/chains.js');
 const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
 const COPIES = Number(new URLSearchParams(location.search).get('copies') ?? 3);
+const [MAX_MSA, MAX_EXTRA] = (new URLSearchParams(location.search).get('maxmsa') ?? '32:64')
+  .split(':').map(Number);
 
 const CA = 1, ATOMS = 37;
 function chainStats(atom37, lengths) {
@@ -50,12 +52,12 @@ try {
   const model = await loadModel('msa', () => {}, undefined, 'multimer');
   const chains = Array(COPIES).fill(CHAIN);
   const lengths = chains.map((c) => c.length);
-  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues\n`);
+  log(`${COPIES} copies, ${lengths.reduce((a, b) => a + b, 0)} residues, ${MAX_MSA}:${MAX_EXTRA}\n`);
   await new AlphaFoldUnifiedGpu(device).predictA3m(
     COPIES === 1 ? a3m : mergeChainA3ms(Array(COPIES).fill(a3m)),
     model.weights, model.featureTables,
     { recycles: 1, randomSeed: 0, chainLengths: lengths,
-      maxMsaSequences: 32, maxExtraSequences: 64,
+      maxMsaSequences: MAX_MSA, maxExtraSequences: MAX_EXTRA,
       outerProductMeanFirst: true, positionScale: 20, templates: false,
       chainAware: COPIES > 1, chainSequences: chains },
     model.paeBreaks,
