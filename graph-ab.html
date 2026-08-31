@@ -39,10 +39,10 @@ log('building features…');
 const a3m = `>query\n${SEQUENCE}\n`;
 const features = makeA3mFeatures(a3m, model.featureTables, { recycles: RECYCLES, randomSeed: 0 });
 
-const run = async (Graph, name) => {
+const run = async (Graph, name, options = {}) => {
   const started = performance.now();
   const prediction = await new Graph(device).predict(
-    features, model.weights, model.paeBreaks, undefined, undefined, {});
+    features, model.weights, model.paeBreaks, undefined, undefined, options);
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const final = prediction.final;
   log(`${name.padEnd(9)} ${seconds}s  meanPlddt ${final.confidence.meanPlddt.toFixed(6)}  ptm ${final.confidence.ptm.toFixed(6)}`);
@@ -75,6 +75,29 @@ try {
   log(exact.every(Boolean)
     ? 'BIT-EXACT: the unified graph reproduces the monomer graph.'
     : 'NOT bit-exact - see the numbers above.');
+
+  // ...and the switches must actually reach something. A flag that changes
+  // nothing reads exactly like a flag that is not wired, which has already
+  // wasted a comparison once this project.
+  log('');
+  log('the switches, against the same weights (all SHOULD differ):');
+  // a split of the one chain: not biology, just enough to light asym/entity/sym
+  const halves = [30, SEQUENCE.length - 30];
+  const variants = [
+    ['opm first', { outerProductMeanFirst: true }],
+    ['scale 20', { positionScale: 20 }],
+    ['chain-aware', { chainAware: true, chainLengths: halves }],
+  ];
+  for (const [name, options] of variants) {
+    try {
+      const other = await new AlphaFoldUnifiedGpu(device).predict(
+        features, model.weights, model.paeBreaks, undefined, undefined, options);
+      let maxabs = 0;
+      const a = other.final.structure.atom37, b = unified.structure.atom37;
+      for (let i = 0; i < a.length; i += 1) maxabs = Math.max(maxabs, Math.abs(a[i] - b[i]));
+      log(`  ${name.padEnd(12)} atom37 maxabs ${maxabs.toExponential(3)}  ${maxabs > 0 ? 'reaches the graph' : 'NO EFFECT - not wired?'}`);
+    } catch (error) { log(`  ${name.padEnd(12)} FAILED: ${error.message}`); }
+  }
   window.__AB__ = { exact: exact.every(Boolean) };
 } catch (error) {
   log(`FAILED: ${error.message}`);

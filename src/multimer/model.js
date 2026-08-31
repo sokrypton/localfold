@@ -23,6 +23,7 @@ import {
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
+import { chainIdentity } from "../input/chains.js";
 import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
@@ -79,6 +80,17 @@ export class AlphaFoldUnifiedGpu {
     // the remaining work is weights, not graph.
     const outerProductMeanFirst = recycleOptions.outerProductMeanFirst === true;
     const positionScale = recycleOptions.positionScale ?? MONOMER_POSITION_SCALE;
+    // 🔴 CHAIN IDENTITY IS FOR MULTIMER WEIGHTS ONLY, and is off unless asked.
+    // Supplying it sends every cross-chain pair to the relative encoding's
+    // "different chain" bin - row 65 - which multimer weights were trained for
+    // and a converted monomer's are ZERO in. So a monomer run must keep the
+    // +200 residue-index offsets it already carries and leave these lanes at
+    // zero, which is also what makes this graph reproduce the monomer one.
+    const identity = recycleOptions.chainAware === true
+        && recycleOptions.chainLengths !== undefined
+        && recycleOptions.chainLengths.length > 1
+      ? chainIdentity(length, recycleOptions.chainLengths, recycleOptions.chainSequences)
+      : {};
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
@@ -144,6 +156,7 @@ export class AlphaFoldUnifiedGpu {
         const embeddingEncoder = encode(`monomer.embedding-${recycle}`);
         const embedding = await encodeInputEmbedder(execution, embeddingEncoder, {
           ...features,
+          ...identity,
           previousMsaFirstRow: new Float32Array(0), previousPair: new Float32Array(0),
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
@@ -172,6 +185,10 @@ export class AlphaFoldUnifiedGpu {
         const covMask = wantsCovMask ? chainMask : undefined;
         const rowAttentionChainMask = wantsRowMask ? chainMask : undefined;
         const extraShape = {
+          // 🔴 THE EXTRA STACK DOES NOT READ THIS YET. Its block runs the outer
+          // product mean through encodeEvoformerPairBlock, which has its own
+          // fixed order; only the main evoformer honours the flag. Carried here
+          // so the shape is complete, and named so it is not mistaken for wired.
           outerProductMeanFirst,
           covMask,
           rowAttentionChainMask,
@@ -201,6 +218,7 @@ export class AlphaFoldUnifiedGpu {
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
           pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
+          outerProductMeanFirst,
           covMask,
           rowAttentionChainMask,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
