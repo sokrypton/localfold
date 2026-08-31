@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { residueIdentity, widenRelativePositionWeight } from "../src/evoformer/input-embedder.js";
+import { residueIdentity, widenRelativePositionWeight } from "../src/multimer/input-embedder.js";
 import { residueIndexWithChainBreaks } from "../src/input/chains.js";
 
 const MAX_RELATIVE = 32;

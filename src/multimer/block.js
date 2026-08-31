@@ -1,3 +1,24 @@
+/*
+ * THE AF2-MULTIMER GRAPH, being built alongside the monomer one rather than on
+ * top of it.
+ *
+ * 🔴 THIS IS A COPY ON PURPOSE, AND IT IS TEMPORARY. The end state is one graph
+ * - multimer's, with monomer as its single-chain case, which is where
+ * ColabDesign2's merge landed (../ColabDesign2/colabdesign2/af2/MERGE_NOTES.md).
+ * But the changes that get there touch the pair embedder's shader, and that
+ * shader is on the monomer path too: a mistake in it would break a fold that
+ * works today, silently, on a machine whose GPU tests cannot run.
+ *
+ * So the work happens here until the multimer graph reproduces the monomer one
+ * with its switch off. Then these files replace src/evoformer/, and this notice
+ * goes with them.
+ *
+ * Everything not listed below is imported from src/evoformer/ unchanged - the
+ * two graphs genuinely share their attention, triangle, transition and
+ * outer-product-mean kernels.
+ *
+ * WHAT DIFFERS HERE: the evoformer block, with the outer product mean able to run first.
+ */
 import {
   ATTENTION_NORMALIZE_SHADER,
   ATTENTION_OUTPUT_SHADER,
@@ -10,7 +31,7 @@ import {
   packAttentionWeights,
   selectAttentionFlashKernel,
 
-} from "./attention.js";
+} from "../evoformer/attention.js";
 import {
   createOuterProductMeanParameters,
   OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
@@ -29,7 +50,7 @@ import {
   packOuterProductMeanWeights,
   useOuterFirstContraction,
 
-} from "./outer-product-mean.js";
+} from "../evoformer/outer-product-mean.js";
 import {
   createTransitionNormalizeParameters,
   createTransitionShaders,
@@ -38,7 +59,7 @@ import {
   TRANSITION_TILE_COLUMNS,
   TRANSITION_TILE_ROWS,
 
-} from "./transition.js";
+} from "../evoformer/transition.js";
 import { WebGpuExecution } from "../runtime/execution.js";
 import { createTriangleShaders } from "../triangle/shaders.js";
 
@@ -576,6 +597,20 @@ export async function encodeEvoformerBlock(
   msaMask,
   pairMask,
 ) {
+  // 🔴 WHERE THE OUTER PRODUCT MEAN SITS IS A PER-MODEL FACT, not a style. AF2
+  // multimer runs it at the TOP of the block, monomer after the MSA transition,
+  // and the weights were trained for their own ordering - so this cannot be
+  // padded around the way a width can. It is the only structural difference
+  // between the two evoformer blocks; everything else here is shared.
+  const outerProductMeanFirst = input.outerProductMeanFirst === true;
+  const outerProductMean = async() => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair, input.covMask,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  };
+  if (outerProductMeanFirst) await outerProductMean();
+
   const row = input.weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
@@ -601,10 +636,7 @@ export async function encodeEvoformerBlock(
     input.weights.msaTransition, "msa-transition", msa,
   );
 
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair, input.covMask,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  if (!outerProductMeanFirst) await outerProductMean();
 
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
