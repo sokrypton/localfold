@@ -30,10 +30,39 @@ import { adaptiveLayerNorm, adaptiveZeroInit, layerNormSlow }
   from "./atom-encoder-reference.js";
 import { linear } from "./pairformer-reference.js";
 import { relativeEncoding } from "./embedder-reference.js";
-import { noiseEmbedding } from "./noise-fourier.js";
 
 /** AF3's assumed data scale, in angstroms. Every noise level is relative to it. */
 export const SIGMA_DATA = 16.0;
+
+/**
+ * The Fourier embedding of a noise level: cos(2*pi * (log(sigma_scaled)/4 * w + b)).
+ *
+ * 🔴 THE WEIGHT AND BIAS COME FROM THE MODEL, ALWAYS, AND THERE IS NO DEFAULT.
+ * Stock AF3 keeps them as frozen constants in its SOURCE rather than its
+ * checkpoint, while every ported model of the lineage trained its own - so a
+ * table compiled in here would be correct for exactly one checkpoint and would
+ * silently apply somebody else's random projection to the rest.
+ * tools/export_af3_model.py resolves that at export time: it writes AF3's
+ * constants under the same tensor names a ported model already uses, so one
+ * loader reads either and this function needs no opinion.
+ *
+ * @param {number} scaledNoiseLevel  the noise level ALREADY divided by SIGMA_DATA
+ * @param {Float32Array} weight      fourier_embedding_weight, from the model
+ * @param {Float32Array} bias        fourier_embedding_bias, from the model
+ */
+export function noiseEmbedding(scaledNoiseLevel, weight, bias) {
+  if (weight === undefined || bias === undefined) {
+    throw new Error("the Fourier embedding's weight and bias must come from the"
+      + " model: AF3 keeps them in its source and ported models train their own,"
+      + " so there is no correct default");
+  }
+  const transformed = 0.25 * Math.log(scaledNoiseLevel);
+  const output = new Float32Array(weight.length);
+  for (let index = 0; index < weight.length; index += 1) {
+    output[index] = Math.cos(2 * Math.PI * (transformed * weight[index] + bias[index]));
+  }
+  return output;
+}
 
 const sigmoid = (value) => 1 / (1 + Math.exp(-value));
 const swish = (value) => value * sigmoid(value);
@@ -237,7 +266,8 @@ export function diffusionConditioning(input, weights) {
   // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG, and the Fourier
   // constants are stock AF3's. A ported checkpoint carries its own trained
   // embedding; see noise-fourier.js.
-  const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA);
+  const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA,
+                                  weights.fourierWeight, weights.fourierBias);
   const noiseChannels = embedded.length;
   const projected = linear(layerNormSlow(embedded, 1, noiseChannels,
                                          weights.noiseEmbeddingInitialNormScale, null),

@@ -12,6 +12,11 @@
  * level. The denoiser itself needs `positions_noisy`, which the sampler draws
  * from a PRNG this cannot reach.
  *
+ * The Fourier weight and bias are read from the EXPORT, not compiled in: stock
+ * AF3 keeps them in its source and every ported model trains its own, so
+ * tools/export_af3_model.py writes AF3's constants under the tensor names a
+ * ported checkpoint already uses and one loader path serves both.
+ *
  * 🔴 --diffusion 1 IS WHAT MAKES THIS AFFORDABLE, and it also fixes the noise
  * level. AF3's schedule is
  *     sigma(t) = SIGMA_DATA * (smax^(1/p) + t*(smin^(1/p) - smax^(1/p)))^p
@@ -22,8 +27,8 @@
 import { join } from "node:path";
 
 import { layerNormSlow } from "../../src/af3/atom-encoder-reference.js";
-import { SIGMA_DATA, diffusionConditioning } from "../../src/af3/diffusion-reference.js";
-import { noiseEmbedding } from "../../src/af3/noise-fourier.js";
+import { SIGMA_DATA, diffusionConditioning, noiseEmbedding }
+  from "../../src/af3/diffusion-reference.js";
 import { linear } from "../../src/af3/pairformer-reference.js";
 import { ROOT, captures, loadDump, loadTensors, report } from "./af3-bundle.js";
 
@@ -80,6 +85,10 @@ async function main() {
     noiseEmbeddingInitialProjection: T("noise_embedding_initial_projection/weights"),
     singleTransitions: [transitionWeights(T, "single_transition_0"),
                         transitionWeights(T, "single_transition_1")],
+    // ...read from the export like any other tensor, whether the checkpoint
+    // carried them or tools/export_af3_model.py baked AF3's constants in.
+    fourierWeight: T("fourier_embedding_weight"),
+    fourierBias: T("fourier_embedding_bias"),
   });
 
   // ...AF3's own accumulation, rebuilt from its captured stages. Each term is
@@ -101,7 +110,9 @@ async function main() {
   console.log(`${dump.model}, ${tokens} tokens, noise level ${noiseLevel}`
     + ` (schedule t=0), weights from ${model}/`);
 
-  const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA);
+  const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA,
+                                  T("fourier_embedding_weight"),
+                                  T("fourier_embedding_bias"));
   report("noise", at(`${HEAD}/noise_embedding_initial_projection/__call__`),
          linear(layerNormSlow(embedded, 1, NOISE_CHANNELS,
                               T("noise_embedding_initial_norm/scale"), null),

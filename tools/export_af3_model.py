@@ -124,9 +124,44 @@ def read_blob(path: str):
     return read(path)
 
 
+# Where a checkpoint keeps its Fourier noise embedding, when it keeps one.
+FOURIER_SCOPE = "diffuser/~/diffusion_head"
+FOURIER_LEAVES = ("fourier_embedding_weight", "fourier_embedding_bias")
+
+
+def stock_fourier_constants():
+    """AF3's frozen Fourier weight and bias, as arrays.
+
+    🔴 STOCK AF3 KEEPS THESE IN ITS SOURCE, NOT IN ITS CHECKPOINT. DeepMind
+    generated them once from a fixed seed and froze them "to future proof
+    against changes in jax rng generation", so a stock export has no tensor for
+    them while every PORTED model of the lineage trained its own and carries it
+    under the names above. Baking the constants in under those same names is
+    what lets one loader read either: the alternative is a table compiled into
+    the page that silently applies somebody else's random projection the moment
+    the weights change.
+    """
+    if COLABDESIGN2 not in sys.path:
+        sys.path.insert(0, COLABDESIGN2)
+    from colabdesign2.af3.alphafold3.model.network import (  # noqa: E402
+        noise_level_embeddings,
+    )
+    return (np.asarray(noise_level_embeddings._WEIGHT, dtype=np.float32),
+            np.asarray(noise_level_embeddings._BIAS, dtype=np.float32))
+
+
 def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
            model: str) -> int:
     records = read_blob(blob_path)
+    # ...synthesised only when the checkpoint has none, so a trained embedding
+    # is never overwritten by the constants.
+    if not any(scope == FOURIER_SCOPE and name in FOURIER_LEAVES
+               for scope, name, _ in records):
+        weight, bias = stock_fourier_constants()
+        records = list(records) + [
+            (FOURIER_SCOPE, FOURIER_LEAVES[0], weight),
+            (FOURIER_SCOPE, FOURIER_LEAVES[1], bias),
+        ]
     wanted = [(scope, name, array) for scope, name, array in records
               if scope.startswith(include)]
     if not wanted:
@@ -148,7 +183,10 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
         # per-block int8 is worst: a 128-element vector is two blocks, so two
         # scales carry the whole tensor, and a norm's job is to set the scale of
         # everything downstream of it. Free to keep, so keep them.
-        if name in ("offset", "scale", "bias"):
+        # ...and the Fourier embedding, which is 512 numbers and a RANDOM
+        # PROJECTION: quantising it would perturb the very thing whose spread
+        # makes the embedding informative, to save half a kilobyte.
+        if name in ("offset", "scale", "bias") or name in FOURIER_LEAVES:
             keep_float32.append(tensor)
     writer.close()
 
