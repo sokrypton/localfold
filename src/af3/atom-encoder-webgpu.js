@@ -930,10 +930,10 @@ export class Af3AtomEncoderGpu {
 
       const trunkSingleProjected = alloc("atom.trunk-single-p", tokens * channels * 4);
       const trunkPairProjected = alloc("atom.trunk-pair-p", tokens * tokens * pairChannels * 4);
-      const queriesCond = alloc("atom.q-cond", queryRows * channels * 4);
-      const queriesMask = alloc("atom.q-mask", queryRows * 4);
-      const keysCond = alloc("atom.k-cond", keyRows * channels * 4);
-      const keysMask = alloc("atom.k-mask", keyRows * 4);
+      const queriesCond = alloc("atom.q-cond", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
+      const queriesMask = alloc("atom.q-mask", queryRows * 4, GPUBufferUsage.COPY_SRC);
+      const keysCond = alloc("atom.k-cond", keyRows * channels * 4, GPUBufferUsage.COPY_SRC);
+      const keysMask = alloc("atom.k-mask", keyRows * 4, GPUBufferUsage.COPY_SRC);
       const act = alloc("atom.act", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
       const pair = alloc("atom.pair", pairRows * pairChannels * 4, GPUBufferUsage.COPY_SRC);
       const logits = alloc("atom.logits", weights.blocks.length * subsets * heads
@@ -952,6 +952,16 @@ export class Af3AtomEncoderGpu {
         skipConnection: keep(this.allocator.allocate("atom.rb-skip", queryRows * channels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         pairCond: keep(this.allocator.allocate("atom.rb-pair", pairRows * pairChannels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        // The decoder reads all four of these, so the head can chain the two
+        // without a second encoder run.
+        queriesCond: keep(this.allocator.allocate("atom.rb-qcond", queryRows * channels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysCond: keep(this.allocator.allocate("atom.rb-kcond", keyRows * channels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        queriesMask: keep(this.allocator.allocate("atom.rb-qmask", queryRows * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysMask: keep(this.allocator.allocate("atom.rb-kmask", keyRows * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
       };
 
@@ -1021,6 +1031,13 @@ export class Af3AtomEncoderGpu {
                                  queryRows * channels * 4);
       encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
                                  pairRows * pairChannels * 4);
+      encoder.copyBufferToBuffer(queriesCond.buffer, 0, readbacks.queriesCond.buffer, 0,
+                                 queryRows * channels * 4);
+      encoder.copyBufferToBuffer(keysCond.buffer, 0, readbacks.keysCond.buffer, 0,
+                                 keyRows * channels * 4);
+      encoder.copyBufferToBuffer(queriesMask.buffer, 0, readbacks.queriesMask.buffer, 0,
+                                 queryRows * 4);
+      encoder.copyBufferToBuffer(keysMask.buffer, 0, readbacks.keysMask.buffer, 0, keyRows * 4);
 
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
@@ -1036,6 +1053,10 @@ export class Af3AtomEncoderGpu {
         tokenAct: await read(readbacks.tokenAct),
         skipConnection: await read(readbacks.skipConnection),
         pairCond: await read(readbacks.pairCond),
+        queriesCond: await read(readbacks.queriesCond),
+        keysCond: await read(readbacks.keysCond),
+        queriesMask: await read(readbacks.queriesMask),
+        keysMask: await read(readbacks.keysMask),
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };
