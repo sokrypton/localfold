@@ -18,53 +18,48 @@
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
-import { DEFAULT_MANIFEST } from "../src/reference/manifest.js";
+import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { withAbort } from "../src/runtime/abort.js";
 
-let storePromise = undefined;
+const stores = new Map();
 
 /**
- * The tensor store this origin can actually use.
+ * The tensor store for one model family, on whatever this origin can use.
+ *
+ * 🔴 ONE WAY IN FOR EVERY MODEL. The monomer read a compiled-in manifest and
+ * the multimer FETCHED one, so they failed differently: a site without multimer
+ * weights 404ed on model-multimer/manifest.json and died there, before a single
+ * shard was asked for. Both tables are now modules - see
+ * src/reference/manifests/ - so neither can 404, and the first thing that can
+ * fail is a shard, which is a failure about weights rather than about metadata.
  *
  * Over http the shards are fetched directly. On a file:// page fetch does not
  * work at all, so the weights come in as classic scripts carrying base64 data:
  * URLs - see ScriptTensorStore, and tools/export-js-weights.py, which writes
  * them.
  *
- * `?model=` overrides both, which is how a page is pointed at a manifest
- * somewhere else without editing it.
- */
-export function openStore(onProgress) {
-  const override = new URLSearchParams(location.search).get("model");
-  if (override !== null) return HttpTensorStore.open(override, onProgress);
-  if (location.protocol === "file:") return ScriptTensorStore.fromManifest("./model/", DEFAULT_MANIFEST, onProgress);
-  storePromise ??= HttpTensorStore.fromManifest("./model/", DEFAULT_MANIFEST, onProgress);
-  return storePromise;
-}
-
-let multimerStorePromise;
-
-/**
- * The AF2-multimer weights, which are a separate download.
+ * `?model=` overrides the monomer path, which is how a page is pointed at a
+ * manifest somewhere else without editing it.
  *
- * 🔴 THEY ARE NOT PART OF THE SITE. model-multimer/ is written by
- * tools/export_multimer_model.py and is another 97 MiB, so it is not deployed
- * alongside the monomer weights - a checkout that has not built it gets a clear
- * failure here rather than a page that half works. Its manifest is fetched
- * rather than compiled in, because unlike the monomer's it is not a fixed
- * artefact of this repository.
+ * @param {import("../src/reference/manifests/index.js").ModelFamily} family
  */
-export function openMultimerStore(onProgress) {
-  multimerStorePromise ??= (async () => {
-    const response = await fetch("./model-multimer/manifest.json");
-    if (!response.ok) {
-      throw new Error("No multimer weights: build them with tools/export_multimer_model.py"
-        + " and tools/quantize_model.py, then serve them at ./model-multimer/");
-    }
-    return HttpTensorStore.fromManifest("./model-multimer/", await response.json(), onProgress);
-  })();
-  return multimerStorePromise;
+export function openStore(onProgress, family = "monomer") {
+  const bundle = MODEL_BUNDLES[family];
+  if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
+  const override = family === "monomer"
+    ? new URLSearchParams(location.search).get("model") : null;
+  if (override !== null) return HttpTensorStore.open(override, onProgress);
+  let store = stores.get(family);
+  if (store === undefined) {
+    store = (async () => {
+      const manifest = await loadManifest(family);
+      const Store = location.protocol === "file:" ? ScriptTensorStore : HttpTensorStore;
+      return Store.fromManifest(bundle.directory, manifest, onProgress);
+    })();
+    stores.set(family, store);
+  }
+  return store;
 }
 
 let devicePromise;
@@ -123,7 +118,7 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
   if (cached !== undefined) return withAbort(cached, signal);
   const pending = (async () => {
     const multimer = family === "multimer";
-    const store = await (multimer ? openMultimerStore(onProgress) : openStore(onProgress));
+    const store = await openStore(onProgress, family);
     const fixture = AlphaFoldFixture.fromStore(store);
     const extraStackWeights = variant === "msa"
       ? fixture.extraStackWeights() : fixture.extraPairStackWeights();

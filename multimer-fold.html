@@ -32,8 +32,8 @@ const CHAIN_LENGTHS = [CHAIN.length, CHAIN.length];
 
 try {
   log('loading model-multimer/ …');
-  const manifest = await fetch('./model-multimer/manifest.json').then((r) => r.json());
-  const store = await HttpTensorStore.fromManifest('./model-multimer/', manifest);
+  const { loadManifest } = await src('src/reference/manifests/index.js');
+  const store = await HttpTensorStore.fromManifest('./model-multimer/', await loadManifest('multimer'));
   const fixture = AlphaFoldFixture.fromStore(store);
   const [embedding, templateEmbedding, extraStack, mainStack, structure, confidence, geometry,
     tables, paeBreaks] = await Promise.all([

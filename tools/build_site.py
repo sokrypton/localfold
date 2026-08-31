@@ -61,32 +61,64 @@ SCRIPT_SRC = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 # shards are re-exported. These are the bytes per element it describes.
 DTYPE_BYTES = {"int8": 1, "float16": 2, "float32": 4}
 
+# ...imported rather than restated: tools/write_manifest_module.py owns the
+# Python-side description of a bundle, and a second copy here would be one more
+# place to forget when a model is added.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from write_manifest_module import BUNDLES  # noqa: E402
 
-def default_manifest() -> dict:
-    """The manifest the site actually loads, read out of its JS module."""
-    text = (ROOT / "src" / "reference" / "manifest.js").read_text(encoding="utf-8")
+
+def compiled_manifest(module: Path) -> dict:
+    """The manifest the site actually loads, read out of its generated module."""
+    text = module.read_text(encoding="utf-8")
     return json.loads(text.split("=", 1)[1].rsplit(";", 1)[0].strip())
 
 
-def manifest_mismatches(model: Path) -> list[str]:
-    """Every way the checked-in manifest disagrees with the shards being shipped.
+def registry_mismatches() -> list[str]:
+    """The Python and JS descriptions of the model bundles, checked against each other.
 
-    🔴 THE MANIFEST IS NO LONGER DERIVED FROM THE WEIGHTS. It used to be read
-    from model/manifest.json, which the exporter wrote beside the shards it had
-    just produced, so the two could not disagree. It is now a committed JS
-    module the exporter FALLS BACK to, which inverts the dependency: re-export
-    the weights and the manifest keeps describing the previous ones. Nothing
-    fails - every offset still lands inside a file of about the right size - and
-    the page loads tensors sliced at the wrong byte and folds to noise.
+    🔴 A FAMILY IN ONE REGISTRY AND NOT THE OTHER is a page that offers a model
+    it cannot load, or a manifest nobody regenerates. They are two files because
+    one is read by a build and the other by a browser; they are checked here so
+    that being two files cannot mean being two answers.
+    """
+    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    in_js = set(re.findall(r"^  (\w+): \{$", index, re.MULTILINE))
+    in_py = set(BUNDLES)
+    problems = []
+    for family in sorted(in_py - in_js):
+        problems.append(f"{family}: in tools/write_manifest_module.py but not in"
+                        " src/reference/manifests/index.js")
+    for family in sorted(in_js - in_py):
+        problems.append(f"{family}: in src/reference/manifests/index.js but not in"
+                        " tools/write_manifest_module.py")
+    for family in sorted(in_py & in_js):
+        module = ROOT / BUNDLES[family]["module"]
+        if not module.is_file():
+            problems.append(f"{family}: {BUNDLES[family]['module']} does not exist;"
+                            f" run python3 tools/write_manifest_module.py {family}")
+    return problems
+
+
+def manifest_mismatches(model: Path, module: Path) -> list[str]:
+    """Every way a compiled-in manifest disagrees with the shards being shipped.
+
+    🔴 THE MANIFEST IS NOT DERIVED FROM THE WEIGHTS AT LOAD TIME. It is a
+    committed JS module, which inverts the dependency: re-export the shards and
+    the module keeps describing the previous ones. Nothing fails - every offset
+    still lands inside a file of about the right size - and the page loads
+    tensors sliced at the wrong byte and folds to noise.
 
     So the offsets are checked against the shards here, where the two are
-    packaged together and a mismatch can still stop the deploy.
+    packaged together and a mismatch can still stop the deploy. This is the
+    whole reason a compiled-in manifest is safe to keep.
     """
     problems = []
-    manifest = default_manifest()
+    manifest = compiled_manifest(module)
+    relative = module.relative_to(ROOT)
     tensors = manifest.get("tensors")
     if not tensors:
-        return ["src/reference/manifest.js has no tensor table"]
+        return [f"{relative} has no tensor table"]
 
     # ...the manifest may also still exist beside the weights. When it does it
     # was written by the exporter, so it is the authority and any difference
@@ -96,8 +128,8 @@ def manifest_mismatches(model: Path) -> list[str]:
         exported = json.loads(on_disk.read_text(encoding="utf-8"))
         if exported.get("tensors") != tensors:
             problems.append(
-                "src/reference/manifest.js disagrees with model/manifest.json;"
-                " re-run tools/export-js-weights.py")
+                f"{relative} disagrees with {model.name}/manifest.json;"
+                " re-run tools/write_manifest_module.py")
 
     # ...the strongest check available, and the one that actually catches the
     # failure this guards: a manifest describing a PREVIOUS export sits at
@@ -105,7 +137,7 @@ def manifest_mismatches(model: Path) -> list[str]:
     # themselves distinguish it from a current one.
     digests = manifest.get("shardDigests")
     if not digests:
-        problems.append("src/reference/manifest.js has no shardDigests table")
+        problems.append(f"{relative} has no shardDigests table")
     else:
         for shard, expected in sorted(digests.items()):
             path = model / shard
@@ -138,7 +170,7 @@ def manifest_mismatches(model: Path) -> list[str]:
     for shard, extent in sorted(required.items()):
         path = model / shard
         if not path.is_file():
-            problems.append(f"{shard}: named by the manifest but not in model/")
+            problems.append(f"{shard}: named by the manifest but not in {model.name}/")
         elif path.stat().st_size < extent:
             problems.append(
                 f"{shard}: {path.stat().st_size} bytes, but the manifest reads to {extent}")
@@ -194,27 +226,45 @@ def build(include_model: bool) -> int:
     # repository is private, so a model directory that happens to be lying
     # around in the checkout must not publish itself.
     if include_model:
-        model = ROOT / "model"
-        if not model.is_dir():
-            print("--model was given but model/ does not exist;"
+        # ...EVERY FAMILY THE REGISTRY KNOWS, on the same terms. The Pages
+        # workflow unpacks each release bundle into dist/ itself, so this path
+        # is for a local build; either way a bundle that is present is checked
+        # and one that is absent is simply not shipped.
+        problems = registry_mismatches()
+        if problems:
+            print("the model registries disagree:", file=sys.stderr)
+            for problem in problems:
+                print(f"  {problem}", file=sys.stderr)
+            return 1
+        shipped = 0
+        for family, bundle in sorted(BUNDLES.items()):
+            model = ROOT / bundle["export"]
+            if not model.is_dir():
+                continue
+            # ...the .bin shards only. A served page reads those through fetch,
+            # and the base64 scripts beside them are a third larger and exist
+            # purely for file:// - shipping both would put a 356 MiB site at
+            # 830 MiB, most of a GitHub Pages allowance spent on bytes nothing
+            # on that site can use.
+            mismatches = manifest_mismatches(model, ROOT / bundle["module"])
+            if mismatches:
+                print(f"{bundle['module']} does not describe {bundle['export']}/:",
+                      file=sys.stderr)
+                for mismatch in mismatches:
+                    print(f"  {mismatch}", file=sys.stderr)
+                print("the site would load tensors at the wrong offsets and fold to"
+                      f" noise; run python3 tools/write_manifest_module.py {family}",
+                      file=sys.stderr)
+                return 1
+            shutil.copytree(model, OUT / bundle["export"],
+                            ignore=shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map",
+                                                          "weights-*.js", "manifest.js",
+                                                          "manifest.json"))
+            shipped += 1
+        if shipped == 0:
+            print("--model was given but no export directory exists;"
                   " run `node tools/export-web-model.js <manifest>` first", file=sys.stderr)
             return 1
-        # ...the .bin shards only. A served page reads those through fetch, and
-        # the base64 scripts beside them are a third larger and exist purely for
-        # file:// - shipping both would put a 356 MiB site at 830 MiB, most of a
-        # GitHub Pages allowance spent on bytes nothing on that site can use.
-        mismatches = manifest_mismatches(model)
-        if mismatches:
-            print("the checked-in manifest does not describe model/:", file=sys.stderr)
-            for mismatch in mismatches:
-                print(f"  {mismatch}", file=sys.stderr)
-            print("the site would load tensors at the wrong offsets and fold to noise;"
-                  " regenerate src/reference/manifest.js from the current export",
-                  file=sys.stderr)
-            return 1
-        shutil.copytree(model, OUT / "model",
-                        ignore=shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store",
-                                                      "*.map", "weights-*.js", "manifest.js"))
 
     problems = unresolved_imports(OUT)
     if problems:
