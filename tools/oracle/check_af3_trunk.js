@@ -12,12 +12,17 @@
  * output here anybody would look at, and it is the one the per-piece checks
  * never produce.
  *
- * 🔴 TWO INPUTS COME FROM THE ORACLE: target_feat (384 of its 447 columns need
- * the atom transformer encoder) and the template embedding. Neither is written
- * yet, so this says the trunk is right ABOUT EVERYTHING ELSE.
+ * Every learned module is ours. What still comes from the oracle is the
+ * FEATURISED BATCH - the tokenisation, the reference conformers, the MSA - none
+ * of which is a neural network, and all of which a browser would build from a
+ * sequence and a 21-entry conformer table.
  */
 import { join } from "node:path";
 
+import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder, targetFeatures }
+  from "../../src/af3/atom-encoder-reference.js";
+import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { runTrunk } from "../../src/af3/trunk-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 
@@ -130,6 +135,119 @@ function pairformerBlockWeights(tensors, index) {
   };
 }
 
+const STE = `${EVO}/template_embedding/single_template_embedding`;
+const ITERATION = `${STE}/__layer_stack_no_per_layer/template_embedding_iteration`;
+
+/** The template stack runs at 64 channels, 4 heads of 16, and factor-2 transitions. */
+function templateWeights(tensors) {
+  const T = (name) => tensors.get(name).data;
+  const at = (leaf, index) => layer(tensors, `${ITERATION}/${leaf}`, index);
+  const blocks = [0, 1].map((index) => {
+    const pick = (leaf) => at(leaf, index);
+    return {
+      triangleMultiplicationOutgoing: triangle(pick, "outgoing"),
+      triangleMultiplicationIncoming: triangle(pick, "incoming"),
+      pairAttention1: { ...gridAttention(pick, 1), dimension: 16 },
+      pairAttention2: { ...gridAttention(pick, 2), dimension: 16 },
+      pairTransition: pairTransition(pick),
+    };
+  });
+  return {
+    queryChannels: 128,
+    queryEmbeddingNormScale: T(`${STE}/query_embedding_norm/scale`),
+    queryEmbeddingNormOffset: T(`${STE}/query_embedding_norm/offset`),
+    templatePairEmbedding2: T(`${STE}/template_pair_embedding_2/weights`),
+    templatePairEmbedding3: T(`${STE}/template_pair_embedding_3/weights`),
+    templatePairEmbedding8: T(`${STE}/template_pair_embedding_8/weights`),
+    outputLayerNormScale: T(`${STE}/output_layer_norm/scale`),
+    outputLayerNormOffset: T(`${STE}/output_layer_norm/offset`),
+    outputLinear: T(`${EVO}/template_embedding/output_linear/weights`),
+    blocks,
+  };
+}
+
+/** target_feat, built from the reference conformers rather than read back. */
+function buildTargetFeat(tensors, dump, tokens) {
+  const C = "diffuser/evoformer_conditioning";
+  const w = (name) => tensors.get(`${C}_${name}/weights`).data;
+  const T = (name) => tensors.get(name).data;
+  const input = (name) => dump.inputs[name].data;
+  const dense = 24;
+  const subsets = 9;
+  const queries = 32;
+  const keys = 128;
+  const reference = {
+    positions: Float32Array.from(input("ref_pos")),
+    mask: Float32Array.from(input("ref_mask")),
+    element: input("ref_element"),
+    charge: Float32Array.from(input("ref_charge")),
+    atomNameChars: input("ref_atom_name_chars"),
+  };
+  const conditioning = perAtomConditioning(reference, tokens, dense, {
+    channels: 128,
+    embedRefPos: w("embed_ref_pos"), embedRefMask: w("embed_ref_mask"),
+    embedRefElement: w("embed_ref_element"), embedRefCharge: w("embed_ref_charge"),
+    embedRefAtomName: w("embed_ref_atom_name"),
+  });
+  const S = `${C}_atom_transformer_encoder`;
+  const P = `${S}/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoder`;
+  const at = (leaf, index) => layer(tensors, `${P}${leaf}`, index);
+  const blocks = [0, 1, 2].map((index) => ({
+    qProjection: at("q_projection/weights", index), qBias: at("q_projection/bias", index),
+    kProjection: at("k_projection/weights", index),
+    vProjection: at("v_projection/weights", index),
+    gatingQuery: at("gating_query/weights", index),
+    qSingleCondLayerNormScale: at("qsingle_cond_layer_norm/scale", index),
+    qSingleCondScaleWeights: at("qsingle_cond_scale/weights", index),
+    qSingleCondScaleBias: at("qsingle_cond_scale/bias", index),
+    qSingleCondBias: at("qsingle_cond_bias/weights", index),
+    kSingleCondLayerNormScale: at("ksingle_cond_layer_norm/scale", index),
+    kSingleCondScaleWeights: at("ksingle_cond_scale/weights", index),
+    kSingleCondScaleBias: at("ksingle_cond_scale/bias", index),
+    kSingleCondBias: at("ksingle_cond_bias/weights", index),
+    Transition2: at("transition2/weights", index),
+    AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights", index),
+    AdaptiveZeroCondBias: at("adaptive_zero_cond/bias", index),
+    ffwSingleCondLayerNormScale: at("ffw_single_cond_layer_norm/scale", index),
+    ffwSingleCondScaleWeights: at("ffw_single_cond_scale/weights", index),
+    ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias", index),
+    ffwSingleCondBias: at("ffw_single_cond_bias/weights", index),
+    ffwTransition1: at("ffw_transition1/weights", index),
+    ffwTransition2: at("ffw_transition2/weights", index),
+    ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights", index),
+    ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias", index),
+  }));
+  const gather = (name, count) => ({
+    indices: input(`${name}:gather_idxs`), mask: input(`${name}:gather_mask`), count,
+  });
+  const atoms = atomCrossAttentionEncoder({
+    shape: { tokens, dense, subsets, queries, keys },
+    conditioning,
+    atomMask: reference.mask,
+    refPos: reference.positions,
+    refSpaceUid: Float32Array.from(input("ref_space_uid")),
+    tokenAtomsToQueries: gather("token_atoms_to_queries", subsets * queries),
+    queriesToKeys: gather("queries_to_keys", subsets * keys),
+    queriesToTokenAtoms: gather("queries_to_token_atoms", tokens * dense),
+  }, {
+    channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
+    singleToPairCondRow: w("single_to_pair_cond_row_1"),
+    singleToPairCondCol: w("single_to_pair_cond_col_1"),
+    embedPairOffsets: w("embed_pair_offsets_1"),
+    embedPairDistances: w("embed_pair_distances_1"),
+    embedPairOffsetsValid: w("embed_pair_offsets_valid"),
+    pairMlp1: w("pair_mlp_1"), pairMlp2: w("pair_mlp_2"), pairMlp3: w("pair_mlp_3"),
+    pairInputLayerNormScale: T(`${S}/pair_input_layer_norm/scale`),
+    pairLogitsProjection: T(`${S}/pair_logits_projection/weights`),
+    projectAtomFeaturesForAggr: w("project_atom_features_for_aggr"),
+    blocks,
+  });
+  return targetFeatures({
+    aatype: input("aatype"), profile: input("profile"),
+    deletionMean: input("deletion_mean"), atomFeatures: atoms,
+  }, tokens);
+}
+
 function embedderWeights(tensors) {
   const at = (name) => {
     const tensor = tensors.get(`${EVO}/${name}`);
@@ -187,8 +305,13 @@ async function main() {
   const result = runTrunk({
     tokens,
     sequences,
-    targetFeat: at(`${EVO}/__call__:target_feat`),
-    templateEmbedding: at(`${EVO}/template_embedding/__call__`),
+    targetFeat: buildTargetFeat(tensors, dump, tokens),
+    templateEmbedding: (pair) => templateEmbedding({
+      pair, tokens, pairMask,
+      templates: dump.inputs.template_aatype.shape[0],
+      templateOccupied: dump.inputs.template_atom_mask.data.some(Boolean),
+      templateAatype: new Int32Array(tokens),
+    }, templateWeights(tensors), { swapTransposedBias: dump.model !== "alphafold3" }),
     msaRows: input("msa").slice(0, sequences * tokens),
     deletionMatrix: input("deletion_matrix").slice(0, sequences * tokens),
     msaMask: Float32Array.from(input("msa_mask")).subarray(0, sequences * tokens),
@@ -207,7 +330,7 @@ async function main() {
   console.log(`${dump.model}, ${tokens} tokens, embedder + 4 MSA blocks +`
     + ` ${dump.pairformerBlocks} pairformer blocks + distogram head`
     + `  (${elapsed.toFixed(1)} s, ${model}/, ${manifest.bundle.encoding})`);
-  console.log("  target_feat and the template embedding are taken from the oracle");
+  console.log("  nothing is taken from the oracle but the featurised batch");
   report("pair", at(`${EVO}/__call__:pair`), result.pair);
   report("single", at(`${EVO}/__call__:single`), result.single);
   report("logits", at("distogram/distogram"), result.logits);

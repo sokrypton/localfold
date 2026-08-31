@@ -154,9 +154,13 @@ export function embed(input, weights) {
     for (let index = 0; index < pair.length; index += 1) pair[index] += bonds[index];
   }
 
-  // ...and the template embedding, which is a stub. See the note at the top:
-  // its contribution is large even when every template slot is empty.
-  const template = input.templateEmbedding;
+  // ...and the template embedding, which reads the pair AS IT IS AT THIS POINT
+  // - after the relative encoding and the bonds, before anything else. Passing
+  // a function rather than an array is how src/af3/template-reference.js gets
+  // that without this file having to know what a template is.
+  const template = typeof input.templateEmbedding === "function"
+    ? input.templateEmbedding(pair)
+    : input.templateEmbedding;
   if (template === undefined) {
     throw new Error("templateEmbedding is required: AF3's template embedder"
       + " contributes even with no templates, so omitting it is not the same as"

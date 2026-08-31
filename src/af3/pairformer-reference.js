@@ -152,8 +152,14 @@ function softmaxRows(values, rows, width) {
  * @param {{inputLayerNormScale: Float32Array, inputLayerNormOffset: Float32Array,
  *          transition1: Float32Array, transition2: Float32Array}} weights
  */
-export function transition(input, rows, channels, weights) {
-  const intermediate = channels * 4;
+export function transition(input, rows, channels, weights, factor = 4) {
+  // 🔴 THE WIDENING FACTOR IS NOT ALWAYS FOUR. The trunk's transitions use 4
+  // (128 -> 512, so transition1 is 128x1024), and the TEMPLATE stack's use 2
+  // (64 -> 128, transition1 64x256). Both are "a transition block" and both
+  // read `transition1` and `transition2`; the only thing that says which is the
+  // shape of the weights, so a wrong factor here reads them at the wrong stride
+  // rather than failing.
+  const intermediate = channels * factor;
   const normalised = layerNorm(input, rows, channels, weights.inputLayerNormScale,
                                weights.inputLayerNormOffset);
   const wide = linear(normalised, rows, channels, intermediate * 2, weights.transition1);
