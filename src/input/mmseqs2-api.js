@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { mergeUnpairedChainA3ms } from "./chains.js";
+import { mergeChainA3ms } from "./chains.js";
 
 const DEFAULT_API_URL = "https://api.colabfold.com";
 const QUERY_ID = 101;
@@ -196,10 +196,11 @@ export async function generateMmseqs2Msa(sequenceValue,
 }
 
 /**
- * Search each unique physical chain and assemble an unpaired complex A3M.
- * Identical chains share one network search but are expanded into independent
- * MSA blocks, which is the monomer-model homooligomer construction ColabFold
- * uses. Distinct chains become the corresponding heterooligomer blocks.
+ * Search each unique physical chain and assemble a complex A3M.
+ * Identical chains share one network search and are PAIRED into single rows,
+ * which is both cheaper in the cluster budget and the only form that carries
+ * coevolution between the copies. Distinct chains stay block-diagonal, the
+ * monomer-model heterooligomer construction ColabFold uses.
  *
  * @param {readonly string[]} sequenceValues one sequence per physical chain
  * @param {any} [options] the options accepted by generateMmseqs2Msa
@@ -223,7 +224,7 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   }));
   const bySequence = new Map();
   for (const [sequence, searched] of entries) bySequence.set(sequence, searched);
-  const a3m = mergeUnpairedChainA3ms(sequences.map((sequence) => bySequence.get(sequence).a3m));
+  const a3m = mergeChainA3ms(sequences.map((sequence) => bySequence.get(sequence).a3m));
   const alignment = parseA3m(a3m);
   return {
     a3m,

@@ -57,7 +57,7 @@ describe("MMseqs2 API", () => {
     expect(phases).toEqual(["submitting", "queued", "running", "downloading", "complete"]);
   });
 
-  it("searches an identical homomer chain once and expands both copies", async() => {
+  it("searches an identical homomer chain once and pairs both copies", async() => {
     const responses = [
       new Response(JSON.stringify({ status: "COMPLETE", id: "ticket-homo" })),
       new Response(new Uint8Array([1, 2, 3])),
@@ -70,7 +70,10 @@ describe("MMseqs2 API", () => {
     expect(result.tickets).toEqual(["ticket-homo"]);
     const parsed = parseA3m(result.a3m);
     expect(parsed.query).toBe("ACDEACDE");
-    expect(parsed.sequences).toContain("AC-E----");
-    expect(parsed.sequences).toContain("----AC-E");
+    // ...one row carrying the homolog in BOTH copies, not two gap-padded rows.
+    // Same protein twice means row s is one organism, so the pairing is exact.
+    expect(parsed.sequences).toContain("AC-EAC-E");
+    expect(parsed.sequences.includes("AC-E----")).toBe(false);
+    expect(parsed.sequences.includes("----AC-E")).toBe(false);
   });
 });

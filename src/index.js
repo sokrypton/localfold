@@ -39,7 +39,8 @@ export { makeQueryOnlyFeatures } from "./input/query-only-features.js";
 
 export { makeA3mFeatures } from "./input/a3m-features.js";
 export {
-  CHAIN_BREAK_OFFSET, mergeUnpairedChainA3ms, residueIndexWithChainBreaks, splitComplexA3mByChain,
+  CHAIN_BREAK_OFFSET, mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks,
+  splitComplexA3mByChain,
   validatedChainLengths,
 } from "./input/chains.js";
 

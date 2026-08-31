@@ -81,6 +81,65 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * Assemble per-chain A3Ms into complex rows, pairing copies of one protein.
+ *
+ * 🔴 BLOCK-DIAGONAL IS THE WRONG SHAPE FOR REPEATED CHAINS, twice over. When a
+ * complex contains the same protein more than once, every copy is searched
+ * against the same database and gets the SAME alignment, so row s of copy 1 and
+ * row s of copy 2 are one homolog from one organism. Stacking them diagonally
+ * throws that away and then pays for the loss:
+ *
+ *   - it spends N rows of the 508-cluster budget to say what one row says, so
+ *     each copy ends up with about 508/N sequences instead of 508. Measured on
+ *     the 59-residue test case doubled: 269 and 236 rows, against 508 folding
+ *     the monomer by itself.
+ *   - it hides the pairing. Coevolution between the copies is exactly the
+ *     signal an oligomer interface is predicted from, and gap-padded rows carry
+ *     none of it.
+ *
+ * Pairing repeated chains is not an approximation of the diagonal form - it is
+ * the construction the diagonal form is a lossy stand-in for. Chains are grouped
+ * by their query sequence, because identical sequences are the same protein and
+ * were served by one search; distinct groups stay block-diagonal, since pairing
+ * two different proteins by row index would invent coevolution between
+ * unrelated organisms.
+ *
+ * @param {readonly string[]} a3mTexts one A3M per physical chain
+ * @returns {string}
+ */
+export function mergeChainA3ms(a3mTexts) {
+  if (!Array.isArray(a3mTexts) || a3mTexts.length === 0) {
+    throw new RangeError("at least one chain A3M is required");
+  }
+  const alignments = a3mTexts.map((text) => parseA3m(text));
+  const lengths = alignments.map((alignment) => alignment.length);
+  const query = alignments.map((alignment) => alignment.query).join("");
+  const lines = [">query", query];
+
+  const groups = new Map();
+  alignments.forEach((alignment, chain) => {
+    const existing = groups.get(alignment.query);
+    if (existing === undefined) groups.set(alignment.query, [chain]);
+    else existing.push(chain);
+  });
+
+  for (const chains of groups.values()) {
+    // ...the first copy's alignment speaks for the group. They were produced by
+    // one search for one sequence, so any later copy is the same alignment.
+    const alignment = alignments[chains[0]];
+    const member = new Set(chains);
+    const label = chains.map((chain) => chain + 1).join("+");
+    for (let row = 1; row < alignment.rawSequences.length; row += 1) {
+      const parts = lengths.map((length, chain) => (
+        member.has(chain) ? alignment.rawSequences[row] : "-".repeat(length)
+      ));
+      lines.push(`>chain_${label}|${alignment.descriptions[row]}`, parts.join(""));
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * Project a complex A3M into one viewer-compatible A3M per physical chain.
  *
  * Model inference must retain the full concatenated alignment. py2Dmol instead
