@@ -11,13 +11,18 @@ the featurisation. AF3 makes that mattersmore than AF2 did, because its
 featurisation is a 515 MB chemical-component dictionary and a tokeniser, none of
 which the browser will ever run.
 
-🔴 THE WEIGHTS ARE OPENFOLD3'S, NOT DEEPMIND'S, AND THAT IS DELIBERATE. AF3's
-own parameters carry a Prohibited Use Policy; OpenFold3's are Apache 2.0. Since
-the whole point of this repository is a page anyone can load, the oracle must be
-the model we can actually ship, or it would certify a graph we cannot use. The
-two share an architecture - `model='openfold3'` selects the OpenFold3 dialect of
-the same forward graph - so the trunk being verified here is the trunk AF3
-describes.
+🔴 THE DEFAULT IS DEEPMIND'S AF3, WHICH THIS SITE MAY NOT SERVE. Those
+parameters carry a Prohibited Use Policy and terms that forbid redistribution,
+so they can verify a graph here and can never be published from it; the shipped
+bundle has to be OpenFold3's Apache-2.0 weights or another open checkpoint of
+the lineage (--model openfold3).
+
+They are still the right thing to build against FIRST, because they are the
+reference the others are ports of, and because the stock graph is the SIMPLER
+one: `model='openfold3'` turns on four branches stock AF3 does not have - the
+column-wise attention's pair-bias swap, a symmetrised bond matrix, an element
+index shift, and Fourier weights read from the checkpoint. Verifying against a
+port would mean carrying its divergences without knowing which were which.
 
 🔴 --blocks TRUNCATES BY SLICING THE STACKED WEIGHTS, and a truncated run is a
 DIFFERENT MODEL, not an approximation of the full one. hk.experimental.layer_stack
@@ -55,8 +60,19 @@ from colabdesign2.af3 import features as f3                     # noqa: E402
 from colabdesign2.af3.runner import AF3Runner, make_config      # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
-WEIGHTS = os.path.expanduser(
-    "~/Documents/GitHub/af3_of3/weights/af3_converted_v4")
+# Each model's blob directory. The runner picks the forward graph's dialect from
+# the model name, so the two must move together - a stock checkpoint read through
+# the OpenFold3 graph asks for parameters it does not contain.
+# Both fetched or converted from source rather than found lying around, and
+# both checked against the graph's own jax.eval_shape table before use: every
+# tensor present, none extra, none mis-shaped.
+WEIGHTS = {
+    "alphafold3": "~/af3_official_weights",
+    # ...written by ColabDesign2's converter, which is the current one. The
+    # alphafold3 repo ships an older convert_of3_weights.py under a different
+    # name, so neither its output nor its path should be reached for here.
+    "openfold3": "~/af3_converted_cd2",
+}
 # 12 residues: the pair representation is 12x12x128, small enough to sit in a
 # JSON file and to be read by eye when a kernel is wrong.
 SEQUENCE = "GSMKQIEDKIEE"
@@ -136,7 +152,9 @@ def main():
     parser.add_argument("--blocks", type=int, default=None,
                         help="trunk pairformer depth (default: all 48)")
     parser.add_argument("--sequence", default=SEQUENCE)
-    parser.add_argument("--weights", default=WEIGHTS)
+    parser.add_argument("--model", default="alphafold3", choices=sorted(WEIGHTS))
+    parser.add_argument("--weights", default=None,
+                        help="blob directory (default: the model's)")
     parser.add_argument("--capture", default=r"evoformer/__call__$",
                         help="regex over module call sites whose full output to"
                              " keep (default: the trunk's single and pair)")
@@ -154,11 +172,13 @@ def main():
     spec = parse_contigs(str(len(sequence))).resolve()
     batch = f3.featurise_spec(spec, sequences={0: sequence}, msa_crop_size=8)
 
-    config = make_config(num_recycles=0, model="openfold3", num_msa=1)
+    weights = os.path.expanduser(arguments.weights
+                                 or WEIGHTS[arguments.model])
+    config = make_config(num_recycles=0, model=arguments.model, num_msa=1)
     if arguments.blocks is not None:
         config.evoformer.pairformer.num_layer = arguments.blocks
-    runner = AF3Runner(model_dir=arguments.weights, cfg=config,
-                       model="openfold3", diffusion="off")
+    runner = AF3Runner(model_dir=weights, cfg=config,
+                       model=arguments.model, diffusion="off")
     if arguments.blocks is not None:
         runner.model_params = truncate_pairformer(runner.model_params,
                                                   arguments.blocks)
@@ -199,10 +219,12 @@ def main():
 
     blocks = 48 if arguments.blocks is None else arguments.blocks
     suffix = "" if arguments.blocks is None else f"-{blocks}block"
+    if arguments.model != "alphafold3":
+        suffix = f"-{arguments.model}{suffix}"
     path = pathlib.Path(arguments.out) if arguments.out else \
         ROOT / f"af3-oracle{suffix}.json"
     path.write_text(json.dumps({
-        "model": "openfold3",
+        "model": arguments.model,
         "sequence": sequence,
         "tokens": int(np.asarray(batch["aatype"]).shape[-1]),
         "pairformerBlocks": blocks,
@@ -210,7 +232,8 @@ def main():
         "outputs": outputs,
     }))
 
-    print(f"{path.name}  {len(sequence)} residues, {blocks} pairformer blocks,"
+    print(f"{path.name}  {arguments.model}, {len(sequence)} residues,"
+          f" {blocks} pairformer blocks,"
           f" {path.stat().st_size / 1024:.0f} KiB")
     for name in sorted(outputs):
         array = np.asarray(outputs[name]["data"], np.float32)

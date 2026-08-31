@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Write a LocalFold float32 model directory from AF3-lineage parameters.
 
-    python3 tools/export_af3_model.py                    # the trunk, from OpenFold3
+    python3 tools/export_af3_model.py                     # the trunk, from AF3
+    python3 tools/export_af3_model.py --model openfold3   # ...from OpenFold3
     python3 tools/export_af3_model.py --include diffuser  # everything
 
 The output is the shape tools/quantize_model.py consumes - manifest.json plus
@@ -15,10 +16,12 @@ AF3-lineage checkpoints (OpenFold3, Boltz-2, Chai-1, Protenix, RF3, IntelliFold,
 OpenDDE). Reading the blob rather than any one checkpoint format is the whole
 point - a second model becomes a different --blob, not a second exporter.
 
-🔴 OPENFOLD3'S PARAMETERS, NOT DEEPMIND'S. AF3's own carry a Prohibited Use
-Policy; OpenFold3's are Apache 2.0. This repository exists to be loaded by
-anyone, so the only weights worth exporting are the ones that may be served.
-The graph is the same - the AF3 architecture under the OpenFold3 dialect.
+🔴 WHICH CHECKPOINT FILLED THE BUNDLE IS RECORDED IN IT. AF3's own parameters
+carry DeepMind's Weights Terms of Use; OpenFold3's are Apache 2.0; both build
+the same graph and both land in `model-af3/`, so the directory cannot say which
+is inside. The manifest's model.name does, and tools/build_site.py reads it and
+requires LOCALFOLD_ACCEPT_MODEL_TERMS before publishing a restricted one. The
+page gates the download behind licence acceptance for the same reason.
 
 🔴 THE TENSOR NAMES ARE THE HAIKU PATHS, UNCHANGED. The AF2 exports rename every
 tensor to `stack_haiku_0042` and keep the real structure in nested manifest
@@ -45,8 +48,14 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
-BLOB = os.path.expanduser(
-    "~/Documents/GitHub/af3_of3/weights/af3_converted_v4/of3_ported_weights.bin.zst")
+# One blob per model, each obtained from source and checked against the graph's
+# own jax.eval_shape table before use. The OpenFold3 one is ColabDesign2's
+# converter's output - the alphafold3 repo ships an older converter under a
+# different name, and its output is not what this reads.
+BLOBS = {
+    "alphafold3": "~/af3_official_weights/af3.bin.zst",
+    "openfold3": "~/af3_converted_cd2/of3_ported_weights.bin.zst",
+}
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
 # (including the atom transformer encoder, which produces 384 of target_feat's
@@ -115,7 +124,8 @@ def read_blob(path: str):
     return read(path)
 
 
-def export(blob_path: str, out_dir: Path, include: tuple[str, ...]) -> int:
+def export(blob_path: str, out_dir: Path, include: tuple[str, ...],
+           model: str) -> int:
     records = read_blob(blob_path)
     wanted = [(scope, name, array) for scope, name, array in records
               if scope.startswith(include)]
@@ -148,8 +158,8 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...]) -> int:
     manifest = {
         "formatVersion": 1,
         "source": f"AF3-lineage parameters from {Path(blob_path).name}",
-        "model": {"name": "openfold3", "recycles": 0},
-        "bundle": {"purpose": "browser-inference", "model": "openfold3",
+        "model": {"name": model, "recycles": 0},
+        "bundle": {"purpose": "browser-inference", "model": model,
                    "encoding": "float32-le"},
         # 🔴 WHAT WAS LEFT OUT, IN THE ARTEFACT ITSELF. A bundle carrying only the
         # trunk is correct today and wrong the moment something asks it for the
@@ -173,9 +183,12 @@ def export(blob_path: str, out_dir: Path, include: tuple[str, ...]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--blob", default=BLOB,
-                        help="a ColabDesign2 AF3-lineage parameter blob")
-    parser.add_argument("--out", default=str(ROOT / "model-af3-f32"))
+    parser.add_argument("--model", default="alphafold3", choices=sorted(BLOBS),
+                        help="which checkpoint of the lineage to export")
+    parser.add_argument("--blob", default=None,
+                        help="an AF3-lineage parameter blob (default: the model's)")
+    parser.add_argument("--out", default=None,
+                        help="default: model-af3-f32, or model-<model>-f32")
     parser.add_argument("--include", nargs="+", default=list(TRUNK),
                         help="scope prefixes to export (default: the trunk)")
     parser.add_argument("--colabdesign2", default=None,
@@ -184,8 +197,15 @@ def main() -> int:
     if arguments.colabdesign2:
         global COLABDESIGN2
         COLABDESIGN2 = os.path.expanduser(arguments.colabdesign2)
-    return export(os.path.expanduser(arguments.blob), Path(arguments.out),
-                  tuple(arguments.include))
+    blob = arguments.blob or BLOBS[arguments.model]
+    # One bundle directory for the AF3 graph, whichever checkpoint of the
+    # lineage fills it. Which one that was is recorded in the manifest's
+    # model.name, and tools/build_site.py reads it there before publishing -
+    # see RESTRICTED_TERMS, which is why the name has to be in the artefact
+    # rather than only in the directory it landed in.
+    out = arguments.out or str(ROOT / "model-af3-f32")
+    return export(os.path.expanduser(blob), Path(out),
+                  tuple(arguments.include), arguments.model)
 
 
 if __name__ == "__main__":

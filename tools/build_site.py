@@ -70,6 +70,24 @@ DTYPE_BYTES = {"int8": 1, "float16": 2, "float32": 4}
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from write_manifest_module import BUNDLES  # noqa: E402
 
+# Model names whose parameters carry redistribution terms, and the terms they
+# carry. Publishing one is permitted here - the maintainers hold an academic
+# licence for it and the page gates the download behind acceptance - but only
+# deliberately: set LOCALFOLD_ACCEPT_MODEL_TERMS to the names being published.
+#
+# 🔴 THIS IS A GATE, NOT A JUDGEMENT. It exists because ONE COMMAND FLAG chooses
+# which checkpoint fills a bundle directory, so the difference between weights
+# that may be served and weights that may not is invisible in the tree. The
+# manifest records which is in there; this makes something read it before the
+# bytes go somewhere public.
+RESTRICTED_TERMS = {
+    "alphafold3": "DeepMind's AF3 Weights Terms of Use and Prohibited Use Policy",
+}
+ACCEPTED_TERMS = frozenset(
+    name.strip() for name in os.environ.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",")
+    if name.strip()
+)
+
 
 def build_commit() -> str:
     """The commit this build came from: the CI one, or the checkout's HEAD."""
@@ -113,6 +131,20 @@ def registry_mismatches() -> list[str]:
             problems.append(f"{family}: {BUNDLES[family]['module']} does not exist;"
                             f" run python3 tools/write_manifest_module.py {family}")
     return problems
+
+
+def restricted_terms(module: Path) -> str | None:
+    """The restricted licence this bundle's weights carry, if unaccepted.
+
+    Read from what the artefact SAYS IT IS - the manifest's model.name - and
+    not from the directory it sits in, because one command flag chooses which
+    checkpoint of a lineage fills a bundle directory and the tree looks
+    identical either way.
+    """
+    named = (compiled_manifest(module).get("model") or {}).get("name")
+    if named in RESTRICTED_TERMS and named not in ACCEPTED_TERMS:
+        return named
+    return None
 
 
 def manifest_mismatches(model: Path, module: Path) -> list[str]:
@@ -275,6 +307,17 @@ def build(include_model: bool) -> int:
             # purely for file:// - shipping both would put a 356 MiB site at
             # 830 MiB, most of a GitHub Pages allowance spent on bytes nothing
             # on that site can use.
+            restricted = restricted_terms(ROOT / bundle["module"])
+            if restricted is not None:
+                print(f"{bundle['export']}/ holds {restricted} parameters, which"
+                      f" carry {RESTRICTED_TERMS[restricted]}.", file=sys.stderr)
+                print("Publishing them is a deliberate act, so it is opt-in:"
+                      f" set LOCALFOLD_ACCEPT_MODEL_TERMS={restricted} to confirm"
+                      " the licence covers this deployment, or re-export the"
+                      " bundle from a checkpoint that carries no such terms.",
+                      file=sys.stderr)
+                return 1
+
             mismatches = manifest_mismatches(model, ROOT / bundle["module"])
             if mismatches:
                 print(f"{bundle['module']} does not describe {bundle['export']}/:",
