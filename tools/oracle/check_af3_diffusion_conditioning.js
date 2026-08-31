@@ -38,10 +38,10 @@ const NOISE_CHANNELS = 256;
 
 /** A conditioning transition: plain LayerNorm, SwiGLU, project. No gate. */
 const transitionWeights = (T, name) => ({
-  FfwLayerNormScale: T(`${name}ffw_layer_norm/scale`),
-  FfwLayerNormOffset: T(`${name}ffw_layer_norm/offset`),
-  FfwTransition1: T(`${name}ffw_transition1/weights`),
-  FfwTransition2: T(`${name}ffw_transition2/weights`),
+  ffwLayerNormScale: T(`${name}ffw_layer_norm/scale`),
+  ffwLayerNormOffset: T(`${name}ffw_layer_norm/offset`),
+  ffwTransition1: T(`${name}ffw_transition1/weights`),
+  ffwTransition2: T(`${name}ffw_transition2/weights`),
 });
 
 async function main() {

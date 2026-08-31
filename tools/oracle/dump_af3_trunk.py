@@ -95,7 +95,7 @@ def truncate_pairformer(model_params, num_layer):
     return out
 
 
-def capture(pattern):
+def capture(pattern, argument_pattern=None):
     """An interceptor that keeps the full output of every module matching `pattern`.
 
     🔴 THE ACTIVATIONS ARE TRACERS AT TRACE TIME AND CANNOT BE READ. The trunk's
@@ -111,6 +111,11 @@ def capture(pattern):
     """
     import re
     matches = re.compile(pattern)
+    # 🔴 SOME THINGS ARE ONLY VISIBLE AS AN ARGUMENT. The denoiser's noisy
+    # positions are drawn inside the sampler's scan and handed straight to the
+    # diffusion head; nothing downstream is an invertible function of them, so a
+    # capture that records only outputs cannot reproduce a single denoising step.
+    takes_arguments = re.compile(argument_pattern) if argument_pattern else None
     kept, counts = {}, {}
 
     def record(name, value):
@@ -119,10 +124,18 @@ def capture(pattern):
     def interceptor(next_f, args, kwargs, context):
         out = next_f(*args, **kwargs)
         site = f"{context.module.module_name}/{context.method_name}"
-        if context.method_name == "__init__" or not matches.search(site):
+        wanted = matches.search(site)
+        if takes_arguments is not None and takes_arguments.search(site):
+            wanted = True
+        if context.method_name == "__init__" or not wanted:
             return out
         index = counts.get(site, 0)
         counts[site] = index + 1
+        if takes_arguments is not None and takes_arguments.search(site):
+            for position, argument in enumerate(args):
+                for leaf, value in arrays(argument):
+                    name = f"{site}<{position}{'.' + leaf if leaf else ''}"
+                    jax.debug.callback(lambda v, n=name: record(n, v), value)
         for leaf, value in arrays(out):
             name = f"{site}:{leaf}" if leaf else site
             jax.debug.callback(lambda v, n=name: record(n, v), value)
@@ -160,6 +173,9 @@ def main():
                              " (default: skip it entirely)")
     parser.add_argument("--float32", action="store_true",
                         help="run the trunk in float32 instead of AF3's bfloat16")
+    parser.add_argument("--capture-args", default=None, dest="capture_args",
+                        help="regex over call sites whose ARGUMENTS to keep too,"
+                             " recorded as site<0, site<1, ...")
     parser.add_argument("--capture", default=r"evoformer/__call__$",
                         help="regex over module call sites whose full output to"
                              " keep (default: the trunk's single and pair)")
@@ -201,7 +217,7 @@ def main():
         runner.model_params = truncate_pairformer(runner.model_params,
                                                   arguments.blocks)
 
-    interceptor, captured = capture(arguments.capture)
+    interceptor, captured = capture(arguments.capture, arguments.capture_args)
     with hk.intercept_methods(interceptor):
         out = runner.predict(batch, key=jax.random.PRNGKey(0))
     jax.block_until_ready(jax.tree_util.tree_leaves(out))   # let the callbacks land

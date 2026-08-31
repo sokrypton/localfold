@@ -68,7 +68,7 @@ const blocks = [0,1,2].map(i => ({
   ffwAdaptiveZeroCondBias: blockAt("ffw_adaptive_zero_cond/bias", i),
 }));
 
-const out = atomCrossAttentionEncoder({
+const encoded = atomCrossAttentionEncoder({
   shape: { tokens, dense, subsets, queries, keys },
   conditioning,
   atomMask: reference.mask,
@@ -90,6 +90,7 @@ const out = atomCrossAttentionEncoder({
   projectAtomFeaturesForAggr: w("project_atom_features_for_aggr"),
   blocks,
 });
+const out = encoded.tokenAct;
 console.log(`${dump.model}, ${tokens} tokens, ${subsets} subsets x ${queries}`
   + ` queries x ${keys} keys, from reference conformers`);
 

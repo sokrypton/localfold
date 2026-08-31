@@ -220,7 +220,7 @@ function buildTargetFeat(tensors, dump, tokens) {
   const gather = (name, count) => ({
     indices: input(`${name}:gather_idxs`), mask: input(`${name}:gather_mask`), count,
   });
-  const atoms = atomCrossAttentionEncoder({
+  const encoded = atomCrossAttentionEncoder({
     shape: { tokens, dense, subsets, queries, keys },
     conditioning,
     atomMask: reference.mask,
@@ -244,7 +244,7 @@ function buildTargetFeat(tensors, dump, tokens) {
   });
   return targetFeatures({
     aatype: input("aatype"), profile: input("profile"),
-    deletionMean: input("deletion_mean"), atomFeatures: atoms,
+    deletionMean: input("deletion_mean"), atomFeatures: encoded.tokenAct,
   }, tokens);
 }
 

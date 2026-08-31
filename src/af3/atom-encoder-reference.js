@@ -127,7 +127,7 @@ export function adaptiveZeroInit(x, cond, rows, channels, weights, prefix,
  *
  * @param {object} shape {subsets, queries, keys, channels, heads, dimension}
  */
-function crossAttentionBlock(queriesAct, state, shape, weights) {
+export function crossAttentionBlock(queriesAct, state, shape, weights) {
   const { subsets, queries, keys, channels, heads, dimension } = shape;
   const { queriesToKeys, queriesMask, keysMask, queriesCond, keysCond, pairLogits } = state;
   const queryRows = subsets * queries;
@@ -225,6 +225,40 @@ function crossAttentionBlock(queriesAct, state, shape, weights) {
 }
 
 /**
+ * The per-block attention biases, for every block of an atom stack at once.
+ *
+ * 🔴 ONE LAYERNORM AND ONE PROJECTION SERVE THE WHOLE STACK, which is why the
+ * projection's output is (blocks, heads) rather than heads. Recomputing it per
+ * block would read the same weights and give the same answer; splitting it the
+ * wrong way round gives every block the biases meant for another.
+ */
+export function atomPairLogits(pair, shape, weights) {
+  const { subsets, queries, keys, pairChannels, heads, blocks } = shape;
+  const pairRows = subsets * queries * keys;
+  const normalised = layerNormSlow(pair, pairRows, pairChannels,
+                                   weights.pairInputLayerNormScale, null);
+  const flat = linear(normalised, pairRows, pairChannels, blocks * heads,
+                      weights.pairLogitsProjection);
+  const output = [];
+  for (let block = 0; block < blocks; block += 1) {
+    const perBlock = new Float32Array(subsets * heads * queries * keys);
+    for (let subset = 0; subset < subsets; subset += 1) {
+      for (let query = 0; query < queries; query += 1) {
+        for (let key = 0; key < keys; key += 1) {
+          const source = (((subset * queries + query) * keys) + key) * blocks * heads;
+          for (let head = 0; head < heads; head += 1) {
+            perBlock[((subset * heads + head) * queries + query) * keys + key] =
+              flat[source + block * heads + head];
+          }
+        }
+      }
+    }
+    output.push(perBlock);
+  }
+  return output;
+}
+
+/**
  * The whole encoder: per-atom conditioning in, per-token features out.
  *
  * @returns {Float32Array} tokens * perTokenChannels
@@ -238,12 +272,49 @@ export function atomCrossAttentionEncoder(input, weights) {
 
   const queriesCond = convert(input.tokenAtomsToQueries, input.conditioning, channels);
   const queriesMask = convert(input.tokenAtomsToQueries, input.atomMask, 1);
-  const keysCond = convert(input.queriesToKeys, queriesCond, channels);
-  const keysMask = convert(input.queriesToKeys, queriesMask, 1);
+
+  // 🔴 THE TRUNK'S SINGLE CONDITIONING IS BROADCAST PER TOKEN, NOT PER ATOM,
+  // and it goes in BEFORE the keys are gathered - so every key sees it too.
+  // Only the diffusion head passes it; the trunk's own encoder has no trunk to
+  // condition on yet.
+  if (input.trunkSingleCond !== undefined) {
+    const projected = linear(
+      layerNormSlow(input.trunkSingleCond, tokens, weights.trunkSingleChannels,
+                    weights.lnormTrunkSingleCondScale, null),
+      tokens, weights.trunkSingleChannels, channels, weights.embedTrunkSingleCond);
+    const perQuery = convert(input.tokensToQueries, projected, channels);
+    for (let index = 0; index < queriesCond.length; index += 1) {
+      queriesCond[index] += perQuery[index];
+    }
+  }
+
+  // 🔴 MASKED BEFORE THE KEYS ARE GATHERED FROM IT, NOT AFTER. This is a no-op
+  // for the trunk's encoder - _per_atom_conditioning already masked its output,
+  // so the two orders agree - and it is NOT a no-op once the trunk conditioning
+  // is added above, because that puts non-zero values into padded atom slots.
+  // Gathering first carries them into the keys, where two thirds of the slots
+  // are padding: measured 8.4e-2 on the encoder's output, which reads like a
+  // subtly wrong kernel rather than a line in the wrong order.
   for (let row = 0; row < queryRows; row += 1) {
     for (let c = 0; c < channels; c += 1) queriesCond[row * channels + c] *= queriesMask[row];
   }
+  const keysCond = convert(input.queriesToKeys, queriesCond, channels);
+  const keysMask = convert(input.queriesToKeys, queriesMask, 1);
+
+  // ...the query starts as the conditioning, and the diffusion head then adds
+  // the NOISY POSITIONS to it. The trunk's encoder has no positions to add, so
+  // its query is the conditioning alone.
   const queriesAct = Float32Array.from(queriesCond);
+  if (input.tokenAtomsAct !== undefined) {
+    const gatheredPositions = convert(input.tokenAtomsToQueries, input.tokenAtomsAct, 3);
+    const positional = linear(gatheredPositions, queryRows, 3, channels,
+                              weights.atomPositionsToFeatures);
+    for (let row = 0; row < queryRows; row += 1) {
+      for (let c = 0; c < channels; c += 1) {
+        queriesAct[row * channels + c] += positional[row * channels + c] * queriesMask[row];
+      }
+    }
+  }
 
   const rectifiedQueries = Float32Array.from(queriesCond, (v) => (v > 0 ? v : 0));
   const rectifiedKeys = Float32Array.from(keysCond, (v) => (v > 0 ? v : 0));
@@ -251,6 +322,26 @@ export function atomCrossAttentionEncoder(input, weights) {
                      weights.singleToPairCondRow);
   const column = linear(rectifiedKeys, keyRows, channels, pairChannels,
                         weights.singleToPairCondCol);
+
+  // ...the trunk pair conditioning, projected once and then gathered per atom
+  // pair below.
+  let trunkPair = null;
+  let tokensToKeys = null;
+  let keysTokenMask = null;
+  if (input.trunkPairCond !== undefined) {
+    trunkPair = linear(
+      layerNormSlow(input.trunkPairCond, tokens * tokens, weights.trunkPairChannels,
+                    weights.lnormTrunkPairCondScale, null),
+      tokens * tokens, weights.trunkPairChannels, pairChannels,
+      weights.embedTrunkPairCond);
+    // 🔴 tokens_to_keys IS IN THE BATCH; DO NOT DERIVE IT. Carrying
+    // tokens_to_queries through the queries-to-keys gather looks equivalent and
+    // is a second source of truth for something the featuriser already
+    // computed - and its MASK is not the same, because a derived one folds in
+    // the query mask where AF3's is the key's own.
+    tokensToKeys = input.tokensToKeys.indices;
+    keysTokenMask = input.tokensToKeys.mask;
+  }
 
   const queriesRefPos = convert(input.tokenAtomsToQueries, input.refPos, 3);
   const queriesSpaceUid = convert(input.tokenAtomsToQueries, input.refSpaceUid, 1);
@@ -291,6 +382,16 @@ export function atomCrossAttentionEncoder(input, weights) {
             // "these two atoms are unrelated" is information the model uses.
             + valid * weights.embedPairOffsetsValid[c];
         }
+        // 🔴 THE TRUNK'S PAIR REPRESENTATION, INDEXED BY THE TWO ATOMS' TOKENS.
+        // Only the diffusion head supplies it; the trunk's own encoder runs
+        // before there is a pair to condition on. Both ends must be real, so
+        // the mask is the AND of the query's token and the key's.
+        if (trunkPair !== null
+            && input.tokensToQueries.mask[queryIndex] && keysTokenMask[keyIndex]) {
+          const from = (input.tokensToQueries.indices[queryIndex] * tokens
+            + tokensToKeys[keyIndex]) * pairChannels;
+          for (let c = 0; c < pairChannels; c += 1) pair[base + c] += trunkPair[from + c];
+        }
       }
     }
   }
@@ -303,35 +404,15 @@ export function atomCrossAttentionEncoder(input, weights) {
                           weights.pairMlp3);
   for (let index = 0; index < pair.length; index += 1) pair[index] += residual[index];
 
-  // ...the pair logits for every block at once, which is why the projection's
-  // output is (blocks, heads) rather than heads.
-  const blocks = weights.blocks.length;
   const heads = weights.heads;
-  const normalisedPair = layerNormSlow(pair, pairRows, pairChannels,
-                                       weights.pairInputLayerNormScale, null);
-  const flatLogits = linear(normalisedPair, pairRows, pairChannels, blocks * heads,
-                            weights.pairLogitsProjection);
-  const pairLogits = [];
-  for (let block = 0; block < blocks; block += 1) {
-    const perBlock = new Float32Array(subsets * heads * queries * keys);
-    for (let subset = 0; subset < subsets; subset += 1) {
-      for (let query = 0; query < queries; query += 1) {
-        for (let key = 0; key < keys; key += 1) {
-          const source = (((subset * queries + query) * keys) + key) * blocks * heads;
-          for (let head = 0; head < heads; head += 1) {
-            perBlock[((subset * heads + head) * queries + query) * keys + key] =
-              flatLogits[source + block * heads + head];
-          }
-        }
-      }
-    }
-    pairLogits.push(perBlock);
-  }
+  const pairLogits = atomPairLogits(pair, { subsets, queries, keys, pairChannels,
+                                            heads, blocks: weights.blocks.length },
+                                    weights);
 
   const shape = { subsets, queries, keys, channels, heads,
                   dimension: weights.dimension };
   let act = queriesAct;
-  for (let block = 0; block < blocks; block += 1) {
+  for (let block = 0; block < weights.blocks.length; block += 1) {
     act = crossAttentionBlock(act, {
       queriesToKeys: input.queriesToKeys, queriesMask, keysMask,
       queriesCond, keysCond, pairLogits: pairLogits[block],
@@ -340,6 +421,7 @@ export function atomCrossAttentionEncoder(input, weights) {
   for (let index = 0; index < queryRows; index += 1) {
     for (let c = 0; c < channels; c += 1) act[index * channels + c] *= queriesMask[index];
   }
+  const skipConnection = Float32Array.from(act);
 
   // ...back to token-atom layout, rectified, and averaged over each token's
   // REAL atoms only.
@@ -365,7 +447,9 @@ export function atomCrossAttentionEncoder(input, weights) {
       for (let c = 0; c < perToken; c += 1) output[token * perToken + c] /= count;
     }
   }
-  return output;
+  // The decoder needs everything the encoder computed, not just its output.
+  return { tokenAct: output, skipConnection, queriesMask, keysMask,
+           queriesCond, keysCond, pairCond: pair };
 }
 
 /**
