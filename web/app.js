@@ -123,23 +123,23 @@ function progress(fraction) {
 }
 
 /**
- * The complex-construction switches that are turned OFF, for the status line.
+ * What a complex fold is doing DIFFERENTLY, for the status line.
  *
  * 🔴 A FLAG THAT IS NOT WIRED READS EXACTLY LIKE A CHANGE THAT DOES NOTHING.
  * `?pairing=off` was compared against the default before it existed, and the
- * two runs agreeing looked like evidence rather than a typo. Naming the active
- * ablations where the fold reports itself makes that failure visible instead.
- * Only shown for a complex; none of these reach a single chain.
- */
-/**
- * What a complex fold is actually doing, for the status line.
+ * two runs agreeing looked like evidence rather than a typo. So an ablation
+ * that is switched on says so where the fold reports itself.
  *
- * 🔴 REPORT WHAT RAN, NOT WHAT WAS ASKED FOR. This used to read the URL flags
- * and say "block-diagonal" whenever none was set - which became a lie the
+ * 🔴 AND IT REPORTS WHAT RAN, NOT WHAT WAS ASKED FOR. This used to read the URL
+ * flags and say "block-diagonal" whenever none was set - which became a lie the
  * moment multimer started pairing its alignment on its own, because nobody had
- * typed ?pairing=on. A label that describes the request rather than the run is
- * worse than no label: it is the same failure as a flag that is not wired, one
- * step further downstream.
+ * typed ?pairing=on.
+ *
+ * What it does NOT say is what each family does every time anyway. Multimer
+ * pairs its repeated chains and the monomer does not, on every fold, so that
+ * label was on screen permanently and carried no information; only a departure
+ * from it is worth a reader's attention. Only shown for a complex; none of
+ * these reach a single chain.
  *
  * @param {number} chainCount
  * @param {{construction?: string}} run what the alignment step actually built
@@ -209,8 +209,7 @@ async function alignmentText(chains, signal, family) {
       const searched = chains.length === 1
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
-      status(`MSA search found ${searched.depth} sequences`
-        + (chains.length > 1 && pairRepeatedChains ? " · paired" : ""));
+      status(`MSA search found ${searched.depth} sequences`);
       // 🔴 EVERY COMPLEX SWITCH IS OFF UNTIL ASKED FOR. The default is the
       // block-diagonal construction this started from; ?perchain=on samples
       // each chain separately and merges the tensors afterwards.
@@ -228,8 +227,13 @@ async function alignmentText(chains, signal, family) {
       return {
         text: searched.a3m,
         chainA3ms: perChain ? searched.chainA3ms : undefined,
-        construction: `${pairRepeatedChains ? "paired" : "block-diagonal"}`
-          + `${perChain ? " · sampled per chain" : ""}`,
+        // ...only when it is not what this family does by default. Multimer
+        // pairs its repeated chains and the monomer does not, every time, so
+        // naming that on every fold is noise; naming a departure from it is
+        // the thing worth seeing.
+        construction: perChain ? "sampled per chain"
+          : pairRepeatedChains !== (family === "multimer")
+            ? (pairRepeatedChains ? "paired" : "block-diagonal") : undefined,
       };
     }
     default:
@@ -728,13 +732,13 @@ async function fold(event) {
     element("downloads").style.display = "flex";
     updateScoresCard(final.confidence, `Final (Pass ${prediction.recycles.length})`);
     const took = ((performance.now() - started) / 1000).toFixed(1);
-    const paired = viewer?.paeRenderer?.n > 0 ? " · PAE paired" : "";
+
     const converged = prediction.recycles.length < passes
       ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`
       : "";
     const finalIptmText = final.confidence.iptm !== undefined ? ` · ipTM ${Number(final.confidence.iptm).toFixed(3)}` : "";
     status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`
-      + ` · pTM ${final.confidence.ptm.toFixed(3)}${finalIptmText}${converged}${paired}`);
+      + ` · pTM ${final.confidence.ptm.toFixed(3)}${finalIptmText}${converged}`);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");
