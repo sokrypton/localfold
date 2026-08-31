@@ -162,6 +162,23 @@ export class AlphaFoldUnifiedGpu {
       );
       let previousAtom37 = new Float32Array(length * 37 * 3);
 
+    // 🔴 A WAY TO SEE INSIDE THE TRUNK, for the oracle to bisect against.
+    // The trunk is three stages - embedder, extra-MSA stack, main evoformer -
+    // and comparing only its final output says which of them is wrong exactly
+    // as well as a coin does. `capture` reads the pair tensor back at a named
+    // stage; it costs a full GPU sync, so it is off unless asked for.
+    const capture = recycleOptions.capture;
+    const capturePair = async(name, tensor) => {
+      if (capture === undefined) return;
+      const encoder = this.device.createCommandEncoder({ label: `capture.${name}` });
+      const readback = execution.createReadback(`capture.${name}`, tensor, encoder);
+      execution.endComputePass(encoder);
+      this.device.queue.submit([encoder.finish()]);
+      capture(name, await execution.mapFloat32(readback));
+      releaseTensor(readback);
+    };
+
+
       for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
         throwIfAborted(signal);
         const features = featuresByRecycle[recycle];
@@ -183,6 +200,7 @@ export class AlphaFoldUnifiedGpu {
           );
         }
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
+        await capturePair("embedder", embedding.pairWithoutTemplates);
         throwIfAborted(signal);
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
@@ -227,6 +245,7 @@ export class AlphaFoldUnifiedGpu {
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
           void this.device.queue.onSubmittedWorkDone().then(() => step());
         }
+        await capturePair("extra-stack", embedding.pairWithoutTemplates);
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
         const mainDescriptor = {

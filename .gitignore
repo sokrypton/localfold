@@ -34,3 +34,7 @@ __pycache__/
 /toy-oracle.json
 /model-multimer-f32
 /toy-oracle-monomer.json
+/toy-oracle-truncated.json
+/toy-oracle-truncated-monomer.json
+/toy-oracle-truncated-opmlast.json
+/toy-oracle-truncated-notmpl.json

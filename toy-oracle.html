@@ -83,16 +83,27 @@ try {
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(),
       fixture.tensor('confidencePaeBreaks'),
     ]);
-  const weights = { embedding, extraStack, mainStack, structure,
-    lddt: confidence.lddt, pae: confidence.pae, geometry };
+  // ...?blocks=main:extra truncates the trunk to match a truncated reference,
+  // so a difference has one block to live in rather than fifty-two.
+  const trunc = (q.get('blocks') ?? '').split(':').map(Number);
+  const weights = { embedding, structure, geometry,
+    extraStack: trunc.length === 2 ? extraStack.slice(0, trunc[1]) : extraStack,
+    mainStack: trunc.length === 2 ? mainStack.slice(0, trunc[0]) : mainStack,
+    lddt: confidence.lddt, pae: confidence.pae };
+  if (trunc.length === 2) log(`trunk truncated to ${weights.mainStack.length} main`
+    + ` + ${weights.extraStack.length} extra blocks`);
 
+  // ...capture the trunk's stages as it runs, so the comparison can say WHICH
+  // of the three is wrong rather than only that the trunk is.
+  const stages = {};
   const device = await getDevice();
   const prediction = await new AlphaFoldUnifiedGpu(device).predict(
     features, weights, paeBreaks, undefined, undefined,
     family === 'monomer'
       ? { templates: false }
-      : { outerProductMeanFirst: true, positionScale: 20, templates: false,
-          chainLengths: [o.chainLength, o.chainLength] });
+      : { outerProductMeanFirst: q.get('opm') !== 'off', positionScale: 20, templates: false,
+          chainLengths: [o.chainLength, o.chainLength],
+          capture: (name, values) => { stages[name] = values; } });
 
   const ours = prediction.final.structure.atom37;
   const theirs = Float64Array.from(o.ca);
@@ -115,7 +126,7 @@ try {
   // hands the structure module, so if they match, everything before them is
   // right and the difference is downstream - and if they do not, nothing after
   // them is worth looking at yet.
-  const compareRep = (name, theirsArr, oursArr) => {
+  var compareRep = (name, theirsArr, oursArr) => {
     let maxabs = 0, sumsq = 0, refsq = 0;
     for (let i = 0; i < theirsArr.length; i += 1) {
       const d = theirsArr[i] - oursArr[i];
@@ -124,6 +135,28 @@ try {
     log(`  ${name.padEnd(22)} n=${String(theirsArr.length).padStart(6)}`
       + `  maxabs ${maxabs.toExponential(3)}  relRMS ${Math.sqrt(sumsq / refsq).toExponential(2)}`);
   };
+  // stage by stage, where a reference for that stage exists
+  const truncRef = trunc.length === 2
+    ? await fetch(family === 'monomer' ? './toy-oracle-truncated-monomer.json'
+        : (q.get('opm') === 'off' ? './toy-oracle-truncated-opmlast.json'
+          : q.get('tmpl') === 'off' ? './toy-oracle-truncated-notmpl.json'
+          : './toy-oracle-truncated.json')).then((r) => r.ok ? r.json() : null).catch(() => null)
+    : null;
+  if (truncRef !== null) {
+    log(`truncated trunk (${truncRef.main} main + ${truncRef.extra} extra):`);
+    compareRep('pair', Float64Array.from(truncRef.truncated_pair), prediction.final.pair);
+    if (truncRef.truncated_msa_first_row !== undefined) {
+      compareRep('msa first row', Float64Array.from(truncRef.truncated_msa_first_row),
+        prediction.final.msaFirstRow);
+    }
+    log('');
+  }
+  const stageRef = await fetch('./toy-oracle-stages.json').then((r) => r.ok ? r.json() : null).catch(() => null);
+  if (stageRef !== null && stages.embedder !== undefined) {
+    log('inside the trunk:');
+    compareRep('embedder pair', Float64Array.from(stageRef.embedder_pair), stages.embedder);
+    log('');
+  }
   log('the trunk, before the structure module:');
   compareRep('pair', Float64Array.from(o.rep_pair), prediction.final.pair);
   compareRep('msa first row', Float64Array.from(o.rep_msa_first_row), prediction.final.msaFirstRow);
