@@ -24,6 +24,7 @@ then a fact with a timestamp on it, not an impression.
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -115,6 +116,16 @@ def main() -> int:
         print(f"would push {head[:8]} to origin/{BRANCH} ({name}),"
               f" dispatch {WORKFLOW!r}, and wait for {site_url} to serve it")
         return report_live(site_url)
+
+    # ...checked BEFORE the push, because the push is the irreversible half. A
+    # missing gh after a successful push leaves the commit on the remote with
+    # nothing deploying it, which is the exact state this tool exists to prevent.
+    if shutil.which("gh") is None:
+        print("gh is not installed, so the workflow cannot be dispatched -"
+              " and a push alone does not deploy. Install the GitHub CLI, or"
+              f" dispatch {WORKFLOW!r} from the Actions tab after pushing.",
+              file=sys.stderr)
+        return 1
 
     print(f"pushing {head[:8]}…")
     subprocess.run(["git", "push", "origin", BRANCH], check=True)
