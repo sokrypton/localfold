@@ -28,7 +28,12 @@ try {
   // ...the monomer control uses the monomer export and the monomer regime, so
   // the same page answers "is this multimer's fault or ours in general?"
   const family = q.get('family') ?? 'multimer';
-  const o = await fetch(family === 'monomer' ? './toy-oracle-monomer.json' : './toy-oracle.json')
+  // ...?copies=3 reads a dump of the same toy at a different chain count, so
+  // "does the error grow with copies" is a measurement rather than a guess.
+  const dump = family === 'monomer' ? './toy-oracle-monomer.json'
+    : q.get('copies') === null ? './toy-oracle.json'
+      : `./toy-oracle-${q.get('copies')}copies.json`;
+  const o = await fetch(dump)
     .then((r) => r.json());
   const L = o.length;
   log(`toy complex: ${o.copies} chains x ${o.chainLength} = ${L} residues\n`);
@@ -117,7 +122,7 @@ try {
           // ...the reference has template.enabled TRUE, so the default here is
           // on; ?tmpl=off pairs with the templates-disabled reference dump.
           templates: q.get('tmpl') !== 'off',
-          chainLengths: [o.chainLength, o.chainLength],
+          chainLengths: Array.from({ length: o.copies }, () => o.chainLength),
           capture: (name, values) => { stages[name] = values; } });
 
   const ours = prediction.final.structure.atom37;
@@ -150,6 +155,23 @@ try {
     log(`  ${name.padEnd(22)} n=${String(theirsArr.length).padStart(6)}`
       + `  maxabs ${maxabs.toExponential(3)}  relRMS ${Math.sqrt(sumsq / refsq).toExponential(2)}`);
   };
+  var compareBlocks = (ref, oursArr) => {
+    const C = Math.ceil(L / o.chainLength), ch = o.chainLength, pc = ref.length / (L * L);
+    for (let i = 0; i < C; i += 1) for (let j = 0; j < C; j += 1) {
+      let sumsq = 0, refsq = 0;
+      for (let r = i * ch; r < Math.min((i + 1) * ch, L); r += 1)
+        for (let c = j * ch; c < Math.min((j + 1) * ch, L); c += 1)
+          for (let k = 0; k < pc; k += 1) {
+            const idx = (r * L + c) * pc + k, d = ref[idx] - oursArr[idx];
+            sumsq += d * d; refsq += ref[idx] * ref[idx];
+          }
+      // ...with the reference block's own RMS beside it, because relRMS
+      // divides by it: a block that is simply smaller reads as a worse block.
+      const n = ch * ch * pc;
+      log(`    block ${i}-${j}${' '.repeat(14)}relRMS ${Math.sqrt(sumsq / refsq).toExponential(2)}`
+        + `   (their RMS ${Math.sqrt(refsq / n).toFixed(3)})`);
+    }
+  };
   // stage by stage, where a reference for that stage exists
   const truncRef = trunc.length === 2
     ? await fetch(family === 'monomer' ? './toy-oracle-truncated-monomer.json'
@@ -174,10 +196,15 @@ try {
   if (stageRef !== null && stages.embedder !== undefined && q.get('tmpl') === 'off') {
     log('inside the trunk:');
     compareRep('embedder pair', Float64Array.from(stageRef.embedder_pair), stages.embedder);
+    compareBlocks(Float64Array.from(stageRef.embedder_pair), stages.embedder);
     log('');
   }
   log('the trunk, before the structure module:');
   compareRep('pair', Float64Array.from(o.rep_pair), prediction.final.pair);
+  // ...and split by chain block. A uniform error is a uniform cause; an error
+  // that lives in one block is a chain-index-dependent one, which is what a
+  // wrong asym/sym id or a wrong relative-chain bin would look like.
+  compareBlocks(Float64Array.from(o.rep_pair), prediction.final.pair);
   compareRep('msa first row', Float64Array.from(o.rep_msa_first_row), prediction.final.msaFirstRow);
   log('');
 
@@ -188,37 +215,50 @@ try {
   for (let r = 0; r < L; r += 1) { A.push(ca(r)); B.push([theirs[r*3], theirs[r*3+1], theirs[r*3+2]]); }
   const centre = (P) => { const c = [0,1,2].map((k) => P.reduce((s,p) => s+p[k], 0)/P.length);
     return P.map((p) => p.map((v,k) => v - c[k])); };
-  const a = centre(A), b = centre(B);
   // Kabsch: the optimal rotation is the one that maximises trace(R H), and the
   // residual RMSD follows from the singular values of the covariance H.
-  const H = [[0,0,0],[0,0,0],[0,0,0]];
-  for (let i = 0; i < L; i += 1) for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) H[r][c] += a[i][r]*b[i][c];
-  // singular values via the eigenvalues of H^T H, by cyclic Jacobi on 3x3
-  const M = [[0,0,0],[0,0,0],[0,0,0]];
-  for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) for (let k = 0; k < 3; k += 1) M[r][c] += H[k][r]*H[k][c];
-  let T = M.map((row) => row.slice());
-  for (let sweep = 0; sweep < 40; sweep += 1) {
-    for (const [p_, q_] of [[0,1],[0,2],[1,2]]) {
-      if (Math.abs(T[p_][q_]) < 1e-12) continue;
-      const theta = 0.5*Math.atan2(2*T[p_][q_], T[q_][q_]-T[p_][p_]);
-      const cth = Math.cos(theta), sth = Math.sin(theta);
-      const R = [[1,0,0],[0,1,0],[0,0,1]];
-      R[p_][p_] = cth; R[q_][q_] = cth; R[p_][q_] = sth; R[q_][p_] = -sth;
-      const N = [[0,0,0],[0,0,0],[0,0,0]];
-      for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1)
-        for (let k = 0; k < 3; k += 1) for (let l = 0; l < 3; l += 1) N[r][c] += R[k][r]*T[k][l]*R[l][c];
-      T = N;
+  const kabsch = (A_, B_) => {
+    const n = A_.length;
+    const a = centre(A_), b = centre(B_);
+    const H = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let i = 0; i < n; i += 1) for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) H[r][c] += a[i][r]*b[i][c];
+    // singular values via the eigenvalues of H^T H, by cyclic Jacobi on 3x3
+    const M = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1) for (let k = 0; k < 3; k += 1) M[r][c] += H[k][r]*H[k][c];
+    let T = M.map((row) => row.slice());
+    for (let sweep = 0; sweep < 40; sweep += 1) {
+      for (const [p_, q_] of [[0,1],[0,2],[1,2]]) {
+        if (Math.abs(T[p_][q_]) < 1e-12) continue;
+        const theta = 0.5*Math.atan2(2*T[p_][q_], T[q_][q_]-T[p_][p_]);
+        const cth = Math.cos(theta), sth = Math.sin(theta);
+        const R = [[1,0,0],[0,1,0],[0,0,1]];
+        R[p_][p_] = cth; R[q_][q_] = cth; R[p_][q_] = sth; R[q_][p_] = -sth;
+        const N = [[0,0,0],[0,0,0],[0,0,0]];
+        for (let r = 0; r < 3; r += 1) for (let c = 0; c < 3; c += 1)
+          for (let k = 0; k < 3; k += 1) for (let l = 0; l < 3; l += 1) N[r][c] += R[k][r]*T[k][l]*R[l][c];
+        T = N;
+      }
     }
+    const sv = [T[0][0], T[1][1], T[2][2]].map((v) => Math.sqrt(Math.max(v, 0)));
+    const det = H[0][0]*(H[1][1]*H[2][2]-H[1][2]*H[2][1]) - H[0][1]*(H[1][0]*H[2][2]-H[1][2]*H[2][0])
+      + H[0][2]*(H[1][0]*H[2][1]-H[1][1]*H[2][0]);
+    sv.sort((x, y) => y - x);
+    const trace = sv[0] + sv[1] + (det < 0 ? -sv[2] : sv[2]);
+    let sq = 0;
+    for (let i = 0; i < n; i += 1) for (let k = 0; k < 3; k += 1) sq += a[i][k]*a[i][k] + b[i][k]*b[i][k];
+    return Math.sqrt(Math.max(0, (sq - 2*trace)) / n);
+  };
+  log(`  superposed CA RMSD  ${kabsch(A, B).toFixed(3)} A   over ${L} residues`);
+  // 🔴 A COMPLEX'S RMSD IS MOSTLY WHERE THE SECOND CHAIN SITS. Superposing the
+  // whole thing mixes "is each chain folded right" with "is the interface
+  // placed right", and the second is far more sensitive. Per chain separates
+  // them: chains that superpose tight under a loose complex means the fold is
+  // fine and the docking is what differs.
+  for (let chain = 0; chain * o.chainLength < L; chain += 1) {
+    const s = chain * o.chainLength, e = s + o.chainLength;
+    log(`  chain ${chain} alone      ${kabsch(A.slice(s, e), B.slice(s, e)).toFixed(3)} A`
+      + `   over ${o.chainLength} residues`);
   }
-  const sv = [T[0][0], T[1][1], T[2][2]].map((v) => Math.sqrt(Math.max(v, 0)));
-  const det = H[0][0]*(H[1][1]*H[2][2]-H[1][2]*H[2][1]) - H[0][1]*(H[1][0]*H[2][2]-H[1][2]*H[2][0])
-    + H[0][2]*(H[1][0]*H[2][1]-H[1][1]*H[2][0]);
-  sv.sort((x, y) => y - x);
-  const trace = sv[0] + sv[1] + (det < 0 ? -sv[2] : sv[2]);
-  let sq = 0;
-  for (let i = 0; i < L; i += 1) for (let k = 0; k < 3; k += 1) sq += a[i][k]*a[i][k] + b[i][k]*b[i][k];
-  const rmsd = Math.sqrt(Math.max(0, (sq - 2*trace)) / L);
-  log(`  superposed CA RMSD  ${rmsd.toFixed(3)} A   over ${L} residues`);
 
   const pl = Float64Array.from(o.plddt_logits);
   const oursLddt = prediction.final.confidence.lddtLogits;
