@@ -1,4 +1,4 @@
-# LocalFold
+# LocalFold - beta
 
 LocalFold is an end-to-end WebGPU implementation of AlphaFold 2 monomer model 1. It accepts either a raw amino-acid sequence or A3M text, runs recycling, the extra-MSA stack, all 48 main Evoformer blocks, the eight-layer structure module, atom geometry, and pLDDT/PAE heads.
 
