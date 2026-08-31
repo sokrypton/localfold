@@ -155,6 +155,8 @@ def main():
     parser.add_argument("--model", default="alphafold3", choices=sorted(WEIGHTS))
     parser.add_argument("--weights", default=None,
                         help="blob directory (default: the model's)")
+    parser.add_argument("--float32", action="store_true",
+                        help="run the trunk in float32 instead of AF3's bfloat16")
     parser.add_argument("--capture", default=r"evoformer/__call__$",
                         help="regex over module call sites whose full output to"
                              " keep (default: the trunk's single and pair)")
@@ -175,6 +177,14 @@ def main():
     weights = os.path.expanduser(arguments.weights
                                  or WEIGHTS[arguments.model])
     config = make_config(num_recycles=0, model=arguments.model, num_msa=1)
+    # 🔴 AF3'S TRUNK COMPUTES IN BFLOAT16, and that sets the floor on what any
+    # reimplementation can be checked to. bfloat16 keeps eight mantissa bits, so
+    # its relative epsilon is 2^-8 = 3.9e-3 - and a block's own captured output
+    # differs from its input plus its five captured deltas by 4.3e-3, which is
+    # that and not a fault in either. An f32 run gives a reference the graph can
+    # actually be held to; it is not what the shipped model does.
+    if arguments.float32:
+        config.global_config.bfloat16 = "none"
     if arguments.blocks is not None:
         config.evoformer.pairformer.num_layer = arguments.blocks
     runner = AF3Runner(model_dir=weights, cfg=config,
@@ -221,6 +231,8 @@ def main():
     suffix = "" if arguments.blocks is None else f"-{blocks}block"
     if arguments.model != "alphafold3":
         suffix = f"-{arguments.model}{suffix}"
+    if arguments.float32:
+        suffix += "-f32"
     path = pathlib.Path(arguments.out) if arguments.out else \
         ROOT / f"af3-oracle{suffix}.json"
     path.write_text(json.dumps({
