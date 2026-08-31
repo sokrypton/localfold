@@ -2,9 +2,9 @@ import {
   encodeEvoformerPairBlock,
   encodeExtraMsaBlock,
   encodeEvoformerBlock,
-
 } from "./block.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
 
 /**
  * The pair track, wherever it already is.
@@ -46,6 +46,7 @@ export class EvoformerStackGpu {
   constructor(device) { this.device = device; }
 
   async run(input) {
+    throwIfAborted(input.signal);
     if (input.blockWeights.length === 0) throw new RangeError("Evoformer stack requires at least one block");
     const execution = input.execution ?? new WebGpuExecution(this.device);
     const ownsExecution = input.execution === undefined;
@@ -61,13 +62,14 @@ export class EvoformerStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       let timestampProfile;
-      const requestedWindow = input.submissionWindow ?? input.blockWeights.length;
+      const requestedWindow = input.submissionWindow ?? (input.signal !== undefined ? 1 : input.blockWeights.length);
       if (!Number.isSafeInteger(requestedWindow) || requestedWindow < 1) {
         throw new RangeError("submissionWindow must be a positive safe integer");
       }
       const submissionWindow = input.profileBlock === undefined ? requestedWindow : 1;
 
       for (let block = 0; block < input.blockWeights.length; block += 1) {
+        throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `evoformer-stack.block-${block}` });
         const profiling = input.profileBlock === block;
         if (profiling) execution.beginTimestampProfile();
@@ -92,8 +94,9 @@ export class EvoformerStackGpu {
           // Pooling makes these buffers available to the next encoded block.
           // Queue ordering ensures its commands execute only after this block.
           execution.releaseSince(persistentCheckpoint);
-          if (endOfWindow) await this.device.queue.onSubmittedWorkDone();
+          if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), input.signal);
         }
+        throwIfAborted(input.signal);
         // 🔴 WHEN THE DEVICE REACHES THIS BLOCK, reported without waiting for it.
         //
         // queue.onSubmittedWorkDone() resolves once everything submitted so far
@@ -124,8 +127,9 @@ export class EvoformerStackGpu {
       const pairReadback = input.keepPair === true
         ? undefined : execution.createReadback("stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
-      const msaOutput = await execution.mapFloat32(msaReadback);
-      const pairOutput = pairReadback === undefined ? undefined : await execution.mapFloat32(pairReadback);
+      const msaOutput = await withAbort(execution.mapFloat32(msaReadback), input.signal);
+      const pairOutput = pairReadback === undefined ? undefined : await withAbort(execution.mapFloat32(pairReadback), input.signal);
+      throwIfAborted(input.signal);
       input.onStage?.("done");
       return {
         msa: msaOutput,
@@ -153,6 +157,7 @@ export class ExtraMsaPairStackGpu {
   async run(input)
 
   {
+    throwIfAborted(input.signal);
     const execution = input.execution ?? new WebGpuExecution(this.device);
     const ownsExecution = input.execution === undefined;
     const entry = execution.checkpoint();
@@ -166,6 +171,7 @@ export class ExtraMsaPairStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       for (let block = 0; block < input.blockWeights.length; block += 1) {
+        throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `extra-msa-pair-stack.block-${block}` });
         this.device.pushErrorScope("validation");
         await encodeEvoformerPairBlock(
@@ -177,9 +183,11 @@ export class ExtraMsaPairStackGpu {
         if (validationError !== null) {
           throw new Error(`WebGPU extra-MSA block ${block} validation failed: ${validationError.message}`);
         }
+        throwIfAborted(input.signal);
         // Commands are queue ordered, so the next block may alias these
         // pooled scratch buffers without a host-side wait.
         execution.releaseSince(persistentCheckpoint);
+        if (input.signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), input.signal);
         // 🔴 WHEN THE DEVICE REACHES THIS BLOCK, reported without waiting for it.
         //
         // queue.onSubmittedWorkDone() resolves once everything submitted so far
@@ -201,6 +209,7 @@ export class ExtraMsaPairStackGpu {
       // residues - it removes a full host-device round trip from the middle of
       // the trunk. The main stack's commands queue straight in behind these.
       if (input.keepPair === true) {
+        throwIfAborted(input.signal);
         return {
           pair: undefined, pairTensor: pair,
           elapsedMilliseconds: performance.now() - start, memory: execution.snapshot(),
@@ -210,7 +219,8 @@ export class ExtraMsaPairStackGpu {
       const encoder = this.device.createCommandEncoder({ label: "extra-msa-pair-stack.readback" });
       const readback = execution.createReadback("extra-stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
-      const output = await execution.mapFloat32(readback);
+      const output = await withAbort(execution.mapFloat32(readback), input.signal);
+      throwIfAborted(input.signal);
       input.onStage?.("done");
       return {
         pair: output, pairTensor: pair,
@@ -228,6 +238,7 @@ export class ExtraMsaStackGpu {
   async run(input)
 
   {
+    throwIfAborted(input.signal);
     const execution = new WebGpuExecution(this.device);
     try {
       const msa = execution.upload("extra-full-stack.msa", input.msa, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
@@ -237,6 +248,7 @@ export class ExtraMsaStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       for (let block = 0; block < input.blockWeights.length; block += 1) {
+        throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `extra-msa-stack.block-${block}` });
         this.device.pushErrorScope("validation");
         await encodeExtraMsaBlock(execution, encoder, input, input.blockWeights[block], msa, pair, msaMask, pairMask);
@@ -244,15 +256,18 @@ export class ExtraMsaStackGpu {
         this.device.queue.submit([encoder.finish()]);
         const validationError = await this.device.popErrorScope();
         if (validationError !== null) throw new Error(`WebGPU extra-MSA block ${block} failed: ${validationError.message}`);
+        throwIfAborted(input.signal);
         execution.releaseSince(persistentCheckpoint);
+        if (input.signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), input.signal);
       }
       const encoder = this.device.createCommandEncoder({ label: "extra-full-stack.readback" });
       const msaReadback = execution.createReadback("extra-full-stack.msa-readback", msa, encoder);
       const pairReadback = execution.createReadback("extra-full-stack.pair-readback", pair, encoder);
       this.device.queue.submit([encoder.finish()]);
-      const [msaOutput, pairOutput] = await Promise.all([
+      const [msaOutput, pairOutput] = await withAbort(Promise.all([
         execution.mapFloat32(msaReadback), execution.mapFloat32(pairReadback),
-      ]);
+      ]), input.signal);
+      throwIfAborted(input.signal);
       return { msa: msaOutput, pair: pairOutput, elapsedMilliseconds: performance.now() - start,
         memory: execution.snapshot() };
     } finally { execution.release(); }

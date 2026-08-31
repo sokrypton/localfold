@@ -32,6 +32,17 @@ describe("browser prediction result formatting", () => {
     expect(pdb.endsWith("ENDMDL\nEND\n")).toBe(true);
   });
 
+  it("writes oligomers as separate PDB chains with numbering restarted", () => {
+    const atom37 = new Float32Array(3 * 37 * 3);
+    const atom37Mask = new Float32Array(3 * 37);
+    atom37Mask[0] = 1; atom37Mask[37] = 1; atom37Mask[74] = 1;
+    const pdb = predictionToPdb("ACD", { atom37, atom37Mask }, Float32Array.of(90, 80, 70), [1, 2]);
+    expect(pdb).toContain(" ALA A   1");
+    expect(pdb).toContain(" CYS B   1");
+    expect(pdb).toContain(" ASP B   2");
+    expect(pdb.match(/^TER$/gm).length).toBe(2);
+  });
+
   it("refuses an empty recycle list", () => {
     expect(() => recyclesToPdb("A", [])).toThrow(/at least one recycle/);
   });

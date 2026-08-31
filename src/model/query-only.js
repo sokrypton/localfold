@@ -5,6 +5,10 @@ import { EvoformerStackGpu, ExtraMsaPairStackGpu } from "../evoformer/stack.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { StructureModuleGpu } from "../structure/module.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
+import {
+  recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
+} from "./recycle-convergence.js";
 
 import { makeQueryOnlyFeatures } from "../input/query-only-features.js";
 
@@ -19,6 +23,7 @@ import { makeQueryOnlyFeatures } from "../input/query-only-features.js";
  * @property {Float32Array} pair
  * @property {StructureModuleResult} structure
  * @property {ConfidenceResult} confidence
+ * @property {number} recycleDistance ColabFold C-alpha distance convergence metric, in angstroms
  * @property {number} elapsedMilliseconds
  */
 
@@ -46,7 +51,7 @@ export class AlphaFoldQueryOnlyGpu {
     onProgress,
   ) {
     return this.predict(makeQueryOnlyFeatures(sequence, featureTables, options), weights,
-      paeBreaks, onRecycle, onProgress);
+      paeBreaks, onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal });
   }
 
   /**
@@ -60,16 +65,21 @@ export class AlphaFoldQueryOnlyGpu {
     paeBreaks,
     onRecycle,
     onProgress,
+    recycleOptions = {},
   ) {
     if (recycleFeatures.length === 0) throw new RangeError("at least one recycle feature set is required");
     const length = recycleFeatures[0] .aatype.length;
+    const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
+    const signal = recycleOptions.signal;
+    throwIfAborted(signal);
     const pairMask = new Float32Array(length * length);
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = recycleFeatures[0] .seqMask[i] * recycleFeatures[0] .seqMask[j];
     }
-    const template = await new QueryOnlyTemplateGpu(this.device).run({
+    const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
       length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
-    });
+    }), signal);
+    throwIfAborted(signal);
     // 🔴 ONE PAIR BUFFER FOR THE WHOLE TRUNK.
     //
     // The pair representation is the largest tensor the model touches - L*L*128
@@ -125,10 +135,11 @@ export class AlphaFoldQueryOnlyGpu {
       const results = [];
       const start = performance.now();
       for (let recycle = 0; recycle < recycleFeatures.length; recycle += 1) {
+        throwIfAborted(signal);
         const recycleStart = performance.now();
         const features = recycleFeatures[recycle];
         if (features.aatype.length !== length) throw new RangeError("recycle lengths differ");
-        const embedding = await new InputEmbedderGpu(this.device).run({
+        const embedding = await withAbort(new InputEmbedderGpu(this.device).run({
           targetFeatures: features.targetFeatures,
           msaFeatures: features.msaFeatures,
           extraMsa: features.extraMsa,
@@ -150,7 +161,8 @@ export class AlphaFoldQueryOnlyGpu {
           pairChannels: 128,
           extraMsaChannels: 64,
           weights: weights.embedding,
-        });
+        }), signal);
+        throwIfAborted(signal);
         // The template contribution, added where the pair already is.
         const residualEncoder = this.device.createCommandEncoder({ label: "trunk.template-residual" });
         this.device.pushErrorScope("validation");
@@ -161,7 +173,8 @@ export class AlphaFoldQueryOnlyGpu {
         if (residualError !== null) {
           throw new Error(`WebGPU template residual failed: ${residualError.message}`);
         }
-        const extra = await new ExtraMsaPairStackGpu(this.device).run({
+        throwIfAborted(signal);
+        const extra = await withAbort(new ExtraMsaPairStackGpu(this.device).run({
           execution,
           msa: embedding.extraMsa,
           pairTensor,
@@ -175,13 +188,14 @@ export class AlphaFoldQueryOnlyGpu {
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.extraStack,
+          signal,
           // ...WHEN THE DEVICE FINISHES A BLOCK, not when one is queued. The stack
           // queues all 48 ahead, so anything counted at encode time arrives in
           // the first moment and tells the reader nothing.
           onBlockDone: () => step(),
           onStage: (stage) => waiting(stage === "gpu"),
-        });
-        const trunk = await new EvoformerStackGpu(this.device).run({
+        }), signal);
+        const trunk = await withAbort(new EvoformerStackGpu(this.device).run({
           execution,
           msa: embedding.msa,
           pairTensor: extra.pairTensor,
@@ -194,14 +208,16 @@ export class AlphaFoldQueryOnlyGpu {
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.mainStack,
+          signal,
           // ...WHEN THE DEVICE FINISHES A BLOCK, not when one is queued. The stack
           // queues all 48 ahead, so anything counted at encode time arrives in
           // the first moment and tells the reader nothing.
           onBlockDone: () => step(),
           onStage: (stage) => waiting(stage === "gpu"),
-        });
+        }), signal);
+        throwIfAborted(signal);
         const msaFirstRow = trunk.msa.subarray(0, length * 256).slice();
-        const structure = await new StructureModuleGpu(this.device).run({
+        const structure = await withAbort(new StructureModuleGpu(this.device).run({
           msaFirstRow,
           pair: trunk.pair,
           mask: features.seqMask,
@@ -211,18 +227,27 @@ export class AlphaFoldQueryOnlyGpu {
           length,
           weights: weights.structure,
           geometry: weights.geometry,
+          signal,
           onStep: () => step(),
-        });
-        const confidence = await new ConfidenceHeadsGpu(this.device).run(
+        }), signal);
+        throwIfAborted(signal);
+        const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, trunk.pair, length, weights.lddt, weights.pae, paeBreaks,
           () => step(),
+          signal,
+        ), signal);
+        throwIfAborted(signal);
+        const recycleDistance = recycleConvergenceDistance(
+          previousPositions, structure.atom37, features.seqMask,
         );
         const recycleResult = {
-          msaFirstRow, pair: trunk.pair, structure, confidence,
+          msaFirstRow, pair: trunk.pair, structure, confidence, recycleDistance,
           elapsedMilliseconds: performance.now() - recycleStart,
         };
         results.push(recycleResult);
         onRecycle?.(recycleResult, recycle);
+        throwIfAborted(signal);
+        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)) break;
         previousMsa = msaFirstRow;
         previousPair = trunk.pair;
         previousPositions = structure.atom37;

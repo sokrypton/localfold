@@ -10,8 +10,27 @@ export const THREE_LETTER = {
   P: "PRO", S: "SER", T: "THR", W: "TRP", Y: "TYR", V: "VAL", X: "UNK",
 };
 
+function residueToCharIndex(sequence, residueIndex) {
+  let count = 0;
+  for (let i = 0; i < sequence.length; i += 1) {
+    if (sequence[i] !== ":") {
+      if (count === residueIndex) return i;
+      count += 1;
+    }
+  }
+  return -1;
+}
+
+function totalResidueCount(sequence) {
+  let count = 0;
+  for (let i = 0; i < sequence.length; i += 1) {
+    if (sequence[i] !== ":") count += 1;
+  }
+  return count;
+}
+
 /**
- * The sequence with one position replaced.
+ * The sequence with one or more positions replaced.
  *
  * THE INDEX IS INTO THE SEQUENCE THAT WAS FOLDED, which is not always what is
  * in the box: the box is editable while a structure is on screen, so a click on
@@ -21,23 +40,56 @@ export const THREE_LETTER = {
  * writing at the wrong place or off the end.
  *
  * @param {string} sequence the sequence the drawn structure was folded from
- * @param {number} index 0-based position
+ * @param {number | Array<number> | Set<number>} index 0-based position(s)
  * @param {string} residue one-letter code to put there
  * @returns {string}
  */
 export function substitute(sequence, index, residue) {
-  if (!Number.isInteger(index) || index < 0 || index >= sequence.length) {
-    throw new RangeError(`position ${index} is outside a ${sequence.length}-residue sequence`);
-  }
   if (typeof residue !== "string" || residue.length !== 1 || !(residue in THREE_LETTER)) {
     throw new RangeError(`${residue} is not one of the twenty amino acids`);
   }
-  return sequence.slice(0, index) + residue + sequence.slice(index + 1);
+  const total = totalResidueCount(sequence);
+  if (Array.isArray(index) || index instanceof Set) {
+    const indices = Array.from(index);
+    if (indices.length === 0) return sequence;
+    const charIndices = [];
+    for (const i of indices) {
+      if (!Number.isInteger(i) || i < 0 || i >= total) {
+        throw new RangeError(`position ${i} is outside a ${total}-residue sequence`);
+      }
+      charIndices.push(residueToCharIndex(sequence, i));
+    }
+    const chars = [...sequence];
+    for (const ci of charIndices) chars[ci] = residue;
+    return chars.join("");
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= total) {
+    throw new RangeError(`position ${index} is outside a ${total}-residue sequence`);
+  }
+  const charIdx = residueToCharIndex(sequence, index);
+  return sequence.slice(0, charIdx) + residue + sequence.slice(charIdx + 1);
 }
 
 /** How a mutation is written in the status line: the old residue, the position, the new one. */
 export function mutationName(sequence, index, residue) {
-  return `${sequence[index]}${index + 1}${residue}`;
+  if (Array.isArray(index) || index instanceof Set) {
+    const indices = Array.from(index).sort((a, b) => a - b);
+    if (indices.length === 0) return "";
+    if (indices.length === 1) {
+      const i = indices[0];
+      const ci = residueToCharIndex(sequence, i);
+      const letter = ci >= 0 ? sequence[ci] : "UNK";
+      return `${letter}${i + 1}${residue}`;
+    }
+    return indices.map((i) => {
+      const ci = residueToCharIndex(sequence, i);
+      const letter = ci >= 0 ? sequence[ci] : "UNK";
+      return `${letter}${i + 1}${residue}`;
+    }).join(", ");
+  }
+  const ci = residueToCharIndex(sequence, index);
+  const letter = ci >= 0 ? sequence[ci] : "UNK";
+  return `${letter}${index + 1}${residue}`;
 }
 
 /**
@@ -120,7 +172,7 @@ export function residueAt(viewer, sequenceLength, clientX, clientY) {
  * py2Dmol's own play bar, which lives along the bottom of the shell.
  *
  * @param {HTMLElement} host the element under the viewer to build into
- * @param {(index: number, residue: string) => void} onPick
+ * @param {(indices: number | number[], residue: string) => void} onPick
  */
 export function createMutationPanel(host, onPick) {
   const panel = document.createElement("div");
@@ -137,10 +189,10 @@ export function createMutationPanel(host, onPick) {
   hint.className = "mutate-hint";
   bar.appendChild(hint);
 
-  let position = -1;
+  let positions = [];
   let staged = "";
 
-  const hide = () => { panel.hidden = true; position = -1; staged = ""; };
+  const hide = () => { panel.hidden = true; positions = []; staged = ""; };
 
   const close = document.createElement("button");
   close.type = "button";
@@ -167,7 +219,7 @@ export function createMutationPanel(host, onPick) {
   // are painted by hydropathy, so ordering them by it turns the row into the
   // scale itself - orange at one end, blue at the other, each band a run.
   for (const code of RESIDUES_BY_HYDROPATHY) {
-      const button = document.createElement("button");
+    const button = document.createElement("button");
     button.type = "button";
     button.className = "mutate-cell";
     button.dataset.residue = code;
@@ -180,18 +232,22 @@ export function createMutationPanel(host, onPick) {
     // exactly what the reader is trying to judge.
     button.style.setProperty("--cell", hydropathyColor(code));
     button.addEventListener("click", () => {
-      if (position < 0) return;
+      if (positions.length === 0) return;
       staged = code;
       markCurrent(code);
-      hint.textContent = `${THREE_LETTER[code]} staged`;
-      onPick(position, code);
+      hint.textContent = positions.length > 1
+        ? `${THREE_LETTER[code]} staged for ${positions.length} residues`
+        : `${THREE_LETTER[code]} staged`;
+      onPick(positions.length === 1 ? positions[0] : positions, code);
     });
     grid.appendChild(button);
   }
 
-  /** Open it against a residue. No coordinates: it is always in the same place. */
-  const show = (index, residueLetter, label) => {
-    position = index;
+  /** Open it against one or multiple residues. */
+  const show = (indices, residueLetter, label) => {
+    positions = Array.isArray(indices) || indices instanceof Set
+      ? Array.from(indices).sort((a, b) => a - b)
+      : [indices];
     staged = "";
     title.textContent = `${label} \u2192`;
     panel.setAttribute("aria-label", `Mutate ${label}`);
@@ -206,7 +262,12 @@ export function createMutationPanel(host, onPick) {
     if (event.key === "Escape") hide();
   });
 
-  return { show, hide, element: panel,
-    get position() { return position; },
-    get staged() { return staged; } };
+  return {
+    show,
+    hide,
+    element: panel,
+    get position() { return positions[0] ?? -1; },
+    get positions() { return positions; },
+    get staged() { return staged; },
+  };
 }

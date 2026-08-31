@@ -10,6 +10,21 @@ describe("mutating one position of the folded sequence", () => {
     expect(substitute("ACDEF", 2, "W").length).toBe(5);
   });
 
+  it("replaces multiple selected residues at once", () => {
+    expect(substitute("ACDEF", [0, 2, 4], "W")).toBe("WCWEW");
+    expect(substitute("AAAAAAAAAA", [2, 5, 8], "G")).toBe("AAGAAGAAGA");
+    expect(substitute("ACDEF", new Set([1, 3]), "K")).toBe("AKDKF");
+    expect(substitute("ACDEF", [], "W")).toBe("ACDEF");
+  });
+
+  it("handles colon-separated complex sequences", () => {
+    expect(substitute("AAAA:GGGG", 0, "W")).toBe("WAAA:GGGG");
+    expect(substitute("AAAA:GGGG", 4, "W")).toBe("AAAA:WGGG");
+    expect(substitute("AAAA:GGGG", 7, "W")).toBe("AAAA:GGGW");
+    expect(substitute("AAAA:GGGG", [0, 4], "W")).toBe("WAAA:WGGG");
+    expect(mutationName("AAAA:GGGG", 4, "W")).toBe("G5W");
+  });
+
   // THE INDEX IS INTO THE SEQUENCE THAT WAS FOLDED, and the box is editable
   // while a structure is on screen - so an index that no longer fits is a
   // reader who trimmed the sequence after folding it, not a bug in the click.
@@ -20,12 +35,14 @@ describe("mutating one position of the folded sequence", () => {
     expect(() => substitute("ACDEF", 5, "W")).toThrow();
     expect(() => substitute("ACDEF", -1, "W")).toThrow();
     expect(() => substitute("ACDEF", 1.5, "W")).toThrow();
+    expect(() => substitute("ACDEF", [1, 5], "W")).toThrow();
   });
 
   it("refuses anything that is not one of the twenty", () => {
     expect(() => substitute("ACDEF", 1, "B")).toThrow();
     expect(() => substitute("ACDEF", 1, "TRP")).toThrow();
     expect(() => substitute("ACDEF", 1, "")).toThrow();
+    expect(() => substitute("ACDEF", [0, 1], "B")).toThrow();
   });
 
   // ...X is in the three-letter table because a prediction may contain one,
@@ -34,6 +51,7 @@ describe("mutating one position of the folded sequence", () => {
   it("names a mutation the way a paper does, 1-based", () => {
     expect(mutationName("ACDEF", 2, "W")).toBe("D3W");
     expect(mutationName("ACDEF", 0, "G")).toBe("A1G");
+    expect(mutationName("ACDEF", [0, 2, 4], "W")).toBe("A1W, D3W, F5W");
   });
 
   // WHAT A PICK ANSWERS WITH. Measured against a live py2Dmol embed: clicking

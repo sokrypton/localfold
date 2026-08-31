@@ -5,7 +5,11 @@ import {
 } from "../evoformer/block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
 import { StructureModuleGpu } from "../structure/module.js";
+import {
+  recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
+} from "./recycle-convergence.js";
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
 
@@ -21,6 +25,7 @@ import { makeA3mFeatures } from "../input/a3m-features.js";
  * @property {Float32Array} pair
  * @property {StructureModuleResult} structure
  * @property {ConfidenceResult} confidence
+ * @property {number} recycleDistance ColabFold C-alpha distance convergence metric, in angstroms
  * @property {number} elapsedMilliseconds
  */
 
@@ -41,7 +46,7 @@ export class AlphaFoldMonomerGpu {
     options = {}, paeBreaks,
     onRecycle, onProgress) {
     return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
-      onRecycle, onProgress);
+      onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal });
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]
@@ -50,16 +55,20 @@ export class AlphaFoldMonomerGpu {
    *   and nothing else for the whole of it, which reads as a hang.
    */
   async predict(featuresByRecycle, weights,
-    paeBreaks, onRecycle, onProgress) {
+    paeBreaks, onRecycle, onProgress, recycleOptions = {}) {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
     const length = featuresByRecycle[0] .aatype.length;
+    const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
+    const signal = recycleOptions.signal;
+    throwIfAborted(signal);
     const pairMask = new Float32Array(length * length);
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featuresByRecycle[0] .seqMask[i] * featuresByRecycle[0] .seqMask[j];
     }
-    const template = await new QueryOnlyTemplateGpu(this.device).run({
+    const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
       length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
-    });
+    }), signal);
+    throwIfAborted(signal);
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -95,8 +104,10 @@ export class AlphaFoldMonomerGpu {
       let previousPositions = execution.upload(
         "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
       );
+      let previousAtom37 = new Float32Array(length * 37 * 3);
 
       for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
+        throwIfAborted(signal);
         const features = featuresByRecycle[recycle];
         if (features.aatype.length !== length) throw new RangeError("all recycle feature lengths must match");
         const recycleStart = performance.now();
@@ -114,6 +125,7 @@ export class AlphaFoldMonomerGpu {
           embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
         );
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
+        throwIfAborted(signal);
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
 
@@ -123,6 +135,7 @@ export class AlphaFoldMonomerGpu {
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };
         for (let block = 0; block < weights.extraStack.length; block += 1) {
+          throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
           const encoder = this.device.createCommandEncoder({ label: `monomer.extra-${recycle}-${block}` });
           this.device.pushErrorScope("validation");
@@ -130,10 +143,8 @@ export class AlphaFoldMonomerGpu {
             embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor);
           await submit(encoder, `extra-MSA recycle ${recycle} block ${block}`);
           execution.releaseSince(checkpoint);
-          // ...WHEN THE DEVICE REACHES THIS BLOCK, not when one is queued.
-          // Unawaited, so the loop carries straight on encoding and the
-          // pipelining that makes this fast is untouched.
-          void this.device.queue.onSubmittedWorkDone().then(step);
+          if (signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          step();
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
@@ -144,6 +155,7 @@ export class AlphaFoldMonomerGpu {
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };
         for (let block = 0; block < weights.mainStack.length; block += 1) {
+          throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
           const encoder = this.device.createCommandEncoder({ label: `monomer.main-${recycle}-${block}` });
           this.device.pushErrorScope("validation");
@@ -152,7 +164,8 @@ export class AlphaFoldMonomerGpu {
           }, embedding.msa, embedding.pairWithoutTemplates, msaMask, pairMaskTensor);
           await submit(encoder, `main Evoformer recycle ${recycle} block ${block}`);
           execution.releaseSince(checkpoint);
-          void this.device.queue.onSubmittedWorkDone().then(step);
+          if (signal !== undefined) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
+          step();
         }
 
         const readbackEncoder = this.device.createCommandEncoder({ label: `monomer.readback-${recycle}` });
@@ -169,28 +182,39 @@ export class AlphaFoldMonomerGpu {
         );
         this.device.pushErrorScope("validation");
         await submit(readbackEncoder, `readback recycle ${recycle}`);
-        const [msaFirstRow, pair] = await Promise.all([
+        const [msaFirstRow, pair] = await withAbort(Promise.all([
           execution.mapFloat32(msaFirstRowTensor), execution.mapFloat32(pairReadback),
-        ]);
+        ]), signal);
+        throwIfAborted(signal);
         releaseTensor(msaFirstRowTensor); releaseTensor(pairReadback); releaseTensor(msaMask);
 
-        const structure = await new StructureModuleGpu(this.device).run({
+        const structure = await withAbort(new StructureModuleGpu(this.device).run({
           msaFirstRow, pair, mask: features.seqMask, aatype: features.aatype,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
+          signal,
           onStep: step,
-        });
-        const confidence = await new ConfidenceHeadsGpu(this.device).run(
+        }), signal);
+        throwIfAborted(signal);
+        const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
-          step,
+          step, signal,
+        ), signal);
+        throwIfAborted(signal);
+        const recycleDistance = recycleConvergenceDistance(
+          previousAtom37, structure.atom37, features.seqMask,
         );
         const recycleResult = { msaFirstRow, pair, structure, confidence,
+          recycleDistance,
           elapsedMilliseconds: performance.now() - recycleStart };
         results.push(recycleResult);
         onRecycle?.(recycleResult, recycle);
+        throwIfAborted(signal);
+        if (shouldStopAfterRecycle(recycle, recycleDistance, tolerance)) break;
         previousMsa = embedding.msa;
         previousPair = embedding.pairWithoutTemplates;
         previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
+        previousAtom37 = structure.atom37;
       }
       return {
         recycles: results, final: results[results.length - 1], elapsedMilliseconds: performance.now() - start,

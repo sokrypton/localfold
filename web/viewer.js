@@ -127,12 +127,25 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
             play: true,
             // ...and do not orient when we are about to put a camera back
             orient: camera === undefined,
+            background: "white",
+            backgroundColor: "white",
           });
+          try { renderer.setBackgroundColor?.("white"); } catch { /* ignore */ }
           objectName = renderer.currentObjectName;
           if (camera) Object.assign(renderer.viewerState, camera);
+          const frame0 = renderer.objectsData?.[objectName]?.frames?.[0];
+          if (frame0 !== undefined) {
+            frame0.name = "recycle_0";
+            frame0.label = "recycle_0";
+            frame0.title = "recycle_0";
+          }
           built = true;
         } else {
-          renderer.addFrame(api.frameFromText(pdb), objectName);
+          const frame = api.frameFromText(pdb);
+          frame.name = `recycle_${frames}`;
+          frame.label = `recycle_${frames}`;
+          frame.title = `recycle_${frames}`;
+          renderer.addFrame(frame, objectName);
         }
         // AFTER EVERY FRAME, not just the first. py2Dmol builds side-chain
         // atoms as real coordinates at frame-load time - its own note says

@@ -60,6 +60,7 @@ export function parseA3m(text) {
   return {
     query: sequences[0],
     descriptions,
+    rawSequences,
     sequences,
     deletionMatrix,
     depth: sequences.length,

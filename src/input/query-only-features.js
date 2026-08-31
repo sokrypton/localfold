@@ -1,3 +1,5 @@
+import { residueIndexWithChainBreaks } from "./chains.js";
+
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
 const RESTYPE_INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
 
@@ -26,7 +28,13 @@ function maskedCodes(aatype, recycle, seed) {
   return result;
 }
 
-/** Construct model-1 query-only tensors directly from an amino-acid sequence. */
+/**
+ * Construct model-1 query-only tensors directly from an amino-acid sequence.
+ * @param {string} sequenceValue concatenated chain sequences
+ * @param {{atom37ToAtom14: Float32Array, atom37Mask: Float32Array}} tables
+ * @param {{recycles?: number, randomSeed?: number, maskedMsaCodes?: readonly Float32Array[],
+ *   chainLengths?: readonly number[], tolerance?: number}} [options]
+ */
 export function makeQueryOnlyFeatures(
   sequenceValue,
   tables,
@@ -44,7 +52,7 @@ export function makeQueryOnlyFeatures(
   const targetFeatures = new Float32Array(length * 22);
   const seqMask = new Float32Array(length).fill(1);
   const msaMask = new Float32Array(length).fill(1);
-  const residueIndex = Float32Array.from({ length }, (_, index) => index);
+  const residueIndex = residueIndexWithChainBreaks(length, options.chainLengths);
   const atom37ToAtom14 = new Float32Array(length * 37);
   const atom37Mask = new Float32Array(length * 37);
   for (let residue = 0; residue < length; residue += 1) {

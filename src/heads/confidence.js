@@ -4,6 +4,7 @@ import {
 } from "../evoformer/transition.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { throwIfAborted, withAbort } from "../runtime/abort.js";
 
 /**
  * @typedef {object} ConfidenceResult
@@ -101,7 +102,9 @@ export class ConfidenceHeadsGpu {
     paeWeights,
     breaks = Float32Array.from({ length: 63 }, (_, index) => index * 0.5),
     onStage,
+    signal = undefined,
   ) {
+    throwIfAborted(signal);
     const structureChannels = structureRepresentation.length / length;
     const pairChannels = pairRepresentation.length / (length * length);
     const hiddenChannels = lddtWeights.act0Bias.length;
@@ -176,7 +179,8 @@ export class ConfidenceHeadsGpu {
         encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, source.byteLength); return target;
       });
       this.device.queue.submit([encoder.finish()]);
-      await Promise.all(readbacks.map((buffer) => buffer.buffer.mapAsync(GPUMapMode.READ)));
+      await withAbort(Promise.all(readbacks.map((buffer) => buffer.buffer.mapAsync(GPUMapMode.READ))), signal);
+      throwIfAborted(signal);
       const values = readbacks.map((buffer) => {
         const value = new Float32Array(buffer.buffer.getMappedRange().slice(0)); buffer.buffer.unmap(); return value;
       });

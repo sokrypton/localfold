@@ -6,12 +6,14 @@ import {
   StructurePostAttentionGpu,
 
 } from "./iteration.js";
+import { throwIfAborted, withAbort } from "../runtime/abort.js";
 
 export class StructureCoreGpu {
   device;
   constructor(device) { this.device = device; }
 
   async run(input) {
+    throwIfAborted(input.signal);
     let activations = input.activations;
     let affine = input.affine;
     const start = performance.now();
@@ -39,20 +41,23 @@ export class StructureCoreGpu {
     // residues that is 25 MiB a time, 200 MiB a pass, plus seven normalisations
     // whose only output was a copy. Prepared once here, it is resident for all
     // eight; only the activations and the frames still travel per iteration.
-    const prepared = await ipa.prepare(geometry);
+    const prepared = await withAbort(ipa.prepare(geometry), input.signal);
     try {
       for (let iteration = 0; iteration < iterations; iteration += 1) {
-        const attention = await ipa.run({ ...geometry, activations, affine, prepared });
-        const update = await post.run({
+        throwIfAborted(input.signal);
+        const attention = await withAbort(ipa.run({ ...geometry, activations, affine, prepared }), input.signal);
+        throwIfAborted(input.signal);
+        const update = await withAbort(post.run({
           activations,
           attentionUpdate: attention.output,
           affine,
           length: input.length,
           channels: input.channels,
           weights: input.postAttentionWeights,
-        });
+        }), input.signal);
         activations = update.activations;
         affine = update.affine;
+        throwIfAborted(input.signal);
         // ...REPORTED HERE AND NOWHERE ELSE. Both calls above already await real
         // GPU work, so this rides on a boundary that existed - it adds a function
         // call per iteration and no synchronisation of its own.
@@ -61,6 +66,7 @@ export class StructureCoreGpu {
     } finally {
       prepared.release();
     }
+    throwIfAborted(input.signal);
     return { activations, affine, elapsedMilliseconds: performance.now() - start };
   }
 }

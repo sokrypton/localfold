@@ -44,6 +44,20 @@ export function cleanSequence(text) {
     .toUpperCase();
 }
 
+/**
+ * Extract the first FASTA header line, or null if there is no header.
+ *
+ * @param {string} text
+ * @returns {string|null}
+ */
+export function extractFastaHeader(text) {
+  const lines = text.split(/\r?\n/).filter((line) => !COMMENT.test(line));
+  const headerLine = lines.find((line) => RECORD.test(line));
+  if (headerLine === undefined) return null;
+  const header = headerLine.replace(/^\s*>\s*/, "").trim();
+  return header.length > 0 ? header : null;
+}
+
 /** The twenty, plus X for unknown - what the model can actually fold. */
 const RESIDUES = /^[ARNDCQEGHILKMFPSTWYVX]+$/;
 
@@ -61,4 +75,23 @@ export function sequenceProblem(sequence) {
   return bad.length === 1
     ? `${bad[0]} is not one of the twenty amino acids`
     : `${bad.join(", ")} are not among the twenty amino acids`;
+}
+
+/** Why a colon-separated complex cannot be folded, or null if it can. */
+export function complexSequenceProblem(sequence) {
+  if (sequence.length === 0) return "Enter a protein sequence";
+  const chains = sequence.split(":");
+  if (chains.some((chain) => chain.length === 0)) return "Every chain between colons must contain a sequence";
+  for (let chain = 0; chain < chains.length; chain += 1) {
+    const problem = sequenceProblem(chains[chain]);
+    if (problem !== null) return chains.length === 1 ? problem : `Chain ${chain + 1}: ${problem}`;
+  }
+  return null;
+}
+
+/** Physical chain sequences from the validated colon-separated notation. */
+export function sequenceChains(sequence) {
+  const problem = complexSequenceProblem(sequence);
+  if (problem !== null) throw new Error(problem);
+  return sequence.split(":");
 }

@@ -153,12 +153,14 @@ def build(out: Path) -> int:
               '})();\n')
 
     page = (ROOT / PAGE).read_text()
-    style = (ROOT / STYLE).read_text()
+    style_py2dmol = (ROOT / "web/vendor/py2Dmol.app.css").read_text()
+    style_localfold = (ROOT / "web/localfold.css").read_text()
     vendor = (ROOT / VENDOR).read_text()
 
-    page = page.replace('<link rel="stylesheet" href="./web/style.css" />',
-                        f"<style>\n{style}\n</style>")
-    page = re.sub(r'[ \t]*<!-- py2Dmol first.*?-->\n', "", page, flags=re.S)
+    page = page.replace('<link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">',
+                        f"<style>\n{style_py2dmol}\n</style>")
+    page = page.replace('<link rel="stylesheet" href="./web/localfold.css">',
+                        f"<style>\n{style_localfold}\n</style>")
     page = page.replace('<script src="./web/vendor/py2Dmol.embed.min.js"></script>',
                         f"<script>\n{vendor}\n</script>")
     page = page.replace('<script type="module" src="./web/main.js"></script>',

@@ -1,91 +1,98 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#071512" />
-    <meta name="description" content="Fold a single protein sequence in your browser with AlphaFold2 and WebGPU, mutate a residue, and watch the structure resolve across recycles." />
-    <title>LocalFold · single sequence</title>
-    <link rel="stylesheet" href="./web/style.css" />
-  </head>
-  <body>
-    <main>
-      <!-- The title and the one action, on one line. The button lives outside
-           the form and reaches it by `form=` so it can sit up here without the
-           layout having to bend around it. -->
-      <header>
-        <h1><a href="./">LocalFold</a> <em>single sequence</em></h1>
-        <button id="predict" class="primary" type="submit" form="prediction-form">Fold</button>
-      </header>
 
-      <form id="prediction-form">
-        <textarea id="sequence" rows="3" spellcheck="false" aria-label="Protein sequence"
-          >PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
-        <span id="sequence-length" class="count">59 residues</span>
-      </form>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LocalFold · Single Sequence</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
+    <link rel="stylesheet" href="./web/localfold.css">
+    <style>
+        #canvasContainer {
+            width: 948px !important;
+            min-height: 480px !important;
+            resize: none !important;
+        }
+    </style>
+</head>
 
-      <!-- THE VIEWER IS NOT PART OF #results, and the status line is not either.
-           Both have to be visible while the model is still loading - which is
-           the longest and least reassuring part of a first visit - so only the
-           things that need a finished prediction are inside the hidden section.
-           Frames are appended as each recycle lands, so the structure appears
-           while the remaining passes are still running. -->
-      <!-- The orient button is a SIBLING of the viewer inside this wrapper, not
-           a child of it: every fold calls replaceChildren() on #viewer to build
-           its canvas, and anything inside would go with it. -->
-      <div class="viewer-wrap">
-        <div id="viewer"><p class="viewer-empty">Press Fold to predict a structure.</p></div>
-        <button id="orient" class="overlay-button" type="button" title="Best view" hidden>Orient</button>
-      </div>
-      <!-- The mutation panel mounts here: a sibling of the viewer, not a child.
-           Every fold empties the viewer box to rebuild it, and a panel inside
-           would go with it. Out here it also stays clear of py2Dmol's play bar. -->
-      <div id="mutate-host"></div>
-      <p id="status" class="status" data-state="idle">Ready</p>
-      <progress id="progress" max="1" value="0" hidden></progress>
+<body class="bg-gray-50 text-gray-800 font-sans p-4">
 
-      <div class="options">
-          <label class="inline">Recycles
-            <select id="recycles">
-              <option value="0" selected>0</option>
-              <option value="1">1</option>
-              <option value="3">3</option>
-              <option value="6">6</option>
-            </select>
-          </label>
-      </div>
+    <!-- Total width: 948px -->
+    <div id="viewer-root" class="mx-auto" style="width: 948px; position: relative;">
 
-      <section id="results" hidden>
-        <div class="scores">
-          <div><span>Mean pLDDT</span><strong id="mean-plddt">—</strong></div>
-          <div><span>pTM</span><strong id="ptm">—</strong></div>
-          <div><span>Passes</span><strong id="recycle-count">—</strong></div>
+        <div class="page-head" style="padding-right: 0;">
+            <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">single sequence</span></h1>
         </div>
 
-        <p class="legend-title">pLDDT</p>
-        <p id="legend-plddt" class="legend"></p>
-        <p class="legend-title">Hydropathy</p>
-        <p id="legend-hydro" class="legend"></p>
+        <!-- Fold Input Panel -->
+        <div id="fold-panel" class="container-box" style="width: 948px; margin-bottom: 10px;">
+            <div class="fetch-panel">
+                <div class="fetch-row" id="fold-input-container">
+                    <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
+                        placeholder="Paste a protein sequence">AAAAAAAAAA</textarea>
+                    <div class="fold-actions" style="width: 96px; min-width: 96px; max-width: 96px; flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px;">
+                        <button id="predict" class="btn btn-primary" style="width: 100%; height: 32px; justify-content: center; font-size: 13px;">
+                            <i class="fa-solid fa-cubes"></i>
+                            <span>Fold</span>
+                        </button>
+                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                            <label for="recycles" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Recycles</label>
+                            <select id="recycles" style="height: 24px; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
+                                <option value="0" selected>0</option>
+                                <option value="1">1</option>
+                                <option value="2">2</option>
+                                <option value="3">3</option>
+                                <option value="6">6</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
 
-        <canvas id="plddt-plot" width="720" height="220"></canvas>
+                <!-- Status & Progress -->
+                <div id="status-row">
+                    <div id="status-message">Ready. Paste a sequence and press Fold.</div>
+                    <progress id="progress" max="1" value="0" data-state="idle"></progress>
+                </div>
+            </div>
+        </div>
 
-        <p class="row">
-          <button id="download-pdb" class="quiet" type="button">Download PDB</button>
-          <button id="download-scores" class="quiet" type="button">Download scores</button>
-        </p>
-      </section>
+        <!-- Main Viewer Area (948px) -->
+        <div id="mainContainer" style="width: 948px; display: flex; flex-direction: column; gap: 8px;">
 
-      <footer>
-        <a href="./">Full version, with MSAs</a>
-        <a href="https://github.com/sokrypton/localfold">Source</a>
-        <span>AlphaFold2 by <a href="https://doi.org/10.1038/s41586-021-03819-2">Jumper et al. 2021</a> · parameters CC BY 4.0 · viewer <a href="https://github.com/sokrypton/py2Dmol">py2Dmol</a></span>
-        <span id="gpu-summary" data-state="checking">Checking WebGPU…</span>
-      </footer>
-    </main>
+            <!-- 3D Structure Viewer -->
+            <div id="canvasContainer" class="container-box" style="position: relative; width: 948px; min-height: 480px; padding: 0; overflow: hidden; background: #ffffff; border-radius: 8px;">
+                <div id="viewer" style="width: 100%; min-height: 480px; background: #ffffff;">
+                    <p class="viewer-empty" style="display: grid; place-items: center; height: 480px; margin: 0; color: #94a3b8; font-size: 13px;">Press Fold to predict a structure.</p>
+                </div>
+                <button id="orient" class="btn btn-secondary" type="button" title="Best view"
+                    style="position: absolute; top: 10px; right: 10px; z-index: 10; font-size: 12px; height: 28px; padding: 0 10px;" hidden>
+                    <i class="fa-solid fa-arrows-to-dot" style="margin-right: 4px;"></i> Orient
+                </button>
+            </div>
 
-    <!-- py2Dmol first: a classic script that installs window.py2Dmol.
-         Vendored, not fetched, so the page draws with no network. -->
+        </div>
+
+        <!-- Mutation host: full-width panel below main container -->
+        <div id="mutate-host" style="width: 948px; margin-top: 8px;"></div>
+
+        <!-- Footer -->
+        <footer style="margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; gap: 12px;">
+                <a href="./" style="color: #3b82f6; text-decoration: none; font-weight: 500;">Full version with MSA</a>
+                <span>·</span>
+                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Source</a>
+            </div>
+            <div id="gpu-summary" data-state="checking">Checking WebGPU…</div>
+        </footer>
+
+    </div>
+
+    <!-- py2Dmol script -->
     <script src="./web/vendor/py2Dmol.embed.min.js"></script>
     <script type="module" src="./web/main.js"></script>
-  </body>
+</body>
+
 </html>

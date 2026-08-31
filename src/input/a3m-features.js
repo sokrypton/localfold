@@ -7,6 +7,8 @@ import { makeQueryOnlyFeatures } from "./query-only-features.js";
  * @property {number} [randomSeed]         seeds the application PRNG; default 0
  * @property {number} [maxMsaSequences]    clustered rows kept; default 508
  * @property {number} [maxExtraSequences]  extra-MSA rows kept; default 1024
+ * @property {readonly number[]} [chainLengths] physical-chain lengths whose sum is the query length
+ * @property {number} [tolerance] recycle early-stop threshold in angstroms; consumed by the model
  *   Both defaults are explained at MAX_MSA_CLUSTERS below - the second is a
  *   deliberate reduction from AlphaFold's own model_1 value, not a copy of it.
  */
@@ -63,9 +65,10 @@ export function makeA3mFeatures(a3mText, tables,
     const symbol = alignment.sequences[row] [residue];
     encoded[row * length + residue] = symbol === "-" ? 21 : (INDEX.get(symbol) ?? 20);
   }
-  const base = makeQueryOnlyFeatures(alignment.query, tables, { recycles: 0, maskedMsaCodes: [
-    Float32Array.from(encoded.subarray(0, length)),
-  ] })[0];
+  const base = makeQueryOnlyFeatures(alignment.query, tables, {
+    recycles: 0, chainLengths: options.chainLengths,
+    maskedMsaCodes: [Float32Array.from(encoded.subarray(0, length))],
+  })[0];
   const recycles = options.recycles ?? 3;
   const maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth);
   const maxExtra = options.maxExtraSequences ?? MAX_EXTRA_SEQUENCES;

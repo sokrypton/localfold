@@ -1,5 +1,7 @@
 import { describe, expect, it } from "./harness.js";
-import { cleanSequence, sequenceProblem } from "../web/sequence.js";
+import {
+  cleanSequence, complexSequenceProblem, extractFastaHeader, sequenceChains, sequenceProblem,
+} from "../web/sequence.js";
 
 describe("cleaning a pasted sequence", () => {
   it("leaves a plain sequence alone", () => {
@@ -67,6 +69,14 @@ describe("cleaning a pasted sequence", () => {
     expect(cleanSequence("   \n\t 123 \n")).toBe("");
     expect(cleanSequence(">just a header")).toBe("");
   });
+
+  it("extracts FASTA header when present", () => {
+    expect(extractFastaHeader("ACDEFGHIKL")).toBe(null);
+    expect(extractFastaHeader(">my_protein\nACDEFGHIKL")).toBe("my_protein");
+    expect(extractFastaHeader("  >  sp|P12345|MY_PROT some desc  \nACDEF")).toBe("sp|P12345|MY_PROT some desc");
+    expect(extractFastaHeader("; comment\n>prot\nACDE")).toBe("prot");
+    expect(extractFastaHeader(">\nACDE")).toBe(null);
+  });
 });
 
 describe("reporting why a sequence cannot be folded", () => {
@@ -85,5 +95,18 @@ describe("reporting why a sequence cannot be folded", () => {
 
   it("names each offending letter once, however often it appears", () => {
     expect(sequenceProblem("BBBACDEB")).toBe("B is not one of the twenty amino acids");
+  });
+});
+
+describe("colon-separated complex sequences", () => {
+  it("keeps boundaries while cleaning and returns physical chains", () => {
+    const cleaned = cleanSequence("ACD : efG\n:ACD");
+    expect(cleaned).toBe("ACD:EFG:ACD");
+    expect(sequenceChains(cleaned)).toEqual(["ACD", "EFG", "ACD"]);
+  });
+
+  it("reports empty and invalid chains by position", () => {
+    expect(complexSequenceProblem("ACD::EFG")).toMatch(/Every chain/);
+    expect(complexSequenceProblem("ACD:EBG")).toBe("Chain 2: B is not one of the twenty amino acids");
   });
 });

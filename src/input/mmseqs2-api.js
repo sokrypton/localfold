@@ -1,4 +1,5 @@
 import { parseA3m } from "./a3m.js";
+import { mergeUnpairedChainA3ms } from "./chains.js";
 
 const DEFAULT_API_URL = "https://api.colabfold.com";
 const QUERY_ID = 101;
@@ -192,4 +193,42 @@ export async function generateMmseqs2Msa(sequenceValue,
   const elapsedMilliseconds = performance.now() - start;
   report("complete", status, ticket);
   return { a3m, ticket, depth: alignment.depth, elapsedMilliseconds };
+}
+
+/**
+ * Search each unique physical chain and assemble an unpaired complex A3M.
+ * Identical chains share one network search but are expanded into independent
+ * MSA blocks, which is the monomer-model homooligomer construction ColabFold
+ * uses. Distinct chains become the corresponding heterooligomer blocks.
+ *
+ * @param {readonly string[]} sequenceValues one sequence per physical chain
+ * @param {any} [options] the options accepted by generateMmseqs2Msa
+ * @returns {Promise<{a3m: string, tickets: string[], depth: number, elapsedMilliseconds: number}>}
+ */
+export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
+  if (!Array.isArray(sequenceValues) || sequenceValues.length < 2) {
+    throw new RangeError("a complex MSA requires at least two chain sequences");
+  }
+  const sequences = sequenceValues.map(normalizedSequence);
+  const unique = [...new Set(sequences)];
+  const started = performance.now();
+  const entries = await Promise.all(unique.map(async(sequence, uniqueIndex) => {
+    const searched = await generateMmseqs2Msa(sequence, {
+      ...options,
+      onProgress: options.onProgress === undefined ? undefined : (progress) => options.onProgress({
+        ...progress, chain: sequences.indexOf(sequence), search: uniqueIndex, searches: unique.length,
+      }),
+    });
+    return [sequence, searched];
+  }));
+  const bySequence = new Map();
+  for (const [sequence, searched] of entries) bySequence.set(sequence, searched);
+  const a3m = mergeUnpairedChainA3ms(sequences.map((sequence) => bySequence.get(sequence).a3m));
+  const alignment = parseA3m(a3m);
+  return {
+    a3m,
+    tickets: unique.map((sequence) => bySequence.get(sequence).ticket),
+    depth: alignment.depth,
+    elapsedMilliseconds: performance.now() - started,
+  };
 }

@@ -130,6 +130,32 @@ console.log(prediction.final.confidence.meanPlddt, prediction.final.confidence.p
 
 For A3M input, load `extraStackWeights()` and call `AlphaFoldMonomerGpu.predictA3m(...)`. `makeA3mFeatures(...)` is also exported for applications that want preprocessing and inference as separate steps.
 
+The monomer model also supports homo- and hetero-oligomers through ColabFold's
+residue-index offset trick. Pass the concatenated sequence plus physical chain
+lengths; every boundary receives a `+200` jump before the existing relative-
+position embedding runs:
+
+```js
+const chains = ["ACDEFG", "WYV", "ACDEFG"]; // A:B:A, a heteromer with two A copies
+const sequence = chains.join("");
+const options = {
+  recycles: 12,
+  tolerance: 0.5, // stop after pass 2+ once C-alpha distance change is below 0.5 Å; 0 disables
+  randomSeed: 0,
+  chainLengths: chains.map((chain) => chain.length),
+};
+const prediction = await new AlphaFoldQueryOnlyGpu(device).predictSequence(
+  sequence, weights, featureTables, options, paeBreaks,
+);
+```
+
+On `index.html`, enter that notation directly as `ACDEFG:WYV:ACDEFG`. Remote
+search queries each unique chain once, then constructs the same unpaired,
+gap-padded complex MSA as ColabFold's monomer path. A pasted or uploaded paired
+complex A3M is accepted when its concatenated query matches the entered chains.
+Downloaded PDBs use a distinct chain ID and restart residue numbering for each
+physical chain.
+
 The manifest is a JSON tensor table whose values are little-endian float32 binary files. `HttpTensorStore` fetches tensors lazily and caches them. `FileTensorStore` provides the equivalent Node test/development loader.
 
 ## Architecture and memory

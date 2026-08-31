@@ -24,10 +24,12 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldQueryOnlyGpu } from "../src/model/query-only.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
+import { splitComplexA3mByChain } from "../src/input/chains.js";
+import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
+import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { getDevice, loadModel } from "./model.js";
-import { confidenceJson, paeMatrix, predictionToPdb, recyclesToPdb } from "./prediction-results.js";
-import { cleanSequence, sequenceProblem } from "./sequence.js";
+import { confidenceJson, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName } from "./prediction-results.js";
+import { cleanSequence, complexSequenceProblem, extractFastaHeader, sequenceChains } from "./sequence.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -37,12 +39,24 @@ const element = (id) => {
 
 const sequenceValue = () => cleanSequence(element("sequence").value);
 const recycleCount = () => Number(element("recycles").value) || 0;
+const recycleTolerance = () => Number(element("tolerance").value) || 0;
+const randomSeed = () => {
+  const input = document.getElementById("random-seed");
+  if (input === null || input.value === "") return 0;
+  const parsed = Number(input.value);
+  return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+};
 const msaMode = () => element("msa-mode").value;
 
 let uploadedA3m = "";
+let predictionCount = 0;
+const predictions = new Map();
 
 /** The last prediction, kept so it can be downloaded as it was computed. */
 let lastPrediction;
+
+/** The one fold owned by the page; pressing the same button aborts it. */
+let activeFold;
 
 /** The drawn object, once the first pass has landed. See appendPass. */
 let viewer;
@@ -53,7 +67,7 @@ function status(text, isError = false) {
   const node = document.getElementById("status-message");
   if (node === null) return;
   node.textContent = text;
-  node.style.color = isError ? "#b91c1c" : "";
+  node.classList.toggle("error", isError);
 }
 
 /**
@@ -82,7 +96,7 @@ function progress(fraction) {
 
 // --- the alignment ---------------------------------------------------------
 
-async function alignmentText() {
+async function alignmentText(chains, signal) {
   switch (msaMode()) {
     case "single": return null;
     case "paste": {
@@ -99,15 +113,20 @@ async function alignmentText() {
       // against weights already on disk. The sequence is sent to the public
       // ColabFold MMseqs2 server, so it is a mode the reader picks rather than
       // a default they discover afterwards.
-      const query = sequenceValue();
-      const problem = sequenceProblem(query);
+      const query = chains.join("");
+      const problem = complexSequenceProblem(chains.join(":"));
       if (problem !== null) throw new Error(problem);
-      const searched = await generateMmseqs2Msa(query, {
+      const searchOptions = {
+        signal,
         onProgress: ({ phase, status: state, elapsedMilliseconds }) => {
+          if (signal.aborted) return;
           status(`MSA search · ${phase} (${state}) · ${(elapsedMilliseconds / 1000).toFixed(0)}s`
             + " · api.colabfold.com");
         },
-      });
+      };
+      const searched = chains.length === 1
+        ? await generateMmseqs2Msa(query, searchOptions)
+        : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`);
       return searched.a3m;
     }
@@ -137,14 +156,21 @@ async function alignmentText() {
  * The alignment is passed only when there is one - handing the app an A3M for a
  * single-sequence fold would draw a one-row MSA panel that says nothing.
  */
-async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length }) {
+async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, length }) {
   const load = window.py2dmolLoadFiles;
   if (typeof load !== "function") {
     throw new Error("this py2Dmol bundle has no py2dmolLoadFiles; it needs the `full` build");
   }
   const file = (name, text) => ({ name, readAsync: () => Promise.resolve(text) });
   const files = [file(`${stem}.pdb`, pdb), file(`${stem}_scores.json`, scores)];
-  if (a3m != null) files.push(file(`${stem}.a3m`, a3m));
+  if (a3m != null) {
+    const alignments = chainLengths?.length > 1
+      ? splitComplexA3mByChain(a3m, chainLengths)
+      : [a3m];
+    alignments.forEach((alignment, chain) => {
+      files.push(file(`${stem}_chain_${chain + 1}.a3m`, alignment));
+    });
+  }
   const stats = await load(files, true);
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
@@ -153,9 +179,14 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length }) {
   // Ingestion sets the panel up, but py2Dmol reads `frame.pae` when the frame
   // CHANGES - so without this, scrubbing the play bar back to the first pass
   // blanks a matrix that was on screen a moment earlier.
-  if (pae !== undefined) {
+  if (pae !== undefined || viewerObject !== undefined) {
     const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
-    if (frame !== undefined) { frame.pae = pae; frame.pae_n = length; }
+    if (frame !== undefined) {
+      frame.name = "recycle_0";
+      frame.label = "recycle_0";
+      frame.title = "recycle_0";
+      if (pae !== undefined) { frame.pae = pae; frame.pae_n = length; }
+    }
   }
   return stats;
 }
@@ -174,11 +205,15 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length }) {
  * The per-pass PAE rides on the frame, which is where py2Dmol looks for it
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
-function appendPass(sequence, recycle) {
+function appendPass(sequence, chainLengths, recycle, recycleIndex) {
   const api = window.py2Dmol;
   if (viewer === undefined || viewerObject === undefined || api?.frameFromText === undefined) return;
-  const pdb = predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt);
+  const pdb = predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt, chainLengths);
   const frame = api.frameFromText(pdb);
+  const index = recycleIndex ?? (viewer?.objectsData?.[viewerObject]?.frames?.length ?? 1);
+  frame.name = `recycle_${index}`;
+  frame.label = `recycle_${index}`;
+  frame.title = `recycle_${index}`;
   frame.pae = paeMatrix(recycle.confidence.predictedAlignedError, sequence.length);
   frame.pae_n = sequence.length;
   viewer.addFrame(frame, viewerObject);
@@ -190,59 +225,118 @@ function appendPass(sequence, recycle) {
 
 // --- running ---------------------------------------------------------------
 
+function setFoldButton(state) {
+  const button = element("predict");
+  const running = state !== "idle";
+  button.classList.toggle("btn-primary", !running);
+  button.classList.toggle("btn-danger", running);
+  button.disabled = state === "stopping";
+  button.setAttribute("aria-label", running ? "Stop prediction" : "Start prediction");
+  const icon = button.querySelector("i");
+  if (icon !== null) icon.className = running ? "fa-solid fa-stop" : "fa-solid fa-cubes";
+  const label = button.querySelector("span");
+  if (label !== null) label.textContent = running ? "Stop" : "Fold";
+}
+
 async function fold(event) {
   event?.preventDefault();
-  const button = element("predict");
-  button.disabled = true;
+  if (activeFold !== undefined) {
+    activeFold.abort();
+    setFoldButton("stopping");
+    status("Stopping prediction…");
+    return;
+  }
+  const controller = new AbortController();
+  const { signal } = controller;
+  activeFold = controller;
+  setFoldButton("running");
   try {
-    let sequence = sequenceValue();
-    const alignment = await alignmentText();
+    const entered = sequenceValue();
+    const enteredProblem = complexSequenceProblem(entered);
+    // A pasted/uploaded A3M remains self-describing: as before, its query may
+    // replace an empty or stale sequence box. Search and query-only input have
+    // no such query row to fall back to, so they require valid box contents.
+    if (enteredProblem !== null && ["single", "search"].includes(msaMode())) {
+      throw new Error(enteredProblem);
+    }
+    let chains = enteredProblem === null ? sequenceChains(entered) : [];
+    let sequence = chains.join("");
+    const alignment = await alignmentText(chains, signal);
+    throwIfAborted(signal);
     if (alignment !== null) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
       // folding the box's sequence against somebody else's alignment would be
       // folding two different proteins at once.
-      sequence = parseA3m(alignment).query;
-      element("sequence").value = sequence;
+      const alignedQuery = parseA3m(alignment).query;
+      if (chains.length > 1 && alignedQuery !== sequence) {
+        throw new Error("The complex A3M query does not match the colon-separated chain sequences");
+      }
+      if (chains.length <= 1) {
+        sequence = alignedQuery;
+        chains = [sequence];
+        element("sequence").value = sequence;
+      }
     }
-    const problem = sequenceProblem(sequence);
-    if (problem !== null) throw new Error(problem);
+    const chainLengths = chains.map((chain) => chain.length);
 
     status("Starting WebGPU");
     const device = await getDevice();
+    throwIfAborted(signal);
     const variant = alignment === null ? "single" : "msa";
     const model = await loadModel(variant, (value) => {
+      if (signal.aborted) return;
       progress(value.totalBytes === 0 ? 0 : value.loadedBytes / value.totalBytes);
       status(`Loading model · ${(value.loadedBytes / 1048576).toFixed(0)}`
         + ` / ${(value.totalBytes / 1048576).toFixed(0)} MiB`);
-    });
+    }, signal);
+    throwIfAborted(signal);
     progress(null);
     const recycles = recycleCount();
+    const tolerance = recycleTolerance();
+    const seed = randomSeed();
     const passes = recycles + 1;
     const started = performance.now();
+
+    predictionCount += 1;
+    const fastaHeader = extractFastaHeader(element("sequence").value);
+    const baseStem = fastaHeader !== null ? safeJobName(fastaHeader) : `prediction_${predictionCount}`;
+    let stem = baseStem;
+    const existingObjects = new Set((viewer?.objects ?? []).map((o) => o.name));
+    let suffix = 1;
+    while (existingObjects.has(stem) || predictions.has(stem)) {
+      suffix += 1;
+      stem = `${baseStem}_${suffix}`;
+    }
+
     // ...a new run draws afresh: the old object stays until the first pass of
     // this one lands, so the page is never blank between folds.
     viewer = undefined;
     viewerObject = undefined;
-    status(`Folding ${sequence.length} residues · ${passes} pass${passes === 1 ? "" : "es"}`);
+    status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
+      + ` · ${passes} pass${passes === 1 ? "" : "es"}`);
 
     // ...DRAWN AS EACH PASS LANDS, not collected and drawn at the end. The
     // first builds the object and the panels; the rest are frames on it.
     const onRecycle = (recycle, index) => {
-      status(`Pass ${index + 1} of ${passes} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}`);
+      if (signal.aborted) return;
+      const distance = index === 0 ? "" : ` · Δ ${recycle.recycleDistance.toFixed(2)} Å`;
+      status(`Pass ${index + 1} of ${passes}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}`);
       if (index === 0) {
         void loadIntoViewer({
-          stem: "prediction",
-          pdb: predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt),
+          stem,
+          pdb: predictionToPdb(sequence, recycle.structure, recycle.confidence.plddt, chainLengths),
           scores: confidenceJson(sequence, recycle.confidence),
           a3m: alignment,
+          chainLengths,
           pae: paeMatrix(recycle.confidence.predictedAlignedError, sequence.length),
           length: sequence.length,
         });
       } else {
-        appendPass(sequence, recycle);
+        appendPass(sequence, chainLengths, recycle, index);
       }
     };
     const runProgress = ({ completed, total, waiting }) => {
+      if (signal.aborted) return;
       if (waiting) {
         const bar = element("progress");
         bar.hidden = false;
@@ -257,19 +351,21 @@ async function fold(event) {
     const prediction = alignment === null
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
-        { recycles, randomSeed: 0 }, model.paeBreaks, onRecycle, runProgress)
+        { recycles, randomSeed: seed, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress)
       : await new AlphaFoldMonomerGpu(device).predictA3m(
         alignment, model.weights, model.featureTables,
-        { recycles, randomSeed: 0 }, model.paeBreaks, onRecycle, runProgress);
+        { recycles, randomSeed: seed, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;
     lastPrediction = {
-      stem: "prediction",
-      pdb: recyclesToPdb(sequence, prediction.recycles),
+      stem,
+      pdb: recyclesToPdb(sequence, prediction.recycles, chainLengths),
       scores: confidenceJson(sequence, final.confidence),
       a3m: alignment,
+      chainLengths,
     };
+    predictions.set(stem, lastPrediction);
     // 🔴 A SAFETY NET, because the failure it catches is invisible. onRecycle is
     // optional the whole way down, so a model path that accepts the callback and
     // never calls it would produce a finished fold, a "Done" status and an empty
@@ -280,13 +376,18 @@ async function fold(event) {
     element("downloads").style.display = "flex";
     const took = ((performance.now() - started) / 1000).toFixed(1);
     const paired = viewer?.paeRenderer?.n > 0 ? " · PAE paired" : "";
+    const converged = prediction.recycles.length < passes
+      ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`
+      : "";
     status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`
-      + ` · pTM ${final.confidence.ptm.toFixed(3)}${paired}`);
+      + ` · pTM ${final.confidence.ptm.toFixed(3)}${converged}${paired}`);
   } catch (error) {
     progress(null);
-    status(error instanceof Error ? error.message : String(error), true);
+    if (signal.aborted || isAbortError(error)) status("Prediction stopped");
+    else status(error instanceof Error ? error.message : String(error), true);
   } finally {
-    button.disabled = false;
+    if (activeFold === controller) activeFold = undefined;
+    setFoldButton("idle");
   }
 }
 
@@ -339,6 +440,10 @@ const PRIVACY_NOTE = {
 const syncMode = () => {
   element("msa-text").hidden = modeSelect.value !== "paste";
   element("msa-file").hidden = modeSelect.value !== "upload";
+  const msaToggle = document.getElementById("useMsaToggle");
+  if (msaToggle !== null) {
+    msaToggle.checked = modeSelect.value !== "single";
+  }
   // ...getElementById rather than element(), which throws on a missing id: the
   // note is index.html's and this file should not require it to exist.
   const note = document.getElementById("privacy-note");
@@ -347,6 +452,18 @@ const syncMode = () => {
   }
 };
 modeSelect.addEventListener("change", syncMode);
+
+const msaToggle = document.getElementById("useMsaToggle");
+if (msaToggle !== null) {
+  msaToggle.addEventListener("change", () => {
+    if (msaToggle.checked) {
+      if (modeSelect.value === "single") modeSelect.value = "search";
+    } else {
+      modeSelect.value = "single";
+    }
+    syncMode();
+  });
+}
 syncMode();
 
 element("msa-file").addEventListener("change", (event) => {
@@ -373,9 +490,16 @@ function download(name, text, type) {
   link.href = url; link.download = name; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+const activePrediction = () => {
+  const currentName = viewer?.currentObjectName;
+  return (currentName ? predictions.get(currentName) : null) ?? lastPrediction;
+};
+
 element("download-pdb").addEventListener("click", () => {
-  if (lastPrediction) download(`${lastPrediction.stem}.pdb`, lastPrediction.pdb, "chemical/x-pdb");
+  const pred = activePrediction();
+  if (pred) download(`${pred.stem}.pdb`, pred.pdb, "chemical/x-pdb");
 });
 element("download-scores").addEventListener("click", () => {
-  if (lastPrediction) download(`${lastPrediction.stem}_scores.json`, lastPrediction.scores, "application/json");
+  const pred = activePrediction();
+  if (pred) download(`${pred.stem}_scores.json`, pred.scores, "application/json");
 });

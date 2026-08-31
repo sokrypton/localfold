@@ -3,6 +3,7 @@ import { StructureCoreGpu } from "./core.js";
 import { StructureInitializeGpu } from "./initialize.js";
 
 import { SidechainAnglesGpu } from "./sidechain.js";
+import { throwIfAborted, withAbort } from "../runtime/abort.js";
 
 /**
  * @typedef {object} StructureModuleResult
@@ -22,6 +23,7 @@ export class StructureModuleGpu {
   constructor(device) { this.device = device; }
 
   async run(input) {
+    throwIfAborted(input.signal);
     const start = performance.now();
     const msaChannels = input.msaChannels ?? 256;
     const structureChannels = input.structureChannels ?? 384;
@@ -30,11 +32,12 @@ export class StructureModuleGpu {
     // module is the longest single thing a fold does at any real length, and as
     // one progress step it left the bar sitting still through all of it.
     const step = input.onStep ?? (() => {});
-    const initialized = await new StructureInitializeGpu(this.device).run(
+    const initialized = await withAbort(new StructureInitializeGpu(this.device).run(
       input.msaFirstRow, input.length, msaChannels, structureChannels, input.weights.initialize,
-    );
+    ), input.signal);
+    throwIfAborted(input.signal);
     step("initialize");
-    const core = await new StructureCoreGpu(this.device).run({
+    const core = await withAbort(new StructureCoreGpu(this.device).run({
       activations: initialized.activations,
       pair: input.pair,
       mask: input.mask,
@@ -44,13 +47,16 @@ export class StructureModuleGpu {
       pairChannels,
       ipaWeights: input.weights.ipa,
       postAttentionWeights: input.weights.postAttention,
+      signal: input.signal,
       onIteration: (done, total) => step(`iteration ${done}/${total}`),
-    });
-    const sidechain = await new SidechainAnglesGpu(this.device).run(
+    }), input.signal);
+    throwIfAborted(input.signal);
+    const sidechain = await withAbort(new SidechainAnglesGpu(this.device).run(
       core.activations, initialized.initialRepresentation, input.length, structureChannels, 128, input.weights.sidechain,
-    );
+    ), input.signal);
+    throwIfAborted(input.signal);
     step("sidechains");
-    const geometry = await new AtomGeometryGpu(this.device).run({
+    const geometry = await withAbort(new AtomGeometryGpu(this.device).run({
       affine: core.affine,
       angles: sidechain.angles,
       aatype: input.aatype,
@@ -58,7 +64,8 @@ export class StructureModuleGpu {
       atom37Mask: input.atom37Mask,
       length: input.length,
       tables: input.geometry,
-    });
+    }), input.signal);
+    throwIfAborted(input.signal);
     step("geometry");
     return {
       atom14: geometry.atom14,

@@ -31,10 +31,12 @@ textarea:focus, input:focus, select:focus { outline: none; border-color: var(--a
 
 .primary {
   padding: .6rem 1.6rem; border: 0; border-radius: 6px; background: var(--accent); color: #04120c;
-  font-weight: 700; cursor: pointer;
+  font-weight: 700; cursor: pointer; min-width: 5.5rem; text-align: center;
 }
 .primary:hover:not(:disabled) { filter: brightness(1.08); }
 .primary:disabled { opacity: .5; cursor: progress; }
+.primary.stop { background: #dc2626; color: #fff; }
+.primary.stop:disabled { opacity: 1; }
 .quiet {
   padding: .45rem .9rem; border: 1px solid var(--line); border-radius: 6px;
   background: transparent; color: var(--muted); font-size: .78rem; cursor: pointer;

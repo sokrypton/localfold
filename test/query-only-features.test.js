@@ -8,6 +8,16 @@ const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
 const SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 describe("query-only feature construction", () => {
+  it("applies chain breaks without changing sequence feature shapes", async() => {
+    const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open(MANIFEST));
+    const generated = makeQueryOnlyFeatures("ACDEF", await fixture.queryOnlyFeatureTables(), {
+      recycles: 0, chainLengths: [2, 3], maskedMsaCodes: [Float32Array.of(0, 4, 3, 6, 13)],
+    })[0];
+    expect(Array.from(generated.residueIndex)).toEqual([0, 1, 202, 203, 204]);
+    expect(generated.targetFeatures.length).toBe(5 * 22);
+    expect(generated.msaFeatures.length).toBe(5 * 49);
+  });
+
   it("reconstructs official processed tensors from sequence and seeded mask codes", async() => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open(MANIFEST));
     const codes = [];

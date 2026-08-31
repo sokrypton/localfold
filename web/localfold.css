@@ -60,14 +60,19 @@
 /* THE OPTION SELECTS WEAR py2Dmol'S INPUT, at the size the groups are built
    for. A browser-default select beside their bordered, rounded controls is the
    one thing in the panel that looks bolted on. */
-#foldOptions select {
+#foldOptions select,
+#foldOptions input[type="number"] {
   height: 28px;
-  padding: 0 24px 0 8px;
   border: 1px solid #d1d5db;
   border-radius: 6px;
   background: #fff;
   color: #111827;
   font-size: 13px;
+  box-sizing: border-box;
+}
+
+#foldOptions select {
+  padding: 0 24px 0 8px;
   line-height: 1;
   cursor: pointer;
   appearance: none;
@@ -77,8 +82,17 @@
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
 }
-#foldOptions select:hover { border-color: #9ca3af; }
-#foldOptions select:focus { outline: none; border-color: #3b82f6; }
+
+#foldOptions input[type="number"] {
+  width: 68px;
+  padding: 0 6px;
+  font-family: inherit;
+}
+
+#foldOptions select:hover,
+#foldOptions input[type="number"]:hover { border-color: #9ca3af; }
+#foldOptions select:focus,
+#foldOptions input[type="number"]:focus { outline: none; border-color: #3b82f6; }
 
 /* ...the caret turns when the panel opens, the same way theirs does, so the
    button says which way it goes. In CSS off aria-expanded rather than by
@@ -95,14 +109,121 @@
 .fold-actions {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  flex-shrink: 0;
+  gap: 8px;
+  width: 198px;
+  min-width: 198px;
+  max-width: 198px;
+  flex: 0 0 198px;
 }
 
 .fold-action-row {
   display: flex;
   gap: 6px;
   align-items: center;
+  width: 100%;
+}
+
+.fold-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+  height: 24px;
+  width: 96px;
+  margin-left: auto;
+  box-sizing: border-box;
+  padding: 0 8px;
+}
+
+.fold-toggle-label {
+  cursor: pointer;
+  font-size: var(--btn-font-size, 14px);
+  font-weight: 600;
+  color: #374151;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  margin: 0;
+}
+
+.switch.switch-sm {
+  width: 36px;
+  height: 20px;
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+  margin: 0;
+}
+
+.switch.switch-sm .slider-toggle {
+  border-radius: 20px;
+}
+
+.switch.switch-sm .slider-toggle:before {
+  height: 16px;
+  width: 16px;
+  left: 2px;
+  bottom: 2px;
+}
+
+.switch.switch-sm input:checked + .slider-toggle:before {
+  transform: translateX(16px);
+}
+
+#predict, #foldOptionsButton {
+  width: 96px;
+  min-width: 96px;
+  max-width: 96px;
+  height: var(--btn-height, 36px);
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+  padding: 0 10px;
+  font-size: var(--btn-font-size, 14px);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+#predict i {
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+#predict span {
+  display: inline-block;
+  text-align: center;
+}
+
+/* STOP stays visibly dangerous while an already-submitted GPU command reaches
+   the next cancellation boundary. */
+#predict.btn-danger:disabled { opacity: 1; }
+
+#status-message {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid #bfdbfe;
+  background: #dbeafe;
+  color: #1e40af;
+  line-height: 1.25;
+  display: block;
+}
+
+#status-message:empty {
+  display: none;
+}
+
+#status-message.error {
+  border-color: #fca5a5;
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 /* PROGRESS IS PART OF THE STATUS BLOCK AND IS ALWAYS THERE.
@@ -112,6 +233,8 @@
    below it twice per run. Reserving the space permanently is the whole fix;
    `data-state` changes how it LOOKS, never whether it occupies room. */
 #status-row {
+  margin: 0;
+  padding: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -160,3 +283,41 @@
   justify-content: center;
   padding: 8px;
 }
+
+/* Legend & swatches */
+.legend { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 11px; color: #64748b; }
+.swatch { display: inline-flex; align-items: center; gap: 4px; }
+.swatch::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--swatch); }
+
+/* --- mutation panel: sits below the viewer in single-sequence educational mode --- */
+#mutate-panel {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05);
+}
+.mutate-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.mutate-title { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; font-weight: 700; color: #0f172a; }
+.mutate-hint { flex: 1; margin: 0; font-size: 12px; color: #64748b; }
+.mutate-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+.mutate-cell {
+  flex: 1 1 24px; min-width: 24px; height: 28px; padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.12); border-radius: 4px; background: var(--cell);
+  color: #0f172a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform 0.1s ease;
+}
+.mutate-cell:hover { transform: scale(1.1); z-index: 2; border-color: #0f172a; }
+.mutate-cell.is-current {
+  border-color: #0f172a;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 4px #0f172a;
+  font-weight: 800;
+}
+.mutate-close {
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: 4px;
+  background: transparent; color: #64748b; font-size: 18px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.mutate-close:hover { color: #0f172a; background: #f1f5f9; }

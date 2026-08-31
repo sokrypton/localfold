@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "./harness.js";
-import { extractMmseqs2A3m, generateMmseqs2Msa, readTarFiles } from "../src/input/mmseqs2-api.js";
+import {
+  extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa, readTarFiles,
+} from "../src/input/mmseqs2-api.js";
+import { parseA3m } from "../src/input/a3m.js";
 
 function tar(files) {
   const chunks= [];
@@ -52,5 +55,22 @@ describe("MMseqs2 API", () => {
     ]);
     expect(String(requests[0] .init?.body)).toContain("mode=env");
     expect(phases).toEqual(["submitting", "queued", "running", "downloading", "complete"]);
+  });
+
+  it("searches an identical homomer chain once and expands both copies", async() => {
+    const responses = [
+      new Response(JSON.stringify({ status: "COMPLETE", id: "ticket-homo" })),
+      new Response(new Uint8Array([1, 2, 3])),
+    ];
+    const fetchImplementation = vi.fn(async() => responses.shift());
+    const result = await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
+      fetchImplementation, wait: async() => {}, decompress: async() => resultTar,
+    });
+    expect(fetchImplementation.mock.calls.length).toBe(2);
+    expect(result.tickets).toEqual(["ticket-homo"]);
+    const parsed = parseA3m(result.a3m);
+    expect(parsed.query).toBe("ACDEACDE");
+    expect(parsed.sequences).toContain("AC-E----");
+    expect(parsed.sequences).toContain("----AC-E");
   });
 });

@@ -19,6 +19,7 @@ import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { withAbort } from "../src/runtime/abort.js";
 
 /**
  * The tensor store this origin can actually use.
@@ -82,12 +83,12 @@ const loaded = new Map();
  * @param {"single"|"msa"} variant which inference path the weights are for
  * @param {(p: {loadedBytes: number, totalBytes: number}) => void} [onProgress]
  */
-export function loadModel(variant, onProgress) {
+export function loadModel(variant, onProgress, signal = undefined) {
   if (variant !== "single" && variant !== "msa") {
     throw new RangeError(`unknown model variant ${variant}: expected "single" or "msa"`);
   }
   const cached = loaded.get(variant);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return withAbort(cached, signal);
   const pending = (async () => {
     const store = await openStore(onProgress);
     const fixture = AlphaFoldFixture.fromStore(store);
@@ -109,5 +110,5 @@ export function loadModel(variant, onProgress) {
     };
   })();
   loaded.set(variant, pending);
-  return pending;
+  return withAbort(pending, signal);
 }

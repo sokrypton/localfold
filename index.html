@@ -44,47 +44,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
 
     <!-- Total width (600 + 8 + 340 = 948px) -->
     <div class="mx-auto" style="width: 948px; position: relative;">
-        <!-- SAVE, CLEAR ALL AND GPU are about the page, not about the thing you
-             are loading, and they are here every second of a session while
-             Fetch and Upload are used once. Smaller and quieter than the
-             controls in the panel below for that reason: three full-size
-             buttons in strong colours at the top of the page took the eye
-             first, and the first thing to do on this page is load something. -->
-        <div class="page-actions"
-            style="position: absolute; top: 0; right: 0; display: flex; gap: 6px; align-items: center;">
-            <!-- USE GPU sits with Save and Clear All because it is a GLOBAL setting,
-                 not something about the file being fetched. It is the rendering
-                 BACKEND and applies to both styles equally, and it wears the same
-                 skin as the toggles in the Style panel - green on, grey off - at the
-                 size of the two buttons beside it.
-
-                 ON BY DEFAULT, on this page only. Measured first render of 3J3Q:
-                 1,813 ms on the 2D path against 455 with the GPU, and every frame
-                 after it 840 ms against 26 - turning a capsid is not usable
-                 without it. Small structures are unaffected either way (1TIM 306
-                 vs 327 ms, 4UG0 332 vs 333).
-
-                 Safe as a default HERE because this page is the one build that
-                 keeps both painters: the control removes itself when WebGL2 is
-                 absent, and the renderer falls back to the 2D path for anything
-                 the GPU declines. Nowhere else has that fallback - the notebook
-                 and embed bundles ship the WebGL2 painter alone, and their
-                 default is gpu=True with nothing behind it. -->
-            <!-- 🔴 TODAY THIS IS py2Dmol'S PAINTER, NOT LOCALFOLD'S INFERENCE.
-                 The toggle chooses WebGL2 against the 2D canvas for DRAWING;
-                 the fold itself always runs on WebGPU because there is no CPU
-                 path to fall back to. The intent is for one control to mean
-                 both - draw and fold on the GPU, or neither - which needs a CPU
-                 inference path first. Until that exists, do not relabel this:
-                 a switch that says it moves the fold to the CPU and quietly
-                 does not is worse than one that only claims the drawing. -->
-            <label id="useGpuRow" class="btn-toggle-global"
-                title="Draw on the GPU (WebGL2): the same picture, but turning and zooming cost one draw call instead of a full repaint. Applies to both styles.">
-                <input type="checkbox" id="useGpuCheckbox" checked>
-                <span><i class="fa-solid fa-microchip"></i>GPU</span>
-            </label>
-
-        </div>
+        <!-- py2Dmol reads this setting during initialization. Keep its fast
+             WebGL2 painter enabled without exposing a GPU toggle that could be
+             mistaken for LocalFold's WebGPU inference backend. -->
+        <input type="checkbox" id="useGpuCheckbox" checked hidden aria-hidden="true">
         <!-- JUST THE TITLE. The line under it said "Upload a PDB/CIF file, or
              fetch by PDB or UniProt ID", which is a description of the two
              controls directly beneath it: a box whose placeholder is an ID and
@@ -92,7 +55,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
              the only part of the syntax nobody can guess - are in that box's
              placeholder now (1a3n_AB), where someone about to type an ID is
              already looking. -->
-        <div class="page-head">
+        <div class="page-head" style="padding-right: 0;">
             <h1>LocalFold</h1>
         </div>
 
@@ -115,8 +78,8 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                  py2Dmol's fetch row is the same shape, one row shorter. -->
             <div class="fetch-row" id="fold-input-container">
               <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
-                placeholder="Paste a protein sequence"
-                >PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+                placeholder="Paste a protein sequence; separate chains with :"
+                >GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE</textarea>
               <div class="fold-actions">
                 <div class="fold-action-row">
                   <button id="predict" class="btn btn-primary">
@@ -125,10 +88,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   </button>
                   <button id="foldOptionsButton" class="btn btn-grey" type="button"
                     aria-expanded="false" aria-controls="foldOptions"
-                    title="Folding options: alignment source and recycles">
+                    title="Folding options: alignment source, recycles and convergence tolerance">
                     <span>Options</span>
                     <span id="foldOptionsCaret" aria-hidden="true">&#9662;</span>
                   </button>
+                </div>
+                <div class="fold-toggle-row">
+                  <label class="switch switch-sm" title="Multiple Sequence Alignment">
+                    <input type="checkbox" id="useMsaToggle">
+                    <span class="slider-toggle"></span>
+                  </label>
+                  <label for="useMsaToggle" class="fold-toggle-label" title="Multiple Sequence Alignment">MSA</label>
                 </div>
               </div>
             </div>
@@ -146,8 +116,8 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group">
                 <span class="fetch-option-title">Alignment</span>
                 <select id="msa-mode">
-                  <option value="search" selected>Search (remote)</option>
-                  <option value="single">None</option>
+                  <option value="single" selected>None</option>
+                  <option value="search">Search (remote)</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
                 </select>
@@ -163,6 +133,21 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="12">12</option>
                   <option value="24">24</option>
                 </select>
+              </div>
+              <div class="fetch-option-group">
+                <span class="fetch-option-title">Tolerance</span>
+                <select id="tolerance" title="Stop after two or more passes when C-alpha distance change is below this value">
+                  <option value="0" selected>Off (0)</option>
+                  <option value="0.1">0.1 Å</option>
+                  <option value="0.5">0.5 Å</option>
+                  <option value="1">1.0 Å</option>
+                  <option value="2">2.0 Å</option>
+                </select>
+              </div>
+              <div class="fetch-option-group">
+                <span class="fetch-option-title">Seed</span>
+                <input type="number" id="random-seed" value="0" min="0" max="2147483647" step="1"
+                  title="Random seed for MSA subsampling and masking (0 is default)">
               </div>
               <div class="fold-option-wide">
                 <textarea id="msa-text" rows="3" spellcheck="false" aria-label="A3M alignment"
@@ -331,7 +316,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                  permanent 3px rule under the status line now: flat and grey
                  when there is nothing to report, filled while a fold runs. The
                  element is always laid out, so nothing below it ever moves. -->
-            <div id="status-row" style="margin-top: 8px;">
+            <div id="status-row">
                 <div id="status-message"></div>
                 <progress id="progress" max="1" value="0" data-state="idle"></progress>
             </div>

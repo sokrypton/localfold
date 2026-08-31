@@ -1,3 +1,5 @@
+import { validatedChainLengths } from "../src/input/chains.js";
+
 const RESIDUE_NAMES = {
   A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY", H: "HIS",
   I: "ILE", L: "LEU", K: "LYS", M: "MET", F: "PHE", P: "PRO", S: "SER", T: "THR", W: "TRP",
@@ -16,40 +18,50 @@ function field(value, width, decimals) {
 }
 
 /** The ATOM records for one structure. Serial numbering restarts per model, as in an NMR ensemble. */
-function atomLines(sequence, structure, plddt) {
+const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+function atomLines(sequence, structure, plddt, chainLengths) {
   if (structure.atom37.length !== sequence.length * 37 * 3 || structure.atom37Mask.length !== sequence.length * 37) {
     throw new RangeError("atom37 output does not match the sequence length");
   }
   if (plddt.length !== sequence.length) throw new RangeError("pLDDT output does not match the sequence length");
+  const lengths = validatedChainLengths(sequence.length, chainLengths);
+  if (lengths.length > CHAIN_IDS.length) throw new RangeError(`PDB output supports at most ${CHAIN_IDS.length} chains`);
   const lines = [];
   let serial = 1;
-  for (let residue = 0; residue < sequence.length; residue += 1) {
-    const residueName = RESIDUE_NAMES[sequence[residue]] ?? "UNK";
-    for (let atom = 0; atom < ATOM_NAMES.length; atom += 1) {
-      if (structure.atom37Mask[residue * 37 + atom] < 0.5) continue;
-      const offset = (residue * 37 + atom) * 3;
-      const atomName = ATOM_NAMES[atom];
-      const element = atomName[0];
-      lines.push(
-        `ATOM  ${String(serial).padStart(5)} ${atomName.padStart(4)} ${residueName} A${String(residue + 1).padStart(4)}    `
-        + `${field(structure.atom37[offset], 8, 3)}${field(structure.atom37[offset + 1], 8, 3)}`
-        + `${field(structure.atom37[offset + 2], 8, 3)}  1.00${field(plddt[residue], 6, 2)}`
-        + `          ${element.padStart(2)}`,
-      );
-      serial += 1;
+  let residue = 0;
+  for (let chain = 0; chain < lengths.length; chain += 1) {
+    const chainId = CHAIN_IDS[chain];
+    for (let within = 0; within < lengths[chain]; within += 1, residue += 1) {
+      const residueName = RESIDUE_NAMES[sequence[residue]] ?? "UNK";
+      for (let atom = 0; atom < ATOM_NAMES.length; atom += 1) {
+        if (structure.atom37Mask[residue * 37 + atom] < 0.5) continue;
+        const offset = (residue * 37 + atom) * 3;
+        const atomName = ATOM_NAMES[atom];
+        const element = atomName[0];
+        lines.push(
+          `ATOM  ${String(serial).padStart(5)} ${atomName.padStart(4)} ${residueName} ${chainId}${String(within + 1).padStart(4)}    `
+          + `${field(structure.atom37[offset], 8, 3)}${field(structure.atom37[offset + 1], 8, 3)}`
+          + `${field(structure.atom37[offset + 2], 8, 3)}  1.00${field(plddt[residue], 6, 2)}`
+          + `          ${element.padStart(2)}`,
+        );
+        serial += 1;
+      }
     }
+    lines.push("TER");
   }
   return lines;
 }
 
-/** Serializes an AlphaFold atom37 result as a single-chain PDB with pLDDT in the B-factor field. */
+/** Serializes an AlphaFold atom37 result as PDB chains with pLDDT in the B-factor field. */
 export function predictionToPdb(
   sequence,
   structure,
   plddt,
+  chainLengths = undefined,
 ) {
   const lines = ["REMARK   1 ALPHAFOLD2 WEBGPU PREDICTION"];
-  lines.push(...atomLines(sequence, structure, plddt), "TER", "END");
+  lines.push(...atomLines(sequence, structure, plddt, chainLengths), "END");
   return `${lines.join("\n")}\n`;
 }
 
@@ -65,13 +77,13 @@ export function predictionToPdb(
  * @param {string} sequence
  * @param {readonly {structure: object, confidence: {plddt: Float32Array}}[]} recycles
  */
-export function recyclesToPdb(sequence, recycles) {
+export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
   if (recycles.length === 0) throw new RangeError("a prediction must have at least one recycle");
   const lines = ["REMARK   1 ALPHAFOLD2 WEBGPU PREDICTION",
     `REMARK   2 ${recycles.length} RECYCLE${recycles.length === 1 ? "" : "S"}, MODEL n IS RECYCLE n-1`];
   recycles.forEach((recycle, index) => {
     lines.push(`MODEL     ${String(index + 1).padStart(4)}`);
-    lines.push(...atomLines(sequence, recycle.structure, recycle.confidence.plddt), "TER", "ENDMDL");
+    lines.push(...atomLines(sequence, recycle.structure, recycle.confidence.plddt, chainLengths), "ENDMDL");
   });
   lines.push("END");
   return `${lines.join("\n")}\n`;
