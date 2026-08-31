@@ -75,6 +75,36 @@ try {
   let finite = 0;
   for (let i = 0; i < atoms.length; i += 1) if (Number.isFinite(atoms[i])) finite += 1;
   log(`  atom37    ${finite}/${atoms.length} finite`);
+
+  // WHAT THE PAE MATRIX ACTUALLY LOOKS LIKE, by block. A complex should read
+  // low within each chain and higher between them; a PAE that is flat, or whose
+  // blocks are the wrong way round, is the symptom of a confidence path fed the
+  // wrong thing rather than of a bad prediction.
+  const pae = final.confidence.predictedAlignedError;
+  const L = CHAIN_LENGTHS[0] + CHAIN_LENGTHS[1];
+  const stats = (fromI, toI, fromJ, toJ) => {
+    let sum = 0, n = 0, lo = Infinity, hi = -Infinity;
+    for (let i = fromI; i < toI; i += 1) for (let j = fromJ; j < toJ; j += 1) {
+      const v = pae[i * L + j];
+      sum += v; n += 1; lo = Math.min(lo, v); hi = Math.max(hi, v);
+    }
+    return { mean: sum / n, lo, hi };
+  };
+  const a = CHAIN_LENGTHS[0];
+  const blocks = [
+    ['A-A intra', stats(0, a, 0, a)],
+    ['B-B intra', stats(a, L, a, L)],
+    ['A-B inter', stats(0, a, a, L)],
+    ['B-A inter', stats(a, L, 0, a)],
+  ];
+  log('');
+  log(`  PAE, max bin ${final.confidence.maxPredictedAlignedError.toFixed(2)} A`);
+  for (const [name, s] of blocks) {
+    log(`    ${name}  mean ${s.mean.toFixed(2)}  min ${s.lo.toFixed(2)}  max ${s.hi.toFixed(2)}`);
+  }
+  const diagonal = Math.max(...[0, 1].map((k) => Math.abs(pae[k * L + k])));
+  log(`    PAE on the diagonal (should be near zero): ${diagonal.toFixed(3)}`);
+  log(`    symmetric A-B vs B-A: ${Math.abs(blocks[2][1].mean - blocks[3][1].mean) < 5 ? 'roughly' : 'NO - suspicious'}`);
   window.__MULTIMER__ = { meanPlddt: final.confidence.meanPlddt, ptm: final.confidence.ptm };
 } catch (error) {
   log(`\nFAILED: ${error.message}`);

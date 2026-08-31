@@ -168,6 +168,17 @@ def export(params_path: Path, monomer_dir: Path, out_dir: Path) -> int:
         if (monomer_dir / "manifest.json").is_file() else reference
     for name in borrowed:
         record = monomer_manifest["tensors"][name]
+        # 🔴 THESE ARE READ AS FLOAT32, so say so rather than assume it. The
+        # monomer model/ has no manifest.json any more, so this falls back to
+        # the compiled-in one - which describes the INT8 export. Every borrowed
+        # tensor happens to be in its float32 keep-list (the geometry tables and
+        # the PAE bin edges are never quantised), but that is luck: quantise one
+        # of them later and this would read the codes as floats and produce
+        # silent nonsense in the geometry.
+        if record["dtype"] != "float32":
+            raise SystemExit(
+                f"{name} is {record['dtype']} in the monomer export; this reads float32. "
+                "Point --monomer at a float32 export, or widen it here first.")
         shard = (monomer_dir / record["file"]).read_bytes()
         values = np.frombuffer(shard, dtype="<f4",
                                count=int(np.prod(record["shape"])),
