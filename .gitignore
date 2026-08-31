@@ -51,3 +51,7 @@ __pycache__/
 # and tools/quantize_model.py's int8 output.
 /model-af3
 /model-af3-f32
+
+# The full AF3 export, including the diffusion and confidence heads.
+/model-af3-full-f32
+/model-af3-full

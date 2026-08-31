@@ -155,6 +155,9 @@ def main():
     parser.add_argument("--model", default="alphafold3", choices=sorted(WEIGHTS))
     parser.add_argument("--weights", default=None,
                         help="blob directory (default: the model's)")
+    parser.add_argument("--diffusion", type=int, default=None, metavar="STEPS",
+                        help="run the diffusion sampler for STEPS steps"
+                             " (default: skip it entirely)")
     parser.add_argument("--float32", action="store_true",
                         help="run the trunk in float32 instead of AF3's bfloat16")
     parser.add_argument("--capture", default=r"evoformer/__call__$",
@@ -176,7 +179,9 @@ def main():
 
     weights = os.path.expanduser(arguments.weights
                                  or WEIGHTS[arguments.model])
-    config = make_config(num_recycles=0, model=arguments.model, num_msa=1)
+    config = make_config(num_recycles=0, model=arguments.model, num_msa=1,
+                         num_diffusion_samples=1,
+                         diffusion_steps=arguments.diffusion)
     # 🔴 AF3'S TRUNK COMPUTES IN BFLOAT16, and that sets the floor on what any
     # reimplementation can be checked to. bfloat16 keeps eight mantissa bits, so
     # its relative epsilon is 2^-8 = 3.9e-3 - and a block's own captured output
@@ -187,8 +192,11 @@ def main():
         config.global_config.bfloat16 = "none"
     if arguments.blocks is not None:
         config.evoformer.pairformer.num_layer = arguments.blocks
-    runner = AF3Runner(model_dir=weights, cfg=config,
-                       model=arguments.model, diffusion="off")
+    # 🔴 THE SAMPLER IS 200 STEPS BY DEFAULT AND EACH ONE IS A FULL DENOISER
+    # PASS. --diffusion 1 runs a single step, which is all a forward-pass check
+    # needs and is the difference between seconds and an afternoon on a CPU.
+    runner = AF3Runner(model_dir=weights, cfg=config, model=arguments.model,
+                       diffusion="off" if arguments.diffusion is None else "forward")
     if arguments.blocks is not None:
         runner.model_params = truncate_pairformer(runner.model_params,
                                                   arguments.blocks)
@@ -231,6 +239,8 @@ def main():
     suffix = "" if arguments.blocks is None else f"-{blocks}block"
     if arguments.model != "alphafold3":
         suffix = f"-{arguments.model}{suffix}"
+    if arguments.diffusion is not None:
+        suffix += f"-diff{arguments.diffusion}"
     if arguments.float32:
         suffix += "-f32"
     path = pathlib.Path(arguments.out) if arguments.out else \

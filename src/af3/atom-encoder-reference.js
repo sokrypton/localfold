@@ -85,15 +85,21 @@ export function convert(gather, source, channels) {
 }
 
 /** Adaptive LayerNorm: normalise, then scale and shift from the conditioning. */
-function adaptiveLayerNorm(x, cond, rows, channels, weights, prefix) {
+export function adaptiveLayerNorm(x, cond, rows, channels, weights, prefix,
+                                  condChannels = channels) {
+  // 🔴 THE CONDITIONING IS NOT THE SAME WIDTH AS THE ACTIVATION. In the atom
+  // stack both are 128 and the distinction is invisible; in the diffusion
+  // transformer the conditioning is 384 and the activation 768, so the two
+  // projections are 384->768 rather than square. Assuming square runs on the
+  // atom stack and reads the diffusion weights at the wrong stride.
   const normalised = layerNormSlow(x, rows, channels, null, null);
   // ...the conditioning gets a scale but NO offset before it is projected.
-  const condNormalised = layerNormSlow(cond, rows, channels,
+  const condNormalised = layerNormSlow(cond, rows, condChannels,
                                        weights[`${prefix}SingleCondLayerNormScale`], null);
-  const scale = linear(condNormalised, rows, channels, channels,
+  const scale = linear(condNormalised, rows, condChannels, channels,
                        weights[`${prefix}SingleCondScaleWeights`],
                        weights[`${prefix}SingleCondScaleBias`]);
-  const shift = linear(condNormalised, rows, channels, channels,
+  const shift = linear(condNormalised, rows, condChannels, channels,
                        weights[`${prefix}SingleCondBias`]);
   const output = new Float32Array(x.length);
   for (let index = 0; index < x.length; index += 1) {
@@ -103,10 +109,11 @@ function adaptiveLayerNorm(x, cond, rows, channels, weights, prefix) {
 }
 
 /** The AdaLN-zero output gate: project, then gate on the conditioning. */
-function adaptiveZeroInit(x, cond, rows, channels, weights, prefix) {
-  const projected = linear(x, rows, channels, channels,
+export function adaptiveZeroInit(x, cond, rows, channels, weights, prefix,
+                                 condChannels = channels, inChannels = channels) {
+  const projected = linear(x, rows, inChannels, channels,
                            weights[`${prefix}Transition2`]);
-  const gate = linear(cond, rows, channels, channels,
+  const gate = linear(cond, rows, condChannels, channels,
                       weights[`${prefix}AdaptiveZeroCondWeights`],
                       weights[`${prefix}AdaptiveZeroCondBias`]);
   for (let index = 0; index < projected.length; index += 1) {
