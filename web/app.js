@@ -121,6 +121,9 @@ function activeAblations(chainCount) {
   if (chainCount < 2) return "";
   const query = new URLSearchParams(location.search);
   const off = ["pairing", "perchain", "covmask", "rowmask"].filter((name) => query.get(name) === "off");
+  // ...pairing=off turns per-chain sampling off with it, so say so rather than
+  // leaving the reader to infer which construction actually ran.
+  if (off.includes("pairing") && !off.includes("perchain")) off.splice(1, 0, "perchain");
   return off.length === 0 ? " · default" : ` · ${off.map((name) => `${name}=off`).join(" ")}`;
 }
 
@@ -175,7 +178,14 @@ async function alignmentText(chains, signal) {
         + (chains.length > 1 && !pairRepeatedChains ? " · block-diagonal" : ""));
       // 🔴 ?perchain=off MERGES FIRST, the construction this replaced, so the
       // two can be folded against each other.
-      const perChain = new URLSearchParams(location.search).get("perchain") !== "off";
+      //
+      // ...AND ?pairing=off IMPLIES IT. Per-chain sampling reads the chain
+      // alignments directly and never looks at the merged text, so on its own
+      // ?pairing=off would change only what the viewer draws while the fold ran
+      // unaltered - a flag that silently does nothing, which is the exact way
+      // this comparison has already been got wrong once.
+      const flags = new URLSearchParams(location.search);
+      const perChain = flags.get("perchain") !== "off" && flags.get("pairing") !== "off";
       return { text: searched.a3m, chainA3ms: perChain ? searched.chainA3ms : undefined };
     }
     default:
