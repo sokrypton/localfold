@@ -236,6 +236,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
+/**
+ * 🔴 THESE SHADERS NEED THEIR OWN CACHE KEYS. The pipeline cache is keyed by
+ * name and refuses two different sources under one key - which is how this was
+ * caught, on the first fold: adding MAX_RELATIVE_CHAIN to the shared COMMON
+ * block changed every shader in this file, not just the pair one, so all three
+ * collided with the monomer's. `embed:normalize` keeps the monomer key on
+ * purpose: it is the shared attention normaliser, imported unchanged.
+ */
 /** Encode the input embedding into an existing execution without crossing the CPU boundary. */
 export async function encodeInputEmbedder(
   execution,
@@ -255,9 +263,9 @@ export async function encodeInputEmbedder(
   const packed = packWeights(input);
   const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
     execution.pipelines.get("embed:normalize", ATTENTION_NORMALIZE_SHADER),
-    execution.pipelines.get("embed:msa", MSA_SHADER),
-    execution.pipelines.get("embed:pair", PAIR_SHADER),
-    execution.pipelines.get("embed:extra", EXTRA_SHADER),
+    execution.pipelines.get("multimer:embed:msa", MSA_SHADER),
+    execution.pipelines.get("multimer:embed:pair", PAIR_SHADER),
+    execution.pipelines.get("multimer:embed:extra", EXTRA_SHADER),
   ]);
   const temporaries = [];
   const temporaryUpload = (label, data, usage = GPUBufferUsage.STORAGE) => {
@@ -324,9 +332,9 @@ export class InputEmbedderGpu {
     const packed = packWeights(input);
     const [normalize, msaPipeline, pairPipeline, extraPipeline] = await Promise.all([
       this.pipelines.get("embed:normalize", ATTENTION_NORMALIZE_SHADER),
-      this.pipelines.get("embed:msa", MSA_SHADER),
-      this.pipelines.get("embed:pair", PAIR_SHADER),
-      this.pipelines.get("embed:extra", EXTRA_SHADER),
+      this.pipelines.get("multimer:embed:msa", MSA_SHADER),
+      this.pipelines.get("multimer:embed:pair", PAIR_SHADER),
+      this.pipelines.get("multimer:embed:extra", EXTRA_SHADER),
     ]);
     const allocations = [];
     const keep = (value) => { allocations.push(value); return value; };

@@ -22,6 +22,7 @@
  * two buttons at the foot of this file, which write what the model produced.
  */
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { AlphaFoldQueryOnlyGpu } from "../src/model/query-only.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { splitComplexA3mByChain } from "../src/input/chains.js";
@@ -587,7 +588,12 @@ async function fold(event) {
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
         { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress)
-      : await new AlphaFoldMonomerGpu(device).predictA3m(
+      // 🔴 ?graph=unified RUNS THE SAME WEIGHTS THROUGH src/multimer/. With its
+      // switches off that graph must reproduce this one exactly - which is the
+      // check that says the superset is right before any multimer weight
+      // exists. A difference here is a graph bug, not a weights bug.
+      : await new (new URLSearchParams(location.search).get("graph") === "unified"
+        ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
         alignmentForModel, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
           maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress);
