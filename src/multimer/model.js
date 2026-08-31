@@ -105,12 +105,17 @@ export class AlphaFoldUnifiedGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featuresByRecycle[0] .seqMask[i] * featuresByRecycle[0] .seqMask[j];
     }
-    // 🔴 A MULTIMER RUN HAS NO TEMPLATE EMBEDDER AT ALL. Multimer's is
-    // architecturally different from the monomer's - no reshape maps one onto
-    // the other - so the multimer export ships none and the fold runs
-    // template-free, which is what ColabDesign2's merge does too. The monomer
-    // regime keeps its mock-template residual, and that is part of why this
-    // graph reproduces the monomer one exactly.
+    // 🔴 TWO TEMPLATE TRACKS, AND ONLY ONE OF THEM IS OPTIONAL. They are
+    // architecturally different - no reshape maps one onto the other - so each
+    // family runs its own, and the monomer's absence from a multimer export is
+    // part of why this graph still reproduces the monomer one exactly.
+    //
+    // The monomer's is the query-only residual, and it is genuinely skipped
+    // when there is nothing to embed. Multimer's is not: `template.enabled` is
+    // True for model_1_multimer_v3 and its wrapper adds the activation to the
+    // pair unconditionally, so it runs every recycle whether or not a template
+    // exists. It reads the pair through a layer norm and adds a learned
+    // constant, so masking the templates off does not zero it.
     const useTemplates = recycleOptions.templates !== false && weights.template !== undefined;
     // ...multimer's is a different embedder entirely, and is on whenever the
     // weights carry one, because the reference always runs it.
