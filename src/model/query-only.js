@@ -37,7 +37,22 @@ import { makeQueryOnlyFeatures } from "../input/query-only-features.js";
  * @property {number} elapsedMilliseconds
  */
 
-/** Model-1 query-only path, including templates, 54 pair blocks, structure, confidence, and recycling. */
+/**
+ * Model-1 query-only path, including templates, 54 pair blocks, structure,
+ * confidence, and recycling.
+ *
+ * 🔴 NO LONGER ON THE PAGE'S PATH. A single sequence is an alignment of depth
+ * one, and web/app.js folds it as such through the A3M driver. This existed
+ * because the extra-MSA stack has nothing to attend over with one sequence and
+ * can run its pair-only block instead - but measured, interleaved over five
+ * reps at 59 residues, that is 1.12s against the general path's 0.59s. It is
+ * slower, not faster, while agreeing to 4.9e-5.
+ *
+ * Being a second driver cost more than it saved: it drifted three times, each
+ * time silently. Kept for the GPU tests that pin it and because it is the
+ * smallest thing that exercises the pair-only stack; nothing should route a
+ * user's fold here.
+ */
 export class AlphaFoldQueryOnlyGpu {
   device;
   constructor(device) { this.device = device; }

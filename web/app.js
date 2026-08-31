@@ -23,7 +23,6 @@
  */
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
-import { AlphaFoldQueryOnlyGpu } from "../src/model/query-only.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { splitComplexA3mByChain } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
@@ -552,7 +551,9 @@ async function fold(event) {
     // regime, so selecting multimer there loaded the right weights and ran the
     // WRONG graph - silently, with a plausible number at the end of it. A
     // single sequence becomes a one-row alignment instead.
-    const variant = alignment === null && family !== "multimer" ? "single" : "msa";
+    // ...and one weight assembly: the A3M driver always wants the full extra
+    // stack, so the "single" variant is no longer reachable from the page.
+    const variant = "msa";
     const model = await loadModel(variant, (value) => {
       if (signal.aborted) return;
       progress(value.totalBytes === 0 ? 0 : value.loadedBytes / value.totalBytes);
@@ -651,13 +652,23 @@ async function fold(event) {
     // which is the check that the superset is right; a difference is a graph
     // bug rather than a weights bug.
     const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
-    const alignmentForDriver = alignment === null && multimer
-      ? `>query\n${sequence}\n` : alignmentForModel;
-    const prediction = alignment === null && !multimer
-      ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
-        sequence, model.weights, model.featureTables,
-        { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress)
-      : await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device).predictA3m(
+    // 🔴 ONE PATH, WHETHER OR NOT THERE IS AN ALIGNMENT. A single sequence is an
+    // alignment of depth one, and it is folded as such.
+    //
+    // There used to be a second driver for it, AlphaFoldQueryOnlyGpu, on the
+    // grounds that the extra-MSA stack has nothing to attend over with one
+    // sequence and can run its pair-only block instead. Measured on this
+    // machine, interleaved over five reps at 59 residues, the specialisation is
+    // 1.12s against 0.59s - it is 1.9x SLOWER than the general path, not faster
+    // - while agreeing with it to 4.9e-5, which is float32 noise.
+    //
+    // So it bought nothing and cost plenty: being a second driver, it drifted
+    // three times. It did not know the multimer regime, it did not receive
+    // chainAware, and options added to one were not added to the other. Each
+    // drift failed silently with a plausible number.
+    const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
+    const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+      .predictA3m(
         alignmentForDriver, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
           maskInterChainCovariance, maskRowAttentionAcrossChains, ...regime },
