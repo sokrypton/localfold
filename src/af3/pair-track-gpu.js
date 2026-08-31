@@ -53,10 +53,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
+  // 🔴 THE TEMPLATE STACK IS THIS TRACK AT 64 CHANNELS WITH A FACTOR-2
+  // TRANSITION, where the trunk runs 128 and factor 4. Both are "a pairformer
+  // block"; only the weight shapes say which, so a wrong factor reads
+  // transition1 at the wrong stride rather than failing.
+  const channels = options.channels ?? PAIR_CHANNELS;
+  const transitionFactor = options.transitionFactor ?? 4;
   const pairs = n * n;
-  const shape = { length: n, cZ: PAIR_CHANNELS, cHidden: PAIR_CHANNELS };
+  const shape = { length: n, cZ: channels, cHidden: channels };
   const triangleOffsets = packTriangleWeights(
-    af3TriangleWeights(sample.triangleMultiplicationOutgoing, PAIR_CHANNELS), "f32").offsets;
+    af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels), "f32").offsets;
   const gridOffsets = packGridAttentionWeights(sample.pairAttention1).offsets;
   const transitionOffsets = packTransitionWeights(sample.pairTransition).offsets;
 
@@ -72,28 +78,26 @@ export async function compilePairTrack(cache, options) {
   for (const [key, attention, transpose] of
        [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]) {
     const sources = createGridAttentionShaders(
-      { n, channels: PAIR_CHANNELS, heads: attention.heads, dimension: attention.dimension,
-        transpose },
+      { n, channels, heads: attention.heads, dimension: attention.dimension, transpose },
       gridOffsets, epsilon, variance, dialect);
     for (const [name, source] of Object.entries(sources)) {
       pipelines[`grid:${key}:${name}`] = await cache.get(`${base}:grid:${key}:${name}`, source);
     }
   }
   pipelines.pairTransition = await cache.get(`${base}:pair-transition`,
-    createTransitionShader({ rows: pairs, channels: PAIR_CHANNELS, factor: 4 },
+    createTransitionShader({ rows: pairs, channels, factor: transitionFactor },
                            transitionOffsets, epsilon, variance));
-  pipelines.addPair = await cache.get(`${base}:add-pair`,
-    createAddShader(pairs * PAIR_CHANNELS));
+  pipelines.addPair = await cache.get(`${base}:add-pair`, createAddShader(pairs * channels));
   return pipelines;
 }
 
 /** Pack one block's pair-track weights, ready to upload. */
-export function packPairTrackWeights(block) {
+export function packPairTrackWeights(block, channels = PAIR_CHANNELS) {
   return {
     outgoing: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationOutgoing, PAIR_CHANNELS), "f32").data,
+      af3TriangleWeights(block.triangleMultiplicationOutgoing, channels), "f32").data,
     incoming: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationIncoming, PAIR_CHANNELS), "f32").data,
+      af3TriangleWeights(block.triangleMultiplicationIncoming, channels), "f32").data,
     grid1: packGridAttentionWeights(block.pairAttention1).data,
     grid2: packGridAttentionWeights(block.pairAttention2).data,
     transition: packTransitionWeights(block.pairTransition).data,
@@ -108,10 +112,11 @@ export function packPairTrackWeights(block) {
  */
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;
+  const channels = context.channels ?? PAIR_CHANNELS;
   const pairs = n * n;
   const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
   const ceil = (value, divisor) => Math.ceil(value / divisor);
-  const addGroups = spread(ceil(pairs * PAIR_CHANNELS, 64));
+  const addGroups = spread(ceil(pairs * channels, 64));
   const addPair = (delta) =>
     run("add", pipelines.addPair, [pair, delta], addGroups[0], addGroups[1]);
 
@@ -120,12 +125,12 @@ export function encodePairTrack(context) {
     const p = (name) => pipelines[`tri:${direction}:${name}`];
     run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]], ceil(pairs, 64));
     run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
-        ceil(PAIR_CHANNELS, 16), ceil(pairs, 16));
+        ceil(channels, 16), ceil(pairs, 16));
     run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
-        ceil(n, 8), ceil(n, 8), PAIR_CHANNELS);
+        ceil(n, 8), ceil(n, 8), channels);
     run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]], ceil(pairs, 64));
     run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, scratch[5]],
-        ceil(PAIR_CHANNELS, 16), ceil(pairs, 16));
+        ceil(channels, 16), ceil(pairs, 16));
     addPair(scratch[5]);
   }
 
