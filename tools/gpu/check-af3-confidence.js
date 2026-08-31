@@ -176,6 +176,27 @@ export async function main(device, args) {
       // f32 keeps ~7 digits, so cancellation bites once |mean|/std approaches 1e3.
       console.log(`  worst per-row |mean|/std ${worst.toFixed(1)} at token ${worstRow}`
         + `  (f32 loses ~${Math.log10(Math.max(worst * worst, 1)).toFixed(1)} digits there)`);
+      // Per block: how big is the delta the block adds, against the result?
+      // If the delta dwarfs the result, the residual is cancelling and relative
+      // error amplifies by exactly that ratio.
+      {
+        let p3 = Float32Array.from(gpu.embeddedPair);
+        let s3 = Float32Array.from(input.single);
+        const sd = (v) => { let m = 0; for (const x of v) m += x; m /= v.length;
+          let q = 0; for (const x of v) q += (x - m) ** 2; return Math.sqrt(q / v.length); };
+        for (let b = 0; b < weights.blocks.length; b += 1) {
+          const before = s3;
+          const next = pairformerBlock({ pair: p3, single: s3, pairMask: pm, seqMask, tokens },
+                                       weights.blocks[b], DIALECT);
+          const delta = new Float32Array(before.length);
+          for (let i = 0; i < delta.length; i += 1) delta[i] = next.single[i] - before[i];
+          console.log(`  block ${b}: single ${sd(before).toExponential(2)}`
+            + ` + delta ${sd(delta).toExponential(2)} -> ${sd(next.single).toExponential(2)}`
+            + `  (delta/result ${(sd(delta) / Math.max(sd(next.single), 1e-30)).toFixed(2)})`);
+          p3 = next.pair;
+          s3 = next.single;
+        }
+      }
       const std = (v) => { let m = 0; for (const x of v) m += x; m /= v.length;
         let s2 = 0; for (const x of v) s2 += (x - m) ** 2; return Math.sqrt(s2 / v.length); };
       console.log(`  scales: input pair ${std(input.pair).toFixed(2)},`
@@ -211,33 +232,36 @@ export async function main(device, args) {
     const value = relativeRms(actual, reference);
     const envelope = relativeRms(controlValue, reference);
     const ratio = value / Math.max(envelope, 1e-30);
-    // 🔴 THE TWO SINGLE-TRACK HEADS CARRY AN UNEXPLAINED 5.5x, AND THE CEILING
-    // BELOW IS A REGRESSION GUARD, NOT A PASS. pae and pde sit at 7-8x their
-    // conditioning envelope like every other kernel in this port. plddt and
-    // resolved do not: both read `single`, which after four confidence blocks
-    // differs from the reference by 1.41e-4 where the pair differs by 3.18e-6.
+    // 🔴 THE SINGLE TRACK AMPLIFIES BY ABOUT 1e5, AND THAT IS WHY plddt AND
+    // resolved SIT AT 1e-4 WHILE pae AND pde SIT AT 6e-6. All four come off the
+    // same four blocks; the first two read `single` and the last two read the
+    // pair.
     //
-    // What has been ruled out, each by measurement:
-    //   - the heads themselves: the divergence is already 1.41e-4 in the STACK's
-    //     single output, before any head runs;
-    //   - the embed pass: 6.75e-7;
-    //   - the pair track: 3.18e-6, in line with everything else;
-    //   - padding: real tokens carry 1.59e-4, padded ones 1.58e-5;
-    //   - LayerNorm cancellation: the worst per-row |mean|/std is 0.0, so
-    //     E[x^2]-E[x]^2 is nowhere near cancelling;
-    //   - magnitude: single attention and the transition are both flat at
-    //     3-5e-7 from scale 1 to scale 170,000, the trunk's real range;
-    //   - the weights being different: with TRUNK weights the same stack gives
-    //     single 5.4-6.2e-7 at every pair scale from 1 to 100.
+    // The measurement that says so: fast and two-pass LayerNorm variance are
+    // ALGEBRAICALLY IDENTICAL and differ only at the 1e-7 level, and swapping
+    // one for the other moves `single` by 6.3e-2. So a 1e-7 perturbation comes
+    // out the far end at 1e-2 - an amplification near 1e5 - and the GPU's
+    // 1.41e-4 against a float64 reference is well UNDER what f32 rounding
+    // through a stack like that would predict.
     //
-    // And the conditioning control: nudging BOTH tracks by 1.5e-6 every block -
-    // calibrated so the CPU's pair error matches the GPU's 3.18e-6 to two
-    // digits - moves single by 2.57e-5, not 1.41e-4. So 5.5x is unaccounted
-    // for, in the single track, only with these weights.
+    // Why this stack and not the trunk's: `single` grows from 0.58 to 4,220 in
+    // ONE confidence block and to 19,356 in four, with no cancellation in the
+    // residual (delta/result stays between 0.5 and 1.0). The trunk's grows far
+    // more gently per block, and the same code gives single 5.4e-7 to 6.2e-7
+    // there at every pair scale from 1 to 100. It is the weights, not the input:
+    // `check-af3-block.js --stack=confidence` reproduces 1.14e-4 on a plain
+    // random pair.
     //
-    // It is inside AF3's own bfloat16 floor of 3.9e-3, so it blocks nothing.
-    // It is still a defect until it is explained, and this ceiling exists so it
-    // cannot quietly get worse.
+    // Ruled out on the way, each by measurement rather than argument: the heads
+    // themselves (the divergence is already in the stack's single output); the
+    // embed pass (6.75e-7); the pair track (3.18e-6); padding (real tokens
+    // 1.59e-4, padded 1.58e-5); LayerNorm cancellation (worst per-row
+    // |mean|/std is 0.0 - this was my first guess and it was wrong); and
+    // magnitude (single attention and the transition are flat at 3-5e-7 from
+    // scale 1 to 170,000, the trunk's real range).
+    //
+    // 1.41e-4 is well inside AF3's own bfloat16 floor of 3.9e-3. The ceiling
+    // below is a regression guard, not a target.
     const bound = name === "plddt" || name === "resolved"
       ? 5e-4
       : Math.max(1e-5, envelope * 10);

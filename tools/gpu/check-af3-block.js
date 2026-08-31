@@ -121,8 +121,17 @@ export async function main(device, args) {
     };
   };
 
+  // --stack=confidence runs the SAME stack with the confidence head's four
+  // blocks instead of the trunk's, which separates "these weights" from "that
+  // input" for the single-track residual recorded in check-af3-confidence.js.
   const blocks = [];
-  for (let index = 0; index < count; index += 1) blocks.push(await blockWeights(index));
+  if (option(args, "stack", "trunk") === "confidence") {
+    const { confidenceWeights } = await import("./af3-weights.js");
+    const confidence = await confidenceWeights(store);
+    for (let index = 0; index < Math.min(count, 4); index += 1) blocks.push(confidence.blocks[index]);
+  } else {
+    for (let index = 0; index < count; index += 1) blocks.push(await blockWeights(index));
+  }
 
   const sequence = new Float32Array(n);
   for (let i = 0; i < n; i += 1) sequence[i] = i < Math.ceil(n * 0.8) ? 1 : 0;
