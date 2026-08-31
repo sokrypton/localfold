@@ -213,17 +213,34 @@ It is a copy with an allow-list, not a bundler: the layout is preserved exactly,
 
 The model exporter copies only the 335 tensors required for inference and discards captured activations and reference outputs. It packs them into eight balanced binary shards to avoid hundreds of HTTP round trips. `tools/quantize_model.py` then rewrites those shards as int8, taking the model-1 PTM download to **97.3 MiB**. Full-model captures are intentionally excluded from the published source history.
 
-The Pages workflow deploys the UI on pushes to `main`. To keep Git history small, the quantised browser model is stored once in the `model1-ptm` GitHub Release as `localfold-model1-ptm.tar.gz`; the workflow downloads that asset before constructing the Pages artifact. The workflow does not publish model parameters unless the repository variable `LOCALFOLD_INCLUDE_MODEL` is set to `true` — Pages is public even when its source repository is not, so a `model/` directory lying around in a checkout must not publish itself. Without the bundled model, enter a CORS-enabled manifest URL in Advanced settings.
+### Deploying
+
+**🔴 `git push` does not deploy this repository.** It is a *fork*, and GitHub does not run a fork's workflows on `push` — `workflow_dispatch` still works, because that is an explicit request, but a push fires nothing. Scheduled triggers are disabled on forks too, so this cannot be fixed inside the workflow file. The failure is silent and convincing: the push succeeds, the Actions tab shows a green run from earlier, and the site serves the previous build. While Pages was still on its legacy *branch* build it was worse than silent — a push did republish the site, without the weights, which are not in the repository, so pushing appeared to work while quietly removing the model.
+
+So deploy with one command, which pushes, dispatches the workflow, and then **reads the deployed site back** until it serves the commit that was pushed:
+
+```bash
+npm run deploy            # push main, dispatch, wait for the site to serve it
+npm run deploy -- --verify   # just report what is live right now
+```
+
+`tools/build_site.py` writes `dist/build.json` carrying the commit it built, and `tools/deploy.py` polls the live copy of it. That makes "is it live?" a question with an answer, which is the only reason this stays reliable.
+
+Each model is stored once as a GitHub Release asset rather than in Git history — `model1-ptm` for the monomer and `model1-multimer-v3` for multimer — and the workflow downloads each before constructing the Pages artifact. Neither ships unless its repository variable says so (`LOCALFOLD_INCLUDE_MODEL`, `LOCALFOLD_INCLUDE_MULTIMER_MODEL`): Pages is public even when its source repository is not, so a model directory lying around in a checkout must not publish itself. Without a bundled model, enter a CORS-enabled manifest URL in Advanced settings.
 
 From a development checkout containing the full model fixture, prepare the release asset with:
 
 ```bash
-node tools/export-web-model.js <full-model-manifest>
+node tools/export-web-model.js <full-model-manifest>   # or tools/export_multimer_model.py
+python3 tools/write_manifest_module.py --all           # regenerate the compiled manifests
 mkdir -p artifacts
-tar -czf artifacts/localfold-model1-ptm.tar.gz model
+tar -czhf artifacts/localfold-model1-ptm.tar.gz model
+tar -czhf artifacts/localfold-model1-multimer-v3.tar.gz model-multimer
 ```
 
-Create a release tagged `model1-ptm` and attach the archive. The archive contains a top-level `model/` directory, so the Pages workflow can extract it directly into the built site.
+Create releases tagged `model1-ptm` and `model1-multimer-v3` and attach the matching archive to each. Every archive contains a top-level model directory, so the Pages workflow extracts it straight into the built site.
+
+**Re-exporting weights means regenerating the manifest module and committing it.** The tensor table is compiled into `src/reference/manifests/`, not fetched, so a stale one describes the previous export at offsets that still land inside files of about the right size — the page loads tensors sliced at the wrong byte and folds to noise with nothing raised. `tools/write_manifest_module.py` records each shard's sha256 and `tools/build_site.py` refuses to package an export whose bytes disagree, which is what makes committing a derived artefact safe.
 
 After pushing the repository, select **Settings → Pages → Source: GitHub Actions**. To publish the model with the demo, add the Actions variable under **Settings → Secrets and variables → Actions → Variables**. The full Pages artifact is **99.3 MiB**, comfortably below GitHub's 1 GiB Pages limit, and its largest single file is a 13 MiB shard.
 

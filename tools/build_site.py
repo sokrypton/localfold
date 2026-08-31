@@ -23,9 +23,12 @@ paths is the build step this repository just got rid of.
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,6 +69,18 @@ DTYPE_BYTES = {"int8": 1, "float16": 2, "float32": 4}
 # place to forget when a model is added.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from write_manifest_module import BUNDLES  # noqa: E402
+
+
+def build_commit() -> str:
+    """The commit this build came from: the CI one, or the checkout's HEAD."""
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
+                              capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def compiled_manifest(module: Path) -> dict:
@@ -220,6 +235,20 @@ def build(include_model: bool) -> int:
             print(f"missing {name}/", file=sys.stderr)
             return 1
         shutil.copytree(source, OUT / name, ignore=IGNORE)
+
+    # 🔴 WHAT THE SITE IS SERVING, ANSWERABLE FROM OUTSIDE IT. "Is it live?"
+    # used to be answered by eye - fetch a file, squint at its bytes - and got
+    # the wrong answer for an hour, because this repository is a FORK and a fork
+    # does not run its workflows on push. Deploys only ever happened when
+    # someone dispatched one by hand, and nothing said so.
+    #
+    # This stamp makes deployment machine-checkable: tools/deploy.py polls it
+    # until it reports the commit that was pushed, so "live" is a fact rather
+    # than an impression.
+    (OUT / "build.json").write_text(json.dumps({
+        "commit": build_commit(),
+        "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }) + "\n", encoding="utf-8")
 
     # THE PARAMETERS ARE OPT-IN, and they are the whole reason the workflow has
     # a repository variable: GitHub Pages is public even when its source

@@ -18,7 +18,8 @@
     "bench": "node tools/benchmark-triangle.js",
     "bench:attention": "node tools/benchmark-attention.js",
     "bench:a3m-stack": "node tools/benchmark-a3m-stack.js",
-    "bench:a3m-model": "node tools/benchmark-a3m-model.js"
+    "bench:a3m-model": "node tools/benchmark-a3m-model.js",
+    "deploy": "python3 tools/deploy.py"
   },
   "engines": {
     "node": ">=22"
