@@ -58,10 +58,17 @@ export class AlphaFoldUnifiedGpu {
   async predictA3m(a3mText, weights, featureTables,
     options = {}, paeBreaks,
     onRecycle, onProgress) {
+    // 🔴 FORWARD THE WHOLE OPTIONS OBJECT. This used to hand-copy five named
+    // options, which silently DROPPED the entire multimer regime -
+    // outerProductMeanFirst, positionScale, chainAware, chainSequences,
+    // templates - so every fold through this entry point ran multimer WEIGHTS
+    // on the MONOMER graph and reported a plausible number for it. The
+    // difference on a paired homodimer was 8 pLDDT and 0.11 ipTM, and nothing
+    // raised. An allow-list of options is a list that goes stale every time one
+    // is added; the extra feature-building keys predict() does not read are
+    // harmless.
     return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
-      onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
-        maskInterChainCovariance: options.maskInterChainCovariance,
-        maskRowAttentionAcrossChains: options.maskRowAttentionAcrossChains });
+      onRecycle, onProgress, options);
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]

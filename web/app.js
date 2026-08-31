@@ -132,14 +132,28 @@ function progress(fraction) {
  * ablations where the fold reports itself makes that failure visible instead.
  * Only shown for a complex; none of these reach a single chain.
  */
-function activeAblations(chainCount) {
+/**
+ * What a complex fold is actually doing, for the status line.
+ *
+ * 🔴 REPORT WHAT RAN, NOT WHAT WAS ASKED FOR. This used to read the URL flags
+ * and say "block-diagonal" whenever none was set - which became a lie the
+ * moment multimer started pairing its alignment on its own, because nobody had
+ * typed ?pairing=on. A label that describes the request rather than the run is
+ * worse than no label: it is the same failure as a flag that is not wired, one
+ * step further downstream.
+ *
+ * @param {number} chainCount
+ * @param {{construction?: string}} run what the alignment step actually built
+ */
+function activeAblations(chainCount, run = {}) {
   if (chainCount < 2) return "";
+  const parts = [];
+  if (run.construction !== undefined) parts.push(run.construction);
   const query = new URLSearchParams(location.search);
-  const on = ["pairing", "perchain", "covmask", "rowmask"].filter((name) => query.get(name) === "on");
-  // ...pairing=on turns per-chain sampling on with it, so say so rather than
-  // leaving the reader to infer which construction actually ran.
-  if (on.includes("pairing") && !on.includes("perchain")) on.splice(1, 0, "perchain");
-  return on.length === 0 ? " · block-diagonal" : ` · ${on.map((name) => `${name}=on`).join(" ")}`;
+  for (const name of ["covmask", "rowmask"]) {
+    if (query.get(name) === "on") parts.push(`${name}=on`);
+  }
+  return parts.length === 0 ? "" : ` · ${parts.join(" · ")}`;
 }
 
 // --- the alignment ---------------------------------------------------------
@@ -212,7 +226,12 @@ async function alignmentText(chains, signal, family) {
       // it: AF2-multimer clusters the assembled complex alignment as one thing.
       const perChain = family !== "multimer"
         && (flags.get("perchain") === "on" || flags.get("pairing") === "on");
-      return { text: searched.a3m, chainA3ms: perChain ? searched.chainA3ms : undefined };
+      return {
+        text: searched.a3m,
+        chainA3ms: perChain ? searched.chainA3ms : undefined,
+        construction: `${pairRepeatedChains ? "paired" : "block-diagonal"}`
+          + `${perChain ? " · sampled per chain" : ""}`,
+      };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);
@@ -505,6 +524,9 @@ async function fold(event) {
       ? alignmentResult : (alignmentResult?.text ?? null);
     // ...what the model reads. An array means one alignment per chain.
     const alignmentForModel = alignmentResult?.chainA3ms ?? alignment;
+    // ...undefined for a pasted or uploaded alignment: the construction was the
+    // user's, and claiming one here would be a guess.
+    const alignmentRun = { construction: alignmentResult?.construction };
     throwIfAborted(signal);
     if (alignment !== null) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
@@ -601,7 +623,7 @@ async function fold(event) {
       }
       progress(Math.min(1, completed / total));
       status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`
-        + activeAblations(chains.length));
+        + activeAblations(chains.length, alignmentRun));
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
