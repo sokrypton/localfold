@@ -102,9 +102,10 @@ export class HttpTensorStore {
   #loadedBytes = 0;
   #loadedTensors = 0;
   #shardCache;
-  constructor(manifestUrl, manifest, onProgress, shardCache) {
+  #shardQuery = "";
+  constructor(manifestUrl, manifest, onProgress, shardCache, shardQuery = "") {
     this.manifestUrl = manifestUrl; this.manifest = manifest; this.#onProgress = onProgress;
-    this.#shardCache = shardCache;
+    this.#shardCache = shardCache; this.#shardQuery = shardQuery;
     const records = Object.values(manifest.tensors);
     this.#totalTensors = records.length;
     // 🔴 EACH TENSOR'S OWN WIDTH, not four bytes. The shards are float16 except
@@ -127,12 +128,20 @@ export class HttpTensorStore {
     const manifest = await response.json();
     return this.fromManifest(manifestUrl, manifest, onProgress);
   }
-  static async fromManifest(manifestUrlValue, manifest, onProgress = undefined) {
+  /**
+   * @param {string} [shardQuery] a `?v=...` appended to every shard URL. The
+   *   manifest is small enough to cache-bust on every load, the shards are not,
+   *   and a re-export that pairs fresh manifest with a browser-cached shard
+   *   fails as "invalid byte length" - which names neither half. Dev harnesses
+   *   pass a token here; the shipped page leaves it empty so the shards cache.
+   */
+  static async fromManifest(manifestUrlValue, manifest, onProgress = undefined, shardQuery = "") {
     const manifestUrl = manifestUrlValue instanceof URL
       ? manifestUrlValue
       : new URL(manifestUrlValue, typeof location !== "undefined" ? location.href : "http://localhost/");
     if (manifest.tensors === undefined) throw new Error("model manifest has no tensor table");
-    const store = new HttpTensorStore(manifestUrl, manifest, onProgress, await openShardCache(manifest));
+    const store = new HttpTensorStore(manifestUrl, manifest, onProgress,
+      await openShardCache(manifest), shardQuery);
     store.#reportProgress();
     return store;
   }
@@ -177,7 +186,7 @@ export class HttpTensorStore {
     });
   }
   async #downloadFile(file, tensorName) {
-    const url = new URL(file, this.manifestUrl);
+    const url = new URL(file + this.#shardQuery, this.manifestUrl);
     const expectedLength = this.#fileByteLengths.get(file);
     if (expectedLength === undefined) throw new Error(`${file} is absent from the manifest`);
     // A HIT IS STILL READ THROUGH THE SAME LOOP, not returned whole, so the

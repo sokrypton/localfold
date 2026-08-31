@@ -79,7 +79,11 @@ try {
   // with fresh shards fails as "invalid byte length", which names neither.
   const manifest = family === 'monomer' ? DEFAULT_MANIFEST
     : await fetch(`${dir}manifest.json?v=${Date.now()}`).then((r) => r.json());
-  const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(dir, manifest));
+  // ...and the shards are busted on the export's identity, so re-exporting
+  // cannot pair a fresh manifest with a browser-cached shard.
+  const shardQuery = `?v=${manifest.bundle?.bytes ?? 0}-${Object.keys(manifest.tensors).length}`;
+  const fixture = AlphaFoldFixture.fromStore(
+    await HttpTensorStore.fromManifest(dir, manifest, undefined, shardQuery));
   const [embedding, extraStack, mainStack, structure, confidence, geometry, paeBreaks] =
     await Promise.all([
       fixture.embeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
@@ -109,7 +113,10 @@ try {
     features, weights, paeBreaks, undefined, undefined,
     family === 'monomer'
       ? { templates: false }
-      : { outerProductMeanFirst: q.get('opm') !== 'off', positionScale: 20, templates: false,
+      : { outerProductMeanFirst: q.get('opm') !== 'off', positionScale: 20,
+          // ...the reference has template.enabled TRUE, so the default here is
+          // on; ?tmpl=off pairs with the templates-disabled reference dump.
+          templates: q.get('tmpl') !== 'off',
           chainLengths: [o.chainLength, o.chainLength],
           capture: (name, values) => { stages[name] = values; } });
 
@@ -160,7 +167,11 @@ try {
     log('');
   }
   const stageRef = await fetch('./toy-oracle-stages.json').then((r) => r.ok ? r.json() : null).catch(() => null);
-  if (stageRef !== null && stages.embedder !== undefined) {
+  // 🔴 `embedder_pair` IS THE PRE-TEMPLATE STAGE. Ours is captured after the
+  // template term is added to the pair, so the two are only the same thing
+  // with templates off - compared with them on, this reads ~1.2 and means
+  // nothing but "the template term is nonzero".
+  if (stageRef !== null && stages.embedder !== undefined && q.get('tmpl') === 'off') {
     log('inside the trunk:');
     compareRep('embedder pair', Float64Array.from(stageRef.embedder_pair), stages.embedder);
     log('');
