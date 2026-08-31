@@ -36,6 +36,19 @@ jobs:
           gh release download model1-ptm --pattern localfold-model1-ptm.tar.gz
           tar -xzf localfold-model1-ptm.tar.gz -C dist
 
+      # 🔴 A SEPARATE BUNDLE AND A SEPARATE SWITCH. Multimer is another 98 MiB
+      # on top of the monomer's 97, and the page loads whichever the fold asks
+      # for, so a site can carry one, both, or neither. Without this the model
+      # dropdown still offers Multimer - and Auto selects it for any sequence
+      # with a ':' - which then fails on a manifest that was never deployed.
+      - name: Add the multimer model-1 release bundle
+        if: ${{ vars.LOCALFOLD_INCLUDE_MULTIMER_MODEL == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download model1-multimer-v3 --pattern localfold-model1-multimer-v3.tar.gz
+          tar -xzf localfold-model1-multimer-v3.tar.gz -C dist
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
