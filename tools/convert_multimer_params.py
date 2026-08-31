@@ -133,6 +133,42 @@ def convert_structure_module(params: dict) -> dict[str, dict[str, np.ndarray]]:
     }
 
 
+TRIANGLE_RENAMES = {"left_norm_input": "layer_norm_input", "center_norm": "center_layer_norm"}
+TRIANGLE_SPLITS = {"projection": ("left_projection", "right_projection"),
+                   "gate": ("left_gate", "right_gate")}
+
+
+def convert_triangle_multiplication(params: dict, scope: str) -> dict[str, dict[str, np.ndarray]]:
+    """Multimer's fused triangle multiplication, split the way monomer stores it.
+
+    Multimer computes both sides in one projection and one gate, each twice the
+    intermediate width, and slices the result:
+
+        left_proj_act  = proj_act[:, :, :c]
+        right_proj_act = proj_act[:, :, c:]
+
+    (modules.py, _fused_triangle_multiplication). So the split is FLAT and left
+    comes first - there are no heads here, unlike the IPA, where the same-looking
+    fusion interleaves per head and a flat slice takes whole heads instead of
+    half of each. The two layer norms are renames.
+
+    Weights arrive stacked over blocks, so the channel axis is the last one.
+    """
+    converted: dict[str, dict[str, np.ndarray]] = {}
+    for direction in ("outgoing", "incoming"):
+        base = f"{scope}triangle_multiplication_{direction}/"
+        for source, target in TRIANGLE_RENAMES.items():
+            converted[base + target] = params[base + source]
+        for source, (left, right) in TRIANGLE_SPLITS.items():
+            fused = params[base + source]
+            width = fused["weights"].shape[-1] // 2
+            converted[base + left] = {
+                "weights": fused["weights"][..., :width], "bias": fused["bias"][..., :width]}
+            converted[base + right] = {
+                "weights": fused["weights"][..., width:], "bias": fused["bias"][..., width:]}
+    return converted
+
+
 EVO = "alphafold/alphafold_iteration/evoformer/"
 
 
@@ -169,6 +205,51 @@ def convert_monomer_alphabet(params: dict) -> dict[str, dict[str, np.ndarray]]:
     return converted
 
 
+EVOFORMER_SCOPES = {
+    "evoformerStack": EVO + "evoformer_iteration/",
+    "extraMsaStack": EVO + "extra_msa_stack/",
+}
+
+
+def widen_multimer_alphabet(params: dict) -> dict[str, dict[str, np.ndarray]]:
+    """Multimer's 21-wide target features, padded to the 22 LocalFold builds.
+
+    🔴 INSERT A LEADING ZERO ROW, mirroring the drop-leading that goes the other
+    way. Multimer puts the real restypes at 0..19 and monomer at 1..20, and
+    LocalFold's feature builder emits the monomer's 22 channels - so a leading
+    zero lands multimer's rows exactly where the features expect them. Padding
+    the trailing end instead shifts every restype by one, which raises nothing.
+    """
+    converted = {}
+    for name in ("left_single", "right_single", "preprocess_1d"):
+        source = params[EVO + name]
+        weights = source["weights"]
+        padded = np.concatenate([np.zeros((1, weights.shape[1]), weights.dtype), weights], axis=0)
+        entry = {"weights": padded}
+        if "bias" in source:
+            entry["bias"] = source["bias"]
+        converted[EVO + name] = entry
+    return converted
+
+
+def convert_multimer_params(params: dict) -> dict[str, dict[str, np.ndarray]]:
+    """Every multimer tensor that has to change shape or name for LocalFold.
+
+    Modules absent from the result pass through unchanged - they are the ~100
+    the two graphs already share.
+    """
+    converted: dict[str, dict[str, np.ndarray]] = {}
+    converted.update(convert_structure_module(params))
+    for scope in EVOFORMER_SCOPES.values():
+        converted.update(convert_triangle_multiplication(params, scope))
+    converted.update(widen_multimer_alphabet(params))
+    # ...the relative encoding keeps its 73 rows; only the name changes, because
+    # LocalFold's packer widens a 65-row table and passes a 73-row one through.
+    converted[EVO + "pair_activiations"] = params[
+        EVO + "~_relative_encoding/position_activations"]
+    return converted
+
+
 def report_unconverted(params: dict) -> list[str]:
     """What still stands between these weights and a multimer fold.
 
@@ -176,23 +257,13 @@ def report_unconverted(params: dict) -> list[str]:
     should make, and a wrong guess here fails silently rather than loudly.
     """
     notes = []
-    relative = params.get("alphafold/alphafold_iteration/evoformer/~_relative_encoding/position_activations")
-    if relative is not None:
-        rows = relative["weights"].shape[0]
-        notes.append(
-            f"relative encoding is ({rows}, 128): 66 offset bins + 1 entity-same + 6 chain bins. "
-            "LocalFold's pair shader indexes a 65-row table and has no asym/entity/sym input, "
-            "so this needs the shader widened and the three per-residue chain ids built.")
-    left = params.get("alphafold/alphafold_iteration/evoformer/left_single")
-    if left is not None:
-        notes.append(
-            f"target-feature width is {left['weights'].shape[0]}, against LocalFold's 22. Multimer puts the "
-            "real restypes at 0..19 and monomer at 1..20, so the rows must be offset by one - "
-            "the direction that cost the reference merge a session when guessed.")
     notes.append(
-        "outer product mean runs FIRST in a multimer evoformer block; LocalFold's block.js runs it "
-        "after the MSA transition. One flag, but it reorders every block.")
-    notes.append("position_scale is 20.0 for multimer against monomer's 10.0.")
+        "the MSA pipeline is multimer's own - paired and unpaired blocks, its own clustering - "
+        "and none of it is built. This is the largest piece left.")
+    notes.append(
+        "chain identity (asym/entity/sym) is built by src/input/chains.js but does not yet reach "
+        "the model: src/multimer/model.js takes no chainLengths.")
+    notes.append("run with outerProductMeanFirst: true and positionScale: 20 - both already exist.")
     notes.append(
         f"{sum(1 for name in params if 'template' in name)} template modules are architecturally "
         "different and are excluded; run template-free, as the reference merge does.")
@@ -206,16 +277,29 @@ def main() -> int:
     args = parser.parse_args()
 
     params = load_params(args.params)
-    converted = convert_structure_module(params)
-    print(f"{len(params)} modules in, {len(converted)} structure-module tensors converted\n")
-    for name, tensors in sorted(converted.items()):
-        shapes = ", ".join(f"{leaf}{tuple(value.shape)}" for leaf, value in sorted(tensors.items()))
-        print(f"  {name.split('/')[-1]:16s} {shapes}")
+    converted = convert_multimer_params(params)
+    print(f"{len(params)} modules in, {len(converted)} converted, "
+          f"{len(params) - len(converted)} passed through\n")
+    groups = {"structure module": "/structure_module/", "triangle multiplication": "triangle_multiplication",
+              "alphabet": "_single", "relative encoding": "pair_activiations"}
+    for label, needle in groups.items():
+        names = sorted(n for n in converted if needle in n)
+        if not names:
+            continue
+        print(f"  {label}:")
+        for name in names[:4]:
+            shapes = ", ".join(f"{leaf}{tuple(value.shape)}"
+                               for leaf, value in sorted(converted[name].items()))
+            print(f"    {name.split('evoformer/')[-1].split('fold_iteration/')[-1]:56s} {shapes}")
+        if len(names) > 4:
+            print(f"    ... {len(names)} in this group")
 
     print("\nNOT converted, and why:")
     for note in report_unconverted(params):
         print(f"  - {note}")
 
+    if "preprocess_1d" in "".join(converted):
+        pass
     if args.output is not None:
         flat = {f"{module}//{leaf}": value
                 for module, tensors in converted.items() for leaf, value in tensors.items()}
