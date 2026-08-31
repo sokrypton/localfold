@@ -228,10 +228,14 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   // ...`pairRepeatedChains: false` restores the block-diagonal form, so the two
   // constructions can be folded against each other without a rebuild.
   const merge = options.pairRepeatedChains === false ? mergeUnpairedChainA3ms : mergeChainA3ms;
-  const a3m = merge(sequences.map((sequence) => bySequence.get(sequence).a3m));
+  const chainA3ms = sequences.map((sequence) => bySequence.get(sequence).a3m);
+  const a3m = merge(chainA3ms);
   const alignment = parseA3m(a3m);
   return {
     a3m,
+    // ...the merged text is what the viewer shows; the model takes these, so
+    // clustering and masking can run separately for each copy.
+    chainA3ms,
     tickets: unique.map((sequence) => bySequence.get(sequence).ticket),
     depth: alignment.depth,
     elapsedMilliseconds: performance.now() - started,

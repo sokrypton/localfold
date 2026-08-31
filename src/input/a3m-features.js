@@ -58,6 +58,9 @@ const MAX_EXTRA_SEQUENCES = 1024;
 /** CPU feature preprocessing for A3M text. Neural inference remains entirely on WebGPU. */
 export function makeA3mFeatures(a3mText, tables,
   options = {}) {
+  // ...an ARRAY IS A COMPLEX, built per chain and merged afterwards so the
+  // copies do not come out identical. See makeComplexA3mFeatures.
+  if (Array.isArray(a3mText)) return makeComplexA3mFeatures(a3mText, tables, options);
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
   const encoded = new Uint8Array(depth * length);
@@ -145,6 +148,116 @@ export function makeA3mFeatures(a3mText, tables,
       residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
       atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
       msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
+    });
+  }
+  return results;
+}
+
+const GAP_CODE = 21;
+const MSA_CHANNELS = 49;
+
+/**
+ * Write one all-gap MSA row segment, the shape a chain gets in a row that ran
+ * out of homologs. Matches what the block-diagonal alignment produced for a
+ * chain another chain's row did not cover: gap one-hot, gap profile, no
+ * deletions. `deletionValue(0)` is 0, so only the two one-hot slots are set.
+ */
+function writeGapSegment(msaFeatures, row, offset, span, width) {
+  for (let residue = 0; residue < span; residue += 1) {
+    const output = ((row * width) + offset + residue) * MSA_CHANNELS;
+    msaFeatures[output + GAP_CODE] = 1;
+    msaFeatures[output + 25 + GAP_CODE] = 1;
+  }
+}
+
+/**
+ * Features for a complex, built independently per chain and merged afterwards.
+ *
+ * 🔴 MERGING THE ALIGNMENTS FIRST MAKES THE COPIES IDENTICAL. Clustering,
+ * subsampling and BERT masking all run over whatever alignment they are handed.
+ * Give them one merged A3M whose repeated chains are paired and every copy of a
+ * protein receives the same homolog in the same row, masked at the same
+ * positions - the copies become substitutable, and the only thing left telling
+ * them apart is the residue-index offset. The block-diagonal form got that
+ * asymmetry for free, because each chain's rows were drawn and masked
+ * separately; pairing the alignments threw it away.
+ *
+ * So the sampling runs per chain, on its own seed, and the RESULTING TENSORS
+ * are concatenated along the residue axis. Every copy then draws a different
+ * subset of the same homologs and is masked at different positions, while each
+ * still gets the full cluster budget rather than its share of one.
+ *
+ * Row s of the merged MSA therefore holds unrelated homologs side by side. That
+ * is deliberate and harmless HERE ONLY BECAUSE the outer product mean is
+ * cov-masked across chains - see interChainCovarianceMask - so no covariance is
+ * ever read between them. Without that mask this construction would invent
+ * coevolution between organisms that never met.
+ *
+ * @param {readonly string[]} a3mTexts one A3M per physical chain
+ * @param {{atom37ToAtom14: Float32Array, atom37Mask: Float32Array}} tables
+ * @param {A3mFeatureOptions} [options]
+ */
+export function makeComplexA3mFeatures(a3mTexts, tables, options = {}) {
+  if (!Array.isArray(a3mTexts) || a3mTexts.length === 0) {
+    throw new RangeError("at least one chain A3M is required");
+  }
+  const recycles = options.recycles ?? 3;
+  const seed = options.randomSeed ?? 0;
+  // ...ONE SEED PER CHAIN, so identical copies diverge. Without this the whole
+  // point of building per chain is lost: the same seed on the same alignment
+  // reproduces the same centres and the same mask positions.
+  const perChain = a3mTexts.map((text, chain) => makeA3mFeatures(text, tables, {
+    ...options,
+    chainLengths: undefined,
+    randomSeed: (seed ^ Math.imul(chain + 1, 0x85ebca6b)) >>> 0,
+  }));
+  const chainLengths = a3mTexts.map((text) => parseA3m(text).length);
+  const width = chainLengths.reduce((sum, length) => sum + length, 0);
+  const offsets = [];
+  let running = 0;
+  for (const length of chainLengths) { offsets.push(running); running += length; }
+
+  const query = a3mTexts.map((text) => parseA3m(text).query).join("");
+  const base = makeQueryOnlyFeatures(query, tables, { recycles: 0, chainLengths })[0];
+
+  const results = [];
+  for (let recycle = 0; recycle <= recycles; recycle += 1) {
+    const parts = perChain.map((chain) => chain[recycle]);
+    const msaSequences = Math.max(...parts.map((part) => part.msaSequences));
+    const extraSequences = Math.max(...parts.map((part) => part.extraSequences));
+
+    const msaFeatures = new Float32Array(msaSequences * width * MSA_CHANNELS);
+    const msaMask = new Float32Array(msaSequences * width).fill(1);
+    const extraMsa = new Float32Array(extraSequences * width);
+    const extraHasDeletion = new Float32Array(extraSequences * width);
+    const extraDeletionValue = new Float32Array(extraSequences * width);
+    const extraMsaMask = new Float32Array(extraSequences * width).fill(1);
+
+    parts.forEach((part, chain) => {
+      const span = chainLengths[chain];
+      const offset = offsets[chain];
+      for (let row = 0; row < msaSequences; row += 1) {
+        if (row >= part.msaSequences) { writeGapSegment(msaFeatures, row, offset, span, width); continue; }
+        const from = row * span * MSA_CHANNELS;
+        const to = (row * width + offset) * MSA_CHANNELS;
+        msaFeatures.set(part.msaFeatures.subarray(from, from + span * MSA_CHANNELS), to);
+      }
+      for (let row = 0; row < extraSequences; row += 1) {
+        const to = row * width + offset;
+        if (row >= part.extraSequences) { extraMsa.fill(GAP_CODE, to, to + span); continue; }
+        const from = row * span;
+        extraMsa.set(part.extraMsa.subarray(from, from + span), to);
+        extraHasDeletion.set(part.extraHasDeletion.subarray(from, from + span), to);
+        extraDeletionValue.set(part.extraDeletionValue.subarray(from, from + span), to);
+      }
+    });
+
+    results.push({
+      targetFeatures: base.targetFeatures.slice(), msaFeatures, msaMask,
+      extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
+      residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
+      atom37ToAtom14: base.atom37ToAtom14.slice(), atom37Mask: base.atom37Mask.slice(),
+      msaSequences, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
     });
   }
   return results;

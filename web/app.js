@@ -110,6 +110,13 @@ function progress(fraction) {
 
 // --- the alignment ---------------------------------------------------------
 
+/**
+ * The alignment, as the viewer wants it and as the model wants it.
+ *
+ * They differ for a complex: the viewer shows one merged A3M, while the model
+ * takes the per-chain alignments so clustering, subsampling and masking run
+ * separately for each copy. Merging first makes repeated chains identical.
+ */
 async function alignmentText(chains, signal) {
   switch (msaMode()) {
     case "single": return null;
@@ -150,7 +157,10 @@ async function alignmentText(chains, signal) {
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`
         + (chains.length > 1 && !pairRepeatedChains ? " · block-diagonal" : ""));
-      return searched.a3m;
+      // 🔴 ?perchain=off MERGES FIRST, the construction this replaced, so the
+      // two can be folded against each other.
+      const perChain = new URLSearchParams(location.search).get("perchain") !== "off";
+      return { text: searched.a3m, chainA3ms: perChain ? searched.chainA3ms : undefined };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);
@@ -437,7 +447,11 @@ async function fold(event) {
     }
     let chains = enteredProblem === null ? sequenceChains(entered) : [];
     let sequence = chains.join("");
-    const alignment = await alignmentText(chains, signal);
+    const alignmentResult = await alignmentText(chains, signal);
+    const alignment = typeof alignmentResult === "string"
+      ? alignmentResult : (alignmentResult?.text ?? null);
+    // ...what the model reads. An array means one alignment per chain.
+    const alignmentForModel = alignmentResult?.chainA3ms ?? alignment;
     throwIfAborted(signal);
     if (alignment !== null) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
@@ -542,7 +556,7 @@ async function fold(event) {
         sequence, model.weights, model.featureTables,
         { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress)
       : await new AlphaFoldMonomerGpu(device).predictA3m(
-        alignment, model.weights, model.featureTables,
+        alignmentForModel, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
           maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress);
 
