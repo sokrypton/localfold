@@ -69,6 +69,10 @@ export class EvoformerStackGpu {
       }
       const submissionWindow = input.profileBlock === undefined ? requestedWindow : 1;
       const validation = new DeferredValidation(this.device, "Evoformer stack");
+      // ...a Float32Array on the way in, a tensor from here on, uploaded once
+      // rather than per block. Absent for a monomer, which keeps the plain path.
+      const covMask = input.covMask === undefined
+        ? undefined : execution.upload("stack.cov-mask", input.covMask);
 
       for (let block = 0; block < input.blockWeights.length; block += 1) {
         throwIfAborted(input.signal);
@@ -78,6 +82,7 @@ export class EvoformerStackGpu {
         validation.begin();
         await encodeEvoformerBlock(execution, encoder, {
           ...input,
+          covMask,
           weights: input.blockWeights[block],
         }, msa, pair, msaMask, pairMask);
         execution.endComputePass(encoder);
@@ -171,12 +176,14 @@ export class ExtraMsaPairStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       const validation = new DeferredValidation(this.device, "extra-MSA pair stack");
+      const covMask = input.covMask === undefined
+        ? undefined : execution.upload("extra-pair-stack.cov-mask", input.covMask);
       for (let block = 0; block < input.blockWeights.length; block += 1) {
         throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `extra-msa-pair-stack.block-${block}` });
         validation.begin();
         await encodeEvoformerPairBlock(
-          execution, encoder, input, input.blockWeights[block], msa, pair, msaMask, pairMask,
+          execution, encoder, { ...input, covMask }, input.blockWeights[block], msa, pair, msaMask, pairMask,
         );
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);

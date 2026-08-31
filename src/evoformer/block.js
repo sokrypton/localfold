@@ -21,6 +21,10 @@ import {
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  OUTER_PRODUCT_MEAN_MARGINALS_SHADER,
+  OUTER_PRODUCT_MEAN_CONTRACT_COV_MASKED_SHADER,
+  OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_COV_MASKED_SHADER,
+  OUTER_PRODUCT_MEAN_TILE_MARGINAL_SHADER,
   packOuterProductMeanWeights,
   useOuterFirstContraction,
 
@@ -402,6 +406,7 @@ async function encodeOuterProductMean(
   input,
   weightsValue,
   residualTarget,
+  covMask,
 ) {
   const descriptor = {
     activations: new Float32Array(0), mask: new Float32Array(0), sequences: input.sequences,
@@ -415,15 +420,28 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
-    execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
+    execution.pipelines.get(
+      covMask === undefined ? "block:opm:tile-accumulate" : "block:opm:tile-accumulate-cov-masked",
+      covMask === undefined
+        ? OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER
+        : OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_COV_MASKED_SHADER,
+    ),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-    execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+    execution.pipelines.get(
+      covMask === undefined ? "block:opm:contract" : "block:opm:contract-cov-masked",
+      covMask === undefined
+        ? OUTER_PRODUCT_MEAN_CONTRACT_SHADER : OUTER_PRODUCT_MEAN_CONTRACT_COV_MASKED_SHADER,
+    ),
     execution.pipelines.get(
       outerFirst && residualTarget !== undefined
         ? "block:opm:project-output-residual" : "block:opm:project-output",
       outerFirst && residualTarget !== undefined
         ? OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER : OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
     ),
+  ]);
+  const [marginalsPipeline, tileMarginalPipeline] = covMask === undefined ? [] : await Promise.all([
+    execution.pipelines.get("block:opm:marginals", OUTER_PRODUCT_MEAN_MARGINALS_SHADER),
+    execution.pipelines.get("block:opm:tile-marginal", OUTER_PRODUCT_MEAN_TILE_MARGINAL_SHADER),
   ]);
   const rows = input.sequences * input.length;
   const pairElements = input.length * input.length * input.cZ;
@@ -446,10 +464,22 @@ async function encodeOuterProductMean(
   let grid = execution.linearGrid(rows * input.cOuter);
   execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right], grid[0], grid[1], 1,
     "opm.project");
+  let leftSum;
+  let rightMean;
+  if (covMask !== undefined) {
+    leftSum = execution.allocate("opm.left-sum", input.length * input.cOuter);
+    rightMean = execution.allocate("opm.right-mean", input.length * input.cOuter);
+    const marginalGrid = execution.linearGrid(input.length * input.cOuter);
+    execution.dispatch(encoder, marginalsPipeline, [left, right, msaMask, params, leftSum, rightMean],
+      marginalGrid[0], marginalGrid[1], 1, "opm.marginals");
+  }
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {
     grid = execution.linearGrid(intermediateElements);
-    execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
+    execution.dispatch(encoder, contractPipeline,
+      covMask === undefined
+        ? [left, right, params, intermediate]
+        : [left, right, params, intermediate, covMask, leftSum, rightMean],
       grid[0], grid[1], 1, "opm.contract");
     execution.dispatch(encoder, projectOutputPipeline, [intermediate, msaMask, weights, params, output],
       outputGrid[0], outputGrid[1], 1, "opm.project-output");
@@ -462,8 +492,16 @@ async function encodeOuterProductMean(
       grid = execution.linearGrid(count * input.length * input.cOuter * input.cZ);
       execution.dispatch(encoder, intermediatePipeline, [left, weights, params, tileParams, intermediate],
         grid[0], grid[1], 1, `opm.intermediate-${offset}`);
-      execution.dispatch(encoder, accumulatePipeline, [right, intermediate, params, tileParams, output],
+      execution.dispatch(encoder, accumulatePipeline,
+        covMask === undefined
+          ? [right, intermediate, params, tileParams, output]
+          : [right, intermediate, params, tileParams, output, covMask],
         outputGrid[0], outputGrid[1], 1, `opm.accumulate-${offset}`);
+    }
+    if (covMask !== undefined) {
+      execution.dispatch(encoder, tileMarginalPipeline,
+        [leftSum, rightMean, covMask, weights, params, output],
+        outputGrid[0], outputGrid[1], 1, "opm.tile-marginal");
     }
     execution.dispatch(encoder, finalizePipeline, [msaMask, weights, params, output],
       outputGrid[0], outputGrid[1], 1, "opm.finalize");
@@ -555,7 +593,7 @@ export async function encodeEvoformerBlock(
   );
 
   let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
+    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair, input.covMask,
   );
   if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
 
@@ -599,7 +637,7 @@ export async function encodeEvoformerPairBlock(
   pairMask,
 ) {
   let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair, shape.covMask,
   );
   if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
   await encodeTriangleMultiplication(

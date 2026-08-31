@@ -81,6 +81,42 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * Which pair entries may keep their MSA covariance, as a [L, L] mask.
+ *
+ * 🔴 PAIRING REPEATED CHAINS CREATES A COEVOLUTION SIGNAL THAT IS NOT REAL.
+ * Every copy of one protein carries the SAME residue in a given row, so the
+ * covariance the outer product mean measures between residue i of copy 1 and
+ * residue j of copy 2 is a verbatim copy of the covariance between i and j
+ * WITHIN one copy. Fed to the pair track it asserts that every intra-chain
+ * contact is also an inter-chain contact, which is a statement about the
+ * interface that the alignment never made.
+ *
+ * Zeroing those entries tells the outer product mean to keep the first-order
+ * profile there and drop the second-order term - the marginal substitution
+ * ColabDesign applies through its `cov_mask`. The depth pairing buys is kept;
+ * the coupling it invents is not.
+ *
+ * @param {number} totalLength
+ * @param {readonly number[] | undefined} chainLengths
+ * @returns {Float32Array} shape [totalLength, totalLength], 1 intra-chain
+ */
+export function interChainCovarianceMask(totalLength, chainLengths) {
+  const lengths = validatedChainLengths(totalLength, chainLengths);
+  const chainOf = new Uint32Array(totalLength);
+  let residue = 0;
+  for (let chain = 0; chain < lengths.length; chain += 1) {
+    for (let within = 0; within < lengths[chain]; within += 1) chainOf[residue++] = chain;
+  }
+  const mask = new Float32Array(totalLength * totalLength);
+  for (let i = 0; i < totalLength; i += 1) {
+    for (let j = 0; j < totalLength; j += 1) {
+      mask[i * totalLength + j] = chainOf[i] === chainOf[j] ? 1 : 0;
+    }
+  }
+  return mask;
+}
+
+/**
  * Assemble per-chain A3Ms into complex rows, pairing copies of one protein.
  *
  * 🔴 BLOCK-DIAGONAL IS THE WRONG SHAPE FOR REPEATED CHAINS, twice over. When a

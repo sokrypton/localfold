@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { mergeChainA3ms } from "./chains.js";
+import { mergeChainA3ms, mergeUnpairedChainA3ms } from "./chains.js";
 
 const DEFAULT_API_URL = "https://api.colabfold.com";
 const QUERY_ID = 101;
@@ -203,7 +203,8 @@ export async function generateMmseqs2Msa(sequenceValue,
  * monomer-model heterooligomer construction ColabFold uses.
  *
  * @param {readonly string[]} sequenceValues one sequence per physical chain
- * @param {any} [options] the options accepted by generateMmseqs2Msa
+ * @param {any} [options] the options accepted by generateMmseqs2Msa, plus
+ *   `pairRepeatedChains` (default true) to pair copies of one protein
  * @returns {Promise<{a3m: string, tickets: string[], depth: number, elapsedMilliseconds: number}>}
  */
 export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
@@ -224,7 +225,10 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   }));
   const bySequence = new Map();
   for (const [sequence, searched] of entries) bySequence.set(sequence, searched);
-  const a3m = mergeChainA3ms(sequences.map((sequence) => bySequence.get(sequence).a3m));
+  // ...`pairRepeatedChains: false` restores the block-diagonal form, so the two
+  // constructions can be folded against each other without a rebuild.
+  const merge = options.pairRepeatedChains === false ? mergeUnpairedChainA3ms : mergeChainA3ms;
+  const a3m = merge(sequences.map((sequence) => bySequence.get(sequence).a3m));
   const alignment = parseA3m(a3m);
   return {
     a3m,

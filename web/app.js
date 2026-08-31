@@ -130,8 +130,15 @@ async function alignmentText(chains, signal) {
       const query = chains.join("");
       const problem = complexSequenceProblem(chains.join(":"));
       if (problem !== null) throw new Error(problem);
+      // 🔴 ?pairing=off FOLDS THE OLD BLOCK-DIAGONAL CONSTRUCTION, so a complex
+      // can be run both ways in one sitting. Comparing against a remembered
+      // number from a previous build is how run-to-run drift gets mistaken for
+      // an effect.
+      const pairRepeatedChains =
+        new URLSearchParams(location.search).get("pairing") !== "off";
       const searchOptions = {
         signal,
+        pairRepeatedChains,
         onProgress: ({ phase, status: state, elapsedMilliseconds }) => {
           if (signal.aborted) return;
           status(`MSA search · ${phase} (${state}) · ${(elapsedMilliseconds / 1000).toFixed(0)}s`
@@ -141,7 +148,8 @@ async function alignmentText(chains, signal) {
       const searched = chains.length === 1
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
-      status(`MSA search found ${searched.depth} sequences`);
+      status(`MSA search found ${searched.depth} sequences`
+        + (chains.length > 1 && !pairRepeatedChains ? " · block-diagonal" : ""));
       return searched.a3m;
     }
     default:
@@ -524,13 +532,19 @@ async function fold(event) {
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
+    // 🔴 ?covmask=off KEEPS THE INTER-CHAIN COVARIANCE, so the marginal
+    // substitution can be folded against the plain contraction. Only reaches
+    // anything when the complex has more than one chain.
+    const maskInterChainCovariance =
+      new URLSearchParams(location.search).get("covmask") !== "off";
     const prediction = alignment === null
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
-        { recycles, randomSeed: seed, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress)
+        { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress)
       : await new AlphaFoldMonomerGpu(device).predictA3m(
         alignment, model.weights, model.featureTables,
-        { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal }, model.paeBreaks, onRecycle, runProgress);
+        { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
+          maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;

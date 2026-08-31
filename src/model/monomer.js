@@ -13,6 +13,7 @@ import {
 } from "./recycle-convergence.js";
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
+import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult
@@ -47,7 +48,8 @@ export class AlphaFoldMonomerGpu {
     options = {}, paeBreaks,
     onRecycle, onProgress) {
     return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
-      onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths });
+      onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
+        maskInterChainCovariance: options.maskInterChainCovariance });
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]
@@ -136,7 +138,19 @@ export class AlphaFoldMonomerGpu {
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
 
+        // 🔴 ONLY WHEN THE COMPLEX HAS MORE THAN ONE CHAIN. Repeated chains are
+        // paired into single MSA rows, which makes the inter-chain covariance a
+        // copy of the intra-chain one; the mask keeps the profile there and
+        // drops the coupling. A monomer has no inter-chain pairs, gets no mask,
+        // and takes the untouched code path.
+        const covMask = recycleOptions.chainLengths !== undefined
+            && recycleOptions.chainLengths.length > 1
+            && recycleOptions.maskInterChainCovariance !== false
+          ? execution.upload(`monomer.cov-mask-${recycle}`,
+            interChainCovarianceMask(length, recycleOptions.chainLengths))
+          : undefined;
         const extraShape = {
+          covMask,
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
@@ -163,6 +177,7 @@ export class AlphaFoldMonomerGpu {
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
           pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
+          covMask,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };
