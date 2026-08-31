@@ -31,31 +31,14 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { createTriangleShaders } from "../triangle/shaders.js";
-import { packWeights as packTriangleWeights } from "../triangle/weights.js";
-import { af3TriangleWeights } from "./triangle-webgpu.js";
-import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention-webgpu.js";
+import {
+  GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
+  packPairTrackWeights,
+} from "./pair-track-gpu.js";
 import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
 import { createSingleAttentionShaders, packSingleAttentionWeights } from "./single-attention-webgpu.js";
 
-const GRID_WIDTH = 32_768;
-const PAIR_CHANNELS = 128;
 const SINGLE_CHANNELS = 384;
-
-/** `target += delta`, elementwise. The residual chain, five times a block. */
-function createAddShader(elements) {
-  return `
-const ELEMENTS: u32 = ${elements}u;
-const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
-@group(0) @binding(0) var<storage, read_write> accumulator: array<f32>;
-@group(0) @binding(1) var<storage, read> delta: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= ELEMENTS) { return; }
-  accumulator[index] = accumulator[index] + delta[index];
-}`;
-}
 
 /**
  * The pair logits that bias single attention: LayerNorm the pair, project to
@@ -159,18 +142,19 @@ export class Af3PairformerStackGpu {
     }
 
     const heads = blocks[0].singleAttention.heads;
+    const gridHeads = blocks[0].pairAttention1.heads;
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     const pairBytes = pairs * PAIR_CHANNELS * 4;
 
-    // Shaders first: every block has the same shapes, so they compile once and
-    // the per-block work is a weight upload.
-    const shapes = { length: n, cZ: PAIR_CHANNELS, cHidden: PAIR_CHANNELS };
-    const triangleOffsets = packTriangleWeights(
-      af3TriangleWeights(blocks[0].triangleMultiplicationOutgoing, PAIR_CHANNELS), "f32").offsets;
-    const gridOffsets = packGridAttentionWeights(blocks[0].pairAttention1).offsets;
-    const transitionOffsets = packTransitionWeights(blocks[0].pairTransition).offsets;
+    // The pair track, shared with the MSA stack.
+    const base = `af3-block:${n}:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
+    const pipelines = await compilePairTrack(this.pipelines, {
+      n, sample: blocks[0], epsilon, variance, dialect, base,
+    });
+    const compile = (key, source) => this.pipelines.get(key, source);
+
     const singleTransitionOffsets = packTransitionWeights(blocks[0].singleTransition).offsets;
     const singleOffsets = packSingleAttentionWeights(blocks[0].singleAttention).offsets;
     const logitsOffsets = packPairLogitsWeights({
@@ -178,39 +162,6 @@ export class Af3PairformerStackGpu {
       offset: blocks[0].singlePairLogitsNormOffset,
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
-
-    const triangleSources = {};
-    for (const direction of ["outgoing", "incoming"]) {
-      triangleSources[direction] = createTriangleShaders(
-        shapes, "f32", triangleOffsets, epsilon, direction, variance);
-    }
-    const gridSources = {
-      false: createGridAttentionShaders(
-        { n, channels: PAIR_CHANNELS, heads: blocks[0].pairAttention1.heads,
-          dimension: blocks[0].pairAttention1.dimension, transpose: false },
-        gridOffsets, epsilon, variance, dialect),
-      true: createGridAttentionShaders(
-        { n, channels: PAIR_CHANNELS, heads: blocks[0].pairAttention2.heads,
-          dimension: blocks[0].pairAttention2.dimension, transpose: true },
-        gridOffsets, epsilon, variance, dialect),
-    };
-
-    const compile = (key, source) => this.pipelines.get(key, source);
-    const base = `af3-block:${n}:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
-    const pipelines = {};
-    for (const direction of ["outgoing", "incoming"]) {
-      for (const [name, source] of Object.entries(triangleSources[direction])) {
-        pipelines[`tri:${direction}:${name}`] = await compile(`${base}:tri:${direction}:${name}`, source);
-      }
-    }
-    for (const transpose of ["false", "true"]) {
-      for (const [name, source] of Object.entries(gridSources[transpose])) {
-        pipelines[`grid:${transpose}:${name}`] = await compile(`${base}:grid:${transpose}:${name}`, source);
-      }
-    }
-    pipelines.pairTransition = await compile(`${base}:pair-transition`,
-      createTransitionShader({ rows: pairs, channels: PAIR_CHANNELS, factor: 4 },
-                             transitionOffsets, epsilon, variance));
     pipelines.singleTransition = await compile(`${base}:single-transition`,
       createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4 },
                              singleTransitionOffsets, epsilon, variance));
@@ -222,7 +173,6 @@ export class Af3PairformerStackGpu {
     }
     pipelines.pairLogits = await compile(`${base}:pair-logits`,
       createPairLogitsShader(n, PAIR_CHANNELS, heads, logitsOffsets, epsilon, variance));
-    pipelines.addPair = await compile(`${base}:add-pair`, createAddShader(pairs * PAIR_CHANNELS));
     pipelines.addSingle = await compile(`${base}:add-single`, createAddShader(n * SINGLE_CHANNELS));
 
     try {
@@ -238,7 +188,7 @@ export class Af3PairformerStackGpu {
         scratch.push(keep(this.allocator.allocate(`af3-block.scratch${index}`, pairBytes, storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
-        "af3-block.bias", heads * pairs * 4, storage));
+        "af3-block.bias", gridHeads * pairs * 4, storage));
       const pairLogits = keep(this.allocator.allocate(
         "af3-block.pair-logits", heads * pairs * 4, storage));
       const singleWidth = heads * blocks[0].singleAttention.dimension;
@@ -259,7 +209,7 @@ export class Af3PairformerStackGpu {
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
-          block: blocks[index], n, pairs, heads, pipelines, storage, keep,
+          block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
         options.onBlock?.(index);
@@ -288,7 +238,7 @@ export class Af3PairformerStackGpu {
 
   /** One block, submitted as one command buffer. */
   async #encodeBlock(context) {
-    const { block, n, pairs, heads, pipelines, storage } = context;
+    const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
     const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch } = context;
 
     // 🔴 PER-BLOCK WEIGHTS ARE RELEASED PER BLOCK, not with the stack. Each
@@ -301,18 +251,14 @@ export class Af3PairformerStackGpu {
       blockAllocations.push(allocation);
       return allocation;
     };
-    const triangleWeights = {
-      outgoing: upload("w.tri.out", packTriangleWeights(
-        af3TriangleWeights(block.triangleMultiplicationOutgoing, PAIR_CHANNELS), "f32").data),
-      incoming: upload("w.tri.in", packTriangleWeights(
-        af3TriangleWeights(block.triangleMultiplicationIncoming, PAIR_CHANNELS), "f32").data),
+    const packedPair = packPairTrackWeights(block);
+    const pairTrackWeights = {
+      outgoing: upload("w.tri.out", packedPair.outgoing),
+      incoming: upload("w.tri.in", packedPair.incoming),
+      grid1: upload("w.grid1", packedPair.grid1),
+      grid2: upload("w.grid2", packedPair.grid2),
+      transition: upload("w.pair-transition", packedPair.transition),
     };
-    const gridWeights = {
-      false: upload("w.grid1", packGridAttentionWeights(block.pairAttention1).data),
-      true: upload("w.grid2", packGridAttentionWeights(block.pairAttention2).data),
-    };
-    const pairTransitionWeights = upload("w.pair-transition",
-      packTransitionWeights(block.pairTransition).data);
     const singleTransitionWeights = upload("w.single-transition",
       packTransitionWeights(block.singleTransition).data);
     const singleWeights = upload("w.single", packSingleAttentionWeights(block.singleAttention).data);
@@ -339,50 +285,10 @@ export class Af3PairformerStackGpu {
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
-    // The five pair updates, each reading the pair as the previous one left it.
-    for (const direction of ["outgoing", "incoming"]) {
-      const weights = triangleWeights[direction];
-      const p = (name) => pipelines[`tri:${direction}:${name}`];
-      run("tri.normalize", p("normalizeInput"), [pair, weights, scratch[0]], ceil(pairs, 64));
-      run("tri.project", p("projectAB"), [scratch[0], pairMask, weights, scratch[1], scratch[2]],
-          ceil(PAIR_CHANNELS, 16), ceil(pairs, 16));
-      run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
-          ceil(n, 8), ceil(n, 8), PAIR_CHANNELS);
-      run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], weights, scratch[4]],
-          ceil(pairs, 64));
-      run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], weights, scratch[5]],
-          ceil(PAIR_CHANNELS, 16), ceil(pairs, 16));
-      const add = spread(ceil(pairs * PAIR_CHANNELS, 64));
-      run("tri.add", pipelines.addPair, [pair, scratch[5]], add[0], add[1]);
-    }
-
-    for (const transpose of ["false", "true"]) {
-      const weights = gridWeights[transpose];
-      const p = (name) => pipelines[`grid:${transpose}:${name}`];
-      const linear = spread(ceil(pairs, 64));
-      run("grid.normalize", p("normalize"), [pair, weights, scratch[0]], linear[0], linear[1]);
-      run("grid.bias", p("bias"), [scratch[0], weights, biasBuffer], linear[0], linear[1]);
-      const perPair = spread(pairs);
-      run("grid.project", p("project"),
-          [scratch[0], weights, scratch[1], scratch[2], scratch[3], scratch[4]],
-          perPair[0], perPair[1]);
-      const perSlot = spread(pairs * heads);
-      run("grid.attend", p("attend"),
-          [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[5]],
-          perSlot[0], perSlot[1]);
-      run("grid.project-out", p("project_out"), [scratch[5], scratch[4], weights, scratch[6]],
-          perPair[0], perPair[1]);
-      const add = spread(ceil(pairs * PAIR_CHANNELS, 64));
-      run("grid.add", pipelines.addPair, [pair, scratch[6]], add[0], add[1]);
-    }
-
-    {
-      const perPair = spread(pairs);
-      run("pair-transition", pipelines.pairTransition,
-          [pair, pairTransitionWeights, scratch[0]], perPair[0], perPair[1]);
-      const add = spread(ceil(pairs * PAIR_CHANNELS, 64));
-      run("pair-transition.add", pipelines.addPair, [pair, scratch[0]], add[0], add[1]);
-    }
+    encodePairTrack({
+      run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer,
+      weights: pairTrackWeights,
+    });
 
     // 🔴 AFTER the five, never before.
     const linear = spread(ceil(pairs, 64));
