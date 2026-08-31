@@ -98,9 +98,18 @@ export class AlphaFoldUnifiedGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featuresByRecycle[0] .seqMask[i] * featuresByRecycle[0] .seqMask[j];
     }
-    const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
-      length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
-    }), signal);
+    // 🔴 A MULTIMER RUN HAS NO TEMPLATE EMBEDDER AT ALL. Multimer's is
+    // architecturally different from the monomer's - no reshape maps one onto
+    // the other - so the multimer export ships none and the fold runs
+    // template-free, which is what ColabDesign2's merge does too. The monomer
+    // regime keeps its mock-template residual, and that is part of why this
+    // graph reproduces the monomer one exactly.
+    const useTemplates = recycleOptions.templates !== false && weights.template !== undefined;
+    const template = useTemplates
+      ? await withAbort(new QueryOnlyTemplateGpu(this.device).run({
+        length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
+      }), signal)
+      : undefined;
     throwIfAborted(signal);
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
@@ -137,7 +146,8 @@ export class AlphaFoldUnifiedGpu {
     };
     const releaseTensor = (tensor) => tensor.allocation.release();
     try {
-      const templateUpdate = execution.upload("monomer.template-update", template.pairUpdate);
+      const templateUpdate = template === undefined
+        ? undefined : execution.upload("monomer.template-update", template.pairUpdate);
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
       let previousMsa = execution.upload("monomer.recycle-msa-zero", new Float32Array(length * 256));
       let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128));
@@ -161,9 +171,12 @@ export class AlphaFoldUnifiedGpu {
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
         }, previousMsa, previousPair, previousPositions);
-        await execution.addInPlace(
-          embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
-        );
+        if (templateUpdate !== undefined) {
+          await execution.addInPlace(
+            embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate,
+            `monomer.template-residual-${recycle}`,
+          );
+        }
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
         throwIfAborted(signal);
         for (const temporary of embedding.temporaries) releaseTensor(temporary);

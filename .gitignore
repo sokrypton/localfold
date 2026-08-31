@@ -25,3 +25,7 @@ test/fixtures/evoformer/
 
 # Written whenever tools/build_site.py imports a sibling.
 __pycache__/
+
+# The multimer export, written by tools/export_multimer_model.py.
+/model-multimer
+/model-multimer.f32/
