@@ -263,9 +263,9 @@ export function diffusionConditioning(input, weights) {
                         tokens, singleWidth, seqChannels,
                         weights.singleCondInitialProjection);
 
-  // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG, and the Fourier
-  // constants are stock AF3's. A ported checkpoint carries its own trained
-  // embedding; see noise-fourier.js.
+  // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG. The weight and
+  // bias come from the model - see noiseEmbedding above - so this is the same
+  // line whether they were trained or baked in at export.
   const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA,
                                   weights.fourierWeight, weights.fourierBias);
   const noiseChannels = embedded.length;
