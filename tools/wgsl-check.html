@@ -28,6 +28,7 @@ const modules = Object.assign({},
   await src('src/evoformer/outer-product-mean.js'),
   await src('src/evoformer/attention.js'),
   await src('src/multimer/input-embedder.js'),
+  await src('src/multimer/template.js'),
   geometry,
   // the atom14 shader is generated per position_scale; compile both
   { ATOM14_SHADER_monomer: geometry.createAtom14Shader(geometry.MONOMER_POSITION_SCALE),

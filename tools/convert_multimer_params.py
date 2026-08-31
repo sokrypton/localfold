@@ -208,6 +208,10 @@ def convert_monomer_alphabet(params: dict) -> dict[str, dict[str, np.ndarray]]:
 EVOFORMER_SCOPES = {
     "evoformerStack": EVO + "evoformer_iteration/",
     "extraMsaStack": EVO + "extra_msa_stack/",
+    # ...the template embedder's pair stack is an evoformer block like any
+    # other, and fuses its triangle multiplication the same way.
+    "templateStack": EVO + "template_embedding/single_template_embedding/"
+                           "template_embedding_iteration/",
 }
 
 

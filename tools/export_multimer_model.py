@@ -196,9 +196,16 @@ def export(params_path: Path, monomer_dir: Path, out_dir: Path) -> int:
     # It IS architecturally different from the monomer's, so nothing is
     # converted here: the modules are exported under their own names, and the
     # graph reads them as multimer's own shapes.
+    # ...`params` carries BOTH forms of the template stack's triangle
+    # multiplication - the checkpoint's fused one and the split one
+    # convert_multimer_params produced - so the fused originals are dropped
+    # rather than shipped twice.
+    superseded = ("/projection", "/gate", "/left_norm_input", "/center_norm")
     template = {}
     for module in sorted(params):
         if "template" not in module:
+            continue
+        if "triangle_multiplication" in module and module.endswith(superseded):
             continue
         leaf = module.split("evoformer/")[-1]
         template[leaf] = {name: writer.add(identifier("templateEmbedding"), values)

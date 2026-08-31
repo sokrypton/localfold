@@ -23,6 +23,7 @@ import {
 
 import { makeA3mFeatures } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
+import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
 import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
@@ -111,6 +112,10 @@ export class AlphaFoldUnifiedGpu {
     // regime keeps its mock-template residual, and that is part of why this
     // graph reproduces the monomer one exactly.
     const useTemplates = recycleOptions.templates !== false && weights.template !== undefined;
+    // ...multimer's is a different embedder entirely, and is on whenever the
+    // weights carry one, because the reference always runs it.
+    const useMultimerTemplates = recycleOptions.templates !== false
+      && hasTemplateEmbedder(weights.templateEmbedding);
     const template = useTemplates
       ? await withAbort(new QueryOnlyTemplateGpu(this.device).run({
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
@@ -193,6 +198,15 @@ export class AlphaFoldUnifiedGpu {
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
         }, previousMsa, previousPair, previousPositions);
+        // 🔴 AF2-MULTIMER'S TEMPLATE EMBEDDER RUNS EVERY RECYCLE, templates or
+        // not, and adds its result to the pair. It reads the pair through a
+        // layer norm, so it is a function of the pair rather than a constant
+        // that could be folded in once.
+        if (useMultimerTemplates) {
+          await encodeTemplateEmbedding(execution, embeddingEncoder, {
+            length, pairChannels: 128, templates: 1,
+          }, weights.templateEmbedding, embedding.pairWithoutTemplates, pairMaskTensor);
+        }
         if (templateUpdate !== undefined) {
           await execution.addInPlace(
             embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate,

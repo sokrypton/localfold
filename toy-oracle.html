@@ -74,8 +74,11 @@ try {
     : (q.get('weights') === 'f32' ? './model-multimer-f32/' : './model-multimer/');
   log(`loading multimer weights from ${dir}…`);
   const { DEFAULT_MANIFEST } = await src('src/reference/manifest.js');
+  // ...the manifest is cache-busted while the shards are not: it is small and
+  // changes whenever the model is re-exported, and pairing a stale manifest
+  // with fresh shards fails as "invalid byte length", which names neither.
   const manifest = family === 'monomer' ? DEFAULT_MANIFEST
-    : await fetch(`${dir}manifest.json`).then((r) => r.json());
+    : await fetch(`${dir}manifest.json?v=${Date.now()}`).then((r) => r.json());
   const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(dir, manifest));
   const [embedding, extraStack, mainStack, structure, confidence, geometry, paeBreaks] =
     await Promise.all([
@@ -83,10 +86,15 @@ try {
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(),
       fixture.tensor('confidencePaeBreaks'),
     ]);
+  const templateEmbedding = family === 'monomer' ? undefined
+    : await fixture.templateEmbeddingWeights();
+  if (templateEmbedding !== undefined) {
+    log(`template embedder: ${templateEmbedding.stack.length} pair blocks`);
+  }
   // ...?blocks=main:extra truncates the trunk to match a truncated reference,
   // so a difference has one block to live in rather than fifty-two.
   const trunc = (q.get('blocks') ?? '').split(':').map(Number);
-  const weights = { embedding, structure, geometry,
+  const weights = { embedding, structure, geometry, templateEmbedding,
     extraStack: trunc.length === 2 ? extraStack.slice(0, trunc[1]) : extraStack,
     mainStack: trunc.length === 2 ? mainStack.slice(0, trunc[0]) : mainStack,
     lddt: confidence.lddt, pae: confidence.pae };

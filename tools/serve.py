@@ -33,7 +33,13 @@ CACHEABLE = ("/model/", "/model-multimer/")
 class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
         if any(self.path.startswith(prefix) for prefix in CACHEABLE):
-            self.send_header("Cache-Control", "public, max-age=3600")
+            # 🔴 REVALIDATE, DO NOT JUST CACHE. A flat max-age served stale
+            # shards after the model was re-exported, and the reader failed with
+            # "invalid byte length" rather than anything about caching.
+            # no-cache still lets the browser keep the bytes - it just has to
+            # ask first, and Last-Modified turns that into a 304 when nothing
+            # changed, so a 97 MiB model is not re-fetched on every reload.
+            self.send_header("Cache-Control", "no-cache")
         else:
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")

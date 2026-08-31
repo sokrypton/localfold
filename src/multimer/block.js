@@ -773,30 +773,44 @@ export async function encodeTemplatePairBlock(
   pair,
   pairMask,
 ) {
-  await encodeAttention(execution, encoder, {
-    source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
-    channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
-    weights: weights.triangleAttentionStarting.attention,
-    pairBias: {
-      source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
-    },
-    label: "template.triangle-attention-starting", residualTarget: pair,
-  });
-  await encodeAttention(execution, encoder, {
-    source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
-    channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
-    weights: weights.triangleAttentionEnding.attention,
-    pairBias: {
-      source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
-    },
-    label: "template.triangle-attention-ending", residualTarget: pair,
-  });
-  await encodeTriangleMultiplication(
-    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
-  );
-  await encodeTriangleMultiplication(
-    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
-  );
+  // 🔴 THE TWO TEMPLATE STACKS RUN THEIR OPS IN DIFFERENT ORDERS. AF2 monomer's
+  // TemplatePairStack attends first and multiplies second; multimer's
+  // TemplateEmbeddingIteration multiplies first. Same five operations, same
+  // weights, different sequence - and running one order with the other's
+  // weights is the kind of mistake that produces a plausible number.
+  const multiplyFirst = shape.templateOrder === "multimer";
+  const multiplications = async() => {
+    await encodeTriangleMultiplication(
+      execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
+    );
+    await encodeTriangleMultiplication(
+      execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
+    );
+  };
+  const attentions = async() => {
+    await encodeAttention(execution, encoder, {
+      source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+      channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
+      weights: weights.triangleAttentionStarting.attention,
+      pairBias: {
+        source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
+      },
+      label: "template.triangle-attention-starting", residualTarget: pair,
+    });
+    await encodeAttention(execution, encoder, {
+      source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+      channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
+      weights: weights.triangleAttentionEnding.attention,
+      pairBias: {
+        source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
+      },
+      label: "template.triangle-attention-ending", residualTarget: pair,
+    });
+  };
+
+  if (multiplyFirst) { await multiplications(); await attentions(); }
+  else { await attentions(); await multiplications(); }
+
   await encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
     weights.pairTransition, "template.pair-transition", pair,

@@ -178,6 +178,65 @@ export class AlphaFoldFixture {
     return result;
   }
 
+  /**
+   * AF2-multimer's template embedder.
+   *
+   * 🔴 IT RUNS EVEN WITH NO TEMPLATES. Multimer's config has template.enabled
+   * true and the embedding wrapper adds this to the pair unconditionally;
+   * masking the templates off leaves the biases and layer norms still
+   * contributing. Skipping it put the pair track 30% out from the first block.
+   *
+   * The pair stack is an ordinary evoformer pair block at 64 channels, so it
+   * reads with the same helpers as the extra-MSA stack.
+   */
+  async templateEmbeddingWeights(pairChannels = 64) {
+    const section = this.manifest.templateEmbedding;
+    if (section?.parameters === undefined) return undefined;
+    const parameters = section.parameters;
+    const blocks = section.pairStackBlocks ?? 2;
+    const S = "template_embedding/single_template_embedding/";
+    const IT = `${S}template_embedding_iteration/`;
+    const scoped = (prefix) => Object.fromEntries(
+      Object.entries(parameters)
+        .filter(([name]) => name.startsWith(prefix))
+        .map(([name, value]) => [name.slice(prefix.length), value]),
+    );
+    const stackParameters = scoped(IT);
+    const stack = [];
+    for (let block = 0; block < blocks; block += 1) {
+      stack.push({
+        triangleMultiplicationOutgoing: await this.#triangle(
+          stackParameters, "triangle_multiplication_outgoing", pairChannels, block, blocks,
+        ),
+        triangleMultiplicationIncoming: await this.#triangle(
+          stackParameters, "triangle_multiplication_incoming", pairChannels, block, blocks,
+        ),
+        triangleAttentionStarting: await this.#triangleAttention(
+          stackParameters, "triangle_attention_starting_node", block, blocks,
+        ),
+        triangleAttentionEnding: await this.#triangleAttention(
+          stackParameters, "triangle_attention_ending_node", block, blocks,
+        ),
+        pairTransition: await this.#transition(stackParameters, "pair_transition", block, blocks),
+      });
+    }
+    const single = scoped(S);
+    const embedding = async(index) => ({
+      weight: await this.#parameter(single, `template_pair_embedding_${index}`, "weights"),
+      bias: await this.#parameter(single, `template_pair_embedding_${index}`, "bias"),
+    });
+    return {
+      stack,
+      pairEmbeddings: await Promise.all([0, 1, 2, 3, 4, 5, 6, 7, 8].map(embedding)),
+      queryNormScale: await this.#parameter(single, "query_embedding_norm", "scale"),
+      queryNormOffset: await this.#parameter(single, "query_embedding_norm", "offset"),
+      outputNormScale: await this.#parameter(single, "output_layer_norm", "scale"),
+      outputNormOffset: await this.#parameter(single, "output_layer_norm", "offset"),
+      outputWeight: await this.#parameter(parameters, "template_embedding/output_linear", "weights"),
+      outputBias: await this.#parameter(parameters, "template_embedding/output_linear", "bias"),
+    };
+  }
+
   async extraPairStackWeights(pairChannels = 128) {
     const { parameters, blocks } = this.manifest.extraMsaStack;
     const result = [];
