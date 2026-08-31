@@ -26,7 +26,7 @@ try {
   // meeting a shallow alignment; if only multimer does, it is ours.
   const cases = [
     ['multimer', await loadModel('msa', () => {}, undefined, 'multimer'),
-      { outerProductMeanFirst: true, positionScale: 20, templates: false,
+      { outerProductMeanFirst: true, positionScale: 20,
         chainAware: true, chainLengths: LENGTHS, chainSequences: [CHAIN, CHAIN] }],
     ['monomer', await loadModel('msa', () => {}, undefined, 'monomer'), { chainLengths: LENGTHS }],
     ['monomer, one chain', await loadModel('msa', () => {}, undefined, 'monomer'), { single: true }],

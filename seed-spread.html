@@ -24,7 +24,7 @@ try {
   const a3m = await fetch('/test.a3m').then((r) => r.text());
   const merged = mergeChainA3ms([a3m, a3m]);
   for (const [family, regime] of [
-    ['multimer', { outerProductMeanFirst: true, positionScale: 20, templates: false,
+    ['multimer', { outerProductMeanFirst: true, positionScale: 20,
       chainAware: true, chainSequences: [CHAIN, CHAIN] }],
     ['monomer', {}],
   ]) {

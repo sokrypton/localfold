@@ -41,7 +41,7 @@ try {
 
   for (const [family, regime] of [
     ['monomer', {}],
-    ['multimer', { outerProductMeanFirst: true, positionScale: 20, templates: false,
+    ['multimer', { outerProductMeanFirst: true, positionScale: 20,
       chainAware: true, chainSequences: [CHAIN, CHAIN] }],
   ]) {
     const model = await loadModel('msa', () => {}, undefined, family);

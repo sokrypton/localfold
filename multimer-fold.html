@@ -7,7 +7,8 @@
  * Loads model-multimer/ - the export from tools/export_multimer_model.py -
  * through the same reader the monomer model uses, and runs it on the unified
  * graph in its MULTIMER regime: outer product mean first, position_scale 20,
- * chain identity on, templates off.
+ * chain identity on, and the template embedder running - which in multimer is
+ * not a choice, it is added to the pair whether or not a template exists.
  *
  * The MSA pipeline is still the monomer's, so this is single-sequence. That is
  * the point: it isolates the graph and the weights from the feature work, so a
@@ -34,9 +35,10 @@ try {
   const manifest = await fetch('./model-multimer/manifest.json').then((r) => r.json());
   const store = await HttpTensorStore.fromManifest('./model-multimer/', manifest);
   const fixture = AlphaFoldFixture.fromStore(store);
-  const [embedding, extraStack, mainStack, structure, confidence, geometry, tables, paeBreaks] =
-    await Promise.all([
-      fixture.embeddingWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
+  const [embedding, templateEmbedding, extraStack, mainStack, structure, confidence, geometry,
+    tables, paeBreaks] = await Promise.all([
+      fixture.embeddingWeights(), fixture.templateEmbeddingWeights(),
+      fixture.extraStackWeights(), fixture.mainStackWeights(),
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(),
       fixture.queryOnlyFeatureTables(), fixture.tensor('confidencePaeBreaks'),
     ]);
@@ -44,8 +46,11 @@ try {
   log(`  relative table ${embedding.relativePositionWeight.length / 128} rows`);
 
   // ...the shape web/model.js assembles: the confidence heads come apart into
-  // lddt and pae, and there is no template entry for a multimer run.
-  const weights = { embedding, extraStack, mainStack, structure,
+  // lddt and pae, and `template` - the monomer's query-only residual - has no
+  // multimer counterpart. `templateEmbedding` is multimer's own, and without it
+  // here the embedder would be skipped and this harness would quietly measure
+  // the graph that shattered backbones.
+  const weights = { embedding, templateEmbedding, extraStack, mainStack, structure,
                     lddt: confidence.lddt, pae: confidence.pae, geometry };
   const device = await getDevice();
   // ...the A3M builder with a query-only alignment: this driver is the A3M one,
@@ -63,7 +68,6 @@ try {
       chainAware: true,
       chainLengths: CHAIN_LENGTHS,
       chainSequences: [CHAIN, CHAIN],
-      templates: false,
     });
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const final = prediction.final;

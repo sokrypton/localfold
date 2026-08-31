@@ -18,7 +18,7 @@ const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
 const COPIES = 3;
 const chains = Array(COPIES).fill(CHAIN);
 const lengths = chains.map((c) => c.length);
-const FULL = { outerProductMeanFirst: true, positionScale: 20, templates: false,
+const FULL = { outerProductMeanFirst: true, positionScale: 20,
   chainAware: true, chainSequences: chains };
 try {
   const device = await getDevice();

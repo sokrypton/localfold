@@ -57,7 +57,7 @@ try {
   };
   log('one chain, 59 residues. A real protein has CA-CA = 3.80 A.\n');
   await run('monomer weights', monomer, {});
-  await run('multimer weights, scale 20', multimer, { outerProductMeanFirst: true, positionScale: 20, templates: false });
-  await run('multimer weights, scale 10', multimer, { outerProductMeanFirst: true, positionScale: 10, templates: false });
+  await run('multimer weights, scale 20', multimer, { outerProductMeanFirst: true, positionScale: 20 });
+  await run('multimer weights, scale 10', multimer, { outerProductMeanFirst: true, positionScale: 10 });
 } catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }
 </script>

@@ -32,7 +32,7 @@ try {
       merged, model.weights, model.featureTables,
       { recycles: RECYCLES, randomSeed: 0, chainLengths: lengths,
         maxMsaSequences: 32, maxExtraSequences: 64,
-        outerProductMeanFirst: true, positionScale: 20, templates: false,
+        outerProductMeanFirst: true, positionScale: 20,
         chainAware: copies > 1, chainSequences: chains },
       model.paeBreaks,
       (result) => {

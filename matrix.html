@@ -25,7 +25,7 @@ try {
       const row = [];
       for (const family of ['monomer', 'multimer']) {
         const regime = family === 'multimer'
-          ? { outerProductMeanFirst: true, positionScale: 20, templates: false,
+          ? { outerProductMeanFirst: true, positionScale: 20,
               chainAware: copies > 1, chainSequences: chains }
           : {};
         let last;

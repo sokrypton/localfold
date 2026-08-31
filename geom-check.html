@@ -58,7 +58,7 @@ try {
     model.weights, model.featureTables,
     { recycles: 1, randomSeed: 0, chainLengths: lengths,
       maxMsaSequences: MAX_MSA, maxExtraSequences: MAX_EXTRA,
-      outerProductMeanFirst: true, positionScale: 20, templates: false,
+      outerProductMeanFirst: true, positionScale: 20,
       chainAware: COPIES > 1, chainSequences: chains },
     model.paeBreaks,
     (result, recycle) => {

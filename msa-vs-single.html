@@ -58,7 +58,7 @@ try {
       text, model.weights, model.featureTables,
       { recycles: 0, randomSeed: 0, chainLengths: lengths,
         maxMsaSequences: depth[0], maxExtraSequences: depth[1],
-        outerProductMeanFirst: true, positionScale: 20, templates: false,
+        outerProductMeanFirst: true, positionScale: 20,
         chainAware: true, chainSequences: chains },
       model.paeBreaks, (r) => { last = r; });
     const b = bond(last.structure.atom37);
