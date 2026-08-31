@@ -72,13 +72,38 @@ function cacheToken(manifest) {
   return `${bundle.model ?? "model"}-${bundle.bytes ?? 0}-${Object.keys(manifest.tensors).length}`;
 }
 
+/**
+ * The cached shard sets this manifest supersedes: OTHER EXPORTS OF THE SAME
+ * MODEL, and nothing else.
+ *
+ * 🔴 IT USED TO SWEEP EVERY CACHE, which was right when there was one model and
+ * wrong the moment there were two. A cache whose name did not match could only
+ * mean a stale export of the one model; now it also means THE OTHER MODEL, and
+ * the sweep evicted it. Loading multimer deleted the monomer's 97 MiB and
+ * loading the monomer deleted multimer's, so every switch between families paid
+ * a full cold download - measured at ~5 s each on a local server, and far worse
+ * over a network.
+ *
+ * The model name is part of the cache name, so keeping the two apart is a
+ * matter of only sweeping within one. The trailing "-" matters: without it
+ * `model_1` would claim `model_1_multimer_v3`'s caches.
+ *
+ * @param {readonly string[]} names existing cache names
+ * @param {{bundle?: {model?: string}, tensors: object}} manifest
+ */
+export function staleShardCaches(names, manifest) {
+  const keep = CACHE_PREFIX + cacheToken(manifest);
+  const mine = `${CACHE_PREFIX}${manifest.bundle?.model ?? "model"}-`;
+  return names.filter((existing) => existing.startsWith(mine) && existing !== keep);
+}
+
 async function openShardCache(manifest) {
   if (typeof caches === "undefined") return undefined;
   const name = CACHE_PREFIX + cacheToken(manifest);
   try {
     return await withTimeout((async () => {
-      for (const existing of await caches.keys()) {
-        if (existing.startsWith(CACHE_PREFIX) && existing !== name) await caches.delete(existing);
+      for (const stale of staleShardCaches(await caches.keys(), manifest)) {
+        await caches.delete(stale);
       }
       return caches.open(name);
     })(), undefined);
