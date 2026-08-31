@@ -1,0 +1,197 @@
+/**
+ * Loading AF3's weights for the GPU checkers, over http.
+ *
+ * The per-kernel checkers each build the one bundle they need inline, which
+ * keeps them readable on their own. Anything that needs a WHOLE STAGE - the
+ * trunk, and the diffusion and confidence heads after it - wants this instead:
+ * the bundles are long, and a typo in one leaf name of one of them surfaces as
+ * a numerical disagreement rather than a missing key.
+ */
+import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+
+export const MANIFEST = "/model-af3-full-f32/manifest.json";
+const EVO = "diffuser/evoformer";
+const MSA_STACK = `${EVO}/__layer_stack_no_per_layer/msa_stack`;
+const PAIRFORMER = `${EVO}/__layer_stack_no_per_layer_1/trunk_pairformer`;
+const TEMPLATE = `${EVO}/template_embedding`;
+const TEMPLATE_SINGLE = `${TEMPLATE}/single_template_embedding`;
+const TEMPLATE_STACK =
+  `${TEMPLATE_SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
+
+export async function openAf3Store(manifest = MANIFEST) {
+  return HttpTensorStore.open(manifest);
+}
+
+/** One tensor, whole. */
+export function tensor(store, name) {
+  return store.tensor(name);
+}
+
+/** One block's slice of a tensor stacked over blocks. */
+export async function layer(store, name, index) {
+  const whole = await store.tensor(name);
+  const shape = store.shape(name);
+  const stride = whole.length / shape[0];
+  if (index >= shape[0]) throw new Error(`${name} has ${shape[0]} blocks; asked for ${index}`);
+  return whole.subarray(index * stride, (index + 1) * stride);
+}
+
+/** The five pair-track modules, which every stack shares. */
+async function pairTrack(store, root, index, gridHeads, gridDimension) {
+  const at = (leaf) => layer(store, `${root}/${leaf}`, index);
+  const triangle = async (direction) => ({
+    leftNormInputScale: await at(`triangle_multiplication_${direction}/left_norm_input/scale`),
+    leftNormInputOffset: await at(`triangle_multiplication_${direction}/left_norm_input/offset`),
+    projection: await at(`triangle_multiplication_${direction}/projection/weights`),
+    gate: await at(`triangle_multiplication_${direction}/gate/weights`),
+    centerNormScale: await at(`triangle_multiplication_${direction}/center_norm/scale`),
+    centerNormOffset: await at(`triangle_multiplication_${direction}/center_norm/offset`),
+    outputProjection: await at(`triangle_multiplication_${direction}/output_projection/weights`),
+    gatingLinear: await at(`triangle_multiplication_${direction}/gating_linear/weights`),
+  });
+  const grid = async (which) => ({
+    heads: gridHeads, dimension: gridDimension,
+    actNormScale: await at(`pair_attention${which}/act_norm/scale`),
+    actNormOffset: await at(`pair_attention${which}/act_norm/offset`),
+    pairBiasProjection: await at(`pair_attention${which}/pair_bias_projection/weights`),
+    qProjection: await at(`pair_attention${which}/q_projection/weights`),
+    kProjection: await at(`pair_attention${which}/k_projection/weights`),
+    vProjection: await at(`pair_attention${which}/v_projection/weights`),
+    gatingQuery: await at(`pair_attention${which}/gating_query/weights`),
+    outputProjection: await at(`pair_attention${which}/output_projection/weights`),
+  });
+  return {
+    triangleMultiplicationOutgoing: await triangle("outgoing"),
+    triangleMultiplicationIncoming: await triangle("incoming"),
+    pairAttention1: await grid(1),
+    pairAttention2: await grid(2),
+    pairTransition: {
+      inputLayerNormScale: await at("pair_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: await at("pair_transition/input_layer_norm/offset"),
+      transition1: await at("pair_transition/transition1/weights"),
+      transition2: await at("pair_transition/transition2/weights"),
+    },
+  };
+}
+
+export async function embedderWeights(store) {
+  const T = (name) => store.tensor(`${EVO}/${name}`);
+  return {
+    pairChannels: 128, singleChannels: 384, msaChannels: 64,
+    targetFeatWidth: 447, relativeWidth: 139,
+    leftSingle: await T("left_single/weights"),
+    rightSingle: await T("right_single/weights"),
+    prevEmbeddingNormScale: await T("prev_embedding_layer_norm/scale"),
+    prevEmbeddingNormOffset: await T("prev_embedding_layer_norm/offset"),
+    prevEmbedding: await T("prev_embedding/weights"),
+    positionActivations: await T("~_relative_encoding/position_activations/weights"),
+    msaActivations: await T("msa_activations/weights"),
+    extraMsaTargetFeat: await T("extra_msa_target_feat/weights"),
+    singleActivations: await T("single_activations/weights"),
+    prevSingleEmbeddingNormScale: await T("prev_single_embedding_layer_norm/scale"),
+    prevSingleEmbeddingNormOffset: await T("prev_single_embedding_layer_norm/offset"),
+    prevSingleEmbedding: await T("prev_single_embedding/weights"),
+  };
+}
+
+export async function templateWeights(store) {
+  const T = (name) => store.tensor(name);
+  // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS 4 HEADS OF 16, not the trunk's
+  // 4 of 32: 64 channels rather than 128.
+  const blocks = [await pairTrack(store, TEMPLATE_STACK, 0, 4, 16),
+                  await pairTrack(store, TEMPLATE_STACK, 1, 4, 16)];
+  return {
+    queryChannels: 128, blocks,
+    queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
+    queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
+    templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
+    templatePairEmbedding2: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_2/weights`),
+    templatePairEmbedding3: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_3/weights`),
+    outputLayerNormScale: await T(`${TEMPLATE_SINGLE}/output_layer_norm/scale`),
+    outputLayerNormOffset: await T(`${TEMPLATE_SINGLE}/output_layer_norm/offset`),
+    outputLinear: await T(`${TEMPLATE}/output_linear/weights`),
+  };
+}
+
+export async function msaBlockWeights(store, index) {
+  const at = (leaf) => layer(store, `${MSA_STACK}/${leaf}`, index);
+  return {
+    pairChannels: 128, msaChannels: 64,
+    ...(await pairTrack(store, MSA_STACK, index, 4, 32)),
+    outerProductMean: {
+      outerChannels: 32,
+      layerNormInputScale: await at("outer_product_mean/layer_norm_input/scale"),
+      layerNormInputOffset: await at("outer_product_mean/layer_norm_input/offset"),
+      leftProjection: await at("outer_product_mean/left_projection/weights"),
+      rightProjection: await at("outer_product_mean/right_projection/weights"),
+      outputW: await at("outer_product_mean/output_w"),
+      outputB: await at("outer_product_mean/output_b"),
+    },
+    msaAttention1: {
+      heads: 8, dimension: 8,
+      actNormScale: await at("msa_attention1/act_norm/scale"),
+      actNormOffset: await at("msa_attention1/act_norm/offset"),
+      pairNormScale: await at("msa_attention1/pair_norm/scale"),
+      pairNormOffset: await at("msa_attention1/pair_norm/offset"),
+      pairLogits: await at("msa_attention1/pair_logits/weights"),
+      vProjection: await at("msa_attention1/v_projection/weights"),
+      gatingQuery: await at("msa_attention1/gating_query/weights"),
+      outputProjection: await at("msa_attention1/output_projection/weights"),
+    },
+    msaTransition: {
+      inputLayerNormScale: await at("msa_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: await at("msa_transition/input_layer_norm/offset"),
+      transition1: await at("msa_transition/transition1/weights"),
+      transition2: await at("msa_transition/transition2/weights"),
+    },
+  };
+}
+
+export async function pairformerBlockWeights(store, index) {
+  const at = (leaf) => layer(store, `${PAIRFORMER}/${leaf}`, index);
+  return {
+    pairChannels: 128, singleChannels: 384,
+    ...(await pairTrack(store, PAIRFORMER, index, 4, 32)),
+    singlePairLogitsNormScale: await at("single_pair_logits_norm/scale"),
+    singlePairLogitsNormOffset: await at("single_pair_logits_norm/offset"),
+    singlePairLogitsProjection: await at("single_pair_logits_projection/weights"),
+    singleAttention: {
+      heads: 16, dimension: 24,
+      layerNormScale: await at("single_attention_layer_norm/scale"),
+      layerNormOffset: await at("single_attention_layer_norm/offset"),
+      qProjection: await at("single_attention_q_projection/weights"),
+      qBias: await at("single_attention_q_projection/bias"),
+      kProjection: await at("single_attention_k_projection/weights"),
+      vProjection: await at("single_attention_v_projection/weights"),
+      gatingQuery: await at("single_attention_gating_query/weights"),
+      outputProjection: await at("single_attention_transition2/weights"),
+    },
+    singleTransition: {
+      inputLayerNormScale: await at("single_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: await at("single_transition/input_layer_norm/offset"),
+      transition1: await at("single_transition/transition1/weights"),
+      transition2: await at("single_transition/transition2/weights"),
+    },
+  };
+}
+
+export async function distogramWeights(store) {
+  return { halfLogits: await store.tensor("diffuser/distogram_head/half_logits/weights") };
+}
+
+/** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
+export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
+  const msa = [];
+  for (let index = 0; index < msaBlocks; index += 1) msa.push(await msaBlockWeights(store, index));
+  const pairformer = [];
+  for (let index = 0; index < pairformerBlocks; index += 1) {
+    pairformer.push(await pairformerBlockWeights(store, index));
+  }
+  return {
+    embedder: await embedderWeights(store),
+    template: await templateWeights(store),
+    msaBlocks: msa,
+    pairformerBlocks: pairformer,
+    distogram: await distogramWeights(store),
+  };
+}
