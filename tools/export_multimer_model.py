@@ -57,6 +57,7 @@ SECTION_PREFIX = {
     "embedding": "embedding_haiku",
     "structureModule": "structure_haiku",
     "confidenceHeads": "confidence_haiku",
+    "templateEmbedding": "template_haiku",
 }
 CONFIDENCE = {
     "predictedLddt": {
@@ -185,10 +186,28 @@ def export(params_path: Path, monomer_dir: Path, out_dir: Path) -> int:
                                offset=record["byteOffset"]).reshape(record["shape"])
         writer.add(name, values)
     manifest["residueGeometry"] = reference["residueGeometry"]
+
+    # 🔴 THE TEMPLATE EMBEDDER IS NOT OPTIONAL, whatever its name suggests.
+    # Multimer's config has template.enabled TRUE, and the embedding wrapper adds
+    # its output to the pair unconditionally - masking every template off does
+    # not zero that term, because the embedder's biases and layer norms still
+    # produce one. Omitting it put the pair track 30% out from the first block.
+    #
+    # It IS architecturally different from the monomer's, so nothing is
+    # converted here: the modules are exported under their own names, and the
+    # graph reads them as multimer's own shapes.
+    template = {}
+    for module in sorted(params):
+        if "template" not in module:
+            continue
+        leaf = module.split("evoformer/")[-1]
+        template[leaf] = {name: writer.add(identifier("templateEmbedding"), values)
+                          for name, values in sorted(params[module].items())}
     manifest["templateEmbedding"] = {
-        "excluded": "multimer's template embedder is architecturally different from the "
-                    "monomer's; no reshape maps one to the other, so a multimer fold runs "
-                    "template-free rather than borrowing weights that would load and be wrong",
+        "parameterFormat": "haiku",
+        "implementation": "AF2-multimer TemplateEmbedding",
+        "pairStackBlocks": 2,
+        "parameters": template,
     }
 
     writer.close()
