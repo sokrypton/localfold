@@ -1,6 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks, splitComplexA3mByChain,
+  chainIdentity, mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks,
+  splitComplexA3mByChain,
   validatedChainLengths,
 } from "../src/input/chains.js";
 import { parseA3m } from "../src/input/a3m.js";
@@ -93,5 +94,51 @@ describe("pairing repeated chains", () => {
     const [first, second] = splitComplexA3mByChain(a3m, [4, 4]);
     expect(parseA3m(first).depth).toBe(3);
     expect(parseA3m(second).depth).toBe(3);
+  });
+});
+
+describe("multimer chain identity", () => {
+  const show = (values) => Array.from(values).join("");
+
+  it("is all zeros for a monomer, which is what one chain means", () => {
+    const { asymId, entityId, symId } = chainIdentity(4, undefined);
+    expect(show(asymId)).toBe("0000");
+    expect(show(entityId)).toBe("0000");
+    expect(show(symId)).toBe("0000");
+  });
+
+  it("gives a homodimer two chains, one entity and two copies", () => {
+    const { asymId, entityId, symId } = chainIdentity(6, [3, 3], ["AAA", "AAA"]);
+    expect(show(asymId)).toBe("000111");
+    expect(show(entityId)).toBe("000000");
+    expect(show(symId)).toBe("000111");
+  });
+
+  it("gives a heterodimer two entities, each its own first copy", () => {
+    const { asymId, entityId, symId } = chainIdentity(6, [3, 3], ["AAA", "BBB"]);
+    expect(show(asymId)).toBe("000111");
+    expect(show(entityId)).toBe("000111");
+    expect(show(symId)).toBe("000000");
+  });
+
+  it("counts copies within each entity separately for A2B2", () => {
+    const { asymId, entityId, symId } = chainIdentity(8, [2, 2, 2, 2], ["AA", "AA", "BB", "BB"]);
+    expect(show(asymId)).toBe("00112233");
+    expect(show(entityId)).toBe("00001111");
+    expect(show(symId)).toBe("00110011");
+  });
+
+  it("treats every chain as its own entity when no sequences are given", () => {
+    const { entityId, symId } = chainIdentity(4, [2, 2]);
+    expect(show(entityId)).toBe("0011");
+    expect(show(symId)).toBe("0000");
+  });
+
+  it("refuses a sequence list that does not match the chains", () => {
+    expect(() => chainIdentity(6, [3, 3], ["AAA"])).toThrow(/one sequence per chain/);
+  });
+
+  it("refuses chain lengths that do not partition the sequence", () => {
+    expect(() => chainIdentity(6, [3, 4])).toThrow(/sum to 7/);
   });
 });

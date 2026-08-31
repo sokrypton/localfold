@@ -81,6 +81,58 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * AlphaFold-multimer's per-residue chain identity: asym, entity and symmetry.
+ *
+ * These are what the multimer relative encoding reads, and between them they say
+ * everything the model is told about how the chains relate:
+ *
+ *   asym_id    which physical chain a residue belongs to. Distinct for every
+ *              copy, so two copies of one protein are still two chains.
+ *   entity_id  which distinct SEQUENCE it is. Copies of one protein share it,
+ *              which is how the model learns they are the same molecule.
+ *   sym_id     which copy within that entity, counting from zero. The encoding
+ *              reads the difference between two residues' sym_ids, so this is
+ *              what makes copy 1 -> copy 2 a different relationship from copy 2
+ *              -> copy 1 rather than an unordered pair.
+ *
+ * 🔴 A MONOMER IS ALL ZEROS, and that is not a special case - it is what one
+ * chain, one entity, one copy actually means. The encoding then reduces to the
+ * monomer form exactly, which is why the widened graph needs no branch.
+ *
+ * @param {readonly number[] | undefined} chainLengths
+ * @param {readonly string[]} [chainSequences] one per chain; equal sequences
+ *   share an entity. Without it every chain is treated as its own entity.
+ * @returns {{asymId: Float32Array, entityId: Float32Array, symId: Float32Array}}
+ */
+export function chainIdentity(totalLength, chainLengths, chainSequences = undefined) {
+  const lengths = validatedChainLengths(totalLength, chainLengths);
+  if (chainSequences !== undefined && chainSequences.length !== lengths.length) {
+    throw new RangeError("one sequence per chain is required to group entities");
+  }
+  const asymId = new Float32Array(totalLength);
+  const entityId = new Float32Array(totalLength);
+  const symId = new Float32Array(totalLength);
+
+  const entities = new Map();
+  const copiesSeen = new Map();
+  let residue = 0;
+  for (let chain = 0; chain < lengths.length; chain += 1) {
+    const key = chainSequences === undefined ? `chain-${chain}` : chainSequences[chain];
+    if (!entities.has(key)) entities.set(key, entities.size);
+    const entity = entities.get(key);
+    const copy = copiesSeen.get(entity) ?? 0;
+    copiesSeen.set(entity, copy + 1);
+    for (let within = 0; within < lengths[chain]; within += 1) {
+      asymId[residue] = chain;
+      entityId[residue] = entity;
+      symId[residue] = copy;
+      residue += 1;
+    }
+  }
+  return { asymId, entityId, symId };
+}
+
+/**
  * Which pair entries may keep their MSA covariance, as a [L, L] mask.
  *
  * 🔴 PAIRING REPEATED CHAINS CREATES A COEVOLUTION SIGNAL THAT IS NOT REAL.
