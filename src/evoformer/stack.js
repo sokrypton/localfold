@@ -41,33 +41,6 @@ function residentPair(execution, label, input, pairElements) {
   return execution.upload(label, input.pair, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
 }
 
-/**
- * Turn the chain masks from Float32Arrays into tensors, once per stack.
- *
- * The two masks are the SAME [L, L] buffer wherever both are on - one gates the
- * outer product mean's covariance, the other gates row attention across chains -
- * so this uploads it once and hands the same tensor to both. A stack that wants
- * neither uploads nothing.
- */
-function uploadChainMasks(execution, input, label) {
-  const wanted = [input.covMask, input.rowAttentionChainMask].filter((mask) => mask !== undefined);
-  if (wanted.length === 0) return { covMask: undefined, rowAttentionChainMask: undefined };
-  const shared = wanted.every((mask) => mask === wanted[0]);
-  const upload = (name, values) => execution.upload(`${label}.${name}`, values);
-  if (shared) {
-    const tensor = upload("chain-mask", wanted[0]);
-    return {
-      covMask: input.covMask === undefined ? undefined : tensor,
-      rowAttentionChainMask: input.rowAttentionChainMask === undefined ? undefined : tensor,
-    };
-  }
-  return {
-    covMask: input.covMask === undefined ? undefined : upload("cov-mask", input.covMask),
-    rowAttentionChainMask: input.rowAttentionChainMask === undefined
-      ? undefined : upload("row-chain-mask", input.rowAttentionChainMask),
-  };
-}
-
 export class EvoformerStackGpu {
   device;
 
@@ -96,15 +69,6 @@ export class EvoformerStackGpu {
       }
       const submissionWindow = input.profileBlock === undefined ? requestedWindow : 1;
       const validation = new DeferredValidation(this.device, "Evoformer stack");
-      // ...a Float32Array on the way in, a tensor from here on, uploaded once
-      // rather than per block. Absent for a monomer, which keeps the plain path.
-      // 🔴 BOTH MASKS HAVE TO BECOME TENSORS, not just the one. They arrive as
-      // Float32Arrays and are bound as buffers, so a lane left un-uploaded
-      // reaches the bind group as a plain array and fails on `.buffer` - which
-      // is exactly how this shipped: the shaders compiled, and the fold died at
-      // runtime with "Cannot read properties of undefined".
-      const uploadedChainMask = uploadChainMasks(execution, input, "stack");
-
       for (let block = 0; block < input.blockWeights.length; block += 1) {
         throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `evoformer-stack.block-${block}` });
@@ -113,7 +77,6 @@ export class EvoformerStackGpu {
         validation.begin();
         await encodeEvoformerBlock(execution, encoder, {
           ...input,
-          ...uploadedChainMask,
           weights: input.blockWeights[block],
         }, msa, pair, msaMask, pairMask);
         execution.endComputePass(encoder);
@@ -207,13 +170,12 @@ export class ExtraMsaPairStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       const validation = new DeferredValidation(this.device, "extra-MSA pair stack");
-      const uploadedChainMask = uploadChainMasks(execution, input, "extra-pair-stack");
       for (let block = 0; block < input.blockWeights.length; block += 1) {
         throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `extra-msa-pair-stack.block-${block}` });
         validation.begin();
         await encodeEvoformerPairBlock(
-          execution, encoder, { ...input, ...uploadedChainMask }, input.blockWeights[block], msa, pair, msaMask, pairMask,
+          execution, encoder, input, input.blockWeights[block], msa, pair, msaMask, pairMask,
         );
         execution.endComputePass(encoder);
         this.device.queue.submit([encoder.finish()]);

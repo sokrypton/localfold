@@ -290,35 +290,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
-/**
- * The pair bias with cross-chain keys shut off, for MSA ROW ATTENTION ONLY.
- *
- * 🔴 A ROW NOW HOLDS TWO UNRELATED PROTEINS. Sampling each chain separately is
- * what breaks the symmetry between copies, but it also means residue i of copy
- * 1 and residue j of copy 2 sit in one row while coming from organisms that
- * never met. Row attention would mix them. The block-diagonal alignment never
- * had to answer this: the other chain was gaps there, so attending to it said
- * nothing.
- *
- * The bias is already an additive per (head, q, k) term on the logits, so the
- * mask rides in here and none of the five flash kernels change. -1e9 matches
- * what those kernels apply for a masked key, and lands before the softmax.
- *
- * 🔴 NOT FOR TRIANGLE ATTENTION, which shares this pipeline. The pair track is
- * where an interface is actually built; masking it across chains would leave
- * the copies unable to see each other at all.
- */
-export const ATTENTION_PAIR_BIAS_CHAIN_MASKED_SHADER = ATTENTION_PAIR_BIAS_SHADER
-  .replace(
-    "@group(0) @binding(3) var<storage, read_write> output: array<f32>;",
-    "@group(0) @binding(3) var<storage, read_write> output: array<f32>;\n"
-    + "@group(0) @binding(4) var<storage, read> chain_mask: array<f32>;",
-  )
-  .replace(
-    "  output[index] = result;",
-    "  output[index] = result + 1e9 * (chain_mask[q * p.queries + k] - 1.0);",
-  );
-
 export const ATTENTION_FLASH_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;

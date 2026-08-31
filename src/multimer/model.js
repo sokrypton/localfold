@@ -24,7 +24,6 @@ import {
 import { makeA3mFeatures } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
 import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
-import { interChainCovarianceMask } from "../input/chains.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult
@@ -224,25 +223,8 @@ export class AlphaFoldUnifiedGpu {
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
 
-        // 🔴 BOTH MASKS ARE OPT-IN, and both are the same [L,L] buffer: 1 where
-        // a pair is intra-chain. One drops the covariance the outer product mean
-        // would read between copies, the other stops a row attending across
-        // them. They are separate switches because they can be wrong
-        // independently. A monomer has no inter-chain pairs and never builds it.
-        const wantsCovMask = recycleOptions.maskInterChainCovariance === true;
-        const wantsRowMask = recycleOptions.maskRowAttentionAcrossChains === true;
-        const chainMask = (wantsCovMask || wantsRowMask)
-            && recycleOptions.chainLengths !== undefined
-            && recycleOptions.chainLengths.length > 1
-          ? execution.upload(`monomer.chain-mask-${recycle}`,
-            interChainCovarianceMask(length, recycleOptions.chainLengths))
-          : undefined;
-        const covMask = wantsCovMask ? chainMask : undefined;
-        const rowAttentionChainMask = wantsRowMask ? chainMask : undefined;
         const extraShape = {
           outerProductMeanFirst,
-          covMask,
-          rowAttentionChainMask,
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
@@ -271,8 +253,6 @@ export class AlphaFoldUnifiedGpu {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
           pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
           outerProductMeanFirst,
-          covMask,
-          rowAttentionChainMask,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };

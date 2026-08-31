@@ -1,7 +1,6 @@
 import { ConfidenceHeadsGpu } from "../heads/confidence.js";
 import { InputEmbedderGpu } from "../evoformer/input-embedder.js";
 import { EvoformerStackGpu, ExtraMsaPairStackGpu } from "../evoformer/stack.js";
-import { interChainCovarianceMask } from "../input/chains.js";
 
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { StructureModuleGpu } from "../structure/module.js";
@@ -67,9 +66,8 @@ export class AlphaFoldQueryOnlyGpu {
     onProgress,
   ) {
     return this.predict(makeQueryOnlyFeatures(sequence, featureTables, options), weights,
-      paeBreaks, onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
-        maskInterChainCovariance: options.maskInterChainCovariance,
-        maskRowAttentionAcrossChains: options.maskRowAttentionAcrossChains });
+      paeBreaks, onRecycle, onProgress,
+      { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths });
   }
 
   /**
@@ -88,18 +86,6 @@ export class AlphaFoldQueryOnlyGpu {
     if (recycleFeatures.length === 0) throw new RangeError("at least one recycle feature set is required");
     const length = recycleFeatures[0] .aatype.length;
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
-    // Repeated chains are paired into single MSA rows, so the covariance the
-    // outer product mean sees between copies restates the intra-chain one; the
-    // mask keeps the profile there and drops the coupling. Monomer: undefined.
-    const wantsCovMask = recycleOptions.maskInterChainCovariance === true;
-    const wantsRowMask = recycleOptions.maskRowAttentionAcrossChains === true;
-    const chainMaskValues = (wantsCovMask || wantsRowMask)
-        && recycleOptions.chainLengths !== undefined
-        && recycleOptions.chainLengths.length > 1
-      ? interChainCovarianceMask(length, recycleOptions.chainLengths)
-      : undefined;
-    const covMaskValues = wantsCovMask ? chainMaskValues : undefined;
-    const rowMaskValues = wantsRowMask ? chainMaskValues : undefined;
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
     const pairMask = new Float32Array(length * length);
@@ -215,8 +201,6 @@ export class AlphaFoldQueryOnlyGpu {
           length,
           cM: 64,
           cZ: 128,
-          covMask: covMaskValues,
-          rowAttentionChainMask: rowMaskValues,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.extraStack,
@@ -237,8 +221,6 @@ export class AlphaFoldQueryOnlyGpu {
           length,
           cM: 256,
           cZ: 128,
-          covMask: covMaskValues,
-          rowAttentionChainMask: rowMaskValues,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.mainStack,

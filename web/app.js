@@ -122,39 +122,6 @@ function progress(fraction) {
   bar.value = fraction;
 }
 
-/**
- * What a complex fold is doing DIFFERENTLY, for the status line.
- *
- * 🔴 A FLAG THAT IS NOT WIRED READS EXACTLY LIKE A CHANGE THAT DOES NOTHING.
- * `?pairing=off` was compared against the default before it existed, and the
- * two runs agreeing looked like evidence rather than a typo. So an ablation
- * that is switched on says so where the fold reports itself.
- *
- * 🔴 AND IT REPORTS WHAT RAN, NOT WHAT WAS ASKED FOR. This used to read the URL
- * flags and say "block-diagonal" whenever none was set - which became a lie the
- * moment multimer started pairing its alignment on its own, because nobody had
- * typed ?pairing=on.
- *
- * What it does NOT say is what each family does every time anyway. Multimer
- * pairs its repeated chains and the monomer does not, on every fold, so that
- * label was on screen permanently and carried no information; only a departure
- * from it is worth a reader's attention. Only shown for a complex; none of
- * these reach a single chain.
- *
- * @param {number} chainCount
- * @param {{construction?: string}} run what the alignment step actually built
- */
-function activeAblations(chainCount, run = {}) {
-  if (chainCount < 2) return "";
-  const parts = [];
-  if (run.construction !== undefined) parts.push(run.construction);
-  const query = new URLSearchParams(location.search);
-  for (const name of ["covmask", "rowmask"]) {
-    if (query.get(name) === "on") parts.push(`${name}=on`);
-  }
-  return parts.length === 0 ? "" : ` · ${parts.join(" · ")}`;
-}
-
 // --- the alignment ---------------------------------------------------------
 
 /**
@@ -184,19 +151,15 @@ async function alignmentText(chains, signal, family) {
       const query = chains.join("");
       const problem = complexSequenceProblem(chains.join(":"));
       if (problem !== null) throw new Error(problem);
-      // 🔴 ?pairing=off FOLDS THE OLD BLOCK-DIAGONAL CONSTRUCTION, so a complex
-      // can be run both ways in one sitting. Comparing against a remembered
-      // number from a previous build is how run-to-run drift gets mistaken for
-      // an effect.
-      // 🔴 MULTIMER WANTS THE PAIRED ALIGNMENT, and for repeated chains that is
-      // not an approximation: every copy of one protein is searched once and
-      // gets the same homologs, so row s IS one organism across all of them.
-      // What makes it correct here and a workaround before is the weights - the
-      // multimer relative encoding is told which chain is which, so the paired
-      // rows mean what they say. The monomer model has no such input, which is
-      // why this stays opt-in for it.
-      const pairRepeatedChains = family === "multimer"
-        || new URLSearchParams(location.search).get("pairing") === "on";
+      // 🔴 MULTIMER PAIRS, THE MONOMER STAYS BLOCK-DIAGONAL, and neither is a
+      // switch. For repeated chains pairing is not an approximation: every copy
+      // of one protein is searched once and gets the same homologs, so row s IS
+      // one organism across all of them. What makes it correct is the weights -
+      // the multimer relative encoding is told which chain is which, so the
+      // paired rows mean what they say. The monomer model has no such input, so
+      // paired rows would tell it that residues of different copies coevolved,
+      // and it stays with the construction it was trained for.
+      const pairRepeatedChains = family === "multimer";
       const searchOptions = {
         signal,
         pairRepeatedChains,
@@ -210,31 +173,7 @@ async function alignmentText(chains, signal, family) {
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`);
-      // 🔴 EVERY COMPLEX SWITCH IS OFF UNTIL ASKED FOR. The default is the
-      // block-diagonal construction this started from; ?perchain=on samples
-      // each chain separately and merges the tensors afterwards.
-      //
-      // ...AND ?pairing=on IMPLIES IT. Per-chain sampling reads the chain
-      // alignments directly and never looks at the merged text, so on its own
-      // ?pairing=on would change only what the viewer draws while the fold ran
-      // unaltered - a flag that silently does nothing, which is the exact way
-      // this comparison has already been got wrong once.
-      const flags = new URLSearchParams(location.search);
-      // ...per-chain sampling is a MONOMER workaround and multimer does not want
-      // it: AF2-multimer clusters the assembled complex alignment as one thing.
-      const perChain = family !== "multimer"
-        && (flags.get("perchain") === "on" || flags.get("pairing") === "on");
-      return {
-        text: searched.a3m,
-        chainA3ms: perChain ? searched.chainA3ms : undefined,
-        // ...only when it is not what this family does by default. Multimer
-        // pairs its repeated chains and the monomer does not, every time, so
-        // naming that on every fold is noise; naming a departure from it is
-        // the thing worth seeing.
-        construction: perChain ? "sampled per chain"
-          : pairRepeatedChains !== (family === "multimer")
-            ? (pairRepeatedChains ? "paired" : "block-diagonal") : undefined,
-      };
+      return { text: searched.a3m };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);
@@ -526,10 +465,7 @@ async function fold(event) {
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // ...what the model reads. An array means one alignment per chain.
-    const alignmentForModel = alignmentResult?.chainA3ms ?? alignment;
-    // ...undefined for a pasted or uploaded alignment: the construction was the
-    // user's, and claiming one here would be a guess.
-    const alignmentRun = { construction: alignmentResult?.construction };
+    const alignmentForModel = alignment;
     throwIfAborted(signal);
     if (alignment !== null) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and
@@ -627,20 +563,10 @@ async function fold(event) {
         return;
       }
       progress(Math.min(1, completed / total));
-      status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`
-        + activeAblations(chains.length, alignmentRun));
+      status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`);
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
-    // 🔴 ?covmask=on REPLACES THE INTER-CHAIN COVARIANCE with the product of
-    // the marginals. Only reaches anything when the complex has more than one
-    // chain.
-    const maskInterChainCovariance =
-      new URLSearchParams(location.search).get("covmask") === "on";
-    // ...and ?rowmask=on stops a row attending across chains, which only
-    // matters once per-chain sampling has put two proteins in one row.
-    const maskRowAttentionAcrossChains =
-      new URLSearchParams(location.search).get("rowmask") === "on";
     // 🔴 THE MULTIMER REGIME IS FOUR FACTS, and they travel together. Multimer
     // runs the outer product mean at the top of each block, works in units of
     // 20 angstroms rather than 10, reads chain identity - asym, entity and
@@ -686,7 +612,7 @@ async function fold(event) {
       .predictA3m(
         alignmentForDriver, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          maskInterChainCovariance, maskRowAttentionAcrossChains, ...regime },
+          ...regime },
         model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
