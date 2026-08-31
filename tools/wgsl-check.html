@@ -1,0 +1,72 @@
+<!doctype html><meta charset="utf-8"><title>WGSL compile check</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/*
+ * COMPILE EVERY SHADER THIS REPOSITORY SHIPS, and say which ones this machine
+ * cannot even try.
+ *
+ * 🔴 WHY THIS EXISTS. `npm test` cannot reach WGSL: the Node GPU path needs a
+ * dawn.node built for a newer macOS than the development machine runs, so a
+ * shader can be written, reviewed, committed and deployed without anything ever
+ * parsing it. A syntax error in a shader has already shipped once that way - the
+ * site loaded and the fold button silently did nothing.
+ *
+ * 🔴 AND WHY IT REPORTS SKIPPED SEPARATELY FROM FAILED. A shader guarded by an
+ * `enable` this adapter does not offer is not broken; the harness simply cannot
+ * ask. Reporting those as failures made eight healthy subgroup variants look
+ * like breakage - twice, because the first fix requested `subgroups` and the
+ * real requirement turned out to be `subgroup_size_control`.
+ */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`../${path}${bust}`);
+
+const geometry = await src('src/multimer/geometry.js');
+const modules = Object.assign({},
+  await src('src/evoformer/outer-product-mean.js'),
+  await src('src/evoformer/attention.js'),
+  await src('src/multimer/input-embedder.js'),
+  geometry,
+  // the atom14 shader is generated per position_scale; compile both
+  { ATOM14_SHADER_monomer: geometry.createAtom14Shader(geometry.MONOMER_POSITION_SCALE),
+    ATOM14_SHADER_multimer: geometry.createAtom14Shader(geometry.MULTIMER_POSITION_SCALE) });
+
+const adapter = await navigator.gpu.requestAdapter();
+// ...ask for everything the adapter has, so a shader is only skipped when the
+// hardware genuinely lacks the extension rather than because we under-asked.
+const requiredFeatures = [...adapter.features];
+const device = await adapter.requestDevice({ requiredFeatures });
+const available = new Set(requiredFeatures);
+log(`adapter   ${adapter.info?.vendor ?? '?'} ${adapter.info?.architecture ?? ''}`);
+log(`features  ${requiredFeatures.length} available`);
+log('');
+
+/** WGSL spells extensions with underscores; WebGPU features use hyphens. */
+const missingExtensions = (code) =>
+  [...code.matchAll(/^\s*enable\s+([a-z0-9_]+)\s*;/gm)]
+    .map((match) => match[1])
+    .filter((name) => !available.has(name.replace(/_/g, '-')) && !available.has(name));
+
+let failed = 0, skipped = 0, compiled = 0;
+for (const [name, code] of Object.entries(modules)) {
+  if (typeof code !== 'string' || !code.includes('@compute')) continue;
+  const missing = missingExtensions(code);
+  if (missing.length > 0) { skipped += 1; log(`skip  ${name}  (needs ${missing.join(', ')})`); continue; }
+  device.pushErrorScope('validation');
+  const module = device.createShaderModule({ code, label: name });
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter((m) => m.type === 'error');
+  const scope = await device.popErrorScope();
+  if (errors.length || scope) {
+    failed += 1;
+    log(`FAIL  ${name}`);
+    for (const e of errors) log(`        line ${e.lineNum}: ${e.message}`);
+    if (scope) log(`        ${scope.message}`);
+  } else { compiled += 1; log(`ok    ${name}`); }
+}
+log('');
+log(`${compiled} compiled, ${skipped} skipped (extension unavailable), ${failed} failed`);
+window.__WGSL__ = { compiled, skipped, failed };
+</script>
