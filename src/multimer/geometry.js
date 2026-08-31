@@ -16,7 +16,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 export const MONOMER_POSITION_SCALE = 10;
 export const MULTIMER_POSITION_SCALE = 20;
 
-const createAtom14Shader = (positionScale) => `
+export const createAtom14Shader = (positionScale) => `
 struct Rotation { row0: vec3<f32>, row1: vec3<f32>, row2: vec3<f32> };
 struct Frame { rotation: Rotation, translation: vec3<f32> };
 @group(0) @binding(0) var<storage, read> affine: array<f32>;
@@ -104,7 +104,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-const ATOM37_SHADER = `
+export const ATOM37_SHADER = `
 @group(0) @binding(0) var<storage, read> atom14: array<f32>;
 @group(0) @binding(1) var<storage, read> atom37_to_atom14: array<f32>;
 @group(0) @binding(2) var<storage, read> atom37_mask: array<f32>;

@@ -122,7 +122,7 @@ const GRID_WIDTH: u32 = 32768u;
 const MAX_RELATIVE_CHAIN: u32 = 2u;
 `;
 
-const MSA_SHADER = `${COMMON}
+export const MSA_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> target_features: array<f32>;
 @group(0) @binding(1) var<storage, read> msa_features: array<f32>;
 @group(0) @binding(2) var<storage, read> previous_msa: array<f32>;
@@ -150,7 +150,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
-const EXTRA_SHADER = `${COMMON}
+export const EXTRA_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> extra_msa: array<f32>;
 @group(0) @binding(1) var<storage, read> has_deletion: array<f32>;
 @group(0) @binding(2) var<storage, read> deletion_value: array<f32>;
@@ -171,7 +171,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[index] = result;
 }`;
 
-const PAIR_SHADER = `${COMMON}
+export const PAIR_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> target_features: array<f32>;
 @group(0) @binding(1) var<storage, read> previous_pair: array<f32>;
 @group(0) @binding(2) var<storage, read> previous_positions: array<f32>;
