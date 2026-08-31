@@ -205,10 +205,6 @@ export class AlphaFoldUnifiedGpu {
         const covMask = wantsCovMask ? chainMask : undefined;
         const rowAttentionChainMask = wantsRowMask ? chainMask : undefined;
         const extraShape = {
-          // 🔴 THE EXTRA STACK DOES NOT READ THIS YET. Its block runs the outer
-          // product mean through encodeEvoformerPairBlock, which has its own
-          // fixed order; only the main evoformer honours the flag. Carried here
-          // so the shape is complete, and named so it is not mistaken for wired.
           outerProductMeanFirst,
           covMask,
           rowAttentionChainMask,

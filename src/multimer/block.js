@@ -677,10 +677,17 @@ export async function encodeEvoformerPairBlock(
   msaMask,
   pairMask,
 ) {
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair, shape.covMask,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  // ...unless the caller already ran it. AF2-multimer puts the outer product
+  // mean at the TOP of an extra-MSA block, before the row attention, where this
+  // has it after the MSA transition - the monomer order. Lifting it out is the
+  // only way to honour that, since this function owns the pair half of the
+  // block and the MSA half sits above it.
+  if (shape.outerProductMeanDone !== true) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair, shape.covMask,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
   );
@@ -721,6 +728,18 @@ export async function encodeExtraMsaBlock(
   msaMask,
   pairMask,
 ) {
+  // 🔴 MULTIMER RUNS THE OUTER PRODUCT MEAN FIRST HERE TOO. Only the main
+  // evoformer honoured the flag before; this stack read it and did nothing,
+  // which left every multimer fold running one of its two stacks in the monomer
+  // order.
+  const outerProductMeanFirst = shape.outerProductMeanFirst === true;
+  if (outerProductMeanFirst) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair, shape.covMask,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
+
   const row = weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
     chainMask: shape.rowAttentionChainMask,
@@ -741,7 +760,9 @@ export async function encodeExtraMsaBlock(
     execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
     "extra.msa-transition", msa,
   );
-  await encodeEvoformerPairBlock(execution, encoder, shape, weights, msa, pair, msaMask, pairMask);
+  await encodeEvoformerPairBlock(execution, encoder,
+    { ...shape, outerProductMeanDone: outerProductMeanFirst },
+    weights, msa, pair, msaMask, pairMask);
 }
 
 export async function encodeTemplatePairBlock(
