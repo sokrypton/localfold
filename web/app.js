@@ -151,7 +151,7 @@ function activeAblations(chainCount) {
  * takes the per-chain alignments so clustering, subsampling and masking run
  * separately for each copy. Merging first makes repeated chains identical.
  */
-async function alignmentText(chains, signal) {
+async function alignmentText(chains, signal, family) {
   switch (msaMode()) {
     case "single": return null;
     case "paste": {
@@ -175,8 +175,15 @@ async function alignmentText(chains, signal) {
       // can be run both ways in one sitting. Comparing against a remembered
       // number from a previous build is how run-to-run drift gets mistaken for
       // an effect.
-      const pairRepeatedChains =
-        new URLSearchParams(location.search).get("pairing") === "on";
+      // 🔴 MULTIMER WANTS THE PAIRED ALIGNMENT, and for repeated chains that is
+      // not an approximation: every copy of one protein is searched once and
+      // gets the same homologs, so row s IS one organism across all of them.
+      // What makes it correct here and a workaround before is the weights - the
+      // multimer relative encoding is told which chain is which, so the paired
+      // rows mean what they say. The monomer model has no such input, which is
+      // why this stays opt-in for it.
+      const pairRepeatedChains = family === "multimer"
+        || new URLSearchParams(location.search).get("pairing") === "on";
       const searchOptions = {
         signal,
         pairRepeatedChains,
@@ -201,7 +208,10 @@ async function alignmentText(chains, signal) {
       // unaltered - a flag that silently does nothing, which is the exact way
       // this comparison has already been got wrong once.
       const flags = new URLSearchParams(location.search);
-      const perChain = flags.get("perchain") === "on" || flags.get("pairing") === "on";
+      // ...per-chain sampling is a MONOMER workaround and multimer does not want
+      // it: AF2-multimer clusters the assembled complex alignment as one thing.
+      const perChain = family !== "multimer"
+        && (flags.get("perchain") === "on" || flags.get("pairing") === "on");
       return { text: searched.a3m, chainA3ms: perChain ? searched.chainA3ms : undefined };
     }
     default:
@@ -489,7 +499,8 @@ async function fold(event) {
     }
     let chains = enteredProblem === null ? sequenceChains(entered) : [];
     let sequence = chains.join("");
-    const alignmentResult = await alignmentText(chains, signal);
+    const family = modelFamily(chains.length);
+    const alignmentResult = await alignmentText(chains, signal, family);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // ...what the model reads. An array means one alignment per chain.
@@ -514,7 +525,6 @@ async function fold(event) {
     status("Starting WebGPU");
     const device = await getDevice();
     throwIfAborted(signal);
-    const family = modelFamily(chains.length);
     // 🔴 MULTIMER ALWAYS TAKES THE A3M DRIVER, even with no alignment. The
     // query-only path is a separate graph that knows nothing about the multimer
     // regime, so selecting multimer there loaded the right weights and ran the
