@@ -46,7 +46,9 @@ try {
     merged, model.weights, model.featureTables,
     { recycles: RECYCLES, randomSeed: 0, chainLengths: lengths,
       maxMsaSequences: MAX_MSA, maxExtraSequences: MAX_EXTRA,
-      outerProductMeanFirst: true, positionScale: 20, templates: false,
+      // ...templates ON, because multimer's embedder is not optional: it runs
+      // every recycle and adds to the pair whether or not a template exists.
+      outerProductMeanFirst: true, positionScale: 20,
       chainAware: true, chainSequences: chains },
     model.paeBreaks,
     (result, recycle) => {

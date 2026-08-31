@@ -637,14 +637,25 @@ async function fold(event) {
     // matters once per-chain sampling has put two proteins in one row.
     const maskRowAttentionAcrossChains =
       new URLSearchParams(location.search).get("rowmask") === "on";
-    // 🔴 THE MULTIMER REGIME IS THREE FACTS, and they travel together. Multimer
+    // 🔴 THE MULTIMER REGIME IS FOUR FACTS, and they travel together. Multimer
     // runs the outer product mean at the top of each block, works in units of
-    // 20 angstroms rather than 10, and reads chain identity - asym, entity and
-    // symmetry - where the monomer reads only a residue index. Its export
-    // carries no template embedder, so the residual is skipped too.
+    // 20 angstroms rather than 10, reads chain identity - asym, entity and
+    // symmetry - where the monomer reads only a residue index, and RUNS ITS
+    // TEMPLATE EMBEDDER WHETHER OR NOT THERE ARE TEMPLATES.
+    //
+    // That last one is not an option in multimer the way it is in the monomer.
+    // `template.enabled` is False for model_1_ptm and True for
+    // model_1_multimer_v3, and multimer's embedding wrapper adds the template
+    // activation to the pair unconditionally - masking every template off does
+    // not zero it, because it reads the pair through a layer norm and adds a
+    // learned constant. Skipping it put the pair 30% out from the first block
+    // and shattered backbones at high copy counts. Measured against
+    // AlphaFold's own forward on the toy oracle, running it takes the trunk
+    // from 6.4e-2 to 1.3e-2 and CA RMSD from 1.96 A to 1.02 A - and on float32
+    // weights, to 7.9e-7 and 0.000 A.
     const multimer = family === "multimer";
     const regime = multimer
-      ? { outerProductMeanFirst: true, positionScale: 20, templates: false,
+      ? { outerProductMeanFirst: true, positionScale: 20,
         chainAware: true, chainSequences: chains }
       : {};
     // ...?graph=unified runs the MONOMER weights through src/multimer/ instead.

@@ -127,12 +127,18 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
     const fixture = AlphaFoldFixture.fromStore(store);
     const extraStackWeights = variant === "msa"
       ? fixture.extraStackWeights() : fixture.extraPairStackWeights();
-    // ...no template embedder in a multimer export: multimer's is architecturally
-    // different from the monomer's, so the fold runs template-free.
+    // 🔴 TWO DIFFERENT TEMPLATE TRACKS, and multimer's is not optional. The
+    // monomer's `template` is the query-only residual, skipped when there are
+    // no templates. Multimer's embedder runs every recycle regardless -
+    // `template.enabled` is True for model_1_multimer_v3 and its wrapper adds
+    // the activation to the pair unconditionally - so its weights are loaded
+    // for every multimer fold, templates or not.
     const templateWeights = multimer ? Promise.resolve(undefined) : fixture.templateWeights();
-    const [embedding, template, extraStack, mainStack, structure, confidence, geometry,
-      featureTables, paeBreaks] = await Promise.all([
-      fixture.embeddingWeights(), templateWeights, extraStackWeights,
+    const templateEmbeddingWeights = multimer
+      ? fixture.templateEmbeddingWeights() : Promise.resolve(undefined);
+    const [embedding, template, templateEmbedding, extraStack, mainStack, structure, confidence,
+      geometry, featureTables, paeBreaks] = await Promise.all([
+      fixture.embeddingWeights(), templateWeights, templateEmbeddingWeights, extraStackWeights,
       fixture.mainStackWeights(), fixture.structureWeights(), fixture.confidenceWeights(),
       fixture.geometryTables(), fixture.queryOnlyFeatureTables(), fixture.tensor("confidencePaeBreaks"),
     ]);
@@ -140,7 +146,7 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
       featureTables,
       paeBreaks,
       weights: {
-        embedding, template, extraStack, mainStack, structure,
+        embedding, template, templateEmbedding, extraStack, mainStack, structure,
         lddt: confidence.lddt, pae: confidence.pae, geometry,
       },
     };
