@@ -122,14 +122,27 @@ export function makeA3mFeatures(a3mText, tables,
         deletionSums[slot] = deletionSums[slot] + alignment.deletionMatrix[row] [residue];
       }
     }
+    // 🔴 THE PROFILE STAYS ON FOR AN ALIGNMENT. ColabDesign2's make_msa_feats
+    // defaults use_cluster_profile=False, and create_msa_feat then falls back to
+    // `c_msa = batch.get("cluster_profile", msa)` - channels 25..47 become a
+    // copy of the one-hot. That is a DESIGN default, for single-sequence work
+    // where a one-hot is what you want; AF-Multimer's own create_msa_feat reads
+    // cluster_profile, exactly as the monomer does. So this switch exists for
+    // that case and is not something multimer should be run with.
+    const useClusterProfile = options.clusterProfile !== false;
     const msaFeatures = new Float32Array(centers.length * length * 49);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
       const slot = center * length + residue; const output = slot * 49;
       msaFeatures[output + centerCodes[slot]] = 1;
       const deletion = alignment.deletionMatrix[centers[center]] [residue];
       msaFeatures[output + 23] = Math.min(deletion, 1); msaFeatures[output + 24] = deletionValue(deletion);
-      for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code] / counts[slot];
-      msaFeatures[output + 48] = deletionValue(deletionSums[slot] / counts[slot]);
+      if (useClusterProfile) {
+        for (let code = 0; code < 23; code += 1) msaFeatures[output + 25 + code] = profile[slot * 23 + code] / counts[slot];
+        msaFeatures[output + 48] = deletionValue(deletionSums[slot] / counts[slot]);
+      } else {
+        msaFeatures[output + 25 + centerCodes[slot]] = 1;
+        msaFeatures[output + 48] = deletionValue(deletion);
+      }
     }
     const extraSequences = Math.max(1, extras.length);
     const extraMsa = new Float32Array(extraSequences * length);

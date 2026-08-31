@@ -1,0 +1,45 @@
+<!doctype html><meta charset="utf-8"><title>where does multimer stand</title>
+<body style="font:13px ui-monospace,Menlo,monospace;padding:16px"><pre id="out">running…</pre>
+<script type="module">
+/* Both models, both depths, one and two copies - all on current code. */
+const out = document.getElementById('out');
+out.textContent = '';
+const log = (s) => { out.textContent += s + "\n"; };
+const bust = `?v=${Date.now()}`;
+const src = (path) => import(`./${path}${bust}`);
+const { getDevice, loadModel } = await src('web/model.js');
+const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { mergeChainA3ms } = await src('src/input/chains.js');
+const CHAIN = 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK';
+try {
+  const device = await getDevice();
+  const a3m = await fetch('/test.a3m').then((r) => r.text());
+  const models = { monomer: await loadModel('msa', () => {}, undefined, 'monomer'),
+                   multimer: await loadModel('msa', () => {}, undefined, 'multimer') };
+  log('plddt / ptm / iptm, one recycle\n');
+  for (const copies of [1, 2]) {
+    const chains = Array(copies).fill(CHAIN);
+    const lengths = chains.map((c) => c.length);
+    const text = copies === 1 ? a3m : mergeChainA3ms(Array(copies).fill(a3m));
+    for (const [maxMsa, maxExtra] of [[32, 64], [508, 1024]]) {
+      const row = [];
+      for (const family of ['monomer', 'multimer']) {
+        const regime = family === 'multimer'
+          ? { outerProductMeanFirst: true, positionScale: 20, templates: false,
+              chainAware: copies > 1, chainSequences: chains }
+          : {};
+        let last;
+        await new AlphaFoldUnifiedGpu(device).predictA3m(
+          text, models[family].weights, models[family].featureTables,
+          { recycles: 1, randomSeed: 0, chainLengths: lengths,
+            maxMsaSequences: maxMsa, maxExtraSequences: maxExtra, ...regime },
+          models[family].paeBreaks, (r) => { last = r; });
+        const c = last.confidence;
+        row.push(`${family} ${(c.meanPlddt / 100).toFixed(3)}/${c.ptm.toFixed(3)}`
+          + `${c.iptm === undefined ? '' : '/' + c.iptm.toFixed(3)}`);
+      }
+      log(`  ${copies} cop${copies === 1 ? 'y ' : 'ies'}  ${String(maxMsa).padStart(3)}:${String(maxExtra).padEnd(4)}   ${row.join('    ')}`);
+    }
+  }
+} catch (error) { log(`FAILED: ${error.message}`); log((error.stack ?? '').split('\n').slice(0,4).join('\n')); }
+</script>
