@@ -227,7 +227,10 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   for (const [sequence, searched] of entries) bySequence.set(sequence, searched);
   // ...`pairRepeatedChains: false` restores the block-diagonal form, so the two
   // constructions can be folded against each other without a rebuild.
-  const merge = options.pairRepeatedChains === false ? mergeUnpairedChainA3ms : mergeChainA3ms;
+  // ...block-diagonal unless the caller asks for pairing. The paired form is
+  // better on depth but only coherent alongside the chain masks, so it is not
+  // something a caller should get without saying so.
+  const merge = options.pairRepeatedChains === true ? mergeChainA3ms : mergeUnpairedChainA3ms;
   const chainA3ms = sequences.map((sequence) => bySequence.get(sequence).a3m);
   const a3m = merge(chainA3ms);
   const alignment = parseA3m(a3m);

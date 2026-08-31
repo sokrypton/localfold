@@ -57,7 +57,7 @@ describe("MMseqs2 API", () => {
     expect(phases).toEqual(["submitting", "queued", "running", "downloading", "complete"]);
   });
 
-  it("searches an identical homomer chain once and pairs both copies", async() => {
+  it("pairs both copies when asked", async() => {
     const responses = [
       new Response(JSON.stringify({ status: "COMPLETE", id: "ticket-homo" })),
       new Response(new Uint8Array([1, 2, 3])),
@@ -65,6 +65,7 @@ describe("MMseqs2 API", () => {
     const fetchImplementation = vi.fn(async() => responses.shift());
     const result = await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
       fetchImplementation, wait: async() => {}, decompress: async() => resultTar,
+      pairRepeatedChains: true,
     });
     expect(fetchImplementation.mock.calls.length).toBe(2);
     expect(result.tickets).toEqual(["ticket-homo"]);
@@ -77,7 +78,7 @@ describe("MMseqs2 API", () => {
     expect(parsed.sequences.includes("----AC-E")).toBe(false);
   });
 
-  it("restores the block-diagonal form when pairing is turned off", async() => {
+  it("is block-diagonal by default", async() => {
     const responses = [
       new Response(JSON.stringify({ status: "COMPLETE", id: "ticket-homo" })),
       new Response(new Uint8Array([1, 2, 3])),
@@ -85,7 +86,6 @@ describe("MMseqs2 API", () => {
     const fetchImplementation = vi.fn(async() => responses.shift());
     const result = await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
       fetchImplementation, wait: async() => {}, decompress: async() => resultTar,
-      pairRepeatedChains: false,
     });
     const parsed = parseA3m(result.a3m);
     expect(parsed.sequences).toContain("AC-E----");

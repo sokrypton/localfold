@@ -120,11 +120,11 @@ function progress(fraction) {
 function activeAblations(chainCount) {
   if (chainCount < 2) return "";
   const query = new URLSearchParams(location.search);
-  const off = ["pairing", "perchain", "covmask", "rowmask"].filter((name) => query.get(name) === "off");
-  // ...pairing=off turns per-chain sampling off with it, so say so rather than
+  const on = ["pairing", "perchain", "covmask", "rowmask"].filter((name) => query.get(name) === "on");
+  // ...pairing=on turns per-chain sampling on with it, so say so rather than
   // leaving the reader to infer which construction actually ran.
-  if (off.includes("pairing") && !off.includes("perchain")) off.splice(1, 0, "perchain");
-  return off.length === 0 ? " · default" : ` · ${off.map((name) => `${name}=off`).join(" ")}`;
+  if (on.includes("pairing") && !on.includes("perchain")) on.splice(1, 0, "perchain");
+  return on.length === 0 ? " · block-diagonal" : ` · ${on.map((name) => `${name}=on`).join(" ")}`;
 }
 
 // --- the alignment ---------------------------------------------------------
@@ -161,7 +161,7 @@ async function alignmentText(chains, signal) {
       // number from a previous build is how run-to-run drift gets mistaken for
       // an effect.
       const pairRepeatedChains =
-        new URLSearchParams(location.search).get("pairing") !== "off";
+        new URLSearchParams(location.search).get("pairing") === "on";
       const searchOptions = {
         signal,
         pairRepeatedChains,
@@ -175,17 +175,18 @@ async function alignmentText(chains, signal) {
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`
-        + (chains.length > 1 && !pairRepeatedChains ? " · block-diagonal" : ""));
-      // 🔴 ?perchain=off MERGES FIRST, the construction this replaced, so the
-      // two can be folded against each other.
+        + (chains.length > 1 && pairRepeatedChains ? " · paired" : ""));
+      // 🔴 EVERY COMPLEX SWITCH IS OFF UNTIL ASKED FOR. The default is the
+      // block-diagonal construction this started from; ?perchain=on samples
+      // each chain separately and merges the tensors afterwards.
       //
-      // ...AND ?pairing=off IMPLIES IT. Per-chain sampling reads the chain
+      // ...AND ?pairing=on IMPLIES IT. Per-chain sampling reads the chain
       // alignments directly and never looks at the merged text, so on its own
-      // ?pairing=off would change only what the viewer draws while the fold ran
+      // ?pairing=on would change only what the viewer draws while the fold ran
       // unaltered - a flag that silently does nothing, which is the exact way
       // this comparison has already been got wrong once.
       const flags = new URLSearchParams(location.search);
-      const perChain = flags.get("perchain") !== "off" && flags.get("pairing") !== "off";
+      const perChain = flags.get("perchain") === "on" || flags.get("pairing") === "on";
       return { text: searched.a3m, chainA3ms: perChain ? searched.chainA3ms : undefined };
     }
     default:
@@ -573,15 +574,15 @@ async function fold(event) {
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
-    // 🔴 ?covmask=off KEEPS THE INTER-CHAIN COVARIANCE, so the marginal
-    // substitution can be folded against the plain contraction. Only reaches
-    // anything when the complex has more than one chain.
+    // 🔴 ?covmask=on REPLACES THE INTER-CHAIN COVARIANCE with the product of
+    // the marginals. Only reaches anything when the complex has more than one
+    // chain.
     const maskInterChainCovariance =
-      new URLSearchParams(location.search).get("covmask") !== "off";
-    // ...and ?rowmask=off lets a row attend across chains again, which the
-    // block-diagonal form could not do because the other chain was gaps there.
+      new URLSearchParams(location.search).get("covmask") === "on";
+    // ...and ?rowmask=on stops a row attending across chains, which only
+    // matters once per-chain sampling has put two proteins in one row.
     const maskRowAttentionAcrossChains =
-      new URLSearchParams(location.search).get("rowmask") !== "off";
+      new URLSearchParams(location.search).get("rowmask") === "on";
     const prediction = alignment === null
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,

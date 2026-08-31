@@ -76,11 +76,15 @@ export class AlphaFoldQueryOnlyGpu {
     // Repeated chains are paired into single MSA rows, so the covariance the
     // outer product mean sees between copies restates the intra-chain one; the
     // mask keeps the profile there and drops the coupling. Monomer: undefined.
-    const covMaskValues = recycleOptions.chainLengths !== undefined
+    const wantsCovMask = recycleOptions.maskInterChainCovariance === true;
+    const wantsRowMask = recycleOptions.maskRowAttentionAcrossChains === true;
+    const chainMaskValues = (wantsCovMask || wantsRowMask)
+        && recycleOptions.chainLengths !== undefined
         && recycleOptions.chainLengths.length > 1
-        && recycleOptions.maskInterChainCovariance !== false
       ? interChainCovarianceMask(length, recycleOptions.chainLengths)
       : undefined;
+    const covMaskValues = wantsCovMask ? chainMaskValues : undefined;
+    const rowMaskValues = wantsRowMask ? chainMaskValues : undefined;
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
     const pairMask = new Float32Array(length * length);
@@ -197,8 +201,7 @@ export class AlphaFoldQueryOnlyGpu {
           cM: 64,
           cZ: 128,
           covMask: covMaskValues,
-          rowAttentionChainMask: recycleOptions.maskRowAttentionAcrossChains === false
-            ? undefined : covMaskValues,
+          rowAttentionChainMask: rowMaskValues,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.extraStack,
@@ -220,8 +223,7 @@ export class AlphaFoldQueryOnlyGpu {
           cM: 256,
           cZ: 128,
           covMask: covMaskValues,
-          rowAttentionChainMask: recycleOptions.maskRowAttentionAcrossChains === false
-            ? undefined : covMaskValues,
+          rowAttentionChainMask: rowMaskValues,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.mainStack,

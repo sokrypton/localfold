@@ -139,22 +139,21 @@ export class AlphaFoldMonomerGpu {
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
 
-        // 🔴 ONLY WHEN THE COMPLEX HAS MORE THAN ONE CHAIN. Repeated chains are
-        // paired into single MSA rows, which makes the inter-chain covariance a
-        // copy of the intra-chain one; the mask keeps the profile there and
-        // drops the coupling. A monomer has no inter-chain pairs, gets no mask,
-        // and takes the untouched code path.
-        const covMask = recycleOptions.chainLengths !== undefined
+        // 🔴 BOTH MASKS ARE OPT-IN, and both are the same [L,L] buffer: 1 where
+        // a pair is intra-chain. One drops the covariance the outer product mean
+        // would read between copies, the other stops a row attending across
+        // them. They are separate switches because they can be wrong
+        // independently. A monomer has no inter-chain pairs and never builds it.
+        const wantsCovMask = recycleOptions.maskInterChainCovariance === true;
+        const wantsRowMask = recycleOptions.maskRowAttentionAcrossChains === true;
+        const chainMask = (wantsCovMask || wantsRowMask)
+            && recycleOptions.chainLengths !== undefined
             && recycleOptions.chainLengths.length > 1
-            && recycleOptions.maskInterChainCovariance !== false
-          ? execution.upload(`monomer.cov-mask-${recycle}`,
+          ? execution.upload(`monomer.chain-mask-${recycle}`,
             interChainCovarianceMask(length, recycleOptions.chainLengths))
           : undefined;
-        // ...THE SAME BUFFER, A SEPARATE SWITCH. Row attention and the outer
-        // product mean are masked for the same reason and can be wrong
-        // independently, so each gets its own ablation.
-        const rowAttentionChainMask = recycleOptions.maskRowAttentionAcrossChains === false
-          ? undefined : covMask;
+        const covMask = wantsCovMask ? chainMask : undefined;
+        const rowAttentionChainMask = wantsRowMask ? chainMask : undefined;
         const extraShape = {
           covMask,
           rowAttentionChainMask,
