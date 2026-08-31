@@ -53,7 +53,8 @@ export class AlphaFoldQueryOnlyGpu {
   ) {
     return this.predict(makeQueryOnlyFeatures(sequence, featureTables, options), weights,
       paeBreaks, onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
-        maskInterChainCovariance: options.maskInterChainCovariance });
+        maskInterChainCovariance: options.maskInterChainCovariance,
+        maskRowAttentionAcrossChains: options.maskRowAttentionAcrossChains });
   }
 
   /**
@@ -196,6 +197,8 @@ export class AlphaFoldQueryOnlyGpu {
           cM: 64,
           cZ: 128,
           covMask: covMaskValues,
+          rowAttentionChainMask: recycleOptions.maskRowAttentionAcrossChains === false
+            ? undefined : covMaskValues,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.extraStack,
@@ -217,6 +220,8 @@ export class AlphaFoldQueryOnlyGpu {
           cM: 256,
           cZ: 128,
           covMask: covMaskValues,
+          rowAttentionChainMask: recycleOptions.maskRowAttentionAcrossChains === false
+            ? undefined : covMaskValues,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
           blockWeights: weights.mainStack,

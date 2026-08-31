@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "./harness.js";
 import { interChainCovarianceMask } from "../src/input/chains.js";
 
@@ -138,6 +139,55 @@ describe("the marginal substitution", () => {
         const exact = plain[slot] * (sequences / (1e-3 + sequences));
         expect(masked[slot]).toBeCloseTo(exact, 10);
       }
+    }
+  });
+});
+
+describe("the chain mask on MSA row attention", () => {
+  it("shuts off exactly the cross-chain keys and nothing else", async() => {
+    const { interChainCovarianceMask } = await import("../src/input/chains.js");
+    const mask = interChainCovarianceMask(4, [2, 2]);
+    // The bias adds 1e9 * (mask - 1), so intra-chain adds 0 and cross-chain
+    // adds -1e9, which is what the flash kernels apply for a masked key.
+    const bias = (q, k) => 1e9 * (mask[q * 4 + k] - 1);
+    expect(bias(0, 1)).toBe(0);
+    expect(bias(2, 3)).toBe(0);
+    expect(bias(0, 2)).toBe(-1e9);
+    expect(bias(3, 1)).toBe(-1e9);
+  });
+
+  it("is the same buffer the outer product mean uses", async() => {
+    const { interChainCovarianceMask } = await import("../src/input/chains.js");
+    const a = interChainCovarianceMask(6, [3, 3]);
+    const b = interChainCovarianceMask(6, [3, 3]);
+    expect(Array.from(a)).toEqual(Array.from(b));
+  });
+
+  it("reaches row attention but never triangle attention", async() => {
+    const source = await readFile(new URL("../src/evoformer/block.js", import.meta.url), "utf8");
+    // Every chainMask hand-off must sit in a block whose label is an MSA row
+    // attention. Triangle attention shares the pipeline and must stay unmasked:
+    // the pair track is where the interface is built.
+    const calls = source.split("encodeAttention(execution, encoder, {").slice(1);
+    const masked = calls.filter((call) => call.slice(0, 600).includes("chainMask:"));
+    expect(masked.length).toBe(2);
+    for (const call of masked) {
+      expect(call.slice(0, 600).includes("msa-row-attention")).toBe(true);
+    }
+    const triangle = calls.filter((call) => call.slice(0, 600).includes("triangle-attention"));
+    expect(triangle.length).toBeGreaterThan(0);
+    for (const call of triangle) {
+      expect(call.slice(0, 600).includes("chainMask:")).toBe(false);
+    }
+  });
+
+  it("leaves column attention alone, since a column is one chain", async() => {
+    const source = await readFile(new URL("../src/evoformer/block.js", import.meta.url), "utf8");
+    const calls = source.split("encodeAttention(execution, encoder, {").slice(1);
+    const column = calls.filter((call) => call.slice(0, 600).includes("column-attention"));
+    expect(column.length).toBeGreaterThan(0);
+    for (const call of column) {
+      expect(call.slice(0, 600).includes("chainMask:")).toBe(false);
     }
   });
 });

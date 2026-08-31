@@ -3,6 +3,7 @@ import {
   ATTENTION_OUTPUT_SHADER,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
+  ATTENTION_PAIR_BIAS_CHAIN_MASKED_SHADER,
   ATTENTION_PROJECT_SHADER,
   createAttentionNormParameters,
   createAttentionParameters,
@@ -275,7 +276,11 @@ async function encodeAttention(
   const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
-    execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+    execution.pipelines.get(
+      options.chainMask === undefined ? "block:attention:pair-bias" : "block:attention:pair-bias-chain-masked",
+      options.chainMask === undefined
+        ? ATTENTION_PAIR_BIAS_SHADER : ATTENTION_PAIR_BIAS_CHAIN_MASKED_SHADER,
+    ),
     execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
     execution.pipelines.get(
       options.residualTarget === undefined ? "block:attention:output" : "block:attention:output-residual",
@@ -321,8 +326,11 @@ async function encodeAttention(
   const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
   if (options.pairBias !== undefined) {
     const grid = execution.linearGrid(pairBiasElements);
-    execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias], grid[0], grid[1], 1,
-      `${options.label}.pair-bias`);
+    execution.dispatch(encoder, pairProject,
+      options.chainMask === undefined
+        ? [normalizedPair, weights, params, pairBias]
+        : [normalizedPair, weights, params, pairBias, options.chainMask],
+      grid[0], grid[1], 1, `${options.label}.pair-bias`);
   }
   execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
     Math.ceil(options.channels / 16), Math.ceil(rows / 16), 1,
@@ -572,6 +580,7 @@ export async function encodeEvoformerBlock(
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
     channels: input.cM, heads: row.heads, transpose: false, weights: row.attention,
+    chainMask: input.rowAttentionChainMask,
     pairBias: {
       source: "separate", activations: new Float32Array(0), channels: input.cZ,
       layerNormScale: row.pairLayerNormScale, layerNormOffset: row.pairLayerNormOffset,
@@ -682,6 +691,7 @@ export async function encodeExtraMsaBlock(
 ) {
   const row = weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
+    chainMask: shape.rowAttentionChainMask,
     source: msa, mask: msaMask, pairSource: pair, batch: shape.sequences, queries: shape.length,
     channels: shape.cM, heads: row.heads, transpose: false, weights: row.attention,
     pairBias: {

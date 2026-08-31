@@ -49,7 +49,8 @@ export class AlphaFoldMonomerGpu {
     onRecycle, onProgress) {
     return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
       onRecycle, onProgress, { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
-        maskInterChainCovariance: options.maskInterChainCovariance });
+        maskInterChainCovariance: options.maskInterChainCovariance,
+        maskRowAttentionAcrossChains: options.maskRowAttentionAcrossChains });
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]
@@ -149,8 +150,14 @@ export class AlphaFoldMonomerGpu {
           ? execution.upload(`monomer.cov-mask-${recycle}`,
             interChainCovarianceMask(length, recycleOptions.chainLengths))
           : undefined;
+        // ...THE SAME BUFFER, A SEPARATE SWITCH. Row attention and the outer
+        // product mean are masked for the same reason and can be wrong
+        // independently, so each gets its own ablation.
+        const rowAttentionChainMask = recycleOptions.maskRowAttentionAcrossChains === false
+          ? undefined : covMask;
         const extraShape = {
           covMask,
+          rowAttentionChainMask,
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
@@ -178,6 +185,7 @@ export class AlphaFoldMonomerGpu {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
           pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
           covMask,
+          rowAttentionChainMask,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };

@@ -120,7 +120,7 @@ function progress(fraction) {
 function activeAblations(chainCount) {
   if (chainCount < 2) return "";
   const query = new URLSearchParams(location.search);
-  const off = ["pairing", "perchain", "covmask"].filter((name) => query.get(name) === "off");
+  const off = ["pairing", "perchain", "covmask", "rowmask"].filter((name) => query.get(name) === "off");
   return off.length === 0 ? " · default" : ` · ${off.map((name) => `${name}=off`).join(" ")}`;
 }
 
@@ -568,14 +568,18 @@ async function fold(event) {
     // anything when the complex has more than one chain.
     const maskInterChainCovariance =
       new URLSearchParams(location.search).get("covmask") !== "off";
+    // ...and ?rowmask=off lets a row attend across chains again, which the
+    // block-diagonal form could not do because the other chain was gaps there.
+    const maskRowAttentionAcrossChains =
+      new URLSearchParams(location.search).get("rowmask") !== "off";
     const prediction = alignment === null
       ? await new AlphaFoldQueryOnlyGpu(device).predictSequence(
         sequence, model.weights, model.featureTables,
-        { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress)
+        { recycles, randomSeed: seed, chainLengths, tolerance, signal, maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress)
       : await new AlphaFoldMonomerGpu(device).predictA3m(
         alignmentForModel, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          maskInterChainCovariance }, model.paeBreaks, onRecycle, runProgress);
+          maskInterChainCovariance, maskRowAttentionAcrossChains }, model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;
