@@ -6,6 +6,48 @@ import { WebGpuExecution } from "../runtime/execution.js";
 const GRID_WIDTH = 32_768;
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
 
+/**
+ * The per-residue identity the relative encoding reads: [4, length] holding the
+ * residue index, then the asymmetric-unit, entity and symmetry ids.
+ *
+ * All three default to zero, which is what a monomer is: one chain, one entity,
+ * one copy. Callers folding a complex supply them.
+ */
+export function residueIdentity(input) {
+  const length = input.length;
+  const identity = new Float32Array(length * 4);
+  identity.set(input.residueIndex.subarray(0, length), 0);
+  const lanes = [input.asymId, input.entityId, input.symId];
+  lanes.forEach((lane, index) => {
+    if (lane === undefined) return;
+    if (lane.length !== length) throw new RangeError("chain identity must have one value per residue");
+    identity.set(lane, length * (index + 1));
+  });
+  return identity;
+}
+
+/**
+ * The relative-position table, widened to the multimer graph's 73 rows.
+ *
+ * 🔴 THE MULTIMER GRAPH IS THE ONE GRAPH, and monomer is its single-chain case.
+ * 73 = 66 offset bins (the last meaning "different chain") + 1 entity-same +
+ * 6 relative-chain bins. A monomer never lights any of the 8 trailing features:
+ * one chain makes asym_same and entity_same true everywhere and the symmetry
+ * delta zero. So zero rows there reproduce the 65-row result EXACTLY, and the
+ * shader needs no monomer branch.
+ *
+ * Widening here rather than at export means the shipped monomer weights are
+ * still the ones on disk - no re-quantisation, no new manifest, no re-download.
+ */
+export function widenRelativePositionWeight(weight, pairChannels) {
+  const rows = weight.length / pairChannels;
+  if (rows === 73) return weight;
+  if (rows !== 65) throw new RangeError(`relative position table has ${rows} rows; expected 65 or 73`);
+  const widened = new Float32Array(73 * pairChannels);
+  widened.set(weight);
+  return widened;
+}
+
 function packWeights(input) {
   const w = input.weights;
   const tensors = [
@@ -14,7 +56,7 @@ function packWeights(input) {
     w.previousPositionWeight, w.previousPositionBias,
     w.previousMsaNormScale, w.previousMsaNormOffset,
     w.previousPairNormScale, w.previousPairNormOffset,
-    w.relativePositionWeight, w.relativePositionBias,
+    widenRelativePositionWeight(w.relativePositionWeight, input.pairChannels), w.relativePositionBias,
     w.extraMsaWeight, w.extraMsaBias,
   ];
   const offsets = [];
@@ -55,6 +97,8 @@ struct Parameters {
   min_bin: f32, max_bin: f32, padding: u32,
 };
 const GRID_WIDTH: u32 = 32768u;
+// AF2 multimer's max_relative_chain: symmetry deltas clip to [-2, 2].
+const MAX_RELATIVE_CHAIN: u32 = 2u;
 `;
 
 const MSA_SHADER = `${COMMON}
@@ -111,7 +155,8 @@ const PAIR_SHADER = `${COMMON}
 @group(0) @binding(1) var<storage, read> previous_pair: array<f32>;
 @group(0) @binding(2) var<storage, read> previous_positions: array<f32>;
 @group(0) @binding(3) var<storage, read> aatype: array<f32>;
-@group(0) @binding(4) var<storage, read> residue_index: array<f32>;
+// [4, length]: residue index, then asym / entity / symmetry id per residue.
+@group(0) @binding(4) var<storage, read> residue_ids: array<f32>;
 @group(0) @binding(5) var<storage, read> weights: array<f32>;
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<f32>;
@@ -149,10 +194,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
   }
   result += previous_pair[index];
-  let raw_offset = i32(residue_index[i]) - i32(residue_index[j]) + i32(p.max_relative);
-  let relative = u32(clamp(raw_offset, 0, i32(2u * p.max_relative)));
+  // THE MULTIMER RELATIVE ENCODING. One chain reduces it to the monomer form:
+  // asym_same and entity_same hold everywhere, the symmetry delta is zero, and
+  // the eight trailing rows are zero in converted monomer weights - so this
+  // computes exactly what the 65-row lookup did, with no branch.
+  let asym_same = residue_ids[p.length + i] == residue_ids[p.length + j];
+  let entity_same = residue_ids[2u * p.length + i] == residue_ids[2u * p.length + j];
+  let raw_offset = i32(residue_ids[i]) - i32(residue_ids[j]) + i32(p.max_relative);
+  let clipped = u32(clamp(raw_offset, 0, i32(2u * p.max_relative)));
+  // ...the bin past the last offset means "a different chain entirely".
+  let offset_row = select(2u * p.max_relative + 1u, clipped, asym_same);
+  let entity_row = 2u * p.max_relative + 2u;
+  let symmetry_delta = i32(residue_ids[3u * p.length + i]) - i32(residue_ids[3u * p.length + j]);
+  let clipped_chain = u32(clamp(symmetry_delta + i32(MAX_RELATIVE_CHAIN), 0, i32(2u * MAX_RELATIVE_CHAIN)));
+  let chain_row = select(2u * MAX_RELATIVE_CHAIN + 1u, clipped_chain, entity_same);
   result += weights[p.relative_bias + channel]
-    + weights[p.relative_weight + relative * p.pair_channels + channel];
+    + weights[p.relative_weight + offset_row * p.pair_channels + channel]
+    + select(0.0, weights[p.relative_weight + entity_row * p.pair_channels + channel], entity_same)
+    + weights[p.relative_weight + (entity_row + 1u + chain_row) * p.pair_channels + channel];
   output[index] = result;
 }`;
 
@@ -191,7 +250,7 @@ export async function encodeInputEmbedder(
   const extraMsaInput = temporaryUpload("embed.extra-codes", input.extraMsa);
   const hasDeletion = temporaryUpload("embed.extra-has-deletion", input.extraHasDeletion);
   const deletionValue = temporaryUpload("embed.extra-deletion-value", input.extraDeletionValue);
-  const residueIndex = temporaryUpload("embed.residue-index", input.residueIndex);
+  const residueIndex = temporaryUpload("embed.residue-ids", residueIdentity(input));
   const aatype = temporaryUpload("embed.aatype", input.aatype);
   const weights = temporaryUpload("embed.weights", packed.data);
   const params = temporaryUpload("embed.parameters", parameters(input, packed.offsets), GPUBufferUsage.UNIFORM);
@@ -265,7 +324,7 @@ export class InputEmbedderGpu {
       const extraMsaInput = upload("embed.extra-codes", input.extraMsa);
       const hasDeletion = upload("embed.extra-has-deletion", input.extraHasDeletion);
       const deletionValue = upload("embed.extra-deletion-value", input.extraDeletionValue);
-      const residueIndex = upload("embed.residue-index", input.residueIndex);
+      const residueIndex = upload("embed.residue-ids", residueIdentity(input));
       const aatype = upload("embed.aatype", input.aatype);
       const previousMsa = upload("embed.previous-msa", input.previousMsaFirstRow);
       const previousPair = upload("embed.previous-pair", input.previousPair);

@@ -576,6 +576,20 @@ export async function encodeEvoformerBlock(
   msaMask,
   pairMask,
 ) {
+  // 🔴 WHERE THE OUTER PRODUCT MEAN SITS IS A PER-MODEL FACT, not a style. AF2
+  // multimer runs it at the TOP of the block, monomer after the MSA transition,
+  // and the weights were trained for their own ordering - so this cannot be
+  // padded around the way a width can. It is the only structural difference
+  // between the two evoformer blocks; everything else here is shared.
+  const outerProductMeanFirst = input.outerProductMeanFirst === true;
+  const outerProductMean = async() => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair, input.covMask,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  };
+  if (outerProductMeanFirst) await outerProductMean();
+
   const row = input.weights.msaRowAttention;
   await encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
@@ -601,10 +615,7 @@ export async function encodeEvoformerBlock(
     input.weights.msaTransition, "msa-transition", msa,
   );
 
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair, input.covMask,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  if (!outerProductMeanFirst) await outerProductMean();
 
   await encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
