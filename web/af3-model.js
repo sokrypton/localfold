@@ -136,16 +136,14 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
  * trunk 3.7 s, and 0.85 s a call after that.
  *
  * 🔴 THE SHARES CANNOT BE CONSTANTS. Features and trunk are fixed costs while
- * the sampler is not, so features are a third of an 8-cycle fold and a
- * fortieth of a 320-step one.
+ * the sampler is not.
  *
- * 🔴 AND THE FEATURE BAND IS A DEAD ZONE. buildTargetFeat is one synchronous
- * call - the per-atom conditioning and the conditioning atom encoder, both on
- * the CPU - so nothing can move while it runs. It is the largest single thing
- * here still waiting for a GPU kernel.
+ * Features were 4.9 s and the bar had nothing to say for all of it; the atom
+ * encoder runs on the GPU now, so it is a few hundred milliseconds and barely
+ * a band. What is left of it is the per-atom conditioning, on the CPU.
  */
 function timeShares(calls, passes) {
-  const features = 4.9;
+  const features = 0.4;
   const trunk = 3.7 * passes;
   const total = features + trunk + 0.85 * calls;
   return { features: features / total, trunk: (features + trunk) / total };
@@ -168,19 +166,19 @@ export async function foldAf3(options) {
   const slots = alphaCarbons(batch);
   let reference = null;
   let shown = 0;
+  // The trajectory, kept as coordinates rather than as text: the frames have to
+  // be rendered twice - once uncoloured while they are computed, and again with
+  // the pLDDT that does not exist until the confidence head has run.
+  const trajectory = [];
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "target-feat-start") {
-        // 🔴 A SWEEP, NOT A NUMBER. buildTargetFeat is ONE synchronous call - 98%
-        // of it is the atom cross-attention encoder, 4.9 s of the 5 on a
-        // 68-residue chain - so there is nothing to count and nothing can move
-        // while it runs. A bar frozen at a value reads as a hang; the
-        // indeterminate state says "working, no idea how far", which is true.
-        // The real fix is a GPU kernel: Af3AtomEncoderGpu already has this
-        // shape, and porting it would remove the wait rather than dress it.
+        // A sweep rather than a number: what is left here is one synchronous
+        // CPU call, so there is still nothing to count - but it is now a few
+        // hundred milliseconds rather than five seconds.
         onProgress("waiting");
         onStatus(`Building input features for ${batch.atomCount} atoms…`);
         // The yield is the point: what follows blocks the main thread for
@@ -217,6 +215,7 @@ export async function foldAf3(options) {
       // picture of anything. `denoised` is the model's predicted structure at
       // each call and is protein-sized in every frame.
       if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
+      trajectory.push(Float32Array.from(denoised));
       options.onFrame?.(fittedPdb(batch, denoised, reference, slots, null), shown);
       shown += 1;
       onProgress(share.trunk + (1 - share.trunk) * (step / calls));
@@ -235,9 +234,26 @@ export async function foldAf3(options) {
   // here, and it is the value the cartoon is coloured by.
   const plddt = slots.map((slot) => result.scores.plddt[slot]);
 
+  // 🔴 EVERY FRAME IS RE-EMITTED WITH THE FINISHED STRUCTURE'S pLDDT. The
+  // confidence head does not run until the sample is done, so the frames drawn
+  // during the fold carry a zero B-factor - and the pLDDT scheme paints that
+  // the colour of no confidence at all, which is a claim rather than a missing
+  // value. The whole trajectory takes the final pLDDT instead, which is a
+  // statement about the prediction and is what every published folding
+  // animation shows.
+  //
+  // 🔴 AND THE FINAL STRUCTURE IS FITTED LIKE THE REST OF THEM. It used to be
+  // appended straight from the sampler, which leaves it in whatever frame
+  // randomAugmentation last rotated into - so the animation ran smoothly and
+  // then jumped on its last frame.
+  const framePdbs = trajectory.map(
+    (positions) => fittedPdb(batch, positions, reference, slots, result.scores.plddt));
+  const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
+
   return {
     batch,
-    pdb: result.pdb,
+    framePdbs,
+    pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,
     seconds: (performance.now() - started) / 1000,

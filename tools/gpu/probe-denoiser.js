@@ -88,7 +88,7 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
 
-  const targetFeat = buildTargetFeat(batch, weights.targetFeat);
+  const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
   const seqMask = batch.seqMask;
   const pairMask = new Float32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {

@@ -588,9 +588,32 @@ async function foldWithAf3(chains, signal) {
   await pending;
   throwIfAborted(signal);
 
-  // The finished structure, carrying the confidence the frames before it could
-  // not have, appended as the last frame and shown.
-  if (viewer !== undefined && viewerObject !== undefined) {
+  // 🔴 THE TRAJECTORY IS RELOADED ONCE THE pLDDT EXISTS. The frames drawn during
+  // the fold have a zero B-factor - the confidence head has not run - so under
+  // the pLDDT scheme they are the colour of no confidence at all. Reloading
+  // from framePdbs, which all carry the finished structure's pLDDT, colours the
+  // whole animation and costs one ingestion of text that is already built.
+  if (viewer !== undefined && viewerObject !== undefined && result.framePdbs.length > 0) {
+    const camera = { ...viewer.viewerState };
+    await loadIntoViewer({
+      stem, pdb: result.framePdbs[0],
+      scores: confidenceJson(sequence, result.confidence),
+      pae: paeMatrix(result.confidence.predictedAlignedError, sequence.length),
+      length: sequence.length, confidence: result.confidence,
+    });
+    // ...and the reader keeps the view they had. A reload flies to its own,
+    // which after watching a fold reads as the structure jumping at the end.
+    if (viewer !== undefined) Object.assign(viewer.viewerState, camera);
+    // loadIntoViewer names its first frame for a recycle, which is the wrong
+    // word for a sampler call.
+    const first = viewer?.objectsData?.[viewerObject]?.frames?.[0];
+    if (first !== undefined) first.name = first.label = first.title = `${mode}_0`;
+    for (const [index, pdb] of result.framePdbs.slice(1).entries()) {
+      const frame = api.frameFromText(pdb);
+      frame.name = frame.label = frame.title = `${mode}_${index + 1}`;
+      frame.confidence = result.confidence;
+      viewer.addFrame(frame, viewerObject);
+    }
     const frame = api.frameFromText(result.pdb);
     frame.name = frame.label = frame.title = "final";
     frame.confidence = result.confidence;

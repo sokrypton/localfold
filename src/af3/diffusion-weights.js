@@ -99,6 +99,23 @@ export async function targetFeatureWeights(store) {
       blocks: [await atomBlock(store, stack, 0),
                await atomBlock(store, stack, 1),
                await atomBlock(store, stack, 2)],
+      // 🔴 THREE WEIGHTS THIS ENCODER DOES NOT HAVE, AT THE RIGHT LENGTHS AND
+      // FULL OF ZEROS. Af3AtomEncoderGpu is a superset of this module: it also
+      // adds the trunk's single, the trunk's pair and an embedding of the noisy
+      // positions. Each is a BIAS-FREE linear of a layer-normed input, so
+      // feeding zero inputs contributes exactly zero and one kernel serves both
+      // - but the shader still INDEXES these, so they have to exist. Their
+      // values are irrelevant; zeros say so.
+      // Checked at relRMS 8e-8 against the CPU reference by
+      // tools/gpu/check-af3-target-feat-gpu.js, which is also where the 33x
+      // comes from.
+      trunkSingleChannels: 384,
+      trunkPairChannels: 128,
+      lnormTrunkSingleCondScale: new Float32Array(384),
+      embedTrunkSingleCond: new Float32Array(384 * 128),
+      lnormTrunkPairCondScale: new Float32Array(128),
+      embedTrunkPairCond: new Float32Array(128 * 16),
+      atomPositionsToFeatures: new Float32Array(3 * 128),
     },
   };
 }
