@@ -975,6 +975,9 @@ async function fold(event) {
 // --- wiring ----------------------------------------------------------------
 
 element("predict").addEventListener("click", (event) => void fold(event));
+// ...and only now is it safe to press. See the note on the button in index.html:
+// it ships disabled, because until this line runs a click is silently a no-op.
+element("predict").disabled = false;
 
 const sequenceBox = element("sequence");
 // ...tidied on blur and paste, not on every keystroke: rewriting the value

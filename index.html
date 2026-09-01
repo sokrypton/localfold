@@ -87,7 +87,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    row it belongs to - it changes what is folded, not how. -->
               <div class="fold-actions">
                 <div class="fold-action-row">
-                  <button id="predict" class="btn btn-primary">
+                  <!-- 🔴 DISABLED UNTIL web/app.js HAS BOUND ITS HANDLER, which
+                       is later than it looks. py2Dmol.full.min.js is 765 KB of
+                       blocking classic script and app.js is a module, so it runs
+                       only after that has downloaded, parsed and executed - and
+                       the whole page, this button included, is on screen and
+                       interactive throughout. A click in that window used to do
+                       nothing at all: no error, no status, no feedback, and the
+                       reasonable conclusion is that the page is broken.
+                       Milliseconds on localhost, seconds over a network. -->
+                  <button id="predict" class="btn btn-primary" disabled>
                     <i class="fa-solid fa-cubes"></i>
                     <span>Fold</span>
                   </button>
@@ -1116,6 +1125,26 @@ AI Context: STANDALONE WEB APP ENTRY POINT
     <script src="./web/vendor/py2Dmol.align.js"></script>
     <script src="./web/vendor/py2Dmol.full.min.js"></script>
     <script type="module" src="./web/app.js"></script>
+    <!-- 🔴 AND IF THAT MODULE NEVER RUNS, SAY SO. A module that throws while
+         loading - a bad import, a 404 on one file of the graph - fails quietly:
+         the page renders, the controls are all there, and nothing works. With
+         the button now shipping disabled, that failure would present as a Fold
+         button that is simply dead forever, which is not much better than one
+         that is silently inert. This turns it into a sentence. It is a classic
+         script on purpose: it has to survive whatever stopped the module. -->
+    <script>
+      setTimeout(function () {
+        var button = document.getElementById("predict");
+        if (button === null || !button.disabled) return;
+        var node = document.getElementById("status-message");
+        if (node !== null) {
+          node.textContent = "This page did not finish loading, so folding is"
+            + " disabled. A reload usually fixes it; if it does not, the"
+            + " browser console will say which file failed.";
+          node.classList.add("error");
+        }
+      }, 15000);
+    </script>
 
 
 </body>
