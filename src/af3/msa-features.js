@@ -98,6 +98,14 @@ export function af3MsaFromA3m(alignment, options = {}) {
   };
   const paired = parse(texts.paired);
   const unpaired = parse(texts.unpaired);
+  // 🔴 THE PROFILE IS COMPUTED BEFORE DEDUPLICATION, over the chain's FULL
+  // unpaired alignment. AF3's features.py calls get_profile_features on every
+  // chain and only then runs msa_pairing.deduplicate_unpaired_sequences, so the
+  // rows the dedup removes still counted towards the profile. Computing it from
+  // what survives is the natural reading and it is a different feature - on a
+  // target with good pairing most of the unpaired block is removed, so most of
+  // the profile would be missing from it.
+  const unpairedProfile = parse(texts.unpairedProfile) ?? unpaired;
 
   // 🔴 THE PAIRED BLOCK GETS AT MOST HALF THE BUDGET, and the unpaired block
   // gets what is left - `max_paired_sequences = msa_size // 2` in AF3's
@@ -143,11 +151,52 @@ export function af3MsaFromA3m(alignment, options = {}) {
   append(paired, 0, pairedCrop - 1);
   // +1 because unpairedFrom indexes the full array, whose row zero is the query.
   const unpairedFrom = msa.length + 1;
-  append(unpaired, 0, unpairedCrop);
+  // 🔴 AND THE UNPAIRED BLOCK SKIPS ITS OWN QUERY WHEN THERE IS A PAIRED ONE.
+  // Every A3M repeats the query as its first row, and the merged MSA already
+  // opens with it - AF3 reaches the same place by deduplicating, since a paired
+  // alignment always contains the query. Keeping it sends the model the query
+  // twice and leaves the batch one row taller than AF3's, which is exactly how
+  // it was found. With no paired block the unpaired query IS row zero's source
+  // and must stay.
+  //
+  // The crop counts ROWS, not indices, so skipping the query moves the end too:
+  // the unpaired block still contributes `unpairedCrop` rows and still spends
+  // exactly its share of the budget.
+  const unpairedStart = paired === null ? 0 : 1;
+  append(unpaired, unpairedStart,
+    unpaired === null ? 0 : Math.min(unpaired.depth, unpairedCrop + unpairedStart));
+
+  // The profile's own rows: the whole unpaired block, query included, before
+  // any deduplication - see above. Kept separate from `msa` rather than
+  // recomputed by the caller, because the two row sets differ only in ways this
+  // function knows about.
+  const profileMsa = [];
+  const profileDeletionMatrix = [];
+  {
+    const into = (parsed, from, upTo) => {
+      if (parsed === null) return;
+      for (let row = from; row < upTo; row += 1) {
+        const aligned = parsed.sequences[row];
+        const codes = new Int32Array(parsed.length);
+        for (let column = 0; column < parsed.length; column += 1) {
+          codes[column] = AF3_MSA_CODES[aligned[column]] ?? AF3_MSA_CODES.X;
+        }
+        profileMsa.push(codes);
+        profileDeletionMatrix.push(Float32Array.from(parsed.deletionMatrix[row]));
+      }
+    };
+    // 🔴 UNCROPPED, TOO. get_profile_features runs at features.py:543 and the
+    // crop only at 576, so the profile sees the whole alignment however few
+    // rows the MSA itself is allowed. Cropping it here is invisible on a
+    // monomer with a shallow alignment and wrong on every deep one.
+    into(unpairedProfile, 0, unpairedProfile === null ? 0 : unpairedProfile.depth);
+  }
 
   return {
     msa,
     deletionMatrix,
+    profileMsa,
+    profileDeletionMatrix,
     depth: msa.length + 1,
     // With no unpaired rows the profile falls back to the query, which is the
     // single-sequence case and is what AF3 does with an empty MSA.

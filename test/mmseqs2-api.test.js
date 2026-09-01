@@ -133,8 +133,12 @@ describe("MMseqs2 API", () => {
     const pairTar = tar({
       "pair.a3m": ">101\nACDE\n>hit_sp1\nAC-E\n\0>102\nWYWY\n>hit_sp1\nW-WY\n\0",
     });
-    const chainTar = (query, hit) => tar({
-      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n\0`,
+    // Each chain's unpaired block holds its paired hit AGAIN - which is what a
+    // real search returns, both blocks coming from the same databases - and one
+    // hit found only unpaired. AlphaFold drops the first and keeps the second.
+    const chainTar = (query, hit, only) => tar({
+      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n`
+        + (only === undefined ? "" : `>u2\n${only}\n`) + "\0",
       "bfd.mgnify30.metaeuk30.smag30.a3m": `>101\n${query}\n\0`,
     });
     const posted = [];
@@ -152,8 +156,8 @@ describe("MMseqs2 API", () => {
       // The two chain searches come first, then the pair job.
       decompress: async() => {
         downloads += 1;
-        if (downloads === 1) return chainTar("ACDE", "AC-E");
-        if (downloads === 2) return chainTar("WYWY", "W-WY");
+        if (downloads === 1) return chainTar("ACDE", "AC-E", "ACD-");
+        if (downloads === 2) return chainTar("WYWY", "W-WY", "WY-Y");
         return pairTar;
       },
       model: "multimer",
@@ -169,13 +173,26 @@ describe("MMseqs2 API", () => {
     // The paired row carries both chains' hits at once...
     expect(rows[1]).toBe("AC-EW-WY");
     // ...and the unpaired rows follow it, block-diagonal between entities.
-    expect(rows).toContain("AC-E----");
-    expect(rows).toContain("----W-WY");
+    expect(rows).toContain("ACD-----");
+    expect(rows).toContain("----WY-Y");
+    // 🔴 AND THE ROWS THE PAIRED BLOCK ALREADY HAS ARE GONE FROM THE UNPAIRED
+    // ONE. AlphaFold deduplicates per chain before merging
+    // (msa_pairing.deduplicate_unpaired_sequences), and it is not tidiness: the
+    // blocks share one row budget, so a duplicate evicts a sequence that
+    // carried something. Both chains' unpaired blocks held their paired hit.
+    expect(rows.includes("AC-E----")).toBe(false);
+    expect(rows.includes("----W-WY")).toBe(false);
     // The query appears once, not once per block.
     expect(rows.filter((row) => row === "ACDEWYWY").length).toBe(1);
     // AF3 gets them apart, because its profile is over the unpaired block only.
     expect(parseA3m(result.blocks.paired).sequences).toContain("AC-EW-WY");
     expect(parseA3m(result.blocks.unpaired).sequences.includes("AC-EW-WY")).toBe(false);
+    // 🔴 AND THE PROFILE'S BLOCK STILL HAS THE DEDUPLICATED ROWS. AF3 computes
+    // the profile at features.py:543 and deduplicates at :559, so the rows the
+    // dedup removes still counted towards it. Handing the model the shrunken
+    // block for both is a different feature, not a tidier one.
+    expect(parseA3m(result.blocks.unpairedProfile).sequences).toContain("AC-E----");
+    expect(parseA3m(result.blocks.unpairedProfile).sequences).toContain("----W-WY");
   });
 
   it("does not pair a homomer, where one search already speaks for every copy", async() => {
@@ -202,8 +219,12 @@ describe("MMseqs2 API", () => {
     // The monomer has no chain input at all - the +200 offset stands in for one
     // - so a row spanning two chains would claim their residues coevolved.
     const posted = [];
-    const chainTar = (query, hit) => tar({
-      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n\0`,
+    // Each chain's unpaired block holds its paired hit AGAIN - which is what a
+    // real search returns, both blocks coming from the same databases - and one
+    // hit found only unpaired. AlphaFold drops the first and keeps the second.
+    const chainTar = (query, hit, only) => tar({
+      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n`
+        + (only === undefined ? "" : `>u2\n${only}\n`) + "\0",
       "bfd.mgnify30.metaeuk30.smag30.a3m": `>101\n${query}\n\0`,
     });
     let downloads = 0;

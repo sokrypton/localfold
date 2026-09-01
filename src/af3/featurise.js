@@ -316,15 +316,34 @@ export function featuriseProtein(sequence, options = {}) {
   // instead double-counts the query in every column. `unpairedFrom` names where
   // that block starts; 0 means there is no alignment and the profile is the
   // query's own one-hot, which is what AF3 produces for a single sequence.
+  //
+  // 🔴 AND THEY ARE COMPUTED BEFORE DEDUPLICATION, so their rows are not always
+  // the rows of `msa`. AF3 calls get_profile_features on each chain and only
+  // then runs deduplicate_unpaired_sequences, which drops every unpaired row
+  // the paired block already had - rows that still counted towards the profile.
+  // `profileMsa` carries that original block when the caller has one; without
+  // it the slice of `msa` is the same thing, which is every case with no
+  // pairing.
   const unpairedFrom = options.unpairedFrom ?? (extra.length === 0 ? 0 : 1);
-  const profileDepth = Math.max(1, sequences - unpairedFrom);
+  // An empty block is no block: the profile then falls back to the query's own
+  // one-hot through the slice below, which is what AF3 gives a single sequence.
+  const profileRows = (options.profileMsa?.length ?? 0) > 0 ? options.profileMsa : null;
   const profile = new Float32Array(tokens * RESTYPES);
   const deletionMean = new Float32Array(tokens);
-  for (let row = unpairedFrom; row < unpairedFrom + profileDepth; row += 1) {
+  const profileDepth = profileRows === null
+    ? Math.max(1, sequences - unpairedFrom)
+    : Math.max(1, profileRows.length);
+  const codeAt = profileRows === null
+    ? (row, token) => msa[(unpairedFrom + row) * tokens + token]
+    : (row, token) => (profileRows[row] === undefined ? -1 : profileRows[row][token]);
+  const deletionAt = profileRows === null
+    ? (row, token) => deletionMatrix[(unpairedFrom + row) * tokens + token]
+    : (row, token) => (options.profileDeletionMatrix?.[row]?.[token] ?? 0);
+  for (let row = 0; row < profileDepth; row += 1) {
     for (let token = 0; token < tokens; token += 1) {
-      const code = msa[row * tokens + token];
+      const code = codeAt(row, token);
       if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / profileDepth;
-      deletionMean[token] += deletionMatrix[row * tokens + token] / profileDepth;
+      deletionMean[token] += deletionAt(row, token) / profileDepth;
     }
   }
 

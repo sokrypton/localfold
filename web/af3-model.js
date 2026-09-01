@@ -174,6 +174,11 @@ export async function foldAf3(options) {
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,
+    // The profile's rows, which are not the MSA's: AF3 computes the profile
+    // before deduplicating the unpaired block against the paired one and before
+    // cropping either. See af3MsaFromA3m.
+    profileMsa: rows.profileMsa,
+    profileDeletionMatrix: rows.profileDeletionMatrix,
   });
   const share = timeShares(calls, (recycles ?? 0) + 1);
   const started = performance.now();

@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { concatenateA3mBlocks, mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
+import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "./chains.js";
 
 /** How each model wants a complex's per-chain alignments merged. */
@@ -375,7 +375,6 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
       + ` expected ${Object.keys(CHAIN_MERGES).join(", ")}`);
   }
   const chainA3ms = sequences.map((sequence) => bySequence.get(sequence).a3m);
-  const unpaired = merge(chainA3ms);
 
   // 🔴 PAIRING IS FOR DISTINCT SEQUENCES, AND ONLY THEM. AlphaFold decides this
   // the same way - feature_processing sets pair_msa_sequences from
@@ -408,6 +407,19 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   const paired = pairedResult === undefined ? undefined
     : mergeRowAlignedChainA3ms(sequences.map((sequence) => pairedBySequence.get(sequence)));
 
+  // 🔴 AND THE UNPAIRED BLOCK IS DEDUPLICATED AGAINST THE PAIRED ONE FIRST,
+  // per chain, before the merge - which is why the merge happens here and not
+  // above beside the search. AlphaFold's own pipeline does exactly this in
+  // msa_pairing.deduplicate_unpaired_sequences, and it matters because the two
+  // blocks are drawn from the same databases: on the 59-mer homodimer AF3
+  // drops every one of the 32 unpaired rows as a duplicate. The blocks share a
+  // fixed row budget, so a duplicate evicts a sequence that carried something.
+  const unpairedProfile = merge(chainA3ms);
+  const deduplicated = pairedResult === undefined ? chainA3ms
+    : sequences.map((sequence, chain) => deduplicateUnpairedAgainstPaired(
+      chainA3ms[chain], pairedBySequence.get(sequence)));
+  const unpaired = merge(deduplicated);
+
   // What a single-alignment consumer reads: paired rows above unpaired ones,
   // which is the order AlphaFold-Multimer's own merge produces and what
   // ColabFold writes out.
@@ -417,7 +429,10 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
     a3m,
     // ...and the two halves apart, for AF3, whose `msa` is the paired block
     // followed by the unpaired one with a profile computed over the second.
-    blocks: { paired: paired ?? null, unpaired },
+    // `unpairedProfile` is the unpaired block BEFORE deduplication, because
+    // AF3 computes the profile first (features.py:543) and deduplicates after
+    // (:559) - the removed rows still counted towards it.
+    blocks: { paired: paired ?? null, unpaired, unpairedProfile },
     pairedTicket: pairedResult?.ticket,
     pairedDepth: pairedResult?.depth ?? 0,
     // ...the merged text is what the viewer shows; the model takes these, so

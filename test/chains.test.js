@@ -1,6 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  chainIdentity, mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks,
+  chainIdentity, deduplicateUnpairedAgainstPaired,
+  mergeChainA3ms, mergeUnpairedChainA3ms, residueIndexWithChainBreaks,
   splitComplexA3mByChain,
   validatedChainLengths,
 } from "../src/input/chains.js";
@@ -140,5 +141,46 @@ describe("multimer chain identity", () => {
 
   it("refuses chain lengths that do not partition the sequence", () => {
     expect(() => chainIdentity(6, [3, 4])).toThrow(/sum to 7/);
+  });
+});
+
+describe("deduplicating the unpaired block against the paired one", () => {
+  // AlphaFold does this per chain before any merge, in
+  // msa_pairing.deduplicate_unpaired_sequences. Both blocks are drawn from the
+  // same databases, so for a target with good pairing most of the unpaired
+  // block is the paired block again - and the two share one row budget, so a
+  // duplicate evicts a sequence that carried something.
+  const paired = ">query\nACDE\n>sp1\nAC-E\n";
+
+  it("drops unpaired rows the paired block already has", () => {
+    const kept = deduplicateUnpairedAgainstPaired(
+      ">query\nACDE\n>u1\nAC-E\n>u2\nACD-\n", paired);
+    expect(parseA3m(kept).sequences).toEqual(["ACDE", "ACD-"]);
+  });
+
+  it("compares the aligned columns, not the raw row", () => {
+    // 🔴 AF3 hashes the FEATURISED row, and featurisation has already moved the
+    // lowercase insertions into the deletion matrix - so two rows differing
+    // only in their insertions are one row here. Comparing the A3M text keeps
+    // duplicates AlphaFold removes.
+    const kept = deduplicateUnpairedAgainstPaired(">query\nACDE\n>u1\nACw-E\n", paired);
+    expect(parseA3m(kept).depth).toBe(1);
+  });
+
+  it("keeps the query row, because an A3M without one is not an A3M", () => {
+    // 🔴 A REPRESENTATION DETAIL, NOT A DISAGREEMENT WITH AF3. AF3 dedups
+    // arrays and drops the unpaired query, since the paired block already opens
+    // with it; parseA3m rejects a block whose first row is not an ungapped
+    // query. So it stays here and af3MsaFromA3m skips it when there is a paired
+    // block, which lands the same rows in the same order.
+    const kept = deduplicateUnpairedAgainstPaired(">query\nACDE\n>u1\nACD-\n", paired);
+    expect(parseA3m(kept).sequences).toEqual(["ACDE", "ACD-"]);
+  });
+
+  it("is the identity when there is no paired block", () => {
+    // A homomer and the AF2 monomer never pair, and must be left exactly alone.
+    const unpaired = ">query\nACDE\n>u1\nAC-E\n";
+    expect(deduplicateUnpairedAgainstPaired(unpaired, null)).toBe(unpaired);
+    expect(deduplicateUnpairedAgainstPaired(unpaired, undefined)).toBe(unpaired);
   });
 });

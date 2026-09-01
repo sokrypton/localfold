@@ -75,9 +75,10 @@ describe("af3MsaFromA3m", () => {
   });
 
   it("puts the paired block first and the unpaired block after it", () => {
-    // AF3's msa is paired ++ unpaired. The paired block's row 0 is the query,
-    // which featuriseProtein writes, so it contributes only its later rows -
-    // while the unpaired block contributes all of its own, query included.
+    // AF3's msa is paired ++ unpaired. Neither block contributes its own query
+    // row when both are present: featuriseProtein writes row 0 from the
+    // sequence, and AF3's deduplication removes the unpaired copy because a
+    // paired alignment always contains the query.
     const paired = a3m(QUERY, "AAAAAAAAAA");
     const unpaired = a3m(QUERY, "CCCCCCCCCC");
     const rows = af3MsaFromA3m({ paired, unpaired });
@@ -89,13 +90,12 @@ describe("af3MsaFromA3m", () => {
     assert.deepEqual(rows.msa.map((row) => row[0]), [
       AF3_MSA_CODES.A,  // the paired block's query row
       AF3_MSA_CODES.A,  // and its one homolog
-      AF3_MSA_CODES.A,  // the unpaired block's query row
-      AF3_MSA_CODES.C,  // and its homolog
+      AF3_MSA_CODES.C,  // the unpaired block's homolog - its query is the dup
     ]);
     // The profile is over the unpaired block alone: row 0 is the query
     // featuriseProtein writes, rows 1-2 are the paired block, so it starts at 3.
     assert.equal(rows.unpairedFrom, 3);
-    assert.equal(rows.depth, 5);
+    assert.equal(rows.depth, 4);
   });
 
   it("points the profile at the query when there is no alignment at all", () => {
@@ -119,13 +119,13 @@ describe("af3MsaFromA3m", () => {
     assert.equal(rows.depth, 10, "the cap is still the cap");
     // The paired crop is 5 - half of 10 - of which row zero is the query
     // featuriseProtein writes, so four rows come from here. The unpaired crop
-    // is the remaining 5, and it contributes ALL of them including its own
-    // query row, which is the duplicate AF3 keeps.
+    // is the remaining 5, and it spends all five on HOMOLOGS: its own query row
+    // is the duplicate AF3's deduplication removes, and the crop counts rows,
+    // so skipping it moves the end rather than costing a row.
     assert.equal(rows.unpairedFrom, 5);
     assert.deepEqual(rows.msa.map((row) => row[0]), [
       ...Array(4).fill(AF3_MSA_CODES.A),
-      AF3_MSA_CODES.A,  // the unpaired block's query row: QUERY starts with A
-      ...Array(4).fill(AF3_MSA_CODES.C),
+      ...Array(5).fill(AF3_MSA_CODES.C),
     ]);
     // ...so the profile sees five rows, not zero, which is the actual failure.
     assert.equal(rows.depth - rows.unpairedFrom, 5);

@@ -347,3 +347,51 @@ export function splitComplexA3mByChain(a3mText, chainLengths) {
   }
   return results;
 }
+
+/**
+ * Drop unpaired rows whose sequence is already in the paired block.
+ *
+ * AlphaFold does this per chain, before any merge, in
+ * `msa_pairing.deduplicate_unpaired_sequences`: it hashes every row of the
+ * chain's paired MSA and keeps only the unpaired rows that are not among them.
+ * Both AF3 and AlphaFold-Multimer run it, and they run it for the same reason -
+ * the paired and unpaired blocks come from the SAME databases, so for a target
+ * with good pairing most of the unpaired block is the paired block again.
+ *
+ * 🔴 IT IS NOT A TIDINESS PASS, IT IS THE MSA BUDGET. The two blocks split a
+ * fixed number of rows, so a duplicate does not merely add nothing - it evicts
+ * a sequence that would have added something. On the 59-mer homodimer AF3's
+ * own featuriser drops ALL 32 unpaired rows this way and pads the block with
+ * zeros, which is how the discrepancy against our batch was found: we were
+ * sending 32 rows the model had already seen.
+ *
+ * 🔴 THE COMPARISON IS ON THE ALIGNED COLUMNS, NOT THE RAW ROW. AF3 hashes the
+ * featurised integer row, and featurisation has already dropped the lowercase
+ * insertions into the deletion matrix - so two rows that differ only in their
+ * insertions are the same row here. Comparing the raw A3M text instead keeps
+ * duplicates that AlphaFold removes.
+ *
+ * @param {string} unpairedA3m  one chain's unpaired alignment
+ * @param {string | null | undefined} pairedA3m  the same chain's paired one
+ * 🔴 THE QUERY ROW IS THE ONE EXEMPTION, AND IT IS A REPRESENTATION DETAIL.
+ * AF3 deduplicates arrays and drops the unpaired query happily, since the
+ * paired block already opens with it. This function returns an A3M, and an A3M
+ * without an ungapped query row is not one - parseA3m rejects it. So the query
+ * stays here and af3MsaFromA3m skips it when a paired block exists, which
+ * lands the same rows in the same order. Dropping it in both places leaves the
+ * merged MSA one query short; in neither, one query too many.
+ *
+ * @returns {string} the unpaired A3M with duplicated rows removed
+ */
+export function deduplicateUnpairedAgainstPaired(unpairedA3m, pairedA3m) {
+  if (pairedA3m === null || pairedA3m === undefined || pairedA3m === "") return unpairedA3m;
+  const paired = parseA3m(pairedA3m);
+  const unpaired = parseA3m(unpairedA3m);
+  const seen = new Set(paired.sequences);
+  const lines = [];
+  for (let row = 0; row < unpaired.depth; row += 1) {
+    if (row > 0 && seen.has(unpaired.sequences[row])) continue;
+    lines.push(`>${unpaired.descriptions[row]}`, unpaired.rawSequences[row]);
+  }
+  return `${lines.join("\n")}\n`;
+}

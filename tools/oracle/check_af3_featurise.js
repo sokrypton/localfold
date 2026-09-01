@@ -25,7 +25,8 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
-import { mergeChainA3ms, mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
+import { deduplicateUnpairedAgainstPaired, mergeChainA3ms, mergeRowAlignedChainA3ms }
+  from "../../src/input/chains.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dumpPath = process.argv[2] ?? join(ROOT, "af3-6mrr.json");
@@ -67,7 +68,17 @@ const rows = a3mPath === null
   ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
   : af3MsaFromA3m({
     paired: pairedPath === null ? null : asBlock(pairedPath, mergeChainA3ms),
-    unpaired: asBlock(a3mPath, mergeRowAlignedChainA3ms),
+    // 🔴 DEDUPLICATED AGAINST THE PAIRED BLOCK FIRST, PER CHAIN, exactly as
+    // msa_pairing.deduplicate_unpaired_sequences does before AF3 merges
+    // anything. Skipping it sends the model rows the paired block already
+    // carried, and on this dimer that is EVERY unpaired row.
+    unpaired: asBlock(a3mPath, (texts) => mergeRowAlignedChainA3ms(
+      pairedPath === null ? texts
+        : texts.map((text) => deduplicateUnpairedAgainstPaired(
+          text, readFileSync(pairedPath, "utf8"))))),
+    // ...and the profile's rows are the block BEFORE that deduplication, since
+    // AF3 computes the profile first. See af3MsaFromA3m.
+    unpairedProfile: asBlock(a3mPath, mergeRowAlignedChainA3ms),
   }, { maxSequences: Infinity });
 // 🔴 A LIGAND'S CHEMISTRY COMES FROM THE PDB, NOT FROM THE DUMP. The batch
 // carries the conformer AF3 sampled and the element of every atom, but not
@@ -82,6 +93,7 @@ for (const code of ligandCodes) {
 }
 const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
   { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
+    profileMsa: rows.profileMsa, profileDeletionMatrix: rows.profileDeletionMatrix,
     ligands });
 const { tokens, dense } = batch;
 
@@ -190,6 +202,24 @@ exact("deletion_matrix", batch.deletionMatrix,
 exact("profile", batch.profile, input("profile"));
 exact("deletion_mean", batch.deletionMean, input("deletion_mean"));
 console.log(`        the dump carries ${depth} rows; ours has ${batch.sequences}`);
+// 🔴 AND AF3'S REMAINING ROWS ARE PADDING, NOT ALIGNMENT. AF3 pads the MSA to
+// its crop size with zeros and masks them off, so a dump's row count is a
+// buffer size and not a depth - on the 59-mer dimer every unpaired row was a
+// duplicate of a paired one, leaving 33 real rows in a 65-row array. Checking
+// that the tail really is zero is what distinguishes "we correctly have fewer
+// rows" from "we lost rows", which the row count alone cannot.
+// ...but only when this run was given the alignment the dump was made with.
+// Checked without one, our single query row is correct and AF3's other rows are
+// its real MSA, which is not padding and must not be asserted to be zero.
+if (depth > batch.sequences && a3mPath !== null) {
+  const theirs = input("msa");
+  let nonZero = 0;
+  for (let index = batch.sequences * tokens; index < depth * tokens; index += 1) {
+    if (theirs[index] !== 0) nonZero += 1;
+  }
+  report("rows past ours are padding", `${depth - batch.sequences} rows,`
+    + ` ${nonZero} non-zero`, nonZero === 0);
+}
 
 // 🔴 THE CONFORMER CHECK IS ON DISTANCES, NOT COORDINATES. See the note above.
 // The pairs held fixed are not chosen by a distance cutoff - a torsion can fold
