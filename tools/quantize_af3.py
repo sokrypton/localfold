@@ -107,6 +107,15 @@ def main():
     for record in tensors.values():
         shards.setdefault(record["file"], []).append(record)
 
+    # 🔴 THE SHARDS ARE RENAMED, BECAUSE THEY ARE NO LONGER WHAT THEY SAY.
+    # The float32 export writes weights-NN.f32.bin and this used to reuse that
+    # name for its output, so a 265 MiB int5 bundle shipped 26 files each
+    # claiming to be float32. Nothing reads the extension - the manifest carries
+    # the dtype and names the file - so it was a lie that cost nothing and
+    # misinformed everyone who looked.
+    renamed = {name: name.replace(".f32.bin", f".int{BITS}.bin")
+               for name in shards}
+
     kept = quantised = 0
     kept_bytes = quantised_bytes = source_bytes = 0
     for filename, records in sorted(shards.items()):
@@ -127,6 +136,7 @@ def main():
             record["byteOffset"] = cursor
 
             name = next(n for n, r in tensors.items() if r is record)
+            record["file"] = renamed[filename]
             if KEEP_FLOAT32.search(name):
                 payload = np.ascontiguousarray(values, dtype="<f4").tobytes()
                 record["dtype"] = "float32"
@@ -147,7 +157,7 @@ def main():
                 quantised_bytes += len(payload)
             pieces.append(payload)
             cursor += len(payload)
-        (out / filename).write_bytes(b"".join(pieces))
+        (out / renamed[filename]).write_bytes(b"".join(pieces))
 
     manifest["quantisation"] = {
         "scheme": "asymmetric-per-group", "bits": BITS, "group": GROUP,

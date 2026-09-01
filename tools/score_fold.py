@@ -45,6 +45,9 @@ def main():
     parser.add_argument("fold")
     parser.add_argument("--reference", required=True)
     parser.add_argument("--chain", default="A")
+    parser.add_argument("--field", default="pdb",
+                        help="which structure in the result to score:"
+                             " pdb (the sample) or denoisedPdb (the prediction)")
     arguments = parser.parse_args()
 
     text = open(arguments.fold).read()
@@ -52,7 +55,7 @@ def main():
     if start < 0:
         sys.exit(f"{arguments.fold} has no fold result - did the run fail?")
     result = json.loads(text[start:])
-    P = ca_from_text(result["pdb"])
+    P = ca_from_text(result[arguments.field])
     Q = ca_from_file(arguments.reference, arguments.chain)
     if len(P) != len(Q):
         sys.exit(f"{len(P)} predicted CA against {len(Q)} in the reference")

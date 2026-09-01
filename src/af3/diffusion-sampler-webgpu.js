@@ -19,11 +19,18 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
  *   and positionsNoisy
  * @param {object} weights the diffusion head's
  * @param {{steps: number, normal: () => number, onStep?: Function,
- *          gamma0?: number, gammaMin?: number, noiseScale?: number,
- *          stepScale?: number}} options
+ *          stopAfter?: number, gamma0?: number, gammaMin?: number,
+ *          noiseScale?: number, stepScale?: number}} options
  */
 export async function sampleOnGpu(device, input, weights, options) {
   const { steps, normal } = options;
+  // 🔴 THE SCHEDULE'S LENGTH AND THE NUMBER OF DENOISER CALLS ARE NOT THE SAME
+  // THING. `steps` sets the discretisation - level i is noiseSchedule(i/steps),
+  // so a coarse schedule is not a subset of a fine one but a different set of
+  // sigmas. `stopAfter` runs a PREFIX of the schedule and leaves the walk at
+  // high noise, which is only useful if what you read out is `denoised` rather
+  // than the returned sample.
+  const stopAfter = Math.min(options.stopAfter ?? steps, steps);
   const gamma0 = options.gamma0 ?? 0.8;
   const gammaMin = options.gammaMin ?? 1.0;
   const noiseScale = options.noiseScale ?? 1.003;
@@ -38,7 +45,7 @@ export async function sampleOnGpu(device, input, weights, options) {
   }
   let previous = levels[0];
 
-  for (let step = 1; step <= steps; step += 1) {
+  for (let step = 1; step <= stopAfter; step += 1) {
     const level = levels[step];
     positions = randomAugmentation(positions, input.atomMask, atoms, normal);
 

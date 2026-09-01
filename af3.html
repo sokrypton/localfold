@@ -104,15 +104,26 @@ AI Context: AF3 PAGE ENTRY POINT
                             <i class="fa-solid fa-cubes"></i>
                             <span>Fold</span>
                         </button>
-                        <!-- THE ONLY DIAL THAT CHANGES THE TIME. Diffusion is 97%
-                             of a fold and is linear in this number. -->
+                        <!-- THE ONLY DIAL THAT CHANGES THE TIME. Diffusion is
+                             97% of a fold and is linear in this number, and so
+                             is the animation: every step is a frame.
+
+                             🔴 IT STARTS AT 20 BECAUSE BELOW THAT THE SAMPLER
+                             DOES NOT LAND. Measured on 6MRR against the crystal
+                             structure: 40 steps gives 0.67 A and CA-CA 3.73 A,
+                             20 gives 0.97 A and 3.73 A, and 10 gives 5.91 A
+                             with a CA-CA of 8.40 A - a chain that is not
+                             connected. 200 steps gives 0.66 A, which is 0.01 A
+                             for four times the wait, so 40 is the default and
+                             the higher settings are there to be disbelieved. -->
                         <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
                             <label for="steps" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Steps</label>
                             <select id="steps" style="height: 24px; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
-                                <option value="25">25</option>
-                                <option value="50">50</option>
-                                <option value="100">100</option>
-                                <option value="200" selected>200</option>
+                                <option value="20">20</option>
+                                <option value="40" selected>40</option>
+                                <option value="80">80</option>
+                                <option value="160">160</option>
+                                <option value="320">320</option>
                             </select>
                         </div>
                         <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">

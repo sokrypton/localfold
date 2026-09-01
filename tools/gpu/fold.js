@@ -14,7 +14,7 @@
  * the page, because the page has to run what was measured.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
-import { foldBatch } from "../../src/af3/fold.js";
+import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
@@ -140,9 +140,11 @@ export async function main(device, args) {
   let trunkStarted = 0;
   let diffusionStarted = 0;
   const trajectory = [];
+  let lastDenoised = null;
 
   const result = await foldBatch(device, batch, weights, {
-    steps, seed: Number(option(args, "seed", "20260831")),
+    steps, stopAfter: Number(option(args, "truncate", String(steps))),
+    seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {
       if (name === "target-feat") {
         const theirs = dump?.outputs["diffuser/evoformer/__call__:target_feat"];
@@ -170,6 +172,7 @@ export async function main(device, args) {
       }
     },
     onStep: ({ step, noiseLevel, denoised, positions }) => {
+      lastDenoised = denoised;
       // Every frame for a short run, every fourth for a long one - the whole
       // trajectory at 200 steps is 200 * 68 * 24 * 3 floats.
       if (steps <= 60 || step % 4 === 0 || step === steps) {
@@ -203,8 +206,23 @@ export async function main(device, args) {
   const elapsed = (performance.now() - started) / 1000;
   console.log(`total ${elapsed.toFixed(1)} s`);
 
+  // 🔴 THE DENOISED PREDICTION IS NOT THE SAMPLE, and at a coarse schedule they
+  // are not close. `positions` is where the sampler's walk ended; `denoised` is
+  // what the model predicted on the last call. Reported side by side because
+  // the difference between them IS the schedule: with many steps the walk has
+  // been pulled onto the prediction and the two agree, and with few it has not.
+  const denoisedGeometry = backboneGeometry(batch, lastDenoised);
+  console.log(`last denoised  N-CA ${denoisedGeometry.nca.toFixed(2)}`
+    + `   CA-C ${denoisedGeometry.cac.toFixed(2)}`
+    + `   CA-CA ${denoisedGeometry.caca.toFixed(2)} A`
+    + `   gyration ${denoisedGeometry.gyration.toFixed(1)} A`);
+
+  // 🔴 sequence STAYS THE FIRST KEY. tools/score_fold.py finds the result in
+  // this log by searching for `{\n  "sequence"`, so reordering the object
+  // silently makes every score say "did the run fail?".
   return {
     sequence: batch.sequence, tokens: batch.tokens, steps,
+    denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
     meanPlddt: result.meanPlddt,
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
     gyration, seconds: elapsed, pdb: result.pdb, trajectory,

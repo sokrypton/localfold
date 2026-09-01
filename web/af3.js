@@ -15,7 +15,8 @@
  * 🔴 THE STEP COUNT IS THE QUALITY DIAL, AND IT IS THE ONLY HONEST ONE. The
  * trunk is 3.7 s of a 146 s fold at 200 steps; diffusion is the other 97%, and
  * it is linear in the step count. Nothing else on this page changes the time
- * materially.
+ * materially - and since every step is now a frame, the animation is linear in
+ * it too.
  */
 import { featuriseProtein } from "../src/af3/featurise.js";
 import { foldBatch, toPdb, atomName } from "../src/af3/fold.js";
@@ -26,15 +27,6 @@ import { createStructureViewer } from "./viewer.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
-/**
- * How many trajectory frames to keep, whatever the step count.
- *
- * 🔴 EACH ONE COSTS ABOUT 0.6 s OF WALL CLOCK - py2Dmol rebuilds the side-chain
- * atoms of every appended frame - so this is a real trade against the fold
- * itself. Fifty frames added 32 s to a 47 s fold; twenty-four is enough to see
- * the structure settle and costs about half that.
- */
-const TRAJECTORY_FRAMES = 24;
 /** Where the acceptance is remembered, per browser. */
 const ACCEPTED = "localfold.af3.termsAccepted";
 
@@ -216,10 +208,6 @@ export async function fold({ sequence, steps, seed, viewer }) {
   progress(0);
   const started = performance.now();
 
-  // Keep a bounded number of frames whatever the step count - the trajectory at
-  // 200 steps is 200 x 1632 x 3 floats otherwise, and forty frames is already
-  // more than the eye resolves at playback speed.
-  const keepEvery = Math.max(1, Math.round(steps / TRAJECTORY_FRAMES));
   const slots = alphaCarbons(batch);
   let reference = null;
   let shown = 0;
@@ -249,15 +237,21 @@ export async function fold({ sequence, steps, seed, viewer }) {
       // gyration at step 4, 11.1 A at the end - so it is protein-sized in every
       // frame and stays in view. What the animation shows is the prediction
       // being refined, which is the part worth watching.
-      if (step % keepEvery === 0 || step === steps) {
-        if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
-        viewer.push(fittedPdb(batch, denoised, reference, slots, null));
-        shown += 1;
-        // Follow the newest frame while the fold is running, so the panel shows
-        // the structure as it is now rather than parking on frame zero.
-        viewer.show(shown - 1, "diffusion");
-        if (shown === 1) viewer.orient();
-      }
+      //
+      // 🔴 EVERY STEP IS A FRAME. This used to keep a bounded twenty-four of
+      // them, on the grounds that each appended frame costs py2Dmol a
+      // side-chain rebuild - about 0.6 s here - so a long fold paid for frames
+      // nobody would resolve at playback speed. Keeping all of them makes the
+      // animation the trajectory rather than a sample of it, and makes the step
+      // count mean one thing instead of two: at 320 steps it is 320 frames and
+      // the drawing costs about as much as the diffusion.
+      if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
+      viewer.push(fittedPdb(batch, denoised, reference, slots, null));
+      shown += 1;
+      // Follow the newest frame while the fold is running, so the panel shows
+      // the structure as it is now rather than parking on frame zero.
+      viewer.show(shown - 1, "diffusion");
+      if (shown === 1) viewer.orient();
       progress(TRUNK_SHARE + (1 - TRUNK_SHARE) * (step / steps));
       const elapsed = (performance.now() - started) / 1000;
       const remaining = elapsed * (steps / step - 1);
@@ -337,7 +331,7 @@ export function start() {
     try {
       await fold({
         sequence,
-        steps: Number(element("steps")?.value) || 200,
+        steps: Number(element("steps")?.value) || 40,
         seed: Number(element("seed")?.value) || 20260831,
         viewer,
       });

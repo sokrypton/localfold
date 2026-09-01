@@ -244,7 +244,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   };
 
   const positions = await sampleOnGpu(device, headInput, weights.diffusion, {
-    steps, normal: normalFrom(options.seed ?? 20260831),
+    steps, stopAfter: options.stopAfter,
+    normal: normalFrom(options.seed ?? 20260831),
     onStep: options.onStep,
   });
 
