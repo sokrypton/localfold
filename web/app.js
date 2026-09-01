@@ -522,6 +522,32 @@ function orientBestView() {
 }
 
 /**
+ * Hold the viewer on the pLDDT ramp rather than letting `auto` decide.
+ *
+ * 🔴 auto RESOLVES TO rainbow WHEN THERE IS NO CONFIDENCE, and during an AF3
+ * fold there is none - the confidence head does not run until the sample is
+ * finished, so the frames drawn on the way carry a zero B-factor. py2Dmol
+ * reasonably concludes there is nothing to colour by and paints an N-to-C
+ * spectrum, so the animation ran rainbow and snapped to pLDDT at the end.
+ * Pinning the mode makes those frames the low end of the confidence ramp
+ * instead, which is one palette throughout and does not claim a fold is
+ * finished before it is.
+ *
+ * Driven through the app's own colour <select> because that is the supported
+ * path: this build's renderer has no setColor or setColorScheme at all - those
+ * belong to the embed build - and reaching past the control into the colour
+ * arrays is what made an earlier attempt at this silently do nothing.
+ */
+function forcePlddtColours() {
+  const select = viewer?.colorSelect;
+  if (select === undefined || select === null) return;
+  try {
+    select.value = "plddt";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  } catch { /* a palette is not worth losing the structure over */ }
+}
+
+/**
  * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
  *
  * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
@@ -573,7 +599,7 @@ async function foldWithAf3(chains, signal) {
       if (signal.aborted) return;
       if (index === 0) {
         pending = loadIntoViewer({ stem, pdb, scores: { sequence }, length: sequence.length })
-          .then(orientBestView);
+          .then(() => { orientBestView(); forcePlddtColours(); });
         return;
       }
       if (viewer === undefined || viewerObject === undefined) return;
@@ -622,6 +648,7 @@ async function foldWithAf3(chains, signal) {
     viewer.addFrame(frame, viewerObject);
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
+    forcePlddtColours();
     viewer.render("af3-final");
   }
   updateScoresCard(result.confidence, `${mode} · ${calls}`);
