@@ -701,6 +701,18 @@ let searchCache;
 
 let trunkCache;
 
+/**
+ * The last AlphaFold 2 fold's recycle state, so asking for more continues.
+ *
+ * 🔴 AF2 HAS NO SAMPLER, SO CONTINUATION IS THE ONLY SAVING THERE IS. Every
+ * part of an AF2 fold is a recycle - the evoformer stacks run once per pass -
+ * so where AF3 reuses a trunk to make re-sampling cheap, here going from three
+ * recycles to five simply runs two passes instead of six. `recycles` also
+ * carries the earlier passes' results, because the trajectory the page animates
+ * is all of them and a continuation returns only the new ones.
+ */
+let af2Cache;
+
 /** FNV-1a, to key on an alignment without holding a second copy of it. */
 const cheapHash = (text) => {
   let hash = 2166136261;
@@ -1140,16 +1152,43 @@ async function fold(event) {
     // chainAware, and options added to one were not added to the other. Each
     // drift failed silently with a plausible number.
     const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
+    // 🔴 THE KEY IS EVERYTHING A PASS READS, for the reason the AF3 one gives:
+    // a stale state is not a slow fold but a structure for another sequence.
+    // Recycles are absent because more of them is a continuation; the tolerance
+    // is present because it decides when the passes STOP.
+    const af2Key = JSON.stringify({
+      sequence, chainLengths, maxMsaSequences, maxExtraSequences, seed, tolerance,
+      unified, family, alignment: cheapHash(alignmentForDriver),
+    });
+    const af2Cached = af2Cache?.key === af2Key ? af2Cache : undefined;
+    const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
+      ? af2Cached.resumable : undefined;
+    // 🔴 AND THE FRAME EVERY PASS IS SUPERPOSED ONTO COMES BACK WITH IT. The
+    // reference is the FIRST pass's landed structure, and a continuation does
+    // not run pass zero - onRecycle receives the absolute index, so its
+    // `index === 0` branch never fires. Without this the fold is right and its
+    // COORDINATES are somewhere else: measured at 0.0007 A RMSD from the fresh
+    // three-recycle structure after superposition, which is float noise, but a
+    // different file for the same prediction.
+    if (resume !== undefined) firstPassLanded = af2Cached.firstPassLanded;
     const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
       .predictA3m(
         alignmentForDriver, model.weights, model.featureTables,
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          ...regime },
+          resume, ...regime },
         model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
     const final = prediction.final;
-    const alignedRecycles = prediction.recycles.map((r, i) => ({
+    // 🔴 THE EARLIER PASSES COME BACK FOR THE ANIMATION. A continuation returns
+    // only the passes it ran, and the play bar is the whole trajectory - so the
+    // cached ones are put back in front of them. `final` is still the last pass
+    // actually computed, which is the one the page lands on.
+    const allRecycles = resume === undefined
+      ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
+    af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
+      firstPassLanded };
+    const alignedRecycles = allRecycles.map((r, i) => ({
       structure: i === 0 ? (firstPassLanded ?? r.structure) : alignedToFirstPass(sequence, r.structure, firstPassLanded),
       confidence: r.confidence,
       recycleDistance: r.recycleDistance,
@@ -1190,11 +1229,11 @@ async function fold(event) {
     }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
-    updateScoresCard(final.confidence, `Final (Pass ${prediction.recycles.length})`);
+    updateScoresCard(final.confidence, `Final (Pass ${allRecycles.length})`);
     const took = ((performance.now() - started) / 1000).toFixed(1);
 
-    const converged = prediction.recycles.length < passes
-      ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${prediction.recycles.length} passes`
+    const converged = allRecycles.length < passes
+      ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${allRecycles.length} passes`
       : "";
     const finalIptmText = final.confidence.iptm !== undefined ? ` · ipTM ${Number(final.confidence.iptm).toFixed(3)}` : "";
     status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`

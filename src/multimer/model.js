@@ -164,12 +164,22 @@ export class AlphaFoldUnifiedGpu {
       const templateUpdate = template === undefined
         ? undefined : execution.upload("monomer.template-update", template.pairUpdate);
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
-      let previousMsa = execution.upload("monomer.recycle-msa-zero", new Float32Array(length * 256));
-      let previousPair = execution.upload("monomer.recycle-pair-zero", new Float32Array(length * length * 128));
+      // 🔴 A RECYCLE'S STATE IS FOUR THINGS, and `resume` is all four from a
+      // previous run - so asking for more recycles runs the difference rather
+      // than starting again. It is sound because the per-recycle features do
+      // not depend on how many were asked for: a3m-features.js seeds each pass
+      // from `randomSeed ^ hash(recycle + 1)`, so features[k] is the same in a
+      // three-recycle run and a five-recycle one, and a continuation lands on
+      // the structure the longer run would have produced.
+      const resume = recycleOptions.resume;
+      let previousMsa = execution.upload("monomer.recycle-msa-zero",
+        resume?.msa ?? new Float32Array(length * 256));
+      let previousPair = execution.upload("monomer.recycle-pair-zero",
+        resume?.pair ?? new Float32Array(length * length * 128));
       let previousPositions = execution.upload(
-        "monomer.recycle-positions-zero", new Float32Array(length * 37 * 3),
+        "monomer.recycle-positions-zero", resume?.atom37 ?? new Float32Array(length * 37 * 3),
       );
-      let previousAtom37 = new Float32Array(length * 37 * 3);
+      let previousAtom37 = resume?.atom37 ?? new Float32Array(length * 37 * 3);
 
     // 🔴 A WAY TO SEE INSIDE THE TRUNK, for the oracle to bisect against.
     // The trunk is three stages - embedder, extra-MSA stack, main evoformer -
@@ -188,7 +198,11 @@ export class AlphaFoldUnifiedGpu {
     };
 
 
-      for (let recycle = 0; recycle < featuresByRecycle.length; recycle += 1) {
+      // Features are built for every pass and only the outstanding ones run;
+      // indexing by absolute recycle is what keeps a continuation on the same
+      // random stream as the run it continues.
+      const firstRecycle = resume === undefined ? 0 : resume.recycles + 1;
+      for (let recycle = firstRecycle; recycle < featuresByRecycle.length; recycle += 1) {
         throwIfAborted(signal);
         const features = featuresByRecycle[recycle];
         if (features.aatype.length !== length) throw new RangeError("all recycle feature lengths must match");
@@ -322,8 +336,22 @@ export class AlphaFoldUnifiedGpu {
         previousPositions = execution.upload(`monomer.recycle-positions-${recycle}`, structure.atom37);
         previousAtom37 = structure.atom37;
       }
+      // The state the next continuation needs. Read back BEFORE the finally
+      // releases the allocator, and only these two: atom37 is already on the
+      // CPU, and previousPositions is re-uploaded from it.
+      const stateEncoder = encode("recycle-state");
+      const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
+      const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
+      await submit(stateEncoder, "recycle state readback");
+      const resumable = {
+        msa: await execution.mapFloat32(msaReadback),
+        pair: await execution.mapFloat32(pairReadback),
+        atom37: previousAtom37,
+        recycles: firstRecycle + results.length - 1,
+      };
       return {
-        recycles: results, final: results[results.length - 1], elapsedMilliseconds: performance.now() - start,
+        recycles: results, final: results[results.length - 1], resumable,
+        elapsedMilliseconds: performance.now() - start,
       };
     } finally {
       execution.release();
