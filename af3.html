@@ -5,8 +5,8 @@ AI Context: AF3 PAGE ENTRY POINT
 - Folds a protein chain with AlphaFold 3 in the browser: no server, no MSA.
 - The model is src/af3/; this file is only markup. web/af3.js wires it up.
 - Two facts shape the layout: the checkpoint is ~265 MiB (so the download is
-  gated and metered) and a 68-residue fold is minutes (so the diffusion step
-  is reported, and the step count is on the panel rather than buried).
+  metered) and a fold is tens of seconds to minutes (so the step is reported,
+  and the count is on the panel rather than buried).
 -->
 <!DOCTYPE html>
 <html lang="en">
@@ -24,28 +24,6 @@ AI Context: AF3 PAGE ENTRY POINT
             width: 948px !important;
             min-height: 480px !important;
             resize: none !important;
-        }
-
-        #terms-gate {
-            background: #fffbeb;
-            border: 1px solid #fcd34d;
-            border-radius: 8px;
-            padding: 14px 16px;
-            margin-bottom: 10px;
-            font-size: 13px;
-            line-height: 1.55;
-            color: #78350f;
-        }
-
-        #terms-gate h2 {
-            margin: 0 0 6px;
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        #terms-gate ul {
-            margin: 8px 0;
-            padding-left: 18px;
         }
 
         .metrics {
@@ -70,28 +48,6 @@ AI Context: AF3 PAGE ENTRY POINT
 
         <div class="page-head" style="padding-right: 0;">
             <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">AlphaFold 3</span></h1>
-        </div>
-
-        <!-- THE GATE. Nothing is downloaded until this is accepted; web/af3.js
-             remembers the acceptance per browser and never asks the network
-             before it. -->
-        <div id="terms-gate" hidden>
-            <h2>Before the model downloads</h2>
-            <p>
-                This page runs AlphaFold 3 entirely in your browser. Pressing Fold downloads
-                about <b>265 MiB</b> of model parameters to this device and runs them on your GPU.
-                Nothing about your sequence leaves the machine.
-            </p>
-            <ul>
-                <li>The parameters are made available for <b>non-commercial use only</b>, under the
-                    terms of the checkpoint they were converted from.</li>
-                <li>Predictions are not experimental structures. Do not rely on them for clinical,
-                    diagnostic, or safety-critical decisions.</li>
-                <li>A fold takes minutes and will keep your GPU busy for the whole time.</li>
-            </ul>
-            <button id="accept-terms" class="btn btn-primary" type="button" style="height: 30px; font-size: 13px;">
-                I understand — download the model
-            </button>
         </div>
 
         <div id="fold-panel" class="container-box" style="width: 948px; margin-bottom: 10px;">

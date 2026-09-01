@@ -3,12 +3,12 @@
  *
  * Everything that decides the answer lives in src/af3/ - featurise.js builds
  * the batch, fold.js runs the model, weights.js reads the checkpoint. This file
- * is the part that knows about the DOM: a text box, a progress bar, a licence
- * gate and a viewer.
+ * is the part that knows about the DOM: a text box, a progress bar and a
+ * viewer.
  *
  * 🔴 THE WEIGHTS ARE A QUARTER OF A GIGABYTE AND THE FOLD IS MINUTES. Those two
- * facts drive every decision here. The download is gated behind an explicit
- * acceptance and reported byte by byte; the fold reports the diffusion step it
+ * facts drive every decision here. The download is reported byte by byte; the
+ * fold reports the step it
  * is on, because a progress bar that sits at "folding..." for two and a half
  * minutes is indistinguishable from one that has hung.
  *
@@ -28,8 +28,6 @@ import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
-/** Where the acceptance is remembered, per browser. */
-const ACCEPTED = "localfold.af3.termsAccepted";
 
 const element = (id) => document.getElementById(id);
 const text = (id, value) => { const node = element(id); if (node) node.textContent = value; };
@@ -191,25 +189,6 @@ function loadWeights() {
     };
   })();
   return weightsPromise;
-}
-
-/** True once the reader has accepted the model terms in this browser. */
-export function hasAccepted() {
-  try {
-    return localStorage.getItem(ACCEPTED) !== null;
-  } catch {
-    // Private windows and blocked site data throw rather than return null. An
-    // unreadable store means "not accepted", never "accepted".
-    return false;
-  }
-}
-
-function remember() {
-  try {
-    localStorage.setItem(ACCEPTED, new Date().toISOString());
-  } catch {
-    // Nothing to do: the gate simply appears again next time.
-  }
 }
 
 /**
@@ -437,16 +416,6 @@ export function start() {
   applyMode(element("mode")?.value ?? "ramp");
   element("mode")?.addEventListener("change", (event) => applyMode(event.target.value));
 
-  const gate = element("terms-gate");
-  const showGate = (show) => { if (gate) gate.hidden = !show; };
-  showGate(!hasAccepted());
-
-  element("accept-terms")?.addEventListener("click", () => {
-    remember();
-    showGate(false);
-    status("Ready. Paste a sequence and press Fold.");
-  });
-
   let activeFold;
 
   element("predict")?.addEventListener("click", async () => {
@@ -457,7 +426,6 @@ export function start() {
       status("Stopping…");
       return;
     }
-    if (!hasAccepted()) { showGate(true); return; }
     let sequence;
     try {
       sequence = cleanSequence(element("sequence").value);
