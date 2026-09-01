@@ -171,6 +171,9 @@ def main():
     parser.add_argument("--diffusion", type=int, default=None, metavar="STEPS",
                         help="run the diffusion sampler for STEPS steps"
                              " (default: skip it entirely)")
+    parser.add_argument("--a3m", default=None, metavar="PATH",
+                        help="an A3M whose rows become the MSA, instead of the"
+                             " query alone; applied to every chain")
     parser.add_argument("--float32", action="store_true",
                         help="run the trunk in float32 instead of AF3's bfloat16")
     parser.add_argument("--capture-args", default=None, dest="capture_args",
@@ -196,12 +199,22 @@ def main():
     sequence = arguments.sequence
     chains = [chain for chain in sequence.split(":") if chain]
     spec = parse_contigs(":".join(str(len(chain)) for chain in chains)).resolve()
-    batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)), msa_crop_size=8)
+    # 🔴 THE CROP MUST CLEAR THE ALIGNMENT, and num_msa must match it below.
+    # AF3 pads the MSA to msa_crop_size rows and then TRUNCATES to num_msa, so a
+    # crop of 8 over a 32-row alignment silently checks eight rows, and a
+    # num_msa of 1 checks one - in both cases against arrays that look right.
+    alignment = None
+    if arguments.a3m is not None:
+        alignment = pathlib.Path(arguments.a3m).read_text()
+    msa_crop = 8 if alignment is None else 1 + alignment.count(">")
+    batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)),
+                              msa=alignment, msa_crop_size=msa_crop)
     sequence = "".join(chains)
 
     weights = os.path.expanduser(arguments.weights
                                  or WEIGHTS[arguments.model])
-    config = make_config(num_recycles=0, model=arguments.model, num_msa=1,
+    config = make_config(num_recycles=0, model=arguments.model,
+                         num_msa=1 if alignment is None else msa_crop,
                          num_diffusion_samples=1,
                          diffusion_steps=arguments.diffusion)
     # 🔴 AF3'S TRUNK COMPUTES IN BFLOAT16, and that sets the floor on what any

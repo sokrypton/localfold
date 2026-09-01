@@ -8,13 +8,14 @@
  * featuriser, a different checkpoint, a different head, and coordinates that
  * arrive from a sampler rather than a structure module.
  *
- * 🔴 SINGLE SEQUENCE ONLY, SO THE MSA CONTROLS DO NOT APPLY. featurise.js builds
- * a one-row MSA from the query, which is what AF3 is given here - a real
- * alignment would change three arrays in that file and nothing in this one, but
- * it is not wired, and offering the page's alignment controls for an AF3 fold
- * would be offering something that is quietly ignored.
+ * THE ALIGNMENT ARRIVES AS A3M TEXT, exactly as it does for the two AlphaFold 2
+ * models: the page's search, paste and upload controls are shared, and the only
+ * AF3-specific step is af3MsaFromA3m() turning that text into AF3's codes. With
+ * no alignment the MSA is the query alone, which is what AF3 itself produces
+ * for a single-sequence input rather than a stub.
  */
 import { featuriseProtein } from "../src/af3/featurise.js";
+import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
@@ -154,12 +155,25 @@ function timeShares(calls, passes) {
  *
  * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
+ *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
+ *          maxMsaSequences?: number,
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
 export async function foldAf3(options) {
   const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
-  const batch = featuriseProtein(sequence);
+  // 🔴 THE MSA IS BUILT BEFORE THE WEIGHTS ARE TOUCHED, because its depth is a
+  // shape: the MSA stack's pipelines are keyed on the row count, so a fold that
+  // discovers its depth later would compile a second set of them.
+  const alignment = options.alignment ?? null;
+  const rows = alignment === null
+    ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
+    : af3MsaFromA3m(alignment, { maxSequences: options.maxMsaSequences });
+  const batch = featuriseProtein(sequence, {
+    msa: rows.msa,
+    deletionMatrix: rows.deletionMatrix,
+    unpairedFrom: rows.unpairedFrom,
+  });
   const share = timeShares(calls, (recycles ?? 0) + 1);
   const started = performance.now();
 
@@ -252,6 +266,7 @@ export async function foldAf3(options) {
 
   return {
     batch,
+    depth: rows.depth,
     framePdbs,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,

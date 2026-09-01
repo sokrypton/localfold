@@ -59,8 +59,9 @@ function gather(count) {
 
 /**
  * @param {string} sequence one-letter codes; anything unrecognised becomes UNK
- * @param {{msa?: number[][], deletionMatrix?: number[][]}} [options] extra MSA
- *   rows, each already tokenised to AF3 aatypes and the same length as the
+ * @param {{msa?: number[][], deletionMatrix?: number[][], unpairedFrom?: number}}
+ *   [options] extra MSA rows, each already tokenised to AF3 aatypes and the
+ *   same length as the
  *   sequence. The query is always row zero and is prepended here.
  */
 export function featuriseProtein(sequence, options = {}) {
@@ -214,15 +215,25 @@ export function featuriseProtein(sequence, options = {}) {
     }
   }
 
-  // profile: the column-wise restype frequency over the MSA, and deletionMean
-  // its mean deletion count. With the query alone the profile is a one-hot.
+  // profile: the column-wise restype frequency, and deletionMean the mean
+  // deletion count.
+  //
+  // 🔴 THESE ARE NOT AVERAGES OVER THE WHOLE ARRAY ABOVE. AF3 computes them in
+  // its data pipeline, per chain, over the UNPAIRED alignment alone - before
+  // the paired rows are prepended and before the query row joins them. So a
+  // 32-row A3M gives a 33-row `msa` and a profile over 32, and averaging the 33
+  // instead double-counts the query in every column. `unpairedFrom` names where
+  // that block starts; 0 means there is no alignment and the profile is the
+  // query's own one-hot, which is what AF3 produces for a single sequence.
+  const unpairedFrom = options.unpairedFrom ?? (extra.length === 0 ? 0 : 1);
+  const profileDepth = Math.max(1, sequences - unpairedFrom);
   const profile = new Float32Array(tokens * RESTYPES);
   const deletionMean = new Float32Array(tokens);
-  for (let token = 0; token < tokens; token += 1) {
-    for (let row = 0; row < sequences; row += 1) {
+  for (let row = unpairedFrom; row < unpairedFrom + profileDepth; row += 1) {
+    for (let token = 0; token < tokens; token += 1) {
       const code = msa[row * tokens + token];
-      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / sequences;
-      deletionMean[token] += deletionMatrix[row * tokens + token] / sequences;
+      if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / profileDepth;
+      deletionMean[token] += deletionMatrix[row * tokens + token] / profileDepth;
     }
   }
 

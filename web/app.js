@@ -24,7 +24,8 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { splitComplexA3mByChain } from "../src/input/chains.js";
+import { splitComplexA3mByChain, mergeChainA3ms, mergeUnpairedChainA3ms }
+  from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -57,9 +58,15 @@ const maxMsaConfig = () => {
   const select = document.getElementById("max-msa");
   const value = select ? select.value : "512:1024";
   const [msaPart, extraPart] = value.split(":").map((part) => Number(part.trim()));
-  const maxMsaSequences = Number.isFinite(msaPart) && msaPart > 0 ? (msaPart === 512 ? 508 : msaPart) : 508;
+  const requested = Number.isFinite(msaPart) && msaPart > 0 ? msaPart : 512;
+  // 🔴 THE 512 -> 508 IS AlphaFold 2's, AND AF3 MUST NOT INHERIT IT. AF2's
+  // monomer config asks for 512 MSA clusters and then spends four of them on
+  // templates, so a templated model_1 reads 508. AF3 takes no template rows out
+  // of its MSA budget - `num_msa` is the whole of it - so the same dial has to
+  // mean 512 there, and reusing the AF2 number would quietly drop four rows.
+  const maxMsaSequences = requested === 512 ? 508 : requested;
   const maxExtraSequences = Number.isFinite(extraPart) && extraPart >= 0 ? extraPart : 1024;
-  return { maxMsaSequences, maxExtraSequences };
+  return { maxMsaSequences, maxExtraSequences, requested };
 };
 /**
  * Which weights to fold with: monomer, multimer, or let the sequence decide.
@@ -173,7 +180,10 @@ async function alignmentText(chains, signal, family) {
       // paired rows mean what they say. The monomer model has no such input, so
       // paired rows would tell it that residues of different copies coevolved,
       // and it stays with the construction it was trained for.
-      const pairRepeatedChains = family === "multimer";
+      // AF3 is told which chain is which by the same relative encoding, so it
+      // reads paired rows the way multimer does. Only the AF2 monomer, which
+      // has no chain input at all, must stay block-diagonal.
+      const pairRepeatedChains = family === "multimer" || family === "af3";
       const searchOptions = {
         signal,
         pairRepeatedChains,
@@ -187,7 +197,29 @@ async function alignmentText(chains, signal, family) {
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`);
-      return { text: searched.a3m };
+      // 🔴 AF3 WANTS THE TWO BLOCKS APART, and only the search knows them apart.
+      // Its `msa` is the paired block followed by the unpaired one - paired rows
+      // line up across chains so the model can read coevolution BETWEEN them,
+      // unpaired rows are block-diagonal. A merged A3M is only ever the second,
+      // so the merge is handed over alongside rather than instead: `text` is
+      // what the viewer draws and what AF2 folds, `blocks` is what AF3 reads.
+      // 🔴 A PAIRED BLOCK ONLY WHERE PAIRING IS REAL. mergeChainA3ms pairs COPIES
+      // of one sequence - it groups rows by identical query - so for a complex
+      // of distinct chains it emits exactly the block-diagonal alignment
+      // mergeUnpairedChainA3ms does, byte for byte. Handing AF3 both would
+      // duplicate every row, doubling the MSA stack's cost to tell the model
+      // nothing it was not already told. True cross-species pairing between
+      // DIFFERENT sequences needs the MMseqs2 server's pair mode, which this
+      // client does not ask for yet; until it does, a heteromer gets the
+      // unpaired block alone, which is what AF3 does with no paired MSA.
+      const repeated = new Set(chains).size < chains.length;
+      return {
+        text: searched.a3m,
+        blocks: searched.chainA3ms === undefined ? { unpaired: searched.a3m } : {
+          paired: pairRepeatedChains && repeated ? mergeChainA3ms(searched.chainA3ms) : null,
+          unpaired: mergeUnpairedChainA3ms(searched.chainA3ms),
+        },
+      };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);
@@ -475,13 +507,9 @@ function syncModelControls() {
   // `pair += prev_embedding(LayerNorm(recycled pair))`, and the loop driving it
   // is in src/af3/fold.js.
   // The MSA groups belong to syncMode, which hides them whenever the toggle is
-  // off - and it is forced off below for AF3. Setting them here as well would
-  // give one pair of controls two owners that disagree.
-  const toggle = document.getElementById("useMsaToggle");
-  if (toggle !== null) {
-    toggle.disabled = af3;
-    if (af3) toggle.checked = false;
-  }
+  // off. Setting them here as well would give one pair of controls two owners
+  // that disagree - so the alignment controls are not touched here at all, and
+  // they now mean the same thing for all three models.
   if (af3) syncAf3Count();
 }
 
@@ -557,7 +585,7 @@ function forcePlddtColours() {
  * are loaded with none and the final structure is appended carrying the real
  * pLDDT and PAE, and that is the frame the page lands on.
  */
-async function foldWithAf3(chains, signal) {
+async function foldWithAf3(chains, alignment, alignmentBlocks, signal) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -593,8 +621,10 @@ async function foldWithAf3(chains, signal) {
 
   const api = window.py2Dmol;
   let pending = Promise.resolve();
+  const { requested: maxMsaSequences } = maxMsaConfig();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
+    alignment: alignmentBlocks, maxMsaSequences,
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -635,6 +665,8 @@ async function foldWithAf3(chains, signal) {
     await loadIntoViewer({
       stem, pdb: timeline[0],
       scores: confidenceJson(chains.join(""), result.confidence),
+      a3m: alignment,
+      chainLengths: chains.map((chain) => chain.length),
       pae: paeMatrix(result.confidence.predictedAlignedError, residues),
       length: residues, confidence: result.confidence,
     });
@@ -668,6 +700,7 @@ async function foldWithAf3(chains, signal) {
   status(`AlphaFold 3 · ${residues} residues`
     + `${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
     + ` in ${result.seconds.toFixed(0)} s`
+    + `${result.depth > 1 ? ` · ${result.depth} MSA rows` : " · single sequence"}`
     + ` · ${recycles + 1} pass${recycles === 0 ? "" : "es"}`
     + ` · pLDDT ${result.meanPlddt.toFixed(1)}`
     + ` · CA-CA ${result.geometry.caca.toFixed(2)} Å`);
@@ -705,18 +738,14 @@ async function fold(event) {
     let sequence = chains.join("");
     const family = modelFamily(chains.length);
 
-    // 🔴 AlphaFold 3 IS A DIFFERENT MODEL ALL THE WAY DOWN, so it branches here
-    // - before the alignment is fetched, before AF2's weights are chosen, and
-    // before anything below assumes a recycle loop. It shares the sequence box,
-    // the viewer, the status line and the Stop button, and nothing else.
-    if (family === "af3") {
-      await foldWithAf3(chains, signal);
-      return;
-    }
-
     const alignmentResult = await alignmentText(chains, signal, family);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
+    // A pasted or uploaded A3M is one text and cannot be split into blocks; it
+    // becomes the unpaired one, which is what a single alignment means.
+    const alignmentBlocks = typeof alignmentResult === "string"
+      ? { unpaired: alignmentResult }
+      : (alignmentResult?.blocks ?? (alignment === null ? null : { unpaired: alignment }));
     // ...what the model reads. An array means one alignment per chain.
     const alignmentForModel = alignment;
     throwIfAborted(signal);
@@ -735,6 +764,17 @@ async function fold(event) {
       }
     }
     const chainLengths = chains.map((chain) => chain.length);
+
+    // 🔴 AlphaFold 3 IS A DIFFERENT MODEL BELOW THIS LINE, so it branches here -
+    // before AF2's weights are chosen and before anything below assumes a
+    // recycle loop over an evoformer. It branches AFTER the alignment, though,
+    // and that is the point: search, paste and upload, the query-wins rule and
+    // the pairing decision are one implementation for all three models. What
+    // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
+    if (family === "af3") {
+      await foldWithAf3(chains, alignment, alignmentBlocks, signal);
+      return;
+    }
 
     status("Starting WebGPU");
     const device = await getDevice();

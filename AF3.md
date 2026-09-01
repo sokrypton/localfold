@@ -20,6 +20,11 @@ in the Model dropdown.
   walks it down deterministically, ~8 calls. *Diffusion* is AF3's own stochastic
   sampler, 20+ steps. Both are seeded.
 - **Recycles** for AF3 as well as AF2.
+- **MSAs**, through the page's own alignment controls - search, paste or upload,
+  shared with both AlphaFold 2 models. `src/af3/msa-features.js` is the whole of
+  the adapter. On the 59-residue demo sequence a 512-row alignment moves pLDDT
+  55.8 -> 65.7 and costs about 2 s (the MSA stack goes from nothing to 239 ms at
+  512 rows).
 - The trajectory animates as it computes, and the finished structure gets
   py2Dmol's PAE panel and prediction-quality card.
 
@@ -52,6 +57,10 @@ first end-to-end fold ran.
     node tools/gpu-chrome.mjs tools/gpu/fold.js --sequence=GWSTELEK... \
       --mode=flow --steps=8 --recycles=1 --model=/model-af3-int5/manifest.json
     python3 tools/score_fold.py <the log> --reference 6mrr-crystal.pdb
+
+    # The featuriser, including the MSA path, against AF3's own batch.
+    python3 tools/oracle/dump_af3_trunk.py --blocks 0 --a3m rows.a3m --out d.json
+    node tools/oracle/check_af3_featurise.js d.json rows.a3m
 
     node tools/gpu-chrome.mjs tools/gpu/bench-blocks.js   # AF2 vs AF3 per block
     node tools/gpu-chrome.mjs tools/gpu/bench-ab.js --skip=single
@@ -95,6 +104,22 @@ type-checks.
 **Four conditioning weights exist twice in the checkpoint**, `..._1` and
 unsuffixed, identical shapes. Dropping the suffix loads clean and gives the
 wrong `target_feat`.
+
+**AF3's MSA gap is 21, not 31.** The alphabet is 21 protein codes, then the
+gap, then the nucleotides - the gap is in the MIDDLE of the 32-wide one-hot. A
+gap at 31 type-checks, folds, and tells the model every gap is an unknown
+nucleotide. Related and just as quiet: the deletion counts stay RAW, because
+AF3's embedder does the `atan(n/3)` squashing itself, and AF2's featuriser does
+it on the way in.
+
+**AF3's `msa` is two blocks and its `profile` is over one of them.** The array
+the model reads is the paired block followed by the unpaired one; the profile
+and deletion_mean are computed upstream, per chain, over the unpaired block
+ALONE. So a 32-row A3M gives a 33-row `msa` - the query appears twice, because
+an absent paired block becomes the query alone - and a profile over 32. Deriving
+the profile from the array instead double-counts the query in every column, and
+looks completely reasonable. `unpairedFrom` is threaded through featurise.js for
+exactly this.
 
 **AF3 resamples the reference conformer per residue instance** - fixed bond
 lengths and angles, random torsions - so a baked table cannot reproduce a dump.
@@ -148,9 +173,17 @@ unexplained. That is the next lead and it is a small one.
 
 ## Open
 
-- **No MSA for AF3.** `featuriseProtein` already takes extra rows and builds
-  `profile` and `deletion_mean` from them; the page can already fetch an a3m.
-  What is missing is only the adapter from a3m to AF3 aatype rows.
+- **No cross-species pairing for a heteromer.** AF3 reads a paired block and an
+  unpaired one, and the plumbing for both is in place - but the only pairing
+  this repository can produce is between COPIES of one sequence, where one
+  search speaks for every copy. Pairing different sequences by species needs the
+  MMseqs2 server's pair mode, which `src/input/mmseqs2-api.js` does not request
+  (it posts `mode: env|all` only). A heteromer therefore folds against the
+  unpaired block alone. This is the single largest remaining gap for complexes.
+- **The A3M parser is narrower than AF3's alphabet.** `src/input/a3m.js` rejects
+  B, Z, J, O and U, which AF3 maps to D, E, X, X and C. The codes are in
+  `AF3_MSA_CODES` and unreachable through that parser - for AlphaFold 2 too, so
+  widening it is a change to all three models rather than to AF3's path.
 - **No ipTM**, which is what a complex is actually judged by. The confidence
   head emits PAE and PDE; pTM and ipTM are not implemented.
 - **Per-atom conditioning is still on the CPU** - a real gap against AGENTS.md,

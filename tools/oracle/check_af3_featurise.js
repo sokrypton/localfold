@@ -23,6 +23,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
+import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dumpPath = process.argv[2] ?? join(ROOT, "af3-6mrr.json");
@@ -32,7 +33,16 @@ const input = (name) => dump.inputs[name].data;
 // 🔴 THE CHAIN SPLIT IS NOT RECOVERABLE FROM THE JOINED SEQUENCE, which is why
 // the dump records it separately. Feeding a complex as one chain would make
 // every same_chain test true and quietly check nothing.
-const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"));
+// An alignment, when the dump was made with one. The a3m path is checked here
+// rather than in its own file because the arrays it changes - msa, profile and
+// deletion_mean - are three of this file's arrays, and AF3 builds them in the
+// same featuriser call as everything else.
+const a3mPath = process.argv[3] ?? dump.a3m ?? null;
+const rows = a3mPath === null
+  ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
+  : af3MsaFromA3m({ unpaired: readFileSync(a3mPath, "utf8") }, { maxSequences: Infinity });
+const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
+  { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom });
 const { tokens, dense } = batch;
 
 let failures = 0;
@@ -104,12 +114,20 @@ gatherMatches("tokens_to_keys", batch.tokensToKeys, "tokens_to_keys");
 gatherMatches("token_atoms_to_pseudo_beta", batch.tokenAtomsToPseudoBeta,
               "token_atoms_to_pseudo_beta");
 
-console.log("\nMSA (the query alone, matching the dump's num_msa=1)");
+// 🔴 THE WHOLE MSA, NOT JUST ROW ZERO. The gap is at 21 - between the amino
+// acids and the nucleotides, not at the end of the 32-wide one-hot - and every
+// row of a real alignment has gaps in it. Checking row zero alone would pass on
+// an alphabet that puts the gap anywhere at all, because a query row is
+// ungapped by construction. The deletion counts are checked the same way and
+// for the same reason: they are RAW here, and AF3's embedder squashes them.
+console.log(`\nMSA (${rows.depth} row${rows.depth === 1 ? "" : "s"})`);
 const depth = input("msa").length / tokens;
-exact("msa row 0", batch.msa, Array.from(input("msa")).slice(0, tokens));
+exact("msa", batch.msa, Array.from(input("msa")).slice(0, batch.sequences * tokens));
+exact("deletion_matrix", batch.deletionMatrix,
+      Array.from(input("deletion_matrix") ?? []).slice(0, batch.sequences * tokens));
 exact("profile", batch.profile, input("profile"));
 exact("deletion_mean", batch.deletionMean, input("deletion_mean"));
-console.log(`        the dump carries ${depth} rows; the trunk read ${1}`);
+console.log(`        the dump carries ${depth} rows; ours has ${batch.sequences}`);
 
 // 🔴 THE CONFORMER CHECK IS ON DISTANCES, NOT COORDINATES. See the note above.
 // The pairs held fixed are not chosen by a distance cutoff - a torsion can fold
