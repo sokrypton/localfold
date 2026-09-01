@@ -29,6 +29,7 @@
  * 🔴 THE SINGLE TRACK READS THE PAIR AFTER ALL FIVE PAIR UPDATES, not before.
  * Reading it earlier is a plausible-looking reordering that still converges.
  */
+import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
@@ -206,18 +207,37 @@ export class Af3PairformerStackGpu {
         "af3-block.readback-single", n * SINGLE_CHANNELS * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
+      // 🔴 SUBMISSION RUNS AHEAD OF THE DEVICE, ON PURPOSE. Every block used to
+      // submit, await a validation error scope and await an empty queue before
+      // releasing its weights - two full GPU stalls per block, 48 times, so
+      // nothing ever pipelined and a 68-token pairformer took 72 ms a block
+      // where AF2's fatter evoformer block takes about 10. The blocks are now
+      // encoded and submitted back to back; the queue keeps them in order.
+      //
+      // The window exists so the queue does not grow without bound and so an
+      // abort can land, not because the memory needs it.
+      const submissionWindow = options.submissionWindow ?? 8;
+      const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
+        const pending = [];
+        validation.begin();
         await this.#encodeBlock({
-          block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep,
+          block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
+        validation.end(`block ${index}`);
+        for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
+        if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
+          await this.device.queue.onSubmittedWorkDone();
+        }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
         // GPU promise, which is a microtask - so a page that only updates a
         // progress bar here would write it and never paint it. Awaiting lets
         // the caller hand control back to the event loop for a frame.
         await options.onBlock?.(index);
       }
+      await validation.settle();
 
       const encoder = this.device.createCommandEncoder({ label: "af3-block.readback" });
       encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairBytes);
@@ -245,11 +265,16 @@ export class Af3PairformerStackGpu {
     const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
     const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch } = context;
 
-    // 🔴 PER-BLOCK WEIGHTS ARE RELEASED PER BLOCK, not with the stack. Each
-    // block's are about 12 MB; holding all 48 would add ~576 MB to a trunk for
-    // no reason, and it would look like the scratch pool leaking rather than
-    // the weights.
-    const blockAllocations = [];
+    // 🔴 RELEASED IMMEDIATELY, AND THAT IS SAFE BECAUSE THE QUEUE IS ORDERED.
+    // Each block's weights are about 12 MB, so they cannot be held for all 48.
+    // Releasing them used to mean draining the GPU first, on the reasoning that
+    // the allocator RECYCLES memory and reusing a buffer the device is still
+    // reading would be a race. It is not: allocator.upload writes through
+    // device.queue.writeBuffer, which is ordered against previously submitted
+    // work, so the recycled buffer is only overwritten after the commands
+    // reading it have run. This is what AF2's evoformer stack has always done -
+    // see the note there about submission running ahead of the device.
+    const blockAllocations = context.pending;
     const upload = (label, data) => {
       const allocation = this.allocator.upload(label, data, storage);
       blockAllocations.push(allocation);
@@ -272,7 +297,6 @@ export class Af3PairformerStackGpu {
       projection: block.singlePairLogitsProjection,
     }).data);
 
-    this.device.pushErrorScope("validation");
     const encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
       const pass = encoder.beginComputePass({ label });
@@ -314,14 +338,8 @@ export class Af3PairformerStackGpu {
     run("single-transition.add", pipelines.addSingle, [single, singleScratch[0]],
         addSingle[0], addSingle[1]);
 
+    // Submitted, not awaited: the queue keeps the work in order, and the batch
+    // this block belongs to drains once for all of them.
     this.device.queue.submit([encoder.finish()]);
-    const error = await this.device.popErrorScope();
-    // ...and wait for the GPU to finish with them before handing the memory
-    // back, since release recycles rather than merely forgets.
-    await this.device.queue.onSubmittedWorkDone();
-    for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
-      blockAllocations[index].release();
-    }
-    if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
   }
 }
