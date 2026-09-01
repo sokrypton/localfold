@@ -585,6 +585,8 @@ async function foldWithAf3(chains, signal) {
   predictionCount += 1;
   const header = extractFastaHeader(element("sequence").value);
   const stem = header !== null ? safeJobName(header) : `af3_${predictionCount}`;
+  // See the note in the AF2 path: dropping the handle is what stops the
+  // score-card poll refilling from the object still on screen.
   viewer = undefined;
   viewerObject = undefined;
 
@@ -671,6 +673,13 @@ async function fold(event) {
   const { signal } = controller;
   activeFold = controller;
   setFoldButton("running");
+  // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
+  // a mean pLDDT and a pTM for a structure that was no longer being computed,
+  // for as long as the new fold took - which is worse than an empty panel,
+  // because a stale number reads as an answer. The structure itself stays: it
+  // is still the last thing that WAS predicted, and the page is never blank
+  // between folds.
+  updateScoresCard(undefined);
   try {
     const entered = sequenceValue();
     const enteredProblem = complexSequenceProblem(entered);
@@ -753,6 +762,11 @@ async function fold(event) {
 
     // ...a new run draws afresh: the old object stays until the first pass of
     // this one lands, so the page is never blank between folds.
+    //
+    // 🔴 AND DROPPING THE HANDLE IS WHAT KEEPS THE CARD EMPTY. A setInterval
+    // watches the drawn frame and refills the card from it whenever the index
+    // moves, so hiding it once is not enough while the previous object is still
+    // animating - that poll returns early on a missing viewer.
     viewer = undefined;
     viewerObject = undefined;
     status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
