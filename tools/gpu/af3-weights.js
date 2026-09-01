@@ -20,8 +20,92 @@ const CONFIDENCE_STACK = `${CONFIDENCE}/__layer_stack_no_per_layer/confidence_pa
 const TEMPLATE_STACK =
   `${TEMPLATE_SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
 
-export async function openAf3Store(manifest = MANIFEST) {
-  return HttpTensorStore.open(manifest);
+/**
+ * Quantise-dequantise a tensor in place, so the model runs at a storage
+ * precision without needing a packed format or new kernels yet.
+ *
+ * 🔴 THIS MEASURES ACCURACY, NOT SIZE. The values come back as float32, so
+ * nothing gets smaller here - what it answers is whether a scheme is USABLE,
+ * which is the question that has to be settled before packing anything.
+ *
+ * @param {"sym"|"asym"} mode asymmetric carries a zero point per group
+ * @param {number} bits
+ * @param {number} group weights sharing one scale
+ * @param {boolean} search pick each group's range to minimise its error rather
+ *   than taking it from the extremes
+ */
+export function quantiseInPlace(values, { bits, group, mode = "asym", search = false }) {
+  // 🔴 SYMMETRIC CODES ARE SIGNED AND ASYMMETRIC ONES ARE NOT. Clamping a
+  // symmetric code to [0, levels] zeroes every negative weight - half of them -
+  // which does not crash, does not NaN, and folds a protein into a hairball.
+  // It showed up as the trunk disagreeing with AF3 by relRMS 20.
+  const levels = mode === "sym" ? (1 << (bits - 1)) - 1 : (1 << bits) - 1;
+  const lowest = mode === "sym" ? -levels - 1 : 0;
+  const clips = search ? [0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0] : [1.0];
+  for (let start = 0; start < values.length; start += group) {
+    const end = Math.min(start + group, values.length);
+    let low = Infinity;
+    let high = -Infinity;
+    for (let i = start; i < end; i += 1) {
+      if (values[i] < low) low = values[i];
+      if (values[i] > high) high = values[i];
+    }
+    let bestError = Infinity;
+    let bestScale = 0;
+    let bestZero = 0;
+    for (const clip of clips) {
+      let scale;
+      let zero;
+      if (mode === "sym") {
+        const extent = Math.max(Math.abs(low), Math.abs(high)) * clip;
+        scale = extent / levels;
+        zero = 0;
+      } else {
+        const mid = (high + low) / 2;
+        const half = ((high - low) / 2) * clip;
+        scale = (2 * half) / levels;
+        zero = mid - half;
+      }
+      if (scale === 0) { scale = 1; }
+      let error = 0;
+      for (let i = start; i < end; i += 1) {
+        const q = Math.max(lowest, Math.min(levels, Math.round((values[i] - zero) / scale)));
+        const d = q * scale + zero - values[i];
+        error += d * d;
+      }
+      if (error < bestError) { bestError = error; bestScale = scale; bestZero = zero; }
+    }
+    for (let i = start; i < end; i += 1) {
+      const q = Math.max(lowest, Math.min(levels, Math.round((values[i] - bestZero) / bestScale)));
+      values[i] = q * bestScale + bestZero;
+    }
+  }
+  return values;
+}
+
+/**
+ * 🔴 NORMS, OFFSETS AND BIASES STAY FLOAT32. They are a fraction of a percent
+ * of the parameters and the worst possible thing to group-quantise: a 128-wide
+ * LayerNorm scale is two groups, so two scales carry the whole tensor, and that
+ * tensor's whole job is to set the scale of what follows.
+ */
+const KEEP_FLOAT32 = /\/(scale|offset|bias)$|_bias$|_weight$|\/output_b$/;
+
+export async function openAf3Store(manifest = MANIFEST, quant = null) {
+  const store = await HttpTensorStore.open(manifest);
+  if (quant === null) return store;
+  const cache = new Map();
+  const original = store.tensor.bind(store);
+  store.tensor = async (name) => {
+    if (cache.has(name)) return cache.get(name);
+    const values = await original(name);
+    const output = KEEP_FLOAT32.test(name)
+      ? values
+      : quantiseInPlace(Float32Array.from(values), quant);
+    cache.set(name, output);
+    return output;
+  };
+  return store;
 }
 
 /** One tensor, whole. */

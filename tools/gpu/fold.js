@@ -118,7 +118,23 @@ export async function main(device, args) {
   console.log(`${dump.sequence.length} residues, ${tokens} tokens,`
     + ` ${subsets} atom subsets, ${blocks} pairformer blocks, ${steps} diffusion steps`);
 
-  const store = await openAf3Store();
+  // --quant=int5:g32:asym[:search] round-trips every learned weight through a
+  // storage precision before the fold, so the cost is measured in ANGSTROMS
+  // rather than in weight error.
+  const quantSpec = option(args, "quant", "");
+  const quant = quantSpec === "" ? null : (() => {
+    const [bitsField, groupField, mode, search] = quantSpec.split(":");
+    return { bits: Number(bitsField.replace("int", "")),
+             group: Number(groupField.replace("g", "")),
+             mode: mode ?? "asym", search: search === "search" };
+  })();
+  if (quant) {
+    console.log(`quantised: int${quant.bits} group ${quant.group} ${quant.mode}`
+      + `${quant.search ? " with range search" : ""}`
+      + `   ${(quant.bits + (quant.mode === "sym" ? 16 : 32) / quant.group).toFixed(2)}`
+      + ` bits/weight`);
+  }
+  const store = await openAf3Store(undefined, quant);
   const weights = await trunkWeights(store, blocks, 4);
   const diffusion = await diffusionWeights(store);
   const confidence = await confidenceWeights(store);
@@ -198,11 +214,18 @@ export async function main(device, args) {
   const diffusionStarted = performance.now();
   const positions = await sampleOnGpu(device, headInput, diffusion, {
     steps, normal,
-    onStep: ({ step, noiseLevel, denoised }) => {
+    onStep: ({ step, noiseLevel, denoised, positions: walk }) => {
       // Every frame for a short run, every fourth for a long one - the whole
       // trajectory at 200 steps is 200 * 68 * 24 * 3 floats.
       if (steps <= 60 || step % 4 === 0 || step === steps) {
-        trajectory.push({ step, noiseLevel, positions: Array.from(denoised) });
+        // 🔴 BOTH TRACKS. `denoised` is the model's running guess and it is
+        // already within about 1 A of the final structure at step ONE - the
+        // trunk decides the fold and diffusion refines it. `positions` is the
+        // actual trajectory, which starts as a cloud thousands of angstroms
+        // across. Only the second one looks like folding.
+        trajectory.push({ step, noiseLevel,
+                          denoised: Array.from(denoised),
+                          positions: Array.from(walk) });
       }
       if (step === 1 || step % Math.ceil(steps / 5) === 0 || step === steps) {
         console.log(`  step ${String(step).padStart(3)}/${steps}  sigma`
