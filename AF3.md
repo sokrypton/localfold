@@ -387,3 +387,52 @@ read from the checkpoint - and none of those are implemented or verified here.
 
 int5 costs nothing measurable: 1405 MiB -> 265 MiB, and 6MRR folds to 0.66 A
 against float32's 0.69, which is the spread between diffusion seeds.
+
+## Open: the side chains are compressed, and it is ours
+
+Reported from the page: side chains badly placed and rings wrong, at any
+number of steps. Measured by `tools/gpu/probe-sidechains.js` against the
+reference conformers' own rigid tables, and then against AF3's own 200-step
+sample of the same 59-mer:
+
+|              | bond ratio | 1-3 ratio | PHE50 ring bonds |
+|--------------|-----------|-----------|------------------|
+| AF3 itself   | 1.017     | 1.015     | 1.407 1.404 1.404 1.405 1.409 1.408 |
+| this port    | 0.927     | 0.908     | 1.122 1.099 1.287 1.198 1.164 1.303 |
+
+AF3 gives a textbook benzene ring; this port gives one about 8% compressed
+and 18% irregular *within a single ring*. Not a scale factor, and not
+under-convergence - 160 diffusion steps score 0.226 mean error against
+flow-8's 0.206. Glycine (backbone alone) is nearly right at 0.078 and the
+error grows with distance from the backbone.
+
+**Already ruled out.** Not atom labelling: the probe matches pairs by NAME
+out of the batch's own `ref_atom_name_chars`, and check_af3_featurise.js
+proves those names and every gather exact against AF3. Not the conformer
+input: the table reproduces its own rigid distances to 1.5e-4 A. Not the
+featuriser: folding AF3's OWN batch from the dump gives the same pLDDT and
+the same backbone.
+
+**Why nothing caught it.** `check-af3-diffusion-head.js` and its neighbours
+are pinned to `af3-oracle-atom-f32.json`, which is `GSMKQIEDKIEE` - twelve
+residues with no F, Y, W, H or P, longest side chain a lysine. Every
+ring-bearing residue is untested. The featurise checkers had the same fault
+against the same class of toy dump.
+
+**Where to resume.** `tools/gpu/fold.js --dump=` now runs on a real dump
+(it was missing `sequences` and `asymId`, and the trunk comparison did not
+know that a recycled dump names its captures `pair#0..#3`). On AF3's own
+batch with matching recycles:
+
+    node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/af3-sample200.json \
+      --steps=200 --recycles=3
+    pair   vs AF3  relRMS 3.69e-2      single vs AF3  relRMS 1.71e-2
+
+which is near the 2.7e-2 the conformer difference is worth, so the trunk is
+roughly right and the diffusion head is the suspect. The next step is a
+dump with the atom-level captures for a sequence that HAS rings - the
+existing atom dump has none - and then check-af3-atom-decoder.js and
+check-af3-diffusion-head.js against it. Regenerate with:
+
+    python3 tools/oracle/dump_af3_trunk.py --blocks 48 --recycles 3 \
+      --diffusion 200 --sequence <a sequence with F Y W H P> --out af3-rings.json

@@ -67,6 +67,18 @@ function batchFromDump(dump) {
     aatype: ints(raw("aatype")), profile: floats(raw("profile")),
     deletionMean: floats(raw("deletion_mean")),
     msa: ints(raw("msa")), msaMask: floats(raw("msa_mask")),
+    // 🔴 THE ROW COUNT IS A SHAPE, AND THE DUMP IS THE ONLY PLACE IT IS WRITTEN
+    // DOWN. AF3 pads its msa array to the crop size and records how many rows
+    // are real in `numMsa`, so deriving it from the array's length reads the
+    // padding as alignment. Absent, the trunk's shader was built with
+    // `const SEQUENCES: u32 = undefinedu;` and the fold died in WGSL parsing -
+    // which is a shape bug wearing a compiler error.
+    sequences: dump.numMsa ?? 1,
+    // ...and the chain identity, which the confidence head's ipTM reduction
+    // indexes directly. Absent, it threw inside reduceTmScore AFTER the whole
+    // fold had run, which is the most expensive place to discover a missing
+    // field.
+    asymId: ints(raw("asym_id")),
     deletionMatrix: floats(raw("deletion_matrix")),
     seqMask: floats(raw("seq_mask")),
     refPos: floats(raw("ref_pos")), refMask,
@@ -196,8 +208,18 @@ export async function main(device, args) {
         // Against AF3's own trunk. Only meaningful on AF3's own batch: from a
         // sequence the reference conformers differ, which is worth about
         // 2.7e-2 on pair and 0.01 A of structure.
-        const pair = dump?.outputs["diffuser/evoformer/__call__:pair"];
-        const single = dump?.outputs["diffuser/evoformer/__call__:single"];
+        // 🔴 A RECYCLED DUMP NAMES ITS CAPTURES PER PASS. With --recycles the
+        // evoformer is called once per pass and each capture gets a `#n`, so
+        // the bare name matches nothing and the comparison silently does not
+        // run - the report simply omits the two lines it exists to print. The
+        // LAST pass is the one whose output reaches the diffusion head.
+        const lastCapture = (base) => dump?.outputs[base]
+          ?? Object.keys(dump?.outputs ?? {})
+            .filter((key) => key.startsWith(`${base}#`))
+            .sort((a, b) => Number(a.split("#")[1]) - Number(b.split("#")[1]))
+            .map((key) => dump.outputs[key]).pop();
+        const pair = lastCapture("diffuser/evoformer/__call__:pair");
+        const single = lastCapture("diffuser/evoformer/__call__:single");
         if (pair && blocks === 48) {
           console.log(`pair   vs AF3  relRMS`
             + ` ${relativeRms(detail.trunk.pair, floats(pair.data)).toExponential(2)}`);
