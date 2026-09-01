@@ -6,6 +6,7 @@ import {
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { throwIfAborted, withAbort } from "../runtime/abort.js";
+import { yieldToBrowser } from "../runtime/yield.js";
 
 /**
  * @typedef {object} ConfidenceResult
@@ -215,7 +216,7 @@ export class ConfidenceHeadsGpu {
       // One macrotask costs about a millisecond and lets the bar show where it
       // actually is before the thread is taken.
       onStage?.("scoring");
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await yieldToBrowser();
       const tmScores = computeTmScores(paeLogitValues, length, breaks, chainLengths);
       return {
         lddtLogits: lddtLogitValues, plddt,

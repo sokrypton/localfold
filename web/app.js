@@ -965,7 +965,16 @@ async function fold(event) {
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");
-    else status(error instanceof Error ? error.message : String(error), true);
+    else {
+      // 🔴 THE STACK GOES TO THE CONSOLE, ALWAYS. The status line gets the
+      // message because that is what a reader can act on, but a message alone
+      // ("Cannot read properties of undefined") names neither the file nor the
+      // line, and this catch is wide enough to cover the search, the model and
+      // the handoff to the viewer. Swallowing the stack turns a five-minute
+      // diagnosis into a bisect.
+      console.error("fold failed", error);
+      status(error instanceof Error ? error.message : String(error), true);
+    }
   } finally {
     if (activeFold === controller) activeFold = undefined;
     setFoldButton("idle");

@@ -23,6 +23,7 @@ import { diffusionWeights, atomReference, targetFeatureWeights }
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
+import { yieldToBrowser } from "../src/runtime/yield.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 
@@ -197,19 +198,19 @@ export async function foldAf3(options) {
         onStatus(`Building input features for ${batch.atomCount} atoms…`);
         // The yield is the point: what follows blocks the main thread for
         // seconds, so the line above has to be painted before it starts.
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await yieldToBrowser();
       }
       if (name === "target-feat") {
         onProgress(share.features);
         onStatus(`Running the trunk over ${batch.tokens} tokens…`);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await yieldToBrowser();
       }
       if (name === "pairformer-block") {
         // 🔴 THIS ONE IS THE YIELD, NOT THE REPORT. It fires when a block is
         // ENCODED, and sixteen are encoded in the time the device takes over
         // one - so it is awaited (a real macrotask, so the page can paint) and
         // says nothing. `pairformer-block-done` below is what it paints.
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await yieldToBrowser();
       }
       if (name === "pairformer-block-done") {
         // Each recycle is another whole trunk, so the trunk band is divided
@@ -245,7 +246,7 @@ export async function foldAf3(options) {
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task
       // boundary the status above is written and never drawn.
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await yieldToBrowser();
     },
   });
 
