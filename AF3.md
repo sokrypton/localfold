@@ -220,6 +220,12 @@ signal the paired block exists to carry.
 It took 88 s for that pair, against about the same for the unpaired searches
 that run alongside it. A homomer skips this entirely.
 
+End to end through the page, AlphaFold-Multimer on those two chains at three
+recycles: **pLDDT 96.5, pTM 0.907, ipTM 0.897** in 684 s. ipTM is the number
+that matters and the one pairing is for - a confident INTERFACE needs
+cross-chain coevolution, which is precisely what the paired block carries and
+what a heteromer folded without until now.
+
 ## The weights
 
 🔴 **`model-af3-int5` is DeepMind's AlphaFold 3, not OpenFold3.** Every manifest
