@@ -29,7 +29,10 @@ const dumpPath = process.argv[2] ?? join(ROOT, "af3-6mrr.json");
 const dump = JSON.parse(readFileSync(dumpPath, "utf8"));
 const input = (name) => dump.inputs[name].data;
 
-const batch = featuriseProtein(dump.sequence);
+// 🔴 THE CHAIN SPLIT IS NOT RECOVERABLE FROM THE JOINED SEQUENCE, which is why
+// the dump records it separately. Feeding a complex as one chain would make
+// every same_chain test true and quietly check nothing.
+const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"));
 const { tokens, dense } = batch;
 
 let failures = 0;
@@ -71,8 +74,9 @@ function gatherMatches(name, ours, prefix) {
   exact(`${name} indices`, mine, yours);
 }
 
-console.log(`${dump.sequence.length} residues, ${tokens} tokens,`
-  + ` ${batch.atomCount} atoms, ${batch.subsets} subsets\n`);
+console.log(`${dump.sequence.length} residues in ${batch.chainLengths.length} chain`
+  + `${batch.chainLengths.length === 1 ? "" : "s"} (${batch.chainLengths.join(", ")}),`
+  + ` ${tokens} tokens, ${batch.atomCount} atoms, ${batch.subsets} subsets\n`);
 
 console.log("tokenisation and identity");
 exact("aatype", batch.aatype, input("aatype"));
@@ -127,10 +131,13 @@ const RIGID_TOLERANCE = 0.3;
 let worst = 0;
 let worstAt = "";
 let checked = 0;
+const chainEnds = new Set();
+let edge = -1;
+for (const length of batch.chainLengths) { edge += length; chainEnds.add(edge); }
 for (let token = 0; token < tokens; token += 1) {
   const code = dump.sequence[token];
   const entry = REFERENCE_CONFORMERS[code] ?? REFERENCE_CONFORMERS.X;
-  const atoms = token === tokens - 1 ? entry.cTerminal : entry.internal;
+  const atoms = chainEnds.has(token) ? entry.cTerminal : entry.internal;
   for (const [i, j] of entry.rigid) {
     const a = token * dense + atoms[i][0];
     const b = token * dense + atoms[j][0];

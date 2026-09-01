@@ -158,8 +158,8 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    quietly ignored. -->
               <div class="fetch-option-group" id="af3ModeGroup" hidden>
                 <span class="fetch-option-title">Sampler</span>
-                <select id="af3-mode" title="Ramp: deterministic, one structure, ~8 calls. Diffusion: AF3's sampler, seeded, an ensemble across seeds.">
-                  <option value="ramp" selected>Ramp</option>
+                <select id="af3-mode" title="Flow: one draw at the top of the schedule, then a deterministic walk down it - about 8 calls. Diffusion: AF3's own sampler, noise injected at every step.">
+                  <option value="flow" selected>Flow</option>
                   <option value="diffusion">Diffusion</option>
                 </select>
               </div>

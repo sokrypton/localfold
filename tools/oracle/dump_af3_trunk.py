@@ -189,9 +189,15 @@ def main():
     # nowhere near the parser that accepted it.
     sys.argv = sys.argv[:1]
 
+    # 🔴 A COLON SEPARATES CHAINS, here and in parse_contigs. A complex is the
+    # only way to exercise the relative encoding's same_chain / same_entity /
+    # sym_id branches at all - on a monomer every pair is same-chain, so those
+    # paths run in no check that uses one.
     sequence = arguments.sequence
-    spec = parse_contigs(str(len(sequence))).resolve()
-    batch = f3.featurise_spec(spec, sequences={0: sequence}, msa_crop_size=8)
+    chains = [chain for chain in sequence.split(":") if chain]
+    spec = parse_contigs(":".join(str(len(chain)) for chain in chains)).resolve()
+    batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)), msa_crop_size=8)
+    sequence = "".join(chains)
 
     weights = os.path.expanduser(arguments.weights
                                  or WEIGHTS[arguments.model])
@@ -264,6 +270,9 @@ def main():
     path.write_text(json.dumps({
         "model": arguments.model,
         "sequence": sequence,
+        # The chains, kept separately: `sequence` is joined so a consumer can
+        # index it by token, and the split is not recoverable from that.
+        "chains": chains,
         "tokens": int(np.asarray(batch["aatype"]).shape[-1]),
         "pairformerBlocks": blocks,
         "inputs": inputs,

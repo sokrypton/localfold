@@ -487,8 +487,8 @@ function syncModelControls() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const mode = document.getElementById("af3-mode")?.value ?? "ramp";
-  const { label, values, preferred } = AF3_COUNTS[mode] ?? AF3_COUNTS.ramp;
+  const mode = document.getElementById("af3-mode")?.value ?? "flow";
+  const { label, values, preferred } = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
@@ -558,14 +558,15 @@ function forcePlddtColours() {
  * pLDDT and PAE, and that is the frame the page lands on.
  */
 async function foldWithAf3(chains, signal) {
-  if (chains.length > 1) {
-    throw new Error("AlphaFold 3 here folds a single chain; remove the ':' or choose AF2-multi.");
-  }
-  const sequence = chains[0] ?? "";
-  const problem = af3SequenceProblem(sequence);
+  const sequence = chains.join(":");
+  // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
+  // can see the chain split; every length below is the residue count, and a PAE
+  // matrix sized from the wrong one is silently the wrong shape.
+  const residues = chains.join("").length;
+  const problem = af3SequenceProblem(chains.join(""));
   if (problem !== null) throw new Error(problem);
 
-  const mode = document.getElementById("af3-mode")?.value ?? "ramp";
+  const mode = document.getElementById("af3-mode")?.value ?? "flow";
   const calls = Number(document.getElementById("af3-count")?.value)
     || AF3_COUNTS[mode].preferred;
   const recycles = recycleCount();
@@ -594,13 +595,15 @@ async function foldWithAf3(chains, signal) {
   let pending = Promise.resolve();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    seed: mode === "diffusion" ? randomSeed() : 0,
+    // Both modes are seeded now: the flow draws its starting positions once at
+    // the top of the schedule.
+    seed: randomSeed(),
     onStatus: (text) => { if (!signal.aborted) status(text); },
     onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
     onFrame: (pdb, index) => {
       if (signal.aborted) return;
       if (index === 0) {
-        pending = loadIntoViewer({ stem, pdb, scores: { sequence }, length: sequence.length })
+        pending = loadIntoViewer({ stem, pdb, scores: { sequence: chains.join("") }, length: residues })
           .then(() => { orientBestView(); forcePlddtColours(); });
         return;
       }
@@ -625,9 +628,9 @@ async function foldWithAf3(chains, signal) {
     const camera = { ...viewer.viewerState };
     await loadIntoViewer({
       stem, pdb: result.framePdbs[0],
-      scores: confidenceJson(sequence, result.confidence),
-      pae: paeMatrix(result.confidence.predictedAlignedError, sequence.length),
-      length: sequence.length, confidence: result.confidence,
+      scores: confidenceJson(chains.join(""), result.confidence),
+      pae: paeMatrix(result.confidence.predictedAlignedError, residues),
+      length: residues, confidence: result.confidence,
     });
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
@@ -645,8 +648,8 @@ async function foldWithAf3(chains, signal) {
     const frame = api.frameFromText(result.pdb);
     frame.name = frame.label = frame.title = "final";
     frame.confidence = result.confidence;
-    frame.pae = paeMatrix(result.confidence.predictedAlignedError, sequence.length);
-    frame.pae_n = sequence.length;
+    frame.pae = paeMatrix(result.confidence.predictedAlignedError, residues);
+    frame.pae_n = residues;
     viewer.addFrame(frame, viewerObject);
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
@@ -655,7 +658,9 @@ async function foldWithAf3(chains, signal) {
   }
   updateScoresCard(result.confidence, `${mode} · ${calls}`);
   progress(null);
-  status(`AlphaFold 3 · ${sequence.length} residues in ${result.seconds.toFixed(0)} s`
+  status(`AlphaFold 3 · ${residues} residues`
+    + `${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
+    + ` in ${result.seconds.toFixed(0)} s`
     + ` · ${recycles + 1} pass${recycles === 0 ? "" : "es"}`
     + ` · pLDDT ${result.meanPlddt.toFixed(1)}`
     + ` · CA-CA ${result.geometry.caca.toFixed(2)} Å`);

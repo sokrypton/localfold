@@ -75,25 +75,37 @@ export async function sampleOnGpu(device, input, weights, options) {
 }
 
 /**
- * The same denoiser, run as a structure module: no noise anywhere.
+ * The same denoiser, walked down the schedule deterministically: a flow.
  *
- * Start every atom at the origin, walk sigma down the schedule, and feed each
- * output back in as the next input. No Gaussian initialisation, no churn, no
- * random augmentation - nothing is drawn.
+ * Draw the starting positions at the top of the schedule, walk sigma down, and
+ * feed each output back in as the next input. No churn, no random augmentation
+ * and no noise injected between steps - the ONLY randomness is where it
+ * started, which is what makes this a flow rather than a sampler and what lets
+ * a seed name a structure.
  *
  * WHY IT WORKS AT ALL. AF3 returns skip * input + out * update, with
  * skip = sigma_d^2/(sigma^2+sigma_d^2), which is 3.9e-5 at the top of the
- * schedule. So the first call discards its input entirely and predicts the
- * structure from the trunk - a black hole is a perfectly good member of "this
- * input is noise, ignore it". Each later call is handed a better structure at a
+ * schedule. So the first call all but discards its input and predicts the
+ * structure from the trunk. Each later call is handed a better structure at a
  * lower sigma, which is exactly the claim the Fourier noise embedding makes
  * about it.
  *
+ * 🔴 IT STARTS FROM NOISE RATHER THAN FROM ZEROS, AND THE DIFFERENCE IS NOT
+ * ONLY DIVERSITY. Measured on one denoiser call at sigma 2560, a black hole
+ * gives 1.39 A and Gaussian noise gives 1.15 A - and from zeros the bond
+ * lengths come back at 73-87% of ideal, the signature of a conditional mean.
+ * With nothing to break the symmetry the network averages over the posterior,
+ * and averaging shrinks distances. Noise breaks it, and it also means a seed
+ * names a structure and repeated folds give an ensemble.
+ *
  * WHAT IT COSTS AND SAVES, measured against the 200-step stochastic sampler:
  *
- *     6MRR   ramp 8 calls  0.69 A  TM 0.951   sampler 200  0.66 A  TM 0.953
- *     1QYS   ramp 8 calls  0.86 A  TM 0.947   sampler 200  0.93-1.12 A over
+ *     6MRR   flow 8 calls  0.69 A  TM 0.951   sampler 200  0.66 A  TM 0.953
+ *     1QYS   flow 8 calls  0.86 A  TM 0.947   sampler 200  0.93-1.12 A over
  *                                             four seeds, TM 0.916-0.941
+ *
+ * (those numbers were measured from zeros; the seeded start is checked below
+ *  them in the commit that introduced it)
  *
  * 🔴 SIGMA IS A CLAIM ABOUT THE INPUT, NOT A DIAL, WHICH IS WHY THE SCHEDULE
  * MUST DESCEND. Holding it fixed and iterating diverges: from zeros at sigma 16
@@ -101,18 +113,21 @@ export async function sampleOnGpu(device, input, weights, options) {
  * network is told its input is nearly correct when it is not and answers with
  * correspondingly small corrections. See tools/gpu/probe-denoiser.js.
  *
- * 🔴 AND IT RETURNS ONE STRUCTURE, FOR EVER. There is no seed and no ensemble:
- * the same trunk gives the same answer every time. That is the whole point of
- * diffusion thrown away, and it is why this is offered beside sampleOnGpu
- * rather than instead of it.
+ * 🔴 IT IS STILL NOT A SAMPLER. One draw at the start is not the same as noise
+ * injected at every step: this follows a deterministic path from wherever it
+ * began, so its spread across seeds is narrower than the sampler's. It is
+ * offered beside sampleOnGpu, not instead of it.
  *
- * @param {{cycles: number, onStep?: Function}} options
+ * @param {{cycles: number, normal: () => number, onStep?: Function}} options
  */
-export async function rampOnGpu(device, input, weights, options) {
-  const { cycles } = options;
+export async function flowOnGpu(device, input, weights, options) {
+  const { cycles, normal } = options;
   const levels = noiseLevels(cycles, options);
   const head = new Af3DiffusionHeadGpu(device);
   let positions = new Float32Array(input.shape.tokens * input.shape.dense * 3);
+  for (let index = 0; index < positions.length; index += 1) {
+    positions[index] = normal() * levels[0];
+  }
 
   for (let cycle = 1; cycle <= cycles; cycle += 1) {
     const noiseLevel = levels[cycle - 1];

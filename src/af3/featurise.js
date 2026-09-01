@@ -27,11 +27,21 @@
  * a single-sequence input - not a stub. A real MSA changes only these three
  * arrays; nothing else here depends on depth.
  *
- * WHAT IS NOT HERE, deliberately: ligands, nucleic acids, more than one chain,
- * covalent bonds between chains, and templates. Each is a token type this
- * tokeniser does not create, and each would need its own CCD entries.
+ * 🔴 A COLON SEPARATES CHAINS, as it does everywhere else on the page. The
+ * chain identity comes from src/input/chains.js - the same chainIdentity() and
+ * residueIndexPerChain() AlphaFold-multimer uses - because AF3 wants exactly
+ * what AF2-multimer wants and writing a second copy of it is how the two drift.
+ * The only difference is the base: AF2 counts asym, entity and sym from zero
+ * and AF3 from one. The relative encoding reads DIFFERENCES and EQUALITY, so
+ * the offset changes nothing the model sees; it is applied so this matches
+ * AF3's own batch element for element, which is what makes the checker strict.
+ *
+ * WHAT IS NOT HERE, deliberately: ligands, nucleic acids, covalent bonds
+ * between chains, and templates. Each is a token type this tokeniser does not
+ * create, and each would need its own CCD entries.
  */
 import { conformerFor, aatypeFor } from "./reference-conformers.js";
+import { chainIdentity, residueIndexPerChain } from "../input/chains.js";
 
 const DENSE = 24;
 const QUERIES = 32;
@@ -54,9 +64,22 @@ function gather(count) {
  *   sequence. The query is always row zero and is prepended here.
  */
 export function featuriseProtein(sequence, options = {}) {
-  const tokens = sequence.length;
+  const chains = sequence.split(":").filter((chain) => chain.length > 0);
+  const joined = chains.join("");
+  const tokens = joined.length;
   if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
   const subsets = Math.ceil((tokens * DENSE) / QUERIES);
+  const chainLengths = chains.map((chain) => chain.length);
+  const identity = chainIdentity(tokens, chainLengths, chains);
+  const withinChain = residueIndexPerChain(tokens, chainLengths);
+  // 🔴 THE LAST RESIDUE OF EVERY CHAIN TAKES AN OXT, not the last token of the
+  // batch. Checked against AF3's own complex: a three-chain A/A/B dump carries
+  // it on tokens 20, 41 and 62. Getting this wrong is one missing oxygen and
+  // one spurious one per extra chain, both of which land in a token's pooled
+  // atom representation and in the atom-pair window around it.
+  const lastOfChain = new Set();
+  let edge = -1;
+  for (const length of chainLengths) { edge += length; lastOfChain.add(edge); }
 
   const aatype = new Int32Array(tokens);
   const refPos = new Float32Array(tokens * DENSE * 3);
@@ -78,16 +101,17 @@ export function featuriseProtein(sequence, options = {}) {
   const pseudoBetaSlot = new Int32Array(tokens).fill(-1);
 
   for (let token = 0; token < tokens; token += 1) {
-    const code = sequence[token];
+    const code = joined[token];
     aatype[token] = aatypeFor(code);
-    residueIndex[token] = token + 1;
+    // AF3 counts these from one; chains.js counts from zero. See the note above.
+    residueIndex[token] = withinChain[token] + 1;
     tokenIndex[token] = token + 1;
-    asymId[token] = 1;
-    entityId[token] = 1;
-    symId[token] = 1;
+    asymId[token] = identity.asymId[token] + 1;
+    entityId[token] = identity.entityId[token] + 1;
+    symId[token] = identity.symId[token] + 1;
     seqMask[token] = 1;
 
-    const atoms = conformerFor(code, token === tokens - 1);
+    const atoms = conformerFor(code, lastOfChain.has(token));
     for (const [slot, name, element, charge, x, y, z] of atoms) {
       const flat = token * DENSE + slot;
       refMask[flat] = 1;
@@ -203,7 +227,8 @@ export function featuriseProtein(sequence, options = {}) {
   }
 
   return {
-    sequence, tokens, dense: DENSE, subsets, atomCount, sequences,
+    sequence: joined, chains, chainLengths,
+    tokens, dense: DENSE, subsets, atomCount, sequences,
     shape: { tokens, dense: DENSE, subsets, queries: QUERIES, keys: KEYS },
     aatype, profile, deletionMean,
     msa, msaMask, deletionMatrix,

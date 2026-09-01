@@ -28,14 +28,14 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 /**
  * What the count dial offers per mode, and what it is called.
  *
- * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A ramp CYCLE walks the whole
+ * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A flow CYCLE walks the whole
  * schedule, so eight is a finished structure. A diffusion STEP discretises it,
  * and below twenty the sampler does not land - ten gives 5.91 A on 6MRR with a
  * CA-CA of 8.40 A, a chain that is not connected. So the dial is rebuilt on a
  * mode change rather than carrying a number across.
  */
 export const AF3_COUNTS = {
-  ramp: { label: "Cycles", values: [2, 4, 8, 16, 32], preferred: 8 },
+  flow: { label: "Cycles", values: [2, 4, 8, 16, 32], preferred: 8 },
   diffusion: { label: "Steps", values: [20, 40, 80, 160, 320], preferred: 20 },
 };
 
@@ -107,7 +107,7 @@ const toPoints = (positions, count) => Array.from(
  * FITTED. AF3's sampler calls randomAugmentation at the top of every step - a
  * fresh rotation and translation of the whole system - so consecutive frames
  * differ by a rigid motion far larger than anything the denoiser did, and
- * unfitted playback is a protein tumbling. Ramp mode rotates nothing, so there
+ * unfitted playback is a protein tumbling. Flow mode rotates nothing, so there
  * the fit is a no-op that costs one superposition a frame.
  *
  * 🔴 FITTED TO THE FIRST FRAME, NOT THE LAST, because the frames are shown as
@@ -152,7 +152,7 @@ function timeShares(calls, passes) {
 /**
  * Fold one chain with AlphaFold 3.
  *
- * @param {{sequence: string, mode: "ramp"|"diffusion", calls: number, seed: number,
+ * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -201,7 +201,7 @@ export async function foldAf3(options) {
       }
       if (name === "trunk-done") {
         onProgress(share.trunk);
-        onStatus(mode === "ramp"
+        onStatus(mode === "flow"
           ? `Refining ${batch.atomCount} atoms over ${calls} cycles…`
           : `Diffusing ${batch.atomCount} atoms over ${calls} steps…`);
       }
@@ -220,7 +220,7 @@ export async function foldAf3(options) {
       shown += 1;
       onProgress(share.trunk + (1 - share.trunk) * (step / calls));
       const elapsed = (performance.now() - started) / 1000;
-      onStatus(`${mode === "ramp" ? "Cycle" : "Diffusion step"} ${step} of ${calls}`
+      onStatus(`${mode === "flow" ? "Cycle" : "Diffusion step"} ${step} of ${calls}`
         + `  ·  about ${Math.ceil(elapsed * (calls / step - 1))} s left`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task

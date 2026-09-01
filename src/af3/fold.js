@@ -30,7 +30,7 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
-import { sampleOnGpu, rampOnGpu } from "./diffusion-sampler-webgpu.js";
+import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
 
 /**
  * 🔴 THE DIALECT IS NOT A PREFERENCE. `model='openfold3'` turns on four
@@ -65,6 +65,14 @@ export function toPdb(batch, positions, plddt) {
   const { tokens, dense, sequence } = batch;
   const lines = [];
   let serial = 1;
+  // 🔴 ONE LETTER PER CHAIN, NOT "A" FOR EVERYTHING. A complex written as one
+  // chain is a single 126-residue protein as far as any viewer or scoring tool
+  // is concerned, with a peptide bond implied across an interface that has
+  // none.
+  const chainLetter = (token) => {
+    const asym = batch.asymId === undefined ? 1 : batch.asymId[token];
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[(asym - 1) % 26];
+  };
   for (let token = 0; token < tokens; token += 1) {
     for (let atom = 0; atom < dense; atom += 1) {
       const slot = token * dense + atom;
@@ -75,7 +83,7 @@ export function toPdb(batch, positions, plddt) {
         "ATOM  "
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
-        + (THREE_LETTER[sequence[token]] ?? "UNK").padEnd(3) + " A"
+        + (THREE_LETTER[sequence[token]] ?? "UNK").padEnd(3) + " " + chainLetter(token)
         // 🔴 residue_index IS ALREADY 1-BASED. Adding one here shifted the whole
         // chain by a residue, which against a helical protein reads as a 3.7 A
         // RMSD and a TM-score of 0.37 - a plausible "wrong fold" rather than an
@@ -87,6 +95,10 @@ export function toPdb(batch, positions, plddt) {
         + "  1.00" + confidence.toFixed(2).padStart(6) + "          "
         + (ELEMENT_SYMBOL[batch.refElement[slot]] ?? "C").padStart(2));
       serial += 1;
+    }
+    if (batch.asymId !== undefined && token + 1 < tokens
+        && batch.asymId[token + 1] !== batch.asymId[token]) {
+      lines.push("TER");
     }
   }
   lines.push("END");
@@ -131,7 +143,14 @@ export function backboneGeometry(batch, positions) {
     const here = slotOf[token];
     if (here.N !== undefined && here.CA !== undefined) nca.push(distance(here.N, here.CA));
     if (here.CA !== undefined && here.C !== undefined) cac.push(distance(here.CA, here.C));
-    if (token + 1 < tokens && here.CA !== undefined && slotOf[token + 1].CA !== undefined) {
+    // 🔴 NOT ACROSS A CHAIN BREAK. There is no bond between the last residue of
+    // one chain and the first of the next, so that distance is a fact about how
+    // the complex packed rather than about its geometry - and CA-CA is the
+    // number that says whether the backbone is connected at all.
+    const sameChain = batch.asymId === undefined
+      || batch.asymId[token] === batch.asymId[token + 1];
+    if (token + 1 < tokens && sameChain
+        && here.CA !== undefined && slotOf[token + 1].CA !== undefined) {
       caca.push(distance(here.CA, slotOf[token + 1].CA));
     }
   }
@@ -217,7 +236,7 @@ export function normalFrom(seed) {
 /**
  * @param {object} batch from featuriseProtein or an AF3 dump
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
- * @param {{mode?: "ramp"|"diffusion", steps?: number, recycles?: number,
+ * @param {{mode?: "flow"|"diffusion", steps?: number, recycles?: number,
  *          seed?: number, blocks?: number,
  *          onStage?: (name: string, detail: object) => void,
  *          onStep?: (step: object) => void}} [options]
@@ -294,19 +313,21 @@ export async function foldBatch(device, batch, weights, options = {}) {
   };
 
   // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
-  // KIND OF THING. "diffusion" is AF3's own stochastic sampler: it draws a
-  // seed, so it gives a different structure each time and an ensemble if you
-  // ask repeatedly. "ramp" is the same denoiser run deterministically down the
-  // schedule from a black hole - one structure, no seed, and about 25x fewer
-  // calls for the same accuracy on the two proteins it has been measured on.
+  // KIND OF THING. "diffusion" is AF3's own stochastic sampler: noise is
+  // injected at every step. "flow" draws once at the top of the schedule and
+  // then walks it deterministically - about 25x fewer calls for the same
+  // accuracy on the two proteins it has been measured on. Both take a seed;
+  // the flow's spread across seeds is the narrower of the two, because one
+  // draw is not the same as noise at every step.
   const positions = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
         steps, stopAfter: options.stopAfter,
         normal: normalFrom(options.seed ?? 20260831),
         onStep: options.onStep,
       })
-    : await rampOnGpu(device, headInput, weights.diffusion, {
-        cycles: steps, onStep: options.onStep,
+    : await flowOnGpu(device, headInput, weights.diffusion, {
+        cycles: steps, normal: normalFrom(options.seed ?? 20260831),
+        onStep: options.onStep,
       });
 
   // The confidence head reads the sample back.
