@@ -97,6 +97,10 @@ export const AF3_MSA_GAP = 21;
 export function af3MsaFromA3m(alignment, options = {}) {
   const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
   const maxSequences = options.maxSequences ?? 512;
+  // A seeded uniform, from the fold's own seed, so a subsample is reproducible
+  // and two seeds are two alignments rather than two lotteries. Absent, the
+  // crop is the deterministic prefix it always was.
+  const { random } = options;
 
   const parse = (text) => {
     if (text === undefined || text === null || text.trim() === "") return null;
@@ -133,13 +137,54 @@ export function af3MsaFromA3m(alignment, options = {}) {
   const unpairedCrop = unpaired === null
     ? 0 : Math.min(unpaired.depth, maxSequences - pairedCrop);
 
+  // 🔴 WHICH ROWS, NOT THE FIRST N. An A3M arrives sorted by how well each hit
+  // matched, so taking a prefix takes the closest homologs - the rows that
+  // agree with the query and with each other - and drops the distant ones that
+  // carry most of the covariation. AlphaFold 3 does not do this: its evoformer
+  // shuffles the MSA and then truncates to num_msa, so what reaches the model
+  // is a random subset of whatever the pipeline held.
+  //
+  // 🔴 THE SET IS RANDOM, THE ORDER IS NOT. AF3 leaves its rows permuted; we
+  // put the chosen rows back in file order, because the MSA stack is
+  // permutation-equivariant across rows - the outer product mean sums over
+  // them and the row attention treats each independently - so only WHICH rows
+  // are kept can change the answer. Keeping file order makes two runs
+  // comparable by eye and costs nothing.
+  //
+  // 🔴 NOTHING IS PINNED, AND THE QUERY IS SAFE ANYWAY. AF3 does not exempt its
+  // first row: gumbel_argsort_sample_idx returns a full permutation whose
+  // logits are 0 for every unmasked row and -1e6 only for padding, and
+  // truncate_msa_batch then takes arange(num_msa) - so AF3's own query can be
+  // shuffled past the cut and dropped. It can afford that because the sequence
+  // reaches every row through target_feat regardless (`extra_msa_target_feat`
+  // is added to all of them), and create_msa_feat carries no which-row-is-the
+  // -query feature. Here it is safer still: featuriseProtein writes the query
+  // as row zero of the finished array and these blocks are appended after it,
+  // so the only row sampling can remove is a block's DUPLICATE of the query.
+  const chooseRows = (available, count) => {
+    if (count >= available.length) return available;
+    if (random === undefined) return available.slice(0, count);
+    const shuffled = available.slice();
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(random() * (index + 1));
+      [shuffled[index], shuffled[swap]] = [shuffled[swap], shuffled[index]];
+    }
+    return shuffled.slice(0, count).sort((a, b) => a - b);
+  };
+
   const msa = [];
   const deletionMatrix = [];
   let length = 0;
   const append = (parsed, from, upTo) => {
     if (parsed === null) return;
     length = parsed.length;
-    for (let row = from; row < upTo; row += 1) {
+    // 🔴 THE POOL IS THE WHOLE BLOCK, AND `upTo` IS ONLY THE COUNT. Sampling
+    // from [from, upTo) would sample the prefix it was meant to replace, which
+    // is a subsample that can never reach past the crop and is exactly the bug
+    // this was written to remove.
+    const span = [];
+    for (let row = from; row < parsed.depth; row += 1) span.push(row);
+    for (const row of chooseRows(span, upTo - from)) {
       const aligned = parsed.sequences[row];
       const codes = new Int32Array(parsed.length);
       for (let column = 0; column < parsed.length; column += 1) {

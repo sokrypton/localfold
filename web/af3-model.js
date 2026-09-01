@@ -17,7 +17,7 @@
 import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
-import { foldBatch, toPdb, atomName } from "../src/af3/fold.js";
+import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
@@ -181,7 +181,14 @@ export async function foldAf3(options) {
   const alignment = options.alignment ?? null;
   const rows = alignment === null
     ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
-    : af3MsaFromA3m(alignment, { maxSequences: options.maxMsaSequences });
+    : af3MsaFromA3m(alignment, {
+      maxSequences: options.maxMsaSequences,
+      // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
+      // seed names. AF3 draws its shuffle from the same key that drives the
+      // rest of the model; here two seeds are two alignments as well as two
+      // starting draws, and one seed is reproducible.
+      random: uniformFrom(options.seed ?? 0),
+    });
   // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED. AF3's own featuriser
   // reads a 515 MB CCD pickle; a fold touches only the components its ligands
   // name, and the PDB serves each as one small mmCIF. The 21 polymer components

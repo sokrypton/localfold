@@ -147,3 +147,62 @@ describe("af3MsaFromA3m", () => {
     assert.deepEqual(Array.from(msa[1]).slice(0, 2), [AF3_MSA_CODES.A, AF3_MSA_CODES.A]);
   });
 });
+
+describe("subsampling a deeper alignment than the budget", () => {
+  // 🔴 A PREFIX IS THE CLOSEST HOMOLOGS. An A3M arrives sorted by how well each
+  // hit matched, so taking the first N takes the rows that agree with the query
+  // and with each other, and drops the distant ones carrying most of the
+  // covariation. AlphaFold 3 shuffles and then truncates to num_msa, so what
+  // reaches its model is a random subset.
+  const deep = a3m(QUERY, ...Array.from({ length: 40 },
+    (_, index) => "ACDEFGHIK" + "LMNPQRSTVWY"[index % 11]));
+  const uniform = (seed) => {
+    let state = seed >>> 0;
+    return () => {
+      state = (state * 1664525 + 1013904223) >>> 0;
+      return (state + 1) / 4294967297;
+    };
+  };
+  const lastColumn = (rows) => rows.msa.map((row) => row[9]).join(",");
+
+  it("takes the prefix when no generator is given", () => {
+    // The old behaviour, kept for anything that wants a fixed alignment.
+    const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8 });
+    assert.equal(lastColumn(rows), lastColumn(af3MsaFromA3m({ unpaired: deep },
+      { maxSequences: 8 })));
+  });
+
+  it("takes a different subset with a generator, and the same one twice", () => {
+    const one = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(1) });
+    const two = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(2) });
+    const again = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(1) });
+    const prefix = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8 });
+    assert.notEqual(lastColumn(one), lastColumn(prefix), "a sample, not the prefix");
+    assert.notEqual(lastColumn(one), lastColumn(two), "two seeds are two alignments");
+    assert.equal(lastColumn(one), lastColumn(again), "one seed is reproducible");
+  });
+
+  it("keeps the depth the budget asked for", () => {
+    for (const seed of [1, 2, 3]) {
+      const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(seed) });
+      assert.equal(rows.depth, 8, `seed ${seed}`);
+    }
+  });
+
+  it("returns the chosen rows in file order, because only the SET matters", () => {
+    // The MSA stack is permutation-equivariant across rows - the outer product
+    // mean sums over them, the row attention treats each independently - so
+    // shuffling the order would change nothing and cost legibility.
+    const rows = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(4) });
+    const codes = rows.msa.map((row) => row[9]);
+    assert.equal(codes.length, 7);
+  });
+
+  it("leaves the profile alone, which is over the whole alignment", () => {
+    // The profile is computed before any crop, so a subsample must not move it.
+    const sampled = af3MsaFromA3m({ unpaired: deep }, { maxSequences: 8, random: uniform(5) });
+    const whole = af3MsaFromA3m({ unpaired: deep }, { maxSequences: Infinity });
+    assert.equal(sampled.profileMsa.length, whole.profileMsa.length);
+    assert.equal(sampled.profileMsa.length, 41, "the query and all 40 hits");
+  });
+});
