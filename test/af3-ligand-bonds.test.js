@@ -29,6 +29,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { featuriseProtein } from "../src/af3/featurise.js";
+import { paeMatrix } from "../web/prediction-results.js";
 import { toPdb } from "../src/af3/fold.js";
 import { ELEMENT_SYMBOLS } from "../src/af3/ccd-component.js";
 
@@ -173,6 +174,94 @@ describe("a ligand's bonds reach the viewer", () => {
     // angstrom, and an iron, which is drawn at a carbon's radius and colour.
     assert.equal(written.get("P1"), "P");
     assert.equal(written.get("FE1"), "FE");
+  });
+});
+
+describe("a ligand's PAE reaches the viewer", () => {
+  // 🔴 THE MATRIX WAS CROPPED TO THE POLYMER, AND DID NOT NEED TO BE.
+  //
+  // AlphaFold 3 scores TOKENS - one per residue, one per ligand HEAVY ATOM - so
+  // a mixed fold's matrix is wider than the sequence, and `paeSize` used to
+  // take the top-left `residues x residues` block for that reason. Reported as
+  // the PAE missing the ligand part of a protein+ligand fold.
+  //
+  // The premise was wrong: py2Dmol carries one POSITION per ligand heavy atom
+  // as well, and reads them in file order, which is the order toPdb writes,
+  // which is token order. The two index spaces are the same one.
+  it("has one token per residue and one per ligand heavy atom, in that order", () => {
+    const batch = batchWithLigand();
+    assert.equal(batch.tokens, 10 + LIGAND.atoms.length,
+      "a ligand is one token per heavy atom, after the polymer");
+    const span = batch.ligandSpans[0];
+    assert.equal(span.from, 10, "the ligand's tokens do not start after the chain");
+    assert.equal(span.count, LIGAND.atoms.length);
+  });
+
+  it("...and the PDB it writes has exactly those positions, in that order", () => {
+    // 🔴 A POSITION IS NOT A RECORD. The first version of this counted ATOM and
+    // HETATM lines and expected 16; there are 94, because a polymer token is a
+    // residue and toPdb writes its whole dense atom layout. py2Dmol makes ONE
+    // position per protein residue - its trace atom, the CA - and one per
+    // HETATM, which is what has to line up with the tokens, and does: measured
+    // through py2Dmol's own parser, this file gives 16 positions, 10 typed P
+    // then 6 typed L.
+    const batch = batchWithLigand();
+    const lines = toPdb(batch, positionsOf(batch), null).split("\n");
+    const atoms = lines.filter((l) => l.startsWith("ATOM") || l.startsWith("HETATM"));
+    const traced = atoms.filter(
+      (l) => l.startsWith("HETATM") || l.slice(12, 16).trim() === "CA");
+    assert.equal(traced.length, batch.tokens,
+      `the file gives ${traced.length} drawn positions for ${batch.tokens} tokens`);
+    const firstHet = traced.findIndex((l) => l.startsWith("HETATM"));
+    assert.equal(firstHet, 10, "the ligand does not begin where its tokens do");
+    assert.ok(traced.slice(firstHet).every((l) => l.startsWith("HETATM")),
+      "the ligand's atoms are not contiguous to the end");
+  });
+
+  it("and web/app.js asks for all of them", () => {
+    // 🔴 THE CHECK BELOW WAS NOT ENOUGH ON ITS OWN. It calls paeMatrix with the
+    // full stride and proves the function keeps what it is given - and the bug
+    // was never in the function, it was in what the CALLER asked for. Restoring
+    // the crop left every other assertion here green.
+    //
+    // `paeSize` is a closure inside foldWithAf3 and cannot be called from here,
+    // so it is read, the same way the trunk input's bondMatrix key is.
+    const source = readSource("web/app.js");
+    const at = source.indexOf("const paeSize =");
+    assert.ok(at >= 0, "paeSize is gone - this check now reads nothing");
+    const line = source.slice(at, source.indexOf("\n", at));
+    assert.ok(/Math\.round\(Math\.sqrt\(values\.length\)\)/.test(line),
+      `paeSize does not take the matrix's own width: ${line}`);
+    assert.ok(!/residues/.test(line),
+      `paeSize is cropping to the residue count again: ${line}`);
+  });
+
+  it("keeps every row, so the ligand block is drawn", () => {
+    const batch = batchWithLigand();
+    const n = batch.tokens;
+    // A matrix whose every cell names its own coordinates, so a crop or a
+    // stride error is visible as a WRONG NUMBER rather than a missing one.
+    const values = new Float32Array(n * n);
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) values[i * n + j] = i * 100 + j;
+    }
+    // what web/app.js now asks for
+    const size = Math.round(Math.sqrt(values.length));
+    assert.equal(size, n);
+    const rows = paeMatrix(values, size);
+    assert.equal(rows.length, n, "rows were dropped");
+    assert.equal(rows[0].length, n, "columns were dropped");
+    // the ligand's own block, and the protein-ligand corner that is the whole
+    // reason to look at a mixed fold's PAE
+    const lig = batch.ligandSpans[0].from;
+    assert.equal(rows[lig][lig], lig * 100 + lig, "the ligand block is wrong");
+    assert.equal(rows[0][lig], lig, "the protein-to-ligand corner is wrong");
+    assert.equal(rows[lig][0], lig * 100, "the ligand-to-protein corner is wrong");
+    // ...and the OLD behaviour, named, so this cannot silently come back
+    const cropped = paeMatrix(values, 10);
+    assert.equal(cropped.length, 10);
+    assert.ok(cropped.every((row) => row.length === 10),
+      "the crop is what the report was about; it still has to work when asked for");
   });
 });
 

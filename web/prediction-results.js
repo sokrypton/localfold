@@ -40,7 +40,17 @@ function atomLines(sequence, structure, plddt, chainLengths) {
         const atomName = ATOM_NAMES[atom];
         const element = atomName[0];
         lines.push(
-          `ATOM  ${String(serial).padStart(5)} ${atomName.padStart(4)} ${residueName} ${chainId}${String(within + 1).padStart(4)}    `
+          // 🔴 THE NAME IS LEFT-JUSTIFIED FROM COLUMN 14, NOT RIGHT-JUSTIFIED
+          // INTO 16. The PDB format gives the atom name columns 13-16 and
+          // starts a one-character element's name at 14, so alpha carbon is
+          // " CA " and only a two-character ELEMENT - iron, " FE " as "FE  " -
+          // begins at 13. padStart wrote "  CA", which every lenient parser
+          // trims back to the right name and every strict one reads by column:
+          // the backbone is then not where N, CA and C are looked for, and a
+          // viewer draws a structure with no backbone rather than refusing to
+          // open it. src/af3/fold.js has always written it the other way, which
+          // is why only AlphaFold 2's files were wrong.
+          `ATOM  ${String(serial).padStart(5)}  ${atomName.padEnd(3)} ${residueName} ${chainId}${String(within + 1).padStart(4)}    `
           + `${field(structure.atom37[offset], 8, 3)}${field(structure.atom37[offset + 1], 8, 3)}`
           + `${field(structure.atom37[offset + 2], 8, 3)}  1.00${field(plddt[residue], 6, 2)}`
           + `          ${element.padStart(2)}`,
@@ -89,29 +99,6 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
   return `${lines.join("\n")}\n`;
 }
 
-/**
- * Already-formed PDB texts as one multi-model file.
- *
- * 🔴 NOT recyclesToPdb. That one BUILDS atom lines from AlphaFold 2's structure
- * arrays; a sampler has already written its frames as text, and re-deriving
- * them would need the coordinates it no longer holds. This wraps what exists.
- *
- * @param {readonly string[]} frames  one PDB per model, in order
- * @param {string} remark  what the models are, for REMARK 2
- */
-export function framesToPdb(frames, remark) {
-  if (frames.length === 0) throw new RangeError("a prediction must have at least one frame");
-  const lines = ["REMARK   1 ALPHAFOLD3 WEBGPU PREDICTION", `REMARK   2 ${remark}`];
-  frames.forEach((frame, index) => {
-    lines.push(`MODEL     ${String(index + 1).padStart(4)}`);
-    // Each frame carries its own END, which cannot appear inside a model.
-    lines.push(...frame.split("\n").filter((line) => line.trim() !== "" && line.trim() !== "END"));
-    lines.push("ENDMDL");
-  });
-  lines.push("END");
-  return `${lines.join("\n")}\n`;
-}
-
 /** The flat per-pair errors as rows, which is how the format is written. */
 export function paeMatrix(values, length) {
   // 🔴 THE STRIDE IS NOT ALWAYS THE LENGTH. AlphaFold 3 scores TOKENS, and a
@@ -127,8 +114,17 @@ export function paeMatrix(values, length) {
   if (stride < length) {
     throw new RangeError(`predicted aligned error is ${stride} wide for ${length} residues`);
   }
-  // The top-left block: the polymer's own rows and columns, in order. The
-  // ligand rows past it are real and are not drawn yet.
+  // `length` rows and columns of it, from the top-left, in order.
+  //
+  // 🔴 THE CALLER ASKS FOR THE WHOLE THING NOW. This used to be handed the
+  // RESIDUE count on an AlphaFold 3 fold, which cropped a mixed fold's matrix
+  // to its polymer block and dropped every ligand row - reported as the PAE
+  // missing the ligand part. It was never necessary: py2Dmol carries one
+  // position per ligand heavy atom too, in the same order, so the token matrix
+  // indexes exactly what is drawn (see the note at `paeSize` in web/app.js).
+  // The parameter stays because the AlphaFold 2 path passes a residue count
+  // that happens to equal the stride, and because a caller that genuinely
+  // wants a block should be able to say so.
   const rows = [];
   for (let row = 0; row < length; row += 1) {
     rows.push(Array.from(values.subarray(row * stride, row * stride + length)));

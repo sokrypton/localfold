@@ -30,7 +30,7 @@ import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-m
 import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
-import { confidenceJson, framesToPdb, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName }
+import { confidenceJson, paeMatrix, predictionToPdb, safeJobName }
   from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
@@ -658,15 +658,28 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // can see the chain split; every length below is the residue count, and a PAE
   // matrix sized from the wrong one is silently the wrong shape.
   const residues = chains.join("").length;
-  // 🔴 THE PAE IS DRAWN OVER THE POLYMER, OR OVER EVERYTHING WHEN THERE IS NO
-  // POLYMER. AF3 scores tokens and a ligand is one token per heavy atom, so a
-  // mixed fold's matrix is wider than the residues the viewer draws and
-  // paeMatrix takes the top-left block. With no residues that block is empty,
-  // and an empty PAE panel for a fold that produced a real one is a bug the
-  // reader has to guess at.
-  // ...and the length reported alongside it follows the same rule, so the
-  // matrix and the label it is drawn under always agree.
-  const paeSize = (values) => (residues > 0 ? residues : Math.round(Math.sqrt(values.length)));
+  // 🔴 THE WHOLE MATRIX, LIGAND ROWS AND ALL - AND THE INDEX SPACES ALREADY
+  // AGREE, WHICH IS WHY THIS COSTS NOTHING.
+  //
+  // This used to take the top-left `residues x residues` block, on the
+  // reasoning that AF3 scores TOKENS - one per heavy atom for a ligand - so a
+  // mixed fold's matrix is wider than what the viewer draws. The second half of
+  // that is simply not true: py2Dmol also carries one POSITION per ligand heavy
+  // atom, and its parser reads them in file order, which is the order toPdb
+  // writes, which is token order. Measured on a ten-residue chain plus a
+  // six-atom ligand: AF3 says 16 tokens, py2Dmol says 16 positions, 10 protein
+  // then 6 ligand contiguous. The matrix indexes exactly what is on screen.
+  //
+  // So the crop was throwing away real, correctly-indexed data - reported as
+  // the PAE missing the ligand part of a protein+ligand fold. The panel sizes
+  // itself from the matrix it is handed (`this.n = paeData.length` for an array
+  // of rows), and `pae_n` equal to that width makes its cell-to-residue
+  // crossings the identity, so nothing downstream has to be told.
+  //
+  // A ligand-only fold falls out of the same rule rather than needing the
+  // special case it used to have: no residues, and the width is still the
+  // width.
+  const paeSize = (values) => Math.round(Math.sqrt(values.length));
   // 🔴 ONLY WHEN THERE IS A POLYMER TO CHECK. A ligand-only fold has no
   // sequence, and af3SequenceProblem reports an empty one as "Paste a protein
   // sequence first" - which is the right message for an empty box and the wrong
@@ -762,8 +775,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // which is the AF3 analogue of one model per recycle.
     lastPrediction = {
       stem,
-      pdb: framesToPdb(timeline, `${timeline.length} ${mode.toUpperCase()} STEPS,`
-        + " MODEL n IS STEP n-1"),
+      // 🔴 THE FINAL STRUCTURE ONLY, NOT THE TRAJECTORY. Saving every sampler
+      // step wrote a file whose MODEL 1 was the FIRST step - measured at a
+      // CA-CA of 2.63 A against the final 3.87 - so anything that opens the
+      // first model, which is most things, showed a collapsed structure with
+      // backbone that does not join up. The trajectory is on screen in the play
+      // bar, where it can be watched; what gets saved is the answer.
+      pdb: result.pdb,
       scores: confidenceJson(chains.join(""), result.confidence),
       a3m: alignment,
       chainLengths: chains.map((chain) => chain.length),
@@ -1053,7 +1071,9 @@ async function fold(event) {
     };
     lastPrediction = {
       stem,
-      pdb: recyclesToPdb(sequence, alignedRecycles, chainLengths),
+      // The final pass, for the reason above: the earlier recycles are the
+      // route, not the result.
+      pdb: predictionToPdb(sequence, finalLanded, final.confidence.plddt, chainLengths),
       scores: confidenceJson(sequence, final.confidence),
       a3m: alignment,
       chainLengths,

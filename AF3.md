@@ -194,6 +194,31 @@ After that:
 `test/af3-ligand-bonds.test.js` covers all of it on the CPU lane; seven
 mutations, each caught.
 
+🔴 **AND THE PAE WAS CROPPED TO THE POLYMER, ON A PREMISE THAT WAS WRONG.**
+`paeSize` took the top-left `residues x residues` block of AF3's token matrix,
+because a ligand is one token per heavy atom and "the matrix is wider than the
+residues the viewer draws". The second half of that is not true: **py2Dmol
+carries one POSITION per ligand heavy atom too**, and reads them in file order,
+which is the order `toPdb` writes, which is token order. Measured across the two
+repos on a 20-residue chain plus an 8-atom ligand: AF3 says **28 tokens**,
+py2Dmol says **28 positions**, ligand starting at index **20 on both sides**, and
+every cell of the matrix lands where its coordinates say - including the
+protein-to-ligand corner, which is the whole reason to look at a mixed fold's
+PAE. Reported as the PAE missing the ligand part.
+
+Driven on py2Dmol's own page with that 28x28 matrix: the panel sizes itself from
+what it is handed (`n = 28`), `pae_n` equal to that width makes its
+cell-to-residue crossings the identity, 112k pixels of plot are drawn, and a
+drag over the ligand block selects positions **20-27** - the ligand's own. A
+ligand-only fold now falls out of the same rule instead of needing the special
+case it used to have.
+
+🔴 **AND THE FIRST TEST FOR IT DID NOT CATCH THE BUG.** It called `paeMatrix`
+with the full stride and asserted the rows survived - proving the function keeps
+what it is given, when the fault was in what the CALLER asked for. Restoring the
+crop left it green. `paeSize` is a closure and cannot be called from a test, so
+it is READ, the same way the trunk input's `bondMatrix` key is.
+
 **py2Dmol read CONECT partners one column late**, which `trim()` hid up to 9,999
 atoms - a right-justified four-digit serial survives a one-column slip, a
 five-digit one does not. Serial 10000's partner came back as **1**: not a

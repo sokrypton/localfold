@@ -11,9 +11,28 @@ describe("browser prediction result formatting", () => {
       affine: new Float32Array(), angles: new Float32Array(), unnormalizedAngles: new Float32Array(),
       elapsedMilliseconds: 0,
     }, Float32Array.of(97.25));
-    expect(pdb).toContain("ATOM      1    N ALA A   1");
+    expect(pdb).toContain("ATOM      1  N   ALA A   1");
     expect(pdb).toContain("   1.250  -2.500   3.750  1.00 97.25");
     expect(pdb.endsWith("TER\nEND\n")).toBe(true);
+  });
+
+  it("starts a one-character element's atom name in column 14", () => {
+    // 🔴 THE COLUMNS, NOT THE TRIMMED TEXT. The PDB format gives the atom name
+    // columns 13-16 and starts a one-character element's name at 14 - " CA " -
+    // reserving column 13 for a two-character ELEMENT like iron. This used to
+    // be padStart(4), which right-justified it into "  CA": every lenient
+    // parser trims that back to the right name, and every strict one reads by
+    // column and does not find the backbone where N, CA and C belong. What it
+    // looks like downstream is a structure drawn with no backbone.
+    const atom37 = new Float32Array(37 * 3);
+    const atom37Mask = new Float32Array(37);
+    // ATOM_NAMES order: N, CA, C, CB, O, CG, CG1 - so this covers a one, two
+    // and three character name, which is every width a protein atom has.
+    for (const slot of [0, 1, 2, 3, 6]) atom37Mask[slot] = 1;
+    const pdb = predictionToPdb("A", { atom37, atom37Mask }, Float32Array.of(50));
+    const names = pdb.split("\n").filter((line) => line.startsWith("ATOM"))
+      .map((line) => line.slice(12, 16));
+    expect(names).toEqual([" N  ", " CA ", " C  ", " CB ", " CG1"]);
   });
 
   it("writes each recycle as its own model, carrying that pass's pLDDT", () => {
