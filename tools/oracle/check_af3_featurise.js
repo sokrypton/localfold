@@ -24,6 +24,7 @@ import { dirname, join, resolve } from "node:path";
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -47,17 +48,41 @@ const a3mPath = process.argv[3] ?? dump.a3m ?? null;
 const pairedPath = process.argv[4] ?? null;
 const chainCount = (dump.chains ?? [dump.sequence]).length;
 const perChain = (path) => Array.from({ length: chainCount }, () => readFileSync(path, "utf8"));
+// 🔴 AN A3M MAY ALREADY BE MERGED, and merging it again is not an error anyone
+// sees - it silently doubles the width and the crash lands deep inside the
+// featuriser. A file whose rows are already as wide as the joined sequence is
+// taken as-is; one that is per-chain is merged. The width is the only thing
+// that distinguishes them, so it is the thing that is read.
+const joinedLength = (dump.chains ?? [dump.sequence]).join("").length;
+const alreadyMerged = (text) => {
+  const first = text.split(/\r?\n/).find((line) => line !== "" && !line.startsWith(">"));
+  return first !== undefined
+    && first.replace(/[a-z.]/g, "").length === joinedLength;
+};
+const asBlock = (path, merge) => {
+  const text = readFileSync(path, "utf8");
+  return chainCount === 1 || alreadyMerged(text) ? text : merge(perChain(path));
+};
 const rows = a3mPath === null
   ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
   : af3MsaFromA3m({
-    paired: pairedPath === null ? null
-      : (chainCount === 1 ? readFileSync(pairedPath, "utf8")
-        : mergeChainA3ms(perChain(pairedPath))),
-    unpaired: chainCount === 1 ? readFileSync(a3mPath, "utf8")
-      : mergeRowAlignedChainA3ms(perChain(a3mPath)),
+    paired: pairedPath === null ? null : asBlock(pairedPath, mergeChainA3ms),
+    unpaired: asBlock(a3mPath, mergeRowAlignedChainA3ms),
   }, { maxSequences: Infinity });
+// 🔴 A LIGAND'S CHEMISTRY COMES FROM THE PDB, NOT FROM THE DUMP. The batch
+// carries the conformer AF3 sampled and the element of every atom, but not
+// which component they belong to or how they are bonded - so the dump records
+// the codes and this fetches the same dictionary entries the page would.
+const ligandCodes = dump.ligands ?? [];
+const ligands = [];
+for (const code of ligandCodes) {
+  const response = await fetch(ccdUrl(code));
+  if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
+  ligands.push(parseCcdComponent(await response.text()));
+}
 const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
-  { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom });
+  { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
+    ligands });
 const { tokens, dense } = batch;
 
 let failures = 0;
@@ -116,7 +141,29 @@ console.log("\nchemistry");
 exact("ref_mask", batch.refMask, input("ref_mask"));
 exact("pred_dense_atom_mask", batch.predDenseAtomMask, input("pred_dense_atom_mask"));
 exact("ref_element", batch.refElement, input("ref_element"));
-exact("ref_charge", batch.refCharge, input("ref_charge"));
+// 🔴 CHARGE IS EXACT FOR POLYMERS AND EXPLAINED FOR LIGANDS. AF3 takes a
+// ligand atom's charge from RDKit's PERCEIVED formal charge, not from the
+// dictionary column, so heme's four -1 atoms come back as 0 - see
+// src/af3/ccd-component.js. Splitting the comparison keeps the polymer half
+// strict rather than loosening the whole of it around a known difference.
+{
+  // The polymer tokens are everything before the ligand block, counted from
+  // the ligands themselves rather than from a `sequence` field a multi-chain
+  // dump does not have.
+  const ligandTokens = ligands.reduce((total, l) => total + l.atoms.length, 0);
+  const residueSlots = (tokens - ligandTokens) * dense;
+  const theirCharge = Array.from(input("ref_charge"));
+  exact("ref_charge (polymer)", batch.refCharge.subarray(0, residueSlots),
+        theirCharge.slice(0, residueSlots));
+  if (residueSlots < tokens * dense) {
+    let differing = 0;
+    for (let index = residueSlots; index < tokens * dense; index += 1) {
+      if (batch.refCharge[index] !== theirCharge[index]) differing += 1;
+    }
+    console.log(`  note  ligand charge differs on ${differing} atom slot(s):`
+      + " RDKit's perception against the dictionary's, see ccd-component.js");
+  }
+}
 exact("ref_atom_name_chars", batch.refAtomNameChars, input("ref_atom_name_chars"));
 exact("ref_space_uid", batch.refSpaceUid, input("ref_space_uid"));
 
@@ -168,6 +215,12 @@ const chainEnds = new Set();
 let edge = -1;
 for (const length of batch.chainLengths) { edge += length; chainEnds.add(edge); }
 for (let token = 0; token < tokens; token += 1) {
+  // 🔴 LIGAND TOKENS ARE NOT RESIDUES AND HAVE NO ENTRY HERE. They sit past the
+  // end of the sequence, so `dump.sequence[token]` is undefined and the lookup
+  // silently falls back to UNK - which then reports a 1.7 A disagreement on a
+  // pair of atoms that do not exist. A ligand's own bonded distances are
+  // checked below, from its CCD bond table.
+  if (token >= dump.sequence.length) continue;
   const code = dump.sequence[token];
   const entry = REFERENCE_CONFORMERS[code] ?? REFERENCE_CONFORMERS.X;
   const atoms = chainEnds.has(token) ? entry.cTerminal : entry.internal;
@@ -184,6 +237,50 @@ for (let token = 0; token < tokens; token += 1) {
 }
 report("rigid pair distances", `worst ${worst.toFixed(3)} A at ${worstAt}`
   + ` over ${checked} pairs`, worst < RIGID_TOLERANCE);
+
+// The ligand's own chemistry, held to the same standard: bonded distances and
+// 1-3 angles survive AF3's per-instance torsion sampling, coordinates do not.
+if (ligands.length > 0) {
+  let base = dump.sequence.length;
+  let worst = 0;
+  let where = "";
+  let pairs = 0;
+  for (const ligand of ligands) {
+    const bonded = new Set(ligand.bonds.map(({ from, to }) => `${from},${to}`));
+    const neighbours = ligand.atoms.map(() => new Set());
+    for (const { from, to } of ligand.bonds) { neighbours[from].add(to); neighbours[to].add(from); }
+    // 🔴 A BOND TO A METAL IS NOT RIGID. RDKit's conformer places coordination
+    // bonds by its own rules - heme's FE-NA is 0.36 A from the dictionary's
+    // even though it IS a bond, and NA-NC across the iron is 0.75 - so pairs
+    // involving a metal are excluded rather than counted as chemistry AF3
+    // should have reproduced. This is the same lesson the amino acid table
+    // learned: rigidity comes from the bond graph, and the bond graph does not
+    // know that a dative bond bends.
+    const METALS = new Set([3, 4, 11, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+      28, 29, 30, 31, 37, 38, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 50, 55, 56,
+      57, 78, 79, 80, 81, 82, 83]);
+    const isMetal = (atom) => METALS.has(ligand.atoms[atom].element);
+    // Each ligand atom is its own token, in slot zero of it.
+    for (let i = 0; i < ligand.atoms.length; i += 1) {
+      for (let j = i + 1; j < ligand.atoms.length; j += 1) {
+        if (isMetal(i) || isMetal(j)) continue;
+        const shared = [...neighbours[i]].filter((k) => neighbours[j].has(k));
+        const oneThree = shared.some((k) => !isMetal(k));
+        if (!bonded.has(`${i},${j}`) && !bonded.has(`${j},${i}`) && !oneThree) continue;
+        pairs += 1;
+        const a = (base + i) * dense;
+        const b = (base + j) * dense;
+        const error = Math.abs(distance(batch.refPos, a, b) - distance(theirPos, a, b));
+        if (error > worst) { worst = error; where = `${ligand.atoms[i].name}-${ligand.atoms[j].name}`; }
+      }
+    }
+    base += ligand.atoms.length;
+  }
+  console.log("\nligand chemistry: the dictionary's conformer against AF3's own");
+  report("ligand rigid pairs", `worst ${worst.toFixed(3)} A at ${where} over ${pairs} pairs`,
+         worst < 0.25);
+}
+
 
 let worstTorsion = 0;
 for (let index = 0; index < theirPos.length; index += 1) {

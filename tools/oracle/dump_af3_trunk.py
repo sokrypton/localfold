@@ -354,6 +354,10 @@ def main():
         # an alignment was supplied.
         "numMsa": int(num_msa),
         "numRecycles": int(arguments.recycles),
+        # So a checker knows what to fetch: a ligand's chemistry is not
+        # recoverable from the batch, and guessing it from the atom names is
+        # exactly the sort of inference this file exists to avoid.
+        "ligands": [code.upper() for code in (arguments.ligand or [])],
         "pairformerBlocks": blocks,
         "inputs": inputs,
         "outputs": outputs,

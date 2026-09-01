@@ -14,10 +14,20 @@
  * between the stereo config and the coordinates. Code that counted fields from
  * the left read the coordinates as flags the day those appeared.
  *
+ * 🔴 NOR ARE THE CHARGES, ON SOME COMPONENTS. AF3 reads `GetFormalCharge()`
+ * off the RDKit molecule it built the conformer from, and only falls back to
+ * this file's `charge` column when no conformer could be generated
+ * (features.py:1626). RDKit reperceives: heme's dictionary entry puts -1 on two
+ * carboxylate oxygens and two porphyrin nitrogens, and AF3 records 0 for all
+ * four. Without RDKit in the page the dictionary's value is the honest choice -
+ * it is the published chemistry - but it is not always AF3's, and the checker
+ * reports the difference rather than hiding it. It reaches the model through
+ * one linear into the atom conditioning, alongside the element and the name.
+ *
  * 🔴 AND THE IDEAL COORDINATES ARE NOT AF3's. AF3 builds a fresh conformer per
  * instance with RDKit - fixed bond lengths and angles, random torsions - so its
  * reference positions for GOL bear no resemblance to the dictionary's, while
- * the atom names, elements and charges match exactly. This is the same thing
+ * the atom names and elements match exactly. This is the same thing
  * the 21 amino acids already do (see reference-conformers.js), it costs about
  * 0.01 A of structure, and it is why the checker compares BONDED DISTANCES
  * rather than coordinates. Using the dictionary's ideal conformer is therefore

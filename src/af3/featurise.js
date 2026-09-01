@@ -48,6 +48,10 @@ const QUERIES = 32;
 const KEYS = 128;
 /** AF3's restype alphabet is 31 wide: 20 amino acids, UNK, and the nucleic acids. */
 const RESTYPES = 31;
+/** Every ligand token carries UNK, whatever the atom is. */
+const UNK_AATYPE = 20;
+/** ...and a gap in the MSA, which sits between the amino acids and the nucleotides. */
+const MSA_GAP = 21;
 
 /**
  * A gather in AF3's form: indices into a flattened source, and a mask marking
@@ -67,12 +71,20 @@ function gather(count) {
 export function featuriseProtein(sequence, options = {}) {
   const chains = sequence.split(":").filter((chain) => chain.length > 0);
   const joined = chains.join("");
-  const tokens = joined.length;
+  const residueTokens = joined.length;
+  // 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM, not one token. Sixty-eight
+  // residues plus glycerol is seventy-four tokens, plus heme is a hundred and
+  // eleven - checked against AF3's own batch. Every array below is sized from
+  // this total, and a ligand counted as a single token produces a batch whose
+  // shapes all agree with each other and with nothing else.
+  const ligands = options.ligands ?? [];
+  const ligandTokens = ligands.reduce((sum, ligand) => sum + ligand.atoms.length, 0);
+  const tokens = residueTokens + ligandTokens;
   if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
   const subsets = Math.ceil((tokens * DENSE) / QUERIES);
   const chainLengths = chains.map((chain) => chain.length);
-  const identity = chainIdentity(tokens, chainLengths, chains);
-  const withinChain = residueIndexPerChain(tokens, chainLengths);
+  const identity = chainIdentity(residueTokens, chainLengths, chains);
+  const withinChain = residueIndexPerChain(residueTokens, chainLengths);
   // 🔴 THE LAST RESIDUE OF EVERY CHAIN TAKES AN OXT, not the last token of the
   // batch. Checked against AF3's own complex: a three-chain A/A/B dump carries
   // it on tokens 20, 41 and 62. Getting this wrong is one missing oxygen and
@@ -101,7 +113,7 @@ export function featuriseProtein(sequence, options = {}) {
   const realAtoms = [];
   const pseudoBetaSlot = new Int32Array(tokens).fill(-1);
 
-  for (let token = 0; token < tokens; token += 1) {
+  for (let token = 0; token < residueTokens; token += 1) {
     const code = joined[token];
     aatype[token] = aatypeFor(code);
     // AF3 counts these from one; chains.js counts from zero. See the note above.
@@ -140,6 +152,78 @@ export function featuriseProtein(sequence, options = {}) {
     // may compare reference coordinates at all - which is what makes the random
     // per-residue orientation harmless.
     for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = token;
+  }
+
+  // 🔴 THE LIGANDS, AFTER EVERY POLYMER CHAIN. Their tokens continue the token
+  // index, take their own asym_id, and share ONE ref_space_uid across the whole
+  // component - the six atoms of a glycerol are one rigid conformer, not six
+  // independent ones, and giving each its own uid tells the atom encoder they
+  // may not be compared, which is the opposite of true.
+  let asym = chainLengths.length;
+  const entityOfCode = new Map();
+  const copiesOfEntity = new Map();
+  let ligandToken = residueTokens;
+  for (const ligand of ligands) {
+    asym += 1;
+    // Identical codes are one entity, and each occurrence is a copy of it -
+    // the same rule chainIdentity applies to repeated sequences.
+    if (!entityOfCode.has(ligand.code)) entityOfCode.set(ligand.code, entityOfCode.size);
+    const entity = entityOfCode.get(ligand.code);
+    const copy = (copiesOfEntity.get(entity) ?? 0) + 1;
+    copiesOfEntity.set(entity, copy);
+    const uid = ligandToken;
+    for (let atom = 0; atom < ligand.atoms.length; atom += 1) {
+      const token = ligandToken + atom;
+      const source = ligand.atoms[atom];
+      aatype[token] = UNK_AATYPE;
+      // Every atom of the component is the same residue, so they share its
+      // number - AF3 writes 1 for a single-residue ligand.
+      residueIndex[token] = 1;
+      tokenIndex[token] = token + 1;
+      // `asym` is already one past the last polymer chain, and AF3 counts from
+      // one, so the two cancel: no further +1 here.
+      asymId[token] = asym;
+      entityId[token] = chains.length + entity + 1;
+      symId[token] = copy;
+      seqMask[token] = 1;
+
+      const flat = token * DENSE;          // one atom, and it sits in slot zero
+      refMask[flat] = 1;
+      refElement[flat] = source.element;
+      refCharge[flat] = source.charge;
+      refPos[flat * 3] = source.x;
+      refPos[flat * 3 + 1] = source.y;
+      refPos[flat * 3 + 2] = source.z;
+      for (let character = 0; character < 4; character += 1) {
+        refAtomNameChars[flat * 4 + character] =
+          character < source.name.length ? source.name.charCodeAt(character) - 32 : 0;
+      }
+      realAtoms.push(flat);
+      // ...and it is its own centre, where a residue's is CB.
+      pseudoBetaSlot[token] = 0;
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
+    }
+    ligandToken += ligand.atoms.length;
+  }
+
+  // 🔴 ONE DIRECTION PER BOND, AND [0,0] CLEARED. AF3 sets contact[i][j] from
+  // the CCD's bond table and does NOT set [j][i]; only the OpenFold3 dialect
+  // symmetrises. It then clears [0,0] explicitly, because its padded gather
+  // rows are zeros and would otherwise mark token 0 as bonded to itself.
+  // Neither is cosmetic: this matrix goes through a learned linear straight
+  // into the pair representation.
+  let bondMatrix;
+  if (ligands.some((ligand) => ligand.bonds.length > 0)) {
+    bondMatrix = new Float32Array(tokens * tokens);
+    let base = residueTokens;
+    for (const ligand of ligands) {
+      for (const bond of ligand.bonds) {
+        bondMatrix[(base + bond.from) * tokens + (base + bond.to)] = 1;
+        if (options.symmetriseBonds) bondMatrix[(base + bond.to) * tokens + (base + bond.from)] = 1;
+      }
+      base += ligand.atoms.length;
+    }
+    bondMatrix[0] = 0;
   }
 
   const atomCount = realAtoms.length;
@@ -207,7 +291,14 @@ export function featuriseProtein(sequence, options = {}) {
   const msa = new Int32Array(sequences * tokens);
   const msaMask = new Float32Array(sequences * tokens).fill(1);
   const deletionMatrix = new Float32Array(sequences * tokens);
-  msa.set(aatype, 0);
+  // 🔴 A LIGAND TOKEN IS A GAP IN THE MSA, NOT AN UNKNOWN RESIDUE. Its aatype
+  // is UNK (20) but AF3 writes MSA_GAP (21) in the alignment and in the
+  // profile - an alignment has nothing to say about an atom. Copying aatype
+  // across, which is right for every polymer token, puts a 20 there instead and
+  // tells the model the ligand is a row of unknown amino acids.
+  const queryRow = Int32Array.from(aatype);
+  for (let token = residueTokens; token < tokens; token += 1) queryRow[token] = MSA_GAP;
+  msa.set(queryRow, 0);
   for (let row = 0; row < extra.length; row += 1) {
     msa.set(extra[row], (row + 1) * tokens);
     if (options.deletionMatrix?.[row]) {
@@ -248,6 +339,7 @@ export function featuriseProtein(sequence, options = {}) {
     // AF3 keeps these separate and they are equal for a protein-only chain:
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
+    bondMatrix,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
     features: { residueIndex, tokenIndex, asymId, entityId, symId },
