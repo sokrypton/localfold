@@ -546,7 +546,42 @@ function syncModelControls() {
   // select reads None. Setting them here as well would give one pair of
   // controls two owners that disagree - so they are not touched here at all,
   // and they mean the same thing for all three models.
+  syncMaxMsa();
   if (af3) syncAf3Count();
+}
+
+/**
+ * The Max MSA dial, rebuilt for the model.
+ *
+ * 🔴 AlphaFold 3 HAS ONE MSA TRACK AND AlphaFold 2 HAS TWO. AF2 clusters the
+ * alignment and runs the leftovers through a SECOND stack, so its dial is a
+ * pair - "512:1024" is 512 clusters and 1024 extra sequences. AF3's evoformer
+ * truncates one `msa_stack` to `num_msa` and has no extra stack at all: the
+ * `extra_msa_target_feat` in its code is a Linear projecting target_feat into
+ * the MSA channel, a layer name rather than a track. So the second number does
+ * nothing under AF3 - foldWithAf3 already reads only the first - and showing it
+ * invites a reader to tune something that is not connected to anything.
+ *
+ * 🔴 AUTO KEEPS THE PAIR. Which model runs is not known until the fold starts -
+ * it depends on the chain count, and on whether there is a ligand - so under
+ * Auto the dial shows the form that can express both, and AF3 ignores the half
+ * it has no use for. Only an explicit AF3 narrows it.
+ */
+const MAX_MSA_DEPTHS = [512, 256, 128, 64, 32, 16];
+
+function syncMaxMsa() {
+  const select = document.getElementById("max-msa");
+  if (select === null) return;
+  const af3 = (document.getElementById("model-family")?.value ?? "auto") === "af3";
+  const previous = Number.parseInt(select.value, 10);
+  const values = MAX_MSA_DEPTHS.map((depth) => (af3 ? String(depth) : `${depth}:${depth * 2}`));
+  select.replaceChildren(...values.map((value) => Object.assign(
+    document.createElement("option"), { value, textContent: value })));
+  // The DEPTH survives the switch, because it is the same quantity either way -
+  // only its notation changed, and re-picking it after every model change would
+  // be the dial forgetting what it was told.
+  const kept = values.find((value) => Number.parseInt(value, 10) === previous);
+  select.value = kept ?? values[0];
 }
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
