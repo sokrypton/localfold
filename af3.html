@@ -1,0 +1,170 @@
+<!--
+af3.html
+--------
+AI Context: AF3 PAGE ENTRY POINT
+- Folds a protein chain with AlphaFold 3 in the browser: no server, no MSA.
+- The model is src/af3/; this file is only markup. web/af3.js wires it up.
+- Two facts shape the layout: the checkpoint is ~265 MiB (so the download is
+  gated and metered) and a 68-residue fold is minutes (so the diffusion step
+  is reported, and the step count is on the panel rather than buried).
+-->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LocalFold · AlphaFold 3</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
+    <link rel="stylesheet" href="./web/localfold.css">
+    <style>
+        #canvasContainer {
+            width: 948px !important;
+            min-height: 480px !important;
+            resize: none !important;
+        }
+
+        #terms-gate {
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+            border-radius: 8px;
+            padding: 14px 16px;
+            margin-bottom: 10px;
+            font-size: 13px;
+            line-height: 1.55;
+            color: #78350f;
+        }
+
+        #terms-gate h2 {
+            margin: 0 0 6px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        #terms-gate ul {
+            margin: 8px 0;
+            padding-left: 18px;
+        }
+
+        .metrics {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
+            color: #64748b;
+            padding: 8px 12px;
+        }
+
+        .metrics b {
+            color: #0f172a;
+            font-weight: 600;
+        }
+    </style>
+    <script>window.py2dmolReadyMessage = "Ready. Paste a sequence and press Fold.";</script>
+</head>
+
+<body class="bg-gray-50 text-gray-800 font-sans p-4">
+
+    <div id="viewer-root" class="mx-auto" style="width: 948px; position: relative;">
+
+        <div class="page-head" style="padding-right: 0;">
+            <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">AlphaFold 3</span></h1>
+        </div>
+
+        <!-- THE GATE. Nothing is downloaded until this is accepted; web/af3.js
+             remembers the acceptance per browser and never asks the network
+             before it. -->
+        <div id="terms-gate" hidden>
+            <h2>Before the model downloads</h2>
+            <p>
+                This page runs AlphaFold 3 entirely in your browser. Pressing Fold downloads
+                about <b>265 MiB</b> of model parameters to this device and runs them on your GPU.
+                Nothing about your sequence leaves the machine.
+            </p>
+            <ul>
+                <li>The parameters are made available for <b>non-commercial use only</b>, under the
+                    terms of the checkpoint they were converted from.</li>
+                <li>Predictions are not experimental structures. Do not rely on them for clinical,
+                    diagnostic, or safety-critical decisions.</li>
+                <li>A fold takes minutes and will keep your GPU busy for the whole time.</li>
+            </ul>
+            <button id="accept-terms" class="btn btn-primary" type="button" style="height: 30px; font-size: 13px;">
+                I understand — download the model
+            </button>
+        </div>
+
+        <div id="fold-panel" class="container-box" style="width: 948px; margin-bottom: 10px;">
+            <div class="fetch-panel">
+                <div class="fetch-row" id="fold-input-container">
+                    <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
+                        placeholder="Paste a protein sequence">GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE</textarea>
+                    <div class="fold-actions" style="width: 96px; min-width: 96px; max-width: 96px; flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px;">
+                        <button id="predict" class="btn btn-primary" style="width: 100%; height: 32px; justify-content: center; font-size: 13px;">
+                            <i class="fa-solid fa-cubes"></i>
+                            <span>Fold</span>
+                        </button>
+                        <!-- THE ONLY DIAL THAT CHANGES THE TIME. Diffusion is 97%
+                             of a fold and is linear in this number. -->
+                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                            <label for="steps" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Steps</label>
+                            <select id="steps" style="height: 24px; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
+                                <option value="25">25</option>
+                                <option value="50">50</option>
+                                <option value="100">100</option>
+                                <option value="200" selected>200</option>
+                            </select>
+                        </div>
+                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+                            <label for="seed" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Seed</label>
+                            <input id="seed" type="number" value="20260831"
+                                style="width: 74px; height: 24px; padding: 0 3px; font-size: 11px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; text-align: center;">
+                        </div>
+                    </div>
+                </div>
+
+                <div id="status-row">
+                    <div id="status-message">Ready. Paste a sequence and press Fold.</div>
+                    <progress id="progress" max="1" value="0" data-state="idle"></progress>
+                </div>
+            </div>
+        </div>
+
+        <div id="mainContainer" style="width: 948px; display: flex; flex-direction: column; gap: 8px;">
+            <div id="canvasContainer" class="container-box" style="position: relative; width: 948px; min-height: 480px; padding: 0; overflow: hidden; background: #ffffff; border-radius: 8px;">
+                <div id="viewer" style="width: 100%; min-height: 480px; background: #ffffff;">
+                    <p class="viewer-empty" style="display: grid; place-items: center; height: 480px; margin: 0; color: #94a3b8; font-size: 13px;">Press Fold to predict a structure.</p>
+                </div>
+            </div>
+
+            <!-- CA-CA IS HERE ON PURPOSE, NEXT TO pLDDT. pLDDT comes off the
+                 trunk and can look healthy over coordinates that are not a
+                 molecule; the backbone spacing cannot. -->
+            <div class="container-box metrics">
+                <span>mean pLDDT <b id="plddt-value">—</b></span>
+                <span>CA–CA <b id="geometry-value">—</b> <span style="color:#94a3b8">(ideal 3.80 Å)</span></span>
+                <span>time <b id="time-value">—</b></span>
+            </div>
+        </div>
+
+        <footer style="margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; gap: 12px;">
+                <a href="./" style="color: #3b82f6; text-decoration: none; font-weight: 500;">AlphaFold 2 with MSA</a>
+                <span>·</span>
+                <a href="./single.html" style="color: #3b82f6; text-decoration: none;">Single sequence</a>
+                <span>·</span>
+                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Source</a>
+            </div>
+            <div id="gpu-summary" data-state="checking">Checking WebGPU…</div>
+        </footer>
+
+    </div>
+
+    <script src="./web/vendor/py2Dmol.embed.min.js"></script>
+    <script type="module">
+        import { start } from "./web/af3.js";
+        start();
+    </script>
+</body>
+
+</html>

@@ -28,7 +28,8 @@ export const VIEWER_CANVAS_HEIGHT = 420;
  * @param {(message: string) => void} [options.onFail] shown in place of the
  *   structure; defaults to writing the message into the container.
  */
-export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail }) {
+export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_HEIGHT, onFail,
+                                        frameLabel = "recycle" }) {
   let renderer;
   let objectName;
   let frames = 0;
@@ -135,16 +136,16 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
           if (camera) Object.assign(renderer.viewerState, camera);
           const frame0 = renderer.objectsData?.[objectName]?.frames?.[0];
           if (frame0 !== undefined) {
-            frame0.name = "recycle_0";
-            frame0.label = "recycle_0";
-            frame0.title = "recycle_0";
+            frame0.name = `${frameLabel}_0`;
+            frame0.label = `${frameLabel}_0`;
+            frame0.title = `${frameLabel}_0`;
           }
           built = true;
         } else {
           const frame = api.frameFromText(pdb);
-          frame.name = `recycle_${frames}`;
-          frame.label = `recycle_${frames}`;
-          frame.title = `recycle_${frames}`;
+          frame.name = `${frameLabel}_${frames}`;
+          frame.label = `${frameLabel}_${frames}`;
+          frame.title = `${frameLabel}_${frames}`;
           renderer.addFrame(frame, objectName);
         }
         // AFTER EVERY FRAME, not just the first. py2Dmol builds side-chain
@@ -163,6 +164,25 @@ export function createStructureViewer({ container, canvasHeight = VIEWER_CANVAS_
         if (frames === 0) fail(error instanceof Error ? error.message : String(error));
         return { built: false, frames };
       }
+    },
+
+    /**
+     * Fly to the best view of what is currently drawn.
+     *
+     * 🔴 CALLED AFTER THE FRAMES ARE IN, NOT BEFORE. A viewer built on the
+     * first frame of a diffusion trajectory orients on a cloud of noise
+     * hundreds of angstroms across, and every real frame after it is then a
+     * speck in the middle.
+     */
+    orient() {
+      if (renderer === undefined) return;
+      try {
+        if (window.py2dmolOrient?.orientToBestView) {
+          window.py2dmolOrient.orientToBestView(renderer, { positions: [], animate: false });
+        } else {
+          renderer.orient?.({ positions: [] });
+        }
+      } catch { /* a view is not worth losing the structure over */ }
     },
 
     /** Show a frame and draw it. Indices are zero-based. */

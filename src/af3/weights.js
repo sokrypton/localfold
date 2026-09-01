@@ -91,8 +91,8 @@ export function quantiseInPlace(values, { bits, group, mode = "asym", search = f
  */
 const KEEP_FLOAT32 = /\/(scale|offset|bias)$|_bias$|_weight$|\/output_b$/;
 
-export async function openAf3Store(manifest = MANIFEST, quant = null) {
-  const store = await HttpTensorStore.open(manifest);
+export async function openAf3Store(manifest = MANIFEST, quant = null, onProgress = undefined) {
+  const store = await HttpTensorStore.open(manifest, onProgress);
   if (quant === null) return store;
   const cache = new Map();
   const original = store.tensor.bind(store);
