@@ -41,6 +41,14 @@ Flow matches or beats the 200-step sampler with ~25x fewer denoiser calls, on
 both proteins measured. It is two proteins, both small designed alpha/beta
 folds, both single-sequence - an observation, not a result.
 
+🔴 AND BOTH ARE 68 AND 92 RESIDUES, WHICH IS WHY THEY KEPT PASSING. Every AF3
+number in this file was a small single-sequence protein until 3RPF; the fold
+that dropped a 512-row alignment on the floor scored the same on these two,
+because they never had an alignment to drop. With an MSA, 3RPF's 146-residue
+chain reaches 1.10 A and its complex 0.32 A - see the section on the AlphaFold
+Server below. A regression suite of two proteins under 100 residues, both
+folded single-sequence, is not one.
+
 ### Speed, 68 tokens
 
 A flow-8 fold is about 7 s, of which the trunk is ~1 s. It was ~150 s when the
@@ -232,73 +240,52 @@ with `unpairedFrom` at 256. That is `max_paired_sequences = msa_size // 2` with
 the remainder to the unpaired block, which is what featurise.js needs to compute
 the profile over the right half.
 
-🔴 BUT OUR AF3 IS MUCH LESS CONFIDENT ON THIS COMPLEX THAN IT SHOULD BE, AND
-THAT IS UNRESOLVED. Same chains, same search: we get pLDDT 62.6 where
-AlphaFold-Multimer gets 96.5 / ipTM 0.897, and where the AlphaFold Server's own
-AF3 gets **pTM 0.91, ipTM 0.91, ranking 0.94**, no clashes, 5% disordered.
+🔴 THE FOLD PASSED ONE MSA ROW TO THE TRUNK, and that was the whole of it.
+`src/af3/fold.js` called the trunk with `sequences: 1` and sliced every MSA
+array down to the query, so the MSA stack never saw an alignment. Fixed; the
+numbers below are after.
 
-What has been ruled out:
+It is worth knowing how it hid, because the next bug of this kind will hide the
+same way. An alignment still reached the model: `profile` and `deletion_mean`
+are computed over all of it and ride into `target_feat`, so supplying one DID
+improve the fold (44.5 -> 62.6 pLDDT on chain A) and the status line honestly
+reported the depth that had been FEATURISED. Nothing reported the depth the
+trunk was handed. `foldBatch` now emits it and `tools/gpu/fold.js` prints a
+marker when the two disagree.
 
-- **Not the sampler.** Diffusion at 40 steps gives 60.2 against flow-8's 62.6.
-  The hypothesis was reasonable - flow was only ever validated on two small
-  single-sequence monomers, and a complex adds rigid-body docking - but the
-  numbers do not support it.
-- **Not the MSA being absent.** Single-sequence AF3 on the same complex gives
-  44.5, so the alignment is worth +18.
-- **Not the featuriser**, everywhere it can be checked: exact against AF3's own
-  batch for a monomer, a monomer with an MSA, a homodimer with an MSA, and a
-  three-chain complex.
-- **Not templates.** The server run above used four hits per chain, but a second
-  server run with templates off is just as good. This was the prime suspect and
-  it is wrong; do not spend time implementing templates to chase this.
+It also explains evidence that fitted none of the theories being tested: more
+recycles made the structure worse while raising pLDDT, the sampler and the
+precision barely mattered, and every component measured exact against AF3 while
+the assembled fold was poor. The model was right the whole way down.
 
-### The reference, and how to use it
+### Against the AlphaFold Server, on 3RPF
 
-`~/Downloads/fold_2026_09_01_10_17.zip` is the AlphaFold Server's own run of
-this exact pair. It contains far more than a score:
+Its own run of the same two chains is the reference (`useStructureTemplate:
+false`, ptm 0.91 / iptm 0.91 across five seeds), and its per-chain MSAs are in
+the zip, which is what makes this comparison clean - no MMseqs2 in the loop.
 
-- `msas/` - the server's own **paired and unpaired A3Ms, per chain**
-  (paired 1849/933 rows, unpaired 1805/593). Feeding these straight into
-  `af3MsaFromA3m` removes MMseqs2 and our own assembly from the picture
-  entirely. If we still land near 60 on the server's own alignments, the fault
-  is downstream of the MSA and the paired port is exonerated. **Do this first.**
-  Note their per-chain paired depths DIFFER, because these are the inputs to
-  AF3's pairing rather than its output; ColabFold's `pair.a3m` is already
-  row-aligned, which is why `generateMmseqs2PairedMsa` requires equal depth.
-- `templates/` - four hits per chain, `useStructureTemplate: true`. Kept for
-  completeness only: a server run WITHOUT templates scores just as well, so this
-  is not the difference.
-- Five `.cif` models with full PAE/pLDDT arrays.
+| | before | after |
+|---|---|---|
+| chain A, 146 res | 9.96 A, TM 0.409, pLDDT 58.1 | **1.10 A, TM 0.962, pLDDT 87.9** |
+| both chains, 220 res | 17.21 A, TM 0.196 | **0.32 A, TM 0.997, pLDDT 93.9** |
 
-### The two suspects left, and the tests that separate them
+217 of 220 CA within one angstrom. 6MRR is unchanged at 0.76 A, because a
+single-sequence fold always had one row.
 
-🔴 **THE PAIRED BLOCK HAS NEVER BEEN CHECKED AGAINST AF3'S OWN BATCH.** The
-homodimer oracle that verified `unpairedFrom` and the budget split came back
-with an EMPTY paired block - the UniRef headers carry no species AF3 can pair
-on, so its paired features collapsed to the query row. Every exact match this
-file claims for a complex is therefore a match with no paired rows in it. The
-row order, the half-and-remainder crop and `unpairedFrom` are all unverified in
-the one configuration a heteromer actually uses. Feeding the server's own
-per-chain paired A3Ms through `--paired-a3m` would close this.
+### Templates are not the difference
 
-🔴 **AND THE STRUCTURE MAY BE FINE WHILE THE NUMBER IS WRONG.** pLDDT is the
-only thing being compared, and AF3's confidence head is the least-exercised part
-of this port - it has no ipTM at all, which is already a known hole in it.
-Superposing our coordinates on `..._model_0.cif` costs nothing and splits the
-question in two: a good structure with a bad score is a confidence-head bug, a
-bad structure is a trunk or sampler bug. `tools/score_fold.py` takes a reference
-already. **Do this before anything else** - it is the cheapest test available
-and it decides which half of the model to look at.
+The server scores the same with them off, so do not implement templates to
+chase a complex that folds badly. That was the prime suspect for an hour and it
+was wrong.
 
-### A separate bug found while measuring this
+### A separate bug, found while measuring and not yet fixed
 
 **A fold crawls in a background tab.** The per-block yield is
 `await new Promise((resolve) => setTimeout(resolve, 0))`, and Chrome clamps
 setTimeout to >=1 s in a hidden tab - so a 48-block pass that takes under a
-second takes the better part of a minute, and the trunk appears to hang.
+second takes the better part of a minute and the trunk appears to hang.
 Measured: pass 1 reached block 11 in five minutes hidden, then jumped to block
-28 the moment the tab was touched. A MessageChannel yield is not throttled and
-would fix it; nothing has been changed yet.
+28 the moment the tab was touched. A MessageChannel yield is not throttled.
 
 ## The weights
 
