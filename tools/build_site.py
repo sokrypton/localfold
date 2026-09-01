@@ -33,6 +33,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "dist"
+# The domain the published site answers to. See the CNAME note in build().
+DOMAIN = "localfold.org"
 
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
@@ -361,6 +363,15 @@ def build(include_model: bool) -> int:
         print("the site would load in a checkout and 404 once deployed;"
               " check .gitignore is not swallowing a source directory", file=sys.stderr)
         return 1
+
+    # 🔴 THE CUSTOM DOMAIN LIVES IN THE ARTIFACT, NOT ONLY IN THE SETTINGS.
+    # This site publishes through upload-pages-artifact rather than a branch, and
+    # for that route the CNAME file is what binds the domain to the repository -
+    # a deploy without one can drop the setting, after which Pages serves 404 to
+    # a domain whose DNS is perfectly correct. That failure reads as a DNS
+    # problem and is not one: the request reaches GitHub, which does not know
+    # whose site to answer with.
+    (OUT / "CNAME").write_text(f"{DOMAIN}\n")
 
     total = sum(path.stat().st_size for path in OUT.rglob("*") if path.is_file())
     count = sum(1 for path in OUT.rglob("*") if path.is_file())
