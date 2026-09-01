@@ -181,6 +181,31 @@ async function main() {
     state = { ...state, msa: next.msa, pair: next.pair };
     console.log(`  after MSA block ${index}`);
     report("msa", at(`msa_stack/__call__:msa#${index}`), next.msa);
+    // 🔴 WHICH ROWS, because "the msa is 20% wrong" and "row 17 onwards is
+    // wrong" are different bugs and the relRMS cannot tell them apart. The MSA
+    // is the one tensor here with a depth axis, so a slicing or padding mistake
+    // shows up as whole rows being wrong and the rest being exact.
+    if (process.argv.includes("--where") && index === 0) {
+      const theirs = at(`msa_stack/__call__:msa#${index}`);
+      const width = theirs.length / sequences;
+      const rows = [];
+      for (let s = 0; s < sequences; s += 1) {
+        let error = 0;
+        let scale = 0;
+        for (let k = 0; k < width; k += 1) {
+          const a = next.msa[s * width + k];
+          const b = theirs[s * width + k];
+          error += (a - b) ** 2; scale += b * b;
+        }
+        rows.push({ s, rel: Math.sqrt(error / Math.max(scale, 1e-30)) });
+      }
+      const bad = rows.filter((r) => r.rel > 1e-4).map((r) => r.s);
+      const good = rows.filter((r) => r.rel <= 1e-4).map((r) => r.s);
+      console.log(`    rows exact (<=1e-4): ${good.length ? good.join(",") : "none"}`);
+      console.log(`    rows wrong  (>1e-4): ${bad.length ? bad.join(",") : "none"}`);
+      console.log("    per-row relRMS: " + rows.slice(0, 8)
+        .map((r) => `${r.s}:${r.rel.toExponential(1)}`).join(" "));
+    }
     report("pair", at(`msa_stack/__call__:pair#${index}`), next.pair);
   }
   console.log("  trunk output (the pairformer stack's input)");

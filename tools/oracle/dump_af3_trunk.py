@@ -322,6 +322,12 @@ def main():
         # index it by token, and the split is not recoverable from that.
         "chains": chains,
         "tokens": int(np.asarray(batch["aatype"]).shape[-1]),
+        # 🔴 WRITTEN OUT, not merely used. A checker cannot recover this from
+        # the arrays - the msa array is padded to msa_crop_size and the model
+        # read only the first num_msa rows of it - so a dump without this field
+        # silently invites the reader to guess, and the guess is wrong whenever
+        # an alignment was supplied.
+        "numMsa": int(num_msa),
         "pairformerBlocks": blocks,
         "inputs": inputs,
         "outputs": outputs,

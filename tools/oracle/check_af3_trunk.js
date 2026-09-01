@@ -316,8 +316,20 @@ async function main() {
     distogram: { halfLogits: tensors.get("diffuser/distogram_head/half_logits/weights").data },
   };
 
+  // 🔴 HOW MUCH THIS STACK AMPLIFIES, measured against ITSELF. Every component
+  // can be exact against AF3 and the assembled trunk still diverge, and there
+  // are two very different reasons for that: a stack that amplifies tiny
+  // differences enormously (in which case matching AF3 bit for bit is not
+  // achievable and not the goal), or one that is unstable (in which case it is
+  // a bug). --perturb=1e-6 runs the whole trunk twice with a relative
+  // perturbation of the input pair and reports how far apart the two outputs
+  // land, which separates the two without needing AF3 at all.
+  //
+  // AF3 itself runs in bfloat16, whose relative epsilon is 3.9e-3, so a trunk
+  // that turned 1e-6 into anything large could not be the trunk AF3 ships.
+  const perturb = Number(process.argv.find((a) => a.startsWith("--perturb="))?.slice(10) ?? "0");
   const started = Date.now();
-  const result = runTrunk({
+  const trunkInput = {
     tokens,
     sequences,
     targetFeat: buildTargetFeat(tensors, dump, tokens),
@@ -361,7 +373,8 @@ async function main() {
       entityId: input("entity_id"),
       symId: input("sym_id"),
     },
-  }, weights, { swapTransposedBias: dump.model !== "alphafold3" },
+  };
+  const result = runTrunk(trunkInput, weights, { swapTransposedBias: dump.model !== "alphafold3" },
   // 🔴 WHICH BLOCK IT STARTS IN. A residual stack forty-eight deep turns one
   // bad value into a bigger one every block, so the block where the magnitude
   // stops looking like a representation and starts looking like a runaway is
@@ -383,6 +396,26 @@ async function main() {
     }
     : undefined);
   const elapsed = (Date.now() - started) / 1000;
+
+  if (perturb > 0) {
+    const nudged = Float32Array.from(trunkInput.targetFeat);
+    // Deterministic, so the number is repeatable, and relative so it means the
+    // same thing at any scale.
+    for (let k = 0; k < nudged.length; k += 1) {
+      nudged[k] *= 1 + perturb * (((k * 2654435761) % 2048) / 1024 - 1);
+    }
+    const second = runTrunk({ ...trunkInput, targetFeat: nudged },
+      weights, { swapTransposedBias: dump.model !== "alphafold3" });
+    let error = 0;
+    let scale = 0;
+    for (let k = 0; k < result.pair.length; k += 1) {
+      error += (second.pair[k] - result.pair[k]) ** 2;
+      scale += result.pair[k] ** 2;
+    }
+    const out = Math.sqrt(error / Math.max(scale, 1e-30));
+    console.log(`  perturbing target_feat by ${perturb.toExponential(0)} moves the`
+      + ` trunk's pair by ${out.toExponential(3)}  (amplification ${(out / perturb).toExponential(1)}x)`);
+  }
 
   console.log(`${dump.model}, ${tokens} tokens, embedder + 4 MSA blocks +`
     + ` ${dump.pairformerBlocks} pairformer blocks + distogram head`
