@@ -171,6 +171,10 @@ export async function embedderWeights(store) {
     prevEmbeddingNormOffset: await T("prev_embedding_layer_norm/offset"),
     prevEmbedding: await T("prev_embedding/weights"),
     positionActivations: await T("~_relative_encoding/position_activations/weights"),
+    // 🔴 [1, 128] - ONE input feature, the contact matrix. It was in the
+    // shipped bundle and read by nothing, so every fold downloaded it and
+    // multiplied it by no ligand bonds at all. See embedder-webgpu.js.
+    bondEmbedding: await T("bond_embedding/weights"),
     msaActivations: await T("msa_activations/weights"),
     extraMsaTargetFeat: await T("extra_msa_target_feat/weights"),
     singleActivations: await T("single_activations/weights"),

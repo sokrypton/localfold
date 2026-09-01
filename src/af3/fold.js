@@ -25,6 +25,7 @@
  * see the loop below - and default to none, which is what the oracle dumps
  * were made with.
  */
+import { ELEMENT_SYMBOLS } from "./ccd-component.js";
 import { perAtomConditioning } from "./atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
@@ -46,7 +47,26 @@ const THREE_LETTER = {
   T: "THR", W: "TRP", Y: "TYR", V: "VAL",
 };
 
-const ELEMENT_SYMBOL = { 6: "C", 7: "N", 8: "O", 16: "S" };
+/**
+ * The element symbol for an atomic number.
+ *
+ * 🔴 THIS WAS FOUR ENTRIES - C, N, O, S - AND EVERYTHING ELSE FELL THROUGH TO
+ * CARBON. Right for a protein, which has nothing else, and wrong for most
+ * ligands: across a corpus of 51 distinct hetero components, TWENTY-EIGHT carry
+ * an element it dropped. Every phosphate-bearing ligand (P), every heme (FE),
+ * and every metal ion - a magnesium written as a carbon atom.
+ *
+ * It costs twice over, because a viewer with no CONECT records derives a
+ * ligand's bonds from the DISTANCE between atoms of known elements: a
+ * disulfide at 2.05 A read as C-C (whose ceiling is 1.8) vanishes, and a P-O
+ * at 1.63 read as C-O survives its 1.65 ceiling by two hundredths.
+ *
+ * ccd-component.js already had the full list, indexed the same way, so this is
+ * one question with one answer rather than a second short table beside it.
+ */
+function elementSymbol(atomicNumber) {
+  return ELEMENT_SYMBOLS[atomicNumber - 1] ?? "C";
+}
 
 /** The four-character atom name AF3 stores as codes offset by 32. */
 export function atomName(nameChars, slot) {
@@ -85,11 +105,16 @@ export function toPdb(batch, positions, plddt) {
       componentOf.set(span.from + offset, span.code);
     }
   }
+  // ...and which serial each ligand token was written as, so CONECT can name
+  // them. A ligand token is one heavy atom and it sits in slot zero, so the
+  // token is the atom; a polymer token is many atoms and has no entry here.
+  const serialOfToken = new Map();
   for (let token = 0; token < tokens; token += 1) {
     const ligandCode = componentOf.get(token);
     for (let atom = 0; atom < dense; atom += 1) {
       const slot = token * dense + atom;
       if (!batch.predDenseAtomMask[slot]) continue;
+      if (ligandCode !== undefined && atom === 0) serialOfToken.set(token, serial);
       const name = atomName(batch.refAtomNameChars, slot);
       const confidence = plddt ? plddt[slot] : 0;
       lines.push(
@@ -107,12 +132,47 @@ export function toPdb(batch, positions, plddt) {
         + positions[slot * 3 + 1].toFixed(3).padStart(8)
         + positions[slot * 3 + 2].toFixed(3).padStart(8)
         + "  1.00" + confidence.toFixed(2).padStart(6) + "          "
-        + (ELEMENT_SYMBOL[batch.refElement[slot]] ?? "C").padStart(2));
+        + elementSymbol(batch.refElement[slot]).padStart(2));
       serial += 1;
     }
     if (batch.asymId !== undefined && token + 1 < tokens
         && batch.asymId[token + 1] !== batch.asymId[token]) {
       lines.push("TER");
+    }
+  }
+  // 🔴 CONECT, OR THE LIGAND IS A BAG OF ATOMS. A viewer handed no bonds
+  // derives them from the DISTANCE between atoms - py2Dmol says so out loud
+  // ("No bonds - will use distance calculation") - and on a diffusion
+  // trajectory it re-derives them from EVERY frame's coordinates, which are
+  // deliberately noisy until the last few steps. The sticks then appear, cross
+  // and vanish frame to frame: the picture looks broken while the prediction
+  // may be fine. The bonds are already known - they came out of the CCD - so
+  // there is nothing to compute here, only to write down.
+  //
+  // Ligand-internal only. A covalent link between a ligand and a polymer is
+  // not featurised yet (see featurise.js), so claiming one here would be the
+  // writer inventing chemistry the fold never saw.
+  //
+  // Four partners per line, continued on another CONECT for an atom with more:
+  // the record has room for exactly four and a fifth silently overruns into
+  // the next field.
+  const partners = new Map();
+  for (const span of batch.ligandSpans ?? []) {
+    for (const bond of span.bonds ?? []) {
+      const a = serialOfToken.get(span.from + bond.from);
+      const b = serialOfToken.get(span.from + bond.to);
+      if (a === undefined || b === undefined) continue;   // a masked atom
+      if (!partners.has(a)) partners.set(a, []);
+      if (!partners.has(b)) partners.set(b, []);
+      partners.get(a).push(b);
+      partners.get(b).push(a);
+    }
+  }
+  for (const [atom, bonded] of [...partners].sort((x, y) => x[0] - y[0])) {
+    for (let start = 0; start < bonded.length; start += 4) {
+      let line = "CONECT" + String(atom).padStart(5);
+      for (const other of bonded.slice(start, start + 4)) line += String(other).padStart(5);
+      lines.push(line);
     }
   }
   lines.push("END");
@@ -252,8 +312,15 @@ export function normalFrom(seed) {
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
  * @param {{mode?: "flow"|"diffusion", steps?: number, recycles?: number,
  *          seed?: number, blocks?: number,
+ *          schedule?: {sigmaData?: number, sigmaMin?: number, sigmaMax?: number,
+ *                      rho?: number},
  *          onStage?: (name: string, detail: object) => void,
  *          onStep?: (step: object) => void}} [options]
+ *
+ * `schedule` overrides the EDM noise schedule the levels are drawn from. It
+ * exists for probing where a structure actually resolves - `sigmaMax` is in
+ * units of sigmaData, so the walk starts at `sigmaData * sigmaMax` angstroms -
+ * and folding leaves it unset, which is AF3's own 160.
  */
 export async function foldBatch(device, batch, weights, options = {}) {
   const steps = options.steps ?? 200;
@@ -311,6 +378,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
       msaRows: batch.msa,
       deletionMatrix: batch.deletionMatrix,
       msaMask: batch.msaMask,
+      // 🔴 NAMED, BECAUSE THIS OBJECT IS BUILT FIELD BY FIELD. A key the batch
+      // carries and this literal does not name is a key thrown away here, and
+      // the embedder cannot tell that from a fold with no ligand: both arrive
+      // as `undefined` and both fall back to zeros. That is how the whole bond
+      // feature came to be computed, shipped and never applied.
+      bondMatrix: batch.bondMatrix,
       pairMask, seqMask, previousPair, previousSingle,
     }, weights.trunk, DIALECT, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
@@ -361,10 +434,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
         steps, stopAfter: options.stopAfter,
         normal: normalFrom(options.seed ?? 20260831),
         onStep: options.onStep,
+        ...(options.schedule ?? {}),
       })
     : await flowOnGpu(device, headInput, weights.diffusion, {
         cycles: steps, normal: normalFrom(options.seed ?? 20260831),
         onStep: options.onStep,
+        // The schedule reaches noiseLevels through here, and both samplers
+        // already forward their options to it.
+        ...(options.schedule ?? {}),
       });
 
   // The confidence head reads the sample back.

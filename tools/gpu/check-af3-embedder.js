@@ -10,6 +10,12 @@
  * same-chain and same-entity and the encoding collapses to one clamped offset.
  * A single-chain check passes on an implementation that ignores asym_id.
  *
+ * 🔴 AND IT MUST CARRY A BOND MATRIX. The reference applies the bond embedding
+ * only when one is supplied, so a fixture without one compared zero against
+ * zero - and the GPU embedder had neither the weight nor the term for as long
+ * as ligands have existed here, while this check passed. A feature that is
+ * absent from BOTH sides of a differential test is not tested by it.
+ *
  * The template term is compared as zeros on both sides: the GPU embedder does
  * not add it (it reads the pair at this point and is sequenced by the caller),
  * so the reference is given a zero template to match. That is a statement about
@@ -84,6 +90,7 @@ export async function main(device, args) {
     prevSingleEmbeddingNormScale: await T("prev_single_embedding_layer_norm/scale"),
     prevSingleEmbeddingNormOffset: await T("prev_single_embedding_layer_norm/offset"),
     prevSingleEmbedding: await T("prev_single_embedding/weights"),
+    bondEmbedding: await T("bond_embedding/weights"),
   };
 
   // Several chains, two of them the same entity, so every branch is live.
@@ -110,11 +117,20 @@ export async function main(device, args) {
     deletionMatrix[index] = next() * 6;
   }
 
+  // A SPARSE, ASYMMETRIC CONTACT MATRIX, which is the shape AF3's is: one
+  // direction per bond from the CCD table, and [0,0] cleared. Sparse because a
+  // dense one would let a wrong index still land on a 1 and agree by luck.
+  const bondMatrix = new Float32Array(tokens * tokens);
+  for (let t = perChain; t + 1 < tokens; t += 3) {
+    bondMatrix[t * tokens + (t + 1)] = 1;
+  }
+  bondMatrix[0] = 0;
+
   const input = {
     tokens, sequences,
     targetFeat: deterministic(tokens * FEATURE_WIDTH, 11 + tokens),
     features: { residueIndex, tokenIndex, asymId, entityId, symId },
-    msaRows, deletionMatrix,
+    msaRows, deletionMatrix, bondMatrix,
     previousPair: deterministic(tokens * tokens * PAIR_CHANNELS, 22 + tokens),
     previousSingle: deterministic(tokens * SINGLE_CHANNELS, 33 + tokens),
   };

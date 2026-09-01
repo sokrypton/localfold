@@ -112,7 +112,7 @@ export function parseCcdComponent(text) {
     byName.set(name, atoms.length);
     atoms.push({
       name,
-      element: ELEMENTS.indexOf(symbol) + 1,
+      element: ELEMENT_SYMBOLS.indexOf(symbol) + 1,
       charge: Number.parseFloat(at(row, "charge") ?? "0") || 0,
       x: coordinate(row, "x"), y: coordinate(row, "y"), z: coordinate(row, "z"),
     });
@@ -141,7 +141,7 @@ export function parseCcdComponent(text) {
  * the list starts at hydrogen and omits nothing. It is written out rather than
  * computed so that a gap would be visible.
  */
-const ELEMENTS = [
+export const ELEMENT_SYMBOLS = [
   "H", "HE", "LI", "BE", "B", "C", "N", "O", "F", "NE",
   "NA", "MG", "AL", "SI", "P", "S", "CL", "AR", "K", "CA",
   "SC", "TI", "V", "CR", "MN", "FE", "CO", "NI", "CU", "ZN",

@@ -46,6 +46,15 @@ const ORDER = [
   "prevEmbedding", "positionActivations", "msaActivations", "extraMsaTargetFeat",
   "singleActivations", "prevSingleEmbeddingNormScale", "prevSingleEmbeddingNormOffset",
   "prevSingleEmbedding",
+  // 🔴 THE BOND EMBEDDING, WHICH WAS DOWNLOADED AND NEVER USED. featurise.js
+  // builds the contact matrix, embedder-reference.js applies it, and this file
+  // - the one a browser fold actually runs - had neither the weight nor the
+  // term, while two comments in here and in trunk-webgpu.js said the template
+  // embedding goes in "after the relative encoding and the bonds". So a ligand
+  // reached the diffusion with its elements, its charges and its reference
+  // conformer, and nothing anywhere saying which of its atoms are bonded.
+  // Its shape is [1, 128]: one input feature, so the linear is a scale.
+  "bondEmbedding",
 ];
 
 export function packEmbedderWeights(weights) {
@@ -91,6 +100,7 @@ const W_SINGLE: u32 = ${offsets.singleActivations}u;
 const W_PREV_SINGLE_SCALE: u32 = ${offsets.prevSingleEmbeddingNormScale}u;
 const W_PREV_SINGLE_OFFSET: u32 = ${offsets.prevSingleEmbeddingNormOffset}u;
 const W_PREV_SINGLE: u32 = ${offsets.prevSingleEmbedding}u;
+const W_BOND: u32 = ${offsets.bondEmbedding}u;
 
 fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
 `;
@@ -136,7 +146,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(2) var<storage, read> previous: array<f32>;
 @group(0) @binding(3) var<storage, read> features: array<i32>;
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
-@group(0) @binding(5) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(5) var<storage, read> bonds: array<f32>;
+@group(0) @binding(6) var<storage, read_write> pair: array<f32>;
 
 // features is five rows of TOKENS: residueIndex, tokenIndex, asymId, entityId, symId.
 fn residue_index(t: u32) -> i32 { return features[t]; }
@@ -252,7 +263,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       if (f == POSITION_BINS * 2u + 1u + bin_c) { onehot = 1.0; }
       relative_total += onehot * weights[W_POSITION + f * C_Z + c];
     }`}
-    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled + relative_total;
+    // ...AND THE BOND TERM. One input feature and a bias-free Linear, so it is
+    // this pair's contact flag times one weight per channel - which is zero
+    // for every pair of a fold with no ligand bonds, and is why the buffer is
+    // ALWAYS bound rather than branched on. Same reasoning as the recycled
+    // term above: a "nothing to add yet" fast path is how a real term goes
+    // missing, and here it went missing for every ligand ever folded.
+    pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled + relative_total
+      + bonds[row] * weights[W_BOND + c];
   }
 }`;
 
@@ -391,6 +409,10 @@ export class Af3EmbedderGpu {
       throw new Error(`targetFeat has ${input.targetFeat.length} elements; `
         + `expected ${tokens * featureWidth}`);
     }
+    if (input.bondMatrix !== undefined && input.bondMatrix.length !== pairs) {
+      throw new Error(`bondMatrix has ${input.bondMatrix.length} elements; `
+        + `expected ${pairs}`);
+    }
 
     const packed = packEmbedderWeights(weights);
     const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels, msaChannels };
@@ -427,6 +449,13 @@ export class Af3EmbedderGpu {
       // 🔴 ALWAYS PRESENT, even on pass one - see the note at the top.
       const previousPair = keep(this.allocator.upload("af3-embed.previous-pair",
         input.previousPair ?? new Float32Array(pairs * pairChannels), storage));
+      // 🔴 ALWAYS BOUND, LIKE THE RECYCLED PAIR ABOVE. A fold with no ligand
+      // has an all-zero contact matrix, and against a bias-free Linear that
+      // adds exactly zero - so there is nothing to gain from a branch and one
+      // more place for the term to go missing. featurise.js only allocates the
+      // matrix when some ligand has bonds, hence the fallback here.
+      const bondMatrix = keep(this.allocator.upload("af3-embed.bonds",
+        input.bondMatrix ?? new Float32Array(pairs), storage));
       const previousSingle = keep(this.allocator.upload("af3-embed.previous-single",
         input.previousSingle ?? new Float32Array(tokens * singleChannels), storage));
 
@@ -469,7 +498,8 @@ export class Af3EmbedderGpu {
           [targetFeat, weightBuffer, left, right, msaFromTarget], Math.ceil(tokens / 64));
       const perPair = spread(pairs);
       run("embed.assemble-pair", compiled.assemblePair,
-          [left, right, previousPair, features, weightBuffer, pair], perPair[0], perPair[1]);
+          [left, right, previousPair, features, weightBuffer, bondMatrix, pair],
+          perPair[0], perPair[1]);
       const perRow = spread(Math.ceil(rows / 64));
       run("embed.assemble-msa", compiled.assembleMsa,
           [codes, deletions, msaFromTarget, weightBuffer, msa], perRow[0], perRow[1]);

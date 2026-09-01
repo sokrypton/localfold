@@ -176,7 +176,13 @@ export function featuriseProtein(sequence, options = {}) {
   const ligandSpans = [];
   for (const ligand of ligands) {
     asym += 1;
-    ligandSpans.push({ from: ligandToken, count: ligand.atoms.length, code: ligand.code });
+    // ...AND ITS BONDS TRAVEL WITH IT, because a writer needs them too. The
+    // bond matrix beside this is token x token and one direction only, which is
+    // the shape the MODEL wants; a PDB's CONECT records want the pairs, and
+    // scanning L^2 cells per trajectory frame to recover them is the wrong way
+    // round when the list is right here.
+    ligandSpans.push({ from: ligandToken, count: ligand.atoms.length, code: ligand.code,
+                       bonds: ligand.bonds });
     // Identical codes are one entity, and each occurrence is a copy of it -
     // the same rule chainIdentity applies to repeated sequences.
     if (!entityOfCode.has(ligand.code)) entityOfCode.set(ligand.code, entityOfCode.size);
