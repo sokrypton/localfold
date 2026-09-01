@@ -269,17 +269,34 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // a recycle IS - so each one costs another full trunk. It is not a cheap
   // refinement pass.
   const recycles = options.recycles ?? 0;
+  // Reported from the batch the trunk is actually handed, so a future
+  // truncation shows up in every run rather than in a fold that is merely
+  // disappointing. The page's status line reports the depth that was
+  // FEATURISED, which is not the same claim.
+  await stage("msa-depth", { sequences: batch.sequences, tokens });
   const trunkGpu = new Af3TrunkGpu(device);
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);
   let trunk;
   for (let pass = 0; pass <= recycles; pass += 1) {
     await stage("recycle", { pass, passes: recycles + 1 });
+    // 🔴 THE WHOLE ALIGNMENT, NOT ITS FIRST ROW. This passed `sequences: 1` and
+    // sliced every MSA array down to one row, which was right when the only
+    // inputs were oracle dumps taken at num_msa=1 and became wrong the moment
+    // featuriseProtein learned to build a real MSA.
+    //
+    // It is a quiet failure and it flatters itself: an alignment still reaches
+    // the model, because `profile` and `deletion_mean` are computed over all of
+    // it and ride into target_feat - so folds DO improve when you supply one
+    // (44.5 -> 62.6 pLDDT on a 146-residue chain) and the status line honestly
+    // reports the depth that was featurised. What never happened is the MSA
+    // stack seeing more than the query, which is most of what an MSA is for.
     trunk = await trunkGpu.run({
-      tokens, sequences: 1, templates: 4, targetFeat, features: batch.features,
-      msaRows: batch.msa.subarray(0, tokens),
-      deletionMatrix: batch.deletionMatrix.subarray(0, tokens),
-      msaMask: batch.msaMask.subarray(0, tokens),
+      tokens, sequences: batch.sequences, templates: 4, targetFeat,
+      features: batch.features,
+      msaRows: batch.msa,
+      deletionMatrix: batch.deletionMatrix,
+      msaMask: batch.msaMask,
       pairMask, seqMask, previousPair, previousSingle,
     }, weights.trunk, DIALECT, {
       onStage: (name, ms) => stage("trunk", { name, ms }),

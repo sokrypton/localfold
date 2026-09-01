@@ -132,6 +132,9 @@ export async function main(device, args) {
   if (rows.depth > 1) {
     console.log(`MSA ${rows.depth} rows, unpaired block starts at ${rows.unpairedFrom}`);
   }
+  if (batch.sequences !== rows.depth) {
+    console.log(`🔴 the batch carries ${batch.sequences} MSA rows, not ${rows.depth}`);
+  }
   console.log(`${batch.sequence.length} residues, ${batch.tokens} tokens,`
     + ` ${batch.atomCount} atoms, ${batch.subsets} atom subsets,`
     + ` ${blocks} pairformer blocks, ${steps} diffusion steps`);
