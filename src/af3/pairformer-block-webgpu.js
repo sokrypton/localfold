@@ -128,7 +128,8 @@ export class Af3PairformerStackGpu {
    *   them for the CPU reference
    * @param {{swapTransposedBias: boolean}} dialect
    * @param {{epsilon?: number, variance?: "fast"|"two-pass",
-   *          onBlock?: (index: number) => void}} options
+   *          onBlock?: (index: number) => void,
+   *          onBlockDone?: (completed: number, total: number) => void}} options
    */
   async run(state, blocks, dialect, options = {}) {
     const n = state.tokens;
@@ -238,6 +239,19 @@ export class Af3PairformerStackGpu {
         });
         validation.end(`block ${index}`);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
+        // 🔴 WHEN THE DEVICE REACHES THIS BLOCK, reported without waiting for it.
+        // This is AF2's idiom, from src/evoformer/stack.js, and it is here for
+        // the same reason: onBlock above fires when a block is ENCODED, and
+        // sixteen of those happen in the time the GPU takes over one - so a
+        // status line driven by it sprints to the end of the window and then
+        // sits still. onSubmittedWorkDone resolves once everything submitted so
+        // far has finished, so one taken here settles exactly when this block
+        // is done. It is NOT awaited: the loop carries on encoding and the
+        // pipelining that makes this stack fast is untouched. They resolve in
+        // submission order, so the count cannot go backwards.
+        const submitted = index + 1;
+        void this.device.queue.onSubmittedWorkDone()
+          .then(() => options.onBlockDone?.(submitted, blocks.length));
         if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
           await this.device.queue.onSubmittedWorkDone();
         }

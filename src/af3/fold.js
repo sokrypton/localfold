@@ -285,6 +285,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
       onStage: (name, ms) => stage("trunk", { name, ms }),
       onPairformerBlock: (index, total) =>
         stage("pairformer-block", { index, total, pass, passes: recycles + 1 }),
+      // 🔴 THE ONE THE STATUS LINE READS. `pairformer-block` fires at encode
+      // time, sixteen at a stride; this fires when the device has actually
+      // finished a block. The first is still awaited, because that is what
+      // yields to the event loop and lets the page paint at all.
+      onPairformerBlockDone: (completed, total) =>
+        stage("pairformer-block-done", { completed, total, pass, passes: recycles + 1 }),
     });
     previousPair = trunk.pair;
     previousSingle = trunk.single;

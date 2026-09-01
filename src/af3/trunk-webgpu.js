@@ -169,6 +169,9 @@ export class Af3TrunkGpu {
         ...options,
         onBlock: (index) => options.onPairformerBlock?.(index,
                                                         weights.pairformerBlocks.length),
+        // ...and the one that says the device GOT there, which is what a status
+        // line should show. See the note in pairformer-block-webgpu.js.
+        onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
       }));
 
     const head = await stage("distogram",

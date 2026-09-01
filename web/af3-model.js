@@ -205,13 +205,19 @@ export async function foldAf3(options) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
       if (name === "pairformer-block") {
+        // 🔴 THIS ONE IS THE YIELD, NOT THE REPORT. It fires when a block is
+        // ENCODED, and sixteen are encoded in the time the device takes over
+        // one - so it is awaited (a real macrotask, so the page can paint) and
+        // says nothing. `pairformer-block-done` below is what it paints.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      if (name === "pairformer-block-done") {
         // Each recycle is another whole trunk, so the trunk band is divided
         // between them rather than replayed.
-        const done = (detail.pass + (detail.index + 1) / detail.total) / detail.passes;
+        const done = (detail.pass + detail.completed / detail.total) / detail.passes;
         onProgress(share.features + (share.trunk - share.features) * done);
         onStatus(`Trunk · pass ${detail.pass + 1} of ${detail.passes}`
-          + ` · pairformer block ${detail.index + 1} of ${detail.total}`);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+          + ` · pairformer block ${detail.completed} of ${detail.total}`);
       }
       if (name === "trunk-done") {
         onProgress(share.trunk);
