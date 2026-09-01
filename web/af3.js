@@ -19,13 +19,13 @@
  */
 import { featuriseProtein } from "../src/af3/featurise.js";
 import { foldBatch, toPdb, atomName } from "../src/af3/fold.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../src/af3/weights.js";
+import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { createStructureViewer } from "./viewer.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
-
-const MANIFEST = "./model-af3-int5/manifest.json";
+import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
+import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
 /**
  * How many trajectory frames to keep, whatever the step count.
  *
@@ -98,11 +98,19 @@ let weightsPromise;
  */
 function loadWeights() {
   weightsPromise ??= (async () => {
-    const store = await openAf3Store(MANIFEST, null, ({ loadedBytes, totalBytes }) => {
+    const onProgress = ({ loadedBytes, totalBytes }) => {
       progress(totalBytes > 0 ? loadedBytes / totalBytes : 0);
       status(`Downloading the model… ${(loadedBytes / 2 ** 20).toFixed(0)}`
         + ` of ${(totalBytes / 2 ** 20).toFixed(0)} MiB`);
-    });
+    };
+    // 🔴 THE TENSOR TABLE IS COMPILED IN, NOT FETCHED. A deploy once 404'd on a
+    // manifest and died before asking for a single shard, which is a failure
+    // about metadata dressed as a failure about weights. src/reference/
+    // manifests/ holds it as a module, imported lazily so its 116 KiB is not in
+    // front of a visitor who never folds anything.
+    const bundle = MODEL_BUNDLES.af3;
+    const store = await HttpTensorStore.fromManifest(
+      bundle.directory, await loadManifest("af3"), onProgress);
     return {
       trunk: await trunkWeights(store, 48, 4),
       diffusion: await diffusionWeights(store),

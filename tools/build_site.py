@@ -36,7 +36,7 @@ OUT = ROOT / "dist"
 
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
-FILES = [".nojekyll", "index.html", "single.html", "dev.html"]
+FILES = [".nojekyll", "index.html", "single.html", "dev.html", "af3.html"]
 DIRECTORIES = ["web", "src"]
 
 # ...and never these, wherever they appear.
@@ -63,6 +63,12 @@ SCRIPT_SRC = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 # The manifest is a checked-in JS module, so nothing regenerates it when the
 # shards are re-exported. These are the bytes per element it describes.
 DTYPE_BYTES = {"int8": 1, "float16": 2, "float32": 4}
+# 🔴 int5 IS NOT A WHOLE NUMBER OF BYTES, which is why it is not in the table
+# above. Thirty-two five-bit codes are exactly 160 bits, so a group is exactly
+# 20 bytes and no group straddles another - see tools/quantize_af3.py, where
+# that is the reason group 32 was chosen. The reader may take two bytes for a
+# code ending on the final one, so there is one trailing byte of slack.
+INT5_GROUP_BYTES = 20
 
 # ...imported rather than restated: tools/write_manifest_module.py owns the
 # Python-side description of a bundle, and a second copy here would be one more
@@ -199,13 +205,22 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
     required: dict[str, int] = {}
     for name, tensor in tensors.items():
         dtype = tensor.get("dtype")
-        if dtype not in DTYPE_BYTES:
+        if dtype not in DTYPE_BYTES and dtype != "int5":
             problems.append(f"{name}: unknown dtype {dtype!r}")
             continue
         elements = 1
         for extent in tensor["shape"]:
             elements *= extent
-        end = tensor["byteOffset"] + elements * DTYPE_BYTES[dtype]
+        if dtype == "int5":
+            # ...packed groups plus the slack byte, then a float16 scale AND a
+            # float16 zero point per group: int5 here is asymmetric, so there
+            # are two tables after the codes and not one.
+            block = tensor["block"]
+            blocks = -(-elements // block)
+            end = tensor["byteOffset"] + blocks * INT5_GROUP_BYTES + 1
+            end = max(end, tensor["zeroOffset"] + blocks * 2)
+        else:
+            end = tensor["byteOffset"] + elements * DTYPE_BYTES[dtype]
         if dtype == "int8":
             # ...int8 tensors carry a float16 scale per block, stored separately.
             block = tensor["block"]

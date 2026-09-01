@@ -49,6 +49,33 @@ jobs:
           gh release download model1-multimer-v3 --pattern localfold-model1-multimer-v3.tar.gz
           tar -xzf localfold-model1-multimer-v3.tar.gz -C dist
 
+      # 🔴 A RESTRICTED BUNDLE, AND THE ONLY ONE SO FAR. model-af3-int5 holds
+      # DeepMind's AF3 parameters, not OpenFold3's - they carry a Prohibited Use
+      # Policy and terms that forbid redistribution, so publishing them is a
+      # deliberate act by whoever runs this deployment. It takes BOTH repository
+      # variables: one to include the bundle, one naming the terms accepted.
+      #
+      # 🔴 AND THAT SECOND VARIABLE EXISTS BECAUSE THIS STEP BYPASSES THE GATE
+      # IN build_site.py. That gate reads what a bundle's manifest SAYS IT IS
+      # and refuses to copy restricted weights without an explicit acceptance -
+      # but it only guards `--model` builds, and this job assembles the site
+      # without weights and then untars them in afterwards. Without the check
+      # below, the one path that actually publishes is the one path with no
+      # gate on it.
+      - name: Add the AlphaFold 3 int5 bundle
+        if: ${{ vars.LOCALFOLD_INCLUDE_AF3_MODEL == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCEPTED: ${{ vars.LOCALFOLD_ACCEPT_MODEL_TERMS }}
+        run: |
+          case ",$ACCEPTED," in
+            *,alphafold3,*) ;;
+            *) echo "::error::model-af3-int5 holds DeepMind's AF3 parameters,"                     "which carry the AF3 Weights Terms of Use and Prohibited"                     "Use Policy. Set the repository variable"                     "LOCALFOLD_ACCEPT_MODEL_TERMS to include alphafold3 to"                     "confirm the licence covers this deployment."
+               exit 1 ;;
+          esac
+          gh release download af3-int5 --pattern localfold-af3-int5.tar.gz
+          tar -xzf localfold-af3-int5.tar.gz -C dist
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -34,15 +34,16 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
     load: () => import("./multimer.js"),
   },
-  // AF3's trunk, under the OpenFold3 dialect and OpenFold3's Apache-2.0
-  // weights. INCOMPLETE BY DESIGN: the diffusion and confidence heads are not
-  // exported yet, so this bundle carries a trunk and a distogram head and
-  // cannot produce coordinates. tools/export_af3_model.py records the omission
-  // in the manifest's `coverage`.
+  // The whole AF3 diffuser at int5: trunk, diffusion head, confidence head.
+  // 265 MiB, and af3.html folds a sequence with it.
+  //
+  // 🔴 DEEPMIND'S PARAMETERS, NOT OPENFOLD3'S, whatever the family name
+  // suggests. They carry a Prohibited Use Policy, so build_site.py will not
+  // publish them without LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3.
   af3: {
-    model: "openfold3",
-    directory: "./model-af3/",
-    release: "openfold3-trunk",
+    model: "alphafold3",
+    directory: "./model-af3-int5/",
+    release: "af3-int5",
     variable: "LOCALFOLD_INCLUDE_AF3_MODEL",
     load: () => import("./af3.js"),
   },

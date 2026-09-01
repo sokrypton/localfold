@@ -48,13 +48,19 @@ BUNDLES = {
         "module": "src/reference/manifests/multimer.js",
         "model": "model_1_multimer_v3",
     },
-    # AF3's trunk under the OpenFold3 dialect, written by
-    # tools/export_af3_model.py. The diffusion and confidence heads are not in
-    # it - see that file - so this bundle folds nothing on its own yet.
+    # The whole AF3 diffuser - trunk, diffusion head and confidence head - at
+    # int5, written by tools/export_af3_model.py and packed by
+    # tools/quantize_af3.py. 265 MiB, and it folds.
+    #
+    # 🔴 THESE ARE DEEPMIND'S PARAMETERS, NOT OPENFOLD3'S. The manifest says so
+    # (model.name is "alphafold3") and build_site.py refuses to publish them
+    # without LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3. An Apache-2.0 bundle
+    # would need an OpenFold3 export, which needs four dialect branches the
+    # kernels here do not implement yet - see tools/oracle/dump_af3_trunk.py.
     "af3": {
-        "export": "model-af3",
+        "export": "model-af3-int5",
         "module": "src/reference/manifests/af3.js",
-        "model": "openfold3",
+        "model": "alphafold3",
     },
 }
 
