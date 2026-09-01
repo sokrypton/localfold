@@ -643,6 +643,34 @@ function forcePlddtColours() {
 }
 
 /**
+ * The last fold's trunk, so changing only the sampler costs only the sampler.
+ *
+ * 🔴 THE KEY IS EVERYTHING THE TRUNK READS, and getting it wrong is not a slow
+ * fold but a wrong one: a stale trunk produces a structure for the PREVIOUS
+ * sequence with a confidence head that agrees with it. Sequence, ligands,
+ * alignment, MSA depth, recycles and seed all go in; the sampler and its step
+ * count deliberately do not, because they are what this exists to make cheap.
+ *
+ * 🔴 THE SEED IS IN THERE BECAUSE THE MSA SUBSAMPLE IS SEEDED FROM IT. Before
+ * the subsample the seed reached only the sampler's first draw and a new seed
+ * would have been free; now it chooses which alignment rows the trunk sees, so
+ * a new seed is a new trunk. That is the faithful behaviour - AF3 draws both
+ * from one key - and it is the reason "try another seed" is not the cheap path
+ * that "try more steps" is.
+ */
+let trunkCache;
+
+/** FNV-1a, to key on an alignment without holding a second copy of it. */
+const cheapHash = (text) => {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
+
+/**
  * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
  *
  * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
@@ -693,6 +721,19 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const calls = Number(document.getElementById("af3-count")?.value)
     || AF3_COUNTS[mode].preferred;
   const recycles = recycleCount();
+  const { requested: maxMsaSequences } = maxMsaConfig();
+  // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
+  // rather than a different question: the cached trunk is the recycle state, so
+  // going from three to five runs two passes. Fewer is not a continuation -
+  // nothing can undo a pass - so the cache is offered only when it is at or
+  // behind what was asked for.
+  const trunkKey = JSON.stringify({
+    chains, ligandCodes, maxMsaSequences, seed: randomSeed(),
+    alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
+  });
+  const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
+  const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
+  const continued = reuse !== undefined && reuse.recycles < recycles;
 
   status("Loading AlphaFold 3 · 0 MiB");
   const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
@@ -716,10 +757,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
 
   const api = window.py2Dmol;
   let pending = Promise.resolve();
-  const { requested: maxMsaSequences } = maxMsaConfig();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    alignment: alignmentBlocks, maxMsaSequences, ligandCodes,
+    alignment: alignmentBlocks, maxMsaSequences, ligandCodes, reuse,
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -743,6 +783,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   });
   await pending;
   throwIfAborted(signal);
+  // Kept for the next fold, and kept even when it was itself reused, so a run
+  // of re-samples all skip the trunk rather than only the first.
+  trunkCache = { key: trunkKey, reusable: result.reusable };
 
   // 🔴 THE TRAJECTORY IS RELOADED ONCE THE pLDDT EXISTS. The frames drawn during
   // the fold have a zero B-factor - the confidence head has not run - so under
@@ -828,7 +871,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // Named, because a fold that silently ignored the ligand would otherwise
   // report exactly the same line - the residue count is the same either way.
   if (ligandCodes.length > 0) what.push(ligandCodes.join(", "));
-  const detail = [`in ${result.seconds.toFixed(0)} s`];
+  const detail = [`in ${result.seconds.toFixed(0)} s`
+    // Said out loud, because a fold that took a third of the time it used to
+    // otherwise reads as something having gone wrong.
+    + (reuse === undefined ? ""
+      : continued ? ` (${recycles - reuse.recycles} more recycle${
+        recycles - reuse.recycles === 1 ? "" : "s"})`
+        : " (trunk reused)")];
   if (residues > 0) {
     detail.push(result.depth > 1 ? `${result.depth} MSA rows` : "single sequence");
   }

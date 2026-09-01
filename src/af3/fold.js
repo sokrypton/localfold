@@ -341,9 +341,24 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // Announced before it runs and awaited, so a page can say what is happening
   // and hand back a frame first. It used to be five seconds of blocked main
   // thread; the encoder is on the GPU now and it is a few hundred milliseconds.
-  await stage("target-feat-start");
-  const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
-  await stage("target-feat", { targetFeat });
+  // 🔴 THE TRUNK IS THE EXPENSIVE PART AND IT DOES NOT DEPEND ON THE SAMPLER.
+  // `reuse` carries a previous fold's trunk and target features back in, so
+  // changing the sampler, its step count, or nothing at all costs only denoiser
+  // calls - measured on a 68-residue chain at 3.7 s a trunk pass against 0.85 s
+  // a sampler call, so a four-pass fold is about two thirds trunk.
+  //
+  // 🔴 IT IS THE CALLER'S JOB TO KNOW THE TRUNK IS STILL THE RIGHT ONE. Nothing
+  // here can tell whether the batch it was given matches the trunk it was
+  // handed; a stale one produces a structure for a different sequence, with a
+  // confidence head that agrees with it. web/app.js keys the cache on
+  // everything the trunk reads.
+  const reused = options.reuse;
+  let targetFeat = reused?.targetFeat;
+  if (targetFeat === undefined) {
+    await stage("target-feat-start");
+    targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
+    await stage("target-feat", { targetFeat });
+  }
 
   const seqMask = batch.seqMask;
   const pairMask = new Float32Array(tokens * tokens);
@@ -366,11 +381,18 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // disappointing. The page's status line reports the depth that was
   // FEATURISED, which is not the same claim.
   await stage("msa-depth", { sequences: batch.sequences, tokens });
+  // 🔴 A RECYCLE'S STATE IS THE TRUNK ITSELF, which is what makes asking for
+  // more of them cheap. The loop feeds `previousPair`/`previousSingle` back in,
+  // and those ARE the previous pass's `trunk.pair`/`trunk.single` - so a cached
+  // trunk is a cached recycle state, and going from three recycles to five runs
+  // two passes rather than six. Asking for FEWER is not a continuation and the
+  // caller must not offer the cache for it; nothing here can undo a pass.
   const trunkGpu = new Af3TrunkGpu(device);
-  let previousPair = new Float32Array(tokens * tokens * 128);
-  let previousSingle = new Float32Array(tokens * 384);
-  let trunk;
-  for (let pass = 0; pass <= recycles; pass += 1) {
+  let trunk = reused?.trunk;
+  let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
+  let previousSingle = trunk?.single ?? new Float32Array(tokens * 384);
+  const firstPass = reused === undefined ? 0 : reused.recycles + 1;
+  for (let pass = firstPass; pass <= recycles; pass += 1) {
     await stage("recycle", { pass, passes: recycles + 1 });
     // 🔴 THE WHOLE ALIGNMENT, NOT ITS FIRST ROW. This passed `sequences: 1` and
     // sliced every MSA array down to one row, which was right when the only
@@ -488,6 +510,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
 
   return {
     positions, trunk, targetFeat, scores, ptm, iptm,
+    // What a caller hands back to skip the trunk next time. Returned even when
+    // it was reused, so the cache survives a chain of re-samples.
+    reusable: { trunk, targetFeat, recycles },
     meanPlddt: total / count, atoms: count,
     geometry: backboneGeometry(batch, positions),
     pdb: toPdb(batch, positions, scores.plddt),

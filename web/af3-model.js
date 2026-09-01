@@ -170,6 +170,7 @@ function timeShares(calls, passes) {
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
  *          maxMsaSequences?: number, ligandCodes?: string[],
+ *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
@@ -226,7 +227,12 @@ export async function foldAf3(options) {
     profileMsa: rows.profileMsa,
     profileDeletionMatrix: rows.profileDeletionMatrix,
   });
-  const share = timeShares(calls, (recycles ?? 0) + 1);
+  // 🔴 ONLY THE PASSES THAT WILL ACTUALLY RUN, or the bar spends a share of
+  // itself waiting for work that never happens and then jumps. A reused trunk
+  // runs none; a continued one runs the difference.
+  const share = timeShares(calls, options.reuse === undefined
+    ? (recycles ?? 0) + 1
+    : Math.max(0, (recycles ?? 0) - options.reuse.recycles));
   const started = performance.now();
 
   const slots = alphaCarbons(batch);
@@ -238,7 +244,7 @@ export async function foldAf3(options) {
   const trajectory = [];
 
   const result = await foldBatch(device, batch, options.weights, {
-    mode, steps: calls, recycles, seed,
+    mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "target-feat-start") {
@@ -324,6 +330,8 @@ export async function foldAf3(options) {
 
   return {
     batch,
+    // Handed back so the caller can re-sample without the trunk. See foldBatch.
+    reusable: result.reusable,
     depth: rows.depth,
     framePdbs,
     pdb: finalPdb,
