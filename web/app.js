@@ -119,10 +119,13 @@ const modelFamily = (chainCount, ligandCount = 0) => {
   return chainCount > 1 ? "multimer" : "monomer";
 };
 
+// 🔴 "none" IS SPELLED "single" BELOW, and the translation happens here so it
+// happens once. Every path downstream already tests for "single" meaning a
+// query-only fold; the select says "None" because that is what it does to the
+// alignment, not to the sequence.
 const msaMode = () => {
-  const msaToggle = document.getElementById("useMsaToggle");
-  if (msaToggle !== null && !msaToggle.checked) return "single";
-  return element("msa-mode").value;
+  const chosen = element("msa-mode").value;
+  return chosen === "none" ? "single" : chosen;
 };
 
 let uploadedA3m = "";
@@ -539,10 +542,10 @@ function syncModelControls() {
   // whatever is chosen. AF3 recycles too - its embedder has always done
   // `pair += prev_embedding(LayerNorm(recycled pair))`, and the loop driving it
   // is in src/af3/fold.js.
-  // The MSA groups belong to syncMode, which hides them whenever the toggle is
-  // off. Setting them here as well would give one pair of controls two owners
-  // that disagree - so the alignment controls are not touched here at all, and
-  // they now mean the same thing for all three models.
+  // The MSA controls belong to syncMode, which greys Max MSA out when the MSA
+  // select reads None. Setting them here as well would give one pair of
+  // controls two owners that disagree - so they are not touched here at all,
+  // and they mean the same thing for all three models.
   if (af3) syncAf3Count();
 }
 
@@ -1085,31 +1088,28 @@ const PRIVACY_NOTE = {
 };
 
 const syncMode = () => {
-  const msaToggle = document.getElementById("useMsaToggle");
-  const isMsa = msaToggle !== null ? msaToggle.checked : true;
-  const msaModeGroup = document.getElementById("msaModeGroup");
-  if (msaModeGroup !== null) {
-    msaModeGroup.hidden = !isMsa;
-  }
+  const isMsa = modeSelect.value !== "none";
+  // 🔴 GREYED OUT, NOT HIDDEN. Max MSA means nothing without an alignment, but
+  // removing it moves every control beside it - the row reflows on a change
+  // that did not concern them - and a reader who set a depth once cannot see
+  // what it still says. Disabled keeps it legible and inert.
   const maxMsaGroup = document.getElementById("maxMsaGroup");
   if (maxMsaGroup !== null) {
-    maxMsaGroup.hidden = !isMsa;
+    maxMsaGroup.classList.toggle("fetch-option-disabled", !isMsa);
+    const select = document.getElementById("max-msa");
+    if (select !== null) select.disabled = !isMsa;
   }
-  element("msa-text").hidden = !isMsa || modeSelect.value !== "paste";
-  element("msa-file").hidden = !isMsa || modeSelect.value !== "upload";
+  element("msa-text").hidden = modeSelect.value !== "paste";
+  element("msa-file").hidden = modeSelect.value !== "upload";
   // ...getElementById rather than element(), which throws on a missing id: the
   // note is index.html's and this file should not require it to exist.
   const note = document.getElementById("privacy-note");
   if (note !== null) {
-    note.innerHTML = isMsa && modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
+    note.innerHTML = modeSelect.value === "search" ? PRIVACY_NOTE.search : PRIVACY_NOTE.local;
   }
 };
 modeSelect.addEventListener("change", syncMode);
 
-const msaToggle = document.getElementById("useMsaToggle");
-if (msaToggle !== null) {
-  msaToggle.addEventListener("change", syncMode);
-}
 syncMode();
 
 // 🔴 THE MODEL DECIDES WHICH CONTROLS EXIST, and syncMode decides what the MSA

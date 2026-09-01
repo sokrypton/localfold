@@ -38,7 +38,12 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * mode change rather than carrying a number across.
  */
 export const AF3_COUNTS = {
-  flow: { label: "Cycles", values: [2, 4, 8, 16, 32], preferred: 8 },
+  // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
+  // Recycles and "Cycles" beside "Recycles" reads as the same word twice. The
+  // note above still applies to what the numbers MEAN - a flow step walks the
+  // whole schedule, a diffusion step discretises it - which is why the values
+  // differ by an order of magnitude and the dial is rebuilt on a mode change.
+  flow: { label: "Steps", values: [2, 4, 8, 16, 32], preferred: 8 },
   diffusion: { label: "Steps", values: [20, 40, 80, 160, 320], preferred: 20 },
 };
 
@@ -280,7 +285,7 @@ export async function foldAf3(options) {
       shown += 1;
       onProgress(share.trunk + (1 - share.trunk) * (step / calls));
       const elapsed = (performance.now() - started) / 1000;
-      onStatus(`${mode === "flow" ? "Cycle" : "Diffusion step"} ${step} of ${calls}`
+      onStatus(`${mode === "flow" ? "Step" : "Diffusion step"} ${step} of ${calls}`
         + `  ·  about ${Math.ceil(elapsed * (calls / step - 1))} s left`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task

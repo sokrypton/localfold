@@ -76,11 +76,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    nothing at all: no error, no status, no feedback, and the
                    reasonable conclusion is that the page is broken.
                    Milliseconds on localhost, seconds over a network. -->
-              <label class="switch switch-sm" title="Multiple Sequence Alignment">
-                <input type="checkbox" id="useMsaToggle">
-                <span class="slider-toggle"></span>
-              </label>
-              <label for="useMsaToggle" class="fold-toggle-label" title="Multiple Sequence Alignment">MSA</label>
               <button id="predict" class="btn btn-primary" disabled>
                 <i class="fa-solid fa-cubes"></i>
                 <span>Fold</span>
@@ -193,20 +188,27 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 </select>
               </div>
               <div class="fetch-option-group" id="af3CountGroup" hidden>
-                <span class="fetch-option-title" id="af3-count-label">Cycles</span>
+                <span class="fetch-option-title" id="af3-count-label">Steps</span>
                 <select id="af3-count"></select>
               </div>
 
               <!-- MSA options on the right of the row -->
-              <div class="fetch-option-group" id="msaModeGroup" hidden>
-                <span class="fetch-option-title">Alignment</span>
+              <!-- 🔴 THE MSA SWITCH IS THIS SELECT'S "None", NOT A SEPARATE
+                   TOGGLE. Two controls for one decision could disagree - the
+                   toggle said off while the select still read "Search" - and
+                   the reader had to look at both to know what would be sent
+                   anywhere. `none` is the default because a fold that reaches
+                   a remote service should be asked for, not arrived at. -->
+              <div class="fetch-option-group" id="msaModeGroup">
+                <span class="fetch-option-title">MSA</span>
                 <select id="msa-mode">
-                  <option value="search" selected>Search (remote)</option>
+                  <option value="none" selected>None</option>
+                  <option value="search">Search (remote)</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
                 </select>
               </div>
-              <div class="fetch-option-group" id="maxMsaGroup" hidden>
+              <div class="fetch-option-group" id="maxMsaGroup">
                 <span class="fetch-option-title">Max MSA</span>
                 <select id="max-msa" title="MSA subsampling depth (clusters:extra sequences)">
                   <option value="512:1024" selected>512:1024</option>

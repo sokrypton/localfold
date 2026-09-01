@@ -32,10 +32,21 @@ in the Model dropdown.
 
 | | RMSD | TM | notes |
 |---|---|---|---|
-| 6MRR, flow 8 | 0.63-0.70 | 0.95 | across four seeds |
+| 6MRR, flow 8 | 0.69-0.75 | 0.949 | four seeds, sigma0 160 |
+| 6MRR, flow 8, sigma0 2560 | 0.65-0.77 | 0.950 | four seeds, AF3's schedule |
 | 6MRR, diffusion 200 | 0.66 | 0.953 | |
-| 1QYS (Top7), flow 8 | 0.86 | 0.947 | |
+| 1QYS (Top7), flow 8 | 0.89-0.92 | 0.944 | four seeds, sigma0 160 |
+| 1QYS, flow 8, sigma0 2560 | 0.85-0.88 | 0.948 | four seeds, AF3's schedule |
 | 1QYS, diffusion 200 | 0.93-1.12 | 0.92-0.94 | across four seeds |
+
+🔴 THE FLOW STARTS AT 160 A NOW, WHICH COSTS 1QYS 0.04 A. Most of AF3's
+schedule sits above the level where the denoiser begins trusting the
+coordinates it is handed, so a walk from 2560 spends its first calls on a
+regime a flow does not need - and a ligand pays for it, HEM's bond error at
+eight steps being 0.218 A from 2560 against 0.129 A from 160. On the proteins
+6MRR is unchanged and 1QYS loses 0.04 A with non-overlapping seed ranges. That
+trade was made deliberately; `schedule: {sigmaMax: 160}` restores AF3's own.
+AF3's DIFFUSION sampler is untouched. See tools/gpu/probe-sigma0.js.
 
 Flow matches or beats the 200-step sampler with ~25x fewer denoiser calls, on
 both proteins measured. It is two proteins, both small designed alpha/beta
@@ -150,6 +161,44 @@ lengths and angles, random torsions - so a baked table cannot reproduce a dump.
 Measured cost of baking one: 0.01 A of structure. `check_af3_featurise.js`
 therefore holds the chemistry (bonded pairs, from the bond graph) and lets the
 torsions go.
+
+**A ligand's bonds were read correctly and then dropped TWICE, on two paths
+that could not see each other.** `ccd-component.js` parses the CCD bond table
+and `featurise.js` turns it into the contact matrix AF3's `_embed_bonds` wants -
+one direction per bond, `[0,0]` cleared, symmetrised only for the OF3 dialect.
+After that:
+
+- **The model never saw it.** `fold.js` assembles the trunk's input as an object
+  literal and did not name `bondMatrix`, so the embedder got `undefined` - which
+  is indistinguishable from a fold with no ligand. And `embedder-webgpu.js`, the
+  one a browser fold runs, had neither the `bondEmbedding` weight nor the term,
+  while `embedder-reference.js` had both. `diffuser/evoformer/bond_embedding/
+  weights` was in the shipped bundle, downloaded on every fold, multiplied by
+  nothing. `tools/gpu/check-af3-embedder.js` passed throughout because its
+  fixture carried no bond matrix either: **a feature absent from both sides of a
+  differential test is not tested by it.**
+- **The viewer never saw it either.** `toPdb` wrote no CONECT records, so
+  py2Dmol derived the ligand's bonds from the DISTANCE between atoms - and
+  re-derived them from every trajectory frame, whose coordinates are noise until
+  the last few diffusion steps. Measured on a six-atom cofactor whose truth is
+  five bonds: **4 sticks at convergence, then 4/4/3, 3/4/3 and 2/3/1 as the
+  noise grows** - a different molecule every frame. With CONECT it is 5 at every
+  noise level, because the bonds stop being a function of the geometry.
+- **And `ELEMENT_SYMBOL` had four entries** - C, N, O, S - with everything else
+  falling through to carbon. Across a corpus of 51 distinct hetero components,
+  **28 carry an element it dropped**: every phosphate-bearing ligand, every
+  heme, every metal ion. That is a wrong colour and a wrong radius, and it
+  breaks the distance fallback a second way, because that rule is per ELEMENT
+  PAIR: a disulfide at 2.05 A read as C-C (ceiling 1.8) vanishes.
+
+`test/af3-ligand-bonds.test.js` covers all of it on the CPU lane; seven
+mutations, each caught.
+
+**py2Dmol read CONECT partners one column late**, which `trim()` hid up to 9,999
+atoms - a right-justified four-digit serial survives a one-column slip, a
+five-digit one does not. Serial 10000's partner came back as **1**: not a
+dropped bond but a stick drawn to a real atom somewhere else. Fixed in py2Dmol's
+`src/io/parse.js`, with the case in its `tests/interaction.js`.
 
 **This build's py2Dmol renderer has no `setColor` or `setColorScheme`** - those
 belong to the embed build. Drive the app's own colour `<select>` instead.

@@ -459,3 +459,12 @@
   justify-content: space-between;
   gap: 16px;
 }
+
+/* A control that is still readable and no longer does anything: Max MSA with
+   the MSA select on None. Hiding it instead would reflow the row on a change
+   that did not concern the controls beside it, and would take the depth a
+   reader set out of sight rather than out of use. */
+.fetch-option-disabled {
+  opacity: .45;
+  pointer-events: none;
+}

@@ -122,7 +122,22 @@ export async function sampleOnGpu(device, input, weights, options) {
  */
 export async function flowOnGpu(device, input, weights, options) {
   const { cycles, normal } = options;
-  const levels = noiseLevels(cycles, options);
+  // 🔴 THE FLOW STARTS AT 160 A, NOT AF3'S 2560, AND THAT IS A CHOICE WITH A
+  // MEASURED COST. sigmaMax is in units of sigmaData, so 10 is 160 angstroms.
+  // Most of AF3's schedule sits above the level where the denoiser starts
+  // trusting the coordinates it is given - the skip weight is
+  // sigma_d^2/(sigma^2+sigma_d^2) - so a walk from 2560 spends its first calls
+  // on a regime a flow does not need, and a ligand pays for it: HEM's bond
+  // error at eight steps is 0.218 A from 2560 and 0.129 A from 160.
+  //
+  // It is not free. Against the crystals at flow 8 over four seeds, 6MRR is
+  // unchanged (0.703 -> 0.712 A, TM .950 -> .949) and 1QYS loses 0.04 A
+  // (0.862 -> 0.905, TM .948 -> .944) with seed ranges that do not overlap.
+  // See tools/gpu/probe-sigma0.js for the table and probe-ligand-flow.js for
+  // the ligand side. AF3's own DIFFUSION sampler is untouched: it keeps the
+  // schedule it was verified against, and noiseSchedule's defaults are still
+  // AF3's, so only the flow - which is ours - moves.
+  const levels = noiseLevels(cycles, { sigmaMax: 10, ...options });
   const head = new Af3DiffusionHeadGpu(device);
   let positions = new Float32Array(input.shape.tokens * input.shape.dense * 3);
   for (let index = 0; index < positions.length; index += 1) {
