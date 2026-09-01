@@ -73,3 +73,60 @@ export async function sampleOnGpu(device, input, weights, options) {
   }
   return positions;
 }
+
+/**
+ * The same denoiser, run as a structure module: no noise anywhere.
+ *
+ * Start every atom at the origin, walk sigma down the schedule, and feed each
+ * output back in as the next input. No Gaussian initialisation, no churn, no
+ * random augmentation - nothing is drawn.
+ *
+ * WHY IT WORKS AT ALL. AF3 returns skip * input + out * update, with
+ * skip = sigma_d^2/(sigma^2+sigma_d^2), which is 3.9e-5 at the top of the
+ * schedule. So the first call discards its input entirely and predicts the
+ * structure from the trunk - a black hole is a perfectly good member of "this
+ * input is noise, ignore it". Each later call is handed a better structure at a
+ * lower sigma, which is exactly the claim the Fourier noise embedding makes
+ * about it.
+ *
+ * WHAT IT COSTS AND SAVES, measured against the 200-step stochastic sampler:
+ *
+ *     6MRR   ramp 8 calls  0.69 A  TM 0.951   sampler 200  0.66 A  TM 0.953
+ *     1QYS   ramp 8 calls  0.86 A  TM 0.947   sampler 200  0.93-1.12 A over
+ *                                             four seeds, TM 0.916-0.941
+ *
+ * 🔴 SIGMA IS A CLAIM ABOUT THE INPUT, NOT A DIAL, WHICH IS WHY THE SCHEDULE
+ * MUST DESCEND. Holding it fixed and iterating diverges: from zeros at sigma 16
+ * the structure goes 9.12 A to 9.72 A, getting worse every round, because the
+ * network is told its input is nearly correct when it is not and answers with
+ * correspondingly small corrections. See tools/gpu/probe-denoiser.js.
+ *
+ * 🔴 AND IT RETURNS ONE STRUCTURE, FOR EVER. There is no seed and no ensemble:
+ * the same trunk gives the same answer every time. That is the whole point of
+ * diffusion thrown away, and it is why this is offered beside sampleOnGpu
+ * rather than instead of it.
+ *
+ * @param {{cycles: number, onStep?: Function}} options
+ */
+export async function rampOnGpu(device, input, weights, options) {
+  const { cycles } = options;
+  const levels = noiseLevels(cycles, options);
+  const head = new Af3DiffusionHeadGpu(device);
+  let positions = new Float32Array(input.shape.tokens * input.shape.dense * 3);
+
+  for (let cycle = 1; cycle <= cycles; cycle += 1) {
+    const noiseLevel = levels[cycle - 1];
+    const denoised = await head.run({ ...input, noiseLevel, positionsNoisy: positions },
+                                    weights);
+    positions = denoised.positions;
+    // The same shape sampleOnGpu reports, so a caller animates either the same
+    // way. Here the two tracks ARE the same array - there is no separate walk -
+    // and no frame needs superposing, because nothing was ever rotated.
+    await options.onStep?.({
+      step: cycle, steps: cycles, noiseLevel, tHat: noiseLevel,
+      positions: Float32Array.from(positions),
+      denoised: Float32Array.from(positions),
+    });
+  }
+  return positions;
+}

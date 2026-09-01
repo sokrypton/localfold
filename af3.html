@@ -105,42 +105,65 @@ AI Context: AF3 PAGE ENTRY POINT
                          the label inside the column at a fixed width so the
                          fields share an edge. -->
                     <div class="fold-actions"
-                        style="width: 108px; min-width: 108px; max-width: 108px; flex: 0 0 108px; display: flex; flex-direction: column; gap: 6px;">
+                        style="width: 142px; min-width: 142px; max-width: 142px; flex: 0 0 142px; display: flex; flex-direction: column; gap: 6px;">
                         <!-- The empty span matches the labels below it, so all
                              three controls share a left and a right edge. -->
                         <div style="display: flex; align-items: center; gap: 4px;">
-                            <span style="width: 32px;"></span>
+                            <span style="width: 42px;"></span>
                             <button id="predict" class="btn btn-primary"
                                 style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; justify-content: center; font-size: 13px;">
                                 <i class="fa-solid fa-cubes"></i>
                                 <span>Fold</span>
                             </button>
                         </div>
-                        <!-- THE ONLY DIAL THAT CHANGES THE TIME. Diffusion is
-                             97% of a fold and is linear in this number, and so
-                             is the animation: every step is a frame.
+                        <!-- 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND
+                             THEY ARE NOT THE SAME KIND OF THING.
 
-                             🔴 IT STARTS AT 20 BECAUSE BELOW THAT THE SAMPLER
-                             DOES NOT LAND. Measured on 6MRR against the crystal
-                             structure: 40 steps gives 0.67 A and CA-CA 3.73 A,
-                             20 gives 0.97 A and 3.73 A, and 10 gives 5.91 A
-                             with a CA-CA of 8.40 A - a chain that is not
-                             connected. 200 steps gives 0.66 A, which is 0.01 A
-                             for four times the wait, so 40 is the default and
-                             the higher settings are there to be disbelieved. -->
+                             Ramp is the denoiser run as a structure module: it
+                             starts every atom at the origin and walks sigma
+                             down the schedule with NO noise drawn anywhere.
+                             Measured against the crystal, 8 cycles gives 0.69 A
+                             on 6MRR and 0.86 A on 1QYS - matching or beating
+                             the 200-step sampler with 25x fewer calls. It is
+                             deterministic, so it has no seed and returns one
+                             structure however many times you press Fold.
+
+                             Diffusion is AF3's own stochastic sampler. It is
+                             slower and, on those two targets, no more accurate
+                             - but it SAMPLES, so a different seed is a
+                             different structure and repeated folds give an
+                             ensemble. That is the thing Ramp throws away. -->
                         <label style="display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 500; color: #64748b;">
-                            <span style="width: 32px;">Steps</span>
-                            <select id="steps"
-                                style="flex: 1 1 auto; width: 100%; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
-                                <option value="20" selected>20</option>
-                                <option value="40">40</option>
-                                <option value="80">80</option>
-                                <option value="160">160</option>
-                                <option value="320">320</option>
+                            <span style="width: 42px;">Mode</span>
+                            <select id="mode"
+                                style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
+                                <option value="ramp" selected>Ramp</option>
+                                <option value="diffusion">Diffusion</option>
                             </select>
                         </label>
+                        <!-- THE DIAL THAT CHANGES THE TIME. Both modes cost about
+                             0.85 s a call, so this is linear in the wait, and so
+                             is the animation: every call is a frame.
+
+                             🔴 ITS OPTIONS DEPEND ON THE MODE, because the two
+                             numbers mean different things. Ramp cycles walk the
+                             whole schedule, so 8 of them is a finished
+                             structure. Diffusion steps discretise it, and below
+                             20 the sampler does not land at all - 10 steps
+                             gives 5.91 A with a CA-CA of 8.40 A, a chain that
+                             is not connected. web/af3.js rewrites the list. -->
                         <label style="display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 500; color: #64748b;">
-                            <span style="width: 32px;">Seed</span>
+                            <span id="steps-label" style="width: 42px;">Cycles</span>
+                            <select id="steps"
+                                style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
+                            </select>
+                        </label>
+                        <!-- 🔴 DISABLED IN RAMP MODE, WHICH HAS NO SEED. Leaving
+                             it live would offer a control that changes nothing,
+                             and a reader who tried it would conclude the page
+                             was broken. -->
+                        <label id="seed-row" style="display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 500; color: #64748b;">
+                            <span style="width: 42px;">Seed</span>
                             <input id="seed" type="number" value="0"
                                 style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; text-align: center;">
                         </label>

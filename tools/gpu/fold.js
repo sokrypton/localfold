@@ -143,6 +143,7 @@ export async function main(device, args) {
   let lastDenoised = null;
 
   const result = await foldBatch(device, batch, weights, {
+    mode: option(args, "mode", "diffusion"),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {

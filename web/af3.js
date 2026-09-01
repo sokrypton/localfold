@@ -88,6 +88,40 @@ function setFoldButton(state) {
   if (label !== null) label.textContent = running ? "Stop" : "Fold";
 }
 
+/**
+ * What the count dial offers, per mode, and what it is called.
+ *
+ * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A ramp cycle walks the whole
+ * schedule, so eight of them is a finished structure; a diffusion step
+ * discretises the schedule, and below twenty the sampler does not land - ten
+ * steps gives 5.91 A on 6MRR with a CA-CA of 8.40 A, a chain that is not
+ * connected. Carrying a number across a mode change would therefore be a way to
+ * ask for something broken by accident.
+ */
+const COUNTS = {
+  ramp: { label: "Cycles", values: [2, 4, 8, 16, 32], preferred: 8 },
+  diffusion: { label: "Steps", values: [20, 40, 80, 160, 320], preferred: 20 },
+};
+
+/** Rebuild the count dial for a mode, and hide the seed where there is none. */
+function applyMode(mode) {
+  const { label, values, preferred } = COUNTS[mode] ?? COUNTS.ramp;
+  text("steps-label", label);
+  const select = element("steps");
+  if (select !== null) {
+    select.replaceChildren(...values.map((value) => Object.assign(
+      document.createElement("option"),
+      { value: String(value), textContent: String(value), selected: value === preferred })));
+    select.value = String(preferred);
+  }
+  // The ramp is deterministic, so its seed box would be a control that does
+  // nothing - and a reader who tried it would conclude the page was broken.
+  const seed = element("seed");
+  const row = element("seed-row");
+  if (seed !== null) seed.disabled = mode === "ramp";
+  if (row !== null) row.style.opacity = mode === "ramp" ? "0.4" : "1";
+}
+
 /** The seed box, where an empty field means zero and zero means zero. */
 function readSeed() {
   const raw = element("seed")?.value ?? "";
@@ -263,7 +297,7 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
   return toPdb(batch, fitted, plddt);
 }
 
-export async function fold({ sequence, steps, seed, viewer, signal }) {
+export async function fold({ sequence, mode, steps, seed, viewer, signal }) {
   const batch = featuriseProtein(sequence);
   status(`Loading the model…`);
   const weights = await loadWeights();
@@ -282,7 +316,7 @@ export async function fold({ sequence, steps, seed, viewer, signal }) {
   let shown = 0;
 
   const result = await foldBatch(await getDevice(), batch, weights, {
-    steps, seed,
+    mode, steps, seed,
     onStage: async (name, detail) => {
       if (name === "target-feat-start") {
         status(`Building input features for ${batch.atomCount} atoms…`);
@@ -312,7 +346,9 @@ export async function fold({ sequence, steps, seed, viewer, signal }) {
       }
       if (name === "trunk-done") {
         progress(share.trunk);
-        status(`Diffusing ${batch.atomCount} atoms over ${steps} steps…`);
+        status(mode === "ramp"
+          ? `Refining ${batch.atomCount} atoms over ${steps} cycles…`
+          : `Diffusing ${batch.atomCount} atoms over ${steps} steps…`);
       }
     },
     onStep: async ({ step, denoised }) => {
@@ -348,7 +384,7 @@ export async function fold({ sequence, steps, seed, viewer, signal }) {
       progress(share.trunk + (1 - share.trunk) * (step / steps));
       const elapsed = (performance.now() - started) / 1000;
       const remaining = elapsed * (steps / step - 1);
-      status(`Diffusion step ${step} of ${steps}`
+      status(`${mode === "ramp" ? "Cycle" : "Diffusion step"} ${step} of ${steps}`
         + `  ·  about ${Math.ceil(remaining)} s left`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task
@@ -398,6 +434,9 @@ export async function fold({ sequence, steps, seed, viewer, signal }) {
 export function start() {
   const viewer = createStructureViewer({ container: element("viewer"), frameLabel: "step" });
 
+  applyMode(element("mode")?.value ?? "ramp");
+  element("mode")?.addEventListener("change", (event) => applyMode(event.target.value));
+
   const gate = element("terms-gate");
   const showGate = (show) => { if (gate) gate.hidden = !show; };
   showGate(!hasAccepted());
@@ -439,7 +478,9 @@ export function start() {
     try {
       await fold({
         sequence,
-        steps: Number(element("steps")?.value) || 20,
+        mode: element("mode")?.value ?? "ramp",
+        steps: Number(element("steps")?.value)
+          || COUNTS[element("mode")?.value ?? "ramp"].preferred,
         // 🔴 ZERO IS A SEED, NOT A MISSING VALUE. `Number(value) || default`
         // silently replaces it with the default, so the one seed a reader is
         // most likely to type first would quietly fold something else.

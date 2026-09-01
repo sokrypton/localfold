@@ -28,7 +28,7 @@ import { perAtomConditioning } from "./atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
-import { sampleOnGpu } from "./diffusion-sampler-webgpu.js";
+import { sampleOnGpu, rampOnGpu } from "./diffusion-sampler-webgpu.js";
 
 /**
  * 🔴 THE DIALECT IS NOT A PREFERENCE. `model='openfold3'` turns on four
@@ -191,7 +191,7 @@ export function normalFrom(seed) {
 /**
  * @param {object} batch from featuriseProtein or an AF3 dump
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
- * @param {{steps?: number, seed?: number, blocks?: number,
+ * @param {{mode?: "ramp"|"diffusion", steps?: number, seed?: number, blocks?: number,
  *          onStage?: (name: string, detail: object) => void,
  *          onStep?: (step: object) => void}} [options]
  */
@@ -251,11 +251,21 @@ export async function foldBatch(device, batch, weights, options = {}) {
     trunkSingle: trunk.single, trunkPair: trunk.pair,
   };
 
-  const positions = await sampleOnGpu(device, headInput, weights.diffusion, {
-    steps, stopAfter: options.stopAfter,
-    normal: normalFrom(options.seed ?? 20260831),
-    onStep: options.onStep,
-  });
+  // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
+  // KIND OF THING. "diffusion" is AF3's own stochastic sampler: it draws a
+  // seed, so it gives a different structure each time and an ensemble if you
+  // ask repeatedly. "ramp" is the same denoiser run deterministically down the
+  // schedule from a black hole - one structure, no seed, and about 25x fewer
+  // calls for the same accuracy on the two proteins it has been measured on.
+  const positions = options.mode === "diffusion"
+    ? await sampleOnGpu(device, headInput, weights.diffusion, {
+        steps, stopAfter: options.stopAfter,
+        normal: normalFrom(options.seed ?? 20260831),
+        onStep: options.onStep,
+      })
+    : await rampOnGpu(device, headInput, weights.diffusion, {
+        cycles: steps, onStep: options.onStep,
+      });
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;
