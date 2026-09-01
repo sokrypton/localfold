@@ -35,6 +35,17 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 const GRID_WIDTH = 32_768;
 
+/**
+ * How many pair rows one projection workgroup handles.
+ *
+ * 🔴 IT IS AN ARITHMETIC-INTENSITY DIAL, not a tuning knob to leave alone. At
+ * one row a thread does a single multiply per weight it loads; at ROWS it does
+ * ROWS of them, and the weight traffic falls by the same factor. Eight fits the
+ * activation tile in 4 KB of workgroup memory and leaves 32 accumulators a
+ * thread, which is comfortable.
+ */
+export const PROJECT_ROWS = 8;
+
 const ORDER = [
   "actNormScale", "actNormOffset", "pairBiasProjection",
   "qProjection", "kProjection", "vProjection", "gatingQuery", "outputProjection",
@@ -174,7 +185,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // One workgroup per pair row; thread w owns output channel w of q, k, v and
   // the gate at once, so the normalised row is read from shared memory four
   // times instead of global memory four times.
+  // 🔴 SEVERAL PAIR ROWS PER WORKGROUP, BECAUSE THIS IS MEMORY-BOUND AND NOT
+  // COMPUTE-BOUND. One row per workgroup means each thread does ONE multiply
+  // per weight it loads - an arithmetic intensity of 1, which no GPU can run
+  // near its peak - and every workgroup re-reads all four 128x128 matrices.
+  // Holding ROWS rows at once lets a weight loaded into a register serve all of
+  // them, so the traffic falls by a factor of ROWS and the intensity rises to
+  // it. This is AF2's habit of blocking a projection over a tile rather than a
+  // row; measured, it is the largest remaining cost in the pairformer.
+  const ROWS = PROJECT_ROWS;
+  const overRows = (body) => Array.from({ length: ROWS }, (_, r) => body(r)).join("\n");
   const project = `${common}
+const ROWS: u32 = ${ROWS}u;
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
@@ -182,41 +204,53 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
-var<workgroup> act: array<f32, ${channels}>;
+// ROWS rows of activations, shared by every output channel in the workgroup.
+var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
 
 @compute @workgroup_size(${width})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= PAIRS) { return; }
+  let tile = group.x + group.y * GRID_WIDTH;
+  let first = tile * ROWS;
+  if (first >= PAIRS) { return; }
   let local = local_id.x;
-  let source = ${sourceRow};
-  for (var c = local; c < CHANNELS; c += WIDTH) { act[c] = normalized[source * CHANNELS + c]; }
+
+  for (var r = 0u; r < ROWS; r += 1u) {
+    let row = first + r;
+    // 🔴 THE TAIL IS ZEROED, NOT SKIPPED. PAIRS is rarely a multiple of ROWS,
+    // and a thread that reads uninitialised workgroup memory for the last tile
+    // would write NaN into q, k, v and the gate for real rows in the same tile.
+    let source = select(0u, ${sourceRow.replace("row", "row")}, row < PAIRS);
+    for (var c = local; c < CHANNELS; c += WIDTH) {
+      act[r * CHANNELS + c] = select(0.0, normalized[source * CHANNELS + c], row < PAIRS);
+    }
+  }
   workgroupBarrier();
 
-  var q_total = 0.0;
-  var k_total = 0.0;
-  var v_total = 0.0;
-  var gate_total = 0.0;
+${overRows((r) => `  var q${r} = 0.0; var k${r} = 0.0; var v${r} = 0.0; var g${r} = 0.0;`)}
+
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    let x = act[c];
-    // All four are (channels, out) now - see packGridAttentionWeights - so
-    // consecutive threads read consecutive addresses.
+    // All four are (channels, out) - see packGridAttentionWeights - so
+    // consecutive threads read consecutive addresses, and each of these four
+    // loads is then used ROWS times.
     let base = c * WIDTH + local;
-    q_total += x * weights[W_Q + base];
-    k_total += x * weights[W_K + base];
-    gate_total += x * weights[W_GATE + base];
-    v_total += x * weights[W_V + base];
+    let wq = weights[W_Q + base];
+    let wk = weights[W_K + base];
+    let wv = weights[W_V + base];
+    let wg = weights[W_GATE + base];
+${overRows((r) => `    let x${r} = act[${r}u * CHANNELS + c];`)}
+${overRows((r) => `    q${r} += x${r} * wq; k${r} += x${r} * wk; v${r} += x${r} * wv; g${r} += x${r} * wg;`)}
   }
-  let index = row * WIDTH + local;
-  q[index] = q_total;
-  k[index] = k_total;
-  v[index] = v_total;
-  gate[index] = gate_total;
+
+${overRows((r) => `  if (first + ${r}u < PAIRS) {
+    let index${r} = (first + ${r}u) * WIDTH + local;
+    q[index${r}] = q${r};
+    k[index${r}] = k${r};
+    v[index${r}] = v${r};
+    gate[index${r}] = g${r};
+  }`)}
 }`;
 
-  // One workgroup per (row, i, head): softmax over that row's j, then the
-  // weighted sum of v.
   // 🔴 AF2'S ATTENTION KERNEL, REWRITTEN AGAINST AF3'S OWN BINDINGS. AlphaFold
   // 2's triangle attention and this are the same operation, and AF2's kernel is
   // a tuned flash one; the version here was naive, and measured at 88% of the
@@ -414,7 +448,9 @@ export class Af3GridSelfAttentionGpu {
               linear2d(Math.ceil(pairs / 64)));
       runPass("bias", bias, [normalized, weightBuffer, biasBuffer],
               linear2d(Math.ceil(pairs / 64)));
-      runPass("project", project, [normalized, weightBuffer, q, k, v, gate], linear2d(pairs));
+      // One workgroup per tile of PROJECT_ROWS pair rows - see the kernel.
+      runPass("project", project, [normalized, weightBuffer, q, k, v, gate],
+              linear2d(Math.ceil(pairs / PROJECT_ROWS)));
       // One thread per (query, row, head) - see the note on the kernel.
       runPass("attend", attend, [q, k, v, biasBuffer, maskBuffer, gathered],
               [Math.ceil(n / 64), n, heads]);

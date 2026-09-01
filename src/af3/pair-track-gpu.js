@@ -22,7 +22,8 @@
 import { createTriangleShaders } from "../triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
-import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention-webgpu.js";
+import { createGridAttentionShaders, packGridAttentionWeights, PROJECT_ROWS }
+  from "./grid-attention-webgpu.js";
 import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
 
 export const PAIR_CHANNELS = 128;
@@ -140,8 +141,10 @@ export function encodePairTrack(context) {
     run("grid.normalize", p("normalize"), [pair, w, scratch[0]], linear[0], linear[1]);
     run("grid.bias", p("bias"), [scratch[0], w, biasBuffer], linear[0], linear[1]);
     const perPair = spread(pairs);
+    // One workgroup per tile of PROJECT_ROWS pair rows - see the kernel.
+    const perTile = spread(ceil(pairs, PROJECT_ROWS));
     run("grid.project", p("project"),
-        [scratch[0], w, scratch[1], scratch[2], scratch[3], scratch[4]], perPair[0], perPair[1]);
+        [scratch[0], w, scratch[1], scratch[2], scratch[3], scratch[4]], perTile[0], perTile[1]);
     // 🔴 THE GRID TRACK'S HEAD COUNT, not the single track's. They differ, 4
     // against 16, and the shader's bounds check makes the wrong one correct but
     // oversubscribed.
