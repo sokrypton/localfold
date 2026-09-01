@@ -1,4 +1,5 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
+import { bestAlignmentTmScore, tmPerBinFor, tmScoreD0 } from "./tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
 } from "../evoformer/transition.js";
@@ -59,9 +60,11 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
   const bins = breaks.length + 1;
   if (logits.length !== length * length * bins) throw new RangeError("invalid PAE logits shape");
   const centers = paeCenters(breaks);
-  const effectiveLength = Math.max(length, 19);
-  const d0 = 1.24 * Math.cbrt(effectiveLength - 15) - 1.8;
-  const tmPerBin = centers.map((center) => 1 / (1 + center * center / (d0 * d0)));
+  // 🔴 d0 IS DRAWN FROM THE WHOLE PREDICTION FOR BOTH SCORES. It is tempting to
+  // size the interface score by the interface, but AlphaFold does not: ipTM
+  // narrows which PAIRS are averaged, not what d0 is, and changing that here
+  // would move a published number.
+  const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));
 
   const isMultiChain = Array.isArray(chainLengths) && chainLengths.length > 1;
   let chainIndices = null;
@@ -74,42 +77,17 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
     });
   }
 
-  let ptm = 0;
-  let iptm = isMultiChain ? 0 : undefined;
+  // The reduction is shared with AlphaFold 3 - see src/heads/tm-score.js. What
+  // stays here is AF2's own conventions: bin centres from the model's breaks,
+  // and chains as contiguous blocks rather than by asym_id.
+  const ptm = bestAlignmentTmScore(logits, length, tmPerBin, () => true);
+  const iptm = isMultiChain
+    ? bestAlignmentTmScore(logits, length, tmPerBin,
+      (anchor, other) => chainIndices[anchor] !== chainIndices[other])
+    : undefined;
 
-  for (let anchor = 0; anchor < length; anchor += 1) {
-    const anchorChain = chainIndices ? chainIndices[anchor] : 0;
-    let fullAlignment = 0;
-    let interfaceAlignment = 0;
-    let interfaceResidueCount = 0;
-
-    for (let residue = 0; residue < length; residue += 1) {
-      const base = (anchor * length + residue) * bins;
-      let maximum = -Infinity;
-      for (let bin = 0; bin < bins; bin += 1) maximum = Math.max(maximum, logits[base + bin]);
-      let denominator = 0;
-      let numerator = 0;
-      for (let bin = 0; bin < bins; bin += 1) {
-        const probability = Math.exp(logits[base + bin] - maximum);
-        denominator += probability;
-        numerator += probability * tmPerBin[bin];
-      }
-      const pairTm = numerator / denominator;
-      fullAlignment += pairTm;
-
-      if (isMultiChain && chainIndices[residue] !== anchorChain) {
-        interfaceAlignment += pairTm;
-        interfaceResidueCount += 1;
-      }
-    }
-
-    ptm = Math.max(ptm, fullAlignment / length);
-    if (isMultiChain && interfaceResidueCount > 0) {
-      iptm = Math.max(iptm, interfaceAlignment / interfaceResidueCount);
-    }
-  }
-
-  const multimerScore = isMultiChain && iptm !== undefined ? (0.8 * iptm + 0.2 * ptm) : undefined;
+  const multimerScore = isMultiChain && iptm !== undefined && !Number.isNaN(iptm)
+    ? (0.8 * iptm + 0.2 * ptm) : undefined;
   return { ptm, iptm, multimerScore };
 }
 

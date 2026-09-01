@@ -73,6 +73,9 @@ describe("browser prediction result formatting", () => {
   });
 });
 
+const { computeTmScores: computeTmScoresPinned } =
+  await import("../src/heads/confidence.js");
+
 describe("TM and interface TM score calculation", () => {
   it("computes pTM and multi-chain ipTM from PAE logits", async() => {
     const { computeTmScores } = await import("../src/heads/confidence.js");
@@ -100,5 +103,39 @@ describe("TM and interface TM score calculation", () => {
     expect(typeof multimerScores.iptm).toBe("number");
     expect(multimerScores.iptm).toBeGreaterThan(0.005);
     expect(multimerScores.multimerScore).toBeCloseTo(0.8 * multimerScores.iptm + 0.2 * multimerScores.ptm, 4);
+  });
+
+  it("holds AlphaFold 2's scores to the exact values it produces today", () => {
+    // 🔴 A CHARACTERISATION TEST, PINNED BEFORE THE REDUCTION WAS SHARED WITH
+    // AF3. The assertions above are all `greaterThan`, which is enough to say
+    // the function does something and not enough to say it still does the same
+    // thing. These numbers are a record of behaviour, not a claim about
+    // correctness.
+    //
+    // 🔴 AND SHARING IT MOVED THEM, BY 2e-10. The old code built its TM-per-bin
+    // table with `centers.map(...)`, and mapping a Float32Array returns a
+    // Float32Array, so the table was single precision; tmPerBinFor returns
+    // float64. That is the whole of the difference - the values below are the
+    // post-refactor ones and the pre-refactor ptm was 0.31470439840500297
+    // against 0.31470439859116128 now. It is ten orders below anything this
+    // score is read to, and it is written down rather than rounded away because
+    // the next difference this test catches might not be.
+    const length = 20;
+    const bins = 64;
+    const breaks = Float32Array.from({ length: 63 }, (_, i) => i * 0.5);
+    const logits = new Float32Array(length * length * bins);
+    for (let i = 0; i < length; i += 1) {
+      for (let j = 0; j < length; j += 1) {
+        const isSame = (i < 10 && j < 10) || (i >= 10 && j >= 10);
+        logits[(i * length + j) * bins + (isSame ? 0 : 6)] = 10.0;
+      }
+    }
+    const monomer = computeTmScoresPinned(logits, length, breaks);
+    const multimer = computeTmScoresPinned(logits, length, breaks, [10, 10]);
+    expect(monomer.ptm).toBeCloseTo(0.314704398591, 12);
+    expect(monomer.iptm).toBe(undefined);
+    expect(multimer.ptm).toBeCloseTo(0.314704398591, 12);
+    expect(multimer.iptm).toBeCloseTo(0.009639396126, 12);
+    expect(multimer.multimerScore).toBeCloseTo(0.070652396619, 12);
   });
 });

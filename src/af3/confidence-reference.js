@@ -67,8 +67,13 @@ export function distogramFeatures(positions, pairMask, tokens) {
   return output;
 }
 
-/** Bin centres for an error head: `bins - 1` edges, plus a catch-all. */
-function errorBinCentres(bins, maxErrorBin) {
+/**
+ * Bin centres for an error head: `bins - 1` edges, plus a catch-all.
+ *
+ * Exported because pTM reads the same centres from the same PAE logits, and two
+ * copies of this would be two chances to disagree about where the bins sit.
+ */
+export function errorBinCentres(bins, maxErrorBin) {
   const step = maxErrorBin / (bins - 2);
   const centres = new Float64Array(bins);
   for (let bin = 0; bin < bins - 1; bin += 1) centres[bin] = bin * step + step / 2;

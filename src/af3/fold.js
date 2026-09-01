@@ -30,6 +30,7 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
+import { reduceTmScore } from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
 
 /**
@@ -373,8 +374,19 @@ export async function foldBatch(device, batch, weights, options = {}) {
     count += 1;
   }
 
+  // pTM and ipTM, from the TM term the confidence head wrote. The reduction is
+  // shared with AlphaFold 2 - see src/heads/tm-score.js - and only the chain
+  // identity differs: AF3 has asym_id, so chains need not be contiguous.
+  const asymId = batch.asymId;
+  const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+  const ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
+  // NaN for one chain, because there is no interface to score. Zero would read
+  // as a confident failure rather than an inapplicable question.
+  const iptm = reduceTmScore(scores.tmAdjusted, tokens,
+    (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
+
   return {
-    positions, trunk, targetFeat, scores,
+    positions, trunk, targetFeat, scores, ptm, iptm,
     meanPlddt: total / count, atoms: count,
     geometry: backboneGeometry(batch, positions),
     pdb: toPdb(batch, positions, scores.plddt),

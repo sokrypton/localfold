@@ -12,7 +12,9 @@
  */
 import { join } from "node:path";
 
-import { confidenceHead } from "../../src/af3/confidence-reference.js";
+import { confidenceHead, errorBinCentres } from "../../src/af3/confidence-reference.js";
+import { interfaceTokenCounts, predictedTmScores, tmAdjustedPae }
+  from "../../src/af3/ptm-reference.js";
 import { convert } from "../../src/af3/atom-encoder-reference.js";
 import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
@@ -137,6 +139,36 @@ async function main() {
   report("pLDDT", at("predicted_lddt"), ours.plddt);
   report("PAE", at("full_pae"), ours.pae);
   report("PDE", at("full_pde"), ours.pde);
+
+  // 🔴 THE TM ADJUSTMENT IS CHECKED AS A TENSOR, not through the scalar it
+  // becomes. pTM is a max over row means, and a max hides almost everything: an
+  // adjustment wrong across most of the matrix still lands on a believable 0.9.
+  // AF3 emits both adjusted PAEs, so both are compared elementwise and the
+  // scores are then arithmetic on something already known to be right.
+  const asymId = Float32Array.from(input("asym_id"));
+  const seqMask = Float32Array.from(input("seq_mask"));
+  const pairMask = new Uint8Array(tokens * tokens);
+  let sequenceTokens = 0;
+  for (let i = 0; i < tokens; i += 1) if (seqMask[i] > 0) sequenceTokens += 1;
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      pairMask[i * tokens + j] = (seqMask[i] > 0 && seqMask[j] > 0) ? 1 : 0;
+    }
+  }
+  const centres = errorBinCentres(64, 31.0);
+  const globalCounts = new Int32Array(tokens * tokens).fill(sequenceTokens);
+  report("adjusted PAE global", at("tmscore_adjusted_pae_global"),
+         tmAdjustedPae(ours.paeLogits, tokens, centres, globalCounts));
+  report("adjusted PAE iface", at("tmscore_adjusted_pae_interface"),
+         tmAdjustedPae(ours.paeLogits, tokens, centres,
+                       interfaceTokenCounts(tokens, asymId, pairMask)));
+
+  const scores = predictedTmScores({ paeLogits: ours.paeLogits, tokens,
+    binCentres: centres, seqMask, asymId });
+  const chains = new Set(Array.from(asymId)).size;
+  console.log(`  pTM ${scores.ptm.toFixed(4)}`
+    + `   ipTM ${Number.isNaN(scores.iptm) ? "n/a (one chain)" : scores.iptm.toFixed(4)}`
+    + `   over ${chains} chain${chains === 1 ? "" : "s"}`);
 }
 
 await main();

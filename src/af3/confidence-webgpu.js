@@ -32,6 +32,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
 import { GRID_WIDTH } from "./pair-track-gpu.js";
+import { tmPerBinFor, tmScoreD0 } from "../heads/tm-score.js";
 
 const NUM_BINS = 64;
 const MAX_ERROR_BIN = 31.0;
@@ -161,8 +162,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
   const centreList = Array.from(centres, (value) => value.toString()).join(", ");
+  // 🔴 d0 IS BAKED IN, WHICH IS SOUND ONLY BECAUSE TOKENS ALREADY IS. The whole
+  // shader is specialised on `tokens` (see TOKENS above) and d0 is a function of
+  // nothing else, so it cannot go stale independently. Both pTM and ipTM use
+  // this same global d0 - the interface score narrows which PAIRS are averaged,
+  // not what d0 is.
+  const tmPerBin = tmPerBinFor(centres, tmScoreD0(tokens));
+  const tmList = Array.from(tmPerBin, (value) => value.toString()).join(", ");
   const pairHeads = `${common}
 const CENTRES = array<f32, ${NUM_BINS}>(${centreList});
+const TM_PER_BIN = array<f32, ${NUM_BINS}>(${tmList});
 const W_LN_SCALE: u32 = ${headOffsets.logitsLnScale}u;
 const W_LN_OFFSET: u32 = ${headOffsets.logitsLnOffset}u;
 const W_HALF: u32 = ${headOffsets.leftHalfDistanceLogits}u;
@@ -175,6 +184,11 @@ const W_PAE: u32 = ${headOffsets.paeLogits}u;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> pde: array<f32>;
 @group(0) @binding(4) var<storage, read_write> pae: array<f32>;
+// 🔴 THE TM TERM, NOT THE LOGITS. pTM and ipTM need the whole PAE distribution,
+// and this shader is the only place it exists - the head keeps the expectation
+// alone. Reading the logits back would be tokens^2 * 64 floats; the term they
+// reduce to is tokens^2, which is 64x smaller and is all either score wants.
+@group(0) @binding(5) var<storage, read_write> tm_adjusted: array<f32>;
 
 fn half_logit(row: u32, bin: u32, scale: u32, offset: u32, projection: u32) -> f32 {
   let base = row * C_Z;
@@ -232,6 +246,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     aligned[b] = half_logit(row, b, W_PAE_SCALE, W_PAE_OFFSET, W_PAE);
   }
   pae[row] = pair_mask[row] * expectation(&aligned);
+
+  // 🔴 UNMASKED, because the reduction masks. Multiplying by pair_mask here
+  // would fold masked pairs into the row mean as zeros rather than leaving them
+  // out of it, which quietly lowers every score on a padded input.
+  var tm_term = 0.0;
+  var tm_largest = -3.0e38;
+  for (var b = 0u; b < BINS; b += 1u) { tm_largest = max(tm_largest, aligned[b]); }
+  var tm_total = 0.0;
+  for (var b = 0u; b < BINS; b += 1u) { tm_total += exp(aligned[b] - tm_largest); }
+  for (var b = 0u; b < BINS; b += 1u) {
+    tm_term += (exp(aligned[b] - tm_largest) / tm_total) * TM_PER_BIN[b];
+  }
+  tm_adjusted[row] = tm_term;
 }`;
 
   // pLDDT and the resolved logits, both per atom slot.
@@ -443,12 +470,15 @@ export class Af3ConfidenceHeadGpu {
         storage | GPUBufferUsage.COPY_SRC));
       const pae = keep(this.allocator.allocate("af3-conf.pae", pairs * 4,
         storage | GPUBufferUsage.COPY_SRC));
+      const tmAdjusted = keep(this.allocator.allocate("af3-conf.tm", pairs * 4,
+        storage | GPUBufferUsage.COPY_SRC));
       const plddt = keep(this.allocator.allocate("af3-conf.plddt", tokens * dense * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const resolved = keep(this.allocator.allocate("af3-conf.resolved", tokens * dense * 2 * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const readbacks = {};
       for (const [name, source, bytes] of [["pde", pde, pairs * 4], ["pae", pae, pairs * 4],
+        ["tmAdjusted", tmAdjusted, pairs * 4],
         ["plddt", plddt, tokens * dense * 4],
         ["resolved", resolved, tokens * dense * 2 * 4]]) {
         readbacks[name] = { allocation: keep(this.allocator.allocate(`af3-conf.rb-${name}`, bytes,
@@ -470,7 +500,7 @@ export class Af3ConfidenceHeadGpu {
         pass.end();
       };
       const groups = Math.ceil(pairs / 64);
-      run("pair-heads", compiled.pairHeads, [pair, maskBuffer, weightBuffer, pde, pae],
+      run("pair-heads", compiled.pairHeads, [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted],
           Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
       for (const { allocation, source, bytes } of Object.values(readbacks)) {

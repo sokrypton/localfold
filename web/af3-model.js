@@ -281,9 +281,10 @@ export async function foldAf3(options) {
     confidence: {
       plddt,
       meanPlddt: result.meanPlddt,
-      // 🔴 NO pTM. AF3's confidence head emits PAE and PDE here; pTM and ipTM
-      // are not implemented, so the field is absent rather than invented - a
-      // plausible number nobody computed is worse than a missing one.
+      ptm: result.ptm,
+      // NaN for a single chain - there is no interface to score - and the card
+      // shows a dash for it rather than a number.
+      iptm: result.iptm,
       predictedAlignedError: result.scores.pae,
     },
   };

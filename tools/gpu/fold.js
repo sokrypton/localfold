@@ -229,7 +229,9 @@ export async function main(device, args) {
   });
 
   console.log(`diffusion done in ${((performance.now() - diffusionStarted) / 1000).toFixed(1)} s`);
-  console.log(`mean pLDDT ${result.meanPlddt.toFixed(1)} over ${result.atoms} atoms`);
+  console.log(`mean pLDDT ${result.meanPlddt.toFixed(1)} over ${result.atoms} atoms`
+    + `   pTM ${result.ptm.toFixed(3)}`
+    + `   ipTM ${Number.isNaN(result.iptm) ? "n/a (one chain)" : result.iptm.toFixed(3)}`);
 
   // 🔴 GEOMETRY IS THE CHECK THAT MATTERS HERE, not pLDDT - see the note on
   // backboneGeometry.
@@ -260,6 +262,8 @@ export async function main(device, args) {
     sequence: batch.sequence, tokens: batch.tokens, steps,
     denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
     meanPlddt: result.meanPlddt,
+    ptm: result.ptm,
+    iptm: Number.isNaN(result.iptm) ? null : result.iptm,
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
     gyration, seconds: elapsed, pdb: result.pdb, trajectory,
   };

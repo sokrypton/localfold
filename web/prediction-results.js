@@ -108,7 +108,11 @@ export function confidenceJson(sequence, confidence) {
     mean_plddt: confidence.meanPlddt,
     ptm: confidence.ptm,
   };
-  if (confidence.iptm !== undefined) {
+  // 🔴 NaN IS "NOT APPLICABLE" HERE, NOT A MISSING FIELD. AlphaFold 3 reports a
+  // monomer's ipTM as NaN - there is no interface to score - and JSON.stringify
+  // turns that into `null`, so a bare `!== undefined` writes `"iptm": null` and
+  // a ranking_confidence of null beside it. Both are treated as absent.
+  if (confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm))) {
     result.iptm = confidence.iptm;
     result.ranking_confidence = confidence.multimerScore ?? (0.8 * confidence.iptm + 0.2 * confidence.ptm);
   }
