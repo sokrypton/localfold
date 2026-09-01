@@ -187,8 +187,41 @@ export async function main(device, args) {
   }
 
   // The per-atom conditioning - see the note at the top.
+  // 🔴 AF3 SAMPLES A FRESH REFERENCE CONFORMER FOR EVERY RESIDUE INSTANCE. Bond
+  // lengths and angles are constant across the 13 internal glutamates in this
+  // dump (spread < 0.09 A on every 1-2 and 1-3 pair) and the torsions are not
+  // (up to 3.3 A on N-OE1). So a browser cannot bake ONE conformer per residue
+  // type and reproduce the dump - the question is whether it has to.
+  // --conformers=canonical answers it: every token takes the conformer of the
+  // FIRST token of its residue type, which is what a baked table would give.
+  const refPos = floats(raw("ref_pos"));
+  const refMask = floats(raw("ref_mask"));
+  if (option(args, "conformers", "dump") === "canonical") {
+    const first = new Map();
+    let copied = 0;
+    for (let token = 0; token < tokens; token += 1) {
+      const type = dump.sequence[token];
+      const source = first.get(type);
+      if (source === undefined) { first.set(type, token); continue; }
+      for (let atom = 0; atom < dense; atom += 1) {
+        // 🔴 ONLY WHERE BOTH INSTANCES HAVE THE ATOM. The C-terminal residue
+        // carries an OXT no internal one has, and copying a masked slot over it
+        // puts that oxygen at the origin - a 5 A error dressed as a table
+        // lookup.
+        if (!refMask[token * dense + atom] || !refMask[source * dense + atom]) continue;
+        for (let axis = 0; axis < 3; axis += 1) {
+          refPos[(token * dense + atom) * 3 + axis] =
+            refPos[(source * dense + atom) * 3 + axis];
+        }
+        copied += 1;
+      }
+    }
+    console.log(`canonical conformers: ${first.size} residue types,`
+      + ` ${copied} atoms replaced`);
+  }
+
   const conditioning = perAtomConditioning({
-    positions: floats(raw("ref_pos")), mask: floats(raw("ref_mask")),
+    positions: refPos, mask: refMask,
     element: ints(raw("ref_element")), charge: floats(raw("ref_charge")),
     atomNameChars: ints(raw("ref_atom_name_chars")),
   }, tokens, dense, reference);
@@ -197,7 +230,7 @@ export async function main(device, args) {
   const headInput = {
     shape: { tokens, dense, subsets, queries: 32, keys: 128 },
     conditioning, atomMask, seqMask, features, targetFeat,
-    refPos: floats(raw("ref_pos")), refSpaceUid: ints(raw("ref_space_uid")),
+    refPos, refSpaceUid: ints(raw("ref_space_uid")),
     tokenAtomsToQueries: gather("token_atoms_to_queries", subsets * 32),
     queriesToKeys: gather("queries_to_keys", subsets * 128),
     queriesToTokenAtoms: gather("queries_to_token_atoms", tokens * dense),
