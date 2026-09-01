@@ -196,24 +196,17 @@ async function alignmentText(chains, signal, family) {
         ? await generateMmseqs2Msa(query, searchOptions)
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`);
-      // 🔴 AF3 WANTS THE TWO BLOCKS APART, and only the search knows them apart.
-      // 🔴 NO SEPARATE PAIRED BLOCK, AND THAT IS NOT AN OMISSION. AF3's `msa` is
-      // a paired block followed by an unpaired one, but the unpaired merge is
-      // already dense - chain A's row r beside chain B's row r - so for a
-      // homo-oligomer, where every copy carries the same alignment, it IS the
-      // paired construction. Supplying both duplicates every row and spends
-      // half the budget saying everything twice, which is what made a homodimer
-      // fold worse with an MSA than without one.
+      // 🔴 THE BLOCKS COME BACK APART, AND AF3 NEEDS THEM THAT WAY. `text` is
+      // the paired rows stacked above the unpaired ones, which is what the
+      // viewer draws and what AlphaFold 2 folds; `blocks` keeps them separate,
+      // because AF3's `msa` is the paired block followed by the unpaired one
+      // and its profile is computed over the second ALONE.
       //
-      // A real paired block would have to pair DIFFERENT sequences by species,
-      // which needs the MMseqs2 server's pair mode; this client does not request
-      // it. Until it does, `paired` stays null and AF3 does what it does with no
-      // paired MSA - the query alone in that block.
-      // ...and AF3 reads the same merged text. It used to be re-merged here,
-      // because the search returned AlphaFold 2's block-diagonal form and AF3
-      // wants the dense one; the search now returns the dense merge for every
-      // chain-aware model, so there is one alignment and no second opinion.
-      return { text: searched.a3m, blocks: { paired: null, unpaired: searched.a3m } };
+      // A homo-oligomer has no paired block: its unpaired merge is already the
+      // paired construction, one search speaking for every copy, so `paired` is
+      // null and AF3 does what it does with none. Pairing is a second search
+      // and it only happens for distinct sequences.
+      return { text: searched.a3m, blocks: searched.blocks ?? { unpaired: searched.a3m } };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);

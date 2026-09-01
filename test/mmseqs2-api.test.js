@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "./harness.js";
 import {
-  extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa, readTarFiles,
+  extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
+  generateMmseqs2PairedMsa, readTarFiles,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
@@ -122,6 +123,123 @@ describe("MMseqs2 API", () => {
     const af3 = parseA3m(mergeRowAlignedChainA3ms([a, b])).sequences;
     expect(af3).toContain("AC-EW-WY");
     expect(af3.includes("AC-E----")).toBe(false);
+  });
+
+  it("pairs distinct sequences through ticket/pair, and stacks the blocks", async() => {
+    // 🔴 THE PAIRED ROWS MUST LINE UP ACROSS CHAINS AND SIT ON TOP. pair.a3m
+    // holds every query's alignment NUL-separated, row r of one being the same
+    // species as row r of another - so the merged result must carry one row
+    // with BOTH chains' paired hits, above the block-diagonal unpaired rows.
+    const pairTar = tar({
+      "pair.a3m": ">101\nACDE\n>hit_sp1\nAC-E\n\0>102\nWYWY\n>hit_sp1\nW-WY\n\0",
+    });
+    const chainTar = (query, hit) => tar({
+      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n\0`,
+      "bfd.mgnify30.metaeuk30.smag30.a3m": `>101\n${query}\n\0`,
+    });
+    const posted = [];
+    let downloads = 0;
+    const result = await generateMmseqs2ComplexMsa(["ACDE", "WYWY"], {
+      fetchImplementation: async(url, init) => {
+        const href = String(url);
+        if (init?.method === "POST") {
+          posted.push({ href, mode: new URLSearchParams(String(init.body)).get("mode") });
+          return new Response(JSON.stringify({ status: "COMPLETE", id: `t${posted.length}` }));
+        }
+        return new Response(new Uint8Array([1, 2, 3]));
+      },
+      wait: async() => {},
+      // The two chain searches come first, then the pair job.
+      decompress: async() => {
+        downloads += 1;
+        if (downloads === 1) return chainTar("ACDE", "AC-E");
+        if (downloads === 2) return chainTar("WYWY", "W-WY");
+        return pairTar;
+      },
+      model: "multimer",
+    });
+
+    // One pair submission, with the pairing mode, alongside the two searches.
+    expect(posted.filter((p) => p.href.endsWith("ticket/pair")).length).toBe(1);
+    expect(posted.find((p) => p.href.endsWith("ticket/pair")).mode).toBe("pairgreedy");
+    expect(result.pairedDepth).toBe(2);
+
+    const rows = parseA3m(result.a3m).sequences;
+    expect(rows[0]).toBe("ACDEWYWY");
+    // The paired row carries both chains' hits at once...
+    expect(rows[1]).toBe("AC-EW-WY");
+    // ...and the unpaired rows follow it, block-diagonal between entities.
+    expect(rows).toContain("AC-E----");
+    expect(rows).toContain("----W-WY");
+    // The query appears once, not once per block.
+    expect(rows.filter((row) => row === "ACDEWYWY").length).toBe(1);
+    // AF3 gets them apart, because its profile is over the unpaired block only.
+    expect(parseA3m(result.blocks.paired).sequences).toContain("AC-EW-WY");
+    expect(parseA3m(result.blocks.unpaired).sequences.includes("AC-EW-WY")).toBe(false);
+  });
+
+  it("does not pair a homomer, where one search already speaks for every copy", async() => {
+    // AlphaFold decides this the same way: feature_processing sets
+    // pair_msa_sequences from `not _is_homomer_or_monomer`. A second search here
+    // would cost a round trip to learn nothing.
+    const posted = [];
+    const result = await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
+      fetchImplementation: async(url, init) => {
+        if (init?.method === "POST") {
+          posted.push(String(url));
+          return new Response(JSON.stringify({ status: "COMPLETE", id: "t" }));
+        }
+        return new Response(new Uint8Array([1, 2, 3]));
+      },
+      wait: async() => {}, decompress: async() => resultTar, model: "multimer",
+    });
+    expect(posted.some((href) => href.endsWith("ticket/pair"))).toBe(false);
+    expect(result.blocks.paired).toBe(null);
+    expect(result.pairedDepth).toBe(0);
+  });
+
+  it("never pairs for the AF2 monomer, whatever the complex", async() => {
+    // The monomer has no chain input at all - the +200 offset stands in for one
+    // - so a row spanning two chains would claim their residues coevolved.
+    const posted = [];
+    const chainTar = (query, hit) => tar({
+      "uniref.a3m": `>101\n${query}\n>u1\n${hit}\n\0`,
+      "bfd.mgnify30.metaeuk30.smag30.a3m": `>101\n${query}\n\0`,
+    });
+    let downloads = 0;
+    const result = await generateMmseqs2ComplexMsa(["ACDE", "WYWY"], {
+      fetchImplementation: async(url, init) => {
+        if (init?.method === "POST") {
+          posted.push(String(url));
+          return new Response(JSON.stringify({ status: "COMPLETE", id: "t" }));
+        }
+        return new Response(new Uint8Array([1, 2, 3]));
+      },
+      wait: async() => {},
+      decompress: async() => (downloads++ === 0 ? chainTar("ACDE", "AC-E") : chainTar("WYWY", "W-WY")),
+      model: "monomer",
+    });
+    expect(posted.some((href) => href.endsWith("ticket/pair"))).toBe(false);
+    expect(result.blocks.paired).toBe(null);
+  });
+
+  it("refuses paired alignments whose depths disagree", async() => {
+    // Equal depth is what makes them paired: row r must exist in every entity
+    // for "row r is one species" to mean anything. A ragged set still merges
+    // into a valid alignment and would silently pair different organisms.
+    const ragged = tar({
+      "pair.a3m": ">101\nACDE\n>a\nAC-E\n>b\nA--E\n\0>102\nWYWY\n>a\nW-WY\n\0",
+    });
+    let message = "no error";
+    try {
+      await generateMmseqs2PairedMsa(["ACDE", "WYWY"], {
+        fetchImplementation: async(url, init) => (init?.method === "POST"
+          ? new Response(JSON.stringify({ status: "COMPLETE", id: "t" }))
+          : new Response(new Uint8Array([1, 2, 3]))),
+        wait: async() => {}, decompress: async() => ragged,
+      });
+    } catch (error) { message = error.message; }
+    expect(message).toContain("aligned row counts");
   });
 
   it("refuses a model it has no merge for", async() => {

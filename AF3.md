@@ -189,14 +189,13 @@ unexplained. That is the next lead and it is a small one.
 
 ## Open
 
-- **No cross-species pairing at all.** AF3 reads a paired block and an unpaired
-  one, and the plumbing for both is in place, but nothing fills the first:
-  pairing DIFFERENT sequences by species needs the MMseqs2 server's pair mode,
-  which `src/input/mmseqs2-api.js` does not request (it posts `mode: env|all`
-  only). Every complex therefore folds against the unpaired block alone - which
-  for a homo-oligomer is already row-aligned and so loses nothing, but for a
-  heteromer means no interface coevolution signal. This is the single largest
-  remaining gap for complexes.
+- **The paired block is not verified against the live server.** A heteromer now
+  gets one, through `ticket/pair` with `mode=pairgreedy`
+  (`generateMmseqs2PairedMsa`), and the parser and assembly are covered by tests
+  against mocked archives - but no run against api.colabfold.com has confirmed
+  that `pair.a3m` really arrives NUL-separated per query with equal depths. That
+  is one heteromer search away. A homo-oligomer needs none of this: its unpaired
+  merge is already the paired construction.
 - **The A3M parser is narrower than AF3's alphabet.** `src/input/a3m.js` rejects
   B, Z, J, O and U, which AF3 maps to D, E, X, X and C. The codes are in
   `AF3_MSA_CODES` and unreachable through that parser - for AlphaFold 2 too, so

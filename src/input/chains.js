@@ -81,6 +81,36 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * Stack a paired block above an unpaired one, as one alignment.
+ *
+ * 🔴 THE SECOND BLOCK'S QUERY ROW IS DROPPED, AND ONLY IT. Both blocks begin
+ * with the same complex query - each is a complete A3M in its own right - so
+ * concatenating them verbatim would put the query in twice and make every
+ * profile computed over the result count it twice. The paired block keeps its
+ * query, because that row is the alignment's own first row and every consumer
+ * expects an A3M to start with the sequence being folded.
+ *
+ * @param {string} pairedA3m rows already aligned across chains
+ * @param {string} unpairedA3m the block-diagonal or dense unpaired rows
+ * @returns {string}
+ */
+export function concatenateA3mBlocks(pairedA3m, unpairedA3m) {
+  const paired = parseA3m(pairedA3m);
+  const unpaired = parseA3m(unpairedA3m);
+  if (paired.query !== unpaired.query) {
+    throw new Error("the paired and unpaired A3M blocks describe different queries");
+  }
+  const lines = [];
+  for (let row = 0; row < paired.depth; row += 1) {
+    lines.push(`>${paired.descriptions[row]}`, paired.rawSequences[row]);
+  }
+  for (let row = 1; row < unpaired.depth; row += 1) {
+    lines.push(`>${unpaired.descriptions[row]}`, unpaired.rawSequences[row]);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * Merge per-chain A3Ms the way AlphaFold 3 merges its UNPAIRED block.
  *
  * 🔴 THIS IS NOT BLOCK-DIAGONAL, AND THAT IS THE WHOLE DIFFERENCE FROM
