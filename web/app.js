@@ -30,7 +30,8 @@ import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-m
 import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
-import { confidenceJson, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName } from "./prediction-results.js";
+import { confidenceJson, framesToPdb, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName }
+  from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
@@ -758,6 +759,22 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       length: paeSize(result.confidence.predictedAlignedError),
       confidence: result.confidence,
     });
+    // 🔴 AND THE PREDICTION IS REGISTERED, WHICH AF3 NEVER DID. The download
+    // buttons read `predictions`, and only the AlphaFold 2 path ever wrote to
+    // it - so an AF3 fold produced a structure on screen with no way to save
+    // what the model actually computed, and the panel holding those buttons
+    // stayed hidden. The trajectory goes in as one model per sampler call,
+    // which is the AF3 analogue of one model per recycle.
+    lastPrediction = {
+      stem,
+      pdb: framesToPdb(timeline, `${timeline.length} ${mode.toUpperCase()} STEPS,`
+        + " MODEL n IS STEP n-1"),
+      scores: confidenceJson(chains.join(""), result.confidence),
+      a3m: alignment,
+      chainLengths: chains.map((chain) => chain.length),
+    };
+    predictions.set(stem, lastPrediction);
+    element("downloads").style.display = "flex";
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
     if (viewer !== undefined) Object.assign(viewer.viewerState, camera);

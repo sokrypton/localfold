@@ -89,6 +89,29 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * Already-formed PDB texts as one multi-model file.
+ *
+ * 🔴 NOT recyclesToPdb. That one BUILDS atom lines from AlphaFold 2's structure
+ * arrays; a sampler has already written its frames as text, and re-deriving
+ * them would need the coordinates it no longer holds. This wraps what exists.
+ *
+ * @param {readonly string[]} frames  one PDB per model, in order
+ * @param {string} remark  what the models are, for REMARK 2
+ */
+export function framesToPdb(frames, remark) {
+  if (frames.length === 0) throw new RangeError("a prediction must have at least one frame");
+  const lines = ["REMARK   1 ALPHAFOLD3 WEBGPU PREDICTION", `REMARK   2 ${remark}`];
+  frames.forEach((frame, index) => {
+    lines.push(`MODEL     ${String(index + 1).padStart(4)}`);
+    // Each frame carries its own END, which cannot appear inside a model.
+    lines.push(...frame.split("\n").filter((line) => line.trim() !== "" && line.trim() !== "END"));
+    lines.push("ENDMDL");
+  });
+  lines.push("END");
+  return `${lines.join("\n")}\n`;
+}
+
 /** The flat per-pair errors as rows, which is how the format is written. */
 export function paeMatrix(values, length) {
   // 🔴 THE STRIDE IS NOT ALWAYS THE LENGTH. AlphaFold 3 scores TOKENS, and a
