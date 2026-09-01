@@ -226,6 +226,21 @@ that matters and the one pairing is for - a confident INTERFACE needs
 cross-chain coevolution, which is precisely what the paired block carries and
 what a heteromer folded without until now.
 
+AF3 takes the same alignment and the budget split is AF3's own: of 9,904 paired
+and 7,283 unpaired rows, it reads 255 paired + 256 unpaired + the query = 512,
+with `unpairedFrom` at 256. That is `max_paired_sequences = msa_size // 2` with
+the remainder to the unpaired block, which is what featurise.js needs to compute
+the profile over the right half.
+
+🔴 BUT AF3 IS MUCH LESS CONFIDENT HERE THAN AlphaFold-Multimer, and it is not
+the wiring. Same chains, same search: AF3 gives pLDDT 62.6 in 84 s against
+multimer's 96.5. The alignment IS doing work - single-sequence AF3 on the same
+complex gives 44.5, so the MSA is worth +18 - and the featuriser is exact
+against AF3's own batch everywhere it can be checked. What cannot be checked
+here is the interface, because AF3 has no ipTM. Whether the gap is int5, the
+model, or something in the paired path that the monomer and homodimer oracles
+cannot see is open.
+
 ## The weights
 
 🔴 **`model-af3-int5` is DeepMind's AlphaFold 3, not OpenFold3.** Every manifest
