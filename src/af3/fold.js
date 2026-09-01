@@ -74,17 +74,30 @@ export function toPdb(batch, positions, plddt) {
     const asym = batch.asymId === undefined ? 1 : batch.asymId[token];
     return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[(asym - 1) % 26];
   };
+  // 🔴 A LIGAND IS HETATM, AND IT HAS A NAME. `sequence` covers the polymers,
+  // so a ligand token indexed into it is undefined and used to be written as a
+  // UNK residue - which a viewer draws as an unknown amino acid and a scoring
+  // tool reads as part of the chain. The span table says which tokens belong to
+  // which component, and the component's own code is its residue name.
+  const componentOf = new Map();
+  for (const span of batch.ligandSpans ?? []) {
+    for (let offset = 0; offset < span.count; offset += 1) {
+      componentOf.set(span.from + offset, span.code);
+    }
+  }
   for (let token = 0; token < tokens; token += 1) {
+    const ligandCode = componentOf.get(token);
     for (let atom = 0; atom < dense; atom += 1) {
       const slot = token * dense + atom;
       if (!batch.predDenseAtomMask[slot]) continue;
       const name = atomName(batch.refAtomNameChars, slot);
       const confidence = plddt ? plddt[slot] : 0;
       lines.push(
-        "ATOM  "
+        (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
-        + (THREE_LETTER[sequence[token]] ?? "UNK").padEnd(3) + " " + chainLetter(token)
+        + (ligandCode ?? THREE_LETTER[sequence[token]] ?? "UNK").padEnd(3)
+        + " " + chainLetter(token)
         // 🔴 residue_index IS ALREADY 1-BASED. Adding one here shifted the whole
         // chain by a residue, which against a helical protein reads as a 3.7 A
         // RMSD and a TM-score of 0.37 - a plausible "wrong fold" rather than an

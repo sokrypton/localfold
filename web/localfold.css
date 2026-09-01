@@ -112,33 +112,16 @@
    two rows tall instead of four. The column does not grow or shrink: the box
    beside it takes whatever is left, which is what makes the row reflow
    sensibly at narrower widths. */
+/* 🔴 A ROW IN THE PAGE HEAD, NOT A 198px COLUMN. This used to reserve a fixed
+   column beside the sequence box for Fold and the MSA switch. The entity list
+   needs the panel's whole width - with a column taken out of every row, the
+   copies fields could not line up - so the actions moved to the page head,
+   opposite the title, where py2Dmol keeps the controls that act on the page. */
 .fold-actions {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: 8px;
-  width: 198px;
-  min-width: 198px;
-  max-width: 198px;
-  flex: 0 0 198px;
-}
-
-.fold-action-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  width: 100%;
-}
-
-.fold-toggle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  user-select: none;
-  height: 24px;
-  width: 96px;
-  margin-left: auto;
-  box-sizing: border-box;
-  padding: 0 8px;
 }
 
 .fold-toggle-label {
@@ -379,4 +362,101 @@
   font-weight: 700;
   color: #111827;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* THE ENTITY LIST replaces the sequence box, so it takes its place in the
+   fetch row: it grows, everything beside it keeps its size. The rows inside
+   stack, and each row is one line - type, value, copies, remove - so the list
+   reads down as "what will be folded" and across as "what this one is". */
+.entity-list {
+  box-sizing: border-box;
+  flex-grow: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 🔴 A GRID, NOT A FLEX ROW, so the columns line up DOWN the list as well as
+   across it. With flex, a ligand's short code pulled its copies field left and
+   the rows no longer read as a table - the eye cannot scan a column that moves.
+   Four tracks: the type, the value taking whatever is left, then copies and
+   remove at a fixed width on every row. */
+.entity-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  align-items: start;
+  gap: 8px;
+}
+
+/* The value field carries the look the sequence box had: py2Dmol's own border,
+   radius and focus colour, with the monospace a sequence needs. */
+.entity-value {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.35;
+  letter-spacing: .02em;
+  background: #fff;
+  color: #111827;
+}
+
+/* One line to start with, draggable taller: a sequence is long, but six
+   entities two lines deep each is a wall before anything has been folded. */
+.entity-value-protein { height: 34px; min-height: 34px; resize: vertical; }
+.entity-value-ligand { height: 34px; text-transform: uppercase; }
+
+.entity-value:hover { border-color: #9ca3af; }
+.entity-value:focus { outline: none; border-color: #3b82f6; }
+
+.entity-type {
+  flex-shrink: 0;
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: #111827;
+  font-size: 13px;
+}
+
+.entity-copies-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: 12px;
+  color: #6b7280;
+  white-space: nowrap;
+}
+
+.entity-copies {
+  width: 52px;
+  height: 34px;
+  padding: 0 4px 0 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: #111827;
+  font-size: 13px;
+}
+
+.entity-remove { flex-shrink: 0; height: 34px; }
+/* Disabled rather than hidden on the last row: a control that comes and goes
+   makes the row jump as entities are added. */
+.entity-remove:disabled { opacity: .35; cursor: default; }
+
+.entity-add { align-self: flex-start; }
+
+/* THE ACTIONS SIT IN THE PAGE HEAD, opposite the title - py2Dmol's own place
+   for controls that act on the whole page, and out of the entity list's way. */
+.page-head-fold {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
 }

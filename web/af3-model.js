@@ -15,6 +15,7 @@
  * for a single-sequence input rather than a stub.
  */
 import { featuriseProtein } from "../src/af3/featurise.js";
+import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
@@ -157,7 +158,7 @@ function timeShares(calls, passes) {
  * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
- *          maxMsaSequences?: number,
+ *          maxMsaSequences?: number, ligandCodes?: string[],
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
@@ -170,7 +171,34 @@ export async function foldAf3(options) {
   const rows = alignment === null
     ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
     : af3MsaFromA3m(alignment, { maxSequences: options.maxMsaSequences });
+  // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED. AF3's own featuriser
+  // reads a 515 MB CCD pickle; a fold touches only the components its ligands
+  // name, and the PDB serves each as one small mmCIF. The 21 polymer components
+  // stay baked in reference-conformers.js, because every fold needs those.
+  const ligands = [];
+  const componentCache = new Map();
+  for (const code of options.ligandCodes ?? []) {
+    if (!componentCache.has(code)) {
+      onStatus(`Fetching ligand ${code}`);
+      let response;
+      try {
+        response = await fetch(ccdUrl(code), { signal });
+      } catch (cause) {
+        throw new Error(`Could not reach the PDB for ligand ${code}`, { cause });
+      }
+      if (!response.ok) {
+        throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
+      }
+      componentCache.set(code, parseCcdComponent(await response.text()));
+    }
+    // Each instance is its own chain, so repeated codes are repeated entries -
+    // featuriseProtein gives them one entity_id and successive sym_ids, which
+    // is the same rule it applies to repeated sequences.
+    ligands.push(componentCache.get(code));
+  }
+
   const batch = featuriseProtein(sequence, {
+    ligands,
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

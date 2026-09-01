@@ -91,12 +91,24 @@ export function recyclesToPdb(sequence, recycles, chainLengths = undefined) {
 
 /** The flat per-pair errors as rows, which is how the format is written. */
 export function paeMatrix(values, length) {
-  if (values.length !== length * length) {
-    throw new RangeError(`predicted aligned error has ${values.length} entries for ${length} residues`);
+  // 🔴 THE STRIDE IS NOT ALWAYS THE LENGTH. AlphaFold 3 scores TOKENS, and a
+  // ligand contributes one token per heavy atom - so a fold with a ligand in it
+  // returns a matrix wider than the polymer the viewer draws. Reading it at the
+  // residue stride walks diagonally through somebody else's rows and produces a
+  // PAE that is scrambled rather than obviously wrong, which is why the stride
+  // is recovered from the data instead of assumed.
+  const stride = Math.round(Math.sqrt(values.length));
+  if (stride * stride !== values.length) {
+    throw new RangeError(`predicted aligned error has ${values.length} entries, which is not square`);
   }
+  if (stride < length) {
+    throw new RangeError(`predicted aligned error is ${stride} wide for ${length} residues`);
+  }
+  // The top-left block: the polymer's own rows and columns, in order. The
+  // ligand rows past it are real and are not drawn yet.
   const rows = [];
   for (let row = 0; row < length; row += 1) {
-    rows.push(Array.from(values.subarray(row * length, (row + 1) * length)));
+    rows.push(Array.from(values.subarray(row * stride, row * stride + length)));
   }
   return rows;
 }

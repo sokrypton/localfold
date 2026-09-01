@@ -55,8 +55,33 @@ AI Context: STANDALONE WEB APP ENTRY POINT
              the only part of the syntax nobody can guess - are in that box's
              placeholder now (1a3n_AB), where someone about to type an ID is
              already looking. -->
-        <div class="page-head" style="padding-right: 0;">
+        <!-- 🔴 FOLD AND MSA LIVE IN THE PAGE HEAD, NOT IN THE INPUT BOX. This is
+             where py2Dmol keeps the controls that act on the whole page - its
+             save and clear-all sat here - and the entity list needs the full
+             width of the panel: with the buttons inside it, every row was cut
+             short by their column and the copies fields could not line up. -->
+        <div class="page-head page-head-fold" style="padding-right: 0;">
             <h1>LocalFold</h1>
+            <div class="fold-actions">
+              <!-- 🔴 DISABLED UNTIL web/app.js HAS BOUND ITS HANDLER, which is
+                   later than it looks. py2Dmol.full.min.js is 765 KB of
+                   blocking classic script and app.js is a module, so it runs
+                   only after that has downloaded, parsed and executed - and the
+                   whole page, this button included, is on screen and
+                   interactive throughout. A click in that window used to do
+                   nothing at all: no error, no status, no feedback, and the
+                   reasonable conclusion is that the page is broken.
+                   Milliseconds on localhost, seconds over a network. -->
+              <button id="predict" class="btn btn-primary" disabled>
+                <i class="fa-solid fa-cubes"></i>
+                <span>Fold</span>
+              </button>
+              <label class="switch switch-sm" title="Multiple Sequence Alignment">
+                <input type="checkbox" id="useMsaToggle">
+                <span class="slider-toggle"></span>
+              </label>
+              <label for="useMsaToggle" class="fold-toggle-label" title="Multiple Sequence Alignment">MSA</label>
+            </div>
         </div>
 
         <!-- THE FOLD PANEL, in py2Dmol's own idiom: one row for what to fold,
@@ -77,36 +102,31 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                  grows, and everything that acts on it stacks to its right.
                  py2Dmol's fetch row is the same shape, one row shorter. -->
             <div class="fetch-row" id="fold-input-container">
-              <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
-                placeholder="Paste a protein sequence; separate chains with :"
-                >PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+              <!-- WHAT TO FOLD, AS A LIST OF ENTITIES, which is AlphaFold
+                   Server's own model: a type, a value and a number of copies.
+                   It replaces the single colon-separated textarea because the
+                   colon notation cannot express a ligand at all - there is no
+                   sequence to write HEM as. The rows are built by
+                   web/entity-ui.js; this is only where they go.
+
+                   🔴 NO DNA OR RNA IN THE TYPE MENU. AF3's restype alphabet
+                   has the nucleic acids and DENSE is wide enough for a
+                   nucleotide, but reference-conformers.js holds the 21 amino
+                   acids and nothing else - so a nucleotide has no reference
+                   conformer and no pseudo-beta. An entry for them would fold,
+                   and would look like it had worked. -->
+              <div class="entity-list">
+                <div id="entity-rows"></div>
+                <button type="button" id="add-entity" class="btn btn-grey btn-small entity-add">
+                  <i class="fa-solid fa-plus"></i>
+                  <span>Add entity</span>
+                </button>
+              </div>
               <!-- 🔴 NO Options BUTTON. The settings below are always on
                    screen: with three models to choose between, the one control
                    that decides what the others mean cannot be behind a
                    disclosure. The MSA switch moves up beside Fold, which is the
                    row it belongs to - it changes what is folded, not how. -->
-              <div class="fold-actions">
-                <div class="fold-action-row">
-                  <!-- 🔴 DISABLED UNTIL web/app.js HAS BOUND ITS HANDLER, which
-                       is later than it looks. py2Dmol.full.min.js is 765 KB of
-                       blocking classic script and app.js is a module, so it runs
-                       only after that has downloaded, parsed and executed - and
-                       the whole page, this button included, is on screen and
-                       interactive throughout. A click in that window used to do
-                       nothing at all: no error, no status, no feedback, and the
-                       reasonable conclusion is that the page is broken.
-                       Milliseconds on localhost, seconds over a network. -->
-                  <button id="predict" class="btn btn-primary" disabled>
-                    <i class="fa-solid fa-cubes"></i>
-                    <span>Fold</span>
-                  </button>
-                  <label class="switch switch-sm" title="Multiple Sequence Alignment">
-                    <input type="checkbox" id="useMsaToggle">
-                    <span class="slider-toggle"></span>
-                  </label>
-                  <label for="useMsaToggle" class="fold-toggle-label" title="Multiple Sequence Alignment">MSA</label>
-                </div>
-              </div>
             </div>
 
             <!-- ...AND THE SETTINGS, in py2Dmol's own groups: a column each, a

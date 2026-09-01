@@ -163,8 +163,13 @@ export function featuriseProtein(sequence, options = {}) {
   const entityOfCode = new Map();
   const copiesOfEntity = new Map();
   let ligandToken = residueTokens;
+  // Where each ligand's tokens sit, so a writer can name them: the batch's
+  // `sequence` covers the polymers only, and a ligand token indexed into it
+  // comes back undefined and is written as UNK.
+  const ligandSpans = [];
   for (const ligand of ligands) {
     asym += 1;
+    ligandSpans.push({ from: ligandToken, count: ligand.atoms.length, code: ligand.code });
     // Identical codes are one entity, and each occurrence is a copy of it -
     // the same rule chainIdentity applies to repeated sequences.
     if (!entityOfCode.has(ligand.code)) entityOfCode.set(ligand.code, entityOfCode.size);
@@ -358,7 +363,7 @@ export function featuriseProtein(sequence, options = {}) {
     // AF3 keeps these separate and they are equal for a protein-only chain:
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
-    bondMatrix,
+    bondMatrix, ligandSpans,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
     features: { residueIndex, tokenIndex, asymId, entityId, symId },

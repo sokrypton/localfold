@@ -31,7 +31,9 @@ import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
 import { confidenceJson, paeMatrix, predictionToPdb, recyclesToPdb, safeJobName } from "./prediction-results.js";
-import { cleanSequence, complexSequenceProblem, extractFastaHeader, sequenceChains } from "./sequence.js";
+import { complexSequenceProblem } from "./sequence.js";
+import { entitiesProblem, expandEntities } from "./entities.js";
+import { createEntityList } from "./entity-ui.js";
 
 const element = (id) => {
   const value = document.getElementById(id);
@@ -39,7 +41,27 @@ const element = (id) => {
   return value;
 };
 
-const sequenceValue = () => cleanSequence(element("sequence").value);
+// 🔴 BUILT BEFORE ANYTHING READS IT. app.js is a module, so the DOM is parsed
+// by the time this runs; the rows have to exist before the first handler fires
+// rather than at the bottom of the file with the other listeners, because
+// sequenceValue() and the fold path both go through them.
+const entityList = createEntityList(
+  element("entity-rows"), element("add-entity"),
+  // The default is the sequence the old textarea shipped with, so the page
+  // still has something foldable in it on arrival.
+  { initial: [{ type: "protein", copies: 1,
+    value: "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK" }] });
+
+// 🔴 THE ENTITY LIST IS THE INPUT NOW, and everything below it still reads a
+// colon-joined sequence: expandEntities turns copies into repeated chains and
+// hands back exactly the string the textarea used to hold, plus the ligand
+// codes the textarea could not express. Declared before entityList exists
+// because these are called from handlers, never at module scope.
+const foldRequest = () => expandEntities(entityList.read());
+const sequenceValue = () => {
+  const entities = entityList.read();
+  return entitiesProblem(entities) === null ? expandEntities(entities).sequence : "";
+};
 const recycleCount = () => Number(element("recycles").value) || 0;
 // 🔴 THE TOLERANCE CONTROL IS GONE AND THE DRIVER'S ARGUMENT IS NOT. Early
 // stopping still works; nothing on the page sets it any more, so every fold
@@ -74,8 +96,20 @@ const maxMsaConfig = () => {
  * multimer was trained for - and the explicit settings exist to fold the same
  * input both ways rather than to be reached for routinely.
  */
-const modelFamily = (chainCount) => {
+const modelFamily = (chainCount, ligandCount = 0) => {
   const choice = document.getElementById("model-family")?.value ?? "auto";
+  // 🔴 A LIGAND IS AlphaFold 3 ONLY, and choosing otherwise is refused rather
+  // than quietly corrected. AF2 has no ligand tokens at all, so folding a
+  // complex with one under AF2 would drop it silently and return a confident
+  // structure of the protein alone - which is a different answer to the
+  // question that was asked, not a worse one.
+  if (ligandCount > 0) {
+    if (choice === "auto") return "af3";
+    if (choice !== "af3") {
+      throw new Error(`Ligands need AlphaFold 3; the model is set to ${choice}`);
+    }
+    return choice;
+  }
   // 🔴 EVERY EXPLICIT CHOICE PASSES THROUGH, AND THE LIST USED TO BE WRITTEN
   // OUT. Adding AF3 to the dropdown without adding it here meant the page
   // offered a model, accepted it, and silently folded with AF2 monomer instead
@@ -584,7 +618,7 @@ function forcePlddtColours() {
  * are loaded with none and the final structure is appended carrying the real
  * pLDDT and PAE, and that is the frame the page lands on.
  */
-async function foldWithAf3(chains, alignment, alignmentBlocks, signal) {
+async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = []) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -611,7 +645,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal) {
   throwIfAborted(signal);
 
   predictionCount += 1;
-  const header = extractFastaHeader(element("sequence").value);
+  const header = entityList.header();
   const stem = header !== null ? safeJobName(header) : `af3_${predictionCount}`;
   // See the note in the AF2 path: dropping the handle is what stops the
   // score-card poll refilling from the object still on screen.
@@ -623,7 +657,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal) {
   const { requested: maxMsaSequences } = maxMsaConfig();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    alignment: alignmentBlocks, maxMsaSequences,
+    alignment: alignmentBlocks, maxMsaSequences, ligandCodes,
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -698,6 +732,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal) {
   progress(null);
   status(`AlphaFold 3 · ${residues} residues`
     + `${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
+    // Named, because a fold that silently ignored the ligand would otherwise
+    // report exactly this line - the residue count is the same either way.
+    + `${ligandCodes.length === 0 ? "" : ` + ${ligandCodes.join(", ")}`}`
     + ` in ${result.seconds.toFixed(0)} s`
     + `${result.depth > 1 ? ` · ${result.depth} MSA rows` : " · single sequence"}`
     + ` · ${recycles + 1} pass${recycles === 0 ? "" : "es"}`
@@ -725,17 +762,20 @@ async function fold(event) {
   // between folds.
   updateScoresCard(undefined);
   try {
-    const entered = sequenceValue();
-    const enteredProblem = complexSequenceProblem(entered);
+    const entities = entityList.read();
+    const enteredProblem = entitiesProblem(entities);
     // A pasted/uploaded A3M remains self-describing: as before, its query may
-    // replace an empty or stale sequence box. Search and query-only input have
-    // no such query row to fall back to, so they require valid box contents.
+    // replace an empty or stale entity list. Search and query-only input have
+    // no such query row to fall back to, so they require a valid list.
     if (enteredProblem !== null && ["single", "search"].includes(msaMode())) {
       throw new Error(enteredProblem);
     }
-    let chains = enteredProblem === null ? sequenceChains(entered) : [];
+    const request = enteredProblem === null
+      ? expandEntities(entities) : { chains: [], ligandCodes: [] };
+    let chains = request.chains;
+    const ligandCodes = request.ligandCodes;
     let sequence = chains.join("");
-    const family = modelFamily(chains.length);
+    const family = modelFamily(chains.length, ligandCodes.length);
 
     const alignmentResult = await alignmentText(chains, signal, family);
     const alignment = typeof alignmentResult === "string"
@@ -759,7 +799,9 @@ async function fold(event) {
       if (chains.length <= 1) {
         sequence = alignedQuery;
         chains = [sequence];
-        element("sequence").value = sequence;
+        // The list shows what will be folded, so the row follows the alignment.
+        // Ligand rows are kept: an A3M says nothing about them.
+        entityList.setChains(chains);
       }
     }
     const chainLengths = chains.map((chain) => chain.length);
@@ -771,7 +813,7 @@ async function fold(event) {
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (family === "af3") {
-      await foldWithAf3(chains, alignment, alignmentBlocks, signal);
+      await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes);
       return;
     }
 
@@ -801,7 +843,7 @@ async function fold(event) {
     const started = performance.now();
 
     predictionCount += 1;
-    const fastaHeader = extractFastaHeader(element("sequence").value);
+    const fastaHeader = entityList.header();
     const baseStem = fastaHeader !== null ? safeJobName(fastaHeader) : `prediction_${predictionCount}`;
     let stem = baseStem;
     const existingObjects = new Set((viewer?.objects ?? []).map((o) => o.name));
@@ -987,16 +1029,6 @@ element("predict").addEventListener("click", (event) => void fold(event));
 // ...and only now is it safe to press. See the note on the button in index.html:
 // it ships disabled, because until this line runs a click is silently a no-op.
 element("predict").disabled = false;
-
-const sequenceBox = element("sequence");
-// ...tidied on blur and paste, not on every keystroke: rewriting the value
-// moves the caret to the end, which throws a mid-sequence correction away.
-const tidySequence = () => {
-  const cleaned = cleanSequence(sequenceBox.value);
-  if (cleaned !== sequenceBox.value) sequenceBox.value = cleaned;
-};
-sequenceBox.addEventListener("blur", tidySequence);
-sequenceBox.addEventListener("paste", () => setTimeout(tidySequence, 0));
 
 const modeSelect = element("msa-mode");
 

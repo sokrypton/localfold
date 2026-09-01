@@ -79,14 +79,20 @@ export const AF3_MSA_GAP = 21;
  * merge produced them - paired or block-diagonal - is the caller's decision,
  * and is what the two arguments distinguish.
  *
- * @param {{paired?: string|null, unpaired?: string|null}|string} alignment A3M
- *   text for each block; a bare string is the unpaired block, which is what a
- *   monomer has.
+ * @param {{paired?: string|null, unpaired?: string|null,
+ *           unpairedProfile?: string|null}|string} alignment A3M text for each
+ *   block; a bare string is the unpaired block, which is what a monomer has.
+ *   `unpairedProfile` is the unpaired block BEFORE deduplication, for the
+ *   profile; it defaults to `unpaired`, which is right whenever nothing was
+ *   deduplicated.
  * @param {{maxSequences?: number}} [options] rows the MODEL sees, counting the
  *   query row prepended downstream; default 512. AF3's own cap is
  *   `num_msa: 1024`.
  * @returns {{msa: Int32Array[], deletionMatrix: Float32Array[], depth: number,
- *            unpairedFrom: number, length: number}}
+ *            unpairedFrom: number, length: number,
+ *            profileMsa: Int32Array[], profileDeletionMatrix: Float32Array[]}}
+ *   `profileMsa` is the unpaired block the PROFILE is computed over: before
+ *   deduplication and before the crop, which is where AF3 computes it.
  */
 export function af3MsaFromA3m(alignment, options = {}) {
   const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
