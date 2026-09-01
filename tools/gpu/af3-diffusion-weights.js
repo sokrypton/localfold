@@ -54,6 +54,55 @@ async function atomBlock(store, root, index) {
   };
 }
 
+/**
+ * The atom encoder that builds target_feat's 384 atom-derived columns.
+ *
+ * 🔴 A DIFFERENT ATOM ENCODER FROM THE DIFFUSION HEAD'S, sharing its shape and
+ * none of its weights. This one lives under `evoformer_conditioning`, runs
+ * ONCE per fold on the reference conformers alone - no noisy positions, no
+ * trunk conditioning - and its pooled output is 384 wide where the diffusion
+ * encoder's is 768. Passing either bundle where the other belongs type-checks
+ * and is a different model.
+ */
+export async function targetFeatureWeights(store) {
+  const root = "diffuser/evoformer_conditioning";
+  const encoder = `${root}_atom_transformer_encoder`;
+  const stack =
+    `${encoder}/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoder`;
+  const W = (leaf) => store.tensor(`${root}_${leaf}/weights`);
+  return {
+    reference: {
+      channels: 128,
+      embedRefPos: await W("embed_ref_pos"),
+      embedRefMask: await W("embed_ref_mask"),
+      embedRefElement: await W("embed_ref_element"),
+      embedRefCharge: await W("embed_ref_charge"),
+      embedRefAtomName: await W("embed_ref_atom_name"),
+    },
+    encoder: {
+      channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
+      // 🔴 THE _1 SUFFIX IS PART OF THE NAME. Four of these also exist under
+      // the unsuffixed name with IDENTICAL shapes, so dropping the suffix loads
+      // clean and gives the wrong target_feat. embed_pair_offsets_valid is the
+      // one with no _1 form, which makes the set look like a typo and is not.
+      singleToPairCondRow: await W("single_to_pair_cond_row_1"),
+      singleToPairCondCol: await W("single_to_pair_cond_col_1"),
+      embedPairOffsets: await W("embed_pair_offsets_1"),
+      embedPairDistances: await W("embed_pair_distances_1"),
+      embedPairOffsetsValid: await W("embed_pair_offsets_valid"),
+      pairMlp1: await W("pair_mlp_1"),
+      pairMlp2: await W("pair_mlp_2"),
+      pairMlp3: await W("pair_mlp_3"),
+      pairInputLayerNormScale: await store.tensor(`${encoder}/pair_input_layer_norm/scale`),
+      pairLogitsProjection: await store.tensor(`${encoder}/pair_logits_projection/weights`),
+      projectAtomFeaturesForAggr: await W("project_atom_features_for_aggr"),
+      blocks: [await atomBlock(store, stack, 0),
+               await atomBlock(store, stack, 1),
+               await atomBlock(store, stack, 2)],
+    },
+  };
+}
+
 /** The five reference embeddings the atom conditioning sums. */
 export async function atomReference(store) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);

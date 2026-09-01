@@ -7,13 +7,10 @@
  *     -> 200-step diffusion sampler around the GPU denoiser
  *     -> confidence head
  *
- * 🔴 THE FEATURISATION COMES FROM A DUMP, NOT FROM A SEQUENCE. Tokenisation,
- * the reference conformers, the atom-layout gathers and target_feat are all
- * produced by AF3's own featuriser (tools/oracle/dump_af3_trunk.py) and read
- * here. That is data preparation rather than a learned operation, but it does
- * mean this is not yet a browser that folds a sequence you type - it is the
- * MODEL running on the GPU against a batch prepared elsewhere. The JavaScript
- * featuriser is the remaining piece.
+ * --sequence=<SEQ> folds from a sequence alone, through src/af3/featurise.js;
+ * --dump=<path> folds AF3's own batch and reports the disagreement at every
+ * point where the two can be compared. Both paths build target_feat from
+ * chemistry rather than reading it, so every fold checks that path.
  *
  * 🔴 THE PER-ATOM CONDITIONING IS COMPUTED ON THE CPU HERE, and it is a learned
  * operation, so this is a real gap against AGENTS.md rather than a convenience.
@@ -25,11 +22,15 @@
  * settings, and AF3's defaults are neither.
  */
 import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder, targetFeatures }
+  from "../../src/af3/atom-encoder-reference.js";
+import { featuriseProtein } from "../../src/af3/featurise.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence-webgpu.js";
 import { sampleOnGpu } from "../../src/af3/diffusion-sampler-webgpu.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "./af3-weights.js";
-import { diffusionWeights, atomReference } from "./af3-diffusion-weights.js";
+import { diffusionWeights, atomReference, targetFeatureWeights }
+  from "./af3-diffusion-weights.js";
 
 const DIALECT = { swapTransposedBias: false };
 
@@ -102,21 +103,80 @@ function toPdb(positions, atomMask, nameChars, elements, residueIndex, tokens, d
   return lines.join("\n");
 }
 
+/**
+ * AF3's own batch, in the shape src/af3/featurise.js produces, so the fold below
+ * reads one object either way and the two paths cannot silently diverge in what
+ * they supply.
+ */
+function batchFromDump(dump) {
+  const tokens = dump.tokens;
+  const dense = 24;
+  const subsets = Math.ceil((tokens * dense) / 32);
+  const raw = (name) => dump.inputs[name].data;
+  // 🔴 count IS NOT DECORATION. convert() in atom-encoder-reference.js sizes its
+  // output from it, so a gather without one silently produces a zero-length
+  // tensor - which reads downstream as a model that runs and folds a 17 A
+  // spaghetti rather than as an error.
+  const gather = (name) => {
+    const indices = ints(raw(`${name}:gather_idxs`));
+    return { indices, mask: floats(raw(`${name}:gather_mask`)), count: indices.length };
+  };
+  const refMask = floats(raw("ref_mask"));
+  let atomCount = 0;
+  for (const value of refMask) atomCount += value;
+  return {
+    sequence: dump.sequence, tokens, dense, subsets, atomCount,
+    shape: { tokens, dense, subsets, queries: 32, keys: 128 },
+    aatype: ints(raw("aatype")), profile: floats(raw("profile")),
+    deletionMean: floats(raw("deletion_mean")),
+    msa: ints(raw("msa")), msaMask: floats(raw("msa_mask")),
+    deletionMatrix: floats(raw("deletion_matrix")),
+    seqMask: floats(raw("seq_mask")),
+    refPos: floats(raw("ref_pos")), refMask,
+    refElement: ints(raw("ref_element")), refCharge: floats(raw("ref_charge")),
+    refAtomNameChars: ints(raw("ref_atom_name_chars")),
+    refSpaceUid: ints(raw("ref_space_uid")),
+    predDenseAtomMask: floats(raw("pred_dense_atom_mask")),
+    tokenAtomsToQueries: gather("token_atoms_to_queries"),
+    queriesToKeys: gather("queries_to_keys"),
+    queriesToTokenAtoms: gather("queries_to_token_atoms"),
+    tokensToQueries: gather("tokens_to_queries"),
+    tokensToKeys: gather("tokens_to_keys"),
+    tokenAtomsToPseudoBeta: gather("token_atoms_to_pseudo_beta"),
+    features: {
+      residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
+      asymId: ints(raw("asym_id")), entityId: ints(raw("entity_id")),
+      symId: ints(raw("sym_id")),
+    },
+  };
+}
+
 export async function main(device, args) {
   const dumpPath = option(args, "dump", "/af3-6mrr.json");
   const steps = Number(option(args, "steps", "50"));
   const blocks = Number(option(args, "blocks", "48"));
 
-  const response = await fetch(dumpPath);
-  if (!response.ok) throw new Error(`failed to load ${dumpPath}: ${response.status}`);
-  const dump = await response.json();
-  const inputs = dump.inputs;
-  const raw = (name) => inputs[name].data;
-  const tokens = dump.tokens;
-  const dense = 24;
-  const subsets = Math.ceil((tokens * dense) / 32);
-  console.log(`${dump.sequence.length} residues, ${tokens} tokens,`
-    + ` ${subsets} atom subsets, ${blocks} pairformer blocks, ${steps} diffusion steps`);
+  // --sequence folds what you type; --dump folds AF3's own batch, which is what
+  // makes a comparison against AF3's own trunk meaningful.
+  const sequenceArg = option(args, "sequence", "");
+  const dump = sequenceArg === "" || args.some((a) => a.startsWith("--dump="))
+    ? await (async () => {
+        const response = await fetch(dumpPath);
+        if (!response.ok) throw new Error(`failed to load ${dumpPath}: ${response.status}`);
+        return response.json();
+      })()
+    : null;
+
+  const batch = sequenceArg !== ""
+    ? featuriseProtein(sequenceArg)
+    : batchFromDump(dump);
+  const { tokens, dense, subsets } = batch;
+  console.log(`${batch.sequence.length} residues, ${tokens} tokens,`
+    + ` ${batch.atomCount} atoms, ${subsets} atom subsets,`
+    + ` ${blocks} pairformer blocks, ${steps} diffusion steps`);
+  console.log(sequenceArg !== ""
+    ? "featurised in JavaScript from the sequence"
+    : "featurised by AF3, read from the dump");
 
   // --quant=int5:g32:asym[:search] round-trips every learned weight through a
   // storage precision before the fold, so the cost is measured in ANGSTROMS
@@ -143,31 +203,51 @@ export async function main(device, args) {
   const confidence = await confidenceWeights(store);
   const reference = await atomReference(store);
 
-  const gather = (name, count) => ({
-    indices: raw(`${name}:gather_idxs`), mask: raw(`${name}:gather_mask`), count,
-  });
-  const features = {
-    residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
-    asymId: ints(raw("asym_id")), entityId: ints(raw("entity_id")),
-    symId: ints(raw("sym_id")),
-  };
-  const targetFeat = floats(dump.outputs["diffuser/evoformer/__call__:target_feat"].data);
-  const seqMask = floats(raw("seq_mask"));
+  const targetFeatWeights = await targetFeatureWeights(store);
+
+  // 🔴 target_feat IS BUILT FROM CHEMISTRY ON EVERY FOLD, never read from the
+  // dump - so the path a browser depends on is the path this exercises. It is
+  // the bottom of the model reached from the top: reference conformers in, the
+  // 447 columns the whole trunk reads out.
+  const conditioning = perAtomConditioning({
+    positions: batch.refPos, mask: batch.refMask,
+    element: batch.refElement, charge: batch.refCharge,
+    atomNameChars: batch.refAtomNameChars,
+  }, tokens, dense, targetFeatWeights.reference);
+
+  const atomFeatures = atomCrossAttentionEncoder({
+    shape: batch.shape, conditioning, atomMask: batch.refMask,
+    refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
+    tokenAtomsToQueries: batch.tokenAtomsToQueries,
+    queriesToKeys: batch.queriesToKeys,
+    queriesToTokenAtoms: batch.queriesToTokenAtoms,
+  }, targetFeatWeights.encoder);
+  const targetFeat = targetFeatures({
+    aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,
+    atomFeatures: atomFeatures.tokenAct,
+  }, tokens);
+
+  const theirTargetFeat = dump?.outputs["diffuser/evoformer/__call__:target_feat"];
+  if (theirTargetFeat) {
+    console.log(`target_feat vs AF3  relRMS`
+      + ` ${relativeRms(targetFeat, floats(theirTargetFeat.data)).toExponential(2)}`);
+  }
+
+  const seqMask = batch.seqMask;
   const pairMask = new Float32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
-  // 🔴 ONE MSA ROW. The dump ran with num_msa=1, so the evoformer saw only the
-  // query - which for a de novo design is all there is anyway.
+  // 🔴 ONE MSA ROW. num_msa=1, so the evoformer sees only the query - which for
+  // a de novo design is all there is anyway.
   const sequences = 1;
-  const msaRows = ints(raw("msa")).subarray(0, sequences * tokens);
-  const deletionMatrix = floats(raw("deletion_matrix")).subarray(0, sequences * tokens);
-  const msaMask = floats(raw("msa_mask")).subarray(0, sequences * tokens);
-
   const trunkInput = {
-    tokens, sequences, templates: 4, targetFeat, features,
-    msaRows, deletionMatrix, msaMask, pairMask, seqMask,
+    tokens, sequences, templates: 4, targetFeat, features: batch.features,
+    msaRows: batch.msa.subarray(0, tokens),
+    deletionMatrix: batch.deletionMatrix.subarray(0, tokens),
+    msaMask: batch.msaMask.subarray(0, tokens),
+    pairMask, seqMask,
     previousPair: new Float32Array(tokens * tokens * 128),
     previousSingle: new Float32Array(tokens * 384),
   };
@@ -178,64 +258,36 @@ export async function main(device, args) {
   });
   console.log(`trunk done in ${((performance.now() - started) / 1000).toFixed(1)} s`);
 
-  // Against AF3's own trunk, on the same batch.
-  const reference2d = dump.outputs["diffuser/evoformer/__call__:pair"];
-  const reference1d = dump.outputs["diffuser/evoformer/__call__:single"];
+  // Against AF3's own trunk. Only meaningful on AF3's own batch: from a
+  // sequence the reference conformers differ, which is worth about 2.7e-2 on
+  // pair and 0.01 A of structure.
+  const reference2d = dump?.outputs["diffuser/evoformer/__call__:pair"];
+  const reference1d = dump?.outputs["diffuser/evoformer/__call__:single"];
   if (reference2d && blocks === 48) {
     console.log(`pair   vs AF3  relRMS ${relativeRms(trunk.pair, floats(reference2d.data)).toExponential(2)}`);
     console.log(`single vs AF3  relRMS ${relativeRms(trunk.single, floats(reference1d.data)).toExponential(2)}`);
   }
 
-  // The per-atom conditioning - see the note at the top.
-  // 🔴 AF3 SAMPLES A FRESH REFERENCE CONFORMER FOR EVERY RESIDUE INSTANCE. Bond
-  // lengths and angles are constant across the 13 internal glutamates in this
-  // dump (spread < 0.09 A on every 1-2 and 1-3 pair) and the torsions are not
-  // (up to 3.3 A on N-OE1). So a browser cannot bake ONE conformer per residue
-  // type and reproduce the dump - the question is whether it has to.
-  // --conformers=canonical answers it: every token takes the conformer of the
-  // FIRST token of its residue type, which is what a baked table would give.
-  const refPos = floats(raw("ref_pos"));
-  const refMask = floats(raw("ref_mask"));
-  if (option(args, "conformers", "dump") === "canonical") {
-    const first = new Map();
-    let copied = 0;
-    for (let token = 0; token < tokens; token += 1) {
-      const type = dump.sequence[token];
-      const source = first.get(type);
-      if (source === undefined) { first.set(type, token); continue; }
-      for (let atom = 0; atom < dense; atom += 1) {
-        // 🔴 ONLY WHERE BOTH INSTANCES HAVE THE ATOM. The C-terminal residue
-        // carries an OXT no internal one has, and copying a masked slot over it
-        // puts that oxygen at the origin - a 5 A error dressed as a table
-        // lookup.
-        if (!refMask[token * dense + atom] || !refMask[source * dense + atom]) continue;
-        for (let axis = 0; axis < 3; axis += 1) {
-          refPos[(token * dense + atom) * 3 + axis] =
-            refPos[(source * dense + atom) * 3 + axis];
-        }
-        copied += 1;
-      }
-    }
-    console.log(`canonical conformers: ${first.size} residue types,`
-      + ` ${copied} atoms replaced`);
-  }
-
-  const conditioning = perAtomConditioning({
-    positions: refPos, mask: refMask,
-    element: ints(raw("ref_element")), charge: floats(raw("ref_charge")),
-    atomNameChars: ints(raw("ref_atom_name_chars")),
+  // 🔴 THE DIFFUSION HEAD HAS ITS OWN REFERENCE EMBEDDINGS, and they are not
+  // the conditioning module's - same five shapes, different weights. The
+  // conditioning above cannot be reused here.
+  const diffusionConditioning = perAtomConditioning({
+    positions: batch.refPos, mask: batch.refMask,
+    element: batch.refElement, charge: batch.refCharge,
+    atomNameChars: batch.refAtomNameChars,
   }, tokens, dense, reference);
 
-  const atomMask = floats(raw("pred_dense_atom_mask"));
+  const atomMask = batch.predDenseAtomMask;
   const headInput = {
-    shape: { tokens, dense, subsets, queries: 32, keys: 128 },
-    conditioning, atomMask, seqMask, features, targetFeat,
-    refPos, refSpaceUid: ints(raw("ref_space_uid")),
-    tokenAtomsToQueries: gather("token_atoms_to_queries", subsets * 32),
-    queriesToKeys: gather("queries_to_keys", subsets * 128),
-    queriesToTokenAtoms: gather("queries_to_token_atoms", tokens * dense),
-    tokensToQueries: gather("tokens_to_queries", subsets * 32),
-    tokensToKeys: gather("tokens_to_keys", subsets * 128),
+    shape: batch.shape,
+    conditioning: diffusionConditioning, atomMask, seqMask,
+    features: batch.features, targetFeat,
+    refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
+    tokenAtomsToQueries: batch.tokenAtomsToQueries,
+    queriesToKeys: batch.queriesToKeys,
+    queriesToTokenAtoms: batch.queriesToTokenAtoms,
+    tokensToQueries: batch.tokensToQueries,
+    tokensToKeys: batch.tokensToKeys,
     trunkSingle: trunk.single, trunkPair: trunk.pair,
   };
 
@@ -272,7 +324,7 @@ export async function main(device, args) {
   console.log(`diffusion done in ${((performance.now() - diffusionStarted) / 1000).toFixed(1)} s`);
 
   // The confidence head reads the sample back.
-  const betaGather = gather("token_atoms_to_pseudo_beta", tokens);
+  const betaGather = batch.tokenAtomsToPseudoBeta;
   const pseudoBeta = new Float32Array(tokens * 3);
   for (let token = 0; token < tokens; token += 1) {
     if (!betaGather.mask[token]) continue;
@@ -294,9 +346,9 @@ export async function main(device, args) {
   const meanPlddt = plddtTotal / plddtCount;
   console.log(`mean pLDDT ${meanPlddt.toFixed(1)} over ${plddtCount} atoms`);
 
-  const pdb = toPdb(positions, atomMask, ints(raw("ref_atom_name_chars")),
-                    ints(raw("ref_element")), features.residueIndex, tokens, dense,
-                    scores.plddt, dump.sequence);
+  const pdb = toPdb(positions, atomMask, batch.refAtomNameChars,
+                    batch.refElement, batch.features.residueIndex, tokens, dense,
+                    scores.plddt, batch.sequence);
 
   // 🔴 GEOMETRY IS THE CHECK THAT MATTERS HERE, not pLDDT. A confident-looking
   // pLDDT comes off the trunk and says nothing about whether the diffusion
@@ -310,7 +362,7 @@ export async function main(device, args) {
       if (!atomMask[slot]) continue;
       let name = "";
       for (let character = 0; character < 4; character += 1) {
-        const code = ints(raw("ref_atom_name_chars"))[slot * 4 + character];
+        const code = batch.refAtomNameChars[slot * 4 + character];
         if (code > 0) name += String.fromCharCode(code + 32);
       }
       atoms[name.trim()] = slot;
@@ -368,7 +420,7 @@ export async function main(device, args) {
   const elapsed = (performance.now() - started) / 1000;
   console.log(`total ${elapsed.toFixed(1)} s`);
   return {
-    sequence: dump.sequence, tokens, steps, meanPlddt, geometry, gyration,
+    sequence: batch.sequence, tokens, steps, meanPlddt, geometry, gyration,
     seconds: elapsed, pdb, trajectory,
   };
 }
