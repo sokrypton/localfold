@@ -56,3 +56,8 @@ __pycache__/
 /model-af3-full-f32
 /model-af3-full
 /model-af3-int5
+
+# A saved copy of Google's AlphaFold Server page, kept locally as a reference
+# for the entity interface. Not ours to redistribute, and not repo content.
+server_suff/
+server_stuff/
