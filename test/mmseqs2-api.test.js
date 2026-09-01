@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "./harness.js";
 import {
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
-  generateMmseqs2PairedMsa, readTarFiles,
+  generateMmseqs2PairedMsa, mergeSearchedChains, readTarFiles,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
@@ -291,5 +291,39 @@ describe("MMseqs2 API", () => {
     expect(parsed.sequences).toContain("AC-E----");
     expect(parsed.sequences).toContain("----AC-E");
     expect(parsed.sequences.includes("AC-EAC-E")).toBe(false);
+  });
+});
+
+describe("re-merging a search for another model", () => {
+  // 🔴 THE SEARCH IS MODEL-INDEPENDENT AND THE MERGE IS NOT, which is the whole
+  // reason these are separable: changing the model must re-merge what is
+  // already here rather than repeat the one request this page makes off the
+  // machine. What it must NOT do is hand a model somebody else's construction.
+  const chainA3ms = [">q\nACDE\n>u\nACD-\n", ">q\nWYWY\n>u\nWY-Y\n"];
+  const sequences = ["ACDE", "WYWY"];
+  const pairedA3ms = new Map([["ACDE", ">q\nACDE\n>s\nAC-E\n"],
+    ["WYWY", ">q\nWYWY\n>s\nW-WY\n"]]);
+
+  it("gives each model its own chain merge from one search", () => {
+    const rows = (model) => parseA3m(mergeSearchedChains(
+      { sequences, chainA3ms, pairedA3ms, model }).a3m).sequences;
+    // AF3 is dense across chains; the monomer is block-diagonal and never
+    // paired. They must not come out the same.
+    expect(rows("af3")).toContain("AC-EW-WY");
+    expect(rows("monomer").includes("AC-EW-WY")).toBe(false);
+    expect(rows("monomer")).toContain("ACD-----");
+  });
+
+  it("refuses a model it has no merge for", () => {
+    expect(() => mergeSearchedChains({ sequences, chainA3ms, model: "nonesuch" }))
+      .toThrow(/unknown model/);
+  });
+
+  it("drops the paired block for the monomer even when one was searched", () => {
+    // The AF2 monomer has no chain input, so a row spanning two chains would
+    // claim their residues coevolved - see CHAIN_MERGES. A cache filled by an
+    // AF3 fold must not leak paired rows into it.
+    const { blocks } = mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model: "monomer" });
+    expect(blocks.paired).toBe(null);
   });
 });

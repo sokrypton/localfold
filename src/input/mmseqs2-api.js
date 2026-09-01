@@ -404,8 +404,67 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   // entity's paired alignment is the same species, so placing them side by side
   // is exactly what "paired" means - there is no per-model choice here, unlike
   // the unpaired block. mergeRowAlignedChainA3ms already does precisely this.
-  const paired = pairedResult === undefined ? undefined
-    : mergeRowAlignedChainA3ms(sequences.map((sequence) => pairedBySequence.get(sequence)));
+  // 🔴 THE MERGE IS THE ONLY MODEL-SPECIFIC STEP, and it is separate for that
+  // reason. The searches above are the expensive part and none of them depends
+  // on the model; only this does. Keeping them apart lets a caller hold the raw
+  // per-chain results and re-merge them when the model changes, instead of
+  // asking the server the same question again.
+  const { a3m, blocks } = mergeSearchedChains({
+    sequences, chainA3ms, pairedA3ms: pairedBySequence, model,
+  });
+  const alignment = parseA3m(a3m);
+  return {
+    a3m,
+    // ...and the two halves apart, for AF3, whose `msa` is the paired block
+    // followed by the unpaired one with a profile computed over the second.
+    // `unpairedProfile` is the unpaired block BEFORE deduplication, because
+    // AF3 computes the profile first (features.py:543) and deduplicates after
+    // (:559) - the removed rows still counted towards it.
+    blocks,
+    pairedTicket: pairedResult?.ticket,
+    pairedDepth: pairedResult?.depth ?? 0,
+    // ...the merged text is what the viewer shows; the model takes these, so
+    // clustering and masking can run separately for each copy.
+    chainA3ms,
+    // ...and the paired ones beside them, keyed by the UNIQUE sequence they
+    // were searched for, so a caller can re-merge for another model without a
+    // second round trip. Absent when the search did not pair.
+    pairedA3ms: pairedResult === undefined ? undefined : pairedBySequence,
+    tickets: unique.map((sequence) => bySequence.get(sequence).ticket),
+    depth: alignment.depth,
+    elapsedMilliseconds: performance.now() - started,
+  };
+}
+
+/**
+ * Merge searched per-chain alignments the way one model wants them.
+ *
+ * Split out of generateMmseqs2ComplexMsa because it is the only part of that
+ * function the model changes: the searches are the expensive half and they are
+ * the same whatever will read them, so a caller holding these raw pieces can
+ * switch models without asking the server again.
+ *
+ * @param {{sequences: string[], chainA3ms: string[],
+ *          pairedA3ms?: Map<string, string>, model: string}} input
+ *   `chainA3ms` is one unpaired A3M per chain, in chain order; `pairedA3ms`
+ *   maps a UNIQUE sequence to its paired A3M, and is absent when the search
+ *   did not pair.
+ * @returns {{a3m: string, blocks: {paired: string|null, unpaired: string,
+ *            unpairedProfile: string}}}
+ */
+export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model }) {
+  const merge = CHAIN_MERGES[model];
+  if (merge === undefined) {
+    throw new RangeError(`unknown model ${model}:`
+      + ` expected ${Object.keys(CHAIN_MERGES).join(", ")}`);
+  }
+  const hasPairing = pairedA3ms !== undefined && pairedA3ms.size > 0
+    // The AF2 monomer never takes paired rows, whatever was searched: it has no
+    // chain input, so a row spanning two chains would claim their residues
+    // coevolved. See CHAIN_MERGES.
+    && model !== "monomer";
+  const paired = !hasPairing ? undefined
+    : mergeRowAlignedChainA3ms(sequences.map((sequence) => pairedA3ms.get(sequence)));
 
   // 🔴 AND THE UNPAIRED BLOCK IS DEDUPLICATED AGAINST THE PAIRED ONE FIRST,
   // per chain, before the merge - which is why the merge happens here and not
@@ -415,31 +474,17 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   // drops every one of the 32 unpaired rows as a duplicate. The blocks share a
   // fixed row budget, so a duplicate evicts a sequence that carried something.
   const unpairedProfile = merge(chainA3ms);
-  const deduplicated = pairedResult === undefined ? chainA3ms
+  const deduplicated = !hasPairing ? chainA3ms
     : sequences.map((sequence, chain) => deduplicateUnpairedAgainstPaired(
-      chainA3ms[chain], pairedBySequence.get(sequence)));
+      chainA3ms[chain], pairedA3ms.get(sequence)));
   const unpaired = merge(deduplicated);
 
   // What a single-alignment consumer reads: paired rows above unpaired ones,
   // which is the order AlphaFold-Multimer's own merge produces and what
   // ColabFold writes out.
-  const a3m = paired === undefined ? unpaired : concatenateA3mBlocks(paired, unpaired);
-  const alignment = parseA3m(a3m);
   return {
-    a3m,
-    // ...and the two halves apart, for AF3, whose `msa` is the paired block
-    // followed by the unpaired one with a profile computed over the second.
-    // `unpairedProfile` is the unpaired block BEFORE deduplication, because
-    // AF3 computes the profile first (features.py:543) and deduplicates after
-    // (:559) - the removed rows still counted towards it.
+    a3m: paired === undefined ? unpaired : concatenateA3mBlocks(paired, unpaired),
     blocks: { paired: paired ?? null, unpaired, unpairedProfile },
-    pairedTicket: pairedResult?.ticket,
-    pairedDepth: pairedResult?.depth ?? 0,
-    // ...the merged text is what the viewer shows; the model takes these, so
-    // clustering and masking can run separately for each copy.
-    chainA3ms,
-    tickets: unique.map((sequence) => bySequence.get(sequence).ticket),
-    depth: alignment.depth,
-    elapsedMilliseconds: performance.now() - started,
   };
 }
+

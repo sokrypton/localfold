@@ -224,10 +224,43 @@ async function alignmentText(chains, signal, family) {
             + " · api.colabfold.com");
         },
       };
-      const searched = chains.length === 1
-        ? await generateMmseqs2Msa(query, searchOptions)
-        : await generateMmseqs2ComplexMsa(chains, searchOptions);
-      status(`MSA search found ${searched.depth} sequences`);
+      // 🔴 THE SEARCH DOES NOT DEPEND ON THE MODEL AND THE MERGE DOES, so
+      // changing the model re-merges what is already here rather than asking
+      // api.colabfold.com the same question again. It is the one request this
+      // page makes off the machine and it is the slow part of a fold, so
+      // repeating it to answer a question already answered is the worst thing
+      // this path can do.
+      //
+      // 🔴 EXCEPT WHEN THE NEW MODEL NEEDS PAIRING THE OLD ONE DID NOT SEARCH
+      // FOR. Pairing is a second request and only multimer and AF3 make it, so
+      // a monomer search has no paired block to re-merge from; the cache is
+      // then not usable and the search runs. Reusing it anyway would silently
+      // fold a complex with no paired rows.
+      const searchKey = JSON.stringify(chains);
+      const needsPairing = family !== "monomer" && new Set(chains).size > 1;
+      const usable = searchCache?.key === searchKey
+        && (!needsPairing || searchCache.raw.pairedA3ms !== undefined);
+      let searched;
+      if (usable && chains.length === 1) {
+        searched = searchCache.raw.single;
+        status(`MSA reused · ${searched.depth} sequences`);
+      } else if (usable) {
+        const { chainA3ms, pairedA3ms, depth } = searchCache.raw;
+        const merged = mergeSearchedChains({
+          sequences: chains, chainA3ms, pairedA3ms, model: family,
+        });
+        searched = { ...merged, depth };
+        status(`MSA reused · ${depth} sequences`);
+      } else {
+        searched = chains.length === 1
+          ? await generateMmseqs2Msa(query, searchOptions)
+          : await generateMmseqs2ComplexMsa(chains, searchOptions);
+        status(`MSA search found ${searched.depth} sequences`);
+        searchCache = { key: searchKey, raw: chains.length === 1
+          ? { single: searched, depth: searched.depth }
+          : { chainA3ms: searched.chainA3ms, pairedA3ms: searched.pairedA3ms,
+            depth: searched.depth } };
+      }
       // 🔴 THE BLOCKS COME BACK APART, AND AF3 NEEDS THEM THAT WAY. `text` is
       // the paired rows stacked above the unpaired ones, which is what the
       // viewer draws and what AlphaFold 2 folds; `blocks` keeps them separate,
@@ -658,6 +691,14 @@ function forcePlddtColours() {
  * from one key - and it is the reason "try another seed" is not the cheap path
  * that "try more steps" is.
  */
+/**
+ * The last MSA search, so changing the model does not repeat it.
+ *
+ * Keyed on the CHAINS alone: the search is the same whatever will read it, and
+ * only the merge is model-specific - see mergeSearchedChains.
+ */
+let searchCache;
+
 let trunkCache;
 
 /** FNV-1a, to key on an alignment without holding a second copy of it. */
