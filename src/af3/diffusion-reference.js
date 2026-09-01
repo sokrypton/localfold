@@ -398,7 +398,14 @@ export function atomDecoder(tokenAct, encoded, input, weights) {
  *   atomCrossAttentionEncoder, injected so this file does not import the atom
  *   stack's whole surface just to call it once.
  */
-export function diffusionHead(input, weights, encode) {
+/**
+ * @param {(stage: string, values: ArrayLike<number>) => void} [onStage] called
+ *   with each intermediate, in order. The denoiser is five stages deep and a
+ *   NaN anywhere in it reaches the caller as a NaN coordinate with nothing to
+ *   say which stage produced it; this is how that question gets answered
+ *   without a second implementation of the pipeline in the checker.
+ */
+export function diffusionHead(input, weights, encode, onStage) {
   const { tokens, dense } = input.shape;
   const { noiseLevel } = input;
   const scale = scalings(noiseLevel);
@@ -411,6 +418,9 @@ export function diffusionHead(input, weights, encode) {
     noiseLevel,
     features: input.features,
   }, weights.conditioning);
+
+  onStage?.("conditioning.single", cond.single);
+  onStage?.("conditioning.pair", cond.pair);
 
   // 🔴 THE POSITIONS ARE MASKED AND THEN RESCALED BY THE NOISE LEVEL, so the
   // encoder always sees something of order one however far down the schedule it
@@ -442,6 +452,16 @@ export function diffusionHead(input, weights, encode) {
     trunkPairCond: cond.pair,
   }, weights.encoder);
 
+  onStage?.("scaled positions", scaled);
+  onStage?.("encoder.tokenAct", encoded.tokenAct);
+  // The decoder reads more of the encoder than tokenAct, and a NaN in any of
+  // these reaches the coordinates without ever touching tokenAct.
+  onStage?.("encoder.skipConnection", encoded.skipConnection);
+  onStage?.("encoder.pairCond", encoded.pairCond);
+  onStage?.("encoder.queriesCond", encoded.queriesCond);
+  onStage?.("encoder.keysCond", encoded.keysCond);
+  onStage?.("encoder.queriesMask", encoded.queriesMask);
+  onStage?.("encoder.keysMask", encoded.keysMask);
   let act = encoded.tokenAct;
   const projected = linear(
     layerNormSlow(cond.single, tokens, weights.seqChannels,
@@ -450,12 +470,15 @@ export function diffusionHead(input, weights, encode) {
     weights.singleCondEmbeddingProjection);
   for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
 
+  onStage?.("after single projection", act);
   act = diffusionTransformer(act, cond.single, cond.pair, input.seqMask, tokens,
                              weights.transformer);
+  onStage?.("transformer", act);
   act = layerNormSlow(act, tokens, weights.perTokenChannels,
                       weights.outputNormScale, null);
 
   const update = atomDecoder(act, encoded, input, weights.decoder);
+  onStage?.("decoder", update);
 
   // 🔴 A BLEND, NOT A PREDICTION. See the note at the top of this file.
   const output = new Float32Array(input.positionsNoisy.length);

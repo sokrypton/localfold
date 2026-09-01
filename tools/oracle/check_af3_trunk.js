@@ -344,7 +344,8 @@ async function main() {
         templateOccupied: dump.inputs.template_atom_mask.data.some(Boolean),
         templateAatype: new Int32Array(tokens),
       }, templateWeights(tensors), { swapTransposedBias: dump.model !== "alphafold3" });
-      const theirs = at(`${EVO}/template_embedding/__call__`);
+      const theirs = at(`${EVO}/template_embedding/__call__`
+        + ((dump.numRecycles ?? 0) > 0 ? "#0" : ""));
       let error = 0;
       let scale = 0;
       for (let k = 0; k < theirs.length; k += 1) {
@@ -457,6 +458,29 @@ async function main() {
     };
     listWorst(worstByToken, "tokens");
     listWorst(worstByChannel, "channels");
+  }
+  // 🔴 THE RECYCLE PASS, WHICH NOTHING ELSE CHECKS. Every dump here was taken
+  // at num_recycles=0 because the dumper pinned it there, and AF3's own default
+  // is TEN. A recycled pass is not the same computation as the first - it adds
+  //     pair   += prev_embedding(LayerNorm(previous pair))
+  //     single += prev_single_embedding(LayerNorm(previous single))
+  // - so forty-eight verified blocks say nothing about it. With a --recycles
+  // dump the captures are suffixed #0, #1, ... and this runs the loop for real.
+  const recycles = dump.numRecycles ?? 0;
+  if (recycles > 0) {
+    let previousPair = result.pair;
+    let previousSingle = result.single;
+    report("pass 0 pair", at(`${EVO}/__call__:pair#0`), result.pair);
+    report("pass 0 single", at(`${EVO}/__call__:single#0`), result.single);
+    for (let pass = 1; pass <= recycles; pass += 1) {
+      const next = runTrunk({ ...trunkInput, previousPair, previousSingle },
+        weights, { swapTransposedBias: dump.model !== "alphafold3" });
+      report(`pass ${pass} pair`, at(`${EVO}/__call__:pair#${pass}`), next.pair);
+      report(`pass ${pass} single`, at(`${EVO}/__call__:single#${pass}`), next.single);
+      previousPair = next.pair;
+      previousSingle = next.single;
+    }
+    return;
   }
   report("pair", at(`${EVO}/__call__:pair`), result.pair);
   report("single", at(`${EVO}/__call__:single`), result.single);

@@ -179,6 +179,9 @@ def main():
                         help="an A3M set as every chain's paired_msa, so AF3"
                              " does its own cross-chain pairing; --a3m stays"
                              " the unpaired block")
+    parser.add_argument("--recycles", type=int, default=0,
+                        help="trunk recycles (AF3's own default is 10);"
+                             " the capture records every pass in order")
     parser.add_argument("--float32", action="store_true",
                         help="run the trunk in float32 instead of AF3's bfloat16")
     parser.add_argument("--capture-args", default=None, dest="capture_args",
@@ -248,7 +251,12 @@ def main():
     # the array compares its own deep trunk against AF3's shallow one and
     # reports nonsense, so the number the model actually used is recorded.
     num_msa = 1 if alignment is None else msa_crop
-    config = make_config(num_recycles=0, model=arguments.model,
+    # 🔴 RECYCLING HAS NEVER BEEN DUMPED. This was pinned to 0, so every check
+    # in tools/oracle compares a single trunk pass - and AF3's own default is
+    # ten. The recycle path feeds the previous pass's pair and single back
+    # through prev_embedding, which is a different code path from the first
+    # pass and is exercised by nothing.
+    config = make_config(num_recycles=arguments.recycles, model=arguments.model,
                          num_msa=num_msa,
                          num_diffusion_samples=1,
                          diffusion_steps=arguments.diffusion)
@@ -328,6 +336,7 @@ def main():
         # silently invites the reader to guess, and the guess is wrong whenever
         # an alignment was supplied.
         "numMsa": int(num_msa),
+        "numRecycles": int(arguments.recycles),
         "pairformerBlocks": blocks,
         "inputs": inputs,
         "outputs": outputs,

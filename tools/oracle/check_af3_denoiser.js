@@ -140,6 +140,37 @@ async function main() {
   const noiseLevel = at(`${HEAD}/__call__<1`)[0];
   const positionsNoisy = at(`${HEAD}/__call__<0`);
 
+  // 🔴 A NaN IS NOT A TOLERANCE FAILURE and must not be reported as one. relRMS
+  // comes back NaN and `worst` stays 0, because every comparison against a NaN
+  // is false - so the summary line reads like a near-miss when the output is
+  // not a number at all. Whatever is finite before the model runs is worth
+  // saying so explicitly, since a NaN in an INPUT and a NaN produced by the
+  // arithmetic are different bugs.
+  if (process.argv.includes("--finite")) {
+    const check = (name, values) => {
+      let nan = 0;
+      let big = 0;
+      for (const value of values) {
+        if (Number.isNaN(value)) nan += 1;
+        else if (!Number.isFinite(value) || Math.abs(value) > 1e12) big += 1;
+      }
+      console.log(`    ${name.padEnd(22)} ${values.length} values`
+        + `  NaN ${nan}  huge/inf ${big}`);
+    };
+    console.log("  inputs, before anything runs:");
+    check("noise level", [noiseLevel]);
+    check("positions noisy", positionsNoisy);
+    check("ref_pos", reference.positions);
+    check("ref_mask", reference.mask);
+    check("ref_charge", reference.charge);
+    for (const name of ["queries_to_keys", "queries_to_token_atoms",
+      "token_atoms_to_queries", "tokens_to_queries", "tokens_to_keys"]) {
+      if (dump.inputs[`${name}:gather_idxs`] !== undefined) {
+        check(name, dump.inputs[`${name}:gather_idxs`].data);
+      }
+    }
+  }
+
   const superBlocks = Array.from({ length: 6 }, (_, superBlock) => ({
     pairLogitsProjection: layer(
       tensors, `${HEAD}/transformer/__layer_stack_with_per_layer/pair_logits_projection/weights`,
@@ -205,11 +236,16 @@ async function main() {
     conditioning,
     refPos: reference.positions,
     refSpaceUid: Float32Array.from(input("ref_space_uid")),
-    tokenAtomsToQueries: gather("token_atoms_to_queries", 9 * 32),
-    queriesToKeys: gather("queries_to_keys", 9 * 128),
+    // 🔴 shape.subsets, NOT 9. Fixing the constant in `shape` above and leaving
+    // it here gave the encoder a 9-subset query layout while the decoder used
+    // the real one, so the decoder indexed past the end of every mask the
+    // encoder returned - and the coordinates came back NaN with the checker
+    // reporting relRMS NaN and worst 0, which reads like a near-miss.
+    tokenAtomsToQueries: gather("token_atoms_to_queries", shape.subsets * shape.queries),
+    queriesToKeys: gather("queries_to_keys", shape.subsets * shape.keys),
     queriesToTokenAtoms: gather("queries_to_token_atoms", tokens * dense),
-    tokensToQueries: gather("tokens_to_queries", 9 * 32),
-    tokensToKeys: gather("tokens_to_keys", 9 * 128),
+    tokensToQueries: gather("tokens_to_queries", shape.subsets * shape.queries),
+    tokensToKeys: gather("tokens_to_keys", shape.subsets * shape.keys),
     features: {
       residueIndex: input("residue_index"), tokenIndex: input("token_index"),
       asymId: input("asym_id"), entityId: input("entity_id"), symId: input("sym_id"),
@@ -250,7 +286,22 @@ async function main() {
       atomFeaturesToPositionUpdate: T("diffusion_atom_features_to_position_update/weights"),
       blocks: atomStack(tensors, `${HEAD}/diffusion_atom_transformer_decoder`, 3),
     },
-  }, atomCrossAttentionEncoder);
+  }, atomCrossAttentionEncoder,
+  // 🔴 WHICH STAGE, when the answer is NaN. relRMS comes back NaN and `worst`
+  // stays zero, so the summary line looks like a near-miss rather than an
+  // output that is not a number - and five stages produce it.
+  process.argv.includes("--finite")
+    ? (stage, values) => {
+      let nan = 0;
+      let worst = 0;
+      for (const value of values) {
+        if (Number.isNaN(value)) nan += 1;
+        else if (Math.abs(value) > worst) worst = Math.abs(value);
+      }
+      console.log(`    ${stage.padEnd(22)} ${String(values.length).padStart(8)} values`
+        + `  NaN ${String(nan).padStart(7)}  max ${worst.toExponential(2)}`);
+    }
+    : undefined);
 
   console.log(`${dump.model}, ${tokens} tokens, one denoising step at noise level`
     + ` ${noiseLevel}, weights from ${model}/`);
