@@ -232,14 +232,52 @@ with `unpairedFrom` at 256. That is `max_paired_sequences = msa_size // 2` with
 the remainder to the unpaired block, which is what featurise.js needs to compute
 the profile over the right half.
 
-🔴 BUT AF3 IS MUCH LESS CONFIDENT HERE THAN AlphaFold-Multimer, and it is not
-the wiring. Same chains, same search: AF3 gives pLDDT 62.6 in 84 s against
-multimer's 96.5. The alignment IS doing work - single-sequence AF3 on the same
-complex gives 44.5, so the MSA is worth +18 - and the featuriser is exact
-against AF3's own batch everywhere it can be checked. What cannot be checked
-here is the interface, because AF3 has no ipTM. Whether the gap is int5, the
-model, or something in the paired path that the monomer and homodimer oracles
-cannot see is open.
+🔴 BUT OUR AF3 IS MUCH LESS CONFIDENT ON THIS COMPLEX THAN IT SHOULD BE, AND
+THAT IS UNRESOLVED. Same chains, same search: we get pLDDT 62.6 where
+AlphaFold-Multimer gets 96.5 / ipTM 0.897, and where the AlphaFold Server's own
+AF3 gets **pTM 0.91, ipTM 0.91, ranking 0.94**, no clashes, 5% disordered.
+
+What has been ruled out:
+
+- **Not the sampler.** Diffusion at 40 steps gives 60.2 against flow-8's 62.6.
+  The hypothesis was reasonable - flow was only ever validated on two small
+  single-sequence monomers, and a complex adds rigid-body docking - but the
+  numbers do not support it.
+- **Not the MSA being absent.** Single-sequence AF3 on the same complex gives
+  44.5, so the alignment is worth +18.
+- **Not the featuriser**, everywhere it can be checked: exact against AF3's own
+  batch for a monomer, a monomer with an MSA, a homodimer with an MSA, and a
+  three-chain complex.
+
+### The reference, and how to use it
+
+`~/Downloads/fold_2026_09_01_10_17.zip` is the AlphaFold Server's own run of
+this exact pair. It contains far more than a score:
+
+- `msas/` - the server's own **paired and unpaired A3Ms, per chain**
+  (paired 1849/933 rows, unpaired 1805/593). Feeding these straight into
+  `af3MsaFromA3m` removes MMseqs2 and our own assembly from the picture
+  entirely. If we still land near 60 on the server's own alignments, the fault
+  is downstream of the MSA and the paired port is exonerated. **Do this first.**
+  Note their per-chain paired depths DIFFER, because these are the inputs to
+  AF3's pairing rather than its output; ColabFold's `pair.a3m` is already
+  row-aligned, which is why `generateMmseqs2PairedMsa` requires equal depth.
+- `templates/` - **four template hits per chain**, and the job request says
+  `useStructureTemplate: true`. We do not implement templates at all; they
+  raise. This is the largest known difference between the two runs and the
+  prime suspect.
+- Five models with full PAE/pLDDT arrays, to compare against ours residue by
+  residue rather than through a single scalar.
+
+### A separate bug found while measuring this
+
+**A fold crawls in a background tab.** The per-block yield is
+`await new Promise((resolve) => setTimeout(resolve, 0))`, and Chrome clamps
+setTimeout to >=1 s in a hidden tab - so a 48-block pass that takes under a
+second takes the better part of a minute, and the trunk appears to hang.
+Measured: pass 1 reached block 11 in five minutes hidden, then jumped to block
+28 the moment the tab was touched. A MessageChannel yield is not throttled and
+would fix it; nothing has been changed yet.
 
 ## The weights
 

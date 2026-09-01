@@ -24,7 +24,6 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { splitComplexA3mByChain } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -234,7 +233,7 @@ async function alignmentText(chains, signal, family) {
  * The alignment is passed only when there is one - handing the app an A3M for a
  * single-sequence fold would draw a one-row MSA panel that says nothing.
  */
-async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, length, confidence }) {
+async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence }) {
   const load = window.py2dmolLoadFiles;
   if (typeof load !== "function") {
     throw new Error("this py2Dmol bundle has no py2dmolLoadFiles; it needs the `full` build");
@@ -245,12 +244,25 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, chainLengths, pae, lengt
     file(`${stem}_scores.json`, typeof scores === "string" ? scores : JSON.stringify(scores, null, 2)),
   ];
   if (a3m != null) {
-    const alignments = chainLengths?.length > 1
-      ? splitComplexA3mByChain(a3m, chainLengths)
-      : [a3m];
-    alignments.forEach((alignment, chain) => {
-      files.push(file(`${stem}_chain_${chain + 1}.a3m`, alignment));
-    });
+    // 🔴 ONE MERGED A3M, NOT ONE PER CHAIN. This split the complex alignment
+    // back into per-chain pieces, and that is exactly what a paired MSA cannot
+    // survive: row s means ONE ORGANISM ACROSS THE CHAINS, and the statement
+    // lives on the boundary between them - cut there, all that is left is two
+    // ordinary single-chain alignments and a viewer with no way to know they
+    // were ever related. py2Dmol reads the concatenation itself now (it matches
+    // no single chain, so it tries the chains' queries end to end), draws the
+    // chain boundaries, keeps the paired rows above the unpaired ones, and
+    // scores each row over the blocks it occupies - without which the unpaired
+    // half of every complex MSA falls under the coverage filter and vanishes.
+    //
+    // NOTHING HAS TO BE DECLARED. `blocks.paired` and `pairedDepth` are ours to
+    // keep for the model; the viewer infers pairing per row, from which blocks
+    // a row has residues in, so an alignment a reader UPLOADS gets the same
+    // picture as one this page searched.
+    //
+    // The query must be the chains concatenated in structure order, which it is:
+    // both this and the PDB are written from `sequence`.
+    files.push(file(`${stem}.a3m`, a3m));
   }
   const stats = await load(files, true);
   const registry = window.py2dmol_viewers ?? {};
