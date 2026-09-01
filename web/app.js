@@ -24,8 +24,8 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { splitComplexA3mByChain, mergeChainA3ms, mergeUnpairedChainA3ms }
-  from "../src/input/chains.js";
+import { splitComplexA3mByChain, mergeChainA3ms, mergeUnpairedChainA3ms,
+  mergeRowAlignedChainA3ms } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -203,21 +203,27 @@ async function alignmentText(chains, signal, family) {
       // unpaired rows are block-diagonal. A merged A3M is only ever the second,
       // so the merge is handed over alongside rather than instead: `text` is
       // what the viewer draws and what AF2 folds, `blocks` is what AF3 reads.
-      // 🔴 A PAIRED BLOCK ONLY WHERE PAIRING IS REAL. mergeChainA3ms pairs COPIES
-      // of one sequence - it groups rows by identical query - so for a complex
-      // of distinct chains it emits exactly the block-diagonal alignment
-      // mergeUnpairedChainA3ms does, byte for byte. Handing AF3 both would
-      // duplicate every row, doubling the MSA stack's cost to tell the model
-      // nothing it was not already told. True cross-species pairing between
-      // DIFFERENT sequences needs the MMseqs2 server's pair mode, which this
-      // client does not ask for yet; until it does, a heteromer gets the
-      // unpaired block alone, which is what AF3 does with no paired MSA.
-      const repeated = new Set(chains).size < chains.length;
+      // 🔴 NO SEPARATE PAIRED BLOCK, AND THAT IS NOT AN OMISSION. AF3's unpaired
+      // merge is already row-aligned - chain A's row r beside chain B's row r -
+      // so for a homo-oligomer, where every copy carries the same alignment, it
+      // IS the paired construction: mergeChainA3ms and mergeRowAlignedChainA3ms
+      // return the same rows byte for byte. Supplying both duplicates every row
+      // and spends half the budget saying everything twice, which is what made
+      // a homodimer fold worse with an MSA than without one.
+      //
+      // A real paired block would have to pair DIFFERENT sequences by species,
+      // which needs the MMseqs2 server's pair mode; this client does not request
+      // it. Until it does, `paired` stays null and AF3 does what it does with no
+      // paired MSA - the query alone in that block.
       return {
         text: searched.a3m,
         blocks: searched.chainA3ms === undefined ? { unpaired: searched.a3m } : {
-          paired: pairRepeatedChains && repeated ? mergeChainA3ms(searched.chainA3ms) : null,
-          unpaired: mergeUnpairedChainA3ms(searched.chainA3ms),
+          paired: null,
+          // 🔴 AF3's UNPAIRED MERGE, NOT AlphaFold 2's. AF3 concatenates the
+          // chains' alignments along the TOKEN axis by row index; AF2 stacks
+          // them block-diagonally. mergeUnpairedChainA3ms is the second, and is
+          // what `text` above still uses for AF2 and for the viewer.
+          unpaired: mergeRowAlignedChainA3ms(searched.chainA3ms),
         },
       };
     }

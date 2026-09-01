@@ -174,6 +174,11 @@ def main():
     parser.add_argument("--a3m", default=None, metavar="PATH",
                         help="an A3M whose rows become the MSA, instead of the"
                              " query alone; applied to every chain")
+    parser.add_argument("--paired-a3m", default=None, metavar="PATH",
+                        dest="paired_a3m",
+                        help="an A3M set as every chain's paired_msa, so AF3"
+                             " does its own cross-chain pairing; --a3m stays"
+                             " the unpaired block")
     parser.add_argument("--float32", action="store_true",
                         help="run the trunk in float32 instead of AF3's bfloat16")
     parser.add_argument("--capture-args", default=None, dest="capture_args",
@@ -206,7 +211,31 @@ def main():
     alignment = None
     if arguments.a3m is not None:
         alignment = pathlib.Path(arguments.a3m).read_text()
+    # 🔴 THE PAIRED BLOCK IS A SEPARATE INPUT AND HAS NO OTHER WAY IN.
+    # spec_to_fold_input only ever sets unpaired_msa, so a homo-oligomer
+    # featurised through it has no paired rows at all - and the paired block is
+    # exactly what a homo-oligomer's MSA mostly IS. Rebuilding each chain with
+    # both is the only way to get ground truth for that case.
+    paired = None
+    if arguments.paired_a3m is not None:
+        paired = pathlib.Path(arguments.paired_a3m).read_text()
+        # ProteinChain is a plain __slots__ class, not a dataclass: rebuilding
+        # one drops whatever the constructor does not take. The slot is set in
+        # place instead, which touches exactly the one field.
+        _original = f3.spec_to_fold_input
+
+        def _with_paired(*args, **kwargs):
+            fold_input = _original(*args, **kwargs)
+            for chain in fold_input.chains:
+                if hasattr(chain, "_paired_msa"):
+                    chain._paired_msa = paired
+            return fold_input
+
+        f3.spec_to_fold_input = _with_paired
+
     msa_crop = 8 if alignment is None else 1 + alignment.count(">")
+    if paired is not None:
+        msa_crop += paired.count(">")
     batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)),
                               msa=alignment, msa_crop_size=msa_crop)
     sequence = "".join(chains)

@@ -112,6 +112,16 @@ nucleotide. Related and just as quiet: the deletion counts stay RAW, because
 AF3's embedder does the `atan(n/3)` squashing itself, and AF2's featuriser does
 it on the way in.
 
+**AF3's unpaired chain merge is NOT block-diagonal.** `merge_msa_features` pads
+each chain's alignment to the deepest and concatenates along the TOKEN axis, so
+merged row r is chain A's row r beside chain B's row r. AlphaFold 2 stacks them
+block-diagonally instead, and `mergeUnpairedChainA3ms` is that - AF2's. AF3 has
+`mergeRowAlignedChainA3ms`. Two consequences, both silent: the block-diagonal
+form halves the information in every row and doubles the depth to carry it; and
+for a HOMO-oligomer the row-aligned merge already IS the paired construction, so
+supplying a paired block as well duplicates every row. That combination made a
+homodimer fold worse with an MSA than without one, and a monomer shows neither.
+
 **AF3's `msa` is two blocks and its `profile` is over one of them.** The array
 the model reads is the paired block followed by the unpaired one; the profile
 and deletion_mean are computed upstream, per chain, over the unpaired block
@@ -173,13 +183,14 @@ unexplained. That is the next lead and it is a small one.
 
 ## Open
 
-- **No cross-species pairing for a heteromer.** AF3 reads a paired block and an
-  unpaired one, and the plumbing for both is in place - but the only pairing
-  this repository can produce is between COPIES of one sequence, where one
-  search speaks for every copy. Pairing different sequences by species needs the
-  MMseqs2 server's pair mode, which `src/input/mmseqs2-api.js` does not request
-  (it posts `mode: env|all` only). A heteromer therefore folds against the
-  unpaired block alone. This is the single largest remaining gap for complexes.
+- **No cross-species pairing at all.** AF3 reads a paired block and an unpaired
+  one, and the plumbing for both is in place, but nothing fills the first:
+  pairing DIFFERENT sequences by species needs the MMseqs2 server's pair mode,
+  which `src/input/mmseqs2-api.js` does not request (it posts `mode: env|all`
+  only). Every complex therefore folds against the unpaired block alone - which
+  for a homo-oligomer is already row-aligned and so loses nothing, but for a
+  heteromer means no interface coevolution signal. This is the single largest
+  remaining gap for complexes.
 - **The A3M parser is narrower than AF3's alphabet.** `src/input/a3m.js` rejects
   B, Z, J, O and U, which AF3 maps to D, E, X, X and C. The codes are in
   `AF3_MSA_CODES` and unreachable through that parser - for AlphaFold 2 too, so

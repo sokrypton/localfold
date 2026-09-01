@@ -81,6 +81,52 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
 }
 
 /**
+ * Merge per-chain A3Ms the way AlphaFold 3 merges its UNPAIRED block.
+ *
+ * 🔴 THIS IS NOT BLOCK-DIAGONAL, AND THAT IS THE WHOLE DIFFERENCE FROM
+ * mergeUnpairedChainA3ms. AF3 pads each chain's alignment to the deepest one
+ * and concatenates along the TOKEN axis (`merge_msa_features`, axis=1), so
+ * merged row r is chain A's row r beside chain B's row r - not chain A's rows
+ * above chain B's rows against gaps. AlphaFold 2's convention is the other one,
+ * which is why both live here: handing AF3 the block-diagonal form halves the
+ * information in every row and doubles the depth to carry it.
+ *
+ * The alignment by row index is not a claim that row r of two chains is one
+ * organism - that is what the paired block is for. It is only how AF3 packs
+ * them, and for a homo-oligomer, where every copy has the same alignment, it
+ * happens to coincide with pairing.
+ *
+ * Short chains are padded with gaps, which is AF3's `MSA_PAD_VALUES['msa'] =
+ * MSA_GAP_IDX`; their deletion counts pad with zero, which falls out of a gap
+ * column having no insertions before it.
+ *
+ * @param {readonly string[]} a3mTexts one A3M per physical chain
+ * @returns {string}
+ */
+export function mergeRowAlignedChainA3ms(a3mTexts) {
+  if (!Array.isArray(a3mTexts) || a3mTexts.length === 0) {
+    throw new RangeError("at least one chain A3M is required");
+  }
+  const alignments = a3mTexts.map((text) => parseA3m(text));
+  const lengths = alignments.map((alignment) => alignment.length);
+  const depth = Math.max(...alignments.map((alignment) => alignment.depth));
+  const lines = [];
+  for (let row = 0; row < depth; row += 1) {
+    const parts = alignments.map((alignment, chain) => (
+      // 🔴 rawSequences, NOT sequences: the lowercase insertions carry the
+      // deletion counts, and a merge that drops them silently zeroes a feature.
+      row < alignment.depth ? alignment.rawSequences[row] : "-".repeat(lengths[chain])
+    ));
+    const label = row === 0 ? "query" : alignments
+      .map((alignment, chain) => (row < alignment.depth
+        ? `${chain + 1}:${alignment.descriptions[row]}` : `${chain + 1}:-`))
+      .join(" ");
+    lines.push(`>${label}`, parts.join(""));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * Residue indices numbered WITHIN each chain, which is what multimer wants.
  *
  * 🔴 THE +200 BREAK IS A MONOMER WORKAROUND AND MULTIMER MUST NOT HAVE IT.

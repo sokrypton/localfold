@@ -81,15 +81,21 @@ describe("af3MsaFromA3m", () => {
     const paired = a3m(QUERY, "AAAAAAAAAA");
     const unpaired = a3m(QUERY, "CCCCCCCCCC");
     const rows = af3MsaFromA3m({ paired, unpaired });
+    // 🔴 BOTH BLOCKS KEEP THEIR OWN QUERY ROW. AF3's pairing prepends a query
+    // row and then emits rows that begin at the A3M's query again, exactly as
+    // the unpaired block does - so each block contributes all of its A3M, and
+    // only the row featuriseProtein writes is not repeated here. QUERY starts
+    // with A, which is why three of these four are A.
     assert.deepEqual(rows.msa.map((row) => row[0]), [
-      AF3_MSA_CODES.A,  // the paired block's one homolog
-      AF3_MSA_CODES.A,  // the unpaired block's query row, kept as AF3 keeps it
+      AF3_MSA_CODES.A,  // the paired block's query row
+      AF3_MSA_CODES.A,  // and its one homolog
+      AF3_MSA_CODES.A,  // the unpaired block's query row
       AF3_MSA_CODES.C,  // and its homolog
     ]);
-    // The profile is over the unpaired block alone, which starts after the
-    // query row (index 0) and the one paired row (index 1).
-    assert.equal(rows.unpairedFrom, 2);
-    assert.equal(rows.depth, 4);
+    // The profile is over the unpaired block alone: row 0 is the query
+    // featuriseProtein writes, rows 1-2 are the paired block, so it starts at 3.
+    assert.equal(rows.unpairedFrom, 3);
+    assert.equal(rows.depth, 5);
   });
 
   it("points the profile at the query when there is no alignment at all", () => {
@@ -97,6 +103,39 @@ describe("af3MsaFromA3m", () => {
     assert.deepEqual(rows.msa, []);
     assert.equal(rows.depth, 1);
     assert.equal(rows.unpairedFrom, 0, "row zero, the query itself");
+  });
+
+  it("gives the paired block at most half the budget, and the rest to unpaired", () => {
+    // 🔴 THE REGRESSION THIS FILE EXISTED WITHOUT. AF3 sets
+    // max_paired_sequences = msa_size // 2 and then fills the remainder from the
+    // unpaired block. Letting the paired block take the whole cap is the natural
+    // way to write the loop, and it only shows on a HOMO-OLIGOMER: a monomer has
+    // no paired block, so every single-chain check passes while a dimer folds
+    // against a paired block that has eaten the entire budget, no unpaired rows
+    // at all, and a profile with nothing left to average.
+    const deep = (residue) => a3m(QUERY, ...Array.from({ length: 40 }, () => residue.repeat(10)));
+    const rows = af3MsaFromA3m({ paired: deep("A"), unpaired: deep("C") },
+                               { maxSequences: 10 });
+    assert.equal(rows.depth, 10, "the cap is still the cap");
+    // The paired crop is 5 - half of 10 - of which row zero is the query
+    // featuriseProtein writes, so four rows come from here. The unpaired crop
+    // is the remaining 5, and it contributes ALL of them including its own
+    // query row, which is the duplicate AF3 keeps.
+    assert.equal(rows.unpairedFrom, 5);
+    assert.deepEqual(rows.msa.map((row) => row[0]), [
+      ...Array(4).fill(AF3_MSA_CODES.A),
+      AF3_MSA_CODES.A,  // the unpaired block's query row: QUERY starts with A
+      ...Array(4).fill(AF3_MSA_CODES.C),
+    ]);
+    // ...so the profile sees five rows, not zero, which is the actual failure.
+    assert.equal(rows.depth - rows.unpairedFrom, 5);
+  });
+
+  it("gives the unpaired block everything when there is no paired one", () => {
+    const deep = a3m(QUERY, ...Array.from({ length: 40 }, () => "CCCCCCCCCC"));
+    const rows = af3MsaFromA3m({ paired: null, unpaired: deep }, { maxSequences: 10 });
+    assert.equal(rows.depth, 10);
+    assert.equal(rows.unpairedFrom, 1, "straight after the query row");
   });
 
   it("takes the first rows rather than sampling them", () => {

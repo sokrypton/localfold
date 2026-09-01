@@ -24,6 +24,7 @@ import { dirname, join, resolve } from "node:path";
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
+import { mergeChainA3ms, mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const dumpPath = process.argv[2] ?? join(ROOT, "af3-6mrr.json");
@@ -37,10 +38,24 @@ const input = (name) => dump.inputs[name].data;
 // rather than in its own file because the arrays it changes - msa, profile and
 // deletion_mean - are three of this file's arrays, and AF3 builds them in the
 // same featuriser call as everything else.
+// The A3M is PER CHAIN, as AF3's own input is, and is merged here exactly as
+// web/app.js merges it - so the merge is part of what this checks. A dimer whose
+// unpaired block is stacked block-diagonally rather than concatenated by row
+// index reaches the model at twice the depth carrying half the information, and
+// nothing downstream can tell.
 const a3mPath = process.argv[3] ?? dump.a3m ?? null;
+const pairedPath = process.argv[4] ?? null;
+const chainCount = (dump.chains ?? [dump.sequence]).length;
+const perChain = (path) => Array.from({ length: chainCount }, () => readFileSync(path, "utf8"));
 const rows = a3mPath === null
   ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
-  : af3MsaFromA3m({ unpaired: readFileSync(a3mPath, "utf8") }, { maxSequences: Infinity });
+  : af3MsaFromA3m({
+    paired: pairedPath === null ? null
+      : (chainCount === 1 ? readFileSync(pairedPath, "utf8")
+        : mergeChainA3ms(perChain(pairedPath))),
+    unpaired: chainCount === 1 ? readFileSync(a3mPath, "utf8")
+      : mergeRowAlignedChainA3ms(perChain(a3mPath)),
+  }, { maxSequences: Infinity });
 const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
   { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom });
 const { tokens, dense } = batch;

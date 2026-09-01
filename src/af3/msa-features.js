@@ -92,19 +92,40 @@ export function af3MsaFromA3m(alignment, options = {}) {
   const texts = typeof alignment === "string" ? { unpaired: alignment } : (alignment ?? {});
   const maxSequences = options.maxSequences ?? 512;
 
+  const parse = (text) => {
+    if (text === undefined || text === null || text.trim() === "") return null;
+    return parseA3m(text);
+  };
+  const paired = parse(texts.paired);
+  const unpaired = parse(texts.unpaired);
+
+  // 🔴 THE PAIRED BLOCK GETS AT MOST HALF THE BUDGET, and the unpaired block
+  // gets what is left - `max_paired_sequences = msa_size // 2` in AF3's
+  // features.py, then `unpaired_crop = total - paired_crop`. Letting the paired
+  // block take the whole cap is the natural way to write this loop and it is
+  // wrong in a way only a homo-oligomer shows: a deep paired alignment fills
+  // every slot, the unpaired block is dropped entirely, and the profile - which
+  // is over the unpaired block - has nothing left to be computed from.
+  //
+  // 🔴 AND THE PAIRED BLOCK IS ONE ROW TALLER THAN ITS A3M. The pairing keeps
+  // row 0 as the query and then emits the species-aligned rows, which begin at
+  // the A3M's own query again - the same duplication the unpaired block has. So
+  // the block AF3 crops is `depth + 1`, and the rows returned here are all of
+  // the A3M's, not all-but-the-first. Skipping one looks right, matches on a
+  // monomer (where there is no paired block at all), and is short by a row on
+  // every complex.
+  const pairedBlock = paired === null ? 1 : paired.depth + 1;
+  const pairedCrop = Math.min(pairedBlock, Math.max(1, Math.floor(maxSequences / 2)));
+  const unpairedCrop = unpaired === null
+    ? 0 : Math.min(unpaired.depth, maxSequences - pairedCrop);
+
   const msa = [];
   const deletionMatrix = [];
   let length = 0;
-  // The paired block contributes its rows AFTER the first: row zero is the
-  // query, and featuriseProtein has already written it from the sequence.
-  const append = (text, skipFirst) => {
-    if (text === undefined || text === null || text.trim() === "") return;
-    const parsed = parseA3m(text);
+  const append = (parsed, from, upTo) => {
+    if (parsed === null) return;
     length = parsed.length;
-    for (let row = skipFirst ? 1 : 0; row < parsed.depth; row += 1) {
-      // 🔴 +1 FOR THE QUERY ROW THIS FUNCTION DOES NOT RETURN. Counting the cap
-      // against msa.length would let one extra row through.
-      if (msa.length + 1 >= maxSequences) return;
+    for (let row = from; row < upTo; row += 1) {
       const aligned = parsed.sequences[row];
       const codes = new Int32Array(parsed.length);
       for (let column = 0; column < parsed.length; column += 1) {
@@ -117,18 +138,20 @@ export function af3MsaFromA3m(alignment, options = {}) {
     }
   };
 
-  append(texts.paired, true);
-  // +1 again: unpairedFrom indexes the full array, whose row zero is the query.
+  // The paired block contributes its rows AFTER the first: row zero is the
+  // query, and featuriseProtein has already written it from the sequence.
+  append(paired, 0, pairedCrop - 1);
+  // +1 because unpairedFrom indexes the full array, whose row zero is the query.
   const unpairedFrom = msa.length + 1;
-  append(texts.unpaired, false);
+  append(unpaired, 0, unpairedCrop);
 
   return {
     msa,
     deletionMatrix,
     depth: msa.length + 1,
-    // With no unpaired rows at all the profile falls back to the query, which
-    // is the single-sequence case and is what AF3 does with an empty MSA.
-    unpairedFrom: unpairedFrom > msa.length ? 0 : unpairedFrom,
+    // With no unpaired rows the profile falls back to the query, which is the
+    // single-sequence case and is what AF3 does with an empty MSA.
+    unpairedFrom: unpairedCrop === 0 ? 0 : unpairedFrom,
     length,
   };
 }
