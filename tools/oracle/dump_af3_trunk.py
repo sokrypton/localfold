@@ -179,6 +179,9 @@ def main():
                         help="an A3M set as every chain's paired_msa, so AF3"
                              " does its own cross-chain pairing; --a3m stays"
                              " the unpaired block")
+    parser.add_argument("--ligand", action="append", metavar="CCD",
+                        help="append a ligand chain by CCD code (repeatable),"
+                             " e.g. --ligand ATP")
     parser.add_argument("--recycles", type=int, default=0,
                         help="trunk recycles (AF3's own default is 10);"
                              " the capture records every pass in order")
@@ -206,7 +209,21 @@ def main():
     # paths run in no check that uses one.
     sequence = arguments.sequence
     chains = [chain for chain in sequence.split(":") if chain]
-    spec = parse_contigs(":".join(str(len(chain)) for chain in chains)).resolve()
+    # 🔴 A LIGAND HAS NO LENGTH IN THE SPEC. Its token count comes from the
+    # chemical component dictionary, which is AF3's to know, so the contig
+    # carries the CCD code and resolve_ligands fills the count in afterwards
+    # from the featurised batch. That is why ligands are appended as
+    # `ligand:ATP` segments rather than as a number of residues.
+    contig = ":".join(str(len(chain)) for chain in chains)
+    for code in arguments.ligand or []:
+        contig += f":ligand:{code.upper()}"
+    # 🔴 AND IT MUST NOT BE RESOLVED WHEN ONE IS PRESENT. resolve() walks every
+    # segment and a ligand has no length to give it, so it raises - the count is
+    # AF3's to supply. A numeric protein contig is already concrete, so skipping
+    # resolve() costs nothing here.
+    spec = parse_contigs(contig)
+    if not arguments.ligand:
+        spec = spec.resolve()
     # 🔴 THE CROP MUST CLEAR THE ALIGNMENT, and num_msa must match it below.
     # AF3 pads the MSA to msa_crop_size rows and then TRUNCATES to num_msa, so a
     # crop of 8 over a 32-row alignment silently checks eight rows, and a
