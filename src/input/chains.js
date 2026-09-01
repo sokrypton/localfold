@@ -87,12 +87,24 @@ export function mergeUnpairedChainA3ms(a3mTexts) {
  * mergeUnpairedChainA3ms. AF3 pads each chain's alignment to the deepest one
  * and concatenates along the TOKEN axis (`merge_msa_features`, axis=1), so
  * merged row r is chain A's row r beside chain B's row r - not chain A's rows
- * above chain B's rows against gaps. AlphaFold 2's convention is the other one,
- * which is why both live here: handing AF3 the block-diagonal form halves the
- * information in every row and doubles the depth to carry it.
+ * above chain B's rows against gaps. Handing AF3 the block-diagonal form halves
+ * the information in every row and doubles the depth to carry it.
+ *
+ * 🔴 AF3 DOES THIS FOR EVERY CHAIN, WITH NO NOTION OF ENTITY. There is no
+ * block_diag anywhere in its codebase. AlphaFold-Multimer is the one that
+ * distinguishes: `_merge_homomers_dense_msa` groups chains by entity_id and
+ * merges each group densely - copies of one sequence are NEVER block
+ * diagonalised - and only distinct entities are block diagonalised against each
+ * other. So for a homo-oligomer this function and mergeChainA3ms agree, and for
+ * a heteromer the two models genuinely differ.
+ *
+ * mergeUnpairedChainA3ms, which block-diagonalises every chain INCLUDING copies
+ * of one sequence, is neither of those: it belongs to the AF2-monomer hack,
+ * where the model has no chain input at all and the +200 residue offset stands
+ * in for one. See residueIndexWithChainBreaks.
  *
  * The alignment by row index is not a claim that row r of two chains is one
- * organism - that is what the paired block is for. It is only how AF3 packs
+ * organism - that is what a paired block is for. It is only how AF3 packs
  * them, and for a homo-oligomer, where every copy has the same alignment, it
  * happens to coincide with pairing.
  *

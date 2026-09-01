@@ -114,9 +114,15 @@ it on the way in.
 
 **AF3's unpaired chain merge is NOT block-diagonal.** `merge_msa_features` pads
 each chain's alignment to the deepest and concatenates along the TOKEN axis, so
-merged row r is chain A's row r beside chain B's row r. AlphaFold 2 stacks them
-block-diagonally instead, and `mergeUnpairedChainA3ms` is that - AF2's. AF3 has
-`mergeRowAlignedChainA3ms`. Two consequences, both silent: the block-diagonal
+merged row r is chain A's row r beside chain B's row r, for every chain, with no
+notion of entity - there is no `block_diag` anywhere in AF3. AlphaFold-Multimer
+is the one that distinguishes: `_merge_homomers_dense_msa` merges copies of one
+sequence densely and block-diagonalises only distinct entities, so it agrees
+with AF3 on a homo-oligomer and differs on a heteromer.
+`mergeUnpairedChainA3ms`, which block-diagonalises copies too, is neither: it
+belongs to the AF2-MONOMER hack, where the +200 residue offset stands in for
+chain awareness. AF3 has `mergeRowAlignedChainA3ms`. Two consequences, both
+silent: the block-diagonal
 form halves the information in every row and doubles the depth to carry it; and
 for a HOMO-oligomer the row-aligned merge already IS the paired construction, so
 supplying a paired block as well duplicates every row. That combination made a
