@@ -450,7 +450,6 @@
    makes the row jump as entities are added. */
 .entity-remove:disabled { opacity: .35; cursor: default; }
 
-.entity-add { align-self: flex-start; }
 
 /* THE ACTIONS SIT IN THE PAGE HEAD, opposite the title - py2Dmol's own place
    for controls that act on the whole page, and out of the entity list's way. */

@@ -63,6 +63,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
         <div class="page-head page-head-fold" style="padding-right: 0;">
             <h1>LocalFold</h1>
             <div class="fold-actions">
+              <button type="button" id="add-entity" class="btn btn-grey btn-small">
+                <i class="fa-solid fa-plus"></i>
+                <span>Add entity</span>
+              </button>
               <!-- 🔴 DISABLED UNTIL web/app.js HAS BOUND ITS HANDLER, which is
                    later than it looks. py2Dmol.full.min.js is 765 KB of
                    blocking classic script and app.js is a module, so it runs
@@ -72,15 +76,15 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    nothing at all: no error, no status, no feedback, and the
                    reasonable conclusion is that the page is broken.
                    Milliseconds on localhost, seconds over a network. -->
-              <button id="predict" class="btn btn-primary" disabled>
-                <i class="fa-solid fa-cubes"></i>
-                <span>Fold</span>
-              </button>
               <label class="switch switch-sm" title="Multiple Sequence Alignment">
                 <input type="checkbox" id="useMsaToggle">
                 <span class="slider-toggle"></span>
               </label>
               <label for="useMsaToggle" class="fold-toggle-label" title="Multiple Sequence Alignment">MSA</label>
+              <button id="predict" class="btn btn-primary" disabled>
+                <i class="fa-solid fa-cubes"></i>
+                <span>Fold</span>
+              </button>
             </div>
         </div>
 
@@ -117,10 +121,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    and would look like it had worked. -->
               <div class="entity-list">
                 <div id="entity-rows"></div>
-                <button type="button" id="add-entity" class="btn btn-grey btn-small entity-add">
-                  <i class="fa-solid fa-plus"></i>
-                  <span>Add entity</span>
-                </button>
               </div>
               <!-- 🔴 NO Options BUTTON. The settings below are always on
                    screen: with three models to choose between, the one control
