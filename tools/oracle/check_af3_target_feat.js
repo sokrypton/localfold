@@ -27,7 +27,14 @@ const gather = (name, count) => ({
   indices: inp(`${name}:gather_idxs`), mask: inp(`${name}:gather_mask`), count,
 });
 
-const tokens = dump.tokens, dense = 24, subsets = 9, queries = 32, keys = 128;
+const tokens = dump.tokens, dense = 24, queries = 32, keys = 128;
+// 🔴 SUBSETS IS A PROPERTY OF THE PROTEIN, NOT A CONSTANT. It was hardcoded to
+// 9, which is right for the 12-token dump this file was written against and
+// wrong for everything else: a 59-residue chain has about 470 atoms and needs
+// 15. Passing 9 truncates the atom gathers, so the checker compares a
+// target_feat built from a third of the atoms and reports the shortfall as an
+// error in the encoder. The dump's own gather says how many there are.
+const subsets = dump.inputs["queries_to_keys:gather_idxs"].data.length / keys;
 const reference = {
   positions: Float32Array.from(inp("ref_pos")),
   mask: Float32Array.from(inp("ref_mask")),

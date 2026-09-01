@@ -114,7 +114,11 @@ async function main() {
 
   const tokens = dump.tokens;
   const dense = 24;
-  const shape = { tokens, dense, subsets: 9, queries: 32, keys: 128 };
+  // 🔴 DERIVED, NOT 9 - see check_af3_trunk.js. A constant here means the
+  // denoiser is only ever checked on the 12-token dump the number was taken
+  // from, and silently reads a fraction of the atoms on anything larger.
+  const shape = { tokens, dense, queries: 32, keys: 128,
+    subsets: dump.inputs["queries_to_keys:gather_idxs"].data.length / 128 };
   const gather = (name, count) => ({
     indices: input(`${name}:gather_idxs`), mask: input(`${name}:gather_mask`), count,
   });

@@ -14,6 +14,8 @@
  * the page, because the page has to run what was measured.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
+import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
+import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
@@ -100,7 +102,36 @@ export async function main(device, args) {
       })()
     : null;
 
-  const batch = sequenceArg !== "" ? featuriseProtein(sequenceArg) : batchFromDump(dump);
+  // 🔴 AN MSA, WHICH THE BROWSER PATH HAS AND THIS DID NOT. --a3m takes one
+  // path per CHAIN, comma-separated, and --paired-a3m the same for the paired
+  // block; both are merged exactly as web/app.js merges them for AF3, so a
+  // fold run here is the fold the page runs. Without this the CLI could only
+  // ever reproduce a single-sequence prediction, which is not the case worth
+  // debugging on a complex.
+  const fetchText = async (path) => {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(`failed to load ${path}: ${response.status}`);
+    return response.text();
+  };
+  const chainTexts = async (spec) => (spec === ""
+    ? null
+    : Promise.all(spec.split(",").map((path) => fetchText(path.trim()))));
+  const unpairedTexts = await chainTexts(option(args, "a3m", ""));
+  const pairedTexts = await chainTexts(option(args, "paired-a3m", ""));
+  const mergeFor = (texts) => (texts === null ? null
+    : (texts.length === 1 ? texts[0] : mergeRowAlignedChainA3ms(texts)));
+  const rows = unpairedTexts === null && pairedTexts === null
+    ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
+    : af3MsaFromA3m({ paired: mergeFor(pairedTexts), unpaired: mergeFor(unpairedTexts) },
+                    { maxSequences: Number(option(args, "max-msa", "512")) });
+
+  const batch = sequenceArg !== ""
+    ? featuriseProtein(sequenceArg,
+      { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom })
+    : batchFromDump(dump);
+  if (rows.depth > 1) {
+    console.log(`MSA ${rows.depth} rows, unpaired block starts at ${rows.unpairedFrom}`);
+  }
   console.log(`${batch.sequence.length} residues, ${batch.tokens} tokens,`
     + ` ${batch.atomCount} atoms, ${batch.subsets} atom subsets,`
     + ` ${blocks} pairformer blocks, ${steps} diffusion steps`);

@@ -173,7 +173,13 @@ function buildTargetFeat(tensors, dump, tokens) {
   const T = (name) => tensors.get(name).data;
   const input = (name) => dump.inputs[name].data;
   const dense = 24;
-  const subsets = 9;
+  // 🔴 DERIVED, NOT 9. This was a constant, right for the 12-token dump and
+  // wrong for every other: a 59-residue chain needs 45 subsets, and passing 9
+  // truncates the atom gathers so target_feat is built from a fraction of the
+  // atoms. src/af3/featurise.js computes ceil(tokens * 24 / 32) and has always
+  // been right; only this file was wrong, which is why the trunk appeared to
+  // diverge at 59 tokens while the browser folded correctly.
+  const subsets = dump.inputs["queries_to_keys:gather_idxs"].data.length / 128;
   const queries = 32;
   const keys = 128;
   const reference = {
@@ -291,7 +297,16 @@ async function main() {
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
-  const sequences = 1;   // the trunk's num_msa; see check_af3_embedder.js
+  // 🔴 HOW MANY MSA ROWS THE MODEL ACTUALLY READ, which was hardcoded to 1 - so
+  // the whole trunk had only ever been checked against AF3 with a single row,
+  // the depth at which the MSA stack's accumulation and its coverage
+  // denominator both do nothing.
+  //
+  // 🔴 AND IT IS NOT THE ARRAY'S HEIGHT. AF3 pads to msa_crop_size and then
+  // truncates to num_msa, so the 12-token dump carries eight rows and read one.
+  // Newer dumps record `numMsa`; older ones do not, and one is right for them.
+  const sequences = Number(process.argv.slice(2)
+    .find((a) => a.startsWith("--sequences="))?.slice(12) ?? dump.numMsa ?? 1);
 
   const weights = {
     embedder: embedderWeights(tensors),
@@ -306,7 +321,29 @@ async function main() {
     tokens,
     sequences,
     targetFeat: buildTargetFeat(tensors, dump, tokens),
-    templateEmbedding: (pair) => templateEmbedding({
+    // 🔴 CHECKED AS IT IS USED, not only in its own file. check_af3_template.js
+    // passes AF3's captured pair and is exact; this passes the pair the trunk
+    // has actually built at that point, which is the only version that matters
+    // and the one nothing was comparing.
+    templateEmbedding: (pair) => {
+      const ours = templateEmbedding({
+        pair, tokens, pairMask,
+        templates: dump.inputs.template_aatype.shape[0],
+        templateOccupied: dump.inputs.template_atom_mask.data.some(Boolean),
+        templateAatype: new Int32Array(tokens),
+      }, templateWeights(tensors), { swapTransposedBias: dump.model !== "alphafold3" });
+      const theirs = at(`${EVO}/template_embedding/__call__`);
+      let error = 0;
+      let scale = 0;
+      for (let k = 0; k < theirs.length; k += 1) {
+        error += (ours[k] - theirs[k]) ** 2;
+        scale += theirs[k] ** 2;
+      }
+      console.log(`  template embedding as the trunk builds it: relRMS `
+        + `${Math.sqrt(error / Math.max(scale, 1e-30)).toExponential(3)}`);
+      return ours;
+    },
+    templateEmbeddingUnused: (pair) => templateEmbedding({
       pair, tokens, pairMask,
       templates: dump.inputs.template_aatype.shape[0],
       templateOccupied: dump.inputs.template_atom_mask.data.some(Boolean),
@@ -324,13 +361,70 @@ async function main() {
       entityId: input("entity_id"),
       symId: input("sym_id"),
     },
-  }, weights, { swapTransposedBias: dump.model !== "alphafold3" });
+  }, weights, { swapTransposedBias: dump.model !== "alphafold3" },
+  // 🔴 WHICH BLOCK IT STARTS IN. A residual stack forty-eight deep turns one
+  // bad value into a bigger one every block, so the block where the magnitude
+  // stops looking like a representation and starts looking like a runaway is
+  // the block with the bug in it. --trace prints the largest |pair| after each,
+  // which is flat for a healthy stack.
+  process.argv.includes("--trace")
+    ? (stage, index, state) => {
+      let worst = 0;
+      let at = -1;
+      for (let k = 0; k < state.pair.length; k += 1) {
+        const value = Math.abs(state.pair[k]);
+        if (value > worst) { worst = value; at = k; }
+      }
+      const channels = state.pair.length / (tokens * tokens);
+      const j = Math.floor(at / channels) % tokens;
+      const i = Math.floor(at / channels / tokens);
+      console.log(`    ${stage} ${String(index).padStart(2)}  max|pair| `
+        + `${worst.toExponential(3)} at [${i},${j}]`);
+    }
+    : undefined);
   const elapsed = (Date.now() - started) / 1000;
 
   console.log(`${dump.model}, ${tokens} tokens, embedder + 4 MSA blocks +`
     + ` ${dump.pairformerBlocks} pairformer blocks + distogram head`
     + `  (${elapsed.toFixed(1)} s, ${model}/, ${manifest.bundle.encoding})`);
   console.log("  nothing is taken from the oracle but the featurised batch");
+  // 🔴 WHERE THE ERROR IS, NOT JUST HOW BIG. A relRMS is a single number and a
+  // single number cannot tell a trunk that is uniformly a little wrong from one
+  // that is exact except for a handful of positions that have blown up - and
+  // those are completely different bugs. On a 59-token pair one outlier of 7e4
+  // against a reference RMS of 88 carries more error energy than the whole
+  // tensor carries signal, so the shape of the distribution IS the diagnosis.
+  if (process.argv.includes("--where")) {
+    const theirs = at(`${EVO}/__call__:pair`);
+    const ours = result.pair;
+    const channels = theirs.length / (tokens * tokens);
+    const worstByToken = new Float64Array(tokens);
+    const worstByChannel = new Float64Array(channels);
+    const top = [];
+    for (let index = 0; index < theirs.length; index += 1) {
+      const error = Math.abs(ours[index] - theirs[index]);
+      const channel = index % channels;
+      const j = Math.floor(index / channels) % tokens;
+      const i = Math.floor(index / channels / tokens);
+      if (error > worstByToken[i]) worstByToken[i] = error;
+      if (error > worstByChannel[channel]) worstByChannel[channel] = error;
+      top.push({ error, i, j, channel });
+      if (top.length > 4096) { top.sort((a, b) => b.error - a.error); top.length = 12; }
+    }
+    top.sort((a, b) => b.error - a.error);
+    console.log("  where the pair error lives:");
+    for (const entry of top.slice(0, 8)) {
+      console.log(`    [${entry.i},${entry.j}] channel ${entry.channel}`
+        + `   ours ${ours[(entry.i * tokens + entry.j) * channels + entry.channel].toExponential(3)}`
+        + `   theirs ${theirs[(entry.i * tokens + entry.j) * channels + entry.channel].toExponential(3)}`);
+    }
+    const listWorst = (values, label) => {
+      const order = [...values.keys()].sort((a, b) => values[b] - values[a]).slice(0, 8);
+      console.log(`    worst ${label}: ` + order.map((k) => `${k}(${values[k].toExponential(1)})`).join(" "));
+    };
+    listWorst(worstByToken, "tokens");
+    listWorst(worstByChannel, "channels");
+  }
   report("pair", at(`${EVO}/__call__:pair`), result.pair);
   report("single", at(`${EVO}/__call__:single`), result.single);
   report("logits", at("distogram/distogram"), result.logits);

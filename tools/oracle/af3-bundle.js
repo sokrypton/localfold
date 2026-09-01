@@ -69,8 +69,22 @@ export function compare(reference, ours) {
   };
 }
 
-export const loadDump = async(name) =>
-  JSON.parse(await readFile(join(ROOT, name), "utf8"));
+/**
+ * A dump, by its conventional name or by one given on the command line.
+ *
+ * 🔴 THE OVERRIDE IS WHY THESE CHECKS CAN BE RUN ON ANYTHING. Every checker
+ * named a fixed file in the repository root, so every one of them only ever saw
+ * the dump that name happened to hold - a 12-token, 1-sequence toy in the case
+ * of the MSA stack, which is precisely the depth at which its accumulation and
+ * its coverage denominator do nothing. A bare .json argument now selects the
+ * dump, so the same check can be pointed at a real protein with a real
+ * alignment.
+ */
+export const loadDump = async(name) => {
+  const override = process.argv.slice(2).find(
+    (argument) => !argument.startsWith("--") && argument.endsWith(".json"));
+  return JSON.parse(await readFile(override ?? join(ROOT, name), "utf8"));
+};
 
 /** The dump's captured arrays, by call site, with a message that says what to run. */
 export function captures(dump, hint) {

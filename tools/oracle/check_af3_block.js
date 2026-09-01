@@ -115,7 +115,12 @@ async function main() {
   }
   // Block `index` reads what block `index - 1` wrote, so the dump must go at
   // least one block deeper than the block being checked.
-  const index = 1;
+  // 🔴 WHICH BLOCK, because this was pinned to 1 and so block 1 is the only one
+  // that has ever been checked. Every block runs the same code with a different
+  // slice of the weights, so a block that is right says nothing about a weight
+  // INDEXING error that only bites deeper in the stack - and the trunk's
+  // divergence begins around block 11, not block 1.
+  const index = Number(process.argv.find((a) => a.startsWith("--block="))?.slice(8) ?? 1);
   const at = captures(dump, `dump_af3_trunk.py --blocks ${index + 1} --float32`
     + " --capture 'trunk_pairformer/__call__$' --out af3-oracle-2block-f32.json");
   const captured = (which, call) =>

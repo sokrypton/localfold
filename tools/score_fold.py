@@ -18,7 +18,50 @@ def ca_from_text(text):
                      if l.startswith("ATOM") and l[12:16].strip() == "CA"])
 
 
+def ca_from_cif(path, chain=None):
+    """CA coordinates from an mmCIF atom_site loop.
+
+    🔴 THE AlphaFold SERVER EMITS mmCIF, NOT PDB, so a reference downloaded from
+    it cannot be read by the fixed-column parser below. The columns of an
+    atom_site loop are self-describing, which is what this reads - never assume
+    an order, because the server's differs from the PDB's.
+    """
+    header, rows, inside = [], [], False
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line.startswith("_atom_site."):
+            header.append(line.strip().split(".", 1)[1]); inside = True; continue
+        if inside and (line.startswith("#") or line.startswith("loop_")):
+            if rows:
+                break
+            inside = False; header = []; continue
+        if not header or not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        rows.append(line.split())
+    if not header:
+        raise SystemExit(f"{path} has no _atom_site loop")
+    index = {name: position for position, name in enumerate(header)}
+    for required in ("label_atom_id", "Cartn_x", "Cartn_y", "Cartn_z"):
+        if required not in index:
+            raise SystemExit(f"{path} atom_site loop has no {required}")
+    # auth_asym_id is the chain a reader means; label_asym_id is the internal one.
+    chain_key = "auth_asym_id" if "auth_asym_id" in index else "label_asym_id"
+    out = []
+    for row in rows:
+        if len(row) <= max(index.values()):
+            continue
+        if row[index["label_atom_id"]].strip('"') != "CA":
+            continue
+        if chain and row[index[chain_key]] != chain:
+            continue
+        out.append([float(row[index["Cartn_x"]]), float(row[index["Cartn_y"]]),
+                    float(row[index["Cartn_z"]])])
+    return np.array(out)
+
+
 def ca_from_file(path, chain=None):
+    if str(path).endswith(".cif"):
+        return ca_from_cif(path, chain)
     rows = []
     for line in open(path):
         if not line.startswith("ATOM") or line[12:16].strip() != "CA":

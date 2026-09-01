@@ -242,8 +242,14 @@ def main():
 
     weights = os.path.expanduser(arguments.weights
                                  or WEIGHTS[arguments.model])
+    # 🔴 num_msa IS NOT THE MSA ARRAY'S HEIGHT. AF3 pads the batch to
+    # msa_crop_size and then TRUNCATES to num_msa, so a dump's msa array can be
+    # eight rows deep while the model read one. A checker that infers depth from
+    # the array compares its own deep trunk against AF3's shallow one and
+    # reports nonsense, so the number the model actually used is recorded.
+    num_msa = 1 if alignment is None else msa_crop
     config = make_config(num_recycles=0, model=arguments.model,
-                         num_msa=1 if alignment is None else msa_crop,
+                         num_msa=num_msa,
                          num_diffusion_samples=1,
                          diffusion_steps=arguments.diffusion)
     # 🔴 AF3'S TRUNK COMPUTES IN BFLOAT16, and that sets the floor on what any
