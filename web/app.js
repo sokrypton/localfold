@@ -625,9 +625,15 @@ async function foldWithAf3(chains, signal) {
   // from framePdbs, which all carry the finished structure's pLDDT, colours the
   // whole animation and costs one ingestion of text that is already built.
   if (viewer !== undefined && viewerObject !== undefined && result.framePdbs.length > 0) {
+    // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, it is not
+    // appended after it. The last frame IS that call's output - in flow mode
+    // they agree to a fraction of an angstrom - so appending made a redundant
+    // extra frame and a play bar that ended on the same picture twice. The
+    // returned structure is the authoritative one, so it takes that slot.
+    const timeline = [...result.framePdbs.slice(0, -1), result.pdb];
     const camera = { ...viewer.viewerState };
     await loadIntoViewer({
-      stem, pdb: result.framePdbs[0],
+      stem, pdb: timeline[0],
       scores: confidenceJson(chains.join(""), result.confidence),
       pae: paeMatrix(result.confidence.predictedAlignedError, residues),
       length: residues, confidence: result.confidence,
@@ -639,18 +645,19 @@ async function foldWithAf3(chains, signal) {
     // word for a sampler call.
     const first = viewer?.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) first.name = first.label = first.title = `${mode}_0`;
-    for (const [index, pdb] of result.framePdbs.slice(1).entries()) {
+    for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);
-      frame.name = frame.label = frame.title = `${mode}_${index + 1}`;
+      const last = index === timeline.length - 2;
+      frame.name = frame.label = frame.title = last ? "final" : `${mode}_${index + 1}`;
       frame.confidence = result.confidence;
+      if (last) {
+        // The PAE rides on the frame the page lands on, so scrubbing away and
+        // back does not blank a matrix that was on screen a moment earlier.
+        frame.pae = paeMatrix(result.confidence.predictedAlignedError, residues);
+        frame.pae_n = residues;
+      }
       viewer.addFrame(frame, viewerObject);
     }
-    const frame = api.frameFromText(result.pdb);
-    frame.name = frame.label = frame.title = "final";
-    frame.confidence = result.confidence;
-    frame.pae = paeMatrix(result.confidence.predictedAlignedError, residues);
-    frame.pae_n = residues;
-    viewer.addFrame(frame, viewerObject);
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
     forcePlddtColours();
