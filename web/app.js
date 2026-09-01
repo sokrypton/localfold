@@ -624,8 +624,23 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // can see the chain split; every length below is the residue count, and a PAE
   // matrix sized from the wrong one is silently the wrong shape.
   const residues = chains.join("").length;
-  const problem = af3SequenceProblem(chains.join(""));
-  if (problem !== null) throw new Error(problem);
+  // 🔴 THE PAE IS DRAWN OVER THE POLYMER, OR OVER EVERYTHING WHEN THERE IS NO
+  // POLYMER. AF3 scores tokens and a ligand is one token per heavy atom, so a
+  // mixed fold's matrix is wider than the residues the viewer draws and
+  // paeMatrix takes the top-left block. With no residues that block is empty,
+  // and an empty PAE panel for a fold that produced a real one is a bug the
+  // reader has to guess at.
+  // ...and the length reported alongside it follows the same rule, so the
+  // matrix and the label it is drawn under always agree.
+  const paeSize = (values) => (residues > 0 ? residues : Math.round(Math.sqrt(values.length)));
+  // 🔴 ONLY WHEN THERE IS A POLYMER TO CHECK. A ligand-only fold has no
+  // sequence, and af3SequenceProblem reports an empty one as "Paste a protein
+  // sequence first" - which is the right message for an empty box and the wrong
+  // one for a job that is complete without it.
+  if (chains.length > 0) {
+    const problem = af3SequenceProblem(chains.join(""));
+    if (problem !== null) throw new Error(problem);
+  }
 
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
   const calls = Number(document.getElementById("af3-count")?.value)
@@ -700,8 +715,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       scores: confidenceJson(chains.join(""), result.confidence),
       a3m: alignment,
       chainLengths: chains.map((chain) => chain.length),
-      pae: paeMatrix(result.confidence.predictedAlignedError, residues),
-      length: residues, confidence: result.confidence,
+      pae: paeMatrix(result.confidence.predictedAlignedError,
+        paeSize(result.confidence.predictedAlignedError)),
+      length: paeSize(result.confidence.predictedAlignedError),
+      confidence: result.confidence,
     });
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
@@ -718,8 +735,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       if (last) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
         // back does not blank a matrix that was on screen a moment earlier.
-        frame.pae = paeMatrix(result.confidence.predictedAlignedError, residues);
-        frame.pae_n = residues;
+        const size = paeSize(result.confidence.predictedAlignedError);
+        frame.pae = paeMatrix(result.confidence.predictedAlignedError, size);
+        frame.pae_n = size;
       }
       viewer.addFrame(frame, viewerObject);
     }
@@ -730,16 +748,28 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
   updateScoresCard(result.confidence, `${mode} · ${calls}`);
   progress(null);
-  status(`AlphaFold 3 · ${residues} residues`
-    + `${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
-    // Named, because a fold that silently ignored the ligand would otherwise
-    // report exactly this line - the residue count is the same either way.
-    + `${ligandCodes.length === 0 ? "" : ` + ${ligandCodes.join(", ")}`}`
-    + ` in ${result.seconds.toFixed(0)} s`
-    + `${result.depth > 1 ? ` · ${result.depth} MSA rows` : " · single sequence"}`
-    + ` · ${recycles + 1} pass${recycles === 0 ? "" : "es"}`
-    + ` · pLDDT ${result.meanPlddt.toFixed(1)}`
-    + ` · CA-CA ${result.geometry.caca.toFixed(2)} Å`);
+  // 🔴 BUILT FROM PARTS, because a ligand-only fold has none of the things this
+  // line used to state unconditionally: no residues, no chains, and no backbone
+  // to measure - `CA-CA NaN Å` was what it printed, which reads as a broken
+  // fold rather than as a fold with no protein in it.
+  const what = [];
+  if (residues > 0) {
+    what.push(`${residues} residues`
+      + (chains.length === 1 ? "" : ` in ${chains.length} chains`));
+  }
+  // Named, because a fold that silently ignored the ligand would otherwise
+  // report exactly the same line - the residue count is the same either way.
+  if (ligandCodes.length > 0) what.push(ligandCodes.join(", "));
+  const detail = [`in ${result.seconds.toFixed(0)} s`];
+  if (residues > 0) {
+    detail.push(result.depth > 1 ? `${result.depth} MSA rows` : "single sequence");
+  }
+  detail.push(`${recycles + 1} pass${recycles === 0 ? "" : "es"}`);
+  detail.push(`pLDDT ${result.meanPlddt.toFixed(1)}`);
+  if (Number.isFinite(result.geometry.caca)) {
+    detail.push(`CA-CA ${result.geometry.caca.toFixed(2)} Å`);
+  }
+  status(`AlphaFold 3 · ${what.join(" + ")} · ${detail.join(" · ")}`);
 }
 
 async function fold(event) {
@@ -777,7 +807,12 @@ async function fold(event) {
     let sequence = chains.join("");
     const family = modelFamily(chains.length, ligandCodes.length);
 
-    const alignmentResult = await alignmentText(chains, signal, family);
+    // 🔴 NOTHING TO ALIGN WITHOUT A POLYMER. A ligand-only fold has no sequence
+    // to search with, and the search path reports an empty one as a missing
+    // sequence - the right message for an empty box, the wrong one for a job
+    // that is already complete.
+    const alignmentResult = chains.length === 0
+      ? null : await alignmentText(chains, signal, family);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it

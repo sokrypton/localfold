@@ -83,8 +83,15 @@ export function featuriseProtein(sequence, options = {}) {
   if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
   const subsets = Math.ceil((tokens * DENSE) / QUERIES);
   const chainLengths = chains.map((chain) => chain.length);
-  const identity = chainIdentity(residueTokens, chainLengths, chains);
-  const withinChain = residueIndexPerChain(residueTokens, chainLengths);
+  // 🔴 NOT COMPUTED WHEN THERE ARE NO RESIDUES. A ligand on its own is a valid
+  // fold - AF3 accepts one - and both of these reject a zero-length sequence,
+  // rightly, because a zero-length CHAIN is a bug. There is no chain here to be
+  // wrong about: they are read only inside the polymer loop below, which does
+  // not run.
+  const identity = residueTokens === 0
+    ? null : chainIdentity(residueTokens, chainLengths, chains);
+  const withinChain = residueTokens === 0
+    ? null : residueIndexPerChain(residueTokens, chainLengths);
   // 🔴 THE LAST RESIDUE OF EVERY CHAIN TAKES AN OXT, not the last token of the
   // batch. Checked against AF3's own complex: a three-chain A/A/B dump carries
   // it on tokens 20, 41 and 62. Getting this wrong is one missing oxygen and

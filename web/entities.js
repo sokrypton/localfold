@@ -96,13 +96,12 @@ export function entitiesProblem(entities) {
     if (problem === null) continue;
     return entities.length === 1 ? problem : `Entity ${index + 1}: ${problem}`;
   }
-  // 🔴 A LIGAND CANNOT BE FOLDED ALONE. Every path below joins the polymer
-  // chains into the sequence the model is built around - the MSA, the profile
-  // and the templates are all indexed by it - and an empty one produces a batch
-  // whose every shape is consistent and whose token count is the ligand's atoms.
-  if (!entities.some((entity) => entity.type === "protein")) {
-    return "Add at least one protein - a ligand cannot be folded on its own";
-  }
+  // 🔴 A LIGAND ON ITS OWN IS A FOLD, and this used to refuse one. AF3 accepts
+  // a ligand-only job and so does the featuriser: the chain identity helpers
+  // reject a zero-length sequence, rightly, but they are only read inside the
+  // polymer loop, which does not run when there are no residues. What needed
+  // fixing was three places that assumed a polymer - the alignment guard, the
+  // PAE's size, and the superposition's CA atoms - not the entity list.
   return null;
 }
 

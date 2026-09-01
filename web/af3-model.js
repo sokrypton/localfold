@@ -90,14 +90,20 @@ export function loadAf3Weights(onProgress) {
 /** The dense slot of every alpha carbon, which frames are fitted on. */
 function alphaCarbons(batch) {
   const slots = [];
+  const predicted = [];
   for (let token = 0; token < batch.tokens; token += 1) {
     for (let atom = 0; atom < batch.dense; atom += 1) {
       const slot = token * batch.dense + atom;
       if (!batch.predDenseAtomMask[slot]) continue;
+      predicted.push(slot);
       if (atomName(batch.refAtomNameChars, slot) === "CA") slots.push(slot);
     }
   }
-  return slots;
+  // 🔴 A LIGAND HAS NO CA, and a superposition with no correspondences returns
+  // NaN coordinates rather than failing. These slots exist to take a rigid
+  // motion out of the trajectory, and any consistent set of atoms does that -
+  // so a fold with no polymer in it fits on the atoms it does have.
+  return slots.length > 0 ? slots : predicted;
 }
 
 const toPoints = (positions, count) => Array.from(

@@ -43,11 +43,18 @@ describe("entity validation", () => {
     expect(entityProblem(protein("ACDE", 999))).toMatch(/At most 20/);
   });
 
-  it("refuses a fold with no protein in it", () => {
-    // Every layer below indexes on the polymer sequence - MSA, profile,
-    // templates - and an empty one is a batch that is shaped correctly and
-    // means nothing.
-    expect(entitiesProblem([ligand("HEM")])).toMatch(/at least one protein/);
+  it("allows a ligand on its own, which AF3 does too", () => {
+    // 🔴 THIS USED TO BE REFUSED, on the assumption that every layer below
+    // indexes on a polymer sequence. It does not: the chain identity helpers
+    // reject a zero-length sequence, rightly, but they are read only inside the
+    // polymer loop, which does not run when there are no residues.
+    expect(entitiesProblem([ligand("HEM")])).toBe(null);
+    expect(expandEntities([ligand("HEM")])).toEqual({
+      chains: [], ligandCodes: ["HEM"], sequence: "",
+    });
+  });
+
+  it("still needs something to fold", () => {
     expect(entitiesProblem([])).toMatch(/Add an entity/);
   });
 
