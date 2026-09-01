@@ -189,13 +189,9 @@ unexplained. That is the next lead and it is a small one.
 
 ## Open
 
-- **The paired block is not verified against the live server.** A heteromer now
-  gets one, through `ticket/pair` with `mode=pairgreedy`
-  (`generateMmseqs2PairedMsa`), and the parser and assembly are covered by tests
-  against mocked archives - but no run against api.colabfold.com has confirmed
-  that `pair.a3m` really arrives NUL-separated per query with equal depths. That
-  is one heteromer search away. A homo-oligomer needs none of this: its unpaired
-  merge is already the paired construction.
+- **ipTM**, which is what a complex is actually judged by, is still not
+  implemented for AF3 - the confidence head emits PAE and PDE, and pTM/ipTM are
+  absent rather than approximated.
 - **The A3M parser is narrower than AF3's alphabet.** `src/input/a3m.js` rejects
   B, Z, J, O and U, which AF3 maps to D, E, X, X and C. The codes are in
   `AF3_MSA_CODES` and unreachable through that parser - for AlphaFold 2 too, so
@@ -207,6 +203,22 @@ unexplained. That is the next lead and it is a small one.
 - **Templates raise** rather than compute: the geometry features are
   unverifiable without a reference.
 - **AF3's block is still 1.09x AF2's** for strictly less work.
+
+## Pairing, as the server actually returns it
+
+`generateMmseqs2PairedMsa` posts every distinct sequence of a complex to
+`ticket/pair` as `>101, >102, ...` with `mode=pairgreedy`, and `pair.a3m` comes
+back holding one NUL-separated block per query. Confirmed live on 3RPF's two
+chains (146 and 74 residues): 9,904 rows for each, equal depth, each block
+carrying its own query and its own width, and no all-gap padding rows.
+
+The pairing is real and not merely aligned. Row 2 of both chains is
+`UniRef100_UPI00129C3066`, one 214-residue protein matching chain A over 83-209
+and chain B over 1-75 - a single partner supplying both halves, which is the
+signal the paired block exists to carry.
+
+It took 88 s for that pair, against about the same for the unpaired searches
+that run alongside it. A homomer skips this entirely.
 
 ## The weights
 
