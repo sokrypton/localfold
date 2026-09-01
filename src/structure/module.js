@@ -28,9 +28,11 @@ export class StructureModuleGpu {
     const msaChannels = input.msaChannels ?? 256;
     const structureChannels = input.structureChannels ?? 384;
     const pairChannels = input.pairChannels ?? 128;
-    // Four stages and eight iterations inside the second of them: the structure
-    // module is the longest single thing a fold does at any real length, and as
-    // one progress step it left the bar sitting still through all of it.
+    // Four stages, the second of which runs eight iterations in one command
+    // buffer. That stage is the longest single thing a fold does at any real
+    // length, and the bar does sit still through it - 27 ms at 59 residues and
+    // 119 ms at 221, which is the price of not fencing eight times to have
+    // something to report.
     const step = input.onStep ?? (() => {});
     const initialized = await withAbort(new StructureInitializeGpu(this.device).run(
       input.msaFirstRow, input.length, msaChannels, structureChannels, input.weights.initialize,
@@ -48,7 +50,14 @@ export class StructureModuleGpu {
       ipaWeights: input.weights.ipa,
       postAttentionWeights: input.weights.postAttention,
       signal: input.signal,
-      onIteration: (done, total) => step(`iteration ${done}/${total}`),
+      // 🔴 ONE STEP, ON COMPLETION, LIKE EVERY OTHER STAGE HERE. This used to
+      // report `iteration ${done}/${total}` eight times, because each iteration
+      // ended in a submit and a readback that the bar could ride on. The eight
+      // now share one command buffer - see structure/core.js - so there is no
+      // per-iteration boundary left to observe, and reporting one anyway would
+      // be counting encodes rather than work, which is the failure the
+      // pairformer's counter already had.
+      onIteration: () => step("iterations"),
     }), input.signal);
     throwIfAborted(input.signal);
     const sidechain = await withAbort(new SidechainAnglesGpu(this.device).run(

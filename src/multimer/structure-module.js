@@ -57,7 +57,14 @@ export class StructureModuleGpu {
       ipaWeights: input.weights.ipa,
       postAttentionWeights: input.weights.postAttention,
       signal: input.signal,
-      onIteration: (done, total) => step(`iteration ${done}/${total}`),
+      // 🔴 ONE STEP, ON COMPLETION, LIKE EVERY OTHER STAGE HERE. This used to
+      // report `iteration ${done}/${total}` eight times, because each iteration
+      // ended in a submit and a readback that the bar could ride on. The eight
+      // now share one command buffer - see structure/core.js - so there is no
+      // per-iteration boundary left to observe, and reporting one anyway would
+      // be counting encodes rather than work, which is the failure the
+      // pairformer's counter already had.
+      onIteration: () => step("iterations"),
     }), input.signal);
     throwIfAborted(input.signal);
     const sidechain = await withAbort(new SidechainAnglesGpu(this.device).run(

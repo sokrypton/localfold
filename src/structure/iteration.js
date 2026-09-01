@@ -122,6 +122,88 @@ export class StructurePostAttentionGpu {
     this.pipelines = pipelineCacheForDevice(device);
   }
 
+  /**
+   * Everything that is the same in every iteration, uploaded once.
+   *
+   * 🔴 run() UPLOADED ALL OF THIS EIGHT TIMES. The packed weights are the whole
+   * post-attention block - three transition matrices at 384x384 plus the norms
+   * and the affine update - and they do not change between iterations; neither
+   * do the six uniform blocks, which are literally constants. Hoisting them is
+   * what makes a single command buffer possible at all, because a queue write
+   * inside the loop would be ordered ahead of dispatches still reading the
+   * buffer it landed in.
+   */
+  async prepare(input) {
+    const packed = pack(input);
+    const [addNormalize, linear, affinePipeline] = await Promise.all([
+      this.pipelines.get("structure:add-normalize", ADD_NORMALIZE_SHADER),
+      this.pipelines.get("structure:linear", LINEAR_SHADER),
+      this.pipelines.get("structure:affine", AFFINE_SHADER),
+    ]);
+    const allocations = [];
+    const keep = (value) => { allocations.push(value); return value; };
+    const upload = (label, value, usage = GPUBufferUsage.STORAGE) =>
+      keep(this.allocator.upload(label, value, usage));
+    const linearParams = (label, weight, bias, activation, columns = input.channels) =>
+      upload(label, new Uint32Array([
+        input.length, input.channels, columns, weight, bias, activation, 0, 0,
+      ]), GPUBufferUsage.UNIFORM);
+    const elements = input.length * input.channels;
+    const allocate = (label, count, usage = GPUBufferUsage.STORAGE) =>
+      keep(this.allocator.allocate(label, count * 4, usage));
+    return {
+      addNormalize, linear, affinePipeline,
+      weights: upload("structure.weights", packed.data),
+      attentionNormParams: upload("structure.attention-norm-params", normParams(
+        input.length, input.channels, packed.offsets[0], packed.offsets[1]), GPUBufferUsage.UNIFORM),
+      transitionNormParams: upload("structure.transition-norm-params", normParams(
+        input.length, input.channels, packed.offsets[8], packed.offsets[9]), GPUBufferUsage.UNIFORM),
+      transitionParams: [
+        linearParams("structure.transition-0-params", packed.offsets[2], packed.offsets[3], 1),
+        linearParams("structure.transition-1-params", packed.offsets[4], packed.offsets[5], 1),
+        linearParams("structure.transition-2-params", packed.offsets[6], packed.offsets[7], 0),
+      ],
+      affineParams: linearParams("structure.affine-params", packed.offsets[10], packed.offsets[11], 0, 6),
+      // Scratch, reused across iterations - safe for the same reason as the
+      // IPA's: one compute pass orders the dispatches and barriers between them.
+      normalized: allocate("structure.attention-normalized", elements),
+      transition0: allocate("structure.transition-0", elements),
+      transition1: allocate("structure.transition-1", elements),
+      transition2: allocate("structure.transition-2", elements),
+      affineUpdate: allocate("structure.affine-update", input.length * 6),
+      release: () => { for (let i = allocations.length - 1; i >= 0; i -= 1) allocations[i].release(); },
+    };
+  }
+
+  /** Record one post-attention update into an open compute pass. */
+  encode(compute, input, prepared, source, attention, affine, output, affineOutput) {
+    const dispatch = (pipeline, buffers, x, y = 1) => {
+      compute.setPipeline(pipeline);
+      compute.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+      }));
+      compute.dispatchWorkgroups(x, y);
+    };
+    const { weights } = prepared;
+    const columns = Math.ceil(input.channels / TRANSITION_TILE_COLUMNS);
+    const rows = Math.ceil(input.length / TRANSITION_TILE_ROWS);
+    dispatch(prepared.addNormalize,
+      [source, attention, weights, prepared.attentionNormParams, prepared.normalized], input.length);
+    dispatch(prepared.linear,
+      [prepared.normalized, weights, prepared.transitionParams[0], prepared.transition0], columns, rows);
+    dispatch(prepared.linear,
+      [prepared.transition0, weights, prepared.transitionParams[1], prepared.transition1], columns, rows);
+    dispatch(prepared.linear,
+      [prepared.transition1, weights, prepared.transitionParams[2], prepared.transition2], columns, rows);
+    dispatch(prepared.addNormalize,
+      [prepared.normalized, prepared.transition2, weights, prepared.transitionNormParams, output], input.length);
+    dispatch(prepared.linear, [output, weights, prepared.affineParams, prepared.affineUpdate],
+      Math.ceil(6 / TRANSITION_TILE_COLUMNS), rows);
+    dispatch(prepared.affinePipeline, [affine, prepared.affineUpdate, affineOutput],
+      Math.ceil(input.length / 64));
+  }
+
   async run(input) {
     const packed = pack(input);
     const [addNormalize, linear, affinePipeline] = await Promise.all([

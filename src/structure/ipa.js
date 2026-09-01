@@ -394,6 +394,85 @@ export class InvariantPointAttentionGpu {
     }
   }
 
+  /**
+   * Scratch the encoded loop reuses across every iteration.
+   *
+   * 🔴 ALLOCATED ONCE, NOT EIGHT TIMES, AND THAT IS ONLY SAFE INSIDE ONE PASS.
+   * Dispatches recorded into a single compute pass run in order with a memory
+   * barrier between them, so iteration N+1 cannot start reading a scratch
+   * buffer before iteration N has finished writing it. Reusing these across
+   * SUBMISSIONS would not be safe, which is why they belong to the encoded path
+   * rather than to run().
+   */
+  allocateScratch(input, shared) {
+    const allocations = [];
+    const keep = (value) => { allocations.push(value); return value; };
+    const allocate = (label, elements, usage = GPUBufferUsage.STORAGE) =>
+      keep(this.allocator.allocate(label, elements * 4, usage));
+    const attentionElements = input.heads * input.length * input.length;
+    return {
+      queryScalar: allocate("ipa.query-scalar", input.length * shared.queryScalarColumns),
+      kvScalar: allocate("ipa.kv-scalar", input.length * shared.kvScalarColumns),
+      queryPointLocal: allocate("ipa.query-point-local", input.length * shared.queryPointColumns),
+      kvPointLocal: allocate("ipa.kv-point-local", input.length * shared.kvPointColumns),
+      queryPoint: allocate("ipa.query-point", input.length * input.heads * input.pointQk * 3),
+      kvPoint: allocate("ipa.kv-point",
+        input.length * input.heads * (input.pointQk + input.pointV) * 3),
+      logits: allocate("ipa.logits", attentionElements),
+      attention: allocate("ipa.attention", attentionElements),
+      features: allocate("ipa.features", input.length * shared.featureChannels),
+      release: () => { for (let i = allocations.length - 1; i >= 0; i -= 1) allocations[i].release(); },
+    };
+  }
+
+  /**
+   * Record one invariant point attention into an open compute pass.
+   *
+   * Everything is GPU-resident: `source` and `affine` are buffers the caller
+   * owns, and `output` is written in place. Nothing is uploaded and nothing is
+   * read back, which is the whole point - see the note in structure/core.js.
+   */
+  encode(compute, input, shared, scratch, source, affine, output) {
+    const { pipelines, weights, params, mask, pair } = shared;
+    const dispatch = (pipeline, buffers, x, y = 1) => {
+      compute.setPipeline(pipeline);
+      compute.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer: buffer.buffer } })),
+      }));
+      compute.dispatchWorkgroups(x, y);
+    };
+    const linearGrid = (elements, workgroupSize = 64) => {
+      const groups = Math.ceil(elements / workgroupSize);
+      return [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+    };
+    const linear = (paramsValue, result, columns) =>
+      dispatch(pipelines[1], [source, weights, paramsValue, result],
+        Math.ceil(columns / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+    linear(shared.qScalarParams, scratch.queryScalar, shared.queryScalarColumns);
+    linear(shared.kvScalarParams, scratch.kvScalar, shared.kvScalarColumns);
+    linear(shared.qPointParams, scratch.queryPointLocal, shared.queryPointColumns);
+    linear(shared.kvPointParams, scratch.kvPointLocal, shared.kvPointColumns);
+    dispatch(pipelines[2], [scratch.queryPointLocal, affine, shared.qPointTransformParams, scratch.queryPoint],
+      Math.ceil(scratch.queryPoint.byteLength / 4 / 3 / 64));
+    dispatch(pipelines[2], [scratch.kvPointLocal, affine, shared.kvPointTransformParams, scratch.kvPoint],
+      Math.ceil(scratch.kvPoint.byteLength / 4 / 3 / 64));
+    const attentionElements = input.heads * input.length * input.length;
+    const logitsGrid = linearGrid(attentionElements);
+    dispatch(pipelines[3],
+      [scratch.queryScalar, scratch.kvScalar, scratch.queryPoint, scratch.kvPoint, pair, mask, weights, params,
+        scratch.logits], logitsGrid[0], logitsGrid[1]);
+    dispatch(pipelines[4], [scratch.logits, params, scratch.attention], input.heads * input.length);
+    dispatch(pipelines[5], [scratch.attention, scratch.kvScalar, params, scratch.features],
+      Math.ceil(input.length * input.heads * input.scalarV / 64));
+    dispatch(pipelines[6], [scratch.attention, scratch.kvPoint, affine, params, scratch.features],
+      Math.ceil(input.length * input.heads * input.pointV / 64));
+    dispatch(pipelines[7], [scratch.attention, pair, params, scratch.features],
+      Math.ceil(input.length * input.heads * input.pairChannels / 64));
+    dispatch(pipelines[1], [scratch.features, weights, shared.outputParams, output],
+      Math.ceil(input.channels / TRANSITION_TILE_COLUMNS), Math.ceil(input.length / TRANSITION_TILE_ROWS));
+  }
+
   async run(input) {
     const shared = input.prepared ?? await this.prepare(input);
     const ownsShared = input.prepared === undefined;
