@@ -109,6 +109,9 @@ function packPairLogitsWeights(weights) {
   return { data, offsets };
 }
 
+/** Packed per-block weights, tied to the block object's own lifetime. */
+const packedCache = new WeakMap();
+
 export class Af3PairformerStackGpu {
   constructor(device) {
     this.device = device;
@@ -280,7 +283,15 @@ export class Af3PairformerStackGpu {
       blockAllocations.push(allocation);
       return allocation;
     };
-    const packedPair = packPairTrackWeights(block);
+    // 🔴 PACKED ONCE PER BLOCK, EVER. Concatenating a block's tensors into one
+    // Float32Array does not depend on anything but the block, and the block
+    // objects live for the life of the page - so doing it inside the encode
+    // loop meant redoing 35 ms of CPU work on every pass, every recycle and
+    // every fold, in between GPU submissions where it stalls the encoding
+    // rather than overlapping anything. A WeakMap keeps it tied to the block's
+    // own lifetime, so nothing is held after the weights are dropped.
+    const packedPair = packedCache.get(block)
+      ?? packedCache.set(block, packPairTrackWeights(block)).get(block);
     const pairTrackWeights = {
       outgoing: upload("w.tri.out", packedPair.outgoing),
       incoming: upload("w.tri.in", packedPair.incoming),

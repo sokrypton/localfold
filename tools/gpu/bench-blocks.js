@@ -42,6 +42,9 @@ function option(args, name, fallback) {
 const LENGTH = 59;
 
 export async function main(device, args) {
+  for (const flag of ["TRICONTRACT","TRIPROJECT","TRIOUT","TRINORM","GNORM","GBIAS","GPROJ","GATT","GOUT","TRANS","ADD","SINGLE"]) {
+    globalThis["__SKIP_" + flag] = args.includes("--skip-" + flag.toLowerCase());
+  }
   const repeats = Number(option(args, "repeats", "2"));
   // 🔴 REAL WEIGHTS, SYNTHETIC ACTIVATIONS, AND THAT IS SOUND FOR A TIMING
   // MEASUREMENT. The stack fixture's own activations are not checked in - only
@@ -96,9 +99,13 @@ export async function main(device, args) {
     previousSingle: new Float32Array(LENGTH * 384),
   };
 
-  // 🔴 THE FIRST RUN COMPILES THE PIPELINES, so it is not the number wanted.
-  // The best of the rest is reported: a slow run means something else had the
-  // device, a fast one cannot be faster than the work.
+  // 🔴 INTERLEAVED, IN ONE PROCESS, AND REPORTED AS A MEDIAN. This machine
+  // drifts by up to 3.2x between runs, so two numbers from two invocations
+  // cannot be compared at all - a difference smaller than the drift is noise
+  // wearing a result's clothes. A and B alternate inside one process and the
+  // medians are compared.
+  //
+  // The first pass also compiles every pipeline, so it is discarded.
   const af2 = [];
   const af3 = [];
   const msa = [];
@@ -114,7 +121,11 @@ export async function main(device, args) {
     af3.push(timings.pairformer);
     msa.push(timings["msa-stack"]);
   }
-  const best = (values) => Math.min(...values);
+  const median = (values) => {
+    const sorted = [...values].sort((x, y) => x - y);
+    return sorted[Math.floor(sorted.length / 2)];
+  };
+  const best = median;
 
   const af2Block = best(af2) / blockWeights.length;
   const af3Block = best(af3) / 48;
