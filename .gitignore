@@ -55,3 +55,4 @@ __pycache__/
 # The full AF3 export, including the diffusion and confidence heads.
 /model-af3-full-f32
 /model-af3-full
+/model-af3-int5

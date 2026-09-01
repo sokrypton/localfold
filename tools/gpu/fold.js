@@ -134,7 +134,10 @@ export async function main(device, args) {
       + `   ${(quant.bits + (quant.mode === "sym" ? 16 : 32) / quant.group).toFixed(2)}`
       + ` bits/weight`);
   }
-  const store = await openAf3Store(undefined, quant);
+  // --model points at an exported directory; the int5 one is packed on disk
+  // rather than round-tripped at load, so it is the real thing.
+  const model = option(args, "model", "/model-af3-full-f32/manifest.json");
+  const store = await openAf3Store(model, quant);
   const weights = await trunkWeights(store, blocks, 4);
   const diffusion = await diffusionWeights(store);
   const confidence = await confidenceWeights(store);

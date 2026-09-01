@@ -21,7 +21,11 @@
  * stride, which produces not an error but a different protein.
  */
 
-const BYTES = { float32: 4, float16: 2, int8: 1 };
+const BYTES = { float32: 4, float16: 2, int8: 1, int5: 1 };
+
+// 32 five-bit codes are exactly 160 bits, so a group is exactly 20 bytes and no
+// group straddles another. That is why the AF3 export uses group 32.
+const INT5_GROUP_BYTES = 20;
 
 /**
  * A typed-array view, copying first when the offset is not aligned to it.
@@ -56,11 +60,18 @@ export function tensorByteLength(record) {
   const width = BYTES[record.dtype];
   if (width === undefined) throw new Error(`unsupported tensor dtype ${record.dtype}`);
   const elements = tensorElements(record);
-  if (record.dtype !== "int8") return elements * width;
+  if (record.dtype !== "int8" && record.dtype !== "int5") return elements * width;
   const { block, scaleOffset, byteOffset = 0 } = record;
-  if (!Number.isInteger(block) || block <= 0) throw new Error("int8 tensor has no block size");
-  if (!Number.isInteger(scaleOffset)) throw new Error("int8 tensor has no scale offset");
-  return (scaleOffset - byteOffset) + Math.ceil(elements / block) * 2;
+  if (!Number.isInteger(block) || block <= 0) {
+    throw new Error(`${record.dtype} tensor has no block size`);
+  }
+  if (!Number.isInteger(scaleOffset)) {
+    throw new Error(`${record.dtype} tensor has no scale offset`);
+  }
+  const groups = Math.ceil(elements / block);
+  // int5 carries a zero point per group as well as a scale.
+  const trailing = record.dtype === "int5" ? groups * 4 : groups * 2;
+  return (scaleOffset - byteOffset) + trailing;
 }
 
 /**
@@ -93,6 +104,43 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     // which is noise. tools/quantize_model.py has the numbers.
     for (let index = 0; index < elements; index += 1) {
       output[index] = codes[index] * scales[(index / block) | 0];
+    }
+    return output;
+  }
+
+  if (record.dtype === "int5") {
+    const { block } = record;
+    const base = record.byteOffset ?? 0;
+    const scaleAt = byteOffset + (record.scaleOffset - base);
+    const zeroAt = byteOffset + (record.zeroOffset - base);
+    if (!Number.isInteger(record.zeroOffset)) {
+      throw new Error("int5 tensor has no zero offset; it is asymmetric and needs one");
+    }
+    if (typeof Float16Array !== "function") {
+      throw new Error("this runtime has no Float16Array, and the model scales are float16");
+    }
+    const groups = Math.ceil(elements / block);
+    const codes = new Uint8Array(buffer, byteOffset,
+                                 groups * INT5_GROUP_BYTES + 1);
+    const scales = view(Float16Array, buffer, scaleAt, groups);
+    const zeros = view(Float16Array, buffer, zeroAt, groups);
+    const output = new Float32Array(elements);
+    // 🔴 ASYMMETRIC: a code is an offset from the group's zero point, not a
+    // multiple of its scale. Reading it as symmetric loses the zero and shifts
+    // every group by its own low value - which stays finite, stays smooth, and
+    // is a different model.
+    //
+    // 🔴 A CODE NEVER SPANS MORE THAN TWO BYTES. Five bits starting at bit
+    // offset at most 7 ends by bit 12, so two bytes always suffice - and the
+    // packer leaves one byte of slack so the last code of a tensor can take its
+    // second byte without walking off the buffer.
+    for (let index = 0; index < elements; index += 1) {
+      const group = (index / block) | 0;
+      const bit = (index % block) * 5;
+      const at = group * INT5_GROUP_BYTES + (bit >> 3);
+      const pair = codes[at] | (codes[at + 1] << 8);
+      const code = (pair >> (bit & 7)) & 31;
+      output[index] = code * scales[group] + zeros[group];
     }
     return output;
   }
