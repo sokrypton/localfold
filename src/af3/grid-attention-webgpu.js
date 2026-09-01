@@ -40,7 +40,30 @@ const ORDER = [
   "qProjection", "kProjection", "vProjection", "gatingQuery", "outputProjection",
 ];
 
-export function packGridAttentionWeights(weights) {
+/**
+ * 🔴 q, k AND THE GATE ARE TRANSPOSED INTO v'S LAYOUT WHEN THEY ARE PACKED, and
+ * it is a memory-coalescing change rather than a mathematical one. AF3 stores
+ * them as (out, channels), so the projection read them at
+ * `local * CHANNELS + c` - consecutive threads reading addresses 128 floats
+ * apart, which a GPU cannot coalesce into one transaction. v was already
+ * (channels, out) and read at `c * WIDTH + local`, where consecutive threads
+ * read consecutive addresses.
+ *
+ * Storing all four the same way makes every read in that loop coalesced. This
+ * is the AF2 habit of packing weights in the layout the kernel wants rather
+ * than the layout the checkpoint happens to use.
+ */
+const TRANSPOSED = new Set(["qProjection", "kProjection", "gatingQuery"]);
+
+function transposeOutChannels(values, channels, width) {
+  const out = new Float32Array(values.length);
+  for (let o = 0; o < width; o += 1) {
+    for (let c = 0; c < channels; c += 1) out[c * width + o] = values[o * channels + c];
+  }
+  return out;
+}
+
+export function packGridAttentionWeights(weights, shape = undefined) {
   const offsets = {};
   let total = 0;
   for (const name of ORDER) {
@@ -49,7 +72,14 @@ export function packGridAttentionWeights(weights) {
     total += weights[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of ORDER) data.set(weights[name], offsets[name]);
+  const width = (shape?.width) ?? weights.heads * weights.dimension;
+  for (const name of ORDER) {
+    const values = weights[name];
+    const channels = values.length / width;
+    data.set(TRANSPOSED.has(name) && Number.isInteger(channels)
+      ? transposeOutChannels(values, channels, width)
+      : values, offsets[name]);
+  }
   return { data, offsets };
 }
 
@@ -170,11 +200,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var gate_total = 0.0;
   for (var c = 0u; c < CHANNELS; c += 1u) {
     let x = act[c];
-    // q, k and the gate are stored (out, channels); v is (channels, out).
-    q_total += x * weights[W_Q + local * CHANNELS + c];
-    k_total += x * weights[W_K + local * CHANNELS + c];
-    gate_total += x * weights[W_GATE + local * CHANNELS + c];
-    v_total += x * weights[W_V + c * WIDTH + local];
+    // All four are (channels, out) now - see packGridAttentionWeights - so
+    // consecutive threads read consecutive addresses.
+    let base = c * WIDTH + local;
+    q_total += x * weights[W_Q + base];
+    k_total += x * weights[W_K + base];
+    gate_total += x * weights[W_GATE + base];
+    v_total += x * weights[W_V + base];
   }
   let index = row * WIDTH + local;
   q[index] = q_total;
@@ -185,75 +217,82 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // One workgroup per (row, i, head): softmax over that row's j, then the
   // weighted sum of v.
+  // 🔴 AF2'S ATTENTION KERNEL, REWRITTEN AGAINST AF3'S OWN BINDINGS. AlphaFold
+  // 2's triangle attention and this are the same operation, and AF2's kernel is
+  // a tuned flash one; the version here was naive, and measured at 88% of the
+  // whole pairformer - removing it took 48 blocks from 3084 ms to 358 ms.
+  //
+  // What it used to do, per (row, query, head): one 64-thread WORKGROUP - so
+  // 18,496 of them at 68 tokens - four separate passes over the keys through
+  // workgroup memory, two barrier-heavy tree reductions for the softmax, scalar
+  // loads, and half the lanes idle in the output loop because the head
+  // dimension is 32 and the workgroup is 64.
+  //
+  // What it does now, taking AF2's principles rather than its code:
+  //
+  //   ONE THREAD PER QUERY, not one workgroup. The dispatch is
+  //   ceil(N/64) x N x heads, so a 68-token block launches 544 workgroups.
+  //   THE SOFTMAX IS ONLINE. A running max and sum are rescaled as each key
+  //   arrives, so the keys are read ONCE instead of four times and no
+  //   workgroup memory or barrier is needed at all.
+  //   THE ACCUMULATOR LIVES IN REGISTERS, as vec4s, unrolled at generation
+  //   time - which is also why the loads are vectorised.
+  //
+  // 🔴 REWRITTEN RATHER THAN REUSED, deliberately. AF2's kernel takes a uniform
+  // for its shape, folds the 1/sqrt(d) scale into the query projection, and
+  // multiplies by the gate itself; AF3 has those as compile-time constants, in
+  // the attend pass, and in the output projection. Binding AF2's shader in here
+  // meant moving all three, and that adapter was wrong in a way that cost more
+  // to find than this took to write. Nothing outside this shader changed.
+  const vectors = dimension / 4;
+  const unroll = (body) => Array.from({ length: vectors }, (_, t) => body(t)).join("\n");
   const attend = `${common}
-@group(0) @binding(0) var<storage, read> q: array<f32>;
-@group(0) @binding(1) var<storage, read> k: array<f32>;
-@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
-@group(0) @binding(5) var<storage, read_write> gathered: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gathered: array<vec4<f32>>;
 
-var<workgroup> logits: array<f32, ${n}>;
-var<workgroup> reduce: array<f32, 64>;
+const HD4: u32 = ${vectors}u;
 
 @compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) group: vec3<u32>,
-        @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let slot = group.x + group.y * GRID_WIDTH;
-  if (slot >= N * N * HEADS) { return; }
-  let head = slot % HEADS;
-  let i = (slot / HEADS) % N;
-  let row = slot / (HEADS * N);
-  let local = local_id.x;
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let i = id.x;
+  let row = id.y;
+  let head = id.z;
+  if (i >= N || row >= N || head >= HEADS) { return; }
 
-  let query_base = (row * N + i) * WIDTH + head * DIMENSION;
-  for (var j = local; j < N; j += 64u) {
-    let key_base = (row * N + j) * WIDTH + head * DIMENSION;
-    var dot = 0.0;
-    for (var d = 0u; d < DIMENSION; d += 1u) {
-      dot += q[query_base + d] * k[key_base + d];
-    }
+  // vec4 units: WIDTH and DIMENSION are both multiples of four, so a head's
+  // slice starts on a vector boundary.
+  let q_base = ((row * N + i) * HEADS + head) * HD4;
+${unroll((t) => `  let qv${t} = q[q_base + ${t}u];`)}
+${unroll((t) => `  var acc${t} = vec4<f32>(0.0);`)}
+  var running_max = -3.0e38;
+  var running_sum = 0.0;
+
+  for (var j = 0u; j < N; j += 1u) {
+    let k_base = ((row * N + j) * HEADS + head) * HD4;
+    var score = 0.0;
+${unroll((t) => `    score += dot(qv${t}, k[k_base + ${t}u]);`)}
     // The KEY's mask, transposed with the activation.
     let masked = mask[${transpose ? "j * N + row" : "row * N + j"}];
-    var value = dot * SCALE + bias[head * PAIRS + i * N + j];
-    if (masked <= 0.0) { value = value - 1.0e9; }
-    logits[j] = value;
-  }
-  workgroupBarrier();
+    var logit = score * SCALE + bias[head * PAIRS + i * N + j];
+    if (masked <= 0.0) { logit = logit - 1.0e9; }
 
-  var local_max = -3.0e38;
-  for (var j = local; j < N; j += 64u) { local_max = max(local_max, logits[j]); }
-  reduce[local] = local_max;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce[local] = max(reduce[local], reduce[local + stride]); }
-    workgroupBarrier();
+    // 🔴 THE RUNNING MAXIMUM IS WHY ONE PASS IS ENOUGH. Everything already
+    // accumulated is rescaled by exp(old - new) whenever a larger logit
+    // arrives, which is algebraically the same as subtracting the final maximum
+    // at the end - and is what removes three passes over the keys.
+    let new_max = max(running_max, logit);
+    let previous = exp(running_max - new_max);
+    let weight = exp(logit - new_max);
+    running_sum = running_sum * previous + weight;
+    running_max = new_max;
+${unroll((t) => `    acc${t} = acc${t} * previous + weight * v[k_base + ${t}u];`)}
   }
-  let largest = reduce[0];
-  workgroupBarrier();
 
-  var local_sum = 0.0;
-  for (var j = local; j < N; j += 64u) {
-    let weight = exp(logits[j] - largest);
-    logits[j] = weight;
-    local_sum += weight;
-  }
-  reduce[local] = local_sum;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce[local] += reduce[local + stride]; }
-    workgroupBarrier();
-  }
-  let total = reduce[0];
-  workgroupBarrier();
-
-  for (var d = local; d < DIMENSION; d += 64u) {
-    var sum = 0.0;
-    for (var j = 0u; j < N; j += 1u) {
-      sum += logits[j] * v[(row * N + j) * WIDTH + head * DIMENSION + d];
-    }
-    gathered[(row * N + i) * WIDTH + head * DIMENSION + d] = sum / total;
-  }
+${unroll((t) => `  gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
 }`;
 
   // Gate, project down, and undo the transpose so the residual lands on the
@@ -367,7 +406,7 @@ export class Af3GridSelfAttentionGpu {
             binding, resource: { buffer: allocation.buffer },
           })),
         }));
-        pass.dispatchWorkgroups(groups[0], groups[1]);
+        pass.dispatchWorkgroups(groups[0], groups[1], groups[2] ?? 1);
         pass.end();
       };
 
@@ -376,8 +415,9 @@ export class Af3GridSelfAttentionGpu {
       runPass("bias", bias, [normalized, weightBuffer, biasBuffer],
               linear2d(Math.ceil(pairs / 64)));
       runPass("project", project, [normalized, weightBuffer, q, k, v, gate], linear2d(pairs));
+      // One thread per (query, row, head) - see the note on the kernel.
       runPass("attend", attend, [q, k, v, biasBuffer, maskBuffer, gathered],
-              linear2d(pairs * heads));
+              [Math.ceil(n / 64), n, heads]);
       runPass("project-out", projectOut, [gathered, gate, weightBuffer, output], linear2d(pairs));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * channels * 4);
 

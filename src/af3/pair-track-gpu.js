@@ -145,10 +145,12 @@ export function encodePairTrack(context) {
     // 🔴 THE GRID TRACK'S HEAD COUNT, not the single track's. They differ, 4
     // against 16, and the shader's bounds check makes the wrong one correct but
     // oversubscribed.
-    const perSlot = spread(pairs * gridHeads);
+    //
+    // One thread per (query, row, head), which is ceil(N/64) x N x heads
+    // workgroups - see the note on the attend kernel.
     run("grid.attend", p("attend"),
         [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[5]],
-        perSlot[0], perSlot[1]);
+        ceil(n, 64), n, gridHeads);
     run("grid.project-out", p("project_out"), [scratch[5], scratch[4], w, scratch[6]],
         perPair[0], perPair[1]);
     addPair(scratch[6]);
