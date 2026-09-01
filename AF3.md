@@ -272,6 +272,13 @@ the zip, which is what makes this comparison clean - no MMseqs2 in the loop.
 217 of 220 CA within one angstrom. 6MRR is unchanged at 0.76 A, because a
 single-sequence fold always had one row.
 
+Through the page, with ColabFold's own MSAs rather than the server's: the same
+complex reaches **pLDDT 94.4**, against 62.6 before.
+
+🔴 AND IT NOW COSTS WHAT AN MSA COSTS: 227 s against 84 s, because the MSA stack
+has 512 rows to work on instead of one. The old number was cheap because it was
+not doing the work. `--max-msa` trades this back if a fold has to be quick.
+
 ### Templates are not the difference
 
 The server scores the same with them off, so do not implement templates to
