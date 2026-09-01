@@ -198,6 +198,28 @@ That split is why there are two vendored py2Dmol bundles. `index.html` loads `we
 
 `dev.html` is a kernel diagnostic and is not part of either page.
 
+🔴 **THE SELECTION PANEL IS THE BUNDLE'S NOW, AND THIS PAGE CARRIED A COPY OF
+IT.** Two hundred and eighty-four lines of markup, pasted from py2Dmol's
+`index.html` — a second copy of a panel that grows rows, which is exactly the
+kind of copy this page exists not to make. py2Dmol builds it from
+`parts/panel.js` at runtime, so `index.html` carries one `<div
+id="selectionPanelMount">` and the bundle supplies the rows, the wiring and the
+stylesheet. Measured on the real page: the panel comes up hidden, opens on a
+selection reading "3 residues", its SSE menu reads the structure back, and a
+colour reaches the object — as a 340px card, identical to py2Dmol's own page,
+because this page's layout is that page's.
+
+The vendored `py2Dmol.app.css` went with it: forty-six selection rules moved out
+of py2Dmol's `src/app/style.css` and into the bundle, so a stale copy here would
+have styled the panel twice. **It is a straight copy of that file now** — the one
+local patch it used to carry, `box-sizing` and 948px on the canvas container, was
+upstreamed.
+
+`single.html` deliberately has none of this: it calls `py2Dmol.show` with `play:
+true` and no `controls`, which is the play-bar-only shell, and its control column
+is hidden. Asking for the panel there means asking for `controls: true`, which
+brings the Style panel, Capture and Orient with it.
+
 Styling: `web/localfold.css` holds only what LocalFold adds to py2Dmol's page, and **no rule in it uses a bare element selector**. `web/style.css` — the dark theme for the standalone pages — sets `body` and restyles `textarea, input, select` globally; loaded over py2Dmol's light application it keeps their layout while turning every text box black.
 
 Alignment depth is **508 clustered rows and 1,024 extra rows**, set in `src/input/a3m-features.js`. 508 is AlphaFold's own effective number for a templated `model_1` — it asks for 512 clusters and gives four rows to templates — and matches the left half of ColabFold's `--max-msa 512:1024`. The 1,024 is a deliberate reduction: AlphaFold's `model_1` sets `max_extra_msa: 5120`, and 1,024 is what its template-free models use and what ColabFold's preset selects to make a run cheaper. The extra-MSA stack is the most expensive part of an A3M fold, so 5120 would cost roughly five times that stack. Measured, the reduction is not visibly hurting the reference case: on the 8,076-row `test.a3m` the JavaScript clustering reaches 96.8 pLDDT against the captured AlphaFold reference's 96.625 at the same recycle — though that is a shallow alignment of a 59-residue protein, which is where a smaller `max_extra_msa` is least likely to bite. Neither value is exposed in the page; both are the defaults for every fold.
