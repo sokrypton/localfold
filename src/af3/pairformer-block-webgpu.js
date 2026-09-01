@@ -212,7 +212,11 @@ export class Af3PairformerStackGpu {
           block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
-        options.onBlock?.(index);
+        // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
+        // GPU promise, which is a microtask - so a page that only updates a
+        // progress bar here would write it and never paint it. Awaiting lets
+        // the caller hand control back to the event loop for a frame.
+        await options.onBlock?.(index);
       }
 
       const encoder = this.device.createCommandEncoder({ label: "af3-block.readback" });

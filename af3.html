@@ -99,11 +99,23 @@ AI Context: AF3 PAGE ENTRY POINT
                 <div class="fetch-row" id="fold-input-container">
                     <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
                         placeholder="Paste a protein sequence">GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE</textarea>
-                    <div class="fold-actions" style="width: 96px; min-width: 96px; max-width: 96px; flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px;">
-                        <button id="predict" class="btn btn-primary" style="width: 100%; height: 32px; justify-content: center; font-size: 13px;">
-                            <i class="fa-solid fa-cubes"></i>
-                            <span>Fold</span>
-                        </button>
+                    <!-- 🔴 THREE CONTROLS OF ONE SIZE. They were a full-width
+                         button over two rows of label-plus-field, so no two of
+                         them lined up. Each row is now the same 100x28, with
+                         the label inside the column at a fixed width so the
+                         fields share an edge. -->
+                    <div class="fold-actions"
+                        style="width: 108px; min-width: 108px; max-width: 108px; flex: 0 0 108px; display: flex; flex-direction: column; gap: 6px;">
+                        <!-- The empty span matches the labels below it, so all
+                             three controls share a left and a right edge. -->
+                        <div style="display: flex; align-items: center; gap: 4px;">
+                            <span style="width: 32px;"></span>
+                            <button id="predict" class="btn btn-primary"
+                                style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; justify-content: center; font-size: 13px;">
+                                <i class="fa-solid fa-cubes"></i>
+                                <span>Fold</span>
+                            </button>
+                        </div>
                         <!-- THE ONLY DIAL THAT CHANGES THE TIME. Diffusion is
                              97% of a fold and is linear in this number, and so
                              is the animation: every step is a frame.
@@ -116,21 +128,22 @@ AI Context: AF3 PAGE ENTRY POINT
                              connected. 200 steps gives 0.66 A, which is 0.01 A
                              for four times the wait, so 40 is the default and
                              the higher settings are there to be disbelieved. -->
-                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-                            <label for="steps" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Steps</label>
-                            <select id="steps" style="height: 24px; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
-                                <option value="20">20</option>
-                                <option value="40" selected>40</option>
+                        <label style="display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 500; color: #64748b;">
+                            <span style="width: 32px;">Steps</span>
+                            <select id="steps"
+                                style="flex: 1 1 auto; width: 100%; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; cursor: pointer; text-align: center;">
+                                <option value="20" selected>20</option>
+                                <option value="40">40</option>
                                 <option value="80">80</option>
                                 <option value="160">160</option>
                                 <option value="320">320</option>
                             </select>
-                        </div>
-                        <div style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-                            <label for="seed" style="font-size: 11px; font-weight: 500; color: #64748b; margin: 0;">Seed</label>
-                            <input id="seed" type="number" value="20260831"
-                                style="width: 74px; height: 24px; padding: 0 3px; font-size: 11px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; text-align: center;">
-                        </div>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 4px; margin: 0; font-size: 11px; font-weight: 500; color: #64748b;">
+                            <span style="width: 32px;">Seed</span>
+                            <input id="seed" type="number" value="0"
+                                style="flex: 1 1 auto; width: 100%; min-width: 0; height: 28px; box-sizing: border-box; padding: 0 4px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; text-align: center;">
+                        </label>
                     </div>
                 </div>
 
@@ -141,11 +154,13 @@ AI Context: AF3 PAGE ENTRY POINT
             </div>
         </div>
 
-        <div id="mainContainer" style="width: 948px; display: flex; flex-direction: column; gap: 8px;">
+        <!-- 🔴 NOTHING HERE UNTIL FOLD IS PRESSED. An empty 480px panel saying
+             "press Fold" is a box asking to be ignored; the page is a text box
+             and a button until it has something to draw. web/af3.js unhides
+             this on the click, and empties it again on the next one. -->
+        <div id="results" hidden style="width: 948px; display: flex; flex-direction: column; gap: 8px;">
             <div id="canvasContainer" class="container-box" style="position: relative; width: 948px; min-height: 480px; padding: 0; overflow: hidden; background: #ffffff; border-radius: 8px;">
-                <div id="viewer" style="width: 100%; min-height: 480px; background: #ffffff;">
-                    <p class="viewer-empty" style="display: grid; place-items: center; height: 480px; margin: 0; color: #94a3b8; font-size: 13px;">Press Fold to predict a structure.</p>
-                </div>
+                <div id="viewer" style="width: 100%; min-height: 480px; background: #ffffff;"></div>
             </div>
 
             <!-- CA-CA IS HERE ON PURPOSE, NEXT TO pLDDT. pLDDT comes off the

@@ -25,6 +25,7 @@ import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { createStructureViewer } from "./viewer.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
 /** Where the acceptance is remembered, per browser. */
@@ -64,6 +65,50 @@ export function cleanSequence(raw) {
   }
   if (sequence.length === 0) throw new Error("Paste a protein sequence first.");
   return sequence;
+}
+
+/**
+ * The Fold button doubles as the Stop button, as it does on the other pages.
+ *
+ * 🔴 A FOLD IS MINUTES AND THERE IS NO OTHER WAY OUT OF IT. Without this the
+ * only way to abandon a 320-step run is to close the tab, which also throws
+ * away the 265 MiB the page just downloaded.
+ */
+function setFoldButton(state) {
+  const button = element("predict");
+  if (button === null) return;
+  const running = state !== "idle";
+  button.classList.toggle("btn-primary", !running);
+  button.classList.toggle("btn-danger", running);
+  button.disabled = state === "stopping";
+  button.setAttribute("aria-label", running ? "Stop prediction" : "Start prediction");
+  const icon = button.querySelector("i");
+  if (icon !== null) icon.className = running ? "fa-solid fa-stop" : "fa-solid fa-cubes";
+  const label = button.querySelector("span");
+  if (label !== null) label.textContent = running ? "Stop" : "Fold";
+}
+
+/** The seed box, where an empty field means zero and zero means zero. */
+function readSeed() {
+  const raw = element("seed")?.value ?? "";
+  const parsed = Number(raw);
+  return raw.trim() === "" || !Number.isFinite(parsed) ? 0 : Math.floor(parsed);
+}
+
+/** Nothing but the input panel, until there is something to show. */
+function showResults(visible) {
+  const panel = element("results");
+  if (panel) panel.hidden = !visible;
+}
+
+/** Forget the last fold: its structure, its numbers, and its frames. */
+function clearResults(viewer) {
+  viewer.cancelAnimations();
+  viewer.reset();
+  viewer.forgetCamera();
+  text("plddt-value", "—");
+  text("geometry-value", "—");
+  text("time-value", "—");
 }
 
 let devicePromise;
@@ -134,10 +179,29 @@ function remember() {
 }
 
 /**
- * Steps 1..N of the sampler, reported as one fraction. The trunk is given the
- * first few percent because it really does take about that share of the fold.
+ * Where the bar should be at each handover, so it runs roughly linear in TIME
+ * rather than in stages. Measured on a 68-residue chain:
+ *
+ *     input features   4.9 s   CPU, and it cannot report sub-progress
+ *     trunk            3.7 s   48 pairformer blocks, which can
+ *     diffusion        0.85 s a step
+ *
+ * 🔴 THE SHARES CANNOT BE CONSTANTS. Features and trunk are fixed costs while
+ * diffusion is not, so features are a THIRD of a 20-step fold and a fortieth of
+ * a 320-step one. A fixed split makes the bar stall on one setting and jump on
+ * the other.
+ *
+ * 🔴 AND THE FEATURE BAND IS A DEAD ZONE. buildTargetFeat is one synchronous
+ * call, so nothing can move while it runs - the bar holds at the band's start
+ * and the status line carries the explanation instead. It is the largest single
+ * thing on this page still waiting for a GPU kernel.
  */
-const TRUNK_SHARE = 0.03;
+function timeShares(steps) {
+  const features = 4.9;
+  const trunk = 3.7;
+  const total = features + trunk + 0.85 * steps;
+  return { features: features / total, trunk: (features + trunk) / total };
+}
 
 /** The dense slot of every alpha carbon, which is what the frames are fitted on. */
 function alphaCarbons(batch) {
@@ -199,31 +263,60 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
   return toPdb(batch, fitted, plddt);
 }
 
-export async function fold({ sequence, steps, seed, viewer }) {
+export async function fold({ sequence, steps, seed, viewer, signal }) {
   const batch = featuriseProtein(sequence);
   status(`Loading the model…`);
   const weights = await loadWeights();
+  // 🔴 LET THE DOWNLOAD'S LAST FRAME PAINT. The final progress callback and the
+  // reset for the fold phase were in the same task, so the bar went from
+  // whatever it had last drawn straight back to zero and never showed 100% -
+  // which reads as a download that stopped early.
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
-  status(`Running the trunk over ${batch.tokens} tokens…`);
   progress(0);
   const started = performance.now();
+  const share = timeShares(steps);
 
   const slots = alphaCarbons(batch);
   let reference = null;
   let shown = 0;
 
-  viewer.reset();
-  viewer.forgetCamera();
-
   const result = await foldBatch(await getDevice(), batch, weights, {
     steps, seed,
-    onStage: (name) => {
+    onStage: async (name, detail) => {
+      if (name === "target-feat-start") {
+        status(`Building input features for ${batch.atomCount} atoms…`);
+        // The yield is the point: what follows blocks the main thread for
+        // seconds, so the line above has to be painted before it starts.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      if (name === "target-feat") {
+        progress(share.features);
+        status(`Running the trunk over ${batch.tokens} tokens…`);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      // 🔴 THE PAIRFORMER IS THE TRUNK, as far as a progress bar is concerned:
+      // 48 blocks, and the other four stages together are a fraction of one of
+      // them. Without this the bar sat at zero for the whole trunk and then
+      // jumped, which reads as a hang.
+      if (name === "pairformer-block") {
+        // 🔴 THE TWO AWAITED CALLBACKS ARE THE ONLY PLACES A FOLD CAN BE
+        // INTERRUPTED. Everything between them is a GPU submission that has to
+        // finish, so Stop lands within one pairformer block or one diffusion
+        // step - a fraction of a second either way.
+        throwIfAborted(signal);
+        progress(share.features
+          + (share.trunk - share.features) * ((detail.index + 1) / detail.total));
+        status(`Trunk: pairformer block ${detail.index + 1} of ${detail.total}`);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
       if (name === "trunk-done") {
-        progress(TRUNK_SHARE);
+        progress(share.trunk);
         status(`Diffusing ${batch.atomCount} atoms over ${steps} steps…`);
       }
     },
     onStep: async ({ step, denoised }) => {
+      throwIfAborted(signal);
       // 🔴 `denoised` AND NOT `positions`, AND THE REASON IS THE CAMERA.
       // `positions` is the sampler's actual walk and the more literal picture
       // of diffusion - but measured over a 200-step fold its radius of gyration
@@ -252,7 +345,7 @@ export async function fold({ sequence, steps, seed, viewer }) {
       // the structure as it is now rather than parking on frame zero.
       viewer.show(shown - 1, "diffusion");
       if (shown === 1) viewer.orient();
-      progress(TRUNK_SHARE + (1 - TRUNK_SHARE) * (step / steps));
+      progress(share.trunk + (1 - share.trunk) * (step / steps));
       const elapsed = (performance.now() - started) / 1000;
       const remaining = elapsed * (steps / step - 1);
       status(`Diffusion step ${step} of ${steps}`
@@ -304,7 +397,6 @@ export async function fold({ sequence, steps, seed, viewer }) {
 
 export function start() {
   const viewer = createStructureViewer({ container: element("viewer"), frameLabel: "step" });
-  let running = false;
 
   const gate = element("terms-gate");
   const showGate = (show) => { if (gate) gate.hidden = !show; };
@@ -316,8 +408,16 @@ export function start() {
     status("Ready. Paste a sequence and press Fold.");
   });
 
+  let activeFold;
+
   element("predict")?.addEventListener("click", async () => {
-    if (running) return;
+    // A second click while a fold is running is Stop, not another fold.
+    if (activeFold !== undefined) {
+      activeFold.abort();
+      setFoldButton("stopping");
+      status("Stopping…");
+      return;
+    }
     if (!hasAccepted()) { showGate(true); return; }
     let sequence;
     try {
@@ -326,22 +426,45 @@ export function start() {
       status(error.message, true);
       return;
     }
-    running = true;
-    element("predict").disabled = true;
+
+    const controller = new AbortController();
+    activeFold = controller;
+    setFoldButton("running");
+    // 🔴 THE PREVIOUS FOLD GOES BEFORE THE NEXT ONE STARTS. Leaving it up meant
+    // the old structure and its pLDDT sat there describing nothing for the
+    // minute the new fold took, which is worse than an empty panel because it
+    // looks like an answer.
+    clearResults(viewer);
+    showResults(true);
     try {
       await fold({
         sequence,
-        steps: Number(element("steps")?.value) || 40,
-        seed: Number(element("seed")?.value) || 20260831,
+        steps: Number(element("steps")?.value) || 20,
+        // 🔴 ZERO IS A SEED, NOT A MISSING VALUE. `Number(value) || default`
+        // silently replaces it with the default, so the one seed a reader is
+        // most likely to type first would quietly fold something else.
+        seed: readSeed(),
         viewer,
+        signal: controller.signal,
       });
     } catch (error) {
       progress(null);
-      status(error.message, true);
-      throw error;
+      if (controller.signal.aborted || isAbortError(error)) {
+        // A stopped fold leaves its partial trajectory on screen: those frames
+        // are real predictions, and throwing them away would be a worse answer
+        // than keeping them. Only the numbers, which describe a structure that
+        // was never finished, are cleared.
+        text("plddt-value", "—");
+        text("geometry-value", "—");
+        text("time-value", "—");
+        status("Stopped.");
+      } else {
+        status(error.message, true);
+        throw error;
+      }
     } finally {
-      running = false;
-      element("predict").disabled = false;
+      activeFold = undefined;
+      setFoldButton("idle");
     }
   });
 

@@ -200,8 +200,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const { tokens, dense } = batch;
   const stage = (name, detail = {}) => options.onStage?.(name, detail);
 
+  // 🔴 THIS IS NOT INSTANT AND IT IS NOT ON THE GPU. buildTargetFeat is the
+  // per-atom conditioning and the conditioning atom encoder, both on the CPU,
+  // and on a 68-residue chain it is 4.9 s - LONGER THAN THE 48-BLOCK TRUNK it
+  // feeds. It is announced before it runs, and awaited, so a page can say what
+  // is happening and hand back a frame first; otherwise the main thread simply
+  // stops for five seconds with the last thing anyone was told still on screen.
+  await stage("target-feat-start");
   const targetFeat = buildTargetFeat(batch, weights.targetFeat);
-  stage("target-feat", { targetFeat });
+  await stage("target-feat", { targetFeat });
 
   const seqMask = batch.seqMask;
   const pairMask = new Float32Array(tokens * tokens);
@@ -219,6 +226,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     previousSingle: new Float32Array(tokens * 384),
   }, weights.trunk, DIALECT, {
     onStage: (name, ms) => stage("trunk", { name, ms }),
+    onPairformerBlock: (index, total) => stage("pairformer-block", { index, total }),
   });
   stage("trunk-done", { trunk });
 

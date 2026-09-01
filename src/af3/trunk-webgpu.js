@@ -124,7 +124,8 @@ export class Af3TrunkGpu {
    * @param {{embedder: object, template: object, msaBlocks: object[],
    *          pairformerBlocks: object[], distogram: object}} weights
    * @param {{swapTransposedBias: boolean}} dialect
-   * @param {{onStage?: (name: string, elapsed: number) => void}} options
+   * @param {{onStage?: (name: string, elapsed: number) => void,
+   *          onPairformerBlock?: (index: number, total: number) => void}} options
    */
   async run(input, weights, dialect, options = {}) {
     const tokens = input.tokens;
@@ -155,10 +156,20 @@ export class Af3TrunkGpu {
         tokens, sequences: input.sequences },
       weights.msaBlocks, dialect, options));
 
+    // 🔴 THE ONLY STAGE WORTH A PROGRESS BAR. The pairformer is 48 blocks and
+    // the bulk of the trunk; the other four stages are each a fraction of it,
+    // so a bar that only moved between stages would sit still for most of the
+    // wait. onBlock is reported under its own name rather than through
+    // `options`, which is passed to every sub-stack and would otherwise fire
+    // for the template's blocks too.
     const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device).run(
       { pair: msa.pair, single: embedded.single, pairMask: input.pairMask,
         seqMask: input.seqMask, tokens },
-      weights.pairformerBlocks, dialect, options));
+      weights.pairformerBlocks, dialect, {
+        ...options,
+        onBlock: (index) => options.onPairformerBlock?.(index,
+                                                        weights.pairformerBlocks.length),
+      }));
 
     const head = await stage("distogram",
       () => this.#distogram(pairformer.pair, input.pairMask, tokens, weights.distogram));
