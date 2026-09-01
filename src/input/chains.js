@@ -246,6 +246,15 @@ export function chainIdentity(totalLength, chainLengths, chainSequences = undefi
  * @returns {string}
  */
 export function mergeChainA3ms(a3mTexts) {
+  // 🔴 THIS IS AlphaFold-MULTIMER'S CONSTRUCTION, AND ONLY ITS.
+  // merge_chain_features runs _merge_homomers_dense_msa first, grouping chains
+  // by entity_id and concatenating each group along num_res, and only then
+  // block diagonalises what remains - so copies of one sequence are dense and
+  // distinct entities are block-diagonal, which is exactly what grouping by
+  // identical query and spanning the group produces here. Do not reach for it
+  // as "the paired merge": AF3 wants mergeRowAlignedChainA3ms and the AF2
+  // monomer wants mergeUnpairedChainA3ms, and the three differ only on inputs
+  // where nothing downstream will notice.
   if (!Array.isArray(a3mTexts) || a3mTexts.length === 0) {
     throw new RangeError("at least one chain A3M is required");
   }

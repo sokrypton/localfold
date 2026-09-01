@@ -24,8 +24,7 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { splitComplexA3mByChain, mergeChainA3ms, mergeUnpairedChainA3ms,
-  mergeRowAlignedChainA3ms } from "../src/input/chains.js";
+import { splitComplexA3mByChain } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -180,13 +179,13 @@ async function alignmentText(chains, signal, family) {
       // paired rows mean what they say. The monomer model has no such input, so
       // paired rows would tell it that residues of different copies coevolved,
       // and it stays with the construction it was trained for.
-      // AF3 is told which chain is which by the same relative encoding, so it
-      // reads paired rows the way multimer does. Only the AF2 monomer, which
-      // has no chain input at all, must stay block-diagonal.
-      const pairRepeatedChains = family === "multimer" || family === "af3";
+      // ...and the model itself selects the chain merge. See CHAIN_MERGES in
+      // mmseqs2-api.js: monomer block-diagonalises everything, multimer is
+      // dense within an entity and block-diagonal between, AF3 is dense
+      // throughout. They agree on a homomer and differ on a heteromer.
       const searchOptions = {
         signal,
-        pairRepeatedChains,
+        model: family,
         onProgress: ({ phase, status: state, elapsedMilliseconds }) => {
           if (signal.aborted) return;
           status(`MSA search · ${phase} (${state}) · ${(elapsedMilliseconds / 1000).toFixed(0)}s`
@@ -198,34 +197,23 @@ async function alignmentText(chains, signal, family) {
         : await generateMmseqs2ComplexMsa(chains, searchOptions);
       status(`MSA search found ${searched.depth} sequences`);
       // 🔴 AF3 WANTS THE TWO BLOCKS APART, and only the search knows them apart.
-      // Its `msa` is the paired block followed by the unpaired one - paired rows
-      // line up across chains so the model can read coevolution BETWEEN them,
-      // unpaired rows are block-diagonal. A merged A3M is only ever the second,
-      // so the merge is handed over alongside rather than instead: `text` is
-      // what the viewer draws and what AF2 folds, `blocks` is what AF3 reads.
-      // 🔴 NO SEPARATE PAIRED BLOCK, AND THAT IS NOT AN OMISSION. AF3's unpaired
-      // merge is already row-aligned - chain A's row r beside chain B's row r -
-      // so for a homo-oligomer, where every copy carries the same alignment, it
-      // IS the paired construction: mergeChainA3ms and mergeRowAlignedChainA3ms
-      // return the same rows byte for byte. Supplying both duplicates every row
-      // and spends half the budget saying everything twice, which is what made
-      // a homodimer fold worse with an MSA than without one.
+      // 🔴 NO SEPARATE PAIRED BLOCK, AND THAT IS NOT AN OMISSION. AF3's `msa` is
+      // a paired block followed by an unpaired one, but the unpaired merge is
+      // already dense - chain A's row r beside chain B's row r - so for a
+      // homo-oligomer, where every copy carries the same alignment, it IS the
+      // paired construction. Supplying both duplicates every row and spends
+      // half the budget saying everything twice, which is what made a homodimer
+      // fold worse with an MSA than without one.
       //
       // A real paired block would have to pair DIFFERENT sequences by species,
       // which needs the MMseqs2 server's pair mode; this client does not request
       // it. Until it does, `paired` stays null and AF3 does what it does with no
       // paired MSA - the query alone in that block.
-      return {
-        text: searched.a3m,
-        blocks: searched.chainA3ms === undefined ? { unpaired: searched.a3m } : {
-          paired: null,
-          // 🔴 AF3's UNPAIRED MERGE, NOT AlphaFold 2's. AF3 concatenates the
-          // chains' alignments along the TOKEN axis by row index; AF2 stacks
-          // them block-diagonally. mergeUnpairedChainA3ms is the second, and is
-          // what `text` above still uses for AF2 and for the viewer.
-          unpaired: mergeRowAlignedChainA3ms(searched.chainA3ms),
-        },
-      };
+      // ...and AF3 reads the same merged text. It used to be re-merged here,
+      // because the search returned AlphaFold 2's block-diagonal form and AF3
+      // wants the dense one; the search now returns the dense merge for every
+      // chain-aware model, so there is one alignment and no second opinion.
+      return { text: searched.a3m, blocks: { paired: null, unpaired: searched.a3m } };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);

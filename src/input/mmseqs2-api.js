@@ -1,5 +1,13 @@
 import { parseA3m } from "./a3m.js";
-import { mergeChainA3ms, mergeUnpairedChainA3ms } from "./chains.js";
+import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
+  from "./chains.js";
+
+/** How each model wants a complex's per-chain alignments merged. */
+const CHAIN_MERGES = {
+  monomer: mergeUnpairedChainA3ms,
+  multimer: mergeChainA3ms,
+  af3: mergeRowAlignedChainA3ms,
+};
 
 const DEFAULT_API_URL = "https://api.colabfold.com";
 const QUERY_ID = 101;
@@ -204,7 +212,8 @@ export async function generateMmseqs2Msa(sequenceValue,
  *
  * @param {readonly string[]} sequenceValues one sequence per physical chain
  * @param {any} [options] the options accepted by generateMmseqs2Msa, plus
- *   `pairRepeatedChains` (default true) to pair copies of one protein
+ *   `model` (default "monomer") naming which model will read the alignment,
+ *   which is what selects the chain merge - see CHAIN_MERGES
  * @returns {Promise<{a3m: string, tickets: string[], depth: number, elapsedMilliseconds: number}>}
  */
 export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
@@ -225,12 +234,31 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
   }));
   const bySequence = new Map();
   for (const [sequence, searched] of entries) bySequence.set(sequence, searched);
-  // ...`pairRepeatedChains: false` restores the block-diagonal form, so the two
-  // constructions can be folded against each other without a rebuild.
-  // ...block-diagonal unless the caller asks for pairing. The paired form is
-  // better on depth but only coherent alongside the chain masks, so it is not
-  // something a caller should get without saying so.
-  const merge = options.pairRepeatedChains === true ? mergeChainA3ms : mergeUnpairedChainA3ms;
+  // 🔴 THE MERGE IS CHOSEN BY THE MODEL THAT WILL READ IT, never by a flag
+  // describing the shape. Three models, three constructions, and each is wrong
+  // for the other two in a way nothing downstream can detect - so the caller
+  // names the model and this table is the only place the mapping lives.
+  //
+  // monomer  block-diagonal for every chain. The AF2 monomer has no chain input
+  //          at all; the +200 residue offset stands in for one, so a row
+  //          carrying two chains would claim their residues coevolved.
+  // multimer dense WITHIN an entity, block-diagonal BETWEEN entities. This is
+  //          AlphaFold-Multimer's own construction: merge_chain_features runs
+  //          _merge_homomers_dense_msa first, which groups by entity_id and
+  //          concatenates each group along num_res, and only then block
+  //          diagonalises what is left. Copies of one sequence are never block
+  //          diagonalised; distinct entities always are.
+  // af3      dense for every chain. AF3 has no block_diag anywhere in it -
+  //          merge_msa_features pads to the deepest alignment and concatenates
+  //          along the token axis, entity or not.
+  //
+  // multimer and af3 therefore agree exactly on a homomer, where there is one
+  // entity, and differ on a heteromer. That is the models differing, not us.
+  const merge = CHAIN_MERGES[options.model ?? "monomer"];
+  if (merge === undefined) {
+    throw new RangeError(`unknown model ${options.model}:`
+      + ` expected ${Object.keys(CHAIN_MERGES).join(", ")}`);
+  }
   const chainA3ms = sequences.map((sequence) => bySequence.get(sequence).a3m);
   const a3m = merge(chainA3ms);
   const alignment = parseA3m(a3m);

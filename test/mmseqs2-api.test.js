@@ -3,6 +3,8 @@ import {
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa, readTarFiles,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
+import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
+  from "../src/input/chains.js";
 
 function tar(files) {
   const chunks= [];
@@ -65,7 +67,7 @@ describe("MMseqs2 API", () => {
     const fetchImplementation = vi.fn(async() => responses.shift());
     const result = await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
       fetchImplementation, wait: async() => {}, decompress: async() => resultTar,
-      pairRepeatedChains: true,
+      model: "multimer",
     });
     expect(fetchImplementation.mock.calls.length).toBe(2);
     expect(result.tickets).toEqual(["ticket-homo"]);
@@ -76,6 +78,65 @@ describe("MMseqs2 API", () => {
     expect(parsed.sequences).toContain("AC-EAC-E");
     expect(parsed.sequences.includes("AC-E----")).toBe(false);
     expect(parsed.sequences.includes("----AC-E")).toBe(false);
+  });
+
+  it("gives each model the merge that model wants", async() => {
+    // 🔴 THE MAPPING IS PINNED, NOT THE CONTENT. All three merges return a
+    // valid A3M of the right width whose first row is the query, so handing a
+    // model the wrong one produces a fold rather than an error - which is how a
+    // homodimer came to be folded against a doubled alignment. Comparing the
+    // result against the merge functions themselves catches a swapped mapping
+    // even on an input where two of them happen to agree, which a homodimer is.
+    const run = async(model) => {
+      const responses = [
+        new Response(JSON.stringify({ status: "COMPLETE", id: "ticket-homo" })),
+        new Response(new Uint8Array([1, 2, 3])),
+      ];
+      return generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
+        fetchImplementation: async() => responses.shift(),
+        wait: async() => {}, decompress: async() => resultTar, model,
+      });
+    };
+    for (const [model, merge] of [
+      ["monomer", mergeUnpairedChainA3ms],
+      ["multimer", mergeChainA3ms],
+      ["af3", mergeRowAlignedChainA3ms],
+    ]) {
+      const result = await run(model);
+      expect(result.a3m).toBe(merge(result.chainA3ms));
+    }
+  });
+
+  it("distinguishes the three merges on a heteromer, which is where they differ", () => {
+    // A homomer cannot tell multimer from AF3: with one entity, dense-within-
+    // entity and dense-throughout are the same thing. Two entities separate
+    // them, and separate both from the monomer's block-diagonal form.
+    const a = ">q\nACDE\n>h\nAC-E\n";
+    const b = ">q\nWYWY\n>k\nW-WY\n";
+    // The monomer gives every homolog a row to itself.
+    expect(parseA3m(mergeUnpairedChainA3ms([a, b])).sequences).toContain("AC-E----");
+    // Multimer block-diagonalises BETWEEN entities, so a heteromer looks the
+    // same - copies of ONE sequence are what it would have made dense.
+    expect(parseA3m(mergeChainA3ms([a, b])).sequences).toContain("AC-E----");
+    // AF3 is dense regardless of entity: one row carries both chains' hits.
+    const af3 = parseA3m(mergeRowAlignedChainA3ms([a, b])).sequences;
+    expect(af3).toContain("AC-EW-WY");
+    expect(af3.includes("AC-E----")).toBe(false);
+  });
+
+  it("refuses a model it has no merge for", async() => {
+    let message = "no error";
+    try {
+      const responses = [
+        new Response(JSON.stringify({ status: "COMPLETE", id: "t" })),
+        new Response(new Uint8Array([1, 2, 3])),
+      ];
+      await generateMmseqs2ComplexMsa(["ACDE", "ACDE"], {
+        fetchImplementation: async() => responses.shift(),
+        wait: async() => {}, decompress: async() => resultTar, model: "af2",
+      });
+    } catch (error) { message = error.message; }
+    expect(message).toContain("unknown model af2");
   });
 
   it("is block-diagonal by default", async() => {
