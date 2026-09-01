@@ -16,4 +16,6 @@
   `tools/bundle.py` is not that stage: it emits a separate offline artifact for
   `file://`, which cannot load modules at all, and the served path never runs it.
 - Describe public shapes in JSDoc, not in a type system the runtime cannot see.
-
+- AlphaFold 3's state, costs and already-tried dead ends are in `AF3.md`.
+  Read it before touching `src/af3/`; several of its entries are things that
+  have been got wrong once already.
