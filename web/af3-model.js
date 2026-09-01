@@ -144,9 +144,9 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
  * the CPU - so nothing can move while it runs. It is the largest single thing
  * here still waiting for a GPU kernel.
  */
-function timeShares(calls) {
+function timeShares(calls, passes) {
   const features = 4.9;
-  const trunk = 3.7;
+  const trunk = 3.7 * passes;
   const total = features + trunk + 0.85 * calls;
   return { features: features / total, trunk: (features + trunk) / total };
 }
@@ -160,9 +160,9 @@ function timeShares(calls) {
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
 export async function foldAf3(options) {
-  const { sequence, mode, calls, seed, signal, device, onStatus, onProgress } = options;
+  const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
   const batch = featuriseProtein(sequence);
-  const share = timeShares(calls);
+  const share = timeShares(calls, (recycles ?? 0) + 1);
   const started = performance.now();
 
   const slots = alphaCarbons(batch);
@@ -170,10 +170,18 @@ export async function foldAf3(options) {
   let shown = 0;
 
   const result = await foldBatch(device, batch, options.weights, {
-    mode, steps: calls, seed,
+    mode, steps: calls, recycles, seed,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "target-feat-start") {
+        // 🔴 A SWEEP, NOT A NUMBER. buildTargetFeat is ONE synchronous call - 98%
+        // of it is the atom cross-attention encoder, 4.9 s of the 5 on a
+        // 68-residue chain - so there is nothing to count and nothing can move
+        // while it runs. A bar frozen at a value reads as a hang; the
+        // indeterminate state says "working, no idea how far", which is true.
+        // The real fix is a GPU kernel: Af3AtomEncoderGpu already has this
+        // shape, and porting it would remove the wait rather than dress it.
+        onProgress("waiting");
         onStatus(`Building input features for ${batch.atomCount} atoms…`);
         // The yield is the point: what follows blocks the main thread for
         // seconds, so the line above has to be painted before it starts.
@@ -185,9 +193,12 @@ export async function foldAf3(options) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
       if (name === "pairformer-block") {
-        onProgress(share.features
-          + (share.trunk - share.features) * ((detail.index + 1) / detail.total));
-        onStatus(`Trunk · pairformer block ${detail.index + 1} of ${detail.total}`);
+        // Each recycle is another whole trunk, so the trunk band is divided
+        // between them rather than replayed.
+        const done = (detail.pass + (detail.index + 1) / detail.total) / detail.passes;
+        onProgress(share.features + (share.trunk - share.features) * done);
+        onStatus(`Trunk · pass ${detail.pass + 1} of ${detail.passes}`
+          + ` · pairformer block ${detail.index + 1} of ${detail.total}`);
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
       if (name === "trunk-done") {

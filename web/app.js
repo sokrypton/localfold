@@ -42,7 +42,11 @@ const element = (id) => {
 
 const sequenceValue = () => cleanSequence(element("sequence").value);
 const recycleCount = () => Number(element("recycles").value) || 0;
-const recycleTolerance = () => Number(element("tolerance").value) || 0;
+// 🔴 THE TOLERANCE CONTROL IS GONE AND THE DRIVER'S ARGUMENT IS NOT. Early
+// stopping still works; nothing on the page sets it any more, so every fold
+// runs the passes it was asked for. element() throws on a missing id, which is
+// why this reads the DOM defensively rather than assuming the control is there.
+const recycleTolerance = () => Number(document.getElementById("tolerance")?.value) || 0;
 const randomSeed = () => {
   const input = document.getElementById("random-seed");
   if (input === null || input.value === "") return 0;
@@ -122,6 +126,10 @@ function progress(fraction) {
   }
   if (fraction === "waiting") {
     bar.dataset.state = "waiting";
+    // 🔴 THE VALUE HAS TO GO, NOT JUST THE COLOUR. A <progress> with a value is
+    // determinate however it is painted, so the sweep animated over a bar still
+    // showing the last number it was given.
+    bar.removeAttribute("value");
     return;
   }
   bar.dataset.state = "running";
@@ -447,9 +455,10 @@ function setFoldButton(state) {
  * Show the controls the chosen model actually reads, and hide the rest.
  *
  * 🔴 A CONTROL THAT IS QUIETLY IGNORED IS WORSE THAN A MISSING ONE. AF3 here
- * runs one pass over a one-row MSA, so recycles, tolerance and the alignment
- * controls do not reach it; leaving them on screen would invite someone to set
- * a recycle count and conclude the model was broken when nothing changed.
+ * folds a one-row MSA, so the alignment controls do not reach it; leaving them
+ * on screen would invite someone to set one and conclude the model was broken
+ * when nothing changed. Model, Recycles and Seed apply to every model and stay
+ * put, so the row keeps one order.
  */
 function syncModelControls() {
   const af3 = (document.getElementById("model-family")?.value ?? "auto") === "af3";
@@ -457,13 +466,14 @@ function syncModelControls() {
     const node = document.getElementById(id);
     if (node !== null) node.hidden = !af3;
   }
-  // 🔴 RESTORED, NOT JUST HIDDEN. The first version only ever SET hidden, so
-  // choosing AF3 and going back to AF2 left the page with no Recycles and no
-  // Tolerance until it was reloaded.
-  for (const id of ["recyclesGroup", "toleranceGroup"]) {
-    const node = document.getElementById(id);
-    if (node !== null) node.hidden = af3;
-  }
+  // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
+  // hidden, so choosing AF3 and going back to AF2 left the page with no
+  // Recycles until it was reloaded.
+  //
+  // 🔴 RECYCLES AND SEED ARE SHOWN FOR EVERY MODEL, so the row keeps one order
+  // whatever is chosen. AF3 recycles too - its embedder has always done
+  // `pair += prev_embedding(LayerNorm(recycled pair))`, and the loop driving it
+  // is in src/af3/fold.js.
   // The MSA groups belong to syncMode, which hides them whenever the toggle is
   // off - and it is forced off below for AF3. Setting them here as well would
   // give one pair of controls two owners that disagree.
@@ -490,6 +500,28 @@ function syncAf3Count() {
 }
 
 /**
+ * Fly to the best view of what is drawn.
+ *
+ * 🔴 py2Dmol ORIENTS DURING ITS OWN INGESTION, AND AF3 RUNS OVER THE TOP OF IT.
+ * The AF2 path loads one pass and stops, so the ingestion's orient is the last
+ * thing to touch the camera. AF3 appends a frame every call and renders each
+ * one, which lands on the camera before that orient has settled - so the first
+ * structure arrived unframed. Orienting once, after the first frame's load has
+ * resolved, is enough for the whole trajectory: every later frame is rigidly
+ * fitted to that first one, so the view stays right and never jumps mid-run.
+ */
+function orientBestView() {
+  if (viewer === undefined) return;
+  try {
+    if (window.py2dmolOrient?.orientToBestView) {
+      window.py2dmolOrient.orientToBestView(viewer, { positions: [], animate: false });
+    } else {
+      viewer.orient?.({ positions: [] });
+    }
+  } catch { /* a view is not worth losing the structure over */ }
+}
+
+/**
  * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
  *
  * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
@@ -510,6 +542,7 @@ async function foldWithAf3(chains, signal) {
   const mode = document.getElementById("af3-mode")?.value ?? "ramp";
   const calls = Number(document.getElementById("af3-count")?.value)
     || AF3_COUNTS[mode].preferred;
+  const recycles = recycleCount();
 
   status("Loading AlphaFold 3 · 0 MiB");
   const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
@@ -532,14 +565,15 @@ async function foldWithAf3(chains, signal) {
   const api = window.py2Dmol;
   let pending = Promise.resolve();
   const result = await foldAf3({
-    sequence, mode, calls, weights, device, signal,
+    sequence, mode, calls, recycles, weights, device, signal,
     seed: mode === "diffusion" ? randomSeed() : 0,
     onStatus: (text) => { if (!signal.aborted) status(text); },
     onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
     onFrame: (pdb, index) => {
       if (signal.aborted) return;
       if (index === 0) {
-        pending = loadIntoViewer({ stem, pdb, scores: { sequence }, length: sequence.length });
+        pending = loadIntoViewer({ stem, pdb, scores: { sequence }, length: sequence.length })
+          .then(orientBestView);
         return;
       }
       if (viewer === undefined || viewerObject === undefined) return;
@@ -570,6 +604,7 @@ async function foldWithAf3(chains, signal) {
   updateScoresCard(result.confidence, `${mode} · ${calls}`);
   progress(null);
   status(`AlphaFold 3 · ${sequence.length} residues in ${result.seconds.toFixed(0)} s`
+    + ` · ${recycles + 1} pass${recycles === 0 ? "" : "es"}`
     + ` · pLDDT ${result.meanPlddt.toFixed(1)}`
     + ` · CA-CA ${result.geometry.caca.toFixed(2)} Å`);
 }
@@ -835,19 +870,6 @@ const tidySequence = () => {
 };
 sequenceBox.addEventListener("blur", tidySequence);
 sequenceBox.addEventListener("paste", () => setTimeout(tidySequence, 0));
-
-// ...THE SETTINGS FOLD AWAY, the way py2Dmol's own do: same button, same
-// caret, same aria contract - a control that reveals something has to say so
-// to anything not looking at it.
-const optionsButton = element("foldOptionsButton");
-const optionsPanel = element("foldOptions");
-optionsButton.addEventListener("click", () => {
-  const open = optionsPanel.hidden;
-  optionsPanel.hidden = !open;
-  // ...and the caret follows from aria-expanded in CSS, so there is one
-  // source of truth for whether the panel is open.
-  optionsButton.setAttribute("aria-expanded", String(open));
-});
 
 const modeSelect = element("msa-mode");
 

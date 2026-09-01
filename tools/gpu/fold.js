@@ -144,6 +144,7 @@ export async function main(device, args) {
 
   const result = await foldBatch(device, batch, weights, {
     mode: option(args, "mode", "diffusion"),
+    recycles: Number(option(args, "recycles", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {

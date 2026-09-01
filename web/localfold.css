@@ -108,14 +108,6 @@
 #foldOptions select:focus,
 #foldOptions input[type="number"]:focus { outline: none; border-color: #3b82f6; }
 
-/* ...the caret turns when the panel opens, the same way theirs does, so the
-   button says which way it goes. In CSS off aria-expanded rather than by
-   swapping the glyph in script: one source of truth for "is it open". */
-#foldOptionsButton[aria-expanded="true"] #foldOptionsCaret {
-  display: inline-block;
-  transform: rotate(180deg);
-}
-
 /* EVERYTHING THAT ACTS ON THE SEQUENCE STACKS TO ITS RIGHT, so the panel is
    two rows tall instead of four. The column does not grow or shrink: the box
    beside it takes whatever is left, which is what makes the row reflow
@@ -184,7 +176,7 @@
   transform: translateX(16px);
 }
 
-#predict, #foldOptionsButton {
+#predict {
   width: 96px;
   min-width: 96px;
   max-width: 96px;

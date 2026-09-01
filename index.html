@@ -80,20 +80,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
                 placeholder="Paste a protein sequence; separate chains with :"
                 >PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK</textarea>
+              <!-- 🔴 NO Options BUTTON. The settings below are always on
+                   screen: with three models to choose between, the one control
+                   that decides what the others mean cannot be behind a
+                   disclosure. The MSA switch moves up beside Fold, which is the
+                   row it belongs to - it changes what is folded, not how. -->
               <div class="fold-actions">
                 <div class="fold-action-row">
                   <button id="predict" class="btn btn-primary">
                     <i class="fa-solid fa-cubes"></i>
                     <span>Fold</span>
                   </button>
-                  <button id="foldOptionsButton" class="btn btn-grey" type="button"
-                    aria-expanded="false" aria-controls="foldOptions"
-                    title="Folding options: alignment source, recycles and convergence tolerance">
-                    <span>Options</span>
-                    <span id="foldOptionsCaret" aria-hidden="true">&#9662;</span>
-                  </button>
-                </div>
-                <div class="fold-toggle-row">
                   <label class="switch switch-sm" title="Multiple Sequence Alignment">
                     <input type="checkbox" id="useMsaToggle">
                     <span class="slider-toggle"></span>
@@ -103,16 +100,40 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
             </div>
 
-            <!-- ...AND THE SETTINGS, folded away, in py2Dmol's own groups: a
-                 column each, a rule between them, and a title that says which
-                 question the column answers. They are defaults, and a default
-                 that is right does not need to be on screen.
+            <!-- ...AND THE SETTINGS, in py2Dmol's own groups: a column each, a
+                 rule between them, and a title that says which question the
+                 column answers.
 
                  THE ALIGNMENT INPUT IS NOT IN A COLUMN. A textarea inside one
                  sets the column's width and pushes the rule off centre; on its
                  own full-width line it takes the panel's width and the columns
                  above keep their measure. -->
-            <div class="fetch-options" id="foldOptions" hidden>
+            <div class="fetch-options" id="foldOptions">
+              <!-- 🔴 ONE ORDER FOR ALL THREE MODELS: Model, Recycles, Seed, and
+                   then whatever else the chosen model reads. Model comes first
+                   because it decides which of the rest apply; Recycles and Seed
+                   are next because every model has them. A control that moves
+                   when the model changes is a control the reader has to find
+                   again. -->
+
+              <!-- WHICH MODEL. Auto picks AF2 multimer as soon as the sequence
+                   has more than one chain, which is the only thing that
+                   distinguishes those two cases in practice; the explicit
+                   settings are there to fold the same input every way. -->
+              <div class="fetch-option-group">
+                <span class="fetch-option-title">Model</span>
+                <select id="model-family" title="Which model to fold with. Auto picks AF2 monomer or multimer by chain count.">
+                  <option value="auto" selected>Auto</option>
+                  <option value="monomer">AF2-mono</option>
+                  <option value="multimer">AF2-multi</option>
+                  <option value="af3">AF3</option>
+                </select>
+              </div>
+
+              <!-- 🔴 ALL THREE MODELS RECYCLE. AF3's embedder has always done
+                   `pair += prev_embedding(LayerNorm(recycled pair))`; what was
+                   missing was the loop driving it, which is now in
+                   src/af3/fold.js. Each recycle is another whole trunk. -->
               <div class="fetch-option-group" id="recyclesGroup">
                 <span class="fetch-option-title">Recycles</span>
                 <select id="recycles">
@@ -125,41 +146,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="24">24</option>
                 </select>
               </div>
-              <div class="fetch-option-group" id="toleranceGroup">
-                <span class="fetch-option-title">Tolerance</span>
-                <select id="tolerance" title="Stop after two or more passes when C-alpha distance change is below this value">
-                  <option value="0" selected>Off (0)</option>
-                  <option value="0.1">0.1 Å</option>
-                  <option value="0.5">0.5 Å</option>
-                  <option value="1">1.0 Å</option>
-                  <option value="2">2.0 Å</option>
-                </select>
-              </div>
+
               <div class="fetch-option-group">
                 <span class="fetch-option-title">Seed</span>
                 <input type="number" id="random-seed" value="0" min="0" max="2147483647" step="1"
-                  title="Random seed for MSA subsampling and masking (0 is default)">
+                  title="Random seed. AF2: MSA subsampling and masking. AF3: the diffusion sampler (Ramp is deterministic and ignores it).">
               </div>
 
-              <!-- WHICH SET OF WEIGHTS. Auto picks multimer as soon as the
-                   sequence has more than one chain, which is the only thing
-                   that distinguishes the two cases in practice; the explicit
-                   settings are there to fold the same input both ways. -->
-              <div class="fetch-option-group">
-                <span class="fetch-option-title">Model</span>
-                <select id="model-family" title="Which model to fold with. Auto picks AF2 monomer or multimer by chain count.">
-                  <option value="auto" selected>Auto</option>
-                  <option value="monomer">AF2-mono</option>
-                  <option value="multimer">AF2-multi</option>
-                  <option value="af3">AF3</option>
-                </select>
-              </div>
-
-              <!-- 🔴 AF3'S OWN OPTIONS, AND ONLY AF3'S. Recycles, tolerance and
-                   the alignment controls mean nothing to it - it runs one pass
-                   over a one-row MSA - so web/app.js swaps which groups are
-                   shown when the model changes rather than leaving controls on
-                   screen that are quietly ignored. -->
+              <!-- AF3'S OWN, AFTER THE SHARED ONES. web/app.js shows them with
+                   the model rather than leaving controls on screen that are
+                   quietly ignored. -->
               <div class="fetch-option-group" id="af3ModeGroup" hidden>
                 <span class="fetch-option-title">Sampler</span>
                 <select id="af3-mode" title="Ramp: deterministic, one structure, ~8 calls. Diffusion: AF3's sampler, seeded, an ensemble across seeds.">

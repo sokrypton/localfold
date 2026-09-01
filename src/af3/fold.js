@@ -19,10 +19,11 @@
  * different weight bundles of the same five shapes. It is 574 x 24 rows and has
  * no GPU kernel yet. Flagged rather than hidden.
  *
- * 🔴 ONE PASS AND ONE MSA ROW: num_recycles=0, num_msa=1. A de novo design has
- * no homologues, so for the sequences this is aimed at the MSA row IS the
- * query; a deeper one would change three arrays in featurise.js and nothing
- * here.
+ * 🔴 ONE MSA ROW: num_msa=1. A de novo design has no homologues, so for the
+ * sequences this is aimed at the MSA row IS the query; a deeper one would
+ * change three arrays in featurise.js and nothing here. Recycles ARE driven -
+ * see the loop below - and default to none, which is what the oracle dumps
+ * were made with.
  */
 import { perAtomConditioning } from "./atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
@@ -191,7 +192,8 @@ export function normalFrom(seed) {
 /**
  * @param {object} batch from featuriseProtein or an AF3 dump
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
- * @param {{mode?: "ramp"|"diffusion", steps?: number, seed?: number, blocks?: number,
+ * @param {{mode?: "ramp"|"diffusion", steps?: number, recycles?: number,
+ *          seed?: number, blocks?: number,
  *          onStage?: (name: string, detail: object) => void,
  *          onStep?: (step: object) => void}} [options]
  */
@@ -216,18 +218,36 @@ export async function foldBatch(device, batch, weights, options = {}) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
-  const trunk = await new Af3TrunkGpu(device).run({
-    tokens, sequences: 1, templates: 4, targetFeat, features: batch.features,
-    msaRows: batch.msa.subarray(0, tokens),
-    deletionMatrix: batch.deletionMatrix.subarray(0, tokens),
-    msaMask: batch.msaMask.subarray(0, tokens),
-    pairMask, seqMask,
-    previousPair: new Float32Array(tokens * tokens * 128),
-    previousSingle: new Float32Array(tokens * 384),
-  }, weights.trunk, DIALECT, {
-    onStage: (name, ms) => stage("trunk", { name, ms }),
-    onPairformerBlock: (index, total) => stage("pairformer-block", { index, total }),
-  });
+  // 🔴 RECYCLING WAS BUILT AND NEVER DRIVEN. The embedder has done
+  // `pair += prev_embedding(LayerNorm(recycled pair))` since it was written, and
+  // this ran one pass with zeros in that slot because the oracle dumps were
+  // made with num_recycles=0 and a comparison is only meaningful at the same
+  // setting. Folding is not a comparison, and AF3's own default is not zero.
+  //
+  // 🔴 THE WHOLE TRUNK RUNS AGAIN PER RECYCLE, embedder and all - that is what
+  // a recycle IS - so each one costs another full trunk. It is not a cheap
+  // refinement pass.
+  const recycles = options.recycles ?? 0;
+  const trunkGpu = new Af3TrunkGpu(device);
+  let previousPair = new Float32Array(tokens * tokens * 128);
+  let previousSingle = new Float32Array(tokens * 384);
+  let trunk;
+  for (let pass = 0; pass <= recycles; pass += 1) {
+    await stage("recycle", { pass, passes: recycles + 1 });
+    trunk = await trunkGpu.run({
+      tokens, sequences: 1, templates: 4, targetFeat, features: batch.features,
+      msaRows: batch.msa.subarray(0, tokens),
+      deletionMatrix: batch.deletionMatrix.subarray(0, tokens),
+      msaMask: batch.msaMask.subarray(0, tokens),
+      pairMask, seqMask, previousPair, previousSingle,
+    }, weights.trunk, DIALECT, {
+      onStage: (name, ms) => stage("trunk", { name, ms }),
+      onPairformerBlock: (index, total) =>
+        stage("pairformer-block", { index, total, pass, passes: recycles + 1 }),
+    });
+    previousPair = trunk.pair;
+    previousSingle = trunk.single;
+  }
   stage("trunk-done", { trunk });
 
   // 🔴 THE DIFFUSION HEAD HAS ITS OWN FIVE REFERENCE EMBEDDINGS - same shapes as
