@@ -19,7 +19,7 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 import { diffusionHead } from "../../src/af3/diffusion-reference.js";
 import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
 import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/atom-encoder-reference.js";
-import { openAf3Store } from "./af3-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
 
 const DUMP = "/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";

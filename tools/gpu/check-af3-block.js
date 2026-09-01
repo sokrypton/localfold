@@ -126,7 +126,7 @@ export async function main(device, args) {
   // input" for the single-track residual recorded in check-af3-confidence.js.
   const blocks = [];
   if (option(args, "stack", "trunk") === "confidence") {
-    const { confidenceWeights } = await import("./af3-weights.js");
+    const { confidenceWeights } = await import("../../src/af3/weights.js");
     const confidence = await confidenceWeights(store);
     for (let index = 0; index < Math.min(count, 4); index += 1) blocks.push(confidence.blocks[index]);
   } else {

@@ -1,5 +1,5 @@
 /**
- * Loading AF3's weights for the GPU checkers, over http.
+ * Loading AF3's weights, over http - for the checkers and for the page.
  *
  * The per-kernel checkers each build the one bundle they need inline, which
  * keeps them readable on their own. Anything that needs a WHOLE STAGE - the
@@ -7,7 +7,7 @@
  * the bundles are long, and a typo in one leaf name of one of them surfaces as
  * a numerical disagreement rather than a missing key.
  */
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { HttpTensorStore } from "../reference/http-tensor-store.js";
 
 export const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";

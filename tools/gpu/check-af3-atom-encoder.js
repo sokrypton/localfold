@@ -25,7 +25,7 @@
  */
 import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
-import { openAf3Store } from "./af3-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
 
 const DUMP = "/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";

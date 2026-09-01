@@ -1,7 +1,7 @@
 /**
  * The diffusion head's weight bundle, and the atom reference embeddings.
  *
- * Split from af3-weights.js because the diffusion side is a different half of
+ * Split from weights.js because the diffusion side is a different half of
  * the checkpoint - the trunk's loader is already long, and a typo in one leaf
  * name here surfaces as a numerical disagreement rather than a missing key.
  */

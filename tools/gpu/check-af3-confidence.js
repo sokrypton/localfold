@@ -12,7 +12,7 @@ import { confidenceHead, distogramFeatures } from "../../src/af3/confidence-refe
 import { linear } from "../../src/af3/pairformer-reference.js";
 import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
 import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence-webgpu.js";
-import { confidenceWeights, openAf3Store } from "./af3-weights.js";
+import { confidenceWeights, openAf3Store } from "../../src/af3/weights.js";
 
 const DIALECT = { swapTransposedBias: false };
 const DENSE = 24;

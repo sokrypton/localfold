@@ -13,7 +13,7 @@ import { Af3DiffusionConditioningGpu } from "../../src/af3/diffusion-conditionin
 import { relativeEncoding } from "../../src/af3/embedder-reference.js";
 import { layerNormSlow } from "../../src/af3/atom-encoder-reference.js";
 import { linear } from "../../src/af3/pairformer-reference.js";
-import { openAf3Store } from "./af3-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const PAIR_CHANNELS = 128;

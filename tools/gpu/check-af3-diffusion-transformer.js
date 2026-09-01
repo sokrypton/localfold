@@ -11,7 +11,7 @@
  */
 import { diffusionTransformer } from "../../src/af3/diffusion-reference.js";
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
-import { openAf3Store } from "./af3-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
 
 const TX = "diffuser/~/diffusion_head/transformer";
 const STACK = `${TX}/__layer_stack_with_per_layer/__layer_stack_with_per_layer/transformer`;

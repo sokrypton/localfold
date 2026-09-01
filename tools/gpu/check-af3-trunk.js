@@ -18,7 +18,7 @@ import { runTrunk } from "../../src/af3/trunk-reference.js";
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { binEdges as binEdgesOf } from "../../src/af3/trunk-webgpu.js";
-import { openAf3Store, trunkWeights } from "./af3-weights.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 
 const DIALECT = { swapTransposedBias: false };
 
