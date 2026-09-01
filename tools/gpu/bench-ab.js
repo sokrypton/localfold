@@ -17,7 +17,7 @@ import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 
 const LENGTH = 59;
 const FLAGS = ["TRICONTRACT", "TRIPROJECT", "TRIOUT", "TRINORM", "GNORM", "GBIAS",
-               "GPROJ", "GATT", "GOUT", "TRANS", "ADD", "SINGLE"];
+               "GPROJ", "GATT", "GOUT", "TRANS", "ADD", "SINGLE", "UPLOAD"];
 
 export async function main(device, args) {
   const which = (args.find((a) => a.startsWith("--skip=")) ?? "--skip=single").slice(7)

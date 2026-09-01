@@ -218,8 +218,15 @@ export class Af3PairformerStackGpu {
       // encoded and submitted back to back; the queue keeps them in order.
       //
       // The window exists so the queue does not grow without bound and so an
-      // abort can land, not because the memory needs it.
-      const submissionWindow = options.submissionWindow ?? 8;
+      // abort can land, not because the memory needs it - the weights are
+      // released as soon as each block is submitted, on queue ordering.
+      //
+      // 🔴 SIXTEEN IS MEASURED. Sweeping it over one 59-token stack: 1 gives
+      // 881 ms, 4 gives 662, 8 gives 622, 16 gives 609 and 48 gives 607. Each
+      // wait is a full pipeline drain, so a narrow window spends most of the
+      // stack refilling; past sixteen the curve is flat and the remaining
+      // waits are cheap insurance against an unbounded queue.
+      const submissionWindow = options.submissionWindow ?? 16;
       const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
