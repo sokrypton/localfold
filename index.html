@@ -146,11 +146,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    settings are there to fold the same input every way. -->
               <div class="fetch-option-group">
                 <span class="fetch-option-title">Model</span>
-                <select id="model-family" title="Which model to fold with. Auto picks AF2 monomer or multimer by chain count.">
-                  <option value="auto" selected>Auto</option>
+                <!-- 🔴 NO Auto, AND AF3 IS THE DEFAULT. Auto read the chain
+                     count and picked between the two AlphaFold 2 models, which
+                     silently made AF2 the default for everything and could
+                     never choose AF3 - so the newest model was the one you had
+                     to know to ask for. It also gave the page a state where
+                     what would run was not written anywhere on it. -->
+                <select id="model-family" title="Which model to fold with.">
+                  <option value="af3" selected>AF3</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
-                  <option value="af3">AF3</option>
                 </select>
               </div>
 

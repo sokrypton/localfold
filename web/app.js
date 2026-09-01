@@ -97,27 +97,22 @@ const maxMsaConfig = () => {
  * multimer was trained for - and the explicit settings exist to fold the same
  * input both ways rather than to be reached for routinely.
  */
-const modelFamily = (chainCount, ligandCount = 0) => {
-  const choice = document.getElementById("model-family")?.value ?? "auto";
+const modelFamily = (ligandCount = 0) => {
+  // 🔴 THE CHOICE IS ALWAYS EXPLICIT NOW. "Auto" used to read the chain count
+  // and pick between the two AlphaFold 2 models - which made AF2 the silent
+  // default for everything and could never choose AF3, so the newest model was
+  // the one a reader had to know to ask for. It also meant the page had a
+  // state in which what would run was written nowhere on it.
+  const choice = document.getElementById("model-family")?.value ?? "af3";
   // 🔴 A LIGAND IS AlphaFold 3 ONLY, and choosing otherwise is refused rather
   // than quietly corrected. AF2 has no ligand tokens at all, so folding a
   // complex with one under AF2 would drop it silently and return a confident
   // structure of the protein alone - which is a different answer to the
   // question that was asked, not a worse one.
-  if (ligandCount > 0) {
-    if (choice === "auto") return "af3";
-    if (choice !== "af3") {
-      throw new Error(`Ligands need AlphaFold 3; the model is set to ${choice}`);
-    }
-    return choice;
+  if (ligandCount > 0 && choice !== "af3") {
+    throw new Error(`Ligands need AlphaFold 3; the model is set to ${choice}`);
   }
-  // 🔴 EVERY EXPLICIT CHOICE PASSES THROUGH, AND THE LIST USED TO BE WRITTEN
-  // OUT. Adding AF3 to the dropdown without adding it here meant the page
-  // offered a model, accepted it, and silently folded with AF2 monomer instead
-  // - which produces a structure and a pTM and looks entirely successful. Auto
-  // is the only value that gets decided from the sequence.
-  if (choice !== "auto") return choice;
-  return chainCount > 1 ? "multimer" : "monomer";
+  return choice;
 };
 
 // 🔴 "none" IS SPELLED "single" BELOW, and the translation happens here so it
@@ -530,7 +525,7 @@ function setFoldButton(state) {
  * put, so the row keeps one order.
  */
 function syncModelControls() {
-  const af3 = (document.getElementById("model-family")?.value ?? "auto") === "af3";
+  const af3 = (document.getElementById("model-family")?.value ?? "af3") === "af3";
   for (const id of ["af3ModeGroup", "af3CountGroup"]) {
     const node = document.getElementById(id);
     if (node !== null) node.hidden = !af3;
@@ -573,7 +568,7 @@ const MAX_MSA_DEPTHS = [512, 256, 128, 64, 32, 16];
 function syncMaxMsa() {
   const select = document.getElementById("max-msa");
   if (select === null) return;
-  const af3 = (document.getElementById("model-family")?.value ?? "auto") === "af3";
+  const af3 = (document.getElementById("model-family")?.value ?? "af3") === "af3";
   const previous = Number.parseInt(select.value, 10);
   const values = MAX_MSA_DEPTHS.map((depth) => (af3 ? String(depth) : `${depth}:${depth * 2}`));
   select.replaceChildren(...values.map((value) => Object.assign(
@@ -860,7 +855,7 @@ async function fold(event) {
     let chains = request.chains;
     const ligandCodes = request.ligandCodes;
     let sequence = chains.join("");
-    const family = modelFamily(chains.length, ligandCodes.length);
+    const family = modelFamily(ligandCodes.length);
 
     // 🔴 NOTHING TO ALIGN WITHOUT A POLYMER. A ligand-only fold has no sequence
     // to search with, and the search path reports an empty one as a missing
