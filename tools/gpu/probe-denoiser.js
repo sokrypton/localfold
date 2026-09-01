@@ -28,6 +28,32 @@
  * the Fourier noise embedding into the conditioning, so the network is told
  * which rung of the schedule it is on. --sigma sets it; the default is the top
  * of the schedule, which is the rung a sampler starts from.
+ *
+ * --iterations RUNS IT AS A STRUCTURE MODULE. Feed the head's own output back in
+ * as its input, repeatedly, at a fixed sigma: no noise, no schedule, no
+ * sampling - just a fixed-point iteration, which is what AF2's structure module
+ * does with its recycles.
+ *
+ * 🔴 ITERATING AT HIGH SIGMA IS A NO-OP, AND THAT IS ARITHMETIC RATHER THAN A
+ * BUG. skip is 3.9e-5 at sigma 2560, so the input is discarded and every
+ * iteration returns the same coordinates - the network is deterministic. The
+ * feedback only means anything where skip is large: at sigma 16 it is 0.5, at
+ * sigma 4 it is 0.94, and there the call IS a residual update on the structure
+ * it was handed.
+ *
+ * 🔴 AND IT IS MUCH WORSE THAN THE SINGLE HIGH-SIGMA CALL. Measured from zeros:
+ *
+ *     sigma 2560, one call      1.39 A, gyration 11.1   (the crystal is 11.1)
+ *     sigma 16, eight rounds    9.12 -> 9.72 A, getting WORSE
+ *     sigma 4,  eight rounds    8.67 -> 6.88 A, gyration only 7.3
+ *
+ * SIGMA IS NOT A FREE PARAMETER: it is a CLAIM ABOUT THE INPUT, told to the
+ * network through the Fourier noise embedding. At sigma 4 the claim is "this
+ * structure is nearly right, correct it slightly" - and a black hole is wildly
+ * out of distribution for that claim, so the network makes small corrections to
+ * garbage forever. At sigma 2560 the claim is "this input is noise, ignore it",
+ * which zeros satisfies perfectly, and the network predicts from the trunk
+ * instead. That single call is the structure module; the loop is not.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, backboneGeometry, toPdb, normalFrom, DIALECT }
@@ -99,7 +125,16 @@ export async function main(device, args) {
   console.log(`the blend keeps ${(scale.skip * 100).toExponential(2)}% of the input`
     + ` and ${scale.out.toFixed(2)}x the network's update`);
 
-  const denoised = await new Af3DiffusionHeadGpu(device).run({
+  const iterations = Number(option(args, "iterations", "1"));
+  // 🔴 A RAMP IS NOT `iterations` AT ANOTHER SIGMA. Holding sigma fixed tells
+  // the network the same thing every round; walking it down tells the truth
+  // about an input that is getting better, which is what it was trained on.
+  const ramp = Number(option(args, "ramp", "0"));
+  const schedule = ramp > 0
+    ? Array.from(noiseLevels(ramp, {}).slice(0, ramp))
+    : new Array(iterations).fill(sigma);
+  const head = new Af3DiffusionHeadGpu(device);
+  const headInput = {
     shape: batch.shape, conditioning, atomMask: batch.predDenseAtomMask, seqMask,
     features: batch.features, targetFeat,
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
@@ -110,18 +145,39 @@ export async function main(device, args) {
     tokensToKeys: batch.tokensToKeys,
     trunkSingle: trunk.single, trunkPair: trunk.pair,
     noiseLevel: sigma, positionsNoisy,
-  }, weights.diffusion);
+  };
 
-  const geometry = backboneGeometry(batch, denoised.positions);
-  console.log(`backbone  N-CA ${geometry.nca.toFixed(2)} A (ideal 1.46)`
-    + `   CA-C ${geometry.cac.toFixed(2)} A (ideal 1.52)`
-    + `   CA-CA ${geometry.caca.toFixed(2)} A (ideal 3.80)`);
-  console.log(`radius of gyration ${geometry.gyration.toFixed(1)} A over`
-    + ` ${geometry.residues} CA   (a compact 68-mer is about 11-12 A)`);
+  const pdbs = [];
+  let geometry = null;
+  let previous = null;
+  for (let round = 1; round <= schedule.length; round += 1) {
+    headInput.noiseLevel = schedule[round - 1];
+    const denoised = await head.run(headInput, weights.diffusion);
+    // How far the structure moved, in a frame-invariant way. There is no
+    // randomAugmentation here so the frames DO line up, but a distance-matrix
+    // metric is the honest one for "has it converged" either way.
+    let moved = NaN;
+    if (previous !== null) {
+      let sum = 0;
+      for (let i = 0; i < previous.length; i += 1) {
+        sum += (denoised.positions[i] - previous[i]) ** 2;
+      }
+      moved = Math.sqrt(sum / (previous.length / 3));
+    }
+    previous = Float32Array.from(denoised.positions);
+    headInput.positionsNoisy = denoised.positions;
+    geometry = backboneGeometry(batch, denoised.positions);
+    pdbs.push(toPdb(batch, denoised.positions, null));
+    console.log(`round ${String(round).padStart(3)}`
+      + ` sigma ${schedule[round - 1].toFixed(1).padStart(8)}`
+      + `   N-CA ${geometry.nca.toFixed(2)}   CA-C ${geometry.cac.toFixed(2)}`
+      + `   CA-CA ${geometry.caca.toFixed(2)}   gyration ${geometry.gyration.toFixed(1)}`
+      + `   moved ${Number.isNaN(moved) ? "-" : moved.toFixed(3)} A`);
+  }
 
   return {
-    sequence, tokens, steps: 1, start, sigma, geometry,
+    sequence, tokens, steps: schedule.length, start, sigma, geometry,
     gyration: geometry.gyration, meanPlddt: 0, seconds: 0,
-    pdb: toPdb(batch, denoised.positions, null),
+    pdb: pdbs[pdbs.length - 1], iterationPdbs: pdbs,
   };
 }
