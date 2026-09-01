@@ -43,8 +43,7 @@
 .fold-option-wide:not(:has(> *:not([hidden]))) { display: none; }
 
 /* Keep option groups in a single row; push MSA options to the right */
-#foldOptions > .fetch-option-group,
-#af3Options > .fetch-option-group {
+#foldOptions > .fetch-option-group {
   flex-shrink: 0;
 }
 
@@ -74,16 +73,9 @@
 
 /* THE OPTION SELECTS WEAR py2Dmol'S INPUT, at the size the groups are built
    for. A browser-default select beside their bordered, rounded controls is the
-   one thing in the panel that looks bolted on.
-
-   #af3Options IS THE SAME ROW ON THE AlphaFold 3 PAGE, listed here rather than
-   given its own copy of these rules: two option rows that drift apart is the
-   failure this file's id-anchored style is meant to avoid, and af3.html has no
-   Options button to hide behind, so it cannot simply reuse the id. */
+   one thing in the panel that looks bolted on. */
 #foldOptions select,
-#foldOptions input[type="number"],
-#af3Options select,
-#af3Options input[type="number"] {
+#foldOptions input[type="number"] {
   height: 28px;
   border: 1px solid #d1d5db;
   border-radius: 6px;
@@ -93,8 +85,7 @@
   box-sizing: border-box;
 }
 
-#foldOptions select,
-#af3Options select {
+#foldOptions select {
   padding: 0 24px 0 8px;
   line-height: 1;
   cursor: pointer;
@@ -106,21 +97,16 @@
   background-repeat: no-repeat;
 }
 
-#foldOptions input[type="number"],
-#af3Options input[type="number"] {
+#foldOptions input[type="number"] {
   width: 68px;
   padding: 0 6px;
   font-family: inherit;
 }
 
 #foldOptions select:hover,
-#foldOptions input[type="number"]:hover,
-#af3Options select:hover,
-#af3Options input[type="number"]:hover { border-color: #9ca3af; }
+#foldOptions input[type="number"]:hover { border-color: #9ca3af; }
 #foldOptions select:focus,
-#foldOptions input[type="number"]:focus,
-#af3Options select:focus,
-#af3Options input[type="number"]:focus { outline: none; border-color: #3b82f6; }
+#foldOptions input[type="number"]:focus { outline: none; border-color: #3b82f6; }
 
 /* ...the caret turns when the panel opens, the same way theirs does, so the
    button says which way it goes. In CSS off aria-expanded rather than by

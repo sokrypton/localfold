@@ -27,6 +27,7 @@ import { parseA3m } from "../src/input/a3m.js";
 import { splitComplexA3mByChain } from "../src/input/chains.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
+import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
@@ -66,7 +67,12 @@ const maxMsaConfig = () => {
  */
 const modelFamily = (chainCount) => {
   const choice = document.getElementById("model-family")?.value ?? "auto";
-  if (choice === "monomer" || choice === "multimer") return choice;
+  // 🔴 EVERY EXPLICIT CHOICE PASSES THROUGH, AND THE LIST USED TO BE WRITTEN
+  // OUT. Adding AF3 to the dropdown without adding it here meant the page
+  // offered a model, accepted it, and silently folded with AF2 monomer instead
+  // - which produces a structure and a pTM and looks entirely successful. Auto
+  // is the only value that gets decided from the sequence.
+  if (choice !== "auto") return choice;
   return chainCount > 1 ? "multimer" : "monomer";
 };
 
@@ -437,6 +443,137 @@ function setFoldButton(state) {
   if (label !== null) label.textContent = running ? "Stop" : "Fold";
 }
 
+/**
+ * Show the controls the chosen model actually reads, and hide the rest.
+ *
+ * 🔴 A CONTROL THAT IS QUIETLY IGNORED IS WORSE THAN A MISSING ONE. AF3 here
+ * runs one pass over a one-row MSA, so recycles, tolerance and the alignment
+ * controls do not reach it; leaving them on screen would invite someone to set
+ * a recycle count and conclude the model was broken when nothing changed.
+ */
+function syncModelControls() {
+  const af3 = (document.getElementById("model-family")?.value ?? "auto") === "af3";
+  for (const id of ["af3ModeGroup", "af3CountGroup"]) {
+    const node = document.getElementById(id);
+    if (node !== null) node.hidden = !af3;
+  }
+  // 🔴 RESTORED, NOT JUST HIDDEN. The first version only ever SET hidden, so
+  // choosing AF3 and going back to AF2 left the page with no Recycles and no
+  // Tolerance until it was reloaded.
+  for (const id of ["recyclesGroup", "toleranceGroup"]) {
+    const node = document.getElementById(id);
+    if (node !== null) node.hidden = af3;
+  }
+  // The MSA groups belong to syncMode, which hides them whenever the toggle is
+  // off - and it is forced off below for AF3. Setting them here as well would
+  // give one pair of controls two owners that disagree.
+  const toggle = document.getElementById("useMsaToggle");
+  if (toggle !== null) {
+    toggle.disabled = af3;
+    if (af3) toggle.checked = false;
+  }
+  if (af3) syncAf3Count();
+}
+
+/** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
+function syncAf3Count() {
+  const mode = document.getElementById("af3-mode")?.value ?? "ramp";
+  const { label, values, preferred } = AF3_COUNTS[mode] ?? AF3_COUNTS.ramp;
+  const title = document.getElementById("af3-count-label");
+  if (title !== null) title.textContent = label;
+  const select = document.getElementById("af3-count");
+  if (select === null) return;
+  select.replaceChildren(...values.map((value) => Object.assign(
+    document.createElement("option"),
+    { value: String(value), textContent: String(value), selected: value === preferred })));
+  select.value = String(preferred);
+}
+
+/**
+ * One AlphaFold 3 fold, drawn into py2Dmol as it computes.
+ *
+ * 🔴 THE PANELS ARE BUILT ON THE FIRST FRAME AND THE SCORES ARRIVE ON THE LAST.
+ * AF3's confidence head does not run until the sample is finished, so unlike a
+ * recycle - which carries its own pLDDT - a trajectory frame has none. py2Dmol
+ * takes confidence PER FRAME, which is what makes this work: the early frames
+ * are loaded with none and the final structure is appended carrying the real
+ * pLDDT and PAE, and that is the frame the page lands on.
+ */
+async function foldWithAf3(chains, signal) {
+  if (chains.length > 1) {
+    throw new Error("AlphaFold 3 here folds a single chain; remove the ':' or choose AF2-multi.");
+  }
+  const sequence = chains[0] ?? "";
+  const problem = af3SequenceProblem(sequence);
+  if (problem !== null) throw new Error(problem);
+
+  const mode = document.getElementById("af3-mode")?.value ?? "ramp";
+  const calls = Number(document.getElementById("af3-count")?.value)
+    || AF3_COUNTS[mode].preferred;
+
+  status("Loading AlphaFold 3 · 0 MiB");
+  const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
+    if (signal.aborted) return;
+    progress(totalBytes === 0 ? 0 : loadedBytes / totalBytes);
+    status(`Loading AlphaFold 3 · ${(loadedBytes / 1048576).toFixed(0)}`
+      + ` / ${(totalBytes / 1048576).toFixed(0)} MiB`);
+  });
+  throwIfAborted(signal);
+
+  const device = await getDevice();
+  throwIfAborted(signal);
+
+  predictionCount += 1;
+  const header = extractFastaHeader(element("sequence").value);
+  const stem = header !== null ? safeJobName(header) : `af3_${predictionCount}`;
+  viewer = undefined;
+  viewerObject = undefined;
+
+  const api = window.py2Dmol;
+  let pending = Promise.resolve();
+  const result = await foldAf3({
+    sequence, mode, calls, weights, device, signal,
+    seed: mode === "diffusion" ? randomSeed() : 0,
+    onStatus: (text) => { if (!signal.aborted) status(text); },
+    onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
+    onFrame: (pdb, index) => {
+      if (signal.aborted) return;
+      if (index === 0) {
+        pending = loadIntoViewer({ stem, pdb, scores: { sequence }, length: sequence.length });
+        return;
+      }
+      if (viewer === undefined || viewerObject === undefined) return;
+      const frame = api.frameFromText(pdb);
+      frame.name = frame.label = frame.title = `${mode}_${index}`;
+      viewer.addFrame(frame, viewerObject);
+      const object = viewer.objects?.find((entry) => entry.name === viewerObject);
+      if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
+      viewer.render("af3");
+    },
+  });
+  await pending;
+  throwIfAborted(signal);
+
+  // The finished structure, carrying the confidence the frames before it could
+  // not have, appended as the last frame and shown.
+  if (viewer !== undefined && viewerObject !== undefined) {
+    const frame = api.frameFromText(result.pdb);
+    frame.name = frame.label = frame.title = "final";
+    frame.confidence = result.confidence;
+    frame.pae = paeMatrix(result.confidence.predictedAlignedError, sequence.length);
+    frame.pae_n = sequence.length;
+    viewer.addFrame(frame, viewerObject);
+    const object = viewer.objects?.find((entry) => entry.name === viewerObject);
+    if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
+    viewer.render("af3-final");
+  }
+  updateScoresCard(result.confidence, `${mode} · ${calls}`);
+  progress(null);
+  status(`AlphaFold 3 · ${sequence.length} residues in ${result.seconds.toFixed(0)} s`
+    + ` · pLDDT ${result.meanPlddt.toFixed(1)}`
+    + ` · CA-CA ${result.geometry.caca.toFixed(2)} Å`);
+}
+
 async function fold(event) {
   event?.preventDefault();
   if (activeFold !== undefined) {
@@ -461,6 +598,16 @@ async function fold(event) {
     let chains = enteredProblem === null ? sequenceChains(entered) : [];
     let sequence = chains.join("");
     const family = modelFamily(chains.length);
+
+    // 🔴 AlphaFold 3 IS A DIFFERENT MODEL ALL THE WAY DOWN, so it branches here
+    // - before the alignment is fetched, before AF2's weights are chosen, and
+    // before anything below assumes a recycle loop. It shares the sequence box,
+    // the viewer, the status line and the Stop button, and nothing else.
+    if (family === "af3") {
+      await foldWithAf3(chains, signal);
+      return;
+    }
+
     const alignmentResult = await alignmentText(chains, signal, family);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
@@ -748,6 +895,16 @@ if (msaToggle !== null) {
   msaToggle.addEventListener("change", syncMode);
 }
 syncMode();
+
+// 🔴 THE MODEL DECIDES WHICH CONTROLS EXIST, and syncMode decides what the MSA
+// ones say - so the model listener runs syncModelControls and then syncMode,
+// in that order: the second reads the visibility the first just set.
+const familySelect = document.getElementById("model-family");
+if (familySelect !== null) {
+  familySelect.addEventListener("change", () => { syncModelControls(); syncMode(); });
+}
+document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
+syncModelControls();
 
 element("msa-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];
