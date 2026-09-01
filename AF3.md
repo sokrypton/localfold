@@ -248,6 +248,9 @@ What has been ruled out:
 - **Not the featuriser**, everywhere it can be checked: exact against AF3's own
   batch for a monomer, a monomer with an MSA, a homodimer with an MSA, and a
   three-chain complex.
+- **Not templates.** The server run above used four hits per chain, but a second
+  server run with templates off is just as good. This was the prime suspect and
+  it is wrong; do not spend time implementing templates to chase this.
 
 ### The reference, and how to use it
 
@@ -262,12 +265,30 @@ this exact pair. It contains far more than a score:
   Note their per-chain paired depths DIFFER, because these are the inputs to
   AF3's pairing rather than its output; ColabFold's `pair.a3m` is already
   row-aligned, which is why `generateMmseqs2PairedMsa` requires equal depth.
-- `templates/` - **four template hits per chain**, and the job request says
-  `useStructureTemplate: true`. We do not implement templates at all; they
-  raise. This is the largest known difference between the two runs and the
-  prime suspect.
-- Five models with full PAE/pLDDT arrays, to compare against ours residue by
-  residue rather than through a single scalar.
+- `templates/` - four hits per chain, `useStructureTemplate: true`. Kept for
+  completeness only: a server run WITHOUT templates scores just as well, so this
+  is not the difference.
+- Five `.cif` models with full PAE/pLDDT arrays.
+
+### The two suspects left, and the tests that separate them
+
+🔴 **THE PAIRED BLOCK HAS NEVER BEEN CHECKED AGAINST AF3'S OWN BATCH.** The
+homodimer oracle that verified `unpairedFrom` and the budget split came back
+with an EMPTY paired block - the UniRef headers carry no species AF3 can pair
+on, so its paired features collapsed to the query row. Every exact match this
+file claims for a complex is therefore a match with no paired rows in it. The
+row order, the half-and-remainder crop and `unpairedFrom` are all unverified in
+the one configuration a heteromer actually uses. Feeding the server's own
+per-chain paired A3Ms through `--paired-a3m` would close this.
+
+🔴 **AND THE STRUCTURE MAY BE FINE WHILE THE NUMBER IS WRONG.** pLDDT is the
+only thing being compared, and AF3's confidence head is the least-exercised part
+of this port - it has no ipTM at all, which is already a known hole in it.
+Superposing our coordinates on `..._model_0.cif` costs nothing and splits the
+question in two: a good structure with a bad score is a confidence-head bug, a
+bad structure is a trunk or sampler bug. `tools/score_fold.py` takes a reference
+already. **Do this before anything else** - it is the cheapest test available
+and it decides which half of the model to look at.
 
 ### A separate bug found while measuring this
 
