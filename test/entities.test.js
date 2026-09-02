@@ -50,7 +50,8 @@ describe("entity validation", () => {
     // polymer loop, which does not run when there are no residues.
     expect(entitiesProblem([ligand("HEM")])).toBe(null);
     expect(expandEntities([ligand("HEM")])).toEqual({
-      chains: [], ligandCodes: ["HEM"], modifications: [], sequence: "",
+      chains: [], chainKinds: [], ligandCodes: ["HEM"], modifications: [],
+      sequence: "",
     });
   });
 
@@ -136,5 +137,44 @@ describe("entities from pasted text", () => {
     // A bare CCD code is indistinguishable from a very short peptide, and
     // guessing wrong is worse than not guessing.
     expect(entitiesFromText("HEM")).toEqual([protein("HEM")]);
+  });
+});
+
+describe("nucleic entities", () => {
+  const chain = (type, value, copies = 1) => ({ type, value, copies, modifications: [] });
+
+  it("carries a kind per chain, in the order the chains are in", () => {
+    // 🔴 THE ONLY THING THAT SAYS WHAT A CHAIN'S LETTERS MEAN. `ACGT` is a
+    // valid protein and a valid DNA chain, so the row's type has to travel with
+    // it - and by CHAIN rather than by entity, because copies are expanded.
+    const expanded = expandEntities([
+      chain("protein", "ACDEFGHIKL"), chain("dna", "ACGT", 2), chain("rna", "ACGU"),
+    ]);
+    expect(expanded.chainKinds).toEqual(["protein", "dna", "dna", "rna"]);
+    expect(expanded.chains).toEqual(["ACDEFGHIKL", "ACGT", "ACGT", "ACGU"]);
+  });
+
+  it("reads the same letters differently in a protein row and a DNA row", () => {
+    expect(entityProblem(chain("protein", "ACGT"))).toBe(null);
+    expect(entityProblem(chain("dna", "ACGT"))).toBe(null);
+  });
+
+  it("names the swapped base rather than listing the alphabet", () => {
+    // A U in a DNA row is a pasted RNA sequence, not a typo for T, and the
+    // message that helps says which row it belongs in.
+    expect(entityProblem(chain("dna", "ACGU"))).toMatch(/RNA/);
+    expect(entityProblem(chain("rna", "ACGT"))).toMatch(/DNA/);
+  });
+
+  it("refuses N, which has no nucleic slot in the alphabet", () => {
+    // The restypes run A G C U and DA DG DC DT and stop; an unknown base would
+    // have to borrow the amino-acid UNK.
+    expect(entityProblem(chain("dna", "ACGN"))).toMatch(/N is not one of A, C, G, T/);
+  });
+
+  it("refuses a modified base rather than featurising it as an amino acid", () => {
+    const modified = { ...chain("dna", "ACGT"),
+      modifications: [{ code: "SEP", position: 2 }] };
+    expect(entityProblem(modified)).toMatch(/not supported/);
   });
 });

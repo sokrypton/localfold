@@ -141,6 +141,45 @@ export function sequenceProblem(sequence) {
     : `${bad.join(", ")} are not among the twenty amino acids`;
 }
 
+/**
+ * The four bases of each kind. T is DNA's and U is RNA's, and swapping them is
+ * the typo this catches: a `U` in a DNA chain is not thymine spelled oddly, it
+ * is a different chain than the one that was meant.
+ */
+const NUCLEIC_BASES = { dna: "ACGT", rna: "ACGU" };
+
+/**
+ * Why this DNA or RNA sequence cannot be folded, or null if it can.
+ *
+ * 🔴 N IS NOT ACCEPTED, THOUGH PROTEIN'S X IS. The alphabet has an UNK slot for
+ * an unknown amino acid and none for an unknown base - AF3's restypes run
+ * A G C U for RNA and DA DG DC DT for DNA and stop - so an N would have to
+ * become UNK, which is the amino-acid unknown and would put a protein token in
+ * a nucleic chain.
+ *
+ * @param {string} sequence cleaned letters
+ * @param {"dna"|"rna"} kind
+ */
+export function nucleicProblem(sequence, kind) {
+  const bases = NUCLEIC_BASES[kind];
+  const label = kind.toUpperCase();
+  if (sequence.length === 0) return `Enter a ${label} sequence`;
+  const bad = [...new Set([...sequence].filter((base) => !bases.includes(base)))];
+  if (bad.length === 0) return null;
+  // The swapped base gets its own message, because "T is not one of A, C, G, U"
+  // is true and unhelpful to somebody who pasted a DNA sequence into an RNA row.
+  const swapped = kind === "rna" ? "T" : "U";
+  const instead = kind === "rna" ? "U (uracil)" : "T (thymine)";
+  if (bad.length === 1 && bad[0] === swapped) {
+    return `${swapped} is not ${kind === "rna" ? "an" : "a"} ${label} base`
+      + ` - ${label} uses ${instead}.`
+      + ` Change the entity type if this is ${kind === "rna" ? "DNA" : "RNA"}`;
+  }
+  return bad.length === 1
+    ? `${bad[0]} is not one of ${bases.split("").join(", ")}`
+    : `${bad.join(", ")} are not among ${bases.split("").join(", ")}`;
+}
+
 /** Why a colon-separated complex cannot be folded, or null if it can. */
 export function complexSequenceProblem(sequence) {
   if (sequence.length === 0) return "Enter a protein sequence";

@@ -22,13 +22,21 @@
  * numbers asym_id straight on from the last chain; a ligand entered first would
  * otherwise claim a chain index that the polymers still use.
  */
-import { cleanSequence, sequenceProblem } from "./sequence.js";
+import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
 
 /** The entity types this page can actually fold. */
-export const ENTITY_TYPES = ["protein", "ligand"];
+export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand"];
 
 /** How they are labelled, in the order the menu offers them. */
-export const ENTITY_LABELS = { protein: "Protein", ligand: "Ligand (CCD)" };
+export const ENTITY_LABELS = {
+  protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
+};
+
+/** The polymer types, which are the ones with a residue sequence. */
+export const POLYMER_TYPES = ["protein", "dna", "rna"];
+
+/** The nucleic types, whose letters are bases rather than amino acids. */
+export const NUCLEIC_TYPES = ["dna", "rna"];
 
 /**
  * The ligands and ions worth putting in a menu, as CCD codes.
@@ -91,13 +99,13 @@ export const MENU_CODES = new Set(
   [...COMMON_LIGANDS, ...COMMON_IONS].map((entry) => entry.code));
 
 /**
- * 🔴 DNA AND RNA ARE ABSENT ON PURPOSE. AF3's restype alphabet is 31 wide and
- * has the nucleic acids in it, and DENSE is 24 atoms so a nucleotide would fit
- * - but reference-conformers.js holds the 21 amino acids and nothing else, so a
- * nucleotide has no reference conformer, no aatype and no C1' pseudo-beta. A
- * menu entry for them would produce a fold, and a plausible-looking one.
+ * 🔴 NOTHING IS UNSUPPORTED HERE ANY MORE, AND THIS STAYS EMPTY RATHER THAN
+ * GOING AWAY. DNA and RNA were listed here for as long as they had no reference
+ * conformers; they now have their own baked table and a featuriser checked
+ * against AF3 array by array. The export remains because callers ask it what to
+ * refuse, and the next type to arrive will want the same answer.
  */
-export const UNSUPPORTED_TYPES = ["dna", "rna"];
+export const UNSUPPORTED_TYPES = [];
 
 /** More copies than this is far likelier to be a typo than a request. */
 const MAX_COPIES = 20;
@@ -188,7 +196,9 @@ export function entityProblem(entity) {
 
   const value = entity.value.trim();
   if (value === "") {
-    return entity.type === "ligand" ? "Enter a CCD code" : "Enter a protein sequence";
+    if (entity.type === "ligand") return "Enter a CCD code";
+    return entity.type === "protein"
+      ? "Enter a protein sequence" : `Enter a ${entity.type.toUpperCase()} sequence`;
   }
   if (entity.type === "ligand") {
     // The same rule ccdUrl enforces, checked here so the message arrives while
@@ -207,8 +217,21 @@ export function entityProblem(entity) {
     return "One sequence per entity - use Add entity for another chain";
   }
   const cleaned = cleanSequence(value);
-  const sequenceFault = sequenceProblem(cleaned);
+  // 🔴 THE SAME LETTERS MEAN DIFFERENT THINGS PER ROW. `ACGT` is a valid
+  // protein and a valid DNA chain, and nothing about the text says which - the
+  // row's type does, so the check follows it rather than sniffing the letters.
+  const sequenceFault = NUCLEIC_TYPES.includes(entity.type)
+    ? nucleicProblem(cleaned, entity.type)
+    : sequenceProblem(cleaned);
   if (sequenceFault !== null) return sequenceFault;
+  // 🔴 A MODIFICATION ON A NUCLEIC CHAIN IS REFUSED RATHER THAN IGNORED. AF3
+  // takes modified bases and this featuriser does not: its modified-residue
+  // path resolves the parent through the amino-acid table, so a modified base
+  // would be featurised as a modified amino acid and fold to something. The
+  // popup does not offer them, so this catches a restored or pasted list.
+  if (NUCLEIC_TYPES.includes(entity.type) && (entity.modifications ?? []).length > 0) {
+    return `Modified bases are not supported yet on a ${entity.type.toUpperCase()} chain`;
+  }
   // ...the modifications last, because every one of their messages talks about
   // a position in a sequence that has to be valid first.
   const seen = new Set();
@@ -263,9 +286,14 @@ export function expandEntities(entities) {
   // featuriser indexes them by the chain number it will actually see - which is
   // the position in `chains`, not the position in `entities`.
   const modifications = [];
+  // 🔴 PER CHAIN AND IN CHAIN ORDER, because that is the only thing that says
+  // what a chain's letters mean. featuriseProtein reads it by the index of the
+  // chain in the colon-joined sequence, so it is built in the same loop that
+  // builds them and can never drift from it.
+  const chainKinds = [];
   for (const entity of entities) {
     for (let copy = 0; copy < entity.copies; copy += 1) {
-      if (entity.type === "protein") {
+      if (POLYMER_TYPES.includes(entity.type)) {
         for (const modification of entity.modifications ?? []) {
           modifications.push({
             chain: chains.length,
@@ -273,11 +301,14 @@ export function expandEntities(entities) {
             code: modification.code.trim().toUpperCase(),
           });
         }
+        chainKinds.push(entity.type);
         chains.push(cleanSequence(entity.value));
       } else ligandCodes.push(entity.value.trim().toUpperCase());
     }
   }
-  return { chains, ligandCodes, modifications, sequence: chains.join(":") };
+  return {
+    chains, chainKinds, ligandCodes, modifications, sequence: chains.join(":"),
+  };
 }
 
 /**

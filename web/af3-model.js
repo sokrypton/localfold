@@ -203,6 +203,7 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
  *          maxMsaSequences?: number, ligandCodes?: string[],
+ *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -268,6 +269,9 @@ export async function foldAf3(options) {
   const batch = featuriseProtein(sequence, {
     ligands,
     modifications,
+    // What each chain's letters mean. Absent, every chain is protein, which is
+    // what every caller before nucleic acids meant.
+    chainKinds: options.chainKinds,
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

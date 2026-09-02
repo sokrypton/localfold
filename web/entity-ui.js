@@ -310,7 +310,13 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     }
     type.value = entity.type;
     type.addEventListener("change", () => {
+      const wasProtein = entity.type === "protein";
       entity.type = type.value;
+      // 🔴 THE MODIFICATIONS GO WITH THE TYPE. They are amino-acid modifications
+      // resolved through the amino-acid table, so carrying them onto a DNA row
+      // leaves the row permanently invalid with its reason behind a button that
+      // the row no longer has.
+      if (wasProtein && entity.type !== "protein") entity.modifications = [];
       // The field itself changes shape with the type - a sequence wants a
       // monospace box that grows, a CCD code wants one small line - so this is
       // a structural change and the row is rebuilt.
@@ -382,8 +388,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       // is five characters, has its own one-line input above rather than
       // sharing this control.
       value.rows = 2;
-      value.placeholder = "Paste a protein sequence";
-      value.setAttribute("aria-label", "Protein sequence");
+      const what = entity.type === "protein" ? "protein" : entity.type.toUpperCase();
+      // "an RNA" and "a DNA": the article follows how the letters are SAID
+      // (ar-en-ay, dee-en-ay), not how they are spelled.
+      value.placeholder = `Paste ${entity.type === "rna" ? "an" : "a"} ${what} sequence`;
+      value.setAttribute("aria-label", `${what} sequence`);
     }
     value.value = entity.value;
     /** Repaint the highlight from the text and the modification list. */

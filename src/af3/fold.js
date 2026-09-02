@@ -116,6 +116,20 @@ export function toPdb(batch, positions, plddt) {
     }
   }
   const residueOf = (token) => batch.residueOfToken?.[token] ?? token;
+  // 🔴 A NUCLEOTIDE'S RESIDUE NAME IS NOT ITS AMINO ACID'S. THREE_LETTER maps
+  // the one-letter code through the amino-acid table, where `A` is ALA and `G`
+  // is GLY - so a DNA chain came out of here as a poly-alanine peptide that
+  // every viewer draws as a protein ribbon and every scoring tool reads as one.
+  // A PDB names DNA " DA" and RNA "  A", right-justified in the field, which is
+  // what distinguishes the two: the D is the only thing in the format that
+  // says which.
+  const nucleicName = (residue) => {
+    const kind = batch.chainKinds?.[batch.chainOfResidue?.[residue]];
+    if (kind !== "dna" && kind !== "rna") return undefined;
+    const code = sequence[residue];
+    if (code === undefined) return undefined;
+    return kind === "dna" ? `D${code}` : code;
+  };
   // ...and which serial each ligand token was written as, so CONECT can name
   // them. A ligand token is one heavy atom and it sits in slot zero, so the
   // token is the atom; a polymer token is many atoms and has no entry here.
@@ -132,7 +146,9 @@ export function toPdb(batch, positions, plddt) {
         (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
-        + (ligandCode ?? THREE_LETTER[sequence[residueOf(token)]] ?? "UNK").padEnd(3)
+        + (ligandCode
+          ?? nucleicName(residueOf(token))?.padStart(3)
+          ?? THREE_LETTER[sequence[residueOf(token)]] ?? "UNK").padEnd(3)
         + " " + chainLetter(token)
         // 🔴 residue_index IS ALREADY 1-BASED. Adding one here shifted the whole
         // chain by a residue, which against a helical protein reads as a 3.7 A

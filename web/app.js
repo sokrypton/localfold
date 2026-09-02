@@ -103,7 +103,7 @@ const maxMsaConfig = () => {
  * multimer was trained for - and the explicit settings exist to fold the same
  * input both ways rather than to be reached for routinely.
  */
-const modelFamily = (ligandCount = 0, modificationCount = 0) => {
+const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) => {
   // 🔴 THE CHOICE IS ALWAYS EXPLICIT NOW. "Auto" used to read the chain count
   // and pick between the two AlphaFold 2 models - which made AF2 the silent
   // default for everything and could never choose AF3, so the newest model was
@@ -126,6 +126,14 @@ const modelFamily = (ligandCount = 0, modificationCount = 0) => {
   // way, so nothing else on the page would have shown the difference.
   if (modificationCount > 0 && choice !== "af3") {
     throw new Error(`Modified residues need AlphaFold 3; the model is set to ${choice}`);
+  }
+  // 🔴 AND A NUCLEIC CHAIN IS AlphaFold 3 ONLY, WHICH IS THE LOUDEST OF THE
+  // THREE. AF2's alphabet is the twenty amino acids: `ACGT` is not refused
+  // there, it is READ - as alanine, cysteine, glycine, threonine - so a DNA
+  // chain folded under AF2 comes back as a confident structure of a short
+  // peptide that was never asked for, with nothing anywhere saying so.
+  if (nucleicCount > 0 && choice !== "af3") {
+    throw new Error(`DNA and RNA need AlphaFold 3; the model is set to ${choice}`);
   }
   return choice;
 };
@@ -754,7 +762,7 @@ const cheapHash = (text) => {
  * pLDDT and PAE, and that is the frame the page lands on.
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
-                           modifications = []) {
+                           modifications = [], chainKinds = []) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -786,8 +794,14 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // sequence, and af3SequenceProblem reports an empty one as "Paste a protein
   // sequence first" - which is the right message for an empty box and the wrong
   // one for a job that is complete without it.
-  if (chains.length > 0) {
-    const problem = af3SequenceProblem(chains.join(""));
+  // ...and only the PROTEIN ones. af3SequenceProblem checks against the twenty
+  // amino acids, which every base but A, C and G fails: a DNA chain would be
+  // refused here as "T is not one of the twenty", naming a letter that is
+  // correct for the row it is in.
+  const proteinOnly = chains
+    .filter((_, index) => (chainKinds[index] ?? "protein") === "protein").join("");
+  if (proteinOnly.length > 0) {
+    const problem = af3SequenceProblem(proteinOnly);
     if (problem !== null) throw new Error(problem);
   }
 
@@ -811,7 +825,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const trunkKey = JSON.stringify({
     // ...modifications included, or a fold that only adds one reuses the trunk
     // of the fold without it and silently ignores what was asked for.
-    chains, ligandCodes, modifications, maxMsaSequences, seed: randomSeed(),
+    // 🔴 THE KINDS ARE IN THE KEY BECAUSE THE LETTERS DO NOT IMPLY THEM. Folding
+    // `ACGT` as a protein and then as DNA is two different questions with the
+    // same `chains`, and without this the second reuses the first one's trunk.
+    chains, chainKinds, ligandCodes, modifications, maxMsaSequences, seed: randomSeed(),
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -842,7 +859,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let pending = Promise.resolve();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications, reuse,
+    alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
+    chainKinds, reuse,
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -1013,19 +1031,44 @@ async function fold(event) {
       throw new Error(enteredProblem);
     }
     const request = enteredProblem === null
-      ? expandEntities(entities) : { chains: [], ligandCodes: [], modifications: [] };
+      ? expandEntities(entities)
+      : { chains: [], chainKinds: [], ligandCodes: [], modifications: [] };
     let chains = request.chains;
+    let chainKinds = request.chainKinds ?? chains.map(() => "protein");
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
     let sequence = chains.join("");
-    const family = modelFamily(ligandCodes.length, modifications.length);
+    const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
+    const family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
 
+    // 🔴 THE ALIGNMENT COVERS THE PROTEIN CHAINS AND NOTHING ELSE, which is
+    // what an A3M can mean and what featuriseProtein reads it as: its columns
+    // are matched to the protein residues, in chain order, and a nucleic chain
+    // has none. Searching with a DNA chain in the query would send `ACGT` to a
+    // protein database as a four-residue peptide and align whatever came back
+    // over the wrong chain.
+    const proteinChains = chains.filter((_, index) => chainKinds[index] === "protein");
+    // 🔴 SAID OUT LOUD, BECAUSE THE ALTERNATIVE IS A SILENT DIFFERENCE. With
+    // the MSA set to Search, a job that is part DNA gets an alignment for its
+    // protein chains and none for the rest - which is what AF3 does for DNA and
+    // is NOT what it does for RNA, where the real pipeline searches an RNA
+    // database this page has no server for. Either way the reader asked for an
+    // alignment and is getting one for some of their chains, so the status line
+    // says which.
+    if (nucleicCount > 0 && msaMode() !== "single") {
+      const kinds = [...new Set(chainKinds.filter((kind) => kind !== "protein"))]
+        .map((kind) => kind.toUpperCase()).join(" and ");
+      status(proteinChains.length === 0
+        ? `${kinds} folds from its own sequence; there is no alignment to search for it`
+        : `Aligning the protein chains only - ${kinds} folds from its own sequence`);
+    }
     // 🔴 NOTHING TO ALIGN WITHOUT A POLYMER. A ligand-only fold has no sequence
     // to search with, and the search path reports an empty one as a missing
     // sequence - the right message for an empty box, the wrong one for a job
-    // that is already complete.
-    const alignmentResult = chains.length === 0
-      ? null : await alignmentText(chains, signal, family);
+    // that is already complete. A DNA-only fold is the same case: there is no
+    // protein to search with, and no RNA database here to search instead.
+    const alignmentResult = proteinChains.length === 0
+      ? null : await alignmentText(proteinChains, signal, family);
     const alignment = typeof alignmentResult === "string"
       ? alignmentResult : (alignmentResult?.text ?? null);
     // A pasted or uploaded A3M is one text and cannot be split into blocks; it
@@ -1041,12 +1084,19 @@ async function fold(event) {
       // folding the box's sequence against somebody else's alignment would be
       // folding two different proteins at once.
       const alignedQuery = parseA3m(alignment).query;
-      if (chains.length > 1 && alignedQuery !== sequence) {
+      // ...against the PROTEIN chains, since those are the ones it covers.
+      const proteinSequence = proteinChains.join("");
+      if (proteinChains.length > 1 && alignedQuery !== proteinSequence) {
         throw new Error("The complex A3M query does not match the colon-separated chain sequences");
       }
-      if (chains.length <= 1) {
+      // 🔴 AND THE ALIGNMENT ONLY REPLACES THE ENTITY LIST WHEN THE LIST IS ONE
+      // PROTEIN. An A3M says nothing about a DNA chain or a ligand, so letting
+      // its query become "the chains" on a mixed job would silently delete
+      // every other chain in it.
+      if (proteinChains.length <= 1 && nucleicCount === 0) {
         sequence = alignedQuery;
         chains = [sequence];
+        chainKinds = ["protein"];
         // The list shows what will be folded, so the row follows the alignment.
         // Ligand rows are kept: an A3M says nothing about them.
         entityList.setChains(chains);
@@ -1061,7 +1111,8 @@ async function fold(event) {
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (family === "af3") {
-      await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes, modifications);
+      await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
+                        modifications, chainKinds);
       return;
     }
 
