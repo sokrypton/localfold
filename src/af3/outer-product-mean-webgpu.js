@@ -36,6 +36,12 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 const GRID_WIDTH = 32_768;
 
+/**
+ * How many token pairs one contraction workgroup carries. Four is a vec4, which
+ * is what keeps the accumulation one instruction; see the note on the kernel.
+ */
+export const OPM_PAIRS_PER_GROUP = 4;
+
 const ORDER = [
   "layerNormInputScale", "layerNormInputOffset",
   "leftProjection", "rightProjection", "outputW", "outputB",
@@ -124,8 +130,42 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  // One workgroup per token pair: accumulate the 32x32 product over sequences
-  // in workgroup memory, then map it through output_w.
+  // 🔴 EVERY WORKGROUP READ THE WHOLE OUTPUT PROJECTION TO PRODUCE ONE PAIR.
+  // The projection is PRODUCTS x C_Z - 131,072 floats, half a megabyte - and
+  // with a workgroup per token pair that is 11.8 GB a call at 150 tokens, which
+  // at the 445 GB/s tools/gpu/probe-alu.js measures for cached global reads is
+  // 26 ms: the whole of what this kernel cost there. A tile of pairs divides it
+  // by the tile, and the pairs share nothing else, so the arithmetic is
+  // untouched.
+  //
+  // 🔴 AND THE TILE IS THE VECTOR, so the accumulation stays one instruction:
+  // a cell's four pairs are one vec4, one weight read serves all of them, and
+  // the workgroup memory holding them is a CHUNK of cells rather than all of
+  // them - PRODUCTS x PAIRS floats would be 16 KB and this way it is 4.
+  const pairsPerGroup = shape.pairsPerGroup ?? OPM_PAIRS_PER_GROUP;
+  const cellChunk = Math.min(products, 256);
+  if (products % cellChunk !== 0) {
+    throw new Error(`PRODUCTS ${products} is not a multiple of the cell chunk ${cellChunk}`);
+  }
+  const pairVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[pairsPerGroup];
+  if (pairVector === undefined) {
+    throw new Error(`pairsPerGroup ${pairsPerGroup} is not 1, 2 or 4`);
+  }
+  // 🔴 AND SPLITTING THAT LOOP ACROSS THE IDLE LANES WAS TRIED AND LOST. It
+  // walks C_Z output channels with 256 invocations and C_Z is 128, so half of
+  // them sit out the loop this kernel spends its time in - which looks like a
+  // free doubling. Giving two partitions half the cells each and adding their
+  // partials once at the end measured 86.3 ms against 58.8 at 150 tokens. The
+  // idle half was costing nothing to begin with: those are whole subgroups
+  // taking a uniform branch, so they were never issuing, and the split bought
+  // no instructions while paying a barrier and a 4 KB round trip through
+  // workgroup memory.
+  const pairAt = (name, p) => pairsPerGroup === 1 ? name : `${name}.${"xyzw"[p]}`;
+  const overPairs = (body) =>
+    Array.from({ length: pairsPerGroup }, (_, p) => body(p)).join("\n      ");
+
+  // One workgroup per tile of token pairs: accumulate the 32x32 product over
+  // sequences in workgroup memory, then map it through output_w.
   //
   // 🔴 256 LANES, NOT 64, AND THAT IS THE ONLY THING HERE THAT PAID. A lane
   // owns PRODUCTS/lanes cells and sweeps every sequence for each, so widening
@@ -134,63 +174,46 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // Measured at 1024 rows, on the msa-stack as a whole:
   //     64 lanes 474 ms    128 lanes 401    256 lanes 386
   //
-  // 🔴 THIS IS THE HOT KERNEL AT DEPTH, AND STAGING THE ROWS WAS TRIED AND LOST.
-  // The MSA stack costs about 72 ms fixed plus 0.38 ms a row, so at AF3's own
-  // num_msa of 1024 it is 469 ms - 43% of a trunk pass - and this contraction is
-  // half of that.
-  //
-  // The redundancy is real and looks damning: each of the 64 lanes owns
-  // PRODUCTS/64 cells and walks all SEQUENCES rows for every one of them, so a
-  // workgroup reads 2 x PRODUCTS x SEQUENCES floats to consume 2 x C_OUTER x
-  // SEQUENCES distinct ones - 32-fold. Staging each chunk of rows' two 32-float
-  // slices in workgroup memory removes exactly that, and measured at 1024 rows
-  // it went 469 ms to 673, 44% WORSE. Two reasons, both structural: the tiled
-  // form needs a per-lane accumulator ARRAY indexed by a loop variable, which
-  // WGSL puts in spillable local memory rather than registers, where the
-  // straight version keeps one scalar `total` live; and it pays two workgroup
-  // barriers per chunk. The reads it saves were being served by cache anyway -
-  // one workgroup's slice of `left` is 32 floats a row, 128 KiB at 1024 rows.
-  //
-  // Staging ALL the rows instead, so the cell loop could keep its scalar, wants
-  // 2 x SEQUENCES x C_OUTER floats - 256 KiB at 1024 rows against a 32 KiB
-  // limit - so the two ways out of the redundancy are mutually exclusive here.
+  // 🔴 STAGING THE ROWS WAS TRIED AND LOST, and that is a different redundancy
+  // from the one above. Each lane owns PRODUCTS/256 cells and walks all
+  // SEQUENCES rows for every one, so a workgroup reads 2 x PRODUCTS x SEQUENCES
+  // floats to consume 2 x C_OUTER x SEQUENCES distinct ones. Staging each chunk
+  // of rows' two 32-float slices removes exactly that, and at 1024 rows it went
+  // 469 ms to 673, 44% WORSE: the tiled form needs a per-lane accumulator ARRAY
+  // indexed by a loop variable, which WGSL puts in spillable local memory, and
+  // it pays two barriers a chunk. Those reads were cache-served anyway.
   const contract = `${common}
+const PAIRS_PER_GROUP: u32 = ${pairsPerGroup}u;
+const CELL_CHUNK: u32 = ${cellChunk}u;
+
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<storage, read> msa_mask: array<f32>;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
-var<workgroup> product: array<f32, ${products}>;
-var<workgroup> reduce: array<f32, 256>;
+var<workgroup> product: array<${pairVector}, ${cellChunk}>;
+var<workgroup> reduce: array<${pairVector}, 256>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let slot = group.x + group.y * GRID_WIDTH;
-  if (slot >= TOKENS * TOKENS) { return; }
-  let i = slot / TOKENS;
-  let j = slot % TOKENS;
+  let first = (group.x + group.y * GRID_WIDTH) * PAIRS_PER_GROUP;
+  if (first >= TOKENS * TOKENS) { return; }
   let local = local_id.x;
 
-  for (var index = local; index < PRODUCTS; index += 256u) { product[index] = 0.0; }
-  workgroupBarrier();
+  // ...a slot past the end is clamped rather than skipped, so its lane of every
+  // vector below holds a real number; it is dropped at the write.
+  ${overPairs((p) => `let slot${p} = min(first + ${p}u, TOKENS * TOKENS - 1u);
+  let i${p} = slot${p} / TOKENS;
+  let j${p} = slot${p} % TOKENS;`)}
 
-  // Each invocation owns a fixed set of (c, e) cells for the whole sweep, so
-  // the accumulator stays in registers and only lands in workgroup memory once.
-  var count = 0.0;
-  for (var index = local; index < PRODUCTS; index += 256u) {
-    let c = index / C_OUTER;
-    let e = index % C_OUTER;
-    var total = 0.0;
-    for (var s = 0u; s < SEQUENCES; s += 1u) {
-      total += left[(s * TOKENS + i) * C_OUTER + c] * right[(s * TOKENS + j) * C_OUTER + e];
-    }
-    product[index] = total;
-  }
   // 🔴 THE DENOMINATOR COUNTS SEQUENCES COVERING BOTH TOKENS.
+  var count: ${pairVector};
+  ${overPairs((p) => `${pairAt("count", p)} = 0.0;`)}
   for (var s = local; s < SEQUENCES; s += 256u) {
-    count += msa_mask[s * TOKENS + i] * msa_mask[s * TOKENS + j];
+    ${overPairs((p) =>
+      `${pairAt("count", p)} += msa_mask[s * TOKENS + i${p}] * msa_mask[s * TOKENS + j${p}];`)}
   }
   reduce[local] = count;
   workgroupBarrier();
@@ -198,19 +221,54 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     if (local < stride) { reduce[local] += reduce[local + stride]; }
     workgroupBarrier();
   }
-  let scale = 1.0 / (NORM_EPSILON + reduce[0]);
+  let scale = ${pairVector}(1.0) / (${pairVector}(NORM_EPSILON) + reduce[0]);
 
-  for (var f = local; f < C_Z; f += 256u) {
-    var total = weights[W_OUT_BIAS + f];
-    for (var index = 0u; index < PRODUCTS; index += 1u) {
-      total += product[index] * weights[W_OUT + index * C_Z + f];
+  var totals: ${pairVector};
+  let has_f = local < C_Z;
+  let f = select(0u, local, has_f);
+  ${overPairs((p) => `${pairAt("totals", p)} = weights[W_OUT_BIAS + f];`)}
+
+  for (var chunk0 = 0u; chunk0 < PRODUCTS; chunk0 += CELL_CHUNK) {
+    // ...before overwriting the chunk the previous iteration is still reading.
+    workgroupBarrier();
+    // Each invocation owns one cell of the chunk for the whole sweep, so the
+    // accumulator stays in registers and lands in workgroup memory once.
+    for (var index = local; index < CELL_CHUNK; index += 256u) {
+      let cell = chunk0 + index;
+      let c = cell / C_OUTER;
+      let e = cell % C_OUTER;
+      var total: ${pairVector};
+      ${overPairs((p) => `${pairAt("total", p)} = 0.0;`)}
+      for (var s = 0u; s < SEQUENCES; s += 1u) {
+        let row = s * TOKENS;
+        ${overPairs((p) =>
+          `${pairAt("total", p)} += left[(row + i${p}) * C_OUTER + c]
+            * right[(row + j${p}) * C_OUTER + e];`)}
+      }
+      product[index] = total;
     }
+    workgroupBarrier();
+
+    // 🔴 ONE WEIGHT READ SERVES EVERY PAIR IN THE TILE. This loop is what the
+    // kernel spends its time in at shallow depth - PRODUCTS x C_Z of it - and
+    // the tile is the only thing that divides it.
+    if (has_f) {
+      for (var t = 0u; t < CELL_CHUNK; t += 1u) {
+        totals += product[t] * weights[W_OUT + (chunk0 + t) * C_Z + f];
+      }
+    }
+  }
+
+  if (has_f) {
     // ...scaled after the projection, so the bias is scaled with it.
-    output[slot * C_Z + f] = total * scale;
+    let scaled = totals * scale;
+    ${overPairs((p) => `if (first + ${p}u < TOKENS * TOKENS) {
+      output[slot${p} * C_Z + f] = ${pairAt("scaled", p)};
+    }`)}
   }
 }`;
 
-  return { project, contract };
+  return { project, contract, pairsPerGroup };
 }
 
 export class Af3OuterProductMeanGpu {
@@ -284,7 +342,9 @@ export class Af3OuterProductMeanGpu {
       const projectGroups = spread(Math.ceil(rows / 64));
       run("opm.project", project, [msaBuffer, maskBuffer, weightBuffer, left, right],
           projectGroups[0], projectGroups[1]);
-      const contractGroups = spread(tokens * tokens);
+      // ...one workgroup per TILE of pairs; the shaders report the tile so the
+      // dispatch cannot divide by a different one.
+      const contractGroups = spread(Math.ceil(tokens * tokens / sources.pairsPerGroup));
       run("opm.contract", contract, [left, right, maskBuffer, weightBuffer, output],
           contractGroups[0], contractGroups[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0,

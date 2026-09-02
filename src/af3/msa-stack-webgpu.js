@@ -80,8 +80,10 @@ export class Af3MsaStackGpu {
 
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
                        pairChannels: PAIR_CHANNELS };
-    const opmSources = createOuterProductMeanShaders(
+    const { pairsPerGroup, ...opmSources } = createOuterProductMeanShaders(
       opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
+    // ...the contraction's dispatch divides by this; see the note on its kernel.
+    pipelines.opmPairsPerGroup = pairsPerGroup;
     for (const [name, source] of Object.entries(opmSources)) {
       pipelines[`opm:${name}`] = await compile(`${base}:opm:${name}`, source);
     }
@@ -208,9 +210,9 @@ export class Af3MsaStackGpu {
     const rowGroups = spread(ceil(rows, 64));
     run("opm.project", pipelines["opm:project"],
         [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
-    const perPair = spread(pairs);
+    const perPairTile = spread(ceil(pairs, pipelines.opmPairsPerGroup));
     run("opm.contract", pipelines["opm:contract"],
-        [left, right, msaMask, opmWeights, scratch[0]], perPair[0], perPair[1]);
+        [left, right, msaMask, opmWeights, scratch[0]], perPairTile[0], perPairTile[1]);
     const addPairGroups = spread(ceil(pairs * PAIR_CHANNELS, 64));
     run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
 

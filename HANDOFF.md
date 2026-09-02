@@ -18,7 +18,7 @@ the one being served. Everything below is live.
 | AF3 diffusion-200 fold, end to end | ~152 s | **26.3 s** |
 | AF3 trunk pass, 32 MSA rows | 756 ms | **411 ms** |
 | ...of which the pairformer | 632 ms | **316 ms** |
-| AF3 trunk pass, 150 tokens | 3.38 s | **2.40 s** |
+| AF3 trunk pass, 150 tokens | 3.38 s | **2.31 s** |
 | AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
@@ -111,7 +111,13 @@ and prints a range; trust the range, not a pair.
 
 ## Open threads, in the order I would take them
 
-1. **Count instructions, not flops.** `tools/gpu/probe-alu.js` says this device
+1. **The MSA stack at real depth is now the untouched half.** At 59 tokens and
+   1024 rows the stack is 325 ms against a 315 ms pairformer, and the outer
+   product's sequence sweep is most of it - the pair tiling below was worth
+   nothing there (312 against 325, adjacent runs) because the sweep scales with
+   SEQUENCES and the win was all in the output projection, which scales with
+   pairs. Two structural attempts on that sweep have already lost; see AF3.md.
+2. **Count instructions, not flops.** `tools/gpu/probe-alu.js` says this device
    does 1287 GFLOP/s scalar, 5034 vec4, and 396 billion workgroup reads a
    second - all of them about **640 billion instructions a second**. The trunk's
    kernels sit at 200-310 billion, so what is left is in the instruction count,
@@ -121,29 +127,29 @@ and prints a range; trust the range, not a pair.
    two vec4 loads and cut the kernel's instruction count by about 28%.
    Estimated, not measured - the accumulators then need a second vector axis
    (four slots by four rows), which is the intricate part.
-2. **`grid.attend` again, at 150 tokens.** Staging its keys was worth 1.9x, but
+3. **`grid.attend` again, at 150 tokens.** Staging its keys was worth 1.9x, but
    it is still the only cubic kernel and it is second-largest at both sizes. Two
    attacks are measured and LOST (more than one query an invocation; a vec4
    score accumulator) - read AF3.md before starting. What has NOT been tried:
    splitting the keys across invocations with a combining pass, which trades a
    second dispatch for occupancy it does not have at small N.
-3. **`single-transition`, 27 ms for 59 rows.** Untouched and under-occupied: 59
+4. **`single-transition`, 27 ms for 59 rows.** Untouched and under-occupied: 59
    workgroups, and its row tile cannot rise because there are no rows, so it is
    the one kernel still generating scalar code. The only real fix is
    materialising the widened intermediate (362 KB at this size) and splitting it
    into two dispatches - which the pair track must NOT do, at 1.47 GB for 600
    tokens. Two code paths for one kernel; judged not worth it yet.
-4. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
+5. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
    from a real client; everything here was localhost, where fetch is 31 ms. The
    fork at `martin-steinegger/alphafold2-webgpu` packs to 8 shards and has
    download-throttling and progress commits worth mining. Blocked on a real
    cold-load number.
-5. **Other Stop-then-retry paths.** A user hit "mergeSearchedChains is not
+6. **Other Stop-then-retry paths.** A user hit "mergeSearchedChains is not
    defined" by stopping a fold and folding again. Fixed, and the search-reuse
    decision was extracted to `planSearchReuse` with tests - but `af2Cache` and the
    recycle-continuation logic that reuses `trunkCache` are the same shape of
    stateful code with the same absence of tests.
-6. **AF2 has no official-value gate on this machine.** Partly closed:
+7. **AF2 has no official-value gate on this machine.** Partly closed:
    `tools/gpu/check-triangle-residual.js` now covers the one path only AF2
    reaches - the residual form of the triangle output projection - and fails at
    1.0 relative if the two forms are swapped. The rest still rests on

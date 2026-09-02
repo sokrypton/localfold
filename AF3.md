@@ -421,8 +421,8 @@ fix, and the failures listed below are what that has to beat.
 
 ## The pairformer's kernels, rewritten for the shape rather than the arithmetic
 
-A trunk pass went **540 -> 411 ms** at 59 tokens and **3.38 -> 2.40 s** at 150,
-its pairformer 435 -> 316 and 2879 -> 1973. AF2's evoformer shares five of these
+A trunk pass went **540 -> 411 ms** at 59 tokens and **3.38 -> 2.31 s** at 150,
+its pairformer 435 -> 316 and 2879 -> 1950. AF2's evoformer shares five of these
 kernels and its triangle projection went 0.581 -> 0.422 ms a block and its
 output projection 0.405 -> 0.327, with the contraction dropping off the
 profiler's list entirely.
@@ -453,6 +453,7 @@ and take before/after totals from two runs that are both unprofiled.
 | grid.project-out  | 39.1 | 15.6 | a tile of rows, where it was one |
 | single-transition | 28.1 | 29.6 | untouched |
 | tri.contract      | 23.3 |  8.6 | 1 output a thread -> 4x4, both tiles vectors |
+| opm.contract      | 15.7 |  9.0 | four token pairs a workgroup, as a vec4 |
 | single.project    | 20.4 | 11.1 | the width split over workgroups, outputs blocked |
 | tri.normalize     | 13.7 |  8.3 | the LayerNorm staged, to coalesce |
 | grid.normalize    | 11.8 |  7.4 | the same |
