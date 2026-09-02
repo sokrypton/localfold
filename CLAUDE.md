@@ -39,10 +39,22 @@ values means the whole-stack checker, not that file.
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
-| Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project}.js` |
+| Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
+| Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **AF2's KERNELS NOW HAVE FOUR DIFFERENTIAL GATES, BECAUSE IT HAD NONE.**
+`npm run test:gpu` cannot load Dawn here and `test/fixtures/evoformer/` is
+gitignored, so every `test/*.gpu.test.js` covering AF2 is unrunnable - which
+left its transition, its outer product mean, its attention projection and the
+residual form of its triangle output projection with nothing checking them at
+all. Each new checker writes its own CPU reference in its own file, because a
+reference that shares code with the thing it checks tests nothing, and each
+uses ragged shapes and ragged masks so the bounds checks and the masking are
+actually exercised. They are differential, not oracle: they say the kernel
+computes the operation, not that AlphaFold agrees.
 
 🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
 multiply-adds out of registers with no memory in the way. On this M2 it reports

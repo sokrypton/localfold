@@ -27,8 +27,11 @@ the one being served. Everything below is live.
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
 | AF2 evoformer block, 512 MSA rows | 302.8 ms | **192.0 ms** |
-| AF2 triangle projection, per block | 0.581 ms | **0.422 ms** |
-| AF2 triangle output projection | 0.405 ms | **0.327 ms** |
+| AF2 evoformer block, 512 MSA rows | 188.6 ms | **160.4 ms** |
+| ...its outer product contraction | 28.8 ms | **16.2 ms** |
+| ...its transition, both halves | 45.1 ms | **37.5 ms** |
+| ...its attention projections, both | 38.5 ms | **33.1 ms** |
+| ...its triangle projection | 0.581 ms | **0.422 ms** |
 | AF3 side-chain bond ratio | 0.927 | **1.015** (AF3 itself: 1.017) |
 
 Accuracy moved the right way: worst relRMS against AF3's own denoiser over
@@ -115,13 +118,21 @@ and prints a range; trust the range, not a pair.
 
 ## Open threads, in the order I would take them
 
-1. **The MSA stack at real depth is now the untouched half.** At 59 tokens and
+1. **AF2's column attention, 32 ms of its 160 ms block at 512 rows.** It is the
+   largest kernel left there and the only one that is quadratic in DEPTH -
+   column attention runs over the sequence axis - so it grows 16x for 4x the
+   rows while everything else grows 4x. It is already a good kernel: key and
+   value tiles staged in workgroup memory, subgroup reductions for the softmax,
+   an online maximum. What is left in it is the 32-iteration `subgroupShuffle`
+   loop that weights the values, which is about three instructions per useful
+   multiply-add. Not attempted.
+2. **The MSA stack at real depth is now the untouched half.** At 59 tokens and
    1024 rows the stack is 325 ms against a 315 ms pairformer, and the outer
    product's sequence sweep is most of it - the pair tiling below was worth
    nothing there (312 against 325, adjacent runs) because the sweep scales with
    SEQUENCES and the win was all in the output projection, which scales with
    pairs. Two structural attempts on that sweep have already lost; see AF3.md.
-2. **Count instructions, not flops.** `tools/gpu/probe-alu.js` says this device
+3. **Count instructions, not flops.** `tools/gpu/probe-alu.js` says this device
    does 1287 GFLOP/s scalar, 5034 vec4, and 396 billion workgroup reads a
    second - all of them about **640 billion instructions a second**. The trunk's
    kernels sit at 200-310 billion, so what is left is in the instruction count,
@@ -131,29 +142,34 @@ and prints a range; trust the range, not a pair.
    two vec4 loads and cut the kernel's instruction count by about 28%.
    Estimated, not measured - the accumulators then need a second vector axis
    (four slots by four rows), which is the intricate part.
-3. **`grid.attend` again, at 150 tokens.** Staging its keys was worth 1.9x, but
+4. **`grid.attend` again, at 150 tokens.** Staging its keys was worth 1.9x, but
    it is still the only cubic kernel and it is second-largest at both sizes. Two
    attacks are measured and LOST (more than one query an invocation; a vec4
    score accumulator) - read AF3.md before starting. What has NOT been tried:
    splitting the keys across invocations with a combining pass, which trades a
    second dispatch for occupancy it does not have at small N.
-4. **`single-transition`, 27 ms for 59 rows.** Untouched and under-occupied: 59
+5. **`single-transition`, 27 ms for 59 rows.** Splitting it into two dispatches
+   was tried and measured 65 ms against 27; see AF3.md. Untouched and under-occupied: 59
    workgroups, and its row tile cannot rise because there are no rows, so it is
    the one kernel still generating scalar code. The only real fix is
    materialising the widened intermediate (362 KB at this size) and splitting it
    into two dispatches - which the pair track must NOT do, at 1.47 GB for 600
    tokens. Two code paths for one kernel; judged not worth it yet.
-5. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
+6. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
    from a real client; everything here was localhost, where fetch is 31 ms. The
    fork at `martin-steinegger/alphafold2-webgpu` packs to 8 shards and has
    download-throttling and progress commits worth mining. Blocked on a real
    cold-load number.
-6. **Other Stop-then-retry paths.** A user hit "mergeSearchedChains is not
+7. **Other Stop-then-retry paths.** A user hit "mergeSearchedChains is not
    defined" by stopping a fold and folding again. Fixed, and the search-reuse
    decision was extracted to `planSearchReuse` with tests - but `af2Cache` and the
    recycle-continuation logic that reuses `trunkCache` are the same shape of
    stateful code with the same absence of tests.
-7. **AF2 has no official-value gate on this machine.** Partly closed:
+8. **AF2 has no official-value gate on this machine.** Four differential gates
+   now exist - `check-evoformer-{transition,opm,attention}.js` and
+   `check-triangle-residual.js` - each with its own CPU reference. They say the
+   kernels compute the operations; they do not say AlphaFold agrees. Partly
+   closed:
    `tools/gpu/check-triangle-residual.js` now covers the one path only AF2
    reaches - the residual form of the triangle output projection - and fails at
    1.0 relative if the two forms are swapped. The rest still rests on
