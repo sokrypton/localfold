@@ -38,6 +38,7 @@ export const MODEL_BUNDLES = {
   monomer: {
     model: "model_1_ptm",
     directory: "./model/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/69ca4a88186ad1782b6a821b451fc7e781daca3a/af2-monomer/",
     release: "model1-ptm",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
@@ -58,6 +59,7 @@ export const MODEL_BUNDLES = {
   af3: {
     model: "alphafold3",
     directory: "./model-af3-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/69ca4a88186ad1782b6a821b451fc7e781daca3a/af3-int5/",
     release: "af3-int5",
     variable: "LOCALFOLD_INCLUDE_AF3_MODEL",
     load: () => import("./af3.js"),
