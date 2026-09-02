@@ -1010,6 +1010,36 @@ export class Af3AtomEncoderGpu {
     const up = (label, data) => keep(this.allocator.upload(label, data, storage));
     const alloc = (label, bytes, extra = 0) =>
       keep(this.allocator.allocate(label, bytes, storage | extra));
+    // 🔴 THE STATIC HALF OF THIS ENCODER SURVIVES THE CALL, WHEN THE CALLER
+    // ASKS. Everything built from the reference conformers, the gathers and the
+    // trunk - the projected trunk tensors, the query and key conditioning and
+    // their masks, the atom pair conditioning and its logits - has nothing to
+    // do with the noisy positions or the noise level, and a sampler calls this
+    // two hundred times down one schedule. `build-pair` alone measured 14.6 ms
+    // of a 147 ms denoiser call, rebuilding the identical tensor every time.
+    //
+    // These are created OUTSIDE the pooled allocator, because a pooled buffer
+    // is recycled at the end of the run that made it, and released only when
+    // the cache is dropped.
+    const staticCache = options.staticCache;
+    // 🔴 BUILD IF ANY OF THEM HAD TO BE CREATED, not if the last one was. They
+    // are created together, so a partially populated cache means a shape
+    // changed underneath it - and skipping the build then would run the blocks
+    // against one molecule's conditioning and another's gathers.
+    let buildStatic = staticCache === undefined;
+    const persistent = (label, bytes, extra = 0) => {
+      if (staticCache === undefined) return alloc(label, bytes, extra);
+      const size = Math.ceil(bytes / 4) * 4;
+      const found = staticCache[label];
+      if (found !== undefined && found.size === size) return { buffer: found };
+      found?.destroy();
+      buildStatic = true;
+      const buffer = this.device.createBuffer({
+        label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
+      });
+      staticCache[label] = buffer;
+      return { buffer };
+    };
     const ints = (source) => Int32Array.from(source, (v) => Number(v));
     const floats = (source) => Float32Array.from(source, (v) => Number(v));
 
@@ -1079,15 +1109,19 @@ export class Af3AtomEncoderGpu {
       const queriesRefBuffer = up("atom.q-ref", queriesRef);
       const keysRefBuffer = up("atom.k-ref", keysRef);
 
-      const trunkSingleProjected = alloc("atom.trunk-single-p", tokens * channels * 4);
-      const trunkPairProjected = alloc("atom.trunk-pair-p", tokens * tokens * pairChannels * 4);
-      const queriesCond = alloc("atom.q-cond", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
-      const queriesMask = alloc("atom.q-mask", queryRows * 4, GPUBufferUsage.COPY_SRC);
-      const keysCond = alloc("atom.k-cond", keyRows * channels * 4, GPUBufferUsage.COPY_SRC);
-      const keysMask = alloc("atom.k-mask", keyRows * 4, GPUBufferUsage.COPY_SRC);
+      const trunkSingleProjected = persistent("atom.trunk-single-p", tokens * channels * 4);
+      const trunkPairProjected = persistent("atom.trunk-pair-p",
+        tokens * tokens * pairChannels * 4);
+      const queriesCond = persistent("atom.q-cond", queryRows * channels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const queriesMask = persistent("atom.q-mask", queryRows * 4, GPUBufferUsage.COPY_SRC);
+      const keysCond = persistent("atom.k-cond", keyRows * channels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const keysMask = persistent("atom.k-mask", keyRows * 4, GPUBufferUsage.COPY_SRC);
       const act = alloc("atom.act", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
-      const pair = alloc("atom.pair", pairRows * pairChannels * 4, GPUBufferUsage.COPY_SRC);
-      const logits = alloc("atom.logits", weights.blocks.length * subsets * heads
+      const pair = persistent("atom.pair", pairRows * pairChannels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const logits = persistent("atom.logits", weights.blocks.length * subsets * heads
         * queries * keys * 4);
       const q = alloc("atom.q", queryRows * width * 4);
       const k = alloc("atom.k", keyRows * width * 4);
@@ -1139,25 +1173,30 @@ export class Af3AtomEncoderGpu {
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));
 
-      run("trunk-single", compiled.trunkSingle,
-          [trunkSingleCond, pairWeights, trunkSingleProjected], Math.ceil(tokens / 64));
-      const tp = lin(tokens * tokens);
-      run("trunk-pair", compiled.trunkPair,
-          [trunkPairCond, pairWeights, trunkPairProjected], tp[0], tp[1]);
       const qr = lin(queryRows);
-      run("build-queries", compiled.buildQueries,
-          [conditioning, atomMask, gatherBuffer, trunkSingleProjected, queriesCond,
-           queriesMask], qr[0], qr[1]);
-      const kr = lin(keyRows);
-      run("build-keys", compiled.buildKeys,
-          [queriesCond, queriesMask, gatherBuffer, keysCond, keysMask], kr[0], kr[1]);
+      const pr = lin(pairRows);
+      // 🔴 EVERYTHING HERE EXCEPT build-act IS THE SAME ON EVERY CALL. See
+      // `persistent` above: with a staticCache these run once per fold.
+      if (buildStatic) {
+        run("trunk-single", compiled.trunkSingle,
+            [trunkSingleCond, pairWeights, trunkSingleProjected], Math.ceil(tokens / 64));
+        const tp = lin(tokens * tokens);
+        run("trunk-pair", compiled.trunkPair,
+            [trunkPairCond, pairWeights, trunkPairProjected], tp[0], tp[1]);
+        run("build-queries", compiled.buildQueries,
+            [conditioning, atomMask, gatherBuffer, trunkSingleProjected, queriesCond,
+             queriesMask], qr[0], qr[1]);
+        const kr = lin(keyRows);
+        run("build-keys", compiled.buildKeys,
+            [queriesCond, queriesMask, gatherBuffer, keysCond, keysMask], kr[0], kr[1]);
+        run("build-pair", compiled.buildPair,
+            [queriesCond, keysCond, queriesRefBuffer, keysRefBuffer, gatherBuffer,
+             trunkPairProjected, pairWeights, pair], pr[0], pr[1]);
+        run("pair-logits", compiled.pairLogits, [pair, pairWeights, logits], pr[0], pr[1]);
+      }
+      // ...and this one reads the noisy positions, so it runs every time.
       run("build-act", compiled.buildAct,
           [queriesCond, queriesMask, positions, gatherBuffer, pairWeights, act], qr[0], qr[1]);
-      const pr = lin(pairRows);
-      run("build-pair", compiled.buildPair,
-          [queriesCond, keysCond, queriesRefBuffer, keysRefBuffer, gatherBuffer,
-           trunkPairProjected, pairWeights, pair], pr[0], pr[1]);
-      run("pair-logits", compiled.pairLogits, [pair, pairWeights, logits], pr[0], pr[1]);
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
@@ -1197,6 +1236,7 @@ export class Af3AtomEncoderGpu {
       // still has them. The GPU still COMPUTES them, because the attention
       // blocks below read the buffers; only the copy back is skipped.
       const reuseStatic = options.reuseStatic;
+      void reuseStatic;
       if (reuseStatic === undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
                                    pairRows * pairChannels * 4);

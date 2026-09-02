@@ -152,6 +152,25 @@ export class Af3DiffusionHeadGpu {
   /** ...and the atom encoder's outputs that depend on it rather than on sigma. */
   #encoderStatic;
 
+  /** The GPU buffers behind those, kept across calls and dropped with them. */
+  #encoderBuffers = {};
+
+  /**
+   * Release what this head is holding on the device.
+   *
+   * 🔴 THE STATIC CACHE OUTLIVES A CALL BY DESIGN AND MUST NOT OUTLIVE THE
+   * FOLD. It is about 25 MB on a 59-residue chain - the atom pair conditioning
+   * and its logits are most of it - and a head is built per sampler run, so
+   * without this every fold would leave that behind until the collector
+   * happened to notice. Both samplers call it in a finally.
+   */
+  dispose() {
+    for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
+    this.#encoderBuffers = {};
+    this.#encoderStatic = undefined;
+    this.#conditioningPair = undefined;
+  }
+
   constructor(device) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
@@ -242,7 +261,13 @@ export class Af3DiffusionHeadGpu {
         targetFeat: input.targetFeat, noiseLevel: input.noiseLevel,
         features: input.features,
       }, weights.conditioning, { reusePair: cachedPair }));
-    if (cachedPair === undefined) this.#encoderStatic = undefined;
+    if (cachedPair === undefined) {
+      // A new trunk means a new fold: drop the encoder's device-side cache too,
+      // or the next call reuses the previous molecule's conditioning.
+      this.#encoderStatic = undefined;
+      for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
+      this.#encoderBuffers = {};
+    }
     this.#conditioningPair = { trunkPair: input.trunkPair, tokens, pair: cond.pair };
 
     // 🔴 MASKED AND RESCALED - see the note at the top.
@@ -270,6 +295,9 @@ export class Af3DiffusionHeadGpu {
       }, weights.encoder, {
         reuseStatic: this.#encoderStatic?.conditioning === input.conditioning
           ? this.#encoderStatic : undefined,
+        // ...and the DEVICE-side half of the same idea: the encoder's static
+        // tensors stay on the GPU between calls instead of being rebuilt.
+        staticCache: this.#encoderBuffers,
       }));
     // ...cached under the same identity rule as the pair conditioning above,
     // and invalidated by the same thing: a new fold brings a new trunk array.

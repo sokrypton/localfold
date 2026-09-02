@@ -28,6 +28,7 @@ import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
 import { normalFrom } from "../../src/af3/fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
+import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -76,9 +77,13 @@ export async function main(device, args) {
     noiseLevel: 16,
   };
 
+  // --profile times every labelled compute pass; see tools/gpu/profile.js.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   const head = new Af3DiffusionHeadGpu(device);
   const rows = [];
   for (let call = 0; call < calls; call += 1) {
+    // ...the last call only, so pipeline compilation is out of the numbers.
+    if (profile !== null && call === calls - 1) profile.reset();
     const started = performance.now();
     const out = await head.run(input, weights);
     rows.push({
@@ -86,6 +91,8 @@ export async function main(device, args) {
       ...Object.fromEntries(Object.entries(out.timings).map(([k, v]) => [k, Math.round(v)])),
     });
   }
+  const gpuPasses = profile === null ? undefined : await profile.report();
+  profile?.restore();
   const after = rows.slice(1);
   const mean = (pick) => {
     const values = after.map(pick).sort((a, b) => a - b);
@@ -97,6 +104,7 @@ export async function main(device, args) {
   };
   return {
     tokens, atoms: tokens * dense, subsets: batch.shape.subsets, weightLoadMs: loadMs,
+    ...(gpuPasses === undefined ? {} : { gpuPasses: gpuPasses.slice(0, 16) }),
     rows,
     range: {
       whole: spread((r) => r.whole),

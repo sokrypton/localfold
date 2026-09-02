@@ -45,6 +45,7 @@ export async function sampleOnGpu(device, input, weights, options) {
   }
   let previous = levels[0];
 
+  try {
   for (let step = 1; step <= stopAfter; step += 1) {
     const level = levels[step];
     positions = randomAugmentation(positions, input.atomMask, atoms, normal);
@@ -72,6 +73,11 @@ export async function sampleOnGpu(device, input, weights, options) {
     });
   }
   return positions;
+  } finally {
+    // 🔴 THE HEAD HOLDS ~25 MB OF DEVICE MEMORY BETWEEN CALLS, deliberately -
+    // the atom encoder's static tensors - and a head is built per run.
+    head.dispose();
+  }
 }
 
 /**
@@ -144,19 +150,26 @@ export async function flowOnGpu(device, input, weights, options) {
     positions[index] = normal() * levels[0];
   }
 
-  for (let cycle = 1; cycle <= cycles; cycle += 1) {
-    const noiseLevel = levels[cycle - 1];
-    const denoised = await head.run({ ...input, noiseLevel, positionsNoisy: positions },
-                                    weights);
-    positions = denoised.positions;
-    // The same shape sampleOnGpu reports, so a caller animates either the same
-    // way. Here the two tracks ARE the same array - there is no separate walk -
-    // and no frame needs superposing, because nothing was ever rotated.
-    await options.onStep?.({
-      step: cycle, steps: cycles, noiseLevel, tHat: noiseLevel,
-      positions: Float32Array.from(positions),
-      denoised: Float32Array.from(positions),
-    });
+  try {
+    for (let cycle = 1; cycle <= cycles; cycle += 1) {
+      const noiseLevel = levels[cycle - 1];
+      const denoised = await head.run({ ...input, noiseLevel, positionsNoisy: positions },
+                                      weights);
+      positions = denoised.positions;
+      // The same shape sampleOnGpu reports, so a caller animates either the
+      // same way. Here the two tracks ARE the same array - there is no separate
+      // walk - and no frame needs superposing, because nothing was ever
+      // rotated.
+      await options.onStep?.({
+        step: cycle, steps: cycles, noiseLevel, tHat: noiseLevel,
+        positions: Float32Array.from(positions),
+        denoised: Float32Array.from(positions),
+      });
+    }
+    return positions;
+  } finally {
+    // 🔴 SEE sampleOnGpu: the head keeps the atom encoder's static tensors on
+    // the device between calls, and a head is built per run.
+    head.dispose();
   }
-  return positions;
 }
