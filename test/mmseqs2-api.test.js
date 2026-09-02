@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "./harness.js";
 import {
   extractMmseqs2A3m, generateMmseqs2ComplexMsa, generateMmseqs2Msa,
-  generateMmseqs2PairedMsa, mergeSearchedChains, readTarFiles,
+  generateMmseqs2PairedMsa, mergeSearchedChains, planSearchReuse, readTarFiles,
+  searchCacheEntry,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
@@ -325,5 +326,67 @@ describe("re-merging a search for another model", () => {
     // AF3 fold must not leak paired rows into it.
     const { blocks } = mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model: "monomer" });
     expect(blocks.paired).toBe(null);
+  });
+});
+
+describe("reusing a search across folds", () => {
+  const complexCache = (chains, { paired = true } = {}) => ({
+    key: JSON.stringify(chains),
+    raw: {
+      chainA3ms: new Map(chains.map((c) => [c, `>q\n${c}\n`])),
+      ...(paired ? { pairedA3ms: new Map(chains.map((c) => [c, `>q\n${c}\n`])) } : {}),
+      depth: 12,
+    },
+  });
+
+  it("searches when there is nothing cached", () => {
+    expect(planSearchReuse({ cache: undefined, chains: ["AAAA"], family: "af3" }).reuse)
+      .toBe(false);
+  });
+
+  it("searches when the cache is for different chains", () => {
+    const cache = { key: JSON.stringify(["AAAA"]), raw: { single: {}, depth: 3 } };
+    expect(planSearchReuse({ cache, chains: ["CCCC"], family: "monomer" }).reuse).toBe(false);
+  });
+
+  it("reuses a one-chain search whole, whatever the model", () => {
+    const cache = { key: JSON.stringify(["AAAA"]), raw: { single: {}, depth: 3 } };
+    for (const family of ["monomer", "multimer", "af3"]) {
+      expect(planSearchReuse({ cache, chains: ["AAAA"], family }).reuse).toBe("single");
+    }
+  });
+
+  it("re-merges a complex rather than searching again when the model changes", () => {
+    const chains = ["AAAA", "CCCC"];
+    const cache = complexCache(chains);
+    expect(planSearchReuse({ cache, chains, family: "af3" }).reuse).toBe("merge");
+    expect(planSearchReuse({ cache, chains, family: "multimer" }).reuse).toBe("merge");
+  });
+
+  it("refuses a heteromer cache that was never paired", () => {
+    // 🔴 THE CASE THAT WOULD FOLD SILENTLY WRONG. A monomer search makes no
+    // paired request, so re-merging it for AF3 gives a complex with no paired
+    // rows - a worse prediction, not an error.
+    const chains = ["AAAA", "CCCC"];
+    const cache = complexCache(chains, { paired: false });
+    expect(planSearchReuse({ cache, chains, family: "af3" }).reuse).toBe(false);
+    expect(planSearchReuse({ cache, chains, family: "multimer" }).reuse).toBe(false);
+    // ...but the monomer wants no pairing, so the same cache serves it.
+    expect(planSearchReuse({ cache, chains, family: "monomer" }).reuse).toBe("merge");
+  });
+
+  it("treats a homomer as needing no pairing, so an unpaired cache serves it", () => {
+    const chains = ["AAAA", "AAAA"];
+    const cache = complexCache(chains, { paired: false });
+    expect(planSearchReuse({ cache, chains, family: "af3" }).needsPairing).toBe(false);
+    expect(planSearchReuse({ cache, chains, family: "af3" }).reuse).toBe("merge");
+  });
+
+  it("keeps a one-chain result whole and a complex in parts", () => {
+    const searched = { depth: 7, chainA3ms: new Map(), pairedA3ms: new Map(), text: "x" };
+    expect(Object.keys(searchCacheEntry({ chains: ["AAAA"], searched })).sort())
+      .toEqual(["depth", "single"]);
+    expect(Object.keys(searchCacheEntry({ chains: ["AAAA", "CCCC"], searched })).sort())
+      .toEqual(["chainA3ms", "depth", "pairedA3ms"]);
   });
 });

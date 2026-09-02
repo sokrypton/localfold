@@ -29,8 +29,8 @@ import { parseA3m } from "../src/input/a3m.js";
 // AND more than one chain, so a first fold never reaches it - and stopping a
 // fold partway is one of the few ways to get a filled cache and then fold
 // again. test/module-references.test.js now looks for the whole class.
-import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains }
-  from "../src/input/mmseqs2-api.js";
+import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
+  planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
@@ -242,15 +242,12 @@ async function alignmentText(chains, signal, family) {
       // a monomer search has no paired block to re-merge from; the cache is
       // then not usable and the search runs. Reusing it anyway would silently
       // fold a complex with no paired rows.
-      const searchKey = JSON.stringify(chains);
-      const needsPairing = family !== "monomer" && new Set(chains).size > 1;
-      const usable = searchCache?.key === searchKey
-        && (!needsPairing || searchCache.raw.pairedA3ms !== undefined);
+      const plan = planSearchReuse({ cache: searchCache, chains, family });
       let searched;
-      if (usable && chains.length === 1) {
+      if (plan.reuse === "single") {
         searched = searchCache.raw.single;
         status(`MSA reused · ${searched.depth} sequences`);
-      } else if (usable) {
+      } else if (plan.reuse === "merge") {
         const { chainA3ms, pairedA3ms, depth } = searchCache.raw;
         const merged = mergeSearchedChains({
           sequences: chains, chainA3ms, pairedA3ms, model: family,
@@ -262,10 +259,7 @@ async function alignmentText(chains, signal, family) {
           ? await generateMmseqs2Msa(query, searchOptions)
           : await generateMmseqs2ComplexMsa(chains, searchOptions);
         status(`MSA search found ${searched.depth} sequences`);
-        searchCache = { key: searchKey, raw: chains.length === 1
-          ? { single: searched, depth: searched.depth }
-          : { chainA3ms: searched.chainA3ms, pairedA3ms: searched.pairedA3ms,
-            depth: searched.depth } };
+        searchCache = { key: plan.key, raw: searchCacheEntry({ chains, searched }) };
       }
       // 🔴 THE BLOCKS COME BACK APART, AND AF3 NEEDS THEM THAT WAY. `text` is
       // the paired rows stacked above the unpaired ones, which is what the

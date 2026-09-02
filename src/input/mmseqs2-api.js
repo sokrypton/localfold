@@ -452,6 +452,55 @@ export async function generateMmseqs2ComplexMsa(sequenceValues, options = {}) {
  * @returns {{a3m: string, blocks: {paired: string|null, unpaired: string,
  *            unpairedProfile: string}}}
  */
+/**
+ * Whether a cached MSA search can answer this fold, and how.
+ *
+ * 🔴 THE SEARCH DOES NOT DEPEND ON THE MODEL AND THE MERGE DOES, so changing
+ * the model re-merges what is already here rather than asking api.colabfold.com
+ * the same question again. It is the one request this page makes off the
+ * machine and the slow part of a fold; repeating it to answer a question
+ * already answered is the worst thing the path can do.
+ *
+ * 🔴 EXCEPT WHEN THE NEW MODEL NEEDS PAIRING THE OLD SEARCH DID NOT ASK FOR.
+ * Pairing is a second request that only multimer and AF3 make, so a monomer
+ * search has no paired block to re-merge from. Reusing it anyway would silently
+ * fold a complex with no paired rows - which looks like a worse prediction
+ * rather than like a bug.
+ *
+ * 🔴 THIS LIVES HERE, NOT IN web/app.js, BECAUSE IT IS WHERE A CRASH CAME FROM.
+ * The reuse branch calls mergeSearchedChains, app.js did not import it, and the
+ * path needs a filled cache AND more than one chain - so no first fold reaches
+ * it and nothing in a DOM-free test could. As a pure function of the cache, the
+ * chains and the model, the decision is testable on its own.
+ *
+ * @param {{cache: {key: string, raw: object}|undefined, chains: string[],
+ *          family: "monomer"|"multimer"|"af3"}} input
+ * @returns {{reuse: "single"|"merge"|false, key: string, needsPairing: boolean}}
+ */
+export function planSearchReuse({ cache, chains, family }) {
+  const key = JSON.stringify(chains);
+  const needsPairing = family !== "monomer" && new Set(chains).size > 1;
+  const usable = cache?.key === key
+    && (!needsPairing || cache.raw?.pairedA3ms !== undefined);
+  if (!usable) return { reuse: false, key, needsPairing };
+  return { reuse: chains.length === 1 ? "single" : "merge", key, needsPairing };
+}
+
+/**
+ * What to remember from a completed search, in the shape planSearchReuse reads.
+ *
+ * 🔴 A ONE-CHAIN SEARCH KEEPS ITS RESULT WHOLE and a complex keeps the PARTS,
+ * because only a complex is ever re-merged - and the parts are what the merge
+ * needs. Keeping the merged text for a complex would cache an answer that is
+ * only right for the model that asked.
+ */
+export function searchCacheEntry({ chains, searched }) {
+  return chains.length === 1
+    ? { single: searched, depth: searched.depth }
+    : { chainA3ms: searched.chainA3ms, pairedA3ms: searched.pairedA3ms,
+      depth: searched.depth };
+}
+
 export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model }) {
   const merge = CHAIN_MERGES[model];
   if (merge === undefined) {
