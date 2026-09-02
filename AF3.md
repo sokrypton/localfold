@@ -39,6 +39,16 @@ in the Model dropdown.
 | 1QYS, flow 8, sigma0 2560 | 0.85-0.88 | 0.948 | four seeds, AF3's schedule |
 | 1QYS, diffusion 200 | 0.93-1.12 | 0.92-0.94 | across four seeds |
 
+🔴 **1QYS DOES NOT REPRODUCE ITS ROW AND HAS NOT FOR SOME TIME.** Measured
+2026-09-02 at `--mode=flow --steps=8 --recycles=1`, seeds 1, 2 and 3: **1.24,
+1.27 and 1.25 A**, TM 0.899-0.903, against the 0.89-0.92 above. Three recycles
+gives 1.23 A and pLDDT 81.2 rather than 69.8, so it is not a recycle count. It
+is not a regression from the kernel work either - the same input on the tree as
+of `ea063a0`, before any of it, gives 1.24 A and pLDDT 69.8 to the digit. 6MRR
+still measures inside its row (0.64 A, TM 0.960). The likeliest explanation is
+that this table predates the side-chain fix, which changed what the denoiser
+produces; it has not been re-run.
+
 🔴 THE FLOW STARTS AT 160 A NOW, WHICH COSTS 1QYS 0.04 A. Most of AF3's
 schedule sits above the level where the denoiser begins trusting the
 coordinates it is handed, so a walk from 2560 spends its first calls on a
