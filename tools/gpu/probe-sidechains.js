@@ -72,8 +72,7 @@ export async function main(device, args) {
   const mode = option(args, "mode", "flow");
   const steps = Number(option(args, "steps", "8"));
 
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = {
     trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
     confidence: await confidenceWeights(store), atomReference: await atomReference(store),

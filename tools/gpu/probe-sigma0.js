@@ -176,8 +176,7 @@ export async function main(device, args) {
   const seeds = option(args, "seeds", "1,2,3,4").split(",").map(Number);
   const only = option(args, "targets", "6MRR,1QYS").split(",");
 
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = {
     trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
     confidence: await confidenceWeights(store), atomReference: await atomReference(store),

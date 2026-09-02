@@ -93,7 +93,17 @@ const KEEP_FLOAT32 = /\/(scale|offset|bias)$|_bias$|_weight$|\/output_b$/;
 
 export async function openAf3Store(manifest = MANIFEST, quant = null, onProgress = undefined) {
   const store = await HttpTensorStore.open(manifest, onProgress);
-  if (quant === null) return store;
+  if (quant === null || quant === undefined) return store;
+  // 🔴 SEVEN TOOLS PASSED `{ fetchImplementation: fetch }` HERE. It is not a
+  // quantisation spec, so quantiseInPlace ran with an undefined group, walked
+  // no groups, and changed nothing - while Float32Array.from copied every
+  // tensor in the model. The measured cost on the full manifest was heap 760
+  // MiB -> 1340 MiB and a pass over 1.4 GiB of floats, for no effect at all.
+  // Naming the mistake is cheaper than measuring it again.
+  if (typeof quant !== "object" || !Number.isInteger(quant.bits) || !Number.isInteger(quant.group)) {
+    throw new TypeError("openAf3Store's second argument is a quantisation spec"
+      + " needing integer bits and group; pass null for the model as exported");
+  }
   const cache = new Map();
   const original = store.tensor.bind(store);
   store.tensor = async (name) => {

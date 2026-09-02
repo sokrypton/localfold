@@ -51,8 +51,7 @@ export async function main(device, args) {
     (_, index) => ALPHABET[index % ALPHABET.length]).join("");
 
   const batch = featuriseProtein(sequence, {});
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = { trunk: await trunkWeights(store, blocks, 4),
                     targetFeat: await targetFeatureWeights(store) };
   const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);

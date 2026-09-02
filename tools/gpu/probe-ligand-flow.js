@@ -164,8 +164,7 @@ export async function main(device, args) {
     components.push(parseCcdComponent(await response.text()));
   }
 
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = {
     trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
     confidence: await confidenceWeights(store), atomReference: await atomReference(store),

@@ -79,8 +79,7 @@ export async function main(device, args) {
   const batch = batchFromDump(dump);
   const { tokens, dense } = batch;
 
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const diffusion = await diffusionWeights(store);
   const reference = await atomReference(store);
 

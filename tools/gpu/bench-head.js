@@ -46,8 +46,7 @@ export async function main(device, args) {
 
   const batch = featuriseProtein(sequence, {});
   const { dense } = batch;
-  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
-                                   { fetchImplementation: fetch });
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const loadStart = performance.now();
   const weights = await diffusionWeights(store);
   const reference = await atomReference(store);
