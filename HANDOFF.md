@@ -193,6 +193,20 @@ and prints a range; trust the range, not a pair.
    `tools/gpu/check-evoformer-stack.js` is ported and will run wherever those
    captures live. Until then AF2 kernel changes rest on differential evidence.
 
+## Measured on AF2 and not kept
+
+- **Widening the transition's column tile from 64 to 128**, so a thread owns
+  sixteen columns as four vec4s rather than eight as two. Its two weight reads a
+  step are shared by every column, so this should have cut the read-to-
+  multiply-add ratio by a third - and the column axis is the safe one to widen,
+  since the ROW tile is shared with the structure module, whose linears run over
+  59 residues. It measured **22.2 ms against 18.7** on AF2's transition at 512
+  MSA rows, and took the structure module's encoded pass from 19.3 ms to 25.8.
+- **Unrolling that kernel's staging and writeback loops** at 64 columns, which
+  the wider tile needed and which looked free: 19.1 and 19.5 ms against 18.7 and
+  18.3, and the structure module unchanged within its noise. The loop with a
+  runtime component index compiles to something no worse than the unrolled form.
+
 ## Traps that cost time
 
 - **`profile-af2-block.js`'s BLOCK total drifts by 10% between processes**, on
