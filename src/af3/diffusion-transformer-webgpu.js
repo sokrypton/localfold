@@ -153,6 +153,50 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   const width = heads * dimension;
   const intermediate = channels * factor;
   const pairs = tokens * tokens;
+  const outLanes = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[outTile];
+  if (outLanes === undefined) {
+    throw new Error(`outTile ${outTile} is not 1, 2 or 4`);
+  }
+  const outChunk = Math.min(intermediate, shape.outChunk ?? 384);
+  if (intermediate % outChunk !== 0) {
+    throw new Error(`outChunk ${outChunk} does not divide the intermediate ${intermediate}`);
+  }
+  const outPerLane = Math.ceil((channels / splits) / lanes);
+  // 🔴 THE TOKEN TILE IS A VECTOR IN THE TWO WIDE PROJECTIONS TOO. Both read
+  // one activation per token of the tile and multiply it by the same weight, so
+  // one workgroup read and one vector multiply-add replace TILE of each - qkvg
+  // went from 24 instructions a channel to nine.
+  const tileWidth = Math.min(4, tile);
+  const tileGroups = tile / tileWidth;
+  const tileLanes = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[tileWidth];
+  if (tileLanes === undefined || !Number.isInteger(tileGroups)) {
+    throw new Error(`tile ${tile} is not 1, 2 or a multiple of 4`);
+  }
+  // Token t of the tile lives in group t/tileWidth, lane t%tileWidth. The
+  // staged activations are indexed by group and channel; a register array only
+  // by group.
+  const lane = (t) => tileWidth === 1 ? "" : `.${"xyzw"[t % tileWidth]}`;
+  const group = (t) => Math.floor(t / tileWidth);
+  const stagedAt = (t) => `xt[${group(t)}u * C + c]${lane(t)}`;
+  const accAt = (name, t) => `${name}[${group(t)}]${lane(t)}`;
+  const overTile = (body) =>
+    Array.from({ length: tile }, (_, t) => body(t)).join("\n      ");
+  const overGroups = (body) =>
+    Array.from({ length: tileGroups }, (_, g) => body(g)).join("\n      ");
+  const stageTokens = `  for (var c = local; c < C; c += ${lanes}u) {
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      var value = 0.0;
+      if (token < TOKENS) { value = xbuf[token * C + c]; }
+      ${stagedAt(t)} = value;
+    }`)}
+  }
+  workgroupBarrier();`;
+
+  const overOutTile = (body) =>
+    Array.from({ length: outTile }, (_, t) =>
+      body(t, outTile === 1 ? "" : `.${"xyzw"[t]}`)).join("\n      ");
+
 
   const common = `
 const TOKENS: u32 = ${tokens}u;
@@ -325,7 +369,7 @@ const SLICE: u32 = ${width / splits}u;
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
-var<workgroup> xt: array<f32, ${tile * channels}>;
+var<workgroup> xt: array<${tileLanes}, ${tileGroups * channels}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -334,52 +378,45 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let out_begin = group.y * SLICE;
   let local = local_id.x;
 
-  for (var i = local; i < TILE * C; i += ${lanes}u) {
-    let token = base_token + i / C;
-    var value = 0.0;
-    if (token < TOKENS) { value = xbuf[token * C + i % C]; }
-    xt[i] = value;
-  }
-  workgroupBarrier();
+${stageTokens}
 
   for (var o = local; o < SLICE; o += ${lanes}u) {
     let out = out_begin + o;
-    var q_acc: array<f32, ${tile}>;
-    var k_acc: array<f32, ${tile}>;
-    var v_acc: array<f32, ${tile}>;
-    var g_acc: array<f32, ${tile}>;
-    for (var t = 0u; t < TILE; t += 1u) {
-      q_acc[t] = weights[W_qBias + out];   // only q has a bias
-      k_acc[t] = 0.0;
-      v_acc[t] = 0.0;
-      g_acc[t] = 0.0;
-    }
+    var q_acc: array<${tileLanes}, ${tileGroups}>;
+    var k_acc: array<${tileLanes}, ${tileGroups}>;
+    var v_acc: array<${tileLanes}, ${tileGroups}>;
+    var g_acc: array<${tileLanes}, ${tileGroups}>;
+    ${overGroups((g) => `q_acc[${g}] = ${tileLanes}(weights[W_qBias + out]);
+      k_acc[${g}] = ${tileLanes}(0.0);
+      v_acc[${g}] = ${tileLanes}(0.0);
+      g_acc[${g}] = ${tileLanes}(0.0);`)}
     // 🔴 FOUR WEIGHTS READ ONCE, USED TILE TIMES. That ratio is the whole point
-    // of this kernel.
+    // of this kernel - and this stack reads all 566 MB of its weights once per
+    // TILE of tokens, so it is also the whole of its cost. See the note above.
     for (var c = 0u; c < C; c += 1u) {
       let column = c * WIDTH + out;
       let wq = weights[W_qProjection + column];
       let wk = weights[W_kProjection + column];
       let wv = weights[W_vProjection + column];
       let wg = weights[W_gatingQuery + column];
-      for (var t = 0u; t < TILE; t += 1u) {
-        let value = xt[t * C + c];
-        q_acc[t] += value * wq;
-        k_acc[t] += value * wk;
-        v_acc[t] += value * wv;
-        g_acc[t] += value * wg;
-      }
+      ${overGroups((g) => `{
+        let value = xt[${g}u * C + c];
+        q_acc[${g}] += value * wq;
+        k_acc[${g}] += value * wk;
+        v_acc[${g}] += value * wv;
+        g_acc[${g}] += value * wg;
+      }`)}
     }
-    for (var t = 0u; t < TILE; t += 1u) {
-      let token = base_token + t;
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
       if (token < TOKENS) {
         let index = token * WIDTH + out;
-        q[index] = q_acc[t];
-        k[index] = k_acc[t];
-        v[index] = v_acc[t];
-        gate[index] = g_acc[t];
+        q[index] = ${accAt("q_acc", t)};
+        k[index] = ${accAt("k_acc", t)};
+        v[index] = ${accAt("v_acc", t)};
+        gate[index] = ${accAt("g_acc", t)};
       }
-    }
+    }`)}
   }
 }`;
 
@@ -450,6 +487,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 
   // Gate, project back, apply the zero-init gate, and add to the residual.
+  // 🔴 ONE WORKGROUP A TOKEN, AND TILING IT WAS TRIED AND LOST. It reads the
+  // whole 768x768 output projection to project one token - 2.4 MB each, 3.3 GB
+  // a call, which is most of its 8.9 ms - so a tile of tokens looks like the
+  // same halving that paid in ffw-out. Tiled by two it measured 69 ms against
+  // 65 for the transformer as a whole, and adding a split of the output range
+  // to restore the workgroup count left it at 70. Whatever ffw-out's traffic
+  // was costing, this kernel's is not costing the same.
   const attentionOutput = `${common}
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
 @group(0) @binding(1) var<storage, read> gate: array<f32>;
@@ -568,7 +612,7 @@ const SLICE: u32 = ${intermediate / splits}u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> gated: array<f32>;
 
-var<workgroup> xt: array<f32, ${tile * channels}>;
+var<workgroup> xt: array<${tileLanes}, ${tileGroups * channels}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -576,52 +620,66 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base_token = group.x * TILE;
   let out_begin = group.y * SLICE;
   let local = local_id.x;
-  for (var i = local; i < TILE * C; i += ${lanes}u) {
-    let token = base_token + i / C;
-    var value = 0.0;
-    if (token < TOKENS) { value = xbuf[token * C + i % C]; }
-    xt[i] = value;
-  }
-  workgroupBarrier();
+${stageTokens}
 
   let wide = INTERMEDIATE * 2u;
   for (var o = local; o < SLICE; o += ${lanes}u) {
     let i = out_begin + o;
-    var gate_acc: array<f32, ${tile}>;
-    var value_acc: array<f32, ${tile}>;
-    for (var t = 0u; t < TILE; t += 1u) { gate_acc[t] = 0.0; value_acc[t] = 0.0; }
+    var gate_acc: array<${tileLanes}, ${tileGroups}>;
+    var value_acc: array<${tileLanes}, ${tileGroups}>;
+    ${overGroups((g) => `gate_acc[${g}] = ${tileLanes}(0.0);
+      value_acc[${g}] = ${tileLanes}(0.0);`)}
     // 🔴 BLOCKED, gate half first - the same convention as the trunk's
     // transition and the opposite of triangle multiplication's interleave.
     for (var c = 0u; c < C; c += 1u) {
       let column = W_ffwTransition1 + c * wide;
       let wg = weights[column + i];
       let wv = weights[column + INTERMEDIATE + i];
-      for (var t = 0u; t < TILE; t += 1u) {
-        let value = xt[t * C + c];
-        gate_acc[t] += value * wg;
-        value_acc[t] += value * wv;
-      }
+      ${overGroups((g) => `{
+        let value = xt[${g}u * C + c];
+        gate_acc[${g}] += value * wg;
+        value_acc[${g}] += value * wv;
+      }`)}
     }
-    for (var t = 0u; t < TILE; t += 1u) {
-      let token = base_token + t;
+    ${overGroups((g) => `let swished${g} =
+      gate_acc[${g}] / (${tileLanes}(1.0) + exp(-gate_acc[${g}])) * value_acc[${g}];`)}
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
       if (token < TOKENS) {
-        gated[token * INTERMEDIATE + i] = swish(gate_acc[t]) * value_acc[t];
+        gated[token * INTERMEDIATE + i] = swished${group(t)}${lane(t)};
       }
-    }
+    }`)}
   }
 }`;
 
   // ...and the way back, INTERMEDIATE -> C, gated by the zero-init conditioning
   // and added to the residual.
+  //
+  // 🔴 THE LARGEST KERNEL OF THE DENOISER, AND IT IS ITS WEIGHT READS. Every
+  // workgroup reads INTERMEDIATE x SLICE of transition2 to produce outTile
+  // tokens - 2.4 MB for two of them, 3.4 GB a call, which at the 445 GB/s
+  // tools/gpu/probe-alu.js measures for cached global reads is most of the
+  // 20 ms it took. A bigger tile divides that traffic and used to cost
+  // workgroup memory: outTile 4 wants 4 x INTERMEDIATE floats, 24 KB, and
+  // measured 85 ms against outTile 2's 74. Staging a CHUNK of the intermediate
+  // instead unties them - the accumulator survives the chunks - so the tile
+  // buys its traffic back without spending residency for it.
+  //
+  // 🔴 AND THE TILE IS THE VECTOR. The inner loop multiplies one weight against
+  // every token of the tile, so those tokens are exactly the axis to vectorise:
+  // one workgroup read and one vector multiply-add where there were outTile of
+  // each. See src/af3/transition-webgpu.js, which is the same kernel shape.
   const ffwOut = `${common}
 const TILE: u32 = ${outTile}u;
 const SLICE: u32 = ${channels / splits}u;
+const OUT_CHUNK: u32 = ${outChunk}u;
 @group(0) @binding(0) var<storage, read> gated: array<f32>;
 @group(0) @binding(1) var<storage, read> cond: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
 
-var<workgroup> wt: array<f32, ${outTile * intermediate}>;
+// One chunk of the intermediate, holding the tile's tokens as a vector.
+var<workgroup> wt: array<${outLanes}, ${outChunk}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -629,40 +687,63 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let base_token = group.x * TILE;
   let out_begin = group.y * SLICE;
   let local = local_id.x;
-  for (var i = local; i < TILE * INTERMEDIATE; i += ${lanes}u) {
-    let token = base_token + i / INTERMEDIATE;
-    var value = 0.0;
-    if (token < TOKENS) { value = gated[token * INTERMEDIATE + i % INTERMEDIATE]; }
-    wt[i] = value;
-  }
-  workgroupBarrier();
 
+  var acc: array<${outLanes}, ${outPerLane}>;
+  for (var slot = 0u; slot < ${outPerLane}u; slot += 1u) { acc[slot] = ${outLanes}(0.0); }
+
+  for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += OUT_CHUNK) {
+    // ...before overwriting the chunk the previous iteration is still reading.
+    workgroupBarrier();
+    for (var i = local; i < OUT_CHUNK; i += ${lanes}u) {
+      var staged: ${outLanes};
+      ${overOutTile((t, at) => `{
+        let token = base_token + ${t}u;
+        var value = 0.0;
+        if (token < TOKENS) { value = gated[token * INTERMEDIATE + chunk0 + i]; }
+        ${outTile === 1 ? "staged" : `staged${at}`} = value;
+      }`)}
+      wt[i] = staged;
+    }
+    workgroupBarrier();
+
+    var slot = 0u;
+    for (var o = local; o < SLICE; o += ${lanes}u) {
+      let c = out_begin + o;
+      for (var i = 0u; i < OUT_CHUNK; i += 1u) {
+        // ...read once, used by every token of the tile.
+        acc[slot] += wt[i] * weights[W_ffwTransition2 + (chunk0 + i) * C + c];
+      }
+      slot += 1u;
+    }
+  }
+
+  var slot = 0u;
   for (var o = local; o < SLICE; o += ${lanes}u) {
     let c = out_begin + o;
-    var acc: array<f32, ${outTile}>;
-    for (var t = 0u; t < TILE; t += 1u) { acc[t] = 0.0; }
-    for (var i = 0u; i < INTERMEDIATE; i += 1u) {
-      let w = weights[W_ffwTransition2 + i * C + c];
-      for (var t = 0u; t < TILE; t += 1u) { acc[t] += wt[t * INTERMEDIATE + i] * w; }
-    }
     // 🔴 THE ZERO-INIT GATE READS THE RAW CONDITIONING, not the normalised one.
     // Its weights are shared across the tile like every other matrix here; the
     // conditioning itself is 384 floats a token and stays in cache.
-    var zero_gate: array<f32, ${outTile}>;
-    for (var t = 0u; t < TILE; t += 1u) { zero_gate[t] = weights[W_ffwAdaptiveZeroCondBias + c]; }
+    var zero_gate = ${outLanes}(weights[W_ffwAdaptiveZeroCondBias + c]);
     for (var d = 0u; d < C_COND; d += 1u) {
       let w = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
-      for (var t = 0u; t < TILE; t += 1u) {
-        let token = base_token + t;
-        if (token < TOKENS) { zero_gate[t] += cond[token * C_COND + d] * w; }
-      }
+      ${overOutTile((t, at) => `{
+        let token = base_token + ${t}u;
+        if (token < TOKENS) {
+          ${outTile === 1 ? "zero_gate" : `zero_gate${at}`} += cond[token * C_COND + d] * w;
+        }
+      }`)}
     }
-    for (var t = 0u; t < TILE; t += 1u) {
-      let token = base_token + t;
+    // ...componentwise, so the gate is applied to every token of the tile at
+    // once rather than through the scalar logistic the other kernels use.
+    let contribution = acc[slot] / (${outLanes}(1.0) + exp(-zero_gate));
+    ${overOutTile((t, at) => `{
+      let token = base_token + ${t}u;
       if (token < TOKENS) {
-        act[token * C + c] = act[token * C + c] + acc[t] * logistic(zero_gate[t]);
+        act[token * C + c] = act[token * C + c]
+          + ${outTile === 1 ? "contribution" : `contribution${at}`};
       }
-    }
+    }`)}
+    slot += 1u;
   }
 }`;
 
@@ -730,14 +811,14 @@ export class Af3DiffusionTransformerGpu {
     const outTile = weights.outTile ?? Math.min(2, tile, fits(intermediate));
     const shape = { tokens, channels, condChannels, pairChannels, heads, dimension,
                     factor: weights.transitionFactor, lanes: weights.lanes,
-                    tile, splits, outTile };
+                    tile, splits, outTile, outChunk: weights.outChunk };
     const sources = createDiffusionTransformerShaders(shape, sample.offsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a
     // later run the pipeline compiled for a different width.
     const base = `af3-difftx:${tokens}:${channels}:${condChannels}:${pairChannels}`
       + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`
-      + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}`;
+      + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}:${weights.outChunk ?? "d"}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       if (name === "pairLogitsFor") continue;

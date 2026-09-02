@@ -626,6 +626,57 @@ tools/gpu/bench-diffusion-transformer.js, which takes about three seconds
 because it synthesises its weights, and gate any change on
 tools/gpu/probe-head-vs-af3-steps.js.
 
+## The denoiser, and the law that governs it
+
+A call is **125 -> 122 ms** at 59 tokens, its transformer 73 -> 67, from chunking
+and vectorising `ffw-out` (20.0 -> 16.7 ms of the 24 blocks). That is small, and
+the reason it is small is the useful part.
+
+🔴 **THE TOKEN TRANSFORMER READS ALL 566 MB OF ITS WEIGHTS ONCE PER TILE OF FOUR
+TOKENS, AND NOTHING ELSE ABOUT IT MATTERS.** Twenty-four blocks of 5.9M floats
+is 566 MB; the tile is 4, so a 59-token call makes fifteen passes over it, 8.5
+GB. At the 114 GB/s `tools/gpu/probe-alu.js` measures for STREAMED global reads
+- and 23.6 MB a block is far past any cache - that is 74 ms. The transformer
+measured 73. The model holds at every length:
+
+| tokens | tiles | measured | per tile |
+|---|---|---|---|
+| 59 | 15 | 67 ms | 4.5 |
+| 120 | 30 | 139 | 4.6 |
+| 240 | 60 | 326 | 5.4 |
+| 480 | 120 | 912 | 7.6 |
+
+The drift upward is the attention, which is quadratic; the linear term is 4.5 ms
+a tile, which is 566 MB at 126 GB/s.
+
+**So the only lever is the tile, and the tile is capped by workgroup memory.**
+`xt` holds TILE x 768 activations - 12 KB at four tokens, 24 at eight - and at
+eight the residency collapses: measured 343 ms against 320 at 240 tokens, where
+the traffic model says it should have been ~200. Chunking the channels the way
+`ffw-out` chunks the intermediate would untie those, and is the obvious next
+thing to try; it needs the accumulators to survive the chunks, which for `qkvg`
+is four matrices by the tile's groups by the outputs a lane owns.
+
+**The other lever nobody has pulled is f16 weights.** The traffic is bytes, not
+values, so half-width weights would halve it outright. README records f16
+COMPUTE being rejected (13% slower, because Apple runs f32 and f16 ALU at the
+same rate) - but that experiment says nothing about f16 STORAGE with f32
+accumulation, which is a bandwidth change rather than an arithmetic one, and
+this stack is bandwidth-bound by a factor of about three.
+
+### What else was tried on the head, and lost
+
+- **Tiling `attention-output` over tokens.** It reads the whole 768x768 output
+  projection to project one token - 2.4 MB each, 3.3 GB a call, most of its
+  8.9 ms - so a tile is the same halving that paid in `ffw-out`. Tiled by two the
+  transformer measured 69 ms against 65, and adding a split of the output range
+  to restore the workgroup count left it at 70.
+- **Vectorising `qkvg` and `ffw-wide` over the token tile**, which takes qkvg
+  from 24 instructions a channel to nine: 68 ms against 67. The same lesson the
+  trunk's transition taught - these kernels wait on their weight reads, not on
+  their arithmetic. It is kept because the code is simpler, not because it is
+  faster.
+
 ## Fixed: the side chains were compressed, and the loader was reading four wrong tensors
 
 Reported from the page: side chains badly placed and rings wrong, at any number
