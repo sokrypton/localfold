@@ -24,7 +24,13 @@
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
 import { parseA3m } from "../src/input/a3m.js";
-import { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "../src/input/mmseqs2-api.js";
+// 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
+// shipped missing from this list. That path needs a cache from an earlier fold
+// AND more than one chain, so a first fold never reaches it - and stopping a
+// fold partway is one of the few ways to get a filled cache and then fold
+// again. test/module-references.test.js now looks for the whole class.
+import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains }
+  from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
