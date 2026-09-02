@@ -20,8 +20,9 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
 import {
-  createAtomBlockShaders, createAtomCommon, packAtomBlockWeights,
+  createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
 } from "./atom-encoder-webgpu.js";
 
 const GRID_WIDTH = 32_768;
@@ -193,8 +194,9 @@ export class Af3AtomDecoderGpu {
     const keyRows = subsets * keys;
     const pairRows = subsets * queries * keys;
 
-    const pairPacked = packDecoderPairWeights(weights);
-    const blockPacked = weights.blocks.map(packAtomBlockWeights);
+    const pairPacked = packCached(weights, "dec.pair", () => packDecoderPairWeights(weights));
+    const blockPacked = weights.blocks.map(
+      (block) => packCached(block, "dec.block", () => packAtomBlockWeights(block)));
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels: weights.perTokenChannels,
@@ -247,9 +249,12 @@ export class Af3AtomDecoderGpu {
       const queriesCond = up("dec.q-cond", encoded.queriesCond);
       const keysCond = up("dec.k-cond", encoded.keysCond);
       const pairCond = up("dec.pair", encoded.pairCond);
-      const pairWeights = up("dec.pair-weights", pairPacked.data);
-      const blockBuffers = blockPacked.map((packed, index) =>
-        up(`dec.block-${index}`, packed.data));
+      const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
+        "dec.pair-weights", () => pairPacked.data) };
+      const blockBuffers = weights.blocks.map((block, index) => ({
+        buffer: residentWeightBuffer(this.device, block, "dec.block",
+                                     () => blockPacked[index].data),
+      }));
 
       const act = alloc("dec.act", queryRows * channels * 4);
       const logits = alloc("dec.logits",

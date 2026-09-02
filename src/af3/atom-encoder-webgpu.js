@@ -33,6 +33,7 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -46,6 +47,30 @@ const BLOCK_ORDER = [
   "ffwSingleCondBias", "ffwTransition1", "ffwTransition2",
   "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
 ];
+
+
+/**
+ * 🔴 PACKED ONCE PER WEIGHT OBJECT, NOT ONCE PER CALL. Packing allocates and
+ * memcpies the whole bundle, and a 200-step sampler ran this two hundred times
+ * over weights that never change. The offsets are still needed on every call,
+ * because the shader sources are generated from them, so the whole result is
+ * cached rather than only the data.
+ */
+const packedOnce = new WeakMap();
+
+export function packCached(key, label, pack) {
+  let forKey = packedOnce.get(key);
+  if (forKey === undefined) {
+    forKey = new Map();
+    packedOnce.set(key, forKey);
+  }
+  let found = forKey.get(label);
+  if (found === undefined) {
+    found = pack();
+    forKey.set(label, found);
+  }
+  return found;
+}
 
 export function packAtomBlockWeights(block) {
   const offsets = {};
@@ -954,8 +979,9 @@ export class Af3AtomEncoderGpu {
     const pairRows = subsets * queries * keys;
     const perTokenChannels = weights.perTokenChannels;
 
-    const pairPacked = packAtomPairWeights(weights);
-    const blockPacked = weights.blocks.map(packAtomBlockWeights);
+    const pairPacked = packCached(weights, "atom.pair", () => packAtomPairWeights(weights));
+    const blockPacked = weights.blocks.map(
+      (block) => packCached(block, "atom.block", () => packAtomBlockWeights(block)));
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
@@ -990,7 +1016,8 @@ export class Af3AtomEncoderGpu {
     try {
       const conditioning = up("atom.cond", input.conditioning);
       const atomMask = up("atom.mask", floats(input.atomMask));
-      const pairWeights = up("atom.pair-weights", pairPacked.data);
+      const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
+        "atom.pair-weights", () => pairPacked.data) };
       const trunkSingleCond = up("atom.trunk-single", input.trunkSingleCond);
       const trunkPairCond = up("atom.trunk-pair", input.trunkPairCond);
       const positions = up("atom.positions", input.tokenAtomsAct);
@@ -1092,8 +1119,10 @@ export class Af3AtomEncoderGpu {
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
       };
 
-      const blockBuffers = blockPacked.map((packed, index) =>
-        up(`atom.block-${index}`, packed.data));
+      const blockBuffers = weights.blocks.map((block, index) => ({
+        buffer: residentWeightBuffer(this.device, block, "atom.block",
+                                     () => blockPacked[index].data),
+      }));
 
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });

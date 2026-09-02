@@ -395,46 +395,65 @@ the head is the whole optimisation target. On a 59-residue chain, steady state:
 
 | stage        | as found | now |
 |--------------|---------|-----|
-| conditioning |    48   |  33 |
-| atom encoder |   100   |  83 |
-| transformer  |   549   | 107 |
-| atom decoder |    48   |  25 |
-| **one call** | **760** | **289** |
+| conditioning |    48   |  11 |
+| atom encoder |   100   |  37 |
+| transformer  |   549   |  74 |
+| atom decoder |    48   |  23 |
+| **one call** | **760** | **176** |
 
-What paid, in order:
+What paid, in order of size:
 
-1. **The block loop awaited `popErrorScope()` AND `onSubmittedWorkDone()` per
-   block** - two host-device round trips a block, 48 a call. `DeferredValidation`
-   in src/runtime/validation.js exists for exactly this and the pairformer had
-   used it for a year. 549 -> 273 ms.
-2. **The per-token workgroups were 64 lanes wide.** Those four kernels run one
-   workgroup per token, so the token count IS the occupancy: 59 workgroups of 64
-   threads is under 4000 for a GPU that wants tens of thousands. 256 lanes -
-   the ceiling, 512 does not compile - took 199 -> 99 ms.
-3. **Block weights packed and uploaded per call**, ~630 MB a call over weights
-   that never change. Now packed once per block object and resident on the
-   device.
-4. **The key rows are a gather of the query rows**, four slots to an atom, and
+1. **Two kernels had no grid at all.** `aggregate` and `single-initial` both
+   dispatched ceil(TOKENS/64) workgroups with one thread to a token - ONE
+   workgroup for any protein under 64 residues - and each lane then walked a
+   whole matmul, 2.4M multiply-adds in `aggregate`'s case. It was 43 ms of the
+   atom encoder's 82: more than its three cross-attention blocks put together,
+   in the pass that only pools their output.
+2. **The transformer was weight-bandwidth bound by 25x.** One workgroup per
+   token meant every workgroup read the block's entire weight set: 5.9M floats
+   for 2.4M MACs, a quarter of a MAC per byte where the device needs about
+   twelve. A call read 33 GB of weights, which at ~350 GB/s is the 107 ms it
+   took. Tiling over tokens - with the output range split so tiling does not
+   cost occupancy - took the stack to 74.
+3. **The block loop awaited `popErrorScope()` AND `onSubmittedWorkDone()` per
+   block**, two host-device round trips a block, 48 a call. `DeferredValidation`
+   exists for exactly this and the pairformer had used it for a year.
+4. **Per-token workgroups were 64 lanes wide**, so the token count was the
+   occupancy. 256 is the ceiling and the optimum.
+5. **Weights packed and uploaded per call.** Now packed once per weight object
+   and resident on the device - src/runtime/resident.js.
+6. **The key rows are a gather of the query rows**, four slots to an atom, and
    the atom transformer projected each slot separately. Projecting per atom and
-   expanding is a quarter of the work and NUMERICALLY IDENTICAL - the encoder
-   checker prints the same digits either way.
-5. **The pair conditioning does not depend on sigma** and was rebuilt 200 times.
+   expanding is a quarter of the work and numerically identical.
+7. **The pair conditioning does not depend on sigma** and was rebuilt 200 times.
 
-🔴 **AND FOUR THINGS THAT LOOKED OBVIOUS AND WERE WORTH NOTHING**, which is most
-of what this section is for: batching the 24 per-block submits into one encoder
-(199 vs 205); skipping ~14 MB of per-call readback that is immediately
-re-uploaded (4 ms - unified memory makes a copy back nearly free); widening the
-ATOM kernels the same way the transformer's were widened (they already launch
-1440 workgroups, so occupancy was never their limit); and replacing the atom
-kernels' redundant serial LayerNorm reductions - where all 64 lanes walk all 128
-channels four times - with workgroup reductions, which is strictly less work and
-came out inside the noise.
+🔴 **AND SIX THINGS THAT LOOKED OBVIOUS AND WERE WORTH NOTHING**, which is most
+of what this section is for. Batching the 24 per-block submits into one encoder
+(199 vs 205 ms). Skipping ~14 MB of per-call readback that is immediately
+re-uploaded (4 ms - unified memory makes a copy back nearly free). Widening the
+ATOM kernels the way the transformer's were widened (they already launch 1440
+workgroups). Replacing the atom kernels' redundant serial LayerNorms - all 64
+lanes walking all 128 channels, four times - with workgroup reductions, which is
+strictly less work and landed inside the noise. Raising
+maxComputeWorkgroupStorageSize to lift the token tile from four to eight, which
+lifts a ceiling that was never binding. And tiling further in general: 4 and 2
+beat every larger pair measured.
 
-The remaining floor is tiling: nothing reuses a weight tile in shared memory
-across tokens, so the transformer runs about 18 GFLOP in 107 ms, low single
-digit percent of the device. Measure with tools/gpu/bench-diffusion-transformer.js,
-which takes about three seconds because it synthesises its weights, and gate any
-change on tools/gpu/probe-head-vs-af3-steps.js.
+🔴 **TWO MEASUREMENTS LIED, BOTH BECAUSE THEY WERE TOO CHEAP.** A bisect of the
+atom encoder on a bench that averaged two calls, with a ten millisecond spread,
+reported a REMOVED pass as costing negative time and named the attention blocks;
+`aggregate`, four times bigger than anything guessed, only appeared once
+bench-head.js reported a median over nine calls with its range. And a 30%
+"speedup" from tile 8 was the shader factory defaulting the tile to 4 while the
+dispatch divided the token count by 8 - half the tokens were never projected. It
+was caught by two numbers disagreeing that should have been identical, not by a
+checker; the factory now throws rather than defaulting.
+
+The remaining floor is the transformer's arithmetic intensity, which tiling by
+four improves and does not fix. Measure with
+tools/gpu/bench-diffusion-transformer.js, which takes about three seconds
+because it synthesises its weights, and gate any change on
+tools/gpu/probe-head-vs-af3-steps.js.
 
 ## Fixed: the side chains were compressed, and the loader was reading four wrong tensors
 
