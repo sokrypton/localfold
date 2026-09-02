@@ -32,6 +32,7 @@
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
 import {
   GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
@@ -313,17 +314,25 @@ export class Af3PairformerStackGpu {
     // own lifetime, so nothing is held after the weights are dropped.
     const packedPair = packedCache.get(block)
       ?? packedCache.set(block, packPairTrackWeights(block)).get(block);
+    // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
+    // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
+    // every pass of every recycle of every fold, over weights that never change.
+    // src/runtime/resident.js keeps them on the device for the model's lifetime.
+    const resident = (label, pack) => ({
+      buffer: residentWeightBuffer(this.device, block, label, pack),
+    });
     const pairTrackWeights = {
-      outgoing: upload("w.tri.out", packedPair.outgoing),
-      incoming: upload("w.tri.in", packedPair.incoming),
-      grid1: upload("w.grid1", packedPair.grid1),
-      grid2: upload("w.grid2", packedPair.grid2),
-      transition: upload("w.pair-transition", packedPair.transition),
+      outgoing: resident("w.tri.out", () => packedPair.outgoing),
+      incoming: resident("w.tri.in", () => packedPair.incoming),
+      grid1: resident("w.grid1", () => packedPair.grid1),
+      grid2: resident("w.grid2", () => packedPair.grid2),
+      transition: resident("w.pair-transition", () => packedPair.transition),
     };
-    const singleTransitionWeights = upload("w.single-transition",
-      packTransitionWeights(block.singleTransition).data);
-    const singleWeights = upload("w.single", packSingleAttentionWeights(block.singleAttention).data);
-    const logitsWeights = upload("w.pair-logits", packPairLogitsWeights({
+    const singleTransitionWeights = resident("w.single-transition",
+      () => packTransitionWeights(block.singleTransition).data);
+    const singleWeights = resident("w.single",
+      () => packSingleAttentionWeights(block.singleAttention).data);
+    const logitsWeights = resident("w.pair-logits", () => packPairLogitsWeights({
       scale: block.singlePairLogitsNormScale,
       offset: block.singlePairLogitsNormOffset,
       projection: block.singlePairLogitsProjection,
