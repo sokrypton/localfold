@@ -5,6 +5,8 @@
  * the checkpoint - the trunk's loader is already long, and a typo in one leaf
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
+import { bind, stacked } from "./weights.js";
+
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
 const DECODER = `${HEAD}/diffusion_atom_transformer_decoder`;
@@ -15,42 +17,38 @@ const DECODER_STACK =
 const TX = `${HEAD}/transformer`;
 const TX_STACK = `${TX}/__layer_stack_with_per_layer/__layer_stack_with_per_layer/transformer`;
 
-async function slice(store, name, index, dims = 1) {
-  const whole = await store.tensor(name);
-  const shape = store.shape(name);
-  const count = dims === 2 ? shape[0] * shape[1] : shape[0];
-  const stride = whole.length / count;
-  return whole.subarray(index * stride, (index + 1) * stride);
-}
-
-/** One AdaLN cross-attention block, from either atom stack. */
-async function atomBlock(store, root, index) {
-  const at = (leaf) => slice(store, `${root}${leaf}`, index);
+/**
+ * One AdaLN cross-attention block, from either atom stack - as a DESCRIPTOR
+ * whose leaves decode when they are read. See src/af3/weights.js: the diffusion
+ * head is 920 MiB of float32 and the device already holds all of it.
+ */
+function atomBlock(store, root, index) {
+  const at = (leaf) => stacked(store, `${root}${leaf}`, index);
   return {
-    qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
-    qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
-    qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
-    qSingleCondBias: await at("qsingle_cond_bias/weights"),
-    kSingleCondLayerNormScale: await at("ksingle_cond_layer_norm/scale"),
-    kSingleCondScaleWeights: await at("ksingle_cond_scale/weights"),
-    kSingleCondScaleBias: await at("ksingle_cond_scale/bias"),
-    kSingleCondBias: await at("ksingle_cond_bias/weights"),
-    qProjection: await at("q_projection/weights"),
-    qBias: await at("q_projection/bias"),
-    kProjection: await at("k_projection/weights"),
-    vProjection: await at("v_projection/weights"),
-    gatingQuery: await at("gating_query/weights"),
-    Transition2: await at("transition2/weights"),
-    AdaptiveZeroCondWeights: await at("adaptive_zero_cond/weights"),
-    AdaptiveZeroCondBias: await at("adaptive_zero_cond/bias"),
-    ffwSingleCondLayerNormScale: await at("ffw_single_cond_layer_norm/scale"),
-    ffwSingleCondScaleWeights: await at("ffw_single_cond_scale/weights"),
-    ffwSingleCondScaleBias: await at("ffw_single_cond_scale/bias"),
-    ffwSingleCondBias: await at("ffw_single_cond_bias/weights"),
-    ffwTransition1: await at("ffw_transition1/weights"),
-    ffwTransition2: await at("ffw_transition2/weights"),
-    ffwAdaptiveZeroCondWeights: await at("ffw_adaptive_zero_cond/weights"),
-    ffwAdaptiveZeroCondBias: await at("ffw_adaptive_zero_cond/bias"),
+    qSingleCondLayerNormScale: at("qsingle_cond_layer_norm/scale"),
+    qSingleCondScaleWeights: at("qsingle_cond_scale/weights"),
+    qSingleCondScaleBias: at("qsingle_cond_scale/bias"),
+    qSingleCondBias: at("qsingle_cond_bias/weights"),
+    kSingleCondLayerNormScale: at("ksingle_cond_layer_norm/scale"),
+    kSingleCondScaleWeights: at("ksingle_cond_scale/weights"),
+    kSingleCondScaleBias: at("ksingle_cond_scale/bias"),
+    kSingleCondBias: at("ksingle_cond_bias/weights"),
+    qProjection: at("q_projection/weights"),
+    qBias: at("q_projection/bias"),
+    kProjection: at("k_projection/weights"),
+    vProjection: at("v_projection/weights"),
+    gatingQuery: at("gating_query/weights"),
+    Transition2: at("transition2/weights"),
+    AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
+    AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
+    ffwSingleCondLayerNormScale: at("ffw_single_cond_layer_norm/scale"),
+    ffwSingleCondScaleWeights: at("ffw_single_cond_scale/weights"),
+    ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
+    ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
+    ffwTransition1: at("ffw_transition1/weights"),
+    ffwTransition2: at("ffw_transition2/weights"),
+    ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
+    ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
   };
 }
 
@@ -96,9 +94,9 @@ export async function targetFeatureWeights(store) {
       pairInputLayerNormScale: await store.tensor(`${encoder}/pair_input_layer_norm/scale`),
       pairLogitsProjection: await store.tensor(`${encoder}/pair_logits_projection/weights`),
       projectAtomFeaturesForAggr: await W("project_atom_features_for_aggr"),
-      blocks: [await atomBlock(store, stack, 0),
-               await atomBlock(store, stack, 1),
-               await atomBlock(store, stack, 2)],
+      blocks: [await bind(store, atomBlock(store, stack, 0)),
+               await bind(store, atomBlock(store, stack, 1)),
+               await bind(store, atomBlock(store, stack, 2))],
       // 🔴 THREE WEIGHTS THIS ENCODER DOES NOT HAVE, AT THE RIGHT LENGTHS AND
       // FULL OF ZEROS. Af3AtomEncoderGpu is a superset of this module: it also
       // adds the trunk's single, the trunk's pair and an embedding of the noisy
@@ -149,29 +147,29 @@ export async function diffusionWeights(store, superBlocks = 6) {
   for (let s = 0; s < superBlocks; s += 1) {
     const blocks = [];
     for (let inner = 0; inner < 4; inner += 1) {
-      const at = (leaf) => slice(store, `${TX_STACK}${leaf}`, s * 4 + inner, 2);
-      blocks.push({
-        SingleCondLayerNormScale: await at("single_cond_layer_norm/scale"),
-        SingleCondScaleWeights: await at("single_cond_scale/weights"),
-        SingleCondScaleBias: await at("single_cond_scale/bias"),
-        SingleCondBias: await at("single_cond_bias/weights"),
-        qProjection: await at("q_projection/weights"),
-        qBias: await at("q_projection/bias"),
-        kProjection: await at("k_projection/weights"),
-        vProjection: await at("v_projection/weights"),
-        gatingQuery: await at("gating_query/weights"),
-        Transition2: await at("transition2/weights"),
-        AdaptiveZeroCondWeights: await at("adaptive_zero_cond/weights"),
-        AdaptiveZeroCondBias: await at("adaptive_zero_cond/bias"),
-        ffwSingleCondLayerNormScale: await at("ffw_single_cond_layer_norm/scale"),
-        ffwSingleCondScaleWeights: await at("ffw_single_cond_scale/weights"),
-        ffwSingleCondScaleBias: await at("ffw_single_cond_scale/bias"),
-        ffwSingleCondBias: await at("ffw_single_cond_bias/weights"),
-        ffwTransition1: await at("ffw_transition1/weights"),
-        ffwTransition2: await at("ffw_transition2/weights"),
-        ffwAdaptiveZeroCondWeights: await at("ffw_adaptive_zero_cond/weights"),
-        ffwAdaptiveZeroCondBias: await at("ffw_adaptive_zero_cond/bias"),
-      });
+      const at = (leaf) => stacked(store, `${TX_STACK}${leaf}`, s * 4 + inner, 2);
+      blocks.push(await bind(store, {
+        SingleCondLayerNormScale: at("single_cond_layer_norm/scale"),
+        SingleCondScaleWeights: at("single_cond_scale/weights"),
+        SingleCondScaleBias: at("single_cond_scale/bias"),
+        SingleCondBias: at("single_cond_bias/weights"),
+        qProjection: at("q_projection/weights"),
+        qBias: at("q_projection/bias"),
+        kProjection: at("k_projection/weights"),
+        vProjection: at("v_projection/weights"),
+        gatingQuery: at("gating_query/weights"),
+        Transition2: at("transition2/weights"),
+        AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
+        AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
+        ffwSingleCondLayerNormScale: at("ffw_single_cond_layer_norm/scale"),
+        ffwSingleCondScaleWeights: at("ffw_single_cond_scale/weights"),
+        ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
+        ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
+        ffwTransition1: at("ffw_transition1/weights"),
+        ffwTransition2: at("ffw_transition2/weights"),
+        ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
+        ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
+      }));
     }
     groups.push({
       pairLogitsProjection: projections.subarray(s * projectionStride,
@@ -237,9 +235,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
       embedTrunkPairCond: await T("diffusion_embed_trunk_pair_cond/weights"),
       atomPositionsToFeatures: await T("diffusion_atom_positions_to_features/weights"),
       projectAtomFeaturesForAggr: await T("diffusion_project_atom_features_for_aggr/weights"),
-      blocks: [await atomBlock(store, ENCODER_STACK, 0),
-               await atomBlock(store, ENCODER_STACK, 1),
-               await atomBlock(store, ENCODER_STACK, 2)],
+      blocks: [await bind(store, atomBlock(store, ENCODER_STACK, 0)),
+               await bind(store, atomBlock(store, ENCODER_STACK, 1)),
+               await bind(store, atomBlock(store, ENCODER_STACK, 2))],
     },
     decoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 768,
@@ -249,9 +247,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
         await T("diffusion_project_token_features_for_broadcast/weights"),
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),
       atomFeaturesToPositionUpdate: await T("diffusion_atom_features_to_position_update/weights"),
-      blocks: [await atomBlock(store, DECODER_STACK, 0),
-               await atomBlock(store, DECODER_STACK, 1),
-               await atomBlock(store, DECODER_STACK, 2)],
+      blocks: [await bind(store, atomBlock(store, DECODER_STACK, 0)),
+               await bind(store, atomBlock(store, DECODER_STACK, 1)),
+               await bind(store, atomBlock(store, DECODER_STACK, 2))],
     },
   };
 }

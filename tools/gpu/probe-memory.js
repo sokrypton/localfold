@@ -13,8 +13,8 @@
  * This walks the load in stages and reports usedJSHeapSize after each, so the
  * cost of each retention can be named rather than guessed at.
  */
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
+import { openAf3Store, trunkWeights, confidenceWeights } from "../../src/af3/weights.js";
+import { targetFeatureWeights, diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
@@ -57,7 +57,15 @@ export async function main(device, args) {
 
   const weights = { trunk: await trunkWeights(store, blocks, 4),
                     targetFeat: await targetFeatureWeights(store) };
-  await note("weights decoded");
+  await note("trunk weights");
+  // ...and the rest of what a fold needs, so the page's heap can be attributed
+  // rather than guessed at from the trunk alone.
+  weights.diffusion = await diffusionWeights(store);
+  await note("+ diffusion head");
+  weights.confidence = await confidenceWeights(store);
+  await note("+ confidence");
+  weights.atomReference = await atomReference(store);
+  await note("+ atom reference");
 
   const tokens = Number(option(args, "tokens", "59"));
   const rows = Number(option(args, "msa", "32"));

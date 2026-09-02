@@ -35,7 +35,7 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
-
+import { releaseWeights } from "./weights.js";
 const GRID_WIDTH = 32_768;
 
 const BLOCK_ORDER = [
@@ -46,25 +46,6 @@ const BLOCK_ORDER = [
   "ffwSingleCondBias", "ffwTransition1", "ffwTransition2",
   "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
 ];
-
-/**
- * 🔴 PACKED ONCE PER BLOCK OBJECT, NOT ONCE PER CALL. A block is about 6.5M
- * floats, so packing twenty-four of them allocates and memcpies ~630 MB of
- * CPU-side Float32Array on every denoiser call - and a 200-step fold makes 200
- * of those calls with the SAME weights each time. The keys are the weight
- * objects the loader built, which live as long as the model does, so a WeakMap
- * lets the cache go when the model does.
- */
-const packed = new WeakMap();
-
-export function packBlockWeightsCached(block) {
-  let entry = packed.get(block);
-  if (entry === undefined) {
-    entry = packBlockWeights(block);
-    packed.set(block, entry);
-  }
-  return entry;
-}
 
 /**
  * Block weights uploaded once and left on the device.
@@ -86,7 +67,16 @@ export function packBlockWeightsCached(block) {
  */
 const residentBlocks = new WeakMap();
 
-function residentBlockBuffer(device, block, packedBlock) {
+/**
+ * 🔴 PACKED ONLY ON A MISS, AND THEN LET GO OF. A block is about 6.5M floats,
+ * so packing twenty-four of them memcpies ~630 MB of Float32Array - which a
+ * 200-step fold used to do two hundred times over weights that never change.
+ * Caching the packed arrays in a WeakMap fixed that and then held 630 MB of
+ * host memory for the model's lifetime, beside the same numbers already on the
+ * device. Passing a thunk keeps the packing at once per block and lets the
+ * array die with the call that made it.
+ */
+function residentBlockBuffer(device, block, pack) {
   let byDevice = residentBlocks.get(device);
   if (byDevice === undefined) {
     byDevice = new WeakMap();
@@ -94,6 +84,7 @@ function residentBlockBuffer(device, block, packedBlock) {
   }
   let buffer = byDevice.get(block);
   if (buffer === undefined) {
+    const packedBlock = pack();
     // 🔴 NOT THROUGH allocator.upload, WHOSE ALLOCATIONS ARE POOLED AND
     // RECYCLED at the end of the run that made them. This one has to outlive
     // every run, so it is created directly and never released.
@@ -935,8 +926,12 @@ export class Af3DiffusionTransformerGpu {
         for (let inner = 0; inner < group.blocks.length; inner += 1) {
           const block = group.blocks[inner];
           const blockWeights = {
-            buffer: residentBlockBuffer(this.device, block, packBlockWeightsCached(block)),
+            buffer: residentBlockBuffer(this.device, block, () => packBlockWeights(block)),
           };
+          // ...and the host's float32 goes: every buffer this block needs is on
+          // the device for the model's lifetime. A lazily loaded weight object
+          // decodes again if anything reads it after this.
+          releaseWeights(block);
           const pairGroups = Math.ceil(pairs / 64);
           run("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
               Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));

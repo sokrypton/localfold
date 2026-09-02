@@ -137,13 +137,18 @@ export function tensor(store, name) {
  * anything reads it; tensorRangeSync is synchronous so this can sit behind a
  * property getter.
  */
-function stacked(store, name, index) {
+export function stacked(store, name, index, dims = 1) {
   const shape = store.shape(name);
-  if (index >= shape[0]) throw new Error(`${name} has ${shape[0]} blocks; asked for ${index}`);
-  const stride = shape.slice(1).reduce((product, value) => product * value, 1);
+  // ...`dims` is how many LEADING axes the stack occupies: the diffusion
+  // transformer nests a stack of six inside a stack of four, so its blocks are
+  // indexed over both.
+  const count = dims === 2 ? shape[0] * shape[1] : shape[0];
+  if (index >= count) throw new Error(`${name} has ${count} blocks; asked for ${index}`);
+  const stride = shape.slice(dims).reduce((product, value) => product * value, 1);
   const thunk = () => store.tensorRangeSync(name, index * stride, stride);
   thunk.tensorName = name;
   thunk.blockIndex = index;
+  thunk.blockDims = dims;
   return thunk;
 }
 
@@ -209,11 +214,11 @@ export function releaseWeights(weights) {
  * of one. Where it cannot, the descriptor is materialised eagerly from whole
  * tensors, which is what this did before and is still correct - just larger.
  */
-async function bind(store, fields) {
+export async function bind(store, fields) {
   if (typeof store.tensorRangeSync !== "function" || typeof store.open !== "function") {
     const eager = {};
     for (const [key, value] of Object.entries(fields)) {
-      if (typeof value === "function") eager[key] = await layer(store, value.tensorName, value.blockIndex);
+      if (typeof value === "function") eager[key] = await sliceOf(store, value);
       else if (value !== null && typeof value === "object" && !ArrayBuffer.isView(value)) {
         eager[key] = await bind(store, value);
       } else eager[key] = value;
@@ -226,6 +231,15 @@ async function bind(store, fields) {
   const object = materialise(fields, memo);
   Object.defineProperty(object, RELEASE, { value: () => memo.clear() });
   return object;
+}
+
+/** The eager form of a thunk, for a store that cannot read a range. */
+async function sliceOf(store, thunk) {
+  const whole = await store.tensor(thunk.tensorName);
+  const shape = store.shape(thunk.tensorName);
+  const count = thunk.blockDims === 2 ? shape[0] * shape[1] : shape[0];
+  const stride = whole.length / count;
+  return whole.subarray(thunk.blockIndex * stride, (thunk.blockIndex + 1) * stride);
 }
 
 /** One block's slice of a tensor stacked over blocks. */
