@@ -167,10 +167,16 @@ export const ATTENTION_PROJECT_SHADER = `${COMMON}
 @group(0) @binding(5) var<storage, read_write> value: array<f32>;
 @group(0) @binding(6) var<storage, read_write> gate: array<f32>;
 var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_query_weight: array<f32, 128>;
-var<workgroup> tile_key_weight: array<f32, 128>;
-var<workgroup> tile_value_weight: array<f32, 128>;
-var<workgroup> tile_gate_weight: array<f32, 128>;
+// 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. q, k, v and the gate are four matrices
+// contracted over the same normalised activation at the same (channel, output)
+// cell, so the four weights a cell needs are always wanted together: packed as
+// a vec4 the inner loop reads them in ONE instruction and accumulates them in
+// one multiply-add instead of four. Ten workgroup reads bought sixteen
+// multiply-adds; four buy the same sixteen. tools/gpu/probe-alu.js puts
+// workgroup reads at 394 billion a second against 580 billion vec4
+// multiply-adds, so the reads were the larger term. AF3's triangle projection
+// is the same change; see src/triangle/shaders.js.
+var<workgroup> tile_weight: array<vec4<f32>, 128>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -184,17 +190,18 @@ fn main(
   let hd = group.x * 16u + local.x;
   let second_hd = hd + 8u;
   let tile_index = local.y * 8u + local.x;
-  var q_00 = 0.0; var k_00 = 0.0; var v_00 = 0.0; var g_00 = 0.0;
-  var q_01 = 0.0; var k_01 = 0.0; var v_01 = 0.0; var g_01 = 0.0;
-  var q_10 = 0.0; var k_10 = 0.0; var v_10 = 0.0; var g_10 = 0.0;
-  var q_11 = 0.0; var k_11 = 0.0; var v_11 = 0.0; var g_11 = 0.0;
+  // Each cell accumulates (query, key, value, gate).
+  var acc_00 = vec4<f32>(0.0);
+  var acc_01 = vec4<f32>(0.0);
+  var acc_10 = vec4<f32>(0.0);
+  var acc_11 = vec4<f32>(0.0);
   if (hd < projected) {
-    g_00 = weights[p.gating_bias + hd];
-    g_10 = g_00;
+    acc_00.w = weights[p.gating_bias + hd];
+    acc_10.w = acc_00.w;
   }
   if (second_hd < projected) {
-    g_01 = weights[p.gating_bias + second_hd];
-    g_11 = g_01;
+    acc_01.w = weights[p.gating_bias + second_hd];
+    acc_11.w = acc_01.w;
   }
   for (var c0 = 0u; c0 < p.channels; c0 += 8u) {
     let source_c = c0 + local.x;
@@ -210,62 +217,56 @@ fn main(
     for (var column_block = 0u; column_block < 2u; column_block += 1u) {
       let tile_offset = tile_index + column_block * 64u;
       let output_hd = hd + column_block * 8u;
-      tile_query_weight[tile_offset] = 0.0;
-      tile_key_weight[tile_offset] = 0.0;
-      tile_value_weight[tile_offset] = 0.0;
-      tile_gate_weight[tile_offset] = 0.0;
+      var packed = vec4<f32>(0.0);
       if (output_hd < projected && weight_c < p.channels) {
         let weight_index = weight_c * projected + output_hd;
-        tile_query_weight[tile_offset] = weights[p.query_weight + weight_index];
-        tile_key_weight[tile_offset] = weights[p.key_weight + weight_index];
-        tile_value_weight[tile_offset] = weights[p.value_weight + weight_index];
-        tile_gate_weight[tile_offset] = weights[p.gating_weight + weight_index];
+        packed = vec4<f32>(weights[p.query_weight + weight_index],
+                           weights[p.key_weight + weight_index],
+                           weights[p.value_weight + weight_index],
+                           weights[p.gating_weight + weight_index]);
       }
+      tile_weight[tile_offset] = packed;
     }
     workgroupBarrier();
     for (var c = 0u; c < 8u; c += 1u) {
       let x_0 = tile_source[local.y * 8u + c];
       let x_1 = tile_source[local.y * 8u + c + 64u];
-      let weight_index_0 = c * 8u + local.x;
-      let weight_index_1 = weight_index_0 + 64u;
-      q_00 += x_0 * tile_query_weight[weight_index_0];
-      k_00 += x_0 * tile_key_weight[weight_index_0];
-      v_00 += x_0 * tile_value_weight[weight_index_0];
-      g_00 += x_0 * tile_gate_weight[weight_index_0];
-      q_01 += x_0 * tile_query_weight[weight_index_1];
-      k_01 += x_0 * tile_key_weight[weight_index_1];
-      v_01 += x_0 * tile_value_weight[weight_index_1];
-      g_01 += x_0 * tile_gate_weight[weight_index_1];
-      q_10 += x_1 * tile_query_weight[weight_index_0];
-      k_10 += x_1 * tile_key_weight[weight_index_0];
-      v_10 += x_1 * tile_value_weight[weight_index_0];
-      g_10 += x_1 * tile_gate_weight[weight_index_0];
-      q_11 += x_1 * tile_query_weight[weight_index_1];
-      k_11 += x_1 * tile_key_weight[weight_index_1];
-      v_11 += x_1 * tile_value_weight[weight_index_1];
-      g_11 += x_1 * tile_gate_weight[weight_index_1];
+      let packed_0 = tile_weight[c * 8u + local.x];
+      let packed_1 = tile_weight[c * 8u + local.x + 64u];
+      acc_00 += x_0 * packed_0;
+      acc_01 += x_0 * packed_1;
+      acc_10 += x_1 * packed_0;
+      acc_11 += x_1 * packed_1;
     }
     workgroupBarrier();
   }
   if (row < rows && hd < projected) {
     let index = row * projected + hd;
-    query[index] = q_00 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_00; value[index] = v_00; gate[index] = 1.0 / (1.0 + exp(-g_00));
+    query[index] = acc_00.x * inverseSqrt(f32(p.head_dim));
+    key[index] = acc_00.y;
+    value[index] = acc_00.z;
+    gate[index] = 1.0 / (1.0 + exp(-acc_00.w));
   }
   if (row < rows && second_hd < projected) {
     let index = row * projected + second_hd;
-    query[index] = q_01 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_01; value[index] = v_01; gate[index] = 1.0 / (1.0 + exp(-g_01));
+    query[index] = acc_01.x * inverseSqrt(f32(p.head_dim));
+    key[index] = acc_01.y;
+    value[index] = acc_01.z;
+    gate[index] = 1.0 / (1.0 + exp(-acc_01.w));
   }
   if (second_row < rows && hd < projected) {
     let index = second_row * projected + hd;
-    query[index] = q_10 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_10; value[index] = v_10; gate[index] = 1.0 / (1.0 + exp(-g_10));
+    query[index] = acc_10.x * inverseSqrt(f32(p.head_dim));
+    key[index] = acc_10.y;
+    value[index] = acc_10.z;
+    gate[index] = 1.0 / (1.0 + exp(-acc_10.w));
   }
   if (second_row < rows && second_hd < projected) {
     let index = second_row * projected + second_hd;
-    query[index] = q_11 * inverseSqrt(f32(p.head_dim));
-    key[index] = k_11; value[index] = v_11; gate[index] = 1.0 / (1.0 + exp(-g_11));
+    query[index] = acc_11.x * inverseSqrt(f32(p.head_dim));
+    key[index] = acc_11.y;
+    value[index] = acc_11.z;
+    gate[index] = 1.0 / (1.0 + exp(-acc_11.w));
   }
 }`;
 
