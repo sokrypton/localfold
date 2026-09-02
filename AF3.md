@@ -395,14 +395,29 @@ the head is the whole optimisation target. On a 59-residue chain, steady state:
 
 | stage           | as found | now |
 |-----------------|---------|-----|
-| conditioning    |    48   |  12 |
-| atom encoder    |   100   |  38 |
+| conditioning    |    48   |  11 |
+| atom encoder    |   100   |  18 |
 | single-proj     |    -    |   2 |
 | transformer     |   549   |  72 |
 | atom decoder    |    48   |  24 |
-| **one call**    | **760** | **148** |
+| **one call**    | **760** | **134** |
 
-So 200 steps is about 30 seconds on a 59-residue chain, where it was 152.
+So 200 steps is about 27 seconds on a 59-residue chain, where it was 152, and a
+whole diffusion-200 fold measures 26.3 s end to end against a flow-8 fold's 2.6.
+
+THE REST OF THE FOLD, for scale, all on the same 59-mer:
+
+| trunk pass, 32 MSA rows   | 756 -> 570 ms  |
+| trunk pass, 1024 MSA rows | 1093 -> 804 ms |
+| AF3 checkpoint load       | 5470 -> 1364 ms |
+| AF2 monomer / multimer load | 1012 / 874 -> 417 / 400 ms |
+
+🔴 **AND BOTH HOT PATHS ARE NOW FLAT, WHICH IS WHERE THE CHEAP WORK ENDS.** The
+head's largest kernel is ffw-out at 21 ms of 134; the trunk's top six are
+pair-transition 84, tri.project 63, tri.project-out 43, grid.project 41,
+grid.attend 40, grid.project-out 39, with no outlier. Everything left is a
+kernel rewrite - tiling both operands in shared memory - rather than a shape
+fix, and the failures listed below are what that has to beat.
 
 What paid, in order of size:
 
