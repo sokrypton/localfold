@@ -123,6 +123,111 @@ export function tensor(store, name) {
   return store.tensor(name);
 }
 
+/**
+ * A block's slice of a stacked tensor, as a THUNK that decodes when it is read.
+ *
+ * 🔴 THE TRUNK'S WEIGHTS ARE 562 MiB OF FLOAT32 AND THE DEVICE ALREADY HAS THEM.
+ * The 48 pairformer blocks are stored as one tensor each with the block as the
+ * leading axis, and every block took its slice by decoding the whole tensor -
+ * so loading a model put 562 MiB on the heap and left it there, beside the same
+ * numbers resident on the GPU. Reading a range instead means one block's
+ * weights exist while it is being packed for upload and not after.
+ *
+ * The thunk carries its tensor name so openFields can bring the shard in before
+ * anything reads it; tensorRangeSync is synchronous so this can sit behind a
+ * property getter.
+ */
+function stacked(store, name, index) {
+  const shape = store.shape(name);
+  if (index >= shape[0]) throw new Error(`${name} has ${shape[0]} blocks; asked for ${index}`);
+  const stride = shape.slice(1).reduce((product, value) => product * value, 1);
+  const thunk = () => store.tensorRangeSync(name, index * stride, stride);
+  thunk.tensorName = name;
+  thunk.blockIndex = index;
+  return thunk;
+}
+
+/** Every tensor a descriptor will read, so their shards can be opened at once. */
+function fieldNames(fields, into = []) {
+  for (const value of Object.values(fields)) {
+    if (typeof value === "function") into.push(value.tensorName);
+    else if (value !== null && typeof value === "object" && !ArrayBuffer.isView(value)) {
+      fieldNames(value, into);
+    }
+  }
+  return into;
+}
+
+/**
+ * A descriptor's thunks turned into properties that decode on first read.
+ *
+ * 🔴 MEMOISED, AND CLEARED ONLY ON REQUEST. A getter that decoded on EVERY read
+ * would be a trap for the CPU reference paths, which read a weight inside a
+ * loop over residues; with the memo they behave exactly as they did when the
+ * arrays were eager. What changes is that a consumer which knows it is finished
+ * - the GPU block encoder, once the weights are resident on the device - can
+ * say so with releaseWeights and get the memory back.
+ */
+function materialise(fields, memo) {
+  const object = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (typeof value === "function") {
+      Object.defineProperty(object, key, {
+        enumerable: true,
+        get() {
+          let held = memo.get(value);
+          if (held === undefined) { held = value(); memo.set(value, held); }
+          return held;
+        },
+      });
+    } else if (value !== null && typeof value === "object" && !ArrayBuffer.isView(value)) {
+      object[key] = materialise(value, memo);
+    } else {
+      object[key] = value;
+    }
+  }
+  return object;
+}
+
+const RELEASE = Symbol("release decoded weights");
+
+/**
+ * Let go of everything a lazily loaded weight object has decoded.
+ *
+ * Safe at any time and on anything: a released field decodes again when it is
+ * next read, and an object that was never lazy ignores this entirely. Call it
+ * once a block's weights are on the device.
+ */
+export function releaseWeights(weights) {
+  weights?.[RELEASE]?.();
+}
+
+/**
+ * Open the shards a descriptor needs, then bind it to properties.
+ *
+ * Every store can decode a whole tensor; only the HTTP store can decode a range
+ * of one. Where it cannot, the descriptor is materialised eagerly from whole
+ * tensors, which is what this did before and is still correct - just larger.
+ */
+async function bind(store, fields) {
+  if (typeof store.tensorRangeSync !== "function" || typeof store.open !== "function") {
+    const eager = {};
+    for (const [key, value] of Object.entries(fields)) {
+      if (typeof value === "function") eager[key] = await layer(store, value.tensorName, value.blockIndex);
+      else if (value !== null && typeof value === "object" && !ArrayBuffer.isView(value)) {
+        eager[key] = await bind(store, value);
+      } else eager[key] = value;
+    }
+    return eager;
+  }
+  const names = fieldNames(fields);
+  await Promise.all([...new Set(names)].map((name) => store.open(name)));
+  const memo = new Map();
+  const object = materialise(fields, memo);
+  Object.defineProperty(object, RELEASE, { value: () => memo.clear() });
+  return object;
+}
+
 /** One block's slice of a tensor stacked over blocks. */
 export async function layer(store, name, index) {
   const whole = await store.tensor(name);
@@ -132,40 +237,43 @@ export async function layer(store, name, index) {
   return whole.subarray(index * stride, (index + 1) * stride);
 }
 
-/** The five pair-track modules, which every stack shares. */
-async function pairTrack(store, root, index, gridHeads, gridDimension) {
-  const at = (leaf) => layer(store, `${root}/${leaf}`, index);
-  const triangle = async (direction) => ({
-    leftNormInputScale: await at(`triangle_multiplication_${direction}/left_norm_input/scale`),
-    leftNormInputOffset: await at(`triangle_multiplication_${direction}/left_norm_input/offset`),
-    projection: await at(`triangle_multiplication_${direction}/projection/weights`),
-    gate: await at(`triangle_multiplication_${direction}/gate/weights`),
-    centerNormScale: await at(`triangle_multiplication_${direction}/center_norm/scale`),
-    centerNormOffset: await at(`triangle_multiplication_${direction}/center_norm/offset`),
-    outputProjection: await at(`triangle_multiplication_${direction}/output_projection/weights`),
-    gatingLinear: await at(`triangle_multiplication_${direction}/gating_linear/weights`),
+/**
+ * The five pair-track modules, which every stack shares - as a DESCRIPTOR whose
+ * leaves are thunks, not as decoded arrays. bind() turns one into an object.
+ */
+function pairTrack(store, root, index, gridHeads, gridDimension) {
+  const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
+  const triangle = (direction) => ({
+    leftNormInputScale: at(`triangle_multiplication_${direction}/left_norm_input/scale`),
+    leftNormInputOffset: at(`triangle_multiplication_${direction}/left_norm_input/offset`),
+    projection: at(`triangle_multiplication_${direction}/projection/weights`),
+    gate: at(`triangle_multiplication_${direction}/gate/weights`),
+    centerNormScale: at(`triangle_multiplication_${direction}/center_norm/scale`),
+    centerNormOffset: at(`triangle_multiplication_${direction}/center_norm/offset`),
+    outputProjection: at(`triangle_multiplication_${direction}/output_projection/weights`),
+    gatingLinear: at(`triangle_multiplication_${direction}/gating_linear/weights`),
   });
-  const grid = async (which) => ({
+  const grid = (which) => ({
     heads: gridHeads, dimension: gridDimension,
-    actNormScale: await at(`pair_attention${which}/act_norm/scale`),
-    actNormOffset: await at(`pair_attention${which}/act_norm/offset`),
-    pairBiasProjection: await at(`pair_attention${which}/pair_bias_projection/weights`),
-    qProjection: await at(`pair_attention${which}/q_projection/weights`),
-    kProjection: await at(`pair_attention${which}/k_projection/weights`),
-    vProjection: await at(`pair_attention${which}/v_projection/weights`),
-    gatingQuery: await at(`pair_attention${which}/gating_query/weights`),
-    outputProjection: await at(`pair_attention${which}/output_projection/weights`),
+    actNormScale: at(`pair_attention${which}/act_norm/scale`),
+    actNormOffset: at(`pair_attention${which}/act_norm/offset`),
+    pairBiasProjection: at(`pair_attention${which}/pair_bias_projection/weights`),
+    qProjection: at(`pair_attention${which}/q_projection/weights`),
+    kProjection: at(`pair_attention${which}/k_projection/weights`),
+    vProjection: at(`pair_attention${which}/v_projection/weights`),
+    gatingQuery: at(`pair_attention${which}/gating_query/weights`),
+    outputProjection: at(`pair_attention${which}/output_projection/weights`),
   });
   return {
-    triangleMultiplicationOutgoing: await triangle("outgoing"),
-    triangleMultiplicationIncoming: await triangle("incoming"),
-    pairAttention1: await grid(1),
-    pairAttention2: await grid(2),
+    triangleMultiplicationOutgoing: triangle("outgoing"),
+    triangleMultiplicationIncoming: triangle("incoming"),
+    pairAttention1: grid(1),
+    pairAttention2: grid(2),
     pairTransition: {
-      inputLayerNormScale: await at("pair_transition/input_layer_norm/scale"),
-      inputLayerNormOffset: await at("pair_transition/input_layer_norm/offset"),
-      transition1: await at("pair_transition/transition1/weights"),
-      transition2: await at("pair_transition/transition2/weights"),
+      inputLayerNormScale: at("pair_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: at("pair_transition/input_layer_norm/offset"),
+      transition1: at("pair_transition/transition1/weights"),
+      transition2: at("pair_transition/transition2/weights"),
     },
   };
 }
@@ -198,8 +306,8 @@ export async function templateWeights(store) {
   const T = (name) => store.tensor(name);
   // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS 4 HEADS OF 16, not the trunk's
   // 4 of 32: 64 channels rather than 128.
-  const blocks = [await pairTrack(store, TEMPLATE_STACK, 0, 4, 16),
-                  await pairTrack(store, TEMPLATE_STACK, 1, 4, 16)];
+  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0, 4, 16)),
+                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1, 4, 16))];
   return {
     queryChannels: 128, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
@@ -214,65 +322,65 @@ export async function templateWeights(store) {
 }
 
 export async function msaBlockWeights(store, index) {
-  const at = (leaf) => layer(store, `${MSA_STACK}/${leaf}`, index);
-  return {
+  const at = (leaf) => stacked(store, `${MSA_STACK}/${leaf}`, index);
+  return bind(store, {
     pairChannels: 128, msaChannels: 64,
-    ...(await pairTrack(store, MSA_STACK, index, 4, 32)),
+    ...pairTrack(store, MSA_STACK, index, 4, 32),
     outerProductMean: {
       outerChannels: 32,
-      layerNormInputScale: await at("outer_product_mean/layer_norm_input/scale"),
-      layerNormInputOffset: await at("outer_product_mean/layer_norm_input/offset"),
-      leftProjection: await at("outer_product_mean/left_projection/weights"),
-      rightProjection: await at("outer_product_mean/right_projection/weights"),
-      outputW: await at("outer_product_mean/output_w"),
-      outputB: await at("outer_product_mean/output_b"),
+      layerNormInputScale: at("outer_product_mean/layer_norm_input/scale"),
+      layerNormInputOffset: at("outer_product_mean/layer_norm_input/offset"),
+      leftProjection: at("outer_product_mean/left_projection/weights"),
+      rightProjection: at("outer_product_mean/right_projection/weights"),
+      outputW: at("outer_product_mean/output_w"),
+      outputB: at("outer_product_mean/output_b"),
     },
     msaAttention1: {
       heads: 8, dimension: 8,
-      actNormScale: await at("msa_attention1/act_norm/scale"),
-      actNormOffset: await at("msa_attention1/act_norm/offset"),
-      pairNormScale: await at("msa_attention1/pair_norm/scale"),
-      pairNormOffset: await at("msa_attention1/pair_norm/offset"),
-      pairLogits: await at("msa_attention1/pair_logits/weights"),
-      vProjection: await at("msa_attention1/v_projection/weights"),
-      gatingQuery: await at("msa_attention1/gating_query/weights"),
-      outputProjection: await at("msa_attention1/output_projection/weights"),
+      actNormScale: at("msa_attention1/act_norm/scale"),
+      actNormOffset: at("msa_attention1/act_norm/offset"),
+      pairNormScale: at("msa_attention1/pair_norm/scale"),
+      pairNormOffset: at("msa_attention1/pair_norm/offset"),
+      pairLogits: at("msa_attention1/pair_logits/weights"),
+      vProjection: at("msa_attention1/v_projection/weights"),
+      gatingQuery: at("msa_attention1/gating_query/weights"),
+      outputProjection: at("msa_attention1/output_projection/weights"),
     },
     msaTransition: {
-      inputLayerNormScale: await at("msa_transition/input_layer_norm/scale"),
-      inputLayerNormOffset: await at("msa_transition/input_layer_norm/offset"),
-      transition1: await at("msa_transition/transition1/weights"),
-      transition2: await at("msa_transition/transition2/weights"),
+      inputLayerNormScale: at("msa_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: at("msa_transition/input_layer_norm/offset"),
+      transition1: at("msa_transition/transition1/weights"),
+      transition2: at("msa_transition/transition2/weights"),
     },
-  };
+  });
 }
 
 export async function pairformerBlockWeights(store, index) {
-  const at = (leaf) => layer(store, `${PAIRFORMER}/${leaf}`, index);
-  return {
+  const at = (leaf) => stacked(store, `${PAIRFORMER}/${leaf}`, index);
+  return bind(store, {
     pairChannels: 128, singleChannels: 384,
-    ...(await pairTrack(store, PAIRFORMER, index, 4, 32)),
-    singlePairLogitsNormScale: await at("single_pair_logits_norm/scale"),
-    singlePairLogitsNormOffset: await at("single_pair_logits_norm/offset"),
-    singlePairLogitsProjection: await at("single_pair_logits_projection/weights"),
+    ...pairTrack(store, PAIRFORMER, index, 4, 32),
+    singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
+    singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
+    singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
     singleAttention: {
       heads: 16, dimension: 24,
-      layerNormScale: await at("single_attention_layer_norm/scale"),
-      layerNormOffset: await at("single_attention_layer_norm/offset"),
-      qProjection: await at("single_attention_q_projection/weights"),
-      qBias: await at("single_attention_q_projection/bias"),
-      kProjection: await at("single_attention_k_projection/weights"),
-      vProjection: await at("single_attention_v_projection/weights"),
-      gatingQuery: await at("single_attention_gating_query/weights"),
-      outputProjection: await at("single_attention_transition2/weights"),
+      layerNormScale: at("single_attention_layer_norm/scale"),
+      layerNormOffset: at("single_attention_layer_norm/offset"),
+      qProjection: at("single_attention_q_projection/weights"),
+      qBias: at("single_attention_q_projection/bias"),
+      kProjection: at("single_attention_k_projection/weights"),
+      vProjection: at("single_attention_v_projection/weights"),
+      gatingQuery: at("single_attention_gating_query/weights"),
+      outputProjection: at("single_attention_transition2/weights"),
     },
     singleTransition: {
-      inputLayerNormScale: await at("single_transition/input_layer_norm/scale"),
-      inputLayerNormOffset: await at("single_transition/input_layer_norm/offset"),
-      transition1: await at("single_transition/transition1/weights"),
-      transition2: await at("single_transition/transition2/weights"),
+      inputLayerNormScale: at("single_transition/input_layer_norm/scale"),
+      inputLayerNormOffset: at("single_transition/input_layer_norm/offset"),
+      transition1: at("single_transition/transition1/weights"),
+      transition2: at("single_transition/transition2/weights"),
     },
-  };
+  });
 }
 
 export async function distogramWeights(store) {
@@ -283,31 +391,31 @@ export async function confidenceWeights(store) {
   const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
   const blocks = [];
   for (let index = 0; index < 4; index += 1) {
-    const at = (leaf) => layer(store, `${CONFIDENCE_STACK}/${leaf}`, index);
-    blocks.push({
+    const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
+    blocks.push(await bind(store, {
       pairChannels: 128, singleChannels: 384,
-      ...(await pairTrack(store, CONFIDENCE_STACK, index, 4, 32)),
-      singlePairLogitsNormScale: await at("single_pair_logits_norm/scale"),
-      singlePairLogitsNormOffset: await at("single_pair_logits_norm/offset"),
-      singlePairLogitsProjection: await at("single_pair_logits_projection/weights"),
+      ...pairTrack(store, CONFIDENCE_STACK, index, 4, 32),
+      singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
+      singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
+      singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
       singleAttention: {
         heads: 16, dimension: 24,
-        layerNormScale: await at("single_attention_layer_norm/scale"),
-        layerNormOffset: await at("single_attention_layer_norm/offset"),
-        qProjection: await at("single_attention_q_projection/weights"),
-        qBias: await at("single_attention_q_projection/bias"),
-        kProjection: await at("single_attention_k_projection/weights"),
-        vProjection: await at("single_attention_v_projection/weights"),
-        gatingQuery: await at("single_attention_gating_query/weights"),
-        outputProjection: await at("single_attention_transition2/weights"),
+        layerNormScale: at("single_attention_layer_norm/scale"),
+        layerNormOffset: at("single_attention_layer_norm/offset"),
+        qProjection: at("single_attention_q_projection/weights"),
+        qBias: at("single_attention_q_projection/bias"),
+        kProjection: at("single_attention_k_projection/weights"),
+        vProjection: at("single_attention_v_projection/weights"),
+        gatingQuery: at("single_attention_gating_query/weights"),
+        outputProjection: at("single_attention_transition2/weights"),
       },
       singleTransition: {
-        inputLayerNormScale: await at("single_transition/input_layer_norm/scale"),
-        inputLayerNormOffset: await at("single_transition/input_layer_norm/offset"),
-        transition1: await at("single_transition/transition1/weights"),
-        transition2: await at("single_transition/transition2/weights"),
+        inputLayerNormScale: at("single_transition/input_layer_norm/scale"),
+        inputLayerNormOffset: at("single_transition/input_layer_norm/offset"),
+        transition1: at("single_transition/transition1/weights"),
+        transition2: at("single_transition/transition2/weights"),
       },
-    });
+    }));
   }
   return {
     pairChannels: 128, singleChannels: 384, targetFeatWidth: 447, blocks,

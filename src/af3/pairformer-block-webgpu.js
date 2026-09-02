@@ -33,6 +33,7 @@ import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { releaseWeights } from "./weights.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
   GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
@@ -356,6 +357,13 @@ export class Af3PairformerStackGpu {
       offset: block.singlePairLogitsNormOffset,
       projection: block.singlePairLogitsProjection,
     }).data);
+    // 🔴 AND NOW LET GO OF THE HOST'S COPY. Every buffer this block needs is on
+    // the device and stays there for the model's lifetime, so the float32 the
+    // packing read is dead - 11.7 MiB a block, 562 MiB over the stack, which is
+    // what a lazily loaded weight object was holding. Releasing is a cache drop
+    // and nothing more: a field read after this decodes again from the shard,
+    // so a CPU reference sharing the same weights still works, just slower.
+    releaseWeights(block);
 
     const encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {

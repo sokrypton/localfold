@@ -85,7 +85,34 @@ export function tensorByteLength(record) {
  *   the shard alive themselves and do not need to.
  */
 export function readTensor(record, buffer, byteOffset, copy = false) {
+  return readTensorRange(record, buffer, byteOffset, 0, tensorElements(record), copy);
+}
+
+/**
+ * PART of a tensor, decoded without decoding the rest of it.
+ *
+ * 🔴 THIS IS WHAT KEEPS A STACKED TENSOR OUT OF THE HEAP. The trunk's 48
+ * pairformer blocks are stored as one tensor each with the block as the leading
+ * axis - 216 MiB for the single transition alone - and a block wants one slice
+ * of it. Decoding the whole thing to hand back a subarray held 562 MiB of
+ * float32 for the life of the page.
+ *
+ * 🔴 THE BLOCK SCALES ARE INDEXED BY ABSOLUTE POSITION, so a range decodes to
+ * exactly the values the whole tensor would have at those indices. The range is
+ * widened to whole quantisation groups internally - the scale is per group and
+ * there is no way to start mid-group without recovering it anyway - and the
+ * requested window is handed back as a subarray of that, so at most `block`
+ * elements either side are decoded and discarded.
+ *
+ * @param {number} first  the first element wanted
+ * @param {number} count  how many
+ */
+export function readTensorRange(record, buffer, byteOffset, first, count, copy = false) {
   const elements = tensorElements(record);
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(count)
+    || first < 0 || count < 0 || first + count > elements) {
+    throw new RangeError(`range ${first}:${count} lies outside a tensor of ${elements}`);
+  }
 
   if (record.dtype === "int8") {
     const { block } = record;
@@ -98,19 +125,22 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
       throw new Error("this runtime has no Float16Array, and the model scales are float16");
     }
     const scales = view(Float16Array, buffer, scaleAt, blocks);
-    const output = new Float32Array(elements);
+    const firstBlock = Math.floor(first / block);
+    const lastBlock = Math.min(blocks, Math.ceil((first + count) / block));
+    const base = firstBlock * block;
+    const output = new Float32Array(Math.min(elements, lastBlock * block) - base);
     // SYMMETRIC, so a code is just a multiple of its block's scale. There is no
     // zero point: at eight bits the bias one would correct measures 0.1 pLDDT,
     // which is noise. tools/quantize_model.py has the numbers.
     // ...the same hoist as int5 below: one Float16Array read a block, not one
     // an element, and no division per element.
-    for (let block_ = 0; block_ < blocks; block_ += 1) {
+    for (let block_ = firstBlock; block_ < lastBlock; block_ += 1) {
       const scale = scales[block_];
       const start = block_ * block;
       const end = Math.min(start + block, elements);
-      for (let index = start; index < end; index += 1) output[index] = codes[index] * scale;
+      for (let index = start; index < end; index += 1) output[index - base] = codes[index] * scale;
     }
-    return output;
+    return output.subarray(first - base, first - base + count);
   }
 
   if (record.dtype === "int5") {
@@ -129,7 +159,10 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
                                  groups * INT5_GROUP_BYTES + 1);
     const scales = view(Float16Array, buffer, scaleAt, groups);
     const zeros = view(Float16Array, buffer, zeroAt, groups);
-    const output = new Float32Array(elements);
+    const firstGroup = Math.floor(first / block);
+    const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
+    const outputBase = firstGroup * block;
+    const output = new Float32Array(Math.min(elements, lastGroup * block) - outputBase);
     // 🔴 ASYMMETRIC: a code is an offset from the group's zero point, not a
     // multiple of its scale. Reading it as symmetric loses the zero and shifts
     // every group by its own low value - which stays finite, stays smooth, and
@@ -153,7 +186,7 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     // arithmetic, no running bit counter and no two-byte straddling read at
     // all. The general form below still runs for a trailing partial group.
     const wholeChunks = (block / 8) | 0;
-    for (let group = 0; group < groups; group += 1) {
+    for (let group = firstGroup; group < lastGroup; group += 1) {
       const scale = scales[group];
       const zero = zeros[group];
       const groupBase = group * INT5_GROUP_BYTES;
@@ -167,14 +200,15 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
         const b2 = codes[at + 2];
         const b3 = codes[at + 3];
         const b4 = codes[at + 4];
-        output[index] = (b0 & 31) * scale + zero;
-        output[index + 1] = ((b0 >> 5) | ((b1 & 3) << 3)) * scale + zero;
-        output[index + 2] = ((b1 >> 2) & 31) * scale + zero;
-        output[index + 3] = ((b1 >> 7) | ((b2 & 15) << 1)) * scale + zero;
-        output[index + 4] = ((b2 >> 4) | ((b3 & 1) << 4)) * scale + zero;
-        output[index + 5] = ((b3 >> 1) & 31) * scale + zero;
-        output[index + 6] = ((b3 >> 6) | ((b4 & 7) << 2)) * scale + zero;
-        output[index + 7] = (b4 >> 3) * scale + zero;
+        const out = index - outputBase;
+        output[out] = (b0 & 31) * scale + zero;
+        output[out + 1] = ((b0 >> 5) | ((b1 & 3) << 3)) * scale + zero;
+        output[out + 2] = ((b1 >> 2) & 31) * scale + zero;
+        output[out + 3] = ((b1 >> 7) | ((b2 & 15) << 1)) * scale + zero;
+        output[out + 4] = ((b2 >> 4) | ((b3 & 1) << 4)) * scale + zero;
+        output[out + 5] = ((b3 >> 1) & 31) * scale + zero;
+        output[out + 6] = ((b3 >> 6) | ((b4 & 7) << 2)) * scale + zero;
+        output[out + 7] = (b4 >> 3) * scale + zero;
         index += 8;
         at += 5;
       }
@@ -183,11 +217,11 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
       for (; index < end; index += 1) {
         const byteAt = groupBase + (bit >> 3);
         const pair = codes[byteAt] | (codes[byteAt + 1] << 8);
-        output[index] = ((pair >> (bit & 7)) & 31) * scale + zero;
+        output[index - outputBase] = ((pair >> (bit & 7)) & 31) * scale + zero;
         bit += 5;
       }
     }
-    return output;
+    return output.subarray(first - outputBase, first - outputBase + count);
   }
 
   if (record.dtype === "float16") {
@@ -196,11 +230,12 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     }
     // ...ALWAYS A COPY, whether or not one was asked for: widening is a new
     // array by definition, so there is no view to hand back.
-    return new Float32Array(view(Float16Array, buffer, byteOffset, elements));
+    return new Float32Array(view(Float16Array, buffer, byteOffset + first * 2, count));
   }
 
   if (record.dtype !== "float32") throw new Error(`unsupported tensor dtype ${record.dtype}`);
+  const at = byteOffset + first * 4;
   return copy
-    ? new Float32Array(buffer.slice(byteOffset, byteOffset + elements * 4))
-    : view(Float32Array, buffer, byteOffset, elements);
+    ? new Float32Array(buffer.slice(at, at + count * 4))
+    : view(Float32Array, buffer, at, count);
 }

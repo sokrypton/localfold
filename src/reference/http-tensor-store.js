@@ -1,4 +1,4 @@
-import { readTensor, tensorByteLength } from "./dtype.js";
+import { readTensor, readTensorRange, tensorByteLength } from "./dtype.js";
 /**
  * @typedef {object} TensorDownloadProgress
  * @property {number} loadedBytes
@@ -118,6 +118,8 @@ export class HttpTensorStore {
   manifest;
   #cache = new Map();
   #fileCache = new Map();
+  #fileBuffers = new Map();
+  #openedTensors = new Set();
   #fileByteLengths = new Map();
   #pending = [];
   #onProgress;
@@ -218,6 +220,62 @@ export class HttpTensorStore {
     const record = this.manifest.tensors[name]; if (record === undefined) throw new Error(`missing tensor ${name}`);
     return record.shape;
   }
+
+  /**
+   * Bring a tensor's SHARD in, without decoding the tensor.
+   *
+   * 🔴 THIS IS THE HALF OF LOADING THAT HAS TO BE AWAITED, and it is the only
+   * half that has to happen up front. Decoding is arithmetic over bytes already
+   * in memory, so once the shard is here a caller can decode whatever part of
+   * it, whenever, without another await - which is what lets a stacked tensor be
+   * read one block at a time instead of all at once. See src/af3/weights.js.
+   *
+   * It counts towards the progress callback exactly as a whole load does, so a
+   * page loading lazily still fills its bar.
+   */
+  async open(name) {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    if (!this.#fileBuffers.has(record.file)) {
+      let pendingFile = this.#fileCache.get(record.file);
+      if (pendingFile === undefined) {
+        pendingFile = this.#scheduleDownload(record.file, name);
+        this.#fileCache.set(record.file, pendingFile);
+      }
+      this.#fileBuffers.set(record.file, await pendingFile);
+    }
+    // ...counted per TENSOR, not per shard, so a lazily loaded model fills the
+    // progress bar the same way an eagerly loaded one does. The set is what
+    // keeps a second open of the same name from counting twice, which the
+    // per-name cache does for tensor().
+    if (this.#openedTensors.has(name)) return;
+    this.#openedTensors.add(name);
+    this.#loadedTensors += 1;
+    this.#reportProgress(name);
+  }
+
+  /**
+   * Part of a tensor, decoded now and cached NOWHERE.
+   *
+   * 🔴 THE CALLER OWNS WHAT COMES BACK, and that is the point: `tensor()` keeps
+   * every array it ever decoded for the life of the store, which is right for a
+   * tensor read once and wrong for 48 blocks of a stacked one. Await open(name)
+   * first; this is synchronous so it can sit behind a property getter.
+   */
+  tensorRangeSync(name, first, count) {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    const buffer = this.#fileBuffers.get(record.file);
+    if (buffer === undefined) {
+      throw new Error(`${name} is in ${record.file}, which is not open yet - await store.open(name)`);
+    }
+    const byteOffset = record.byteOffset ?? 0;
+    const byteLength = tensorByteLength(record);
+    if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > buffer.byteLength) {
+      throw new Error(`${name} points outside ${record.file}`);
+    }
+    return readTensorRange(record, buffer, byteOffset, first, count);
+  }
   async #load(name) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);
@@ -227,12 +285,16 @@ export class HttpTensorStore {
       this.#fileCache.set(record.file, pendingFile);
     }
     const buffer = await pendingFile;
+    this.#fileBuffers.set(record.file, buffer);
     const byteOffset = record.byteOffset ?? 0;
     const byteLength = tensorByteLength(record);
     if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || byteOffset + byteLength > buffer.byteLength) {
       throw new Error(`${name} points outside ${record.file}`);
     }
-    this.#loadedTensors += 1;
+    if (!this.#openedTensors.has(name)) {
+      this.#openedTensors.add(name);
+      this.#loadedTensors += 1;
+    }
     this.#reportProgress(name);
     return readTensor(record, buffer, byteOffset);
   }
