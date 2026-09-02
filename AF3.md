@@ -519,6 +519,17 @@ barrier the staging loop makes.
 - **Blocking the transition's first matmul over i**, on its own: nothing.
 - **Barriers.** Priced by removing them from the projection's k loop: exactly
   zero. The step stays at 8.
+- **Splitting the SINGLE track's transition into two dispatches.** Its rows are
+  its tokens, so the fused kernel gets 59 workgroups on a 59-residue chain and
+  cannot tile out of it - 27 ms of a 307 ms pairformer for a fiftieth of its
+  arithmetic. Splitting the two matmuls apart, with the widened intermediate
+  travelling through a 363 KB buffer, gives twelve times the workgroups and the
+  same weight traffic. It measured **65 ms** - a widening pass of 53.5 and a
+  contraction of 11.9 - against the fused 27. The widening repeats the row's
+  LayerNorm once per slice of the intermediate, twelve tree reductions a row
+  where there was one, and that is more than the occupancy was worth. A third
+  dispatch to normalise once would remove it; the fused form is 27 ms and this
+  would have to beat it from 53.5, so it was not pursued.
 - **Reading the transition's widening weights as vec4.** Its two weight reads a
   channel were half its instructions, and consecutive lanes read consecutive
   slots - so four consecutive slots to a lane makes those two reads two vec4
