@@ -18,6 +18,21 @@
  * The loaders are written as literal `import()` calls rather than built from
  * `directory` because a bundler cannot follow a computed specifier; these
  * resolve statically and survive bundling.
+ *
+ * 🔴 `remote` IS WHERE THE SHARDS ACTUALLY LIVE, AND `directory` IS THE FALLBACK.
+ * GitHub Pages publishes at most a gigabyte and the weights are most of it -
+ * AF2 monomer is 227 MB and AF3 150 MB before a third model exists - so a page
+ * that means to offer five of them cannot bake them into its own artefact. A
+ * bundle with a `remote` fetches its shards from there and ships none; without
+ * one it behaves exactly as before, which is what keeps an offline build
+ * (tools/bundle.py) and a self-hosted copy working.
+ *
+ * 🔴 THE REVISION IS PINNED IN THE URL, NOT LEFT AT `main`. A shard fetched
+ * from a moving branch can change under a manifest that did not, which is the
+ * failure the shard cache token exists to prevent - and three separate hours
+ * have gone into "<file> has an invalid byte length" already. A commit SHA
+ * makes the URL immutable, which is also what lets the browser cache it
+ * forever.
  */
 export const MODEL_BUNDLES = {
   monomer: {
@@ -50,6 +65,24 @@ export const MODEL_BUNDLES = {
 };
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
+
+/**
+ * Where a family's shards are fetched from: its remote if it has one, and its
+ * directory beside the page if not.
+ *
+ * 🔴 A TRAILING SLASH OR THE LAST SEGMENT IS LOST. Shard URLs are resolved with
+ * `new URL(file, base)`, and a base of ".../resolve/abc123" without the slash
+ * puts the shard next to `abc123` rather than inside it - a 404 naming a path
+ * that looks almost right.
+ *
+ * @param {ModelFamily} family
+ */
+export function bundleBaseUrl(family) {
+  const bundle = MODEL_BUNDLES[family];
+  if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
+  const base = bundle.remote ?? bundle.directory;
+  return base.endsWith("/") ? base : `${base}/`;
+}
 
 /**
  * The tensor table for one family.

@@ -141,6 +141,33 @@ def registry_mismatches() -> list[str]:
     return problems
 
 
+def remote_families() -> set[str]:
+    """The families whose shards are fetched from somewhere else.
+
+    🔴 A BUNDLE WITH A `remote` MUST NOT BE PUBLISHED HERE. GitHub Pages caps a
+    published site at a gigabyte and the weights are most of it - AF2 monomer is
+    227 MB and AF3 150 MB before a third model exists - so a page meaning to
+    offer five of them keeps its parameters elsewhere. Shipping them anyway
+    would spend the allowance twice: once on the artefact and once on a copy no
+    page fetches, because the browser resolves shards against the remote.
+
+    Read out of index.js rather than duplicated here, for the reason
+    registry_mismatches gives: two files may not mean two answers.
+    """
+    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    families = set()
+    family = None
+    for line in index.splitlines():
+        opened = re.match(r"^  (\w+): \{$", line)
+        if opened:
+            family = opened.group(1)
+        elif family is not None and re.match(r"^\s*remote:\s*[\"']", line):
+            families.add(family)
+        elif line == "  },":
+            family = None
+    return families
+
+
 def restricted_terms(module: Path) -> str | None:
     """The restricted licence this bundle's weights carry, if unaccepted.
 
@@ -315,9 +342,13 @@ def build(include_model: bool) -> int:
                 print(f"  {problem}", file=sys.stderr)
             return 1
         shipped = 0
+        remote = remote_families()
         for family, bundle in sorted(BUNDLES.items()):
             model = ROOT / bundle["export"]
             if not model.is_dir():
+                continue
+            if family in remote:
+                print(f"{bundle['export']}/ is hosted remotely; not publishing it")
                 continue
             # ...the .bin shards only. A served page reads those through fetch,
             # and the base64 scripts beside them are a third larger and exist
@@ -384,4 +415,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", action="store_true",
                         help="include the exported model/ directory")
-    raise SystemExit(build(parser.parse_args().model))
+    # 🔴 SO THE WORKFLOW CAN ASK THE REGISTRY RATHER THAN REPEAT IT. The Pages
+    # job unpacks each release bundle into dist/ ITSELF, after this script has
+    # run, so a family skipped here is still published unless the job skips it
+    # too - and a second list of which models are remote is a second answer.
+    # Exits 0 when the family is hosted remotely, which is what `if` wants.
+    parser.add_argument("--is-remote", metavar="FAMILY", default=None,
+                        help="exit 0 if FAMILY's shards are fetched from elsewhere")
+    arguments = parser.parse_args()
+    if arguments.is_remote is not None:
+        raise SystemExit(0 if arguments.is_remote in remote_families() else 1)
+    raise SystemExit(build(arguments.model))

@@ -22,7 +22,7 @@ import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
-import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
+import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
 import { af3Plan, describeRemaining, RuntimeEstimator }
@@ -98,9 +98,8 @@ let weightsPromise;
  */
 export function loadAf3Weights(onProgress) {
   weightsPromise ??= (async () => {
-    const bundle = MODEL_BUNDLES.af3;
     const store = await HttpTensorStore.fromManifest(
-      bundle.directory, await loadManifest("af3"), onProgress);
+      bundleBaseUrl("af3"), await loadManifest("af3"), onProgress);
     // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
     // and await each one - so without this the network runs one shard at a time
     // and idles through every dequantisation. See HttpTensorStore.prefetch.

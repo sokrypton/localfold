@@ -109,6 +109,53 @@ pass is unmeasurable; totals over many passes are fine.
 process, or take a median of many calls - `bench-head.js` medians nine. A single
 run of each is not a comparison.
 
+## Hosting the weights somewhere other than Pages
+
+GitHub Pages publishes at most a gigabyte, and the weights are most of it: AF2
+monomer 227 MB, AF3 150 MB, before a third model exists. A page meaning to offer
+five keeps its parameters elsewhere.
+
+Everything a bundle needs is one field. In `src/reference/manifests/index.js`:
+
+```js
+af3: {
+  directory: "./model-af3-int5/",                       // the fallback
+  remote: "https://huggingface.co/USER/REPO/resolve/<sha>/",
+  ...
+}
+```
+
+and that is the whole change. Shard URLs are resolved against the bundle's base,
+so the store never learns the difference; `build_site.py` and the Pages workflow
+both ask `build_site.py --is-remote <family>` and stop publishing a copy.
+
+🔴 **PIN A COMMIT SHA, NOT `main`.** A shard fetched from a moving branch can
+change under a manifest that did not, which is the failure the shard-cache token
+exists to prevent - and three separate hours have already gone into "<file> has
+an invalid byte length", a message that names neither half.
+
+🔴 **AND A TRAILING SLASH, OR THE LAST SEGMENT IS LOST.** `new URL(file, base)`
+against ".../resolve/abc123" puts the shard beside `abc123` rather than inside
+it. `bundleBaseUrl` adds one; `test/model-bundles.test.js` holds it to that.
+
+Verified against Hugging Face from the browser: CORS passes, the 302 to
+`cdn.hf.co` is followed, `?v=` cache tokens survive, ranges answer 206, and the
+responses come back `type: "cors"` so the shard cache can store them. What is
+NOT verified is a real upload - there were no HF credentials on this machine, so
+the repository and the push are still to do.
+
+To upload:
+
+```
+pip install huggingface_hub && hf auth login
+hf upload USER/REPO model-af3-int5 . --repo-type=model
+```
+
+DeepMind's AF3 parameters carry a Prohibited Use Policy - `build_site.py`
+already refuses to publish them without `LOCALFOLD_ACCEPT_MODEL_TERMS`. On
+Hugging Face the equivalent is a **gated repository**, which is a better fit
+than a CI variable because it asks each downloader rather than the deployer.
+
 ## Deploying
 
 ```

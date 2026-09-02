@@ -33,6 +33,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
+          # in src/reference/manifests/index.js is fetched by the browser from
+          # there, so publishing a copy here would spend the Pages allowance on
+          # bytes nothing loads. Asking build_site.py keeps one answer.
+          if python3 tools/build_site.py --is-remote monomer; then
+            echo "monomer is hosted remotely; not publishing it"
+            exit 0
+          fi
           gh release download model1-ptm --pattern localfold-model1-ptm.tar.gz
           tar -xzf localfold-model1-ptm.tar.gz -C dist
 
@@ -46,6 +54,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
+          # in src/reference/manifests/index.js is fetched by the browser from
+          # there, so publishing a copy here would spend the Pages allowance on
+          # bytes nothing loads. Asking build_site.py keeps one answer.
+          if python3 tools/build_site.py --is-remote multimer; then
+            echo "multimer is hosted remotely; not publishing it"
+            exit 0
+          fi
           gh release download model1-multimer-v3 --pattern localfold-model1-multimer-v3.tar.gz
           tar -xzf localfold-model1-multimer-v3.tar.gz -C dist
 
@@ -73,6 +89,14 @@ jobs:
             *) echo "::error::model-af3-int5 holds DeepMind's AF3 parameters,"                     "which carry the AF3 Weights Terms of Use and Prohibited"                     "Use Policy. Set the repository variable"                     "LOCALFOLD_ACCEPT_MODEL_TERMS to include alphafold3 to"                     "confirm the licence covers this deployment."
                exit 1 ;;
           esac
+          # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
+          # in src/reference/manifests/index.js is fetched by the browser from
+          # there, so publishing a copy here would spend the Pages allowance on
+          # bytes nothing loads. Asking build_site.py keeps one answer.
+          if python3 tools/build_site.py --is-remote af3; then
+            echo "af3 is hosted remotely; not publishing it"
+            exit 0
+          fi
           gh release download af3-int5 --pattern localfold-af3-int5.tar.gz
           tar -xzf localfold-af3-int5.tar.gz -C dist
 

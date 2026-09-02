@@ -18,7 +18,7 @@
 import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
-import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { withAbort } from "../src/runtime/abort.js";
 
@@ -54,8 +54,19 @@ export function openStore(onProgress, family = "monomer") {
   if (store === undefined) {
     store = (async () => {
       const manifest = await loadManifest(family);
-      const Store = location.protocol === "file:" ? ScriptTensorStore : HttpTensorStore;
-      const opened = await Store.fromManifest(bundle.directory, manifest, onProgress);
+      const offline = location.protocol === "file:";
+      const Store = offline ? ScriptTensorStore : HttpTensorStore;
+      // 🔴 THE SHARDS COME FROM THE BUNDLE'S BASE, WHICH MAY BE OFF-ORIGIN. A
+      // model hosted on Hugging Face resolves to an absolute URL and the store
+      // does not need to know the difference: shard paths are resolved against
+      // whatever base it was opened with. See bundleBaseUrl.
+      //
+      // 🔴 EXCEPT OFFLINE, WHICH IS THE WHOLE POINT OF BEING OFFLINE. A file://
+      // bundle carries its weights beside it as base64 scripts and reads them
+      // with ScriptTensorStore; pointing that at a remote would make the one
+      // build that must not need the network the only one that always does.
+      const base = offline ? bundle.directory : bundleBaseUrl(family);
+      const opened = await Store.fromManifest(base, manifest, onProgress);
       // ...every shard at once; see HttpTensorStore.prefetch. AF2's loaders read
       // the whole bundle too.
       opened.prefetch?.();
