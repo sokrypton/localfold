@@ -127,6 +127,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // One workgroup per token pair: accumulate the 32x32 product over sequences
   // in workgroup memory, then map it through output_w.
   //
+  // 🔴 256 LANES, NOT 64, AND THAT IS THE ONLY THING HERE THAT PAID. A lane
+  // owns PRODUCTS/lanes cells and sweeps every sequence for each, so widening
+  // the workgroup divides the cells a lane carries rather than the work it
+  // does - the same trick the diffusion transformer's per-token kernels wanted.
+  // Measured at 1024 rows, on the msa-stack as a whole:
+  //     64 lanes 474 ms    128 lanes 401    256 lanes 386
+  //
   // 🔴 THIS IS THE HOT KERNEL AT DEPTH, AND STAGING THE ROWS WAS TRIED AND LOST.
   // The MSA stack costs about 72 ms fixed plus 0.38 ms a row, so at AF3's own
   // num_msa of 1024 it is 469 ms - 43% of a trunk pass - and this contraction is
@@ -155,9 +162,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 var<workgroup> product: array<f32, ${products}>;
-var<workgroup> reduce: array<f32, 64>;
+var<workgroup> reduce: array<f32, 256>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let slot = group.x + group.y * GRID_WIDTH;
@@ -166,13 +173,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let j = slot % TOKENS;
   let local = local_id.x;
 
-  for (var index = local; index < PRODUCTS; index += 64u) { product[index] = 0.0; }
+  for (var index = local; index < PRODUCTS; index += 256u) { product[index] = 0.0; }
   workgroupBarrier();
 
   // Each invocation owns a fixed set of (c, e) cells for the whole sweep, so
   // the accumulator stays in registers and only lands in workgroup memory once.
   var count = 0.0;
-  for (var index = local; index < PRODUCTS; index += 64u) {
+  for (var index = local; index < PRODUCTS; index += 256u) {
     let c = index / C_OUTER;
     let e = index % C_OUTER;
     var total = 0.0;
@@ -182,18 +189,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     product[index] = total;
   }
   // 🔴 THE DENOMINATOR COUNTS SEQUENCES COVERING BOTH TOKENS.
-  for (var s = local; s < SEQUENCES; s += 64u) {
+  for (var s = local; s < SEQUENCES; s += 256u) {
     count += msa_mask[s * TOKENS + i] * msa_mask[s * TOKENS + j];
   }
   reduce[local] = count;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = 128u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce[local] += reduce[local + stride]; }
     workgroupBarrier();
   }
   let scale = 1.0 / (NORM_EPSILON + reduce[0]);
 
-  for (var f = local; f < C_Z; f += 64u) {
+  for (var f = local; f < C_Z; f += 256u) {
     var total = weights[W_OUT_BIAS + f];
     for (var index = 0u; index < PRODUCTS; index += 1u) {
       total += product[index] * weights[W_OUT + index * C_Z + f];
