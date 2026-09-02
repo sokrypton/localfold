@@ -83,6 +83,51 @@ noise injection, the Euler step and two copies of the coordinates for the
 trajectory callback - and it is 2.4 s of a 200-step fold. Nobody has looked at
 it.
 
+## Modified residues, and why they need sixteen steps
+
+Supported as of 2026-09-02, verified against AF3 array by array
+(`check_af3_featurise.js` with a `--modification` dump) and structurally
+(`tools/gpu/probe-modified.js`).
+
+A modified residue is **one token per heavy atom**, inside the chain: SEP at
+position 3 of a twelve-residue chain is 21 tokens, the ten belonging to it each
+carrying one atom, all holding the PARENT residue's aatype (serine), all
+sharing that residue's index, and all keeping the chain's asym, entity and sym.
+Its own bonds go through the ligand-bond machinery; its peptide bonds to its
+neighbours stay implicit in `residue_index`, as a standard chain's do. The
+dictionary describes a FREE amino acid, so `polymerResidue` drops the OXT it
+loses on forming a peptide bond and puts it back at a C-terminus.
+
+🔴 **MSE IS NOT ONE OF THESE.** AF3 folds selenomethionine into methionine's
+alphabet slot and leaves it one token with its own chemistry - SD becomes SE.
+Every other modification tried is atom-tokenised. The page refuses MSE with
+that reason rather than offering it and doing something else.
+
+🔴 **AN ATOM-TOKENISED RESIDUE IS PLACED LESS PRECISELY THAN A STANDARD ONE,
+AND THAT IS AF3'S BEHAVIOUR.** Its atoms are each their own token rather than
+coming from a shared residue conformer, so the sampler places them
+individually. Folding `ACSEFGHIKLWY` with SEP at 3, as the median
+predicted-to-ideal bond ratio:
+
+| | control | modified |
+|---|---|---|
+| AF3 itself, 32 diffusion steps | 1.003 | **0.956** |
+| this port, 32 diffusion steps | 1.005 | **0.953** |
+
+We match AF3 to three thousandths on both, so the gap between 0.95 and 1.00 is
+the architecture's price and not a porting bug. What IS ours to get right is the
+step count: at eight flow steps the residue comes out visibly compressed while
+its neighbours are fine.
+
+    flow-8    0.835   (control 1.003)
+    flow-16   0.974   (control 1.007)
+    flow-32   0.996   (control 1.010)
+
+So sixteen is the lowest the dial offers, in both modes. It looked exactly like
+the side-chain bug below - everything short, worse with distance from the
+backbone, P-O3P at 0.483 - and the two are told apart by the fact that this one
+improves with more steps and that one did not.
+
 ## Running it
 
     python3 -m http.server 8080          # then open /index.html

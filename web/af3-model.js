@@ -34,10 +34,28 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * What the count dial offers per mode, and what it is called.
  *
  * 🔴 THE TWO NUMBERS ARE NOT INTERCHANGEABLE. A flow CYCLE walks the whole
- * schedule, so eight is a finished structure. A diffusion STEP discretises it,
- * and below twenty the sampler does not land - ten gives 5.91 A on 6MRR with a
- * CA-CA of 8.40 A, a chain that is not connected. So the dial is rebuilt on a
- * mode change rather than carrying a number across.
+ * schedule; a diffusion STEP discretises it, and below twenty the sampler does
+ * not land - ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A, a chain that is
+ * not connected. So the dial is rebuilt on a mode change rather than carrying a
+ * number across.
+ *
+ * 🔴 AND SIXTEEN IS THE LOWEST EITHER OFFERS, WHICH IT WAS NOT. Flow used to
+ * start at two and prefer eight, and eight IS a finished structure for a chain
+ * of standard residues - but not for a modified one, whose atoms are each their
+ * own token rather than coming from a shared residue conformer and so have to
+ * be placed individually. Measured with tools/gpu/probe-modified.js on a
+ * phosphoserine, as the median predicted-to-ideal bond ratio against the
+ * unmodified residues of the same chain:
+ *
+ *     flow-8    0.835   (control 1.003)
+ *     flow-16   0.974   (control 1.007)
+ *     flow-32   0.996   (control 1.010)
+ *
+ * A dial whose lowest setting is wrong for a supported input is a trap, and one
+ * number that is always good enough beats two and a rule about when to use
+ * which. The cost is a few seconds. AF3 itself scores 0.956 against this port's
+ * 0.953 at matched settings, so what is left at sixteen is the architecture's
+ * price for an atom-tokenised residue and not something more steps will fix.
  */
 export const AF3_COUNTS = {
   // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
@@ -45,7 +63,7 @@ export const AF3_COUNTS = {
   // note above still applies to what the numbers MEAN - a flow step walks the
   // whole schedule, a diffusion step discretises it - which is why the values
   // differ by an order of magnitude and the dial is rebuilt on a mode change.
-  flow: { label: "Steps", values: [2, 4, 8, 16, 32], preferred: 8 },
+  flow: { label: "Steps", values: [16, 32, 64], preferred: 16 },
   diffusion: { label: "Steps", values: [20, 40, 80, 160, 320], preferred: 20 },
 };
 

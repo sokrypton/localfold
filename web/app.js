@@ -794,26 +794,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
   const asked = Number(document.getElementById("af3-count")?.value)
     || AF3_COUNTS[mode].preferred;
-  // 🔴 A MODIFIED RESIDUE NEEDS MORE SAMPLING THAN A STANDARD ONE, and eight
-  // steps is not enough for it. Its atoms are each their own token rather than
-  // coming from a shared residue conformer, so the sampler has to place them
-  // individually - and at the default eight steps they come out COMPRESSED
-  // while every standard residue around them is fine. Measured with
-  // tools/gpu/probe-modified.js, as the median predicted-to-ideal bond ratio
-  // of a phosphoserine against the unmodified residues of the same chain:
-  //
-  //     flow-8    0.835   (control 1.003)
-  //     flow-16   0.974   (control 1.007)
-  //     flow-32   0.996   (control 1.010)
-  //
-  // 🔴 THIS IS NOT A PORTING BUG, WHICH IS WHY THE FLOOR IS A FLOOR AND NOT A
-  // FIX. AF3 itself scores 0.956 on the same input at 32 diffusion steps where
-  // this port scores 0.953, with both controls at 1.003-1.005: an
-  // atom-tokenised residue is simply placed less precisely than a standard one.
-  // What the floor buys is that the page does not draw a visibly wrong
-  // phosphate by default, and it is said out loud rather than applied quietly.
-  const floor = modifications.length > 0 ? 16 : 0;
-  const calls = Math.max(asked, floor);
+  // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
+  // insurance rather than policy - a stale stored value or a hand-edited option
+  // is the only way below it now. AF3_COUNTS carries the measurements and the
+  // reason; the short version is that a modified residue's atoms are each their
+  // own token and eight steps leaves them compressed (0.835 against a control
+  // of 1.003) while sixteen does not (0.974).
+  const calls = Math.max(asked, modifications.length > 0 ? 16 : 0);
   const recycles = recycleCount();
   const { requested: maxMsaSequences } = maxMsaConfig();
   // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
