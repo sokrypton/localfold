@@ -210,22 +210,38 @@ export async function foldAf3(options) {
   // reads a 515 MB CCD pickle; a fold touches only the components its ligands
   // name, and the PDB serves each as one small mmCIF. The 21 polymer components
   // stay baked in reference-conformers.js, because every fold needs those.
-  const ligands = [];
   const componentCache = new Map();
-  for (const code of options.ligandCodes ?? []) {
+  const component = async (code, what) => {
     if (!componentCache.has(code)) {
-      onStatus(`Fetching ligand ${code}`);
+      onStatus(`Fetching ${what} ${code}`);
       let response;
       try {
         response = await fetch(ccdUrl(code), { signal });
       } catch (cause) {
-        throw new Error(`Could not reach the PDB for ligand ${code}`, { cause });
+        throw new Error(`Could not reach the PDB for ${what} ${code}`, { cause });
       }
       if (!response.ok) {
         throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
       }
       componentCache.set(code, parseCcdComponent(await response.text()));
     }
+    return componentCache.get(code);
+  };
+  // 🔴 A MODIFIED RESIDUE'S COMPONENT COMES FROM THE SAME PLACE AS A LIGAND'S,
+  // and it is fetched here rather than in the featuriser because the featuriser
+  // is synchronous - it is the one piece of a batch that cannot be computed
+  // from the sequence alone.
+  const modifications = [];
+  for (const modification of options.modifications ?? []) {
+    modifications.push({
+      chain: modification.chain,
+      position: modification.position,
+      ...(await component(modification.code, "modified residue")),
+    });
+  }
+  const ligands = [];
+  for (const code of options.ligandCodes ?? []) {
+    await component(code, "ligand");
     // Each instance is its own chain, so repeated codes are repeated entries -
     // featuriseProtein gives them one entity_id and successive sym_ids, which
     // is the same rule it applies to repeated sequences.
@@ -234,6 +250,7 @@ export async function foldAf3(options) {
 
   const batch = featuriseProtein(sequence, {
     ligands,
+    modifications,
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

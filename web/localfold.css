@@ -382,9 +382,14 @@
    the rows no longer read as a table - the eye cannot scan a column that moves.
    Four tracks: the type, the value taking whatever is left, then copies and
    remove at a fixed width on every row. */
+/* 🔴 FIVE COLUMNS, AND EVERY ROW FILLS ALL FIVE. A protein row is type,
+   sequence, copies, options, remove; a ligand row is type, menu, code, copies,
+   remove. It was four, and adding the options button gave protein rows a fifth
+   child with nowhere to go - so it wrapped onto a line of its own and the row
+   grew a break down the middle. */
 .entity-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto auto 1fr auto auto;
   align-items: start;
   gap: 8px;
 }
@@ -392,7 +397,9 @@
 /* A ligand row has one more control - the menu of common codes - and the box
    beside it only ever holds five characters, so the menu takes the width the
    sequence box would otherwise have. */
-.entity-row-ligand { grid-template-columns: auto minmax(0, 1fr) 9ch auto auto; }
+/* A ligand row swaps the sequence box for the menu and a five-character code,
+   so the menu takes the width the sequence would have had. */
+.entity-row-ligand { grid-template-columns: auto auto minmax(0, 1fr) 9ch auto; }
 .entity-picker {
   box-sizing: border-box;
   min-width: 0;
@@ -426,6 +433,65 @@
    height, so setting rows=2 in entity-ui.js alone changed nothing - both have
    to agree. Two lines is 13px at 1.35 twice, plus 8px of padding either side
    and the border: 52px. A ligand really is five characters and keeps one. */
+/* The row has to be the popup's positioning context, since the popup hangs off
+   the options button rather than off the page. */
+.entity-row { position: relative; }
+
+/* ...and it matches the button beside it, because they sit together and a
+   half-height neighbour reads as a different kind of control. */
+.entity-options { position: relative; flex-shrink: 0; height: 34px; width: 34px; }
+.entity-remove { width: 34px; }
+/* A count on the button, because a closed popup hides what it holds and a
+   modification changes what is folded. */
+.entity-options[data-count]::after {
+  content: attr(data-count);
+  position: absolute;
+  top: -5px; right: -5px;
+  min-width: 15px; height: 15px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 10px; line-height: 15px;
+  text-align: center;
+}
+
+.entity-popup {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 340px;
+  padding: 10px 12px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, .16);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.entity-popup-title { font-size: 12px; font-weight: 600; color: #374151; }
+.entity-popup-empty, .entity-popup-problem {
+  margin: 0; font-size: 12px; line-height: 1.4; color: #6b7280;
+}
+.entity-popup-problem { color: #b91c1c; }
+.entity-popup-row { display: flex; align-items: center; gap: 6px; }
+.entity-popup-code { flex: 1 1 auto; min-width: 0; height: 30px; font-size: 12px;
+  border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
+.entity-popup-typed { width: 6ch; height: 30px; font-size: 12px; text-align: center;
+  text-transform: uppercase; border: 1px solid #d1d5db; border-radius: 7px; }
+.entity-popup-at { font-size: 12px; color: #6b7280; }
+.entity-popup-position { width: 6ch; height: 30px; font-size: 12px; text-align: center;
+  border: 1px solid #d1d5db; border-radius: 7px; }
+/* The residue actually at that position: a wrong number is then visible here
+   rather than as a validation message after pressing Fold. */
+.entity-popup-residue {
+  width: 2ch; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  font-weight: 600; color: #2563eb; text-align: center;
+}
+.entity-popup-add { align-self: flex-start; font-size: 12px; }
+
 .entity-value-protein { height: 52px; min-height: 52px; resize: vertical; }
 .entity-value-ligand { height: 34px; text-transform: uppercase; }
 
@@ -443,16 +509,8 @@
   font-size: 13px;
 }
 
-.entity-copies-label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-  font-size: 12px;
-  color: #6b7280;
-  white-space: nowrap;
-}
-
+/* No label: a number beside "Protein" already reads as a count, and the word
+   pushed the box to the far end of the row away from the thing it counts. */
 .entity-copies {
   width: 52px;
   height: 34px;

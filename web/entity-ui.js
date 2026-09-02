@@ -15,7 +15,8 @@
  * input. So adding, removing and changing a type rebuild; typing and copies do
  * not, and update the model in place instead.
  */
-import { COMMON_IONS, COMMON_LIGANDS, ENTITY_LABELS, ENTITY_TYPES, MENU_CODES, entitiesFromText, newEntity } from "./entities.js";
+import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
+  MENU_CODES, entitiesFromText, entityProblem, newEntity } from "./entities.js";
 import { cleanSequence, extractFastaHeader } from "./sequence.js";
 
 /**
@@ -40,6 +41,203 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
   const render = () => {
     rowsContainer.replaceChildren(...entities.map((entity, index) => row(entity, index)));
     notify();
+  };
+
+  /**
+   * The modified-residue popup: one row per modification, a menu of the common
+   * ones and a position, plus a free code for anything else.
+   *
+   * 🔴 ONE POPUP AT A TIME AND IT CLOSES ON ANYTHING ELSE. Left open it sits
+   * over the row below and takes clicks meant for it, which reads as the page
+   * having frozen rather than as a menu being open.
+   */
+  let closePopup = null;
+  const openModifications = (anchor, entity, index) => {
+    if (closePopup !== null) { closePopup(); return; }
+    const popup = document.createElement("div");
+    popup.className = "entity-popup";
+    popup.setAttribute("role", "dialog");
+    popup.setAttribute("aria-label", "Modified residues");
+
+    const draw = () => {
+      // 🔴 NOT render(). The popup is a CHILD of the row, so rebuilding the row
+      // deletes the popup out from under itself - clicking "Add modification"
+      // closed the menu and left the modification behind, which reads as the
+      // button having failed. The one thing outside the popup that has to keep
+      // up is the badge on the button, so that is updated by hand.
+      const badge = anchor.querySelector(".entity-options");
+      const count = (entity.modifications ?? []).length;
+      if (badge !== null) {
+        if (count > 0) badge.dataset.count = String(count);
+        else delete badge.dataset.count;
+        badge.title = count === 0
+          ? "Modified residues" : `${count} modified residue${count === 1 ? "" : "s"}`;
+      }
+      popup.replaceChildren();
+      const title = document.createElement("div");
+      title.className = "entity-popup-title";
+      title.textContent = "Modified residues";
+      popup.append(title);
+
+      const sequence = cleanSequence(entity.value);
+      entity.modifications ??= [];
+      if (entity.modifications.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "entity-popup-empty";
+        empty.textContent = sequence.length === 0
+          ? "Paste a sequence first, then add a modification to one of its residues."
+          : "None. A modification replaces one residue with a PDB component.";
+        popup.append(empty);
+      }
+
+      entity.modifications.forEach((modification, at) => {
+        const line = document.createElement("div");
+        line.className = "entity-popup-row";
+
+        const menu = document.createElement("select");
+        menu.className = "entity-popup-code";
+        const custom = document.createElement("option");
+        custom.value = "";
+        custom.textContent = "Custom";
+        menu.append(custom);
+        for (const entry of COMMON_MODIFICATIONS) {
+          const option = document.createElement("option");
+          option.value = entry.code;
+          option.textContent = `${entry.code} · ${entry.name}`;
+          menu.append(option);
+        }
+        const code = (modification.code ?? "").toUpperCase();
+        menu.value = COMMON_MODIFICATIONS.some((entry) => entry.code === code) ? code : "";
+
+        const typed = document.createElement("input");
+        typed.type = "text";
+        typed.className = "entity-popup-typed";
+        typed.value = modification.code ?? "";
+        typed.placeholder = "CCD";
+        typed.setAttribute("aria-label", "Modification CCD code");
+
+        const at1 = document.createElement("span");
+        at1.className = "entity-popup-at";
+        at1.textContent = "at";
+
+        const position = document.createElement("input");
+        position.type = "number";
+        position.className = "entity-popup-position";
+        position.min = "1";
+        if (sequence.length > 0) position.max = String(sequence.length);
+        position.value = modification.position ? String(modification.position) : "";
+        position.setAttribute("aria-label", "Residue position");
+
+        // What is actually at that position, so a wrong number is visible
+        // before the fold rather than as a validation message after it.
+        const residue = document.createElement("span");
+        residue.className = "entity-popup-residue";
+        const letter = sequence[modification.position - 1];
+        residue.textContent = letter === undefined ? "" : letter;
+
+        const drop = document.createElement("button");
+        drop.type = "button";
+        drop.className = "btn btn-grey btn-small";
+        drop.title = "Remove this modification";
+        drop.setAttribute("aria-label", "Remove this modification");
+        drop.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+
+        menu.addEventListener("change", () => {
+          if (menu.value === "") { typed.focus(); return; }
+          modification.code = menu.value;
+          // ...and jump the position to the first residue this one can go on,
+          // when the current one cannot take it.
+          const entry = COMMON_MODIFICATIONS.find((e) => e.code === menu.value);
+          if (entry && sequence[modification.position - 1] !== entry.parent) {
+            const first = sequence.indexOf(entry.parent);
+            modification.position = first < 0 ? modification.position : first + 1;
+          }
+          notify();
+          draw();
+        });
+        typed.addEventListener("input", () => {
+          modification.code = typed.value.trim().toUpperCase();
+          notify();
+        });
+        typed.addEventListener("blur", () => { notify(); draw(); });
+        position.addEventListener("input", () => {
+          modification.position = Number.parseInt(position.value, 10);
+          residue.textContent = cleanSequence(entity.value)[modification.position - 1] ?? "";
+          notify();
+        });
+        drop.addEventListener("click", () => {
+          entity.modifications.splice(at, 1);
+          notify();
+          draw();
+        });
+
+        line.append(menu, typed, at1, position, residue, drop);
+        popup.append(line);
+      });
+
+      const add = document.createElement("button");
+      add.type = "button";
+      add.className = "btn btn-grey btn-small entity-popup-add";
+      add.textContent = "+ Add modification";
+      add.addEventListener("click", () => {
+        // 🔴 THE FIRST FREE RESIDUE, NOT THE FIRST ONE. Defaulting to the first
+        // match put every new row on the same residue, so adding a second
+        // modification greeted the user with "Two modifications on residue 12"
+        // before they had touched anything.
+        const letters = cleanSequence(entity.value);
+        const taken = new Set(entity.modifications.map((one) => one.position));
+        let chosen = null;
+        for (const entry of COMMON_MODIFICATIONS) {
+          for (let at = 0; at < letters.length; at += 1) {
+            if (letters[at] === entry.parent && !taken.has(at + 1)) {
+              chosen = { code: entry.code, position: at + 1 };
+              break;
+            }
+          }
+          if (chosen !== null) break;
+        }
+        // ...and if every residue a listed modification fits is already taken,
+        // an empty row is honest: the user picks a code and a position.
+        entity.modifications.push(chosen ?? { code: "", position: 1 });
+        notify();
+        draw();
+      });
+      popup.append(add);
+
+      const problem = entityProblem(entity);
+      if (problem !== null) {
+        const warning = document.createElement("p");
+        warning.className = "entity-popup-problem";
+        warning.textContent = problem;
+        popup.append(warning);
+      }
+    };
+
+    draw();
+    anchor.append(popup);
+    // 🔴 CAUGHT ON THE WAY DOWN, NOT ON THE WAY UP. A click inside the popup
+    // redraws it, which REPLACES the element that was clicked - so by the time
+    // the event bubbled to the document the target was detached and
+    // `popup.contains(target)` was false, and the popup closed itself every
+    // time "Add modification" was pressed. In the capture phase the target is
+    // still where it was clicked.
+    const dismiss = (event) => {
+      if (popup.contains(event.target)) return;
+      closePopup?.();
+    };
+    const onKey = (event) => { if (event.key === "Escape") closePopup?.(); };
+    closePopup = () => {
+      popup.remove();
+      document.removeEventListener("click", dismiss, true);
+      document.removeEventListener("keydown", onKey);
+      closePopup = null;
+      render();
+    };
+    // ...on the next tick, or the click that opened it closes it again.
+    setTimeout(() => {
+      document.addEventListener("click", dismiss, true);
+      document.addEventListener("keydown", onKey);
+    }, 0);
   };
 
   const row = (entity, index) => {
@@ -166,9 +364,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       });
     }
 
-    const copiesLabel = document.createElement("label");
-    copiesLabel.className = "entity-copies-label";
-    copiesLabel.textContent = "copies";
+    // 🔴 A BARE BOX BESIDE THE TYPE, WITH NO WORD ON IT. It used to carry the
+    // label "copies", which is what a number next to "Protein" already means -
+    // and the label pushed the box to the far end of the row, away from the
+    // thing it counts. AlphaFold Server puts it right after the type for the
+    // same reason.
     const copies = document.createElement("input");
     copies.className = "entity-copies";
     copies.type = "number";
@@ -177,13 +377,39 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     copies.step = "1";
     copies.value = String(entity.copies);
     copies.title = "How many identical copies of this entity to fold";
+    copies.setAttribute("aria-label", "Copies");
     copies.addEventListener("input", () => {
       // Left as typed while it is being typed; entitiesProblem reports a bad
       // count, and rewriting the field mid-edit fights the user for the caret.
       entity.copies = Number.parseInt(copies.value, 10);
       notify();
     });
-    copiesLabel.prepend(copies);
+
+    // 🔴 MODIFICATIONS GO BEHIND A BUTTON, NOT INTO THE SEQUENCE BOX. They were
+    // going to be inline - "ACS[SEP]EFG" - which is compact and wrong for the
+    // thing people actually do: paste a sequence from somewhere else, then say
+    // that residue 3 is phosphorylated. Inline means editing the pasted text,
+    // and a typo in it is a different sequence rather than a bad modification.
+    // A row can carry several, so the button opens a list rather than a field.
+    let options = null;
+    if (entity.type === "protein") {
+      options = document.createElement("button");
+      options.type = "button";
+      options.className = "btn btn-grey btn-small entity-options";
+      const count = (entity.modifications ?? []).length;
+      options.title = count === 0
+        ? "Modified residues" : `${count} modified residue${count === 1 ? "" : "s"}`;
+      options.setAttribute("aria-label", options.title);
+      options.setAttribute("aria-haspopup", "dialog");
+      options.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+      // ...and it says so without being opened, because a modification changes
+      // what is folded and a closed popup hides it.
+      if (count > 0) options.dataset.count = String(count);
+      options.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openModifications(wrapper, entity, index);
+      });
+    }
 
     const remove = document.createElement("button");
     remove.type = "button";
@@ -202,7 +428,10 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
 
     // The picker sits between the type and the box, so the row reads
     // "Ligand · [ATP ▾] [ATP] × 1" left to right.
-    wrapper.append(type, ...(picker === null ? [] : [picker]), value, copiesLabel, remove);
+    // The row reads left to right: what it is, how many, what it holds, and
+    // then the two buttons that act on it.
+    wrapper.append(type, copies, ...(picker === null ? [] : [picker]), value,
+                   ...(options === null ? [] : [options]), remove);
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
     return wrapper;
   };

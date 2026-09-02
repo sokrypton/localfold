@@ -744,7 +744,8 @@ const cheapHash = (text) => {
  * are loaded with none and the final structure is appended carrying the real
  * pLDDT and PAE, and that is the frame the page lands on.
  */
-async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = []) {
+async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
+                           modifications = []) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -792,7 +793,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // nothing can undo a pass - so the cache is offered only when it is at or
   // behind what was asked for.
   const trunkKey = JSON.stringify({
-    chains, ligandCodes, maxMsaSequences, seed: randomSeed(),
+    // ...modifications included, or a fold that only adds one reuses the trunk
+    // of the fold without it and silently ignores what was asked for.
+    chains, ligandCodes, modifications, maxMsaSequences, seed: randomSeed(),
     alignment: alignmentBlocks === null ? null : cheapHash(JSON.stringify(alignmentBlocks)),
   });
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
@@ -823,7 +826,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let pending = Promise.resolve();
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
-    alignment: alignmentBlocks, maxMsaSequences, ligandCodes, reuse,
+    alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications, reuse,
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -935,6 +938,15 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // Named, because a fold that silently ignored the ligand would otherwise
   // report exactly the same line - the residue count is the same either way.
   if (ligandCodes.length > 0) what.push(ligandCodes.join(", "));
+  // ...and the same argument applies twice over to a modified residue, whose
+  // residue COUNT is unchanged by definition: "59 residues" is the line either
+  // way, so the only evidence the modification was applied is this.
+  if (modifications.length > 0) {
+    const named = modifications.map((one) => `${one.code}${one.position}`);
+    const shown = named.length > 3 ? `${named.slice(0, 3).join(", ")} +${named.length - 3}`
+      : named.join(", ");
+    what.push(shown);
+  }
   const detail = [`in ${result.seconds.toFixed(0)} s`
     // Said out loud, because a fold that took a third of the time it used to
     // otherwise reads as something having gone wrong.
@@ -982,9 +994,10 @@ async function fold(event) {
       throw new Error(enteredProblem);
     }
     const request = enteredProblem === null
-      ? expandEntities(entities) : { chains: [], ligandCodes: [] };
+      ? expandEntities(entities) : { chains: [], ligandCodes: [], modifications: [] };
     let chains = request.chains;
     const ligandCodes = request.ligandCodes;
+    const modifications = request.modifications ?? [];
     let sequence = chains.join("");
     const family = modelFamily(ligandCodes.length);
 
@@ -1029,7 +1042,7 @@ async function fold(event) {
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (family === "af3") {
-      await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes);
+      await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes, modifications);
       return;
     }
 

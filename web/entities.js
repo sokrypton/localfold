@@ -102,9 +102,75 @@ export const UNSUPPORTED_TYPES = ["dna", "rna"];
 /** More copies than this is far likelier to be a typo than a request. */
 const MAX_COPIES = 20;
 
+/**
+ * The modified residues worth putting in a menu, as CCD codes with the residue
+ * each one modifies.
+ *
+ * 🔴 A CONVENIENCE AND NOT A LIMIT, like the ligand menu: anything the PDB
+ * serves works, because the fold fetches the component by code. `parent` is
+ * what the menu uses to offer the ones that fit the residue actually at that
+ * position - a phosphoserine on a tyrosine is a typo, and the position is the
+ * part people get wrong.
+ *
+ * 🔴 MSE IS NOT IN HERE. AF3 folds selenomethionine into methionine's alphabet
+ * slot and leaves it one token, where every entry below becomes one token per
+ * atom. It is a different thing wearing the same name, and offering it beside
+ * these would promise something this path does not do.
+ */
+export const COMMON_MODIFICATIONS = [
+  { code: "SEP", parent: "S", name: "phosphoserine" },
+  { code: "TPO", parent: "T", name: "phosphothreonine" },
+  { code: "PTR", parent: "Y", name: "phosphotyrosine" },
+  { code: "HYP", parent: "P", name: "hydroxyproline" },
+  { code: "MLY", parent: "K", name: "N-methyllysine" },
+  { code: "M3L", parent: "K", name: "N-trimethyllysine" },
+  { code: "ALY", parent: "K", name: "N-acetyllysine" },
+  { code: "KCX", parent: "K", name: "carboxylysine" },
+  { code: "CSO", parent: "C", name: "S-hydroxycysteine" },
+  { code: "CME", parent: "C", name: "S,S-(2-hydroxyethyl)thiocysteine" },
+  { code: "OCS", parent: "C", name: "cysteinesulfonic acid" },
+  { code: "SNC", parent: "C", name: "S-nitrosocysteine" },
+  { code: "NEP", parent: "H", name: "N1-phosphohistidine" },
+  { code: "AGM", parent: "R", name: "methylarginine" },
+  { code: "PCA", parent: "E", name: "pyroglutamate" },
+];
+
 /** A fresh entity of the given type, as `+ Add entity` makes one. */
 export function newEntity(type = "protein") {
-  return { type, value: "", copies: 1 };
+  return { type, value: "", copies: 1, modifications: [] };
+}
+
+/**
+ * What is wrong with one modified residue on one entity, or null.
+ *
+ * @param {{code: string, position: number}} modification
+ * @param {string} sequence the cleaned residue letters this entity holds
+ */
+export function modificationProblem(modification, sequence) {
+  const code = (modification.code ?? "").trim().toUpperCase();
+  if (code === "") return "Choose a modification";
+  if (!/^[A-Z0-9]{1,5}$/.test(code)) {
+    return "A CCD code is 1-5 letters or digits, like SEP or PTR";
+  }
+  if (code === "MSE") {
+    // Better said here than discovered as a wrong token count later.
+    return "MSE is not supported yet: AF3 treats it as methionine rather than "
+      + "as a modified residue";
+  }
+  if (!Number.isInteger(modification.position) || modification.position < 1) {
+    return "A position is a whole number, counting from 1";
+  }
+  if (modification.position > sequence.length) {
+    return `Position ${modification.position} is past the end of a `
+      + `${sequence.length}-residue sequence`;
+  }
+  const known = COMMON_MODIFICATIONS.find((entry) => entry.code === code);
+  const parent = sequence[modification.position - 1];
+  if (known !== undefined && parent !== known.parent) {
+    return `${code} modifies ${known.parent}, but position ${modification.position}`
+      + ` is ${parent}`;
+  }
+  return null;
 }
 
 /**
@@ -140,7 +206,21 @@ export function entityProblem(entity) {
   if (value.includes(":")) {
     return "One sequence per entity - use Add entity for another chain";
   }
-  return sequenceProblem(cleanSequence(value));
+  const cleaned = cleanSequence(value);
+  const sequenceFault = sequenceProblem(cleaned);
+  if (sequenceFault !== null) return sequenceFault;
+  // ...the modifications last, because every one of their messages talks about
+  // a position in a sequence that has to be valid first.
+  const seen = new Set();
+  for (const modification of entity.modifications ?? []) {
+    const fault = modificationProblem(modification, cleaned);
+    if (fault !== null) return fault;
+    if (seen.has(modification.position)) {
+      return `Two modifications on residue ${modification.position}`;
+    }
+    seen.add(modification.position);
+  }
+  return null;
 }
 
 /**
@@ -178,13 +258,26 @@ export function expandEntities(entities) {
   if (problem !== null) throw new Error(problem);
   const chains = [];
   const ligandCodes = [];
+  // 🔴 PER CHAIN, NOT PER ENTITY, BECAUSE COPIES ARE EXPANDED. Two copies of a
+  // phosphorylated chain are two chains each carrying the modification, and the
+  // featuriser indexes them by the chain number it will actually see - which is
+  // the position in `chains`, not the position in `entities`.
+  const modifications = [];
   for (const entity of entities) {
     for (let copy = 0; copy < entity.copies; copy += 1) {
-      if (entity.type === "protein") chains.push(cleanSequence(entity.value));
-      else ligandCodes.push(entity.value.trim().toUpperCase());
+      if (entity.type === "protein") {
+        for (const modification of entity.modifications ?? []) {
+          modifications.push({
+            chain: chains.length,
+            position: modification.position,
+            code: modification.code.trim().toUpperCase(),
+          });
+        }
+        chains.push(cleanSequence(entity.value));
+      } else ligandCodes.push(entity.value.trim().toUpperCase());
     }
   }
-  return { chains, ligandCodes, sequence: chains.join(":") };
+  return { chains, ligandCodes, modifications, sequence: chains.join(":") };
 }
 
 /**

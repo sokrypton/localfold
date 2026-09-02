@@ -50,8 +50,23 @@ describe("entity validation", () => {
     // polymer loop, which does not run when there are no residues.
     expect(entitiesProblem([ligand("HEM")])).toBe(null);
     expect(expandEntities([ligand("HEM")])).toEqual({
-      chains: [], ligandCodes: ["HEM"], sequence: "",
+      chains: [], ligandCodes: ["HEM"], modifications: [], sequence: "",
     });
+  });
+
+  it("gives every copy of a chain its own modification, numbered by chain", () => {
+    // 🔴 COPIES ARE EXPANDED, so two copies of a phosphorylated chain are two
+    // chains each carrying it - and the featuriser indexes by the chain it will
+    // actually see, which is the position in `chains` and not in `entities`.
+    const modified = { type: "protein", value: "ACSEFG", copies: 2,
+                       modifications: [{ code: "sep", position: 3 }] };
+    const plain = { type: "protein", value: "MKV", copies: 1, modifications: [] };
+    const out = expandEntities([modified, plain]);
+    expect(out.chains).toEqual(["ACSEFG", "ACSEFG", "MKV"]);
+    expect(out.modifications).toEqual([
+      { chain: 0, position: 3, code: "SEP" },
+      { chain: 1, position: 3, code: "SEP" },
+    ]);
   });
 
   it("still needs something to fold", () => {
@@ -64,7 +79,9 @@ describe("entity validation", () => {
   });
 
   it("makes a blank protein row by default", () => {
-    expect(newEntity()).toEqual({ type: "protein", value: "", copies: 1 });
+    // `modifications` is present and empty rather than absent, so every reader
+    // can iterate it without asking whether it is there.
+    expect(newEntity()).toEqual({ type: "protein", value: "", copies: 1, modifications: [] });
     expect(newEntity("ligand").type).toBe("ligand");
   });
 });
