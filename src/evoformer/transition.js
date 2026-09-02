@@ -197,7 +197,15 @@ struct MatmulParameters {
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_weight: array<f32, 512>;
+// 🔴 A THREAD'S EIGHT COLUMNS ARE ADJACENT HERE, WHICH IS NOT HOW IT READS THEM
+// OUT. The eight output columns an invocation owns are strided by eight in the
+// OUTPUT - column + block * 8 - but nothing says the staged copy has to match:
+// laid out per thread, its eight weights are two vec4 reads where they were
+// eight scalar ones, and the inner loop goes from ten workgroup reads to four
+// for the same sixteen multiply-adds. tools/gpu/probe-alu.js puts workgroup
+// reads at 394 billion a second against 580 billion vec4 multiply-adds, so for
+// this kernel the reads were the larger term.
+var<workgroup> tile_weight: array<vec4<f32>, 128>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -224,26 +232,28 @@ fn main(
     if (second_row < parameters.rows && source_k < parameters.inner) {
       tile_source[tile_index + 64u] = source[second_row * parameters.inner + source_k];
     }
+    var staged_low = vec4<f32>(0.0);
+    var staged_high = vec4<f32>(0.0);
     for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let tile_column = local.x + column_block * 8u;
       let output_column = column + column_block * 8u;
-      let weight_index = local.y * 64u + tile_column;
-      tile_weight[weight_index] = 0.0;
+      var value = 0.0;
       if (output_column < parameters.columns && weight_k < parameters.inner) {
-        tile_weight[weight_index] = weights[
+        value = weights[
           parameters.weight_offset + weight_k * parameters.columns + output_column
         ];
       }
+      if (column_block < 4u) { staged_low[column_block] = value; }
+      else { staged_high[column_block - 4u] = value; }
     }
+    tile_weight[local.y * 16u + local.x * 2u] = staged_low;
+    tile_weight[local.y * 16u + local.x * 2u + 1u] = staged_high;
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
       let source_value = tile_source[local.y * 8u + k];
       let second_source_value = tile_source[local.y * 8u + k + 64u];
-      let weight_base = k * 64u + local.x;
-      let weight_low = vec4<f32>(tile_weight[weight_base], tile_weight[weight_base + 8u],
-        tile_weight[weight_base + 16u], tile_weight[weight_base + 24u]);
-      let weight_high = vec4<f32>(tile_weight[weight_base + 32u], tile_weight[weight_base + 40u],
-        tile_weight[weight_base + 48u], tile_weight[weight_base + 56u]);
+      let weight_base = k * 16u + local.x * 2u;
+      let weight_low = tile_weight[weight_base];
+      let weight_high = tile_weight[weight_base + 1u];
       value_low += source_value * weight_low;
       value_high += source_value * weight_high;
       second_value_low += second_source_value * weight_low;
