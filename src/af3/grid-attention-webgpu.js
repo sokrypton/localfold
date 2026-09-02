@@ -58,10 +58,39 @@ export const PROJECT_ROWS = 8;
  */
 export const PROJECT_OUT_ROWS = 8;
 
+/**
+ * 🔴 THE ATTENTION IS CUBIC IN N AND EVERYTHING AROUND IT IS QUADRATIC, so
+ * which kernel is worth attacking depends on the protein. At 59 tokens
+ * `grid.attend` is 39 ms of a 398 ms pairformer; at 150 it is 563 of 2429 - the
+ * largest in the trunk by half again - and it keeps growing.
+ *
+ * 🔴 AND CARRYING MORE THAN ONE QUERY AN INVOCATION IS NOT THE ANSWER, which is
+ * the obvious thing to try: it reads DIMENSION/4 vectors of k and as many of v
+ * per key and does the same number of vector operations with them, one load per
+ * multiply-add, and those loads do not depend on the query. Two queries an
+ * invocation should have halved them. Measured at 150 tokens it was 1.85x
+ * SLOWER, and four queries 3.9x - a query costs DIMENSION/4 vectors of q plus
+ * as many accumulators, so two is already 128 floats of register and it spills.
+ * The kernel keeps one query a thread.
+ */
+
+/**
+ * 🔴 q, k, v AND THE GATE ARE PACKED AS ONE INTERLEAVED BLOCK OF vec4, not as
+ * four matrices. The projection kernel contracts all four over the same
+ * activation and reads them at the same (channel, out) cell, so interleaved
+ * they are one 16-byte load and one vector multiply-add where they were four of
+ * each - the same arithmetic in a quarter of the issue slots and a quarter of
+ * the memory transactions. `qkvgProjection` is that block; the four names it
+ * replaces are still what the checkpoint calls them, and packing is where they
+ * meet.
+ */
 const ORDER = [
   "actNormScale", "actNormOffset", "pairBiasProjection",
-  "qProjection", "kProjection", "vProjection", "gatingQuery", "outputProjection",
+  "qkvgProjection", "outputProjection",
 ];
+
+/** The four, in the vec4 lane order the shader reads them in. */
+const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
 
 /**
  * 🔴 q, k AND THE GATE ARE TRANSPOSED INTO v'S LAYOUT WHEN THEY ARE PACKED, and
@@ -87,21 +116,38 @@ function transposeOutChannels(values, channels, width) {
 }
 
 export function packGridAttentionWeights(weights, shape = undefined) {
+  const width = (shape?.width) ?? weights.heads * weights.dimension;
+  const sizeOf = (name) => name === "qkvgProjection"
+    ? QKVG.reduce((total, part) => total + weights[part].length, 0)
+    : weights[name].length;
+  for (const name of [...ORDER.filter((n) => n !== "qkvgProjection"), ...QKVG]) {
+    if (weights[name] === undefined) throw new Error(`grid attention weights missing ${name}`);
+  }
   const offsets = {};
   let total = 0;
   for (const name of ORDER) {
-    if (weights[name] === undefined) throw new Error(`grid attention weights missing ${name}`);
     offsets[name] = total;
-    total += weights[name].length;
+    total += sizeOf(name);
   }
   const data = new Float32Array(total);
-  const width = (shape?.width) ?? weights.heads * weights.dimension;
-  for (const name of ORDER) {
+  const laid = (name) => {
     const values = weights[name];
     const channels = values.length / width;
-    data.set(TRANSPOSED.has(name) && Number.isInteger(channels)
+    return TRANSPOSED.has(name) && Number.isInteger(channels)
       ? transposeOutChannels(values, channels, width)
-      : values, offsets[name]);
+      : values;
+  };
+  for (const name of ORDER) {
+    if (name !== "qkvgProjection") { data.set(laid(name), offsets[name]); continue; }
+    // ...(channels, out) for each, interleaved into (channels, out, 4).
+    const parts = QKVG.map(laid);
+    const base = offsets[name];
+    for (let lane = 0; lane < 4; lane += 1) {
+      const values = parts[lane];
+      for (let index = 0; index < values.length; index += 1) {
+        data[base + index * 4 + lane] = values[index];
+      }
+    }
   }
   return { data, offsets };
 }
@@ -132,10 +178,8 @@ const SCALE: f32 = ${1 / Math.sqrt(dimension)};
 const W_NORM_SCALE: u32 = ${offsets.actNormScale}u;
 const W_NORM_OFFSET: u32 = ${offsets.actNormOffset}u;
 const W_BIAS: u32 = ${offsets.pairBiasProjection}u;
-const W_Q: u32 = ${offsets.qProjection}u;
-const W_K: u32 = ${offsets.kProjection}u;
-const W_V: u32 = ${offsets.vProjection}u;
-const W_GATE: u32 = ${offsets.gatingQuery}u;
+// ...as a vec4 index, which is why the packed offset must be a multiple of 4.
+const W_QKVG: u32 = ${offsets.qkvgProjection / 4}u;
 const W_OUT: u32 = ${offsets.outputProjection}u;
 
 fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
@@ -265,7 +309,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const project = `${common}
 const ROWS: u32 = ${ROWS}u;
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+// 🔴 THE ONLY KERNEL HERE THAT READS THE WEIGHTS AS vec4, and it can because it
+// reads nothing but the interleaved q/k/v/gate block. The other three passes
+// bind the same buffer as scalars.
+@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read_write> k: array<f32>;
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
@@ -294,27 +341,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-${overRows((r) => `  var q${r} = 0.0; var k${r} = 0.0; var v${r} = 0.0; var g${r} = 0.0;`)}
+  // One accumulator a row, holding (q, k, v, gate).
+${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
 
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    // All four are (channels, out) - see packGridAttentionWeights - so
-    // consecutive threads read consecutive addresses, and each of these four
-    // loads is then used ROWS times.
-    let base = c * WIDTH + local;
-    let wq = weights[W_Q + base];
-    let wk = weights[W_K + base];
-    let wv = weights[W_V + base];
-    let wg = weights[W_GATE + base];
-${overRows((r) => `    let x${r} = act[${r}u * CHANNELS + c];`)}
-${overRows((r) => `    q${r} += x${r} * wq; k${r} += x${r} * wk; v${r} += x${r} * wv; g${r} += x${r} * wg;`)}
+    // (channels, out, 4) - see packGridAttentionWeights - so consecutive
+    // threads read consecutive vec4s, and this one load is used ROWS times.
+    let w = weights[W_QKVG + c * WIDTH + local];
+${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
   }
 
 ${overRows((r) => `  if (first + ${r}u < PAIRS) {
     let index${r} = (first + ${r}u) * WIDTH + local;
-    q[index${r}] = q${r};
-    k[index${r}] = k${r};
-    v[index${r}] = v${r};
-    gate[index${r}] = g${r};
+    q[index${r}] = acc${r}.x;
+    k[index${r}] = acc${r}.y;
+    v[index${r}] = acc${r}.z;
+    gate[index${r}] = acc${r}.w;
   }`)}
 }`;
 

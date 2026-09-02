@@ -26,8 +26,8 @@ const DIALECT = { swapTransposedBias: false };
 const SIZES = (channels, heads, dimension) => [
   ["actNormScale", channels], ["actNormOffset", channels],
   ["pairBiasProjection", channels * heads],
-  ["qProjection", channels * heads * dimension], ["kProjection", channels * heads * dimension],
-  ["vProjection", channels * heads * dimension], ["gatingQuery", channels * heads * dimension],
+  // ...q, k, v and the gate interleaved; see packGridAttentionWeights.
+  ["qkvgProjection", 4 * channels * heads * dimension],
   ["outputProjection", heads * dimension * channels],
 ];
 
@@ -38,7 +38,9 @@ export async function main(device, args) {
   const dimension = Number(option(args, "dimension", "32"));
   const rounds = Number(option(args, "rounds", "9"));
   const iterations = Number(option(args, "iterations", "8"));
-  const arms_spec = option(args, "arms", "1,4,8,16,32").split(",").map(Number);
+  // Arms are the projection row tile; the attention is timed alongside them as
+  // an unchanging control.
+  const arms_spec = option(args, "arms", "1,4,8,16,32").split(",");
   const pairs = n * n;
   const width = heads * dimension;
 
@@ -71,6 +73,9 @@ export async function main(device, args) {
   const weights = upload(random(total));
   const normalized = upload(random(pairs * channels));
   const gathered = upload(random(pairs * width));
+  const bias = upload(random(pairs * heads));
+  const mask = upload(new Float32Array(pairs).fill(1));
+  const attended = allocate(pairs * width);
   const q = allocate(pairs * width);
   const k = allocate(pairs * width);
   const v = allocate(pairs * width);
@@ -80,10 +85,12 @@ export async function main(device, args) {
     size: pairs * channels * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
   const arms = [];
-  for (const rows of arms_spec) {
+  for (const spec of arms_spec) {
+    const [rows] = spec.split("/").map(Number);
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose: false,
-        projectRows: rows, projectOutRows: rows },
+        projectRows: rows, projectOutRows: rows,
+      },
       offsets, 1e-5, "fast", DIALECT);
     const build = async (source, buffers, tile) => {
       const pipeline = await device.createComputePipelineAsync({
@@ -99,13 +106,28 @@ export async function main(device, args) {
         groups: Math.ceil(pairs / tile),
       };
     };
+    const attend = await device.createComputePipelineAsync({
+      layout: "auto",
+      compute: { module: device.createShaderModule({ code: sources.attend }),
+                 entryPoint: "main" },
+    });
     arms.push({
+      arm: spec,
       rows,
+      attend: {
+        pipeline: attend,
+        bindGroup: device.createBindGroup({
+          layout: attend.getBindGroupLayout(0),
+          entries: [q, k, v, bias, mask, attended].map((buffer, binding) => ({
+            binding, resource: { buffer } })),
+        }),
+        groups: Math.ceil(n / 64), y: n, z: heads,
+      },
       project: await build(sources.project, [normalized, weights, q, k, v, gate],
                            sources.tiles.projectRows),
       projectOut: await build(sources.project_out, [gathered, gate, weights, output],
                               sources.tiles.projectOutRows),
-      times: { project: [], projectOut: [] },
+      times: { project: [], projectOut: [], attend: [] },
     });
   }
 
@@ -115,7 +137,7 @@ export async function main(device, args) {
       const pass = encoder.beginComputePass();
       pass.setPipeline(kernel.pipeline);
       pass.setBindGroup(0, kernel.bindGroup);
-      pass.dispatchWorkgroups(kernel.groups);
+      pass.dispatchWorkgroups(kernel.groups, kernel.y ?? 1, kernel.z ?? 1);
       pass.end();
     }
     const start = performance.now();
@@ -124,11 +146,14 @@ export async function main(device, args) {
     return (performance.now() - start) / iterations;
   };
 
-  for (const arm of arms) { await time(arm.project); await time(arm.projectOut); }
+  for (const arm of arms) {
+    await time(arm.project); await time(arm.projectOut); await time(arm.attend);
+  }
   for (let round = 0; round < rounds; round += 1) {
     for (const arm of arms) {
       arm.times.project.push(await time(arm.project));
       arm.times.projectOut.push(await time(arm.projectOut));
+      arm.times.attend.push(await time(arm.attend));
     }
   }
 
@@ -139,7 +164,7 @@ export async function main(device, args) {
       const pass = encoder.beginComputePass();
       pass.setPipeline(kernel.pipeline);
       pass.setBindGroup(0, kernel.bindGroup);
-      pass.dispatchWorkgroups(kernel.groups);
+      pass.dispatchWorkgroups(kernel.groups, kernel.y ?? 1, kernel.z ?? 1);
       pass.end();
     }
     encoder.copyBufferToBuffer(output, 0, readback, 0, pairs * channels * 4);
@@ -162,9 +187,10 @@ export async function main(device, args) {
   return {
     n, pairs, channels, width,
     arms: arms.map((arm, index) => ({
-      rows: arm.rows,
+      arm: arm.arm,
       project: Number(median(arm.times.project).toFixed(3)),
       projectOut: Number(median(arm.times.projectOut).toFixed(3)),
+      attend: Number(median(arm.times.attend).toFixed(3)),
       relRmsVsFirst: Number(relRms[index].toExponential(2)),
     })),
   };

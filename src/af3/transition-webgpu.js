@@ -76,10 +76,15 @@ export function transitionRowTile(rows) {
  * half is 1.525, a quarter is 1.569, against 1.653 before the kernel was
  * chunked at all. The curve is shallow and it has an interior minimum, which is
  * why this is a function rather than "as small as possible".
+ *
+ * 🔴 AND HALVING ONLY PAYS WHILE THE HALF IS STILL BIG. The MSA track widens 64
+ * channels to 256, where half is 128 and each invocation then accumulates one
+ * slot: 0.266 ms against the whole intermediate's 0.256. So the floor is 256,
+ * which leaves the MSA track unchunked and the pair and single tracks halved.
  */
 export function transitionChunk(intermediate, width = DEFAULT_WORKGROUP) {
   const half = intermediate / 2;
-  return half >= width && half % width === 0 ? half : intermediate;
+  return half >= 256 && half % width === 0 ? half : intermediate;
 }
 
 const GRID_WIDTH = 32_768;
