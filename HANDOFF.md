@@ -8,13 +8,18 @@ produced the numbers, so none of it has to be re-derived.
 
 ## Live right now
 
-`3a51020a`, deployed to https://localfold.org and verified by
+`62c81596`, deployed to https://localfold.org and verified by
 `python3 tools/deploy.py`, which polls `build.json` until the pushed commit is
-the one being served.
+the one being served. Driven in the browser at that commit: 31 residues, AF3,
+flow-8, pLDDT 68.7, CA-CA 3.89 A, with the device reporting 1390 MiB resident
+against its 5461 MiB budget.
 
-🔴 **HEAD IS SIX COMMITS AHEAD OF WHAT IS DEPLOYED** (`14629ca`), all of it the
-memory work below. It has been driven locally at `http://127.0.0.1:4173` -
-31 residues, AF3, flow-8, pLDDT 68.7 - but not deployed.
+🔴 **A LOCAL PAGE SERVED FROM THE SAME PORT WILL RUN YESTERDAY'S MODULES.**
+Chrome caches ES modules by URL and `python3 -m http.server` gives it no reason
+not to; after an edit the page failed with "does not provide an export named
+releaseResidentWeights" while the file on disk plainly had it, and reloads did
+not help because the import specifier has no query on it. Serve on a NEW PORT
+(`python3 -m http.server 4188`) - a different origin is a different cache.
 
 ## The memory work, 2026-09-02
 
@@ -67,14 +72,65 @@ which cannot see a Float32Array. It forces a collection before each reading
 (`gpu-chrome.mjs` now passes `--expose-gc` and `--enable-precise-memory-info`);
 without that the numbers carry uncollected garbage and move by 300 MiB.
 
+## The device memory work, 2026-09-02
+
+The second half, and the first time anything here counted GPU memory.
+`GpuBufferAllocator` counts its own allocations, but the buffers that dominate
+bypass it - resident weights, the diffusion transformer's blocks and the atom
+encoder's statics all call `createBuffer` directly because they must outlive
+the run. `src/runtime/device-memory.js` keeps one account per device and all
+four sites report to it.
+
+**A 31-residue flow-8 fold holds 1390 MiB on the device**, peaking at 1395:
+567 MiB the 48 pairformer blocks, ~630 the 24 transformer blocks, the rest
+scratch. Confirmed in the page as well as headless.
+
+**The budget, taken from upstream.** Metal accepts allocations past the point
+where macOS pages and a phone's driver takes them and is then killed; WebGPU
+reports nothing either way, so the symptom is a frozen machine. An allocation
+over the ceiling is now refused BEFORE `createBuffer` with a
+`GpuMemoryBudgetError` naming the tensor, the resident total and the ceiling.
+The page sets one at a third of `navigator.deviceMemory` - 5461 MiB here, since
+this Mac reports 16 GiB; 1365 MiB on a 4 GiB phone, which is under what a fold
+needs, and that is the machine this exists for. Benches set none.
+
+**Residency is a measured trade, decided by the budget rather than guessed.**
+Keeping the pairformer resident costs 567 MiB and buys 30 ms a recycle (398 ms
+against 428 at 59 tokens). Choosing in advance needs an estimate of scratch
+against weights, which is exactly the number upstream let drift 3-5x; instead
+the fast path is tried and the refusal answers. On refusal the stack is
+ABANDONED and re-encoded uploading per block - freeing mid-stack gives
+"Buffer w.tri.out used in submit while destroyed", and not freeing leaves the
+fallback ten megabytes to work in. The refusal is remembered on the DEVICE:
+the trunk builds a fresh stack per pass, so remembering it on the object cost
+a whole abandoned stack every pass (654 ms a pass at a 400 MiB ceiling, 421
+after). The allocator also drops its pool before giving up, since a pooled
+buffer is memory nothing is using.
+
+The diffusion head submits per super-block when it is not resident, which
+bounds its uploading path at four blocks; batched into one command buffer it
+held all twenty-four, 756 MiB, more than the residency it was avoiding.
+
+A 31-residue fold, 8 flow steps, by ceiling - pLDDT 64.2 at every one:
+
+| ceiling | time | device peak |
+|---|---|---|
+| none | 2.0 s | 1390 MiB |
+| 800 MiB | 3.2 s | 774 MiB |
+| 400 MiB | 3.5 s | 398 MiB |
+| 150 MiB | 3.2 s | 150 MiB |
+| 110 MiB | refused | four blocks and scratch do not fit |
+
+At 32 steps the constrained path is 8.1 s against 3.4, which is the price of
+running at all on a machine that could not have.
+
+Exercise it with `fold.js --budget=<MiB>` or `bench-trunk.js --budget=<MiB>`.
+Nothing else reaches that code on a Mac.
+
 ### Still on the table from upstream
 
 Read but not taken, roughly in order of value:
 
-- **A shared GPU memory budget** that fails an allocation before `createBuffer`
-  with an error naming the tensor. Upstream added it because Metal accepts
-  allocations past the point where macOS pages, and a ten-chain complex froze a
-  notebook. We have the same exposure, and worse on Android.
 - **An allocator that can reuse a buffer it did not size exactly.** Ours keys
   the pool on `bytes:usage` and matches both exactly, which is the failure
   upstream describes: each operation grows its own set of chunks. Theirs backs
@@ -86,10 +142,13 @@ Read but not taken, roughly in order of value:
 - **Optional half-precision activation storage** for the MSA and the triangle
   projection - inexact, off by default, 15-25% of the working set.
 - **A memory estimate pinned to measured working sets by a test**, so it cannot
-  drift; theirs had gone 3-5x stale unnoticed.
+  drift; theirs had gone 3-5x stale unnoticed. We chose the reactive answer
+  instead, which needs no estimate - but it is first-come-first-served, and a
+  stage that fits takes the budget from every stage after it.
 - **Running the pipeline in a worker**, so a long fold does not freeze the page.
 
-We already had their submit-ahead window and their deferred validation.
+We already had their submit-ahead window and their deferred validation, and
+their on-demand weight decoding is done and went further.
 
 | | before today | now |
 |---|---|---|
