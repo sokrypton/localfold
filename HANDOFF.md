@@ -1,54 +1,64 @@
 # Where this is, and how to pick it up
 
-Written 2026-09-02, after two sessions that were mostly performance work. `CLAUDE.md`
-is the permanent operational file (how to run anything); `AF3.md` is the AF3
-port's state and its dead ends; `AGENTS.md` is the invariants. This file is the
-perishable half: what is live, what is open, and the exact commands that produced
-the numbers, so none of it has to be re-derived.
+Written 2026-09-02, after a long day of performance work. `CLAUDE.md` is the
+permanent operational file (how to run anything); `AF3.md` is the AF3 port's
+state and its dead ends; `AGENTS.md` is the invariants. This file is the
+perishable half: what is live, what is open, and the exact commands that
+produced the numbers, so none of it has to be re-derived.
 
 ## Live right now
 
-`60cb9e02`, deployed to https://localfold.org and verified by
+`3a51020a`, deployed to https://localfold.org and verified by
 `python3 tools/deploy.py`, which polls `build.json` until the pushed commit is
-the one being served. Everything below is live.
+the one being served.
+
+🔴 **THE LAST DEPLOY WAS NOT RE-VERIFIED IN THE BROWSER.** `3a51020a` removes
+the weight warm-start and keeps the prefetch; the tests pass and it deployed
+clean, but the site was last DRIVEN at `ffc670d7` (the commit before). If
+anything is broken it is in that one revert. Re-check with the browser recipe
+under "Driving the site".
 
 | | before today | now |
 |---|---|---|
-
-| AF3 diffusion-200 fold, end to end | ~152 s | **26.3 s** |
-| AF3 trunk pass, 32 MSA rows | 756 ms | **408 ms** |
-| ...of which the pairformer | 632 ms | **311 ms** |
+| AF3 trunk pass, 59 tokens / 32 MSA rows | 540 ms | **403 ms** |
+| ...of which the pairformer | 435 ms | **311 ms** |
 | AF3 trunk pass, 150 tokens | 3.38 s | **2.25 s** |
-| AF3 trunk pass, 1024 MSA rows | 1093 ms | **544 ms** |
+| AF3 trunk pass, 1024 MSA rows | 670 ms | **544 ms** |
 | ...of which the MSA stack | 334 ms | **196 ms** |
-| AF3 denoiser call | 760 ms | **111 ms** |
+| AF3 denoiser call | 134 ms | **111 ms** |
+| AF3 flow-8 fold, 68-mer | ~7 s | **3.0 s** |
+| AF3 diffusion-200 fold | 26.3 s | **25.9 s** |
+| AF2 evoformer block, 512 MSA rows | 188.6 ms | **138.6 ms** |
+| AF3 cold weight download, 266 MB | ~20 s | **7.8 s** |
 | 6MRR, flow 8, seed 1 | - | 0.64 A, TM 0.960 |
 
-🔴 **AND BOTH MODELS WERE DRIVEN ON THE DEPLOYED SITE, not just on the bench.**
-2026-09-02, localfold.org, the 68-residue 6MRR sequence, single sequence, in
-Chrome on this M2:
+Accuracy moved the right way or not at all: the denoiser's worst error against
+AF3's own is **6.03e-6** (was 9.22e-6), side-chain bond ratio **1.015** against
+AF3's own 1.017, 383 CPU tests, 18 AF3 checkers and 6 AF2 gates all pass.
 
-- **AF2 monomer** through `single.html`: done in **6.9 s**, pLDDT 85.0, pTM
-  0.593, structure rendered with side chains.
-- **AF3** through `index.html` at 3 recycles and flow-8: **6 s** cold and **1 s**
-  on a repeat with the trunk reused, pLDDT 86.9, pTM 0.764, CA-CA 3.83 A - with
-  the PAE panel, the trajectory scrubber and the sequence track all working.
+## Driving the site, which is the check the benches cannot make
 
-That is the check the benches cannot make: every number above this line is a
-kernel or a stage, and none of them says the page still folds.
-| AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
-| AF3 checkpoint load | 5470 ms | **1364 ms** |
-| AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
-| AF2 evoformer block, 512 MSA rows | 302.8 ms | **192.0 ms** |
-| AF2 evoformer block, 512 MSA rows | 188.6 ms | **160.4 ms** |
-| ...its outer product contraction | 28.8 ms | **16.2 ms** |
-| ...its transition, both halves | 45.1 ms | **37.5 ms** |
-| ...its attention projections, both | 38.5 ms | **33.1 ms** |
-| ...its triangle projection | 0.581 ms | **0.422 ms** |
-| AF3 side-chain bond ratio | 0.927 | **1.015** (AF3 itself: 1.017) |
+Both models were run on localfold.org in Chrome at `ffc670d7`: **AF2 monomer**
+through `single.html` in 6.9 s at pLDDT 85.0, and **AF3** through `index.html`
+at 3 recycles and flow-8 in 6 s cold, 1 s on a repeat with the trunk reused,
+pLDDT 86.9 - with the PAE panel, trajectory scrubber and sequence track working.
 
-Accuracy moved the right way: worst relRMS against AF3's own denoiser over
-twenty noise levels is **9.22e-6**, where it was 1.19e-5 this morning.
+The recipe, through the browser tools: navigate to the page, then in the tab
+
+```js
+for (const n of await caches.keys()) await caches.delete(n);   // cold-ish
+performance.clearResourceTimings();
+const ta = document.querySelector('textarea');
+const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+set.call(ta, '<SEQUENCE>');
+ta.dispatchEvent(new Event('input', { bubbles: true }));
+[...document.querySelectorAll('button')].find(b => /^\s*Fold\s*$/i.test(b.textContent)).click();
+```
+
+then read the status line out of the DOM and the shard timings out of
+`performance.getEntriesByType('resource')`. 🔴 Clearing the Cache API does NOT
+give a cold load - Chrome's own HTTP cache still serves the shards. To measure
+the network, refetch the shard URLs with a `?bust=` query instead.
 
 ## What 2026-09-02 did, in one place
 
@@ -75,6 +85,32 @@ over and over, was not arithmetic - it was **who reads what**:
 
 And the thing that made all of it decidable: `tools/gpu/probe-alu.js`, which
 asks the device what it can do rather than reading a specification sheet.
+
+## The tools this session added, and what each answers
+
+Everything runs through `node tools/gpu-chrome.mjs tools/gpu/<module>.js`.
+
+| new tool | answers |
+|---|---|
+| `probe-alu.js` | what this device actually does: 1236 GFLOP/s scalar, 4839 vec4, 394 G workgroup reads/s, 111 G cached global reads/s, and 7 G streamed |
+| `probe-latency.js` | why kernels reach 270 G instr/s and the probe says 640 - sweeps chains, lanes, workgroup memory, read:fma ratio, barriers |
+| `bench-triangle-project.js` | the triangle projection and contraction tiles, `rows x cols[@contraction]`, with `:barrier`/`:x`/`:w` diagnostic arms |
+| `bench-grid-project.js` | the grid attention's projection row tile, and times `attend` beside it |
+| `bench-transition.js` | the transition's `tile:chunk[:drop[:width[:lanes]]]` |
+| `bench-single-project.js` | the single track's width split |
+| `bench-opm.js` | the outer product's `i x j[@cells]` block |
+| `check-triangle-residual.js` | AF2-only: the residual form of the triangle output projection |
+| `check-evoformer-transition.js` | AF2's transition against a CPU reference |
+| `check-evoformer-opm.js` | AF2's outer product, BOTH paths |
+| `check-evoformer-attention.js` | AF2's attention against a CPU reference |
+
+🔴 **THE FOUR `check-evoformer-*` / `check-triangle-residual` GATES EXIST
+BECAUSE AF2 HAD NONE.** Dawn will not load here and `test/fixtures/evoformer/`
+is gitignored, so every AF2 `.gpu.test.js` is unrunnable. Each new checker
+writes its own CPU reference in its own file - a reference sharing code with the
+thing it checks tests nothing - and each uses ragged shapes and ragged masks so
+the bounds checks and the masking are exercised. They are differential, not
+oracle: they say the kernel computes the operation, not that AlphaFold agrees.
 
 ## The commands that produced those numbers
 
