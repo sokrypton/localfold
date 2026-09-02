@@ -77,3 +77,41 @@ describe("HttpTensorStore", () => {
     expect(Array.from(item)).toEqual([10, 20]);
   });
 });
+
+describe("prefetch ordering", () => {
+  // 🔴 THE LAST SHARD TO START DECIDES WHEN THE LOAD ENDS, and the shards are
+  // not evenly sized: a shard is at least one whole tensor, so AF3's stacked
+  // single-transition weights make a 40.5 MiB shard against a 7.9 MiB median.
+  // Started last it runs on alone after the other connections have nothing
+  // left to do; started first the small ones fill in around it.
+  it("asks for the biggest shard first", async () => {
+    const asked = [];
+    const bytes = { "small.bin": 16, "mid.bin": 1024, "huge.bin": 16384 };
+    const manifest = {
+      tensors: {
+        small: { file: "small.bin", dtype: "float32", shape: [4] },
+        huge: { file: "huge.bin", dtype: "float32", shape: [4096] },
+        middling: { file: "mid.bin", dtype: "float32", shape: [256] },
+      },
+    };
+    const original = globalThis.fetch;
+    // A complete response for each, so every promise settles and nothing leaks
+    // past the end of the test.
+    globalThis.fetch = (url) => {
+      const file = String(url).split("/").pop().split("?")[0];
+      asked.push(file);
+      return Promise.resolve(new Response(new ArrayBuffer(bytes[file] ?? 0), { status: 200 }));
+    };
+    try {
+      const store = await HttpTensorStore.fromManifest("./m/", manifest, undefined, "");
+      asked.length = 0;                       // ignore anything the open itself did
+      store.prefetch();
+      await store.tensor("huge");             // let the queue drain
+      await store.tensor("small");
+      await store.tensor("middling");
+    } finally {
+      globalThis.fetch = original;
+    }
+    expect(asked.slice(0, 3)).toEqual(["huge.bin", "mid.bin", "small.bin"]);
+  });
+});

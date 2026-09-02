@@ -66,6 +66,21 @@ TRUNK = ("diffuser/evoformer", "diffuser/distogram_head")
 # is: quantize_model.py maps shard to shard, so a 48 MiB float32 shard lands at
 # about 12 MiB - the size the shipped monomer's shards are, and the size that
 # measured best against making four times as many requests for the same bytes.
+#
+# 🔴 AF3 IS PACKED TO int5, NOT int8, SO ITS SHARDS LAND NEARER 10 MiB. That is
+# why the shipped af3-int5 bundle clusters there rather than at 12: the limit is
+# calibrated for a quantiser it is no longer paired with. Harmless, and worth
+# expressing per target dtype whenever this is next re-exported.
+#
+# 🔴 AND A SHARD IS AT LEAST ONE WHOLE TENSOR, which is what `and self.chunks`
+# below means: a tensor over the limit gets a file to itself rather than being
+# split, because a reader takes it from one contiguous span in one file. AF3's
+# single-transition weights are stacked over 48 blocks and land at 40.5 MiB
+# against a 7.9 MiB median - the two outliers in that bundle are one tensor
+# each. Evening them out means letting a tensor span shards, which is a manifest
+# and reader change; measured, it is not worth it - splitting the largest across
+# four ranges saved 7%, and fetching biggest-first saved nothing at all, because
+# a cold load is bytes over bandwidth long before it is a tail.
 SHARD_LIMIT = 48 * 1024 * 1024
 
 
