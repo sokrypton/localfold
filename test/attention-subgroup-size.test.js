@@ -11,16 +11,26 @@
  */
 import { describe, expect, it } from "./harness.js";
 import {
-  allowsAttentionSubgroupSize, buildAttentionFlashKernel, supportsAttentionSubgroups,
+  allowsAttentionSubgroupSize, buildAttentionFlashKernel, selectAttentionFlashKernel,
+  supportsAttentionSubgroups,
 } from "../src/evoformer/attention.js";
 
 const deviceWith = (subgroupMinSize, subgroupMaxSize, features = ["subgroups", "subgroup-size-control"]) => ({
   features: new Set(features),
   adapterInfo: subgroupMinSize === undefined && subgroupMaxSize === undefined
     ? {} : { subgroupMinSize, subgroupMaxSize },
+  // Generous, so the size range is the only thing under test.
+  limits: { maxComputeInvocationsPerWorkgroup: 1024, maxComputeWorkgroupStorageSize: 32_768 },
 });
 
 describe("the subgroup attention kernels' size requirement", () => {
+  it("no longer picks a subgroup kernel by default, whatever the device allows", () => {
+    // The register-resident kernel is faster on every shape measured here; see
+    // selectAttentionFlashKernel and tools/gpu/check-attention-variants.js.
+    expect(selectAttentionFlashKernel(deviceWith(32, 32), 32, "auto").cacheKey)
+      .toBe("attention:flash-registers-32");
+  });
+
   it("accepts a device whose range contains 32", () => {
     expect(allowsAttentionSubgroupSize(deviceWith(32, 32))).toBe(true);
     expect(allowsAttentionSubgroupSize(deviceWith(16, 64))).toBe(true);
@@ -60,6 +70,10 @@ describe("building the flash pipeline when the device refuses it", () => {
   };
 
   it("falls back to the register kernel when the subgroup pipeline is rejected", async () => {
+    // 🔴 REQUESTED EXPLICITLY, because `auto` no longer picks a subgroup kernel
+    // at all - the register one is faster on every shape measured. The fallback
+    // still has to work for a caller that names one, and for a head dimension
+    // the register kernel cannot take.
     const asked = [];
     const execution = { pipelines: { get: async (key) => {
       asked.push(key);
@@ -68,7 +82,7 @@ describe("building the flash pipeline when the device refuses it", () => {
       }
       return { key };
     } } };
-    const built = await buildAttentionFlashKernel(execution, device, 32);
+    const built = await buildAttentionFlashKernel(execution, device, 32, "subgroup-key32");
     expect(built.kernel.cacheKey).toBe("attention:flash-registers-32");
     expect(built.kernel.queryTile).toBe(64);
     expect(asked.length).toBe(2);
@@ -78,7 +92,7 @@ describe("building the flash pipeline when the device refuses it", () => {
     const execution = { pipelines: { get: async () => { throw new Error("out of memory"); } } };
     let message = "no error";
     try {
-      await buildAttentionFlashKernel(execution, device, 32);
+      await buildAttentionFlashKernel(execution, device, 32, "subgroup-key32");
     } catch (error) {
       message = error.message;
     }

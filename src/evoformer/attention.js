@@ -825,8 +825,29 @@ export function selectAttentionFlashKernel(
 ) {
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
+  // 🔴 THE REGISTER-RESIDENT KERNEL IS THE DEFAULT, AND THE SUBGROUP ONES ARE
+  // NOT FASTER HERE. This preferred subgroup-key32 wherever the device had the
+  // features, on the strength of timings recorded upstream - and README.md
+  // believed Chrome-on-Metal never reached that path at all, so the comparison
+  // had never been run on this hardware. It has now, on one column-attention
+  // shaped problem (512 queries, 59 batch, 8 heads, head dim 32), every variant
+  // against the same input:
+  //
+  //     portable  87 ms   subgroup-key32 184   subgroup-16x64 263
+  //     subgroup-32x64 284   subgroup-8x64 275   subgroup-64x64 301
+  //     subgroup-4x8 333
+  //
+  // They agree to 1.3e-6, which is reassociation and not a disagreement. In a
+  // whole evoformer block at 512 MSA rows the default costs 302.8 ms against
+  // 198.8: column attention 128.9 against 33.9, row attention 17.7 against 5.1.
+  // tools/gpu/check-attention-variants.js is that measurement and re-runs it.
+  //
+  // 🔴 THE SUBGROUP KERNELS ARE KEPT AND STILL SELECTABLE. They are
+  // differentially tested, this is one device, and `requested` still names any
+  // of them - what changes is only which one is picked when nobody asks.
   const variant = requested === "auto"
-    ? (subgroup64 ? "subgroup-key32" : subgroup ? "subgroup-4x8" : "portable")
+    ? (headDim % 4 === 0 ? "portable"
+      : subgroup64 ? "subgroup-key32" : subgroup ? "subgroup-4x8" : "portable")
     : requested;
   if (variant.startsWith("subgroup-") && variant !== "subgroup-4x8" && !subgroup64) {
     throw new Error(`the ${variant} attention kernel is unsupported by this device`);
