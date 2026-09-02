@@ -183,6 +183,37 @@ export class HttpTensorStore {
     if (value === undefined) { value = this.#load(name); this.#cache.set(name, value); }
     return value;
   }
+
+  /**
+   * Start every shard downloading now, instead of when a tensor in it is first
+   * asked for.
+   *
+   * 🔴 WITHOUT THIS THE NETWORK RUNS AT 0.68 OF ONE CONNECTION. A shard is only
+   * requested when a loader reaches a tensor inside it, and the loaders await
+   * tensor by tensor - so the shape of a cold load is: fetch a shard, sit on the
+   * network while it is dequantised, fetch the next. Measured on localfold.org
+   * over 26 shards: a 13.4 s span containing 9.1 s of transfer, with a gap
+   * between every shard's end and the next one's start, and an effective
+   * 6.8 MB/s against the 12 MB/s a single shard was actually moving at. The
+   * eight-way concurrency limit below was never once reached, because nothing
+   * ever asked for eight.
+   *
+   * Scheduling them all up front costs no extra memory - #fileCache already
+   * holds every shard for the life of the store, so this only changes WHEN they
+   * arrive - and the queue in #scheduleDownload still keeps the number in
+   * flight at MAX_CONCURRENT_DOWNLOADS.
+   *
+   * 🔴 IT IS OPT-IN BECAUSE NOT EVERY CALLER READS EVERY SHARD. A bench that
+   * loads four pairformer blocks touches a fraction of the manifest, and
+   * prefetching the rest would make it slower and noisier, not faster. The page
+   * loads whole models and calls this; the tools do not.
+   */
+  prefetch() {
+    for (const [name, record] of Object.entries(this.manifest.tensors)) {
+      if (this.#fileCache.has(record.file)) continue;
+      this.#fileCache.set(record.file, this.#scheduleDownload(record.file, name));
+    }
+  }
   shape(name) {
     const record = this.manifest.tensors[name]; if (record === undefined) throw new Error(`missing tensor ${name}`);
     return record.shape;

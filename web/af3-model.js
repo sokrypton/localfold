@@ -81,6 +81,11 @@ export function loadAf3Weights(onProgress) {
     const bundle = MODEL_BUNDLES.af3;
     const store = await HttpTensorStore.fromManifest(
       bundle.directory, await loadManifest("af3"), onProgress);
+    // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
+    // and await each one - so without this the network runs one shard at a time
+    // and idles through every dequantisation. See HttpTensorStore.prefetch.
+    // This path reads the whole model, so there is nothing to be careful about.
+    store.prefetch();
     return {
       trunk: await trunkWeights(store, 48, 4),
       diffusion: await diffusionWeights(store),

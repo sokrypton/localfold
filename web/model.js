@@ -55,7 +55,11 @@ export function openStore(onProgress, family = "monomer") {
     store = (async () => {
       const manifest = await loadManifest(family);
       const Store = location.protocol === "file:" ? ScriptTensorStore : HttpTensorStore;
-      return Store.fromManifest(bundle.directory, manifest, onProgress);
+      const opened = await Store.fromManifest(bundle.directory, manifest, onProgress);
+      // ...every shard at once; see HttpTensorStore.prefetch. AF2's loaders read
+      // the whole bundle too.
+      opened.prefetch?.();
+      return opened;
     })();
     stores.set(family, store);
   }
