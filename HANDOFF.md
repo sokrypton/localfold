@@ -16,9 +16,9 @@ the one being served. Everything below is live.
 |---|---|---|
 | AF3 denoiser call, 59-mer | 760 ms | **134 ms** |
 | AF3 diffusion-200 fold, end to end | ~152 s | **26.3 s** |
-| AF3 trunk pass, 32 MSA rows | 756 ms | **540 ms** |
-| ...of which the pairformer | 632 ms | **400 ms** |
-| AF3 trunk pass, 150 tokens | - | 2.9 s (grid.attend is 564 of it) |
+| AF3 trunk pass, 32 MSA rows | 756 ms | **439 ms** |
+| ...of which the pairformer | 632 ms | **337 ms** |
+| AF3 trunk pass, 150 tokens | 3.38 s | **2.54 s** |
 | AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
@@ -48,6 +48,7 @@ tools/gpu/bench-triangle-project.js --arms=16x16,32x16@32x32   # projection@cont
 tools/gpu/bench-grid-project.js --arms=4,8,16                  # grid projection row tile
 tools/gpu/bench-transition.js --arms=4,4:256,8:128             # tile:chunk[:diagnostic[:width]]
 tools/gpu/bench-single-project.js --tokens=59 --arms=1,2,3     # the single track's width split
+tools/gpu/probe-alu.js                             # the device's own ceiling, for the above
 tools/gpu/bench-weights.js --family=monomer|multimer           # or --model=<dir>/manifest.json
 tools/gpu/bench-blocks.js --repeats=2 --profile    # AF2 against AF3, interleaved
 tools/gpu/profile-af2-block.js --sequences=512     # AF2 per DISPATCH, not per pass
@@ -109,27 +110,28 @@ and prints a range; trust the range, not a pair.
 
 ## Open threads, in the order I would take them
 
-1. **`grid.attend`, and measure it at 150 tokens, not 59.** It is the one
-   pairformer kernel that is CUBIC in N; everything around it is quadratic. At
-   59 tokens it is 39 ms of 400 and looks ordinary, at 150 it is **564 of
-   2429** - the largest in the trunk by half again - and it keeps growing, so it
-   is what a real protein will wait on. The obvious attack (more than one query
-   an invocation, to amortise the k and v loads) is already measured and LOST:
-   1.85x slower at two queries, 3.9x at four, because a query is 128 floats of
-   register and it spills. Read AF3.md's "what was tried on these and lost"
-   before starting. What has NOT been tried: splitting the keys across
-   invocations with a combining pass (flash-decoding), which trades a second
-   dispatch for occupancy the kernel does not have at small N.
-2. **`pair-transition`, 76 ms and the largest kernel at 59 tokens.** Its second
-   matmul gives one output channel to each of 128 lanes, so a `gated` read buys
-   one multiply-add. Blocking it needs 2 channels an invocation and 2
-   key-partitions with a reduction - about 4 KB more workgroup memory, which is
-   exactly what this kernel is sensitive to. Estimated 8-13%, not measured.
-3. **`single-transition`, 30 ms for 59 rows.** Untouched and under-occupied: 59
-   workgroups, and its row tile cannot rise because there are no rows. The only
-   real fix is materialising the widened intermediate (362 KB at this size) and
-   splitting it into two dispatches - which the pair track must NOT do, at 1.47
-   GB for 600 tokens. Two code paths for one kernel; judged not worth it yet.
+1. **Count instructions, not flops.** `tools/gpu/probe-alu.js` says this device
+   does 1287 GFLOP/s scalar, 5034 vec4, and 396 billion workgroup reads a
+   second - all of them about **640 billion instructions a second**. The trunk's
+   kernels sit at 200-310 billion, so what is left is in the instruction count,
+   and the biggest remaining term is global weight loads. Concretely, for
+   `pair-transition`: its first matmul issues two scalar weight loads per
+   channel per slot. Giving each lane four CONSECUTIVE slots would make those
+   two vec4 loads and cut the kernel's instruction count by about 28%.
+   Estimated, not measured - the accumulators then need a second vector axis
+   (four slots by four rows), which is the intricate part.
+2. **`grid.attend` again, at 150 tokens.** Staging its keys was worth 1.9x, but
+   it is still the only cubic kernel and it is second-largest at both sizes. Two
+   attacks are measured and LOST (more than one query an invocation; a vec4
+   score accumulator) - read AF3.md before starting. What has NOT been tried:
+   splitting the keys across invocations with a combining pass, which trades a
+   second dispatch for occupancy it does not have at small N.
+3. **`single-transition`, 27 ms for 59 rows.** Untouched and under-occupied: 59
+   workgroups, and its row tile cannot rise because there are no rows, so it is
+   the one kernel still generating scalar code. The only real fix is
+   materialising the widened intermediate (362 KB at this size) and splitting it
+   into two dispatches - which the pair track must NOT do, at 1.47 GB for 600
+   tokens. Two code paths for one kernel; judged not worth it yet.
 4. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
    from a real client; everything here was localhost, where fetch is 31 ms. The
    fork at `martin-steinegger/alphafold2-webgpu` packs to 8 shards and has
@@ -152,6 +154,10 @@ and prints a range; trust the range, not a pair.
    captures live. Until then AF2 kernel changes rest on differential evidence.
 
 ## Traps that cost time
+
+- **`--profile` costs about a fifth of the trunk.** It writes a timestamp pair
+  per compute pass; the same build measures 439 ms without it and 528 with. Rank
+  kernels with it; quote totals from runs that do not use it.
 
 - **`fold.js` defaults to `--mode=diffusion`**, where `--steps` is the schedule's
   discretisation and not a budget. Eight steps of it prints an N-CA of 27 A

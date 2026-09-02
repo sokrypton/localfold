@@ -421,19 +421,25 @@ fix, and the failures listed below are what that has to beat.
 
 ## The pairformer's kernels, rewritten for the shape rather than the arithmetic
 
-A trunk pass at 59 tokens and 32 MSA rows went **606 -> 540 ms**, its
-pairformer **482 -> 400**, and AF2's evoformer block **12.6 -> 10.4** (a 48-block
-stack 603 -> 498) because five of these kernels are shared. Nothing computes
-anything different; every checker is unmoved and the denoiser's worst error
-against AF3's own is still 9.22e-6.
+A trunk pass went **540 -> 439 ms** at 59 tokens and **3.38 -> 2.54 s** at 150,
+its pairformer 435 -> 337 and 2879 -> 2106, and AF2's evoformer block 12.6 ->
+10.4 (a 48-block stack 603 -> 498) because five of these kernels are shared.
+Nothing computes anything different; every checker is unmoved and the denoiser's
+worst error against AF3's own moved 1.19e-5 -> 5.86e-6.
+
+🔴 **THOSE ARE UNPROFILED NUMBERS AND THE TABLE BELOW IS NOT.** `--profile`
+writes a timestamp pair per compute pass, and at these shapes that is about a
+fifth of the trunk: the same build measures 439 ms without it and 528 with. Use
+the per-pass numbers to rank kernels against each other, never to quote a total,
+and take before/after totals from two runs that are both unprofiled.
 
 | kernel | before | after | what changed |
 |---|---|---|---|
-| pair-transition   | 83.3 | 76.4 | the intermediate walked in chunks |
+| pair-transition   | 83.3 | 73.0 | chunked, then its rows made vec4 lanes |
 | tri.project       | 61.3 | 47.9 | register block 2x2 -> 4x2, and one vec4 a cell |
 | tri.project-out   | 42.8 | 35.2 | the same register block |
 | grid.project      | 41.1 | 38.4 | q/k/v/gate interleaved, read as one vec4 |
-| grid.attend       | 39.0 | 39.4 | untouched - see below |
+| grid.attend       | 39.0 | 21.7 | a chunk of keys staged in workgroup memory |
 | grid.project-out  | 39.1 | 15.6 | a tile of rows, where it was one |
 | single-transition | 28.1 | 29.6 | untouched |
 | tri.contract      | 23.3 | 11.2 | register block, 1 output a thread -> 4x4 |
@@ -450,13 +456,32 @@ because a tile the dispatch does not match leaves rows unprocessed and reads as
 a speedup.
 
 🔴 **AND THE NEXT PROTEIN IS NOT THIS ONE. `grid.attend` IS CUBIC IN N.**
-Everything else in the pairformer is quadratic. At 59 tokens the attention is
-39 ms of 400; at 150 tokens it is **564 of 2429**, the largest kernel in the
-trunk by half again, and it keeps growing. A trunk pass at 150 tokens is 2.9 s.
-Anything further should be measured there, not here.
+Everything else in the pairformer is quadratic. Before it was staged, the
+attention was 39 ms of 400 at 59 tokens and **564 of 2429** at 150 - the largest
+kernel in the trunk by half again. Staged it is 21.7 and 318, second at both,
+but the exponent has not changed and it will lead again on a longer chain.
+Anything further should be measured at 150, not at 59.
+
+**Staging is what fixed it, and the reason generalises.** The dispatch gives a
+workgroup one (pair row, head) and sixty-four queries, and the key loop runs over
+the same axis for all of them - so each of the `2 * dimension/4` vectors a key
+needs was fetched by sixty-four lanes issuing sixty-four IDENTICAL global loads.
+A chunk of keys in workgroup memory makes that one load and sixty-four workgroup
+reads: 1.9x at every length measured (0.425 -> 0.237 ms at 59 tokens, 5.75 ->
+3.05 at 150, 36.9 -> 19.5 at 300). Chunks of 16 and 32 tie and 64 loses, so the
+bound is 8 KiB. Two shape notes: the kernel reads `workgroup_id` rather than
+`global_invocation_id`, because WGSL's uniformity analysis has to SEE that row
+and head are workgroup-uniform or it rejects a barrier under the branch on them;
+and a lane past the last query no longer returns, because it has to reach every
+barrier the staging loop makes.
 
 ### What was tried on these and lost
 
+- **Accumulating the query-key score into vec4s** reduced once, instead of a
+  chain of `dot()`s - which looked like the problem, since `dot()` is four
+  multiplies and four DEPENDENT adds and eight of them are a chain about
+  thirty-two deep. Interleaved in one process at 150 tokens: the dot form
+  5.10 ms, one accumulator 5.80, two 6.00, four 5.05.
 - **More than one query per attention invocation.** The attention reads
   `dimension/4` vectors of k and as many of v per key and does the same number
   of vector operations with them - one load per multiply-add - and those loads
