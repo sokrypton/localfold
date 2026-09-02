@@ -50,6 +50,32 @@ kernel or a stage, and none of them says the page still folds.
 Accuracy moved the right way: worst relRMS against AF3's own denoiser over
 twenty noise levels is **9.22e-6**, where it was 1.19e-5 this morning.
 
+## What 2026-09-02 did, in one place
+
+Twenty-one commits, every one deployed and verified. The pattern that paid,
+over and over, was not arithmetic - it was **who reads what**:
+
+1. **N lanes issuing N identical global loads.** A workgroup shares a row, a
+   head, a pair; the loop runs over an axis they all share; every lane fetches
+   the same value. Staging it in workgroup memory was worth 1.9x on AF3's grid
+   attention, 1.8x on its outer product, 1.6x on AF2's flash attention, and 3x
+   on AF2's output projection.
+2. **A quantity recomputed per output that depends only on the input.** AF2's
+   outer product recomputed its denominator once per channel - 128 times per
+   pair. AF3's MSA projection renormalised a row once per output - 64 times.
+   The pairformer's pair-logits renormalised inside the head loop - 16 times.
+3. **Four matrices contracted over one activation, read as four scalars.** They
+   want to be one vec4: the triangle projection, the grid projection, AF2's
+   q/k/v/gate.
+4. **A tile of rows so one weight read serves all of them** - and the tile is
+   always a function of the row count, because past a point the workgroups are
+   worth more than the traffic.
+5. **A delta written, then read, then added.** Four of the pair track's five
+   updates now write themselves in.
+
+And the thing that made all of it decidable: `tools/gpu/probe-alu.js`, which
+asks the device what it can do rather than reading a specification sheet.
+
 ## The commands that produced those numbers
 
 Everything GPU runs through the Chrome harness; see CLAUDE.md for why
