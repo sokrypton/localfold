@@ -99,12 +99,23 @@ export function toPdb(batch, positions, plddt) {
   // UNK residue - which a viewer draws as an unknown amino acid and a scoring
   // tool reads as part of the chain. The span table says which tokens belong to
   // which component, and the component's own code is its residue name.
+  //
+  // 🔴 A MODIFIED RESIDUE IS THE SAME PROBLEM ONE STEP FURTHER IN. Its tokens
+  // are inside the chain, so `sequence` HAS a letter at that position - but
+  // `sequence` is indexed by RESIDUE and this loop walks TOKENS, and the two
+  // stopped being the same number the moment a residue could be several
+  // tokens. Every residue from the first modification onwards was named by
+  // whatever letter happened to sit at its token index: a chain that reads as
+  // a real protein and is not the one that was folded. residueOfToken is the
+  // map, and a modified residue takes its component's own code, which is what
+  // a PDB calls one.
   const componentOf = new Map();
-  for (const span of batch.ligandSpans ?? []) {
+  for (const span of [...(batch.ligandSpans ?? []), ...(batch.modifiedSpans ?? [])]) {
     for (let offset = 0; offset < span.count; offset += 1) {
       componentOf.set(span.from + offset, span.code);
     }
   }
+  const residueOf = (token) => batch.residueOfToken?.[token] ?? token;
   // ...and which serial each ligand token was written as, so CONECT can name
   // them. A ligand token is one heavy atom and it sits in slot zero, so the
   // token is the atom; a polymer token is many atoms and has no entry here.
@@ -121,7 +132,7 @@ export function toPdb(batch, positions, plddt) {
         (ligandCode === undefined ? "ATOM  " : "HETATM")
         + String(serial).padStart(5) + " "
         + (name.length < 4 ? ` ${name}`.padEnd(4) : name.slice(0, 4)) + " "
-        + (ligandCode ?? THREE_LETTER[sequence[token]] ?? "UNK").padEnd(3)
+        + (ligandCode ?? THREE_LETTER[sequence[residueOf(token)]] ?? "UNK").padEnd(3)
         + " " + chainLetter(token)
         // 🔴 residue_index IS ALREADY 1-BASED. Adding one here shifted the whole
         // chain by a residue, which against a helical protein reads as a 3.7 A
@@ -157,7 +168,7 @@ export function toPdb(batch, positions, plddt) {
   // the record has room for exactly four and a fifth silently overruns into
   // the next field.
   const partners = new Map();
-  for (const span of batch.ligandSpans ?? []) {
+  for (const span of [...(batch.ligandSpans ?? []), ...(batch.modifiedSpans ?? [])]) {
     for (const bond of span.bonds ?? []) {
       const a = serialOfToken.get(span.from + bond.from);
       const b = serialOfToken.get(span.from + bond.to);

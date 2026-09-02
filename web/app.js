@@ -103,7 +103,7 @@ const maxMsaConfig = () => {
  * multimer was trained for - and the explicit settings exist to fold the same
  * input both ways rather than to be reached for routinely.
  */
-const modelFamily = (ligandCount = 0) => {
+const modelFamily = (ligandCount = 0, modificationCount = 0) => {
   // 🔴 THE CHOICE IS ALWAYS EXPLICIT NOW. "Auto" used to read the chain count
   // and pick between the two AlphaFold 2 models - which made AF2 the silent
   // default for everything and could never choose AF3, so the newest model was
@@ -117,6 +117,15 @@ const modelFamily = (ligandCount = 0) => {
   // question that was asked, not a worse one.
   if (ligandCount > 0 && choice !== "af3") {
     throw new Error(`Ligands need AlphaFold 3; the model is set to ${choice}`);
+  }
+  // 🔴 AND A MODIFIED RESIDUE IS AlphaFold 3 ONLY FOR THE SAME REASON. AF2
+  // tokenises one residue per letter and has no way to say that residue 12 is
+  // a phosphoserine, so folding under it would drop the modification and return
+  // a confident structure of the unmodified chain - which is a different answer
+  // to the question, not a worse one. The residue COUNT is unchanged either
+  // way, so nothing else on the page would have shown the difference.
+  if (modificationCount > 0 && choice !== "af3") {
+    throw new Error(`Modified residues need AlphaFold 3; the model is set to ${choice}`);
   }
   return choice;
 };
@@ -999,7 +1008,7 @@ async function fold(event) {
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
     let sequence = chains.join("");
-    const family = modelFamily(ligandCodes.length);
+    const family = modelFamily(ligandCodes.length, modifications.length);
 
     // 🔴 NOTHING TO ALIGN WITHOUT A POLYMER. A ligand-only fold has no sequence
     // to search with, and the search path reports an empty one as a missing
