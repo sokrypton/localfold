@@ -1,4 +1,4 @@
-import { noteAllocation, noteDestroy } from "./device-memory.js";
+import { GpuMemoryBudgetError, noteAllocation, noteDestroy } from "./device-memory.js";
 
 export class AllocatedGpuBuffer {
   buffer;
@@ -46,7 +46,20 @@ export class GpuBufferAllocator {
       // ...counted before it is created, so a refusal costs nothing and the
       // caller learns which tensor did not fit. A POOLED buffer is already on
       // the device and was counted when it was made.
-      noteAllocation(this.device, label, byteLength);
+      //
+      // 🔴 AND A REFUSAL DROPS THE POOL BEFORE IT GIVES UP. Every released
+      // buffer this allocator is holding for reuse still occupies the device
+      // and is counted against the budget, so under pressure the pool is what
+      // is failing - a cache, holding memory nothing is using. Dropping it and
+      // retrying once turns "out of budget" into a slower fold rather than no
+      // fold, and a caller that still cannot fit gets the error it deserves.
+      try {
+        noteAllocation(this.device, label, byteLength);
+      } catch (error) {
+        if (!(error instanceof GpuMemoryBudgetError) || this.#pool.size === 0) throw error;
+        this.destroyPooled();
+        noteAllocation(this.device, label, byteLength);
+      }
       buffer = this.device.createBuffer({ label, size: byteLength, usage });
     }
     if (pooled?.length === 0) this.#pool.delete(key);

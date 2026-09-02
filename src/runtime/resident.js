@@ -17,9 +17,20 @@
  * at the end of the run that made them. These have to outlive every run, so
  * they are created directly and never released.
  */
-import { noteAllocation } from "./device-memory.js";
+import { noteAllocation, noteDestroy } from "./device-memory.js";
 
 const byDevice = new WeakMap();
+
+/**
+ * Every resident buffer on a device, so they can be given back.
+ *
+ * 🔴 A WeakMap CANNOT BE EMPTIED, and the degraded path needs to empty one. The
+ * maps above are keyed on the weight objects so the buffers die with the model,
+ * which is right; but when an allocation is refused for want of budget, the
+ * memory that has to be reclaimed is exactly the residency built so far, and
+ * nothing can enumerate it. This flat list can.
+ */
+const heldByDevice = new WeakMap();
 
 /**
  * @param {GPUDevice} device
@@ -50,5 +61,33 @@ export function residentWeightBuffer(device, key, label, pack) {
   });
   device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
   forKey.set(label, buffer);
+  const held = heldByDevice.get(device) ?? [];
+  held.push({ buffer, size, forKey, label });
+  heldByDevice.set(device, held);
   return buffer;
+}
+
+/**
+ * Destroy every weight buffer resident on a device, and forget them.
+ *
+ * For the caller that has just been refused an allocation and is about to fall
+ * back to uploading per pass: without this the residency built up to the
+ * refusal is stranded on the device, holding the budget that the fallback then
+ * has to fit inside. Anything asking for one of these afterwards packs and
+ * uploads it again, which is what the fallback does anyway.
+ *
+ * @returns {number} bytes reclaimed
+ */
+export function releaseResidentWeights(device) {
+  const held = heldByDevice.get(device);
+  if (held === undefined) return 0;
+  let bytes = 0;
+  for (const entry of held) {
+    entry.forKey.delete(entry.label);
+    entry.buffer.destroy();
+    noteDestroy(device, entry.size);
+    bytes += entry.size;
+  }
+  heldByDevice.delete(device);
+  return bytes;
 }

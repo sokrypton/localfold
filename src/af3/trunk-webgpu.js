@@ -112,7 +112,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 export class Af3TrunkGpu {
-  constructor(device) {
+  /** @param {{residentWeights?: boolean}} [options] passed to the pairformer. */
+  constructor(device, options = {}) {
+    this.options = options;
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
@@ -162,7 +164,7 @@ export class Af3TrunkGpu {
     // wait. onBlock is reported under its own name rather than through
     // `options`, which is passed to every sub-stack and would otherwise fire
     // for the template's blocks too.
-    const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device).run(
+    const pairformer = await stage("pairformer", () => new Af3PairformerStackGpu(this.device, this.options).run(
       { pair: msa.pair, single: embedded.single, pairMask: input.pairMask,
         seqMask: input.seqMask, tokens },
       weights.pairformerBlocks, dialect, {

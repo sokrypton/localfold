@@ -95,6 +95,28 @@ export function noteDestroy(device, bytes) {
 }
 
 /**
+ * Devices that have already refused to hold a model's weights.
+ *
+ * 🔴 THE DEGRADATION HAS TO OUTLIVE THE OBJECT THAT DISCOVERED IT. The trunk
+ * builds a fresh pairformer stack for every pass, so a fallback remembered on
+ * the stack is re-discovered on the next one - and each rediscovery costs a
+ * whole abandoned stack. Measured at a 400 MiB ceiling that was 654 ms a pass
+ * against 531 at 200, because the larger budget got further before it gave up.
+ * It belongs to the device, which is the thing that was too small.
+ */
+const refusedResidency = new WeakSet();
+
+/** Say that this device cannot afford to keep a model's weights on it. */
+export function noteResidencyRefused(device) {
+  refusedResidency.add(device);
+}
+
+/** Whether keeping weights on this device is still worth attempting. */
+export function residencyAllowed(device) {
+  return !refusedResidency.has(device);
+}
+
+/**
  * Everything on this device right now.
  *
  * 🔴 RESIDENT, NOT LIVE. A buffer a caller has released but the allocator has

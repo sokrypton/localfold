@@ -13,7 +13,7 @@
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
-import { memorySnapshot } from "../../src/runtime/device-memory.js";import { featuriseProtein } from "../../src/af3/featurise.js";
+import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";import { featuriseProtein } from "../../src/af3/featurise.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
@@ -188,6 +188,11 @@ export async function main(device, args) {
       + ` bits/weight`);
   }
 
+  // --budget=<MiB> puts a ceiling on the device, which is how a machine too
+  // small to keep the weights resident behaves. It is the only way that
+  // fallback gets exercised on a Mac.
+  const budgetMiB = Number(option(args, "budget", "0"));
+  if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
                                    quant);
   const weights = {
@@ -218,9 +223,17 @@ export async function main(device, args) {
         }
         trunkStarted = performance.now();
       }
-      if (name === "trunk") console.log(`  ${detail.name.padEnd(12)} ${detail.ms.toFixed(0)} ms`);
+      if (name === "trunk") {
+        const gpu = memorySnapshot(device);
+        console.log(`  ${detail.name.padEnd(12)} ${detail.ms.toFixed(0)} ms`
+          + `   gpu ${(gpu.residentBytes / (1024 * 1024)).toFixed(0)} MiB`
+          + ` (peak ${(gpu.peakBytes / (1024 * 1024)).toFixed(0)})`);
+      }
       if (name === "trunk-done") {
-        console.log(`trunk done in ${((performance.now() - trunkStarted) / 1000).toFixed(1)} s`);
+        const gpu = memorySnapshot(device);
+        console.log(`trunk done in ${((performance.now() - trunkStarted) / 1000).toFixed(1)} s`
+          + `   gpu ${(gpu.residentBytes / (1024 * 1024)).toFixed(0)} MiB`
+          + ` (peak ${(gpu.peakBytes / (1024 * 1024)).toFixed(0)})`);
         // Against AF3's own trunk. Only meaningful on AF3's own batch: from a
         // sequence the reference conformers differ, which is worth about
         // 2.7e-2 on pair and 0.01 A of structure.

@@ -32,6 +32,7 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
+import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 
@@ -75,7 +76,15 @@ export async function main(device, args) {
 
   // --profile times every compute pass by label; see tools/gpu/profile.js.
   const profile = args.includes("--profile") ? profileDevice(device) : null;
-  const trunkGpu = new Af3TrunkGpu(device);
+  // --no-resident uploads each block's weights per pass instead of keeping
+  // them on the device, which is the 562 MiB half of what a fold holds.
+  // --budget=<MiB> puts a ceiling on the device instead and lets the stack
+  // discover it, which is how the page behaves on a machine too small for the
+  // resident path - and the only way that fallback gets exercised here.
+  const residentWeights = !args.includes("--no-resident");
+  const budgetMiB = Number(option(args, "budget", "0"));
+  if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
+  const trunkGpu = new Af3TrunkGpu(device, { residentWeights });
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);
   const perPass = [];
@@ -104,7 +113,8 @@ export async function main(device, args) {
     return values[Math.floor(values.length / 2)];
   };
   return {
-    tokens, msaRows: rows, blocks, perPass,
+    tokens, msaRows: rows, blocks, residentWeights, budgetMiB, perPass,
+    deviceMemory: memorySnapshot(device),
     ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, 18) }),
     steady: Object.fromEntries(Object.keys(perPass[0])
       .filter((key) => key !== "pass")

@@ -32,8 +32,10 @@
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { residentWeightBuffer } from "../runtime/resident.js";
+import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
 import { releaseWeights } from "./weights.js";
+import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
+  from "../runtime/device-memory.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
   GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
@@ -127,10 +129,15 @@ function packPairLogitsWeights(weights) {
 
 
 export class Af3PairformerStackGpu {
-  constructor(device) {
+  /**
+   * @param {{residentWeights?: boolean}} [options] whether a block's weights
+   *   stay on the device between passes. See the note at the upload below.
+   */
+  constructor(device, options = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
 
   /**
@@ -145,7 +152,42 @@ export class Af3PairformerStackGpu {
    *          onBlock?: (index: number) => void,
    *          onBlockDone?: (completed: number, total: number) => void}} options
    */
+  /**
+   * Run the stack, and if the device cannot afford to keep the weights on it,
+   * run it again without doing that.
+   *
+   * 🔴 THE FALLBACK CANNOT HAPPEN MID-STACK, WHICH IS WHY IT IS A RETRY. The
+   * refusal arrives partway through, with sixteen blocks' weights already on
+   * the device and their command buffers still in flight; freeing them there
+   * gives "Buffer w.tri.out used in submit while destroyed", and NOT freeing
+   * them leaves the per-pass path to fit inside whatever budget they left - at
+   * a 200 MiB ceiling, ten megabytes. So the stack is abandoned instead: drain
+   * the queue, hand back every resident weight buffer, and encode the whole
+   * thing again uploading per block. That costs one partial stack, once, on a
+   * machine that could not have finished the other way.
+   *
+   * 🔴 AND IT IS NOT PREDICTED. Deciding in advance needs an estimate of what
+   * the stack will hold against what scratch will need, which is a number that
+   * goes stale in silence - upstream's had drifted 3-5x before anyone looked.
+   * The budget already knows the answer; this asks it.
+   */
   async run(state, blocks, dialect, options = {}) {
+    try {
+      return await this.#runStack(state, blocks, dialect, options);
+    } catch (error) {
+      if (!(error instanceof GpuMemoryBudgetError) || !this.residentWeights) throw error;
+      await this.device.queue.onSubmittedWorkDone();
+      const reclaimed = releaseResidentWeights(this.device);
+      this.residentWeights = false;
+      noteResidencyRefused(this.device);
+      this.degradedTo = `uploading weights per pass (${(reclaimed / (1024 * 1024)).toFixed(0)}`
+        + ` MiB reclaimed): ${error.message}`;
+      options.onStatus?.(this.degradedTo);
+      return await this.#runStack(state, blocks, dialect, options);
+    }
+  }
+
+  async #runStack(state, blocks, dialect, options = {}) {
     const n = state.tokens;
     const pairs = n * n;
     const epsilon = options.epsilon ?? 1e-5;
@@ -338,9 +380,25 @@ export class Af3PairformerStackGpu {
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
     // src/runtime/resident.js keeps them on the device for the model's lifetime.
-    const resident = (label, pack) => ({
-      buffer: residentWeightBuffer(this.device, block, label, pack),
-    });
+    // 🔴 RESIDENT IS A TRADE, AND WHICH SIDE OF IT IS RIGHT DEPENDS ON THE
+    // MACHINE. Keeping all 48 blocks' weights on the device costs 567 MiB - 40%
+    // of what a fold holds - and buys 30 ms a recycle, measured here at 59
+    // tokens: 398 ms resident against 428 ms uploading per pass, with the
+    // device at 567 MiB against 4 MiB. On this Mac that is worth paying. On a
+    // 4 GiB phone, whose whole budget is 1.3 GiB, it is the difference between
+    // folding and not.
+    //
+    // 🔴 SO IT IS NOT A CHOICE MADE IN ADVANCE. A guess needs an estimate of
+    // what the stack will hold, and an estimate is a thing that goes stale
+    // silently. Instead the fast path is tried and the budget answers: the
+    // first allocation that would cross it raises GpuMemoryBudgetError before
+    // createBuffer, and the stack drops to uploading per pass from there on -
+    // for the rest of the run, since what did not fit will not fit later
+    // either. A device with no budget set never takes this path at all.
+    // The refusal is NOT caught here. See run(), which restarts the stack.
+    const resident = this.residentWeights
+      ? (label, pack) => ({ buffer: residentWeightBuffer(this.device, block, label, pack) })
+      : (label, pack) => ({ buffer: upload(label, pack()).buffer });
     const pairTrackWeights = {
       outgoing: resident("w.tri.out", () => packedFor().outgoing),
       incoming: resident("w.tri.in", () => packedFor().incoming),
@@ -363,7 +421,7 @@ export class Af3PairformerStackGpu {
     // what a lazily loaded weight object was holding. Releasing is a cache drop
     // and nothing more: a field read after this decodes again from the shard,
     // so a CPU reference sharing the same weights still works, just slower.
-    releaseWeights(block);
+    if (this.residentWeights) releaseWeights(block);
 
     const encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {

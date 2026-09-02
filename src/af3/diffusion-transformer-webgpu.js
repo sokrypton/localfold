@@ -33,7 +33,9 @@
  * src/triangle/shaders.js for why that cannot be a global.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
-import { noteAllocation } from "../runtime/device-memory.js";
+import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
+  from "../runtime/device-memory.js";
+import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
@@ -49,58 +51,19 @@ const BLOCK_ORDER = [
 ];
 
 /**
- * Block weights uploaded once and left on the device.
- *
  * 🔴 THE UPLOAD WAS THE FLOOR, NOT THE ARITHMETIC. A block is ~26 MB, so the
  * loop wrote ~630 MB to the device per call - and at eight tokens, where the
  * matmuls are nothing, twenty-four blocks still cost 174 ms, which is that
  * write at about 3.6 GB/s. A 200-step fold did it two hundred times over
  * weights that never change.
  *
- * 🔴 SO THIS TRADES DEVICE MEMORY FOR IT, DELIBERATELY. The stack stays
- * resident - ~630 MB at f32, the same order as the checkpoint itself - held as
- * long as the weight objects the loader built are reachable, which is as long
- * as the model is loaded. A denoiser called two hundred times should upload its
- * weights once.
- *
- * Keyed device-first so two devices cannot hand each other a buffer, and by the
- * block OBJECT so the buffers go when the model does.
- */
-const residentBlocks = new WeakMap();
-
-/**
- * 🔴 PACKED ONLY ON A MISS, AND THEN LET GO OF. A block is about 6.5M floats,
- * so packing twenty-four of them memcpies ~630 MB of Float32Array - which a
- * 200-step fold used to do two hundred times over weights that never change.
- * Caching the packed arrays in a WeakMap fixed that and then held 630 MB of
- * host memory for the model's lifetime, beside the same numbers already on the
- * device. Passing a thunk keeps the packing at once per block and lets the
- * array die with the call that made it.
+ * 🔴 SO THIS TRADES DEVICE MEMORY FOR IT, DELIBERATELY - ~630 MB at f32, the
+ * same order as the checkpoint itself. It goes through src/runtime/resident.js
+ * rather than a WeakMap of its own so that ONE call hands back every weight
+ * buffer on a device, which is what the budget fallback below needs.
  */
 function residentBlockBuffer(device, block, pack) {
-  let byDevice = residentBlocks.get(device);
-  if (byDevice === undefined) {
-    byDevice = new WeakMap();
-    residentBlocks.set(device, byDevice);
-  }
-  let buffer = byDevice.get(block);
-  if (buffer === undefined) {
-    const packedBlock = pack();
-    // 🔴 NOT THROUGH allocator.upload, WHOSE ALLOCATIONS ARE POOLED AND
-    // RECYCLED at the end of the run that made them. This one has to outlive
-    // every run, so it is created directly and never released.
-    const size = Math.ceil(packedBlock.data.byteLength / 4) * 4;
-    noteAllocation(device, "difftx.block.resident", size);
-    buffer = device.createBuffer({
-      label: "difftx.block.resident",
-      size,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(buffer, 0, packedBlock.data.buffer,
-                             packedBlock.data.byteOffset, packedBlock.data.byteLength);
-    byDevice.set(block, buffer);
-  }
-  return buffer;
+  return residentWeightBuffer(device, block, "difftx.block.resident", () => pack().data);
 }
 
 export function packBlockWeights(block) {
@@ -764,10 +727,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 export class Af3DiffusionTransformerGpu {
-  constructor(device) {
+  /**
+   * @param {{residentWeights?: boolean}} [options] whether the 24 blocks' packed
+   *   weights stay on the device between calls. See the note at the upload; a
+   *   budget refusal turns this off on its own.
+   */
+  constructor(device, options = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
 
   /**
@@ -780,6 +749,24 @@ export class Af3DiffusionTransformerGpu {
    *   transitionFactor, blocksPerSuperBlock, pairInputLayerNormScale, superBlocks
    */
   async run(act, cond, pairCond, mask, tokens, weights) {
+    try {
+      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights);
+    } catch (error) {
+      if (!(error instanceof GpuMemoryBudgetError) || !this.residentWeights) throw error;
+      // The pairformer's reasoning exactly; see the note on its run(). The
+      // refusal arrives with some blocks already resident and their command
+      // buffers in flight, so the call is abandoned rather than patched up.
+      await this.device.queue.onSubmittedWorkDone();
+      const reclaimed = releaseResidentWeights(this.device);
+      this.residentWeights = false;
+      noteResidencyRefused(this.device);
+      this.degradedTo = `uploading weights per call (${(reclaimed / (1024 * 1024)).toFixed(0)}`
+        + ` MiB reclaimed): ${error.message}`;
+      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights);
+    }
+  }
+
+  async #runBlocks(act, cond, pairCond, mask, tokens, weights) {
     const channels = weights.channels;
     const condChannels = weights.condChannels;
     const pairChannels = weights.pairChannels;
@@ -928,13 +915,37 @@ export class Af3DiffusionTransformerGpu {
         projections.push(projection);
         for (let inner = 0; inner < group.blocks.length; inner += 1) {
           const block = group.blocks[inner];
-          const blockWeights = {
-            buffer: residentBlockBuffer(this.device, block, () => packBlockWeights(block)),
-          };
-          // ...and the host's float32 goes: every buffer this block needs is on
-          // the device for the model's lifetime. A lazily loaded weight object
-          // decodes again if anything reads it after this.
-          releaseWeights(block);
+          // 🔴 THE SAME TRADE AS THE PAIRFORMER'S, AND THE SAME ANSWER: TRY IT
+          // AND LET THE BUDGET DECIDE. The 24 blocks are about 630 MB resident,
+          // which is what makes a 200-step fold affordable - the upload alone
+          // was 174 ms a call at eight tokens - but it is also half of what a
+          // fold holds on the device. Over budget, this drops to uploading the
+          // block per call, which is slow and finishes, rather than a
+          // createBuffer the driver accepts on its way to freezing the machine.
+          let blockWeights;
+          if (this.residentWeights) {
+            // A refusal here is not caught: run() restarts the call.
+            blockWeights = {
+              buffer: residentBlockBuffer(this.device, block, () => packBlockWeights(block)),
+            };
+            // ...and the host's float32 goes: every buffer this block needs is
+            // on the device for the model's lifetime. A lazily loaded weight
+            // object decodes again if anything reads it after this.
+            releaseWeights(block);
+          } else {
+            // 🔴 AND THIS PATH'S PEAK IS WORSE THAN THE RESIDENT ONE IT REPLACES.
+            // All twenty-four blocks are encoded into ONE command buffer, so an
+            // upload cannot be released inside the loop - the pool would hand
+            // the same buffer to the next block, which is still being encoded
+            // against it - and 24 x 31.5 MiB is 756 MiB held at once, against
+            // 630 resident. Measured: a 31-residue fold completes at an 800 MiB
+            // ceiling and is refused at 600, where the trunk's 567 MiB of
+            // residency is still held when the head starts. Fixing it means
+            // submitting per super-block here so the uploads can be recycled,
+            // which is the pairformer's idiom and is not done.
+            blockWeights = keep(this.allocator.upload("difftx.block",
+              packBlockWeights(block).data, storage));
+          }
           const pairGroups = Math.ceil(pairs / 64);
           run("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
               Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
