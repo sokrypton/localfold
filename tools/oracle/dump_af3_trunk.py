@@ -179,6 +179,10 @@ def main():
                         help="an A3M set as every chain's paired_msa, so AF3"
                              " does its own cross-chain pairing; --a3m stays"
                              " the unpaired block")
+    parser.add_argument("--dna", action="append", metavar="SEQUENCE",
+                        help="a DNA chain, appended after the protein chains. Repeatable.")
+    parser.add_argument("--rna", action="append", metavar="SEQUENCE",
+                        help="an RNA chain, appended after the protein chains. Repeatable.")
     parser.add_argument("--modification", action="append", metavar="CHAIN:CCD:POSITION",
                         help="a modified residue, as CCD:POSITION for the first chain "
                              "or CHAIN:CCD:POSITION for a numbered one, 1-based. "
@@ -264,11 +268,18 @@ def main():
     # for the same reason. ProteinChain is a __slots__ class rather than a
     # dataclass, so rebuilding one would drop whatever the constructor does not
     # take; setting the one slot touches only that field.
-    if arguments.modification:
+    # 🔴 A NUCLEIC CHAIN CANNOT COME THROUGH parse_contigs, which describes
+    # protein segments by length and nothing else. It is built as a chain object
+    # and featurised directly, the same path --modification takes and for the
+    # same reason: featurise_spec renumbers residue_index from the contig, which
+    # assumes one token per residue and knows nothing about these.
+    nucleic = [("dna", seq) for seq in (arguments.dna or [])]
+    nucleic += [("rna", seq) for seq in (arguments.rna or [])]
+    if arguments.modification or nucleic:
         import dataclasses
         from colabdesign2.af3.alphafold3.common import folding_input as _fi
         wanted = {}
-        for entry in arguments.modification:
+        for entry in (arguments.modification or []):
             parts = entry.split(":")
             if len(parts) == 2:
                 chain_index, code, position = 0, parts[0], int(parts[1])
@@ -312,7 +323,7 @@ def main():
     # featurise() the same fold_input gives the correct numbering, so that is
     # what a modified dump uses. Ligands are unaffected - their tokens are a
     # chain of their own, so contig numbering happens to land right.
-    if arguments.modification:
+    if arguments.modification or nucleic:
         captured = {}
         _before_capture = f3.spec_to_fold_input
 
@@ -324,7 +335,20 @@ def main():
         f3.spec_to_fold_input = _capture
         f3.spec_to_fold_input(spec, name="design", seeds=(0,),
                               sequences=dict(enumerate(chains)))
-        batch = f3.featurise(captured["fold_input"], msa_crop_size=msa_crop)
+        fold_input = captured["fold_input"]
+        if nucleic:
+            import string
+            extra = []
+            for index, (kind, seq) in enumerate(nucleic):
+                ident = string.ascii_uppercase[len(fold_input.chains) + index]
+                if kind == "dna":
+                    extra.append(_fi.DnaChain(id=ident, sequence=seq, modifications=[]))
+                else:
+                    extra.append(_fi.RnaChain(id=ident, sequence=seq, modifications=[],
+                                              unpaired_msa=f">query\n{seq}\n"))
+            fold_input = dataclasses.replace(
+                fold_input, chains=list(fold_input.chains) + extra)
+        batch = f3.featurise(fold_input, msa_crop_size=msa_crop)
         if isinstance(batch, (list, tuple)):
             batch = batch[0]
     else:
@@ -416,6 +440,8 @@ def main():
         "model": arguments.model,
         "sequence": sequence,
         "modifications": arguments.modification or [],
+        "dna": arguments.dna or [],
+        "rna": arguments.rna or [],
         # The chains, kept separately: `sequence` is joined so a consumer can
         # index it by token, and the split is not recoverable from that.
         "chains": chains,

@@ -42,6 +42,8 @@
  */
 import { conformerFor, aatypeFor } from "./reference-conformers.js";
 import { polymerResidue } from "./ccd-component.js";
+import { nucleicAatypeFor, nucleicConformerFor }
+  from "./reference-conformers-nucleic.js";
 import { chainIdentity, residueIndexPerChain } from "../input/chains.js";
 
 const DENSE = 24;
@@ -94,10 +96,20 @@ export function featuriseProtein(sequence, options = {}) {
   //
   // So a chain's tokens are no longer one per letter, and everything below that
   // used to index the sequence by token now indexes the RESIDUE list instead.
+  // 🔴 A CHAIN'S KIND DECIDES WHAT ITS LETTERS MEAN. `A` is alanine in a protein
+  // chain and adenine in a nucleic one, and the two take different aatypes,
+  // different conformers and a different terminal rule - so a kind is carried
+  // per chain rather than inferred from the letters, which cannot distinguish
+  // them. Absent, every chain is protein, which is what every caller before
+  // nucleic acids meant.
+  const chainKinds = chains.map((_, index) => options.chainKinds?.[index] ?? "protein");
   const modificationOf = new Map();
   for (const modification of options.modifications ?? []) {
     modificationOf.set(`${modification.chain}:${modification.position}`, modification);
   }
+  // Which chain each residue came from, so a reader can ask what its letters
+  // mean without re-deriving the split.
+  const chainOfResidue = [];
   const residues = [];
   chains.forEach((chain, chainIndex) => {
     for (let at = 0; at < chain.length; at += 1) {
@@ -111,9 +123,17 @@ export function featuriseProtein(sequence, options = {}) {
         ? null : polymerResidue(asked, at === chain.length - 1);
       residues.push({
         code: chain[at],
+        kind: chainKinds[chainIndex],
+        // 🔴 THE TERMINAL RULE IS AT THE OTHER END FOR A NUCLEOTIDE. A protein
+        // residue takes its extra atom (OXT) at the chain's LAST residue; a
+        // nucleotide takes its extra atom (OP3) at the FIRST.
+        terminal: chainKinds[chainIndex] === "protein"
+          ? at === chain.length - 1
+          : at === 0,
         modification,
         tokens: modification === null ? 1 : modification.atoms.length,
       });
+      chainOfResidue.push(chainIndex);
     }
   });
   const polymerTokens = residues.reduce((sum, residue) => sum + residue.tokens, 0);
@@ -181,8 +201,12 @@ export function featuriseProtein(sequence, options = {}) {
   // residues that were oriented independently.
   let space = 0;
   for (let residue = 0; residue < residueCount; residue += 1) {
-    const { code, modification } = residues[residue];
-    const isCTerminal = lastOfChain.has(residue);
+    const { code, kind, terminal, modification } = residues[residue];
+    // 🔴 lastOfChain IS THE PROTEIN RULE AND ONLY THE PROTEIN RULE. `terminal`
+    // above already knows which end this residue's kind cares about; keeping
+    // the old set here would put an OXT on a nucleotide's last base.
+    const isCTerminal = terminal;
+    void lastOfChain;
     const asym = identity.asymId[residue] + 1;
     const entity = identity.entityId[residue] + 1;
     const sym = identity.symId[residue] + 1;
@@ -190,7 +214,12 @@ export function featuriseProtein(sequence, options = {}) {
     const number = withinChain[residue] + 1;
 
     if (modification === null) {
-      aatype[token] = aatypeFor(code);
+      // 🔴 THE KIND PICKS THE ALPHABET, NOT THE LETTER. A in a protein chain is
+      // aatype 0 and in an RNA chain 22; there is no way to tell from the
+      // letter, and getting it wrong folds a different molecule that looks
+      // entirely reasonable.
+      aatype[token] = kind === "protein"
+        ? aatypeFor(code) : (nucleicAatypeFor(kind, code) ?? UNK_AATYPE);
       residueIndex[token] = number;
       tokenIndex[token] = token + 1;
       asymId[token] = asym;
@@ -199,7 +228,9 @@ export function featuriseProtein(sequence, options = {}) {
       seqMask[token] = 1;
       residueOfToken[token] = residue;
 
-      const atoms = conformerFor(code, isCTerminal);
+      const atoms = kind === "protein"
+        ? conformerFor(code, isCTerminal)
+        : (nucleicConformerFor(kind, code, isCTerminal) ?? conformerFor("X", false));
       for (const [slot, name, element, charge, x, y, z] of atoms) {
         const flat = token * DENSE + slot;
         refMask[flat] = 1;
@@ -219,8 +250,17 @@ export function featuriseProtein(sequence, options = {}) {
       // would read a masked slot sitting at the origin - the pseudo-beta feeds
       // the confidence head's distance bins, so every glycine would come out
       // tens of angstroms from everything.
-      const beta = atoms.find((atom) => atom[1] === "CB")
-        ?? atoms.find((atom) => atom[1] === "CA");
+      // 🔴 A NUCLEOTIDE HAS NEITHER CB NOR CA, AND ITS CENTRE IS IN THE BASE.
+      // Read out of AF3's own gather rather than guessed: C4 for a purine and
+      // C2 for a pyrimidine - ring atoms, not the primed sugar carbons, and not
+      // the C1' the sugar hangs the base off, which was the plausible wrong
+      // answer. The distinction is by base, since both names exist in both:
+      // a pyrimidine has a C4 as well, so matching on the name alone would take
+      // the wrong atom in three of the five components.
+      const purine = code === "A" || code === "G";
+      const beta = kind === "protein"
+        ? (atoms.find((atom) => atom[1] === "CB") ?? atoms.find((atom) => atom[1] === "CA"))
+        : atoms.find((atom) => atom[1] === (purine ? "C4" : "C2"));
       if (beta) pseudoBetaSlot[token] = beta[0];
       // 🔴 ONE REFERENCE SPACE PER TOKEN. Every atom of a residue shares its uid,
       // and the atom encoder uses the uid only to decide whether a PAIR of atoms
@@ -505,6 +545,7 @@ export function featuriseProtein(sequence, options = {}) {
     // every atom the model predicts is one it has a reference conformer for.
     predDenseAtomMask: refMask,
     bondMatrix, ligandSpans, modifiedSpans, residueOfToken,
+    chainKinds, chainOfResidue,
     tokenAtomsToQueries, queriesToKeys, queriesToTokenAtoms,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
     features: { residueIndex, tokenIndex, asymId, entityId, symId },

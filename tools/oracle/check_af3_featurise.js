@@ -23,6 +23,7 @@ import { dirname, join, resolve } from "node:path";
 
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
+import { nucleicConformers } from "../../src/af3/reference-conformers-nucleic.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { deduplicateUnpairedAgainstPaired, mergeChainA3ms, mergeRowAlignedChainA3ms }
@@ -106,10 +107,21 @@ for (const entry of dump.modifications ?? []) {
   const component = parseCcdComponent(await response.text());
   modifications.push({ chain, position, ...component });
 }
-const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
+// 🔴 A NUCLEIC CHAIN IS APPENDED AFTER THE PROTEINS AND ITS LETTERS MEAN
+// SOMETHING ELSE. The dump records which sequences were DNA and which RNA,
+// because `A` is alanine or adenine depending only on that.
+const proteinChains = dump.chains ?? (dump.sequence ? [dump.sequence] : []);
+const nucleicChains = [
+  ...(dump.dna ?? []).map((sequence) => ["dna", sequence]),
+  ...(dump.rna ?? []).map((sequence) => ["rna", sequence]),
+];
+const allChains = [...proteinChains, ...nucleicChains.map(([, sequence]) => sequence)];
+const chainKinds = [...proteinChains.map(() => "protein"),
+                    ...nucleicChains.map(([kind]) => kind)];
+const batch = featuriseProtein(allChains.join(":"),
   { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
     profileMsa: rows.profileMsa, profileDeletionMatrix: rows.profileDeletionMatrix,
-    ligands, modifications });
+    ligands, modifications, chainKinds });
 const { tokens, dense } = batch;
 
 let failures = 0;
@@ -274,7 +286,14 @@ for (let token = 0; token < tokens; token += 1) {
   // A modified residue has no baked conformer; its chemistry is checked below
   // from its own bond table, the way a ligand's is.
   if (batch.modifiedSpans.some((span) => span.residue === residue)) continue;
-  const code = dump.sequence[residue];
+  // 🔴 A NUCLEIC RESIDUE IS NOT IN `dump.sequence`, WHICH IS THE PROTEINS. Read
+  // by residue index it comes back undefined, falls through to UNK, and reports
+  // a 2.2 A disagreement on a pair of atoms that do not exist - the same trap a
+  // ligand token used to spring here. Their chemistry is checked below against
+  // their own table.
+  const kind = batch.chainKinds?.[batch.chainOfResidue?.[residue]] ?? "protein";
+  if (kind !== "protein") continue;
+  const code = batch.sequence[residue];
   const entry = REFERENCE_CONFORMERS[code] ?? REFERENCE_CONFORMERS.X;
   const atoms = chainEnds.has(residue) ? entry.cTerminal : entry.internal;
   for (const [i, j] of entry.rigid) {
@@ -332,6 +351,38 @@ if (ligands.length > 0) {
   console.log("\nligand chemistry: the dictionary's conformer against AF3's own");
   report("ligand rigid pairs", `worst ${worst.toFixed(3)} A at ${where} over ${pairs} pairs`,
          worst < 0.25);
+}
+
+// 🔴 AND THE NUCLEIC RESIDUES, AGAINST THEIR OWN BAKED TABLE. Held to exactly
+// what the protein components are held to: the bonded and 1-3 distances AF3
+// keeps fixed while it resamples the torsions.
+{
+  let worst = 0;
+  let where = "";
+  let pairs = 0;
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = batch.residueOfToken[token];
+    if (residue < 0) continue;
+    const kind = batch.chainKinds?.[batch.chainOfResidue?.[residue]] ?? "protein";
+    if (kind === "protein") continue;
+    const code = batch.sequence[residue];
+    const entry = nucleicConformers(kind)?.[code];
+    if (entry === undefined) continue;
+    const atoms = entry.internal;
+    for (const [i, j] of entry.rigid) {
+      const a = token * dense + atoms[i][0];
+      const b = token * dense + atoms[j][0];
+      const error = Math.abs(distance(batch.refPos, a, b) - distance(theirPos, a, b));
+      pairs += 1;
+      if (error > worst) { worst = error; where = `${kind} ${code} ${atoms[i][1]}-${atoms[j][1]}`; }
+    }
+  }
+  if (pairs > 0) {
+    console.log("\nnucleic conformers: the chemistry AF3 holds fixed");
+    report("nucleic rigid pairs",
+           `worst ${worst.toFixed(3)} A at ${where} over ${pairs} pairs`,
+           worst < RIGID_TOLERANCE);
+  }
 }
 
 // 🔴 AND A MODIFIED RESIDUE'S CHEMISTRY, WHICH NOTHING ELSE HERE COVERS. It has
