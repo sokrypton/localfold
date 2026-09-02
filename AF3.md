@@ -611,6 +611,15 @@ tile 8 lost to tile 4 (1.556 against 1.525), and vectorised it wins (1.394
 against 1.494), because the rows now cost a quarter of the workgroup memory they
 did.
 
+🔴 **AND THE KERNELS ARE NOW AT THE PRACTICAL CEILING, WHICH IS NOT THE PAPER
+ONE.** At 150 tokens with a 512-row alignment - a real fold - a trunk pass is
+2.60 s, and every one of its top kernels runs at about **270 billion
+instructions a second** against the 640 billion probe-alu.js measures with no
+memory in the way. Their instruction counts are within about 1.3x of what the
+arithmetic needs. The remaining factor is latency the machine is not hiding, and
+it does not yield to another tile: the list above is eight attempts at cutting
+instructions further, and every one measured worse or level.
+
 🔴 **AND PRICING A READ BY SUBSTITUTING A CONSTANT OVERSTATES IT.** Replacing
 the projection's weight-tile reads with a constant took it from 0.525 to 0.375
 ms, suggesting 29% to win; packing those four reads into one vec4 - which is as

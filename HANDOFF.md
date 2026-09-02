@@ -193,6 +193,22 @@ and prints a range; trust the range, not a pair.
    `tools/gpu/check-evoformer-stack.js` is ported and will run wherever those
    captures live. Until then AF2 kernel changes rest on differential evidence.
 
+## Where the time is now, in the case that matters
+
+150 tokens with a 512-row alignment - a real fold rather than a corner. A trunk
+pass is **2.60 s**: pairformer 1960, MSA stack 531, template 51, distogram 31.
+Inside the pairformer, in milliseconds over the measured window:
+
+    pair-transition 449   grid.attend 316   tri.project 291   grid.project 243
+    opm.contract 219      tri.project-out 212   tri.contract 115
+
+🔴 **AND EVERY ONE OF THOSE IS NOW AT ABOUT 270 BILLION INSTRUCTIONS A SECOND**,
+against the 640 billion tools/gpu/probe-alu.js measures with no memory in the
+way and no dependent chains. That gap is latency, not instruction count: the
+counts are within about 1.3x of what the arithmetic needs, and eight separate
+attempts to cut them further (listed in AF3.md) measured worse or level. The
+next real gain is not another tile.
+
 ## Measured on AF2 and not kept
 
 - **Widening the transition's column tile from 64 to 128**, so a thread owns
