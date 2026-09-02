@@ -85,11 +85,26 @@ export async function main(device, args) {
     size: pairs * channels * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
   const arms = [];
+  // 🔴 THE :drop ARMS RETURN WRONG NUMBERS ON PURPOSE, to price one read rather
+  // than to compute anything, and they OVERSTATE it - a constant lets the
+  // compiler hoist the arithmetic that depended on the read too. Rank with
+  // them; never take one as a target. "bias" replaces the attention's pair-bias
+  // read, "kv" its key and value reads.
+  const surgery = {
+    // ...each replacement keeps the binding and is loop-invariant, so the
+    // compiler hoists it out of the key loop. Dropping the read entirely would
+    // drop the binding, and "auto" layout then rejects the bind group.
+    bias: [/bias\[head \* PAIRS \+ i \* N \+ j\]/g, "bias[head * PAIRS]"],
+    kv: [/(k|v)\[k_base \+ (\d)u\]/g, "$1[$2u]"],
+    konly: [/k\[k_base \+ (\d)u\]/g, "k[$1u]"],
+    vonly: [/v\[k_base \+ (\d)u\]/g, "v[$1u]"],
+  };
   for (const spec of arms_spec) {
-    const [rows] = spec.split("/").map(Number);
+    const [shapeSpec, drop] = spec.split(":");
+    const [rows, chunk] = shapeSpec.split("/").map(Number);
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose: false,
-        projectRows: rows, projectOutRows: rows,
+        projectRows: rows, projectOutRows: rows, attendKeyChunk: chunk,
       },
       offsets, 1e-5, "fast", DIALECT);
     const build = async (source, buffers, tile) => {
@@ -106,9 +121,16 @@ export async function main(device, args) {
         groups: Math.ceil(pairs / tile),
       };
     };
+    let attendSource = sources.attend;
+    if (drop) {
+      const [pattern, replacement] = surgery[drop];
+      const patched = attendSource.replace(pattern, replacement);
+      if (patched === attendSource) throw new Error(`arm ${spec} matched nothing`);
+      attendSource = patched;
+    }
     const attend = await device.createComputePipelineAsync({
       layout: "auto",
-      compute: { module: device.createShaderModule({ code: sources.attend }),
+      compute: { module: device.createShaderModule({ code: attendSource }),
                  entryPoint: "main" },
     });
     arms.push({

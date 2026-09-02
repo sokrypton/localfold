@@ -89,6 +89,31 @@ const ORDER = [
   "qkvgProjection", "outputProjection",
 ];
 
+/**
+ * How many keys the attention stages in workgroup memory at once.
+ *
+ * 🔴 EVERY LANE OF A WORKGROUP READS THE SAME KEY AND THE SAME VALUE. The
+ * dispatch gives a workgroup one (pair row, head) and sixty-four queries, and
+ * the key loop is over the same axis for all of them - so before this, sixty-
+ * four lanes issued sixty-four identical global loads for each of the
+ * 2 * dimension/4 vectors a key needs. Staging a chunk of keys makes that one
+ * load and sixty-four workgroup reads: at 150 tokens the kernel went 5.75 ms to
+ * 3.05, chunk 16 and 32 tying and 64 losing at 4.25 because 16 KiB a workgroup
+ * costs residency.
+ *
+ * The bound is 8 KiB, which is 32 keys at the trunk's head dimension of 32 and
+ * scales down with it, so the shape stays inside the 16 KiB a conservative
+ * adapter grants and leaves room for nothing else - this kernel has no other
+ * workgroup memory.
+ */
+export function attendKeyChunk(dimension) {
+  const vectorsPerKey = 2 * (dimension / 4);
+  for (const chunk of [32, 16, 8]) {
+    if (chunk * vectorsPerKey * 16 <= 8192) return chunk;
+  }
+  return 0;
+}
+
 /** The four, in the vec4 lane order the shader reads them in. */
 const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
 
@@ -389,37 +414,26 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
   // to find than this took to write. Nothing outside this shader changed.
   const vectors = dimension / 4;
   const unroll = (body) => Array.from({ length: vectors }, (_, t) => body(t)).join("\n");
-  const attend = `${common}
-@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> bias: array<f32>;
-@group(0) @binding(4) var<storage, read> mask: array<f32>;
-@group(0) @binding(5) var<storage, read_write> gathered: array<vec4<f32>>;
-
-const HD4: u32 = ${vectors}u;
-
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let i = id.x;
-  let row = id.y;
-  let head = id.z;
-  if (i >= N || row >= N || head >= HEADS) { return; }
-
-  // vec4 units: WIDTH and DIMENSION are both multiples of four, so a head's
-  // slice starts on a vector boundary.
-  let q_base = ((row * N + i) * HEADS + head) * HD4;
-${unroll((t) => `  let qv${t} = q[q_base + ${t}u];`)}
-${unroll((t) => `  var acc${t} = vec4<f32>(0.0);`)}
-  var running_max = -3.0e38;
-  var running_sum = 0.0;
-
-  for (var j = 0u; j < N; j += 1u) {
-    let k_base = ((row * N + j) * HEADS + head) * HD4;
+  // How many keys are staged in workgroup memory at once; 0 reads them from
+  // global. Every lane of a workgroup shares (row, head) and therefore reads
+  // the SAME k and v, so staging replaces 64 identical global loads with one.
+  const keyChunk = shape.attendKeyChunk ?? attendKeyChunk(dimension);
+  const staged = keyChunk > 0;
+  const readK = (t) => staged ? `k_tile[slot * HD4 + ${t}u]` : `k[k_base + ${t}u]`;
+  const readV = (t) => staged ? `v_tile[slot * HD4 + ${t}u]` : `v[k_base + ${t}u]`;
+  const body = `
+${staged ? "" : "    let k_base = ((row * N + j) * HEADS + head) * HD4;"}
     var score = 0.0;
-${unroll((t) => `    score += dot(qv${t}, k[k_base + ${t}u]);`)}
+${unroll((t) => `    score += dot(qv${t}, ${readK(t)});`)}
     // The KEY's mask, transposed with the activation.
     let masked = mask[${transpose ? "j * N + row" : "row * N + j"}];
+    // 🔴 THE MASK STAYS A CONDITIONAL SUBTRACTION FROM THIS LOGIT. Lifting it
+    // to a penalty computed once for the key and ADDED - either as
+    // select(-1.0e9, 0.0, masked > 0.0) or as a plain var set in an if - is
+    // algebraically the same expression and measured relRMS 2.24e-1 against the
+    // CPU reference where this measures 9.63e-7, deterministically, and to the
+    // same wrong value both ways. It was not run down; it is not needed; do not
+    // rewrite it.
     var logit = score * SCALE + bias[head * PAIRS + i * N + j];
     if (masked <= 0.0) { logit = logit - 1.0e9; }
 
@@ -432,10 +446,69 @@ ${unroll((t) => `    score += dot(qv${t}, k[k_base + ${t}u]);`)}
     let weight = exp(logit - new_max);
     running_sum = running_sum * previous + weight;
     running_max = new_max;
-${unroll((t) => `    acc${t} = acc${t} * previous + weight * v[k_base + ${t}u];`)}
-  }
+${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`;
 
-${unroll((t) => `  gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
+  const loop = staged ? `
+  for (var j0 = 0u; j0 < N; j0 += ${keyChunk}u) {
+    // ...before overwriting the tile the previous chunk is still reading.
+    workgroupBarrier();
+    for (var index = local; index < ${keyChunk}u * HD4; index += 64u) {
+      let j = min(j0 + index / HD4, N - 1u);
+      let source = ((row * N + j) * HEADS + head) * HD4 + index % HD4;
+      k_tile[index] = k[source];
+      v_tile[index] = v[source];
+    }
+    workgroupBarrier();
+    for (var slot = 0u; slot < ${keyChunk}u; slot += 1u) {
+      let j = j0 + slot;
+      if (j >= N) { break; }
+${body}
+    }
+  }` : `
+  for (var j = 0u; j < N; j += 1u) {
+${body}
+  }`;
+
+  const attend = `${common}
+@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read> mask: array<f32>;
+@group(0) @binding(5) var<storage, read_write> gathered: array<vec4<f32>>;
+
+const HD4: u32 = ${vectors}u;
+${staged ? `var<workgroup> k_tile: array<vec4<f32>, ${keyChunk * vectors}>;
+var<workgroup> v_tile: array<vec4<f32>, ${keyChunk * vectors}>;` : ""}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 THE WORKGROUP id, NOT THE GLOBAL ONE, because the uniformity analysis
+  // has to SEE that row and head are workgroup-uniform: a barrier inside a
+  // branch on a global id is rejected, and this kernel's staging loop has two.
+  let i = group.x * 64u + local_id.x;
+  let row = group.y;
+  let head = group.z;
+  // 🔴 row AND head ARE WORKGROUP-UNIFORM AND i IS NOT, which is why only the
+  // first two are a return. A lane past the end still has to reach every
+  // barrier the staging loop makes; it is stopped at the write instead.
+  if (row >= N || head >= HEADS) { return; }
+  let live = i < N;
+  let local = local_id.x;
+
+  // vec4 units: WIDTH and DIMENSION are both multiples of four, so a head's
+  // slice starts on a vector boundary.
+  let q_base = ((row * N + select(0u, i, live)) * HEADS + head) * HD4;
+${unroll((t) => `  let qv${t} = q[q_base + ${t}u];`)}
+${unroll((t) => `  var acc${t} = vec4<f32>(0.0);`)}
+  var running_max = -3.0e38;
+  var running_sum = 0.0;
+${loop}
+
+  if (live) {
+${unroll((t) => `    gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
+  }
 }`;
 
   // Gate, project down, and undo the transpose so the residual lands on the
