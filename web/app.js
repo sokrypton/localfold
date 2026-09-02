@@ -792,8 +792,28 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
 
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
-  const calls = Number(document.getElementById("af3-count")?.value)
+  const asked = Number(document.getElementById("af3-count")?.value)
     || AF3_COUNTS[mode].preferred;
+  // 🔴 A MODIFIED RESIDUE NEEDS MORE SAMPLING THAN A STANDARD ONE, and eight
+  // steps is not enough for it. Its atoms are each their own token rather than
+  // coming from a shared residue conformer, so the sampler has to place them
+  // individually - and at the default eight steps they come out COMPRESSED
+  // while every standard residue around them is fine. Measured with
+  // tools/gpu/probe-modified.js, as the median predicted-to-ideal bond ratio
+  // of a phosphoserine against the unmodified residues of the same chain:
+  //
+  //     flow-8    0.835   (control 1.003)
+  //     flow-16   0.974   (control 1.007)
+  //     flow-32   0.996   (control 1.010)
+  //
+  // 🔴 THIS IS NOT A PORTING BUG, WHICH IS WHY THE FLOOR IS A FLOOR AND NOT A
+  // FIX. AF3 itself scores 0.956 on the same input at 32 diffusion steps where
+  // this port scores 0.953, with both controls at 1.003-1.005: an
+  // atom-tokenised residue is simply placed less precisely than a standard one.
+  // What the floor buys is that the page does not draw a visibly wrong
+  // phosphate by default, and it is said out loud rather than applied quietly.
+  const floor = modifications.length > 0 ? 16 : 0;
+  const calls = Math.max(asked, floor);
   const recycles = recycleCount();
   const { requested: maxMsaSequences } = maxMsaConfig();
   // 🔴 RECYCLES ARE NOT IN THE KEY, because more of them is a CONTINUATION
@@ -963,6 +983,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       : continued ? ` (${recycles - reuse.recycles} more recycle${
         recycles - reuse.recycles === 1 ? "" : "s"})`
         : " (trunk reused)")];
+  // ...beside the timing rather than beside the sequence, because it is a
+  // statement about how the fold was RUN and not about what was folded.
+  if (calls > asked) detail.push(`${calls} steps, raised from ${asked} for the modification`);
   if (residues > 0) {
     detail.push(result.depth > 1 ? `${result.depth} MSA rows` : "single sequence");
   }

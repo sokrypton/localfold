@@ -32,6 +32,7 @@ values means the whole-stack checker, not that file.
 |---|---|
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
+| Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
 | Does AF2's stack match AlphaFold? | `tools/gpu/check-evoformer-stack.js` |
 | Where does a denoiser call's time go? | `tools/gpu/bench-head.js --profile` |
 | Where does a trunk pass's time go? | `tools/gpu/bench-trunk.js --profile --msa=1024` |
