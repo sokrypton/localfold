@@ -23,6 +23,19 @@ the one being served. Everything below is live.
 | ...of which the MSA stack | 334 ms | **196 ms** |
 | AF3 denoiser call | 760 ms | **111 ms** |
 | 6MRR, flow 8, seed 1 | - | 0.64 A, TM 0.960 |
+
+🔴 **AND BOTH MODELS WERE DRIVEN ON THE DEPLOYED SITE, not just on the bench.**
+2026-09-02, localfold.org, the 68-residue 6MRR sequence, single sequence, in
+Chrome on this M2:
+
+- **AF2 monomer** through `single.html`: done in **6.9 s**, pLDDT 85.0, pTM
+  0.593, structure rendered with side chains.
+- **AF3** through `index.html` at 3 recycles and flow-8: **6 s** cold and **1 s**
+  on a repeat with the trunk reused, pLDDT 86.9, pTM 0.764, CA-CA 3.83 A - with
+  the PAE panel, the trajectory scrubber and the sequence track all working.
+
+That is the check the benches cannot make: every number above this line is a
+kernel or a stage, and none of them says the page still folds.
 | AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
