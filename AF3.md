@@ -632,8 +632,41 @@ A call is **125 -> 122 ms** at 59 tokens, its transformer 73 -> 67, from chunkin
 and vectorising `ffw-out` (20.0 -> 16.7 ms of the 24 blocks). That is small, and
 the reason it is small is the useful part.
 
+🔴 **AND THAT MODEL WAS WRONG, WHICH TOOK A PROFILE AT 240 TOKENS TO SEE.**
+Halving the traffic by doubling the tile bought nothing once the structure
+allowed it (323 ms against 324), so the stack is not bandwidth-bound; the
+numbers below were a coincidence of scale. What it IS bound by is the
+instruction count of four kernels that each read one or two weights per
+multiply-add, and restructuring those took a 240-token stack **324 -> 234 ms**
+and a 59-token denoiser call 121 -> 117:
+
+| kernel, 240 tokens, 8 blocks | before | after | what changed |
+|---|---|---|---|
+| pair-logits | 27.2 | 7.4 | heads as four vec4, channels outside |
+| adaln | 8.6 | 3.1 | a tile of tokens |
+| ffw-adaln | 7.9 | 2.8 | the same |
+| attention-output | 12.5 | ~10 | a tile, and one output an invocation |
+
+`pair-logits` is the one that mattered: it is quadratic in tokens where the
+token projections are linear, so it leads on any real protein. It looped heads
+OUTSIDE channels, re-reading the normalised pair row for each of the sixteen and
+reading one weight per multiply-add - 48 instructions to buy 16. The heads are
+contiguous in the projection, so they are the vector: channels outside, four
+vec4 accumulators, nine instructions.
+
+🔴 **AND ONE OUTPUT AN INVOCATION IS WHAT MADE THE REST OF IT WORK.** These
+kernels' accumulators are (matrices x tile groups x outputs a lane) vectors and
+every one is live across the whole channel loop, so a second output a lane
+doubles the registers - enough to spill at eight tokens, where tile 8 measured
+542 ms against tile 4's 332. Each kernel now splits its own output range to
+exactly `lanes` wide rather than sharing one `splits`; their ranges differ
+(heads*dimension, the doubled intermediate, the channels) so one number cannot
+make all three exact.
+
+The superseded reasoning, kept because the arithmetic is still worth seeing:
+
 🔴 **THE TOKEN TRANSFORMER READS ALL 566 MB OF ITS WEIGHTS ONCE PER TILE OF FOUR
-TOKENS, AND NOTHING ELSE ABOUT IT MATTERS.** Twenty-four blocks of 5.9M floats
+TOKENS.** Twenty-four blocks of 5.9M floats
 is 566 MB; the tile is 4, so a 59-token call makes fifteen passes over it, 8.5
 GB. At the 114 GB/s `tools/gpu/probe-alu.js` measures for STREAMED global reads
 - and 23.6 MB a block is far past any cache - that is 74 ms. The transformer
@@ -649,13 +682,11 @@ measured 73. The model holds at every length:
 The drift upward is the attention, which is quadratic; the linear term is 4.5 ms
 a tile, which is 566 MB at 126 GB/s.
 
-**So the only lever is the tile, and the tile is capped by workgroup memory.**
-`xt` holds TILE x 768 activations - 12 KB at four tokens, 24 at eight - and at
-eight the residency collapses: measured 343 ms against 320 at 240 tokens, where
-the traffic model says it should have been ~200. Chunking the channels the way
-`ffw-out` chunks the intermediate would untie those, and is the obvious next
-thing to try; it needs the accumulators to survive the chunks, which for `qkvg`
-is four matrices by the tile's groups by the outputs a lane owns.
+**The tile is capped by workgroup memory, and lifting the cap changed nothing.**
+`xt` holds TILE x 768 activations - 12 KB at four tokens, 24 at eight. Chunking
+the channels unties that, and it is implemented; with it, tile 8 at 240 tokens
+measures 253 against tile 4's 235, and tile 4 wins at 59 tokens too (65 against
+82). So the traffic the tile divides was not what the stack was waiting on.
 
 **The other lever nobody has pulled is f16 weights.** The traffic is bytes, not
 values, so half-width weights would halve it outright. README records f16
@@ -666,11 +697,12 @@ this stack is bandwidth-bound by a factor of about three.
 
 ### What else was tried on the head, and lost
 
-- **Tiling `attention-output` over tokens.** It reads the whole 768x768 output
-  projection to project one token - 2.4 MB each, 3.3 GB a call, most of its
-  8.9 ms - so a tile is the same halving that paid in `ffw-out`. Tiled by two the
-  transformer measured 69 ms against 65, and adding a split of the output range
-  to restore the workgroup count left it at 70.
+- **Tiling `attention-output` over tokens, on its own.** 69 ms against 65 for
+  the stack, and 70 with a split of the output range added. It only became a
+  small win once every kernel took one output an invocation.
+- **Lifting the token tile past four**, which is what the traffic model above
+  said to do. 253 ms against 235 at 240 tokens with the channels chunked, and
+  worse without.
 - **Vectorising `qkvg` and `ffw-wide` over the token tile**, which takes qkvg
   from 24 instructions a channel to nine: 68 ms against 67. The same lesson the
   trunk's transition taught - these kernels wait on their weight reads, not on

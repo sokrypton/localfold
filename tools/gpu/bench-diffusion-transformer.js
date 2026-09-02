@@ -12,6 +12,7 @@
  * at most of them. bench-head.js is the one that runs all four stages.
  */
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
+import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -64,6 +65,8 @@ export async function main(device, args) {
       ? Number(option(args, "out-tile", "")) : undefined,
     outChunk: args.some((a) => a.startsWith("--out-chunk="))
       ? Number(option(args, "out-chunk", "")) : undefined,
+    channelChunk: args.some((a) => a.startsWith("--channel-chunk="))
+      ? Number(option(args, "channel-chunk", "")) : undefined,
     pairInputLayerNormScale: new Float32Array(pairChannels).fill(1),
     superBlocks: Array.from({ length: superBlocks }, () => ({
       // 🔴 THE SAME OBJECT IN EVERY SLOT, WHICH IS THE POINT ON THE WEIGHT
@@ -80,15 +83,20 @@ export async function main(device, args) {
   const pair = new Float32Array(tokens * tokens * pairChannels).fill(0.01);
   const seqMask = new Float32Array(tokens).fill(1);
 
+  // --profile times every labelled compute pass; see tools/gpu/profile.js.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   const rows = [];
   for (let call = 0; call < calls; call += 1) {
+    if (profile && call === 1) profile.reset();
     const started = performance.now();
     await new Af3DiffusionTransformerGpu(device)
       .run(Float32Array.from(act), cond, pair, seqMask, tokens, weights);
     rows.push(Math.round(performance.now() - started));
   }
   const after = rows.slice(1);
+  const passes = profile ? await profile.report() : undefined;
   return {
+    gpuPasses: passes,
     tokens, lanes: weights.lanes ?? "default",
     tile: weights.tile ?? "default", splits: weights.splits ?? "default",
     blocks: superBlocks * blocksPerSuperBlock, callsMs: rows,
