@@ -41,7 +41,7 @@ import { confidenceJson, paeMatrix, predictionToPdb, safeJobName }
 import { complexSequenceProblem } from "./sequence.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
-import { describeRemaining, RuntimeEstimator } from "../src/runtime/cost-model.js";
+import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -1210,9 +1210,10 @@ async function fold(event) {
       runEstimator ??= new RuntimeEstimator({ stages: [{ name: "fold", units: total, count: 1 }] });
       runEstimator.completedUnits(completed);
       progress(runEstimator.fraction());
-      const left = describeRemaining(runEstimator.remainingMs());
+      // See the note on `say` in web/af3-model.js: the percentage, and nothing
+      // beside it that moves on its own.
       const percent = Math.min(100, Math.round(100 * runEstimator.fraction()));
-      status(`Folding · ${percent}%${left === undefined ? "" : `  ·  ~${left} left`}`);
+      status(`Folding · ${percent}%`);
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();

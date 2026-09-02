@@ -25,7 +25,7 @@ import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
-import { af3Plan, describeRemaining, RuntimeEstimator }
+import { af3Plan, RuntimeEstimator }
   from "../src/runtime/cost-model.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
@@ -309,19 +309,24 @@ export async function foldAf3(options) {
     tokens: batch.tokens, rows: rows.depth, passes, calls, atoms: batch.atomCount,
   }));
   /**
-   * The status line: what is happening, how far in, and how much is left.
+   * The status line: what is running, and how far in.
    *
-   * 🔴 THREE FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
+   * 🔴 TWO FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
    * block 23 of 48", which is a number that changes forty-eight times a pass
    * next to two that barely move - so the eye tracks the one part that does not
-   * matter. The percentage says the same thing and says it about the whole
-   * fold, which is the question being asked.
+   * matter. The percentage says the same thing about the whole fold, which is
+   * the question being asked.
+   *
+   * 🔴 AND NO ESTIMATE. A time remaining has to be RIGHT to be worth reading,
+   * and this one is a cost model against a machine that drifts up to 3.2x
+   * between runs - so it moved around, and a number that moves around next to a
+   * percentage that does not is the thing that made the line feel unsteady. The
+   * percentage is the honest half; the model still drives the BAR, where being
+   * approximately right is all a bar needs.
    */
   const say = (phase) => {
     if (budget === null) { onStatus(phase); return; }
-    const percent = Math.round(100 * budget.estimator.fraction());
-    const left = describeRemaining(budget.estimator.remainingMs());
-    onStatus(`${phase} · ${percent}%${left === undefined ? "" : `  ·  ~${left} left`}`);
+    onStatus(`${phase} · ${Math.round(100 * budget.estimator.fraction())}%`);
   };
   /** Move the bar to a point in the plan, in units. */
   const reached = (units) => {
@@ -348,8 +353,13 @@ export async function foldAf3(options) {
         // A sweep rather than a number: what is left here is one synchronous
         // CPU call, so there is still nothing to count - but it is now a few
         // hundred milliseconds rather than five seconds.
-        onProgress("waiting");
-        onStatus("Preparing…");
+        // 🔴 BACK TO ZERO EXPLICITLY, because the bar it inherits is FULL. The
+        // same element showed the weight download, which ends at 100%, and the
+        // sweep that used to sit here hid the handover. Without either it would
+        // stay full through featurisation and then appear to run backwards on
+        // the trunk's first report.
+        onProgress(0);
+        onStatus("Preparing · 0%");
         // The yield is the point: what follows blocks the main thread for
         // seconds, so the line above has to be painted before it starts.
         await yieldToBrowser();
@@ -386,8 +396,14 @@ export async function foldAf3(options) {
         // happening before the thread goes away, with a sweeping bar rather
         // than a still one. Both need this paint to land first, which is what
         // the yield below the status line is for.
+        // 🔴 THE BAR HOLDS ITS VALUE HERE, IT NO LONGER SWEEPS. This band is a
+        // pipeline compile that blocks the main thread with no milestones, and
+        // the sweep was meant to show it was alive - but a determinate bar
+        // going indeterminate and back is a visible flip in the middle of a
+        // fold, twice, and a bar that stops for four seconds already reads as
+        // busy next to a status line that says so. Holding is steadier than
+        // sweeping, and it keeps the bar monotonic from end to end.
         say(mode === "flow" ? "Refining" : "Diffusing");
-        onProgress("waiting");
         await yieldToBrowser();
       }
     },
