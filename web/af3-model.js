@@ -146,15 +146,20 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
 
 /**
  * Where the bar should be at each handover, so it runs roughly linear in TIME
- * rather than in stages. Measured on a 68-residue chain: input features 4.9 s,
- * trunk 3.7 s, and 0.85 s a call after that.
+ * rather than in stages.
  *
  * 🔴 THE SHARES CANNOT BE CONSTANTS. Features and trunk are fixed costs while
  * the sampler is not.
  *
- * Features were 4.9 s and the bar had nothing to say for all of it; the atom
- * encoder runs on the GPU now, so it is a few hundred milliseconds and barely
- * a band. What is left of it is the per-atom conditioning, on the CPU.
+ * 🔴 THE CONSTANTS BELOW ARE STALE IN ABSOLUTE TERMS AND STILL RIGHT AS A
+ * RATIO, WHICH IS ALL THIS USES THEM FOR. They were measured when a trunk pass
+ * was 3.7 s and a denoiser call 0.85; on a 59-residue chain those are now about
+ * 0.6 s and 0.13. Both shrank by roughly the same factor, so trunk-to-call is
+ * 4.35 against a real 4.5 and the bands barely move - which is why they have
+ * not been re-fitted. `features` was 4.9 s in the very first version, when
+ * featurisation was CPU work and the bar had nothing to say for all of it; it
+ * is now about a millisecond (tools/gpu/bench-weights.js and fold.js print the
+ * rest), so its band is decoration.
  */
 function timeShares(calls, passes) {
   const features = 0.4;

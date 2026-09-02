@@ -103,8 +103,24 @@ export function batchFromDump(dump) {
 export async function main(device, args) {
   const dumpPath = option(args, "dump", "/af3-6mrr.json");
   const steps = Number(option(args, "steps", "50"));
+  // Named here rather than inline at the fold, because the guard below reads it.
+  const samplerMode = option(args, "mode", "diffusion");
   const blocks = Number(option(args, "blocks", "48"));
   const sequenceArg = option(args, "sequence", "");
+
+  // 🔴 AF3's DIFFUSION SAMPLER NEEDS ITS WHOLE SCHEDULE, AND STOPPING EARLY
+  // LOOKS EXACTLY LIKE A BROKEN MODEL. `--steps` sets the discretisation, not a
+  // budget: eight steps of the stochastic sampler leaves the walk at high noise
+  // and prints an N-CA of 27 A next to an ideal of 1.46, which reads as
+  // corrupted weights rather than as the wrong flag. The flow reaches a
+  // structure in eight because it is a different walk - see
+  // src/af3/diffusion-sampler-webgpu.js - so say so rather than let the
+  // geometry report take the blame.
+  if (samplerMode === "diffusion" && steps < 50) {
+    console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
+      + " it wants about 200. Add --mode=flow to get a structure in this many,"
+      + " or raise --steps. What follows is expected to look like noise.");
+  }
 
   const dump = sequenceArg === "" || args.some((a) => a.startsWith("--dump="))
     ? await (async () => {
@@ -189,7 +205,7 @@ export async function main(device, args) {
   let lastDenoised = null;
 
   const result = await foldBatch(device, batch, weights, {
-    mode: option(args, "mode", "diffusion"),
+    mode: samplerMode,
     recycles: Number(option(args, "recycles", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
