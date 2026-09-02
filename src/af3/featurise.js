@@ -136,6 +136,32 @@ export function featuriseProtein(sequence, options = {}) {
       chainOfResidue.push(chainIndex);
     }
   });
+  // 🔴 AN ALIGNMENT COLUMN IS NOT A TOKEN INDEX, AND USED TO BE ASSUMED TO BE
+  // ONE. An A3M has one column per RESIDUE of the PROTEIN chains, and a batch
+  // has one token per residue only in the simplest case: a modified residue is
+  // several tokens, a ligand is several more, and a nucleic chain has no
+  // columns in a protein alignment at all. Copying a row in flat - which is
+  // what `msa.set(row, ...)` did - lines the alignment up with the tokens for
+  // as long as those agree and shifts it silently from the first modified
+  // residue onward, laying one residue's homologs over another's.
+  //
+  // Measured against AF3, twice, because the two cases differ:
+  //   - a modified residue's tokens ALL REPEAT the parent residue's column
+  //     (SEP at position 3 gives ten tokens, every one of them reading the
+  //     alignment's third column - 15 in every row, the gapped one included)
+  //   - a nucleic token takes MSA_GAP in a protein row, and its own aatype in
+  //     the query row.
+  const msaColumnOfResidue = new Int32Array(residueCount).fill(-1);
+  {
+    // Only the protein chains are in the alignment, in chain order, which is
+    // the order its columns are in.
+    let column = 0;
+    for (let residue = 0; residue < residueCount; residue += 1) {
+      if (residues[residue].kind !== "protein") continue;
+      msaColumnOfResidue[residue] = column;
+      column += 1;
+    }
+  }
   const polymerTokens = residues.reduce((sum, residue) => sum + residue.tokens, 0);
   const tokens = polymerTokens + ligandTokens;
   if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
@@ -485,10 +511,44 @@ export function featuriseProtein(sequence, options = {}) {
   const queryRow = Int32Array.from(aatype);
   for (let token = polymerTokens; token < tokens; token += 1) queryRow[token] = MSA_GAP;
   msa.set(queryRow, 0);
+  // Which column of the alignment each TOKEN reads, or -1 for a token the
+  // alignment does not describe: a ligand's atom, or any token of a nucleic
+  // chain.
+  const msaColumnOfToken = new Int32Array(tokens).fill(-1);
+  const nucleicToken = new Uint8Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const residue = residueOfToken[token];
+    if (residue < 0) continue;
+    msaColumnOfToken[token] = msaColumnOfResidue[residue];
+    if (residues[residue].kind !== "protein") nucleicToken[token] = 1;
+  }
+  // Where the unpaired block starts in the finished array, which is where a
+  // chain's own alignment begins. Read before `unpairedFrom` is declared below,
+  // so it is computed here by the same rule.
+  const unpairedFromRow = () => options.unpairedFrom ?? (extra.length === 0 ? 0 : 1);
+  // 🔴 A NUCLEIC CHAIN CONTRIBUTES ONE ROW OF ITS OWN, AND IT IS NOT ROW ZERO.
+  // AF3 stacks each chain's unpaired block side by side and pads the short ones
+  // with gaps, so a DNA chain - whose alignment is only itself - puts its own
+  // sequence in the FIRST ROW OF THE UNPAIRED BLOCK and gaps below it. Measured:
+  // in a protein+DNA batch rows 0 and 1 both read 26 28 27 29 at the DNA
+  // columns and rows 2 and 3 read 21. Gapping every row but the query is the
+  // natural reading and is one row short, which is a row the model reads as the
+  // chain being absent from its own alignment.
+  const nucleicRow = unpairedFromRow();
   for (let row = 0; row < extra.length; row += 1) {
-    msa.set(extra[row], (row + 1) * tokens);
-    if (options.deletionMatrix?.[row]) {
-      deletionMatrix.set(options.deletionMatrix[row], (row + 1) * tokens);
+    const base = (row + 1) * tokens;
+    const deletions = options.deletionMatrix?.[row];
+    const nucleicHere = row + 1 === nucleicRow ? "own" : MSA_GAP;
+    for (let token = 0; token < tokens; token += 1) {
+      const column = msaColumnOfToken[token];
+      if (column < 0 && nucleicToken[token]) {
+        msa[base + token] = nucleicHere === "own" ? aatype[token] : MSA_GAP;
+        continue;
+      }
+      msa[base + token] = column < 0 ? MSA_GAP : (extra[row][column] ?? MSA_GAP);
+      if (deletions !== undefined) {
+        deletionMatrix[base + token] = column < 0 ? 0 : (deletions[column] ?? 0);
+      }
     }
   }
 
@@ -519,18 +579,39 @@ export function featuriseProtein(sequence, options = {}) {
   const profileDepth = profileRows === null
     ? Math.max(1, sequences - unpairedFrom)
     : Math.max(1, profileRows.length);
+  //
+  // 🔴 AND THE PROFILE'S ROWS ARE ALIGNMENT COLUMNS TOO. `profileMsa` comes
+  // straight from the A3M and was indexed here by token, which is the same
+  // off-by-a-modified-residue as the block above.
   const codeAt = profileRows === null
     ? (row, token) => msa[(unpairedFrom + row) * tokens + token]
-    : (row, token) => (profileRows[row] === undefined ? -1 : profileRows[row][token]);
+    : (row, token) => {
+      const column = msaColumnOfToken[token];
+      if (column < 0) return -1;
+      return profileRows[row] === undefined ? -1 : profileRows[row][column];
+    };
   const deletionAt = profileRows === null
     ? (row, token) => deletionMatrix[(unpairedFrom + row) * tokens + token]
-    : (row, token) => (options.profileDeletionMatrix?.[row]?.[token] ?? 0);
+    : (row, token) => {
+      const column = msaColumnOfToken[token];
+      return column < 0 ? 0 : (options.profileDeletionMatrix?.[row]?.[column] ?? 0);
+    };
+  // 🔴 A NUCLEIC TOKEN'S PROFILE IS ONE-HOT AT ITS OWN AATYPE, NOT AT THE GAP.
+  // AF3 runs get_profile_features PER CHAIN, so a DNA chain - which has no
+  // alignment beyond itself - gets a profile of its own sequence: measured as
+  // exactly 1.0 at restype 26 for a leading A. Letting it fall out of the loop
+  // below would put that 1.0 at MSA_GAP instead, which says the chain is absent.
   for (let row = 0; row < profileDepth; row += 1) {
     for (let token = 0; token < tokens; token += 1) {
+      if (nucleicToken[token]) continue;
       const code = codeAt(row, token);
       if (code >= 0 && code < RESTYPES) profile[token * RESTYPES + code] += 1 / profileDepth;
       deletionMean[token] += deletionAt(row, token) / profileDepth;
     }
+  }
+
+  for (let token = 0; token < tokens; token += 1) {
+    if (nucleicToken[token]) profile[token * RESTYPES + aatype[token]] = 1;
   }
 
   return {

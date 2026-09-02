@@ -336,6 +336,19 @@ def main():
         f3.spec_to_fold_input(spec, name="design", seeds=(0,),
                               sequences=dict(enumerate(chains)))
         fold_input = captured["fold_input"]
+        # 🔴 --a3m HAS TO BE APPLIED HERE TOO, AND WAS NOT. featurise_spec takes
+        # the alignment as an argument; featurise() takes it off the chain, so
+        # on this path every protein chain kept the query-only MSA that
+        # spec_to_fold_input builds - and a dump asked for with --a3m came back
+        # with padding rows, looking exactly like an alignment that had been
+        # read and found empty.
+        # ProteinChain is a __slots__ class, not a dataclass - the slot is set
+        # in place, the way --paired-a3m does it, because rebuilding one drops
+        # whatever the constructor does not take.
+        if alignment is not None:
+            for chain in fold_input.chains:
+                if isinstance(chain, _fi.ProteinChain):
+                    chain._unpaired_msa = alignment
         if nucleic:
             import string
             extra = []
