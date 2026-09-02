@@ -147,16 +147,42 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     // knows. Same arithmetic, same output, hoisted: decoding the int5 bundle
     // went from 5.3 s to 1.5 s, which the page pays once and the user waits
     // through all of.
+    // 🔴 EIGHT CODES OUT OF FIVE BYTES, WITH THE SHIFTS WRITTEN OUT. Forty bits
+    // is exactly five bytes, and a group of 32 codes is exactly four of those -
+    // INT5_GROUP_BYTES is 20 for that reason - so a full group needs no address
+    // arithmetic, no running bit counter and no two-byte straddling read at
+    // all. The general form below still runs for a trailing partial group.
+    const wholeChunks = (block / 8) | 0;
     for (let group = 0; group < groups; group += 1) {
       const scale = scales[group];
       const zero = zeros[group];
       const groupBase = group * INT5_GROUP_BYTES;
       const start = group * block;
       const end = Math.min(start + block, elements);
-      let bit = 0;
-      for (let index = start; index < end; index += 1) {
-        const at = groupBase + (bit >> 3);
-        const pair = codes[at] | (codes[at + 1] << 8);
+      let index = start;
+      let at = groupBase;
+      for (let chunk = 0; chunk < wholeChunks && index + 8 <= end; chunk += 1) {
+        const b0 = codes[at];
+        const b1 = codes[at + 1];
+        const b2 = codes[at + 2];
+        const b3 = codes[at + 3];
+        const b4 = codes[at + 4];
+        output[index] = (b0 & 31) * scale + zero;
+        output[index + 1] = ((b0 >> 5) | ((b1 & 3) << 3)) * scale + zero;
+        output[index + 2] = ((b1 >> 2) & 31) * scale + zero;
+        output[index + 3] = ((b1 >> 7) | ((b2 & 15) << 1)) * scale + zero;
+        output[index + 4] = ((b2 >> 4) | ((b3 & 1) << 4)) * scale + zero;
+        output[index + 5] = ((b3 >> 1) & 31) * scale + zero;
+        output[index + 6] = ((b3 >> 6) | ((b4 & 7) << 2)) * scale + zero;
+        output[index + 7] = (b4 >> 3) * scale + zero;
+        index += 8;
+        at += 5;
+      }
+      // ...whatever is left of a short final group, the general way.
+      let bit = (index - start) * 5;
+      for (; index < end; index += 1) {
+        const byteAt = groupBase + (bit >> 3);
+        const pair = codes[byteAt] | (codes[byteAt + 1] << 8);
         output[index] = ((pair >> (bit & 7)) & 31) * scale + zero;
         bit += 5;
       }

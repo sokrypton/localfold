@@ -91,3 +91,51 @@ describe("int5 tensors", () => {
     assert.throws(() => readTensor(broken, buffer, 0, true), /zero offset/);
   });
 });
+
+describe("the unrolled int5 fast path", () => {
+  /** The general per-element form this replaced, kept here as the reference. */
+  function perElement(codes, scales, zeros, elements, block, groupBytes) {
+    const out = new Float32Array(elements);
+    const groups = Math.ceil(elements / block);
+    for (let group = 0; group < groups; group += 1) {
+      const base = group * groupBytes;
+      for (let i = group * block; i < Math.min((group + 1) * block, elements); i += 1) {
+        const bit = (i - group * block) * 5;
+        const at = base + (bit >> 3);
+        const pair = codes[at] | (codes[at + 1] << 8);
+        out[i] = ((pair >> (bit & 7)) & 31) * scales[group] + zeros[group];
+      }
+    }
+    return out;
+  }
+
+  // 🔴 THE SIZES ARE THE POINT. A group is 32 codes in 20 bytes and the fast
+  // path takes eight codes out of five, so what can break it is a tail that
+  // does not divide: shorter than eight, not a whole group, exactly one group.
+  it("decodes every size exactly as the per-element form did", () => {
+    const block = 32;
+    const groupBytes = 20;
+    for (const elements of [1, 7, 8, 9, 31, 32, 33, 63, 64, 100, 257, 1024]) {
+      const groups = Math.ceil(elements / block);
+      const bytes = groups * groupBytes + 1;
+      const scaleAt = Math.ceil(bytes / 2) * 2;
+      const buffer = new ArrayBuffer(scaleAt + groups * 4);
+      const codes = new Uint8Array(buffer, 0, bytes);
+      for (let i = 0; i < bytes; i += 1) codes[i] = (i * 37 + 11) & 255;
+      const scales = new Float16Array(buffer, scaleAt, groups);
+      const zeros = new Float16Array(buffer, scaleAt + groups * 2, groups);
+      for (let g = 0; g < groups; g += 1) {
+        scales[g] = 0.001 * (g + 1);
+        zeros[g] = -0.5 + g * 0.01;
+      }
+      const decoded = readTensor({
+        dtype: "int5", shape: [elements], block,
+        byteOffset: 0, scaleOffset: scaleAt, zeroOffset: scaleAt + groups * 2,
+      }, buffer, 0);
+      const expected = perElement(codes, scales, zeros, elements, block, groupBytes);
+      for (let i = 0; i < elements; i += 1) {
+        assert.equal(decoded[i], expected[i], `element ${i} of ${elements}`);
+      }
+    }
+  });
+});

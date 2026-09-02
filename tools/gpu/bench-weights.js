@@ -14,6 +14,7 @@
  * bundle means dequantising), and the loaders' own assembly.
  */
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { MODEL_BUNDLES, loadManifest } from "../../src/reference/manifests/index.js";
 import { confidenceWeights, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
@@ -24,10 +25,17 @@ const option = (args, name, fallback) => {
 };
 
 export async function main(device, args) {
-  const manifestUrl = option(args, "model", "/model-af3-int5/manifest.json");
+  // --family loads a bundle the page ships (monomer, multimer, af3) through the
+  // same compiled-in manifest the page uses; --model takes a directory instead.
+  const family = option(args, "family", "");
+  const manifestUrl = family === ""
+    ? option(args, "model", "/model-af3-int5/manifest.json")
+    : MODEL_BUNDLES[family].directory;
 
   const manifestStart = performance.now();
-  const manifest = await (await fetch(manifestUrl)).json();
+  const manifest = family === ""
+    ? await (await fetch(manifestUrl)).json()
+    : await loadManifest(family);
   const manifestMs = performance.now() - manifestStart;
 
   const tensors = Object.values(manifest.tensors ?? {});
@@ -53,13 +61,22 @@ export async function main(device, args) {
     await work();
     return [label, Math.round(performance.now() - started)];
   };
-  const loaders = Object.fromEntries([
-    await timed("trunk", () => trunkWeights(store, 48, 4)),
-    await timed("diffusion", () => diffusionWeights(store)),
-    await timed("confidence", () => confidenceWeights(store)),
-    await timed("atomReference", () => atomReference(store)),
-    await timed("targetFeat", () => targetFeatureWeights(store)),
-  ]);
+  // 🔴 AF2's LOADERS ARE THE FIXTURE'S, NOT A WEIGHTS MODULE, so for those
+  // families this times decoding EVERY tensor in the bundle instead - which is
+  // what the page ends up doing and is the number the dequantiser moves.
+  const loaders = family === "" || family === "af3"
+    ? Object.fromEntries([
+      await timed("trunk", () => trunkWeights(store, 48, 4)),
+      await timed("diffusion", () => diffusionWeights(store)),
+      await timed("confidence", () => confidenceWeights(store)),
+      await timed("atomReference", () => atomReference(store)),
+      await timed("targetFeat", () => targetFeatureWeights(store)),
+    ])
+    : Object.fromEntries([
+      await timed("all tensors", async () => {
+        for (const name of Object.keys(manifest.tensors)) await store.tensor(name);
+      }),
+    ]);
 
   const bytes = tensors.reduce((sum, entry) => sum + (entry.byteLength ?? 0), 0);
   return {
