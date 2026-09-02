@@ -14,11 +14,15 @@ the one being served. Everything below is live.
 
 | | before today | now |
 |---|---|---|
-| AF3 denoiser call, 59-mer | 760 ms | **134 ms** |
+
 | AF3 diffusion-200 fold, end to end | ~152 s | **26.3 s** |
-| AF3 trunk pass, 32 MSA rows | 756 ms | **411 ms** |
-| ...of which the pairformer | 632 ms | **316 ms** |
-| AF3 trunk pass, 150 tokens | 3.38 s | **2.31 s** |
+| AF3 trunk pass, 32 MSA rows | 756 ms | **408 ms** |
+| ...of which the pairformer | 632 ms | **311 ms** |
+| AF3 trunk pass, 150 tokens | 3.38 s | **2.25 s** |
+| AF3 trunk pass, 1024 MSA rows | 1093 ms | **544 ms** |
+| ...of which the MSA stack | 334 ms | **196 ms** |
+| AF3 denoiser call | 760 ms | **111 ms** |
+| 6MRR, flow 8, seed 1 | - | 0.64 A, TM 0.960 |
 | AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |

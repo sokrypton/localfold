@@ -431,8 +431,10 @@ fix, and the failures listed below are what that has to beat.
 
 ## The pairformer's kernels, rewritten for the shape rather than the arithmetic
 
-A trunk pass went **540 -> 411 ms** at 59 tokens and **3.38 -> 2.31 s** at 150,
-its pairformer 435 -> 316 and 2879 -> 1950. AF2's evoformer shares five of these
+A trunk pass went **540 -> 408 ms** at 59 tokens, **3.38 -> 2.25 s** at 150, and
+**670 -> 544 ms** at 59 tokens with a 1024-row alignment; its pairformer 435 ->
+311 and 2879 -> 1900, and its MSA stack at that depth 334 -> 196. A denoiser
+call went 134 -> 111. 6MRR folds to 0.64 A, TM 0.960. AF2's evoformer shares five of these
 kernels and its triangle projection went 0.581 -> 0.422 ms a block and its
 output projection 0.405 -> 0.327, with the contraction dropping off the
 profiler's list entirely.
@@ -463,7 +465,10 @@ and take before/after totals from two runs that are both unprofiled.
 | grid.project-out  | 39.1 | 15.6 | a tile of rows, where it was one |
 | single-transition | 28.1 | 29.6 | untouched |
 | tri.contract      | 23.3 |  8.6 | 1 output a thread -> 4x4, both tiles vectors |
-| opm.contract      | 15.7 |  9.0 | four token pairs a workgroup, as a vec4 |
+| opm.contract      | 15.7 |  9.0 | a block of (i, j) pairs, and a bigger chunk |
+| pair-logits       | 11.8 |  4.9 | heads as vec4, normalised once |
+| grid.bias         |  5.6 |  3.0 | the same |
+| single.project    | 20.4 | 11.1 | the width split over workgroups |
 | single.project    | 20.4 | 11.1 | the width split over workgroups, outputs blocked |
 | tri.normalize     | 13.7 |  8.3 | the LayerNorm staged, to coalesce |
 | grid.normalize    | 11.8 |  7.4 | the same |
@@ -537,6 +542,29 @@ barrier the staging loop makes.
   it was five to buy eight. It needs a chunk of four workgroup widths, and at
   the tile that then fits it measured 1.63 ms against the current shape's 1.39.
   A third measurement saying this kernel is not waiting on its weight reads.
+
+### What the MSA stack cost, once anyone measured it at depth
+
+At 59 tokens and 1024 rows the stack was 334 ms against a 310 ms pairformer -
+the untouched half of the trunk. Two kernels were most of it and both had the
+same shape of fault:
+
+| kernel, 1024 rows | before | after |
+|---|---|---|
+| opm.contract | 113 | 60 |
+| msa.project | 62 | out of the top twelve |
+
+`msa.project` gave a ROW TO A THREAD, walking WIDTH outputs by C_M channels and
+re-deriving the normalised activation inside both loops - so a row's 64 values
+were recomputed 64 times each, and two thirds of the kernel was that. A
+workgroup a row: 64 lanes share the reduction, stage the normalised row once,
+and take an output each.
+
+`opm.contract` needed a two-dimensional block, and the reason generalises. A
+cell's product is `left[i][c] * right[j][e]`, so an i-by-j block of pairs reads
+BLOCK_I values of left and BLOCK_J of right to make BLOCK_I * BLOCK_J products;
+a run of consecutive SLOTS shares an i only by accident, and nothing the
+compiler can see says so.
 
 ### The ceiling these are measured against
 
