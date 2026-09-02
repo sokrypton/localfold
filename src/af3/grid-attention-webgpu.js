@@ -184,6 +184,9 @@ export function createGridAttentionShaders(shape, offsets, epsilon, variance, di
   // instead would still compile against a shader generated from something else
   // - which is how a kernel here once processed half its rows and reported it
   // as a speedup.
+  // ...and whether project-out adds into its target instead of overwriting it;
+  // see the note in src/af3/transition-webgpu.js for why that removes a pass.
+  const residual = shape.residual ?? false;
   const projectRows = shape.projectRows ?? PROJECT_ROWS;
   const projectOutRows = shape.projectOutRows ?? PROJECT_OUT_ROWS;
   const width = heads * dimension;
@@ -555,7 +558,7 @@ ${overOutRows((r) => `      sum${r} += gated[${r}u * ${width}u + w] * weight;`)}
 ${overOutRows((r) => `    if (first + ${r}u < PAIRS) {
       let row${r} = first + ${r}u;
       let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
-      output[destination${r} * CHANNELS + c] = sum${r};
+      output[destination${r} * CHANNELS + c] ${residual ? "+=" : "="} sum${r};
     }`)}
   }
 }`;

@@ -141,6 +141,14 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   //
   // The single track's tile is 1 - there are only 59 rows to give it - so this
   // generates scalar code there, which is what LANES = 1 means below.
+  // 🔴 WRITING THE RESIDUAL IN PLACE RATHER THAN A DELTA AND AN ADD PASS. The
+  // pair track's five updates each wrote a full pair tensor to scratch and then
+  // read it, read the pair, and wrote the pair back - four passes over 11.5 MB
+  // at 150 tokens where two will do, and `add` measured 113 ms of a 2106 ms
+  // pairformer there. This kernel already reads every row it writes, into
+  // workgroup memory, before it writes any of them, and no other workgroup
+  // touches those rows - so the read-modify-write is safe within one dispatch.
+  const residual = shape.residual ?? false;
   const lanes = shape.lanes ?? (tile % 4 === 0 ? 4 : 1);
   if (tile % lanes !== 0) throw new Error(`tile ${tile} is not a multiple of ${lanes} lanes`);
   const groups = tile / lanes;
@@ -188,9 +196,16 @@ const W_OFFSET: u32 = ${offsets.inputLayerNormOffset}u;
 const W_T1: u32 = ${offsets.transition1}u;
 const W_T2: u32 = ${offsets.transition2}u;
 
-@group(0) @binding(0) var<storage, read> input: array<f32>;
+${residual
+  ? `// 🔴 ONE BINDING FOR BOTH, because WebGPU refuses a bind group that lists
+// the same buffer as a read binding and a writable one. In place is what the
+// residual form means here anyway: this kernel reads every row it touches into
+// workgroup memory before it writes any of them.
+@group(0) @binding(0) var<storage, read_write> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;`
+  : `@group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;`}
 
 var<workgroup> normalized: array<${vector}, ${groups * channels}>;
 var<workgroup> gated: array<${vector}, ${groups * chunk}>;
@@ -341,7 +356,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       let packed = sum[${writeAccumulator}];
       ${overLanes((l, at) => `{
         let row${l} = base_row + g * ${lanes}u + ${l}u;
-        if (row${l} < ROWS) { output[row${l} * CHANNELS + c] = packed${at}; }
+        if (row${l} < ROWS) {
+          ${residual ? "input" : "output"}[row${l} * CHANNELS + c] ${residual ? "+=" : "="} packed${at};
+        }
       }`).join("\n      ")}
     }
     write_slot += 1u;

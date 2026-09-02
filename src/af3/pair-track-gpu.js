@@ -70,8 +70,12 @@ export async function compilePairTrack(cache, options) {
 
   const pipelines = {};
   for (const direction of ["outgoing", "incoming"]) {
+    // 🔴 THE RESIDUAL FORM, so project-out adds into the pair representation
+    // rather than writing a delta for a separate add pass to fold in. All five
+    // of this track's updates do that now; see the note in
+    // src/af3/transition-webgpu.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
-      shape, "f32", triangleOffsets, epsilon, direction, variance);
+      shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true);
     // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
@@ -86,7 +90,8 @@ export async function compilePairTrack(cache, options) {
   for (const [key, attention, transpose] of
        [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]) {
     const { tiles, ...sources } = createGridAttentionShaders(
-      { n, channels, heads: attention.heads, dimension: attention.dimension, transpose },
+      { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
+        residual: true },
       gridOffsets, epsilon, variance, dialect);
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
@@ -94,8 +99,11 @@ export async function compilePairTrack(cache, options) {
     }
   }
   pipelines.pairTransition = await cache.get(`${base}:pair-transition`,
-    createTransitionShader({ rows: pairs, channels, factor: transitionFactor },
+    createTransitionShader({ rows: pairs, channels, factor: transitionFactor, residual: true },
                            transitionOffsets, epsilon, variance));
+  // 🔴 STILL ONE ADD PASS, and it belongs to the MSA stack rather than to this
+  // track: the outer product mean is the one producer whose kernel does not
+  // write the pair representation itself. See msa-stack-webgpu.js's "opm.add".
   pipelines.addPair = await cache.get(`${base}:add-pair`, createAddShader(pairs * channels));
   return pipelines;
 }
@@ -125,10 +133,6 @@ export function encodePairTrack(context) {
   const pairs = n * n;
   const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
   const ceil = (value, divisor) => Math.ceil(value / divisor);
-  const addGroups = spread(ceil(pairs * channels, 64));
-  const addPair = (delta) =>
-    run("add", pipelines.addPair, [pair, delta], addGroups[0], addGroups[1]);
-
   for (const direction of ["outgoing", "incoming"]) {
     const w = weights[direction];
     const p = (name) => pipelines[`tri:${direction}:${name}`];
@@ -141,9 +145,10 @@ export function encodePairTrack(context) {
         ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
     run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]],
         perNormalizeTile[0], perNormalizeTile[1]);
-    run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, scratch[5]],
+    // ...straight into the pair representation, which nothing has read since
+    // tri.normalize consumed it into scratch[0].
+    run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, pair],
         ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
-    addPair(scratch[5]);
   }
 
   for (const [key, w] of [["false", weights.grid1], ["true", weights.grid2]]) {
@@ -166,16 +171,16 @@ export function encodePairTrack(context) {
     run("grid.attend", p("attend"),
         [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[5]],
         ceil(n, 64), n, gridHeads);
-    run("grid.project-out", p("project_out"), [scratch[5], scratch[4], w, scratch[6]],
+    run("grid.project-out", p("project_out"), [scratch[5], scratch[4], w, pair],
         perOutTile[0], perOutTile[1]);
-    addPair(scratch[6]);
   }
 
   // 🔴 A TILE OF PAIRS A WORKGROUP. This was 241 ms of a 632 ms pairformer pass
   // - the largest single kernel in the trunk - because each workgroup read the
   // whole 196k-float weight set for one row.
   const perTransition = spread(Math.ceil(pairs / transitionRowTile(pairs)));
-  run("pair-transition", pipelines.pairTransition, [pair, weights.transition, scratch[0]],
+  // ...reads every row it writes into workgroup memory before writing any of
+  // them, and no other workgroup touches those rows, so this is in place.
+  run("pair-transition", pipelines.pairTransition, [pair, weights.transition],
       perTransition[0], perTransition[1]);
-  addPair(scratch[0]);
 }

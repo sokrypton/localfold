@@ -8,7 +8,7 @@ the numbers, so none of it has to be re-derived.
 
 ## Live right now
 
-`c057bc63`, deployed to https://localfold.org and verified by
+`60cb9e02`, deployed to https://localfold.org and verified by
 `python3 tools/deploy.py`, which polls `build.json` until the pushed commit is
 the one being served. Everything below is live.
 
