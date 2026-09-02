@@ -388,6 +388,54 @@ read from the checkpoint - and none of those are implemented or verified here.
 int5 costs nothing measurable: 1405 MiB -> 265 MiB, and 6MRR folds to 0.66 A
 against float32's 0.69, which is the spread between diffusion seeds.
 
+## What a denoiser call costs, and what made it cost less
+
+A sampler calls the diffusion head up to 200 times and everything else once, so
+the head is the whole optimisation target. On a 59-residue chain, steady state:
+
+| stage        | as found | now |
+|--------------|---------|-----|
+| conditioning |    48   |  33 |
+| atom encoder |   100   |  83 |
+| transformer  |   549   | 107 |
+| atom decoder |    48   |  25 |
+| **one call** | **760** | **289** |
+
+What paid, in order:
+
+1. **The block loop awaited `popErrorScope()` AND `onSubmittedWorkDone()` per
+   block** - two host-device round trips a block, 48 a call. `DeferredValidation`
+   in src/runtime/validation.js exists for exactly this and the pairformer had
+   used it for a year. 549 -> 273 ms.
+2. **The per-token workgroups were 64 lanes wide.** Those four kernels run one
+   workgroup per token, so the token count IS the occupancy: 59 workgroups of 64
+   threads is under 4000 for a GPU that wants tens of thousands. 256 lanes -
+   the ceiling, 512 does not compile - took 199 -> 99 ms.
+3. **Block weights packed and uploaded per call**, ~630 MB a call over weights
+   that never change. Now packed once per block object and resident on the
+   device.
+4. **The key rows are a gather of the query rows**, four slots to an atom, and
+   the atom transformer projected each slot separately. Projecting per atom and
+   expanding is a quarter of the work and NUMERICALLY IDENTICAL - the encoder
+   checker prints the same digits either way.
+5. **The pair conditioning does not depend on sigma** and was rebuilt 200 times.
+
+🔴 **AND FOUR THINGS THAT LOOKED OBVIOUS AND WERE WORTH NOTHING**, which is most
+of what this section is for: batching the 24 per-block submits into one encoder
+(199 vs 205); skipping ~14 MB of per-call readback that is immediately
+re-uploaded (4 ms - unified memory makes a copy back nearly free); widening the
+ATOM kernels the same way the transformer's were widened (they already launch
+1440 workgroups, so occupancy was never their limit); and replacing the atom
+kernels' redundant serial LayerNorm reductions - where all 64 lanes walk all 128
+channels four times - with workgroup reductions, which is strictly less work and
+came out inside the noise.
+
+The remaining floor is tiling: nothing reuses a weight tile in shared memory
+across tokens, so the transformer runs about 18 GFLOP in 107 ms, low single
+digit percent of the device. Measure with tools/gpu/bench-diffusion-transformer.js,
+which takes about three seconds because it synthesises its weights, and gate any
+change on tools/gpu/probe-head-vs-af3-steps.js.
+
 ## Fixed: the side chains were compressed, and the loader was reading four wrong tensors
 
 Reported from the page: side chains badly placed and rings wrong, at any number

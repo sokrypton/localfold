@@ -575,6 +575,118 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     v[row * WIDTH + out] = v_total;
   }
 }`;
+  const projectKeysAtoms = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;
+
+var<workgroup> xk: array<f32, ${channels}>;
+var<workgroup> kcond: array<f32, ${channels}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+  // ...every atom is its own source here, and there is no dead slot: the key
+  // layout's padding is applied when this is expanded into it.
+  let live = true;
+  let source = row;
+
+  var total = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    total += value;
+  }
+  let mean = total / f32(C);
+  var variance = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    let d = value - mean;
+    variance += d * d;
+  }
+  let inverse = inverseSqrt(variance / f32(C) + EPSILON);
+
+  var cond_total = 0.0;
+  for (var c = 0u; c < C; c += 1u) { cond_total += queries_cond[row * C + c]; }
+  let cond_mean = cond_total / f32(C);
+  var cond_variance = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    let d = queries_cond[row * C + c] - cond_mean;
+    cond_variance += d * d;
+  }
+  let cond_inverse = inverseSqrt(cond_variance / f32(C) + EPSILON);
+  for (var c = local; c < C; c += 64u) {
+    kcond[c] = (queries_cond[row * C + c] - cond_mean) * cond_inverse
+      * weights[W_kSingleCondLayerNormScale + c];
+  }
+  workgroupBarrier();
+  for (var c = local; c < C; c += 64u) {
+    var scale_value = weights[W_kSingleCondScaleBias + c];
+    var shift = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      scale_value += kcond[d] * weights[W_kSingleCondScaleWeights + d * C + c];
+      shift += kcond[d] * weights[W_kSingleCondBias + d * C + c];
+    }
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    xk[c] = logistic(scale_value) * ((value - mean) * inverse) + shift;
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < WIDTH; out += 64u) {
+    var k_total = 0.0;
+    var v_total = 0.0;
+    for (var c = 0u; c < C; c += 1u) {
+      k_total += xk[c] * weights[W_kProjection + c * WIDTH + out];
+      v_total += xk[c] * weights[W_vProjection + c * WIDTH + out];
+    }
+    k[row * WIDTH + out] = k_total;
+    v[row * WIDTH + out] = v_total;
+  }
+}`;
+
+  // 🔴 THE KEY ROWS ARE A GATHER OF THE QUERY ROWS, SO THEIR PROJECTION IS ONE
+  // TOO. queries_to_keys maps 45x128 key slots onto 1440 atoms - about four
+  // slots an atom - and projectKeys recomputed the identical LayerNorm, AdaLN
+  // and k/v projection for every one of them. Everything it reads for a key row
+  // is a function of that row's SOURCE atom: keys_cond is built as a gather of
+  // queries_cond, and the activation is read through the same index. So the
+  // projection runs once per atom and this expands it: a quarter of the work
+  // for the same numbers.
+  //
+  // 🔴 AND A DEAD SLOT MUST WRITE ZERO, not the atom it happens to point at.
+  // The old kernel got that from `live` gating its reads; here the mask lives
+  // in the expansion, and dropping it would feed the attention real keys where
+  // it expects padding.
+  const expandKeys = `${common}
+@group(0) @binding(0) var<storage, read> k_atoms: array<f32>;
+@group(0) @binding(1) var<storage, read> v_atoms: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read_write> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= KEY_ROWS * WIDTH) { return; }
+  let row = slot / WIDTH;
+  let out = slot % WIDTH;
+  var k_value = 0.0;
+  var v_value = 0.0;
+  if (gathers[G_QK_MASK + row] != 0) {
+    let source = u32(max(gathers[G_QK_IDX + row], 0));
+    k_value = k_atoms[source * WIDTH + out];
+    v_value = v_atoms[source * WIDTH + out];
+  }
+  k[slot] = k_value;
+  v[slot] = v_value;
+}`;
 
   const attendFor = (block) => `${common}
 const BLOCK: u32 = ${block}u;
@@ -803,7 +915,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  return { project, projectKeys, attendFor, output, maskAct, aggregate };
+  return { project, projectKeys, projectKeysAtoms, expandKeys,
+           attendFor, output, maskAct, aggregate };
 }
 
 export class Af3AtomEncoderGpu {
@@ -941,6 +1054,9 @@ export class Af3AtomEncoderGpu {
       const q = alloc("atom.q", queryRows * width * 4);
       const k = alloc("atom.k", keyRows * width * 4);
       const v = alloc("atom.v", keyRows * width * 4);
+      // ...one row an ATOM, expanded into the key layout below.
+      const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
+      const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
       const gathered = alloc("atom.gathered", queryRows * width * 4);
       const tokenAct = alloc("atom.token-act", tokens * perTokenChannels * 4,
@@ -1006,11 +1122,13 @@ export class Af3AtomEncoderGpu {
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
         const perQuery = spread(queryRows);
-        const perKey = spread(keyRows);
         run(`project-${index}`, compiled.project,
             [act, queriesCond, w, q, gate], perQuery[0], perQuery[1]);
-        run(`project-keys-${index}`, compiled.projectKeys,
-            [act, keysCond, gatherBuffer, w, k, v], perKey[0], perKey[1]);
+        run(`project-keys-${index}`, compiled.projectKeysAtoms,
+            [act, queriesCond, w, kAtoms, vAtoms], perQuery[0], perQuery[1]);
+        const expand = lin(keyRows * width);
+        run(`expand-keys-${index}`, compiled.expandKeys,
+            [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
         // The per-block slice of the logits.
         const slots = spread(queryRows * heads);
         run(`attend-${index}`, compiled.attend[index],

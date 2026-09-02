@@ -162,8 +162,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // Only the four block passes; the encoder's masking and aggregation are its
   // own, and `aggregate` reads a weight this bundle does not carry.
-  const { project, projectKeys, attendFor, output } = createAtomBlockShaders(common, shape);
-  return { pairLogits, start, finish, project, projectKeys, attendFor, output };
+  const { project, projectKeys, projectKeysAtoms, expandKeys, attendFor, output } =
+    createAtomBlockShaders(common, shape);
+  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms, expandKeys,
+           attendFor, output };
 }
 
 export class Af3AtomDecoderGpu {
@@ -255,6 +257,8 @@ export class Af3AtomDecoderGpu {
       const q = alloc("dec.q", queryRows * width * 4);
       const k = alloc("dec.k", keyRows * width * 4);
       const v = alloc("dec.v", keyRows * width * 4);
+      const kAtoms = alloc("dec.k-atoms", queryRows * width * 4);
+      const vAtoms = alloc("dec.v-atoms", queryRows * width * 4);
       const gate = alloc("dec.gate", queryRows * width * 4);
       const gathered = alloc("dec.gathered", queryRows * width * 4);
       const update = alloc("dec.update", tokens * dense * 3 * 4, GPUBufferUsage.COPY_SRC);
@@ -285,11 +289,13 @@ export class Af3AtomDecoderGpu {
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
         const perQuery = spread(queryRows);
-        const perKey = spread(keyRows);
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
             perQuery[0], perQuery[1]);
-        run(`project-keys-${index}`, compiled.projectKeys,
-            [act, keysCond, gatherBuffer, w, k, v], perKey[0], perKey[1]);
+        run(`project-keys-${index}`, compiled.projectKeysAtoms,
+            [act, queriesCond, w, kAtoms, vAtoms], perQuery[0], perQuery[1]);
+        const expand = lin(keyRows * width);
+        run(`expand-keys-${index}`, compiled.expandKeys,
+            [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
         const slots = spread(queryRows * heads);
         run(`attend-${index}`, compiled.attend[index],
             [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);
