@@ -77,6 +77,74 @@ function normaliseAndProject(input, rows, channels, outChannels, scale, projecti
   return output;
 }
 
+
+/**
+ * LayerNorm with a scale and no offset, then a projection. One workgroup a row.
+ *
+ * 🔴 THIS WAS 58 MS OF A 204 MS DENOISER CALL, IN JAVASCRIPT. The single
+ * conditioning is 384 wide and the token transformer wants 768, so this is a
+ * 59x384x768 matmul - 17M multiply-adds in a scalar loop on the main thread,
+ * two hundred times a fold, while the GPU sat idle. It is the last big piece of
+ * the head that was not a shader.
+ */
+const NORMALISE_AND_PROJECT = (rows, inChannels, outChannels, lanes) => `
+const ROWS: u32 = ${rows}u;
+const C_IN: u32 = ${inChannels}u;
+const C_OUT: u32 = ${outChannels}u;
+const LANES: u32 = ${lanes}u;
+const EPSILON: f32 = 1.0e-5;
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read> projection: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+var<workgroup> normalised: array<f32, ${inChannels}>;
+var<workgroup> reduce_a: array<f32, ${lanes}>;
+
+fn reduce_sum(local: u32, value: f32) -> f32 {
+  reduce_a[local] = value;
+  workgroupBarrier();
+  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+    workgroupBarrier();
+  }
+  return reduce_a[0];
+}
+
+@compute @workgroup_size(${lanes})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x;
+  if (row >= ROWS) { return; }
+  let local = local_id.x;
+  let base = row * C_IN;
+
+  var total = 0.0;
+  for (var c = local; c < C_IN; c += LANES) { total += input[base + c]; }
+  let mean = reduce_sum(local, total) / f32(C_IN);
+  workgroupBarrier();
+  var centred = 0.0;
+  for (var c = local; c < C_IN; c += LANES) {
+    let d = input[base + c] - mean;
+    centred += d * d;
+  }
+  let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C_IN) + EPSILON);
+  workgroupBarrier();
+  for (var c = local; c < C_IN; c += LANES) {
+    normalised[c] = (input[base + c] - mean) * inverse * scale[c];
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < C_OUT; out += LANES) {
+    var value = 0.0;
+    for (var c = 0u; c < C_IN; c += 1u) {
+      value += normalised[c] * projection[c * C_OUT + out];
+    }
+    output[row * C_OUT + out] = value;
+  }
+}`;
+
 export class Af3DiffusionHeadGpu {
   /** The last trunk's pair conditioning, which no noise level changes. */
   #conditioningPair;
@@ -99,6 +167,51 @@ export class Af3DiffusionHeadGpu {
    * @param {object} weights conditioning, encoder, transformer, decoder, plus
    *   singleCondEmbedding* and outputNormScale
    */
+
+  /** The GPU form of normaliseAndProject, for the one call that is hot. */
+  async #normaliseAndProject(input, rows, inChannels, outChannels, scale, projection) {
+    const allocator = new GpuBufferAllocator(this.device);
+    const storage = GPUBufferUsage.STORAGE;
+    const held = [];
+    try {
+      const lanes = 256;
+      const pipeline = await pipelineCacheForDevice(this.device).get(
+        `af3-normalise-project:${rows}:${inChannels}:${outChannels}:${lanes}`,
+        NORMALISE_AND_PROJECT(rows, inChannels, outChannels, lanes));
+      const keep = (allocation) => { held.push(allocation); return allocation; };
+      const inputBuffer = keep(allocator.upload("np.input", input, storage));
+      const scaleBuffer = keep(allocator.upload("np.scale", scale, storage));
+      const weightBuffer = keep(allocator.upload("np.projection", projection, storage));
+      const output = keep(allocator.allocate("np.output", rows * outChannels * 4,
+        storage | GPUBufferUsage.COPY_SRC));
+      const readback = keep(allocator.allocate("np.readback", rows * outChannels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+
+      this.device.pushErrorScope("validation");
+      const encoder = this.device.createCommandEncoder({ label: "af3-normalise-project" });
+      const pass = encoder.beginComputePass({ label: "normalise-project" });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [inputBuffer, scaleBuffer, weightBuffer, output].map((a, binding) => ({
+          binding, resource: { buffer: a.buffer },
+        })),
+      }));
+      pass.dispatchWorkgroups(rows);
+      pass.end();
+      encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * outChannels * 4);
+      this.device.queue.submit([encoder.finish()]);
+      const error = await this.device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      await readback.buffer.mapAsync(GPUMapMode.READ);
+      const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
+      readback.buffer.unmap();
+      return result;
+    } finally {
+      for (let index = held.length - 1; index >= 0; index -= 1) held[index].release();
+    }
+  }
+
   async run(input, weights, options = {}) {
     const { tokens, dense } = input.shape;
     const scale = scalings(input.noiseLevel);
@@ -173,9 +286,9 @@ export class Af3DiffusionHeadGpu {
       };
     }
 
-    const projected = normaliseAndProject(
+    const projected = await stage("single-projection", () => this.#normaliseAndProject(
       cond.single, tokens, weights.seqChannels, weights.perTokenChannels,
-      weights.singleCondEmbeddingNormScale, weights.singleCondEmbeddingProjection);
+      weights.singleCondEmbeddingNormScale, weights.singleCondEmbeddingProjection));
     const act = Float32Array.from(encoded.tokenAct);
     for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
 
@@ -183,9 +296,13 @@ export class Af3DiffusionHeadGpu {
       new Af3DiffusionTransformerGpu(this.device)
         .run(act, cond.single, cond.pair, input.seqMask, tokens, weights.transformer));
 
-    const normalised = normaliseAndProject(
+    // 🔴 THIS ONE STAYS ON THE CPU, AND THE DIFFERENCE IS THE PROJECTION. With
+    // `null` for it this is a LayerNorm and nothing else - 59 rows of 768, too
+    // small to be worth a dispatch, and measured at 0 ms. The one above is a
+    // 384x768 matmul and was 58.
+    const normalised = await stage("output-norm", async () => normaliseAndProject(
       transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
-      weights.outputNormScale, null);
+      weights.outputNormScale, null));
 
     const decoded = await stage("atom-decoder", () =>
       new Af3AtomDecoderGpu(this.device).run(normalised, encoded, input, weights.decoder));

@@ -103,12 +103,10 @@ export async function main(device, args) {
       atomEncoder: spread((r) => r["atom-encoder"]),
       transformer: spread((r) => r.transformer),
     },
-    steady: {
-      whole: mean((r) => r.whole),
-      conditioning: mean((r) => r.conditioning),
-      atomEncoder: mean((r) => r["atom-encoder"]),
-      transformer: mean((r) => r.transformer),
-      atomDecoder: mean((r) => r["atom-decoder"]),
-    },
+    // Every stage the head reports, in the order it reports them, so a stage
+    // added to the head shows up here without editing this file.
+    steady: Object.fromEntries(Object.keys(rows[0])
+      .filter((key) => key !== "call")
+      .map((key) => [key, mean((row) => row[key])])),
   };
 }
