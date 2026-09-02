@@ -389,6 +389,22 @@
   gap: 8px;
 }
 
+/* A ligand row has one more control - the menu of common codes - and the box
+   beside it only ever holds five characters, so the menu takes the width the
+   sequence box would otherwise have. */
+.entity-row-ligand { grid-template-columns: auto minmax(0, 1fr) 9ch auto auto; }
+.entity-picker {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 34px;
+  padding: 0 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  color: #111827;
+  font-size: 13px;
+}
+
 /* The value field carries the look the sequence box had: py2Dmol's own border,
    radius and focus colour, with the monospace a sequence needs. */
 .entity-value {

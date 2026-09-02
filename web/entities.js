@@ -31,6 +31,66 @@ export const ENTITY_TYPES = ["protein", "ligand"];
 export const ENTITY_LABELS = { protein: "Protein", ligand: "Ligand (CCD)" };
 
 /**
+ * The ligands and ions worth putting in a menu, as CCD codes.
+ *
+ * 🔴 A CONVENIENCE, NOT A LIMIT. Anything the PDB serves works - the fold
+ * fetches the component by code at run time - so this list exists to spare
+ * people looking up "the code for heme" and to show that ions are supported at
+ * all. "Custom" stays the default and the box beside it still takes any code.
+ *
+ * 🔴 IONS ARE HALF THE POINT OF HAVING THE MENU. A zinc finger, a kinase's
+ * magnesium, an EF-hand's calcium: these are the second thing anyone tries
+ * after a protein, and they are the entries most likely to be typed wrong,
+ * being one or two letters. They also did not work until the CCD reader learned
+ * that a lone atom has no conformer - see src/af3/ccd-component.js.
+ *
+ * The set follows what AlphaFold Server offers. That list is not published in a
+ * form worth citing, so this is the commonly reported one; it is one array, and
+ * adding to it costs nothing.
+ */
+export const COMMON_LIGANDS = [
+  { code: "ATP", name: "adenosine triphosphate" },
+  { code: "ADP", name: "adenosine diphosphate" },
+  { code: "AMP", name: "adenosine monophosphate" },
+  { code: "GTP", name: "guanosine triphosphate" },
+  { code: "GDP", name: "guanosine diphosphate" },
+  { code: "NAD", name: "NAD, oxidised" },
+  { code: "NAP", name: "NADP, oxidised" },
+  { code: "NDP", name: "NADPH, reduced" },
+  { code: "FAD", name: "flavin adenine dinucleotide" },
+  { code: "HEM", name: "heme B" },
+  { code: "HEC", name: "heme C" },
+  { code: "CIT", name: "citrate" },
+  { code: "PLM", name: "palmitate" },
+  { code: "MYR", name: "myristate" },
+  { code: "OLA", name: "oleate" },
+  { code: "GOL", name: "glycerol" },
+  { code: "SAM", name: "S-adenosylmethionine" },
+  { code: "COA", name: "coenzyme A" },
+  { code: "PLP", name: "pyridoxal phosphate" },
+  { code: "NAG", name: "N-acetylglucosamine" },
+];
+
+export const COMMON_IONS = [
+  { code: "MG", name: "magnesium" },
+  { code: "ZN", name: "zinc" },
+  { code: "CA", name: "calcium" },
+  { code: "MN", name: "manganese" },
+  { code: "FE", name: "iron (III)" },
+  { code: "FE2", name: "iron (II)" },
+  { code: "CU", name: "copper (II)" },
+  { code: "CO", name: "cobalt (II)" },
+  { code: "NI", name: "nickel" },
+  { code: "K", name: "potassium" },
+  { code: "NA", name: "sodium" },
+  { code: "CL", name: "chloride" },
+];
+
+/** Every code the menu offers, for deciding whether a value is one of them. */
+export const MENU_CODES = new Set(
+  [...COMMON_LIGANDS, ...COMMON_IONS].map((entry) => entry.code));
+
+/**
  * 🔴 DNA AND RNA ARE ABSENT ON PURPOSE. AF3's restype alphabet is 31 wide and
  * has the nucleic acids in it, and DENSE is 24 atoms so a nucleotide would fit
  * - but reference-conformers.js holds the 21 amino acids and nothing else, so a

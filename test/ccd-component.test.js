@@ -64,6 +64,97 @@ GOL C1 H11 SING N N 5
 #
 `;
 
+// MG, as files.rcsb.org actually serves it: ONE atom, so the category is not a
+// loop at all - mmCIF writes a single row as plain `_item value` pairs, since
+// `loop_` exists only to avoid repeating the names. Every coordinate is "?",
+// because a single atom has no conformer to describe. Both facts are load
+// bearing, and the file ends its blocks with "# #" rather than "#".
+const MG = `data_MG
+_chem_comp.id                                    MG
+_chem_comp.name                                  "MAGNESIUM ION"
+_chem_comp.type                                  NON-POLYMER
+_chem_comp.formula                               "Mg 2"
+#
+_chem_comp_atom.comp_id                    MG
+_chem_comp_atom.atom_id                    MG
+_chem_comp_atom.alt_atom_id                MG
+_chem_comp_atom.type_symbol                MG
+_chem_comp_atom.charge                     2
+_chem_comp_atom.pdbx_align                 0
+_chem_comp_atom.pdbx_aromatic_flag         N
+_chem_comp_atom.pdbx_leaving_atom_flag     N
+_chem_comp_atom.pdbx_stereo_config         N
+_chem_comp_atom.model_Cartn_x              ?
+_chem_comp_atom.model_Cartn_y              ?
+_chem_comp_atom.model_Cartn_z              ?
+_chem_comp_atom.pdbx_model_Cartn_x_ideal   ?
+_chem_comp_atom.pdbx_model_Cartn_y_ideal   ?
+_chem_comp_atom.pdbx_model_Cartn_z_ideal   ?
+_chem_comp_atom.pdbx_component_atom_id     MG
+_chem_comp_atom.pdbx_component_comp_id     MG
+_chem_comp_atom.pdbx_ordinal               1
+#   #
+`;
+
+describe("monatomic ions", () => {
+  // 🔴 A PROTEIN WITH ONE MAGNESIUM USED TO FAIL THE WHOLE FOLD, with "MG has
+  // no usable x coordinate". Ions are among the most common things anyone wants
+  // to co-fold - zinc fingers, kinase magnesium, EF-hand calcium - so this is
+  // not an edge case, it is the second thing a user tries.
+  it("gives a lone atom the origin rather than refusing it", () => {
+    const parsed = parseCcdComponent(MG);
+    assert.equal(parsed.code, "MG");
+    assert.equal(parsed.atoms.length, 1);
+    assert.deepEqual(
+      { x: parsed.atoms[0].x, y: parsed.atoms[0].y, z: parsed.atoms[0].z },
+      { x: 0, y: 0, z: 0 });
+    assert.equal(parsed.atoms[0].charge, 2);
+    assert.deepEqual(parsed.bonds, []);
+  });
+
+  it("still refuses a missing coordinate when there is more than one atom", () => {
+    // ...because there a zero is a WRONG geometry, not an arbitrary one: it
+    // collapses that atom onto whatever sits at the origin. Two atoms means a
+    // real loop, which is the form this case has to be written in.
+    const twoAtoms = GOL
+      .replace(/GOL C1  C1  C 0 1 N N N N N N [-\d. ]+C1  GOL 1/,
+        "GOL C1  C1  C 0 1 N N N N N N ? ? ? ? ? ? C1  GOL 1");
+    assert.throws(() => parseCcdComponent(twoAtoms), /no usable x coordinate/);
+  });
+
+  it("reads the atom's own fields, not whatever followed the block", () => {
+    // 🔴 THE OLD READER "WORKED" ON MG AND WAS WRONG. It took the item lines for
+    // headers, threw their values away, and then accepted the "# #" terminator
+    // as a two-field row - so the ion parsed as one atom named undefined with
+    // element 0. It folded. That is worse than an error.
+    const parsed = parseCcdComponent(MG);
+    assert.equal(parsed.atoms[0].name, "MG");
+    assert.equal(parsed.atoms[0].element, 12);       // magnesium
+  });
+});
+
+describe("loop terminators", () => {
+  // 🔴 EVERY ATP FOLD DIED ON THIS. files.rcsb.org ends ATP's atom loop with the
+  // line "# #", not "#": it passed the comment test, tokenised into a two-field
+  // row, and became a 48th atom with no coordinates. The error said "ATP has no
+  // usable x coordinate", which names the component and not the line, so it
+  // read as "ATP is unsupported" rather than "the parser invented an atom".
+  it("ends a loop at a comment written as more than one hash", () => {
+    const withHashes = GOL.replace(/^#$/m, "# #");
+    const parsed = parseCcdComponent(withHashes);
+    assert.equal(parsed.atoms.length, 6);      // the hydrogen is dropped
+    assert.ok(parsed.atoms.every((atom) => Number.isFinite(atom.x)));
+  });
+
+  it("does not take a short line for a row of the loop", () => {
+    const withJunk = GOL.replace(
+      "GOL H11 H11 H 0 1 N N N N N N 30.000 3.000 31.000 -1.300 -1.700 0.000  H11 GOL 7",
+      "GOL H11 H11 H 0 1 N N N N N N 30.000 3.000 31.000 -1.300 -1.700 0.000  H11 GOL 7\nGOL X");
+    const parsed = parseCcdComponent(withJunk);
+    assert.equal(parsed.atoms.length, 6);
+  });
+});
+
 describe("CCD component", () => {
   it("reads atoms by column name, not by position", () => {
     // 🔴 THE COLUMNS MOVED ONCE ALREADY. pdbx_backbone_atom_flag and the two

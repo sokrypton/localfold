@@ -15,7 +15,7 @@
  * input. So adding, removing and changing a type rebuild; typing and copies do
  * not, and update the model in place instead.
  */
-import { ENTITY_LABELS, ENTITY_TYPES, entitiesFromText, newEntity } from "./entities.js";
+import { COMMON_IONS, COMMON_LIGANDS, ENTITY_LABELS, ENTITY_TYPES, MENU_CODES, entitiesFromText, newEntity } from "./entities.js";
 import { cleanSequence, extractFastaHeader } from "./sequence.js";
 
 /**
@@ -68,6 +68,38 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // code is five characters and a sequence is hundreds. A single control
     // sized for one is wrong for the other, and the wrong one invites a paste
     // that cannot be read back.
+    // 🔴 A MENU IN FRONT OF THE BOX, NOT INSTEAD OF IT. The codes are the part
+    // nobody remembers - "the code for heme", "is magnesium MG or MG2" - and
+    // the ions are one or two letters, which is exactly what gets typed wrong.
+    // But the fold fetches whatever code it is given from the PDB, so the menu
+    // must not become the limit: "Custom" is the default, the box beside it
+    // still takes anything, and picking from the menu only fills the box in.
+    let picker = null;
+    if (entity.type === "ligand") {
+      picker = document.createElement("select");
+      picker.className = "entity-picker";
+      picker.title = "Common ligands and ions";
+      const custom = document.createElement("option");
+      custom.value = "";
+      custom.textContent = "Custom…";
+      picker.append(custom);
+      for (const [label, entries] of [["Ligands", COMMON_LIGANDS], ["Ions", COMMON_IONS]]) {
+        const group = document.createElement("optgroup");
+        group.label = label;
+        for (const entry of entries) {
+          const option = document.createElement("option");
+          option.value = entry.code;
+          option.textContent = `${entry.code} · ${entry.name}`;
+          group.append(option);
+        }
+        picker.append(group);
+      }
+      // A code typed by hand that happens to be on the menu shows as that entry
+      // rather than as Custom, so the two controls never disagree.
+      const current = entity.value.trim().toUpperCase();
+      picker.value = MENU_CODES.has(current) ? current : "";
+    }
+
     const value = entity.type === "ligand"
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -90,8 +122,22 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     value.value = entity.value;
     value.addEventListener("input", () => {
       entity.value = value.value;
+      // ...the menu follows the box WITHOUT a re-render, which would take the
+      // focus and the caret away mid-word.
+      if (picker !== null) {
+        const typed = value.value.trim().toUpperCase();
+        picker.value = MENU_CODES.has(typed) ? typed : "";
+      }
       notify();
     });
+    if (picker !== null) {
+      picker.addEventListener("change", () => {
+        if (picker.value === "") { value.focus(); return; }   // Custom: go type one
+        entity.value = picker.value;
+        value.value = picker.value;
+        notify();
+      });
+    }
     // Tidied on blur, not on every keystroke: see the note at the top.
     value.addEventListener("blur", () => {
       if (entity.type === "ligand") {
@@ -154,7 +200,10 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       render();
     });
 
-    wrapper.append(type, value, copiesLabel, remove);
+    // The picker sits between the type and the box, so the row reads
+    // "Ligand · [ATP ▾] [ATP] × 1" left to right.
+    wrapper.append(type, ...(picker === null ? [] : [picker]), value, copiesLabel, remove);
+    if (picker !== null) wrapper.classList.add("entity-row-ligand");
     return wrapper;
   };
 

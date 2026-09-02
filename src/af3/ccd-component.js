@@ -43,31 +43,66 @@ export function ccdUrl(code) {
   return `https://files.rcsb.org/ligands/download/${upper}.cif`;
 }
 
-/** The column names of an mmCIF `loop_`, and the rows under it. */
+/**
+ * The column names of an mmCIF category and the rows under it.
+ *
+ * 🔴 A CATEGORY WITH ONE ROW IS NOT WRITTEN AS A LOOP, and that is how mmCIF
+ * has always worked: `loop_` exists to avoid repeating item names, so a single
+ * row is written as plain `_category.item value` pairs instead. Every monatomic
+ * ion is such a category - MG, ZN, CL, K, FE2 - and reading only the looped
+ * form found no atoms in any of them.
+ *
+ * It did not fail cleanly either. The item lines were taken for column headers,
+ * their values discarded, and the "# #" line that follows was then accepted as
+ * a two-field row - so MG parsed as one atom with no name, element zero and no
+ * coordinates, and folded. A wrong answer, quietly.
+ */
 function loopOf(text, prefix) {
   const lines = text.split(/\r?\n/);
   const columns = [];
   const rows = [];
+  // The unlooped form: item -> its value, gathered from the same lines that
+  // name the columns.
+  const single = new Map();
   let inHeader = false;
   let inBody = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith(`${prefix}.`)) {
       if (inBody) break;              // a second loop with the same prefix
-      columns.push(trimmed.slice(prefix.length + 1).split(/\s+/)[0]);
+      const [item, ...value] = trimmed.slice(prefix.length + 1).split(/\s+/);
+      columns.push(item);
+      if (value.length > 0) single.set(item, value.join(" "));
       inHeader = true;
       continue;
     }
     if (!inHeader) continue;
-    if (trimmed === "" || trimmed === "#" || trimmed === "loop_") {
+    // 🔴 A COMMENT IS NOT ALWAYS A LONE "#". files.rcsb.org ends ATP's atom loop
+    // with the line "# #", which passed this test, tokenised into a two-field
+    // "row", and became an atom with no coordinates - so every ATP fold died on
+    // "ATP has no usable x coordinate" and the same went for any component
+    // written that way. Anything made only of hashes and spaces is a comment.
+    if (trimmed === "" || trimmed === "loop_" || /^[#\s]+$/.test(trimmed)) {
       if (inBody) break;
       continue;
     }
     if (trimmed.startsWith("_")) break;
-    inBody = true;
     // Values may be quoted, and an atom name like O5' or "C1'" can carry one.
-    rows.push(trimmed.match(/'[^']*'|"[^"]*"|\S+/g)?.map(
-      (value) => value.replace(/^['"]|['"]$/g, "")) ?? []);
+    const fields = trimmed.match(/'[^']*'|"[^"]*"|\S+/g)?.map(
+      (value) => value.replace(/^['"]|['"]$/g, "")) ?? [];
+    // 🔴 AND A ROW HAS AS MANY FIELDS AS THERE ARE COLUMNS. A short line is not
+    // a row of this loop whatever else it is; accepting one puts undefined in
+    // every column and the error that follows names the wrong thing entirely.
+    // In these files a row is always one line, so the first mismatch is the end.
+    if (fields.length !== columns.length) {
+      if (inBody) break;
+      continue;
+    }
+    inBody = true;
+    rows.push(fields);
+  }
+  if (rows.length === 0 && single.size > 0) {
+    rows.push(columns.map((item) => (single.get(item) ?? "").replace(/^['"]|['"]$/g, "")));
   }
   return { columns, rows };
 }
@@ -95,12 +130,30 @@ export function parseCcdComponent(text) {
   };
   // The ideal conformer is the one with no crystal contacts in it. A component
   // occasionally lacks it, and then the model coordinates are what there is.
-  const hasIdeal = atomLoop.columns.includes("pdbx_model_Cartn_x_ideal");
+  //
+  // 🔴 PER ATOM, NOT PER COLUMN, AND AN ION HAS NEITHER. The choice used to be
+  // made once from whether the ideal COLUMNS existed, but a component can carry
+  // the columns and leave them as "?" - which every monatomic ion does, because
+  // a single atom has no conformer to describe. MG has the columns and no
+  // values in them, so a protein with one magnesium failed the whole fold with
+  // "MG has no usable x coordinate".
+  //
+  // 🔴 AND THE ORIGIN IS THE RIGHT ANSWER FOR EXACTLY ONE ATOM, not for a
+  // missing coordinate in general. A conformer is only defined up to a rigid
+  // motion and the diffusion head places the component itself, so for a lone
+  // atom every point is equally correct and the origin is one of them. For a
+  // component with several atoms a zero would be a WRONG geometry rather than
+  // an arbitrary one - it would collapse that atom onto the others - so that
+  // stays an error.
+  const monatomic = atomLoop.rows.filter(
+    (row) => !["H", "D"].includes((at(row, "type_symbol") ?? "").toUpperCase())).length === 1;
   const coordinate = (row, axis) => {
-    const value = at(row, hasIdeal ? `pdbx_model_Cartn_${axis}_ideal` : `model_Cartn_${axis}`);
-    const parsed = Number.parseFloat(value);
-    if (!Number.isFinite(parsed)) throw new Error(`${code} has no usable ${axis} coordinate`);
-    return parsed;
+    for (const column of [`pdbx_model_Cartn_${axis}_ideal`, `model_Cartn_${axis}`]) {
+      const parsed = Number.parseFloat(at(row, column));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    if (monatomic) return 0;
+    throw new Error(`${code} has no usable ${axis} coordinate`);
   };
 
   const byName = new Map();
