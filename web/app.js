@@ -32,8 +32,9 @@ import { parseA3m } from "../src/input/a3m.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
-import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
-import { getDevice, loadModel } from "./model.js";
+import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights, warmAf3Weights }
+  from "./af3-model.js";
+import { getDevice, loadModel, warmStore } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
 import { confidenceJson, paeMatrix, predictionToPdb, safeJobName }
@@ -1317,6 +1318,29 @@ if (familySelect !== null) {
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
 syncModelControls();
+
+// 🔴 THE WEIGHTS START MOVING WHEN A SEQUENCE IS TYPED, NOT WHEN FOLD IS
+// PRESSED. A cold AF3 load is ten seconds of network that nothing else can
+// overlap once a fold has been asked for - 277 MB of int5 at the 27 MB/s eight
+// parallel connections reach, and gzip takes 5% off packed integers and no
+// more. So the only thing left to move is when it starts, and typing a real
+// sequence is the signal that somebody means to fold one.
+//
+// 🔴 AND NOT ON PAGE LOAD, deliberately. A quarter of a gigabyte is not
+// something to spend on a visitor who has not asked for anything, least of all
+// on a phone. The threshold is a sequence long enough to be one.
+const warmModel = () => {
+  const family = document.getElementById("model-family")?.value ?? "af3";
+  if (family === "af3") warmAf3Weights();
+  else warmStore(family);
+};
+let warmed = false;
+document.addEventListener("input", (event) => {
+  if (warmed || !(event.target instanceof HTMLTextAreaElement)) return;
+  if ((event.target.value ?? "").replace(/\s/g, "").length < 10) return;
+  warmed = true;
+  warmModel();
+}, { passive: true });
 
 element("msa-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];
