@@ -50,6 +50,16 @@ const SINGLE_CHANNELS = 384;
  */
 function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance) {
   const pairs = n * n;
+  // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR - and
+  // the normalisation belongs outside them. This looped heads OUTSIDE channels
+  // and re-derived the normalised value inside both, so a row cost
+  // HEADS x CHANNELS x (four reads and four operations) where it needs
+  // CHANNELS x (three reads and HEADS/4 vector multiply-adds). The same shape
+  // in the diffusion transformer's pair-logits was worth 3.7x.
+  const headVectors = Math.ceil(heads / 4);
+  const overHeadVectors = (body) =>
+    Array.from({ length: headVectors }, (_, h) => body(h)).join("\n    ");
+  if (heads % 4 !== 0) throw new Error(`heads ${heads} is not a multiple of four`);
   return `
 const PAIRS: u32 = ${pairs}u;
 const CHANNELS: u32 = ${channels}u;
@@ -62,7 +72,9 @@ const W_PROJECT: u32 = ${offsets.projection}u;
 
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+// ...as vec4, which is why W_PROJECT and HEADS must both be multiples of four.
+@group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> logits: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -86,15 +98,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   variance /= f32(CHANNELS);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
-  for (var h = 0u; h < HEADS; h += 1u) {
-    var sum = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      let value = (pair[base + c] - mean) * inverse_std * weights[W_SCALE + c]
-        + weights[W_OFFSET + c];
-      sum += value * weights[W_PROJECT + c * HEADS + h];
-    }
-    logits[h * PAIRS + row] = sum;
+  ${overHeadVectors((h) => `var sum${h} = vec4<f32>(0.0);`)}
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    // ...normalised once, used by every head.
+    let value = (pair[base + c] - mean) * inverse_std * weights[W_SCALE + c]
+      + weights[W_OFFSET + c];
+    let column = (W_PROJECT + c * HEADS) / 4u;
+    ${overHeadVectors((h) => `sum${h} += value * projection[column + ${h}u];`)}
   }
+  ${overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>
+    `logits[(${h * 4 + l}u) * PAIRS + row] = sum${h}.${"xyzw"[l]};`).join("\n  "))}
 }`;
 }
 
@@ -364,7 +377,10 @@ export class Af3PairformerStackGpu {
 
     // 🔴 AFTER the five, never before.
     const linear = spread(ceil(pairs, 64));
-    run("pair-logits", pipelines.pairLogits, [pair, logitsWeights, pairLogits], linear[0], linear[1]);
+    // ...the weights are bound twice, as scalars and as the vec4 view the head
+    // projection is read through.
+    run("pair-logits", pipelines.pairLogits,
+        [pair, logitsWeights, logitsWeights, pairLogits], linear[0], linear[1]);
 
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],

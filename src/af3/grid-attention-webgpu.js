@@ -302,7 +302,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // row of it per (row, i, head).
   const biasPass = `${common}
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+// ...as vec4, which is why W_BIAS and HEADS must both be multiples of four.
+@group(0) @binding(1) var<storage, read> projection: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> bias: array<f32>;
 
 @compute @workgroup_size(64)
@@ -312,13 +313,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // 🔴 THE UNTRANSPOSED ROW unless the dialect says otherwise.
   let source = ${swapBias ? "(row % N) * N + row / N" : "row"};
   let base = source * CHANNELS;
-  for (var h = 0u; h < HEADS; h += 1u) {
-    var total = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      total += normalized[base + c] * weights[W_BIAS + c * HEADS + h];
-    }
-    bias[h * PAIRS + row] = total;
+  // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR. This
+  // looped heads OUTSIDE channels, re-reading the normalised row for each of
+  // them and reading one weight per multiply-add.
+  ${Array.from({ length: heads / 4 }, (_, h) =>
+    `var total${h} = vec4<f32>(0.0);`).join("\n  ")}
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let value = normalized[base + c];
+    let column = (W_BIAS + c * HEADS) / 4u;
+    ${Array.from({ length: heads / 4 }, (_, h) =>
+      `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
   }
+  ${Array.from({ length: heads / 4 }, (_, h) => Array.from({ length: 4 }, (_, l) =>
+    `bias[(${h * 4 + l}u) * PAIRS + row] = total${h}.${"xyzw"[l]};`).join("\n  ")).join("\n  ")}
 }`;
 
   // One workgroup per pair row; thread w owns output channel w of q, k, v and
