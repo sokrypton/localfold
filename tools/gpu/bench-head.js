@@ -14,8 +14,13 @@
  * oracle behind it.
  *
  * 🔴 THE FIRST CALL IS NOT THE NUMBER. It compiles every pipeline and warms
- * every buffer pool, and on a 59-token chain it runs about 40% long. `steady`
- * is the mean of the calls after it, which is what a 200-step fold pays.
+ * every buffer pool, and on a 59-token chain it runs about 40% long.
+ *
+ * 🔴 AND `steady` IS A MEDIAN, NOT A MEAN, over the calls after it. Run-to-run
+ * spread here is around ten milliseconds a stage, which is wide enough that a
+ * mean of two calls once reported a REMOVED pass as costing negative time -
+ * so single-run deltas below about 15 ms mean nothing and a bisect built on
+ * them will confidently name the wrong pass.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
@@ -34,7 +39,7 @@ const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "59"));
-  const calls = Number(option(args, "calls", "3"));
+  const calls = Number(option(args, "calls", "9"));
   const sequence = Array.from({ length: tokens },
     (_, index) => ALPHABET[index % ALPHABET.length]).join("");
 
@@ -82,10 +87,22 @@ export async function main(device, args) {
     });
   }
   const after = rows.slice(1);
-  const mean = (pick) => Math.round(after.reduce((a, r) => a + pick(r), 0) / after.length);
+  const mean = (pick) => {
+    const values = after.map(pick).sort((a, b) => a - b);
+    return values[Math.floor(values.length / 2)];
+  };
+  const spread = (pick) => {
+    const values = after.map(pick).sort((a, b) => a - b);
+    return `${values[0]}-${values[values.length - 1]}`;
+  };
   return {
     tokens, atoms: tokens * dense, subsets: batch.shape.subsets, weightLoadMs: loadMs,
     rows,
+    range: {
+      whole: spread((r) => r.whole),
+      atomEncoder: spread((r) => r["atom-encoder"]),
+      transformer: spread((r) => r.transformer),
+    },
     steady: {
       whole: mean((r) => r.whole),
       conditioning: mean((r) => r.conditioning),

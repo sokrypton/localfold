@@ -176,52 +176,81 @@ const W_NOISE_PROJECT: u32 = ${offsets.noiseEmbeddingInitialProjection}u;
 @group(0) @binding(5) var<storage, read> noise_weights: array<f32>;
 @group(0) @binding(6) var<storage, read_write> single: array<f32>;
 
+// 🔴 ONE WORKGROUP PER TOKEN, NOT ONE THREAD. This dispatched ceil(TOKENS/64)
+// workgroups - ONE for a 59-residue protein - and each thread then computed 384
+// output channels over an 831-wide concatenation plus the 256-wide noise
+// embedding: 417k multiply-adds on a single lane, with the LayerNorm statistics
+// recomputed for every one of those 384 outputs. The normalised vectors are
+// computed once into workgroup memory here and the output range is strided
+// across the lanes.
+var<workgroup> normalised: array<f32, ${singleWidth}>;
+var<workgroup> noise_norm: array<f32, ${noiseChannels}>;
+var<workgroup> reduce_s: array<f32, 64>;
+
+fn reduce_sum(local: u32, value: f32) -> f32 {
+  reduce_s[local] = value;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce_s[local] += reduce_s[local + stride]; }
+    workgroupBarrier();
+  }
+  return reduce_s[0];
+}
+
+/** The concatenation [trunk single | target_feat], read as one row. */
+fn feature(token: u32, index: u32) -> f32 {
+  if (index < C_SEQ) { return trunk_single[token * C_SEQ + index]; }
+  return target_feat[token * TARGET_WIDTH + index - C_SEQ];
+}
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let token = id.x;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let token = group.x;
   if (token >= TOKENS) { return; }
+  let local = local_id.x;
 
   var total = 0.0;
-  for (var c = 0u; c < C_SEQ; c += 1u) { total += trunk_single[token * C_SEQ + c]; }
-  for (var c = 0u; c < TARGET_WIDTH; c += 1u) { total += target_feat[token * TARGET_WIDTH + c]; }
-  let mean = total / f32(WIDTH);
-  var variance = 0.0;
-  for (var c = 0u; c < C_SEQ; c += 1u) {
-    let d = trunk_single[token * C_SEQ + c] - mean;
-    variance += d * d;
+  for (var c = local; c < WIDTH; c += 64u) { total += feature(token, c); }
+  let mean = reduce_sum(local, total) / f32(WIDTH);
+  workgroupBarrier();
+  var centred = 0.0;
+  for (var c = local; c < WIDTH; c += 64u) {
+    let d = feature(token, c) - mean;
+    centred += d * d;
   }
-  for (var c = 0u; c < TARGET_WIDTH; c += 1u) {
-    let d = target_feat[token * TARGET_WIDTH + c] - mean;
-    variance += d * d;
+  let inverse_std = inverseSqrt(reduce_sum(local, centred) / f32(WIDTH) + EPSILON);
+  workgroupBarrier();
+  for (var c = local; c < WIDTH; c += 64u) {
+    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c];
   }
-  let inverse_std = inverseSqrt(variance / f32(WIDTH) + EPSILON);
 
   // The noise embedding is one row, shared by every token: normalise and
   // project it here rather than in its own pass.
   var noise_total = 0.0;
-  for (var c = 0u; c < NOISE_CHANNELS; c += 1u) { noise_total += noise[c]; }
-  let noise_mean = noise_total / f32(NOISE_CHANNELS);
-  var noise_variance = 0.0;
-  for (var c = 0u; c < NOISE_CHANNELS; c += 1u) {
+  for (var c = local; c < NOISE_CHANNELS; c += 64u) { noise_total += noise[c]; }
+  let noise_mean = reduce_sum(local, noise_total) / f32(NOISE_CHANNELS);
+  workgroupBarrier();
+  var noise_centred = 0.0;
+  for (var c = local; c < NOISE_CHANNELS; c += 64u) {
     let d = noise[c] - noise_mean;
-    noise_variance += d * d;
+    noise_centred += d * d;
   }
-  let noise_inverse = inverseSqrt(noise_variance / f32(NOISE_CHANNELS) + EPSILON);
+  let noise_inverse = inverseSqrt(reduce_sum(local, noise_centred)
+    / f32(NOISE_CHANNELS) + EPSILON);
+  workgroupBarrier();
+  for (var c = local; c < NOISE_CHANNELS; c += 64u) {
+    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse * noise_weights[W_NOISE_SCALE + c];
+  }
+  workgroupBarrier();
 
-  for (var out = 0u; out < C_SEQ; out += 1u) {
+  for (var out = local; out < C_SEQ; out += 64u) {
     var value = 0.0;
-    for (var c = 0u; c < C_SEQ; c += 1u) {
-      value += (trunk_single[token * C_SEQ + c] - mean) * inverse_std * scale[c]
-        * projection[c * C_SEQ + out];
-    }
-    for (var c = 0u; c < TARGET_WIDTH; c += 1u) {
-      let index = C_SEQ + c;
-      value += (target_feat[token * TARGET_WIDTH + c] - mean) * inverse_std * scale[index]
-        * projection[index * C_SEQ + out];
+    for (var c = 0u; c < WIDTH; c += 1u) {
+      value += normalised[c] * projection[c * C_SEQ + out];
     }
     for (var c = 0u; c < NOISE_CHANNELS; c += 1u) {
-      value += (noise[c] - noise_mean) * noise_inverse * noise_weights[W_NOISE_SCALE + c]
-        * noise_weights[W_NOISE_PROJECT + c * C_SEQ + out];
+      value += noise_norm[c] * noise_weights[W_NOISE_PROJECT + c * C_SEQ + out];
     }
     single[token * C_SEQ + out] = value;
   }
@@ -412,7 +441,7 @@ export class Af3DiffusionConditioningGpu {
       }
       run("single-initial", compiled.singleInitial,
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
-          Math.ceil(tokens / 64));
+          tokens);
 
       const pairAdd = spread(Math.ceil(pairs * pairChannels / 64));
       const singleAdd = spread(Math.ceil(tokens * seqChannels / 64));

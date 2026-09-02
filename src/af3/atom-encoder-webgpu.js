@@ -888,20 +888,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
 @group(0) @binding(5) var<storage, read_write> token_act: array<f32>;
 
+// 🔴 ONE THREAD PER (TOKEN, CHANNEL), NOT PER TOKEN. This used to dispatch
+// ceil(TOKENS/64) workgroups with a thread to a token - ONE workgroup for a
+// 59-residue protein - and each of those threads then walked 768 output
+// channels x 24 atoms x 128 input channels, 2.4M multiply-adds on a single
+// lane. It was 43 ms of the atom encoder's 82: more than the three
+// cross-attention blocks put together, in the pass that only pools their
+// output. Splitting the channel loop across the grid gives 45k work items
+// where there were 59, and consecutive threads read consecutive weight
+// columns, so the reads coalesce as well.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let token = id.x;
-  if (token >= TOKENS) { return; }
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * C_TOKEN) { return; }
+  let token = slot / C_TOKEN;
+  let c = slot % C_TOKEN;
   var count = 0.0;
   for (var atom = 0u; atom < DENSE; atom += 1u) { count += atom_mask[token * DENSE + atom]; }
 
-  for (var c = 0u; c < C_TOKEN; c += 1u) {
+  {
     var total = 0.0;
     for (var atom = 0u; atom < DENSE; atom += 1u) {
-      let slot = token * DENSE + atom;
-      if (atom_mask[slot] == 0.0) { continue; }
-      if (gathers[G_QTA_MASK + slot] == 0) { continue; }
-      let source = u32(max(gathers[G_QTA_IDX + slot], 0));
+      let dense_slot = token * DENSE + atom;
+      if (atom_mask[dense_slot] == 0.0) { continue; }
+      if (gathers[G_QTA_MASK + dense_slot] == 0) { continue; }
+      let source = u32(max(gathers[G_QTA_IDX + dense_slot], 0));
       var value = 0.0;
       for (var d = 0u; d < C; d += 1u) {
         value += act[source * C + d] * queries_mask[source]
@@ -1139,9 +1150,10 @@ export class Af3AtomEncoderGpu {
 
       const maskGroups = lin(queryRows * channels);
       run("mask-act", compiled.maskAct, [queriesMask, act], maskGroups[0], maskGroups[1]);
+      const aggregateGroups = lin(tokens * perTokenChannels);
       run("aggregate", compiled.aggregate,
           [act, queriesMask, gatherBuffer, atomMask, pairWeights, tokenAct],
-          Math.ceil(tokens / 64));
+          aggregateGroups[0], aggregateGroups[1]);
 
       encoder.copyBufferToBuffer(tokenAct.buffer, 0, readbacks.tokenAct.buffer, 0,
                                  tokens * perTokenChannels * 4);
