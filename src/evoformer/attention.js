@@ -476,8 +476,17 @@ export function createAttentionRegisterFlashShader(headDim) {
   const each = (body) => Array.from({ length: vectors }, (_, t) => `    ${body(t)}`).join("\n");
   const declare = (name, init) => Array.from({ length: vectors },
     (_, t) => `  var ${name}${t} = ${init(t)};`).join("\n");
+  // 🔴 EVERY LANE OF A WORKGROUP READS THE SAME KEY AND THE SAME VALUE. The
+  // dispatch gives a workgroup 64 consecutive QUERIES of one (batch, head), and
+  // the key loop runs over the same axis for all of them - so each of the
+  // 2 * head_dim/4 vectors a key needs was fetched by 64 lanes issuing 64
+  // identical global loads. Staged, that is one load and 64 workgroup reads.
+  // AF3's grid attention is the same kernel and the same fix, worth 1.9x there;
+  // see src/af3/grid-attention-webgpu.js.
+  const chunk = Math.max(8, Math.floor(512 / (vectors * 2)));
   return `${COMMON}
 const HD4: u32 = ${vectors}u;
+const KEY_CHUNK: u32 = ${chunk}u;
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
@@ -487,42 +496,68 @@ const HD4: u32 = ${vectors}u;
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
 
+var<workgroup> key_chunk: array<vec4<f32>, ${chunk * vectors}>;
+var<workgroup> value_chunk: array<vec4<f32>, ${chunk * vectors}>;
+
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
   return key_index * p.batch + batch;
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let q_index = id.x;
-  let batch_index = id.y;
-  let head = id.z;
-  if (q_index >= p.queries || batch_index >= p.batch || head >= p.heads) { return; }
-  let q_base = ((batch_index * p.queries + q_index) * p.heads + head) * HD4;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 THE WORKGROUP id, NOT THE GLOBAL ONE, because the uniformity analysis
+  // has to SEE that the batch and the head are workgroup-uniform or it rejects
+  // the barriers below - and a lane past the last query cannot return, because
+  // it has to reach every one of them. It is stopped at the write instead.
+  let local = local_id.x;
+  let q_index = group.x * 64u + local;
+  let batch_index = group.y;
+  let head = group.z;
+  if (batch_index >= p.batch || head >= p.heads) { return; }
+  let live = q_index < p.queries;
+  let q_base = ((batch_index * p.queries + select(0u, q_index, live)) * p.heads + head) * HD4;
 
 ${declare("qv", (t) => `query[q_base + ${t}u]`)}
 ${declare("acc", () => "vec4<f32>(0.0)")}
   var running_max = -1e30;
   var running_sum = 0.0;
 
-  for (var k_index = 0u; k_index < p.queries; k_index += 1u) {
-    let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4;
-    var score = 0.0;
-${each((t) => `score += dot(qv${t}, key[k_base + ${t}u]);`)}
-    var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
-    if (p.has_pair_bias != 0u) {
-      logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+  for (var k0 = 0u; k0 < p.queries; k0 += KEY_CHUNK) {
+    // ...before overwriting the chunk the previous iteration is still reading.
+    workgroupBarrier();
+    for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
+      let k_index = min(k0 + index / HD4, p.queries - 1u);
+      let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
+      key_chunk[index] = key[k_base];
+      value_chunk[index] = value[k_base];
     }
-    logit = clamp(logit, -1e8, 1e8);
-    let new_max = max(running_max, logit);
-    let previous_scale = exp(running_max - new_max);
-    let weight = exp(logit - new_max);
-    running_sum = running_sum * previous_scale + weight;
-    running_max = new_max;
-${each((t) => `acc${t} = acc${t} * previous_scale + weight * value[k_base + ${t}u];`)}
+    workgroupBarrier();
+
+    for (var slot = 0u; slot < KEY_CHUNK; slot += 1u) {
+      let k_index = k0 + slot;
+      if (k_index >= p.queries) { break; }
+      let staged = slot * HD4;
+      var score = 0.0;
+${each((t) => `score += dot(qv${t}, key_chunk[staged + ${t}u]);`)}
+      var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
+      if (p.has_pair_bias != 0u) {
+        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
+      }
+      logit = clamp(logit, -1e8, 1e8);
+      let new_max = max(running_max, logit);
+      let previous_scale = exp(running_max - new_max);
+      let weight = exp(logit - new_max);
+      running_sum = running_sum * previous_scale + weight;
+      running_max = new_max;
+${each((t) => `acc${t} = acc${t} * previous_scale + weight * value_chunk[staged + ${t}u];`)}
+    }
   }
 
+  if (live) {
 ${each((t) => `output[q_base + ${t}u] = (acc${t} / running_sum) * gate[q_base + ${t}u];`)}
+  }
 }`;
 }
 
@@ -704,6 +739,8 @@ ${COMMON}
 @group(0) @binding(7) var<storage, read_write> output: array<f32>;
 var<workgroup> key_tile: array<vec4<f32>, 256>;
 var<workgroup> value_tile: array<vec4<f32>, 256>;
+// One query's eight output vectors, so a lane can index the one it writes.
+var<workgroup> gathered_tile: array<vec4<f32>, 64>;
 
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
@@ -724,7 +761,28 @@ fn main(
   let output_vector = subgroup_lane / 4u;
   let output_component = subgroup_lane % 4u;
   let linear_lane = local.y * 32u + local.x;
-  var accumulated = 0.0;
+  // 🔴 A LANE OWNS A KEY, NOT AN OUTPUT COMPONENT, AND THAT IS THE WHOLE
+  // KERNEL. Weighting the values used to be a 32-iteration loop per lane -
+  // shuffle a neighbour's probability, read that key's component, multiply -
+  // three instructions for every useful multiply-add, and this is the largest
+  // kernel of an AF2 block at depth because column attention is quadratic in
+  // SEQUENCES. Owning a key instead, a lane multiplies ITS probability into all
+  // 32 components with no shuffle at all: eight vec4 reads and eight vector
+  // multiply-adds for thirty-two, and the cross-lane sum happens once at the
+  // end rather than once per key.
+  //
+  // The online softmax survives it: the running maximum and sum are
+  // subgroup-uniform, so every lane rescales its own partial by the same
+  // factor, and summing the partials at the end is the same sum in a different
+  // order.
+  var accumulated_0 = vec4<f32>(0.0);
+  var accumulated_1 = vec4<f32>(0.0);
+  var accumulated_2 = vec4<f32>(0.0);
+  var accumulated_3 = vec4<f32>(0.0);
+  var accumulated_4 = vec4<f32>(0.0);
+  var accumulated_5 = vec4<f32>(0.0);
+  var accumulated_6 = vec4<f32>(0.0);
+  var accumulated_7 = vec4<f32>(0.0);
   var running_max = -1e30;
   var running_sum = 0.0;
 
@@ -760,24 +818,51 @@ fn main(
     let tile_max = subgroupMax(logit);
     let probability = select(0.0, exp(logit - tile_max), valid_query && valid_key);
     let tile_sum = subgroupAdd(probability);
-    var tile_weighted = 0.0;
-    for (var source_lane = 0u; source_lane < 32u; source_lane += 1u) {
-      let source_probability = subgroupShuffle(probability, source_lane);
-      tile_weighted += source_probability
-        * value_tile[output_vector * 32u + source_lane][output_component];
-    }
 
     let new_max = max(running_max, tile_max);
     let previous_scale = exp(running_max - new_max);
     let tile_scale = exp(tile_max - new_max);
-    accumulated = accumulated * previous_scale + tile_weighted * tile_scale;
+    let weight = probability * tile_scale;
+    // ...this lane's own key, so there is nothing to shuffle.
+    accumulated_0 = accumulated_0 * previous_scale + weight * value_tile[subgroup_lane];
+    accumulated_1 = accumulated_1 * previous_scale + weight * value_tile[32u + subgroup_lane];
+    accumulated_2 = accumulated_2 * previous_scale + weight * value_tile[64u + subgroup_lane];
+    accumulated_3 = accumulated_3 * previous_scale + weight * value_tile[96u + subgroup_lane];
+    accumulated_4 = accumulated_4 * previous_scale + weight * value_tile[128u + subgroup_lane];
+    accumulated_5 = accumulated_5 * previous_scale + weight * value_tile[160u + subgroup_lane];
+    accumulated_6 = accumulated_6 * previous_scale + weight * value_tile[192u + subgroup_lane];
+    accumulated_7 = accumulated_7 * previous_scale + weight * value_tile[224u + subgroup_lane];
     running_sum = running_sum * previous_scale + tile_sum * tile_scale;
     running_max = new_max;
     workgroupBarrier();
   }
 
+  // ...the partials meet here, once, instead of once per key.
+  let total_0 = subgroupAdd(accumulated_0);
+  let total_1 = subgroupAdd(accumulated_1);
+  let total_2 = subgroupAdd(accumulated_2);
+  let total_3 = subgroupAdd(accumulated_3);
+  let total_4 = subgroupAdd(accumulated_4);
+  let total_5 = subgroupAdd(accumulated_5);
+  let total_6 = subgroupAdd(accumulated_6);
+  let total_7 = subgroupAdd(accumulated_7);
+  // Every lane holds all eight; one of them lands them where a lane can index
+  // by its own output component.
+  if (subgroup_lane == 0u) {
+    gathered_tile[local.y * 8u + 0u] = total_0;
+    gathered_tile[local.y * 8u + 1u] = total_1;
+    gathered_tile[local.y * 8u + 2u] = total_2;
+    gathered_tile[local.y * 8u + 3u] = total_3;
+    gathered_tile[local.y * 8u + 4u] = total_4;
+    gathered_tile[local.y * 8u + 5u] = total_5;
+    gathered_tile[local.y * 8u + 6u] = total_6;
+    gathered_tile[local.y * 8u + 7u] = total_7;
+  }
+  workgroupBarrier();
+
   if (valid_query) {
     let output_base = ((batch_index * p.queries + q_index) * p.heads + head) * p.head_dim;
+    let accumulated = gathered_tile[local.y * 8u + output_vector][output_component];
     output[output_base + subgroup_lane] = (accumulated / running_sum)
       * gate[output_base + subgroup_lane];
   }
