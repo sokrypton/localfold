@@ -8,12 +8,9 @@ the numbers, so none of it has to be re-derived.
 
 ## Live right now
 
-`57088515`, deployed to https://localfold.org and verified by
+`c057bc63`, deployed to https://localfold.org and verified by
 `python3 tools/deploy.py`, which polls `build.json` until the pushed commit is
-the one being served.
-
-🔴 **THE PAIRFORMER WORK BELOW IS COMMITTED AND NOT YET DEPLOYED.** `3c2b7a8` is
-the head; the site is still serving `57088515`.
+the one being served. Everything below is live.
 
 | | before today | now |
 |---|---|---|
