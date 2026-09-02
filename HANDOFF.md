@@ -194,11 +194,33 @@ and prints a range; trust the range, not a pair.
    materialising the widened intermediate (362 KB at this size) and splitting it
    into two dispatches - which the pair track must NOT do, at 1.47 GB for 600
    tokens. Two code paths for one kernel; judged not worth it yet.
-6. **The network side of weight loading** — 265 MB over 26 shards, unmeasured
-   from a real client; everything here was localhost, where fetch is 31 ms. The
-   fork at `martin-steinegger/alphafold2-webgpu` packs to 8 shards and has
-   download-throttling and progress commits worth mining. Blocked on a real
-   cold-load number.
+6. **Weight loading — done, and here is what it was.** The thread said this was
+   blocked on a real cold-load number. Measured on localfold.org rather than
+   localhost, where fetch is 22 ms and hides everything:
+
+   | | before | after |
+   |---|---|---|
+   | mean download concurrency | 0.68 | **7.32** |
+   | peak concurrency | 1 | **8** (the cap) |
+   | effective throughput | 6.8 MB/s | **34.3 MB/s** |
+   | span for 266 MB | ~20 s | **7.8 s** |
+
+   A shard was only requested when a loader reached a tensor inside it, and the
+   loaders await tensor by tensor - so a cold load was: fetch a shard, sit on
+   the network while it is dequantised, fetch the next. The eight-way limit was
+   never once reached because nothing ever asked for eight.
+   `HttpTensorStore.prefetch()` schedules them all up front, and the page calls
+   it. It also now starts on the first typed sequence rather than on Fold, so
+   the transfer overlaps composing the input: measured, 15 of 26 shards are down
+   four seconds after typing, with the button still untouched.
+
+   **What is left is the bytes, and they are close to irreducible.** 277 MB of
+   int5, served gzipped already, and gzip takes 5% off packed integers. The
+   link caps at about 27 MB/s (serial 14, four-way 27.5, eight-way 26.3 - so
+   four connections already saturate it). Going below 10 s cold means fewer
+   bytes: int4 is the only lever anybody has looked at, and its accuracy cost is
+   unmeasured.
+
 7. **Other Stop-then-retry paths.** A user hit "mergeSearchedChains is not
    defined" by stopping a fold and folding again. Fixed, and the search-reuse
    decision was extracted to `planSearchReuse` with tests - but `af2Cache` and the
