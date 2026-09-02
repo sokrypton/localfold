@@ -41,7 +41,12 @@ function option(args, name, fallback) {
 
 const LENGTH = 59;
 
+import { profileDevice } from "./profile.js";
+
 export async function main(device, args) {
+  // --profile times every labelled compute pass; see tools/gpu/profile.js. The
+  // AF2 and AF3 labels are distinct, so one run splits both stacks.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   for (const flag of ["TRICONTRACT","TRIPROJECT","TRIOUT","TRINORM","GNORM","GBIAS","GPROJ","GATT","GOUT","TRANS","ADD","SINGLE"]) {
     globalThis["__SKIP_" + flag] = args.includes("--skip-" + flag.toLowerCase());
   }
@@ -137,5 +142,8 @@ export async function main(device, args) {
   console.log(`AF3 msa-stack   ${best(msa).toFixed(0)} ms / 4 blocks`
     + `   ${(best(msa) / 4).toFixed(2)} ms per block   (MSA 1 row)`);
   console.log(`AF3 pairformer block is ${(af3Block / af2Block).toFixed(2)}x AF2's evoformer block`);
-  return { tokens: LENGTH, af2Block, af3Block, msaRows: sequences };
+  const gpuPasses = profile === null ? undefined : await profile.report();
+  profile?.restore();
+  return {
+    ...(gpuPasses === undefined ? {} : { gpuPasses }), tokens: LENGTH, af2Block, af3Block, msaRows: sequences };
 }

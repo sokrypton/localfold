@@ -28,7 +28,12 @@
  */
 export function profileDevice(device, options = {}) {
   if (!device.features.has("timestamp-query")) return null;
-  const capacity = options.capacity ?? 4096;
+  // 🔴 4096 IS A DEVICE MAXIMUM, NOT A CHOICE. createQuerySet rejects anything
+  // larger, and the rejection is an uncaptured device error rather than a
+  // throw - so a bench that asked for more simply died with no stack. A stack
+  // with more passes than this loses the tail, which the report's pass counts
+  // make visible.
+  const capacity = Math.min(options.capacity ?? 4096, 4096);
   const querySet = device.createQuerySet({ type: "timestamp", count: capacity });
   const resolved = device.createBuffer({
     size: capacity * 8,
