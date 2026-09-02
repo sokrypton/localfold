@@ -128,7 +128,8 @@ class TriangleMultiplicationGpu {
         ceilDivide(cHidden, shaders.projectTile.columns),
         ceilDivide(pairCount, shaders.projectTile.rows));
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer],
-        ceilDivide(length, 8), ceilDivide(length, 8), cHidden);
+        ceilDivide(length, shaders.contractTile.columns),
+        ceilDivide(length, shaders.contractTile.rows), cHidden);
       runPass("normalize-hidden", normalizeHidden,
         [contracted.buffer, weights.buffer, xNormalized.buffer],
         normalizeGroups[0], normalizeGroups[1]);

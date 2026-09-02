@@ -44,9 +44,53 @@ export function packSingleAttentionWeights(weights) {
   return { data, offsets };
 }
 
+/**
+ * How many workgroups share one token's projection, given how many tokens there
+ * are.
+ *
+ * 🔴 THE TOKEN COUNT IS THE OCCUPANCY HERE, AND IT IS TINY. One workgroup a
+ * token launches 59 of them on a 59-residue chain - 3,776 invocations, on a
+ * part that wants tens of thousands - and the kernel measured 163 GFLOP/s, a
+ * twentieth of what the pair track's projections reach. There are no more
+ * tokens to hand out, so the only axis left is the output width: each split
+ * repeats the token's LayerNorm (384 reads, against the 590k weight reads the
+ * projection does) and takes a slice of q, k, v and the gate.
+ *
+ * 🔴 AND IT IS A FUNCTION OF n, NOT A CONSTANT, because splitting costs the
+ * register blocking it buys occupancy with - each invocation then accumulates
+ * fewer outputs from the same activation read. Measured (tools/gpu/
+ * bench-single-project.js), in milliseconds, best in each row marked:
+ *
+ *     n=30    1: 0.275   2: 0.150   *3: 0.119   6: 0.150
+ *     n=59    1: 0.306  *2: 0.175    3: 0.238   6: 0.263
+ *     n=100   1: 0.363  *2: 0.325    3: 0.425   6: 0.425
+ *     n=128  *1: 0.369   2: 0.519    3: 0.525   6: 0.538
+ *     n=200  *1: 0.675   2: 0.781    3: 0.813
+ *     n=500  *1: 1.481   2: 2.000    3: 2.019
+ *
+ * Every one of those is the smallest split that reaches about 110 workgroups,
+ * which is what this returns.
+ */
+export function singleProjectSplits(n, width) {
+  for (const splits of [1, 2, 3]) {
+    if (width % (64 * splits) !== 0) continue;
+    if (n * splits >= 110) return splits;
+  }
+  return width % (64 * 3) === 0 ? 3 : 1;
+}
+
 export function createSingleAttentionShaders(shape, offsets, epsilon, variance) {
   const { n, channels, heads, dimension } = shape;
   const width = heads * dimension;
+  // 🔴 RESOLVED ONCE AND RETURNED, because the dispatch multiplies by it. A
+  // caller reading the constant while the shader was generated from something
+  // else would project a slice of the width and leave the rest as it found it.
+  const splits = shape.projectSplits ?? singleProjectSplits(n, width);
+  if (width % (64 * splits) !== 0) {
+    throw new Error(`width ${width} is not a multiple of 64 * ${splits} splits`);
+  }
+  const perSplit = width / splits;
+  const perThread = perSplit / 64;
 
   const common = `
 const N: u32 = ${n}u;
@@ -84,7 +128,8 @@ var<workgroup> reduce_b: array<f32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let token = group.x;
+  let token = group.x / ${splits}u;
+  let split = group.x % ${splits}u;
   if (token >= N) { return; }
   let local = local_id.x;
   let base = token * CHANNELS;
@@ -137,23 +182,40 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   // All four are (channels, width): channels first, no transpose_weights.
-  for (var out = local; out < WIDTH; out += 64u) {
-    var q_total = weights[W_QBIAS + out];   // ...and only q has one.
-    var k_total = 0.0;
-    var v_total = 0.0;
-    var gate_total = 0.0;
-    for (var c = 0u; c < CHANNELS; c += 1u) {
-      let x = act[c];
-      q_total += x * weights[W_Q + c * WIDTH + out];
-      k_total += x * weights[W_K + c * WIDTH + out];
-      v_total += x * weights[W_V + c * WIDTH + out];
-      gate_total += x * weights[W_GATE + c * WIDTH + out];
+  //
+  // 🔴 EVERY OUTPUT THIS INVOCATION OWNS IS ACCUMULATED AT ONCE, so the
+  // normalised token is read from workgroup memory once for all of them rather
+  // than once each. Output-outer, channel-inner, it read CHANNELS activations
+  // per output; blocked, it reads them once and buys PER_THREAD * 4 times the
+  // multiply-adds from them.
+  let out0 = split * ${perSplit}u + local;
+  var q_total: array<f32, ${perThread}>;
+  var k_total: array<f32, ${perThread}>;
+  var v_total: array<f32, ${perThread}>;
+  var gate_total: array<f32, ${perThread}>;
+  for (var b = 0u; b < ${perThread}u; b += 1u) {
+    q_total[b] = weights[W_QBIAS + out0 + b * 64u];   // ...and only q has one.
+    k_total[b] = 0.0;
+    v_total[b] = 0.0;
+    gate_total[b] = 0.0;
+  }
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let x = act[c];
+    let row = c * WIDTH;
+    for (var b = 0u; b < ${perThread}u; b += 1u) {
+      let out = row + out0 + b * 64u;
+      q_total[b] += x * weights[W_Q + out];
+      k_total[b] += x * weights[W_K + out];
+      v_total[b] += x * weights[W_V + out];
+      gate_total[b] += x * weights[W_GATE + out];
     }
-    let index = token * WIDTH + out;
-    q[index] = q_total;
-    k[index] = k_total;
-    v[index] = v_total;
-    gate[index] = gate_total;
+  }
+  for (var b = 0u; b < ${perThread}u; b += 1u) {
+    let index = token * WIDTH + out0 + b * 64u;
+    q[index] = q_total[b];
+    k[index] = k_total[b];
+    v[index] = v_total[b];
+    gate[index] = gate_total[b];
   }
 }`;
 
@@ -254,7 +316,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { project, attend, project_out };
+  return { project, attend, project_out, projectSplits: splits };
 }
 
 export class Af3SingleAttentionGpu {
@@ -332,7 +394,8 @@ export class Af3SingleAttentionGpu {
         pass.end();
       };
 
-      runPass("project", project, [singleBuffer, weightBuffer, q, k, v, gate], n);
+      runPass("project", project, [singleBuffer, weightBuffer, q, k, v, gate],
+              n * sources.projectSplits);
       runPass("attend", attend, [q, k, v, logitsBuffer, maskBuffer, gathered], n * heads);
       runPass("project-out", projectOut, [gathered, gate, weightBuffer, output], n);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, n * channels * 4);

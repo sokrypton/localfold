@@ -172,9 +172,11 @@ export class Af3PairformerStackGpu {
     pipelines.singleTransition = await compile(`${base}:single-transition`,
       createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4 },
                              singleTransitionOffsets, epsilon, variance));
-    const singleSources = createSingleAttentionShaders(
+    const { projectSplits, ...singleSources } = createSingleAttentionShaders(
       { n, channels: SINGLE_CHANNELS, heads, dimension: blocks[0].singleAttention.dimension },
       singleOffsets, epsilon, variance);
+    // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
+    pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
       pipelines[`single:${name}`] = await compile(`${base}:single:${name}`, source);
     }
@@ -366,7 +368,7 @@ export class Af3PairformerStackGpu {
 
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],
-         singleScratch[3]], n);
+         singleScratch[3]], n * pipelines.singleProjectSplits);
     run("single.attend", pipelines["single:attend"],
         [singleScratch[0], singleScratch[1], singleScratch[2], pairLogits, seqMask,
          singleScratch[4]], n * heads);

@@ -70,13 +70,14 @@ export async function compilePairTrack(cache, options) {
 
   const pipelines = {};
   for (const direction of ["outgoing", "incoming"]) {
-    const { projectTile, normalizeRows, ...sources } = createTriangleShaders(
+    const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance);
     // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
     pipelines.projectTile = projectTile;
     pipelines.normalizeRows = normalizeRows;
+    pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
       pipelines[`tri:${direction}:${name}`] =
         await cache.get(`${base}:tri:${direction}:${name}`, source);
@@ -137,7 +138,7 @@ export function encodePairTrack(context) {
     run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
         ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
     run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
-        ceil(n, 8), ceil(n, 8), channels);
+        ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
     run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]],
         perNormalizeTile[0], perNormalizeTile[1]);
     run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, scratch[5]],

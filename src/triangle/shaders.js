@@ -67,6 +67,15 @@ function varianceCode(variance, count, at) {
  */
 const PROJECT_TILE = { rows: 32, columns: 16 };
 
+/**
+ * The same idea for the contraction, and it does NOT peak where the projection
+ * does. 32x32 against 8x8 measured 0.162 ms against 0.238 at L=59, 0.80 against
+ * 1.53 at L=128 and 5.25 against 11.4 at L=256; 32x64 and 64x32 tie with it and
+ * 64x64 falls off a cliff at 0.725. See tools/gpu/bench-triangle-project.js,
+ * whose arms take "projection@contraction" for exactly this reason.
+ */
+const CONTRACT_TILE_DEFAULT = { rows: 32, columns: 32 };
+
 export function createTriangleShaders(
   shape,
   precision,
@@ -76,6 +85,7 @@ export function createTriangleShaders(
   variance = "two-pass",
   projectTile = PROJECT_TILE,
   residual = false,
+  contractTile = CONTRACT_TILE_DEFAULT,
 ) {
   if (variance !== "two-pass" && variance !== "fast") {
     throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
@@ -230,8 +240,14 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(4) var<storage, read_write> b: array<f32>;
 
 var<workgroup> tile_source: array<f32, ${rowsPerThread * 64}>;
-${MATRICES.map(([name]) =>
-  `var<workgroup> tile_${name}_weight: array<f32, ${columnsPerThread * 64}>;`).join("\n")}
+// 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
+// separate matrices contracted over the same source, so the four weights a
+// (k, channel) cell needs are always wanted together. Packed as a vec4 the
+// inner loop reads them in ONE instruction and accumulates them in one
+// multiply-add instead of four - the same arithmetic, a quarter of the issue
+// slots. Priced before it was written: replacing these reads with a constant
+// took the kernel from 0.525 ms to 0.375, so they were 29% of it.
+var<workgroup> tile_weight: array<vec4<f32>, ${columnsPerThread * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -241,19 +257,17 @@ fn main(
   let row0 = group.y * TILE_ROWS + local.y;
   let h0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * 8u + local.x;
-${MATRICES.map(([name]) =>
-  `  var ${name}: array<f32, ${rowsPerThread * columnsPerThread}>;`).join("\n")}
+  // Each cell accumulates (a, a's gate, b, b's gate).
+  var acc: array<vec4<f32>, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
     let h = h0 + column * 8u;
-    ${MATRICES.map(([name, , bias]) =>
-      `var ${name}_bias = 0.0;`).join(" ")}
+    var bias = vec4<f32>(0.0);
     if (h < CH) {
-      ${MATRICES.map(([name, , bias]) =>
-        `${name}_bias = ${read(precision, `weights[W_${bias} + h]`)};`).join("\n      ")}
+      bias = vec4<f32>(
+        ${MATRICES.map(([, , name]) => read(precision, `weights[W_${name} + h]`)).join(",\n        ")});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      ${MATRICES.map(([name]) =>
-        `${name}[r * ${columnsPerThread}u + column] = ${name}_bias;`).join("\n      ")}
+      acc[r * ${columnsPerThread}u + column] = bias;
     }
   }
   for (var c0 = 0u; c0 < CZ; c0 += 8u) {
@@ -268,13 +282,14 @@ ${MATRICES.map(([name]) =>
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + column * 8u;
       let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
-      ${MATRICES.map(([name]) => `var ${name}_w = 0.0;`).join(" ")}
+      var packed = vec4<f32>(0.0);
       if (h < CH && weight_c < CZ) {
         let weight_index = h * CZ + weight_c;
-        ${MATRICES.map(([name, weight]) =>
-          `${name}_w = ${read(precision, `weights[W_${weight} + weight_index]`)};`).join("\n        ")}
+        packed = vec4<f32>(
+          ${MATRICES.map(([, name]) =>
+            read(precision, `weights[W_${name} + weight_index]`)).join(",\n          ")});
       }
-      ${MATRICES.map(([name]) => `tile_${name}_weight[slot] = ${name}_w;`).join("\n      ")}
+      tile_weight[slot] = packed;
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
@@ -283,11 +298,9 @@ ${MATRICES.map(([name]) =>
         x[r] = tile_source[r * 64u + local.y * 8u + k];
       }
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-        let slot = k * TILE_COLUMNS + local.x + column * 8u;
-        ${MATRICES.map(([name]) => `let ${name}_w = tile_${name}_weight[slot];`).join("\n        ")}
+        let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
         for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-          let at = r * ${columnsPerThread}u + column;
-          ${MATRICES.map(([name]) => `${name}[at] += x[r] * ${name}_w;`).join("\n          ")}
+          acc[r * ${columnsPerThread}u + column] += x[r] * packed;
         }
       }
     }
@@ -300,7 +313,7 @@ ${MATRICES.map(([name]) =>
   //
   // 🔴 STAGING THE TILE THROUGH WORKGROUP MEMORY TO COALESCE THIS WAS TRIED AND
   // WAS SLOWER. The store does put PAIRS floats between the lanes of a
-  // subgroup, so parking the 16x16 tile in workgroup memory and writing it back
+  // subgroup, so parking the tile in workgroup memory and writing it back
   // indexed by row looks like the obvious fix. Measured interleaved against
   // this version, bitwise-identical output, it lost at every length:
   //   L=64 0.92x   L=128 0.88x   L=192 0.95x   L=256 0.93x   (and 0.74x
@@ -313,10 +326,10 @@ ${MATRICES.map(([name]) =>
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + column * 8u;
       if (h >= CH) { continue; }
-      let at = r * ${columnsPerThread}u + column;
+      let cell = acc[r * ${columnsPerThread}u + column];
       let index = h * PAIRS + row;
-      a[index] = pair_mask * ap[at] * logistic(ag[at]);
-      b[index] = pair_mask * bp[at] * logistic(bg[at]);
+      a[index] = pair_mask * cell.x * logistic(cell.y);
+      b[index] = pair_mask * cell.z * logistic(cell.w);
     }
   }
 }`;
@@ -339,45 +352,77 @@ ${MATRICES.map(([name]) =>
   const loadBTile = direction === "outgoing"
     ? "b[h * PAIRS + j * L + b_k]"
     : "a[h * PAIRS + b_k * L + j]";
+  const CONTRACT_TILE = contractTile;
+  // 🔴 THE CONTRACTION HAD THE WORST READ-TO-ARITHMETIC RATIO IN THE FILE: one
+  // output a thread meant two workgroup reads bought a single multiply-add, and
+  // it ran at 244 GFLOP/s where the projections beside it reach a thousand.
+  // A register block of CONTRACT_TILE / 8 each way buys ROWS * COLUMNS of them
+  // from ROWS + COLUMNS reads. There is occupancy to spend: at 59 tokens and
+  // 128 channels the old shape launched 8,192 workgroups.
+  const contractRows = CONTRACT_TILE.rows / 8;
+  const contractColumns = CONTRACT_TILE.columns / 8;
   const contract = `${common}
+const CONTRACT_ROWS: u32 = ${CONTRACT_TILE.rows}u;
+const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
+
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_a: array<f32, 64>;
-var<workgroup> tile_b: array<f32, 64>;
+var<workgroup> tile_a: array<f32, ${contractRows * 64}>;
+var<workgroup> tile_b: array<f32, ${contractColumns * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  let i = group.y * 8u + local.y;
-  let j = group.x * 8u + local.x;
+  let i0 = group.y * CONTRACT_ROWS + local.y;
+  let j0 = group.x * CONTRACT_COLUMNS + local.x;
   let h = group.z;
   let tile_index = local.y * 8u + local.x;
-  var sum = 0.0;
+  var sum: array<f32, ${contractRows * contractColumns}>;
+  for (var slot = 0u; slot < ${contractRows * contractColumns}u; slot += 1u) { sum[slot] = 0.0; }
 
   for (var k0 = 0u; k0 < L; k0 += 8u) {
     let a_k = k0 + local.x;
     let b_k = k0 + local.y;
-    tile_a[tile_index] = 0.0;
-    tile_b[tile_index] = 0.0;
-    if (i < L && a_k < L) {
-      tile_a[tile_index] = ${loadATile};
+    for (var r = 0u; r < ${contractRows}u; r += 1u) {
+      let i = i0 + r * 8u;
+      var value = 0.0;
+      if (i < L && a_k < L) { value = ${loadATile}; }
+      tile_a[r * 64u + tile_index] = value;
     }
-    if (j < L && b_k < L) {
-      tile_b[tile_index] = ${loadBTile};
+    for (var c = 0u; c < ${contractColumns}u; c += 1u) {
+      let j = j0 + c * 8u;
+      var value = 0.0;
+      if (j < L && b_k < L) { value = ${loadBTile}; }
+      tile_b[c * 64u + tile_index] = value;
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
-      sum += tile_a[local.y * 8u + k] * tile_b[k * 8u + local.x];
+      var left: array<f32, ${contractRows}>;
+      for (var r = 0u; r < ${contractRows}u; r += 1u) {
+        left[r] = tile_a[r * 64u + local.y * 8u + k];
+      }
+      for (var c = 0u; c < ${contractColumns}u; c += 1u) {
+        let right = tile_b[c * 64u + k * 8u + local.x];
+        for (var r = 0u; r < ${contractRows}u; r += 1u) {
+          sum[r * ${contractColumns}u + c] += left[r] * right;
+        }
+      }
     }
     workgroupBarrier();
   }
 
-  if (i < L && j < L) {
-    output[h * PAIRS + i * L + j] = sum;
+  for (var r = 0u; r < ${contractRows}u; r += 1u) {
+    let i = i0 + r * 8u;
+    if (i >= L) { continue; }
+    for (var c = 0u; c < ${contractColumns}u; c += 1u) {
+      let j = j0 + c * 8u;
+      if (j >= L) { continue; }
+      output[h * PAIRS + i * L + j] = sum[r * ${contractColumns}u + c];
+    }
   }
 }`;
 
@@ -493,5 +538,6 @@ fn main(
 }`;
 
   return { normalizeInput, projectAB, contract, normalizeHidden, projectOutput,
-           projectTile: { ...projectTile }, normalizeRows: NORMALIZE_ROWS };
+           projectTile: { ...projectTile }, contractTile: { ...contractTile },
+           normalizeRows: NORMALIZE_ROWS };
 }

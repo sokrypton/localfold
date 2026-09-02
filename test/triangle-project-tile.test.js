@@ -48,11 +48,12 @@ describe("triangle projection tile", () => {
   });
 
   it("sizes the register block from the tile", () => {
-    // Four rows and two columns an invocation, at 32x16.
+    // Four rows and two columns an invocation at 32x16, and one vec4 a cell:
+    // a, b and their two gates share a source and are accumulated together.
     expect(build({ rows: 32, columns: 16 }).projectAB)
-      .toContain("var ap: array<f32, 8>;");
+      .toContain("var acc: array<vec4<f32>, 8>;");
     expect(build({ rows: 16, columns: 16 }).projectAB)
-      .toContain("var ap: array<f32, 4>;");
+      .toContain("var acc: array<vec4<f32>, 4>;");
   });
 
   it("accumulates in the residual form and assigns in the plain one", () => {

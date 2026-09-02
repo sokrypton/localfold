@@ -547,8 +547,10 @@ async function encodeTriangleMultiplication(
     Math.ceil(input.triangleHidden / shaders.projectTile.columns),
     Math.ceil(pairs / shaders.projectTile.rows), 1,
     `triangle.${direction}.project`);
-  execution.dispatch(encoder, contract, [a, b, contracted], Math.ceil(input.length / 8),
-    Math.ceil(input.length / 8), input.triangleHidden, `triangle.${direction}.contract`);
+  execution.dispatch(encoder, contract, [a, b, contracted],
+    Math.ceil(input.length / shaders.contractTile.columns),
+    Math.ceil(input.length / shaders.contractTile.rows),
+    input.triangleHidden, `triangle.${direction}.contract`);
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
     normalizeGroups, 1, 1, `triangle.${direction}.normalize-hidden`);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
