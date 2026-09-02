@@ -39,8 +39,16 @@ values means the whole-stack checker, not that file.
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
+| Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project}.js` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
+AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at
+several shapes interleaved in one process, and costs about a second an arm - and
+each checks every arm's output against the first, because a tile the dispatch
+does not match leaves rows unprocessed and reads as a speedup. Tune with those;
+confirm with `bench-trunk.js`.
 
 ## Measuring, without fooling yourself
 

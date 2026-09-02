@@ -413,11 +413,81 @@ THE REST OF THE FOLD, for scale, all on the same 59-mer:
 | AF2 monomer / multimer load | 1012 / 874 -> 417 / 400 ms |
 
 🔴 **AND BOTH HOT PATHS ARE NOW FLAT, WHICH IS WHERE THE CHEAP WORK ENDS.** The
-head's largest kernel is ffw-out at 21 ms of 134; the trunk's top six are
+head's largest kernel is ffw-out at 21 ms of 134; the trunk's top six were
 pair-transition 84, tri.project 63, tri.project-out 43, grid.project 41,
 grid.attend 40, grid.project-out 39, with no outlier. Everything left is a
 kernel rewrite - tiling both operands in shared memory - rather than a shape
 fix, and the failures listed below are what that has to beat.
+
+## The pairformer's kernels, rewritten for the shape rather than the arithmetic
+
+A trunk pass at 59 tokens and 32 MSA rows went **606 -> 540 ms**, its
+pairformer **482 -> 400**, and AF2's evoformer block **12.6 -> 10.4** (a 48-block
+stack 603 -> 498) because five of these kernels are shared. Nothing computes
+anything different; every checker is unmoved and the denoiser's worst error
+against AF3's own is still 9.22e-6.
+
+| kernel | before | after | what changed |
+|---|---|---|---|
+| pair-transition   | 83.3 | 76.4 | the intermediate walked in chunks |
+| tri.project       | 61.3 | 47.9 | register block 2x2 -> 4x2, and one vec4 a cell |
+| tri.project-out   | 42.8 | 35.2 | the same register block |
+| grid.project      | 41.1 | 38.4 | q/k/v/gate interleaved, read as one vec4 |
+| grid.attend       | 39.0 | 39.4 | untouched - see below |
+| grid.project-out  | 39.1 | 15.6 | a tile of rows, where it was one |
+| single-transition | 28.1 | 29.6 | untouched |
+| tri.contract      | 23.3 | 11.2 | register block, 1 output a thread -> 4x4 |
+| single.project    | 20.4 | 11.1 | the width split over workgroups, outputs blocked |
+| tri.normalize     | 13.7 |  8.3 | the LayerNorm staged, to coalesce |
+| grid.normalize    | 11.8 |  7.4 | the same |
+
+Every one of those is a ratio of reads to multiply-adds or a count of
+workgroups, and every one is measured by a bench that runs in about a second an
+arm - `bench-triangle-project.js`, `bench-grid-project.js`,
+`bench-transition.js`, `bench-single-project.js` - against `bench-trunk.js`'s
+forty seconds and 48-block average. Each checks its arms against the first,
+because a tile the dispatch does not match leaves rows unprocessed and reads as
+a speedup.
+
+🔴 **AND THE NEXT PROTEIN IS NOT THIS ONE. `grid.attend` IS CUBIC IN N.**
+Everything else in the pairformer is quadratic. At 59 tokens the attention is
+39 ms of 400; at 150 tokens it is **564 of 2429**, the largest kernel in the
+trunk by half again, and it keeps growing. A trunk pass at 150 tokens is 2.9 s.
+Anything further should be measured there, not here.
+
+### What was tried on these and lost
+
+- **More than one query per attention invocation.** The attention reads
+  `dimension/4` vectors of k and as many of v per key and does the same number
+  of vector operations with them - one load per multiply-add - and those loads
+  do not depend on the query, so two queries an invocation should halve them.
+  At 150 tokens it was **1.85x slower**, and four queries 3.9x: a query costs
+  `dimension/4` vectors of q plus as many accumulators, so two is already 128
+  floats of register and it spills.
+- **Widening the transition's workgroup to 256 lanes** where the single track
+  has only 59 rows to hand out: 0.728 ms against 128 lanes' 0.591. The
+  LayerNorm's reduction grows a level and 384 channels split unevenly.
+- **Raising the transition's row tile to 8 without chunking the intermediate**:
+  1.77x slower. It fits in the 32 KiB this device grants and leaves one
+  workgroup resident per core.
+- **Blocking the transition's first matmul over i**, on its own: nothing.
+- **Barriers.** Priced by removing them from the projection's k loop: exactly
+  zero. The step stays at 8.
+
+🔴 **AND PRICING A READ BY SUBSTITUTING A CONSTANT OVERSTATES IT.** Replacing
+the projection's weight-tile reads with a constant took it from 0.525 to 0.375
+ms, suggesting 29% to win; packing those four reads into one vec4 - which is as
+far as that goes - was worth 5%. A constant lets the compiler hoist the
+multiply-add too, so the arm measures the read AND the arithmetic that depended
+on it. Useful for ranking, useless as a target.
+
+🔴 **AND ONE ALGEBRAIC IDENTITY IS NOT ONE HERE.** `grid.attend` subtracts 1e9
+from each masked logit inside an `if`. Computing that penalty once per key and
+ADDING it - with `select(-1.0e9, 0.0, masked > 0.0)`, or with a plain `var` set
+in an `if` - is the same expression and measures **relRMS 2.24e-1** against the
+CPU reference where the `if` measures 9.63e-7. Deterministic, and identical to
+the last digit whichever of the two rewrites is used, so it is a real difference
+and not noise. It was not run down. Do not rewrite it.
 
 What paid, in order of size:
 
