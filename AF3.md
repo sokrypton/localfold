@@ -70,10 +70,18 @@ chain reaches 1.10 A and its complex 0.32 A - see the section on the AlphaFold
 Server below. A regression suite of two proteins under 100 residues, both
 folded single-sequence, is not one.
 
-### Speed, 68 tokens
+ ### Speed, 68 tokens
 
-A flow-8 fold is about 7 s, of which the trunk is ~1 s. It was ~150 s when the
-first end-to-end fold ran.
+A flow-8 fold is **3.0 s** - 1.1 s of trunk and 1.7 s of diffusion - and a
+diffusion-200 fold is 25.9 s. It was ~150 s when the first end-to-end fold ran,
+and 7 s before the kernel work of 2026-09-02.
+
+🔴 **A DENOISER CALL COSTS 123 ms INSIDE THE SAMPLER AND 111 ON THE BENCH**
+(24.6 s over 200 steps against tools/gpu/bench-head.js's median). The 12 ms is
+the sampler's own per-step work - a random augmentation of every atom, the
+noise injection, the Euler step and two copies of the coordinates for the
+trajectory callback - and it is 2.4 s of a 200-step fold. Nobody has looked at
+it.
 
 ## Running it
 
