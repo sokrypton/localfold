@@ -22,7 +22,7 @@
  *     node tools/gpu-chrome.mjs tools/gpu/bench-triangle.js --lengths=300,600
  */
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, rmSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, relative, resolve } from "node:path";
@@ -133,6 +133,12 @@ async function main() {
   const profile = join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
   const chrome = spawn(CHROME, [
     "--headless=new", "--enable-unsafe-webgpu", "--disable-gpu-sandbox",
+    // performance.memory rounds to 100 KiB without this, which is too coarse to
+    // see a tensor cache being dropped. It affects nothing else.
+    "--enable-precise-memory-info",
+    // ...and a collection has to be requestable, or a heap reading counts
+    // whatever garbage has not been swept yet and cannot see a cache dropped.
+    "--js-flags=--expose-gc",
     "--no-first-run", "--no-default-browser-check", `--user-data-dir=${profile}`,
     `http://127.0.0.1:${port}/__runner`,
   ], { stdio: ["ignore", "ignore", "pipe"] });
@@ -153,6 +159,17 @@ async function main() {
   chrome.removeAllListeners("exit");
   chrome.kill("SIGKILL");
   server.close();
+
+  // 🔴 AND THEN DELETE THE PROFILE, WHICH THIS DID NOT DO FOR A YEAR. A fresh
+  // user-data-dir per run is right; leaving it behind is not. Each is 3 MiB to
+  // 2.5 GiB depending on how much the run cached, and they accumulate silently
+  // in TMPDIR because macOS only sweeps files untouched for three days and a
+  // busy week never lets them go cold. This machine reached 1265 of them and
+  // 428 GB - a full disk, which surfaces as git failing to write its index and
+  // every redirection producing an empty file, naming nothing.
+  //
+  // rmSync after the kill, not before: Chrome writes on the way out.
+  try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
 
   for (const line of result.logs ?? []) console.log(line);
   if (!result.ok) {
