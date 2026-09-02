@@ -46,6 +46,18 @@ const GRID_WIDTH = 32_768;
  */
 export const PROJECT_ROWS = 8;
 
+/**
+ * How many pair rows one output-projection workgroup handles.
+ *
+ * 🔴 IT WAS ONE, AND THAT KERNEL READ THE WHOLE OUTPUT MATRIX PER ROW. With a
+ * workgroup a row, each of 3481 workgroups pulled all 16,384 weights to project
+ * one row down: 228 MB a pass, two global reads for every multiply-add. Every
+ * row wants the same matrix, so a tile of them divides that traffic by the tile
+ * and the gated activations it needs cost WIDTH floats of workgroup memory
+ * each. Measured on the pair track's shape - see tools/gpu/bench-grid-project.js.
+ */
+export const PROJECT_OUT_ROWS = 8;
+
 const ORDER = [
   "actNormScale", "actNormOffset", "pairBiasProjection",
   "qProjection", "kProjection", "vProjection", "gatingQuery", "outputProjection",
@@ -96,6 +108,13 @@ export function packGridAttentionWeights(weights, shape = undefined) {
 
 export function createGridAttentionShaders(shape, offsets, epsilon, variance, dialect) {
   const { n, channels, heads, dimension, transpose } = shape;
+  // 🔴 THE TILES TRAVEL BACK OUT WITH THE SHADERS, as `tiles`, because the
+  // dispatch divides by exactly these. A caller that reads the constants
+  // instead would still compile against a shader generated from something else
+  // - which is how a kernel here once processed half its rows and reported it
+  // as a speedup.
+  const projectRows = shape.projectRows ?? PROJECT_ROWS;
+  const projectOutRows = shape.projectOutRows ?? PROJECT_OUT_ROWS;
   const width = heads * dimension;
   const pairs = n * n;
   const swapBias = transpose && dialect.swapTransposedBias;
@@ -126,36 +145,84 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
   // direction.
   const sourceRow = transpose ? "(row % N) * N + row / N" : "row";
 
+  // 🔴 A ROW A THREAD IS THE WRONG SHAPE FOR A LAYER NORM. A thread walking its
+  // own row reads addresses CHANNELS * 4 = 512 bytes from its neighbours, so
+  // every lane pulls a cache line to use four bytes of it - measured at about
+  // half this part's memory bandwidth. Staging a tile of rows through workgroup
+  // memory makes both the load and the writeback consecutive-lane-consecutive-
+  // address, and the reduction then runs over the staged copy. The same change
+  // took the triangle stack's input normalisation down by 36%; see the note in
+  // src/triangle/shaders.js.
+  const NORMALIZE_ROWS = 8;
+  const LANES_PER_ROW = 64 / NORMALIZE_ROWS;
   const normalize = `${common}
+const NORMALIZE_ROWS: u32 = ${NORMALIZE_ROWS}u;
+const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
 
+var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${channels}>;
+var<workgroup> partial_sum: array<f32, 64>;
+var<workgroup> partial_squares: array<f32, 64>;
+var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
+var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= PAIRS) { return; }
-  let base = row * CHANNELS;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let base_row = (group.x + group.y * GRID_WIDTH) * NORMALIZE_ROWS;
+  if (base_row >= PAIRS) { return; }
+  let local = local_id.x;
+
+  // 🔴 THE TAIL IS ZEROED, NOT SKIPPED: PAIRS is rarely a multiple of the tile
+  // and the reduction below runs over the whole staged block.
+  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
+    let row = base_row + index / CHANNELS;
+    tile[index] = select(0.0, pair[row * CHANNELS + index % CHANNELS], row < PAIRS);
+  }
+  workgroupBarrier();
+
+  let slot = local / LANES_PER_ROW;
+  let lane = local % LANES_PER_ROW;
   var total = 0.0;
   var squares = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let value = pair[base + c];
+  for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
+    let value = tile[slot * CHANNELS + c];
     total += value;
     squares += value * value;
   }
-  let mean = total / f32(CHANNELS);
-  ${variance === "fast"
-    ? "let variance = squares / f32(CHANNELS) - mean * mean;"
-    : `var variance = 0.0;
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    let d = pair[base + c] - mean;
-    variance += d * d;
+  partial_sum[local] = total;
+  partial_squares[local] = squares;
+  workgroupBarrier();
+  if (lane == 0u) {
+    var row_total = 0.0;
+    var row_squares = 0.0;
+    for (var l = 0u; l < LANES_PER_ROW; l += 1u) {
+      row_total += partial_sum[slot * LANES_PER_ROW + l];
+      row_squares += partial_squares[slot * LANES_PER_ROW + l];
+    }
+    let mean = row_total / f32(CHANNELS);
+    ${variance === "fast"
+      ? "let variance = row_squares / f32(CHANNELS) - mean * mean;"
+      : `var variance = 0.0;
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      let d = tile[slot * CHANNELS + c] - mean;
+      variance += d * d;
+    }
+    variance /= f32(CHANNELS);`}
+    row_mean[slot] = mean;
+    row_inverse_std[slot] = inverseSqrt(variance + EPSILON);
   }
-  variance /= f32(CHANNELS);`}
-  let inverse_std = inverseSqrt(variance + EPSILON);
-  for (var c = 0u; c < CHANNELS; c += 1u) {
-    normalized[base + c] = (pair[base + c] - mean) * inverse_std * weights[W_NORM_SCALE + c]
-      + weights[W_NORM_OFFSET + c];
+  workgroupBarrier();
+
+  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
+    let row = base_row + index / CHANNELS;
+    if (row >= PAIRS) { continue; }
+    let c = index % CHANNELS;
+    normalized[row * CHANNELS + c] =
+      (tile[index] - row_mean[index / CHANNELS]) * row_inverse_std[index / CHANNELS]
+      * weights[W_NORM_SCALE + c] + weights[W_NORM_OFFSET + c];
   }
 }`;
 
@@ -193,7 +260,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // them, so the traffic falls by a factor of ROWS and the intensity rises to
   // it. This is AF2's habit of blocking a projection over a tile rather than a
   // row; measured, it is the largest remaining cost in the pairformer.
-  const ROWS = PROJECT_ROWS;
+  const ROWS = projectRows;
   const overRows = (body) => Array.from({ length: ROWS }, (_, r) => body(r)).join("\n");
   const project = `${common}
 const ROWS: u32 = ${ROWS}u;
@@ -331,35 +398,55 @@ ${unroll((t) => `  gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
 
   // Gate, project down, and undo the transpose so the residual lands on the
   // orientation it came from.
+  const OUT_ROWS = projectOutRows;
+  const overOutRows = (body) =>
+    Array.from({ length: OUT_ROWS }, (_, r) => body(r)).join("\n");
   const project_out = `${common}
+const OUT_ROWS: u32 = ${OUT_ROWS}u;
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
 @group(0) @binding(1) var<storage, read> gate: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> gated: array<f32, ${width}>;
+// OUT_ROWS gated rows, so one read of the output matrix serves all of them.
+var<workgroup> gated: array<f32, ${width} * ${OUT_ROWS}>;
 
 @compute @workgroup_size(${width})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= PAIRS) { return; }
+  let first = (group.x + group.y * GRID_WIDTH) * OUT_ROWS;
+  if (first >= PAIRS) { return; }
   let local = local_id.x;
-  let index = row * WIDTH + local;
-  gated[local] = gathered[index] * logistic(gate[index]);
+
+  // 🔴 THE TAIL IS ZEROED, NOT SKIPPED, for the reason the projection kernel
+  // gives: PAIRS is rarely a multiple of the tile, and uninitialised workgroup
+  // memory would reach real rows sharing the tile.
+  for (var r = 0u; r < OUT_ROWS; r += 1u) {
+    let row = first + r;
+    let index = select(0u, row * WIDTH + local, row < PAIRS);
+    gated[r * ${width}u + local] =
+      select(0.0, gathered[index] * logistic(gate[index]), row < PAIRS);
+  }
   workgroupBarrier();
 
-  let destination = ${transpose ? "(row % N) * N + row / N" : "row"};
   for (var c = local; c < CHANNELS; c += WIDTH) {
-    var sum = 0.0;
+${overOutRows((r) => `    var sum${r} = 0.0;`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
-      sum += gated[w] * weights[W_OUT + w * CHANNELS + c];
+      // Consecutive threads read consecutive channels, and this one load is
+      // then used OUT_ROWS times.
+      let weight = weights[W_OUT + w * CHANNELS + c];
+${overOutRows((r) => `      sum${r} += gated[${r}u * ${width}u + w] * weight;`)}
     }
-    output[destination * CHANNELS + c] = sum;
+${overOutRows((r) => `    if (first + ${r}u < PAIRS) {
+      let row${r} = first + ${r}u;
+      let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};
+      output[destination${r} * CHANNELS + c] = sum${r};
+    }`)}
   }
 }`;
 
-  return { normalize, bias: biasPass, project, attend, project_out };
+  return { normalize, bias: biasPass, project, attend, project_out,
+           tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS } };
 }
 
 export class Af3GridSelfAttentionGpu {
@@ -445,16 +532,18 @@ export class Af3GridSelfAttentionGpu {
       };
 
       runPass("normalize", normalize, [pairBuffer, weightBuffer, normalized],
-              linear2d(Math.ceil(pairs / 64)));
+              linear2d(Math.ceil(pairs / sources.tiles.normalizeRows)));
       runPass("bias", bias, [normalized, weightBuffer, biasBuffer],
               linear2d(Math.ceil(pairs / 64)));
       // One workgroup per tile of PROJECT_ROWS pair rows - see the kernel.
       runPass("project", project, [normalized, weightBuffer, q, k, v, gate],
-              linear2d(Math.ceil(pairs / PROJECT_ROWS)));
+              linear2d(Math.ceil(pairs / sources.tiles.projectRows)));
       // One thread per (query, row, head) - see the note on the kernel.
       runPass("attend", attend, [q, k, v, biasBuffer, maskBuffer, gathered],
               [Math.ceil(n / 64), n, heads]);
-      runPass("project-out", projectOut, [gathered, gate, weightBuffer, output], linear2d(pairs));
+      // One workgroup per tile of PROJECT_OUT_ROWS pair rows - see the kernel.
+      runPass("project-out", projectOut, [gathered, gate, weightBuffer, output],
+              linear2d(Math.ceil(pairs / sources.tiles.projectOutRows)));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * channels * 4);
 
       const start = performance.now();

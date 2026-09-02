@@ -30,7 +30,17 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
-const WORKGROUP = 128;
+/**
+ * 🔴 128 EVEN WHERE THE ROWS RUN OUT, WHICH IS NOT WHAT IT LOOKS LIKE. One
+ * workgroup a row means the pairformer's SINGLE transition launches 59 of them
+ * on a 59-residue chain - 7,552 invocations on a part that wants tens of
+ * thousands - so widening the workgroup looks like the only lever left. It is
+ * slower: 256 lanes measured 0.728 ms against 128 lanes' 0.591 on exactly that
+ * shape. The LayerNorm's tree reduction grows a level, and the second matmul
+ * hands 384 channels to 256 lanes, so half of them do two and half do one.
+ * `shape.width` still overrides it, for tools/gpu/bench-transition.js.
+ */
+const DEFAULT_WORKGROUP = 128;
 
 /**
  * How many rows one workgroup transitions at once, given how many there are.
@@ -53,6 +63,25 @@ export function transitionRowTile(rows) {
   }
   return 1;
 }
+
+/**
+ * How much of the widened intermediate is resident in workgroup memory at once.
+ *
+ * 🔴 HALF, WHICH IS NEITHER THE LARGEST NOR THE SMALLEST THAT FITS. The chunk
+ * sets two things against each other: it is the whole of this kernel's
+ * workgroup memory, so a smaller one leaves more workgroups resident per core,
+ * and it is also how many slots one invocation accumulates at once, so a larger
+ * one reads the normalised tile fewer times. Measured on the pair track's shape
+ * - 3481 rows, 512 intermediate, tile 4 - the whole intermediate is 1.559 ms,
+ * half is 1.525, a quarter is 1.569, against 1.653 before the kernel was
+ * chunked at all. The curve is shallow and it has an interior minimum, which is
+ * why this is a function rather than "as small as possible".
+ */
+export function transitionChunk(intermediate, width = DEFAULT_WORKGROUP) {
+  const half = intermediate / 2;
+  return half >= width && half % width === 0 ? half : intermediate;
+}
+
 const GRID_WIDTH = 32_768;
 
 /** The packing order of the four tensors this kernel reads. */
@@ -75,6 +104,20 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   const { rows, channels, factor } = shape;
   const intermediate = channels * factor;
   const tile = shape.tile ?? transitionRowTile(rows);
+  const WORKGROUP = shape.width ?? DEFAULT_WORKGROUP;
+  const chunk = shape.chunk ?? transitionChunk(intermediate, WORKGROUP);
+  if (intermediate % chunk !== 0) {
+    throw new Error(`chunk ${chunk} does not divide intermediate ${intermediate}`);
+  }
+  // The second matmul gives each invocation this many output channels, and one
+  // accumulator per (channel, tile row) has to survive the chunk loop.
+  const channelsPerThread = Math.ceil(channels / WORKGROUP);
+  if (chunk % WORKGROUP !== 0) {
+    throw new Error(`chunk ${chunk} is not a multiple of the workgroup ${WORKGROUP}`);
+  }
+  const slotsPerThread = chunk / WORKGROUP;
+  const accumulator = channelsPerThread === 1 ? "t" : "out_slot * TILE + t";
+  const writeAccumulator = channelsPerThread === 1 ? "t" : "write_slot * TILE + t";
   // The fast variance is the trunk's; the atom and diffusion stacks want the
   // two-pass one. See the note in src/triangle/shaders.js.
   const varianceCode = variance === "fast"
@@ -104,6 +147,8 @@ const CHANNELS: u32 = ${channels}u;
 const INTERMEDIATE: u32 = ${intermediate}u;
 const WORKGROUP: u32 = ${WORKGROUP}u;
 const TILE: u32 = ${tile}u;
+const CHUNK: u32 = ${chunk}u;
+const BLOCK: u32 = ${slotsPerThread}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const EPSILON: f32 = ${epsilon};
 const W_SCALE: u32 = ${offsets.inputLayerNormScale}u;
@@ -116,7 +161,7 @@ const W_T2: u32 = ${offsets.transition2}u;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 var<workgroup> normalized: array<f32, ${tile * channels}>;
-var<workgroup> gated: array<f32, ${tile * intermediate}>;
+var<workgroup> gated: array<f32, ${tile * chunk}>;
 var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
 var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;
 
@@ -174,40 +219,75 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // transition1 is (channels, intermediate * 2), so a column is strided by the
   // full doubled width. Gate half first, value half second.
+  //
+  // 🔴 THE INTERMEDIATE IS WALKED IN CHUNKS SO THAT THE ROW TILE COSTS NOTHING.
+  // gated is the whole of this kernel's workgroup memory - TILE * 512 floats
+  // for the pair track - and holding all of it is what capped the tile at four:
+  // tile 8 fits in the 32 KiB this device grants and measured 1.77x SLOWER,
+  // because 20 KiB a workgroup leaves one resident per core. The contraction
+  // below only ever reads gated in the order it is written, so a chunk can be
+  // produced, consumed into the output accumulators, and overwritten. Shared
+  // memory then depends on CHUNK rather than INTERMEDIATE, and the tile buys
+  // its halved weight traffic without spending occupancy for it.
   let wide = INTERMEDIATE * 2u;
-  for (var i = local; i < INTERMEDIATE; i += WORKGROUP) {
-    var gate: array<f32, ${tile}>;
-    var value: array<f32, ${tile}>;
-    for (var t = 0u; t < TILE; t += 1u) { gate[t] = 0.0; value[t] = 0.0; }
+  var sum: array<f32, ${tile * channelsPerThread}>;
+  for (var s = 0u; s < ${tile * channelsPerThread}u; s += 1u) { sum[s] = 0.0; }
+
+  for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += CHUNK) {
+    // ...before overwriting the chunk the previous iteration is still reading.
+    workgroupBarrier();
+    // 🔴 EVERY SLOT THIS INVOCATION OWNS IS ACCUMULATED AT ONCE, so the tile's
+    // normalised values are read from workgroup memory once for all of them
+    // rather than once each. The loop used to be slot-outer, channel-inner:
+    // TILE shared reads and two weight reads bought 2 * TILE multiply-adds.
+    // Blocked, BLOCK * 2 weight reads and the same TILE shared reads buy
+    // BLOCK * 2 * TILE. CHUNK is what sets BLOCK, which is why the chunk that
+    // wins is not simply the smallest one that fits.
+    var gate: array<f32, ${tile * slotsPerThread}>;
+    var value: array<f32, ${tile * slotsPerThread}>;
+    for (var s = 0u; s < ${tile * slotsPerThread}u; s += 1u) { gate[s] = 0.0; value[s] = 0.0; }
     for (var c = 0u; c < CHANNELS; c += 1u) {
       let column = W_T1 + c * wide;
-      // ...read once, used TILE times. That ratio is the point.
-      let wg = weights[column + i];
-      let wv = weights[column + INTERMEDIATE + i];
-      for (var t = 0u; t < TILE; t += 1u) {
-        let x = normalized[t * CHANNELS + c];
-        gate[t] += x * wg;
-        value[t] += x * wv;
+      var x: array<f32, ${tile}>;
+      for (var t = 0u; t < TILE; t += 1u) { x[t] = normalized[t * CHANNELS + c]; }
+      for (var b = 0u; b < BLOCK; b += 1u) {
+        // ...read once, used TILE times. That ratio is the point.
+        let i = chunk0 + local + b * WORKGROUP;
+        let wg = weights[column + i];
+        let wv = weights[column + INTERMEDIATE + i];
+        for (var t = 0u; t < TILE; t += 1u) {
+          gate[b * TILE + t] += x[t] * wg;
+          value[b * TILE + t] += x[t] * wv;
+        }
       }
     }
-    for (var t = 0u; t < TILE; t += 1u) {
-      gated[t * INTERMEDIATE + i] = swish(gate[t]) * value[t];
+    for (var b = 0u; b < BLOCK; b += 1u) {
+      for (var t = 0u; t < TILE; t += 1u) {
+        gated[t * CHUNK + local + b * WORKGROUP] = swish(gate[b * TILE + t]) * value[b * TILE + t];
+      }
+    }
+    workgroupBarrier();
+
+    // transition2 is (intermediate, channels).
+    var out_slot = 0u;
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      for (var slot = 0u; slot < CHUNK; slot += 1u) {
+        let w = weights[W_T2 + (chunk0 + slot) * CHANNELS + c];
+        for (var t = 0u; t < TILE; t += 1u) {
+          sum[${accumulator}] += gated[t * CHUNK + slot] * w;
+        }
+      }
+      out_slot += 1u;
     }
   }
-  workgroupBarrier();
 
-  // transition2 is (intermediate, channels).
+  var write_slot = 0u;
   for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    var sum: array<f32, ${tile}>;
-    for (var t = 0u; t < TILE; t += 1u) { sum[t] = 0.0; }
-    for (var i = 0u; i < INTERMEDIATE; i += 1u) {
-      let w = weights[W_T2 + i * CHANNELS + c];
-      for (var t = 0u; t < TILE; t += 1u) { sum[t] += gated[t * INTERMEDIATE + i] * w; }
-    }
     for (var t = 0u; t < TILE; t += 1u) {
       let row = base_row + t;
-      if (row < ROWS) { output[row * CHANNELS + c] = sum[t]; }
+      if (row < ROWS) { output[row * CHANNELS + c] = sum[${writeAccumulator}]; }
     }
+    write_slot += 1u;
   }
 }`;
 }

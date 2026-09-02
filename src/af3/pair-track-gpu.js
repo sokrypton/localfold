@@ -22,7 +22,7 @@
 import { createTriangleShaders } from "../triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
-import { createGridAttentionShaders, packGridAttentionWeights, PROJECT_ROWS }
+import { createGridAttentionShaders, packGridAttentionWeights }
   from "./grid-attention-webgpu.js";
 import { createTransitionShader, packTransitionWeights, transitionRowTile }
   from "./transition-webgpu.js";
@@ -70,8 +70,13 @@ export async function compilePairTrack(cache, options) {
 
   const pipelines = {};
   for (const direction of ["outgoing", "incoming"]) {
-    const sources = createTriangleShaders(
+    const { projectTile, normalizeRows, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance);
+    // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
+    // its dispatch by exactly this, so the two cannot drift apart the way a
+    // constant repeated in both places did once - see src/triangle/shaders.js.
+    pipelines.projectTile = projectTile;
+    pipelines.normalizeRows = normalizeRows;
     for (const [name, source] of Object.entries(sources)) {
       pipelines[`tri:${direction}:${name}`] =
         await cache.get(`${base}:tri:${direction}:${name}`, source);
@@ -79,9 +84,10 @@ export async function compilePairTrack(cache, options) {
   }
   for (const [key, attention, transpose] of
        [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]) {
-    const sources = createGridAttentionShaders(
+    const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose },
       gridOffsets, epsilon, variance, dialect);
+    pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
       pipelines[`grid:${key}:${name}`] = await cache.get(`${base}:grid:${key}:${name}`, source);
     }
@@ -125,25 +131,29 @@ export function encodePairTrack(context) {
   for (const direction of ["outgoing", "incoming"]) {
     const w = weights[direction];
     const p = (name) => pipelines[`tri:${direction}:${name}`];
-    run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]], ceil(pairs, 64));
+    const perNormalizeTile = spread(ceil(pairs, pipelines.normalizeRows));
+    run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]],
+        perNormalizeTile[0], perNormalizeTile[1]);
     run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
-        ceil(channels, 16), ceil(pairs, 16));
+        ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
     run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
         ceil(n, 8), ceil(n, 8), channels);
-    run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]], ceil(pairs, 64));
+    run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]],
+        perNormalizeTile[0], perNormalizeTile[1]);
     run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, scratch[5]],
-        ceil(channels, 16), ceil(pairs, 16));
+        ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
     addPair(scratch[5]);
   }
 
   for (const [key, w] of [["false", weights.grid1], ["true", weights.grid2]]) {
     const p = (name) => pipelines[`grid:${key}:${name}`];
     const linear = spread(ceil(pairs, 64));
-    run("grid.normalize", p("normalize"), [pair, w, scratch[0]], linear[0], linear[1]);
+    const perNormalize = spread(ceil(pairs, pipelines.gridTiles.normalizeRows));
+    run("grid.normalize", p("normalize"), [pair, w, scratch[0]], perNormalize[0], perNormalize[1]);
     run("grid.bias", p("bias"), [scratch[0], w, biasBuffer], linear[0], linear[1]);
-    const perPair = spread(pairs);
-    // One workgroup per tile of PROJECT_ROWS pair rows - see the kernel.
-    const perTile = spread(ceil(pairs, PROJECT_ROWS));
+    const perOutTile = spread(ceil(pairs, pipelines.gridTiles.projectOutRows));
+    // One workgroup per tile of pair rows - see the kernel.
+    const perTile = spread(ceil(pairs, pipelines.gridTiles.projectRows));
     run("grid.project", p("project"),
         [scratch[0], w, scratch[1], scratch[2], scratch[3], scratch[4]], perTile[0], perTile[1]);
     // 🔴 THE GRID TRACK'S HEAD COUNT, not the single track's. They differ, 4
@@ -156,7 +166,7 @@ export function encodePairTrack(context) {
         [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[5]],
         ceil(n, 64), n, gridHeads);
     run("grid.project-out", p("project_out"), [scratch[5], scratch[4], w, scratch[6]],
-        perPair[0], perPair[1]);
+        perOutTile[0], perOutTile[1]);
     addPair(scratch[6]);
   }
 

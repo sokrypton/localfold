@@ -109,22 +109,33 @@ class TriangleMultiplicationGpu {
         pass.dispatchWorkgroups(x, y, zGroups);
         pass.end();
       };
+      const linearDispatch2d = (groups) =>
+        [Math.min(groups, LINEAR_GRID_WIDTH), ceilDivide(groups, LINEAR_GRID_WIDTH)];
       const linearDispatch = (elements) => {
         const groups = ceilDivide(elements, 64);
         return [Math.min(groups, LINEAR_GRID_WIDTH), ceilDivide(groups, LINEAR_GRID_WIDTH)];
       };
 
-      runPass("normalize-input", normalizeInput, [z.buffer, weights.buffer, zNormalized.buffer], ceilDivide(pairCount, 64));
+      // ...divided by the rows the staged LayerNorm carries, which the shaders
+      // report rather than this file assuming.
+      const normalizeGroups = linearDispatch2d(ceilDivide(pairCount, shaders.normalizeRows));
+      runPass("normalize-input", normalizeInput, [z.buffer, weights.buffer, zNormalized.buffer],
+        normalizeGroups[0], normalizeGroups[1]);
+      // ...divided by the tile the shaders were GENERATED with, not by a
+      // constant of this file's own. See the note on PROJECT_TILE.
       runPass("project-ab", projectAB,
         [zNormalized.buffer, mask.buffer, weights.buffer, a.buffer, b.buffer],
-        ceilDivide(cHidden, 16), ceilDivide(pairCount, 16));
+        ceilDivide(cHidden, shaders.projectTile.columns),
+        ceilDivide(pairCount, shaders.projectTile.rows));
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer],
         ceilDivide(length, 8), ceilDivide(length, 8), cHidden);
       runPass("normalize-hidden", normalizeHidden,
-        [contracted.buffer, weights.buffer, xNormalized.buffer], ceilDivide(pairCount, 64));
+        [contracted.buffer, weights.buffer, xNormalized.buffer],
+        normalizeGroups[0], normalizeGroups[1]);
       runPass("project-output", projectOutput,
         [zNormalized.buffer, xNormalized.buffer, weights.buffer, output.buffer],
-        ceilDivide(cZ, 16), ceilDivide(pairCount, 16));
+        ceilDivide(cZ, shaders.projectTile.columns),
+        ceilDivide(pairCount, shaders.projectTile.rows));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairCount * cZ * 4);
 
       const start = performance.now();

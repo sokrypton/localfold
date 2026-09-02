@@ -513,6 +513,13 @@ async function encodeTriangleMultiplication(
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
   const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction);
+  // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
+  // replacement on the finished WGSL; when the kernel's writeback was rewritten
+  // the pattern stopped matching, and a replacement that matches nothing throws
+  // nothing - the block would have OVERWRITTEN the pair representation instead
+  // of adding to it, on the shipped AF2 path only.
+  const residualShaders = createTriangleShaders(
+    shape, "f32", packed.offsets, 1e-5, direction, "two-pass", shaders.projectTile, true);
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`;
   const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
@@ -521,9 +528,7 @@ async function encodeTriangleMultiplication(
     execution.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
     execution.pipelines.get(
       `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
-      residualTarget === undefined ? shaders.projectOutput : shaders.projectOutput.replace(
-        "output[index] = projected * logistic(gate);", "output[index] += projected * logistic(gate);",
-      ),
+      residualTarget === undefined ? shaders.projectOutput : residualShaders.projectOutput,
     ),
   ]);
   const pairs = input.length * input.length;
@@ -534,18 +539,21 @@ async function encodeTriangleMultiplication(
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
   const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
-  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], Math.ceil(pairs / 64), 1, 1,
+  const normalizeGroups = Math.ceil(pairs / shaders.normalizeRows);
+  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], normalizeGroups, 1, 1,
     `triangle.${direction}.normalize-input`);
   let grid = execution.linearGrid(pairs * input.triangleHidden);
   execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
-    Math.ceil(input.triangleHidden / 16), Math.ceil(pairs / 16), 1,
+    Math.ceil(input.triangleHidden / shaders.projectTile.columns),
+    Math.ceil(pairs / shaders.projectTile.rows), 1,
     `triangle.${direction}.project`);
   execution.dispatch(encoder, contract, [a, b, contracted], Math.ceil(input.length / 8),
     Math.ceil(input.length / 8), input.triangleHidden, `triangle.${direction}.contract`);
-  execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized], Math.ceil(pairs / 64), 1, 1,
-    `triangle.${direction}.normalize-hidden`);
+  execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
+    normalizeGroups, 1, 1, `triangle.${direction}.normalize-hidden`);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
-    Math.ceil(input.cZ / 16), Math.ceil(pairs / 16), 1,
+    Math.ceil(input.cZ / shaders.projectTile.columns),
+    Math.ceil(pairs / shaders.projectTile.rows), 1,
     `triangle.${direction}.output`);
   return output;
 }
