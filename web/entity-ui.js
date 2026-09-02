@@ -544,8 +544,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       field.className = "entity-field";
       field.append(mirror, value);
     }
+    // 🔴 A ROW WITHOUT AN OPTIONS BUTTON STILL OCCUPIES ITS COLUMN. The grid
+    // has five, and a DNA row - which has no modifications to open - was
+    // appending four children, so its remove button slid up into the options
+    // column and sat six pixels left of every other row's. An empty cell keeps
+    // the column, which is what the placeholder is for.
+    const optionsCell = options ?? document.createElement("span");
     wrapper.append(type, copies, ...(picker === null ? [] : [picker]), field,
-                   ...(options === null ? [] : [options]), remove);
+                   optionsCell, remove);
     paint();
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
     return wrapper;
