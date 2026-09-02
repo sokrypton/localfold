@@ -59,11 +59,18 @@ export function setMemoryBudget(device, budgetBytes) {
 /**
  * A budget for a device nobody has measured, from what the browser will admit.
  *
- * `navigator.deviceMemory` is system RAM in GiB, rounded down to a power of two
- * and capped at 8 by Chromium - so it understates a big machine and is roughly
- * right about a small one, which is the direction that matters. A third of it
+ * `navigator.deviceMemory` is system RAM in GiB, rounded down to a power of two:
+ * this 16 GiB Mac reports 16, and a phone reports 4 or less. A third of it
  * leaves room for the browser, the driver and the system, which on unified
- * memory are all spending the same pool.
+ * memory are all spending the same pool - 5461 MiB here, against the 1390 MiB
+ * a 31-residue fold actually holds, and 1365 MiB on a 4 GiB phone, which is
+ * under it. That is the machine this exists for.
+ *
+ * 🔴 IT IS A GUESS AND IT IS ALLOWED TO BE WRONG, in either direction: too
+ * high and the fallback never fires on a machine that needed it, too low and a
+ * fold that would have fitted runs slower. What it must not do is report a
+ * number nobody checked as if it were a device limit, which is why the only
+ * thing it is used for is choosing between two paths that both work.
  */
 export function budgetForDevice(fallbackGiB = 4) {
   const gib = (typeof navigator === "object" && navigator !== null
