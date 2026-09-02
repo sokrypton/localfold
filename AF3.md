@@ -19,6 +19,18 @@ in the Model dropdown.
 - **Two samplers.** *Flow* (default) draws once at the top of the schedule and
   walks it down deterministically, ~8 calls. *Diffusion* is AF3's own stochastic
   sampler, 20+ steps. Both are seeded.
+- **DNA and RNA chains**, as their own entity types. A standard nucleotide is
+  ONE TOKEN PER RESIDUE, so this needed no tokeniser change - only teaching the
+  featuriser that a chain has a KIND, because `ACGT` is a valid protein as well
+  as a valid DNA chain and nothing about the letters says which. Checked
+  array-by-array against AF3 for protein+DNA, protein+RNA and a three-chain
+  complex; folded geometry checked by `tools/gpu/probe-nucleic.js` (bond ratio
+  1.013 DNA, 1.009 RNA, against 1.017 for the protein control). Their reference
+  conformers are `src/af3/reference-conformers-nucleic.js`, generated from the
+  oracle rather than typed. No MSA: AF3 searches an RNA database this page has
+  no server for, and DNA gets none in AF3 either.
+- **Modified residues** on protein chains; modified BASES are refused, since the
+  modified-residue path resolves parents through the amino-acid table.
 - **Recycles** for AF3 as well as AF2.
 - **MSAs**, through the page's own alignment controls - search, paste or upload,
   shared with both AlphaFold 2 models. `src/af3/msa-features.js` is the whole of
@@ -292,6 +304,26 @@ dropped bond but a stick drawn to a real atom somewhere else. Fixed in py2Dmol's
 belong to the embed build. Drive the app's own colour `<select>` instead.
 Writing `renderer.colors` directly is overwritten on the next recompute.
 
+### The two traps nucleic acids set
+
+🔴 **AN A3M COLUMN IS NOT A TOKEN INDEX.** `msa.set(row, ...)` copies an
+alignment row in flat, which is right for exactly as long as one token means
+one residue. A modified residue is ten tokens, so from the first one onward
+every column of the alignment sat over the wrong residue - silently, with every
+array still the right shape. It survived because the two features were tested
+apart: the modified-residue work was checked without an alignment and every
+alignment dump was a plain protein. ONE DUMP WITH BOTH FOUND IT. The batch now
+carries a residue->column map and the msa, the deletion matrix and the profile
+all read through it.
+
+🔴 **THE PSEUDO-BETA IS C4 FOR A PURINE AND C2 FOR A PYRIMIDINE**, read out of
+AF3's own gather rather than reasoned about. C1' is the plausible wrong answer -
+the sugar carbon the base hangs off - and it disagreed. It has to be decided by
+BASE rather than by name, because a pyrimidine has a C4 as well, so matching the
+name alone takes the wrong atom in three components of five. And a nucleotide's
+extra terminal atom is at the OTHER END from a protein's: OP3 at the 5-prime,
+where a protein takes OXT at its last residue.
+
 ## Performance, and what has already been tried
 
 The pairformer went 3468 ms -> 621 ms over 48 blocks at 59-68 tokens, and AF3's
@@ -348,6 +380,12 @@ unexplained. That is the next lead and it is a small one.
 - **Templates raise** rather than compute: the geometry features are
   unverifiable without a reference.
 - **AF3's block is still 1.09x AF2's** for strictly less work.
+- **No RNA alignment.** AF3's pipeline searches an RNA database; single-sequence
+  is what an RNA chain gets here, and the status line says so. The seam is
+  ready for one - featuriseProtein reads the MSA by ALIGNMENT COLUMN now, and
+  a nucleic chain's columns are simply absent from a protein A3M.
+- **No modified bases**, and no nucleic ligand bonds: a DNA chain and a ligand
+  in the same job are two separate molecules to the featuriser.
 
 ## Pairing, as the server actually returns it
 
