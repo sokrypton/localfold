@@ -20,39 +20,46 @@
  * A off the chemistry AF3 was given, not off some other reference.
  *
  * Runs in a browser, because the native Dawn binding does not load on this
- * machine. Import it from the page and call sweepLigandFlow.
+ * machine:
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/probe-ligand-flow.js \
+ *       --ligand=HEM --sigmas=2560,640,160,56,16 --steps=2,4,6,8,16
  *
  * WHAT IT FOUND, on HEM alone (50 bonds, one seed a cell, recycles 0), as
- * rms/max bond error in angstroms:
+ * rms/max bond error in angstroms, AFTER the diffusion head's weight-name fix
+ * (see AF3.md, "Fixed: the side chains were compressed"):
  *
- *     sigma0 |    2 steps     4 steps     6 steps     8 steps
- *       2560 | 0.446/0.87  0.267/0.80  0.190/0.64  0.218/0.83
- *        640 | 0.368/1.00  0.198/0.67  0.218/0.79  0.187/0.69
- *        160 | 0.360/1.05  0.241/0.78  0.163/0.60  0.129/0.45
- *         56 | 0.312/0.92  0.199/0.70  0.138/0.54  0.102/0.38
- *         16 | 0.190/0.65  0.208/0.65  0.116/0.49  0.061/0.17
+ *     sigma0 |  2 steps    4 steps    6 steps    8 steps   16 steps
+ *       2560 | 0.401/.92  0.270/.78  0.198/.66  0.202/.72  0.168/.61
+ *        640 | 0.324/.90  0.252/.73  0.210/.70  0.187/.65  0.069/.20
+ *        160 | 0.311/.86  0.229/.73  0.188/.65  0.160/.59  0.047/.15
+ *         56 | 0.342/.93  0.220/.74  0.164/.64  0.153/.60  0.043/.11
+ *         16 | 0.233/.71  0.185/.66  0.115/.50  0.044/.12  0.043/.11
  *
- * AF3's own top of schedule needs 16 steps to reach 0.065/0.15 and does not
- * improve at 32. Starting at sigma0 = 16 gets there in EIGHT. Below 16 the
- * curve is flat - 8 and 4 both give 0.060 - so the knee is at sigma_data, and
- * across three seeds it is steady (0.071, 0.071, 0.059 against 0.218 thrice).
+ * The knee is still at sigma_data: sigma0 = 16 reaches in EIGHT steps what
+ * AF3's own top of schedule does not reach in sixteen. What the fix changed is
+ * the top of the table - 2560 used to get to 0.065 by sixteen steps and now
+ * plateaus at 0.168, so the SPREAD between a high and a low start is wider
+ * against the correct weights, not narrower.
  *
- * 🔴 AND IT IS NOT A DEFAULT. The same sigma0 = 16 destroys a protein: the
- * 59-mer comes out with a CA-CA of 3.21 A instead of 3.88 and a radius of
- * gyration of 6.7 A instead of 12.6 - collapsed into a ball - at pLDDT 43.8
- * against 55.6, and sixteen steps does not rescue it (3.39 A, 8.0 A). The skip
- * weight is sigma_d^2/(sigma^2+sigma_d^2), which is 1/2 at sigma = sigma_d: above
- * it the denoiser mostly ignores the coordinates it is given, below it mostly
- * trusts them. Starting at sigma_d therefore spends every call refining and none
- * exploring - which is exactly right for a lone ligand, whose chemistry is
- * local, and fatal for a chain that has to find a fold first.
+ * 🔴 AND IT IS STILL NOT A DEFAULT. probe-sigma0.js scores the same starts
+ * against crystal structures: sigma0 = 16 costs 1QYS 0.26 A of backbone RMSD
+ * and a whole seed's worth of variance (1.10 A mean, one seed at 1.70), because
+ * the skip weight sigma_d^2/(sigma^2+sigma_d^2) is 1/2 at sigma = sigma_d -
+ * above it the denoiser mostly ignores the coordinates it is given, below it
+ * mostly trusts them. Starting at sigma_d spends every call refining and none
+ * exploring: exactly right for a lone ligand, whose chemistry is local, and
+ * wrong for a chain that has to find a fold first.
  *
- * sigma0 = 160 is the setting that is safe for both: the protein is unchanged
- * (CA-CA 3.88, pLDDT 54.7) and the ligand improves from 0.218 to 0.129 at eight
- * steps.
+ * sigma0 = 160 is the setting that is defensible for both: 0.047 against 0.168
+ * on the ligand at sixteen steps, for 0.025 A of backbone RMSD on 1QYS.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
+import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { diffusionWeights, atomReference, targetFeatureWeights }
+  from "../../src/af3/diffusion-weights.js";
 
 /** sigmaMax is in units of sigmaData, so the walk starts at sigmaData*sigmaMax. */
 const SIGMA_DATA = 16;
@@ -141,4 +148,36 @@ export async function sweepLigandFlow(options) {
     }
   }
   return rows;
+}
+
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+export async function main(device, args) {
+  const codes = option(args, "ligand", "HEM").split(",");
+  const components = [];
+  for (const code of codes) {
+    const response = await fetch(ccdUrl(code));
+    if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
+    components.push(parseCcdComponent(await response.text()));
+  }
+
+  const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
+                                   { fetchImplementation: fetch });
+  const weights = {
+    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
+    confidence: await confidenceWeights(store), atomReference: await atomReference(store),
+    targetFeat: await targetFeatureWeights(store),
+  };
+
+  return sweepLigandFlow({
+    device, weights, components,
+    sequence: option(args, "sequence", ""),
+    startSigmas: option(args, "sigmas", "2560,640,160,56,16").split(",").map(Number),
+    stepCounts: option(args, "steps", "2,4,6,8,16").split(",").map(Number),
+    seed: Number(option(args, "seed", "20260831")),
+    recycles: Number(option(args, "recycles", "0")),
+  });
 }

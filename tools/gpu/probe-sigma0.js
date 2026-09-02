@@ -17,20 +17,28 @@
  * look like an improvement in it. RMSD and TM against the deposited structure
  * are the numbers AF3.md records, so they are the numbers a default moves on.
  *
- * WHAT IT FOUND, at flow 8 over four seeds, mean RMSD (range) and TM:
+ * WHAT IT FOUND, at flow 8 over four seeds, mean RMSD (range) and TM, AFTER the
+ * diffusion head's weight-name fix (see AF3.md):
  *
  *     sigma0 | 6MRR (68 res)              | 1QYS (92 res)
- *       2560 | 0.703 [0.65-0.77]  TM .950 | 0.862 [0.85-0.88]  TM .948
- *        640 | 0.709 [0.68-0.78]  TM .949 | 0.878 [0.86-0.90]  TM .947
- *        160 | 0.712 [0.69-0.75]  TM .949 | 0.905 [0.89-0.92]  TM .944
+ *       2560 | 0.701 [0.65-0.76]  TM .950 | 0.841 [0.82-0.87]  TM .951
+ *        640 | 0.701 [0.66-0.78]  TM .951 | 0.851 [0.84-0.87]  TM .950
+ *        160 | 0.708 [0.67-0.76]  TM .950 | 0.866 [0.85-0.88]  TM .948
+ *         16 | 0.740 [0.66-0.83]  TM .949 | 1.101 [0.81-1.70]  TM .919
  *
- * 🔴 SO THE DEFAULT DID NOT MOVE. sigma0 = 160 looked free on 6MRR and on the
- * pLDDT of one 59-mer, and it is not: on 1QYS it costs 0.04 A monotonically,
- * with seed ranges that do not overlap the default's. That is small, and it is
- * a real regression paid by every protein fold to help a ligand - so the flow
- * keeps AF3's own top of schedule, and a caller who wants a lower one passes
- * `schedule` explicitly. The lesson is the one this file opens with: pLDDT and
- * CA-CA agreed the change was free, and the crystals did not.
+ * 🔴 THE DEFAULT STILL DID NOT MOVE, AND THE PENALTY SHRANK. Against the wrong
+ * weights sigma0 = 160 cost 1QYS 0.043 A with seed ranges that did not overlap
+ * the default's; against the right ones it costs 0.025 A and they do overlap.
+ * It is still monotonic and still a real regression paid by every protein fold
+ * to help a ligand - so the flow keeps AF3's own top of schedule, and a caller
+ * who wants a lower one passes `schedule` explicitly. sigma0 = 16, which is
+ * where a lone ligand's bonds resolve fastest, is where a protein comes apart:
+ * 0.26 A worse on average and one seed at 1.70.
+ *
+ * 🔴 AND EVERY NUMBER HERE MOVED WHEN A WEIGHT NAME CHANGED. The pre-fix table
+ * ranked the same three starts in the same order at almost the same values,
+ * which is exactly why a sampler sweep is no evidence that the model under it
+ * is right. Run tools/gpu/probe-head-vs-af3-steps.js first.
  *
  * 🔴 AND THE COMPARISON IS CA-ONLY, BY RESIDUE INDEX. Both benchmark chains are
  * single-chain and complete, so the correspondence is the identity - no

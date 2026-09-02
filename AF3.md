@@ -440,7 +440,25 @@ through the loader does not check the loader.
 After the fix the head reproduces AF3 to about 1e-6 at all twenty noise levels
 from 4608 A down to 0.03, and the bond ratios agree to three decimals.
 
-🔴 **AND EVERY SAMPLER MEASUREMENT ABOVE PREDATES THE FIX.** The sigma0 sweep,
-the ligand-flow knee at sigma_data, the flow-versus-diffusion step counts and
-the 160 A default were all measured against a denoiser that was 3-6% wrong at
-every noise level. They should be re-run before any of them is trusted again.
+🔴 **AND EVERY SAMPLER MEASUREMENT PREDATED THE FIX.** The sigma0 sweep, the
+ligand-flow knee at sigma_data, the flow-versus-diffusion step counts and the
+160 A default were all measured against a denoiser that was 3-6% wrong at every
+noise level. Two have been re-run and their docstrings now carry the new
+tables; what changed is worth reading, because it is a lesson about what a
+sampler sweep can and cannot tell you:
+
+- **The rankings did not move.** sigma0 still trades a ligand's bond lengths
+  against a protein's backbone in the same direction, with the knee still at
+  sigma_data. A sweep that ranks settings is nearly blind to whether the model
+  underneath is the right one.
+- **The magnitudes did.** On 1QYS the 160 A default cost 0.043 A before and
+  0.025 A after, and the seed ranges that used to be disjoint now overlap. On
+  HEM at sixteen steps AF3's own top of schedule got WORSE, 0.065 to 0.168,
+  while 160 A improved to 0.047 - so the gap the default exists to close is
+  wider against the correct weights, not narrower.
+- **pLDDT moved most of all**, 6MRR to 85.8 and 1QYS to 79.8 from the high
+  fifties, which is the clearest single sign that the weights were wrong: the
+  confidence head was reading a structure the trunk did not predict.
+
+Still to re-run: the flow-versus-diffusion step counts, and the ligand-only
+HEM-forms-by-8-steps observation the default was chosen from.
