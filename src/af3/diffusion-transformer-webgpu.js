@@ -895,7 +895,7 @@ export class Af3DiffusionTransformerGpu {
       // orders passes within an encoder, so batching them changes nothing about
       // what runs, only how many times the CPU asks the driver to run it.
       validation.begin();
-      const encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
+      let encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
       const run = (label, pipeline, buffers, x, y = 1) => {
         const pass = encoder.beginComputePass({ label });
         pass.setPipeline(pipeline);
@@ -909,10 +909,35 @@ export class Af3DiffusionTransformerGpu {
         pass.end();
       };
       const projections = [];
-      for (const group of weights.superBlocks) {
+      // The uploads a super-block owns, released once its commands are queued.
+      const pending = [];
+      let submits = 0;
+      /**
+       * Queue what has been encoded and let its weight uploads be reused.
+       *
+       * 🔴 RELEASING AFTER THE SUBMIT IS SAFE, AND RELEASING BEFORE IT IS NOT.
+       * The allocator RECYCLES a released buffer, so handing one back while a
+       * later block's pass is still being encoded against it would give that
+       * block the same memory. Once the commands are queued the ordering does
+       * the rest: allocator.upload writes through device.queue.writeBuffer,
+       * which is ordered against work already submitted, so a recycled buffer
+       * is only overwritten after the passes reading it have run. This is the
+       * pairformer stack's idiom, for the same reason.
+       */
+      const flush = (label) => {
+        this.device.queue.submit([encoder.finish()]);
+        validation.end(label);
+        for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
+        pending.length = 0;
+        submits += 1;
+        validation.begin();
+        encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
+      };
+      for (const [groupIndex, group] of weights.superBlocks.entries()) {
         const projection = this.allocator.upload("difftx.pair-projection",
           group.pairLogitsProjection, storage);
         projections.push(projection);
+        if (!this.residentWeights) pending.push(projection);
         for (let inner = 0; inner < group.blocks.length; inner += 1) {
           const block = group.blocks[inner];
           // 🔴 THE SAME TRADE AS THE PAIRFORMER'S, AND THE SAME ANSWER: TRY IT
@@ -933,18 +958,10 @@ export class Af3DiffusionTransformerGpu {
             // object decodes again if anything reads it after this.
             releaseWeights(block);
           } else {
-            // 🔴 AND THIS PATH'S PEAK IS WORSE THAN THE RESIDENT ONE IT REPLACES.
-            // All twenty-four blocks are encoded into ONE command buffer, so an
-            // upload cannot be released inside the loop - the pool would hand
-            // the same buffer to the next block, which is still being encoded
-            // against it - and 24 x 31.5 MiB is 756 MiB held at once, against
-            // 630 resident. Measured: a 31-residue fold completes at an 800 MiB
-            // ceiling and is refused at 600, where the trunk's 567 MiB of
-            // residency is still held when the head starts. Fixing it means
-            // submitting per super-block here so the uploads can be recycled,
-            // which is the pairformer's idiom and is not done.
+            // ...held only until this super-block is submitted; see flush().
             blockWeights = keep(this.allocator.upload("difftx.block",
               packBlockWeights(block).data, storage));
+            pending.push(blockWeights);
           }
           const pairGroups = Math.ceil(pairs / 64);
           run("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
@@ -967,11 +984,21 @@ export class Af3DiffusionTransformerGpu {
               [gatedBuffer, condBuffer, blockWeights, actBuffer],
               Math.ceil(tokens / outTile), sources.outSplits);
         }
+        // 🔴 ONE SUBMIT FOR THE WHOLE STACK WHEN THE WEIGHTS ARE RESIDENT, AND
+        // ONE PER SUPER-BLOCK WHEN THEY ARE NOT. Batching all twenty-four
+        // blocks into one command buffer is worth a lot at small token counts,
+        // where the driver call is most of what the stack costs - but it also
+        // means no upload can be released until the end, and the uploading path
+        // then holds all twenty-four at once: 24 x 31.5 MiB is 756 MiB, MORE
+        // than the 630 of residency it was called in to avoid. Four blocks at a
+        // time bounds that at a super-block, which is the whole point of
+        // falling back. Resident runs are untouched and still submit once.
+        if (!this.residentWeights) flush(`super-block ${groupIndex}`);
       }
       // ...and the readback rides the same submit.
       encoder.copyBufferToBuffer(actBuffer.buffer, 0, readback.buffer, 0, tokens * channels * 4);
       this.device.queue.submit([encoder.finish()]);
-      validation.end("block stack");
+      validation.end(submits === 0 ? "block stack" : "readback");
       // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
       // LOOP. They are pooled, so releasing one while a later block's encoded
       // pass still refers to it would hand the same buffer to that block's
