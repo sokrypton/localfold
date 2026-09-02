@@ -80,10 +80,11 @@ export class Af3MsaStackGpu {
 
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
                        pairChannels: PAIR_CHANNELS };
-    const { pairsPerGroup, ...opmSources } = createOuterProductMeanShaders(
+    const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
       opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
-    // ...the contraction's dispatch divides by this; see the note on its kernel.
-    pipelines.opmPairsPerGroup = pairsPerGroup;
+    // ...the contraction's dispatch is one workgroup per (i, j) block of token
+    // pairs; see the note on its kernel.
+    pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
     for (const [name, source] of Object.entries(opmSources)) {
       pipelines[`opm:${name}`] = await compile(`${base}:opm:${name}`, source);
     }
@@ -117,6 +118,9 @@ export class Af3MsaStackGpu {
         "af3-msa.bias", gridHeads * pairs * 4, storage));
       const left = keep(this.allocator.allocate("af3-msa.left", rows * outerChannels * 4, storage));
       const right = keep(this.allocator.allocate("af3-msa.right", rows * outerChannels * 4, storage));
+      // ...the outer product's denominator, computed once per pass rather than
+      // carried through its contraction; see outer-product-mean-webgpu.js.
+      const opmCounts = keep(this.allocator.allocate("af3-msa.opm-counts", pairs * 4, storage));
       const keyMask = keep(this.allocator.allocate("af3-msa.key-mask", n * 4, storage));
       const attention = keep(this.allocator.allocate(
         "af3-msa.attention", msaHeads * pairs * 4, storage));
@@ -138,7 +142,7 @@ export class Af3MsaStackGpu {
         await this.#encodeBlock({
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
-          left, right, keyMask, attention, msaScratch,
+          left, right, opmCounts, keyMask, attention, msaScratch,
         });
         options.onBlock?.(index);
       }
@@ -167,7 +171,7 @@ export class Af3MsaStackGpu {
   async #encodeBlock(context) {
     const { block, n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads } = context;
     const { pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer } = context;
-    const { left, right, keyMask, attention, msaScratch } = context;
+    const { left, right, opmCounts, keyMask, attention, msaScratch } = context;
 
     const blockAllocations = [];
     const upload = (label, data) => {
@@ -210,9 +214,12 @@ export class Af3MsaStackGpu {
     const rowGroups = spread(ceil(rows, 64));
     run("opm.project", pipelines["opm:project"],
         [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
-    const perPairTile = spread(ceil(pairs, pipelines.opmPairsPerGroup));
+    const countGroups = spread(ceil(pairs, 64));
+    run("opm.counts", pipelines["opm:counts"], [msaMask, opmCounts],
+        countGroups[0], countGroups[1]);
+    const perBlock = spread(pipelines.opmBlocks);
     run("opm.contract", pipelines["opm:contract"],
-        [left, right, msaMask, opmWeights, scratch[0]], perPairTile[0], perPairTile[1]);
+        [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
     const addPairGroups = spread(ceil(pairs * PAIR_CHANNELS, 64));
     run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
 
