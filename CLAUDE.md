@@ -43,6 +43,7 @@ values means the whole-stack checker, not that file.
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
+| How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
 | Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
 
