@@ -1,3 +1,5 @@
+import { noteAllocation, noteDestroy } from "./device-memory.js";
+
 export class AllocatedGpuBuffer {
   buffer;
   byteLength;
@@ -39,7 +41,14 @@ export class GpuBufferAllocator {
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
     const key = `${byteLength}:${usage}`;
     const pooled = this.#pool.get(key);
-    const buffer = pooled?.pop() ?? this.device.createBuffer({ label, size: byteLength, usage });
+    let buffer = pooled?.pop();
+    if (buffer === undefined) {
+      // ...counted before it is created, so a refusal costs nothing and the
+      // caller learns which tensor did not fit. A POOLED buffer is already on
+      // the device and was counted when it was made.
+      noteAllocation(this.device, label, byteLength);
+      buffer = this.device.createBuffer({ label, size: byteLength, usage });
+    }
     if (pooled?.length === 0) this.#pool.delete(key);
     this.#currentBytes += byteLength;
     this.#peakBytes = Math.max(this.#peakBytes, this.#currentBytes);
@@ -71,11 +80,18 @@ export class GpuBufferAllocator {
       this.#pool.set(key, pooled);
     } else {
       buffer.destroy();
+      noteDestroy(this.device, byteLength);
     }
   }
 
   destroyPooled() {
-    for (const buffers of this.#pool.values()) for (const buffer of buffers) buffer.destroy();
+    for (const [key, buffers] of this.#pool.entries()) {
+      const byteLength = Number(key.slice(0, key.indexOf(":")));
+      for (const buffer of buffers) {
+        buffer.destroy();
+        noteDestroy(this.device, byteLength);
+      }
+    }
     this.#pool.clear();
   }
 

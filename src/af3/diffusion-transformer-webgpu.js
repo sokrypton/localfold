@@ -33,6 +33,7 @@
  * src/triangle/shaders.js for why that cannot be a global.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { noteAllocation } from "../runtime/device-memory.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
@@ -88,9 +89,11 @@ function residentBlockBuffer(device, block, pack) {
     // 🔴 NOT THROUGH allocator.upload, WHOSE ALLOCATIONS ARE POOLED AND
     // RECYCLED at the end of the run that made them. This one has to outlive
     // every run, so it is created directly and never released.
+    const size = Math.ceil(packedBlock.data.byteLength / 4) * 4;
+    noteAllocation(device, "difftx.block.resident", size);
     buffer = device.createBuffer({
       label: "difftx.block.resident",
-      size: Math.ceil(packedBlock.data.byteLength / 4) * 4,
+      size,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     device.queue.writeBuffer(buffer, 0, packedBlock.data.buffer,

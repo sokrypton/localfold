@@ -11,6 +11,8 @@
  * the request cannot fail: requestDevice rejects a limit BETTER than the
  * adapter's, not one equal to it.
  */
+import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
+
 const RAISED_LIMITS = [
   // The MSA activations at a large complex: rows x residues x channels x 4.
   "maxStorageBufferBindingSize",
@@ -27,7 +29,12 @@ const RAISED_LIMITS = [
   "maxComputeWorkgroupStorageSize",
 ];
 
-export async function requestAlphaFoldDevice(adapter) {
+/**
+ * @param {{memoryBudgetBytes?: number}} [options] a ceiling on what this device
+ *   may hold, in bytes. Omitted, the device is only counted, not bounded;
+ *   `null` asks for the default guess from budgetForDevice.
+ */
+export async function requestAlphaFoldDevice(adapter, options = {}) {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
   const optional = ["subgroups", "subgroup-size-control", "timestamp-query"];
   const requiredFeatures = optional.filter(
@@ -40,5 +47,15 @@ export async function requestAlphaFoldDevice(adapter) {
       requiredLimits[name] = available;
     }
   }
-  return adapter.requestDevice({ requiredFeatures, requiredLimits });
+  const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  // 🔴 A DEVICE THAT ACCEPTS AN ALLOCATION IT CANNOT AFFORD FREEZES THE MACHINE.
+  // Metal takes buffers well past the point where macOS starts paging, and a
+  // phone's driver takes them and is then killed by the system - in neither
+  // case does WebGPU report anything. src/runtime/device-memory.js turns that
+  // into a GpuMemoryBudgetError naming the tensor, but only for a device that
+  // has been given a ceiling, which is this.
+  if ("memoryBudgetBytes" in options) {
+    setMemoryBudget(device, options.memoryBudgetBytes ?? budgetForDevice());
+  }
+  return device;
 }

@@ -17,6 +17,8 @@
  * at the end of the run that made them. These have to outlive every run, so
  * they are created directly and never released.
  */
+import { noteAllocation } from "./device-memory.js";
+
 const byDevice = new WeakMap();
 
 /**
@@ -39,9 +41,11 @@ export function residentWeightBuffer(device, key, label, pack) {
   const found = forKey.get(label);
   if (found !== undefined) return found;
   const data = pack();
+  const size = Math.ceil(data.byteLength / 4) * 4;
+  noteAllocation(device, label, size);
   const buffer = device.createBuffer({
     label,
-    size: Math.ceil(data.byteLength / 4) * 4,
+    size,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);

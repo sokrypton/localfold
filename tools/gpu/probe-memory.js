@@ -18,6 +18,7 @@ import { targetFeatureWeights, diffusionWeights, atomReference } from "../../src
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
+import { memorySnapshot } from "../../src/runtime/device-memory.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -44,7 +45,14 @@ export async function main(device, args) {
   const manifestUrl = option(args, "model", "/model-af3-full-f32/manifest.json");
   const stages = [];
   const note = async (label, extra = {}) => {
-    stages.push({ label, heapMiB: Number(((await heap()) / MIB).toFixed(1)), ...extra });
+    const gpu = memorySnapshot(device);
+    stages.push({
+      label,
+      heapMiB: Number(((await heap()) / MIB).toFixed(1)),
+      gpuMiB: Number((gpu.residentBytes / MIB).toFixed(1)),
+      gpuPeakMiB: Number((gpu.peakBytes / MIB).toFixed(1)),
+      ...extra,
+    });
   };
 
   await note("start");

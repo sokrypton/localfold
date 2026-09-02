@@ -34,6 +34,7 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -1135,8 +1136,9 @@ export class Af3AtomEncoderGpu {
       const size = Math.ceil(bytes / 4) * 4;
       const found = staticCache[label];
       if (found !== undefined && found.size === size) return { buffer: found };
-      found?.destroy();
+      if (found !== undefined) { found.destroy(); noteDestroy(this.device, found.size); }
       buildStatic = true;
+      noteAllocation(this.device, label, size);
       const buffer = this.device.createBuffer({
         label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
       });

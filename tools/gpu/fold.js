@@ -13,7 +13,7 @@
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { memorySnapshot } from "../../src/runtime/device-memory.js";import { featuriseProtein } from "../../src/af3/featurise.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
@@ -304,5 +304,7 @@ export async function main(device, args) {
     iptm: Number.isNaN(result.iptm) ? null : result.iptm,
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
     gyration, seconds: elapsed, pdb: result.pdb, trajectory,
+    // What the device is holding at the end, which nothing else reports.
+    memory: memorySnapshot(device),
   };
 }

@@ -74,7 +74,11 @@ export function getDevice() {
     if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
-    return requestAlphaFoldDevice(adapter);
+    // 🔴 THE PAGE IS THE ONE CALLER THAT HAS TO SURVIVE BEING WRONG. A bench
+    // that asks for too much should fail loudly and does; a page that asks for
+    // too much takes the machine down with it, so this is where the ceiling is
+    // set. `null` takes the guess in device-memory.js from navigator.deviceMemory.
+    return requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
   })();
   return devicePromise;
 }
