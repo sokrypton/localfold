@@ -405,9 +405,12 @@
   color: #111827;
 }
 
-/* One line to start with, draggable taller: a sequence is long, but six
-   entities two lines deep each is a wall before anything has been folded. */
-.entity-value-protein { height: 34px; min-height: 34px; resize: vertical; }
+/* 🔴 TWO LINES FOR A SEQUENCE, ONE FOR A LIGAND, AND THE HEIGHT IS SET HERE
+   RATHER THAN BY `rows`. A textarea's rows attribute loses to an explicit
+   height, so setting rows=2 in entity-ui.js alone changed nothing - both have
+   to agree. Two lines is 13px at 1.35 twice, plus 8px of padding either side
+   and the border: 52px. A ligand really is five characters and keeps one. */
+.entity-value-protein { height: 52px; min-height: 52px; resize: vertical; }
 .entity-value-ligand { height: 34px; text-transform: uppercase; }
 
 .entity-value:hover { border-color: #9ca3af; }

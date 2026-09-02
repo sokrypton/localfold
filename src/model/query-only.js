@@ -5,6 +5,7 @@ import { EvoformerStackGpu, ExtraMsaPairStackGpu } from "../evoformer/stack.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { StructureModuleGpu } from "../structure/module.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { af2Plan, planTotal } from "../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
 import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
@@ -134,13 +135,31 @@ export class AlphaFoldQueryOnlyGpu {
       // IPA iterations inside the second - and the confidence heads, which report
       // twice. As one step each the structure module and the heads left the bar
       // sitting at 89% for the longest part of a long fold.
+      // 🔴 AND WEIGHTED BY WHAT EACH COSTS, or counting them evenly just moves
+      // the stall. An evoformer block at depth is a hundred IPA iterations, and
+      // the two stacks run at different depths from each other.
+      // src/runtime/cost-model.js has the fits and the measurements.
       const STRUCTURE_STEPS = 11;    // initialize, 8 iterations, sidechains, geometry
       const CONFIDENCE_STEPS = 2;    // reading back, then scoring
-      const blocksPerPass = weights.extraStack.length + weights.mainStack.length;
-      const totalSteps = recycleFeatures.length * (blocksPerPass + STRUCTURE_STEPS + CONFIDENCE_STEPS);
+      const plan = af2Plan({
+        length, extraRows: recycleFeatures[0] .extraSequences ?? 1,
+        mainRows: recycleFeatures[0] .msaSequences ?? 1,
+        extraBlocks: weights.extraStack.length,
+        mainBlocks: weights.mainStack.length,
+        passes: recycleFeatures.length,
+        structureSteps: STRUCTURE_STEPS, confidenceSteps: CONFIDENCE_STEPS,
+      });
+      const unitsOf = (name) => plan.stages.find((stage) => stage.name === name).units;
+      const EXTRA_BLOCK = unitsOf("extra-stack");
+      const MAIN_BLOCK = unitsOf("main-stack");
+      const STRUCTURE_STEP = unitsOf("structure");
+      const CONFIDENCE_STEP = unitsOf("confidence");
+      const totalSteps = planTotal(plan);
       let completed = 0;
-      const step = (count = 1) => {
-        completed += count;
+      // A caller may report a stage by NAME rather than a cost; see the note in
+      // src/model/monomer.js, where doing the obvious thing failed a fold.
+      const step = (count) => {
+        completed += Number.isFinite(count) ? count : STRUCTURE_STEP;
         onProgress?.({ completed, total: totalSteps, waiting: false });
       };
       // ...AND A PHASE, which is the honest report for work whose length is not
@@ -208,7 +227,7 @@ export class AlphaFoldQueryOnlyGpu {
           // ...WHEN THE DEVICE FINISHES A BLOCK, not when one is queued. The stack
           // queues all 48 ahead, so anything counted at encode time arrives in
           // the first moment and tells the reader nothing.
-          onBlockDone: () => step(),
+          onBlockDone: () => step(EXTRA_BLOCK),
           onStage: (stage) => waiting(stage === "gpu"),
         }), signal);
         const trunk = await withAbort(new EvoformerStackGpu(this.device).run({
@@ -229,7 +248,7 @@ export class AlphaFoldQueryOnlyGpu {
           // ...WHEN THE DEVICE FINISHES A BLOCK, not when one is queued. The stack
           // queues all 48 ahead, so anything counted at encode time arrives in
           // the first moment and tells the reader nothing.
-          onBlockDone: () => step(),
+          onBlockDone: () => step(MAIN_BLOCK),
           onStage: (stage) => waiting(stage === "gpu"),
         }), signal);
         throwIfAborted(signal);
@@ -250,7 +269,7 @@ export class AlphaFoldQueryOnlyGpu {
         throwIfAborted(signal);
         const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, trunk.pair, length, weights.lddt, weights.pae, paeBreaks,
-          () => step(),
+          () => step(CONFIDENCE_STEP),
           signal,
           recycleOptions.chainLengths,
         ), signal);
@@ -277,8 +296,11 @@ export class AlphaFoldQueryOnlyGpu {
       // ...OVERFLOW ONLY. Block completions arrive as promises resolve, so the
       // last few may land after this line - falling short here is timing, not a
       // miscount. Going OVER the budget is always a bug, and that is worth saying.
-      if (onProgress !== undefined && completed > totalSteps) {
-        console.warn(`progress reported ${completed} steps against a budget of ${totalSteps}`);
+      // ...with a per-cent of slack, because the units are now costs rather
+      // than counts and a float sum of them will not land exactly on the total.
+      if (onProgress !== undefined && completed > totalSteps * 1.01) {
+        console.warn(`progress reported ${completed.toFixed(0)} units`
+          + ` against a budget of ${totalSteps.toFixed(0)}`);
       }
       return { recycles: results, final: results[results.length - 1], elapsedMilliseconds: performance.now() - start };
     } finally {

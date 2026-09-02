@@ -78,9 +78,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.placeholder = "CCD code, e.g. HEM";
       value.setAttribute("aria-label", "Ligand CCD code");
     } else {
-      // One line by default, and the user can drag it taller. A sequence is
-      // long, but a list of six entities each two lines deep is a wall.
-      value.rows = 1;
+      // Two lines by default, and the user can drag it taller. One line was too
+      // mean for the thing this box is actually for - a sequence of a few
+      // hundred residues shows a sliver of itself - and a ligand, which really
+      // is five characters, has its own one-line input above rather than
+      // sharing this control.
+      value.rows = 2;
       value.placeholder = "Paste a protein sequence";
       value.setAttribute("aria-label", "Protein sequence");
     }

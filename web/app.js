@@ -41,7 +41,7 @@ import { confidenceJson, paeMatrix, predictionToPdb, safeJobName }
 import { complexSequenceProblem } from "./sequence.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
-
+import { describeRemaining, RuntimeEstimator } from "../src/runtime/cost-model.js";
 const element = (id) => {
   const value = document.getElementById(id);
   if (value === null) throw new Error(`missing element #${id}`);
@@ -176,8 +176,19 @@ function progress(fraction) {
     bar.removeAttribute("value");
     return;
   }
+  // 🔴 A BAR MUST NOT BE ABLE TO FAIL A FOLD. HTMLProgressElement throws on a
+  // non-finite value - "the provided double value is non-finite" - and that
+  // exception unwinds through the progress callback into the prediction, which
+  // then reports a failure for a fold that was running perfectly. One undefined
+  // alignment depth in the cost model did exactly that. The model no longer
+  // produces one, and this makes it not matter if it ever does again.
+  if (!Number.isFinite(fraction)) {
+    bar.dataset.state = "waiting";
+    bar.removeAttribute("value");
+    return;
+  }
   bar.dataset.state = "running";
-  bar.value = fraction;
+  bar.value = Math.min(1, Math.max(0, fraction));
 }
 
 // --- the alignment ---------------------------------------------------------
@@ -1097,17 +1108,28 @@ async function fold(event) {
         appendPass(sequence, chainLengths, recycle, index, firstPassLanded);
       }
     };
+    // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
+    // possible. src/model/*.js weight every step by what the cost model says it
+    // costs, so `completed / total` is a fraction of the WORK - and the ratio
+    // of elapsed time to work done is this machine's speed, whatever it is.
+    // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
+    // it, since the weighting has already happened upstream.
+    let runEstimator = null;
     const runProgress = ({ completed, total, waiting }) => {
       if (signal.aborted) return;
       if (waiting) {
         const bar = element("progress");
         bar.hidden = false;
         bar.removeAttribute("value");
-        status("Running the trunk on the GPU…");
+        status("Folding…");
         return;
       }
-      progress(Math.min(1, completed / total));
-      status(`Folding · ${Math.min(100, Math.round(100 * completed / total))}%`);
+      runEstimator ??= new RuntimeEstimator({ stages: [{ name: "fold", units: total, count: 1 }] });
+      runEstimator.completedUnits(completed);
+      progress(runEstimator.fraction());
+      const left = describeRemaining(runEstimator.remainingMs());
+      const percent = Math.min(100, Math.round(100 * runEstimator.fraction()));
+      status(`Folding · ${percent}%${left === undefined ? "" : `  ·  ~${left} left`}`);
     };
 
     const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();

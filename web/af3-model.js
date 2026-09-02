@@ -25,6 +25,8 @@ import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { MODEL_BUNDLES, loadManifest } from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
+import { af3Plan, describeRemaining, RuntimeEstimator }
+  from "../src/runtime/cost-model.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
 
@@ -150,27 +152,31 @@ function fittedPdb(batch, positions, reference, slots, plddt) {
 }
 
 /**
- * Where the bar should be at each handover, so it runs roughly linear in TIME
- * rather than in stages.
+ * The plan a fold's bar and clock run off, and where each band ends.
  *
- * 🔴 THE SHARES CANNOT BE CONSTANTS. Features and trunk are fixed costs while
- * the sampler is not.
- *
- * 🔴 THE CONSTANTS BELOW ARE STALE IN ABSOLUTE TERMS AND STILL RIGHT AS A
- * RATIO, WHICH IS ALL THIS USES THEM FOR. They were measured when a trunk pass
- * was 3.7 s and a denoiser call 0.85; on a 59-residue chain those are now about
- * 0.6 s and 0.13. Both shrank by roughly the same factor, so trunk-to-call is
- * 4.35 against a real 4.5 and the bands barely move - which is why they have
- * not been re-fitted. `features` was 4.9 s in the very first version, when
- * featurisation was CPU work and the bar had nothing to say for all of it; it
- * is now about a millisecond (tools/gpu/bench-weights.js and fold.js print the
- * rest), so its band is decoration.
+ * 🔴 THIS USED TO BE THREE CONSTANTS THAT DID NOT MENTION LENGTH. A trunk pass
+ * was "3.7 s" and a denoiser call "0.85", so the trunk was always 4.35 calls'
+ * worth of work whatever was being folded. Measured, that ratio is 3.1 at 59
+ * tokens and 15.3 at 256 - the trunk grows as L squared and the sampler barely
+ * faster than linearly - so the bar raced through the trunk band and stalled on
+ * anything long. src/runtime/cost-model.js has the fits and the measurements.
  */
-function timeShares(calls, passes) {
-  const features = 0.4;
-  const trunk = 3.7 * passes;
-  const total = features + trunk + 0.85 * calls;
-  return { features: features / total, trunk: (features + trunk) / total };
+function foldPlan({ tokens, rows, passes, calls, atoms }) {
+  const plan = af3Plan({ tokens, rows, passes, calls, atoms });
+  const at = (name) => plan.stages.find((stage) => stage.name === name);
+  const features = at("features").units;
+  const trunk = at("trunk").units * passes;
+  const warmup = at("sampler-warmup").units;
+  return {
+    plan,
+    estimator: new RuntimeEstimator(plan),
+    // Where each phase's work ends, in units, so a partial phase can be placed.
+    featuresEnd: features,
+    trunkEnd: features + trunk,
+    samplerStart: features + trunk + warmup,
+    warmupUnits: warmup,
+    callUnits: at("sampler").units,
+  };
 }
 
 /**
@@ -240,9 +246,51 @@ export async function foldAf3(options) {
   // 🔴 ONLY THE PASSES THAT WILL ACTUALLY RUN, or the bar spends a share of
   // itself waiting for work that never happens and then jumps. A reused trunk
   // runs none; a continued one runs the difference.
-  const share = timeShares(calls, options.reuse === undefined
+  const passes = options.reuse === undefined
     ? (recycles ?? 0) + 1
-    : Math.max(0, (recycles ?? 0) - options.reuse.recycles));
+    : Math.max(0, (recycles ?? 0) - options.reuse.recycles);
+  // 🔴 THE CLOCK STARTS WHEN THE GPU DOES, NOT WHEN THE FOLD IS ASKED FOR.
+  // Featurisation is a synchronous CPU call of a few hundred milliseconds that
+  // the bar already shows as indeterminate, and it is not work this plan
+  // models - so counting it as elapsed time makes the first ETA several times
+  // too long, which is the estimate people actually read.
+  // 🔴 BUILT ON FIRST USE, BECAUSE A REUSED TRUNK SKIPS THE FIRST STAGE.
+  // Folding a second time in the same page runs no trunk passes at all, so
+  // `target-feat` never fires - and a budget created only there is null when
+  // the sampler asks it where to put the bar. It threw "Cannot read properties
+  // of null" onto the status line, which is a fold that does not run.
+  //
+  // 🔴 AND THE CLOCK STARTS WITH IT, WHICH MEANS BEFORE FEATURISATION. The
+  // estimator learns this machine's speed from time elapsed over units done, so
+  // crediting featurisation's units without its three seconds makes every
+  // estimate short - measured at 10-15 s remaining when 18-25 s remained. Time
+  // and units have to cover the same work. That is why the first stage calls
+  // this before doing anything, not after.
+  let budget = null;
+  const plan = () => (budget ??= foldPlan({
+    tokens: batch.tokens, rows: rows.depth, passes, calls, atoms: batch.atomCount,
+  }));
+  /**
+   * The status line: what is happening, how far in, and how much is left.
+   *
+   * 🔴 THREE FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
+   * block 23 of 48", which is a number that changes forty-eight times a pass
+   * next to two that barely move - so the eye tracks the one part that does not
+   * matter. The percentage says the same thing and says it about the whole
+   * fold, which is the question being asked.
+   */
+  const say = (phase) => {
+    if (budget === null) { onStatus(phase); return; }
+    const percent = Math.round(100 * budget.estimator.fraction());
+    const left = describeRemaining(budget.estimator.remainingMs());
+    onStatus(`${phase} · ${percent}%${left === undefined ? "" : `  ·  ~${left} left`}`);
+  };
+  /** Move the bar to a point in the plan, in units. */
+  const reached = (units) => {
+    const active = plan();
+    active.estimator.completedUnits(units);
+    onProgress(active.estimator.fraction());
+  };
   const started = performance.now();
 
   const slots = alphaCarbons(batch);
@@ -258,18 +306,19 @@ export async function foldAf3(options) {
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "target-feat-start") {
+        plan();               // ...starts the clock; see the note on plan().
         // A sweep rather than a number: what is left here is one synchronous
         // CPU call, so there is still nothing to count - but it is now a few
         // hundred milliseconds rather than five seconds.
         onProgress("waiting");
-        onStatus(`Building input features for ${batch.atomCount} atoms…`);
+        onStatus("Preparing…");
         // The yield is the point: what follows blocks the main thread for
         // seconds, so the line above has to be painted before it starts.
         await yieldToBrowser();
       }
       if (name === "target-feat") {
-        onProgress(share.features);
-        onStatus(`Running the trunk over ${batch.tokens} tokens…`);
+        reached(plan().featuresEnd);
+        say("Trunk");
         await yieldToBrowser();
       }
       if (name === "pairformer-block") {
@@ -283,15 +332,25 @@ export async function foldAf3(options) {
         // Each recycle is another whole trunk, so the trunk band is divided
         // between them rather than replayed.
         const done = (detail.pass + detail.completed / detail.total) / detail.passes;
-        onProgress(share.features + (share.trunk - share.features) * done);
-        onStatus(`Trunk · pass ${detail.pass + 1} of ${detail.passes}`
-          + ` · pairformer block ${detail.completed} of ${detail.total}`);
+        reached(plan().featuresEnd
+          + (plan().trunkEnd - plan().featuresEnd) * done);
+        say(detail.passes > 1 ? `Trunk ${detail.pass + 1}/${detail.passes}` : "Trunk");
       }
       if (name === "trunk-done") {
-        onProgress(share.trunk);
-        onStatus(mode === "flow"
-          ? `Refining ${batch.atomCount} atoms over ${calls} cycles…`
-          : `Diffusing ${batch.atomCount} atoms over ${calls} steps…`);
+        reached(plan().trunkEnd);
+        // 🔴 THE COMPILE HAS NO MILESTONES AND BLOCKS THE MAIN THREAD, so the
+        // bar can neither be advanced nor animated through it: at 150 tokens
+        // that is 4.9 s of a 27 s fold in which no timer fires and nothing
+        // paints. A crawl on setInterval was tried and never ticked once.
+        //
+        // What CAN be done is to size the band correctly - which the plan now
+        // does, so the jump lands where it should - and to say what is
+        // happening before the thread goes away, with a sweeping bar rather
+        // than a still one. Both need this paint to land first, which is what
+        // the yield below the status line is for.
+        say(mode === "flow" ? "Refining" : "Diffusing");
+        onProgress("waiting");
+        await yieldToBrowser();
       }
     },
     onStep: async ({ step, denoised }) => {
@@ -306,10 +365,12 @@ export async function foldAf3(options) {
       trajectory.push(Float32Array.from(denoised));
       options.onFrame?.(fittedPdb(batch, denoised, reference, slots, null), shown);
       shown += 1;
-      onProgress(share.trunk + (1 - share.trunk) * (step / calls));
-      const elapsed = (performance.now() - started) / 1000;
-      onStatus(`${mode === "flow" ? "Step" : "Diffusion step"} ${step} of ${calls}`
-        + `  ·  about ${Math.ceil(elapsed * (calls / step - 1))} s left`);
+      reached(plan().samplerStart + plan().callUnits * step);
+      // ...the sampler used to run its OWN clock here, from its own elapsed
+      // time over its own steps. It was the only honest one on the page, and
+      // only because a denoiser call is the one unit that repeats identically.
+      // The estimator generalises exactly that idea to the whole fold.
+      say(`${mode === "flow" ? "Refining" : "Diffusing"} ${step}/${calls}`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task
       // boundary the status above is written and never drawn.

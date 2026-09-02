@@ -5,6 +5,7 @@ import {
 } from "../evoformer/block.js";
 import { QueryOnlyTemplateGpu } from "../evoformer/template.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { af2Plan, planTotal } from "../runtime/cost-model.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../runtime/abort.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { StructureModuleGpu } from "../structure/module.js";
@@ -80,16 +81,43 @@ export class AlphaFoldMonomerGpu {
     const start = performance.now();
     // WHAT A PASS IS MADE OF, in the units it advances through: both block
     // stacks, then the structure module - four stages with eight IPA iterations
-    // inside the second - and the confidence heads, which report twice. The
-    // same budget the single-sequence path uses, so the two bars mean the same.
+    // inside the second - and the confidence heads, which report twice.
+    //
+    // 🔴 WEIGHTED BY WHAT EACH ONE COSTS, WHICH IT DID NOT USED TO BE. Every
+    // one of these counted as one step, so eleven IPA iterations and two
+    // confidence reads were a quarter of the bar at 59 residues - and at 512
+    // alignment rows an evoformer block is a hundred times an IPA iteration.
+    // The bar therefore crawled through the stacks and then jumped to the end.
+    // The two stacks are not equal either: they run at DIFFERENT DEPTHS, and
+    // AF2's cost is mostly its depth. src/runtime/cost-model.js has the fits.
     const STRUCTURE_STEPS = 11;    // initialize, 8 iterations, sidechains, geometry
     const CONFIDENCE_STEPS = 2;    // reading back, then scoring
-    const blocksPerPass = weights.extraStack.length + weights.mainStack.length;
-    const totalSteps = featuresByRecycle.length
-      * (blocksPerPass + STRUCTURE_STEPS + CONFIDENCE_STEPS);
+    const extraRows = featuresByRecycle[0] .extraSequences ?? 1;
+    const mainRows = featuresByRecycle[0] .msaSequences ?? 1;
+    const plan = af2Plan({
+      length, extraRows, mainRows,
+      extraBlocks: weights.extraStack.length,
+      mainBlocks: weights.mainStack.length,
+      passes: featuresByRecycle.length,
+      structureSteps: STRUCTURE_STEPS, confidenceSteps: CONFIDENCE_STEPS,
+    });
+    const unitsOf = (name) => plan.stages.find((stage) => stage.name === name).units;
+    const EXTRA_BLOCK = unitsOf("extra-stack");
+    const MAIN_BLOCK = unitsOf("main-stack");
+    const STRUCTURE_STEP = unitsOf("structure");
+    const CONFIDENCE_STEP = unitsOf("confidence");
+    const totalSteps = planTotal(plan);
     let completed = 0;
-    const step = () => {
-      completed += 1;
+    // `units` defaults to a structure step because that is what the callers
+    // which cannot pass one - StructureModuleGpu's onStep - are.
+    // 🔴 THE CALLERS DO NOT ALL PASS A NUMBER. StructureModuleGpu reports its
+    // stages by NAME - step("initialize"), step("sidechains") - which the old
+    // counter ignored because it added one whatever it was handed. Adding a
+    // string instead made `completed` NaN, which reached the progress element
+    // as "the provided double value is non-finite" and failed the fold. A label
+    // means "one step of whatever I am", which is the structure module's step.
+    const step = (units) => {
+      completed += Number.isFinite(units) ? units : STRUCTURE_STEP;
       onProgress?.({ completed, total: totalSteps, waiting: false });
     };
     // 🔴 THE SCOPE OPENS AT THE ENCODER, NOT HERE. Validation errors are raised
@@ -172,7 +200,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.extraStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          void this.device.queue.onSubmittedWorkDone().then(() => step());
+          void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK));
         }
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
@@ -196,7 +224,7 @@ export class AlphaFoldMonomerGpu {
           execution.releaseSince(checkpoint);
           const endOfWindow = (block + 1) % windowSize === 0 || block + 1 === weights.mainStack.length;
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
-          void this.device.queue.onSubmittedWorkDone().then(() => step());
+          void this.device.queue.onSubmittedWorkDone().then(() => step(MAIN_BLOCK));
         }
 
         await validation.settle();
@@ -229,7 +257,7 @@ export class AlphaFoldMonomerGpu {
         throwIfAborted(signal);
         const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
           structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
-          step, signal, recycleOptions.chainLengths,
+          () => step(CONFIDENCE_STEP), signal, recycleOptions.chainLengths,
         ), signal);
         throwIfAborted(signal);
         const recycleDistance = recycleConvergenceDistance(
