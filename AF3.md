@@ -393,13 +393,16 @@ against float32's 0.69, which is the spread between diffusion seeds.
 A sampler calls the diffusion head up to 200 times and everything else once, so
 the head is the whole optimisation target. On a 59-residue chain, steady state:
 
-| stage        | as found | now |
-|--------------|---------|-----|
-| conditioning |    48   |  11 |
-| atom encoder |   100   |  37 |
-| transformer  |   549   |  74 |
-| atom decoder |    48   |  23 |
-| **one call** | **760** | **176** |
+| stage           | as found | now |
+|-----------------|---------|-----|
+| conditioning    |    48   |  12 |
+| atom encoder    |   100   |  38 |
+| single-proj     |    -    |   2 |
+| transformer     |   549   |  72 |
+| atom decoder    |    48   |  24 |
+| **one call**    | **760** | **148** |
+
+So 200 steps is about 30 seconds on a 59-residue chain, where it was 152.
 
 What paid, in order of size:
 
@@ -448,6 +451,23 @@ bench-head.js reported a median over nine calls with its range. And a 30%
 dispatch divided the token count by 8 - half the tokens were never projected. It
 was caught by two numbers disagreeing that should have been identical, not by a
 checker; the factory now throws rather than defaulting.
+
+🔴 **THE TRANSFORMER IS AT A LOCAL OPTIMUM AND FOUR THINGS SAY SO.** Its tile
+and lane counts are both measured maxima; giving each workgroup ONE of q/k/v/gate
+instead of four - on the theory that 4 x TILE accumulators were spilling - was
+worse at 59 tokens and at 200 (the token tile is then staged four times);
+reading the token tile from global instead of workgroup memory, to let the tile
+grow past what that memory caps, was worse again; and `splits` makes no
+difference at all, so the lane imbalance it creates at SLICE 384 against 256
+lanes is not costing anything. f16 is settled too, in README.md: 13% SLOWER at
+1.89e-4 error, because Apple GPUs run f32 and f16 ALU at the same rate and these
+kernels are ALU-bound.
+
+🔴 **AND THERE IS A BETTER TOOL THAN THE ONE USED HERE.** Every bisect above
+disabled a pass and re-measured, which is noisy and cost two wrong conclusions.
+`timestamp-query` is in the features src/runtime/device.js already requests, and
+README.md records per-kernel timestamp profiling being used on the triangle
+stack. Use that first next time.
 
 The remaining floor is the transformer's arithmetic intensity, which tiling by
 four improves and does not fix. Measure with
