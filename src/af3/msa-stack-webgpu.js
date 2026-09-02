@@ -229,9 +229,10 @@ export class Af3MsaStackGpu {
     const weightGroups = spread(msaHeads * n);
     run("msa.attention-weights", pipelines["msa:attentionWeights"],
         [pair, keyMask, attentionWeights, attention], weightGroups[0], weightGroups[1]);
-    run("msa.project", pipelines["msa:project"],
-        [msa, attentionWeights, msaScratch[0], msaScratch[1]], rowGroups[0], rowGroups[1]);
     const perRow = spread(rows);
+    // ...one workgroup a row now; see the note on the kernel.
+    run("msa.project", pipelines["msa:project"],
+        [msa, attentionWeights, msaScratch[0], msaScratch[1]], perRow[0], perRow[1]);
     run("msa.average", pipelines["msa:average"],
         [attention, msaScratch[0], msaScratch[1], attentionWeights, msaScratch[2]],
         perRow[0], perRow[1]);

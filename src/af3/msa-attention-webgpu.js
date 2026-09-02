@@ -166,33 +166,77 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 
   // v and the gate, per MSA row.
+  //
+  // 🔴 ONE WORKGROUP A ROW, NOT ONE THREAD, AND THE NORMALISED ROW STAGED. This
+  // had a single invocation walk WIDTH outputs by C_M channels and re-derive
+  // the normalised activation inside BOTH loops - so the row's 64 values were
+  // recomputed 64 times each, and two thirds of the kernel was that. It is
+  // 62 ms of a 255 ms MSA stack at 1024 rows, which is 60,416 rows of it.
   const project = `${common}
 @group(0) @binding(0) var<storage, read> msa: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> values: array<f32>;
 @group(0) @binding(3) var<storage, read_write> gate: array<f32>;
 
+var<workgroup> normalized: array<f32, ${msaChannels}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= ROWS) { return; }
+  let local = local_id.x;
   let base = row * C_M;
+
   var total = 0.0;
   var squares = 0.0;
-  for (var c = 0u; c < C_M; c += 1u) {
+  for (var c = local; c < C_M; c += 64u) {
     let value = msa[base + c];
     total += value;
     squares += value * value;
   }
-  let mean = total / f32(C_M);
-  ${varianceCode("C_M", "msa[base + c]")}
+  reduce_a[local] = total;
+  reduce_b[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C_M);
+  ${variance === "fast"
+    ? "let variance = reduce_b[0] / f32(C_M) - mean * mean;"
+    : `workgroupBarrier();
+  var centred = 0.0;
+  for (var c = local; c < C_M; c += 64u) {
+    let d = msa[base + c] - mean;
+    centred += d * d;
+  }
+  reduce_a[local] = centred;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+    workgroupBarrier();
+  }
+  let variance = reduce_a[0] / f32(C_M);`}
   let inverse_std = inverseSqrt(variance + EPSILON);
-  for (var out = 0u; out < WIDTH; out += 1u) {
+  workgroupBarrier();
+  for (var c = local; c < C_M; c += 64u) {
+    normalized[c] = (msa[base + c] - mean) * inverse_std * weights[W_ACT_SCALE + c]
+      + weights[W_ACT_OFFSET + c];
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < WIDTH; out += 64u) {
     var value_total = 0.0;
     var gate_total = 0.0;
     for (var c = 0u; c < C_M; c += 1u) {
-      let value = (msa[base + c] - mean) * inverse_std * weights[W_ACT_SCALE + c]
-        + weights[W_ACT_OFFSET + c];
+      // ...normalised once for the row, read here by every output.
+      let value = normalized[c];
       value_total += value * weights[W_V + c * WIDTH + out];
       gate_total += value * weights[W_GATE + c * WIDTH + out];
     }
@@ -322,10 +366,10 @@ export class Af3MsaAttentionGpu {
       const weightGroups = spread(heads * tokens);
       run("msa.attention-weights", compiled.attentionWeights,
           [pairBuffer, keyMask, weightBuffer, attention], weightGroups[0], weightGroups[1]);
-      const rowGroups = spread(Math.ceil(rows / 64));
-      run("msa.project", compiled.project, [msaBuffer, weightBuffer, values, gate],
-          rowGroups[0], rowGroups[1]);
       const perRow = spread(rows);
+      // ...one workgroup a row now; see the note on the kernel.
+      run("msa.project", compiled.project, [msaBuffer, weightBuffer, values, gate],
+          perRow[0], perRow[1]);
       run("msa.average", compiled.average, [attention, values, gate, weightBuffer, output],
           perRow[0], perRow[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * msaChannels * 4);
