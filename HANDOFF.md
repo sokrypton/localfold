@@ -12,11 +12,84 @@ produced the numbers, so none of it has to be re-derived.
 `python3 tools/deploy.py`, which polls `build.json` until the pushed commit is
 the one being served.
 
-🔴 **THE LAST DEPLOY WAS NOT RE-VERIFIED IN THE BROWSER.** `3a51020a` removes
-the weight warm-start and keeps the prefetch; the tests pass and it deployed
-clean, but the site was last DRIVEN at `ffc670d7` (the commit before). If
-anything is broken it is in that one revert. Re-check with the browser recipe
-under "Driving the site".
+🔴 **HEAD IS SIX COMMITS AHEAD OF WHAT IS DEPLOYED** (`14629ca`), all of it the
+memory work below. It has been driven locally at `http://127.0.0.1:4173` -
+31 residues, AF3, flow-8, pLDDT 68.7 - but not deployed.
+
+## The memory work, 2026-09-02
+
+Prompted by reading upstream (`martin-steinegger/alphafold2-webgpu`), which
+spent September on exactly this. We had never measured host memory at all.
+
+🔴 **THE DISK WAS FULL, AND IT WAS OUR OWN TOOLING.** `tools/gpu-chrome.mjs`
+gave every run a fresh Chrome `--user-data-dir` and never deleted it: 1265 of
+them, 428 GB, 20 MiB free on a 926 GiB disk. A full disk does not announce
+itself - git fails to write its index, shell redirections produce empty files,
+node exits non-zero with no message. `249c068` deletes the profile after the
+run. If a session ever looks like "the shell is broken", run `df -h /` first.
+
+| host heap, shipped int5 export | before | now |
+|---|---|---|
+| after loading the trunk's weights | 732 MiB | **116 MiB** |
+| after the diffusion head as well | 1039 MiB | **272 MiB** |
+| after confidence and the atom reference | 1050 MiB | **284 MiB** |
+| after one trunk pass | 1068 MiB | **305 MiB** |
+
+Three causes, all the same shape - a decoded float32 copy kept alive beside the
+same numbers already resident on the device:
+
+- **Stacked tensors decoded whole.** The trunk's 48 pairformer blocks and the
+  head's 24 transformer blocks are each one tensor with the block as the
+  leading axis; a block took its slice by decoding all of it, and
+  `HttpTensorStore` kept every array it ever decoded. `readTensorRange` decodes
+  part of a tensor with the block scales indexed by absolute position, the
+  store gained `open(name)` (the shard, not the tensor) and `tensorRangeSync`,
+  and the block loaders build descriptors of thunks that `bind()` turns into
+  properties decoding on first read. Memoised, so the CPU reference paths are
+  unaffected; released explicitly by the GPU block encoders, once every buffer
+  they need is on the device.
+- **Packed arrays cached after they were needed.** Two WeakMaps held the
+  concatenated upload buffers - 103 MiB for the pairformer, ~630 MB for the
+  diffusion transformer - although the resident device buffers they fill are
+  created on the first miss and never again.
+- **A no-op quantiser copying the model.** Nine tools passed
+  `{ fetchImplementation: fetch }` into `openAf3Store`'s quantisation slot, so
+  every tensor went through `Float32Array.from` and then through a quantiser
+  that walked no groups. `openAf3Store` now rejects it.
+
+Nothing moved on time or accuracy: trunk vs AF3 6.18e-7, transformer 2.20e-5,
+flow-8 bond scale median 1.015, a 59-token recycle ~390 ms, a denoiser call
+114 ms.
+
+`tools/gpu/probe-memory.js` is what found all of it and is the only tool here
+that reports host memory - the benches print the GPU allocator's snapshot,
+which cannot see a Float32Array. It forces a collection before each reading
+(`gpu-chrome.mjs` now passes `--expose-gc` and `--enable-precise-memory-info`);
+without that the numbers carry uncollected garbage and move by 300 MiB.
+
+### Still on the table from upstream
+
+Read but not taken, roughly in order of value:
+
+- **A shared GPU memory budget** that fails an allocation before `createBuffer`
+  with an error naming the tensor. Upstream added it because Metal accepts
+  allocations past the point where macOS pages, and a ten-chain complex froze a
+  notebook. We have the same exposure, and worse on Android.
+- **An allocator that can reuse a buffer it did not size exactly.** Ours keys
+  the pool on `bytes:usage` and matches both exactly, which is the failure
+  upstream describes: each operation grows its own set of chunks. Theirs backs
+  any request over a mebibyte with whole mebibytes, reuses any retired buffer
+  whose usage covers the request and is at most twice its size, and destroys
+  buffers idle for four submissions.
+- **Blocking the pair-shaped scratch** so no operation holds a whole one
+  (their 8e679b5, worth 100-130 MiB at 384-512 residues, at 3-4% of the run).
+- **Optional half-precision activation storage** for the MSA and the triangle
+  projection - inexact, off by default, 15-25% of the working set.
+- **A memory estimate pinned to measured working sets by a test**, so it cannot
+  drift; theirs had gone 3-5x stale unnoticed.
+- **Running the pipeline in a worker**, so a long fold does not freeze the page.
+
+We already had their submit-ahead window and their deferred validation.
 
 | | before today | now |
 |---|---|---|
