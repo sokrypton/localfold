@@ -43,6 +43,8 @@ values means the whole-stack checker, not that file.
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
+| What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
+| Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
@@ -56,6 +58,16 @@ reference that shares code with the thing it checks tests nothing, and each
 uses ragged shapes and ragged masks so the bounds checks and the masking are
 actually exercised. They are differential, not oracle: they say the kernel
 computes the operation, not that AlphaFold agrees.
+
+🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
+allocator's snapshot cannot see a `Float32Array`, and until
+`src/runtime/device-memory.js` existed nothing counted the buffers created
+outside the allocator - which are most of them by size. Host heap comes from
+`tools/gpu/probe-memory.js` (it forces a collection first, or the reading
+carries 300 MiB of garbage); device memory from `memorySnapshot(device)`,
+which `fold.js` and `bench-trunk.js` print. A 31-residue fold holds **305 MiB
+of heap and 1390 MiB on the device**; 1190 MiB of the latter is weights kept
+resident on purpose, which `--budget` makes the code give up when it must.
 
 🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
 multiply-adds out of registers with no memory in the way. On this M2 it reports
