@@ -163,10 +163,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // Only the four block passes; the encoder's masking and aggregation are its
   // own, and `aggregate` reads a weight this bundle does not carry.
-  const { project, projectKeys, projectKeysAtoms, expandKeys, attendFor, output } =
-    createAtomBlockShaders(common, shape);
+  const { project, projectKeys, projectKeysAtoms, expandKeys, attendFor, output,
+          outputRowTile } = createAtomBlockShaders(common, shape);
   return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms, expandKeys,
-           attendFor, output };
+           attendFor, output, outputRowTile };
 }
 
 export class Af3AtomDecoderGpu {
@@ -209,7 +209,9 @@ export class Af3AtomDecoderGpu {
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
-      if (name === "attendFor") continue;
+      // ...the factory also returns the row tile the dispatch needs, which is a
+      // number rather than a shader.
+      if (name === "attendFor" || typeof source !== "string") continue;
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
     }
     compiled.attend = [];
@@ -293,7 +295,9 @@ export class Af3AtomDecoderGpu {
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
+        // ...one workgroup per TILE of query rows; see the note on `output`.
         const perQuery = spread(queryRows);
+        const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
             perQuery[0], perQuery[1]);
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
@@ -305,7 +309,7 @@ export class Af3AtomDecoderGpu {
         run(`attend-${index}`, compiled.attend[index],
             [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);
         run(`output-${index}`, compiled.output, [gathered, gate, queriesCond, w, act],
-            perQuery[0], perQuery[1]);
+            perOutput[0], perOutput[1]);
       }
 
       const slotGroups = lin(tokens * dense);

@@ -456,7 +456,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /** The three cross-attention blocks. */
+/**
+ * How many query rows one `output` workgroup carries, given how many there are.
+ *
+ * 🔴 A FUNCTION OF THE ROW COUNT, LIKE EVERY OTHER TILE HERE. It divides the
+ * 655 KB of weights each workgroup reads - see the note on the kernel - and it
+ * multiplies nothing else, so the only thing pulling the other way is the
+ * workgroup count: this kernel is 64 lanes wide, so a 68-mer's 576 query rows
+ * are only 9,216 invocations at a tile of four. Measured on a denoiser call at
+ * that size: tile 2 gives 15 ms of atom encoder and 21 of decoder, tile 4 gives
+ * 16 and 22, tile 8 gives 20 and 26. A real protein has thousands of atoms and
+ * wants the larger tile.
+ */
+export function outputRowTileFor(queryRows) {
+  for (const tile of [8, 4, 2]) {
+    if (queryRows / tile >= 256) return tile;
+  }
+  return 1;
+}
+
 export function createAtomBlockShaders(common, shape) {
+  const outputRowTile = shape.outputRowTile
+    ?? outputRowTileFor(shape.subsets * shape.queries);
   const { channels, keys } = shape;
   const intermediate = channels * 2;
 
@@ -788,104 +809,193 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // The zero-init gate, the residual, and the conditioned transition - all of
   // which read the query conditioning RAW rather than normalised.
+  //
+  // 🔴 A TILE OF QUERY ROWS, BECAUSE ONE WORKGROUP A ROW READ 655 KB OF WEIGHTS
+  // TO PRODUCE ONE. This kernel fuses five matmuls - the attention's output
+  // projection, the zero-init gate, the conditioned scale and shift, the
+  // widening and the way back - and with a workgroup per row every one of them
+  // read its whole matrix for a single row: 377 MB a block, and the three
+  // blocks of a decoder call were 10.5 ms of 24. The rows share every weight
+  // and share nothing else, so a tile of them is exactly the vector: one read,
+  // one vector multiply-add, four rows.
+  const rowWidth = Math.min(4, outputRowTile);
+  const rowGroups = outputRowTile / rowWidth;
+  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowWidth];
+  if (rowVector === undefined || !Number.isInteger(rowGroups)) {
+    throw new Error(`outputRowTile ${outputRowTile} is not 1, 2 or a multiple of 4`);
+  }
+  const rowLane = (t) => rowWidth === 1 ? "" : `.${"xyzw"[t % rowWidth]}`;
+  const rowGroup = (t) => Math.floor(t / rowWidth);
+  const overRows = (body) =>
+    Array.from({ length: outputRowTile }, (_, t) => body(t)).join("\n    ");
+  const overRowGroups = (body) =>
+    Array.from({ length: rowGroups }, (_, g) => body(g)).join("\n    ");
+  /** A per-row quantity gathered into the tile's vectors. */
+  const gather = (name, expression) => `${overRowGroups((g) => `var ${name}${g} = ${rowVector}(0.0);`)}
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      ${name}${rowGroup(t)}${rowLane(t)} = ${expression};
+    }`)}`;
   const output = `${common}
+const ROW_TILE: u32 = ${outputRowTile}u;
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
 @group(0) @binding(1) var<storage, read> gate: array<f32>;
 @group(0) @binding(2) var<storage, read> queries_cond: array<f32>;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<storage, read_write> act: array<f32>;
 
-var<workgroup> gated: array<f32, ${channels}>;
-var<workgroup> after: array<f32, ${channels}>;
-var<workgroup> cond_norm: array<f32, ${channels}>;
-var<workgroup> x: array<f32, ${channels}>;
-var<workgroup> wide: array<f32, ${intermediate}>;
+var<workgroup> gated: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> after: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> cond_norm: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> x: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> wide: array<${rowVector}, ${rowGroups * intermediate}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= QUERY_ROWS) { return; }
+  let base_row = (group.x + group.y * GRID_WIDTH) * ROW_TILE;
+  if (base_row >= QUERY_ROWS) { return; }
   let local = local_id.x;
 
+  // ...a row past the end is clamped rather than skipped: every lane reaches
+  // the barriers, and its lane of each vector is dropped at the write.
   for (var w = local; w < WIDTH; w += 64u) {
-    gated[w] = gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      gated[${rowGroup(t)}u * WIDTH + w]${rowLane(t)} =
+        gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
+    }`)}
   }
   workgroupBarrier();
 
   for (var c = local; c < C; c += 64u) {
-    var projected = 0.0;
+    ${overRowGroups((g) => `var projected${g} = ${rowVector}(0.0);`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
-      projected += gated[w] * weights[W_Transition2 + w * C + c];
+      // ...read once, used by every row of the tile.
+      let weight = weights[W_Transition2 + w * C + c];
+      ${overRowGroups((g) => `projected${g} += gated[${g}u * WIDTH + w] * weight;`)}
     }
-    var zero_gate = weights[W_AdaptiveZeroCondBias + c];
+    ${overRowGroups((g) => `var zero${g} = ${rowVector}(weights[W_AdaptiveZeroCondBias + c]);`)}
     for (var d = 0u; d < C; d += 1u) {
-      zero_gate += queries_cond[row * C + d] * weights[W_AdaptiveZeroCondWeights + d * C + c];
+      let weight = weights[W_AdaptiveZeroCondWeights + d * C + c];
+      ${overRows((t) => `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        zero${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + d] * weight;
+      }`)}
     }
-    after[c] = act[row * C + c] + projected * logistic(zero_gate);
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      after[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c]
+        + projected${rowGroup(t)}${rowLane(t)} * logistic(zero${rowGroup(t)}${rowLane(t)});
+    }`)}
   }
   workgroupBarrier();
 
   // The transition reads the POST-attention activation.
-  var total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { total += after[c]; }
-  let mean = total / f32(C);
-  var variance = 0.0;
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    let d = after[c] - mean;
-    variance += d * d;
+    ${overRowGroups((g) => `total${g} += after[${g}u * C + c];`)}
   }
-  let inverse = inverseSqrt(variance / f32(C) + EPSILON);
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));`)}
+  ${overRowGroups((g) => `var variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `{
+      let d = after[${g}u * C + c] - mean${g};
+      variance${g} += d * d;
+    }`)}
+  }
+  ${overRowGroups((g) => `let inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
 
-  var cond_total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { cond_total += queries_cond[row * C + c]; }
-  let cond_mean = cond_total / f32(C);
-  var cond_variance = 0.0;
+  ${overRowGroups((g) => `var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    let d = queries_cond[row * C + c] - cond_mean;
-    cond_variance += d * d;
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      cond_total${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + c];
+    }`)}
   }
-  let cond_inverse = inverseSqrt(cond_variance / f32(C) + EPSILON);
+  ${overRowGroups((g) => `let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));`)}
+  ${overRowGroups((g) => `var cond_variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      let d = queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)};
+      cond_variance${rowGroup(t)}${rowLane(t)} += d * d;
+    }`)}
+  }
+  ${overRowGroups((g) => `let cond_inverse${g} =
+    inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
-    cond_norm[c] = (queries_cond[row * C + c] - cond_mean) * cond_inverse
-      * weights[W_ffwSingleCondLayerNormScale + c];
+    let scale = weights[W_ffwSingleCondLayerNormScale + c];
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      cond_norm[${rowGroup(t)}u * C + c]${rowLane(t)} =
+        (queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)})
+        * cond_inverse${rowGroup(t)}${rowLane(t)} * scale;
+    }`)}
   }
   workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
-    var scale_value = weights[W_ffwSingleCondScaleBias + c];
-    var shift = 0.0;
+    ${overRowGroups((g) =>
+      `var scale_value${g} = ${rowVector}(weights[W_ffwSingleCondScaleBias + c]);
+    var shift${g} = ${rowVector}(0.0);`)}
     for (var d = 0u; d < C; d += 1u) {
-      scale_value += cond_norm[d] * weights[W_ffwSingleCondScaleWeights + d * C + c];
-      shift += cond_norm[d] * weights[W_ffwSingleCondBias + d * C + c];
+      let ws = weights[W_ffwSingleCondScaleWeights + d * C + c];
+      let wb = weights[W_ffwSingleCondBias + d * C + c];
+      ${overRowGroups((g) => `{
+        let cn = cond_norm[${g}u * C + d];
+        scale_value${g} += cn * ws;
+        shift${g} += cn * wb;
+      }`)}
     }
-    x[c] = logistic(scale_value) * ((after[c] - mean) * inverse) + shift;
+    ${overRowGroups((g) => `x[${g}u * C + c] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
+      * ((after[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
   }
   workgroupBarrier();
 
   let doubled = INTERMEDIATE * 2u;
   for (var i = local; i < INTERMEDIATE; i += 64u) {
-    var gate_value = 0.0;
-    var value = 0.0;
+    ${overRowGroups((g) => `var gate_value${g} = ${rowVector}(0.0);
+    var value${g} = ${rowVector}(0.0);`)}
     for (var c = 0u; c < C; c += 1u) {
       let column = W_ffwTransition1 + c * doubled;
-      gate_value += x[c] * weights[column + i];
-      value += x[c] * weights[column + INTERMEDIATE + i];
+      let wg = weights[column + i];
+      let wv = weights[column + INTERMEDIATE + i];
+      ${overRowGroups((g) => `{
+        let xc = x[${g}u * C + c];
+        gate_value${g} += xc * wg;
+        value${g} += xc * wv;
+      }`)}
     }
-    wide[i] = swish(gate_value) * value;
+    ${overRowGroups((g) => `wide[${g}u * INTERMEDIATE + i] =
+      gate_value${g} / (${rowVector}(1.0) + exp(-gate_value${g})) * value${g};`)}
   }
   workgroupBarrier();
 
   for (var c = local; c < C; c += 64u) {
-    var projected = 0.0;
+    ${overRowGroups((g) => `var projected${g} = ${rowVector}(0.0);`)}
     for (var i = 0u; i < INTERMEDIATE; i += 1u) {
-      projected += wide[i] * weights[W_ffwTransition2 + i * C + c];
+      let weight = weights[W_ffwTransition2 + i * C + c];
+      ${overRowGroups((g) => `projected${g} += wide[${g}u * INTERMEDIATE + i] * weight;`)}
     }
-    var zero_gate = weights[W_ffwAdaptiveZeroCondBias + c];
+    ${overRowGroups((g) =>
+      `var zero${g} = ${rowVector}(weights[W_ffwAdaptiveZeroCondBias + c]);`)}
     for (var d = 0u; d < C; d += 1u) {
-      zero_gate += queries_cond[row * C + d]
-        * weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
+      let weight = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
+      ${overRows((t) => `{
+        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+        zero${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + d] * weight;
+      }`)}
     }
-    act[row * C + c] = after[c] + projected * logistic(zero_gate);
+    ${overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        act[row * C + c] = after[${rowGroup(t)}u * C + c]${rowLane(t)}
+          + projected${rowGroup(t)}${rowLane(t)}
+            * logistic(zero${rowGroup(t)}${rowLane(t)});
+      }
+    }`)}
   }
 }`;
 
@@ -952,7 +1062,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
   return { project, projectKeys, projectKeysAtoms, expandKeys,
-           attendFor, output, maskAct, aggregate };
+           attendFor, output, maskAct, aggregate, outputRowTile };
 }
 
 export class Af3AtomEncoderGpu {
@@ -992,7 +1102,9 @@ export class Af3AtomEncoderGpu {
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
-      if (name === "attendFor") continue;
+      // ...the factory also returns the row tile the dispatch needs, which is a
+      // number rather than a shader.
+      if (name === "attendFor" || typeof source !== "string") continue;
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
     }
     // 🔴 ONE attend PIPELINE PER BLOCK. All three blocks' head biases live in
@@ -1200,7 +1312,9 @@ export class Af3AtomEncoderGpu {
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
+        // ...one workgroup per TILE of query rows; see the note on `output`.
         const perQuery = spread(queryRows);
+        const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project,
             [act, queriesCond, w, q, gate], perQuery[0], perQuery[1]);
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
@@ -1213,7 +1327,7 @@ export class Af3AtomEncoderGpu {
         run(`attend-${index}`, compiled.attend[index],
             [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);
         run(`output-${index}`, compiled.output,
-            [gathered, gate, queriesCond, w, act], perQuery[0], perQuery[1]);
+            [gathered, gate, queriesCond, w, act], perOutput[0], perOutput[1]);
       }
 
       const maskGroups = lin(queryRows * channels);
