@@ -35,6 +35,10 @@ function validate(input) {
   if (![sequences, length, cM, cOuter, cZ].every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("outer product mean dimensions must be positive safe integers");
   }
+  // ...see MAX_C_OUTER: the contraction kernel's arrays are sized for it.
+  if (cOuter > MAX_C_OUTER) {
+    throw new RangeError(`cOuter ${cOuter} exceeds the ${MAX_C_OUTER} the contraction stages for`);
+  }
   const expected = [
     ["activations", activations, sequences * length * cM],
     ["mask", mask, sequences * length],
@@ -76,6 +80,19 @@ export function createOuterProductMeanParameters(input, offsets) {
   view.setFloat32(56, input.normalizationEpsilon ?? 1e-3, true);
   return new Uint8Array(buffer);
 }
+
+/**
+ * The largest c_outer the contraction kernel stages for, and the cells a lane
+ * then owns.
+ *
+ * 🔴 THE SHADER IS ONE PIPELINE FOR EVERY SHAPE - its dimensions come from a
+ * uniform, not from generation - so its workgroup array and its accumulator
+ * array have to be sized for the largest c_outer that can arrive, and the loop
+ * bounds have to be the real ones. AlphaFold's c_outer is 32; anything larger
+ * would overrun `totals` silently, so it is checked rather than assumed.
+ */
+const MAX_C_OUTER = 32;
+const MAX_CELLS_PER_LANE = (MAX_C_OUTER * MAX_C_OUTER) / 64;
 
 const COMMON = `
 struct Parameters {
@@ -290,28 +307,91 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // Algebraically identical to AF2's original einsum order: first contract the
 // MSA sequence axis into [L, L, c_outer, c_outer], then apply output_w once.
-export const OUTER_PRODUCT_MEAN_CONTRACT_SHADER = `${COMMON}
+/**
+ * The sequence contraction, generated for one c_outer.
+ *
+ * 🔴 IT IS A FUNCTION AND NOT A CONSTANT BECAUSE THE ACCUMULATORS HAVE TO BE
+ * REGISTERS. A thread owns c_outer^2 / 64 cells and carries a running sum for
+ * each across the whole sweep; written as an ARRAY indexed by a loop variable,
+ * WGSL puts that in spillable local memory and the kernel measured 38 ms
+ * against the 29 it replaced. Named variables need the count at generation
+ * time, and c_outer arrives in a uniform - so the shader is generated per
+ * c_outer and the pipeline cache key carries it. AF3's outer product learned
+ * the same thing the same way; see the note in
+ * src/af3/outer-product-mean-webgpu.js.
+ *
+ * 🔴 AND A CHUNK OF SEQUENCES IS STAGED, which is what the cells buy. A thread
+ * that owned ONE cell re-read the same two 32-float slices as its 1023
+ * neighbours: two global reads for every multiply-add, 3.6 billion reads a
+ * block at 512 rows, which at the 111 billion a second tools/gpu/probe-alu.js
+ * measures is most of what this cost. Staged, a chunk's reads are shared by the
+ * whole workgroup and a thread's sixteen cells come out of eight of them.
+ */
+export function createOuterProductMeanContractShader(cOuter) {
+  const cells = cOuter * cOuter;
+  // ...rounded up, and each slot guarded: AlphaFold's c_outer is 32 and gives
+  // exactly sixteen a lane, but the checkers use ragged shapes on purpose.
+  const perLane = Math.ceil(cells / 64);
+  const chunk = 8;
+  const overCells = (body) =>
+    Array.from({ length: perLane }, (_, slot) => body(slot)).join("\n    ");
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+
+const OPM_CHUNK: u32 = ${chunk}u;
+const C_OUTER: u32 = ${cOuter}u;
+const CELLS: u32 = ${cells}u;
+
+var<workgroup> left_tile: array<f32, ${chunk * cOuter}>;
+var<workgroup> right_tile: array<f32, ${chunk * cOuter}>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  let elements = p.length * p.length * p.c_outer * p.c_outer;
-  if (index >= elements) { return; }
-  let outer_right = index % p.c_outer;
-  let outer_left = (index / p.c_outer) % p.c_outer;
-  let pair = index / (p.c_outer * p.c_outer);
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let pair = group.x + group.y * GRID_WIDTH;
+  if (pair >= p.length * p.length) { return; }
   let i = pair / p.length;
   let j = pair % p.length;
-  var value = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    value += left[(sequence * p.length + i) * p.c_outer + outer_left]
-      * right[(sequence * p.length + j) * p.c_outer + outer_right];
+  let local = local_id.x;
+
+  // The cells this lane owns, strided so 64 lanes cover the grid.
+  ${overCells((slot) => `let cell${slot} = local + ${slot}u * 64u;
+    let live${slot} = cell${slot} < CELLS;
+    let cl${slot} = select(0u, cell${slot} / C_OUTER, live${slot});
+    let cr${slot} = select(0u, cell${slot} % C_OUTER, live${slot});
+    var total${slot} = 0.0;`)}
+
+  for (var s0 = 0u; s0 < p.sequences; s0 += OPM_CHUNK) {
+    workgroupBarrier();
+    for (var index = local; index < OPM_CHUNK * C_OUTER; index += 64u) {
+      let s = s0 + index / C_OUTER;
+      let o = index % C_OUTER;
+      var l = 0.0;
+      var r = 0.0;
+      if (s < p.sequences) {
+        l = left[(s * p.length + i) * C_OUTER + o];
+        r = right[(s * p.length + j) * C_OUTER + o];
+      }
+      left_tile[index] = l;
+      right_tile[index] = r;
+    }
+    workgroupBarrier();
+
+    let available = min(OPM_CHUNK, p.sequences - s0);
+    for (var t = 0u; t < available; t += 1u) {
+      let base = t * C_OUTER;
+      ${overCells((slot) =>
+        `total${slot} += left_tile[base + cl${slot}] * right_tile[base + cr${slot}];`)}
+    }
   }
-  outer[index] = value;
+
+  ${overCells((slot) =>
+    `if (live${slot}) { outer[pair * CELLS + cell${slot}] = total${slot}; }`)}
 }`;
+}
 
 export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> outer: array<f32>;
@@ -377,7 +457,8 @@ export class OuterProductMeanGpu {
       this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
       this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
       this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-      this.pipelines.get("opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+      this.pipelines.get(`opm:contract:${input.cOuter}`,
+        createOuterProductMeanContractShader(input.cOuter)),
       this.pipelines.get("opm:project-output", OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER),
     ]);
     const storage = GPUBufferUsage.STORAGE;
@@ -433,7 +514,10 @@ export class OuterProductMeanGpu {
         projectGrid[0], projectGrid[1]);
       const outputGrid = linearGrid(pairElements);
       if (outerFirst) {
-        const outerGrid = linearGrid(intermediateElements);
+        // ...one workgroup per PAIR now, not per element; see the note on the
+        // contraction kernel.
+        const pairs = input.length * input.length;
+        const outerGrid = [Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH)];
         pass(contractPipeline, [left.buffer, right.buffer, params.buffer, intermediate.buffer],
           outerGrid[0], outerGrid[1]);
         pass(projectOutputPipeline, [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],

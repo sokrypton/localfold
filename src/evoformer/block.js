@@ -16,7 +16,7 @@ import {
   OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
   OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER,
   OUTER_PRODUCT_MEAN_FINALIZE_SHADER,
-  OUTER_PRODUCT_MEAN_CONTRACT_SHADER,
+  createOuterProductMeanContractShader,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   outerProductMeanTileCapacity,
   OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
@@ -424,7 +424,8 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-    execution.pipelines.get("block:opm:contract", OUTER_PRODUCT_MEAN_CONTRACT_SHADER),
+    execution.pipelines.get(`block:opm:contract:${input.cOuter}`,
+      createOuterProductMeanContractShader(input.cOuter)),
     execution.pipelines.get(
       outerFirst && residualTarget !== undefined
         ? "block:opm:project-output-residual" : "block:opm:project-output",
