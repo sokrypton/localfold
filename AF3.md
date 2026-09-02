@@ -524,6 +524,13 @@ barrier the staging loop makes.
 - **Blocking the transition's first matmul over i**, on its own: nothing.
 - **Barriers.** Priced by removing them from the projection's k loop: exactly
   zero. The step stays at 8.
+- **Batching a pairformer block's dispatches into ONE compute pass**, the way
+  AF2's stack does. A trunk pass opens 1,332 of them, and the profiler's timed
+  GPU work summed to 335 ms of a 451 ms wall - which looked like 116 ms of pass
+  boundaries. It is not: batching measured 312 ms against 311. The gap was the
+  profiler's own timestamp writes (451 profiled against 403 not) plus the
+  labels the report does not list. Pass boundaries cost nothing here, and
+  splitting them per dispatch is what lets profile.js see in, so they stay.
 - **Splitting the SINGLE track's transition into two dispatches.** Its rows are
   its tokens, so the fused kernel gets 59 workgroups on a 59-residue chain and
   cannot tile out of it - 27 ms of a 307 ms pairformer for a fiftieth of its
