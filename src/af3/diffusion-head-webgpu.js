@@ -78,6 +78,12 @@ function normaliseAndProject(input, rows, channels, outChannels, scale, projecti
 }
 
 export class Af3DiffusionHeadGpu {
+  /** The last trunk's pair conditioning, which no noise level changes. */
+  #conditioningPair;
+
+  /** ...and the atom encoder's outputs that depend on it rather than on sigma. */
+  #encoderStatic;
+
   constructor(device) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
@@ -105,12 +111,26 @@ export class Af3DiffusionHeadGpu {
       return value;
     };
 
+    // 🔴 THE PAIR CONDITIONING IS COMPUTED ONCE PER TRUNK, NOT ONCE PER CALL.
+    // Nothing in it reads the noise level, so a 200-step sampler was building
+    // the same tokens x tokens x 128 tensor two hundred times. The cache is on
+    // the head instance and keyed by the trunk pair OBJECT: sampleOnGpu and
+    // flowOnGpu construct one head and spread the same input through every
+    // step, so identity is exactly the question "is this the same fold", and a
+    // new fold brings a new array. Nothing here could tell a MUTATED array
+    // apart, which is why the key is identity rather than a hash - the callers
+    // never mutate one, and a hash would cost more than the work it saves.
+    const cachedPair = this.#conditioningPair?.trunkPair === input.trunkPair
+      && this.#conditioningPair?.tokens === tokens
+      ? this.#conditioningPair.pair : undefined;
     const cond = await stage("conditioning", () =>
       new Af3DiffusionConditioningGpu(this.device).run({
         tokens, trunkSingle: input.trunkSingle, trunkPair: input.trunkPair,
         targetFeat: input.targetFeat, noiseLevel: input.noiseLevel,
         features: input.features,
-      }, weights.conditioning));
+      }, weights.conditioning, { reusePair: cachedPair }));
+    if (cachedPair === undefined) this.#encoderStatic = undefined;
+    this.#conditioningPair = { trunkPair: input.trunkPair, tokens, pair: cond.pair };
 
     // 🔴 MASKED AND RESCALED - see the note at the top.
     const scaled = new Float32Array(tokens * dense * 3);
@@ -134,7 +154,24 @@ export class Af3DiffusionHeadGpu {
         // 🔴 THE TRUNK'S single, not the conditioning module's.
         trunkSingleCond: input.trunkSingle,
         trunkPairCond: cond.pair,
-      }, weights.encoder));
+      }, weights.encoder, {
+        reuseStatic: this.#encoderStatic?.conditioning === input.conditioning
+          ? this.#encoderStatic : undefined,
+      }));
+    // ...cached under the same identity rule as the pair conditioning above,
+    // and invalidated by the same thing: a new fold brings a new trunk array.
+    if (this.#encoderStatic?.conditioning !== input.conditioning) {
+      // 🔴 KEYED ON THE PER-ATOM CONDITIONING TOO, NOT ONLY THE TRUNK. The
+      // queries and keys are built from it, and a caller that folds a different
+      // molecule against a trunk it happens to still hold would otherwise be
+      // handed the previous molecule's atom conditioning.
+      this.#encoderStatic = {
+        conditioning: input.conditioning,
+        pairCond: encoded.pairCond, queriesCond: encoded.queriesCond,
+        keysCond: encoded.keysCond, queriesMask: encoded.queriesMask,
+        keysMask: encoded.keysMask,
+      };
+    }
 
     const projected = normaliseAndProject(
       cond.single, tokens, weights.seqChannels, weights.perTokenChannels,

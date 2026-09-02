@@ -818,7 +818,7 @@ export class Af3AtomEncoderGpu {
    *   the five gathers, tokenAtomsAct, trunkSingleCond, trunkPairCond
    * @param {object} weights the pair tensors plus `blocks`
    */
-  async run(input, weights) {
+  async run(input, weights, options = {}) {
     const { tokens, dense, subsets, queries, keys } = input.shape;
     const channels = weights.channels;
     const pairChannels = weights.pairChannels;
@@ -1029,15 +1029,26 @@ export class Af3AtomEncoderGpu {
                                  tokens * perTokenChannels * 4);
       encoder.copyBufferToBuffer(act.buffer, 0, readbacks.skipConnection.buffer, 0,
                                  queryRows * channels * 4);
-      encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
-                                 pairRows * pairChannels * 4);
-      encoder.copyBufferToBuffer(queriesCond.buffer, 0, readbacks.queriesCond.buffer, 0,
-                                 queryRows * channels * 4);
-      encoder.copyBufferToBuffer(keysCond.buffer, 0, readbacks.keysCond.buffer, 0,
-                                 keyRows * channels * 4);
-      encoder.copyBufferToBuffer(queriesMask.buffer, 0, readbacks.queriesMask.buffer, 0,
-                                 queryRows * 4);
-      encoder.copyBufferToBuffer(keysMask.buffer, 0, readbacks.keysMask.buffer, 0, keyRows * 4);
+      // 🔴 FIVE OF THE SEVEN READBACKS ARE THE SAME EVERY CALL. pairCond,
+      // queriesCond, keysCond and the two masks are built from the reference
+      // conformers, the gathers and the trunk - not from the noisy positions
+      // and not from the noise level - so a 200-step sampler copied ~14 MB back
+      // from the device two hundred times to get identical arrays, and handed
+      // them straight back to the decoder. `reuseStatic` is the head saying it
+      // still has them. The GPU still COMPUTES them, because the attention
+      // blocks below read the buffers; only the copy back is skipped.
+      const reuseStatic = options.reuseStatic;
+      if (reuseStatic === undefined) {
+        encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
+                                   pairRows * pairChannels * 4);
+        encoder.copyBufferToBuffer(queriesCond.buffer, 0, readbacks.queriesCond.buffer, 0,
+                                   queryRows * channels * 4);
+        encoder.copyBufferToBuffer(keysCond.buffer, 0, readbacks.keysCond.buffer, 0,
+                                   keyRows * channels * 4);
+        encoder.copyBufferToBuffer(queriesMask.buffer, 0, readbacks.queriesMask.buffer, 0,
+                                   queryRows * 4);
+        encoder.copyBufferToBuffer(keysMask.buffer, 0, readbacks.keysMask.buffer, 0, keyRows * 4);
+      }
 
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
@@ -1052,11 +1063,11 @@ export class Af3AtomEncoderGpu {
       return {
         tokenAct: await read(readbacks.tokenAct),
         skipConnection: await read(readbacks.skipConnection),
-        pairCond: await read(readbacks.pairCond),
-        queriesCond: await read(readbacks.queriesCond),
-        keysCond: await read(readbacks.keysCond),
-        queriesMask: await read(readbacks.queriesMask),
-        keysMask: await read(readbacks.keysMask),
+        pairCond: reuseStatic?.pairCond ?? await read(readbacks.pairCond),
+        queriesCond: reuseStatic?.queriesCond ?? await read(readbacks.queriesCond),
+        keysCond: reuseStatic?.keysCond ?? await read(readbacks.keysCond),
+        queriesMask: reuseStatic?.queriesMask ?? await read(readbacks.queriesMask),
+        keysMask: reuseStatic?.keysMask ?? await read(readbacks.keysMask),
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };

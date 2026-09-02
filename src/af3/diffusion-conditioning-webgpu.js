@@ -395,10 +395,21 @@ export class Af3DiffusionConditioningGpu {
         pass.end();
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+      // 🔴 THE PAIR CONDITIONING DOES NOT DEPEND ON THE NOISE LEVEL. It is the
+      // trunk's pair and the relative encoding, projected and twice
+      // transitioned - and none of that reads sigma, which enters only through
+      // the Fourier embedding added to the SINGLE. A sampler calls this two
+      // hundred times down one schedule and got the identical pair every time.
+      // `reusePair` hands back the one a previous call already computed and
+      // skips three of the five pipelines here; the head owns the caching,
+      // because only the head knows the trunk has not changed underneath it.
+      const reusePair = options.reusePair;
       const pairLinear = spread(Math.ceil(pairs / 64));
-      run("pair-initial", compiled.pairInitial,
-          [trunkPair, features, pairScale, pairProjection, sums, pair],
-          pairLinear[0], pairLinear[1]);
+      if (reusePair === undefined) {
+        run("pair-initial", compiled.pairInitial,
+            [trunkPair, features, pairScale, pairProjection, sums, pair],
+            pairLinear[0], pairLinear[1]);
+      }
       run("single-initial", compiled.singleInitial,
           [trunkSingle, targetFeat, singleScale, singleProjection, noise, noiseWeights, single],
           Math.ceil(tokens / 64));
@@ -409,16 +420,20 @@ export class Af3DiffusionConditioningGpu {
       // closed-form relative-encoding path is checked on its own.
       const transitionCount = options.transitions ?? 2;
       for (let index = 0; index < transitionCount; index += 1) {
-        const perPair = spread(pairs);
-        run(`pair-transition-${index}`, transitionPipelines.pair[index],
-            [pair, transitionWeights.pair[index], pairScratch], perPair[0], perPair[1]);
-        run(`pair-add-${index}`, compiled.addPair, [pair, pairScratch], pairAdd[0], pairAdd[1]);
+        if (reusePair === undefined) {
+          const perPair = spread(pairs);
+          run(`pair-transition-${index}`, transitionPipelines.pair[index],
+              [pair, transitionWeights.pair[index], pairScratch], perPair[0], perPair[1]);
+          run(`pair-add-${index}`, compiled.addPair, [pair, pairScratch], pairAdd[0], pairAdd[1]);
+        }
         run(`single-transition-${index}`, transitionPipelines.single[index],
             [single, transitionWeights.single[index], singleScratch], tokens);
         run(`single-add-${index}`, compiled.addSingle, [single, singleScratch],
             singleAdd[0], singleAdd[1]);
       }
-      encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);
+      if (reusePair === undefined) {
+        encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);
+      }
       encoder.copyBufferToBuffer(single.buffer, 0, readSingle.buffer, 0, tokens * seqChannels * 4);
 
       const start = performance.now();
@@ -432,7 +447,7 @@ export class Af3DiffusionConditioningGpu {
         return copy;
       };
       return {
-        pair: await read(readPair), single: await read(readSingle),
+        pair: reusePair ?? await read(readPair), single: await read(readSingle),
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };
