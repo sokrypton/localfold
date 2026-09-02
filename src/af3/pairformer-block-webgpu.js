@@ -124,8 +124,6 @@ function packPairLogitsWeights(weights) {
   return { data, offsets };
 }
 
-/** Packed per-block weights, tied to the block object's own lifetime. */
-const packedCache = new WeakMap();
 
 export class Af3PairformerStackGpu {
   constructor(device) {
@@ -321,15 +319,20 @@ export class Af3PairformerStackGpu {
       blockAllocations.push(allocation);
       return allocation;
     };
-    // 🔴 PACKED ONCE PER BLOCK, EVER. Concatenating a block's tensors into one
-    // Float32Array does not depend on anything but the block, and the block
-    // objects live for the life of the page - so doing it inside the encode
-    // loop meant redoing 35 ms of CPU work on every pass, every recycle and
-    // every fold, in between GPU submissions where it stalls the encoding
-    // rather than overlapping anything. A WeakMap keeps it tied to the block's
-    // own lifetime, so nothing is held after the weights are dropped.
-    const packedPair = packedCache.get(block)
-      ?? packedCache.set(block, packPairTrackWeights(block)).get(block);
+    // 🔴 PACKED ONCE PER BLOCK, EVER, AND THEN LET GO OF. Concatenating a
+    // block's tensors into one Float32Array does not depend on anything but the
+    // block, so doing it inside the encode loop meant redoing 35 ms of CPU work
+    // on every pass, every recycle and every fold, in between GPU submissions
+    // where it stalls the encoding rather than overlapping anything.
+    //
+    // 🔴 BUT A WeakMap KEEPING IT ALIVE COST 350 MiB OF HEAP FOR NOTHING. The
+    // packed arrays exist to fill the resident device buffers below, and
+    // residentWeightBuffer calls pack() only on a MISS - so after a block's
+    // first encode nothing ever reads them again. Holding them made the page's
+    // heap 1.1 GiB for a 59-token fold. This packs on demand instead: at most
+    // once per block, and only while the misses are being filled.
+    let packedPair;
+    const packedFor = () => (packedPair ??= packPairTrackWeights(block));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
@@ -338,11 +341,11 @@ export class Af3PairformerStackGpu {
       buffer: residentWeightBuffer(this.device, block, label, pack),
     });
     const pairTrackWeights = {
-      outgoing: resident("w.tri.out", () => packedPair.outgoing),
-      incoming: resident("w.tri.in", () => packedPair.incoming),
-      grid1: resident("w.grid1", () => packedPair.grid1),
-      grid2: resident("w.grid2", () => packedPair.grid2),
-      transition: resident("w.pair-transition", () => packedPair.transition),
+      outgoing: resident("w.tri.out", () => packedFor().outgoing),
+      incoming: resident("w.tri.in", () => packedFor().incoming),
+      grid1: resident("w.grid1", () => packedFor().grid1),
+      grid2: resident("w.grid2", () => packedFor().grid2),
+      transition: resident("w.pair-transition", () => packedFor().transition),
     };
     const singleTransitionWeights = resident("w.single-transition",
       () => packTransitionWeights(block.singleTransition).data);

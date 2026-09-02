@@ -42,6 +42,7 @@ values means the whole-stack checker, not that file.
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
+| Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
