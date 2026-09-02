@@ -81,7 +81,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       picker.title = "Common ligands and ions";
       const custom = document.createElement("option");
       custom.value = "";
-      custom.textContent = "Custom…";
+      custom.textContent = "Custom";
       picker.append(custom);
       for (const [label, entries] of [["Ligands", COMMON_LIGANDS], ["Ions", COMMON_IONS]]) {
         const group = document.createElement("optgroup");
