@@ -64,17 +64,14 @@ try {
   if (!navigator.gpu) throw new Error("no navigator.gpu: Chrome was launched without WebGPU");
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (adapter === null) throw new Error("no WebGPU adapter");
-  const features = [];
-  if (adapter.features.has("shader-f16")) features.push("shader-f16");
-  // 🔴 THE DEFAULT LIMITS ARE TOO SMALL FOR A REAL PROTEIN. WebGPU defaults
-  // maxStorageBufferBindingSize to 128 MiB; the AF3 pair representation at 600
-  // tokens is 600*600*128*4 = 184.3 MB, so the kernel fails validation at a
-  // length people actually fold. The adapter allows 4 GiB - it just has to be
-  // asked. Ask for whatever it has.
-  const device = await adapter.requestDevice({ requiredFeatures: features, requiredLimits: {
-    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-    maxBufferSize: adapter.limits.maxBufferSize,
-  } });
+  // 🔴 THE SAME DEVICE THE PAGE ASKS FOR, FROM THE SAME PLACE. This used to
+  // hand-roll its own requiredLimits, and had already drifted: it was missing
+  // maxComputeWorkgroupsPerDimension, so a bench could pass on a device the
+  // page does not get. A kernel that picks its shape from device.limits - the
+  // diffusion transformer picks its token tile that way - would then be
+  // measured in one configuration and shipped in another.
+  const { requestAlphaFoldDevice } = await import("/src/runtime/device.js");
+  const device = await requestAlphaFoldDevice(adapter);
   device.addEventListener("uncapturederror", (event) => {
     post({ ok: false, error: "uncaptured: " + event.error.message, logs });
   });
@@ -83,7 +80,7 @@ try {
   const value = await module.main(device, ${JSON.stringify(moduleArgs)});
   post({ ok: true, value, logs, adapter: {
     vendor: adapter.info?.vendor, architecture: adapter.info?.architecture,
-    description: adapter.info?.description, features,
+    description: adapter.info?.description, features: [...device.features],
   } });
 } catch (error) {
   post({ ok: false, error: error && error.stack ? error.stack : String(error), logs });

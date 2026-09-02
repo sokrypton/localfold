@@ -134,11 +134,22 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   const lanes = shape.lanes ?? 256;
   // How many tokens one workgroup projects at once, and how many ways its
   // output range is split. `splits` must divide heads*dimension.
-  const tile = shape.tile ?? 4;
-  const splits = shape.splits ?? 2;
-  // The way back from the widened tensor needs twice the scratch a token, so it
-  // tiles half as far.
-  const outTile = shape.outTile ?? Math.max(1, Math.floor(tile / 2));
+  // 🔴 NO DEFAULTS HERE. These used to fall back to their own constants, and a
+  // caller that resolved them from the device limits and forgot to pass them
+  // down got shaders tiling by four under a dispatch that divided the token
+  // count by eight - half the tokens never projected, reported as a speedup.
+  // A shape that does not say is a bug, so say so.
+  const { tile, splits, outTile } = shape;
+  for (const [name, value] of Object.entries({ tile, splits, outTile })) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw new Error(`the diffusion transformer's ${name} must be a positive integer,`
+        + ` not ${value}: the caller resolves it from the device's workgroup storage`);
+    }
+  }
+  if ((heads * dimension) % splits !== 0 || (channels * factor) % splits !== 0) {
+    throw new Error(`splits ${splits} must divide both ${heads * dimension} and`
+      + ` ${channels * factor}`);
+  }
   const width = heads * dimension;
   const intermediate = channels * factor;
   const pairs = tokens * tokens;
@@ -689,13 +700,37 @@ export class Af3DiffusionTransformerGpu {
     }
 
     const sample = packBlockWeights(weights.superBlocks[0].blocks[0]);
+    // 🔴 FOUR AND TWO ARE MEASURED, AND MORE IS WORSE. Each kernel holds its
+    // tile of activations in workgroup storage - the projection and the
+    // widening keep `channels` floats a token, the way back `intermediate`,
+    // twice as many - so a bigger tile buys weight traffic and costs
+    // workgroups, and past here the workgroups are worth more:
+    //
+    //     tile     2   4   4   4   4   6   8      outTile 1 2 3 4 for tile 4
+    //     outTile  2   1   2   3   4   2   2
+    //     ms      91  75  74  79  85  79  83
+    //
+    // 🔴 SO RAISING maxComputeWorkgroupStorageSize BOUGHT NOTHING. It is asked
+    // for in src/runtime/device.js and it does lift the ceiling from four
+    // tokens to ten - but the ceiling was never what bound this, occupancy was.
+    // The limit stays requested because it costs nothing and the cap below is
+    // then real rather than notional; the numbers above are why the defaults do
+    // not use the room.
+    //
+    // 🔴 AND THEY ARE RESOLVED BEFORE THE SHAPE, NOT AFTER. Leaving them to
+    // default a second time inside the shader factory meant the SHADERS tiled
+    // by four while the DISPATCH divided the token count by eight: every second
+    // tile of tokens was simply never projected, and the bench reported it as a
+    // 30% speedup. One resolution, passed down.
+    const workgroupStorage = this.device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+    const intermediate = channels * weights.transitionFactor;
+    const fits = (perToken) => Math.max(1, Math.floor(workgroupStorage / (perToken * 4)));
+    const tile = weights.tile ?? Math.min(4, fits(channels));
+    const splits = weights.splits ?? 2;
+    const outTile = weights.outTile ?? Math.min(2, tile, fits(intermediate));
     const shape = { tokens, channels, condChannels, pairChannels, heads, dimension,
                     factor: weights.transitionFactor, lanes: weights.lanes,
-                    tile: weights.tile, splits: weights.splits,
-                    outTile: weights.outTile };
-    const tile = shape.tile ?? 4;
-    const splits = shape.splits ?? 2;
-    const outTile = shape.outTile ?? Math.max(1, Math.floor(tile / 2));
+                    tile, splits, outTile };
     const sources = createDiffusionTransformerShaders(shape, sample.offsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a

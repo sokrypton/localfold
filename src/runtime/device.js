@@ -18,6 +18,13 @@ const RAISED_LIMITS = [
   "maxBufferSize",
   // Long sequences make the pair track's dispatches wide.
   "maxComputeWorkgroupsPerDimension",
+  // 🔴 THE DIFFUSION TRANSFORMER SPENDS THIS ON TOKEN TILES. Its matmul kernels
+  // hold a tile of activations in workgroup memory so that one weight read
+  // serves the whole tile, and the tile size is capped by exactly this limit -
+  // 16 KiB by default, which allows four tokens, against the 32 KiB every
+  // adapter tested reports. It is the difference between reading the block's
+  // weights once per four tokens and once per eight.
+  "maxComputeWorkgroupStorageSize",
 ];
 
 export async function requestAlphaFoldDevice(adapter) {

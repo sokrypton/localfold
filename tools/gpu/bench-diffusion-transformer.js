@@ -60,6 +60,8 @@ export async function main(device, args) {
     lanes: args.some((a) => a.startsWith("--lanes=")) ? Number(option(args, "lanes", "")) : undefined,
     tile: args.some((a) => a.startsWith("--tile=")) ? Number(option(args, "tile", "")) : undefined,
     splits: args.some((a) => a.startsWith("--splits=")) ? Number(option(args, "splits", "")) : undefined,
+    outTile: args.some((a) => a.startsWith("--out-tile="))
+      ? Number(option(args, "out-tile", "")) : undefined,
     pairInputLayerNormScale: new Float32Array(pairChannels).fill(1),
     superBlocks: Array.from({ length: superBlocks }, () => ({
       // 🔴 THE SAME OBJECT IN EVERY SLOT, WHICH IS THE POINT ON THE WEIGHT
