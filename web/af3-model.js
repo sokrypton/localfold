@@ -76,37 +76,11 @@ let weightsPromise;
  * manifest and died before asking for a single shard, which is a failure about
  * metadata wearing the costume of a failure about weights.
  */
-/**
- * 🔴 THE PROGRESS CALLBACK IS A MUTABLE SINK, not the one baked in at the first
- * call. The download can be started speculatively before anybody wants to watch
- * it - see warmAf3Weights - and the fold that later awaits the same promise has
- * to be able to attach its own progress bar to a load already in flight.
- */
-let progressSink = null;
-
-/**
- * Start the download without waiting for it, and without minding if it fails.
- *
- * 🔴 A COLD AF3 LOAD IS TEN SECONDS OF NETWORK AND NOTHING ELSE CAN OVERLAP IT
- * once a fold has been asked for. 277 MB of int5 at the 27 MB/s eight parallel
- * connections reach here - gzip takes 5% off packed integers and no more - so
- * the only thing left to move is WHEN it starts. Typing a sequence is the
- * signal: by the time the button is pressed the bytes are on their way.
- *
- * Speculative, so it swallows its own errors: a real fold calls
- * loadAf3Weights and gets the same promise, and the same failure, with a
- * status line attached to it.
- */
-export function warmAf3Weights() {
-  void loadAf3Weights().catch(() => {});
-}
-
 export function loadAf3Weights(onProgress) {
-  if (onProgress !== undefined) progressSink = onProgress;
   weightsPromise ??= (async () => {
     const bundle = MODEL_BUNDLES.af3;
     const store = await HttpTensorStore.fromManifest(
-      bundle.directory, await loadManifest("af3"), (progress) => progressSink?.(progress));
+      bundle.directory, await loadManifest("af3"), onProgress);
     // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
     // and await each one - so without this the network runs one shard at a time
     // and idles through every dequantisation. See HttpTensorStore.prefetch.

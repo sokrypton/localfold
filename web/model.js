@@ -23,8 +23,6 @@ import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { withAbort } from "../src/runtime/abort.js";
 
 const stores = new Map();
-// Progress callbacks by family; see openStore.
-const progressSinks = new Map();
 
 /**
  * The tensor store for one model family, on whatever this origin can use.
@@ -46,30 +44,18 @@ const progressSinks = new Map();
  *
  * @param {import("../src/reference/manifests/index.js").ModelFamily} family
  */
-/**
- * Start a family's shards downloading without waiting, and without minding if
- * it fails. See warmAf3Weights in af3-model.js for why this exists.
- */
-export function warmStore(family) {
-  try { void openStore(undefined, family).catch(() => {}); } catch { /* speculative */ }
-}
-
 export function openStore(onProgress, family = "monomer") {
   const bundle = MODEL_BUNDLES[family];
   if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
   const override = family === "monomer"
     ? new URLSearchParams(location.search).get("model") : null;
   if (override !== null) return HttpTensorStore.open(override, onProgress);
-  // ...the sink, not the callback, so a speculative warm-up can be joined later
-  // by a fold that wants a progress bar. See warmAf3Weights.
-  if (onProgress !== undefined) progressSinks.set(family, onProgress);
   let store = stores.get(family);
   if (store === undefined) {
     store = (async () => {
       const manifest = await loadManifest(family);
       const Store = location.protocol === "file:" ? ScriptTensorStore : HttpTensorStore;
-      const opened = await Store.fromManifest(bundle.directory, manifest,
-        (progress) => progressSinks.get(family)?.(progress));
+      const opened = await Store.fromManifest(bundle.directory, manifest, onProgress);
       // ...every shard at once; see HttpTensorStore.prefetch. AF2's loaders read
       // the whole bundle too.
       opened.prefetch?.();

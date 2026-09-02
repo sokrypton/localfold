@@ -210,9 +210,15 @@ and prints a range; trust the range, not a pair.
    the network while it is dequantised, fetch the next. The eight-way limit was
    never once reached because nothing ever asked for eight.
    `HttpTensorStore.prefetch()` schedules them all up front, and the page calls
-   it. It also now starts on the first typed sequence rather than on Fold, so
-   the transfer overlaps composing the input: measured, 15 of 26 shards are down
-   four seconds after typing, with the button still untouched.
+   it once a load has legitimately begun.
+
+   🔴 **AND STARTING THE TRANSFER EARLIER WAS BUILT AND THEN TAKEN OUT.** Warming
+   on the first typed sequence worked - 15 of 26 shards down four seconds after
+   typing, with the button untouched - but it has to guess which model the
+   sequence is for, and guessing wrong spends 277 MB on a download nobody wanted.
+   With a model selector on the page and more models intended, the guess is
+   wrong often enough that it is not worth having. If it ever returns it belongs
+   on the model SELECTION, not on the sequence.
 
    **What is left is the bytes, and they are close to irreducible.** 277 MB of
    int5, served gzipped already, and gzip takes 5% off packed integers. The
