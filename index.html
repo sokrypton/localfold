@@ -202,13 +202,22 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    TOGGLE. Two controls for one decision could disagree - the
                    toggle said off while the select still read "Search" - and
                    the reader had to look at both to know what would be sent
-                   anywhere. `none` is the default because a fold that reaches
-                   a remote service should be asked for, not arrived at. -->
+                   anywhere.
+                   🔴 AND "Search" IS THE DEFAULT, WHICH IT DID NOT USED TO BE.
+                   The old default was `none`, on the reasoning that a fold
+                   reaching a remote service should be asked for rather than
+                   arrived at. What that actually produced was a page whose
+                   first answer is the model's WORST one - single-sequence -
+                   which misrepresents the model to everybody who does not know
+                   to change it. The remote call is named in the option text and
+                   in the footer badge, which switches to "MSA via colabfold.com"
+                   for this mode; PRIVACY_NOTE in web/app.js is the other half of
+                   this decision and the two must not drift. -->
               <div class="fetch-option-group" id="msaModeGroup">
                 <span class="fetch-option-title">MSA</span>
                 <select id="msa-mode">
-                  <option value="none" selected>None</option>
-                  <option value="search">Search (remote)</option>
+                  <option value="none">None</option>
+                  <option value="search" selected>Search (remote)</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
                 </select>
