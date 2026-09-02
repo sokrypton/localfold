@@ -296,12 +296,11 @@ export class Af3AtomDecoderGpu {
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
         // ...one workgroup per TILE of query rows; see the note on `output`.
-        const perQuery = spread(queryRows);
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
-            perQuery[0], perQuery[1]);
+            perOutput[0], perOutput[1]);
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perQuery[0], perQuery[1]);
+            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);

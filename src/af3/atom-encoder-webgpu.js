@@ -480,70 +480,145 @@ export function createAtomBlockShaders(common, shape) {
     ?? outputRowTileFor(shape.subsets * shape.queries);
   const { channels, keys } = shape;
   const intermediate = channels * 2;
+  const rowWidth = Math.min(4, outputRowTile);
+  const rowGroups = outputRowTile / rowWidth;
+  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowWidth];
+  if (rowVector === undefined || !Number.isInteger(rowGroups)) {
+    throw new Error(`outputRowTile ${outputRowTile} is not 1, 2 or a multiple of 4`);
+  }
+  const rowLane = (t) => rowWidth === 1 ? "" : `.${"xyzw"[t % rowWidth]}`;
+  const rowGroup = (t) => Math.floor(t / rowWidth);
+  const overRows = (body) =>
+    Array.from({ length: outputRowTile }, (_, t) => body(t)).join("\n    ");
+  const overRowGroups = (body) =>
+    Array.from({ length: rowGroups }, (_, g) => body(g)).join("\n    ");
+  /** A per-row quantity gathered into the tile's vectors. */
+  const gather = (name, expression) => `${overRowGroups((g) => `var ${name}${g} = ${rowVector}(0.0);`)}
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      ${name}${rowGroup(t)}${rowLane(t)} = ${expression};
+    }`)}`;
 
-  // AdaLN on queries and keys (different prefixes), then q/k/v/gate.
-  const project = `${common}
-@group(0) @binding(0) var<storage, read> act: array<f32>;
-@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<storage, read_write> q: array<f32>;
-@group(0) @binding(4) var<storage, read_write> gate: array<f32>;
+  /**
+   * AdaLN on a row's activation, conditioned by that row's own conditioning,
+   * then two projections of the result. The query side and the atom-wise key
+   * side are the same operation with different weights and different outputs,
+   * so they are generated from here.
+   *
+   * 🔴 A TILE OF ROWS, for the reason the `output` kernel gives: with one
+   * workgroup a row each of the four matrices is read whole to produce a single
+   * row - 262 KB of weights for 128 output values.
+   */
+  const conditionedProject = (prefix, options) => `${common}
+const ROW_TILE: u32 = ${outputRowTile}u;
+${options.bindings}
 
-var<workgroup> xq: array<f32, ${channels}>;
-var<workgroup> qcond: array<f32, ${channels}>;
+var<workgroup> xq: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> qcond: array<${rowVector}, ${rowGroups * channels}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= QUERY_ROWS) { return; }
+  let base_row = (group.x + group.y * GRID_WIDTH) * ROW_TILE;
+  if (base_row >= QUERY_ROWS) { return; }
   let local = local_id.x;
-  var total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { total += act[row * C + c]; }
-  let mean = total / f32(C);
-  var variance = 0.0;
-  for (var c = 0u; c < C; c += 1u) {
-    let d = act[row * C + c] - mean;
-    variance += d * d;
-  }
-  let inverse = inverseSqrt(variance / f32(C) + EPSILON);
 
-  var cond_total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { cond_total += queries_cond[row * C + c]; }
-  let cond_mean = cond_total / f32(C);
-  var cond_variance = 0.0;
+  // ...a row past the end is clamped rather than skipped: every lane reaches
+  // the barriers, and its lane of each vector is dropped at the write.
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
+  var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    let d = queries_cond[row * C + c] - cond_mean;
-    cond_variance += d * d;
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      total${rowGroup(t)}${rowLane(t)} += act[row * C + c];
+      cond_total${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + c];
+    }`)}
   }
-  let cond_inverse = inverseSqrt(cond_variance / f32(C) + EPSILON);
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
+  let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
+  var variance${g} = ${rowVector}(0.0);
+  var cond_variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      let d = act[row * C + c] - mean${rowGroup(t)}${rowLane(t)};
+      variance${rowGroup(t)}${rowLane(t)} += d * d;
+      let e = queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)};
+      cond_variance${rowGroup(t)}${rowLane(t)} += e * e;
+    }`)}
+  }
+  ${overRowGroups((g) => `let inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));
+  let cond_inverse${g} =
+    inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
+
   for (var c = local; c < C; c += 64u) {
-    qcond[c] = (queries_cond[row * C + c] - cond_mean) * cond_inverse
-      * weights[W_qSingleCondLayerNormScale + c];
+    let scale = weights[W_${prefix}SingleCondLayerNormScale + c];
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      qcond[${rowGroup(t)}u * C + c]${rowLane(t)} =
+        (queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)})
+        * cond_inverse${rowGroup(t)}${rowLane(t)} * scale;
+    }`)}
   }
   workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
-    var scale_value = weights[W_qSingleCondScaleBias + c];
-    var shift = 0.0;
+    ${overRowGroups((g) =>
+      `var scale_value${g} = ${rowVector}(weights[W_${prefix}SingleCondScaleBias + c]);
+    var shift${g} = ${rowVector}(0.0);`)}
     for (var d = 0u; d < C; d += 1u) {
-      scale_value += qcond[d] * weights[W_qSingleCondScaleWeights + d * C + c];
-      shift += qcond[d] * weights[W_qSingleCondBias + d * C + c];
+      let ws = weights[W_${prefix}SingleCondScaleWeights + d * C + c];
+      let wb = weights[W_${prefix}SingleCondBias + d * C + c];
+      ${overRowGroups((g) => `{
+        let cn = qcond[${g}u * C + d];
+        scale_value${g} += cn * ws;
+        shift${g} += cn * wb;
+      }`)}
     }
-    xq[c] = logistic(scale_value) * ((act[row * C + c] - mean) * inverse) + shift;
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      xq[${rowGroup(t)}u * C + c]${rowLane(t)} =
+        logistic(scale_value${rowGroup(t)}${rowLane(t)})
+        * ((act[row * C + c] - mean${rowGroup(t)}${rowLane(t)})
+           * inverse${rowGroup(t)}${rowLane(t)})
+        + shift${rowGroup(t)}${rowLane(t)};
+    }`)}
   }
   workgroupBarrier();
 
   for (var out = local; out < WIDTH; out += 64u) {
-    var q_total = weights[W_qBias + out];
-    var gate_total = 0.0;
+    ${overRowGroups((g) =>
+      `var a${g} = ${rowVector}(${options.biasA ? `weights[${options.biasA} + out]` : "0.0"});
+    var b${g} = ${rowVector}(0.0);`)}
     for (var c = 0u; c < C; c += 1u) {
-      q_total += xq[c] * weights[W_qProjection + c * WIDTH + out];
-      gate_total += xq[c] * weights[W_gatingQuery + c * WIDTH + out];
+      // ...read once, used by every row of the tile.
+      let wa = weights[${options.weightA} + c * WIDTH + out];
+      let wb = weights[${options.weightB} + c * WIDTH + out];
+      ${overRowGroups((g) => `{
+        let x = xq[${g}u * C + c];
+        a${g} += x * wa;
+        b${g} += x * wb;
+      }`)}
     }
-    q[row * WIDTH + out] = q_total;
-    gate[row * WIDTH + out] = gate_total;
+    ${overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        ${options.outA}[row * WIDTH + out] = a${rowGroup(t)}${rowLane(t)};
+        ${options.outB}[row * WIDTH + out] = b${rowGroup(t)}${rowLane(t)};
+      }
+    }`)}
   }
 }`;
+
+  const project = conditionedProject("q", {
+    bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> q: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gate: array<f32>;`,
+    weightA: "W_qProjection", biasA: "W_qBias", outA: "q",
+    weightB: "W_gatingQuery", outB: "gate",
+  });
 
   // The key side is a separate dispatch because there are more key rows than
   // query rows, and they gather the activation through queries_to_keys.
@@ -621,81 +696,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     v[row * WIDTH + out] = v_total;
   }
 }`;
-  const projectKeysAtoms = `${common}
-@group(0) @binding(0) var<storage, read> act: array<f32>;
+  const projectKeysAtoms = conditionedProject("k", {
+    bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> k: array<f32>;
-@group(0) @binding(4) var<storage, read_write> v: array<f32>;
-
-var<workgroup> xk: array<f32, ${channels}>;
-var<workgroup> kcond: array<f32, ${channels}>;
-
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) group: vec3<u32>,
-        @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= QUERY_ROWS) { return; }
-  let local = local_id.x;
-  // ...every atom is its own source here, and there is no dead slot: the key
-  // layout's padding is applied when this is expanded into it.
-  let live = true;
-  let source = row;
-
-  var total = 0.0;
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    if (live) { value = act[source * C + c]; }
-    total += value;
-  }
-  let mean = total / f32(C);
-  var variance = 0.0;
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    if (live) { value = act[source * C + c]; }
-    let d = value - mean;
-    variance += d * d;
-  }
-  let inverse = inverseSqrt(variance / f32(C) + EPSILON);
-
-  var cond_total = 0.0;
-  for (var c = 0u; c < C; c += 1u) { cond_total += queries_cond[row * C + c]; }
-  let cond_mean = cond_total / f32(C);
-  var cond_variance = 0.0;
-  for (var c = 0u; c < C; c += 1u) {
-    let d = queries_cond[row * C + c] - cond_mean;
-    cond_variance += d * d;
-  }
-  let cond_inverse = inverseSqrt(cond_variance / f32(C) + EPSILON);
-  for (var c = local; c < C; c += 64u) {
-    kcond[c] = (queries_cond[row * C + c] - cond_mean) * cond_inverse
-      * weights[W_kSingleCondLayerNormScale + c];
-  }
-  workgroupBarrier();
-  for (var c = local; c < C; c += 64u) {
-    var scale_value = weights[W_kSingleCondScaleBias + c];
-    var shift = 0.0;
-    for (var d = 0u; d < C; d += 1u) {
-      scale_value += kcond[d] * weights[W_kSingleCondScaleWeights + d * C + c];
-      shift += kcond[d] * weights[W_kSingleCondBias + d * C + c];
-    }
-    var value = 0.0;
-    if (live) { value = act[source * C + c]; }
-    xk[c] = logistic(scale_value) * ((value - mean) * inverse) + shift;
-  }
-  workgroupBarrier();
-
-  for (var out = local; out < WIDTH; out += 64u) {
-    var k_total = 0.0;
-    var v_total = 0.0;
-    for (var c = 0u; c < C; c += 1u) {
-      k_total += xk[c] * weights[W_kProjection + c * WIDTH + out];
-      v_total += xk[c] * weights[W_vProjection + c * WIDTH + out];
-    }
-    k[row * WIDTH + out] = k_total;
-    v[row * WIDTH + out] = v_total;
-  }
-}`;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;`,
+    weightA: "W_kProjection", outA: "k",
+    weightB: "W_vProjection", outB: "v",
+  });
 
   // 🔴 THE KEY ROWS ARE A GATHER OF THE QUERY ROWS, SO THEIR PROJECTION IS ONE
   // TOO. queries_to_keys maps 45x128 key slots onto 1440 atoms - about four
@@ -818,24 +827,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // blocks of a decoder call were 10.5 ms of 24. The rows share every weight
   // and share nothing else, so a tile of them is exactly the vector: one read,
   // one vector multiply-add, four rows.
-  const rowWidth = Math.min(4, outputRowTile);
-  const rowGroups = outputRowTile / rowWidth;
-  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowWidth];
-  if (rowVector === undefined || !Number.isInteger(rowGroups)) {
-    throw new Error(`outputRowTile ${outputRowTile} is not 1, 2 or a multiple of 4`);
-  }
-  const rowLane = (t) => rowWidth === 1 ? "" : `.${"xyzw"[t % rowWidth]}`;
-  const rowGroup = (t) => Math.floor(t / rowWidth);
-  const overRows = (body) =>
-    Array.from({ length: outputRowTile }, (_, t) => body(t)).join("\n    ");
-  const overRowGroups = (body) =>
-    Array.from({ length: rowGroups }, (_, g) => body(g)).join("\n    ");
-  /** A per-row quantity gathered into the tile's vectors. */
-  const gather = (name, expression) => `${overRowGroups((g) => `var ${name}${g} = ${rowVector}(0.0);`)}
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      ${name}${rowGroup(t)}${rowLane(t)} = ${expression};
-    }`)}`;
   const output = `${common}
 const ROW_TILE: u32 = ${outputRowTile}u;
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
@@ -1313,12 +1304,11 @@ export class Af3AtomEncoderGpu {
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
         // ...one workgroup per TILE of query rows; see the note on `output`.
-        const perQuery = spread(queryRows);
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project,
-            [act, queriesCond, w, q, gate], perQuery[0], perQuery[1]);
+            [act, queriesCond, w, q, gate], perOutput[0], perOutput[1]);
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perQuery[0], perQuery[1]);
+            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
