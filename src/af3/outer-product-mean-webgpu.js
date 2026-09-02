@@ -126,6 +126,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // One workgroup per token pair: accumulate the 32x32 product over sequences
   // in workgroup memory, then map it through output_w.
+  //
+  // 🔴 THIS IS THE HOT KERNEL AT DEPTH, AND STAGING THE ROWS WAS TRIED AND LOST.
+  // The MSA stack costs about 72 ms fixed plus 0.38 ms a row, so at AF3's own
+  // num_msa of 1024 it is 469 ms - 43% of a trunk pass - and this contraction is
+  // half of that.
+  //
+  // The redundancy is real and looks damning: each of the 64 lanes owns
+  // PRODUCTS/64 cells and walks all SEQUENCES rows for every one of them, so a
+  // workgroup reads 2 x PRODUCTS x SEQUENCES floats to consume 2 x C_OUTER x
+  // SEQUENCES distinct ones - 32-fold. Staging each chunk of rows' two 32-float
+  // slices in workgroup memory removes exactly that, and measured at 1024 rows
+  // it went 469 ms to 673, 44% WORSE. Two reasons, both structural: the tiled
+  // form needs a per-lane accumulator ARRAY indexed by a loop variable, which
+  // WGSL puts in spillable local memory rather than registers, where the
+  // straight version keeps one scalar `total` live; and it pays two workgroup
+  // barriers per chunk. The reads it saves were being served by cache anyway -
+  // one workgroup's slice of `left` is 32 floats a row, 128 KiB at 1024 rows.
+  //
+  // Staging ALL the rows instead, so the cell loop could keep its scalar, wants
+  // 2 x SEQUENCES x C_OUTER floats - 256 KiB at 1024 rows against a 32 KiB
+  // limit - so the two ways out of the redundancy are mutually exclusive here.
   const contract = `${common}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
