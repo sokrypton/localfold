@@ -166,5 +166,130 @@ def main():
                       f" -{sorted(internal - here)}")
 
 
+# 🔴 NUCLEIC ACIDS ARE THE MIRROR IMAGE OF PROTEIN, AT THE OTHER END. A protein
+# residue gains an OXT at its C-terminus and its N-terminal form is the internal
+# one; a nucleotide gains OP3 at its 5' end - the phosphate oxygen an internal
+# residue trades for the bond to the one before it - and its 3' form is the
+# internal one. Measured, not assumed: an eight-base chain gives its first
+# adenine 22 atoms and its fifth 21, while the last base has exactly as many as
+# its internal twin.
+def _atoms_js(atoms):
+    rows = ", ".join(
+        "[{},{!r},{},{},{},{},{}]".format(
+            a["slot"], a["name"], a["element"],
+            int(a["charge"]) if float(a["charge"]).is_integer() else a["charge"],
+            *a["pos"])
+        for a in atoms)
+    return "[" + rows + "]"
+
+
+def write_nucleic_module(tables):
+    """The JS constant the browser reads, written from the table above."""
+    here = ROOT / "tools" / "oracle"
+    parts = [(here / "js_header.txt").read_text().rstrip()]
+    for kind, table in tables.items():
+        parts.append("")
+        parts.append("export const %s_CONFORMERS = {" % kind.upper())
+        for code, entry in table.items():
+            parts.append("  %s: { aatype: %d," % (code, entry["aatype"]))
+            parts.append("    internal: %s," % _atoms_js(entry["internal"]))
+            parts.append("    fivePrime: %s," % _atoms_js(entry["fivePrime"]))
+            rigid = ", ".join("[%d,%d,%s]" % (i, j, d) for i, j, d in entry["rigid"])
+            parts.append("    rigid: [%s] }," % rigid)
+        parts.append("};")
+    parts.append((here / "js_tail.txt").read_text().rstrip())
+    target = ROOT / "src" / "af3" / "reference-conformers-nucleic.js"
+    target.write_text("\n".join(parts) + "\n")
+    print("%s  %.0f KiB" % (target.relative_to(ROOT), target.stat().st_size / 1024))
+
+
+NUCLEIC = {
+    "dna": ("A", "C", "G", "T"),
+    "rna": ("A", "C", "G", "U"),
+}
+NUCLEIC_POSITIONS = ("fivePrime", "internal", "threePrime")
+
+
+def nucleic_table():
+    """The eight nucleotide components, from AF3's own featuriser."""
+    from colabdesign2.af3.alphafold3.common import folding_input as fi
+
+    tables = {}
+    for kind, codes in NUCLEIC.items():
+        table = {}
+        for code in codes:
+            length = 12
+            sequence = code * length
+            chain = (fi.DnaChain(id="A", sequence=sequence, modifications=[])
+                     if kind == "dna"
+                     else fi.RnaChain(id="A", sequence=sequence, modifications=[],
+                                      unpaired_msa=f">q\n{sequence}\n"))
+            batch = f3.featurise(fi.Input(name=f"{kind}-{code}", chains=[chain],
+                                          rng_seeds=[0]), msa_crop_size=4)
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            mask = np.asarray(batch["ref_mask"]).astype(bool)
+            pos = np.asarray(batch["ref_pos"], np.float64)
+            element = np.asarray(batch["ref_element"]).astype(int)
+            charge = np.asarray(batch["ref_charge"], np.float64)
+            chars = np.asarray(batch["ref_atom_name_chars"]).astype(int)
+            aatype = np.asarray(batch["aatype"]).astype(int)
+
+            entry = {"aatype": int(aatype[1])}
+            internal = list(range(1, length - 1))
+            for token, where in zip((0, 1, length - 1), NUCLEIC_POSITIONS):
+                slots = np.nonzero(mask[token])[0]
+                entry[where] = [
+                    {"slot": int(s), "name": name_of(chars[token, s]),
+                     "element": int(element[token, s]),
+                     "charge": round(float(charge[token, s]), 6),
+                     "pos": [round(float(v), 4) for v in pos[token, s]]}
+                    for s in slots]
+            slots = [a["slot"] for a in entry["internal"]]
+            n = len(slots)
+            spread = np.zeros((n, n))
+            first = None
+            for t in internal:
+                p = pos[t][slots]
+                d = np.linalg.norm(p[:, None] - p[None], axis=-1)
+                if first is None:
+                    first = d
+                spread = np.maximum(spread, np.abs(d - first))
+            bonded = (first < BOND_LENGTH) & ~np.eye(n, dtype=bool)
+            rigid = bonded | (bonded @ bonded)
+            entry["rigid"] = [[i, j, round(float(first[i, j]), 4)]
+                              for i in range(n) for j in range(i + 1, n)
+                              if rigid[i, j]]
+            entry["samples"] = len(internal)
+            loose = [(entry["internal"][i]["name"], entry["internal"][j]["name"],
+                      round(float(spread[i, j]), 3))
+                     for i, j, _ in entry["rigid"] if spread[i, j] > RIGID_THRESHOLD]
+            if loose:
+                print(f"  !! {kind} {code}: 1-2 or 1-3 pairs that moved: {loose}")
+            table[code] = entry
+            names = [a["name"] for a in entry["internal"]]
+            five = [a["name"] for a in entry["fivePrime"]]
+            print(f"{kind} {code} aatype {entry['aatype']:2d}  {len(names):2d} atoms"
+                  f"  5' {len(five):2d}  rigid {len(entry['rigid']):3d}"
+                  f"  {' '.join(names)}")
+        tables[kind] = table
+
+    out = ROOT / "tools" / "oracle" / "reference-conformers-nucleic.json"
+    out.write_text(json.dumps(tables, indent=1))
+    print(f"\n{out.relative_to(ROOT)}  {out.stat().st_size / 1024:.0f} KiB")
+    write_nucleic_module(tables)
+    for kind, table in tables.items():
+        for code, entry in table.items():
+            inside = {a["name"] for a in entry["internal"]}
+            for where in ("fivePrime", "threePrime"):
+                here = {a["name"] for a in entry[where]}
+                if here != inside:
+                    print(f"{kind} {code} {where}: +{sorted(here - inside)}"
+                          f" -{sorted(inside - here)}")
+
+
 if __name__ == "__main__":
-    main()
+    if "--nucleic" in sys.argv:
+        nucleic_table()
+    else:
+        main()

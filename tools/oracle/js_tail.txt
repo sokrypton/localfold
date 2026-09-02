@@ -1,0 +1,22 @@
+
+/** The table for a chain kind, or undefined for anything that is not nucleic. */
+export function nucleicConformers(kind) {
+  if (kind === "dna") return DNA_CONFORMERS;
+  if (kind === "rna") return RNA_CONFORMERS;
+  return undefined;
+}
+
+/**
+ * One nucleotide's atoms. `isFivePrime` picks the form carrying OP3; every
+ * other position, the 3-prime end included, takes the internal one.
+ */
+export function nucleicConformerFor(kind, code, isFivePrime) {
+  const entry = nucleicConformers(kind)?.[code];
+  if (entry === undefined) return undefined;
+  return isFivePrime ? entry.fivePrime : entry.internal;
+}
+
+/** AF3's aatype for a nucleotide, which is not its aatype in a protein chain. */
+export function nucleicAatypeFor(kind, code) {
+  return nucleicConformers(kind)?.[code]?.aatype;
+}
