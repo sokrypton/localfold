@@ -547,6 +547,14 @@
 .entity-value:hover { border-color: #9ca3af; }
 .entity-value:focus { outline: none; border-color: #3b82f6; }
 
+/* 🔴 BORDER-BOX ON ALL THREE, BECAUSE THE BROWSER DOES NOT AGREE WITH ITSELF.
+   Chrome makes a <select> and a <button> border-box by default and an
+   <input type="number"> content-box, so three controls all declaring
+   `height: 34px` came out 34, 34 and 35.6 - the copies box a border and a half
+   taller than the dropdown beside it, and visibly so against the shared bottom
+   edge. Stated here rather than relied on, so a fourth control cannot drift. */
+.entity-type, .entity-copies, .entity-remove { box-sizing: border-box; }
+
 .entity-type {
   flex-shrink: 0;
   height: 34px;
@@ -561,7 +569,9 @@
 /* No label: a number beside "Protein" already reads as a count, and the word
    pushed the box to the far end of the row away from the thing it counts. */
 .entity-copies {
-  width: 52px;
+  /* ...and the width follows the box it is now measured in: 52 + 12 of padding
+     + the border was 66 on screen, so 66 keeps it exactly where it was. */
+  width: 66px;
   height: 34px;
   padding: 0 4px 0 8px;
   border: 1px solid #d1d5db;

@@ -548,10 +548,17 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // has five, and a DNA row - which has no modifications to open - was
     // appending four children, so its remove button slid up into the options
     // column and sat six pixels left of every other row's. An empty cell keeps
-    // the column, which is what the placeholder is for.
-    const optionsCell = options ?? document.createElement("span");
+    // the column.
+    //
+    // 🔴 BUT NOT ON A LIGAND ROW, WHICH SPENDS THAT COLUMN ON ITS PICKER. Its
+    // five are type, copies, picker, code, remove - so a placeholder there is a
+    // SIXTH child in a five-column grid, and the remove button wraps onto a
+    // second line 44 px below the row it belongs to. Every row has exactly five
+    // cells; which five is what differs.
+    const spacer = picker === null && options === null
+      ? [document.createElement("span")] : [];
     wrapper.append(type, copies, ...(picker === null ? [] : [picker]), field,
-                   optionsCell, remove);
+                   ...(options === null ? [] : [options]), ...spacer, remove);
     paint();
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
     return wrapper;
