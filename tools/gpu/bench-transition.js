@@ -78,10 +78,11 @@ export async function main(device, args) {
          "let w = f32(slot) * 1e-6;"],
   };
   for (const spec of arms_spec) {
-    const [tile, chunk, drop, width] = spec.split(":");
+    const [tile, chunk, drop, width, lanes] = spec.split(":");
     let source = createTransitionShader(
       { rows, channels, factor, tile: Number(tile), chunk: chunk ? Number(chunk) : undefined,
-        width: width ? Number(width) : undefined },
+        width: width ? Number(width) : undefined,
+        lanes: lanes ? Number(lanes) : undefined },
       packed.offsets, 1e-5, "fast");
     if (drop) {
       const [pattern, replacement] = surgery[drop];

@@ -52,14 +52,20 @@ const DEFAULT_WORKGROUP = 128;
  * workgroups: it went 30.6 ms to 43.7, because there is no occupancy left to
  * trade. So the tile is taken only when the rows can spare it.
  *
+ * 🔴 AND EIGHT ONLY BECAME THE RIGHT ANSWER ONCE THE ROWS WERE VECTOR LANES.
+ * As scalar code tile 8 measured 1.556 ms against tile 4's 1.525 on the pair
+ * shape; with four rows to a vec4 it is 1.394 against 1.494. Vectorising the
+ * arithmetic bought nothing on its own - this kernel waits on its weight reads,
+ * not its multiply-adds - but it freed the tile to grow.
+ *
  * 🔴 AND EVERY CALLER MUST AGREE WITH THE SHADER. The shader is generated with
  * this tile and the dispatch is divided by it, so a caller that computes one
  * and not the other silently transitions a fraction of its rows. Both sides
  * call this with the same `rows`, which is why it is a pure function.
  */
 export function transitionRowTile(rows) {
-  for (const tile of [4, 2]) {
-    if (rows / tile >= 256) return tile;
+  for (const tile of [8, 4, 2]) {
+    if (rows / tile >= 220) return tile;
   }
   return 1;
 }
@@ -67,24 +73,28 @@ export function transitionRowTile(rows) {
 /**
  * How much of the widened intermediate is resident in workgroup memory at once.
  *
- * 🔴 HALF, WHICH IS NEITHER THE LARGEST NOR THE SMALLEST THAT FITS. The chunk
- * sets two things against each other: it is the whole of this kernel's
- * workgroup memory, so a smaller one leaves more workgroups resident per core,
- * and it is also how many slots one invocation accumulates at once, so a larger
- * one reads the normalised tile fewer times. Measured on the pair track's shape
- * - 3481 rows, 512 intermediate, tile 4 - the whole intermediate is 1.559 ms,
- * half is 1.525, a quarter is 1.569, against 1.653 before the kernel was
- * chunked at all. The curve is shallow and it has an interior minimum, which is
- * why this is a function rather than "as small as possible".
+ * 🔴 NEITHER THE LARGEST NOR THE SMALLEST THAT FITS. The chunk sets two things
+ * against each other: it is the whole of this kernel's workgroup memory, so a
+ * smaller one leaves more workgroups resident per core, and it is also how many
+ * slots one invocation accumulates at once, so a larger one reads the
+ * normalised tile fewer times. Measured on the pair track's shape - 3481 rows,
+ * 512 intermediate - at tile 4 the whole intermediate is 1.559 ms, half 1.525,
+ * a quarter 1.569; at tile 8 a quarter is 1.394 and a half 1.713. What holds
+ * across both is the product: TILE * CHUNK stays at two intermediates' worth of
+ * floats, 4 KB for the pair track, so the tile buys its halved weight traffic
+ * without also spending workgroup memory.
  *
- * 🔴 AND HALVING ONLY PAYS WHILE THE HALF IS STILL BIG. The MSA track widens 64
- * channels to 256, where half is 128 and each invocation then accumulates one
- * slot: 0.266 ms against the whole intermediate's 0.256. So the floor is 256,
- * which leaves the MSA track unchunked and the pair and single tracks halved.
+ * The MSA track lands on the floor of one workgroup width and is flat there
+ * anyway (0.262 to 0.269 ms across every arm), and the single track's tile is 1
+ * so it stays unchunked.
  */
-export function transitionChunk(intermediate, width = DEFAULT_WORKGROUP) {
-  const half = intermediate / 2;
-  return half >= 256 && half % width === 0 ? half : intermediate;
+export function transitionChunk(intermediate, tile = 1, width = DEFAULT_WORKGROUP) {
+  // Keep the staged block a constant size - two intermediates' worth of floats,
+  // 4 KB for the pair track - so the tile trades weight traffic for occupancy
+  // and not for workgroup memory as well.
+  const wanted = Math.max(width, Math.round(2 * intermediate / tile / width) * width);
+  const chunk = Math.min(intermediate, wanted);
+  return intermediate % chunk === 0 ? chunk : intermediate;
 }
 
 const GRID_WIDTH = 32_768;
@@ -110,7 +120,7 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   const intermediate = channels * factor;
   const tile = shape.tile ?? transitionRowTile(rows);
   const WORKGROUP = shape.width ?? DEFAULT_WORKGROUP;
-  const chunk = shape.chunk ?? transitionChunk(intermediate, WORKGROUP);
+  const chunk = shape.chunk ?? transitionChunk(intermediate, tile, WORKGROUP);
   if (intermediate % chunk !== 0) {
     throw new Error(`chunk ${chunk} does not divide intermediate ${intermediate}`);
   }
@@ -121,8 +131,25 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
     throw new Error(`chunk ${chunk} is not a multiple of the workgroup ${WORKGROUP}`);
   }
   const slotsPerThread = chunk / WORKGROUP;
-  const accumulator = channelsPerThread === 1 ? "t" : "out_slot * TILE + t";
-  const writeAccumulator = channelsPerThread === 1 ? "t" : "write_slot * TILE + t";
+  // 🔴 THE TILE'S ROWS ARE THE VECTOR LANES, AND THAT IS WORTH ABOUT 4x. This
+  // device runs a scalar multiply-add at 1287 GFLOP/s and a vec4 one at 5034 -
+  // measured, by tools/gpu/probe-alu.js, because the paper figure says nothing
+  // about what WGSL reaches here. Both matmuls do the SAME multiply against
+  // every row of the tile, so the tile is exactly the axis to vectorise: four
+  // rows become one vec4 and four multiply-adds become one. It also quarters
+  // the workgroup reads, since the four rows now live in one slot.
+  //
+  // The single track's tile is 1 - there are only 59 rows to give it - so this
+  // generates scalar code there, which is what LANES = 1 means below.
+  const lanes = shape.lanes ?? (tile % 4 === 0 ? 4 : 1);
+  if (tile % lanes !== 0) throw new Error(`tile ${tile} is not a multiple of ${lanes} lanes`);
+  const groups = tile / lanes;
+  const vector = lanes === 1 ? "f32" : `vec${lanes}<f32>`;
+  const zero = lanes === 1 ? "0.0" : `${vector}(0.0)`;
+  const overLanes = (body) =>
+    Array.from({ length: lanes }, (_, l) => body(l, lanes === 1 ? "" : `.${"xyzw"[l]}`));
+  const accumulator = channelsPerThread === 1 ? "g" : "out_slot * " + groups + "u + g";
+  const writeAccumulator = channelsPerThread === 1 ? "g" : "write_slot * " + groups + "u + g";
   // The fast variance is the trunk's; the atom and diffusion stacks want the
   // two-pass one. See the note in src/triangle/shaders.js.
   const varianceCode = variance === "fast"
@@ -165,12 +192,14 @@ const W_T2: u32 = ${offsets.transition2}u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<workgroup> normalized: array<f32, ${tile * channels}>;
-var<workgroup> gated: array<f32, ${tile * chunk}>;
+var<workgroup> normalized: array<${vector}, ${groups * channels}>;
+var<workgroup> gated: array<${vector}, ${groups * chunk}>;
 var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
 var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;
+var<workgroup> row_mean: array<f32, ${tile}>;
+var<workgroup> row_inverse_std: array<f32, ${tile}>;
 
-fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
+fn swish(value: ${vector}) -> ${vector} { return value / (${vector}(1.0) + exp(-value)); }
 
 @compute @workgroup_size(${WORKGROUP})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -187,40 +216,57 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // 🔴 THE LAYER NORM IS PER ROW AND STAYS THAT WAY. Its reduction is over
   // CHANNELS and the tile's rows do not share it, so this loop is sequential -
-  // it is cheap next to the two matmuls, which are what the tile is for.
+  // it is cheap next to the two matmuls, which are what the tile is for. What
+  // it leaves behind is a mean and an inverse deviation per row, so that the
+  // normalised tile can then be written LANES rows at a time.
   for (var t = 0u; t < TILE; t += 1u) {
-    let row = base_row + t;
-    if (row < ROWS) {
-      let base = row * CHANNELS;
-      var total = 0.0;
-      var sq_total = 0.0;
-      for (var c = local; c < CHANNELS; c += WORKGROUP) {
-        let value = input[base + c];
-        total += value;
-        sq_total += value * value;
+    let row = min(base_row + t, ROWS - 1u);
+    let base = row * CHANNELS;
+    var total = 0.0;
+    var sq_total = 0.0;
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      let value = input[base + c];
+      total += value;
+      sq_total += value * value;
+    }
+    reduce_a[local] = total;
+    reduce_b[local] = sq_total;
+    workgroupBarrier();
+    for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+      if (local < stride) {
+        reduce_a[local] += reduce_a[local + stride];
+        reduce_b[local] += reduce_b[local + stride];
       }
-      reduce_a[local] = total;
-      reduce_b[local] = sq_total;
       workgroupBarrier();
-      for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
-        if (local < stride) {
-          reduce_a[local] += reduce_a[local + stride];
-          reduce_b[local] += reduce_b[local + stride];
-        }
-        workgroupBarrier();
-      }
-      let mean = reduce_a[0] / f32(CHANNELS);
-      let sum_squares = reduce_b[0];
-      ${varianceCode}
-      let inverse_std = inverseSqrt(variance + EPSILON);
-      workgroupBarrier();
-      for (var c = local; c < CHANNELS; c += WORKGROUP) {
-        normalized[t * CHANNELS + c] = (input[base + c] - mean) * inverse_std
-          * weights[W_SCALE + c] + weights[W_OFFSET + c];
-      }
+    }
+    let mean = reduce_a[0] / f32(CHANNELS);
+    let sum_squares = reduce_b[0];
+    ${varianceCode}
+    if (local == 0u) {
+      row_mean[t] = mean;
+      row_inverse_std[t] = inverseSqrt(variance + EPSILON);
     }
     workgroupBarrier();
   }
+
+  // ...LANES rows of one channel per slot, which is the layout both matmuls
+  // read. A row past the end is clamped rather than skipped: it contributes to
+  // no output, and leaving the lane uninitialised would put a NaN in a vector
+  // whose other lanes are real.
+  for (var g = 0u; g < ${groups}u; g += 1u) {
+    for (var c = local; c < CHANNELS; c += WORKGROUP) {
+      let scale = weights[W_SCALE + c];
+      let offset = weights[W_OFFSET + c];
+      var packed: ${vector};
+      ${overLanes((l, at) => `{
+        let row${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u);
+        packed${at} = (input[row${l} * CHANNELS + c] - row_mean[g * ${lanes}u + ${l}u])
+          * row_inverse_std[g * ${lanes}u + ${l}u] * scale + offset;
+      }`).join("\n      ")}
+      normalized[g * CHANNELS + c] = packed;
+    }
+  }
+  workgroupBarrier();
 
   // transition1 is (channels, intermediate * 2), so a column is strided by the
   // full doubled width. Gate half first, value half second.
@@ -235,8 +281,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // memory then depends on CHUNK rather than INTERMEDIATE, and the tile buys
   // its halved weight traffic without spending occupancy for it.
   let wide = INTERMEDIATE * 2u;
-  var sum: array<f32, ${tile * channelsPerThread}>;
-  for (var s = 0u; s < ${tile * channelsPerThread}u; s += 1u) { sum[s] = 0.0; }
+  var sum: array<${vector}, ${groups * channelsPerThread}>;
+  for (var s = 0u; s < ${groups * channelsPerThread}u; s += 1u) { sum[s] = ${zero}; }
 
   for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += CHUNK) {
     // ...before overwriting the chunk the previous iteration is still reading.
@@ -244,31 +290,34 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // 🔴 EVERY SLOT THIS INVOCATION OWNS IS ACCUMULATED AT ONCE, so the tile's
     // normalised values are read from workgroup memory once for all of them
     // rather than once each. The loop used to be slot-outer, channel-inner:
-    // TILE shared reads and two weight reads bought 2 * TILE multiply-adds.
-    // Blocked, BLOCK * 2 weight reads and the same TILE shared reads buy
-    // BLOCK * 2 * TILE. CHUNK is what sets BLOCK, which is why the chunk that
+    // GROUPS shared reads and two weight reads bought 2 * GROUPS multiply-adds.
+    // Blocked, BLOCK * 2 weight reads and the same GROUPS shared reads buy
+    // BLOCK * 2 * GROUPS. CHUNK is what sets BLOCK, which is why the chunk that
     // wins is not simply the smallest one that fits.
-    var gate: array<f32, ${tile * slotsPerThread}>;
-    var value: array<f32, ${tile * slotsPerThread}>;
-    for (var s = 0u; s < ${tile * slotsPerThread}u; s += 1u) { gate[s] = 0.0; value[s] = 0.0; }
+    var gate: array<${vector}, ${groups * slotsPerThread}>;
+    var value: array<${vector}, ${groups * slotsPerThread}>;
+    for (var s = 0u; s < ${groups * slotsPerThread}u; s += 1u) {
+      gate[s] = ${zero};
+      value[s] = ${zero};
+    }
     for (var c = 0u; c < CHANNELS; c += 1u) {
       let column = W_T1 + c * wide;
-      var x: array<f32, ${tile}>;
-      for (var t = 0u; t < TILE; t += 1u) { x[t] = normalized[t * CHANNELS + c]; }
       for (var b = 0u; b < BLOCK; b += 1u) {
         // ...read once, used TILE times. That ratio is the point.
         let i = chunk0 + local + b * WORKGROUP;
         let wg = weights[column + i];
         let wv = weights[column + INTERMEDIATE + i];
-        for (var t = 0u; t < TILE; t += 1u) {
-          gate[b * TILE + t] += x[t] * wg;
-          value[b * TILE + t] += x[t] * wv;
+        for (var g = 0u; g < ${groups}u; g += 1u) {
+          let x = normalized[g * CHANNELS + c];
+          gate[b * ${groups}u + g] += x * wg;
+          value[b * ${groups}u + g] += x * wv;
         }
       }
     }
     for (var b = 0u; b < BLOCK; b += 1u) {
-      for (var t = 0u; t < TILE; t += 1u) {
-        gated[t * CHUNK + local + b * WORKGROUP] = swish(gate[b * TILE + t]) * value[b * TILE + t];
+      for (var g = 0u; g < ${groups}u; g += 1u) {
+        gated[g * CHUNK + local + b * WORKGROUP] =
+          swish(gate[b * ${groups}u + g]) * value[b * ${groups}u + g];
       }
     }
     workgroupBarrier();
@@ -278,8 +327,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var c = local; c < CHANNELS; c += WORKGROUP) {
       for (var slot = 0u; slot < CHUNK; slot += 1u) {
         let w = weights[W_T2 + (chunk0 + slot) * CHANNELS + c];
-        for (var t = 0u; t < TILE; t += 1u) {
-          sum[${accumulator}] += gated[t * CHUNK + slot] * w;
+        for (var g = 0u; g < ${groups}u; g += 1u) {
+          sum[${accumulator}] += gated[g * CHUNK + slot] * w;
         }
       }
       out_slot += 1u;
@@ -288,9 +337,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   var write_slot = 0u;
   for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    for (var t = 0u; t < TILE; t += 1u) {
-      let row = base_row + t;
-      if (row < ROWS) { output[row * CHANNELS + c] = sum[${writeAccumulator}]; }
+    for (var g = 0u; g < ${groups}u; g += 1u) {
+      let packed = sum[${writeAccumulator}];
+      ${overLanes((l, at) => `{
+        let row${l} = base_row + g * ${lanes}u + ${l}u;
+        if (row${l} < ROWS) { output[row${l} * CHANNELS + c] = packed${at}; }
+      }`).join("\n      ")}
     }
     write_slot += 1u;
   }

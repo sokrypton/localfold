@@ -40,8 +40,18 @@ values means the whole-stack checker, not that file.
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project}.js` |
+| What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
+multiply-adds out of registers with no memory in the way. On this M2 it reports
+**1287 GFLOP/s scalar, 2526 vec2, 5034 vec4**, and 396 billion workgroup reads a
+second - so a vec4 multiply-add is 4x a scalar one, and every one of those is
+about 640 G instructions a second. Read a kernel's number against THAT, not
+against a specification sheet: the trunk's kernels sit at 900 GFLOP/s to
+1.1 TFLOP/s, which is 70-85% of the scalar ceiling and a quarter of the vector
+one. It is an instruction-count machine.
 
 🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
 AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at

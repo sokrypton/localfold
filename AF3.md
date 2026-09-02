@@ -474,6 +474,36 @@ Anything further should be measured there, not here.
 - **Barriers.** Priced by removing them from the projection's k loop: exactly
   zero. The step stays at 8.
 
+### The ceiling these are measured against
+
+`tools/gpu/probe-alu.js` asks the device directly, with no memory in the way:
+
+| | GFLOP/s |
+|---|---|
+| scalar f32 multiply-add | 1287 |
+| vec2 | 2526 |
+| vec4 | 5034 |
+
+and 396 billion workgroup-memory reads a second. Every one of those is about
+**640 billion instructions a second**, which is the number that actually
+governs: a vec4 multiply-add and a scalar one and a workgroup read all cost one
+instruction, so this is an instruction-count machine and vectorising pays
+exactly when it reduces the count.
+
+That reframes everything above. The trunk's kernels run at 900 GFLOP/s to
+1.1 TFLOP/s, which is not 25% of a 3.6 TFLOP/s paper peak - it is **70-85% of
+the scalar ceiling**, and about a third of the instruction rate once their loads
+are counted. The remaining factor is in the loads, not the arithmetic.
+
+🔴 **WHICH IS WHY VECTORISING THE TRANSITION BOUGHT NOTHING BY ITSELF.** Its
+tile's rows became vec4 lanes - four multiply-adds into one, and a quarter of
+the workgroup reads - and the pair shape measured 1.488 ms against the scalar
+1.475. The kernel waits on its two weight reads per channel, not on its
+arithmetic. What the vectorisation DID buy is room for the tile: as scalar code
+tile 8 lost to tile 4 (1.556 against 1.525), and vectorised it wins (1.394
+against 1.494), because the rows now cost a quarter of the workgroup memory they
+did.
+
 🔴 **AND PRICING A READ BY SUBSTITUTING A CONSTANT OVERSTATES IT.** Replacing
 the projection's weight-tile reads with a constant took it from 0.525 to 0.375
 ms, suggesting 29% to win; packing those four reads into one vec4 - which is as
