@@ -34,6 +34,7 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { DeferredValidation } from "../runtime/validation.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -45,6 +46,68 @@ const BLOCK_ORDER = [
   "ffwSingleCondBias", "ffwTransition1", "ffwTransition2",
   "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
 ];
+
+/**
+ * 🔴 PACKED ONCE PER BLOCK OBJECT, NOT ONCE PER CALL. A block is about 6.5M
+ * floats, so packing twenty-four of them allocates and memcpies ~630 MB of
+ * CPU-side Float32Array on every denoiser call - and a 200-step fold makes 200
+ * of those calls with the SAME weights each time. The keys are the weight
+ * objects the loader built, which live as long as the model does, so a WeakMap
+ * lets the cache go when the model does.
+ */
+const packed = new WeakMap();
+
+export function packBlockWeightsCached(block) {
+  let entry = packed.get(block);
+  if (entry === undefined) {
+    entry = packBlockWeights(block);
+    packed.set(block, entry);
+  }
+  return entry;
+}
+
+/**
+ * Block weights uploaded once and left on the device.
+ *
+ * 🔴 THE UPLOAD WAS THE FLOOR, NOT THE ARITHMETIC. A block is ~26 MB, so the
+ * loop wrote ~630 MB to the device per call - and at eight tokens, where the
+ * matmuls are nothing, twenty-four blocks still cost 174 ms, which is that
+ * write at about 3.6 GB/s. A 200-step fold did it two hundred times over
+ * weights that never change.
+ *
+ * 🔴 SO THIS TRADES DEVICE MEMORY FOR IT, DELIBERATELY. The stack stays
+ * resident - ~630 MB at f32, the same order as the checkpoint itself - held as
+ * long as the weight objects the loader built are reachable, which is as long
+ * as the model is loaded. A denoiser called two hundred times should upload its
+ * weights once.
+ *
+ * Keyed device-first so two devices cannot hand each other a buffer, and by the
+ * block OBJECT so the buffers go when the model does.
+ */
+const residentBlocks = new WeakMap();
+
+function residentBlockBuffer(device, block, packedBlock) {
+  let byDevice = residentBlocks.get(device);
+  if (byDevice === undefined) {
+    byDevice = new WeakMap();
+    residentBlocks.set(device, byDevice);
+  }
+  let buffer = byDevice.get(block);
+  if (buffer === undefined) {
+    // 🔴 NOT THROUGH allocator.upload, WHOSE ALLOCATIONS ARE POOLED AND
+    // RECYCLED at the end of the run that made them. This one has to outlive
+    // every run, so it is created directly and never released.
+    buffer = device.createBuffer({
+      label: "difftx.block.resident",
+      size: Math.ceil(packedBlock.data.byteLength / 4) * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(buffer, 0, packedBlock.data.buffer,
+                             packedBlock.data.byteOffset, packedBlock.data.byteLength);
+    byDevice.set(block, buffer);
+  }
+  return buffer;
+}
 
 export function packBlockWeights(block) {
   const offsets = {};
@@ -506,9 +569,17 @@ export class Af3DiffusionTransformerGpu {
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const start = performance.now();
+      // 🔴 ONE VALIDATION SCOPE PER BLOCK, NONE OF THEM AWAITED IN THE LOOP.
+      // See src/runtime/validation.js: `await popErrorScope()` between blocks
+      // puts a host-device synchronisation in the middle of the stack, which is
+      // what the pairformer found first. This loop also awaited
+      // `onSubmittedWorkDone()` per block on top of that - two round trips a
+      // block, twenty-four blocks, every denoiser call - and a denoiser call
+      // happens up to 200 times a fold.
+      const validation = new DeferredValidation(this.device, "diffusion transformer");
       // The shared pair LayerNorm, once for the whole stack.
       {
-        this.device.pushErrorScope("validation");
+        validation.begin();
         const encoder = this.device.createCommandEncoder({ label: "difftx.pair-norm" });
         const pass = encoder.beginComputePass({ label: "pair-norm" });
         pass.setPipeline(compiled.normalisePair);
@@ -522,29 +593,38 @@ export class Af3DiffusionTransformerGpu {
         pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
         pass.end();
         this.device.queue.submit([encoder.finish()]);
-        const error = await this.device.popErrorScope();
-        if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+        validation.end("pair layer norm");
       }
 
+      // 🔴 ONE ENCODER AND ONE SUBMIT FOR ALL TWENTY-FOUR BLOCKS. Every block
+      // used to finish and submit its own command buffer, which at eight tokens
+      // - where the matmuls are nothing at all - was most of what the stack
+      // cost. The blocks are strictly sequential on the same buffers and WebGPU
+      // orders passes within an encoder, so batching them changes nothing about
+      // what runs, only how many times the CPU asks the driver to run it.
+      validation.begin();
+      const encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
+      const run = (label, pipeline, buffers, x, y = 1) => {
+        const pass = encoder.beginComputePass({ label });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: buffers.map((allocation, binding) => ({
+            binding, resource: { buffer: allocation.buffer },
+          })),
+        }));
+        pass.dispatchWorkgroups(x, y);
+        pass.end();
+      };
+      const projections = [];
       for (const group of weights.superBlocks) {
         const projection = this.allocator.upload("difftx.pair-projection",
           group.pairLogitsProjection, storage);
+        projections.push(projection);
         for (let inner = 0; inner < group.blocks.length; inner += 1) {
-          const packed = packBlockWeights(group.blocks[inner]);
-          const blockWeights = this.allocator.upload("difftx.block", packed.data, storage);
-          this.device.pushErrorScope("validation");
-          const encoder = this.device.createCommandEncoder({ label: "difftx.block" });
-          const run = (label, pipeline, buffers, x, y = 1) => {
-            const pass = encoder.beginComputePass({ label });
-            pass.setPipeline(pipeline);
-            pass.setBindGroup(0, this.device.createBindGroup({
-              layout: pipeline.getBindGroupLayout(0),
-              entries: buffers.map((allocation, binding) => ({
-                binding, resource: { buffer: allocation.buffer },
-              })),
-            }));
-            pass.dispatchWorkgroups(x, y);
-            pass.end();
+          const block = group.blocks[inner];
+          const blockWeights = {
+            buffer: residentBlockBuffer(this.device, block, packBlockWeightsCached(block)),
           };
           const pairGroups = Math.ceil(pairs / 64);
           run("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
@@ -557,18 +637,20 @@ export class Af3DiffusionTransformerGpu {
           run("attention-output", compiled.attentionOutput,
               [gathered, gate, condBuffer, blockWeights, actBuffer], tokens);
           run("transition", compiled.transition, [condBuffer, blockWeights, actBuffer], tokens);
-          this.device.queue.submit([encoder.finish()]);
-          const error = await this.device.popErrorScope();
-          await this.device.queue.onSubmittedWorkDone();
-          blockWeights.release();
-          if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
         }
-        projection.release();
       }
-
-      const encoder = this.device.createCommandEncoder({ label: "difftx.readback" });
+      // ...and the readback rides the same submit.
       encoder.copyBufferToBuffer(actBuffer.buffer, 0, readback.buffer, 0, tokens * channels * 4);
       this.device.queue.submit([encoder.finish()]);
+      validation.end("block stack");
+      // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
+      // LOOP. They are pooled, so releasing one while a later block's encoded
+      // pass still refers to it would hand the same buffer to that block's
+      // upload.
+      for (const projection of projections) projection.release();
+      // ...the boundary that already synchronises, so the deferred scopes cost
+      // nothing to read here.
+      await validation.settle();
       await readback.buffer.mapAsync(GPUMapMode.READ);
       const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
       readback.buffer.unmap();
