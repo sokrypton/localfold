@@ -1,6 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  cleanSequence, complexSequenceProblem, extractFastaHeader, sequenceChains, sequenceProblem,
+  cleanSequence, cleanSequenceMap, complexSequenceProblem, extractFastaHeader,
+  sequenceChains, sequenceProblem,
 } from "../web/sequence.js";
 
 describe("cleaning a pasted sequence", () => {
@@ -108,5 +109,41 @@ describe("colon-separated complex sequences", () => {
   it("reports empty and invalid chains by position", () => {
     expect(complexSequenceProblem("ACD::EFG")).toMatch(/Every chain/);
     expect(complexSequenceProblem("ACD:EBG")).toBe("Chain 2: B is not one of the twenty amino acids");
+  });
+});
+
+describe("mapping residues back to the box", () => {
+  // 🔴 A RESIDUE'S POSITION IS NOT ITS OFFSET IN THE BOX. Headers, comment
+  // lines and whitespace all go, so residue 12 of a pasted record can be
+  // character 80 on screen - and anything pointing AT a residue needs to know
+  // which. The map has to agree with cleanSequence exactly, or a highlight
+  // lands on the wrong letter.
+  const cases = ["ACDEF", "AC  DE", "AC\t\t DE", "A1234C", "AC DE\nF",
+                 ">header\nACDE\nFGH", ";note\nACD\n>next\nZZZ", "", "   ",
+                 "ac-de*f"];
+
+  it("agrees with cleanSequence on every shape of input", () => {
+    for (const text of cases) {
+      expect(cleanSequenceMap(text).cleaned).toBe(cleanSequence(text));
+    }
+  });
+
+  it("points every residue at the character it came from", () => {
+    for (const text of cases) {
+      const { cleaned, offsets } = cleanSequenceMap(text);
+      expect(offsets.length).toBe(cleaned.length);
+      offsets.forEach((offset, index) => {
+        expect(text[offset].toUpperCase()).toBe(cleaned[index]);
+      });
+    }
+  });
+
+  it("does not let a run of spaces alternate", () => {
+    // FORMATTING carries the `g` flag for its replace, and a global regex
+    // remembers where it got to: testing one character at a time down a run of
+    // spaces returned true, false, true, false, and "AC  DE" cleaned to
+    // "AC DE" here while cleanSequence gave "ACDE".
+    expect(cleanSequenceMap("AC    DE").cleaned).toBe("ACDE");
+    expect(cleanSequenceMap("A1234C").cleaned).toBe("AC");
   });
 });

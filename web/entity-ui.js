@@ -17,7 +17,7 @@
  */
 import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
   MENU_CODES, entitiesFromText, entityProblem, newEntity } from "./entities.js";
-import { cleanSequence, extractFastaHeader } from "./sequence.js";
+import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 
 /**
  * Wire an entity list into a container.
@@ -51,6 +51,9 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
    * over the row below and takes clicks meant for it, which reads as the page
    * having frozen rather than as a menu being open.
    */
+  // Repainting the highlight of a row from outside it, when the popup changes
+  // the modification list.
+  const entityPaint = new WeakMap();
   let closePopup = null;
   const openModifications = (anchor, entity, index) => {
     if (closePopup !== null) { closePopup(); return; }
@@ -59,6 +62,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     popup.setAttribute("role", "dialog");
     popup.setAttribute("aria-label", "Modified residues");
 
+    // 🔴 A CLICK ON THE SEQUENCE MEANS "THIS RESIDUE", AND IT HAS TO MEAN IT
+    // FOR ONE ROW. Typing a number is the part people get wrong - counting to
+    // 147 by eye - so the box itself becomes the position picker, and the row
+    // it moves is the one last touched. Without a chosen row a click would
+    // either do nothing or move all of them.
+    let active = Math.max(0, (entity.modifications ?? []).length - 1);
     const draw = () => {
       // 🔴 NOT render(). The popup is a CHILD of the row, so rebuilding the row
       // deletes the popup out from under itself - clicking "Add modification"
@@ -73,11 +82,26 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         badge.title = count === 0
           ? "Modified residues" : `${count} modified residue${count === 1 ? "" : "s"}`;
       }
+      entityPaint.get(entity)?.();
       popup.replaceChildren();
+      const head = document.createElement("div");
+      head.className = "entity-popup-head";
       const title = document.createElement("div");
       title.className = "entity-popup-title";
       title.textContent = "Modified residues";
-      popup.append(title);
+      // 🔴 CLOSED ON PURPOSE, NOT BY LOOKING AWAY. It used to dismiss on any
+      // click outside itself, which fought the one thing it is for: clicking
+      // the sequence to pick a position happens OUTSIDE the popup, so the
+      // gesture that sets a residue was also the gesture that closed the menu.
+      const shut = document.createElement("button");
+      shut.type = "button";
+      shut.className = "entity-popup-close";
+      shut.title = "Close";
+      shut.setAttribute("aria-label", "Close");
+      shut.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+      shut.addEventListener("click", () => closePopup?.());
+      head.append(title, shut);
+      popup.append(head);
 
       const sequence = cleanSequence(entity.value);
       entity.modifications ??= [];
@@ -171,9 +195,26 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
           draw();
         });
 
+        if (at === active) line.classList.add("entity-popup-row-active");
+        for (const control of [menu, typed, position]) {
+          control.addEventListener("focus", () => {
+            if (active === at) return;
+            active = at;
+            draw();
+          });
+        }
+        line.addEventListener("mousedown", () => { active = at; });
+
         line.append(menu, typed, at1, position, residue, drop);
         popup.append(line);
       });
+
+      if (entity.modifications.length > 0) {
+        const hint = document.createElement("p");
+        hint.className = "entity-popup-hint";
+        hint.textContent = "Click a residue in the sequence to set the position.";
+        popup.append(hint);
+      }
 
       const add = document.createElement("button");
       add.type = "button";
@@ -215,29 +256,43 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
 
     draw();
     anchor.append(popup);
+    const box = anchor.querySelector("textarea.entity-value");
+    const pick = () => {
+      const { offsets } = cleanSequenceMap(box.value);
+      const caret = box.selectionStart;
+      // The residue the caret sits on, or the one before it when the click
+      // landed on something this sequence does not count - a space, a header,
+      // or the gap past the end of a line.
+      let chosen = -1;
+      for (let index = 0; index < offsets.length; index += 1) {
+        if (offsets[index] <= caret) chosen = index; else break;
+      }
+      const modification = entity.modifications[active];
+      if (chosen < 0 || modification === undefined) return;
+      modification.position = chosen + 1;
+      notify();
+      draw();
+    };
+    if (box !== null) {
+      box.addEventListener("click", pick);
+      box.addEventListener("keyup", pick);
+    }
     // 🔴 CAUGHT ON THE WAY DOWN, NOT ON THE WAY UP. A click inside the popup
     // redraws it, which REPLACES the element that was clicked - so by the time
     // the event bubbled to the document the target was detached and
     // `popup.contains(target)` was false, and the popup closed itself every
     // time "Add modification" was pressed. In the capture phase the target is
     // still where it was clicked.
-    const dismiss = (event) => {
-      if (popup.contains(event.target)) return;
-      closePopup?.();
-    };
     const onKey = (event) => { if (event.key === "Escape") closePopup?.(); };
     closePopup = () => {
       popup.remove();
-      document.removeEventListener("click", dismiss, true);
+      box?.removeEventListener("click", pick);
+      box?.removeEventListener("keyup", pick);
       document.removeEventListener("keydown", onKey);
       closePopup = null;
       render();
     };
-    // ...on the next tick, or the click that opened it closes it again.
-    setTimeout(() => {
-      document.addEventListener("click", dismiss, true);
-      document.addEventListener("keydown", onKey);
-    }, 0);
+    document.addEventListener("keydown", onKey);
   };
 
   const row = (entity, index) => {
@@ -298,6 +353,19 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       picker.value = MENU_CODES.has(current) ? current : "";
     }
 
+    // 🔴 A TEXTAREA CANNOT COLOUR ONE CHARACTER, so the highlight is a mirror
+    // BEHIND it: the same text in the same font at the same width, with the
+    // modified residues wrapped in a mark, and the textarea itself made
+    // transparent except for its caret. Every metric that affects wrapping has
+    // to match or the two drift apart down the line - which is why the mirror
+    // takes its font from the same rule the box does rather than restating it.
+    let mirror = null;
+    if (entity.type === "protein") {
+      mirror = document.createElement("div");
+      mirror.className = "entity-value entity-value-protein entity-mirror";
+      mirror.setAttribute("aria-hidden", "true");
+    }
+
     const value = entity.type === "ligand"
       ? document.createElement("input")
       : document.createElement("textarea");
@@ -318,8 +386,37 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.setAttribute("aria-label", "Protein sequence");
     }
     value.value = entity.value;
+    /** Repaint the highlight from the text and the modification list. */
+    const paint = () => {
+      if (mirror === null) return;
+      const { offsets } = cleanSequenceMap(value.value);
+      const marked = new Set();
+      for (const modification of entity.modifications ?? []) {
+        const offset = offsets[modification.position - 1];
+        if (offset !== undefined) marked.add(offset);
+      }
+      mirror.replaceChildren();
+      const text = value.value;
+      let run = "";
+      const flush = () => { if (run !== "") { mirror.append(run); run = ""; } };
+      for (let at = 0; at < text.length; at += 1) {
+        if (!marked.has(at)) { run += text[at]; continue; }
+        flush();
+        const mark = document.createElement("mark");
+        mark.textContent = text[at];
+        mirror.append(mark);
+      }
+      flush();
+      // A trailing newline collapses in a div and not in a textarea, so the
+      // last line would sit one row higher than the text it is behind.
+      mirror.append("\n");
+      mirror.scrollTop = value.scrollTop;
+    };
+    entityPaint.set(entity, paint);
+    value.addEventListener("scroll", () => { if (mirror !== null) mirror.scrollTop = value.scrollTop; });
     value.addEventListener("input", () => {
       entity.value = value.value;
+      paint();
       // ...the menu follows the box WITHOUT a re-render, which would take the
       // focus and the caret away mid-word.
       if (picker !== null) {
@@ -430,8 +527,17 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // "Ligand · [ATP ▾] [ATP] × 1" left to right.
     // The row reads left to right: what it is, how many, what it holds, and
     // then the two buttons that act on it.
-    wrapper.append(type, copies, ...(picker === null ? [] : [picker]), value,
+    // The mirror goes in a box with the textarea so the two share one grid
+    // cell and one set of metrics.
+    let field = value;
+    if (mirror !== null) {
+      field = document.createElement("div");
+      field.className = "entity-field";
+      field.append(mirror, value);
+    }
+    wrapper.append(type, copies, ...(picker === null ? [] : [picker]), field,
                    ...(options === null ? [] : [options]), remove);
+    paint();
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
     return wrapper;
   };

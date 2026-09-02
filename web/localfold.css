@@ -471,7 +471,22 @@
   flex-direction: column;
   gap: 6px;
 }
+.entity-popup-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .entity-popup-title { font-size: 12px; font-weight: 600; color: #374151; }
+/* A round close in the corner, since the popup no longer dismisses itself. */
+.entity-popup-close {
+  flex-shrink: 0;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  padding: 0;
+  border: 1px solid #d1d5db;
+  border-radius: 50%;
+  background: #fff;
+  color: #6b7280;
+  font-size: 11px;
+  cursor: pointer;
+}
+.entity-popup-close:hover { background: #f3f4f6; color: #111827; }
 .entity-popup-empty, .entity-popup-problem {
   margin: 0; font-size: 12px; line-height: 1.4; color: #6b7280;
 }
@@ -490,7 +505,41 @@
   width: 2ch; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
   font-weight: 600; color: #2563eb; text-align: center;
 }
+.entity-popup-hint { margin: 0; font-size: 11px; color: #6b7280; }
+/* Which row a click on the sequence will move. Without it the click looks like
+   it lands somewhere at random once there is more than one modification. */
+.entity-popup-row-active { 
+  background: #eff6ff;
+  border-radius: 7px;
+  box-shadow: 0 0 0 3px #eff6ff;
+}
 .entity-popup-add { align-self: flex-start; font-size: 12px; }
+
+/* 🔴 THE MIRROR AND THE BOX SHARE ONE CELL AND ONE SET OF METRICS. A textarea
+   cannot colour a single character, so the highlight is the same text drawn
+   behind it; anything that changes where a line breaks - font, size, letter
+   spacing, padding, border, width - has to be identical or the mark slides off
+   the residue further down the box. Both carry .entity-value for that reason. */
+.entity-field { position: relative; min-width: 0; }
+.entity-field > .entity-value { width: 100%; }
+.entity-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;      /* a sequence is one unbroken word */
+  color: transparent;
+  pointer-events: none;
+  background: #fff;
+}
+.entity-mirror mark {
+  background: #fde68a;
+  color: transparent;
+  border-radius: 3px;
+}
+/* The text itself stays on top and visible; only its background comes from the
+   mirror below, so the caret and selection behave as they always did. */
+.entity-field > textarea.entity-value { position: relative; background: transparent; }
 
 .entity-value-protein { height: 52px; min-height: 52px; resize: vertical; }
 .entity-value-ligand { height: 34px; text-transform: uppercase; }

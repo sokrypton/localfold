@@ -17,6 +17,8 @@
 
 // -,. are alignment gaps; * is a stop; both are notation, not residues.
 const FORMATTING = /[\s\d.\-*]+/g;
+/** The same class, one character at a time and WITHOUT the global flag. */
+const NOT_A_RESIDUE = /[\s\d.\-*]/;
 
 /**
  * `>` starts a RECORD; `;` starts a COMMENT. They are not the same thing and
@@ -24,6 +26,68 @@ const FORMATTING = /[\s\d.\-*]+/g;
  */
 const RECORD = /^\s*>/;
 const COMMENT = /^\s*;/;
+
+/**
+ * The cleaned sequence, and where each of its residues came from in the raw
+ * text.
+ *
+ * 🔴 A RESIDUE'S POSITION IS NOT ITS OFFSET IN THE BOX. cleanSequence drops
+ * FASTA headers, comment lines and every scrap of whitespace, so residue 12 of
+ * a pasted record can be character 80 of what is on screen. Anything that has
+ * to point AT a residue - a highlight behind the text, a click that means
+ * "this one" - needs the map, and computing it by re-deriving the rules
+ * separately is how the two drift apart. It is the same walk as cleanSequence,
+ * carrying the offsets along.
+ *
+ * @param {string} text whatever is in the box
+ * @returns {{cleaned: string, offsets: number[]}} `offsets[i]` is where
+ *   `cleaned[i]` sits in `text`
+ */
+export function cleanSequenceMap(text) {
+  // 🔴 NOT `FORMATTING.test(character)`. That regex carries the `g` flag for
+  // the replace below, and a global regex REMEMBERS where it got to - so
+  // testing one character at a time returns true, false, true, false down a run
+  // of spaces, and "AC  DE" cleaned to "AC DE" while cleanSequence gave "ACDE".
+  // The two would then disagree about which character residue 3 is.
+  const offsets = [];
+  let cleaned = "";
+  let at = 0;
+  const lines = text.split(/\r?\n/);
+  // Which lines survive, by the same rules and in the same order.
+  const kept = lines.filter((line) => !COMMENT.test(line));
+  const start = kept.findIndex((line) => RECORD.test(line));
+  const body = start === -1 ? kept : kept.slice(start + 1);
+  const end = body.findIndex((line) => RECORD.test(line));
+  const wanted = new Set(end === -1 ? body : body.slice(0, end));
+  // ...matched by identity of position rather than of content, since two lines
+  // of a sequence can read the same.
+  const keepIndex = new Set();
+  {
+    let seen = 0;
+    const survivors = [];
+    lines.forEach((line, index) => {
+      if (COMMENT.test(line)) return;
+      survivors.push(index);
+    });
+    const bodyStart = start === -1 ? 0 : start + 1;
+    const bodyEnd = end === -1 ? survivors.length : bodyStart + end;
+    for (let i = bodyStart; i < bodyEnd; i += 1) keepIndex.add(survivors[i]);
+    seen = wanted.size;
+    void seen;
+  }
+  lines.forEach((line, index) => {
+    if (keepIndex.has(index)) {
+      for (let i = 0; i < line.length; i += 1) {
+        const character = line[i];
+        if (NOT_A_RESIDUE.test(character)) continue;
+        cleaned += character.toUpperCase();
+        offsets.push(at + i);
+      }
+    }
+    at += line.length + 1;                 // the newline the split removed
+  });
+  return { cleaned, offsets };
+}
 
 /**
  * @param {string} text whatever is in the box
