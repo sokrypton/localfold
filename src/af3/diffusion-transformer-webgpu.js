@@ -124,6 +124,14 @@ export function packBlockWeights(block) {
 
 export function createDiffusionTransformerShaders(shape, offsets) {
   const { tokens, channels, condChannels, pairChannels, heads, dimension, factor } = shape;
+  // 🔴 THE FOUR PER-TOKEN KERNELS RUN ONE WORKGROUP PER TOKEN, so the token
+  // count IS the occupancy: a 59-residue chain launched 59 workgroups of 64
+  // threads, which is under four thousand threads for a GPU that wants tens of
+  // thousands, and each of those threads then walked a 768-long dot product.
+  // Widening the workgroup is the cheap half of fixing that - the same work,
+  // more lanes over it - and it costs only workgroup memory, which the
+  // transition's 1536-wide scratch dominates anyway.
+  const lanes = shape.lanes ?? 256;
   const width = heads * dimension;
   const intermediate = channels * factor;
   const pairs = tokens * tokens;
@@ -216,19 +224,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 var<workgroup> x: array<f32, ${channels}>;
 var<workgroup> cond_norm: array<f32, ${condChannels}>;
-var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_a: array<f32, ${lanes}>;
 
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_a[local] = value;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
     workgroupBarrier();
   }
   return reduce_a[0];
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let token = group.x;
@@ -237,11 +245,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // 🔴 TWO-PASS VARIANCE, and no scale or offset on the activation's own norm.
   var total = 0.0;
-  for (var c = local; c < C; c += 64u) { total += act[token * C + c]; }
+  for (var c = local; c < C; c += ${lanes}u) { total += act[token * C + c]; }
   let act_mean = reduce_sum(local, total) / f32(C);
   workgroupBarrier();
   var centred = 0.0;
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     let d = act[token * C + c] - act_mean;
     centred += d * d;
   }
@@ -250,23 +258,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // ...the conditioning gets a scale but NO offset before it is projected.
   var cond_total = 0.0;
-  for (var c = local; c < C_COND; c += 64u) { cond_total += cond[token * C_COND + c]; }
+  for (var c = local; c < C_COND; c += ${lanes}u) { cond_total += cond[token * C_COND + c]; }
   let cond_mean = reduce_sum(local, cond_total) / f32(C_COND);
   workgroupBarrier();
   var cond_centred = 0.0;
-  for (var c = local; c < C_COND; c += 64u) {
+  for (var c = local; c < C_COND; c += ${lanes}u) {
     let d = cond[token * C_COND + c] - cond_mean;
     cond_centred += d * d;
   }
   let cond_inverse = inverseSqrt(reduce_sum(local, cond_centred) / f32(C_COND) + EPSILON);
   workgroupBarrier();
-  for (var c = local; c < C_COND; c += 64u) {
+  for (var c = local; c < C_COND; c += ${lanes}u) {
     cond_norm[c] = (cond[token * C_COND + c] - cond_mean) * cond_inverse
       * weights[W_SingleCondLayerNormScale + c];
   }
   workgroupBarrier();
 
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     var scale_value = weights[W_SingleCondScaleBias + c];
     var shift = 0.0;
     for (var d = 0u; d < C_COND; d += 1u) {
@@ -278,7 +286,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var out = local; out < WIDTH; out += 64u) {
+  for (var out = local; out < WIDTH; out += ${lanes}u) {
     var q_total = weights[W_qBias + out];   // only q has a bias
     var k_total = 0.0;
     var v_total = 0.0;
@@ -307,9 +315,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 @group(0) @binding(5) var<storage, read_write> gathered: array<f32>;
 
 var<workgroup> logits: array<f32, ${tokens}>;
-var<workgroup> reduce: array<f32, 64>;
+var<workgroup> reduce: array<f32, ${lanes}>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let slot = group.x + group.y * GRID_WIDTH;
@@ -319,7 +327,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let local = local_id.x;
   let query_base = i * WIDTH + head * DIMENSION;
 
-  for (var j = local; j < TOKENS; j += 64u) {
+  for (var j = local; j < TOKENS; j += ${lanes}u) {
     var dot = 0.0;
     for (var d = 0u; d < DIMENSION; d += 1u) {
       dot += q[query_base + d] * k[j * WIDTH + head * DIMENSION + d];
@@ -330,10 +338,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   var local_max = -3.0e38;
-  for (var j = local; j < TOKENS; j += 64u) { local_max = max(local_max, logits[j]); }
+  for (var j = local; j < TOKENS; j += ${lanes}u) { local_max = max(local_max, logits[j]); }
   reduce[local] = local_max;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce[local] = max(reduce[local], reduce[local + stride]); }
     workgroupBarrier();
   }
@@ -341,21 +349,21 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   var local_sum = 0.0;
-  for (var j = local; j < TOKENS; j += 64u) {
+  for (var j = local; j < TOKENS; j += ${lanes}u) {
     let value = exp(logits[j] - largest);
     logits[j] = value;
     local_sum += value;
   }
   reduce[local] = local_sum;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce[local] += reduce[local + stride]; }
     workgroupBarrier();
   }
   let total = reduce[0];
   workgroupBarrier();
 
-  for (var d = local; d < DIMENSION; d += 64u) {
+  for (var d = local; d < DIMENSION; d += ${lanes}u) {
     var sum = 0.0;
     for (var j = 0u; j < TOKENS; j += 1u) {
       sum += logits[j] * v[j * WIDTH + head * DIMENSION + d];
@@ -374,19 +382,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 var<workgroup> gated: array<f32, ${width}>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let token = group.x;
   if (token >= TOKENS) { return; }
   let local = local_id.x;
-  for (var w = local; w < WIDTH; w += 64u) {
+  for (var w = local; w < WIDTH; w += ${lanes}u) {
     let index = token * WIDTH + w;
     gated[w] = gathered[index] * logistic(gate[index]);
   }
   workgroupBarrier();
 
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     var projected = 0.0;
     for (var w = 0u; w < WIDTH; w += 1u) {
       projected += gated[w] * weights[W_Transition2 + w * C + c];
@@ -410,19 +418,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 var<workgroup> x: array<f32, ${channels}>;
 var<workgroup> cond_norm: array<f32, ${condChannels}>;
 var<workgroup> gated: array<f32, ${intermediate}>;
-var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_a: array<f32, ${lanes}>;
 
 fn reduce_sum(local: u32, value: f32) -> f32 {
   reduce_a[local] = value;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${lanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
     workgroupBarrier();
   }
   return reduce_a[0];
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let token = group.x;
@@ -430,11 +438,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let local = local_id.x;
 
   var total = 0.0;
-  for (var c = local; c < C; c += 64u) { total += act[token * C + c]; }
+  for (var c = local; c < C; c += ${lanes}u) { total += act[token * C + c]; }
   let act_mean = reduce_sum(local, total) / f32(C);
   workgroupBarrier();
   var centred = 0.0;
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     let d = act[token * C + c] - act_mean;
     centred += d * d;
   }
@@ -442,23 +450,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   var cond_total = 0.0;
-  for (var c = local; c < C_COND; c += 64u) { cond_total += cond[token * C_COND + c]; }
+  for (var c = local; c < C_COND; c += ${lanes}u) { cond_total += cond[token * C_COND + c]; }
   let cond_mean = reduce_sum(local, cond_total) / f32(C_COND);
   workgroupBarrier();
   var cond_centred = 0.0;
-  for (var c = local; c < C_COND; c += 64u) {
+  for (var c = local; c < C_COND; c += ${lanes}u) {
     let d = cond[token * C_COND + c] - cond_mean;
     cond_centred += d * d;
   }
   let cond_inverse = inverseSqrt(reduce_sum(local, cond_centred) / f32(C_COND) + EPSILON);
   workgroupBarrier();
-  for (var c = local; c < C_COND; c += 64u) {
+  for (var c = local; c < C_COND; c += ${lanes}u) {
     cond_norm[c] = (cond[token * C_COND + c] - cond_mean) * cond_inverse
       * weights[W_ffwSingleCondLayerNormScale + c];
   }
   workgroupBarrier();
 
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     var scale_value = weights[W_ffwSingleCondScaleBias + c];
     var shift = 0.0;
     for (var d = 0u; d < C_COND; d += 1u) {
@@ -472,7 +480,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // 🔴 BLOCKED, gate half first - the same convention as the trunk's transition
   // and the opposite of triangle multiplication's interleave.
   let wide = INTERMEDIATE * 2u;
-  for (var i = local; i < INTERMEDIATE; i += 64u) {
+  for (var i = local; i < INTERMEDIATE; i += ${lanes}u) {
     var gate_value = 0.0;
     var value = 0.0;
     for (var c = 0u; c < C; c += 1u) {
@@ -484,7 +492,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var c = local; c < C; c += 64u) {
+  for (var c = local; c < C; c += ${lanes}u) {
     var projected = 0.0;
     for (var i = 0u; i < INTERMEDIATE; i += 1u) {
       projected += gated[i] * weights[W_ffwTransition2 + i * C + c];
@@ -531,10 +539,14 @@ export class Af3DiffusionTransformerGpu {
 
     const sample = packBlockWeights(weights.superBlocks[0].blocks[0]);
     const shape = { tokens, channels, condChannels, pairChannels, heads, dimension,
-                    factor: weights.transitionFactor };
+                    factor: weights.transitionFactor, lanes: weights.lanes };
     const sources = createDiffusionTransformerShaders(shape, sample.offsets);
+    // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
+    // sources as a workgroup size, so a cache that ignored it would hand a
+    // later run the pipeline compiled for a different width.
     const base = `af3-difftx:${tokens}:${channels}:${condChannels}:${pairChannels}`
-      + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`;
+      + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`
+      + `:${shape.lanes ?? "default"}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       if (name === "pairLogitsFor") continue;
