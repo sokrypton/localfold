@@ -388,6 +388,28 @@ and prints a range; trust the range, not a pair.
    wrong often enough that it is not worth having. If it ever returns it belongs
    on the model SELECTION, not on the sequence.
 
+   **Measured again on 2026-09-02, against Hugging Face, and there is no
+   parallelism win left.** Throughput against the number of connections, 4 MB
+   apiece on distinct shards:
+
+   | connections | 1 | 2 | 4 | 8 | 16 |
+   |---|---|---|---|---|---|
+   | MB/s | 3.7 | 6.9 | 8.5 | **9.3** | 9.4 |
+
+   Eight is already 99% of sixteen, so the eight-way fetch is right and raising
+   it buys nothing.
+
+   🔴 **AND THE 3.7 AT ONE CONNECTION IS NOT A PER-CONNECTION CAP**, which is
+   what it looks like and what sent this down a wrong path. A 4 MB transfer is
+   mostly redirect, TLS and TCP slow-start; the same connection fetching a
+   41 MiB shard on its own reaches **9.0 MB/s, the whole link**. Splitting that
+   shard into four ranges - which Hugging Face serves, 206 and all - therefore
+   saves 7%, not 4x: 4.39 s against 4.68 s, alternated. The shards are uneven
+   (median 7.9 MiB, max 40.5) and it does not matter.
+
+   So a cold load is bytes divided by the link, and nothing about how they are
+   requested changes that: 265 MB at 9.4 MB/s is 28 s against 32.4 measured.
+
    **What is left is the bytes, and they are close to irreducible.** 277 MB of
    int5, served gzipped already, and gzip takes 5% off packed integers. The
    link caps at about 27 MB/s (serial 14, four-way 27.5, eight-way 26.3 - so
