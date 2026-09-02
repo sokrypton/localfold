@@ -9,7 +9,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
+import { ccdUrl, parseCcdComponent, polymerResidue } from "../src/af3/ccd-component.js";
 
 // GOL, as files.rcsb.org serves it. Hydrogens kept in, so the test can show
 // they are dropped; one atom name quoted, as components with primes are.
@@ -133,6 +133,84 @@ describe("monatomic ions", () => {
   });
 });
 
+/** A four-atom polymer component whose OXT is flagged as leaving, like SEP's. */
+const LEAVING = `data_XYZ
+_chem_comp.id                                    XYZ
+loop_
+_chem_comp_atom.comp_id
+_chem_comp_atom.atom_id
+_chem_comp_atom.type_symbol
+_chem_comp_atom.charge
+_chem_comp_atom.pdbx_leaving_atom_flag
+_chem_comp_atom.pdbx_model_Cartn_x_ideal
+_chem_comp_atom.pdbx_model_Cartn_y_ideal
+_chem_comp_atom.pdbx_model_Cartn_z_ideal
+_chem_comp_atom.pdbx_ordinal
+XYZ N   N 0 N 0.000 0.000 0.000 1
+XYZ CA  C 0 N 1.458 0.000 0.000 2
+XYZ C   C 0 N 2.009 1.420 0.000 3
+XYZ O   O 0 N 1.251 2.394 0.000 4
+XYZ OXT O 0 Y 3.340 1.550 0.000 5
+XYZ CB  C 0 N 1.990 -0.773 1.204 6
+#
+loop_
+_chem_comp_bond.comp_id
+_chem_comp_bond.atom_id_1
+_chem_comp_bond.atom_id_2
+_chem_comp_bond.value_order
+_chem_comp_bond.pdbx_ordinal
+XYZ N   CA  SING 1
+XYZ CA  C   SING 2
+XYZ C   O   DOUB 3
+XYZ C   OXT SING 4
+XYZ CA  CB  SING 5
+#
+`;
+
+describe("a component inside a polymer", () => {
+  // 🔴 THE DICTIONARY DESCRIBES A FREE AMINO ACID. A modified residue therefore
+  // arrives carrying the OXT it loses on forming a peptide bond, and AF3 counts
+  // ten tokens for a phosphoserine in the middle of a chain and eleven at the
+  // C-terminus. Getting this wrong is one token either way, which changes every
+  // shape in the batch.
+  it("keeps the leaving flag the dictionary gives", () => {
+    const component = parseCcdComponent(LEAVING);
+    assert.deepEqual(component.atoms.map((atom) => atom.name),
+                     ["N", "CA", "C", "O", "OXT", "CB"]);
+    assert.deepEqual(component.atoms.map((atom) => atom.leaving),
+                     [false, false, false, false, true, false]);
+  });
+
+  it("drops a leaving atom in the middle of a chain and keeps OXT at the end", () => {
+    const component = parseCcdComponent(LEAVING);
+    assert.deepEqual(polymerResidue(component, false).atoms.map((a) => a.name),
+                     ["N", "CA", "C", "O", "CB"]);
+    // ...and the OXT comes back WHERE THE DICTIONARY PUTS IT, before CB, rather
+    // than appended: AF3's C-terminal phosphoserine reads N CA CB OG C O OXT P.
+    assert.deepEqual(polymerResidue(component, true).atoms.map((a) => a.name),
+                     ["N", "CA", "C", "O", "OXT", "CB"]);
+  });
+
+  it("renumbers the bonds when it drops an atom", () => {
+    // 🔴 A BOND INDEXES THE ATOM LIST. Dropping an atom without remapping moves
+    // every later bond one place along, which is a molecule that does not exist
+    // and looks like one that does: here CA-CB would become CA-OXT.
+    const internal = polymerResidue(parseCcdComponent(LEAVING), false);
+    const named = internal.bonds.map(
+      (bond) => `${internal.atoms[bond.from].name}-${internal.atoms[bond.to].name}`);
+    assert.deepEqual(named, ["N-CA", "CA-C", "C-O", "CA-CB"]);
+    for (const bond of internal.bonds) {
+      assert.ok(bond.from < internal.atoms.length && bond.to < internal.atoms.length);
+    }
+    // At a C-terminus the C-OXT bond is back and everything still points home.
+    const terminal = polymerResidue(parseCcdComponent(LEAVING), true);
+    assert.equal(terminal.bonds.length, 5);
+    assert.deepEqual(terminal.bonds.map(
+      (bond) => `${terminal.atoms[bond.from].name}-${terminal.atoms[bond.to].name}`),
+      ["N-CA", "CA-C", "C-O", "C-OXT", "CA-CB"]);
+  });
+});
+
 describe("loop terminators", () => {
   // 🔴 EVERY ATP FOLD DIED ON THIS. files.rcsb.org ends ATP's atom loop with the
   // line "# #", not "#": it passed the comment test, tokenised into a two-field
@@ -165,7 +243,10 @@ describe("CCD component", () => {
     assert.equal(gol.code, "GOL");
     assert.deepEqual(gol.atoms.map((a) => a.name), ["C1", "O1", "C2", "O2", "C3", "O3'"]);
     assert.deepEqual(gol.atoms.map((a) => a.element), [6, 8, 6, 8, 6, 8]);
-    assert.deepEqual(gol.atoms[0], { name: "C1", element: 6, charge: 0, x: -1.249, y: -0.665, z: 0.295 });
+    // `leaving` marks an atom the polymer loses on forming a peptide bond; a
+    // glycerol has none, being a ligand. See polymerResidue.
+    assert.deepEqual(gol.atoms[0],
+      { name: "C1", element: 6, charge: 0, leaving: false, x: -1.249, y: -0.665, z: 0.295 });
   });
 
   it("prefers the ideal conformer over the model one", () => {

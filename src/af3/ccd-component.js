@@ -167,6 +167,16 @@ export function parseCcdComponent(text) {
       name,
       element: ELEMENT_SYMBOLS.indexOf(symbol) + 1,
       charge: Number.parseFloat(at(row, "charge") ?? "0") || 0,
+      // 🔴 A LEAVING ATOM IS PRESENT IN THE COMPONENT AND ABSENT FROM THE
+      // POLYMER. The dictionary describes a free amino acid, so a modified
+      // residue carries the OXT it would lose on forming a peptide bond -
+      // SEP has eleven heavy atoms here and AF3 gives it TEN tokens in the
+      // middle of a chain and eleven at the C-terminus. The flag is kept
+      // rather than acted on, because which end a residue sits at is not a
+      // property of the component. See polymerResidue below.
+      leaving: (at(row, "pdbx_leaving_atom_flag") ?? "N").toUpperCase() === "Y",
+    });
+    Object.assign(atoms[atoms.length - 1], {
       x: coordinate(row, "x"), y: coordinate(row, "y"), z: coordinate(row, "z"),
     });
   }
@@ -185,6 +195,41 @@ export function parseCcdComponent(text) {
     bonds.push({ from, to, order: BOND_ORDERS[bondAt(row, "value_order") ?? "SING"] ?? 1 });
   }
   return { code, atoms, bonds };
+}
+
+/**
+ * A component as it appears INSIDE a polymer chain, with its leaving atoms
+ * resolved and its bonds renumbered to match.
+ *
+ * 🔴 THE OXT COMES BACK ONLY AT A C-TERMINUS, which is what AF3 does: a
+ * phosphoserine is ten tokens in the middle of a chain and eleven at the end,
+ * the extra one an OXT sitting where the dictionary puts it - between O and the
+ * modification's own atoms - rather than appended. Every other leaving atom
+ * goes, since it is exactly the atom the peptide bond replaced.
+ *
+ * 🔴 AND THE BONDS ARE RENUMBERED, because they index the atom list. Dropping
+ * an atom without remapping them silently rewires the residue: SEP's bonds
+ * would move one place along from OXT onwards, which is a molecule that does
+ * not exist and reads as a plausible one.
+ *
+ * @param {{code: string, atoms: object[], bonds: object[]}} component
+ * @param {boolean} isCTerminal
+ */
+export function polymerResidue(component, isCTerminal) {
+  const keep = component.atoms.map(
+    (atom) => !atom.leaving || (isCTerminal && atom.name === "OXT"));
+  const renumbered = [];
+  let next = 0;
+  for (let index = 0; index < component.atoms.length; index += 1) {
+    renumbered.push(keep[index] ? next++ : -1);
+  }
+  return {
+    code: component.code,
+    atoms: component.atoms.filter((_, index) => keep[index]),
+    bonds: component.bonds
+      .filter((bond) => renumbered[bond.from] >= 0 && renumbered[bond.to] >= 0)
+      .map((bond) => ({ ...bond, from: renumbered[bond.from], to: renumbered[bond.to] })),
+  };
 }
 
 /**

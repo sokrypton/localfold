@@ -179,6 +179,10 @@ def main():
                         help="an A3M set as every chain's paired_msa, so AF3"
                              " does its own cross-chain pairing; --a3m stays"
                              " the unpaired block")
+    parser.add_argument("--modification", action="append", metavar="CHAIN:CCD:POSITION",
+                        help="a modified residue, as CCD:POSITION for the first chain "
+                             "or CHAIN:CCD:POSITION for a numbered one, 1-based. "
+                             "Repeatable. e.g. SEP:3, or 1:PTR:12")
     parser.add_argument("--ligand", action="append", metavar="CCD",
                         help="append a ligand chain by CCD code (repeatable),"
                              " e.g. --ligand ATP")
@@ -253,11 +257,79 @@ def main():
 
         f3.spec_to_fold_input = _with_paired
 
+    # 🔴 MODIFICATIONS GO ON THE CHAIN OBJECT, WHICH THE SPEC CANNOT CARRY. The
+    # contig says how long a chain is and spec_to_fold_input builds a plain
+    # ProteinChain from it, so a PTM has no way in through that path - the
+    # wrapper below sets the slot afterwards, the same trick --paired-a3m uses
+    # for the same reason. ProteinChain is a __slots__ class rather than a
+    # dataclass, so rebuilding one would drop whatever the constructor does not
+    # take; setting the one slot touches only that field.
+    if arguments.modification:
+        import dataclasses
+        from colabdesign2.af3.alphafold3.common import folding_input as _fi
+        wanted = {}
+        for entry in arguments.modification:
+            parts = entry.split(":")
+            if len(parts) == 2:
+                chain_index, code, position = 0, parts[0], int(parts[1])
+            elif len(parts) == 3:
+                chain_index, code, position = int(parts[0]), parts[1], int(parts[2])
+            else:
+                raise SystemExit(f"--modification wants CCD:POSITION or CHAIN:CCD:POSITION, got {entry}")
+            wanted.setdefault(chain_index, []).append((code.upper(), position))
+        _before_ptms = f3.spec_to_fold_input
+
+        def _with_ptms(*args, **kwargs):
+            fold_input = _before_ptms(*args, **kwargs)
+            # 🔴 REBUILT THROUGH THE CONSTRUCTOR, NOT POKED INTO THE SLOT. The
+            # paired-MSA hack above sets `_paired_msa` directly and is right to:
+            # that slot is read as it is written. `_ptms` is not - the
+            # constructor is what turns the list into the form the rest of the
+            # pipeline expects - and assigning it raw produced a batch with the
+            # right TOKEN COUNT and nonsense residue numbering: 1..12 followed
+            # by 4..12 for a twelve-residue chain, which looks plausible enough
+            # to check against.
+            rebuilt = []
+            for index, chain in enumerate(fold_input.chains):
+                if index in wanted and isinstance(chain, _fi.ProteinChain):
+                    chain = _fi.ProteinChain(
+                        id=chain.id, sequence=chain.sequence, ptms=wanted[index],
+                        description=chain.description, paired_msa=chain.paired_msa,
+                        unpaired_msa=chain.unpaired_msa, templates=chain.templates)
+                rebuilt.append(chain)
+            return dataclasses.replace(fold_input, chains=rebuilt)
+
+        f3.spec_to_fold_input = _with_ptms
+
     msa_crop = 8 if alignment is None else 1 + alignment.count(">")
     if paired is not None:
         msa_crop += paired.count(">")
-    batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)),
-                              msa=alignment, msa_crop_size=msa_crop)
+    # 🔴 featurise_spec RENUMBERS residue_index FROM THE CONTIG, WHICH ASSUMES
+    # ONE TOKEN PER RESIDUE. With a modified residue that is false, and the
+    # renumbering is silent: a twelve-residue chain with a phosphoserine comes
+    # back with the right token count, the right aatype, and residue_index
+    # 1..12 then 4..12 instead of 1, 2, then ten 3s and 4..12. Called through
+    # featurise() the same fold_input gives the correct numbering, so that is
+    # what a modified dump uses. Ligands are unaffected - their tokens are a
+    # chain of their own, so contig numbering happens to land right.
+    if arguments.modification:
+        captured = {}
+        _before_capture = f3.spec_to_fold_input
+
+        def _capture(*args, **kwargs):
+            fold_input = _before_capture(*args, **kwargs)
+            captured["fold_input"] = fold_input
+            return fold_input
+
+        f3.spec_to_fold_input = _capture
+        f3.spec_to_fold_input(spec, name="design", seeds=(0,),
+                              sequences=dict(enumerate(chains)))
+        batch = f3.featurise(captured["fold_input"], msa_crop_size=msa_crop)
+        if isinstance(batch, (list, tuple)):
+            batch = batch[0]
+    else:
+        batch = f3.featurise_spec(spec, sequences=dict(enumerate(chains)),
+                                  msa=alignment, msa_crop_size=msa_crop)
     sequence = "".join(chains)
 
     weights = os.path.expanduser(arguments.weights
@@ -343,6 +415,7 @@ def main():
     path.write_text(json.dumps({
         "model": arguments.model,
         "sequence": sequence,
+        "modifications": arguments.modification or [],
         # The chains, kept separately: `sequence` is joined so a consumer can
         # index it by token, and the split is not recoverable from that.
         "chains": chains,

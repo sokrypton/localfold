@@ -91,10 +91,25 @@ for (const code of ligandCodes) {
   if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
   ligands.push(parseCcdComponent(await response.text()));
 }
+// 🔴 AND SO DOES A MODIFIED RESIDUE'S. The dump records what was asked for -
+// "SEP:3", or "1:PTR:12" for a numbered chain - and the component itself comes
+// from the same dictionary, because AF3's batch carries the atoms without
+// saying which component they came from or how they are bonded.
+const modifications = [];
+for (const entry of dump.modifications ?? []) {
+  const parts = entry.split(":");
+  const [chain, code, position] = parts.length === 2
+    ? [0, parts[0], Number(parts[1])]
+    : [Number(parts[0]), parts[1], Number(parts[2])];
+  const response = await fetch(ccdUrl(code));
+  if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
+  const component = parseCcdComponent(await response.text());
+  modifications.push({ chain, position, ...component });
+}
 const batch = featuriseProtein((dump.chains ?? [dump.sequence]).join(":"),
   { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
     profileMsa: rows.profileMsa, profileDeletionMatrix: rows.profileDeletionMatrix,
-    ligands });
+    ligands, modifications });
 const { tokens, dense } = batch;
 
 let failures = 0;
@@ -250,10 +265,18 @@ for (let token = 0; token < tokens; token += 1) {
   // silently falls back to UNK - which then reports a 1.7 A disagreement on a
   // pair of atoms that do not exist. A ligand's own bonded distances are
   // checked below, from its CCD bond table.
-  if (token >= dump.sequence.length) continue;
-  const code = dump.sequence[token];
+  // 🔴 THE RESIDUE, NOT THE TOKEN. They were the same number until a modified
+  // residue became several tokens; `dump.sequence[token]` then still finds A
+  // residue for every token past it, so the check reports a plausible 1.2 A
+  // disagreement instead of an error. batch.residueOfToken is the map.
+  const residue = batch.residueOfToken[token];
+  if (residue < 0) continue;                       // a ligand is not a residue
+  // A modified residue has no baked conformer; its chemistry is checked below
+  // from its own bond table, the way a ligand's is.
+  if (batch.modifiedSpans.some((span) => span.residue === residue)) continue;
+  const code = dump.sequence[residue];
   const entry = REFERENCE_CONFORMERS[code] ?? REFERENCE_CONFORMERS.X;
-  const atoms = chainEnds.has(token) ? entry.cTerminal : entry.internal;
+  const atoms = chainEnds.has(residue) ? entry.cTerminal : entry.internal;
   for (const [i, j] of entry.rigid) {
     const a = token * dense + atoms[i][0];
     const b = token * dense + atoms[j][0];
@@ -261,7 +284,7 @@ for (let token = 0; token < tokens; token += 1) {
     checked += 1;
     if (difference > worst) {
       worst = difference;
-      worstAt = `${code}${token + 1} ${atoms[i][1]}-${atoms[j][1]}`;
+      worstAt = `${code}${residue + 1} ${atoms[i][1]}-${atoms[j][1]}`;
     }
   }
 }
@@ -309,6 +332,54 @@ if (ligands.length > 0) {
   console.log("\nligand chemistry: the dictionary's conformer against AF3's own");
   report("ligand rigid pairs", `worst ${worst.toFixed(3)} A at ${where} over ${pairs} pairs`,
          worst < 0.25);
+}
+
+// 🔴 AND A MODIFIED RESIDUE'S CHEMISTRY, WHICH NOTHING ELSE HERE COVERS. It has
+// no baked conformer, so the rigid-pair loop above skips it; its atoms come
+// from the dictionary like a ligand's and are held to the same standard -
+// bonded distances and 1-3 angles survive AF3's torsion sampling, coordinates
+// do not. Without this the residue could be built from the wrong component, or
+// with its atoms in the wrong order, and every array above would still agree.
+if (batch.modifiedSpans.length > 0) {
+  // 🔴 BONDS AND ANGLES REPORTED APART, BECAUSE THEY ARE NOT EQUALLY FIXED. A
+  // bond length is chemistry and must agree closely; a 1-3 distance is a bond
+  // ANGLE, and the dictionary's ideal angle and AF3's sampled one can differ
+  // where the linkage is soft - phosphotyrosine's CZ-OH-P opens by 0.36 A of
+  // 1-3 distance, while every bond in it agrees to a hundredth. Reporting one
+  // number for both would either hide that or fail on it, and neither says
+  // what is true: the molecule is right and one angle is drawn differently.
+  const worst = { bond: 0, angle: 0 };
+  const where = { bond: "", angle: "" };
+  const counted = { bond: 0, angle: 0 };
+  for (const span of batch.modifiedSpans) {
+    const bonded = new Set(span.bonds.flatMap(({ from, to }) => [`${from},${to}`, `${to},${from}`]));
+    const neighbours = Array.from({ length: span.count }, () => new Set());
+    for (const { from, to } of span.bonds) { neighbours[from].add(to); neighbours[to].add(from); }
+    const name = (index) => span.atoms?.[index]?.name ?? index;
+    for (let i = 0; i < span.count; i += 1) {
+      for (let j = i + 1; j < span.count; j += 1) {
+        const isBond = bonded.has(`${i},${j}`);
+        const isAngle = !isBond && [...neighbours[i]].some((k) => neighbours[j].has(k));
+        if (!isBond && !isAngle) continue;
+        const kind = isBond ? "bond" : "angle";
+        counted[kind] += 1;
+        const a = (span.from + i) * dense;
+        const b = (span.from + j) * dense;
+        const error = Math.abs(distance(batch.refPos, a, b) - distance(theirPos, a, b));
+        if (error > worst[kind]) {
+          worst[kind] = error;
+          where[kind] = `${span.code} ${name(i)}-${name(j)}`;
+        }
+      }
+    }
+  }
+  console.log("\nmodified residues: the dictionary's conformer against AF3's own");
+  report("modified bond lengths",
+         `worst ${worst.bond.toFixed(3)} A at ${where.bond} over ${counted.bond} bonds`,
+         worst.bond < 0.1);
+  report("modified bond angles",
+         `worst ${worst.angle.toFixed(3)} A at ${where.angle} over ${counted.angle} pairs`,
+         worst.angle < 0.5);
 }
 
 
