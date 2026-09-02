@@ -688,12 +688,21 @@ the channels unties that, and it is implemented; with it, tile 8 at 240 tokens
 measures 253 against tile 4's 235, and tile 4 wins at 59 tokens too (65 against
 82). So the traffic the tile divides was not what the stack was waiting on.
 
-**The other lever nobody has pulled is f16 weights.** The traffic is bytes, not
-values, so half-width weights would halve it outright. README records f16
-COMPUTE being rejected (13% slower, because Apple runs f32 and f16 ALU at the
-same rate) - but that experiment says nothing about f16 STORAGE with f32
-accumulation, which is a bandwidth change rather than an arithmetic one, and
-this stack is bandwidth-bound by a factor of about three.
+🔴 **AND f16 WEIGHTS ARE NOT THE LEVER EITHER, WHICH IS THE MEASUREMENT THAT
+SETTLES THE MODEL.** README records f16 COMPUTE being rejected (13% slower;
+Apple runs f32 and f16 ALU at the same rate), and that says nothing about f16
+STORAGE with f32 accumulation - a bandwidth change rather than an arithmetic
+one, and the obvious move if 630 MB of resident weights were the problem. Built
+(the device feature, half-width packing, and one rewrite of the finished WGSL
+turning every `weights[...]` into `f32(weights[...])`) it measured **85 ms
+against 65 at 59 tokens** and 232 against 234 at 240. Slower, or level. The
+bytes were never the constraint; the conversions are instructions and
+instructions are.
+
+It also costs accuracy that is not free: relRMS against the f32 reference goes
+1.88e-2, against a 3.02e-6 rounding envelope. That is still inside AF3's own
+bfloat16 noise - eleven mantissa bits against eight - but there is no reason to
+spend it for nothing.
 
 ### What else was tried on the head, and lost
 
