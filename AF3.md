@@ -509,6 +509,13 @@ barrier the staging loop makes.
 - **Blocking the transition's first matmul over i**, on its own: nothing.
 - **Barriers.** Priced by removing them from the projection's k loop: exactly
   zero. The step stays at 8.
+- **Reading the transition's widening weights as vec4.** Its two weight reads a
+  channel were half its instructions, and consecutive lanes read consecutive
+  slots - so four consecutive slots to a lane makes those two reads two vec4
+  reads and the multiply-adds eight: eleven instructions to buy thirty-two where
+  it was five to buy eight. It needs a chunk of four workgroup widths, and at
+  the tile that then fits it measured 1.63 ms against the current shape's 1.39.
+  A third measurement saying this kernel is not waiting on its weight reads.
 
 ### The ceiling these are measured against
 
