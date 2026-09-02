@@ -58,6 +58,8 @@ export async function main(device, args) {
   const weights = {
     ...SHAPE,
     lanes: args.some((a) => a.startsWith("--lanes=")) ? Number(option(args, "lanes", "")) : undefined,
+    tile: args.some((a) => a.startsWith("--tile=")) ? Number(option(args, "tile", "")) : undefined,
+    splits: args.some((a) => a.startsWith("--splits=")) ? Number(option(args, "splits", "")) : undefined,
     pairInputLayerNormScale: new Float32Array(pairChannels).fill(1),
     superBlocks: Array.from({ length: superBlocks }, () => ({
       // 🔴 THE SAME OBJECT IN EVERY SLOT, WHICH IS THE POINT ON THE WEIGHT
@@ -84,6 +86,7 @@ export async function main(device, args) {
   const after = rows.slice(1);
   return {
     tokens, lanes: weights.lanes ?? "default",
+    tile: weights.tile ?? "default", splits: weights.splits ?? "default",
     blocks: superBlocks * blocksPerSuperBlock, callsMs: rows,
     steadyMs: Math.round(after.reduce((a, b) => a + b, 0) / after.length),
   };
