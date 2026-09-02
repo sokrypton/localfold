@@ -102,8 +102,13 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     // SYMMETRIC, so a code is just a multiple of its block's scale. There is no
     // zero point: at eight bits the bias one would correct measures 0.1 pLDDT,
     // which is noise. tools/quantize_model.py has the numbers.
-    for (let index = 0; index < elements; index += 1) {
-      output[index] = codes[index] * scales[(index / block) | 0];
+    // ...the same hoist as int5 below: one Float16Array read a block, not one
+    // an element, and no division per element.
+    for (let block_ = 0; block_ < blocks; block_ += 1) {
+      const scale = scales[block_];
+      const start = block_ * block;
+      const end = Math.min(start + block, elements);
+      for (let index = start; index < end; index += 1) output[index] = codes[index] * scale;
     }
     return output;
   }
@@ -134,13 +139,27 @@ export function readTensor(record, buffer, byteOffset, copy = false) {
     // offset at most 7 ends by bit 12, so two bytes always suffice - and the
     // packer leaves one byte of slack so the last code of a tensor can take its
     // second byte without walking off the buffer.
-    for (let index = 0; index < elements; index += 1) {
-      const group = (index / block) | 0;
-      const bit = (index % block) * 5;
-      const at = group * INT5_GROUP_BYTES + (bit >> 3);
-      const pair = codes[at] | (codes[at + 1] << 8);
-      const code = (pair >> (bit & 7)) & 31;
-      output[index] = code * scales[group] + zeros[group];
+    // 🔴 GROUP OUTSIDE, ELEMENT INSIDE, AND THE SCALES READ ONCE EACH. Written
+    // as one flat loop this re-read scales[group] and zeros[group] for EVERY
+    // element - and those are Float16Array, so each read is an f16-to-f64
+    // conversion, `block` times more of them than the data has. It also divided
+    // and took a modulo per element to recover a group index the loop already
+    // knows. Same arithmetic, same output, hoisted: decoding the int5 bundle
+    // went from 5.3 s to 1.5 s, which the page pays once and the user waits
+    // through all of.
+    for (let group = 0; group < groups; group += 1) {
+      const scale = scales[group];
+      const zero = zeros[group];
+      const groupBase = group * INT5_GROUP_BYTES;
+      const start = group * block;
+      const end = Math.min(start + block, elements);
+      let bit = 0;
+      for (let index = start; index < end; index += 1) {
+        const at = groupBase + (bit >> 3);
+        const pair = codes[at] | (codes[at + 1] << 8);
+        output[index] = ((pair >> (bit & 7)) & 31) * scale + zero;
+        bit += 5;
+      }
     }
     return output;
   }
