@@ -17,9 +17,8 @@ import {
   OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER,
   OUTER_PRODUCT_MEAN_FINALIZE_SHADER,
   createOuterProductMeanContractShader,
-  OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
   outerProductMeanTileCapacity,
-  OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER,
+  createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
   packOuterProductMeanWeights,
@@ -428,9 +427,11 @@ async function encodeOuterProductMean(
       createOuterProductMeanContractShader(input.cOuter)),
     execution.pipelines.get(
       outerFirst && residualTarget !== undefined
-        ? "block:opm:project-output-residual" : "block:opm:project-output",
+        ? `block:opm:project-output-residual:${input.cOuter}`
+        : `block:opm:project-output:${input.cOuter}`,
       outerFirst && residualTarget !== undefined
-        ? OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER : OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER,
+        ? createOuterProductMeanProjectOutputShader(input.cOuter, true)
+        : createOuterProductMeanProjectOutputShader(input.cOuter),
     ),
   ]);
   const rows = input.sequences * input.length;
@@ -456,11 +457,12 @@ async function encodeOuterProductMean(
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {
-    grid = execution.linearGrid(intermediateElements);
+    // ...both are one workgroup per PAIR; see outer-product-mean.js.
+    const pairGrid = execution.linearGrid(input.length * input.length * 64);
     execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
-      grid[0], grid[1], 1, "opm.contract");
+      pairGrid[0], pairGrid[1], 1, "opm.contract");
     execution.dispatch(encoder, projectOutputPipeline, [intermediate, msaMask, weights, params, output],
-      outputGrid[0], outputGrid[1], 1, "opm.project-output");
+      pairGrid[0], pairGrid[1], 1, "opm.project-output");
   } else {
     execution.endComputePass(encoder);
     encoder.clearBuffer(output.allocation.buffer);

@@ -393,39 +393,67 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
-export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER = `${COMMON}
+/**
+ * The output projection, generated for one c_outer.
+ *
+ * 🔴 IT RECOMPUTED THE DENOMINATOR ONCE PER OUTPUT CHANNEL. The count of
+ * sequences covering both tokens depends on the PAIR alone, and a thread owned
+ * a (pair, channel) - so 128 threads each swept all 512 sequences for the same
+ * number: 456 million redundant reads a block at depth, about a third of what
+ * this kernel cost. One workgroup a pair computes it once, cooperatively.
+ *
+ * 🔴 AND EVERY THREAD RE-READ THE WHOLE OUTER TENSOR. A pair's c_outer^2 values
+ * are the same for all 128 channels; staged in workgroup memory they are one
+ * global read each rather than 128, which halves what is left.
+ */
+export function createOuterProductMeanProjectOutputShader(cOuter, residual = false) {
+  const cells = cOuter * cOuter;
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> outer: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const CELLS: u32 = ${cells}u;
+var<workgroup> staged: array<f32, ${cells}>;
+var<workgroup> reduce: array<f32, 64>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.length * p.c_z) { return; }
-  let z = index % p.c_z;
-  let pair = index / p.c_z;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let pair = group.x + group.y * GRID_WIDTH;
+  if (pair >= p.length * p.length) { return; }
   let i = pair / p.length;
   let j = pair % p.length;
-  var value = weights[p.output_bias + z];
-  for (var outer_left = 0u; outer_left < p.c_outer; outer_left += 1u) {
-    for (var outer_right = 0u; outer_right < p.c_outer; outer_right += 1u) {
-      let outer_index = (pair * p.c_outer + outer_left) * p.c_outer + outer_right;
-      let weight_index = (outer_left * p.c_outer + outer_right) * p.c_z + z;
-      value += outer[outer_index] * weights[p.output_weight + weight_index];
-    }
+  let local = local_id.x;
+
+  for (var cell = local; cell < CELLS; cell += 64u) {
+    staged[cell] = outer[pair * CELLS + cell];
   }
+  // ...the denominator, once for the pair rather than once per channel.
   var count = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+  for (var sequence = local; sequence < p.sequences; sequence += 64u) {
     count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
   }
-  output[index] = value / (p.normalization_epsilon + count);
-}`;
+  reduce[local] = count;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce[local] += reduce[local + stride]; }
+    workgroupBarrier();
+  }
+  let scale = 1.0 / (p.normalization_epsilon + reduce[0]);
 
-export const OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_RESIDUAL_SHADER = OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER.replace(
-  "output[index] = value / (p.normalization_epsilon + count);",
-  "output[index] += value / (p.normalization_epsilon + count);",
-);
+  for (var z = local; z < p.c_z; z += 64u) {
+    var value = weights[p.output_bias + z];
+    for (var cell = 0u; cell < CELLS; cell += 1u) {
+      // ...read once for the pair, used by every channel.
+      value += staged[cell] * weights[p.output_weight + cell * p.c_z + z];
+    }
+    output[pair * p.c_z + z] ${residual ? "+=" : "="} value * scale;
+  }
+}`;
+}
 
 const OUTER_FIRST_LIMIT_BYTES = 64 * 1024 * 1024;
 
@@ -459,7 +487,8 @@ export class OuterProductMeanGpu {
       this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
       this.pipelines.get(`opm:contract:${input.cOuter}`,
         createOuterProductMeanContractShader(input.cOuter)),
-      this.pipelines.get("opm:project-output", OUTER_PRODUCT_MEAN_PROJECT_OUTPUT_SHADER),
+      this.pipelines.get(`opm:project-output:${input.cOuter}`,
+        createOuterProductMeanProjectOutputShader(input.cOuter)),
     ]);
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -520,8 +549,10 @@ export class OuterProductMeanGpu {
         const outerGrid = [Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH)];
         pass(contractPipeline, [left.buffer, right.buffer, params.buffer, intermediate.buffer],
           outerGrid[0], outerGrid[1]);
-        pass(projectOutputPipeline, [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],
-          outputGrid[0], outputGrid[1]);
+        // ...one workgroup per PAIR now; see the note on the kernel.
+        pass(projectOutputPipeline,
+          [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],
+          outerGrid[0], outerGrid[1]);
       } else {
         encoder.clearBuffer(output.buffer);
         for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
