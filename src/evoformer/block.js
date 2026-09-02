@@ -7,6 +7,7 @@ import {
   createAttentionNormParameters,
   createAttentionParameters,
   packAttentionWeights,
+  buildAttentionFlashKernel,
   selectAttentionFlashKernel,
 
 } from "./attention.js";
@@ -267,12 +268,18 @@ async function encodeAttention(
     ...(options.pairBias === undefined ? {} : { pairBias: options.pairBias }),
   };
   const packed = packAttentionWeights(descriptor);
-  const flashKernel = selectAttentionFlashKernel(execution.device, options.channels / options.heads);
-  const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
+  // 🔴 BUILT SEPARATELY SO A REFUSED SUBGROUP PIPELINE CAN FALL BACK. See
+  // buildAttentionFlashKernel: a device can carry both subgroup features and
+  // still reject `@subgroup_size(32)`, and inside a Promise.all that rejection
+  // is just a failed fold.
+  const built = await buildAttentionFlashKernel(
+    execution, execution.device, options.channels / options.heads);
+  const flashKernel = built.kernel;
+  const flash = built.pipeline;
+  const [normalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
-    execution.pipelines.get(`block:${flashKernel.cacheKey}`, flashKernel.shader),
     execution.pipelines.get(
       options.residualTarget === undefined ? "block:attention:output" : "block:attention:output-residual",
       options.residualTarget === undefined ? ATTENTION_OUTPUT_SHADER : ATTENTION_OUTPUT_RESIDUAL_SHADER,

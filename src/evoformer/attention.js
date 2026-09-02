@@ -525,8 +525,42 @@ ${each((t) => `output[q_base + ${t}u] = (acc${t} / running_sum) * gate[q_base + 
 }`;
 }
 
+/**
+ * The subgroup size every one of these kernels is written for. It is pinned in
+ * the shader as `@subgroup_size(32)` and assumed by the lane arithmetic, so it
+ * is a correctness requirement and not a preference.
+ */
+export const ATTENTION_SUBGROUP_SIZE = 32;
+
+/**
+ * Whether this device allows the subgroup size the kernels declare.
+ *
+ * 🔴 A DEVICE CAN HAVE THE FEATURES AND STILL REFUSE THE SIZE, AND THE FAILURE
+ * IS FATAL RATHER THAN SLOW. Reported from a Pixel: "The subgroup_size
+ * attribute (32) is not in the allowed range ([16, 16])" while building
+ * block:attention:flash-subgroup-key32. Adreno and Mali parts report a
+ * 16-lane range, so `@subgroup_size(32)` fails PIPELINE CREATION - the fold
+ * does not fall back, it stops - and this checked only for the two features,
+ * both of which those devices have.
+ *
+ * 🔴 UNKNOWN IS TREATED AS ALLOWED, DELIBERATELY. Browsers that expose the
+ * subgroups feature without the size range would otherwise lose the fast path
+ * they have been running correctly; the range is what the error message quotes,
+ * so a browser that can raise that error can also report it.
+ */
+export function allowsAttentionSubgroupSize(device, size = ATTENTION_SUBGROUP_SIZE) {
+  const info = device.adapterInfo ?? device.info ?? {};
+  const min = info.subgroupMinSize;
+  const max = info.subgroupMaxSize;
+  if (typeof min === "number" && size < min) return false;
+  if (typeof max === "number" && size > max) return false;
+  return true;
+}
+
 export function supportsAttentionSubgroups(device, headDim = 32) {
-  return headDim === 32 && device.features.has("subgroups") && device.features.has("subgroup-size-control");
+  return headDim === 32 && device.features.has("subgroups")
+    && device.features.has("subgroup-size-control")
+    && allowsAttentionSubgroupSize(device);
 }
 
 /**
@@ -752,6 +786,36 @@ export function supportsAttentionSubgroup64x64(device, headDim = 32) {
   return supportsAttentionSubgroups(device, headDim)
     && device.limits.maxComputeInvocationsPerWorkgroup >= 256
     && device.limits.maxComputeWorkgroupStorageSize >= 16_384;
+}
+
+/**
+ * The flash kernel AND its pipeline, falling back if the device refuses it.
+ *
+ * 🔴 INTROSPECTION IS NOT ENOUGH ON ITS OWN. supportsAttentionSubgroups now
+ * checks the device's subgroup size range, but a browser that exposes the
+ * subgroups feature WITHOUT that range reads as "allowed" - deliberately, so
+ * devices that have been running these kernels correctly keep them - and on a
+ * part that only does 16 lanes the pipeline then fails to build and the fold
+ * stops. createComputePipelineAsync rejects rather than throwing, so the
+ * refusal is catchable, and the register-resident kernel needs no subgroup
+ * support at all. Cheaper to try and fall back than to guess.
+ *
+ * @param {{pipelines: {get: (key: string, code: string) => Promise<GPUComputePipeline>}}} execution
+ */
+export async function buildAttentionFlashKernel(execution, device, headDim, requested = "auto") {
+  const kernel = selectAttentionFlashKernel(device, headDim, requested);
+  try {
+    return { kernel, pipeline: await execution.pipelines.get(`block:${kernel.cacheKey}`, kernel.shader) };
+  } catch (error) {
+    // Only a subgroup kernel has a fallback; anything else failing is real.
+    if (!kernel.variant.startsWith("subgroup")) throw error;
+    const portable = selectAttentionFlashKernel(device, headDim, "portable");
+    if (portable.cacheKey === kernel.cacheKey) throw error;
+    return {
+      kernel: portable,
+      pipeline: await execution.pipelines.get(`block:${portable.cacheKey}`, portable.shader),
+    };
+  }
 }
 
 export function selectAttentionFlashKernel(
