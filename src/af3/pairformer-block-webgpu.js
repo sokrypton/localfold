@@ -33,6 +33,7 @@ import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { transitionRowTile } from "./transition-webgpu.js";
 import {
   GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
@@ -375,7 +376,7 @@ export class Af3PairformerStackGpu {
     run("single.add", pipelines.addSingle, [single, singleScratch[5]], addSingle[0], addSingle[1]);
 
     run("single-transition", pipelines.singleTransition,
-        [single, singleTransitionWeights, singleScratch[0]], n);
+        [single, singleTransitionWeights, singleScratch[0]], ceil(n, transitionRowTile(n)));
     run("single-transition.add", pipelines.addSingle, [single, singleScratch[0]],
         addSingle[0], addSingle[1]);
 

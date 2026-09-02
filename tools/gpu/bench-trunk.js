@@ -31,6 +31,7 @@
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
+import { profileDevice } from "./profile.js";
 import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 
@@ -73,6 +74,8 @@ export async function main(device, args) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
+  // --profile times every compute pass by label; see tools/gpu/profile.js.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
   const trunkGpu = new Af3TrunkGpu(device);
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);
@@ -88,7 +91,11 @@ export async function main(device, args) {
     previousPair = trunk.pair;
     previousSingle = trunk.single;
     perPass.push({ pass, whole: Math.round(performance.now() - started), ...timings });
+    // ...the last pass only, so pipeline compilation is not in the numbers.
+    if (profile !== null && pass < passes - 1) profile.reset();
   }
+  const passes_ = profile === null ? undefined : await profile.report();
+  profile?.restore();
 
   // 🔴 THE FIRST PASS COMPILES EVERY PIPELINE. The median of the rest is what a
   // recycle actually costs.
@@ -99,6 +106,7 @@ export async function main(device, args) {
   };
   return {
     tokens, msaRows: rows, blocks, perPass,
+    ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, 18) }),
     steady: Object.fromEntries(Object.keys(perPass[0])
       .filter((key) => key !== "pass")
       .map((key) => [key, median((row) => row[key])])),

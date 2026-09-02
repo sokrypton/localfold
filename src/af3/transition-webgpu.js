@@ -31,6 +31,28 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 const WORKGROUP = 128;
+
+/**
+ * How many rows one workgroup transitions at once, given how many there are.
+ *
+ * 🔴 A FUNCTION OF THE ROW COUNT, NOT A CONSTANT, BECAUSE THE TWO CALLERS ARE
+ * NOTHING ALIKE. The pair track transitions 3481 rows and the weight set is
+ * what costs - tiling by four cut it from 241 ms to 85. The pairformer's SINGLE
+ * transition has one row a token, 59 of them, and tiling by four leaves fifteen
+ * workgroups: it went 30.6 ms to 43.7, because there is no occupancy left to
+ * trade. So the tile is taken only when the rows can spare it.
+ *
+ * 🔴 AND EVERY CALLER MUST AGREE WITH THE SHADER. The shader is generated with
+ * this tile and the dispatch is divided by it, so a caller that computes one
+ * and not the other silently transitions a fraction of its rows. Both sides
+ * call this with the same `rows`, which is why it is a pure function.
+ */
+export function transitionRowTile(rows) {
+  for (const tile of [4, 2]) {
+    if (rows / tile >= 256) return tile;
+  }
+  return 1;
+}
 const GRID_WIDTH = 32_768;
 
 /** The packing order of the four tensors this kernel reads. */
@@ -52,6 +74,7 @@ export function packTransitionWeights(weights) {
 export function createTransitionShader(shape, offsets, epsilon, variance) {
   const { rows, channels, factor } = shape;
   const intermediate = channels * factor;
+  const tile = shape.tile ?? transitionRowTile(rows);
   // The fast variance is the trunk's; the atom and diffusion stacks want the
   // two-pass one. See the note in src/triangle/shaders.js.
   const varianceCode = variance === "fast"
@@ -80,6 +103,7 @@ const ROWS: u32 = ${rows}u;
 const CHANNELS: u32 = ${channels}u;
 const INTERMEDIATE: u32 = ${intermediate}u;
 const WORKGROUP: u32 = ${WORKGROUP}u;
+const TILE: u32 = ${tile}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const EPSILON: f32 = ${epsilon};
 const W_SCALE: u32 = ${offsets.inputLayerNormScale}u;
@@ -91,8 +115,8 @@ const W_T2: u32 = ${offsets.transition2}u;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<workgroup> normalized: array<f32, ${channels}>;
-var<workgroup> gated: array<f32, ${intermediate}>;
+var<workgroup> normalized: array<f32, ${tile * channels}>;
+var<workgroup> gated: array<f32, ${tile * intermediate}>;
 var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
 var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;
 
@@ -101,66 +125,89 @@ fn swish(value: f32) -> f32 { return value / (1.0 + exp(-value)); }
 @compute @workgroup_size(${WORKGROUP})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  // 🔴 THE ROW IS UNIFORM ACROSS THE WORKGROUP, which is what makes the early
-  // return legal next to the barriers below - every invocation in the group
-  // takes the same branch.
-  let row = group.x + group.y * GRID_WIDTH;
-  if (row >= ROWS) { return; }
+  // 🔴 A TILE OF ROWS, NOT ONE, BECAUSE THE WEIGHTS WERE THE COST. Timestamp
+  // profiling put this kernel at 241 ms of a 632 ms pairformer pass - the
+  // largest single kernel in the trunk - and one workgroup a row means every
+  // workgroup reads the whole weight set: 196k floats for 3481 pair rows, which
+  // is 2.7 GB a block. Tiling divides that by TILE and the arithmetic is
+  // unchanged. The disable-and-remeasure bisect this replaced said 129 ms.
+  let base_row = (group.x + group.y * GRID_WIDTH) * TILE;
+  if (base_row >= ROWS) { return; }
   let local = local_id.x;
-  let base = row * CHANNELS;
 
-  var total = 0.0;
-  var sq_total = 0.0;
-  for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    let value = input[base + c];
-    total += value;
-    sq_total += value * value;
-  }
-  reduce_a[local] = total;
-  reduce_b[local] = sq_total;
-  workgroupBarrier();
-  for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
-    if (local < stride) {
-      reduce_a[local] += reduce_a[local + stride];
-      reduce_b[local] += reduce_b[local + stride];
+  // 🔴 THE LAYER NORM IS PER ROW AND STAYS THAT WAY. Its reduction is over
+  // CHANNELS and the tile's rows do not share it, so this loop is sequential -
+  // it is cheap next to the two matmuls, which are what the tile is for.
+  for (var t = 0u; t < TILE; t += 1u) {
+    let row = base_row + t;
+    if (row < ROWS) {
+      let base = row * CHANNELS;
+      var total = 0.0;
+      var sq_total = 0.0;
+      for (var c = local; c < CHANNELS; c += WORKGROUP) {
+        let value = input[base + c];
+        total += value;
+        sq_total += value * value;
+      }
+      reduce_a[local] = total;
+      reduce_b[local] = sq_total;
+      workgroupBarrier();
+      for (var stride = WORKGROUP / 2u; stride > 0u; stride >>= 1u) {
+        if (local < stride) {
+          reduce_a[local] += reduce_a[local + stride];
+          reduce_b[local] += reduce_b[local + stride];
+        }
+        workgroupBarrier();
+      }
+      let mean = reduce_a[0] / f32(CHANNELS);
+      let sum_squares = reduce_b[0];
+      ${varianceCode}
+      let inverse_std = inverseSqrt(variance + EPSILON);
+      workgroupBarrier();
+      for (var c = local; c < CHANNELS; c += WORKGROUP) {
+        normalized[t * CHANNELS + c] = (input[base + c] - mean) * inverse_std
+          * weights[W_SCALE + c] + weights[W_OFFSET + c];
+      }
     }
     workgroupBarrier();
   }
-  let mean = reduce_a[0] / f32(CHANNELS);
-  let sum_squares = reduce_b[0];
-  ${varianceCode}
-  let inverse_std = inverseSqrt(variance + EPSILON);
-  workgroupBarrier();
-
-  for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    normalized[c] = (input[base + c] - mean) * inverse_std * weights[W_SCALE + c]
-      + weights[W_OFFSET + c];
-  }
-  workgroupBarrier();
 
   // transition1 is (channels, intermediate * 2), so a column is strided by the
   // full doubled width. Gate half first, value half second.
   let wide = INTERMEDIATE * 2u;
   for (var i = local; i < INTERMEDIATE; i += WORKGROUP) {
-    var gate = 0.0;
-    var value = 0.0;
+    var gate: array<f32, ${tile}>;
+    var value: array<f32, ${tile}>;
+    for (var t = 0u; t < TILE; t += 1u) { gate[t] = 0.0; value[t] = 0.0; }
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      let x = normalized[c];
       let column = W_T1 + c * wide;
-      gate += x * weights[column + i];
-      value += x * weights[column + INTERMEDIATE + i];
+      // ...read once, used TILE times. That ratio is the point.
+      let wg = weights[column + i];
+      let wv = weights[column + INTERMEDIATE + i];
+      for (var t = 0u; t < TILE; t += 1u) {
+        let x = normalized[t * CHANNELS + c];
+        gate[t] += x * wg;
+        value[t] += x * wv;
+      }
     }
-    gated[i] = swish(gate) * value;
+    for (var t = 0u; t < TILE; t += 1u) {
+      gated[t * INTERMEDIATE + i] = swish(gate[t]) * value[t];
+    }
   }
   workgroupBarrier();
 
   // transition2 is (intermediate, channels).
   for (var c = local; c < CHANNELS; c += WORKGROUP) {
-    var sum = 0.0;
+    var sum: array<f32, ${tile}>;
+    for (var t = 0u; t < TILE; t += 1u) { sum[t] = 0.0; }
     for (var i = 0u; i < INTERMEDIATE; i += 1u) {
-      sum += gated[i] * weights[W_T2 + i * CHANNELS + c];
+      let w = weights[W_T2 + i * CHANNELS + c];
+      for (var t = 0u; t < TILE; t += 1u) { sum[t] += gated[t * INTERMEDIATE + i] * w; }
     }
-    output[base + c] = sum;
+    for (var t = 0u; t < TILE; t += 1u) {
+      let row = base_row + t;
+      if (row < ROWS) { output[row * CHANNELS + c] = sum[t]; }
+    }
   }
 }`;
 }
@@ -224,7 +271,9 @@ export class Af3TransitionGpu {
           binding, resource: { buffer: allocation.buffer },
         })),
       }));
-      pass.dispatchWorkgroups(Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+      // ...one workgroup a TILE of rows; see TRANSITION_ROW_TILE.
+      const groups = Math.ceil(rows / transitionRowTile(rows));
+      pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
       encoder.copyBufferToBuffer(outputBuffer.buffer, 0, readback.buffer, 0, rows * channels * 4);
 

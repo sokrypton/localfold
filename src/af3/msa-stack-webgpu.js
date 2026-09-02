@@ -25,7 +25,8 @@ import {
   createOuterProductMeanShaders, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
 import { createMsaAttentionShaders, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
-import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
+import { createTransitionShader, packTransitionWeights, transitionRowTile }
+  from "./transition-webgpu.js";
 
 export class Af3MsaStackGpu {
   constructor(device) {
@@ -227,8 +228,9 @@ export class Af3MsaStackGpu {
         perRow[0], perRow[1]);
     run("msa.add", pipelines.addMsa, [msa, msaScratch[2]], addMsaGroups[0], addMsaGroups[1]);
 
+    const perTransition = spread(ceil(rows, transitionRowTile(rows)));
     run("msa-transition", pipelines.msaTransition, [msa, msaTransitionWeights, msaScratch[0]],
-        perRow[0], perRow[1]);
+        perTransition[0], perTransition[1]);
     run("msa-transition.add", pipelines.addMsa, [msa, msaScratch[0]],
         addMsaGroups[0], addMsaGroups[1]);
 

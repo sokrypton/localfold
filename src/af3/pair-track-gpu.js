@@ -24,7 +24,8 @@ import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
 import { createGridAttentionShaders, packGridAttentionWeights, PROJECT_ROWS }
   from "./grid-attention-webgpu.js";
-import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
+import { createTransitionShader, packTransitionWeights, transitionRowTile }
+  from "./transition-webgpu.js";
 
 export const PAIR_CHANNELS = 128;
 export const GRID_WIDTH = 32_768;
@@ -159,8 +160,11 @@ export function encodePairTrack(context) {
     addPair(scratch[6]);
   }
 
-  const perPair = spread(pairs);
+  // 🔴 A TILE OF PAIRS A WORKGROUP. This was 241 ms of a 632 ms pairformer pass
+  // - the largest single kernel in the trunk - because each workgroup read the
+  // whole 196k-float weight set for one row.
+  const perTransition = spread(Math.ceil(pairs / transitionRowTile(pairs)));
   run("pair-transition", pipelines.pairTransition, [pair, weights.transition, scratch[0]],
-      perPair[0], perPair[1]);
+      perTransition[0], perTransition[1]);
   addPair(scratch[0]);
 }

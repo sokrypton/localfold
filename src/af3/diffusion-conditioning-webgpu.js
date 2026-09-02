@@ -37,7 +37,8 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
+import { createTransitionShader, packTransitionWeights, transitionRowTile }
+  from "./transition-webgpu.js";
 
 const GRID_WIDTH = 32_768;
 const SIGMA_DATA = 16.0;
@@ -450,13 +451,14 @@ export class Af3DiffusionConditioningGpu {
       const transitionCount = options.transitions ?? 2;
       for (let index = 0; index < transitionCount; index += 1) {
         if (reusePair === undefined) {
-          const perPair = spread(pairs);
+          const perPair = spread(Math.ceil(pairs / transitionRowTile(pairs)));
           run(`pair-transition-${index}`, transitionPipelines.pair[index],
               [pair, transitionWeights.pair[index], pairScratch], perPair[0], perPair[1]);
           run(`pair-add-${index}`, compiled.addPair, [pair, pairScratch], pairAdd[0], pairAdd[1]);
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
-            [single, transitionWeights.single[index], singleScratch], tokens);
+            [single, transitionWeights.single[index], singleScratch],
+            Math.ceil(tokens / transitionRowTile(tokens)));
         run(`single-add-${index}`, compiled.addSingle, [single, singleScratch],
             singleAdd[0], singleAdd[1]);
       }
