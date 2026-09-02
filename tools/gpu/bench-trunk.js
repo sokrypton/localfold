@@ -11,6 +11,22 @@
  * 🔴 THE MSA IS SYNTHETIC AND ITS DEPTH IS A DIAL. The MSA stack's cost is
  * linear in rows and the pairformer's is not, so a bench at depth 1 measures a
  * different machine from the one a real fold runs. --msa sets it.
+ *
+ * WHAT IT FOUND, on a 59-residue chain at 32 rows, after the block weights were
+ * made resident:
+ *
+ *     pairformer 577   msa-stack 89   template 13   embedder 11   distogram 8
+ *
+ * and inside the pairformer, by disabling groups of passes:
+ *
+ *     pair-transition 129   grid.* 125   tri.* 105   single.* 41
+ *
+ * 🔴 AND THERE IS NO OVERHEAD LEFT TO RECLAIM HERE. Making #encodeBlock encode
+ * nothing at all - the block loop, the deferred validation, the per-block
+ * fences and the weight setup, and no dispatches - leaves 7 ms of the 577. The
+ * diffusion side's wins were host-side waste of exactly that kind; this stack
+ * has none, so anything further has to come out of the kernels themselves, and
+ * src/triangle/shaders.js already records several tiling attempts that lost.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
