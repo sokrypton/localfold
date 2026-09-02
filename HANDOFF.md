@@ -410,6 +410,22 @@ and prints a range; trust the range, not a pair.
    So a cold load is bytes divided by the link, and nothing about how they are
    requested changes that: 265 MB at 9.4 MB/s is 28 s against 32.4 measured.
 
+   🔴 **AND ONE BIG FILE IS NOT THE ANSWER, THOUGH IT LOOKS LIKE ONE.** Asked
+   directly: 32 MB as eight ranges of a single file against the same bytes as
+   twenty-six shard requests, alternated - 9.6 and 10.0 MB/s against 9.9 and
+   10.2. Request count does not matter; both saturate the link. What one file
+   costs is everything else:
+
+   - **A single request cannot use a fast link.** HANDOFF's own earlier figures
+     say so: serial 14 MB/s against four-way 27.5. One file fetched as one
+     request would have been half speed there.
+   - **Fetching it as parallel ranges gives up the cache.** `Cache.put()`
+     rejects a 206 by specification, and every ranged response is a 206 - so a
+     repeat visitor would re-download the whole model. The shard cache works
+     because a whole shard is a cacheable 200.
+   - So one file is either not parallel or not cacheable, and shards are what
+     you get back if you fix both.
+
    **What is left is the bytes, and they are close to irreducible.** 277 MB of
    int5, served gzipped already, and gzip takes 5% off packed integers. The
    link caps at about 27 MB/s (serial 14, four-way 27.5, eight-way 26.3 - so
