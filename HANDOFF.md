@@ -16,14 +16,15 @@ the one being served. Everything below is live.
 |---|---|---|
 | AF3 denoiser call, 59-mer | 760 ms | **134 ms** |
 | AF3 diffusion-200 fold, end to end | ~152 s | **26.3 s** |
-| AF3 trunk pass, 32 MSA rows | 756 ms | **439 ms** |
-| ...of which the pairformer | 632 ms | **337 ms** |
-| AF3 trunk pass, 150 tokens | 3.38 s | **2.54 s** |
+| AF3 trunk pass, 32 MSA rows | 756 ms | **411 ms** |
+| ...of which the pairformer | 632 ms | **316 ms** |
+| AF3 trunk pass, 150 tokens | 3.38 s | **2.40 s** |
 | AF3 trunk pass, 1024 MSA rows | 1093 ms | **804 ms** |
 | AF3 checkpoint load | 5470 ms | **1364 ms** |
 | AF2 monomer / multimer load | 1012 / 874 ms | **417 / 400 ms** |
 | AF2 evoformer block, 512 MSA rows | 302.8 ms | **192.0 ms** |
-| AF2 evoformer block, 5 MSA rows | 12.6 ms | **10.4 ms** (a 48-block stack, 498) |
+| AF2 triangle projection, per block | 0.581 ms | **0.422 ms** |
+| AF2 triangle output projection | 0.405 ms | **0.327 ms** |
 | AF3 side-chain bond ratio | 0.927 | **1.015** (AF3 itself: 1.017) |
 
 Accuracy moved the right way: worst relRMS against AF3's own denoiser over
@@ -155,6 +156,10 @@ and prints a range; trust the range, not a pair.
 
 ## Traps that cost time
 
+- **`profile-af2-block.js`'s BLOCK total drifts by 10% between processes**, on
+  the same build - 11.0 to 12.7 ms measured four times. Its per-DISPATCH numbers
+  are stable to about 1%, so a claim about an AF2 kernel rests on those and a
+  claim about the block does not rest on anything.
 - **`--profile` costs about a fifth of the trunk.** It writes a timestamp pair
   per compute pass; the same build measures 439 ms without it and 528 with. Rank
   kernels with it; quote totals from runs that do not use it.

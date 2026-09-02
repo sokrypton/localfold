@@ -226,6 +226,21 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   }
   const rowsPerThread = PROJECT_TILE_ROWS / 8;
   const columnsPerThread = PROJECT_TILE_COLUMNS / 8;
+  // 🔴 THE STAGED ROWS ARE ONE VECTOR, WHICH HALVES THIS KERNEL'S WORKGROUP
+  // READS. Every step of k reads the source tile once per row an invocation
+  // owns, and those rows are adjacent slots, so four of them are one vec4 read
+  // and three swizzles - and a swizzle is free where a workgroup read is not.
+  // tools/gpu/probe-alu.js puts workgroup reads at 394 billion a second against
+  // 580 billion vec4 multiply-adds, so for these kernels the reads are the
+  // larger of the two terms.
+  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowsPerThread];
+  if (rowVector === undefined) {
+    throw new Error(`projectTile rows ${PROJECT_TILE_ROWS} gives ${rowsPerThread} rows an `
+      + "invocation, which is not 1, 2 or 4");
+  }
+  const rowAt = (name, r) => rowsPerThread === 1 ? name : `${name}.${"xyzw"[r]}`;
+  const overRows = (body) =>
+    Array.from({ length: rowsPerThread }, (_, r) => body(r)).join("\n      ");
   const MATRICES = [["ap", "LINEARAPWEIGHT", "LINEARAPBIAS"], ["ag", "LINEARAGWEIGHT", "LINEARAGBIAS"],
                     ["bp", "LINEARBPWEIGHT", "LINEARBPBIAS"], ["bg", "LINEARBGWEIGHT", "LINEARBGBIAS"]];
 
@@ -239,7 +254,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(3) var<storage, read_write> a: array<f32>;
 @group(0) @binding(4) var<storage, read_write> b: array<f32>;
 
-var<workgroup> tile_source: array<f32, ${rowsPerThread * 64}>;
+var<workgroup> tile_source: array<${rowVector}, 64>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
 // separate matrices contracted over the same source, so the four weights a
 // (k, channel) cell needs are always wanted together. Packed as a vec4 the
@@ -273,12 +288,14 @@ fn main(
   for (var c0 = 0u; c0 < CZ; c0 += 8u) {
     let source_c = c0 + local.x;
     let weight_c = c0 + local.y;
-    for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      let row = row0 + r * 8u;
-      var value = 0.0;
-      if (row < PAIRS && source_c < CZ) { value = z[row * CZ + source_c]; }
-      tile_source[r * 64u + tile_index] = value;
-    }
+    var staged: ${rowVector};
+    ${overRows((r) => `{
+        let row = row0 + ${r}u * 8u;
+        var value = 0.0;
+        if (row < PAIRS && source_c < CZ) { value = z[row * CZ + source_c]; }
+        ${rowAt("staged", r)} = value;
+      }`)}
+    tile_source[tile_index] = staged;
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + column * 8u;
       let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
@@ -293,15 +310,11 @@ fn main(
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
-      var x: array<f32, ${rowsPerThread}>;
-      for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-        x[r] = tile_source[r * 64u + local.y * 8u + k];
-      }
+      let x = tile_source[local.y * 8u + k];
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
         let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
-        for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-          acc[r * ${columnsPerThread}u + column] += x[r] * packed;
-        }
+        ${overRows((r) =>
+          `acc[${r}u * ${columnsPerThread}u + column] += ${rowAt("x", r)} * packed;`)}
       }
     }
     workgroupBarrier();
@@ -359,8 +372,28 @@ fn main(
   // A register block of CONTRACT_TILE / 8 each way buys ROWS * COLUMNS of them
   // from ROWS + COLUMNS reads. There is occupancy to spend: at 59 tokens and
   // 128 channels the old shape launched 8,192 workgroups.
+  //
+  // 🔴 AND BOTH STAGED TILES ARE VECTORS, WHICH TAKES IT FURTHER. The rows an
+  // invocation owns are adjacent slots of a, and the columns are adjacent slots
+  // of b, so a 4x4 block reads ONE vec4 from each and does four vector
+  // multiply-adds - two reads and four instructions where the scalar form had
+  // eight reads and sixteen.
   const contractRows = CONTRACT_TILE.rows / 8;
   const contractColumns = CONTRACT_TILE.columns / 8;
+  const contractRowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[contractRows];
+  const contractColumnVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[contractColumns];
+  if (contractRowVector === undefined || contractColumnVector === undefined) {
+    throw new Error(`contractTile ${CONTRACT_TILE.rows}x${CONTRACT_TILE.columns} gives a block `
+      + "that is not 1, 2 or 4 each way");
+  }
+  const contractRowAt = (name, r) =>
+    contractRows === 1 ? name : `${name}.${"xyzw"[r]}`;
+  const contractColumnAt = (name, c) =>
+    contractColumns === 1 ? name : `${name}.${"xyzw"[c]}`;
+  const overContractRows = (body) =>
+    Array.from({ length: contractRows }, (_, r) => body(r)).join("\n      ");
+  const overContractColumns = (body) =>
+    Array.from({ length: contractColumns }, (_, c) => body(c)).join("\n      ");
   const contract = `${common}
 const CONTRACT_ROWS: u32 = ${CONTRACT_TILE.rows}u;
 const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
@@ -369,8 +402,9 @@ const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_a: array<f32, ${contractRows * 64}>;
-var<workgroup> tile_b: array<f32, ${contractColumns * 64}>;
+// a's rows an invocation owns, and b's columns, each packed into one vector.
+var<workgroup> tile_a: array<${contractRowVector}, 64>;
+var<workgroup> tile_b: array<${contractColumnVector}, 64>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -381,36 +415,34 @@ fn main(
   let j0 = group.x * CONTRACT_COLUMNS + local.x;
   let h = group.z;
   let tile_index = local.y * 8u + local.x;
-  var sum: array<f32, ${contractRows * contractColumns}>;
-  for (var slot = 0u; slot < ${contractRows * contractColumns}u; slot += 1u) { sum[slot] = 0.0; }
+  // One accumulator a row, holding that row's columns.
+  var sum: array<${contractColumnVector}, ${contractRows}>;
+  for (var r = 0u; r < ${contractRows}u; r += 1u) { sum[r] = ${contractColumnVector}(0.0); }
 
   for (var k0 = 0u; k0 < L; k0 += 8u) {
     let a_k = k0 + local.x;
     let b_k = k0 + local.y;
-    for (var r = 0u; r < ${contractRows}u; r += 1u) {
-      let i = i0 + r * 8u;
-      var value = 0.0;
-      if (i < L && a_k < L) { value = ${loadATile}; }
-      tile_a[r * 64u + tile_index] = value;
-    }
-    for (var c = 0u; c < ${contractColumns}u; c += 1u) {
-      let j = j0 + c * 8u;
-      var value = 0.0;
-      if (j < L && b_k < L) { value = ${loadBTile}; }
-      tile_b[c * 64u + tile_index] = value;
-    }
+    var staged_a: ${contractRowVector};
+    ${overContractRows((r) => `{
+        let i = i0 + ${r}u * 8u;
+        var value = 0.0;
+        if (i < L && a_k < L) { value = ${loadATile}; }
+        ${contractRowAt("staged_a", r)} = value;
+      }`)}
+    var staged_b: ${contractColumnVector};
+    ${overContractColumns((c) => `{
+        let j = j0 + ${c}u * 8u;
+        var value = 0.0;
+        if (j < L && b_k < L) { value = ${loadBTile}; }
+        ${contractColumnAt("staged_b", c)} = value;
+      }`)}
+    tile_a[tile_index] = staged_a;
+    tile_b[tile_index] = staged_b;
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
-      var left: array<f32, ${contractRows}>;
-      for (var r = 0u; r < ${contractRows}u; r += 1u) {
-        left[r] = tile_a[r * 64u + local.y * 8u + k];
-      }
-      for (var c = 0u; c < ${contractColumns}u; c += 1u) {
-        let right = tile_b[c * 64u + k * 8u + local.x];
-        for (var r = 0u; r < ${contractRows}u; r += 1u) {
-          sum[r * ${contractColumns}u + c] += left[r] * right;
-        }
-      }
+      let left = tile_a[local.y * 8u + k];
+      let right = tile_b[k * 8u + local.x];
+      ${overContractRows((r) => `sum[${r}u] += ${contractRowAt("left", r)} * right;`)}
     }
     workgroupBarrier();
   }
@@ -418,11 +450,11 @@ fn main(
   for (var r = 0u; r < ${contractRows}u; r += 1u) {
     let i = i0 + r * 8u;
     if (i >= L) { continue; }
-    for (var c = 0u; c < ${contractColumns}u; c += 1u) {
-      let j = j0 + c * 8u;
-      if (j >= L) { continue; }
-      output[h * PAIRS + i * L + j] = sum[r * ${contractColumns}u + c];
-    }
+    let row = sum[r];
+    ${overContractColumns((c) => `{
+        let j = j0 + ${c}u * 8u;
+        if (j < L) { output[h * PAIRS + i * L + j] = ${contractColumnAt("row", c)}; }
+      }`)}
   }
 }`;
 
@@ -448,8 +480,8 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${t}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_x: array<f32, ${rowsPerThread * 64}>;
-var<workgroup> tile_z: array<f32, ${rowsPerThread * 64}>;
+var<workgroup> tile_x: array<${rowVector}, 64>;
+var<workgroup> tile_z: array<${rowVector}, 64>;
 var<workgroup> tile_projection_weight: array<f32, ${columnsPerThread * 64}>;
 var<workgroup> tile_gate_weight: array<f32, ${columnsPerThread * 64}>;
 
@@ -481,15 +513,19 @@ fn main(
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
     let source_k = k0 + local.x;
     let weight_k = k0 + local.y;
-    for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      let row = row0 + r * 8u;
-      var x_value = 0.0;
-      var z_value = 0.0;
-      if (row < PAIRS && source_k < CH) { x_value = x[row * CH + source_k]; }
-      if (row < PAIRS && source_k < CZ) { z_value = z[row * CZ + source_k]; }
-      tile_x[r * 64u + tile_index] = x_value;
-      tile_z[r * 64u + tile_index] = z_value;
-    }
+    var staged_x: ${rowVector};
+    var staged_z: ${rowVector};
+    ${overRows((r) => `{
+        let row = row0 + ${r}u * 8u;
+        var x_value = 0.0;
+        var z_value = 0.0;
+        if (row < PAIRS && source_k < CH) { x_value = x[row * CH + source_k]; }
+        if (row < PAIRS && source_k < CZ) { z_value = z[row * CZ + source_k]; }
+        ${rowAt("staged_x", r)} = x_value;
+        ${rowAt("staged_z", r)} = z_value;
+      }`)}
+    tile_x[tile_index] = staged_x;
+    tile_z[tile_index] = staged_z;
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let out_channel = channel0 + column * 8u;
       let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
@@ -506,21 +542,17 @@ fn main(
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
-      var xs: array<f32, ${rowsPerThread}>;
-      var zs: array<f32, ${rowsPerThread}>;
-      for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-        xs[r] = tile_x[r * 64u + local.y * 8u + k];
-        zs[r] = tile_z[r * 64u + local.y * 8u + k];
-      }
+      let xs = tile_x[local.y * 8u + k];
+      let zs = tile_z[local.y * 8u + k];
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
         let slot = k * TILE_COLUMNS + local.x + column * 8u;
         let projection_w = tile_projection_weight[slot];
         let gate_w = tile_gate_weight[slot];
-        for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-          let at = r * ${columnsPerThread}u + column;
-          projected[at] += xs[r] * projection_w;
-          gated[at] += zs[r] * gate_w;
-        }
+        ${overRows((r) => `{
+          let at = ${r}u * ${columnsPerThread}u + column;
+          projected[at] += ${rowAt("xs", r)} * projection_w;
+          gated[at] += ${rowAt("zs", r)} * gate_w;
+        }`)}
       }
     }
     workgroupBarrier();

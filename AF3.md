@@ -421,9 +421,18 @@ fix, and the failures listed below are what that has to beat.
 
 ## The pairformer's kernels, rewritten for the shape rather than the arithmetic
 
-A trunk pass went **540 -> 439 ms** at 59 tokens and **3.38 -> 2.54 s** at 150,
-its pairformer 435 -> 337 and 2879 -> 2106, and AF2's evoformer block 12.6 ->
-10.4 (a 48-block stack 603 -> 498) because five of these kernels are shared.
+A trunk pass went **540 -> 411 ms** at 59 tokens and **3.38 -> 2.40 s** at 150,
+its pairformer 435 -> 316 and 2879 -> 1973. AF2's evoformer shares five of these
+kernels and its triangle projection went 0.581 -> 0.422 ms a block and its
+output projection 0.405 -> 0.327, with the contraction dropping off the
+profiler's list entirely.
+
+🔴 **AND ITS BLOCK TOTAL IS NOT MEASURABLE TO THAT PRECISION HERE.**
+`profile-af2-block.js` reports a block at 11.0 to 12.7 ms for the SAME build
+across processes, so a 4% change in it says nothing; the per-dispatch numbers
+above are stable to about 1% and are what a claim about AF2 should rest on. An
+earlier "12.6 -> 10.4" in this file was two numbers from two processes and has
+been withdrawn.
 Nothing computes anything different; every checker is unmoved and the denoiser's
 worst error against AF3's own moved 1.19e-5 -> 5.86e-6.
 
@@ -436,13 +445,14 @@ and take before/after totals from two runs that are both unprofiled.
 | kernel | before | after | what changed |
 |---|---|---|---|
 | pair-transition   | 83.3 | 73.0 | chunked, then its rows made vec4 lanes |
-| tri.project       | 61.3 | 47.9 | register block 2x2 -> 4x2, and one vec4 a cell |
-| tri.project-out   | 42.8 | 35.2 | the same register block |
+| tri.project       | 61.3 | 45.4 | 2x2 -> 4x2, one vec4 a cell, rows staged as one |
+| tri.project-out   | 42.8 | 32.8 | the same |
 | grid.project      | 41.1 | 38.4 | q/k/v/gate interleaved, read as one vec4 |
 | grid.attend       | 39.0 | 21.7 | a chunk of keys staged in workgroup memory |
+| add               | 11.2 |  2.4 | four of the five folded into their producer |
 | grid.project-out  | 39.1 | 15.6 | a tile of rows, where it was one |
 | single-transition | 28.1 | 29.6 | untouched |
-| tri.contract      | 23.3 | 11.2 | register block, 1 output a thread -> 4x4 |
+| tri.contract      | 23.3 |  8.6 | 1 output a thread -> 4x4, both tiles vectors |
 | single.project    | 20.4 | 11.1 | the width split over workgroups, outputs blocked |
 | tri.normalize     | 13.7 |  8.3 | the LayerNorm staged, to coalesce |
 | grid.normalize    | 11.8 |  7.4 | the same |
