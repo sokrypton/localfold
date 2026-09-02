@@ -388,51 +388,59 @@ read from the checkpoint - and none of those are implemented or verified here.
 int5 costs nothing measurable: 1405 MiB -> 265 MiB, and 6MRR folds to 0.66 A
 against float32's 0.69, which is the spread between diffusion seeds.
 
-## Open: the side chains are compressed, and it is ours
+## Fixed: the side chains were compressed, and the loader was reading four wrong tensors
 
-Reported from the page: side chains badly placed and rings wrong, at any
-number of steps. Measured by `tools/gpu/probe-sidechains.js` against the
-reference conformers' own rigid tables, and then against AF3's own 200-step
-sample of the same 59-mer:
+Reported from the page: side chains badly placed and rings wrong, at any number
+of steps. `tools/gpu/probe-sidechains.js` measured it against the reference
+conformers' own rigid tables, and against AF3's own 200-step sample of the same
+59-mer:
 
-|              | bond ratio | 1-3 ratio | PHE50 ring bonds |
-|--------------|-----------|-----------|------------------|
-| AF3 itself   | 1.017     | 1.015     | 1.407 1.404 1.404 1.405 1.409 1.408 |
-| this port    | 0.927     | 0.908     | 1.122 1.099 1.287 1.198 1.164 1.303 |
+|                    | bond ratio | 1-3 ratio | PHE ring bonds |
+|--------------------|-----------|-----------|----------------|
+| AF3 itself         | 1.017     | 1.015     | 1.407 1.404 1.404 1.405 1.409 1.408 |
+| this port, before  | 0.927     | 0.908     | 1.122 1.099 1.287 1.198 1.164 1.303 |
+| this port, after   | 1.015     | 1.017     | 1.407 1.403 1.407 1.402 1.407 1.401 |
 
-AF3 gives a textbook benzene ring; this port gives one about 8% compressed
-and 18% irregular *within a single ring*. Not a scale factor, and not
-under-convergence - 160 diffusion steps score 0.226 mean error against
-flow-8's 0.206. Glycine (backbone alone) is nearly right at 0.078 and the
-error grows with distance from the backbone.
+**The bug.** `diffusionWeights` loaded the diffusion atom encoder's four pair
+tensors under their UNSUFFIXED names. The checkpoint has each of them twice, at
+identical shapes: the unsuffixed set belongs to the pair conditioning computed
+over a token's own 24 dense atom slots (AF3 captures it as `[tokens, 24, 24,
+16]`), and the `_1` set to the queries-keys layout the atom transformer actually
+works in (`[subsets, 32, 128, 16]`). Loading the wrong four threw nothing,
+changed no shape, and folded a plausible protein - with every side chain about
+8% short. `targetFeatureWeights`, ten lines above in the same file, carries a
+comment warning about exactly this trap.
 
-**Already ruled out.** Not atom labelling: the probe matches pairs by NAME
-out of the batch's own `ref_atom_name_chars`, and check_af3_featurise.js
-proves those names and every gather exact against AF3. Not the conformer
-input: the table reproduces its own rigid distances to 1.5e-4 A. Not the
-featuriser: folding AF3's OWN batch from the dump gives the same pLDDT and
-the same backbone.
+**Why nothing caught it.** The only checker that reaches the whole head,
+`tools/oracle/check_af3_denoiser.js`, builds its weight dict BY HAND rather than
+through the loader - so it scored 6.8e-6 against AF3 the whole time the shipped
+pipeline was wrong. Everything downstream compared the GPU against our own CPU
+reference, which was fed the same hand-built weights. A checker that does not go
+through the loader does not check the loader.
 
-**Why nothing caught it.** `check-af3-diffusion-head.js` and its neighbours
-are pinned to `af3-oracle-atom-f32.json`, which is `GSMKQIEDKIEE` - twelve
-residues with no F, Y, W, H or P, longest side chain a lysine. Every
-ring-bearing residue is untested. The featurise checkers had the same fault
-against the same class of toy dump.
+**How it was found**, in the order the possibilities died:
 
-**Where to resume.** `tools/gpu/fold.js --dump=` now runs on a real dump
-(it was missing `sequences` and `asymId`, and the trunk comparison did not
-know that a recycled dump names its captures `pair#0..#3`). On AF3's own
-batch with matching recycles:
+1. `tools/gpu/probe-af3-trunk-sample.js` substituted AF3's OWN trunk into
+   `foldBatch`'s `reuse` path. The side chains stayed at 0.921, which
+   exonerated the trunk and its 3.7e-2 pair disagreement.
+2. `tools/gpu/probe-head-cpu-vs-gpu.js` ran one denoising step both ways on
+   AF3's own 59-token batch: 5e-7. Not the shaders either - the CPU reference
+   and the GPU shared the error.
+3. A 20-step oracle dump WITH the head's arguments captured
+   (`--capture-args 'diffusion_head/__call__$'`) gave AF3's own answer at every
+   rung of the schedule. `tools/gpu/probe-head-vs-af3-steps.js` asked ours the
+   identical twenty questions and got 2e-2 to 6e-2 at EVERY level - which said
+   the divergence was the molecule, not the noise level, and killed the
+   hypothesis that the EDM preconditioning was wrong at low sigma.
+4. `tools/gpu/probe-head-stages-vs-af3.js` then ran the same comparison on the
+   TWELVE-mer, where the head is supposed to be exact, and got 0.102. That is
+   the moment it stopped being about the molecule: the same dump, the same
+   reference code, two weight dicts.
 
-    node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/af3-sample200.json \
-      --steps=200 --recycles=3
-    pair   vs AF3  relRMS 3.69e-2      single vs AF3  relRMS 1.71e-2
+After the fix the head reproduces AF3 to about 1e-6 at all twenty noise levels
+from 4608 A down to 0.03, and the bond ratios agree to three decimals.
 
-which is near the 2.7e-2 the conformer difference is worth, so the trunk is
-roughly right and the diffusion head is the suspect. The next step is a
-dump with the atom-level captures for a sequence that HAS rings - the
-existing atom dump has none - and then check-af3-atom-decoder.js and
-check-af3-diffusion-head.js against it. Regenerate with:
-
-    python3 tools/oracle/dump_af3_trunk.py --blocks 48 --recycles 3 \
-      --diffusion 200 --sequence <a sequence with F Y W H P> --out af3-rings.json
+🔴 **AND EVERY SAMPLER MEASUREMENT ABOVE PREDATES THE FIX.** The sigma0 sweep,
+the ligand-flow knee at sigma_data, the flow-versus-diffusion step counts and
+the 160 A default were all measured against a denoiser that was 3-6% wrong at
+every noise level. They should be re-run before any of them is trusted again.

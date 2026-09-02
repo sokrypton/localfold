@@ -45,7 +45,7 @@ function relativeRms(actual, expected) {
  * one object either way and the two paths cannot silently diverge in what they
  * supply.
  */
-function batchFromDump(dump) {
+export function batchFromDump(dump) {
   const tokens = dump.tokens;
   const dense = 24;
   const subsets = Math.ceil((tokens * dense) / 32);

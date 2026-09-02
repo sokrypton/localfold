@@ -24,27 +24,22 @@
  *     AF3 itself     1.017  1.015   1.407 1.404 1.404 1.405 1.409 1.408
  *     this port      0.927  0.908   1.122 1.099 1.287 1.198 1.164 1.303
  *
- * 🔴 SO THE SIDE CHAINS ARE OURS TO FIX, NOT THE MODEL'S. AF3 returns a
- * textbook benzene ring; this port returns one compressed by about 8% and
- * irregular by 18% within a single ring, which rules out a scale factor. It
- * does not improve with steps - 160 diffusion steps give 0.226 mean error
- * against flow-8's 0.206 - so it is not under-convergence either. Glycine, which
- * is backbone alone, is nearly right at 0.078; the error grows with distance
- * from the backbone.
+ * 🔴 THE CAUSE WAS A WEIGHT NAME, AND THIS PROBE IS WHAT MADE IT VISIBLE.
+ * src/af3/diffusion-weights.js loaded four of the atom encoder's pair tensors
+ * under their unsuffixed names, which exist at identical shapes and belong to a
+ * different module - see AF3.md, "Fixed: the side chains were compressed". The
+ * port now scores 1.015 / 1.017 with textbook aromatic rings. The numbers above
+ * are kept because they are what the failure LOOKED like: everything short,
+ * worse with distance from the backbone, glycine nearly right, and no
+ * improvement with more steps - a shape a scale factor cannot make and
+ * under-convergence cannot either.
  *
- * 🔴 AND IT IS NOT ATOM LABELLING. The pairs here are matched by NAME out of the
- * batch's own ref_atom_name_chars, and check_af3_featurise.js already proves
- * those names and every gather exact against AF3. A swap would also show as a
- * bimodal pattern - one bond at another bond's ideal - rather than as everything
- * short at once.
+ * 🔴 AND IT IS NOT ATOM LABELLING, which is why the pairs here are matched by
+ * NAME out of the batch's own ref_atom_name_chars. A swap would show as a
+ * bimodal pattern - one bond at another bond's ideal - rather than as
+ * everything short at once.
  *
- * 🔴 WHY NOTHING CAUGHT IT: check-af3-diffusion-head.js and its neighbours are
- * pinned to af3-oracle-atom-f32.json, which is GSMKQIEDKIEE - twelve residues
- * with no F, Y, W, H or P in them. Every ring-bearing residue is untested, and
- * the longest side chain in that sequence is a lysine. This is the same fault
- * the featurise checkers had against a 12-token toy dump.
- *
- * 🔴 AND A RING IS REPORTED WHOLE. An aromatic ring's six bonds are all about
+ * 🔴 A RING IS REPORTED WHOLE. An aromatic ring's six bonds are all about
  * 1.39 A, so a single worst-pair number cannot distinguish "the ring is a
  * little large" from "two atoms are swapped and it is a bowtie". The ring pairs
  * are named and printed together for the aromatic types.

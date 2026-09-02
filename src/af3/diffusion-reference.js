@@ -233,7 +233,7 @@ export function diffusionTransformer(act, cond, pairCond, mask, tokens, weights)
  *
  * @returns {{single: Float32Array, pair: Float32Array}}
  */
-export function diffusionConditioning(input, weights) {
+export function diffusionConditioning(input, weights, onStage) {
   const { tokens, trunkSingle, trunkPair, targetFeat, noiseLevel } = input;
   const pairs = tokens * tokens;
   const pairChannels = weights.pairChannels;
@@ -255,6 +255,7 @@ export function diffusionConditioning(input, weights) {
   let pair = linear(layerNormSlow(features2d, pairs, width,
                                   weights.pairCondInitialNormScale, null),
                     pairs, width, pairChannels, weights.pairCondInitialProjection);
+  onStage?.("conditioning.pairInitial", pair);
   for (let index = 0; index < 2; index += 1) {
     const delta = conditionedTransition(pair, null, pairs, pairChannels, 2,
                                         weights.pairTransitions[index], "");
@@ -278,6 +279,7 @@ export function diffusionConditioning(input, weights) {
                         tokens, singleWidth, seqChannels,
                         weights.singleCondInitialProjection);
 
+  onStage?.("conditioning.singleInitial", single);
   // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG. The weight and
   // bias come from the model - see noiseEmbedding above - so this is the same
   // line whether they were trained or baked in at export.
@@ -417,7 +419,7 @@ export function diffusionHead(input, weights, encode, onStage) {
     targetFeat: input.targetFeat,
     noiseLevel,
     features: input.features,
-  }, weights.conditioning);
+  }, weights.conditioning, onStage);
 
   onStage?.("conditioning.single", cond.single);
   onStage?.("conditioning.pair", cond.pair);

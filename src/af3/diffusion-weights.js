@@ -209,10 +209,22 @@ export async function diffusionWeights(store, superBlocks = 6) {
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32,
       perTokenChannels: 768, trunkSingleChannels: 384, trunkPairChannels: 128,
-      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row/weights"),
-      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col/weights"),
-      embedPairOffsets: await T("diffusion_embed_pair_offsets/weights"),
-      embedPairDistances: await T("diffusion_embed_pair_distances/weights"),
+      // 🔴 THE _1 SUFFIX IS PART OF THE NAME, HERE TOO. The same four tensors
+      // exist unsuffixed, at IDENTICAL shapes, and belong to the pair
+      // conditioning computed over a token's own 24 dense atom slots - AF3
+      // captures them as [tokens, 24, 24, 16] against these ones'
+      // [subsets, 32, 128, 16]. This encoder works in the QUERIES-KEYS layout,
+      // so it wants the _1 set; dropping the suffix loads clean, runs, folds a
+      // protein, and is a different model. targetFeatureWeights above says the
+      // same thing about the same trap and this loader had it wrong: it cost
+      // 0.102 relRMS against AF3 on the head's own output, side chains about 8%
+      // compressed, and nothing caught it because the only checker that reaches
+      // the head builds its weights by hand.
+      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row_1/weights"),
+      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col_1/weights"),
+      embedPairOffsets: await T("diffusion_embed_pair_offsets_1/weights"),
+      embedPairDistances: await T("diffusion_embed_pair_distances_1/weights"),
+      // ...and this one has no _1 form, which makes the set look like a typo.
       embedPairOffsetsValid: await T("diffusion_embed_pair_offsets_valid/weights"),
       pairMlp1: await T("diffusion_pair_mlp_1/weights"),
       pairMlp2: await T("diffusion_pair_mlp_2/weights"),
