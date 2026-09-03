@@ -773,6 +773,36 @@ tile 8 lost to tile 4 (1.556 against 1.525), and vectorised it wins (1.394
 against 1.494), because the rows now cost a quarter of the workgroup memory they
 did.
 
+🔴 **AND RANKING THE TRUNK'S KERNELS BY GFLOP/s MISLEADS, WHICH COST A DAY'S
+LEAD TO FIND OUT.** `tri.project-out` measures 672 GFLOP/s against
+`tri.project`'s 977 on the same shape, and it had the fault to match: it
+contracts TWO matrices at each (k, output channel) cell and staged their
+weights as two SCALAR arrays, where projectAB packs its four into one vec4.
+Scalar, its inner loop was two source reads, four weight reads and sixteen
+multiply-adds a step of k - 0.73 useful operations an instruction against 2.9.
+Packing the pair into a vec2, with one vec2 accumulator a cell, should have
+been worth about 1.5x.
+
+It was worth **3%** (210.5 -> 205.2 ms), because the kernel is not instruction
+bound. Counted properly, per dispatch at 150 tokens:
+
+| | source | weights | store | total | achieved |
+|---|---:|---:|---:|---:|---:|
+| tri.project | 92 MB | 184 | 23 | 300 MB in 2.675 ms | **112 GB/s** |
+| tri.project-out | 184 MB | 92 | 12 | 288 MB in 1.950 ms | **148 GB/s** |
+
+Both are AT or ABOVE the 114 GB/s `probe-alu.js` measures for streamed global
+reads. They differ in GFLOP/s because they differ in multiply-adds per BYTE -
+project-out reads two source tensors and one set of weights, project reads one
+and four - and not because one is better written than the other. The change is
+kept because the code is simpler and the 3% is real, not because the reasoning
+that motivated it was right.
+
+The lever on a memory-bound kernel is traffic, and traffic is what the tile
+divides - which is why every tile here has been swept and why every sweep ends
+at the same place: a bigger tile cuts traffic and loses more to occupancy. 32x16
+beats 32x32, 32x8, 16x16 and 16x32 at 150 tokens.
+
 🔴 **AND THE KERNELS ARE NOW AT THE PRACTICAL CEILING, WHICH IS NOT THE PAPER
 ONE.** At 150 tokens with a 512-row alignment - a real fold - a trunk pass is
 2.60 s, and every one of its top kernels runs at about **270 billion

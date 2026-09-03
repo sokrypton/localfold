@@ -482,8 +482,16 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
 var<workgroup> tile_x: array<${rowVector}, 64>;
 var<workgroup> tile_z: array<${rowVector}, 64>;
-var<workgroup> tile_projection_weight: array<f32, ${columnsPerThread * 64}>;
-var<workgroup> tile_gate_weight: array<f32, ${columnsPerThread * 64}>;
+// 🔴 ONE vec2 A CELL, NOT TWO SCALAR ARRAYS - the same argument projectAB
+// makes with four matrices and a vec4. The output projection and its gate are
+// contracted at the SAME (k, output channel) cell, so their two weights are
+// always wanted together: packed, the inner loop reads them in one instruction
+// and accumulates them in one multiply-add instead of two. Scalar, this kernel
+// spent two source reads, four weight reads and sixteen multiply-adds a step of
+// k to buy sixteen products - 0.73 useful operations an instruction, against
+// projectAB's 2.9 on the same shape, and it showed: 672 GFLOP/s where the
+// projection that feeds it runs at 977.
+var<workgroup> tile_weight: array<vec2<f32>, ${columnsPerThread * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -494,20 +502,19 @@ fn main(
   let channel0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * 8u + local.x;
   // ...the projection contracts over CH and the gate over CZ, on the same
-  // output channel, so one register block carries two accumulators per cell.
-  var projected: array<f32, ${rowsPerThread * columnsPerThread}>;
-  var gated: array<f32, ${rowsPerThread * columnsPerThread}>;
+  // output channel, so one accumulator a cell carries both: x is the
+  // projection, y the gate.
+  var acc: array<vec2<f32>, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
     let out_channel = channel0 + column * 8u;
-    var projection_bias = 0.0;
-    var gate_bias = 0.0;
+    var bias = vec2<f32>(0.0);
     if (out_channel < CZ) {
-      projection_bias = ${read(precision, "weights[W_LINEARZBIAS + out_channel]")};
-      gate_bias = ${read(precision, "weights[W_LINEARGBIAS + out_channel]")};
+      bias = vec2<f32>(
+        ${read(precision, "weights[W_LINEARZBIAS + out_channel]")},
+        ${read(precision, "weights[W_LINEARGBIAS + out_channel]")});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
-      projected[r * ${columnsPerThread}u + column] = projection_bias;
-      gated[r * ${columnsPerThread}u + column] = gate_bias;
+      acc[r * ${columnsPerThread}u + column] = bias;
     }
   }
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
@@ -537,22 +544,18 @@ fn main(
       if (out_channel < CZ && weight_k < CZ) {
         gate_w = ${read(precision, "weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
       }
-      tile_projection_weight[slot] = projection_w;
-      tile_gate_weight[slot] = gate_w;
+      tile_weight[slot] = vec2<f32>(projection_w, gate_w);
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
       let xs = tile_x[local.y * 8u + k];
       let zs = tile_z[local.y * 8u + k];
+      // ...paired once a row, outside the column loop, because the pairing
+      // depends on the row and the weight does not.
+      ${overRows((r) => `let xz${r} = vec2<f32>(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-        let slot = k * TILE_COLUMNS + local.x + column * 8u;
-        let projection_w = tile_projection_weight[slot];
-        let gate_w = tile_gate_weight[slot];
-        ${overRows((r) => `{
-          let at = ${r}u * ${columnsPerThread}u + column;
-          projected[at] += ${rowAt("xs", r)} * projection_w;
-          gated[at] += ${rowAt("zs", r)} * gate_w;
-        }`)}
+        let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
+        ${overRows((r) => `acc[${r}u * ${columnsPerThread}u + column] += xz${r} * packed;`)}
       }
     }
     workgroupBarrier();
@@ -563,8 +566,8 @@ fn main(
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let out_channel = channel0 + column * 8u;
       if (out_channel >= CZ) { continue; }
-      let at = r * ${columnsPerThread}u + column;
-      output[row * CZ + out_channel] ${residual ? "+=" : "="} projected[at] * logistic(gated[at]);
+      let cell = acc[r * ${columnsPerThread}u + column];
+      output[row * CZ + out_channel] ${residual ? "+=" : "="} cell.x * logistic(cell.y);
     }
   }
 }`;
