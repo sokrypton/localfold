@@ -79,6 +79,19 @@ export function packBlockWeights(block) {
   return { data, offsets };
 }
 
+/**
+ * How much of the intermediate `ffw-out` stages at once.
+ *
+ * 🔴 RESOLVED IN ONE PLACE BECAUSE TWO PLACES NEED IT AND THEY MUST AGREE. The
+ * factory sizes its workgroup array from this; the caller sizes `outTile` from
+ * it, since the tile only fits if the chunk is what is staged. Defaulting it
+ * twice is the shape of mistake the note on `tile` and `splits` below records
+ * as half the tokens going unprojected.
+ */
+export const DEFAULT_OUT_CHUNK = 384;
+export const resolveOutChunk = (intermediate, requested) =>
+  Math.min(intermediate, requested ?? DEFAULT_OUT_CHUNK);
+
 export function createDiffusionTransformerShaders(shape, offsets) {
   const { tokens, channels, condChannels, pairChannels, heads, dimension, factor } = shape;
   // 🔴 THE FOUR PER-TOKEN KERNELS RUN ONE WORKGROUP PER TOKEN, so the token
@@ -110,7 +123,7 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   const width = heads * dimension;
   const intermediate = channels * factor;
   const pairs = tokens * tokens;
-  const outChunk = Math.min(intermediate, shape.outChunk ?? 384);
+  const outChunk = resolveOutChunk(intermediate, shape.outChunk);
   if (intermediate % outChunk !== 0) {
     throw new Error(`outChunk ${outChunk} does not divide the intermediate ${intermediate}`);
   }
@@ -807,10 +820,22 @@ export class Af3DiffusionTransformerGpu {
     const fits = (perToken) => Math.max(1, Math.floor(workgroupStorage / (perToken * 4)));
     const tile = weights.tile ?? Math.min(4, fits(channels));
     const splits = weights.splits ?? 2;
-    const outTile = weights.outTile ?? Math.min(2, tile, fits(intermediate));
+    // 🔴 THE CHUNK IS WHAT `ffw-out` STAGES, NOT THE WHOLE INTERMEDIATE, AND
+    // THIS RULE STILL SAID OTHERWISE. It read `Math.min(2, tile,
+    // fits(intermediate))`: a hard cap of two, under a sizing term that assumed
+    // a workgroup held outTile x 1536 floats. Chunking removed that - it holds
+    // outTile x outChunk, 6 KiB at four - and the kernel's own comment says so
+    // ("staging a CHUNK of the intermediate instead unties them"), but the cap
+    // was never lifted, so the measurement that set it (outTile 4 at 85 ms
+    // against 2's 74) was left standing against a kernel that no longer
+    // existed. Re-measured on the whole transformer with the chunking in place,
+    // as medians of repeated runs: at 150 tokens **2 -> 138 ms, 4 -> 128, 8 ->
+    // 132**; at 59 tokens they tie (63-65 either way). Four it is.
+    const outChunk = resolveOutChunk(intermediate, weights.outChunk);
+    const outTile = weights.outTile ?? Math.min(4, tile, fits(outChunk));
     const shape = { tokens, channels, condChannels, pairChannels, heads, dimension,
                     factor: weights.transitionFactor, lanes: weights.lanes,
-                    tile, splits, outTile, outChunk: weights.outChunk,
+                    tile, splits, outTile, outChunk,
                     channelChunk: weights.channelChunk };
     const sources = createDiffusionTransformerShaders(shape, sample.offsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
@@ -818,7 +843,7 @@ export class Af3DiffusionTransformerGpu {
     // later run the pipeline compiled for a different width.
     const base = `af3-difftx:${tokens}:${channels}:${condChannels}:${pairChannels}`
       + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`
-      + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}:${weights.outChunk ?? "d"}`
+      + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}:${outChunk}`
       + `:${weights.channelChunk ?? "d"}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
