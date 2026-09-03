@@ -719,6 +719,29 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                                 <div class="score-metric-label">ipTM</div>
                                 <div id="metricIptm" class="score-metric-value">-</div>
                             </div>
+                            <!-- 🔴 THE TRUNK'S OWN CROSS-CHAIN CONTACT
+                                 CONFIDENCE, UNDER ITS OWN NAME. It is the mean
+                                 of the trunk's P(d <= 8 A) over the cross-chain
+                                 contacts it is most sure of, and it is known
+                                 before the first denoiser call - where the
+                                 three scores above are minutes away. It tracks
+                                 ipTM across a panel at 0.84 Pearson and 0.91
+                                 Spearman. Its within-chain sibling p(intra) is
+                                 computed and tested but deliberately not shown;
+                                 see src/af3/distogram-confidence.js. -->
+                            <div id="metricPinterCell" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">p(inter)</div>
+                                <div id="metricPinter" class="score-metric-value">-</div>
+                            </div>
+                            <!-- ...and how far the frame being LOOKED AT has
+                                 settled, which only an intermediate frame has:
+                                 the share of the trunk's predicted distances
+                                 it already satisfies. The finished structure
+                                 has the head's real scores instead. -->
+                            <div id="metricSettledCell" class="score-metric-cell" style="display: none;">
+                                <div class="score-metric-label">Settled</div>
+                                <div id="metricSettled" class="score-metric-value">-</div>
+                            </div>
                             <div id="metricMultimerCell" class="score-metric-cell" style="display: none;">
                                 <div class="score-metric-label">Ranking</div>
                                 <div id="metricMultimer" class="score-metric-value">-</div>

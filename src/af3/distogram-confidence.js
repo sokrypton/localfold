@@ -145,6 +145,23 @@ const INTERFACE_CONTACT_EXPONENT = 2 / 3;
 const INTERFACE_CONTACT_SCALE = 1.5;
 const INTERFACE_CONTACT_FLOOR = 8;
 /**
+ * The sequence separation p(intra) starts counting at.
+ *
+ * 🔴 IT CANNOT BE 1, AND THAT IS NOT A TUNING CHOICE. Adjacent residues are in
+ * contact in every chain, folded or not, at a probability of essentially one -
+ * so at separation 1 the strongest intra-chain contacts are the neighbours, and
+ * p(intra) reads 1.000 on ALL SEVENTEEN targets of the panel including the
+ * homopolymer. A quantity with no variance is not a measurement.
+ *
+ * 🔴 PAST THAT IT BARELY MATTERS, so 12 is chosen for what it MEANS rather than
+ * for a number. Contact prediction has called |i - j| >= 12 medium-and-long
+ * range for decades, which is the range that says a chain comes back on itself.
+ * Swept against real pTM across the panel, separations 6, 12 and 24 sit at
+ * Pearson 0.128, 0.144 and 0.167 - a spread far inside what seventeen targets
+ * can resolve.
+ */
+const INTRA_SEPARATION = 12;
+/**
  * ...relaxed for a chain too short to have contacts at that separation at all.
  *
  * 🔴 DERIVED FROM MINIMUM_SEPARATION, BECAUSE IT WAS WRITTEN OUT AND THEY
@@ -466,6 +483,97 @@ export function distogramTmTerm(table, pseudoBeta, d0) {
  * @returns {number} 0 to 1, or NaN when there is no interface to score
  */
 export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens, count) {
+  const { cross, smallest } = crossChainContacts(contactProbs, asymId, seqMask, tokens);
+  // ...NaN rather than zero for a single chain, as ipTM itself reports: there
+  // is no interface to score, which is not the same as a bad one.
+  return topMean(cross, count ?? contactCount(smallest));
+}
+
+/**
+ * The two numbers the page actually shows: p(intra) and p(inter).
+ *
+ * 🔴 THEY ARE WHAT THEY SAY AND NOTHING ELSE. Both are a mean of the trunk's
+ * own P(d <= 8 A) over the contacts it is most confident about - within a chain
+ * for p(intra), across chains for p(inter). No calibration, no fitted mapping,
+ * no borrowed name. The page used to show this machinery as an estimated pLDDT
+ * and an interface WORD, and a number named after a quantity it is not is
+ * worse than a number named after itself, however well it correlates.
+ *
+ * 🔴 AND THEY DO CORRELATE, WHICH IS WHY THEY ARE WORTH SHOWING. Measured
+ * against the real confidence head across the panel in
+ * tools/gpu/probe-contact-confidence.js, as Pearson and Spearman:
+ *
+ *     p(inter) vs ipTM   0.844 / 0.905   over 8 complexes
+ *     p(inter) vs pTM    0.734 / 0.833   over the same 8
+ *
+ * p(inter) is the one that earns its place: it ranks complexes the way ipTM
+ * does, and it is known the moment the trunk is - before a single denoiser
+ * call, where the real score is minutes away.
+ *
+ * 🔴 p(intra) TRACKS NOTHING THE HEAD REPORTS, AND IS SHOWN ANYWAY BECAUSE IT
+ * IS SHOWN AS ITSELF. Across the same seventeen targets it reaches 0.144 /
+ * 0.075 against pTM and 0.293 / 0.157 against mean pLDDT - which is nothing,
+ * and no slice of the panel rescues it: monomers alone 0.046, complexes alone
+ * 0.115, excluding the nonsense targets 0.207.
+ *
+ * 🔴 THE FAILURE IS REAL AND IS NOT THE REDUCTION'S. The control is pTM's OWN
+ * reduction run over the distogram's expected TM term with no coordinates in
+ * it - same input, the head's own arithmetic - and it reaches only 0.531 /
+ * 0.385. The trunk's distogram carries the interface; it does not carry a
+ * single chain's pTM.
+ *
+ * 🔴 AND GCN4 IS WHY, WHICH IS WORTH KNOWING BEFORE READING p(intra). A coiled
+ * coil is one long helix: real pLDDT 83.9, real pTM 0.506, and p(intra) 0.017,
+ * because it has no long-range intra-chain contacts to be confident about. That
+ * is p(intra) being correct about a different question. It answers "does this
+ * chain come back on itself, and is the trunk sure?" - not "is this a good
+ * prediction?".
+ *
+ * 🔴 p(intra) SKIPS THE SHORT SEPARATIONS AND HAS TO. Neighbouring residues are
+ * in contact in any chain, folded or not, at a probability of essentially one,
+ * so the strongest intra-chain contacts of a random coil and of a real domain
+ * are the same contacts. Requiring |i - j| >= INTRA_SEPARATION asks the only
+ * question that distinguishes them: does the chain come back on itself?
+ *
+ * 🔴 AND IT FALLS BACK FOR A CHAIN TOO SHORT TO HAVE ANY, rather than
+ * returning nothing - a twenty residue miniprotein has few pairs that far
+ * apart and would otherwise report NaN where it has a real answer.
+ *
+ * @param {ArrayLike<number>} contactProbs  tokens * tokens, P(d <= 8 A)
+ * @param {ArrayLike<number>} asymId  tokens
+ * @param {Float32Array} seqMask  tokens
+ * @param {number} tokens
+ * @param {{separation?: number}} [options]  the separation floor, for the probe
+ *   that swept it; the default is the swept value
+ * @returns {{intra: number, inter: number}} each 0 to 1, and `inter` NaN when
+ *   there is only one chain
+ */
+export function distogramContactConfidence(contactProbs, asymId, seqMask, tokens,
+    options = {}) {
+  const separation = options.separation ?? INTRA_SEPARATION;
+  const { cross, smallest, live } = crossChainContacts(
+    contactProbs, asymId, seqMask, tokens);
+  let within = [];
+  for (const floor of separationsFrom(separation)) {
+    within = withinChainContacts(contactProbs, asymId, seqMask, tokens, floor);
+    if (within.length > 0) break;
+  }
+  return {
+    intra: topMean(within, contactCount(live)),
+    inter: topMean(cross, contactCount(smallest)),
+  };
+}
+
+/**
+ * Every cross-chain contact probability, and the sizes the count rule needs.
+ *
+ * 🔴 BOTH ORDERS OF EACH PAIR, WHICH IS DELIBERATE AND LOAD-BEARING. The list
+ * holds (i, j) and (j, i), so a "top 64" is really the strongest 32 pairs. The
+ * count rule above was swept against real ipTM on a list built this way, so
+ * de-duplicating it here would halve the effective count and silently move
+ * every number the sweep settled.
+ */
+function crossChainContacts(contactProbs, asymId, seqMask, tokens) {
   const cross = [];
   const sizes = new Map();
   for (let i = 0; i < tokens; i += 1) {
@@ -476,15 +584,45 @@ export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens,
       cross.push(contactProbs[i * tokens + j]);
     }
   }
-  const smallest = sizes.size === 0 ? 0 : Math.min(...sizes.values());
-  const wanted = count ?? Math.max(INTERFACE_CONTACT_FLOOR, Math.round(
-    INTERFACE_CONTACT_SCALE * smallest ** INTERFACE_CONTACT_EXPONENT));
-  // ...NaN rather than zero for a single chain, as ipTM itself reports: there
-  // is no interface to score, which is not the same as a bad one.
-  if (cross.length === 0) return Number.NaN;
-  cross.sort((a, b) => b - a);
-  const take = Math.min(wanted, cross.length);
+  let live = 0;
+  for (const size of sizes.values()) live += size;
+  return { cross, live, smallest: sizes.size === 0 ? 0 : Math.min(...sizes.values()) };
+}
+
+/** The same, within a chain and past a sequence separation. Both orders too. */
+function withinChainContacts(contactProbs, asymId, seqMask, tokens, separation) {
+  const within = [];
+  for (let i = 0; i < tokens; i += 1) {
+    if (seqMask[i] <= 0) continue;
+    for (let j = 0; j < tokens; j += 1) {
+      if (seqMask[j] <= 0 || asymId[i] !== asymId[j]) continue;
+      if (Math.abs(i - j) < separation) continue;
+      within.push(contactProbs[i * tokens + j]);
+    }
+  }
+  return within;
+}
+
+/** The mean of the strongest `count`, or NaN when there is nothing to mean. */
+function topMean(values, count) {
+  if (values.length === 0) return Number.NaN;
+  values.sort((a, b) => b - a);
+  const take = Math.min(count, values.length);
   let total = 0;
-  for (let index = 0; index < take; index += 1) total += cross[index];
+  for (let index = 0; index < take; index += 1) total += values[index];
   return total / take;
+}
+
+/** How many strong contacts a unit of `length` residues can present. */
+function contactCount(length) {
+  return Math.max(INTERFACE_CONTACT_FLOOR, Math.round(
+    INTERFACE_CONTACT_SCALE * length ** INTERFACE_CONTACT_EXPONENT));
+}
+
+/** `separation`, then halves of it, then 1 - for a chain too short for it. */
+function separationsFrom(separation) {
+  const out = [];
+  for (let step = Math.max(1, separation); step > 1; step = Math.floor(step / 2)) out.push(step);
+  out.push(1);
+  return out;
 }

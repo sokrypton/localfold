@@ -86,20 +86,46 @@ export async function main(device, args) {
       means: liveFrames.map((pdb) => Number(mean(bFactors(pdb)).toFixed(1))),
       allZero: liveFrames.every((pdb) => bFactors(pdb).every((v) => v === 0)),
     },
-    // 🔴 THE CARD'S NUMBER AGAINST THE FRAME'S OWN COLOUR. web/app.js hands
-    // each viewer frame a `confidence.meanPlddt` from `frameConfidence`, and
-    // the B-factors it is drawn with come from the same estimate - so the two
-    // must agree frame for frame. They are assembled by different code with
-    // different indexing (the loop walks timeline.slice(1), one behind), which
-    // is exactly where an off-by-one hides: it would show frame 3's number on
-    // frame 4 and nothing would look wrong.
+    // 🔴 THE CARD'S NUMBER AGAINST THE FRAME'S OWN COLOUR, WHICH ARE NO
+    // LONGER THE SAME NUMBER AND MUST STILL LINE UP. The card shows a
+    // percentage named "Settled" - the RAW share of the trunk's predicted
+    // distances a frame satisfies - while the colour is that same score
+    // calibrated to the fold's own pLDDT so the ramp keeps its meaning. The
+    // calibration is affine and increasing, so the two are related by one line
+    // across the whole trajectory: fit it and the residuals must vanish.
+    //
+    // 🔴 A FIT RATHER THAN AN EQUALITY BECAUSE THAT IS WHAT CATCHES THE
+    // OFF-BY-ONE. The card and the colours are assembled by different code with
+    // different indexing (the loop walks timeline.slice(1), one behind), and a
+    // shifted pairing shows frame 3's number on frame 4 with nothing looking
+    // wrong. Rank agreement would not see it - a settling trajectory is
+    // monotone, so a shift ranks identically - but a straight line through a
+    // shifted pairing does not fit.
     cardVersusColour: (() => {
-      const card = result.frameConfidence ?? [];
+      const card = result.frameSettled ?? [];
+      if (card.length !== means.length || card.length < 3) {
+        return { length: card.length, colourFrames: means.length, fits: false };
+      }
+      const n = card.length;
+      const mx = card.reduce((a, b) => a + b, 0) / n;
+      const my = means.reduce((a, b) => a + b, 0) / n;
+      let sxy = 0; let sxx = 0;
+      for (let i = 0; i < n; i += 1) {
+        sxy += (card[i] - mx) * (means[i] - my);
+        sxx += (card[i] - mx) ** 2;
+      }
+      const gain = sxx === 0 ? 0 : sxy / sxx;
+      let worst = 0;
+      for (let i = 0; i < n; i += 1) {
+        worst = Math.max(worst, Math.abs(my + gain * (card[i] - mx) - means[i]));
+      }
       return {
-        length: card.length,
-        matchesFrameMeans: card.length === means.length
-          && card.every((value, i) => Math.abs(value - means[i]) < 0.05),
-        means: card.map((v) => Number(v.toFixed(1))),
+        length: n,
+        // ...one pLDDT point of slack, which is well inside the clamp the
+        // calibration applies at the ends and far outside a one-frame shift.
+        fits: worst < 1,
+        worstResidual: Number(worst.toFixed(2)),
+        settled: card.map((v) => Number(v.toFixed(1))),
       };
     })(),
     timeline: {

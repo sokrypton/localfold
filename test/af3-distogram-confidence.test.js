@@ -11,7 +11,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { distogramAgreementTable, distogramConfidence, distogramInterfaceContact }
+import { distogramAgreementTable, distogramConfidence, distogramContactConfidence,
+  distogramInterfaceContact }
   from "../src/af3/distogram-confidence.js";
 
 const BINS = 64;
@@ -242,5 +243,83 @@ describe("distogram interface contact", () => {
   it("ignores masked tokens on both sides of the interface", () => {
     const half = Float32Array.from([1, 1, 1, 1, 0, 0, 0, 0]);
     assert.ok(Number.isNaN(distogramInterfaceContact(probs(0.9, 0.1), asymId, half, tokens)));
+  });
+});
+
+describe("distogram contact confidence", () => {
+  /** One chain of `length`, with `value` on every pair at least `far` apart. */
+  const chain = (length, far, value, near = 1) => {
+    const probs = new Float32Array(length * length);
+    for (let i = 0; i < length; i += 1) {
+      for (let j = 0; j < length; j += 1) {
+        probs[i * length + j] = Math.abs(i - j) >= far ? value : near;
+      }
+    }
+    return {
+      probs, n: length,
+      asym: new Int32Array(length),
+      live: new Float32Array(length).fill(1),
+    };
+  };
+
+  it("does not count the neighbours, which every chain has", () => {
+    // 🔴 THE WHOLE POINT OF THE SEPARATION FLOOR. Adjacent residues are in
+    // contact in a random coil too, so a p(intra) that counted them would read
+    // 1.000 on anything at all - which is exactly what it did at separation 1.
+    const coil = chain(60, 12, 0, 1);
+    const { intra } = distogramContactConfidence(
+      coil.probs, coil.asym, coil.live, coil.n);
+    assert.ok(intra < 1e-6, `a chain with only neighbour contacts scored ${intra}`);
+  });
+
+  it("reads a chain that comes back on itself", () => {
+    const folded = chain(60, 12, 0.95, 1);
+    const { intra } = distogramContactConfidence(
+      folded.probs, folded.asym, folded.live, folded.n);
+    assert.ok(Math.abs(intra - 0.95) < 1e-6, `scored ${intra}`);
+  });
+
+  it("relaxes the separation for a chain too short to have one", () => {
+    // 🔴 NaN WOULD BE WRONG HERE. A ten residue chain has no pair twelve apart,
+    // and reporting nothing for it hides an answer it does have.
+    const tiny = chain(10, 4, 0.8, 0.1);
+    const { intra } = distogramContactConfidence(
+      tiny.probs, tiny.asym, tiny.live, tiny.n);
+    assert.ok(Number.isFinite(intra), `short chain scored ${intra}`);
+  });
+
+  it("has no p(inter) for a single chain, and a p(intra) regardless", () => {
+    const one = chain(40, 12, 0.7);
+    const { intra, inter } = distogramContactConfidence(
+      one.probs, one.asym, one.live, one.n);
+    assert.ok(Number.isNaN(inter));
+    assert.ok(Number.isFinite(intra));
+  });
+
+  it("gives the same p(inter) the interface score gives, being the same one", () => {
+    // 🔴 ONE REDUCTION, NOT TWO. They shared a count rule and a doubled pair
+    // list by copy once; a second copy is a second chance to disagree.
+    const tokens = 12;
+    const asym = Int32Array.from([0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]);
+    const live = new Float32Array(tokens).fill(1);
+    const probs = new Float32Array(tokens * tokens);
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        probs[i * tokens + j] = ((i * 7 + j * 3) % 11) / 10;
+      }
+    }
+    const { inter } = distogramContactConfidence(probs, asym, live, tokens);
+    assert.equal(inter, distogramInterfaceContact(probs, asym, live, tokens));
+  });
+
+  it("ignores masked tokens on both halves", () => {
+    const one = chain(40, 12, 0.9);
+    const half = new Float32Array(40);
+    half.fill(1, 0, 20);
+    const { intra } = distogramContactConfidence(
+      one.probs, one.asym, half, one.n);
+    // Still finite and still the long-range value: masking removes tokens, it
+    // does not change what the surviving pairs say.
+    assert.ok(Math.abs(intra - 0.9) < 1e-6, `scored ${intra}`);
   });
 });

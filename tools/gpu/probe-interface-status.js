@@ -1,15 +1,15 @@
 /**
- * Does the status line say anything about the interface, and only when there is
- * one?
+ * Does the status line carry p(inter), and only when there is an interface?
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-interface-status.js
  *
- * WHY IT EXISTS. The word comes from the trunk's cross-chain contacts and is
+ * WHY IT EXISTS. p(inter) comes from the trunk's cross-chain contacts and is
  * meant to appear WHILE the fold runs - before the confidence head has produced
  * a real ipTM - so it cannot be checked from a finished result. This captures
- * every status line the page emits and asks two things of them: a complex says
- * something, and a single chain says nothing at all, because a monomer has no
- * interface and a line claiming otherwise would be worse than silence.
+ * every status line the page emits and asks two things of them: a complex
+ * prints a p(inter), and a single chain prints none at all, because a monomer
+ * has no interface and a number claiming otherwise would be worse than
+ * silence.
  */
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
@@ -30,7 +30,7 @@ export async function main(device, args) {
       sequence, mode: "flow", calls, recycles: 0, seed: 3, device, weights,
       onStatus: (text) => { lines.push(text); }, onProgress: () => {},
     });
-    const mentions = lines.filter((line) => line.includes("interface"));
+    const mentions = lines.filter((line) => line.includes("p(inter)"));
     return {
       statusLines: lines.length,
       mentioning: mentions.length,

@@ -60,15 +60,25 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * price for an atom-tokenised residue and not something more steps will fix.
  */
 /**
- * Where the trunk's cross-chain contact score stops reading as an interface.
+ * How the trunk's contact confidences are written into the status line.
  *
- * 🔴 A THRESHOLD, NOT A CALIBRATION, and 0.80 because that is where it
- * separates best. Against the real ipTM on fifteen two-chain folds, asking
- * whether ipTM will reach 0.5: at 0.80 it is right 13 times, at 0.75 twelve, at
- * 0.60 ten. It is a rough word in a status line and nothing more - the real
- * score arrives minutes later and replaces it.
+ * 🔴 THE NUMBER IS SHOWN AS ITSELF. An earlier version turned p(inter) into
+ * the word "interface looks strong" against a fitted threshold, and before that
+ * the same machinery was shown as an estimated pLDDT. Both were the same
+ * mistake in different clothes: a quantity presented as a claim it does not
+ * support. p(inter) is the mean of the trunk's own P(d <= 8 A) over the
+ * cross-chain contacts it is most confident about, and that is what the line
+ * now says. It tracks the real ipTM at 0.84 Pearson and 0.91 Spearman across a
+ * seventeen-target panel, minutes before the head produces one.
+ *
+ * 🔴 AND ITS SIBLING p(intra) IS NOT SHOWN, THOUGH IT IS COMPUTED AND TESTED.
+ * See distogramContactConfidence: it tracks nothing the confidence head
+ * reports, and on a coiled coil - one long helix with no long-range contacts
+ * within a chain - it reads 0.00 beside a real pLDDT of 89. That is p(intra)
+ * being correct about a different question, and a 0.00 in a card called
+ * Prediction Quality would be read as a verdict on the fold.
  */
-const INTERFACE_LIKELY = 0.80;
+const CONTACT_DIGITS = 2;
 
 export const AF3_COUNTS = {
   // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
@@ -373,9 +383,9 @@ export async function foldAf3(options) {
   // the 15. So it goes in the transient status line, where it is superseded
   // minutes later by the real score, and NOT in the quality card, which is read
   // as a result.
-  let interfaceWord = "";
+  let contactWords = "";
   const say = (phase) => {
-    const line = `${phase}${interfaceWord}`;
+    const line = `${phase}${contactWords}`;
     if (budget === null) { onStatus(line); return; }
     onStatus(`${line} · ${Math.round(100 * budget.estimator.fraction())}%`);
   };
@@ -417,22 +427,27 @@ export async function foldAf3(options) {
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
   let liveConfidence = null;
+  // ...and the cross-chain contact confidence, kept so the quality card can
+  // show the same number the status line did rather than a second opinion.
+  let interContact = Number.NaN;
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
-      if (name === "trunk-done" && interfaceWord === "") {
+      if (name === "trunk-done" && contactWords === "") {
         try {
-          const contact = distogramInterfaceContact(
+          const inter = distogramInterfaceContact(
             detail.trunk.contactProbs, batch.asymId, batch.seqMask, batch.tokens);
-          // NaN for a single chain: there is no interface to say anything about.
-          if (Number.isFinite(contact)) {
-            interfaceWord = contact >= INTERFACE_LIKELY
-              ? " · interface looks strong" : " · interface looks weak";
+          interContact = inter;
+          // ...NaN for a single chain: there is no interface to score, which is
+          // not the same as a bad one, so the line stays quiet about it rather
+          // than printing a zero.
+          if (Number.isFinite(inter)) {
+            contactWords = ` · p(inter) ${inter.toFixed(CONTACT_DIGITS)}`;
           }
         } catch (cause) {
-          console.warn("interface estimate unavailable", cause);
+          console.warn("contact confidence unavailable", cause);
         }
       }
       if (name === "trunk-done" && liveConfidence === null) {
@@ -565,7 +580,7 @@ export async function foldAf3(options) {
   // reused trunk from an older build - the prediction is still the valuable
   // thing and must not be lost to it. The failure is reported once and the
   // animation reverts to what it did before.
-  const perFrameConfidence = (() => {
+  const frameScores = (() => {
     const tokens = batch.tokens;
     // The head emits one distribution per dense atom slot, so a token's pLDDT
     // is the mean over the atoms it actually has - and the anchor has to be
@@ -592,12 +607,21 @@ export async function foldAf3(options) {
         realPerToken, batch.seqMask);
     } catch (cause) {
       console.warn("per-frame confidence unavailable; frames take the final pLDDT", cause);
-      return () => result.scores.plddt;
+      return { coloured: () => result.scores.plddt, settled: null };
     }
-    // ...broadcast back to atom slots, because that is how toPdb indexes the
-    // B-factor it writes.
-    return (positions) => broadcastToSlots(batch,
-      calibrate(distogramConfidence(table, pseudoBetaOf(batch, positions))));
+    return {
+      // ...broadcast back to atom slots, because that is how toPdb indexes the
+      // B-factor it writes.
+      coloured: (positions) => broadcastToSlots(batch,
+        calibrate(distogramConfidence(table, pseudoBetaOf(batch, positions)))),
+      // 🔴 AND THE UNCALIBRATED ONE FOR THE CARD, WHICH IS NOT THE SAME NUMBER.
+      // The colour is calibrated to this fold's own pLDDT so the ramp means
+      // what it always means; the CARD shows a percentage named "Settled", and
+      // that has to be the raw quantity - the share of the trunk's predicted
+      // distances this frame already satisfies. Calibrating it would make the
+      // number depend on a score the frame is not being shown.
+      settled: (positions) => distogramConfidence(table, pseudoBetaOf(batch, positions)),
+    };
   })();
 
   // 🔴 EVERY FRAME IS RE-EMITTED, because the frames drawn during the fold
@@ -612,22 +636,26 @@ export async function foldAf3(options) {
   // randomAugmentation last rotated into - so the animation ran smoothly and
   // then jumped on its last frame.
   const framePdbs = trajectory.map(
-    (positions) => fittedPdb(batch, positions, reference, slots, perFrameConfidence(positions)));
-  // 🔴 AND THE NUMBER BEHIND EACH FRAME'S COLOUR, so the quality card can show
-  // the frame being LOOKED AT rather than the finished score on every one of
-  // them. It is the same per-token estimate the B-factors carry, meaned over
-  // the live tokens - not a second opinion, the same one.
-  const frameConfidence = trajectory.map((positions) => {
-    const perSlot = perFrameConfidence(positions);
-    let total = 0;
-    let count = 0;
-    for (let slot = 0; slot < perSlot.length; slot += 1) {
-      if (!batch.predDenseAtomMask[slot]) continue;
-      total += perSlot[slot];
-      count += 1;
-    }
-    return count === 0 ? undefined : total / count;
-  });
+    (positions) => fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
+  // 🔴 AND HOW FAR EACH FRAME HAS SETTLED, so the quality card can say
+  // something about the frame being LOOKED AT rather than showing the finished
+  // score on every one of them. It is the mean over the live tokens of the
+  // share of the trunk's predicted distances that frame already satisfies -
+  // which is what the trajectory's colour is drawn from, and is NOT a pLDDT.
+  // The card used to show it as one, which is the naming this file no longer
+  // does anywhere.
+  const frameSettled = frameScores.settled === null ? trajectory.map(() => undefined)
+    : trajectory.map((positions) => {
+      const perToken = frameScores.settled(positions);
+      let total = 0;
+      let count = 0;
+      for (let token = 0; token < batch.tokens; token += 1) {
+        if (batch.seqMask[token] <= 0) continue;
+        total += perToken[token];
+        count += 1;
+      }
+      return count === 0 ? undefined : total / count;
+    });
   // ...and the finished structure keeps the REAL pLDDT, which is the one number
   // here that is a claim about the prediction rather than about the animation.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
@@ -638,7 +666,7 @@ export async function foldAf3(options) {
     reusable: result.reusable,
     depth: rows.depth,
     framePdbs,
-    frameConfidence,
+    frameSettled,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,
@@ -650,6 +678,9 @@ export async function foldAf3(options) {
       // NaN for a single chain - there is no interface to score - and the card
       // shows a dash for it rather than a number.
       iptm: result.iptm,
+      // The trunk's own cross-chain contact confidence, shown beside the
+      // head's scores under its own name. NaN for a single chain, as ipTM is.
+      pinter: interContact,
       predictedAlignedError: result.scores.pae,
     },
   };

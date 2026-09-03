@@ -530,6 +530,23 @@ function updateScoresCard(confidence, passBadge = "") {
     }
   }
 
+  // ...a cell that shows only when its number exists, because these three are
+  // not available on every frame or for every input: p(inter) needs two chains
+  // and Settled only means something on a frame that has not finished.
+  const optional = (cellId, valueId, value, digits) => {
+    const cell = document.getElementById(cellId);
+    const slot = document.getElementById(valueId);
+    if (!cell || !slot) return;
+    if (value !== undefined && Number.isFinite(Number(value))) {
+      cell.style.display = "flex";
+      slot.textContent = Number(value).toFixed(digits);
+    } else {
+      cell.style.display = "none";
+    }
+  };
+  optional("metricPinterCell", "metricPinter", confidence.pinter, 2);
+  optional("metricSettledCell", "metricSettled", confidence.settled, 0);
+
   const multimerCell = document.getElementById("metricMultimerCell");
   const multimer = document.getElementById("metricMultimer");
   if (multimerCell && multimer) {
@@ -998,9 +1015,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // rather than by the loop below, so it is easy to leave carrying whatever
       // that put there.
       first.confidence = {
-        ...result.confidence,
-        meanPlddt: result.frameConfidence?.[0],
-        badge: `${mode}_0 · pLDDT estimated`,
+        pinter: result.confidence.pinter,
+        predictedAlignedError: result.confidence.predictedAlignedError,
+        plddt: result.confidence.plddt,
+        settled: result.frameSettled?.[0],
+        badge: `${mode}_0`,
       };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
@@ -1014,17 +1033,22 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // so; the last frame is the finished structure and keeps the real head's
       // answer.
       //
-      // 🔴 pTM AND ipTM DO NOT MOVE, and that is deliberate. They come from the
-      // confidence head on the finished structure and there is no per-frame
-      // version of either - blanking them while scrubbing would add no
-      // information and would toggle the ipTM cell in and out, resizing the
-      // card under the reader. The badge carries the caveat instead.
+      // 🔴 AN INTERMEDIATE FRAME HAS NO pLDDT, pTM OR ipTM AND NOW SAYS SO.
+      // All three come from the confidence head, which runs once on the
+      // finished structure. The card used to show the head's finished numbers
+      // on every frame, and then a distogram estimate labelled as a pLDDT;
+      // both told the reader something the frame does not support. An
+      // intermediate frame now shows a dash for the three head scores, the
+      // trunk's contact confidences - which ARE known this early, and do not
+      // move - and how far it has settled.
       frame.confidence = last ? result.confidence : {
-        ...result.confidence,
+        pinter: result.confidence.pinter,
+        predictedAlignedError: result.confidence.predictedAlignedError,
+        plddt: result.confidence.plddt,
         // ...`index` walks timeline.slice(1), so it is one behind the frame
-        // number the name uses and one behind the confidence array.
-        meanPlddt: result.frameConfidence?.[index + 1],
-        badge: `${mode}_${index + 1} · pLDDT estimated`,
+        // number the name uses and one behind the settling array.
+        settled: result.frameSettled?.[index + 1],
+        badge: `${mode}_${index + 1}`,
       };
       if (last) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
