@@ -19,8 +19,8 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
-import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
-  from "../src/af3/distogram-confidence.js";
+import { distogramAgreementTable, distogramConfidence, calibrateToPlddt,
+  distogramInterfaceContact } from "../src/af3/distogram-confidence.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -59,6 +59,17 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * 0.953 at matched settings, so what is left at sixteen is the architecture's
  * price for an atom-tokenised residue and not something more steps will fix.
  */
+/**
+ * Where the trunk's cross-chain contact score stops reading as an interface.
+ *
+ * 🔴 A THRESHOLD, NOT A CALIBRATION, and 0.80 because that is where it
+ * separates best. Against the real ipTM on fifteen two-chain folds, asking
+ * whether ipTM will reach 0.5: at 0.80 it is right 13 times, at 0.75 twelve, at
+ * 0.60 ten. It is a rough word in a status line and nothing more - the real
+ * score arrives minutes later and replaces it.
+ */
+const INTERFACE_LIKELY = 0.80;
+
 export const AF3_COUNTS = {
   // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
   // Recycles and "Cycles" beside "Recycles" reads as the same word twice. The
@@ -349,9 +360,24 @@ export async function foldAf3(options) {
    * percentage is the honest half; the model still drives the BAR, where being
    * approximately right is all a bar needs.
    */
+  // 🔴 A WORD ABOUT THE INTERFACE, ONCE THE TRUNK KNOWS ONE, AND ONLY IN THE
+  // STATUS LINE. src/af3/distogram-confidence.js can read the trunk's own
+  // cross-chain contacts the moment the trunk is done - well before the
+  // confidence head produces a real ipTM - so a complex that is going nowhere
+  // can say so while there is still time to stop it.
+  //
+  // 🔴 IT IS A WORD AND NOT A NUMBER, DELIBERATELY. Calibrated to ipTM on
+  // fifteen two-chain folds it is out by 0.09 on average and 0.31 at worst
+  // under leave-one-out - enough to move a complex across the 0.5 line people
+  // actually judge by. As a yes/no at the threshold below it is right on 13 of
+  // the 15. So it goes in the transient status line, where it is superseded
+  // minutes later by the real score, and NOT in the quality card, which is read
+  // as a result.
+  let interfaceWord = "";
   const say = (phase) => {
-    if (budget === null) { onStatus(phase); return; }
-    onStatus(`${phase} · ${Math.round(100 * budget.estimator.fraction())}%`);
+    const line = `${phase}${interfaceWord}`;
+    if (budget === null) { onStatus(line); return; }
+    onStatus(`${line} · ${Math.round(100 * budget.estimator.fraction())}%`);
   };
   /** Move the bar to a point in the plan, in units. */
   const reached = (units) => {
@@ -396,6 +422,19 @@ export async function foldAf3(options) {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
+      if (name === "trunk-done" && interfaceWord === "") {
+        try {
+          const contact = distogramInterfaceContact(
+            detail.trunk.contactProbs, batch.asymId, batch.seqMask, batch.tokens);
+          // NaN for a single chain: there is no interface to say anything about.
+          if (Number.isFinite(contact)) {
+            interfaceWord = contact >= INTERFACE_LIKELY
+              ? " · interface looks strong" : " · interface looks weak";
+          }
+        } catch (cause) {
+          console.warn("interface estimate unavailable", cause);
+        }
+      }
       if (name === "trunk-done" && liveConfidence === null) {
         // ...best effort, for the reason the finished-frame path gives: this is
         // a colour, and losing a prediction to it would be a bad trade.
