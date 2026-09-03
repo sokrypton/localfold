@@ -6,6 +6,12 @@ output of a single block, which is concrete, and the same truncation is easy to
 apply on the LocalFold side by handing it one block's weights.
 """
 import os, sys, json
+
+# 🔴 DERIVED FROM THIS FILE, NOT WRITTEN OUT. The default output path used to be
+# the absolute path of one checkout, so renaming the folder sent the dump
+# somewhere that did not exist. TRUNC_OUT still overrides it.
+REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 os.environ["JAX_PLATFORMS"] = "cpu"
 sys.path.insert(0, "/Users/mini/Documents/GitHub/ColabDesign2")
 import numpy as np, jax
@@ -82,6 +88,6 @@ print("msa_first_row", msa_first.shape, "|x|", np.abs(msa_first).mean())
 json.dump({"truncated_pair": pair.ravel().tolist(),
            "truncated_msa_first_row": msa_first.ravel().tolist(),
            "main": MAIN, "extra": EXTRA},
-          open(os.environ.get("TRUNC_OUT",
-    "/Users/mini/Documents/GitHub/alphafold2-webgpu/toy-oracle-truncated.json"), "w"))
+          open(os.environ.get("TRUNC_OUT", os.path.join(REPO_ROOT,
+    "toy-oracle-truncated.json")), "w"))
 print("wrote toy-oracle-truncated.json")

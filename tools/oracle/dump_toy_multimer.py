@@ -5,6 +5,12 @@ features and hope", but the model input dict itself, so any difference that
 shows up afterwards is in the forward pass rather than in the featurisation.
 """
 import os, sys, json
+
+# 🔴 DERIVED FROM THIS FILE, NOT WRITTEN OUT. The default output path used to be
+# the absolute path of one checkout, so renaming the folder sent the dump
+# somewhere that did not exist. ORACLE_OUT still overrides it.
+REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 os.environ["JAX_PLATFORMS"] = "cpu"
 sys.path.insert(0, "/Users/mini/Documents/GitHub/ColabDesign2")
 import numpy as np
@@ -87,8 +93,7 @@ payload["distogram"] = dg.astype(np.float64).ravel().tolist()
 payload["plddt_logits"] = pl.astype(np.float64).ravel().tolist()
 payload["ca"] = ca.astype(np.float64).ravel().tolist()
 payload["shapes"] = {n: list(np.asarray(model_inputs[n]).shape) for n in wanted}
-out_path = os.environ.get("ORACLE_OUT",
-    "/Users/mini/Documents/GitHub/alphafold2-webgpu/toy-oracle.json")
+out_path = os.environ.get("ORACLE_OUT", os.path.join(REPO_ROOT, "toy-oracle.json"))
 with open(out_path, "w") as fh:
     json.dump(payload, fh)
 print("saved toy_multimer.npz and", out_path)
