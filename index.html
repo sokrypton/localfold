@@ -693,9 +693,24 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          now; what this page still owns is the layout slot. -->
                     <div id="selectionPanelMount"></div>
 
-                    <!-- PAE Canvas Container -->
-                    <div id="paeContainer" class="container-box" style="display: none;">
-                        <canvas id="paeCanvas" style="cursor: crosshair;"></canvas>
+                    <!-- THE HEATMAP PANEL, which used to be the PAE panel and
+                         draws any map now - PAE and the trunk's contact map,
+                         picked with a tab strip.
+
+                         🔴 THE NEW IDS, AND THE RENAME IS NOT COSMETIC. The
+                         panel's JS still accepts #paeContainer/#paeCanvas, so
+                         the old names looked fine - but the vendored
+                         STYLESHEET has no rule for them at all, and the tab
+                         strip is absolutely positioned. Without
+                         `position: relative` here it escapes to the nearest
+                         positioned ancestor, .py2dmol-viewer-instance, and is
+                         drawn somewhere else on the page; the container also
+                         loses its 340px, its square aspect and its overflow
+                         clip, and the canvas its absolute fill. Accepted by
+                         the code and unstyled by the CSS is exactly the shape
+                         of bug that looks like it works. -->
+                    <div id="heatmapContainer" class="container-box" style="display: none;">
+                        <canvas id="heatmapCanvas" style="cursor: crosshair;"></canvas>
                     </div>
 
                     <!-- THE RAW PREDICTION, under the confidence it describes.

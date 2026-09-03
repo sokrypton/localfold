@@ -10,11 +10,13 @@ DOM module and the reader is inside a 787 KB bundle. So this loads the real
 page, hands it a structure the way a fold does, attaches the two maps the way
 web/app.js does, and reads the tab strip back.
 
-🔴 AND IT IS A VENDOR-BUMP TRIPWIRE. The panel was called the PAE panel until
-recently and its markup ids moved; ours are the old names, which it still
-accepts. A future bundle that drops them, or that changes the map format,
-breaks the page silently - the panel simply stays hidden - and this is what
-says so.
+🔴 AND IT IS A VENDOR-BUMP TRIPWIRE, WHICH ALREADY CAUGHT ONE. The panel was
+called the PAE panel until recently and its markup ids moved. Keeping the old
+names looked fine - the JS still accepts them - but the vendored STYLESHEET
+has no rule for them, so the container lost `position: relative` and the
+absolutely positioned tab strip was drawn against the viewer instead of the
+panel. Accepted by the code and unstyled by the CSS is the shape of bug that
+looks like it works, so this asserts on GEOMETRY as well as on the tabs.
 
 🔴 THE FILE READER IS `readAsync`, NOT `text`. web/app.js hands py2Dmol virtual
 files as `{name, readAsync}`, and a file with the wrong reader loads without
@@ -109,17 +111,40 @@ def main():
         time.sleep(0.8)
 
         state = cdp.evaluate(ws, """(() => {
-          const c = document.getElementById('paeContainer');
-          if (!c) return JSON.stringify({ error: 'no #paeContainer' });
+          const c = document.getElementById('heatmapContainer');
+          if (!c) return JSON.stringify({ error: 'no #heatmapContainer' });
           const tabs = [...c.querySelectorAll('[role="tab"], button')]
             .map((t) => t.textContent.trim()).filter(Boolean);
-          return JSON.stringify({ visible: c.style.display !== 'none', tabs });
+          const cs = getComputedStyle(c);
+          const box = c.getBoundingClientRect();
+          // 🔴 THE STRIP MUST LAND INSIDE THE PANEL. It is absolutely
+          // positioned, so this is the one thing that says the container is
+          // its positioning context rather than something further up.
+          const strip = c.querySelector('[role="tablist"]')
+            || (c.querySelector('[role="tab"], button') || {}).parentElement;
+          const s = strip ? strip.getBoundingClientRect() : null;
+          return JSON.stringify({
+            visible: cs.display !== 'none',
+            position: cs.position,
+            square: box.width > 0 && Math.abs(box.width - box.height) < 2,
+            stripInside: !!s && s.left >= box.left - 1 && s.right <= box.right + 1
+              && s.top >= box.top - 1 && s.bottom <= box.bottom + 1,
+            tabs,
+          });
         })()""")
         print("attached:", attached)
         print("panel   :", state)
 
-        if '"visible": true' not in state.replace('":', '": '):
+        if '"visible":true' not in state:
             failures.append("the panel stayed hidden: %s" % state)
+        if '"position":"relative"' not in state:
+            failures.append("the container is not a positioning context, so the"
+                            " tab strip escapes it: %s" % state)
+        if '"square":true' not in state:
+            failures.append("the panel is not square, so the vendored CSS is not"
+                            " reaching it: %s" % state)
+        if '"stripInside":true' not in state:
+            failures.append("the tab strip is drawn outside the panel: %s" % state)
         for wanted in ("Contact", "PAE"):
             if wanted not in state:
                 failures.append("no %s tab: %s" % (wanted, state))
