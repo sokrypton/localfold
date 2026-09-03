@@ -615,6 +615,34 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
 /**
+ * Tell the heatmap panel a frame's maps changed.
+ *
+ * 🔴 `render()` DOES NOT DO THIS, WHICH IS WHY NO CONTACT MAP EVER APPEARED.
+ * py2Dmol drives the panel from `setFrame` and from its loader - both call
+ * Heatmap.updateFrame - and a plain render redraws the 3D scene without
+ * re-resolving which maps the current frame has. So a map attached AFTER the
+ * frame was added, which is what computing it off the critical path means,
+ * reached the frame object and was never looked at again.
+ *
+ * 🔴 AND IT MUST NOT MOVE THE VIEW. Re-calling setFrame would work and would
+ * yank a reader who has scrubbed elsewhere, so the panel is told about the
+ * frame it is ALREADY showing.
+ */
+function refreshHeatmap() {
+  // 🔴 objectsData, NOT `viewer.objects`, WHICH DOES NOT EXIST. Measured on
+  // the page: `typeof viewer.objects` is "undefined", so every
+  // `viewer.objects?.find(...)` in this file is an optional-chain that
+  // silently yields undefined. The frames live in objectsData[name], and the
+  // entry there has no `name` of its own - which Heatmap.updateFrame tolerates,
+  // because an object with no name skips its owner guards and goes straight to
+  // the map resolution this wants.
+  const object = viewer?.objectsData?.[viewerObject];
+  if (viewer === undefined || object?.frames === undefined) return;
+  window.Heatmap?.updateFrame(viewer, object, viewer.currentFrame ?? 0);
+  viewer.render("contact");
+}
+
+/**
  * The contact map for one AF2 recycle, attached once the frame is on screen.
  *
  * 🔴 EVERY RECYCLE GETS ITS OWN, WHICH IS THE WHOLE POINT. AF2's distogram is
@@ -643,8 +671,9 @@ function attachContactMap(frame, recycle, weights, length) {
         recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
         { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
       const contact = contactMapFor(contacts);
-      if (contact !== undefined) frame.maps = { ...frame.maps, contact };
-      viewer?.render("contact");
+      if (contact === undefined) return;
+      frame.maps = { ...frame.maps, contact };
+      refreshHeatmap();
     } catch (cause) {
       console.warn("contact map unavailable for this pass", cause);
     }
@@ -1002,7 +1031,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
             const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
             if (frame !== undefined && liveContacts !== undefined) {
               frame.maps = { ...frame.maps, contact: liveContacts };
-              viewer?.render("af3-contacts");
+              refreshHeatmap();
             }
           });
         return;

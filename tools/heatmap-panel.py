@@ -160,6 +160,38 @@ def main():
         if '"same":true' not in geom:
             failures.append("the plot moves when a tab is clicked: %s" % geom)
 
+        # 🔴 A MAP ATTACHED AFTER THE FRAME WAS ADDED MUST STILL APPEAR, and a
+        # plain render() is NOT what makes it. py2Dmol drives the panel from
+        # setFrame and from its loader; render redraws the 3D scene without
+        # re-resolving which maps the frame has. Both contact maps here are
+        # computed off the critical path - AF2's per recycle, AF3's at
+        # trunk-done - so they always arrive after their frame, and for a
+        # while none of them ever showed.
+        deferred = cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+          const name = v.currentObjectName;
+          // objectsData, because `v.objects` does not exist - see
+          // refreshHeatmap in web/app.js.
+          const object = v.objectsData[name];
+          const frame = v.objectsData[name].frames[0];
+          const n = frame.pae_n;
+          const late = new Uint8Array(n * n).fill(200);
+          frame.maps = Object.assign({}, frame.maps, {
+            late: { data: late, n, vmin: 0, vmax: 1 },
+          });
+          const tabs = () => [...document.querySelectorAll(
+            '#heatmapContainer [role="tab"]')].map((t) => t.dataset.mapKey);
+          v.render('render-only');
+          const afterRender = tabs();
+          window.Heatmap.updateFrame(v, object, v.currentFrame || 0);
+          v.render('after-update');
+          return JSON.stringify({ afterRender, afterUpdate: tabs() });
+        })()""")
+        print("deferred:", deferred)
+        if '"afterUpdate"' in deferred and "late" not in deferred.split('"afterUpdate"')[1]:
+            failures.append("a map attached after the frame never appears: %s" % deferred)
+
         if '"visible":true' not in state:
             failures.append("the panel stayed hidden: %s" % state)
         if '"position":"relative"' not in state:
