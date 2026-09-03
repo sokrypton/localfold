@@ -544,8 +544,22 @@ const TILE: u32 = ${tile}u;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<storage, read_write> act: array<f32>;
 
-// The tile's tokens as one vector, so one weight read serves all of them.
-var<workgroup> gated: array<${tileLanes}, ${tileGroups * width}>;
+// The tile's tokens as one vector, so one weight read serves all of them - and
+// then, once the projection loop is done with it, the CONDITIONING.
+//
+// 🔴 THE ZERO-GATE LOOP BELOW READ cond FROM GLOBAL, ONCE PER TOKEN PER
+// CONDITIONING CHANNEL, ON EVERY LANE. It is indexed by (token, d) and not by
+// the channel a lane owns, so all 256 lanes wanted the same TILE x C_COND
+// floats: one weight read, TILE global reads and TILE scalar multiply-adds a
+// step, which at width 768 and C_COND 384 is about 60% of this kernel. Staged
+// as a vector over the tile it is one weight read, one workgroup read and one
+// vector multiply-add.
+//
+// 🔴 AND IT REUSES THESE SLOTS RATHER THAN TAKING MORE. gated is dead once
+// the projection loop has read it, and it is the larger of the two uses at
+// WIDTH against C_COND - so the conditioning costs nothing and this kernel's
+// residency is unchanged. ffw-out does the same thing for the same reason.
+var<workgroup> gated: array<${tileLanes}, ${tileGroups * Math.max(width, condChannels)}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -575,13 +589,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     ${overGroups((g) => `projected${g} += gated[${g}u * WIDTH + w] * weight;`)}
   }
   // 🔴 THE ZERO-INIT GATE READS THE RAW CONDITIONING, not the normalised one.
+  // ...staged into the slots the projection loop has finished with. The barrier
+  // before is what makes reusing them safe.
+  workgroupBarrier();
+  for (var d = local; d < C_COND; d += ${lanes}u) {
+    ${overTile((t) => `{
+      let token = base_token + ${t}u;
+      var value = 0.0;
+      if (token < TOKENS) { value = cond[token * C_COND + d]; }
+      gated[${group(t)}u * C_COND + d]${lane(t)} = value;
+    }`)}
+  }
+  workgroupBarrier();
   ${overGroups((g) => `var zero${g} = ${tileLanes}(weights[W_AdaptiveZeroCondBias + c]);`)}
   for (var d = 0u; d < C_COND; d += 1u) {
     let w = weights[W_AdaptiveZeroCondWeights + d * C + c];
-    ${overTile((t) => `{
-      let token = base_token + ${t}u;
-      if (token < TOKENS) { zero${group(t)}${lane(t)} += cond[token * C_COND + d] * w; }
-    }`)}
+    ${overGroups((g) => `zero${g} += gated[${g}u * C_COND + d] * w;`)}
   }
   ${overGroups((g) => `let contribution${g} = projected${g}
     / (${tileLanes}(1.0) + exp(-zero${g}));`)}
