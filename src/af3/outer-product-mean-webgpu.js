@@ -218,6 +218,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // accumulator ARRAY indexed by a loop variable, which WGSL puts in spillable
   // local memory, and it pays two barriers a chunk. Those reads were
   // cache-served anyway.
+  //
+  // 🔴 AND THERE IS A RESIDENCY REASON IT CANNOT WIN, WHICH IS WORTH KNOWING
+  // BEFORE ANYONE TRIES A THIRD TIME. `product` is already CELL_CHUNK x BLOCK_I
+  // vectors - 8 KiB at 256 cells and a 2x4 block - so this kernel holds four
+  // workgroups a core on a device granting 32 KiB. Staging the rows needs the
+  // chunk's left and right slices on top: about 4.5 KiB at eight sequences,
+  // 9 KiB at sixteen, which takes it to two workgroups a core or one. The
+  // instruction count only improves from 1.0 useful operations to about 1.45
+  // once the staging loop is paid for, and this device has traded four
+  // workgroups for a 45% instruction cut before and lost.
+  //
+  // Measured elsewhere on the same day: the kernels that DID answer to staging
+  // - the atom blocks' conditioning, ffw-out, attention-output - all reused an
+  // array that was already dead, and cost no residency at all. That is the
+  // distinction, not whether the reads look redundant.
   const contract = `${common}
 const CELL_CHUNK: u32 = ${cellChunk}u;
 const BLOCKS_PER_ROW: u32 = ${blocksPerRow}u;
