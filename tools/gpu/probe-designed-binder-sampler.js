@@ -88,18 +88,39 @@ const option = (args, name, fallback) => {
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
-/** 27UH entity 1, the designed VHH, with GGGGSHHHHHH removed. */
-const VHH = "EVQLVESGGGLVQPGGSLRLSCAASGDTSFIIAMAWYRQAPGKGRELVAGLNRLTSSISYADSVKG"
+/**
+ * 27UH entity 1, the designed VHH.
+ *
+ * 🔴 THE TAG IS A VARIABLE, NOT A DETAIL. The deposited sequence ends
+ * GGGGSHHHHHH - a Gly-Ser linker and a His6 - and stripping it was a judgement
+ * call made here without evidence. It is twelve disordered residues on EACH
+ * copy, twenty-four tokens across the A2B2 assembly, and a floppy tail is
+ * exactly the kind of thing a model can thread through an interface. `--tag=keep`
+ * folds what is actually deposited.
+ */
+const TAG = "GGGGSHHHHHH";
+const VHH_CORE = "EVQLVESGGGLVQPGGSLRLSCAASGDTSFIIAMAWYRQAPGKGRELVAGLNRLTSSISYADSVKG"
   + "RFTISRDNAKNTLYLQMNSLRPEDTAVYYCAAARVLGGTTERAWGQGTLVTVSS";
 /** 27UH entity 2, human S100A4. */
 const S100A4 = "SMACPLEKALDVMVSTFHKYSGKEGDKFKLNKSELKELLTRELPSFLGKRTDEAAFQKLMSNLDSN"
   + "RDNEVDFQEYCVFLSCIAMMCNEFFEGFPDKQPRKK";
 
-/** The sampler arms: AF3's own across step counts, and the flow beside it. */
+/**
+ * The sampler arms: AF3's own across step counts, and the flow beside it.
+ *
+ * 🔴 THE FLOW ARMS CARRY sigma0 NOW, BECAUSE THE TWO SAMPLERS DIFFER IN IT AND
+ * NOT ONLY IN CHURN. The flow starts at 160 A and AF3's sampler at 2560, and on
+ * this target's A2B2 assembly the flow was reported to fail where the sampler
+ * succeeds at ONE step - which is what a sigma0 difference would look like.
+ * A single call at 2560 has a skip weight of 4e-5, so it emits the conditional
+ * mean from the trunk and ignores its input coordinates entirely; at 160 the
+ * weight is 1e-2, so about 1.6 A of the starting noise is read as signal.
+ */
 const ARMS = [
-  ["diffusion", 20], ["diffusion", 40], ["diffusion", 80],
+  ["diffusion", 1], ["diffusion", 20], ["diffusion", 40], ["diffusion", 80],
   ["diffusion", 160], ["diffusion", 320],
   ["flow", 16], ["flow", 32], ["flow", 64],
+  ["flow", 16, 640], ["flow", 16, 2560], ["flow", 32, 2560],
 ];
 
 /** `--arms=diffusion:20,flow:16` to run a subset, for bisecting a failure. */
@@ -107,7 +128,8 @@ const chosenArms = (args) => {
   const wanted = args.find((a) => a.startsWith("--arms="))?.slice(7);
   if (wanted === undefined) return ARMS;
   const keep = new Set(wanted.split(","));
-  return ARMS.filter(([mode, calls]) => keep.has(`${mode}:${calls}`));
+  return ARMS.filter(([mode, calls, sigma]) => keep.has(
+    sigma === undefined ? `${mode}:${calls}` : `${mode}:${calls}:${sigma}`));
 };
 
 const mean = (values) => values.reduce((a, b) => a + b, 0) / values.length;
@@ -116,6 +138,7 @@ export async function main(device, args) {
   const seeds = option(args, "seeds", "1,2").split(",").map(Number);
   const recycles = Number(option(args, "recycles", "0"));
   const maxMsaSequences = Number(option(args, "max-msa", "128"));
+  const VHH = option(args, "tag", "strip") === "keep" ? VHH_CORE + TAG : VHH_CORE;
   // Chains in blocks, so an interface can be named: 0,1 are VHH and 2,3 S100A4.
   const chains = option(args, "assembly", "1to1") === "a2b2"
     ? [VHH, VHH, S100A4, S100A4] : [VHH, S100A4];
@@ -134,13 +157,15 @@ export async function main(device, args) {
   // 🔴 REPORTED, NOT THROWN. A rejection out of main reaches the harness as
   // "Chrome exited before reporting", which names nothing and cost a run.
   const failures = [];
-  for (const [mode, calls] of chosenArms(args)) {
+  for (const [mode, calls, sigma] of chosenArms(args)) {
     try {
     const runs = [];
     for (const seed of seeds) {
       const result = await foldAf3({
         sequence: chains.join(":"), mode, calls, recycles, seed,
         device, weights, alignment, maxMsaSequences,
+        // sigmaMax is in units of sigmaData, which is 16 A.
+        schedule: sigma === undefined ? undefined : { sigmaMax: sigma / 16 },
         onStatus: () => {}, onProgress: () => {},
       });
       tokens = result.batch.tokens;
@@ -148,23 +173,29 @@ export async function main(device, args) {
       runs.push(result);
     }
     const iptm = runs.map((r) => r.confidence.iptm).filter(Number.isFinite);
-    arms[`${mode} ${calls}`] = {
+    arms[sigma === undefined ? `${mode} ${calls}` : `${mode} ${calls} s0=${sigma}`] = {
       iptm: iptm.length === 0 ? null : Number(mean(iptm).toFixed(3)),
       iptmRange: iptm.length === 0 ? null
         : [Number(Math.min(...iptm).toFixed(3)), Number(Math.max(...iptm).toFixed(3))],
       ptm: Number(mean(runs.map((r) => r.confidence.ptm)).toFixed(3)),
       meanPlddt: Number(mean(runs.map((r) => r.meanPlddt)).toFixed(1)),
       seconds: Number(mean(runs.map((r) => r.seconds)).toFixed(1)),
+      // 🔴 GEOMETRY TOO, because "does not work" is not a low score - it is a
+      // structure that is wrong, and a broken chain or a blown-up assembly
+      // shows here while ipTM may not.
+      caCa: Number(mean(runs.map((r) => r.geometry.caca)).toFixed(2)),
+      gyration: Number(mean(runs.map((r) => r.geometry.gyration)).toFixed(1)),
       // ...and every interface on its own, meaned over the seeds.
       interfaces: Object.fromEntries(
         Object.keys(runs[0].confidence.chainPairIptm ?? {}).map((pair) => [pair,
           Number(mean(runs.map((r) => r.confidence.chainPairIptm[pair])).toFixed(3))])),
     };
     } catch (cause) {
-      failures.push({ arm: `${mode} ${calls}`, error: String(cause?.message ?? cause),
+      failures.push({ arm: `${mode} ${calls} ${sigma ?? ""}`, error: String(cause?.message ?? cause),
         stack: String(cause?.stack ?? "").split("\n").slice(0, 5) });
     }
   }
-  return { target: "27UH", tokens, msaRows: depth, recycles, maxMsaSequences,
-    seeds, arms, failures };
+  return { target: "27UH", tag: option(args, "tag", "strip"),
+    assembly: option(args, "assembly", "1to1"),
+    tokens, msaRows: depth, recycles, maxMsaSequences, seeds, arms, failures };
 }

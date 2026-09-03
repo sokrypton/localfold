@@ -242,6 +242,7 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onTrunk?: (reusable: object) => void,
+ *          schedule?: {sigmaMax?: number, sigmaMin?: number, rho?: number},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
@@ -424,6 +425,9 @@ export async function foldAf3(options) {
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
+    // ...forwarded for probes that move the noise schedule. Unset for a page
+    // fold, which is AF3's own for the sampler and 160 A for the flow.
+    schedule: options.schedule,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
       if (name === "trunk-done") {

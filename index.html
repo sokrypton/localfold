@@ -706,13 +706,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          where a reader looking at pLDDT and PAE already is. -->
                     <!-- Prediction scores card -->
                     <div id="predictionScoresBox" class="container-box" style="display: none;">
-                        <!-- 🔴 NO TITLE. Every cell here is labelled, so a
-                             heading over them said only that scores are
-                             scores - and it cost the width that keeps them on
-                             one line. -->
-                        <div class="scores-card-header">
-                            <span id="scoresPassBadge" class="scores-pass-badge"></span>
-                        </div>
+                        <!-- 🔴 NO TITLE AND NO BADGE. Every cell here is
+                             labelled, so a heading over them said only that
+                             scores are scores; and the badge named the frame
+                             ("Pass 16", "flow_12"), which the trajectory's own
+                             play bar already says. Both cost the width that
+                             keeps the metrics on one line. -->
                         <div class="scores-card-grid" id="scoresCardGrid">
                             <div class="score-metric-cell">
                                 <div class="score-metric-label">pLDDT</div>

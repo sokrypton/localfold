@@ -472,10 +472,8 @@ function syncScoresCardToActiveFrame(frameIndex) {
   const result = getActiveFrameConfidence(frameIndex);
   if (result && result.confidence) {
     lastReportedFrameIdx = result.index;
-    // ...a frame may name its own badge - an AF3 sampler step is not a "Pass",
     // and an estimated pLDDT has to say that it is one.
-    updateScoresCard(result.confidence,
-      result.confidence.badge ?? `Pass ${result.index + 1}`);
+updateScoresCard(result.confidence);
   }
 }
 
@@ -493,7 +491,7 @@ setInterval(() => {
   } catch (e) {}
 }, 50);
 
-function updateScoresCard(confidence, passBadge = "") {
+function updateScoresCard(confidence) {
   const box = document.getElementById("predictionScoresBox");
   if (!box) return;
   if (!confidence) {
@@ -501,9 +499,6 @@ function updateScoresCard(confidence, passBadge = "") {
     return;
   }
   box.style.display = "flex";
-
-  const badge = document.getElementById("scoresPassBadge");
-  if (badge) badge.textContent = passBadge;
 
   const meanPlddt = document.getElementById("metricMeanPlddt");
   if (meanPlddt) {
@@ -1007,7 +1002,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       first.confidence = {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
-        badge: `${mode}_0`,
       };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
@@ -1026,11 +1020,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // finished structure. The card used to show the head's finished numbers
       // on every frame, and then a distogram estimate labelled as a pLDDT;
       // both told the reader something the frame does not support. It shows a
-      // dash for all three instead, and the badge names the frame.
+      // dash for all three instead.
       frame.confidence = last ? result.confidence : {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
-        badge: `${mode}_${index + 1}`,
       };
       if (last) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
@@ -1046,7 +1039,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     forcePlddtColours();
     viewer.render("af3-final");
   }
-  updateScoresCard(result.confidence, `${mode} · ${calls}`);
+  updateScoresCard(result.confidence);
   progress(null);
   // 🔴 BUILT FROM PARTS, because a ligand-only fold has none of the things this
   // line used to state unconditionally: no residues and no chains. It once
@@ -1266,7 +1259,7 @@ async function fold(event) {
       const passText = `Pass ${index + 1} of ${passes}`;
       const iptmText = recycle.confidence.iptm !== undefined ? ` · ipTM ${Number(recycle.confidence.iptm).toFixed(3)}` : "";
       status(`${passText}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}${iptmText}`);
-      updateScoresCard(recycle.confidence, `${passText}${distance}`);
+      updateScoresCard(recycle.confidence);
       if (index === 0) {
         firstPassLanded = alignedToPrevious(sequence, recycle.structure);
         initialLoadPromise = loadIntoViewer({
@@ -1427,7 +1420,7 @@ async function fold(event) {
     }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
-    updateScoresCard(final.confidence, `Final (Pass ${allRecycles.length})`);
+    updateScoresCard(final.confidence);
     const took = ((performance.now() - started) / 1000).toFixed(1);
 
     const converged = allRecycles.length < passes

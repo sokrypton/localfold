@@ -329,9 +329,8 @@
    which is what buys the height. Dropping the cell chrome alone took it to 86,
    because the metrics still could not share a line with anything: measured, the
    four pairs are 84 + 70 + 73 + 90 = 317px against the 310 inside this card, so
-   a multimer wrapped them and paid for a header line as well. With the title in
-   the row, line one is title + pLDDT + pTM and line two is whatever is left
-   plus the badge - 56px, monomer and multimer alike.
+   a multimer wrapped them and paid for a header line as well. The title and the
+   badge have both since gone, which is what finally bought the room.
 
    Nothing is smaller. The value keeps its 14px monospace, which is the part
    anyone reads; it is the boxes and the two spare lines that went. */
@@ -354,18 +353,7 @@
 /* `display: contents` and not a rewrite of the markup: the header and the grid
    are still their own elements, still where web/app.js looks for them, and
    their children are the row's items. */
-.scores-card-header,
 .scores-card-grid { display: contents; }
-
-/* LAST ON WHATEVER LINE IT LANDS ON. The badge is first in the DOM - it is the
-   header's only child now - and `order` is what moves it past the metrics
-   without moving the markup. */
-.scores-pass-badge {
-  order: 1;
-  font-size: 12px;
-  color: #6b7280;
-  font-weight: 500;
-}
 
 /* 🔴 AND THE TWO CELLS THAT COME AND GO ARE SHOWN FROM JAVASCRIPT, so the
    display value lives in two places. web/app.js wrote `display = "block"` for
