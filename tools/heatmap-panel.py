@@ -117,9 +117,13 @@ def main():
             .map((t) => t.textContent.trim()).filter(Boolean);
           const cs = getComputedStyle(c);
           const box = c.getBoundingClientRect();
-          // 🔴 THE STRIP MUST LAND INSIDE THE PANEL. It is absolutely
-          // positioned, so this is the one thing that says the container is
-          // its positioning context rather than something further up.
+          // 🔴 THE STRIP HANGS ABOVE THE PANEL AND MUST STAY GLUED TO IT. The
+          // tabs are outside the box on purpose - inside, in a reserved band,
+          // they read as part of the plot rather than as a control over it -
+          // so "inside" is the wrong assertion. What still has to hold is that
+          // they are positioned against the CONTAINER: a strip that escaped to
+          // a positioned ancestor would be somewhere else on the page
+          // entirely, which is the bug this replaced.
           const strip = c.querySelector('[role="tablist"]')
             || (c.querySelector('[role="tab"], button') || {}).parentElement;
           const s = strip ? strip.getBoundingClientRect() : null;
@@ -127,8 +131,11 @@ def main():
             visible: cs.display !== 'none',
             position: cs.position,
             square: box.width > 0 && Math.abs(box.width - box.height) < 2,
-            stripInside: !!s && s.left >= box.left - 1 && s.right <= box.right + 1
-              && s.top >= box.top - 1 && s.bottom <= box.bottom + 1,
+            // Glued to the box's top edge and within its span. NOT flush with
+            // its left edge: the strip is aligned to the PLOT, inside the
+            // y-axis caption's band, which is where the tabs belong.
+            stripAbove: !!s && Math.abs(s.bottom - box.top) <= 2
+              && s.left >= box.left - 2 && s.right <= box.right + 2,
             tabs,
           });
         })()""")
@@ -237,8 +244,10 @@ def main():
         if '"square":true' not in state:
             failures.append("the panel is not square, so the vendored CSS is not"
                             " reaching it: %s" % state)
-        if '"stripInside":true' not in state:
-            failures.append("the tab strip is drawn outside the panel: %s" % state)
+        if '"stripAbove":true' not in state:
+            failures.append("the tab strip is not sitting on the panel's top"
+                            " edge, so it is positioned against something else:"
+                            " %s" % state)
         for wanted in ("Contact", "PAE"):
             if wanted not in state:
                 failures.append("no %s tab: %s" % (wanted, state))

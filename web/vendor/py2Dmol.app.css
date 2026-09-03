@@ -988,7 +988,12 @@
     width: 340px;
     aspect-ratio: 1;
     position: relative;
-    overflow: hidden;
+    /* 🔴 VISIBLE, BECAUSE THE TAB STRIP HANGS ABOVE THE BOX. The tabs used to
+       sit in a reserved white band INSIDE the card, which reads as part of the
+       plot rather than as a control over it - and a clipped container cut them
+       off the moment they moved outside. The canvas is absolutely positioned
+       and sized to fit by updateSize, so nothing else here overflows. */
+    overflow: visible;
     flex-shrink: 0;
 }
 
