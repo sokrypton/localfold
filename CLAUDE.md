@@ -34,6 +34,9 @@ values means the whole-stack checker, not that file.
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
 | Does p(inter) still track ipTM? | `tools/gpu/probe-contact-confidence.js` |
+| Is the sampler converged at this step count? | `tools/gpu/probe-flow-sigma-by-size.js --panel=churn` |
+| Do recycles help a complex? | `tools/gpu/probe-recycles-on-complexes.js` |
+| Does MSA depth help a complex? | `tools/gpu/probe-msa-depth-on-complexes.js` (**goes to the network**) |
 | Does AF2's stack match AlphaFold? | `tools/gpu/check-evoformer-stack.js` |
 | Does AF2 still fold the SAME structure? | `tools/gpu/fold-af2.js` |
 | Which register tile does AF2's dense projection want? | `tools/gpu/bench-evoformer-linear.js` |
