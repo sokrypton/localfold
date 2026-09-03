@@ -354,6 +354,22 @@ const ROWS: u32 = ${ROWS}u;
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
 // ROWS rows of activations, shared by every output channel in the workgroup.
+//
+// 🔴 STAGING THESE TRANSPOSED - FOUR ROWS TO A VECTOR - IS THE CHANGE THAT WON
+// FOUR TIMES IN AF2 AND LOSES HERE. The weights are already one vec4 a cell and
+// the activations are read one float at a time, once per row, so an invocation
+// spends one global read and eight workgroup reads to buy eight vector
+// multiply-adds: 1.88 useful operations an instruction, where four rows to a
+// vector would make it 2.9 - a 35% cut in instructions, and the identical fix
+// took AF2's transition, its q/k/v/gate projection and its attention output
+// projection 1.18x, 1.18x and 1.52x.
+//
+// Measured on the trunk at 150 tokens, where bench-trunk.js --profile
+// reproduces a kernel to about 0.3% across processes: grid.project 239.1 ->
+// 243.6 ms, 2% WORSE, with every other kernel inside 1% and the trunk total
+// unmoved at 2324 ms. So this kernel is not waiting on its workgroup reads,
+// and the instruction count does not govern it - the one global weight read a
+// channel does. Do not transpose the activation tile.
 var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
 
 @compute @workgroup_size(${width})
