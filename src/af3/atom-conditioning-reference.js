@@ -51,12 +51,24 @@ export function perAtomConditioning(reference, tokens, dense, weights) {
 
   // ...the element as a one-hot over the periodic table, which is why the
   // weight is 128 rows: an atomic number indexes it directly.
-  const element = new Float32Array(rows * 128);
+  //
+  // 🔴 AND "INDEXES IT DIRECTLY" IS THE IMPLEMENTATION, NOT JUST THE READING.
+  // Building the one-hot and multiplying by it is rows * 128 * channels
+  // multiply-adds of which all but rows * channels are by zero. Adding the row
+  // the one-hot selects is the SAME FLOAT: `linear` accumulates from zero over
+  // ascending columns, so the sum is a run of exact zeros around one term.
+  // This and the atom name below are 384 of this function's 389 input columns
+  // and were 99% of its arithmetic - 72 ms at 59 tokens, 220 at 150, 343 at
+  // 300, once per fold, all of it spent multiplying by zero.
   for (let index = 0; index < rows; index += 1) {
     const atomicNumber = reference.element[index];
-    if (atomicNumber >= 0 && atomicNumber < 128) element[index * 128 + atomicNumber] = 1;
+    if (atomicNumber < 0 || atomicNumber >= 128) continue;
+    const weightBase = atomicNumber * channels;
+    const actBase = index * channels;
+    for (let c = 0; c < channels; c += 1) {
+      act[actBase + c] += weights.embedRefElement[weightBase + c];
+    }
   }
-  add(linear(element, rows, 128, channels, weights.embedRefElement));
 
   // 🔴 arcsinh, NOT the charge. See the note at the top: identical at zero, so
   // no protein-only check can catch this.
@@ -69,15 +81,39 @@ export function perAtomConditioning(reference, tokens, dense, weights) {
   // ...the atom's NAME, as four characters, each a 64-way one-hot of its ASCII
   // code minus 32, flattened to 256 columns. "CA" is padded, so the trailing
   // slots are the one-hot of character 0 rather than nothing at all.
-  const nameWidth = 4 * 64;
-  const names = new Float32Array(rows * nameWidth);
+  //
+  // Four one-hots, so four gathered rows summed - and summed in CHARACTER
+  // order, which is ascending column order, because that is the order the
+  // matmul added them in and floating-point addition does not commute.
+  //
+  // 🔴 THE FOUR ROWS ARE SUMMED BEFORE THEY REACH `act`, AND THAT IS NOT
+  // TIDINESS. The matmul form accumulated a row's whole dot product from zero and
+  // `add` then committed it in one step, so `act + (a+b+c+d)` is what it
+  // computed; adding the four to `act` in turn is `(((act+a)+b)+c)+d`, which
+  // floating-point addition does not promise is the same number. Measured
+  // across four shapes it differed in 169,390 of 696,512 floats by up to
+  // 4.8e-7 - physically nothing, but this file is the reference the GPU
+  // kernels are checked against, and a reference that moves under them is a
+  // tolerance nobody chose. Summed first, every float is identical.
+  // 🔴 AND IT IS A Float64Array, WHICH IS THE SECOND HALF OF THE SAME POINT.
+  // `linear` accumulates a dot product in a JS number - float64 - and rounds
+  // ONCE, when it stores the result. A Float32Array scratch rounds after every
+  // addition instead, and that alone left 12,641 floats differing by up to
+  // 1.2e-7. Accumulate wide, round where the matmul rounded.
+  const nameSum = new Float64Array(channels);
   for (let index = 0; index < rows; index += 1) {
+    nameSum.fill(0);
     for (let character = 0; character < 4; character += 1) {
       const code = reference.atomNameChars[index * 4 + character];
-      if (code >= 0 && code < 64) names[index * nameWidth + character * 64 + code] = 1;
+      if (code < 0 || code >= 64) continue;
+      const weightBase = (character * 64 + code) * channels;
+      for (let c = 0; c < channels; c += 1) {
+        nameSum[c] += weights.embedRefAtomName[weightBase + c];
+      }
     }
+    const actBase = index * channels;
+    for (let c = 0; c < channels; c += 1) act[actBase + c] += Math.fround(nameSum[c]);
   }
-  add(linear(names, rows, nameWidth, channels, weights.embedRefAtomName));
 
   // ...and masked last, so an absent atom contributes nothing downstream even
   // though four of the five embeddings above are non-zero for it.
