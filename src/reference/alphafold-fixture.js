@@ -427,9 +427,30 @@ export class AlphaFoldFixture {
   async distogramHeadWeights() {
     const section = this.manifest.distogramHead;
     if (section === undefined) return undefined;
+    // 🔴 EMBEDDED, NOT FETCHED, AND THAT IS THE WHOLE POINT. It was a shard
+    // first, which is append-only and leaves the published bytes alone - and
+    // it still broke every AF2 fold. The manifests are COMPILED INTO the page
+    // (src/reference/manifests/) while the shards are fetched from a pinned
+    // remote, so the moment the manifest declared a shard the remote did not
+    // have, every load asked for a 404 and the rejection took the model down
+    // with it. 44 KB of base64 travels with the manifest that declares it, so
+    // the two can never be out of step.
+    const decode = (text, expected) => {
+      const binary = atob(text);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      const values = new Float32Array(bytes.buffer);
+      if (values.length !== expected) {
+        throw new RangeError(`distogram head: ${values.length} floats, expected ${expected}`);
+      }
+      return values;
+    };
+    const [rows, columns] = section.weightsShape;
     return {
-      halfLogitsWeights: await this.tensor(section.parameters.halfLogitsWeights),
-      halfLogitsBias: await this.tensor(section.parameters.halfLogitsBias),
+      halfLogitsWeights: decode(section.weights, rows * columns),
+      halfLogitsBias: decode(section.bias, section.biasShape[0]),
       bins: section.bins,
       firstBreak: section.firstBreak,
       lastBreak: section.lastBreak,

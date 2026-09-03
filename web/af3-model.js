@@ -242,6 +242,7 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onTrunk?: (reusable: object) => void,
+ *          onContacts?: (contactProbs: Float32Array) => void,
  *          schedule?: {sigmaMax?: number, sigmaMin?: number, rho?: number},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -434,6 +435,13 @@ export async function foldAf3(options) {
         // ...handed up the moment it exists, so a caller can cache it before
         // anything downstream has had a chance to fail. See fold.js.
         options.onTrunk?.(detail.reusable);
+        // 🔴 AND THE CONTACT MAP, WHICH IS READY BEFORE THE FIRST DENOISER
+        // CALL. It used to reach the page only in the replay after the whole
+        // fold, which is minutes late for something the trunk already knows -
+        // the sampler has not run yet at this point.
+        if (detail.trunk?.contactProbs !== undefined) {
+          options.onContacts?.(detail.trunk.contactProbs);
+        }
       }
       if (name === "trunk-done" && liveConfidence === null) {
         // ...best effort, for the reason the finished-frame path gives: this is

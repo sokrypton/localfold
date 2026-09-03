@@ -970,6 +970,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
 
   const api = window.py2Dmol;
   let pending = Promise.resolve();
+  let liveContacts;
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
@@ -985,11 +986,25 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     seed: randomSeed(),
     onStatus: (text) => { if (!signal.aborted) status(text); },
     onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
+    // 🔴 THE CONTACT MAP ARRIVES BEFORE THE FIRST FRAME DOES, so it is held
+    // until there is something to hang it on. The trunk knows it before the
+    // sampler runs; the viewer has no object until the first denoiser call
+    // lands, and the heatmap panel is driven by an object's frames.
+    onContacts: (contactProbs) => { liveContacts = contactMapFor(contactProbs); },
     onFrame: (pdb, index) => {
       if (signal.aborted) return;
       if (index === 0) {
         pending = loadIntoViewer({ stem, pdb, scores: { sequence: chains.join("") }, length: residues })
-          .then(() => { orientBestView(); forcePlddtColours(); });
+          .then(() => {
+            orientBestView();
+            forcePlddtColours();
+            // ...on frame 0, which every later frame resolves back to.
+            const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
+            if (frame !== undefined && liveContacts !== undefined) {
+              frame.maps = { ...frame.maps, contact: liveContacts };
+              viewer?.render("af3-contacts");
+            }
+          });
         return;
       }
       if (viewer === undefined || viewerObject === undefined) return;

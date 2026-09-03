@@ -6,16 +6,14 @@ describe("DEFAULT_MANIFEST", () => {
     expect(DEFAULT_MANIFEST.formatVersion).toBe(1);
     expect(DEFAULT_MANIFEST.model.name).toBe("model_1");
     expect(DEFAULT_MANIFEST.bundle.model).toBe("model_1_ptm");
-    // 🔴 NINE SHARDS AND 337 TENSORS SINCE THE DISTOGRAM HEAD WAS APPENDED.
-    // tools/add_distogram_head.py adds AlphaFold 2's half_logits weights and
-    // bias in a shard of their own rather than re-sharding the bundle, so the
-    // first eight shards and their digests are byte-identical to what is
-    // published and only the new 33 KB file has to be uploaded.
-    expect(DEFAULT_MANIFEST.bundle.shards).toBe(9);
-    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(337);
+    // 🔴 STILL EIGHT SHARDS. The distogram head is embedded in the manifest
+    // as base64 rather than sharded, so nothing published changes and no
+    // remote has to catch up before the page can use it.
+    expect(DEFAULT_MANIFEST.bundle.shards).toBe(8);
+    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(335);
   });
 
-  it("carries the distogram head, in its own shard", () => {
+  it("carries the distogram head, embedded rather than sharded", () => {
     // 🔴 THE HEAD ALPHAFOLD ALWAYS HAD AND THIS BUNDLE NEVER SHIPPED. Without
     // it there is no contact map for AF2 at all - the confidence heads are
     // pLDDT and PAE only.
@@ -24,20 +22,19 @@ describe("DEFAULT_MANIFEST", () => {
     expect(head.bins).toBe(64);
     expect(head.firstBreak).toBe(2);
     expect(head.lastBreak).toBe(22);
-    const weights = DEFAULT_MANIFEST.tensors[head.parameters.halfLogitsWeights];
-    const bias = DEFAULT_MANIFEST.tensors[head.parameters.halfLogitsBias];
-    expect(weights.shape).toEqual([128, 64]);
-    expect(bias.shape).toEqual([64]);
-    expect(weights.dtype).toBe("float32");
-    expect(bias.dtype).toBe("float32");
-    // Its own shard, so nothing already published moved.
-    expect(weights.file).toBe(bias.file);
-    expect(weights.file === "weights-00.bin").toBe(false);
+    expect(head.weightsShape).toEqual([128, 64]);
+    expect(head.biasShape).toEqual([64]);
+    expect(head.encoding).toBe("base64-float32-le");
+    // 🔴 CARRIED BY THE MANIFEST, NOT BY A SHARD. A shard would have to reach
+    // the pinned remote before the page could load at all - which is exactly
+    // how the first version of this broke every AF2 fold.
+    expect(typeof head.weights).toBe("string");
+    expect(head.weights.length > 40000).toBe(true);
   });
 
-  it("contains all 337 tensor entries with valid shapes and dtypes", () => {
+  it("contains all 335 tensor entries with valid shapes and dtypes", () => {
     const tensorKeys = Object.keys(DEFAULT_MANIFEST.tensors);
-    expect(tensorKeys.length).toBe(337);
+    expect(tensorKeys.length).toBe(335);
 
     const validDtypes = new Set(["int8", "float32", "float16"]);
     for (const [name, tensor] of Object.entries(DEFAULT_MANIFEST.tensors)) {
