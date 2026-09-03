@@ -78,7 +78,11 @@ function pearson(a, b) {
     da += (a[i] - ma) ** 2;
     db += (b[i] - mb) ** 2;
   }
-  return num / Math.sqrt(da * db);
+  // ...zero when either side does not vary at all, which happens on the first
+  // frames where every token's lDDT to the final structure is the same. NaN
+  // there would serialise as null and read as a failure rather than as a
+  // question with no answer.
+  return da === 0 || db === 0 ? 0 : num / Math.sqrt(da * db);
 }
 
 /** Ranks with ties averaged, so Spearman is Pearson on them. */
@@ -92,6 +96,45 @@ function ranks(values) {
     const mean = (index + end) / 2;
     for (let k = index; k <= end; k += 1) out[order[k]] = mean;
     index = end + 1;
+  }
+  return out;
+}
+
+/**
+ * Per-token lDDT of one frame against another structure - the real thing, not
+ * the distogram stand-in.
+ *
+ * 🔴 THIS IS THE TARGET THE STAND-IN SHOULD BE JUDGED AGAINST, and pLDDT is
+ * not. The distogram is FIXED for a fold; only the structure moves. So what a
+ * coloured trajectory shows is how much of the structure has settled, and the
+ * honest reference for a frame is the fold's own final answer - which every
+ * fold has. pLDDT is a different quantity about a different question.
+ */
+function localDistanceDifference(frame, final, tokens, mask) {
+  const thresholds = [0.5, 1, 2, 4];
+  const separation = (beta, i, j) => {
+    let squared = 0;
+    for (let axis = 0; axis < 3; axis += 1) {
+      const delta = beta[i * 3 + axis] - beta[j * 3 + axis];
+      squared += delta * delta;
+    }
+    return Math.sqrt(squared);
+  };
+  const out = new Float64Array(tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    if (mask[i] <= 0) continue;
+    let kept = 0;
+    let considered = 0;
+    for (let j = 0; j < tokens; j += 1) {
+      if (i === j || mask[j] <= 0) continue;
+      const reference = separation(final, i, j);
+      // lDDT's own inclusion rule, on the reference structure.
+      if (reference > 15) continue;
+      const error = Math.abs(separation(frame, i, j) - reference);
+      for (const threshold of thresholds) if (error < threshold) kept += 1;
+      considered += thresholds.length;
+    }
+    out[i] = considered === 0 ? 0 : (kept / considered) * 100;
   }
   return out;
 }
@@ -163,6 +206,23 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
     // ...and the same trajectory on the fold's own pLDDT scale, anchored to the
     // final frame. The last entry must equal realMean by construction, which is
     // the check that the calibration is doing what it claims.
+    // 🔴 THE MEASUREMENT THAT MATTERS FOR A TRAJECTORY. For every frame, the
+    // stand-in against that frame's real lDDT versus the FINAL structure -
+    // that is, does the colour actually say which parts have settled? The last
+    // frame is excluded: it is the reference, so its lDDT is 100 everywhere and
+    // there is nothing to rank.
+    settling: (() => {
+      const finalBeta = gather(result.positions);
+      return frames.slice(0, -1).map(({ positions }) => {
+        const beta = gather(positions);
+        const truth = pick(localDistanceDifference(beta, finalBeta, tokens, batch.seqMask));
+        const guess = pick(distogramConfidence(table, beta));
+        return {
+          meanLddt: Number((truth.reduce((s, x) => s + x, 0) / truth.length).toFixed(1)),
+          spearman: Number(pearson(ranks(truth), ranks(guess)).toFixed(3)),
+        };
+      });
+    })(),
     calibrated: (() => {
       const map = calibrateToPlddt(approx, realPlddt, batch.seqMask);
       return frames.map(({ positions }) =>

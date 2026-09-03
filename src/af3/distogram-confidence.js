@@ -20,15 +20,32 @@
  * where D is distributed as the trunk's distogram for (i, j) and d_ij is the
  * frame's own distance. It is in [0, 1] and is scaled to pLDDT's 0-100.
  *
- * 🔴 THE CONTACTS THAT PIN IT ARE THE EIGHT SHARPEST LONG-RANGE ONES, AND THAT
- * CHOICE IS MEASURED, NOT REASONED. Averaging over every pair inside 15 A is
- * what lDDT does and it is worse here: the near-sequence neighbours are
- * trivially predicted and identical everywhere, so they dilute the signal.
- * Taking the eight sharpest with |i - j| >= 6 raises the worst-case rank
- * correlation against real pLDDT from 0.62 to 0.66 across three proteins, and
- * costs 8 distances a token instead of L.
+ * 🔴 WHAT IT IS TUNED AGAINST IS SETTLING, NOT pLDDT, AND THE TWO WANT
+ * OPPOSITE SETTINGS. The distogram is FIXED for a fold; only the structure
+ * moves. So what a coloured trajectory shows is how much of the structure has
+ * settled, and the honest reference for a frame is the fold's own final answer
+ * - per-token lDDT against it, which every fold can compute. pLDDT is a
+ * different quantity about a different question, and tuning against it picked
+ * the eight sharpest LONG-RANGE contacts (|i - j| >= 6, tolerance 0.75 A).
+ * Tuning against settling picks the opposite - all pairs from |i - j| >= 1,
+ * tolerance 1 A - because local structure settles first and short-range pairs
+ * are what track it. Across an eight-target panel the change is 0.411 -> 0.440
+ * mean rank correlation with what has actually settled, better on six of the
+ * eight.
  *
- * 🔴 AND TAKING THE BEST-HELD CONTACTS RATHER THAN THE MEAN IS WORSE, which is
+ * 🔴 AND 0.44 IS WHAT IT IS: A ROUGH SIGNAL. On targets that fold it reaches
+ * 0.65 to 0.72; on a GS linker and poly-alanine it is 0.14 to 0.20. The
+ * property that holds everywhere is the GLOBAL one - the mean rises
+ * monotonically and saturates on all eight targets, including the scramble,
+ * the linker and the homopolymer. Use it to show a structure resolving. Do not
+ * invite anyone to read a single residue's colour.
+ *
+ * 🔴 THREE ALTERNATIVES LOST AGAINST THE pLDDT OBJECTIVE and were not re-run
+ * against settling, so they are recorded as leads rather than as settled. The
+ * first is worth re-testing if anyone returns to this; the other two are
+ * unlikely to change sign.
+ *
+ * 🔴 TAKING THE BEST-HELD CONTACTS RATHER THAN THE MEAN IS WORSE, which is
  * the obvious next thing to try. Scoring a token by its single best contact, or
  * the mean of its best three or five, measured 0.58, 0.58 and 0.61 worst-case
  * against the mean's 0.664 - one contact holding up does not mean a position is
@@ -88,10 +105,10 @@
  * many contacts a token is scored on. All four were swept together against real
  * pLDDT on three proteins; see tools/gpu/probe-distogram-confidence.js.
  */
-const TOLERANCE = 0.75;
+const TOLERANCE = 1.0;
 const INCLUSION_RADIUS = 15;
-const MINIMUM_SEPARATION = 6;
-const CONTACTS = 8;
+const MINIMUM_SEPARATION = 1;
+const CONTACTS = 16;
 /** ...relaxed for a chain too short to have long-range contacts at all. */
 const FALLBACK_SEPARATIONS = [6, 3, 1];
 
