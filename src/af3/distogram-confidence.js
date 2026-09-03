@@ -111,27 +111,38 @@ const MINIMUM_SEPARATION = 1;
 const CONTACTS = 16;
 /**
  * How many of the strongest cross-chain contacts the interface score means
- * over, as a fraction of the SMALLER chain's length, and the floor below which
- * that fraction stops being sensible.
+ * over: `k * L^(2/3)` of the SMALLER chain, floored.
  *
  * 🔴 IT SCALES WITH THE SMALLER CHAIN BECAUSE THE INTERFACE DOES. A twenty
  * residue peptide cannot present as many contacts as a ninety residue domain,
- * so a fixed count reaches past the real interface on the small ones and stops
- * short of it on the large. Measured on fifteen two-chain folds with the
- * smaller chain spanning 20 to 93 residues, as the correlation between the
- * estimate's residual error and that length - which is the size bias itself,
- * with the constant offset every version of this has already removed:
+ * so a FIXED count reaches past the real interface on the small complexes and
+ * stops short on the large. Measured on fifteen two-chain folds, as the
+ * correlation between the estimate's residual error and the smaller chain's
+ * length - the size bias itself, with the constant offset every version of this
+ * has already removed:
  *
- *     fixed 64        +0.258        0.5x smaller chain   -0.072
- *     fixed 32        +0.194        1.0x smaller chain   -0.259
+ *     fixed 64   +0.258        0.5 * L        -0.074
+ *     fixed 32   +0.194        1.5 * L^(2/3)  -0.005
  *
- * A fixed count is biased high for the larger complexes; half the smaller
- * chain has no size trend left, and a full chain length over-corrects. It also
- * ranks best of the four against the real ipTM (Spearman 0.875 against 0.846
- * for fixed 64), though that difference alone is inside what fifteen targets
- * can resolve - the flat residual is the reason to prefer it.
+ * 🔴 AND IT IS SUB-LINEAR BECAUSE AN INTERFACE IS A SURFACE. Two large proteins
+ * do not meet over a large fraction of themselves - they touch on a patch. A
+ * globular chain of L residues has a surface going as L^(2/3), and measured
+ * interfaces are famously narrow in range, tens of residues across complexes
+ * that differ in size by an order of magnitude. Linear extrapolates absurdly:
+ * at 500 residues `0.5 * L` asks for 250 contacts and `1.5 * L^(2/3)` for 94,
+ * and at 1000 it is 500 against 150.
+ *
+ * 🔴 THE EXPONENT IS CHOSEN ON THAT ARGUMENT AND NOT ON THE DATA, WHICH CANNOT
+ * SEE IT. The fifteen targets span 20 to 93 residues in the smaller chain - a
+ * factor of 4.6 - and over that range every exponent from 0 to 1 can be made
+ * flat by trading the constant against it: p=0.5 and p=0.67 both reach a bias
+ * of 0.000, and even p=1 reaches -0.008 at k=0.15. Their rank correlations sit
+ * between 0.804 and 0.875, which fifteen targets cannot separate either. What
+ * separates them is where they go OUTSIDE that range, and only one of them is
+ * a statement about interfaces rather than about this panel.
  */
-const INTERFACE_CONTACT_FRACTION = 0.5;
+const INTERFACE_CONTACT_EXPONENT = 2 / 3;
+const INTERFACE_CONTACT_SCALE = 1.5;
 const INTERFACE_CONTACT_FLOOR = 8;
 /**
  * ...relaxed for a chain too short to have contacts at that separation at all.
@@ -451,7 +462,7 @@ export function distogramTmTerm(table, pseudoBeta, d0) {
  * @param {Float32Array} seqMask  tokens
  * @param {number} tokens
  * @param {number} [count]  how many of the strongest to mean over; by default
- *   half the smaller chain's length, floored at 8
+ *   `1.5 * L^(2/3)` of the smaller chain, floored at 8
  * @returns {number} 0 to 1, or NaN when there is no interface to score
  */
 export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens, count) {
@@ -466,8 +477,8 @@ export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens,
     }
   }
   const smallest = sizes.size === 0 ? 0 : Math.min(...sizes.values());
-  const wanted = count ?? Math.max(
-    INTERFACE_CONTACT_FLOOR, Math.round(INTERFACE_CONTACT_FRACTION * smallest));
+  const wanted = count ?? Math.max(INTERFACE_CONTACT_FLOOR, Math.round(
+    INTERFACE_CONTACT_SCALE * smallest ** INTERFACE_CONTACT_EXPONENT));
   // ...NaN rather than zero for a single chain, as ipTM itself reports: there
   // is no interface to score, which is not the same as a bad one.
   if (cross.length === 0) return Number.NaN;

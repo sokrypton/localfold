@@ -163,6 +163,41 @@ describe("distogram interface contact", () => {
     assert.ok(everything < 0.1, `mean over all was ${everything}`);
   });
 
+  it("grows the count SUB-linearly, because an interface is a surface", () => {
+    // 🔴 THE REASON THE RULE IS NOT LINEAR. Two large chains meet on a patch,
+    // not over a fixed fraction of themselves - a globular chain's surface goes
+    // as L^(2/3) - so doubling both chains must NOT double the count.
+    //
+    // The count is read back rather than asserted as a number: with FEWER real
+    // contacts than the rule takes, the score is exactly
+    // realContacts / count, so realContacts / score is the count. That only
+    // works while `real` stays under the count, which is why it is small.
+    const countTaken = (length, real) => {
+      const n = 2 * length;
+      const asym = Int32Array.from({ length: n }, (_, i) => (i < length ? 0 : 1));
+      const live = new Float32Array(n).fill(1);
+      const probs = new Float32Array(n * n);
+      let placed = 0;
+      for (let i = 0; i < length && placed < real; i += 1) {
+        for (let j = length; j < n && placed < real; j += 1) {
+          probs[i * n + j] = 1;
+          placed += 1;
+        }
+      }
+      return real / distogramInterfaceContact(probs, asym, live, n);
+    };
+    const small = countTaken(64, 10);
+    const large = countTaken(256, 10);
+    // Four times the chain gives more contacts...
+    assert.ok(large > small, `${large} was not more than ${small}`);
+    // ...but nothing like four times as many, which linear would demand. At
+    // L^(2/3) the factor is 4^(2/3) = 2.52.
+    assert.ok(large < 4 * small * 0.8,
+      `${large} is too close to the linear ${4 * small}`);
+    assert.ok(Math.abs(large / small - Math.pow(4, 2 / 3)) < 0.15,
+      `growth was ${(large / small).toFixed(2)}x, not the surface's 2.52x`);
+  });
+
   it("counts a fraction of the SMALLER chain, not a fixed number", () => {
     // 🔴 THE HYPOTHESIS THIS RULE EXISTS FOR. A short chain cannot present as
     // many interface contacts as a long one, so a fixed count reaches past the
@@ -184,14 +219,14 @@ describe("distogram interface contact", () => {
       }
       return { probs, asym, live, n };
     };
-    // 20 by 90: half of 20 is 10 contacts. Twenty ones means all ten are 1.
+    // 20 by 90 takes eleven contacts, so twenty ones cover all of them.
     const small = build(20, 90, 20);
     assert.equal(distogramInterfaceContact(small.probs, small.asym, small.live, small.n), 1);
-    // 90 by 90: half of 90 is 45. Twenty ones over 45 taken is well under 1,
-    // which a fixed count of 10 would have reported as a perfect interface.
+    // 90 by 90 takes thirty, so the SAME twenty real contacts no longer fill
+    // it - which the smaller complex's count would have called perfect.
     const big = build(90, 90, 20);
     const score = distogramInterfaceContact(big.probs, big.asym, big.live, big.n);
-    assert.ok(Math.abs(score - 20 / 45) < 1e-6, `scored ${score}`);
+    assert.ok(Math.abs(score - 20 / 30) < 1e-6, `scored ${score}`);
   });
 
   it("floors the count, so a tiny chain still averages something", () => {
