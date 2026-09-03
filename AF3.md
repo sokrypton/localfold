@@ -389,8 +389,18 @@ unexplained. That is the next lead and it is a small one.
   widening it is a change to all three models rather than to AF3's path.
 - **No ipTM**, which is what a complex is actually judged by. The confidence
   head emits PAE and PDE; pTM and ipTM are not implemented.
-- **Per-atom conditioning is still on the CPU** - a real gap against AGENTS.md,
-  now a few hundred ms rather than five seconds. It has no kernel.
+- **Per-atom conditioning is still on the CPU**, but it is no longer a few
+  hundred milliseconds and most of it never needed a kernel. Two of its five
+  embeddings multiplied by a materialised ONE-HOT - the element, 128 columns
+  indexed by atomic number, and the atom name, four 64-way one-hots flattened
+  to 256 - which is 384 of its 389 input columns, so 99% of its arithmetic was
+  multiplying by zero. As gathers: **72.5 -> 3.7 ms at 59 tokens, 219.8 -> 9.2
+  at 150, 343 -> 14.6 at 300**, bitwise identical, and
+  test/af3-atom-conditioning.test.js holds it to the matmul form's exact
+  floats. Both the summation ORDER and the float64 accumulation are load-
+  bearing there; getting either wrong moved 1e-7 through a reference the GPU
+  checkers compare against at 1e-6, which is a tolerance nobody chose. What is
+  left is ~4 ms of genuine dense work and is no longer worth a kernel.
 - **Templates raise** rather than compute: the geometry features are
   unverifiable without a reference.
 - **AF3's block is still 1.09x AF2's** for strictly less work.
