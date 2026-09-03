@@ -206,6 +206,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // not what d0 is.
   const tmPerBin = tmPerBinFor(centres, tmScoreD0(tokens));
   const tmList = Array.from(tmPerBin, (value) => value.toString()).join(", ");
+  // 🔴 IT RECOMPUTED THE LAYERNORM FOR EVERY BIN, 192 TIMES A ROW. `half_logit`
+  // took a (row, bin) and derived the row's mean, its variance and its whole
+  // normalised activation before projecting ONE bin out of it - and it was
+  // called three times per bin (the PDE's two halves and the PAE) across
+  // sixty-four bins. That is three normalisations' worth of work done 64 times
+  // each: about 246,000 operations a row where 70,000 would do, all of it on a
+  // SINGLE thread, because the kernel gave one invocation the whole row.
+  //
+  // It is now shaped like `singleHeads` below, which had it right: a workgroup
+  // a row, the reductions cooperative, the three normalised rows staged once,
+  // and a lane to a bin. 33.6 -> a fraction of it, and the arithmetic is the
+  // same arithmetic - each half still accumulates its own sum over channels in
+  // the same order, and the two are added at the end as they were.
   const pairHeads = `${common}
 const CENTRES = array<f32, ${NUM_BINS}>(${centreList});
 const TM_PER_BIN = array<f32, ${NUM_BINS}>(${tmList});
@@ -227,78 +240,125 @@ const W_PAE: u32 = ${headOffsets.paeLogits}u;
 // reduce to is tokens^2, which is 64x smaller and is all either score wants.
 @group(0) @binding(5) var<storage, read_write> tm_adjusted: array<f32>;
 
-fn half_logit(row: u32, bin: u32, scale: u32, offset: u32, projection: u32) -> f32 {
-  let base = row * C_Z;
+// The row's normalised activations, staged once: the PDE's own normalisation of
+// this row and of its transpose, and the PAE's of this row.
+var<workgroup> norm_row: array<f32, ${pairChannels}>;
+var<workgroup> norm_transposed: array<f32, ${pairChannels}>;
+var<workgroup> norm_pae: array<f32, ${pairChannels}>;
+var<workgroup> distance: array<f32, ${NUM_BINS}>;
+var<workgroup> aligned: array<f32, ${NUM_BINS}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+/** Mean and inverse standard deviation of one pair row, cooperatively. */
+fn row_statistics(base: u32, local: u32) -> vec2<f32> {
   var total = 0.0;
   var squares = 0.0;
-  for (var c = 0u; c < C_Z; c += 1u) {
+  for (var c = local; c < C_Z; c += 64u) {
     let value = pair[base + c];
     total += value;
     squares += value * value;
   }
-  let mean = total / f32(C_Z);
-  ${varianceCode("C_Z", "pair[base + c]")}
-  let inverse_std = inverseSqrt(variance + EPSILON);
-  var logit = 0.0;
-  for (var c = 0u; c < C_Z; c += 1u) {
-    let normalized = (pair[base + c] - mean) * inverse_std * weights[scale + c]
-      + weights[offset + c];
-    logit += normalized * weights[projection + c * BINS + bin];
+  reduce_a[local] = total;
+  reduce_b[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
   }
-  return logit;
-}
-
-fn expectation(values: ptr<function, array<f32, ${NUM_BINS}>>) -> f32 {
-  var largest = -3.0e38;
-  for (var b = 0u; b < BINS; b += 1u) { largest = max(largest, (*values)[b]); }
-  var total = 0.0;
-  var weighted = 0.0;
-  for (var b = 0u; b < BINS; b += 1u) {
-    let probability = exp((*values)[b] - largest);
-    total += probability;
-    weighted += probability * CENTRES[b];
-  }
-  return weighted / total;
+  let mean = reduce_a[0] / f32(C_Z);
+  let variance = reduce_b[0] / f32(C_Z) - mean * mean;
+  // 🔴 A BARRIER BEFORE THE CALLER REUSES THE REDUCTION BUFFER, for the reason
+  // singleHeads gives: every lane has just read slot 0, and a fast one writing
+  // it again while a slow one still reads gives a wrong mean in some rows some
+  // of the time.
+  workgroupBarrier();
+  return vec2<f32>(mean, inverseSqrt(variance + EPSILON));
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
   if (row >= PAIRS) { return; }
   let i = row / TOKENS;
   let j = row % TOKENS;
   let transposed = j * TOKENS + i;
+  let local = local_id.x;
 
-  // PDE: symmetrised by adding the transpose of the SAME projection.
-  var distance: array<f32, ${NUM_BINS}>;
-  for (var b = 0u; b < BINS; b += 1u) {
-    distance[b] = half_logit(row, b, W_LN_SCALE, W_LN_OFFSET, W_HALF)
-      + half_logit(transposed, b, W_LN_SCALE, W_LN_OFFSET, W_HALF);
+  let own = row_statistics(row * C_Z, local);
+  let other = row_statistics(transposed * C_Z, local);
+  for (var c = local; c < C_Z; c += 64u) {
+    let centred = (pair[row * C_Z + c] - own.x) * own.y;
+    norm_row[c] = centred * weights[W_LN_SCALE + c] + weights[W_LN_OFFSET + c];
+    norm_transposed[c] = (pair[transposed * C_Z + c] - other.x) * other.y
+      * weights[W_LN_SCALE + c] + weights[W_LN_OFFSET + c];
+    // ...the PAE normalises the SAME row with its own scale and offset, so the
+    // centred value is shared and only the affine part differs.
+    norm_pae[c] = centred * weights[W_PAE_SCALE + c] + weights[W_PAE_OFFSET + c];
   }
-  pde[row] = pair_mask[row] * expectation(&distance);
+  workgroupBarrier();
 
-  // PAE: directional, NOT symmetrised.
-  var aligned: array<f32, ${NUM_BINS}>;
-  for (var b = 0u; b < BINS; b += 1u) {
-    aligned[b] = half_logit(row, b, W_PAE_SCALE, W_PAE_OFFSET, W_PAE);
+  // A lane to a bin. The two halves of the PDE keep their own sums and are
+  // added at the end, which is the order half_logit produced them in.
+  for (var b = local; b < BINS; b += 64u) {
+    var half_own = 0.0;
+    var half_other = 0.0;
+    var pae_total = 0.0;
+    for (var c = 0u; c < C_Z; c += 1u) {
+      let half_weight = weights[W_HALF + c * BINS + b];
+      half_own += norm_row[c] * half_weight;
+      half_other += norm_transposed[c] * half_weight;
+      pae_total += norm_pae[c] * weights[W_PAE + c * BINS + b];
+    }
+    distance[b] = half_own + half_other;
+    aligned[b] = pae_total;
   }
-  pae[row] = pair_mask[row] * expectation(&aligned);
+  workgroupBarrier();
 
-  // 🔴 UNMASKED, because the reduction masks. Multiplying by pair_mask here
-  // would fold masked pairs into the row mean as zeros rather than leaving them
-  // out of it, which quietly lowers every score on a padded input.
-  var tm_term = 0.0;
-  var tm_largest = -3.0e38;
-  for (var b = 0u; b < BINS; b += 1u) { tm_largest = max(tm_largest, aligned[b]); }
-  var tm_total = 0.0;
-  for (var b = 0u; b < BINS; b += 1u) { tm_total += exp(aligned[b] - tm_largest); }
-  for (var b = 0u; b < BINS; b += 1u) {
-    tm_term += (exp(aligned[b] - tm_largest) / tm_total) * TM_PER_BIN[b];
+  // 🔴 THE THREE EXPECTATIONS ARE COMPUTED ON ONE LANE, DELIBERATELY. They are
+  // sixty-four values each and the reduction that would parallelise them costs
+  // more barriers than the arithmetic is worth - but more than that, doing them
+  // serially keeps the summation order the CPU reference uses, and this head's
+  // checker compares against it at 1e-6 with a rounding envelope a fifth of
+  // that.
+  if (local == 0u) {
+    var largest = -3.0e38;
+    for (var b = 0u; b < BINS; b += 1u) { largest = max(largest, distance[b]); }
+    var total = 0.0;
+    var weighted = 0.0;
+    for (var b = 0u; b < BINS; b += 1u) {
+      let probability = exp(distance[b] - largest);
+      total += probability;
+      weighted += probability * CENTRES[b];
+    }
+    pde[row] = pair_mask[row] * (weighted / total);
+
+    var pae_largest = -3.0e38;
+    for (var b = 0u; b < BINS; b += 1u) { pae_largest = max(pae_largest, aligned[b]); }
+    var pae_sum = 0.0;
+    var pae_weighted = 0.0;
+    for (var b = 0u; b < BINS; b += 1u) {
+      let probability = exp(aligned[b] - pae_largest);
+      pae_sum += probability;
+      pae_weighted += probability * CENTRES[b];
+    }
+    pae[row] = pair_mask[row] * (pae_weighted / pae_sum);
+
+    // 🔴 UNMASKED, because the reduction masks. Multiplying by pair_mask here
+    // would fold masked pairs into the row mean as zeros rather than leaving
+    // them out of it, which quietly lowers every score on a padded input.
+    var tm_term = 0.0;
+    for (var b = 0u; b < BINS; b += 1u) {
+      tm_term += (exp(aligned[b] - pae_largest) / pae_sum) * TM_PER_BIN[b];
+    }
+    tm_adjusted[row] = tm_term;
   }
-  tm_adjusted[row] = tm_term;
 }`;
 
-  // pLDDT and the resolved logits, both per atom slot.
   const singleHeads = `${common}
 const PLDDT_CENTRES = array<f32, ${PLDDT_BINS}>(${plddtCentres.join(", ")});
 const W_PLDDT_SCALE: u32 = ${headOffsets.plddtLnScale}u;
@@ -552,9 +612,13 @@ export class Af3ConfidenceHeadGpu {
         pass.dispatchWorkgroups(x, y);
         pass.end();
       };
-      const groups = Math.ceil(pairs / 64);
+      // ...ONE WORKGROUP A PAIR ROW, not one thread. The kernel gave a single
+      // invocation the whole row and re-derived its LayerNorm for every bin;
+      // it now stages the row once and gives a lane to each bin, so the
+      // dispatch counts rows. Folded through x and y as every pair grid here
+      // is - 300 tokens is 90,000 of them.
       run("pair-heads", compiled.pairHeads, [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted],
-          Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
+          Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
       for (const { allocation, source, bytes } of Object.values(readbacks)) {
         encoder.copyBufferToBuffer(source.buffer, 0, allocation.buffer, 0, bytes);
