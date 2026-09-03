@@ -1005,9 +1005,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   updateScoresCard(result.confidence, `${mode} · ${calls}`);
   progress(null);
   // 🔴 BUILT FROM PARTS, because a ligand-only fold has none of the things this
-  // line used to state unconditionally: no residues, no chains, and no backbone
-  // to measure - `CA-CA NaN Å` was what it printed, which reads as a broken
-  // fold rather than as a fold with no protein in it.
+  // line used to state unconditionally: no residues and no chains. It once
+  // printed `CA-CA NaN Å` for one, which reads as a broken fold rather than as
+  // a fold with no protein in it - that field has since moved to the tools, but
+  // the residue and chain counts have the same problem and this is the fix.
   const what = [];
   if (residues > 0) {
     what.push(`${residues} residues`
@@ -1040,9 +1041,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
   detail.push(`${recycles + 1} pass${recycles === 0 ? "" : "es"}`);
   detail.push(`pLDDT ${result.meanPlddt.toFixed(1)}`);
-  if (Number.isFinite(result.geometry.caca)) {
-    detail.push(`CA-CA ${result.geometry.caca.toFixed(2)} Å`);
-  }
+  // 🔴 THE BACKBONE CA-CA IS STILL MEASURED AND IS NO LONGER SHOWN. It is the
+  // number a wrong sampler cannot fake - AF3.md records a batch with one broken
+  // gather folding 17 A of spaghetti at pLDDT 55 - so `foldBatch` keeps
+  // computing it and every probe that judges a fold still prints it. But "3.81"
+  // means nothing to somebody who wanted a structure, and a status line that
+  // ends in a diagnostic reads as a diagnostic. It belongs to the tools.
   status(`AlphaFold 3 · ${what.join(" + ")} · ${detail.join(" · ")}`);
 }
 
