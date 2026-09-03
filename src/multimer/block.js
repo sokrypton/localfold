@@ -46,6 +46,7 @@ import {
   createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  OPM_PROJECT_OUTPUT_PAIRS,
   opmProjectTileRows,
   opmProjectTileColumns,
   packOuterProductMeanWeights,
@@ -505,8 +506,12 @@ async function encodeOuterProductMean(
     const pairGrid = execution.linearGrid(input.length * input.length * 64);
     execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
       pairGrid[0], pairGrid[1], 1, "opm.contract");
+    // ...its OWN grid, because it carries several pairs a workgroup where the
+    // contraction carries one; they shared `pairGrid` when both were one.
+    const projectOutputGrid = execution.linearGrid(
+      Math.ceil(input.length * input.length / OPM_PROJECT_OUTPUT_PAIRS) * 64);
     execution.dispatch(encoder, projectOutputPipeline, [intermediate, msaMask, weights, params, output],
-      pairGrid[0], pairGrid[1], 1, "opm.project-output");
+      projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
   } else {
     execution.endComputePass(encoder);
     encoder.clearBuffer(output.allocation.buffer);

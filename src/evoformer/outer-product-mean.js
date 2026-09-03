@@ -594,6 +594,30 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 /**
+ * How many pairs one output-projection workgroup carries.
+ *
+ * 🔴 IT EXISTS TO AMORTISE THE WEIGHT READ AND NOTHING ELSE. Every pair
+ * contracts its c_outer^2 cells against the SAME output matrix, so a workgroup
+ * holding P pairs reads that matrix once for all of them - one global read
+ * buying P multiply-adds where it used to buy one. The cost is P * CELLS floats
+ * of workgroup memory, which is occupancy.
+ *
+ * Swept at 512 MSA rows, as this kernel's share of the block, with the
+ * untouched kernels around it matching to 0.1 ms:
+ *
+ *     as it was  3.12      P=1  3.14      P=2  2.22      P=4  3.12
+ *
+ * P=1 is the loop swap alone - cell outside channel, so a staged value serves
+ * both of a lane's channels - and it is worth NOTHING on its own, which is the
+ * measurement that says this kernel was waiting on the weight read and not on
+ * the staged one. P=4 gives it all back: 16 KiB of workgroup memory against
+ * this device's 32 KiB leaves two workgroups a core, and that costs more than
+ * halving the reads buys. The same shape of answer as every other tile in this
+ * repository - see chooseLinearTile, and the attention key chunk.
+ */
+export const OPM_PROJECT_OUTPUT_PAIRS = 2;
+
+/**
  * The output projection, generated for one c_outer.
  *
  * 🔴 IT RECOMPUTED THE DENOMINATOR ONCE PER OUTPUT CHANNEL. The count of
@@ -605,9 +629,35 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * 🔴 AND EVERY THREAD RE-READ THE WHOLE OUTER TENSOR. A pair's c_outer^2 values
  * are the same for all 128 channels; staged in workgroup memory they are one
  * global read each rather than 128, which halves what is left.
+ *
+ * 🔴 WHAT WAS LEFT AFTER BOTH WAS ONE GLOBAL WEIGHT READ PER MULTIPLY-ADD. The
+ * loops ran channel-outside-cell, so a lane re-read all CELLS staged values for
+ * each of its channels, and read `weights[output_weight + cell * c_z + z]` for
+ * every product it formed: one workgroup read, one global read and one
+ * multiply-add, 0.33 useful operations an instruction. At 512 MSA rows it
+ * measured 3.12 ms of a 110 ms block - 296 GFLOP/s, and 69% of this device's
+ * instruction issue, so it was the count and not the bytes.
+ *
+ * Cell is now the OUTER loop, so a staged value is read once for both of a
+ * lane's channels, and a workgroup carries several pairs whose products share
+ * that one weight read. Per cell an invocation issues one staged read, two
+ * weight reads and two vector multiply-adds for 2*P products.
  */
-export function createOuterProductMeanProjectOutputShader(cOuter, residual = false) {
+export function createOuterProductMeanProjectOutputShader(
+  cOuter, residual = false, pairsPerGroup = OPM_PROJECT_OUTPUT_PAIRS,
+) {
   const cells = cOuter * cOuter;
+  const pairs = pairsPerGroup;
+  if (!Number.isSafeInteger(pairs) || pairs < 1 || pairs > 4) {
+    throw new RangeError(`OPM output pairs must be 1..4; got ${pairsPerGroup}`);
+  }
+  // A vector over the pairs a workgroup holds, so one weight read multiplies
+  // into all of them at once.
+  const vector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[pairs];
+  if (vector === undefined) throw new RangeError(`OPM output pairs ${pairs} is not 1, 2 or 4`);
+  const at = (name, p) => (pairs === 1 ? name : `${name}.${"xyzw"[p]}`);
+  const overPairs = (body) => Array.from({ length: pairs }, (_, p) => body(p)).join("\n");
+
   return `${COMMON}
 @group(0) @binding(0) var<storage, read> outer: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
@@ -616,41 +666,62 @@ export function createOuterProductMeanProjectOutputShader(cOuter, residual = fal
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 
 const CELLS: u32 = ${cells}u;
-var<workgroup> staged: array<f32, ${cells}>;
+const PAIRS_PER_GROUP: u32 = ${pairs}u;
+
+// One vector a cell, holding that cell's value for each pair in the group.
+var<workgroup> staged: array<${vector}, ${cells}>;
 var<workgroup> reduce: array<f32, 64>;
+var<workgroup> scales: array<f32, ${pairs}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let pair = group.x + group.y * GRID_WIDTH;
-  if (pair >= p.length * p.length) { return; }
-  let i = pair / p.length;
-  let j = pair % p.length;
+  let total_pairs = p.length * p.length;
+  let first_pair = (group.x + group.y * GRID_WIDTH) * PAIRS_PER_GROUP;
+  if (first_pair >= total_pairs) { return; }
   let local = local_id.x;
 
-  for (var cell = local; cell < CELLS; cell += 64u) {
-    staged[cell] = outer[pair * CELLS + cell];
-  }
-  // ...the denominator, once for the pair rather than once per channel.
-  var count = 0.0;
-  for (var sequence = local; sequence < p.sequences; sequence += 64u) {
-    count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
-  }
-  reduce[local] = count;
-  workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
-    if (local < stride) { reduce[local] += reduce[local + stride]; }
-    workgroupBarrier();
-  }
-  let scale = 1.0 / (p.normalization_epsilon + reduce[0]);
+  // ...a pair past the end is clamped rather than skipped, so every lane
+  // reaches every barrier below; it is dropped at the write.
+${overPairs((n) => `  let pair${n} = min(first_pair + ${n}u, total_pairs - 1u);
+  let live${n} = first_pair + ${n}u < total_pairs;`)}
 
-  for (var z = local; z < p.c_z; z += 64u) {
-    var value = weights[p.output_bias + z];
-    for (var cell = 0u; cell < CELLS; cell += 1u) {
-      // ...read once for the pair, used by every channel.
-      value += staged[cell] * weights[p.output_weight + cell * p.c_z + z];
+  for (var cell = local; cell < CELLS; cell += 64u) {
+    var value = ${vector}(0.0);
+${overPairs((n) => `    ${at("value", n)} = outer[pair${n} * CELLS + cell];`)}
+    staged[cell] = value;
+  }
+  workgroupBarrier();
+
+  // ...the denominator, once for each pair rather than once per channel.
+${overPairs((n) => `  {
+    let i = pair${n} / p.length;
+    let j = pair${n} % p.length;
+    var count = 0.0;
+    for (var sequence = local; sequence < p.sequences; sequence += 64u) {
+      count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
     }
-    output[pair * p.c_z + z] ${residual ? "+=" : "="} value * scale;
+    reduce[local] = count;
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { reduce[local] += reduce[local + stride]; }
+      workgroupBarrier();
+    }
+    if (local == 0u) { scales[${n}u] = 1.0 / (p.normalization_epsilon + reduce[0]); }
+    workgroupBarrier();
+  }`)}
+
+  // 🔴 CELL OUTSIDE CHANNEL. A lane's channels share the staged value, and all
+  // PAIRS_PER_GROUP pairs share the weight read - which is the whole point of
+  // carrying more than one.
+  for (var z = local; z < p.c_z; z += 64u) {
+    var acc = ${vector}(weights[p.output_bias + z]);
+    for (var cell = 0u; cell < CELLS; cell += 1u) {
+      acc += staged[cell] * weights[p.output_weight + cell * p.c_z + z];
+    }
+${overPairs((n) => `    if (live${n}) {
+      output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at("acc", n)} * scales[${n}u];
+    }`)}
   }
 }`;
 }
@@ -753,10 +824,15 @@ export class OuterProductMeanGpu {
         const outerGrid = [Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH)];
         pass(contractPipeline, [left.buffer, right.buffer, params.buffer, intermediate.buffer],
           outerGrid[0], outerGrid[1]);
-        // ...one workgroup per PAIR now; see the note on the kernel.
+        // ...several pairs a workgroup now; see the note on the kernel. This is
+        // the path check-evoformer-opm.js drives, so its grid has to agree with
+        // the block encoders' or the gate would test a dispatch no fold uses.
+        const outputGroups = Math.ceil(pairs / OPM_PROJECT_OUTPUT_PAIRS);
+        const projectOutputGrid = [
+          Math.min(outputGroups, GRID_WIDTH), Math.ceil(outputGroups / GRID_WIDTH)];
         pass(projectOutputPipeline,
           [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],
-          outerGrid[0], outerGrid[1]);
+          projectOutputGrid[0], projectOutputGrid[1]);
       } else {
         encoder.clearBuffer(output.buffer);
         for (let offset = 0; offset < input.sequences; offset += tileCapacity) {

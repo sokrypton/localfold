@@ -183,6 +183,28 @@ export function packTransitionWeights(input) {
  * it was 2.0. tools/gpu/probe-alu.js measures this device at about 640 billion
  * instructions a second whatever their width, so that ratio IS the speed.
  *
+ * 🔴 TWO MORE THINGS WERE TRIED ON IT AND BOTH LOST, which puts this kernel at
+ * its optimum rather than merely un-examined. Measured as the two MSA
+ * transitions of a 512-row block, against 15.70 and 15.62 ms, in runs where the
+ * untouched kernels around them matched to 0.05 ms:
+ *
+ *   - HOISTING THE BIAS AND THE ACTIVATION out of the store. A lane owns
+ *     `rowsPerLane` rows of the same columns, so `weights[bias_offset + column]`
+ *     is read from global memory `rowsPerLane` times over and the activation
+ *     uniform re-tested with it - 32 reads and 32 branches a lane where four
+ *     registers and one branch would do. **16.53 and 16.51**, and 16.61/16.54
+ *     with the bias vector's writes unrolled to rule out a dynamic index. The
+ *     four extra vectors live across the whole k loop and cost more than the
+ *     reads, which are cached and few.
+ *   - UNROLLING THE STAGING LOOPS' vec4 COMPONENT WRITES. `staged[j]` with `j`
+ *     a loop variable is a dynamically indexed vector, which WGSL is entitled
+ *     to put in spillable local memory - the trap src/af3/
+ *     outer-product-mean-webgpu.js documents for accumulator arrays, and these
+ *     sit in the hot k loop. **16.69 and 16.39.** A four-iteration loop over a
+ *     constant bound is not that case: the compiler already unrolls it and
+ *     keeps the vector in registers, and writing it out by hand only loses the
+ *     hoisting it was doing.
+ *
  * 🔴 A LANE'S COLUMNS STAY STRIDED BY `lanesX`, WHICH LOOKS WRONG AND IS NOT.
  * Contiguous columns per lane would make the staged weights one flat vec4 read,
  * but the OUTPUT store then goes out at stride `columnsPerLane` across the
