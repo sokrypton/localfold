@@ -42,8 +42,14 @@ AI Context: STANDALONE WEB APP ENTRY POINT
     </div>
     <!-- End Global Drop Overlay -->
 
-    <!-- Total width (600 + 8 + 340 = 948px) -->
-    <div class="mx-auto" style="width: 948px; position: relative;">
+    <!-- .page-width is the shell: 600 (canvas) + 8 (gap) + 340 (panel). It
+         was written inline on four elements here, and AN INLINE WIDTH IS ONE
+         NO STYLESHEET CAN OVERRIDE - not a media query, not a container
+         query, not any specificity; only `!important`, and a page whose
+         responsive rules all need that has no cascade left. The number lives
+         once in py2Dmol.app.css and its narrow block overrides that one rule
+         instead of four attributes. -->
+    <div class="mx-auto page-width" style="position: relative;">
         <!-- py2Dmol reads this setting during initialization. Keep its fast
              WebGL2 painter enabled without exposing a GPU toggle that could be
              mistaken for LocalFold's WebGPU inference backend. -->
@@ -95,7 +101,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
              aborts the REST of initializeApp. The symptom is not an error; it is
              that the MSA panel never wires itself up. Hidden is safe. Deleted is
              not. Our own ids are distinct from theirs for the same reason. -->
-        <div id="fold-panel" class="container-box" style="width: 948px; margin-bottom: 10px;">
+        <div id="fold-panel" class="container-box page-width" style="margin-bottom: 10px;">
           <div class="fetch-panel">
             <!-- WHAT TO FOLD, AND WHAT TO DO WITH IT, on one line: the box
                  grows, and everything that acts on it stacks to its right.
@@ -108,12 +114,11 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    sequence to write HEM as. The rows are built by
                    web/entity-ui.js; this is only where they go.
 
-                   🔴 NO DNA OR RNA IN THE TYPE MENU. AF3's restype alphabet
-                   has the nucleic acids and DENSE is wide enough for a
-                   nucleotide, but reference-conformers.js holds the 21 amino
-                   acids and nothing else - so a nucleotide has no reference
-                   conformer and no pseudo-beta. An entry for them would fold,
-                   and would look like it had worked. -->
+                   🔴 DNA AND RNA ARE AF3-ONLY, and web/app.js refuses AF2 for
+                   a nucleic chain rather than leaving a fold that looks like it
+                   worked: AF2 has no alphabet for one. The type list is in
+                   web/entities.js. A nucleotide is ONE token per residue,
+                   unlike a ligand or a modified residue. -->
               <div class="entity-list">
                 <div id="entity-rows"></div>
               </div>
@@ -243,7 +248,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
 
           </div>
         </div>
-        <div id="upload-options-container" class="container-box" style="width: 948px; margin-bottom: 10px;">
+        <div id="upload-options-container" class="container-box page-width" style="margin-bottom: 10px;">
 
             <!-- FETCH PANEL. Three lines, and the third is usually not there.
                  It was a two-column table: an ID box and a Load button on the
@@ -412,7 +417,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
             <div id="mainContainer">
 
                 <div id="viewerColumn">
-                    <div id="canvasContainer" class="container-box">
+                    <!-- data-autosize="css": THE STYLESHEET OWNS THIS BOX, so
+                         py2Dmol's setupViewport writes no inline width and a
+                         media query can reach it. Without it every rule aimed
+                         at this box loses to an attribute set at load, and the
+                         failure reads as a media query that is not matching. -->
+                    <div id="canvasContainer" class="container-box" data-autosize="css">
                         <canvas id="canvas"></canvas>
                         <!-- Resize handle -->
                         <div class="resize-handle"></div>
@@ -739,8 +749,8 @@ AI Context: STANDALONE WEB APP ENTRY POINT
         </div>
 
         <!-- Sequence container with box and toggle -->
-        <div id="sequence-viewer-container" class="container-box sequence-section-container"
-            style="width: 948px; display: none;">
+        <div id="sequence-viewer-container" class="container-box sequence-section-container page-width"
+            style="display: none;">
             <div id="sequenceHeader" class="sequence-header">
                 <!-- Left side: Mode dropdown -->
                 <div style="display: flex; align-items: center; gap: 8px;">
@@ -824,22 +834,23 @@ AI Context: STANDALONE WEB APP ENTRY POINT
 
                 <!-- Right: Filters box and Chain selector -->
                 <div style="display: flex; align-items: center; gap: 8px; margin-left: auto;">
-                    <div
+                    <!-- .msa-filters so the narrow block can reach this row: two 100px
+                         sliders, two labels, two readouts and a count come to a
+                         min-content of 521px, which is wider than any phone. -->
+                    <div class="msa-filters"
                         style="display: flex; align-items: center; gap: 10px; padding: 4px 10px; border: 1px solid #ccc; border-radius: 4px; background: #f9f9f9;">
                         <span style="font-size: 12px; color: #666; font-weight: 500;">Filters:</span>
                         <div style="display: flex; align-items: center; gap: 4px;">
                             <label for="coverageSlider"
                                 style="font-size: 11px; color: #666; white-space: nowrap;">cov:</label>
-                            <input type="range" id="coverageSlider" min="0" max="100" value="75" step="5"
-                                style="width: 100px;">
+                            <input type="range" id="coverageSlider" min="0" max="100" value="75" step="5">
                             <span id="coverageValue"
                                 style="font-size: 11px; color: #666; width: 40px; text-align: right; display: inline-block;">75%</span>
                         </div>
                         <div style="display: flex; align-items: center; gap: 4px;">
                             <label for="identitySlider"
                                 style="font-size: 11px; color: #666; white-space: nowrap;">qid:</label>
-                            <input type="range" id="identitySlider" min="0" max="100" value="15" step="5"
-                                style="width: 100px;">
+                            <input type="range" id="identitySlider" min="0" max="100" value="15" step="5">
                             <span id="identityValue"
                                 style="font-size: 11px; color: #666; width: 40px; text-align: right; display: inline-block;">15%</span>
                         </div>
@@ -857,9 +868,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
 
     <!-- Footer -->
     <footer style="margin-top: var(--container-gap); padding: 0; color: #6b7280; font-size: 11px;">
-        <div
-            style="width: 948px; margin: 0 auto; padding: 8px 0 0 0; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; align-items: center; gap: 16px;">
-            <div style="flex: 1 1 auto; display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+        <div class="page-width"
+            style="margin: 0 auto; padding: 8px 0 0 0; border-top: 1px solid #e5e7eb; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 16px;">
+            <!-- WRAPS RATHER THAN ELLIPSISES. One unbroken line with the overflow
+                 hidden is a footer that reads "LocalFold · forks alphafold2-web…" on a
+                 phone and hides the link to the single-sequence page entirely; at
+                 948 it is one line either way. -->
+            <div id="footer-links" style="flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px;">
                 <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;"><i class="fab fa-github" style="margin-right: 5px;"></i>LocalFold</a>
                 <span style="color: #d1d5db;">·</span>
                 forks <a href="https://github.com/martin-steinegger/alphafold2-webgpu" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">alphafold2-webgpu</a>
@@ -873,7 +888,11 @@ AI Context: STANDALONE WEB APP ENTRY POINT
             <!-- 🔴 TRACKS THE ALIGNMENT MODE. It read "No data is uploaded to a
                  server", which stopped being true when remote MSA search became
                  the default. web/app.js rewrites it from syncMode(). -->
-            <div id="privacy-note" style="flex: 0 0 auto; white-space: nowrap;"></div>
+            <!-- `flex: 0 0 auto` and one unbroken line is 300px of text that refuses
+                 to shrink, which is most of a phone. Wrapping cannot help an item
+                 wider than the line - it needs permission to shrink so the text
+                 wraps INSIDE it. -->
+            <div id="privacy-note" style="flex: 0 1 auto; min-width: 0;"></div>
         </div>
     </footer>
 

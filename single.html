@@ -9,26 +9,37 @@
         crossorigin="anonymous" referrerpolicy="no-referrer" />
     <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
     <link rel="stylesheet" href="./web/localfold.css">
+    <!-- 🔴 THIS BLOCK WAS THREE `!important`s AND IS THE SHAPE OF THE PROBLEM.
+         py2Dmol's embed writes the viewer box's width inline, so the only way
+         to state a width here was to out-rank an inline style - and a rule that
+         needs `!important` to be believed is one no media query can undo
+         either. `max-width` is a DIFFERENT PROPERTY from `width`: it constrains
+         the used width whatever the inline value says, with no `!important` and
+         nothing for the narrow layout to fight. -->
     <style>
         #canvasContainer {
             width: 948px !important;
+            max-width: 100%;
             min-height: 480px !important;
             resize: none !important;
         }
+        #canvasContainer > #viewer { max-width: 100%; overflow-x: auto; }
     </style>
 </head>
 
 <body class="bg-gray-50 text-gray-800 font-sans p-4">
 
-    <!-- Total width: 948px -->
-    <div id="viewer-root" class="mx-auto" style="width: 948px; position: relative;">
+    <!-- .page-width is the shell, and it is a CLASS so that py2Dmol.app.css's
+         narrow block can make it fluid - see the banner there. It was an
+         inline width, which no media query can reach. -->
+    <div id="viewer-root" class="mx-auto page-width" style="position: relative;">
 
         <div class="page-head" style="padding-right: 0;">
             <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">single sequence</span></h1>
         </div>
 
         <!-- Fold Input Panel -->
-        <div id="fold-panel" class="container-box" style="width: 948px; margin-bottom: 10px;">
+        <div id="fold-panel" class="container-box page-width" style="margin-bottom: 10px;">
             <div class="fetch-panel">
                 <div class="fetch-row" id="fold-input-container">
                     <textarea id="sequence" rows="2" spellcheck="false" aria-label="Protein sequence"
@@ -60,7 +71,7 @@
         </div>
 
         <!-- Main Viewer Area (948px) -->
-        <div id="mainContainer" style="width: 948px; display: flex; flex-direction: column; gap: 8px;">
+        <div id="mainContainer" class="page-width" style="display: flex; flex-direction: column; gap: 8px;">
 
             <!-- 3D Structure Viewer -->
             <div id="canvasContainer" class="container-box" style="position: relative; width: 948px; min-height: 480px; padding: 0; overflow: hidden; background: #ffffff; border-radius: 8px;">
@@ -76,11 +87,11 @@
         </div>
 
         <!-- Mutation host: full-width panel below main container -->
-        <div id="mutate-host" style="width: 948px; margin-top: 8px;"></div>
+        <div id="mutate-host" class="page-width" style="margin-top: 8px;"></div>
 
         <!-- Footer -->
-        <footer style="margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; align-items: center;">
-            <div style="display: flex; gap: 12px;">
+        <footer style="margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #64748b; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 12px;">
+            <div style="display: flex; flex-wrap: wrap; gap: 4px 12px;">
                 <a href="./" style="color: #3b82f6; text-decoration: none; font-weight: 500;">Full version with MSA</a>
                 <span>·</span>
                 <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Source</a>

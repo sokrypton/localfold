@@ -47,8 +47,45 @@ values means the whole-stack checker, not that file.
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
 | Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
+| Does the page fit a phone? | `python3 tools/mobile-layout.py` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **THE PHONE LAYOUT IS MEASURED, NOT LOOKED AT, AND `--window-size` CLAMPS AT
+500px.** 390 and 320 both report an innerWidth of 500; `--headless=old` clamps
+identically. `tools/cdp.py` is sixty lines of WebSocket (no new dependency) and
+gives `Emulation.setDeviceMetricsOverride`, which is a true viewport at any
+width, plus `Page.captureScreenshot`, which `--screenshot` cannot do on a page
+with a running rAF loop. `tools/mobile-layout.py` runs 320, 360 and 390 with
+1200 as the control, loading a structure and an alignment first - half the rows
+it measures are `display: none` on a bare page. It checks `single.html` too.
+
+🔴 **AND "NO HORIZONTAL OVERFLOW" IS NOT THE TEST.** Under mobile emulation a
+page that cannot fit does not overflow: the LAYOUT VIEWPORT GROWS, so
+`scrollWidth == innerWidth` while the phone renders everything zoomed out. The
+assertion is `innerWidth == the width asked for`. Nor can a size check see an
+OVERLAP, or a `1fr` grid track squeezed to nothing - the entity row's sequence
+box measured 0px at 320 with "PIA" set one letter per line, and every fit check
+passed. Nor can it see a page that is ready to be measured: `processFiles` is
+defined while `initializeApp` is still running and before `web/app.js` (a
+module) has run at all, and called in that window it resolves having loaded
+NOTHING. Wait for `#predict` to be enabled, which is the last thing to happen.
+
+🔴 **AN INLINE WIDTH IS ONE NO STYLESHEET CAN OVERRIDE.** Not a media query, not
+a container query, not any specificity - only `!important`, and a page whose
+responsive rules all need that has no cascade left. There were four in
+`index.html`, five in `single.html`, two on the MSA filter sliders, and one that
+py2Dmol's own JS writes on the viewer box (turned off with
+`data-autosize="css"` on `#canvasContainer`). `max-width` is a DIFFERENT
+PROPERTY and beats an inline `width` with no `!important` at all, which is how
+the MSA panel is contained and how `single.html` lost three of its own.
+
+🔴 **AND py2Dmol's MSA PANEL IS STILL 948px.** `src/panels/msa.js` has
+`const MIN_CANVAS_WIDTH = 948`, clamps every canvas width up to it and writes
+the result as `container.style.width`. Our narrow block gives that box
+`max-width: 100%; overflow-x: auto`, so it scrolls sideways inside its own card
+instead of taking the whole document with it - measured, it was forcing a 972px
+layout viewport on a 320px phone. Fixing it properly is an upstream change.
 
 🔴 **AF2's KERNELS NOW HAVE FOUR DIFFERENTIAL GATES, BECAUSE IT HAD NONE.**
 `npm run test:gpu` cannot load Dawn here and `test/fixtures/evoformer/` is
