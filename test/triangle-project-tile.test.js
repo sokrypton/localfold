@@ -60,8 +60,12 @@ describe("triangle projection tile", () => {
     const tile = { rows: 32, columns: 16 };
     const plain = build(tile).projectOutput;
     const residual = build(tile, true).projectOutput;
-    expect(plain).toContain("output[row * CZ + out_channel] = projected[at]");
-    expect(residual).toContain("output[row * CZ + out_channel] += projected[at]");
+    // ...matched on the store's OPERATOR and its target, which is what this
+    // test is about; the expression on the right has been rewritten once
+    // already (`projected[at] * logistic(gated[at])` became one vec2
+    // accumulator) and broke this assertion without breaking the kernel.
+    expect(plain).toContain("output[row * CZ + out_channel] = cell.x");
+    expect(residual).toContain("output[row * CZ + out_channel] += cell.x");
   });
 
   it("changes nothing else between the two forms", () => {
