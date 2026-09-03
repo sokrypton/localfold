@@ -59,6 +59,7 @@ values means the whole-stack checker, not that file.
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
 | Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |
+| Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 

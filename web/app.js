@@ -491,6 +491,37 @@ setInterval(() => {
   } catch (e) {}
 }, 50);
 
+/**
+ * The trunk's contact map, as the heatmap panel's byte format.
+ *
+ * 🔴 IT IS A RESHAPE, NOT A COMPUTATION. The distogram head already sums its
+ * bins up to 8 A into P(d <= 8 A) for every pair and the result is already read
+ * back to the host, so this costs one pass over tokens^2 bytes and no GPU work
+ * at all.
+ *
+ * 🔴 AND IT NEEDS NO COLOURS OR BOUNDS FROM HERE. `contact` is a scale the
+ * panel knows - 0 to 1, white to a dark blue - and a map that states its own
+ * would override exactly the thing that makes it read correctly: white is zero
+ * and the ink is the signal, which is the opposite of PAE's reading. `vmin`
+ * and `vmax` are given because the BYTES are encoded against them and a map
+ * that does not say so is trusting two tables to agree.
+ *
+ * 🔴 IT GOES ON FRAME 0, NOT THE LAST ONE. The panel resolves each map by
+ * searching BACKWARD from the frame being drawn, and the contact map is a
+ * property of the trunk rather than of any sampler step - fixed for the whole
+ * fold - so one copy at the start is on screen for every frame. The PAE stays
+ * where it is, on the final frame, because it only exists there.
+ */
+function contactMapFor(contactProbs) {
+  const n = Math.round(Math.sqrt(contactProbs.length));
+  if (n * n !== contactProbs.length) return undefined;
+  const data = new Uint8Array(n * n);
+  for (let index = 0; index < data.length; index += 1) {
+    data[index] = Math.max(0, Math.min(255, Math.round(contactProbs[index] * 255)));
+  }
+  return { data, n, vmin: 0, vmax: 1 };
+}
+
 function updateScoresCard(confidence) {
   const box = document.getElementById("predictionScoresBox");
   if (!box) return;
@@ -1003,6 +1034,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
       };
+      // ...and the trunk's contact map, which every frame then resolves to.
+      const contact = result.contactProbs === undefined
+        ? undefined : contactMapFor(result.contactProbs);
+      if (contact !== undefined) first.maps = { ...first.maps, contact };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);

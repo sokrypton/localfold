@@ -112,7 +112,7 @@
 
 .py2dmol-viewer-instance #canvasContainer.container-box,
 .py2dmol-viewer-instance #scatterContainer.container-box,
-.py2dmol-viewer-instance #paeContainer.container-box {
+.py2dmol-viewer-instance #heatmapContainer.container-box {
     padding: 0;
 }
 
@@ -983,7 +983,7 @@
 /* ============================================================================
    PAE CONTAINER
    ============================================================================ */
-.py2dmol-viewer-instance #paeContainer {
+.py2dmol-viewer-instance #heatmapContainer {
     display: none;
     width: 340px;
     aspect-ratio: 1;
@@ -992,13 +992,13 @@
     flex-shrink: 0;
 }
 
-.py2dmol-viewer-instance #paeContainer.container-box {
+.py2dmol-viewer-instance #heatmapContainer.container-box {
     /* Inherits all container-box styles */
     padding: 0;
     /* PAE canvas needs no padding */
 }
 
-.py2dmol-viewer-instance #paeCanvas {
+.py2dmol-viewer-instance #heatmapCanvas {
     width: 100%;
     height: 100%;
     display: block;

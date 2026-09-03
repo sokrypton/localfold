@@ -624,6 +624,12 @@ export async function foldAf3(options) {
     // Handed back so the caller can re-sample without the trunk. See foldBatch.
     reusable: result.reusable,
     depth: rows.depth,
+    // 🔴 THE TRUNK'S OWN CONTACT MAP, WHICH COSTS NOTHING TO HAND OVER. The
+    // distogram head already computes P(d <= 8 A) for every pair and it is
+    // already read back to the host - so the heatmap panel's `contact` map is
+    // a reshape, not a computation, and unlike the PAE it exists the moment
+    // the trunk does rather than after the confidence head.
+    contactProbs: result.trunk.contactProbs,
     framePdbs,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
