@@ -1,6 +1,8 @@
 import {
   ATTENTION_NORMALIZE_SHADER,
   ATTENTION_OUTPUT_SHADER,
+  attentionOutputTileColumns,
+  attentionOutputTileRows,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
   ATTENTION_PROJECT_SHADER,
@@ -341,7 +343,8 @@ async function encodeAttention(
     Math.ceil(options.queries / flashKernel.queryTile),
     options.batch, options.heads, `${options.label}.flash`);
   execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
-    Math.ceil(options.channels / 32), Math.ceil(rows / 16), 1,
+    Math.ceil(options.channels / attentionOutputTileColumns()),
+    Math.ceil(rows / attentionOutputTileRows()), 1,
     `${options.label}.output`);
   return output;
 }

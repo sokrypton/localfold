@@ -986,90 +986,176 @@ export function selectAttentionFlashKernel(
   return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };
 }
 
-export const ATTENTION_OUTPUT_SHADER = `${COMMON}
+/**
+ * The tile the attention output projection computes, and the only statement of
+ * it - `encodeAttention` dispatches with these, so the shader and the grid
+ * cannot drift apart.
+ */
+export const ATTENTION_OUTPUT_TILE = { lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 8 };
+export const attentionOutputTileRows = (tile = ATTENTION_OUTPUT_TILE) =>
+  tile.lanesY * tile.rowsPerLane;
+export const attentionOutputTileColumns = (tile = ATTENTION_OUTPUT_TILE) =>
+  tile.lanesX * tile.columnsPerLane;
+
+/**
+ * The projection that turns the gated attention result back into c_m channels.
+ *
+ * 🔴 IT WAS THE LAST ALL-SCALAR KERNEL IN AN AF2 BLOCK. Two rows and four
+ * columns to an invocation, every operand read one float at a time: two source
+ * reads, eight weight reads and eight multiply-adds per step of k - eighteen
+ * instructions to buy eight products, 0.44 useful operations an instruction.
+ * The transition and the outer product mean both had the same shape of fault
+ * and both answered to the same fix.
+ *
+ * The source tile is staged TRANSPOSED, four rows to a vector, so one read
+ * serves four accumulators; the weight tile is staged per thread, so a lane's
+ * eight strided columns are two vec4 reads. Per step of k that is three reads
+ * and eight vector multiply-adds for thirty-two products - 2.9 an instruction,
+ * against 0.44.
+ *
+ * 🔴 THE COLUMNS STAY STRIDED BY EIGHT, for the same reason they do in
+ * src/evoformer/transition.js: contiguous columns per lane would make the
+ * staged weights one flat read, but the store then goes out at stride eight
+ * across a row's lanes instead of as a consecutive run.
+ *
+ * @param {boolean} residual whether the store accumulates into an existing tensor
+ */
+export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residual = false) {
+  const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
+    throw new RangeError("attention output tile must be a multiple of 4 each way");
+  }
+  const lanes = lanesX * lanesY;
+  const step = lanesY;
+  const tileRows = lanesY * rowsPerLane;
+  const rowVectors = tileRows / 4;
+  const columnVectors = columnsPerLane / 4;
+  const sourceTasks = step * rowVectors;
+  const sourcePerLane = Math.ceil(sourceTasks / lanes);
+
+  const lines = [];
+  const declare = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    for (let v = 0; v < columnVectors; v += 1) declare.push(`  var acc_${r}_${v} = vec4<f32>(0.0);`);
+  }
+  for (let k = 0; k < step; k += 1) {
+    for (let g = 0; g < rowsPerLane / 4; g += 1) {
+      lines.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local.y * ${rowsPerLane / 4}u + ${g}u];`);
+    }
+    for (let v = 0; v < columnVectors; v += 1) {
+      lines.push(`    let w_${k}_${v} = tile_weight[${k * lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u];`);
+    }
+    for (let r = 0; r < rowsPerLane; r += 1) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        lines.push(`    acc_${r}_${v} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+      }
+    }
+  }
+
+  const stageSource = [];
+  for (let n = 0; n < sourcePerLane; n += 1) {
+    const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
+    const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    stageSource.push(`    ${guard}{
+      let task = ${task};
+      let row_group = task / ${step}u;
+      let k_local = task % ${step}u;
+      let k = k0 + k_local;
+      let row_base = group.y * ${tileRows}u + row_group * 4u;
+      var staged = vec4<f32>(0.0);
+      if (k < projected) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let row = row_base + j;
+          if (row < rows) { staged[j] = source[row * projected + k]; }
+        }
+      }
+      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+    }`);
+  }
+
+  const stageWeight = [];
+  for (let v = 0; v < columnVectors; v += 1) {
+    stageWeight.push(`    {
+      var staged = vec4<f32>(0.0);
+      if (weight_k < projected) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let output_channel = channel_origin + (${v}u * 4u + j) * ${lanesX}u;
+          if (output_channel < p.channels) {
+            staged[j] = weights[p.output_weight + weight_k * p.channels + output_channel];
+          }
+        }
+      }
+      tile_weight[local.y * ${lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u] = staged;
+    }`);
+  }
+
+  const store = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    const body = [];
+    for (let v = 0; v < columnVectors; v += 1) {
+      for (let c = 0; c < 4; c += 1) {
+        body.push(`      {
+        let output_channel = channel_origin + ${(v * 4 + c) * lanesX}u;
+        if (output_channel < p.channels) {
+          output[output_row_${r} * p.channels + output_channel] ${residual ? "+=" : "="}
+            acc_${r}_${v}[${c}u] + weights[p.output_bias + output_channel];
+        }
+      }`);
+      }
+    }
+    // ...column attention writes its result back TRANSPOSED, which is why this
+    // cannot simply be the transition's linear kernel.
+    store.push(`  {
+    let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;
+    if (row_${r} < rows) {
+      let b_${r} = row_${r} / p.queries;
+      let q_${r} = row_${r} % p.queries;
+      let output_row_${r} = select(row_${r}, q_${r} * p.batch + b_${r}, p.transpose != 0u);
+${body.join("\n")}
+    }
+  }`);
+  }
+
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
-var<workgroup> tile_source: array<f32, 128>;
-var<workgroup> tile_weight: array<f32, 256>;
 
-@compute @workgroup_size(8, 8, 1)
+// Transposed: four ROWS to a vector, so one read serves four accumulators.
+var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+// Laid out per thread: a lane's own strided columns, contiguous where it reads.
+var<workgroup> tile_weight: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+
+@compute @workgroup_size(${lanesX}, ${lanesY}, 1)
 fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
   let rows = p.batch * p.queries;
   let projected = p.heads * p.head_dim;
-  let canonical_row = group.y * 16u + local.y;
-  let second_row = canonical_row + 8u;
-  let channel = group.x * 32u + local.x;
-  let tile_index = local.y * 8u + local.x;
-  var result_00 = 0.0; var result_01 = 0.0; var result_02 = 0.0; var result_03 = 0.0;
-  var result_10 = 0.0; var result_11 = 0.0; var result_12 = 0.0; var result_13 = 0.0;
-  for (var k0 = 0u; k0 < projected; k0 += 8u) {
-    let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (canonical_row < rows && source_k < projected) {
-      tile_source[tile_index] = source[canonical_row * projected + source_k];
-    }
-    if (second_row < rows && source_k < projected) {
-      tile_source[tile_index + 64u] = source[second_row * projected + source_k];
-    }
-    for (var column_block = 0u; column_block < 4u; column_block += 1u) {
-      let tile_column = local.x + column_block * 8u;
-      let output_channel = channel + column_block * 8u;
-      let weight_index = local.y * 32u + tile_column;
-      tile_weight[weight_index] = 0.0;
-      if (output_channel < p.channels && weight_k < projected) {
-        tile_weight[weight_index] = weights[p.output_weight + weight_k * p.channels + output_channel];
-      }
-    }
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let x_0 = tile_source[local.y * 8u + k];
-      let x_1 = tile_source[local.y * 8u + k + 64u];
-      result_00 += x_0 * tile_weight[k * 32u + local.x];
-      result_01 += x_0 * tile_weight[k * 32u + local.x + 8u];
-      result_02 += x_0 * tile_weight[k * 32u + local.x + 16u];
-      result_03 += x_0 * tile_weight[k * 32u + local.x + 24u];
-      result_10 += x_1 * tile_weight[k * 32u + local.x];
-      result_11 += x_1 * tile_weight[k * 32u + local.x + 8u];
-      result_12 += x_1 * tile_weight[k * 32u + local.x + 16u];
-      result_13 += x_1 * tile_weight[k * 32u + local.x + 24u];
-    }
-    workgroupBarrier();
-  }
-  for (var row_block = 0u; row_block < 2u; row_block += 1u) {
-    let row = canonical_row + row_block * 8u;
-    if (row < rows) {
-      let b = row / p.queries; let q = row % p.queries;
-      let output_row = select(row, q * p.batch + b, p.transpose != 0u);
-      for (var column_block = 0u; column_block < 4u; column_block += 1u) {
-        let output_channel = channel + column_block * 8u;
-        if (output_channel < p.channels) {
-          var result = select(result_00, result_01, column_block == 1u);
-          result = select(result, result_02, column_block == 2u);
-          result = select(result, result_03, column_block == 3u);
-          if (row_block == 1u) {
-            result = select(result_10, result_11, column_block == 1u);
-            result = select(result, result_12, column_block == 2u);
-            result = select(result, result_13, column_block == 3u);
-          }
-          output[output_row * p.channels + output_channel] = result + weights[p.output_bias + output_channel];
-        }
-      }
-    }
-  }
-}`;
+  let linear_lane = local.y * ${lanesX}u + local.x;
+  let channel_origin = group.x * ${lanesX * columnsPerLane}u + local.x;
+${declare.join("\n")}
 
-/** Same projection as ATTENTION_OUTPUT_SHADER, but commits directly into an existing residual tensor. */
-export const ATTENTION_OUTPUT_RESIDUAL_SHADER = ATTENTION_OUTPUT_SHADER.replace(
-  "output[output_row * p.channels + output_channel] = result + weights[p.output_bias + output_channel];",
-  "output[output_row * p.channels + output_channel] += result + weights[p.output_bias + output_channel];",
-);
+  for (var k0 = 0u; k0 < projected; k0 += ${step}u) {
+    let weight_k = k0 + local.y;
+${stageSource.join("\n")}
+${stageWeight.join("\n")}
+    workgroupBarrier();
+${lines.join("\n")}
+    workgroupBarrier();
+  }
+
+${store.join("\n")}
+}`;
+}
+
+export const ATTENTION_OUTPUT_SHADER = createAttentionOutputShader(ATTENTION_OUTPUT_TILE, false);
+
+/** Same projection, but commits directly into an existing residual tensor. */
+export const ATTENTION_OUTPUT_RESIDUAL_SHADER =
+  createAttentionOutputShader(ATTENTION_OUTPUT_TILE, true);
 
 export class AttentionGpu {
   device;
@@ -1175,7 +1261,8 @@ export class AttentionGpu {
         weighted.buffer], ceilDivide(input.queryLength, flashKernel.queryTile),
         input.batch, input.heads);
       pass(outputProject, [weighted.buffer, weights.buffer, params.buffer, output.buffer],
-        ceilDivide(input.channels, 32), ceilDivide(rows, 16));
+        ceilDivide(input.channels, attentionOutputTileColumns()),
+        ceilDivide(rows, attentionOutputTileRows()));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, tensorBytes);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
