@@ -334,6 +334,21 @@
 
    Nothing is smaller. The value keeps its 14px monospace, which is the part
    anyone reads; it is the boxes and the two spare lines that went. */
+/* 🔴 A MOUNT HOLDING ONLY A HIDDEN PANEL STILL COSTS A GAP.
+   #selectionPanelMount is a layout slot the selection panel is built into, and
+   that panel ships `hidden` until something is selected - so the mount is a
+   zero-height flex item, and the column's 8px gap applies on BOTH sides of it.
+   Measured, that put 16px between the object selector and the heatmap's tab
+   strip where there should be 8, and since the strip hangs above its box the
+   doubled gap reads as empty space over the TABS.
+
+   🔴 `:empty` IS THE WRONG TEST AND SILENTLY DOES NOTHING. The mount is not
+   empty: it contains #selectionPanel, hidden. What has to be asked is whether
+   it holds anything VISIBLE, which is what :has() is for. */
+#selectionPanelMount:not(:has(> *:not([hidden]))) {
+  display: none;
+}
+
 #predictionScoresBox {
   /* 🔴 IT GROWS TO ITS CONTENT NOW, up to whatever the column allows. A
      monomer shows two metrics and a multimer five, and a fixed 340px wrapped
