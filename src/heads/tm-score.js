@@ -122,3 +122,53 @@ export function tmPerBinFor(binCentres, d0) {
   }
   return output;
 }
+
+/**
+ * ipTM for each PAIR OF CHAINS separately, rather than pooled over all of them.
+ *
+ * 🔴 THE POOLED ipTM ANSWERS THE WRONG QUESTION ON MORE THAN TWO CHAINS. Its
+ * selector is `asymId[i] !== asymId[j]`, so every cross-chain pair counts
+ * equally - and in an assembly that holds both a native homodimer and a
+ * designed binder, the homodimer's interface is the easy one and lifts the
+ * score for the interface anyone is actually asking about. PDB 27UH is exactly
+ * that shape: two S100A4 and two VHH, where the S100A4 pair is a real
+ * biological dimer the model places well and each VHH is a de novo design.
+ *
+ * 🔴 IT IS THE SAME REDUCTION, ONLY THE SELECTION MOVES, which is the whole
+ * reason reduceTmScore takes a predicate. ipTM already differs from pTM only in
+ * what it selects; a per-interface score differs from ipTM the same way, and a
+ * second implementation of "max over anchors of mean over selected" would be a
+ * second chance to disagree about it.
+ *
+ * 🔴 AND AN ANCHOR IS TAKEN FROM EITHER SIDE. The reduction maximises over
+ * every anchor whose row has selected pairs, so both chains contribute anchors
+ * and the score is symmetric in the pair - which is what AF3's own chain-pair
+ * ipTM reports.
+ *
+ * @param {ArrayLike<number>} term  tokens * tokens, the per-pair TM term
+ * @param {number} tokens
+ * @param {ArrayLike<number>} asymId  tokens, the chain each token belongs to
+ * @param {ArrayLike<number>} seqMask  tokens
+ * @returns {{chains: number[], scores: Map<string, number>}} `scores` is keyed
+ *   `"a|b"` with a < b, holding that interface's ipTM; a pair with no live
+ *   cross pairs is absent rather than zero
+ */
+export function chainPairTmScores(term, tokens, asymId, seqMask) {
+  const chains = [];
+  for (let i = 0; i < tokens; i += 1) {
+    if (seqMask[i] > 0 && !chains.includes(asymId[i])) chains.push(asymId[i]);
+  }
+  chains.sort((a, b) => a - b);
+  const scores = new Map();
+  for (let a = 0; a < chains.length; a += 1) {
+    for (let b = a + 1; b < chains.length; b += 1) {
+      const first = chains[a];
+      const second = chains[b];
+      const score = reduceTmScore(term, tokens, (i, j) => seqMask[i] > 0 && seqMask[j] > 0
+        && ((asymId[i] === first && asymId[j] === second)
+          || (asymId[i] === second && asymId[j] === first)));
+      if (Number.isFinite(score)) scores.set(`${first}|${second}`, score);
+    }
+  }
+  return { chains, scores };
+}

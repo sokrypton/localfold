@@ -530,9 +530,8 @@ function updateScoresCard(confidence, passBadge = "") {
     }
   }
 
-  // ...a cell that shows only when its number exists, because these three are
-  // not available on every frame or for every input: p(inter) needs two chains
-  // and Settled only means something on a frame that has not finished.
+  // ...a cell that shows only when its number exists: Settled means something
+  // on a frame that has not finished, and nothing on the finished one.
   const optional = (cellId, valueId, value, digits) => {
     const cell = document.getElementById(cellId);
     const slot = document.getElementById(valueId);
@@ -544,7 +543,6 @@ function updateScoresCard(confidence, passBadge = "") {
       cell.style.display = "none";
     }
   };
-  optional("metricPinterCell", "metricPinter", confidence.pinter, 2);
   optional("metricSettledCell", "metricSettled", confidence.settled, 0);
 
   const multimerCell = document.getElementById("metricMultimerCell");
@@ -1015,7 +1013,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // rather than by the loop below, so it is easy to leave carrying whatever
       // that put there.
       first.confidence = {
-        pinter: result.confidence.pinter,
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
         settled: result.frameSettled?.[0],
@@ -1042,7 +1039,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // trunk's contact confidences - which ARE known this early, and do not
       // move - and how far it has settled.
       frame.confidence = last ? result.confidence : {
-        pinter: result.confidence.pinter,
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
         // ...`index` walks timeline.slice(1), so it is one behind the frame

@@ -31,7 +31,7 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
-import { reduceTmScore } from "../heads/tm-score.js";
+import { chainPairTmScores, reduceTmScore } from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
 
 /**
@@ -534,9 +534,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // as a confident failure rather than an inapplicable question.
   const iptm = reduceTmScore(scores.tmAdjusted, tokens,
     (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
+  // 🔴 AND ONE SCORE PER INTERFACE, BECAUSE THE POOLED ONE AVERAGES THEM. On
+  // more than two chains `iptm` counts every cross-chain pair equally, so an
+  // assembly holding both a native dimer and a designed binder reports the
+  // easy interface's confidence for the hard one. See chainPairTmScores.
+  const chainPairIptm = Object.fromEntries(
+    chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
 
   return {
-    positions, trunk, targetFeat, scores, ptm, iptm,
+    positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
     reusable: { trunk, targetFeat, recycles },

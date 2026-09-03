@@ -19,8 +19,8 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
-import { distogramAgreementTable, distogramConfidence, calibrateToPlddt,
-  distogramInterfaceContact } from "../src/af3/distogram-confidence.js";
+import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
+  from "../src/af3/distogram-confidence.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -60,26 +60,15 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * price for an atom-tokenised residue and not something more steps will fix.
  */
 /**
- * How the trunk's contact confidences are written into the status line.
- *
- * 🔴 THE NUMBER IS SHOWN AS ITSELF. An earlier version turned p(inter) into
- * the word "interface looks strong" against a fitted threshold, and before that
- * the same machinery was shown as an estimated pLDDT. Both were the same
- * mistake in different clothes: a quantity presented as a claim it does not
- * support. p(inter) is the mean of the trunk's own P(d <= 8 A) over the
- * cross-chain contacts it is most confident about, and that is what the line
- * now says. It tracks the real ipTM at 0.84 Pearson and 0.91 Spearman across a
- * seventeen-target panel, minutes before the head produces one.
- *
- * 🔴 THERE IS NO p(intra) BESIDE IT, AND THE WITHIN-CHAIN NUMBER IS "Settled"
- * INSTEAD. distogramContactConfidence's `intra` - the same top-N reduction run
- * within a chain - tracks nothing the head reports and reads 0.00 on a coiled
- * coil whose real pLDDT is 89. What does track it is the per-position
- * agreement score meaned, at 0.70 against pLDDT and 0.64 against pTM, and that
- * is already on the card under its own name. The price is that it needs a
- * frame: p(inter) lands when the trunk does, Settled one denoiser call later.
+ * 🔴 THE TRUNK'S CONTACT CONFIDENCES ARE NOT SHOWN, AND THE CODE FOR THEM IS
+ * STILL THERE. p(inter) rode in the status line and the quality card for a
+ * while; it tracks ipTM at 0.84 Pearson across a panel and arrives before the
+ * first denoiser call, but on a real target the seed moves ipTM by 0.3 and a
+ * number that early invites a decision the fold has not earned yet.
+ * src/af3/distogram-confidence.js keeps distogramInterfaceContact and
+ * distogramContactConfidence, tested and measured by
+ * tools/gpu/probe-contact-confidence.js; nothing on the page reads them.
  */
-const CONTACT_DIGITS = 2;
 
 export const AF3_COUNTS = {
   // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
@@ -358,11 +347,10 @@ export async function foldAf3(options) {
   /**
    * The status line: what is running, and how far in.
    *
-   * 🔴 THREE WORDS FOR THE WHOLE FOLD: Preparing, Analysing, Building. They
-   * used to be Preparing, Trunk and either Refining or Diffusing - which named
-   * the ARCHITECTURE and the SAMPLER, two things a reader watching a bar has no
-   * way to tell apart and no reason to care about. The sampler's mode is
-   * already a control on the page; the status line says what is happening.
+   * 🔴 THREE WORDS FOR THE WHOLE FOLD: Preparing, Trunk, Folding. What went was
+   * the SAMPLER's name - the line used to read "Refining" or "Diffusing"
+   * depending on the mode, which is a distinction the mode dial already makes
+   * and a reader watching a bar has no reason to care about.
    *
    * 🔴 TWO FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
    * block 23 of 48", which is a number that changes forty-eight times a pass
@@ -390,11 +378,9 @@ export async function foldAf3(options) {
   // the 15. So it goes in the transient status line, where it is superseded
   // minutes later by the real score, and NOT in the quality card, which is read
   // as a result.
-  let contactWords = "";
   const say = (phase) => {
-    const line = `${phase}${contactWords}`;
-    if (budget === null) { onStatus(line); return; }
-    onStatus(`${line} · ${Math.round(100 * budget.estimator.fraction())}%`);
+    if (budget === null) { onStatus(phase); return; }
+    onStatus(`${phase} · ${Math.round(100 * budget.estimator.fraction())}%`);
   };
   /** Move the bar to a point in the plan, in units. */
   const reached = (units) => {
@@ -434,29 +420,11 @@ export async function foldAf3(options) {
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
   let liveConfidence = null;
-  // ...and the cross-chain contact confidence, kept so the quality card can
-  // show the same number the status line did rather than a second opinion.
-  let interContact = Number.NaN;
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
-      if (name === "trunk-done" && contactWords === "") {
-        try {
-          const inter = distogramInterfaceContact(
-            detail.trunk.contactProbs, batch.asymId, batch.seqMask, batch.tokens);
-          interContact = inter;
-          // ...NaN for a single chain: there is no interface to score, which is
-          // not the same as a bad one, so the line stays quiet about it rather
-          // than printing a zero.
-          if (Number.isFinite(inter)) {
-            contactWords = ` · p(inter) ${inter.toFixed(CONTACT_DIGITS)}`;
-          }
-        } catch (cause) {
-          console.warn("contact confidence unavailable", cause);
-        }
-      }
       if (name === "trunk-done" && liveConfidence === null) {
         // ...best effort, for the reason the finished-frame path gives: this is
         // a colour, and losing a prediction to it would be a bad trade.
@@ -487,7 +455,7 @@ export async function foldAf3(options) {
       }
       if (name === "target-feat") {
         reached(plan().featuresEnd);
-        say("Analysing");
+        say("Trunk");
         await yieldToBrowser();
       }
       if (name === "pairformer-block") {
@@ -503,8 +471,7 @@ export async function foldAf3(options) {
         const done = (detail.pass + detail.completed / detail.total) / detail.passes;
         reached(plan().featuresEnd
           + (plan().trunkEnd - plan().featuresEnd) * done);
-        say(detail.passes > 1
-          ? `Analysing ${detail.pass + 1}/${detail.passes}` : "Analysing");
+        say(detail.passes > 1 ? `Trunk ${detail.pass + 1}/${detail.passes}` : "Trunk");
       }
       if (name === "trunk-done") {
         reached(plan().trunkEnd);
@@ -525,7 +492,7 @@ export async function foldAf3(options) {
         // fold, twice, and a bar that stops for four seconds already reads as
         // busy next to a status line that says so. Holding is steadier than
         // sweeping, and it keeps the bar monotonic from end to end.
-        say("Building");
+        say("Folding");
         await yieldToBrowser();
       }
     },
@@ -547,7 +514,7 @@ export async function foldAf3(options) {
       // time over its own steps. It was the only honest one on the page, and
       // only because a denoiser call is the one unit that repeats identically.
       // The estimator generalises exactly that idea to the whole fold.
-      say(`Building ${step}/${calls}`);
+      say(`Folding ${step}/${calls}`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task
       // boundary the status above is written and never drawn.
@@ -686,9 +653,10 @@ export async function foldAf3(options) {
       // NaN for a single chain - there is no interface to score - and the card
       // shows a dash for it rather than a number.
       iptm: result.iptm,
-      // The trunk's own cross-chain contact confidence, shown beside the
-      // head's scores under its own name. NaN for a single chain, as ipTM is.
-      pinter: interContact,
+      // ...and one ipTM per interface, which the pooled one averages away on
+      // more than two chains. Empty for a monomer; the same number as `iptm`
+      // for exactly two chains. See src/heads/tm-score.js.
+      chainPairIptm: result.chainPairIptm,
       predictedAlignedError: result.scores.pae,
     },
   };

@@ -67,10 +67,18 @@
  * disordered tokens drag pLDDT and pTM down globally and would be charged to
  * whichever sampler happened to place them.
  *
- * 🔴 AND IT FOLDS 1:1, NOT THE DEPOSITED 4:4. The asymmetric unit holds four
- * copies of each chain and S100A4 is physiologically a homodimer, so the
- * biological unit is plausibly two S100A4 to one VHH. 1:1 is the cheap version
- * of the same interface question; 2:1 is a follow-up worth running.
+ * 🔴 THE BIOLOGICAL ASSEMBLY IS A2B2 AND `--assembly=a2b2` FOLDS IT. RCSB
+ * reports 27UH-1 as tetrameric with C2 global symmetry, stoichiometry A2B2:
+ * the S100A4 homodimer with a VHH on each protomer. The 1:1 default is the
+ * cheap version of the interface question and the sweep above was run on it.
+ *
+ * 🔴 AND ON A2B2 THE POOLED ipTM IS THE WRONG NUMBER. Its selector counts every
+ * cross-chain pair equally, so the native S100A4 dimer - an interface the model
+ * places well - is averaged in with the designed binder's, and the score reads
+ * better while saying less about the only interface anyone is asking about.
+ * The per-interface breakdown comes from chainPairTmScores; chains 0 and 1 are
+ * the VHHs and 2 and 3 the S100A4s, so 2|3 is the native dimer and 0|2, 0|3,
+ * 1|2, 1|3 are the four binder interfaces.
  */
 import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
@@ -108,7 +116,9 @@ export async function main(device, args) {
   const seeds = option(args, "seeds", "1,2").split(",").map(Number);
   const recycles = Number(option(args, "recycles", "0"));
   const maxMsaSequences = Number(option(args, "max-msa", "128"));
-  const chains = [VHH, S100A4];
+  // Chains in blocks, so an interface can be named: 0,1 are VHH and 2,3 S100A4.
+  const chains = option(args, "assembly", "1to1") === "a2b2"
+    ? [VHH, VHH, S100A4, S100A4] : [VHH, S100A4];
 
   const search = await generateMmseqs2ComplexMsa(chains, {
     model: "af3",
@@ -145,6 +155,10 @@ export async function main(device, args) {
       ptm: Number(mean(runs.map((r) => r.confidence.ptm)).toFixed(3)),
       meanPlddt: Number(mean(runs.map((r) => r.meanPlddt)).toFixed(1)),
       seconds: Number(mean(runs.map((r) => r.seconds)).toFixed(1)),
+      // ...and every interface on its own, meaned over the seeds.
+      interfaces: Object.fromEntries(
+        Object.keys(runs[0].confidence.chainPairIptm ?? {}).map((pair) => [pair,
+          Number(mean(runs.map((r) => r.confidence.chainPairIptm[pair])).toFixed(3))])),
     };
     } catch (cause) {
       failures.push({ arm: `${mode} ${calls}`, error: String(cause?.message ?? cause),

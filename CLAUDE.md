@@ -33,7 +33,7 @@ values means the whole-stack checker, not that file.
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
-| Does p(inter) still track ipTM? | `tools/gpu/probe-contact-confidence.js` |
+| Do the distogram's contact scores track pTM/ipTM? | `tools/gpu/probe-contact-confidence.js` |
 | Is the sampler converged at this step count? | `tools/gpu/probe-flow-sigma-by-size.js --panel=churn` |
 | Do recycles help a complex? | `tools/gpu/probe-recycles-on-complexes.js` |
 | Does MSA depth help a complex? | `tools/gpu/probe-msa-depth-on-complexes.js` (**goes to the network**) |
