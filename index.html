@@ -212,9 +212,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               </div>
 
               <!-- MSA options on the right of the row -->
-              <!-- 🔴 THE MSA SWITCH IS THIS SELECT'S "None", NOT A SEPARATE
-                   TOGGLE. Two controls for one decision could disagree - the
-                   toggle said off while the select still read "Search" - and
+              <!-- 🔴 THE MSA SWITCH IS THIS SELECT'S "Single Sequence", NOT A
+                   SEPARATE TOGGLE. Two controls for one decision could
+                   disagree - the toggle said off while the select still read
+                   the search option - and
                    the reader had to look at both to know what would be sent
                    anywhere.
                    🔴 AND "Search" IS THE DEFAULT, WHICH IT DID NOT USED TO BE.
@@ -230,8 +231,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group" id="msaModeGroup">
                 <span class="fetch-option-title">MSA</span>
                 <select id="msa-mode">
-                  <option value="none">None</option>
-                  <option value="search" selected>Search (remote)</option>
+                  <!-- 🔴 THE LABELS MOVED AND THE VALUES DID NOT. web/app.js
+                       reads "none" and "search" - and translates "none" to
+                       "single" for the driver - so renaming a value here
+                       silently changes which alignment a fold gets. -->
+                  <option value="none">Single Sequence</option>
+                  <option value="search" selected>MMseqs2</option>
                   <option value="paste">Paste A3M</option>
                   <option value="upload">Upload file</option>
                 </select>

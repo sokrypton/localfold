@@ -143,8 +143,9 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
 
 // 🔴 "none" IS SPELLED "single" BELOW, and the translation happens here so it
 // happens once. Every path downstream already tests for "single" meaning a
-// query-only fold; the select says "None" because that is what it does to the
-// alignment, not to the sequence.
+// query-only fold. The select says "Single Sequence", which names what is
+// FOLDED rather than what is missing - it used to say "None", which reads as
+// an absent setting rather than a choice about the input.
 const msaMode = () => {
   const chosen = element("msa-mode").value;
   return chosen === "none" ? "single" : chosen;
@@ -1625,9 +1626,9 @@ const modeSelect = element("msa-mode");
 
 // 🔴 THE FOOTER'S PRIVACY LINE IS NOT A CONSTANT. It read "All processing is
 // performed locally in your browser. No data is uploaded to a server", which
-// was true while "None" was the default alignment mode and false the moment
-// remote search became it - that mode posts the sequence to the public
-// ColabFold MMseqs2 server. The fold itself never leaves the machine either
+// was true while single-sequence was the default alignment mode and false the
+// moment the MMseqs2 search became it - that mode posts the sequence to the
+// public ColabFold server. The fold itself never leaves the machine either
 // way, so the accurate claim depends on the mode, and a page that states the
 // stronger one while doing the weaker thing is worse than one that says
 // nothing. Written from here so the two cannot drift apart.
