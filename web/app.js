@@ -1064,7 +1064,28 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // until there is something to hang it on. The trunk knows it before the
     // sampler runs; the viewer has no object until the first denoiser call
     // lands, and the heatmap panel is driven by an object's frames.
-    onContacts: (contactProbs) => { liveContacts = contactMapFor(contactProbs); },
+    onContacts: (contactProbs) => {
+      liveContacts = contactMapFor(contactProbs);
+      // 🔴 AND STRAIGHT TO THE PANEL WHILE THERE IS NO FRAME TO HANG IT ON.
+      // The trunk finishes every recycle before the sampler emits anything, so
+      // for the longest part of an AF3 fold the viewer holds the blank object
+      // openBlankFold made and the panel has nothing to resolve. Pushing the
+      // map at the renderer shows it evolving through the recycles; the
+      // frame-driven path takes over by itself once frame 0 lands, because
+      // that goes through updateFrame.
+      if (liveContacts === undefined) return;
+      const registry = window.py2dmol_viewers ?? {};
+      const renderer = registry[Object.keys(registry)[0]]?.renderer;
+      const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames;
+      if (renderer?.heatmapRenderer === undefined || (frames?.length ?? 0) > 0) return;
+      try {
+        renderer.heatmapRenderer.setMaps({ contact: liveContacts });
+        window.Heatmap?.updateVisibility?.(renderer);
+        renderer.render("trunk-contacts");
+      } catch (cause) {
+        console.warn("could not show the trunk's contact map", cause);
+      }
+    },
     onFrame: (pdb, index) => {
       if (signal.aborted) return;
       if (index === 0) {

@@ -458,6 +458,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     });
     previousPair = trunk.pair;
     previousSingle = trunk.single;
+    // 🔴 EVERY PASS HAS ITS OWN DISTOGRAM, so the contact map can be shown
+    // while the trunk is still recycling rather than only at the end. The
+    // head runs per pass regardless - this only hands the result up. A page
+    // has no structure to draw yet at this point, which is exactly why it is
+    // worth showing: it is the one thing the model knows during the longest
+    // part of a fold.
+    await stage("recycle-done", { pass, passes: recycles + 1, trunk });
   }
   // 🔴 THE REUSABLE TRUNK RIDES ON trunk-done, NOT ONLY ON THE RETURN. A fold
   // that fails AFTER this point - the memory ceiling refusing the sampler is

@@ -153,6 +153,22 @@ each checks every arm's output against the first, because a tile the dispatch
 does not match leaves rows unprocessed and reads as a speedup. Tune with those;
 confirm with `bench-trunk.js`.
 
+🔴 **A PLAIN RELOAD SERVES CACHED ES MODULES, AND THAT LOOKS EXACTLY LIKE A
+BROKEN FEATURE.** `python3 -m http.server` sends no cache headers, so Chrome
+caches `web/app.js`, `src/af3/fold.js` and every other module heuristically -
+and `location.reload()` does not refetch them. A change lands, the page is
+reloaded, nothing happens, and the code looks wrong. Ask the page what it
+actually loaded rather than what is on disk:
+
+```js
+(await import('/src/af3/fold.js')).foldBatch.toString().includes('recycle-done')
+```
+
+against `fetch('/src/af3/fold.js?v=' + Date.now())`. If they disagree, it is the
+cache. ⌘⇧R clears it. `tools/fold-in-page.py` never sees this because it
+launches a fresh Chrome profile, which is why it can pass while the browser in
+front of you does not.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring

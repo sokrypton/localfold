@@ -242,7 +242,8 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onTrunk?: (reusable: object) => void,
- *          onContacts?: (contactProbs: Float32Array) => void,
+ *          onContacts?: (contactProbs: Float32Array, pass?: number,
+ *                        passes?: number) => void,
  *          schedule?: {sigmaMax?: number, sigmaMin?: number, rho?: number},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -431,6 +432,13 @@ export async function foldAf3(options) {
     schedule: options.schedule,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
+      if (name === "recycle-done" && detail.trunk?.contactProbs !== undefined) {
+        // 🔴 ONE PER PASS, so the map sharpens as the trunk recycles rather
+        // than appearing once at the end. AF3 runs every recycle before the
+        // sampler emits a single frame, so for the longest part of a fold this
+        // is the only thing the model has to show.
+        options.onContacts?.(detail.trunk.contactProbs, detail.pass, detail.passes);
+      }
       if (name === "trunk-done") {
         // ...handed up the moment it exists, so a caller can cache it before
         // anything downstream has had a chance to fail. See fold.js.
