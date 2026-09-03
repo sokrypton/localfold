@@ -604,3 +604,12 @@
   opacity: .45;
   pointer-events: none;
 }
+
+/* The one button that appears inside the status line, when a fold is refused
+   for memory and the reader is offered the choice of lifting the ceiling.
+   Inline with the message rather than below it, because it belongs to that
+   sentence and a block-level button would move everything under the panel. */
+.status-action {
+  margin-left: 4px;
+  vertical-align: baseline;
+}

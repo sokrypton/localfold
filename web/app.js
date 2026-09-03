@@ -32,6 +32,8 @@ import { parseA3m } from "../src/input/a3m.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
+import { budgetForDevice, GpuMemoryBudgetError, setMemoryBudget }
+  from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
@@ -167,6 +169,54 @@ function status(text, isError = false) {
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
+}
+
+/**
+ * The status line, with something to press.
+ *
+ * 🔴 textContent AND A BUTTON, NOT innerHTML. The message can carry a tensor
+ * name and a device's own error string, neither of which this page authored -
+ * so it goes in as text and the button is built beside it.
+ */
+function statusWithAction(text, label, title, onClick) {
+  const node = document.getElementById("status-message");
+  if (node === null) return;
+  node.replaceChildren();
+  node.classList.add("error");
+  node.append(document.createTextNode(text + " "));
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn btn-grey btn-small status-action";
+  button.textContent = label;
+  button.title = title;
+  button.addEventListener("click", onClick, { once: true });
+  node.append(button);
+}
+
+/**
+ * What a refused allocation looks like to somebody who has to decide about it.
+ *
+ * 🔴 "FREE RAM" IS NOT AVAILABLE AND IS NOT GUESSED AT HERE. No browser API
+ * reports free system memory or free GPU memory - `navigator.deviceMemory` is
+ * TOTAL system RAM rounded down to a power of two, and WebGPU reports nothing
+ * at all. So this states the four numbers that are real: what the allocation
+ * needed, what the fold is already holding, the ceiling it was measured
+ * against, and where that ceiling came from. Inventing a "free" figure from
+ * those would be the one number in the sentence nobody could check.
+ */
+function describeBudget(error) {
+  const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
+  // 🔴 AND WHERE THE CEILING CAME FROM IS ONLY SAID WHEN IT IS TRUE. The
+  // parenthetical explains the DEFAULT ceiling; a ceiling that was set to
+  // anything else is not a third of anything, and asserting it anyway would put
+  // the one uncheckable clause in the sentence right next to four numbers that
+  // are all exact.
+  const isDefault = error.budgetBytes === budgetForDevice();
+  const total = isDefault && typeof navigator.deviceMemory === "number"
+    ? ` (a third of this machine's ${navigator.deviceMemory} GB)` : "";
+  return `Not enough room: ${error.label} needs ${mib(error.bytes)} and this fold`
+    + ` is holding ${mib(error.residentBytes)}, against a ${mib(error.budgetBytes)}`
+    + ` ceiling${total}.`;
 }
 
 /**
@@ -1355,7 +1405,26 @@ async function fold(event) {
       // the handoff to the viewer. Swallowing the stack turns a five-minute
       // diagnosis into a bisect.
       console.error("fold failed", error);
-      status(error instanceof Error ? error.message : String(error), true);
+      // 🔴 A CEILING IS A CHOICE, SO IT IS OFFERED BACK. This one is a GUESS -
+      // a third of what the browser admits the machine has - and it is
+      // deliberately conservative, so it will sometimes refuse a fold that
+      // would have finished. The reader is the one who knows what else is
+      // running, so they get the numbers and a button rather than a dead end.
+      //
+      // 🔴 AND THE WARNING IS REAL, NOT A FORMALITY. The ceiling exists because
+      // Metal accepts allocations well past the point where macOS starts
+      // paging and reports nothing: without it the failure is not an error
+      // message, it is a machine that stops responding. That is what the title
+      // on the button says, in those words.
+      if (error instanceof GpuMemoryBudgetError && !ceilingLifted) {
+        statusWithAction(
+          describeBudget(error),
+          "Fold anyway",
+          "Removes the memory ceiling for the rest of this session. The ceiling"
+          + " is what turns running out of memory into this message: without it"
+          + " the browser tab, or the machine, may stop responding instead.",
+          () => { void foldWithoutCeiling(); });
+      } else status(error instanceof Error ? error.message : String(error), true);
     }
   } finally {
     if (activeFold === controller) activeFold = undefined;
@@ -1364,6 +1433,25 @@ async function fold(event) {
 }
 
 // --- wiring ----------------------------------------------------------------
+
+/**
+ * Whether the reader has taken the ceiling off, which lasts the session.
+ *
+ * 🔴 ASKED ONCE, NOT EVERY TIME. A second refusal after the button has been
+ * pressed is not the same question - the ceiling is already gone, so whatever
+ * failed the second time failed for another reason and offering the same
+ * button again would be a loop.
+ */
+let ceilingLifted = false;
+
+/** Take the ceiling off this device and fold again. */
+async function foldWithoutCeiling() {
+  ceilingLifted = true;
+  status("Folding without the memory ceiling…");
+  const device = await getDevice();
+  setMemoryBudget(device, undefined);
+  await fold();
+}
 
 element("predict").addEventListener("click", (event) => void fold(event));
 // ...and only now is it safe to press. See the note on the button in index.html:
