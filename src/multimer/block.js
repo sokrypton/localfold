@@ -46,6 +46,8 @@ import {
   createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  opmProjectTileRows,
+  opmProjectTileColumns,
   packOuterProductMeanWeights,
   useOuterFirstContraction,
 
@@ -487,8 +489,15 @@ async function encodeOuterProductMean(
   const opmNormGrid = execution.rowGrid(rows);
   execution.dispatch(encoder, normalize, [msa, weights, params, normalized],
     opmNormGrid[0], opmNormGrid[1], 1, "opm.normalize");
-  let grid = execution.linearGrid(rows * input.cOuter);
-  execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right], grid[0], grid[1], 1,
+  // 🔴 A TILE GRID, NOT A THREAD GRID. The projection used to give one thread
+  // each (row, channel); it now gives one WORKGROUP a tile of both, so the
+  // dispatch counts tiles. Row tiles are folded through x and y for the same
+  // reason every other row grid here is - a row per sequence and residue passes
+  // 32,768 at any real MSA depth - and the channel tile is z.
+  const projectRowTiles = Math.ceil(rows / opmProjectTileRows());
+  let grid = execution.rowGrid(projectRowTiles);
+  execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right],
+    grid[0], grid[1], Math.ceil(input.cOuter / opmProjectTileColumns()),
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {

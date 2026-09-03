@@ -160,7 +160,155 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   }
 }`;
 
-export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = `${COMMON}
+/**
+ * The tile one workgroup of the left/right projection computes, and the only
+ * statement of it - both call sites dispatch with these.
+ */
+export const OPM_PROJECT_TILE = { lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4 };
+export const opmProjectTileRows = (tile = OPM_PROJECT_TILE) => tile.lanesY * tile.rowsPerLane;
+export const opmProjectTileColumns = (tile = OPM_PROJECT_TILE) => tile.lanesX * tile.columnsPerLane;
+
+/**
+ * The left and right projections of the normalised MSA, in one pass.
+ *
+ * 🔴 IT WAS ONE THREAD PER (row, channel) AND IT WALKED THE WHOLE CONTRACTION.
+ * Every thread read `source[row * c_m + c]` for all 256 channels - and the 32
+ * threads holding that row's 32 outer channels each read the SAME value, so a
+ * row's activation was fetched from global memory 32 times over - plus one
+ * weight for the left projection and one for the right. Three global reads and
+ * two multiply-adds per step of c: 0.4 useful operations an instruction, on a
+ * machine that issues about 640 billion a second whatever their width. It
+ * measured 4.16 ms of a 113 ms block at 512 MSA rows, which is 238 GFLOP/s
+ * where every tuned kernel around it runs at 1000.
+ *
+ * It is a plain matrix multiply and it is now tiled like one: a workgroup takes
+ * 32 rows by 32 outer channels, stages the source TRANSPOSED so one vec4 read
+ * serves four rows, and stages the weights per thread so a lane's four strided
+ * channels are one vec4. Per step of c an invocation issues three reads and
+ * eight vector multiply-adds for thirty-two products - 2.9 an instruction.
+ *
+ * 🔴 LEFT AND RIGHT ARE THE SAME CONTRACTION OVER THE SAME SOURCE, which is why
+ * they stay one kernel rather than becoming two. The source tile and its whole
+ * staging cost are shared; splitting them would read it twice.
+ */
+export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE) {
+  const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
+    throw new RangeError("OPM project tile must be a multiple of 4 each way");
+  }
+  const lanes = lanesX * lanesY;
+  const step = lanesY;
+  const tileRows = lanesY * rowsPerLane;
+  const tileColumns = lanesX * columnsPerLane;
+  const rowVectors = tileRows / 4;
+  const columnVectors = columnsPerLane / 4;
+  const sourceTasks = step * rowVectors;
+  const sourcePerLane = Math.ceil(sourceTasks / lanes);
+
+  const declare = [];
+  for (const side of ["left", "right"]) {
+    for (let r = 0; r < rowsPerLane; r += 1) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        // ...the bias rides in as the accumulator's initial value, read once a
+        // lane rather than once a row.
+        declare.push(`  var acc_${side}_${r}_${v} = bias_${side}_${v};`);
+      }
+    }
+  }
+  const bias = [];
+  for (const side of ["left", "right"]) {
+    for (let v = 0; v < columnVectors; v += 1) {
+      bias.push(`  var bias_${side}_${v} = vec4<f32>(0.0);
+  for (var j = 0u; j < 4u; j += 1u) {
+    let outer = column_origin + (${v}u * 4u + j) * ${lanesX}u;
+    if (outer < p.c_outer) { bias_${side}_${v}[j] = weights[p.${side}_bias + outer]; }
+  }`);
+    }
+  }
+
+  const inner = [];
+  for (let k = 0; k < step; k += 1) {
+    for (let g = 0; g < rowsPerLane / 4; g += 1) {
+      inner.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local_y * ${rowsPerLane / 4}u + ${g}u];`);
+    }
+    for (const side of ["left", "right"]) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        inner.push(`    let w_${side}_${k}_${v} = tile_${side}[${k * lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u];`);
+      }
+    }
+    for (const side of ["left", "right"]) {
+      for (let r = 0; r < rowsPerLane; r += 1) {
+        for (let v = 0; v < columnVectors; v += 1) {
+          inner.push(`    acc_${side}_${r}_${v} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${side}_${k}_${v};`);
+        }
+      }
+    }
+  }
+
+  const stageSource = [];
+  for (let n = 0; n < sourcePerLane; n += 1) {
+    const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
+    const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    stageSource.push(`    ${guard}{
+      let task = ${task};
+      let row_group = task / ${step}u;
+      let k_local = task % ${step}u;
+      let c = c0 + k_local;
+      let row_base = first_row + row_group * 4u;
+      var staged = vec4<f32>(0.0);
+      if (c < p.c_m) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let row = row_base + j;
+          if (row < rows) { staged[j] = source[row * p.c_m + c]; }
+        }
+      }
+      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+    }`);
+  }
+
+  const stageWeight = [];
+  for (const side of ["left", "right"]) {
+    for (let v = 0; v < columnVectors; v += 1) {
+      stageWeight.push(`    {
+      var staged = vec4<f32>(0.0);
+      if (weight_c < p.c_m) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let outer = column_origin + (${v}u * 4u + j) * ${lanesX}u;
+          if (outer < p.c_outer) {
+            staged[j] = weights[p.${side}_weight + weight_c * p.c_outer + outer];
+          }
+        }
+      }
+      tile_${side}[local_y * ${lanesX * columnVectors}u + local_x * ${columnVectors}u + ${v}u] = staged;
+    }`);
+    }
+  }
+
+  const store = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    const body = [];
+    for (let v = 0; v < columnVectors; v += 1) {
+      for (let c = 0; c < 4; c += 1) {
+        body.push(`      {
+        let outer = column_origin + ${(v * 4 + c) * lanesX}u;
+        if (outer < p.c_outer) {
+          let index = row_${r} * p.c_outer + outer;
+          left[index] = keep_${r} * acc_left_${r}_${v}[${c}u];
+          right[index] = keep_${r} * acc_right_${r}_${v}[${c}u];
+        }
+      }`);
+      }
+    }
+    store.push(`  {
+    let row_${r} = first_row + local_y * ${rowsPerLane}u + ${r}u;
+    if (row_${r} < rows) {
+      let keep_${r} = mask[row_${r}];
+${body.join("\n")}
+    }
+  }`);
+  }
+
+  return `${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
@@ -168,23 +316,44 @@ export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = `${COMMON}
 @group(0) @binding(4) var<storage, read_write> left: array<f32>;
 @group(0) @binding(5) var<storage, read_write> right: array<f32>;
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
+// Transposed: four ROWS to a vector, so one read serves four accumulators.
+var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+// Laid out per thread: a lane's own strided channels, contiguous where it reads.
+var<workgroup> tile_left: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+var<workgroup> tile_right: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+
+@compute @workgroup_size(${lanesX}, ${lanesY}, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
   let rows = p.sequences * p.length;
-  if (index >= rows * p.c_outer) { return; }
-  let row = index / p.c_outer;
-  let outer = index % p.c_outer;
-  var left_value = weights[p.left_bias + outer];
-  var right_value = weights[p.right_bias + outer];
-  for (var c = 0u; c < p.c_m; c += 1u) {
-    let value = source[row * p.c_m + c];
-    left_value += value * weights[p.left_weight + c * p.c_outer + outer];
-    right_value += value * weights[p.right_weight + c * p.c_outer + outer];
+  // ...FOLDED in x and y, because a row per sequence and residue is far more
+  // than a dispatch may be wide at any real MSA depth; the channel tile is z.
+  let tile_index = group.x + group.y * GRID_WIDTH;
+  let first_row = tile_index * ${tileRows}u;
+  if (first_row >= rows) { return; }
+  let local_x = local.x;
+  let local_y = local.y;
+  let linear_lane = local_y * ${lanesX}u + local_x;
+  let column_origin = group.z * ${tileColumns}u + local_x;
+${bias.join("\n")}
+${declare.join("\n")}
+
+  for (var c0 = 0u; c0 < p.c_m; c0 += ${step}u) {
+    let weight_c = c0 + local_y;
+${stageSource.join("\n")}
+${stageWeight.join("\n")}
+    workgroupBarrier();
+${inner.join("\n")}
+    workgroupBarrier();
   }
-  left[index] = mask[row] * left_value;
-  right[index] = mask[row] * right_value;
+
+${store.join("\n")}
 }`;
+}
+
+export const OUTER_PRODUCT_MEAN_PROJECT_SHADER = createOuterProductMeanProjectShader();
 
 export const OUTER_PRODUCT_MEAN_INTERMEDIATE_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
@@ -556,22 +725,26 @@ export class OuterProductMeanGpu {
       ));
       const encoder = this.device.createCommandEncoder({ label: "outer-product-mean" });
       this.device.pushErrorScope("validation");
-      const pass = (pipeline, buffers, x, y = 1) => {
+      const pass = (pipeline, buffers, x, y = 1, z = 1) => {
         const compute = encoder.beginComputePass();
         compute.setPipeline(pipeline);
         compute.setBindGroup(0, this.device.createBindGroup({
           layout: pipeline.getBindGroupLayout(0),
           entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
         }));
-        compute.dispatchWorkgroups(x, y);
+        compute.dispatchWorkgroups(x, y, z);
         compute.end();
       };
       const normalizeGrid = rowGrid(rows);
       pass(normalize, [source.buffer, weights.buffer, params.buffer, normalized.buffer],
         normalizeGrid[0], normalizeGrid[1]);
-      const projectGrid = linearGrid(rows * input.cOuter);
+      // ...tiles, not threads, and folded the same way the block encoders fold
+      // it - this path is what check-evoformer-opm.js drives, so a dispatch
+      // that disagreed with theirs would leave the real one ungated.
+      const projectTiles = Math.ceil(rows / opmProjectTileRows());
+      const projectGrid = rowGrid(projectTiles);
       pass(project, [normalized.buffer, mask.buffer, weights.buffer, params.buffer, left.buffer, right.buffer],
-        projectGrid[0], projectGrid[1]);
+        projectGrid[0], projectGrid[1], Math.ceil(input.cOuter / opmProjectTileColumns()));
       const outputGrid = linearGrid(pairElements);
       if (outerFirst) {
         // ...one workgroup per PAIR now, not per element; see the note on the
