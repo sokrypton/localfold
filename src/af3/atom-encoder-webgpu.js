@@ -514,6 +514,21 @@ export function createAtomBlockShaders(common, shape) {
 const ROW_TILE: u32 = ${outputRowTile}u;
 ${options.bindings}
 
+// 🔴 EACH HOLDS ITS RAW TENSOR FIRST AND ITS NORMALISED ONE AFTER, IN PLACE.
+// act and queries_cond were both read from GLOBAL memory in four loops -
+// the two passes of a shared LayerNorm and the two normalisations - and two of
+// those run over every channel on EVERY lane rather than a strided share, so a
+// workgroup of 64 issued tens of thousands of loads for 2 * C * ROW_TILE
+// distinct values. Staged once they are that many loads and the rest are
+// workgroup reads, and the loops collapse from ROW_TILE scalar operations to
+// ROW_TILE/4 vector ones.
+//
+// 🔴 IN PLACE AND NOT IN TWO MORE ARRAYS, WHICH IS THE DIFFERENCE FROM THE
+// output KERNEL. That one already held 24 of the device's 32 KiB, so a fifth
+// array cost no residency; this one holds 8, and two more would take it to 16 -
+// halving how many workgroups a core can keep. Neither raw tensor is wanted
+// after its own normalisation, so each is overwritten where it lies. The
+// barrier below is what makes that safe.
 var<workgroup> xq: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> qcond: array<${rowVector}, ${rowGroups * channels}>;
 
@@ -526,26 +541,31 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // ...a row past the end is clamped rather than skipped: every lane reaches
   // the barriers, and its lane of each vector is dropped at the write.
+  for (var c = local; c < C; c += 64u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      xq[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c];
+      qcond[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    }`)}
+  }
+  workgroupBarrier();
+
   ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
   var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      total${rowGroup(t)}${rowLane(t)} += act[row * C + c];
-      cond_total${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + c];
-    }`)}
+    ${overRowGroups((g) => `total${g} += xq[${g}u * C + c];
+    cond_total${g} += qcond[${g}u * C + c];`)}
   }
   ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
   let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
   var variance${g} = ${rowVector}(0.0);
   var cond_variance${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      let d = act[row * C + c] - mean${rowGroup(t)}${rowLane(t)};
-      variance${rowGroup(t)}${rowLane(t)} += d * d;
-      let e = queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)};
-      cond_variance${rowGroup(t)}${rowLane(t)} += e * e;
+    ${overRowGroups((g) => `{
+      let d = xq[${g}u * C + c] - mean${g};
+      variance${g} += d * d;
+      let e = qcond[${g}u * C + c] - cond_mean${g};
+      cond_variance${g} += e * e;
     }`)}
   }
   ${overRowGroups((g) => `let inverse${g} =
@@ -553,14 +573,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let cond_inverse${g} =
     inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
 
+  // ...the two loops above read every slot on every lane, so nothing may be
+  // overwritten until all of them are past it.
+  workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_${prefix}SingleCondLayerNormScale + c];
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      qcond[${rowGroup(t)}u * C + c]${rowLane(t)} =
-        (queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)})
-        * cond_inverse${rowGroup(t)}${rowLane(t)} * scale;
-    }`)}
+    ${overRowGroups((g) => `qcond[${g}u * C + c] =
+      (qcond[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
   }
   workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
@@ -576,14 +595,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         shift${g} += cn * wb;
       }`)}
     }
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      xq[${rowGroup(t)}u * C + c]${rowLane(t)} =
-        logistic(scale_value${rowGroup(t)}${rowLane(t)})
-        * ((act[row * C + c] - mean${rowGroup(t)}${rowLane(t)})
-           * inverse${rowGroup(t)}${rowLane(t)})
-        + shift${rowGroup(t)}${rowLane(t)};
-    }`)}
+    // ...written out rather than through logistic(), which takes an f32; this
+    // is its definition applied to the whole vector, so the arithmetic is the
+    // same one. The output kernel above spells it the same way.
+    ${overRowGroups((g) => `xq[${g}u * C + c] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
+      * ((xq[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
   }
   workgroupBarrier();
 
@@ -838,6 +855,24 @@ const ROW_TILE: u32 = ${outputRowTile}u;
 
 var<workgroup> gated: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> after: array<${rowVector}, ${rowGroups * channels}>;
+// 🔴 THE RAW CONDITIONING, STAGED ONCE, AND IT IS NOT cond_norm. It is read
+// in FIVE places - the two adaptive-zero projections, the two passes of its own
+// LayerNorm, and the normalisation itself - and it was read from GLOBAL memory
+// in every one, once per row of the tile. Two of those loops run over every
+// channel on EVERY lane rather than a strided share, so a workgroup of 64 was
+// issuing tens of thousands of global loads for the C * ROW_TILE distinct
+// values it needed. Staged, that is C * ROW_TILE loads and the rest are
+// workgroup reads - and because the stage is a vector over the tile's rows, the
+// loops reading it collapse from ROW_TILE scalar operations to ROW_TILE/4
+// vector ones.
+//
+// 🔴 IT CANNOT SHARE cond_norm's SLOTS, which is the first thing to try and
+// is wrong. The SECOND adaptive-zero projection reads the RAW conditioning -
+// see the note where it does - and it runs after the normalised form has been
+// written. Normalising in place would feed it the wrong tensor silently, and
+// nothing here would fail. It costs 4 KiB and no residency: this kernel already
+// holds 24 of the device's 32 KiB, so it is one workgroup a core either way.
+var<workgroup> cond_raw: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> cond_norm: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> x: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> wide: array<${rowVector}, ${rowGroups * intermediate}>;
@@ -858,6 +893,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
     }`)}
   }
+  for (var c = local; c < C; c += 64u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      cond_raw[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    }`)}
+  }
   workgroupBarrier();
 
   for (var c = local; c < C; c += 64u) {
@@ -870,10 +911,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     ${overRowGroups((g) => `var zero${g} = ${rowVector}(weights[W_AdaptiveZeroCondBias + c]);`)}
     for (var d = 0u; d < C; d += 1u) {
       let weight = weights[W_AdaptiveZeroCondWeights + d * C + c];
-      ${overRows((t) => `{
-        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-        zero${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + d] * weight;
-      }`)}
+      ${overRowGroups((g) => `zero${g} += cond_raw[${g}u * C + d] * weight;`)}
     }
     ${overRows((t) => `{
       let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
@@ -901,30 +939,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   ${overRowGroups((g) => `var cond_total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      cond_total${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + c];
-    }`)}
+    ${overRowGroups((g) => `cond_total${g} += cond_raw[${g}u * C + c];`)}
   }
   ${overRowGroups((g) => `let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));`)}
   ${overRowGroups((g) => `var cond_variance${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      let d = queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)};
-      cond_variance${rowGroup(t)}${rowLane(t)} += d * d;
+    ${overRowGroups((g) => `{
+      let d = cond_raw[${g}u * C + c] - cond_mean${g};
+      cond_variance${g} += d * d;
     }`)}
   }
   ${overRowGroups((g) => `let cond_inverse${g} =
     inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
   for (var c = local; c < C; c += 64u) {
     let scale = weights[W_ffwSingleCondLayerNormScale + c];
-    ${overRows((t) => `{
-      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-      cond_norm[${rowGroup(t)}u * C + c]${rowLane(t)} =
-        (queries_cond[row * C + c] - cond_mean${rowGroup(t)}${rowLane(t)})
-        * cond_inverse${rowGroup(t)}${rowLane(t)} * scale;
-    }`)}
+    ${overRowGroups((g) => `cond_norm[${g}u * C + c] =
+      (cond_raw[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
   }
   workgroupBarrier();
   for (var c = local; c < C; c += 64u) {
@@ -975,10 +1005,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       `var zero${g} = ${rowVector}(weights[W_ffwAdaptiveZeroCondBias + c]);`)}
     for (var d = 0u; d < C; d += 1u) {
       let weight = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
-      ${overRows((t) => `{
-        let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
-        zero${rowGroup(t)}${rowLane(t)} += queries_cond[row * C + d] * weight;
-      }`)}
+      ${overRowGroups((g) => `zero${g} += cond_raw[${g}u * C + d] * weight;`)}
     }
     ${overRows((t) => `{
       let row = base_row + ${t}u;

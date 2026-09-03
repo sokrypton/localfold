@@ -41,6 +41,11 @@ const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "59"));
   const calls = Number(option(args, "calls", "9"));
+  // 🔴 SIXTEEN WAS NOT ENOUGH TO SEE THE ATOM BLOCKS. They are 106 ms of a
+  // 261 ms call at 150 tokens and most of their passes fell off the end of the
+  // list, so the two stages that are 41% of a denoiser call were invisible to
+  // the only tool that profiles it.
+  const passCount = Number(option(args, "passes", "16"));
   const sequence = Array.from({ length: tokens },
     (_, index) => ALPHABET[index % ALPHABET.length]).join("");
 
@@ -103,7 +108,7 @@ export async function main(device, args) {
   };
   return {
     tokens, atoms: tokens * dense, subsets: batch.shape.subsets, weightLoadMs: loadMs,
-    ...(gpuPasses === undefined ? {} : { gpuPasses: gpuPasses.slice(0, 16) }),
+    ...(gpuPasses === undefined ? {} : { gpuPasses: gpuPasses.slice(0, passCount) }),
     rows,
     range: {
       whole: spread((r) => r.whole),
