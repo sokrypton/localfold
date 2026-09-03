@@ -199,6 +199,8 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
   // interface - and unlike the TM term it needs no frame at all, which also
   // means it cannot move as the structure settles.
   const contactEstimates = {};
+  let crossSorted = [];
+  let chainSizes = [];
   {
     const cross = [];
     for (let i = 0; i < tokens; i += 1) {
@@ -208,6 +210,18 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
       }
     }
     cross.sort((a, b) => b - a);
+    // 🔴 THE SORTED LIST AND THE CHAIN SIZES, so any rule for HOW MANY to take
+    // can be swept without re-folding. A count that does not scale with the
+    // smaller chain cannot be right at both ends - a short peptide cannot
+    // present as many interface contacts as a domain - and testing that needs
+    // the raw list, not a handful of precomputed means.
+    crossSorted = cross.slice(0, 512).map((v) => Number(v.toFixed(4)));
+    const sizes = new Map();
+    for (let i = 0; i < tokens; i += 1) {
+      if (batch.seqMask[i] <= 0) continue;
+      sizes.set(asymId[i], (sizes.get(asymId[i]) ?? 0) + 1);
+    }
+    chainSizes = [...sizes.values()].sort((a, b) => a - b);
     for (const n of [4, 8, 16, 32, 64, 128, 256, 1e9]) {
       const take = Math.min(n, cross.length);
       contactEstimates[n >= 1e9 ? "all" : `top${n}`] = take === 0 ? null
@@ -243,6 +257,8 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
     iptm: Number.isNaN(result.iptm) ? null : Number(result.iptm.toFixed(3)),
     iptmEstimate: Number.isNaN(iptmEstimate) ? null : Number(iptmEstimate.toFixed(3)),
     contactEstimates,
+    crossSorted,
+    chainSizes,
     prepareMs: Number(prepareMs.toFixed(1)),
     perFrameMs: Number(scoreMs.toFixed(2)),
     trajectory: frames.map(({ step, positions }) =>

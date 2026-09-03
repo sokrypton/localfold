@@ -109,8 +109,30 @@ const TOLERANCE = 1.0;
 const INCLUSION_RADIUS = 15;
 const MINIMUM_SEPARATION = 1;
 const CONTACTS = 16;
-/** How many of the strongest cross-chain contacts the interface score means over. */
-const INTERFACE_CONTACTS = 64;
+/**
+ * How many of the strongest cross-chain contacts the interface score means
+ * over, as a fraction of the SMALLER chain's length, and the floor below which
+ * that fraction stops being sensible.
+ *
+ * 🔴 IT SCALES WITH THE SMALLER CHAIN BECAUSE THE INTERFACE DOES. A twenty
+ * residue peptide cannot present as many contacts as a ninety residue domain,
+ * so a fixed count reaches past the real interface on the small ones and stops
+ * short of it on the large. Measured on fifteen two-chain folds with the
+ * smaller chain spanning 20 to 93 residues, as the correlation between the
+ * estimate's residual error and that length - which is the size bias itself,
+ * with the constant offset every version of this has already removed:
+ *
+ *     fixed 64        +0.258        0.5x smaller chain   -0.072
+ *     fixed 32        +0.194        1.0x smaller chain   -0.259
+ *
+ * A fixed count is biased high for the larger complexes; half the smaller
+ * chain has no size trend left, and a full chain length over-corrects. It also
+ * ranks best of the four against the real ipTM (Spearman 0.875 against 0.846
+ * for fixed 64), though that difference alone is inside what fifteen targets
+ * can resolve - the flat residual is the reason to prefer it.
+ */
+const INTERFACE_CONTACT_FRACTION = 0.5;
+const INTERFACE_CONTACT_FLOOR = 8;
 /**
  * ...relaxed for a chain too short to have contacts at that separation at all.
  *
@@ -399,17 +421,21 @@ export function distogramTmTerm(table, pseudoBeta, d0) {
  * apart in any complex, so the mean measures interface SIZE against total size
  * and collapses to nothing.
  *
- * Measured against the real ipTM on ten two-chain folds spanning 0.12 to 0.74,
- * as Pearson over all ten and over the eight that are not nonsense homodimers:
+ * Measured against the real ipTM on two-chain folds spanning 0.10 to 0.74, as
+ * Pearson over ten of them and over the eight that are not nonsense
+ * homodimers:
  *
  *     top 4    0.742 / 0.872      top 64   0.890 / 0.974
  *     top 16   0.809 / 0.923      top 128  0.863 / 0.972
  *     top 32   0.854 / 0.953      ALL     0.156 / 0.120
  *
- * The collapse at "all" against the peak at 64 is the result; the plateau from
- * 32 to 128 is broad, so the exact count is not delicate. It also beats the
- * distance-agreement estimator above on rank - 0.855 against 0.552 over the
- * ten - which is what a score anyone compares between folds needs.
+ * The collapse at "all" against the peak around 64 is the result: averaging
+ * every cross-chain pair measures interface size against total size and
+ * carries almost nothing. It also beats the distance-agreement estimator above
+ * on rank - 0.855 against 0.552 - which is what a score anyone compares
+ * between folds needs.
+ *
+ * How many to take is not a constant; see INTERFACE_CONTACT_FRACTION.
  *
  * 🔴 IT IS FRAME-INDEPENDENT, WHICH IS THE PRICE. It reads the distogram alone,
  * so it is one number for a fold and cannot animate the way the pLDDT stand-in
@@ -424,25 +450,29 @@ export function distogramTmTerm(table, pseudoBeta, d0) {
  * @param {ArrayLike<number>} asymId  tokens, the chain each token belongs to
  * @param {Float32Array} seqMask  tokens
  * @param {number} tokens
- * @param {number} count  how many of the strongest to mean over
+ * @param {number} [count]  how many of the strongest to mean over; by default
+ *   half the smaller chain's length, floored at 8
  * @returns {number} 0 to 1, or NaN when there is no interface to score
  */
-export function distogramInterfaceContact(
-  contactProbs, asymId, seqMask, tokens, count = INTERFACE_CONTACTS,
-) {
+export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens, count) {
   const cross = [];
+  const sizes = new Map();
   for (let i = 0; i < tokens; i += 1) {
     if (seqMask[i] <= 0) continue;
+    sizes.set(asymId[i], (sizes.get(asymId[i]) ?? 0) + 1);
     for (let j = 0; j < tokens; j += 1) {
       if (seqMask[j] <= 0 || asymId[i] === asymId[j]) continue;
       cross.push(contactProbs[i * tokens + j]);
     }
   }
+  const smallest = sizes.size === 0 ? 0 : Math.min(...sizes.values());
+  const wanted = count ?? Math.max(
+    INTERFACE_CONTACT_FLOOR, Math.round(INTERFACE_CONTACT_FRACTION * smallest));
   // ...NaN rather than zero for a single chain, as ipTM itself reports: there
   // is no interface to score, which is not the same as a bad one.
   if (cross.length === 0) return Number.NaN;
   cross.sort((a, b) => b - a);
-  const take = Math.min(count, cross.length);
+  const take = Math.min(wanted, cross.length);
   let total = 0;
   for (let index = 0; index < take; index += 1) total += cross[index];
   return total / take;

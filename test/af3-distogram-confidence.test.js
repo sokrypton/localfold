@@ -163,6 +163,47 @@ describe("distogram interface contact", () => {
     assert.ok(everything < 0.1, `mean over all was ${everything}`);
   });
 
+  it("counts a fraction of the SMALLER chain, not a fixed number", () => {
+    // 🔴 THE HYPOTHESIS THIS RULE EXISTS FOR. A short chain cannot present as
+    // many interface contacts as a long one, so a fixed count reaches past the
+    // real interface on the small ones - measured as a +0.26 correlation
+    // between the estimate's error and the smaller chain's length. Half the
+    // smaller chain leaves no size trend.
+    //
+    // Built so the answer SAYS how many were taken: the strongest `n` contacts
+    // are 1 and the rest 0, so the score is (however many were taken, capped at
+    // the number of ones) / (however many were taken).
+    const build = (a, b, ones) => {
+      const n = a + b;
+      const asym = Int32Array.from({ length: n }, (_, i) => (i < a ? 0 : 1));
+      const live = new Float32Array(n).fill(1);
+      const probs = new Float32Array(n * n);
+      let placed = 0;
+      for (let i = 0; i < a && placed < ones; i += 1) {
+        for (let j = a; j < n && placed < ones; j += 1) { probs[i * n + j] = 1; placed += 1; }
+      }
+      return { probs, asym, live, n };
+    };
+    // 20 by 90: half of 20 is 10 contacts. Twenty ones means all ten are 1.
+    const small = build(20, 90, 20);
+    assert.equal(distogramInterfaceContact(small.probs, small.asym, small.live, small.n), 1);
+    // 90 by 90: half of 90 is 45. Twenty ones over 45 taken is well under 1,
+    // which a fixed count of 10 would have reported as a perfect interface.
+    const big = build(90, 90, 20);
+    const score = distogramInterfaceContact(big.probs, big.asym, big.live, big.n);
+    assert.ok(Math.abs(score - 20 / 45) < 1e-6, `scored ${score}`);
+  });
+
+  it("floors the count, so a tiny chain still averages something", () => {
+    const n = 8;
+    const asym = Int32Array.from([0, 0, 0, 0, 1, 1, 1, 1]);
+    const live = new Float32Array(n).fill(1);
+    const probs = new Float32Array(n * n).fill(1);
+    // Half of four is two, below the floor of eight - it must not divide by two
+    // and it must not divide by more than the pairs that exist.
+    assert.equal(distogramInterfaceContact(probs, asym, live, n), 1);
+  });
+
   it("ignores masked tokens on both sides of the interface", () => {
     const half = Float32Array.from([1, 1, 1, 1, 0, 0, 0, 0]);
     assert.ok(Number.isNaN(distogramInterfaceContact(probs(0.9, 0.1), asymId, half, tokens)));
