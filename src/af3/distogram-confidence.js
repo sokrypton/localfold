@@ -109,6 +109,8 @@ const TOLERANCE = 1.0;
 const INCLUSION_RADIUS = 15;
 const MINIMUM_SEPARATION = 1;
 const CONTACTS = 16;
+/** How many of the strongest cross-chain contacts the interface score means over. */
+const INTERFACE_CONTACTS = 64;
 /**
  * ...relaxed for a chain too short to have contacts at that separation at all.
  *
@@ -343,25 +345,20 @@ export function calibrateToPlddt(approxFinal, realFinal, mask) {
  * ten-target panel it is optimistic by +0.125 of pTM on average, high on nine
  * of the ten.
  *
- * 🔴 SO USE IT FOR pTM AND NOT FOR ipTM. pTM correlates at 0.843 across the
- * panel, which is a usable trend. ipTM does not survive at all:
+ * 🔴 IT TRACKS ipTM TOO, AND AN EARLIER VERSION OF THIS COMMENT SAID IT COULD
+ * NOT. That claim was measured on two complexes whose real ipTM was 0.129 and
+ * 0.153 - both at the bottom of the range - so a constant offset read as a
+ * total failure. Across ten complexes spanning 0.12 to 0.74 it correlates at
+ * 0.734 (0.954 excluding two nonsense homodimers), biased high throughout. Two
+ * points cannot tell a bias from a blindness, and I called it a blindness.
  *
- *     6MRR homodimer   real 0.129   estimated 0.409
- *     hetero 2-chain   real 0.153   estimated 0.454
+ * 🔴 BUT `distogramInterfaceContact` BEATS IT FOR ipTM AND IS SIMPLER. See
+ * below. This is kept for pTM, where it correlates at 0.843 across the mixed
+ * panel and 0.997 across the complexes.
  *
- * Three times too high on both complexes, and the reason is the floor above.
- * The thing this cannot see - a pair at the right distance but the wrong
- * orientation about it - is precisely what an INTERFACE score is asking about,
- * so the blind spot is total exactly where ipTM lives. The distogram is
- * confident about the cross-chain distances and the frame matches them; the
- * PAE head, which is trained on alignment error rather than on distance, knows
- * the interface is unreliable anyway. Reporting 0.41 where the truth is 0.13 is
- * the difference between a plausible interface and none, so this must not be
- * shown as ipTM.
- *
- * It is deliberately NOT wired to the page. It is here because the measurement
- * is worth keeping and because a reader will otherwise wonder whether pTM could
- * come from the distogram too - it can, roughly; ipTM cannot.
+ * It is deliberately NOT wired to the page: it is optimistic by about +0.16 of
+ * pTM and the bias is not constant, so it would sit beside the real score at
+ * the final frame and visibly step.
  *
  * @param {ReturnType<typeof distogramAgreementTable>} table
  * @param {Float32Array} pseudoBeta  tokens * 3
@@ -389,4 +386,64 @@ export function distogramTmTerm(table, pseudoBeta, d0) {
     }
   }
   return term;
+}
+
+/**
+ * How strongly the trunk believes two chains touch, from its own contacts.
+ *
+ * 🔴 THE STRONGEST CROSS-CHAIN CONTACTS, NOT THE AVERAGE OF THEM, AND THAT IS
+ * THE WHOLE ESTIMATOR. The distogram head already computes P(d <= 8 A) for
+ * every pair, so an interface is a question it has effectively been asked
+ * already: are there cross-chain pairs it is confident about? Averaging over
+ * ALL cross-chain pairs answers a different question - most of them are far
+ * apart in any complex, so the mean measures interface SIZE against total size
+ * and collapses to nothing.
+ *
+ * Measured against the real ipTM on ten two-chain folds spanning 0.12 to 0.74,
+ * as Pearson over all ten and over the eight that are not nonsense homodimers:
+ *
+ *     top 4    0.742 / 0.872      top 64   0.890 / 0.974
+ *     top 16   0.809 / 0.923      top 128  0.863 / 0.972
+ *     top 32   0.854 / 0.953      ALL     0.156 / 0.120
+ *
+ * The collapse at "all" against the peak at 64 is the result; the plateau from
+ * 32 to 128 is broad, so the exact count is not delicate. It also beats the
+ * distance-agreement estimator above on rank - 0.855 against 0.552 over the
+ * ten - which is what a score anyone compares between folds needs.
+ *
+ * 🔴 IT IS FRAME-INDEPENDENT, WHICH IS THE PRICE. It reads the distogram alone,
+ * so it is one number for a fold and cannot animate the way the pLDDT stand-in
+ * does. What it buys for that is availability: it is ready the moment the trunk
+ * is, before a single denoiser call.
+ *
+ * 🔴 AND IT IS NOT ON ipTM's SCALE. It is a mean probability - 0.99 where ipTM
+ * is 0.74 - so it ranks well and cannot be shown as an ipTM without a
+ * calibration nobody here has fitted.
+ *
+ * @param {ArrayLike<number>} contactProbs  tokens * tokens, P(d <= 8 A)
+ * @param {ArrayLike<number>} asymId  tokens, the chain each token belongs to
+ * @param {Float32Array} seqMask  tokens
+ * @param {number} tokens
+ * @param {number} count  how many of the strongest to mean over
+ * @returns {number} 0 to 1, or NaN when there is no interface to score
+ */
+export function distogramInterfaceContact(
+  contactProbs, asymId, seqMask, tokens, count = INTERFACE_CONTACTS,
+) {
+  const cross = [];
+  for (let i = 0; i < tokens; i += 1) {
+    if (seqMask[i] <= 0) continue;
+    for (let j = 0; j < tokens; j += 1) {
+      if (seqMask[j] <= 0 || asymId[i] === asymId[j]) continue;
+      cross.push(contactProbs[i * tokens + j]);
+    }
+  }
+  // ...NaN rather than zero for a single chain, as ipTM itself reports: there
+  // is no interface to score, which is not the same as a bad one.
+  if (cross.length === 0) return Number.NaN;
+  cross.sort((a, b) => b - a);
+  const take = Math.min(count, cross.length);
+  let total = 0;
+  for (let index = 0; index < take; index += 1) total += cross[index];
+  return total / take;
 }

@@ -193,6 +193,27 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
   const bothLive = (a, b) => batch.seqMask[a] > 0 && batch.seqMask[b] > 0;
   const tmTerm = distogramTmTerm(table, gather(result.positions), tmScoreD0(tokens));
   const ptmEstimate = reduceTmScore(tmTerm, tokens, bothLive);
+  // 🔴 AND A SECOND, SIMPLER ipTM ESTIMATE: does the trunk believe these chains
+  // TOUCH? The distogram head already computes P(d <= 8 A) for every pair, so
+  // the strongest cross-chain contacts are a direct statement about the
+  // interface - and unlike the TM term it needs no frame at all, which also
+  // means it cannot move as the structure settles.
+  const contactEstimates = {};
+  {
+    const cross = [];
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        if (!bothLive(i, j) || asymId[i] === asymId[j]) continue;
+        cross.push(result.trunk.contactProbs[i * tokens + j]);
+      }
+    }
+    cross.sort((a, b) => b - a);
+    for (const n of [4, 8, 16, 32, 64, 128, 256, 1e9]) {
+      const take = Math.min(n, cross.length);
+      contactEstimates[n >= 1e9 ? "all" : `top${n}`] = take === 0 ? null
+        : Number((cross.slice(0, take).reduce((s, x) => s + x, 0) / take).toFixed(3));
+    }
+  }
   const iptmEstimate = reduceTmScore(tmTerm, tokens,
     (a, b) => bothLive(a, b) && asymId[a] !== asymId[b]);
   const scoreMs = performance.now() - scoreStart;
@@ -221,6 +242,7 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
     ptmEstimate: Number(ptmEstimate.toFixed(3)),
     iptm: Number.isNaN(result.iptm) ? null : Number(result.iptm.toFixed(3)),
     iptmEstimate: Number.isNaN(iptmEstimate) ? null : Number(iptmEstimate.toFixed(3)),
+    contactEstimates,
     prepareMs: Number(prepareMs.toFixed(1)),
     perFrameMs: Number(scoreMs.toFixed(2)),
     trajectory: frames.map(({ step, positions }) =>

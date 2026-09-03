@@ -11,7 +11,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { distogramAgreementTable, distogramConfidence }
+import { distogramAgreementTable, distogramConfidence, distogramInterfaceContact }
   from "../src/af3/distogram-confidence.js";
 
 const BINS = 64;
@@ -121,5 +121,50 @@ describe("distogram confidence", () => {
     const others = [...scores.keys()].filter((i) => i !== moved);
     const best = Math.max(...others.map((i) => scores[i]));
     assert.ok(scores[moved] < best, `moved token scored ${scores[moved]} against ${best}`);
+  });
+});
+
+describe("distogram interface contact", () => {
+  const tokens = 8;
+  const mask = new Float32Array(tokens).fill(1);
+  // Two chains of four.
+  const asymId = Int32Array.from([0, 0, 0, 0, 1, 1, 1, 1]);
+  const probs = (crossValue, intraValue) => {
+    const out = new Float32Array(tokens * tokens);
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        out[i * tokens + j] = asymId[i] === asymId[j] ? intraValue : crossValue;
+      }
+    }
+    return out;
+  };
+
+  it("reads the cross-chain contacts and ignores the intra-chain ones", () => {
+    // 🔴 THE INTRA VALUE IS THE OPPOSITE OF THE CROSS ONE ON PURPOSE. A score
+    // that quietly averaged both would land in the middle and look plausible.
+    const score = distogramInterfaceContact(probs(0.9, 0.1), asymId, mask, tokens);
+    assert.ok(Math.abs(score - 0.9) < 1e-6, `scored ${score}`);
+  });
+
+  it("is NaN for a single chain, as ipTM itself is", () => {
+    const one = new Int32Array(tokens);
+    assert.ok(Number.isNaN(distogramInterfaceContact(probs(0.9, 0.9), one, mask, tokens)));
+  });
+
+  it("takes the STRONGEST contacts, not the mean of all of them", () => {
+    // One confident interface pair among many empty ones: a mean over
+    // everything buries it, a mean over the strongest few does not.
+    const out = new Float32Array(tokens * tokens);
+    out[0 * tokens + 4] = 1;
+    out[4 * tokens + 0] = 1;
+    const strongest = distogramInterfaceContact(out, asymId, mask, tokens, 2);
+    const everything = distogramInterfaceContact(out, asymId, mask, tokens, 1e9);
+    assert.equal(strongest, 1);
+    assert.ok(everything < 0.1, `mean over all was ${everything}`);
+  });
+
+  it("ignores masked tokens on both sides of the interface", () => {
+    const half = Float32Array.from([1, 1, 1, 1, 0, 0, 0, 0]);
+    assert.ok(Number.isNaN(distogramInterfaceContact(probs(0.9, 0.1), asymId, half, tokens)));
   });
 });
