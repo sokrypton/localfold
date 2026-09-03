@@ -52,10 +52,31 @@
  * 🔴 IT IS NOT pLDDT AND MUST NOT BE LABELLED AS IT. pLDDT is a learned head
  * predicting the lDDT of a structure against the unknown truth; this measures
  * agreement with another of the model's own predictions, so it cannot know
- * anything the trunk did not. Where they part company is instructive and is
- * measured in tools/gpu/probe-distogram-confidence.js: it is a good rank
- * proxy and a poor absolute one, so use it for a colour ramp and never for a
- * number a user might compare against a real pLDDT.
+ * anything the trunk did not.
+ *
+ * 🔴 AND THE TEST THAT MATTERS IS ACROSS TARGETS, NOT WITHIN ONE. Ranking
+ * residues inside a fold says whether the loop looks worse than the core.
+ * Whether a BAD fold looks worse than a good one is a different question, and
+ * it is the one somebody comparing two predictions is asking. On an
+ * eight-target panel spanning three that fold, a miniprotein, a scramble, a
+ * linker and a homopolymer (tools/gpu/probe-distogram-confidence.js
+ * --sequences=panel):
+ *
+ *     across targets   rank 0.762, linear 0.712 against mean pLDDT
+ *     within targets   0.29 to 0.83 where the real pLDDT actually varies
+ *
+ * 🔴 THE WITHIN-TARGET NUMBERS ARE ONLY MEANINGFUL WHERE THERE IS SOMETHING TO
+ * RANK. The panel's three worst - a GS linker at -0.30, poly-alanine at 0.06,
+ * trp-cage at 0.46 - all have a real pLDDT that barely varies (spread 3.1, 2.4
+ * and 2.1 points), so the correlation there is noise against noise and a low
+ * number is not a failure. The probe reports that spread beside the
+ * correlation for exactly this reason.
+ *
+ * 🔴 AND THE TOP OF THE RANGE IS WHERE THE RAW SCORE IS WORST. trp-cage is the
+ * panel's most confident target at a real 96.6 and scores 54.0: a small rigid
+ * protein's DISTANCE uncertainty does not shrink the way its pLDDT rises. So
+ * the raw number must not be compared between folds. `calibrateToPlddt` is the
+ * answer to that and is not optional if the colour is meant to mean anything.
  *
  * 🔴 AND ITS COST IS ALL IN THE PREPARATION, WHICH IS ONCE PER FOLD. The table
  * below is pairs x bins and takes one softmax and one prefix sum per pair;
@@ -205,4 +226,56 @@ export function distogramConfidence(table, pseudoBeta) {
     scores[i] = (total / count) * 100;
   }
   return scores;
+}
+
+/**
+ * Put the stand-in on the fold's OWN pLDDT scale, using the final frame.
+ *
+ * 🔴 THIS IS WHAT MAKES IT COMPARABLE, AND WITHOUT IT THE RAW SCORE IS NOT.
+ * Measured across an eight-target panel, the raw score orders targets about
+ * right - rank correlation 0.76 against their mean pLDDT - but its ABSOLUTE
+ * range is compressed and length-dependent, and the top of the range is where
+ * it is worst: trp-cage is the panel's most confident target at a real 96.6 and
+ * scores 54.0. Colouring two folds with the raw number would say the wrong
+ * thing about which was better.
+ *
+ * A fold computes the real per-token pLDDT of its FINAL structure anyway, so
+ * every trajectory has an anchor. Matching the mean and spread of the stand-in
+ * to that anchor costs nothing, is exact on the final frame by construction,
+ * and leaves the ranking untouched - the map is affine and increasing, so it
+ * moves no residue past another. What it cannot fix is how the INTERMEDIATE
+ * frames map, which nothing can: there is no pLDDT for a half-formed
+ * structure to check against.
+ *
+ * 🔴 AND IT NEEDS THE FOLD TO HAVE FINISHED, which is a constraint on the UI
+ * and not on the arithmetic. A trajectory drawn live has no anchor yet; the
+ * honest options are to colour live on the raw score and recolour once the
+ * fold lands, or to draw the trajectory only on replay.
+ *
+ * @param {Float32Array} approxFinal  the stand-in on the final frame
+ * @param {Float64Array|Float32Array} realFinal  per-token pLDDT of that frame
+ * @param {Float32Array} mask  tokens; only live tokens are fitted
+ * @returns {(scores: Float32Array) => Float32Array}
+ */
+export function calibrateToPlddt(approxFinal, realFinal, mask) {
+  const live = [];
+  for (let i = 0; i < mask.length; i += 1) if (mask[i] > 0) live.push(i);
+  const mean = (pick) => live.reduce((sum, i) => sum + pick(i), 0) / Math.max(live.length, 1);
+  const spread = (pick, m) => Math.sqrt(
+    live.reduce((sum, i) => sum + (pick(i) - m) ** 2, 0) / Math.max(live.length, 1));
+  const approxMean = mean((i) => approxFinal[i]);
+  const realMean = mean((i) => realFinal[i]);
+  const approxSd = spread((i) => approxFinal[i], approxMean);
+  const realSd = spread((i) => realFinal[i], realMean);
+  // ...a flat stand-in cannot be stretched to a varying pLDDT, and pretending
+  // otherwise would amplify noise into a colour. Shift only.
+  const gain = approxSd > 1e-3 ? realSd / approxSd : 0;
+  return (scores) => {
+    const out = new Float32Array(scores.length);
+    for (let i = 0; i < scores.length; i += 1) {
+      const value = realMean + gain * (scores[i] - approxMean);
+      out[i] = Math.min(100, Math.max(0, value));
+    }
+    return out;
+  };
 }

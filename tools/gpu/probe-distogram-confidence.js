@@ -26,13 +26,21 @@
  * settings that survived all three are in src/af3/distogram-confidence.js with
  * what each alternative measured. Run this on more than one sequence before
  * believing any change to it.
+ *
+ * 🔴 AND ACROSS TARGETS IS A DIFFERENT QUESTION FROM WITHIN ONE, WHICH IS THE
+ * QUESTION A COLOUR ACTUALLY ASKS. Ranking residues inside a fold says whether
+ * the wobbly loop looks worse than the core. It says NOTHING about whether a
+ * badly folded protein looks worse than a well folded one - and somebody
+ * comparing two predictions, or watching one resolve, is doing exactly that.
+ * `--sequences` folds several and reports the correlation of the MEANS, which
+ * is the test that a 0.9 target and a 0.5 target come out in that order.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
-import { distogramAgreementTable, distogramConfidence }
+import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
   from "../../src/af3/distogram-confidence.js";
 
 const option = (args, name, fallback) => {
@@ -41,6 +49,23 @@ const option = (args, name, fallback) => {
 };
 
 const DEFAULT = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK";
+
+/**
+ * A spread of targets for the across-target test, chosen to span the range
+ * rather than to be representative: three that should fold, one miniprotein,
+ * and three that should not - a scramble, a linker and a homopolymer. A
+ * correlation measured only on things that fold says nothing.
+ */
+const PANEL = [
+  ["6MRR", DEFAULT],
+  ["Top7", "DIQVQVNIDDNGKNFDYTYTVTTESELQKVLNELMDYIKKQGAKRVRISITARTKKEAEKFAAILIKVFAELGYNDINVTFDGDTVTVEGQLE"],
+  ["designed-58", "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK"],
+  ["villin-HP36", "LSDEDFKAVFGMTRSAFANLPLWKQQNLKKEKGLF"],
+  ["trp-cage", "NLYIQWLKDGGPSSGRPPPS"],
+  ["6MRR-scrambled", "EKLGKFLKSLEHTKEEGRWLNFAKQGKKGLEAIVELPLIKELSTKQFAEKAIGLRLTEKS"],
+  ["GS-linker", "GSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGS"],
+  ["poly-alanine", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+];
 
 function pearson(a, b) {
   const n = a.length;
@@ -71,26 +96,13 @@ function ranks(values) {
   return out;
 }
 
-export async function main(device, args) {
-  const sequence = option(args, "sequence", DEFAULT);
-  const steps = Number(option(args, "steps", "8"));
-  const mode = option(args, "mode", "flow");
+async function foldOne(device, sequence, weights, { steps, mode, seed }) {
   const batch = featuriseProtein(sequence, {});
-  const store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
-  const [trunk, diffusion, confidence, reference, targetFeat] = await Promise.all([
-    trunkWeights(store), diffusionWeights(store), confidenceWeights(store),
-    atomReference(store), targetFeatureWeights(store),
-  ]);
-
-  // Every frame's pseudo-beta, kept as the sampler produces them.
   const frames = [];
-  const result = await foldBatch(device, batch,
-    { trunk, diffusion, confidence, atomReference: reference, targetFeat },
-    {
-      mode, steps, recycles: 0, seed: 3,
-      onStep: ({ step, denoised }) => { frames.push({ step, positions: denoised }); },
-    });
-
+  const result = await foldBatch(device, batch, weights, {
+    mode, steps, recycles: 0, seed,
+    onStep: ({ step, denoised }) => { frames.push({ step, positions: denoised }); },
+  });
   const tokens = batch.tokens;
   const beta = batch.tokenAtomsToPseudoBeta;
   const gather = (positions) => {
@@ -102,14 +114,13 @@ export async function main(device, args) {
     }
     return out;
   };
-
   const prepareStart = performance.now();
   const table = distogramAgreementTable(
     result.trunk.logits, result.trunk.binEdges, tokens, batch.seqMask);
   const prepareMs = performance.now() - prepareStart;
 
-  // The real per-token pLDDT: the head emits one distribution per dense atom
-  // slot, so a token's score is the mean over the atoms it actually has.
+  // The head emits one distribution per dense atom slot, so a token's pLDDT is
+  // the mean over the atoms it actually has.
   const realPlddt = new Float64Array(tokens);
   for (let token = 0; token < tokens; token += 1) {
     let total = 0; let count = 0;
@@ -121,59 +132,81 @@ export async function main(device, args) {
     }
     realPlddt[token] = count === 0 ? 0 : total / count;
   }
-
-  const finalBeta = gather(result.positions);
   const scoreStart = performance.now();
-  const approx = distogramConfidence(table, finalBeta);
+  const approx = distogramConfidence(table, gather(result.positions));
   const scoreMs = performance.now() - scoreStart;
 
   const live = [...batch.seqMask.keys()].filter((t) => batch.seqMask[t] > 0);
   const pick = (values) => Float64Array.from(live, (t) => values[t]);
   const a = pick(realPlddt);
   const b = pick(approx);
+  const mean = (v) => v.reduce((s, x) => s + x, 0) / v.length;
+  // 🔴 THE SPREAD OF THE REAL pLDDT IS REPORTED BESIDE THE CORRELATION, because
+  // a correlation against something that barely varies is measuring noise. A
+  // GS linker's per-residue pLDDT is nearly flat; ranking it is not a question
+  // this or anything else can answer, and a low number there is not a failure.
+  const sd = (v) => {
+    const m = mean(v);
+    return Math.sqrt(v.reduce((s, x) => s + (x - m) ** 2, 0) / v.length);
+  };
+  return {
+    tokens: live.length,
+    realMean: Number(mean(a).toFixed(1)),
+    realSd: Number(sd(a).toFixed(1)),
+    approxMean: Number(mean(b).toFixed(1)),
+    approxSd: Number(sd(b).toFixed(1)),
+    withinSpearman: Number(pearson(ranks(a), ranks(b)).toFixed(3)),
+    prepareMs: Number(prepareMs.toFixed(1)),
+    perFrameMs: Number(scoreMs.toFixed(2)),
+    trajectory: frames.map(({ step, positions }) =>
+      Number(mean(pick(distogramConfidence(table, gather(positions)))).toFixed(1))),
+    // ...and the same trajectory on the fold's own pLDDT scale, anchored to the
+    // final frame. The last entry must equal realMean by construction, which is
+    // the check that the calibration is doing what it claims.
+    calibrated: (() => {
+      const map = calibrateToPlddt(approx, realPlddt, batch.seqMask);
+      return frames.map(({ positions }) =>
+        Number(mean(pick(map(distogramConfidence(table, gather(positions))))).toFixed(1)));
+    })(),
+  };
+}
 
-  const trajectory = frames.map(({ step, positions }) => {
-    const scores = distogramConfidence(table, gather(positions));
-    const chosen = pick(scores);
-    let mean = 0;
-    for (const value of chosen) mean += value;
-    return {
-      step,
-      meanScore: Number((mean / chosen.length).toFixed(1)),
-      spearmanVsFinalPlddt: Number(pearson(ranks(a), ranks(chosen)).toFixed(3)),
-    };
-  });
+export async function main(device, args) {
+  const steps = Number(option(args, "steps", "8"));
+  const mode = option(args, "mode", "flow");
+  const seed = Number(option(args, "seed", "3"));
+  const store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
+  const [trunk, diffusion, confidence, reference, targetFeat] = await Promise.all([
+    trunkWeights(store), diffusionWeights(store), confidenceWeights(store),
+    atomReference(store), targetFeatureWeights(store),
+  ]);
+  const weights = { trunk, diffusion, confidence, atomReference: reference, targetFeat };
 
-  // --dump returns the raw arrays so the SCORING can be iterated on without
-  // re-folding: one fold, then any number of formulations offline.
-  if (args.includes("--dump")) {
-    return {
-      tokens, dense: batch.dense,
-      binEdges: [...result.trunk.binEdges],
-      seqMask: [...batch.seqMask],
-      logits: [...result.trunk.logits],
-      realPlddt: [...realPlddt],
-      finalBeta: [...finalBeta],
-      frames: frames.map(({ step, positions }) => ({ step, beta: [...gather(positions)] })),
-    };
+  const requested = option(args, "sequences", "");
+  const panel = requested === "panel" ? PANEL
+    : requested !== "" ? requested.split(",").map((s, i) => [`seq${i}`, s])
+      : [["6MRR", option(args, "sequence", DEFAULT)]];
+
+  const targets = [];
+  for (const [name, sequence] of panel) {
+    targets.push({ name, ...await foldOne(device, sequence, weights, { steps, mode, seed }) });
   }
 
-  let absolute = 0;
-  for (let i = 0; i < a.length; i += 1) absolute += Math.abs(a[i] - b[i]);
+  // 🔴 THE ACROSS-TARGET CORRELATION IS OVER THE MEANS, and it is the one a
+  // colour that gets compared between folds has to pass.
+  const real = Float64Array.from(targets, (t) => t.realMean);
+  const approx = Float64Array.from(targets, (t) => t.approxMean);
+  const across = targets.length < 3 ? null : {
+    pearson: Number(pearson(real, approx).toFixed(3)),
+    spearman: Number(pearson(ranks(real), ranks(approx)).toFixed(3)),
+  };
+  const within = targets.map((t) => t.withinSpearman);
   return {
-    tokens, live: live.length, mode, steps,
-    cost: {
-      prepareMs: Number(prepareMs.toFixed(1)),
-      perFrameMs: Number(scoreMs.toFixed(2)),
-      confidenceHeadMs: "226 at 150 tokens, for scale",
+    mode, steps, seed, targets,
+    acrossTargets: across,
+    withinTargets: {
+      worst: Math.min(...within),
+      mean: Number((within.reduce((s, x) => s + x, 0) / within.length).toFixed(3)),
     },
-    finalFrame: {
-      pearson: Number(pearson(a, b).toFixed(3)),
-      spearman: Number(pearson(ranks(a), ranks(b)).toFixed(3)),
-      meanAbsoluteError: Number((absolute / a.length).toFixed(1)),
-      meanRealPlddt: Number((a.reduce((s, v) => s + v, 0) / a.length).toFixed(1)),
-      meanApprox: Number((b.reduce((s, v) => s + v, 0) / b.length).toFixed(1)),
-    },
-    trajectory,
   };
 }
