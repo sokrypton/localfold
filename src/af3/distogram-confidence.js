@@ -29,12 +29,12 @@
  * the eight sharpest LONG-RANGE contacts (|i - j| >= 6, tolerance 0.75 A).
  * Tuning against settling picks the opposite - all pairs from |i - j| >= 1,
  * tolerance 1 A - because local structure settles first and short-range pairs
- * are what track it. Across an eight-target panel the change is 0.411 -> 0.440
- * mean rank correlation with what has actually settled, better on six of the
- * eight.
+ * are what track it. Across an eight-target panel that is 0.489 mean rank
+ * correlation with what has actually settled, against 0.411 for the
+ * pLDDT-tuned settings.
  *
- * 🔴 AND 0.44 IS WHAT IT IS: A ROUGH SIGNAL. On targets that fold it reaches
- * 0.65 to 0.72; on a GS linker and poly-alanine it is 0.14 to 0.20. The
+ * 🔴 AND 0.49 IS WHAT IT IS: A ROUGH SIGNAL. On targets that fold it reaches
+ * 0.63 to 0.88; on a GS linker and trp-cage it is 0.19 to 0.28. The
  * property that holds everywhere is the GLOBAL one - the mean rises
  * monotonically and saturates on all eight targets, including the scramble,
  * the linker and the homopolymer. Use it to show a structure resolving. Do not
@@ -109,8 +109,21 @@ const TOLERANCE = 1.0;
 const INCLUSION_RADIUS = 15;
 const MINIMUM_SEPARATION = 1;
 const CONTACTS = 16;
-/** ...relaxed for a chain too short to have long-range contacts at all. */
-const FALLBACK_SEPARATIONS = [6, 3, 1];
+/**
+ * ...relaxed for a chain too short to have contacts at that separation at all.
+ *
+ * 🔴 DERIVED FROM MINIMUM_SEPARATION, BECAUSE IT WAS WRITTEN OUT AND THEY
+ * DISAGREED. This was the literal [6, 3, 1] while MINIMUM_SEPARATION said 1,
+ * and the selection loop takes the FIRST of these that yields candidates - so
+ * every chain long enough used 6 and the constant naming the behaviour was
+ * decorative. A retune that set MINIMUM_SEPARATION to 1 changed nothing and
+ * was measured as though it had.
+ */
+const FALLBACK_SEPARATIONS = (() => {
+  const out = [];
+  for (let step = MINIMUM_SEPARATION; step >= 1; step = Math.floor(step / 2)) out.push(step);
+  return out;
+})();
 
 /**
  * The per-bin agreement table, computed once from a trunk's distogram.
