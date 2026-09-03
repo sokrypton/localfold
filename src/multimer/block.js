@@ -23,6 +23,8 @@ import {
   ATTENTION_NORMALIZE_SHADER,
   ATTENTION_OUTPUT_SHADER,
   attentionOutputTileColumns,
+  attentionProjectTileColumns,
+  attentionProjectTileRows,
   attentionOutputTileRows,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
@@ -358,7 +360,8 @@ async function encodeAttention(
       grid[0], grid[1], 1, `${options.label}.pair-bias`);
   }
   execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-    Math.ceil(options.channels / 16), Math.ceil(rows / 16), 1,
+    Math.ceil(options.channels / attentionProjectTileColumns()),
+    Math.ceil(rows / attentionProjectTileRows()), 1,
     `${options.label}.project`);
   execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
     Math.ceil(options.queries / flashKernel.queryTile),

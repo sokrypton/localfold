@@ -187,19 +187,9 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  * 🔴 THE TILE IS 32 BY 16 AND NOT WIDER, BECAUSE A CELL HERE IS ALREADY A
  * VECTOR. Every other kernel that took this treatment holds `rows * columns / 4`
  * vec4 accumulators; this one holds `rows * columns` of them, one per matrix
- * set - so the register budget runs out four times sooner, and it is the budget
- * and not the traffic that decides. Measured as the two projections of a
- * 512-row block, in runs where every other kernel matched to within 0.05 ms:
- *
- *     2x2 (as it was, scalar source)   16.29  16.20
- *     4x2                              13.85  13.64
- *     8x2                              17.32  17.32
- *     4x4                              19.30  19.04
- *
- * Four by two is eight vec4, 32 floats, the same budget the transition's
- * winning tile has. Sixteen vec4 spills, and the kernel is then slower than
- * the scalar-source form it replaced - which is the shape of every tile sweep
- * in this repo and the reason none of them is left to a guess.
+ * set. Four rows by two columns is eight vec4 - 32 floats, the same register
+ * budget the transition's winning tile has. Four by four is sixteen vec4 and
+ * measured worse; the same cliff the linear kernel falls off at 32.
  */
 export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
