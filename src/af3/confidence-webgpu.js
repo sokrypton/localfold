@@ -110,17 +110,58 @@ const EPSILON: f32 = ${epsilon};
   variance /= f32(${count});`;
 
   // pair += left_j + right_i + the predicted structure's distogram.
+  // 🔴 THE TARGET-FEATURE PROJECTION IS PER TOKEN AND WAS COMPUTED PER PAIR.
+  // `embed` gave one thread each (i, j) and had it contract all 447 target
+  // features into all 128 pair channels, twice - once for i and once for j -
+  // so the same per-token projection was recomputed for every pair that token
+  // appears in. That is TOKENS times too much work: at 150 tokens, 2.57 GMAC
+  // where 17 M would do, and it grows as L^3 where the rest of the head grows
+  // as L^2. It measured 64 ms of a 289 ms head at 150 tokens and would have
+  // been most of it at 300.
+  //
+  // src/af3/confidence-reference.js has always done it this way - two calls to
+  // `linear` over TOKENS rows, then broadcast into the pair - so this brings
+  // the GPU TOWARDS the reference rather than away from it.
+  const embedProject = `${common}
+const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
+const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
+
+@group(0) @binding(0) var<storage, read> target_feat: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> left: array<f32>;
+@group(0) @binding(3) var<storage, read_write> right: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * C_Z) { return; }
+  let token = slot / C_Z;
+  let c = slot % C_Z;
+  var left_total = 0.0;
+  var right_total = 0.0;
+  // ...one read of the feature serving both projections, which is why they
+  // share a kernel rather than being two dispatches.
+  for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+    let feature = target_feat[token * TARGET_WIDTH + f];
+    left_total += feature * weights[W_LEFT + f * C_Z + c];
+    right_total += feature * weights[W_RIGHT + f * C_Z + c];
+  }
+  left[slot] = left_total;
+  right[slot] = right_total;
+}`;
+
   const embed = `${common}
 const LOWER = array<f32, ${DGRAM_BINS}>(${lower.join(", ")});
 const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
 const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 const W_DGRAM: u32 = ${embedOffsets.distogramFeatProject}u;
 
-@group(0) @binding(0) var<storage, read> target_feat: array<f32>;
+@group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> pseudo_beta: array<f32>;
 @group(0) @binding(2) var<storage, read> pair_mask: array<f32>;
 @group(0) @binding(3) var<storage, read> weights: array<f32>;
 @group(0) @binding(4) var<storage, read_write> pair: array<f32>;
+@group(0) @binding(5) var<storage, read> right: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -148,12 +189,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let keep = pair_mask[row];
 
   for (var c = 0u; c < C_Z; c += 1u) {
-    var value = pair[row * C_Z + c];
     // ...left is indexed by j and right by i. See the note at the top.
-    for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
-      value += target_feat[j * TARGET_WIDTH + f] * weights[W_LEFT + f * C_Z + c];
-      value += target_feat[i * TARGET_WIDTH + f] * weights[W_RIGHT + f * C_Z + c];
-    }
+    var value = pair[row * C_Z + c] + left[j * C_Z + c] + right[i * C_Z + c];
     if (bin >= 0) {
       value += keep * weights[W_DGRAM + u32(bin) * C_Z + c];
     }
@@ -368,7 +405,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { embed, pairHeads, singleHeads };
+  return { embedProject, embed, pairHeads, singleHeads };
 }
 
 export class Af3ConfidenceHeadGpu {
@@ -424,12 +461,28 @@ export class Af3ConfidenceHeadGpu {
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       this.device.pushErrorScope("validation");
+      // ...one per TOKEN, not one per pair; see the note on the kernel.
+      const left = keep(this.allocator.allocate(
+        "af3-conf.left", tokens * pairChannels * 4, storage));
+      const right = keep(this.allocator.allocate(
+        "af3-conf.right", tokens * pairChannels * 4, storage));
       const encoder = this.device.createCommandEncoder({ label: "af3-confidence-embed" });
+      const project = encoder.beginComputePass({ label: "embed-project" });
+      project.setPipeline(compiled.embedProject);
+      project.setBindGroup(0, this.device.createBindGroup({
+        layout: compiled.embedProject.getBindGroupLayout(0),
+        entries: [targetFeat, embedWeights, left, right].map(
+          (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
+      }));
+      const projectGroups = Math.ceil((tokens * pairChannels) / 64);
+      project.dispatchWorkgroups(
+        Math.min(projectGroups, GRID_WIDTH), Math.ceil(projectGroups / GRID_WIDTH));
+      project.end();
       const pass = encoder.beginComputePass({ label: "embed" });
       pass.setPipeline(compiled.embed);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: compiled.embed.getBindGroupLayout(0),
-        entries: [targetFeat, pseudoBeta, maskBuffer, embedWeights, pair].map(
+        entries: [left, pseudoBeta, maskBuffer, embedWeights, pair, right].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
       const groups = Math.ceil(pairs / 64);
