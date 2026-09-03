@@ -160,6 +160,43 @@ def main():
         if '"same":true' not in geom:
             failures.append("the plot moves when a tab is clicked: %s" % geom)
 
+        # 🔴 AND THE PLOT MUST NOT MOVE WHEN THE SECOND MAP ARRIVES. A fold
+        # adds them at different times - the contact map comes off the trunk
+        # before there is a structure, the PAE only after the confidence head -
+        # so a panel that reserves its axis bands for the maps it currently
+        # HOLDS resizes mid-fold. Both scales caption their axes now, so the
+        # reservation is the same with one map or two.
+        staged = cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+          const name = v.currentObjectName;
+          const object = v.objectsData[name];
+          const frame = object.frames[0];
+          const n = frame.pae_n;
+          const canvas = document.getElementById('heatmapCanvas');
+          const rect = () => {
+            const b = canvas.getBoundingClientRect();
+            return [Math.round(b.left), Math.round(b.top),
+                    Math.round(b.width), Math.round(b.height)];
+          };
+          const keptPae = frame.pae;
+          // Contact alone, as it is during a fold...
+          delete frame.pae;
+          frame.maps = { contact: frame.maps.contact };
+          window.Heatmap.updateFrame(v, object, 0);
+          const contactOnly = rect();
+          // ...then the PAE lands.
+          frame.pae = keptPae;
+          window.Heatmap.updateFrame(v, object, 0);
+          const withPae = rect();
+          return JSON.stringify({ contactOnly, withPae,
+            same: contactOnly.join() === withPae.join() });
+        })()""")
+        print("staged  :", staged)
+        if '"same":true' not in staged:
+            failures.append("the plot moves when the PAE arrives after the"
+                            " contact map: %s" % staged)
+
         # 🔴 A MAP ATTACHED AFTER THE FRAME WAS ADDED MUST STILL APPEAR, and a
         # plain render() is NOT what makes it. py2Dmol drives the panel from
         # setFrame and from its loader; render redraws the 3D scene without
