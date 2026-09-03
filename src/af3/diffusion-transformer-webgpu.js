@@ -683,8 +683,24 @@ const OUT_CHUNK: u32 = ${outChunk}u;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
 
-// One chunk of the intermediate, holding the tile's tokens as a vector.
-var<workgroup> wt: array<${outVector}, ${outGroups * outChunk}>;
+// One chunk of the intermediate, holding the tile's tokens as a vector - and
+// then, once the chunk loop is done with it, the CONDITIONING.
+//
+// 🔴 THE ZERO-GATE LOOP READ cond FROM GLOBAL, ONCE PER TOKEN PER CHANNEL,
+// ON EVERY LANE. It is indexed by (token, d) and not by c, so all 256 lanes
+// of a workgroup want the same 4 x C_COND values - and at C_COND 384 that loop
+// was one weight read, four global conditioning reads and four scalar
+// multiply-adds a step, about 43% of this kernel's instructions. Staged as a
+// vector over the tile it is one weight read, one workgroup read and one vector
+// multiply-add: 384 x 3 where it was 384 x 9.
+//
+// 🔴 AND IT COSTS NO WORKGROUP MEMORY, because wt is dead by then. The chunk
+// loop has finished reading it before the gate is computed, so the same slots
+// carry the conditioning; the array is sized for whichever use is larger. A
+// second array would have taken this kernel from 6 KiB to 12 - two workgroups
+// a core against five - which is the trade this repository has lost to four
+// times.
+var<workgroup> wt: array<${outVector}, ${outGroups * Math.max(outChunk, condChannels)}>;
 
 @compute @workgroup_size(${lanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -717,13 +733,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 
   // 🔴 THE ZERO-INIT GATE READS THE RAW CONDITIONING, not the normalised one.
+  // ...the conditioning into the slots the chunk loop has finished with. The
+  // barrier before is what makes reusing them safe; the one after is the
+  // ordinary staging barrier.
+  workgroupBarrier();
+  for (var d = local; d < C_COND; d += ${lanes}u) {
+    ${overOutTile((t) => `{
+      let token = base_token + ${t}u;
+      var value = 0.0;
+      if (token < TOKENS) { value = cond[token * C_COND + d]; }
+      wt[${outGroup(t)}u * C_COND + d]${outLane(t)} = value;
+    }`)}
+  }
+  workgroupBarrier();
+
   ${overOutGroups((g) => `var zero${g} = ${outVector}(weights[W_ffwAdaptiveZeroCondBias + c]);`)}
   for (var d = 0u; d < C_COND; d += 1u) {
     let w = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
-    ${overOutTile((t) => `{
-      let token = base_token + ${t}u;
-      if (token < TOKENS) { zero${outGroup(t)}${outLane(t)} += cond[token * C_COND + d] * w; }
-    }`)}
+    ${overOutGroups((g) => `zero${g} += wt[${g}u * C_COND + d] * w;`)}
   }
   ${overOutGroups((g) => `let contribution${g} = acc${g}
     / (${outVector}(1.0) + exp(-zero${g}));`)}
