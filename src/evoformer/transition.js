@@ -3,7 +3,60 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
 const GRID_WIDTH = 32_768;
-export const TRANSITION_TILE_COLUMNS = 64;
+
+/**
+ * The register block one invocation of the `linear` kernel owns.
+ *
+ * 🔴 THIS IS THE ONLY PLACE THE TILE IS STATED, AND THAT IS DELIBERATE. Every
+ * caller dispatches with TRANSITION_TILE_ROWS/COLUMNS, which are derived from
+ * it below, so a tile the dispatch does not match cannot be constructed - the
+ * failure that once read as a 30% speedup while half the rows went unprojected.
+ *
+ * `step` is pinned to `lanesY` because a lane stages the weight row at its own
+ * `local.y`; `rowsPerLane` and `columnsPerLane` must be multiples of 4, because
+ * both operands are read as vec4 in the inner loop.
+ */
+export const LINEAR_TILE = {
+  lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
+};
+
+/**
+ * The same tile, twice as wide.
+ *
+ * 🔴 THE TWO DIFFER ONLY IN COLUMNS, AND THAT IS LOAD-BEARING. Both are 32
+ * rows, so TRANSITION_TILE_ROWS is one number whatever the choice - which is
+ * what keeps `transitionChunkRows` honest, since a chunk is aligned to the row
+ * tile and is computed before any shader exists to ask.
+ */
+export const LINEAR_TILE_WIDE = { ...LINEAR_TILE, columnsPerLane: 8 };
+
+export const linearTileRows = (tile = LINEAR_TILE) => tile.lanesY * tile.rowsPerLane;
+export const linearTileColumns = (tile = LINEAR_TILE) => tile.lanesX * tile.columnsPerLane;
+
+/**
+ * Which of the two tiles a dispatch of this shape wants.
+ *
+ * 🔴 THE AXIS IS OCCUPANCY, NOT SIZE, WHICH IS WHY THE RULE COUNTS WORKGROUPS.
+ * The wide tile halves the weight traffic and reads two vec4 of weights for one
+ * of source, so it is the better kernel wherever the device is full - 1.18x
+ * over the two-row scalar-source kernel at 30,208 rows. It is the WORSE kernel
+ * when it is not: at 59 rows and 384 columns it launches twelve workgroups
+ * against the narrow tile's twenty-four and measures 0.150 ms against 0.113.
+ * Measured either side of the crossing (tools/gpu/bench-evoformer-linear.js,
+ * 512 columns): at 512 rows the two tie, at 2,048 the wide tile leads by 7%,
+ * at 8,192 by 8%, and that is 512 workgroups.
+ *
+ * Halving the traffic AGAIN, with a 64-row tile of 128 or 256 lanes, is slower
+ * at every shape measured - so this is not a bandwidth story and a third tile
+ * is not the next move.
+ */
+export function chooseLinearTile({ rows, columns }) {
+  const wide = Math.ceil(rows / linearTileRows(LINEAR_TILE_WIDE))
+    * Math.ceil(columns / linearTileColumns(LINEAR_TILE_WIDE));
+  return wide >= 512 ? LINEAR_TILE_WIDE : LINEAR_TILE;
+}
+
+export const TRANSITION_TILE_COLUMNS = linearTileColumns();
 
 /**
  * How large a single transition binding is allowed to get.
@@ -71,7 +124,7 @@ export function transitionChunkRows(
   }
   return Math.min(rows, Math.floor(capacity / rowAlignment) * rowAlignment);
 }
-export const TRANSITION_TILE_ROWS = 16;
+export const TRANSITION_TILE_ROWS = linearTileRows();
 
 function validate(input) {
   const { rows, channels, hiddenChannels, activations, weights } = input;
@@ -112,7 +165,187 @@ export function packTransitionWeights(input) {
   return { data, offsets };
 }
 
-export function createTransitionShaders(input, offsets) {
+
+/**
+ * The register-blocked projection that serves every dense layer in AF2.
+ *
+ * A workgroup computes a `lanesY*rowsPerLane` by `lanesX*columnsPerLane` output
+ * tile; each invocation holds `rowsPerLane * columnsPerLane / 4` vec4
+ * accumulators and the k loop reads BOTH operands as vec4.
+ *
+ * 🔴 THE SOURCE SIDE WAS THE SCALAR HALF, AND THAT WAS THE WHOLE KERNEL. The
+ * weight tile has been staged per-thread-as-vec4 for a while; the source tile
+ * was still read one float at a time, so an invocation owning two rows spent
+ * two workgroup reads and two vec4 weight reads - four reads - to buy four vec4
+ * multiply-adds. Staging the source TRANSPOSED, four rows to a vec4, lets one
+ * read serve four rows: at eight rows and eight columns a lane now issues four
+ * reads for sixteen multiply-adds, 3.2 useful operations an instruction where
+ * it was 2.0. tools/gpu/probe-alu.js measures this device at about 640 billion
+ * instructions a second whatever their width, so that ratio IS the speed.
+ *
+ * 🔴 A LANE'S COLUMNS STAY STRIDED BY `lanesX`, WHICH LOOKS WRONG AND IS NOT.
+ * Contiguous columns per lane would make the staged weights one flat vec4 read,
+ * but the OUTPUT store then goes out at stride `columnsPerLane` across the
+ * lanes of a row, where strided ownership makes each store instruction a
+ * consecutive run. The weight tile is laid out per thread instead, which costs
+ * the staging loop nothing and keeps both ends coalesced.
+ *
+ * @param {{lanesX: number, lanesY: number, rowsPerLane: number, columnsPerLane: number}} tile
+ * @param {boolean} residual whether the store accumulates into the output
+ */
+export function createLinearShader(tile = LINEAR_TILE, residual = false) {
+  const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  for (const [name, value] of Object.entries(tile)) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RangeError(`linear tile ${name} must be a positive integer; got ${value}`);
+    }
+  }
+  if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
+    throw new RangeError("linear tile rowsPerLane and columnsPerLane must be multiples of 4");
+  }
+  const lanes = lanesX * lanesY;
+  const step = lanesY;
+  const tileRows = lanesY * rowsPerLane;
+  const tileColumns = lanesX * columnsPerLane;
+  const rowVectors = tileRows / 4;
+  const columnVectors = columnsPerLane / 4;
+  // Each lane stages whole vec4s of both operands. A wide, shallow tile can
+  // have fewer source vectors than lanes, so the last pass is guarded rather
+  // than forbidden - the alternative is a tile shape the sweep cannot reach.
+  const sourceTasks = step * rowVectors;
+  const sourcePerLane = Math.ceil(sourceTasks / lanes);
+
+  const accumulator = (r, v) => `acc_${r}_${v}`;
+  const declare = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    for (let v = 0; v < columnVectors; v += 1) {
+      declare.push(`  var ${accumulator(r, v)} = vec4<f32>(0.0);`);
+    }
+  }
+
+  // The k loop, fully unrolled: the reads are hoisted so each is issued once.
+  const inner = [];
+  for (let k = 0; k < step; k += 1) {
+    for (let g = 0; g < rowsPerLane / 4; g += 1) {
+      inner.push(`    let s_${k}_${g} = tile_source[${k * rowVectors}u + local.y * ${rowsPerLane / 4}u + ${g}u];`);
+    }
+    for (let v = 0; v < columnVectors; v += 1) {
+      inner.push(`    let w_${k}_${v} = tile_weight[${k * lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u];`);
+    }
+    for (let r = 0; r < rowsPerLane; r += 1) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        inner.push(`    ${accumulator(r, v)} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+      }
+    }
+  }
+
+  // Staging the source: a lane takes four rows at one k, so its four global
+  // reads are `inner` apart and CONSECUTIVE LANES take consecutive k - which is
+  // what makes each of the four a coalesced run.
+  const stageSource = [];
+  for (let n = 0; n < sourcePerLane; n += 1) {
+    const task = n === 0 ? "linear_lane" : `(linear_lane + ${n * lanes}u)`;
+    const guard = (n + 1) * lanes > sourceTasks ? `if (${task} < ${sourceTasks}u) ` : "";
+    stageSource.push(`    ${guard}{
+      let task = ${task};
+      let row_group = task / ${step}u;
+      let k_local = task % ${step}u;
+      let k = k0 + k_local;
+      let row_base = group.y * ${tileRows}u + row_group * 4u;
+      var staged = vec4<f32>(0.0);
+      if (k < parameters.inner) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let row = row_base + j;
+          if (row < parameters.rows) { staged[j] = source[row * parameters.inner + k]; }
+        }
+      }
+      tile_source[k_local * ${rowVectors}u + row_group] = staged;
+    }`);
+  }
+
+  const stageWeight = [];
+  for (let v = 0; v < columnVectors; v += 1) {
+    stageWeight.push(`    {
+      var staged = vec4<f32>(0.0);
+      if (weight_k < parameters.inner) {
+        for (var j = 0u; j < 4u; j += 1u) {
+          let output_column = column_origin + (${v}u * 4u + j) * ${lanesX}u;
+          if (output_column < parameters.columns) {
+            staged[j] = weights[parameters.weight_offset + weight_k * parameters.columns + output_column];
+          }
+        }
+      }
+      tile_weight[local.y * ${lanesX * columnVectors}u + local.x * ${columnVectors}u + ${v}u] = staged;
+    }`);
+  }
+
+  const store = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    const body = [];
+    for (let v = 0; v < columnVectors; v += 1) {
+      for (let c = 0; c < 4; c += 1) {
+        body.push(`      {
+        let output_column = column_origin + ${(v * 4 + c) * lanesX}u;
+        if (output_column < parameters.columns) {
+          var value = ${accumulator(r, v)}[${c}u] + weights[parameters.bias_offset + output_column];
+          if (parameters.activation == 1u) { value = max(value, 0.0); }
+          output[row_${r} * parameters.columns + output_column] ${residual ? "+=" : "="} value;
+        }
+      }`);
+      }
+    }
+    store.push(`  if (row_${r} < parameters.rows) {\n${body.join("\n")}\n  }`);
+  }
+
+  const rowNames = [];
+  for (let r = 0; r < rowsPerLane; r += 1) {
+    rowNames.push(`  let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;`);
+  }
+
+  return `
+struct MatmulParameters {
+  rows: u32,
+  inner: u32,
+  columns: u32,
+  weight_offset: u32,
+  bias_offset: u32,
+  activation: u32,
+  padding: vec2<u32>,
+};
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
+@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+
+// Transposed: four ROWS to a vector, so one read serves four accumulators.
+var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+// Laid out per thread: a lane's own strided columns, contiguous where it reads.
+var<workgroup> tile_weight: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+
+@compute @workgroup_size(${lanesX}, ${lanesY}, 1)
+fn main(
+  @builtin(local_invocation_id) local: vec3<u32>,
+  @builtin(workgroup_id) group: vec3<u32>,
+) {
+  let linear_lane = local.y * ${lanesX}u + local.x;
+  let column_origin = group.x * ${tileColumns}u + local.x;
+${rowNames.join("\n")}
+${declare.join("\n")}
+
+  for (var k0 = 0u; k0 < parameters.inner; k0 += ${step}u) {
+    let weight_k = k0 + local.y;
+${stageSource.join("\n")}
+${stageWeight.join("\n")}
+    workgroupBarrier();
+${inner.join("\n")}
+    workgroupBarrier();
+  }
+
+${store.join("\n")}
+}`;
+}
+
+export function createTransitionShaders(input, offsets, tile = LINEAR_TILE) {
   void input;
   void offsets;
   const normalize = `
@@ -177,123 +410,7 @@ fn main(
       * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
   }
 }`;
-  // One register-blocked projection serves both dense layers. A workgroup
-  // computes a 16x64 output tile: every invocation retains sixteen accumulators,
-  // so the source tile is loaded once for 64 columns instead of eight times by
-  // separate 8x8 workgroups. The k loop order is unchanged from the reference.
-  const linear = `
-struct MatmulParameters {
-  rows: u32,
-  inner: u32,
-  columns: u32,
-  weight_offset: u32,
-  bias_offset: u32,
-  activation: u32,
-  padding: vec2<u32>,
-};
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
-var<workgroup> tile_source: array<f32, 128>;
-// 🔴 A THREAD'S EIGHT COLUMNS ARE ADJACENT HERE, WHICH IS NOT HOW IT READS THEM
-// OUT. The eight output columns an invocation owns are strided by eight in the
-// OUTPUT - column + block * 8 - but nothing says the staged copy has to match:
-// laid out per thread, its eight weights are two vec4 reads where they were
-// eight scalar ones, and the inner loop goes from ten workgroup reads to four
-// for the same sixteen multiply-adds. tools/gpu/probe-alu.js puts workgroup
-// reads at 394 billion a second against 580 billion vec4 multiply-adds, so for
-// this kernel the reads were the larger term.
-var<workgroup> tile_weight: array<vec4<f32>, 128>;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(
-  @builtin(local_invocation_id) local: vec3<u32>,
-  @builtin(workgroup_id) group: vec3<u32>,
-) {
-  let row = group.y * 16u + local.y;
-  let second_row = row + 8u;
-  let column = group.x * 64u + local.x;
-  let tile_index = local.y * 8u + local.x;
-  var value_low = vec4<f32>(0.0);
-  var value_high = vec4<f32>(0.0);
-  var second_value_low = vec4<f32>(0.0);
-  var second_value_high = vec4<f32>(0.0);
-
-  for (var k0 = 0u; k0 < parameters.inner; k0 += 8u) {
-    let source_k = k0 + local.x;
-    let weight_k = k0 + local.y;
-    tile_source[tile_index] = 0.0;
-    tile_source[tile_index + 64u] = 0.0;
-    if (row < parameters.rows && source_k < parameters.inner) {
-      tile_source[tile_index] = source[row * parameters.inner + source_k];
-    }
-    if (second_row < parameters.rows && source_k < parameters.inner) {
-      tile_source[tile_index + 64u] = source[second_row * parameters.inner + source_k];
-    }
-    var staged_low = vec4<f32>(0.0);
-    var staged_high = vec4<f32>(0.0);
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let output_column = column + column_block * 8u;
-      var value = 0.0;
-      if (output_column < parameters.columns && weight_k < parameters.inner) {
-        value = weights[
-          parameters.weight_offset + weight_k * parameters.columns + output_column
-        ];
-      }
-      if (column_block < 4u) { staged_low[column_block] = value; }
-      else { staged_high[column_block - 4u] = value; }
-    }
-    tile_weight[local.y * 16u + local.x * 2u] = staged_low;
-    tile_weight[local.y * 16u + local.x * 2u + 1u] = staged_high;
-    workgroupBarrier();
-    for (var k = 0u; k < 8u; k += 1u) {
-      let source_value = tile_source[local.y * 8u + k];
-      let second_source_value = tile_source[local.y * 8u + k + 64u];
-      let weight_base = k * 16u + local.x * 2u;
-      let weight_low = tile_weight[weight_base];
-      let weight_high = tile_weight[weight_base + 1u];
-      value_low += source_value * weight_low;
-      value_high += source_value * weight_high;
-      second_value_low += second_source_value * weight_low;
-      second_value_high += second_source_value * weight_high;
-    }
-    workgroupBarrier();
-  }
-
-  if (row < parameters.rows) {
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let output_column = column + column_block * 8u;
-      if (output_column < parameters.columns) {
-        let values = select(value_low, value_high, column_block >= 4u);
-        var value = values[column_block % 4u];
-        value += weights[parameters.bias_offset + output_column];
-        if (parameters.activation == 1u) { value = max(value, 0.0); }
-        output[row * parameters.columns + output_column] = value;
-      }
-    }
-  }
-  if (second_row < parameters.rows) {
-    for (var column_block = 0u; column_block < 8u; column_block += 1u) {
-      let output_column = column + column_block * 8u;
-      if (output_column < parameters.columns) {
-        let values = select(second_value_low, second_value_high, column_block >= 4u);
-        var value = values[column_block % 4u];
-        value += weights[parameters.bias_offset + output_column];
-        if (parameters.activation == 1u) { value = max(value, 0.0); }
-        output[second_row * parameters.columns + output_column] = value;
-      }
-    }
-  }
-}`;
-  const linearResidual = linear.replace(
-    "output[row * parameters.columns + output_column] = value;",
-    "output[row * parameters.columns + output_column] += value;",
-  ).replace(
-    "output[second_row * parameters.columns + output_column] = value;",
-    "output[second_row * parameters.columns + output_column] += value;",
-  );
+  const [linear, linearResidual] = [false, true].map((residual) => createLinearShader(tile, residual));
   return [normalize, linear, linearResidual];
 }
 
@@ -322,8 +439,15 @@ export class TransitionGpu {
   async run(input) {
     validate(input);
     const packed = packTransitionWeights(input);
-    const code = createTransitionShaders(input, packed.offsets);
-    const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}:${input.epsilon ?? 1e-5}`;
+    // The same choice the block encoders make, so this path - and the
+    // differential checker that drives it - exercises whichever tile a fold of
+    // this shape would actually run.
+    const tile = chooseLinearTile({
+      rows: input.rows, columns: Math.max(input.channels, input.hiddenChannels),
+    });
+    const tileColumns = linearTileColumns(tile);
+    const code = createTransitionShaders(input, packed.offsets, tile);
+    const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}:${input.epsilon ?? 1e-5}:${tileColumns}`;
     const pipelines = [];
     for (let index = 0; index < code.length; index += 1) {
       pipelines.push(await this.pipelines.get(`${key}:${index}`, code[index]));
@@ -367,9 +491,9 @@ export class TransitionGpu {
       pass(pipelines[0], [source.buffer, weights.buffer, layerNormParameters.buffer, normalized.buffer],
         Math.min(input.rows, GRID_WIDTH), ceilDivide(input.rows, GRID_WIDTH));
       pass(pipelines[1], [normalized.buffer, weights.buffer, firstParameters.buffer, hidden.buffer],
-        ceilDivide(input.hiddenChannels, TRANSITION_TILE_COLUMNS), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
+        ceilDivide(input.hiddenChannels, tileColumns), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
       pass(pipelines[1], [hidden.buffer, weights.buffer, secondParameters.buffer, output.buffer],
-        ceilDivide(input.channels, TRANSITION_TILE_COLUMNS), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
+        ceilDivide(input.channels, tileColumns), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, input.rows * input.channels * 4);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

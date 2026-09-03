@@ -28,9 +28,10 @@ import {
 import {
   createTransitionNormalizeParameters,
   createTransitionShaders,
+  chooseLinearTile,
+  linearTileColumns,
   packTransitionWeights,
   transitionChunkRows,
-  TRANSITION_TILE_COLUMNS,
   TRANSITION_TILE_ROWS,
 
 } from "./transition.js";
@@ -178,11 +179,18 @@ async function encodeTransition(
     activations: new Float32Array(0), rows, channels, hiddenChannels, weights: weightsValue,
   };
   const packed = packTransitionWeights(descriptor);
-  const shaders = createTransitionShaders(descriptor, packed.offsets);
+  // 🔴 THE TILE IS PART OF THE CACHE KEY, because it is part of the shader. The
+  // deep MSA transitions want the wide tile and a 59-residue structure module
+  // wants the narrow one, and a key that named neither would hand the second
+  // shape the first shape's pipeline - dispatched with the wrong column stride,
+  // which leaves columns unprojected and reads as a speedup.
+  const tile = chooseLinearTile({ rows, columns: Math.max(channels, hiddenChannels) });
+  const tileColumns = linearTileColumns(tile);
+  const shaders = createTransitionShaders(descriptor, packed.offsets, tile);
   const [normalize, linear, linearResidual] = await Promise.all([
     execution.pipelines.get("block:transition:normalize", shaders[0]),
-    execution.pipelines.get("block:transition:linear", shaders[1]),
-    execution.pipelines.get("block:transition:linear-residual", shaders[2]),
+    execution.pipelines.get(`block:transition:linear:${tileColumns}`, shaders[1]),
+    execution.pipelines.get(`block:transition:linear-residual:${tileColumns}`, shaders[2]),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
@@ -209,11 +217,11 @@ async function encodeTransition(
     execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
       transitionNormGrid[0], transitionNormGrid[1], 1, `${label}.normalize`);
     execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
-      Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
       `${label}.first`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
       [hidden, weights, secondParams, output],
-      Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(channels / tileColumns), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
       `${label}.second`);
     return output;
   }
@@ -245,11 +253,11 @@ async function encodeTransition(
     execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
       chunkNormGrid[0], chunkNormGrid[1], 1, `${label}.normalize-${rowOffset}`);
     execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
-      Math.ceil(hiddenChannels / TRANSITION_TILE_COLUMNS), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
       `${label}.first-${rowOffset}`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
       [hiddenChunk, weights, secondParams, outputChunk],
-      Math.ceil(channels / TRANSITION_TILE_COLUMNS), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(channels / tileColumns), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
       `${label}.second-${rowOffset}`);
   }
   return output;

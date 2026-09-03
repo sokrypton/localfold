@@ -329,12 +329,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createOuterProductMeanContractShader(cOuter) {
   const cells = cOuter * cOuter;
-  // ...rounded up, and each slot guarded: AlphaFold's c_outer is 32 and gives
-  // exactly sixteen a lane, but the checkers use ragged shapes on purpose.
-  const perLane = Math.ceil(cells / 64);
   const chunk = 8;
-  const overCells = (body) =>
-    Array.from({ length: perLane }, (_, slot) => body(slot)).join("\n    ");
+  // Both operands are read four channels at a time, so the staged rows are
+  // padded up to a whole vector and the tail staged as zero - which contributes
+  // exactly zero to a product and needs no guard in the inner loop.
+  const vectors = Math.ceil(cOuter / 4);
+  const blocks = vectors * vectors;
+  const blocksPerLane = Math.ceil(blocks / 64);
+  const overBlocks = (body) =>
+    Array.from({ length: blocksPerLane }, (_, slot) => body(slot)).join("\n    ");
   return `${COMMON}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
@@ -344,9 +347,11 @@ export function createOuterProductMeanContractShader(cOuter) {
 const OPM_CHUNK: u32 = ${chunk}u;
 const C_OUTER: u32 = ${cOuter}u;
 const CELLS: u32 = ${cells}u;
+const VECTORS: u32 = ${vectors}u;
+const BLOCKS: u32 = ${blocks}u;
 
-var<workgroup> left_tile: array<f32, ${chunk * cOuter}>;
-var<workgroup> right_tile: array<f32, ${chunk * cOuter}>;
+var<workgroup> left_tile: array<vec4<f32>, ${chunk * vectors}>;
+var<workgroup> right_tile: array<vec4<f32>, ${chunk * vectors}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -357,23 +362,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let j = pair % p.length;
   let local = local_id.x;
 
-  // The cells this lane owns, strided so 64 lanes cover the grid.
-  ${overCells((slot) => `let cell${slot} = local + ${slot}u * 64u;
-    let live${slot} = cell${slot} < CELLS;
-    let cl${slot} = select(0u, cell${slot} / C_OUTER, live${slot});
-    let cr${slot} = select(0u, cell${slot} % C_OUTER, live${slot});
-    var total${slot} = 0.0;`)}
+  // A lane owns a 4x4 BLOCK of cells, not sixteen scattered ones - see the note
+  // above. Four accumulators, each a vector over the right-hand channel.
+  ${overBlocks((slot) => `let block${slot} = local + ${slot}u * 64u;
+    let live${slot} = block${slot} < BLOCKS;
+    let left_block${slot} = select(0u, block${slot} / VECTORS, live${slot});
+    let right_block${slot} = select(0u, block${slot} % VECTORS, live${slot});
+    var acc${slot}_0 = vec4<f32>(0.0);
+    var acc${slot}_1 = vec4<f32>(0.0);
+    var acc${slot}_2 = vec4<f32>(0.0);
+    var acc${slot}_3 = vec4<f32>(0.0);`)}
 
   for (var s0 = 0u; s0 < p.sequences; s0 += OPM_CHUNK) {
     workgroupBarrier();
-    for (var index = local; index < OPM_CHUNK * C_OUTER; index += 64u) {
-      let s = s0 + index / C_OUTER;
-      let o = index % C_OUTER;
-      var l = 0.0;
-      var r = 0.0;
+    for (var index = local; index < OPM_CHUNK * VECTORS; index += 64u) {
+      let s = s0 + index / VECTORS;
+      let v = index % VECTORS;
+      var l = vec4<f32>(0.0);
+      var r = vec4<f32>(0.0);
       if (s < p.sequences) {
-        l = left[(s * p.length + i) * C_OUTER + o];
-        r = right[(s * p.length + j) * C_OUTER + o];
+        for (var c = 0u; c < 4u; c += 1u) {
+          let o = v * 4u + c;
+          if (o < C_OUTER) {
+            l[c] = left[(s * p.length + i) * C_OUTER + o];
+            r[c] = right[(s * p.length + j) * C_OUTER + o];
+          }
+        }
       }
       left_tile[index] = l;
       right_tile[index] = r;
@@ -382,14 +396,31 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
     let available = min(OPM_CHUNK, p.sequences - s0);
     for (var t = 0u; t < available; t += 1u) {
-      let base = t * C_OUTER;
-      ${overCells((slot) =>
-        `total${slot} += left_tile[base + cl${slot}] * right_tile[base + cr${slot}];`)}
+      let base = t * VECTORS;
+      ${overBlocks((slot) => `let lv${slot} = left_tile[base + left_block${slot}];
+      let rv${slot} = right_tile[base + right_block${slot}];
+      acc${slot}_0 += lv${slot}[0] * rv${slot};
+      acc${slot}_1 += lv${slot}[1] * rv${slot};
+      acc${slot}_2 += lv${slot}[2] * rv${slot};
+      acc${slot}_3 += lv${slot}[3] * rv${slot};`)}
     }
   }
 
-  ${overCells((slot) =>
-    `if (live${slot}) { outer[pair * CELLS + cell${slot}] = total${slot}; }`)}
+  ${overBlocks((slot) => `if (live${slot}) {
+      for (var a = 0u; a < 4u; a += 1u) {
+        let cl = left_block${slot} * 4u + a;
+        if (cl < C_OUTER) {
+          var row = acc${slot}_0;
+          if (a == 1u) { row = acc${slot}_1; }
+          if (a == 2u) { row = acc${slot}_2; }
+          if (a == 3u) { row = acc${slot}_3; }
+          for (var b = 0u; b < 4u; b += 1u) {
+            let cr = right_block${slot} * 4u + b;
+            if (cr < C_OUTER) { outer[pair * CELLS + cl * C_OUTER + cr] = row[b]; }
+          }
+        }
+      }
+    }`)}
 }`;
 }
 
