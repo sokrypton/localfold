@@ -137,6 +137,29 @@ function alphaCarbons(batch) {
   return slots.length > 0 ? slots : predicted;
 }
 
+/** A batch's representative atom per token, gathered from a frame's positions. */
+function pseudoBetaOf(batch, positions) {
+  const beta = batch.tokenAtomsToPseudoBeta;
+  const out = new Float32Array(batch.tokens * 3);
+  for (let token = 0; token < batch.tokens; token += 1) {
+    if (!beta.mask[token]) continue;
+    const from = Number(beta.indices[token]) * 3;
+    for (let axis = 0; axis < 3; axis += 1) out[token * 3 + axis] = positions[from + axis];
+  }
+  return out;
+}
+
+/** Per token to per dense atom slot, which is how toPdb indexes the B-factor. */
+function broadcastToSlots(batch, perToken) {
+  const out = new Float32Array(batch.tokens * batch.dense);
+  for (let token = 0; token < batch.tokens; token += 1) {
+    for (let atom = 0; atom < batch.dense; atom += 1) {
+      out[token * batch.dense + atom] = perToken[token];
+    }
+  }
+  return out;
+}
+
 const toPoints = (positions, count) => Array.from(
   { length: count }, (_, i) => [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
 
@@ -345,11 +368,46 @@ export async function foldAf3(options) {
   // be rendered twice - once uncoloured while they are computed, and again with
   // the pLDDT that does not exist until the confidence head has run.
   const trajectory = [];
+  // 🔴 THE LIVE COLOUR, BUILT THE MOMENT THE TRUNK EXISTS. `trunk-done` fires
+  // before the sampler runs and carries the distogram, so the frames drawn
+  // DURING the fold can be coloured too - they used to be handed a null
+  // B-factor, which the pLDDT scheme paints as no confidence at all.
+  //
+  // 🔴 IT IS THE RAW SCORE, NOT THE CALIBRATED ONE, because there is no
+  // finished structure to calibrate against yet. That is only usable because
+  // the raw score sits near the pLDDT scale on its own - 8.1 points from the
+  // real mean across the panel, within 7 on six of eight. It did not, until
+  // MINIMUM_SEPARATION started being read; before that it ran ~30 points low
+  // and a live trajectory would have been red until the fold landed.
+  //
+  // 🔴 SO THE LIVE FRAMES AND THE REPLAYED ONES DIFFER, AND THE REPLAY IS THE
+  // ONE TO GET RIGHT. Measured on a 58-mer, live 13.9 53.1 68.6 70.7 71.7 ...
+  // against a calibrated replay of 46.2 63.9 70.9 71.9 72.3 ... - they agree
+  // from the third frame on and part company at the start, where calibration
+  // lifts the low end. The alternative is to drop the calibration so the two
+  // agree exactly, and it is worse: the timeline's LAST frame is the finished
+  // structure's real pLDDT either way, so an uncalibrated trajectory would end
+  // on a step - 76.3 to 96.6 on trp-cage - and that is the frame everyone
+  // looks at. A difference between a transient live frame and its replay is
+  // cheaper than a jump at the end of the animation.
+  let liveConfidence = null;
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
+      if (name === "trunk-done" && liveConfidence === null) {
+        // ...best effort, for the reason the finished-frame path gives: this is
+        // a colour, and losing a prediction to it would be a bad trade.
+        try {
+          const table = distogramAgreementTable(
+            detail.trunk.logits, detail.trunk.binEdges, batch.tokens, batch.seqMask);
+          liveConfidence = (positions) => broadcastToSlots(
+            batch, distogramConfidence(table, pseudoBetaOf(batch, positions)));
+        } catch (cause) {
+          console.warn("live frame confidence unavailable; frames stay uncoloured", cause);
+        }
+      }
       if (name === "target-feat-start") {
         plan();               // ...starts the clock; see the note on plan().
         // A sweep rather than a number: what is left here is one synchronous
@@ -419,7 +477,8 @@ export async function foldAf3(options) {
       // each call and is protein-sized in every frame.
       if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
       trajectory.push(Float32Array.from(denoised));
-      options.onFrame?.(fittedPdb(batch, denoised, reference, slots, null), shown);
+      options.onFrame?.(
+        fittedPdb(batch, denoised, reference, slots, liveConfidence?.(denoised) ?? null), shown);
       shown += 1;
       reached(plan().samplerStart + plan().callUnits * step);
       // ...the sampler used to run its OWN clock here, from its own elapsed
@@ -469,16 +528,6 @@ export async function foldAf3(options) {
   // animation reverts to what it did before.
   const perFrameConfidence = (() => {
     const tokens = batch.tokens;
-    const beta = batch.tokenAtomsToPseudoBeta;
-    const gather = (positions) => {
-      const out = new Float32Array(tokens * 3);
-      for (let token = 0; token < tokens; token += 1) {
-        if (!beta.mask[token]) continue;
-        const from = Number(beta.indices[token]) * 3;
-        for (let axis = 0; axis < 3; axis += 1) out[token * 3 + axis] = positions[from + axis];
-      }
-      return out;
-    };
     // The head emits one distribution per dense atom slot, so a token's pLDDT
     // is the mean over the atoms it actually has - and the anchor has to be
     // per token, because the stand-in is.
@@ -500,23 +549,16 @@ export async function foldAf3(options) {
       table = distogramAgreementTable(
         result.trunk.logits, result.trunk.binEdges, tokens, batch.seqMask);
       calibrate = calibrateToPlddt(
-        distogramConfidence(table, gather(result.positions)), realPerToken, batch.seqMask);
+        distogramConfidence(table, pseudoBetaOf(batch, result.positions)),
+        realPerToken, batch.seqMask);
     } catch (cause) {
       console.warn("per-frame confidence unavailable; frames take the final pLDDT", cause);
       return () => result.scores.plddt;
     }
     // ...broadcast back to atom slots, because that is how toPdb indexes the
     // B-factor it writes.
-    return (positions) => {
-      const perToken = calibrate(distogramConfidence(table, gather(positions)));
-      const perSlot = new Float32Array(tokens * batch.dense);
-      for (let token = 0; token < tokens; token += 1) {
-        for (let atom = 0; atom < batch.dense; atom += 1) {
-          perSlot[token * batch.dense + atom] = perToken[token];
-        }
-      }
-      return perSlot;
-    };
+    return (positions) => broadcastToSlots(batch,
+      calibrate(distogramConfidence(table, pseudoBetaOf(batch, positions))));
   })();
 
   // 🔴 EVERY FRAME IS RE-EMITTED, because the frames drawn during the fold

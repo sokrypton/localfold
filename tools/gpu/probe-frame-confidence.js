@@ -45,9 +45,16 @@ export async function main(device, args) {
     "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK");
   const calls = Number(option(args, "steps", "8"));
   const weights = await loadAf3Weights(() => {});
+  // 🔴 THE LIVE FRAMES ARE CAPTURED SEPARATELY FROM THE FINISHED ONES. They
+  // come through onFrame while the sampler runs, coloured from the trunk's
+  // distogram with no calibration - there is no finished structure yet. They
+  // used to arrive with a null B-factor, so "every live frame is zero" is the
+  // regression this exists to catch.
+  const liveFrames = [];
   const result = await foldAf3({
     sequence, mode: "flow", calls, recycles: 0, seed: 3, device, weights,
     onStatus: () => {}, onProgress: () => {},
+    onFrame: (pdb) => { liveFrames.push(pdb); },
   });
 
   const frames = result.framePdbs.map(bFactors);
@@ -74,6 +81,11 @@ export async function main(device, args) {
     // The last frame is the same structure as the final PDB, so its calibrated
     // confidence should land on the real pLDDT the card reports.
     lastFrameVersusFinal: Number((means[means.length - 1] - mean(final)).toFixed(1)),
+    live: {
+      frames: liveFrames.length,
+      means: liveFrames.map((pdb) => Number(mean(bFactors(pdb)).toFixed(1))),
+      allZero: liveFrames.every((pdb) => bFactors(pdb).every((v) => v === 0)),
+    },
     timeline: {
       length: timeline.length,
       means: timeline.map((f) => Number(mean(f).toFixed(1))),
