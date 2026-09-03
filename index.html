@@ -149,7 +149,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    has more than one chain, which is the only thing that
                    distinguishes those two cases in practice; the explicit
                    settings are there to fold the same input every way. -->
-              <div class="fetch-option-group">
+              <div class="fetch-option-group" id="modelGroup">
                 <span class="fetch-option-title">Model</span>
                 <!-- 🔴 NO Auto, AND AF3 IS THE DEFAULT. Auto read the chain
                      count and picked between the two AlphaFold 2 models, which
@@ -181,7 +181,12 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 </select>
               </div>
 
-              <div class="fetch-option-group">
+              <!-- ...and an id, like every other group here. The narrow layout
+                   puts Model / Recycles / Seed on one line and the pairs below
+                   it on theirs, which means naming them - and a probe that has
+                   to report WHICH controls share a line cannot say
+                   ".fetch-option-group" twice and mean two different rows. -->
+              <div class="fetch-option-group" id="seedGroup">
                 <span class="fetch-option-title">Seed</span>
                 <input type="number" id="random-seed" value="0" min="0" max="2147483647" step="1"
                   title="Random seed. AF2: MSA subsampling and masking. AF3: the diffusion sampler (Ramp is deterministic and ignores it).">

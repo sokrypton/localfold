@@ -453,6 +453,18 @@ def main():
             bad.append("%s: the MSA panel's bitmap is %d logical px in a %dpx box - a"
                        " %.2fx horizontal scale" % (name, R["msa"]["logical"],
                                                     R["msa"]["css"], R["msa"]["stretch"]))
+        # THE OPTIONS ARE PAIRED BY MEANING, and a flex row left to itself
+        # filled lines in DOM order: Seed beside Sampler, Steps beside MSA -
+        # controls from different questions sharing a line while the two halves
+        # of one question were split across two. A line COUNT cannot see that;
+        # this is the membership.
+        options = R["rows"]["options"]
+        want = [["modelGroup", "recyclesGroup", "seedGroup"],
+                ["af3ModeGroup", "af3CountGroup"],
+                ["msaModeGroup", "maxMsaGroup"]]
+        if options != want:
+            bad.append("%s: the fold options should be Model/Recycles/Seed, then"
+                       " Sampler/Steps, then MSA/Max MSA; got %s" % (name, options))
         for what, m in R["overflowing"].items():
             if m and m["over"] > 1:
                 bad.append("%s: %s overflows its own box by %dpx - the label wrapped"
@@ -515,6 +527,10 @@ def main():
     if D["resizeHandle"] == "none":
         bad.append("the desktop canvas resize handle was hidden too - that rule is"
                    " meant to be narrow-only")
+    if D["rows"]["options"] is not None and len(D["rows"]["options"]) != 1:
+        bad.append("the desktop fold options broke across %d lines - they are one row"
+                   " there and the narrow grouping must not reach them"
+                   % len(D["rows"]["options"]))
     if D["rows"]["entity"] and len(D["rows"]["entity"]) != 1:
         bad.append("the desktop entity row broke across %d lines"
                    % len(D["rows"]["entity"]))

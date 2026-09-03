@@ -707,6 +707,18 @@
   .entity-row > .entity-value:not(.entity-value-ligand),
   .entity-row > .entity-picker { order: 1; flex: 1 0 100%; min-width: 0; }
   .entity-row > .entity-value-ligand { flex: 0 0 9ch; }
+  /* 🔴 AND A 52px BOX HOLDS TWO 13px LINES, NOT TWO 16px ONES. The height is
+     stated (a textarea's `rows` loses to it), and raising the font to keep
+     Safari from zooming left 34px of content box against 21.6px lines - one
+     line and a clipped half of the next, which reads as a rendering fault
+     rather than as a box you can scroll. 1.25 line-height and 6px of padding
+     put two whole lines in 56. */
+  .entity-value-protein {
+    height: 56px;
+    min-height: 56px;
+    padding: 6px 10px;
+    line-height: 1.25;
+  }
   /* `1 1 auto` LEAVES A <select> AT ITS CONTENT WIDTH, which is 142px for
      "Protein" - and 142 + 66 + 34 + 34 with three gaps is 294 against a 320px
      phone's 272px row, so the remove button took a line of its own and the
@@ -725,11 +737,54 @@
      lines two and three; `#msaModeGroup`'s `margin-left: auto` then opened a
      hole in the middle of whichever line it landed on. Two even columns with
      no rules at all, and the labels do the separating. */
-  #foldOptions { gap: 10px 12px; }
-  #foldOptions > .fetch-option-group {
-    flex: 1 1 calc(50% - 6px);
-    min-width: 0;
+  /* 🔴 AND THREE ROWS OF LABEL-OVER-CONTROL IS 176px OF A 844px PHONE. Measured
+     at 390: the fold panel is 297px before the reader sees a structure, and the
+     options are 176 of it - three rows of 46 (a 13px title, a 4px gap and a
+     28px control) plus 20px of row gaps and 16 of padding.
+
+     THE CONTROLS ARE NOT TOUCHED. 28px is already small for a finger and the
+     16px text is what stops mobile Safari zooming the page on focus; what comes
+     off is the space around them. A 10px title on a 1.2 line box is 12px
+     instead of 13, the group gap 4 -> 2, the row gap 10 -> 8 and the options'
+     own padding 8/10 -> 6/8. Measured at 390: the options go 176 -> 156 and the
+     fold panel 297 -> 281, which is 16px of a 844px phone returned to the
+     structure. A `#fold-panel { padding }` rule was written here too and
+     removed: `--container-padding` is already 8px, so it saved nothing
+     vertically and cost 2px either side.
+
+     LABELS BESIDE THE CONTROLS WOULD BE THE BIG WIN AND DOES NOT FIT. Measured,
+     "AF2-multi" needs the whole 98px a third of a 390px row gives it, so
+     "MODEL" and its select cannot share a line - and moving to two columns
+     turns seven groups into four rows, which is worse and breaks the pairing
+     above. */
+  #foldOptions { gap: 8px 10px; padding: 6px 8px; }
+  #foldOptions > .fetch-option-group { min-width: 0; gap: 2px; }
+  #foldOptions .fetch-option-title {
+    font-size: 10px;
+    line-height: 1.2;
+    letter-spacing: 0.03em;
+    margin-bottom: 0;
   }
+
+  /* 🔴 THE GROUPS ARE PAIRED BY MEANING, AND A BARE `flex-wrap` KNOWS NOTHING
+     ABOUT THAT. Two per line filled the row in DOM order and put Seed beside
+     Sampler and Steps beside MSA - controls from different questions sharing a
+     line, and the two halves of one question (MSA and Max MSA, Sampler and
+     Steps) split across two.
+
+     A FLEX LINE IS CHOSEN FROM BASES, so stating the basis IS stating the row:
+     three at a third fill line one exactly and the next item cannot follow
+     them; two at a half fill the next. The subtraction is the column gap's
+     share (12px over three items is 8, over two is 6) plus a pixel of slack,
+     because a line that fits EXACTLY is one sub-pixel from wrapping.
+
+     It holds when a group is hidden, which is the case that matters: AF2 has no
+     Sampler or Steps, so line two becomes MSA and Max MSA and nothing is
+     stranded. Groups that grow rather than merely fit is why `1 1` and not
+     `0 0` - a lone MSA select with Max MSA hidden takes the line. */
+  #modelGroup, #recyclesGroup, #seedGroup { flex: 1 1 calc(33.333% - 9px); }
+  #af3ModeGroup, #af3CountGroup,
+  #msaModeGroup, #maxMsaGroup { flex: 1 1 calc(50% - 7px); }
   #foldOptions > .fetch-option-group + .fetch-option-group,
   #msaModeGroup {
     border-left: 0;
