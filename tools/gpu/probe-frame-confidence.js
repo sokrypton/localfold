@@ -14,6 +14,13 @@
  * page's assembly and not the model. Everything the page does to a frame -
  * the rigid fit onto the first frame, the B-factor broadcast from tokens to
  * atom slots, the PDB text - is in that path and in none of the others.
+ *
+ * 🔴 AND IT ASSEMBLES THE TIMELINE THE WAY web/app.js DOES, which is the thing
+ * actually watched: every frame but the last from the distogram, and the last
+ * one the FINISHED structure with its real pLDDT. app.js drops the final
+ * sampler frame rather than appending after it - it is the same structure, so
+ * keeping both ends the play bar on the same picture twice - and that slicing
+ * is easy to get wrong in a way no other check here would see.
  */
 import { foldAf3, loadAf3Weights } from "../../web/af3-model.js";
 
@@ -45,6 +52,8 @@ export async function main(device, args) {
 
   const frames = result.framePdbs.map(bFactors);
   const final = bFactors(result.pdb);
+  // web/app.js line for line: `[...framePdbs.slice(0, -1), result.pdb]`.
+  const timeline = [...result.framePdbs.slice(0, -1), result.pdb].map(bFactors);
   const means = frames.map((f) => Number(mean(f).toFixed(1)));
   // Every frame must have the same atom count as the final structure, or the
   // broadcast has gone wrong rather than the score.
@@ -65,5 +74,15 @@ export async function main(device, args) {
     // The last frame is the same structure as the final PDB, so its calibrated
     // confidence should land on the real pLDDT the card reports.
     lastFrameVersusFinal: Number((means[means.length - 1] - mean(final)).toFixed(1)),
+    timeline: {
+      length: timeline.length,
+      means: timeline.map((f) => Number(mean(f).toFixed(1))),
+      // The last entry must BE the finished structure, not a distogram frame.
+      endsOnRealPlddt: Math.abs(mean(timeline[timeline.length - 1])
+        - mean(final)) < 1e-6,
+      // ...and it must not repeat the structure: one fewer sampler frame than
+      // was produced, with the finished one in its place.
+      dropsLastSamplerFrame: timeline.length === frames.length,
+    },
   };
 }
