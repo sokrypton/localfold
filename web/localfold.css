@@ -265,9 +265,12 @@
   to { background-position: -125% 0; }
 }
 
-/* The download pair sits under the score card, matching the panels around it. */
+/* The download pair sits under the score card, matching the panels around it.
+   `max-width` because 340 is the DESKTOP panel column and this box is inside a
+   column that goes fluid below 980px - stated width, capped by the screen. */
 #downloads {
   width: 340px;
+  max-width: 100%;
   display: flex;
   gap: 8px;
   align-items: center;
@@ -317,45 +320,72 @@
 .mutate-close:hover { color: #0f172a; background: #f1f5f9; }
 
 /* --- Prediction scores card --- */
+/* 🔴 FOUR NUMBERS DO NOT NEED FOUR BOXES, OR A LINE OF THEIR OWN. This was a
+   header line and then a grid of bordered, filled cells with the label stacked
+   over the value: 92px of a 340px column that also holds the PAE matrix and the
+   downloads, for four short readings.
+
+   THE WHOLE CARD IS ONE WRAPPING ROW NOW - title, the metrics, then the badge -
+   which is what buys the height. Dropping the cell chrome alone took it to 86,
+   because the metrics still could not share a line with anything: measured, the
+   four pairs are 84 + 70 + 73 + 90 = 317px against the 310 inside this card, so
+   a multimer wrapped them and paid for a header line as well. With the title in
+   the row, line one is title + pLDDT + pTM and line two is whatever is left
+   plus the badge - 56px, monomer and multimer alike.
+
+   Nothing is smaller. The value keeps its 14px monospace, which is the part
+   anyone reads; it is the boxes and the two spare lines that went. */
 #predictionScoresBox {
   width: 340px;
+  max-width: 100%;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 10px 14px;
-}
-.scores-card-header {
-  display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
   align-items: baseline;
+  /* 10px between pairs; the 2px row gap is what keeps two lines from reading as
+     two paragraphs. */
+  gap: 2px 10px;
+  padding: 8px 14px;
 }
+
+/* `display: contents` and not a rewrite of the markup: the header and the grid
+   are still their own elements, still where web/app.js looks for them, and
+   their children are the row's items. */
+.scores-card-header,
+.scores-card-grid { display: contents; }
+
 .scores-card-title {
   font-size: 13px;
   font-weight: 600;
   color: #374151;
 }
+
+/* LAST, AND HARD RIGHT ON WHATEVER LINE IT LANDS ON. The badge is second in the
+   DOM - it belongs to the title - and `order` is what moves it past the metrics
+   without moving the markup. `margin-left: auto` then pushes it to the end of
+   its line, which is where it was when it had a header row to itself. */
 .scores-pass-badge {
+  order: 1;
+  margin-left: auto;
   font-size: 12px;
   color: #6b7280;
   font-weight: 500;
 }
-.scores-card-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
-  gap: 6px;
-}
+
+/* 🔴 AND THE TWO CELLS THAT COME AND GO ARE SHOWN FROM JAVASCRIPT, so the
+   display value lives in two places. web/app.js wrote `display = "block"` for
+   ipTM and Ranking - correct for a stacked cell and, once the cell is a flex
+   row, an inline style that beats this rule and puts those two labels back
+   above their values while pLDDT and pTM stayed beside theirs. It writes
+   "flex" now; the two must agree. */
 .score-metric-cell {
-  background: #f9fafb;
-  padding: 6px 4px;
-  border: 1px solid #e5e7eb;
-  border-radius: 6px;
-  text-align: center;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
 }
 .score-metric-label {
   font-size: 11px;
   color: #6b7280;
   font-weight: 500;
-  margin-bottom: 2px;
 }
 .score-metric-value {
   font-size: 14px;

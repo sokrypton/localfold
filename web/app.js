@@ -520,7 +520,7 @@ function updateScoresCard(confidence, passBadge = "") {
   const iptm = document.getElementById("metricIptm");
   if (iptmCell && iptm) {
     if (confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm))) {
-      iptmCell.style.display = "block";
+      iptmCell.style.display = "flex";
       iptm.textContent = Number(confidence.iptm).toFixed(3);
     } else {
       iptmCell.style.display = "none";
@@ -536,7 +536,7 @@ function updateScoresCard(confidence, passBadge = "") {
         : undefined
     );
     if (multimerScore !== undefined && !Number.isNaN(Number(multimerScore))) {
-      multimerCell.style.display = "block";
+      multimerCell.style.display = "flex";
       multimer.textContent = Number(multimerScore).toFixed(3);
     } else {
       multimerCell.style.display = "none";
