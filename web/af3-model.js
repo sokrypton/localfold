@@ -358,6 +358,12 @@ export async function foldAf3(options) {
   /**
    * The status line: what is running, and how far in.
    *
+   * 🔴 THREE WORDS FOR THE WHOLE FOLD: Preparing, Analysing, Building. They
+   * used to be Preparing, Trunk and either Refining or Diffusing - which named
+   * the ARCHITECTURE and the SAMPLER, two things a reader watching a bar has no
+   * way to tell apart and no reason to care about. The sampler's mode is
+   * already a control on the page; the status line says what is happening.
+   *
    * 🔴 TWO FIELDS, NOT SIX. It used to read "Trunk · pass 1 of 4 · pairformer
    * block 23 of 48", which is a number that changes forty-eight times a pass
    * next to two that barely move - so the eye tracks the one part that does not
@@ -481,7 +487,7 @@ export async function foldAf3(options) {
       }
       if (name === "target-feat") {
         reached(plan().featuresEnd);
-        say("Trunk");
+        say("Analysing");
         await yieldToBrowser();
       }
       if (name === "pairformer-block") {
@@ -497,7 +503,8 @@ export async function foldAf3(options) {
         const done = (detail.pass + detail.completed / detail.total) / detail.passes;
         reached(plan().featuresEnd
           + (plan().trunkEnd - plan().featuresEnd) * done);
-        say(detail.passes > 1 ? `Trunk ${detail.pass + 1}/${detail.passes}` : "Trunk");
+        say(detail.passes > 1
+          ? `Analysing ${detail.pass + 1}/${detail.passes}` : "Analysing");
       }
       if (name === "trunk-done") {
         reached(plan().trunkEnd);
@@ -518,7 +525,7 @@ export async function foldAf3(options) {
         // fold, twice, and a bar that stops for four seconds already reads as
         // busy next to a status line that says so. Holding is steadier than
         // sweeping, and it keeps the bar monotonic from end to end.
-        say(mode === "flow" ? "Refining" : "Diffusing");
+        say("Building");
         await yieldToBrowser();
       }
     },
@@ -540,7 +547,7 @@ export async function foldAf3(options) {
       // time over its own steps. It was the only honest one on the page, and
       // only because a denoiser call is the one unit that repeats identically.
       // The estimator generalises exactly that idea to the whole fold.
-      say(`${mode === "flow" ? "Refining" : "Diffusing"} ${step}/${calls}`);
+      say(`Building ${step}/${calls}`);
       // 🔴 YIELD, OR THE PAGE NEVER PAINTS. Every await in the sampler resolves
       // from a GPU callback, which is a microtask - so without a real task
       // boundary the status above is written and never drawn.

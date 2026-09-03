@@ -50,6 +50,7 @@ values means the whole-stack checker, not that file.
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
+| Does the progress bar move at the fold's speed? | `tools/gpu/probe-progress-bar.js` |
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
 | Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |

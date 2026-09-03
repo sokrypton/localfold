@@ -62,7 +62,7 @@ export function af3TrunkPassUnits(tokensIn, rowsIn) {
   const tokens = shape(tokensIn, 1, "tokens");
   const rows = shape(rowsIn, 1, "MSA rows");
   const l2 = tokens * tokens;
-  return 96.8 + 0.0772 * l2 + 8.786e-5 * l2 * tokens + 3.244e-5 * rows * l2;
+  return 91.8 + 0.08093 * l2 + 7.782e-5 * l2 * tokens + 2.751e-5 * rows * l2;
 }
 
 /**
@@ -74,7 +74,7 @@ export function af3TrunkPassUnits(tokensIn, rowsIn) {
  */
 export function af3DenoiserCallUnits(tokensIn) {
   const tokens = shape(tokensIn, 1, "tokens");
-  return 48.8 + 1.200 * tokens + 1.269e-3 * tokens * tokens;
+  return 55.7 + 0.8034 * tokens + 1.833e-3 * tokens * tokens;
 }
 
 /**
@@ -118,45 +118,53 @@ export function af2ConfidenceStepUnits(lengthIn) {
 /**
  * Building the input features: the synchronous CPU pass over the atoms.
  *
- * 🔴 IT IS NOT "ABOUT A MILLISECOND", WHICH IS WHAT THE OLD BAR ASSUMED. Timed
- * in the page: 1.45 s for 449 atoms and 3.06 s for 1162, so 11% of a
- * 150-residue fold spent at zero. It is CPU work while everything else here is
- * GPU work, so this is the one term whose ratio to the rest does NOT carry
- * across devices - it is here because being roughly right beats being zero.
+ * 🔴 IT USED TO BE SECONDS AND IS NOW MILLISECONDS: 84, 139 and 186 ms at
+ * 1392, 3072 and 4608 atoms, against the 1.45 s for 449 atoms this term was
+ * originally fitted to. Featurisation got about forty times faster and the
+ * coefficient did not follow, so the bar handed this band 23% of a fold that
+ * spends 2% of its clock here - which is most of why it jumped. It is CPU work
+ * while everything else here is GPU work, so this is the one term whose ratio
+ * to the rest does NOT carry across devices.
  */
 export function af3FeaturiseUnits(atomsIn) {
   const atoms = shape(atomsIn, 1, "atoms");
-  return 440 + 2.26 * atoms;
+  return 40.4 + 0.0317 * atoms;
 }
 
 /**
  * What the PAGE does per sampler step, beyond the denoiser call: superpose the
  * frame onto the reference, write a PDB, push it to the viewer, and yield.
  *
- * 🔴 WITHOUT THIS THE SAMPLER BAND IS UNDER-WEIGHTED BY A FACTOR OF THREE. A
- * denoiser call at 59 tokens is 124 ms on its own and 350 ms as a step of a
- * fold in the page; at 150 tokens, 257 against 690. The bar therefore reached
- * 81% when the sampler began and had 35% of the fold's wall clock left to
- * cover. Measured against the atom count, which is what the superposition and
+ * 🔴 IT IS NOW ALMOST NOTHING, AND USED TO BE MOST OF THE SAMPLER BAND. This
+ * was fitted when a denoiser call was 124 ms alone and 350 ms as a step of a
+ * page fold. Measured now with tools/gpu/probe-progress-bar.js, a page step is
+ * 109, 193 and 293 ms at 58, 128 and 192 tokens against 109, 190 and 276 for
+ * the call by itself - so the page adds single-digit milliseconds, not
+ * hundreds. Left in rather than deleted because it is real and grows; the old
+ * coefficient made the sampler 64% of the bar for 40% of the clock.
+ * Measured against the atom count, which is what the superposition and
  * the PDB are proportional to.
  */
 export function af3FrameUnits(atomsIn) {
   const atoms = shape(atomsIn, 1, "atoms");
-  return 96 + 0.29 * atoms;
+  return 0.0026 * atoms;
 }
 
 /**
  * Compiling the sampler's pipelines, once, before its first call.
  *
- * 🔴 THE FIRST DENOISER CALL IS NOT LIKE THE OTHERS. Measured in the page: at
- * 59 tokens 911 ms against 350 for the rest, and at 150 tokens 4.9 s against
- * 690 ms - so the bar sat still for 18% of a fold. The shaders are generated
- * per shape, so the compiler's work grows with the shape, which is why this is
- * quadratic rather than a constant.
+ * 🔴 THE FIRST DENOISER CALL IS NOT LIKE THE OTHERS, and the compile it pays
+ * for is now FLAT rather than quadratic in the shape: 740, 669 and 789 ms at
+ * 58, 128 and 192 tokens, each in its own cold process. It used to be fitted as
+ * 0.17 * L^2, which is right at 58 and four times over at 128.
+ *
+ * 🔴 MEASURE IT COLD, ONE FOLD PER PROCESS. A second fold at another shape
+ * reuses most of the pipelines and reports 155 ms where a cold one reports 669,
+ * and the page only ever does the cold one.
  */
 export function af3SamplerWarmupUnits(tokensIn) {
-  const tokens = shape(tokensIn, 1, "tokens");
-  return 0.17 * tokens * tokens;
+  shape(tokensIn, 1, "tokens");
+  return 730;
 }
 
 /**

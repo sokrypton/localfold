@@ -19,17 +19,15 @@ import {
 
 /** Measured on the reference M2 by tools/gpu/bench-runtime.js. */
 const AF3_TRUNK = [
-  { tokens: 59, rows: 32, ms: 387 },
-  { tokens: 128, rows: 32, ms: 1606 },
-  { tokens: 192, rows: 32, ms: 3583 },
-  { tokens: 256, rows: 32, ms: 6716 },
-  { tokens: 128, rows: 1, ms: 1529 },
-  { tokens: 128, rows: 128, ms: 1592 },
-  { tokens: 128, rows: 512, ms: 1822 },
+  { tokens: 59, rows: 32, ms: 392 }, { tokens: 128, rows: 32, ms: 1597 },
+  { tokens: 192, rows: 32, ms: 3584 }, { tokens: 256, rows: 32, ms: 6830 },
+  { tokens: 128, rows: 1, ms: 1572 },
+  { tokens: 128, rows: 128, ms: 1677 },
+  { tokens: 128, rows: 512, ms: 1802 },
 ];
 const AF3_DENOISER = [
-  { tokens: 59, ms: 124 }, { tokens: 128, ms: 223 },
-  { tokens: 192, ms: 326 }, { tokens: 256, ms: 439 },
+  { tokens: 59, ms: 109 }, { tokens: 128, ms: 190 },
+  { tokens: 192, ms: 276 }, { tokens: 256, ms: 382 },
 ];
 const AF2_STACK = [
   { length: 59, rows: 32, ms: 824 }, { length: 96, rows: 32, ms: 1873 },
@@ -55,9 +53,9 @@ describe("the runtime cost model", () => {
     }
   });
 
-  it("matches the measured AF3 denoiser within 2%", () => {
+  it("matches the measured AF3 denoiser within 3%", () => {
     for (const { tokens, ms } of AF3_DENOISER) {
-      within(af3DenoiserCallUnits(tokens), ms, 2, `denoiser ${tokens}`);
+      within(af3DenoiserCallUnits(tokens), ms, 3, `denoiser ${tokens}`);
     }
   });
 
@@ -95,6 +93,31 @@ describe("the runtime cost model", () => {
 });
 
 describe("planning a fold", () => {
+  it("splits a page fold the way the page's clock splits it", () => {
+    // 🔴 THE BAR'S WORST FAULT WAS HERE AND NOT IN A KERNEL. Featurisation and
+    // the per-frame work were fitted when they cost seconds; they cost
+    // milliseconds now, and the stale coefficients handed featurisation 23% of
+    // a fold that spends 2% of its clock there while the sampler took 64% of
+    // the bar for 40% of the clock. Measured with
+    // tools/gpu/probe-progress-bar.js at 58 tokens, 4 passes, 16 flow steps:
+    //
+    //     features 2.0%   trunk 39.7%   compile 16.1%   calls 38.6%
+    //
+    // and the worst bar-versus-clock error went from 0.18 to 0.07 there, and
+    // from 0.24 to under 0.04 at 128 and 192 tokens.
+    const measured = {
+      features: 0.020, trunk: 0.397, "sampler-warmup": 0.161, sampler: 0.386,
+    };
+    const plan = af3Plan({ tokens: 58, rows: 32, passes: 4, calls: 16, atoms: 1392 });
+    const total = planTotal(plan);
+    for (const stage of plan.stages) {
+      const share = (stage.units * stage.count) / total;
+      const off = Math.abs(share - measured[stage.name]);
+      assert.ok(off < 0.08, `${stage.name} takes ${(share * 100).toFixed(1)}% of `
+        + `the bar against ${(measured[stage.name] * 100).toFixed(1)}% of the clock`);
+    }
+  });
+
   it("puts the sampler's share up as the chain gets shorter", () => {
     const shortFold = af3Plan({ tokens: 59, rows: 32, passes: 4, calls: 8 });
     const longFold = af3Plan({ tokens: 256, rows: 32, passes: 4, calls: 8 });

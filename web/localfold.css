@@ -336,7 +336,11 @@
    Nothing is smaller. The value keeps its 14px monospace, which is the part
    anyone reads; it is the boxes and the two spare lines that went. */
 #predictionScoresBox {
-  width: 340px;
+  /* 🔴 IT GROWS TO ITS CONTENT NOW, up to whatever the column allows. A
+     monomer shows two metrics and a multimer five, and a fixed 340px wrapped
+     the second into a line of its own. */
+  width: fit-content;
+  min-width: 340px;
   max-width: 100%;
   display: flex;
   flex-wrap: wrap;
@@ -353,19 +357,11 @@
 .scores-card-header,
 .scores-card-grid { display: contents; }
 
-.scores-card-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: #374151;
-}
-
-/* LAST, AND HARD RIGHT ON WHATEVER LINE IT LANDS ON. The badge is second in the
-   DOM - it belongs to the title - and `order` is what moves it past the metrics
-   without moving the markup. `margin-left: auto` then pushes it to the end of
-   its line, which is where it was when it had a header row to itself. */
+/* LAST ON WHATEVER LINE IT LANDS ON. The badge is first in the DOM - it is the
+   header's only child now - and `order` is what moves it past the metrics
+   without moving the markup. */
 .scores-pass-badge {
   order: 1;
-  margin-left: auto;
   font-size: 12px;
   color: #6b7280;
   font-weight: 500;

@@ -171,10 +171,14 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fetch-option-group" id="recyclesGroup">
                 <span class="fetch-option-title">Recycles</span>
                 <select id="recycles">
-                  <option value="0" selected>0</option>
+                  <option value="0">0</option>
                   <option value="1">1</option>
                   <option value="2">2</option>
-                  <option value="3">3</option>
+                  <!-- 🔴 THREE BY DEFAULT, NOT ZERO. Every recycle is another
+                       whole trunk, so zero was the cheap answer rather than the
+                       right one - and it is the setting AlphaFold itself
+                       ships. -->
+                  <option value="3" selected>3</option>
                   <option value="6">6</option>
                   <option value="12">12</option>
                   <option value="24">24</option>
@@ -702,8 +706,11 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                          where a reader looking at pLDDT and PAE already is. -->
                     <!-- Prediction scores card -->
                     <div id="predictionScoresBox" class="container-box" style="display: none;">
+                        <!-- 🔴 NO TITLE. Every cell here is labelled, so a
+                             heading over them said only that scores are
+                             scores - and it cost the width that keeps them on
+                             one line. -->
                         <div class="scores-card-header">
-                            <span class="scores-card-title">Prediction Quality</span>
                             <span id="scoresPassBadge" class="scores-pass-badge"></span>
                         </div>
                         <div class="scores-card-grid" id="scoresCardGrid">
