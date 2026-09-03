@@ -71,12 +71,13 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * now says. It tracks the real ipTM at 0.84 Pearson and 0.91 Spearman across a
  * seventeen-target panel, minutes before the head produces one.
  *
- * 🔴 AND ITS SIBLING p(intra) IS NOT SHOWN, THOUGH IT IS COMPUTED AND TESTED.
- * See distogramContactConfidence: it tracks nothing the confidence head
- * reports, and on a coiled coil - one long helix with no long-range contacts
- * within a chain - it reads 0.00 beside a real pLDDT of 89. That is p(intra)
- * being correct about a different question, and a 0.00 in a card called
- * Prediction Quality would be read as a verdict on the fold.
+ * 🔴 THERE IS NO p(intra) BESIDE IT, AND THE WITHIN-CHAIN NUMBER IS "Settled"
+ * INSTEAD. distogramContactConfidence's `intra` - the same top-N reduction run
+ * within a chain - tracks nothing the head reports and reads 0.00 on a coiled
+ * coil whose real pLDDT is 89. What does track it is the per-position
+ * agreement score meaned, at 0.70 against pLDDT and 0.64 against pTM, and that
+ * is already on the card under its own name. The price is that it needs a
+ * frame: p(inter) lands when the trunk does, Settled one denoiser call later.
  */
 const CONTACT_DIGITS = 2;
 

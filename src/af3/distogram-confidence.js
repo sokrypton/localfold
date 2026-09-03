@@ -33,6 +33,22 @@
  * correlation with what has actually settled, against 0.411 for the
  * pLDDT-tuned settings.
  *
+ * 🔴 AND ITS MEAN TRACKS THE HEAD ACROSS TARGETS, WHICH IS A SEPARATE FACT
+ * FROM THE PER-RESIDUE ONE AND A BETTER ONE. Meaned over the live tokens of a
+ * finished structure, across the seventeen-target panel in
+ * tools/gpu/probe-contact-confidence.js:
+ *
+ *     vs mean pLDDT   0.702 Pearson / 0.765 Spearman
+ *     vs pTM          0.642 / 0.748
+ *
+ * That is the honest within-chain analogue of p(inter), and it is what the page
+ * shows on an intermediate frame under the name "Settled". It is NOT
+ * distogramContactConfidence's `intra`, which asks a different question of the
+ * same distogram and correlates with this at 0.166 - see there.
+ *
+ * 🔴 THE PRICE IS THAT IT NEEDS A FRAME. p(inter) is ready when the trunk is;
+ * this is ready one denoiser call later. Still minutes before the head.
+ *
  * 🔴 AND 0.49 IS WHAT IT IS: A ROUGH SIGNAL. On targets that fold it reaches
  * 0.63 to 0.88; on a GS linker and trp-cage it is 0.19 to 0.28. The
  * property that holds everywhere is the GLOBAL one - the mean rises
@@ -528,6 +544,18 @@ export function distogramInterfaceContact(contactProbs, asymId, seqMask, tokens,
  * is p(intra) being correct about a different question. It answers "does this
  * chain come back on itself, and is the trunk sure?" - not "is this a good
  * prediction?".
+ *
+ * 🔴 THE WITHIN-CHAIN QUESTION HAS A GOOD ANSWER AND THIS IS NOT IT. It is
+ * distogramConfidence's own per-position score, meaned - 0.702 against mean
+ * pLDDT and 0.642 against pTM on the same panel, where p(intra) reaches 0.293
+ * and 0.144. The two agree at 0.166, so they are not versions of one thing:
+ * this one asks how sure the trunk is about its strongest contacts, and that
+ * one asks how much of everything the trunk predicted the structure actually
+ * satisfies. The second is the one worth showing, and the page shows it.
+ *
+ * `intra` is kept because the probe measures it and because the negative
+ * result is worth more written down than rediscovered. It is not wired to
+ * anything.
  *
  * 🔴 p(intra) SKIPS THE SHORT SEPARATIONS AND HAS TO. Neighbouring residues are
  * in contact in any chain, folded or not, at a probability of essentially one,

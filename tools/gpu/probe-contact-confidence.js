@@ -27,7 +27,8 @@ import { confidenceWeights, openAf3Store, trunkWeights }
   from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
-import { distogramContactConfidence } from "../../src/af3/distogram-confidence.js";
+import { distogramAgreementTable, distogramConfidence, distogramContactConfidence }
+  from "../../src/af3/distogram-confidence.js";
 import { bestAlignmentTmScore, tmPerBinFor, tmScoreD0 }
   from "../../src/heads/tm-score.js";
 
@@ -100,6 +101,35 @@ function ranks(values) {
   return out;
 }
 
+/**
+ * The per-position agreement score, meaned - what the page calls "Settled".
+ *
+ * 🔴 THE OTHER CANDIDATE FOR p(intra), AND THE OBVIOUS ONE. It is the same
+ * distogram asked a different way: not "how sure is the trunk about its
+ * strongest contacts" but "how much of what the trunk predicted does this
+ * structure actually satisfy". It needs a frame, which p(inter) does not.
+ */
+function settledMean(trunk, batch, positions) {
+  const table = distogramAgreementTable(
+    trunk.logits, trunk.binEdges, batch.tokens, batch.seqMask);
+  const beta = batch.tokenAtomsToPseudoBeta;
+  const pseudo = new Float32Array(batch.tokens * 3);
+  for (let token = 0; token < batch.tokens; token += 1) {
+    if (!beta.mask[token]) continue;
+    const from = Number(beta.indices[token]) * 3;
+    for (let axis = 0; axis < 3; axis += 1) pseudo[token * 3 + axis] = positions[from + axis];
+  }
+  const perToken = distogramConfidence(table, pseudo);
+  let total = 0;
+  let count = 0;
+  for (let token = 0; token < batch.tokens; token += 1) {
+    if (batch.seqMask[token] <= 0) continue;
+    total += perToken[token];
+    count += 1;
+  }
+  return count === 0 ? Number.NaN : total / count;
+}
+
 /** pTM's own reduction over the distogram's expected TM term - no frame. */
 function distogramPtm(trunk, batch) {
   const bins = trunk.binEdges.length + 1;
@@ -146,6 +176,7 @@ export async function main(device, args) {
       // pTM and p(intra) does not, the failure is p(intra)'s and not the
       // distogram's.
       distogramPtm: Number(distogramPtm(result.trunk, batch).toFixed(3)),
+      settled: Number(settledMean(result.trunk, batch, result.positions).toFixed(1)),
       iptm: Number.isNaN(result.iptm) ? null : Number(result.iptm.toFixed(3)),
     };
     for (const separation of SEPARATIONS) {
@@ -191,5 +222,13 @@ export async function main(device, args) {
       rows.map((row) => row.meanPlddt), rows.map((row) => row["intra@12"])),
     distogramPtmVsPtm: both(
       rows.map((row) => row.ptm), rows.map((row) => row.distogramPtm)),
+    // 🔴 AND THE CANDIDATE p(intra) SHOULD HAVE BEEN: the per-position score
+    // averaged, against both head scores and against p(intra) itself.
+    settledVsPlddt: both(
+      rows.map((row) => row.meanPlddt), rows.map((row) => row.settled)),
+    settledVsPtm: both(
+      rows.map((row) => row.ptm), rows.map((row) => row.settled)),
+    settledVsIntra: both(
+      rows.map((row) => row["intra@12"]), rows.map((row) => row.settled)),
   };
 }
