@@ -216,7 +216,12 @@ export function distogramAgreementTable(logits, binEdges, tokens, seqMask) {
       }
     }
   }
-  return { tokens, bins, contacts: CONTACTS, centres, agreement, neighbours, counts, binEdges };
+  return {
+    tokens, bins, contacts: CONTACTS, centres, agreement, neighbours, counts, binEdges,
+    // ...kept for the TM estimate below, which needs EVERY pair rather than the
+    // eight a token is coloured by: pTM means over all of them.
+    expected, spread,
+  };
 }
 
 /**
@@ -308,4 +313,80 @@ export function calibrateToPlddt(approxFinal, realFinal, mask) {
     }
     return out;
   };
+}
+
+/**
+ * A per-pair TM term from the distogram and a frame, for pTM and ipTM.
+ *
+ * 🔴 THE SAME REDUCTION AS THE REAL SCORE, ONLY THE TERM IS ESTIMATED. pTM is
+ * `max over anchors i of mean over selected j of E[tm(PAE_ij)]`, and
+ * src/heads/tm-score.js already owns that reduction and its chain selection -
+ * so this produces only the term, and both scores fall out of `reduceTmScore`
+ * exactly as the confidence head's own do. ipTM differs from pTM in the
+ * SELECTION, not here.
+ *
+ * 🔴 THE ERROR IS THE TRUNK'S UNCERTAINTY AND THE FRAME'S DISAGREEMENT, IN
+ * QUADRATURE. PAE asks how far off j is when aligned on i. The distogram does
+ * not answer that - it describes one distance, not a relative frame - but it
+ * bounds it from two sides, and both are in angstroms:
+ *
+ *     e_ij = sqrt( spread_ij^2 + (d_ij - E[D_ij])^2 )
+ *
+ * A pair the trunk is unsure of cannot be well aligned however the frame falls,
+ * and a pair the frame has put at the wrong distance is misaligned whatever the
+ * trunk thought. Neither term alone is the error; the quadrature is the
+ * smallest thing that respects both.
+ *
+ * 🔴 AND IT IS A FLOOR, NOT AN ESTIMATE OF PAE. A pair can sit at exactly the
+ * predicted distance and still be rotated wrongly about it - the distogram
+ * cannot see that, so this can only ever be optimistic. Measured on the
+ * ten-target panel it is optimistic by +0.125 of pTM on average, high on nine
+ * of the ten.
+ *
+ * 🔴 SO USE IT FOR pTM AND NOT FOR ipTM. pTM correlates at 0.843 across the
+ * panel, which is a usable trend. ipTM does not survive at all:
+ *
+ *     6MRR homodimer   real 0.129   estimated 0.409
+ *     hetero 2-chain   real 0.153   estimated 0.454
+ *
+ * Three times too high on both complexes, and the reason is the floor above.
+ * The thing this cannot see - a pair at the right distance but the wrong
+ * orientation about it - is precisely what an INTERFACE score is asking about,
+ * so the blind spot is total exactly where ipTM lives. The distogram is
+ * confident about the cross-chain distances and the frame matches them; the
+ * PAE head, which is trained on alignment error rather than on distance, knows
+ * the interface is unreliable anyway. Reporting 0.41 where the truth is 0.13 is
+ * the difference between a plausible interface and none, so this must not be
+ * shown as ipTM.
+ *
+ * It is deliberately NOT wired to the page. It is here because the measurement
+ * is worth keeping and because a reader will otherwise wonder whether pTM could
+ * come from the distogram too - it can, roughly; ipTM cannot.
+ *
+ * @param {ReturnType<typeof distogramAgreementTable>} table
+ * @param {Float32Array} pseudoBeta  tokens * 3
+ * @param {number} d0  from tmScoreD0(tokens), the caller's own
+ * @returns {Float32Array} tokens * tokens
+ */
+export function distogramTmTerm(table, pseudoBeta, d0) {
+  const { tokens, expected, spread } = table;
+  if (pseudoBeta.length !== tokens * 3) {
+    throw new RangeError(`pseudoBeta is ${pseudoBeta.length}; expected ${tokens * 3}`);
+  }
+  const d0Squared = d0 * d0;
+  const term = new Float32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const pair = i * tokens + j;
+      let squared = 0;
+      for (let axis = 0; axis < 3; axis += 1) {
+        const delta = pseudoBeta[i * 3 + axis] - pseudoBeta[j * 3 + axis];
+        squared += delta * delta;
+      }
+      const deviation = Math.sqrt(squared) - expected[pair];
+      const error = spread[pair] * spread[pair] + deviation * deviation;
+      term[pair] = 1 / (1 + error / d0Squared);
+    }
+  }
+  return term;
 }

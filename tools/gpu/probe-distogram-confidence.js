@@ -40,8 +40,9 @@ import { foldBatch } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
-import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
+import { distogramAgreementTable, distogramConfidence, calibrateToPlddt, distogramTmTerm }
   from "../../src/af3/distogram-confidence.js";
+import { reduceTmScore, tmScoreD0 } from "../../src/heads/tm-score.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -65,6 +66,13 @@ const PANEL = [
   ["6MRR-scrambled", "EKLGKFLKSLEHTKEEGRWLNFAKQGKKGLEAIVELPLIKELSTKQFAEKAIGLRLTEKS"],
   ["GS-linker", "GSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGSGS"],
   ["poly-alanine", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
+  // 🔴 TWO CHAINS, BECAUSE ipTM DOES NOT EXIST FOR ONE. A single-chain fold
+  // reports it as NaN - there is no interface to score - so a panel of monomers
+  // measures the pTM estimate and says nothing at all about the ipTM one.
+  ["6MRR-homodimer", `${DEFAULT}:${DEFAULT}`],
+  ["hetero-2chain",
+    "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
+    + ":PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK"],
 ];
 
 function pearson(a, b) {
@@ -177,6 +185,16 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
   }
   const scoreStart = performance.now();
   const approx = distogramConfidence(table, gather(result.positions));
+
+  // The pTM/ipTM estimate, through the SAME reduction the real score uses -
+  // only the per-pair term differs, and ipTM differs from pTM in the SELECTION
+  // rather than in the term. See distogramTmTerm.
+  const asymId = batch.asymId;
+  const bothLive = (a, b) => batch.seqMask[a] > 0 && batch.seqMask[b] > 0;
+  const tmTerm = distogramTmTerm(table, gather(result.positions), tmScoreD0(tokens));
+  const ptmEstimate = reduceTmScore(tmTerm, tokens, bothLive);
+  const iptmEstimate = reduceTmScore(tmTerm, tokens,
+    (a, b) => bothLive(a, b) && asymId[a] !== asymId[b]);
   const scoreMs = performance.now() - scoreStart;
 
   const live = [...batch.seqMask.keys()].filter((t) => batch.seqMask[t] > 0);
@@ -199,6 +217,10 @@ async function foldOne(device, sequence, weights, { steps, mode, seed }) {
     approxMean: Number(mean(b).toFixed(1)),
     approxSd: Number(sd(b).toFixed(1)),
     withinSpearman: Number(pearson(ranks(a), ranks(b)).toFixed(3)),
+    ptm: Number(result.ptm.toFixed(3)),
+    ptmEstimate: Number(ptmEstimate.toFixed(3)),
+    iptm: Number.isNaN(result.iptm) ? null : Number(result.iptm.toFixed(3)),
+    iptmEstimate: Number.isNaN(iptmEstimate) ? null : Number(iptmEstimate.toFixed(3)),
     prepareMs: Number(prepareMs.toFixed(1)),
     perFrameMs: Number(scoreMs.toFixed(2)),
     trajectory: frames.map(({ step, positions }) =>
