@@ -101,24 +101,32 @@ These are engineering measurements on one machine, not cross-device claims.
 
 A fold with a real alignment is its 48-block main stack and almost nothing
 else, and that block is measured by `tools/gpu/profile-af2-block.js`. At 512
-MSA rows on a 59-residue chain it went **139.6 ms to 112.8**, and the 48-block
-stack 6.70 s to 5.41 s. End to end, through the driver the page uses, a
-512-row two-pass fold went **13.67 s to 11.22 s**.
+MSA rows on a 59-residue chain it went **139.6 ms to 108.6**, and the 48-block
+stack 6.70 s to 5.21 s. End to end, through the driver the page uses, a
+512-row two-pass fold went **13.67 s to 10.97 s**, and a two-chain multimer
+fold 1.98 s to 1.60 s.
 
-Four kernels were most of it and all four had the same fault: **one operand
-read as scalars.** Each had been vectorised on the side someone had looked at
-and left scalar on the other.
+Six kernels were most of it and every one had the same fault in some form:
+**an operand read one float at a time**, on a machine that issues about 640
+billion instructions a second whatever their width. Each had been vectorised on
+the side someone had looked at and left scalar on the other.
 
 | kernel | before | after | what it was doing |
 |---|---:|---:|---|
 | `opm.contract` | 15.6 | 5.3 | 16 cells strided by 64: two workgroup reads per multiply-add |
+| `opm.project` | 4.2 | 1.1 | one thread per (row, channel), each re-reading the row 32 times |
 | `attention.output` | 6.4 x2 | 4.2 x2 | two rows an invocation, every operand a float at a time |
-| `attention.project` | 16.3 x2 | 13.7 x2 | weights already vec4, source still scalar |
+| `attention.project` | 16.3 x2 | 13.6 x2 | weights already vec4, source still scalar |
 | transition `linear` | 19.3 + 18.3 | 15.7 + 15.6 | the same, and it serves the structure module too |
+| `opm.project-output` | 3.1 | 2.2 | one global weight read per multiply-add |
 
-The fix is one idea: stage the source tile **transposed**, four rows to a
-vector, so one read serves four accumulators. It takes a kernel from about 2.0
-useful operations an instruction to 2.9, and `opm.contract` from 0.33 to 2.67.
+The fix is mostly one idea: stage the source tile **transposed**, four rows to
+a vector, so one read serves four accumulators. It takes a kernel from about
+2.0 useful operations an instruction to 2.9, and `opm.contract` from 0.33 to
+2.67. Where the operand that repeats is a WEIGHT rather than an activation, the
+same argument says to carry more outputs per workgroup instead - which is what
+`opm.project-output` does, and what lifted AF3's `ffw-out` token tile from two
+to four (33.4 -> 25.0 ms, the diffusion transformer 143 -> 133).
 
 🔴 **AND THE INSTRUCTION COUNT IS NOT A MODEL OF THIS MACHINE, IT IS A
 HEURISTIC THAT WON FOUR TIMES AND LOST TWICE.** The identical change applied to
@@ -131,10 +139,12 @@ is to measure it: `bench-evoformer-linear.js` and `bench-msa-attention.js`
 interleave their arms in one process, because this machine drifts up to 3.2x
 between them.
 
-What is left is flat. The block's top six kernels are within 21 and 15 ms of
-each other and every one runs at 680-950 GFLOP/s, which `tools/gpu/probe-alu.js`
-puts at 53-74% of this device's scalar multiply-add ceiling. Every tile in them
-is a measured optimum. The next thing here is a different algorithm.
+What is left is flat. The block's top five kernels are within 21 and 13.6 ms of
+each other and every one runs at 680-1150 GFLOP/s, which `tools/gpu/probe-alu.js`
+puts at 53-89% of this device's scalar multiply-add ceiling. Every tile in them
+is a measured optimum, and the transition resisted two further attempts (see the
+notes in `src/evoformer/transition.js`). The next thing here is a different
+algorithm.
 
 ## Public API
 

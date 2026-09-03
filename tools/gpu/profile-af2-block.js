@@ -22,7 +22,7 @@
  *
  *      5 rows    13.5 ms    646 ms    opm.accumulate 2.04, opm.intermediate 1.07
  *    128 rows    32.8 ms   1574 ms    the two attention projections 4.07 each
- *    512 rows   117.9 ms   5660 ms    msa-column-attention.flash 21.0
+ *    512 rows   108.6 ms   5213 ms    msa-column-attention.flash 21.0
  *
  * 🔴 THE DEEP BLOCK IS NO LONGER ALMOST ALL ONE KERNEL, AND THIS DOCSTRING
  * SAID IT WAS FOR A WHILE AFTER IT STOPPED BEING TRUE. It recorded 294.9 ms at
@@ -35,9 +35,9 @@
  * output projection - each turned out to be reading one operand a float at a
  * time, and were given vector operands.
  *
- * What is left is FLAT. At 512 rows the top six kernels are within 21 to 15 ms
- * of each other and every one of them runs between 680 and 950 GFLOP/s, which
- * tools/gpu/probe-alu.js puts at 53-74% of this device's scalar multiply-add
+ * What is left is FLAT. At 512 rows the top five kernels are within 21 to 13.6
+ * ms of each other and every one of them runs between 680 and 1150 GFLOP/s, which
+ * tools/gpu/probe-alu.js puts at 53-89% of this device's scalar multiply-add
  * ceiling. There is no outlier to attack: the next thing here is a different
  * algorithm, not a better tile, and the two benches that exist for these
  * kernels (bench-evoformer-linear.js, bench-msa-attention.js) both report their

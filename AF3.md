@@ -533,6 +533,27 @@ the head is the whole optimisation target. On a 59-residue chain, steady state:
 So 200 steps is about 27 seconds on a 59-residue chain, where it was 152, and a
 whole diffusion-200 fold measures 26.3 s end to end against a flow-8 fold's 2.6.
 
+🔴 **AND AT 150 TOKENS THE HEAD IS A DIFFERENT SHAPE, WHICH IS WHERE THE LAST
+WIN CAME FROM.** A call there is 261 ms - transformer 133, atom decoder 61, atom
+encoder 45, conditioning 15 - and `ffw-out` alone was 33.4 of it. Its token tile
+was pinned at two by `Math.min(2, tile, fits(intermediate))`, a sizing term that
+assumed a workgroup staged `outTile * INTERMEDIATE` floats. Chunking had removed
+that long before: it stages `outTile * outChunk`, 6 KiB at four. The cap was
+never lifted, so the measurement that set it - outTile 4 at 85 ms against 2's 74
+- stood against a kernel that no longer existed.
+
+The tile is what amortises the weight read, one per step of the intermediate
+multiplied into every token of the tile. Re-measured with the chunking in place,
+as medians of repeated runs of bench-diffusion-transformer.js: **at 150 tokens
+2 -> 138 ms, 4 -> 128, 8 -> 132; at 59 tokens they tie.** `ffw-out` 33.4 -> 25.0,
+the transformer 143 -> 133, a call 267 -> 261. Arithmetically neutral to every
+digit - each token's sum runs over the same intermediate in the same order
+whatever the tile - and check-af3-diffusion-transformer.js reports the identical
+relRMS either side.
+
+The lesson is not the tile. It is that a cap and the measurement justifying it
+outlive the kernel they were about, and nothing fails when they do.
+
 THE REST OF THE FOLD, for scale, all on the same 59-mer:
 
 | trunk pass, 32 MSA rows   | 756 -> 570 ms  |
