@@ -32,7 +32,7 @@ import { parseA3m } from "../src/input/a3m.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
-import { budgetForDevice, GpuMemoryBudgetError, setMemoryBudget }
+import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
@@ -196,27 +196,21 @@ function statusWithAction(text, label, title, onClick) {
 /**
  * What a refused allocation looks like to somebody who has to decide about it.
  *
- * 🔴 "FREE RAM" IS NOT AVAILABLE AND IS NOT GUESSED AT HERE. No browser API
- * reports free system memory or free GPU memory - `navigator.deviceMemory` is
- * TOTAL system RAM rounded down to a power of two, and WebGPU reports nothing
- * at all. So this states the four numbers that are real: what the allocation
- * needed, what the fold is already holding, the ceiling it was measured
- * against, and where that ceiling came from. Inventing a "free" figure from
- * those would be the one number in the sentence nobody could check.
+ * 🔴 TWO NUMBERS. What the fold needs, and what it is allowed. Everything else
+ * that was here - the tensor's name, the split between what is held and what
+ * was asked for, where the ceiling comes from - is true and is not what the
+ * reader is deciding on. The tensor name still goes to the console, where the
+ * person it helps is already looking.
+ *
+ * 🔴 AND NOT "FREE RAM", WHICH DOES NOT EXIST TO ASK FOR. No browser API
+ * reports free system or GPU memory; navigator.deviceMemory is TOTAL RAM
+ * rounded down to a power of two. A "free" figure would be the one number here
+ * nobody could check.
  */
 function describeBudget(error) {
   const mib = (bytes) => `${Math.round(bytes / 1048576)} MiB`;
-  // 🔴 AND WHERE THE CEILING CAME FROM IS ONLY SAID WHEN IT IS TRUE. The
-  // parenthetical explains the DEFAULT ceiling; a ceiling that was set to
-  // anything else is not a third of anything, and asserting it anyway would put
-  // the one uncheckable clause in the sentence right next to four numbers that
-  // are all exact.
-  const isDefault = error.budgetBytes === budgetForDevice();
-  const total = isDefault && typeof navigator.deviceMemory === "number"
-    ? ` (a third of this machine's ${navigator.deviceMemory} GB)` : "";
-  return `Not enough room: ${error.label} needs ${mib(error.bytes)} and this fold`
-    + ` is holding ${mib(error.residentBytes)}, against a ${mib(error.budgetBytes)}`
-    + ` ceiling${total}.`;
+  return `Needs ${mib(error.residentBytes + error.bytes)}, over this device's`
+    + ` ${mib(error.budgetBytes)} limit.`;
 }
 
 /**
@@ -1420,9 +1414,8 @@ async function fold(event) {
         statusWithAction(
           describeBudget(error),
           "Fold anyway",
-          "Removes the memory ceiling for the rest of this session. The ceiling"
-          + " is what turns running out of memory into this message: without it"
-          + " the browser tab, or the machine, may stop responding instead.",
+          "Lifts the limit for this session. The limit is what turns running out"
+          + " of memory into a message; without it the tab may stop responding.",
           () => { void foldWithoutCeiling(); });
       } else status(error instanceof Error ? error.message : String(error), true);
     }
