@@ -241,6 +241,7 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          maxMsaSequences?: number, ligandCodes?: string[],
  *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
+ *          onTrunk?: (reusable: object) => void,
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
  */
@@ -425,6 +426,11 @@ export async function foldAf3(options) {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
     onStage: async (name, detail) => {
       throwIfAborted(signal);
+      if (name === "trunk-done") {
+        // ...handed up the moment it exists, so a caller can cache it before
+        // anything downstream has had a chance to fail. See fold.js.
+        options.onTrunk?.(detail.reusable);
+      }
       if (name === "trunk-done" && liveConfidence === null) {
         // ...best effort, for the reason the finished-frame path gives: this is
         // a colour, and losing a prediction to it would be a bad trade.
@@ -582,20 +588,13 @@ export async function foldAf3(options) {
         realPerToken, batch.seqMask);
     } catch (cause) {
       console.warn("per-frame confidence unavailable; frames take the final pLDDT", cause);
-      return { coloured: () => result.scores.plddt, settled: null };
+      return { coloured: () => result.scores.plddt };
     }
     return {
       // ...broadcast back to atom slots, because that is how toPdb indexes the
       // B-factor it writes.
       coloured: (positions) => broadcastToSlots(batch,
         calibrate(distogramConfidence(table, pseudoBetaOf(batch, positions)))),
-      // 🔴 AND THE UNCALIBRATED ONE FOR THE CARD, WHICH IS NOT THE SAME NUMBER.
-      // The colour is calibrated to this fold's own pLDDT so the ramp means
-      // what it always means; the CARD shows a percentage named "Settled", and
-      // that has to be the raw quantity - the share of the trunk's predicted
-      // distances this frame already satisfies. Calibrating it would make the
-      // number depend on a score the frame is not being shown.
-      settled: (positions) => distogramConfidence(table, pseudoBetaOf(batch, positions)),
     };
   })();
 
@@ -612,25 +611,6 @@ export async function foldAf3(options) {
   // then jumped on its last frame.
   const framePdbs = trajectory.map(
     (positions) => fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
-  // 🔴 AND HOW FAR EACH FRAME HAS SETTLED, so the quality card can say
-  // something about the frame being LOOKED AT rather than showing the finished
-  // score on every one of them. It is the mean over the live tokens of the
-  // share of the trunk's predicted distances that frame already satisfies -
-  // which is what the trajectory's colour is drawn from, and is NOT a pLDDT.
-  // The card used to show it as one, which is the naming this file no longer
-  // does anywhere.
-  const frameSettled = frameScores.settled === null ? trajectory.map(() => undefined)
-    : trajectory.map((positions) => {
-      const perToken = frameScores.settled(positions);
-      let total = 0;
-      let count = 0;
-      for (let token = 0; token < batch.tokens; token += 1) {
-        if (batch.seqMask[token] <= 0) continue;
-        total += perToken[token];
-        count += 1;
-      }
-      return count === 0 ? undefined : total / count;
-    });
   // ...and the finished structure keeps the REAL pLDDT, which is the one number
   // here that is a claim about the prediction rather than about the animation.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
@@ -641,7 +621,6 @@ export async function foldAf3(options) {
     reusable: result.reusable,
     depth: rows.depth,
     framePdbs,
-    frameSettled,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,

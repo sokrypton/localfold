@@ -459,7 +459,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     previousPair = trunk.pair;
     previousSingle = trunk.single;
   }
-  stage("trunk-done", { trunk });
+  // 🔴 THE REUSABLE TRUNK RIDES ON trunk-done, NOT ONLY ON THE RETURN. A fold
+  // that fails AFTER this point - the memory ceiling refusing the sampler is
+  // the case that prompted it - used to lose the trunk with the exception, so
+  // retrying re-ran every pass of work that had already succeeded. The loop
+  // above has finished by here, so this carries all the recycles that were
+  // asked for.
+  stage("trunk-done", { trunk, reusable: { trunk, targetFeat, recycles } });
 
   // 🔴 THE DIFFUSION HEAD HAS ITS OWN FIVE REFERENCE EMBEDDINGS - same shapes as
   // the conditioning module's, different weights. Reusing one for both

@@ -530,21 +530,6 @@ function updateScoresCard(confidence, passBadge = "") {
     }
   }
 
-  // ...a cell that shows only when its number exists: Settled means something
-  // on a frame that has not finished, and nothing on the finished one.
-  const optional = (cellId, valueId, value, digits) => {
-    const cell = document.getElementById(cellId);
-    const slot = document.getElementById(valueId);
-    if (!cell || !slot) return;
-    if (value !== undefined && Number.isFinite(Number(value))) {
-      cell.style.display = "flex";
-      slot.textContent = Number(value).toFixed(digits);
-    } else {
-      cell.style.display = "none";
-    }
-  };
-  optional("metricSettledCell", "metricSettled", confidence.settled, 0);
-
   const multimerCell = document.getElementById("metricMultimerCell");
   const multimer = document.getElementById("metricMultimer");
   if (multimerCell && multimer) {
@@ -923,6 +908,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse,
+    // 🔴 CACHED WHEN THE TRUNK EXISTS, NOT WHEN THE FOLD FINISHES. This used to
+    // be written after foldAf3 resolved, so a fold that hit the memory ceiling
+    // in the SAMPLER threw the trunk away with the exception and "Fold anyway"
+    // started from featurisation - re-running minutes of work that had already
+    // succeeded. An aborted fold now leaves its trunk behind too.
+    onTrunk: (reusable) => { trunkCache = { key: trunkKey, reusable }; },
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -946,6 +937,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   });
   await pending;
   throwIfAborted(signal);
+  // ...`onTrunk` above has already cached this, and it is the same object.
   // Kept for the next fold, and kept even when it was itself reused, so a run
   // of re-samples all skip the trunk rather than only the first.
   trunkCache = { key: trunkKey, reusable: result.reusable };
@@ -1015,7 +1007,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       first.confidence = {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
-        settled: result.frameSettled?.[0],
         badge: `${mode}_0`,
       };
     }
@@ -1034,16 +1025,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // All three come from the confidence head, which runs once on the
       // finished structure. The card used to show the head's finished numbers
       // on every frame, and then a distogram estimate labelled as a pLDDT;
-      // both told the reader something the frame does not support. An
-      // intermediate frame now shows a dash for the three head scores, the
-      // trunk's contact confidences - which ARE known this early, and do not
-      // move - and how far it has settled.
+      // both told the reader something the frame does not support. It shows a
+      // dash for all three instead, and the badge names the frame.
       frame.confidence = last ? result.confidence : {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
-        // ...`index` walks timeline.slice(1), so it is one behind the frame
-        // number the name uses and one behind the settling array.
-        settled: result.frameSettled?.[index + 1],
         badge: `${mode}_${index + 1}`,
       };
       if (last) {
