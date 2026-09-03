@@ -88,12 +88,26 @@ A flow-8 fold is **3.0 s** - 1.1 s of trunk and 1.7 s of diffusion - and a
 diffusion-200 fold is 25.9 s. It was ~150 s when the first end-to-end fold ran,
 and 7 s before the kernel work of 2026-09-02.
 
-🔴 **A DENOISER CALL COSTS 123 ms INSIDE THE SAMPLER AND 111 ON THE BENCH**
-(24.6 s over 200 steps against tools/gpu/bench-head.js's median). The 12 ms is
-the sampler's own per-step work - a random augmentation of every atom, the
-noise injection, the Euler step and two copies of the coordinates for the
-trajectory callback - and it is 2.4 s of a 200-step fold. Nobody has looked at
-it.
+🔴 **THE 12 ms THIS FILE ATTRIBUTED TO THE SAMPLER'S PER-STEP WORK WAS NOT
+THERE.** It said a denoiser call cost 123 ms inside the sampler against 111 on
+tools/gpu/bench-head.js, blamed the gap on the random augmentation, the noise
+injection, the Euler step and the two trajectory copies, and called it 2.4 s of
+a 200-step fold that nobody had looked at. Someone has now:
+`tools/gpu/probe-sampler-overhead.js` times each phase inside the loop.
+
+    59 tokens    step 112.8 ms   head.run 112.2   everything else 0.6
+    150 tokens   step 250.5 ms   head.run 249.0   everything else 1.5
+
+So the loop costs **0.6%**, not 10%, and the host arithmetic is 0.4 ms of it -
+nearly all the noise injection's 4,248 gaussian draws. The augmentation, the
+Euler step and both copies measure zero. They were always going to: at 59
+tokens the whole of that work is about fifteen thousand float operations, which
+is microseconds, and the count was checkable without running anything.
+
+The 12 ms was two numbers from two processes - the drift this file warns about
+three times over. `head.run` itself is within 0.2 ms of the GPU time it
+reports, so there is no round trip to win back either. **Do not build a GPU
+sampler step; there is nothing under it.**
 
 ## Modified residues, and why they need sixteen steps
 
@@ -460,14 +474,17 @@ The server scores the same with them off, so do not implement templates to
 chase a complex that folds badly. That was the prime suspect for an hour and it
 was wrong.
 
-### A separate bug, found while measuring and not yet fixed
+### Fixed: a fold crawled in a background tab
 
-**A fold crawls in a background tab.** The per-block yield is
-`await new Promise((resolve) => setTimeout(resolve, 0))`, and Chrome clamps
-setTimeout to >=1 s in a hidden tab - so a 48-block pass that takes under a
-second takes the better part of a minute and the trunk appears to hang.
-Measured: pass 1 reached block 11 in five minutes hidden, then jumped to block
-28 the moment the tab was touched. A MessageChannel yield is not throttled.
+The per-block yield was `setTimeout(resolve, 0)`, and Chrome clamps setTimeout
+to >=1 s in a hidden tab - so a 48-block pass that takes under a second took
+the better part of a minute and the trunk appeared to hang. Measured at the
+time: pass 1 reached block 11 in five minutes hidden, then jumped to block 28
+the moment the tab was touched.
+
+`src/runtime/yield.js` is the fix (commit 882e3f2) and the whole of it: a
+MessageChannel message is a task, so it still lets the page paint and still
+lets Stop respond, but it is not a timer and is not clamped.
 
 ## The weights
 
