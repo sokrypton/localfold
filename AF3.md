@@ -530,6 +530,37 @@ the head is the whole optimisation target. On a 59-residue chain, steady state:
 | atom decoder    |    48   |  24 |
 | **one call**    | **760** | **134** |
 
+🔴 **AND AT 150 TOKENS IT IS A DIFFERENT KERNEL LIST, WHICH IS WHERE THE 2026-09-03
+WORK CAME FROM.** The table above is a 59-residue chain, where the atom blocks
+are small. At 150 tokens a call was 267 ms - transformer 143, atom decoder 59,
+atom encoder 46 - and **three kernels were reading the conditioning from global
+memory once per token per channel, on every lane**: `ffw-out` and
+`attention-output` in the transformer, and the atom blocks' `output`. The value
+is indexed by (token, d) and never by the channel a lane owns, so all 256 lanes
+of a workgroup wanted the same tile-by-C_COND floats. `conditionedProject` did
+the same with two tensors.
+
+| kernel | before | after | |
+|---|---:|---:|---|
+| ffw-out | 33.4 | **14.1** | the token tile lifted from two, then the conditioning staged |
+| attention-output | 19.1 | **9.0** | the zero-gate loop was 60% of it |
+| output (x3) | 11.6 | **10.0** | five global reads of the conditioning became one stage |
+| project / project-keys | 3.3, 2.1, 2.1 | **1.8** | act AND queries_cond, four loops each |
+
+A denoiser call **267 -> 221 ms**, its transformer 143 -> 111. A 200-step fold
+at that length is about nine seconds less.
+
+🔴 **AND WHERE THE STAGE GOES IS DECIDED BY RESIDENCY, NOT BY STYLE.** Three of
+these reuse an array that is already dead - `wt` in ffw-out, `gated` in
+attention-output, the raw tensors in conditionedProject - because a second
+array would have taken those kernels from 6 to 12 KiB, or 8 to 16, and halved
+how many workgroups a core can hold. The atom `output` kernel is the exception
+and gets a fifth array: it already holds 24 of this device's 32 KiB, so it is
+one workgroup a core either way and the array is free. It also CANNOT reuse
+`cond_norm`, because its second adaptive-zero projection reads the RAW
+conditioning after the normalised form has been written - which would have been
+silent.
+
 So 200 steps is about 27 seconds on a 59-residue chain, where it was 152, and a
 whole diffusion-200 fold measures 26.3 s end to end against a flow-8 fold's 2.6.
 

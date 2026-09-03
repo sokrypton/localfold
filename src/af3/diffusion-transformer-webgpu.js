@@ -868,6 +868,11 @@ export class Af3DiffusionTransformerGpu {
     const workgroupStorage = this.device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
     const intermediate = channels * weights.transitionFactor;
     const fits = (perToken) => Math.max(1, Math.floor(workgroupStorage / (perToken * 4)));
+    // 🔴 FOUR, AND RE-MEASURED AFTER THE CONDITIONING WAS STAGED. Eight used to
+    // lose partly because two kernels' zero-gate loops were TILE global reads a
+    // step; staged, those loops cost the same whatever the tile, so the reason
+    // for the old answer had gone even though the answer had not. Re-swept on
+    // the whole transformer at 150 tokens: 4 -> 103, 105 ms; 8 -> 106, 113.
     const tile = weights.tile ?? Math.min(4, fits(channels));
     const splits = weights.splits ?? 2;
     // 🔴 THE CHUNK IS WHAT `ffw-out` STAGES, NOT THE WHOLE INTERMEDIATE, AND
