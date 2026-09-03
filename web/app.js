@@ -472,7 +472,10 @@ function syncScoresCardToActiveFrame(frameIndex) {
   const result = getActiveFrameConfidence(frameIndex);
   if (result && result.confidence) {
     lastReportedFrameIdx = result.index;
-    updateScoresCard(result.confidence, `Pass ${result.index + 1}`);
+    // ...a frame may name its own badge - an AF3 sampler step is not a "Pass",
+    // and an estimated pLDDT has to say that it is one.
+    updateScoresCard(result.confidence,
+      result.confidence.badge ?? `Pass ${result.index + 1}`);
   }
 }
 
@@ -989,12 +992,40 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // loadIntoViewer names its first frame for a recycle, which is the wrong
     // word for a sampler call.
     const first = viewer?.objectsData?.[viewerObject]?.frames?.[0];
-    if (first !== undefined) first.name = first.label = first.title = `${mode}_0`;
+    if (first !== undefined) {
+      first.name = first.label = first.title = `${mode}_0`;
+      // ...and frame zero's own estimate too. It is built by loadIntoViewer
+      // rather than by the loop below, so it is easy to leave carrying whatever
+      // that put there.
+      first.confidence = {
+        ...result.confidence,
+        meanPlddt: result.frameConfidence?.[0],
+        badge: `${mode}_0 · pLDDT estimated`,
+      };
+    }
     for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);
       const last = index === timeline.length - 2;
       frame.name = frame.label = frame.title = last ? "final" : `${mode}_${index + 1}`;
-      frame.confidence = result.confidence;
+      // 🔴 THE FRAME'S OWN NUMBER, NOT THE FINISHED ONE. Every frame used to
+      // carry `result.confidence`, so scrubbing the trajectory showed the final
+      // pLDDT on a structure that had not reached it. An intermediate frame now
+      // reports the distogram estimate its own colour is drawn from, and says
+      // so; the last frame is the finished structure and keeps the real head's
+      // answer.
+      //
+      // 🔴 pTM AND ipTM DO NOT MOVE, and that is deliberate. They come from the
+      // confidence head on the finished structure and there is no per-frame
+      // version of either - blanking them while scrubbing would add no
+      // information and would toggle the ipTM cell in and out, resizing the
+      // card under the reader. The badge carries the caveat instead.
+      frame.confidence = last ? result.confidence : {
+        ...result.confidence,
+        // ...`index` walks timeline.slice(1), so it is one behind the frame
+        // number the name uses and one behind the confidence array.
+        meanPlddt: result.frameConfidence?.[index + 1],
+        badge: `${mode}_${index + 1} · pLDDT estimated`,
+      };
       if (last) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
         // back does not blank a matrix that was on screen a moment earlier.

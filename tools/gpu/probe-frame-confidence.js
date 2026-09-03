@@ -86,6 +86,22 @@ export async function main(device, args) {
       means: liveFrames.map((pdb) => Number(mean(bFactors(pdb)).toFixed(1))),
       allZero: liveFrames.every((pdb) => bFactors(pdb).every((v) => v === 0)),
     },
+    // 🔴 THE CARD'S NUMBER AGAINST THE FRAME'S OWN COLOUR. web/app.js hands
+    // each viewer frame a `confidence.meanPlddt` from `frameConfidence`, and
+    // the B-factors it is drawn with come from the same estimate - so the two
+    // must agree frame for frame. They are assembled by different code with
+    // different indexing (the loop walks timeline.slice(1), one behind), which
+    // is exactly where an off-by-one hides: it would show frame 3's number on
+    // frame 4 and nothing would look wrong.
+    cardVersusColour: (() => {
+      const card = result.frameConfidence ?? [];
+      return {
+        length: card.length,
+        matchesFrameMeans: card.length === means.length
+          && card.every((value, i) => Math.abs(value - means[i]) < 0.05),
+        means: card.map((v) => Number(v.toFixed(1))),
+      };
+    })(),
     timeline: {
       length: timeline.length,
       means: timeline.map((f) => Number(mean(f).toFixed(1))),

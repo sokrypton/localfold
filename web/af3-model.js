@@ -574,6 +574,21 @@ export async function foldAf3(options) {
   // then jumped on its last frame.
   const framePdbs = trajectory.map(
     (positions) => fittedPdb(batch, positions, reference, slots, perFrameConfidence(positions)));
+  // 🔴 AND THE NUMBER BEHIND EACH FRAME'S COLOUR, so the quality card can show
+  // the frame being LOOKED AT rather than the finished score on every one of
+  // them. It is the same per-token estimate the B-factors carry, meaned over
+  // the live tokens - not a second opinion, the same one.
+  const frameConfidence = trajectory.map((positions) => {
+    const perSlot = perFrameConfidence(positions);
+    let total = 0;
+    let count = 0;
+    for (let slot = 0; slot < perSlot.length; slot += 1) {
+      if (!batch.predDenseAtomMask[slot]) continue;
+      total += perSlot[slot];
+      count += 1;
+    }
+    return count === 0 ? undefined : total / count;
+  });
   // ...and the finished structure keeps the REAL pLDDT, which is the one number
   // here that is a claim about the prediction rather than about the animation.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
@@ -584,6 +599,7 @@ export async function foldAf3(options) {
     reusable: result.reusable,
     depth: rows.depth,
     framePdbs,
+    frameConfidence,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,
