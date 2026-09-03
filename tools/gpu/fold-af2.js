@@ -4,6 +4,7 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/fold-af2.js
  *     node tools/gpu-chrome.mjs tools/gpu/fold-af2.js --rows=512 --recycles=1
+ *     node tools/gpu-chrome.mjs tools/gpu/fold-af2.js --family=multimer --chains=30,29
  *
  * 🔴 AF2 HAD NO END-TO-END GATE THAT RUNS ON THIS MACHINE, and its kernels have
  * now been rewritten three times. `npm run test:gpu` cannot load Dawn here;
@@ -26,6 +27,15 @@
  * download besides. It makes the numbers meaningless as biology and perfectly
  * good as a fingerprint, which is what a regression needs.
  *
+ * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. src/multimer/block.js
+ * builds its blocks from the same attention, transition and outer-product-mean
+ * shaders src/evoformer/block.js does, with its own dispatches - so a tile
+ * changed in one and not threaded through the other is a bug that only a
+ * multimer fold can see. `--family=multimer` runs that path, through
+ * AlphaFoldUnifiedGpu and the multimer regime the page passes (outer product
+ * mean first, chain-aware, position scale 20), with `--chains` splitting the
+ * sequence.
+ *
  * 🔴 AND pLDDT IS NOT THE CHECK. AF3.md records a batch with one broken gather
  * folding 17 A of spaghetti at pLDDT 55. Consecutive CA are 3.80 A apart in a
  * real protein and nothing else; `caca` is the number that a wrong kernel
@@ -34,6 +44,7 @@
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../src/multimer/model.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -45,6 +56,11 @@ const DEFAULT_SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGG
 
 export async function main(device, args) {
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
+  const family = option(args, "family", "monomer");
+  if (family !== "monomer" && family !== "multimer") {
+    throw new RangeError(`unknown family ${family}: expected "monomer" or "multimer"`);
+  }
+  const chainLengths = option(args, "chains", "").split(",").filter(Boolean).map(Number);
   const rows = Number(option(args, "rows", "128"));
   const recycles = Number(option(args, "recycles", "0"));
   const seed = Number(option(args, "seed", "0"));
@@ -55,18 +71,24 @@ export async function main(device, args) {
   // machine should not pull 227 MB to run a regression.
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
-    MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"));
+    MODEL_BUNDLES[family].directory, await loadManifest(family));
   const fixture = AlphaFoldFixture.fromStore(store);
   const loadStart = performance.now();
-  const [embedding, template, extraStack, mainStack, structure, confidence,
+  // ...the same split web/model.js makes: multimer's embedder runs its template
+  // track every recycle, the monomer's is the query-only residual.
+  const multimer = family === "multimer";
+  const [embedding, template, templateEmbedding, extraStack, mainStack, structure, confidence,
          geometry, featureTables, paeBreaks] = await Promise.all([
-    fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(),
+    fixture.embeddingWeights(),
+    multimer ? Promise.resolve(undefined) : fixture.templateWeights(),
+    multimer ? fixture.templateEmbeddingWeights() : Promise.resolve(undefined),
+    fixture.extraStackWeights(),
     fixture.mainStackWeights(), fixture.structureWeights(), fixture.confidenceWeights(),
     fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
     fixture.tensor("confidencePaeBreaks"),
   ]);
   const weights = {
-    embedding, template, extraStack, mainStack, structure,
+    embedding, template, templateEmbedding, extraStack, mainStack, structure,
     lddt: confidence.lddt, pae: confidence.pae, geometry,
   };
   const loadMs = Math.round(performance.now() - loadStart);
@@ -79,20 +101,40 @@ export async function main(device, args) {
   }
   const a3m = `${lines.join("\n")}\n`;
 
+  const chains = chainLengths.length > 0 ? chainLengths : [sequence.length];
+  if (chains.reduce((sum, value) => sum + value, 0) !== sequence.length) {
+    throw new RangeError(`--chains sums to ${chains.reduce((a, b) => a + b, 0)}, not ${sequence.length}`);
+  }
+  // The regime web/app.js passes for multimer, verbatim - it is not defaults,
+  // and dropping it once ran multimer WEIGHTS on the monomer graph.
+  const regime = multimer
+    ? { outerProductMeanFirst: true, positionScale: 20, chainAware: true, chainSequences: chains }
+    : {};
   const started = performance.now();
-  const prediction = await new AlphaFoldMonomerGpu(device).predictA3m(
-    a3m, weights, featureTables,
-    { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: rows },
-    paeBreaks,
-  );
+  const prediction = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+    .predictA3m(
+      a3m, weights, featureTables,
+      { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: rows,
+        chainLengths: chains, ...regime },
+      paeBreaks,
+    );
   const elapsed = Math.round(performance.now() - started);
   const final = prediction.final;
   const length = sequence.length;
   const atom37 = final.structure.atom37;
 
   // Consecutive alpha carbons, which is atom 1 of the 37.
+  //
+  // 🔴 THE CHAIN JUNCTIONS ARE SKIPPED, OR THE METRIC MEASURES NOTHING. Two
+  // chains are not bonded to each other, so the step across the boundary is
+  // whatever the fold placed them at - 18.4 A on the first run of this - and it
+  // would sit in `worst` for ever looking like a broken backbone.
+  const breaks = new Set();
+  let boundary = 0;
+  for (const chain of chains.slice(0, -1)) { boundary += chain; breaks.add(boundary - 1); }
   const distances = [];
   for (let residue = 0; residue + 1 < length; residue += 1) {
+    if (breaks.has(residue)) continue;
     const a = (residue * 37 + 1) * 3;
     const b = ((residue + 1) * 37 + 1) * 3;
     distances.push(Math.hypot(
@@ -114,9 +156,11 @@ export async function main(device, args) {
   const round = (value, places = 4) => Number(value.toFixed(places));
   return {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
-    length, rows, recycles, seed, weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
+    family, chains, length, rows, recycles, seed,
+    weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
+    ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),
     caca: { median: round(median, 3), worst: round(worst, 3) },
     checksum,
     // The first and last CA, so a difference has somewhere to be looked at.
