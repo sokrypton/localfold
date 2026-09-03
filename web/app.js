@@ -616,6 +616,47 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
 /**
+ * Open an empty object for the fold that is about to start.
+ *
+ * 🔴 THE PREVIOUS PREDICTION USED TO STAY ON SCREEN UNTIL THE FIRST FRAME OF
+ * THE NEW ONE LANDED, so the page would never be blank. That is the wrong
+ * trade: the trunk is the long part - tens of seconds at AF3's sizes, and four
+ * passes now that recycles default to three - and for all of it the reader is
+ * looking at the LAST fold's structure with this fold's progress bar over it.
+ * Nothing marks it stale, and the scores card and the heatmap panel are
+ * showing the old numbers too, so all three agree and all three are wrong.
+ *
+ * 🔴 IT ADDS AN OBJECT RATHER THAN CLEARING THEM ALL. clearAllObjects() would
+ * also drop a previous prediction someone is comparing against - py2Dmol holds
+ * several and the page's own `predictions` map expects them to survive. With
+ * `shownObjects` at its resting state only the CURRENT object draws, so
+ * switching to an empty one blanks the view and keeps the rest.
+ *
+ * 🔴 AND IT RUNS BEFORE THE HANDLES ARE DROPPED, because `viewer` is about to
+ * become undefined - that is what stops the score-card poll refilling from
+ * whatever is still animating - so this reaches the renderer through the
+ * registry instead.
+ */
+function openBlankFold(stem) {
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  if (renderer === undefined) return;
+  try {
+    renderer.addObject(stem);
+    if (typeof renderer._switchToObject === "function") renderer._switchToObject(stem);
+    else renderer.currentObjectName = stem;
+    // ...and the two panels that describe a fold must stop describing the old
+    // one. The heatmap is told about an object with no frames, which is what
+    // makes it hide rather than keep the last matrix up.
+    updateScoresCard(undefined);
+    window.Heatmap?.updateFrame(renderer, renderer.objectsData?.[stem], 0);
+    renderer.render("blank-fold");
+  } catch (cause) {
+    console.warn("could not open a blank object for this fold", cause);
+  }
+}
+
+/**
  * Tell the heatmap panel a frame's maps changed.
  *
  * 🔴 `render()` DOES NOT DO THIS, WHICH IS WHY NO CONTACT MAP EVER APPEARED.
@@ -993,6 +1034,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   predictionCount += 1;
   const header = entityList.header();
   const stem = header !== null ? safeJobName(header) : `af3_${predictionCount}`;
+  // ...and the view goes blank first, so the trunk is not spent showing the
+  // previous fold. See openBlankFold.
+  openBlankFold(stem);
   // See the note in the AF2 path: dropping the handle is what stops the
   // score-card poll refilling from the object still on screen.
   viewer = undefined;
@@ -1364,6 +1408,7 @@ async function fold(event) {
     // watches the drawn frame and refills the card from it whenever the index
     // moves, so hiding it once is not enough while the previous object is still
     // animating - that poll returns early on a missing viewer.
+    openBlankFold(stem);
     viewer = undefined;
     viewerObject = undefined;
     status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
