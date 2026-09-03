@@ -135,6 +135,31 @@ def main():
         print("attached:", attached)
         print("panel   :", state)
 
+        # 🔴 AND CLICKING A TAB MUST NOT MOVE ANYTHING. `pae` captions both
+        # axes and `contact` captions neither, so a panel that reserves the
+        # axis bands for the map ON SCREEN resizes and re-centres the plot on
+        # every switch - the plot jumps and the strip moves with it. The
+        # reservation is over the SET of maps; this is what says so.
+        geom = cdp.evaluate(ws, """(() => {
+          const c = document.getElementById('heatmapContainer');
+          const canvas = document.getElementById('heatmapCanvas');
+          const tabs = [...c.querySelectorAll('[role="tab"]')];
+          const rect = () => {
+            const b = canvas.getBoundingClientRect();
+            return [Math.round(b.left), Math.round(b.top),
+                    Math.round(b.width), Math.round(b.height)];
+          };
+          const seen = {};
+          for (const t of tabs) { t.click(); seen[t.dataset.mapKey] = rect(); }
+          const keys = Object.keys(seen);
+          const same = keys.every((k) =>
+            seen[k].join() === seen[keys[0]].join());
+          return JSON.stringify({ same, seen });
+        })()""")
+        print("on click:", geom)
+        if '"same":true' not in geom:
+            failures.append("the plot moves when a tab is clicked: %s" % geom)
+
         if '"visible":true' not in state:
             failures.append("the panel stayed hidden: %s" % state)
         if '"position":"relative"' not in state:
