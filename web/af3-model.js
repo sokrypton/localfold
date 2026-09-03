@@ -19,6 +19,8 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
+import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
+  from "../src/af3/distogram-confidence.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -437,20 +439,101 @@ export async function foldAf3(options) {
   // here, and it is the value the cartoon is coloured by.
   const plddt = slots.map((slot) => result.scores.plddt[slot]);
 
-  // 🔴 EVERY FRAME IS RE-EMITTED WITH THE FINISHED STRUCTURE'S pLDDT. The
-  // confidence head does not run until the sample is done, so the frames drawn
-  // during the fold carry a zero B-factor - and the pLDDT scheme paints that
-  // the colour of no confidence at all, which is a claim rather than a missing
-  // value. The whole trajectory takes the final pLDDT instead, which is a
-  // statement about the prediction and is what every published folding
-  // animation shows.
+  // 🔴 EACH FRAME NOW CARRIES ITS OWN CONFIDENCE, WHICH IS NOT pLDDT AND IS NOT
+  // TRYING TO BE. The confidence head costs more than a denoiser call and every
+  // part of it depends on the coordinates, so running it per frame would about
+  // double a fold. src/af3/distogram-confidence.js is the stand-in: the trunk's
+  // distogram is FIXED for a fold and only the structure moves, so how well a
+  // frame agrees with it is a measure of how much has settled - at 0.1 to
+  // 0.4 ms a frame against the head's 47 to 226.
+  //
+  // 🔴 CALIBRATED TO THIS FOLD'S OWN pLDDT, using the final frame as the
+  // anchor. The raw score's absolute range is compressed and length-dependent -
+  // trp-cage is a real 96.6 and scores 54 - so painting it with the pLDDT ramp
+  // would say the wrong thing about which of two folds was better. Matching
+  // mean and spread to the final structure's real pLDDT is exact on that frame
+  // by construction, leaves the ranking untouched, and puts the trajectory on a
+  // scale the ramp already means something on.
+  //
+  // 🔴 AND IT IS A GLOBAL SIGNAL, NOT A PER-RESIDUE CLAIM. Measured against
+  // what has actually settled - each frame's lDDT to the final structure - it
+  // ranks residues at 0.65 to 0.72 on targets that fold and 0.14 to 0.20 on a
+  // linker or a homopolymer. What holds on all eight targets of the panel is
+  // that the MEAN rises monotonically and saturates. It is a picture of a
+  // structure resolving; it is not a number to read off one residue.
+  //
+  // 🔴 AND IT FALLS BACK TO THE FINAL pLDDT RATHER THAN FAILING. This is a
+  // colour. If the distogram is not the shape this expects - a future head, a
+  // reused trunk from an older build - the prediction is still the valuable
+  // thing and must not be lost to it. The failure is reported once and the
+  // animation reverts to what it did before.
+  const perFrameConfidence = (() => {
+    const tokens = batch.tokens;
+    const beta = batch.tokenAtomsToPseudoBeta;
+    const gather = (positions) => {
+      const out = new Float32Array(tokens * 3);
+      for (let token = 0; token < tokens; token += 1) {
+        if (!beta.mask[token]) continue;
+        const from = Number(beta.indices[token]) * 3;
+        for (let axis = 0; axis < 3; axis += 1) out[token * 3 + axis] = positions[from + axis];
+      }
+      return out;
+    };
+    // The head emits one distribution per dense atom slot, so a token's pLDDT
+    // is the mean over the atoms it actually has - and the anchor has to be
+    // per token, because the stand-in is.
+    const realPerToken = new Float32Array(tokens);
+    for (let token = 0; token < tokens; token += 1) {
+      let total = 0;
+      let count = 0;
+      for (let atom = 0; atom < batch.dense; atom += 1) {
+        const slot = token * batch.dense + atom;
+        if (!batch.predDenseAtomMask[slot]) continue;
+        total += result.scores.plddt[slot];
+        count += 1;
+      }
+      realPerToken[token] = count === 0 ? 0 : total / count;
+    }
+    let table;
+    let calibrate;
+    try {
+      table = distogramAgreementTable(
+        result.trunk.logits, result.trunk.binEdges, tokens, batch.seqMask);
+      calibrate = calibrateToPlddt(
+        distogramConfidence(table, gather(result.positions)), realPerToken, batch.seqMask);
+    } catch (cause) {
+      console.warn("per-frame confidence unavailable; frames take the final pLDDT", cause);
+      return () => result.scores.plddt;
+    }
+    // ...broadcast back to atom slots, because that is how toPdb indexes the
+    // B-factor it writes.
+    return (positions) => {
+      const perToken = calibrate(distogramConfidence(table, gather(positions)));
+      const perSlot = new Float32Array(tokens * batch.dense);
+      for (let token = 0; token < tokens; token += 1) {
+        for (let atom = 0; atom < batch.dense; atom += 1) {
+          perSlot[token * batch.dense + atom] = perToken[token];
+        }
+      }
+      return perSlot;
+    };
+  })();
+
+  // 🔴 EVERY FRAME IS RE-EMITTED, because the frames drawn during the fold
+  // carry a zero B-factor - the pLDDT scheme paints that the colour of no
+  // confidence at all, which is a claim rather than a missing value. It used to
+  // re-emit them all with the FINISHED structure's pLDDT, which is a constant
+  // colour on a moving structure; each frame now carries its own, from the
+  // distogram. See below.
   //
   // 🔴 AND THE FINAL STRUCTURE IS FITTED LIKE THE REST OF THEM. It used to be
   // appended straight from the sampler, which leaves it in whatever frame
   // randomAugmentation last rotated into - so the animation ran smoothly and
   // then jumped on its last frame.
   const framePdbs = trajectory.map(
-    (positions) => fittedPdb(batch, positions, reference, slots, result.scores.plddt));
+    (positions) => fittedPdb(batch, positions, reference, slots, perFrameConfidence(positions)));
+  // ...and the finished structure keeps the REAL pLDDT, which is the one number
+  // here that is a claim about the prediction rather than about the animation.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
 
   return {

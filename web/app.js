@@ -932,11 +932,18 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // of re-samples all skip the trunk rather than only the first.
   trunkCache = { key: trunkKey, reusable: result.reusable };
 
-  // 🔴 THE TRAJECTORY IS RELOADED ONCE THE pLDDT EXISTS. The frames drawn during
-  // the fold have a zero B-factor - the confidence head has not run - so under
-  // the pLDDT scheme they are the colour of no confidence at all. Reloading
-  // from framePdbs, which all carry the finished structure's pLDDT, colours the
-  // whole animation and costs one ingestion of text that is already built.
+  // 🔴 THE TRAJECTORY IS RELOADED ONCE THE CONFIDENCE EXISTS. The frames drawn
+  // during the fold have a zero B-factor - the confidence head has not run - so
+  // under the pLDDT scheme they are the colour of no confidence at all.
+  // Reloading from framePdbs colours the whole animation and costs one
+  // ingestion of text that is already built.
+  //
+  // 🔴 AND EACH FRAME NOW CARRIES ITS OWN. They used to all take the finished
+  // structure's pLDDT, which is a constant colour on a moving structure; each
+  // is now scored on how well it agrees with the trunk's distogram, calibrated
+  // to this fold's own pLDDT. See the note in web/af3-model.js: it is a picture
+  // of a structure resolving and not a per-residue claim, and the FINISHED
+  // structure below still carries the real pLDDT.
   if (viewer !== undefined && viewerObject !== undefined && result.framePdbs.length > 0) {
     // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, it is not
     // appended after it. The last frame IS that call's output - in flow mode
