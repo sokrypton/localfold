@@ -34,6 +34,10 @@ values means the whole-stack checker, not that file.
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
 | Does AF2's stack match AlphaFold? | `tools/gpu/check-evoformer-stack.js` |
+| Does AF2 still fold the SAME structure? | `tools/gpu/fold-af2.js` |
+| Which register tile does AF2's dense projection want? | `tools/gpu/bench-evoformer-linear.js` |
+| What does AF2's column attention cost alone? | `tools/gpu/bench-msa-attention.js` |
+| What does a sampler step cost besides the denoiser? | `tools/gpu/probe-sampler-overhead.js` |
 | Where does a denoiser call's time go? | `tools/gpu/bench-head.js --profile` |
 | Where does a trunk pass's time go? | `tools/gpu/bench-trunk.js --profile --msa=1024` |
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
@@ -86,6 +90,21 @@ the result as `container.style.width`. Our narrow block gives that box
 `max-width: 100%; overflow-x: auto`, so it scrolls sideways inside its own card
 instead of taking the whole document with it - measured, it was forcing a 972px
 layout viewport on a 320px phone. Fixing it properly is an upstream change.
+
+🔴 **AND AF2 NOW HAS AN END-TO-END GATE, WHICH THE DIFFERENTIAL ONES ARE NOT.**
+A per-kernel checker says one kernel still computes its own operation. It
+cannot say the assembled model still folds, and after three kernel rewrites
+that was the whole of AF2's coverage here. `tools/gpu/fold-af2.js` folds a
+59-mer through the driver the page uses and prints a checksum over every
+coordinate, plus mean pLDDT, pTM and the backbone CA-CA geometry. Run it, stash
+the change, run it again: at 128 rows and at 512 rows with a recycle, the tree
+before this session's kernel work and the tree after agree to every digit.
+
+It synthesises its alignment from the query, so the 512-row kernels run without
+fetching anything, and it opens `./model/` by directory - `loadModel` resolves
+the monomer family to Hugging Face, and a regression tool should not pull
+227 MB. That makes it a fingerprint, not an oracle: it does not know what
+AlphaFold would say.
 
 🔴 **AF2's KERNELS NOW HAVE FOUR DIFFERENTIAL GATES, BECAUSE IT HAD NONE.**
 `npm run test:gpu` cannot load Dawn here and `test/fixtures/evoformer/` is

@@ -8,7 +8,7 @@
  * runs every flash kernel against the same input and reports how far they
  * disagree - which catches a broken VARIANT and cannot catch a broken
  * projection, because all of them share it. The q/k/v/gate projection is 19 ms
- * of AF2's 165 ms block at 512 MSA rows, twice over, and nothing was checking
+ * of AF2's 118 ms block at 512 MSA rows, twice over, and nothing was checking
  * what it computed.
  *
  * The reference is LayerNorm, four projections, scaled dot-product attention

@@ -17,21 +17,37 @@
  * so the wrapper reports 1218 ms against a single label and attributes nothing.
  * The batching is load-bearing for speed; the switch is the right seam.
  *
- * WHAT IT FOUND, on 59 residues, as block time and the 48-block stack it implies:
+ * WHAT IT FINDS, on 59 residues, as block time and the 48-block stack it
+ * implies:
  *
- *      5 rows    12.6 ms    603 ms    opm.accumulate 1.21, tri-attention 0.98 x2
- *    128 rows    61.1 ms   2930 ms    msa-column-attention.flash 7.7, opm.contract 7.5
- *    512 rows   294.9 ms  14154 ms    msa-column-attention.flash 125.6, opm.contract 29.3
+ *      5 rows    13.5 ms    646 ms    opm.accumulate 2.04, opm.intermediate 1.07
+ *    128 rows    32.8 ms   1574 ms    the two attention projections 4.07 each
+ *    512 rows   117.9 ms   5660 ms    msa-column-attention.flash 21.0
  *
- * 🔴 THE SINGLE-SEQUENCE BLOCK HAS NO HOT KERNEL, AND THE DEEP ONE IS ALMOST
- * ALL ONE. At 5 rows the largest kernel is under 10% of the block and the tail
- * is flat - there is no pair-transition here, which was 38% of AF3's pairformer
- * and worth 2.8x. At 512 rows msa-column-attention.flash is 43% of the block on
- * its own, and it grows 16x for 4x the rows: column attention is over the
- * SEQUENCE axis, so it is quadratic in depth where everything else is linear.
- * At that depth it runs about 63 GFLOP/s, a couple of percent of this device,
- * so it is the one AF2 kernel that looks worth attacking - and only for folds
- * with a real alignment.
+ * 🔴 THE DEEP BLOCK IS NO LONGER ALMOST ALL ONE KERNEL, AND THIS DOCSTRING
+ * SAID IT WAS FOR A WHILE AFTER IT STOPPED BEING TRUE. It recorded 294.9 ms at
+ * 512 rows with msa-column-attention.flash at 125.6 - 43% of the block, "the
+ * one AF2 kernel that looks worth attacking". Two things happened to that.
+ * `selectAttentionFlashKernel` changed its default to the register-resident
+ * kernel, which is 3.7x faster here and took column attention to 21 ms on its
+ * own; and the three kernels that were then left leading - the transition's
+ * dense projection, the outer product mean's contraction and the attention
+ * output projection - each turned out to be reading one operand a float at a
+ * time, and were given vector operands.
+ *
+ * What is left is FLAT. At 512 rows the top six kernels are within 21 to 15 ms
+ * of each other and every one of them runs between 680 and 950 GFLOP/s, which
+ * tools/gpu/probe-alu.js puts at 53-74% of this device's scalar multiply-add
+ * ceiling. There is no outlier to attack: the next thing here is a different
+ * algorithm, not a better tile, and the two benches that exist for these
+ * kernels (bench-evoformer-linear.js, bench-msa-attention.js) both report their
+ * current shape as the optimum of everything tried.
+ *
+ * 🔴 AND THE BLOCK TOTAL IS NOT COMPARABLE ACROSS PROCESSES. This machine
+ * drifts up to 3.2x between them - measured in this repo's own bench, where one
+ * arm read 32.1 ms and 15.9 ms an hour apart. The per-dispatch numbers within a
+ * run are stable to about 1%, and a claim about a change belongs in a bench
+ * that interleaves its arms, or in tools/gpu/fold-af2.js's end-to-end time.
  *
  * 🔴 ONE BLOCK, NOT THE STACK. Profiling forces a submission window of 1 and a
  * device sync around the profiled block, so a whole-stack profile would measure
