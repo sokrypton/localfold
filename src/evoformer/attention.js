@@ -471,7 +471,7 @@ fn main(
  * impossible rather than unlikely. head_dim is 32 in all 48 Evoformer blocks
  * and 8 in the 4 extra-MSA ones, so this generates two shaders in a fold.
  */
-export function createAttentionRegisterFlashShader(headDim) {
+export function createAttentionRegisterFlashShader(headDim, keyChunk) {
   const vectors = headDim / 4;
   const each = (body) => Array.from({ length: vectors }, (_, t) => `    ${body(t)}`).join("\n");
   const declare = (name, init) => Array.from({ length: vectors },
@@ -483,7 +483,21 @@ export function createAttentionRegisterFlashShader(headDim) {
   // identical global loads. Staged, that is one load and 64 workgroup reads.
   // AF3's grid attention is the same kernel and the same fix, worth 1.9x there;
   // see src/af3/grid-attention-webgpu.js.
-  const chunk = Math.max(8, Math.floor(512 / (vectors * 2)));
+  //
+  // 🔴 THE MASK LOOKS LIKE THE FOURTH OPERAND OF THAT ARGUMENT AND STAGING IT
+  // LOSES. It is indexed by the batch and the KEY, so all 64 lanes read the
+  // same float, one global load per key per lane - exactly the shape above.
+  // Staged in workgroup memory alongside key and value, with the arithmetic
+  // left alone, the kernel measured 22.1 ms against 20.9 in an otherwise
+  // identical block (every other kernel within 0.05 ms across the two runs).
+  // One float a key is already broadcast and cached; the extra staging loop and
+  // its workgroup memory cost more than the load did. Do not stage the mask.
+  // ...8 KiB of workgroup memory at head_dim 32, which is the size AF3's grid
+  // attention settled on. tools/gpu/bench-msa-attention.js sweeps it.
+  const chunk = keyChunk ?? Math.max(8, Math.floor(512 / (vectors * 2)));
+  if (!Number.isSafeInteger(chunk) || chunk < 1) {
+    throw new RangeError(`attention key chunk must be a positive integer; got ${chunk}`);
+  }
   return `${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
