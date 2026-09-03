@@ -151,17 +151,19 @@ export function loadModel(variant, onProgress, signal = undefined, family = "mon
     const templateEmbeddingWeights = multimer
       ? fixture.templateEmbeddingWeights() : Promise.resolve(undefined);
     const [embedding, template, templateEmbedding, extraStack, mainStack, structure, confidence,
-      geometry, featureTables, paeBreaks] = await Promise.all([
+      geometry, featureTables, paeBreaks, distogram] = await Promise.all([
       fixture.embeddingWeights(), templateWeights, templateEmbeddingWeights, extraStackWeights,
       fixture.mainStackWeights(), fixture.structureWeights(), fixture.confidenceWeights(),
       fixture.geometryTables(), fixture.queryOnlyFeatureTables(), fixture.tensor("confidencePaeBreaks"),
+      // ...undefined on a bundle predating the head. See distogramHeadWeights.
+      fixture.distogramHeadWeights(),
     ]);
     return {
       featureTables,
       paeBreaks,
       weights: {
         embedding, template, templateEmbedding, extraStack, mainStack, structure,
-        lddt: confidence.lddt, pae: confidence.pae, geometry,
+        lddt: confidence.lddt, pae: confidence.pae, geometry, distogram,
       },
     };
   })();

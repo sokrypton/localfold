@@ -40,6 +40,7 @@ values means the whole-stack checker, not that file.
 | Does the sampler setting matter on a real binder? | `tools/gpu/probe-designed-binder-sampler.js` (**network**) |
 | Does AF2's stack match AlphaFold? | `tools/gpu/check-evoformer-stack.js` |
 | Does AF2 still fold the SAME structure? | `tools/gpu/fold-af2.js` |
+| Does AF2's distogram head agree with AF2's structure? | `tools/gpu/probe-af2-contacts.js` |
 | Which register tile does AF2's dense projection want? | `tools/gpu/bench-evoformer-linear.js` |
 | What does AF2's column attention cost alone? | `tools/gpu/bench-msa-attention.js` |
 | What does a sampler step cost besides the denoiser? | `tools/gpu/probe-sampler-overhead.js` |

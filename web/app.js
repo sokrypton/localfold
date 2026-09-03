@@ -32,6 +32,7 @@ import { parseA3m } from "../src/input/a3m.js";
 import { generateMmseqs2ComplexMsa, generateMmseqs2Msa, mergeSearchedChains,
   planSearchReuse, searchCacheEntry } from "../src/input/mmseqs2-api.js";
 import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
+import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
@@ -613,7 +614,45 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * The per-pass PAE rides on the frame, which is where py2Dmol looks for it
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
-function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined) {
+/**
+ * The contact map for one AF2 recycle, attached once the frame is on screen.
+ *
+ * 🔴 EVERY RECYCLE GETS ITS OWN, WHICH IS THE WHOLE POINT. AF2's distogram is
+ * recomputed from the pair representation on every pass, so the contact map is
+ * a picture of the model changing its mind - and each recycle is already its
+ * own frame here, so the panel's backward search lands on the right one. AF3
+ * is the opposite: its recycles all finish before the sampler emits a frame,
+ * so one map at frame 0 is correct for its whole trajectory.
+ *
+ * 🔴 AND IT IS COMPUTED OFF THE CRITICAL PATH. The head is L*L*128*64
+ * multiply-adds on the CPU - measured 131 ms at 128 residues and 712 ms at 300
+ * - which is a few percent of an AF2 fold but enough to stall a paint if it
+ * ran before the frame was added. The frame goes up first; this fills the map
+ * in after and asks for one more render.
+ *
+ * 🔴 UNDEFINED WEIGHTS ARE NOT AN ERROR. A bundle from before the head was
+ * appended has no distogram section, and losing the contact map is the right
+ * price for that - losing the fold is not.
+ */
+function attachContactMap(frame, recycle, weights, length) {
+  if (weights?.distogram === undefined || recycle.pair === undefined) return;
+  setTimeout(() => {
+    try {
+      const head = weights.distogram;
+      const contacts = distogramContactProbabilities(
+        recycle.pair, head.halfLogitsWeights, head.halfLogitsBias, length,
+        { bins: head.bins, first: head.firstBreak, last: head.lastBreak });
+      const contact = contactMapFor(contacts);
+      if (contact !== undefined) frame.maps = { ...frame.maps, contact };
+      viewer?.render("contact");
+    } catch (cause) {
+      console.warn("contact map unavailable for this pass", cause);
+    }
+  }, 0);
+}
+
+function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStructure = undefined,
+                    weights = undefined) {
   const api = window.py2Dmol;
   if (viewer === undefined || viewerObject === undefined || api?.frameFromText === undefined) return;
   const aligned = alignedToFirstPass(sequence, recycle.structure, firstPassStructure);
@@ -628,6 +667,7 @@ function appendPass(sequence, chainLengths, recycle, recycleIndex, firstPassStru
   frame.pae_n = sequence.length;
   frame.align = true;
   viewer.addFrame(frame, viewerObject);
+  attachContactMap(frame, recycle, weights, sequence.length);
   // ...and jump to it, so the newest pass is the one being looked at.
   const object = viewer.objects?.find((entry) => entry.name === viewerObject);
   if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
@@ -1307,8 +1347,18 @@ async function fold(event) {
           length: sequence.length,
           confidence: recycle.confidence,
         });
+        // ...recycle 0's frame is built by loadIntoViewer rather than by
+        // appendPass, so its contact map has to be attached here or the first
+        // pass is the one frame without one - and it is the frame on screen
+        // while every later pass is still running.
+        void initialLoadPromise.then(() => {
+          const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
+          if (frame !== undefined) {
+            attachContactMap(frame, recycle, model.weights, sequence.length);
+          }
+        });
       } else {
-        appendPass(sequence, chainLengths, recycle, index, firstPassLanded);
+        appendPass(sequence, chainLengths, recycle, index, firstPassLanded, model.weights);
       }
     };
     // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock

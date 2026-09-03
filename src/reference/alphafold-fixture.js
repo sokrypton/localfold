@@ -415,6 +415,27 @@ export class AlphaFoldFixture {
     };
   }
 
+  /**
+   * AlphaFold 2's distogram head, or undefined on a bundle without one.
+   *
+   * 🔴 OPTIONAL ON PURPOSE. The head was appended to the published bundles
+   * long after they shipped (tools/add_distogram_head.py), so a store pointed
+   * at an older copy - a cached one, a fork, a remote that has not been
+   * re-uploaded - simply has no `distogramHead` section. Returning undefined
+   * costs the contact map and nothing else; throwing would cost the fold.
+   */
+  async distogramHeadWeights() {
+    const section = this.manifest.distogramHead;
+    if (section === undefined) return undefined;
+    return {
+      halfLogitsWeights: await this.tensor(section.parameters.halfLogitsWeights),
+      halfLogitsBias: await this.tensor(section.parameters.halfLogitsBias),
+      bins: section.bins,
+      firstBreak: section.firstBreak,
+      lastBreak: section.lastBreak,
+    };
+  }
+
   async confidenceWeights()
 
   {
