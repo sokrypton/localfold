@@ -19,10 +19,6 @@ import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
-import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
-  from "../src/af3/distogram-confidence.js";
-import { distogramLddt, distogramLddtTable, lddtToPlddt }
-  from "../src/af3/distogram-lddt.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -61,17 +57,6 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * 0.953 at matched settings, so what is left at sixteen is the architecture's
  * price for an atom-tokenised residue and not something more steps will fix.
  */
-/**
- * 🔴 THE TRUNK'S CONTACT CONFIDENCES ARE NOT SHOWN, AND THE CODE FOR THEM IS
- * STILL THERE. p(inter) rode in the status line and the quality card for a
- * while; it tracks ipTM at 0.84 Pearson across a panel and arrives before the
- * first denoiser call, but on a real target the seed moves ipTM by 0.3 and a
- * number that early invites a decision the fold has not earned yet.
- * src/af3/distogram-confidence.js keeps distogramInterfaceContact and
- * distogramContactConfidence, tested and measured by
- * tools/gpu/probe-contact-confidence.js; nothing on the page reads them.
- */
-
 export const AF3_COUNTS = {
   // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
   // Recycles and "Cycles" beside "Recycles" reads as the same word twice. The
@@ -148,29 +133,6 @@ function alphaCarbons(batch) {
   // motion out of the trajectory, and any consistent set of atoms does that -
   // so a fold with no polymer in it fits on the atoms it does have.
   return slots.length > 0 ? slots : predicted;
-}
-
-/** A batch's representative atom per token, gathered from a frame's positions. */
-function pseudoBetaOf(batch, positions) {
-  const beta = batch.tokenAtomsToPseudoBeta;
-  const out = new Float32Array(batch.tokens * 3);
-  for (let token = 0; token < batch.tokens; token += 1) {
-    if (!beta.mask[token]) continue;
-    const from = Number(beta.indices[token]) * 3;
-    for (let axis = 0; axis < 3; axis += 1) out[token * 3 + axis] = positions[from + axis];
-  }
-  return out;
-}
-
-/** Per token to per dense atom slot, which is how toPdb indexes the B-factor. */
-function broadcastToSlots(batch, perToken) {
-  const out = new Float32Array(batch.tokens * batch.dense);
-  for (let token = 0; token < batch.tokens; token += 1) {
-    for (let atom = 0; atom < batch.dense; atom += 1) {
-      out[token * batch.dense + atom] = perToken[token];
-    }
-  }
-  return out;
 }
 
 const toPoints = (positions, count) => Array.from(
@@ -373,19 +335,6 @@ export async function foldAf3(options) {
    * percentage is the honest half; the model still drives the BAR, where being
    * approximately right is all a bar needs.
    */
-  // 🔴 A WORD ABOUT THE INTERFACE, ONCE THE TRUNK KNOWS ONE, AND ONLY IN THE
-  // STATUS LINE. src/af3/distogram-confidence.js can read the trunk's own
-  // cross-chain contacts the moment the trunk is done - well before the
-  // confidence head produces a real ipTM - so a complex that is going nowhere
-  // can say so while there is still time to stop it.
-  //
-  // 🔴 IT IS A WORD AND NOT A NUMBER, DELIBERATELY. Calibrated to ipTM on
-  // fifteen two-chain folds it is out by 0.09 on average and 0.31 at worst
-  // under leave-one-out - enough to move a complex across the 0.5 line people
-  // actually judge by. As a yes/no at the threshold below it is right on 13 of
-  // the 15. So it goes in the transient status line, where it is superseded
-  // minutes later by the real score, and NOT in the quality card, which is read
-  // as a result.
   const say = (phase) => {
     if (budget === null) { onStatus(phase); return; }
     onStatus(`${phase} · ${Math.round(100 * budget.estimator.fraction())}%`);
@@ -427,7 +376,6 @@ export async function foldAf3(options) {
   // on a step - 76.3 to 96.6 on trp-cage - and that is the frame everyone
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
-  let liveConfidence = null;
   const previewPdbs = [];
   // 🔴 THE POSITIONS TOO, because the PDB written during the fold carries the
   // RAW estimate - there is no calibration until the fold has finished - and
@@ -448,7 +396,7 @@ export async function foldAf3(options) {
     // all the confidence there is at this point.
     onPreview: options.onPreview === undefined ? undefined : async (preview) => {
       if (reference === null) reference = toPoints(preview.positions, batch.tokens * batch.dense);
-      const colour = liveConfidence?.(preview.positions) ?? null;
+      const colour = null;
       const pdb = fittedPdb(batch, preview.positions, reference, slots, colour);
       // 🔴 KEPT, NOT JUST SHOWN. The previews are frames of the same
       // trajectory - the structure the model believed at each recycle - so
@@ -483,29 +431,6 @@ export async function foldAf3(options) {
         // the sampler has not run yet at this point.
         if (detail.trunk?.contactProbs !== undefined) {
           options.onContacts?.(detail.trunk.contactProbs);
-        }
-      }
-      // 🔴 BUILT AT THE FIRST RECYCLE, NOT AT trunk-done, because the PREVIEWS
-      // need it and they run between passes. Every pass has its own distogram,
-      // so the first one to arrive is enough to colour by - and it is rebuilt
-      // on each later pass, which is what makes a preview coloured by the
-      // trunk that produced it rather than by an earlier one.
-      if (name === "recycle-done" || (name === "trunk-done" && liveConfidence === null)) {
-        // ...best effort, for the reason the finished-frame path gives: this is
-        // a colour, and losing a prediction to it would be a bad trade.
-        try {
-          // 🔴 lDDT's OWN ARITHMETIC, NOT THE OLDER AGREEMENT HEURISTIC.
-          // src/af3/distogram-lddt.js evaluates lDDT's definition with the
-          // distogram standing in for the reference - four thresholds,
-          // probabilistic inclusion inside 15 A, every pair rather than the
-          // sixteen sharpest - and it beats the heuristic on the same frames:
-          // 6.9 against 8.1 mean error per token, leave-one-target-out.
-          const table = distogramLddtTable(
-            detail.trunk.logits, detail.trunk.binEdges, batch.tokens, batch.seqMask);
-          liveConfidence = (positions) => broadcastToSlots(batch,
-            lddtToPlddt(distogramLddt(table, pseudoBetaOf(batch, positions))));
-        } catch (cause) {
-          console.warn("live frame confidence unavailable; frames stay uncoloured", cause);
         }
       }
       if (name === "target-feat-start") {
@@ -578,7 +503,7 @@ export async function foldAf3(options) {
       if (reference === null) reference = toPoints(denoised, batch.tokens * batch.dense);
       trajectory.push(Float32Array.from(denoised));
       options.onFrame?.(
-        fittedPdb(batch, denoised, reference, slots, liveConfidence?.(denoised) ?? null), shown);
+        fittedPdb(batch, denoised, reference, slots, null), shown);
       shown += 1;
       reached(plan().samplerStart + plan().callUnits * step);
       // ...the sampler used to run its OWN clock here, from its own elapsed
@@ -598,70 +523,13 @@ export async function foldAf3(options) {
   // here, and it is the value the cartoon is coloured by.
   const plddt = slots.map((slot) => result.scores.plddt[slot]);
 
-  // 🔴 EACH FRAME NOW CARRIES ITS OWN CONFIDENCE, WHICH IS NOT pLDDT AND IS NOT
-  // TRYING TO BE. The confidence head costs more than a denoiser call and every
-  // part of it depends on the coordinates, so running it per frame would about
-  // double a fold. src/af3/distogram-confidence.js is the stand-in: the trunk's
-  // distogram is FIXED for a fold and only the structure moves, so how well a
-  // frame agrees with it is a measure of how much has settled - at 0.1 to
-  // 0.4 ms a frame against the head's 47 to 226.
-  //
-  // 🔴 CALIBRATED TO THIS FOLD'S OWN pLDDT, using the final frame as the
-  // anchor. The raw score's absolute range is compressed and length-dependent -
-  // trp-cage is a real 96.6 and scores 54 - so painting it with the pLDDT ramp
-  // would say the wrong thing about which of two folds was better. Matching
-  // mean and spread to the final structure's real pLDDT is exact on that frame
-  // by construction, leaves the ranking untouched, and puts the trajectory on a
-  // scale the ramp already means something on.
-  //
-  // 🔴 AND IT IS A GLOBAL SIGNAL, NOT A PER-RESIDUE CLAIM. Measured against
-  // what has actually settled - each frame's lDDT to the final structure - it
-  // ranks residues at 0.65 to 0.72 on targets that fold and 0.14 to 0.20 on a
-  // linker or a homopolymer. What holds on all eight targets of the panel is
-  // that the MEAN rises monotonically and saturates. It is a picture of a
-  // structure resolving; it is not a number to read off one residue.
-  //
-  // 🔴 AND IT FALLS BACK TO THE FINAL pLDDT RATHER THAN FAILING. This is a
-  // colour. If the distogram is not the shape this expects - a future head, a
-  // reused trunk from an older build - the prediction is still the valuable
-  // thing and must not be lost to it. The failure is reported once and the
-  // animation reverts to what it did before.
-  const frameScores = (() => {
-    const tokens = batch.tokens;
-    // The head emits one distribution per dense atom slot, so a token's pLDDT
-    // is the mean over the atoms it actually has - and the anchor has to be
-    // per token, because the stand-in is.
-    const realPerToken = new Float32Array(tokens);
-    for (let token = 0; token < tokens; token += 1) {
-      let total = 0;
-      let count = 0;
-      for (let atom = 0; atom < batch.dense; atom += 1) {
-        const slot = token * batch.dense + atom;
-        if (!batch.predDenseAtomMask[slot]) continue;
-        total += result.scores.plddt[slot];
-        count += 1;
-      }
-      realPerToken[token] = count === 0 ? 0 : total / count;
-    }
-    let table;
-    let calibrate;
-    try {
-      table = distogramAgreementTable(
-        result.trunk.logits, result.trunk.binEdges, tokens, batch.seqMask);
-      calibrate = calibrateToPlddt(
-        distogramConfidence(table, pseudoBetaOf(batch, result.positions)),
-        realPerToken, batch.seqMask);
-    } catch (cause) {
-      console.warn("per-frame confidence unavailable; frames take the final pLDDT", cause);
-      return { coloured: () => result.scores.plddt };
-    }
-    return {
-      // ...broadcast back to atom slots, because that is how toPdb indexes the
-      // B-factor it writes.
-      coloured: (positions) => broadcastToSlots(batch,
-        calibrate(distogramConfidence(table, pseudoBetaOf(batch, positions)))),
-    };
-  })();
+  // 🔴 EVERY FRAME TAKES THE FINISHED STRUCTURE'S REAL pLDDT, WHICH IS A
+  // CONSTANT COLOUR ON A MOVING STRUCTURE. It is the honest one: the head runs
+  // once, on the final sample, and there is no per-frame confidence here that
+  // is a measurement rather than a guess. A distogram-derived stand-in used to
+  // fill the gap and has been removed - see the note in HANDOFF.md for what it
+  // scored and why it was not worth what it claimed.
+  const frameScores = { coloured: () => result.scores.plddt };
 
   // 🔴 EVERY FRAME IS RE-EMITTED, because the frames drawn during the fold
   // carry a zero B-factor - the pLDDT scheme paints that the colour of no

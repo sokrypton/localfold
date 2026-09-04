@@ -62,3 +62,8 @@ __pycache__/
 server_suff/
 server_stuff/
 natives
+
+# The AF2 distogram/pLDDT training set, written by
+# tools/gpu/probe-af2-dgram-plddt.js: 108 single-sequence targets over four
+# recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
+/plddt-data/

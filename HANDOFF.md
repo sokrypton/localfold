@@ -1,89 +1,148 @@
-# Where this is, and what it is for
+# The pLDDT-from-distogram problem, and why the code for it is gone
 
-Written mid-task so the next session can pick it up. Delete it when the work
-below is finished.
+Everything that estimated confidence from a distogram has been deleted. The
+DATA is kept. This is the record of what was measured, so the next attempt does
+not re-derive it.
 
-## The question that is now ANSWERED
+## What the page does now
 
-**AF3 has no confidence until the fold is over.** Its head runs once, on the
-finished sample, so the trunk previews and sampler frames drawn on the way have
-nothing real to colour by; the page paints them with a distogram-derived
-estimate and recolours the trajectory once the head has run.
+**Frames drawn during a fold carry no confidence, and the finished trajectory
+takes the final structure's real pLDDT.** That is a constant colour on a moving
+structure - honest, and worse to look at than what it replaced.
 
-The plan was to replace that estimate with something fitted, on the user's
-framing:
+AF3's confidence head runs ONCE, on the finished sample. The four trunk
+previews and fifteen sampler frames drawn on the way have no measured
+confidence and cannot have one without running the head per frame, which costs
+more than a denoiser call and would roughly double a fold.
 
-> use af2 dgram and af2 coordinates and af2 plddt, and figure out how to
-> convert dgram to plddt
+## The data that is kept
 
-**That has been done, and the answer is not to ship a fitted predictor.**
-`tools/gpu/probe-af2-dgram-plddt.js` collected 108 single-sequence targets over
-four recycles - 44,740 residue rows, per-target mean pLDDT from 29.7 to 91.5 -
-and `tools/fit-distogram-plddt.py` fitted them leave-one-target-out:
+`plddt-data/` (gitignored, 228 MB), written by
+`tools/gpu/probe-af2-dgram-plddt.js`:
 
-    shipped estimator, uncalibrated   RMSE 10.44   worst target 23.28
-    the same + a two-number affine          4.53                 7.88
-    ten features, ridge                     4.18                 6.97
-    all 89 raw features, ridge              3.91                 6.23
+- 108 single-chain natives, folded SINGLE SEQUENCE by AF2 monomer, 4 recycles.
+- Per target per recycle: the distogram (softmaxed, uint8, upper triangle,
+  base64), the alpha carbons, AF2's per-residue pLDDT, and true lDDT vs the
+  native.
+- 44,740 residue-recycle rows. Per-target mean pLDDT from 29.7 to 91.5, 28
+  targets under 40 and 16 over 70 - the range is the point, and single sequence
+  is how it was got.
+- `features.npz` is a cached design matrix: 89 raw features per row plus the
+  pLDDT and true-lDDT columns and the target names, for leave-one-target-out.
 
-**Almost all of it is calibration.** Two numbers take 10.44 to 4.53; eighty-nine
-features buy 0.6 more, and the constants are per-model anyway - AF2 wants
-`1.33 + 1.20x` for the same feature where AF3 wants `41.29 + 0.578x`, so a
-vector fitted on AF2 cannot be dropped into an AF3 estimator. The lDDT-shaped
-estimator in `src/af3/distogram-lddt.js` stays, and `web/af3-model.js` keeps
-calling it. For scale: it predicts AF2's pLDDT to 4.53 where AF2's pLDDT
-predicts a crystal structure to 13.44.
+🔴 **AF2 IS THE VEHICLE AND AF3 IS THE CUSTOMER.** AF2's confidence head runs on
+every recycle, so it hands over (distogram, structure, pLDDT) already paired.
+That is the only source of free labels; it is not the model the answer is for.
 
-Two open parameters were closed at the same time, both negative - a sequence
-separation floor and a contact cap are a wash at best and much worse past a
-floor of three or a cap of thirty-two. The numbers are in the constants block
-of `src/af3/distogram-lddt.js`.
+## Everything that was tried, and what it scored
 
-🔴 **AND ONE EARLIER CONCLUSION DID NOT REPRODUCE.** The 18 A inclusion radius
-was chosen on a fourteen-target AF3 panel where it beat 15 by 0.34 RMSE. On
-108 AF2 targets they are level the other way - 15 at 4.97, 18 at 5.06 - while
-12 (6.27) and 22 (5.48) are clearly worse on both. The shape of the curve is
-real and the peak is not. 18 stays because it is the better of the two on the
-model the estimator actually serves, not because the margin was established.
+All leave-one-TARGET-out on the 108 targets, RMSE against AF2's own pLDDT,
+single score plus a two-number affine unless said otherwise.
 
-## Still outstanding, unrelated to the fitting
+| estimator | RMSE | worst target |
+|---|---|---|
+| lDDT's arithmetic, distogram as reference | 4.97 | 9.29 |
+| contact Jaccard, 12-14 A | 5.93 | 12.39 |
+| cross entropy, arithmetic mean, 2 A box | 6.58 | 12.39 |
+| cross entropy, arithmetic mean, one-hot | 7.14 | 15.71 |
+| contact precision only | 7.06 | 17.62 |
+| cross entropy, GEOMETRIC mean (the plain CE) | 11.11 | 55.40 |
+| distogram entropy alone, structure unused | 13.84 | 25.32 |
 
-- **Four of thirteen collection chunks crashed** ("Chrome exited (0) before
-  reporting", the known ceiling somewhere above fifteen folds in one process),
-  so the set is 108 targets rather than 151. Re-running those four would add
-  about forty targets; nothing above turned on set size.
+and with fitted weights rather than one affine:
+
+| | RMSE |
+|---|---|
+| the four lDDT thresholds as separate regressors | 4.53 |
+| + contact Jaccard | 4.35 |
+| + Jaccard and the CE box term | 4.30 |
+| ten hand-picked features, ridge | 4.18 |
+| all 89 raw features, ridge | 3.91 |
+
+### What those numbers mean
+
+🔴 **ALMOST ALL OF ANY FIT IS CALIBRATION.** Two numbers take the shipped shape
+from 10.44 uncalibrated to 4.53. Eighty-nine features buy 0.6 more. Nothing in
+the feature engineering was worth what it cost to justify.
+
+🔴 **AND THE CALIBRATION DOES NOT CROSS MODELS.** AF2 wants `1.33 + 1.20x` for
+the same feature where AF3 wants `41.29 + 0.578x`; crossing them costs RMSE
+19.17. A ten-feature vector fitted on AF2 and moved to the AF3 panel with only
+the affine refitted scored 8.77 where the plain lDDT form scored 8.33 - worse
+than the thing it was supposed to improve.
+
+🔴 **THE PLAIN CROSS ENTROPY FAILS BECAUSE OF THE LOG, NOT BECAUSE IT IS THE
+WRONG QUANTITY.** Same per-pair number, averaged arithmetically instead of
+geometrically: 11.11 to 7.14. One pair the trunk gave 1e-4 to drags the whole
+geometric mean, so the score reads the worst neighbour rather than the typical
+one. Widening the one-hot to a 2 A box - a bin is 0.32 A, so an exact one-hot
+asks the trunk to name a distance to a third of an angstrom - takes it to 6.58.
+It was NOT measuring the distogram's sharpness: the entropy-only control
+correlates 0.072 with it.
+
+🔴 **AND THE ARITHMETIC MEAN OF THE MASS WITHIN A TOLERANCE IS lDDT'S
+NUMERATOR.** So the cross-entropy sweep walks back to the lDDT form by changing
+only how the average is taken and how wide the target is. Three independent
+starting points - lDDT's definition, ColabDesign's contact loss, and cross
+entropy against the frame - converge on the same estimator.
+
+### Parameters, all swept
+
+- **Inclusion radius**: 12 -> 6.27, 15 -> 4.97, 18 -> 5.06, 22 -> 5.48. 15 and
+  18 are a coin toss and the ends are clearly worse. An earlier 14-target AF3
+  panel put 18 ahead by 0.34; it did not reproduce.
+- **Thresholds**: lDDT's {0.5, 1, 2, 4} against {1, 2, 4, 8} was 0.10 apart.
+- **Sequence separation**: 0 to 3 is a wash for the lDDT form, 6 and beyond
+  worse. For the contact and CE forms 3 to 6 was best. Nothing dramatic
+  anywhere; the free marks from chain neighbours are not the problem they look.
+- **Contact cap**: every cap is worse than none - top-8 is 12.10 against 5.93
+  for every pair. Restricting to the sharpest contacts throws away information.
+- **Contact cutoff**: 12 and 14 A level and best, 8, 10 and 16 worse.
+- **Match form**: Jaccard beats precision (7.06), recall and F1, because it is
+  the only one charging for BOTH a promised contact that never forms and a
+  formed one that was never promised.
+
+## What is NOT known
+
+- **Nothing here was ever validated against a large AF3 set.** Every AF3 number
+  above comes from a 14-target, 810-token panel. AF2's 108 targets are what the
+  conclusions rest on, and AF3 is a different distogram.
+- **Whether AF3's own head could be run cheaply on a preview.** It was assumed
+  too expensive from the AF2 measurement (47-226 ms against a denoiser call)
+  and never actually profiled on a trunk preview.
+- **Whether a frame needs a per-residue number at all.** Every attempt was
+  aimed at per-residue pLDDT. A single per-frame "how settled is this" scalar,
+  which is what the animation actually communicates, was never tried on its own
+  terms - the per-residue estimator's mean was measured to rise monotonically
+  and saturate on all eight targets of an earlier panel, which is the property
+  that was actually wanted.
+
+## Reproducing any of it
+
+`tools/gpu/probe-af2-dgram-plddt.js` is the collector and is kept. The fitting
+scripts were scratchpad Python over `plddt-data/`; the design matrix in
+`features.npz` is 64 distogram-mass bins, 6 error-histogram counts, the mass
+inside 15 A, the same 6 restricted to it, and both sets normalised by that mass.
+
+## Also outstanding, unrelated
+
 - **`../py2Dmol` has ~8 uncommitted changes of mine** on top of heatmap work
-  that was already dirty when first vendored: the borrowed-head option, the
-  axis-band union, contact captions, tab styling, the outside-the-box strip,
-  the `overflow` rule, the margin and four-side inset, and `updateVisibility`
-  accepting a renderer-loaded map. That tree should be committed so the
-  vendored bundles have a reference point.
-- **Nothing is deployed.** `localfold.org` is ~60 commits behind. The AF2
-  distogram head is embedded in the manifest specifically so it needs no
-  upload.
+  that was already dirty when first vendored. That tree should be committed so
+  the vendored bundles have a reference point.
+- **Nothing is deployed.** `localfold.org` is ~60 commits behind.
+- **Four of thirteen collection chunks crashed** ("Chrome exited (0) before
+  reporting", the known ceiling above ~15 folds in one process), so the set is
+  108 targets rather than 151.
 
 ## Traps that have already cost time
 
 - **`recycle-done` fires BEFORE that pass's preview** in `src/af3/fold.js`.
   Reading backwards from a captured list pairs each distogram with the PREVIOUS
-  pass's structure. Silent - every row still looks well formed. Hold the trunk
-  in a variable instead.
+  pass's structure. Silent - every row still looks well formed.
 - **A plain reload serves cached ES modules.** `http.server` sends no cache
-  headers, so a change lands, the page is reloaded, and nothing happens. Ask
-  the page what it LOADED, not what is on disk:
-  `(await import('/src/af3/fold.js')).foldBatch.toString().includes('...')`
-  against a cache-busted `fetch`. Cmd+Shift+R clears it. `tools/fold-in-page.py`
-  never sees this because it launches a fresh profile - which is why it can
-  pass while the browser in front of you does not. Also in CLAUDE.md.
-- **A soft reload keeps CSS cached too**, and a rule that never arrived looks
-  exactly like a rule that does not work. Check `document.styleSheets` for the
-  selector.
-- **`viewer.objects` does not exist on this build.** Several call sites use
-  `viewer?.objects?.find(...)`, an optional chain that always yields undefined.
-  The objects live in `viewer.objectsData`.
+  headers. Ask the page what it LOADED, not what is on disk. Also in CLAUDE.md.
+- **`viewer.objects` does not exist on this build.** The objects live in
+  `viewer.objectsData`; `viewer?.objects?.find(...)` is a silent no-op.
 - **The entity field is a `<textarea>`.** Setting `textContent` does not change
-  its value once rendered, so a test can fold the same sequence repeatedly and
-  hit the trunk cache without noticing. Set `.value` and dispatch `input`.
-- **A re-fold reuses the cached trunk and runs no recycles**, so it produces no
-  previews. Correct, but it makes the trajectory change length with cache
-  state.
+  its value, so a test can fold the same sequence repeatedly and hit the trunk
+  cache without noticing. Set `.value` and dispatch `input`.

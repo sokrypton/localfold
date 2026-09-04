@@ -33,7 +33,7 @@ values means the whole-stack checker, not that file.
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
-| Do the distogram's contact scores track pTM/ipTM? | `tools/gpu/probe-contact-confidence.js` |
+| What does AF2 predict, distogram and pLDDT, per recycle? | `tools/gpu/probe-af2-dgram-plddt.js --sample=10` |
 | Is the sampler converged at this step count? | `tools/gpu/probe-flow-sigma-by-size.js --panel=churn` |
 | Do recycles help a complex? | `tools/gpu/probe-recycles-on-complexes.js` |
 | Does MSA depth help a complex? | `tools/gpu/probe-msa-depth-on-complexes.js` (**goes to the network**) |
@@ -62,7 +62,6 @@ values means the whole-stack checker, not that file.
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
-| Is the live pLDDT estimator the right shape? | `python3 tools/fit-distogram-plddt.py` (needs a collected set) |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
