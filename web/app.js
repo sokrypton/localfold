@@ -1079,6 +1079,52 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   let pending = Promise.resolve();
   let liveContacts;
   let oriented = false;
+  /**
+   * Add one frame drawn while the fold is running - a trunk preview or a
+   * sampler step - and give it whatever contact map the trunk has produced.
+   *
+   * 🔴 THE SAME CODE FOR BOTH, which is the point. The sampler's first frame
+   * used to go through loadIntoViewer, the virtual-FILE path, which rebuilds
+   * the object: the previews were discarded at the handover, the structure
+   * blinked, and the heatmap panel lost the frame its map was on. Nothing here
+   * is specific to which half of the fold produced the frame.
+   */
+  let liveTrunk = 0;
+  let liveSampler = 0;
+  const drawLiveFrame = (pdb, kind) => {
+    if (signal.aborted || api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      const index = object.frames.length;
+      // ...opened before the frame is added, so the canvas is measured against
+      // a container that is actually on screen.
+      if (index === 0) revealViewer(renderer);
+      const frame = api.frameFromText(pdb);
+      // ...numbered within their own half of the fold, not by their position
+      // in a list that is still growing - the sampler's first frame is its
+      // zeroth, however many previews came before it.
+      frame.name = frame.label = frame.title = kind === "trunk"
+        ? `trunk_${(liveTrunk += 1)}` : `${kind}_${liveSampler++}`;
+      // ...and the map of the pass that produced it, so the panel has
+      // something to resolve on every frame rather than only the first.
+      if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
+      renderer.addFrame(frame, renderer.currentObjectName);
+      renderer.setFrame(object.frames.length - 1);
+      if (index === 0) {
+        // The camera and the palette are set on the FIRST thing drawn, or the
+        // trunk is watched from the default view in rainbow.
+        orientBestView(renderer);
+        forcePlddtColours(renderer);
+        oriented = true;
+      }
+      renderer.render("live-frame");
+    } catch (cause) {
+      console.warn("could not draw a frame", cause);
+    }
+  };
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
@@ -1126,64 +1172,20 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // backbone. Each preview REPLACES the last: they are the same structure
     // getting better, not a trajectory, and leaving them stacked would put
     // four of them in front of the real one on the play bar.
-    onPreview: ({ pdb }) => {
-      if (signal.aborted) return;
-      const registry = window.py2dmol_viewers ?? {};
-      const renderer = registry[Object.keys(registry)[0]]?.renderer;
-      const object = renderer?.objectsData?.[renderer?.currentObjectName];
-      if (renderer === undefined || object === undefined
-          || api?.frameFromText === undefined) return;
-      try {
-        const first = object.frames.length === 0;
-        // ...the viewer is opened before the frame is added, so the canvas is
-        // measured against a container that is actually on screen.
-        if (first) revealViewer(renderer);
-        const frame = api.frameFromText(pdb);
-        frame.name = frame.label = frame.title = `trunk_${object.frames.length + 1}`;
-        renderer.addFrame(frame, renderer.currentObjectName);
-        renderer.setFrame(object.frames.length - 1);
-        // ...the camera and the palette are set on the FIRST thing drawn, not
-        // on the sampler's first frame, or the whole trunk is watched from the
-        // default view in rainbow.
-        if (first) {
-          orientBestView(renderer);
-          forcePlddtColours(renderer);
-          oriented = true;
-        }
-        renderer.render("preview");
-      } catch (cause) {
-        console.warn("could not draw the recycle preview", cause);
-      }
-    },
-    onFrame: (pdb, index) => {
-      if (signal.aborted) return;
-      if (index === 0) {
-
-        pending = loadIntoViewer({ stem, pdb, scores: { sequence: chains.join("") }, length: residues })
-          .then(() => {
-            // ...and not again if a preview already framed it: the previews and
-            // the sampler's frames are superposed onto the same reference, so
-            // one orientation serves both and a second one is a visible jump
-            // in the middle of the animation.
-            if (!oriented) orientBestView();
-            forcePlddtColours();
-            // ...on frame 0, which every later frame resolves back to.
-            const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
-            if (frame !== undefined && liveContacts !== undefined) {
-              frame.maps = { ...frame.maps, contact: liveContacts };
-              refreshHeatmap();
-            }
-          });
-        return;
-      }
-      if (viewer === undefined || viewerObject === undefined) return;
-      const frame = api.frameFromText(pdb);
-      frame.name = frame.label = frame.title = `${mode}_${index}`;
-      viewer.addFrame(frame, viewerObject);
-      const object = viewer.objects?.find((entry) => entry.name === viewerObject);
-      if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
-      viewer.render("af3");
-    },
+    onPreview: ({ pdb }) => { drawLiveFrame(pdb, "trunk"); },
+    // 🔴 THE SAMPLER'S FRAMES GO THE SAME WAY THE PREVIEWS DO. This called
+    // loadIntoViewer for index 0 - the virtual-FILE path - which rebuilds the
+    // object: the trunk's previews were discarded at that moment, the
+    // structure blinked, and the heatmap lost the frame carrying its map.
+    // loadIntoViewer still runs, once, at the end of the fold with the
+    // finished trajectory, its alignment, its scores and its PAE.
+    //
+    // 🔴 AND `viewer` IS NOT AVAILABLE HERE ANY MORE, which is why this went
+    // through the registry: the handle is deliberately undefined until the
+    // final load, so that the score-card poll cannot refill from a fold in
+    // progress. drawLiveFrame reaches the renderer the same way openBlankFold
+    // does.
+    onFrame: (pdb) => { drawLiveFrame(pdb, mode); },
   });
   await pending;
   throwIfAborted(signal);
@@ -1191,6 +1193,22 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // Kept for the next fold, and kept even when it was itself reused, so a run
   // of re-samples all skip the trunk rather than only the first.
   trunkCache = { key: trunkKey, reusable: result.reusable };
+
+  // 🔴 THE HANDLES ARE ACQUIRED HERE, because nothing during the fold sets
+  // them any more. drawLiveFrame reaches the renderer through the registry so
+  // that the score-card poll cannot refill from a fold in progress - which
+  // left `viewer` undefined at the replay, and the replay is guarded on it.
+  // The whole rebuild was silently skipped: the finished animation kept the
+  // LIVE frames, so it carried the raw distogram colours instead of the
+  // calibrated ones (83.7 against a real pLDDT of 54.0), no PAE, and no final
+  // frame. A guard that turns a rebuild into a no-op is the worst shape of
+  // bug; this is the point at which the fold IS finished, so it is where they
+  // belong.
+  if (viewer === undefined) {
+    const registry = window.py2dmol_viewers ?? {};
+    viewer = registry[Object.keys(registry)[0]]?.renderer;
+    viewerObject = viewer?.currentObjectName;
+  }
 
   // 🔴 THE TRAJECTORY IS RELOADED ONCE THE CONFIDENCE EXISTS. The frames drawn
   // during the fold have a zero B-factor - the confidence head has not run - so
@@ -1223,7 +1241,14 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       if (index < previews.length) return `trunk_${index + 1}`;
       return `${mode}_${index - previews.length}`;
     };
-    const camera = { ...viewer.viewerState };
+    const camera = { ...(viewer?.viewerState ?? {}) };
+    // ...and the live frames are dropped first. They are the same structures,
+    // drawn with the uncalibrated colour and named by their position in a list
+    // that was still growing; loadIntoViewer appends to an object that has
+    // frames rather than clearing it, so without this the trajectory is drawn
+    // twice, once wrong.
+    const live = viewer?.objectsData?.[viewerObject];
+    if (live?.frames !== undefined) live.frames.length = 0;
     await loadIntoViewer({
       stem, pdb: timeline[0],
       scores: confidenceJson(chains.join(""), result.confidence),
