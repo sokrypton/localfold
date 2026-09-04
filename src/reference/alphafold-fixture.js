@@ -427,30 +427,25 @@ export class AlphaFoldFixture {
   async distogramHeadWeights() {
     const section = this.manifest.distogramHead;
     if (section === undefined) return undefined;
-    // 🔴 EMBEDDED, NOT FETCHED, AND THAT IS THE WHOLE POINT. It was a shard
-    // first, which is append-only and leaves the published bytes alone - and
-    // it still broke every AF2 fold. The manifests are COMPILED INTO the page
-    // (src/reference/manifests/) while the shards are fetched from a pinned
-    // remote, so the moment the manifest declared a shard the remote did not
-    // have, every load asked for a 404 and the rejection took the model down
-    // with it. 44 KB of base64 travels with the manifest that declares it, so
-    // the two can never be out of step.
-    const decode = (text, expected) => {
-      const binary = atob(text);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
-      const values = new Float32Array(bytes.buffer);
-      if (values.length !== expected) {
-        throw new RangeError(`distogram head: ${values.length} floats, expected ${expected}`);
-      }
-      return values;
-    };
-    const [rows, columns] = section.weightsShape;
+    // 🔴 A TENSOR IN THE SHARDS, LIKE EVERY OTHER WEIGHT. It was base64 in the
+    // manifest for a while - 44 KB of text carried beside the table that
+    // declared it - which existed only to avoid rewriting published bytes. The
+    // cost was a bundle that was not the whole model: a reader of `model/` got
+    // weights whose distogram head lived somewhere else, in another encoding,
+    // reachable only through a special case here. It is appended to the last
+    // shard now, so the 227 MB before it are untouched and this is an ordinary
+    // read.
+    //
+    // 🔴 WHICH MAKES THE PUBLISH ORDER LOAD-BEARING. The manifests are compiled
+    // into the page while the shards come from a pinned remote, so a manifest
+    // naming bytes the pinned commit does not have breaks every AF2 fold. See
+    // tools/add_distogram_head.py: upload, re-pin, then regenerate.
+    const [halfLogitsWeights, halfLogitsBias] = await Promise.all([
+      this.tensor(section.weights), this.tensor(section.bias),
+    ]);
     return {
-      halfLogitsWeights: decode(section.weights, rows * columns),
-      halfLogitsBias: decode(section.bias, section.biasShape[0]),
+      halfLogitsWeights,
+      halfLogitsBias,
       bins: section.bins,
       firstBreak: section.firstBreak,
       lastBreak: section.lastBreak,

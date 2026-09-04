@@ -6,14 +6,15 @@ describe("DEFAULT_MANIFEST", () => {
     expect(DEFAULT_MANIFEST.formatVersion).toBe(1);
     expect(DEFAULT_MANIFEST.model.name).toBe("model_1");
     expect(DEFAULT_MANIFEST.bundle.model).toBe("model_1_ptm");
-    // 🔴 STILL EIGHT SHARDS. The distogram head is embedded in the manifest
-    // as base64 rather than sharded, so nothing published changes and no
-    // remote has to catch up before the page can use it.
+    // 🔴 STILL EIGHT SHARDS, AND TWO MORE TENSORS THAN THERE WERE. The
+    // distogram head is appended to the LAST shard rather than given one of
+    // its own, so the 227 MB before it are untouched and an upload transfers
+    // one shard.
     expect(DEFAULT_MANIFEST.bundle.shards).toBe(8);
-    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(335);
+    expect(DEFAULT_MANIFEST.bundle.tensors).toBe(337);
   });
 
-  it("carries the distogram head, embedded rather than sharded", () => {
+  it("carries the distogram head as tensors in the shards", () => {
     // 🔴 THE HEAD ALPHAFOLD ALWAYS HAD AND THIS BUNDLE NEVER SHIPPED. Without
     // it there is no contact map for AF2 at all - the confidence heads are
     // pLDDT and PAE only.
@@ -22,19 +23,30 @@ describe("DEFAULT_MANIFEST", () => {
     expect(head.bins).toBe(64);
     expect(head.firstBreak).toBe(2);
     expect(head.lastBreak).toBe(22);
-    expect(head.weightsShape).toEqual([128, 64]);
-    expect(head.biasShape).toEqual([64]);
-    expect(head.encoding).toBe("base64-float32-le");
-    // 🔴 CARRIED BY THE MANIFEST, NOT BY A SHARD. A shard would have to reach
-    // the pinned remote before the page could load at all - which is exactly
-    // how the first version of this broke every AF2 fold.
+    // 🔴 IT NAMES TENSORS, IT DOES NOT CARRY BYTES. The head was 44 KB of
+    // base64 in this manifest for a while, which existed only to avoid
+    // rewriting published shards - and the cost was a bundle that was not the
+    // whole model, readable only through a special case in the loader.
     expect(typeof head.weights).toBe("string");
-    expect(head.weights.length > 40000).toBe(true);
+    expect(typeof head.bias).toBe("string");
+    expect(head.encoding).toBe(undefined);
+    const weights = DEFAULT_MANIFEST.tensors[head.weights];
+    const bias = DEFAULT_MANIFEST.tensors[head.bias];
+    expect(weights.shape).toEqual([128, 64]);
+    expect(bias.shape).toEqual([64]);
+    // ...float32, because 33 KB is not worth a codec and the store already
+    // reads float32 from these same shards for the PAE bin edges.
+    expect(weights.dtype).toBe("float32");
+    expect(bias.dtype).toBe("float32");
+    // ...and both in the last shard, which is what keeps the earlier ones byte
+    // for byte what they were.
+    expect(weights.file).toBe(bias.file);
+    expect(bias.byteOffset).toBe(weights.byteOffset + 128 * 64 * 4);
   });
 
-  it("contains all 335 tensor entries with valid shapes and dtypes", () => {
+  it("contains all 337 tensor entries with valid shapes and dtypes", () => {
     const tensorKeys = Object.keys(DEFAULT_MANIFEST.tensors);
-    expect(tensorKeys.length).toBe(335);
+    expect(tensorKeys.length).toBe(337);
 
     const validDtypes = new Set(["int8", "float32", "float16"]);
     for (const [name, tensor] of Object.entries(DEFAULT_MANIFEST.tensors)) {

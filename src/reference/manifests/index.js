@@ -38,7 +38,7 @@ export const MODEL_BUNDLES = {
   monomer: {
     model: "model_1_ptm",
     directory: "./model/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/c4dc5f59324a6467e153298739c31cc14e8187f2/af2-monomer/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/2afc5a814499006d54f6ddd889944f0bae3e9442/af2-monomer/",
     release: "model1-ptm",
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
@@ -46,7 +46,7 @@ export const MODEL_BUNDLES = {
   multimer: {
     model: "model_1_multimer_v3",
     directory: "./model-multimer/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/c4dc5f59324a6467e153298739c31cc14e8187f2/af2-multimer/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/2afc5a814499006d54f6ddd889944f0bae3e9442/af2-multimer/",
     release: "model1-multimer-v3",
     variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
     load: () => import("./multimer.js"),
@@ -60,7 +60,7 @@ export const MODEL_BUNDLES = {
   af3: {
     model: "alphafold3",
     directory: "./model-af3-int5/",
-    remote: "https://huggingface.co/sokrypton/localfold/resolve/c4dc5f59324a6467e153298739c31cc14e8187f2/af3-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/2afc5a814499006d54f6ddd889944f0bae3e9442/af3-int5/",
     release: "af3-int5",
     variable: "LOCALFOLD_INCLUDE_AF3_MODEL",
     load: () => import("./af3.js"),

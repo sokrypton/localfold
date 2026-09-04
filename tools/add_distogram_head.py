@@ -1,29 +1,36 @@
-"""Add AlphaFold 2's distogram head to an already-published bundle.
+"""Fold AlphaFold 2's distogram head into an exported bundle, as real tensors.
 
-    python3 tools/add_distogram_head.py --model model \\
+    python3 tools/add_distogram_head.py --model model \
         --params ~/Documents/GitHub/af-params/params_model_1_ptm.npz
-    python3 tools/add_distogram_head.py --model model-multimer \\
-        --params ~/Documents/GitHub/af-params/params_model_1_multimer_v3.npz
-
-WHY IT IS NOT PART OF THE EXPORT. tools/export-web-model.js builds a bundle by
-re-sharding every tensor from the source manifest, so adding one head that way
-rewrites all eight shards - 227 MB for the monomer - and everything published
-has to be uploaded again. The head is 33 KB.
-
-🔴 SO THE HEAD IS EMBEDDED IN THE MANIFEST, NOT SHARDED. It was a new shard
-first, which is append-only and leaves the published bytes alone - and that
-still broke every fold: the manifests are COMPILED INTO the page
-(src/reference/manifests/), but the shards are fetched from a pinned remote,
-so the moment the manifest declared a shard the remote did not have, every AF2
-load asked for a 404 and the rejection took the model load down with it.
-Base64 in the manifest has no such gap: 44 KB of text per model, carried by
-the same file that declares the head, published the moment the page is.
+    python3 tools/add_distogram_head.py --model model --check
 
 WHAT THE HEAD IS. One linear projection of the 128-channel pair representation
 to 64 distance bins, symmetrised as `logits + logits^T`, over breaks that run
 2 to 22 A. AlphaFold 2 has always had it - it is what the contact map in every
 AlphaFold figure is drawn from - and this repo simply never converted it,
 because the bundle was built for the structure and the confidence heads.
+
+🔴 IT LIVES IN THE SHARDS, LIKE EVERY OTHER TENSOR. It was base64 in the
+manifest for a while, and before that a shard of its own; both were ways of
+not rewriting published bytes. The cost was a bundle that was not the whole
+model - a reader of `model/` got weights whose distogram head was somewhere
+else, in a different encoding, reachable only through a special case in the
+loader. The head is 33 KB against 227 MB, so it is appended to the LAST shard
+and the earlier ones are untouched: only that shard and the manifest change,
+and an upload transfers only what changed.
+
+🔴 THE ORDER OF OPERATIONS IS NOT OPTIONAL, and getting it wrong breaks every
+AF2 fold. The manifests are COMPILED INTO the page (src/reference/manifests/)
+while the shards are fetched from a PINNED remote, so a manifest that
+references bytes the pinned commit does not have makes every load ask for a
+range that is not there. Upload the bundle first, re-pin the commit, and only
+then regenerate the manifest module:
+
+    python3 tools/add_distogram_head.py --model model --params ...
+    hf upload USER/REPO model af2-monomer --repo-type=model
+    # ...pin the new sha in src/reference/manifests/index.js
+    python3 tools/write_manifest_module.py monomer
+    python3 tools/check_remote_bundle.py monomer
 
 🔴 FLOAT32, NOT QUANTISED. The rest of the bundle is int8 with per-block
 scales; 33 KB is not worth a codec, and the store already reads float32
@@ -34,18 +41,47 @@ import argparse
 import base64
 import json
 import pathlib
-import sys
 
 import numpy as np
 
 WEIGHTS = "alphafold/alphafold_iteration/distogram_head/half_logits//weights"
 BIAS = "alphafold/alphafold_iteration/distogram_head/half_logits//bias"
 
+WEIGHTS_TENSOR = "af2DistogramHalfLogitsWeights"
+BIAS_TENSOR = "af2DistogramHalfLogitsBias"
+
 # AlphaFold 2's distogram: 64 bins with 63 breaks from 2 to 22 A. The head
 # itself carries no bin edges, so they are written into the manifest here -
 # the same shape the PAE breaks are stored in, so nothing downstream has to
 # know a second convention.
 FIRST_BREAK, LAST_BREAK, BINS = 2.0, 22.0, 64
+CHANNELS = 128
+
+
+def last_shard(manifest):
+    """The highest-numbered shard any tensor is stored in."""
+    files = {entry["file"] for entry in manifest["tensors"].values()
+             if isinstance(entry, dict) and "file" in entry}
+    return max(files, key=lambda name: int(name[len("weights-"):-len(".bin")]))
+
+
+def read_head(root, manifest):
+    """The head's two tensors, read back out of the shard they were put in."""
+    section = manifest.get("distogramHead")
+    if section is None:
+        return None
+    out = {}
+    for key, name in (("weights", section.get("weights")),
+                      ("bias", section.get("bias"))):
+        entry = manifest["tensors"].get(name)
+        if entry is None:
+            return None
+        data = (root / entry["file"]).read_bytes()
+        count = int(np.prod(entry["shape"]))
+        start = entry["byteOffset"]
+        out[key] = np.frombuffer(data[start:start + count * 4], dtype="<f4")
+        out[key + "_shape"] = entry["shape"]
+    return out
 
 
 def main():
@@ -64,20 +100,23 @@ def main():
     manifest = json.loads(manifest_path.read_text())
 
     if args.check:
-        section = manifest.get("distogramHead")
-        if section is None:
-            print("FAIL: no distogramHead section in %s" % manifest_path)
+        head = read_head(root, manifest)
+        if head is None:
+            print("FAIL: %s has no distogramHead in its tensors" % manifest_path)
             return 1
-        w = np.frombuffer(base64.b64decode(section["weights"]), dtype="<f4")
-        b = np.frombuffer(base64.b64decode(section["bias"]), dtype="<f4")
-        if list(w.shape) != [int(np.prod(section["weightsShape"]))]:
-            print("FAIL: weights decode to %s, not %s" % (w.shape, section["weightsShape"]))
+        if head["weights_shape"] != [CHANNELS, BINS] or head["bias_shape"] != [BINS]:
+            print("FAIL: shapes are %s and %s" % (head["weights_shape"], head["bias_shape"]))
             return 1
-        if list(b.shape) != section["biasShape"]:
-            print("FAIL: bias decodes to %s, not %s" % (b.shape, section["biasShape"]))
+        if head["weights"].size != CHANNELS * BINS or head["bias"].size != BINS:
+            print("FAIL: read %d weights and %d bias"
+                  % (head["weights"].size, head["bias"].size))
             return 1
-        print("ok: distogramHead embedded, %d weights and %d bias"
-              % (w.size, b.size))
+        if not (np.isfinite(head["weights"]).all() and np.isfinite(head["bias"]).all()):
+            print("FAIL: the head has non-finite values")
+            return 1
+        print("ok: distogramHead in the shards, %d weights and %d bias, |w| mean %.5f"
+              % (head["weights"].size, head["bias"].size,
+                 float(np.abs(head["weights"]).mean())))
         return 0
 
     if args.params is None:
@@ -87,31 +126,44 @@ def main():
     if WEIGHTS not in params.files:
         print("FAIL: %s has no distogram head" % args.params)
         return 1
-    weights = np.asarray(params[WEIGHTS], dtype="<f4")
-    bias = np.asarray(params[BIAS], dtype="<f4")
-    if weights.shape != (128, BINS) or bias.shape != (BINS,):
+    weights = np.ascontiguousarray(params[WEIGHTS], dtype="<f4")
+    bias = np.ascontiguousarray(params[BIAS], dtype="<f4")
+    if weights.shape != (CHANNELS, BINS) or bias.shape != (BINS,):
         print("FAIL: unexpected shapes %s %s" % (weights.shape, bias.shape))
         return 1
 
-    # 🔴 REMOVE AN EARLIER SHARDED ATTEMPT, so re-running is idempotent and a
-    # tree that tried the shard route does not keep a file nothing references.
-    for stale in ("af2DistogramHalfLogitsWeights", "af2DistogramHalfLogitsBias"):
-        entry = manifest["tensors"].pop(stale, None)
-        if entry is not None and entry.get("file", "").startswith("weights-"):
-            shard = root / entry["file"]
-            index = int(entry["file"][len("weights-"):-len(".bin")])
-            if shard.exists() and index >= int(manifest["bundle"]["shards"]) - 1:
-                shard.unlink()
-                manifest["bundle"]["shards"] = index
-                manifest.get("shardDigests", {}).pop(entry["file"], None)
+    # 🔴 RE-RUNNING MUST NOT APPEND TWICE. An earlier run's tensors are dropped
+    # from the manifest and the shard is truncated back to where they started,
+    # so the bytes written are the same whether this is the first run or the
+    # fifth - which is what makes the digests in the manifest module stable.
+    existing = manifest["tensors"].get(WEIGHTS_TENSOR)
+    if existing is not None:
+        shard = root / existing["file"]
+        with open(shard, "r+b") as handle:
+            handle.truncate(existing["byteOffset"])
+        manifest["tensors"].pop(WEIGHTS_TENSOR, None)
+        manifest["tensors"].pop(BIAS_TENSOR, None)
+    # ...and so is the base64 the head used to be carried as.
+    manifest.pop("distogramHead", None)
 
-    payload = weights.tobytes() + bias.tobytes()
+    name = last_shard(manifest)
+    shard = root / name
+    offset = shard.stat().st_size
+    with open(shard, "ab") as handle:
+        handle.write(weights.tobytes())
+        handle.write(bias.tobytes())
+
+    manifest["tensors"][WEIGHTS_TENSOR] = {
+        "file": name, "shape": [CHANNELS, BINS],
+        "byteOffset": offset, "dtype": "float32",
+    }
+    manifest["tensors"][BIAS_TENSOR] = {
+        "file": name, "shape": [BINS],
+        "byteOffset": offset + weights.nbytes, "dtype": "float32",
+    }
     manifest["distogramHead"] = {
-        "encoding": "base64-float32-le",
-        "weights": base64.b64encode(weights.tobytes()).decode("ascii"),
-        "bias": base64.b64encode(bias.tobytes()).decode("ascii"),
-        "weightsShape": list(weights.shape),
-        "biasShape": list(bias.shape),
+        "weights": WEIGHTS_TENSOR,
+        "bias": BIAS_TENSOR,
         "bins": BINS,
         "firstBreak": FIRST_BREAK,
         "lastBreak": LAST_BREAK,
@@ -119,13 +171,15 @@ def main():
                 " lastBreak, bins - 1)",
     }
     manifest["bundle"]["tensors"] = len(manifest["tensors"])
-
+    manifest["bundle"]["bytes"] = manifest["bundle"].get("bytes", 0)
+    manifest["bundle"]["bytes"] += weights.nbytes + bias.nbytes
     manifest_path.write_text(json.dumps(manifest))
-    print("embedded the head in %s (%d bytes of weights, %d of base64)"
-          % (manifest_path, len(payload),
-             len(manifest["distogramHead"]["weights"])
-             + len(manifest["distogramHead"]["bias"])))
-    print("re-run tools/write_manifest_module.py for the committed copy")
+
+    print("wrote the head into %s at %d (+%d bytes); %s now has %d tensors"
+          % (name, offset, weights.nbytes + bias.nbytes,
+             manifest_path, len(manifest["tensors"])))
+    print("upload the bundle and re-pin the commit BEFORE"
+          " tools/write_manifest_module.py - see the note at the top")
     return 0
 
 
