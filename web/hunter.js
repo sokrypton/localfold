@@ -46,13 +46,16 @@ const viewer = createStructureViewer({ container: element("viewer"), canvasHeigh
 /**
  * The target, as index.html's own entity rows.
  *
- * 🔴 IT STARTS EMPTY, WHICH index.html's LIST NEVER DOES. There it seeds a
- * protein row because a fold needs something to fold; here an empty list is a
- * monomer hallucination, which is the method's first example - so a row a
- * reader has to delete to get the default behaviour would be in the way.
+ * 🔴 IT SHOWS ONE EMPTY ROW, AND `initial: []` DOES NOT MEAN NO ROW.
+ * createEntityList falls back to a single protein row when it is handed an
+ * empty list, which is right: a control that starts as nothing but a button
+ * is a control people do not find. What "empty" means here is the row's
+ * VALUE - a blank sequence is a monomer hallucination, which is the method's
+ * own first example, so chainsFromControls drops blank rows rather than
+ * refusing them.
  */
 const targets = createEntityList(element("entity-rows"), element("add-entity"), {
-  initial: [], onChange: () => syncDesignerNote(),
+  onChange: () => syncDesignerNote(),
 });
 
 /** Every record every run has yielded, in the order they arrived. */

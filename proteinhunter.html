@@ -54,6 +54,19 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
            only `!important`. Measured at 320px with them: the binder's
            sequence box was 32px, because the 96px column and the 110px length
            box would not give any of it back. */
+        /* 🔴 THE ENTITY ROWS NEEDED A HEADING AND HAD NONE. The list renders
+           an unlabelled type/copies/sequence row whose placeholder reads
+           "Paste a protein sequence" - which, sitting directly above a field
+           labelled "Binder start sequence", reads as being about the binder.
+           Every other control on this page carries a label; this one is
+           several controls and carries the most. */
+        .hunt-section { display: flex; align-items: baseline; justify-content: space-between;
+            gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+        .hunt-section h2 { font-size: 12px; font-weight: 600; color: #334155; margin: 0;
+            text-transform: uppercase; letter-spacing: 0.03em; }
+        .hunt-section .hint { font-size: 11px; font-weight: 400; color: #64748b;
+            text-transform: none; letter-spacing: 0; margin-left: 6px; }
+
         .hunt-row { display: flex; gap: 8px; align-items: flex-end; }
         .hunt-row .hunt-grow { flex: 1 1 auto; min-width: 0; }
         .hunt-row .hunt-length { flex: 0 0 110px; }
@@ -111,8 +124,19 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                      `{chains, chainKinds, ligandCodes, modifications}` the fold
                      takes. Reusing them removed the parser and the bug with
                      it. An empty list is a monomer hallucination. -->
-                <div class="entity-list" style="margin-bottom: 8px;">
+                <div class="hunt-section">
+                    <h2>Target <span class="hint">what the binder is designed against — leave it empty to hallucinate a monomer</span></h2>
+                    <button type="button" id="add-entity" class="btn btn-grey btn-small">
+                        <i class="fa-solid fa-plus"></i>
+                        <span>Add chain or ligand</span>
+                    </button>
+                </div>
+                <div class="entity-list" style="margin-bottom: 10px;">
                     <div id="entity-rows"></div>
+                </div>
+
+                <div class="hunt-section">
+                    <h2>Binder <span class="hint">the chain being designed, always chain A</span></h2>
                 </div>
 
                 <div class="hunt-row" id="fold-input-container">
@@ -125,10 +149,6 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                         <input type="number" id="length" min="4" max="600" step="1" value="75">
                     </div>
                     <div class="hunt-actions">
-                        <button type="button" id="add-entity" class="btn btn-grey btn-small">
-                            <i class="fa-solid fa-plus"></i>
-                            <span>Target</span>
-                        </button>
                         <button id="hunt" class="btn btn-primary" style="height: 32px; font-size: 13px;">
                             <i class="fa-solid fa-crosshairs"></i>
                             <span>Hunt</span>
