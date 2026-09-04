@@ -616,6 +616,32 @@ function alignedToFirstPass(sequence, structure, firstPassStructure) {
  * (`frame.pae` / `frame.pae_n`), so scrubbing the bar moves the matrix too.
  */
 /**
+ * Show the viewer, for a fold that has a structure before it has a file.
+ *
+ * 🔴 THE CONTAINER STARTS `display: none` AND ONLY THE FILE-LOAD PATH OPENS
+ * IT. py2Dmol reveals it inside applyPendingObjects, which runs when a file is
+ * ingested - so the trunk previews were added to the object, drawn, and
+ * displayed inside a hidden container. Frames existed, the panel updated, and
+ * the page looked as though nothing had happened until the sampler's first
+ * frame arrived through the normal path.
+ *
+ * 🔴 AND THE CANVAS HAS TO BE RE-MEASURED, because it was sized while hidden
+ * and a hidden element measures zero. That is the same trap the heatmap panel
+ * documents about its own layout; here it would leave a 0-pixel canvas that
+ * never draws.
+ */
+function revealViewer(renderer) {
+  const container = document.getElementById("viewer-container");
+  if (container === null || getComputedStyle(container).display !== "none") return;
+  container.style.display = "flex";
+  const top = document.getElementById("sequence-viewer-container");
+  if (top !== null) top.style.display = "block";
+  try {
+    renderer?._updateCanvasDimensions?.();
+  } catch { /* a resize is not worth losing the fold over */ }
+}
+
+/**
  * Open an empty object for the fold that is about to start.
  *
  * 🔴 THE PREVIOUS PREDICTION USED TO STAY ON SCREEN UNTIL THE FIRST FRAME OF
@@ -850,13 +876,17 @@ function syncAf3Count() {
  * resolved, is enough for the whole trajectory: every later frame is rigidly
  * fitted to that first one, so the view stays right and never jumps mid-run.
  */
-function orientBestView() {
-  if (viewer === undefined) return;
+function orientBestView(renderer = viewer) {
+  // 🔴 IT TAKES A RENDERER, because the first thing drawn in an AF3 fold is
+  // now a trunk preview and `viewer` is deliberately undefined until the
+  // sampler's first frame lands. Oriented only at that point, the whole trunk
+  // phase was drawn at whatever camera the blank object happened to have.
+  if (renderer === undefined) return;
   try {
     if (window.py2dmolOrient?.orientToBestView) {
-      window.py2dmolOrient.orientToBestView(viewer, { positions: [], animate: false });
+      window.py2dmolOrient.orientToBestView(renderer, { positions: [], animate: false });
     } else {
-      viewer.orient?.({ positions: [] });
+      renderer.orient?.({ positions: [] });
     }
   } catch { /* a view is not worth losing the structure over */ }
 }
@@ -878,8 +908,11 @@ function orientBestView() {
  * belong to the embed build - and reaching past the control into the colour
  * arrays is what made an earlier attempt at this silently do nothing.
  */
-function forcePlddtColours() {
-  const select = viewer?.colorSelect;
+function forcePlddtColours(renderer = viewer) {
+  // ...for the same reason orientBestView takes one: the previews are drawn
+  // before `viewer` exists, and without this they are painted by `auto`, which
+  // resolves to rainbow rather than to the pLDDT ramp they are coloured for.
+  const select = renderer?.colorSelect;
   if (select === undefined || select === null) return;
   try {
     select.value = "plddt";
@@ -1045,6 +1078,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const api = window.py2Dmol;
   let pending = Promise.resolve();
   let liveContacts;
+  let oriented = false;
   const result = await foldAf3({
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
@@ -1100,10 +1134,22 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       if (renderer === undefined || object === undefined
           || api?.frameFromText === undefined) return;
       try {
+        const first = object.frames.length === 0;
+        // ...the viewer is opened before the frame is added, so the canvas is
+        // measured against a container that is actually on screen.
+        if (first) revealViewer(renderer);
         const frame = api.frameFromText(pdb);
         frame.name = frame.label = frame.title = `trunk_${object.frames.length + 1}`;
         renderer.addFrame(frame, renderer.currentObjectName);
         renderer.setFrame(object.frames.length - 1);
+        // ...the camera and the palette are set on the FIRST thing drawn, not
+        // on the sampler's first frame, or the whole trunk is watched from the
+        // default view in rainbow.
+        if (first) {
+          orientBestView(renderer);
+          forcePlddtColours(renderer);
+          oriented = true;
+        }
         renderer.render("preview");
       } catch (cause) {
         console.warn("could not draw the recycle preview", cause);
@@ -1115,7 +1161,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
 
         pending = loadIntoViewer({ stem, pdb, scores: { sequence: chains.join("") }, length: residues })
           .then(() => {
-            orientBestView();
+            // ...and not again if a preview already framed it: the previews and
+            // the sampler's frames are superposed onto the same reference, so
+            // one orientation serves both and a second one is a visible jump
+            // in the middle of the animation.
+            if (!oriented) orientBestView();
             forcePlddtColours();
             // ...on frame 0, which every later frame resolves back to.
             const frame = viewer?.objectsData?.[viewerObject]?.frames?.[0];
