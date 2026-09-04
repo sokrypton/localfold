@@ -186,6 +186,23 @@ def main():
           return JSON.stringify({ changes: log.length, shapes: seen });
         })()""")
         print("statusln:", shapes)
+        # 🔴 THE BUTTON GREYS OUT WHEN FOLDING AGAIN WOULD RECOMPUTE THE SAME
+        # ANSWER, and comes back on any edit. Checked in that order, because a
+        # button that never re-enables is worse than one that never greys.
+        print("button :", cdp.evaluate(ws, """(() => {
+          const b = document.getElementById('predict');
+          const before = b.disabled;
+          const el = document.getElementById('recycles');
+          const was = el.value;
+          el.value = String(Number(was) + 1);
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          const afterEdit = b.disabled;
+          el.value = was;
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          const afterUndo = b.disabled;
+          return JSON.stringify({ afterFold: before, afterEdit, afterUndo,
+            title: (b.title || '').slice(0, 40) });
+        })()"""))
         print("map1   :", cdp.evaluate(ws, """(() => {
               const reg = window.py2dmol_viewers || {};
               const v = reg[Object.keys(reg)[0]].renderer;
