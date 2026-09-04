@@ -513,7 +513,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // It costs one call - 0.11 s at 58 tokens, 0.77 s at 444 - against a trunk
     // pass of seconds, and it is the only structure anyone can be shown while
     // the trunk is still recycling.
-    if (wantsPreview) {
+    // 🔴 NOT AFTER THE LAST PASS, because the real sampler is that pass's
+    // preview. Every recycle is followed by a walk down the schedule; the
+    // intermediate ones get two cycles and the final one gets all `steps` of
+    // them, and there is no reason for the last pass to have both. It used to,
+    // which put a two-step frame immediately before the sixteen-step run over
+    // the same trunk - the same picture twice, the first one worse.
+    if (wantsPreview && pass < recycles) {
       try {
         const preview = await flowOnGpu(device,
           { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair },
