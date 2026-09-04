@@ -244,6 +244,8 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          onTrunk?: (reusable: object) => void,
  *          onContacts?: (contactProbs: Float32Array, pass?: number,
  *                        passes?: number) => void,
+ *          onPreview?: (preview: {pdb: string, pass: number,
+ *                                 passes: number}) => void|Promise<void>,
  *          schedule?: {sigmaMax?: number, sigmaMin?: number, rho?: number},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -424,9 +426,28 @@ export async function foldAf3(options) {
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
   let liveConfidence = null;
+  const previewPdbs = [];
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
+    // 🔴 ONE STRUCTURE PER RECYCLE, WHILE THE TRUNK IS STILL RUNNING. See
+    // fold.js: a single flow cycle against that pass's trunk is a real
+    // backbone, and it is the only structure that exists before the sampler
+    // starts. Written as a PDB here, like every other frame, so the page draws
+    // it the same way - and coloured by the trunk's own agreement, which is
+    // all the confidence there is at this point.
+    onPreview: options.onPreview === undefined ? undefined : async (preview) => {
+      if (reference === null) reference = toPoints(preview.positions, batch.tokens * batch.dense);
+      const colour = liveConfidence?.(preview.positions) ?? null;
+      const pdb = fittedPdb(batch, preview.positions, reference, slots, colour);
+      // 🔴 KEPT, NOT JUST SHOWN. The previews are frames of the same
+      // trajectory - the structure the model believed at each recycle - so
+      // they are handed back with the rest and the replay rebuilds them in
+      // order rather than throwing away the only record of the trunk.
+      previewPdbs.push(pdb);
+      await options.onPreview({ pdb, pass: preview.pass, passes: preview.passes });
+      await yieldToBrowser();
+    },
     // ...forwarded for probes that move the noise schedule. Unset for a page
     // fold, which is AF3's own for the sampler and 160 A for the flow.
     schedule: options.schedule,
@@ -451,7 +472,12 @@ export async function foldAf3(options) {
           options.onContacts?.(detail.trunk.contactProbs);
         }
       }
-      if (name === "trunk-done" && liveConfidence === null) {
+      // 🔴 BUILT AT THE FIRST RECYCLE, NOT AT trunk-done, because the PREVIEWS
+      // need it and they run between passes. Every pass has its own distogram,
+      // so the first one to arrive is enough to colour by - and it is rebuilt
+      // on each later pass, which is what makes a preview coloured by the
+      // trunk that produced it rather than by an earlier one.
+      if (name === "recycle-done" || (name === "trunk-done" && liveConfidence === null)) {
         // ...best effort, for the reason the finished-frame path gives: this is
         // a colour, and losing a prediction to it would be a bad trade.
         try {
@@ -647,6 +673,8 @@ export async function foldAf3(options) {
     // the trunk does rather than after the confidence head.
     contactProbs: result.trunk.contactProbs,
     framePdbs,
+    // One per recycle, in order, before the sampler's first frame.
+    previewPdbs,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,

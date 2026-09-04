@@ -1086,9 +1086,33 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         console.warn("could not show the trunk's contact map", cause);
       }
     },
+    // 🔴 A STRUCTURE DURING THE TRUNK, REPLACED EACH RECYCLE. There is nothing
+    // else to look at for the longest part of an AF3 fold - the sampler has
+    // not started - and one flow cycle against the current trunk is a real
+    // backbone. Each preview REPLACES the last: they are the same structure
+    // getting better, not a trajectory, and leaving them stacked would put
+    // four of them in front of the real one on the play bar.
+    onPreview: ({ pdb }) => {
+      if (signal.aborted) return;
+      const registry = window.py2dmol_viewers ?? {};
+      const renderer = registry[Object.keys(registry)[0]]?.renderer;
+      const object = renderer?.objectsData?.[renderer?.currentObjectName];
+      if (renderer === undefined || object === undefined
+          || api?.frameFromText === undefined) return;
+      try {
+        const frame = api.frameFromText(pdb);
+        frame.name = frame.label = frame.title = `trunk_${object.frames.length + 1}`;
+        renderer.addFrame(frame, renderer.currentObjectName);
+        renderer.setFrame(object.frames.length - 1);
+        renderer.render("preview");
+      } catch (cause) {
+        console.warn("could not draw the recycle preview", cause);
+      }
+    },
     onFrame: (pdb, index) => {
       if (signal.aborted) return;
       if (index === 0) {
+
         pending = loadIntoViewer({ stem, pdb, scores: { sequence: chains.join("") }, length: residues })
           .then(() => {
             orientBestView();
@@ -1136,7 +1160,19 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // they agree to a fraction of an angstrom - so appending made a redundant
     // extra frame and a play bar that ended on the same picture twice. The
     // returned structure is the authoritative one, so it takes that slot.
-    const timeline = [...result.framePdbs.slice(0, -1), result.pdb];
+    // 🔴 THE PREVIEWS ARE PART OF THE TRAJECTORY. One per recycle, before the
+    // sampler's first frame - the structure the model believed at each pass -
+    // so the play bar runs the whole fold rather than starting where the trunk
+    // finished. They are prepended here so the rebuild below keeps the order
+    // the live fold drew them in.
+    const previews = result.previewPdbs ?? [];
+    const timeline = [...previews, ...result.framePdbs.slice(0, -1), result.pdb];
+    /** What a frame is called: the trunk's passes, then the sampler's calls. */
+    const frameName = (index, last) => {
+      if (last) return "final";
+      if (index < previews.length) return `trunk_${index + 1}`;
+      return `${mode}_${index - previews.length}`;
+    };
     const camera = { ...viewer.viewerState };
     await loadIntoViewer({
       stem, pdb: timeline[0],
@@ -1176,7 +1212,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // word for a sampler call.
     const first = viewer?.objectsData?.[viewerObject]?.frames?.[0];
     if (first !== undefined) {
-      first.name = first.label = first.title = `${mode}_0`;
+      first.name = first.label = first.title = frameName(0, false);
       // ...and frame zero's own estimate too. It is built by loadIntoViewer
       // rather than by the loop below, so it is easy to leave carrying whatever
       // that put there.
@@ -1192,7 +1228,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);
       const last = index === timeline.length - 2;
-      frame.name = frame.label = frame.title = last ? "final" : `${mode}_${index + 1}`;
+      frame.name = frame.label = frame.title = frameName(index + 1, last);
       // 🔴 THE FRAME'S OWN NUMBER, NOT THE FINISHED ONE. Every frame used to
       // carry `result.confidence`, so scrubbing the trajectory showed the final
       // pLDDT on a structure that had not reached it. An intermediate frame now

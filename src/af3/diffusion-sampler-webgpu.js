@@ -37,7 +37,12 @@ export async function sampleOnGpu(device, input, weights, options) {
   const stepScale = options.stepScale ?? 1.5;
   const atoms = input.shape.tokens * input.shape.dense;
   const levels = noiseLevels(steps, options);
-  const head = new Af3DiffusionHeadGpu(device);
+  // 🔴 A CALLER MAY OWN THE HEAD, AND THEN IT KEEPS IT. Building one compiles
+  // its pipelines - measured 730 ms, flat in the shape - so a caller that
+  // denoises repeatedly (fold.js previews one step per recycle) would pay that
+  // every time. `options.head` is borrowed: used and NOT disposed here.
+  const borrowed = options.head;
+  const head = borrowed ?? new Af3DiffusionHeadGpu(device);
 
   let positions = new Float32Array(atoms * 3);
   for (let index = 0; index < positions.length; index += 1) {
@@ -76,7 +81,7 @@ export async function sampleOnGpu(device, input, weights, options) {
   } finally {
     // 🔴 THE HEAD HOLDS ~25 MB OF DEVICE MEMORY BETWEEN CALLS, deliberately -
     // the atom encoder's static tensors - and a head is built per run.
-    head.dispose();
+    if (borrowed === undefined) head.dispose();
   }
 }
 
@@ -144,7 +149,12 @@ export async function flowOnGpu(device, input, weights, options) {
   // schedule it was verified against, and noiseSchedule's defaults are still
   // AF3's, so only the flow - which is ours - moves.
   const levels = noiseLevels(cycles, { sigmaMax: 10, ...options });
-  const head = new Af3DiffusionHeadGpu(device);
+  // 🔴 A CALLER MAY OWN THE HEAD, AND THEN IT KEEPS IT. Building one compiles
+  // its pipelines - measured 730 ms, flat in the shape - so a caller that
+  // denoises repeatedly (fold.js previews one step per recycle) would pay that
+  // every time. `options.head` is borrowed: used and NOT disposed here.
+  const borrowed = options.head;
+  const head = borrowed ?? new Af3DiffusionHeadGpu(device);
   let positions = new Float32Array(input.shape.tokens * input.shape.dense * 3);
   for (let index = 0; index < positions.length; index += 1) {
     positions[index] = normal() * levels[0];
@@ -170,6 +180,6 @@ export async function flowOnGpu(device, input, weights, options) {
   } finally {
     // 🔴 SEE sampleOnGpu: the head keeps the atom encoder's static tensors on
     // the device between calls, and a head is built per run.
-    head.dispose();
+    if (borrowed === undefined) head.dispose();
   }
 }
