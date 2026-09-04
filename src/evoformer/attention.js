@@ -309,7 +309,7 @@ ${body.join("\n")}
   }`);
   }
 
-  return `${half ? "enable f16;\n" : ""}${COMMON}
+  return `${half ? "enable f16;\n" : ""}${half ? "enable f16;\n" : ""}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -1405,8 +1405,21 @@ export const attentionOutputTileColumns = (tile = ATTENTION_OUTPUT_TILE) =>
  *
  * @param {boolean} residual whether the store accumulates into an existing tensor
  */
-export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residual = false) {
+export function createAttentionOutputShader(
+  tile = ATTENTION_OUTPUT_TILE, residual = false, precision = "f32",
+) {
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  // Same trade as the transition's linear kernel, which this kernel is a
+  // sibling of: in f16 the staged operands and the accumulators halve, so the
+  // narrow tile keeps its occupancy and gets the cheaper reads. The bias, the
+  // residual and the store stay f32.
+  if (!["f32", "f16"].includes(precision)) {
+    throw new RangeError(`unknown attention output precision ${precision}`);
+  }
+  const half = precision === "f16";
+  const vector = half ? "vec4<f16>" : "vec4<f32>";
+  const narrow = (e) => (half ? `f16(${e})` : e);
+  const widen = (e) => (half ? `f32(${e})` : e);
   if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
     throw new RangeError("attention output tile must be a multiple of 4 each way");
   }
@@ -1421,7 +1434,7 @@ export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residu
   const lines = [];
   const declare = [];
   for (let r = 0; r < rowsPerLane; r += 1) {
-    for (let v = 0; v < columnVectors; v += 1) declare.push(`  var acc_${r}_${v} = vec4<f32>(0.0);`);
+    for (let v = 0; v < columnVectors; v += 1) declare.push(`  var acc_${r}_${v} = ${vector}(0.0);`);
   }
   for (let k = 0; k < step; k += 1) {
     for (let g = 0; g < rowsPerLane / 4; g += 1) {
@@ -1447,11 +1460,11 @@ export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residu
       let k_local = task % ${step}u;
       let k = k0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
-      var staged = vec4<f32>(0.0);
+      var staged = ${vector}(0.0);
       if (k < projected) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < rows) { staged[j] = source[row * projected + k]; }
+          if (row < rows) { staged[j] = ${narrow("source[row * projected + k]")}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -1461,12 +1474,12 @@ export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residu
   const stageWeight = [];
   for (let v = 0; v < columnVectors; v += 1) {
     stageWeight.push(`    {
-      var staged = vec4<f32>(0.0);
+      var staged = ${vector}(0.0);
       if (weight_k < projected) {
         for (var j = 0u; j < 4u; j += 1u) {
           let output_channel = channel_origin + (${v}u * 4u + j) * ${lanesX}u;
           if (output_channel < p.channels) {
-            staged[j] = weights[p.output_weight + weight_k * p.channels + output_channel];
+            staged[j] = ${narrow("weights[p.output_weight + weight_k * p.channels + output_channel]")};
           }
         }
       }
@@ -1483,7 +1496,7 @@ export function createAttentionOutputShader(tile = ATTENTION_OUTPUT_TILE, residu
         let output_channel = channel_origin + ${(v * 4 + c) * lanesX}u;
         if (output_channel < p.channels) {
           output[output_row_${r} * p.channels + output_channel] ${residual ? "+=" : "="}
-            acc_${r}_${v}[${c}u] + weights[p.output_bias + output_channel];
+            ${widen(`acc_${r}_${v}[${c}u]`)} + weights[p.output_bias + output_channel];
         }
       }`);
       }
@@ -1501,16 +1514,16 @@ ${body.join("\n")}
   }`);
   }
 
-  return `${COMMON}
+  return `${half ? "enable f16;\n" : ""}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
 // Laid out per thread: a lane's own strided columns, contiguous where it reads.
-var<workgroup> tile_weight: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnVectors}>;
 
 @compute @workgroup_size(${lanesX}, ${lanesY}, 1)
 fn main(
@@ -1542,6 +1555,40 @@ export const ATTENTION_OUTPUT_SHADER = createAttentionOutputShader(ATTENTION_OUT
 export const ATTENTION_OUTPUT_RESIDUAL_SHADER =
   createAttentionOutputShader(ATTENTION_OUTPUT_TILE, true);
 
+/**
+ * The output projection's tile and the element its k loop works in.
+ *
+ * 🔴 THE SAME INVERSION AS THE TRANSITION'S LINEAR KERNEL, which this is a
+ * sibling of - it differs only in writing its result back transposed. The wide
+ * tile exists to halve the weight traffic at the cost of workgroups; f16 halves
+ * the traffic anyway and halves the accumulators too, so the NARROW tile keeps
+ * its occupancy and gets the cheaper reads. Measured as the block's two
+ * attention outputs, in runs where every untouched kernel matched to 0.05 ms.
+ *
+ * `requested` is "auto", "f32" or "f16"; f32 keeps the 32x64 tile this shipped
+ * with, which is still the right answer on a device without shader-f16.
+ */
+export const ATTENTION_OUTPUT_TILE_F16 = {
+  lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
+};
+
+export function selectAttentionOutputKernel(device, residual, requested = "auto") {
+  const precision = requested !== "auto" ? requested
+    : device?.features?.has("shader-f16") ? "f16" : "f32";
+  if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
+    throw new Error("the f16 attention output projection requires the shader-f16 feature");
+  }
+  const tile = precision === "f16" ? ATTENTION_OUTPUT_TILE_F16 : ATTENTION_OUTPUT_TILE;
+  return {
+    precision, tile,
+    // The tile is in the key with the precision: the dispatch divides by it.
+    cacheKey: `block:attention:output${residual ? "-residual" : ""}:${precision}`
+      + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`,
+    shader: precision === "f16"
+      ? createAttentionOutputShader(tile, residual, "f16")
+      : (residual ? ATTENTION_OUTPUT_RESIDUAL_SHADER : ATTENTION_OUTPUT_SHADER),
+  };
+}
 export class AttentionGpu {
   device;
   allocator;
@@ -1564,12 +1611,14 @@ export class AttentionGpu {
     );
     const projectKernel = selectAttentionProjectKernel(
       this.device, this.options.projectPrecision ?? "auto");
+    const outputKernel = selectAttentionOutputKernel(
+      this.device, false, this.options.outputPrecision ?? "auto");
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
       this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
-      this.pipelines.get("attention:output", ATTENTION_OUTPUT_SHADER),
+      this.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
     ]);
     const allocations = [];
     const keep = (value) => { allocations.push(value); return value; };
@@ -1650,8 +1699,8 @@ export class AttentionGpu {
         weighted.buffer], ceilDivide(input.queryLength, flashKernel.queryTile),
         input.batch, input.heads);
       pass(outputProject, [weighted.buffer, weights.buffer, params.buffer, output.buffer],
-        ceilDivide(input.channels, attentionOutputTileColumns()),
-        ceilDivide(rows, attentionOutputTileRows()));
+        ceilDivide(input.channels, attentionOutputTileColumns(outputKernel.tile)),
+        ceilDivide(rows, attentionOutputTileRows(outputKernel.tile)));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, tensorBytes);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

@@ -184,6 +184,7 @@ async function check(device, input, precision, bound) {
   const { output } = await new AttentionGpu(device, {
     flashPrecision: precision === "f32" ? "f32" : "chunk16",
     projectPrecision: precision === "f32" ? "f32" : "f16",
+    outputPrecision: precision === "f32" ? "f32" : "f16",
   }).run(input);
   const expected = reference(input);
   let error = 0;

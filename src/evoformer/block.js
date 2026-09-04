@@ -1,13 +1,12 @@
 import {
   ATTENTION_NORMALIZE_SHADER,
-  ATTENTION_OUTPUT_SHADER,
   attentionOutputTileColumns,
   attentionProjectTileColumns,
   attentionProjectTileRows,
   attentionOutputTileRows,
-  ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
   selectAttentionProjectKernel,
+  selectAttentionOutputKernel,
   createAttentionNormParameters,
   createAttentionParameters,
   packAttentionWeights,
@@ -298,14 +297,14 @@ async function encodeAttention(
   // selectAttentionProjectKernel.
   const projectKernel = selectAttentionProjectKernel(
     execution.device, options.projectPrecision ?? "auto");
+  const outputKernel = selectAttentionOutputKernel(
+    execution.device, options.residualTarget !== undefined,
+    options.outputPrecision ?? "auto");
   const [normalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
-    execution.pipelines.get(
-      options.residualTarget === undefined ? "block:attention:output" : "block:attention:output-residual",
-      options.residualTarget === undefined ? ATTENTION_OUTPUT_SHADER : ATTENTION_OUTPUT_RESIDUAL_SHADER,
-    ),
+    execution.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
   ]);
   const rows = options.batch * options.queries;
   const elements = rows * options.channels;
@@ -357,8 +356,8 @@ async function encodeAttention(
     Math.ceil(options.queries / flashKernel.queryTile),
     options.batch, options.heads, `${options.label}.flash`);
   execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
-    Math.ceil(options.channels / attentionOutputTileColumns()),
-    Math.ceil(rows / attentionOutputTileRows()), 1,
+    Math.ceil(options.channels / attentionOutputTileColumns(outputKernel.tile)),
+    Math.ceil(rows / attentionOutputTileRows(outputKernel.tile)), 1,
     `${options.label}.output`);
   return output;
 }
