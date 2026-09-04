@@ -41,26 +41,35 @@ const option = (args, name, fallback) => {
 
 const CHAINS = 8;
 
-function fmaShader(width) {
-  const type = width === 1 ? "f32" : `vec${width}<f32>`;
-  const zero = width === 1 ? "0.0" : `${type}(0.0)`;
-  const chain = (c) => `  var a${c} = ${type}(f32(index) * 1e-6 + ${c}.0);`;
+/**
+ * @param {number} width lanes per operand: 1 for a scalar, 2 or 4 for a vector
+ * @param {"f32"|"f16"} scalar the element type
+ */
+function fmaShader(width, scalar = "f32") {
+  const type = width === 1 ? scalar : `vec${width}<${scalar}>`;
+  const zero = width === 1 ? `${scalar}(0.0)` : `${type}(0.0)`;
+  // 🔴 THE ACCUMULATOR STAYS IN THE NARROW TYPE AND THE STORE WIDENS. Writing
+  // out an f16 would need an f16 buffer and prices a conversion into the loop;
+  // one f32() at the end prices nothing, because it is outside it.
+  const chain = (c) => `  var a${c} = ${type}(${scalar}(f32(index) * 1e-6 + ${c}.0));`;
   const step = (c) => `    a${c} = a${c} * m + b;`;
-  return `
+  const enable = scalar === "f16" ? "enable f16;\n" : "";
+  const lane = width === 1 ? "total" : "total.x";
+  return `${enable}
 @group(0) @binding(0) var<storage, read_write> out: array<f32>;
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x;
 ${Array.from({ length: CHAINS }, (_, c) => chain(c)).join("\n")}
-  let m = ${type}(1.0000001);
-  let b = ${type}(1e-7);
+  let m = ${type}(${scalar}(1.0000001));
+  let b = ${type}(${scalar}(1e-7));
   for (var step = 0u; step < ITERATIONS; step += 1u) {
 ${Array.from({ length: CHAINS }, (_, c) => step(c)).join("\n")}
   }
   var total = ${zero};
 ${Array.from({ length: CHAINS }, (_, c) => `  total += a${c};`).join("\n")}
-  out[index] = ${width === 1 ? "total" : "total.x"};
+  out[index] = f32(${lane});
 }`;
 }
 
@@ -135,7 +144,11 @@ export async function main(device, args) {
     size: 4194304 * 16, usage: GPUBufferUsage.STORAGE });
 
   const build = async (code, extra = []) => {
-    const source = `const ITERATIONS: u32 = ${iterations}u;\n${code}`;
+    // 🔴 A DIRECTIVE MUST PRECEDE EVERY DECLARATION, so `enable f16;` cannot sit
+    // where the shader body put it once ITERATIONS is prepended. Lift it.
+    const directives = [...code.matchAll(/^\s*enable [^;]+;/gm)].map((m) => m[0].trim());
+    const body = code.replace(/^\s*enable [^;]+;/gm, "");
+    const source = `${directives.join("\n")}\nconst ITERATIONS: u32 = ${iterations}u;\n${body}`;
     const pipeline = await device.createComputePipelineAsync({
       layout: "auto",
       compute: { module: device.createShaderModule({ code: source }), entryPoint: "main" },
@@ -153,6 +166,11 @@ export async function main(device, args) {
     "fma f32": { kernel: await build(fmaShader(1)), lanes: 1 },
     "fma vec2": { kernel: await build(fmaShader(2)), lanes: 2 },
     "fma vec4": { kernel: await build(fmaShader(4)), lanes: 4 },
+    ...(device.features.has("shader-f16") ? {
+      "fma f16": { kernel: await build(fmaShader(1, "f16")), lanes: 1 },
+      "fma vec2 f16": { kernel: await build(fmaShader(2, "f16")), lanes: 2 },
+      "fma vec4 f16": { kernel: await build(fmaShader(4, "f16")), lanes: 4 },
+    } : {}),
     "workgroup reads": { kernel: await build(SHARED_SHADER), lanes: 0 },
     "global f32 reads, cached": {
       kernel: await build(globalShader(1, 262144), [{ binding: 0, resource: { buffer: cached } }]),

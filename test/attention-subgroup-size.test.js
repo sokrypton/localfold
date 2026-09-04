@@ -28,7 +28,22 @@ describe("the subgroup attention kernels' size requirement", () => {
     // The register-resident kernel is faster on every shape measured here; see
     // selectAttentionFlashKernel and tools/gpu/check-attention-variants.js.
     expect(selectAttentionFlashKernel(deviceWith(32, 32), 32, "auto").cacheKey)
-      .toBe("attention:flash-registers-32");
+      .toBe("attention:flash-registers-32-f32");
+  });
+
+  // 🔴 THE PRECISION IS IN THE CACHE KEY BECAUSE IT CHANGES THE SHADER. Two
+  // devices in one process - the checkers run both - would otherwise share a
+  // compiled pipeline whose staged chunk is the wrong width for one of them.
+  it("stages the key and value in f16 only where the device has shader-f16", () => {
+    const withF16 = deviceWith(32, 32, ["subgroups", "subgroup-size-control", "shader-f16"]);
+    expect(selectAttentionFlashKernel(withF16, 32, "auto").cacheKey)
+      .toBe("attention:flash-registers-32-chunk16");
+    expect(selectAttentionFlashKernel(deviceWith(32, 32), 32, "auto").cacheKey)
+      .toBe("attention:flash-registers-32-f32");
+    // ...and an explicit request still wins over what the device offers, which
+    // is what lets the differential checker hold the f32 kernel to 1e-5.
+    expect(selectAttentionFlashKernel(withF16, 32, "auto", "f32").cacheKey)
+      .toBe("attention:flash-registers-32-f32");
   });
 
   it("accepts a device whose range contains 32", () => {
@@ -83,7 +98,7 @@ describe("building the flash pipeline when the device refuses it", () => {
       return { key };
     } } };
     const built = await buildAttentionFlashKernel(execution, device, 32, "subgroup-key32");
-    expect(built.kernel.cacheKey).toBe("attention:flash-registers-32");
+    expect(built.kernel.cacheKey).toBe("attention:flash-registers-32-f32");
     expect(built.kernel.queryTile).toBe(64);
     expect(asked.length).toBe(2);
   });

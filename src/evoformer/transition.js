@@ -16,6 +16,8 @@ const GRID_WIDTH = 32_768;
  * `local.y`; `rowsPerLane` and `columnsPerLane` must be multiples of 4, because
  * both operands are read as vec4 in the inner loop.
  */
+export const LINEAR_PRECISIONS = new Set(["f32", "f16", "mixed"]);
+
 export const LINEAR_TILE = {
   lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
 };
@@ -215,7 +217,15 @@ export function packTransitionWeights(input) {
  * @param {{lanesX: number, lanesY: number, rowsPerLane: number, columnsPerLane: number}} tile
  * @param {boolean} residual whether the store accumulates into the output
  */
-export function createLinearShader(tile = LINEAR_TILE, residual = false) {
+export function createLinearShader(tile = LINEAR_TILE, residual = false, precision = "f32") {
+  if (!LINEAR_PRECISIONS.has(precision)) throw new RangeError(`unknown linear precision ${precision}`);
+  // The element the staged operands and the k loop work in. `mixed` multiplies
+  // in f16 and folds into an f32 accumulator once a k tile, so a long inner
+  // dimension does not accumulate in ten mantissa bits.
+  const element = precision === "f32" ? "f32" : "f16";
+  const vector = `vec4<${element}>`;
+  const folds = precision === "mixed";
+  const cast = element === "f32" ? (e) => e : (e) => `f16(${e})`;
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
   for (const [name, value] of Object.entries(tile)) {
     if (!Number.isSafeInteger(value) || value < 1) {
@@ -238,10 +248,13 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
   const sourcePerLane = Math.ceil(sourceTasks / lanes);
 
   const accumulator = (r, v) => `acc_${r}_${v}`;
+  const block = (r, v) => `blk_${r}_${v}`;
+  const target = folds ? block : accumulator;
   const declare = [];
   for (let r = 0; r < rowsPerLane; r += 1) {
     for (let v = 0; v < columnVectors; v += 1) {
-      declare.push(`  var ${accumulator(r, v)} = vec4<f32>(0.0);`);
+      declare.push(`  var ${accumulator(r, v)} = ${folds ? "vec4<f32>" : vector}(0.0);`);
+      if (folds) declare.push(`  var ${block(r, v)} = ${vector}(0.0);`);
     }
   }
 
@@ -256,7 +269,21 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
     }
     for (let r = 0; r < rowsPerLane; r += 1) {
       for (let v = 0; v < columnVectors; v += 1) {
-        inner.push(`    ${accumulator(r, v)} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+        inner.push(`    ${target(r, v)} += s_${k}_${Math.floor(r / 4)}[${r % 4}u] * w_${k}_${v};`);
+      }
+    }
+  }
+
+  // Folding a k tile's f16 partial into the f32 accumulator. One conversion and
+  // one add per accumulator per EIGHT k, so the error stays that of a sum of
+  // eight rather than of the whole inner dimension, and the arithmetic stays
+  // f16 where all of the instructions are.
+  const fold = [];
+  if (folds) {
+    for (let r = 0; r < rowsPerLane; r += 1) {
+      for (let v = 0; v < columnVectors; v += 1) {
+        fold.push(`    ${accumulator(r, v)} += vec4<f32>(${block(r, v)});`);
+        fold.push(`    ${block(r, v)} = ${vector}(0.0);`);
       }
     }
   }
@@ -274,11 +301,11 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
       let k_local = task % ${step}u;
       let k = k0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
-      var staged = vec4<f32>(0.0);
+      var staged = ${vector}(0.0);
       if (k < parameters.inner) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < parameters.rows) { staged[j] = source[row * parameters.inner + k]; }
+          if (row < parameters.rows) { staged[j] = ${cast('source[row * parameters.inner + k]')}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -288,12 +315,12 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
   const stageWeight = [];
   for (let v = 0; v < columnVectors; v += 1) {
     stageWeight.push(`    {
-      var staged = vec4<f32>(0.0);
+      var staged = ${vector}(0.0);
       if (weight_k < parameters.inner) {
         for (var j = 0u; j < 4u; j += 1u) {
           let output_column = column_origin + (${v}u * 4u + j) * ${lanesX}u;
           if (output_column < parameters.columns) {
-            staged[j] = weights[parameters.weight_offset + weight_k * parameters.columns + output_column];
+            staged[j] = ${cast('weights[parameters.weight_offset + weight_k * parameters.columns + output_column]')};
           }
         }
       }
@@ -309,7 +336,7 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
         body.push(`      {
         let output_column = column_origin + ${(v * 4 + c) * lanesX}u;
         if (output_column < parameters.columns) {
-          var value = ${accumulator(r, v)}[${c}u] + weights[parameters.bias_offset + output_column];
+          var value = f32(${accumulator(r, v)}[${c}u]) + weights[parameters.bias_offset + output_column];
           if (parameters.activation == 1u) { value = max(value, 0.0); }
           output[row_${r} * parameters.columns + output_column] ${residual ? "+=" : "="} value;
         }
@@ -324,7 +351,7 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false) {
     rowNames.push(`  let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;`);
   }
 
-  return `
+  return `${element === "f16" ? "enable f16;\n" : ""}
 struct MatmulParameters {
   rows: u32,
   inner: u32,
@@ -340,9 +367,9 @@ struct MatmulParameters {
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
 // Laid out per thread: a lane's own strided columns, contiguous where it reads.
-var<workgroup> tile_weight: array<vec4<f32>, ${step * lanesX * columnVectors}>;
+var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnVectors}>;
 
 @compute @workgroup_size(${lanesX}, ${lanesY}, 1)
 fn main(
@@ -360,6 +387,7 @@ ${stageSource.join("\n")}
 ${stageWeight.join("\n")}
     workgroupBarrier();
 ${inner.join("\n")}
+${fold.join("\n")}
     workgroupBarrier();
   }
 

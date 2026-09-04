@@ -539,8 +539,43 @@ fn main(
  * impossible rather than unlikely. head_dim is 32 in all 48 Evoformer blocks
  * and 8 in the 4 extra-MSA ones, so this generates two shaders in a fold.
  */
-export function createAttentionRegisterFlashShader(headDim, keyChunk) {
+export function createAttentionRegisterFlashShader(headDim, keyChunk, options = {}) {
   const vectors = headDim / 4;
+  // How many keys share one rescale of the accumulator, and whether the q.k
+  // reduction runs through a vec4. Both default to what this kernel always did.
+  const group = options.group ?? 1;
+  const vectorScore = options.vectorScore ?? false;
+  const lazyRescale = options.lazyRescale ?? false;
+  const queriesPerLane = options.queriesPerLane ?? 1;
+  // 🔴 THE REGISTER FILE IS WHAT THIS KERNEL IS SHORT OF, WHICH IS THE OPPOSITE
+  // OF WHAT ITS FLOP RATE SUGGESTS. Eight query vectors and eight accumulators
+  // are 64 registers a lane before anything else; two queries a lane doubles
+  // that and measures 4.7x SLOWER, and grouping the keys to save the rescale
+  // measures 2.3x slower for two more scalars. Nothing here is arithmetic
+  // bound - removing the whole per-key rescale moves it 2%.
+  //
+  // So the move is to make the state SMALLER. In f16 the query, the
+  // accumulators and both staged chunks halve: 64 registers become 32 and the
+  // 8 KiB of workgroup memory becomes 4, both of which buy occupancy, and
+  // probe-alu.js puts an f16 multiply-add at 1.7x an f32 one for the same
+  // instruction on top. The softmax state - the running max, the running sum
+  // and the logit - stays f32, because that is where the RANGE is and f16 tops
+  // out at 65504.
+  const precision = options.precision ?? "f32";
+  if (!["f32", "f16", "chunk16"].includes(precision)) {
+    throw new RangeError(`unknown attention precision ${precision}`);
+  }
+  const chunk16 = precision !== "f32";
+  const register16 = precision === "f16";
+  const chunkType = chunk16 ? "vec4<f16>" : "vec4<f32>";
+  const registerType = register16 ? "vec4<f16>" : "vec4<f32>";
+  const enable = chunk16 ? "enable f16;\n" : "";
+  if (!Number.isSafeInteger(queriesPerLane) || queriesPerLane < 1) {
+    throw new RangeError(`attention queries per lane must be positive; got ${queriesPerLane}`);
+  }
+  if (!Number.isSafeInteger(group) || group < 1) {
+    throw new RangeError(`attention key group must be a positive integer; got ${group}`);
+  }
   const each = (body) => Array.from({ length: vectors }, (_, t) => `    ${body(t)}`).join("\n");
   const declare = (name, init) => Array.from({ length: vectors },
     (_, t) => `  var ${name}${t} = ${init(t)};`).join("\n");
@@ -566,7 +601,133 @@ export function createAttentionRegisterFlashShader(headDim, keyChunk) {
   if (!Number.isSafeInteger(chunk) || chunk < 1) {
     throw new RangeError(`attention key chunk must be a positive integer; got ${chunk}`);
   }
-  return `${COMMON}
+  if (chunk % group !== 0) {
+    throw new RangeError(`attention key chunk ${chunk} is not a multiple of the group ${group}`);
+  }
+
+  // 🔴 THE q.k REDUCTION TARGET DECIDES THE ISSUE WIDTH OF HALF THIS KERNEL.
+  // `score += dot(qv_t, k_t)` names a SCALAR accumulator, so head_dim scalar
+  // multiply-adds are issued where head_dim/4 vec4 ones would do the same work
+  // - and probe-alu.js puts a vec4 multiply-add at four times a scalar one for
+  // the same instruction. Accumulating into a vec4 and folding it once at the
+  // end costs three adds a key and issues eight instructions where it issued
+  // thirty-two.
+  const scoreOf = (g, indexExpression) => (vectorScore
+    ? [`      var part${g} = ${registerType}(0.0);`,
+       ...Array.from({ length: vectors }, (_, t) =>
+         `      part${g} += qv${t} * ${register16 !== chunk16 ? `${registerType}(key_chunk[${indexExpression} + ${t}u])` : `key_chunk[${indexExpression} + ${t}u]`};`),
+       `      let score${g} = f32(part${g}.x) + f32(part${g}.y) + f32(part${g}.z) + f32(part${g}.w);`]
+    : [`      var sum${g} = 0.0;`,
+       ...Array.from({ length: vectors }, (_, t) =>
+         `      sum${g} += f32(dot(qv${t}, ${register16 !== chunk16 ? `${registerType}(key_chunk[${indexExpression} + ${t}u])` : `key_chunk[${indexExpression} + ${t}u]`}));`),
+       `      let score${g} = sum${g};`]).join("\n");
+
+  // 🔴 AND THE RESCALE IS PAID ONCE A KEY FOR A MAX THAT RARELY MOVES. The
+  // online softmax multiplies every one of head_dim/4 accumulators by
+  // exp(old_max - new_max) on every key. Taking the max of `group` keys FIRST
+  // and rescaling once for all of them leaves the arithmetic exact - it is the
+  // same associativity the key chunk already reassociates - and turns
+  // head_dim/4 multiplies a key into head_dim/(4*group).
+  //
+  // An out-of-range key is scored -1e30 so it cannot raise the group max, and
+  // its weight is selected to zero, which is what the per-key `break` did.
+  const indices = Array.from({ length: group }, (_, g) => g);
+
+  // 🔴 AND THE CHEAPEST WAY TO SKIP THE RESCALE IS TO ASK WHETHER THE MAX MOVED.
+  // Grouping the keys removes the same multiplies and pays for them in
+  // registers - the accumulators and the query already fill the file, so two
+  // more scores an iteration measured 2.3x SLOWER (bench-msa-attention.js).
+  // A branch costs nothing to hold. The running max of 512 keys is a record
+  // sequence, so it advances about H(512) ~ 7 times rather than 512, and the
+  // lanes of a workgroup are different queries only for as long as one of them
+  // is still setting records - which is early and short.
+  const lazy = lazyRescale ? [
+    `    for (var slot = 0u; slot < KEY_CHUNK; slot += 1u) {`,
+    `      let k_index = k0 + slot;`,
+    `      if (k_index >= p.queries) { break; }`,
+    `      let staged = slot * HD4;`,
+    scoreOf("", "staged"),
+    `      var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);`,
+    `      if (p.has_pair_bias != 0u) {`,
+    `        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];`,
+    `      }`,
+    `      logit = clamp(logit, -1e8, 1e8);`,
+    `      if (logit > running_max) {`,
+    `        let previous_scale = exp(running_max - logit);`,
+    `        running_sum = running_sum * previous_scale;`,
+    ...Array.from({ length: vectors }, (_, t) => `        acc${t} = acc${t} * ${narrow("previous_scale")};`),
+    `        running_max = logit;`,
+    `      }`,
+    `      let weight = exp(logit - running_max);`,
+    `      running_sum = running_sum + weight;`,
+    ...Array.from({ length: vectors }, (_, t) =>
+      `      acc${t} = acc${t} + ${narrow("weight")} * ${chunkRead(`staged + ${t}u`)};`),
+    `    }`,
+  ].join("\n") : null;
+
+  // 🔴 A KEY IS STAGED ONCE AND READ BY EVERY LANE, WHICH IS WHERE THIS KERNEL'S
+  // TIME GOES. Priced by removing the reads (bench-msa-attention.js
+  // `auto:noval`, `auto:nokey`): the sixteen workgroup vec4 reads a lane issues
+  // per key are 8.7 ms of 20.8 at 512 sequences, against 0.4 ms for both
+  // exponentials and nothing at all for the staging loop's global loads. The
+  // arithmetic is not the bound - removing the whole per-key rescale changes
+  // the time by 2% and costs more in registers than it saves.
+  //
+  // So a lane takes `queriesPerLane` queries instead of one. The staged key and
+  // value vectors are read ONCE and used for all of them, which divides the
+  // dominant term by that number; what it multiplies is the register file, and
+  // the queries and accumulators already fill most of it. That is the trade,
+  // and it is why this is a measured option rather than the shape of the
+  // kernel.
+  // A scalar narrowed to the accumulator's element, and a staged read widened
+  // to it - both no-ops when the two already agree.
+  const narrow = (e) => (register16 ? `f16(${e})` : e);
+  const chunkRead = (e) => (register16 === chunk16 ? `value_chunk[${e}]` : `${registerType}(value_chunk[${e}])`);
+  const queryIndex = (q) => `q_index_${q}`;
+  const perQuery = (body) => Array.from({ length: queriesPerLane }, (_, q) => body(q)).join("\n");
+  const multiDeclare = perQuery((q) => [
+    `  let ${queryIndex(q)} = group.x * ${64 * queriesPerLane}u + local + ${q * 64}u;`,
+    `  let live${q} = ${queryIndex(q)} < p.queries;`,
+    `  let base${q} = ((batch_index * p.queries + select(0u, ${queryIndex(q)}, live${q})) * p.heads + head) * HD4;`,
+    Array.from({ length: vectors }, (_, t) => `  var qv${q}_${t} = ${registerType}(query[base${q} + ${t}u]);`).join("\n"),
+    Array.from({ length: vectors }, (_, t) => `  var acc${q}_${t} = ${registerType}(0.0);`).join("\n"),
+    `  var running_max${q} = -1e30;`,
+    `  var running_sum${q} = 0.0;`,
+  ].join("\n"));
+
+  const multiInner = [
+    `    for (var slot = 0u; slot < KEY_CHUNK; slot += 1u) {`,
+    `      let k_index = k0 + slot;`,
+    `      if (k_index >= p.queries) { break; }`,
+    `      let staged = slot * HD4;`,
+    `      let masked = 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);`,
+    perQuery((q) => `      var part${q} = ${registerType}(0.0);`),
+    // One staged read, every query's partial sum fed from it.
+    Array.from({ length: vectors }, (_, t) => [
+      `      let kv_${t} = ${register16 === chunk16 ? `key_chunk[staged + ${t}u]` : `${registerType}(key_chunk[staged + ${t}u])`};`,
+      perQuery((q) => `      part${q} += qv${q}_${t} * kv_${t};`),
+    ].join("\n")).join("\n"),
+    perQuery((q) => [
+      `      var logit${q} = f32(part${q}.x) + f32(part${q}.y) + f32(part${q}.z) + f32(part${q}.w) + masked;`,
+      `      if (p.has_pair_bias != 0u) {`,
+      `        logit${q} += pair_bias[(head * p.queries + ${queryIndex(q)}) * p.queries + k_index];`,
+      `      }`,
+      `      logit${q} = clamp(logit${q}, -1e8, 1e8);`,
+      `      let new_max${q} = max(running_max${q}, logit${q});`,
+      `      let scale${q} = exp(running_max${q} - new_max${q});`,
+      `      let weight${q} = exp(logit${q} - new_max${q});`,
+      `      running_sum${q} = running_sum${q} * scale${q} + weight${q};`,
+      `      running_max${q} = new_max${q};`,
+    ].join("\n")),
+    Array.from({ length: vectors }, (_, t) => [
+      `      let vv_${t} = ${register16 === chunk16 ? `value_chunk[staged + ${t}u]` : `${registerType}(value_chunk[staged + ${t}u])`};`,
+      perQuery((q) => `      acc${q}_${t} = acc${q}_${t} * ${narrow(`scale${q}`)} + ${narrow(`weight${q}`)} * vv_${t};`),
+    ].join("\n")).join("\n"),
+    `    }`,
+  ].join("\n");
+
+  if (queriesPerLane > 1) {
+    return `${enable}${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
 @group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
@@ -578,8 +739,80 @@ const KEY_CHUNK: u32 = ${chunk}u;
 @group(0) @binding(6) var<uniform> p: Parameters;
 @group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
 
-var<workgroup> key_chunk: array<vec4<f32>, ${chunk * vectors}>;
-var<workgroup> value_chunk: array<vec4<f32>, ${chunk * vectors}>;
+var<workgroup> key_chunk: array<${chunkType}, ${chunk * vectors}>;
+var<workgroup> value_chunk: array<${chunkType}, ${chunk * vectors}>;
+
+fn mask_index(batch: u32, key_index: u32) -> u32 {
+  if (p.transpose == 0u) { return batch * p.queries + key_index; }
+  return key_index * p.batch + batch;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let local = local_id.x;
+  let batch_index = group.y;
+  let head = group.z;
+  if (batch_index >= p.batch || head >= p.heads) { return; }
+${multiDeclare}
+
+  for (var k0 = 0u; k0 < p.queries; k0 += KEY_CHUNK) {
+    workgroupBarrier();
+    for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
+      let k_index = min(k0 + index / HD4, p.queries - 1u);
+      let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
+      key_chunk[index] = ${chunkType}(key[k_base]);
+      value_chunk[index] = ${chunkType}(value[k_base]);
+    }
+    workgroupBarrier();
+${multiInner}
+  }
+
+${perQuery((q) => `  if (live${q}) {
+${Array.from({ length: vectors }, (_, t) =>
+  `    output[base${q} + ${t}u] = (vec4<f32>(acc${q}_${t}) / running_sum${q}) * gate[base${q} + ${t}u];`).join("\n")}
+  }`)}
+}`;
+  }
+
+  const inner = lazy ?? [
+    `    for (var slot = 0u; slot < KEY_CHUNK; slot += ${group}u) {`,
+    `      if (k0 + slot >= p.queries) { break; }`,
+    ...indices.flatMap((g) => [
+      `      let key_at${g} = k0 + slot + ${g}u;`,
+      `      let live${g} = key_at${g} < p.queries;`,
+      `      let staged${g} = (slot + ${g}u) * HD4;`,
+      scoreOf(g, `staged${g}`),
+      `      var logit${g} = score${g} + 1e9 * (mask[mask_index(batch_index, min(key_at${g}, p.queries - 1u))] - 1.0);`,
+      `      if (p.has_pair_bias != 0u) {`,
+      `        logit${g} += pair_bias[(head * p.queries + q_index) * p.queries + min(key_at${g}, p.queries - 1u)];`,
+      `      }`,
+      `      logit${g} = select(-1e30, clamp(logit${g}, -1e8, 1e8), live${g});`,
+    ]),
+    `      let group_max = ${indices.map((g) => `logit${g}`).reduce((a, b) => `max(${a}, ${b})`)};`,
+    `      let new_max = max(running_max, group_max);`,
+    `      let previous_scale = exp(running_max - new_max);`,
+    `      running_max = new_max;`,
+    ...indices.map((g) => `      let w${g} = select(0.0, exp(logit${g} - new_max), live${g});`),
+    `      running_sum = running_sum * previous_scale + ${indices.map((g) => `w${g}`).join(" + ")};`,
+    ...Array.from({ length: vectors }, (_, t) =>
+      `      acc${t} = acc${t} * ${narrow("previous_scale")}${indices.map((g) => ` + ${narrow(`w${g}`)} * ${chunkRead(`staged${g} + ${t}u`)}`).join("")};`),
+    `    }`,
+  ].join("\n");
+  return `${enable}${COMMON}
+const HD4: u32 = ${vectors}u;
+const KEY_CHUNK: u32 = ${chunk}u;
+@group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> mask: array<f32>;
+@group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
+@group(0) @binding(6) var<uniform> p: Parameters;
+@group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
+
+var<workgroup> key_chunk: array<${chunkType}, ${chunk * vectors}>;
+var<workgroup> value_chunk: array<${chunkType}, ${chunk * vectors}>;
 
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
@@ -601,8 +834,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let live = q_index < p.queries;
   let q_base = ((batch_index * p.queries + select(0u, q_index, live)) * p.heads + head) * HD4;
 
-${declare("qv", (t) => `query[q_base + ${t}u]`)}
-${declare("acc", () => "vec4<f32>(0.0)")}
+${declare("qv", (t) => `${registerType}(query[q_base + ${t}u])`)}
+${declare("acc", () => `${registerType}(0.0)`)}
   var running_max = -1e30;
   var running_sum = 0.0;
 
@@ -612,33 +845,16 @@ ${declare("acc", () => "vec4<f32>(0.0)")}
     for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
       let k_index = min(k0 + index / HD4, p.queries - 1u);
       let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
-      key_chunk[index] = key[k_base];
-      value_chunk[index] = value[k_base];
+      key_chunk[index] = ${chunkType}(key[k_base]);
+      value_chunk[index] = ${chunkType}(value[k_base]);
     }
     workgroupBarrier();
 
-    for (var slot = 0u; slot < KEY_CHUNK; slot += 1u) {
-      let k_index = k0 + slot;
-      if (k_index >= p.queries) { break; }
-      let staged = slot * HD4;
-      var score = 0.0;
-${each((t) => `score += dot(qv${t}, key_chunk[staged + ${t}u]);`)}
-      var logit = score + 1e9 * (mask[mask_index(batch_index, k_index)] - 1.0);
-      if (p.has_pair_bias != 0u) {
-        logit += pair_bias[(head * p.queries + q_index) * p.queries + k_index];
-      }
-      logit = clamp(logit, -1e8, 1e8);
-      let new_max = max(running_max, logit);
-      let previous_scale = exp(running_max - new_max);
-      let weight = exp(logit - new_max);
-      running_sum = running_sum * previous_scale + weight;
-      running_max = new_max;
-${each((t) => `acc${t} = acc${t} * previous_scale + weight * value_chunk[staged + ${t}u];`)}
-    }
+${inner}
   }
 
   if (live) {
-${each((t) => `output[q_base + ${t}u] = (acc${t} / running_sum) * gate[q_base + ${t}u];`)}
+${each((t) => `output[q_base + ${t}u] = (vec4<f32>(acc${t}) / running_sum) * gate[q_base + ${t}u];`)}
   }
 }`;
 }
@@ -648,6 +864,8 @@ ${each((t) => `output[q_base + ${t}u] = (acc${t} / running_sum) * gate[q_base + 
  * the shader as `@subgroup_size(32)` and assumed by the lane arithmetic, so it
  * is a correctness requirement and not a preference.
  */
+export const attentionFlashQueriesPerGroup = (queriesPerLane = 1) => 64 * queriesPerLane;
+
 export const ATTENTION_SUBGROUP_SIZE = 32;
 
 /**
@@ -970,8 +1188,10 @@ export function supportsAttentionSubgroup64x64(device, headDim = 32) {
  *
  * @param {{pipelines: {get: (key: string, code: string) => Promise<GPUComputePipeline>}}} execution
  */
-export async function buildAttentionFlashKernel(execution, device, headDim, requested = "auto") {
-  const kernel = selectAttentionFlashKernel(device, headDim, requested);
+export async function buildAttentionFlashKernel(
+  execution, device, headDim, requested = "auto", precision = "auto",
+) {
+  const kernel = selectAttentionFlashKernel(device, headDim, requested, precision);
   try {
     return { kernel, pipeline: await execution.pipelines.get(`block:${kernel.cacheKey}`, kernel.shader) };
   } catch (error) {
@@ -990,6 +1210,7 @@ export function selectAttentionFlashKernel(
   device,
   headDim = 32,
   requested = "auto",
+  requestedPrecision = "auto",
 ) {
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
@@ -1059,9 +1280,27 @@ export function selectAttentionFlashKernel(
   // 64 because that is the workgroup size, and the caller's dispatch already
   // divides the query count by it; batch and head stay the y and z dimensions.
   if (headDim % 4 === 0) {
+    // 🔴 AND THE STAGED KEY AND VALUE GO IN f16 WHEREVER THE DEVICE ALLOWS IT.
+    // The chunk is the kernel's largest cost and the reason is not arithmetic:
+    // priced by removing them, the sixteen workgroup reads a lane issues per
+    // key are 8.7 ms of 20.8 at 512 sequences. In f16 the chunk is 4 KiB
+    // instead of 8, which is what buys the occupancy, and column attention
+    // measures 20.83 -> 17.05 ms - 1.22x on the largest kernel in the block.
+    //
+    // 🔴 ONLY THE STAGED COPY NARROWS. The running max, the running sum, the
+    // logit and the accumulators stay f32: the softmax is where the RANGE is,
+    // and f16 tops out at 65504. Narrowing the accumulators and the query as
+    // well reaches 16.4 ms, but at relRMS 3.4e-3 against this kernel's 2.0e-4,
+    // and 0.65 ms is not worth an order of magnitude of error.
+    //
+    // 2.0e-4 is a storage format for the key and the value, not a change of
+    // model: AF2's own inference runs in bfloat16, whose eight mantissa bits
+    // put it an order of magnitude LOOSER than this.
+    const precision = requestedPrecision !== "auto" ? requestedPrecision
+      : device.features?.has("shader-f16") ? "chunk16" : "f32";
     return {
-      cacheKey: `attention:flash-registers-${headDim}`,
-      shader: createAttentionRegisterFlashShader(headDim),
+      cacheKey: `attention:flash-registers-${headDim}-${precision}`,
+      shader: createAttentionRegisterFlashShader(headDim, undefined, { precision }),
       queryTile: 64, variant,
     };
   }
@@ -1257,6 +1496,7 @@ export class AttentionGpu {
     const packed = packAttentionWeights(input);
     const flashKernel = selectAttentionFlashKernel(
       this.device, input.channels / input.heads, this.options.flashVariant ?? "auto",
+      this.options.flashPrecision ?? "auto",
     );
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),

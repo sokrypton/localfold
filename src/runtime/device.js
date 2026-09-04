@@ -36,7 +36,7 @@ const RAISED_LIMITS = [
  */
 export async function requestAlphaFoldDevice(adapter, options = {}) {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
-  const optional = ["subgroups", "subgroup-size-control", "timestamp-query"];
+  const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16"];
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature),
   );

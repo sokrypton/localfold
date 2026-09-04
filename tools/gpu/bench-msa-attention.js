@@ -92,11 +92,54 @@ export async function main(device, args) {
 
   const arms = [];
   for (const spec of armsSpec) {
-    const chunk = spec === "auto" ? undefined : Number(spec);
-    if (spec !== "auto" && (!Number.isSafeInteger(chunk) || chunk < 1)) {
+    // `32/g4v` is a key chunk, then the keys sharing one rescale (`g<n>`) and
+    // whether the q.k reduction runs through a vec4 (`v`).
+    const [armSpec, drop] = spec.split(":");
+    const [chunkSpec, shapeSpec = ""] = armSpec.split("/");
+    const chunk = chunkSpec === "auto" ? undefined : Number(chunkSpec);
+    if (chunkSpec !== "auto" && (!Number.isSafeInteger(chunk) || chunk < 1)) {
       throw new Error(`arm ${spec} is not a key chunk`);
     }
-    const shader = createAttentionRegisterFlashShader(headDim, chunk);
+    const group = Number(shapeSpec.match(/g(\d+)/)?.[1] ?? 1);
+    const vectorScore = shapeSpec.includes("v");
+    const lazyRescale = shapeSpec.includes("l");
+    const queriesPerLane = Number(shapeSpec.match(/q(\d+)/)?.[1] ?? 1);
+    const precision = shapeSpec.includes("h") ? "f16" : shapeSpec.includes("c") ? "chunk16" : "f32";
+    if (precision !== "f32" && !device.features.has("shader-f16")) { results.push({ arm: spec, skipped: "no shader-f16" }); continue; }
+    let shader = createAttentionRegisterFlashShader(headDim, chunk, { group, vectorScore, lazyRescale, queriesPerLane, precision });
+    // `:nokey` and friends remove one term to price it. They compute the wrong
+    // answer on purpose - a large relRMS is the expected report, and the number
+    // that matters is the millisecond one.
+    if (drop) {
+      const surgery = {
+        // The staged key and value reads, priced by removing the dependency.
+        nokey: [/key_chunk\[staged[^\]]*\]/g, "vec4<f32>(1e-6)"],
+        noval: [/value_chunk\[staged[^\]]*\]/g, "vec4<f32>(1e-6)"],
+        // The staging loop's own global loads.
+        nostage: [/(key_chunk\[index\] = )key\[k_base\];/g, "$1vec4<f32>(1e-6);"],
+        // Both transcendentals.
+        noexp: [/exp\(/g, "noexp("],
+        // The per-key global mask load.
+        nomask: [/mask\[mask_index\(batch_index, [^;]*?\)\]/g, "1.0"],
+      };
+      const [pattern, replacement] = surgery[drop] ?? [];
+      if (!pattern) throw new Error(`arm ${spec} names no known surgery`);
+      const patched = shader.replace(pattern, replacement);
+      if (patched === shader) throw new Error(`arm ${spec} patched nothing`);
+      shader = drop === "noexp"
+        ? patched.replace("@compute", "fn noexp(x: f32) -> f32 { return x * 1.0001; }\n@compute")
+        : patched;
+      // 🔴 REMOVING A TERM REMOVES ITS BINDING, and `layout: "auto"` then builds
+      // a layout the bind group does not match - which reports as a validation
+      // error about entry 4 rather than as anything to do with the surgery. A
+      // dead branch that names every buffer keeps the layout the shape the
+      // reference arm has, and never runs.
+      shader = shader.replace("  let local = local_id.x;", `  let local = local_id.x;
+  if (p.batch == 4294967295u) {
+    output[0] = query[0] + key[0] + value[0] + gate[0]
+      + vec4<f32>(mask[0]) + vec4<f32>(pair_bias[0]);
+  }`);
+    }
     const pipeline = await device.createComputePipelineAsync({
       layout: "auto",
       compute: { module: device.createShaderModule({ code: shader }), entryPoint: "main" },
@@ -106,7 +149,7 @@ export async function main(device, args) {
       entries: [query, key, value, gate, mask, pairBias, parameters, output]
         .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
-    arms.push({ spec, pipeline, bindGroup, times: [] });
+    arms.push({ spec, pipeline, bindGroup, queriesPerLane, times: [] });
   }
 
   const run = async (arm) => {
@@ -115,7 +158,7 @@ export async function main(device, args) {
     pass.setPipeline(arm.pipeline);
     pass.setBindGroup(0, arm.bindGroup);
     for (let i = 0; i < iterations; i += 1) {
-      pass.dispatchWorkgroups(Math.ceil(queries / 64), batch, heads);
+      pass.dispatchWorkgroups(Math.ceil(queries / (64 * arm.queriesPerLane)), batch, heads);
     }
     pass.end();
     const start = performance.now();

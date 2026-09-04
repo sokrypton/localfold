@@ -220,9 +220,17 @@ export async function main(device, args) {
   const results = [];
   const arms = [];
   for (const spec of armsSpec) {
-    const [tileSpec, drop] = spec.split(":");
+    // `8x8@f16` names a tile and the element its k loop works in; the suffix is
+    // optional and `f32` is what every arm meant before it existed.
+    const [tileAndPrecision, drop] = spec.split(":");
+    const [tileSpec, precision = "f32"] = tileAndPrecision.split("@");
+    if (precision !== "f32" && !device.features.has("shader-f16")) {
+      results.push({ arm: spec, skipped: "no shader-f16" });
+      continue;
+    }
     let shader; let tile;
     if (tileSpec === "legacy") {
+      if (precision !== "f32") throw new Error("the legacy kernel has no precision option");
       shader = LEGACY_SHADER;
       tile = LEGACY_TILE;
     } else {
@@ -232,7 +240,7 @@ export async function main(device, args) {
         ? parts : [8, 8, ...parts];
       if (columnsPerLane === undefined) throw new Error(`arm ${spec} is not a tile`);
       const descriptor = { lanesX, lanesY, rowsPerLane, columnsPerLane };
-      shader = createLinearShader(descriptor, false);
+      shader = createLinearShader(descriptor, false, precision);
       tile = {
         rows: descriptor.lanesY * descriptor.rowsPerLane,
         columns: descriptor.lanesX * descriptor.columnsPerLane,

@@ -146,7 +146,34 @@ export async function main(device, args) {
     },
   };
 
-  const { output } = await new AttentionGpu(device).run(input);
+  // 🔴 THE f16 PATH IS A DIFFERENT KERNEL AND GETS ITS OWN BOUND, NOT A LOOSER
+  // ONE ON THE f32 KERNEL. The default flash kernel stages the key and the
+  // value in f16 wherever the device has shader-f16, which is a storage format
+  // with eleven significant bits - so holding it to f32's 1e-5 asserts
+  // something it cannot be true of, and RAISING that bound would stop the f32
+  // kernel being checked at all. Both are run, each against the same CPU
+  // reference, each at the tolerance its arithmetic implies.
+  const precisions = option(args, "precision", "f32,auto").split(",");
+  const bounds = { f32: 1e-5, chunk16: 2e-3, f16: 8e-3 };
+  const results = [];
+  let failed = 0;
+  for (const requested of precisions) {
+    const precision = requested !== "auto" ? requested
+      : device.features.has("shader-f16") ? "chunk16" : "f32";
+    if (precision !== "f32" && !device.features.has("shader-f16")) continue;
+    if (results.some((r) => r.precision === precision)) continue;
+    results.push(await check(device, input, precision, bounds[precision]));
+  }
+  for (const result of results) if (!result.ok) failed += 1;
+  if (failed > 0) {
+    throw new Error(`${failed} attention precision(s) outside tolerance`);
+  }
+  return { batch, queryLength, channels, heads, results };
+}
+
+async function check(device, input, precision, bound) {
+  const { batch, queryLength, channels, heads } = input;
+  const { output } = await new AttentionGpu(device, { flashPrecision: precision }).run(input);
   const expected = reference(input);
   let error = 0;
   let scale = 0;
@@ -157,10 +184,9 @@ export async function main(device, args) {
     worst = Math.max(worst, Math.abs(output[i] - expected[i]));
   }
   const relRms = Math.sqrt(error / scale);
-  const bound = 1e-5;
   const ok = relRms <= bound;
-  console.log(`${ok ? "PASS" : "FAIL"}\tbatch ${batch} queries ${queryLength} heads ${heads}`
-    + ` dim ${dimension}\trelRMS ${relRms.toExponential(2)}\tworst ${worst.toExponential(2)}`);
-  if (!ok) throw new Error(`attention relRMS ${relRms.toExponential(2)} exceeds ${bound}`);
-  return { batch, queryLength, channels, heads, relRms, worst, ok };
+  console.log(`${ok ? "PASS" : "FAIL"}\t${precision}\tbatch ${batch} queries ${queryLength}`
+    + ` heads ${heads}\trelRMS ${relRms.toExponential(2)}\tworst ${worst.toExponential(2)}`
+    + `\tbound ${bound.toExponential(0)}`);
+  return { precision, bound, relRms, worst, ok };
 }
