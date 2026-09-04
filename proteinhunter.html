@@ -1,0 +1,206 @@
+<!--
+proteinhunter.html
+------------------
+AI Context: THE DESIGN LOOP'S ENTRY POINT
+- Protein Hunter (biorxiv 2025.10.10.681530) in the browser: fold a mostly-X
+  sequence, redesign it with MPNN off the prediction, fold again, keep the best
+  cycle.
+- The method is src/design/hunter-loop.js and knows nothing about this file.
+  web/hunter.js is the wiring: it reads these controls and supplies a real fold
+  and a real design.
+- Modelled on single.html, which is the precedent for a second page reusing
+  index.html's shell: the same stylesheet, the same py2Dmol embed, one module
+  script of its own.
+-->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LocalFold · Protein Hunter</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+    <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
+    <link rel="stylesheet" href="./web/localfold.css">
+    <!-- 🔴 max-width, NOT width, AND THAT IS THE WHOLE POINT. py2Dmol's embed
+         writes the viewer box's width inline, and AN INLINE WIDTH IS ONE NO
+         STYLESHEET CAN OVERRIDE - not a media query, not any specificity, only
+         `!important`, and a page whose responsive rules all need that has no
+         cascade left. `max-width` is a DIFFERENT PROPERTY: it constrains the
+         used width whatever the inline value says. single.html carries the
+         same block for the same reason; see tools/mobile-layout.py. -->
+    <style>
+        #canvasContainer { width: 948px !important; max-width: 100%; min-height: 480px !important; resize: none !important; }
+        #canvasContainer > #viewer { max-width: 100%; overflow-x: auto; }
+
+        /* The controls are a two-column grid of label/field pairs that
+           collapses to one column when there is no room, which is the only
+           responsive rule this page needs of its own. */
+        .hunt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 12px; margin-top: 8px; }
+        .hunt-field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+        .hunt-field label { font-size: 11px; font-weight: 500; color: #64748b; margin: 0; }
+        .hunt-field input[type="number"], .hunt-field input[type="text"] {
+            height: 28px; padding: 0 6px; font-size: 13px; border: 1px solid #cbd5e1;
+            border-radius: 4px; background: #f8fafc; color: #0f172a; min-width: 0; }
+        .hunt-check { flex-direction: row; align-items: center; gap: 6px; }
+        .hunt-check label { font-size: 12px; }
+
+        /* 🔴 THE TABLE SCROLLS INSIDE ITS OWN CARD. A designed sequence is 150
+           characters of monospace and there is one per cycle; without this the
+           widest row sets the LAYOUT VIEWPORT and a phone renders the whole
+           page zoomed out - which no "does it overflow" check can see, because
+           under mobile emulation the viewport grows rather than overflowing. */
+        #results { overflow-x: auto; }
+        #results table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        #results th, #results td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
+        #results th { font-weight: 600; color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+        #results tbody tr { cursor: pointer; }
+        #results tbody tr:hover { background: #f1f5f9; }
+        #results tbody tr.best { background: #ecfdf5; font-weight: 600; }
+        #results td.sequence { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+    </style>
+</head>
+
+<body class="bg-gray-50 text-gray-800 font-sans p-4">
+
+    <div id="viewer-root" class="mx-auto page-width" style="position: relative;">
+
+        <div class="page-head" style="padding-right: 0;">
+            <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">protein hunter</span></h1>
+        </div>
+
+        <div id="fold-panel" class="container-box page-width" style="margin-bottom: 10px;">
+            <div class="fetch-panel">
+                <div class="fetch-row" id="fold-input-container">
+                    <!-- THE TARGET, AND ONLY THE TARGET. The designed chain is
+                         not written here because it does not exist yet: the
+                         loop draws it, mostly as X, and replaces it every
+                         cycle. Leave this empty to hallucinate a monomer. -->
+                    <textarea id="target" rows="2" spellcheck="false" aria-label="Target sequence"
+                        placeholder="Paste the target sequence, chains separated by : — or leave empty to hallucinate a monomer"></textarea>
+                    <div class="fold-actions" style="width: 96px; min-width: 96px; max-width: 96px; flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px;">
+                        <button id="hunt" class="btn btn-primary" style="width: 100%; height: 32px; justify-content: center; font-size: 13px;">
+                            <i class="fa-solid fa-crosshairs"></i>
+                            <span>Hunt</span>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="hunt-grid">
+                    <div class="hunt-field" style="grid-column: span 2;">
+                        <label for="start-sequence">Binder start sequence (optional)</label>
+                        <input type="text" id="start-sequence" spellcheck="false" placeholder="empty — draw one">
+                    </div>
+                    <div class="hunt-field" id="length-range" style="grid-column: span 2; flex-direction: row; gap: 8px;">
+                        <div class="hunt-field" style="flex: 1;">
+                            <label for="min-length">Shortest</label>
+                            <input type="number" id="min-length" min="4" max="600" step="1" value="60">
+                        </div>
+                        <div class="hunt-field" style="flex: 1;">
+                            <label for="max-length">Longest</label>
+                            <input type="number" id="max-length" min="4" max="600" step="1" value="90">
+                        </div>
+                    </div>
+                    <div class="hunt-field">
+                        <label for="runs">Designs</label>
+                        <input type="number" id="runs" min="1" max="50" step="1" value="1">
+                    </div>
+                    <div class="hunt-field">
+                        <label for="cycles">Cycles</label>
+                        <input type="number" id="cycles" min="0" max="20" step="1" value="3">
+                    </div>
+                    <!-- The reference's default is 90: nine positions in ten
+                         start unknown, so the first fold is very nearly a pure
+                         hallucination and the loop has somewhere to go. -->
+                    <div class="hunt-field">
+                        <label for="percent-x">Unknown %</label>
+                        <input type="number" id="percent-x" min="0" max="100" step="5" value="90">
+                    </div>
+                    <div class="hunt-field">
+                        <label for="temperature">MPNN temperature</label>
+                        <input type="number" id="temperature" min="0.001" max="1" step="0.01" value="0.1">
+                    </div>
+                    <div class="hunt-field">
+                        <label for="steps">Sampler steps</label>
+                        <input type="number" id="steps" min="8" max="64" step="8" value="16">
+                    </div>
+                    <div class="hunt-field">
+                        <label for="omit">Omit</label>
+                        <input type="text" id="omit" spellcheck="false" value="C">
+                    </div>
+                    <div class="hunt-field">
+                        <label for="seed">Seed</label>
+                        <input type="number" id="seed" min="0" step="1" value="0">
+                    </div>
+                    <div class="hunt-field hunt-check">
+                        <input type="checkbox" id="alanine-bias">
+                        <label for="alanine-bias">Alanine bias ramp</label>
+                    </div>
+                </div>
+
+                <div id="status-row">
+                    <div id="status-message">Ready. Press Hunt to design a binder.</div>
+                    <progress id="progress" max="1" value="0" data-state="idle"></progress>
+                </div>
+            </div>
+        </div>
+
+        <div id="mainContainer" class="page-width" style="display: flex; flex-direction: column; gap: 8px;">
+            <div id="canvasContainer" class="container-box" style="position: relative; width: 948px; min-height: 480px; padding: 0; overflow: hidden; background: #ffffff; border-radius: 8px;">
+                <div id="viewer" style="width: 100%; min-height: 480px; background: #ffffff;">
+                    <p class="viewer-empty" style="display: grid; place-items: center; height: 480px; margin: 0; color: #94a3b8; font-size: 13px;">Press Hunt to start designing.</p>
+                </div>
+                <button id="orient" class="btn btn-secondary" type="button" title="Best view"
+                    style="position: absolute; top: 10px; right: 10px; z-index: 10; font-size: 12px; height: 28px; padding: 0 10px;" hidden>
+                    <i class="fa-solid fa-arrows-to-dot" style="margin-right: 4px;"></i> Orient
+                </button>
+            </div>
+
+            <!-- EVERY CYCLE, NOT JUST THE ANSWER. A run that ends badly is
+                 still worth reading - which cycle it peaked at says whether
+                 more cycles would help - and clicking a row puts that cycle's
+                 structure back in the viewer. -->
+            <div id="results" class="container-box page-width" style="padding: 8px;" hidden>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Design</th><th>Cycle</th><th>Score</th><th>On</th>
+                            <th>pLDDT</th><th>ipTM</th><th>Ala</th><th>Sequence</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body"></tbody>
+                </table>
+            </div>
+
+            <div id="downloads" style="display: flex; gap: 8px; flex-wrap: wrap;" hidden>
+                <button id="download-fasta" class="btn btn-grey btn-small" type="button">
+                    <i class="fa-solid fa-download" style="margin-right: 4px;"></i> Best sequence
+                </button>
+                <button id="download-pdb" class="btn btn-grey btn-small" type="button">
+                    <i class="fa-solid fa-download" style="margin-right: 4px;"></i> Best structure
+                </button>
+                <button id="download-csv" class="btn btn-grey btn-small" type="button">
+                    <i class="fa-solid fa-table" style="margin-right: 4px;"></i> All cycles (CSV)
+                </button>
+            </div>
+        </div>
+
+        <footer style="margin-top: 24px; padding-top: 12px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #64748b; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 4px 12px;">
+            <div style="display: flex; flex-wrap: wrap; gap: 4px 12px;">
+                <a href="./" style="color: #3b82f6; text-decoration: none; font-weight: 500;">Fold a structure</a>
+                <span>·</span>
+                <a href="https://github.com/yehlincho/Protein-Hunter" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Method</a>
+                <span>·</span>
+                <a href="https://github.com/sokrypton/localfold" target="_blank" rel="noopener noreferrer" style="color: #3b82f6; text-decoration: none;">Source</a>
+            </div>
+            <div id="gpu-summary" data-state="checking">Checking WebGPU…</div>
+        </footer>
+
+    </div>
+
+    <script src="./web/vendor/py2Dmol.embed.min.js"></script>
+    <script type="module" src="./web/hunter.js"></script>
+</body>
+
+</html>

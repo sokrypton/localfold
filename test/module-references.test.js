@@ -36,9 +36,24 @@ function stripCommentsAndStrings(source) {
     .replace(/"(?:\\.|[^"\\\n])*"/g, " ");
 }
 
+/**
+ * 🔴 THE VENDORED MPNN MIRROR IS NOT THIS REPOSITORY'S CODE AND IS SKIPPED.
+ * Two reasons, and the second is the one that matters. It reports a false
+ * positive - `accel.js` reaches `useAccelerator` through
+ * `const { useAccelerator } = await import("./ops.js")`, which this scanner's
+ * import patterns do not model - and there is nothing to be done about it
+ * here, because src/design/mpnn/ is a MIRROR: editing it is reverted by the
+ * next `python3 tools/sync-mpnn.py`. And its exports would otherwise join
+ * `projectExports`, so common names it ships (`linear`, `softmax`,
+ * `layerNorm`) would start being looked for in every unrelated file.
+ * test/mpnn-vendored.test.js is what holds that directory to anything.
+ */
+const VENDORED = join("src", "design", "mpnn");
+
 function walk(directory, out = []) {
   for (const entry of readdirSync(directory)) {
     const path = join(directory, entry);
+    if (path === VENDORED) continue;
     if (statSync(path).isDirectory()) walk(path, out);
     else if (entry.endsWith(".js") && !entry.endsWith(".min.js")) out.push(path);
   }

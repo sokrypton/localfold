@@ -318,10 +318,12 @@ def main():
 
     write_probe()
     write_probe("single.html", os.path.join(ROOT, "_mobile-single.html"))
+    write_probe("proteinhunter.html", os.path.join(ROOT, "_mobile-hunter.html"))
     httpd = serve()
     proc = ws = None
     results = {}
     single = {}
+    hunter = {}
     try:
         proc, ws = launch(DBG, PROFILE)
         ws.call("Page.enable")
@@ -364,10 +366,74 @@ def main():
                 sequence: Math.round(document.getElementById('sequence')
                                              .getBoundingClientRect().width)}))()""", False)
             single[name]["asked"] = w
+            # ===== AND THE DESIGN PAGE, which is the same shell again with a
+            # grid of controls and a results table under the viewer. The table
+            # is the new risk: a designed sequence is 150 monospace characters
+            # and there is one per cycle, so without `overflow-x: auto` on its
+            # card the widest ROW would set the layout viewport - which reads
+            # as the whole page zoomed out rather than as anything overflowing.
+            # Measured with the table EMPTY, because that is the page as it is
+            # first met; the rule that contains it is on the card either way.
+            ws.call("Page.navigate", url="http://127.0.0.1:%d/_mobile-hunter.html" % PORT)
+            wait_for(ws, "!!document.getElementById('hunt')",
+                     what="proteinhunter.html to load")
+            evaluate(ws, "new Promise(r => requestAnimationFrame("
+                         "() => setTimeout(() => r(1), 300)))")
+            # 🔴 WITH A ROW IN IT. An empty table cannot squeeze anything,
+            # and the row is the whole risk: eight cells of `white-space:
+            # nowrap` with a 150-character monospace sequence in the last one.
+            # Measured empty this check passed while the populated page pushed
+            # the layout viewport to 1100 on a 320px phone.
+            evaluate(ws, """(() => {
+                const body = document.getElementById('results-body');
+                const cells = ['1', '3', '0.812', 'iptm', '87.4', '0.812', '5%',
+                    'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
+                    + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
+                    + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'];
+                for (let i = 0; i < 4; i += 1) {
+                    const row = document.createElement('tr');
+                    for (const [index, text] of cells.entries()) {
+                        const cell = document.createElement('td');
+                        cell.textContent = text;
+                        if (index === cells.length - 1) cell.className = 'sequence';
+                        row.append(cell);
+                    }
+                    body.append(row);
+                }
+                document.getElementById('results').hidden = false;
+                document.getElementById('downloads').hidden = false;
+                return body.children.length;
+            })()""", False)
+            evaluate(ws, "new Promise(r => requestAnimationFrame("
+                         "() => setTimeout(() => r(1), 200)))")
+            hunter[name] = evaluate(ws, """(() => {
+                const box = (id) => Math.round(
+                    document.getElementById(id).getBoundingClientRect().width);
+                return {
+                    viewport: innerWidth,
+                    overflow: document.documentElement.scrollWidth - innerWidth,
+                    shell: box('viewer-root'),
+                    viewer: box('canvasContainer'),
+                    target: box('target'),
+                    // 🔴 THE NARROWEST FIELD OF THE CONTROL GRID, NOT THE GRID.
+                    // A `1fr` track squeezed to nothing is invisible to every
+                    // fit check - the entity row's sequence box measured 0px at
+                    // 320 while every one of them passed - and an auto-fit grid
+                    // is exactly the construct that does it.
+                    // ...text and number fields only. A checkbox is 13px on
+                    // purpose and would be the minimum at every width, which
+                    // is a floor that can never move and so measures nothing.
+                    field: Math.min(...[...document.querySelectorAll(
+                        '.hunt-field input:not([type=checkbox])')].map((el) =>
+                            Math.round(el.getBoundingClientRect().width))),
+                };
+            })()""", False)
+            hunter[name]["asked"] = w
     finally:
         if proc: proc.kill()
         httpd.shutdown()
-        for stale in (PROBE, os.path.join(ROOT, "_mobile-single.html")):
+        for stale in (PROBE, os.path.join(ROOT, "_mobile-single.html"),
+                      os.path.join(ROOT, "_mobile-hunter.html")):
             if os.path.exists(stale): os.remove(stale)
         import shutil
         shutil.rmtree(PROFILE, ignore_errors=True)
@@ -509,6 +575,32 @@ def main():
         elif S["shell"] != 948 or S["viewer"] != 948:
             bad.append("single.html on the desktop: shell %d, viewer %d - both were 948"
                        % (S["shell"], S["viewer"]))
+
+    print("proteinhunter.html:")
+    for name in ("320px", "360px", "390px", "desktop"):
+        H = hunter[name]
+        print("   %-8s asked %d, innerWidth %d, shell %d, viewer %d, target box %d,"
+              " narrowest field %d"
+              % (name, H["asked"], H["viewport"], H["shell"], H["viewer"],
+                 H["target"], H["field"]))
+        if name != "desktop":
+            if H["viewport"] > H["asked"] + 8:
+                bad.append("proteinhunter.html at %s: the layout viewport is %d - it"
+                           " could not fit and renders zoomed out"
+                           % (name, H["viewport"]))
+            if H["viewer"] > H["asked"]:
+                bad.append("proteinhunter.html at %s: the viewer box is %dpx on a %dpx"
+                           " device" % (name, H["viewer"], H["asked"]))
+            if H["target"] < 100:
+                bad.append("proteinhunter.html at %s: the target box is %dpx wide"
+                           % (name, H["target"]))
+            if H["field"] < 40:
+                bad.append("proteinhunter.html at %s: a control-grid field is %dpx"
+                           " wide - the auto-fit track collapsed"
+                           % (name, H["field"]))
+        elif H["shell"] != 948 or H["viewer"] != 948:
+            bad.append("proteinhunter.html on the desktop: shell %d, viewer %d - both"
+                       " were 948" % (H["shell"], H["viewer"]))
 
     D = results["desktop"]
     if D["overflow"] > 1:

@@ -38,7 +38,7 @@ DOMAIN = "localfold.org"
 
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
-FILES = [".nojekyll", "index.html", "single.html", "dev.html"]
+FILES = [".nojekyll", "index.html", "single.html", "proteinhunter.html", "dev.html"]
 DIRECTORIES = ["web", "src"]
 
 # ...and never these, wherever they appear.

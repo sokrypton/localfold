@@ -13,8 +13,18 @@
 /* THE SEQUENCE BOX IS THE FETCH BOX, one line taller. py2Dmol's #fetch-id is
    the shape a reader already associates with "the thing you type into", so this
    copies it rather than inventing a second look: same border, radius, focus
-   colour and flex-grow, with the height and the monospace a sequence needs. */
-#sequence {
+   colour and flex-grow, with the height and the monospace a sequence needs.
+
+   🔴 AND #target IS THE SAME BOX ON proteinhunter.html, WHICH IS WHY IT IS
+   NAMED HERE RATHER THAN RESTYLED THERE. A bare <textarea> in a .fetch-row has
+   no flex-grow, so it takes its DEFAULT intrinsic width and stops: measured at
+   183px inside a 948px shell, on every viewport width alike, which reads as a
+   box that simply does not know it is in a layout. The three declarations that
+   fix it - box-sizing, flex-grow, min-width - are the same three, so a second
+   copy of this rule under another id would be a second thing to keep in step
+   with the narrow block below. */
+#sequence,
+#target {
   /* ...BORDER-BOX, because these carry padding and a border and are sized
      against their container. Without it a width:100% box is its padding wider
      than the panel it sits in, and overflows by exactly that much. */
@@ -34,8 +44,10 @@
   color: #111827;
 }
 
-#sequence:hover { border-color: #9ca3af; }
-#sequence:focus { outline: none; border-color: #3b82f6; }
+#sequence:hover,
+#target:hover { border-color: #9ca3af; }
+#sequence:focus,
+#target:focus { outline: none; border-color: #3b82f6; }
 
 /* ...and the alignment box, on its own full-width line inside the options so
    the option columns beside it keep their measure. */
