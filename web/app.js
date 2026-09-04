@@ -857,62 +857,6 @@ function setFoldButton(state) {
   if (icon !== null) icon.className = running ? "fa-solid fa-stop" : "fa-solid fa-cubes";
   const label = button.querySelector("span");
   if (label !== null) label.textContent = running ? "Stop" : "Fold";
-  if (!running) refreshFoldButton();
-}
-
-/**
- * Everything a fold's RESULT depends on, as one string.
- *
- * 🔴 THE SEED IS A CONTROL, NOT A DRAW, WHICH IS WHAT MAKES THIS SOUND. If the
- * page rolled a fresh seed per fold then re-folding would legitimately produce
- * a different structure and there would be nothing to grey out. It does not:
- * `random-seed` is read from the input and defaults to 0, and both samplers
- * are seeded from it - so the same inputs give the same answer, exactly.
- *
- * 🔴 AND IT IS THE FOLD'S INPUTS, NOT THE PAGE'S. The viewer's own controls -
- * the colour ramp, the clip slider, which object is shown - change what is on
- * screen and not what the model computes, so they are deliberately absent.
- * Getting that wrong in the other direction is the dangerous one: a control
- * the fold reads and this does not would leave the button greyed out over a
- * change that matters.
- */
-function foldSignature() {
-  const value = (id) => document.getElementById(id)?.value ?? "";
-  const upload = document.getElementById("msa-file");
-  return JSON.stringify({
-    entities: entityList.read(),
-    family: value("model-family"),
-    recycles: value("recycles"),
-    seed: value("random-seed"),
-    maxMsa: value("max-msa"),
-    msaMode: value("msa-mode"),
-    af3Mode: value("af3-mode"),
-    af3Count: value("af3-count"),
-    // ...an uploaded alignment is an input too, and it is not in any <select>.
-    msaFile: upload?.files?.[0]
-      ? `${upload.files[0].name}:${upload.files[0].size}` : "",
-  });
-}
-
-/** The inputs the last completed fold ran on, or null before there is one. */
-let foldedSignature = null;
-
-/**
- * Grey the button out when folding again would recompute the same answer.
- *
- * 🔴 IT IS A DISABLED BUTTON, NOT A REFUSED CLICK. The fold is deterministic
- * in its inputs, so pressing Fold with nothing changed spends the whole cost
- * again to redraw what is already on screen - and on a complex that is
- * minutes. Saying so on the button is cheaper than saying it afterwards.
- */
-function refreshFoldButton() {
-  const button = document.getElementById("predict");
-  if (button === null || activeFold !== undefined) return;
-  const same = foldedSignature !== null && foldedSignature === foldSignature();
-  button.disabled = same;
-  button.title = same
-    ? "Nothing has changed since the last fold, which would give the same answer"
-    : "";
 }
 
 /**
@@ -1546,12 +1490,6 @@ async function fold(event) {
   const controller = new AbortController();
   const { signal } = controller;
   activeFold = controller;
-  // 🔴 TAKEN AT THE START, NOT AT THE END. What this fold RAN on is what the
-  // button has to compare against, and a reader who edits a control while the
-  // fold is running has changed the inputs for the NEXT one - so reading the
-  // signature afterwards would grey the button out over an edit that has not
-  // been folded yet.
-  const ranOn = foldSignature();
   setFoldButton("running");
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
@@ -1937,11 +1875,6 @@ async function fold(event) {
     const finalIptmText = final.confidence.iptm !== undefined ? ` · ipTM ${Number(final.confidence.iptm).toFixed(3)}` : "";
     status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`
       + ` · pTM ${final.confidence.ptm.toFixed(3)}${finalIptmText}${converged}`);
-    // ...and only a fold that FINISHED counts. A stopped or failed one leaves
-    // the button live, because pressing it again is exactly what a reader
-    // wants after either - so this is the last line of the try rather than
-    // anything in the catch or the finally.
-    foldedSignature = ranOn;
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");
@@ -2001,15 +1934,6 @@ async function foldWithoutCeiling() {
 }
 
 element("predict").addEventListener("click", (event) => void fold(event));
-
-// 🔴 ONE LISTENER ON THE DOCUMENT, NOT ONE PER CONTROL. The fold reads eight
-// controls and an entity list whose rows are added and removed at runtime, so
-// binding each would leave the newest row unwatched - which is the row someone
-// is most likely to be editing. `input` and `change` both bubble; the handler
-// is a string comparison, so running it on every keystroke costs nothing.
-for (const event of ["input", "change"]) {
-  document.addEventListener(event, () => refreshFoldButton(), true);
-}
 // ...and only now is it safe to press. See the note on the button in index.html:
 // it ships disabled, because until this line runs a click is silently a no-op.
 element("predict").disabled = false;
