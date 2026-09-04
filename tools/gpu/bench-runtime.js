@@ -21,6 +21,27 @@
  * the pairformer does not read the alignment, so its cost is a function of
  * tokens alone; the MSA stack is linear in rows at fixed tokens. Both are
  * checked here rather than assumed.
+ *
+ * 🔴 ONE RUN OF THIS CANNOT FIT THE MODEL, AND THE REASON IS THE DRIFT THIS
+ * REPO WARNS ABOUT EVERYWHERE ELSE. Running everything in one process was meant
+ * to defeat it - and does, for two arms measured back to back. It does not for
+ * a sweep that takes two minutes, because the shapes run in SEQUENCE and the
+ * drift accumulates across them. Two runs of this file, same tree, same
+ * machine, on the identical shapes:
+ *
+ *     AF3 trunk    59 tokens  +0.7%   128 -22.9%   192 -33.2%   256 -37.7%
+ *     AF3 denoiser 59         -5.7%   128 -14.4%   192 -21.8%   256 -30.3%
+ *     AF2 stack    59        -39.6%   128 -33.3%   192 -20.6%   256 +10.5%
+ *
+ * AF3 got uniformly faster and AF2 uniformly slower between the two, which is
+ * not a property of either model. A fit over one of these columns puts a 3x
+ * error into the exponent - the L^3 term came out 3x apart between the runs.
+ *
+ * So: to refit, INTERLEAVE the shapes the way tools/gpu/bench-ab.js interleaves
+ * its arms, and take medians over several rounds. Until then the constants in
+ * src/runtime/cost-model.js stay where they are, and the check that they are
+ * still good enough is tools/gpu/probe-progress-bar.js, which measures the bar
+ * against the clock rather than the model against a bench.
  */
 import { EvoformerStackGpu } from "../../src/evoformer/stack.js";
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";

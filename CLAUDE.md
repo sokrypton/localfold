@@ -206,6 +206,15 @@ pass is unmeasurable; totals over many passes are fine.
 process, or take a median of many calls - `bench-head.js` medians nine. A single
 run of each is not a comparison.
 
+🔴 **AND ONE PROCESS IS NOT ENOUGH IF THE PROCESS IS LONG.** "Run both arms in
+one process" defeats the drift for two things measured back to back, and not for
+a sweep that takes two minutes: the shapes run in sequence and the drift
+accumulates across them. Two runs of `bench-runtime.js` on the identical shapes
+disagreed by **-38% on AF3's trunk at 256 tokens and +25% on AF2's stack at 128
+rows**, in opposite directions, which is not a property of either model - and a
+fit over one of those columns moves the cubic term by 3x. Interleave the shapes,
+not just the arms, and take medians.
+
 ## Hosting the weights somewhere other than Pages
 
 GitHub Pages publishes at most a gigabyte, and the weights are most of it: AF2
