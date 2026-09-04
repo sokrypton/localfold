@@ -439,6 +439,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
     tokensToQueries: batch.tokensToQueries,
     tokensToKeys: batch.tokensToKeys,
   };
+  // 🔴 TWO CYCLES, NOT ONE. A single call from sigma0 is the head's
+  // conditional mean under a lot of noise and it LOOKS it - the backbone is
+  // there but loose. The second cycle costs one more denoiser call, which is
+  // 0.11 s at 58 tokens against a trunk pass of seconds, and is the difference
+  // between a preview that reads as a structure and one that reads as a
+  // mistake. More than two buys little: the schedule is walked in whatever
+  // number of steps it is given, so the preview is a coarse walk either way.
+  const PREVIEW_CYCLES = 2;
   // 🔴 ONE HEAD FOR THE WHOLE FOLD, because building one compiles its
   // pipelines - 730 ms, flat in the shape - and a preview per recycle would
   // pay that every pass. Built only when something asks for previews; the
@@ -515,7 +523,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
           // reasons at once and the sequence was not monotone - measured 20.2,
           // 23.1, 28.2 then 15.1 on a four-pass fold, which reads as the model
           // getting worse when it was the draw that moved.
-          { cycles: 1, head, normal: normalFrom(options.seed ?? 20260831),
+          { cycles: PREVIEW_CYCLES, head, normal: normalFrom(options.seed ?? 20260831),
             ...(options.schedule ?? {}) });
         await options.onPreview({ positions: preview, pass, passes: recycles + 1 });
       } catch (cause) {
