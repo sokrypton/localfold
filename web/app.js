@@ -47,6 +47,7 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
+import { describeCoverage, fetchStructure } from "./template-source.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 const element = (id) => {
   const value = document.getElementById(id);
@@ -64,6 +65,12 @@ const entityList = createEntityList(
   // still has something foldable in it on arrival.
   { initial: [{ type: "protein", copies: 1,
     value: "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK" }] });
+
+// 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
+// built by entity-ui.js and their model is a closure; a harness that wrote into
+// a row's field would leave that model behind the DOM, and the fold would run
+// on what the model still held. `set` is the same call the paste path makes.
+window.__entityList = entityList;
 
 // 🔴 THE ENTITY LIST IS THE INPUT NOW, and everything below it still reads a
 // colon-joined sequence: expandEntities turns copies into repeated chains and
@@ -1019,7 +1026,7 @@ const cheapHash = (text) => {
  * pLDDT and PAE, and that is the frame the page lands on.
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
-                           modifications = [], chainKinds = []) {
+                           modifications = [], chainKinds = [], templates = []) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -1189,6 +1196,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse,
+    // 🔴 TEXT AND A CHAIN, NOT A SLOT. foldAf3 places them, because a slot is
+    // indexed by TOKEN and a modified residue is several tokens - so a chain's
+    // first token is not the sum of the preceding chains' residue counts, and
+    // only the featuriser knows the difference.
+    templates,
     // 🔴 CACHED WHEN THE TRUNK EXISTS, NOT WHEN THE FOLD FINISHES. This used to
     // be written after foldAf3 resolved, so a fold that hit the memory ceiling
     // in the SAMPLER threw the trunk away with the exception and "Fold anyway"
@@ -1449,6 +1461,18 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
   detail.push(`${recycles + 1} pass${recycles === 0 ? "" : "es"}`);
   detail.push(`pLDDT ${result.meanPlddt.toFixed(1)}`);
+  // 🔴 THE COVERAGE GOES BACK ON THE ROW THAT ASKED FOR IT, and is the only
+  // thing that says a template arrived: a fold that lost one folds and scores,
+  // and the number is merely different. `origin` is the entity's own object -
+  // see expandEntities - so this reaches the popup the reader opened.
+  (result.templateCoverage ?? []).forEach((coverage, index) => {
+    const described = describeCoverage(coverage);
+    if (templates[index]?.origin !== undefined) {
+      templates[index].origin.status = described;
+    }
+    detail.push(`template ${templates[index]?.source ?? index + 1}:`
+      + ` ${coverage.residues}/${coverage.of}`);
+  });
   // 🔴 THE BACKBONE CA-CA IS STILL MEASURED AND IS NO LONGER SHOWN. It is the
   // number a wrong sampler cannot fake - AF3.md records a batch with one broken
   // gather folding 17 A of spaghetti at pLDDT 55 - so `foldBatch` keeps
@@ -1488,11 +1512,28 @@ async function fold(event) {
     }
     const request = enteredProblem === null
       ? expandEntities(entities)
-      : { chains: [], chainKinds: [], ligandCodes: [], modifications: [] };
+      : { chains: [], chainKinds: [], ligandCodes: [], modifications: [], templates: [] };
     let chains = request.chains;
     let chainKinds = request.chainKinds ?? chains.map(() => "protein");
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
+    // 🔴 FETCHED HERE AND NOT INSIDE THE FOLD, so a structure that cannot be
+    // reached stops the run with its own message rather than surfacing as a
+    // fold that scored badly. AF3 only: AF2's drivers take a template through
+    // a different path and nothing on this page builds one for them yet.
+    const templateSources = [];
+    for (const template of request.templates ?? []) {
+      const source = (template.source ?? "").trim();
+      if (source === "") continue;
+      status(`Fetching template ${source}`);
+      const structure = await fetchStructure(source, { signal });
+      templateSources.push({
+        chain: template.chain, chainId: structure.chain, text: structure.text,
+        // AlphaFold DB has every residue and no way to say it did not see one.
+        minConfidence: template.minConfidence ?? (structure.kind === "afdb" ? 70 : 0),
+        spanChains: template.spanChains === true, origin: template.origin, source,
+      });
+    }
     let sequence = chains.join("");
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
     const family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
@@ -1568,7 +1609,7 @@ async function fold(event) {
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (family === "af3") {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds);
+                        modifications, chainKinds, templateSources);
       return;
     }
 

@@ -67,6 +67,7 @@ values means the whole-stack checker, not that file.
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
+| ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
@@ -105,7 +106,14 @@ covered, because a template covering 17 of 120 residues folds perfectly well and
 says nothing about it. Measured on a 53-residue target with 1QYS_A: ipTM 0.324
 without, 0.358 with.
 
-🔴 **AND A SLOT BUILT BEFORE THE BINDER'S LENGTH IS KNOWN IS BUILT AT THE WRONG
+🔴 **AND foldAf3 PLACES THE SLOTS, BECAUSE ONLY THE FEATURISER KNOWS THE TOKEN
+LAYOUT.** A slot is indexed by TOKEN; a modified residue is one token PER ATOM
+and a ligand is a chain of its own, so a chain's first token is not the sum of
+the preceding chains' residue counts. Callers hand over TEXT and a chain index,
+and `batch.chainOfResidue` / `batch.residueOfToken` do the placing. The earlier
+offset version had a matching bug:
+
+🔴 **A SLOT BUILT BEFORE THE BINDER'S LENGTH IS KNOWN IS BUILT AT THE WRONG
 OFFSET.** Protein Hunter draws its designed chain inside the loop, so
 `chains[0].length` is 0 when the templates are fetched - which made the complex
 53 tokens instead of 69 and put the target's template across the binder. It

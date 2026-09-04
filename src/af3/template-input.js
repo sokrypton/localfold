@@ -100,12 +100,21 @@ export function chainResidues(text, chain) {
  * @param {number} options.tokens the QUERY's token count
  * @param {Map<number, number>|number[][]} options.map query token index ->
  *   index into `structure.residues`. Everything not named is uncovered.
- * @param {number} [options.offset] the first query token of this chain, for a
- *   complex: the map is per chain and the arrays are over the whole complex.
+ * @param {(residue: number) => number} [options.tokenOf] which TOKEN a chain's
+ *   residue occupies. Defaults to `residue + offset`, which is right only while
+ *   one residue is one token.
+ * @param {number} [options.offset] the first query token of this chain.
+ *
+ * 🔴 A RESIDUE IS NOT A TOKEN ONCE A CHAIN CARRIES A MODIFICATION. AF3 gives a
+ * modified residue one token PER ATOM, so a chain with a phosphoserine in it is
+ * longer in tokens than in residues, and every chain after it starts later than
+ * a residue count says. `tokenOf` is how a caller that has featurised hands
+ * over the real layout; the offset is the shortcut for when it has not.
  * @returns {{aatype: Int32Array, atomPositions: Float32Array,
  *            atomMask: Float32Array, covered: number, atoms: number}}
  */
-export function templateSlot({ structure, tokens, map, offset = 0 }) {
+export function templateSlot({ structure, tokens, map, offset = 0, tokenOf }) {
+  const at = tokenOf ?? ((residue) => residue + offset);
   const aatype = new Int32Array(tokens).fill(GAP_AATYPE);
   const atomPositions = new Float32Array(tokens * NUM_DENSE * 3);
   const atomMask = new Float32Array(tokens * NUM_DENSE);
@@ -113,7 +122,7 @@ export function templateSlot({ structure, tokens, map, offset = 0 }) {
   let atoms = 0;
 
   for (const [queryIndex, templateIndex] of map instanceof Map ? map : new Map(map)) {
-    const token = queryIndex + offset;
+    const token = at(queryIndex);
     const residue = structure.residues[templateIndex];
     if (token < 0 || token >= tokens || residue === undefined) continue;
 

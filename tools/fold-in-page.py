@@ -23,6 +23,7 @@ served, which it is here - the server's root is the repo.
 """
 import argparse
 import http.server
+import re
 import json
 import os
 import socketserver
@@ -38,13 +39,42 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 
-def serve():
+MANIFESTS = "/src/reference/manifests/index.js"
+REMOTE_LINE = re.compile(rb'^\s*remote:\s*"[^"]*",\s*$', re.MULTILINE)
+
+
+def serve(local_weights=True):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=REPO, **kw)
 
         def log_message(self, *a):
             pass
+
+        def end_headers(self):
+            # 🔴 SOURCE IS NEVER CACHED, because a cached ES module looks exactly
+            # like a broken feature - CLAUDE.md's own trap, from the server's
+            # side. Not the weights: they are hundreds of megabytes of shards
+            # and re-reading them turns a one-minute run into ten.
+            if self.path.split("?")[0].endswith((".js", ".html", ".css")):
+                self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
+        def do_GET(self):
+            # 🔴 AND THE AF3 BUNDLE COMES OFF THE DISK BY DEFAULT. Its manifest
+            # names a `remote`, which a deployed page is right to use and a
+            # check that runs on demand is not: 150 MB per run. Rewriting the
+            # one module as it is served changes nothing on disk.
+            if local_weights and self.path.split("?")[0] == MANIFESTS:
+                source = open(os.path.join(REPO, MANIFESTS.lstrip("/")), "rb").read()
+                body = REMOTE_LINE.sub(b"", source)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/javascript")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            super().do_GET()
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     httpd = socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler)
@@ -67,6 +97,13 @@ def main():
                              " because each run starts a fresh profile with an"
                              " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--remote-weights", action="store_true",
+                        help="fetch the AF3 bundle from its pinned remote"
+                             " (~150 MB) instead of ./model-af3-int5/")
+    parser.add_argument("--template", default="",
+                        help="a PDB entry (1abc, 1abc_A) or UniProt accession"
+                             " to show the first protein entity as a template."
+                             " Goes to the network - the RCSB or AlphaFold DB.")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -75,7 +112,7 @@ def main():
                              " what the rewind-and-continue path does")
     args = parser.parse_args()
 
-    httpd = serve()
+    httpd = serve(local_weights=args.url is None and not args.remote_weights)
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile")
     try:
         ws.call("Page.enable")
@@ -97,6 +134,22 @@ def main():
           field.dispatchEvent(new Event('input', { bubbles: true }));
           return field.tagName;
         })()""" % (json.dumps(args.sequence), json.dumps(args.sequence)))
+
+        # 🔴 THE TEMPLATE GOES ON THE ENTITY, NOT ON A CONTROL. It lives behind
+        # the row's ⋮ beside the modified residues, in the entity model that
+        # web/entities.js expands - so it is set through the list's own API,
+        # the way a paste would set it, rather than by poking at the popup.
+        if args.template:
+            print("template:", cdp.evaluate(ws, """(() => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const entities = list.read();
+              const protein = entities.find((e) => e.type === 'protein');
+              if (!protein) return 'no protein entity';
+              protein.template = { source: %s };
+              list.set(entities);
+              return JSON.stringify(list.read().map((e) => e.template || null));
+            })()""" % json.dumps(args.template)))
 
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {

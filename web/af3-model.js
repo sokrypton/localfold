@@ -24,6 +24,7 @@ import { diffusionWeights, atomReference, targetFeatureWeights }
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
+import { buildTemplate } from "./template-source.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
 import { af3Plan, RuntimeEstimator }
   from "../src/runtime/cost-model.js";
@@ -214,11 +215,17 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  */
 export async function foldAf3(options) {
   const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
-  // 🔴 A TEMPLATE IS A SLOT PER CHAIN, ALREADY OVER THE COMPLEX'S TOKENS.
-  // web/template-source.js builds it, because turning a structure into one is
-  // a question about files and residue numbering rather than about folding -
-  // and building it here would put a PDB parser on the fold's critical path.
-  const templateSlots = options.templateSlots;
+  // 🔴 THE SLOTS ARE BUILT HERE, AFTER FEATURISATION, AND NOT BY THE CALLER.
+  // They are indexed by TOKEN, and a caller has no way to know the token
+  // layout: a modified residue is one token PER ATOM and a ligand is a chain of
+  // its own, so a chain's first token is not the sum of the preceding chains'
+  // residue counts. `batch.chainOfResidue` and `batch.residueOfToken` are the
+  // real layout and they exist only once the batch does.
+  //
+  // A caller that has already built slots may still pass them - the checkers
+  // do - but the page passes `templates`, which is text plus a chain.
+  const templateSources = options.templates ?? [];
+  const templateCoverage = [];
   // 🔴 THE MSA IS BUILT BEFORE THE WEIGHTS ARE TOUCHED, because its depth is a
   // shape: the MSA stack's pipelines are keyed on the row count, so a fold that
   // discovers its depth later would compile a second set of them.
@@ -380,6 +387,34 @@ export async function foldAf3(options) {
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
 
+  // 🔴 RESIDUE -> TOKEN, PER CHAIN, FROM THE BATCH ITSELF. A residue's token is
+  // the FIRST token that names it, because a modified residue names several.
+  const tokenOfResidue = new Int32Array(batch.sequence.length).fill(-1);
+  for (let token = batch.tokens - 1; token >= 0; token -= 1) {
+    const residue = batch.residueOfToken?.[token] ?? token;
+    if (residue >= 0 && residue < tokenOfResidue.length) tokenOfResidue[residue] = token;
+  }
+  const residuesOfChain = [];
+  for (let residue = 0; residue < batch.sequence.length; residue += 1) {
+    const chain = batch.chainOfResidue?.[residue] ?? 0;
+    (residuesOfChain[chain] ??= []).push(residue);
+  }
+  const templateSlots = options.templateSlots ?? (templateSources.length === 0
+    ? undefined
+    : templateSources.map((template) => buildTemplate({
+      text: template.text,
+      chain: template.chainId,
+      query: sequence.split(":")[template.chain] ?? "",
+      tokens: batch.tokens,
+      minConfidence: template.minConfidence ?? 0,
+      spanChains: template.spanChains === true,
+      tokenOf: (residue) => tokenOfResidue[(residuesOfChain[template.chain] ?? [])[residue]
+        ?? -1] ?? -1,
+    })).map((built) => {
+      templateCoverage.push(built.coverage);
+      return built.slot;
+    }));
+
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     // ...forwarded for probes that move the noise schedule. Unset for a page
@@ -518,6 +553,10 @@ export async function foldAf3(options) {
 
   return {
     batch,
+    // What each template actually covered, which is the only thing that says a
+    // template arrived: a fold that silently lost one folds and scores, and the
+    // number is merely different.
+    templateCoverage,
     // Handed back so the caller can re-sample without the trunk. See foldBatch.
     reusable: result.reusable,
     depth: rows.depth,

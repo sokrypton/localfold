@@ -30,7 +30,7 @@ import { createEntityList } from "./entity-ui.js";
 import { superposeCycle } from "../src/design/superpose-pdb.js";
 import { followActiveFrame, updateScoresCard } from "./scores-card.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
-import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
+import { describeCoverage, fetchStructure } from "./template-source.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
 const element = (id) => {
@@ -365,7 +365,7 @@ followActiveFrame(() => ({ renderer: viewer.renderer, object: viewer.object }));
  * slots, and their cross-chain pairs stay masked because they were never in one
  * frame. A single file covering both is one slot with `spanChains`.
  */
-async function loadTemplates(input, binderLength, signal) {
+async function loadTemplates(input, signal) {
   const templates = input.templates ?? [];
   window.__hunterTemplateLog = [`asked for ${templates.length}`];
   if (templates.length === 0) return undefined;
@@ -374,46 +374,45 @@ async function loadTemplates(input, binderLength, signal) {
   // proceeds without it looks identical to one that used it and scores worse
   // for a reason nothing on the page states.
 
-  // 🔴 THE BINDER'S LENGTH IS PASSED IN, NOT READ OFF THE CHAIN. Its entry is
-  // EMPTY at this point - runDesign draws the starting sequence - so taking
-  // `chains[0].length` makes the complex 53 tokens instead of 69, and every
-  // template after the binder lands that many places to the left. It still
-  // folds, and it still changes the answer, which is what makes it worth a
-  // note: measured, the fold moved from ipTM 0.324 to 0.533 with the template
-  // in the WRONG place.
-  const chains = input.chains.map((chain, index) =>
-    (index === 0 ? binderLength : chain.length));
-  const offsets = [];
-  let at = 0;
-  for (const length of chains) { offsets.push(at); at += length; }
-  const tokens = at;
-
-  const slots = [];
+  // 🔴 ONLY THE FETCH HAPPENS HERE. Turning a structure into a SLOT needs the
+  // token layout - a modified residue is several tokens - and only the
+  // featuriser knows it, so foldAf3 builds the slots and this hands over the
+  // text. The binder's drawn length is not even needed any more, which is what
+  // the earlier version got wrong: it placed the target's template across the
+  // binder and moved ipTM from 0.324 to 0.533, which reads as a template
+  // working unusually well.
+  const fetched = [];
   for (const template of templates) {
     const source = (template.source ?? "").trim();
     if (source === "") continue;
     status(`Fetching template ${source}`);
     window.__hunterTemplateLog.push(`fetching ${source}`);
-    const fetched = await fetchStructure(source, { signal });
-    window.__hunterTemplateLog.push(`got ${fetched.text.length} bytes from ${fetched.url}`);
-    const built = buildTemplate({
-      text: fetched.text,
-      chain: fetched.chain,
-      query: input.chains[template.chain] ?? "",
-      tokens,
-      offset: offsets[template.chain] ?? 0,
-      minConfidence: template.minConfidence ?? (fetched.kind === "afdb" ? 70 : 0),
+    const structure = await fetchStructure(source, { signal });
+    window.__hunterTemplateLog.push(
+      `got ${structure.text.length} bytes from ${structure.url}`);
+    fetched.push({
+      chain: template.chain,
+      chainId: structure.chain,
+      text: structure.text,
+      // AlphaFold DB has every residue and no way to say it did not see one,
+      // so a floor is the default there and not for a crystal structure.
+      minConfidence: template.minConfidence ?? (structure.kind === "afdb" ? 70 : 0),
       spanChains: template.spanChains === true,
+      origin: template.origin,
+      source,
     });
-    const description = describeCoverage(built.coverage);
-    // ...onto the entity's own object, so the row shows it. See `origin`.
-    if (template.origin !== undefined) template.origin.status = description;
-    template.status = description;
-    window.__hunterTemplateLog.push(`built ${description}`);
-    status(`Template ${source} · ${description}`);
-    slots.push(built.slot);
   }
-  return slots.length === 0 ? undefined : slots;
+  return fetched.length === 0 ? undefined : fetched;
+}
+
+/** Write each template's coverage back onto the row that asked for it. */
+function reportCoverage(templates, coverage) {
+  (coverage ?? []).forEach((one, index) => {
+    const description = describeCoverage(one);
+    const template = templates?.[index];
+    if (template?.origin !== undefined) template.origin.status = description;
+    window.__hunterTemplateLog?.push(`built ${description}`);
+  });
 }
 
 function download(name, text, type = "text/plain") {
@@ -560,7 +559,7 @@ async function hunt() {
     // They are over the complex's TOKENS, so a template cannot be built until
     // the designed chain has a length - which is why this happens here rather
     // than when the field is typed into.
-    const templateSlots = await loadTemplates(input, binderLength, signal);
+    const templates = await loadTemplates(input, signal);
     status("Starting WebGPU");
     const device = await getDevice(signal);
     // 🔴 THE TWO LOADERS REPORT PROGRESS DIFFERENTLY, AND GETTING IT WRONG
@@ -598,12 +597,12 @@ async function hunt() {
 
         fold: async (sequence, context) => {
           const done = context.run * (cycles + 1) + context.cycle;
-          return foldAf3({
+          const folded = await foldAf3({
             sequence, mode, calls, recycles, weights, device, signal, seed: seed + run,
             // A ligand and a nucleic chain change the FOLD as well as the
             // designer: featurise gives each ligand a chain of its own and
             // reads a nucleic chain one token per base.
-            chainKinds, ligandCodes, modifications, templateSlots,
+            chainKinds, ligandCodes, modifications, templates,
             onStatus: (text) => {
               if (!signal.aborted) {
                 status(`Run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · ${text}`);
@@ -615,6 +614,12 @@ async function hunt() {
               if (!signal.aborted) progress((done + fraction) / total);
             },
           });
+          // ...once, on the first fold: the coverage cannot change between
+          // cycles, and a line rewritten eighteen times would only flicker.
+          if (context.cycle === 0 && context.run === 0) {
+            reportCoverage(templates, folded.templateCoverage);
+          }
+          return folded;
         },
 
         design: (pdb, context) => {

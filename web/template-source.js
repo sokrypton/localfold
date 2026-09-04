@@ -120,6 +120,9 @@ export function mapToQuery(structure, query) {
  * @param {string} [options.query] the chain's sequence; "" takes the structure's
  * @param {number} options.tokens the whole complex's token count
  * @param {number} [options.offset] this chain's first token
+ * @param {(residue: number) => number} [options.tokenOf] which token a residue
+ *   of this chain occupies; see templateSlot. A modified residue is several
+ *   tokens, so an offset alone is not enough once a chain carries one.
  * @param {number} [options.minConfidence] drop residues below this pLDDT
  * @param {boolean} [options.spanChains]
  * @returns {{slot: object, sequence: string, coverage: object}}
@@ -136,7 +139,8 @@ export function buildTemplate(options) {
                                   (residue) => residue.confidence);
   const chainLength = (options.query ?? "").length || structure.residues.length;
   const slot = templateSlot({
-    structure, tokens: options.tokens, map: kept, offset: options.offset ?? 0,
+    structure, tokens: options.tokens, map: kept,
+    offset: options.offset ?? 0, tokenOf: options.tokenOf,
   });
   if (slot.covered === 0) {
     throw new Error("that template covers none of the chain"
