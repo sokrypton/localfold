@@ -270,6 +270,26 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         heading.textContent = "Template";
         section.append(heading);
 
+        // 🔴 AUTOMATIC MEANS "USE WHAT THE SEARCH ALREADY FOUND", and it is
+        // only meaningful where a search runs. The MSA job's own tar carries
+        // `pdb70.m8` beside `uniref.a3m` - the hits cost nothing extra - so
+        // this is a switch on data the page has already paid for. Single
+        // sequence has no hits, and the page says so rather than silently
+        // folding without one.
+        const autoLine = document.createElement("label");
+        autoLine.className = "entity-popup-check";
+        const auto = document.createElement("input");
+        auto.type = "checkbox";
+        auto.checked = template.auto === true;
+        auto.addEventListener("change", () => {
+          template.auto = auto.checked;
+          draw();
+          notify();
+        });
+        autoLine.append(auto, document.createTextNode(
+          " Use the templates the MSA search finds"));
+        section.append(autoLine);
+
         const source = document.createElement("input");
         source.type = "text";
         source.className = "entity-template-source";
@@ -308,8 +328,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // file this list has never seen, and a template covering 17 of 120
         // residues folds perfectly well and says nothing about it.
         status.textContent = template.status
-          ?? "A structure to show this chain. Its coverage appears here once it"
-            + " is fetched.";
+          ?? (template.auto === true
+            ? "The best hit from the search will be used. Its coverage appears"
+              + " here once the fold has run."
+            : "A structure to show this chain, or tick the box to use what the"
+              + " search finds. Its coverage appears here once it is fetched.");
         section.append(status);
         popup.append(section);
       }

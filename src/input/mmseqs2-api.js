@@ -152,6 +152,107 @@ export function extractMmseqs2PairedA3ms(tarBytes, queryCount) {
 }
 
 /** Extracts and combines the UniRef and environmental A3Ms exactly as ColabFold does. */
+/**
+ * The template hits the search already returned.
+ *
+ * 🔴 THEY COME FREE WITH THE ALIGNMENT. `pdb70.m8` is in the MSA job's own tar
+ * beside `uniref.a3m` - no second search, no extra request - and nothing here
+ * had ever read it.
+ *
+ * 🔴 THE CIGAR IS KEPT AND DELIBERATELY NOT USED FOR THE MAPPING. The last
+ * column is a real alignment - `34M1D57M` with the query and target starts -
+ * but its target coordinates index pdb70's SEQUENCE, and what a template
+ * actually offers is its RESOLVED residues. A structure missing a loop has
+ * fewer of the second than the first, so reading the cigar against the parsed
+ * chain would shift every residue after the first gap. Reconciling the two
+ * needs the entry's SEQRES, which is a third parse of the mmCIF for a gain
+ * that only shows up on remote homologs - and pdb70's top hits are not that.
+ * web/template-source.js aligns the query to the resolved sequence instead,
+ * and the coverage line says what it got.
+ *
+ * The fields are carried anyway, because choosing WHICH hits to use is what
+ * the identity and the e-value are for.
+ *
+ * The row is BLAST tabular plus that column:
+ * query, target, identity, alnlen, mismatch, gapopen, qstart, qend, tstart,
+ * tend, evalue, bits, cigar.
+ *
+ * @param {Uint8Array} tarBytes the decompressed MSA result
+ * @returns {Map<number, object[]>} query index -> hits, best first
+ */
+export function extractMmseqs2TemplateHits(tarBytes) {
+  const files = readTarFiles(tarBytes);
+  const entry = [...files].find(([path]) => path === "pdb70.m8"
+    || path.endsWith("/pdb70.m8"));
+  const hits = new Map();
+  if (entry === undefined) return hits;
+  for (const line of new TextDecoder().decode(entry[1]).split("\n")) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 12) continue;
+    const [query, target, identity, , , , qstart, , tstart, , evalue, bits] = parts;
+    // 🔴 THE QUERY IS NUMBERED FROM 101, which is how the server labels the
+    // chains of a job: the first is 101, the second 102. Subtracting gives the
+    // chain index the rest of this page counts in.
+    const chainIndex = Number(query) - 101;
+    if (!Number.isInteger(chainIndex) || chainIndex < 0) continue;
+    // `1qys_A` is a PDB entry and a chain; the structure arrives as `1qys.cif`.
+    const [id, chain] = target.split("_");
+    if (id === undefined) continue;
+    if (!hits.has(chainIndex)) hits.set(chainIndex, []);
+    hits.get(chainIndex).push({
+      id: id.toLowerCase(),
+      chain: chain ?? "A",
+      target,
+      identity: Number(identity),
+      evalue: Number(evalue),
+      bits: Number(bits),
+      queryStart: Number(qstart),
+      templateStart: Number(tstart),
+      cigar: parts[12] ?? "",
+    });
+  }
+  return hits;
+}
+
+/**
+ * The structures for a set of hits, as mmCIF.
+ *
+ * 🔴 ONE HOST FOR EVERYTHING, AND NOT THE RCSB. ColabFold asks its own server
+ * for these - `{api}/template/{comma-separated ids}` - and gets a gzipped tar
+ * of `<id>.cif` back, so a page that already talks to the MSA API needs no
+ * second origin and no second CORS story.
+ *
+ * 🔴 ASK FOR THE HIT NAMES, `1qys_A`, NOT THE BARE ENTRY. The endpoint takes
+ * the pdb70 target names the m8 gave - chain suffix included - and returns
+ * ONE mmCIF PER ENTRY, named `1qys.cif`. Asked for `1qys` alone it answers 200
+ * with a tar holding only the hhsearch index and no structure at all, which is
+ * a success with nothing in it rather than an error.
+ *
+ * @param {string[]} targets pdb70 target names, `1qys_A`
+ * @returns {Promise<Map<string, string>>} entry id -> mmCIF text
+ */
+export async function fetchMmseqs2Templates(targets, options = {}) {
+  const wanted = [...new Set(targets)].filter((id) => /^[A-Za-z0-9]{4}_[A-Za-z0-9]+$/.test(id));
+  if (wanted.length === 0) return new Map();
+  const fetchImplementation = options.fetchImplementation ?? fetch;
+  const decompress = options.decompress ?? decompressGzip;
+  const apiUrl = new URL(options.apiUrl ?? DEFAULT_API_URL);
+  if (!apiUrl.pathname.endsWith("/")) apiUrl.pathname += "/";
+  const response = await request(
+    fetchImplementation,
+    new URL(`template/${wanted.join(",")}`, apiUrl),
+    options.signal === undefined ? {} : { signal: options.signal },
+    "MMseqs2 template download");
+  const files = readTarFiles(new Uint8Array(await decompress(await response.arrayBuffer())));
+  const structures = new Map();
+  for (const [path, bytes] of files) {
+    const name = path.split("/").pop() ?? path;
+    if (!name.endsWith(".cif")) continue;
+    structures.set(name.slice(0, -4).toLowerCase(), new TextDecoder().decode(bytes));
+  }
+  return structures;
+}
+
 export function extractMmseqs2A3m(tarBytes, useEnvironmental = true) {
   const files = readTarFiles(tarBytes);
   const find = (suffix) =>
@@ -263,7 +364,8 @@ export async function generateMmseqs2PairedMsa(uniqueSequences, options = {}) {
   if (!alignments.every((alignment) => alignment.depth === alignments[0].depth)) {
     throw new Error("MMseqs2 paired A3Ms do not have aligned row counts");
   }
-  return { a3ms, ticket: job.ticket, depth: alignments[0].depth };
+  return { a3ms, ticket: job.ticket, depth: alignments[0].depth,
+           templateHits: extractMmseqs2TemplateHits(job.archive) };
 }
 
 /** Generates a monomer MSA through the public ColabFold MMseqs2 API. */
@@ -309,12 +411,19 @@ export async function generateMmseqs2Msa(sequenceValue,
   const response = await request(fetchImplementation,
     new URL(`result/download/${encodeURIComponent(ticket)}`, apiUrl),
     signal === undefined ? {} : { signal }, "MMseqs2 result download");
-  const a3m = extractMmseqs2A3m(await decompress(await response.arrayBuffer()), useEnvironmental);
+  // ...the archive is kept, not consumed inline: the template hits come out of
+  // the same tar and a second decompression would be a second copy of it.
+  const archive = await decompress(await response.arrayBuffer());
+  const a3m = extractMmseqs2A3m(archive, useEnvironmental);
   const alignment = parseA3m(a3m);
   if (alignment.query !== sequence) throw new Error("MMseqs2 returned an A3M for a different query sequence");
   const elapsedMilliseconds = performance.now() - start;
   report("complete", status, ticket);
-  return { a3m, ticket, depth: alignment.depth, elapsedMilliseconds };
+  // 🔴 THE TEMPLATE HITS COME OUT OF THE SAME TAR, so a page that wants them
+  // pays for no second request. Returned rather than fetched later because the
+  // archive is discarded here and nothing else ever sees it.
+  return { a3m, ticket, depth: alignment.depth, elapsedMilliseconds,
+           templateHits: extractMmseqs2TemplateHits(archive) };
 }
 
 /**

@@ -63,6 +63,7 @@ export function coordinateAtoms(pdb) {
   const residueNames = [];
   const residues = [];
   const bFactors = [];
+  const hetero = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const record = line.slice(...RECORD);
@@ -84,8 +85,9 @@ export function coordinateAtoms(pdb) {
     // puts anything meaningful here.
     const bFactor = Number(line.slice(...B_FACTOR));
     bFactors.push(Number.isFinite(bFactor) ? bFactor : 0);
+    hetero.push(record === "HETATM");
   }
-  return { lines, at, points, names, chains, residueNames, residues, bFactors };
+  return { lines, at, points, names, chains, residueNames, residues, bFactors, hetero };
 }
 
 /**

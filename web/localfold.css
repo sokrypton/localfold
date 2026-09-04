@@ -872,3 +872,4 @@
   border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a;
 }
 .entity-template-status.error { color: #b91c1c; }
+.entity-popup-check { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 6px; }

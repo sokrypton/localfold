@@ -106,6 +106,30 @@ covered, because a template covering 17 of 120 residues folds perfectly well and
 says nothing about it. Measured on a 53-residue target with 1QYS_A: ipTM 0.324
 without, 0.358 with.
 
+🔴 **AND TEMPLATES CAN COME FROM THE MMseqs2 SEARCH, WHICH ALREADY FOUND THEM.**
+`pdb70.m8` is in the MSA job's own tar beside `uniref.a3m` - no second search,
+no extra request - and nothing had ever read it. The structures come from
+ColabFold's own server, `{api}/template/{1qys_A,7fao_C}`, as a gzipped tar of
+mmCIF; the RCSB is not involved. **Ask with the chain suffix**: `/template/1qys`
+answers 200 with a tar holding only the hhsearch index and no structure, which
+is a success with nothing in it.
+
+ColabFold then runs `hhsearch` over that index to get the alignment. A browser
+has no such binary and does not need one: the m8's last column is a CIGAR - but
+its target coordinates index pdb70's SEQUENCE while a template offers its
+RESOLVED residues, so it is deliberately not used. The query is aligned to the
+resolved sequence instead and the coverage line says what came of it.
+
+Measured: a 91-residue query at `--msa-mode search --template auto` found
+`1qys_A`, covered 91/91 and folded at pLDDT 84.9.
+
+🔴 **AND A WATER IS NOT A RESIDUE.** `chainResidues` read every HETATM, so 1qys
+chain A came out ninety-NINE residues instead of ninety-two - eight waters, each
+an X with one atom, each a pseudo-beta position in the distogram. Found by
+running the PDB reader and the mmCIF reader over the same entry and comparing.
+MSE is the one heteroatom kept: selenomethionine is how a great many structures
+were phased, and dropping it puts a hole in the middle of a chain.
+
 🔴 **AND foldAf3 PLACES THE SLOTS, BECAUSE ONLY THE FEATURISER KNOWS THE TOKEN
 LAYOUT.** A slot is indexed by TOKEN; a modified residue is one token PER ATOM
 and a ligand is a chain of its own, so a chain's first token is not the sum of

@@ -164,8 +164,9 @@ export function templateProblem(entity) {
   const template = entity.template;
   if (template === undefined || template === null) return null;
   const source = (template.source ?? "").trim();
-  if (source === "") return null;
+  if (source === "" && template.auto !== true) return null;
   if (entity.type !== "protein") return "Only a protein chain can take a template";
+  if (source === "") return null;
   if (!/^[A-Za-z0-9]{4,12}([_:][A-Za-z0-9])?$/.test(source)) {
     return `${source} is not a PDB entry (1abc, 1abc_A) or a UniProt accession`;
   }
@@ -336,7 +337,8 @@ export function expandEntities(entities) {
         // reason the modifications are: copies are expanded, so two copies of a
         // templated chain are two chains each carrying it, and the embedder
         // indexes slots by the chain number it will actually see.
-        if (entity.template?.source && entity.type === "protein") {
+        if ((entity.template?.source || entity.template?.auto === true)
+            && entity.type === "protein") {
           // 🔴 `origin` IS THE ENTITY'S OWN OBJECT, NOT A COPY OF IT. The
           // coverage a template turns out to have - "17 of 120 residues" - is
           // discovered when the structure is fetched, long after this, and the

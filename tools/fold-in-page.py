@@ -97,13 +97,18 @@ def main():
                              " because each run starts a fresh profile with an"
                              " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
+    # 🔴 SINGLE SEQUENCE BY DEFAULT, because this tool is a wiring check and a
+    # search is a minute of somebody else's server. `--msa-mode search` is
+    # needed for `--template auto`, which has nothing to draw on without one.
+    parser.add_argument("--msa-mode", default="none", choices=["none", "search"])
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--template", default="",
                         help="a PDB entry (1abc, 1abc_A) or UniProt accession"
-                             " to show the first protein entity as a template."
-                             " Goes to the network - the RCSB or AlphaFold DB.")
+                             " to show the first protein entity as a template,"
+                             " or `auto` to use what the MSA search finds."
+                             " Goes to the network either way.")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
                              " fresh fold rather than a continuation")
@@ -146,10 +151,11 @@ def main():
               const entities = list.read();
               const protein = entities.find((e) => e.type === 'protein');
               if (!protein) return 'no protein entity';
-              protein.template = { source: %s };
+              protein.template = %s;
               list.set(entities);
               return JSON.stringify(list.read().map((e) => e.template || null));
-            })()""" % json.dumps(args.template)))
+            })()""" % json.dumps({"auto": True} if args.template == "auto"
+                                  else {"source": args.template})))
 
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {
@@ -161,9 +167,9 @@ def main():
           set('model-family', %s);
           set('recycles', %s);
           set('af3-count', %s);
-          set('msa-mode', 'none');
+          set('msa-mode', %s);
         })()""" % (json.dumps(args.model), json.dumps(args.recycles),
-                   json.dumps(args.steps)))
+                   json.dumps(args.steps), json.dumps(args.msa_mode)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;

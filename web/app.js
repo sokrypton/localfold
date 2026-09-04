@@ -48,6 +48,7 @@ import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
+import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 const element = (id) => {
   const value = document.getElementById(id);
@@ -355,7 +356,10 @@ async function alignmentText(chains, signal, family) {
       // paired construction, one search speaking for every copy, so `paired` is
       // null and AF3 does what it does with none. Pairing is a second search
       // and it only happens for distinct sequences.
-      return { text: searched.a3m, blocks: searched.blocks ?? { unpaired: searched.a3m } };
+      // ...and the template hits, which came out of the same tar and cost
+      // nothing. See extractMmseqs2TemplateHits.
+      return { text: searched.a3m, blocks: searched.blocks ?? { unpaired: searched.a3m },
+               templateHits: searched.templateHits };
     }
     default:
       throw new Error(`unknown alignment mode ${msaMode()}`);
@@ -1524,6 +1528,13 @@ async function fold(event) {
     const templateSources = [];
     for (const template of request.templates ?? []) {
       const source = (template.source ?? "").trim();
+      if (template.auto === true && source === "") {
+        // Resolved after the search, which is when the hits exist.
+        templateSources.push({ chain: template.chain, auto: true,
+          minConfidence: template.minConfidence ?? 0,
+          spanChains: template.spanChains === true, origin: template.origin });
+        continue;
+      }
       if (source === "") continue;
       status(`Fetching template ${source}`);
       const structure = await fetchStructure(source, { signal });
@@ -1575,6 +1586,30 @@ async function fold(event) {
       : (alignmentResult?.blocks ?? (alignment === null ? null : { unpaired: alignment }));
     // ...what the model reads. An array means one alignment per chain.
     const alignmentForModel = alignment;
+    // 🔴 THE AUTOMATIC TEMPLATES ARE RESOLVED AFTER THE SEARCH, because that is
+    // when the hits exist. A chain asking for them without a search gets
+    // nothing and is told so - single sequence has no hits, and folding
+    // silently without the template someone asked for is the failure this
+    // whole path is trying to avoid.
+    const hits = typeof alignmentResult === "string"
+      ? undefined : alignmentResult?.templateHits;
+    for (const template of templateSources) {
+      if (template.auto !== true) continue;
+      const best = (hits?.get(template.chain) ?? [])[0];
+      if (best === undefined) {
+        throw new Error(hits === undefined
+          ? "Automatic templates need an MSA search: set the MSA to search, or"
+            + " name a structure instead."
+          : `The search found no template for chain ${template.chain + 1}.`);
+      }
+      status(`Fetching template ${best.target}`);
+      const structures = await fetchMmseqs2Templates([best.target], { signal });
+      const text = structures.get(best.id);
+      if (text === undefined) throw new Error(`No structure came back for ${best.target}`);
+      template.text = text;
+      template.chainId = best.chain;
+      template.source = best.target;
+    }
     throwIfAborted(signal);
     if (alignment !== null) {
       // THE ALIGNMENT'S QUERY WINS. An A3M carries its own first record, and

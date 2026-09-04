@@ -26,6 +26,8 @@ import { alignPositions } from "./align.js";
 import {
   chainResidues, filterByConfidence, identityMap, templateSlot,
 } from "../src/af3/template-input.js";
+import { ONE_LETTER } from "../src/af3/fold.js";
+import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
 
 const RCSB = "https://files.rcsb.org/download";
 const AFDB = "https://alphafold.ebi.ac.uk/files";
@@ -128,7 +130,14 @@ export function mapToQuery(structure, query) {
  * @returns {{slot: object, sequence: string, coverage: object}}
  */
 export function buildTemplate(options) {
-  const structure = chainResidues(options.text, options.chain);
+  // 🔴 THE FORMAT IS SNIFFED, because the two sources hand over different ones:
+  // the RCSB and AlphaFold DB give fixed-column PDB and the MMseqs2 template
+  // endpoint gives mmCIF. Guessing from the URL would be one more thing to
+  // keep in step with the fetch.
+  const structure = /^\s*(data_|#|loop_|_)/m.test(options.text.slice(0, 4096))
+    && options.text.includes("_atom_site.")
+    ? residuesFromCif(options.text, options.chain)
+    : chainResidues(options.text, options.chain);
   if (structure.residues.length === 0) {
     throw new Error(options.chain === undefined
       ? "that structure has no protein chain this can read"
@@ -158,6 +167,57 @@ export function buildTemplate(options) {
       aligned: !identical,
       chain: structure.chain,
     },
+  };
+}
+
+/**
+ * An mmCIF chain in the shape `templateSlot` reads.
+ *
+ * 🔴 THE PARSER IS THE MPNN MIRROR'S, NOT A FOURTH ONE. `chainResidues` reads
+ * fixed-column PDB, which is what the RCSB and AlphaFold DB hand over; the
+ * MMseqs2 template endpoint hands over mmCIF, and `parseCIFAtoms` already
+ * reads it - including the alternate-location and first-model rules that make
+ * a naive `_atom_site` loop wrong. Three parsers in this repository is enough.
+ *
+ * @param {string} text an mmCIF
+ * @param {string} [chain] auth_asym_id; the first one found if absent
+ * @returns {{chain: string, residues: object[], sequence: string}}
+ */
+export function residuesFromCif(text, chain) {
+  // 🔴 MSE IS A HETATM AND IS A RESIDUE. See HETERO_RESIDUES in
+  // src/af3/template-input.js: dropping every heteroatom takes a
+  // selenomethionine out of the middle of a chain, and keeping every one makes
+  // the waters into residues.
+  const atoms = parseCIFAtoms(text).filter((atom) =>
+    (!atom.hetero || atom.resName === "MSE")
+    && atom.occupancy > 0 && Number.isFinite(atom.x)
+    && (atom.altLoc === "" || atom.altLoc === "A"));
+  const wanted = chain ?? atoms[0]?.chain;
+  const byNumber = new Map();
+  const order = [];
+  for (const atom of atoms) {
+    if (atom.chain !== wanted) continue;
+    const number = `${atom.resSeq}${atom.iCode}`;
+    if (!byNumber.has(number)) {
+      const residue = {
+        number,
+        code: ONE_LETTER[atom.resName] ?? (atom.resName === "MSE" ? "M" : "X"),
+        atoms: new Map(),
+        // An experimental structure states no per-residue confidence, and a
+        // floor of zero is the only honest reading of that.
+        confidence: 0,
+        atomCount: 0,
+      };
+      byNumber.set(number, residue);
+      order.push(residue);
+    }
+    const residue = byNumber.get(number);
+    if (!residue.atoms.has(atom.name)) residue.atoms.set(atom.name, [atom.x, atom.y, atom.z]);
+  }
+  return {
+    chain: wanted,
+    residues: order,
+    sequence: order.map((residue) => residue.code).join(""),
   };
 }
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
   buildTemplate, describeCoverage, fetchStructure, mapToQuery, parseSource,
+  residuesFromCif,
 } from "../web/template-source.js";
 import { chainResidues } from "../src/af3/template-input.js";
 import { GAP_AATYPE } from "../src/af3/template-input.js";
@@ -174,5 +175,73 @@ describe("describeCoverage", () => {
     expect(text).toContain("75%");
     expect(text).toContain("5 below the pLDDT floor");
     expect(text).toContain("aligned");
+  });
+});
+
+describe("heteroatoms in a template", () => {
+  const withWaters = `${structure().trim()}\n`
+    + `${line(99, "O", "HOH", "A", 900, 9, 9, 9, 30).replace(/^ATOM  /, "HETATM")}\n`
+    + `${line(100, "SE", "MSE", "A", 4, 12, 0, 0, 40).replace(/^ATOM  /, "HETATM")}\n`
+    + `${line(101, "CA", "MSE", "A", 4, 13, 0, 0, 40).replace(/^ATOM  /, "HETATM")}\nEND\n`;
+
+  /**
+   * 🔴 A WATER IS NOT A RESIDUE, AND A PDB PUTS IT ON A CHAIN. Reading every
+   * HETATM as one made 1qys chain A ninety-NINE residues instead of
+   * ninety-two: eight waters, each an X with one atom, each contributing a
+   * pseudo-beta position to the distogram and a row to the alignment. Found by
+   * comparing the PDB reader against the mmCIF one on the same entry.
+   */
+  it("drops waters", () => {
+    const parsed = chainResidues(withWaters, "A");
+    expect(parsed.residues.some((residue) => residue.number === "900")).toBe(false);
+  });
+
+  // Selenomethionine is how a great many structures were phased; dropping
+  // every heteroatom takes a real methionine out of the middle of a chain.
+  it("keeps selenomethionine, as M", () => {
+    const parsed = chainResidues(withWaters, "A");
+    const mse = parsed.residues.find((residue) => residue.number === "4");
+    expect(mse?.code).toBe("M");
+    expect(parsed.sequence).toBe("AAAM");
+  });
+});
+
+describe("mmCIF templates", () => {
+  // The MMseqs2 template endpoint hands over mmCIF where the RCSB and
+  // AlphaFold DB hand over PDB, so buildTemplate sniffs rather than being told.
+  const cif = `data_TEST
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+ATOM 1 N ALA A 1 0.0 1.0 0.0 1.0
+ATOM 2 CA ALA A 1 0.0 0.0 0.0 1.0
+ATOM 3 C ALA A 1 1.0 0.0 0.0 1.0
+ATOM 4 CB ALA A 1 0.0 -1.0 1.0 1.0
+ATOM 5 N ALA A 2 4.0 1.0 0.0 1.0
+ATOM 6 CA ALA A 2 4.0 0.0 0.0 1.0
+ATOM 7 C ALA A 2 5.0 0.0 0.0 1.0
+ATOM 8 CB ALA A 2 4.0 -1.0 1.0 1.0
+HETATM 9 O HOH A 900 9.0 9.0 9.0 1.0
+#
+`;
+
+  it("reads a chain, and still drops the water", () => {
+    const parsed = residuesFromCif(cif, "A");
+    expect(parsed.residues).toHaveLength(2);
+    expect(parsed.sequence).toBe("AA");
+  });
+
+  it("is picked by buildTemplate without being told the format", () => {
+    const built = buildTemplate({ text: cif, chain: "A", tokens: 2 });
+    expect(built.coverage.residues).toBe(2);
+    expect(built.coverage.atoms).toBe(8);
   });
 });

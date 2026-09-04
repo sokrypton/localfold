@@ -37,6 +37,21 @@ import { coordinateAtoms } from "../design/superpose-pdb.js";
 export const GAP_AATYPE = 21;
 
 /**
+ * 🔴 A WATER IS NOT A RESIDUE, AND A PDB PUTS IT ON A CHAIN. Reading every
+ * HETATM as a template residue made 1qys chain A ninety-NINE residues instead
+ * of ninety-one: eight waters, each an X with one atom, each contributing a
+ * pseudo-beta position to the distogram and a row to the alignment.
+ *
+ * 🔴 BUT MSE IS A RESIDUE AND IS ALWAYS A HETATM. Selenomethionine is how a
+ * great many crystal structures were phased, and dropping every HETATM would
+ * take a real methionine out of the middle of a chain - leaving a hole the
+ * alignment then has to guess across. It is the one exception worth carrying;
+ * anything else heteroatomic is a ligand, an ion or a solvent molecule, and a
+ * template is one protein chain.
+ */
+const HETERO_RESIDUES = { MSE: "M" };
+
+/**
  * One chain of a structure, as residues in file order.
  *
  * 🔴 KEYED ON THE RESIDUE NUMBER, NEVER ON POSITION IN THE ATOM LIST. A PDB's
@@ -52,16 +67,22 @@ export const GAP_AATYPE = 21;
  */
 export function chainResidues(text, chain) {
   const atoms = coordinateAtoms(text);
-  const wanted = chain ?? atoms.chains[0];
+  // ...the first chain that has a polymer residue on it, not the first chain
+  // of any kind: a structure whose first ATOM is a ligand would otherwise name
+  // a chain with nothing in it.
+  const wanted = chain ?? atoms.chains[atoms.hetero?.findIndex((h) => !h) ?? 0]
+    ?? atoms.chains[0];
   const byNumber = new Map();
   const order = [];
   for (let index = 0; index < atoms.points.length; index += 1) {
     if (atoms.chains[index] !== wanted) continue;
+    const name = atoms.residueNames[index];
+    if (atoms.hetero?.[index] === true && HETERO_RESIDUES[name] === undefined) continue;
     const number = atoms.residues[index];
     if (!byNumber.has(number)) {
       const residue = {
         number,
-        code: ONE_LETTER[atoms.residueNames[index]] ?? "X",
+        code: ONE_LETTER[name] ?? HETERO_RESIDUES[name] ?? "X",
         atoms: new Map(),
         // 🔴 AlphaFold DB PUTS pLDDT IN THE B-FACTOR, which is the only thing
         // in a predicted structure that says "I am not sure about this". A
