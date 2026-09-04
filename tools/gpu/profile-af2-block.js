@@ -22,7 +22,7 @@
  *
  *      5 rows    13.5 ms    646 ms    opm.accumulate 2.04, opm.intermediate 1.07
  *    128 rows    32.8 ms   1574 ms    the two attention projections 4.07 each
- *    512 rows    90.1 ms   4326 ms    msa-column-attention.flash 16.7
+ *    512 rows    87.8 ms   4216 ms    msa-column-attention.flash 16.6
  *
  * 🔴 THE DEEP BLOCK IS NO LONGER ALMOST ALL ONE KERNEL, AND THIS DOCSTRING
  * SAID IT WAS FOR A WHILE AFTER IT STOPPED BEING TRUE. It recorded 294.9 ms at
@@ -44,19 +44,25 @@
  * current shape as the optimum of everything tried.
  *
  * 🔴 WHAT MOVED AFTERWARDS WAS NOT A TILE EITHER - IT WAS THE ELEMENT. The
- * block went 109.25 -> 90.12 ms, and every step of that was half precision
- * somewhere, for two different reasons:
+ * block went 109.25 -> 87.83 ms, and every step of that was half precision
+ * somewhere, for three different reasons:
  *
  *   - COLUMN ATTENTION 21.0 -> 16.7 and row attention 3.9 -> 2.9, by staging
  *     the key and value in f16. Not arithmetic: the surgery arms in
  *     bench-msa-attention.js price those staged reads at 8.7 ms of 20.8,
  *     against 0.4 for both exponentials. Halving the workgroup memory buys the
  *     occupancy. Everything tried that ADDED registers lost, by 2.3x and 4.7x.
- *   - THE THREE DENSE KERNELS 13.6/13.6 -> 9.7/9.7 (the q/k/v/gate
+ *   - THE THREE DENSE KERNELS 13.6/13.6 -> 9.7/9.6 (the q/k/v/gate
  *     projections), 4.2/4.2 -> 3.5/3.5 (the outputs) and the transitions with
  *     them, by putting the ACCUMULATORS in f16 - which is what let each of them
  *     take a tile that spilled in f32. The register budget was the ceiling and
  *     half precision moved it.
+ *   - THE TRANSITIONS AGAIN, 27.8 -> 24.8, by storing their WEIGHTS in f16.
+ *     That one is bandwidth: this kernel re-reads the whole weight set once per
+ *     row tile, 944 times for a 512-row alignment, so halving the bytes is a
+ *     separate win from halving the arithmetic. AF3's trunk got nothing from
+ *     the same change, because its weights are resident and its reads are
+ *     instruction-bound - see AF3.md.
  *
  * So "no outlier to attack, the next thing is a different algorithm" was right
  * about tiles and wrong about the kernel as a whole: what was left was a

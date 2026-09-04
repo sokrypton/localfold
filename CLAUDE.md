@@ -146,7 +146,15 @@ AF3 keeps its WEIGHTS resident (three tensors were 1216 MiB of a 1406 MiB fold)
 and AF2 keeps none, so AF2's peak is all ACTIVATIONS (`msa-transition.hidden`
 alone was 118 MiB of 681). Both are now smaller - a 59-token AF3 fold holds
 **798 MiB against 1406**, and an AF2 fold at 512 MSA rows peaks at **573 MiB
-against 681** - and neither change is worth any time. See AF3.md's memory
+against 681**.
+
+🔴 **AND THE SAME DIFFERENCE DECIDES WHETHER f16 WEIGHTS BUY TIME.** It is the
+question that has no answer except about the traffic: AF3's trunk keeps its
+weights resident and reads them one scalar at a time, so halving their bytes
+measured 377 ms against 378 - a dead end recorded in AF3.md. AF2 uploads its
+weights every pass and re-reads them 944 times a transition, so the identical
+change is worth 8% of that kernel. AF3's diffusion transformer streams 566 MB
+of weights once per token tile, and it is worth 10-15% there. See AF3.md's memory
 section and `TRANSITION_CHUNK_TARGET_BYTES`.
 
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
