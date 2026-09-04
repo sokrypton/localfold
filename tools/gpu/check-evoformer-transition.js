@@ -92,7 +92,26 @@ export async function main(device, args) {
     },
   };
 
-  const { output } = await new TransitionGpu(device).run(input);
+  // 🔴 THE PRECISION IS AN AXIS, AND WITHOUT IT THIS CHECKED ONLY HALF THE
+  // SHIPPED PATH. A block's transitions run the f16 kernel wherever the device
+  // has shader-f16 and the shape is large enough - see chooseLinearKernel - so
+  // a checker that always built the f32 one was silent about the kernel that
+  // actually folds. Each arm is held to the tolerance its arithmetic implies.
+  const precisions = option(args, "precision", "f32,f16").split(",");
+  const bounds = { f32: 1e-5, f16: 4e-3 };
+  const results = [];
+  for (const precision of precisions) {
+    if (precision === "f16" && !device.features.has("shader-f16")) continue;
+    results.push(await check(device, input, precision, bounds[precision]));
+  }
+  const failed = results.filter((r) => !r.ok).length;
+  if (failed > 0) throw new Error(`${failed} transition precision(s) outside tolerance`);
+  return { rows, channels, hiddenChannels, results };
+}
+
+async function check(device, input, precision, bound) {
+  const { rows, channels, hiddenChannels } = input;
+  const { output } = await new TransitionGpu(device, { precision }).run(input);
   const expected = reference(input);
   let error = 0;
   let scale = 0;
@@ -103,10 +122,8 @@ export async function main(device, args) {
     worst = Math.max(worst, Math.abs(output[i] - expected[i]));
   }
   const relRms = Math.sqrt(error / scale);
-  const bound = 1e-5;
   const ok = relRms <= bound;
   console.log(`${ok ? "PASS" : "FAIL"}\trows ${rows} channels ${channels} hidden ${hiddenChannels}`
     + `\trelRMS ${relRms.toExponential(2)}\tworst ${worst.toExponential(2)}`);
-  if (!ok) throw new Error(`transition relRMS ${relRms.toExponential(2)} exceeds ${bound}`);
-  return { rows, channels, hiddenChannels, relRms, worst, ok };
+  return { precision, bound, relRms, worst, ok };
 }

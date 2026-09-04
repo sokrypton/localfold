@@ -58,6 +58,45 @@ export function chooseLinearTile({ rows, columns }) {
   return wide >= 512 ? LINEAR_TILE_WIDE : LINEAR_TILE;
 }
 
+/**
+ * The tile AND the element its k loop works in, which is one choice.
+ *
+ * 🔴 IN f16 THE NARROW TILE WINS EVERYWHERE THE WIDE ONE DID, and that inverts
+ * the rule above rather than adding to it. The wide tile exists to halve the
+ * weight traffic at the cost of workgroups; f16 halves the traffic too, and
+ * halves the accumulators, so the narrow tile keeps its occupancy AND gets the
+ * cheaper reads. Measured on the transition's own shapes
+ * (bench-evoformer-linear.js), best f32 arm against 32x32 in f16:
+ *
+ *     first,  8192 rows   4.425 -> 3.725 ms      second   15.55 -> 13.45
+ *     pair, 150 tokens    3.225 -> 2.850         first, 4096 rows  2.225 -> 1.925
+ *
+ * 🔴 AND IT LOSES ON SMALL SHAPES, WHICH IS WHY THIS IS A THRESHOLD AND NOT A
+ * SWITCH. At 24 workgroups - a 59-residue structure module's single track -
+ * f32 measures 0.188 ms against f16's 0.237, because there is not enough work
+ * to hide the conversion. Swept: 32 and 64 workgroups favour f32, 128 and up
+ * favour f16, so the crossing is put at 128.
+ *
+ * The structure module and the confidence head do not come through here at all
+ * - they build the default shader once, at module level - so this only ever
+ * decides for a block's transitions, which is where the rows are.
+ */
+export function chooseLinearKernel({ rows, columns, device, requested = "auto" }) {
+  if (requested === "f32") return { tile: chooseLinearTile({ rows, columns }), precision: "f32" };
+  const narrow = Math.ceil(rows / linearTileRows(LINEAR_TILE))
+    * Math.ceil(columns / linearTileColumns(LINEAR_TILE));
+  if (requested === "f16") {
+    if (device?.features?.has("shader-f16") !== true) {
+      throw new Error("the f16 linear kernel requires the shader-f16 feature");
+    }
+    return { tile: LINEAR_TILE, precision: "f16" };
+  }
+  if (device?.features?.has("shader-f16") === true && narrow >= 128) {
+    return { tile: LINEAR_TILE, precision: "f16" };
+  }
+  return { tile: chooseLinearTile({ rows, columns }), precision: "f32" };
+}
+
 export const TRANSITION_TILE_COLUMNS = linearTileColumns();
 
 /**
@@ -409,7 +448,7 @@ ${store.join("\n")}
 }`;
 }
 
-export function createTransitionShaders(input, offsets, tile = LINEAR_TILE) {
+export function createTransitionShaders(input, offsets, tile = LINEAR_TILE, precision = "f32") {
   void input;
   void offsets;
   const normalize = `
@@ -474,7 +513,8 @@ fn main(
       * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
   }
 }`;
-  const [linear, linearResidual] = [false, true].map((residual) => createLinearShader(tile, residual));
+  const [linear, linearResidual] = [false, true]
+    .map((residual) => createLinearShader(tile, residual, precision));
   return [normalize, linear, linearResidual];
 }
 
@@ -494,8 +534,11 @@ export class TransitionGpu {
   allocator;
   pipelines;
 
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
+    // So the differential checker can drive the same choice a block makes, and
+    // force either arm of it.
+    this.options = options;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
   }
@@ -506,12 +549,14 @@ export class TransitionGpu {
     // The same choice the block encoders make, so this path - and the
     // differential checker that drives it - exercises whichever tile a fold of
     // this shape would actually run.
-    const tile = chooseLinearTile({
+    const { tile, precision } = chooseLinearKernel({
       rows: input.rows, columns: Math.max(input.channels, input.hiddenChannels),
+      device: this.device, requested: this.options?.precision ?? "auto",
     });
     const tileColumns = linearTileColumns(tile);
-    const code = createTransitionShaders(input, packed.offsets, tile);
-    const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}:${input.epsilon ?? 1e-5}:${tileColumns}`;
+    const code = createTransitionShaders(input, packed.offsets, tile, precision);
+    const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}`
+      + `:${input.epsilon ?? 1e-5}:${tileColumns}:${precision}`;
     const pipelines = [];
     for (let index = 0; index < code.length; index += 1) {
       pipelines.push(await this.pipelines.get(`${key}:${index}`, code[index]));

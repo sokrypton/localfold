@@ -35,7 +35,7 @@ import {
 import {
   createTransitionNormalizeParameters,
   createTransitionShaders,
-  chooseLinearTile,
+  chooseLinearKernel,
   linearTileColumns,
   packTransitionWeights,
   transitionChunkRows,
@@ -191,13 +191,16 @@ async function encodeTransition(
   // wants the narrow one, and a key that named neither would hand the second
   // shape the first shape's pipeline - dispatched with the wrong column stride,
   // which leaves columns unprojected and reads as a speedup.
-  const tile = chooseLinearTile({ rows, columns: Math.max(channels, hiddenChannels) });
+  // 🔴 THE TILE AND THE PRECISION ARE ONE CHOICE - see chooseLinearKernel.
+  const { tile, precision } = chooseLinearKernel({
+    rows, columns: Math.max(channels, hiddenChannels), device: execution.device,
+  });
   const tileColumns = linearTileColumns(tile);
-  const shaders = createTransitionShaders(descriptor, packed.offsets, tile);
+  const shaders = createTransitionShaders(descriptor, packed.offsets, tile, precision);
   const [normalize, linear, linearResidual] = await Promise.all([
     execution.pipelines.get("block:transition:normalize", shaders[0]),
-    execution.pipelines.get(`block:transition:linear:${tileColumns}`, shaders[1]),
-    execution.pipelines.get(`block:transition:linear-residual:${tileColumns}`, shaders[2]),
+    execution.pipelines.get(`block:transition:linear:${precision}:${tileColumns}`, shaders[1]),
+    execution.pipelines.get(`block:transition:linear-residual:${precision}:${tileColumns}`, shaders[2]),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
