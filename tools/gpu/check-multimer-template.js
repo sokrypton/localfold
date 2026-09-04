@@ -61,8 +61,14 @@ export async function main(device) {
   const stage = await load("toy-oracle-stages.json");
   const results = [];
 
-  for (const [name, file] of [["masked", "toy-template.json"],
-                              ["real", "toy-template-real.json"]]) {
+  // 🔴 THE JAX ARM IS THE ONLY ORACLE HERE. The other two files are numpy
+  // transcriptions - useful, and not ground truth. This one is AF2-multimer's
+  // own module, captured through hk.intercept_methods by
+  // tools/oracle/dump_multimer_template.py, with the pair it actually read.
+  for (const [name, file] of [["jax masked", "toy-template-jax.json"],
+                              ["jax real", "toy-template-jax-real.json"],
+                              ["numpy masked", "toy-template.json"],
+                              ["numpy real", "toy-template-real.json"]]) {
     let oracle;
     try {
       oracle = await load(file);
@@ -71,9 +77,20 @@ export async function main(device) {
       continue;
     }
     const length = oracle.length;
-    const pair = Float32Array.from(stage.embedder_pair).subarray(
+    // The JAX dump carries the pair the module actually read; the numpy ones
+    // read the toy stage file, which is the same pair by construction.
+    const pair = Float32Array.from(oracle.pair ?? stage.embedder_pair).subarray(
       0, length * length * PAIR_CHANNELS);
-    const pairMask = new Float32Array(length * length).fill(1);
+    // 🔴 THE MASKS THE MODULE WAS ACTUALLY GIVEN. Arg 2 is padding_mask_2d and
+    // arg 3 is multichain_mask_2d, and both are all ones in these dumps -
+    // ColabDesign2's featurisation gives one asym_id. Substituting our own
+    // two-chain mask scored 7.3e-2 against a module that is right, which is a
+    // check reporting a fault in its own setup.
+    const pairMask = oracle.pairMask === undefined
+      ? new Float32Array(length * length).fill(1)
+      : Float32Array.from(oracle.pairMask);
+    const multichainMask2d = oracle.multichainMask2d === undefined
+      ? undefined : Float32Array.from(oracle.multichainMask2d);
 
     const template = oracle.template === undefined ? undefined : {
       aatype: Int32Array.from(oracle.template.aatype),
@@ -93,6 +110,7 @@ export async function main(device) {
     const encoder = device.createCommandEncoder({ label: "multimer-template" });
     const captured = await encodeTemplateEmbedding(execution, encoder, {
       length, pairChannels: PAIR_CHANNELS, templates: 1, template, asymId,
+      multichainMask2d,
     }, weights, pairBuffer, maskBuffer, { captureStages: true });
     // 🔴 THE INPUT TERM TOO, because the final number localises nothing. The
     // reference emits `act` after construct_input and after each block; this
@@ -181,24 +199,37 @@ export async function main(device) {
     results.push({ name, relRms, inputRelRms });
     execution.release?.();
 
-    // 🔴 ONLY THE INPUT TERM IS ASSERTED, AND THAT IS NOT TIMIDITY. It is the
-    // part this reference can settle: GPU, plain JS and numpy agree to 2e-7 on
-    // it once the f32 bundle is read rather than the shipped int8 one. The two
-    // PAIR BLOCKS after it are a different story - the numpy transcription of
-    // them was hand-written for that file and has never been checked against
-    // AF2, while `encodeTemplatePairBlock` is the evoformer's own block and
-    // has been. They disagree by relRMS 1.2e-1 after block 1, and asserting
-    // either way would be picking a winner between two unvalidated
-    // implementations. tools/oracle/dump_multimer_template.py captures the
-    // module from JAX and is what settles it; it needs dm-tree installed.
-    if (!(inputRelRms < 2e-5)) {
+    // 🔴 THE numpy ARMS ASSERT ONLY THEIR INPUT TERM, BECAUSE THEIR PAIR
+    // BLOCKS ARE WRONG AND THE JAX ARM SAYS SO. Both sides were unvalidated
+    // when they were first compared - they agreed to 2e-7 on construct_input
+    // and disagreed by 1.2e-1 after the first block - and asserting either way
+    // would have been picking a winner. The capture settled it: the GPU
+    // reproduces AF2 to 6.5e-5 and the numpy transcription misses by 1.0e-2,
+    // so the transcription is at fault. It is kept because its INPUT term is a
+    // second independent reading of construct_input, including the six
+    // geometry features, and that is worth having.
+    if (name.startsWith("jax")) {
+      // 🔴 THE ORACLE ARMS ASSERT THE WHOLE MODULE, because they are the only
+      // ones entitled to. Measured through two pair blocks of f32: 6.5e-5
+      // masked and 3.0e-4 with a real template. The real arm is the larger of
+      // the two by more than its magnitude accounts for (std 2.04 against
+      // 1.75), so there may be a little left in the geometry path - but it is
+      // a thirtieth of what the numpy transcription misses by, and the
+      // featurisation feeding it is bit-identical to what AF2 read.
+      if (!(relRms < 1e-3)) throw new Error(`${name}: relRMS ${relRms}`);
+    } else if (!(inputRelRms < 2e-5)) {
       throw new Error(`${name} input term: relRMS ${inputRelRms}`);
     }
   }
 
-  if (!results.some((result) => result.name === "real")) {
-    throw new Error("the real-template arm did not run: write toy-template-real.json"
-      + " with tools/oracle/template_reference.py --template <pdb>");
+  // 🔴 THE ORACLE ARMS ARE THE POINT AND THEIR ABSENCE IS A FAILURE. Without
+  // them this file compares one unvalidated implementation against another and
+  // reports agreement, which is the shape of a check that cannot fail.
+  for (const wanted of ["jax masked", "jax real"]) {
+    if (!results.some((result) => result.name === wanted)) {
+      throw new Error(`the ${wanted} arm did not run: write its dump with`
+        + " tools/oracle/dump_multimer_template.py");
+    }
   }
   return { layout: AF2_ATOM37.slots, results };
 }

@@ -68,3 +68,5 @@ natives
 # recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
 /plddt-data/
 /toy-template-real.json
+/toy-template-jax.json
+/toy-template-jax-real.json

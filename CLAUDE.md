@@ -80,12 +80,25 @@ disagree - and the comparison localises where:
 | after the first pair block | 1.2e-1 |
 | after the second | 1.1e-2 |
 
-So `construct_input` is settled and the two PAIR BLOCKS are not. Neither side is
-an oracle there: the numpy transcription of them was hand-written for that file
-and never checked against AF2, and `encodeTemplatePairBlock` is the evoformer's
-own block, which has been. `tools/oracle/dump_multimer_template.py` captures the
-module from JAX and is what settles it - **it needs `dm-tree`, which no
-interpreter on this machine has.**
+`tools/oracle/dump_multimer_template.py` settled it by capturing the module from
+AF2 itself, and the GPU is right:
+
+| against AF2, captured | masked | real template |
+|---|---|---|
+| `src/multimer/template.js` | **6.5e-5** | **3.0e-4** |
+| `tools/oracle/template_reference.py` | 1.0e-2 | 2.5e-1 |
+
+🔴 **SO THE numpy REFERENCE'S PAIR BLOCKS ARE WRONG, AND ITS BANNER SAYS SO.**
+Its `construct_input` is right - it agrees with the GPU to 2.15e-7, geometry
+included - and everything after that is not. It stays because that input term is
+a second, independently written reading of the nine features; the checker
+asserts exactly that much of it.
+
+🔴 **AND FEED THE MODULE THE MASKS IT WAS GIVEN.** `__call__<2` is
+`padding_mask_2d` and `<3` is `multichain_mask_2d`, and both are all ones in
+these dumps because ColabDesign2's featurisation gives one asym_id.
+Substituting a two-chain mask of our own scored 7.3e-2 against a module that is
+right - a check reporting a fault in its own setup.
 
 🔴 **AND COMPARE AGAINST `model-multimer-f32`, NOT THE SHIPPED BUNDLE.**
 `model-multimer` is int8 at block 64 (`dtype: "int8"` in its manifest) and the

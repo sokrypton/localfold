@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""AF2-multimer's template embedder, evaluated for a fully-masked template.
+"""AF2-multimer's template embedder, in numpy.
+
+🔴 ITS PAIR BLOCKS ARE WRONG. USE tools/oracle/dump_multimer_template.py.
+Measured against AF2 itself, captured through hk.intercept_methods: this file
+reproduces the module to relRMS 1.0e-2 with the templates masked and 2.5e-1
+with a real template, while src/multimer/template.js reproduces it to 6.5e-5
+and 3.0e-4. The disagreement is entirely after `construct_input` - the input
+term here agrees with the GPU to 2.15e-7 - and is somewhere in the transcribed
+triangle multiplication, triangle attention or transition below. It has never
+been found, because for a long time nothing compared this file to anything: it
+wrote toy-template.json and no reader existed.
+
+What it is still good for is that input term, which is a second and
+independently written reading of construct_input including the six geometry
+features, and tools/gpu/check-multimer-template.js asserts exactly that much of
+it and no more.
+
+The original note follows.
+
+AF2-multimer's template embedder, evaluated for a fully-masked template.
 
 This is the term LocalFold omits. With every template masked off it is far
 smaller than the module count suggests: the distogram, the unit vectors and the
