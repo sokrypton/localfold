@@ -16,14 +16,18 @@
  * 🔴 AND THE WEIGHTS LOAD ONCE PER PAGE, NOT ONCE PER FOLD. A run of five
  * cycles is six folds and a hunt of three runs is eighteen; re-reading a
  * quarter-gigabyte checkpoint between them would dwarf the inference. Both
- * loaders memoise - `loadAf3Weights` in web/af3-model.js by module state, the
- * designer by the promise held here.
+ * loaders memoise - `loadAf3Weights` in web/af3-model.js by module state, and
+ * `loadDesigner` per MPNN family, which is also why switching the picker back
+ * and forth costs nothing after the first read of each.
  */
 import { getDevice } from "./model.js";
 import { createStructureViewer } from "./viewer.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { runDesign } from "../src/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../src/design/mpnn-bridge.js";
+import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
+import { createEntityList } from "./entity-ui.js";
+import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
 const element = (id) => {
@@ -39,10 +43,21 @@ const number = (id, fallback) => {
 
 const viewer = createStructureViewer({ container: element("viewer"), canvasHeight: 480 });
 
+/**
+ * The target, as index.html's own entity rows.
+ *
+ * 🔴 IT STARTS EMPTY, WHICH index.html's LIST NEVER DOES. There it seeds a
+ * protein row because a fold needs something to fold; here an empty list is a
+ * monomer hallucination, which is the method's first example - so a row a
+ * reader has to delete to get the default behaviour would be in the way.
+ */
+const targets = createEntityList(element("entity-rows"), element("add-entity"), {
+  initial: [], onChange: () => syncDesignerNote(),
+});
+
 /** Every record every run has yielded, in the order they arrived. */
 let history = [];
 let controller = null;
-let designerPromise;
 
 function status(text, isError = false) {
   const node = element("status-message");
@@ -65,10 +80,70 @@ function progress(fraction) {
  * that MPNN then reads.
  */
 function chainsFromControls() {
-  const target = element("target").value.toUpperCase().replace(/[^A-Z:]/g, "");
-  const targets = target.split(":").filter((chain) => chain.length > 0);
+  const entities = targets.read();
+  // 🔴 AN EMPTY LIST IS A MONOMER HALLUCINATION, WHICH entitiesProblem CALLS AN
+  // ERROR. It is right to for index.html - a fold of nothing is a mistake
+  // there - and wrong here, where "design me a protein" is the method's own
+  // first example. So the empty case is answered before asking.
+  const filled = entities.filter((entity) => entity.value.trim().length > 0);
+  const expanded = filled.length === 0
+    ? { chains: [], chainKinds: [], ligandCodes: [], modifications: [] }
+    : expandEntities(filled);
   const start = element("start-sequence").value.toUpperCase().replace(/[^A-Z]/g, "");
-  return { chains: [start, ...targets], targets };
+  return {
+    // The designed chain is always protein and always first, which is what
+    // makes "A" mean the binder in the PDB that MPNN then reads.
+    chains: [start, ...expanded.chains],
+    chainKinds: ["protein", ...expanded.chainKinds],
+    // 🔴 THE MODIFICATIONS' CHAIN INDEX SHIFTS BY ONE. expandEntities numbers
+    // them against its own chain list, and the binder is inserted in front of
+    // it - so a phosphoserine on the target's chain 0 belongs to chain 1 here.
+    // The featuriser reads this index to decide which chain to put the
+    // component in, and being one out puts it in the binder.
+    modifications: expanded.modifications.map((modification) => ({
+      ...modification, chain: modification.chain + 1,
+    })),
+    ligandCodes: expanded.ligandCodes,
+    problem: filled.length === 0 ? null : entitiesProblem(filled),
+    // 🔴 COUNTS, NOT LISTS. chooseDesigner takes numbers and compares them with
+    // `> 0`; handed the ARRAY of ligand codes, `["HEM"] > 0` is false and Auto
+    // reported "the complex is protein only" for a fold that had a haem in it.
+    // It folded correctly and designed with the wrong model, silently.
+    ligands: expanded.ligandCodes.length,
+    nucleic: expanded.chainKinds.filter((kind) => NUCLEIC_TYPES.includes(kind)).length,
+  };
+}
+
+/**
+ * The family this job will design with, and the sentence explaining it.
+ *
+ * 🔴 THE PICKER IS NEVER WRITTEN TO. A control that changes its own value
+ * while you are reading it is a control you cannot trust to still say what you
+ * set - so Auto stays Auto and the note beside it says what Auto resolved to.
+ */
+function resolveDesigner(input) {
+  const chosen = element("designer").value;
+  if (chosen !== "auto") {
+    return { name: chosen, why: "you chose it", automatic: false };
+  }
+  return {
+    ...chooseDesigner({ ligands: input.ligands, nucleic: input.nucleic }),
+    automatic: true,
+  };
+}
+
+function syncDesignerNote() {
+  let input;
+  try {
+    input = chainsFromControls();
+  } catch {
+    // A half-typed entity is not worth a message here; Hunt reports it.
+    return;
+  }
+  const { name, why, automatic } = resolveDesigner(input);
+  element("designer-note").textContent = automatic
+    ? `Auto \u2192 ${DESIGNERS[name].label}, because ${why}. ${DESIGNERS[name].note}`
+    : DESIGNERS[name].note;
 }
 
 /** py2Dmol wants a fresh object per cycle: the sequence changes, so the atoms do. */
@@ -167,23 +242,36 @@ function setRunning(running) {
   button.classList.toggle("btn-danger", running);
   button.querySelector("i").className = running ? "fa-solid fa-stop" : "fa-solid fa-crosshairs";
   button.querySelector("span").textContent = running ? "Stop" : "Hunt";
-  for (const id of ["target", "start-sequence", "runs", "cycles", "percent-x",
+  for (const id of ["start-sequence", "runs", "cycles", "percent-x", "add-entity",
                     "temperature", "seed", "steps", "alanine-bias", "omit",
-                    "min-length", "max-length"]) {
+                    "length", "designer"]) {
     element(id).disabled = running;
+  }
+  // The entity rows are inputs, buttons and selects built by entity-ui.js, so
+  // they are disabled by walking them rather than by id.
+  for (const field of element("entity-rows").querySelectorAll("input, select, button")) {
+    field.disabled = running;
+  }
+  for (const field of element("entity-rows").querySelectorAll("[contenteditable]")) {
+    field.contentEditable = running ? "false" : "true";
   }
 }
 
-/** The designer, once per page. */
-function designer() {
-  designerPromise ??= loadDesigner({
+/**
+ * The designer for one family.
+ *
+ * `loadDesigner` memoises per family itself, so switching back and forth
+ * re-reads nothing; this only adds the progress line.
+ */
+function designer(name) {
+  return loadDesigner({
+    name,
     onProgress: (received, total) => {
       status(total > 0
-        ? `Loading the designer · ${Math.round((received / total) * 100)}%`
-        : "Loading the designer");
+        ? `Loading ${DESIGNERS[name].label} · ${Math.round((received / total) * 100)}%`
+        : `Loading ${DESIGNERS[name].label}`);
     },
   });
-  return designerPromise;
 }
 
 async function hunt() {
@@ -192,19 +280,34 @@ async function hunt() {
     return;
   }
 
-  const { chains, targets } = chainsFromControls();
+  let input;
+  try {
+    input = chainsFromControls();
+  } catch (error) {
+    status(error.message, true);
+    return;
+  }
+  const { chains, chainKinds, ligandCodes, modifications } = input;
   // 🔴 THE TARGET IS CHECKED, THE BINDER IS NOT - IT DOES NOT EXIST YET. An
-  // empty designed chain is the normal case and `runDesign` draws one; a
-  // target with a stray letter in it would otherwise fold as a chain of blanks.
-  for (const chain of targets) {
-    const problem = af3SequenceProblem(chain);
+  // empty designed chain is the normal case and `runDesign` draws one. The
+  // check itself is entities.js's, which already knows a DNA chain is written
+  // in A, C, G and T rather than in the twenty amino acids - the rule this
+  // page used to carry a second, shorter copy of.
+  if (input.problem !== null) {
+    status(input.problem, true);
+    return;
+  }
+  // ...and the binder, when one was typed in. entityProblem does not see it:
+  // it is not an entity.
+  if (chains[0].length > 0) {
+    const problem = af3SequenceProblem(chains[0]);
     if (problem !== null) {
-      status(problem, true);
+      status(`Binder: ${problem}`, true);
       return;
     }
   }
-  if (chains[0].length === 0 && number("min-length", 100) > number("max-length", 150)) {
-    status("The binder's shortest length is longer than its longest.", true);
+  if (chains[0].length === 0 && !(number("length", 0) >= 4)) {
+    status("A binder is at least four residues.", true);
     return;
   }
 
@@ -220,7 +323,14 @@ async function hunt() {
   const cycles = Math.max(0, number("cycles", 5));
   const mode = "flow";
   const calls = number("steps", AF3_COUNTS[mode].preferred);
-  const seed = number("seed", 0);
+  // 🔴 DRAWN ONCE PER HUNT AND REPORTED, NOT DRAWN PER RUN AND LOST. Exploring
+  // is the point, so an empty box means a new answer every press - but a run
+  // worth keeping has to be repeatable, and a seed nobody can read is not a
+  // seed. It goes in the status line at the end, and typing it back in pins
+  // the whole hunt.
+  const asked = element("seed").value.trim();
+  const seed = /^[0-9]+$/.test(asked)
+    ? Number(asked) : Math.floor(Math.random() * 0x7fffffff);
   const total = runs * (cycles + 1);
   const started = performance.now();
 
@@ -230,7 +340,8 @@ async function hunt() {
     const weights = await loadAf3Weights((received, expected) => {
       status(`Loading AlphaFold 3 · ${Math.round((received / expected) * 100)}%`);
     });
-    const { model } = await designer();
+    const chosen = resolveDesigner(input);
+    const { model } = await designer(chosen.name);
 
     for (let run = 0; run < runs; run += 1) {
       const iterator = runDesign({
@@ -243,9 +354,7 @@ async function hunt() {
         // so a single seed would make three runs three copies of one run - and
         // "num_designs" would buy nothing at all.
         seed: seed + run,
-        length: chains[0].length > 0 ? chains[0].length : undefined,
-        minLength: number("min-length", 100),
-        maxLength: number("max-length", 150),
+        length: chains[0].length > 0 ? chains[0].length : number("length", 75),
         percentX: number("percent-x", 90),
         temperature: number("temperature", 0.1),
         omit: element("omit").value.toUpperCase().replace(/[^A-Z]/g, ""),
@@ -255,6 +364,10 @@ async function hunt() {
           const done = context.run * (cycles + 1) + context.cycle;
           return foldAf3({
             sequence, mode, calls, recycles: 0, weights, device, signal, seed: seed + run,
+            // A ligand and a nucleic chain change the FOLD as well as the
+            // designer: featurise gives each ligand a chain of its own and
+            // reads a nucleic chain one token per base.
+            chainKinds, ligandCodes, modifications,
             onStatus: (text) => {
               if (!signal.aborted) {
                 status(`Run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · ${text}`);
@@ -293,14 +406,16 @@ async function hunt() {
     progress(1);
     const took = ((performance.now() - started) / 1000).toFixed(0);
     status(best === null
-      ? `Done in ${took} s · nothing under the alanine ceiling`
-      : `Done in ${took} s · best ${best.objective} ${fixed(best.score)}`
-        + ` (run ${best.run + 1}, cycle ${best.cycle})`);
+      ? `Done in ${took} s · seed ${seed} · nothing under the alanine ceiling`
+      : `Done in ${took} s · ${DESIGNERS[chosen.name].label} · best ${best.objective}`
+        + ` ${fixed(best.score)} (run ${best.run + 1}, cycle ${best.cycle})`
+        + ` · seed ${seed}`);
   } catch (error) {
     progress(0);
     if (isAbortError(error)) {
       element("downloads").hidden = bestOverall() === null;
-      status(`Stopped after ${history.length} ${history.length === 1 ? "cycle" : "cycles"}`);
+      status(`Stopped after ${history.length} ${history.length === 1 ? "cycle" : "cycles"}`
+        + ` · seed ${seed}`);
     } else {
       console.error(error);
       status(error.message, true);
@@ -350,10 +465,29 @@ element("orient").addEventListener("click", () => {
 // silently ignored.
 const syncLengthControls = () => {
   const given = element("start-sequence").value.replace(/[^A-Za-z]/g, "").length > 0;
-  element("length-range").hidden = given;
+  element("length-field").hidden = given;
 };
 element("start-sequence").addEventListener("input", syncLengthControls);
 syncLengthControls();
+
+// The picker is built from the registry rather than written into the HTML, so
+// a family added to src/design/designers.js and mirrored by tools/sync-mpnn.py
+// appears here with nothing else to remember.
+for (const name of DESIGNER_NAMES) {
+  element("designer").append(Object.assign(document.createElement("option"), {
+    value: name, textContent: DESIGNERS[name].label,
+  }));
+}
+// 🔴 EXPOSED FOR tools/protein-hunter-in-page.py, WHICH HAS NO OTHER WAY IN.
+// The rows are built by entity-ui.js and their model is a closure; a harness
+// that wrote into a row's field would leave that model behind the DOM and the
+// fold would run on what the model still held. `set` is the same call
+// index.html's paste path makes.
+window.__hunterTargets = targets;
+
+// The entity list notifies through its own onChange; this is the picker.
+element("designer").addEventListener("change", syncDesignerNote);
+syncDesignerNote();
 
 void (async () => {
   const summary = element("gpu-summary");

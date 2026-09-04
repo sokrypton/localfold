@@ -18,7 +18,7 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LocalFold · Protein Hunter</title>
+    <title>😈 Protein Hunter</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
         crossorigin="anonymous" referrerpolicy="no-referrer" />
     <link rel="stylesheet" href="./web/vendor/py2Dmol.app.css">
@@ -46,6 +46,31 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
         .hunt-check { flex-direction: row; align-items: center; gap: 6px; }
         .hunt-check label { font-size: 12px; }
 
+        /* 🔴 THE BINDER ROW'S WIDTHS ARE CLASSES, NOT INLINE STYLES, AND THAT
+           IS THE WHOLE REASON THE MEDIA QUERY BELOW WORKS. Copied from
+           single.html they were four inline attributes on the button column -
+           width, min-width, max-width and flex - and AN INLINE WIDTH IS ONE NO
+           STYLESHEET CAN OVERRIDE: not a media query, not any specificity,
+           only `!important`. Measured at 320px with them: the binder's
+           sequence box was 32px, because the 96px column and the 110px length
+           box would not give any of it back. */
+        .hunt-row { display: flex; gap: 8px; align-items: flex-end; }
+        .hunt-row .hunt-grow { flex: 1 1 auto; min-width: 0; }
+        .hunt-row .hunt-length { flex: 0 0 110px; }
+        .hunt-row .hunt-actions { flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px; }
+        .hunt-row .hunt-actions .btn { width: 100%; justify-content: center; }
+
+        /* One column below the width where three of them stop fitting. The
+           number is the page's own: 272px of shell at a 320px device, less the
+           button column, is not a sequence box. */
+        @media (max-width: 700px) {
+            .hunt-row { flex-wrap: wrap; }
+            .hunt-row .hunt-grow,
+            .hunt-row .hunt-length,
+            .hunt-row .hunt-actions { flex: 1 1 100%; }
+            .hunt-row .hunt-actions { flex-direction: row; }
+        }
+
         /* 🔴 THE TABLE SCROLLS INSIDE ITS OWN CARD. A designed sequence is 150
            characters of monospace and there is one per cycle; without this the
            widest row sets the LAYOUT VIEWPORT and a phone renders the whole
@@ -67,20 +92,44 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
     <div id="viewer-root" class="mx-auto page-width" style="position: relative;">
 
         <div class="page-head" style="padding-right: 0;">
-            <h1>LocalFold <span style="font-size: 15px; font-weight: 500; color: #64748b; margin-left: 8px;">protein hunter</span></h1>
+            <h1>😈 Protein Hunter</h1>
         </div>
 
         <div id="fold-panel" class="container-box page-width" style="margin-bottom: 10px;">
             <div class="fetch-panel">
-                <div class="fetch-row" id="fold-input-container">
-                    <!-- THE TARGET, AND ONLY THE TARGET. The designed chain is
-                         not written here because it does not exist yet: the
-                         loop draws it, mostly as X, and replaces it every
-                         cycle. Leave this empty to hallucinate a monomer. -->
-                    <textarea id="target" rows="2" spellcheck="false" aria-label="Target sequence"
-                        placeholder="Paste the target sequence, chains separated by : — or leave empty to hallucinate a monomer"></textarea>
-                    <div class="fold-actions" style="width: 96px; min-width: 96px; max-width: 96px; flex: 0 0 96px; display: flex; flex-direction: column; gap: 6px;">
-                        <button id="hunt" class="btn btn-primary" style="width: 100%; height: 32px; justify-content: center; font-size: 13px;">
+                <!-- 🔴 THE TARGET IS index.html's ENTITY LIST, NOT A TEXTAREA
+                     OF ITS OWN. It was one, with a `dna:` prefix and a separate
+                     box of CCD codes, and the syntax was ambiguous in exactly
+                     the way ad-hoc syntax is: the prefix separator WAS the
+                     chain separator, so `dna:ATGC` split into a protein chain
+                     reading "DNA" beside a protein chain reading "ATGC". Both
+                     are valid amino acids, so it folded, and nothing said the
+                     DNA had been lost.
+                     web/entity-ui.js already expresses a type, a sequence, a
+                     copy count and modified residues, with no syntax at all,
+                     and web/entities.js already turns the list into the
+                     `{chains, chainKinds, ligandCodes, modifications}` the fold
+                     takes. Reusing them removed the parser and the bug with
+                     it. An empty list is a monomer hallucination. -->
+                <div class="entity-list" style="margin-bottom: 8px;">
+                    <div id="entity-rows"></div>
+                </div>
+
+                <div class="hunt-row" id="fold-input-container">
+                    <div class="hunt-field hunt-grow">
+                        <label for="start-sequence">Binder start sequence (optional)</label>
+                        <input type="text" id="start-sequence" spellcheck="false" placeholder="empty — draw one">
+                    </div>
+                    <div class="hunt-field hunt-length" id="length-field">
+                        <label for="length">Binder length</label>
+                        <input type="number" id="length" min="4" max="600" step="1" value="75">
+                    </div>
+                    <div class="hunt-actions">
+                        <button type="button" id="add-entity" class="btn btn-grey btn-small">
+                            <i class="fa-solid fa-plus"></i>
+                            <span>Target</span>
+                        </button>
+                        <button id="hunt" class="btn btn-primary" style="height: 32px; font-size: 13px;">
                             <i class="fa-solid fa-crosshairs"></i>
                             <span>Hunt</span>
                         </button>
@@ -88,20 +137,6 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                 </div>
 
                 <div class="hunt-grid">
-                    <div class="hunt-field" style="grid-column: span 2;">
-                        <label for="start-sequence">Binder start sequence (optional)</label>
-                        <input type="text" id="start-sequence" spellcheck="false" placeholder="empty — draw one">
-                    </div>
-                    <div class="hunt-field" id="length-range" style="grid-column: span 2; flex-direction: row; gap: 8px;">
-                        <div class="hunt-field" style="flex: 1;">
-                            <label for="min-length">Shortest</label>
-                            <input type="number" id="min-length" min="4" max="600" step="1" value="60">
-                        </div>
-                        <div class="hunt-field" style="flex: 1;">
-                            <label for="max-length">Longest</label>
-                            <input type="number" id="max-length" min="4" max="600" step="1" value="90">
-                        </div>
-                    </div>
                     <div class="hunt-field">
                         <label for="runs">Designs</label>
                         <input type="number" id="runs" min="1" max="50" step="1" value="1">
@@ -129,13 +164,32 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                         <label for="omit">Omit</label>
                         <input type="text" id="omit" spellcheck="false" value="C">
                     </div>
+                    <!-- 🔴 EMPTY MEANS A FRESH DRAW, AND THE STATUS LINE SAYS
+                         WHICH. Pressing Hunt twice with a fixed seed gives the
+                         same design twice, which is the wrong default for a
+                         method whose point is to explore - but a run worth
+                         keeping has to be repeatable, so the seed it drew is
+                         reported rather than lost. Type one in to pin it. -->
                     <div class="hunt-field">
                         <label for="seed">Seed</label>
-                        <input type="number" id="seed" min="0" step="1" value="0">
+                        <input type="text" id="seed" spellcheck="false" placeholder="random" value="">
                     </div>
                     <div class="hunt-field hunt-check">
                         <input type="checkbox" id="alanine-bias">
                         <label for="alanine-bias">Alanine bias ramp</label>
+                    </div>
+                    <!-- 🔴 AUTO IS THE REFERENCE'S OWN RULE, not a heuristic
+                         this page invented: boltz_ph/pipeline.py picks
+                         LigandMPNN when there is a ligand or a nucleic chain
+                         and SolubleMPNN otherwise. See chooseDesigner() in
+                         src/design/designers.js, which says what it picked and
+                         why rather than silently changing this control. -->
+                    <div class="hunt-field" style="grid-column: span 2;">
+                        <label for="designer">Designer</label>
+                        <select id="designer" style="height: 28px; padding: 0 6px; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; min-width: 0;">
+                            <option value="auto" selected>Auto</option>
+                        </select>
+                        <span id="designer-note" style="font-size: 11px; color: #64748b;"></span>
                     </div>
                 </div>
 

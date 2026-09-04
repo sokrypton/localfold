@@ -105,7 +105,14 @@ export function omittedLetters(cycle, omit = "C") {
 const OMIT = -1e8;
 
 /**
- * The `[L, V]` bias `Model.sample` takes, over MPNN's 21-letter alphabet.
+ * How many letters of an MPNN alphabet are protein: the twenty amino acids and
+ * X. Both alphabets put them first - in different ORDERS, see designBias - so
+ * this one boundary separates protein from nucleic under either.
+ */
+const PROTEIN_LETTERS = 21;
+
+/**
+ * The `[L, V]` bias `Model.sample` takes.
  *
  * 🔴 OMISSION AND BIAS SHARE ONE TENSOR, which is the reference's
  * `-1e8 * omit_AA + bias_AA` and not two mechanisms. `Model.sample` falls back
@@ -113,28 +120,60 @@ const OMIT = -1e8;
  * caller that passes a bias owns every omission - including `X`, which is a
  * legal AF3 input letter but never something MPNN should be allowed to design.
  *
+ * 🔴 THE ALPHABET IS AN ARGUMENT BECAUSE NA-MPNN'S IS 33 LETTERS, NOT 21, AND
+ * A BIAS OF THE WRONG WIDTH IS READ AS THE RIGHT ONE. `Model.sample` indexes
+ * it as `bias[position * V + letter]` with V from the CHECKPOINT, so a
+ * 21-wide row handed to a 33-letter model is not a length error - it is every
+ * position reading twelve letters into the next position's row, silently, and
+ * every omission landing on a letter nobody named. Measured on the Top7
+ * fixture: the correct bias designs `SKKITVTIKSKDKTKTITYEVESEKELENVKKELKLL`
+ * and a 21-wide one designs `SARVTVTITEADTTRTLTAEVESAAAAAAAAAAAAAA` - a
+ * plausible protein with a poly-alanine tail, which no assertion about "is it
+ * made of amino acids" can tell from a real answer.
+ *
+ * 🔴 AND THE TWO ALPHABETS ARE NOT THE SAME 21 LETTERS IN THE SAME ORDER.
+ * `ALPHABET` is `ACDEFGHIKLMNPQRSTVWYX` and `NA_ALPHABET` starts
+ * `ARNDCQEGHILKMFPSTWYVX` - the same set, AlphaFold's ordering against
+ * alphabetical, so token 11 is `N` in one and `K` in the other. Every letter
+ * below is therefore looked up in the alphabet actually in use rather than
+ * assumed; the same trap cost ../mpnn a bug where switching family turned
+ * "omit cysteine" into "omit arginine".
+ *
+ * What the extra width needs is the nucleic tokens omitted, which is what
+ * `proteinOnly` does - without it NA-MPNN could answer a protein position
+ * with a nucleotide. Both alphabets put their 21 protein letters first, so
+ * one boundary serves.
+ *
  * @param {number} length residues in the structure, not in the designed chain
- * @param {{omit?: string, alanineBias?: number}} [options]
- * @returns {Float32Array} length * 21
+ * @param {{omit?: string, alanineBias?: number, alphabet?: string,
+ *          proteinOnly?: boolean}} [options]
+ * @returns {Float32Array} length * alphabet.length
  */
 export function designBias(length, options = {}) {
-  const bias = new Float32Array(length * ALPHABET.length);
-  const row = new Float32Array(ALPHABET.length);
+  const alphabet = options.alphabet ?? ALPHABET;
+  const bias = new Float32Array(length * alphabet.length);
+  const row = new Float32Array(alphabet.length);
   // X is position 20 and is never a design choice: the loop puts X into the
   // sequence AF3 folds, and reads letters back out of MPNN.
-  row[ALPHABET.indexOf("X")] = OMIT;
+  row[alphabet.indexOf("X")] = OMIT;
+  // ...and under a wider alphabet, everything past the twenty amino acids and
+  // X. `proteinOnly` defaults on because a designed chain here is a protein.
+  for (let index = PROTEIN_LETTERS; options.proteinOnly !== false
+    && index < alphabet.length; index += 1) {
+    row[index] = OMIT;
+  }
   for (const letter of options.omit ?? "") {
-    const index = ALPHABET.indexOf(letter);
+    const index = alphabet.indexOf(letter);
     if (index >= 0) row[index] = OMIT;
   }
   if (options.alanineBias !== undefined && options.alanineBias !== 0) {
-    const alanine = ALPHABET.indexOf("A");
+    const alanine = alphabet.indexOf("A");
     // ...added, not assigned: "omit alanine" and "discourage alanine" have to
     // compose, and an omitted A stays omitted whatever the ramp says.
     row[alanine] += options.alanineBias;
   }
   for (let position = 0; position < length; position += 1) {
-    bias.set(row, position * ALPHABET.length);
+    bias.set(row, position * alphabet.length);
   }
   return bias;
 }

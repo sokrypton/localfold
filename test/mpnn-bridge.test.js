@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "./harness.js";
 import { chainMaskFor, designChain } from "../src/design/mpnn-bridge.js";
-import { Model } from "../src/design/mpnn/model.js";
+import { DESIGNER_NAMES, DESIGNERS } from "../src/design/designers.js";
+import { Model, sequenceToString } from "../src/design/mpnn/model.js";
+import { NA_ALPHABET } from "../src/design/mpnn/na.js";
+import { ALPHABET } from "../src/design/mpnn/constants.js";
 import { Weights } from "../src/design/mpnn/weights.js";
 import { structureFromText } from "../src/design/mpnn/pdb.js";
 import { enableAcceleration } from "../src/design/mpnn/accel.js";
@@ -56,8 +59,8 @@ const accelerated = await enableAcceleration(
  * node will not point at a file on disk. The page's loader and this one differ
  * only in how the bytes arrive.
  */
-function designer() {
-  const bytes = readFileSync(path("../web/public/mpnn/solublempnn_v_48_020.mpnn"));
+function designer(name = "soluble") {
+  const bytes = readFileSync(path(`../web/public/mpnn/${DESIGNERS[name].file}`));
   return new Model(Weights.fromArrayBuffer(
     bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)));
 }
@@ -149,5 +152,66 @@ describe("designChain", () => {
 
   it("names the chains it does have when asked for one it does not", () => {
     expect(() => designChain(model, { pdb, chain: "Z" })).toThrow(/no chain Z.*A, B/s);
+  });
+});
+
+/**
+ * 🔴 EVERY FAMILY THE PAGE SHIPS, ON THE SAME PROTEIN FIXTURE.
+ *
+ * The picker can reach four checkpoints and three of them were unreachable
+ * from any test. Two things differ per family and both are silent when wrong:
+ *
+ *   * the PARSE. LigandMPNN wants heteroatoms kept, NA-MPNN wants nucleic
+ *     residues promoted to positions, and handing a model the wrong reading
+ *     produces a plausible answer against an incomplete structure.
+ *   * the ALPHABET. NA-MPNN's is 33 letters, `Model.sample` indexes the bias
+ *     as `bias[position * V + letter]` with V from the CHECKPOINT, and
+ *     `result.seq` is built against the 21-letter alphabet whatever the model
+ *     is - while NA_ALPHABET's protein letters are the SAME 21 IN A DIFFERENT
+ *     ORDER (`ARNDCQEGHILKMFPSTWYVX` against `ACDEFGHIKLMNPQRSTVWYX`).
+ *
+ * 🔴 SO "IS IT MADE OF AMINO ACIDS" PROVES NOTHING HERE, WHICH IS HOW THIS
+ * TEST FIRST PASSED WITHOUT MEANING IT. Both failures produce a valid protein
+ * sequence of the right length. Measured on this fixture: the correct reading
+ * gives `SKKITVTIKSKDKTKTITYEV...`, the 21-letter reading of the same tokens
+ * gives `SNNLTYTLNSNENTNTLTWHY...`, and a 21-wide bias gives
+ * `SARVTVTITEADTTRTLTAE` and then fourteen alanines. Every one of those is
+ * twenty amino acids at the right length. What discriminates is the TOKENS
+ * and the alphabet they were read in, which is why designChain returns both.
+ */
+describe.each(DESIGNER_NAMES)("designChain under %s", (name) => {
+  const native = structureFromText(pdb, { ligands: false });
+  const nativeB = native.sequence.slice(native.sequence.length / 2);
+
+  it("designs a protein sequence and holds the other chain", () => {
+    const result = designChain(designer(name), {
+      pdb, chain: "A", temperature: 0.2, random: uniformFrom(21),
+    });
+    // ...the chain's real length, which is not CHAIN_RESIDUES: 1qys is
+    // numbered from 4, so its first 40 residue NUMBERS are 37 residues.
+    expect(result.sequence).toHaveLength(nativeB.length);
+    expect(/^[ACDEFGHIKLMNPQRSTVWY]+$/.test(result.sequence)).toBe(true);
+    expect(result.full.split(":")[1]).toBe(nativeB);
+  });
+
+  it("reads its tokens in the alphabet its checkpoint was trained on", () => {
+    const model = designer(name);
+    const result = designChain(model, {
+      pdb, chain: "A", temperature: 0.2, random: uniformFrom(21),
+    });
+    // The bias must have been the width the checkpoint indexes it at, or the
+    // sample above read across position boundaries.
+    expect(result.alphabet).toHaveLength(model.numLetters);
+    expect(result.alphabet).toBe(model.isNA ? NA_ALPHABET : ALPHABET);
+    // ...and the letters handed back are those tokens under THAT alphabet.
+    const expected = [...result.tokens].slice(0, nativeB.length)
+      .map((token) => result.alphabet[token]).join("");
+    expect(result.sequence).toBe(expected);
+    // For NA-MPNN the wrong reading is a different protein, not a broken one -
+    // so the test that the branch exists is that the two disagree.
+    if (model.isNA) {
+      expect(result.sequence === sequenceToString(result.tokens).slice(0, nativeB.length))
+        .toBe(false);
+    }
   });
 });

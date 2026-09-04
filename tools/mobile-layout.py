@@ -379,6 +379,21 @@ def main():
                      what="proteinhunter.html to load")
             evaluate(ws, "new Promise(r => requestAnimationFrame("
                          "() => setTimeout(() => r(1), 300)))")
+            # 🔴 AND WITH A TARGET ENTITY ROW, which is the element that has
+            # already done this once: index.html's entity row put its sequence
+            # box on a `1fr` grid track and measured 0px at 320 with "PIA" set
+            # one letter per line, while every fit check passed. This page
+            # reuses that row, so it inherits both the layout and the trap, and
+            # it starts EMPTY - so a probe that did not add one would measure a
+            # page with no entity row in it at all.
+            evaluate(ws, """(() => {
+                if (!window.__hunterTargets) return 'no entity list';
+                window.__hunterTargets.set([
+                    { type: 'protein', value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEK', copies: 2 },
+                    { type: 'ligand', value: 'HEM', copies: 1 },
+                ]);
+                return window.__hunterTargets.read().length;
+            })()""", False)
             # 🔴 WITH A ROW IN IT. An empty table cannot squeeze anything,
             # and the row is the whole risk: eight cells of `white-space:
             # nowrap` with a 150-character monospace sequence in the last one.
@@ -414,7 +429,11 @@ def main():
                     overflow: document.documentElement.scrollWidth - innerWidth,
                     shell: box('viewer-root'),
                     viewer: box('canvasContainer'),
-                    target: box('target'),
+                    // The entity row's own sequence box, which is the one that
+                    // has measured 0px before. `.entity-field` is entity-ui's.
+                    target: Math.min(...[...document.querySelectorAll(
+                        '#entity-rows .entity-field')].map((el) =>
+                            Math.round(el.getBoundingClientRect().width))),
                     // 🔴 THE NARROWEST FIELD OF THE CONTROL GRID, NOT THE GRID.
                     // A `1fr` track squeezed to nothing is invisible to every
                     // fit check - the entity row's sequence box measured 0px at
@@ -579,8 +598,8 @@ def main():
     print("proteinhunter.html:")
     for name in ("320px", "360px", "390px", "desktop"):
         H = hunter[name]
-        print("   %-8s asked %d, innerWidth %d, shell %d, viewer %d, target box %d,"
-              " narrowest field %d"
+        print("   %-8s asked %d, innerWidth %d, shell %d, viewer %d,"
+              " narrowest entity box %d, narrowest field %d"
               % (name, H["asked"], H["viewport"], H["shell"], H["viewer"],
                  H["target"], H["field"]))
         if name != "desktop":
@@ -592,8 +611,8 @@ def main():
                 bad.append("proteinhunter.html at %s: the viewer box is %dpx on a %dpx"
                            " device" % (name, H["viewer"], H["asked"]))
             if H["target"] < 100:
-                bad.append("proteinhunter.html at %s: the target box is %dpx wide"
-                           % (name, H["target"]))
+                bad.append("proteinhunter.html at %s: an entity row's sequence box"
+                           " is %dpx wide" % (name, H["target"]))
             if H["field"] < 40:
                 bad.append("proteinhunter.html at %s: a control-grid field is %dpx"
                            " wide - the auto-fit track collapsed"

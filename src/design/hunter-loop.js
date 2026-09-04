@@ -125,7 +125,11 @@ export function withChain(chains, index, sequence) {
  * @param {number} [options.cycles=5]
  * @param {number} [options.length] the designed chain's length when it has no
  *   starting sequence; drawn from [minLength, maxLength] when absent
- * @param {number} [options.minLength=100]
+ * @param {number} [options.minLength=100] the reference's
+ *   --min_protein_length. The page always passes `length` and so never reaches
+ *   these two; they are kept because a length RANGE is part of the method -
+ *   the reference draws a new one per design - and a caller sweeping lengths
+ *   would otherwise have to reimplement the draw.
  * @param {number} [options.maxLength=150]
  * @param {number} [options.percentX=90]
  * @param {boolean} [options.excludeP=false] see sampleSequence

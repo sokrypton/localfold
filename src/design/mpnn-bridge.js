@@ -23,35 +23,64 @@
  * SOURCE.md there and tools/sync-mpnn.py.
  */
 import { ALPHABET } from "./mpnn/constants.js";
-import { Model } from "./mpnn/model.js";
+import { Model, sequenceToString } from "./mpnn/model.js";
+import { NA_ALPHABET, naDisplaySequence } from "./mpnn/na.js";
 import { structureFromText } from "./mpnn/pdb.js";
 import { Weights } from "./mpnn/weights.js";
 import { enableAcceleration } from "./mpnn/accel.js";
+import { DESIGNERS } from "./designers.js";
 import { designBias } from "./sample-sequence.js";
 
 /** Where the page serves the mirror from. */
-export const DEFAULT_CHECKPOINT = "./web/public/mpnn/solublempnn_v_48_020.mpnn";
+export const CHECKPOINT_BASE = "./web/public/mpnn/";
 export const DEFAULT_KERNELS = "./web/vendor/mpnn/kernels.wasm";
+export const DEFAULT_DESIGNER = "soluble";
+
+/** One promise per family, so switching back and forth re-reads nothing. */
+const loaded = new Map();
 
 /**
- * Read the checkpoint and install the SIMD kernel.
+ * Read a checkpoint and install the SIMD kernel.
+ *
+ * 🔴 ON DEMAND AND MEMOISED PER FAMILY. The four checkpoints are 16 MB
+ * together and a page that read all of them on load would spend that before
+ * anyone had chosen anything - while a page that re-read one per design cycle
+ * would spend it eighteen times in a five-cycle hunt. Keyed by name rather
+ * than by URL because the URL is derived from the name; two spellings of one
+ * file would be two entries and two reads.
  *
  * 🔴 THE ACCELERATOR IS BEST EFFORT AND ITS ABSENCE IS NOT AN ERROR. It is a
  * 26 KB WebAssembly module holding one dense kernel; a runtime without SIMD
  * fails to validate it, `enableAcceleration` returns null, and the JS kernel
- * serves every call. The design step is seconds either way against a fold that
- * is seconds - this is not the loop's cost centre.
+ * serves every call. It installs into `ops.linear` globally, so it is loaded
+ * once and every family after the first gets it for free.
  *
- * @param {{url?: string, kernels?: string, signal?: AbortSignal,
+ * @param {{name?: keyof typeof DESIGNERS, base?: string, kernels?: string,
+ *          signal?: AbortSignal,
  *          onProgress?: (received: number, total: number) => void}} [options]
- * @returns {Promise<{model: Model, accelerated: boolean}>}
+ * @returns {Promise<{model: Model, name: string, accelerated: boolean}>}
  */
-export async function loadDesigner(options = {}) {
-  const weights = await Weights.fetch(options.url ?? DEFAULT_CHECKPOINT, {
-    signal: options.signal, onProgress: options.onProgress,
-  });
-  const accelerator = await enableAcceleration(options.kernels ?? DEFAULT_KERNELS);
-  return { model: new Model(weights), accelerated: accelerator !== null };
+export function loadDesigner(options = {}) {
+  const name = options.name ?? DEFAULT_DESIGNER;
+  const designer = DESIGNERS[name];
+  if (designer === undefined) {
+    throw new Error(`no designer ${name} (have ${Object.keys(DESIGNERS).join(", ")})`);
+  }
+  if (!loaded.has(name)) {
+    loaded.set(name, (async () => {
+      const weights = await Weights.fetch(
+        `${options.base ?? CHECKPOINT_BASE}${designer.file}`,
+        { signal: options.signal, onProgress: options.onProgress });
+      const accelerator = await enableAcceleration(options.kernels ?? DEFAULT_KERNELS);
+      return { model: new Model(weights), name, accelerated: accelerator !== null };
+    })().catch((error) => {
+      // ...a failed read is not cached: an aborted or offline first attempt
+      // would otherwise make the family permanently unavailable to the page.
+      loaded.delete(name);
+      throw error;
+    }));
+  }
+  return loaded.get(name);
 }
 
 /**
@@ -88,7 +117,24 @@ export function chainMaskFor(structure, chain) {
  *   colon-separated, in the order the structure lists them.
  */
 export function designChain(model, options) {
-  const structure = structureFromText(options.pdb, { ligands: false });
+  // 🔴 THE PARSE DEPENDS ON THE FAMILY, AND PARSING WRONG IS SILENT. Three
+  // readings of one file:
+  //
+  //   * `ligands: true` keeps heteroatoms as an atom cloud. Only LigandMPNN's
+  //     encoder looks at them; for anyone else they are memory and a longer
+  //     parse.
+  //   * `nucleicAsResidues: true` promotes DNA and RNA to model POSITIONS with
+  //     their own backbone - and switches `S` and `sequence` to the 33-letter
+  //     alphabet, so the structure object belongs to ONE family at a time.
+  //   * neither, which is the protein-only reading.
+  //
+  // Handing NA-MPNN the protein-only parse is the quiet one: the nucleic chain
+  // simply is not in the structure, the designed chain is graphed against
+  // nothing, and every number downstream looks reasonable.
+  const structure = structureFromText(options.pdb, {
+    ligands: model.isLigand, nucleicAsResidues: model.isNA,
+  });
+  const alphabet = model.isNA ? NA_ALPHABET : ALPHABET;
   const chainMask = chainMaskFor(structure, options.chain);
   let designed = 0;
   for (const value of chainMask) designed += value;
@@ -102,6 +148,16 @@ export function designChain(model, options) {
     mask: structure.mask,
     residueIdx: structure.residueIdx,
     chainLabels: structure.chainLabels,
+    // NA-MPNN graphs 18 atom slots over protein and nucleic alike and reads
+    // the polymer type as a node label; the parse above filled all three.
+    X16: structure.X16,
+    X16Mask: structure.X16Mask,
+    polytype: structure.polytype,
+    // LigandMPNN's atom context. Empty arrays for everyone else, which its
+    // encoder is the only one to look at anyway.
+    ligandXyz: structure.ligandXyz,
+    ligandType: structure.ligandType,
+    ligandMask: structure.ligandMask,
   }), {
     batch: 1,
     temperature: options.temperature ?? 0.1,
@@ -111,11 +167,24 @@ export function designChain(model, options) {
     S: Int32Array.from(structure.S),
     chainMask,
     bias: designBias(structure.chainIds.length, {
-      omit: options.omit, alanineBias: options.alanineBias,
+      omit: options.omit, alanineBias: options.alanineBias, alphabet,
     }),
   });
 
-  const letters = [...result.seq[0]];
+  // 🔴 `result.seq` IS 21-LETTER, WHATEVER THE MODEL IS, AND READING NA-MPNN
+  // WITH IT PRODUCES A PERFECTLY GOOD PROTEIN SEQUENCE THAT IS NOT THE ONE THE
+  // MODEL CHOSE. `sequenceToString` in the mirror indexes `ALPHABET` -
+  // `ACDEFGHIKLMNPQRSTVWYX` - while NA-MPNN's tokens are `NA_ALPHABET`,
+  // `ARNDCQEGHILKMFPSTWYVX` then the nucleic letters. Same 21 letters, a
+  // DIFFERENT ORDER, so token 11 is `N` in one and `K` in the other. Measured
+  // on the Top7 fixture: `SKKITVTIKSKDKTKTITYEV...` read the wrong way is
+  // `SNNLTYTLNSNENTNTLTWHY...` - twenty amino acids, right length, wrong
+  // protein, and nothing downstream can tell. `naDisplaySequence` is the
+  // mirror's own reader for that alphabet, and it also undoes the shared-token
+  // trick that stores an RNA base as the corresponding DNA one.
+  const letters = [...(model.isNA
+    ? naDisplaySequence(result.S[0], structure.isRNA)
+    : sequenceToString(result.S[0]))];
   const chainLetters = [];
   for (let index = 0; index < chainMask.length; index += 1) {
     if (chainMask[index] === 1) chainLetters.push(letters[index]);
@@ -135,6 +204,13 @@ export function designChain(model, options) {
     score: result.score[0],
     designed,
     structure,
+    // 🔴 THE TOKENS AND THE ALPHABET THEY MEAN SOMETHING IN, TOGETHER. A
+    // sequence handed over without its alphabet is what the note above is
+    // about: twenty amino acids under either reading, and no way to tell which
+    // was used. test/mpnn-bridge.test.js pins the branch with these, and a
+    // caller wanting a profile or a logo needs them anyway.
+    tokens: result.S[0],
+    alphabet,
   };
 }
 

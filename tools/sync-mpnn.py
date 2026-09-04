@@ -42,12 +42,23 @@ PUBLIC = ROOT / "web" / "public" / "mpnn"
 # What mpnn-bridge.js imports. Everything else is reached from these.
 ENTRY = ["model.js", "pdb.js", "weights.js", "accel.js", "constants.js"]
 
-# 🔴 ONE CHECKPOINT, NOT SIXTEEN. Upstream ships 66 MB of weights across five
-# model families; Pages publishes at most a gigabyte and the AF3 parameters are
-# already most of it. SolubleMPNN at noise 0.2 is what Protein Hunter's own
-# pipeline.py selects when there is no ligand, which is every design this page
-# can currently set up.
-CHECKPOINTS = ["solublempnn_v_48_020.mpnn"]
+# 🔴 ONE CHECKPOINT PER FAMILY, NOT ALL SIXTEEN. Upstream ships 66 MB across
+# five families at four noise levels each; Pages publishes at most a gigabyte
+# and the AF3 parameters are already most of it. These four are 16 MB, they are
+# fetched on demand rather than on load, and they are all at noise 0.2 - which
+# is the level Protein Hunter's own pipeline.py uses and the level a design
+# method wants: enough backbone noise that the model does not read a predicted
+# structure as exact. The membrane models are the family left out; nothing on
+# this page can say a residue is in a bilayer.
+#
+# See DESIGNERS in src/design/designers.js, which is the same list and is what
+# the page reads. The two are held together by test/designers.test.js.
+CHECKPOINTS = [
+    "solublempnn_v_48_020.mpnn",
+    "proteinmpnn_v_48_020.mpnn",
+    "ligandmpnn_v_32_020_25.mpnn",
+    "na_mpnn_design.mpnn",
+]
 
 IMPORT = re.compile(r'from\s+"\./([^"]+)"')
 

@@ -104,14 +104,21 @@ READ_TABLE = """(() => {
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", default="",
-                        help="the target chain(s); empty hallucinates a monomer")
+                        help="comma-separated target entities; a bare sequence"
+                             " is protein, or write dna=ATGC / rna=AUGC."
+                             " Empty hallucinates a monomer.")
     parser.add_argument("--length", type=int, default=24,
-                        help="the designed chain's length, both ends of the range")
+                        help="the designed chain's length")
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=8, help="AF3 sampler steps")
     parser.add_argument("--percent-x", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--designer", default="auto",
+                        help="auto, soluble, protein, ligand or na")
+    parser.add_argument("--ligands", default="",
+                        help="comma-separated CCD codes; each is fetched from"
+                             " the PDB, which is a few KB per code")
     parser.add_argument("--alanine-bias", action="store_true",
                         help="ramp the alanine bias, as the reference does")
     parser.add_argument("--remote-weights", action="store_true",
@@ -139,26 +146,50 @@ def main():
         # disabled on this page. web/hunter.js is a module, so it runs after
         # py2Dmol's blocking script; until its listener is bound a click does
         # nothing at all, silently. The status line it writes is the proof it
-        # ran, and `__hunterReady` is set by nothing, so wait on the listener
-        # having replaced the initial text is wrong too - it has not yet.
-        # What IS true once the module has run: #results exists and the
-        # length-range block has been synced.
+        # ran, and `__hunterReady` is set by nothing, so waiting on the status
+        # line to change is wrong too - it has not yet. What IS true once the
+        # module has run: it has built the designer picker's options from the
+        # registry, so that select has more than the one Auto option the HTML
+        # ships with.
         cdp.wait_for(ws, "document.getElementById('results') !== null"
-                         " && document.getElementById('length-range') !== null"
+                         " && document.getElementById('designer').options.length > 1"
                          " && typeof window.py2Dmol !== 'undefined'",
                      what="the page to finish loading")
         time.sleep(0.5)
 
+        # 🔴 THE TARGET IS ENTITY ROWS NOW, NOT A TEXTAREA, so it is set
+        # through the list's own API rather than by writing a value. `set`
+        # rebuilds the rows and notifies, which is what index.html's paste path
+        # does too - poking a row's field instead would leave the model behind
+        # the DOM, and the fold would run on whatever the model still held.
+        if args.target or args.ligands:
+            entities = []
+            for field in [chunk.strip() for chunk in args.target.split(",")]:
+                if not field:
+                    continue
+                kind, _, value = field.partition("=")
+                if not value:
+                    kind, value = "protein", kind
+                entities.append({"type": kind.lower(), "value": value, "copies": 1})
+            for code in [chunk.strip() for chunk in args.ligands.split(",")]:
+                if code:
+                    entities.append({"type": "ligand", "value": code, "copies": 1})
+            written = cdp.evaluate(ws, """(() => {
+              if (!window.__hunterTargets) return 'no entity list';
+              window.__hunterTargets.set(%s);
+              return JSON.stringify(window.__hunterTargets.read());
+            })()""" % json.dumps(entities))
+            print("entities:", written)
+
         controls = [
-            ("target", args.target),
             ("start-sequence", ""),
-            ("min-length", args.length),
-            ("max-length", args.length),
+            ("length", args.length),
             ("runs", args.runs),
             ("cycles", args.cycles),
             ("percent-x", args.percent_x),
             ("steps", args.steps),
             ("seed", args.seed),
+            ("designer", args.designer),
             ("alanine-bias", args.alanine_bias),
         ]
         problems = cdp.evaluate(ws, SET_CONTROLS % ", ".join(
@@ -168,6 +199,8 @@ def main():
             return 1
         print("controls: ok ·", ", ".join("%s=%s" % (k, v) for k, v in controls))
         print("weights :", "./model-af3-int5/" if local else "the pinned remote")
+        print("designer:", cdp.evaluate(
+            ws, "(document.getElementById('designer-note')||{}).textContent"))
 
         cdp.evaluate(ws, "document.getElementById('hunt').click()")
         cdp.wait_for(ws, """(() => {
@@ -218,9 +251,20 @@ def main():
                     failures.append("cycle %s has no score (%r)"
                                     % (row["cycle"], row["score"]))
                     break
-            if sum(1 for row in rows if row["best"]) != 1:
-                failures.append("%d rows marked best, expected 1"
-                                % sum(1 for row in rows if row["best"]))
+            # 🔴 "NOTHING IS BEST" IS A LEGITIMATE OUTCOME, NOT A FAILURE.
+            # Every design cycle can be over the 20% alanine ceiling - a short
+            # binder with the bias ramp off does it regularly - and the run is
+            # then correctly reporting that it found nothing worth keeping.
+            # What must never happen is TWO bests, or a best where an eligible
+            # cycle was passed over.
+            marked = sum(1 for row in rows if row["best"])
+            eligible = [row for row in rows
+                        if row["cycle"] != "0" and int(row["alanine"].rstrip("%")) <= 20]
+            if marked > 1:
+                failures.append("%d rows marked best, expected at most 1" % marked)
+            elif marked == 0 and eligible:
+                failures.append("nothing marked best though %d cycles were under"
+                                " the alanine ceiling" % len(eligible))
 
         print("frames  :", cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
