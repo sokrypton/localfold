@@ -42,11 +42,22 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
  */
 export const DIALECT = { swapTransposedBias: false };
 
-const THREE_LETTER = {
+export const THREE_LETTER = {
   A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY",
   H: "HIS", I: "ILE", L: "LEU", K: "LYS", M: "MET", F: "PHE", P: "PRO", S: "SER",
   T: "THR", W: "TRP", Y: "TYR", V: "VAL",
 };
+
+/**
+ * ...and back, which reading a template needs.
+ *
+ * 🔴 INVERTED RATHER THAN WRITTEN OUT, so the two directions cannot disagree.
+ * A second table would be twenty more lines that have to be edited together
+ * with this one, and the failure of getting one wrong is a residue silently
+ * becoming UNK - a four-atom blank the model folds around.
+ */
+export const ONE_LETTER = Object.fromEntries(
+  Object.entries(THREE_LETTER).map(([one, three]) => [three, one]));
 
 /**
  * The element symbol for an atomic number.

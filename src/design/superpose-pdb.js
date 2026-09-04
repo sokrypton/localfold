@@ -30,7 +30,12 @@
 /** Fixed columns of a PDB coordinate line. */
 const RECORD = [0, 6];
 const NAME = [12, 16];
+const RES_NAME = [17, 20];
 const CHAIN = 21;
+// The residue number AND its insertion code, together: two residues can share
+// a number and be told apart only by the code, which is what a PDB uses when a
+// structure is numbered against a reference it does not quite match.
+const RES_SEQ = [22, 27];
 const X = [30, 38];
 const Y = [38, 46];
 const Z = [46, 54];
@@ -40,8 +45,12 @@ const Z = [46, 54];
  *
  * @param {string} pdb
  * @returns {{lines: string[], at: number[], points: number[][],
- *            names: string[], chains: string[]}} `at[i]` is the line index
- *   point `i` came from, so a rewrite can put it back without re-parsing.
+ *            names: string[], chains: string[], residueNames: string[],
+ *            residues: string[]}} `at[i]` is the line index point `i` came
+ *   from, so a rewrite can put it back without re-parsing. `residues[i]` is
+ *   the residue NUMBER plus its insertion code, as written - the key a
+ *   template's residue map has to use, because grouping by position in this
+ *   list closes up every gap the structure has.
  */
 export function coordinateAtoms(pdb) {
   const lines = pdb.split("\n");
@@ -49,6 +58,8 @@ export function coordinateAtoms(pdb) {
   const points = [];
   const names = [];
   const chains = [];
+  const residueNames = [];
+  const residues = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const record = line.slice(...RECORD);
@@ -63,8 +74,10 @@ export function coordinateAtoms(pdb) {
     points.push([x, y, z]);
     names.push(line.slice(...NAME).trim());
     chains.push(line[CHAIN]);
+    residueNames.push(line.slice(...RES_NAME).trim());
+    residues.push(line.slice(...RES_SEQ).trim());
   }
-  return { lines, at, points, names, chains };
+  return { lines, at, points, names, chains, residueNames, residues };
 }
 
 /**

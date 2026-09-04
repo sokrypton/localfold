@@ -26,8 +26,11 @@
  * slot at the point the summation starts, so both are compared.
  */
 import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 
 import { templateEmbedding } from "../../src/af3/template-reference.js";
+import { chainResidues, identityMap, templateSlot } from "../../src/af3/template-input.js";
+import { templateGeometry } from "../../src/af3/template-features.js";
 import * as B from "./af3-bundle.js";
 
 const dump = await B.loadDump("af3-oracle-template-f32.json");
@@ -126,6 +129,53 @@ for (let slot = 0; slot < slotCount; slot += 1) {
 }
 console.log(`${slotCount} slots, ${slots.filter(Boolean).length} occupied`
   + `, ${tokens} tokens`);
+
+// 🔴 AND THE FEATURISATION ITSELF, AGAINST AF3'S OWN. Everything above takes
+// the template arrays FROM the dump, so it checks the embedder and not the
+// thing that will actually build those arrays in the browser. This reads the
+// same PDB the dump was made from and holds src/af3/template-input.js to
+// AF3's featuriser element for element - the dense slot each atom landed in,
+// the aatype at a covered position and at an uncovered one.
+if (process.env.TEMPLATE_PDB) {
+  const text = await readFile(process.env.TEMPLATE_PDB, "utf8");
+  const structure = chainResidues(text, process.env.TEMPLATE_CHAIN || undefined);
+  const built = templateSlot({
+    structure, tokens, map: identityMap(structure),
+  });
+  console.log(`built from ${process.env.TEMPLATE_PDB}:`
+    + ` ${built.covered}/${tokens} residues, ${built.atoms} atoms`);
+  const theirs = slots[0];
+  let aatypeWrong = 0;
+  for (let token = 0; token < tokens; token += 1) {
+    if (built.aatype[token] !== theirs.aatype[token]) aatypeWrong += 1;
+  }
+  console.log(`  aatype        ${aatypeWrong === 0 ? "exact" : `${aatypeWrong} of ${tokens} WRONG`}`);
+
+  // 🔴 THE ARRAYS DO NOT MATCH AND MUST NOT BE COMPARED. AF3's dense-24 is
+  // BUILT BY GATHER: `take_along_axis(atom37_mask, dense_indices)` over a
+  // 24-wide index row whose unused entries are 0, so every padding slot
+  // inherits atom 0's mask and atom 0's coordinates. Its template carries 374
+  // "atoms" over 16 residues - 23 of 24 slots - which no amino acid has, and
+  // most of them are the backbone nitrogen repeated. Building the array
+  // sparsely, as an atom either being there or not, is a different
+  // representation of the same structure.
+  //
+  // What has to agree is the MEANING: the features read slot 4 or 1 for the
+  // pseudo-beta and slots 2, 1, 0 for the frame, and nothing else. So the
+  // check is the geometry computed from each, and then the module's whole
+  // output with my arrays in place of AF3's.
+  const mine = templateGeometry(built, multichainMask2d, tokens);
+  const reference = templateGeometry(theirs, multichainMask2d, tokens);
+  for (const key of ["distogram", "pseudoBetaMask2d", "unitVector", "backboneMask2d"]) {
+    B.report(`  ${key}`, reference[key], mine[key]);
+  }
+  const fromMine = templateEmbedding({
+    pair: ref(`${STE}/__call__<0#0`),
+    tokens, pairMask, templates: slotCount, multichainMask2d,
+    slots: [built, ...slots.slice(1)],
+  }, w, { swapTransposedBias: false });
+  B.report("  module, my arrays", ref(`${TE}/__call__`), fromMine);
+}
 
 const perSlot = [];
 const out = templateEmbedding({
