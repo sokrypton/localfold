@@ -190,6 +190,19 @@ def main():
     parser.add_argument("--ligand", action="append", metavar="CCD",
                         help="append a ligand chain by CCD code (repeatable),"
                              " e.g. --ligand ATP")
+    parser.add_argument("--template", default=None, metavar="PATH[:CHAIN]",
+                        help="a PDB file to show the query as a TEMPLATE."
+                             " 🔴 THE MODULE THIS EXISTS FOR IS THE ONE NOBODY"
+                             " CHECKS: src/af3/template-reference.js implements"
+                             " only the empty-template path and says so,"
+                             " because with no template the six geometry"
+                             " features are identically zero and nothing here"
+                             " could tell a correct implementation of them from"
+                             " a wrong one. This is what makes them checkable."
+                             " Templates go on protein chain 0 unless"
+                             " --template-chain says otherwise.")
+    parser.add_argument("--template-chain", type=int, default=0, metavar="INDEX",
+                        help="which query chain the template covers")
     parser.add_argument("--recycles", type=int, default=0,
                         help="trunk recycles (AF3's own default is 10);"
                              " the capture records every pass in order")
@@ -323,7 +336,76 @@ def main():
     # featurise() the same fold_input gives the correct numbering, so that is
     # what a modified dump uses. Ligands are unaffected - their tokens are a
     # chain of their own, so contig numbering happens to land right.
-    if arguments.modification or nucleic:
+    if arguments.template:
+        # 🔴 AF3 TAKES A TEMPLATE AS mmCIF PLUS A RESIDUE MAP, not as the
+        # coordinate arrays AF2 uses - so the reference has to be SERIALISED
+        # rather than gathered. ColabDesign2 already writes that mmCIF
+        # (_mmcif_for), and the query-to-template map is what carries the
+        # masking: AF2 hides a position by zeroing its row, AF3 hides it by
+        # leaving it out of the map.
+        # 🔴 STRAIGHT FROM THE FILE'S OWN ATOM NAMES, NOT THROUGH atom37.
+        # ColabDesign2's _mmcif_for does the same job but reaches AF2's
+        # residue_constants for the atom-type table, which imports `dm-tree` -
+        # not installed here, and not worth installing to copy 37 strings that
+        # the PDB already spells out on every line. A PDB names its atoms; the
+        # mmCIF writer wants names; going through a fixed table in between adds
+        # a thing that can drift and answers no question.
+        import datetime as _dt
+        import colabdesign2.af3.alphafold3.structure as _st
+        from colabdesign2.af3.alphafold3.common import folding_input as _fi_t
+
+        path, _, want_chain = arguments.template.partition(":")
+        rows = []
+        seen = {}
+        for line in open(os.path.expanduser(path)):
+            if not line.startswith("ATOM"):
+                continue
+            if want_chain and line[21] != want_chain:
+                continue
+            # Hydrogens and alternate locations are not template geometry.
+            element = (line[76:78].strip() or line[12:16].strip()[:1]).upper()
+            if element == "H" or line[16] not in " A":
+                continue
+            key = line[22:27]
+            if key not in seen:
+                seen[key] = len(seen)
+            rows.append((seen[key], line[17:20].strip(), line[12:16].strip(),
+                         element, float(line[30:38]), float(line[38:46]),
+                         float(line[46:54])))
+        # 🔴 ONLY AS MANY RESIDUES AS THE QUERY HAS. A map naming a query
+        # residue that does not exist is an error AF3 raises deep inside its
+        # own featuriser, and a template longer than its query is the ordinary
+        # way to produce one.
+        query_length = len(chains[arguments.template_chain])
+        rows = [row for row in rows if row[0] < query_length]
+        if not rows:
+            raise SystemExit(f"--template {path} covers none of the query")
+        covered = sorted({row[0] for row in rows})
+        rank = {residue: index for index, residue in enumerate(covered)}
+        count = len(rows)
+        template_mmcif = _st.from_atom_arrays(
+            name="template", release_date=_dt.date(1970, 1, 1),
+            chain_id=np.full(count, "A", object),
+            chain_type=np.full(count, "polypeptide(L)", object),
+            res_id=np.asarray([rank[row[0]] + 1 for row in rows], np.int32),
+            res_name=np.asarray([row[1] for row in rows], object),
+            atom_name=np.asarray([row[2] for row in rows], object),
+            atom_element=np.asarray([row[3] for row in rows], object),
+            atom_x=np.asarray([row[4] for row in rows], np.float32),
+            atom_y=np.asarray([row[5] for row in rows], np.float32),
+            atom_z=np.asarray([row[6] for row in rows], np.float32),
+            atom_b_factor=np.zeros(count, np.float32),
+            atom_occupancy=np.ones(count, np.float32),
+        ).to_mmcif()
+        templates = {arguments.template_chain: [_fi_t.Template(
+            mmcif=template_mmcif,
+            query_to_template_map={int(q): rank[q] for q in covered})]}
+        print(f"template: {path}"
+              f"{f' chain {want_chain}' if want_chain else ''},"
+              f" {len(covered)} of {query_length} query residues,"
+              f" {count} atoms")
+
+    if arguments.modification or nucleic or arguments.template:
         captured = {}
         _before_capture = f3.spec_to_fold_input
 
@@ -334,7 +416,8 @@ def main():
 
         f3.spec_to_fold_input = _capture
         f3.spec_to_fold_input(spec, name="design", seeds=(0,),
-                              sequences=dict(enumerate(chains)))
+                              sequences=dict(enumerate(chains)),
+                              **({"templates": templates} if arguments.template else {}))
         fold_input = captured["fold_input"]
         # 🔴 --a3m HAS TO BE APPLIED HERE TOO, AND WAS NOT. featurise_spec takes
         # the alignment as an argument; featurise() takes it off the chain, so

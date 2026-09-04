@@ -67,6 +67,20 @@ values means the whole-stack checker, not that file.
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
+🔴 **AND THE TEMPLATE EMBEDDER IS NO LONGER UNCHECKABLE.**
+`tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a
+real structure as its template and captures the module's inputs and its
+per-slot outputs. That answers the objection at the top of
+`src/af3/template-reference.js` - "with no template the six geometry features
+are identically zero, so nothing here can tell a correct implementation of them
+from a wrong one" - which was true and is the reason only the empty-slot path
+exists. See AF3.md's template entry for the numbers.
+
+It writes the template's mmCIF from the PDB's OWN ATOM NAMES rather than
+through atom37. ColabDesign2's `_mmcif_for` does the same job but reaches AF2's
+`residue_constants`, which imports `dm-tree` - not installed here, and not
+worth installing to copy 37 strings that every PDB line already spells out.
+
 🔴 **THE PHONE LAYOUT IS MEASURED, NOT LOOKED AT, AND `--window-size` CLAMPS AT
 500px.** 390 and 320 both report an innerWidth of 500; `--headless=old` clamps
 identically. `tools/cdp.py` is sixty lines of WebSocket (no new dependency) and

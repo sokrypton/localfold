@@ -628,8 +628,32 @@ measurements is in each file.
   bearing there; getting either wrong moved 1e-7 through a reference the GPU
   checkers compare against at 1e-6, which is a tolerance nobody chose. What is
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
-- **Templates raise** rather than compute: the geometry features are
-  unverifiable without a reference.
+- **Templates raise** rather than compute - but the reason has changed and the
+  blocker is gone. It was "the geometry features are unverifiable without a
+  reference", which was true: with no template all six are identically zero, so
+  nothing here could tell a correct implementation from a wrong one.
+  `tools/oracle/dump_af3_trunk.py --template <pdb>` now produces one. Measured
+  on a 16-residue query with Top7 as its template, four slots:
+
+  | slot | template | module output |
+  |---|---|---|
+  | 0 | real, 374 atoms | mean -0.0781 std 2.0651 |
+  | 1, 2, 3 | empty | mean +0.2583 std 0.7561, all three IDENTICAL |
+
+  which is the module's documented behaviour seen from outside: an empty slot
+  is a learned transform of the QUERY and three of them produce the same
+  answer. The dump carries `template_aatype [4, 16]`,
+  `template_atom_mask [4, 16, 24]` and `template_atom_positions [4, 16, 24, 3]`
+  as inputs, and the per-slot 64-channel output beside the module's 128-channel
+  contribution - so the six features can be checked in isolation from the two
+  pairformer blocks that follow them.
+
+  The two constant tables they need are small and, for protein, trivial:
+  `RESTYPE_PSEUDOBETA_INDEX` is dense slot 4 (CB) for every amino acid except
+  glycine, which takes slot 1 (CA); the backbone frame is
+  `RESTYPE_RIGIDGROUP_DENSE_ATOM_IDX[:, 0]` = (2, 1, 0) = (C, CA, N) for all
+  twenty. Nucleotides differ and AF3's own `Template` is documented as one
+  protein chain.
 - ~~**AF3's block is still 1.09x AF2's** for strictly less work.~~ Closed
   2026-09-04: it is 0.61x. See the performance section.
 - **No RNA alignment.** AF3's pipeline searches an RNA database; single-sequence
