@@ -698,12 +698,21 @@ function openBlankFold(stem, keep = []) {
     // With nothing to keep this is the blank it says it is.
     const existing = renderer.objectsData?.[stem];
     if (existing?.frames !== undefined) existing.frames.length = 0;
-    for (const [index, pdb] of keep.entries()) {
+    // 🔴 A KEPT FRAME IS A WHOLE FRAME, NOT JUST COORDINATES. AF3's previews
+    // are bare PDB strings, but AF2's recycles each carry their own pLDDT, PAE
+    // and contact map - and a rewind that dropped those would put the frames
+    // back with no panels behind them, which is worse than losing them.
+    for (const [index, entry] of keep.entries()) {
       const api = window.py2Dmol;
       if (api?.frameFromText === undefined) break;
+      const spec = typeof entry === "string" ? { pdb: entry } : entry;
       try {
-        const frame = api.frameFromText(pdb);
-        frame.name = frame.label = frame.title = `trunk_${index + 1}`;
+        const frame = api.frameFromText(spec.pdb);
+        frame.name = frame.label = frame.title = spec.name ?? `trunk_${index + 1}`;
+        if (spec.confidence !== undefined) frame.confidence = spec.confidence;
+        if (spec.pae !== undefined) { frame.pae = spec.pae; frame.pae_n = spec.pae_n; }
+        if (spec.maps !== undefined) frame.maps = spec.maps;
+        if (spec.align) frame.align = true;
         renderer.addFrame(frame, stem);
       } catch { break; }
     }
@@ -789,6 +798,9 @@ function attachContactMap(frame, recycle, weights, length) {
       const contact = contactMapFor(contacts);
       if (contact === undefined) return;
       frame.maps = { ...frame.maps, contact };
+      // ...and kept, so a rewind can put this frame back without recomputing a
+      // head that costs 131 ms at 128 residues and 712 at 300.
+      recycle.contactMap = contact;
       refreshHeatmap();
     } catch (cause) {
       console.warn("contact map unavailable for this pass", cause);
@@ -1609,16 +1621,57 @@ async function fold(event) {
     const passes = recycles + 1;
     const started = performance.now();
 
+    // 🔴 THE RESUME DECISION COMES BEFORE THE OBJECT, because what the object
+    // is rewound TO depends on it. These four were declared further down, next
+    // to the model call that reads them; the key needs them here.
+    const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
+    const multimer = family === "multimer";
+    const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
+    const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
+
+    // 🔴 THE KEY IS EVERYTHING A PASS READS, for the reason the AF3 one gives:
+    // a stale state is not a slow fold but a structure for another sequence.
+    // Recycles are absent because more of them is a continuation; the tolerance
+    // is present because it decides when the passes STOP.
+    const af2Key = JSON.stringify({
+      sequence, chainLengths, maxMsaSequences, maxExtraSequences, seed, tolerance,
+      unified, family, alignment: cheapHash(alignmentForDriver),
+    });
+    const af2Cached = af2Cache?.key === af2Key ? af2Cache : undefined;
+    const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
+      ? af2Cached.resumable : undefined;
+
     predictionCount += 1;
     const fastaHeader = entityList.header();
-    const baseStem = fastaHeader !== null ? safeJobName(fastaHeader) : `prediction_${predictionCount}`;
-    let stem = baseStem;
-    const existingObjects = new Set((viewer?.objects ?? []).map((o) => o.name));
-    let suffix = 1;
-    while (existingObjects.has(stem) || predictions.has(stem)) {
-      suffix += 1;
-      stem = `${baseStem}_${suffix}`;
-    }
+    const baseStem = fastaHeader !== null
+      ? safeJobName(fastaHeader) : `prediction_${predictionCount}`;
+    // 🔴 uniqueStem READS objectsData; the loop that used to be here read
+    // `viewer.objects`, which does not exist on this build.
+    const stem = resume === undefined ? uniqueStem(baseStem) : af2Cache.stem;
+
+    // 🔴 A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS; IT DOES NOT OPEN A
+    // NEW ONE. Asking for more recycles resumes the cached passes and computes
+    // only the missing ones - but the page opened a fresh object for it and
+    // named it uniquely, so the frames of the passes being resumed were
+    // stranded on the previous object and the new one started empty. Measured:
+    // a one-recycle fold followed by a three-recycle one left prediction_1 with
+    // recycle_0 and recycle_1 and gave prediction_2 a single frame.
+    //
+    // Keeping the NAME is what makes it a rewind rather than a copy: the
+    // alignment, the MSA panel and everything else py2Dmol hangs off an object
+    // stay attached, and only the frames are replayed.
+    const kept = resume === undefined ? [] : af2Cached.recycles.map((pass, index) => ({
+      pdb: predictionToPdb(sequence, index === 0
+        ? (af2Cached.firstPassLanded ?? pass.structure)
+        : alignedToFirstPass(sequence, pass.structure, af2Cached.firstPassLanded),
+        pass.confidence.plddt, chainLengths),
+      name: `recycle_${index}`,
+      confidence: pass.confidence,
+      pae: paeMatrix(pass.confidence.predictedAlignedError, sequence.length),
+      pae_n: sequence.length,
+      maps: pass.contactMap === undefined ? undefined : { contact: pass.contactMap },
+      align: true,
+    }));
 
     // ...a new run draws afresh: the old object stays until the first pass of
     // this one lands, so the page is never blank between folds.
@@ -1627,9 +1680,19 @@ async function fold(event) {
     // watches the drawn frame and refills the card from it whenever the index
     // moves, so hiding it once is not enough while the previous object is still
     // animating - that poll returns early on a missing viewer.
-    openBlankFold(stem);
+    openBlankFold(stem, kept);
     viewer = undefined;
     viewerObject = undefined;
+    // 🔴 AND A REWIND KEEPS ITS HANDLES, because the passes it is about to run
+    // are NOT pass zero. `onRecycle` gets the absolute index, so the branch
+    // that calls loadIntoViewer - the only place `viewer` is ever set - never
+    // fires on a continuation, and every appendPass returned at its first line.
+    // That is why the resumed passes never appeared.
+    if (kept.length > 0) {
+      const registry = window.py2dmol_viewers ?? {};
+      viewer = registry[Object.keys(registry)[0]]?.renderer;
+      viewerObject = viewer === undefined ? undefined : stem;
+    }
     status(`Folding ${sequence.length} residues${chains.length === 1 ? "" : ` in ${chains.length} chains`}`
       + ` · ${passes} pass${passes === 1 ? "" : "es"} · ${family}`);
 
@@ -1695,7 +1758,6 @@ async function fold(event) {
       status(`Folding · ${percent}%`);
     };
 
-    const { maxMsaSequences, maxExtraSequences } = maxMsaConfig();
     // 🔴 THE MULTIMER REGIME IS FOUR FACTS, and they travel together. Multimer
     // runs the outer product mean at the top of each block, works in units of
     // 20 angstroms rather than 10, reads chain identity - asym, entity and
@@ -1712,7 +1774,6 @@ async function fold(event) {
     // AlphaFold's own forward on the toy oracle, running it takes the trunk
     // from 6.4e-2 to 1.3e-2 and CA RMSD from 1.96 A to 1.02 A - and on float32
     // weights, to 7.9e-7 and 0.000 A.
-    const multimer = family === "multimer";
     const regime = multimer
       ? { outerProductMeanFirst: true, positionScale: 20,
         chainAware: true, chainSequences: chains }
@@ -1721,7 +1782,6 @@ async function fold(event) {
     // With its switches off that graph reproduces the monomer one bit for bit,
     // which is the check that the superset is right; a difference is a graph
     // bug rather than a weights bug.
-    const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
     // 🔴 ONE PATH, WHETHER OR NOT THERE IS AN ALIGNMENT. A single sequence is an
     // alignment of depth one, and it is folded as such.
     //
@@ -1736,18 +1796,6 @@ async function fold(event) {
     // three times. It did not know the multimer regime, it did not receive
     // chainAware, and options added to one were not added to the other. Each
     // drift failed silently with a plausible number.
-    const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
-    // 🔴 THE KEY IS EVERYTHING A PASS READS, for the reason the AF3 one gives:
-    // a stale state is not a slow fold but a structure for another sequence.
-    // Recycles are absent because more of them is a continuation; the tolerance
-    // is present because it decides when the passes STOP.
-    const af2Key = JSON.stringify({
-      sequence, chainLengths, maxMsaSequences, maxExtraSequences, seed, tolerance,
-      unified, family, alignment: cheapHash(alignmentForDriver),
-    });
-    const af2Cached = af2Cache?.key === af2Key ? af2Cache : undefined;
-    const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
-      ? af2Cached.resumable : undefined;
     // 🔴 AND THE FRAME EVERY PASS IS SUPERPOSED ONTO COMES BACK WITH IT. The
     // reference is the FIRST pass's landed structure, and a continuation does
     // not run pass zero - onRecycle receives the absolute index, so its
@@ -1772,7 +1820,7 @@ async function fold(event) {
     const allRecycles = resume === undefined
       ? prediction.recycles : [...af2Cached.recycles, ...prediction.recycles];
     af2Cache = { key: af2Key, resumable: prediction.resumable, recycles: allRecycles,
-      firstPassLanded };
+      firstPassLanded, stem };
     const alignedRecycles = allRecycles.map((r, i) => ({
       structure: i === 0 ? (firstPassLanded ?? r.structure) : alignedToFirstPass(sequence, r.structure, firstPassLanded),
       confidence: r.confidence,

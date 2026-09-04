@@ -60,6 +60,9 @@ def main():
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--then-recycles", default=None,
+                        help="fold a SECOND time at this recycle count, which is"
+                             " what the rewind-and-continue path does")
     args = parser.parse_args()
 
     httpd = serve()
@@ -158,6 +161,37 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+
+        # 🔴 THE SECOND FOLD IS THE ONE THAT REWINDS. Asking for more recycles
+        # with everything else unchanged should keep the frames the earlier
+        # passes already produced and append to them - not start an object over.
+        if args.then_recycles is not None:
+            cdp.evaluate(ws, """(() => {
+              const el = document.getElementById('recycles');
+              el.value = %s;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              document.getElementById('predict').click();
+            })()""" % json.dumps(args.then_recycles))
+            time.sleep(2)
+            cdp.wait_for(ws, """(() => {
+              const s = document.getElementById('status-message');
+              return /done|complete|finished|s\\b/i.test(s ? s.textContent : '')
+                && document.getElementById('predict').disabled === false;
+            })()""", timeout=args.timeout, what="the second fold to finish")
+            time.sleep(1.5)
+            print("2nd    :", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const names = Object.keys(v.objectsData);
+              return JSON.stringify({
+                objects: names,
+                current: v.currentObjectName,
+                frames: names.map((n) => [n, v.objectsData[n].frames.length,
+                  v.objectsData[n].frames.map((f) => f.name)]),
+              });
+            })()"""))
+            print("2status:", cdp.evaluate(ws,
+                "(document.getElementById('status-message')||{}).textContent"))
     finally:
         proc.kill()
         httpd.shutdown()
