@@ -76,7 +76,12 @@ export class Af3MsaStackGpu {
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample, epsilon, variance, dialect, base,
     });
+    // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compile = (key, source) => this.pipelines.get(key, source);
+    const compiling = [];
+    const into = (slot, key, source) => {
+      compiling.push(compile(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
+    };
 
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
                        pairChannels: PAIR_CHANNELS };
@@ -86,20 +91,21 @@ export class Af3MsaStackGpu {
     // pairs; see the note on its kernel.
     pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
     for (const [name, source] of Object.entries(opmSources)) {
-      pipelines[`opm:${name}`] = await compile(`${base}:opm:${name}`, source);
+      into(`opm:${name}`, `${base}:opm:${name}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels: PAIR_CHANNELS,
         heads: msaHeads, dimension: msaDimension },
       packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
     for (const [name, source] of Object.entries(attentionSources)) {
-      pipelines[`msa:${name}`] = await compile(`${base}:msa:${name}`, source);
+      into(`msa:${name}`, `${base}:msa:${name}`, source);
     }
-    pipelines.msaTransition = await compile(`${base}:msa-transition`,
+    into("msaTransition", `${base}:msa-transition`,
       createTransitionShader({ rows, channels: msaChannels, factor: 4 },
                              packTransitionWeights(sample.msaTransition).offsets,
                              epsilon, variance));
-    pipelines.addMsa = await compile(`${base}:add-msa`, createAddShader(rows * msaChannels));
+    into("addMsa", `${base}:add-msa`, createAddShader(rows * msaChannels));
+    await Promise.all(compiling);
 
     try {
       const pair = keep(this.allocator.upload("af3-msa.pair", state.pair,

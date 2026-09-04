@@ -928,18 +928,29 @@ export class Af3DiffusionTransformerGpu {
       + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`
       + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}:${outChunk}`
       + `:${weights.channelChunk ?? "d"}:${weightPrecision}`;
-    const compiled = {};
+    // 🔴 AWAITED TOGETHER, NOT ONE AT A TIME. `createComputePipelineAsync`
+    // compiles off the main thread, so a loop that awaits each one in turn
+    // serialises eleven compilations that could overlap - and this stack's
+    // shaders are the largest in the model. It is paid once per process and
+    // lands inside the FIRST denoiser call, which bench-head.js reports at 606
+    // ms against a steady 86. The cache stores the promise, not the pipeline,
+    // so asking for the same key twice is still one compilation.
+    const compiled = { pairLogits: [] };
+    const pending = [];
     for (const [name, source] of Object.entries(sources)) {
       // ...the factory also returns the split counts the dispatch needs, which
       // are numbers rather than shaders.
       if (name === "pairLogitsFor" || typeof source !== "string") continue;
-      compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
+      pending.push(this.pipelines.get(`${base}:${name}`, source)
+        .then((pipeline) => { compiled[name] = pipeline; }));
     }
-    compiled.pairLogits = [];
     for (let inner = 0; inner < perSuper; inner += 1) {
-      compiled.pairLogits.push(await this.pipelines.get(
-        `${base}:pair-logits:${inner}`, sources.pairLogitsFor(inner, perSuper)));
+      const at = inner;
+      pending.push(this.pipelines.get(
+        `${base}:pair-logits:${at}`, sources.pairLogitsFor(at, perSuper))
+        .then((pipeline) => { compiled.pairLogits[at] = pipeline; }));
     }
+    await Promise.all(pending);
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];

@@ -244,7 +244,14 @@ export class Af3PairformerStackGpu {
       n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
       weightPrecision: pairWeightPrecision,
     });
+    // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js. `compile`
+    // returns the cache's promise and the awaits are collected, so these
+    // overlap instead of serialising on the trunk's first pass.
     const compile = (key, source) => this.pipelines.get(key, source);
+    const compiling = [];
+    const into = (slot, key, source) => {
+      compiling.push(compile(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
+    };
 
     const singleTransitionOffsets = packTransitionWeights(blocks[0].singleTransition).offsets;
     const singleOffsets = packSingleAttentionWeights(blocks[0].singleAttention).offsets;
@@ -253,7 +260,7 @@ export class Af3PairformerStackGpu {
       offset: blocks[0].singlePairLogitsNormOffset,
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
-    pipelines.singleTransition = await compile(`${base}:single-transition:${weightPrecision}`,
+    into("singleTransition", `${base}:single-transition:${weightPrecision}`,
       createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4, weightPrecision },
                              singleTransitionOffsets, epsilon, variance));
     const { projectSplits, ...singleSources } = createSingleAttentionShaders(
@@ -263,12 +270,12 @@ export class Af3PairformerStackGpu {
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
-      pipelines[`single:${name}`] =
-        await compile(`${base}:single:${weightPrecision}:${name}`, source);
+      into(`single:${name}`, `${base}:single:${weightPrecision}:${name}`, source);
     }
-    pipelines.pairLogits = await compile(`${base}:pair-logits`,
+    into("pairLogits", `${base}:pair-logits`,
       createPairLogitsShader(n, PAIR_CHANNELS, heads, logitsOffsets, epsilon, variance));
-    pipelines.addSingle = await compile(`${base}:add-single`, createAddShader(n * SINGLE_CHANNELS));
+    into("addSingle", `${base}:add-single`, createAddShader(n * SINGLE_CHANNELS));
+    await Promise.all(compiling);
 
     try {
       // Resident state.

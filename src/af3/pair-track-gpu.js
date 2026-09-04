@@ -75,6 +75,16 @@ export async function compilePairTrack(cache, options) {
   const transitionOffsets = packTransitionWeights(sample.pairTransition).offsets;
 
   const pipelines = {};
+  // 🔴 COMPILED CONCURRENTLY, NOT ONE AT A TIME. `createComputePipelineAsync`
+  // runs off the main thread, so awaiting each of this track's ~20 shaders in
+  // turn serialises compilations that overlap for free. It is paid on the
+  // trunk's FIRST pass, which bench-trunk.js reports at 588 ms against a steady
+  // 379. The cache stores the promise, so a key asked for twice is still one
+  // compilation.
+  const pending = [];
+  const compileInto = (slot, key, source) => {
+    pending.push(cache.get(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
+  };
   for (const direction of ["outgoing", "incoming"]) {
     // 🔴 THE RESIDUAL FORM, so project-out adds into the pair representation
     // rather than writing a delta for a separate add pass to fold in. All five
@@ -89,8 +99,8 @@ export async function compilePairTrack(cache, options) {
     pipelines.normalizeRows = normalizeRows;
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
-      pipelines[`tri:${direction}:${name}`] =
-        await cache.get(`${base}:tri:${direction}:${weightPrecision}:${name}`, source);
+      compileInto(`tri:${direction}:${name}`,
+                  `${base}:tri:${direction}:${weightPrecision}:${name}`, source);
     }
   }
   for (const [key, attention, transpose] of
@@ -101,14 +111,14 @@ export async function compilePairTrack(cache, options) {
       gridOffsets, epsilon, variance, dialect);
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
-      pipelines[`grid:${key}:${name}`] =
-        await cache.get(`${base}:grid:${key}:${stagedPrecision}:${name}`, source);
+      compileInto(`grid:${key}:${name}`,
+                  `${base}:grid:${key}:${stagedPrecision}:${name}`, source);
     }
   }
   // The transition stages two blocks of its own - the layer-normed rows and the
   // gated intermediate - and narrowing them is the same trade as the attention
   // tile above, on the largest kernel in the trunk. See transition-webgpu.js.
-  pipelines.pairTransition = await cache.get(
+  compileInto("pairTransition",
     `${base}:pair-transition:${stagedPrecision}:${weightPrecision}`,
     createTransitionShader(
       { rows: pairs, channels, factor: transitionFactor, residual: true,
@@ -117,7 +127,8 @@ export async function compilePairTrack(cache, options) {
   // 🔴 STILL ONE ADD PASS, and it belongs to the MSA stack rather than to this
   // track: the outer product mean is the one producer whose kernel does not
   // write the pair representation itself. See msa-stack-webgpu.js's "opm.add".
-  pipelines.addPair = await cache.get(`${base}:add-pair`, createAddShader(pairs * channels));
+  compileInto("addPair", `${base}:add-pair`, createAddShader(pairs * channels));
+  await Promise.all(pending);
   return pipelines;
 }
 

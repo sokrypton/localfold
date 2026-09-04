@@ -208,17 +208,22 @@ export class Af3AtomDecoderGpu {
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`;
     const compiled = {};
+    // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
+    const compiling = [];
     for (const [name, source] of Object.entries(sources)) {
       // ...the factory also returns the row tile the dispatch needs, which is a
       // number rather than a shader.
       if (name === "attendFor" || typeof source !== "string") continue;
-      compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
+      compiling.push(this.pipelines.get(`${base}:${name}`, source)
+        .then((pipeline) => { compiled[name] = pipeline; }));
     }
     compiled.attend = [];
     for (let index = 0; index < weights.blocks.length; index += 1) {
-      compiled.attend.push(await this.pipelines.get(
-        `${base}:attend:${index}`, sources.attendFor(index)));
+      const at = index;
+      compiling.push(this.pipelines.get(`${base}:attend:${at}`, sources.attendFor(at))
+        .then((pipeline) => { compiled.attend[at] = pipeline; }));
     }
+    await Promise.all(compiling);
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
