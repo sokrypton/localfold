@@ -67,3 +67,4 @@ natives
 # tools/gpu/probe-af2-dgram-plddt.js: 108 single-sequence targets over four
 # recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
 /plddt-data/
+/toy-template-real.json

@@ -53,6 +53,7 @@ values means the whole-stack checker, not that file.
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
 | Does the template embedder match AF3 with a REAL template? | `tools/oracle/check_af3_template_geometry.js` |
+| Does AF2-multimer's template term match its reference? | `tools/gpu/check-multimer-template.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
@@ -67,6 +68,30 @@ values means the whole-stack checker, not that file.
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **AF2-MULTIMER'S TEMPLATE TERM RUNS ON EVERY RECYCLE AND NOTHING CHECKED
+IT.** `tools/oracle/template_reference.py` computed a numpy reference and wrote
+`toy-template.json`; no JavaScript ever read it. Compared at last, the two
+disagree - and the comparison localises where:
+
+| | relRMS |
+|---|---|
+| the input term, all nine features, masked AND with a real template | **2.15e-7** |
+| after the first pair block | 1.2e-1 |
+| after the second | 1.1e-2 |
+
+So `construct_input` is settled and the two PAIR BLOCKS are not. Neither side is
+an oracle there: the numpy transcription of them was hand-written for that file
+and never checked against AF2, and `encodeTemplatePairBlock` is the evoformer's
+own block, which has been. `tools/oracle/dump_multimer_template.py` captures the
+module from JAX and is what settles it - **it needs `dm-tree`, which no
+interpreter on this machine has.**
+
+🔴 **AND COMPARE AGAINST `model-multimer-f32`, NOT THE SHIPPED BUNDLE.**
+`model-multimer` is int8 at block 64 (`dtype: "int8"` in its manifest) and the
+references read float32 parameters, so the same correct code scores 6e-3 on the
+input term against one and 2e-7 against the other. An hour went into that
+before the manifest was read.
 
 🔴 **AND THE TEMPLATE EMBEDDER IS NO LONGER UNCHECKABLE.**
 `tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a

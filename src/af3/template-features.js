@@ -405,3 +405,42 @@ export function coverageOf(template, tokens, layout = AF3_DENSE) {
   }
   return covered;
 }
+
+/** Floats per pair in the packed geometry buffer. */
+export const GEOMETRY_STRIDE = 6;
+
+/**
+ * The six geometry features, packed for upload.
+ *
+ * 🔴 THE BIN IS STORED PLUS ONE, SO A ZEROED BUFFER IS AN EMPTY SLOT. AF3 puts
+ * a pair closer than 3.25 A in NO bin at all rather than in bin 0, and an
+ * empty template slot has no geometry whatsoever - both are "nothing here".
+ * Storing the raw index would make them indistinguishable from bin 0, which is
+ * the shortest-distance bin and the one carrying the strongest signal. With
+ * the offset, an empty slot binds a buffer of zeros and the shader needs no
+ * flag, no second pipeline and no branch on which slot it is running.
+ *
+ * @param {{distogram: Float32Array, pseudoBetaMask2d: Float32Array,
+ *          unitVector: Float32Array, backboneMask2d: Float32Array}} geometry
+ * @param {number} tokens
+ * @returns {Float32Array} pairs * GEOMETRY_STRIDE
+ */
+export function packTemplateGeometry(geometry, tokens) {
+  const pairs = tokens * tokens;
+  const packed = new Float32Array(pairs * GEOMETRY_STRIDE);
+  const bins = geometry.distogram.length / pairs;
+  for (let pair = 0; pair < pairs; pair += 1) {
+    let bin = -1;
+    for (let index = 0; index < bins; index += 1) {
+      if (geometry.distogram[pair * bins + index] !== 0) { bin = index; break; }
+    }
+    const base = pair * GEOMETRY_STRIDE;
+    packed[base] = bin + 1;
+    packed[base + 1] = geometry.pseudoBetaMask2d[pair];
+    packed[base + 2] = geometry.unitVector[pair * 3];
+    packed[base + 3] = geometry.unitVector[pair * 3 + 1];
+    packed[base + 4] = geometry.unitVector[pair * 3 + 2];
+    packed[base + 5] = geometry.backboneMask2d[pair];
+  }
+  return packed;
+}
