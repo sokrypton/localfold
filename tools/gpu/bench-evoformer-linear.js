@@ -24,6 +24,7 @@
  * match leaves rows unprojected and reads as a speedup.
  */
 import { createLinearShader } from "../../src/evoformer/transition.js";
+import { float32ToFloat16Array } from "../../src/runtime/float16.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -190,6 +191,9 @@ export async function main(device, args) {
   weightData.set(random(inner * columns), 0);
   weightData.set(random(columns), inner * columns);
   const weights = upload(weightData);
+  // ...and the same values as halves, for the arms that bind them that way.
+  const weightsHalf = device.features.has("shader-f16")
+    ? upload(float32ToFloat16Array(weightData)) : weights;
   const source = upload(random(rows * inner));
   const output = device.createBuffer({
     size: rows * columns * 4, usage: storage | GPUBufferUsage.COPY_SRC,
@@ -223,8 +227,12 @@ export async function main(device, args) {
     // `8x8@f16` names a tile and the element its k loop works in; the suffix is
     // optional and `f32` is what every arm meant before it existed.
     const [tileAndPrecision, drop] = spec.split(":");
-    const [tileSpec, precision = "f32"] = tileAndPrecision.split("@");
-    if (precision !== "f32" && !device.features.has("shader-f16")) {
+    // `8x8@f16` is the k loop's element; `8x8@f16/f16` narrows the WEIGHT
+    // BUFFER as well, which is a bandwidth question rather than a register one.
+    const [tileSpec, precisionSpec = "f32"] = tileAndPrecision.split("@");
+    const [precision, weightPrecision = "f32"] = precisionSpec.split("/");
+    if ((precision !== "f32" || precisionSpec.includes("/f16"))
+      && !device.features.has("shader-f16")) {
       results.push({ arm: spec, skipped: "no shader-f16" });
       continue;
     }
@@ -240,7 +248,7 @@ export async function main(device, args) {
         ? parts : [8, 8, ...parts];
       if (columnsPerLane === undefined) throw new Error(`arm ${spec} is not a tile`);
       const descriptor = { lanesX, lanesY, rowsPerLane, columnsPerLane };
-      shader = createLinearShader(descriptor, false, precision);
+      shader = createLinearShader(descriptor, false, precision, weightPrecision);
       tile = {
         rows: descriptor.lanesY * descriptor.rowsPerLane,
         columns: descriptor.lanesX * descriptor.columnsPerLane,
@@ -259,7 +267,8 @@ export async function main(device, args) {
     });
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-      entries: [source, weights, parameters, output].map((buffer, binding) => ({
+      entries: [source, weightPrecision === "f16" ? weightsHalf : weights, parameters, output]
+        .map((buffer, binding) => ({
         binding, resource: { buffer },
       })),
     });

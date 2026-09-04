@@ -205,22 +205,23 @@ async function encodeTransition(
   const descriptor = {
     activations: new Float32Array(0), rows, channels, hiddenChannels, weights: weightsValue,
   };
-  const packed = packTransitionWeights(descriptor);
   // 🔴 THE TILE IS PART OF THE CACHE KEY, because it is part of the shader. The
   // deep MSA transitions want the wide tile and a 59-residue structure module
   // wants the narrow one, and a key that named neither would hand the second
   // shape the first shape's pipeline - dispatched with the wrong column stride,
   // which leaves columns unprojected and reads as a speedup.
   // 🔴 THE TILE AND THE PRECISION ARE ONE CHOICE - see chooseLinearKernel.
-  const { tile, precision } = chooseLinearKernel({
+  const { tile, precision, weightPrecision } = chooseLinearKernel({
     rows, columns: Math.max(channels, hiddenChannels), device: execution.device,
   });
+  const packed = packTransitionWeights(descriptor, weightPrecision);
   const tileColumns = linearTileColumns(tile);
-  const shaders = createTransitionShaders(descriptor, packed.offsets, tile, precision);
+  const shaders = createTransitionShaders(
+    descriptor, packed.offsets, tile, precision, weightPrecision);
   const [normalize, linear, linearResidual] = await Promise.all([
-    execution.pipelines.get("block:transition:normalize", shaders[0]),
-    execution.pipelines.get(`block:transition:linear:${precision}:${tileColumns}`, shaders[1]),
-    execution.pipelines.get(`block:transition:linear-residual:${precision}:${tileColumns}`, shaders[2]),
+    execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
+    execution.pipelines.get(`block:transition:linear:${precision}:${weightPrecision}:${tileColumns}`, shaders[1]),
+    execution.pipelines.get(`block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}`, shaders[2]),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);

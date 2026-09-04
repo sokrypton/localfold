@@ -1,3 +1,4 @@
+import { concatenateAs } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -89,12 +90,19 @@ export function chooseLinearKernel({ rows, columns, device, requested = "auto" }
     if (device?.features?.has("shader-f16") !== true) {
       throw new Error("the f16 linear kernel requires the shader-f16 feature");
     }
-    return { tile: LINEAR_TILE, precision: "f16" };
+    return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
   }
   if (device?.features?.has("shader-f16") === true && narrow >= 128) {
-    return { tile: LINEAR_TILE, precision: "f16" };
+    // 🔴 THE WEIGHT BUFFER NARROWS WITH THE k LOOP, and it is a separate win
+    // from it: this kernel re-reads the whole weight set once per row tile -
+    // 944 times for a 512-row alignment, about 2 GB against a 2 MiB working
+    // set - so halving those bytes is worth 3.675 -> 3.375 ms on top of the
+    // 4.338 -> 3.675 the k loop already bought (bench-evoformer-linear.js at
+    // 8192 rows), and 13.50 -> 12.24 on the second half. It also halves what
+    // AF2 uploads per block, which it does on every pass of every recycle.
+    return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
   }
-  return { tile: chooseLinearTile({ rows, columns }), precision: "f32" };
+  return { tile: chooseLinearTile({ rows, columns }), precision: "f32", weightPrecision: "f32" };
 }
 
 export const TRANSITION_TILE_COLUMNS = linearTileColumns();
@@ -200,7 +208,12 @@ function validate(input) {
   }
 }
 
-export function packTransitionWeights(input) {
+/**
+ * @param {"f32"|"f16"} weightPrecision the element the packed buffer holds. The
+ *   offsets are in ELEMENTS and do not depend on it; a caller that packs one way
+ *   and builds the shaders the other reads half the values at twice the stride.
+ */
+export function packTransitionWeights(input, weightPrecision = "f32") {
   const values = [
     input.weights.layerNormScale,
     input.weights.layerNormOffset,
@@ -215,8 +228,11 @@ export function packTransitionWeights(input) {
     offsets.push(length);
     length += value.length;
   }
-  const data = new Float32Array(length);
-  for (let index = 0; index < values.length; index += 1) data.set(values[index], offsets[index]);
+  const data = concatenateAs(weightPrecision, length, (target) => {
+    for (let index = 0; index < values.length; index += 1) {
+      target.set(values[index], offsets[index]);
+    }
+  });
   return { data, offsets };
 }
 
@@ -270,7 +286,21 @@ export function packTransitionWeights(input) {
  * @param {{lanesX: number, lanesY: number, rowsPerLane: number, columnsPerLane: number}} tile
  * @param {boolean} residual whether the store accumulates into the output
  */
-export function createLinearShader(tile = LINEAR_TILE, residual = false, precision = "f32") {
+export function createLinearShader(
+  tile = LINEAR_TILE, residual = false, precision = "f32", weightPrecision = "f32",
+) {
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown linear weight precision ${weightPrecision}`);
+  }
+  // 🔴 THE WEIGHT BUFFER IS A FOURTH FORMAT, AND FOR AF2 IT IS A BANDWIDTH
+  // QUESTION RATHER THAN A REGISTER ONE. This kernel reads the whole weight set
+  // once per ROW TILE - 944 of them for a 512-row alignment - which is about
+  // 2 GB of traffic per transition per block against a 2 MiB working set that
+  // lives in cache. AF3's trunk kernels do not care, because their weights are
+  // resident and their reads are instruction-bound (measured 377 ms against
+  // 378); AF2 uploads its weights per block and re-reads them far more times.
+  const weight16 = weightPrecision === "f16";
+  const wf = (e) => (weight16 ? `f32(${e})` : e);
   if (!LINEAR_PRECISIONS.has(precision)) throw new RangeError(`unknown linear precision ${precision}`);
   // The element the staged operands and the k loop work in. `mixed` multiplies
   // in f16 and folds into an f32 accumulator once a k tile, so a long inner
@@ -373,7 +403,7 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false, precisi
         for (var j = 0u; j < 4u; j += 1u) {
           let output_column = column_origin + (${v}u * 4u + j) * ${lanesX}u;
           if (output_column < parameters.columns) {
-            staged[j] = ${cast('weights[parameters.weight_offset + weight_k * parameters.columns + output_column]')};
+            staged[j] = ${cast(wf('weights[parameters.weight_offset + weight_k * parameters.columns + output_column]'))};
           }
         }
       }
@@ -389,7 +419,8 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false, precisi
         body.push(`      {
         let output_column = column_origin + ${(v * 4 + c) * lanesX}u;
         if (output_column < parameters.columns) {
-          var value = f32(${accumulator(r, v)}[${c}u]) + weights[parameters.bias_offset + output_column];
+          var value = f32(${accumulator(r, v)}[${c}u])
+            + ${wf("weights[parameters.bias_offset + output_column]")};
           if (parameters.activation == 1u) { value = max(value, 0.0); }
           output[row_${r} * parameters.columns + output_column] ${residual ? "+=" : "="} value;
         }
@@ -404,7 +435,7 @@ export function createLinearShader(tile = LINEAR_TILE, residual = false, precisi
     rowNames.push(`  let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;`);
   }
 
-  return `${element === "f16" ? "enable f16;\n" : ""}
+  return `${element === "f16" || weight16 ? "enable f16;\n" : ""}
 struct MatmulParameters {
   rows: u32,
   inner: u32,
@@ -415,7 +446,7 @@ struct MatmulParameters {
   padding: vec2<u32>,
 };
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
@@ -448,10 +479,16 @@ ${store.join("\n")}
 }`;
 }
 
-export function createTransitionShaders(input, offsets, tile = LINEAR_TILE, precision = "f32") {
+export function createTransitionShaders(
+  input, offsets, tile = LINEAR_TILE, precision = "f32", weightPrecision = "f32",
+) {
   void input;
   void offsets;
-  const normalize = `
+  // The normalize pass binds the SAME buffer as the two linear passes, so it
+  // narrows with them or reads half the values at twice the stride.
+  const weight16 = weightPrecision === "f16";
+  const wf = (e) => (weight16 ? `f32(${e})` : e);
+  const normalize = `${weight16 ? "enable f16;\n" : ""}
 struct NormalizeParameters {
   rows: u32,
   channels: u32,
@@ -464,7 +501,7 @@ struct NormalizeParameters {
 };
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> parameters: NormalizeParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
@@ -510,11 +547,12 @@ fn main(
   let inverse_std = inverseSqrt(partial[0] / f32(parameters.channels) + parameters.epsilon);
   for (var c = local.x; c < parameters.channels; c += 64u) {
     output[base + c] = (source[base + c] - row_mean[0]) * inverse_std
-      * weights[parameters.scale_offset + c] + weights[parameters.offset_offset + c];
+      * ${wf("weights[parameters.scale_offset + c]")}
+      + ${wf("weights[parameters.offset_offset + c]")};
   }
 }`;
   const [linear, linearResidual] = [false, true]
-    .map((residual) => createLinearShader(tile, residual, precision));
+    .map((residual) => createLinearShader(tile, residual, precision, weightPrecision));
   return [normalize, linear, linearResidual];
 }
 
@@ -545,18 +583,19 @@ export class TransitionGpu {
 
   async run(input) {
     validate(input);
-    const packed = packTransitionWeights(input);
     // The same choice the block encoders make, so this path - and the
     // differential checker that drives it - exercises whichever tile a fold of
     // this shape would actually run.
-    const { tile, precision } = chooseLinearKernel({
+    const { tile, precision, weightPrecision } = chooseLinearKernel({
       rows: input.rows, columns: Math.max(input.channels, input.hiddenChannels),
       device: this.device, requested: this.options?.precision ?? "auto",
     });
+    const packed = packTransitionWeights(input, weightPrecision);
     const tileColumns = linearTileColumns(tile);
-    const code = createTransitionShaders(input, packed.offsets, tile, precision);
+    const code = createTransitionShaders(
+      input, packed.offsets, tile, precision, weightPrecision);
     const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}`
-      + `:${input.epsilon ?? 1e-5}:${tileColumns}:${precision}`;
+      + `:${input.epsilon ?? 1e-5}:${tileColumns}:${precision}:${weightPrecision}`;
     const pipelines = [];
     for (let index = 0; index < code.length; index += 1) {
       pipelines.push(await this.pipelines.get(`${key}:${index}`, code[index]));
