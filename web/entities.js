@@ -149,6 +149,34 @@ export function newEntity(type = "protein") {
 }
 
 /**
+ * What is wrong with an entity's template source, or null.
+ *
+ * 🔴 THE SOURCE IS ONE FIELD FOR THREE THINGS, because "which structure" is one
+ * question: `1abc`, `1abc_A` and a UniProt accession all answer it, and two
+ * widgets asking it would be two things to keep in step. Four characters is a
+ * PDB entry and anything else an accession - see parseSource in
+ * web/template-source.js, which is where the fetching lives.
+ *
+ * 🔴 AND A TEMPLATE ONLY MEANS ANYTHING ON A POLYMER. AF3's own Template is
+ * documented as one protein chain; a ligand has no residues to map onto.
+ */
+export function templateProblem(entity) {
+  const template = entity.template;
+  if (template === undefined || template === null) return null;
+  const source = (template.source ?? "").trim();
+  if (source === "") return null;
+  if (entity.type !== "protein") return "Only a protein chain can take a template";
+  if (!/^[A-Za-z0-9]{4,12}([_:][A-Za-z0-9])?$/.test(source)) {
+    return `${source} is not a PDB entry (1abc, 1abc_A) or a UniProt accession`;
+  }
+  const floor = template.minConfidence;
+  if (floor !== undefined && floor !== "" && !(Number(floor) >= 0 && Number(floor) <= 100)) {
+    return "The pLDDT floor is a number from 0 to 100";
+  }
+  return null;
+}
+
+/**
  * What is wrong with one modified residue on one entity, or null.
  *
  * @param {{code: string, position: number}} modification
@@ -255,7 +283,7 @@ export function entityProblem(entity) {
 export function entitiesProblem(entities) {
   if (entities.length === 0) return "Add an entity to fold";
   for (let index = 0; index < entities.length; index += 1) {
-    const problem = entityProblem(entities[index]);
+    const problem = entityProblem(entities[index]) ?? templateProblem(entities[index]);
     if (problem === null) continue;
     return entities.length === 1 ? problem : `Entity ${index + 1}: ${problem}`;
   }
@@ -272,7 +300,8 @@ export function entitiesProblem(entities) {
  * The entity list as the fold pipeline wants it.
  *
  * @param {readonly {type: string, value: string, copies: number}[]} entities
- * @returns {{chains: string[], ligandCodes: string[], sequence: string}}
+ * @returns {{chains: string[], ligandCodes: string[], templates: object[],
+ *            sequence: string}}
  *   `sequence` is the colon-joined chains, which is what every layer below
  *   already reads; `ligandCodes` are upper-cased, in order, one per instance.
  */
@@ -291,6 +320,7 @@ export function expandEntities(entities) {
   // chain in the colon-joined sequence, so it is built in the same loop that
   // builds them and can never drift from it.
   const chainKinds = [];
+  const templates = [];
   for (const entity of entities) {
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
@@ -302,12 +332,28 @@ export function expandEntities(entities) {
           });
         }
         chainKinds.push(entity.type);
+        // 🔴 THE TEMPLATE IS RECORDED PER CHAIN, NOT PER ENTITY, for the same
+        // reason the modifications are: copies are expanded, so two copies of a
+        // templated chain are two chains each carrying it, and the embedder
+        // indexes slots by the chain number it will actually see.
+        if (entity.template?.source && entity.type === "protein") {
+          // 🔴 `origin` IS THE ENTITY'S OWN OBJECT, NOT A COPY OF IT. The
+          // coverage a template turns out to have - "17 of 120 residues" - is
+          // discovered when the structure is fetched, long after this, and the
+          // only place worth writing it is the row the reader is looking at.
+          // Written onto the spread copy instead it goes nowhere, which is
+          // exactly what happened: the page fetched, mapped, folded, and
+          // reported "(no status)".
+          templates.push({ chain: chains.length, ...entity.template,
+                           origin: entity.template });
+        }
         chains.push(cleanSequence(entity.value));
       } else ligandCodes.push(entity.value.trim().toUpperCase());
     }
   }
   return {
-    chains, chainKinds, ligandCodes, modifications, sequence: chains.join(":"),
+    chains, chainKinds, ligandCodes, modifications, templates,
+    sequence: chains.join(":"),
   };
 }
 

@@ -63,6 +63,13 @@ export function chainResidues(text, chain) {
         number,
         code: ONE_LETTER[atoms.residueNames[index]] ?? "X",
         atoms: new Map(),
+        // 🔴 AlphaFold DB PUTS pLDDT IN THE B-FACTOR, which is the only thing
+        // in a predicted structure that says "I am not sure about this". A
+        // crystal structure says it by having no atoms; a prediction has every
+        // residue and no way to say it, so a disordered tail at pLDDT 30 would
+        // otherwise be handed over as geometry. See filterByConfidence.
+        confidence: 0,
+        atomCount: 0,
       };
       byNumber.set(number, residue);
       order.push(residue);
@@ -71,6 +78,11 @@ export function chainResidues(text, chain) {
     const residue = byNumber.get(number);
     if (!residue.atoms.has(atoms.names[index])) {
       residue.atoms.set(atoms.names[index], atoms.points[index]);
+      // ...a running mean, because a residue's atoms all carry the same pLDDT
+      // in an AlphaFold DB file and an average is right either way.
+      residue.atomCount += 1;
+      residue.confidence += (atoms.bFactors[index] - residue.confidence)
+        / residue.atomCount;
     }
   }
   return {

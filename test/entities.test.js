@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "./harness.js";
 import {
-  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity,
+  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity, templateProblem,
 } from "../web/entities.js";
 
 const protein = (value, copies = 1) => ({ type: "protein", value, copies });
@@ -51,6 +51,9 @@ describe("entity validation", () => {
     expect(entitiesProblem([ligand("HEM")])).toBe(null);
     expect(expandEntities([ligand("HEM")])).toEqual({
       chains: [], chainKinds: [], ligandCodes: ["HEM"], modifications: [],
+      // ...a ligand takes no template: AF3's own Template is one protein
+      // chain, and a ligand has no residues to map onto.
+      templates: [],
       sequence: "",
     });
   });
@@ -176,5 +179,52 @@ describe("nucleic entities", () => {
     const modified = { ...chain("dna", "ACGT"),
       modifications: [{ code: "SEP", position: 2 }] };
     expect(entityProblem(modified)).toMatch(/not supported/);
+  });
+});
+
+describe("entity templates", () => {
+  const withTemplate = (source, extra = {}) => ({
+    type: "protein", value: "ACDEFGHIK", copies: 1, modifications: [],
+    template: { source, ...extra },
+  });
+
+  it("accepts a PDB entry, a chain suffix and an accession", () => {
+    for (const source of ["1abc", "1abc_A", "1abc:B", "P00533"]) {
+      expect(templateProblem(withTemplate(source))).toBe(null);
+    }
+  });
+
+  it("says so when the source is not one of those", () => {
+    expect(templateProblem(withTemplate("not a code!"))).toContain("not a PDB entry");
+  });
+
+  // AF3's own Template is documented as one protein chain, and a ligand has no
+  // residues for a map to name.
+  it("refuses a template on anything but a protein", () => {
+    expect(templateProblem({ ...withTemplate("1abc"), type: "ligand" }))
+      .toContain("Only a protein chain");
+  });
+
+  it("ignores an empty source rather than complaining about it", () => {
+    expect(templateProblem(withTemplate(""))).toBe(null);
+    expect(templateProblem({ type: "protein", value: "AC", copies: 1 })).toBe(null);
+  });
+
+  it("holds the pLDDT floor to a percentage", () => {
+    expect(templateProblem(withTemplate("P00533", { minConfidence: 70 }))).toBe(null);
+    expect(templateProblem(withTemplate("P00533", { minConfidence: 700 })))
+      .toContain("0 to 100");
+  });
+
+  // 🔴 PER CHAIN, NOT PER ENTITY, because copies are expanded - the same rule
+  // the modifications follow, and for the same reason: the embedder indexes
+  // slots by the chain number it will actually see.
+  it("gives every copy of a chain its own template", () => {
+    const expanded = expandEntities([
+      { ...withTemplate("1abc_A"), copies: 2 },
+      { type: "protein", value: "MKV", copies: 1, modifications: [] },
+    ]);
+    expect(expanded.templates.map((template) => template.chain)).toEqual([0, 1]);
+    expect(expanded.templates[0].source).toBe("1abc_A");
   });
 });

@@ -508,6 +508,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // ...and the chain ids, which the template embedder masks its geometry
       // by. See the note at its call site in trunk-webgpu.js.
       asymId: batch.asymId,
+      // 🔴 THE SLOTS ARE OVER TOKENS, NOT RESIDUES, and a fold with a ligand or
+      // a modified residue has more of the first than the second. They are
+      // built against `tokens` by web/template-source.js for that reason;
+      // handing over a residue-indexed array would put a template's geometry
+      // one place to the left of everything after the first ligand.
       templateSlots: options.templateSlots,
       pairMask, seqMask, previousPair, previousSingle,
     }, weights.trunk, DIALECT, {

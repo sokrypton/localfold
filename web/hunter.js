@@ -30,6 +30,7 @@ import { createEntityList } from "./entity-ui.js";
 import { superposeCycle } from "../src/design/superpose-pdb.js";
 import { followActiveFrame, updateScoresCard } from "./scores-card.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
+import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
 const element = (id) => {
@@ -124,6 +125,12 @@ function chainsFromControls() {
       ...modification, chain: modification.chain + 1,
     })),
     ligandCodes: expanded.ligandCodes,
+    // 🔴 THE CHAIN INDEX SHIFTS BY ONE, LIKE THE MODIFICATIONS'. expandEntities
+    // numbers against its own chain list and the binder is inserted in front of
+    // it, so a template on the target's chain 0 belongs to chain 1 here.
+    templates: (expanded.templates ?? []).map((template) => ({
+      ...template, chain: template.chain + 1,
+    })),
     problem: filled.length === 0 ? null : entitiesProblem(filled),
     // 🔴 COUNTS, NOT LISTS. chooseDesigner takes numbers and compares them with
     // `> 0`; handed the ARRAY of ligand codes, `["HEM"] > 0` is false and Auto
@@ -345,6 +352,70 @@ const keepDiffusionFrames = () => element("diffusion-frames").checked;
 // announce. See followActiveFrame.
 followActiveFrame(() => ({ renderer: viewer.renderer, object: viewer.object }));
 
+/**
+ * Every chain's template, fetched and mapped onto the complex's tokens.
+ *
+ * 🔴 A TOKEN IS NOT A RESIDUE ONCE THERE IS A LIGAND, so the offset a chain
+ * starts at is counted over what the featuriser will actually see. Getting it
+ * from the residue counts alone puts every template after the first ligand one
+ * place to the left.
+ *
+ * 🔴 AND ONE SLOT PER TEMPLATE, NOT ONE PER CHAIN. AF3 pads to four slots and a
+ * chain's template goes in its own; two chains templated from two files are two
+ * slots, and their cross-chain pairs stay masked because they were never in one
+ * frame. A single file covering both is one slot with `spanChains`.
+ */
+async function loadTemplates(input, binderLength, signal) {
+  const templates = input.templates ?? [];
+  window.__hunterTemplateLog = [`asked for ${templates.length}`];
+  if (templates.length === 0) return undefined;
+  // 🔴 A FAILED FETCH STOPS THE HUNT RATHER THAN FOLDING WITHOUT THE TEMPLATE.
+  // Someone who typed a structure in wants it used; a fold that quietly
+  // proceeds without it looks identical to one that used it and scores worse
+  // for a reason nothing on the page states.
+
+  // 🔴 THE BINDER'S LENGTH IS PASSED IN, NOT READ OFF THE CHAIN. Its entry is
+  // EMPTY at this point - runDesign draws the starting sequence - so taking
+  // `chains[0].length` makes the complex 53 tokens instead of 69, and every
+  // template after the binder lands that many places to the left. It still
+  // folds, and it still changes the answer, which is what makes it worth a
+  // note: measured, the fold moved from ipTM 0.324 to 0.533 with the template
+  // in the WRONG place.
+  const chains = input.chains.map((chain, index) =>
+    (index === 0 ? binderLength : chain.length));
+  const offsets = [];
+  let at = 0;
+  for (const length of chains) { offsets.push(at); at += length; }
+  const tokens = at;
+
+  const slots = [];
+  for (const template of templates) {
+    const source = (template.source ?? "").trim();
+    if (source === "") continue;
+    status(`Fetching template ${source}`);
+    window.__hunterTemplateLog.push(`fetching ${source}`);
+    const fetched = await fetchStructure(source, { signal });
+    window.__hunterTemplateLog.push(`got ${fetched.text.length} bytes from ${fetched.url}`);
+    const built = buildTemplate({
+      text: fetched.text,
+      chain: fetched.chain,
+      query: input.chains[template.chain] ?? "",
+      tokens,
+      offset: offsets[template.chain] ?? 0,
+      minConfidence: template.minConfidence ?? (fetched.kind === "afdb" ? 70 : 0),
+      spanChains: template.spanChains === true,
+    });
+    const description = describeCoverage(built.coverage);
+    // ...onto the entity's own object, so the row shows it. See `origin`.
+    if (template.origin !== undefined) template.origin.status = description;
+    template.status = description;
+    window.__hunterTemplateLog.push(`built ${description}`);
+    status(`Template ${source} · ${description}`);
+    slots.push(built.slot);
+  }
+  return slots.length === 0 ? undefined : slots;
+}
+
 function download(name, text, type = "text/plain") {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const link = Object.assign(document.createElement("a"), { href: url, download: name });
@@ -475,8 +546,21 @@ async function hunt() {
     ? Number(asked) : Math.floor(Math.random() * 0x7fffffff);
   const total = runs * (cycles + 1);
   const started = performance.now();
+  // One number, used for the template placement and for the draw, so the two
+  // cannot disagree about how long the binder is.
+  const binderLength = chains[0].length > 0 ? chains[0].length : number("length", 75);
 
   try {
+    // 🔴 THE TEMPLATES ARE FETCHED ONCE, BEFORE THE FIRST FOLD, AND NOT PER
+    // CYCLE. A hunt is one fold per cycle per design; re-fetching a structure
+    // eighteen times would be eighteen requests for a file that cannot have
+    // changed, and the coverage line would flicker with them.
+    //
+    // 🔴 AND THE SLOTS ARE BUILT AGAINST THE BINDER'S LENGTH, WHICH IS DRAWN.
+    // They are over the complex's TOKENS, so a template cannot be built until
+    // the designed chain has a length - which is why this happens here rather
+    // than when the field is typed into.
+    const templateSlots = await loadTemplates(input, binderLength, signal);
     status("Starting WebGPU");
     const device = await getDevice(signal);
     // 🔴 THE TWO LOADERS REPORT PROGRESS DIFFERENTLY, AND GETTING IT WRONG
@@ -506,7 +590,7 @@ async function hunt() {
         // so a single seed would make three runs three copies of one run - and
         // "num_designs" would buy nothing at all.
         seed: seed + run,
-        length: chains[0].length > 0 ? chains[0].length : number("length", 75),
+        length: binderLength,
         percentX: number("percent-x", 90),
         temperature: number("temperature", 0.1),
         omit: element("omit").value.toUpperCase().replace(/[^A-Z]/g, ""),
@@ -519,7 +603,7 @@ async function hunt() {
             // A ligand and a nucleic chain change the FOLD as well as the
             // designer: featurise gives each ligand a chain of its own and
             // reads a nucleic chain one token per base.
-            chainKinds, ligandCodes, modifications,
+            chainKinds, ligandCodes, modifications, templateSlots,
             onStatus: (text) => {
               if (!signal.aborted) {
                 status(`Run ${context.run + 1}/${runs} · cycle ${context.cycle}/${cycles} · ${text}`);
@@ -641,6 +725,14 @@ window.__hunterTargets = targets;
 // reads when an assertion fails. The table shows the numbers; only the records
 // carry the structures those numbers describe.
 window.__hunterHistory = () => history;
+
+// ...and what the controls currently amount to, which is the thing a fold
+// actually reads. The entity list can hold a template that never reaches the
+// fold, and only this tells the two apart.
+window.__hunterInput = () => {
+  const input = chainsFromControls();
+  return { ...input, templates: input.templates.map((t) => ({ ...t, origin: undefined })) };
+};
 
 /**
  * Rebuild the step dial for the sampler that is selected.

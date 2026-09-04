@@ -36,6 +36,8 @@ const CHAIN = 21;
 // a number and be told apart only by the code, which is what a PDB uses when a
 // structure is numbered against a reference it does not quite match.
 const RES_SEQ = [22, 27];
+// The B-factor, which a predicted structure uses to carry pLDDT.
+const B_FACTOR = [60, 66];
 const X = [30, 38];
 const Y = [38, 46];
 const Z = [46, 54];
@@ -60,6 +62,7 @@ export function coordinateAtoms(pdb) {
   const chains = [];
   const residueNames = [];
   const residues = [];
+  const bFactors = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     const record = line.slice(...RECORD);
@@ -76,8 +79,13 @@ export function coordinateAtoms(pdb) {
     chains.push(line[CHAIN]);
     residueNames.push(line.slice(...RES_NAME).trim());
     residues.push(line.slice(...RES_SEQ).trim());
+    // ...0 when the column is blank or unparseable, which reads as "no
+    // confidence stated" rather than as a confident zero. Only AlphaFold DB
+    // puts anything meaningful here.
+    const bFactor = Number(line.slice(...B_FACTOR));
+    bFactors.push(Number.isFinite(bFactor) ? bFactor : 0);
   }
-  return { lines, at, points, names, chains, residueNames, residues };
+  return { lines, at, points, names, chains, residueNames, residues, bFactors };
 }
 
 /**

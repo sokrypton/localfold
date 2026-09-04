@@ -95,6 +95,21 @@ included - and everything after that is not. It stays because that input term is
 a second, independently written reading of the nine features; the checker
 asserts exactly that much of it.
 
+🔴 **AND A TEMPLATE IS REACHABLE FROM THE PAGE NOW.** A protein entity row
+takes one source - `1abc`, `1abc_A` or a UniProt accession, one field because it
+is one question - fetched by `web/template-source.js` from the RCSB or AlphaFold
+DB and turned into a slot over the complex's TOKENS. The row shows what it
+covered, because a template covering 17 of 120 residues folds perfectly well and
+says nothing about it. Measured on a 53-residue target with 1QYS_A: ipTM 0.324
+without, 0.358 with.
+
+🔴 **AND A SLOT BUILT BEFORE THE BINDER'S LENGTH IS KNOWN IS BUILT AT THE WRONG
+OFFSET.** Protein Hunter draws its designed chain inside the loop, so
+`chains[0].length` is 0 when the templates are fetched - which made the complex
+53 tokens instead of 69 and put the target's template across the binder. It
+folded, and it moved ipTM from 0.324 to **0.533**, which looks like a template
+working well. The binder's length is passed in now.
+
 🔴 **AF2-MONOMER'S EMBEDDER IS A THIRD DIALECT, NOT A THIRD COPY.** Same six
 geometry features, but: ONE `Linear` over an 88-channel CONCATENATION rather
 than nine summed projections; the whole concatenation masked by the BACKBONE

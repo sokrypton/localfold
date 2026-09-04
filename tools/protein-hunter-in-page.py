@@ -53,6 +53,23 @@ def serve(local_weights):
         def log_message(self, *a):
             pass
 
+        def end_headers(self):
+            # 🔴 NOTHING IS CACHED, BECAUSE A CACHED ES MODULE LOOKS LIKE A
+            # BROKEN FEATURE. python's http.server sends no cache headers, so
+            # Chrome caches web/*.js heuristically - and a page reloaded after
+            # an edit runs the OLD module while the file on disk and the bytes
+            # this server hands out are both new. It cost an hour here: the
+            # served text contained a debug hook the running page had never
+            # heard of, so a function that ran perfectly well reported "never
+            # ran". CLAUDE.md documents the same trap for the browser you are
+            # looking at; this is the harness's half of it.
+            # ...for SOURCE only. Sending it for everything defeats the
+            # weight cache too, and the AF3 bundle is 265 MB of shards: a run
+            # that took a minute took more than ten.
+            if self.path.split("?")[0].endswith((".js", ".html", ".css")):
+                self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
         def do_GET(self):
             if local_weights and self.path.split("?")[0] == MANIFESTS:
                 source = open(os.path.join(REPO, MANIFESTS.lstrip("/")), "rb").read()
@@ -60,11 +77,6 @@ def serve(local_weights):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript")
                 self.send_header("Content-Length", str(len(body)))
-                # 🔴 AND NO CACHING, or the second run of this tool serves the
-                # UNPATCHED module from Chrome's heuristic cache and quietly
-                # goes to the network anyway. A fresh profile per launch makes
-                # that unlikely; saying so makes it impossible.
-                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -124,6 +136,12 @@ def main():
     parser.add_argument("--recycles", type=int, default=0)
     parser.add_argument("--percent-x", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--template", default="",
+                        help="a PDB entry (1abc, 1abc_A) or UniProt accession"
+                             " to show the first protein target as a template."
+                             " 🔴 THIS GOES TO THE NETWORK - the RCSB or"
+                             " AlphaFold DB - unlike everything else this tool"
+                             " does.")
     parser.add_argument("--designer", default="auto",
                         help="auto, soluble, protein, ligand or na")
     parser.add_argument("--ligands", default="",
@@ -184,6 +202,14 @@ def main():
             for code in [chunk.strip() for chunk in args.ligands.split(",")]:
                 if code:
                     entities.append({"type": "ligand", "value": code, "copies": 1})
+            # 🔴 THE TEMPLATE GOES ON THE FIRST PROTEIN TARGET ROW, which is
+            # where the entity list keeps it - per chain, because AF3 masks a
+            # template's geometry across chains and a slot belongs to one.
+            if args.template:
+                for entity in entities:
+                    if entity["type"] == "protein":
+                        entity["template"] = {"source": args.template}
+                        break
             written = cdp.evaluate(ws, """(() => {
               if (!window.__hunterTargets) return 'no entity list';
               window.__hunterTargets.set(%s);
@@ -223,6 +249,8 @@ def main():
             return 1
         print("controls: ok ·", ", ".join("%s=%s" % (k, v) for k, v in controls))
         print("weights :", "./model-af3-int5/" if local else "the pinned remote")
+        # What the template actually covered, which is a fact about a file the
+        # page has never seen and the only thing that says the fetch worked.
         print("designer:", cdp.evaluate(
             ws, "(document.getElementById('designer-note')||{}).textContent"))
 
@@ -243,6 +271,34 @@ def main():
             return 1
 
         rows = json.loads(cdp.evaluate(ws, READ_TABLE))
+        if args.template:
+            print("entities:", cdp.evaluate(ws, """(() => {
+              const h = window.__hunterTargets ? window.__hunterTargets.read() : [];
+              return JSON.stringify(h.map((e) => ({type: e.type, len: (e.value||"").length,
+                template: e.template || null})));
+            })()"""))
+            print("tmpllog :", cdp.evaluate(ws,
+                "JSON.stringify(window.__hunterTemplateLog || 'never ran')"))
+            print("input   :", cdp.evaluate(ws,
+                "window.__hunterInput ? JSON.stringify(window.__hunterInput().templates)"
+                " : 'no hook'"))
+            covered = cdp.evaluate(ws, """(() => {
+              const h = window.__hunterTargets ? window.__hunterTargets.read() : [];
+              const t = h.map((e) => e.template).filter(Boolean);
+              return JSON.stringify(t.map((x) => x.status || ""));
+            })()""")
+            # 🔴 THE COVERAGE LINE IS THE ONLY THING THAT SAYS THE TEMPLATE WAS
+            # USED. A fold with a template that silently failed to arrive looks
+            # exactly like one without: it folds, it scores, and the number is
+            # merely different.
+            if not [line for line in json.loads(covered) if line]:
+                failures.append("the template produced no coverage line, so it"
+                                " never reached the fold")
+            print("template:", cdp.evaluate(ws, """(() => {
+              const h = window.__hunterTargets ? window.__hunterTargets.read() : [];
+              const t = h.map((e) => e.template).filter(Boolean);
+              return JSON.stringify(t.map((x) => x.status || "(no status)"));
+            })()"""))
         # 🔴 THE FIRST ATOM LINES OF THE FIRST CYCLE, because every assertion
         # below is about numbers and the failures have all been about the PDB
         # those numbers came from. A chain that the viewer or MPNN silently

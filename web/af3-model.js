@@ -214,6 +214,11 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  */
 export async function foldAf3(options) {
   const { sequence, mode, calls, recycles, seed, signal, device, onStatus, onProgress } = options;
+  // 🔴 A TEMPLATE IS A SLOT PER CHAIN, ALREADY OVER THE COMPLEX'S TOKENS.
+  // web/template-source.js builds it, because turning a structure into one is
+  // a question about files and residue numbering rather than about folding -
+  // and building it here would put a PDB parser on the fold's critical path.
+  const templateSlots = options.templateSlots;
   // 🔴 THE MSA IS BUILT BEFORE THE WEIGHTS ARE TOUCHED, because its depth is a
   // shape: the MSA stack's pipelines are keyed on the row count, so a fold that
   // discovers its depth later would compile a second set of them.
@@ -376,7 +381,7 @@ export async function foldAf3(options) {
   // cheaper than a jump at the end of the animation.
 
   const result = await foldBatch(device, batch, options.weights, {
-    mode, steps: calls, recycles, seed, reuse: options.reuse,
+    mode, steps: calls, recycles, seed, reuse: options.reuse, templateSlots,
     // ...forwarded for probes that move the noise schedule. Unset for a page
     // fold, which is AF3's own for the sampler and 160 A for the flow.
     schedule: options.schedule,
