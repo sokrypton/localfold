@@ -293,6 +293,37 @@ function parameters(length, pairChannels, templates) {
 }
 
 /**
+ * Which pairs a template is allowed to speak about.
+ *
+ * 🔴 NO PERMISSIVE DEFAULT, AND THE FIRST VERSION OF THIS HAD ONE.
+ * `input.asymId ?? new Int32Array(length)` puts every token in chain 0, which
+ * is right for a monomer and silently lets a template speak across a complex's
+ * chains - about pairs whose two ends were never in one coordinate frame. AF3
+ * has the same shape of bug measured at relRMS 1.09 against a two-chain
+ * reference, and it went unnoticed there because every check had ONE chain.
+ * A template with no chain ids raises instead.
+ *
+ * 🔴 SPANNING IS A PROPERTY OF THE SLOT. AF2-multimer masks across chains for
+ * the same reason AF3 does - its templates are searched per chain - but when
+ * both chains came from ONE file they are in one frame and the cross-chain
+ * distances are the interface geometry a binder method wants. See
+ * multichainMaskFor in src/af3/template-features.js.
+ */
+function chainMaskFor(input, length) {
+  if (input.multichainMask2d !== undefined) return input.multichainMask2d;
+  if (input.asymId === undefined) {
+    throw new Error("a template needs `asymId` (or `multichainMask2d`):"
+      + " AF2-multimer masks the template's geometry across chains, and"
+      + " assuming one chain lets it speak about pairs it has never seen in"
+      + " one coordinate frame");
+  }
+  return multichainMaskFor(input.asymId, length, {
+    coverage: coverageOf(input.template, length, AF2_ATOM37),
+    spanChains: input.template.spanChains === true,
+  });
+}
+
+/**
  * Add AF2-multimer's template term to the pair, in place.
  *
  * @param {number} templates how many templates were averaged; 1 when masked
@@ -325,11 +356,7 @@ export async function encodeTemplateEmbedding(execution, encoder, input, weights
   const geometry = input.template === undefined
     ? new Float32Array(length * length * GEOMETRY_STRIDE)
     : packTemplateGeometry(
-      templateGeometry(input.template, input.multichainMask2d
-        ?? multichainMaskFor(input.asymId ?? new Int32Array(length), length, {
-          coverage: coverageOf(input.template, length, AF2_ATOM37),
-          spanChains: input.template.spanChains === true,
-        }), length, AF2_ATOM37),
+      templateGeometry(input.template, chainMaskFor(input, length), length, AF2_ATOM37),
       length);
   const aatypeRow = execution.upload("template.aatype-row", terms.row);
   const aatypeColumn = execution.upload("template.aatype-column", terms.column);

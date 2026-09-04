@@ -98,6 +98,11 @@ export async function main(device) {
       atomMask: Float32Array.from(oracle.template.atomMask),
       spanChains: oracle.spanChains === true,
     };
+    // 🔴 THE CHAINS THE ORACLE USED, NOT CHAINS OF OUR OWN. Splitting these
+    // into two for the spanning arm's benefit made the GPU mask cross-chain
+    // pairs that the reference had left open, and the numpy real arm reported
+    // 3.8e-1 against an implementation that was right. The spanning block
+    // below builds its own ids, which is where a second chain belongs.
     const asymId = Int32Array.from(oracle.chains ?? new Array(length).fill(0));
 
     const execution = new WebGpuExecution(device);
@@ -220,6 +225,48 @@ export async function main(device) {
     } else if (!(inputRelRms < 2e-5)) {
       throw new Error(`${name} input term: relRMS ${inputRelRms}`);
     }
+  }
+
+  // 🔴 INTER-CHAIN TEMPLATES, WHICH AF2 DOES NOT DO AND SO HAS NO ORACLE FOR.
+  // Its `multichain_mask_2d` closes every cross-chain pair because a complex's
+  // chains are templated by SEPARATE searches - two structures that were never
+  // in one frame. When both chains come from ONE file they are in one frame,
+  // and those distances are the interface geometry a binder method wants. So
+  // it is checked by construction: masking per chain and spanning must differ,
+  // or the flag is decoration.
+  const spanning = await load("toy-template-jax-real.json").catch(() => undefined);
+  if (spanning !== undefined) {
+    const length = spanning.length;
+    const asymId = Int32Array.from(
+      Array.from({ length }, (_, token) => (token < length / 2 ? 1 : 2)));
+    const base = {
+      aatype: Int32Array.from(spanning.template.aatype),
+      atomPositions: Float32Array.from(spanning.template.positions),
+      atomMask: Float32Array.from(spanning.template.atomMask),
+    };
+    const terms = [];
+    for (const spanChains of [false, true]) {
+      const execution = new WebGpuExecution(device);
+      const pair = Float32Array.from(spanning.pair);
+      const pairBuffer = execution.upload("pair", Float32Array.from(pair),
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+      const maskBuffer = execution.upload("pair-mask", Float32Array.from(spanning.pairMask));
+      const encoder = device.createCommandEncoder({ label: `span-${spanChains}` });
+      await encodeTemplateEmbedding(execution, encoder, {
+        length, pairChannels: PAIR_CHANNELS, templates: 1, asymId,
+        template: { ...base, spanChains },
+      }, weights, pairBuffer, maskBuffer);
+      const readback = execution.createReadback("out", pairBuffer, encoder);
+      device.queue.submit([encoder.finish()]);
+      const after = await execution.mapFloat32(readback);
+      const term = new Float32Array(after.length);
+      for (let index = 0; index < term.length; index += 1) term[index] = after[index] - pair[index];
+      terms.push(term);
+      execution.release?.();
+    }
+    const moved = relativeRms(terms[1], terms[0]);
+    console.log(`spanning	moves the term by relRMS ${moved.toExponential(2)}`);
+    if (!(moved > 1e-3)) throw new Error(`spanChains changed nothing (relRMS ${moved})`);
   }
 
   // 🔴 THE ORACLE ARMS ARE THE POINT AND THEIR ABSENCE IS A FAILURE. Without

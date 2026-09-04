@@ -244,6 +244,13 @@ export class AlphaFoldUnifiedGpu {
         if (useMultimerTemplates) {
           await encodeTemplateEmbedding(execution, embeddingEncoder, {
             length, pairChannels: 128, templates: 1,
+            // 🔴 THE CHAIN IDS TRAVEL WITH THE TEMPLATE, because the embedder
+            // masks its geometry across chains and refuses to guess. They are
+            // on the feature set already - makeA3mFeatures emits asym/entity/
+            // sym under chainAware - so this is the one place that had to
+            // remember to hand them over.
+            template: recycleOptions.template,
+            asymId: featuresByRecycle[0].asymId,
           }, weights.templateEmbedding, embedding.pairWithoutTemplates, pairMaskTensor);
         }
         if (templateUpdate !== undefined) {

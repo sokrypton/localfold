@@ -94,6 +94,15 @@ included - and everything after that is not. It stays because that input term is
 a second, independently written reading of the nine features; the checker
 asserts exactly that much of it.
 
+🔴 **AND ITS CROSS-CHAIN MASK REFUSES TO GUESS, LIKE AF3'S.** The first
+version defaulted `asymId` to all zeros - every token in chain 0 - which is
+right for a monomer and silently lets a template speak across a complex's
+chains. AF3 had the identical bug, measured at relRMS 1.09. A template with no
+chain ids now raises, and `src/multimer/model.js` hands the ids over from the
+feature set. Inter-chain templates are opt-in per slot there too, and moving
+the term by relRMS 7.3e-2 is what `tools/gpu/check-multimer-template.js`
+asserts, since AF2 has no oracle for something it does not do.
+
 🔴 **AND FEED THE MODULE THE MASKS IT WAS GIVEN.** `__call__<2` is
 `padding_mask_2d` and `<3` is `multichain_mask_2d`, and both are all ones in
 these dumps because ColabDesign2's featurisation gives one asym_id.
