@@ -90,8 +90,12 @@ export function anchoredStart(from, to, length) {
  * indistinguishable at this scale - and an arc would need a torsion-space
  * model of a move that is not physical anyway.
  *
- * pLDDT travels with it, so the confidence colouring resolves per frame and
- * the cartoon shades from the old prediction's confidence to the new one's.
+ * 🔴 THE INTERMEDIATE FRAMES CARRY NO pLDDT, AND THE RAMP PAINTS THAT RED.
+ * They used to interpolate it between the two ends, which colours a structure
+ * that never existed with a confidence nothing measured - the two ends are
+ * predictions and everything between them is an animation. The ends keep their
+ * own real values, so the morph starts and finishes on the truth and is
+ * honestly blank in between.
  *
  * @param {{atom37: Float32Array, atom37Mask: Float32Array}} from
  * @param {{atom37: Float32Array, atom37Mask: Float32Array}} to superposed onto `from`
@@ -119,7 +123,8 @@ export function morphFrames(from, to, plddtFrom, plddtTo, length, steps) {
       a[2] + (end[i][2] - a[2]) * t,
     ]);
     const plddt = new Float32Array(length);
-    for (let r = 0; r < length; r += 1) plddt[r] = plddtFrom[r] + (plddtTo[r] - plddtFrom[r]) * t;
+    const ends = step === 0 ? plddtFrom : (step === steps - 1 ? plddtTo : null);
+    if (ends !== null) for (let r = 0; r < length; r += 1) plddt[r] = ends[r];
     frames.push({
       // THE NEW MASK THROUGHOUT, which is what keeps every frame the same
       // length - see anchoredStart.

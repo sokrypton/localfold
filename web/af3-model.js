@@ -392,12 +392,12 @@ export async function foldAf3(options) {
     // fold.js: a single flow cycle against that pass's trunk is a real
     // backbone, and it is the only structure that exists before the sampler
     // starts. Written as a PDB here, like every other frame, so the page draws
-    // it the same way - and coloured by the trunk's own agreement, which is
-    // all the confidence there is at this point.
+    // it the same way - and uncoloured, because nothing has measured this
+    // structure's confidence and the ramp's red is what "not known" looks
+    // like here.
     onPreview: options.onPreview === undefined ? undefined : async (preview) => {
       if (reference === null) reference = toPoints(preview.positions, batch.tokens * batch.dense);
-      const colour = null;
-      const pdb = fittedPdb(batch, preview.positions, reference, slots, colour);
+      const pdb = fittedPdb(batch, preview.positions, reference, slots, null);
       // 🔴 KEPT, NOT JUST SHOWN. The previews are frames of the same
       // trajectory - the structure the model believed at each recycle - so
       // they are handed back with the rest and the replay rebuilds them in
@@ -523,38 +523,26 @@ export async function foldAf3(options) {
   // here, and it is the value the cartoon is coloured by.
   const plddt = slots.map((slot) => result.scores.plddt[slot]);
 
-  // 🔴 EVERY FRAME TAKES THE FINISHED STRUCTURE'S REAL pLDDT, WHICH IS A
-  // CONSTANT COLOUR ON A MOVING STRUCTURE. It is the honest one: the head runs
-  // once, on the final sample, and there is no per-frame confidence here that
-  // is a measurement rather than a guess. A distogram-derived stand-in used to
-  // fill the gap and has been removed - see the note in HANDOFF.md for what it
-  // scored and why it was not worth what it claimed.
-  const frameScores = { coloured: () => result.scores.plddt };
-
-  // 🔴 EVERY FRAME IS RE-EMITTED, because the frames drawn during the fold
-  // carry a zero B-factor - the pLDDT scheme paints that the colour of no
-  // confidence at all, which is a claim rather than a missing value. It used to
-  // re-emit them all with the FINISHED structure's pLDDT, which is a constant
-  // colour on a moving structure; each frame now carries its own, from the
-  // distogram. See below.
+  // 🔴 A FRAME WHOSE CONFIDENCE IS NOT KNOWN IS COLOURED AS ZERO, WHICH THE
+  // pLDDT RAMP PAINTS RED. AF3's confidence head runs ONCE, on the finished
+  // sample, so every frame before it is unmeasured - and the two ways of
+  // hiding that were both worse than saying it. Painting them with the final
+  // structure's pLDDT puts a confident colour on a structure that has not
+  // earned it yet and holds it constant while the model moves; painting them
+  // with a distogram-derived estimate reads high and is not on pLDDT's scale
+  // at all. Red for "no confidence here" is a missing value shown as one.
   //
-  // 🔴 AND THE FINAL STRUCTURE IS FITTED LIKE THE REST OF THEM. It used to be
-  // appended straight from the sampler, which leaves it in whatever frame
-  // randomAugmentation last rotated into - so the animation ran smoothly and
-  // then jumped on its last frame.
+  // 🔴 THE FRAMES ARE STILL RE-EMITTED, for the fitting rather than the
+  // colour. AF3's sampler calls randomAugmentation at the top of every step,
+  // so consecutive frames sit in different reference frames - including the
+  // final one, which used to be appended straight from the sampler and made
+  // the animation jump on its last frame.
   const framePdbs = trajectory.map(
-    (positions) => fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
-  // 🔴 AND THE PREVIEWS ARE RECOLOURED ON THE SAME SCALE. They were written
-  // during the trunk with the RAW distogram estimate, which is not on pLDDT's
-  // scale and reads HIGH: measured, a two-step preview showed 54.8 to 58.1
-  // while the finished structure's real pLDDT was 54.1, so the roughest frames
-  // in the animation looked as confident as the answer. The calibration only
-  // exists once the confidence head has run, so the fix is to rebuild them
-  // here rather than to colour them differently there.
-  const previewFrames = previewPositions.map((positions) =>
-    fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
-  // ...and the finished structure keeps the REAL pLDDT, which is the one number
-  // here that is a claim about the prediction rather than about the animation.
+    (positions) => fittedPdb(batch, positions, reference, slots, null));
+  const previewFrames = previewPositions.map(
+    (positions) => fittedPdb(batch, positions, reference, slots, null));
+  // ...and the finished structure keeps the REAL pLDDT, which is the one
+  // number here that is a claim about the prediction rather than a colour.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
 
   return {
@@ -569,8 +557,8 @@ export async function foldAf3(options) {
     // the trunk does rather than after the confidence head.
     contactProbs: result.trunk.contactProbs,
     framePdbs,
-    // One per recycle, in order, before the sampler's first frame - recoloured
-    // on the finished fold's scale, so the whole animation is one ramp.
+    // One per recycle, in order, before the sampler's first frame, and
+    // uncoloured like the sampler's own frames.
     previewPdbs: previewFrames,
     previewContacts,
     pdb: finalPdb,

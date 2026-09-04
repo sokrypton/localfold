@@ -129,6 +129,25 @@ def main():
             })),
           });
         })()"""))
+        # 🔴 THE B-FACTOR IS THE COLOUR, so read it rather than the frame count.
+        # A frame nothing has measured must carry zero - the pLDDT ramp paints
+        # that red - and only the finished structure may carry real values.
+        print("bfactor:", cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+          if (!v) return 'no viewer';
+          const frames = v.objectsData[v.currentObjectName].frames;
+          // 🔴 A FRAME KEEPS A FLAT `plddts`, NOT PER-ATOM OBJECTS. Reading
+          // it wrong reports zero for everything, which is exactly what an
+          // uncoloured frame looks like - so the check would have passed
+          // whatever the page did.
+          return JSON.stringify(frames.map((f) => {
+            const b = Array.from(f.plddts || []);
+            if (b.length === 0) return { name: f.name, plddts: 'missing' };
+            return { name: f.name, n: b.length, min: Math.min(...b).toFixed(1),
+              max: Math.max(...b).toFixed(1) };
+          }));
+        })()"""))
         print("panel :", cdp.evaluate(ws, """(() => {
           const c = document.getElementById('heatmapContainer');
           return JSON.stringify({

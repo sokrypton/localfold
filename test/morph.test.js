@@ -73,6 +73,13 @@ describe("morphing one prediction into the next", () => {
     expect(at(frames[4].structure, 1, CA)).toEqual([1, 10, 0]);
     expect(frames[0].confidence.plddt[0]).toBe(50);
     expect(frames[4].confidence.plddt[0]).toBe(90);
+    // 🔴 AND NOTHING IN BETWEEN, because the intermediate structures never
+    // existed and no confidence was ever measured on them. Interpolating the
+    // ends colours an animation frame as though it were a prediction; zero is
+    // what the ramp paints as "not known".
+    for (const frame of frames.slice(1, 4)) {
+      expect([...frame.confidence.plddt]).toEqual([0, 0, 0]);
+    }
     // ...and it is monotonic in between, which a bad easing is not
     const ys = frames.map((f) => at(f.structure, 1, CA)[1]);
     for (let i = 1; i < ys.length; i += 1) expect(ys[i] >= ys[i - 1]).toBe(true);
