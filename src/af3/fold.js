@@ -505,6 +505,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // as `undefined` and both fall back to zeros. That is how the whole bond
       // feature came to be computed, shipped and never applied.
       bondMatrix: batch.bondMatrix,
+      // ...and the chain ids, which the template embedder masks its geometry
+      // by. See the note at its call site in trunk-webgpu.js.
+      asymId: batch.asymId,
+      templateSlots: options.templateSlots,
       pairMask, seqMask, previousPair, previousSingle,
     }, weights.trunk, DIALECT, {
       onStage: (name, ms) => stage("trunk", { name, ms }),

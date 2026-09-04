@@ -1,7 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import {
   BACKBONE_SLOTS, DGRAM_BINS, NUM_DENSE, PSEUDO_BETA_SLOT,
-  backboneFrames, distogram, pseudoBeta, templateGeometry,
+  backboneFrames, coverageOf, distogram, multichainMaskFor, pseudoBeta,
+  templateGeometry,
 } from "../src/af3/template-features.js";
 
 /**
@@ -201,5 +202,61 @@ describe("templateGeometry", () => {
     for (let bin = 0; bin < DGRAM_BINS; bin += 1) {
       expect(geometry.distogram[DGRAM_BINS + bin]).toBe(0);
     }
+  });
+});
+
+describe("multichainMaskFor", () => {
+  // Two chains of two tokens each.
+  const asymId = Int32Array.from([1, 1, 2, 2]);
+  const covered = Float32Array.from([1, 1, 1, 1]);
+  const at = (mask, i, j) => mask[i * 4 + j];
+
+  /**
+   * 🔴 AF3 MASKS ACROSS CHAINS FOR A REASON ABOUT PROVENANCE. Its `Template`
+   * is one protein chain and a complex's chains are templated by SEPARATE
+   * searches, so a cross-chain distance is computed from two structures that
+   * were never in one frame. Measured on a two-chain query with a template on
+   * each chain: masking as AF3 does reproduces it to relRMS 5.5e-7, and
+   * leaving the cross-chain pairs open scores 1.09.
+   */
+  it("closes cross-chain pairs by default", () => {
+    const mask = multichainMaskFor(asymId, 4, { coverage: covered });
+    expect(at(mask, 0, 1)).toBe(1);
+    expect(at(mask, 2, 3)).toBe(1);
+    expect(at(mask, 0, 2)).toBe(0);
+    expect(at(mask, 3, 1)).toBe(0);
+  });
+
+  // ...but when both chains came from ONE file they ARE in one frame, and the
+  // cross-chain distances are the interface geometry a binder method wants.
+  it("opens them when one structure covered both chains", () => {
+    const mask = multichainMaskFor(asymId, 4, { coverage: covered, spanChains: true });
+    expect(at(mask, 0, 2)).toBe(1);
+    expect(at(mask, 3, 1)).toBe(1);
+  });
+
+  // A pair with one end outside the template is still two frames apart, so
+  // spanning opens only what the slot actually covers at BOTH ends.
+  it("opens only the pairs it covers at both ends", () => {
+    const partial = Float32Array.from([1, 1, 1, 0]);
+    const mask = multichainMaskFor(asymId, 4, { coverage: partial, spanChains: true });
+    expect(at(mask, 0, 2)).toBe(1);
+    expect(at(mask, 0, 3)).toBe(0);
+    // ...and an intra-chain pair stays open whether or not it is covered.
+    expect(at(mask, 2, 3)).toBe(1);
+  });
+
+  it("cannot span without knowing what it covers", () => {
+    const mask = multichainMaskFor(asymId, 4, { spanChains: true });
+    expect(at(mask, 0, 2)).toBe(0);
+  });
+});
+
+describe("coverageOf", () => {
+  it("reads coverage off the atom mask, so the two cannot disagree", () => {
+    const template = { atomMask: new Float32Array(3 * NUM_DENSE) };
+    template.atomMask[0 * NUM_DENSE + 1] = 1;
+    template.atomMask[2 * NUM_DENSE + 4] = 1;
+    expect([...coverageOf(template, 3)]).toEqual([1, 0, 1]);
   });
 });

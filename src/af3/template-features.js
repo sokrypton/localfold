@@ -285,3 +285,68 @@ export function templateGeometry(template, multichainMask2d, tokens) {
   }
   return { distogram: masked, pseudoBetaMask2d, unitVector, backboneMask2d };
 }
+
+/**
+ * Which pairs a template slot is allowed to speak about.
+ *
+ * 🔴 AF3 MASKS ACROSS CHAINS, AND THE REASON IS PROVENANCE, NOT MODELLING. Its
+ * `Template` is documented as one protein chain, and a complex's chains are
+ * templated by SEPARATE searches - so the coordinates for chain A and chain B
+ * were never in one frame and a distance between them is a number computed
+ * from two unrelated structures. Masking is the only correct thing to do with
+ * it.
+ *
+ * 🔴 BUT IT IS NOT ALWAYS TRUE, AND THAT IS WORTH UNLOCKING. When both chains
+ * come from ONE file - a real co-crystal, or a complex this page predicted -
+ * they ARE in one frame, and the cross-chain distances are exactly the
+ * interface geometry a binder method wants. So spanning is a property of where
+ * the coordinates came from, which is why it is a flag on the SLOT rather than
+ * a setting on the model: a slot built from one structure may span, and two
+ * slots built from two structures may not, in the same fold.
+ *
+ * Measured on a two-chain query with a template on each chain: masking as AF3
+ * does reproduces it to relRMS 5.5e-7, and leaving the cross-chain pairs open
+ * scores 1.09 - so this is most of the module's answer, not a correction.
+ *
+ * @param {ArrayLike<number>} asymId [tokens], one id per chain
+ * @param {number} tokens
+ * @param {{coverage?: ArrayLike<number>, spanChains?: boolean}} [options]
+ *   `coverage` is 1 where THIS slot has a residue; spanning opens only the
+ *   pairs it covers at both ends, because a pair with one end outside the
+ *   template is still two frames apart.
+ * @returns {Float32Array} [tokens, tokens]
+ */
+export function multichainMaskFor(asymId, tokens, options = {}) {
+  const { coverage, spanChains = false } = options;
+  const mask = new Float32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const same = asymId[i] === asymId[j];
+      const spanned = spanChains && coverage !== undefined
+        && coverage[i] > 0 && coverage[j] > 0;
+      mask[i * tokens + j] = same || spanned ? 1 : 0;
+    }
+  }
+  return mask;
+}
+
+/**
+ * Which query tokens a slot actually has a residue at.
+ *
+ * Derived from the atom mask rather than carried alongside it, because two
+ * statements of the same thing drift and this one cannot: a token with no
+ * atoms contributes nothing to any feature whatever a coverage array says.
+ *
+ * @param {{atomMask: ArrayLike<number>}} template
+ * @param {number} tokens
+ * @returns {Float32Array}
+ */
+export function coverageOf(template, tokens) {
+  const covered = new Float32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let slot = 0; slot < NUM_DENSE; slot += 1) {
+      if (template.atomMask[token * NUM_DENSE + slot] > 0) { covered[token] = 1; break; }
+    }
+  }
+  return covered;
+}

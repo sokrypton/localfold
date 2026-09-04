@@ -151,6 +151,12 @@ export class Af3TrunkGpu {
         // Absent, every slot is empty - which is what a de novo fold has, and
         // is still a quarter of what enters the MSA stack.
         slots: input.templateSlots,
+        // 🔴 THE CHAIN IDS, NOT A MASK. AF3 masks the template's geometry
+        // ACROSS chains - two chains' templates were never in one coordinate
+        // frame - and the embedder derives that per slot. Passing nothing used
+        // to mean "assume one chain", which on a two-chain fold scored relRMS
+        // 1.09 against AF3.
+        asymId: input.asymId,
         multichainMask2d: input.multichainMask2d },
       weights.template, dialect, options));
     const pair = Float32Array.from(embedded.pair);

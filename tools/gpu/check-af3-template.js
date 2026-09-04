@@ -168,22 +168,50 @@ export async function main(device, args) {
     return made;
   };
 
-  for (const occupied of [0, 1, templates]) {
-    const input = {
-      pair, pairMask, tokens, templates, slots: slotsFor(occupied),
-    };
+  // 🔴 TWO CHAINS, BECAUSE ONE CHAIN CANNOT TELL THE MASKS APART. AF3 masks
+  // the geometry across chains and this checker had a single-chain query, so
+  // "mask per chain" and "mask nothing" were the same array - which is how a
+  // permissive default survived until a two-chain oracle dump scored relRMS
+  // 1.09 against AF3. Half the tokens are chain 1 and half chain 2.
+  const asymId = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) asymId[token] = token < tokens / 2 ? 1 : 2;
+
+  for (const [occupied, spanChains] of [[0, false], [1, false], [templates, false],
+                                        [1, true], [templates, true]]) {
+    const made = slotsFor(occupied);
+    // Spanning is a property of the SLOT: it says these coordinates came from
+    // one structure, so its cross-chain distances are real geometry rather
+    // than two frames compared.
+    if (made !== undefined && spanChains) {
+      for (const slot of made) if (slot) slot.spanChains = true;
+    }
+    const input = { pair, pairMask, tokens, templates, asymId, slots: made };
     const expected = templateEmbedding(input, weights, DIALECT);
     const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
     const relRms = relativeRms(gpu.output, expected);
     console.log(`template\ttokens=${tokens} slots=${templates}`
-      + ` occupied=${occupied}`
+      + ` occupied=${occupied}${spanChains ? " spanning" : ""}`
       + `\trelRMS ${relRms.toExponential(2)}`
-      + `\t${gpu.elapsedMilliseconds.toFixed(1)} ms`);
+      + `\t${gpu.elapsedMilliseconds.toFixed(1)} ms`
+      + `\tstd ${standardDeviation(gpu.output).toFixed(2)}`);
     if (!(relRms < 2e-5)) {
-      throw new Error(`template with ${occupied} occupied slots: relRMS ${relRms}`);
+      throw new Error(`template with ${occupied} occupied slots`
+        + `${spanChains ? " spanning" : ""}: relRMS ${relRms}`);
+    }
+    // 🔴 AND SPANNING HAS TO CHANGE THE ANSWER, or the flag is decoration.
+    // Cross-chain geometry is most of what a two-chain template knows, so an
+    // arm that agrees with its masked twin means the mask never opened.
+    if (spanChains) {
+      const masked = templateEmbedding(
+        { ...input, slots: slotsFor(occupied) }, weights, DIALECT);
+      const moved = relativeRms(expected, masked);
+      console.log(`  spanning moves the output by relRMS ${moved.toExponential(2)}`);
+      if (!(moved > 1e-3)) {
+        throw new Error(`spanChains changed nothing (relRMS ${moved})`);
+      }
     }
   }
-  const input = { pair, pairMask, tokens, templates };
+  const input = { pair, pairMask, tokens, templates, asymId };
   const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
   // The argument for the module existing: this is not a small correction.
   console.log(`output std ${standardDeviation(gpu.output).toFixed(2)}`

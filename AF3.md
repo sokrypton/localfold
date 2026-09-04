@@ -658,6 +658,40 @@ measurements is in each file.
   slots it stands for and the accumulate shader multiplies by it, so a fold
   with no templates runs one pass, which is what it always did.
 
+  🔴 **AND THE CROSS-CHAIN MASK WAS DEFAULTING PERMISSIVELY.** AF3 masks the
+  geometry features ACROSS chains, because its `Template` is one protein chain
+  and a complex's chains are templated by separate searches - so a cross-chain
+  distance is computed from two structures that were never in one frame. The
+  embedders defaulted to "every pair is intra-chain", which is right for a
+  one-chain query and is what every check had. Measured on a two-chain query
+  with a template on EACH chain:
+
+  | mask | slot 0 |
+  |---|---|
+  | per chain, as AF3 | 5.5e-7 |
+  | all-ones | **1.09** |
+
+  So it is most of the module's answer, not a correction. The mask is derived
+  per slot from `asymId` now and there is no permissive default: a template
+  with neither `asymId` nor an explicit mask raises.
+
+  ### Inter-chain templates, which AF3 does not do
+
+  The masking is about PROVENANCE, not modelling. When two chains come from
+  ONE file - a real co-crystal, or a complex this page predicted - they ARE in
+  one frame, and the cross-chain distances are exactly the interface geometry a
+  binder method wants. So `spanChains` is a flag on the SLOT, not a setting on
+  the model: one slot built from one structure may span while another built
+  from a separate search may not, in the same fold. Spanning opens only the
+  pairs the slot covers at BOTH ends, because a pair with one end outside the
+  template is still two frames apart.
+
+  Measured at 32 tokens over two chains, against the same slots masked per
+  chain: spanning moves the module's output by relRMS 1.5e-2 with one occupied
+  slot and 4.9e-2 with four. There is no oracle for this - AF3 does not do it -
+  so it is checked by construction: the GPU and CPU paths agree to 2e-7 on
+  every arm, and an arm that failed to move would fail the check.
+
   The page is unchanged: nothing yet builds `slots` from a user's structure.
 
   🔴 **ONE THING WAS WRONG AND ONLY THE ORACLE COULD HAVE SAID SO.** The unit

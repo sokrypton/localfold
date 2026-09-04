@@ -30,7 +30,9 @@
 import {
   gridSelfAttention, layerNorm, linear, transition, triangleMultiplication,
 } from "./pairformer-reference.js";
-import { DGRAM_BINS, templateGeometry } from "./template-features.js";
+import {
+  DGRAM_BINS, coverageOf, multichainMaskFor, templateGeometry,
+} from "./template-features.js";
 
 const RESTYPES = 31;
 const CHANNELS = 64;
@@ -84,12 +86,32 @@ export function templateEmbedding(input, weights, dialect) {
     throw new Error("templateOccupied is true but no slots were given:"
       + " pass `slots` with {aatype, atomPositions, atomMask} per template");
   }
-  // 🔴 EVERY PAIR IS INTRA-CHAIN UNLESS SAID OTHERWISE. A template covers ONE
-  // chain, so AF3 masks the cross-chain pairs out of every geometry feature -
-  // and a caller that forgets gets distances between two chains that were
-  // never in the same reference frame, which are real numbers and are nonsense.
-  const multichainMask2d = input.multichainMask2d
-    ?? new Float32Array(pairs).fill(1);
+  const EMPTY_MASK = new Float32Array(pairs);
+  // 🔴 THE MASK IS PER SLOT AND IS NOT ALLOWED TO DEFAULT TO "EVERYTHING". It
+  // did, and a two-chain query with a template on each chain then scored
+  // relRMS 1.09 against AF3 - the cross-chain geometry is most of the module's
+  // answer, so a permissive default is not a small error. It went unnoticed
+  // because every check had a ONE-CHAIN query, where all-ones and per-chain
+  // are the same array.
+  const chainMaskFor = (template) => {
+    if (input.multichainMask2d !== undefined) return input.multichainMask2d;
+    if (input.asymId === undefined) {
+      if (template === undefined || template === null) {
+        // An empty slot has no geometry to mask, so the mask is unread.
+        return EMPTY_MASK;
+      }
+      throw new Error("a template needs `asymId` (or `multichainMask2d`):"
+        + " AF3 masks the geometry features across chains, and assuming one"
+        + " chain silently lets a template speak about pairs it has never"
+        + " seen in one coordinate frame");
+    }
+    return multichainMaskFor(input.asymId, tokens, {
+      coverage: coverageOf(template, tokens),
+      // ...opt in, and only where one structure covered both chains. See
+      // multichainMaskFor.
+      spanChains: template.spanChains === true,
+    });
+  };
 
   // Feature 8: the query pair representation, normalised. It does not depend on
   // the slot, so it and its projection are computed ONCE - which is most of the
@@ -135,7 +157,7 @@ export function templateEmbedding(input, weights, dialect) {
     // themselves two of the features - so an empty slot skips the work rather
     // than computing zeros.
     if (template !== undefined && template !== null) {
-      const geometry = templateGeometry(template, multichainMask2d, tokens);
+      const geometry = templateGeometry(template, chainMaskFor(template), tokens);
       for (let index = 0; index < pairs; index += 1) {
         const base = index * CHANNELS;
         for (let bin = 0; bin < DGRAM_BINS; bin += 1) {

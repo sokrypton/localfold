@@ -39,7 +39,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
-import { templateGeometry } from "./template-features.js";
+import { coverageOf, multichainMaskFor, templateGeometry } from "./template-features.js";
 
 const CHANNELS = 64;
 const RESTYPES = 31;
@@ -368,9 +368,34 @@ export class Af3TemplateEmbedderGpu {
       // slots; the query pair, the masks and every weight are shared and are
       // uploaded once. Four geometry buffers is 6 floats a pair per slot -
       // 8.6 MiB at 300 tokens, against a trunk that holds hundreds.
-      const multichainMask2d = input.multichainMask2d
-        ?? new Float32Array(pairs).fill(1);
       const empty = new Float32Array(pairs * GEOMETRY_STRIDE);
+      const EMPTY_MASK = new Float32Array(pairs);
+  // 🔴 THE MASK IS PER SLOT AND IS NOT ALLOWED TO DEFAULT TO "EVERYTHING". It
+      // did, and a two-chain query with a template on each chain then scored
+      // relRMS 1.09 against AF3 - the cross-chain geometry is most of the module's
+      // answer, so a permissive default is not a small error. It went unnoticed
+      // because every check had a ONE-CHAIN query, where all-ones and per-chain
+      // are the same array.
+      const chainMaskFor = (template) => {
+        if (input.multichainMask2d !== undefined) return input.multichainMask2d;
+        if (input.asymId === undefined) {
+          if (template === undefined || template === null) {
+            // An empty slot has no geometry to mask, so the mask is unread.
+            return EMPTY_MASK;
+          }
+          throw new Error("a template needs `asymId` (or `multichainMask2d`):"
+            + " AF3 masks the geometry features across chains, and assuming one"
+            + " chain silently lets a template speak about pairs it has never"
+            + " seen in one coordinate frame");
+        }
+        return multichainMaskFor(input.asymId, tokens, {
+          coverage: coverageOf(template, tokens),
+          // ...opt in, and only where one structure covered both chains. See
+          // multichainMaskFor.
+          spanChains: template.spanChains === true,
+        });
+      };
+
       // 🔴 THE EMPTY SLOTS ARE RUN ONCE BETWEEN THEM, NOT ONCE EACH. They
       // produce the same embedding by construction - same all-ALA aatype, same
       // zero geometry, same query pair, same weights - so four of them is four
@@ -410,7 +435,8 @@ export class Af3TemplateEmbedderGpu {
           geometry: keep(this.allocator.upload(
             `af3-template.geometry.${slot}`,
             template !== undefined && template !== null
-              ? packTemplateGeometry(templateGeometry(template, multichainMask2d, tokens), tokens)
+              ? packTemplateGeometry(
+                templateGeometry(template, chainMaskFor(template), tokens), tokens)
               : empty,
             storage)),
         });

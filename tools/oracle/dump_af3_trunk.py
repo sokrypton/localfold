@@ -190,7 +190,7 @@ def main():
     parser.add_argument("--ligand", action="append", metavar="CCD",
                         help="append a ligand chain by CCD code (repeatable),"
                              " e.g. --ligand ATP")
-    parser.add_argument("--template", default=None, metavar="PATH[:CHAIN]",
+    parser.add_argument("--template", action="append", metavar="PATH[:CHAIN]",
                         help="a PDB file to show the query as a TEMPLATE."
                              " 🔴 THE MODULE THIS EXISTS FOR IS THE ONE NOBODY"
                              " CHECKS: src/af3/template-reference.js implements"
@@ -199,10 +199,15 @@ def main():
                              " features are identically zero and nothing here"
                              " could tell a correct implementation of them from"
                              " a wrong one. This is what makes them checkable."
-                             " Templates go on protein chain 0 unless"
-                             " --template-chain says otherwise.")
+                             " Repeat it to template SEVERAL query chains:"
+                             " the first goes on query chain 0, the second on"
+                             " chain 1, and so on. A structure per chain is"
+                             " what AF3 takes - its Template is documented as"
+                             " one protein chain - and what it then MASKS"
+                             " between them, because two templates searched"
+                             " separately were never in one coordinate frame.")
     parser.add_argument("--template-chain", type=int, default=0, metavar="INDEX",
-                        help="which query chain the template covers")
+                        help="which query chain a single --template covers")
     parser.add_argument("--recycles", type=int, default=0,
                         help="trunk recycles (AF3's own default is 10);"
                              " the capture records every pass in order")
@@ -354,56 +359,64 @@ def main():
         import colabdesign2.af3.alphafold3.structure as _st
         from colabdesign2.af3.alphafold3.common import folding_input as _fi_t
 
-        path, _, want_chain = arguments.template.partition(":")
-        rows = []
-        seen = {}
-        for line in open(os.path.expanduser(path)):
-            if not line.startswith("ATOM"):
-                continue
-            if want_chain and line[21] != want_chain:
-                continue
-            # Hydrogens and alternate locations are not template geometry.
-            element = (line[76:78].strip() or line[12:16].strip()[:1]).upper()
-            if element == "H" or line[16] not in " A":
-                continue
-            key = line[22:27]
-            if key not in seen:
-                seen[key] = len(seen)
-            rows.append((seen[key], line[17:20].strip(), line[12:16].strip(),
-                         element, float(line[30:38]), float(line[38:46]),
-                         float(line[46:54])))
-        # 🔴 ONLY AS MANY RESIDUES AS THE QUERY HAS. A map naming a query
-        # residue that does not exist is an error AF3 raises deep inside its
-        # own featuriser, and a template longer than its query is the ordinary
-        # way to produce one.
-        query_length = len(chains[arguments.template_chain])
-        rows = [row for row in rows if row[0] < query_length]
-        if not rows:
-            raise SystemExit(f"--template {path} covers none of the query")
-        covered = sorted({row[0] for row in rows})
-        rank = {residue: index for index, residue in enumerate(covered)}
-        count = len(rows)
-        template_mmcif = _st.from_atom_arrays(
-            name="template", release_date=_dt.date(1970, 1, 1),
-            chain_id=np.full(count, "A", object),
-            chain_type=np.full(count, "polypeptide(L)", object),
-            res_id=np.asarray([rank[row[0]] + 1 for row in rows], np.int32),
-            res_name=np.asarray([row[1] for row in rows], object),
-            atom_name=np.asarray([row[2] for row in rows], object),
-            atom_element=np.asarray([row[3] for row in rows], object),
-            atom_x=np.asarray([row[4] for row in rows], np.float32),
-            atom_y=np.asarray([row[5] for row in rows], np.float32),
-            atom_z=np.asarray([row[6] for row in rows], np.float32),
-            atom_b_factor=np.zeros(count, np.float32),
-            atom_occupancy=np.ones(count, np.float32),
-        ).to_mmcif()
-        templates = {arguments.template_chain: [_fi_t.Template(
-            mmcif=template_mmcif,
-            query_to_template_map={int(q): rank[q] for q in covered})]}
-        print(f"template: {path}"
-              f"{f' chain {want_chain}' if want_chain else ''},"
-              f" {len(covered)} of {query_length} query residues,"
-              f" {count} atoms")
+        templates = {}
+        # 🔴 NOT `spec`, WHICH IS THE DesignSpec THIS FUNCTION IS ABOUT. Naming
+        # the loop variable `spec` shadowed it and handed a path string to
+        # spec_to_fold_input, which failed as "'str' object has no attribute
+        # 'chains'" - a message about neither the template nor the spec.
+        for offset, argument in enumerate(arguments.template):
+          query_chain = arguments.template_chain if len(arguments.template) == 1 else offset
+          path, _, want_chain = argument.partition(":")
+          rows = []
+          seen = {}
+          for line in open(os.path.expanduser(path)):
+              if not line.startswith("ATOM"):
+                  continue
+              if want_chain and line[21] != want_chain:
+                  continue
+              # Hydrogens and alternate locations are not template geometry.
+              element = (line[76:78].strip() or line[12:16].strip()[:1]).upper()
+              if element == "H" or line[16] not in " A":
+                  continue
+              key = line[22:27]
+              if key not in seen:
+                  seen[key] = len(seen)
+              rows.append((seen[key], line[17:20].strip(), line[12:16].strip(),
+                           element, float(line[30:38]), float(line[38:46]),
+                           float(line[46:54])))
+          # 🔴 ONLY AS MANY RESIDUES AS THE QUERY HAS. A map naming a query
+          # residue that does not exist is an error AF3 raises deep inside its
+          # own featuriser, and a template longer than its query is the ordinary
+          # way to produce one.
+          query_length = len(chains[query_chain])
+          rows = [row for row in rows if row[0] < query_length]
+          if not rows:
+              raise SystemExit(f"--template {path} covers none of query chain {query_chain}")
+          covered = sorted({row[0] for row in rows})
+          rank = {residue: index for index, residue in enumerate(covered)}
+          count = len(rows)
+          template_mmcif = _st.from_atom_arrays(
+              name="template", release_date=_dt.date(1970, 1, 1),
+              chain_id=np.full(count, "A", object),
+              chain_type=np.full(count, "polypeptide(L)", object),
+              res_id=np.asarray([rank[row[0]] + 1 for row in rows], np.int32),
+              res_name=np.asarray([row[1] for row in rows], object),
+              atom_name=np.asarray([row[2] for row in rows], object),
+              atom_element=np.asarray([row[3] for row in rows], object),
+              atom_x=np.asarray([row[4] for row in rows], np.float32),
+              atom_y=np.asarray([row[5] for row in rows], np.float32),
+              atom_z=np.asarray([row[6] for row in rows], np.float32),
+              atom_b_factor=np.zeros(count, np.float32),
+              atom_occupancy=np.ones(count, np.float32),
+          ).to_mmcif()
+          templates[query_chain] = [_fi_t.Template(
+              mmcif=template_mmcif,
+              query_to_template_map={int(q): rank[q] for q in covered})]
+          print(f"template: {path}"
+                f"{f' chain {want_chain}' if want_chain else ''}"
+                f" -> query chain {query_chain},"
+                f" {len(covered)} of {query_length} query residues,"
+                f" {count} atoms")
 
     if arguments.modification or nucleic or arguments.template:
         captured = {}

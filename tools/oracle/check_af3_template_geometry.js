@@ -30,7 +30,9 @@ import { readFile } from "node:fs/promises";
 
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { chainResidues, identityMap, templateSlot } from "../../src/af3/template-input.js";
-import { templateGeometry } from "../../src/af3/template-features.js";
+import {
+  coverageOf, multichainMaskFor, templateGeometry,
+} from "../../src/af3/template-features.js";
 import * as B from "./af3-bundle.js";
 
 const dump = await B.loadDump("af3-oracle-template-f32.json");
@@ -53,13 +55,13 @@ for (let i = 0; i < tokens; i += 1) {
 // A template covers one chain; every pair here is intra-chain because the
 // query is one chain. asym_id is read rather than assumed so a two-chain dump
 // exercises the masking instead of silently skipping it.
-const asymId = inp("asym_id");
-const multichainMask2d = new Float32Array(tokens * tokens);
-for (let i = 0; i < tokens; i += 1) {
-  for (let j = 0; j < tokens; j += 1) {
-    multichainMask2d[i * tokens + j] = asymId[i] === asymId[j] ? 1 : 0;
-  }
-}
+// 🔴 asym_id IS PASSED, NOT A PREBUILT MASK. The embedder derives the mask
+// per slot now, which is the thing being checked: a permissive one scored
+// relRMS 1.09 here against AF3's 5.5e-7, and every earlier check had a
+// one-chain query where the two are the same array.
+const asymId = Int32Array.from(inp("asym_id"));
+const multichainMask2d = process.env.MASK === "ones"
+  ? new Float32Array(tokens * tokens).fill(1) : undefined;
 
 const tri = (d, i) => ({
   leftNormInputScale: at(`triangle_multiplication_${d}/left_norm_input/scale`, i),
@@ -164,14 +166,15 @@ if (process.env.TEMPLATE_PDB) {
   // pseudo-beta and slots 2, 1, 0 for the frame, and nothing else. So the
   // check is the geometry computed from each, and then the module's whole
   // output with my arrays in place of AF3's.
-  const mine = templateGeometry(built, multichainMask2d, tokens);
-  const reference = templateGeometry(theirs, multichainMask2d, tokens);
+  const chainMask = multichainMaskFor(asymId, tokens, { coverage: coverageOf(theirs, tokens) });
+  const mine = templateGeometry(built, chainMask, tokens);
+  const reference = templateGeometry(theirs, chainMask, tokens);
   for (const key of ["distogram", "pseudoBetaMask2d", "unitVector", "backboneMask2d"]) {
     B.report(`  ${key}`, reference[key], mine[key]);
   }
   const fromMine = templateEmbedding({
     pair: ref(`${STE}/__call__<0#0`),
-    tokens, pairMask, templates: slotCount, multichainMask2d,
+    tokens, pairMask, templates: slotCount, asymId, multichainMask2d,
     slots: [built, ...slots.slice(1)],
   }, w, { swapTransposedBias: false });
   B.report("  module, my arrays", ref(`${TE}/__call__`), fromMine);
@@ -180,7 +183,7 @@ if (process.env.TEMPLATE_PDB) {
 const perSlot = [];
 const out = templateEmbedding({
   pair: ref(`${STE}/__call__<0#0`),
-  tokens, pairMask, templates: slotCount, multichainMask2d, slots,
+  tokens, pairMask, templates: slotCount, asymId, multichainMask2d, slots,
   onSlot: (slot, embedded) => { perSlot[slot] = embedded; },
 }, w, { swapTransposedBias: false });
 
