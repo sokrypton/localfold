@@ -1715,10 +1715,17 @@ async function fold(event) {
     let initialLoadPromise = undefined;
     const onRecycle = (recycle, index) => {
       if (signal.aborted) return;
-      const distance = index === 0 ? "" : ` · Δ ${recycle.recycleDistance.toFixed(2)} Å`;
-      const passText = `Pass ${index + 1} of ${passes}`;
-      const iptmText = recycle.confidence.iptm !== undefined ? ` · ipTM ${Number(recycle.confidence.iptm).toFixed(3)}` : "";
-      status(`${passText}${distance} · pLDDT ${recycle.confidence.meanPlddt.toFixed(1)}${iptmText}`);
+      // 🔴 A PASS DOES NOT WRITE THE STATUS LINE. It used to put its own
+      // number there - "Pass 2 of 4 · Δ 0.41 Å · pLDDT 63.4" - while the
+      // progress callback writes "Folding · 62%" many times a second between
+      // passes. The two alternate, and a line that swaps between two different
+      // sentences is unreadable: it reads as flicker rather than as progress.
+      // The percentage is the only thing there that moves smoothly, so it is
+      // the only thing there. See the same note in web/af3-model.js.
+      //
+      // 🔴 THE NUMBERS ARE NOT LOST, they are in the place that is meant to
+      // hold them: the scores card, which is a panel rather than a line and
+      // can be read at leisure while it updates once a pass.
       updateScoresCard(recycle.confidence);
       if (index === 0) {
         firstPassLanded = alignedToPrevious(sequence, recycle.structure);

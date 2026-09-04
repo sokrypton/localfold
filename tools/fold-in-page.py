@@ -107,6 +107,21 @@ def main():
             msa: v('msa-mode'), af3count: v('af3-count') });
         })()"""))
 
+        # 🔴 THE STATUS LINE IS SAMPLED, NOT GLANCED AT. A line that alternates
+        # between two sentences reads as flicker, and neither a screenshot nor
+        # a reading after the fold can see it - only the sequence of values it
+        # took while the fold ran. Every distinct value is recorded, with the
+        # numbers blanked, so the SHAPES it took can be counted.
+        cdp.evaluate(ws, """(() => {
+          window.__statusLog = [];
+          const el = document.getElementById('status-message');
+          const shape = (s) => s.replace(/[0-9]+(\\.[0-9]+)?/g, '#');
+          new MutationObserver(() => {
+            const now = shape(el.textContent || '');
+            const log = window.__statusLog;
+            if (log.length === 0 || log[log.length - 1] !== now) log.push(now);
+          }).observe(el, { childList: true, characterData: true, subtree: true });
+        })()""")
         cdp.evaluate(ws, "document.getElementById('predict').click()")
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
@@ -161,6 +176,13 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+        shapes = cdp.evaluate(ws, """(() => {
+          const log = window.__statusLog || [];
+          const seen = [];
+          for (const s of log) if (seen.indexOf(s) < 0) seen.push(s);
+          return JSON.stringify({ changes: log.length, shapes: seen });
+        })()""")
+        print("statusln:", shapes)
         # 🔴 THE CAMERA IS PART OF THE ANSWER. addFrame recentres viewerState on
         # the centroid of every frame the object holds, so a rewind that clears
         # the frames and re-adds them walks the camera - which is what "the view
