@@ -498,6 +498,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export function createOuterProductMeanContractShader(cOuter) {
   const cells = cOuter * cOuter;
+  // 🔴 EIGHT IS MEASURED, AND IT WAS A HARDCODED GUESS UNTIL IT WAS. Swept
+  // through profile-af2-block.js at 512 MSA rows, in runs where every untouched
+  // kernel matched to 0.1 ms - the block and this kernel:
+  //
+  //     chunk  8   87.49 / 5.34 ms      16   87.89 / 5.33
+  //           32   88.39 / 5.67         64   90.21 / 7.82
+  //
+  // Sixteen ties and everything above it loses, so the constant was right. It
+  // is not obvious that it would be: a bigger chunk halves the barriers, and
+  // this kernel takes 128 of them per workgroup at 512 rows. It is not what
+  // governs.
   const chunk = 8;
   // Both operands are read four channels at a time, so the staged rows are
   // padded up to a whole vector and the tail staged as zero - which contributes

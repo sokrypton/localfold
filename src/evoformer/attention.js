@@ -1376,6 +1376,14 @@ export function selectAttentionFlashKernel(
     // 2.0e-4 is a storage format for the key and the value, not a change of
     // model: AF2's own inference runs in bfloat16, whose eight mantissa bits
     // put it an order of magnitude LOOSER than this.
+    //
+    // 🔴 AND THE FULL-f16 VARIANT WAS RE-MEASURED AFTER THE REST OF THE BLOCK
+    // TOOK HALF PRECISION, in case its 3.4e-3 had stopped being exceptional.
+    // It has not: 16.225 ms against this kernel's 16.850, 3.7%, for 17x the
+    // error of the staged form. The block's dense kernels carry 1.7e-3 to
+    // 2.4e-3 and this would add the largest single contribution for the
+    // smallest single gain. bench-msa-attention.js's `auto/h` arm is the
+    // measurement.
     const precision = requestedPrecision !== "auto" ? requestedPrecision
       : device.features?.has("shader-f16") ? "chunk16" : "f32";
     return {
