@@ -31,6 +31,39 @@
 /** Dense atom slots per residue in AF3's protein layout. */
 export const NUM_DENSE = 24;
 
+/**
+ * 🔴 AF2 AND AF3 COMPUTE THE SAME SIX FEATURES IN TWO ATOM LAYOUTS, and that
+ * is worth stating because it is not obvious from either source. Checked line
+ * by line against both:
+ *
+ *   * the frame is `from_two_vectors(C - CA, N - CA)` with the translation at
+ *     CA in BOTH. AF3 reaches it through the side-chain table's group 0 and
+ *     undoes the reversed convention by naming its locals `c, b, a`; AF2's
+ *     `make_transform_from_reference(a=N, b=CA, c=C)` computes
+ *     `from_two_vectors(c - b, a - b)`. Same thing, spelled twice.
+ *   * the distogram is 39 bins over 3.25-50.75 A in both.
+ *   * `restype_order` 0-19 IS AF3's aatype 0-19, with 20 unknown and 21 gap in
+ *     both - so the residue codes need no translation between them. Only the
+ *     one-hot WIDTH differs: AF2 embeds 22 classes and AF3 31.
+ *
+ * What differs is where a residue's atoms live. AF3 uses a 24-slot dense
+ * layout, `conformerFor`'s own order; AF2 uses atom37, whose first three are
+ * also N, CA, C - so the backbone slots coincide at (2, 1, 0) and only the
+ * pseudo-beta moves, CB being slot 4 of the dense layout and slot 3 of
+ * atom37.
+ *
+ * 🔴 THE ALPHABET AF2 WRITES ON DISK IS NOT THE ONE ITS MODEL READS. hhsearch
+ * produces `template_aatype` in HHBLITS order - `A=0, C=1, D=3` - and
+ * `fix_templates_aatype` in AF2's data transforms maps it to restype order
+ * BEFORE the model sees it. So a template built from a structure, as this
+ * repository builds them, goes straight to restype order and never touches
+ * HHBLITS; a template read from an hhsearch hit would have to be converted,
+ * and the two orderings share every letter, so getting it wrong produces a
+ * different, entirely plausible protein.
+ */
+export const AF3_DENSE = { slots: 24, pseudoBeta: 4, backbone: [2, 1, 0] };
+export const AF2_ATOM37 = { slots: 37, pseudoBeta: 3, backbone: [2, 1, 0] };
+
 /** Distogram bins, from AF3's DistogramFeaturesConfig. */
 export const DGRAM_BINS = 39;
 export const DGRAM_MIN = 3.25;
@@ -78,6 +111,24 @@ export const BACKBONE_SLOTS = [
 const slotOf = (table, code) => (code >= 0 && code < table.length ? table[code] : table[20]);
 
 /**
+ * A layout's per-residue tables. AF3 varies both by residue type (a nucleotide
+ * has different slots); AF2's atom37 is one layout for every amino acid, and
+ * glycine is the only special case either has.
+ */
+const layoutFor = (layout) => (layout === AF2_ATOM37
+  ? {
+    slots: 37,
+    // Glycine has no CB and takes CA, which is the whole of AF2's table.
+    pseudoBeta: (code) => (code === 7 ? 1 : AF2_ATOM37.pseudoBeta),
+    backbone: () => AF2_ATOM37.backbone,
+  }
+  : {
+    slots: NUM_DENSE,
+    pseudoBeta: (code) => slotOf(PSEUDO_BETA_SLOT, code),
+    backbone: (code) => slotOf(BACKBONE_SLOTS, code),
+  });
+
+/**
  * Pseudo-beta positions and their mask.
  *
  * @param {ArrayLike<number>} aatype [tokens]
@@ -86,16 +137,17 @@ const slotOf = (table, code) => (code >= 0 && code < table.length ? table[code] 
  * @param {number} tokens
  * @returns {{positions: Float32Array, mask: Float32Array}} [tokens, 3], [tokens]
  */
-export function pseudoBeta(aatype, positions, mask, tokens) {
+export function pseudoBeta(aatype, positions, mask, tokens, layout = AF3_DENSE) {
+  const table = layoutFor(layout);
   const out = new Float32Array(tokens * 3);
   const present = new Float32Array(tokens);
   for (let token = 0; token < tokens; token += 1) {
-    const slot = slotOf(PSEUDO_BETA_SLOT, aatype[token]);
-    const base = (token * NUM_DENSE + slot) * 3;
+    const slot = table.pseudoBeta(aatype[token]);
+    const base = (token * table.slots + slot) * 3;
     out[token * 3] = positions[base];
     out[token * 3 + 1] = positions[base + 1];
     out[token * 3 + 2] = positions[base + 2];
-    present[token] = mask[token * NUM_DENSE + slot] > 0 ? 1 : 0;
+    present[token] = mask[token * table.slots + slot] > 0 ? 1 : 0;
   }
   return { positions: out, mask: present };
 }
@@ -151,15 +203,16 @@ export function distogram(positions, tokens) {
  * @returns {{rotations: Float32Array, translations: Float32Array,
  *            mask: Float32Array}} [tokens, 9] row-major, [tokens, 3], [tokens]
  */
-export function backboneFrames(aatype, positions, mask, tokens) {
+export function backboneFrames(aatype, positions, mask, tokens, layout = AF3_DENSE) {
+  const table = layoutFor(layout);
   const rotations = new Float32Array(tokens * 9);
   const translations = new Float32Array(tokens * 3);
   const present = new Float32Array(tokens);
-  const at = (token, slot, axis) => positions[(token * NUM_DENSE + slot) * 3 + axis];
+  const at = (token, slot, axis) => positions[(token * table.slots + slot) * 3 + axis];
   for (let token = 0; token < tokens; token += 1) {
-    const [c, b, a] = slotOf(BACKBONE_SLOTS, aatype[token]);
-    present[token] = (mask[token * NUM_DENSE + a] > 0 && mask[token * NUM_DENSE + b] > 0
-      && mask[token * NUM_DENSE + c] > 0) ? 1 : 0;
+    const [c, b, a] = table.backbone(aatype[token]);
+    present[token] = (mask[token * table.slots + a] > 0 && mask[token * table.slots + b] > 0
+      && mask[token * table.slots + c] > 0) ? 1 : 0;
     for (let axis = 0; axis < 3; axis += 1) translations[token * 3 + axis] = at(token, b, axis);
 
     // e1 along C - CA; e2 the part of N - CA orthogonal to it; e3 = e1 x e2.
@@ -220,25 +273,26 @@ export function backboneFrames(aatype, positions, mask, tokens) {
  *            unitVector: Float32Array, backboneMask2d: Float32Array}}
  *   `unitVector` is [tokens, tokens, 3], already masked.
  */
-export function templateGeometry(template, multichainMask2d, tokens) {
+export function templateGeometry(template, multichainMask2d, tokens, layout = AF3_DENSE) {
   const { aatype, atomMask } = template;
+  const slots = layoutFor(layout).slots;
   // 🔴 THE POSITIONS ARE MASKED FIRST, which AF3 does as
   // `dense_atom_positions *= dense_atom_mask[..., None]` before anything reads
   // them. An unresolved atom's coordinates are whatever the featuriser left
   // there, and they reach the distogram through the pseudo-beta gather even
   // though its mask is zero - the mask only zeroes the OUTPUT, and a bin index
   // computed from a stale coordinate is still a bin index.
-  const positions = new Float32Array(tokens * NUM_DENSE * 3);
-  for (let slot = 0; slot < tokens * NUM_DENSE; slot += 1) {
+  const positions = new Float32Array(tokens * slots * 3);
+  for (let slot = 0; slot < tokens * slots; slot += 1) {
     const keep = atomMask[slot] > 0 ? 1 : 0;
     positions[slot * 3] = template.atomPositions[slot * 3] * keep;
     positions[slot * 3 + 1] = template.atomPositions[slot * 3 + 1] * keep;
     positions[slot * 3 + 2] = template.atomPositions[slot * 3 + 2] * keep;
   }
 
-  const beta = pseudoBeta(aatype, positions, atomMask, tokens);
+  const beta = pseudoBeta(aatype, positions, atomMask, tokens, layout);
   const dgram = distogram(beta.positions, tokens);
-  const frames = backboneFrames(aatype, positions, atomMask, tokens);
+  const frames = backboneFrames(aatype, positions, atomMask, tokens, layout);
 
   const pseudoBetaMask2d = new Float32Array(tokens * tokens);
   const backboneMask2d = new Float32Array(tokens * tokens);
@@ -341,11 +395,12 @@ export function multichainMaskFor(asymId, tokens, options = {}) {
  * @param {number} tokens
  * @returns {Float32Array}
  */
-export function coverageOf(template, tokens) {
+export function coverageOf(template, tokens, layout = AF3_DENSE) {
+  const slots = layoutFor(layout).slots;
   const covered = new Float32Array(tokens);
   for (let token = 0; token < tokens; token += 1) {
-    for (let slot = 0; slot < NUM_DENSE; slot += 1) {
-      if (template.atomMask[token * NUM_DENSE + slot] > 0) { covered[token] = 1; break; }
+    for (let slot = 0; slot < slots; slot += 1) {
+      if (template.atomMask[token * slots + slot] > 0) { covered[token] = 1; break; }
     }
   }
   return covered;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  BACKBONE_SLOTS, DGRAM_BINS, NUM_DENSE, PSEUDO_BETA_SLOT,
+  AF2_ATOM37, AF3_DENSE, BACKBONE_SLOTS, DGRAM_BINS, NUM_DENSE, PSEUDO_BETA_SLOT,
   backboneFrames, coverageOf, distogram, multichainMaskFor, pseudoBeta,
   templateGeometry,
 } from "../src/af3/template-features.js";
@@ -258,5 +258,61 @@ describe("coverageOf", () => {
     template.atomMask[0 * NUM_DENSE + 1] = 1;
     template.atomMask[2 * NUM_DENSE + 4] = 1;
     expect([...coverageOf(template, 3)]).toEqual([1, 0, 1]);
+  });
+});
+
+describe("the AF2 atom37 layout", () => {
+  /** A residue in atom37: N=0, CA=1, C=2, CB=3, O=4. */
+  const atom37 = (origin, cb) => {
+    const positions = new Float32Array(37 * 3);
+    const mask = new Float32Array(37);
+    const put = (slot, point) => {
+      positions[slot * 3] = point[0];
+      positions[slot * 3 + 1] = point[1];
+      positions[slot * 3 + 2] = point[2];
+      mask[slot] = 1;
+    };
+    put(0, [origin[0], origin[1] + 1, origin[2]]);
+    put(1, origin);
+    put(2, [origin[0] + 1, origin[1], origin[2]]);
+    if (cb) put(3, cb);
+    return { positions, mask };
+  };
+
+  // 🔴 CB IS SLOT 3 HERE AND SLOT 4 IN AF3'S DENSE LAYOUT, because atom37 is
+  // N, CA, C, CB, O and the dense one is N, CA, C, O, CB. Reading the wrong
+  // one takes the backbone oxygen as the pseudo-beta: a real coordinate, about
+  // a bond length from the right answer, which moves a short-range distogram
+  // bin and nothing at long range.
+  it("takes CB from slot 3, not slot 4", () => {
+    const one = atom37([0, 0, 0], [5, 5, 5]);
+    const beta = pseudoBeta(Int32Array.from([0]), one.positions, one.mask, 1, AF2_ATOM37);
+    expect([...beta.positions]).toEqual([5, 5, 5]);
+    expect(beta.mask[0]).toBe(1);
+  });
+
+  it("still gives glycine CA", () => {
+    const one = atom37([1, 2, 3], [5, 5, 5]);
+    const beta = pseudoBeta(Int32Array.from([7]), one.positions, one.mask, 1, AF2_ATOM37);
+    expect([...beta.positions]).toEqual([1, 2, 3]);
+  });
+
+  // The frame is `from_two_vectors(C - CA, N - CA)` translated to CA in BOTH
+  // models - AF3 through the side-chain table with its reversed convention,
+  // AF2 through make_transform_from_reference(N, CA, C). Same slots, too.
+  it("builds the same frame as AF3 does, from the same three slots", () => {
+    const one = atom37([7, -2, 3]);
+    const frames = backboneFrames(
+      Int32Array.from([0]), one.positions, one.mask, 1, AF2_ATOM37);
+    expect([...frames.translations]).toEqual([7, -2, 3]);
+    expect(frames.rotations[0]).toBeCloseTo(1, 6);
+    expect(frames.mask[0]).toBe(1);
+    expect(AF2_ATOM37.backbone).toEqual(AF3_DENSE.backbone);
+  });
+
+  it("reads coverage over 37 slots rather than 24", () => {
+    const template = { atomMask: new Float32Array(2 * 37) };
+    template.atomMask[37 + 3] = 1;
+    expect([...coverageOf(template, 2, AF2_ATOM37)]).toEqual([0, 1]);
   });
 });
