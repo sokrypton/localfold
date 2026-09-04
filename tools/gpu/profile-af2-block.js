@@ -20,9 +20,16 @@
  * WHAT IT FINDS, on 59 residues, as block time and the 48-block stack it
  * implies:
  *
- *      5 rows    13.5 ms    646 ms    opm.accumulate 2.04, opm.intermediate 1.07
- *    128 rows    32.8 ms   1574 ms    the two attention projections 4.07 each
- *    512 rows    87.8 ms   4216 ms    msa-column-attention.flash 16.6
+ *      5 rows     8.1 ms    389 ms    opm.accumulate 1.21, opm.intermediate 0.68
+ *    128 rows    24.5 ms   1176 ms    the two attention projections 2.45 each
+ *    512 rows    87.1 ms   4220 ms    msa-column-attention.flash 16.7
+ *
+ * 🔴 READ THOSE TO ABOUT 5%, AND THE PER-CHANGE NUMBERS BELOW TO ABOUT 1%. Three
+ * runs of this file back to back agree to 0.6% - 86.99, 87.13 and 87.52 ms at
+ * 512 rows - and runs an hour apart do not: the same tree measured the two
+ * attention projections at 19.3 ms and then at 20.4. So an A/B belongs in one
+ * process, which is what every arrow below is, and an absolute belongs with a
+ * tolerance.
  *
  * 🔴 THE DEEP BLOCK IS NO LONGER ALMOST ALL ONE KERNEL, AND THIS DOCSTRING
  * SAID IT WAS FOR A WHILE AFTER IT STOPPED BEING TRUE. It recorded 294.9 ms at
@@ -35,16 +42,29 @@
  * output projection - each turned out to be reading one operand a float at a
  * time, and were given vector operands.
  *
- * What is left is FLAT. At 512 rows the top five kernels are within 16.7 to 13.6
- * ms of each other and every one of them runs between 900 and 1150 GFLOP/s, which
- * tools/gpu/probe-alu.js puts at 70-89% of this device's scalar multiply-add
- * ceiling. There is no outlier to attack: the next thing here is a different
- * algorithm, not a better tile, and the two benches that exist for these
- * kernels (bench-evoformer-linear.js, bench-msa-attention.js) both report their
- * current shape as the optimum of everything tried.
+ * What was left after that was FLAT - the top five kernels within 16.7 to 13.6
+ * ms of each other, all between 900 and 1150 GFLOP/s - and the conclusion drawn
+ * was that the next thing had to be a different algorithm rather than a better
+ * tile. Half of that was right. The tiles were at their optimum; the ELEMENT was
+ * not, and the note below is what that was worth.
+ *
+ * 🔴 SO THE BLOCK IS NOT FLAT ANY MORE, AND opm.contract IS THE OUTLIER NOW. At
+ * 512 rows, as GFLOP/s against the 1287 scalar and 5034 vec4 ceilings
+ * tools/gpu/probe-alu.js measures:
+ *
+ *     the two projections   10.2 ms each   1550 GFLOP/s
+ *     the transitions       24.7 total     1280
+ *     msa-column-attention.flash  16.7      950
+ *     the two outputs        3.5 each      1140
+ *     opm.contract            5.3           684
+ *
+ * The outer product mean's contraction is half the rate of the projections and
+ * has not moved all session: its sequence chunk is at its measured optimum (see
+ * src/evoformer/outer-product-mean.js) and neither f16 lever applies cleanly to
+ * it. That is where the next thing is.
  *
  * 🔴 WHAT MOVED AFTERWARDS WAS NOT A TILE EITHER - IT WAS THE ELEMENT. The
- * block went 109.25 -> 87.83 ms, and every step of that was half precision
+ * block went 109.25 -> 87.1 ms, and every step of that was half precision
  * somewhere, for three different reasons:
  *
  *   - COLUMN ATTENTION 21.0 -> 16.7 and row attention 3.9 -> 2.9, by staging

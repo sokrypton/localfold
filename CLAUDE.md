@@ -148,14 +148,20 @@ alone was 118 MiB of 681). Both are now smaller - a 59-token AF3 fold holds
 **798 MiB against 1406**, and an AF2 fold at 512 MSA rows peaks at **573 MiB
 against 681**.
 
-🔴 **AND THE SAME DIFFERENCE DECIDES WHETHER f16 WEIGHTS BUY TIME.** It is the
-question that has no answer except about the traffic: AF3's trunk keeps its
-weights resident and reads them one scalar at a time, so halving their bytes
-measured 377 ms against 378 - a dead end recorded in AF3.md. AF2 uploads its
-weights every pass and re-reads them 944 times a transition, so the identical
-change is worth 8% of that kernel. AF3's diffusion transformer streams 566 MB
-of weights once per token tile, and it is worth 10-15% there. See AF3.md's memory
-section and `TRANSITION_CHUNK_TARGET_BYTES`.
+🔴 **AND THE SAME DIFFERENCE DECIDES WHETHER f16 WEIGHTS BUY TIME.** The
+question has no answer except one about the traffic, and it was asked three
+times here with three answers:
+
+| where | how the weights are read | f16 storage is worth |
+|---|---|---|
+| AF3's trunk | resident, one scalar at a time | **-2%** (377 vs 378 on the pair track; 163-166 vs 166-168 on the single track) |
+| AF2's transition | uploaded every pass, re-read 944 times | **+8%** of the kernel, plus half the upload |
+| AF3's diffusion transformer | streamed once per token tile | **+14%** (48 -> 41 ms at 59 tokens, 103 -> 89 at 150) |
+
+Halving the bytes never halves the read INSTRUCTIONS, and the `f32()` at each
+read is not free - so where the bytes are not the bottleneck it is a small
+LOSS taken for the memory. See AF3.md's memory section and
+`TRANSITION_CHUNK_TARGET_BYTES`.
 
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
 allocator's snapshot cannot see a `Float32Array`, and until
@@ -163,20 +169,33 @@ allocator's snapshot cannot see a `Float32Array`, and until
 outside the allocator - which are most of them by size. Host heap comes from
 `tools/gpu/probe-memory.js` (it forces a collection first, or the reading
 carries 300 MiB of garbage); device memory from `memorySnapshot(device)`,
-which `fold.js` and `bench-trunk.js` print. A 31-residue fold holds **305 MiB
-of heap and 1390 MiB on the device**; 1190 MiB of the latter is weights kept
+which `fold.js`, `bench-trunk.js` and `fold-af2.js` print. A 31-residue fold
+held **305 MiB of heap and 1390 MiB on the device** before the f16 weight work
+of 2026-09-04 and holds about 800 MiB on the device after it; 1190 MiB of the
+1390 was weights kept
 resident on purpose, which `--budget` makes the code give up when it must.
 
 🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
 multiply-adds out of registers with no memory in the way. On this M2 it reports
-**1254 GFLOP/s scalar, 2472 vec2, 4980 vec4**, and 403 billion workgroup reads a
-second - so a vec4 multiply-add is 4x a scalar one, and every one of those is
-about 640 G instructions a second. **In f16 it reports 2121, 4295 and 8590**:
-an f16 multiply-add issues at **1.7x** an f32 one for the same instruction, and
-`shader-f16` is now requested by `requestAlphaFoldDevice`. Read a kernel's number against THAT, not
-against a specification sheet: the trunk's kernels sit at 900 GFLOP/s to
+**about 1220-1260 GFLOP/s scalar, 2420-2470 vec2, 4870-4980 vec4**, and ~400
+billion workgroup reads a second - so a vec4 multiply-add is 4x a scalar one,
+and every one of those is about 640 G instructions a second. **In f16 it reports
+2045-2121, 4090-4295 and 8279-8590.**
+
+🔴 **THE RATIO IS THE STABLE PART, NOT THE ABSOLUTES.** Two runs of this probe
+an hour apart differ by 3-4% on every arm, so a kernel quoted against one of
+them is quoted to about that. What does not move is that an f16 multiply-add
+issues at **1.7x** an f32 one for the same instruction. `shader-f16` is now
+requested by `requestAlphaFoldDevice`. Read a kernel's number against THAT, not
+against a specification sheet: the trunk's kernels sat at 900 GFLOP/s to
 1.1 TFLOP/s, which is 70-85% of the scalar ceiling and a quarter of the vector
 one. It is an instruction-count machine.
+
+🔴 **AND HALF PRECISION MOVED THAT CEILING, so the sentence above is about f32
+only.** After the f16 work of 2026-09-04 AF2's dense kernels run at 1140-1550
+GFLOP/s rather than 900-1100 - past the scalar ceiling, because their
+arithmetic is no longer scalar-equivalent - and `opm.contract` at 684 is the
+one left behind. See tools/gpu/profile-af2-block.js.
 
 🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
 AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at

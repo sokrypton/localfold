@@ -3,13 +3,18 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/probe-dispatch.js
  *
- * WHY IT EXISTS. An AF3 trunk pass at 59 tokens spends 338 ms waiting on a GPU
- * whose labelled compute passes add up to about 120 - and the encoding that
- * queues it costs 5 ms, so the gap is neither the host's nor inside any pass.
- * It is BETWEEN the dispatches: 1,521 of them over three passes, each one
- * small enough at 59 tokens that whatever a dispatch costs to start and drain
- * is the larger term. Nothing measured that, and every conclusion about where
- * the trunk's time goes depends on the number.
+ * WHY IT EXISTS. An AF3 trunk pass spends nearly all of its wall clock waiting
+ * on a GPU whose labelled compute passes add up to well under it, while the
+ * encoding that queues the work costs one or two milliseconds - so the gap is
+ * neither the host's nor inside any pass. It looked like it had to be BETWEEN
+ * the dispatches, of which a pass has hundreds, each small enough at these
+ * token counts that whatever a dispatch costs to start and drain could be the
+ * larger term. Nothing measured that, and every conclusion about where the
+ * trunk's time goes depended on the number.
+ *
+ * It is not the dispatches. See the answer in AF3.md - the gap is the profiler,
+ * which adds 30% to the clock it is measured against and quantises its
+ * timestamps to about 100 us across a great many short passes.
  *
  * Three arms, all issuing the same trivial kernel:
  *   - `one-pass`    N dispatches inside a single compute pass

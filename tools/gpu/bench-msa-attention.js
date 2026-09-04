@@ -6,7 +6,8 @@
  *     node tools/gpu-chrome.mjs tools/gpu/bench-msa-attention.js --shape=row
  *
  * WHY IT EXISTS. `msa-column-attention.flash` is the largest single kernel in
- * an AF2 evoformer block at depth - 21 ms of 118 at 512 rows, and quadratic in
+ * an AF2 evoformer block at depth - it was 21 ms of 118 at 512 rows when this
+ * was written and is 16.7 of 87 now - and quadratic in
  * SEQUENCES where everything else in the block is linear, so it grows fastest
  * with the thing a real alignment adds. Nothing measured it on its own:
  * check-attention-variants.js times a whole AttentionGpu.run (projections

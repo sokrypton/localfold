@@ -361,20 +361,35 @@ where a protein takes OXT at its last residue.
 
 ## Performance, and what has already been tried
 
-The pairformer went 3468 ms -> 621 ms over 48 blocks at 59-68 tokens, and AF3's
-block is now 1.09x AF2's evoformer block - for a block with no MSA row
-attention, no column attention and no outer product mean in it.
+The pairformer went 3468 ms -> 621 ms over 48 blocks at 59-68 tokens, and then
+to **261 ms** with the f16 work of 2026-09-04.
+
+🔴 **AND IT IS NO LONGER SLOWER THAN AF2'S BLOCK, WHICH THIS FILE SAID TWICE.**
+"AF3's block is 1.09x AF2's evoformer block - for a block with no MSA row
+attention, no column attention and no outer product mean in it" was a standing
+complaint, and it is now the other way round: `tools/gpu/bench-blocks.js` at 59
+tokens reports **5.44 ms a pairformer block against AF2's 8.93, or 0.61x.**
+
+The reason is not that AF3 got better at the same thing. Both models took the
+same class of change, but at 5 MSA rows an AF2 block is almost all PAIR track -
+its triangle and its transition, none of which was touched - while the
+pairformer is nothing but pair track and every one of its kernels was. At 512
+MSA rows, where AF2's block is nine tenths MSA track, AF2 is the one that
+moved: 109.25 -> 87.1 ms.
 
 🔴 **AND THE TRUNK IS COMPUTE BOUND, WHICH THIS FILE USED TO SAY WAS THE NEXT
 LEAD.** It said ~5 ms a block in the encoder, submit and validation path was
 unexplained. It is not there. The labelled compute passes do sum to well under
-the wall clock - 352 ms against 1201 - and three separate measurements say that
-gap is the instrument and not the machine:
+the wall clock - it was 352 ms against 1201 when this was written - and three
+separate measurements say that gap is the instrument and not the machine. The
+absolutes below have all moved since (the trunk is much faster now); the SHAPE
+is the argument and it has not:
 
-- `Af3PairformerStackGpu` now returns its own `split`. A whole 48-block pass is
-  encoded in **5 ms** and spends **338** inside `onSubmittedWorkDone`.
-- Doubling the tokens quadruples the time, three times over: 59, 118 and 236
-  tokens give 104, 384 and 1670 ms. A pass paying a fixed cost per block does
+- `Af3PairformerStackGpu` now returns its own `split`. A 16-block pass is
+  encoded in **1.3-2 ms** and spends **82, 308 and 1345** inside
+  `onSubmittedWorkDone` at 59, 118 and 236 tokens.
+- Doubling the tokens quadruples the time, three times over: those same three
+  shapes give **87, 318 and 1379 ms**. A pass paying a fixed cost per block does
   not scale like that.
 - `tools/gpu/probe-dispatch.js` prices a dispatch before it computes anything:
   **3.5 us** in a shared compute pass, 4.9 in its own, 5.1 when it changes
@@ -405,8 +420,8 @@ What worked, in order of size:
    contribute exactly zero. Checked by `check-af3-target-feat-gpu.js`.
 
 7. **f16 accumulators in the two triangle projections**, 2026-09-04.
-   `tri.project` and `tri.project-out` are 23% of the trunk's GPU time between
-   them and hold their accumulators in WGSL ARRAYS - eight vec4 and eight vec2 -
+   `tri.project` and `tri.project-out` were 23% of the trunk's GPU time between
+   them, and are 19% after this and hold their accumulators in WGSL ARRAYS - eight vec4 and eight vec2 -
    which is the shape a driver spills first. In f16: **1.688 -> 1.087 ms and
    1.250 -> 0.875** at 118 tokens, 1.55x and 1.43x, at the tile they already
    had. As the pairformer's wall time: **118 tokens 180 -> 162 ms, 236
@@ -465,10 +480,17 @@ What did **not** work, measured, so it is not retried:
   projection and applies the gate itself. The adapter was wrong at relRMS
   2.96e-1 and cost more to find than the rewrite took.
 
-Where the remaining time goes, at 59 tokens: 348 ms of dispatch work and 284 ms
-of per-block overhead that is **not** uploads (40 ms) and **not** bind groups
+~~Where the remaining time goes, at 59 tokens: 348 ms of dispatch work and
+284 ms of per-block overhead that is not uploads (40 ms) and not bind groups
 (0 ms). About 5 ms a block in the encoder, submit and validation path is
-unexplained. That is the next lead and it is a small one.
+unexplained. That is the next lead and it is a small one.~~
+
+🔴 **STRUCK OUT 2026-09-04: THERE IS NO SUCH OVERHEAD.** The paragraph above
+survived because the numbers it quotes are real - the labelled compute passes
+genuinely do sum to less than the wall clock - but the gap is the profiler and
+not the machine. See the compute-bound note in the section above, which prices
+a dispatch, splits the encode from the wait, and shows the pass scaling as a
+clean square. It was a lead for a long time and it was never there.
 
 ### The f16 budget, spent and accounted for
 
@@ -484,13 +506,28 @@ blocks and real weights:
 | + triangle accumulators | 1.99e-5 | 8.06e-5 | 1.33e-3 | 1.26e-5 |
 
 So the contacts - the most sensitive thing the trunk emits - are 13.6x their
-f32 value, for about 25% of the trunk's time and 43% of its memory.
+f32 value. What that bought, measured by forcing every f16 path off with
+`--staged=f32 --weights=f32 --accumulate=f32`:
+
+| | all f32 | shipped | |
+|---|---|---|---|
+| pairformer, 236 tokens | 854 ms | 727 | 15% |
+| whole trunk pass, 236 tokens | 1677 ms | 1558 | 7% |
+| a fold, cold / warm | 3.23 / 2.18 s | 2.48 / 1.93 | 23% / 11% |
+| a fold's device memory | 1406 MiB | 798 | 43% |
+
+🔴 **THE FOUR ROWS ARE NOT THE SAME NUMBER SEEN FOUR WAYS, and quoting the
+biggest one is the mistake.** A trunk pass is 7% because the MSA stack and the
+template are most of what is left in it and neither was touched; a fold is 23%
+cold because the diffusion head's weights are most of its memory traffic and
+the f32 arm uploads 608 MiB more of them. The pairformer's 15% is the one that
+matches the kernel work.
 
 🔴 **WHAT DECIDES IS WHETHER A NUMBER A USER SEES MOVES, AND NONE DOES.** On
 6MRR and 1QYS at flow-8: CA RMSD 0.032 A and 0.005 against the f32 tree, where
 AF3's own accuracy on these is 0.7-0.9 A and the sampler's seed-to-seed spread
-is ~0.1. Mean pLDDT within 0.01 and worst per-residue 0.22, on a number the
-page shows to one decimal. pTM within 2e-4, shown to two. A contact probability
+is ~0.1. Mean pLDDT within 0.01 and worst per-residue 0.04 on 6MRR and 0.22 on
+1QYS, on a number the page shows to one decimal. pTM within 2e-4, shown to two. A contact probability
 moves by ~1e-3 in [0, 1].
 
 🔴 **AND RMSD IS NOT MONOTONE IN THE ERROR, so do not read one structure as a
@@ -514,14 +551,28 @@ was three rows out of a 1406 MiB fold:
 1216 of 1406 MiB, all of it weights. In f16 they are 608, and **a fold now
 holds 798 MiB against 1406; the trunk alone 337 against 567.**
 
-🔴 **IT BUYS NO TIME AND IS NOT SUPPOSED TO.** Measured at 377 ms against 378 on
-the pairformer. Halving the bytes does not halve the read instructions. What it
-buys is a device small enough to hold the model at all - a 4 GiB phone's whole
-budget is 1.3 GiB, which a fold was exceeding on its own.
+🔴 **IT BUYS NO TIME AND IS NOT SUPPOSED TO - IT COSTS ABOUT 2%.** Halving the
+bytes does not halve the read instructions, and the `f32()` at each read is not
+free. Two separate measurements, both on the pairformer:
 
-Two folds say what it costs, against the same seeds on the all-f32 tree at
-flow-8 with one recycle: **6MRR 0.0077 A CA RMSD, 1QYS 0.0093 A**, worst
-per-residue pLDDT 0.02 and 0.24, bond geometry identical to five decimals.
+- the PAIR track's weights (triangle and pair transition): 377 ms against 378,
+  which is nothing;
+- the SINGLE track's, which is where the memory is: 163, 163, 166 ms in f32
+  against 166, 167, 168 in f16 across three interleaved pairs.
+
+What it buys is a device small enough to hold the model at all - a 4 GiB
+phone's whole budget is 1.3 GiB, which a fold was exceeding on its own.
+
+🔴 **AND THE DIFFUSION TRANSFORMER IS THE EXCEPTION, so do not generalise the
+paragraph above to it.** That stack streams its whole weight set once per token
+tile instead of keeping it in cache, so there the bytes ARE the cost: 48 -> 41
+ms at 59 tokens and 103 -> 89 at 150. See its shader factory.
+
+Two folds say what THIS CHANGE costs, against the same seeds on the all-f32
+tree at flow-8 with one recycle: **6MRR 0.0077 A CA RMSD, 1QYS 0.0093 A**, worst
+per-residue pLDDT 0.02 and 0.24, bond geometry identical to five decimals. The
+triangle accumulators landed after it and moved those to 0.032 and 0.005; the
+budget table above is the combined figure and this one is the weights alone.
 
 🔴 **TWO PLACES KEEP f32 ON PURPOSE, AND BOTH ARE ABOUT THE RATIO.**
 
@@ -579,7 +630,8 @@ measurements is in each file.
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
 - **Templates raise** rather than compute: the geometry features are
   unverifiable without a reference.
-- **AF3's block is still 1.09x AF2's** for strictly less work.
+- ~~**AF3's block is still 1.09x AF2's** for strictly less work.~~ Closed
+  2026-09-04: it is 0.61x. See the performance section.
 - **No RNA alignment.** AF3's pipeline searches an RNA database; single-sequence
   is what an RNA chain gets here, and the status line says so. The seam is
   ready for one - featuriseProtein reads the MSA by ALIGNMENT COLUMN now, and
@@ -935,10 +987,16 @@ governs: a vec4 multiply-add and a scalar one and a workgroup read all cost one
 instruction, so this is an instruction-count machine and vectorising pays
 exactly when it reduces the count.
 
-That reframes everything above. The trunk's kernels run at 900 GFLOP/s to
+That reframes everything above. The trunk's kernels ran at 900 GFLOP/s to
 1.1 TFLOP/s, which is not 25% of a 3.6 TFLOP/s paper peak - it is **70-85% of
 the scalar ceiling**, and about a third of the instruction rate once their loads
 are counted. The remaining factor is in the loads, not the arithmetic.
+
+🔴 **AND HALF PRECISION MOVED THE CEILING ITSELF, which is the one way past
+that argument.** An f16 multiply-add issues at 1.7x an f32 one for the same
+instruction, so a kernel at 85% of the f32 scalar ceiling is not finished - it
+is finished IN f32. The kernels that took f16 accumulators now run past that
+line; see the f16 budget section above and tools/gpu/profile-af2-block.js.
 
 🔴 **WHICH IS WHY VECTORISING THE TRANSITION BOUGHT NOTHING BY ITSELF.** Its
 tile's rows became vec4 lanes - four multiply-adds into one, and a quarter of

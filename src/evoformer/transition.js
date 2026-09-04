@@ -260,8 +260,9 @@ export function packTransitionWeights(input, weightPrecision = "f32") {
  *
  * 🔴 TWO MORE THINGS WERE TRIED ON IT AND BOTH LOST, which puts this kernel at
  * its optimum rather than merely un-examined. Measured as the two MSA
- * transitions of a 512-row block, against 15.70 and 15.62 ms, in runs where the
- * untouched kernels around them matched to 0.05 ms:
+ * transitions of a 512-row block against the f32 baseline of the time, 15.70
+ * and 15.62 ms - the same two are 12.17 and 12.58 now, in f16 and split across
+ * four chunks each - in runs where the untouched kernels matched to 0.05 ms:
  *
  *   - HOISTING THE BIAS AND THE ACTIVATION out of the store. A lane owns
  *     `rowsPerLane` rows of the same columns, so `weights[bias_offset + column]`

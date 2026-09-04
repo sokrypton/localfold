@@ -163,8 +163,14 @@ export async function main(device, args) {
   // 6MRR at 71 tokens and 1QYS at 91, flow-8, one recycle, against the same
   // seeds on the all-f32 tree:
   //
-  //     6MRR   CA RMSD 0.0104 A   pLDDT 70.18260 -> 70.18063   1406 -> 740 MiB
-  //     1QYS   CA RMSD 0.0093 A   pLDDT 69.54053 -> 69.54726   1414 -> 748 MiB
+  //     6MRR   CA RMSD 0.0104 A   pLDDT 70.18260 -> 70.18063
+  //     1QYS   CA RMSD 0.0093 A   pLDDT 69.54053 -> 69.54726
+  //
+  // ...measured for THIS AXIS on the tree it landed on, where a fold went 1406
+  // MiB to 740. Two things moved after it: the pair track's weights came back
+  // out of f16 (so a fold holds 798 now, not 740) and the triangle projections
+  // took f16 accumulators (so the shipped tree's RMSD against all-f32 is 0.032
+  // on 6MRR, not 0.0104). AF3.md carries the combined figure.
   //
   // ...with N-CA, CA-C and CA-CA medians identical to five decimals. AF3's own
   // accuracy on these is 0.7-0.9 A and the sampler's seed-to-seed spread is

@@ -215,14 +215,17 @@ export class Af3PairformerStackGpu {
     const hasF16 = this.device.features?.has("shader-f16") === true;
     const stagedPrecision = this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE RESIDENT WEIGHTS ARE THE MEMORY, AND THE SINGLE TRACK IS THE
-    // WEIGHTS. Broken down by label, a 59-token fold's 567 MiB is
+    // WEIGHTS. Broken down by label, the 567 MiB an AF3 TRUNK keeps resident is
     // w.single-transition 324 and w.single 135 - 81% of it in two tensors,
     // because the single track runs 384 channels against the pair track's 128
     // and its transition widens by four on top. Held in f16 those are 230 MiB
     // instead of 459. It buys no time, and is not meant to: these kernels read
     // their weights one scalar at a time and this machine is instruction-bound,
-    // so halving the BYTES does not halve the read instructions. What it buys
-    // is a device small enough to hold the model at all.
+    // so halving the BYTES does not halve the read instructions. Measured on
+    // the pairformer at 118 tokens, three interleaved pairs: 163, 163, 166 ms
+    // in f32 against 166, 167, 168 in f16 - so it costs about 2%, from the
+    // f32() on every read, rather than costing nothing. What it buys is a
+    // device small enough to hold the model at all.
     const weightPrecision = this.options?.weightPrecision ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE PAIR TRACK'S OWN WEIGHTS STAY f32 BY DEFAULT, AND THE REASON IS THE
     // RATIO. Narrowing them saves 38 MiB - the triangle's 20 and the pair

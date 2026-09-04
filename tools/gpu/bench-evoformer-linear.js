@@ -8,7 +8,7 @@
  * WHY IT EXISTS. `createLinearShader` is the workhorse of the whole AF2 side -
  * both halves of every transition, every attention projection's sibling, the
  * confidence head and all four structure-module kernels - and at 512 MSA rows
- * its two transition dispatches are 27% of an evoformer block. Moving it
+ * its two transition dispatches are about 28% of an evoformer block. Moving it
  * through `profile-af2-block.js` costs a minute an arm and cannot separate a
  * change in the kernel from a change in how the block schedules around it.
  * Here an arm is about a second.

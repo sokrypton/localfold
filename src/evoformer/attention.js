@@ -390,6 +390,12 @@ export const ATTENTION_PROJECT_SHADER = createAttentionProjectShader();
  * (tools/gpu/fold-af2.js): at 128 rows pLDDT 57.284 -> 57.300 with pTM and the
  * CA-CA median unchanged to four and three decimals, and 1619 -> 1529 ms; at
  * 512 rows 5285 -> 4920 ms.
+ *
+ * 🔴 THOSE FOUR TIMES ARE THIS CHANGE'S A/B AND NOT THE CURRENT FOLD. Two more
+ * of the same kind landed after it - the transitions' accumulators and then
+ * their weights - and a fold is now about 1395 ms at 128 rows and 4470 at 512,
+ * at pLDDT 57.314. An arrow in this file always means "what this change was
+ * worth, measured against the tree it landed on".
  */
 export const ATTENTION_PROJECT_TILE_F16 = {
   lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,

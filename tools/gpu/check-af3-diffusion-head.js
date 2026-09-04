@@ -327,7 +327,8 @@ export async function main(device, args) {
   // 🔴 DERIVED, AND THE STRUCTURAL CLAIM IS MADE ELSEWHERE. f16 transformer
   // weights measure 1.28e-4 here against the f32 path's 1.76e-6, on a denoiser
   // whose output is coordinates in angstroms - and what that is worth is two
-  // whole folds, not this number: 6MRR moves 0.0104 A and 1QYS 0.0093 A, with
+  // whole folds, not this number: for this axis 6MRR moved 0.0104 A and 1QYS
+  // 0.0093 A (the shipped tree's combined figure is 0.032 and 0.005), with
   // bond geometry identical to five decimals. See the note in
   // check-af3-diffusion-transformer.js. 4e-4 is 3x the measurement.
   const bound = weightPrecision === "f16" ? 4e-4 : 1e-4;

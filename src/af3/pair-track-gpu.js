@@ -71,7 +71,8 @@ export async function compilePairTrack(cache, options) {
   // It holds eight vec4 in a WGSL array - the thing a driver spills first - and
   // in f16 they are half that. Worth 1.55x on the kernel at the tile it already
   // had (bench-triangle-project.js at 118 tokens: 1.688 -> 1.087 ms), and
-  // tri.project is 13% of the trunk's GPU time.
+  // tri.project WAS 13% of the trunk's GPU time before this and is 10% after,
+  // which is the point rather than a correction.
   const accumulatePrecision = options.accumulatePrecision ?? "f32";
   const shape = {
     length: n, cZ: channels, cHidden: channels, weightPrecision, accumulatePrecision,

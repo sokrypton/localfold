@@ -4,13 +4,19 @@
  *     node tools/gpu-chrome.mjs tools/gpu/bench-attention-project.js
  *     node tools/gpu-chrome.mjs tools/gpu/bench-attention-project.js --arms=4x2,8x2@f16
  *
- * WHY IT EXISTS. The two attention projections are 27 ms of a 105 ms evoformer
+ * WHY IT EXISTS. The two attention projections were 27 ms of a 105 ms evoformer
  * block at 512 MSA rows - the largest thing in it after column attention - and
  * the sweep that chose their tile was run through profile-af2-block.js at a
  * minute an arm, which is the same complaint bench-evoformer-linear.js was
  * written to answer for the transition's kernel. This is that, for this kernel:
  * synthetic weights, one shader, several tiles interleaved, about a second an
  * arm.
+ *
+ * 🔴 THEY ARE 20 ms OF AN 87 ms BLOCK NOW, AND NO LONGER SECOND. The tile this
+ * bench found took them there, and the transitions - 25 ms across their two
+ * halves - are the larger group. Column attention is still the largest single
+ * kernel at 16.7. The sentence above is kept in the past tense because it is
+ * why the file exists, not what the block looks like.
  *
  * Arms are `rowsPerLane x columnsPerLane` (lanes default to 8 by 8) or the full
  * `lanesX x lanesY x rowsPerLane x columnsPerLane`, optionally suffixed `@f16`

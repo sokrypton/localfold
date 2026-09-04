@@ -90,7 +90,8 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
   const { n, channels, heads, dimension } = shape;
   const width = heads * dimension;
   // 🔴 A STORAGE FORMAT FOR THE WEIGHTS, FOR MEMORY AND NOT FOR TIME. `w.single`
-  // is 135 MiB of the 567 a 59-token AF3 fold keeps on the device - the single
+  // is 135 MiB of the 567 an AF3 TRUNK keeps resident (a whole fold held 1406,
+  // of which this is one tensor of three) - the single
   // track runs 384 channels where the pair track runs 128 - and every read here
   // is a scalar, so halving the bytes halves the residency and changes the time
   // by nothing. Reads are widened at the point of use; the arithmetic is f32

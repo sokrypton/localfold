@@ -158,15 +158,21 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   // one workgroup read and one vector multiply-add replace TILE of each - qkvg
   // went from 24 instructions a channel to nine.
   // 🔴 THE WEIGHT BUFFER IS A STORAGE FORMAT, AND THIS IS THE BIGGEST ONE THERE
-  // IS. `difftx.block.resident` is 756 MiB of the 1118 a 59-token AF3 fold
-  // holds on the device - 68% of it, more than the trunk's entire pairformer -
-  // because 24 blocks of a 768-channel transformer each keep 31.5 MiB resident
-  // for the model's lifetime. In f16 that is 378.
+  // IS. `difftx.block.resident` was 756 MiB when it was f32 - 68% of what a
+  // fold then held, more than the trunk's entire pairformer - because 24 blocks
+  // of a 768-channel transformer each keep 31.5 MiB resident for the model's
+  // lifetime. In f16 it is 378 MiB, and it is still the largest single tensor a
+  // fold holds; a fold now holds 798 MiB in total.
   //
-  // It buys no time. Every read below is a scalar and this machine is
-  // instruction-bound, so halving the bytes does not halve the reads; what it
-  // buys is a device small enough to hold the model. Reads are widened at the
-  // point of use and the arithmetic is f32 throughout.
+  // 🔴 AND HERE IT BUYS TIME AS WELL, WHICH IS TRUE OF NOWHERE ELSE IN EITHER
+  // MODEL. This comment said "it buys no time" for a while, on the strength of
+  // AF3's trunk, where halving resident weight bytes measured 377 ms against
+  // 378. That reasoning does not transfer: this stack STREAMS its whole weight
+  // set once per token tile rather than keeping it in cache, so the bytes are
+  // the cost. Measured on bench-diffusion-transformer.js: 48 -> 41 ms at 59
+  // tokens and 103 -> 89 at 150, and a denoiser call 104-114 -> 86-91.
+  //
+  // Reads are widened at the point of use and the arithmetic is f32 throughout.
   const weightPrecision = shape.weightPrecision ?? "f32";
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown diffusion transformer weight precision ${weightPrecision}`);

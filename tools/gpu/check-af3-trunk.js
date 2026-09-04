@@ -211,12 +211,17 @@ export async function main(device, args) {
   //     staged weights acc      pair     single    contact    logits
   //     f32    f32     f32    6.18e-7    6.21e-7   9.76e-5   4.46e-7
   //     f16    f32     f32    1.04e-5    2.91e-6   1.86e-4   6.83e-6
-  //     f32    f16     f32    8.18e-6    7.99e-5   9.05e-4   5.93e-6
-  //     f16    f16     f32    1.04e-5    8.06e-5   1.86e-4   -
-  //     f16    f16     f16    1.49e-5    8.15e-5   3.78e-4   9.44e-6
+  //     f32    f16     f32    6.18e-7    8.04e-5   9.76e-5   4.46e-7
+  //     f16    f16     f32    1.04e-5    8.06e-5   1.86e-4   6.83e-6
+  //     f16    f16     f16    1.99e-5    8.06e-5   1.33e-3   1.26e-5
   //
-  // (the third and fourth rows differ because the third also had the PAIR
-  // track's weights in f16, which is off by default - see pairWeightPrecision.)
+  // 🔴 THAT TABLE HAS BEEN WRONG ONCE AND IT IS WORTH SAYING HOW. Two of its
+  // rows were measured under a configuration the columns do not name - one with
+  // the PAIR track's weights in f16 as well, which is off by default, and one
+  // before the second triangle projection took the accumulate axis. Both read
+  // as facts about the labelled combination and were not. Re-measure the whole
+  // table when a row moves; a row measured against a different tree is worse
+  // than no row.
   //
   // 4e-5 is 3x the worst pair measurement: these runs are deterministic, so the
   // margin is for scheduling and not for drift, and a bug moves this by orders

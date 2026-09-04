@@ -192,8 +192,8 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   // 🔴 AND THE WEIGHT BUFFER IS A STORAGE FORMAT TOO, WHICH IS A MEMORY WIN AND
   // NOT A SPEED ONE. This kernel reads its weights one scalar at a time and
   // this machine is instruction-bound, so halving their bytes changes the time
-  // by nothing measurable - but `w.single-transition` is 324 MiB of the 567 a
-  // 59-token AF3 fold keeps resident, more than every other tensor together,
+  // by nothing measurable - but `w.single-transition` is 324 MiB of the 567 an
+  // AF3 TRUNK keeps resident, more than every other tensor in it together,
   // and that is the number that decides whether a phone folds at all. Every
   // read is wrapped in f32() at the point of use, so the arithmetic is
   // unchanged.
