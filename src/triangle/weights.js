@@ -1,4 +1,4 @@
-import { float32ToFloat16Array } from "../runtime/float16.js";
+import { concatenateAs } from "../runtime/float16.js";
 
 const ORDER = [
   "layerNormInWeight", "layerNormInBias",
@@ -16,12 +16,10 @@ export function packWeights(weights, precision) {
     elementCount += weights[name].length;
   }
 
-  const f32 = new Float32Array(elementCount);
-  for (const name of ORDER) f32.set(weights[name], offsets[name]);
-  return {
-    data: precision === "f16" ? float32ToFloat16Array(f32) : f32,
-    offsets,
-  };
+  const data = concatenateAs(precision, elementCount, (target) => {
+    for (const name of ORDER) target.set(weights[name], offsets[name]);
+  });
+  return { data, offsets };
 }
 
 export function expectedWeightElementCount(shape) {

@@ -59,3 +59,39 @@ export function float32ToFloat16Array(values) {
   for (let i = 0; i < values.length; i += 1) result[i] = numberToFloat16(values[i]);
   return result;
 }
+
+
+/**
+ * Concatenate float32 tensors into one buffer of `precision`, in one pass.
+ *
+ * 🔴 THE OBVIOUS SHAPE COSTS TWICE AND ALLOCATES THE LARGER HALF. Every packer
+ * here built a Float32Array of the whole block, filled it, and then converted
+ * that to f16 - so a 31.5 MiB block was written once as f32 and read again to
+ * make 15.7 MiB of f16, with the f32 copy live the whole time. Setting straight
+ * into a Float16Array converts on the way in: one pass, and the wide buffer
+ * never exists.
+ *
+ * It is worth caring about because this is not a loader. An AF3 fold converts
+ * about 319 million floats the first time each block's resident buffer is
+ * filled, which is most of a second on the way to the first fold.
+ *
+ * @param {"f32"|"f16"} precision
+ * @param {number} total how many elements the result holds
+ * @param {(target: Float32Array | Float16Array) => void} fill writes each
+ *   tensor into the target at its offset
+ */
+export function concatenateAs(precision, total, fill) {
+  if (precision !== "f16") {
+    const wide = new Float32Array(total);
+    fill(wide);
+    return wide;
+  }
+  if (hasNativeFloat16) {
+    const half = new globalThis.Float16Array(total);
+    fill(half);
+    return new Uint16Array(half.buffer, half.byteOffset, half.length);
+  }
+  const wide = new Float32Array(total);
+  fill(wide);
+  return float32ToFloat16Array(wide);
+}

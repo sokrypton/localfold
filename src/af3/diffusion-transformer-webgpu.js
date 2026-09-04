@@ -1,4 +1,4 @@
-import { float32ToFloat16Array } from "../runtime/float16.js";
+import { concatenateAs } from "../runtime/float16.js";
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
  *
@@ -80,9 +80,10 @@ export function packBlockWeights(block, precision = "f32") {
     offsets[name] = total;
     total += block[name].length;
   }
-  const data = new Float32Array(total);
-  for (const name of BLOCK_ORDER) data.set(block[name], offsets[name]);
-  return { data: precision === "f16" ? float32ToFloat16Array(data) : data, offsets };
+  const data = concatenateAs(precision, total, (target) => {
+    for (const name of BLOCK_ORDER) target.set(block[name], offsets[name]);
+  });
+  return { data, offsets };
 }
 
 /**
