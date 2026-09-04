@@ -41,6 +41,7 @@
  * real protein and nothing else; `caca` is the number that a wrong kernel
  * cannot fake, so it is printed with its worst outlier.
  */
+import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
@@ -158,6 +159,9 @@ export async function main(device, args) {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
     family, chains, length, rows, recycles, seed,
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
+    // What the fold left on the device, and in what - the totals alone cannot
+    // say which tensor to attack. See src/runtime/device-memory.js.
+    deviceMemory: memorySnapshot(device),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),

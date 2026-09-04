@@ -63,12 +63,26 @@ export const TRANSITION_TILE_COLUMNS = linearTileColumns();
 /**
  * How large a single transition binding is allowed to get.
  *
- * Well under any device's limit on purpose: the point is not to squeeze to the
- * ceiling but to keep one chunk's scratch small enough that the pool can reuse
- * it, and 96 MiB is a window that divides the working set without making the
- * loop long.
+ * 🔴 A CEILING, NOT A WORKAROUND, AND THAT CHANGED. This used to apply only
+ * when the hidden activation could not be BOUND - so a fold that bound fine
+ * allocated whatever it liked, and `msa-transition.hidden` was 118 MiB of an
+ * AF2 fold's 681 MiB peak at 512 MSA rows: the largest tensor on the device by
+ * a factor of four, for a scratch buffer that is read once and thrown away.
+ * Chunking it always costs dispatches and nothing else, because the work per
+ * row and the weight traffic per workgroup are identical either way.
+ *
+ * 🔴 AND 32 MiB IS THE KNEE, MEASURED. On a 59-residue fold at 512 MSA rows,
+ * as device peak and wall clock (fold-af2.js, one run each, so the times are
+ * inside this machine's noise floor and the peaks are exact - they are
+ * accounting, not timing):
+ *
+ *     no cap   681 MiB   5256 ms        32 MiB   573 MiB   5294 ms
+ *     64 MiB   613 MiB   5266 ms        16 MiB   553 MiB   5354 ms
+ *
+ * Every arm folds to the same pLDDT of 67.131. Past 32 the saving flattens and
+ * the loop keeps getting longer.
  */
-export const TRANSITION_CHUNK_TARGET_BYTES = 96 * 1024 * 1024;
+export const TRANSITION_CHUNK_TARGET_BYTES = 32 * 1024 * 1024;
 
 const gcd = (left, right) => {
   let a = left; let b = right;
@@ -95,8 +109,9 @@ const gcd = (left, right) => {
  * is the row stride the offset is measured in, so how many rows it takes to
  * reach a 256-byte boundary depends on it - hence the gcd.
  *
- * THE FULL PATH IS PRESERVED EXACTLY: when everything already binds, this
- * returns `rows` and the caller runs its single-dispatch branch unchanged.
+ * THE FULL PATH IS PRESERVED EXACTLY for anything under the ceiling: this
+ * returns `rows` and the caller runs its single-dispatch branch unchanged. What
+ * changed is where the ceiling is - see TRANSITION_CHUNK_TARGET_BYTES.
  */
 export function transitionChunkRows(
   rows,
@@ -110,10 +125,9 @@ export function transitionChunkRows(
     throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
   }
   const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
-  if (rows * rowBytes <= maxStorageBufferBindingSize) return rows;
-  const capacity = Math.floor(
-    Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES) / rowBytes,
-  );
+  const ceiling = Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES);
+  if (rows * rowBytes <= ceiling) return rows;
+  const capacity = Math.floor(ceiling / rowBytes);
   if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");
   const sourceRowBytes = channels * Float32Array.BYTES_PER_ELEMENT;
   const offsetRowAlignment = minStorageBufferOffsetAlignment

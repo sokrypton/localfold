@@ -17,15 +17,26 @@ const MiB = 1024 * 1024;
 
 describe("transition chunking", () => {
   it("leaves short inputs alone, so nothing about them changes", () => {
-    // ...THE FULL PATH IS THE DEFAULT. 508 rows of a 59-residue alignment is
-    // 29,972 rows, and at 1024 hidden channels that is 117 MiB - under the
-    // limit, so the caller keeps its single-dispatch branch.
-    expect(transitionChunkRows(508 * 59, 256, 1024, 128 * MiB, 256)).toBe(508 * 59);
+    // ...THE FULL PATH IS STILL THE DEFAULT, for anything under the ceiling.
     expect(transitionChunkRows(59, 128, 512, 128 * MiB, 256)).toBe(59);
+    expect(transitionChunkRows(4096, 256, 1024, 128 * MiB, 256)).toBe(4096);
+  });
+
+  it("chunks a tensor that BINDS but is larger than the ceiling", () => {
+    // 🔴 THIS IS THE CASE THAT USED TO GO UNCHUNKED, AND IT WAS THE BIGGEST
+    // TENSOR ON THE DEVICE. 508 rows of a 59-residue alignment is 29,972 rows,
+    // and at 1024 hidden channels that is 117 MiB - under any modern binding
+    // limit, so it allocated whole. It is scratch, read once; capping it took
+    // an AF2 fold's peak from 681 MiB to 573 with the same pLDDT and no
+    // measurable time. See TRANSITION_CHUNK_TARGET_BYTES for the sweep.
+    const chunk = transitionChunkRows(508 * 59, 256, 1024, 128 * MiB, 256);
+    expect(chunk < 508 * 59).toBe(true);
+    expect(chunk * 1024 * 4 <= TRANSITION_CHUNK_TARGET_BYTES).toBe(true);
+    expect(chunk % TRANSITION_TILE_ROWS).toBe(0);
   });
 
   it("splits an input that cannot be bound whole", () => {
-    expect(transitionChunkRows(508 * 291, 256, 1024, 256 * MiB, 256)).toBe(24_576);
+    expect(transitionChunkRows(508 * 291, 256, 1024, 256 * MiB, 256)).toBe(8192);
   });
 
   it("aligns a chunk to the row tile AND to the binding offset", () => {
