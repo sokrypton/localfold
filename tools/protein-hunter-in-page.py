@@ -113,7 +113,14 @@ def main():
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--mode", default="flow", choices=["flow", "diffusion"],
                         help="which sampler the fold runs")
-    parser.add_argument("--steps", type=int, default=16, help="AF3 sampler steps")
+    # 🔴 THE PAGE'S #steps IS A SELECT, so a value it has no option for leaves
+    # it EMPTY - which is how this tool once ran the sampler for ZERO steps and
+    # got a PDB of NaNs that read as a missing chain. The choices here are
+    # AF3_COUNTS' own.
+    parser.add_argument("--steps", type=int, default=16,
+                        choices=[16, 32, 64, 20, 40, 80, 160, 320],
+                        help="AF3 sampler steps; flow takes 16/32/64 and"
+                             " diffusion 20/40/80/160/320")
     parser.add_argument("--recycles", type=int, default=0)
     parser.add_argument("--percent-x", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
@@ -202,6 +209,18 @@ def main():
         if json.loads(problems):
             print("controls:", problems, file=sys.stderr)
             return 1
+        # ...and every control took the value it was given. A <select> handed
+        # an option it does not have goes empty and says nothing.
+        blank = cdp.evaluate(ws, """(() => JSON.stringify(
+          [%s].filter(([id, want]) => {
+            const el = document.getElementById(id);
+            return el.type !== 'checkbox' && String(el.value) !== String(want);
+          }).map(([id, want]) => `${id} wanted ${want}, holds ${
+            document.getElementById(id).value}`)))()""" % ", ".join(
+            "[%s, %s]" % (json.dumps(k), json.dumps(v)) for k, v in controls))
+        if json.loads(blank):
+            print("controls:", blank, file=sys.stderr)
+            return 1
         print("controls: ok ·", ", ".join("%s=%s" % (k, v) for k, v in controls))
         print("weights :", "./model-af3-int5/" if local else "the pinned remote")
         print("designer:", cdp.evaluate(
@@ -224,6 +243,20 @@ def main():
             return 1
 
         rows = json.loads(cdp.evaluate(ws, READ_TABLE))
+        # 🔴 THE FIRST ATOM LINES OF THE FIRST CYCLE, because every assertion
+        # below is about numbers and the failures have all been about the PDB
+        # those numbers came from. A chain that the viewer or MPNN silently
+        # drops looks like a wrong score, not like a missing chain.
+        print("pdb     :", cdp.evaluate(ws, """(() => {
+          const h = window.__hunterHistory ? window.__hunterHistory() : [];
+          if (!h.length) return 'no history';
+          const lines = (h[0].pdb || '').split('\\n');
+          const atoms = lines.filter((l) => l.startsWith('ATOM') || l.startsWith('HETATM'));
+          const chains = [...new Set(atoms.map((l) => l[21]))];
+          const names = [...new Set(atoms.map((l) => l.slice(17, 20)))];
+          return JSON.stringify({ lines: lines.length, atoms: atoms.length,
+            chains, residueNames: names.slice(0, 6), first: atoms[0] || null });
+        })()"""))
         for row in rows:
             print("row     : run %s cycle %s  %s %s  plddt %s  ala %s  %s%s"
                   % (row["run"], row["cycle"], row["objective"], row["score"],

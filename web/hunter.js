@@ -38,8 +38,21 @@ const element = (id) => {
   return value;
 };
 
+/**
+ * A control's numeric value, or the fallback.
+ *
+ * 🔴 AN EMPTY VALUE IS ABSENT, NOT ZERO, AND `Number("")` IS 0. That caught
+ * this page hard: #steps became a <select> offering 16, 32 and 64, something
+ * set it to 8, a select given a value it has no option for goes EMPTY - and
+ * the sampler then ran ZERO steps. It did not throw. It folded in a second,
+ * wrote a PDB whose every coordinate was NaN, and the viewer and MPNN both
+ * silently dropped the chain, which read as a missing chain rather than as a
+ * fold that never ran.
+ */
 const number = (id, fallback) => {
-  const value = Number(element(id).value);
+  const raw = element(id).value.trim();
+  if (raw === "") return fallback;
+  const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 };
 
@@ -446,7 +459,11 @@ async function hunt() {
   const runs = Math.max(1, number("runs", 1));
   const cycles = Math.max(0, number("cycles", 5));
   const mode = element("af3-mode").value;
-  const calls = number("steps", AF3_COUNTS[mode].preferred);
+  // ...and a step count below the mode's smallest is not a fast fold, it is a
+  // structure that has not been denoised. Clamped rather than trusted, because
+  // the value comes from a control whose options change with the mode.
+  const counts = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
+  const calls = Math.max(number("steps", counts.preferred), Math.min(...counts.values));
   const recycles = number("recycles", 0);
   // 🔴 DRAWN ONCE PER HUNT AND REPORTED, NOT DRAWN PER RUN AND LOST. Exploring
   // is the point, so an empty box means a new answer every press - but a run
@@ -619,6 +636,11 @@ for (const name of DESIGNER_NAMES) {
 // fold would run on what the model still held. `set` is the same call
 // index.html's paste path makes.
 window.__hunterTargets = targets;
+
+// ...and what every cycle produced, which tools/protein-hunter-in-page.py
+// reads when an assertion fails. The table shows the numbers; only the records
+// carry the structures those numbers describe.
+window.__hunterHistory = () => history;
 
 /**
  * Rebuild the step dial for the sampler that is selected.

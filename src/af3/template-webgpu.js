@@ -11,15 +11,25 @@
  * two pairformer blocks. AF2-multimer had the identical trap and it cost this
  * project a week there.
  *
- * 🔴 ONLY THE EMPTY-TEMPLATE PATH IS HERE, AND REAL TEMPLATES RAISE. The six
- * geometry features are identically zero without a template, so nothing in this
- * repository can tell a correct implementation of them from a wrong one.
- * Writing them anyway would add code no measurement covers.
+ * 🔴 THE SIX GEOMETRY FEATURES ARE COMPUTED ON THE HOST, NOT IN A SHADER, and
+ * that is a choice rather than an omission. They are O(tokens^2) arithmetic
+ * over coordinates - a distogram bin, two masks and a unit vector per pair -
+ * and src/af3/template-features.js already computes them, is held to AF3 by
+ * tools/oracle/check_af3_template_geometry.js, and is where the one real bug
+ * in them was found. Writing them again in WGSL would mean a second
+ * implementation of a thing that took an oracle to get right, for work that
+ * does not scale with the model: 300 tokens is 90k pairs, once per fold,
+ * against a trunk that runs 48 blocks over the same pairs 4 times.
+ *
+ * What goes to the device is the RESULT, six floats a pair - see
+ * packTemplateGeometry.
  *
  * 🔴 THE SUM IS DIVIDED BY THE SLOT COUNT, NOT BY HOW MANY SLOTS ARE REAL. Four
  * empty slots produce the same embedding four times, so the division puts it
  * back and the module behaves as though there were exactly one template.
- * Dividing by the number of REAL templates would be a division by zero here.
+ * Dividing by the number of REAL templates would be a division by zero here -
+ * and it means one real template among four slots is worth a QUARTER of what
+ * it would be alone, which is AF3's arithmetic and not an oversight.
  *
  * The two template blocks are the shared pair track at 64 channels with a
  * factor-2 transition; see src/af3/pair-track-gpu.js.
@@ -29,6 +39,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
+import { templateGeometry } from "./template-features.js";
 
 const CHANNELS = 64;
 const RESTYPES = 31;
@@ -36,8 +47,52 @@ const RESTYPES = 31;
 const ORDER = [
   "queryEmbeddingNormScale", "queryEmbeddingNormOffset", "templatePairEmbedding8",
   "templatePairEmbedding2", "templatePairEmbedding3",
+  // The six geometry projections. Four of them are [64] rather than a matrix:
+  // AF3 builds them with `num_input_dims=0`, so the feature is a SCALAR per
+  // pair and the weight a per-channel scale. See template-features.js.
+  "templatePairEmbedding0", "templatePairEmbedding1", "templatePairEmbedding4",
+  "templatePairEmbedding5", "templatePairEmbedding6", "templatePairEmbedding7",
   "outputLayerNormScale", "outputLayerNormOffset", "outputLinear",
 ];
+
+/** Floats per pair in the packed geometry buffer. */
+export const GEOMETRY_STRIDE = 6;
+
+/**
+ * The six geometry features, packed for upload.
+ *
+ * 🔴 THE BIN IS STORED PLUS ONE, SO A ZEROED BUFFER IS AN EMPTY SLOT. AF3 puts
+ * a pair closer than 3.25 A in NO bin at all rather than in bin 0, and an
+ * empty template slot has no geometry whatsoever - both are "nothing here".
+ * Storing the raw index would make them indistinguishable from bin 0, which is
+ * the shortest-distance bin and the one carrying the strongest signal. With
+ * the offset, an empty slot binds a buffer of zeros and the shader needs no
+ * flag, no second pipeline and no branch on which slot it is running.
+ *
+ * @param {{distogram: Float32Array, pseudoBetaMask2d: Float32Array,
+ *          unitVector: Float32Array, backboneMask2d: Float32Array}} geometry
+ * @param {number} tokens
+ * @returns {Float32Array} pairs * GEOMETRY_STRIDE
+ */
+export function packTemplateGeometry(geometry, tokens) {
+  const pairs = tokens * tokens;
+  const packed = new Float32Array(pairs * GEOMETRY_STRIDE);
+  const bins = geometry.distogram.length / pairs;
+  for (let pair = 0; pair < pairs; pair += 1) {
+    let bin = -1;
+    for (let index = 0; index < bins; index += 1) {
+      if (geometry.distogram[pair * bins + index] !== 0) { bin = index; break; }
+    }
+    const base = pair * GEOMETRY_STRIDE;
+    packed[base] = bin + 1;
+    packed[base + 1] = geometry.pseudoBetaMask2d[pair];
+    packed[base + 2] = geometry.unitVector[pair * 3];
+    packed[base + 3] = geometry.unitVector[pair * 3 + 1];
+    packed[base + 4] = geometry.unitVector[pair * 3 + 2];
+    packed[base + 5] = geometry.backboneMask2d[pair];
+  }
+  return packed;
+}
 
 export function packTemplateWeights(weights) {
   const offsets = {};
@@ -64,13 +119,31 @@ const CHANNELS: u32 = ${CHANNELS}u;
 const RESTYPES: u32 = ${RESTYPES}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const EPSILON: f32 = ${epsilon};
-// The slot count, not the real-template count - see the note at the top.
-const TEMPLATE_SCALE: f32 = ${templates / (1e-7 + templates)};
+// 🔴 1/(slots), NOT slots/(slots) - AND IT USED TO BE THE SECOND. While every
+// slot produced the same embedding the shader computed ONE of them, so
+// "sum four and divide by four" collapsed to a multiply by
+// templates/(1e-7 + templates), which is 1 to within a rounding error. The
+// sum is real now, so the scale is the division alone. Leaving the old
+// expression would have made a one-template fold four times too strong and an
+// empty fold unchanged, which is the shape of bug that passes every existing
+// check.
+//
+// It is the SLOT count and not the real-template count: four empty slots each
+// produce the same embedding and the division puts it back, so the module
+// behaves as though there were exactly one template whatever the slot count.
+const TEMPLATE_SCALE: f32 = ${1 / (1e-7 + templates)};
 const W_QUERY_SCALE: u32 = ${offsets.queryEmbeddingNormScale}u;
 const W_QUERY_OFFSET: u32 = ${offsets.queryEmbeddingNormOffset}u;
 const W_EMBED8: u32 = ${offsets.templatePairEmbedding8}u;
 const W_EMBED2: u32 = ${offsets.templatePairEmbedding2}u;
 const W_EMBED3: u32 = ${offsets.templatePairEmbedding3}u;
+const W_EMBED0: u32 = ${offsets.templatePairEmbedding0}u;
+const W_EMBED1: u32 = ${offsets.templatePairEmbedding1}u;
+const W_EMBED4: u32 = ${offsets.templatePairEmbedding4}u;
+const W_EMBED5: u32 = ${offsets.templatePairEmbedding5}u;
+const W_EMBED6: u32 = ${offsets.templatePairEmbedding6}u;
+const W_EMBED7: u32 = ${offsets.templatePairEmbedding7}u;
+const GEOMETRY_STRIDE: u32 = ${GEOMETRY_STRIDE}u;
 const W_OUT_SCALE: u32 = ${offsets.outputLayerNormScale}u;
 const W_OUT_OFFSET: u32 = ${offsets.outputLayerNormOffset}u;
 const W_OUT: u32 = ${offsets.outputLinear}u;
@@ -93,6 +166,10 @@ const W_OUT: u32 = ${offsets.outputLinear}u;
 @group(0) @binding(1) var<storage, read> aatype: array<i32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
+// 🔴 ZEROES MEAN AN EMPTY SLOT AND THE SHADER NEED NOT KNOW WHICH. The
+// distogram bin is stored PLUS ONE, so 0 is "no bin" - which is what both an
+// empty slot and a pair closer than 3.25 A have. One pipeline serves both.
+@group(0) @binding(4) var<storage, read> geometry: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -131,15 +208,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (code_column >= 0 && u32(code_column) < RESTYPES) {
       value += weights[W_EMBED3 + u32(code_column) * CHANNELS + e];
     }
+
+    // Features 0, 1, 4, 5, 6 and 7: the template geometry, computed on the
+    // host and packed by packTemplateGeometry.
+    let g = row * GEOMETRY_STRIDE;
+    let bin = u32(geometry[g]);
+    if (bin > 0u) {
+      value += weights[W_EMBED0 + (bin - 1u) * CHANNELS + e];
+    }
+    value += geometry[g + 1u] * weights[W_EMBED1 + e];
+    value += geometry[g + 2u] * weights[W_EMBED4 + e];
+    value += geometry[g + 3u] * weights[W_EMBED5 + e];
+    value += geometry[g + 4u] * weights[W_EMBED6 + e];
+    value += geometry[g + 5u] * weights[W_EMBED7 + e];
+
     act[row * CHANNELS + e] = value;
   }
 }`;
 
-  // LayerNorm, the slot-count scaling, a relu, and the projection back up.
-  const output = `${common}
+  // 🔴 THESE WERE ONE SHADER AND COULD NOT STAY ONE. It fused the LayerNorm,
+  // the slot-count scaling, the relu and the projection, which is correct only
+  // when every slot produces the SAME embedding - true while the only path was
+  // four empty slots and false the moment one carries a template. The
+  // LayerNorm and the summation are per slot; the scale, the relu and the
+  // projection happen once, on the sum.
+  const accumulate = `${common}
 @group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(2) var<storage, read_write> summed: array<f32>;
+// 🔴 HOW MANY IDENTICAL SLOTS THIS PASS STANDS FOR. Empty slots all produce
+// the SAME embedding, so running four of them is four times the work for an
+// answer that is one of them times four. See the note in run().
+@group(0) @binding(3) var<storage, read> repeat: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -158,22 +258,37 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   ${varianceCode("CHANNELS", "act[base + c]")}
   let inverse_std = inverseSqrt(variance + EPSILON);
 
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    summed[base + c] += ((act[base + c] - mean) * inverse_std * weights[W_OUT_SCALE + c]
+      + weights[W_OUT_OFFSET + c]) * repeat[0];
+  }
+}`;
+
+  // The slot-count scaling, a relu, and the projection back up.
+  const output = `${common}
+@group(0) @binding(0) var<storage, read> summed: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= PAIRS) { return; }
+  let base = row * CHANNELS;
+
   for (var f = 0u; f < QUERY_CHANNELS; f += 1u) {
     var value = 0.0;
     for (var c = 0u; c < CHANNELS; c += 1u) {
-      var normalized = (act[base + c] - mean) * inverse_std * weights[W_OUT_SCALE + c]
-        + weights[W_OUT_OFFSET + c];
-      normalized = normalized * TEMPLATE_SCALE;
       // ...relu BEFORE the projection, so the module can only add along a
       // non-negative combination of output_linear's directions.
-      normalized = max(normalized, 0.0);
-      value += normalized * weights[W_OUT + c * QUERY_CHANNELS + f];
+      let scaled = max(summed[base + c] * TEMPLATE_SCALE, 0.0);
+      value += scaled * weights[W_OUT + c * QUERY_CHANNELS + f];
     }
     output[row * QUERY_CHANNELS + f] = value;
   }
 }`;
 
-  return { embed, output };
+  return { embed, accumulate, output };
 }
 
 export class Af3TemplateEmbedderGpu {
@@ -185,16 +300,28 @@ export class Af3TemplateEmbedderGpu {
 
   /**
    * @param {{pair: Float32Array, pairMask: Float32Array, tokens: number,
-   *          templates: number, templateOccupied?: boolean,
-   *          templateAatype?: ArrayLike<number>}} input
-   * @param {object} weights the eight tensors in ORDER, `blocks`, `queryChannels`
+   *          templates: number, slots?: (object|undefined)[],
+   *          multichainMask2d?: ArrayLike<number>}} input `slots` holds one
+   *   entry per OCCUPIED slot - `{aatype, atomPositions, atomMask}` in AF3's
+   *   dense-24 layout - with `undefined` for an empty one. Absent, every slot
+   *   is empty, which is what a de novo fold has and is still not a no-op.
+   * @param {object} weights the tensors in ORDER, `blocks`, `queryChannels`
    * @param {{swapTransposedBias: boolean}} dialect
    */
   async run(input, weights, dialect, options = {}) {
     const { tokens, templates } = input;
-    if (input.templateOccupied) {
-      throw new Error("this template embedder only implements the empty-template path;"
-        + " see src/af3/template-reference.js");
+    const slots = input.slots ?? [];
+    if (slots.length > templates) {
+      throw new RangeError(`${slots.length} templates for ${templates} slots`);
+    }
+    // 🔴 THE OLD FLAG STILL REFUSES, RATHER THAN BEING IGNORED. Callers wrote
+    // `templateOccupied: <does the dump have a template>` to fail loudly when
+    // one appeared, back when this path could not handle it. Now that it can,
+    // dropping the flag would turn that deliberate noise into silence: a dump
+    // WITH a template would be folded WITHOUT one and simply score worse.
+    if (input.templateOccupied === true && slots.filter(Boolean).length === 0) {
+      throw new Error("templateOccupied is true but no slots were given:"
+        + " pass `slots` with {aatype, atomPositions, atomMask} per template");
     }
     if (dialect?.swapTransposedBias === undefined) {
       throw new Error("dialect.swapTransposedBias has no default");
@@ -227,13 +354,72 @@ export class Af3TemplateEmbedderGpu {
       const pair = keep(this.allocator.upload("af3-template.pair", input.pair, storage));
       const pairMask = keep(this.allocator.upload("af3-template.mask", input.pairMask, storage));
       const weightBuffer = keep(this.allocator.upload("af3-template.weights", packed.data, storage));
-      const aatypeData = new Int32Array(tokens);
-      if (input.templateAatype !== undefined) {
-        for (let t = 0; t < tokens; t += 1) aatypeData[t] = input.templateAatype[t];
+      // 🔴 ONE BUFFER PER SLOT, AND REUSING ONE IS THE BUG THAT LOOKS LIKE A
+      // WRONG KERNEL. `queue.writeBuffer` is ordered against SUBMITS, not
+      // against the recording of a command encoder - so writing slot 0's data,
+      // recording its passes, writing slot 1's over the top, recording those,
+      // and submitting once at the end runs every slot against the LAST
+      // slot's data. Measured: with one occupied slot of four the whole module
+      // computed the all-empty answer, which differs by only the real slot's
+      // quarter share and scored relRMS 2.1e-2 - small enough to read as a
+      // precision problem and wrong enough to lose the template entirely.
+      //
+      // The aatype and the geometry are the only things that differ between
+      // slots; the query pair, the masks and every weight are shared and are
+      // uploaded once. Four geometry buffers is 6 floats a pair per slot -
+      // 8.6 MiB at 300 tokens, against a trunk that holds hundreds.
+      const multichainMask2d = input.multichainMask2d
+        ?? new Float32Array(pairs).fill(1);
+      const empty = new Float32Array(pairs * GEOMETRY_STRIDE);
+      // 🔴 THE EMPTY SLOTS ARE RUN ONCE BETWEEN THEM, NOT ONCE EACH. They
+      // produce the same embedding by construction - same all-ALA aatype, same
+      // zero geometry, same query pair, same weights - so four of them is four
+      // times the work for one answer counted four times. The old code got
+      // this for free by never having a real slot to run; measured on the
+      // trunk checker, running all four cost 150 ms against 40 for one, on
+      // every de novo fold, for an identical result.
+      //
+      // So each PASS carries how many slots it stands for, and the accumulate
+      // shader multiplies by it. A fold with no templates runs one pass, which
+      // is what it always did.
+      const passes = [];
+      let emptySlots = 0;
+      for (let slot = 0; slot < templates; slot += 1) {
+        if (slots[slot] === undefined || slots[slot] === null) emptySlots += 1;
+        else passes.push({ template: slots[slot], repeat: 1 });
       }
-      const aatype = keep(this.allocator.upload("af3-template.aatype", aatypeData, storage));
+      if (emptySlots > 0) passes.push({ template: undefined, repeat: emptySlots });
+
+      const slotBuffers = [];
+      for (const { template, repeat } of passes) {
+        const slot = slotBuffers.length;
+        const aatypeData = new Int32Array(tokens);
+        // An empty slot carries type 0 - ALA - which contributes ROW 0 of each
+        // aatype weight rather than nothing. That is half of why an empty slot
+        // is not a no-op; see the note at the top of this file.
+        if (template !== undefined && template !== null) {
+          for (let t = 0; t < tokens; t += 1) aatypeData[t] = template.aatype[t];
+        }
+        slotBuffers.push({
+          repeat: keep(this.allocator.upload(
+            `af3-template.repeat.${slot}`, Float32Array.from([repeat]), storage)),
+          aatype: keep(this.allocator.upload(
+            `af3-template.aatype.${slot}`, aatypeData, storage)),
+          // ...and an empty slot's geometry is zeros, which the shader reads as
+          // "no bin, no mask, no direction" with no branch of its own.
+          geometry: keep(this.allocator.upload(
+            `af3-template.geometry.${slot}`,
+            template !== undefined && template !== null
+              ? packTemplateGeometry(templateGeometry(template, multichainMask2d, tokens), tokens)
+              : empty,
+            storage)),
+        });
+      }
 
       const act = keep(this.allocator.allocate("af3-template.act", pairs * CHANNELS * 4, storage));
+      // The running sum over slots, which the projection reads once at the end.
+      const summed = keep(this.allocator.allocate(
+        "af3-template.summed", pairs * CHANNELS * 4, storage | GPUBufferUsage.COPY_DST));
       const scratch = [];
       for (let index = 0; index < 7; index += 1) {
         scratch.push(keep(this.allocator.allocate(
@@ -271,24 +457,36 @@ export class Af3TemplateEmbedderGpu {
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const linear = spread(Math.ceil(pairs / 64));
 
-      run("template.embed", compiled.embed, [pair, aatype, weightBuffer, act],
-          linear[0], linear[1]);
-      for (let index = 0; index < weights.blocks.length; index += 1) {
-        const block = weights.blocks[index];
+      // 🔴 THE BLOCK WEIGHTS ARE PACKED AND UPLOADED ONCE, OUTSIDE THE SLOT
+      // LOOP. Every slot runs the SAME two pairformer blocks, so packing them
+      // per slot would repack 1.4 MiB four times for four identical buffers -
+      // and the release below would then have to know which upload belonged to
+      // which pass.
+      const blockWeights = weights.blocks.map((block, index) => {
         const packedTrack = packPairTrackWeights(block, CHANNELS);
-        encodePairTrack({
-          run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
-          pair: act, pairMask, scratch, biasBuffer,
-          weights: {
-            outgoing: upload(`w.tri.out.${index}`, packedTrack.outgoing),
-            incoming: upload(`w.tri.in.${index}`, packedTrack.incoming),
-            grid1: upload(`w.grid1.${index}`, packedTrack.grid1),
-            grid2: upload(`w.grid2.${index}`, packedTrack.grid2),
-            transition: upload(`w.transition.${index}`, packedTrack.transition),
-          },
-        });
+        return {
+          outgoing: upload(`w.tri.out.${index}`, packedTrack.outgoing),
+          incoming: upload(`w.tri.in.${index}`, packedTrack.incoming),
+          grid1: upload(`w.grid1.${index}`, packedTrack.grid1),
+          grid2: upload(`w.grid2.${index}`, packedTrack.grid2),
+          transition: upload(`w.transition.${index}`, packedTrack.transition),
+        };
+      });
+
+      for (let slot = 0; slot < slotBuffers.length; slot += 1) {
+        run(`template.embed.${slot}`, compiled.embed,
+            [pair, slotBuffers[slot].aatype, weightBuffer, act,
+             slotBuffers[slot].geometry], linear[0], linear[1]);
+        for (let index = 0; index < blockWeights.length; index += 1) {
+          encodePairTrack({
+            run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
+            pair: act, pairMask, scratch, biasBuffer, weights: blockWeights[index],
+          });
+        }
+        run(`template.accumulate.${slot}`, compiled.accumulate,
+            [act, weightBuffer, summed, slotBuffers[slot].repeat], linear[0], linear[1]);
       }
-      run("template.output", compiled.output, [act, weightBuffer, output],
+      run("template.output", compiled.output, [summed, weightBuffer, output],
           linear[0], linear[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * queryChannels * 4);
 

@@ -110,14 +110,17 @@ export async function main(device, args) {
     queryChannels: QUERY_CHANNELS,
     queryEmbeddingNormScale: await T(`${SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${SINGLE}/query_embedding_norm/offset`),
-    templatePairEmbedding8: await T(`${SINGLE}/template_pair_embedding_8/weights`),
-    templatePairEmbedding2: await T(`${SINGLE}/template_pair_embedding_2/weights`),
-    templatePairEmbedding3: await T(`${SINGLE}/template_pair_embedding_3/weights`),
     outputLayerNormScale: await T(`${SINGLE}/output_layer_norm/scale`),
     outputLayerNormOffset: await T(`${SINGLE}/output_layer_norm/offset`),
     outputLinear: await T(`${ROOT}/output_linear/weights`),
     blocks: [await blockWeights(0), await blockWeights(1)],
   };
+  // All nine projections. Six of them were unreachable while every slot was
+  // empty and are the whole point of the second arm below.
+  for (const index of [0, 1, 2, 3, 4, 5, 6, 7, 8]) {
+    weights[`templatePairEmbedding${index}`] =
+      await T(`${SINGLE}/template_pair_embedding_${index}/weights`);
+  }
 
   const sequence = new Float32Array(tokens);
   for (let i = 0; i < tokens; i += 1) sequence[i] = i < Math.ceil(tokens * 0.8) ? 1 : 0;
@@ -126,21 +129,67 @@ export async function main(device, args) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = sequence[i] * sequence[j];
   }
   const pair = deterministic(tokens * tokens * QUERY_CHANNELS, 555 + tokens);
-  const input = { pair, pairMask, tokens, templates, templateOccupied: false };
 
-  const expected = templateEmbedding(input, weights, DIALECT);
+  // 🔴 TWO ARMS, BECAUSE THE EMPTY ONE REACHES THREE OF NINE FEATURES. With
+  // every slot empty the six geometry projections multiply zero, so this
+  // checker agreed to 1e-7 for months while `templatePairEmbedding0` was not
+  // even being LOADED. The occupied arm is the one that exercises them, and it
+  // fills only some slots so the empty and occupied branches run in the same
+  // dispatch sequence rather than in two separate runs.
+  const slotsFor = (occupied) => {
+    if (occupied === 0) return undefined;
+    const made = [];
+    for (let slot = 0; slot < templates; slot += 1) {
+      if (slot >= occupied) { made.push(undefined); continue; }
+      // A backbone that is a real, if uninteresting, chain: a helix along x,
+      // so the distogram spans many bins and every frame is well conditioned.
+      const aatype = new Int32Array(tokens);
+      const atomPositions = new Float32Array(tokens * 24 * 3);
+      const atomMask = new Float32Array(tokens * 24);
+      for (let token = 0; token < tokens; token += 1) {
+        aatype[token] = (token * 7 + slot) % 20;
+        const turn = token * 1.75 + slot;
+        const centre = [token * 1.5, 2.3 * Math.cos(turn), 2.3 * Math.sin(turn)];
+        // N, CA, C, O, CB - enough for a frame and a pseudo-beta.
+        const offsets = [[-0.6, 0.6, 0], [0, 0, 0], [0.6, 0.6, 0], [0.9, 1.7, 0], [0, -0.5, 1.2]];
+        for (const [index, offset] of offsets.entries()) {
+          // ...glycine has no CB, which is what makes the pseudo-beta fall
+          // back to CA for one residue in twenty here rather than never.
+          if (index === 4 && aatype[token] === 7) continue;
+          const at = (token * 24 + index) * 3;
+          for (let axis = 0; axis < 3; axis += 1) {
+            atomPositions[at + axis] = centre[axis] + offset[axis];
+          }
+          atomMask[token * 24 + index] = 1;
+        }
+      }
+      made.push({ aatype, atomPositions, atomMask });
+    }
+    return made;
+  };
+
+  for (const occupied of [0, 1, templates]) {
+    const input = {
+      pair, pairMask, tokens, templates, slots: slotsFor(occupied),
+    };
+    const expected = templateEmbedding(input, weights, DIALECT);
+    const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
+    const relRms = relativeRms(gpu.output, expected);
+    console.log(`template\ttokens=${tokens} slots=${templates}`
+      + ` occupied=${occupied}`
+      + `\trelRMS ${relRms.toExponential(2)}`
+      + `\t${gpu.elapsedMilliseconds.toFixed(1)} ms`);
+    if (!(relRms < 2e-5)) {
+      throw new Error(`template with ${occupied} occupied slots: relRMS ${relRms}`);
+    }
+  }
+  const input = { pair, pairMask, tokens, templates };
   const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
-  const relRms = relativeRms(gpu.output, expected);
-
-  console.log(`template\ttokens=${tokens} slots=${templates}`
-    + `\trelRMS ${relRms.toExponential(2)}`
-    + `\t${gpu.elapsedMilliseconds.toFixed(1)} ms`);
   // The argument for the module existing: this is not a small correction.
   console.log(`output std ${standardDeviation(gpu.output).toFixed(2)}`
     + ` against an input pair std of ${standardDeviation(pair).toFixed(2)}`
     + ` - with ${templates} EMPTY slots`);
 
-  const bound = 1e-5;
-  if (relRms > bound) throw new Error(`relRMS ${relRms.toExponential(2)} exceeds ${bound}`);
-  return { tokens, templates, relRms, outputStd: standardDeviation(gpu.output) };
+  // Each arm asserted its own bound in the loop above.
+  return { tokens, templates, outputStd: standardDeviation(gpu.output) };
 }

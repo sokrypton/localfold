@@ -639,7 +639,26 @@ measurements is in each file.
   | slots 1-3, empty | 2.35e-7 |
   | the module's 128-channel output | 1.74e-7 |
 
-  **The GPU path still raises**, and the page is unchanged until it does not.
+  The GPU path computes them too, checked against the CPU reference at 32
+  tokens with 0, 1 and 4 of 4 slots occupied: relRMS 2.5e-7, 2.2e-7, 1.6e-7.
+
+  🔴 **AND A REUSED BUFFER LOOKED EXACTLY LIKE A WRONG KERNEL.** The first
+  version wrote each slot's aatype and geometry into one buffer inside the slot
+  loop. `queue.writeBuffer` is ordered against SUBMITS, not against the
+  recording of a command encoder - so all four writes landed before the single
+  submit and every slot ran against the LAST slot's data. With one occupied
+  slot of four the module computed the all-empty answer, which differs by only
+  that slot's quarter share: relRMS 2.1e-2, small enough to read as precision
+  and wrong enough to lose the template entirely. One buffer per slot.
+
+  🔴 **AND IDENTICAL SLOTS RUN ONCE BETWEEN THEM.** Four empty slots produce
+  the same embedding by construction, so a naive per-slot loop is 4x the work
+  for an identical answer on every de novo fold - the trunk's template stage
+  went 83 ms -> 150 ms before this was put back. Each pass carries how many
+  slots it stands for and the accumulate shader multiplies by it, so a fold
+  with no templates runs one pass, which is what it always did.
+
+  The page is unchanged: nothing yet builds `slots` from a user's structure.
 
   🔴 **ONE THING WAS WRONG AND ONLY THE ORACLE COULD HAVE SAID SO.** The unit
   vector is `R_i^-1 (t_j - t_i)` - the FRAME is the row index and the POINT is

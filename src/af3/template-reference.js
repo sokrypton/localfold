@@ -59,8 +59,11 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
  * The template embedding added to the pair representation.
  *
  * @param {{pair: Float32Array, tokens: number, pairMask: Float32Array,
- *          aatype: ArrayLike<number>, templates: number,
- *          templateOccupied: boolean}} input
+ *          templates: number, slots?: (object|undefined)[],
+ *          multichainMask2d?: ArrayLike<number>,
+ *          onSlot?: (slot: number, embedded: Float32Array) => void}} input
+ *   `slots` holds one entry per OCCUPIED slot - `{aatype, atomPositions,
+ *   atomMask}` in AF3's dense-24 layout - with `undefined` for an empty one.
  * @param {object} weights
  * @param {{swapTransposedBias: boolean}} dialect
  * @returns {Float32Array} tokens * tokens * pairChannels
@@ -71,6 +74,15 @@ export function templateEmbedding(input, weights, dialect) {
   const slots = input.slots ?? [];
   if (slots.length > templates) {
     throw new RangeError(`${slots.length} templates for ${templates} slots`);
+  }
+  // 🔴 THE OLD FLAG STILL REFUSES, RATHER THAN BEING IGNORED. Callers wrote
+  // `templateOccupied: <does the dump have a template>` to fail loudly when
+  // one appeared, back when this path could not handle it. Now that it can,
+  // dropping the flag would turn that deliberate noise into silence: a dump
+  // WITH a template would be folded WITHOUT one and simply score worse.
+  if (input.templateOccupied === true && slots.filter(Boolean).length === 0) {
+    throw new Error("templateOccupied is true but no slots were given:"
+      + " pass `slots` with {aatype, atomPositions, atomMask} per template");
   }
   // 🔴 EVERY PAIR IS INTRA-CHAIN UNLESS SAID OTHERWISE. A template covers ONE
   // chain, so AF3 masks the cross-chain pairs out of every geometry feature -
