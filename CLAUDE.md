@@ -49,6 +49,7 @@ values means the whole-stack checker, not that file.
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
+| What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
@@ -127,6 +128,17 @@ uses ragged shapes and ragged masks so the bounds checks and the masking are
 actually exercised. They are differential, not oracle: they say the kernel
 computes the operation, not that AlphaFold agrees.
 
+🔴 **AND THE TOTALS CANNOT SAY WHICH TENSOR TO ATTACK.** `memorySnapshot`
+returns `byLabel` beside the totals - the allocator was always given a label per
+buffer and threw it away - and `fold.js`, `bench-trunk.js` and `fold-af2.js`
+print it. The two models fail differently and the breakdown is what says so:
+AF3 keeps its WEIGHTS resident (three tensors were 1216 MiB of a 1406 MiB fold)
+and AF2 keeps none, so AF2's peak is all ACTIVATIONS (`msa-transition.hidden`
+alone was 118 MiB of 681). Both are now smaller - a 59-token AF3 fold holds
+**798 MiB against 1406**, and an AF2 fold at 512 MSA rows peaks at **573 MiB
+against 681** - and neither change is worth any time. See AF3.md's memory
+section and `TRANSITION_CHUNK_TARGET_BYTES`.
+
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
 allocator's snapshot cannot see a `Float32Array`, and until
 `src/runtime/device-memory.js` existed nothing counted the buffers created
@@ -139,9 +151,11 @@ resident on purpose, which `--budget` makes the code give up when it must.
 
 🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
 multiply-adds out of registers with no memory in the way. On this M2 it reports
-**1287 GFLOP/s scalar, 2526 vec2, 5034 vec4**, and 396 billion workgroup reads a
+**1254 GFLOP/s scalar, 2472 vec2, 4980 vec4**, and 403 billion workgroup reads a
 second - so a vec4 multiply-add is 4x a scalar one, and every one of those is
-about 640 G instructions a second. Read a kernel's number against THAT, not
+about 640 G instructions a second. **In f16 it reports 2121, 4295 and 8590**:
+an f16 multiply-add issues at **1.7x** an f32 one for the same instruction, and
+`shader-f16` is now requested by `requestAlphaFoldDevice`. Read a kernel's number against THAT, not
 against a specification sheet: the trunk's kernels sit at 900 GFLOP/s to
 1.1 TFLOP/s, which is 70-85% of the scalar ceiling and a quarter of the vector
 one. It is an instruction-count machine.

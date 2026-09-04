@@ -344,6 +344,28 @@ The pairformer went 3468 ms -> 621 ms over 48 blocks at 59-68 tokens, and AF3's
 block is now 1.09x AF2's evoformer block - for a block with no MSA row
 attention, no column attention and no outer product mean in it.
 
+🔴 **AND THE TRUNK IS COMPUTE BOUND, WHICH THIS FILE USED TO SAY WAS THE NEXT
+LEAD.** It said ~5 ms a block in the encoder, submit and validation path was
+unexplained. It is not there. The labelled compute passes do sum to well under
+the wall clock - 352 ms against 1201 - and three separate measurements say that
+gap is the instrument and not the machine:
+
+- `Af3PairformerStackGpu` now returns its own `split`. A whole 48-block pass is
+  encoded in **5 ms** and spends **338** inside `onSubmittedWorkDone`.
+- Doubling the tokens quadruples the time, three times over: 59, 118 and 236
+  tokens give 104, 384 and 1670 ms. A pass paying a fixed cost per block does
+  not scale like that.
+- `tools/gpu/probe-dispatch.js` prices a dispatch before it computes anything:
+  **3.5 us** in a shared compute pass, 4.9 in its own, 5.1 when it changes
+  pipeline and builds a bind group, 29 when it gets its own encoder and
+  submission, and **294 us** for a full round trip (submit, drain, map back).
+  At ~500 dispatches a pass that is 2.5 ms.
+
+Merging every dispatch of a block into ONE compute pass was tried on the
+strength of the first number and measured 1278 ms against 1269 - nothing. The
+gap is `tools/gpu/profile.js`: it adds 30% to the wall clock it is measured
+against, and its timestamps are quantised to ~100 us across 1,521 short passes.
+
 What worked, in order of size:
 
 1. **Weight layout.** q, k and the gate were stored `(out, channels)`, so
@@ -361,6 +383,13 @@ What worked, in order of size:
    have; they enter through bias-free linears of layer-normed values, so zeros
    contribute exactly zero. Checked by `check-af3-target-feat-gpu.js`.
 
+6. **f16 for the staged workgroup blocks**, 2026-09-04. Grid attention's key and
+   value tile and the pair transition's two blocks are read once per output by
+   every lane, and narrowing them halves the workgroup memory that bounds the
+   occupancy. As the pairformer's wall time: **59 tokens 55 -> 53 ms, 118
+   387 -> 361, 236 848 -> 777, 384 2461 -> 2226** - it grows with the problem.
+   The arithmetic is untouched; only the staged copy narrows. `stagedPrecision`.
+
 What did **not** work, measured, so it is not retried:
 
 - **Uploading all 48 blocks' weights once** instead of per block: 30% *slower*
@@ -368,6 +397,19 @@ What did **not** work, measured, so it is not retried:
   the up-front burst serialises ahead of all compute.
 - **Caching bind groups**: exactly zero, 636-639 either way, though ~1,680 are
   created per stack.
+- **f16 weights for the triangle, for SPEED.** `src/triangle/` has had a
+  precision option since before this port and `bench-triangle.js` reports 1.40x
+  for it at L=128, which reads exactly like an unclaimed win. Wired through to
+  the pairformer it measured **377 ms against 378**. The bench's 1.40x is its
+  per-call weight UPLOAD shrinking; in the trunk the weights are resident and
+  never uploaded, and halving their bytes does not halve the read INSTRUCTIONS -
+  these kernels read weights one scalar at a time and this machine is
+  instruction-bound. It is still worth doing for MEMORY; see below.
+- **Anything that adds registers to the flash attention kernel.** See
+  src/evoformer/attention.js: a vec4 q.k accumulator is worth exactly zero
+  (the compiler already does it), grouping the keys to amortise the softmax
+  rescale is 2.3x SLOWER, and two queries a lane is 4.7x slower. The query and
+  the accumulators are already 64 registers a lane and that is the ceiling.
 - **Binding AF2's attention kernel directly** rather than rewriting on its
   principles: it takes a uniform for its shape, folds `1/sqrt(d)` into the query
   projection and applies the gate itself. The adapter was wrong at relRMS
@@ -377,6 +419,61 @@ Where the remaining time goes, at 59 tokens: 348 ms of dispatch work and 284 ms
 of per-block overhead that is **not** uploads (40 ms) and **not** bind groups
 (0 ms). About 5 ms a block in the encoder, submit and validation path is
 unexplained. That is the next lead and it is a small one.
+
+## Memory, which is a separate question from speed
+
+🔴 **THE TOTALS COULD NOT SAY WHICH TENSOR TO ATTACK, AND NOW THEY CAN.** The
+allocator was already given a label for every buffer and threw it away.
+`memorySnapshot(device)` returns `byLabel` as well as the totals, and
+`bench-trunk.js`, `fold.js` and `fold-af2.js` all print it. The answer for AF3
+was three rows out of a 1406 MiB fold:
+
+    difftx.block.resident   756.4 MiB   24 diffusion transformer blocks
+    w.single-transition     324.1       48 pairformer blocks, 384 channels x4
+    w.single                135.2       48 single-track attentions
+
+1216 of 1406 MiB, all of it weights. In f16 they are 608, and **a fold now
+holds 798 MiB against 1406; the trunk alone 337 against 567.**
+
+🔴 **IT BUYS NO TIME AND IS NOT SUPPOSED TO.** Measured at 377 ms against 378 on
+the pairformer. Halving the bytes does not halve the read instructions. What it
+buys is a device small enough to hold the model at all - a 4 GiB phone's whole
+budget is 1.3 GiB, which a fold was exceeding on its own.
+
+Two folds say what it costs, against the same seeds on the all-f32 tree at
+flow-8 with one recycle: **6MRR 0.0077 A CA RMSD, 1QYS 0.0093 A**, worst
+per-residue pLDDT 0.02 and 0.24, bond geometry identical to five decimals.
+
+🔴 **TWO PLACES KEEP f32 ON PURPOSE, AND BOTH ARE ABOUT THE RATIO.**
+
+- **The confidence head's four pairformer blocks.** pLDDT and PAE are what the
+  page shows and they are a softmax over 50 and 64 bins - the most amplifying
+  thing either model emits. In f16, pLDDT's relRMS goes 1.16e-4 to **2.32e-2**
+  and PAE's 5.75e-6 to 2.51e-3. Four blocks of 52 is ~14 MiB, so f32 here costs
+  almost nothing and keeps both numbers checked at the tolerance their own
+  arithmetic reaches.
+- **The pair track's own weights**, offered as `pairWeightPrecision` and off by
+  default. They save 38 MiB - 6% of the 608 - and cost the worst amplification
+  measured anywhere here: `check-af3-block`'s pair goes from 17x its rounding
+  envelope to 51x. A caller that would otherwise not fold can still ask, which
+  is what `--budget` already exists for.
+
+🔴 **AND `createTriangleShaders` CONFLATED TWO FORMATS.** Its `precision` named
+the weights AND the activations: at "f16" the normalize shader declared
+`source` - the pair representation itself - as an f16 array, which is right for
+the standalone runner (it converts `z` on the way in) and wrong for anything
+sharing that buffer with a track. Wired into AF3 it read every f32 pair value
+as two halves of one float and the trunk produced NaN.
+`shape.weightPrecision` now narrows the weight buffer alone.
+
+🔴 **EVERY CHECKER THE CHANGE REACHES GREW A PRECISION AXIS RATHER THAN A RAISED
+BOUND**, and both arms run: `check-af3-trunk` (two axes, four combinations),
+`check-af3-block`, `check-af3-diffusion-head`,
+`check-af3-diffusion-transformer`, `check-af3-grid-attention`,
+`check-af3-confidence`. Raising one bound would have stopped the f32 path being
+checked at all - which is the whole reason the f32 arms still measure what they
+did before. The bounds are derived from the arithmetic and the table of
+measurements is in each file.
 
 ## Open
 

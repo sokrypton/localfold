@@ -22,7 +22,7 @@
  *
  *      5 rows    13.5 ms    646 ms    opm.accumulate 2.04, opm.intermediate 1.07
  *    128 rows    32.8 ms   1574 ms    the two attention projections 4.07 each
- *    512 rows   108.6 ms   5213 ms    msa-column-attention.flash 21.0
+ *    512 rows   103.8 ms   4980 ms    msa-column-attention.flash 16.7
  *
  * 🔴 THE DEEP BLOCK IS NO LONGER ALMOST ALL ONE KERNEL, AND THIS DOCSTRING
  * SAID IT WAS FOR A WHILE AFTER IT STOPPED BEING TRUE. It recorded 294.9 ms at
@@ -35,13 +35,20 @@
  * output projection - each turned out to be reading one operand a float at a
  * time, and were given vector operands.
  *
- * What is left is FLAT. At 512 rows the top five kernels are within 21 to 13.6
- * ms of each other and every one of them runs between 680 and 1150 GFLOP/s, which
- * tools/gpu/probe-alu.js puts at 53-89% of this device's scalar multiply-add
+ * What is left is FLAT. At 512 rows the top five kernels are within 16.7 to 13.6
+ * ms of each other and every one of them runs between 900 and 1150 GFLOP/s, which
+ * tools/gpu/probe-alu.js puts at 70-89% of this device's scalar multiply-add
  * ceiling. There is no outlier to attack: the next thing here is a different
  * algorithm, not a better tile, and the two benches that exist for these
  * kernels (bench-evoformer-linear.js, bench-msa-attention.js) both report their
  * current shape as the optimum of everything tried.
+ *
+ * 🔴 THE ONE THING THAT DID MOVE AFTERWARDS WAS NOT A TILE. Column attention
+ * went 21.0 -> 16.7 ms and row attention 3.9 -> 2.9 by staging the key and
+ * value in f16, which is not arithmetic: the surgery arms in
+ * bench-msa-attention.js price those staged reads at 8.7 ms of 20.8, against
+ * 0.4 for both exponentials. Halving the workgroup memory buys the occupancy.
+ * Everything tried that ADDED registers instead lost, by 2.3x and 4.7x.
  *
  * 🔴 AND THE BLOCK TOTAL IS NOT COMPARABLE ACROSS PROCESSES. This machine
  * drifts up to 3.2x between them - measured in this repo's own bench, where one
