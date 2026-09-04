@@ -83,7 +83,11 @@ export function chooseLinearTile({ rows, columns }) {
  * decides for a block's transitions, which is where the rows are.
  */
 export function chooseLinearKernel({ rows, columns, device, requested = "auto" }) {
-  if (requested === "f32") return { tile: chooseLinearTile({ rows, columns }), precision: "f32" };
+  if (requested === "f32") {
+    return {
+      tile: chooseLinearTile({ rows, columns }), precision: "f32", weightPrecision: "f32",
+    };
+  }
   const narrow = Math.ceil(rows / linearTileRows(LINEAR_TILE))
     * Math.ceil(columns / linearTileColumns(LINEAR_TILE));
   if (requested === "f16") {
