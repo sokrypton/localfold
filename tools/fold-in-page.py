@@ -161,6 +161,30 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+        # 🔴 THE CAMERA IS PART OF THE ANSWER. addFrame recentres viewerState on
+        # the centroid of every frame the object holds, so a rewind that clears
+        # the frames and re-adds them walks the camera - which is what "the view
+        # jumps" is. Read before and after, and compare.
+        camera_before = cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const s = v.viewerState || {};
+              const o = v.objectsData[v.currentObjectName] || {};
+              const r = (x) => x === null || x === undefined ? null
+                : (typeof x === 'number' ? Number(x.toFixed(3)) : x);
+              return JSON.stringify({
+                zoom: r(s.zoom), focal: r(s.focalLength),
+                center: s.center ? [r(s.center.x), r(s.center.y), r(s.center.z)] : null,
+                objCenter: (o.center || []).map(r),
+                extent: r(o.maxExtent),
+                rot0: (s.rotation && s.rotation[0] || []).map(r),
+              });
+            })()""")
+        print("camera1:", camera_before)
+        first_object = json.loads(cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          return JSON.stringify(reg[Object.keys(reg)[0]].renderer.currentObjectName);
+        })()"""))
 
         # 🔴 THE SECOND FOLD IS THE ONE THAT REWINDS. Asking for more recycles
         # with everything else unchanged should keep the frames the earlier
@@ -179,7 +203,7 @@ def main():
                 && document.getElementById('predict').disabled === false;
             })()""", timeout=args.timeout, what="the second fold to finish")
             time.sleep(1.5)
-            print("2nd    :", cdp.evaluate(ws, """(() => {
+            second = cdp.evaluate(ws, """(() => {
               const reg = window.py2dmol_viewers || {};
               const v = reg[Object.keys(reg)[0]].renderer;
               const names = Object.keys(v.objectsData);
@@ -189,7 +213,39 @@ def main():
                 frames: names.map((n) => [n, v.objectsData[n].frames.length,
                   v.objectsData[n].frames.map((f) => f.name)]),
               });
-            })()"""))
+            })()""")
+            print("2nd    :", second)
+            camera_after = cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const s = v.viewerState || {};
+              const o = v.objectsData[v.currentObjectName] || {};
+              const r = (x) => x === null || x === undefined ? null
+                : (typeof x === 'number' ? Number(x.toFixed(3)) : x);
+              return JSON.stringify({
+                zoom: r(s.zoom), focal: r(s.focalLength),
+                center: s.center ? [r(s.center.x), r(s.center.y), r(s.center.z)] : null,
+                objCenter: (o.center || []).map(r),
+                extent: r(o.maxExtent),
+                rot0: (s.rotation && s.rotation[0] || []).map(r),
+              });
+            })()""")
+            print("camera2:", camera_after)
+            # 🔴 A REWIND MUST NOT MOVE THE CAMERA. It continues on the object
+            # it already had, so the reader is looking at a view they set - and
+            # _switchToObject restores a viewerState that is only ever SAVED
+            # when switching AWAY from an object, so asking for the object
+            # already current restored its default and reset the rotation to
+            # the identity. A fresh fold is a different object and is expected
+            # to orient itself, so this only applies when the second fold
+            # stayed on the first one's object.
+            if json.loads(second).get("current") == first_object:
+                was = json.loads(camera_before)
+                now = json.loads(camera_after)
+                for field in ("rot0", "center", "zoom", "focal"):
+                    if was[field] != now[field]:
+                        print("FAIL: a rewind moved the camera's %s: %r -> %r"
+                              % (field, was[field], now[field]))
             print("2status:", cdp.evaluate(ws,
                 "(document.getElementById('status-message')||{}).textContent"))
     finally:

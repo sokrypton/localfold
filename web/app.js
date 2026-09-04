@@ -726,8 +726,21 @@ function openBlankFold(stem, keep = []) {
     if (renderer.shownObjects instanceof Set) {
       renderer.shownObjects = new Set([stem]);
     }
-    if (typeof renderer._switchToObject === "function") renderer._switchToObject(stem);
-    else renderer.currentObjectName = stem;
+    // 🔴 SWITCHING TO THE OBJECT ALREADY ON SCREEN RESETS THE CAMERA, so a
+    // rewind must not ask for it. _switchToObject restores the target's saved
+    // viewerState, and that is only ever SAVED when switching away from an
+    // object - so for the object already current there is nothing saved and
+    // the restore falls back to its default, which is the identity rotation.
+    // Measured across a rewind: centre, zoom and extent all held, and the
+    // rotation went from [0.732, -0.597, -0.329] to [1, 0, 0]. That is the
+    // view jumping.
+    if (renderer.currentObjectName === stem) {
+      // ...already here; the frames changed under it and nothing else has to.
+    } else if (typeof renderer._switchToObject === "function") {
+      renderer._switchToObject(stem);
+    } else {
+      renderer.currentObjectName = stem;
+    }
     // ...and the two panels that describe a fold must stop describing the old
     // one. The heatmap is told about an object with no frames, which is what
     // makes it hide rather than keep the last matrix up.
