@@ -415,7 +415,16 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // trunk is a cached recycle state, and going from three recycles to five runs
   // two passes rather than six. Asking for FEWER is not a continuation and the
   // caller must not offer the cache for it; nothing here can undo a pass.
-  const trunkGpu = new Af3TrunkGpu(device);
+  // 🔴 THE PRECISION KNOBS TRAVEL WITH THE FOLD so a bench can measure both
+  // arms without editing a source file - which is the only way to compare them
+  // on a machine that drifts up to 3.2x between processes. Omitted, every one
+  // defaults to what the device supports; see AF3.md's memory section.
+  const precision = {
+    stagedPrecision: options.stagedPrecision,
+    weightPrecision: options.weightPrecision,
+    pairWeightPrecision: options.pairWeightPrecision,
+  };
+  const trunkGpu = new Af3TrunkGpu(device, precision);
   // 🔴 THE CONDITIONING AND THE HEAD INPUT DO NOT DEPEND ON THE TRUNK, so they
   // are built once, above the recycle loop. Only `trunkSingle` and `trunkPair`
   // move.
@@ -453,7 +462,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // its pipelines - 730 ms, flat in the shape - and doing that here overlaps
   // the compile with the trunk instead of paying it when the sampler starts.
   // Both samplers borrow it rather than building their own.
-  const head = steps > 0 ? new Af3DiffusionHeadGpu(device) : undefined;
+  const head = steps > 0 ? new Af3DiffusionHeadGpu(device, precision) : undefined;
 
   let trunk = reused?.trunk;
   let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
@@ -551,7 +560,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     const from = Number(beta.indices[token]) * 3;
     for (let axis = 0; axis < 3; axis += 1) pseudoBeta[token * 3 + axis] = positions[from + axis];
   }
-  const scores = await new Af3ConfidenceHeadGpu(device).run({
+  const scores = await new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
     tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
   }, weights.confidence, DIALECT);
 

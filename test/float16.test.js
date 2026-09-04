@@ -34,3 +34,45 @@ describe("float16 encoding", () => {
     }
   });
 });
+
+
+/**
+ * 🔴 TWO IMPLEMENTATIONS, AND THE FAST ONE IS THE DEFAULT. float32ToFloat16Array
+ * uses the engine's Float16Array where there is one, because the scalar loop is
+ * most of a second on the 319 million floats an AF3 fold converts. That is only
+ * safe if the two agree exactly, so this holds them to each other on the
+ * patterns where half precision is decided - and skips itself on a runtime that
+ * has only one of them, rather than passing vacuously.
+ */
+describe("float32ToFloat16Array against the scalar reference", () => {
+  it("agrees bit for bit wherever both implementations exist", () => {
+    if (typeof globalThis.Float16Array !== "function") return;
+    const probe = new Float32Array([
+      0, -0, 1, -1, 0.5, -0.5, 65504, 65520, 65536, 1e30, -1e30,
+      Number.NaN, Infinity, -Infinity, 1 / 3, 0.1, 1023.5, 2048.5,
+      6.103515625e-5, 5.960464477539063e-8, 2.9802322387695312e-8, 1e-8,
+      // ...ties, which are the case a "round half up" implementation gets wrong
+      1.0009765625, 1.00146484375, 1.0029296875,
+    ]);
+    const fast = float32ToFloat16Array(probe);
+    for (let index = 0; index < probe.length; index += 1) {
+      expect(fast[index]).toBe(numberToFloat16(probe[index]));
+    }
+  });
+
+  it("agrees on arbitrary values too, where a hand-picked list would not look", () => {
+    if (typeof globalThis.Float16Array !== "function") return;
+    const values = new Float32Array(4096);
+    let state = 12345;
+    for (let index = 0; index < values.length; index += 1) {
+      state = (state * 1103515245 + 12345) & 0x7fffffff;
+      values[index] = (state / 0x7fffffff - 0.5) * 10 ** ((index % 20) - 10);
+    }
+    const fast = float32ToFloat16Array(values);
+    let disagreements = 0;
+    for (let index = 0; index < values.length; index += 1) {
+      if (fast[index] !== numberToFloat16(values[index])) disagreements += 1;
+    }
+    expect(disagreements).toBe(0);
+  });
+});

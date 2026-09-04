@@ -58,6 +58,10 @@ export async function main(device, args) {
   const block = blockWeights(SHAPE);
   const weights = {
     ...SHAPE,
+    // The element the resident weight buffer holds. This stack streams its
+    // whole weight set once per token tile, so unlike the trunk's kernels it
+    // is the one place where halving their BYTES might also halve a cost.
+    weightPrecision: option(args, "weights", undefined),
     lanes: args.some((a) => a.startsWith("--lanes=")) ? Number(option(args, "lanes", "")) : undefined,
     tile: args.some((a) => a.startsWith("--tile=")) ? Number(option(args, "tile", "")) : undefined,
     splits: args.some((a) => a.startsWith("--splits=")) ? Number(option(args, "splits", "")) : undefined,

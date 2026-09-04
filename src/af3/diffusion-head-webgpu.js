@@ -171,8 +171,12 @@ export class Af3DiffusionHeadGpu {
     this.#conditioningPair = undefined;
   }
 
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
+    // Only the transformer's resident weights read a precision here; see the
+    // note in diffusion-transformer-webgpu.js for why it is the one stage where
+    // narrowing them buys TIME as well as memory.
+    this.options = options;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
   }
@@ -321,8 +325,11 @@ export class Af3DiffusionHeadGpu {
     for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
 
     const transformed = await stage("transformer", () =>
-      new Af3DiffusionTransformerGpu(this.device)
-        .run(act, cond.single, cond.pair, input.seqMask, tokens, weights.transformer));
+      new Af3DiffusionTransformerGpu(this.device).run(
+        act, cond.single, cond.pair, input.seqMask, tokens,
+        this.options?.weightPrecision === undefined
+          ? weights.transformer
+          : { ...weights.transformer, weightPrecision: this.options.weightPrecision }));
 
     // 🔴 THIS ONE STAYS ON THE CPU, AND THE DIFFERENCE IS THE PROJECTION. With
     // `null` for it this is a LayerNorm and nothing else - 59 rows of 768, too
