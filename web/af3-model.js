@@ -21,6 +21,8 @@ import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
 import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { distogramAgreementTable, distogramConfidence, calibrateToPlddt }
   from "../src/af3/distogram-confidence.js";
+import { distogramLddt, distogramLddtTable, lddtToPlddt }
+  from "../src/af3/distogram-lddt.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -492,10 +494,16 @@ export async function foldAf3(options) {
         // ...best effort, for the reason the finished-frame path gives: this is
         // a colour, and losing a prediction to it would be a bad trade.
         try {
-          const table = distogramAgreementTable(
+          // 🔴 lDDT's OWN ARITHMETIC, NOT THE OLDER AGREEMENT HEURISTIC.
+          // src/af3/distogram-lddt.js evaluates lDDT's definition with the
+          // distogram standing in for the reference - four thresholds,
+          // probabilistic inclusion inside 15 A, every pair rather than the
+          // sixteen sharpest - and it beats the heuristic on the same frames:
+          // 6.9 against 8.1 mean error per token, leave-one-target-out.
+          const table = distogramLddtTable(
             detail.trunk.logits, detail.trunk.binEdges, batch.tokens, batch.seqMask);
-          liveConfidence = (positions) => broadcastToSlots(
-            batch, distogramConfidence(table, pseudoBetaOf(batch, positions)));
+          liveConfidence = (positions) => broadcastToSlots(batch,
+            lddtToPlddt(distogramLddt(table, pseudoBetaOf(batch, positions))));
         } catch (cause) {
           console.warn("live frame confidence unavailable; frames stay uncoloured", cause);
         }

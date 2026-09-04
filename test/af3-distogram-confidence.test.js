@@ -11,8 +11,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { distogramAgreementTable, distogramConfidence, distogramContactConfidence,
-  distogramInterfaceContact }
+import { calibrateToPlddt, distogramAgreementTable, distogramConfidence,
+  distogramContactConfidence, distogramInterfaceContact }
   from "../src/af3/distogram-confidence.js";
 
 const BINS = 64;
