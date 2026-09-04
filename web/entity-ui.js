@@ -60,7 +60,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     const popup = document.createElement("div");
     popup.className = "entity-popup";
     popup.setAttribute("role", "dialog");
-    popup.setAttribute("aria-label", "Modified residues");
+    popup.setAttribute("aria-label", "Options");
 
     // 🔴 A CLICK ON THE SEQUENCE MEANS "THIS RESIDUE", AND IT HAS TO MEAN IT
     // FOR ONE ROW. Typing a number is the part people get wrong - counting to
@@ -76,11 +76,20 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       // up is the badge on the button, so that is updated by hand.
       const badge = anchor.querySelector(".entity-options");
       const count = (entity.modifications ?? []).length;
+      // 🔴 THE BADGE COUNTS EVERYTHING BEHIND THE BUTTON, not just the
+      // modifications. A template changes what is folded exactly as much as a
+      // modified residue does, and a closed popup hides both - so the button
+      // has to say that something is set without being opened.
+      const templated = (entity.template?.source ?? "").trim() !== ""
+        || entity.template?.auto === true;
       if (badge !== null) {
-        if (count > 0) badge.dataset.count = String(count);
+        const total = count + (templated ? 1 : 0);
+        if (total > 0) badge.dataset.count = String(total);
         else delete badge.dataset.count;
-        badge.title = count === 0
-          ? "Modified residues" : `${count} modified residue${count === 1 ? "" : "s"}`;
+        const said = [];
+        if (count > 0) said.push(`${count} modified residue${count === 1 ? "" : "s"}`);
+        if (templated) said.push("a template");
+        badge.title = said.length === 0 ? "Options" : said.join(" and ");
       }
       entityPaint.get(entity)?.();
       popup.replaceChildren();
@@ -88,7 +97,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       head.className = "entity-popup-head";
       const title = document.createElement("div");
       title.className = "entity-popup-title";
-      title.textContent = "Modified residues";
+      title.textContent = "Options";
       // 🔴 CLOSED ON PURPOSE, NOT BY LOOKING AWAY. It used to dismiss on any
       // click outside itself, which fought the one thing it is for: clicking
       // the sequence to pick a position happens OUTSIDE the popup, so the
@@ -244,6 +253,66 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         draw();
       });
       popup.append(add);
+
+      // 🔴 THE TEMPLATE LIVES BEHIND THE SAME BUTTON, because it is the same
+      // kind of thing: something set on ONE chain that changes what is folded
+      // and is invisible on the row. It had a button of its own and that made
+      // the entity row a six-track grid - a grid with fewer tracks than
+      // children WRAPS rather than overflowing, so it read as "the desktop
+      // entity row broke across 2 lines".
+      if (entity.type === "protein") {
+        entity.template ??= { source: "" };
+        const template = entity.template;
+        const section = document.createElement("div");
+        section.className = "entity-popup-section";
+        const heading = document.createElement("div");
+        heading.className = "entity-popup-title";
+        heading.textContent = "Template";
+        section.append(heading);
+
+        const source = document.createElement("input");
+        source.type = "text";
+        source.className = "entity-template-source";
+        source.placeholder = "1abc_A, or a UniProt accession";
+        source.value = template.source ?? "";
+        source.setAttribute("aria-label", "Template structure");
+        source.addEventListener("input", () => {
+          template.source = source.value;
+          draw();
+          notify();
+        });
+
+        const floor = document.createElement("input");
+        floor.type = "number";
+        floor.className = "entity-template-floor";
+        floor.min = "0";
+        floor.max = "100";
+        floor.placeholder = "pLDDT";
+        floor.title = "Drop residues below this pLDDT. AlphaFold DB has every"
+          + " residue and no way to say it did not see one, so a disordered"
+          + " tail arrives as geometry unless this is set.";
+        floor.value = template.minConfidence ?? "";
+        floor.addEventListener("input", () => {
+          template.minConfidence = floor.value === "" ? undefined : Number(floor.value);
+          notify();
+        });
+
+        const line = document.createElement("div");
+        line.className = "entity-popup-row";
+        line.append(source, floor);
+        section.append(line);
+
+        const status = document.createElement("p");
+        status.className = "entity-popup-empty entity-template-status";
+        // Written by the page once it has fetched: coverage is a fact about a
+        // file this list has never seen, and a template covering 17 of 120
+        // residues folds perfectly well and says nothing about it.
+        status.textContent = template.status
+          ?? "A structure to show this chain. Its coverage appears here once it"
+            + " is fetched.";
+        section.append(status);
+        popup.append(section);
+      }
 
       const problem = entityProblem(entity);
       if (problem !== null) {
@@ -517,31 +586,6 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       });
     }
 
-    // 🔴 A TEMPLATE IS A LINE UNDER THE ROW, NOT A POPUP. The modifications
-    // popup exists because a modification is a LIST - a code and a position,
-    // repeated - and a list needs somewhere to live. A template is one string,
-    // and its coverage is a sentence the reader has to be able to see WHILE
-    // deciding whether to fold: hidden behind a click, "17 of 120 residues"
-    // is a fact nobody reads.
-    let templateButton = null;
-    if (entity.type === "protein") {
-      templateButton = document.createElement("button");
-      templateButton.type = "button";
-      templateButton.className = "btn btn-grey btn-small entity-template";
-      const source = (entity.template?.source ?? "").trim();
-      templateButton.title = source === ""
-        ? "Show this chain a template" : `Template: ${source}`;
-      templateButton.setAttribute("aria-label", templateButton.title);
-      templateButton.innerHTML = '<i class="fa-solid fa-cube"></i>';
-      if (source !== "") templateButton.dataset.count = "1";
-      templateButton.addEventListener("click", (event) => {
-        event.stopPropagation();
-        entity.template = entity.template ?? { source: "" };
-        entity.template.open = !(entity.template.open === true);
-        render();
-      });
-    }
-
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "btn btn-grey btn-small entity-remove";
@@ -583,48 +627,9 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     const spacer = picker === null && options === null
       ? [document.createElement("span")] : [];
     wrapper.append(type, copies, ...(picker === null ? [] : [picker]), field,
-                   ...(templateButton === null ? [] : [templateButton]),
                    ...(options === null ? [] : [options]), ...spacer, remove);
     paint();
     if (picker !== null) wrapper.classList.add("entity-row-ligand");
-    if (entity.template?.open === true) {
-      // ...its own element after the row, so the row's grid is untouched and
-      // the line can be as long as the coverage sentence needs.
-      const panel = document.createElement("div");
-      panel.className = "entity-template-panel";
-      const source = document.createElement("input");
-      source.type = "text";
-      source.className = "entity-template-source";
-      source.placeholder = "1abc_A, or a UniProt accession";
-      source.value = entity.template.source ?? "";
-      source.setAttribute("aria-label", "Template structure");
-      // Typing updates the model in place and does NOT re-render, for the same
-      // reason the sequence box does not: a rebuild moves the caret to the end.
-      source.addEventListener("input", () => {
-        entity.template.source = source.value;
-        notify();
-      });
-      const floor = document.createElement("input");
-      floor.type = "number";
-      floor.className = "entity-template-floor";
-      floor.min = "0";
-      floor.max = "100";
-      floor.placeholder = "pLDDT";
-      floor.title = "Drop residues below this pLDDT. AlphaFold DB has every"
-        + " residue and no way to say it did not see one.";
-      floor.value = entity.template.minConfidence ?? "";
-      floor.addEventListener("input", () => {
-        entity.template.minConfidence = floor.value === "" ? undefined : Number(floor.value);
-        notify();
-      });
-      const status = document.createElement("span");
-      status.className = "entity-template-status";
-      // Written by the page once it has fetched, because coverage is a fact
-      // about a file this list has never seen.
-      status.textContent = entity.template.status ?? "";
-      panel.append(source, floor, status);
-      wrapper.append(panel);
-    }
     return wrapper;
   };
 

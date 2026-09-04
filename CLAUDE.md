@@ -95,8 +95,10 @@ included - and everything after that is not. It stays because that input term is
 a second, independently written reading of the nine features; the checker
 asserts exactly that much of it.
 
-🔴 **AND A TEMPLATE IS REACHABLE FROM THE PAGE NOW.** A protein entity row
-takes one source - `1abc`, `1abc_A` or a UniProt accession, one field because it
+🔴 **AND A TEMPLATE IS REACHABLE FROM THE PAGE NOW.** It lives behind a protein
+row's `⋮`, beside the modified residues, because the two are the same kind of
+thing: set on ONE chain, changing what is folded, and invisible on the row - so
+the badge counts both. It takes one source - `1abc`, `1abc_A` or a UniProt accession, one field because it
 is one question - fetched by `web/template-source.js` from the RCSB or AlphaFold
 DB and turned into a slot over the complex's TOKENS. The row shows what it
 covered, because a template covering 17 of 120 residues folds perfectly well and

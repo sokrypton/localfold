@@ -428,22 +428,19 @@
    remove. It was four, and adding the options button gave protein rows a fifth
    child with nowhere to go - so it wrapped onto a line of its own and the row
    grew a break down the middle. */
-/* 🔴 SIX TRACKS, NOT FIVE, SINCE THE TEMPLATE BUTTON JOINED THE ROW. A grid
-   with fewer tracks than children does not overflow - it WRAPS, putting the
-   overflow on an implicit second row - so the symptom was "the desktop entity
-   row broke across 2 lines" rather than anything about a button. The template
-   panel is a separate element after the row for the same reason: a source
-   field and a coverage sentence in these tracks would squeeze the sequence
-   box, and a `1fr` track squeezed to nothing is invisible to every fit check.
-   See tools/mobile-layout.py, which is what caught this. */
+/* 🔴 FIVE TRACKS, AND A SIXTH CONTROL DOES NOT FIT. The template briefly had a
+   button of its own here, and a grid with fewer tracks than children does not
+   overflow - it WRAPS, putting the overflow on an implicit second row, which
+   tools/mobile-layout.py reported as "the desktop entity row broke across 2
+   lines". The template lives behind the same `⋮` as the modified residues now,
+   which is where it belonged: both are set on one chain, both change what is
+   folded, and both are invisible on the row. */
 .entity-row {
   display: grid;
-  grid-template-columns: auto auto 1fr auto auto auto;
+  grid-template-columns: auto auto 1fr auto auto;
   align-items: start;
   gap: 8px;
 }
-/* ...and the panel spans all of them. */
-.entity-row > .entity-template-panel { grid-column: 1 / -1; }
 
 /* A ligand row has one more control - the menu of common codes - and the box
    beside it only ever holds five characters, so the menu takes the width the
@@ -865,27 +862,13 @@
   .msa-filters input[type="range"] { width: 72px; }
 }
 
-/* 🔴 THE TEMPLATE LINE SITS UNDER ITS ROW, NOT INSIDE IT. The entity row is a
-   grid whose tracks are sized for a type, a copy count and a sequence; putting
-   a source field and a coverage sentence in it squeezes the sequence box, and
-   a `1fr` track squeezed to nothing is invisible to every fit check - see the
-   note in tools/mobile-layout.py about the entity row measuring 0px at 320. */
-.entity-template-panel {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-  flex-wrap: wrap;
-  margin: 4px 0 8px 0;
-  font-size: 12px;
-}
-.entity-template-source { flex: 1 1 180px; min-width: 0; }
+/* The template's own controls, inside the options popup. */
+.entity-popup-section { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 10px; }
+.entity-template-source { flex: 1 1 auto; min-width: 0; }
 .entity-template-floor { flex: 0 0 72px; }
-.entity-template-panel input {
-  height: 26px; padding: 0 6px; font-size: 12px;
+.entity-popup-section input {
+  box-sizing: border-box;
+  height: 28px; padding: 0 6px; font-size: 12px;
   border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a;
 }
-.entity-template-status { flex: 1 1 100%; color: #64748b; }
 .entity-template-status.error { color: #b91c1c; }
-/* ...and the button says a template is set without being opened, the way the
-   modifications button does. */
-.entity-template[data-count] { border-color: #10b981; color: #047857; }
