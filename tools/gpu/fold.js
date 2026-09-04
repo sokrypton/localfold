@@ -214,6 +214,7 @@ export async function main(device, args) {
     stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
     pairWeightPrecision: option(args, "pair-weights", undefined),
+    accumulatePrecision: option(args, "accumulate", undefined),
     mode: samplerMode,
     recycles: Number(option(args, "recycles", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),

@@ -482,7 +482,9 @@ export class Af3ConfidenceHeadGpu {
     // almost nothing and keeps the two user-facing numbers checked at the
     // tolerance the f32 arithmetic actually reaches. A caller that wants the
     // memory can still ask.
-    this.options = { stagedPrecision: "f32", weightPrecision: "f32", ...options };
+    this.options = {
+      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32", ...options,
+    };
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
   }

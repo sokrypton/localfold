@@ -7,7 +7,8 @@ function prelude(shape, precision, offsets, epsilon, weightPrecision = precision
   const offsetConstants = Object.entries(offsets)
     .map(([name, offset]) => `const W_${name.toUpperCase()}: u32 = ${offset}u;`)
     .join("\n");
-  return `${declaration(precision === "f16" || weightPrecision === "f16" ? "f16" : "f32")}
+  return `${declaration(precision === "f16" || weightPrecision === "f16"
+    || shape.accumulatePrecision === "f16" ? "f16" : "f32")}
 const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
@@ -103,6 +104,23 @@ export function createTriangleShaders(
   // between them. It defaults to `precision`, so the standalone runner and its
   // checkers are unchanged.
   const weightPrecision = shape.weightPrecision ?? precision;
+  // 🔴 AND THE ACCUMULATORS ARE A THIRD FORMAT, FOR A THIRD REASON. The
+  // projection holds `rowsPerThread * columnsPerThread` vec4 in a WGSL ARRAY -
+  // eight of them at the default tile, which is 32 registers, and an array is
+  // the thing a driver is most willing to spill. In f16 they are 16, which is
+  // what lets a wider tile fit; this is the same finding as
+  // src/evoformer/attention.js's projection, where the 32x32 tile spills in
+  // f32 and is the fastest arm there is in f16. The staged operands narrow with
+  // them, since they feed the same multiply-add.
+  //
+  // The bias, the layer norm, the gate and the store all stay f32.
+  const accumulatePrecision = shape.accumulatePrecision ?? "f32";
+  if (!["f32", "f16"].includes(accumulatePrecision)) {
+    throw new RangeError(`unknown triangle accumulate precision ${accumulatePrecision}`);
+  }
+  const acc16 = accumulatePrecision === "f16";
+  const accVector = acc16 ? "vec4<f16>" : "vec4<f32>";
+  const accNarrow = (e) => (acc16 ? `f16(${e})` : e);
   const common = prelude(shape, precision, offsets, epsilon, weightPrecision);
   const t = scalar(precision);
   const tw = scalar(weightPrecision);
@@ -248,8 +266,15 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // tools/gpu/probe-alu.js puts workgroup reads at 394 billion a second against
   // 580 billion vec4 multiply-adds, so for these kernels the reads are the
   // larger of the two terms.
-  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowsPerThread];
-  if (rowVector === undefined) {
+  const rowVector = rowsPerThread === 1 ? "f32" : `vec${rowsPerThread}<f32>`;
+  // 🔴 ONLY THE PROJECTION'S STAGED SOURCE NARROWS, not the output kernel's.
+  // They share this shape but not their accumulators - the projection holds
+  // four matrices in a vec4 and the output kernel two in a vec2 - and WGSL will
+  // not mix widths in one multiply-add, so a single type here would have made
+  // the output kernel assign an f32 into an f16 and fail to compile. It did.
+  const projectRowVector = acc16
+    ? (rowsPerThread === 1 ? "f16" : `vec${rowsPerThread}<f16>`) : rowVector;
+  if (![1, 2, 4].includes(rowsPerThread)) {
     throw new Error(`projectTile rows ${PROJECT_TILE_ROWS} gives ${rowsPerThread} rows an `
       + "invocation, which is not 1, 2 or 4");
   }
@@ -269,7 +294,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(3) var<storage, read_write> a: array<f32>;
 @group(0) @binding(4) var<storage, read_write> b: array<f32>;
 
-var<workgroup> tile_source: array<${rowVector}, 64>;
+var<workgroup> tile_source: array<${projectRowVector}, 64>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
 // separate matrices contracted over the same source, so the four weights a
 // (k, channel) cell needs are always wanted together. Packed as a vec4 the
@@ -277,7 +302,7 @@ var<workgroup> tile_source: array<${rowVector}, 64>;
 // multiply-add instead of four - the same arithmetic, a quarter of the issue
 // slots. Priced before it was written: replacing these reads with a constant
 // took the kernel from 0.525 ms to 0.375, so they were 29% of it.
-var<workgroup> tile_weight: array<vec4<f32>, ${columnsPerThread * 64}>;
+var<workgroup> tile_weight: array<${accVector}, ${columnsPerThread * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -288,13 +313,13 @@ fn main(
   let h0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * 8u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
-  var acc: array<vec4<f32>, ${rowsPerThread * columnsPerThread}>;
+  var acc: array<${accVector}, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
     let h = h0 + column * 8u;
-    var bias = vec4<f32>(0.0);
+    var bias = ${accVector}(0.0);
     if (h < CH) {
-      bias = vec4<f32>(
-        ${MATRICES.map(([, , name]) => readWeight(`weights[W_${name} + h]`)).join(",\n        ")});
+      bias = ${accVector}(
+        ${MATRICES.map(([, , name]) => accNarrow(readWeight(`weights[W_${name} + h]`))).join(",\n        ")});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
       acc[r * ${columnsPerThread}u + column] = bias;
@@ -303,23 +328,23 @@ fn main(
   for (var c0 = 0u; c0 < CZ; c0 += 8u) {
     let source_c = c0 + local.x;
     let weight_c = c0 + local.y;
-    var staged: ${rowVector};
+    var staged: ${projectRowVector};
     ${overRows((r) => `{
         let row = row0 + ${r}u * 8u;
         var value = 0.0;
         if (row < PAIRS && source_c < CZ) { value = z[row * CZ + source_c]; }
-        ${rowAt("staged", r)} = value;
+        ${rowAt("staged", r)} = ${accNarrow("value")};
       }`)}
     tile_source[tile_index] = staged;
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + column * 8u;
       let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
-      var packed = vec4<f32>(0.0);
+      var packed = ${accVector}(0.0);
       if (h < CH && weight_c < CZ) {
         let weight_index = h * CZ + weight_c;
-        packed = vec4<f32>(
+        packed = ${accVector}(
           ${MATRICES.map(([, name]) =>
-            readWeight(`weights[W_${name} + weight_index]`)).join(",\n          ")});
+            accNarrow(readWeight(`weights[W_${name} + weight_index]`))).join(",\n          ")});
       }
       tile_weight[slot] = packed;
     }
@@ -354,7 +379,7 @@ fn main(
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let h = h0 + column * 8u;
       if (h >= CH) { continue; }
-      let cell = acc[r * ${columnsPerThread}u + column];
+      let cell = vec4<f32>(acc[r * ${columnsPerThread}u + column]);
       let index = h * PAIRS + row;
       a[index] = pair_mask * cell.x * logistic(cell.y);
       b[index] = pair_mask * cell.z * logistic(cell.w);

@@ -67,7 +67,15 @@ export async function compilePairTrack(cache, options) {
   const channels = options.channels ?? PAIR_CHANNELS;
   const transitionFactor = options.transitionFactor ?? 4;
   const pairs = n * n;
-  const shape = { length: n, cZ: channels, cHidden: channels, weightPrecision };
+  // 🔴 THE TRIANGLE PROJECTION'S ACCUMULATORS, WHICH ARE A THIRD FORMAT AGAIN.
+  // It holds eight vec4 in a WGSL array - the thing a driver spills first - and
+  // in f16 they are half that. Worth 1.55x on the kernel at the tile it already
+  // had (bench-triangle-project.js at 118 tokens: 1.688 -> 1.087 ms), and
+  // tri.project is 13% of the trunk's GPU time.
+  const accumulatePrecision = options.accumulatePrecision ?? "f32";
+  const shape = {
+    length: n, cZ: channels, cHidden: channels, weightPrecision, accumulatePrecision,
+  };
   const triangleOffsets = packTriangleWeights(
     af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels),
     weightPrecision).offsets;
@@ -100,7 +108,8 @@ export async function compilePairTrack(cache, options) {
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`tri:${direction}:${name}`,
-                  `${base}:tri:${direction}:${weightPrecision}:${name}`, source);
+                  `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}:${name}`,
+                  source);
     }
   }
   for (const [key, attention, transpose] of

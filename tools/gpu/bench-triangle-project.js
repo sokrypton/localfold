@@ -80,6 +80,8 @@ export async function main(device, args) {
   const output = allocate(pairs * cZ);
   const readback = device.createBuffer({
     size: pairs * cZ * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const projectedReadback = device.createBuffer({
+    size: pairs * cH * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
   // 🔴 THE :drop ARMS RETURN WRONG NUMBERS ON PURPOSE, to price one class of
   // instruction rather than to compute anything. "barrier" removes the two
@@ -95,7 +97,11 @@ export async function main(device, args) {
   };
   const arms = [];
   for (const spec of arms_spec) {
-    const [shapeSpec, drop] = spec.split(":");
+    // ...and `@f16` after the tiles puts the projection's accumulators and its
+    // staged source in half precision, which is what lets a wider tile fit.
+    const [armSpec, accumulatePrecision = "f32"] = spec.split("@@");
+    const [shapeSpec, drop] = armSpec.split(":");
+    if (accumulatePrecision !== "f32" && !device.features.has("shader-f16")) continue;
     // "32x16" sets both tiles; "32x16@32x32" sets the projection's and the
     // contraction's separately, since they do not peak at the same shape.
     const [projectSpec, contractSpec] = shapeSpec.split("@");
@@ -103,7 +109,8 @@ export async function main(device, args) {
     const [contractRows, contractColumns] =
       (contractSpec ?? projectSpec).split("x").map(Number);
     // The contraction takes the same tile shape, so one arm prices both.
-    const shaders = createTriangleShaders(shape, "f32", offsets, 1e-5, "outgoing",
+    const shaders = createTriangleShaders({ ...shape, accumulatePrecision },
+                                          "f32", offsets, 1e-5, "outgoing",
                                           "fast", { rows, columns }, false,
                                           { rows: contractRows, columns: contractColumns });
     if (drop) {
@@ -178,8 +185,19 @@ export async function main(device, args) {
     }
   }
 
-  // The output of project-out depends on every cell project-ab wrote, so one
-  // readback per arm covers both kernels.
+  // 🔴 THE PROJECTION'S OWN OUTPUT HAS TO BE READ, AND READING project-out's
+  // INSTEAD MADE THIS CHECK BLIND TO THE KERNEL IT IS NAMED AFTER. The three
+  // kernels are wired here as independent timing subjects, not as a chain:
+  // `project-out` reads the buffer `x`, which is uploaded random data, while
+  // project-ab writes `a` and `b` and only the contraction reads those. So
+  // comparing `output` compared two arms over a result project-ab never
+  // touched - every arm scored relRMS 0, including ones whose projection was
+  // deliberately computing different numbers. The docstring's promise, that a
+  // tile the dispatch does not match reads as a speedup unless something
+  // checks, was not being kept for the projection at all.
+  //
+  // Both buffers are read now: `a` for project-ab and `output` for
+  // project-out.
   const results = [];
   for (const arm of arms) {
     const encoder = device.createCommandEncoder();
@@ -191,20 +209,29 @@ export async function main(device, args) {
       pass.end();
     }
     encoder.copyBufferToBuffer(output, 0, readback, 0, pairs * cZ * 4);
+    encoder.copyBufferToBuffer(a, 0, projectedReadback, 0, pairs * cH * 4);
     device.queue.submit([encoder.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
-    results.push(new Float32Array(readback.getMappedRange().slice(0)));
+    const outCopy = new Float32Array(readback.getMappedRange().slice(0));
     readback.unmap();
+    await projectedReadback.mapAsync(GPUMapMode.READ);
+    const projectedCopy = new Float32Array(projectedReadback.getMappedRange().slice(0));
+    projectedReadback.unmap();
+    results.push({ output: outCopy, projected: projectedCopy });
   }
-  const reference = results[0];
-  const relRms = results.map((out) => {
-    let error = 0, scale = 0;
-    for (let i = 0; i < reference.length; i += 1) {
-      error += (out[i] - reference[i]) ** 2;
-      scale += reference[i] ** 2;
-    }
-    return Math.sqrt(error / scale);
-  });
+  const relOf = (field) => {
+    const reference = results[0][field];
+    return results.map((r) => {
+      let error = 0; let scale = 0;
+      for (let i = 0; i < reference.length; i += 1) {
+        error += (r[field][i] - reference[i]) ** 2;
+        scale += reference[i] ** 2;
+      }
+      return Math.sqrt(error / Math.max(scale, 1e-30));
+    });
+  };
+  const projectRel = relOf("projected");
+  const outputRel = relOf("output");
 
   const median = (values) => [...values].sort((p, q) => p - q)[values.length >> 1];
   return {
@@ -215,7 +242,10 @@ export async function main(device, args) {
       project: Number(median(arm.times.project).toFixed(3)),
       projectOut: Number(median(arm.times.projectOut).toFixed(3)),
       contract: Number(median(arm.times.contract).toFixed(3)),
-      relRmsVsFirst: Number(relRms[index].toExponential(2)),
+      // Both kernels, separately: the projection is checked through `a`, which
+      // is the buffer it writes, and project-out through `output`.
+      projectRelRms: Number(projectRel[index].toExponential(2)),
+      outputRelRms: Number(outputRel[index].toExponential(2)),
     })),
   };
 }

@@ -87,6 +87,7 @@ export async function main(device, args) {
   const trunkGpu = new Af3TrunkGpu(device, {
     residentWeights, stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
+    accumulatePrecision: option(args, "accumulate", undefined),
   });
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);

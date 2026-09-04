@@ -77,9 +77,14 @@ export async function main(device, args) {
   //     f16     f32       3.00e-4    1.02e-3
   //     f32     f16       2.32e-2    2.51e-3
   //     f16     f16       2.32e-2    2.71e-3
+  //
+  // ...and the triangle's f16 ACCUMULATORS, the third axis, put pLDDT at
+  // 1.20e-3 and PAE at 9.63e-3. All three are pinned off for this head.
   const stagedPrecision = option(args, "staged", "f32");
   const weightPrecision = option(args, "weights", "f32");
-  const gpu = await new Af3ConfidenceHeadGpu(device, { stagedPrecision, weightPrecision })
+  const accumulatePrecision = option(args, "accumulate", "f32");
+  const gpu = await new Af3ConfidenceHeadGpu(
+    device, { stagedPrecision, weightPrecision, accumulatePrecision })
     .run(input, weights, DIALECT,
     { variance: option(args, "variance", "fast") });
 

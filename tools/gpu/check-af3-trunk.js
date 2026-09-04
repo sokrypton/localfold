@@ -113,9 +113,11 @@ export async function main(device, args) {
   const hasF16 = device.features.has("shader-f16");
   const stagedPrecision = option(args, "staged", hasF16 ? "f16" : "f32");
   const weightPrecision = option(args, "weights", hasF16 ? "f16" : "f32");
+  const accumulatePrecision = option(args, "accumulate", hasF16 ? "f16" : "f32");
   const staged16 = stagedPrecision === "f16";
   const weight16 = weightPrecision === "f16";
-  const gpu = await new Af3TrunkGpu(device, { stagedPrecision, weightPrecision })
+  const gpu = await new Af3TrunkGpu(
+    device, { stagedPrecision, weightPrecision, accumulatePrecision })
     .run(input, weights, DIALECT, {
     onStage: (name, ms) => console.log(`  ${name}\t${ms.toFixed(0)} ms`),
   });
@@ -206,17 +208,23 @@ export async function main(device, args) {
   // 🔴 DERIVED FROM THE ARITHMETIC, NOT FROM WHAT PASSES. Both f16 axes are
   // measured here, separately and together, over 48 blocks:
   //
-  //     staged  weights      pair     single    contact    logits
-  //     f32     f32       6.18e-7    6.21e-7   9.76e-5   4.46e-7
-  //     f16     f32       1.04e-5    2.91e-6   1.86e-4   6.83e-6
-  //     f32     f16       8.18e-6    7.99e-5   9.05e-4   5.93e-6
-  //     f16     f16       1.32e-5    8.04e-5   8.71e-4   9.17e-6
+  //     staged weights acc      pair     single    contact    logits
+  //     f32    f32     f32    6.18e-7    6.21e-7   9.76e-5   4.46e-7
+  //     f16    f32     f32    1.04e-5    2.91e-6   1.86e-4   6.83e-6
+  //     f32    f16     f32    8.18e-6    7.99e-5   9.05e-4   5.93e-6
+  //     f16    f16     f32    1.04e-5    8.06e-5   1.86e-4   -
+  //     f16    f16     f16    1.49e-5    8.15e-5   3.78e-4   9.44e-6
+  //
+  // (the third and fourth rows differ because the third also had the PAIR
+  // track's weights in f16, which is off by default - see pairWeightPrecision.)
   //
   // 4e-5 is 3x the worst pair measurement: these runs are deterministic, so the
   // margin is for scheduling and not for drift, and a bug moves this by orders
   // rather than by a factor. The f32 arm keeps its envelope rule and still
   // measures 1.0x it.
-  const pairBound = (staged16 || weight16) ? 4e-5 : Math.max(1e-5, envelope * 10);
+  const accumulate16 = accumulatePrecision === "f16";
+  const pairBound = (staged16 || weight16 || accumulate16)
+    ? 4e-5 : Math.max(1e-5, envelope * 10);
   if (pairRms > pairBound) {
     throw new Error(`pair relRMS ${pairRms.toExponential(2)} exceeds ${pairBound.toExponential(2)}`);
   }

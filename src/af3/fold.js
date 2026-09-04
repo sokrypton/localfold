@@ -423,6 +423,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     stagedPrecision: options.stagedPrecision,
     weightPrecision: options.weightPrecision,
     pairWeightPrecision: options.pairWeightPrecision,
+    accumulatePrecision: options.accumulatePrecision,
   };
   const trunkGpu = new Af3TrunkGpu(device, precision);
   // 🔴 THE CONDITIONING AND THE HEAD INPUT DO NOT DEPEND ON THE TRUNK, so they

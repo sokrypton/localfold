@@ -237,12 +237,14 @@ export class Af3PairformerStackGpu {
     // real state that --budget already exists for, and 38 MiB is 38 MiB when
     // the alternative is not folding.
     const pairWeightPrecision = this.options?.pairWeightPrecision ?? "f32";
+    // The triangle projection's accumulators; see the note in pair-track-gpu.js.
+    const accumulatePrecision = this.options?.accumulatePrecision ?? (hasF16 ? "f16" : "f32");
     if ((weightPrecision === "f16" || stagedPrecision === "f16") && !hasF16) {
       throw new Error("f16 weights and staged tiles require the shader-f16 feature");
     }
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
-      weightPrecision: pairWeightPrecision,
+      weightPrecision: pairWeightPrecision, accumulatePrecision,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js. `compile`
     // returns the cache's promise and the awaits are collected, so these
