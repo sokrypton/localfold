@@ -177,8 +177,17 @@ def main() -> int:
         print(f"template {path}: {covered} of {total} residues,"
               f" {int(mask.sum())} atoms")
 
+    # 🔴 MONOMER'S TEMPLATE BRANCH IS OFF UNLESS ASKED FOR, and a run without
+    # this captures NOTHING while looking like a success: the module simply
+    # does not execute, so the interceptor has nothing to intercept and the
+    # dump comes back with a length and no tensors. ColabDesign2 picks
+    # `model_3_ptm`'s config - templates disabled - unless use_templates is
+    # set, and the weight loader drops the template parameters to match.
+    # Multimer has template.enabled true either way, which is why it worked
+    # without this.
     runner = AF2Runner(model_type=arguments.model, data_dir=PARAMS,
-                       model_names=[arguments.name], use_bfloat16=False)
+                       model_names=[arguments.name], use_bfloat16=False,
+                       use_templates=arguments.template is not None)
     rng = np.random.default_rng(0)
     seq = np.zeros((1, total, 20), np.float32)
     for index in range(total):

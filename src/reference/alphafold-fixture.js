@@ -342,6 +342,12 @@ export class AlphaFoldFixture {
     }
     return {
       embeddingBias: await this.#parameter(p, "single_template_embedding/embedding2d", "bias"),
+      // 🔴 THE WEIGHT WAS NEVER LOADED, ONLY THE BIAS. With every template
+      // masked the whole 88-channel concatenation is zero and `embedding2d`
+      // contributes its bias alone, so the weight was unreachable - the same
+      // shape of gap as AF3's six unread template projections.
+      embeddingWeight: await this.#parameter(
+        p, "single_template_embedding/embedding2d", "weights"),
       blockWeights,
       outputNormScale: await this.#parameter(p, "single_template_embedding/output_layer_norm", "scale"),
       outputNormOffset: await this.#parameter(p, "single_template_embedding/output_layer_norm", "offset"),

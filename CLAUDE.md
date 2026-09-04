@@ -54,6 +54,7 @@ values means the whole-stack checker, not that file.
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
 | Does the template embedder match AF3 with a REAL template? | `tools/oracle/check_af3_template_geometry.js` |
 | Does AF2-multimer's template term match its reference? | `tools/gpu/check-multimer-template.js` |
+| ...and AF2-MONOMER's? | `tools/gpu/check-monomer-template.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
@@ -93,6 +94,32 @@ Its `construct_input` is right - it agrees with the GPU to 2.15e-7, geometry
 included - and everything after that is not. It stays because that input term is
 a second, independently written reading of the nine features; the checker
 asserts exactly that much of it.
+
+🔴 **AF2-MONOMER'S EMBEDDER IS A THIRD DIALECT, NOT A THIRD COPY.** Same six
+geometry features, but: ONE `Linear` over an 88-channel CONCATENATION rather
+than nine summed projections; the whole concatenation masked by the BACKBONE
+mask rather than each feature by its own; its distogram NOT pseudo-beta-masked
+at all; `use_template_unit_vector` **False** in every shipped monomer config,
+so three of the six are deliberately zeroed; and the query pair enters
+afterwards through a pointwise attention the other two do not have. Against
+AF2's own module: 2.7e-4 masked, 4.5e-4 with a real template.
+
+🔴 **AND `template_mask = 0` IS NOT "A TEMPLATE WITH NO ATOMS".** AF2-monomer
+ends with `embedding *= (sum(template_mask) > 0)`, so with no template the term
+is EXACTLY ZERO, while a present-but-empty one gives `embedding2d`'s bias
+through two pair blocks and a projection - which is not small. LocalFold has
+always computed the second, which is what ColabFold does; measuring it against
+the first reports relRMS 14.5 for a path that is right.
+`dump_monomer_template.py --masked-template` is the arm that means anything.
+
+🔴 **AND COLABDESIGN2 CANNOT CAPTURE MONOMER TEMPLATES AT ALL.** It puts the
+monomer on the multimer graph and raises - the two embedders differ and the
+weights do not convert - so `dump_monomer_template.py` transforms AF2's
+`TemplateEmbedding` with haiku and runs the module alone. Two version traps on
+the way: that checkout's config sets `fuse_projection_weights: True` everywhere
+while `model_1_ptm`'s weights use the older `layer_norm_input` /
+`left_projection` names, and comparing against the shipped `model/` bundle
+reports int8 quantisation as a fault - use `model.f32-backup`.
 
 🔴 **AND ITS CROSS-CHAIN MASK REFUSES TO GUESS, LIKE AF3'S.** The first
 version defaulted `asymId` to all zeros - every token in chain 0 - which is

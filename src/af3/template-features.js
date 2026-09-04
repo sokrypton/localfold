@@ -64,6 +64,22 @@ export const NUM_DENSE = 24;
 export const AF3_DENSE = { slots: 24, pseudoBeta: 4, backbone: [2, 1, 0] };
 export const AF2_ATOM37 = { slots: 37, pseudoBeta: 3, backbone: [2, 1, 0] };
 
+/**
+ * 🔴 AND AF2-MONOMER MASKS DIFFERENTLY FROM BOTH, WHICH IS THE THIRD DIALECT.
+ * AF3 and AF2-multimer multiply the distogram by the pseudo-beta mask and the
+ * unit vectors by the backbone mask, each feature by its own. The monomer
+ * masks NOTHING per feature: it concatenates all 88 channels and multiplies
+ * the whole vector by the BACKBONE mask at the end - so its distogram survives
+ * at a pair whose pseudo-beta is missing but whose backbone is not, where the
+ * other two zero it.
+ *
+ * The distogram is therefore left unmasked here and the caller applies the
+ * backbone mask, which is what `maskDistogram: false` says.
+ */
+export const AF2_ATOM37_MONOMER = {
+  slots: 37, pseudoBeta: 3, backbone: [2, 1, 0], maskDistogram: false,
+};
+
 /** Distogram bins, from AF3's DistogramFeaturesConfig. */
 export const DGRAM_BINS = 39;
 export const DGRAM_MIN = 3.25;
@@ -115,7 +131,7 @@ const slotOf = (table, code) => (code >= 0 && code < table.length ? table[code] 
  * has different slots); AF2's atom37 is one layout for every amino acid, and
  * glycine is the only special case either has.
  */
-const layoutFor = (layout) => (layout === AF2_ATOM37
+const layoutFor = (layout) => (layout === AF2_ATOM37 || layout === AF2_ATOM37_MONOMER
   ? {
     slots: 37,
     // Glycine has no CB and takes CA, which is the whole of AF2's table.
@@ -329,10 +345,12 @@ export function templateGeometry(template, multichainMask2d, tokens, layout = AF
     }
   }
 
-  // The distogram is masked last, exactly as AF3 does: `dgram *= mask[..., None]`.
+  // The distogram is masked last, exactly as AF3 does: `dgram *= mask[..., None]`
+  // - unless the dialect says otherwise. See AF2_ATOM37_MONOMER.
+  const maskDistogram = layout.maskDistogram !== false;
   const masked = new Float32Array(tokens * tokens * DGRAM_BINS);
   for (let pair = 0; pair < tokens * tokens; pair += 1) {
-    if (pseudoBetaMask2d[pair] === 0) continue;
+    if (maskDistogram && pseudoBetaMask2d[pair] === 0) continue;
     for (let bin = 0; bin < DGRAM_BINS; bin += 1) {
       masked[pair * DGRAM_BINS + bin] = dgram[pair * DGRAM_BINS + bin];
     }
