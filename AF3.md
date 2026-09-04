@@ -84,11 +84,21 @@ folded single-sequence, is not one.
 
  ### Speed, 68 tokens
 
-A flow-8 fold is **2.47 s** and holds **798 MiB** on the device, against
-**3.22 s and 1406 MiB** for the same tree with every f16 path forced off
-(`tools/gpu/fold.js --staged=f32 --weights=f32 --accumulate=f32`, both arms
-alternated in one shell). It was 3.2-3.4 s and 1406 MiB before the f16 work of
-2026-09-04, ~150 s when the first end-to-end fold ran, and 7 s before
+🔴 **THE FIRST FOLD OF A SESSION IS NOT THE FOLD, AND THIS FILE ONLY EVER
+QUOTED THE FIRST.** Pipelines and the resident f16 weights are cached for the
+life of the DEVICE, so the page pays for them once and every fold after is
+cheaper. `tools/gpu/fold.js --folds=3` runs three in one process:
+
+| | cold | warm | device |
+|---|---|---|---|
+| every f16 path off | 3.23 s | 2.18, 2.17 | 1463 MiB |
+| as shipped | 2.48 s | 1.97, 1.90 | 855 MiB |
+
+So a flow-8 fold is **1.9 s** once a session is going, and 2.5 the first time.
+The f16 work is worth 23% cold and 11% warm - bigger cold because the f32 arm's
+larger weight UPLOAD costs more than the f16 arm's one-off conversion.
+
+It was 3.2-3.4 s and 1406 MiB before the f16 work of 2026-09-04, ~150 s when the first end-to-end fold ran, and 7 s before
 the kernel work of 2026-09-02. A diffusion-200 fold was 25.9 s at the 3.0 s
 era.
 

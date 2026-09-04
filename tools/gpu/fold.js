@@ -56,7 +56,8 @@ export function batchFromDump(dump) {
   // spaghetti rather than as an error.
   const gather = (name) => {
     const indices = ints(raw(`${name}:gather_idxs`));
-    return { indices, mask: floats(raw(`${name}:gather_mask`)), count: indices.length };
+    return {
+    indices, mask: floats(raw(`${name}:gather_mask`)), count: indices.length };
   };
   const refMask = floats(raw("ref_mask"));
   let atomCount = 0;
@@ -203,13 +204,24 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
 
-  const started = performance.now();
+  // 🔴 A REPEAT FOLD IS THE ONE THE PAGE ACTUALLY SHOWS AFTER THE FIRST. The
+  // pipelines and the resident f16 weights are cached for the life of the
+  // DEVICE, so a second fold in the same session pays neither - and this file
+  // measures a cold process, which is the slowest fold there is. `--folds=2`
+  // runs it twice and reports both, so the two can be told apart.
+  const folds = Number(option(args, "folds", "1"));
+  const foldSeconds = [];
+  let result;
   let trunkStarted = 0;
   let diffusionStarted = 0;
   const trajectory = [];
   let lastDenoised = null;
+  for (let attempt = 0; attempt < folds; attempt += 1) {
+  const started = performance.now();
+  trajectory.length = 0;
+  lastDenoised = null;
 
-  const result = await foldBatch(device, batch, weights, {
+  result = await foldBatch(device, batch, weights, {
     // Omitted, each defaults to what the device supports. See AF3.md.
     stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
@@ -283,6 +295,10 @@ export async function main(device, args) {
       }
     },
   });
+  const elapsed = (performance.now() - started) / 1000;
+  foldSeconds.push(Number(elapsed.toFixed(3)));
+  if (folds > 1) console.log(`fold ${attempt + 1} of ${folds}: ${elapsed.toFixed(1)} s`);
+  }
 
   console.log(`diffusion done in ${((performance.now() - diffusionStarted) / 1000).toFixed(1)} s`);
   console.log(`mean pLDDT ${result.meanPlddt.toFixed(1)} over ${result.atoms} atoms`
@@ -297,8 +313,7 @@ export async function main(device, args) {
     + `   CA-CA ${caca.toFixed(2)} A (ideal 3.80)`);
   console.log(`radius of gyration ${gyration.toFixed(1)} A over ${residues} CA`
     + `   (a compact 68-mer is about 11-12 A)`);
-  const elapsed = (performance.now() - started) / 1000;
-  console.log(`total ${elapsed.toFixed(1)} s`);
+  console.log(`total ${foldSeconds[foldSeconds.length - 1].toFixed(1)} s`);
 
   // 🔴 THE DENOISED PREDICTION IS NOT THE SAMPLE, and at a coarse schedule they
   // are not close. `positions` is where the sampler's walk ended; `denoised` is
@@ -315,13 +330,15 @@ export async function main(device, args) {
   // this log by searching for `{\n  "sequence"`, so reordering the object
   // silently makes every score say "did the run fail?".
   return {
+    // Both folds, so a cold process and a warm one can be told apart.
+    foldSeconds,
     sequence: batch.sequence, tokens: batch.tokens, steps,
     denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
     meanPlddt: result.meanPlddt,
     ptm: result.ptm,
     iptm: Number.isNaN(result.iptm) ? null : result.iptm,
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
-    gyration, seconds: elapsed, pdb: result.pdb, trajectory,
+    gyration, seconds: foldSeconds[foldSeconds.length - 1], pdb: result.pdb, trajectory,
     // What the device is holding at the end, which nothing else reports.
     memory: memorySnapshot(device),
   };
