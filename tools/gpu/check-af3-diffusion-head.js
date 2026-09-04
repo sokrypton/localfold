@@ -308,15 +308,31 @@ export async function main(device, args) {
   };
 
   const expected = diffusionHead(headInput, headWeights, encodeCpu);
-  const gpu = await new Af3DiffusionHeadGpu(device).run(headInput, headWeights, {
-    onStage: (name, ms) => console.log(`  ${name}\t${ms.toFixed(0)} ms`),
-  });
+  // 🔴 THE TRANSFORMER'S RESIDENT WEIGHTS ARE AN AXIS, because they are 756 MiB
+  // of a fold and are held in f16 wherever the device allows it. The whole
+  // denoiser is checked either way; the f32 arm is what holds the arithmetic.
+  const weightPrecision = option(args, "weights",
+    device.features.has("shader-f16") ? "f16" : "f32");
+  const gpu = await new Af3DiffusionHeadGpu(device).run(
+    headInput,
+    { ...headWeights, transformer: { ...headWeights.transformer, weightPrecision } },
+    { onStage: (name, ms) => console.log(`  ${name}\t${ms.toFixed(0)} ms`) },
+  );
   const relRms = relativeRms(gpu.positions, expected);
   console.log(`denoiser\tsigma=${noiseLevel}\t${supers * 4} transformer blocks`
     + `\trelRMS ${relRms.toExponential(2)}`);
   console.log(`scalings: skip ${gpu.scalings.skip.toFixed(4)},`
     + ` out ${gpu.scalings.out.toFixed(4)}, input ${gpu.scalings.input.toFixed(4)}`);
 
-  if (relRms > 1e-4) throw new Error(`relRMS ${relRms.toExponential(2)} exceeds 1e-4`);
-  return { tokens, noiseLevel, supers, relRms };
+  // 🔴 DERIVED, AND THE STRUCTURAL CLAIM IS MADE ELSEWHERE. f16 transformer
+  // weights measure 1.28e-4 here against the f32 path's 1.76e-6, on a denoiser
+  // whose output is coordinates in angstroms - and what that is worth is two
+  // whole folds, not this number: 6MRR moves 0.0104 A and 1QYS 0.0093 A, with
+  // bond geometry identical to five decimals. See the note in
+  // check-af3-diffusion-transformer.js. 4e-4 is 3x the measurement.
+  const bound = weightPrecision === "f16" ? 4e-4 : 1e-4;
+  if (relRms > bound) {
+    throw new Error(`relRMS ${relRms.toExponential(2)} exceeds ${bound}`);
+  }
+  return { tokens, noiseLevel, supers, weightPrecision, relRms, bound };
 }

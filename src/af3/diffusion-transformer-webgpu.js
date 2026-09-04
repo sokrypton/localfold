@@ -1,3 +1,4 @@
+import { float32ToFloat16Array } from "../runtime/float16.js";
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
  *
@@ -62,11 +63,16 @@ const BLOCK_ORDER = [
  * rather than a WeakMap of its own so that ONE call hands back every weight
  * buffer on a device, which is what the budget fallback below needs.
  */
-function residentBlockBuffer(device, block, pack) {
-  return residentWeightBuffer(device, block, "difftx.block.resident", () => pack().data);
+function residentBlockBuffer(device, block, pack, variant = "") {
+  return residentWeightBuffer(device, block, "difftx.block.resident", () => pack().data, variant);
 }
 
-export function packBlockWeights(block) {
+/**
+ * @param {"f32"|"f16"} precision the element the packed buffer holds. Offsets
+ *   are in elements and do not depend on it; the shader must be built for the
+ *   same word or it reads half the values at twice the stride.
+ */
+export function packBlockWeights(block, precision = "f32") {
   const offsets = {};
   let total = 0;
   for (const name of BLOCK_ORDER) {
@@ -76,7 +82,7 @@ export function packBlockWeights(block) {
   }
   const data = new Float32Array(total);
   for (const name of BLOCK_ORDER) data.set(block[name], offsets[name]);
-  return { data, offsets };
+  return { data: precision === "f16" ? float32ToFloat16Array(data) : data, offsets };
 }
 
 /**
@@ -132,6 +138,23 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   // one activation per token of the tile and multiply it by the same weight, so
   // one workgroup read and one vector multiply-add replace TILE of each - qkvg
   // went from 24 instructions a channel to nine.
+  // 🔴 THE WEIGHT BUFFER IS A STORAGE FORMAT, AND THIS IS THE BIGGEST ONE THERE
+  // IS. `difftx.block.resident` is 756 MiB of the 1118 a 59-token AF3 fold
+  // holds on the device - 68% of it, more than the trunk's entire pairformer -
+  // because 24 blocks of a 768-channel transformer each keep 31.5 MiB resident
+  // for the model's lifetime. In f16 that is 378.
+  //
+  // It buys no time. Every read below is a scalar and this machine is
+  // instruction-bound, so halving the bytes does not halve the reads; what it
+  // buys is a device small enough to hold the model. Reads are widened at the
+  // point of use and the arithmetic is f32 throughout.
+  const weightPrecision = shape.weightPrecision ?? "f32";
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown diffusion transformer weight precision ${weightPrecision}`);
+  }
+  const weight16 = weightPrecision === "f16";
+  const wf = (e) => (weight16 ? `f32(${e})` : e);
+
   const tileWidth = Math.min(4, tile);
   const tileGroups = tile / tileWidth;
   const tileLanes = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[tileWidth];
@@ -195,7 +218,7 @@ export function createDiffusionTransformerShaders(shape, offsets) {
 
 
 
-  const common = `
+  const common = `${weight16 ? "enable f16;\n" : ""}
 const TOKENS: u32 = ${tokens}u;
 const PAIRS: u32 = ${pairs}u;
 const C: u32 = ${channels}u;
@@ -366,7 +389,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     workgroupBarrier();
     for (var c = local; c < C_COND; c += ${lanes}u) {
       let value = (cond[token * C_COND + c] - cond_mean) * cond_inverse
-        * weights[W_${prefix}SingleCondLayerNormScale + c];
+        * ${wf(`weights[W_${prefix}SingleCondLayerNormScale + c]`)};
       ${Array.from({ length: tile }, (_, t) =>
         `if (t == ${t}u) { cond_norm[${group(t)}u * C_COND + c]${lane(t)} = value; }`)
         .join("\n      ")}
@@ -376,11 +399,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   for (var c = local; c < C; c += ${lanes}u) {
     ${overGroups((g) =>
-      `var scale${g} = ${tileLanes}(weights[W_${prefix}SingleCondScaleBias + c]);
+      `var scale${g} = ${tileLanes}(${wf(`weights[W_${prefix}SingleCondScaleBias + c]`)});
     var shift${g} = ${tileLanes}(0.0);`)}
     for (var d = 0u; d < C_COND; d += 1u) {
-      let ws = weights[W_${prefix}SingleCondScaleWeights + d * C + c];
-      let wb = weights[W_${prefix}SingleCondBias + d * C + c];
+      let ws = ${wf(`weights[W_${prefix}SingleCondScaleWeights + d * C + c]`)};
+      let wb = ${wf(`weights[W_${prefix}SingleCondBias + d * C + c]`)};
       ${overGroups((g) => `{
         let cn = cond_norm[${g}u * C_COND + d];
         scale${g} += cn * ws;
@@ -402,14 +425,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   const adaln = conditionedNorm("", `@group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> cond: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(3) var<storage, read_write> xbuf: array<f32>;`);
 
   const qkvg = `${common}
 const TILE: u32 = ${tile}u;
 const SPLITS: u32 = ${splits}u;
 @group(0) @binding(0) var<storage, read> xbuf: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read_write> k: array<f32>;
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
@@ -425,7 +448,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let local = local_id.x;
   let out = group.y * ${lanes}u + local;
 
-  ${overGroups((g) => `var q${g} = ${tileLanes}(weights[W_qBias + out]);   // only q has a bias
+  ${overGroups((g) => `var q${g} = ${tileLanes}(${wf(`weights[W_qBias + out]`)});   // only q has a bias
   var k${g} = ${tileLanes}(0.0);
   var v${g} = ${tileLanes}(0.0);
   var g${g} = ${tileLanes}(0.0);`)}
@@ -437,10 +460,10 @@ ${stageChunk}
     // per TILE of tokens, so it is also the whole of its cost.
     for (var cc = 0u; cc < CHANNEL_CHUNK; cc += 1u) {
       let column = (c0 + cc) * WIDTH + out;
-      let wq = weights[W_qProjection + column];
-      let wk = weights[W_kProjection + column];
-      let wv = weights[W_vProjection + column];
-      let wg = weights[W_gatingQuery + column];
+      let wq = ${wf(`weights[W_qProjection + column]`)};
+      let wk = ${wf(`weights[W_kProjection + column]`)};
+      let wv = ${wf(`weights[W_vProjection + column]`)};
+      let wg = ${wf(`weights[W_gatingQuery + column]`)};
       ${overGroups((g) => `{
         let x = xt[${g}u * CHANNEL_CHUNK + cc];
         q${g} += x * wq;
@@ -541,7 +564,7 @@ const TILE: u32 = ${tile}u;
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
 @group(0) @binding(1) var<storage, read> gate: array<f32>;
 @group(0) @binding(2) var<storage, read> cond: array<f32>;
-@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(4) var<storage, read_write> act: array<f32>;
 
 // The tile's tokens as one vector, so one weight read serves all of them - and
@@ -585,7 +608,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${overGroups((g) => `var projected${g} = ${tileLanes}(0.0);`)}
   for (var w = 0u; w < WIDTH; w += 1u) {
     // ...read once, used by every token of the tile.
-    let weight = weights[W_Transition2 + w * C + c];
+    let weight = ${wf(`weights[W_Transition2 + w * C + c]`)};
     ${overGroups((g) => `projected${g} += gated[${g}u * WIDTH + w] * weight;`)}
   }
   // 🔴 THE ZERO-INIT GATE READS THE RAW CONDITIONING, not the normalised one.
@@ -601,9 +624,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }`)}
   }
   workgroupBarrier();
-  ${overGroups((g) => `var zero${g} = ${tileLanes}(weights[W_AdaptiveZeroCondBias + c]);`)}
+  ${overGroups((g) => `var zero${g} = ${tileLanes}(${wf(`weights[W_AdaptiveZeroCondBias + c]`)});`)}
   for (var d = 0u; d < C_COND; d += 1u) {
-    let w = weights[W_AdaptiveZeroCondWeights + d * C + c];
+    let w = ${wf(`weights[W_AdaptiveZeroCondWeights + d * C + c]`)};
     ${overGroups((g) => `zero${g} += gated[${g}u * C_COND + d] * w;`)}
   }
   ${overGroups((g) => `let contribution${g} = projected${g}
@@ -618,7 +641,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   const ffwAdaln = conditionedNorm("ffw",
     `@group(0) @binding(0) var<storage, read> cond: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read> act: array<f32>;
 @group(0) @binding(3) var<storage, read_write> xbuf: array<f32>;`);
 
@@ -626,7 +649,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   const ffwWide = `${common}
 const TILE: u32 = ${tile}u;
 @group(0) @binding(0) var<storage, read> xbuf: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read_write> gated: array<f32>;
 
 const CHANNEL_CHUNK: u32 = ${channelChunk}u;
@@ -649,8 +672,8 @@ ${stageChunk}
     // transition and the opposite of triangle multiplication's interleave.
     for (var cc = 0u; cc < CHANNEL_CHUNK; cc += 1u) {
       let column = W_ffwTransition1 + (c0 + cc) * wide;
-      let wg = weights[column + i];
-      let wv = weights[column + INTERMEDIATE + i];
+      let wg = ${wf(`weights[column + i]`)};
+      let wv = ${wf(`weights[column + INTERMEDIATE + i]`)};
       ${overGroups((g) => `{
         let x = xt[${g}u * CHANNEL_CHUNK + cc];
         gate_acc${g} += x * wg;
@@ -703,7 +726,7 @@ const TILE: u32 = ${outTile}u;
 const OUT_CHUNK: u32 = ${outChunk}u;
 @group(0) @binding(0) var<storage, read> gated: array<f32>;
 @group(0) @binding(1) var<storage, read> cond: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(3) var<storage, read_write> act: array<f32>;
 
 // One chunk of the intermediate, holding the tile's tokens as a vector - and
@@ -750,7 +773,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
     for (var i = 0u; i < OUT_CHUNK; i += 1u) {
       // ...read once, used by every token of the tile.
-      let weight = weights[W_ffwTransition2 + (chunk0 + i) * C + c];
+      let weight = ${wf(`weights[W_ffwTransition2 + (chunk0 + i) * C + c]`)};
       ${overOutGroups((g) => `acc${g} += wt[${g}u * OUT_CHUNK + i] * weight;`)}
     }
   }
@@ -770,9 +793,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  ${overOutGroups((g) => `var zero${g} = ${outVector}(weights[W_ffwAdaptiveZeroCondBias + c]);`)}
+  ${overOutGroups((g) => `var zero${g} = ${outVector}(${wf(`weights[W_ffwAdaptiveZeroCondBias + c]`)});`)}
   for (var d = 0u; d < C_COND; d += 1u) {
-    let w = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
+    let w = ${wf(`weights[W_ffwAdaptiveZeroCondWeights + d * C + c]`)};
     ${overOutGroups((g) => `zero${g} += wt[${g}u * C_COND + d] * w;`)}
   }
   ${overOutGroups((g) => `let contribution${g} = acc${g}
@@ -888,9 +911,13 @@ export class Af3DiffusionTransformerGpu {
     // 132**; at 59 tokens they tie (63-65 either way). Four it is.
     const outChunk = resolveOutChunk(intermediate, weights.outChunk);
     const outTile = weights.outTile ?? Math.min(4, tile, fits(outChunk));
+    // 🔴 f16 WHEREVER THE DEVICE HAS IT, FOR THE MEMORY. See the note in the
+    // shader factory: this is the largest resident tensor a fold holds.
+    const weightPrecision = weights.weightPrecision
+      ?? (this.device.features?.has("shader-f16") ? "f16" : "f32");
     const shape = { tokens, channels, condChannels, pairChannels, heads, dimension,
                     factor: weights.transitionFactor, lanes: weights.lanes,
-                    tile, splits, outTile, outChunk,
+                    tile, splits, outTile, outChunk, weightPrecision,
                     channelChunk: weights.channelChunk };
     const sources = createDiffusionTransformerShaders(shape, sample.offsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
@@ -899,7 +926,7 @@ export class Af3DiffusionTransformerGpu {
     const base = `af3-difftx:${tokens}:${channels}:${condChannels}:${pairChannels}`
       + `:${heads}:${dimension}:${weights.transitionFactor}:${perSuper}`
       + `:${shape.lanes ?? "default"}:${tile}:${splits}:${outTile}:${outChunk}`
-      + `:${weights.channelChunk ?? "d"}`;
+      + `:${weights.channelChunk ?? "d"}:${weightPrecision}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       // ...the factory also returns the split counts the dispatch needs, which
@@ -1031,7 +1058,9 @@ export class Af3DiffusionTransformerGpu {
           if (this.residentWeights) {
             // A refusal here is not caught: run() restarts the call.
             blockWeights = {
-              buffer: residentBlockBuffer(this.device, block, () => packBlockWeights(block)),
+              buffer: residentBlockBuffer(
+                this.device, block, () => packBlockWeights(block, weightPrecision),
+                weightPrecision),
             };
             // ...and the host's float32 goes: every buffer this block needs is
             // on the device for the model's lifetime. A lazily loaded weight
@@ -1040,7 +1069,7 @@ export class Af3DiffusionTransformerGpu {
           } else {
             // ...held only until this super-block is submitted; see flush().
             blockWeights = keep(this.allocator.upload("difftx.block",
-              packBlockWeights(block).data, storage));
+              packBlockWeights(block, weightPrecision).data, storage));
             pending.push(blockWeights);
           }
           const pairGroups = Math.ceil(pairs / 64);

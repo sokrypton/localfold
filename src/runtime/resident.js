@@ -38,7 +38,15 @@ const heldByDevice = new WeakMap();
  * @param {string} label    names the buffer, and separates two uses of one key
  * @param {() => Float32Array} pack  called only on a miss
  */
-export function residentWeightBuffer(device, key, label, pack) {
+/**
+ * @param {string} [variant] what distinguishes two buffers that would otherwise
+ *   share a label - the element the weights are packed in, say. It is part of
+ *   the cache key and NOT of the label, so a device-memory breakdown still
+ *   reads as one row per tensor. Without it an f16 pipeline can be handed the
+ *   f32 buffer, which is half the values at twice the stride: a wrong answer
+ *   rather than an error.
+ */
+export function residentWeightBuffer(device, key, label, pack, variant = "") {
   let forDevice = byDevice.get(device);
   if (forDevice === undefined) {
     forDevice = new WeakMap();
@@ -49,7 +57,8 @@ export function residentWeightBuffer(device, key, label, pack) {
     forKey = new Map();
     forDevice.set(key, forKey);
   }
-  const found = forKey.get(label);
+  const slot = variant === "" ? label : `${label}\u0000${variant}`;
+  const found = forKey.get(slot);
   if (found !== undefined) return found;
   const data = pack();
   const size = Math.ceil(data.byteLength / 4) * 4;
@@ -60,9 +69,9 @@ export function residentWeightBuffer(device, key, label, pack) {
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
-  forKey.set(label, buffer);
+  forKey.set(slot, buffer);
   const held = heldByDevice.get(device) ?? [];
-  held.push({ buffer, size, forKey, label });
+  held.push({ buffer, size, forKey, label: slot });
   heldByDevice.set(device, held);
   return buffer;
 }

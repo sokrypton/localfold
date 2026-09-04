@@ -38,7 +38,15 @@ const byDevice = new WeakMap();
 function accountFor(device) {
   let account = byDevice.get(device);
   if (account === undefined) {
-    account = { residentBytes: 0, peakBytes: 0, budgetBytes: undefined, count: 0 };
+    account = {
+      residentBytes: 0, peakBytes: 0, budgetBytes: undefined, count: 0,
+      // 🔴 WHAT IS ON THE DEVICE, BY WHAT IT IS. The totals alone say a fold
+      // holds 567 MiB and nothing about which tensor to attack, and the
+      // allocator's callers already pass a label - it was simply thrown away.
+      // Keyed by the label with its trailing index stripped, so the 48 copies
+      // of one block's weights read as one row rather than as forty-eight.
+      byLabel: new Map(),
+    };
     byDevice.set(device, account);
   }
   return account;
@@ -90,7 +98,22 @@ export function noteAllocation(device, label, bytes) {
   }
   account.residentBytes += bytes;
   account.count += 1;
+  const family = labelFamily(label);
+  const seen = account.byLabel.get(family);
+  if (seen === undefined) account.byLabel.set(family, { bytes, count: 1 });
+  else { seen.bytes += bytes; seen.count += 1; }
   if (account.residentBytes > account.peakBytes) account.peakBytes = account.residentBytes;
+}
+
+/**
+ * The label without whatever distinguishes one instance of it from the next.
+ *
+ * A stack allocates "w.tri.out" once a block and the scratch buffers once a
+ * pass, so the interesting row is the family and not the instance. Trailing
+ * digits and index suffixes are what vary.
+ */
+function labelFamily(label) {
+  return String(label ?? "unlabelled").replace(/[.:#-]?\d+$/, "");
 }
 
 /** Give room back, when a buffer is destroyed rather than merely released. */
@@ -131,6 +154,9 @@ export function residencyAllowed(device) {
  * point: the device does not care that we intend to reuse it.
  */
 export function memorySnapshot(device) {
-  const { residentBytes, peakBytes, budgetBytes, count } = accountFor(device);
-  return { residentBytes, peakBytes, budgetBytes, bufferCount: count };
+  const { residentBytes, peakBytes, budgetBytes, count, byLabel } = accountFor(device);
+  const largest = [...byLabel.entries()]
+    .map(([label, seen]) => ({ label, bytes: seen.bytes, count: seen.count }))
+    .sort((a, b) => b.bytes - a.bytes);
+  return { residentBytes, peakBytes, budgetBytes, bufferCount: count, byLabel: largest };
 }

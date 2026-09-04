@@ -3,11 +3,11 @@ const scalar = (precision) => precision;
 const read = (precision, expression) =>
   precision === "f16" ? `f32(${expression})` : expression;
 
-function prelude(shape, precision, offsets, epsilon) {
+function prelude(shape, precision, offsets, epsilon, weightPrecision = precision) {
   const offsetConstants = Object.entries(offsets)
     .map(([name, offset]) => `const W_${name.toUpperCase()}: u32 = ${offset}u;`)
     .join("\n");
-  return `${declaration(precision)}
+  return `${declaration(precision === "f16" || weightPrecision === "f16" ? "f16" : "f32")}
 const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
@@ -90,8 +90,23 @@ export function createTriangleShaders(
   if (variance !== "two-pass" && variance !== "fast") {
     throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
   }
-  const common = prelude(shape, precision, offsets, epsilon);
+  // 🔴 THE WEIGHTS AND THE ACTIVATIONS ARE TWO DIFFERENT FORMATS, AND CONFLATING
+  // THEM READS f32 DATA AS f16. `precision` used to name both: at "f16" the
+  // normalize shader declared `source` - the PAIR REPRESENTATION - as an f16
+  // array too, which is right for the standalone runner (it converts z on the
+  // way in) and wrong for anything sharing that buffer with the rest of a
+  // track. AF3's pair track hands it an f32 pair, so every value came back as
+  // two halves of one float and the trunk produced NaN.
+  //
+  // `shape.weightPrecision` narrows the WEIGHT buffer alone, which is what buys
+  // the memory: w.tri.out and w.tri.in are 40 MiB of an AF3 fold's residency
+  // between them. It defaults to `precision`, so the standalone runner and its
+  // checkers are unchanged.
+  const weightPrecision = shape.weightPrecision ?? precision;
+  const common = prelude(shape, precision, offsets, epsilon, weightPrecision);
   const t = scalar(precision);
+  const tw = scalar(weightPrecision);
+  const readWeight = (expression) => read(weightPrecision, expression);
 
   // 🔴 A ROW A THREAD IS THE WRONG SHAPE FOR A LAYER NORM, and it cost half the
   // memory bandwidth of both normalisation passes. A thread walking its own row
@@ -194,14 +209,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let value = (tile[index] - row_mean[index / ${count}])
       * row_inverse_std[index / ${count}];
     normalized[row * ${count} + channel] = value
-      * ${read(precision, `weights[W_${scale} + channel]`)}
-      + ${read(precision, `weights[W_${offset} + channel]`)};
+      * ${readWeight(`weights[W_${scale} + channel]`)}
+      + ${readWeight(`weights[W_${offset} + channel]`)};
   }
 }`;
 
   const normalizeInput = `${common}
 @group(0) @binding(0) var<storage, read> source: array<${t}>;
-@group(0) @binding(1) var<storage, read> weights: array<${t}>;
+@group(0) @binding(1) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
 ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + ${channel}]`),
                   "LAYERNORMINWEIGHT", "LAYERNORMINBIAS")}`;
@@ -250,7 +265,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
 @group(0) @binding(0) var<storage, read> z: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<${t}>;
+@group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> a: array<f32>;
 @group(0) @binding(4) var<storage, read_write> b: array<f32>;
 
@@ -279,7 +294,7 @@ fn main(
     var bias = vec4<f32>(0.0);
     if (h < CH) {
       bias = vec4<f32>(
-        ${MATRICES.map(([, , name]) => read(precision, `weights[W_${name} + h]`)).join(",\n        ")});
+        ${MATRICES.map(([, , name]) => readWeight(`weights[W_${name} + h]`)).join(",\n        ")});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
       acc[r * ${columnsPerThread}u + column] = bias;
@@ -304,7 +319,7 @@ fn main(
         let weight_index = h * CZ + weight_c;
         packed = vec4<f32>(
           ${MATRICES.map(([, name]) =>
-            read(precision, `weights[W_${name} + weight_index]`)).join(",\n          ")});
+            readWeight(`weights[W_${name} + weight_index]`)).join(",\n          ")});
       }
       tile_weight[slot] = packed;
     }
@@ -460,7 +475,7 @@ fn main(
 
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<${t}>;
+@group(0) @binding(1) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
 // ...READS CHANNEL-MAJOR AND WRITES CHANNEL-MINOR, because this is where the
 // two layouts meet: the contraction upstream wants h slowest, and
@@ -477,7 +492,7 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
 @group(0) @binding(0) var<storage, read> z: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<${t}>;
+@group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 var<workgroup> tile_x: array<${rowVector}, 64>;
@@ -510,8 +525,8 @@ fn main(
     var bias = vec2<f32>(0.0);
     if (out_channel < CZ) {
       bias = vec2<f32>(
-        ${read(precision, "weights[W_LINEARZBIAS + out_channel]")},
-        ${read(precision, "weights[W_LINEARGBIAS + out_channel]")});
+        ${readWeight("weights[W_LINEARZBIAS + out_channel]")},
+        ${readWeight("weights[W_LINEARGBIAS + out_channel]")});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
       acc[r * ${columnsPerThread}u + column] = bias;
@@ -539,10 +554,10 @@ fn main(
       var projection_w = 0.0;
       var gate_w = 0.0;
       if (out_channel < CZ && weight_k < CH) {
-        projection_w = ${read(precision, "weights[W_LINEARZWEIGHT + out_channel * CH + weight_k]")};
+        projection_w = ${readWeight("weights[W_LINEARZWEIGHT + out_channel * CH + weight_k]")};
       }
       if (out_channel < CZ && weight_k < CZ) {
-        gate_w = ${read(precision, "weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
+        gate_w = ${readWeight("weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
       }
       tile_weight[slot] = vec2<f32>(projection_w, gate_w);
     }

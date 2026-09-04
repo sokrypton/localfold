@@ -469,8 +469,20 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 export class Af3ConfidenceHeadGpu {
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
+    // 🔴 THIS HEAD'S FOUR BLOCKS STAY IN f32, AND THAT IS A DELIBERATE EXCEPTION
+    // TO THE TRUNK'S DEFAULT. pLDDT and PAE are the numbers the page puts in
+    // front of a user, and they are a softmax over 50 and 64 bins - the most
+    // amplifying thing either model emits. Measured on check-af3-confidence,
+    // pLDDT goes 1.16e-4 to 2.32e-2 with f16 weights and PAE 5.75e-6 to
+    // 2.51e-3, where the trunk's own outputs move by a factor.
+    //
+    // Four blocks of 52 is about 14 MiB of a 740 MiB fold, so f32 here costs
+    // almost nothing and keeps the two user-facing numbers checked at the
+    // tolerance the f32 arithmetic actually reaches. A caller that wants the
+    // memory can still ask.
+    this.options = { stagedPrecision: "f32", weightPrecision: "f32", ...options };
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
   }
@@ -560,7 +572,7 @@ export class Af3ConfidenceHeadGpu {
     }
 
     // The four confidence pairformer blocks: the same stack the trunk runs.
-    const stack = await new Af3PairformerStackGpu(this.device).run(
+    const stack = await new Af3PairformerStackGpu(this.device, this.options).run(
       { pair: embeddedPair, single: Float32Array.from(input.single),
         pairMask, seqMask, tokens }, weights.blocks, dialect, options);
 

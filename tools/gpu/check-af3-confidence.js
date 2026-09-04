@@ -66,7 +66,21 @@ export async function main(device, args) {
   };
 
   const expected = confidenceHead(input, weights, pairformerBlock, DIALECT);
-  const gpu = await new Af3ConfidenceHeadGpu(device).run(input, weights, DIALECT,
+  // 🔴 THE HEAD RUNS FOUR PAIRFORMER BLOCKS, so the trunk's two f16 axes could
+  // reach it - and deliberately do not. It pins both to f32 because pLDDT and
+  // PAE are what the page shows and they amplify hardest; see the note in
+  // Af3ConfidenceHeadGpu's constructor. The default here is the shipped
+  // configuration, and the flags are what measured the exception:
+  //
+  //     staged  weights     pLDDT       PAE
+  //     f32     f32       1.16e-4    5.75e-6
+  //     f16     f32       3.00e-4    1.02e-3
+  //     f32     f16       2.32e-2    2.51e-3
+  //     f16     f16       2.32e-2    2.71e-3
+  const stagedPrecision = option(args, "staged", "f32");
+  const weightPrecision = option(args, "weights", "f32");
+  const gpu = await new Af3ConfidenceHeadGpu(device, { stagedPrecision, weightPrecision })
+    .run(input, weights, DIALECT,
     { variance: option(args, "variance", "fast") });
 
   // 🔴 THE FOUR CONFIDENCE PAIRFORMER BLOCKS ARE THE SAME CHAOTIC STACK the

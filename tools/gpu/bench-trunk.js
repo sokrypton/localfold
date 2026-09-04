@@ -86,6 +86,7 @@ export async function main(device, args) {
   if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
   const trunkGpu = new Af3TrunkGpu(device, {
     residentWeights, stagedPrecision: option(args, "staged", undefined),
+    weightPrecision: option(args, "weights", undefined),
   });
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);

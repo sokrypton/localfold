@@ -133,8 +133,15 @@ export async function main(device, args) {
   for (let index = 0; index < perturbed.length; index += 1) perturbed[index] *= 1 + 1e-7;
   const control = diffusionTransformer(perturbed, cond, pairCond, mask, tokens, weights);
   const envelope = relativeRms(control, expected);
+  // 🔴 THE RESIDENT WEIGHTS' STORAGE FORMAT IS AN AXIS. This stack keeps 756
+  // MiB of weights on the device - more than everything else a fold holds put
+  // together - and holds them in f16 wherever the device allows it. The f32
+  // path keeps its bound; the f16 one gets its own, derived from what half
+  // precision does to a residual stack this deep.
+  const weightPrecision = option(args, "weights",
+    device.features.has("shader-f16") ? "f16" : "f32");
   const gpu = await new Af3DiffusionTransformerGpu(device)
-    .run(act, cond, pairCond, mask, tokens, weights);
+    .run(act, cond, pairCond, mask, tokens, { ...weights, weightPrecision });
   const relRms = relativeRms(gpu.output, expected);
 
   console.log(`diffusion transformer\t${supers} super-block(s) = ${supers * PER_SUPER} blocks`
@@ -144,10 +151,33 @@ export async function main(device, args) {
     + `\t${gpu.elapsedMilliseconds.toFixed(0)} ms`
     + `\t${(gpu.memory.peakBytes / 2 ** 20).toFixed(1)} MiB`);
 
-  const bound = Math.max(1e-5, envelope * 10);
+  // 🔴 THE f16 ARM'S BOUND IS LOOSE AND THE STRUCTURAL CLAIM IS NOT MADE HERE.
+  // Half-precision weights measure 1.88e-2 on this checker's output against the
+  // f32 path's ~1e-6, which is a big number to bless, so it is worth saying
+  // exactly what it is and is not evidence of.
+  //
+  // It is a residual stack: eight blocks of synthetic weights amplify a 4.9e-4
+  // per-weight rounding into the output, the same way the pairformer block
+  // checker reads 17x the envelope where the assembled 48-block trunk reads
+  // 4.3e-6. What decides whether that matters is a fold, and two were run -
+  // 6MRR at 71 tokens and 1QYS at 91, flow-8, one recycle, against the same
+  // seeds on the all-f32 tree:
+  //
+  //     6MRR   CA RMSD 0.0104 A   pLDDT 70.18260 -> 70.18063   1406 -> 740 MiB
+  //     1QYS   CA RMSD 0.0093 A   pLDDT 69.54053 -> 69.54726   1414 -> 748 MiB
+  //
+  // ...with N-CA, CA-C and CA-CA medians identical to five decimals. AF3's own
+  // accuracy on these is 0.7-0.9 A and the sampler's seed-to-seed spread is
+  // ~0.1, so 0.01 A is three orders under the thing being measured.
+  //
+  // So this arm is here to catch a BROKEN kernel, which moves relRMS by orders,
+  // and 4e-2 does that while leaving 2.1x over the measurement. The f32 arm
+  // keeps the envelope rule and is the one that holds the arithmetic exact.
+  const bound = weightPrecision === "f16" ? 4e-2 : Math.max(1e-5, envelope * 10);
   if (relRms > bound) {
     throw new Error(`relRMS ${relRms.toExponential(2)} exceeds ${bound.toExponential(2)}`
       + ` (${(relRms / envelope).toFixed(1)}x the rounding envelope)`);
   }
-  return { tokens, supers, relRms, envelope, ms: gpu.elapsedMilliseconds };
+  return { tokens, supers, weightPrecision, relRms, bound, envelope,
+           ms: gpu.elapsedMilliseconds };
 }

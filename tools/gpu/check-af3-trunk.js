@@ -104,10 +104,19 @@ export async function main(device, args) {
   // in f16 wherever the device has shader-f16, so the assembled trunk cannot be
   // held to the f32 path's number - and raising the one bound would stop the
   // f32 path being checked at the 4.3e-6 it actually reaches.
-  const stagedPrecision = option(args, "staged",
-    device.features.has("shader-f16") ? "f16" : "f32");
+  // 🔴 TWO AXES, BECAUSE THEY ARE TWO DIFFERENT TRADES. `staged` narrows the
+  // workgroup blocks the pair track holds, which buys TIME; `weights` narrows
+  // the resident weight buffers, which buys MEMORY and no time at all. They
+  // land on different representations - the staged tiles move the pair and the
+  // contacts, the weights move the single - so one bound over both would hide
+  // whichever moved less.
+  const hasF16 = device.features.has("shader-f16");
+  const stagedPrecision = option(args, "staged", hasF16 ? "f16" : "f32");
+  const weightPrecision = option(args, "weights", hasF16 ? "f16" : "f32");
   const staged16 = stagedPrecision === "f16";
-  const gpu = await new Af3TrunkGpu(device, { stagedPrecision }).run(input, weights, DIALECT, {
+  const weight16 = weightPrecision === "f16";
+  const gpu = await new Af3TrunkGpu(device, { stagedPrecision, weightPrecision })
+    .run(input, weights, DIALECT, {
     onStage: (name, ms) => console.log(`  ${name}\t${ms.toFixed(0)} ms`),
   });
 
@@ -194,18 +203,29 @@ export async function main(device, args) {
     + `\t(envelope ${logitsEnvelope.toExponential(2)},`
     + ` ${(logitsRms / Math.max(logitsEnvelope, 1e-30)).toFixed(1)}x)`);
 
-  // 🔴 DERIVED FROM THE ARITHMETIC, NOT FROM WHAT PASSES. Forty-eight blocks of
-  // f16-staged tiles measure 1.04e-5 where the f32 path measures 6.18e-7, and
-  // the contact probabilities - the most sensitive thing the trunk emits - go
-  // 9.76e-5 to 1.86e-4, which is a factor of two on a number that is already
-  // 19x its own conditioning envelope in f32. 4e-5 keeps a margin over the
-  // measurement without leaving room for a bug, which would move this by orders
-  // rather than by a factor. The f32 arm keeps 1e-5 and measures 6.18e-7.
-  const pairBound = staged16 ? 4e-5 : Math.max(1e-5, envelope * 10);
+  // 🔴 DERIVED FROM THE ARITHMETIC, NOT FROM WHAT PASSES. Both f16 axes are
+  // measured here, separately and together, over 48 blocks:
+  //
+  //     staged  weights      pair     single    contact    logits
+  //     f32     f32       6.18e-7    6.21e-7   9.76e-5   4.46e-7
+  //     f16     f32       1.04e-5    2.91e-6   1.86e-4   6.83e-6
+  //     f32     f16       8.18e-6    7.99e-5   9.05e-4   5.93e-6
+  //     f16     f16       1.32e-5    8.04e-5   8.71e-4   9.17e-6
+  //
+  // 4e-5 is 3x the worst pair measurement: these runs are deterministic, so the
+  // margin is for scheduling and not for drift, and a bug moves this by orders
+  // rather than by a factor. The f32 arm keeps its envelope rule and still
+  // measures 1.0x it.
+  const pairBound = (staged16 || weight16) ? 4e-5 : Math.max(1e-5, envelope * 10);
   if (pairRms > pairBound) {
     throw new Error(`pair relRMS ${pairRms.toExponential(2)} exceeds ${pairBound.toExponential(2)}`);
   }
-  const singleBound = staged16 ? 4e-5 : 1e-5;
+  // 🔴 THE SINGLE TRACK IS WHERE THE f16 WEIGHTS SHOW, AND ALMOST ONLY THERE.
+  // Read down the `weights` column of the table above: the single track moves
+  // by 130x and the pair by 13x, where the staged tiles do the reverse. That
+  // the two axes land on different representations is what says they are two
+  // effects and not one measured twice. 2e-4 is 2.5x the measurement.
+  const singleBound = weight16 ? 2e-4 : staged16 ? 4e-5 : 1e-5;
   if (singleRms > singleBound) {
     throw new Error(`single relRMS ${singleRms.toExponential(2)} exceeds ${singleBound}`);
   }

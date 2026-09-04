@@ -57,6 +57,9 @@ export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
   // f16 wherever the device has it; see grid-attention-webgpu.js's staged tile.
   const stagedPrecision = options.stagedPrecision ?? "f32";
+  // The element the RESIDENT weight buffers hold. Memory, not time; see the
+  // note in pairformer-block-webgpu.js.
+  const weightPrecision = options.weightPrecision ?? "f32";
   // 🔴 THE TEMPLATE STACK IS THIS TRACK AT 64 CHANNELS WITH A FACTOR-2
   // TRANSITION, where the trunk runs 128 and factor 4. Both are "a pairformer
   // block"; only the weight shapes say which, so a wrong factor reads
@@ -64,9 +67,10 @@ export async function compilePairTrack(cache, options) {
   const channels = options.channels ?? PAIR_CHANNELS;
   const transitionFactor = options.transitionFactor ?? 4;
   const pairs = n * n;
-  const shape = { length: n, cZ: channels, cHidden: channels };
+  const shape = { length: n, cZ: channels, cHidden: channels, weightPrecision };
   const triangleOffsets = packTriangleWeights(
-    af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels), "f32").offsets;
+    af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels),
+    weightPrecision).offsets;
   const gridOffsets = packGridAttentionWeights(sample.pairAttention1).offsets;
   const transitionOffsets = packTransitionWeights(sample.pairTransition).offsets;
 
@@ -86,7 +90,7 @@ export async function compilePairTrack(cache, options) {
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
       pipelines[`tri:${direction}:${name}`] =
-        await cache.get(`${base}:tri:${direction}:${name}`, source);
+        await cache.get(`${base}:tri:${direction}:${weightPrecision}:${name}`, source);
     }
   }
   for (const [key, attention, transpose] of
@@ -104,10 +108,11 @@ export async function compilePairTrack(cache, options) {
   // The transition stages two blocks of its own - the layer-normed rows and the
   // gated intermediate - and narrowing them is the same trade as the attention
   // tile above, on the largest kernel in the trunk. See transition-webgpu.js.
-  pipelines.pairTransition = await cache.get(`${base}:pair-transition:${stagedPrecision}`,
+  pipelines.pairTransition = await cache.get(
+    `${base}:pair-transition:${stagedPrecision}:${weightPrecision}`,
     createTransitionShader(
       { rows: pairs, channels, factor: transitionFactor, residual: true,
-        stagePrecision: stagedPrecision },
+        stagePrecision: stagedPrecision, weightPrecision },
       transitionOffsets, epsilon, variance));
   // 🔴 STILL ONE ADD PASS, and it belongs to the MSA stack rather than to this
   // track: the outer product mean is the one producer whose kernel does not
@@ -117,15 +122,15 @@ export async function compilePairTrack(cache, options) {
 }
 
 /** Pack one block's pair-track weights, ready to upload. */
-export function packPairTrackWeights(block, channels = PAIR_CHANNELS) {
+export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrecision = "f32") {
   return {
     outgoing: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationOutgoing, channels), "f32").data,
+      af3TriangleWeights(block.triangleMultiplicationOutgoing, channels), weightPrecision).data,
     incoming: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationIncoming, channels), "f32").data,
+      af3TriangleWeights(block.triangleMultiplicationIncoming, channels), weightPrecision).data,
     grid1: packGridAttentionWeights(block.pairAttention1).data,
     grid2: packGridAttentionWeights(block.pairAttention2).data,
-    transition: packTransitionWeights(block.pairTransition).data,
+    transition: packTransitionWeights(block.pairTransition, weightPrecision).data,
   };
 }
 

@@ -1,3 +1,4 @@
+import { float32ToFloat16Array } from "../runtime/float16.js";
 /**
  * AF3's transition block on the GPU: LayerNorm, then SwiGLU, then a projection
  * back down.
@@ -102,7 +103,13 @@ const GRID_WIDTH = 32_768;
 /** The packing order of the four tensors this kernel reads. */
 const ORDER = ["inputLayerNormScale", "inputLayerNormOffset", "transition1", "transition2"];
 
-export function packTransitionWeights(weights) {
+/**
+ * @param {"f32"|"f16"} precision the element the packed buffer holds. The
+ *   offsets are in ELEMENTS and do not depend on it, so a caller that packs one
+ *   way and builds the shader the other gets a wrong answer rather than an
+ *   error - which is why `createTransitionShader` takes the same word.
+ */
+export function packTransitionWeights(weights, precision = "f32") {
   const offsets = {};
   let total = 0;
   for (const name of ORDER) {
@@ -112,7 +119,7 @@ export function packTransitionWeights(weights) {
   }
   const data = new Float32Array(total);
   for (const name of ORDER) data.set(weights[name], offsets[name]);
-  return { data, offsets };
+  return { data: precision === "f16" ? float32ToFloat16Array(data) : data, offsets };
 }
 
 export function createTransitionShader(shape, offsets, epsilon, variance) {
@@ -164,6 +171,20 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
     throw new RangeError(`unknown transition stage precision ${stagePrecision}`);
   }
   const stage16 = stagePrecision === "f16";
+  // 🔴 AND THE WEIGHT BUFFER IS A STORAGE FORMAT TOO, WHICH IS A MEMORY WIN AND
+  // NOT A SPEED ONE. This kernel reads its weights one scalar at a time and
+  // this machine is instruction-bound, so halving their bytes changes the time
+  // by nothing measurable - but `w.single-transition` is 324 MiB of the 567 a
+  // 59-token AF3 fold keeps resident, more than every other tensor together,
+  // and that is the number that decides whether a phone folds at all. Every
+  // read is wrapped in f32() at the point of use, so the arithmetic is
+  // unchanged.
+  const weightPrecision = shape.weightPrecision ?? "f32";
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown transition weight precision ${weightPrecision}`);
+  }
+  const weight16 = weightPrecision === "f16";
+  const w = (e) => (weight16 ? `f32(${e})` : e);
   const stageVector = stage16
     ? (lanes === 1 ? "f16" : `vec${lanes}<f16>`) : vector;
   const narrow = (e) => (stage16 ? `${stageVector}(${e})` : e);
@@ -196,7 +217,7 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   }
   let variance = reduce_a[0] / f32(CHANNELS);`;
 
-  return `${stage16 ? "enable f16;\n" : ""}
+  return `${stage16 || weight16 ? "enable f16;\n" : ""}
 const ROWS: u32 = ${rows}u;
 const CHANNELS: u32 = ${channels}u;
 const INTERMEDIATE: u32 = ${intermediate}u;
@@ -217,9 +238,9 @@ ${residual
 // residual form means here anyway: this kernel reads every row it touches into
 // workgroup memory before it writes any of them.
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;`
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;`
   : `@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;`}
 
 var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
@@ -285,8 +306,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // whose other lanes are real.
   for (var g = 0u; g < ${groups}u; g += 1u) {
     for (var c = local; c < CHANNELS; c += WORKGROUP) {
-      let scale = weights[W_SCALE + c];
-      let offset = weights[W_OFFSET + c];
+      let scale = ${w("weights[W_SCALE + c]")};
+      let offset = ${w("weights[W_OFFSET + c]")};
       var packed: ${vector};
       ${overLanes((l, at) => `{
         let row${l} = min(base_row + g * ${lanes}u + ${l}u, ROWS - 1u);
@@ -335,8 +356,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       for (var b = 0u; b < BLOCK; b += 1u) {
         // ...read once, used TILE times. That ratio is the point.
         let i = chunk0 + local + b * WORKGROUP;
-        let wg = weights[column + i];
-        let wv = weights[column + INTERMEDIATE + i];
+        let wg = ${w("weights[column + i]")};
+        let wv = ${w("weights[column + INTERMEDIATE + i]")};
         for (var g = 0u; g < ${groups}u; g += 1u) {
           let x = ${widen("normalized[g * CHANNELS + c]")};
           gate[b * ${groups}u + g] += x * wg;
@@ -356,7 +377,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     var out_slot = 0u;
     for (var c = local; c < CHANNELS; c += WORKGROUP) {
       for (var slot = 0u; slot < CHUNK; slot += 1u) {
-        let w = weights[W_T2 + (chunk0 + slot) * CHANNELS + c];
+        let w = ${w("weights[W_T2 + (chunk0 + slot) * CHANNELS + c]")};
         for (var g = 0u; g < ${groups}u; g += 1u) {
           sum[${accumulator}] += ${widen("gated[g * CHUNK + slot]")} * w;
         }

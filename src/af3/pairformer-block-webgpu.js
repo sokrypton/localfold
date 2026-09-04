@@ -212,10 +212,37 @@ export class Af3PairformerStackGpu {
 
     // The pair track, shared with the MSA stack.
     const base = `af3-block:${n}:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
-    const stagedPrecision = this.options?.stagedPrecision
-      ?? (this.device.features?.has("shader-f16") ? "f16" : "f32");
+    const hasF16 = this.device.features?.has("shader-f16") === true;
+    const stagedPrecision = this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
+    // 🔴 THE RESIDENT WEIGHTS ARE THE MEMORY, AND THE SINGLE TRACK IS THE
+    // WEIGHTS. Broken down by label, a 59-token fold's 567 MiB is
+    // w.single-transition 324 and w.single 135 - 81% of it in two tensors,
+    // because the single track runs 384 channels against the pair track's 128
+    // and its transition widens by four on top. Held in f16 those are 230 MiB
+    // instead of 459. It buys no time, and is not meant to: these kernels read
+    // their weights one scalar at a time and this machine is instruction-bound,
+    // so halving the BYTES does not halve the read instructions. What it buys
+    // is a device small enough to hold the model at all.
+    const weightPrecision = this.options?.weightPrecision ?? (hasF16 ? "f16" : "f32");
+    // 🔴 THE PAIR TRACK'S OWN WEIGHTS STAY f32 BY DEFAULT, AND THE REASON IS THE
+    // RATIO. Narrowing them saves 38 MiB - the triangle's 20 and the pair
+    // transition's 18 - which is 6% of the 608 MiB the single track and the
+    // diffusion transformer give up between them. What it costs is the worst
+    // amplification measured anywhere here: the block checker's pair goes from
+    // 17x its rounding envelope to 51x, and the confidence head's pLDDT from
+    // 3.0e-4 to 2.3e-2. 94% of the saving for none of that is the better half
+    // of the trade.
+    //
+    // It is still offered, because "this device cannot hold the model" is a
+    // real state that --budget already exists for, and 38 MiB is 38 MiB when
+    // the alternative is not folding.
+    const pairWeightPrecision = this.options?.pairWeightPrecision ?? "f32";
+    if ((weightPrecision === "f16" || stagedPrecision === "f16") && !hasF16) {
+      throw new Error("f16 weights and staged tiles require the shader-f16 feature");
+    }
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
+      weightPrecision: pairWeightPrecision,
     });
     const compile = (key, source) => this.pipelines.get(key, source);
 
@@ -226,16 +253,18 @@ export class Af3PairformerStackGpu {
       offset: blocks[0].singlePairLogitsNormOffset,
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
-    pipelines.singleTransition = await compile(`${base}:single-transition`,
-      createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4 },
+    pipelines.singleTransition = await compile(`${base}:single-transition:${weightPrecision}`,
+      createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4, weightPrecision },
                              singleTransitionOffsets, epsilon, variance));
     const { projectSplits, ...singleSources } = createSingleAttentionShaders(
-      { n, channels: SINGLE_CHANNELS, heads, dimension: blocks[0].singleAttention.dimension },
+      { n, channels: SINGLE_CHANNELS, heads, dimension: blocks[0].singleAttention.dimension,
+        weightPrecision },
       singleOffsets, epsilon, variance);
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
-      pipelines[`single:${name}`] = await compile(`${base}:single:${name}`, source);
+      pipelines[`single:${name}`] =
+        await compile(`${base}:single:${weightPrecision}:${name}`, source);
     }
     pipelines.pairLogits = await compile(`${base}:pair-logits`,
       createPairLogitsShader(n, PAIR_CHANNELS, heads, logitsOffsets, epsilon, variance));
@@ -307,6 +336,7 @@ export class Af3PairformerStackGpu {
         const encodeStart = performance.now();
         await this.#encodeBlock({
           block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
+          weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
         encodeMilliseconds += performance.now() - encodeStart;
@@ -399,7 +429,8 @@ export class Af3PairformerStackGpu {
     // heap 1.1 GiB for a 59-token fold. This packs on demand instead: at most
     // once per block, and only while the misses are being filled.
     let packedPair;
-    const packedFor = () => (packedPair ??= packPairTrackWeights(block));
+    const packedFor = () => (packedPair ??= packPairTrackWeights(
+      block, PAIR_CHANNELS, context.pairWeightPrecision));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
@@ -421,19 +452,28 @@ export class Af3PairformerStackGpu {
     // either. A device with no budget set never takes this path at all.
     // The refusal is NOT caught here. See run(), which restarts the stack.
     const resident = this.residentWeights
-      ? (label, pack) => ({ buffer: residentWeightBuffer(this.device, block, label, pack) })
+      ? (label, pack, variant) => ({
+        buffer: residentWeightBuffer(this.device, block, label, pack, variant),
+      })
       : (label, pack) => ({ buffer: upload(label, pack()).buffer });
     const pairTrackWeights = {
-      outgoing: resident("w.tri.out", () => packedFor().outgoing),
-      incoming: resident("w.tri.in", () => packedFor().incoming),
+      outgoing: resident("w.tri.out", () => packedFor().outgoing, context.pairWeightPrecision),
+      incoming: resident("w.tri.in", () => packedFor().incoming, context.pairWeightPrecision),
       grid1: resident("w.grid1", () => packedFor().grid1),
       grid2: resident("w.grid2", () => packedFor().grid2),
-      transition: resident("w.pair-transition", () => packedFor().transition),
+      transition: resident(
+        "w.pair-transition", () => packedFor().transition, context.pairWeightPrecision),
     };
-    const singleTransitionWeights = resident("w.single-transition",
-      () => packTransitionWeights(block.singleTransition).data);
+    // 🔴 THE PRECISION IS PART OF THE CACHE KEY, as a variant rather than as
+    // part of the label - see residentWeightBuffer. A process running both arms
+    // would otherwise hand an f16 pipeline the f32 buffer.
+    const singleTransitionWeights = resident(
+      "w.single-transition",
+      () => packTransitionWeights(block.singleTransition, context.weightPrecision).data,
+      context.weightPrecision);
     const singleWeights = resident("w.single",
-      () => packSingleAttentionWeights(block.singleAttention).data);
+      () => packSingleAttentionWeights(block.singleAttention, context.weightPrecision).data,
+      context.weightPrecision);
     const logitsWeights = resident("w.pair-logits", () => packPairLogitsWeights({
       scale: block.singlePairLogitsNormScale,
       offset: block.singlePairLogitsNormOffset,

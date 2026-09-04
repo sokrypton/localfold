@@ -1,3 +1,4 @@
+import { float32ToFloat16Array } from "../runtime/float16.js";
 /**
  * AF3's single-track attention, biased by the pair representation.
  *
@@ -31,7 +32,12 @@ const ORDER = [
   "kProjection", "vProjection", "gatingQuery", "outputProjection",
 ];
 
-export function packSingleAttentionWeights(weights) {
+/**
+ * @param {"f32"|"f16"} precision the element the packed buffer holds. Offsets
+ *   are in elements and do not depend on it; the shader has to be built for the
+ *   same word or it reads half the values at twice the stride.
+ */
+export function packSingleAttentionWeights(weights, precision = "f32") {
   const offsets = {};
   let total = 0;
   for (const name of ORDER) {
@@ -41,7 +47,7 @@ export function packSingleAttentionWeights(weights) {
   }
   const data = new Float32Array(total);
   for (const name of ORDER) data.set(weights[name], offsets[name]);
-  return { data, offsets };
+  return { data: precision === "f16" ? float32ToFloat16Array(data) : data, offsets };
 }
 
 /**
@@ -82,6 +88,19 @@ export function singleProjectSplits(n, width) {
 export function createSingleAttentionShaders(shape, offsets, epsilon, variance) {
   const { n, channels, heads, dimension } = shape;
   const width = heads * dimension;
+  // 🔴 A STORAGE FORMAT FOR THE WEIGHTS, FOR MEMORY AND NOT FOR TIME. `w.single`
+  // is 135 MiB of the 567 a 59-token AF3 fold keeps on the device - the single
+  // track runs 384 channels where the pair track runs 128 - and every read here
+  // is a scalar, so halving the bytes halves the residency and changes the time
+  // by nothing. Reads are widened at the point of use; the arithmetic is f32
+  // throughout. See the note in src/af3/pairformer-block-webgpu.js.
+  const weightPrecision = shape.weightPrecision ?? "f32";
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown single attention weight precision ${weightPrecision}`);
+  }
+  const weight16 = weightPrecision === "f16";
+  const wf = (e) => (weight16 ? `f32(${e})` : e);
+  const enableF16 = weight16 ? "enable f16;\n" : "";
   // 🔴 RESOLVED ONCE AND RETURNED, because the dispatch multiplies by it. A
   // caller reading the constant while the shader was generated from something
   // else would project a slice of the width and leave the rest as it found it.
@@ -92,7 +111,7 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
   const perSplit = width / splits;
   const perThread = perSplit / 64;
 
-  const common = `
+  const common = `${enableF16}
 const N: u32 = ${n}u;
 const CHANNELS: u32 = ${channels}u;
 const HEADS: u32 = ${heads}u;
@@ -115,7 +134,7 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
   // One workgroup per token: normalise, then q/k/v/gate for that token.
   const project = `${common}
 @group(0) @binding(0) var<storage, read> single: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<storage, read_write> q: array<f32>;
 @group(0) @binding(3) var<storage, read_write> k: array<f32>;
 @group(0) @binding(4) var<storage, read_write> v: array<f32>;
@@ -176,8 +195,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
   for (var c = local; c < CHANNELS; c += 64u) {
-    act[c] = (single[base + c] - mean) * inverse_std * weights[W_NORM_SCALE + c]
-      + weights[W_NORM_OFFSET + c];
+    act[c] = (single[base + c] - mean) * inverse_std * ${wf("weights[W_NORM_SCALE + c]")}
+      + ${wf("weights[W_NORM_OFFSET + c]")};
   }
   workgroupBarrier();
 
@@ -194,7 +213,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var v_total: array<f32, ${perThread}>;
   var gate_total: array<f32, ${perThread}>;
   for (var b = 0u; b < ${perThread}u; b += 1u) {
-    q_total[b] = weights[W_QBIAS + out0 + b * 64u];   // ...and only q has one.
+    q_total[b] = ${wf("weights[W_QBIAS + out0 + b * 64u]")};   // ...and only q has one.
     k_total[b] = 0.0;
     v_total[b] = 0.0;
     gate_total[b] = 0.0;
@@ -204,10 +223,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let row = c * WIDTH;
     for (var b = 0u; b < ${perThread}u; b += 1u) {
       let out = row + out0 + b * 64u;
-      q_total[b] += x * weights[W_Q + out];
-      k_total[b] += x * weights[W_K + out];
-      v_total[b] += x * weights[W_V + out];
-      gate_total[b] += x * weights[W_GATE + out];
+      q_total[b] += x * ${wf("weights[W_Q + out]")};
+      k_total[b] += x * ${wf("weights[W_K + out]")};
+      v_total[b] += x * ${wf("weights[W_V + out]")};
+      gate_total[b] += x * ${wf("weights[W_GATE + out]")};
     }
   }
   for (var b = 0u; b < ${perThread}u; b += 1u) {
@@ -290,7 +309,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   const project_out = `${common}
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
 @group(0) @binding(1) var<storage, read> gate: array<f32>;
-@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
 var<workgroup> gated: array<f32, ${width}>;
@@ -309,8 +328,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   for (var c = local; c < CHANNELS; c += 64u) {
     var sum = 0.0;
-    for (var w = 0u; w < WIDTH; w += 1u) {
-      sum += gated[w] * weights[W_OUT + w * CHANNELS + c];
+    for (var wi = 0u; wi < WIDTH; wi += 1u) {
+      sum += gated[wi] * ${wf("weights[W_OUT + wi * CHANNELS + c]")};
     }
     output[token * CHANNELS + c] = sum;
   }
