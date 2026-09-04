@@ -244,11 +244,12 @@ export async function main(device, args) {
   // the f32 rounding envelope rather than a flat number. At four blocks:
   //
   //     staged f32, acc f32    1.0x     staged f16, acc f32   17.1x
-  //     staged f32, acc f16  200.2x     staged f16, acc f16  255.7x
+  //     staged f32, acc f16  255.6x     staged f16, acc f16  255.7x
   //
-  // (the accumulate arm covers BOTH triangle kernels - the projection and the
-  // output projection - which is why it moved again when the second one took
-  // it.)
+  // (the accumulate arm covers BOTH triangle kernels, the projection and the
+  // output projection, and dominates the staged one so completely that turning
+  // the staged tile on as well moves nothing. It read 200.2x when only the
+  // first of the two had it.)
   //
   // 🔴 THE TWO ARE NOT COMPARABLE NUMBERS, AND READING THEM AS ONE SCALE IS THE
   // MISTAKE TO AVOID. The envelope is built by perturbing the INPUT by 1e-7 and

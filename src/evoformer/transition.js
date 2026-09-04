@@ -72,6 +72,10 @@ export function chooseLinearTile({ rows, columns }) {
  *     first,  8192 rows   4.425 -> 3.725 ms      second   15.55 -> 13.45
  *     pair, 150 tokens    3.225 -> 2.850         first, 4096 rows  2.225 -> 1.925
  *
+ * (a later run of the same two arms read 4.338 -> 3.675, which is this
+ * machine's ~2% between-session drift and not a different result; the arrow is
+ * what reproduces, the endpoints are not.)
+ *
  * 🔴 AND IT LOSES ON SMALL SHAPES, WHICH IS WHY THIS IS A THRESHOLD AND NOT A
  * SWITCH. At 24 workgroups - a 59-residue structure module's single track -
  * f32 measures 0.188 ms against f16's 0.237, because there is not enough work
