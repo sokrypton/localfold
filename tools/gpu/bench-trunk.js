@@ -113,9 +113,13 @@ export async function main(device, args) {
     return values[Math.floor(values.length / 2)];
   };
   return {
+    pairformerSplit: trunkGpu.lastPairformerSplit,
     tokens, msaRows: rows, blocks, residentWeights, budgetMiB, perPass,
     deviceMemory: memorySnapshot(device),
-    ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, 18) }),
+    ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, 18),
+      gpuTotalMs: Number(passes_.reduce((t, e) => t + e.ms, 0).toFixed(1)),
+      gpuLabels: passes_.length,
+      gpuDispatches: passes_.reduce((t, e) => t + e.passes, 0) }),
     steady: Object.fromEntries(Object.keys(perPass[0])
       .filter((key) => key !== "pass")
       .map((key) => [key, median((row) => row[key])])),

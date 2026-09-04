@@ -74,7 +74,9 @@ export async function main(device, args) {
   }
 
   const results = {};
-  let worst = 0;
+  const precisions = option(args, "precision", "f32,f16").split(",");
+  const bounds = { f32: 1e-5, f16: 2e-3 };
+  let failed = 0;
   for (const [module, transpose] of [["pair_attention1", false], ["pair_attention2", true]]) {
     const at = (leaf) => layer(`${module}/${leaf}`);
     const weights = {
@@ -89,17 +91,29 @@ export async function main(device, args) {
       outputProjection: await at("output_projection/weights"),
     };
     const expected = gridSelfAttention(pair, mask, n, CHANNELS, transpose, weights, DIALECT);
-    const { output, elapsedMilliseconds, memory } = await runner.run(
-      pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT);
-    const relRms = relativeRms(output, expected);
-    worst = Math.max(worst, relRms);
-    results[module] = { transpose, relRms, ms: Number(elapsedMilliseconds.toFixed(2)),
-                        peakMiB: Number((memory.peakBytes / 2 ** 20).toFixed(2)) };
-    console.log(`${module}\ttranspose=${transpose}\trelRMS ${relRms.toExponential(2)}`
-      + `\t${elapsedMilliseconds.toFixed(1)} ms\t${(memory.peakBytes / 2 ** 20).toFixed(1)} MiB`);
+    // 🔴 THE STAGED TILE'S PRECISION IS AN AXIS, NOT A RAISED BOUND. A block
+    // stages the key and the value in f16 wherever the device has shader-f16,
+    // which is eleven significant bits - so one tolerance cannot hold both, and
+    // widening the single bound would stop the f32 kernel being checked at the
+    // 1e-5 it actually reaches. Each runs against the same CPU reference.
+    for (const stagedPrecision of precisions) {
+      if (stagedPrecision === "f16" && !device.features.has("shader-f16")) continue;
+      const { output, elapsedMilliseconds, memory } = await runner.run(
+        pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT, { stagedPrecision });
+      const relRms = relativeRms(output, expected);
+      const bound = bounds[stagedPrecision];
+      if (relRms > bound) failed += 1;
+      results[`${module}/${stagedPrecision}`] = {
+        transpose, stagedPrecision, relRms, bound,
+        ms: Number(elapsedMilliseconds.toFixed(2)),
+        peakMiB: Number((memory.peakBytes / 2 ** 20).toFixed(2)),
+      };
+      console.log(`${module}\t${stagedPrecision}\ttranspose=${transpose}`
+        + `\trelRMS ${relRms.toExponential(2)}\tbound ${bound.toExponential(0)}`
+        + `\t${elapsedMilliseconds.toFixed(1)} ms`);
+    }
   }
 
-  const bound = 1e-5;
-  if (worst > bound) throw new Error(`relRMS ${worst.toExponential(2)} exceeds ${bound}`);
+  if (failed > 0) throw new Error(`${failed} grid attention precision(s) outside tolerance`);
   return { n, block, results };
 }

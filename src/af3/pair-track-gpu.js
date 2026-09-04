@@ -55,6 +55,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
+  // f16 wherever the device has it; see grid-attention-webgpu.js's staged tile.
+  const stagedPrecision = options.stagedPrecision ?? "f32";
   // 🔴 THE TEMPLATE STACK IS THIS TRACK AT 64 CHANNELS WITH A FACTOR-2
   // TRANSITION, where the trunk runs 128 and factor 4. Both are "a pairformer
   // block"; only the weight shapes say which, so a wrong factor reads
@@ -91,11 +93,12 @@ export async function compilePairTrack(cache, options) {
        [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]) {
     const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
-        residual: true },
+        residual: true, stagedPrecision },
       gridOffsets, epsilon, variance, dialect);
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
-      pipelines[`grid:${key}:${name}`] = await cache.get(`${base}:grid:${key}:${name}`, source);
+      pipelines[`grid:${key}:${name}`] =
+        await cache.get(`${base}:grid:${key}:${stagedPrecision}:${name}`, source);
     }
   }
   pipelines.pairTransition = await cache.get(`${base}:pair-transition`,

@@ -176,6 +176,10 @@ export class Af3TrunkGpu {
         onBlockDone: (completed, total) => options.onPairformerBlockDone?.(completed, total),
       }));
 
+    // The pairformer's own encode/wait split, carried out so a bench can report
+    // where the stack's wall time went without re-instrumenting it.
+    this.lastPairformerSplit = pairformer.split;
+
     const head = await stage("distogram",
       () => this.#distogram(pairformer.pair, input.pairMask, tokens, weights.distogram));
 

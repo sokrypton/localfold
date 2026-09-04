@@ -194,10 +194,18 @@ export async function main(device, args) {
   }
   const envelope = relativeRms(control.pair, cpu.pair);
 
-  const gpu = await new Af3PairformerStackGpu(device).run(state, blocks, DIALECT);
+  // 🔴 THE STAGED ATTENTION TILE'S PRECISION IS AN AXIS. A block stages grid
+  // attention's key and value in f16 wherever the device has shader-f16, so one
+  // bound cannot hold both it and the f32 path - and raising the single bound
+  // would stop the f32 path being checked at the 1.7e-6 it actually reaches.
+  const stagedPrecision = option(args, "staged",
+    device.features.has("shader-f16") ? "f16" : "f32");
+  const f16 = stagedPrecision === "f16";
+  const gpu = await new Af3PairformerStackGpu(device, { stagedPrecision }).run(
+    state, blocks, DIALECT);
   const pairRms = relativeRms(gpu.pair, cpu.pair);
   const singleRms = relativeRms(gpu.single, cpu.single);
-  console.log(`${count} block(s), n=${n}`);
+  console.log(`${count} block(s), n=${n}, staged ${stagedPrecision}`);
   console.log(`pair\trelRMS ${pairRms.toExponential(2)}`
     + `\t(rounding envelope ${envelope.toExponential(2)},`
     + ` ${(pairRms / Math.max(envelope, 1e-30)).toFixed(1)}x)`);
@@ -207,14 +215,23 @@ export async function main(device, args) {
     + `\t${(gpu.elapsedMilliseconds / count).toFixed(1)} ms/block`);
 
   // The single track is not chaotic here, so it keeps an absolute bound.
-  const singleBound = 1e-5;
+  // f16's eleven significant bits on the staged key and value, carried through
+  // `count` blocks of residual accumulation. Measured 1.8e-5 at two blocks.
+  const singleBound = f16 ? 2e-4 : 1e-5;
   if (singleRms > singleBound) {
     throw new Error(`single relRMS ${singleRms.toExponential(2)} exceeds ${singleBound}`);
   }
   // The pair gets the larger of a flat floor and ten times the envelope, so a
   // single block - where the envelope is small and the GPU injects error at
   // every operation rather than only at the input - is still held tightly.
-  const pairBound = Math.max(1e-5, envelope * 10);
+  // 🔴 AND THE f16 ARM GETS ITS OWN MULTIPLE, DERIVED RATHER THAN CONVENIENT.
+  // The pair track is chaotic across blocks, so its bound has always been a
+  // multiple of the f32 rounding envelope rather than a flat number. Staging
+  // the key and value in f16 measures 17.0x that envelope at four blocks where
+  // f32 measures 1.0x; 20 is that with enough margin to stay deterministic and
+  // not enough to hide a bug, which would move this by orders and not by
+  // tenths. The f32 arm keeps 10x and still measures 1.0x.
+  const pairBound = Math.max(1e-5, envelope * (f16 ? 20 : 10));
   if (pairRms > pairBound) {
     throw new Error(`pair relRMS ${pairRms.toExponential(2)} exceeds ${pairBound.toExponential(2)}`
       + ` (${(pairRms / envelope).toFixed(1)}x the rounding envelope)`);

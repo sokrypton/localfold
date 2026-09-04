@@ -445,8 +445,21 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
   // the SAME k and v, so staging replaces 64 identical global loads with one.
   const keyChunk = shape.attendKeyChunk ?? attendKeyChunk(dimension);
   const staged = keyChunk > 0;
-  const readK = (t) => staged ? `k_tile[slot * HD4 + ${t}u]` : `k[k_base + ${t}u]`;
-  const readV = (t) => staged ? `v_tile[slot * HD4 + ${t}u]` : `v[k_base + ${t}u]`;
+  // 🔴 AND THE STAGED COPY GOES IN f16 WHERE THE DEVICE ALLOWS IT. This is the
+  // same kernel and the same finding as AF2's - see
+  // src/evoformer/attention.js, where the staged reads priced out at 8.7 ms of
+  // 20.8 and narrowing them to f16 was worth 1.22x. Only the TILE narrows: the
+  // running max, the running sum, the logit and the accumulators stay f32,
+  // because the softmax is where the range is.
+  const stagedPrecision = shape.stagedPrecision ?? "f32";
+  if (!["f32", "f16"].includes(stagedPrecision)) {
+    throw new RangeError(`unknown grid attention staged precision ${stagedPrecision}`);
+  }
+  const tile16 = staged && stagedPrecision === "f16";
+  const tileType = tile16 ? "vec4<f16>" : "vec4<f32>";
+  const widen = (e) => (tile16 ? `vec4<f32>(${e})` : e);
+  const readK = (t) => staged ? widen(`k_tile[slot * HD4 + ${t}u]`) : `k[k_base + ${t}u]`;
+  const readV = (t) => staged ? widen(`v_tile[slot * HD4 + ${t}u]`) : `v[k_base + ${t}u]`;
   const body = `
 ${staged ? "" : "    let k_base = ((row * N + j) * HEADS + head) * HD4;"}
     var score = 0.0;
@@ -481,8 +494,8 @@ ${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`;
     for (var index = local; index < ${keyChunk}u * HD4; index += 64u) {
       let j = min(j0 + index / HD4, N - 1u);
       let source = ((row * N + j) * HEADS + head) * HD4 + index % HD4;
-      k_tile[index] = k[source];
-      v_tile[index] = v[source];
+      k_tile[index] = ${tileType}(k[source]);
+      v_tile[index] = ${tileType}(v[source]);
     }
     workgroupBarrier();
     for (var slot = 0u; slot < ${keyChunk}u; slot += 1u) {
@@ -495,7 +508,7 @@ ${body}
 ${body}
   }`;
 
-  const attend = `${common}
+  const attend = `${tile16 ? "enable f16;\n" : ""}${common}
 @group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
@@ -504,8 +517,8 @@ ${body}
 @group(0) @binding(5) var<storage, read_write> gathered: array<vec4<f32>>;
 
 const HD4: u32 = ${vectors}u;
-${staged ? `var<workgroup> k_tile: array<vec4<f32>, ${keyChunk * vectors}>;
-var<workgroup> v_tile: array<vec4<f32>, ${keyChunk * vectors}>;` : ""}
+${staged ? `var<workgroup> k_tile: array<${tileType}, ${keyChunk * vectors}>;
+var<workgroup> v_tile: array<${tileType}, ${keyChunk * vectors}>;` : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -624,10 +637,12 @@ export class Af3GridSelfAttentionGpu {
     }
 
     const packed = packGridAttentionWeights(weights);
+    const stagedPrecision = options.stagedPrecision ?? "f32";
     const sources = createGridAttentionShaders(
-      { n, channels, heads, dimension, transpose }, packed.offsets, epsilon, variance, dialect);
+      { n, channels, heads, dimension, transpose, stagedPrecision },
+      packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
-      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
+      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),

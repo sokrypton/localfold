@@ -135,6 +135,7 @@ export class Af3PairformerStackGpu {
    */
   constructor(device, options = {}) {
     this.device = device;
+    this.options = options;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
     this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
@@ -211,8 +212,10 @@ export class Af3PairformerStackGpu {
 
     // The pair track, shared with the MSA stack.
     const base = `af3-block:${n}:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
+    const stagedPrecision = this.options?.stagedPrecision
+      ?? (this.device.features?.has("shader-f16") ? "f16" : "f32");
     const pipelines = await compilePairTrack(this.pipelines, {
-      n, sample: blocks[0], epsilon, variance, dialect, base,
+      n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
     });
     const compile = (key, source) => this.pipelines.get(key, source);
 
@@ -288,15 +291,29 @@ export class Af3PairformerStackGpu {
       const submissionWindow = options.submissionWindow ?? 16;
       const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
+      // 🔴 WHERE THE STACK'S WALL TIME ACTUALLY GOES, REPORTED RATHER THAN
+      // GUESSED. This was needed to settle whether the trunk is compute bound:
+      // the labelled compute passes summed to well under the wall clock, which
+      // looked like per-block overhead, and the answer is that it is not - the
+      // host encodes a whole 48-block pass in about 5 ms and spends the rest
+      // inside onSubmittedWorkDone. Kept because the next person to see that
+      // gap will otherwise re-derive it.
+      let encodeMilliseconds = 0;
+      let waitMilliseconds = 0;
+      let releaseMilliseconds = 0;
       for (let index = 0; index < blocks.length; index += 1) {
         const pending = [];
         validation.begin();
+        const encodeStart = performance.now();
         await this.#encodeBlock({
           block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
+        encodeMilliseconds += performance.now() - encodeStart;
         validation.end(`block ${index}`);
+        const releaseStart = performance.now();
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
+        releaseMilliseconds += performance.now() - releaseStart;
         // 🔴 WHEN THE DEVICE REACHES THIS BLOCK, reported without waiting for it.
         // This is AF2's idiom, from src/evoformer/stack.js, and it is here for
         // the same reason: onBlock above fires when a block is ENCODED, and
@@ -311,7 +328,9 @@ export class Af3PairformerStackGpu {
         void this.device.queue.onSubmittedWorkDone()
           .then(() => options.onBlockDone?.(submitted, blocks.length));
         if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
+          const waitStart = performance.now();
           await this.device.queue.onSubmittedWorkDone();
+          waitMilliseconds += performance.now() - waitStart;
         }
         // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
         // GPU promise, which is a microtask - so a page that only updates a
@@ -335,6 +354,11 @@ export class Af3PairformerStackGpu {
       return {
         pair: outPair, single: outSingle,
         elapsedMilliseconds: performance.now() - start,
+        split: {
+          encodeMilliseconds: Number(encodeMilliseconds.toFixed(1)),
+          waitMilliseconds: Number(waitMilliseconds.toFixed(1)),
+          releaseMilliseconds: Number(releaseMilliseconds.toFixed(1)),
+        },
         memory: this.allocator.snapshot(),
       };
     } finally {
