@@ -155,3 +155,67 @@ export function superposePdb(superpose, pdb, reference, options = {}) {
   const moved = superpose(atoms.points, target.points, { from, to });
   return { pdb: rewriteCoordinates(atoms, moved), fitted: from.length, on };
 }
+
+/**
+ * A whole cycle - its sampler trajectory and the structure it settled to -
+ * moved by ONE transform, the one that fits the settled structure.
+ *
+ * 🔴 EVERY FRAME FITTED SEPARATELY WOULD BE WRONG, AND WOULD LOOK RIGHT. A
+ * diffusion trajectory starts as noise: at step 1 the "target chain" is a
+ * cloud, so fitting on its alpha carbons fits on nothing and lands the frame
+ * somewhere arbitrary. The frames of one cycle are ALREADY in a common
+ * reference frame - fittedPdb in web/af3-model.js puts them there before they
+ * leave the fold - so the whole cycle needs one rigid move, derived from the
+ * only frame that has a real structure in it.
+ *
+ * 🔴 AND THE TRANSFORM IS OBTAINED BY MOVING EVERYTHING AT ONCE, because
+ * py2Dmol's `superpose` returns moved POINTS and not a matrix. Concatenating
+ * the trajectory behind the settled structure and naming the settled
+ * structure's alpha carbons as the fit set gives exactly that: one fit, one
+ * transform, applied to every point handed in. No matrix arithmetic here to
+ * get wrong.
+ *
+ * @param {Function} superpose py2Dmol's
+ * @param {string[]} frames the trajectory, in order
+ * @param {string} settled the structure the cycle finished at
+ * @param {string} reference what to move onto
+ * @param {{designed?: string}} [options]
+ * @returns {{frames: string[], settled: string, fitted: number, on: string}}
+ */
+export function superposeCycle(superpose, frames, settled, reference, options = {}) {
+  const designed = options.designed ?? "A";
+  const anchor = coordinateAtoms(settled);
+  const target = coordinateAtoms(reference);
+
+  let on = "target";
+  let from = alphaCarbons(anchor, (chain) => chain !== designed);
+  let to = alphaCarbons(target, (chain) => chain !== designed);
+  if (from.length < 3 || to.length < 3) {
+    on = "designed";
+    from = alphaCarbons(anchor, (chain) => chain === designed);
+    to = alphaCarbons(target, (chain) => chain === designed);
+  }
+  if (from.length < 3 || from.length !== to.length) {
+    return { frames, settled, fitted: 0, on: "none" };
+  }
+
+  // The settled structure FIRST, so `from` indexes straight into the
+  // concatenation with no offset to get wrong.
+  const parsed = frames.map((frame) => coordinateAtoms(frame));
+  const points = [...anchor.points];
+  for (const atoms of parsed) points.push(...atoms.points);
+
+  const moved = superpose(points, target.points, { from, to });
+  let at = anchor.points.length;
+  const movedFrames = parsed.map((atoms) => {
+    const slice = moved.slice(at, at + atoms.points.length);
+    at += atoms.points.length;
+    return rewriteCoordinates(atoms, slice);
+  });
+  return {
+    frames: movedFrames,
+    settled: rewriteCoordinates(anchor, moved.slice(0, anchor.points.length)),
+    fitted: from.length,
+    on,
+  };
+}

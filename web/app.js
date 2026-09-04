@@ -42,6 +42,9 @@ import { superposeOnto } from "./morph.js";
 import { CHAIN_IDS, confidenceJson, paeMatrix, predictionToPdb, safeJobName }
   from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
+// 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
+// own play bar. See web/scores-card.js.
+import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
@@ -537,57 +540,6 @@ function contactMapFor(contactProbs) {
     data[index] = Math.max(0, Math.min(255, Math.round(contactProbs[index] * 255)));
   }
   return { data, n, vmin: 0, vmax: 1 };
-}
-
-function updateScoresCard(confidence) {
-  const box = document.getElementById("predictionScoresBox");
-  if (!box) return;
-  if (!confidence) {
-    box.style.display = "none";
-    return;
-  }
-  box.style.display = "flex";
-
-  const meanPlddt = document.getElementById("metricMeanPlddt");
-  if (meanPlddt) {
-    meanPlddt.textContent = confidence.meanPlddt !== undefined
-      ? Number(confidence.meanPlddt).toFixed(1)
-      : "-";
-  }
-
-  const ptm = document.getElementById("metricPtm");
-  if (ptm) {
-    ptm.textContent = confidence.ptm !== undefined
-      ? Number(confidence.ptm).toFixed(2)
-      : "-";
-  }
-
-  const iptmCell = document.getElementById("metricIptmCell");
-  const iptm = document.getElementById("metricIptm");
-  if (iptmCell && iptm) {
-    if (confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm))) {
-      iptmCell.style.display = "flex";
-      iptm.textContent = Number(confidence.iptm).toFixed(2);
-    } else {
-      iptmCell.style.display = "none";
-    }
-  }
-
-  const multimerCell = document.getElementById("metricMultimerCell");
-  const multimer = document.getElementById("metricMultimer");
-  if (multimerCell && multimer) {
-    const multimerScore = confidence.multimerScore ?? (
-      confidence.iptm !== undefined && !Number.isNaN(Number(confidence.iptm)) && confidence.ptm !== undefined
-        ? 0.8 * Number(confidence.iptm) + 0.2 * Number(confidence.ptm)
-        : undefined
-    );
-    if (multimerScore !== undefined && !Number.isNaN(Number(multimerScore))) {
-      multimerCell.style.display = "flex";
-      multimer.textContent = Number(multimerScore).toFixed(2);
-    } else {
-      multimerCell.style.display = "none";
-    }
-  }
 }
 
 let previousFold = undefined;

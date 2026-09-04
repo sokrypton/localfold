@@ -111,7 +111,10 @@ def main():
                         help="the designed chain's length")
     parser.add_argument("--cycles", type=int, default=2)
     parser.add_argument("--runs", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=8, help="AF3 sampler steps")
+    parser.add_argument("--mode", default="flow", choices=["flow", "diffusion"],
+                        help="which sampler the fold runs")
+    parser.add_argument("--steps", type=int, default=16, help="AF3 sampler steps")
+    parser.add_argument("--recycles", type=int, default=0)
     parser.add_argument("--percent-x", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--designer", default="auto",
@@ -187,7 +190,9 @@ def main():
             ("runs", args.runs),
             ("cycles", args.cycles),
             ("percent-x", args.percent_x),
+            ("af3-mode", args.mode),
             ("steps", args.steps),
+            ("recycles", args.recycles),
             ("seed", args.seed),
             ("designer", args.designer),
             ("alanine-bias", args.alanine_bias),
@@ -338,6 +343,7 @@ def main():
           return JSON.stringify({
             object: v.currentObjectName, frames: frames.length,
             labels: frames.map((f) => f.label),
+            withConfidence: frames.filter((f) => f.confidence).length,
             chains, fittedOn: on, driftRmsd: drift,
             centroidOffset: offset, radius: extent,
             playBar: bar !== null && getComputedStyle(bar).display !== 'none',
@@ -345,9 +351,17 @@ def main():
         })()""")
         print("frames  :", frames)
         shown = json.loads(frames)
-        if shown.get("frames") != expected:
-            failures.append("%s frames in the viewer, expected %d"
+        # 🔴 ONE FRAME PER CYCLE IS THE FLOOR, NOT THE COUNT. With the
+        # diffusion steps kept - the page's default - a cycle contributes its
+        # whole sampler trajectory plus the structure it settled to, so the
+        # count is `cycles * steps`-ish. What must hold either way is that
+        # every cycle is represented and nothing collapsed them.
+        if shown.get("frames", 0) < expected:
+            failures.append("%s frames in the viewer, expected at least %d"
                             % (shown.get("frames"), expected))
+        settled = [text for text in (shown.get("labels") or []) if "step" not in text]
+        if len(settled) != expected:
+            failures.append("%d settled frames, expected %d" % (len(settled), expected))
         if expected > 1 and not shown.get("playBar"):
             failures.append("no play bar, so the cycles cannot be replayed")
         offset = shown.get("centroidOffset")
@@ -358,6 +372,44 @@ def main():
                             " first frame and the last (radius %.1f) - the frames"
                             " are not superposed"
                             % (offset, shown.get("radius") or 0))
+        # AF3's confidence head runs once per fold, so only the settled frame
+        # of each cycle has measured numbers - a step carrying the cycle's
+        # would put a confident colour on a structure that has not earned it.
+        if shown.get("withConfidence") != expected:
+            failures.append("%s frames carry confidence, expected %d (one per cycle)"
+                            % (shown.get("withConfidence"), expected))
+        # 🔴 THE CARD MUST FOLLOW THE BAR, WHICH py2Dmol DOES NOT ANNOUNCE.
+        # web/scores-card.js polls for it, and a poll that silently stopped
+        # would leave the last cycle's numbers under whatever frame is drawn -
+        # which looks like a working card. So this scrubs to a SAMPLER STEP,
+        # which has no measured confidence, and checks the card empties.
+        card = cdp.evaluate(ws, """(async () => {
+          const reg = window.py2dmol_viewers || {};
+          const v = reg[Object.keys(reg)[0]].renderer;
+          const frames = v.objectsData[v.currentObjectName].frames;
+          const read = () => ({
+            shown: getComputedStyle(
+              document.getElementById('predictionScoresBox')).display !== 'none',
+            plddt: (document.getElementById('metricMeanPlddt') || {}).textContent,
+          });
+          const settled = frames.findLastIndex((f) => f.confidence);
+          const step = frames.findIndex((f) => !f.confidence);
+          const wait = () => new Promise((r) => setTimeout(r, 250));
+          v.setFrame(settled); v.render('cycle'); await wait();
+          const onSettled = read();
+          v.setFrame(step); v.render('cycle'); await wait();
+          const onStep = read();
+          return JSON.stringify({ settledIndex: settled, stepIndex: step,
+                                  onSettled, onStep });
+        })()""")
+        print("card    :", card)
+        seen = json.loads(card)
+        if not seen["onSettled"]["shown"] or seen["onSettled"]["plddt"] in ("-", ""):
+            failures.append("the scores card shows no pLDDT on a settled frame")
+        if seen["onStep"]["shown"]:
+            failures.append("the scores card stayed up on a sampler step, which has"
+                            " no measured confidence - the poll is not following")
+
         print("download:", cdp.evaluate(
             ws, "!document.getElementById('downloads').hidden"))
     finally:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "./harness.js";
 import {
-  alphaCarbons, coordinateAtoms, rewriteCoordinates, superposePdb,
+  alphaCarbons, coordinateAtoms, rewriteCoordinates, superposeCycle, superposePdb,
 } from "../src/design/superpose-pdb.js";
 
 /**
@@ -203,5 +203,52 @@ describe("superposePdb", () => {
   it("does nothing when there are too few atoms to fit on", () => {
     const tiny = `${atom(1, "CA", "ALA", "A", 1, 1, 2, 3)}\nEND\n`;
     expect(superposePdb(shiftBy(1), tiny, tiny, { designed: "A" }).on).toBe("none");
+  });
+});
+
+describe("superposeCycle", () => {
+  // 🔴 THE POINT: ONE TRANSFORM FOR THE WHOLE CYCLE. A diffusion trajectory
+  // starts as noise, so fitting each frame on its own "target chain" fits on a
+  // cloud and lands it somewhere arbitrary. The frames already share a
+  // reference frame; what they need is the settled structure's rigid move.
+  it("moves every frame by the transform fitted from the settled structure", () => {
+    const settled = structure(0, true);
+    // A trajectory whose early frames are nothing like the settled structure.
+    const frames = [structure(100, true), structure(50, true), settled];
+    const result = superposeCycle(shiftBy(7), frames, settled, structure(), { designed: "A" });
+    expect(result.on).toBe("target");
+    expect(result.fitted).toBe(5);
+    expect(result.frames).toHaveLength(3);
+    for (const [index, moved] of result.frames.entries()) {
+      const before = coordinateAtoms(frames[index]).points;
+      const after = coordinateAtoms(moved).points;
+      expect(after).toHaveLength(before.length);
+      for (let atom = 0; atom < before.length; atom += 1) {
+        expect(after[atom][0]).toBeCloseTo(before[atom][0] + 7, 3);
+      }
+    }
+    expect(coordinateAtoms(result.settled).points[0][0])
+      .toBeCloseTo(coordinateAtoms(settled).points[0][0] + 7, 3);
+  });
+
+  it("fits once, not once per frame", () => {
+    const { calls, superpose } = recording();
+    const settled = structure(0, true);
+    superposeCycle(superpose, [settled, settled, settled], settled, structure(),
+                   { designed: "A" });
+    expect(calls).toHaveLength(1);
+    // ...and it was handed the settled structure plus all three frames.
+    const one = coordinateAtoms(settled).points.length;
+    expect(calls[0].points).toBe(one * 4);
+  });
+
+  it("hands everything back untouched when it cannot fit", () => {
+    const frames = [structure(1), structure(2)];
+    const shorter = structure().split("\n")
+      .filter((line) => !line.startsWith("ATOM") || line[21] !== "B"
+        || Number(line.slice(22, 26)) < 5).join("\n");
+    const result = superposeCycle(shiftBy(1), frames, structure(), shorter, { designed: "A" });
+    expect(result.on).toBe("none");
+    expect(result.frames).toEqual(frames);
   });
 });

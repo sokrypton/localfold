@@ -27,7 +27,8 @@ import { runDesign } from "../src/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../src/design/mpnn-bridge.js";
 import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
 import { createEntityList } from "./entity-ui.js";
-import { superposePdb } from "../src/design/superpose-pdb.js";
+import { superposeCycle } from "../src/design/superpose-pdb.js";
+import { followActiveFrame, updateScoresCard } from "./scores-card.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
@@ -168,42 +169,86 @@ function syncDesignerNote() {
  */
 let referencePdb;
 
-function frameFor(record) {
+/**
+ * One cycle's frames: its sampler trajectory, then the structure it settled to.
+ *
+ * 🔴 THE WHOLE CYCLE MOVES BY ONE TRANSFORM, fitted from the settled
+ * structure. A diffusion trajectory starts as noise, so fitting each frame on
+ * its own target chain fits on a cloud - see superposeCycle().
+ *
+ * 🔴 AND THE TRAJECTORY IS ADDED AFTER THE CYCLE, NOT DURING IT. `foldAf3`
+ * offers an `onFrame` hook and it is deliberately not used: a frame drawn as
+ * it arrives cannot be superposed, because the transform comes from a settled
+ * structure that does not exist yet. Live frames would therefore be the one
+ * thing this module exists to prevent - a structure thrown around a room -
+ * and a cycle is a few seconds, which the status line and the bar already
+ * account for. What the reader gets instead is every step, kept and
+ * scrubbable, which is the part worth watching twice.
+ */
+function cycleFrames(record) {
   const api = window.py2Dmol;
-  if (referencePdb === undefined || api?.superpose === undefined) return record.pdb;
+  const trajectory = keepDiffusionFrames() ? (record.folded?.framePdbs ?? []) : [];
+  // The settled structure is the last frame of its own trajectory, so a
+  // trajectory that already ends there is not repeated.
+  const steps = trajectory.length > 0 ? trajectory.slice(0, -1) : [];
+  if (referencePdb === undefined || api?.superpose === undefined) {
+    return { steps, settled: record.pdb };
+  }
   try {
-    return superposePdb(api.superpose, record.pdb, referencePdb,
-                        { designed: record.chain ?? "A" }).pdb;
+    const moved = superposeCycle(api.superpose, steps, record.pdb, referencePdb,
+                                 { designed: record.chain ?? "A" });
+    return { steps: moved.frames, settled: moved.settled };
   } catch (error) {
-    // An unalignable frame is still worth showing; it just sits where it fell.
+    // An unalignable cycle is still worth showing; it just sits where it fell.
     console.warn("superposition skipped:", error);
-    return record.pdb;
+    return { steps, settled: record.pdb };
   }
 }
 
 function show(record) {
-  const pdb = frameFor(record);
-  const { built, frames } = viewer.push(pdb);
+  const { steps, settled } = cycleFrames(record);
+  let frames = 0;
+  let built = false;
+  for (const [index, step] of steps.entries()) {
+    const pushed = viewer.push(step);
+    frames = pushed.frames;
+    if (pushed.built) {
+      built = true;
+      // 🔴 THE REFERENCE IS THE FIRST FRAME EVER DRAWN, whatever it is. If
+      // that is a sampler step it is a step of cycle 0, which every later
+      // cycle is then fitted onto - consistent, which is all the reference has
+      // to be.
+      referencePdb = step;
+    }
+    label(frames - 1, `${title(record)} · step ${index + 1}`, undefined);
+  }
+  const pushed = viewer.push(settled);
+  frames = pushed.frames;
+  if (pushed.built) { built = true; referencePdb = settled; }
   if (built) {
-    referencePdb = pdb;
     viewer.paint();
     element("orient").hidden = false;
   }
-  // 🔴 THE FRAME CARRIES ITS OWN CONFIDENCE AND PAE, which is where py2Dmol
-  // looks for them - so scrubbing the bar moves the score card and the matrix
-  // with it, rather than leaving the last cycle's numbers under an earlier
-  // cycle's structure.
-  const object = viewer.renderer?.objectsData?.[viewer.object];
-  const frame = object?.frames?.[frames - 1];
-  if (frame !== undefined) {
-    const label = `run ${record.run + 1} · cycle ${record.cycle}`;
-    frame.name = label;
-    frame.label = label;
-    frame.title = label;
-    frame.confidence = record.folded?.confidence;
-  }
+  // 🔴 THE SETTLED FRAME CARRIES THE CONFIDENCE AND THE SAMPLER STEPS DO NOT.
+  // AF3's confidence head runs once, on the finished sample - so a step has no
+  // measured pLDDT and giving it the cycle's would put a confident number on a
+  // structure that has not earned it. The card empties on those frames, which
+  // is a missing value shown as one.
+  label(frames - 1, title(record), record.folded?.confidence);
   jumpTo(frames - 1);
   return frames - 1;
+}
+
+const title = (record) => `run ${record.run + 1} · cycle ${record.cycle}`;
+
+/** Name one frame of the object, and hang its confidence on it. */
+function label(index, text, confidence) {
+  const frame = viewer.renderer?.objectsData?.[viewer.object]?.frames?.[index];
+  if (frame === undefined) return;
+  frame.name = text;
+  frame.label = text;
+  frame.title = text;
+  frame.confidence = confidence;
 }
 
 /** Draw a frame that is already in the object. */
@@ -281,6 +326,12 @@ function bestOverall() {
   return best;
 }
 
+const keepDiffusionFrames = () => element("diffusion-frames").checked;
+
+// The card follows whatever the bar is showing, which py2Dmol does not
+// announce. See followActiveFrame.
+followActiveFrame(() => ({ renderer: viewer.renderer, object: viewer.object }));
+
 function download(name, text, type = "text/plain") {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const link = Object.assign(document.createElement("a"), { href: url, download: name });
@@ -311,7 +362,8 @@ function setRunning(running) {
   button.querySelector("span").textContent = running ? "Stop" : "Hunt";
   for (const id of ["start-sequence", "runs", "cycles", "percent-x", "add-entity",
                     "temperature", "seed", "steps", "alanine-bias", "omit",
-                    "length", "designer"]) {
+                    "length", "designer", "diffusion-frames", "af3-mode",
+                    "recycles", "model-family"]) {
     element(id).disabled = running;
   }
   // The entity rows are inputs, buttons and selects built by entity-ui.js, so
@@ -333,6 +385,8 @@ function setRunning(running) {
 function designer(name) {
   return loadDesigner({
     name,
+    // ...two positional numbers here, unlike loadAf3Weights above. See the
+    // note at its call site.
     onProgress: (received, total) => {
       status(total > 0
         ? `Loading ${DESIGNERS[name].label} · ${Math.round((received / total) * 100)}%`
@@ -387,11 +441,13 @@ async function hunt() {
   viewer.forgetCamera();
   viewer.reset();
   referencePdb = undefined;
+  updateScoresCard(undefined);
 
   const runs = Math.max(1, number("runs", 1));
   const cycles = Math.max(0, number("cycles", 5));
-  const mode = "flow";
+  const mode = element("af3-mode").value;
   const calls = number("steps", AF3_COUNTS[mode].preferred);
+  const recycles = number("recycles", 0);
   // 🔴 DRAWN ONCE PER HUNT AND REPORTED, NOT DRAWN PER RUN AND LOST. Exploring
   // is the point, so an empty box means a new answer every press - but a run
   // worth keeping has to be repeatable, and a seed nobody can read is not a
@@ -406,8 +462,18 @@ async function hunt() {
   try {
     status("Starting WebGPU");
     const device = await getDevice(signal);
-    const weights = await loadAf3Weights((received, expected) => {
-      status(`Loading AlphaFold 3 · ${Math.round((received / expected) * 100)}%`);
+    // 🔴 THE TWO LOADERS REPORT PROGRESS DIFFERENTLY, AND GETTING IT WRONG
+    // PRINTS "NaN%" RATHER THAN FAILING. loadAf3Weights hands its callback ONE
+    // OBJECT, `{loadedBytes, totalBytes}` - it goes through to
+    // HttpTensorStore, which reports a whole-store figure - while
+    // `Weights.fetch` below hands two positional numbers off one response.
+    // Read as `(received, expected)` the object divided by undefined is NaN,
+    // and a status line is the one place that does not throw.
+    const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
+      if (signal.aborted) return;
+      progress(totalBytes === 0 ? 0 : loadedBytes / totalBytes);
+      status(`Loading AlphaFold 3 · ${(loadedBytes / 1048576).toFixed(0)}`
+        + ` / ${(totalBytes / 1048576).toFixed(0)} MiB`);
     });
     const chosen = resolveDesigner(input);
     const { model } = await designer(chosen.name);
@@ -432,7 +498,7 @@ async function hunt() {
         fold: async (sequence, context) => {
           const done = context.run * (cycles + 1) + context.cycle;
           return foldAf3({
-            sequence, mode, calls, recycles: 0, weights, device, signal, seed: seed + run,
+            sequence, mode, calls, recycles, weights, device, signal, seed: seed + run,
             // A ligand and a nucleic chain change the FOLD as well as the
             // designer: featurise gives each ligand a chain of its own and
             // reads a nucleic chain one token per base.
@@ -553,6 +619,32 @@ for (const name of DESIGNER_NAMES) {
 // fold would run on what the model still held. `set` is the same call
 // index.html's paste path makes.
 window.__hunterTargets = targets;
+
+/**
+ * Rebuild the step dial for the sampler that is selected.
+ *
+ * 🔴 THE TWO MODES DO NOT SHARE A RANGE. A flow step walks the whole noise
+ * schedule and a diffusion step discretises it, so the counts differ by an
+ * order of magnitude - 16 against 20 to 320 - and one `<input type=number>`
+ * spanning both would offer a flow value that is pointlessly slow and a
+ * diffusion value that does not resolve. index.html rebuilds this control on a
+ * mode change for the same reason; AF3_COUNTS carries the values and the
+ * measurements behind them.
+ */
+function syncSteps() {
+  const mode = element("af3-mode").value;
+  const counts = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
+  const select = element("steps");
+  const wanted = Number(select.value);
+  select.replaceChildren(...counts.values.map((value) => Object.assign(
+    document.createElement("option"), { value: String(value), textContent: String(value) })));
+  // Keep the reader's choice when the new mode also offers it; otherwise take
+  // that mode's own preferred count rather than the first thing in the list.
+  select.value = String(counts.values.includes(wanted) ? wanted : counts.preferred);
+  element("steps-label").textContent = counts.label;
+}
+element("af3-mode").addEventListener("change", syncSteps);
+syncSteps();
 
 // The entity list notifies through its own onChange; this is the picker.
 element("designer").addEventListener("change", syncDesignerNote);

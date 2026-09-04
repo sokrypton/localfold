@@ -40,7 +40,8 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
         .hunt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px 12px; margin-top: 8px; }
         .hunt-field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
         .hunt-field label { font-size: 11px; font-weight: 500; color: #64748b; margin: 0; }
-        .hunt-field input[type="number"], .hunt-field input[type="text"] {
+        .hunt-field input[type="number"], .hunt-field input[type="text"],
+        .hunt-field select {
             height: 28px; padding: 0 6px; font-size: 13px; border: 1px solid #cbd5e1;
             border-radius: 4px; background: #f8fafc; color: #0f172a; min-width: 0; }
         .hunt-check { flex-direction: row; align-items: center; gap: 6px; }
@@ -176,9 +177,50 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                         <label for="temperature">MPNN temperature</label>
                         <input type="number" id="temperature" min="0.001" max="1" step="0.01" value="0.1">
                     </div>
+                    <!-- 🔴 THE MODEL, THE SAMPLER AND ITS STEP COUNT ARE ONE
+                         SETTING IN THREE CONTROLS. A flow step walks the whole
+                         schedule and a diffusion step discretises it, so the
+                         two want step counts an order of magnitude apart -
+                         which is why #steps is REBUILT when the mode changes
+                         rather than carrying one range that is wrong for one
+                         of them. AF3_COUNTS in web/af3-model.js holds the
+                         values and the measurements behind them. -->
+                    <!-- ONE OPTION TODAY AND A LIST BY DESIGN. Protein Hunter
+                         is written against AF3-style models generally - the
+                         reference ships Boltz and Chai arms of the same loop -
+                         and src/design/hunter-loop.js already takes its folder
+                         as an argument, so a second model is a `fold` function
+                         and an entry here rather than a change to the method. -->
                     <div class="hunt-field">
-                        <label for="steps">Sampler steps</label>
-                        <input type="number" id="steps" min="8" max="64" step="8" value="16">
+                        <label for="model-family">Model</label>
+                        <select id="model-family">
+                            <option value="af3" selected>AlphaFold 3</option>
+                        </select>
+                    </div>
+                    <div class="hunt-field">
+                        <label for="af3-mode">Sampler</label>
+                        <select id="af3-mode">
+                            <option value="flow" selected>Flow</option>
+                            <option value="diffusion">Diffusion</option>
+                        </select>
+                    </div>
+                    <div class="hunt-field">
+                        <label for="steps" id="steps-label">Steps</label>
+                        <select id="steps"></select>
+                    </div>
+                    <!-- 🔴 ZERO BY DEFAULT, WHICH IS NOT index.html's DEFAULT.
+                         A recycle is a whole extra trunk pass, and this page
+                         runs one fold per cycle per design - so a recycle is
+                         multiplied by everything. The loop's own iteration is
+                         where its quality comes from here. -->
+                    <div class="hunt-field">
+                        <label for="recycles">Recycles</label>
+                        <select id="recycles">
+                            <option value="0" selected>0</option>
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                        </select>
                     </div>
                     <div class="hunt-field">
                         <label for="omit">Omit</label>
@@ -198,6 +240,15 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                         <input type="checkbox" id="alanine-bias">
                         <label for="alanine-bias">Alanine bias ramp</label>
                     </div>
+                    <!-- Every sampler step of every cycle becomes a frame, so
+                         the play bar walks the diffusion itself and not just
+                         the structures it settled to. Off keeps one frame per
+                         cycle, which is a shorter thing to scrub through on a
+                         long hunt. -->
+                    <div class="hunt-field hunt-check">
+                        <input type="checkbox" id="diffusion-frames" checked>
+                        <label for="diffusion-frames">Keep diffusion steps</label>
+                    </div>
                     <!-- 🔴 AUTO IS THE REFERENCE'S OWN RULE, not a heuristic
                          this page invented: boltz_ph/pipeline.py picks
                          LigandMPNN when there is a ligand or a nucleic chain
@@ -206,7 +257,7 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                          why rather than silently changing this control. -->
                     <div class="hunt-field" style="grid-column: span 2;">
                         <label for="designer">Designer</label>
-                        <select id="designer" style="height: 28px; padding: 0 6px; font-size: 13px; border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a; min-width: 0;">
+                        <select id="designer">
                             <option value="auto" selected>Auto</option>
                         </select>
                         <span id="designer-note" style="font-size: 11px; color: #64748b;"></span>
@@ -235,6 +286,31 @@ AI Context: THE DESIGN LOOP'S ENTRY POINT
                  still worth reading - which cycle it peaked at says whether
                  more cycles would help - and clicking a row puts that cycle's
                  structure back in the viewer. -->
+            <!-- index.html's confidence card, which follows the play bar:
+                 scrubbing to a cycle shows THAT cycle's numbers rather than
+                 the last one's. The markup is its markup and the classes are
+                 py2Dmol's; web/scores-card.js is the shared code. -->
+            <div id="predictionScoresBox" class="container-box" style="display: none;">
+                <div class="scores-card-grid" id="scoresCardGrid">
+                    <div class="score-metric-cell">
+                        <div class="score-metric-label">pLDDT</div>
+                        <div id="metricMeanPlddt" class="score-metric-value">-</div>
+                    </div>
+                    <div class="score-metric-cell">
+                        <div class="score-metric-label">pTM</div>
+                        <div id="metricPtm" class="score-metric-value">-</div>
+                    </div>
+                    <div id="metricIptmCell" class="score-metric-cell" style="display: none;">
+                        <div class="score-metric-label">ipTM</div>
+                        <div id="metricIptm" class="score-metric-value">-</div>
+                    </div>
+                    <div id="metricMultimerCell" class="score-metric-cell" style="display: none;">
+                        <div class="score-metric-label">Ranking</div>
+                        <div id="metricMultimer" class="score-metric-value">-</div>
+                    </div>
+                </div>
+            </div>
+
             <div id="results" class="container-box page-width" style="padding: 8px;" hidden>
                 <table>
                     <thead>
