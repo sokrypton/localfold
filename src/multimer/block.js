@@ -25,7 +25,6 @@ import {
   attentionProjectTileColumns,
   attentionProjectTileRows,
   attentionOutputTileRows,
-  ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
   selectAttentionProjectKernel,
   selectAttentionOutputKernel,

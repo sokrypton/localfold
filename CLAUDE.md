@@ -103,6 +103,15 @@ the result as `container.style.width`. Our narrow block gives that box
 instead of taking the whole document with it - measured, it was forcing a 972px
 layout viewport on a 320px phone. Fixing it properly is an upstream change.
 
+🔴 **AND A DIFFERENTIAL CHECKER THAT BUILDS ITS OWN KERNEL TESTS WHATEVER IT
+BUILT.** Four of them did this session, each found the same way: a shipped path
+learned to pick between an f32 and an f16 kernel, the checker went on
+constructing the f32 one from a module constant, and the arm labelled "f32" was
+either testing a kernel nothing runs or - once - silently testing the f16 one
+and failing. Ask the selection function for the kernel, take the precision as
+an axis, and hold each arm to the bound its own arithmetic implies. Raising one
+bound to cover both stops the f32 path being checked at all.
+
 🔴 **AND AF2 NOW HAS AN END-TO-END GATE, WHICH THE DIFFERENTIAL ONES ARE NOT.**
 A per-kernel checker says one kernel still computes its own operation. It
 cannot say the assembled model still folds, and after three kernel rewrites
