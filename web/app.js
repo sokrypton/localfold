@@ -1220,15 +1220,31 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
       };
-      // ...and the trunk's contact map, which every frame then resolves to.
-      const contact = result.contactProbs === undefined
-        ? undefined : contactMapFor(result.contactProbs);
+      // ...and frame zero's contact map, which is its OWN pass's when the
+      // trunk previews are there. See the loop below.
+      const firstProbs = previews.length > 0
+        ? result.previewContacts?.[0] : result.contactProbs;
+      const contact = firstProbs === undefined ? undefined : contactMapFor(firstProbs);
       if (contact !== undefined) first.maps = { ...first.maps, contact };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);
       const last = index === timeline.length - 2;
       frame.name = frame.label = frame.title = frameName(index + 1, last);
+      // 🔴 A CONTACT MAP PER TRUNK PASS, AND ONE FOR THE SAMPLER. The panel
+      // resolves a map by searching BACKWARD from the frame drawn, so a single
+      // map at frame 0 is the same picture for the whole playback - which is
+      // what it was. Every recycle has its own distogram, so every trunk frame
+      // carries its own and scrubbing them shows the model changing its mind.
+      // The sampler's frames all follow the finished trunk, so the first of
+      // them carries the final map and the rest resolve back to it.
+      const position = index + 1;
+      const probs = position < previews.length ? result.previewContacts?.[position]
+        : (position === previews.length ? result.contactProbs : undefined);
+      if (probs !== undefined) {
+        const map = contactMapFor(probs);
+        if (map !== undefined) frame.maps = { ...frame.maps, contact: map };
+      }
       // 🔴 THE FRAME'S OWN NUMBER, NOT THE FINISHED ONE. Every frame used to
       // carry `result.confidence`, so scrubbing the trajectory showed the final
       // pLDDT on a structure that had not reached it. An intermediate frame now

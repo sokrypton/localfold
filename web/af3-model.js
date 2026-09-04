@@ -427,6 +427,10 @@ export async function foldAf3(options) {
   // cheaper than a jump at the end of the animation.
   let liveConfidence = null;
   const previewPdbs = [];
+  // ...and the distogram each preview belongs to, so a trunk frame can carry
+  // the contact map of ITS pass rather than the last one's.
+  const previewContacts = [];
+  let latestContacts;
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
@@ -445,6 +449,7 @@ export async function foldAf3(options) {
       // they are handed back with the rest and the replay rebuilds them in
       // order rather than throwing away the only record of the trunk.
       previewPdbs.push(pdb);
+      previewContacts.push(latestContacts);
       await options.onPreview({ pdb, pass: preview.pass, passes: preview.passes });
       await yieldToBrowser();
     },
@@ -458,6 +463,7 @@ export async function foldAf3(options) {
         // than appearing once at the end. AF3 runs every recycle before the
         // sampler emits a single frame, so for the longest part of a fold this
         // is the only thing the model has to show.
+        latestContacts = detail.trunk.contactProbs;
         options.onContacts?.(detail.trunk.contactProbs, detail.pass, detail.passes);
       }
       if (name === "trunk-done") {
@@ -675,6 +681,7 @@ export async function foldAf3(options) {
     framePdbs,
     // One per recycle, in order, before the sampler's first frame.
     previewPdbs,
+    previewContacts,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,
