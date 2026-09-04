@@ -154,7 +154,11 @@ export async function main(device, args) {
   // kernel being checked at all. Both are run, each against the same CPU
   // reference, each at the tolerance its arithmetic implies.
   const precisions = option(args, "precision", "f32,auto").split(",");
-  const bounds = { f32: 1e-5, chunk16: 2e-3, f16: 8e-3 };
+  // 🔴 THE PROJECTION'S 2.4e-3 IS THE LARGER HALF OF THE f16 ARM, not the
+  // staged tile's 2.0e-4, so the bound is set by it. Both are storage formats
+  // for q, k, v and the gate; AF2's own inference runs in bfloat16, whose eight
+  // mantissa bits are looser again.
+  const bounds = { f32: 1e-5, chunk16: 4e-3, f16: 8e-3 };
   const results = [];
   let failed = 0;
   for (const requested of precisions) {
@@ -173,7 +177,14 @@ export async function main(device, args) {
 
 async function check(device, input, precision, bound) {
   const { batch, queryLength, channels, heads } = input;
-  const { output } = await new AttentionGpu(device, { flashPrecision: precision }).run(input);
+  // 🔴 ONE WORD FOR BOTH HALVES. The flash kernel stages its key and value in
+  // f16 and the projection accumulates in it; an arm that narrowed one and not
+  // the other would report a number belonging to neither shipped path, and an
+  // "f32" arm that left the projection in f16 would not be checking f32 at all.
+  const { output } = await new AttentionGpu(device, {
+    flashPrecision: precision === "f32" ? "f32" : "chunk16",
+    projectPrecision: precision === "f32" ? "f32" : "f16",
+  }).run(input);
   const expected = reference(input);
   let error = 0;
   let scale = 0;

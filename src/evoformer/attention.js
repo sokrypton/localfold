@@ -201,8 +201,20 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  * the scalar-source form it replaced - which is the shape of every tile sweep
  * in this repo and the reason none of them is left to a guess.
  */
-export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
+export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE, precision = "f32") {
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
+  if (!["f32", "f16"].includes(precision)) {
+    throw new RangeError(`unknown attention project precision ${precision}`);
+  }
+  // 🔴 IN f16 THE ACCUMULATORS ARE HALF THE REGISTERS, WHICH IS THE ONLY THING
+  // THAT COULD MOVE THIS KERNEL'S CEILING. The sweep below says the budget and
+  // not the traffic decides its tile, and that sixteen vec4 spills - so a wider
+  // tile, which halves the weight traffic, is only reachable if the
+  // accumulators get smaller. The bias and the store stay f32.
+  const half = precision === "f16";
+  const vector = half ? "vec4<f16>" : "vec4<f32>";
+  const narrow = (e) => (half ? `f16(${e})` : e);
+  const widen = (e) => (half ? `f32(${e})` : e);
   if (rowsPerLane % 4 !== 0) throw new RangeError("project tile rowsPerLane must be a multiple of 4");
   const lanes = lanesX * lanesY;
   const step = lanesY;
@@ -215,7 +227,7 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
   for (let r = 0; r < rowsPerLane; r += 1) {
     for (let v = 0; v < columnsPerLane; v += 1) {
       // ...the gate's bias rides in the w lane, as it did before.
-      declare.push(`  var acc_${r}_${v} = vec4<f32>(0.0, 0.0, 0.0, bias_${v});`);
+      declare.push(`  var acc_${r}_${v} = ${vector}(0.0, 0.0, 0.0, ${narrow(`bias_${v}`)});`);
     }
   }
   const bias = [];
@@ -250,11 +262,11 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
       let k_local = task % ${step}u;
       let c = c0 + k_local;
       let row_base = group.y * ${tileRows}u + row_group * 4u;
-      var staged = vec4<f32>(0.0);
+      var staged = ${vector}(0.0);
       if (c < p.channels) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < rows) { staged[j] = source[row * p.channels + c]; }
+          if (row < rows) { staged[j] = ${narrow("source[row * p.channels + c]")}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -264,14 +276,14 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
   const stageWeight = [];
   for (let v = 0; v < columnsPerLane; v += 1) {
     stageWeight.push(`    {
-      var packed = vec4<f32>(0.0);
+      var packed = ${vector}(0.0);
       let output_hd = column_origin + ${v * lanesX}u;
       if (output_hd < projected && weight_c < p.channels) {
         let weight_index = weight_c * projected + output_hd;
-        packed = vec4<f32>(weights[p.query_weight + weight_index],
-                           weights[p.key_weight + weight_index],
-                           weights[p.value_weight + weight_index],
-                           weights[p.gating_weight + weight_index]);
+        packed = ${vector}(${narrow("weights[p.query_weight + weight_index]")},
+                           ${narrow("weights[p.key_weight + weight_index]")},
+                           ${narrow("weights[p.value_weight + weight_index]")},
+                           ${narrow("weights[p.gating_weight + weight_index]")});
       }
       tile_weight[local.y * ${lanesX * columnsPerLane}u + local.x * ${columnsPerLane}u + ${v}u] = packed;
     }`);
@@ -283,10 +295,10 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE) {
     for (let v = 0; v < columnsPerLane; v += 1) {
       body.push(`    if (hd_${v} < projected) {
       let index = row_${r} * projected + hd_${v};
-      query[index] = acc_${r}_${v}.x * inverseSqrt(f32(p.head_dim));
-      key[index] = acc_${r}_${v}.y;
-      value[index] = acc_${r}_${v}.z;
-      gate[index] = 1.0 / (1.0 + exp(-acc_${r}_${v}.w));
+      query[index] = ${widen(`acc_${r}_${v}.x`)} * inverseSqrt(f32(p.head_dim));
+      key[index] = ${widen(`acc_${r}_${v}.y`)};
+      value[index] = ${widen(`acc_${r}_${v}.z`)};
+      gate[index] = 1.0 / (1.0 + exp(-${widen(`acc_${r}_${v}.w`)}));
     }`);
     }
     store.push(`  {
@@ -297,7 +309,7 @@ ${body.join("\n")}
   }`);
   }
 
-  return `${COMMON}
+  return `${half ? "enable f16;\n" : ""}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -307,9 +319,9 @@ ${body.join("\n")}
 @group(0) @binding(6) var<storage, read_write> gate: array<f32>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
-var<workgroup> tile_source: array<vec4<f32>, ${step * rowVectors}>;
+var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
 // One vec4 a cell: (query, key, value, gate), laid out per thread.
-var<workgroup> tile_weight: array<vec4<f32>, ${step * lanesX * columnsPerLane}>;
+var<workgroup> tile_weight: array<${vector}, ${step * lanesX * columnsPerLane}>;
 
 @compute @workgroup_size(${lanesX}, ${lanesY}, 1)
 fn main(
@@ -337,6 +349,58 @@ ${store.join("\n")}
 }
 
 export const ATTENTION_PROJECT_SHADER = createAttentionProjectShader();
+
+/**
+ * The wider tile the f16 accumulators pay for, and its shader.
+ *
+ * 🔴 THE TILE AND THE PRECISION ARE ONE CHOICE, NOT TWO. The sweep above says
+ * this kernel is bound by its register budget - it holds `rowsPerLane *
+ * columnsPerLane` vec4 accumulators where every other kernel here holds a
+ * quarter as many - and that a 32x32 tile SPILLS in f32 and is then slower than
+ * the 32x16 one. In f16 the accumulators are half the registers, the same tile
+ * fits, and it is the fastest arm there is. Measured on the block's own shape
+ * (30,208 rows, 256 channels, 8 heads of 32) by
+ * tools/gpu/bench-attention-project.js:
+ *
+ *     f32   32x16  13.79 ms    32x32  19.24 ms   (spilling)
+ *     f16   32x32   9.80        32x16 10.23      64x16 10.95
+ *
+ * 1.41x on the best f32 arm, and only reachable by changing both together -
+ * which is why the two travel in one object rather than as two options.
+ *
+ * The error is 2.4e-3 on q, k, v and the gate, and it is a storage format for
+ * them rather than a change of model: AF2's own inference runs in bfloat16,
+ * whose eight mantissa bits are looser again. End to end
+ * (tools/gpu/fold-af2.js): at 128 rows pLDDT 57.284 -> 57.300 with pTM and the
+ * CA-CA median unchanged to four and three decimals, and 1619 -> 1529 ms; at
+ * 512 rows 5285 -> 4920 ms.
+ */
+export const ATTENTION_PROJECT_TILE_F16 = {
+  lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
+};
+
+/**
+ * @param {"auto"|"f32"|"f16"} requested `auto` takes f16 wherever the device
+ *   has shader-f16, which is where the wider tile is affordable.
+ */
+export function selectAttentionProjectKernel(device, requested = "auto") {
+  const precision = requested !== "auto" ? requested
+    : device?.features?.has("shader-f16") ? "f16" : "f32";
+  if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
+    throw new Error("the f16 attention projection requires the shader-f16 feature");
+  }
+  const tile = precision === "f16" ? ATTENTION_PROJECT_TILE_F16 : ATTENTION_PROJECT_TILE;
+  return {
+    precision, tile,
+    // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
+    // divides by it: a cache that handed back the other one would leave whole
+    // tiles of rows unprojected, which reads as a speedup.
+    cacheKey: `block:attention:project:${precision}`
+      + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`,
+    shader: precision === "f16"
+      ? createAttentionProjectShader(tile, "f16") : ATTENTION_PROJECT_SHADER,
+  };
+}
 
 export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
@@ -1498,9 +1562,11 @@ export class AttentionGpu {
       this.device, input.channels / input.heads, this.options.flashVariant ?? "auto",
       this.options.flashPrecision ?? "auto",
     );
+    const projectKernel = selectAttentionProjectKernel(
+      this.device, this.options.projectPrecision ?? "auto");
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
-      this.pipelines.get("attention:project", ATTENTION_PROJECT_SHADER),
+      this.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
       this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
       this.pipelines.get("attention:output", ATTENTION_OUTPUT_SHADER),
@@ -1578,8 +1644,8 @@ export class AttentionGpu {
           pairGrid[0], pairGrid[1]);
       }
       pass(project, [normalized.buffer, weights.buffer, params.buffer, query.buffer, key.buffer, value.buffer, gate.buffer],
-        ceilDivide(input.channels, attentionProjectTileColumns()),
-        ceilDivide(rows, attentionProjectTileRows()));
+        ceilDivide(input.channels, attentionProjectTileColumns(projectKernel.tile)),
+        ceilDivide(rows, attentionProjectTileRows(projectKernel.tile)));
       pass(flash, [query.buffer, key.buffer, value.buffer, gate.buffer, mask.buffer, pairBias.buffer, params.buffer,
         weighted.buffer], ceilDivide(input.queryLength, flashKernel.queryTile),
         input.batch, input.heads);

@@ -28,7 +28,7 @@ import {
   attentionOutputTileRows,
   ATTENTION_OUTPUT_RESIDUAL_SHADER,
   ATTENTION_PAIR_BIAS_SHADER,
-  ATTENTION_PROJECT_SHADER,
+  selectAttentionProjectKernel,
   createAttentionNormParameters,
   createAttentionParameters,
   packAttentionWeights,
@@ -311,9 +311,14 @@ async function encodeAttention(
     execution, execution.device, options.channels / options.heads);
   const flashKernel = built.kernel;
   const flash = built.pipeline;
+  // 🔴 THE PROJECTION'S TILE TRAVELS WITH ITS SHADER, because the dispatch
+  // below divides by it and the two shapes differ by precision - see
+  // selectAttentionProjectKernel.
+  const projectKernel = selectAttentionProjectKernel(
+    execution.device, options.projectPrecision ?? "auto");
   const [normalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
-    execution.pipelines.get("block:attention:project", ATTENTION_PROJECT_SHADER),
+    execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
     execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
     execution.pipelines.get(
       options.residualTarget === undefined ? "block:attention:output" : "block:attention:output-residual",
@@ -363,8 +368,8 @@ async function encodeAttention(
       grid[0], grid[1], 1, `${options.label}.pair-bias`);
   }
   execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
-    Math.ceil(options.channels / attentionProjectTileColumns()),
-    Math.ceil(rows / attentionProjectTileRows()), 1,
+    Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
+    Math.ceil(rows / attentionProjectTileRows(projectKernel.tile)), 1,
     `${options.label}.project`);
   execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
     Math.ceil(options.queries / flashKernel.queryTile),
