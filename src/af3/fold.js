@@ -418,8 +418,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const trunkGpu = new Af3TrunkGpu(device);
   // 🔴 THE CONDITIONING AND THE HEAD INPUT DO NOT DEPEND ON THE TRUNK, so they
   // are built once, above the recycle loop. Only `trunkSingle` and `trunkPair`
-  // move, which is what lets a single denoiser call run against ANY pass -
-  // the preview below.
+  // move.
   //
   // 🔴 THE DIFFUSION HEAD HAS ITS OWN FIVE REFERENCE EMBEDDINGS - same shapes
   // as the conditioning module's, different weights. Reusing one for both
@@ -439,20 +438,22 @@ export async function foldBatch(device, batch, weights, options = {}) {
     tokensToQueries: batch.tokensToQueries,
     tokensToKeys: batch.tokensToKeys,
   };
-  // 🔴 TWO CYCLES, NOT ONE. A single call from sigma0 is the head's
-  // conditional mean under a lot of noise and it LOOKS it - the backbone is
-  // there but loose. The second cycle costs one more denoiser call, which is
-  // 0.11 s at 58 tokens against a trunk pass of seconds, and is the difference
-  // between a preview that reads as a structure and one that reads as a
-  // mistake. More than two buys little: the schedule is walked in whatever
-  // number of steps it is given, so the preview is a coarse walk either way.
-  const PREVIEW_CYCLES = 2;
-  // 🔴 ONE HEAD FOR THE WHOLE FOLD, because building one compiles its
-  // pipelines - 730 ms, flat in the shape - and a preview per recycle would
-  // pay that every pass. Built only when something asks for previews; the
-  // sampler borrows it either way, so the compile happens once and earlier.
-  const wantsPreview = typeof options.onPreview === "function" && steps > 0;
-  const head = wantsPreview ? new Af3DiffusionHeadGpu(device) : undefined;
+  // 🔴 THERE ARE NO STRUCTURES DURING THE TRUNK ANY MORE. Each recycle used to
+  // be followed by a two-cycle flow against that pass's trunk - a real
+  // backbone, and the only structure anyone could be shown while the trunk was
+  // still running. It was removed because of what it did to the VIEWER rather
+  // than to the fold: every preview is a fresh structure in the object, so the
+  // camera reframed on each one and a continuation had to carry them forward
+  // to avoid losing them. The trunk's own contact map moves per recycle and is
+  // free - the distogram is already computed and already read back - so the
+  // recycles are watched through the heatmap panel instead, and the viewer
+  // shows nothing until the sampler produces the first real frame.
+  //
+  // 🔴 ONE HEAD, BUILT ABOVE THE RECYCLE LOOP, because building one compiles
+  // its pipelines - 730 ms, flat in the shape - and doing that here overlaps
+  // the compile with the trunk instead of paying it when the sampler starts.
+  // Both samplers borrow it rather than building their own.
+  const head = steps > 0 ? new Af3DiffusionHeadGpu(device) : undefined;
 
   let trunk = reused?.trunk;
   let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
@@ -504,39 +505,6 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // worth showing: it is the one thing the model knows during the longest
     // part of a fold.
     await stage("recycle-done", { pass, passes: recycles + 1, trunk });
-    // 🔴 ONE DENOISER CALL AGAINST THIS PASS'S TRUNK, WHICH IS A STRUCTURE.
-    // `flowOnGpu` at one cycle seeds the positions at sigma0 and makes a
-    // single call told the level is sigma0, and what comes back is the head's
-    // DENOISED prediction - a real backbone, not a noisy walk. AF3's own
-    // sampler at one step returns the walk instead, which is a 2234 A cloud.
-    //
-    // It costs one call - 0.11 s at 58 tokens, 0.77 s at 444 - against a trunk
-    // pass of seconds, and it is the only structure anyone can be shown while
-    // the trunk is still recycling.
-    // 🔴 NOT AFTER THE LAST PASS, because the real sampler is that pass's
-    // preview. Every recycle is followed by a walk down the schedule; the
-    // intermediate ones get two cycles and the final one gets all `steps` of
-    // them, and there is no reason for the last pass to have both. It used to,
-    // which put a two-step frame immediately before the sixteen-step run over
-    // the same trunk - the same picture twice, the first one worse.
-    if (wantsPreview && pass < recycles) {
-      try {
-        const preview = await flowOnGpu(device,
-          { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair },
-          weights.diffusion,
-          // 🔴 THE SAME DRAW EVERY PASS, so what changes between previews is
-          // the TRUNK and not the noise. Seeded per pass they differed for two
-          // reasons at once and the sequence was not monotone - measured 20.2,
-          // 23.1, 28.2 then 15.1 on a four-pass fold, which reads as the model
-          // getting worse when it was the draw that moved.
-          { cycles: PREVIEW_CYCLES, head, normal: normalFrom(options.seed ?? 20260831),
-            ...(options.schedule ?? {}) });
-        await options.onPreview({ positions: preview, pass, passes: recycles + 1 });
-      } catch (cause) {
-        // A preview is a picture. Losing the fold to one would be a bad trade.
-        console.warn("recycle preview unavailable", cause);
-      }
-    }
   }
   // 🔴 THE REUSABLE TRUNK RIDES ON trunk-done, NOT ONLY ON THE RETURN. A fold
   // that fails AFTER this point - the memory ceiling refusing the sampler is
@@ -571,8 +539,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
       });
 
   // 🔴 THE BORROWED HEAD IS RELEASED HERE, because the samplers no longer do
-  // it for one they did not build. Without this a fold with previews leaks the
-  // diffusion head's device buffers for the life of the page.
+  // it for one they did not build. Without this a fold leaks the diffusion
+  // head's device buffers for the life of the page.
   head?.dispose();
 
   // The confidence head reads the sample back.

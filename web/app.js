@@ -1125,14 +1125,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
   const continued = reuse !== undefined && reuse.recycles < recycles;
   // 🔴 A CONTINUATION REWINDS RATHER THAN RESTARTS. Asking for more recycles
-  // reuses the trunk and runs only the passes that are missing - so the frames
-  // the earlier passes produced are still true, and only the SAMPLER's are
-  // stale. They are carried over and the new ones appended, which is the same
-  // thing the trunk cache does for the tensors. Re-sampling at the SAME
-  // recycle count carries them too: without this a re-fold silently produced a
-  // shorter trajectory than the first one, because no pass ran to preview.
-  const carriedPreviews = reuse !== undefined ? (trunkCache?.previews ?? []) : [];
-  const carriedContacts = reuse !== undefined ? (trunkCache?.contacts ?? []) : [];
+  // reuses the trunk and runs only the passes that are missing.
 
   status("Loading AlphaFold 3 · 0 MiB");
   const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
@@ -1152,12 +1145,18 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // run's frames came to be in front of this one's: safeJobName(header) does
   // not change between folds, so every fold reopened the SAME object. The AF2
   // path has always uniquified; this one never did.
-  const stem = uniqueStem(header !== null ? safeJobName(header) : `af3_${predictionCount}`);
+  //
+  // 🔴 A CONTINUATION REWINDS THE OBJECT IT ALREADY HAS, as the AF2 path does,
+  // and for the same reason: opening a new one resets the camera. There is
+  // nothing to carry forward now that the trunk draws no structures - the
+  // whole trajectory is the sampler's and it is re-run either way - so the
+  // rewind is simply an empty object under the name already on screen.
+  const stem = reuse === undefined
+    ? uniqueStem(header !== null ? safeJobName(header) : `af3_${predictionCount}`)
+    : trunkCache.stem;
   // ...and the view goes blank first, so the trunk is not spent showing the
   // previous fold. See openBlankFold.
-  // ...rewound to the frames a continuation keeps, or blank when there are
-  // none. See openBlankFold.
-  openBlankFold(stem, carriedPreviews);
+  openBlankFold(stem);
   // See the note in the AF2 path: dropping the handle is what stops the
   // score-card poll refilling from the object still on screen.
   viewer = undefined;
@@ -1177,7 +1176,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
    * blinked, and the heatmap panel lost the frame its map was on. Nothing here
    * is specific to which half of the fold produced the frame.
    */
-  let liveTrunk = 0;
   let liveSampler = 0;
   const drawLiveFrame = (pdb, kind) => {
     if (signal.aborted || api?.frameFromText === undefined) return;
@@ -1191,11 +1189,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // a container that is actually on screen.
       if (index === 0) revealViewer(renderer);
       const frame = api.frameFromText(pdb);
-      // ...numbered within their own half of the fold, not by their position
-      // in a list that is still growing - the sampler's first frame is its
-      // zeroth, however many previews came before it.
-      frame.name = frame.label = frame.title = kind === "trunk"
-        ? `trunk_${(liveTrunk += 1)}` : `${kind}_${liveSampler++}`;
+      // ...numbered by the sampler's own count. Every frame in the object is
+      // the sampler's now; the trunk draws none.
+      frame.name = frame.label = frame.title = `${kind}_${liveSampler++}`;
       // ...and the map of the pass that produced it, so the panel has
       // something to resolve on every frame rather than only the first.
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
@@ -1203,8 +1199,17 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       renderer.setFrame(object.frames.length - 1);
       if (index === 0) {
         // The camera and the palette are set on the FIRST thing drawn, or the
-        // trunk is watched from the default view in rainbow.
-        orientBestView(renderer);
+        // fold is watched from the default view in rainbow.
+        //
+        // 🔴 EXCEPT ON A CONTINUATION, WHICH KEEPS THE VIEW THE READER HAS.
+        // A rewind empties the object it is continuing, so the first frame of
+        // the new sampler run is index 0 and this fired - flying the camera to
+        // the best view of a structure the reader was already looking at.
+        // Measured across a continuation, the rotation moved from
+        // [0.837, 0.153, 0.526] to [0.797, 0.195, 0.571]: a small tilt, and a
+        // tilt nobody asked for. The centre and the focal length still follow
+        // the molecule, because a re-sample really does land somewhere else.
+        if (reuse === undefined) orientBestView(renderer);
         forcePlddtColours(renderer);
         oriented = true;
       }
@@ -1225,8 +1230,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     onTrunk: (reusable) => {
       // ...the carried previews stay with it: they belong to passes this trunk
       // has already run, and a continuation must not lose them.
-      trunkCache = { key: trunkKey, reusable, previews: carriedPreviews,
-        contacts: carriedContacts };
+      trunkCache = { key: trunkKey, reusable, stem };
     },
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
@@ -1265,7 +1269,6 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // backbone. Each preview REPLACES the last: they are the same structure
     // getting better, not a trajectory, and leaving them stacked would put
     // four of them in front of the real one on the play bar.
-    onPreview: ({ pdb }) => { drawLiveFrame(pdb, "trunk"); },
     // 🔴 THE SAMPLER'S FRAMES GO THE SAME WAY THE PREVIEWS DO. This called
     // loadIntoViewer for index 0 - the virtual-FILE path - which rebuilds the
     // object: the trunk's previews were discarded at that moment, the
@@ -1285,9 +1288,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // ...`onTrunk` above has already cached this, and it is the same object.
   // Kept for the next fold, and kept even when it was itself reused, so a run
   // of re-samples all skip the trunk rather than only the first.
-  trunkCache = { key: trunkKey, reusable: result.reusable,
-    previews: [...carriedPreviews, ...(result.previewPdbs ?? [])],
-    contacts: [...carriedContacts, ...(result.previewContacts ?? [])] };
+  trunkCache = { key: trunkKey, reusable: result.reusable, stem };
 
   // 🔴 THE HANDLES ARE ACQUIRED HERE, because nothing during the fold sets
   // them any more. drawLiveFrame reaches the renderer through the registry so
@@ -1323,19 +1324,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // they agree to a fraction of an angstrom - so appending made a redundant
     // extra frame and a play bar that ended on the same picture twice. The
     // returned structure is the authoritative one, so it takes that slot.
-    // 🔴 THE PREVIEWS ARE PART OF THE TRAJECTORY. One per recycle, before the
-    // sampler's first frame - the structure the model believed at each pass -
-    // so the play bar runs the whole fold rather than starting where the trunk
-    // finished. They are prepended here so the rebuild below keeps the order
-    // the live fold drew them in.
-    const previews = [...carriedPreviews, ...(result.previewPdbs ?? [])];
-    const timeline = [...previews, ...result.framePdbs.slice(0, -1), result.pdb];
-    /** What a frame is called: the trunk's passes, then the sampler's calls. */
-    const frameName = (index, last) => {
-      if (last) return "final";
-      if (index < previews.length) return `trunk_${index + 1}`;
-      return `${mode}_${index - previews.length}`;
-    };
+    // 🔴 THE TRAJECTORY IS THE SAMPLER'S, AND ONLY THE SAMPLER'S. The trunk
+    // used to contribute one frame per recycle; it draws no structures now, so
+    // the play bar starts where the sampler does. The recycles are watched
+    // through the contact map instead, which moves per pass and costs nothing.
+    const timeline = [...result.framePdbs.slice(0, -1), result.pdb];
+    /** What a frame is called: the sampler's calls, then the answer. */
+    const frameName = (index, last) => (last ? "final" : `${mode}_${index}`);
     const camera = { ...(viewer?.viewerState ?? {}) };
     // ...and the live frames are dropped first. They are the same structures,
     // drawn with the uncalibrated colour and named by their position in a list
@@ -1390,32 +1385,21 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
       };
-      // ...and frame zero's contact map, which is its OWN pass's when the
-      // trunk previews are there. See the loop below.
-      const firstProbs = previews.length > 0
-        ? [...carriedContacts, ...(result.previewContacts ?? [])][0] : result.contactProbs;
-      const contact = firstProbs === undefined ? undefined : contactMapFor(firstProbs);
+      // ...and frame zero's contact map, which is the finished trunk's: every
+      // recycle is over before the sampler emits anything.
+      const contact = result.contactProbs === undefined
+        ? undefined : contactMapFor(result.contactProbs);
       if (contact !== undefined) first.maps = { ...first.maps, contact };
     }
     for (const [index, pdb] of timeline.slice(1).entries()) {
       const frame = api.frameFromText(pdb);
       const last = index === timeline.length - 2;
       frame.name = frame.label = frame.title = frameName(index + 1, last);
-      // 🔴 A CONTACT MAP PER TRUNK PASS, AND ONE FOR THE SAMPLER. The panel
-      // resolves a map by searching BACKWARD from the frame drawn, so a single
-      // map at frame 0 is the same picture for the whole playback - which is
-      // what it was. Every recycle has its own distogram, so every trunk frame
-      // carries its own and scrubbing them shows the model changing its mind.
-      // The sampler's frames all follow the finished trunk, so the first of
-      // them carries the final map and the rest resolve back to it.
-      const position = index + 1;
-      const allContacts = [...carriedContacts, ...(result.previewContacts ?? [])];
-      const probs = position < previews.length ? allContacts[position]
-        : (position === previews.length ? result.contactProbs : undefined);
-      if (probs !== undefined) {
-        const map = contactMapFor(probs);
-        if (map !== undefined) frame.maps = { ...frame.maps, contact: map };
-      }
+      // 🔴 NO MAP PAST FRAME ZERO, DELIBERATELY. The trunk finishes before the
+      // sampler emits anything, so every frame of this trajectory has the same
+      // contact map - and the panel resolves a map by searching BACKWARD from
+      // the frame drawn, so carrying it once at frame 0 is exactly right and
+      // repeating it would be the same picture stored sixteen times.
       // 🔴 THE FRAME'S OWN NUMBER, NOT THE FINISHED ONE. Every frame used to
       // carry `result.confidence`, so scrubbing the trajectory showed the final
       // pLDDT on a structure that had not reached it. An intermediate frame now

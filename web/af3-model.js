@@ -208,8 +208,6 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
  *          onTrunk?: (reusable: object) => void,
  *          onContacts?: (contactProbs: Float32Array, pass?: number,
  *                        passes?: number) => void,
- *          onPreview?: (preview: {pdb: string, pass: number,
- *                                 passes: number}) => void|Promise<void>,
  *          schedule?: {sigmaMax?: number, sigmaMin?: number, rho?: number},
  *          onStatus: (text: string) => void, onProgress: (fraction: number) => void,
  *          onFrame?: (pdb: string, index: number) => void}} options
@@ -376,38 +374,9 @@ export async function foldAf3(options) {
   // on a step - 76.3 to 96.6 on trp-cage - and that is the frame everyone
   // looks at. A difference between a transient live frame and its replay is
   // cheaper than a jump at the end of the animation.
-  const previewPdbs = [];
-  // 🔴 THE POSITIONS TOO, because the PDB written during the fold carries the
-  // RAW estimate - there is no calibration until the fold has finished - and
-  // the finished trajectory must be one scale. See below.
-  const previewPositions = [];
-  // ...and the distogram each preview belongs to, so a trunk frame can carry
-  // the contact map of ITS pass rather than the last one's.
-  const previewContacts = [];
-  let latestContacts;
 
   const result = await foldBatch(device, batch, options.weights, {
     mode, steps: calls, recycles, seed, reuse: options.reuse,
-    // 🔴 ONE STRUCTURE PER RECYCLE, WHILE THE TRUNK IS STILL RUNNING. See
-    // fold.js: a single flow cycle against that pass's trunk is a real
-    // backbone, and it is the only structure that exists before the sampler
-    // starts. Written as a PDB here, like every other frame, so the page draws
-    // it the same way - and uncoloured, because nothing has measured this
-    // structure's confidence and the ramp's red is what "not known" looks
-    // like here.
-    onPreview: options.onPreview === undefined ? undefined : async (preview) => {
-      if (reference === null) reference = toPoints(preview.positions, batch.tokens * batch.dense);
-      const pdb = fittedPdb(batch, preview.positions, reference, slots, null);
-      // 🔴 KEPT, NOT JUST SHOWN. The previews are frames of the same
-      // trajectory - the structure the model believed at each recycle - so
-      // they are handed back with the rest and the replay rebuilds them in
-      // order rather than throwing away the only record of the trunk.
-      previewPdbs.push(pdb);
-      previewPositions.push(Float32Array.from(preview.positions));
-      previewContacts.push(latestContacts);
-      await options.onPreview({ pdb, pass: preview.pass, passes: preview.passes });
-      await yieldToBrowser();
-    },
     // ...forwarded for probes that move the noise schedule. Unset for a page
     // fold, which is AF3's own for the sampler and 160 A for the flow.
     schedule: options.schedule,
@@ -418,7 +387,6 @@ export async function foldAf3(options) {
         // than appearing once at the end. AF3 runs every recycle before the
         // sampler emits a single frame, so for the longest part of a fold this
         // is the only thing the model has to show.
-        latestContacts = detail.trunk.contactProbs;
         options.onContacts?.(detail.trunk.contactProbs, detail.pass, detail.passes);
       }
       if (name === "trunk-done") {
@@ -539,8 +507,6 @@ export async function foldAf3(options) {
   // the animation jump on its last frame.
   const framePdbs = trajectory.map(
     (positions) => fittedPdb(batch, positions, reference, slots, null));
-  const previewFrames = previewPositions.map(
-    (positions) => fittedPdb(batch, positions, reference, slots, null));
   // ...and the finished structure keeps the REAL pLDDT, which is the one
   // number here that is a claim about the prediction rather than a colour.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
@@ -557,10 +523,6 @@ export async function foldAf3(options) {
     // the trunk does rather than after the confidence head.
     contactProbs: result.trunk.contactProbs,
     framePdbs,
-    // One per recycle, in order, before the sampler's first frame, and
-    // uncoloured like the sampler's own frames.
-    previewPdbs: previewFrames,
-    previewContacts,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,

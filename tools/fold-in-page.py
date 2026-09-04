@@ -264,9 +264,18 @@ def main():
             if json.loads(second).get("current") == first_object:
                 was = json.loads(camera_before)
                 now = json.loads(camera_after)
-                for field in ("rot0", "center", "zoom", "focal"):
+                # 🔴 ORIENTATION AND ZOOM ONLY. The centre and the focal
+                # length are derived from the structure - a continuation that
+                # re-samples really does land somewhere else, and following it
+                # is right - but the ROTATION is the reader's, and moving it is
+                # what reads as the view jumping.
+                for field in ("rot0", "zoom"):
                     if was[field] != now[field]:
                         print("FAIL: a rewind moved the camera's %s: %r -> %r"
+                              % (field, was[field], now[field]))
+                for field in ("center", "focal"):
+                    if was[field] != now[field]:
+                        print("note: %s followed the structure: %r -> %r"
                               % (field, was[field], now[field]))
             print("2status:", cdp.evaluate(ws,
                 "(document.getElementById('status-message')||{}).textContent"))
