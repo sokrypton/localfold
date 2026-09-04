@@ -390,6 +390,14 @@ What worked, in order of size:
    have; they enter through bias-free linears of layer-normed values, so zeros
    contribute exactly zero. Checked by `check-af3-target-feat-gpu.js`.
 
+7. **f16 accumulators in the two triangle projections**, 2026-09-04.
+   `tri.project` and `tri.project-out` are 23% of the trunk's GPU time between
+   them and hold their accumulators in WGSL ARRAYS - eight vec4 and eight vec2 -
+   which is the shape a driver spills first. In f16: **1.688 -> 1.087 ms and
+   1.250 -> 0.875** at 118 tokens, 1.55x and 1.43x, at the tile they already
+   had. As the pairformer's wall time: **118 tokens 180 -> 162 ms, 236
+   772 -> 702, 384 2200 -> 2034.** `accumulatePrecision`.
+
 6. **f16 for the staged workgroup blocks**, 2026-09-04. Grid attention's key and
    value tile and the pair transition's two blocks are read once per output by
    every lane, and narrowing them halves the workgroup memory that bounds the
@@ -447,6 +455,35 @@ Where the remaining time goes, at 59 tokens: 348 ms of dispatch work and 284 ms
 of per-block overhead that is **not** uploads (40 ms) and **not** bind groups
 (0 ms). About 5 ms a block in the encoder, submit and validation path is
 unexplained. That is the next lead and it is a small one.
+
+### The f16 budget, spent and accounted for
+
+Half precision is used in four places now, and it is worth seeing what they cost
+together rather than one at a time. The trunk against the all-f32 tree, 48
+blocks and real weights:
+
+| | pair | single | contact | logits |
+|---|---|---|---|---|
+| all f32 | 6.18e-7 | 6.21e-7 | 9.76e-5 | 4.46e-7 |
+| + staged tiles | 1.04e-5 | 2.91e-6 | 1.86e-4 | 6.83e-6 |
+| + resident weights | 1.04e-5 | 8.06e-5 | 1.86e-4 | - |
+| + triangle accumulators | 1.99e-5 | 8.06e-5 | 1.33e-3 | 1.26e-5 |
+
+So the contacts - the most sensitive thing the trunk emits - are 13.6x their
+f32 value, for about 25% of the trunk's time and 43% of its memory.
+
+🔴 **WHAT DECIDES IS WHETHER A NUMBER A USER SEES MOVES, AND NONE DOES.** On
+6MRR and 1QYS at flow-8: CA RMSD 0.032 A and 0.005 against the f32 tree, where
+AF3's own accuracy on these is 0.7-0.9 A and the sampler's seed-to-seed spread
+is ~0.1. Mean pLDDT within 0.01 and worst per-residue 0.22, on a number the
+page shows to one decimal. pTM within 2e-4, shown to two. A contact probability
+moves by ~1e-3 in [0, 1].
+
+🔴 **AND RMSD IS NOT MONOTONE IN THE ERROR, so do not read one structure as a
+verdict.** Adding the triangle accumulators took 6MRR from 0.0086 to 0.0322 A
+and 1QYS from 0.0119 to 0.0053 - the sampler is chaotic and both are noise
+around a small perturbation. The deterministic trunk numbers above are the
+signal; the folds say the scale.
 
 ## Memory, which is a separate question from speed
 

@@ -272,6 +272,9 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // four matrices in a vec4 and the output kernel two in a vec2 - and WGSL will
   // not mix widths in one multiply-add, so a single type here would have made
   // the output kernel assign an f32 into an f16 and fail to compile. It did.
+  const outVector2 = acc16 ? "vec2<f16>" : "vec2<f32>";
+  const outRowVector = acc16
+    ? (rowsPerThread === 1 ? "f16" : `vec${rowsPerThread}<f16>`) : rowVector;
   const projectRowVector = acc16
     ? (rowsPerThread === 1 ? "f16" : `vec${rowsPerThread}<f16>`) : rowVector;
   if (![1, 2, 4].includes(rowsPerThread)) {
@@ -520,8 +523,8 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
-var<workgroup> tile_x: array<${rowVector}, 64>;
-var<workgroup> tile_z: array<${rowVector}, 64>;
+var<workgroup> tile_x: array<${outRowVector}, 64>;
+var<workgroup> tile_z: array<${outRowVector}, 64>;
 // 🔴 ONE vec2 A CELL, NOT TWO SCALAR ARRAYS - the same argument projectAB
 // makes with four matrices and a vec4. The output projection and its gate are
 // contracted at the SAME (k, output channel) cell, so their two weights are
@@ -531,7 +534,7 @@ var<workgroup> tile_z: array<${rowVector}, 64>;
 // k to buy sixteen products - 0.73 useful operations an instruction, against
 // projectAB's 2.9 on the same shape, and it showed: 672 GFLOP/s where the
 // projection that feeds it runs at 977.
-var<workgroup> tile_weight: array<vec2<f32>, ${columnsPerThread * 64}>;
+var<workgroup> tile_weight: array<${outVector2}, ${columnsPerThread * 64}>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(
@@ -544,14 +547,14 @@ fn main(
   // ...the projection contracts over CH and the gate over CZ, on the same
   // output channel, so one accumulator a cell carries both: x is the
   // projection, y the gate.
-  var acc: array<vec2<f32>, ${rowsPerThread * columnsPerThread}>;
+  var acc: array<${outVector2}, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
     let out_channel = channel0 + column * 8u;
-    var bias = vec2<f32>(0.0);
+    var bias = ${outVector2}(0.0);
     if (out_channel < CZ) {
-      bias = vec2<f32>(
-        ${readWeight("weights[W_LINEARZBIAS + out_channel]")},
-        ${readWeight("weights[W_LINEARGBIAS + out_channel]")});
+      bias = ${outVector2}(
+        ${accNarrow(readWeight("weights[W_LINEARZBIAS + out_channel]"))},
+        ${accNarrow(readWeight("weights[W_LINEARGBIAS + out_channel]"))});
     }
     for (var r = 0u; r < ${rowsPerThread}u; r += 1u) {
       acc[r * ${columnsPerThread}u + column] = bias;
@@ -560,16 +563,16 @@ fn main(
   for (var k0 = 0u; k0 < max(CH, CZ); k0 += 8u) {
     let source_k = k0 + local.x;
     let weight_k = k0 + local.y;
-    var staged_x: ${rowVector};
-    var staged_z: ${rowVector};
+    var staged_x: ${outRowVector};
+    var staged_z: ${outRowVector};
     ${overRows((r) => `{
         let row = row0 + ${r}u * 8u;
         var x_value = 0.0;
         var z_value = 0.0;
         if (row < PAIRS && source_k < CH) { x_value = x[row * CH + source_k]; }
         if (row < PAIRS && source_k < CZ) { z_value = z[row * CZ + source_k]; }
-        ${rowAt("staged_x", r)} = x_value;
-        ${rowAt("staged_z", r)} = z_value;
+        ${rowAt("staged_x", r)} = ${accNarrow("x_value")};
+        ${rowAt("staged_z", r)} = ${accNarrow("z_value")};
       }`)}
     tile_x[tile_index] = staged_x;
     tile_z[tile_index] = staged_z;
@@ -584,7 +587,7 @@ fn main(
       if (out_channel < CZ && weight_k < CZ) {
         gate_w = ${readWeight("weights[W_LINEARGWEIGHT + out_channel * CZ + weight_k]")};
       }
-      tile_weight[slot] = vec2<f32>(projection_w, gate_w);
+      tile_weight[slot] = ${outVector2}(${accNarrow("projection_w")}, ${accNarrow("gate_w")});
     }
     workgroupBarrier();
     for (var k = 0u; k < 8u; k += 1u) {
@@ -592,7 +595,7 @@ fn main(
       let zs = tile_z[local.y * 8u + k];
       // ...paired once a row, outside the column loop, because the pairing
       // depends on the row and the weight does not.
-      ${overRows((r) => `let xz${r} = vec2<f32>(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
+      ${overRows((r) => `let xz${r} = ${outVector2}(${rowAt("xs", r)}, ${rowAt("zs", r)});`)}
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
         let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
         ${overRows((r) => `acc[${r}u * ${columnsPerThread}u + column] += xz${r} * packed;`)}
@@ -606,7 +609,7 @@ fn main(
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
       let out_channel = channel0 + column * 8u;
       if (out_channel >= CZ) { continue; }
-      let cell = acc[r * ${columnsPerThread}u + column];
+      let cell = vec2<f32>(acc[r * ${columnsPerThread}u + column]);
       output[row * CZ + out_channel] ${residual ? "+=" : "="} cell.x * logistic(cell.y);
     }
   }
