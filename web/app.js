@@ -39,7 +39,7 @@ import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-m
 import { getDevice, loadModel } from "./model.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
-import { confidenceJson, paeMatrix, predictionToPdb, safeJobName }
+import { CHAIN_IDS, confidenceJson, paeMatrix, predictionToPdb, safeJobName }
   from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
 import { entitiesProblem, expandEntities } from "./entities.js";
@@ -514,6 +514,21 @@ setInterval(() => {
  * fold - so one copy at the start is on screen for every frame. The PAE stays
  * where it is, on the final frame, because it only exists there.
  */
+/**
+ * One chain id per residue, in the ids `predictionToPdb` will use.
+ *
+ * The heatmap only cares where the id CHANGES, but matching the writer means
+ * the lines do not move when the real structure replaces this.
+ */
+function trunkChainIds(chains) {
+  const ids = [];
+  for (let chain = 0; chain < chains.length; chain += 1) {
+    const id = CHAIN_IDS[chain] ?? CHAIN_IDS[CHAIN_IDS.length - 1];
+    for (let within = 0; within < chains[chain].length; within += 1) ids.push(id);
+  }
+  return ids;
+}
+
 function contactMapFor(contactProbs) {
   const n = Math.round(Math.sqrt(contactProbs.length));
   if (n * n !== contactProbs.length) return undefined;
@@ -1256,6 +1271,18 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames;
       if (renderer?.heatmapRenderer === undefined || (frames?.length ?? 0) > 0) return;
       try {
+        // 🔴 AND THE CHAIN LAYOUT WITH IT, OR A COMPLEX GETS NO DIVIDER LINES.
+        // The panel rules a line wherever the chain changes and reads the
+        // chains off the RENDERER, which fills them in when a structure is
+        // parsed - so on this path, which exists precisely because there is no
+        // structure yet, `renderer.chains` is empty and _drawChainBoundaries
+        // returns before drawing anything. A complex's contact map came up
+        // unruled for the whole trunk and grew its lines when the sampler's
+        // first frame landed, which reads as the panel changing its mind.
+        //
+        // Written only while it is empty: the parser overwrites this the
+        // moment it has a real structure, and that one is authoritative.
+        if ((renderer.chains?.length ?? 0) === 0) renderer.chains = trunkChainIds(chains);
         renderer.heatmapRenderer.setMaps({ contact: liveContacts });
         window.Heatmap?.updateVisibility?.(renderer);
         renderer.render("trunk-contacts");

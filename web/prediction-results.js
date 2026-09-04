@@ -18,7 +18,13 @@ function field(value, width, decimals) {
 }
 
 /** The ATOM records for one structure. Serial numbering restarts per model, as in an NMR ensemble. */
-const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+/**
+ * The chain ids this writer gives a complex, in order.
+ *
+ * Exported because the heatmap needs the same ones BEFORE there is a structure
+ * to read them off: see the trunk's contact map in web/app.js.
+ */
+export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
 function atomLines(sequence, structure, plddt, chainLengths) {
   if (structure.atom37.length !== sequence.length * 37 * 3 || structure.atom37Mask.length !== sequence.length * 37) {
