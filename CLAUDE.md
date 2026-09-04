@@ -62,6 +62,7 @@ values means the whole-stack checker, not that file.
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
+| Is the live pLDDT estimator the right shape? | `python3 tools/fit-distogram-plddt.py` (needs a collected set) |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 

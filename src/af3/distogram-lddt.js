@@ -44,14 +44,23 @@
  * inclusion from a structure it can measure; here the reference is a
  * distribution, so a pair whose EXPECTED distance is 17 A still carries real
  * mass below 15 and belongs in the sum. Widening the window admits it. Swept
- * on 810 tokens over fourteen single-sequence targets, leave-one-target-out
+ * on 810 tokens over fourteen single-sequence AF3 targets, leave-one-target-out
  * RMSE against the confidence head:
  *
  *     r=10  10.55      r=15   8.67      r=22   9.30
  *     r=12   9.56      r=18   8.33
  *
- * and 18 beats 15 on ten of the fourteen targets and in all fourteen
- * leave-one-out subsets, so it is a preference rather than selection noise.
+ * 🔴 THE MARGIN OVER 15 IS AF3's, AND DOES NOT REPRODUCE ELSEWHERE. The same
+ * sweep over 44,740 residues of AF2 - 108 single-sequence targets, four
+ * recycles each, scored against AF2's own per-recycle pLDDT - puts them level
+ * and slightly the other way:
+ *
+ *     r=12   6.27      r=15   4.97      r=18   5.06      r=22   5.48
+ *
+ * So the SHAPE of the curve is real on both models and the peak is not: 12 is
+ * clearly too tight and 22 clearly too loose, while anything between 15 and 18
+ * is a coin toss. 18 stays because it is the better of the two on the model
+ * this actually serves, not because a fourteen-target margin established it.
  *
  * 🔴 THE THRESHOLDS STAY lDDT's. Widening them to {1, 2, 4, 8} measured 8.23
  * against 8.33 - a tenth of an angstrom of RMSE, and it flips sign on one of
@@ -78,7 +87,15 @@ const WEIGHT_FLOOR = 0.01;
  * 🔴 SWEPT AND REJECTED, WHICH IS WHY THEY ARE ZERO. Excluding local contacts
  * is the obvious idea - a chain's neighbours are preserved whatever it folds
  * into, so they are always confident and look like free marks - and a cap
- * bounds the work per token. Neither helped; see the note on the sweep below.
+ * bounds the work per token. On the same fourteen targets, leave-one-target-out
+ * RMSE against 8.33 for the estimator as it stands:
+ *
+ *     separation  1  8.33   2  8.28   3  8.32   6  8.64   12  12.54
+ *     contacts   64  8.38  32  9.14  16 10.57    8  12.10
+ *
+ * A floor of two or three is a wash and everything beyond it is worse; every
+ * cap is worse, sharply so once it starts discarding real neighbours. Neither
+ * earns a departure from lDDT's definition, so both stay off.
  */
 const MINIMUM_SEPARATION = 0;
 const MAX_CONTACTS = 0;
