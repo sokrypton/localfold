@@ -201,7 +201,23 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  * the scalar-source form it replaced - which is the shape of every tile sweep
  * in this repo and the reason none of them is left to a guess.
  */
-export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE, precision = "f32") {
+export function createAttentionProjectShader(
+  tile = ATTENTION_PROJECT_TILE, precision = "f32", weightPrecision = "f32",
+) {
+  // 🔴 THE WEIGHT BUFFER'S ELEMENT, MEASURED AND NOT SHIPPED. This kernel
+  // rereads the whole weight set once per row tile - 944 of them at 512 MSA
+  // rows - so halving its bytes is a bandwidth win on top of the register one,
+  // and bench-attention-project.js puts it at 9.762 -> 9.238 ms, 5.4%, with
+  // BITWISE IDENTICAL output: the f16 accumulators already truncate every
+  // weight to a half, so pre-rounding the buffer changes nothing.
+  //
+  // It is not wired into a block, and the reason is scope rather than doubt.
+  // This buffer is bound by four shaders - the normalisation, this, the pair
+  // bias and the output projection - and by the multimer's global-attention
+  // path as well, so narrowing it is a five-shader change with a silent failure
+  // mode, for 1.6% of a block. The measurement is here for whoever wants it.
+  const weight16 = weightPrecision === "f16";
+  const wf = (e) => (weight16 ? `f32(${e})` : e);
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
   if (!["f32", "f16"].includes(precision)) {
     throw new RangeError(`unknown attention project precision ${precision}`);
@@ -234,7 +250,7 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE, prec
   for (let v = 0; v < columnsPerLane; v += 1) {
     bias.push(`  let hd_${v} = column_origin + ${v * lanesX}u;
   var bias_${v} = 0.0;
-  if (hd_${v} < projected) { bias_${v} = weights[p.gating_bias + hd_${v}]; }`);
+  if (hd_${v} < projected) { bias_${v} = ${wf(`weights[p.gating_bias + hd_${v}]`)}; }`);
   }
 
   const inner = [];
@@ -280,10 +296,10 @@ export function createAttentionProjectShader(tile = ATTENTION_PROJECT_TILE, prec
       let output_hd = column_origin + ${v * lanesX}u;
       if (output_hd < projected && weight_c < p.channels) {
         let weight_index = weight_c * projected + output_hd;
-        packed = ${vector}(${narrow("weights[p.query_weight + weight_index]")},
-                           ${narrow("weights[p.key_weight + weight_index]")},
-                           ${narrow("weights[p.value_weight + weight_index]")},
-                           ${narrow("weights[p.gating_weight + weight_index]")});
+        packed = ${vector}(${narrow(wf("weights[p.query_weight + weight_index]"))},
+                           ${narrow(wf("weights[p.key_weight + weight_index]"))},
+                           ${narrow(wf("weights[p.value_weight + weight_index]"))},
+                           ${narrow(wf("weights[p.gating_weight + weight_index]"))});
       }
       tile_weight[local.y * ${lanesX * columnsPerLane}u + local.x * ${columnsPerLane}u + ${v}u] = packed;
     }`);
@@ -309,9 +325,9 @@ ${body.join("\n")}
   }`);
   }
 
-  return `${half ? "enable f16;\n" : ""}${half ? "enable f16;\n" : ""}${COMMON}
+  return `${half || weight16 ? "enable f16;\n" : ""}${COMMON}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<f32>;
 @group(0) @binding(4) var<storage, read_write> key: array<f32>;

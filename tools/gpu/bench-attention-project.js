@@ -29,6 +29,7 @@
 import {
   createAttentionProjectShader, attentionProjectTileRows, attentionProjectTileColumns,
 } from "../../src/evoformer/attention.js";
+import { float32ToFloat16Array } from "../../src/runtime/float16.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -70,6 +71,8 @@ export async function main(device, args) {
   const weightData = new Float32Array(4 * matrix + width);
   weightData.set(random(4 * matrix + width), 0);
   const weights = upload(weightData);
+  const weightsHalf = device.features.has("shader-f16")
+    ? upload(float32ToFloat16Array(weightData)) : weights;
   const source = upload(random(rows * channels));
   const outputs = ["query", "key", "value", "gate"].map(() => device.createBuffer({
     size: rows * width * 4, usage: storage | GPUBufferUsage.COPY_SRC,
@@ -95,8 +98,13 @@ export async function main(device, args) {
   const arms = [];
   const results = [];
   for (const spec of armsSpec) {
-    const [tileSpec, precision = "f32"] = spec.split("@");
-    if (precision !== "f32" && !device.features.has("shader-f16")) {
+    // `4x4@f16` is the accumulator's element; `4x4@f16/f16` narrows the WEIGHT
+    // BUFFER too, which is bandwidth rather than registers: this kernel rereads
+    // the whole weight set once per row tile, 944 of them at 512 MSA rows.
+    const [tileSpec, precisionSpec = "f32"] = spec.split("@");
+    const [precision, weightPrecision = "f32"] = precisionSpec.split("/");
+    if ((precision !== "f32" || weightPrecision !== "f32")
+      && !device.features.has("shader-f16")) {
       results.push({ arm: spec, skipped: "no shader-f16" });
       continue;
     }
@@ -109,7 +117,7 @@ export async function main(device, args) {
       layout: "auto",
       compute: {
         module: device.createShaderModule({
-          code: createAttentionProjectShader(tile, precision),
+          code: createAttentionProjectShader(tile, precision, weightPrecision),
         }),
         entryPoint: "main",
       },
@@ -118,7 +126,7 @@ export async function main(device, args) {
       spec, pipeline,
       bindGroup: device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: [source, weights, parameters, ...outputs]
+        entries: [source, weightPrecision === "f16" ? weightsHalf : weights, parameters, ...outputs]
           .map((buffer, binding) => ({ binding, resource: { buffer } })),
       }),
       x: Math.ceil(width / attentionProjectTileColumns(tile)),
