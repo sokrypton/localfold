@@ -427,6 +427,10 @@ export async function foldAf3(options) {
   // cheaper than a jump at the end of the animation.
   let liveConfidence = null;
   const previewPdbs = [];
+  // 🔴 THE POSITIONS TOO, because the PDB written during the fold carries the
+  // RAW estimate - there is no calibration until the fold has finished - and
+  // the finished trajectory must be one scale. See below.
+  const previewPositions = [];
   // ...and the distogram each preview belongs to, so a trunk frame can carry
   // the contact map of ITS pass rather than the last one's.
   const previewContacts = [];
@@ -449,6 +453,7 @@ export async function foldAf3(options) {
       // they are handed back with the rest and the replay rebuilds them in
       // order rather than throwing away the only record of the trunk.
       previewPdbs.push(pdb);
+      previewPositions.push(Float32Array.from(preview.positions));
       previewContacts.push(latestContacts);
       await options.onPreview({ pdb, pass: preview.pass, passes: preview.passes });
       await yieldToBrowser();
@@ -663,6 +668,15 @@ export async function foldAf3(options) {
   // then jumped on its last frame.
   const framePdbs = trajectory.map(
     (positions) => fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
+  // 🔴 AND THE PREVIEWS ARE RECOLOURED ON THE SAME SCALE. They were written
+  // during the trunk with the RAW distogram estimate, which is not on pLDDT's
+  // scale and reads HIGH: measured, a two-step preview showed 54.8 to 58.1
+  // while the finished structure's real pLDDT was 54.1, so the roughest frames
+  // in the animation looked as confident as the answer. The calibration only
+  // exists once the confidence head has run, so the fix is to rebuild them
+  // here rather than to colour them differently there.
+  const previewFrames = previewPositions.map((positions) =>
+    fittedPdb(batch, positions, reference, slots, frameScores.coloured(positions)));
   // ...and the finished structure keeps the REAL pLDDT, which is the one number
   // here that is a claim about the prediction rather than about the animation.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
@@ -679,8 +693,9 @@ export async function foldAf3(options) {
     // the trunk does rather than after the confidence head.
     contactProbs: result.trunk.contactProbs,
     framePdbs,
-    // One per recycle, in order, before the sampler's first frame.
-    previewPdbs,
+    // One per recycle, in order, before the sampler's first frame - recoloured
+    // on the finished fold's scale, so the whole animation is one ramp.
+    previewPdbs: previewFrames,
     previewContacts,
     pdb: finalPdb,
     meanPlddt: result.meanPlddt,
