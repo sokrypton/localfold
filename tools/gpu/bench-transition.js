@@ -78,11 +78,16 @@ export async function main(device, args) {
          "let w = f32(slot) * 1e-6;"],
   };
   for (const spec of arms_spec) {
-    const [tile, chunk, drop, width, lanes] = spec.split(":");
+    // `8:128@f16` names the tile and chunk, then the element the two staged
+    // blocks are held in. The suffix is optional and f32 is what every arm
+    // meant before it existed.
+    const [armSpec, stagePrecision = "f32"] = spec.split("@");
+    const [tile, chunk, drop, width, lanes] = armSpec.split(":");
+    if (stagePrecision !== "f32" && !device.features.has("shader-f16")) continue;
     let source = createTransitionShader(
       { rows, channels, factor, tile: Number(tile), chunk: chunk ? Number(chunk) : undefined,
         width: width ? Number(width) : undefined,
-        lanes: lanes ? Number(lanes) : undefined },
+        lanes: lanes ? Number(lanes) : undefined, stagePrecision },
       packed.offsets, 1e-5, "fast");
     if (drop) {
       const [pattern, replacement] = surgery[drop];

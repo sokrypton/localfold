@@ -101,9 +101,14 @@ export async function compilePairTrack(cache, options) {
         await cache.get(`${base}:grid:${key}:${stagedPrecision}:${name}`, source);
     }
   }
-  pipelines.pairTransition = await cache.get(`${base}:pair-transition`,
-    createTransitionShader({ rows: pairs, channels, factor: transitionFactor, residual: true },
-                           transitionOffsets, epsilon, variance));
+  // The transition stages two blocks of its own - the layer-normed rows and the
+  // gated intermediate - and narrowing them is the same trade as the attention
+  // tile above, on the largest kernel in the trunk. See transition-webgpu.js.
+  pipelines.pairTransition = await cache.get(`${base}:pair-transition:${stagedPrecision}`,
+    createTransitionShader(
+      { rows: pairs, channels, factor: transitionFactor, residual: true,
+        stagePrecision: stagedPrecision },
+      transitionOffsets, epsilon, variance));
   // 🔴 STILL ONE ADD PASS, and it belongs to the MSA stack rather than to this
   // track: the outer product mean is the one producer whose kernel does not
   // write the pair representation itself. See msa-stack-webgpu.js's "opm.add".

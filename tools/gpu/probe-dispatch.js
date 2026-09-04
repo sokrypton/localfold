@@ -137,6 +137,34 @@ export async function main(device, args) {
     device.queue.submit([encoder.finish()]);
   };
 
+  // 🔴 AND WHAT A ROUND TRIP COSTS, which is the thing a pipeline of separate
+  // GPU modules pays between every pair of them. Each iteration submits, drains
+  // the queue and maps a buffer back - the shape of `run()` returning a
+  // Float32Array. `bytes` sizes the copy so the drain and the copy separate.
+  const roundTripBytes = Number(option(args, "readback-bytes", String(59 * 768 * 4)));
+  const staging = device.createBuffer({
+    size: roundTripBytes,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const source = device.createBuffer({
+    size: roundTripBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const roundTrip = async (count, x) => {
+    for (let i = 0; i < count; i += 1) {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(x);
+      pass.end();
+      encoder.copyBufferToBuffer(source, 0, staging, 0, roundTripBytes);
+      device.queue.submit([encoder.finish()]);
+      await staging.mapAsync(GPUMapMode.READ);
+      staging.getMappedRange().slice(0);
+      staging.unmap();
+    }
+  };
+
   const time = async (shape, count, x) => {
     const start = performance.now();
     shapes[shape](count, x);
@@ -146,6 +174,23 @@ export async function main(device, args) {
 
   const median = (values) => [...values].sort((a, b) => a - b)[values.length >> 1];
   const results = [];
+  {
+    const trips = Number(option(args, "round-trips", "32"));
+    await roundTrip(4, 8);
+    const times = [];
+    for (let round = 0; round < rounds; round += 1) {
+      const start = performance.now();
+      await roundTrip(trips, 8);
+      times.push(performance.now() - start);
+    }
+    const ms = median(times);
+    results.push({
+      shape: "round-trip", groups: 8, dispatches: trips,
+      bytes: roundTripBytes,
+      ms: Number(ms.toFixed(2)),
+      microsecondsEach: Number((ms * 1000 / trips).toFixed(1)),
+    });
+  }
   for (const x of groups) {
     for (const shape of Object.keys(shapes)) {
       await time(shape, 8, x);

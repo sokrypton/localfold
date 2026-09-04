@@ -153,6 +153,21 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   if (tile % lanes !== 0) throw new Error(`tile ${tile} is not a multiple of ${lanes} lanes`);
   const groups = tile / lanes;
   const vector = lanes === 1 ? "f32" : `vec${lanes}<f32>`;
+  // 🔴 THE TWO STAGED BLOCKS ARE WHAT THIS KERNEL IS SHORT OF, NOT ARITHMETIC.
+  // `normalized` and `gated` are 4 KiB each for the pair track, and both are
+  // read once per output channel by every lane - the same shape as the staged
+  // key and value in src/evoformer/attention.js, where narrowing them to f16
+  // bought 1.22x through occupancy. Only the STAGED COPY narrows: the layer
+  // norm's reductions, the accumulators and the store all stay f32.
+  const stagePrecision = shape.stagePrecision ?? "f32";
+  if (!["f32", "f16"].includes(stagePrecision)) {
+    throw new RangeError(`unknown transition stage precision ${stagePrecision}`);
+  }
+  const stage16 = stagePrecision === "f16";
+  const stageVector = stage16
+    ? (lanes === 1 ? "f16" : `vec${lanes}<f16>`) : vector;
+  const narrow = (e) => (stage16 ? `${stageVector}(${e})` : e);
+  const widen = (e) => (stage16 ? `${vector}(${e})` : e);
   const zero = lanes === 1 ? "0.0" : `${vector}(0.0)`;
   const overLanes = (body) =>
     Array.from({ length: lanes }, (_, l) => body(l, lanes === 1 ? "" : `.${"xyzw"[l]}`));
@@ -181,7 +196,7 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   }
   let variance = reduce_a[0] / f32(CHANNELS);`;
 
-  return `
+  return `${stage16 ? "enable f16;\n" : ""}
 const ROWS: u32 = ${rows}u;
 const CHANNELS: u32 = ${channels}u;
 const INTERMEDIATE: u32 = ${intermediate}u;
@@ -207,8 +222,8 @@ ${residual
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;`}
 
-var<workgroup> normalized: array<${vector}, ${groups * channels}>;
-var<workgroup> gated: array<${vector}, ${groups * chunk}>;
+var<workgroup> normalized: array<${stageVector}, ${groups * channels}>;
+var<workgroup> gated: array<${stageVector}, ${groups * chunk}>;
 var<workgroup> reduce_a: array<f32, ${WORKGROUP}>;
 var<workgroup> reduce_b: array<f32, ${WORKGROUP}>;
 var<workgroup> row_mean: array<f32, ${tile}>;
@@ -278,7 +293,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         packed${at} = (input[row${l} * CHANNELS + c] - row_mean[g * ${lanes}u + ${l}u])
           * row_inverse_std[g * ${lanes}u + ${l}u] * scale + offset;
       }`).join("\n      ")}
-      normalized[g * CHANNELS + c] = packed;
+      normalized[g * CHANNELS + c] = ${narrow("packed")};
     }
   }
   workgroupBarrier();
@@ -323,7 +338,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         let wg = weights[column + i];
         let wv = weights[column + INTERMEDIATE + i];
         for (var g = 0u; g < ${groups}u; g += 1u) {
-          let x = normalized[g * CHANNELS + c];
+          let x = ${widen("normalized[g * CHANNELS + c]")};
           gate[b * ${groups}u + g] += x * wg;
           value[b * ${groups}u + g] += x * wv;
         }
@@ -331,8 +346,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     for (var b = 0u; b < BLOCK; b += 1u) {
       for (var g = 0u; g < ${groups}u; g += 1u) {
-        gated[g * CHUNK + local + b * WORKGROUP] =
-          swish(gate[b * ${groups}u + g]) * value[b * ${groups}u + g];
+        gated[g * CHUNK + local + b * WORKGROUP] = ${narrow(
+          "swish(gate[b * " + groups + "u + g]) * value[b * " + groups + "u + g]")};
       }
     }
     workgroupBarrier();
@@ -343,7 +358,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       for (var slot = 0u; slot < CHUNK; slot += 1u) {
         let w = weights[W_T2 + (chunk0 + slot) * CHANNELS + c];
         for (var g = 0u; g < ${groups}u; g += 1u) {
-          sum[${accumulator}] += gated[g * CHUNK + slot] * w;
+          sum[${accumulator}] += ${widen("gated[g * CHUNK + slot]")} * w;
         }
       }
       out_slot += 1u;

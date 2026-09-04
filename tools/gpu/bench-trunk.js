@@ -84,7 +84,9 @@ export async function main(device, args) {
   const residentWeights = !args.includes("--no-resident");
   const budgetMiB = Number(option(args, "budget", "0"));
   if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
-  const trunkGpu = new Af3TrunkGpu(device, { residentWeights });
+  const trunkGpu = new Af3TrunkGpu(device, {
+    residentWeights, stagedPrecision: option(args, "staged", undefined),
+  });
   let previousPair = new Float32Array(tokens * tokens * 128);
   let previousSingle = new Float32Array(tokens * 384);
   const perPass = [];
