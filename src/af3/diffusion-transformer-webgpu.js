@@ -72,6 +72,24 @@ function residentBlockBuffer(device, block, pack, variant = "") {
  *   are in elements and do not depend on it; the shader must be built for the
  *   same word or it reads half the values at twice the stride.
  */
+/**
+ * The packing offsets alone, without building the buffer.
+ *
+ * 🔴 THE SHADERS NEED THE OFFSETS AND NOTHING ELSE, and `packBlockWeights` was
+ * being called on a sample block to get them - concatenating 31.5 MiB, and in
+ * f16 converting it, to read a dozen numbers that are a running sum of lengths.
+ */
+export function blockWeightOffsets(block) {
+  const offsets = {};
+  let total = 0;
+  for (const name of BLOCK_ORDER) {
+    if (block[name] === undefined) throw new Error(`diffusion block missing ${name}`);
+    offsets[name] = total;
+    total += block[name].length;
+  }
+  return offsets;
+}
+
 export function packBlockWeights(block, precision = "f32") {
   const offsets = {};
   let total = 0;
@@ -853,7 +871,24 @@ export class Af3DiffusionTransformerGpu {
     }
   }
 
-  async #runBlocks(act, cond, pairCond, mask, tokens, weights) {
+  /**
+   * Everything about a run that depends only on the shape: the tiles, the
+   * shaders and their pipelines.
+   *
+   * 🔴 SEPARATED BECAUSE IT WAS DOING PER-CALL WORK THAT DEPENDS ON NOTHING.
+   * It read the packing offsets by calling `packBlockWeights` on a sample block
+   * - concatenating 31.5 MiB, and in f16 converting it, to obtain a dozen
+   * numbers that are a running sum of lengths - and it did that on EVERY
+   * denoiser call, eight times a fold. `blockWeightOffsets` is the same numbers
+   * without the buffer: a steady call goes 86-89 ms to 83-85, its transformer
+   * 43 to 40.
+   *
+   * Compiling this early was tried too and is not worth keeping: measured from
+   * a fold, the pipelines are ready in 6 ms, so compilation is not what makes
+   * the first call several times a steady one. That is the weight conversion,
+   * and AF3.md records why it cannot be moved either.
+   */
+  async #compile(tokens, weights) {
     const channels = weights.channels;
     const condChannels = weights.condChannels;
     const pairChannels = weights.pairChannels;
@@ -862,11 +897,7 @@ export class Af3DiffusionTransformerGpu {
     const perSuper = weights.blocksPerSuperBlock;
     const width = heads * dimension;
     const pairs = tokens * tokens;
-    if (act.length !== tokens * channels) {
-      throw new Error(`act has ${act.length} elements; expected ${tokens * channels}`);
-    }
-
-    const sample = packBlockWeights(weights.superBlocks[0].blocks[0]);
+    const sampleOffsets = blockWeightOffsets(weights.superBlocks[0].blocks[0]);
     // 🔴 FOUR AND TWO ARE MEASURED, AND MORE IS WORSE. Each kernel holds its
     // tile of activations in workgroup storage - the projection and the
     // widening keep `channels` floats a token, the way back `intermediate`,
@@ -920,7 +951,7 @@ export class Af3DiffusionTransformerGpu {
                     factor: weights.transitionFactor, lanes: weights.lanes,
                     tile, splits, outTile, outChunk, weightPrecision,
                     channelChunk: weights.channelChunk };
-    const sources = createDiffusionTransformerShaders(shape, sample.offsets);
+    const sources = createDiffusionTransformerShaders(shape, sampleOffsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a
     // later run the pipeline compiled for a different width.
@@ -951,6 +982,20 @@ export class Af3DiffusionTransformerGpu {
         .then((pipeline) => { compiled.pairLogits[at] = pipeline; }));
     }
     await Promise.all(pending);
+    return { channels, condChannels, pairChannels, heads, dimension, perSuper,
+             width, pairs, shape, sources, compiled, tile, splits, outTile, outChunk,
+             weightPrecision };
+  }
+
+  async #runBlocks(act, cond, pairCond, mask, tokens, weights) {
+    const {
+      channels, condChannels, pairChannels, heads, dimension, perSuper,
+      width, pairs, shape, sources, compiled, tile, splits, outTile, outChunk,
+      weightPrecision,
+    } = await this.#compile(tokens, weights);
+    if (act.length !== tokens * channels) {
+      throw new Error(`act has ${act.length} elements; expected ${tokens * channels}`);
+    }
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
