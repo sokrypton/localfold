@@ -157,10 +157,27 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   // workgroup memory, before it writes any of them, and no other workgroup
   // touches those rows - so the read-modify-write is safe within one dispatch.
   const residual = shape.residual ?? false;
+  // 🔴 AND THE ACCUMULATORS ARE A THIRD FORMAT, FOR THE THIRD REASON AGAIN.
+  // `sum` is a WGSL ARRAY of `groups * channelsPerThread` vectors - the shape a
+  // driver spills first - and this is the largest kernel in the trunk. Halving
+  // it is the same change as src/triangle/shaders.js's two projections, where
+  // it was worth 1.55x and 1.43x. The layer norm's reductions, the swish and
+  // the store stay f32; only the running sum and the weight it multiplies
+  // narrow.
+  const accumulatePrecision = shape.accumulatePrecision ?? "f32";
+  if (!["f32", "f16"].includes(accumulatePrecision)) {
+    throw new RangeError(`unknown transition accumulate precision ${accumulatePrecision}`);
+  }
+  const acc16 = accumulatePrecision === "f16";
   const lanes = shape.lanes ?? (tile % 4 === 0 ? 4 : 1);
   if (tile % lanes !== 0) throw new Error(`tile ${tile} is not a multiple of ${lanes} lanes`);
   const groups = tile / lanes;
   const vector = lanes === 1 ? "f32" : `vec${lanes}<f32>`;
+  // The running sum's element; see the note on accumulatePrecision above.
+  const sumVector = acc16 ? (lanes === 1 ? "f16" : `vec${lanes}<f16>`) : vector;
+  const sumZero = acc16 ? `${sumVector}(0.0)` : null;
+  const toSum = (e) => (acc16 ? `${sumVector}(${e})` : e);
+  const fromSum = (e) => (acc16 ? `${vector}(${e})` : e);
   // 🔴 THE TWO STAGED BLOCKS ARE WHAT THIS KERNEL IS SHORT OF, NOT ARITHMETIC.
   // `normalized` and `gated` are 4 KiB each for the pair track, and both are
   // read once per output channel by every lane - the same shape as the staged
@@ -218,7 +235,7 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   }
   let variance = reduce_a[0] / f32(CHANNELS);`;
 
-  return `${stage16 || weight16 ? "enable f16;\n" : ""}
+  return `${stage16 || weight16 || acc16 ? "enable f16;\n" : ""}
 const ROWS: u32 = ${rows}u;
 const CHANNELS: u32 = ${channels}u;
 const INTERMEDIATE: u32 = ${intermediate}u;
@@ -333,8 +350,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // memory then depends on CHUNK rather than INTERMEDIATE, and the tile buys
   // its halved weight traffic without spending occupancy for it.
   let wide = INTERMEDIATE * 2u;
-  var sum: array<${vector}, ${groups * channelsPerThread}>;
-  for (var s = 0u; s < ${groups * channelsPerThread}u; s += 1u) { sum[s] = ${zero}; }
+  var sum: array<${sumVector}, ${groups * channelsPerThread}>;
+  for (var s = 0u; s < ${groups * channelsPerThread}u; s += 1u) { sum[s] = ${sumZero ?? zero}; }
 
   for (var chunk0 = 0u; chunk0 < INTERMEDIATE; chunk0 += CHUNK) {
     // ...before overwriting the chunk the previous iteration is still reading.
@@ -380,7 +397,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       for (var slot = 0u; slot < CHUNK; slot += 1u) {
         let w = ${w("weights[W_T2 + (chunk0 + slot) * CHANNELS + c]")};
         for (var g = 0u; g < ${groups}u; g += 1u) {
-          sum[${accumulator}] += ${widen("gated[g * CHUNK + slot]")} * w;
+          sum[${accumulator}] += ${acc16
+            ? `${sumVector}(gated[g * CHUNK + slot]) * f16(w)`
+            : `${widen("gated[g * CHUNK + slot]")} * w`};
         }
       }
       out_slot += 1u;
@@ -390,7 +409,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var write_slot = 0u;
   for (var c = local; c < CHANNELS; c += WORKGROUP) {
     for (var g = 0u; g < ${groups}u; g += 1u) {
-      let packed = sum[${writeAccumulator}];
+      let packed = ${fromSum(`sum[${writeAccumulator}]`)};
       ${overLanes((l, at) => `{
         let row${l} = base_row + g * ${lanes}u + ${l}u;
         if (row${l} < ROWS) {

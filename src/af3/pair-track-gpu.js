@@ -130,6 +130,15 @@ export async function compilePairTrack(cache, options) {
   compileInto("pairTransition",
     `${base}:pair-transition:${stagedPrecision}:${weightPrecision}`,
     createTransitionShader(
+      // 🔴 THE TRANSITION'S RUNNING SUM STAYS f32, WHERE THE TRIANGLE'S DOES
+      // NOT, AND THE DIFFERENCE IS THE RATIO. Narrowing it measures 3.938 ->
+      // 3.769 ms on bench-transition.js at 118 tokens - 4.3% of a kernel that
+      // is 18% of the trunk, so 0.8% - and takes the kernel's own relRMS from
+      // 3.55e-4 to 3.33e-3. Ten times the error for eight tenths of a percent
+      // is the wrong side of the trade; the triangle's two projections are
+      // 1.55x and 1.43x for the same class of change. The option is still in
+      // the shader and the bench still reaches it (`@f16+f16`), which is where
+      // that measurement lives.
       { rows: pairs, channels, factor: transitionFactor, residual: true,
         stagePrecision: stagedPrecision, weightPrecision },
       transitionOffsets, epsilon, variance));

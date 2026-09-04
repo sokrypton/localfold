@@ -81,13 +81,18 @@ export async function main(device, args) {
     // `8:128@f16` names the tile and chunk, then the element the two staged
     // blocks are held in. The suffix is optional and f32 is what every arm
     // meant before it existed.
-    const [armSpec, stagePrecision = "f32"] = spec.split("@");
+    // `8:128@f16` narrows the two STAGED blocks; `8:128@f16+f16` narrows the
+    // running sum as well, which is a different register story - see
+    // accumulatePrecision in src/af3/transition-webgpu.js.
+    const [armSpec, precisionSpec = "f32"] = spec.split("@");
+    const [stagePrecision, accumulatePrecision = "f32"] = precisionSpec.split("+");
     const [tile, chunk, drop, width, lanes] = armSpec.split(":");
-    if (stagePrecision !== "f32" && !device.features.has("shader-f16")) continue;
+    if ((stagePrecision !== "f32" || accumulatePrecision !== "f32")
+      && !device.features.has("shader-f16")) continue;
     let source = createTransitionShader(
       { rows, channels, factor, tile: Number(tile), chunk: chunk ? Number(chunk) : undefined,
         width: width ? Number(width) : undefined,
-        lanes: lanes ? Number(lanes) : undefined, stagePrecision },
+        lanes: lanes ? Number(lanes) : undefined, stagePrecision, accumulatePrecision },
       packed.offsets, 1e-5, "fast");
     if (drop) {
       const [pattern, replacement] = surgery[drop];
