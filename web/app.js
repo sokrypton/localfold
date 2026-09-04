@@ -642,6 +642,24 @@ function revealViewer(renderer) {
 }
 
 /**
+ * A name no object and no earlier prediction is already using.
+ *
+ * 🔴 IT READS objectsData, NOT `viewer.objects`, WHICH DOES NOT EXIST. The AF2
+ * path checked `viewer?.objects` - an optional chain that always yields
+ * undefined on this build - so its uniquifying loop only ever consulted
+ * `predictions` and would have collided with any object loaded another way.
+ */
+function uniqueStem(base) {
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  const taken = new Set(Object.keys(renderer?.objectsData ?? {}));
+  if (!taken.has(base) && !predictions.has(base)) return base;
+  let suffix = 2;
+  while (taken.has(`${base}_${suffix}`) || predictions.has(`${base}_${suffix}`)) suffix += 1;
+  return `${base}_${suffix}`;
+}
+
+/**
  * Open an empty object for the fold that is about to start.
  *
  * 🔴 THE PREVIOUS PREDICTION USED TO STAY ON SCREEN UNTIL THE FIRST FRAME OF
@@ -663,12 +681,42 @@ function revealViewer(renderer) {
  * whatever is still animating - so this reaches the renderer through the
  * registry instead.
  */
-function openBlankFold(stem) {
+function openBlankFold(stem, keep = []) {
   const registry = window.py2dmol_viewers ?? {};
   const renderer = registry[Object.keys(registry)[0]]?.renderer;
   if (renderer === undefined) return;
   try {
     renderer.addObject(stem);
+    // 🔴 addObject KEEPS THE FRAMES OF AN OBJECT THAT ALREADY HAS THEM - "only
+    // clear if it has no frames", which is right for a data refresh and wrong
+    // for this. A fold whose name repeats therefore APPENDED to the previous
+    // run: its frames, its colours and its maps stayed in front of the new
+    // ones. This function is called openBlankFold, so it blanks.
+    // 🔴 REWOUND, NOT ALWAYS EMPTIED. A fold that continues a cached trunk
+    // keeps the frames those passes already produced - only the sampler's are
+    // stale - so the object is truncated to them and the new frames append.
+    // With nothing to keep this is the blank it says it is.
+    const existing = renderer.objectsData?.[stem];
+    if (existing?.frames !== undefined) existing.frames.length = 0;
+    for (const [index, pdb] of keep.entries()) {
+      const api = window.py2Dmol;
+      if (api?.frameFromText === undefined) break;
+      try {
+        const frame = api.frameFromText(pdb);
+        frame.name = frame.label = frame.title = `trunk_${index + 1}`;
+        renderer.addFrame(frame, stem);
+      } catch { break; }
+    }
+    // 🔴 AND THIS OBJECT ALONE IS SHOWN. `shownObjects` is a SET of names once
+    // anything has toggled object visibility, and addObject ADDS to it - so
+    // every previous fold stayed in the set and kept drawing alongside the new
+    // one. Two structures in one viewer, coloured by two different folds'
+    // confidence, is what "the old run bleeding into this one" looks like.
+    // Null is py2Dmol's resting state, where only the current object draws;
+    // narrowing the set to this name is the same thing said explicitly.
+    if (renderer.shownObjects instanceof Set) {
+      renderer.shownObjects = new Set([stem]);
+    }
     if (typeof renderer._switchToObject === "function") renderer._switchToObject(stem);
     else renderer.currentObjectName = stem;
     // ...and the two panels that describe a fold must stop describing the old
@@ -1051,6 +1099,15 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   const cached = trunkCache?.key === trunkKey ? trunkCache.reusable : undefined;
   const reuse = cached !== undefined && cached.recycles <= recycles ? cached : undefined;
   const continued = reuse !== undefined && reuse.recycles < recycles;
+  // 🔴 A CONTINUATION REWINDS RATHER THAN RESTARTS. Asking for more recycles
+  // reuses the trunk and runs only the passes that are missing - so the frames
+  // the earlier passes produced are still true, and only the SAMPLER's are
+  // stale. They are carried over and the new ones appended, which is the same
+  // thing the trunk cache does for the tensors. Re-sampling at the SAME
+  // recycle count carries them too: without this a re-fold silently produced a
+  // shorter trajectory than the first one, because no pass ran to preview.
+  const carriedPreviews = reuse !== undefined ? (trunkCache?.previews ?? []) : [];
+  const carriedContacts = reuse !== undefined ? (trunkCache?.contacts ?? []) : [];
 
   status("Loading AlphaFold 3 · 0 MiB");
   const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
@@ -1066,10 +1123,16 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
 
   predictionCount += 1;
   const header = entityList.header();
-  const stem = header !== null ? safeJobName(header) : `af3_${predictionCount}`;
+  // 🔴 A HEADER MAKES THE NAME THE SAME EVERY FOLD, which is how the previous
+  // run's frames came to be in front of this one's: safeJobName(header) does
+  // not change between folds, so every fold reopened the SAME object. The AF2
+  // path has always uniquified; this one never did.
+  const stem = uniqueStem(header !== null ? safeJobName(header) : `af3_${predictionCount}`);
   // ...and the view goes blank first, so the trunk is not spent showing the
   // previous fold. See openBlankFold.
-  openBlankFold(stem);
+  // ...rewound to the frames a continuation keeps, or blank when there are
+  // none. See openBlankFold.
+  openBlankFold(stem, carriedPreviews);
   // See the note in the AF2 path: dropping the handle is what stops the
   // score-card poll refilling from the object still on screen.
   viewer = undefined;
@@ -1134,7 +1197,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // in the SAMPLER threw the trunk away with the exception and "Fold anyway"
     // started from featurisation - re-running minutes of work that had already
     // succeeded. An aborted fold now leaves its trunk behind too.
-    onTrunk: (reusable) => { trunkCache = { key: trunkKey, reusable }; },
+    onTrunk: (reusable) => {
+      // ...the carried previews stay with it: they belong to passes this trunk
+      // has already run, and a continuation must not lose them.
+      trunkCache = { key: trunkKey, reusable, previews: carriedPreviews,
+        contacts: carriedContacts };
+    },
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
     seed: randomSeed(),
@@ -1192,7 +1260,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // ...`onTrunk` above has already cached this, and it is the same object.
   // Kept for the next fold, and kept even when it was itself reused, so a run
   // of re-samples all skip the trunk rather than only the first.
-  trunkCache = { key: trunkKey, reusable: result.reusable };
+  trunkCache = { key: trunkKey, reusable: result.reusable,
+    previews: [...carriedPreviews, ...(result.previewPdbs ?? [])],
+    contacts: [...carriedContacts, ...(result.previewContacts ?? [])] };
 
   // 🔴 THE HANDLES ARE ACQUIRED HERE, because nothing during the fold sets
   // them any more. drawLiveFrame reaches the renderer through the registry so
@@ -1233,7 +1303,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // so the play bar runs the whole fold rather than starting where the trunk
     // finished. They are prepended here so the rebuild below keeps the order
     // the live fold drew them in.
-    const previews = result.previewPdbs ?? [];
+    const previews = [...carriedPreviews, ...(result.previewPdbs ?? [])];
     const timeline = [...previews, ...result.framePdbs.slice(0, -1), result.pdb];
     /** What a frame is called: the trunk's passes, then the sampler's calls. */
     const frameName = (index, last) => {
@@ -1298,7 +1368,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // ...and frame zero's contact map, which is its OWN pass's when the
       // trunk previews are there. See the loop below.
       const firstProbs = previews.length > 0
-        ? result.previewContacts?.[0] : result.contactProbs;
+        ? [...carriedContacts, ...(result.previewContacts ?? [])][0] : result.contactProbs;
       const contact = firstProbs === undefined ? undefined : contactMapFor(firstProbs);
       if (contact !== undefined) first.maps = { ...first.maps, contact };
     }
@@ -1314,7 +1384,8 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // The sampler's frames all follow the finished trunk, so the first of
       // them carries the final map and the rest resolve back to it.
       const position = index + 1;
-      const probs = position < previews.length ? result.previewContacts?.[position]
+      const allContacts = [...carriedContacts, ...(result.previewContacts ?? [])];
+      const probs = position < previews.length ? allContacts[position]
         : (position === previews.length ? result.contactProbs : undefined);
       if (probs !== undefined) {
         const map = contactMapFor(probs);
