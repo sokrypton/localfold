@@ -60,6 +60,9 @@ def main():
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--then-sequence", default=None,
+                        help="fold a SECOND time on this sequence, which is a"
+                             " fresh fold rather than a continuation")
     parser.add_argument("--then-recycles", default=None,
                         help="fold a SECOND time at this recycle count, which is"
                              " what the rewind-and-continue path does")
@@ -183,6 +186,24 @@ def main():
           return JSON.stringify({ changes: log.length, shapes: seen });
         })()""")
         print("statusln:", shapes)
+        print("map1   :", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const h = v.heatmapRenderer;
+              const maps = h && h.maps;
+              const sum = (m) => {
+                if (!m || !m.data) return null;
+                let a = 0;
+                for (let i = 0; i < m.data.length; i += 1) a = (a + m.data[i] * (i % 7 + 1)) % 1000000007;
+                return a;
+              };
+              const c = document.getElementById('heatmapContainer');
+              return JSON.stringify({
+                visible: !!(c && getComputedStyle(c).display !== 'none'),
+                keys: maps ? Object.keys(maps) : [],
+                contact: maps ? sum(maps.contact) : null,
+              });
+            })()"""))
         # 🔴 THE CAMERA IS PART OF THE ANSWER. addFrame recentres viewerState on
         # the centroid of every frame the object holds, so a rewind that clears
         # the frames and re-adds them walks the camera - which is what "the view
@@ -211,14 +232,48 @@ def main():
         # 🔴 THE SECOND FOLD IS THE ONE THAT REWINDS. Asking for more recycles
         # with everything else unchanged should keep the frames the earlier
         # passes already produced and append to them - not start an object over.
-        if args.then_recycles is not None:
+        if args.then_recycles is not None or args.then_sequence is not None:
+            if args.then_sequence is not None:
+                cdp.evaluate(ws, """(() => {
+                  const field = document.querySelector('.entity-field [contenteditable],'
+                    + ' .entity-field textarea, .entity-field input');
+                  if ('value' in field && field.tagName !== 'DIV') field.value = %s;
+                  else field.textContent = %s;
+                  field.dispatchEvent(new Event('input', { bubbles: true }));
+                })()""" % (json.dumps(args.then_sequence), json.dumps(args.then_sequence)))
+                time.sleep(0.5)
             cdp.evaluate(ws, """(() => {
               const el = document.getElementById('recycles');
-              el.value = %s;
-              el.dispatchEvent(new Event('change', { bubbles: true }));
+              if (%s !== null) {
+                el.value = %s;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
               document.getElementById('predict').click();
-            })()""" % json.dumps(args.then_recycles))
-            time.sleep(2)
+            })()""" % (json.dumps(args.then_recycles), json.dumps(args.then_recycles)))
+            # 🔴 THE PANEL IS SAMPLED WHILE THE NEW FOLD IS STILL IN ITS TRUNK.
+            # A map left over from the PREVIOUS fold is invisible afterwards -
+            # by then the new one has replaced it - so the only moment it can
+            # be caught is between the click and the first recycle's contacts.
+            for _ in range(6):
+                print("early  :", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]].renderer;
+              const h = v.heatmapRenderer;
+              const maps = h && h.maps;
+              const sum = (m) => {
+                if (!m || !m.data) return null;
+                let a = 0;
+                for (let i = 0; i < m.data.length; i += 1) a = (a + m.data[i] * (i % 7 + 1)) % 1000000007;
+                return a;
+              };
+              const c = document.getElementById('heatmapContainer');
+              return JSON.stringify({
+                visible: !!(c && getComputedStyle(c).display !== 'none'),
+                keys: maps ? Object.keys(maps) : [],
+                contact: maps ? sum(maps.contact) : null,
+              });
+            })()"""))
+                time.sleep(0.4)
             cdp.wait_for(ws, """(() => {
               const s = document.getElementById('status-message');
               return /done|complete|finished|s\\b/i.test(s ? s.textContent : '')
