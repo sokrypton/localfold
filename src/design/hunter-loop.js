@@ -41,7 +41,7 @@ import {
 export const MAX_ALANINE = 0.20;
 
 /** Chain letters, in the order `toPdb` in src/af3/fold.js assigns them. */
-const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+export const CHAIN_IDS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 /**
  * The number a run is optimised on.
@@ -228,7 +228,7 @@ export async function* runDesign(options) {
     const eligible = cycle > 0 && alanine <= MAX_ALANINE;
     const record = {
       run, cycle, sequence, alanine, objective, score: value, designScore,
-      omit, alanineBias: bias,
+      omit, alanineBias: bias, chainIndex, chain: chainLetter,
       complex: withChain(chains, chainIndex, sequence),
       pdb: folded.pdb,
       meanPlddt: confidence.meanPlddt,

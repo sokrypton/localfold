@@ -266,14 +266,98 @@ def main():
                 failures.append("nothing marked best though %d cycles were under"
                                 " the alanine ceiling" % len(eligible))
 
-        print("frames  :", cdp.evaluate(ws, """(() => {
+        # 🔴 ONE OBJECT, ONE FRAME PER CYCLE, AND THE TARGET HOLDING STILL.
+        # The frames are the replay: a viewer rebuilt per cycle shows one
+        # structure and no play bar, and frames that were not superposed play
+        # back as a structure being thrown around a room. So this counts them,
+        # checks the transport controls appeared, and measures how far the
+        # TARGET's alpha carbons moved between the first frame and the last -
+        # which is what the fit holds at zero and what nothing else would.
+        frames = cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
           const key = Object.keys(reg)[0];
           const v = key && reg[key].renderer;
-          if (!v) return 'no viewer';
+          if (!v) return JSON.stringify({ error: 'no viewer' });
           const frames = v.objectsData[v.currentObjectName].frames;
-          return JSON.stringify({ object: v.currentObjectName, frames: frames.length });
-        })()"""))
+          // 🔴 A FRAME KEEPS ONE `coords` ENTRY PER RESIDUE - the alpha
+          // carbon - beside a parallel `chains`. Reading it as a list of
+          // ATOMS finds nothing, reports no chains, and the drift check
+          // silently measures neither structure.
+          const ca = (frame, chain) => frame.coords
+            .filter((_, i) => frame.chains[i] === chain);
+          const chains = [...new Set(frames[0].chains)].sort();
+          const held = chains.filter((c) => c !== 'A');
+          const on = held.length > 0 ? held[0] : 'A';
+          // 🔴 THE CENTROIDS, NOT THE RMSD. A superposed pair is NOT expected
+          // to have a small RMSD here: every cycle folds the target again from
+          // scratch, so its CONFORMATION differs between frames and a 31-mer
+          // peptide legitimately measured 3.9 A after a perfect fit. What a
+          // Kabsch fit does guarantee is that it translates the two centroids
+          // together. Measured both ways on this 31-mer target, superposition
+          // on and then off:
+          //
+          //     on   centroid 0.00006 A   rmsd  3.86 A
+          //     off  centroid 3.80    A   rmsd 13.60 A
+          //
+          // so the centroid separates them by five orders of magnitude and the
+          // RMSD by a factor of 3.5 against a real conformational difference
+          // of unknown size. The offset is not larger with superposition off
+          // because fittedPdb in web/af3-model.js already fits each fold's own
+          // frames to a per-fold reference, which removes most of the
+          // augmentation's TRANSLATION - what it cannot remove is the
+          // rotation, which is where the 13.6 comes from. The RMSD is reported
+          // because it is worth reading, not because it is the check.
+          const centre = (points) => points.reduce(
+            (sum, p) => [sum[0] + p[0] / points.length,
+                         sum[1] + p[1] / points.length,
+                         sum[2] + p[2] / points.length], [0, 0, 0]);
+          let drift = null;
+          let offset = null;
+          let extent = null;
+          if (frames.length > 1) {
+            const first = ca(frames[0], on);
+            const last = ca(frames[frames.length - 1], on);
+            if (first.length > 0 && first.length === last.length) {
+              let total = 0;
+              for (let i = 0; i < first.length; i += 1) {
+                total += (first[i][0] - last[i][0]) ** 2
+                       + (first[i][1] - last[i][1]) ** 2
+                       + (first[i][2] - last[i][2]) ** 2;
+              }
+              drift = Math.sqrt(total / first.length);
+              const a = centre(first);
+              const b = centre(last);
+              offset = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+              // ...and how big the thing is, so "close" is relative to it.
+              extent = Math.sqrt(first.reduce((sum, p) =>
+                sum + ((p[0] - a[0]) ** 2 + (p[1] - a[1]) ** 2
+                       + (p[2] - a[2]) ** 2) / first.length, 0));
+            }
+          }
+          const bar = document.getElementById('playButton');
+          return JSON.stringify({
+            object: v.currentObjectName, frames: frames.length,
+            labels: frames.map((f) => f.label),
+            chains, fittedOn: on, driftRmsd: drift,
+            centroidOffset: offset, radius: extent,
+            playBar: bar !== null && getComputedStyle(bar).display !== 'none',
+          });
+        })()""")
+        print("frames  :", frames)
+        shown = json.loads(frames)
+        if shown.get("frames") != expected:
+            failures.append("%s frames in the viewer, expected %d"
+                            % (shown.get("frames"), expected))
+        if expected > 1 and not shown.get("playBar"):
+            failures.append("no play bar, so the cycles cannot be replayed")
+        offset = shown.get("centroidOffset")
+        if offset is None:
+            failures.append("could not measure the fitted chain's drift")
+        elif offset > 1.0:
+            failures.append("the fitted chain's centroid moved %.2f A between the"
+                            " first frame and the last (radius %.1f) - the frames"
+                            " are not superposed"
+                            % (offset, shown.get("radius") or 0))
         print("download:", cdp.evaluate(
             ws, "!document.getElementById('downloads').hidden"))
     finally:

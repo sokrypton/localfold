@@ -27,6 +27,7 @@ import { runDesign } from "../src/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../src/design/mpnn-bridge.js";
 import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
 import { createEntityList } from "./entity-ui.js";
+import { superposePdb } from "../src/design/superpose-pdb.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
@@ -41,7 +42,9 @@ const number = (id, fallback) => {
   return Number.isFinite(value) ? value : fallback;
 };
 
-const viewer = createStructureViewer({ container: element("viewer"), canvasHeight: 480 });
+const viewer = createStructureViewer({
+  container: element("viewer"), canvasHeight: 480, frameLabel: "cycle",
+});
 
 /**
  * The target, as index.html's own entity rows.
@@ -149,12 +152,70 @@ function syncDesignerNote() {
     : DESIGNERS[name].note;
 }
 
-/** py2Dmol wants a fresh object per cycle: the sequence changes, so the atoms do. */
+/**
+ * Every cycle is a FRAME of one object, so the play bar walks the whole hunt.
+ *
+ * 🔴 THIS USED TO RESET THE VIEWER AND PUSH ONE FRAME, which threw away the
+ * thing `viewer.push` exists to do. It appends by design - it builds the
+ * object on the first call and adds a frame on every one after - and py2Dmol's
+ * transport controls reveal themselves the moment a second frame lands. A
+ * reset per cycle meant a viewer that could only ever hold one.
+ *
+ * 🔴 AND EACH FRAME IS SUPERPOSED ONTO THE FIRST BEFORE IT GOES IN. AF3's
+ * sampler randomly re-orients every fold, and `addFrame`'s own alignment needs
+ * two frames with equal position counts - which a redesigned chain never has.
+ * See src/design/superpose-pdb.js.
+ */
+let referencePdb;
+
+function frameFor(record) {
+  const api = window.py2Dmol;
+  if (referencePdb === undefined || api?.superpose === undefined) return record.pdb;
+  try {
+    return superposePdb(api.superpose, record.pdb, referencePdb,
+                        { designed: record.chain ?? "A" }).pdb;
+  } catch (error) {
+    // An unalignable frame is still worth showing; it just sits where it fell.
+    console.warn("superposition skipped:", error);
+    return record.pdb;
+  }
+}
+
 function show(record) {
-  viewer.reset();
-  viewer.push(record.pdb);
-  viewer.paint();
-  element("orient").hidden = false;
+  const pdb = frameFor(record);
+  const { built, frames } = viewer.push(pdb);
+  if (built) {
+    referencePdb = pdb;
+    viewer.paint();
+    element("orient").hidden = false;
+  }
+  // 🔴 THE FRAME CARRIES ITS OWN CONFIDENCE AND PAE, which is where py2Dmol
+  // looks for them - so scrubbing the bar moves the score card and the matrix
+  // with it, rather than leaving the last cycle's numbers under an earlier
+  // cycle's structure.
+  const object = viewer.renderer?.objectsData?.[viewer.object];
+  const frame = object?.frames?.[frames - 1];
+  if (frame !== undefined) {
+    const label = `run ${record.run + 1} · cycle ${record.cycle}`;
+    frame.name = label;
+    frame.label = label;
+    frame.title = label;
+    frame.confidence = record.folded?.confidence;
+  }
+  jumpTo(frames - 1);
+  return frames - 1;
+}
+
+/** Draw a frame that is already in the object. */
+function jumpTo(index) {
+  const renderer = viewer.renderer;
+  if (renderer === undefined || index < 0) return;
+  try {
+    renderer.setFrame(index);
+    renderer.render("cycle");
+  } catch (error) {
+    console.warn("frame skipped:", error);
+  }
 }
 
 const percent = (value) => (Number.isFinite(value) ? `${(value * 100).toFixed(0)}%` : "–");
@@ -195,7 +256,10 @@ function renderTable() {
       }
       row.append(cell);
     }
-    row.addEventListener("click", () => show(record));
+    // ...scrub to that cycle's frame rather than rebuilding the viewer, which
+    // is the whole reason the frames are in one object.
+    const at = record.frame;
+    row.addEventListener("click", () => jumpTo(at));
     body.append(row);
   }
   element("results").hidden = history.length === 0;
@@ -321,6 +385,8 @@ async function hunt() {
   renderTable();
   element("downloads").hidden = true;
   viewer.forgetCamera();
+  viewer.reset();
+  referencePdb = undefined;
 
   const runs = Math.max(1, number("runs", 1));
   const cycles = Math.max(0, number("cycles", 5));
@@ -399,7 +465,7 @@ async function hunt() {
 
       for await (const record of iterator) {
         history.push(record);
-        show(record);
+        record.frame = show(record);
         renderTable();
       }
     }
