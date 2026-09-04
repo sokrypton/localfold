@@ -405,6 +405,18 @@ What did **not** work, measured, so it is not retried:
   never uploaded, and halving their bytes does not halve the read INSTRUCTIONS -
   these kernels read weights one scalar at a time and this machine is
   instruction-bound. It is still worth doing for MEMORY; see below.
+- **The same f16 staging in the MSA STACK, which is the same kernels one stage
+  earlier.** Its pair track and transition give 580 -> 516 ms at 236 tokens -
+  11%, a bigger relative win than the pairformer's - and the trunk's contact
+  probabilities go **1.86e-4 to 5.21e-3**, 28x, with the pair at 6.64e-5
+  against 4e-5. Staging only its pair track and leaving the MSA transition
+  alone still costs 3.72e-3 for 44 ms.
+
+  🔴 **THE DIFFERENCE IS POSITION, NOT ARITHMETIC.** The MSA stack writes the
+  pair representation that all 48 pairformer blocks then read, so its rounding
+  is amplified by everything downstream; the pairformer's own is not. That is
+  the rule for the next one of these: the same trade is worth taking near the
+  output and not near the input.
 - **Anything that adds registers to the flash attention kernel.** See
   src/evoformer/attention.js: a vec4 q.k accumulator is worth exactly zero
   (the compiler already does it), grouping the keys to amortise the softmax
