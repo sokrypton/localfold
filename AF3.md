@@ -628,8 +628,37 @@ measurements is in each file.
   bearing there; getting either wrong moved 1e-7 through a reference the GPU
   checkers compare against at 1e-6, which is a tolerance nobody chose. What is
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
-- **Templates raise** rather than compute - but the reason has changed and the
-  blocker is gone. It was "the geometry features are unverifiable without a
+- ~~**Templates raise** rather than compute.~~ Closed on the CPU 2026-09-04:
+  `src/af3/template-features.js` computes all six geometry features and
+  `template-reference.js` loops over real slots. Against AF3 on a 16-residue
+  query with Top7 in slot 0 of four:
+
+  | | relRMS |
+  |---|---|
+  | slot 0, real | 5.03e-7 |
+  | slots 1-3, empty | 2.35e-7 |
+  | the module's 128-channel output | 1.74e-7 |
+
+  **The GPU path still raises**, and the page is unchanged until it does not.
+
+  🔴 **ONE THING WAS WRONG AND ONLY THE ORACLE COULD HAVE SAID SO.** The unit
+  vector is `R_i^-1 (t_j - t_i)` - the FRAME is the row index and the POINT is
+  the column - because AF3 writes
+  `rigid[:, None].inverse().apply_to_point(points)` and the broadcast puts
+  frames on axis 0. Written the other way it is the exact transpose: still unit
+  length, still smooth, still masked correctly. Measured both ways against
+  AF3's own `make_backbone_rigid`:
+
+  | | unit vector | distogram | both masks |
+  |---|---|---|---|
+  | frame on the row | **1.29e-7** | 0 | 0 |
+  | frame on the column | 1.51e+0 | 0 | 0 |
+
+  Everything else was bit-exact either way, so nothing but a real template
+  could have found it - which is precisely the argument the module's own
+  header used for not writing these features at all.
+
+  The rest of the entry, kept because it is what the checkers read: It was "the geometry features are unverifiable without a
   reference", which was true: with no template all six are identically zero, so
   nothing here could tell a correct implementation from a wrong one.
   `tools/oracle/dump_af3_trunk.py --template <pdb>` now produces one. Measured

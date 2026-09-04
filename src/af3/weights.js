@@ -329,6 +329,19 @@ export async function templateWeights(store) {
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
     templatePairEmbedding2: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_2/weights`),
     templatePairEmbedding3: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_3/weights`),
+    // 🔴 THE SIX GEOMETRY FEATURES' WEIGHTS WERE IN THE BUNDLE ALL ALONG AND
+    // WERE NOT READ. Only 2, 3 and 8 were loaded, because only those three are
+    // reachable when every template slot is empty - so a checkpoint that has
+    // always carried nine projections was being read for three. Four of these
+    // are [64] rather than [39, 64] or [31, 64]: AF3 builds them with
+    // `num_input_dims=0`, which makes the input a SCALAR per pair and the
+    // weight a per-channel vector.
+    templatePairEmbedding0: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_0/weights`),
+    templatePairEmbedding1: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_1/weights`),
+    templatePairEmbedding4: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_4/weights`),
+    templatePairEmbedding5: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_5/weights`),
+    templatePairEmbedding6: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_6/weights`),
+    templatePairEmbedding7: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_7/weights`),
     outputLayerNormScale: await T(`${TEMPLATE_SINGLE}/output_layer_norm/scale`),
     outputLayerNormOffset: await T(`${TEMPLATE_SINGLE}/output_layer_norm/offset`),
     outputLinear: await T(`${TEMPLATE}/output_linear/weights`),

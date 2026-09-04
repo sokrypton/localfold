@@ -52,6 +52,7 @@ values means the whole-stack checker, not that file.
 | What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
+| Does the template embedder match AF3 with a REAL template? | `tools/oracle/check_af3_template_geometry.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |

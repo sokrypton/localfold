@@ -15,17 +15,22 @@
  *
  * AF2-multimer had the identical trap. It cost this project a week there.
  *
- * 🔴 ONLY THE EMPTY-TEMPLATE PATH IS IMPLEMENTED, AND REAL TEMPLATES RAISE.
- * The six geometry features - a 39-bin pseudo-beta distogram, its mask, three
- * components of a unit vector in each residue's backbone frame, and the
- * backbone mask - are all identically zero when no template is present, so
- * nothing in this repository can currently tell a correct implementation of
- * them from a wrong one. Writing them anyway would add a hundred lines that no
- * measurement covers, which is how a silent error gets in. They raise instead.
+ * 🔴 REAL TEMPLATES USED TO RAISE, AND THE REASON WAS GOOD. The six geometry
+ * features - a 39-bin pseudo-beta distogram, its mask, three components of a
+ * unit vector in each residue's backbone frame, and the backbone mask - are
+ * all identically zero when no template is present, so nothing here could tell
+ * a correct implementation of them from a wrong one, and writing them anyway
+ * would have been a hundred lines no measurement covers.
+ *
+ * `tools/oracle/dump_af3_trunk.py --template <pdb>` produces the measurement.
+ * The features themselves are in src/af3/template-features.js, kept separate
+ * because they are arithmetic over coordinates and can be checked before any
+ * embedding is involved; `tools/oracle/check_af3_template.js` does both.
  */
 import {
   gridSelfAttention, layerNorm, linear, transition, triangleMultiplication,
 } from "./pairformer-reference.js";
+import { DGRAM_BINS, templateGeometry } from "./template-features.js";
 
 const RESTYPES = 31;
 const CHANNELS = 64;
@@ -62,71 +67,119 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
  */
 export function templateEmbedding(input, weights, dialect) {
   const { tokens, pair, pairMask, templates } = input;
-  if (input.templateOccupied) {
-    throw new Error("this template embedder only implements the empty-template"
-      + " path: the six geometry features are identically zero without a"
-      + " template, so nothing here can verify an implementation of them."
-      + " See the note at the top of src/af3/template-reference.js.");
-  }
   const pairs = tokens * tokens;
+  const slots = input.slots ?? [];
+  if (slots.length > templates) {
+    throw new RangeError(`${slots.length} templates for ${templates} slots`);
+  }
+  // 🔴 EVERY PAIR IS INTRA-CHAIN UNLESS SAID OTHERWISE. A template covers ONE
+  // chain, so AF3 masks the cross-chain pairs out of every geometry feature -
+  // and a caller that forgets gets distances between two chains that were
+  // never in the same reference frame, which are real numbers and are nonsense.
+  const multichainMask2d = input.multichainMask2d
+    ?? new Float32Array(pairs).fill(1);
 
-  // Feature 8: the query pair representation, normalised. With no template this
-  // is the only per-pair signal, and it is what makes the module's output large.
+  // Feature 8: the query pair representation, normalised. It does not depend on
+  // the slot, so it and its projection are computed ONCE - which is most of the
+  // module's arithmetic when the slots are empty and all of it when there are
+  // none.
   const normalised = layerNorm(pair, pairs, weights.queryChannels,
                                weights.queryEmbeddingNormScale,
                                weights.queryEmbeddingNormOffset);
-  const act = linear(normalised, pairs, weights.queryChannels, CHANNELS,
-                     weights.templatePairEmbedding8);
+  const queryTerm = linear(normalised, pairs, weights.queryChannels, CHANNELS,
+                           weights.templatePairEmbedding8);
 
-  // Features 2 and 3: the query aatype, once along each axis. The template's
-  // OWN aatype is what AF3 embeds here, and an empty slot carries type 0 - so
-  // these contribute row 0 of each weight rather than nothing.
-  const oneHot = new Float32Array(tokens * RESTYPES);
-  for (let token = 0; token < tokens; token += 1) {
-    const code = input.templateAatype ? input.templateAatype[token] : 0;
-    if (code >= 0 && code < RESTYPES) oneHot[token * RESTYPES + code] = 1;
-  }
-  const row = linear(oneHot, tokens, RESTYPES, CHANNELS,
-                     weights.templatePairEmbedding2);
-  const column = linear(oneHot, tokens, RESTYPES, CHANNELS,
-                        weights.templatePairEmbedding3);
-  for (let i = 0; i < tokens; i += 1) {
-    for (let j = 0; j < tokens; j += 1) {
-      const base = (i * tokens + j) * CHANNELS;
-      for (let c = 0; c < CHANNELS; c += 1) {
-        // ...feature 2 is aatype[None, :, :], so it varies along j; feature 3
-        // is aatype[:, None, :] and varies along i.
-        act[base + c] += row[j * CHANNELS + c] + column[i * CHANNELS + c];
+  const summed = new Float32Array(pairs * CHANNELS);
+  for (let slot = 0; slot < templates; slot += 1) {
+    const template = slots[slot];
+    const act = Float32Array.from(queryTerm);
+
+    // Features 2 and 3: the TEMPLATE's aatype, once along each axis. An empty
+    // slot carries type 0 - ALA - so these contribute row 0 of each weight
+    // rather than nothing, which is half of why an empty slot is not a no-op.
+    const oneHot = new Float32Array(tokens * RESTYPES);
+    for (let token = 0; token < tokens; token += 1) {
+      const code = template ? template.aatype[token] : 0;
+      if (code >= 0 && code < RESTYPES) oneHot[token * RESTYPES + code] = 1;
+    }
+    const row = linear(oneHot, tokens, RESTYPES, CHANNELS,
+                       weights.templatePairEmbedding2);
+    const column = linear(oneHot, tokens, RESTYPES, CHANNELS,
+                          weights.templatePairEmbedding3);
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        const base = (i * tokens + j) * CHANNELS;
+        for (let c = 0; c < CHANNELS; c += 1) {
+          // ...feature 2 is aatype[None, :, :], so it varies along j; feature 3
+          // is aatype[:, None, :] and varies along i.
+          act[base + c] += row[j * CHANNELS + c] + column[i * CHANNELS + c];
+        }
       }
     }
+
+    // Features 0, 1, 4, 5, 6 and 7: the geometry. All exactly zero for an empty
+    // slot - the distogram is multiplied by a pseudo-beta mask that is zero,
+    // the unit vectors by a backbone mask that is zero, and the two masks are
+    // themselves two of the features - so an empty slot skips the work rather
+    // than computing zeros.
+    if (template !== undefined && template !== null) {
+      const geometry = templateGeometry(template, multichainMask2d, tokens);
+      for (let index = 0; index < pairs; index += 1) {
+        const base = index * CHANNELS;
+        for (let bin = 0; bin < DGRAM_BINS; bin += 1) {
+          const value = geometry.distogram[index * DGRAM_BINS + bin];
+          if (value === 0) continue;
+          for (let c = 0; c < CHANNELS; c += 1) {
+            act[base + c] += value * weights.templatePairEmbedding0[bin * CHANNELS + c];
+          }
+        }
+        // 🔴 FEATURES 1, 4, 5, 6 AND 7 ARE SCALARS TIMES A [64] VECTOR, not
+        // matrix products. AF3 builds them with `num_input_dims=0`, which makes
+        // the weight a per-channel scale rather than a projection - so reading
+        // any of these four as a [1, 64] matmul is right by accident and
+        // reading them as [39, 64] or [31, 64] is a shape error that only
+        // shows up as a wrong answer.
+        const scalars = [
+          [geometry.pseudoBetaMask2d[index], weights.templatePairEmbedding1],
+          [geometry.unitVector[index * 3], weights.templatePairEmbedding4],
+          [geometry.unitVector[index * 3 + 1], weights.templatePairEmbedding5],
+          [geometry.unitVector[index * 3 + 2], weights.templatePairEmbedding6],
+          [geometry.backboneMask2d[index], weights.templatePairEmbedding7],
+        ];
+        for (const [value, weight] of scalars) {
+          if (value === 0) continue;
+          for (let c = 0; c < CHANNELS; c += 1) act[base + c] += value * weight[c];
+        }
+      }
+    }
+
+    let embedded = act;
+    for (let index = 0; index < weights.blocks.length; index += 1) {
+      embedded = templateBlock(embedded, pairMask, tokens, weights.blocks[index], dialect);
+    }
+    embedded = layerNorm(embedded, pairs, CHANNELS, weights.outputLayerNormScale,
+                         weights.outputLayerNormOffset);
+    // 🔴 REPORTED PER SLOT, BECAUSE THE SUM HIDES WHICH SLOT WAS WRONG. AF3
+    // captures `single_template_embedding/__call__#k` at exactly this point -
+    // after the two blocks and the LayerNorm, before the summation and the
+    // output projection - so a checker can hold ONE slot's 64 channels to it
+    // and see the geometry on its own. Summed and projected, a wrong unit
+    // vector and a wrong distogram bin are the same number.
+    input.onSlot?.(slot, embedded);
+    for (let index = 0; index < summed.length; index += 1) summed[index] += embedded[index];
   }
 
-  // Features 0, 1, 4, 5, 6 and 7 are the template geometry and are all exactly
-  // zero here: the distogram is multiplied by a pseudo-beta mask that is zero,
-  // the unit vectors by a backbone mask that is zero, and the two masks are
-  // themselves the remaining features.
-
-  let embedded = act;
-  for (let index = 0; index < weights.blocks.length; index += 1) {
-    embedded = templateBlock(embedded, pairMask, tokens, weights.blocks[index], dialect);
-  }
-  embedded = layerNorm(embedded, pairs, CHANNELS, weights.outputLayerNormScale,
-                       weights.outputLayerNormOffset);
-
-  // 🔴 THE SUM IS DIVIDED BY THE TEMPLATE COUNT, NOT BY HOW MANY ARE REAL.
-  // Four empty slots each produce the SAME embedding, so the sum is four times
-  // one of them and the division puts it back - the module behaves as though
-  // there were exactly one template, whatever the slot count. Dividing by the
-  // number of real templates instead would be a division by zero here.
-  const summed = new Float32Array(embedded.length);
-  for (let index = 0; index < embedded.length; index += 1) {
-    summed[index] = embedded[index] * templates / (1e-7 + templates);
-  }
-
-  // ...relu before the projection, so the module can only add along the
-  // directions its output_linear selects from a non-negative combination.
+  // 🔴 DIVIDED BY THE SLOT COUNT, NOT BY HOW MANY SLOTS ARE REAL. Four empty
+  // slots each produce the SAME embedding, so the sum is four times one of them
+  // and the division puts it back - the module behaves as though there were
+  // exactly one template, whatever the slot count. With one real template among
+  // four slots the real one is therefore worth a QUARTER of what it would be
+  // alone, which is AF3's arithmetic and not an oversight to correct.
+  const scale = 1 / (1e-7 + templates);
   for (let index = 0; index < summed.length; index += 1) {
-    if (summed[index] < 0) summed[index] = 0;
+    // ...relu before the projection, so the module can only add along the
+    // directions its output_linear selects from a non-negative combination.
+    summed[index] = Math.max(0, summed[index] * scale);
   }
   return linear(summed, pairs, CHANNELS, weights.queryChannels, weights.outputLinear);
 }
