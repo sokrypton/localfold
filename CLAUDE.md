@@ -56,6 +56,7 @@ values means the whole-stack checker, not that file.
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
+| Is an AF3 fold's f16 path still worth it? | `tools/gpu/fold.js --staged= --weights=` (both arms, one shell) |
 | Does the progress bar move at the fold's speed? | `tools/gpu/probe-progress-bar.js` |
 | Does a failed fold keep its trunk for the retry? | `tools/gpu/probe-trunk-reuse-after-failure.js` |
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |

@@ -84,9 +84,16 @@ folded single-sequence, is not one.
 
  ### Speed, 68 tokens
 
-A flow-8 fold is **3.0 s** - 1.1 s of trunk and 1.7 s of diffusion - and a
-diffusion-200 fold is 25.9 s. It was ~150 s when the first end-to-end fold ran,
-and 7 s before the kernel work of 2026-09-02.
+A flow-8 fold is **2.5 s** - 1.1 s of trunk and 1.4 s of diffusion - and it
+holds **798 MiB** on the device. It was 3.2-3.4 s and 1406 MiB before the f16
+work of 2026-09-04, ~150 s when the first end-to-end fold ran, and 7 s before
+the kernel work of 2026-09-02. A diffusion-200 fold was 25.9 s at the 3.0 s
+era.
+
+Where the 2.5 s goes: two trunk passes at ~350 ms of pairformer each, then
+eight denoiser calls of which the FIRST is ~550 ms and the rest ~86. That first
+call is pipeline compilation and the one-off f16 conversion of the transformer's
+weights, and it is the largest single item left.
 
 🔴 **THE 12 ms THIS FILE ATTRIBUTED TO THE SAMPLER'S PER-STEP WORK WAS NOT
 THERE.** It said a denoiser call cost 123 ms inside the sampler against 111 on
@@ -417,6 +424,15 @@ What did **not** work, measured, so it is not retried:
   is amplified by everything downstream; the pairformer's own is not. That is
   the rule for the next one of these: the same trade is worth taking near the
   output and not near the input.
+- **Preparing the diffusion head's weights during the trunk.** A pairformer
+  pass encodes in ~5 ms and waits ~340 for the device, and none of the
+  transformer's 24 blocks depends on the trunk - so packing them into that gap
+  should be free, and the first denoiser call would stop being several times a
+  steady one. Measured, the work MOVED and the fold did not: **trunk 1.1 -> 1.4
+  s, diffusion 1.4 -> 1.0, total 2.5 either way.** The host time is idle but
+  the BUS is not - filling 378 MiB of resident buffers competes with the
+  trunk's own traffic for exactly what it saves. It is the same finding as the
+  up-front weight burst above, in a new place.
 - **Anything that adds registers to the flash attention kernel.** See
   src/evoformer/attention.js: a vec4 q.k accumulator is worth exactly zero
   (the compiler already does it), grouping the keys to amortise the softmax
