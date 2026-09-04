@@ -59,6 +59,13 @@ def main():
                         help="the value of the #model select: monomer, multimer or af3")
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
+    parser.add_argument("--url", default=None,
+                        help="drive a DEPLOYED page instead of this checkout,"
+                             " e.g. https://localfold.org/index.html. The"
+                             " weights then come from the bundle's pinned"
+                             " remote, which is a ~97 MB download per run"
+                             " because each run starts a fresh profile with an"
+                             " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
@@ -72,7 +79,8 @@ def main():
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile")
     try:
         ws.call("Page.enable")
-        ws.call("Page.navigate", url="http://127.0.0.1:%d/index.html" % PORT)
+        ws.call("Page.navigate",
+                url=args.url or ("http://127.0.0.1:%d/index.html" % PORT))
         cdp.wait_for(ws, "typeof window.processFiles === 'function'"
                          " && !document.getElementById('predict').disabled",
                      what="the page to finish loading")
