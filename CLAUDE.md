@@ -452,6 +452,50 @@ left the status line **75px**, which fits none of "MSA search · queued
 Measured by forcing the dial visible at each width, which is the only way it is
 ever laid out.
 
+🔴 **"DOWNLOAD ALL" WRITES THE AF3 SERVER'S ARCHIVE, AND THE UPLOAD BOX READS
+IT BACK.** `web/zip.js` is a writer and a reader in one file; `web/fold-archive.js`
+assembles the members. Checked against `fold_2026_09_01_10_17.zip` in the repo
+root: `full_data_0.json` and `job_request.json` match key for key, and
+`summary_confidences_0.json` carries nine of its ten. The tenth, `has_clash`, is
+omitted because it is a claim about geometry nothing here computes. The
+structure is `.pdb` where the server writes `.cif`, which is the one deliberate
+difference.
+
+🔴 **AND THE ALIGNMENT ROUND TRIP WAS BROKEN BEFORE IT, IN A WAY THE PAGE
+ADMITTED IN A COMMENT.** "A pasted or uploaded A3M is one text and cannot be
+split into blocks; it becomes the unpaired one." AF3 reads the paired block
+first and takes its profile over the UNPAIRED one alone, so downloading an
+alignment and uploading it again folded something else, silently. The archive
+carries one a3m per chain per block; `msasFromArchive` feeds them back through
+`mergeSearchedChains`, the same call the search path makes.
+`tools/archive-roundtrip.py` folds, downloads, re-uploads and folds again -
+and asserts on **"trunk reused"**, because the trunk cache key hashes the
+alignment blocks, so reuse is the page saying the restored blocks are
+bit-identical to the searched ones. A matching structure alone would be weaker.
+
+🔴 **AND THE SCORE KEYS ARE ASYM IDS, NOT CHAIN INDICES.** AF3 numbers chains
+from ONE (`featurise.js` writes `identity.asymId + 1`); AF2 uses contiguous
+blocks from zero. Reading the keys as indices gave a real two-chain fold
+`chain_pair_iptm: [[null, null], [null, null]]` and `chain_ptm: [null, 0.69]` -
+"1|2" matching nothing and "1" matching the second chain by accident. **Every
+unit test passed**, because they were all written with 0-based keys. The
+archive sorts the ids it finds and takes the nth as the nth chain.
+
+🔴 **AND `fold-in-page.py` CAN DRIVE A COMPLEX NOW** - one entity per chain
+through `window.__entityList`, instead of typing a colon-joined sequence into
+one field and waiting out the timeout. A 108-residue two-chain fold with
+`--msa-mode search` takes about 6 s. **A 199-residue one (barnase/barstar with
+10,839 hits) sat at "Trunk · 1%" for twenty minutes and did not finish** - not
+diagnosed, but it is the shape to avoid in a quick loop.
+
+🔴 **AND AlphaFold 2 SAVES ITS BEST PASS, NOT ITS LAST.** Recycling is not
+monotonic and AlphaFold's own pipeline ranks its outputs; the criterion is
+ColabFold's `rank_by: auto` - the multimer score for a complex, mean pLDDT for a
+monomer - and the search starts from the last pass so a tie keeps the more
+converged one. The scores card and the status line report the saved pass, and
+the line says `saved pass N of M` when it is not the last, because the play bar
+is still sitting on the last one.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring

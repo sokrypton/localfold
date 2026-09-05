@@ -141,9 +141,46 @@ export function fullDataJson({ confidence, pdb, tokenChainIds, tokenResIds }) {
   return `${JSON.stringify(data)}\n`;
 }
 
+/**
+ * Which asym id is which chain, in chain order.
+ *
+ * 🔴 THE SCORE KEYS ARE ASYM IDS AND THEY ARE NOT THE CHAIN INDEX. AlphaFold 3
+ * numbers its chains from ONE - `featurise.js` writes `identity.asymId + 1` -
+ * while AlphaFold 2 uses contiguous blocks numbered from zero. Reading the keys
+ * as indices produced a summary that looked complete and was not: a real
+ * two-chain fold came out with `chain_pair_iptm` all null and
+ * `chain_ptm: [null, 0.69]`, because "1|2" matched nothing and "1" matched the
+ * second chain by accident. Every unit test passed - they were written with
+ * 0-based keys, which is the AF2 convention and half the truth.
+ *
+ * So the ids are taken from the scores themselves and sorted: the nth distinct
+ * asym id is the nth chain. That holds for both models without either being
+ * named here.
+ */
+function asymOrder(confidence, chainCount) {
+  const ids = new Set();
+  const add = (value) => {
+    const id = Number(value);
+    if (Number.isFinite(id)) ids.add(id);
+  };
+  for (const key of Object.keys(confidence.chainPtm ?? {})) add(key);
+  for (const key of Object.keys(confidence.chainIptm ?? {})) add(key);
+  for (const key of Object.keys(confidence.chainPairIptm ?? {})) {
+    for (const part of key.split("|")) add(part);
+  }
+  const sorted = [...ids].sort((a, b) => a - b);
+  // ...and when the scores do not name every chain - a monomer, or a pair that
+  // could not be scored - there is nothing to align against, so the plain
+  // index is used and a missing entry stays null rather than being shifted onto
+  // the wrong chain.
+  return sorted.length === chainCount ? sorted
+    : Array.from({ length: chainCount }, (_, index) => index);
+}
+
 /** The scalar scores, as `summary_confidences_0.json`. */
 export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds }) {
   const chains = chainLengths.map((_, index) => chainLetter(index));
+  const asym = asymOrder(confidence, chains.length);
   const summary = { chain_ids: tokenChainIds };
 
   // 🔴 THE PAIR MATRIX IS BUILT FROM THE MAP, NOT ASSUMED SQUARE-COMPLETE.
@@ -155,15 +192,15 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
   if (pairs !== undefined && Object.keys(pairs).length > 0) {
     summary.chain_pair_iptm = chains.map((_, a) => chains.map((__, b) => {
       if (a === b) return null;
-      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
-      const value = pairs[key];
+      const [first, second] = asym[a] < asym[b] ? [asym[a], asym[b]] : [asym[b], asym[a]];
+      const value = pairs[`${first}|${second}`];
       return value === undefined ? null : round2(value);
     }));
   }
   // Per chain, in chain order, as the server writes them.
   const perChain = (values) => (values === undefined ? undefined
-    : chains.map((_, index) => (values[index] === undefined
-      ? null : round2(values[index]))));
+    : chains.map((_, index) => (values[asym[index]] === undefined
+      ? null : round2(values[asym[index]]))));
   const chainPtm = perChain(confidence.chainPtm);
   const chainIptm = perChain(confidence.chainIptm);
   if (chainPtm !== undefined) summary.chain_ptm = chainPtm;
@@ -291,6 +328,14 @@ export function buildFoldArchive({
   (msas.paired ?? []).forEach((text, chain) => {
     if (text) files.set(`msas/${name}_paired_msa_chains_${chainLetter(chain).toLowerCase()}.a3m`, text);
   });
+  // 🔴 A MERGED ALIGNMENT IS NOT WRITTEN AS CHAIN A'S. A pasted a3m, or an
+  // uploaded one that was not an archive, is one text covering every chain and
+  // carrying no record of which rows were paired - so naming it
+  // `_unpaired_msa_chains_a.a3m` would claim a split it does not have, and on a
+  // complex would claim the whole alignment belongs to the first chain. It goes
+  // under a name of its own, which is also what tells the reader on the way
+  // back that there is nothing to reconstruct.
+  if (msas.merged) files.set(`msas/${name}_merged_msa.a3m`, msas.merged);
 
   templates.forEach((template, index) => {
     if (!template?.text) return;
@@ -345,5 +390,9 @@ export function msasFromArchive(files) {
   for (let chain = 0; chain <= highest; chain += 1) {
     chainA3ms.push(unpaired.get(chain) ?? "");
   }
-  return { chainA3ms, pairedA3ms: paired, chains: highest + 1 };
+  let merged;
+  for (const [path, text] of files) {
+    if (/^msas\/.*_merged_msa\.a3m$/i.test(path)) merged = text;
+  }
+  return { chainA3ms, pairedA3ms: paired, chains: highest + 1, merged };
 }

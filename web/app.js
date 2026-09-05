@@ -46,6 +46,8 @@ import { complexSequenceProblem } from "./sequence.js";
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
+import { buildFoldArchive, msasFromArchive } from "./fold-archive.js";
+import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
@@ -163,8 +165,55 @@ const msaMode = () => {
 };
 
 let uploadedA3m = "";
+/**
+ * The per-chain alignments out of an uploaded archive, when one was uploaded.
+ *
+ * 🔴 KEPT SEPARATELY FROM `uploadedA3m` BECAUSE THEY ARE NOT THE SAME THING. A
+ * bare a3m is one text with no record of which rows were paired; an archive
+ * carries the blocks apart, which is the whole reason the archive exists. See
+ * msasFromArchive in web/fold-archive.js.
+ */
+let uploadedMsas;
 let predictionCount = 0;
 const predictions = new Map();
+
+/**
+ * The per-chain alignments a downloaded archive should carry.
+ *
+ * 🔴 THE SPLIT SURVIVES ONLY WHERE IT EXISTED. A search produces one alignment
+ * per chain and, for distinct sequences, a paired block beside it - that is
+ * what `searchCache.raw` already holds, and writing it out is a copy rather
+ * than a computation. A pasted a3m never had the split, and an uploaded one had
+ * it only if it arrived as an archive. Each case is written as what it is; the
+ * one thing this must not do is present a merged alignment as chain A's
+ * unpaired block, which reads back as a fold nobody ran.
+ */
+function archiveMsas(chains, alignment) {
+  if (msaMode() === "upload" && uploadedMsas !== undefined) return uploadedMsas;
+  if (msaMode() === "search" && searchCache?.raw !== undefined) {
+    const { chainA3ms, pairedA3ms, single } = searchCache.raw;
+    if (chainA3ms !== undefined) {
+      return {
+        unpaired: chainA3ms,
+        paired: chains.map((chain) => pairedA3ms?.get(chain)),
+      };
+    }
+    if (single !== undefined) return { unpaired: [single.a3m] };
+  }
+  return alignment ? { merged: alignment } : {};
+}
+
+/**
+ * What the running fold was GIVEN, as opposed to what it produced.
+ *
+ * 🔴 THE ARCHIVE NEEDS BOTH HALVES AND THEY ARE KNOWN IN DIFFERENT PLACES. The
+ * entities, the settings and the alignment are settled in `runFold`, before it
+ * branches on the model; the structure and the scores exist only inside
+ * whichever branch ran. Threading the first set through two long signatures to
+ * meet the second was the alternative, and it means every future field is two
+ * more parameters on functions that already take eight.
+ */
+let foldContext = {};
 
 /** The last prediction, kept so it can be downloaded as it was computed. */
 let lastPrediction;
@@ -381,6 +430,29 @@ async function alignmentText(chains, signal, family) {
       return text;
     }
     case "upload": {
+      // 🔴 AN ARCHIVE RESTORES THE BLOCKS; A BARE a3m NEVER HAD THEM. This is
+      // the half of the round trip that makes downloading an alignment worth
+      // anything: the per-chain files are merged back through the SAME function
+      // the search path uses, so an uploaded archive reaches the model as
+      // exactly what its fold reached it as. A single a3m keeps the old
+      // meaning - one text, recorded as the unpaired block - because that is
+      // genuinely all it says.
+      if (uploadedMsas?.chains > 0) {
+        const merged = mergeSearchedChains({
+          sequences: chains,
+          chainA3ms: uploadedMsas.chainA3ms,
+          pairedA3ms: new Map(chains.map((chain, index) =>
+            [chain, uploadedMsas.pairedA3ms.get(index)])),
+          model: family,
+        });
+        if (uploadedMsas.chains !== chains.length) {
+          throw new Error(`that archive holds ${uploadedMsas.chains} alignments`
+            + ` and this fold has ${chains.length} chain`
+            + `${chains.length === 1 ? "" : "s"}`);
+        }
+        status(`Alignment from the archive · ${uploadedMsas.chains} chains`);
+        return { text: merged.a3m, blocks: merged.blocks };
+      }
       if (uploadedA3m.length === 0) throw new Error("Choose an A3M file, or switch the alignment back to none");
       return uploadedA3m;
     }
@@ -890,6 +962,11 @@ function attachContactMap(frame, recycle, weights, length) {
       // ...and kept, so a rewind can put this frame back without recomputing a
       // head that costs 131 ms at 128 residues and 712 at 300.
       recycle.contactMap = contact;
+      // 🔴 AND THE PROBABILITIES THEMSELVES, NOT ONLY THE BYTES. `contactMapFor`
+      // quantises to 0-255 for the heatmap, which is all the panel needs and is
+      // a lossy thing to put in a results file - the archive writes the same
+      // numbers AlphaFold 3 does, so it wants what the head produced.
+      recycle.contactProbs = contacts;
       refreshHeatmap();
     } catch (cause) {
       console.warn("contact map unavailable for this pass", cause);
@@ -1462,9 +1539,17 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // backbone that does not join up. The trajectory is on screen in the play
       // bar, where it can be watched; what gets saved is the answer.
       pdb: result.pdb,
-      scores: confidenceJson(chains.join(""), result.confidence),
+      // ...the contacts travel WITH the confidence, because everything that
+      // reads one reads the other: the scores file, the archive's full_data,
+      // and the heatmap all want the same token-by-token matrices.
+      confidence: { ...result.confidence, contactProbs: result.contactProbs },
+      scores: confidenceJson(chains.join(""),
+        { ...result.confidence, contactProbs: result.contactProbs }),
       a3m: alignment,
+      chains,
       chainLengths: chains.map((chain) => chain.length),
+      model: "AlphaFold 3",
+      ...foldContext,
     };
     predictions.set(stem, lastPrediction);
     element("downloads").style.display = "flex";
@@ -1753,6 +1838,26 @@ async function fold(event) {
     }
     const chainLengths = chains.map((chain) => chain.length);
 
+    // 🔴 RECORDED BEFORE THE BRANCH, because this is where it is all known. See
+    // foldContext: the entities, the settings and the alignment are settled
+    // here and the structure exists only inside whichever branch runs.
+    foldContext = {
+      entities,
+      templates: templateSources,
+      msas: archiveMsas(chains, alignment),
+      msaOrigin: {
+        single: "none (single sequence)",
+        search: "MMseqs2 search at api.colabfold.com",
+        paste: "pasted by hand",
+        upload: uploadedMsas === undefined ? "uploaded a3m" : "uploaded archive",
+      }[msaMode()] ?? msaMode(),
+      settings: {
+        seed: randomSeed(),
+        recycles: recycleCount(),
+        "max msa": maxMsaConfig().requested,
+      },
+    };
+
     // 🔴 AlphaFold 3 IS A DIFFERENT MODEL BELOW THIS LINE, so it branches here -
     // before AF2's weights are chosen and before anything below assumes a
     // recycle loop over an evoformer. It branches AFTER the alignment, though,
@@ -1998,21 +2103,53 @@ async function fold(event) {
       structure: i === 0 ? (firstPassLanded ?? r.structure) : alignedToFirstPass(sequence, r.structure, firstPassLanded),
       confidence: r.confidence,
       recycleDistance: r.recycleDistance,
+      // 🔴 THE DRIVER'S OWN PASS, KEPT BY REFERENCE. Its contact map is attached
+      // in a setTimeout long after this map runs, so copying the field here
+      // copies `undefined`; holding the object means whatever lands on it later
+      // is visible to anything that reads this afterwards.
+      pass: r,
     }));
     const finalLanded = alignedRecycles[alignedRecycles.length - 1].structure;
+
+    // 🔴 THE BEST PASS, NOT THE LAST. Recycling is not monotonic - a pass can
+    // score worse than the one before it, and AlphaFold's own pipeline ranks
+    // its outputs rather than taking whichever finished last. The criterion is
+    // ColabFold's `rank_by: auto`: the multimer score for a complex, mean pLDDT
+    // for a monomer.
+    //
+    // 🔴 AND THE SEARCH STARTS FROM THE LAST ONE, so a tie keeps it. Passes
+    // often converge to the same score to several decimals, and preferring an
+    // earlier one on an exact tie would hand back a less converged structure
+    // for no gain.
+    const rankOf = (confidence) => (family === "multimer"
+      ? (confidence?.multimerScore ?? confidence?.iptm ?? Number.NEGATIVE_INFINITY)
+      : (confidence?.meanPlddt ?? Number.NEGATIVE_INFINITY));
+    let bestIndex = alignedRecycles.length - 1;
+    for (let index = alignedRecycles.length - 1; index >= 0; index -= 1) {
+      if (rankOf(alignedRecycles[index].confidence)
+        > rankOf(alignedRecycles[bestIndex].confidence)) bestIndex = index;
+    }
+    const best = alignedRecycles[bestIndex];
     previousFold = {
       sequence,
       structure: finalLanded,
     };
     lastPrediction = {
       stem,
-      // The final pass, for the reason above: the earlier recycles are the
-      // route, not the result.
-      pdb: predictionToPdb(sequence, finalLanded, final.confidence.plddt, chainLengths),
-      scores: confidenceJson(sequence, final.confidence),
+      // The BEST pass, and its own scores with it - a structure from one pass
+      // beside another pass's pLDDT would be a file that describes nothing that
+      // was ever computed.
+      pdb: predictionToPdb(sequence, best.structure, best.confidence.plddt, chainLengths),
+      confidence: best.confidence,
+      scores: confidenceJson(sequence, best.confidence),
       a3m: alignment,
+      chains,
       chainLengths,
       recycles: alignedRecycles,
+      bestPass: bestIndex,
+      contactSource: best.pass,
+      model: `AlphaFold 2 (${family})`,
+      ...foldContext,
     };
     predictions.set(stem, lastPrediction);
     // 🔴 A SAFETY NET, because the failure it catches is invisible. onRecycle is
@@ -2035,15 +2172,24 @@ async function fold(event) {
     }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
-    updateScoresCard(final.confidence);
+    // 🔴 THE CARD SCORES WHAT WILL BE SAVED, which is the best pass and not
+    // always the last. Showing the last pass's numbers beside a download of the
+    // best one is the kind of disagreement nobody reads a status line closely
+    // enough to catch.
+    updateScoresCard(best.confidence);
     const took = ((performance.now() - started) / 1000).toFixed(1);
 
     const converged = allRecycles.length < passes
       ? ` · converged at ${final.recycleDistance.toFixed(2)} Å after ${allRecycles.length} passes`
       : "";
-    const finalIptmText = final.confidence.iptm !== undefined ? ` · ipTM ${Number(final.confidence.iptm).toFixed(3)}` : "";
-    status(`Done in ${took} s · pLDDT ${final.confidence.meanPlddt.toFixed(1)}`
-      + ` · pTM ${final.confidence.ptm.toFixed(3)}${finalIptmText}${converged}`);
+    const bestIptmText = best.confidence.iptm !== undefined
+      ? ` · ipTM ${Number(best.confidence.iptm).toFixed(3)}` : "";
+    // ...and said out loud when the two differ, because the play bar is still
+    // sitting on the last pass while the download is a different one.
+    const ranked = bestIndex !== alignedRecycles.length - 1
+      ? ` · saved pass ${bestIndex + 1} of ${alignedRecycles.length}` : "";
+    status(`Done in ${took} s · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
+      + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");
@@ -2164,13 +2310,42 @@ syncModelControls();
 element("msa-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];
   if (file === undefined) return;
-  void file.text().then((text) => {
+  // 🔴 THE BYTES DECIDE, NOT THE EXTENSION. A fold archive renamed to .a3m is
+  // still an archive and an a3m called .zip is still an alignment, and the
+  // failure of guessing by name is a confusing parse error rather than a
+  // refusal. See looksLikeZip.
+  void file.arrayBuffer().then(async (buffer) => {
+    const bytes = new Uint8Array(buffer);
     try {
+      if (looksLikeZip(bytes)) {
+        const restored = msasFromArchive(await readZip(bytes));
+        if (restored.chains === 0 && restored.merged === undefined) {
+          throw new Error("that archive holds no alignments");
+        }
+        if (restored.chains === 0) {
+          // An archive whose fold was given one merged alignment carries it
+          // back as exactly that, with no split to restore.
+          uploadedMsas = { merged: restored.merged };
+          uploadedA3m = restored.merged;
+          const described = parseA3m(restored.merged);
+          status(`archive · ${described.depth} sequences · ${described.length} columns`);
+          return;
+        }
+        uploadedMsas = restored;
+        uploadedA3m = "";
+        const paired = restored.pairedA3ms.size;
+        status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
+          + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`);
+        return;
+      }
+      const text = new TextDecoder().decode(bytes);
       const described = parseA3m(text);
       uploadedA3m = text;
+      uploadedMsas = undefined;
       status(`${described.depth} sequences · ${described.length} columns`);
     } catch (error) {
       uploadedA3m = "";
+      uploadedMsas = undefined;
       status(error instanceof Error ? error.message : String(error), true);
     }
   });
@@ -2180,7 +2355,12 @@ element("msa-file").addEventListener("change", (event) => {
 // ...THE RAW PREDICTION, downloadable as computed. py2Dmol's own save button
 // writes a session; these two write what the model actually produced.
 function download(name, text, type) {
-  const url = URL.createObjectURL(new Blob([text], { type }));
+  downloadBlob(name, text, type);
+}
+
+/** The same, for bytes as readily as text. */
+function downloadBlob(name, content, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
   const link = document.createElement("a");
   link.href = url; link.download = name; link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
@@ -2194,7 +2374,46 @@ element("download-pdb").addEventListener("click", () => {
   const pred = activePrediction();
   if (pred) download(`${pred.stem}.pdb`, pred.pdb, "chemical/x-pdb");
 });
-element("download-scores").addEventListener("click", () => {
+// 🔴 EVERYTHING THE FOLD USED AND PRODUCED, NOT JUST THE SCORES. What this
+// replaces wrote pLDDT, PAE and pTM into one JSON and dropped the rest on the
+// floor - the alignment, the templates, the request - so a fold could not be
+// reproduced or handed on once the tab was closed. See web/fold-archive.js for
+// the layout and why it is the AlphaFold 3 server's.
+element("download-all").addEventListener("click", async () => {
   const pred = activePrediction();
-  if (pred) download(`${pred.stem}_scores.json`, pred.scores, "application/json");
+  if (!pred) return;
+  const button = element("download-all");
+  button.disabled = true;
+  try {
+    const files = buildFoldArchive({
+      stem: pred.stem,
+      model: pred.model ?? "AlphaFold",
+      settings: pred.settings,
+      entities: pred.entities,
+      msas: pred.msas ?? {},
+      msaOrigin: pred.msaOrigin ?? "none (single sequence)",
+      templates: pred.templates ?? [],
+      prediction: {
+        pdb: pred.pdb,
+        chainLengths: pred.chainLengths,
+        tokens: pred.tokens,
+        confidence: {
+          ...pred.confidence,
+          // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
+          // its contact map in a setTimeout - the distogram head costs 131 ms
+          // at 128 residues and is deliberately off the fold's critical path -
+          // so at the moment the prediction was stored it does not exist yet.
+          // By the time anyone presses this it does. `contactSource` is the
+          // pass the saved structure came from, which is not always the last.
+          contactProbs: pred.confidence?.contactProbs
+            ?? pred.contactSource?.contactProbs,
+        },
+      },
+    });
+    downloadBlob(`${pred.stem}.zip`, await writeZip(files), "application/zip");
+  } catch (error) {
+    status(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    button.disabled = false;
+  }
 });

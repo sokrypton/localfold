@@ -175,18 +175,38 @@ def main():
                          " && !document.getElementById('predict').disabled",
                      what="the page to finish loading")
 
+        # 🔴 ONE ENTITY PER CHAIN, because the page validates one sequence per
+        # entity. Typing a colon-joined complex into a single field is rejected
+        # with "One sequence per entity - use Add entity for another chain", the
+        # Fold click does nothing, and the tool waits out its whole timeout: two
+        # 25-minute runs went that way. The entity list has its own API, which
+        # is also how the templates below are set, so a complex goes in through
+        # that rather than through the DOM.
+        #
         # 🔴 THE SEQUENCE FIELD IS CONTENTEDITABLE, NOT AN INPUT, and the list
         # reads it on `input` - so setting textContent alone leaves the entity
-        # empty and Fold does nothing.
-        cdp.evaluate(ws, """(() => {
-          const field = document.querySelector('.entity-field [contenteditable],'
-            + ' .entity-field textarea, .entity-field input');
-          if (!field) return 'no field';
-          if ('value' in field && field.tagName !== 'DIV') field.value = %s;
-          else field.textContent = %s;
-          field.dispatchEvent(new Event('input', { bubbles: true }));
-          return field.tagName;
-        })()""" % (json.dumps(args.sequence), json.dumps(args.sequence)))
+        # empty and Fold does nothing. That still applies to the single-chain
+        # path, which is left alone because it is what every existing run uses.
+        chains = [c for c in args.sequence.split(":") if c.strip()]
+        if len(chains) > 1:
+            print("chains:", cdp.evaluate(ws, """(() => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const template = list.read().find((e) => e.type === 'protein')
+                ?? { type: 'protein', copies: 1, modifications: [] };
+              list.set(%s.map((value) => ({ ...template, value, copies: 1 })));
+              return JSON.stringify(list.read().map((e) => e.value.length));
+            })()""" % json.dumps(chains)))
+        else:
+            cdp.evaluate(ws, """(() => {
+              const field = document.querySelector('.entity-field [contenteditable],'
+                + ' .entity-field textarea, .entity-field input');
+              if (!field) return 'no field';
+              if ('value' in field && field.tagName !== 'DIV') field.value = %s;
+              else field.textContent = %s;
+              field.dispatchEvent(new Event('input', { bubbles: true }));
+              return field.tagName;
+            })()""" % (json.dumps(args.sequence), json.dumps(args.sequence)))
 
         # 🔴 THE TEMPLATE GOES ON THE ENTITY, NOT ON A CONTROL. It lives behind
         # the row's ⋮ beside the modified residues, in the entity model that

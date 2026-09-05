@@ -256,7 +256,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
               <div class="fold-option-wide">
                 <textarea id="msa-text" rows="3" spellcheck="false" aria-label="A3M alignment"
                   placeholder="Paste A3M &#8212; the first record is the query" hidden></textarea>
-                <input id="msa-file" type="file" accept=".a3m,.fasta,.fa,.txt" hidden />
+                <input id="msa-file" type="file" accept=".a3m,.fasta,.fa,.txt,.zip" hidden />
               </div>
             </div>
 
@@ -779,9 +779,14 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                             title="Download the predicted structure">
                             <i class="fa-solid fa-download"></i><span>PDB</span>
                         </button>
-                        <button id="download-scores" class="btn btn-secondary"
-                            title="Download pLDDT, PAE and pTM as JSON">
-                            <i class="fa-solid fa-download"></i><span>Scores</span>
+                        <button id="download-all" class="btn btn-secondary"
+                            title="Download everything this fold used and produced,
+                                   as a zip in the AlphaFold 3 server's layout:
+                                   structure, scores, contacts, the request, and
+                                   one alignment per chain. Drop the zip back on
+                                   the alignment upload box to fold again with
+                                   exactly these alignments.">
+                            <i class="fa-solid fa-download"></i><span>All</span>
                         </button>
                     </div>
 

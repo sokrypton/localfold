@@ -136,6 +136,38 @@ describe("the fold archive", () => {
     expect(summary.chain_pair_pae_min).toEqual([[0.5, 1.25], [3.75, 0.5]]);
   });
 
+  // 🔴 THE CASE THE TESTS ABOVE MISSED, AND A REAL FOLD DID NOT. AlphaFold 3
+  // numbers its chains from ONE, AlphaFold 2 from zero. Written against 0-based
+  // keys alone, every test here passed while a real two-chain AF3 fold produced
+  // `chain_pair_iptm: [[null, null], [null, null]]` and
+  // `chain_ptm: [null, 0.69]` - "1|2" matching nothing and "1" matching the
+  // second chain by accident, which is a summary that looks complete.
+  it("reads the score keys as asym ids, whichever base the model numbers from", () => {
+    const oneBased = JSON.parse(summaryConfidencesJson({
+      confidence: {
+        ...prediction().confidence,
+        chainPairIptm: { "1|2": 0.42 },
+        chainPtm: { 1: 0.9, 2: 0.7 },
+        chainIptm: { 1: 0.42, 2: 0.42 },
+      },
+      chainLengths: [2, 2], tokenChainIds: ["A", "A", "B", "B"],
+    }));
+    expect(oneBased.chain_pair_iptm).toEqual([[null, 0.42], [0.42, null]]);
+    expect(oneBased.chain_ptm).toEqual([0.9, 0.7]);
+
+    const zeroBased = JSON.parse(summaryConfidencesJson({
+      confidence: {
+        ...prediction().confidence,
+        chainPairIptm: { "0|1": 0.42 },
+        chainPtm: { 0: 0.9, 1: 0.7 },
+        chainIptm: { 0: 0.42, 1: 0.42 },
+      },
+      chainLengths: [2, 2], tokenChainIds: ["A", "A", "B", "B"],
+    }));
+    expect(zeroBased.chain_pair_iptm).toEqual(oneBased.chain_pair_iptm);
+    expect(zeroBased.chain_ptm).toEqual(oneBased.chain_ptm);
+  });
+
   it("writes each chain's own pTM and its ipTM against the rest", () => {
     const summary = JSON.parse(summaryConfidencesJson({
       confidence: {
