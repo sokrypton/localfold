@@ -14,7 +14,23 @@ import { makeQueryOnlyFeatures } from "./query-only-features.js";
  */
 
 const RESTYPES = "ARNDCQEGHILKMFPSTWYV";
-const INDEX = new Map([...RESTYPES].map((residue, index) => [residue, index]));
+/**
+ * The residue alphabet as a table over character codes: residue index, 20 for
+ * anything unknown, 21 for a gap.
+ *
+ * 🔴 THIS WAS A Map AND A ONE-CHARACTER STRING PER RESIDUE.
+ * `alignment.sequences[row][residue]` allocates and `Map.get` hashes it, and a
+ * 200-residue query at 10,000 rows is two million of each before the
+ * clustering has started.
+ */
+const CODE_OF_CHARACTER = (() => {
+  const table = new Uint8Array(128).fill(20);
+  for (let index = 0; index < RESTYPES.length; index += 1) {
+    table[RESTYPES.charCodeAt(index)] = index;
+  }
+  table["-".charCodeAt(0)] = 21;
+  return table;
+})();
 
 function generator(seed) {
   let state = seed >>> 0;
@@ -137,9 +153,13 @@ export function makeA3mFeatures(a3mText, tables,
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
   const encoded = new Uint8Array(depth * length);
-  for (let row = 0; row < depth; row += 1) for (let residue = 0; residue < length; residue += 1) {
-    const symbol = alignment.sequences[row] [residue];
-    encoded[row * length + residue] = symbol === "-" ? 21 : (INDEX.get(symbol) ?? 20);
+  for (let row = 0; row < depth; row += 1) {
+    const sequence = alignment.sequences[row];
+    const base = row * length;
+    for (let residue = 0; residue < length; residue += 1) {
+      const code = sequence.charCodeAt(residue);
+      encoded[base + residue] = code < 128 ? CODE_OF_CHARACTER[code] : 20;
+    }
   }
   const base = makeQueryOnlyFeatures(alignment.query, tables, {
     recycles: 0, chainLengths: options.chainLengths,
