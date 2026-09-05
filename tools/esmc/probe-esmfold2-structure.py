@@ -235,7 +235,11 @@ def main():
     names = [n.strip() for n in arguments.schemes.split(',') if n.strip()]
     for entry in (e for e in arguments.calibrated.split(',') if e.strip()):
         label, _, where = entry.partition('=')
-        scheme = Q.calibrated(where, label)
+        # A codebook file carries its table under __codebook__; a scalar one
+        # does not. Told apart by the artefact rather than by the filename.
+        scheme = (Q.codebook(where, label)
+                  if '__codebook__' in np.load(where, mmap_mode='r').files
+                  else Q.calibrated(where, label))
         catalogue[scheme.name] = scheme
         names.append(scheme.name)
     outdir = pathlib.Path(arguments.out) if arguments.out else None

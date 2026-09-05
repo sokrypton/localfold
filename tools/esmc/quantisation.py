@@ -84,6 +84,63 @@ def with_outliers(values, bits, group, count):
     return _ungroup(output, padded, len(values))
 
 
+def nm_sparse(values, n, m, bits, group, importance=None):
+    """Keep the n largest of every m weights, quantise those, zero the rest.
+
+    🔴 THE MASK IS NOT FREE AND IT IS MOST OF THE BUDGET AT HIGH SPARSITY.
+    Saying "90% of the weights are zero" says nothing until you say how the
+    reader learns WHICH. An arbitrary mask costs the binary entropy of the
+    density - 0.54 bits a weight at one in eight - which at that density is
+    more than the surviving values. n:m fixes the count per block instead, so
+    the mask is log2(C(m, n))/m and is decodable without a search: 0.375 bits
+    a weight at 1:8 against the entropy bound's 0.544.
+
+    🔴 AND IT COSTS NO KERNEL. LocalFold already expands quantised weights into
+    a dense float16 buffer in one dispatch (src/runtime/quantised-upload.js);
+    a mask is the same shape of operation, so nothing downstream has to know
+    the weights were ever sparse. That is the difference between this and the
+    rotation a codebook scheme wants.
+
+    `importance` is Wanda's criterion - the score is |w| times the root of the
+    channel's activation energy, so a weight is kept for what it CARRIES, not
+    for how large it is. Magnitude alone is the special case of importance
+    being flat.
+    """
+    flat = np.asarray(values, np.float32).reshape(-1)
+    pad = (-flat.size) % m
+    if pad:
+        flat = np.concatenate([flat, np.zeros(pad, np.float32)])
+    blocks = flat.reshape(-1, m)
+    score = np.abs(blocks)
+    if importance is not None:
+        weight = np.asarray(importance, np.float32).reshape(-1)
+        if weight.size != flat.size:
+            weight = np.resize(weight, flat.size)
+        score = score * np.sqrt(weight.reshape(-1, m))
+    keep = np.argsort(-score, axis=1)[:, :n]
+    rows = np.arange(len(blocks))[:, None]
+
+    survivors = blocks[rows, keep].reshape(-1)
+    approximate = asymmetric(survivors, bits, group).reshape(len(blocks), n)
+
+    out = np.zeros_like(blocks)
+    out[rows, keep] = approximate
+    result = out.reshape(-1)
+    return result[:result.size - pad] if pad else result
+
+
+def nm_rate(n, m, bits, group):
+    """bits per weight: the mask, plus the survivors and their metadata."""
+    from math import comb, log2
+    return log2(comb(m, n)) / m + (n / m) * (bits + 32.0 / group)
+
+
+def sparse_scheme(n, m, bits, group=32):
+    return Scheme('%d:%d int%d g%d' % (n, m, bits, group),
+                  nm_rate(n, m, bits, group),
+                  lambda v: nm_sparse(v, n, m, bits, group))
+
+
 def to_bfloat16(values):
     u = np.ascontiguousarray(values, np.float32).view(np.uint32)
     rounded = (((u >> 16) + ((u >> 15) & 1)) & 0xFFFF).astype(np.uint32)
@@ -185,6 +242,33 @@ def calibrated(path, name=None):
     return Scheme(label, bits + 32.0 / group, apply, keyed=True)
 
 
+def codebook(path, name=None):
+    """An arm whose codes index a shared table, written by fit-codebook.py.
+
+    🔴 THE TABLE IS THE WHOLE DIFFERENCE AND IT IS 8 KB. Everything else here
+    reconstructs a weight arithmetically - code times scale plus zero - and
+    this looks it up. That is CHEAPER to decode than unpacking five bits from a
+    twenty-byte group, so the shader this would need is simpler than the one
+    LocalFold already runs; what it is not is the same shader.
+    """
+    store = np.load(path)
+    meta = store['__meta__']
+    clusters, dimension, group = int(meta[1]), int(meta[2]), int(meta[3])
+    table = store['__codebook__'].astype(np.float32)
+
+    def apply(values, key):
+        codes = store[key + '.codes']
+        scales = store[key + '.scales'].astype(np.float32)
+        pad = int(store[key + '.pad'][0])
+        rebuilt = (table[codes].reshape(-1, group)
+                   * scales[:, None]).reshape(-1)
+        return rebuilt[:rebuilt.size - pad] if pad else rebuilt
+
+    rate = np.log2(clusters) / dimension + 16.0 / group
+    label = name or 'codebook %dx%dd g%d' % (clusters, dimension, group)
+    return Scheme(label, float(rate), apply, keyed=True)
+
+
 def catalogue():
     """The arms, cheapest storage last, so a table reads down to the frontier."""
     def asym(bits, group, search=None):
@@ -215,5 +299,11 @@ def catalogue():
         Scheme('int3 g32 asym', 4.00, asym(3, 32)),
         Scheme('int3 g32 asym+search', 4.00, asym(3, 32, SEARCH_GRID)),
         Scheme('int2 g32 asym', 3.00, asym(2, 32)),
+        # Sparse arms, at rates the dense frontier cannot reach. Read them
+        # against a DENSE arm of the same bits/weight, never against each other.
+        sparse_scheme(2, 4, 8), sparse_scheme(2, 4, 6), sparse_scheme(2, 4, 4),
+        sparse_scheme(1, 4, 8), sparse_scheme(1, 4, 6), sparse_scheme(1, 4, 4),
+        sparse_scheme(2, 8, 6), sparse_scheme(2, 8, 4),
+        sparse_scheme(1, 8, 8), sparse_scheme(1, 8, 6),
     ]
     return {s.name: s for s in out}

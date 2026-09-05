@@ -302,6 +302,108 @@ cliff. Getting under 200 needs a different representation - QuIP#-style
 incoherence processing with vector codebooks is the class that makes 2-bit
 language models work - and that is a new WebGPU decoder, not a new packer.
 
+## The 600M bundle, all the way down
+
+Everything above measures the tower with a float32 folding model, which prices
+about two thirds of a download. This is the whole bundle: ESM-C 600M plus the
+folding model at int3 group 32, sixteen held-out targets, against a seed
+yardstick of **2.43 A mean and 11.00 A worst** over 32 folds of identical
+weights.
+
+| bundle | tower scheme | bits/w | median vs crystal | mean | past the seed noise |
+|---:|---|---:|---:|---:|---:|
+| - | float32 | 32.00 | **2.13 A** | 5.17 | - |
+| 496 MiB | int5 g32 | 6.00 | 2.12 A | 5.22 | 2/16 |
+| 428 MiB | int4 g32 | 5.00 | 2.19 A | 5.12 | 2/16 |
+| 360 MiB | int3 g32 | 4.00 | 2.39 A | 5.21 | 2/16 |
+| 325 MiB | int3 g64 | 3.50 | **2.13 A** | 5.19 | 2/16 |
+| 308 MiB | int3 g128 | 3.25 | **2.13 A** | 5.19 | 2/16 |
+| **308 MiB** | **codebook 4096 x 4d** | 3.25 | 2.32 A | 5.33 | **1/16** |
+| **274 MiB** | **codebook 1024 x 4d** | 2.75 | 2.37 A | 5.26 | **1/16** |
+| 291 MiB | int2 g32 | 3.00 | 6.16 A | 8.52 | 10/16 |
+| 257 MiB | int2 g64 | 2.50 | 11.37 A | - | - |
+| 240 MiB | codebook 256 x 4d | 2.25 | 7.13 A | 11.71 | 9/16 |
+| - | *no language model* | - | 14.03 A | 17.12 | 16/16 |
+
+🔴 **THE FLOOR IS 274 MiB, AND IT WAS 533 WHEN THIS DOCUMENT STARTED.** Three
+separate things moved it, none of them a better packer: quantising the FOLDING
+MODEL, which nobody had priced and which gives up bits almost for free; opening
+the tower's GROUP from 32 to 128, which is a quarter of a bit at no measurable
+cost; and replacing the uniform grid with a codebook.
+
+🔴 **AND THE TWO-BIT CLIFF IS A PROPERTY OF THE GRID, NOT OF THE BUDGET.**
+Scalar int2 group 32 spends **3.00** bits a weight and folds at 6.16 A median;
+a 1024-entry codebook spends **2.75** and folds at 2.37 A. A uniform grid puts
+its levels where there are no weights, and at two bits there are too few levels
+to waste any. That is the whole of the difference - same information budget,
+one representation folds and the other does not.
+
+🔴 **AND AT MATCHED RATE THE CODEBOOK IS THE MORE ROBUST ONE, WHICH THE MEDIAN
+HIDES.** At 3.25 bits, scalar int3 g128 and the 4096-entry codebook read 2.13 A
+and 2.32 A of median crystal RMSD - the scalar arm looks better. On the tail it
+is the other way round: the codebook moves **1 of 16** targets past the
+sampler's own spread against the scalar arm's 2, and **none at all** past 5 A
+against the scalar arm's 1, with a worst case of 3.43 A against 9.06 A. The
+median is where these schemes agree; the tail is where they differ, and the
+tail is what a user notices.
+
+### What the codebook costs to decode, which is less than what it replaces
+
+🔴 **A TABLE LOOKUP IS CHEAPER THAN UNPACKING FIVE BITS.** `fit-codebook.py`
+writes ONE shared table for the whole tower - 1024 entries of 4 float16 is
+**8 KB** - so decoding a weight is an index into it and a multiply by the
+group's scale, against int5's shift-mask-across-a-byte-boundary. LocalFold
+already expands quantised weights into a dense float16 buffer in one dispatch
+(`src/runtime/quantised-upload.js`); this is that same dispatch with a simpler
+body. It is not the same shader, but it is not a harder one.
+
+🔴 **AND THE ROTATION - QuIP#'s OTHER HALF - IS NOT WORTH IT HERE.** Multiplying
+by a random orthogonal matrix before quantising is what makes 2-bit language
+models work in the literature, and it is the expensive half: the kernel has to
+un-rotate at run time. On ESM-C's weights it buys **1%** (relRMS 0.2090 against
+0.2106 at 2.75 bits) and 5.6% on the scalar path. Measured before building it,
+which is the only reason it was not built.
+
+🔴 **AND AN EMPTY CENTRE IS A WASTED CODE.** Lloyd's algorithm strands centres
+that nothing selects, so a 1024-entry table silently becomes a 900-entry table
+at the same price. Restarting a dead centre on the vectors currently worst
+served is four lines and it is why all three tables report every entry used.
+
+🔴 **AND THE GROUP SCALE IS AN RMS, NOT A MAXIMUM.** A shared table only works
+if every group hands it the same distribution, and dividing by the group's
+largest weight standardises the OUTLIER rather than the bulk. There is also no
+zero point: a scalar scheme needs one because its grid is symmetric and its
+weights are not, and a codebook's entries are already wherever k-means put
+them. That is half a bit per group not spent.
+
+### And what sparsity is worth, which is nothing here
+
+Zeroing weights reaches rates dense quantisation cannot - 1:8 with int4
+survivors is 1.00 bits a weight - but it is dominated everywhere the model
+still folds:
+
+| scheme | bits/w | reconstruction relRMS |
+|---|---:|---:|
+| 2:8 int4 | 1.85 | 0.5442 |
+| scalar int2 g32 | 3.00 | 0.3947 |
+| 2:4 int4 | 3.15 | 0.3468 |
+| **scalar int3 g64** | **3.50** | **0.2093** |
+| 2:4 int8 | 5.15 | 0.3383 |
+| **scalar int4 g32** | **5.00** | **0.0845** |
+
+🔴 **BECAUSE THE DISCARDED ENERGY IS A FLOOR NO PRECISION RECOVERS.** The top 4
+of every 8 weights carry 96.5% of the energy, so 2:4 throws away 3.5% and
+cannot beat relRMS **0.187** at any survivor precision - and scalar int3 g64
+*achieves* 0.209 at 3.50 bits. The same table shows it directly: 2:4 with int4
+survivors reads 0.3468 and with int8 survivors 0.3383, so **two extra bits a
+weight buy 2%**. The error is what was zeroed, not how the rest is stored.
+
+🔴 **AND THE MASK IS NOT FREE.** "90% of the weights are zero" says nothing
+until the reader is told WHICH. An arbitrary mask costs the binary entropy of
+the density - 0.54 bits a weight at one in eight, more than the surviving
+values themselves. n:m fixes the count per block so the mask is log2(C(m,n))/m
+and needs no search, which is the only version worth quoting.
+
 ## Calibrated quantisation, which is what the LLM world does instead
 
 Everything above rounds each weight to the nearest code and looks at nothing
