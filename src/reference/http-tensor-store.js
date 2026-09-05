@@ -284,6 +284,25 @@ export class HttpTensorStore {
    * tensor read once and wrong for 48 blocks of a stacked one. Await open(name)
    * first; this is synchronous so it can sit behind a property getter.
    */
+  /**
+   * Where a tensor's bytes are, without decoding any of them.
+   *
+   * 🔴 THIS IS WHAT LETS A DECODER RUN SOMEWHERE ELSE. `tensorRangeSync` hands
+   * back float32, which for an int5 tensor means the host has already done the
+   * work; a caller that wants to decode on the GPU needs the CODES, and the
+   * scale and zero tables beside them. It returns a view, not a copy - the
+   * shard stays owned by this store.
+   */
+  tensorSource(name) {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    const buffer = this.#fileBuffers.get(record.file);
+    if (buffer === undefined) {
+      throw new Error(`${name} is in ${record.file}, which is not open yet - await store.open(name)`);
+    }
+    return { record, buffer, byteOffset: record.byteOffset ?? 0 };
+  }
+
   tensorRangeSync(name, first, count) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);

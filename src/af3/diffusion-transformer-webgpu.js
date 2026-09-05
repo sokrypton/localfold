@@ -43,7 +43,7 @@ import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
 const GRID_WIDTH = 32_768;
 
-const BLOCK_ORDER = [
+export const BLOCK_ORDER = [
   "SingleCondLayerNormScale", "SingleCondScaleWeights", "SingleCondScaleBias", "SingleCondBias",
   "qProjection", "qBias", "kProjection", "vProjection", "gatingQuery",
   "Transition2", "AdaptiveZeroCondWeights", "AdaptiveZeroCondBias",

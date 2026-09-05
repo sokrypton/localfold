@@ -149,6 +149,13 @@ export function stacked(store, name, index, dims = 1) {
   thunk.tensorName = name;
   thunk.blockIndex = index;
   thunk.blockDims = dims;
+  // 🔴 AND WHERE THE VALUES COME FROM, NOT ONLY WHAT THEY ARE. A caller that
+  // means to decode this range somewhere other than the main thread needs the
+  // store and the range, and calling the thunk to find out would be the decode
+  // it is trying to avoid. See HttpTensorStore.tensorSource.
+  thunk.store = store;
+  thunk.first = index * stride;
+  thunk.count = stride;
   return thunk;
 }
 
@@ -175,6 +182,7 @@ function fieldNames(fields, into = []) {
  */
 function materialise(fields, memo) {
   const object = {};
+  Object.defineProperty(object, SOURCES, { value: fields });
   for (const [key, value] of Object.entries(fields)) {
     if (typeof value === "function") {
       Object.defineProperty(object, key, {
@@ -195,6 +203,16 @@ function materialise(fields, memo) {
 }
 
 const RELEASE = Symbol("release decoded weights");
+
+/**
+ * The thunks behind a bound descriptor, for a caller that wants the SOURCE of
+ * a weight rather than its values - see `stacked`.
+ *
+ * 🔴 A SYMBOL, SO IT IS NOT A FIELD. `fieldNames` walks a descriptor's own
+ * enumerable properties and a string key here would look like another tensor
+ * to it, and to every loop that iterates a weight object.
+ */
+export const SOURCES = Symbol("weight sources");
 
 /**
  * Let go of everything a lazily loaded weight object has decoded.
