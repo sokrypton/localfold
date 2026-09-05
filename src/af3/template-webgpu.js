@@ -38,7 +38,8 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
-  GRID_WIDTH, PAIR_SCRATCH_STORAGE, compilePairTrack, encodePairTrack, packPairTrackWeights,
+  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, encodePairTrack,
+  packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import {
   GEOMETRY_STRIDE, coverageOf, multichainMaskFor, packTemplateGeometry, templateGeometry,
@@ -310,6 +311,7 @@ export class Af3TemplateEmbedderGpu {
     }
     // The template stack: the shared pair track at 64 channels, factor 2.
     const trackPipelines = await compilePairTrack(this.pipelines, {
+      scratchStorage: UNPACKED_PAIR_SCRATCH,
       n: tokens, channels: CHANNELS, transitionFactor: 2,
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
     });
@@ -414,17 +416,17 @@ export class Af3TemplateEmbedderGpu {
       // The running sum over slots, which the projection reads once at the end.
       const summed = keep(this.allocator.allocate(
         "af3-template.summed", pairs * CHANNELS * 4, storage | GPUBufferUsage.COPY_DST));
-      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND FIVE OF THEM ARE PACKED.
-      // compilePairTrack builds every shader that touches these from
-      // PAIR_SCRATCH_STORAGE, so they have always been READ two halves to a
-      // word here; only the allocation said otherwise, and a buffer LARGER
-      // than a shader expects is not something WebGPU can catch. At 200 tokens
-      // that was 26 MiB wasted.
+      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
+      // See UNPACKED_PAIR_SCRATCH: packing them costs this embedder 150x its
+      // agreement with AF3 and saves 26 MiB on a stage that is not the trunk's
+      // peak. The allocation and the shaders read the same array, because a
+      // buffer that disagrees with a shader about its element is not something
+      // WebGPU can catch.
       const scratch = [];
-      for (let index = 0; index < 7; index += 1) {
+      for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-template.scratch${index}`,
-          storageBytes(pairs * CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));
+          storageBytes(pairs * CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-template.bias", gridHeads * pairs * 4, storage));

@@ -39,7 +39,7 @@ import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_STORAGE,
+  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, PAIR_SCRATCH_STORAGE,
   compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
@@ -296,7 +296,7 @@ export class Af3PairformerStackGpu {
       // same array - a buffer half the bytes of what a shader expects is not
       // something WebGPU can catch.
       const scratch = [];
-      for (let index = 0; index < 7; index += 1) {
+      for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-block.scratch${index}`,
           storageBytes(pairs * PAIR_CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));

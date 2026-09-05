@@ -19,7 +19,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_STORAGE, compilePairTrack, createAddShader,
+  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
   encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import {
@@ -75,6 +75,7 @@ export class Af3MsaStackGpu {
     const base = `af3-msa:${n}:${sequences}:${msaChannels}:${epsilon}:${variance}`
       + `:${dialect.swapTransposedBias}`;
     const pipelines = await compilePairTrack(this.pipelines, {
+      scratchStorage: UNPACKED_PAIR_SCRATCH,
       n, sample, epsilon, variance, dialect, base,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
@@ -116,25 +117,16 @@ export class Af3MsaStackGpu {
       const pairMask = keep(this.allocator.upload("af3-msa.pair-mask", state.pairMask, storage));
       const msaMask = keep(this.allocator.upload("af3-msa.msa-mask", state.msaMask, storage));
 
-      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND FIVE OF THEM ARE PACKED.
-      // compilePairTrack builds every shader that touches these from
-      // PAIR_SCRATCH_STORAGE, so they have always been READ two halves to a
-      // word here; only the allocation said otherwise, and a buffer LARGER
-      // than a shader expects is not something WebGPU can catch. At 200 tokens
-      // that was 51 MiB, on the stage that holds an AF3 trunk's peak wasted.
+      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
+      // See UNPACKED_PAIR_SCRATCH for the three checkers that say so. The
+      // allocation and the shaders read the SAME array, because a buffer that
+      // disagrees with a shader about its element is not something WebGPU can
+      // catch.
       const scratch = [];
-      for (let index = 0; index < 7; index += 1) {
+      for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-msa.scratch${index}`,
-          // 🔴 AND scratch[0] IS BORROWED BY A KERNEL THAT IS NOT THE PAIR
-          // TRACK'S. `opm.contract` writes it and `opm.add` reads it, both in
-          // f32, so it has to be big enough for the WIDER of its two readings.
-          // Sizing it by the packed one alone put the outer product mean's
-          // output half outside its buffer, which WebGPU clamps rather than
-          // refuses: check-af3-trunk went from 4e-5 to relRMS 2.82.
-          index === 0
-            ? pairs * PAIR_CHANNELS * 4
-            : storageBytes(pairs * PAIR_CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));
+          storageBytes(pairs * PAIR_CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-msa.bias", gridHeads * pairs * 4, storage));

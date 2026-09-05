@@ -55,6 +55,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  */
 export async function compilePairTrack(cache, options) {
   const { n, sample, epsilon, variance, dialect, base } = options;
+  // 🔴 THE SCRATCH LAYOUT IS THIS STACK'S, NOT THE MODULE'S. See
+  // PAIR_SCRATCH_STORAGE for what packing buys and UNPACKED_PAIR_SCRATCH for
+  // the stack that measured it as a bad trade.
+  const scratchStorage = options.scratchStorage ?? PAIR_SCRATCH_STORAGE;
   // f16 wherever the device has it; see grid-attention-webgpu.js's staged tile.
   const stagedPrecision = options.stagedPrecision ?? "f32";
   // The element the RESIDENT weight buffers hold. Memory, not time; see the
@@ -102,10 +106,10 @@ export async function compilePairTrack(cache, options) {
     const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
       undefined,
-      { normalized: PAIR_SCRATCH_STORAGE[0], hidden: PAIR_SCRATCH_STORAGE[4],
+      { normalized: scratchStorage[0], hidden: scratchStorage[4],
         // a is scratch[1] and b is scratch[2]; they share one storage because
         // the incoming direction reads them the other way round.
-        ab: PAIR_SCRATCH_STORAGE[1] });
+        ab: scratchStorage[1] });
     // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
@@ -115,7 +119,7 @@ export async function compilePairTrack(cache, options) {
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
-                  + `:${PAIR_SCRATCH_STORAGE.join("")}:${name}`,
+                  + `:${scratchStorage.join("")}:${name}`,
                   source);
     }
   }
@@ -125,15 +129,15 @@ export async function compilePairTrack(cache, options) {
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision },
       gridOffsets, epsilon, variance, dialect,
-      PAIR_SCRATCH_STORAGE[5], PAIR_SCRATCH_STORAGE[0],
+      scratchStorage[5], scratchStorage[0],
       // q, k, v and the gate are scratch 1, 2, 3 and 4 in that order.
-      { q: PAIR_SCRATCH_STORAGE[1], k: PAIR_SCRATCH_STORAGE[2],
-        v: PAIR_SCRATCH_STORAGE[3], gate: PAIR_SCRATCH_STORAGE[4] });
+      { q: scratchStorage[1], k: scratchStorage[2],
+        v: scratchStorage[3], gate: scratchStorage[4] });
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
-                  + `:${PAIR_SCRATCH_STORAGE.join("")}:${name}`,
+                  + `:${scratchStorage.join("")}:${name}`,
                   source);
     }
   }
@@ -191,13 +195,70 @@ export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrec
  * buffer; see src/runtime/storage.js for what a packed word costs and for the
  * rule that one invocation must own both of its halves.
  *
+ * 🔴 THERE ARE SIX OF THESE AND THERE WERE SEVEN. Nothing in the repository
+ * ever read `scratch[6]`: encodePairTrack indexes 0 to 5, and so does every
+ * caller. All three stacks allocated it anyway - a pair-sized tensor per
+ * stack, 19.5 MiB in the MSA stack at 200 tokens and 10.2 in the template,
+ * held for the length of a pass and touched by nothing.
+ *
  * 🔴 AND INDEX 5 IS THE ONLY ONE NO TRIANGLE OPERATION TOUCHES. The other six
  * are shared between the triangle multiplications and the grid attentions, so
  * converting any of them is a change to both at once; this one is written by
  * `grid.attend` and read by `grid.project-out` and by nothing else, which is
  * why it is the one converted first.
  */
-export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16", "f16", "f32"];
+export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16", "f16"];
+
+/**
+ * The same seven, unpacked - what a stack asks for when the trade goes the
+ * other way, and for two of the three it does.
+ *
+ * 🔴 THE SAME PACKING COSTS DIFFERENT AMOUNTS IN DIFFERENT STACKS, AND IN TWO
+ * OF THEM IT COST MORE THAN THE ORACLE ALLOWS. PAIR_SCRATCH_STORAGE was a
+ * module constant that every caller of compilePairTrack got, and it was
+ * measured on the pairformer alone. Measured on the other two, against their
+ * own checkers and their own long-standing bounds:
+ *
+ *   |                      | packed  | unpacked | bound |
+ *   |----------------------|---------|----------|-------|
+ *   | check-af3-msa-block  | 1.82e-3 |  7.16e-6 | 1e-5  |
+ *   | check-af3-template   | 3.79e-5 |  2.52e-7 | 2e-5  |
+ *   | check-af3-trunk pair | 1.04e-4 |  2.18e-5 | 4e-5  |
+ *
+ * Three checkers failing, none of them noticed, because the packing landed
+ * without re-running them. The pairformer keeps its packing - it is worth 190
+ * MiB at 408 tokens and check-af3-block passes - and the two stacks here do
+ * not.
+ *
+ * 🔴 AND A HALFWAY LAYOUT IS NOT THE ANSWER EITHER. Which tensor hurts was
+ * bisected on check-af3-trunk's pair term, changing only the MSA stack's
+ * layout:
+ *
+ *   | MSA scratch                     | trunk pair | msa-block |
+ *   |---------------------------------|------------|-----------|
+ *   | all five packed                 |    1.04e-4 |   1.82e-3 |
+ *   | ...with a and b unpacked        |    1.04e-4 |           |
+ *   | only a and b packed             |    6.44e-5 |           |
+ *   | all but `normalized` packed     |    6.40e-5 |           |
+ *   | only `hidden` and grid's output |    3.11e-5 |   4.95e-4 |
+ *   | none packed                     |    2.18e-5 |   7.16e-6 |
+ *
+ * `normalized` and the triangle's a and b are where it hurts - a and b are
+ * MULTIPLIED against each other in the contraction, so their rounding squares
+ * - and the last row but one passes the trunk's bound while still missing the
+ * MSA block's by 50x. Half the memory is not worth a checker that has to be
+ * told to expect less.
+ *
+ * 🔴 AND scratch[0] COULD NEVER HAVE BEEN PACKED IN THE MSA STACK ANYWAY.
+ * `opm.contract` writes it and `opm.add` reads it, neither of them a
+ * pair-track kernel and both in f32. Allocating it for the packed layout put
+ * that kernel's output half outside its buffer, which WebGPU clamps rather
+ * than refuses: check-af3-trunk read relRMS 2.82.
+ */
+export const UNPACKED_PAIR_SCRATCH = ["f32", "f32", "f32", "f32", "f32", "f32"];
+
+/** How many pair-sized scratch tensors a pair-track stack needs. */
+export const PAIR_SCRATCH_COUNT = PAIR_SCRATCH_STORAGE.length;
 
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;
