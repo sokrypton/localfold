@@ -46,6 +46,14 @@ function accountFor(device) {
       // Keyed by the label with its trailing index stripped, so the 48 copies
       // of one block's weights read as one row rather than as forty-eight.
       byLabel: new Map(),
+      // 🔴 byLabel ABOVE IS CUMULATIVE, WHICH IS THE WRONG QUESTION FOR A PEAK.
+      // It sums every allocation a label ever made, so a scratch tensor taken
+      // and given back forty-eight times reads as forty-eight times its size -
+      // useful for "what churns", useless for "what is the 552 MiB made of".
+      // This one is what is LIVE, and the composition is copied out of it at
+      // the moment the peak is set, which is the only moment it can be had.
+      liveByLabel: new Map(),
+      peakByLabel: [],
     };
     byDevice.set(device, account);
   }
@@ -102,7 +110,14 @@ export function noteAllocation(device, label, bytes) {
   const seen = account.byLabel.get(family);
   if (seen === undefined) account.byLabel.set(family, { bytes, count: 1 });
   else { seen.bytes += bytes; seen.count += 1; }
-  if (account.residentBytes > account.peakBytes) account.peakBytes = account.residentBytes;
+  const live = account.liveByLabel.get(family);
+  if (live === undefined) account.liveByLabel.set(family, { bytes, count: 1 });
+  else { live.bytes += bytes; live.count += 1; }
+  if (account.residentBytes > account.peakBytes) {
+    account.peakBytes = account.residentBytes;
+    account.peakByLabel = [...account.liveByLabel.entries()]
+      .map(([name, seen]) => ({ label: name, bytes: seen.bytes, count: seen.count }));
+  }
 }
 
 /**
@@ -116,12 +131,24 @@ function labelFamily(label) {
   return String(label ?? "unlabelled").replace(/[.:#-]?\d+$/, "");
 }
 
-/** Give room back, when a buffer is destroyed rather than merely released. */
-export function noteDestroy(device, bytes) {
+/**
+ * Give room back, when a buffer is destroyed rather than merely released.
+ *
+ * @param {string} [label] what is going away, so the live breakdown stays
+ *   truthful. A caller that cannot say leaves the totals right and one row of
+ *   the breakdown high, which is why every caller here does say.
+ */
+export function noteDestroy(device, bytes, label) {
   const account = accountFor(device);
   account.residentBytes -= bytes;
   account.count -= 1;
   if (account.residentBytes < 0) throw new Error("GPU memory accounting underflow");
+  const live = account.liveByLabel.get(labelFamily(label));
+  if (live !== undefined) {
+    live.bytes -= bytes;
+    live.count -= 1;
+    if (live.count <= 0) account.liveByLabel.delete(labelFamily(label));
+  }
 }
 
 /**
@@ -154,9 +181,14 @@ export function residencyAllowed(device) {
  * point: the device does not care that we intend to reuse it.
  */
 export function memorySnapshot(device) {
-  const { residentBytes, peakBytes, budgetBytes, count, byLabel } = accountFor(device);
+  const { residentBytes, peakBytes, budgetBytes, count, byLabel, peakByLabel } = accountFor(device);
   const largest = [...byLabel.entries()]
     .map(([label, seen]) => ({ label, bytes: seen.bytes, count: seen.count }))
     .sort((a, b) => b.bytes - a.bytes);
-  return { residentBytes, peakBytes, budgetBytes, bufferCount: count, byLabel: largest };
+  return {
+    residentBytes, peakBytes, budgetBytes, bufferCount: count, byLabel: largest,
+    // What was actually on the device when it was fullest, largest first. The
+    // rows sum to peakBytes; byLabel above does not sum to anything.
+    peakByLabel: [...peakByLabel].sort((a, b) => b.bytes - a.bytes),
+  };
 }

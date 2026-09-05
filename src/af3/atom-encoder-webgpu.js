@@ -1168,7 +1168,7 @@ export class Af3AtomEncoderGpu {
       const size = Math.ceil(bytes / 4) * 4;
       const found = staticCache[label];
       if (found !== undefined && found.size === size) return { buffer: found };
-      if (found !== undefined) { found.destroy(); noteDestroy(this.device, found.size); }
+      if (found !== undefined) { found.destroy(); noteDestroy(this.device, found.size, label); }
       buildStatic = true;
       noteAllocation(this.device, label, size);
       const buffer = this.device.createBuffer({

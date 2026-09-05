@@ -94,7 +94,7 @@ export function releaseResidentWeights(device) {
   for (const entry of held) {
     entry.forKey.delete(entry.label);
     entry.buffer.destroy();
-    noteDestroy(device, entry.size);
+    noteDestroy(device, entry.size, entry.buffer.label);
     bytes += entry.size;
   }
   heldByDevice.delete(device);

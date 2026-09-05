@@ -52,6 +52,32 @@ const option = (args, name, fallback) => {
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
+/**
+ * The memory report, cut to the rows worth reading.
+ *
+ * 🔴 `peakByLabel` IS THE ONE TO READ. `byLabel` sums every allocation a label
+ * ever made, so a scratch tensor taken and returned once a block reads as
+ * forty-eight times its size; it says what CHURNS. `peakByLabel` is what was
+ * on the device when it was fullest, and its rows sum to `peakBytes` - it says
+ * what to attack.
+ */
+const trimMemory = (snapshot, rows = 12) => ({
+  peakBytes: snapshot.peakBytes,
+  peakMiB: Number((snapshot.peakBytes / (1024 * 1024)).toFixed(1)),
+  peakByLabel: snapshot.peakByLabel.slice(0, rows).map((entry) => ({
+    label: entry.label,
+    mib: Number((entry.bytes / (1024 * 1024)).toFixed(2)),
+    count: entry.count,
+  })),
+  peakAccountedMiB: Number((snapshot.peakByLabel.reduce((sum, e) => sum + e.bytes, 0)
+    / (1024 * 1024)).toFixed(1)),
+  churnByLabel: snapshot.byLabel.slice(0, rows).map((entry) => ({
+    label: entry.label,
+    mib: Number((entry.bytes / (1024 * 1024)).toFixed(2)),
+    count: entry.count,
+  })),
+});
+
 /** 59 residues with side chains of every length; the shape the benches use. */
 const DEFAULT_SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
@@ -161,7 +187,7 @@ export async function main(device, args) {
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
     // What the fold left on the device, and in what - the totals alone cannot
     // say which tensor to attack. See src/runtime/device-memory.js.
-    deviceMemory: memorySnapshot(device),
+    deviceMemory: trimMemory(memorySnapshot(device)),
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),

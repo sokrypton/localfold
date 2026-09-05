@@ -93,7 +93,7 @@ export class GpuBufferAllocator {
       this.#pool.set(key, pooled);
     } else {
       buffer.destroy();
-      noteDestroy(this.device, byteLength);
+      noteDestroy(this.device, byteLength, buffer.label);
     }
   }
 
@@ -102,7 +102,7 @@ export class GpuBufferAllocator {
       const byteLength = Number(key.slice(0, key.indexOf(":")));
       for (const buffer of buffers) {
         buffer.destroy();
-        noteDestroy(this.device, byteLength);
+        noteDestroy(this.device, byteLength, buffer.label);
       }
     }
     this.#pool.clear();
