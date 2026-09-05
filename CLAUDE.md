@@ -385,12 +385,56 @@ and both halves are near their limit. That is why halving the tile's BYTES buys
 5% and halving the barriers buys nothing: neither reduces the number of
 operations.
 
-🔴 **SO THE ONLY THINGS LEFT ARE THE TWO EXPENSIVE ONES.** Register-block over
-QUERIES, so one key read serves two or four accumulators and the read term
-halves - which is the same trade `grid.project` records, where too large a
-block spilled and cost 4x. Or f16 ARITHMETIC in the accumulator update, whose
-ceiling is 1.7x and whose bound here is 1e-5. Neither is a tuning change and
-neither has been attempted.
+🔴 **AND THE REGISTER BLOCK WAS ATTEMPTED, AND IS THE WORST OF THE FOUR.**
+Giving a lane Q queries so one key read serves all of them divides the read
+term by Q and leaves the arithmetic alone, which is the right idea. It is
+bit-identical - checked at n=128 and n=192 against the reference, where Q of 1,
+2 and 4 agree to every digit - and it is catastrophically slower:
+
+| tokens | Q=1 | Q=2 | Q=4 |
+|---|---|---|---|
+| 256 | 45.1 ms | 78.8 (**0.57x**) | 166.5 (**0.27x**) |
+| 400 | 131.6 | 330.8 (**0.40x**) | 745.2 (**0.18x**) |
+
+Q x 8 vec4 of accumulators and Q x 8 of the query is 128 registers at Q=2, and
+it spills - the same 4x-the-wrong-way that `grid.project`'s row tile records at
+16. The code was reverted rather than kept behind a flag: parameterising the
+hottest kernel in the trunk over an arm nobody should use costs every later
+reader, and these numbers are worth more than the switch. **What is left is f16
+ARITHMETIC in the accumulator update**, whose ceiling is 1.7x - and see the
+next entry before trusting a bound on it.
+
+🔴 **AND check-af3-grid-attention.js WAS PASSING BY LUCK.** It builds its input
+as `deterministic(n * n * CHANNELS, 991 + n)` - a different random pair for
+every n - and it had only ever been run at its default of **24 tokens**. Run
+anywhere else, the f16 staged arm fails the 2e-3 bound that n=24 happens to
+give:
+
+| n | 24 | 32 | 33 | 36 | 48 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| f16 | 5.5e-4 | 1.1e-3 | 6.0e-4 | 1.2e-2 | 1.4e-2 | 7.1e-3 | 7.4e-3 |
+| f32 | 9.6e-7 | | | | 1.0e-6 | 1.2e-6 | 1.3e-6 |
+
+Not a trend in n - n=28 is worse than n=33 - but a spread over DRAWS, a factor
+of 26 wide. The f32 arm is flat at about 1e-6 throughout. So the bound measured
+one lucky input. It takes the worst of four draws now and the f16 bound is
+3e-2, which is what this input costs.
+
+🔴 **AND THE INPUT IS HARSHER THAN A FOLD, WHICH IS WHY THE SHIPPING PATH IS
+FINE.** f16 holds eleven mantissa bits, so a staged key is good to ~5e-4 - but
+the error lands in a LOGIT, and `exp` turns an absolute logit error into a
+relative weight error. Uniform noise makes large, poorly conditioned logits; a
+real pair representation does not, and the whole trunk still agrees with AF3 to
+**3.94e-4 end to end** with this same path on. Do not read 1e-2 here as a fold's
+error.
+
+🔴 **AND ONE DRAW AT n=192 PUTS THE f32 ARM AT 3.99e-4, WHICH IS 400x ITS NORM
+AND IS NOT EXPLAINED.** Only the UNTRANSPOSED module, and only draw 2 of four;
+the transposed module sees the same pair and measures 1.13e-6. It is the
+shipping kernel - the checker is what changed - so it is a real property of
+`pair_attention1` on some inputs at that size, found the day the checker
+stopped running at one shape. **Open.** `--n=192 --seeds=3 --precision=f32` is
+the reproduction.
 
 🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
 AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at

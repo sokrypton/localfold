@@ -63,7 +63,29 @@ export async function main(device, args) {
     return whole.subarray(block * stride, (block + 1) * stride);
   };
 
-  const pair = deterministic(n * n * CHANNELS, 991 + n);
+  // 🔴 SEVERAL DRAWS, AND THE WORST OF THEM, BECAUSE ONE DRAW WAS PASSING BY
+  // LUCK. The input was `deterministic(n * n * CHANNELS, 991 + n)` - a
+  // different random pair for every n - and this file only ever ran at its
+  // default of 24 tokens. Swept, the f16 arm's error is dominated by WHICH
+  // draw it got rather than by how big it is:
+  //
+  //     n     24      32      33      36      48      128     256
+  //     f16   5.5e-4  1.1e-3  6.0e-4  1.2e-2  1.4e-2  7.1e-3  7.4e-3
+  //     f32   9.6e-7  ...     ...     ...     1.0e-6  1.2e-6  1.3e-6
+  //
+  // The f32 arm is flat at about 1e-6 throughout; the f16 arm ranges over a
+  // factor of 26. So a bound set from one draw says nothing, and the one that
+  // was here - 2e-3, which is what n=24 happens to give - was failed by five
+  // of the seven sizes above the moment anyone ran them.
+  //
+  // 🔴 AND THE MECHANISM IS THE SOFTMAX, NOT THE STORAGE. f16 holds eleven
+  // mantissa bits, so a staged key is good to about 5e-4 - but the error lands
+  // in a LOGIT, and exp turns an absolute logit error into a relative weight
+  // error. Uniform noise makes large, poorly conditioned logits; a real pair
+  // representation does not, which is why the whole trunk still agrees with
+  // AF3 to 3.94e-4 end to end with this same path on. This input is harsher
+  // than a fold, deliberately, and the bound below says so.
+  const seeds = Number(option(args, "seeds", "4"));
   // 🔴 RAGGED, so the key-vs-query mask confusion is visible. With an all-ones
   // mask both choices agree and the check passes on a kernel that is wrong.
   const sequence = new Float32Array(n);
@@ -75,7 +97,13 @@ export async function main(device, args) {
 
   const results = {};
   const precisions = option(args, "precision", "f32,f16").split(",");
-  const bounds = { f32: 1e-5, f16: 2e-3 };
+  // 🔴 THE f16 BOUND IS THE MEASURED SPREAD, NOT ONE DRAW. Over four draws at
+  // sizes from 24 to 256 the worst was 1.4e-2, so 2e-3 was a bound five of
+  // seven sizes failed and nobody had run. 3e-2 is what this INPUT costs; the
+  // fold does not, and the note above says why. The f32 arm keeps its 1e-5,
+  // which it reaches at every size measured - widening one bound to cover both
+  // is how the f32 path stops being checked at all.
+  const bounds = { f32: 1e-5, f16: 3e-2 };
   let failed = 0;
   for (const [module, transpose] of [["pair_attention1", false], ["pair_attention2", true]]) {
     const at = (leaf) => layer(`${module}/${leaf}`);
@@ -90,7 +118,13 @@ export async function main(device, args) {
       gatingQuery: await at("gating_query/weights"),
       outputProjection: await at("output_projection/weights"),
     };
-    const expected = gridSelfAttention(pair, mask, n, CHANNELS, transpose, weights, DIALECT);
+    // ...the worst of the draws, per precision, so one lucky input cannot
+    // carry the check. Each draw is a fresh pair and its own reference.
+    const draws = Array.from({ length: seeds }, (_, draw) => {
+      const pair = deterministic(n * n * CHANNELS, 991 + n + draw * 7919);
+      return { pair, expected: gridSelfAttention(
+        pair, mask, n, CHANNELS, transpose, weights, DIALECT) };
+    });
     // 🔴 THE STAGED TILE'S PRECISION IS AN AXIS, NOT A RAISED BOUND. A block
     // stages the key and the value in f16 wherever the device has shader-f16,
     // which is eleven significant bits - so one tolerance cannot hold both, and
@@ -98,13 +132,21 @@ export async function main(device, args) {
     // 1e-5 it actually reaches. Each runs against the same CPU reference.
     for (const stagedPrecision of precisions) {
       if (stagedPrecision === "f16" && !device.features.has("shader-f16")) continue;
-      const { output, elapsedMilliseconds, memory } = await runner.run(
-        pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT, { stagedPrecision });
-      const relRms = relativeRms(output, expected);
+      let relRms = 0;
+      let elapsedMilliseconds = 0;
+      let memory;
+      for (const draw of draws) {
+        const run = await runner.run(
+          draw.pair, mask, { n, channels: CHANNELS, transpose }, weights, DIALECT,
+          { stagedPrecision });
+        relRms = Math.max(relRms, relativeRms(run.output, draw.expected));
+        elapsedMilliseconds = run.elapsedMilliseconds;
+        memory = run.memory;
+      }
       const bound = bounds[stagedPrecision];
       if (relRms > bound) failed += 1;
       results[`${module}/${stagedPrecision}`] = {
-        transpose, stagedPrecision, relRms, bound,
+        transpose, stagedPrecision, seeds, relRms, bound,
         ms: Number(elapsedMilliseconds.toFixed(2)),
         peakMiB: Number((memory.peakBytes / 2 ** 20).toFixed(2)),
       };
