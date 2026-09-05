@@ -62,9 +62,9 @@ const relative = (got, want) => {
 };
 
 export async function main(device, args = {}) {
-  const bundle = args.bundle ?? "/model-esmc-600m-f32";
-  const dumpPath = args.dump ?? "/oracle-dumps/esmc-59.json";
-  const bound = Number(args.bound ?? 2e-5);
+  const bundle = option(args, "bundle", "/model-esmc-600m-f32");
+  const dumpPath = option(args, "dump", "/oracle-dumps/esmc-59.json");
+  const bound = Number(option(args, "bound", "2e-5"));
 
   const dump = await (await fetch(dumpPath)).json();
   const manifest = await (await fetch(`${bundle}/manifest.json`)).json();

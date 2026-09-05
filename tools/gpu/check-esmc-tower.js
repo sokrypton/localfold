@@ -13,6 +13,7 @@
 // The export writes tensors in block order, so a sequential pass walks the
 // shards in order too and a window of three is enough - which is 144 MiB live
 // against 2190, the same shape of trade the tower itself makes with weights.
+import { readTensor } from "../../src/reference/dtype.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 
 const WINDOW = 3;
@@ -35,20 +36,18 @@ function shardReader(base) {
   };
 }
 
+// 🔴 DECODED BY THE PAGE'S OWN READER, WHICH IS WHY THIS WORKS ON THE int5
+// BUNDLE UNCHANGED. src/reference/dtype.js already understands `int5` - packed
+// codes, a float16 scale and a float16 zero per group of 32 - so pointing this
+// at model-esmc-600m-int5 measures the artefact that would actually ship rather
+// than a float32 stand-in for it. A checker with its own unpacker would be
+// checking its own unpacker.
 function tensorReader(manifest, read) {
   return async (name) => {
     const record = manifest.tensors[name];
     if (record === undefined) throw new Error(`bundle has no tensor ${name}`);
-    if (record.dtype !== "float32") {
-      throw new Error(`${name} is ${record.dtype}; this checker reads the float32 export`);
-    }
-    const count = record.shape.reduce((a, b) => a * b, 1);
-    const start = record.byteOffset ?? 0;
     const buffer = await read(record.file);
-    if (start + count * 4 > buffer.byteLength) {
-      throw new Error(`${name} runs past the end of ${record.file}`);
-    }
-    return new Float32Array(buffer.slice(start, start + count * 4));
+    return readTensor(record, buffer, record.byteOffset ?? 0, true);
   };
 }
 
@@ -70,10 +69,23 @@ const SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/norm/scal
   "lm/norm/offset", "lm/projection/weights", "lm/downproject/weights",
   "lm/downproject/bias"];
 
-export async function main(device, args = {}) {
-  const bundle = args.bundle ?? "/model-esmc-600m-f32";
-  const dumpPath = args.dump ?? "/oracle-dumps/esmc-59.json";
-  const bound = Number(args.bound ?? 5e-5);
+// 🔴 `args` IS THE RAW ARGV ARRAY, NOT AN OPTIONS OBJECT. Reading `args.bundle`
+// off it is `undefined` and falls through to the default silently - which is
+// how this checker ran the float32 bundle twice while reporting a bound it had
+// been asked to change. The `bundle` and `encoding` fields in the result exist
+// so that cannot happen again without showing.
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+export async function main(device, args = []) {
+  const bundle = option(args, "bundle", "/model-esmc-600m-f32");
+  const dumpPath = option(args, "dump", "/oracle-dumps/esmc-59.json");
+  // int5 is a lossy bundle and the float32 one is not, so the bound is the
+  // caller's: 5e-5 says "the shaders are right", and nothing near it says
+  // anything true about a quantised tower.
+  const bound = Number(option(args, "bound", "5e-5"));
 
   const dump = await (await fetch(dumpPath)).json();
   const manifest = await (await fetch(`${bundle}/manifest.json`)).json();
@@ -135,6 +147,8 @@ export async function main(device, args = {}) {
   for (const arm of arms) arm.within = arm.relRms !== null && arm.relRms <= bound;
 
   return {
+    bundle,
+    encoding: manifest.tensors["blocks/0/fc1/weights"].dtype,
     tower: manifest.languageModel.tower,
     shim: manifest.languageModel.shim,
     shape,
