@@ -546,6 +546,16 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // asked for.
   stage("trunk-done", { trunk, reusable: { trunk, targetFeat, recycles } });
 
+  // 🔴 AND THE PAIRFORMER'S WEIGHTS GO BACK HERE, for the same reason the
+  // diffusion transformer's go back below: the stage that can read them is
+  // over. The recycle loop has finished, the stack has already awaited its own
+  // readback, and what runs next is the sampler - which holds its OWN 378 MiB
+  // of resident weights and, until this line, held them alongside these.
+  //
+  // The confidence head's four blocks are a different weight object and cache
+  // themselves; only a LATER fold's trunk pays, and it pays in packing.
+  releaseResidentWeights(device, "w.");
+
   const headInput = { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair };
 
   // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
