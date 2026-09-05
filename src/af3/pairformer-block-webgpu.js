@@ -548,13 +548,24 @@ export class Af3PairformerStackGpu {
     if (this.residentWeights) releaseWeights(block);
 
     const encoder = this.device.createCommandEncoder({ label: "af3-pairformer-block" });
+    // 🔴 A BUFFER ARGUMENT MAY BE A SLICE OF ONE, WHICH IS HOW THE PAIR TRACK
+    // RUNS IN LESS MEMORY. Every pass in that track indexes its pair-shaped
+    // buffers so that a range of ROWS is a contiguous range of bytes - a pair
+    // row is `n * channels * 4`, which is always a multiple of the 256-byte
+    // binding alignment - so handing a shader the slice for rows [r0, r1)
+    // makes its existing indexing address the chunk with no change to any
+    // kernel. See encodePairTrack's rowChunk, and slice() beside it.
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
       const pass = encoder.beginComputePass({ label });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
         entries: buffers.map((allocation, binding) => ({
-          binding, resource: { buffer: allocation.buffer },
+          binding,
+          resource: allocation.byteOffset === undefined
+            ? { buffer: allocation.buffer }
+            : { buffer: allocation.buffer,
+                offset: allocation.byteOffset, size: allocation.byteSize },
         })),
       }));
       pass.dispatchWorkgroups(x, y, z);

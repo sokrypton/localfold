@@ -635,6 +635,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const scores = await new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
     tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
   }, weights.confidence, DIALECT);
+  // 🔴 AND ITS FOUR BLOCKS' WEIGHTS GO BACK TOO. `releaseResidentWeights("w.")`
+  // above runs when the TRUNK is done, which is before this head exists - so
+  // its own pairformer blocks stayed resident for the life of the page, and a
+  // second fold began with 52 blocks' weights on the device where the first
+  // began with 48. They are the same prefix and the same policy: the trunk's
+  // are given back every fold, so these are too.
+  releaseResidentWeights(device, "w.");
 
   let total = 0;
   let count = 0;

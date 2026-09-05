@@ -273,6 +273,39 @@ export function encodePairTrack(context) {
   const spreadTriangle = (groups) =>
     [Math.min(groups, triangleWidth), Math.ceil(groups / triangleWidth)];
   const ceil = (value, divisor) => Math.ceil(value / divisor);
+
+  /**
+   * The rows of the pair this track processes at a time.
+   *
+   * 🔴 THE SCRATCH IS 62% OF A LARGE FOLD'S PEAK AND HAD NO CHEAPER ROUTE.
+   * Five pair-sized buffers is 5987 MiB at 1530 tokens, of a 9662 MiB fold -
+   * and the only thing the budget's retry could give up was WEIGHT residency,
+   * which is about 567 MiB and does not grow with the protein. Chunking is the
+   * route that does: everything here except the contraction's `b` and the
+   * normalised input needs only the rows it is working on.
+   *
+   * 🔴 AND IT NEEDS NO KERNEL CHANGES, WHICH IS WHY IT IS WORTH DOING. Every
+   * pair-shaped buffer is indexed row-major, so rows [r0, r1) are a contiguous
+   * byte range and binding that SLICE makes the shader's own indexing address
+   * the chunk. A pair row is `n * channels * 4` bytes, always a multiple of the
+   * 256-byte binding alignment, so the offsets are always legal.
+   *
+   * Defaults to the whole track, which emits exactly the passes it always did.
+   */
+  const rowChunk = Math.min(context.rowChunk ?? n, n);
+  if (!Number.isInteger(rowChunk) || rowChunk < 1) {
+    throw new RangeError(`rowChunk ${context.rowChunk} is not a positive integer`);
+  }
+  /** Rows [from, from + rows) of a pair-shaped buffer of `width` channels. */
+  const slice = (allocation, from, rows, width) => (from === 0 && rows === n
+    ? allocation
+    : { buffer: allocation.buffer,
+        byteOffset: from * n * width * 4,
+        byteSize: rows * n * width * 4 });
+  const chunks = [];
+  for (let from = 0; from < n; from += rowChunk) {
+    chunks.push({ from, rows: Math.min(rowChunk, n - from) });
+  }
   for (const direction of ["outgoing", "incoming"]) {
     const w = weights[direction];
     const p = (name) => pipelines[`tri:${direction}:${name}`];

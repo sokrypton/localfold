@@ -283,10 +283,19 @@ export class Af3DiffusionHeadGpu {
    * happened to notice. Both samplers call it in a finally.
    */
   dispose() {
-    for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
-    for (const buffer of Object.values(this.#decoderBuffers)) buffer.destroy();
-    this.#encoderBuffers = {};
-    this.#decoderBuffers = {};
+    // 🔴 noteDestroy, NOT JUST destroy. These buffers are created through the
+    // atom encoder's and decoder's `persistentUpload`, which calls
+    // noteAllocation - so destroying them without the matching note leaves the
+    // accounting believing they are still on the device, for ever. At 1530
+    // tokens that is about 2.2 GB a fold: atom.trunk-pair alone is 1197 MiB,
+    // and a real trace showed it "held" after the fold had finished.
+    //
+    // 🔴 AND IT IS NOT ONLY A WRONG NUMBER. `residentBytes` is what the budget
+    // compares against, so every fold made the device look permanently fuller
+    // than it is and the NEXT one is refused on memory that was given back -
+    // an out-of-memory that is an accounting error. It also inflates
+    // `peakBytes`, which is the figure anyone tuning memory reads.
+    this.#releasePersistent();
     this.#encoderStatic = undefined;
     this.#conditioningPair = undefined;
     this.#transformer?.dispose();
@@ -298,6 +307,38 @@ export class Af3DiffusionHeadGpu {
     this.#projections?.destroyPooled();
     this.#projections = undefined;
     this.#releaseChain();
+  }
+
+  /**
+   * Give the atom encoder's and decoder's persistent buffers back, and SAY so.
+   *
+   * 🔴 THEY WERE DESTROYED WITHOUT THE NOTE, IN TWO PLACES. These are created
+   * through `persistentUpload`, which calls noteAllocation - so destroying them
+   * without the matching noteDestroy leaves the accounting believing they are
+   * still on the device, for ever. At 1530 tokens that is about 2.2 GB a fold;
+   * `atom.trunk-pair` alone is 1197 MiB, and a real trace showed it "held"
+   * after the fold had finished and again in the peak the fold reported.
+   *
+   * 🔴 AND IT IS NOT ONLY A WRONG NUMBER. `residentBytes` is what the memory
+   * BUDGET compares against, so every fold made the device look permanently
+   * fuller than it is and the next one is refused on memory that had been
+   * given back - an out-of-memory that is an accounting error. Measured at 200
+   * tokens over two folds in one process, the second fold's held figure went
+   * 524 -> 392 MiB.
+   *
+   * 🔴 ONE RELEASER, BECAUSE THERE WERE TWO CALLERS AND THEY DISAGREED. dispose
+   * runs at the end of a fold and the cache invalidation runs when a new trunk
+   * arrives mid-page; both destroyed the same buffers and neither noted it.
+   */
+  #releasePersistent() {
+    for (const set of [this.#encoderBuffers, this.#decoderBuffers]) {
+      for (const buffer of Object.values(set)) {
+        noteDestroy(this.device, buffer.size, buffer.label || "atom.persistent");
+        buffer.destroy();
+      }
+    }
+    this.#encoderBuffers = {};
+    this.#decoderBuffers = {};
   }
 
   #releaseChain() {
@@ -583,10 +624,7 @@ export class Af3DiffusionHeadGpu {
       // A new trunk means a new fold: drop the encoder's device-side cache too,
       // or the next call reuses the previous molecule's conditioning.
       this.#encoderStatic = undefined;
-      for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
-      for (const buffer of Object.values(this.#decoderBuffers)) buffer.destroy();
-      this.#encoderBuffers = {};
-      this.#decoderBuffers = {};
+      this.#releasePersistent();
     }
     this.#conditioningPair = { trunkPair: input.trunkPair, tokens, pair: cond.pair };
 
