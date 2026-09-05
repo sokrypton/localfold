@@ -385,8 +385,22 @@ describe("reusing a search across folds", () => {
   it("keeps a one-chain result whole and a complex in parts", () => {
     const searched = { depth: 7, chainA3ms: new Map(), pairedA3ms: new Map(), text: "x" };
     expect(Object.keys(searchCacheEntry({ chains: ["AAAA"], searched })).sort())
-      .toEqual(["depth", "single"]);
+      .toEqual(["depth", "single", "templateHits"]);
     expect(Object.keys(searchCacheEntry({ chains: ["AAAA", "CCCC"], searched })).sort())
-      .toEqual(["chainA3ms", "depth", "pairedA3ms"]);
+      .toEqual(["chainA3ms", "depth", "pairedA3ms", "templateHits"]);
+  });
+
+  it("carries the template hits into the cache, for a complex as for a chain", () => {
+    // 🔴 THE COMPLEX DROPPED THEM, AND ONLY THE SECOND FOLD COULD TELL. The
+    // hits come out of the same tar as the alignment and are returned beside
+    // it, so the FIRST fold of a complex has them; the cache kept only the
+    // per-chain alignments, so a fold that reused the search had none - and a
+    // chain asking for a template "from the MSA search" was told the MSA was
+    // not a search. It was.
+    const hits = new Map([[0, [{ target: "1qys_A", id: "1qys", chain: "A" }]]]);
+    const searched = { depth: 7, chainA3ms: new Map(), pairedA3ms: new Map(),
+                       text: "x", templateHits: hits };
+    expect(searchCacheEntry({ chains: ["AAAA"], searched }).templateHits).toBe(hits);
+    expect(searchCacheEntry({ chains: ["AAAA", "CCCC"], searched }).templateHits).toBe(hits);
   });
 });

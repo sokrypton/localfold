@@ -510,11 +510,15 @@ async function alignmentText(chains, signal, family) {
         searched = searchCache.raw.single;
         status(`MSA reused · ${searched.depth} sequences`);
       } else if (plan.reuse === "merge") {
-        const { chainA3ms, pairedA3ms, depth } = searchCache.raw;
+        const { chainA3ms, pairedA3ms, depth, templateHits } = searchCache.raw;
         const merged = mergeSearchedChains({
           sequences: chains, chainA3ms, pairedA3ms, model: family,
         });
-        searched = { ...merged, depth };
+        // ...and the hits with them. `mergeSearchedChains` re-merges the
+        // ALIGNMENTS and knows nothing about templates, so without this a
+        // reused search reports no hits and an automatic template says the MSA
+        // is not a search.
+        searched = { ...merged, depth, templateHits };
         status(`MSA reused · ${depth} sequences`);
       } else {
         searched = chains.length === 1

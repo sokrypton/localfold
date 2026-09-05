@@ -937,6 +937,17 @@
 
 /* The template's own controls, inside the options popup. */
 .entity-popup-section { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 10px; }
+/* 🔴 THE TEMPLATE SECTION RESERVES ITS TALLEST SHAPE, so choosing a source
+   does not move the menu that is choosing it. A PDB entry and an AlphaFold
+   accession add a text row and an upload adds a file row; "no template" and
+   "from the MSA search" have no control at all, and without this the popup
+   changed height by exactly one row - 28px, measured - under the cursor, which
+   on the last item moves the menu out from under the pointer.
+   The tallest of the five measures 90px including the section's own gaps, so
+   the content box is reserved at 79 and the popup is exactly the size its
+   largest source already made it. python3 tools/entity-popup.py is what says
+   so, and what will say when it stops being true. */
+.entity-popup-section-template { min-height: 79px; }
 .entity-template-kind { flex: 1 1 auto; min-width: 0; }
 .entity-template-source { flex: 1 1 auto; min-width: 0; }
 /* The file input carries its own button, so it needs room to shrink rather

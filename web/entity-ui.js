@@ -69,12 +69,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // it moves is the one last touched. Without a chosen row a click would
     // either do nothing or move all of them.
     let active = Math.max(0, (entity.modifications ?? []).length - 1);
-    const draw = () => {
-      // 🔴 NOT render(). The popup is a CHILD of the row, so rebuilding the row
-      // deletes the popup out from under itself - clicking "Add modification"
-      // closed the menu and left the modification behind, which reads as the
-      // button having failed. The one thing outside the popup that has to keep
-      // up is the badge on the button, so that is updated by hand.
+    // 🔴 THE BADGE WITHOUT THE REBUILD, because a keystroke needs one and not
+    // the other. `draw()` replaces every child of the popup, so calling it from
+    // an input handler destroys the very box being typed into: the source field
+    // took one character and lost the caret, which is a template that cannot be
+    // named. python3 tools/entity-popup.py asserts the caret survives.
+    const refreshBadge = () => {
       const badge = anchor.querySelector(".entity-options");
       const count = (entity.modifications ?? []).length;
       // 🔴 THE BADGE COUNTS EVERYTHING BEHIND THE BUTTON, not just the
@@ -92,6 +92,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         badge.title = said.length === 0 ? "Options" : said.join(" and ");
       }
       entityPaint.get(entity)?.();
+    };
+    const draw = () => {
+      // 🔴 NOT render(). The popup is a CHILD of the row, so rebuilding the row
+      // deletes the popup out from under itself - clicking "Add modification"
+      // closed the menu and left the modification behind, which reads as the
+      // button having failed. The one thing outside the popup that has to keep
+      // up is the badge on the button, so that is updated by hand.
+      refreshBadge();
       popup.replaceChildren();
       const head = document.createElement("div");
       head.className = "entity-popup-head";
@@ -264,7 +272,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         entity.template ??= { source: "" };
         const template = entity.template;
         const section = document.createElement("div");
-        section.className = "entity-popup-section";
+        section.className = "entity-popup-section entity-popup-section-template";
         const heading = document.createElement("div");
         heading.className = "entity-popup-title";
         heading.textContent = "Template";
@@ -315,7 +323,9 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
             ? "PDB entry" : "UniProt accession");
           source.addEventListener("input", () => {
             template.source = source.value;
-            draw();
+            // ...the badge, not the popup: see refreshBadge. Rebuilding here
+            // would replace this input between one keystroke and the next.
+            refreshBadge();
             notify();
           });
           const line = document.createElement("div");

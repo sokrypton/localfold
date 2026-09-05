@@ -604,10 +604,16 @@ export function planSearchReuse({ cache, chains, family }) {
  * only right for the model that asked.
  */
 export function searchCacheEntry({ chains, searched }) {
+  // 🔴 THE TEMPLATE HITS ARE PART OF WHAT WAS SEARCHED, so they are cached with
+  // it. A complex kept only its per-chain alignments here, so the SECOND fold -
+  // the one that reuses this - had no hits, and a chain asking for a template
+  // "from the MSA search" was told the MSA was not a search. It was; the hits
+  // had simply been dropped on the way into the cache. They come out of the
+  // same tar and cost nothing to keep.
   return chains.length === 1
-    ? { single: searched, depth: searched.depth }
+    ? { single: searched, depth: searched.depth, templateHits: searched.templateHits }
     : { chainA3ms: searched.chainA3ms, pairedA3ms: searched.pairedA3ms,
-      depth: searched.depth };
+      depth: searched.depth, templateHits: searched.templateHits };
 }
 
 export function mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model }) {
