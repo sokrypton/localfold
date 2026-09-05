@@ -200,6 +200,7 @@ async function uploadPipeline(device) {
 }
 
 export async function runBlockUpload(device, plan, destination) {
+  if (plan.params.length === 0) return () => {};
   const { pipeline, layout } = await uploadPipeline(device);
   const staging = [];
   const make = (size, usage) => {

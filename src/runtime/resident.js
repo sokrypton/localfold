@@ -46,6 +46,50 @@ const heldByDevice = new WeakMap();
  *   f32 buffer, which is half the values at twice the stride: a wrong answer
  *   rather than an error.
  */
+/**
+ * A resident buffer of a known size, filled by the caller on the DEVICE.
+ *
+ * 🔴 THE SIBLING OF residentWeightBuffer, FOR WEIGHTS THAT NEVER TOUCH THE
+ * HOST. That one takes a `pack` returning bytes to upload; this one takes a
+ * size and a `fill` handed the buffer, so an int5 decode can run as a compute
+ * pass instead of a JavaScript loop - see src/runtime/quantised-upload.js. The
+ * caching, the labelling and the accounting are the same, and so is the rule
+ * about `variant`.
+ *
+ * `fill` runs only when the buffer is created. A cache hit returns the buffer
+ * without calling it, which is what makes a second fold free.
+ */
+export async function residentWeightBufferFilled(device, key, label, byteLength, fill,
+                                                 variant = "") {
+  const slotOf = (forKey) => forKey.get(variant === "" ? label : `${label}\u0000${variant}`);
+  let forDevice = byDevice.get(device);
+  if (forDevice === undefined) {
+    forDevice = new WeakMap();
+    byDevice.set(device, forDevice);
+  }
+  let forKey = forDevice.get(key);
+  if (forKey === undefined) {
+    forKey = new Map();
+    forDevice.set(key, forKey);
+  }
+  const found = slotOf(forKey);
+  if (found !== undefined) return found;
+  const size = Math.ceil(byteLength / 4) * 4;
+  noteAllocation(device, label, size);
+  const buffer = device.createBuffer({
+    label,
+    size,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  await fill(buffer);
+  const slot = variant === "" ? label : `${label}\u0000${variant}`;
+  forKey.set(slot, buffer);
+  const held = heldByDevice.get(device) ?? [];
+  held.push({ buffer, size, forKey, label: slot });
+  heldByDevice.set(device, held);
+  return buffer;
+}
+
 export function residentWeightBuffer(device, key, label, pack, variant = "") {
   let forDevice = byDevice.get(device);
   if (forDevice === undefined) {
