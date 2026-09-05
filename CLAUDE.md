@@ -427,6 +427,22 @@ that may queue for a minute. It reports on the right instead - a filling dial
 plus `AlphaFold 3 · 92 / 265 MiB` - and appears only once a load reports itself
 partway, so a model already in the shard cache does not flash it.
 
+🔴 **AND `tabular-nums` DOES NOT STOP A COUNTER RESIZING.** It holds every
+DIGIT to one width, which is not the problem; the problem is a number that
+GROWS a digit, so `1 / 265` became `10 / 265` became `100 / 265` and the label
+stepped wider twice per download - moving the dial right and squeezing the
+status line, twice, every time. The loaded figure is padded to the width of the
+total with **U+2007 FIGURE SPACE**, which is defined as a digit's width. A
+plain space does not work: it collapses, and measured it steps exactly as the
+unpadded string does. Measured at 1, 10, 100 and 265 MiB, with the unpadded
+string as the control that says the measurement can see a difference at all:
+
+| pad | widths | constant |
+|---|---|---|
+| none (control) | 132.78, 139.78, 146.77, 146.77 | no |
+| a plain space | 132.78, 139.78, 146.77, 146.77 | no |
+| U+2007 | 146.77 x4 | **yes** |
+
 🔴 **AND THE DIAL IS NEVER LAID OUT UNLESS SOMETHING FORCES IT.** It is
 `hidden` on a bare page, so `tools/mobile-layout.py` had never seen it, and its
 label cannot wrap or shrink: at 320px the label took 171px of a 254px row and

@@ -300,13 +300,25 @@ function modelProgress(fraction, detail = "") {
  */
 function startModelPreload(family, signal) {
   const name = family === "af3" ? "AlphaFold 3" : "AlphaFold 2";
+  // 🔴 THE LABEL MUST NOT CHANGE WIDTH WHILE IT COUNTS. `tabular-nums` holds
+  // every DIGIT to one width, which is not the problem: the problem is that the
+  // number of digits grows, so "1 / 265" became "10 / 265" became "100 / 265"
+  // and the box stepped wider twice per load - moving the dial right and
+  // squeezing the status line beside it, twice, during every download.
+  //
+  // The loaded figure is padded to the width of the total, which is known from
+  // the first callback and does not change. U+2007 FIGURE SPACE is the pad: it
+  // is defined as the width of a digit, so with tabular digits the string is
+  // the same width at 1 MiB as at 265.
+  const mib = (bytes) => (bytes / 1048576).toFixed(0);
   const report = ({ loadedBytes = 0, totalBytes = 0 }) => {
     if (signal.aborted) return;
+    const total = mib(totalBytes);
     modelProgress(totalBytes === 0 ? NaN : loadedBytes / totalBytes,
       totalBytes === 0
-        ? `${name} · ${(loadedBytes / 1048576).toFixed(0)} MiB`
-        : `${name} · ${(loadedBytes / 1048576).toFixed(0)}`
-          + ` / ${(totalBytes / 1048576).toFixed(0)} MiB`);
+        ? `${name} · ${mib(loadedBytes)} MiB`
+        : `${name} · ${mib(loadedBytes).padStart(total.length, "\u2007")}`
+          + ` / ${total} MiB`);
   };
   const load = family === "af3"
     ? loadAf3Weights(report)
