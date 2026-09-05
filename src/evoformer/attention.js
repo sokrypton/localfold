@@ -1,3 +1,4 @@
+import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -80,6 +81,13 @@ export function createAttentionNormParameters(
   rows, channels, scale, offset,
   transpose, batch, queries, epsilon,
 ) {
+  // 🔴 THE WRITE LOOP WALKS PAIRS OF CHANNELS, so an odd count would drop the
+  // last one - in the f32 path as much as the packed one, since both share the
+  // generated store. Every AF2 layer norm here is 256, 128 or 64 channels wide;
+  // this is the assertion that says so rather than a comment claiming it.
+  if (channels % 2 !== 0) {
+    throw new RangeError(`layer norm needs an even channel count; got ${channels}`);
+  }
   const buffer = new ArrayBuffer(32);
   const view = new DataView(buffer);
   [rows, channels, scale, offset, transpose ? 1 : 0, batch, queries].forEach(
@@ -89,7 +97,25 @@ export function createAttentionNormParameters(
   return new Uint8Array(buffer);
 }
 
-export const ATTENTION_NORMALIZE_SHADER = `
+/**
+ * Layer normalisation, one workgroup per row.
+ *
+ * 🔴 THE OUTPUT MAY BE PACKED, AND THIS KERNEL IS WHY IT CAN BE. A workgroup
+ * owns a whole row, so the two channels sharing a packed word are always
+ * produced by the same dispatch - and the write loop below walks WORDS rather
+ * than channels, so they are produced by the same INVOCATION, which is the
+ * part that makes it a store and not a read-modify-write race. See
+ * src/runtime/storage.js.
+ *
+ * The read side is untouched: the source is whatever it was, the sums are f32,
+ * and only the values leaving the kernel are narrowed.
+ *
+ * @param {"f32"|"f16"} outputStorage
+ */
+export function createAttentionNormalizeShader(outputStorage = "f32") {
+  const value = (c) => `((source[input_base + ${c}] - row_mean[0]) * inverse_std
+      * weights[p.scale + ${c}] + weights[p.offset + ${c}])`;
+  return `
 const GRID_WIDTH: u32 = 32768u;
 struct NormParameters {
   rows: u32, channels: u32, scale: u32, offset: u32,
@@ -98,7 +124,7 @@ struct NormParameters {
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: NormParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<${storageArray(outputStorage)}>;
 var<workgroup> partial: array<f32, 64>;
 var<workgroup> row_mean: array<f32, 1>;
 
@@ -118,7 +144,6 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let row = group.x + group.y * GRID_WIDTH;
   if (row >= p.rows) { return; }
   let input_base = source_row(row) * p.channels;
-  let output_base = row * p.channels;
   var sum = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) { sum += source[input_base + c]; }
   partial[local.x] = sum;
@@ -141,11 +166,20 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
     workgroupBarrier();
   }
   let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
-  for (var c = local.x; c < p.channels; c += 64u) {
-    output[output_base + c] = (source[input_base + c] - row_mean[0]) * inverse_std
-      * weights[p.scale + c] + weights[p.offset + c];
+  // A lane owns a PAIR of channels, so it owns the whole word they share.
+  // The channel count is even in every caller; createAttentionNormParameters
+  // is where that is asserted.
+  let pairs = p.channels / 2u;
+  let pair_base = row * pairs;
+  for (var w = local.x; w < pairs; w += 64u) {
+    let c = w * 2u;
+    let pair = pair_base + w;
+    ${storedPair(outputStorage, "output", "pair", value("c"), value("c + 1u"))}
   }
 }`;
+}
+
+export const ATTENTION_NORMALIZE_SHADER = createAttentionNormalizeShader();
 
 const COMMON = `
 struct Parameters {
@@ -203,6 +237,7 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  */
 export function createAttentionProjectShader(
   tile = ATTENTION_PROJECT_TILE, precision = "f32", weightPrecision = "f32",
+  sourceStorage = "f32",
 ) {
   // 🔴 THE WEIGHT BUFFER'S ELEMENT, MEASURED AND NOT SHIPPED. This kernel
   // rereads the whole weight set once per row tile - 944 of them at 512 MSA
@@ -282,7 +317,7 @@ export function createAttentionProjectShader(
       if (c < p.channels) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < rows) { staged[j] = ${narrow("source[row * p.channels + c]")}; }
+          if (row < rows) { staged[j] = ${narrow(storedElement(sourceStorage, "source", "row * p.channels + c"))}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -326,7 +361,7 @@ ${body.join("\n")}
   }
 
   return `${half || weight16 ? "enable f16;\n" : ""}${COMMON}
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<f32>;
@@ -405,7 +440,7 @@ export const ATTENTION_PROJECT_TILE_F16 = {
  * @param {"auto"|"f32"|"f16"} requested `auto` takes f16 wherever the device
  *   has shader-f16, which is where the wider tile is affordable.
  */
-export function selectAttentionProjectKernel(device, requested = "auto") {
+export function selectAttentionProjectKernel(device, requested = "auto", sourceStorage = "f32") {
   const precision = requested !== "auto" ? requested
     : device?.features?.has("shader-f16") ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
@@ -417,15 +452,27 @@ export function selectAttentionProjectKernel(device, requested = "auto") {
     // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
     // divides by it: a cache that handed back the other one would leave whole
     // tiles of rows unprojected, which reads as a speedup.
-    cacheKey: `block:attention:project:${precision}`
+    cacheKey: `block:attention:project:${precision}:${sourceStorage}`
       + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`,
-    shader: precision === "f16"
-      ? createAttentionProjectShader(tile, "f16") : ATTENTION_PROJECT_SHADER,
+    shader: precision === "f16" || sourceStorage !== "f32"
+      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage)
+      : ATTENTION_PROJECT_SHADER,
   };
 }
 
-export const ATTENTION_PAIR_BIAS_SHADER = `${COMMON}
-@group(0) @binding(0) var<storage, read> pair: array<f32>;
+/**
+ * The per-head bias a triangle or row attention reads off the pair track.
+ *
+ * 🔴 ITS SOURCE IS SOMETIMES THE NORMALISED ACTIVATION ITSELF. When the bias
+ * comes from a SEPARATE tensor - an MSA row attention biased by the pair - this
+ * reads that tensor. When it does not, `normalizedPair` IS `normalized`, which
+ * is the triangle attentions' case, and the storage has to follow it. Reading a
+ * packed tensor as f32 here folded 59 residues at pLDDT 27 with 5.3 A between
+ * consecutive alpha carbons: every shape still agreed, so nothing threw.
+ */
+export function createAttentionPairBiasShader(pairStorage = "f32") {
+  return `${COMMON}
+@group(0) @binding(0) var<storage, read> pair: array<${storageArray(pairStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -439,11 +486,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let head = index / (p.queries * p.queries);
   var result = 0.0;
   for (var c = 0u; c < p.pair_channels; c += 1u) {
-    result += pair[(q * p.queries + k) * p.pair_channels + c]
+    result += ${storedElement(pairStorage, "pair", "(q * p.queries + k) * p.pair_channels + c")}
       * weights[p.pair_weight + c * p.heads + head];
   }
   output[index] = result;
 }`;
+}
+
+export const ATTENTION_PAIR_BIAS_SHADER = createAttentionPairBiasShader();
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;

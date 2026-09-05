@@ -1,10 +1,11 @@
 import {
   ATTENTION_NORMALIZE_SHADER,
+  createAttentionNormalizeShader,
   attentionOutputTileColumns,
   attentionProjectTileColumns,
   attentionProjectTileRows,
   attentionOutputTileRows,
-  ATTENTION_PAIR_BIAS_SHADER,
+  createAttentionPairBiasShader,
   selectAttentionProjectKernel,
   selectAttentionOutputKernel,
   createAttentionNormParameters,
@@ -296,15 +297,28 @@ async function encodeAttention(
   // 🔴 THE PROJECTION'S TILE TRAVELS WITH ITS SHADER, because the dispatch
   // below divides by it and the two shapes differ by precision - see
   // selectAttentionProjectKernel.
+  // 🔴 THE NORMALISED ACTIVATION IS PACKED, AND NOTHING ELSE HERE IS YET. It
+  // is the one tensor in this operation with exactly two touchers - the layer
+  // norm writes it and the projection reads it - and both were already
+  // generated shaders, so it is where the packed storage can be measured
+  // without a five-kernel change. At 512 MSA rows it is 29.5 MiB of a fold
+  // whose peak is 603; see src/runtime/storage.js for what a packed word costs.
+  const normalizedStorage = "f16";
+  const pairBiasStorage = options.pairBias?.source === "separate" ? "f32" : normalizedStorage;
   const projectKernel = selectAttentionProjectKernel(
-    execution.device, options.projectPrecision ?? "auto");
+    execution.device, options.projectPrecision ?? "auto", normalizedStorage);
   const outputKernel = selectAttentionOutputKernel(
     execution.device, options.residualTarget !== undefined,
     options.outputPrecision ?? "auto");
-  const [normalize, project, pairProject, outputProject] = await Promise.all([
+  const [normalize, packedNormalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
+    execution.pipelines.get(`block:attention:normalize:${normalizedStorage}`,
+      createAttentionNormalizeShader(normalizedStorage)),
     execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
-    execution.pipelines.get("block:attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+    // The bias reads `normalized` itself unless the caller gave a separate
+    // source, so its storage is the normalised one in exactly that case.
+    execution.pipelines.get(`block:attention:pair-bias:${pairBiasStorage}`,
+      createAttentionPairBiasShader(pairBiasStorage)),
     execution.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
   ]);
   const rows = options.batch * options.queries;
@@ -315,7 +329,8 @@ async function encodeAttention(
     rows, options.channels, packed.offsets[0], packed.offsets[1], options.transpose,
     options.batch, options.queries, 1e-5,
   ));
-  const normalized = execution.allocate(`${options.label}.normalized`, elements);
+  const normalized = execution.allocate(
+    `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage);
   const query = execution.allocate(`${options.label}.query`, elements);
   const key = execution.allocate(`${options.label}.key`, elements);
   const value = execution.allocate(`${options.label}.value`, elements);
@@ -323,7 +338,7 @@ async function encodeAttention(
   const weighted = execution.allocate(`${options.label}.weighted`, elements);
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   const attentionNormGrid = execution.rowGrid(rows);
-  execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
+  execution.dispatch(encoder, packedNormalize, [options.source, weights, normParams, normalized],
     attentionNormGrid[0], attentionNormGrid[1], 1,
     `${options.label}.normalize`);
 

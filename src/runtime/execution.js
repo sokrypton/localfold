@@ -1,5 +1,6 @@
 import { GpuBufferAllocator } from "./allocator.js";
 import { pipelineCacheForDevice } from "./pipeline-cache.js";
+import { storageBytes, storageWords } from "./storage.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
@@ -58,23 +59,34 @@ export class WebGpuExecution {
       || offsetElements < 0 || elements <= 0 || offsetElements + elements > tensor.elements) {
       throw new RangeError(`invalid GPU tensor view ${offsetElements}:${elements} of ${tensor.elements}`);
     }
-    return {
-      allocation: tensor.allocation,
-      elements,
-      offsetElements: (tensor.offsetElements ?? 0) + offsetElements,
-    };
+    const storage = tensor.storage ?? "f32";
+    const offset = (tensor.offsetElements ?? 0) + offsetElements;
+    // 🔴 A PACKED VIEW HAS TO START ON A WORD. Two elements share one, so an
+    // odd offset would put the view's first element in the HIGH half of the
+    // word the binding starts at, and every index inside it would be off by
+    // one - silently, since the shapes still agree.
+    if (storage === "f16" && offset % 2 !== 0) {
+      throw new RangeError(`a packed tensor view must start on an even element; got ${offset}`);
+    }
+    return { allocation: tensor.allocation, elements, offsetElements: offset, storage };
   }
 
   upload(label, data, usage = GPUBufferUsage.STORAGE) {
     const allocation = this.allocator.upload(label, data, usage);
     this.#allocations.push(allocation);
-    return { allocation, elements: data.byteLength / 4 };
+    return { allocation, elements: data.byteLength / 4, storage: "f32" };
   }
 
-  allocate(label, elements, usage = GPUBufferUsage.STORAGE) {
-    const allocation = this.allocator.allocate(label, elements * 4, usage);
+  /**
+   * @param {number} elements how many VALUES the tensor holds, whatever the
+   *   storage. A packed tensor is half the bytes and the same shape, so every
+   *   caller's arithmetic is unchanged and only the allocation shrinks.
+   * @param {"f32"|"f16"} [storage] see src/runtime/storage.js
+   */
+  allocate(label, elements, usage = GPUBufferUsage.STORAGE, storage = "f32") {
+    const allocation = this.allocator.allocate(label, storageBytes(elements, storage), usage);
     this.#allocations.push(allocation);
-    return { allocation, elements };
+    return { allocation, elements, storage };
   }
 
   // 🔴 WEIGHTS ARE NOT CACHED ACROSS PASSES, and that was measured, not assumed.
@@ -171,8 +183,8 @@ export class WebGpuExecution {
         binding,
         resource: {
           buffer: tensor.allocation.buffer,
-          offset: (tensor.offsetElements ?? 0) * 4,
-          size: tensor.elements * 4,
+          offset: storageWords(tensor.offsetElements ?? 0, tensor.storage ?? "f32") * 4,
+          size: storageBytes(tensor.elements, tensor.storage ?? "f32"),
         },
       })),
     }));
