@@ -1247,6 +1247,18 @@ rounding to half precision, and the matrix units buy the same or more by not.
 `requestAlphaFoldDevice` now asks for the feature (optionally, so a browser
 without it never sees it requested); nothing in `src/` uses it yet.
 
+🔴 **AND THE SECOND ROW OF THAT TABLE IS NOT A SHIPPABLE 1.31x, BECAUSE THAT
+KERNEL'S SOURCE IS PACKED.** Every arm in `bench-evoformer-linear.js` reads an
+f32 source, so the arms compare fairly with each other and only the FIRST half's
+shape is the configuration that ships: `block.js` stores the transition's hidden
+activation as `f16` whenever `hiddenChannels % 4 == 0`, which the MSA
+transition's 1024 and the pair transition's are, and the second matmul reads it
+through `storedElement` - an `unpack2x16float` expression. `subgroupMatrixLoad`
+cannot consume an expression. So taking the matrix path there means storing
+`hidden` unpacked, which src/runtime/storage.js records as 16 MiB at 512 MSA
+rows for a BIT-IDENTICAL fold - a free win being given back. That is a real
+trade to weigh, not a number to quote.
+
 🔴 **AND AN OUT-OF-BOUNDS `subgroupMatrixLoad` RETURNS AN ENTIRELY ZERO MATRIX
 HERE, WHICH IS NOT WHAT UPSTREAM'S KERNEL ASSUMES.** Their bounded kernel runs
 the matrix path everywhere and bounds-checks only in the store, on the stated
