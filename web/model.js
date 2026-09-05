@@ -20,6 +20,7 @@ import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
 import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
+import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../src/runtime/abort.js";
 
 const stores = new Map();
@@ -89,7 +90,11 @@ export function getDevice() {
     // that asks for too much should fail loudly and does; a page that asks for
     // too much takes the machine down with it, so this is where the ceiling is
     // set. `null` takes the guess in device-memory.js from navigator.deviceMemory.
-    return requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
+    const device = await requestAlphaFoldDevice(adapter, { memoryBudgetBytes: null });
+    // ...so the footer's timing panel can read this device's memory counters.
+    // It reads them; it does not install anything on the device.
+    devUseDevice(device);
+    return device;
   })();
   return devicePromise;
 }

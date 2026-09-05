@@ -146,6 +146,8 @@ def main():
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
+    parser.add_argument("--dev-report", action="store_true",
+                        help="open the footer's dev panel and print what it says")
     parser.add_argument("--timeline", action="store_true",
                         help="print when the model shards and the MSA search"
                              " were each on the wire, and how much they"
@@ -353,6 +355,19 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+        if args.dev_report:
+            # 🔴 THROUGH THE BUTTON, NOT THE MODULE. The panel is built the
+            # first time it is opened, so calling devReport() directly would
+            # check the log and not the thing a reader presses.
+            print("dev    :", cdp.evaluate(ws, """(() => {
+              const button = document.getElementById('dev-toggle');
+              if (button === null) return 'no dev button in the footer';
+              button.click();
+              const panel = document.getElementById('dev-panel');
+              if (panel === null) return 'the button built no panel';
+              if (panel.hidden) return 'the panel stayed hidden';
+              return panel.querySelector('pre').textContent;
+            })()"""))
         shapes = cdp.evaluate(ws, """(() => {
           const log = window.__statusLog || [];
           const seen = [];

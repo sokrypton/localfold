@@ -180,6 +180,20 @@ export function residencyAllowed(device) {
  * pooled is still occupying the device, and is counted here - which is the
  * point: the device does not care that we intend to reuse it.
  */
+/**
+ * The two totals, and nothing else.
+ *
+ * 🔴 `memorySnapshot` BUILDS AND SORTS THREE ARRAYS, one per breakdown, which is
+ * right for a bench that calls it twice and wrong for anything on a fold's
+ * path. The footer's timing panel reads the totals once per phase - a couple of
+ * hundred times across a long sampler - and wants none of the breakdowns until
+ * a reader opens it. This allocates nothing.
+ */
+export function memoryTotals(device) {
+  const { residentBytes, peakBytes, budgetBytes, count } = accountFor(device);
+  return { residentBytes, peakBytes, budgetBytes, bufferCount: count };
+}
+
 export function memorySnapshot(device) {
   const { residentBytes, peakBytes, budgetBytes, count, byLabel, peakByLabel } = accountFor(device);
   const largest = [...byLabel.entries()]

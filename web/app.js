@@ -37,6 +37,8 @@ import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
+import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
+import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
 import { superposeOnto } from "./morph.js";
 import { CHAIN_IDS, confidenceJson, paeMatrix, predictionToPdb, safeJobName }
@@ -228,6 +230,11 @@ let viewerObject;
 /** py2Dmol's own status line, so folding reports where fetching used to. */
 function status(text, isError = false) {
   const node = document.getElementById("status-message");
+  // 🔴 THE TIMELINE IS FED BEFORE THE EARLY RETURN, so a page whose status line
+  // is missing still records. It costs one string compare a write, and only a
+  // CHANGE of leading segment records a row - the sampler rewriting a
+  // percentage several times a second is one phase, not four hundred.
+  devStatus(text);
   if (node === null) return;
   node.textContent = text;
   node.classList.toggle("error", isError);
@@ -1686,6 +1693,9 @@ async function fold(event) {
   const { signal } = controller;
   activeFold = controller;
   setFoldButton("running");
+  devBeginRun(`fold · ${element("model-family").value}`
+    + ` · alignment ${element("msa-mode").value}`
+    + ` · ${element("recycles").value} recycles`);
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
   // for as long as the new fold took - which is worse than an empty panel,
@@ -2222,6 +2232,10 @@ async function fold(event) {
       } else status(error instanceof Error ? error.message : String(error), true);
     }
   } finally {
+    // ...whatever happened, including a stop. The timeline is most useful about
+    // the fold that did NOT finish, so it is closed here and not on the way out
+    // of the success path.
+    devEndRun();
     if (activeFold === controller) activeFold = undefined;
     setFoldButton("idle");
   }
@@ -2295,6 +2309,7 @@ const syncMode = () => {
 };
 modeSelect.addEventListener("change", syncMode);
 
+installDevPanel();
 syncMode();
 
 // 🔴 THE MODEL DECIDES WHICH CONTROLS EXIST, and syncMode decides what the MSA
