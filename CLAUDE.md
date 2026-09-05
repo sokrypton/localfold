@@ -692,6 +692,36 @@ Caching the transformer's bind groups and scratch tensors bought nothing
 measurable against that - the stage sat at 45-46 ms either way - so the next
 thing there is chaining the stages ON THE DEVICE, not another cache.
 
+🔴 **PREPARING AN AF2 ALIGNMENT WAS 525 ms OF MAIN-THREAD JAVASCRIPT AND
+NOBODY HAD MEASURED IT.** Three loops, none of them subtle, all of them once
+per residue: `parseA3m` ran a regex and a `toUpperCase` per character and built
+each row by concatenation; `makeA3mFeatures` looked each residue up in a `Map`
+through a one-character string; and the nearest-centre assignment - extras x
+centres x residues, 1024 x 508 x 59 - ran once per RECYCLE.
+
+| | before | after |
+|---|---|---|
+| `parseA3m`, 30,000 rows | 307 ms | **85** |
+| `makeA3mFeatures`, 200 residues x 10,000 rows, one pass | 403 | **91** |
+| ...`tools/fixtures/test.a3m`, four passes | 525 | **75** |
+
+`tools/gpu/fold-af2.js`'s checksum is unchanged at -2105827, which is what
+says the clustering still clusters the same way.
+
+🔴 **AND `(x - 0x01010101) & ~x & 0x80808080` IS THE WRONG ZERO-BYTE TRICK IF
+YOU ARE COUNTING.** It is the one everyone reaches for and it is exact only for
+"is there a zero byte ANYWHERE": a borrow out of a zero byte marks its
+neighbour too. Used to count agreeing residues it changed 1024 assignments'
+checksum from 195329 to 199057 - a wrong answer that still looks like a
+histogram. `~(((x & 0x7f7f7f7f) + 0x7f7f7f7f) | x) & 0x80808080` has no borrow
+between bytes.
+
+🔴 **AND THE OTHER TWO PREP PATHS ARE NOT WORTH TOUCHING, MEASURED.** AF3's
+`featuriseProtein` is **1 ms** at 200 tokens, and `perAtomConditioning` - which
+fold.js's own comment calls out as 119 ms - is **4 ms at 59 tokens and 17 at
+240**. That comment is stale; the one-hot it describes was fixed. Writing the
+archive is 28 ms for a 2 MB alignment.
+
 🔴 **AND `node tools/gpu-chrome.mjs` SOMETIMES DOES NOT EXIT.** The results file
 is complete and correct and the node process sits there with a headless Chrome
 still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
