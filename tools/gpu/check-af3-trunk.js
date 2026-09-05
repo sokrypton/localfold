@@ -223,6 +223,15 @@ export async function main(device, args) {
   // table when a row moves; a row measured against a different tree is worse
   // than no row.
   //
+  // 🔴 AND IT WENT WRONG A THIRD WAY, WHICH THIS TABLE IS THE EVIDENCE FOR.
+  // Packing the pair track's scratch two f16 halves to a word turned the last
+  // row's pair term from the 1.99e-5 written here into 1.04e-4, and nobody
+  // re-measured - so the table stayed right about a tree nobody was running.
+  // The packing is gone (see UNPACKED_PAIR_SCRATCH) and the shipped
+  // configuration reads 1.99e-5 again, which is what says the packing was a
+  // regression rather than a new baseline. A storage format is a row here too,
+  // even though it has no column.
+  //
   // 4e-5 is 3x the worst pair measurement: these runs are deterministic, so the
   // margin is for scheduling and not for drift, and a bug moves this by orders
   // rather than by a factor. The f32 arm keeps its envelope rule and still
