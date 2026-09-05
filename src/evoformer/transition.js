@@ -1,5 +1,5 @@
 import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
-import { concatenateAs } from "../runtime/float16.js";
+import { concatenateAs, writeInto } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -239,7 +239,7 @@ export function packTransitionWeights(input, weightPrecision = "f32") {
   }
   const data = concatenateAs(weightPrecision, length, (target) => {
     for (let index = 0; index < values.length; index += 1) {
-      target.set(values[index], offsets[index]);
+      writeInto(target, values[index], offsets[index]);
     }
   });
   return { data, offsets };

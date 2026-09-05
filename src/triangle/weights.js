@@ -1,4 +1,4 @@
-import { concatenateAs } from "../runtime/float16.js";
+import { concatenateAs, writeInto } from "../runtime/float16.js";
 
 const ORDER = [
   "layerNormInWeight", "layerNormInBias",
@@ -17,7 +17,7 @@ export function packWeights(weights, precision) {
   }
 
   const data = concatenateAs(precision, elementCount, (target) => {
-    for (const name of ORDER) target.set(weights[name], offsets[name]);
+    for (const name of ORDER) writeInto(target, weights[name], offsets[name]);
   });
   return { data, offsets };
 }

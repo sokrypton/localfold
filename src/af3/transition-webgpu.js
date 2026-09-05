@@ -1,4 +1,4 @@
-import { concatenateAs } from "../runtime/float16.js";
+import { concatenateAs, writeInto } from "../runtime/float16.js";
 /**
  * AF3's transition block on the GPU: LayerNorm, then SwiGLU, then a projection
  * back down.
@@ -118,7 +118,7 @@ export function packTransitionWeights(weights, precision = "f32") {
     total += weights[name].length;
   }
   const data = concatenateAs(precision, total, (target) => {
-    for (const name of ORDER) target.set(weights[name], offsets[name]);
+    for (const name of ORDER) writeInto(target, weights[name], offsets[name]);
   });
   return { data, offsets };
 }

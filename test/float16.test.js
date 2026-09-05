@@ -1,5 +1,6 @@
 import { describe, expect, it } from "./harness.js";
-import { float32ToFloat16Array, numberToFloat16 } from "../src/runtime/float16.js";
+import { concatenateAs, float32ToFloat16Array, numberToFloat16, writeInto }
+  from "../src/runtime/float16.js";
 
 describe("float16 encoding", () => {
   it("encodes IEEE-754 boundary values", () => {
@@ -74,5 +75,36 @@ describe("float32ToFloat16Array against the scalar reference", () => {
       if (fast[index] !== numberToFloat16(values[index])) disagreements += 1;
     }
     expect(disagreements).toBe(0);
+  });
+});
+
+describe("writeInto", () => {
+  // 🔴 THE TAIL IS THE WHOLE RISK. It copies eight elements at a time and then
+  // whatever is left, so a length that is not a multiple of eight is the case
+  // that gets dropped - and a dropped tail is a weight buffer of the right
+  // LENGTH holding zeros at the end, which no shader can notice.
+  const lengths = [0, 1, 7, 8, 9, 15, 16, 17, 33];
+
+  it("agrees with set, at every length around the unrolled step", () => {
+    for (const length of lengths) {
+      const source = new Float32Array(length);
+      for (let index = 0; index < length; index += 1) source[index] = index * 0.3 - 2;
+      for (const offset of [0, 3]) {
+        const viaSet = concatenateAs("f16", length + offset + 2, (target) => {
+          target.set(source, offset);
+        });
+        const viaWrite = concatenateAs("f16", length + offset + 2, (target) => {
+          writeInto(target, source, offset);
+        });
+        expect(Array.from(viaWrite)).toEqual(Array.from(viaSet));
+      }
+    }
+  });
+
+  it("leaves an f32 target to set, which is already a memmove there", () => {
+    const source = new Float32Array([1.5, -2.25, 3]);
+    const target = new Float32Array(5);
+    writeInto(target, source, 1);
+    expect(Array.from(target)).toEqual([0, 1.5, -2.25, 3, 0]);
   });
 });

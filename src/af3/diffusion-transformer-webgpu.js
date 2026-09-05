@@ -1,4 +1,4 @@
-import { concatenateAs } from "../runtime/float16.js";
+import { concatenateAs, writeInto } from "../runtime/float16.js";
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
  *
@@ -100,7 +100,7 @@ export function packBlockWeights(block, precision = "f32") {
     total += block[name].length;
   }
   const data = concatenateAs(precision, total, (target) => {
-    for (const name of BLOCK_ORDER) target.set(block[name], offsets[name]);
+    for (const name of BLOCK_ORDER) writeInto(target, block[name], offsets[name]);
   });
   return { data, offsets };
 }
