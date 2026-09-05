@@ -39,7 +39,7 @@ import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, PAIR_SCRATCH_STORAGE,
+  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
@@ -291,15 +291,17 @@ export class Af3PairformerStackGpu {
       const pairMask = keep(this.allocator.upload("af3-block.pair-mask", state.pairMask, storage));
       const seqMask = keep(this.allocator.upload("af3-block.seq-mask", state.seqMask, storage));
 
-      // Seven pair-sized scratch buffers, shared by every operation. Their
-      // storage is PAIR_SCRATCH_STORAGE's to say, and the shaders read the
+      // Six pair-sized scratch buffers, shared by every operation. Their
+      // storage is UNPACKED_PAIR_SCRATCH's to say, and the shaders read the
       // same array - a buffer half the bytes of what a shader expects is not
-      // something WebGPU can catch.
+      // something WebGPU can catch. See that constant for what packing them
+      // cost: a factor of 1200 on the pair representation this stack produces,
+      // which is what the confidence head reads.
       const scratch = [];
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-block.scratch${index}`,
-          storageBytes(pairs * PAIR_CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));
+          storageBytes(pairs * PAIR_CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-block.bias", gridHeads * pairs * 4, storage));
