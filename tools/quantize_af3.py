@@ -98,6 +98,19 @@ def main():
     out = ROOT / arguments.out
     manifest = json.loads((source / "manifest.json").read_text())
     tensors = manifest["tensors"]
+    # 🔴 THE MANIFEST'S OWN float32 LIST WAS BEING IGNORED HERE, AND HONOURED BY
+    # tools/quantize_model.py. Every AF3 export writes `float32Tensors` and all
+    # 150 of its entries already match KEEP_FLOAT32, so this changed nothing for
+    # AF3 and looked like it worked - but a bundle whose float32 tensors are not
+    # named `/scale`, `/offset` or `/bias` had no way to say so. ESM-C's
+    # embedding table is one: it is a `weights` by name and it is the input to
+    # all 36 blocks, which the AF3 port measured at corr 0.19 against native
+    # when it was left as raw codes.
+    named_float32 = set(manifest.get("float32Tensors", []))
+    unknown = named_float32 - set(tensors)
+    if unknown:
+        raise SystemExit("float32Tensors names tensors not in this export: "
+                         + ", ".join(sorted(unknown)))
 
     if out.exists():
         shutil.rmtree(out)
@@ -137,7 +150,7 @@ def main():
 
             name = next(n for n, r in tensors.items() if r is record)
             record["file"] = renamed[filename]
-            if KEEP_FLOAT32.search(name):
+            if KEEP_FLOAT32.search(name) or name in named_float32:
                 payload = np.ascontiguousarray(values, dtype="<f4").tobytes()
                 record["dtype"] = "float32"
                 kept += 1

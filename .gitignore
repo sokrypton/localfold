@@ -72,6 +72,8 @@ natives
 /esmfold2-fast-600m/
 /esmfold2-fast-300m/
 /model-esmc-*/
+/model-esmc-600m-f32
+/model-esmc-600m-int5
 
 # transformers, installed with --system-site-packages so it shares this
 # machine's torch, purely to have an ORACLE for the hand-written ESM-C forward
