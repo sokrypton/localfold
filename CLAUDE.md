@@ -496,6 +496,21 @@ converged one. The scores card and the status line report the saved pass, and
 the line says `saved pass N of M` when it is not the last, because the play bar
 is still sitting on the last one.
 
+🔴 **py2Dmol IS A MIRROR NOW, WITH A COMMIT ON IT.** The four vendored files -
+`py2Dmol.app.css`, `py2Dmol.align.js`, `py2Dmol.embed.min.js`,
+`py2Dmol.full.min.js` - had been copied by hand and nothing recorded from
+where, so "is this current?" could only be answered by diffing 800 KB of
+minified JavaScript against a build. `python3 tools/sync-py2dmol.py` runs
+upstream's own `tools/bundle.py build`, copies the four, and stamps the commit
+and each file's hash into `web/vendor/SOURCE.md`; `--check` says whether the
+mirror has drifted. Never edit the mirror.
+
+🔴 **AND BOTH BUNDLES ARE NEEDED, WHICH THE SIZES HIDE.** `full` is the website
+plus the embed API and `embed` is the embed API alone, so `full` looks like a
+superset and is nearly one - but `index.html` loads `full` while `single.html`
+and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
+the three pages on a stale viewer.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring
