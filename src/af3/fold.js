@@ -31,6 +31,7 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
+import { releaseResidentWeights } from "../runtime/resident.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
@@ -573,6 +574,18 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // it for one they did not build. Without this a fold leaks the diffusion
   // head's device buffers for the life of the page.
   head?.dispose();
+
+  // 🔴 AND THE DIFFUSION TRANSFORMER'S RESIDENT WEIGHTS GO WITH IT, because the
+  // fold's peak is AFTER this point and not before it. The sampler is finished
+  // and its positions are read back, so nothing can still be reading them; what
+  // runs next is the confidence head, which is four more pairformer blocks and
+  // allocates the whole pair scratch again. Measured at 272 tokens, they were
+  // 378 MiB of a 1214 MiB peak, held for a stage that cannot use them.
+  //
+  // The cost is that the NEXT fold packs and uploads them again. On unified
+  // memory that is the packing and not the transfer; see the measurement in
+  // the commit that added this.
+  releaseResidentWeights(device, "difftx.");
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;

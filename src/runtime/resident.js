@@ -77,7 +77,7 @@ export function residentWeightBuffer(device, key, label, pack, variant = "") {
 }
 
 /**
- * Destroy every weight buffer resident on a device, and forget them.
+ * Destroy weight buffers resident on a device, and forget them.
  *
  * For the caller that has just been refused an allocation and is about to fall
  * back to uploading per pass: without this the residency built up to the
@@ -85,18 +85,34 @@ export function residentWeightBuffer(device, key, label, pack, variant = "") {
  * has to fit inside. Anything asking for one of these afterwards packs and
  * uploads it again, which is what the fallback does anyway.
  *
+ * 🔴 AND A STAGE'S RESIDENCY CAN BE GIVEN BACK WHEN THE STAGE IS OVER, which
+ * is what `prefix` is for. An AF3 fold's peak is not in its diffusion and not
+ * in its trunk: it is in the CONFIDENCE HEAD, which runs four more pairformer
+ * blocks after the sampler has finished, while the diffusion transformer's
+ * weights are still resident and can no longer be read by anything. Releasing
+ * by prefix at that point is the difference between a fold that fits and one
+ * that does not, and it costs only what re-packing costs the NEXT fold.
+ *
+ * @param {string} [prefix] release only buffers whose label starts with this.
+ *   Omit to release everything, which is the refusal path's meaning.
  * @returns {number} bytes reclaimed
  */
-export function releaseResidentWeights(device) {
+export function releaseResidentWeights(device, prefix) {
   const held = heldByDevice.get(device);
   if (held === undefined) return 0;
   let bytes = 0;
+  const kept = [];
   for (const entry of held) {
+    if (prefix !== undefined && !String(entry.buffer.label ?? "").startsWith(prefix)) {
+      kept.push(entry);
+      continue;
+    }
     entry.forKey.delete(entry.label);
     entry.buffer.destroy();
     noteDestroy(device, entry.size, entry.buffer.label);
     bytes += entry.size;
   }
-  heldByDevice.delete(device);
+  if (kept.length === 0) heldByDevice.delete(device);
+  else heldByDevice.set(device, kept);
   return bytes;
 }
