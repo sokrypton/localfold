@@ -10,6 +10,24 @@
  * and a 48-block average; this synthesises the weights and runs the one shader,
  * so an arm costs about a second and the tiles alternate inside one process.
  * See the note on run-to-run drift in CLAUDE.md.
+ *
+ * 🔴 WHAT IT SAYS NOW, AT 200 TOKENS (40,000 ROWS), AGAINST A 10.69 ms ARM AT
+ * THE TILE AND CHUNK THE TRUNK ACTUALLY RUNS - which is `8:128`, and which the
+ * sweep confirms is still the optimum there (4 gives 14.34, 8:512 14.71,
+ * 16:128 11.78, 8:256 11.54):
+ *
+ *     the first matmul's two weight reads   2.08 ms   19%
+ *     the normalised tile, from shared      1.24       12%
+ *     the second matmul's weight read       0.63        6%
+ *     the gated block, from shared          0.41        4%
+ *     ---------------------------------------------------
+ *     everything left is arithmetic         6.33       59%
+ *
+ * So it is NOT bandwidth bound: removing every weight read saves 2.7 ms of
+ * 10.69. Storing the weights in f16 is worth 1.08 ms - 10% - and costs relRMS
+ * 1.35e-3 against the f32 arm, which is why the trunk does not take it by
+ * default; see CLAUDE.md's table on where f16 weights buy time and where they
+ * do not.
  */
 import { createTransitionShader, packTransitionWeights } from "../../src/af3/transition-webgpu.js";
 
@@ -46,17 +64,26 @@ export async function main(device, args) {
     transition2: random(intermediate * channels),
   };
   const packed = packTransitionWeights(weights);
+  // 🔴 THE BUFFER AND THE SHADER MUST AGREE ABOUT THE ELEMENT. The offsets are
+  // in ELEMENTS and do not depend on it, so a mismatch is a wrong answer
+  // rather than an error - see packTransitionWeights.
+  const packedHalf = packTransitionWeights(weights, "f16");
   const input = random(rows * channels);
 
   const storage = GPUBufferUsage.STORAGE;
+  // ...by BYTES, not by floats: a packed f16 bundle is a Uint16Array and
+  // writing it through a Float32Array view runs off the end of the mapping.
   const upload = (data, usage) => {
-    const buffer = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
-    new Float32Array(buffer.getMappedRange()).set(data);
+    const size = Math.ceil(data.byteLength / 4) * 4;
+    const buffer = device.createBuffer({ size, usage, mappedAtCreation: true });
+    new Uint8Array(buffer.getMappedRange()).set(
+      new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
     buffer.unmap();
     return buffer;
   };
   const inputBuffer = upload(input, storage);
   const weightBuffer = upload(packed.data, storage);
+  const halfWeightBuffer = upload(packedHalf.data, storage);
   const outputBuffer = device.createBuffer({
     size: rows * channels * 4, usage: storage | GPUBufferUsage.COPY_SRC });
   const readback = device.createBuffer({
@@ -69,11 +96,23 @@ export async function main(device, args) {
   // of the normalised tile, "w" drops the two weight reads. Their relRms is
   // expected to be large; they exist only to say which read the loop is waiting
   // on. Never read a fold out of one.
+  //
+  // 🔴 AND EVERY PATTERN HERE ROTS WITH THE KERNEL. Two of the four - `x` and
+  // `g` - had stopped matching, and the arm raises rather than reporting a
+  // wrong number, which is the right failure but only if someone runs it. They
+  // are written against the loop bodies as they stand; when the shader is
+  // rearranged again, expect to rewrite them with it.
   const surgery = {
-    x: [/x\[t\] = normalized\[t \* CHANNELS \+ c\];/, "x[t] = f32(c) * 1e-6;"],
+    // ...tolerant of the widen wrapper, which is `vec4<f32>(...)` for a staged
+    // f16 tile at lanes 4 and nothing at all for an f32 one. The replacement
+    // has to be the same TYPE as what it replaces, so it is written from the
+    // capture rather than as a scalar.
+    x: [/let x = ((?:vec\d<f32>|f32)?\()?normalized\[g \* CHANNELS \+ c\]\)?;/,
+        (whole, open_) => `let x = ${open_ ?? ""}f32(c) * 1e-6${open_ ? ")" : ""};`],
     w: [/let wg = weights\[column \+ i\];\n\s*let wv = weights\[column \+ INTERMEDIATE \+ i\];/,
         "let wg = f32(i) * 1e-6; let wv = f32(c) * 1e-6;"],
-    g: [/sum\[t\] \+= gated\[t \* CHUNK \+ slot\] \* w;/, "sum[t] += w;"],
+    g: [/((?:vec\d<f16>|f16|f32)?\()?gated\[g \* CHUNK \+ slot\]\)?/,
+        (whole, open_) => `${open_ ?? ""}f16(slot)${open_ ? ")" : ""}`],
     t2: [/let w = weights\[W_T2 \+ \(chunk0 \+ slot\) \* CHANNELS \+ c\];/,
          "let w = f32(slot) * 1e-6;"],
   };
@@ -84,15 +123,20 @@ export async function main(device, args) {
     // `8:128@f16` narrows the two STAGED blocks; `8:128@f16+f16` narrows the
     // running sum as well, which is a different register story - see
     // accumulatePrecision in src/af3/transition-webgpu.js.
+    // `8:128@f16+f16+f16` names the staged blocks, the running sum, and the
+    // element the WEIGHT buffer holds - a third axis, and the one that decides
+    // how many bytes each workgroup reads. See createTransitionShader.
     const [armSpec, precisionSpec = "f32"] = spec.split("@");
-    const [stagePrecision, accumulatePrecision = "f32"] = precisionSpec.split("+");
+    const [stagePrecision, accumulatePrecision = "f32", weightPrecision = "f32"] =
+      precisionSpec.split("+");
     const [tile, chunk, drop, width, lanes] = armSpec.split(":");
-    if ((stagePrecision !== "f32" || accumulatePrecision !== "f32")
-      && !device.features.has("shader-f16")) continue;
+    if ((stagePrecision !== "f32" || accumulatePrecision !== "f32"
+         || weightPrecision !== "f32") && !device.features.has("shader-f16")) continue;
     let source = createTransitionShader(
       { rows, channels, factor, tile: Number(tile), chunk: chunk ? Number(chunk) : undefined,
         width: width ? Number(width) : undefined,
-        lanes: lanes ? Number(lanes) : undefined, stagePrecision, accumulatePrecision },
+        lanes: lanes ? Number(lanes) : undefined, stagePrecision, accumulatePrecision,
+        weightPrecision },
       packed.offsets, 1e-5, "fast");
     if (drop) {
       const [pattern, replacement] = surgery[drop];
@@ -104,8 +148,8 @@ export async function main(device, args) {
       layout: "auto", compute: { module, entryPoint: "main" } });
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-      entries: [inputBuffer, weightBuffer, outputBuffer].map((buffer, binding) => ({
-        binding, resource: { buffer } })),
+      entries: [inputBuffer, weightPrecision === "f16" ? halfWeightBuffer : weightBuffer,
+                outputBuffer].map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     arms.push({ spec, pipeline, bindGroup, groups: Math.ceil(rows / Number(tile)), times: [] });
   }
