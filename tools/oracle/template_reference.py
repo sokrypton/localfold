@@ -9,7 +9,7 @@ and 3.0e-4. The disagreement is entirely after `construct_input` - the input
 term here agrees with the GPU to 2.15e-7 - and is somewhere in the transcribed
 triangle multiplication, triangle attention or transition below. It has never
 been found, because for a long time nothing compared this file to anything: it
-wrote toy-template.json and no reader existed.
+wrote oracle-dumps/toy-template.json and no reader existed.
 
 What it is still good for is that input term, which is a second and
 independently written reading of construct_input including the six geometry
@@ -249,12 +249,12 @@ def main() -> int:
     parser.add_argument("--span-chains", action="store_true",
                         help="let one template speak across chains, which AF2"
                              " never does - see src/af3/template-features.js")
-    parser.add_argument("--out", default="toy-template.json")
+    parser.add_argument("--out", default="oracle-dumps/toy-template.json")
     arguments = parser.parse_args()
 
     P = load_params(pathlib.Path(
         "/Users/mini/Documents/GitHub/af-params/params_model_1_multimer_v3.npz"))
-    stage = json.load(open("toy-oracle-stages.json"))
+    stage = json.load(open("oracle-dumps/toy-oracle-stages.json"))
     L = 16
     pair = np.array(stage["embedder_pair"], np.float64).reshape(L, L, 128)
 

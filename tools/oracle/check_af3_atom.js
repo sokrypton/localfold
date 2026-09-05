@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
  *         --capture 'evoformer_conditioning_embed_ref|evoformer_conditioning_single_to_pair|evoformer_conditioning_embed_pair' \
- *         --out af3-oracle-atom-f32.json
+ *         --out oracle-dumps/af3-oracle-atom-f32.json
  *     node tools/oracle/check_af3_atom.js
  *
  * Nine terms, each isolated: the five reference embeddings that are summed into
@@ -24,7 +24,7 @@ import { ROOT, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const model = process.argv.includes("--model")
   ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-f32";
-const dump = await loadDump("af3-oracle-atom-f32.json");
+const dump = await loadDump("oracle-dumps/af3-oracle-atom-f32.json");
 const { tensors } = await loadTensors(join(ROOT, model));
 const C = "diffuser/evoformer_conditioning";
 const w = (n) => tensors.get(`${C}_${n}/weights`).data;

@@ -93,7 +93,7 @@ payload["distogram"] = dg.astype(np.float64).ravel().tolist()
 payload["plddt_logits"] = pl.astype(np.float64).ravel().tolist()
 payload["ca"] = ca.astype(np.float64).ravel().tolist()
 payload["shapes"] = {n: list(np.asarray(model_inputs[n]).shape) for n in wanted}
-out_path = os.environ.get("ORACLE_OUT", os.path.join(REPO_ROOT, "toy-oracle.json"))
+out_path = os.environ.get("ORACLE_OUT", os.path.join(REPO_ROOT, "oracle-dumps/toy-oracle.json"))
 with open(out_path, "w") as fh:
     json.dump(payload, fh)
 print("saved toy_multimer.npz and", out_path)

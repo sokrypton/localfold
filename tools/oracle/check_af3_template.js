@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
  *       --capture 'evoformer/template_embedding/__call__$|evoformer/__call__$|msa_stack/__call__$' \
- *       --out af3-oracle-embed-f32.json
+ *       --out oracle-dumps/af3-oracle-embed-f32.json
  *     node tools/oracle/check_af3_template.js
  *
  * 🔴 "NO TEMPLATES" IS THE INTERESTING CASE, NOT THE TRIVIAL ONE. The module's
@@ -22,7 +22,7 @@ import { embed } from "../../src/af3/embedder-reference.js";
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import * as B from "./af3-bundle.js";
 
-const dump = await B.loadDump("af3-oracle-embed-f32.json");
+const dump = await B.loadDump("oracle-dumps/af3-oracle-embed-f32.json");
 const { tensors } = await B.loadTensors(join(B.ROOT, "model-af3-f32"));
 const EVO = "diffuser/evoformer";
 const TE = `${EVO}/template_embedding`;

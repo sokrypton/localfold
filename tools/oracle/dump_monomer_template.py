@@ -1,7 +1,7 @@
 """Capture AF2-MONOMER's template embedder by running AF2's own module.
 
-    python3 tools/oracle/dump_monomer_template.py --template 1qys-crystal.pdb:A \
-      --out toy-template-monomer-jax.json
+    python3 tools/oracle/dump_monomer_template.py --template tools/fixtures/1qys-crystal.pdb:A \
+      --out oracle-dumps/toy-template-monomer-jax.json
 
 🔴 COLABDESIGN2 CANNOT DO THIS ONE AND SAYS SO. Its AF2Runner puts the monomer
 on the multimer graph and raises: "the monomer and multimer template embedders
@@ -96,7 +96,7 @@ def main() -> int:
                              " a fold means is a question about the caller.")
     parser.add_argument("--length", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", default="toy-template-monomer-jax.json")
+    parser.add_argument("--out", default="oracle-dumps/toy-template-monomer-jax.json")
     arguments = parser.parse_args()
 
     length = arguments.length

@@ -2,7 +2,7 @@
  * Check the confidence head against AF3: pLDDT, PAE and PDE.
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 48 --diffusion 1 --float32 \
- *       --capture 'evoformer/__call__$' --out af3-oracle-confidence-f32.json
+ *       --capture 'evoformer/__call__$' --out oracle-dumps/af3-oracle-confidence-f32.json
  *     node tools/oracle/check_af3_confidence.js
  *
  * The head is fed AF3's own sampled coordinates, which the run dumps as
@@ -84,7 +84,7 @@ function blockWeights(tensors, index) {
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-full-f32";
-  const dump = await loadDump("af3-oracle-confidence-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-confidence-f32.json");
   const { tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py --blocks 48 --diffusion 1 --float32");
   const T = (name) => {

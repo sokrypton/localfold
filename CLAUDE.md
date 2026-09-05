@@ -1,6 +1,6 @@
 # Working on LocalFold
 
-`AGENTS.md` has the engineering invariants and `AF3.md` the AF3 port's state,
+`AGENTS.md` has the engineering invariants and `docs/AF3.md` the AF3 port's state,
 costs and dead ends. This file is the operational half: how to actually run
 things here, and the traps that have cost time more than once.
 
@@ -198,7 +198,7 @@ per-slot outputs. That answers the objection at the top of
 `src/af3/template-reference.js` - "with no template the six geometry features
 are identically zero, so nothing here can tell a correct implementation of them
 from a wrong one" - which was true and is the reason only the empty-slot path
-exists. See AF3.md's template entry for the numbers.
+exists. See docs/AF3.md's template entry for the numbers.
 
 It writes the template's mmCIF from the PDB's OWN ATOM NAMES rather than
 through atom37. ColabDesign2's `_mmcif_for` does the same job but reaches AF2's
@@ -298,7 +298,7 @@ times here with three answers:
 
 Halving the bytes never halves the read INSTRUCTIONS, and the `f32()` at each
 read is not free - so where the bytes are not the bottleneck it is a small
-LOSS taken for the memory. See AF3.md's memory section and
+LOSS taken for the memory. See docs/AF3.md's memory section and
 `TRANSITION_CHUNK_TARGET_BYTES`.
 
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
@@ -454,7 +454,7 @@ ever laid out.
 
 🔴 **"DOWNLOAD ALL" WRITES THE AF3 SERVER'S ARCHIVE, AND THE UPLOAD BOX READS
 IT BACK.** `web/zip.js` is a writer and a reader in one file; `web/fold-archive.js`
-assembles the members. Checked against `fold_2026_09_01_10_17.zip` in the repo
+assembles the members. Checked against `tools/fixtures/fold_2026_09_01_10_17.zip` in the repo
 root: `full_data_0.json` and `job_request.json` match key for key, and
 `summary_confidences_0.json` carries nine of its ten. The tenth, `has_clash`, is
 omitted because it is a claim about geometry nothing here computes. The
@@ -611,8 +611,19 @@ python3 tools/oracle/dump_af3_trunk.py --blocks 48 --recycles 0 --diffusion 20 \
 ```
 
 `--capture-args` is what records the head's *inputs*, without which its answer
-cannot be reproduced. Dumps are large; keep them in the scratchpad and symlink
-into the repo root only while a checker needs to fetch them.
+cannot be reproduced.
+
+🔴 **EVERY DUMP LIVES IN `oracle-dumps/`, AND THE CHECKERS FETCH IT FROM
+THERE.** They used to be written into the repository root, one `.gitignore`
+line per file, and 300 MB of generated tensors sat beside `index.html` where a
+reader cannot tell the project from somebody's afternoon. The directory is
+ignored whole; the dump scripts default their `--out` into it and the checkers
+fetch `/oracle-dumps/<name>.json`.
+
+🔴 **AND THE FIXTURES ARE IN `tools/fixtures/`** - `1qys-crystal.pdb`,
+`6mrr-crystal.pdb`, `test.a3m` and the reference AF3 server archive. They are
+inputs to the tooling, not repository content, and they were nine PDB files and
+two zips deep in the root before.
 
 ## Two habits worth keeping
 

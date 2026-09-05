@@ -2,7 +2,7 @@
  * Check the template embedder against AF3 with a REAL TEMPLATE in slot 0.
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
- *       --sequence DIQVQVNIDDNGKNFD --template 1qys-crystal.pdb:A \
+ *       --sequence DIQVQVNIDDNGKNFD --template tools/fixtures/1qys-crystal.pdb:A \
  *       --capture 'template_embedding/__call__$|evoformer/__call__$' \
  *       --capture-args 'template_embedding/__call__$' \
  *       --out af3-oracle-template-f32.json

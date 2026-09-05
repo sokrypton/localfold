@@ -46,7 +46,7 @@ function deletionValue(value) { return Math.atan(value / 3) * 2 / Math.PI; }
  * expensive thing in an A3M fold - profiling puts `extra.msa-row-attention.flash`
  * at about 1.2 s per block - so 5120 would cost roughly five times that stack.
  *
- * WHAT THE REDUCTION COSTS, measured: on the 8,076-row `test.a3m` the JS
+ * WHAT THE REDUCTION COSTS, measured: on the 8,076-row `tools/fixtures/test.a3m` the JS
  * clustering at 508/1024 reaches 96.8 pLDDT against the captured AlphaFold
  * reference's 96.625 at the same recycle. That is a shallow alignment of a
  * 59-residue protein, which is where a smaller `max_extra_msa` is least likely

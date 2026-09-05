@@ -170,7 +170,7 @@ export async function main(device, args) {
   // MiB to 740. Two things moved after it: the pair track's weights came back
   // out of f16 (so a fold holds 798 now, not 740) and the triangle projections
   // took f16 accumulators (so the shipped tree's RMSD against all-f32 is 0.032
-  // on 6MRR, not 0.0104). AF3.md carries the combined figure.
+  // on 6MRR, not 0.0104). docs/AF3.md carries the combined figure.
   //
   // ...with N-CA, CA-C and CA-CA medians identical to five decimals. AF3's own
   // accuracy on these is 0.7-0.9 A and the sampler's seed-to-seed spread is

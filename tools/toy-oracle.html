@@ -17,7 +17,10 @@ const out = document.getElementById('out');
 out.textContent = '';
 const log = (s) => { out.textContent += s + "\n"; };
 const bust = `?v=${Date.now()}`;
-const src = (path) => import(`./${path}${bust}`);
+// 🔴 `../`, BECAUSE THIS PAGE MOVED INTO tools/. It is served over HTTP
+// from the repository root, so a page at /tools/ resolving `../src/...`
+// asks for /src/... - which is what it did when it sat at the root.
+const src = (path) => import(`../${path}${bust}`);
 const { getDevice } = await src('web/model.js');
 const { HttpTensorStore } = await src('src/reference/http-tensor-store.js');
 const { AlphaFoldFixture } = await src('src/reference/alphafold-fixture.js');
@@ -30,9 +33,9 @@ try {
   const family = q.get('family') ?? 'multimer';
   // ...?copies=3 reads a dump of the same toy at a different chain count, so
   // "does the error grow with copies" is a measurement rather than a guess.
-  const dump = family === 'monomer' ? './toy-oracle-monomer.json'
-    : q.get('copies') === null ? './toy-oracle.json'
-      : `./toy-oracle-${q.get('copies')}copies.json`;
+  const dump = family === 'monomer' ? '../oracle-dumps/toy-oracle-monomer.json'
+    : q.get('copies') === null ? '../oracle-dumps/toy-oracle.json'
+      : `../oracle-dumps/toy-oracle-${q.get('copies')}copies.json`;
   const o = await fetch(dump)
     .then((r) => r.json());
   const L = o.length;
@@ -173,10 +176,10 @@ try {
   };
   // stage by stage, where a reference for that stage exists
   const truncRef = trunc.length === 2
-    ? await fetch(family === 'monomer' ? './toy-oracle-truncated-monomer.json'
-        : (q.get('opm') === 'off' ? './toy-oracle-truncated-opmlast.json'
-          : q.get('tmpl') === 'off' ? './toy-oracle-truncated-notmpl.json'
-          : './toy-oracle-truncated.json')).then((r) => r.ok ? r.json() : null).catch(() => null)
+    ? await fetch(family === 'monomer' ? '../oracle-dumps/toy-oracle-truncated-monomer.json'
+        : (q.get('opm') === 'off' ? '../oracle-dumps/toy-oracle-truncated-opmlast.json'
+          : q.get('tmpl') === 'off' ? '../oracle-dumps/toy-oracle-truncated-notmpl.json'
+          : '../oracle-dumps/toy-oracle-truncated.json')).then((r) => r.ok ? r.json() : null).catch(() => null)
     : null;
   if (truncRef !== null) {
     log(`truncated trunk (${truncRef.main} main + ${truncRef.extra} extra):`);
@@ -187,7 +190,7 @@ try {
     }
     log('');
   }
-  const stageRef = await fetch('./toy-oracle-stages.json').then((r) => r.ok ? r.json() : null).catch(() => null);
+  const stageRef = await fetch('../oracle-dumps/toy-oracle-stages.json').then((r) => r.ok ? r.json() : null).catch(() => null);
   // 🔴 `embedder_pair` IS THE PRE-TEMPLATE STAGE. Ours is captured after the
   // template term is added to the pair, so the two are only the same thing
   // with templates off - compared with them on, this reads ~1.2 and means

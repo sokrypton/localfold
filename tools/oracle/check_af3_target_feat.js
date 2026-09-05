@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
  *       --capture 'evoformer_conditioning_embed_ref|evoformer_conditioning_single_to_pair|evoformer_conditioning_embed_pair|atom_transformer_encoder/__call__$|project_atom_features|evoformer/__call__$' \
- *       --out af3-oracle-atom-f32.json
+ *       --out oracle-dumps/af3-oracle-atom-f32.json
  *     node tools/oracle/check_af3_target_feat.js
  *
  * This is the bottom of the model reached from the top: reference conformers
@@ -17,7 +17,7 @@ import { atomCrossAttentionEncoder, targetFeatures }
   from "../../src/af3/atom-encoder-reference.js";
 import * as B from "./af3-bundle.js";
 
-const dump = await B.loadDump("af3-oracle-atom-f32.json");
+const dump = await B.loadDump("oracle-dumps/af3-oracle-atom-f32.json");
 const { tensors } = await B.loadTensors(join(B.ROOT, "model-af3-f32"));
 const C = "diffuser/evoformer_conditioning";
 const w = (n) => tensors.get(`${C}_${n}/weights`).data;

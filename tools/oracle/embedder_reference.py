@@ -19,7 +19,7 @@ from convert_multimer_params import load_params
 
 EVO = "alphafold/alphafold_iteration/evoformer/"
 P = load_params(pathlib.Path("/Users/mini/Documents/GitHub/af-params/params_model_1_multimer_v3.npz"))
-o = json.load(open("toy-oracle.json"))
+o = json.load(open("oracle-dumps/toy-oracle.json"))
 L = o["length"]
 
 target = np.array(o["target_feat"], np.float64).reshape(L, 20)
@@ -56,5 +56,5 @@ pair = pair + feat @ W["weights"] + W["bias"]
 
 print(f"embedder pair init {pair.shape}  |x| {np.abs(pair).mean():.4f}  max {np.abs(pair).max():.3f}")
 json.dump({"embedder_pair": pair.ravel().tolist()},
-          open("toy-oracle-stages.json", "w"))
-print("wrote toy-oracle-stages.json")
+          open("oracle-dumps/toy-oracle-stages.json", "w"))
+print("wrote oracle-dumps/toy-oracle-stages.json")

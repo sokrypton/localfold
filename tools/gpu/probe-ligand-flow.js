@@ -27,7 +27,7 @@
  *
  * WHAT IT FOUND, on HEM alone (50 bonds, one seed a cell, recycles 0), as
  * rms/max bond error in angstroms, AFTER the diffusion head's weight-name fix
- * (see AF3.md, "Fixed: the side chains were compressed"):
+ * (see docs/AF3.md, "Fixed: the side chains were compressed"):
  *
  *     sigma0 |  2 steps    4 steps    6 steps    8 steps   16 steps
  *       2560 | 0.401/.92  0.270/.78  0.198/.66  0.202/.72  0.168/.61

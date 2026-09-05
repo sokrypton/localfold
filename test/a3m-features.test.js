@@ -15,7 +15,7 @@ describe("A3M model feature preprocessing", () => {
 
   it("clusters the uploaded 8,076-row alignment into model-1 tensors", async() => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open("test/fixtures/evoformer/model1-query-59-stack/manifest.json"));
-    const result = makeA3mFeatures(await readFile("test.a3m", "utf8"), await fixture.queryOnlyFeatureTables(), {
+    const result = makeA3mFeatures(await readFile("tools/fixtures/test.a3m", "utf8"), await fixture.queryOnlyFeatureTables(), {
       recycles: 0, randomSeed: 0,
     });
     const features = result[0];
@@ -29,7 +29,7 @@ describe("A3M model feature preprocessing", () => {
 
   it("subsamples MSA depth to user-specified cluster and extra limits", async() => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open("test/fixtures/evoformer/model1-query-59-stack/manifest.json"));
-    const text = await readFile("test.a3m", "utf8");
+    const text = await readFile("tools/fixtures/test.a3m", "utf8");
     const tables = await fixture.queryOnlyFeatureTables();
     const f256 = makeA3mFeatures(text, tables, { recycles: 0, maxMsaSequences: 256, maxExtraSequences: 512 })[0];
     expect(f256.msaSequences).toBe(256);

@@ -89,5 +89,5 @@ json.dump({"truncated_pair": pair.ravel().tolist(),
            "truncated_msa_first_row": msa_first.ravel().tolist(),
            "main": MAIN, "extra": EXTRA},
           open(os.environ.get("TRUNC_OUT", os.path.join(REPO_ROOT,
-    "toy-oracle-truncated.json")), "w"))
-print("wrote toy-oracle-truncated.json")
+    "oracle-dumps/toy-oracle-truncated.json")), "w"))
+print("wrote oracle-dumps/toy-oracle-truncated.json")

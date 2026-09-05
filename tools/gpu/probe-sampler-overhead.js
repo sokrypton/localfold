@@ -4,7 +4,7 @@
  *     node tools/gpu-chrome.mjs tools/gpu/probe-sampler-overhead.js
  *     node tools/gpu-chrome.mjs tools/gpu/probe-sampler-overhead.js --tokens=150 --steps=12
  *
- * WHY IT EXISTS. AF3.md records a denoiser call at 123 ms inside the sampler
+ * WHY IT EXISTS. docs/AF3.md records a denoiser call at 123 ms inside the sampler
  * and 111 on tools/gpu/bench-head.js's bench, attributes the 12 ms to "the
  * sampler's own per-step work - a random augmentation of every atom, the noise
  * injection, the Euler step and two copies of the coordinates" and ends "nobody

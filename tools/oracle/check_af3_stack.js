@@ -2,7 +2,7 @@
  * Run the whole 48-block pairformer stack and watch the error accumulate.
  *
  *     python3 tools/oracle/dump_af3_trunk.py --float32 \
- *         --capture 'trunk_pairformer/__call__$' --out af3-oracle-stack-f32.json
+ *         --capture 'trunk_pairformer/__call__$' --out oracle-dumps/af3-oracle-stack-f32.json
  *     node tools/oracle/check_af3_stack.js
  *
  * 🔴 A PER-BLOCK CHECK DOES NOT ANSWER THIS. check_af3_block.js feeds every
@@ -87,10 +87,10 @@ function blockWeights(tensors, index) {
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-f32";
-  const dump = await loadDump("af3-oracle-stack-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-stack-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py --float32"
-    + " --capture 'trunk_pairformer/__call__$' --out af3-oracle-stack-f32.json");
+    + " --capture 'trunk_pairformer/__call__$' --out oracle-dumps/af3-oracle-stack-f32.json");
 
   const tokens = dump.tokens;
   const seqMask = Float32Array.from(dump.inputs.seq_mask.data);

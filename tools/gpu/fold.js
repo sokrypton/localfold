@@ -3,7 +3,7 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/fold.js --sequence=GWSTELEK... \
  *       --steps=200 --model=/model-af3-int5/manifest.json
- *     node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/af3-6mrr.json
+ *     node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/oracle-dumps/af3-6mrr.json
  *
  * --sequence folds what you type, through src/af3/featurise.js. --dump folds
  * AF3's own batch and reports the disagreement at every point where the two can
@@ -102,7 +102,7 @@ export function batchFromDump(dump) {
 }
 
 export async function main(device, args) {
-  const dumpPath = option(args, "dump", "/af3-6mrr.json");
+  const dumpPath = option(args, "dump", "/oracle-dumps/af3-6mrr.json");
   const steps = Number(option(args, "steps", "50"));
   // Named here rather than inline at the fold, because the guard below reads it.
   const samplerMode = option(args, "mode", "diffusion");
@@ -222,7 +222,7 @@ export async function main(device, args) {
   lastDenoised = null;
 
   result = await foldBatch(device, batch, weights, {
-    // Omitted, each defaults to what the device supports. See AF3.md.
+    // Omitted, each defaults to what the device supports. See docs/AF3.md.
     stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
     pairWeightPrecision: option(args, "pair-weights", undefined),

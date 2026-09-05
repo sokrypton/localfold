@@ -4,7 +4,7 @@
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 48 --diffusion 1 --float32 \
  *       --capture 'diffusion_head/__call__$|evoformer/__call__$' \
  *       --capture-args 'diffusion_head/__call__$' \
- *       --out af3-oracle-denoiser-f32.json
+ *       --out oracle-dumps/af3-oracle-denoiser-f32.json
  *     node tools/oracle/check_af3_denoiser.js
  *
  * 🔴 THE NOISY POSITIONS ARE AN INPUT AND CANNOT BE INFERRED. The sampler draws
@@ -99,7 +99,7 @@ function atomStack(tensors, scope, blocks) {
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-full-f32";
-  const dump = await loadDump("af3-oracle-denoiser-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-denoiser-f32.json");
   const { tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py with --capture-args"
     + " (see the header of this file)");

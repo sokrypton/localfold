@@ -1666,7 +1666,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       + ` ${coverage.residues}/${coverage.of}`);
   });
   // 🔴 THE BACKBONE CA-CA IS STILL MEASURED AND IS NO LONGER SHOWN. It is the
-  // number a wrong sampler cannot fake - AF3.md records a batch with one broken
+  // number a wrong sampler cannot fake - docs/AF3.md records a batch with one broken
   // gather folding 17 A of spaghetti at pLDDT 55 - so `foldBatch` keeps
   // computing it and every probe that judges a fold still prints it. But "3.81"
   // means nothing to somebody who wanted a structure, and a status line that

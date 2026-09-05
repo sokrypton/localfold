@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 48 --diffusion 1 --float32 \
  *       --capture 'diffusion_head/__call__$' --capture-args 'diffusion_head/__call__$' \
- *       --out af3-oracle-denoiser-f32.json
+ *       --out oracle-dumps/af3-oracle-denoiser-f32.json
  *     node tools/oracle/check_af3_sampler.js
  *
  * 🔴 THE TRAJECTORY IS NOT REPRODUCIBLE AND THE ARITHMETIC IS. Every step draws
@@ -27,7 +27,7 @@ import { captures, loadDump, report } from "./af3-bundle.js";
 const HEAD = "diffuser/~/diffusion_head";
 
 async function main() {
-  const dump = await loadDump("af3-oracle-denoiser-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-denoiser-f32.json");
   const at = captures(dump, "dump_af3_trunk.py --diffusion 1 --capture-args"
     + " 'diffusion_head/__call__$'");
 

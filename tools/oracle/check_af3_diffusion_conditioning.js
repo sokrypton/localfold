@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 48 --diffusion 1 --float32 \
  *       --capture 'diffusion_head/[a-z_0-9]+/__call__$|evoformer/__call__$' \
- *       --out af3-oracle-diffusion-f32.json
+ *       --out oracle-dumps/af3-oracle-diffusion-f32.json
  *     node tools/oracle/check_af3_diffusion_conditioning.js
  *
  * The conditioning is everything the denoiser knows besides the atoms, and it
@@ -47,7 +47,7 @@ const transitionWeights = (T, name) => ({
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-full-f32";
-  const dump = await loadDump("af3-oracle-diffusion-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-diffusion-f32.json");
   const { tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py --blocks 48 --diffusion 1 --float32"
     + " (see the header of this file)");

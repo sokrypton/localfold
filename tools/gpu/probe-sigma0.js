@@ -15,10 +15,10 @@
  * model's own opinion, produced by a head that never saw the crystal; a
  * schedule change that made predictions more confident and less correct would
  * look like an improvement in it. RMSD and TM against the deposited structure
- * are the numbers AF3.md records, so they are the numbers a default moves on.
+ * are the numbers docs/AF3.md records, so they are the numbers a default moves on.
  *
  * WHAT IT FOUND, at flow 8 over four seeds, mean RMSD (range) and TM, AFTER the
- * diffusion head's weight-name fix (see AF3.md):
+ * diffusion head's weight-name fix (see docs/AF3.md):
  *
  *     sigma0 | 6MRR (68 res)              | 1QYS (92 res)
  *       2560 | 0.701 [0.65-0.76]  TM .950 | 0.841 [0.82-0.87]  TM .951

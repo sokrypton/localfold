@@ -25,7 +25,7 @@ const path = (name) => fileURLToPath(new URL(name, import.meta.url));
 const CHAIN_RESIDUES = 40;
 
 function twoChainPdb() {
-  const lines = readFileSync(path("../1qys-crystal.pdb"), "utf8").split("\n");
+  const lines = readFileSync(path("../tools/fixtures/1qys-crystal.pdb"), "utf8").split("\n");
   // ...the first 40 residues of it. The whole 92 make every assertion below
   // read identically and cost the CPU suite twenty seconds instead of five;
   // what is under test is the chain bookkeeping, which 40 residues exercise.

@@ -892,7 +892,7 @@ export class Af3DiffusionTransformerGpu {
    * Compiling this early was tried too and is not worth keeping: measured from
    * a fold, the pipelines are ready in 6 ms, so compilation is not what makes
    * the first call several times a steady one. That is the weight conversion,
-   * and AF3.md records why it cannot be moved either.
+   * and docs/AF3.md records why it cannot be moved either.
    */
   async #compile(tokens, weights) {
     const channels = weights.channels;

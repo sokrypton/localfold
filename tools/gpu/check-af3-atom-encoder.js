@@ -10,7 +10,7 @@
  * would be regular in ways a real one is not, and the padding is where the
  * interesting disagreements live: two thirds of the key slots are empty.
  *
- * The dump is af3-oracle-atom-f32.json, produced by
+ * The dump is oracle-dumps/af3-oracle-atom-f32.json, produced by
  * tools/oracle/dump_af3_trunk.py --diffusion 1 --float32.
  *
  * 🔴 ONE TRAP HERE HAS NO DISCRIMINATING CONTROL ON THIS BATCH, and saying so
@@ -27,7 +27,7 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 
-const DUMP = "/af3-oracle-atom-f32.json";
+const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
 const STACK = `${ENCODER}/__layer_stack_with_per_layer/diffusion_atom_transformer_encoder`;

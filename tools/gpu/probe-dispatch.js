@@ -12,7 +12,7 @@
  * larger term. Nothing measured that, and every conclusion about where the
  * trunk's time goes depended on the number.
  *
- * It is not the dispatches. See the answer in AF3.md - the gap is the profiler,
+ * It is not the dispatches. See the answer in docs/AF3.md - the gap is the profiler,
  * which adds 30% to the clock it is measured against and quantises its
  * timestamps to about 100 us across a great many short passes.
  *

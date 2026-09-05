@@ -2,7 +2,7 @@
  * Run our AF3 MSA block against the oracle's, with the real weights.
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
- *         --capture 'msa_stack/__call__$' --out af3-oracle-msa-f32.json
+ *         --capture 'msa_stack/__call__$' --out oracle-dumps/af3-oracle-msa-f32.json
  *     node tools/oracle/check_af3_msa_block.js
  *
  * Same shape as check_af3_block.js: the capture records every block's output in
@@ -95,14 +95,14 @@ async function main() {
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-f32";
   const index = Number(process.argv.includes("--block")
     ? process.argv[process.argv.indexOf("--block") + 1] : 1);
-  const dump = await loadDump("af3-oracle-msa-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-msa-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   if (manifest.model.name !== dump.model) {
     throw new Error(`${model}/ holds ${manifest.model.name} but the oracle ran`
       + ` ${dump.model}`);
   }
   const at = captures(dump, "dump_af3_trunk.py --blocks 0 --float32"
-    + " --capture 'msa_stack/__call__$' --out af3-oracle-msa-f32.json");
+    + " --capture 'msa_stack/__call__$' --out oracle-dumps/af3-oracle-msa-f32.json");
 
   const tokens = dump.tokens;
   const msaShape = dump.outputs[`msa_stack/__call__:msa#${index}`].shape;

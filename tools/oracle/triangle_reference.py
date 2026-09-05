@@ -13,7 +13,7 @@ from convert_multimer_params import load_params
 
 E = "alphafold/alphafold_iteration/evoformer/evoformer_iteration/"
 P = load_params(pathlib.Path("/Users/mini/Documents/GitHub/af-params/params_model_1_multimer_v3.npz"))
-stage = json.load(open("toy-oracle-stages.json"))
+stage = json.load(open("oracle-dumps/toy-oracle-stages.json"))
 L = 16
 z = np.array(stage["embedder_pair"], np.float64).reshape(L, L, 128)
 mask = np.ones((L, L))
@@ -37,5 +37,5 @@ act = act * sigmoid(linear(P[base + "gating_linear"], x))
 
 print(f"AF2 triangle-outgoing on the toy pair: |x| {np.abs(act).mean():.4f} max {np.abs(act).max():.3f}")
 json.dump({"z": z.ravel().tolist(), "expected": act.ravel().tolist(), "length": L},
-          open("toy-triangle.json", "w"))
-print("wrote toy-triangle.json")
+          open("oracle-dumps/toy-triangle.json", "w"))
+print("wrote oracle-dumps/toy-triangle.json")

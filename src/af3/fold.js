@@ -430,7 +430,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // 🔴 THE PRECISION KNOBS TRAVEL WITH THE FOLD so a bench can measure both
   // arms without editing a source file - which is the only way to compare them
   // on a machine that drifts up to 3.2x between processes. Omitted, every one
-  // defaults to what the device supports; see AF3.md's memory section.
+  // defaults to what the device supports; see docs/AF3.md's memory section.
   const precision = {
     stagedPrecision: options.stagedPrecision,
     weightPrecision: options.weightPrecision,

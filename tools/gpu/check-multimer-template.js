@@ -1,13 +1,13 @@
 /**
  * AF2-multimer's template embedder against its numpy reference.
  *
- *     python3 tools/oracle/template_reference.py --out toy-template.json
- *     python3 tools/oracle/template_reference.py --template 1qys-crystal.pdb:A \
- *       --out toy-template-real.json
+ *     python3 tools/oracle/template_reference.py --out oracle-dumps/toy-template.json
+ *     python3 tools/oracle/template_reference.py --template tools/fixtures/1qys-crystal.pdb:A \
+ *       --out oracle-dumps/toy-template-real.json
  *     node tools/gpu-chrome.mjs tools/gpu/check-multimer-template.js
  *
  * 🔴 NOTHING CHECKED THIS MODULE AT ALL. `tools/oracle/template_reference.py`
- * computed the reference and wrote `toy-template.json`, and no JavaScript ever
+ * computed the reference and wrote `oracle-dumps/toy-template.json`, and no JavaScript ever
  * read it - so AF2-multimer's template term, which runs on EVERY recycle of
  * every multimer fold and is not small (masking the templates off does not zero
  * it), was covered by nothing. That is how the aatype terms came to be folded
@@ -58,17 +58,17 @@ export async function main(device) {
 
   // The same pair the numpy reference reads, so a disagreement is in this
   // module and cannot be in the embedder before it.
-  const stage = await load("toy-oracle-stages.json");
+  const stage = await load("oracle-dumps/toy-oracle-stages.json");
   const results = [];
 
   // 🔴 THE JAX ARM IS THE ONLY ORACLE HERE. The other two files are numpy
   // transcriptions - useful, and not ground truth. This one is AF2-multimer's
   // own module, captured through hk.intercept_methods by
   // tools/oracle/dump_multimer_template.py, with the pair it actually read.
-  for (const [name, file] of [["jax masked", "toy-template-jax.json"],
-                              ["jax real", "toy-template-jax-real.json"],
-                              ["numpy masked", "toy-template.json"],
-                              ["numpy real", "toy-template-real.json"]]) {
+  for (const [name, file] of [["jax masked", "oracle-dumps/toy-template-jax.json"],
+                              ["jax real", "oracle-dumps/toy-template-jax-real.json"],
+                              ["numpy masked", "oracle-dumps/toy-template.json"],
+                              ["numpy real", "oracle-dumps/toy-template-real.json"]]) {
     let oracle;
     try {
       oracle = await load(file);
@@ -234,7 +234,7 @@ export async function main(device) {
   // and those distances are the interface geometry a binder method wants. So
   // it is checked by construction: masking per chain and spanning must differ,
   // or the flag is decoration.
-  const spanning = await load("toy-template-jax-real.json").catch(() => undefined);
+  const spanning = await load("oracle-dumps/toy-template-jax-real.json").catch(() => undefined);
   if (spanning !== undefined) {
     const length = spanning.length;
     const asymId = Int32Array.from(

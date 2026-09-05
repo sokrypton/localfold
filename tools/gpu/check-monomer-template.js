@@ -2,9 +2,9 @@
  * AF2-monomer's template embedder against AF2's own module.
  *
  *     python3 tools/oracle/dump_monomer_template.py \
- *       --out toy-template-monomer-jax.json
- *     python3 tools/oracle/dump_monomer_template.py --template 1qys-crystal.pdb:A \
- *       --out toy-template-monomer-jax-real.json
+ *       --out oracle-dumps/toy-template-monomer-jax.json
+ *     python3 tools/oracle/dump_monomer_template.py --template tools/fixtures/1qys-crystal.pdb:A \
+ *       --out oracle-dumps/toy-template-monomer-jax-real.json
  *     node tools/gpu-chrome.mjs tools/gpu/check-monomer-template.js
  *
  * 🔴 THE ORACLE IS AF2'S MODULE RUN ON ITS OWN, not a transcription and not a
@@ -47,8 +47,8 @@ export async function main(device) {
   }
 
   const results = [];
-  for (const [name, file] of [["masked", "toy-template-monomer-jax.json"],
-                              ["real", "toy-template-monomer-jax-real.json"]]) {
+  for (const [name, file] of [["masked", "oracle-dumps/toy-template-monomer-jax.json"],
+                              ["real", "oracle-dumps/toy-template-monomer-jax-real.json"]]) {
     let oracle;
     try {
       oracle = await load(file);

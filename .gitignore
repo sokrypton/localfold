@@ -6,8 +6,6 @@ dist/
 # were never committed, and the deployed site 404'd on both while every local
 # checkout worked. A leading slash keeps it to the one at the root.
 /model/
-# The self-contained offline page, written by tools/bundle.py.
-localfold-local.html
 coverage/
 artifacts/
 test-results/
@@ -32,20 +30,14 @@ __pycache__/
 /model-multimer
 /model-multimer-f32
 
-# The toy oracle's dumped tensors, written by tools/oracle/dump_toy_multimer.py.
-/toy-oracle.json
-/toy-oracle-3copies.json
-/toy-oracle-monomer.json
-/toy-oracle-stages.json
-/toy-oracle-truncated.json
-/toy-oracle-truncated-monomer.json
-/toy-oracle-truncated-opmlast.json
-/toy-oracle-truncated-notmpl.json
-/toy-template.json
-/toy-triangle.json
-
-# The AF3 trunk oracle's dumps, written by tools/oracle/dump_af3_trunk.py.
-/af3-oracle*.json
+# Every oracle dump, from every dump script, in one directory.
+# 🔴 THEY USED TO SIT IN THE REPOSITORY ROOT, one ignore rule per file, and the
+# list went stale every time a dump script learned a new output. 300 MB of
+# generated tensors beside index.html also reads as repository content, which
+# is the part that matters: a reader cannot tell what is the project and what
+# is somebody's afternoon. One directory, one rule, and the checkers fetch from
+# it by path.
+/oracle-dumps/
 
 # The AF3 trunk export, written by tools/export_af3_model.py: the float32 master
 # and tools/quantize_model.py's int8 output.
@@ -67,8 +59,3 @@ natives
 # tools/gpu/probe-af2-dgram-plddt.js: 108 single-sequence targets over four
 # recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
 /plddt-data/
-/toy-template-real.json
-/toy-template-jax.json
-/toy-template-jax-real.json
-/toy-template-monomer-jax.json
-/toy-template-monomer-jax-real.json

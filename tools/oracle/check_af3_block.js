@@ -6,7 +6,7 @@
  * Both sides come from ONE dump, and that is the point:
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 2 \
- *         --capture 'trunk_pairformer/__call__$' --out af3-oracle-2block.json
+ *         --capture 'trunk_pairformer/__call__$' --out oracle-dumps/af3-oracle-2block.json
  *
  * captures every block's output in execution order, so block 0's output IS
  * block 1's input and the two are guaranteed consistent. Nothing here builds
@@ -107,7 +107,7 @@ async function main() {
   // Dump it with --float32 --blocks 2. That run is not what the model does; it
   // is the only thing that can hold a reimplementation to account.
   const dump = await loadDump(process.argv.includes("--bfloat16")
-    ? "af3-oracle-2block.json" : "af3-oracle-2block-f32.json");
+    ? "oracle-dumps/af3-oracle-2block.json" : "oracle-dumps/af3-oracle-2block-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   if (manifest.model.name !== dump.model) {
     throw new Error(`${model}/ holds ${manifest.model.name} but the oracle ran`
@@ -122,7 +122,7 @@ async function main() {
   // divergence begins around block 11, not block 1.
   const index = Number(process.argv.find((a) => a.startsWith("--block="))?.slice(8) ?? 1);
   const at = captures(dump, `dump_af3_trunk.py --blocks ${index + 1} --float32`
-    + " --capture 'trunk_pairformer/__call__$' --out af3-oracle-2block-f32.json");
+    + " --capture 'trunk_pairformer/__call__$' --out oracle-dumps/af3-oracle-2block-f32.json");
   const captured = (which, call) =>
     at(`trunk_pairformer/__call__:[${which}]#${call}`);
 

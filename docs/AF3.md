@@ -185,7 +185,7 @@ improves with more steps and that one did not.
 
     node tools/gpu-chrome.mjs tools/gpu/fold.js --sequence=GWSTELEK... \
       --mode=flow --steps=8 --recycles=1 --model=/model-af3-int5/manifest.json
-    python3 tools/score_fold.py <the log> --reference 6mrr-crystal.pdb
+    python3 tools/score_fold.py <the log> --reference tools/fixtures/6mrr-crystal.pdb
 
     # The featuriser, including the MSA path, against AF3's own batch.
     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --a3m rows.a3m --out d.json

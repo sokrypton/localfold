@@ -82,7 +82,7 @@
  *     row tile, 944 times for a 512-row alignment, so halving the bytes is a
  *     separate win from halving the arithmetic. AF3's trunk got nothing from
  *     the same change, because its weights are resident and its reads are
- *     instruction-bound - see AF3.md.
+ *     instruction-bound - see docs/AF3.md.
  *
  * So "no outlier to attack, the next thing is a different algorithm" was right
  * about tiles and wrong about the kernel as a whole: what was left was a

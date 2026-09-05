@@ -21,8 +21,8 @@ THE PAGE IS LOADED WITH A STRUCTURE AND AN ALIGNMENT, not bare. Half the rows
 this measures - the play bar, the sequence strip, the MSA header, the panel
 column - are `display: none` until something is loaded, and a probe that
 measures a bare page is green while they are broken. The structure is
-6mrr-crystal.pdb from the repo root, loaded TWICE so the play bar exists, and
-the alignment is synthesised from its own sequence - test.a3m is a different
+tools/fixtures/6mrr-crystal.pdb from the repo root, loaded TWICE so the play bar exists, and
+the alignment is synthesised from its own sequence - tools/fixtures/test.a3m is a different
 protein, so py2Dmol matched no chain and drew a warning where the MSA panel
 should have been.
 """
@@ -200,14 +200,14 @@ MEASURE = r"""(() => {
   return R;
 })()"""
 
-# 🔴 THE ALIGNMENT IS SYNTHESISED FROM THE STRUCTURE, not read from test.a3m.
+# 🔴 THE ALIGNMENT IS SYNTHESISED FROM THE STRUCTURE, not read from tools/fixtures/test.a3m.
 # That file is the 59-residue "PIAQ..." reference and 6mrr is a different
 # protein, so py2Dmol matched no chain and put "No chains matched to MSA
 # sequences" on the page instead of an MSA panel - a probe that then measured
 # every row except the widest one this page has. Four rows is enough for the
 # panel to draw its coverage bar and its logo.
 LOAD = """(async () => {
-    const pdb = await (await fetch('/6mrr-crystal.pdb')).text();
+    const pdb = await (await fetch('/tools/fixtures/6mrr-crystal.pdb')).text();
     const AA = {ALA:'A',ARG:'R',ASN:'N',ASP:'D',CYS:'C',GLN:'Q',GLU:'E',GLY:'G',
                 HIS:'H',ILE:'I',LEU:'L',LYS:'K',MET:'M',PHE:'F',PRO:'P',SER:'S',
                 THR:'T',TRP:'W',TYR:'Y',VAL:'V'};

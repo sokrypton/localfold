@@ -156,7 +156,7 @@ export async function main(device, args) {
   // 🔴 INTERLEAVED IN ONE PROCESS. This machine drifts up to 3.2x between
   // invocations, so timing the encoded loop in one run and the iterated loop in
   // another measures the machine, not the change. A whole round of AF3
-  // profiling was thrown away to that once - see AF3.md.
+  // profiling was thrown away to that once - see docs/AF3.md.
   const times = [];
   const legacyTimes = [];
   let latest = reference;

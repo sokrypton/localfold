@@ -21,7 +21,7 @@
  * which at one step is still at the top of the schedule. Measured on 27UH A2B2,
  * `diffusion 1` gives a CA-CA of 2852 A and a radius of gyration of 2234 A -
  * a cloud, not a structure - while the page's trajectory looks fine at that
- * setting because web/app.js draws `denoised`. See AF3.md.
+ * setting because web/app.js draws `denoised`. See docs/AF3.md.
  *
  * 🔴 BACKBONE FIRST, SCORES SECOND. A CA-CA around 3.8 A is what a connected
  * chain looks like and a radius of gyration near the crystal's is what a

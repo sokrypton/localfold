@@ -13,13 +13,13 @@ describe.skipIf(!enabled)("raw A3M input to WebGPU prediction", () => {
   beforeAll(async() => { Object.assign(globalThis, globals); gpu = create([]); const adapter = await gpu.requestAdapter();
     if (adapter === null) throw new Error("no WebGPU adapter"); device = await requestAlphaFoldDevice(adapter); });
   afterAll(() => device?.destroy());
-  it("predicts the literal uploaded test.a3m without Python preprocessing", async() => {
+  it("predicts the literal uploaded tools/fixtures/test.a3m without Python preprocessing", async() => {
     const fixture = AlphaFoldFixture.fromStore(await FileTensorStore.open(MANIFEST));
     const [embedding, template, extraStack, mainStack, structure, confidence, geometry, featureTables] = await Promise.all([
       fixture.embeddingWeights(), fixture.templateWeights(), fixture.extraStackWeights(), fixture.mainStackWeights(),
       fixture.structureWeights(), fixture.confidenceWeights(), fixture.geometryTables(), fixture.queryOnlyFeatureTables(),
     ]);
-    const prediction = await new AlphaFoldMonomerGpu(device).predictA3m(await readFile("test.a3m", "utf8"), {
+    const prediction = await new AlphaFoldMonomerGpu(device).predictA3m(await readFile("tools/fixtures/test.a3m", "utf8"), {
       embedding, template, extraStack, mainStack, structure, lddt: confidence.lddt, pae: confidence.pae, geometry,
     }, featureTables, { recycles: 0, randomSeed: 0 }, await fixture.tensor("confidencePaeBreaks"));
     expect(prediction.final.confidence.meanPlddt).toBeGreaterThan(90);

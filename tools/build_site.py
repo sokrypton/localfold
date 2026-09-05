@@ -9,7 +9,7 @@ The page loads src/**/*.js as written - plain ES modules, resolved by the
 browser through the same relative paths they have in the checkout. So there is
 nothing to compile, and the only real question a "build" answers here is WHICH
 FILES a public site should contain: not test/, not tools/, and not the 946 KB
-test.a3m or the fixtures under test/fixtures, which together dwarf the app.
+tools/fixtures/test.a3m or the fixtures under test/fixtures, which together dwarf the app.
 
 That makes this a copy with an allow-list, and the allow-list is the point. It
 is written out below rather than derived, because a derived rule ("everything

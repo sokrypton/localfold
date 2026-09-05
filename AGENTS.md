@@ -12,10 +12,10 @@
   specifiers with a `.js` extension, no build step and no bundler. A change that
   reintroduces a compile stage between the source and the page is the thing this
   layout exists to prevent - the runtime shape checks above are what the types
-  used to buy, and they are why removing the compiler cost nothing.
-  `tools/bundle.py` is not that stage: it emits a separate offline artifact for
-  `file://`, which cannot load modules at all, and the served path never runs it.
+  used to buy, and they are why removing the compiler cost nothing. There is no
+  bundler here at all now: the single-file `file://` build was the one thing
+  that looked like one, and it is gone.
 - Describe public shapes in JSDoc, not in a type system the runtime cannot see.
-- AlphaFold 3's state, costs and already-tried dead ends are in `AF3.md`.
+- AlphaFold 3's state, costs and already-tried dead ends are in `docs/AF3.md`.
   Read it before touching `src/af3/`; several of its entries are things that
   have been got wrong once already.

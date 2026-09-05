@@ -36,7 +36,7 @@
  * mean first, chain-aware, position scale 20), with `--chains` splitting the
  * sequence.
  *
- * 🔴 AND pLDDT IS NOT THE CHECK. AF3.md records a batch with one broken gather
+ * 🔴 AND pLDDT IS NOT THE CHECK. docs/AF3.md records a batch with one broken gather
  * folding 17 A of spaghetti at pLDDT 55. Consecutive CA are 3.80 A apart in a
  * real protein and nothing else; `caca` is the number that a wrong kernel
  * cannot fake, so it is printed with its worst outlier.

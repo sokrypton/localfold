@@ -1,14 +1,14 @@
 """Capture AF2-multimer's template embedder from JAX, with a REAL template.
 
-    python3 tools/oracle/dump_multimer_template.py --out toy-template-jax.json
-    python3 tools/oracle/dump_multimer_template.py --template 1qys-crystal.pdb:A \
-      --out toy-template-jax-real.json
+    python3 tools/oracle/dump_multimer_template.py --out oracle-dumps/toy-template-jax.json
+    python3 tools/oracle/dump_multimer_template.py --template tools/fixtures/1qys-crystal.pdb:A \
+      --out oracle-dumps/toy-template-jax-real.json
 
 🔴 IT EXISTS BECAUSE TWO UNVALIDATED IMPLEMENTATIONS DISAGREED AND NEITHER WAS
 AN ORACLE. `tools/oracle/template_reference.py` is a hand-written numpy
 transcription of this module and nothing ever checked IT; the GPU path is
 `src/multimer/template.js` and nothing ever checked that either - the reference
-wrote `toy-template.json` and no JavaScript read it. Compared at last they
+wrote `oracle-dumps/toy-template.json` and no JavaScript read it. Compared at last they
 differ by relRMS 1.2e-1 after the first pair block, which says only that one of
 them is wrong.
 
@@ -144,7 +144,7 @@ def main() -> int:
     parser.add_argument("--copies", type=int, default=2)
     parser.add_argument("--model", default="alphafold2_multimer_v3")
     parser.add_argument("--name", default="model_1_multimer_v3")
-    parser.add_argument("--out", default="toy-template-jax.json")
+    parser.add_argument("--out", default="oracle-dumps/toy-template-jax.json")
     arguments = parser.parse_args()
 
     total = arguments.length * arguments.copies

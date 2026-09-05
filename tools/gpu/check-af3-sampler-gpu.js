@@ -47,7 +47,7 @@ import { sampleOnGpu } from "../../src/af3/diffusion-sampler-webgpu.js";
 import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/atom-encoder-reference.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 
-const DUMP = "/af3-oracle-atom-f32.json";
+const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
 const DECODER = `${HEAD}/diffusion_atom_transformer_decoder`;

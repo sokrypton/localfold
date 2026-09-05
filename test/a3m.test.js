@@ -5,7 +5,7 @@ import { parseA3m } from "../src/input/a3m.js";
 
 describe("A3M parser", () => {
   it("parses the uploaded homolog-rich alignment", async() => {
-    const text = await readFile(resolve("test.a3m"), "utf8");
+    const text = await readFile(resolve("tools/fixtures/test.a3m"), "utf8");
     const alignment = parseA3m(text);
     expect(alignment.depth).toBe(8076);
     expect(alignment.length).toBe(59);

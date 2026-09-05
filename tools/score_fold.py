@@ -1,7 +1,7 @@
 """Score a fold from tools/gpu/fold.js against a reference structure.
 
     node tools/gpu-chrome.mjs tools/gpu/fold.js ... > out.json
-    python3 tools/score_fold.py out.json --reference 6mrr-crystal.pdb
+    python3 tools/score_fold.py out.json --reference tools/fixtures/6mrr-crystal.pdb
 
 🔴 CA RMSD AND TM-SCORE, NOT pLDDT. pLDDT comes off the trunk and is a
 prediction of confidence, so a quantisation that damages only the diffusion

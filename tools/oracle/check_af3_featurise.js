@@ -1,8 +1,8 @@
 /**
  * Check the JavaScript featuriser against AF3's own batch, array by array.
  *
- *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --out af3-6mrr.json
- *     node tools/oracle/check_af3_featurise.js [af3-6mrr.json]
+ *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --out oracle-dumps/af3-6mrr.json
+ *     node tools/oracle/check_af3_featurise.js [oracle-dumps/af3-6mrr.json]
  *
  * This is the last stub between "a batch prepared elsewhere" and "a sequence
  * you type". Everything the featuriser produces is an integer layout or a mask
@@ -30,7 +30,7 @@ import { deduplicateUnpairedAgainstPaired, mergeChainA3ms, mergeRowAlignedChainA
   from "../../src/input/chains.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const dumpPath = process.argv[2] ?? join(ROOT, "af3-6mrr.json");
+const dumpPath = process.argv[2] ?? join(ROOT, "oracle-dumps/af3-6mrr.json");
 const dump = JSON.parse(readFileSync(dumpPath, "utf8"));
 const input = (name) => dump.inputs[name].data;
 

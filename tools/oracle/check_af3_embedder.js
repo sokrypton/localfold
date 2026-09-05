@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --blocks 0 --float32 \
  *         --capture 'evoformer/template_embedding/__call__$|evoformer/__call__$|msa_stack/__call__$' \
- *         --out af3-oracle-embed-f32.json
+ *         --out oracle-dumps/af3-oracle-embed-f32.json
  *     node tools/oracle/check_af3_embedder.js
  *
  * This is the first check that starts from FEATURES rather than from an
@@ -123,7 +123,7 @@ function msaBlockWeights(tensors, index) {
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-f32";
-  const dump = await loadDump("af3-oracle-embed-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-embed-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py --blocks 0 --float32 with the"
     + " embedder capture (see the header of this file)");

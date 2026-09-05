@@ -3,7 +3,7 @@
  *
  *     python3 tools/oracle/dump_af3_trunk.py --float32 \
  *         --capture 'evoformer/template_embedding/__call__$|evoformer/__call__$' \
- *         --out af3-oracle-trunk-f32.json
+ *         --out oracle-dumps/af3-oracle-trunk-f32.json
  *     node tools/oracle/check_af3_trunk.js                  # float32 weights
  *     node tools/oracle/check_af3_trunk.js --model model-af3  # ...and int8
  *
@@ -285,7 +285,7 @@ function embedderWeights(tensors) {
 async function main() {
   const model = process.argv.includes("--model")
     ? process.argv[process.argv.indexOf("--model") + 1] : "model-af3-f32";
-  const dump = await loadDump("af3-oracle-trunk-f32.json");
+  const dump = await loadDump("oracle-dumps/af3-oracle-trunk-f32.json");
   const { manifest, tensors } = await loadTensors(join(ROOT, model));
   const at = captures(dump, "dump_af3_trunk.py --float32 with the trunk capture"
     + " (see the header of this file)");

@@ -27,7 +27,7 @@
  * 🔴 THE CAUSE WAS A WEIGHT NAME, AND THIS PROBE IS WHAT MADE IT VISIBLE.
  * src/af3/diffusion-weights.js loaded four of the atom encoder's pair tensors
  * under their unsuffixed names, which exist at identical shapes and belong to a
- * different module - see AF3.md, "Fixed: the side chains were compressed". The
+ * different module - see docs/AF3.md, "Fixed: the side chains were compressed". The
  * port now scores 1.015 / 1.017 with textbook aromatic rings. The numbers above
  * are kept because they are what the failure LOOKED like: everything short,
  * worse with distance from the backbone, glycine nearly right, and no

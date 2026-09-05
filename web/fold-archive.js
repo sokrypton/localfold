@@ -3,7 +3,7 @@
  *
  * WHY THIS SHAPE AND NOT ONE OF OUR OWN. The server's layout is what every
  * script written against AlphaFold 3 already reads, and the reference archive
- * `fold_2026_09_01_10_17.zip` in the repository root is what this was written
+ * `tools/fixtures/fold_2026_09_01_10_17.zip` in the repository root is what this was written
  * against - file for file, key for key. A format nobody else writes would need
  * a reader written for it before anyone could use a fold from this page.
  *
