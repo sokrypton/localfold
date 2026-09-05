@@ -45,6 +45,14 @@ export function profileDevice(device, options = {}) {
 
   let next = 0;
   let spans = [];
+  // 🔴 WHAT DID NOT FIT, because a profile that silently stops is worse than no
+  // profile. The query set is capped at 4096 timestamps by the device, which is
+  // 2048 passes - and a whole AF3 fold at 200 tokens uses exactly that in its
+  // trunk, so every sampler pass after it was dropped and the report read as
+  // "the denoiser costs almost nothing". `attend` showed 38 passes where 16
+  // calls of 24 blocks is 384. The report carries this now; a caller with a
+  // non-zero `dropped` is reading a prefix, not a fold.
+  let dropped = 0;
   const createCommandEncoder = device.createCommandEncoder.bind(device);
 
   device.createCommandEncoder = (descriptor) => {
@@ -54,7 +62,10 @@ export function profileDevice(device, options = {}) {
     let used = false;
     encoder.beginComputePass = (pass = {}) => {
       // Out of slots, or already timed by the caller: leave it alone.
-      if (next + 2 > capacity || pass.timestampWrites !== undefined) return beginComputePass(pass);
+      if (next + 2 > capacity || pass.timestampWrites !== undefined) {
+        if (next + 2 > capacity) dropped += 1;
+        return beginComputePass(pass);
+      }
       const at = next;
       next += 2;
       used = true;
@@ -74,7 +85,10 @@ export function profileDevice(device, options = {}) {
   };
 
   return {
-    reset() { next = 0; spans = []; },
+    reset() { next = 0; spans = []; dropped = 0; },
+    /** Passes that found no slot. Non-zero means the report is a prefix. */
+    dropped: () => dropped,
+    capacityPasses: Math.floor(capacity / 2),
     restore() { device.createCommandEncoder = createCommandEncoder; },
     async report() {
       const encoder = createCommandEncoder({ label: "profile.readback" });

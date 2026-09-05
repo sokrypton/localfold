@@ -20,6 +20,7 @@ import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
+import { profileDevice } from "./profile.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -210,6 +211,23 @@ export async function main(device, args) {
   // measures a cold process, which is the slowest fold there is. `--folds=2`
   // runs it twice and reports both, so the two can be told apart.
   const folds = Number(option(args, "folds", "1"));
+  // 🔴 --profile TIMES THE WHOLE FOLD, WHICH NOTHING ELSE DID. bench-trunk,
+  // bench-head and bench-confidence each profile ONE stage against synthesised
+  // inputs, so each says where its own time goes and none of them says what
+  // share of a fold that stage is. The confidence head in particular had never
+  // been placed against the trunk it follows.
+  //
+  // 🔴 IT IS RESET AT THE LAST FOLD, so `--folds=2 --profile` profiles the
+  // WARM one - the pipelines and the resident weights are cached for the life
+  // of the device, and a cold process is not the fold the page shows twice.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
+  // 🔴 A WHOLE FOLD DOES NOT FIT IN ONE PROFILE, and the device says so: the
+  // query set is capped at 4096 timestamps, which is 2048 passes, and a
+  // 200-token trunk alone uses all of them. `--profile-from=<stage>` resets at
+  // a stage boundary so the half that was being dropped can be read on its
+  // own - `--profile-from=trunk-done` profiles the sampler and the confidence
+  // head, which is the half nothing had ever timed inside a real fold.
+  const profileFrom = option(args, "profile-from", "");
   const foldSeconds = [];
   let result;
   let trunkStarted = 0;
@@ -217,6 +235,7 @@ export async function main(device, args) {
   const trajectory = [];
   let lastDenoised = null;
   for (let attempt = 0; attempt < folds; attempt += 1) {
+  if (profile !== null && attempt === folds - 1) profile.reset();
   const started = performance.now();
   trajectory.length = 0;
   lastDenoised = null;
@@ -232,6 +251,7 @@ export async function main(device, args) {
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {
+      if (profile !== null && name === profileFrom && attempt === folds - 1) profile.reset();
       if (name === "target-feat") {
         const theirs = dump?.outputs["diffuser/evoformer/__call__:target_feat"];
         if (theirs) {
@@ -328,6 +348,48 @@ export async function main(device, args) {
   console.log(`radius of gyration ${gyration.toFixed(1)} A over ${residues} CA`
     + `   (a compact 68-mer is about 11-12 A)`);
   console.log(`total ${foldSeconds[foldSeconds.length - 1].toFixed(1)} s`);
+  // 🔴 GROUPED BY THE LABEL'S FIRST WORD, because that is the STAGE. Every
+  // pass here is labelled `<stage>.<pass>` - af3-block, difftx, atom, cond,
+  // conf - so the prefix answers "which stage is this fold" and the rows under
+  // it answer "which kernel in it". The pass count is printed beside each,
+  // because Chrome quantises timestamps to ~100 us: a label with one pass is
+  // not a measurement, a label with hundreds is.
+  if (profile !== null) {
+    const rows = await profile.report();
+    const stages = new Map();
+    let measured = 0;
+    for (const row of rows) {
+      const stage = row.label.split(".")[0];
+      const found = stages.get(stage) ?? { stage, ms: 0, passes: 0 };
+      found.ms += row.ms; found.passes += row.passes;
+      stages.set(stage, found);
+      measured += row.ms;
+    }
+    const wall = foldSeconds[foldSeconds.length - 1] * 1000;
+    const dropped = profile.dropped();
+    console.log(`profile${profileFrom === "" ? "" : ` from ${profileFrom}`}:`
+      + ` ${measured.toFixed(0)} ms in ${rows.length} labels`
+      + ` over ${rows.reduce((n, r) => n + r.passes, 0)} passes`
+      + `, of ${wall.toFixed(0)} ms wall (${(100 * measured / wall).toFixed(0)}%)`);
+    // 🔴 SAY SO WHEN IT IS A PREFIX. Without this the trunk fills the query set
+    // and the sampler reads as free - which is what it did.
+    if (dropped > 0) {
+      console.log(`  🔴 TRUNCATED: ${dropped} passes found no slot`
+        + ` (the device caps this at ${profile.capacityPasses}).`
+        + ` These totals are a PREFIX of the fold, not the fold.`
+        + ` Use --profile-from=<stage> to profile a later part on its own.`);
+    }
+    for (const row of [...stages.values()].sort((a, b) => b.ms - a.ms)) {
+      console.log(`  ${row.ms.toFixed(0).padStart(6)} ms`
+        + ` ${(100 * row.ms / measured).toFixed(1).padStart(5)}%`
+        + ` x${String(row.passes).padEnd(5)} ${row.stage}`);
+    }
+    console.log("  the ten costliest passes:");
+    for (const row of rows.slice(0, 10)) {
+      console.log(`    ${row.ms.toFixed(0).padStart(6)} ms x${String(row.passes).padEnd(5)} ${row.label}`);
+    }
+    profile.restore();
+  }
 
   // 🔴 THE DENOISED PREDICTION IS NOT THE SAMPLE, and at a coarse schedule they
   // are not close. `positions` is where the sampler's walk ended; `denoised` is
