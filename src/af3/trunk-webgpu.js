@@ -159,7 +159,13 @@ export class Af3TrunkGpu {
         asymId: input.asymId,
         multichainMask2d: input.multichainMask2d },
       weights.template, dialect, options));
-    const pair = Float32Array.from(embedded.pair);
+    // 🔴 THE TEMPLATE TERM IS ADDED INTO THE EMBEDDER'S PAIR, NOT INTO A COPY
+    // OF IT. Nothing reads `embedded.pair` after this line - the template
+    // above was its only other reader - and at 200 tokens the copy was a
+    // 19.5 MiB host allocation per RECYCLE, thrown away immediately. Measured
+    // on the pair alone: 7.1 ms for `Float32Array.from` plus the add, 4.4 for
+    // the add in place.
+    const pair = embedded.pair;
     for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
 
     const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device).run(

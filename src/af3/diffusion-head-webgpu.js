@@ -612,7 +612,9 @@ export class Af3DiffusionHeadGpu {
                           deferred);
       act = chain.act;
     } else {
-      act = Float32Array.from(encoded.tokenAct);
+      // ...in place: `encoded.tokenAct` is this call's own readback and
+      // nothing reads it again.
+      act = encoded.tokenAct;
       for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
     }
 

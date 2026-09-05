@@ -32,6 +32,10 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
 import { GRID_WIDTH } from "./pair-track-gpu.js";
+
+/** The same values as a Float32Array, without copying one that already is. */
+const asFloats = (values) =>
+  (values instanceof Float32Array ? values : Float32Array.from(values));
 import { tmPerBinFor, tmScoreD0 } from "../heads/tm-score.js";
 
 const NUM_BINS = 64;
@@ -525,7 +529,12 @@ export class Af3ConfidenceHeadGpu {
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     let embeddedPair;
     try {
-      const pair = keep(this.allocator.upload("af3-conf.pair", Float32Array.from(input.pair),
+      // 🔴 COPIED ONLY IF IT IS NOT ALREADY THE RIGHT ARRAY. `upload` writes
+      // through queue.writeBuffer and does not mutate what it is given, so a
+      // Float32Array can go straight in - and at 300 tokens this copy was 43.9
+      // MiB of host allocation for nothing. The fallback stays because a
+      // checker may hand this a plain array.
+      const pair = keep(this.allocator.upload("af3-conf.pair", asFloats(input.pair),
         storage | GPUBufferUsage.COPY_SRC));
       const targetFeat = keep(this.allocator.upload("af3-conf.target", input.targetFeat, storage));
       const pseudoBeta = keep(this.allocator.upload("af3-conf.beta", input.pseudoBeta, storage));
@@ -575,7 +584,7 @@ export class Af3ConfidenceHeadGpu {
 
     // The four confidence pairformer blocks: the same stack the trunk runs.
     const stack = await new Af3PairformerStackGpu(this.device, this.options).run(
-      { pair: embeddedPair, single: Float32Array.from(input.single),
+      { pair: embeddedPair, single: asFloats(input.single),
         pairMask, seqMask, tokens }, weights.blocks, dialect, options);
 
     return { ...(await this.#heads(stack, pairMask, input, weights, headPacked, compiled)),
