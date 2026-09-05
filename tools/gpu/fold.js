@@ -251,6 +251,20 @@ export async function main(device, args) {
         console.log(`trunk done in ${((performance.now() - trunkStarted) / 1000).toFixed(1)} s`
           + `   gpu ${(gpu.residentBytes / (1024 * 1024)).toFixed(0)} MiB`
           + ` (peak ${(gpu.peakBytes / (1024 * 1024)).toFixed(0)})`);
+        // 🔴 WHAT IS STILL HELD WHEN THE TRUNK IS DONE. The peak composition
+        // shows the pairformer's scratch and the diffusion transformer's
+        // resident weights in the same snapshot, though one finishes before
+        // the other starts - so either the scratch is not given back, or it is
+        // given back to a POOL that goes on holding it. This says which.
+        for (const row of gpu.currentByLabel.slice(0, 6)) {
+          console.log(`    held ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(8)} MiB`
+            + ` x${String(row.count).padEnd(3)} ${row.label}`);
+        }
+        console.log(`  peak so far ${(gpu.peakBytes / (1024 * 1024)).toFixed(1)} MiB, made of:`);
+        for (const row of gpu.peakByLabel.slice(0, 6)) {
+          console.log(`    peak ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(8)} MiB`
+            + ` x${String(row.count).padEnd(3)} ${row.label}`);
+        }
         // Against AF3's own trunk. Only meaningful on AF3's own batch: from a
         // sequence the reference conformers differ, which is worth about
         // 2.7e-2 on pair and 0.01 A of structure.

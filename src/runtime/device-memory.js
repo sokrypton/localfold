@@ -185,8 +185,14 @@ export function memorySnapshot(device) {
   const largest = [...byLabel.entries()]
     .map(([label, seen]) => ({ label, bytes: seen.bytes, count: seen.count }))
     .sort((a, b) => b.bytes - a.bytes);
+  const live = [...accountFor(device).liveByLabel.entries()]
+    .map(([label, seen]) => ({ label, bytes: seen.bytes, count: seen.count }))
+    .sort((a, b) => b.bytes - a.bytes);
   return {
     residentBytes, peakBytes, budgetBytes, bufferCount: count, byLabel: largest,
+    // What is on the device NOW, largest first; sums to residentBytes. Pooled
+    // buffers are in here, because the device is still holding them.
+    currentByLabel: live,
     // What was actually on the device when it was fullest, largest first. The
     // rows sum to peakBytes; byLabel above does not sum to anything.
     peakByLabel: [...peakByLabel].sort((a, b) => b.bytes - a.bytes),
