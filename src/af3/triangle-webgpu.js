@@ -131,5 +131,9 @@ export async function af3TriangleMultiplication(
   // (use_fast_variance=True). The atom and diffusion stacks want "two-pass".
   return new Runner(device).run(input, {
     precision: options.precision ?? "f32", variance: "fast",
+    // ...forceable, so the row tile's fold over group.z can be checked at a
+    // size a CPU reference can follow. See PROJECT_GRID_WIDTH in shaders.js.
+    ...(options.projectGridWidth === undefined
+      ? {} : { projectGridWidth: options.projectGridWidth }),
   });
 }

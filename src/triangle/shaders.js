@@ -14,7 +14,13 @@ const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
 const PAIRS: u32 = L * L;
-const LINEAR_GRID_WIDTH: u32 = 32768u;
+const LINEAR_GRID_WIDTH: u32 = ${LINEAR_GRID_WIDTH}u;
+// 🔴 THE PROJECTIONS' OWN, BECAUSE IT HAS TO BE FORCEABLE. Exceeding 65535 row
+// tiles needs about 1450 residues, and the contraction is O(n^3) - no CPU
+// reference can follow a differential at that size, so the z path could only
+// ever be checked by folding a real 1500-mer and hoping. Lowering this instead
+// puts group.z > 0 at 68 residues, where the reference is a few milliseconds.
+const PROJECT_GRID_WIDTH: u32 = ${shape.projectGridWidth ?? LINEAR_GRID_WIDTH}u;
 const EPSILON: f32 = ${epsilon.toPrecision(9)};
 ${offsetConstants}
 
@@ -77,6 +83,18 @@ const PROJECT_TILE = { rows: 32, columns: 16 };
  * whose arms take "projection@contraction" for exactly this reason.
  */
 const CONTRACT_TILE_DEFAULT = { rows: 32, columns: 32 };
+
+/**
+ * The width these kernels fold a linear workgroup count at.
+ *
+ * 🔴 EXPORTED SO THE CALLERS CANNOT DRIFT FROM THE KERNEL. Three files dispatch
+ * these shaders - src/af3/pair-track-gpu.js, src/multimer/block.js and
+ * src/triangle/webgpu.js - and each had its own 32768 written out. The kernels
+ * read `group.y + group.z * LINEAR_GRID_WIDTH`, so a caller splitting at a
+ * different width addresses rows that do not exist and skips rows that do, with
+ * nothing to report it: the dispatch is valid and the answer is wrong.
+ */
+export const LINEAR_GRID_WIDTH = 32_768;
 
 export function createTriangleShaders(
   shape,
@@ -284,6 +302,9 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   // column) because a, b and their two gates share one source tile - so this is
   // the knob that trades occupancy for issue slots and it is measured, not
   // assumed. See tools/gpu/bench-triangle-project.js.
+  // ...resolved once and REPORTED, not restated by each caller. See
+  // LINEAR_GRID_WIDTH: three files dispatch these kernels.
+  const projectGridWidth = shape.projectGridWidth ?? LINEAR_GRID_WIDTH;
   const { rows: PROJECT_TILE_ROWS, columns: PROJECT_TILE_COLUMNS } = projectTile;
   if (PROJECT_TILE_ROWS % 8 !== 0 || PROJECT_TILE_COLUMNS % 8 !== 0) {
     throw new Error(`projectTile ${PROJECT_TILE_ROWS}x${PROJECT_TILE_COLUMNS} is not a `
@@ -389,7 +410,17 @@ fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  let row0 = group.y * TILE_ROWS + local.y;
+  // 🔴 THE ROW TILE IS SPREAD OVER y AND z, because a dispatch is at most
+  // 65535 workgroups in ANY dimension and there are n^2 pair rows. At 1566
+  // residues that is 2.45M rows, 76637 tiles of 32, and the browser refuses the
+  // pass: "Dispatch workgroup count Y (76637) exceeds max compute workgroups
+  // per dimension (65535)". Every other pass in the track already folded
+  // through a linear grid; these two divided by the tile and dispatched the
+  // quotient raw.
+  //
+  // With a single z slice this is exactly group.y, so a caller that has not
+  // been taught to fold is unchanged.
+  let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let h0 = group.x * TILE_COLUMNS;
   let tile_index = local.y * 8u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
@@ -614,7 +645,17 @@ fn main(
   @builtin(local_invocation_id) local: vec3<u32>,
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
-  let row0 = group.y * TILE_ROWS + local.y;
+  // 🔴 THE ROW TILE IS SPREAD OVER y AND z, because a dispatch is at most
+  // 65535 workgroups in ANY dimension and there are n^2 pair rows. At 1566
+  // residues that is 2.45M rows, 76637 tiles of 32, and the browser refuses the
+  // pass: "Dispatch workgroup count Y (76637) exceeds max compute workgroups
+  // per dimension (65535)". Every other pass in the track already folded
+  // through a linear grid; these two divided by the tile and dispatched the
+  // quotient raw.
+  //
+  // With a single z slice this is exactly group.y, so a caller that has not
+  // been taught to fold is unchanged.
+  let row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS + local.y;
   let channel0 = group.x * TILE_COLUMNS + local.x;
   let tile_index = local.y * 8u + local.x;
   // ...the projection contracts over CH and the gate over CZ, on the same
@@ -690,5 +731,9 @@ fn main(
 
   return { normalizeInput, projectAB, contract, normalizeHidden, projectOutput,
            projectTile: { ...projectTile }, contractTile: { ...contractTile },
+           // ...the width the two projections fold their row tile at, so a
+           // caller splits at the number the kernel was GENERATED with rather
+           // than at a constant of its own that happens to match.
+           projectGridWidth,
            normalizeRows: NORMALIZE_ROWS };
 }

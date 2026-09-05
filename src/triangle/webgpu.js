@@ -1,13 +1,13 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { createTriangleShaders } from "./shaders.js";
+import { LINEAR_GRID_WIDTH, createTriangleShaders } from "./shaders.js";
 
 import { validateTriangleInput } from "./types.js";
 import { packWeights } from "./weights.js";
 
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
-const LINEAR_GRID_WIDTH = 32_768;
+// ...the kernels' own, imported rather than restated: see the note on it.
 
 function makeBindGroup(
   device,
@@ -48,15 +48,21 @@ class TriangleMultiplicationGpu {
     // "two-pass" is AF2's formula and stays the default; AF3's trunk asks for
     // "fast". See varianceCode in shaders.js.
     const variance = options.variance ?? "two-pass";
+    // 🔴 THE FOLD WIDTH TRAVELS WITH THE SHAPE, so a checker can force the row
+    // tile across group.z at a size a CPU reference can follow. Reaching it for
+    // real takes ~1450 residues and the contraction is O(n^3); see the note on
+    // PROJECT_GRID_WIDTH in shaders.js.
+    const shape = options.projectGridWidth === undefined
+      ? input.shape : { ...input.shape, projectGridWidth: options.projectGridWidth };
     const shaders = createTriangleShaders(
-      input.shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
+      shape, precision, packedWeights.offsets, input.epsilon ?? 1e-5, this.direction,
       variance,
     );
     // 🔴 `variance` BELONGS IN THE KEY. It changes the generated WGSL, so
     // leaving it out would hand an AF3 call the AF2 pipeline compiled earlier
     // at the same shape - silently, and only when both models run in one page.
     const pipelineKey = `${this.direction}:${precision}:${length}:${cZ}:${cHidden}`
-      + `:${input.epsilon ?? 1e-5}:${variance}`;
+      + `:${input.epsilon ?? 1e-5}:${variance}:${shaders.projectGridWidth}`;
     const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
       this.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
       this.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),
@@ -123,10 +129,16 @@ class TriangleMultiplicationGpu {
         normalizeGroups[0], normalizeGroups[1]);
       // ...divided by the tile the shaders were GENERATED with, not by a
       // constant of this file's own. See the note on PROJECT_TILE.
+      // ...rows over y AND z, because x is the channel tile and there are
+      // pairCount of them. See the note in the kernel.
+      const projectWidth = shaders.projectGridWidth ?? LINEAR_GRID_WIDTH;
+      const projectTiles = ceilDivide(pairCount, shaders.projectTile.rows);
+      const projectRows = [Math.min(projectTiles, projectWidth),
+                           ceilDivide(projectTiles, projectWidth)];
       runPass("project-ab", projectAB,
         [zNormalized.buffer, mask.buffer, weights.buffer, a.buffer, b.buffer],
         ceilDivide(cHidden, shaders.projectTile.columns),
-        ceilDivide(pairCount, shaders.projectTile.rows));
+        projectRows[0], projectRows[1]);
       runPass("contract", contract, [a.buffer, b.buffer, contracted.buffer],
         ceilDivide(length, shaders.contractTile.columns),
         ceilDivide(length, shaders.contractTile.rows), cHidden);
@@ -136,7 +148,7 @@ class TriangleMultiplicationGpu {
       runPass("project-output", projectOutput,
         [zNormalized.buffer, xNormalized.buffer, weights.buffer, output.buffer],
         ceilDivide(cZ, shaders.projectTile.columns),
-        ceilDivide(pairCount, shaders.projectTile.rows));
+        projectRows[0], projectRows[1]);
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairCount * cZ * 4);
 
       const start = performance.now();

@@ -67,6 +67,14 @@ export async function main(device, args) {
   const n = Number(option(args, "n", "32"));
   const block = Number(option(args, "block", "0"));
   const precisions = option(args, "precision", "f32").split(",");
+  // 🔴 --grid-width IS THE ONLY WAY THE z PATH GETS CHECKED. The two
+  // projections fold their row tile over y AND z, because n^2 rows over a
+  // 32-row tile passes the 65535-per-dimension limit at about 1450 residues -
+  // and the contraction is O(n^3), so no CPU reference can follow a
+  // differential there. Lowering the width puts group.z > 0 at n=32, against
+  // this file's independent reference. `--grid-width=1` is one z slice per
+  // tile, which is the most the arithmetic can be asked to survive.
+  const projectGridWidth = Number(option(args, "grid-width", "32768"));
   const store = await HttpTensorStore.open(MANIFEST);
 
   // Each trunk tensor is stacked over the 48 blocks; take one layer's slice.
@@ -99,7 +107,8 @@ export async function main(device, args) {
     for (const precision of precisions) {
       if (precision === "f16" && !device.features.has("shader-f16")) continue;
       const { output } = await af3TriangleMultiplication(
-        device, pair, mask, n, CHANNELS, direction, weights, { precision });
+        device, pair, mask, n, CHANNELS, direction, weights,
+        { precision, projectGridWidth });
       const relRms = relativeRms(output, expected);
       worst = Math.max(worst, precision === "f32" ? relRms : 0);
       results[`${direction}/${precision}`] = relRms;

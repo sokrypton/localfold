@@ -24,7 +24,23 @@ import { TriangleMultiplicationOutgoingGpu } from "../../src/triangle/webgpu.js"
 const FIXTURE = new URL("/test/fixtures/openfold-triangle-small/manifest.json",
                         location.href).href;
 
-export async function main(device) {
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+export async function main(device, args = []) {
+  // 🔴 --grid-width IS HOW THE z PATH GETS CHECKED AT ALL. The two projections
+  // fold their row tile over y AND z, because n^2 rows over a 32-row tile
+  // passes 65535 at about 1450 residues - and no CPU reference can follow an
+  // O(n^3) contraction at that size. Lowering the width puts group.z > 0 on
+  // this fixture, where the reference is OpenFold's own recorded output.
+  //
+  // It has to be checked HERE and not in check-triangle-packed.js: that one
+  // compares two kernels against each other, and a wrong z index is wrong in
+  // both of them identically, so it agrees with itself. Measured - with the z
+  // term deleted, the packed checker still passed.
+  const projectGridWidth = Number(option(args, "grid-width", "32768"));
   const bundle = await loadTriangleReferenceBundle(FIXTURE);
   const runner = new TriangleMultiplicationOutgoingGpu(device);
   const cpu = triangleMultiplicationOutgoingReference(bundle.input);
@@ -33,7 +49,7 @@ export async function main(device) {
   let failed = 0;
   for (const precision of ["f32", "f16"]) {
     if (precision === "f16" && !device.features.has("shader-f16")) continue;
-    const { output } = await runner.run(bundle.input, { precision });
+    const { output } = await runner.run(bundle.input, { precision, projectGridWidth });
     // Against OpenFold, which is the reference that matters, and against this
     // repo's CPU path, which is what the AF3 checks will compare to.
     const openfold = errorMetrics(output, bundle.expected);

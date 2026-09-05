@@ -139,9 +139,18 @@ export class WebGpuExecution {
     // validation error naming a count and nothing else. Every grid here should
     // have been folded by linearGrid or rowGrid; saying which one was not, and
     // at what size, is the difference between a five-minute fix and a hunt.
-    if (x > MAX_WORKGROUPS_PER_DIMENSION) {
-      throw new RangeError(`${label ?? "dispatch"} needs ${x} workgroups in x, over the`
-        + ` ${MAX_WORKGROUPS_PER_DIMENSION} limit - it wants folding through linearGrid or rowGrid`);
+    // 🔴 ALL THREE, NOT JUST x. This checked x alone, and the one that
+    // overflowed in the field was Y: a 1566-residue AF3 fold refused with
+    // "Dispatch workgroup count Y (76637) exceeds max compute workgroups per
+    // dimension (65535)" from inside the template embedder, which is the raw
+    // browser message this guard exists to replace. A limit worth naming is
+    // worth naming on every axis that has it.
+    for (const [axis, count] of [["x", x], ["y", y], ["z", z]]) {
+      if (count > MAX_WORKGROUPS_PER_DIMENSION) {
+        throw new RangeError(`${label ?? "dispatch"} needs ${count} workgroups in ${axis}, over`
+          + ` the ${MAX_WORKGROUPS_PER_DIMENSION} limit - it wants folding through linearGrid`
+          + " or rowGrid");
+      }
     }
     const timestamp = this.#timestamps;
     let timestampWrites;

@@ -19,7 +19,7 @@
  * deltas against a common input to be summed at the end. Batching them that way
  * is a natural-looking optimisation and a different function.
  */
-import { createTriangleShaders } from "../triangle/shaders.js";
+import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
 import { createGridAttentionShaders, packGridAttentionWeights }
@@ -103,7 +103,7 @@ export async function compilePairTrack(cache, options) {
     // rather than writing a delta for a separate add pass to fold in. All five
     // of this track's updates do that now; see the note in
     // src/af3/transition-webgpu.js for what the add pass was costing.
-    const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
+    const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
       undefined,
       { normalized: scratchStorage[0], hidden: scratchStorage[4],
@@ -114,6 +114,7 @@ export async function compilePairTrack(cache, options) {
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
     pipelines.projectTile = projectTile;
+    pipelines.projectGridWidth = projectGridWidth;
     pipelines.normalizeRows = normalizeRows;
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
@@ -265,6 +266,12 @@ export function encodePairTrack(context) {
   const channels = context.channels ?? PAIR_CHANNELS;
   const pairs = n * n;
   const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+  // 🔴 THE TRIANGLE KERNELS FOLD AT THEIR OWN WIDTH, NOT THIS FILE'S. They
+  // happen to be the same number, and agreeing by coincidence is how a caller
+  // silently addresses rows that do not exist. See LINEAR_GRID_WIDTH.
+  const triangleWidth = pipelines.projectGridWidth ?? LINEAR_GRID_WIDTH;
+  const spreadTriangle = (groups) =>
+    [Math.min(groups, triangleWidth), Math.ceil(groups / triangleWidth)];
   const ceil = (value, divisor) => Math.ceil(value / divisor);
   for (const direction of ["outgoing", "incoming"]) {
     const w = weights[direction];
@@ -272,8 +279,11 @@ export function encodePairTrack(context) {
     const perNormalizeTile = spread(ceil(pairs, pipelines.normalizeRows));
     run("tri.normalize", p("normalizeInput"), [pair, w, scratch[0]],
         perNormalizeTile[0], perNormalizeTile[1]);
+    // ...rows folded over y and z: x is the channel tile, so the pair rows have
+    // nowhere else to go and there are n^2 of them. See the note in the kernel.
+    const perProjectTile = spreadTriangle(ceil(pairs, pipelines.projectTile.rows));
     run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
-        ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
+        ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
     run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
         ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
     run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]],
@@ -281,7 +291,7 @@ export function encodePairTrack(context) {
     // ...straight into the pair representation, which nothing has read since
     // tri.normalize consumed it into scratch[0].
     run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, pair],
-        ceil(channels, pipelines.projectTile.columns), ceil(pairs, pipelines.projectTile.rows));
+        ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
   }
 
   for (const [key, w] of [["false", weights.grid1], ["true", weights.grid2]]) {

@@ -63,7 +63,7 @@ import {
 
 } from "../evoformer/transition.js";
 import { WebGpuExecution } from "../runtime/execution.js";
-import { createTriangleShaders } from "../triangle/shaders.js";
+import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../triangle/shaders.js";
 
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 
@@ -589,9 +589,16 @@ async function encodeTriangleMultiplication(
   execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], normalizeGroups, 1, 1,
     `triangle.${direction}.normalize-input`);
   let grid = execution.linearGrid(pairs * input.triangleHidden);
+  // ...rows over y AND z: x is the channel tile, so there is nowhere else for
+  // n^2 pair rows to go, and past ~1450 residues the quotient is over the
+  // 65535 a dimension allows. See the note in src/triangle/shaders.js.
+  const projectWidth = shaders.projectGridWidth ?? LINEAR_GRID_WIDTH;
+  const projectTiles = Math.ceil(pairs / shaders.projectTile.rows);
+  const projectRows = [Math.min(projectTiles, projectWidth),
+                       Math.ceil(projectTiles / projectWidth)];
   execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
     Math.ceil(input.triangleHidden / shaders.projectTile.columns),
-    Math.ceil(pairs / shaders.projectTile.rows), 1,
+    projectRows[0], projectRows[1],
     `triangle.${direction}.project`);
   execution.dispatch(encoder, contract, [a, b, contracted],
     Math.ceil(input.length / shaders.contractTile.columns),
@@ -601,7 +608,7 @@ async function encodeTriangleMultiplication(
     normalizeGroups, 1, 1, `triangle.${direction}.normalize-hidden`);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
     Math.ceil(input.cZ / shaders.projectTile.columns),
-    Math.ceil(pairs / shaders.projectTile.rows), 1,
+    projectRows[0], projectRows[1],
     `triangle.${direction}.output`);
   return output;
 }

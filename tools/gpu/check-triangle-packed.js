@@ -78,7 +78,13 @@ export async function main(device, args) {
   // `accumulatePrecision` is a separate axis from the storage.
   const direction = option(args, "direction", "outgoing");
   const accumulatePrecision = option(args, "accumulate", "f32");
-  const shape = { length, cZ, cHidden: cH, accumulatePrecision };
+  // 🔴 THE WIDTH THE ROW TILE FOLDS AT, SO group.z CAN BE REACHED HERE.
+  // Overflowing 65535 row tiles needs about 1450 residues, and the contraction
+  // is O(n^3) - no CPU reference can follow a differential at that size. Small
+  // values put the same arithmetic under test at 68: `--grid-width=4` gives
+  // 4624 pairs / 32 rows = 145 tiles over 37 z slices.
+  const projectGridWidth = Number(option(args, "grid-width", "32768"));
+  const shape = { length, cZ, cHidden: cH, accumulatePrecision, projectGridWidth };
   const build = (ab) => createTriangleShaders(
     shape, "f32", offsets, 1e-5, direction, "two-pass", undefined, false, undefined, { ab });
   const plain = build("f32");
@@ -108,8 +114,13 @@ export async function main(device, args) {
     return out;
   };
 
+  // ...rows folded over y AND z at the width the kernel reports, which is the
+  // whole point of --grid-width: with 32768 this is one z slice and is exactly
+  // what shipped, and with 4 it is 37 of them over the same 145 tiles.
+  const projectTiles = Math.ceil(pairs / plain.projectTile.rows);
   const projectGroups = [Math.ceil(cH / plain.projectTile.columns),
-                         Math.ceil(pairs / plain.projectTile.rows)];
+                         Math.min(projectTiles, plain.projectGridWidth),
+                         Math.ceil(projectTiles / plain.projectGridWidth)];
   const contractGroups = [Math.ceil(length / plain.contractTile.columns),
                           Math.ceil(length / plain.contractTile.rows)];
 
@@ -194,6 +205,7 @@ export async function main(device, args) {
   const updated = compare(await wholeUpdate(plain, false), await wholeUpdate(packed, true));
 
   return {
+    projectDispatch: projectGroups, projectGridWidth: plain.projectGridWidth,
     length, pairs, cZ, cH, direction, accumulatePrecision,
     contracted, updated,
     note: "a/b compared element by element in the LOGICAL layout a[h][row]",
