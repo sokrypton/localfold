@@ -27,10 +27,15 @@ and, for a calibrated arm (70 s for the whole tower on an A100):
 | `quantisation.py` | the schemes, including the exact int5 packer LocalFold ships AF3 under |
 | `gptq.py` | GPTQ and an importance-weighted range search, in that same format. `python3 tools/esmc/gptq.py` is its self-test |
 | `calibrate-esmc.py` | runs one of those over the tower against real sequences, block by block |
+| `distil-esmc.py` | quantisation-aware distillation - moves the WEIGHTS so their codes are better, which post-training methods cannot |
 | `fetch_calibration.py` | the UniRef50 calibration set, length-filtered |
 | `probe-esmc-compression.py` | what each scheme costs the folding trunk's input |
 | `probe-esmfold2-structure.py` | ...and what that costs the structure. Needs `esm`, so run it with `.venv-esm/bin/python` |
 | `fetch_targets.py` | held-out targets: single chains released after the checkpoint's cutoff |
+
+The probes take `--fold-bits` as well, because the bundle is two models: the
+folding model is 171 M parameters and a size measured on the tower alone is a
+size for three fifths of the download.
 
 `esmc_forward.py` is written from the block layout
 `../alphafold3/converters/esmc.py` documents rather than by importing the `esm`

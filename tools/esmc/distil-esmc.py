@@ -160,6 +160,13 @@ def main():
     sequences = read_fasta(arguments.fasta, min(LENGTHS), 200000)
     split = max(64, len(sequences) // 50)
     held_out = Sampler(sequences[:split], arguments.batch, arguments.device, 777)
+    # 🔴 A MOVING EVALUATION SET IS NOT AN EVALUATION. The first version drew a
+    # fresh batch of four every time, and its numbers walked between 2.7e-1 and
+    # 4.2e-1 with no trend while the training loss fell by 45% - the variance
+    # between four random proteins is larger than anything training does in a
+    # thousand steps. The batches are drawn ONCE and reused, so two readings
+    # differ only by what changed in the weights.
+    evaluation_batches = [held_out() for _ in range(8)]
     sampler = Sampler(sequences[split:], arguments.batch, arguments.device,
                       arguments.seed)
     print('%d sequences, %d held out' % (len(sequences), split), flush=True)
@@ -193,16 +200,17 @@ def main():
         return (mix * per_state_error(got, want)).sum()
 
     def evaluate():
-        """The number the compression probe reports, on held-out sequences."""
+        """The number the compression probe reports, on fixed held-out batches."""
         with torch.no_grad():
-            ids = held_out()
-            bind(True)
-            got = student.hidden_states(ids)
-            bind(False)
-            want = student.hidden_states(ids)
-            errors = [E.relative_rms(shim.single(got[:, row]),
-                                     shim.single(want[:, row]))
-                      for row in range(got.shape[1])]
+            errors = []
+            for ids in evaluation_batches:
+                bind(True)
+                got = student.hidden_states(ids)
+                bind(False)
+                want = student.hidden_states(ids)
+                errors.extend(E.relative_rms(shim.single(got[:, row]),
+                                             shim.single(want[:, row]))
+                              for row in range(got.shape[1]))
             return float(np.mean(errors))
 
     print('mixed-single relRMS before training: %.4e' % evaluate(), flush=True)
