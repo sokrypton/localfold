@@ -32,6 +32,7 @@ import { Af3AtomDecoderGpu } from "./atom-decoder-webgpu.js";
 import { Af3DiffusionTransformerGpu } from "./diffusion-transformer-webgpu.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
 
 const SIGMA_DATA = 16.0;
 
@@ -144,6 +145,61 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       value += normalised[c] * projection[c * C_OUT + out];
     }
     output[row * C_OUT + out] = value;
+  }
+}`;
+
+/**
+ * The same LayerNorm with no projection after it: one workgroup a row.
+ *
+ * 🔴 IT WAS ON THE CPU AND MEASURED AT 0 MS, WHICH WAS NOT THE REASON TO MOVE
+ * IT. 59 rows of 768 really is nothing; what it cost was the READBACK in front
+ * of it - the transformer's output had to reach the host for this loop to run,
+ * and then go back for the decoder. The arithmetic is free either way; the
+ * round trip was not.
+ */
+const NORMALISE_ONLY = (rows, channels, lanes) => `
+const ROWS: u32 = ${rows}u;
+const C: u32 = ${channels}u;
+const LANES: u32 = ${lanes}u;
+const EPSILON: f32 = 1.0e-5;
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> scale: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+var<workgroup> reduce_a: array<f32, ${lanes}>;
+
+fn reduce_sum(local: u32, value: f32) -> f32 {
+  reduce_a[local] = value;
+  workgroupBarrier();
+  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
+    workgroupBarrier();
+  }
+  return reduce_a[0];
+}
+
+@compute @workgroup_size(${lanes})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x;
+  if (row >= ROWS) { return; }
+  let local = local_id.x;
+  let base = row * C;
+
+  var total = 0.0;
+  for (var c = local; c < C; c += LANES) { total += input[base + c]; }
+  let mean = reduce_sum(local, total) / f32(C);
+  workgroupBarrier();
+  var centred = 0.0;
+  for (var c = local; c < C; c += LANES) {
+    let d = input[base + c] - mean;
+    centred += d * d;
+  }
+  let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C) + EPSILON);
+  workgroupBarrier();
+  for (var c = local; c < C; c += LANES) {
+    output[base + c] = (input[base + c] - mean) * inverse * scale[c];
   }
 }`;
 
@@ -296,6 +352,30 @@ export class Af3DiffusionHeadGpu {
    *   singleCondEmbedding* and outputNormScale
    */
 
+  /** LayerNorm a device tensor into another, with the head's deferred scope. */
+  async #normaliseOnly(input, into, rows, channels, scale, validation) {
+    const lanes = 256;
+    const pipeline = await pipelineCacheForDevice(this.device).get(
+      `af3-normalise-only:${rows}:${channels}:${lanes}`,
+      NORMALISE_ONLY(rows, channels, lanes));
+    const scaleBuffer = residentWeightBuffer(this.device, scale, "cond.output-norm",
+                                             () => scale);
+    validation.begin();
+    const encoder = this.device.createCommandEncoder({ label: "af3-output-norm" });
+    const pass = encoder.beginComputePass({ label: "output-norm" });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [input, scaleBuffer, into].map((buffer, binding) => ({
+        binding, resource: { buffer },
+      })),
+    }));
+    pass.dispatchWorkgroups(rows);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    validation.end("output norm");
+  }
+
   /** `accumulator += delta`, elementwise, for two tensors already on the device. */
   async #addInto(accumulator, delta, elements, validation) {
     const pipeline = await pipelineCacheForDevice(this.device).get(
@@ -428,6 +508,8 @@ export class Af3DiffusionHeadGpu {
                                   tokens * weights.perTokenChannels * 4),
       skip: this.#chainBuffer(shapeKey, "head.skip",
                               queryRows * weights.encoder.channels * 4),
+      normalised: this.#chainBuffer(shapeKey, "head.normalised",
+                                    tokens * weights.perTokenChannels * 4),
     } : undefined;
     // One scope over the whole chain, settled at the decoder's readback - the
     // one boundary a denoiser step already synchronises at.
@@ -540,20 +622,30 @@ export class Af3DiffusionHeadGpu {
         act, chained ? chain.condSingle : cond.single, cond.pair, input.seqMask, tokens,
         this.options?.weightPrecision === undefined
           ? weights.transformer
-          : { ...weights.transformer, weightPrecision: this.options.weightPrecision }));
+          : { ...weights.transformer, weightPrecision: this.options.weightPrecision },
+        chained ? { validation: deferred, keepOnDevice: true } : {}));
 
     // 🔴 THIS ONE STAYS ON THE CPU, AND THE DIFFERENCE IS THE PROJECTION. With
     // `null` for it this is a LayerNorm and nothing else - 59 rows of 768, too
     // small to be worth a dispatch, and measured at 0 ms. The one above is a
     // 384x768 matmul and was 58.
-    const normalised = await stage("output-norm", async () => normaliseAndProject(
-      transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
-      weights.outputNormScale, null));
+    const normalised = await stage("output-norm", async () => {
+      if (!chained) {
+        return normaliseAndProject(
+          transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
+          weights.outputNormScale, null);
+      }
+      await this.#normaliseOnly(transformed.outputBuffer, chain.normalised, tokens,
+                                weights.perTokenChannels, weights.outputNormScale, deferred);
+      return undefined;
+    });
 
     const decoded = await stage("atom-decoder", () =>
       new Af3AtomDecoderGpu(this.device).run(normalised, encoded, input, weights.decoder,
         { staticCache: this.#decoderBuffers,
-          ...(chained ? { deviceInputs: { skipConnection: chain.skip } } : {}) }));
+          ...(chained
+            ? { deviceInputs: { skipConnection: chain.skip, tokenAct: chain.normalised } }
+            : {}) }));
     // 🔴 SETTLED HERE AND NOWHERE EARLIER. The decoder's readback is the one
     // boundary a denoiser step already synchronises at, so every scope the
     // chain opened is read for free; opening and awaiting them per stage is

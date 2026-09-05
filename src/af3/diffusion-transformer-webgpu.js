@@ -968,9 +968,9 @@ export class Af3DiffusionTransformerGpu {
    * @param {object} weights channels, condChannels, heads, dimension,
    *   transitionFactor, blocksPerSuperBlock, pairInputLayerNormScale, superBlocks
    */
-  async run(act, cond, pairCond, mask, tokens, weights) {
+  async run(act, cond, pairCond, mask, tokens, weights, options = {}) {
     try {
-      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights);
+      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights, options);
     } catch (error) {
       if (!(error instanceof GpuMemoryBudgetError) || !this.residentWeights) throw error;
       // The pairformer's reasoning exactly; see the note on its run(). The
@@ -982,7 +982,7 @@ export class Af3DiffusionTransformerGpu {
       noteResidencyRefused(this.device);
       this.degradedTo = `uploading weights per call (${(reclaimed / (1024 * 1024)).toFixed(0)}`
         + ` MiB reclaimed): ${error.message}`;
-      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights);
+      return await this.#runBlocks(act, cond, pairCond, mask, tokens, weights, options);
     }
   }
 
@@ -1111,7 +1111,10 @@ export class Af3DiffusionTransformerGpu {
              weightPrecision };
   }
 
-  async #runBlocks(act, cond, pairCond, mask, tokens, weights) {
+  async #runBlocks(act, cond, pairCond, mask, tokens, weights, options = {}) {
+    // The caller keeps the stack's output as a buffer, and hands in the scope
+    // it will settle. See the head's #chain.
+    const keepOnDevice = options.keepOnDevice === true;
     const {
       channels, condChannels, pairChannels, heads, dimension, perSuper,
       width, pairs, shape, sources, compiled, tile, splits, outTile, outChunk,
@@ -1192,8 +1195,13 @@ export class Af3DiffusionTransformerGpu {
       const v = scratch("difftx.v", tokens * width * 4);
       const gate = scratch("difftx.gate", tokens * width * 4);
       const gathered = scratch("difftx.gathered", tokens * width * 4);
-      const readback = scratch("difftx.readback", tokens * channels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+      // 🔴 NOT ALLOCATED WHEN THE CALLER IS KEEPING THE ANSWER ON THE DEVICE.
+      // The head's next act is a LayerNorm and then the atom decoder, both on
+      // the GPU; reading tokens x 768 floats out and writing them straight back
+      // is a pipeline drain for nothing.
+      const readback = keepOnDevice ? undefined
+        : scratch("difftx.readback", tokens * channels * 4,
+                  GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
 
       const start = performance.now();
       // 🔴 ONE VALIDATION SCOPE PER BLOCK, NONE OF THEM AWAITED IN THE LOOP.
@@ -1203,7 +1211,10 @@ export class Af3DiffusionTransformerGpu {
       // `onSubmittedWorkDone()` per block on top of that - two round trips a
       // block, twenty-four blocks, every denoiser call - and a denoiser call
       // happens up to 200 times a fold.
-      const validation = new DeferredValidation(this.device, "diffusion transformer");
+      // The caller's scope when it has one, so it can settle every stage of a
+      // denoiser step at the one boundary that already synchronises.
+      const validation = options.validation
+        ?? new DeferredValidation(this.device, "diffusion transformer");
       // The shared pair LayerNorm, once for the whole stack - and once for the
       // whole SCHEDULE, since nothing it reads moves with the noise level.
       if (buildPairNorm) {
@@ -1353,8 +1364,10 @@ export class Af3DiffusionTransformerGpu {
         // falling back. Resident runs are untouched and still submit once.
         if (!this.residentWeights) flush(`super-block ${groupIndex}`);
       }
-      // ...and the readback rides the same submit.
-      encoder.copyBufferToBuffer(actBuffer.buffer, 0, readback.buffer, 0, tokens * channels * 4);
+      // ...and the readback rides the same submit, when there is one.
+      if (!keepOnDevice) {
+        encoder.copyBufferToBuffer(actBuffer.buffer, 0, readback.buffer, 0, tokens * channels * 4);
+      }
       this.device.queue.submit([encoder.finish()]);
       validation.end(submits === 0 ? "block stack" : "readback");
       // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
@@ -1362,6 +1375,13 @@ export class Af3DiffusionTransformerGpu {
       // pass still refers to it would hand the same buffer to that block's
       // upload.
       for (const projection of projections) projection.release();
+      if (keepOnDevice) {
+        return {
+          output: undefined, outputBuffer: actBuffer.buffer,
+          elapsedMilliseconds: performance.now() - start,
+          memory: this.allocator.snapshot(),
+        };
+      }
       // ...the boundary that already synchronises, so the deferred scopes cost
       // nothing to read here.
       await validation.settle();
