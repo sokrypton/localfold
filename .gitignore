@@ -48,6 +48,10 @@ __pycache__/
 /model-af3-full-f32
 /model-af3-full
 /model-af3-int5
+# ...and the same pair for OpenBind, OpenFold3's v0.5.0 release, written by
+# the same two tools with --model openbind.
+/model-openbind-full-f32
+/model-openbind-int5
 
 # A saved copy of Google's AlphaFold Server page, kept locally as a reference
 # for the entity interface. Not ours to redistribute, and not repo content.

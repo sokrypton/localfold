@@ -2,7 +2,7 @@
 """Write a LocalFold float32 model directory from AF3-lineage parameters.
 
     python3 tools/export_af3_model.py                     # the trunk, from AF3
-    python3 tools/export_af3_model.py --model openfold3   # ...from OpenFold3
+    python3 tools/export_af3_model.py --model openbind    # ...from OpenBind
     python3 tools/export_af3_model.py --include diffuser  # everything
 
 The output is the shape tools/quantize_model.py consumes - manifest.json plus
@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import sys
 from pathlib import Path
 
@@ -49,12 +50,32 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # One blob per model, each obtained from source and checked against the graph's
-# own jax.eval_shape table before use. The OpenFold3 one is ColabDesign2's
-# converter's output - the alphafold3 repo ships an older converter under a
-# different name, and its output is not what this reads.
+# own jax.eval_shape table before use.
+#
+# 🔴 openbind IS DOWNLOADED, NOT CONVERTED HERE. It is OpenFold3's v0.5.0
+# release, published already converted at
+# huggingface.co/sokrypton/af3-any-model, and `read_blob` above reads that file
+# directly - so adding it needed no torch, no 2.3 GB checkpoint and no second
+# checkout:
+#
+#     mkdir -p ~/af3_ported && cd ~/af3_ported
+#     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/\
+#       bc9038fdabff2a06968f85e91838fe49c936d68f/openbind.bin.zst
+#
+# 🔴 AND THE REVISION IS PINNED, for the reason the shard URLs are: a blob
+# fetched from a moving branch can change under a bundle that did not, and the
+# resulting failure names neither half. `openbind.shapes.json` beside it is the
+# conversion's own coverage record - it reports 406 arrays and 0 missing, and
+# names `of3-ob-174k.pt` as the source.
+#
+# 🔴 openbind IS NOT openfold3, WHATEVER THE LINEAGE SUGGESTS. They are two
+# releases of one project with different forward conventions - see
+# src/af3/dialect.js - so they are two entries, and the manifest's model.name
+# is what carries the difference into the page.
 BLOBS = {
     "alphafold3": "~/af3_official_weights/af3.bin.zst",
     "openfold3": "~/af3_converted_cd2/of3_ported_weights.bin.zst",
+    "openbind": "~/af3_ported/openbind.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
@@ -120,23 +141,79 @@ class ShardWriter:
         self._flush()
 
 
-def read_blob(path: str):
-    """(scope, name, array) records, through ColabDesign2's reader.
+def decode(data: bytes, dtype: str, length: int, offset: int, shape) -> np.ndarray:
+    """One record's buffer as an array.
 
-    Imported here rather than at the top so that --help works on a machine that
-    has never seen ColabDesign2, and so the failure names the thing that is
-    missing instead of dying on an import line.
+    🔴 AlphaFold 3's OWN BLOB IS bfloat16, WHICH numpy HAS NO DTYPE FOR. It is
+    the top sixteen bits of a float32 and nothing else - same exponent, seven
+    mantissa bits - so widening is a shift, not a conversion, and it needs no
+    ml_dtypes. Every ported blob this reads is float32; discovering that AF3's
+    is not was the first thing this reader did.
     """
-    if COLABDESIGN2 not in sys.path:
-        sys.path.insert(0, COLABDESIGN2)
-    try:
-        from colabdesign2.af3.converters import read_blob as read
-    except ImportError as error:
-        raise SystemExit(
-            f"cannot import ColabDesign2's blob reader from {COLABDESIGN2}: {error}\n"
-            "It is where the AF3-lineage converters live; clone it or pass"
-            " --colabdesign2.") from error
-    return read(path)
+    if dtype == "bfloat16":
+        raw = np.frombuffer(data, dtype="<u2", count=length // 2, offset=offset)
+        return (raw.astype(np.uint32) << 16).view(np.float32).reshape(shape)
+    numpy_dtype = np.dtype(dtype)
+    return np.frombuffer(data, dtype=numpy_dtype, count=length // numpy_dtype.itemsize,
+                         offset=offset).reshape(shape)
+
+
+def read_blob(path: str):
+    """(scope, name, array) records out of a haiku parameter blob.
+
+    🔴 READ HERE RATHER THAN THROUGH A CHECKOUT, because the format is a wire
+    format and this is thirty lines of it. It is AlphaFold 3's own
+    (`src/alphafold3/model/params.py`, `encode_record`): a `<5i` header giving
+    the lengths of the scope, the name, the dtype string, the shape and the
+    buffer, then those five fields back to back, repeated to the end of the
+    stream, the whole thing zstd-compressed when the name says `.zst`. Both
+    producers this project reads write exactly that - ColabDesign2's converters
+    and the `converters/` package in a sokrypton/alphafold3 checkout - so
+    importing either one to parse it made the exporter depend on a clone at a
+    hardcoded path for a struct.unpack.
+
+    🔴 AND THAT MATTERS FOR A PORTED MODEL SPECIFICALLY. `openbind.bin.zst` is
+    published on Hugging Face already converted; needing a torch environment and
+    a 2 GB checkpoint to read a file that has been downloaded is the difference
+    between "add a model" and "set up a machine".
+    """
+    path = os.path.expanduser(str(path))
+    if path.endswith(".zst"):
+        try:
+            import zstandard
+        except ImportError as error:
+            raise SystemExit(
+                f"reading {path} needs zstandard: pip install zstandard") from error
+        with open(path, "rb") as handle:
+            data = zstandard.ZstdDecompressor().stream_reader(handle).read()
+    else:
+        with open(path, "rb") as handle:
+            data = handle.read()
+
+    header = struct.Struct("<5i")
+    records = []
+    at = 0
+    while at < len(data):
+        if len(data) - at < header.size:
+            raise SystemExit(f"{path}: {len(data) - at} trailing bytes, "
+                             f"too few for a {header.size}-byte record header")
+        scope_len, name_len, dtype_len, rank, buffer_len = header.unpack_from(data, at)
+        at += header.size
+        take = lambda n: data[at:at + n]  # noqa: E731
+        scope = take(scope_len).decode("utf-8"); at += scope_len
+        name = take(name_len).decode("utf-8"); at += name_len
+        dtype = take(dtype_len).decode("utf-8"); at += dtype_len
+        shape = struct.unpack_from(f"<{rank}i", data, at); at += rank * 4
+        values = decode(data, dtype, buffer_len, at, shape)
+        at += buffer_len
+        # 🔴 THE IDENTIFIER RECORD IS NOT A PARAMETER. A blob written by
+        # `converters/common.py` opens with `__meta__/__identifier__`, 64 bytes
+        # naming the model; AF3's own carries the same. Handing it to the
+        # exporter's name matching would have it looking for a tensor.
+        if scope == "__meta__":
+            continue
+        records.append((scope, name, np.asarray(values)))
+    return records
 
 
 # Where a checkpoint keeps its Fourier noise embedding, when it keeps one.

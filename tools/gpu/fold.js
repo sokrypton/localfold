@@ -205,6 +205,48 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
 
+  // 🔴 --ablate TURNS A DIALECT BRANCH OFF, WHICH IS THE ONLY HONEST WAY TO
+  // PRICE ONE. Each of them is silent when wrong: the shapes agree, the fold
+  // finishes, and what comes out is a slightly different model. Folding a
+  // ported bundle with one convention removed and scoring both against a
+  // crystal is the measurement that says whether the convention was worth
+  // having - and, if removing it IMPROVES the fold, that it was wrong.
+  //
+  //     --ablate=maskPaddedKeys              one branch off
+  //     --ablate=maskPaddedKeys,symmetriseBonds
+  //
+  // 🔴 padSingleCondUnknownDna CANNOT BE ABLATED HERE and nothing needs to
+  // pretend otherwise: it changes the LayerNorm's WIDTH, so the bundle's own
+  // 833-long scale no longer matches and the conditioning throws. That is the
+  // structural gate doing its job, and it is why that branch needs no
+  // measurement to be trusted.
+  //
+  // 🔴 AND --enable IS THE OTHER DIRECTION, WHICH IS NOT SYMMETRY FOR ITS OWN
+  // SAKE. `swapTransposedBias` is false for OpenBind on the strength of
+  // upstream's TRANSPOSED_COLUMN_PAIR_BIAS listing openfold3 and not openbind -
+  // a reading of somebody else's table. Turning it ON and scoring the fold is
+  // how that reading gets checked against the weights themselves.
+  const ablate = option(args, "ablate", "").split(",").filter(Boolean);
+  const enable = option(args, "enable", "").split(",").filter(Boolean);
+  if (ablate.length + enable.length > 0) {
+    const known = Object.keys(weights.trunk.dialect);
+    for (const flag of [...ablate, ...enable]) {
+      if (!known.includes(flag)) {
+        throw new Error(`--ablate/--enable names ${flag}, which is not a dialect `
+          + `flag; known: ${known.join(", ")}`);
+      }
+    }
+    const overrides = {
+      ...Object.fromEntries(ablate.map((flag) => [flag, false])),
+      ...Object.fromEntries(enable.map((flag) => [flag, true])),
+    };
+    for (const bundle of [weights.trunk, weights.diffusion, weights.confidence,
+                          weights.targetFeat]) {
+      bundle.dialect = { ...bundle.dialect, ...overrides };
+    }
+    console.log(`dialect overridden: ${JSON.stringify(overrides)}`);
+  }
+
   // 🔴 A REPEAT FOLD IS THE ONE THE PAGE ACTUALLY SHOWS AFTER THE FIRST. The
   // pipelines and the resident f16 weights are cached for the life of the
   // DEVICE, so a second fold in the same session pays neither - and this file

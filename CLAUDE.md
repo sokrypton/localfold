@@ -1041,6 +1041,83 @@ demanding all three fails on a correct implementation.
 1.28e-4, atom encoder 9.48e-6 / 2.05e-5 - every one of them the figure already
 recorded in this file.
 
+🔴 **AND OpenBind FOLDS, WITH ITS OWN NUMBERS.** `openbind.bin.zst` is
+published already converted, `read_blob` in `tools/export_af3_model.py` now
+reads that format directly - no torch, no 2.3 GB checkpoint, no second checkout
+- and the two existing tools do the rest:
+
+```
+python3 tools/export_af3_model.py --model openbind --include diffuser \
+  --out model-openbind-full-f32           # 406 tensors, 368.4 M, 1405 MiB
+python3 tools/quantize_af3.py --source model-openbind-full-f32 \
+  --out model-openbind-int5               # 264.6 MiB, 5.31x
+node tools/gpu-chrome.mjs tools/gpu/fold.js --model=/model-openbind-int5/manifest.json
+```
+
+Scored against `tools/fixtures/6mrr-crystal.pdb`, both bundles at int5:
+
+| | RMSD | TM | pLDDT | CA-CA |
+|---|---|---|---|---|
+| alphafold3 | **0.67 A** | **0.952** | 85.8 | 3.82 |
+| openbind | 1.99 | 0.833 | 79.4 | 3.78 |
+| openbind, `swapTransposedBias` forced TRUE | 2.03 | 0.820 | 76.7 | 3.78 |
+
+The AF3 row reproduces this file's own quantisation table (0.66 / 0.953), which
+is what says the harness is sound. **The third row is the experiment that
+matters**: it turns on the convention OpenFold3 preview-2 was trained with, and
+it is WORSE on every measure - so `swapTransposedBias: false` is confirmed
+against the weights themselves rather than against a reading of somebody else's
+table. One target, so read it as a direction and not a margin.
+
+🔴 **AND THE SHAPES CONFIRM THE WHOLE ANALYSIS INDEPENDENTLY.** `openbind.shapes.json`
+against the AF3 bundle: **406 arrays each, identical names, exactly two shape
+differences** - `single_cond_initial_norm/scale` 833 against 831 and
+`single_cond_initial_projection/weights` [833, 384] against [831, 384]. Nothing
+else. Preview-2's per-block diffusion pair LayerNorm would have added
+twenty-four tensors and does not appear, which is the tree agreeing with the
+release note.
+
+🔴 **`--ablate` AND `--enable` PRICE A DIALECT BRANCH, because a branch that is
+silent when wrong cannot be trusted on a reading.** `tools/gpu/fold.js
+--ablate=maskPaddedKeys` turns one off and `--enable=swapTransposedBias` turns
+one on. `padSingleCondUnknownDna` cannot be ablated: it changes the LayerNorm's
+WIDTH, so the bundle's 833-long scale stops matching and the conditioning
+throws - the structural gate doing its job, and the reason that branch needs no
+measurement.
+
+🔴 **A PADDED KEY ONLY EXISTS BELOW 128 ATOMS, AND EVEN THERE IT REACHES
+NOTHING.** `featurise.js` clamps the 128-wide key window against the REAL atom
+count, so at 128 atoms or more every key lands on a real atom and the key mask
+is identically one. `tools/gpu/probe-ablate.js` sweeps the boundary:
+
+| residues | atoms | padded keys | `pairCond` | `tokenAct` | control |
+|---|---|---|---|---|---|
+| 4 | 32 | 288 of 384 | **4.13e-1** | **0.00e+0** | 1.04e-6 |
+| 8 | 67 | 366 of 768 | 2.72e-1 | 0.00e+0 | |
+| 12 | 106 | 198 of 1152 | 1.37e-1 | 0.00e+0 | 1.03e-6 |
+| 16 | 143 | **0** of 1536 | 0.00e+0 | 0.00e+0 | |
+| 68 | 574 | **0** of 6528 | 0.00e+0 | 0.00e+0 | 1.00e-6 |
+
+So the branch moves the atom PAIR conditioning by up to 41% and the encoder's
+OUTPUT by exactly nothing. The control column is a 1e-6 nudge to the
+conditioning, and it is there because "relRMS 0.00e+0" is also what a broken
+comparison says.
+
+🔴 **WHICH IS WHY AN ABLATION ON 6MRR CAME BACK BIT-IDENTICAL.** Same PDB, same
+pLDDT to every digit, with `maskPaddedKeys` off - because 6MRR has 574 atoms and
+therefore no padded keys at all. The dumps differ on this and it decides what a
+checker can see: `af3-6mrr.json` has 6528 of 6528 keys live, while
+`af3-oracle-atom-f32.json` has 873 of 1152 - a 97-atom molecule, under the
+window - which is why `check-af3-atom-encoder.js` measures a 7.77e-2 separation
+and a whole fold measures none.
+
+🔴 **SO THE PADDING IS AVOIDABLE, NOT NECESSARY.** AF3 pads because JAX wants
+static shapes; nothing here does. Sizing the key window to `min(128, atomCount)`
+would leave no padded key at any size and make this branch permanently
+unreachable - and the table above says it should be a no-op, since what a padded
+key contains provably does not reach the encoder's output. Not done: it changes
+the featuriser for stock AF3 as well, so it wants its own before-and-after fold.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring
