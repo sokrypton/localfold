@@ -280,7 +280,20 @@ def main():
             // ...and the download dial beside it, which is a second animation
             // with a second calibration and the same way of being wrong.
             const node = document.getElementById('model-load');
-            const dial = node && !node.hidden ? (node.getAttribute('aria-label') || '') : '';
+            // 🔴 THE ARC AS DRAWN, NOT THE LABEL BESIDE IT. The two can
+            // disagree: the fill carries a .2s transition on stroke-dashoffset,
+            // so on a fast load the label reads 100% while the arc is still
+            // sweeping - and it is the arc that gets hidden mid-sweep.
+            const fillNode = node ? node.querySelector('.model-load-fill') : null;
+            const arc = fillNode === null || node.hidden ? null : (() => {
+              const cs = getComputedStyle(fillNode);
+              const array = parseFloat(cs.strokeDasharray);
+              const offset = parseFloat(cs.strokeDashoffset);
+              return Number.isFinite(array) && array > 0
+                ? Number((1 - offset / array).toFixed(2)) : null;
+            })();
+            const dial = node && !node.hidden
+              ? (node.getAttribute('aria-label') || '') + ' [arc ' + arc + ']' : '';
             const log = window.__barLog;
             const last = log[log.length - 1];
             if (last !== undefined && last.value === value

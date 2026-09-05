@@ -296,9 +296,25 @@
 .model-load-fill {
   stroke: #3b82f6;
   stroke-linecap: round;
-  /* The arc is set by app.js as a dash offset; the transition is what makes it
-     sweep rather than jump between shard callbacks. */
-  transition: stroke-dashoffset .2s linear;
+  /* 🔴 NO TRANSITION, AND IT USED TO HAVE ONE. The arc is set by app.js as a
+     dash offset, and `transition: stroke-dashoffset .2s linear` was here to
+     make it sweep rather than jump between shard callbacks. There is nothing
+     to smooth: HttpTensorStore reports once per network chunk, which is 8776
+     callbacks over one load of model-af3-int5 - and a transition retargeted
+     that often never arrives. Each callback restarts it from wherever the arc
+     has got to, so the arc trails the true value by about `duration x rate`,
+     and the rate is one whole arc over the length of the load.
+
+     Measured through tools/fold-in-page.py --bar, which reads the DRAWN
+     dashoffset beside the label, on a 450 ms local load:
+
+         label  96 / 265 MiB   arc 0.05
+         label 192 / 265 MiB   arc 0.28
+         label 264 / 265 MiB   arc 0.64   <- hidden here
+
+     The dial reads 99.6% and is two thirds drawn. It is worse the faster the
+     load, so a returning visitor with the shards cached sees the least of it,
+     and a slow link sees none: at 30 s the lag is 0.2/30, which is 0.7%. */
 }
 
 /* A load whose total is not known yet spins instead of filling, for the same
