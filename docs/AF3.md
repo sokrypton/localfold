@@ -103,9 +103,32 @@ the kernel work of 2026-09-02. A diffusion-200 fold was 25.9 s at the 3.0 s
 era.
 
 Where it goes: two trunk passes, then eight denoiser calls of which the FIRST is
-~550 ms and the rest ~85. That first call is the one-off f16 conversion of the
-transformer's weights - not compilation, which measures 6 ms - and it is the
-largest single item left. Inside a trunk pass the order is now pair-transition
+~550 ms and the rest ~85. It is the largest single item left, and it is not
+compilation, which measures 6 ms.
+
+🔴 **AND IT IS NOT THE f16 CONVERSION EITHER, WHICH IS WHAT THIS FILE USED TO
+SAY.** `tools/gpu/probe-pack.js` splits it over all 24 blocks of the int5
+manifest, which pack to 378.2 MiB:
+
+| cold, f16 (decode + convert + concatenate) | 494 ms |
+| warm, f16 (convert + concatenate) | 244 |
+| warm, f32 (concatenate alone) | 66 |
+
+So the int5 DECODE is **250 ms**, the f16 conversion 178, and the concatenation
+66. The decode is the store binding a block lazily - the first read of each of
+its ~40 tensors decodes that tensor out of the shard - and it is paid whatever
+precision the buffer ends up in. Dropping to f32 weights would save 178 ms of
+494 and cost 378 MiB more on the device.
+
+🔴 **AND ALL OF IT COULD HIDE BEHIND THE TRUNK, FOR 378 MiB.** None of it reads
+the trunk, and a trunk pass leaves the host idle - 9.4 ms of encoding against
+2948 of waiting. What stops it is memory: `src/af3/fold.js` releases the trunk's
+~350 MiB of resident weights BEFORE the sampler makes the transformer's 378 MiB
+resident, precisely so the two never coexist. Packing during the trunk means
+holding those 378 MiB somewhere, on the host if the upload is deferred and on
+the device if it is not. It is 378 MiB bought with 494 ms, on the FIRST fold of
+a session only - a second fold finds the weights resident and pays none of it.
+Not taken; measured so it can be. Inside a trunk pass the order is now pair-transition
 86 ms, grid.project 58, tri.project 48, grid.attend 47, tri.project-out 39, at
 118 tokens over two passes.
 
