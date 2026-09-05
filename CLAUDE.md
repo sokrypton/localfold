@@ -443,6 +443,32 @@ string as the control that says the measurement can see a difference at all:
 | a plain space | 132.78, 139.78, 146.77, 146.77 | no |
 | U+2007 | 146.77 x4 | **yes** |
 
+🔴 **AND A CSS TRANSITION ON A VALUE THAT CHANGES 8776 TIMES IS PURE LAG.**
+The dial's fill carried `transition: stroke-dashoffset .2s linear`, to sweep
+rather than jump between shard callbacks. `HttpTensorStore` reports once per
+network CHUNK - 8776 callbacks over one load of `model-af3-int5` - and a
+transition retargeted that often never arrives: each callback restarts it from
+wherever the arc has got to, so the arc trails the true value by about
+`duration x rate`, and the rate is one whole arc over the length of the load.
+The dial read 99.6% while two thirds drawn, and was hidden there, so a load
+that COMPLETED looked like one that stopped. Measured with
+`tools/fold-in-page.py --bar`, which reads the drawn dashoffset beside the
+label, on a 450 ms local load:
+
+| label | arc, with the transition | without |
+|---|---|---|
+| 96 / 265 MiB | 0.05 | **0.39** |
+| 192 / 265 MiB | 0.28 | **0.74** |
+| 264 / 265 MiB | 0.64 | **0.93** |
+
+🔴 **AND IT IS WORSE THE FASTER THE LOAD**, which is why nothing caught it: a
+slow link lags 0.2 s in 30, which is 0.7% and invisible, while a returning
+visitor with the shards cached sees almost none of the arc at all. The DATA was
+right the whole time - `tools/gpu/probe-load-dial.js` reports the store's
+fraction ending at exactly 1, and the manifest's 264.6 MiB matches the shards on
+disk and the shards Hugging Face serves - so every check that read the numbers
+passed. **Sample what is DRAWN, not what was computed.**
+
 🔴 **AND THE DIAL IS NEVER LAID OUT UNLESS SOMETHING FORCES IT.** It is
 `hidden` on a bare page, so `tools/mobile-layout.py` had never seen it, and its
 label cannot wrap or shrink: at 320px the label took 171px of a 254px row and
