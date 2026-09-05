@@ -155,12 +155,13 @@ describe("the licence dialog", () => {
     const dialog = page.slice(page.indexOf('id="model-terms"'),
                               page.indexOf("</dialog>")).replace(/<!--[\s\S]*?-->/g, "");
     assert.doesNotMatch(dialog, /not open source/i);
-    assert.match(dialog, /non-commercial\s+use only/i);
+    assert.match(dialog, /not available for\s+commercial use/i);
     // 🔴 AND NOT NARROWER THAN THE TERMS EITHER. "Academic use only" is the
-    // obvious short phrase and it is wrong twice over: DeepMind's terms also
-    // cover non-profits, research institutes, journalism and government, and
-    // they exclude a researcher employed by a commercial organisation. A
-    // dialog asking somebody to accept a licence must not restate it.
+    // obvious short phrase and it is wrong twice over: DeepMind's terms cover
+    // non-profits, research institutes, journalism and government bodies too,
+    // and they exclude a researcher employed by a commercial organisation.
+    // "Not available for commercial use" is the short form that stays true;
+    // the linked terms carry the detail this dialog has no room for.
     assert.doesNotMatch(dialog, /academic use only/i);
   });
 });

@@ -1178,6 +1178,15 @@ capability the model has: *"Ligands need AlphaFold 3; the model is set to
 openbind"*. `AF3_FAMILIES` in `src/reference/manifests/index.js` is the list;
 `isAf3Family` is the test.
 
+🔴 **AND THE DIALOG SAYS "NOT AVAILABLE FOR COMMERCIAL USE" AND NOT "ACADEMIC
+USE ONLY".** The second is the phrase that comes to hand and it is wrong twice:
+DeepMind's terms cover non-profits, research institutes, journalism and
+government bodies as well as universities, and they exclude a researcher
+employed by a commercial organisation. The short form has to stay TRUE while
+being short; the linked terms carry the detail. "Not open source" was the
+earlier version of the same mistake - the CODE is openly licensed and it is the
+PARAMETERS that are restricted.
+
 🔴 **THE LICENCE DIALOG ASKS THE PERSON FOLDING, NOT THE DEPLOYER.**
 `build_site.py` already refuses to publish DeepMind's parameters without
 `LOCALFOLD_ACCEPT_MODEL_TERMS`; the page's `#model-terms` dialog gates the first
