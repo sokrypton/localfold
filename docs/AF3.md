@@ -120,15 +120,47 @@ its ~40 tensors decodes that tensor out of the shard - and it is paid whatever
 precision the buffer ends up in. Dropping to f32 weights would save 178 ms of
 494 and cost 378 MiB more on the device.
 
-🔴 **AND ALL OF IT COULD HIDE BEHIND THE TRUNK, FOR 378 MiB.** None of it reads
-the trunk, and a trunk pass leaves the host idle - 9.4 ms of encoding against
-2948 of waiting. What stops it is memory: `src/af3/fold.js` releases the trunk's
-~350 MiB of resident weights BEFORE the sampler makes the transformer's 378 MiB
-resident, precisely so the two never coexist. Packing during the trunk means
-holding those 378 MiB somewhere, on the host if the upload is deferred and on
-the device if it is not. It is 378 MiB bought with 494 ms, on the FIRST fold of
-a session only - a second fold finds the weights resident and pays none of it.
-Not taken; measured so it can be. Inside a trunk pass the order is now pair-transition
+🔴 **AND IT IS A COMPUTE PASS NOW, NOT HOST WORK AT ALL.** Hiding it behind the
+trunk was considered and would have cost 378 MiB; decoding it on the GPU costs
+nothing and is 3.7x faster. `src/runtime/quantised-upload.js` uploads the int5
+CODES - about an eighth of the bytes - and decodes them straight into the
+resident buffer. Over the 24 blocks, both arms cold: **437 ms on the host
+against 119 on the device**, and 0 of 198 million elements differ.
+
+The same helper (`src/af3/device-weights.js`) took the trunk's two f16 labels,
+which were the next largest:
+
+| packer | MiB | host, cold |
+|---|---|---|
+| the transformer's 24 blocks | 378.2 | 440 ms |
+| the trunk's single transition | 162.1 | 200 |
+| its single attention | 67.6 | 77 |
+| its pair transition (f32) | 36.0 | 16 |
+| its outgoing triangle (f32) | 18.2 | 15 |
+| its first grid attention (f32) | 15.1 | 19 |
+
+What a real page fold does, through the dev panel's own timeline:
+
+| | before | + the transformer | + the trunk |
+|---|---|---|---|
+| Trunk 1/2 | 673 ms | 647 | **355** |
+| Folding | 920 | 311 | **257** |
+| the whole fold | 3.31 s | 2.62 | **2.30** |
+
+🔴 **THE f32 PACKERS ARE NOT WORTH CONVERTING, AND NEITHER WAS THE LAST f16
+ONE, ON TIME ALONE.** Moving the single ATTENTION changed the fold by 2.31 s
+against 2.30 - nothing - because once the single TRANSITION was off the main
+thread the rest of the trunk's packing fits inside the pairformer's own GPU
+time. It is kept for the 77 ms of main-thread work, which matters on a slower
+CPU, not for the clock here. The f32 ones total about 50 ms, already hidden,
+and would need an f32 variant of the kernel.
+
+🔴 **AND THE RELEASE OF THE STAGING BUFFERS MUST NOT BE AWAITED.** The first
+version awaited `onSubmittedWorkDone` per block, which put 48 host-device
+synchronisations inside the pairformer's block loop - a loop written to run
+ahead of the device on purpose. Trunk 1/2 went 647 ms to **778**. It rides an
+unawaited promise now, which is the idiom that loop already uses for its
+progress callback. Inside a trunk pass the order is now pair-transition
 86 ms, grid.project 58, tri.project 48, grid.attend 47, tri.project-out 39, at
 118 tokens over two passes.
 

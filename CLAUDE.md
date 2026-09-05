@@ -753,6 +753,38 @@ fold.js's own comment calls out as 119 ms - is **4 ms at 59 tokens and 17 at
 240**. That comment is stale; the one-hot it describes was fixed. Writing the
 archive is 28 ms for a 2 MB alignment.
 
+🔴 **QUANTISED WEIGHTS CAN BE DECODED ON THE GPU, AND IT IS 3.7x.** The path to
+a resident f16 buffer used to be: decode int5 into float32 on the main thread,
+narrow the lot into a Float16Array, upload. `src/runtime/quantised-upload.js`
+uploads the CODES instead - an eighth of the bytes - and decodes them into the
+destination with one dispatch per tensor. 437 ms of host packing becomes 119 of
+compute for the diffusion transformer's 24 blocks, and a real page fold went
+**3.31 s to 2.30**. `src/af3/device-weights.js` is the shared entry point;
+docs/AF3.md has the per-packer table.
+
+🔴 **AND BIT-IDENTITY WAS THE FIRST THING MEASURED, NOT THE LAST.** JavaScript
+computes `code * scale + zero` in f64 and WGSL has no f64. The product is exact
+in both - a 5-bit code times an f16 scale needs at most 16 mantissa bits - but
+the SUM can need more than f32's 24. `tools/gpu/check-int5-gpu.js` answered it
+on 131,072 synthetic elements spanning 10^-4 to 10^4 before any of the
+plumbing existed; `tools/gpu/check-block-upload.js` answers it on whole real
+blocks against the shipping packer. Both read **0 differ**.
+
+🔴 **AND ON A LAZILY BOUND WEIGHT OBJECT, `.length` IS THE DECODE.** Reading
+`block[name].length` materialises that tensor. `blockWeightOffsets` existed
+precisely to avoid building a buffer and was doing it anyway; the device
+planner would have undone its own point; and in the checker it silently made
+the host arm WARM and flattered the GPU by 234 ms of work it had itself caused.
+`stacked` records the range it will read, and that is the length.
+
+🔴 **AND `Float16Array.set` FROM A Float32Array IS NOT A MEMMOVE.** 8M elements
+measure 9.4 ms through `set`, 6.1 through a plain loop and 4.4 unrolled eight
+ways - bit-identical. `writeInto` in src/runtime/float16.js is that loop, and
+it leaves same-element copies to `set`, which really is a memmove. On real
+shapes it is 26% of the narrowing rather than 52%: a block is forty tensors
+averaging 200k elements, so per-call overhead is a much larger share than the
+microbenchmark suggests.
+
 🔴 **AND `node tools/gpu-chrome.mjs` SOMETIMES DOES NOT EXIT.** The results file
 is complete and correct and the node process sits there with a headless Chrome
 still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
