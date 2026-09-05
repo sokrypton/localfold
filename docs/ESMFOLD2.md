@@ -302,6 +302,64 @@ cliff. Getting under 200 needs a different representation - QuIP#-style
 incoherence processing with vector codebooks is the class that makes 2-bit
 language models work - and that is a new WebGPU decoder, not a new packer.
 
+## What the AF3 port learned about the language model, and what it means here
+
+`../alphafold3` now folds all six ESMFold2 releases against native, and getting
+there turned up four things this directory has to know.
+
+🔴 **THE SHIM IS PER MODEL, NOT PER FAMILY.** Every release trains its own
+`language_model.*` - the module that turns ESM-C's 37 hidden states into a pair
+representation. They share the TOWER and nothing else. The AF3 port shipped one
+`esmfold2.lm.npz` for the whole family and fed every variant the BASE model's,
+which against native's own `lm_z` for that variant reads **corr 0.026** where the
+variant's own shim reads **0.999998**. It cost `esmfold2_exp_fast` **8.798 A
+against 0.812** on 6MRR.
+
+🔴 **THIS DIRECTORY AVOIDS IT BY CONSTRUCTION, AND THAT IS WORTH KNOWING BEFORE
+SOMEBODY OPTIMISES IT.** `Shim.__init__` reads `language_model.*` out of the
+folding checkpoint it is handed, so the tower and the shim cannot come from
+different models without the caller naming two directories. Verified against
+the `esm` package's own module on the 600M experimental-fast checkpoint:
+
+| | |
+|---|---|
+| `Shim.pair` against native `model.language_model` | **relRMS 3.20e-7** |
+| correlation | 1.000000 |
+| standard deviation | 3.354 against 3.354 |
+
+The failure mode returns the moment anyone caches a precomputed `lm_pair` or an
+`lm.npz` beside the tower - which is exactly the shape of optimisation this
+repository likes, and exactly what made the mistake easy upstream.
+
+🔴 **AND BETWEEN 600M AND 300M IT WOULD RAISE, WHICH IS NOT REASSURANCE.** Their
+shims differ in SHAPE - 37 mix entries against 31, a (256, 1152) projection
+against (256, 960) - so crossing those two is a loud error. Upstream's case was
+two releases of the SAME width, where it is silent and folds anyway. Any check
+here has to discriminate on the weights, not on the shapes.
+
+🔴 **AND THE EXPERIMENTAL LINE IS A DIFFERENT IMPLEMENTATION, NOT A DIFFERENT
+CONFIG.** `ESMFold2ExperimentalModel` is its own class. Three divergences the
+AF3 port found by reading it rather than inferring from `config.json`, all of
+which a LocalFold port would have to carry:
+
+* **no `lm_encoder`**: the shim's output is added straight to `z_init`, ONCE,
+  outside the recycle loop. Reading the released line's early-return here meant
+  the language model never reached the trunk at all - and it still folded, one
+  variant at 1.694 A, with ESM-C changing the answer by nothing to three
+  decimals.
+* **`lm_dropout` is 0.0**, not the released line's 0.25, which lives in
+  `lm_encoder.per_loop_lm_dropout` and therefore does not exist here.
+* the MSA encoder runs AFTER the recycle and is ADDED - moot for "fast", which
+  has no MSA encoder at all.
+
+🔴 **AND ALL SIX VARIANTS THE AF3 PORT WIRES IN USE ESM-C 6B.** Its registry
+says so in as many words ("all six share ESM-C 6B") and there is no reference to
+a 600M tower anywhere in that tree. The checkpoints this document compresses -
+`...-base600M-step1500k` and `...-base300M-step1500k` - are the paper's LM-size
+ablation series and are not in it. So the model that is validated end to end is
+not the model that fits a browser, and the model that fits a browser is not
+validated end to end. See the note on the confidence head above.
+
 ## The 600M bundle, all the way down
 
 Everything above measures the tower with a float32 folding model, which prices
