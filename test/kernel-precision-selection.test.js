@@ -109,6 +109,37 @@ describe("the attention kernels' choices", () => {
 
   it("refuse f16 on a device without it rather than building a shader it cannot compile", () => {
     expect(() => selectAttentionProjectKernel(withoutF16, "f16")).toThrow();
+  });
+
+  it("keys a packed kernel apart from the f32 one it would otherwise share", () => {
+    // 🔴 A SHARED KEY HERE IS FOUR BINDINGS OF THE RIGHT LENGTH HOLDING TWICE
+    // THE VALUES THEY SHOULD, which nothing validates and nothing throws on.
+    const plain = selectAttentionFlashKernel(withF16, 32);
+    const packed = selectAttentionFlashKernel(withF16, 32, "auto", "auto",
+      { input: "f16", output: "f16" });
+    expect(plain.cacheKey).toBe("attention:flash-registers-32-chunk16");
+    expect(packed.cacheKey).toBe("attention:flash-registers-32-chunk16-storagef16f16");
+    expect(plain.packedStorageSupported).toBe(true);
+    // Only the register kernel reads them packed. A head that does not divide
+    // into vec4s falls to the portable kernel, which does not - and the caller
+    // checks this flag before it allocates, so that device keeps f32 storage.
+    expect(selectAttentionFlashKernel(withF16, 30).packedStorageSupported).toBe(false);
+    // 🔴 THE SHADER, NOT ONLY THE KEY. An earlier version of this test compared
+    // keys alone and passed while `outputStorage` was not threaded into the
+    // generator at all: the key differed on the SOURCE storage, so a projection
+    // writing f32 into a buffer the flash kernel read as packed went unnoticed
+    // until the fold came back NaN. Assert that the storage reaches the WGSL.
+    const packedProject = selectAttentionProjectKernel(withF16, "f32", "f16", "f16");
+    expect(packedProject.shader.includes("pack2x16float")).toBe(true);
+    expect(packedProject.shader.includes("unpack2x16float")).toBe(true);
+    expect(selectAttentionProjectKernel(withF16, "f32").shader.includes("2x16float")).toBe(false);
+    const packedOutput = selectAttentionOutputKernel(withF16, false, "f32", "f16");
+    expect(packedOutput.shader.includes("unpack2x16float")).toBe(true);
+    expect(selectAttentionOutputKernel(withF16, false, "f32").shader.includes("2x16float"))
+      .toBe(false);
+    expect(packed.shader.includes("fn load4")).toBe(true);
+    expect(packed.shader.includes("fn store4")).toBe(true);
+    expect(plain.shader.includes("2x16float")).toBe(false);
     expect(() => selectAttentionOutputKernel(withoutF16, false, "f16")).toThrow();
     expect(() => chooseLinearKernel({ rows: 30208, columns: 1024, device: withoutF16,
                                       requested: "f16" })).toThrow();

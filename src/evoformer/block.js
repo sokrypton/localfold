@@ -302,10 +302,22 @@ async function encodeAttention(
   // buildAttentionFlashKernel: a device can carry both subgroup features and
   // still reject `@subgroup_size(32)`, and inside a Promise.all that rejection
   // is just a failed fold.
+  // 🔴 THE STORAGE IS THE FLASH KERNEL'S TO REFUSE, AND IT IS ASKED FIRST.
+  // Only the register-resident kernel reads the projected tensors packed - it
+  // already reads them four floats at a time, and four halves are two words at
+  // the same index. Every other variant is f32, and a caller that allocated
+  // packed anyway would hand it four bindings of the right byte length holding
+  // twice the values they should. So this is awaited BEFORE anything is
+  // allocated, and what comes back decides, not what was asked for.
   const built = await buildAttentionFlashKernel(
-    execution, execution.device, options.channels / options.heads);
+    execution, execution.device, options.channels / options.heads, undefined, undefined,
+    { input: "f16", output: "f16" });
   const flashKernel = built.kernel;
   const flash = built.pipeline;
+  // A packed pair is two adjacent channels of one row, so a row has to hold a
+  // whole number of them. Every attention here projects to 256 or 128.
+  const projectedStorage = flashKernel.packedStorageSupported === true
+    && options.channels % 2 === 0 ? "f16" : "f32";
   // 🔴 THE PROJECTION'S TILE TRAVELS WITH ITS SHADER, because the dispatch
   // below divides by it and the two shapes differ by precision - see
   // selectAttentionProjectKernel.
@@ -318,10 +330,10 @@ async function encodeAttention(
   const normalizedStorage = "f16";
   const pairBiasStorage = options.pairBias?.source === "separate" ? "f32" : normalizedStorage;
   const projectKernel = selectAttentionProjectKernel(
-    execution.device, options.projectPrecision ?? "auto", normalizedStorage);
+    execution.device, options.projectPrecision ?? "auto", normalizedStorage, projectedStorage);
   const outputKernel = selectAttentionOutputKernel(
     execution.device, options.residualTarget !== undefined,
-    options.outputPrecision ?? "auto");
+    options.outputPrecision ?? "auto", projectedStorage);
   const [normalize, packedNormalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get(`block:attention:normalize:${normalizedStorage}`,
@@ -343,11 +355,13 @@ async function encodeAttention(
   ));
   const normalized = execution.allocate(
     `${options.label}.normalized`, elements, GPUBufferUsage.STORAGE, normalizedStorage);
-  const query = execution.allocate(`${options.label}.query`, elements);
-  const key = execution.allocate(`${options.label}.key`, elements);
-  const value = execution.allocate(`${options.label}.value`, elements);
-  const gate = execution.allocate(`${options.label}.gate`, elements);
-  const weighted = execution.allocate(`${options.label}.weighted`, elements);
+  const projected = (name) => execution.allocate(
+    `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage);
+  const query = projected("query");
+  const key = projected("key");
+  const value = projected("value");
+  const gate = projected("gate");
+  const weighted = projected("weighted");
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   const attentionNormGrid = execution.rowGrid(rows);
   execution.dispatch(encoder, packedNormalize, [options.source, weights, normParams, normalized],

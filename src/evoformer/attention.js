@@ -237,7 +237,7 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  */
 export function createAttentionProjectShader(
   tile = ATTENTION_PROJECT_TILE, precision = "f32", weightPrecision = "f32",
-  sourceStorage = "f32",
+  sourceStorage = "f32", outputStorage = "f32",
 ) {
   // 🔴 THE WEIGHT BUFFER'S ELEMENT, MEASURED AND NOT SHIPPED. This kernel
   // rereads the whole weight set once per row tile - 944 of them at 512 MSA
@@ -267,6 +267,12 @@ export function createAttentionProjectShader(
   const narrow = (e) => (half ? `f16(${e})` : e);
   const widen = (e) => (half ? `f32(${e})` : e);
   if (rowsPerLane % 4 !== 0) throw new RangeError("project tile rowsPerLane must be a multiple of 4");
+  const packOut = outputStorage === "f16";
+  if (packOut && tile.columnsPerLane % 2 !== 0) {
+    // A lane has to hold both halves of a word, and a half is one of its
+    // accumulators - so it needs an even number of them to pair up.
+    throw new RangeError("a packed projection needs an even columnsPerLane");
+  }
   const lanes = lanesX * lanesY;
   const step = lanesY;
   const tileRows = lanesY * rowsPerLane;
@@ -281,9 +287,18 @@ export function createAttentionProjectShader(
       declare.push(`  var acc_${r}_${v} = ${vector}(0.0, 0.0, 0.0, ${narrow(`bias_${v}`)});`);
     }
   }
+  // 🔴 THE COLUMN A LANE OWNS DEPENDS ON THE STORAGE. In f32 a lane takes
+  // columns strided by lanesX, which keeps each store instruction a
+  // consecutive run across the workgroup. Two halves of a packed word are
+  // ADJACENT columns, so under packing a lane takes PAIRS of them: it writes
+  // one word where it wrote two floats, and the run across the workgroup is
+  // the same length in words that it was in floats.
+  const columnExpr = packOut
+    ? (v) => `pair_origin * 2u + ${Math.floor(v / 2) * lanesX * 2}u + ${v % 2}u`
+    : (v) => `column_origin + ${v * lanesX}u`;
   const bias = [];
   for (let v = 0; v < columnsPerLane; v += 1) {
-    bias.push(`  let hd_${v} = column_origin + ${v * lanesX}u;
+    bias.push(`  let hd_${v} = ${columnExpr(v)};
   var bias_${v} = 0.0;
   if (hd_${v} < projected) { bias_${v} = ${wf(`weights[p.gating_bias + hd_${v}]`)}; }`);
   }
@@ -328,7 +343,7 @@ export function createAttentionProjectShader(
   for (let v = 0; v < columnsPerLane; v += 1) {
     stageWeight.push(`    {
       var packed = ${vector}(0.0);
-      let output_hd = column_origin + ${v * lanesX}u;
+      let output_hd = hd_${v};
       if (output_hd < projected && weight_c < p.channels) {
         let weight_index = weight_c * projected + output_hd;
         packed = ${vector}(${narrow(wf("weights[p.query_weight + weight_index]"))},
@@ -340,17 +355,35 @@ export function createAttentionProjectShader(
     }`);
   }
 
+  const q = (r, v) => `${widen(`acc_${r}_${v}.x`)} * inverseSqrt(f32(p.head_dim))`;
+  const k = (r, v) => widen(`acc_${r}_${v}.y`);
+  const val = (r, v) => widen(`acc_${r}_${v}.z`);
+  const g = (r, v) => `1.0 / (1.0 + exp(-${widen(`acc_${r}_${v}.w`)}))`;
   const store = [];
   for (let r = 0; r < rowsPerLane; r += 1) {
     const body = [];
-    for (let v = 0; v < columnsPerLane; v += 1) {
-      body.push(`    if (hd_${v} < projected) {
-      let index = row_${r} * projected + hd_${v};
-      query[index] = ${widen(`acc_${r}_${v}.x`)} * inverseSqrt(f32(p.head_dim));
-      key[index] = ${widen(`acc_${r}_${v}.y`)};
-      value[index] = ${widen(`acc_${r}_${v}.z`)};
-      gate[index] = 1.0 / (1.0 + exp(-${widen(`acc_${r}_${v}.w`)}));
+    if (packOut) {
+      for (let v = 0; v < columnsPerLane; v += 2) {
+        // One word per output, holding this lane's two adjacent columns.
+        const word = `row_${r} * (projected / 2u) + (hd_${v} / 2u)`;
+        body.push(`    if (hd_${v + 1} < projected) {
+      let word = ${word};
+      query[word] = pack2x16float(vec2<f32>(${q(r, v)}, ${q(r, v + 1)}));
+      key[word] = pack2x16float(vec2<f32>(${k(r, v)}, ${k(r, v + 1)}));
+      value[word] = pack2x16float(vec2<f32>(${val(r, v)}, ${val(r, v + 1)}));
+      gate[word] = pack2x16float(vec2<f32>(${g(r, v)}, ${g(r, v + 1)}));
     }`);
+      }
+    } else {
+      for (let v = 0; v < columnsPerLane; v += 1) {
+        body.push(`    if (hd_${v} < projected) {
+      let index = row_${r} * projected + hd_${v};
+      query[index] = ${q(r, v)};
+      key[index] = ${k(r, v)};
+      value[index] = ${val(r, v)};
+      gate[index] = ${g(r, v)};
+    }`);
+      }
     }
     store.push(`  {
     let row_${r} = group.y * ${tileRows}u + local.y * ${rowsPerLane}u + ${r}u;
@@ -364,10 +397,10 @@ ${body.join("\n")}
 @group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> query: array<f32>;
-@group(0) @binding(4) var<storage, read_write> key: array<f32>;
-@group(0) @binding(5) var<storage, read_write> value: array<f32>;
-@group(0) @binding(6) var<storage, read_write> gate: array<f32>;
+@group(0) @binding(3) var<storage, read_write> query: array<${storageArray(outputStorage)}>;
+@group(0) @binding(4) var<storage, read_write> key: array<${storageArray(outputStorage)}>;
+@group(0) @binding(5) var<storage, read_write> value: array<${storageArray(outputStorage)}>;
+@group(0) @binding(6) var<storage, read_write> gate: array<${storageArray(outputStorage)}>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
 var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
@@ -382,7 +415,9 @@ fn main(
   let projected = p.heads * p.head_dim;
   let rows = p.batch * p.queries;
   let linear_lane = local.y * ${lanesX}u + local.x;
-  let column_origin = group.x * ${lanesX * columnsPerLane}u + local.x;
+${packOut
+  ? `  let pair_origin = group.x * ${lanesX * (columnsPerLane / 2)}u + local.x;`
+  : `  let column_origin = group.x * ${lanesX * columnsPerLane}u + local.x;`}
 ${bias.join("\n")}
 ${declare.join("\n")}
 
@@ -440,7 +475,9 @@ export const ATTENTION_PROJECT_TILE_F16 = {
  * @param {"auto"|"f32"|"f16"} requested `auto` takes f16 wherever the device
  *   has shader-f16, which is where the wider tile is affordable.
  */
-export function selectAttentionProjectKernel(device, requested = "auto", sourceStorage = "f32") {
+export function selectAttentionProjectKernel(
+  device, requested = "auto", sourceStorage = "f32", outputStorage = "f32",
+) {
   const precision = requested !== "auto" ? requested
     : device?.features?.has("shader-f16") ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
@@ -452,10 +489,10 @@ export function selectAttentionProjectKernel(device, requested = "auto", sourceS
     // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
     // divides by it: a cache that handed back the other one would leave whole
     // tiles of rows unprojected, which reads as a speedup.
-    cacheKey: `block:attention:project:${precision}:${sourceStorage}`
+    cacheKey: `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
       + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`,
-    shader: precision === "f16" || sourceStorage !== "f32"
-      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage)
+    shader: precision === "f16" || sourceStorage !== "f32" || outputStorage !== "f32"
+      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage, outputStorage)
       : ATTENTION_PROJECT_SHADER,
   };
 }
@@ -677,6 +714,28 @@ fn main(
  */
 export function createAttentionRegisterFlashShader(headDim, keyChunk, options = {}) {
   const vectors = headDim / 4;
+  // 🔴 THE PROJECTED TENSORS MAY BE PACKED, AND THE INDEXING DOES NOT MOVE.
+  // This kernel already reads them four floats at a time as `vec4<f32>`; four
+  // halves are two words, so `vec2<u32>` covers exactly the same elements at
+  // exactly the same index. Only the element type and a widen on the way in
+  // change - the staged chunks, the softmax and the accumulators are untouched.
+  const packIn = options.inputStorage === "f16";
+  const packOut = options.outputStorage === "f16";
+  const vec4In = packIn ? "vec2<u32>" : "vec4<f32>";
+  const vec4Out = packOut ? "vec2<u32>" : "vec4<f32>";
+  const read4 = (array, index) => (packIn ? `load4(${array}[${index}])` : `${array}[${index}]`);
+  const write4 = (array, index, expr) => (packOut
+    ? `${array}[${index}] = store4(${expr});`
+    : `${array}[${index}] = ${expr};`);
+  const helpers = `${packIn ? `
+fn load4(w: vec2<u32>) -> vec4<f32> {
+  let lo = unpack2x16float(w.x);
+  let hi = unpack2x16float(w.y);
+  return vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+}` : ""}${packOut ? `
+fn store4(v: vec4<f32>) -> vec2<u32> {
+  return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}` : ""}`;
   // How many keys share one rescale of the accumulator, and whether the q.k
   // reduction runs through a vec4. Both default to what this kernel always did.
   const group = options.group ?? 1;
@@ -825,7 +884,7 @@ export function createAttentionRegisterFlashShader(headDim, keyChunk, options = 
     `  let ${queryIndex(q)} = group.x * ${64 * queriesPerLane}u + local + ${q * 64}u;`,
     `  let live${q} = ${queryIndex(q)} < p.queries;`,
     `  let base${q} = ((batch_index * p.queries + select(0u, ${queryIndex(q)}, live${q})) * p.heads + head) * HD4;`,
-    Array.from({ length: vectors }, (_, t) => `  var qv${q}_${t} = ${registerType}(query[base${q} + ${t}u]);`).join("\n"),
+    Array.from({ length: vectors }, (_, t) => `  var qv${q}_${t} = ${registerType}(${read4("query", `base${q} + ${t}u`)});`).join("\n"),
     Array.from({ length: vectors }, (_, t) => `  var acc${q}_${t} = ${registerType}(0.0);`).join("\n"),
     `  var running_max${q} = -1e30;`,
     `  var running_sum${q} = 0.0;`,
@@ -866,18 +925,19 @@ export function createAttentionRegisterFlashShader(headDim, keyChunk, options = 
     return `${enable}${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
-@group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
+@group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
+@group(0) @binding(2) var<storage, read> value: array<${vec4In}>;
+@group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
 @group(0) @binding(6) var<uniform> p: Parameters;
-@group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> output: array<${vec4Out}>;
 
 var<workgroup> key_chunk: array<${chunkType}, ${chunk * vectors}>;
 var<workgroup> value_chunk: array<${chunkType}, ${chunk * vectors}>;
 
+${helpers}
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
   return key_index * p.batch + batch;
@@ -897,8 +957,8 @@ ${multiDeclare}
     for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
       let k_index = min(k0 + index / HD4, p.queries - 1u);
       let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
-      key_chunk[index] = ${chunkType}(key[k_base]);
-      value_chunk[index] = ${chunkType}(value[k_base]);
+      key_chunk[index] = ${chunkType}(${read4("key", "k_base")});
+      value_chunk[index] = ${chunkType}(${read4("value", "k_base")});
     }
     workgroupBarrier();
 ${multiInner}
@@ -906,7 +966,8 @@ ${multiInner}
 
 ${perQuery((q) => `  if (live${q}) {
 ${Array.from({ length: vectors }, (_, t) =>
-  `    output[base${q} + ${t}u] = (vec4<f32>(acc${q}_${t}) / running_sum${q}) * gate[base${q} + ${t}u];`).join("\n")}
+  `    ${write4("output", `base${q} + ${t}u`,
+    `(vec4<f32>(acc${q}_${t}) / running_sum${q}) * ${read4("gate", `base${q} + ${t}u`)}`)}`).join("\n")}
   }`)}
 }`;
   }
@@ -938,18 +999,19 @@ ${Array.from({ length: vectors }, (_, t) =>
   return `${enable}${COMMON}
 const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
-@group(0) @binding(0) var<storage, read> query: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> key: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> value: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> gate: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
+@group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
+@group(0) @binding(2) var<storage, read> value: array<${vec4In}>;
+@group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
 @group(0) @binding(6) var<uniform> p: Parameters;
-@group(0) @binding(7) var<storage, read_write> output: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> output: array<${vec4Out}>;
 
 var<workgroup> key_chunk: array<${chunkType}, ${chunk * vectors}>;
 var<workgroup> value_chunk: array<${chunkType}, ${chunk * vectors}>;
 
+${helpers}
 fn mask_index(batch: u32, key_index: u32) -> u32 {
   if (p.transpose == 0u) { return batch * p.queries + key_index; }
   return key_index * p.batch + batch;
@@ -970,7 +1032,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let live = q_index < p.queries;
   let q_base = ((batch_index * p.queries + select(0u, q_index, live)) * p.heads + head) * HD4;
 
-${declare("qv", (t) => `${registerType}(query[q_base + ${t}u])`)}
+${declare("qv", (t) => `${registerType}(${read4("query", `q_base + ${t}u`)})`)}
 ${declare("acc", () => `${registerType}(0.0)`)}
   var running_max = -1e30;
   var running_sum = 0.0;
@@ -981,8 +1043,8 @@ ${declare("acc", () => `${registerType}(0.0)`)}
     for (var index = local; index < KEY_CHUNK * HD4; index += 64u) {
       let k_index = min(k0 + index / HD4, p.queries - 1u);
       let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
-      key_chunk[index] = ${chunkType}(key[k_base]);
-      value_chunk[index] = ${chunkType}(value[k_base]);
+      key_chunk[index] = ${chunkType}(${read4("key", "k_base")});
+      value_chunk[index] = ${chunkType}(${read4("value", "k_base")});
     }
     workgroupBarrier();
 
@@ -990,7 +1052,8 @@ ${inner}
   }
 
   if (live) {
-${each((t) => `output[q_base + ${t}u] = (vec4<f32>(acc${t}) / running_sum) * gate[q_base + ${t}u];`)}
+${each((t) => write4("output", `q_base + ${t}u`,
+  `(vec4<f32>(acc${t}) / running_sum) * ${read4("gate", `q_base + ${t}u`)}`))}
   }
 }`;
 }
@@ -1325,14 +1388,17 @@ export function supportsAttentionSubgroup64x64(device, headDim = 32) {
  * @param {{pipelines: {get: (key: string, code: string) => Promise<GPUComputePipeline>}}} execution
  */
 export async function buildAttentionFlashKernel(
-  execution, device, headDim, requested = "auto", precision = "auto",
+  execution, device, headDim, requested = "auto", precision = "auto", storage = {},
 ) {
-  const kernel = selectAttentionFlashKernel(device, headDim, requested, precision);
+  const kernel = selectAttentionFlashKernel(device, headDim, requested, precision, storage);
   try {
     return { kernel, pipeline: await execution.pipelines.get(`block:${kernel.cacheKey}`, kernel.shader) };
   } catch (error) {
     // Only a subgroup kernel has a fallback; anything else failing is real.
     if (!kernel.variant.startsWith("subgroup")) throw error;
+    // ...and f32 storage with it: the fallback cannot read packed tensors, and
+    // the caller reads `packedStorageSupported` off what comes back rather than
+    // off what it asked for, so this is the whole of the retreat.
     const portable = selectAttentionFlashKernel(device, headDim, "portable");
     if (portable.cacheKey === kernel.cacheKey) throw error;
     return {
@@ -1342,11 +1408,20 @@ export async function buildAttentionFlashKernel(
   }
 }
 
+/**
+ * @param {{input?: "f32"|"f16", output?: "f32"|"f16"}} [storage] how the
+ *   projected tensors and the attended result are stored. Only the
+ *   register-resident kernel reads them packed; every other variant is f32,
+ *   and `packedStorageSupported` on the result is how the caller finds out
+ *   BEFORE it allocates - a mismatch would be four bindings of the right size
+ *   holding twice the values they should.
+ */
 export function selectAttentionFlashKernel(
   device,
   headDim = 32,
   requested = "auto",
   requestedPrecision = "auto",
+  storage = {},
 ) {
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
@@ -1383,7 +1458,7 @@ export function selectAttentionFlashKernel(
   if (variant === "subgroup-key32") {
     return {
       cacheKey: "attention:flash-subgroup-key32", shader: ATTENTION_SUBGROUP_KEY32_SHADER,
-      queryTile: 8, variant,
+      queryTile: 8, variant, packedStorageSupported: false,
     };
   }
   const tiled = variant === "subgroup-8x16"
@@ -1402,13 +1477,13 @@ export function selectAttentionFlashKernel(
   if (tiled !== undefined) {
     return {
       cacheKey: `attention:flash-${variant}`, shader: tiled.shader,
-      queryTile: tiled.queryTile, variant,
+      queryTile: tiled.queryTile, variant, packedStorageSupported: false,
     };
   }
   if (variant === "subgroup-4x8") {
     return {
       cacheKey: "attention:flash-subgroup4x8", shader: ATTENTION_SUBGROUP_FLASH_SHADER,
-      queryTile: 4, variant,
+      queryTile: 4, variant, packedStorageSupported: false,
     };
   }
   // ...THE DEFAULT IS THE REGISTER-RESIDENT KERNEL, whenever the head divides
@@ -1442,13 +1517,23 @@ export function selectAttentionFlashKernel(
     // measurement.
     const precision = requestedPrecision !== "auto" ? requestedPrecision
       : device.features?.has("shader-f16") ? "chunk16" : "f32";
+    const inputStorage = storage.input ?? "f32";
+    const outputStorage = storage.output ?? "f32";
     return {
-      cacheKey: `attention:flash-registers-${headDim}-${precision}`,
-      shader: createAttentionRegisterFlashShader(headDim, undefined, { precision }),
-      queryTile: 64, variant,
+      // The suffix appears only when something is packed, so the key a device
+      // without this path gets is the one it has always had.
+      cacheKey: `attention:flash-registers-${headDim}-${precision}`
+        + (inputStorage === "f32" && outputStorage === "f32"
+          ? "" : `-storage${inputStorage}${outputStorage}`),
+      shader: createAttentionRegisterFlashShader(
+        headDim, undefined, { precision, inputStorage, outputStorage }),
+      queryTile: 64, variant, packedStorageSupported: true,
     };
   }
-  return { cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant };
+  return {
+    cacheKey: "attention:flash", shader: ATTENTION_FLASH_SHADER, queryTile: 1, variant,
+    packedStorageSupported: false,
+  };
 }
 
 /**
@@ -1487,6 +1572,7 @@ export const attentionOutputTileColumns = (tile = ATTENTION_OUTPUT_TILE) =>
  */
 export function createAttentionOutputShader(
   tile = ATTENTION_OUTPUT_TILE, residual = false, precision = "f32",
+  sourceStorage = "f32",
 ) {
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
   // Same trade as the transition's linear kernel, which this kernel is a
@@ -1544,7 +1630,7 @@ export function createAttentionOutputShader(
       if (k < projected) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < rows) { staged[j] = ${narrow("source[row * projected + k]")}; }
+          if (row < rows) { staged[j] = ${narrow(storedElement(sourceStorage, "source", "row * projected + k"))}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -1595,7 +1681,7 @@ ${body.join("\n")}
   }
 
   return `${half ? "enable f16;\n" : ""}${COMMON}
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -1652,7 +1738,9 @@ export const ATTENTION_OUTPUT_TILE_F16 = {
   lanesX: 8, lanesY: 8, rowsPerLane: 4, columnsPerLane: 4,
 };
 
-export function selectAttentionOutputKernel(device, residual, requested = "auto") {
+export function selectAttentionOutputKernel(
+  device, residual, requested = "auto", sourceStorage = "f32",
+) {
   const precision = requested !== "auto" ? requested
     : device?.features?.has("shader-f16") ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
@@ -1662,10 +1750,10 @@ export function selectAttentionOutputKernel(device, residual, requested = "auto"
   return {
     precision, tile,
     // The tile is in the key with the precision: the dispatch divides by it.
-    cacheKey: `block:attention:output${residual ? "-residual" : ""}:${precision}`
+    cacheKey: `block:attention:output${residual ? "-residual" : ""}:${precision}:${sourceStorage}`
       + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`,
-    shader: precision === "f16"
-      ? createAttentionOutputShader(tile, residual, "f16")
+    shader: precision === "f16" || sourceStorage !== "f32"
+      ? createAttentionOutputShader(tile, residual, precision, sourceStorage)
       : (residual ? ATTENTION_OUTPUT_RESIDUAL_SHADER : ATTENTION_OUTPUT_SHADER),
   };
 }
