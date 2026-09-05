@@ -103,7 +103,7 @@ def evaluate(ws, expr, await_promise=True):
     return r["result"].get("value")
 
 
-def wait_for(ws, expr, timeout=45, what=""):
+def wait_for(ws, expr, timeout=45, what="", progress=None):
     """Poll until an expression is truthy.
 
     🔴 A FIXED SLEEP IS NOT A WAIT. `time.sleep(3.5)` after a navigate passed
@@ -111,15 +111,35 @@ def wait_for(ws, expr, timeout=45, what=""):
     a dozen browsers at once and the page had not finished its 34 scripts:
     `window.processFiles is not a function`. A probe that only passes when the
     machine is idle is worse than no probe.
+
+    🔴 AND A TIMEOUT THAT NAMES NO STAGE COSTS THE WHOLE WAIT AGAIN. A 25-minute
+    fold that ends in "timed out waiting for the fold to finish" says nothing
+    about whether it was the alignment server, the template download or the
+    sampler - so the only way to find out is to run it again with a print in a
+    different place. `progress` is an expression polled alongside the condition
+    (the page's own status line, normally) and printed WHENEVER IT CHANGES, so a
+    long wait narrates itself and a timeout ends with the last stage it reached.
     """
     end = time.time() + timeout
     last = None
+    seen = None
+    next_progress = 0.0
     while time.time() < end:
         try:
             if evaluate(ws, expr, False):
                 return True
         except Exception as e:
             last = e
+        if progress is not None and time.time() >= next_progress:
+            next_progress = time.time() + 2
+            try:
+                now = evaluate(ws, progress, False)
+            except Exception:
+                now = None
+            if now and now != seen:
+                seen = now
+                print("  ...%s" % now, flush=True)
         time.sleep(0.25)
-    raise RuntimeError("timed out waiting for %s%s"
-                       % (what or expr, (" (last: %s)" % last) if last else ""))
+    raise RuntimeError("timed out waiting for %s%s%s"
+                       % (what or expr, (" (last stage: %s)" % seen) if seen else "",
+                          (" (last: %s)" % last) if last else ""))

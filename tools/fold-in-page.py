@@ -82,6 +82,11 @@ def serve(local_weights=True):
     return httpd
 
 
+# The page's own status line, polled by `cdp.wait_for` so a long fold narrates
+# itself rather than ending in a timeout that names no stage.
+STATUS_LINE = "(document.getElementById('status-message')||{}).textContent"
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence", default=DEFAULT)
@@ -198,7 +203,8 @@ def main():
           const text = s ? s.textContent : '';
           return /done|complete|finished|s\\b/i.test(text)
             && document.getElementById('downloads').style.display !== 'none';
-        })()""", timeout=args.timeout, what="the fold to finish")
+        })()""", timeout=args.timeout, what="the fold to finish",
+                     progress=STATUS_LINE)
         time.sleep(1.5)
 
         print("frames:", cdp.evaluate(ws, """(() => {
@@ -345,7 +351,8 @@ def main():
               const s = document.getElementById('status-message');
               return /done|complete|finished|s\\b/i.test(s ? s.textContent : '')
                 && document.getElementById('predict').disabled === false;
-            })()""", timeout=args.timeout, what="the second fold to finish")
+            })()""", timeout=args.timeout, what="the second fold to finish",
+                     progress=STATUS_LINE)
             time.sleep(1.5)
             second = cdp.evaluate(ws, """(() => {
               const reg = window.py2dmol_viewers || {};
