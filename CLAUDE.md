@@ -545,6 +545,53 @@ kernel read packed, and the fold came back **NaN**. The unit test written to
 catch the second passed, because it compared cache KEYS and they already
 differed on the source storage: assert on the generated WGSL.
 
+🔴 **AN AF3 FOLD'S PEAK IS IN THE CONFIDENCE HEAD, NOT THE TRUNK OR THE
+DIFFUSION.** It runs four more pairformer blocks after the sampler, so it
+allocates the whole pair scratch again while the diffusion transformer's 378 MiB
+of resident weights are still held and unreadable by anything.
+`releaseResidentWeights(device, prefix)` gives a stage's residency back when the
+stage is over - `"w."` after the trunk, `"difftx."` after the sampler - and took
+a 272-token fold from **1214 to 671 MiB, 45%, for no time at all** and about half
+a second on a REPEAT fold, which is the re-packing. Mean pLDDT identical to every
+digit. Do this before reaching for kernels.
+
+🔴 **AND AF3's PACKED ACTIVATIONS COST TIME WHERE AF2's DID NOT.** Five of the
+seven pair scratch buffers are packed: at 408 tokens **1086.5 -> 896.1 MiB,
+17.5%, for no measurable time**; at 272 the peak does not move AT ALL - it is
+the diffusion's there - and it costs about 1.4%. The difference from AF2 is what
+reads the tensor: AF2's flash kernel re-reads its key and value once per query
+tile, so halving the bytes paid for the unpacking twice over; nothing in AF3's
+pair track reads these more than once. **It is a trade taken for LENGTH.**
+
+🔴 **AND WHO OWNS A WORD IS A DIFFERENT ANSWER IN EVERY KERNEL.** The layer
+norms own whole rows and only had to walk words. `grid.project` gave a lane ONE
+output channel, so it had to take a PAIR - twice the accumulators - and its row
+tile had to fall from 8 to 4: bench-grid-project.js's `p` arms put packed at
+8.21 ms against 8.16 at rows 4, **11.01 against 7.54 at 8, and 42.64 against
+10.14 at 16**, which is the same register spill AF2's projection sweep records.
+The triangle's a and b pair by CHANNEL instead, because they are channel-major
+and `h * PAIRS + row` is odd at odd h when n is odd - n = 59 and n = 68 are the
+two sizes checked here, one of each, so half the suite would have passed.
+`scratch[3]` is still f32: it is the contraction's output, where `h` is group.z
+and one workgroup owns one channel.
+
+🔴 **AND A SUBSTITUTION ACROSS GENERATED SHADERS FAILS SILENTLY IN BOTH
+DIRECTIONS.** Two of them in one file in one afternoon: one matched NOTHING,
+because the indentation differed, and left a bias loop on the old column
+mapping; one matched TWICE, because `tile_weight[k * TILE_COLUMNS + local.x +
+column * 8u]` is in projectAB and in projectOutput, and broke the kernel that
+was not being changed. `a` was right, the contraction was right, and the fold
+came out at relRMS 1.42.
+
+🔴 **AND A DIFFERENTIAL THAT TESTS TWO KERNELS CANNOT FIND A BUG IN THE FIFTH.**
+tools/gpu/check-triangle-packed.js was wrong twice before it was right: first it
+unpacked with the generic `i >> 1` layout while the kernel pairs by channel -
+a permutation, reported as relRMS 1.39 against a correct kernel - and then,
+corrected, it declared both kernels sound while the fold stayed broken, because
+it ran a configuration nothing runs. Run the WHOLE update, and sweep the axes
+the caller varies (`direction`, `accumulatePrecision`), or it is a check of
+something else.
+
 🔴 **AND `memorySnapshot`'s `byLabel` IS CUMULATIVE, WHICH IS THE WRONG
 QUESTION.** It sums every allocation a label ever made, so a scratch tensor
 taken and returned once a block reads as forty-eight times its size - that is
