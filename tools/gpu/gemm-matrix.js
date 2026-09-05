@@ -54,6 +54,26 @@
  */
 
 /**
+ * Whether a geometry can serve a shape at all.
+ *
+ * 🔴 A REGION LARGER THAN THE TENSOR CANNOT SLIDE BACK, and the failure is
+ * silent. `row_origin` is `min(group.y * R, rows - R)` in u32, so a tensor with
+ * fewer than R rows underflows it to something enormous, every load lands out
+ * of bounds, and - see the note below - an out-of-bounds matrix load yields
+ * zeros rather than an error. The 64x128 geometry at 59 rows reads relRMS
+ * 0.153 that way. A caller asks this first; there is no in-shader guard,
+ * because WGSL has nothing to raise.
+ *
+ * @param {{rows: number, columns: number}} shape
+ * @param {{blocks?: number, columnBlocks?: number}} [geometry]
+ */
+export function matrixLinearFits(shape, geometry = {}) {
+  const blocks = geometry.blocks ?? 4;
+  const columnBlocks = geometry.columnBlocks ?? blocks;
+  return shape.rows >= blocks * 8 && shape.columns >= columnBlocks * 8;
+}
+
+/**
  * @param {object} [options]
  * @param {number} [options.blocks] 8x8 tiles per side, so the region is
  *   `blocks * 8` square. 4 is upstream's `matrix-bounded-f32`.
@@ -61,6 +81,12 @@
  *   square. Defaults to `blocks`, and `blocks=8, columnBlocks=16` is the
  *   shipped 64x128 geometry, which is what a caller needs if it wants the
  *   existing dispatch grid.
+ * @param {number} [options.subBlocks] how many of those tiles one subgroup holds
+ *   as ACCUMULATORS at a time, down and across. Defaults to the whole region,
+ *   which is the straight-line form. A region larger than the accumulators is
+ *   walked in sub-regions: see the note on the register budget below.
+ * @param {number} [options.subColumnBlocks] the same, across. Defaults to
+ *   `subBlocks`.
  * @param {"f32"|"f16"} [options.element] what the units multiply in. A device
  *   reports its configs through adapter.info.subgroupMatrixConfigs; this M2
  *   offers f32/f32 and f16/f16 at 8x8x8, and the f16 one ACCUMULATES in f16,
@@ -69,10 +95,25 @@
 export function createMatrixLinearShader(options = {}) {
   const blocks = options.blocks ?? 4;
   const columnBlocks = options.columnBlocks ?? blocks;
+  const subBlocks = options.subBlocks ?? blocks;
+  const subColumnBlocks = options.subColumnBlocks ?? subBlocks;
   const element = options.element ?? "f32";
   if (!Number.isInteger(blocks) || blocks < 1) throw new RangeError("blocks must be a positive integer");
   if (!Number.isInteger(columnBlocks) || columnBlocks < 1) {
     throw new RangeError("columnBlocks must be a positive integer");
+  }
+  // 🔴 THE ACCUMULATORS ARE THE BUDGET, AND A REGION IS NOT OBLIGED TO BE ONE
+  // SET OF THEM. A 32x32 region is sixteen 8x8 accumulators - 1024 floats a
+  // subgroup, 32 a lane - and that is roughly what fits. The shipped 64x128
+  // geometry is 128 of them, 8192 floats a subgroup, and holding all of it
+  // spills catastrophically: measured at 122-172 GFLOP/s against 1082-1466 for
+  // the 32x32 region, which is the same 4x-the-wrong-way grid.project's row
+  // tile records at 16. So a region wider than the accumulators is WALKED -
+  // `subBlocks` by `subColumnBlocks` at a time, each sub-region running its own
+  // K loop - which keeps the register budget flat and the dispatch grid the
+  // caller's. It costs re-reading the left operand once per column sub-region.
+  if (blocks % subBlocks !== 0 || columnBlocks % subColumnBlocks !== 0) {
+    throw new RangeError("the sub-region must divide the region on both axes");
   }
   if (element !== "f32" && element !== "f16") throw new RangeError(`unknown element ${element}`);
   const rowsPerGroup = blocks * 8;
@@ -90,30 +131,50 @@ export function createMatrixLinearShader(options = {}) {
   // about what is written out.
   const result = element === "f16" ? "f16" : "f32";
 
+  const rowSteps = blocks / subBlocks;
+  const columnSteps = columnBlocks / subColumnBlocks;
+  const walked = rowSteps > 1 || columnSteps > 1;
+
+  // Offsets inside a sub-region are static; the sub-region's own origin is a
+  // loop counter when the region is walked, and a constant when it is not.
+  // Both are workgroup-uniform, which is what subgroupMatrixStore requires.
+  const rowOrigin = walked ? "sub_row" : "0u";
+  const columnOrigin = walked ? "sub_column" : "0u";
+
   const loads = [];
-  for (let m = 0; m < blocks; m += 1) {
+  for (let m = 0; m < subBlocks; m += 1) {
     loads.push(`      let left_${m} = subgroupMatrixLoad<subgroup_matrix_left<${element}, 8, 8>>(`
-      + `&source, row_base + ${m * 8}u * parameters.inner + k0, false, parameters.inner);`);
+      + `&source, row_base + (${rowOrigin} + ${m * 8}u) * parameters.inner + k0, false, parameters.inner);`);
   }
-  for (let n = 0; n < columnBlocks; n += 1) {
+  for (let n = 0; n < subColumnBlocks; n += 1) {
     loads.push(`      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${element}, 8, 8>>(`
-      + `&weights, k0 * parameters.columns + column_base + ${n * 8}u, false, parameters.columns);`);
+      + `&weights, k0 * parameters.columns + column_base + ${columnOrigin} + ${n * 8}u, false, parameters.columns);`);
   }
   const macs = [];
-  for (let m = 0; m < blocks; m += 1) {
-    for (let n = 0; n < columnBlocks; n += 1) {
-      macs.push(`      acc_${m}_${n} = subgroupMatrixMultiplyAccumulate(left_${m}, right_${n}, acc_${m}_${n});`);
-    }
-  }
   const declarations = [];
   const stores = [];
-  for (let m = 0; m < blocks; m += 1) {
-    for (let n = 0; n < columnBlocks; n += 1) {
-      declarations.push(`  var acc_${m}_${n} = subgroup_matrix_result<${result}, 8, 8>();`);
-      stores.push(`  subgroupMatrixStore(&staged, ${m * 8 * columnsPerGroup + n * 8}u,`
-        + ` acc_${m}_${n}, false, ${columnsPerGroup}u);`);
+  for (let m = 0; m < subBlocks; m += 1) {
+    for (let n = 0; n < subColumnBlocks; n += 1) {
+      macs.push(`      acc_${m}_${n} = subgroupMatrixMultiplyAccumulate(left_${m}, right_${n}, acc_${m}_${n});`);
+      declarations.push(`    var acc_${m}_${n} = subgroup_matrix_result<${result}, 8, 8>();`);
+      stores.push(`    subgroupMatrixStore(&staged, (${rowOrigin} + ${m * 8}u) * ${columnsPerGroup}u`
+        + ` + ${columnOrigin} + ${n * 8}u, acc_${m}_${n}, false, ${columnsPerGroup}u);`);
     }
   }
+
+  const inner = `${declarations.join("\n")}
+    for (var k0 = 0u; k0 < whole; k0 += 8u) {
+${loads.join("\n")}
+${macs.join("\n")}
+    }
+${stores.join("\n")}`;
+  const body = walked
+    ? `  for (var sub_row = 0u; sub_row < ${rowsPerGroup}u; sub_row += ${subBlocks * 8}u) {
+  for (var sub_column = 0u; sub_column < ${columnsPerGroup}u; sub_column += ${subColumnBlocks * 8}u) {
+${inner}
+  }
+  }`
+    : inner;
 
   return `${enables}
 struct MatmulParameters {
@@ -148,17 +209,12 @@ fn main(
   // subgroup-derived offset does not pass uniformity analysis.
   let row_base = row_origin * parameters.inner;
   let column_base = column_origin;
-${declarations.join("\n")}
   // The weights are bound as [weight | bias], so K runs to inner and the
   // bias sits past it. A tail k0 past inner would read the BIAS as if it
   // were a weight row, so the loop stops on a whole tile and the remainder is
   // handled below.
   let whole = parameters.inner - (parameters.inner % 8u);
-  for (var k0 = 0u; k0 < whole; k0 += 8u) {
-${loads.join("\n")}
-${macs.join("\n")}
-  }
-${stores.join("\n")}
+${body}
   workgroupBarrier();
   // The epilogue: bias, activation, bounds. It runs per invocation over the
   // staged region, which is the same shape as an ordinary kernel's tail and is

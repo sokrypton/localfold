@@ -17,6 +17,7 @@
  * a speedup.
  */
 import { createTriangleShaders } from "../../src/triangle/shaders.js";
+import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -159,6 +160,49 @@ export async function main(device, args) {
     });
   }
 
+  // 🔴 TIMED IN THIS PROCESS, for the reason bench-grid-project.js gives: a
+  // comparison drawn across two runs on this machine is inside its drift.
+  // project-ab is four projections of cZ x cH off one normalised pair
+  // representation, so the arithmetic is M = pairs, K = cZ, N = 4 * cH - and
+  // like the grid's, it is FUSED (two projections and their two sigmoid gates,
+  // one read of z), which a plain GEMM is not. This is the ceiling, not a
+  // replacement.
+  let matrixArm = null;
+  if (option(args, "matrix", "0") !== "0") {
+    const columns = 4 * cH;
+    if (!matrixLinearFits({ rows: pairs, columns })) {
+      matrixArm = { skipped: `a 32x32 region does not fit ${pairs}x${columns}` };
+    } else {
+      const matrixWeights = upload(random(cZ * columns + columns));
+      const matrixOut = allocate(pairs * columns);
+      const matrixParams = device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
+      new Uint32Array(matrixParams.getMappedRange()).set(
+        [pairs, cZ, columns, 0, cZ * columns, 0, 0, 0]);
+      matrixParams.unmap();
+      const pipeline = await device.createComputePipelineAsync({
+        layout: "auto",
+        compute: {
+          module: device.createShaderModule({ code: createMatrixLinearShader({ blocks: 4 }) }),
+          entryPoint: "main",
+        },
+      });
+      matrixArm = {
+        columns,
+        kernel: {
+          pipeline,
+          bindGroup: device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [z, matrixWeights, matrixParams, matrixOut].map(
+              (buffer, binding) => ({ binding, resource: { buffer } })),
+          }),
+          x: Math.ceil(columns / 32), y: Math.ceil(pairs / 32),
+        },
+        times: [],
+      };
+    }
+  }
+
   const time = async (kernel) => {
     const encoder = device.createCommandEncoder();
     for (let i = 0; i < iterations; i += 1) {
@@ -177,12 +221,14 @@ export async function main(device, args) {
   for (const arm of arms) {
     await time(arm.project); await time(arm.projectOut); await time(arm.contract);
   }
+  if (matrixArm?.kernel) await time(matrixArm.kernel);
   for (let round = 0; round < rounds; round += 1) {
     for (const arm of arms) {
       arm.times.project.push(await time(arm.project));
       arm.times.projectOut.push(await time(arm.projectOut));
       arm.times.contract.push(await time(arm.contract));
     }
+    if (matrixArm?.kernel) matrixArm.times.push(await time(matrixArm.kernel));
   }
 
   // 🔴 THE PROJECTION'S OWN OUTPUT HAS TO BE READ, AND READING project-out's
@@ -246,6 +292,14 @@ export async function main(device, args) {
       // is the buffer it writes, and project-out through `output`.
       projectRelRms: Number(projectRel[index].toExponential(2)),
       outputRelRms: Number(outputRel[index].toExponential(2)),
+      projectGflops: Number(((2 * pairs * cZ * 4 * cH)
+        / (median(arm.times.project) * 1e6)).toFixed(1)),
     })),
+    matrix: matrixArm === null ? null : (matrixArm.skipped ? matrixArm : {
+      columns: matrixArm.columns,
+      ms: Number(median(matrixArm.times).toFixed(3)),
+      gflops: Number(((2 * pairs * cZ * matrixArm.columns)
+        / (median(matrixArm.times) * 1e6)).toFixed(1)),
+    }),
   };
 }

@@ -31,6 +31,7 @@
  * unwritten shows up far larger; that is still what the column is for.
  */
 import { createGridAttentionShaders } from "../../src/af3/grid-attention-webgpu.js";
+import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -171,6 +172,51 @@ export async function main(device, args) {
     });
   }
 
+  // 🔴 THE MATRIX ARM IS TIMED IN THIS PROCESS OR IT IS NOT A COMPARISON. This
+  // repository's own note says a sweep taken across two processes drifts by
+  // tens of percent on this machine, and `grid.project` against a subgroup
+  // matrix GEMM read 4.14 ms and 4.70 ms in two of them - a 13% gap, which is
+  // inside that. It is the same arithmetic either way: M = pairs, K = channels,
+  // N = the four projections' combined width. What it is NOT is a drop-in -
+  // grid.project reads the normalised activation once and produces q, k, v and
+  // a SIGMOID-GATED fourth output, and a plain GEMM produces none of that
+  // fusion - so this measures the arithmetic's ceiling, not a replacement.
+  let matrixArm = null;
+  if (option(args, "matrix", "0") !== "0") {
+    const columns = 4 * width;
+    if (!matrixLinearFits({ rows: pairs, columns })) {
+      matrixArm = { skipped: `a 32x32 region does not fit ${pairs}x${columns}` };
+    } else {
+      const matrixWeights = upload(random(channels * columns + columns));
+      const matrixOut = allocate(pairs * columns);
+      const matrixParams = device.createBuffer({
+        size: 32, usage: GPUBufferUsage.UNIFORM, mappedAtCreation: true });
+      new Uint32Array(matrixParams.getMappedRange()).set(
+        [pairs, channels, columns, 0, channels * columns, 0, 0, 0]);
+      matrixParams.unmap();
+      const pipeline = await device.createComputePipelineAsync({
+        layout: "auto",
+        compute: {
+          module: device.createShaderModule({ code: createMatrixLinearShader({ blocks: 4 }) }),
+          entryPoint: "main",
+        },
+      });
+      matrixArm = {
+        columns,
+        kernel: {
+          pipeline,
+          bindGroup: device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [normalized, matrixWeights, matrixParams, matrixOut].map(
+              (buffer, binding) => ({ binding, resource: { buffer } })),
+          }),
+          groups: Math.ceil(columns / 32), y: Math.ceil(pairs / 32),
+        },
+        times: [],
+      };
+    }
+  }
+
   const time = async (kernel) => {
     const encoder = device.createCommandEncoder();
     for (let i = 0; i < iterations; i += 1) {
@@ -189,12 +235,14 @@ export async function main(device, args) {
   for (const arm of arms) {
     await time(arm.project); await time(arm.projectOut); await time(arm.attend);
   }
+  if (matrixArm?.kernel) await time(matrixArm.kernel);
   for (let round = 0; round < rounds; round += 1) {
     for (const arm of arms) {
       arm.times.project.push(await time(arm.project));
       arm.times.projectOut.push(await time(arm.projectOut));
       arm.times.attend.push(await time(arm.attend));
     }
+    if (matrixArm?.kernel) matrixArm.times.push(await time(matrixArm.kernel));
   }
 
   const results = [];
@@ -233,5 +281,16 @@ export async function main(device, args) {
       attend: Number(median(arm.times.attend).toFixed(3)),
       relRmsVsFirst: Number(relRms[index].toExponential(2)),
     })),
+    // The same arithmetic through the subgroup matrix units, timed in this
+    // process against the arms above. GFLOP/s so the two are comparable
+    // whatever the shape: 2 * pairs * channels * columns per pass.
+    matrix: matrixArm === null ? null : (matrixArm.skipped ? matrixArm : {
+      columns: matrixArm.columns,
+      ms: Number(median(matrixArm.times).toFixed(3)),
+      gflops: Number(((2 * pairs * channels * matrixArm.columns)
+        / (median(matrixArm.times) * 1e6)).toFixed(1)),
+    }),
+    projectGflops: arms.map((arm) => Number(((2 * pairs * channels * 4 * width)
+      / (median(arm.times.project) * 1e6)).toFixed(1))),
   };
 }

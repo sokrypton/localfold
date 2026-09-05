@@ -52,6 +52,7 @@ values means the whole-stack checker, not that file.
 | Does this device have matrix units, and in what shapes? | `tools/gpu/probe-subgroup-matrix.js` |
 | What do `subgroupMatrixLoad`/`Store` actually mean here? | `tools/gpu/check-subgroup-matrix.js` |
 | Are the matrix units worth it on a dense projection? | `tools/gpu/bench-evoformer-linear.js --arms=8x8@f16/f16,matrix4` |
+| ...and against AF3's own fused projections? | `bench-{grid,triangle}-project.js --tokens=200 --matrix=1` |
 | What does packing the attention key cost, and the value? | `tools/gpu/check-attention-packing.js --dense=f32` |
 | What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
@@ -1273,13 +1274,51 @@ whose product is known on the host and scores the seven interpretations a
 transpose could produce: plain row-major `A@B` at **relRMS 0**, everything else
 above 1.1. A bench run before that check would have been timing a transpose.
 
-🔴 **AND THE 64x128 GEOMETRY MEASURED HERE IS A REGISTER SPILL, NOT A RESULT.**
+🔴 **AND THE 64x128 GEOMETRY IS A REAL LOSS HERE, WHICH TOOK TWO GOES TO SAY.**
 Upstream reports the shipped-grid geometry at 1.28x-1.66x, worth about a fifth
-of the win, and the arm here reads **122-172 GFLOP/s against 1082-1466** for the
-32x32 one. The difference is the implementation: holding 8x16 accumulator tiles
-is 128 of them, 8192 floats a subgroup, and it spills - the same 4x-the-wrong-way
-`grid.project`'s row tile records at 16. Upstream's version walks sub-regions
-instead of holding them all. Do not quote that row as a fact about the hardware.
+of the win. The first arm written here read 122-172 GFLOP/s against 1082-1466
+for the 32x32 one, and that was an implementation fault, not a device fact:
+holding 8x16 accumulator tiles is 128 of them, 8192 floats a subgroup, and it
+spills - the same 4x-the-wrong-way `grid.project`'s row tile records at 16.
+`subBlocks`/`subColumnBlocks` walk the region a sub-region at a time instead, so
+the register budget is flat and the geometry is the caller's; `matrix8x16x4x4`
+is that arm, and it is exact (relRMS 0 at 64 and at 128 rows).
+
+It is still a loss, by a factor of four, and now the number means something:
+
+| shape | 32x32 | 64x64, walked 4x4 | 64x128, walked 4x4 | 64x128, walked 8x8 |
+|---|---:|---:|---:|---:|
+| transition, first half | **1284** | 590 | 306 | 210 |
+| ...second half | **1456** | 717 | 361 | 250 |
+| a long chain's pair transition | **1082** | 441 | 230 | 167 |
+
+One workgroup is one subgroup - the store's uniformity requirement - so a 64x128
+region is an EIGHTH of the workgroups doing eight times the sequential work, and
+this device would rather have the occupancy. Upstream's M4 Pro would not, which
+is the same shape of disagreement as the queries-per-invocation one below. **So
+the grid-compatibility problem is not a fifth of the win here, it is all of it**:
+a caller taking this path needs a matrix-specific dispatch grid, not the one
+`gemmGrid` derives from the shipped tile.
+
+🔴 **AND AF3's PROJECTIONS ARE ALREADY AT THE MATRIX CEILING, SO THE WIN IS
+AF2's ALONE.** The trunk's two hottest dense passes were measured against a
+matrix GEMM of identical M, K and N - 40000 x 128 x 512 at 200 tokens - **timed
+in the same process**, because a comparison drawn across two runs of anything
+here is inside this machine's drift, and the cross-process version of exactly
+this comparison read 4.14 against 4.70 ms and would have said the opposite:
+
+| | shipped | matrix f32 | |
+|---|---:|---:|---|
+| `grid.project` (row tile 8) | **1287 GFLOP/s** | 1131 | the fused kernel wins by 1.14x |
+| `tri.project` (32x16) | 1073 | **1125** | 1.05x, inside the noise |
+
+`--matrix=1` on `bench-grid-project.js` and `bench-triangle-project.js` is that
+arm. Both AF3 kernels are FUSED - one read of the normalised pair
+representation, four projections out of it, two of them through a sigmoid gate -
+and that fusion is worth about what the matrix units are. AF2's transition is a
+generic unfused `createLinearShader`, which is exactly why the matrix path beats
+it by 1.16x-1.31x and does not beat these. **Ask what a kernel already fuses
+before pricing its arithmetic.**
 
 🔴 **PACKING THE ATTENTION VALUE COSTS NOTHING HERE, BECAUSE THIS KERNEL HAD
 ALREADY ROUNDED IT.** Upstream found that packing the flash kernel's keys AND
@@ -1357,10 +1396,12 @@ projection at all, from `profile-af2-block.js --sequences=512` and
 | out of reach | the two flash attentions, 20% | `grid.attend`, 19% |
 
 AF2's dense work is `createLinearShader` and the attention's own projection, so
-the table at the top applies to it directly. AF3's five are bespoke and were not
-measured against a matrix arm; `pair-transition` fuses a LayerNorm, two matmuls
-and a gate, and is 59% arithmetic rather than bandwidth, so it is the one most
-likely to move and the one furthest from a drop-in.
+the table at the top applies to it directly. AF3's two hottest were measured and
+are at the ceiling already - see above - which leaves `pair-transition` as the
+only one that might still move: it fuses a LayerNorm, two matmuls and a gate,
+and is 59% arithmetic rather than bandwidth. It is also the furthest from a
+drop-in, and the two that WERE measured both say fusion is worth as much as the
+units are.
 
 🔴 **AND THE CALLERS ARE THE OBSTACLE, NOT THE KERNEL.** `subgroupMatrixLoad`
 cannot consume a WGSL expression: it needs a typed binding, a base offset and a

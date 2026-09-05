@@ -24,7 +24,7 @@
  * match leaves rows unprojected and reads as a speedup.
  */
 import { createLinearShader } from "../../src/evoformer/transition.js";
-import { createMatrixLinearShader } from "./gemm-matrix.js";
+import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 import { float32ToFloat16Array } from "../../src/runtime/float16.js";
 
 const option = (args, name, fallback) => {
@@ -251,10 +251,26 @@ export async function main(device, args) {
         results.push({ arm: spec, skipped: "no chromium-experimental-subgroup-matrix" });
         continue;
       }
-      const [blocks, columnBlocks = blocks] = tileSpec.slice("matrix".length).split("x").map(Number);
+      // `matrix4` is a 32x32 region per subgroup; `matrix8x16` is the shipped
+      // 64x128 geometry; a third and fourth number give the ACCUMULATOR
+      // sub-region, so `matrix8x16x4x4` walks that geometry four tiles at a
+      // time instead of holding all 128 - see gemm-matrix.js.
+      const [blocks, columnBlocks = blocks, subBlocks = blocks, subColumnBlocks = subBlocks] =
+        tileSpec.slice("matrix".length).split("x").map(Number);
       if (!blocks) throw new Error(`arm ${spec} is not a matrix geometry`);
+      // A region larger than the tensor cannot slide back and reads as a
+      // moderate wrong answer rather than an error; skip loudly instead.
+      if (!matrixLinearFits({ rows, columns }, { blocks, columnBlocks })) {
+        results.push({
+          arm: spec,
+          skipped: `a ${blocks * 8}x${columnBlocks * 8} region does not fit ${rows}x${columns}`,
+        });
+        continue;
+      }
       matrixElement = precision;
-      shader = createMatrixLinearShader({ blocks, columnBlocks, element: precision });
+      shader = createMatrixLinearShader({
+        blocks, columnBlocks, subBlocks, subColumnBlocks, element: precision,
+      });
       tile = { rows: blocks * 8, columns: columnBlocks * 8 };
     } else if (tileSpec === "legacy") {
       if (precision !== "f32") throw new Error("the legacy kernel has no precision option");
