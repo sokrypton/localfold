@@ -125,6 +125,11 @@ def main():
     parser.add_argument('--calibrated', default='',
                         help='label=path.npz, comma separated - arms whose '
                              'codes were chosen against real activations')
+    parser.add_argument('--fold-bits', type=int, default=0,
+                        help='also quantise the FOLDING model at this many bits')
+    parser.add_argument('--fold-group', type=int, default=32)
+    parser.add_argument('--fold-keep', type=int, default=1 << 16,
+                        help='tensors smaller than this stay float32')
     parser.add_argument('--samples', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--seed-spread', type=int, default=0,
@@ -159,6 +164,30 @@ def main():
     model = EsmFold2ExperimentalModel.from_pretrained(
         str(ROOT / arguments.esmfold2), load_esmc=False,
         device=arguments.device).eval()
+    if arguments.fold_bits:
+        # 🔴 THE BUNDLE IS TWO MODELS AND ONLY ONE OF THEM WAS EVER PRICED.
+        # The folding model is 171 M parameters - 34% of the 600M bundle and
+        # 41% of the 300M one at equal bits - so a size target that quantises
+        # only the tower is a size target for two thirds of the download. Same
+        # rule as tools/quantize_af3.py: anything 1-D, or smaller than
+        # --fold-keep, stays float32, because norms and biases are a rounding
+        # error of the bytes and sit where an error is not averaged away.
+        touched = kept = 0
+        for name, parameter in model.named_parameters():
+            values = parameter.detach().cpu().numpy().reshape(-1)
+            if parameter.dim() < 2 or values.size < arguments.fold_keep:
+                kept += 1
+                continue
+            approximate = Q.asymmetric(values.astype(np.float32),
+                                       arguments.fold_bits, arguments.fold_group)
+            parameter.data.copy_(torch.as_tensor(
+                approximate.reshape(parameter.shape), dtype=parameter.dtype,
+                device=parameter.device))
+            touched += 1
+        print('folding model: %d tensors at int%d group %d, %d kept float32'
+              % (touched, arguments.fold_bits, arguments.fold_group, kept),
+              flush=True)
+
     checkpoint = E.Checkpoint(ROOT / arguments.esmc)
 
     features = {}

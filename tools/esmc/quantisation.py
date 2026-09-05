@@ -167,6 +167,16 @@ def calibrated(path, name=None):
         codes = store[key + '.codes'].astype(np.float32)
         scales = store[key + '.scales'].astype(np.float32)
         zeros = store[key + '.zeros'].astype(np.float32)
+        if key + '.pad' in store:
+            # 🔴 THE FLAT LAYOUT, which is what tools/quantize_af3.py writes
+            # and what a group that does not divide the row length forces.
+            # Distinguished by the presence of a pad, not by a name: a file
+            # read under the wrong layout is a permutation of the right
+            # weights and reports as a broken model rather than a broken read.
+            pad = int(store[key + '.pad'][0])
+            flat = (codes.reshape(-1, group) * scales[:, None]
+                    + zeros[:, None]).reshape(-1)
+            return flat[:flat.size - pad] if pad else flat
         rows, inner = codes.shape
         grouped = codes.reshape(rows, inner // group, group)
         return (grouped * scales[:, :, None] + zeros[:, :, None]).reshape(-1)
@@ -198,6 +208,10 @@ def catalogue():
         Scheme('int4 g64 asym+2 outliers', 5.19,
                lambda v: with_outliers(v, 4, 64, 2)),
         Scheme('int4 g64 asym', 4.50, asym(4, 64)),
+        Scheme('int3 g64 asym', 3.50, asym(3, 64)),
+        Scheme('int3 g128 asym', 3.25, asym(3, 128)),
+        Scheme('int2 g64 asym', 2.50, asym(2, 64)),
+        Scheme('int2 g128 asym', 2.25, asym(2, 128)),
         Scheme('int3 g32 asym', 4.00, asym(3, 32)),
         Scheme('int3 g32 asym+search', 4.00, asym(3, 32, SEARCH_GRID)),
         Scheme('int2 g32 asym', 3.00, asym(2, 32)),
