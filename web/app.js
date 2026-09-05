@@ -37,6 +37,7 @@ import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
 import { getDevice, loadModel } from "./model.js";
+import { AF3_FAMILIES } from "../src/reference/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
@@ -124,6 +125,181 @@ const maxMsaConfig = () => {
  * multimer was trained for - and the explicit settings exist to fold the same
  * input both ways rather than to be reached for routinely.
  */
+/**
+ * What the model row is set to, and whether that is an AlphaFold 3 graph.
+ *
+ * 🔴 TWO BUNDLES BUILD THAT GRAPH NOW, so `=== "af3"` no longer means what its
+ * five call sites meant by it. Every one of them was asking "is this the AF3
+ * pipeline", not "is this DeepMind's checkpoint", and a second AF3-graph family
+ * would have taken the AlphaFold 2 branch at each - which is a page that runs
+ * the wrong driver rather than one that says so.
+ */
+/**
+ * Ask about AlphaFold 3's model parameters, once per browser.
+ *
+ * 🔴 THE PARAMETERS ARE NOT THIS PROJECT'S TO LICENCE. LocalFold's own code is
+ * one thing and DeepMind's weights are another: they permit non-commercial use
+ * only and carry a prohibited-use policy, and nothing here grants anybody
+ * anything. `tools/build_site.py` already refuses to PUBLISH them without
+ * LOCALFOLD_ACCEPT_MODEL_TERMS - but that asks the deployer, and the terms are
+ * addressed to whoever folds.
+ *
+ * 🔴 AND IT OFFERS SOMEWHERE ELSE TO GO. A dialog whose only button is "I
+ * agree" is a toll gate and teaches people to click through it. OpenBind runs
+ * the same graph under Apache 2.0, so this is a choice between two models
+ * rather than an obstacle in front of one - which is also why the switch is the
+ * button styled as the primary action.
+ *
+ * @param {string} family what the model row is set to
+ * @returns {Promise<string|null>} the family to fold with, or null if the
+ *   dialog was dismissed - which cancels the fold rather than picking for them.
+ */
+async function agreeModelTerms(family) {
+  if (family !== "af3" || termsAccepted()) return family;
+  const dialog = document.getElementById("model-terms");
+  // 🔴 NO DIALOG MEANS NO FOLD IS BLOCKED. single.html and the bundled offline
+  // build do not carry this markup, and a missing element must not make the
+  // page unfoldable - the deploy-side gate still stands either way.
+  if (dialog === null || typeof dialog.showModal !== "function") return family;
+
+  dialog.returnValue = "";
+  dialog.showModal();
+  await new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
+
+  if (dialog.returnValue === "accept") {
+    rememberTermsAccepted();
+    return "af3";
+  }
+  if (dialog.returnValue === "openbind") {
+    // 🔴 THE ROW IS UPDATED, NOT JUST THE FOLD. Folding with a model the
+    // control does not name is a page whose state is written nowhere on it -
+    // the same fault the "Auto" model setting had before it was removed.
+    const select = document.getElementById("model-family");
+    if (select !== null) {
+      select.value = "openbind";
+      syncModelControls();
+      syncMode();
+    }
+    return "openbind";
+  }
+  // Escape, or a click on the backdrop. Not an answer, so not a fold.
+  return null;
+}
+
+/**
+ * Whether this browser has already accepted AlphaFold 3's parameter terms.
+ *
+ * 🔴 EVERY READ AND WRITE IS GUARDED. localStorage throws outright in a few
+ * contexts - a browser set to block site data, some private windows - and an
+ * exception here would stop a fold that has nothing to do with storage. A
+ * failure to remember means being asked again, which is the safe direction.
+ */
+const TERMS_KEY = "localfold.modelTerms.alphafold3";
+
+function termsAccepted() {
+  try {
+    return globalThis.localStorage?.getItem(TERMS_KEY) === "accepted";
+  } catch {
+    return false;
+  }
+}
+
+function rememberTermsAccepted() {
+  try {
+    globalThis.localStorage?.setItem(TERMS_KEY, "accepted");
+  } catch {
+    // Asked again next time, which is better than a fold that cannot start.
+  }
+}
+
+/**
+ * `?model=` in the URL, so a link can name which model it means.
+ *
+ * 🔴 THE SELECT'S OWN OPTIONS ARE THE AUTHORITY, not a list written here. A
+ * build that ships without a bundle drops its option, and a URL pointing at a
+ * model this page does not have must not leave the row set to something it
+ * cannot load.
+ *
+ * 🔴 AND A URL CANNOT ACCEPT ANYBODY'S TERMS. `?model=af3` selects AlphaFold 3
+ * and nothing more - the licence dialog still opens on the first fold. A link
+ * that could dismiss it would let one person agree on another's behalf, which
+ * is the one thing this whole mechanism exists to prevent.
+ *
+ * 🔴 AND AN UNKNOWN NAME IS SAID OUT LOUD. A query parameter that is silently
+ * ignored looks exactly like one that worked, and the reader finds out from the
+ * fold they get. `of3` is deliberately NOT an alias for `openbind`: OpenFold3's
+ * preview-2 and its v0.5.0 release are different models with different forward
+ * conventions (see src/af3/dialect.js), so quietly resolving one to the other
+ * would hand somebody a model they did not ask for.
+ */
+const MODEL_ALIASES = { ob: "openbind", af2: "monomer", mono: "monomer",
+                        multi: "multimer" };
+
+function applyModelFromUrl() {
+  let asked;
+  try {
+    asked = new URL(globalThis.location?.href ?? "").searchParams.get("model");
+  } catch {
+    return;
+  }
+  if (asked === null || asked.trim() === "") return;
+  const select = document.getElementById("model-family");
+  if (select === null) return;
+  const wanted = MODEL_ALIASES[asked.trim().toLowerCase()] ?? asked.trim().toLowerCase();
+  const offered = [...select.options].map((option) => option.value);
+  if (!offered.includes(wanted)) {
+    // 🔴 RECORDED, NOT WRITTEN HERE. The viewer's own "Ready." message lands
+    // asynchronously AFTER this runs and overwrites the status line, so a
+    // complaint written now is a complaint nobody sees - which is precisely
+    // the silently-ignored parameter this exists to prevent. Reported once the
+    // page is ready instead; see reportModelFromUrl.
+    modelFromUrlProblem = `This page has no model called "${asked}" - it offers `
+      + `${offered.join(", ")}. Folding with ${select.value}.`;
+    return;
+  }
+  select.value = wanted;
+}
+
+let modelFromUrlProblem;
+
+/**
+ * Say so, once the page has finished writing its own opening line over ours.
+ *
+ * 🔴 A POLL, BECAUSE THE MESSAGE COMES FROM THE VENDORED BUNDLE. `Ready.` is
+ * set from `window.py2dmolReadyMessage` inside py2Dmol's initialisation, not
+ * from anything here, so there is no callback to hang this on and no ordering
+ * to rely on. It waits for the line to say something and then replaces it,
+ * giving up rather than looping forever if it never does.
+ */
+function reportModelFromUrl(attempt = 0) {
+  if (modelFromUrlProblem === undefined) return;
+  const node = document.getElementById("status-message");
+  if (node === null) return;
+  // 🔴 WAIT FOR THE OPENING LINE, NOT FOR ANY LINE. The first attempt at this
+  // waited for the status to be non-empty, which it already was - so the
+  // complaint was written and then overwritten a moment later by exactly the
+  // message it was waiting for. What it has to wait for is that specific
+  // string, which the page hands the viewer in index.html.
+  const ready = globalThis.py2dmolReadyMessage;
+  if (typeof ready === "string" && node.textContent !== ready && attempt < 60) {
+    setTimeout(() => reportModelFromUrl(attempt + 1), 50);
+    return;
+  }
+  status(modelFromUrlProblem, true);
+  modelFromUrlProblem = undefined;
+}
+
+const chosenFamily = () => document.getElementById("model-family")?.value ?? "af3";
+const isAf3Family = (family) => AF3_FAMILIES.includes(family);
+
+/** What to call each model while its weights download. */
+const MODEL_LABELS = {
+  af3: "AlphaFold 3",
+  openbind: "OpenBind",
+  monomer: "AlphaFold 2",
+  multimer: "AlphaFold 2",
+};
+
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) => {
   // 🔴 THE CHOICE IS ALWAYS EXPLICIT NOW. "Auto" used to read the chain count
   // and pick between the two AlphaFold 2 models - which made AF2 the silent
@@ -132,12 +308,20 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // state in which what would run was written nowhere on it.
   const choice = document.getElementById("model-family")?.value ?? "af3";
   // 🔴 A LIGAND IS AlphaFold 3 ONLY, and choosing otherwise is refused rather
-  // than quietly corrected. AF2 has no ligand tokens at all, so folding a
+  // than quietly corrected.
+  //
+  // 🔴 "AlphaFold 3" HERE MEANS THE GRAPH, NOT DEEPMIND'S CHECKPOINT. OpenBind
+  // runs the same featuriser and the same token layout, so it has ligand
+  // tokens, modified residues and nucleic chains exactly as AF3 does - what
+  // differs is whose parameters are in it. Written as `choice !== "af3"` this
+  // refused every one of those inputs the moment somebody switched models,
+  // with a message naming a capability the model actually has. AF2 has no ligand tokens at all, so folding a
   // complex with one under AF2 would drop it silently and return a confident
   // structure of the protein alone - which is a different answer to the
   // question that was asked, not a worse one.
-  if (ligandCount > 0 && choice !== "af3") {
-    throw new Error(`Ligands need AlphaFold 3; the model is set to ${choice}`);
+  if (ligandCount > 0 && !isAf3Family(choice)) {
+    throw new Error("Ligands need an AlphaFold 3 model - AF3 or OpenBind;"
+      + ` the model is set to ${choice}`);
   }
   // 🔴 AND A MODIFIED RESIDUE IS AlphaFold 3 ONLY FOR THE SAME REASON. AF2
   // tokenises one residue per letter and has no way to say that residue 12 is
@@ -145,16 +329,18 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // a confident structure of the unmodified chain - which is a different answer
   // to the question, not a worse one. The residue COUNT is unchanged either
   // way, so nothing else on the page would have shown the difference.
-  if (modificationCount > 0 && choice !== "af3") {
-    throw new Error(`Modified residues need AlphaFold 3; the model is set to ${choice}`);
+  if (modificationCount > 0 && !isAf3Family(choice)) {
+    throw new Error("Modified residues need an AlphaFold 3 model - AF3 or OpenBind;"
+      + ` the model is set to ${choice}`);
   }
   // 🔴 AND A NUCLEIC CHAIN IS AlphaFold 3 ONLY, WHICH IS THE LOUDEST OF THE
   // THREE. AF2's alphabet is the twenty amino acids: `ACGT` is not refused
   // there, it is READ - as alanine, cysteine, glycine, threonine - so a DNA
   // chain folded under AF2 comes back as a confident structure of a short
   // peptide that was never asked for, with nothing anywhere saying so.
-  if (nucleicCount > 0 && choice !== "af3") {
-    throw new Error(`DNA and RNA need AlphaFold 3; the model is set to ${choice}`);
+  if (nucleicCount > 0 && !isAf3Family(choice)) {
+    throw new Error("DNA and RNA need an AlphaFold 3 model - AF3 or OpenBind;"
+      + ` the model is set to ${choice}`);
   }
   return choice;
 };
@@ -358,7 +544,7 @@ function modelProgress(fraction, detail = "") {
  * @returns {Promise<object>} awaited by whichever fold path runs
  */
 function startModelPreload(family, signal) {
-  const name = family === "af3" ? "AlphaFold 3" : "AlphaFold 2";
+  const name = MODEL_LABELS[family] ?? "AlphaFold 2";
   // 🔴 THE LABEL MUST NOT CHANGE WIDTH WHILE IT COUNTS. `tabular-nums` holds
   // every DIGIT to one width, which is not the problem: the problem is that the
   // number of digits grows, so "1 / 265" became "10 / 265" became "100 / 265"
@@ -379,8 +565,8 @@ function startModelPreload(family, signal) {
         : `${name} · ${mib(loadedBytes).padStart(total.length, "\u2007")}`
           + ` / ${total} MiB`);
   };
-  const load = family === "af3"
-    ? loadAf3Weights(report)
+  const load = AF3_FAMILIES.includes(family)
+    ? loadAf3Weights(report, family)
     : loadModel("msa", report, signal, family);
   // 🔴 A REJECTION HANDLER NOW, OR AN UNHANDLED ONE LATER. Nothing awaits this
   // promise until the fold reaches it, and a download that fails before then is
@@ -1055,7 +1241,7 @@ function setFoldButton(state) {
  * put, so the row keeps one order.
  */
 function syncModelControls() {
-  const af3 = (document.getElementById("model-family")?.value ?? "af3") === "af3";
+  const af3 = isAf3Family(chosenFamily());
   for (const id of ["af3ModeGroup", "af3CountGroup"]) {
     const node = document.getElementById(id);
     if (node !== null) node.hidden = !af3;
@@ -1098,7 +1284,7 @@ const MAX_MSA_DEPTHS = [512, 256, 128, 64, 32, 16];
 function syncMaxMsa() {
   const select = document.getElementById("max-msa");
   if (select === null) return;
-  const af3 = (document.getElementById("model-family")?.value ?? "af3") === "af3";
+  const af3 = isAf3Family(chosenFamily());
   const previous = Number.parseInt(select.value, 10);
   const values = MAX_MSA_DEPTHS.map((depth) => (af3 ? String(depth) : `${depth}:${depth * 2}`));
   select.replaceChildren(...values.map((value) => Object.assign(
@@ -1239,7 +1425,12 @@ const cheapHash = (text) => {
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
                            modifications = [], chainKinds = [], templates = [],
-                           modelLoad = undefined) {
+                           modelLoad = undefined, family = "af3") {
+  // 🔴 THE FOLD SAYS WHICH MODEL MADE IT, and this is not decoration. Two
+  // bundles run this same function; a status line and an archive that both
+  // read "AlphaFold 3" for an OpenBind fold are a record of the wrong
+  // provenance - and provenance is the whole reason the licence dialog exists.
+  const modelName = MODEL_LABELS[family] ?? family;
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -1300,6 +1491,19 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // nothing can undo a pass - so the cache is offered only when it is at or
   // behind what was asked for.
   const trunkKey = JSON.stringify({
+    // 🔴 THE MODEL IS IN THE KEY, AND LEAVING IT OUT BROKE FOLDS SILENTLY. Two
+    // bundles build this graph now, and the cached trunk is a PAIR AND SINGLE
+    // REPRESENTATION - the same shapes whichever parameters produced them. Fold
+    // with OpenBind, switch to AlphaFold 3, fold the same sequence: every other
+    // field here matched, so AF3's diffusion head was handed OpenBind's trunk
+    // and denoised coordinates out of a representation it had never seen. It
+    // does not error, it does not warn, and what comes back is a chain whose
+    // atoms are no longer attached to each other.
+    //
+    // The weight loader has the same hazard and the same answer - one memo per
+    // family, not one memo. A cache is the easiest place for a second model to
+    // be mistaken for the first.
+    family,
     // ...modifications included, or a fold that only adds one reuses the trunk
     // of the fold without it and silently ignores what was asked for.
     // 🔴 THE KINDS ARE IN THE KEY BECAUSE THE LETTERS DO NOT IMPLY THEM. Folding
@@ -1592,7 +1796,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       a3m: alignment,
       chains,
       chainLengths: chains.map((chain) => chain.length),
-      model: "AlphaFold 3",
+      model: modelName,
       ...foldContext,
     };
     predictions.set(stem, lastPrediction);
@@ -1715,7 +1919,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // computing it and every probe that judges a fold still prints it. But "3.81"
   // means nothing to somebody who wanted a structure, and a status line that
   // ends in a diagnostic reads as a diagnostic. It belongs to the tools.
-  status(`AlphaFold 3 · ${what.join(" + ")} · ${detail.join(" · ")}`);
+  status(`${modelName} · ${what.join(" + ")} · ${detail.join(" · ")}`);
 }
 
 async function fold(event) {
@@ -1761,7 +1965,21 @@ async function fold(event) {
     // pasted-A3M branch, which runs only where `nucleicCount` is already zero
     // and sets it to the protein it already was.
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
-    const family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
+    let family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
+    // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
+    // parameters carry DeepMind's own terms, and the moment they apply is the
+    // moment the bytes are fetched - which is the next line. Asking on page
+    // load would put a dialog in front of somebody who came to fold with AF2,
+    // and asking afterwards would ask about something already done.
+    //
+    // It can answer `openbind`, which is why `family` is no longer const: the
+    // dialog offers a way past the terms rather than only a way through them,
+    // and taking it has to change what this fold loads.
+    family = await agreeModelTerms(family);
+    if (family === null) {
+      status("Fold cancelled - no model chosen.");
+      return;
+    }
     // ...and started, not awaited. The templates and the alignment below are
     // network work of their own; this runs beside them.
     const modelLoad = startModelPreload(family, signal);
@@ -1911,9 +2129,9 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
-    if (family === "af3") {
+    if (isAf3Family(family)) {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds, templateSources, modelLoad);
+                        modifications, chainKinds, templateSources, modelLoad, family);
       return;
     }
 
@@ -2357,7 +2575,19 @@ if (familySelect !== null) {
   familySelect.addEventListener("change", () => { syncModelControls(); syncMode(); });
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
+// 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
+// row after syncMode() has already read it above, so the controls have to be
+// brought back into agreement exactly as a change event would - and
+// syncModelControls before syncMode, because the second reads the visibility
+// the first sets.
+applyModelFromUrl();
 syncModelControls();
+syncMode();
+// ...and only after the parameter has been read can a complaint about it be
+// made. The first version called this beside the Fold button's enabling,
+// which runs EARLIER than this block - so it always found nothing to report
+// and said nothing, which is the same silence it was written to fix.
+reportModelFromUrl();
 
 element("msa-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];

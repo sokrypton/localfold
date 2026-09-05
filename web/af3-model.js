@@ -22,7 +22,8 @@ import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
-import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
+import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
+  from "../src/reference/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
@@ -85,7 +86,12 @@ export function af3SequenceProblem(sequence) {
   return null;
 }
 
-let weightsPromise;
+// 🔴 ONE PROMISE PER FAMILY, NOT ONE PROMISE. Two bundles now build this same
+// graph - DeepMind's parameters and OpenBind's - and a single memo would hand
+// the second fold the first model's weights, silently, with every shape
+// agreeing. That is the failure the whole dialect mechanism exists to prevent,
+// and it would have arrived through the cache rather than through the loader.
+const weightsPromises = new Map();
 
 /**
  * The whole AF3 checkpoint, once per page.
@@ -97,24 +103,32 @@ let weightsPromise;
  * manifest and died before asking for a single shard, which is a failure about
  * metadata wearing the costume of a failure about weights.
  */
-export function loadAf3Weights(onProgress) {
-  weightsPromise ??= (async () => {
-    const store = await HttpTensorStore.fromManifest(
-      bundleBaseUrl("af3"), await loadManifest("af3"), onProgress);
-    // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
-    // and await each one - so without this the network runs one shard at a time
-    // and idles through every dequantisation. See HttpTensorStore.prefetch.
-    // This path reads the whole model, so there is nothing to be careful about.
-    store.prefetch();
-    return {
-      trunk: await trunkWeights(store, 48, 4),
-      diffusion: await diffusionWeights(store),
-      confidence: await confidenceWeights(store),
-      atomReference: await atomReference(store),
-      targetFeat: await targetFeatureWeights(store),
-    };
-  })();
-  return weightsPromise;
+export function loadAf3Weights(onProgress, family = "af3") {
+  if (!AF3_FAMILIES.includes(family)) {
+    throw new Error(`${family} is not an AlphaFold 3-graph family; `
+      + `known: ${AF3_FAMILIES.join(", ")}`);
+  }
+  let promise = weightsPromises.get(family);
+  if (promise === undefined) {
+    promise = (async () => {
+      const store = await HttpTensorStore.fromManifest(
+        bundleBaseUrl(family), await loadManifest(family), onProgress);
+      // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
+      // and await each one - so without this the network runs one shard at a time
+      // and idles through every dequantisation. See HttpTensorStore.prefetch.
+      // This path reads the whole model, so there is nothing to be careful about.
+      store.prefetch();
+      return {
+        trunk: await trunkWeights(store, 48, 4),
+        diffusion: await diffusionWeights(store),
+        confidence: await confidenceWeights(store),
+        atomReference: await atomReference(store),
+        targetFeat: await targetFeatureWeights(store),
+      };
+    })();
+    weightsPromises.set(family, promise);
+  }
+  return promise;
 }
 
 /** The dense slot of every alpha carbon, which frames are fitted on. */

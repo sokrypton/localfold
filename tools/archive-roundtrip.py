@@ -117,6 +117,11 @@ def main() -> int:
               return el.value;
             })()""" % (json.dumps(name), json.dumps(name), json.dumps(value)))
 
+        # 🔴 ACCEPT AF3'S PARAMETER TERMS FIRST, or the Fold press opens the
+        # licence dialog instead of folding and this tool waits out its
+        # timeout. See tools/model-terms.py, which is what checks the
+        # dialog itself; here it is in the way.
+        cdp.evaluate(ws, "try { localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted'); } catch (e) {} 1")
         control("model-family", "af3")
         control("recycles", "0")
         control("af3-count", "4")

@@ -3,10 +3,16 @@ import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired,
   from "./chains.js";
 
 /** How each model wants a complex's per-chain alignments merged. */
+// 🔴 KEYED BY FAMILY, AND EVERY AF3-GRAPH FAMILY TAKES THE SAME MERGE. The
+// alignment is an INPUT to the graph, not a property of whose weights are in
+// it, so OpenBind reads its MSA exactly as AlphaFold 3 does. Absent here, a
+// fold with it raises rather than quietly picking somebody's merge - which is
+// why this throws on an unknown name instead of defaulting.
 const CHAIN_MERGES = {
   monomer: mergeUnpairedChainA3ms,
   multimer: mergeChainA3ms,
   af3: mergeRowAlignedChainA3ms,
+  openbind: mergeRowAlignedChainA3ms,
 };
 
 const DEFAULT_API_URL = "https://api.colabfold.com";

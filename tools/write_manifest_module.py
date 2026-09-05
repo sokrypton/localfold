@@ -54,13 +54,21 @@ BUNDLES = {
     #
     # 🔴 THESE ARE DEEPMIND'S PARAMETERS, NOT OPENFOLD3'S. The manifest says so
     # (model.name is "alphafold3") and build_site.py refuses to publish them
-    # without LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3. An Apache-2.0 bundle
-    # would need an OpenFold3 export, which needs four dialect branches the
-    # kernels here do not implement yet - see tools/oracle/dump_af3_trunk.py.
+    # without LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3.
     "af3": {
         "export": "model-af3-int5",
         "module": "src/reference/manifests/af3.js",
         "model": "alphafold3",
+    },
+    # ...and the Apache-2.0 one, which is the same graph and the same 265 MiB.
+    # OpenBind is OpenFold3's v0.5.0 release; `--model openbind` exports it and
+    # the manifest's model.name carries the dialect into the page, so the two
+    # bundles cannot be confused for one another at load time. Nothing gates
+    # this one: its weights carry no prohibited-use policy.
+    "openbind": {
+        "export": "model-openbind-int5",
+        "module": "src/reference/manifests/openbind.js",
+        "model": "openbind",
     },
 }
 

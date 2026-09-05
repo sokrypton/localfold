@@ -65,7 +65,41 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_AF3_MODEL",
     load: () => import("./af3.js"),
   },
+  // The same graph and the same 265 MiB, under the Apache License 2.0.
+  //
+  // 🔴 OpenBind IS OpenFold3's v0.5.0 RELEASE, AND NOT ITS PREVIEW-2 WEIGHTS.
+  // The two differ in forward conventions - see src/af3/dialect.js - so they
+  // are different models, and this bundle's manifest names `openbind` so the
+  // loader picks the right one. Reading the OpenFold3 porting notes as if they
+  // described this release turns on branches it does not want.
+  //
+  // 🔴 AND IT CARRIES NO PROHIBITED USE POLICY, which is the point of offering
+  // it: build_site.py publishes it with no LOCALFOLD_ACCEPT_MODEL_TERMS, and
+  // the page's licence dialog offers it as the way past AF3's terms rather than
+  // as a second-best.
+  //
+  // 🔴 NO `remote` YET. Its shards have not been uploaded, so this bundle is
+  // published beside the page. Give it a pinned `remote` the moment they are -
+  // a commit SHA, and a trailing slash; see the notes at the top of this file.
+  openbind: {
+    model: "openbind",
+    directory: "./model-openbind-int5/",
+    release: "openbind-int5",
+    variable: "LOCALFOLD_INCLUDE_OPENBIND_MODEL",
+    load: () => import("./openbind.js"),
+  },
 };
+
+/**
+ * The families that build AlphaFold 3's graph, as opposed to AlphaFold 2's.
+ *
+ * 🔴 A LIST, NOT `family === "af3"`. That comparison was in five places and
+ * every one of them meant "is this the AF3 pipeline" rather than "is this
+ * DeepMind's checkpoint" - so a second AF3-graph bundle would have taken the
+ * AlphaFold 2 branch at each of them, which is not a failure that announces
+ * itself.
+ */
+export const AF3_FAMILIES = ["af3", "openbind"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 

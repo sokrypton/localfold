@@ -1118,6 +1118,59 @@ unreachable - and the table above says it should be a no-op, since what a padded
 key contains provably does not reach the encoder's output. Not done: it changes
 the featuriser for stock AF3 as well, so it wants its own before-and-after fold.
 
+🔴 **A SECOND MODEL IS MISTAKEN FOR THE FIRST IN A CACHE, NOT IN A LOADER.**
+Two bundles now build AF3's graph, and every memo keyed on something that does
+not distinguish them is a silent wrong answer. Two were found, one of them the
+hard way:
+
+* `loadAf3Weights` memoised ONE promise, so the second family's fold got the
+  first family's weights. Caught while writing it - `weightsPromises` is a Map
+  keyed by family.
+* **`trunkKey` did not include the family.** The cached trunk is a pair and a
+  single representation, and those have the same shapes whichever parameters
+  produced them - so folding with OpenBind and then AlphaFold 3 on the same
+  sequence matched every other field and handed AF3's diffusion head OpenBind's
+  trunk. Reproduced in the page at 32 residues: **pLDDT 41.5 with the status
+  line reading "trunk reused", against 83.3 once `family` was in the key.**
+  Nothing errors, nothing warns; the chain comes apart, which is how it was
+  reported ("atoms are no longer attached").
+
+Neither is findable by folding one model. The reproduction is
+openbind -> af3 -> openbind in one page session, which
+`test/model-family.test.js` pins by asserting the key names the family.
+
+🔴 **AND "IS THIS AF3" IS NOT `family === "af3"` ANY MORE.** That comparison sat
+in five places and every one meant "is this the AF3 pipeline", not "is this
+DeepMind's checkpoint" - so a second AF3-graph family took the AlphaFold 2
+branch at each. Three of them were CAPABILITY guards, and they refused ligands,
+modified residues and nucleic chains under OpenBind with a message naming a
+capability the model has: *"Ligands need AlphaFold 3; the model is set to
+openbind"*. `AF3_FAMILIES` in `src/reference/manifests/index.js` is the list;
+`isAf3Family` is the test.
+
+🔴 **THE LICENCE DIALOG ASKS THE PERSON FOLDING, NOT THE DEPLOYER.**
+`build_site.py` already refuses to publish DeepMind's parameters without
+`LOCALFOLD_ACCEPT_MODEL_TERMS`; the page's `#model-terms` dialog gates the first
+AF3 fold and remembers the answer in `localStorage`. It offers OpenBind as the
+alternative rather than only an "I agree", because a dialog with one button
+teaches people to click it. `tools/model-terms.py` is the check - it drives the
+real page and asserts the dialog opens, remembers, switches the model row, and
+**still opens for `?model=af3`**, since a URL must not be able to accept
+somebody else's terms.
+
+🔴 **AND A `<dialog>` IS NEVER LAID OUT UNTIL IT IS OPENED**, which is the load
+dial's blind spot again: `tools/mobile-layout.py` cannot see it. `model-terms.py`
+forces it open under a 320px device override and asserts it is neither clipped
+nor sideways-scrolling and that its two buttons stack (measured 298px wide,
+buttons 260px, left 11px).
+
+🔴 **AND A `?model=` THAT IS IGNORED LOOKS EXACTLY LIKE ONE THAT WORKED.** The
+complaint about an unknown name was written twice before it was visible: once
+before the vendored viewer's own "Ready." line overwrote it, and once before the
+parameter had even been read, because it was called beside the Fold button's
+enabling - which runs EARLIER in the file. It waits for that specific string
+now. `of3` is deliberately not an alias for `openbind`.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring

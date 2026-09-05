@@ -157,8 +157,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      never choose AF3 - so the newest model was the one you had
                      to know to ask for. It also gave the page a state where
                      what would run was not written anywhere on it. -->
-                <select id="model-family" title="Which model to fold with.">
+                <select id="model-family" title="Which model to fold with. AF3 is DeepMind's, under their own terms; OpenBind is OpenFold3 v0.5.0, Apache 2.0.">
                   <option value="af3" selected>AF3</option>
+                  <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind runs
+                       through foldWithAf3 exactly as AF3 does; what differs is
+                       the bundle and the three dialect branches its weights
+                       were trained with. See src/af3/dialect.js. -->
+                  <option value="openbind">OpenBind</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                 </select>
@@ -954,6 +959,63 @@ AI Context: STANDALONE WEB APP ENTRY POINT
          against the loose sources - real line numbers, no rebuild between an
          edit and a reload - open dev.html, which tools/bundle.py generates
          from this file. -->
+
+    <!-- 🔴 THE MODEL PARAMETERS ARE NOT THIS PROJECT'S TO LICENCE, AND THIS IS
+         WHERE THAT IS SAID. AlphaFold 3's weights carry DeepMind's own terms
+         and a Prohibited Use Policy; LocalFold's code is not the thing under
+         them. tools/build_site.py already refuses to PUBLISH them without
+         LOCALFOLD_ACCEPT_MODEL_TERMS, which asks the deployer - this asks the
+         person actually about to fold, which is who the terms are addressed to.
+
+         🔴 AND IT IS A CHOICE, NOT AN INTERSTITIAL. A dialog whose only button
+         is "I agree" teaches people to click it. This one offers OpenBind, a
+         model that runs the same graph under Apache 2.0, so the acknowledgement
+         is a decision with an alternative rather than a toll gate.
+
+         The native <dialog> is deliberate: it gives focus trapping, Escape and
+         a backdrop that no hand-rolled overlay in this page gets right. -->
+    <dialog id="model-terms" class="terms-dialog" aria-labelledby="model-terms-title">
+      <form method="dialog" class="terms-form">
+        <h2 id="model-terms-title" class="terms-title">AlphaFold 3 model parameters</h2>
+        <!-- 🔴 "NOT OPEN SOURCE" WAS WRONG AND IS NOT WHAT THE TERMS SAY. The
+             AlphaFold 3 CODE is openly licensed; it is the PARAMETERS that are
+             restricted, and the restriction is on commercial use, not on
+             availability. Getting that backwards misstates somebody else's
+             licence in a dialog asking people to agree to it. -->
+        <p class="terms-body">
+          These are Google DeepMind's parameters. They are not available for
+          commercial use and carry a prohibited-use policy.
+        </p>
+        <p class="terms-body">
+          <strong>OpenBind</strong> runs the same architecture under Apache 2.0.
+          It is a different model, and less accurate in our testing.
+        </p>
+        <p class="terms-links">
+          <a href="https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md"
+             target="_blank" rel="noopener noreferrer">AlphaFold 3 weights terms</a>
+          &middot;
+          <a href="https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md"
+             target="_blank" rel="noopener noreferrer">prohibited use policy</a>
+          &middot;
+          <a href="https://github.com/aqlaboratory/openfold-3"
+             target="_blank" rel="noopener noreferrer">OpenBind</a>
+        </p>
+        <div class="terms-actions">
+          <button type="submit" value="openbind" class="terms-button terms-button-primary"
+                  id="model-terms-switch">Use OpenBind instead</button>
+          <!-- 🔴 A FILLED BUTTON TOO, because an outline beside a filled one
+               reads as a cancel rather than as the other half of a choice -
+               and this dialog's whole point is that there are two real
+               options. Red for the restricted one: not "dangerous", but "this
+               one comes with conditions". -->
+          <button type="submit" value="accept" class="terms-button terms-button-caution"
+                  id="model-terms-accept">I accept &mdash; use AlphaFold 3</button>
+        </div>
+        <!-- 🔴 REMEMBERED, AND SAID TO BE. An acknowledgement that silently
+             never returns looks like it did not register the first time. -->
+        <p class="terms-note">Accepting is remembered on this browser.</p>
+      </form>
+    </dialog>
 
     <!-- TM-align and the viewer's side of it, in one file, and the one thing
          that can never be concatenated: it starts its Worker by having the

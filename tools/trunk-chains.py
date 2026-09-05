@@ -77,6 +77,10 @@ def main():
                 { type: 'protein', copies: 1, value, modifications: [] })));
               const set = (id, v) => { const el = document.getElementById(id);
                 el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
+              // AF3's parameter terms are acknowledged here or the Fold press
+              // opens the licence dialog and nothing folds - see tools/model-terms.py.
+              try { localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted'); }
+              catch (e) {}
               set('model-family', 'af3'); set('recycles', '1'); set('msa-mode', 'none');
               return JSON.stringify(list.read().map((e) => e.value.length));
             })()""" % json.dumps(chains))
