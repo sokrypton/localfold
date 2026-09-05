@@ -472,11 +472,25 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // recycles are watched through the heatmap panel instead, and the viewer
   // shows nothing until the sampler produces the first real frame.
   //
-  // 🔴 ONE HEAD, BUILT ABOVE THE RECYCLE LOOP, because building one compiles
-  // its pipelines - 730 ms, flat in the shape - and doing that here overlaps
-  // the compile with the trunk instead of paying it when the sampler starts.
-  // Both samplers borrow it rather than building their own.
+  // 🔴 ONE HEAD, BUILT ABOVE THE RECYCLE LOOP, so both samplers borrow it
+  // rather than building their own.
   const head = steps > 0 ? new Af3DiffusionHeadGpu(device, precision) : undefined;
+  // 🔴 AND WARMED HERE, WHICH THE COMMENT ABOVE THIS ONE USED TO CLAIM THE
+  // CONSTRUCTOR DID. It said "building one compiles its pipelines - 730 ms -
+  // and doing that here overlaps the compile with the trunk". The constructor
+  // stores a device, an allocator and a cache and compiles nothing, so all of
+  // it landed inside the first denoiser call with the trunk already over and
+  // nothing left to overlap: 311 ms of a 2.9 s fold at 58 residues sits in the
+  // page's "Folding" band before a single step reports.
+  //
+  // 🔴 NOT AWAITED, WHICH IS THE WHOLE POINT. createComputePipelineAsync
+  // compiles off the main thread and a trunk pass leaves the host idle -
+  // bench-trunk reports 9.4 ms of encoding against 2948 of waiting - so this
+  // costs the trunk nothing and the sampler's first call awaits the same
+  // memoised promise. The catch is only so that a compile that fails before
+  // anything awaits it is not an unhandled rejection; the real failure still
+  // arrives where the sampler asks.
+  head?.warm(tokens, weights.diffusion).catch(() => {});
 
   let trunk = reused?.trunk;
   let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);

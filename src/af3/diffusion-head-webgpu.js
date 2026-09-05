@@ -332,6 +332,49 @@ export class Af3DiffusionHeadGpu {
     return buffer;
   }
 
+  /**
+   * The transformer's weight object, with this head's precision on it.
+   *
+   * 🔴 MEMOISED ON THE SOURCE, BECAUSE #compile KEYS ON IDENTITY. A fresh
+   * spread per call misses that memo every time, and what it rebuilds is the
+   * largest WGSL in the model - the very thing #compile exists to stop. The
+   * default path passes `weights.transformer` straight through and never had
+   * the problem; the arm that sets a precision explicitly, which is how a bench
+   * compares f16 against f32, did.
+   */
+  #transformerWeights(weights) {
+    const precision = this.options?.weightPrecision;
+    if (precision === undefined) return weights.transformer;
+    if (this.#transformerWeightsFor?.source !== weights.transformer) {
+      this.#transformerWeightsFor = {
+        source: weights.transformer,
+        value: { ...weights.transformer, weightPrecision: precision },
+      };
+    }
+    return this.#transformerWeightsFor.value;
+  }
+
+  /**
+   * Compile the sampler's pipelines now, so the trunk pays for them.
+   *
+   * 🔴 NOTHING USED TO. fold.js builds the head above the recycle loop and its
+   * comment claimed that compiled the pipelines; the constructor compiles
+   * nothing, so the whole cost landed in the first denoiser call with the
+   * trunk already finished. `createComputePipelineAsync` runs off the main
+   * thread and the trunk leaves it idle - bench-trunk reports 9.4 ms of
+   * encoding against 2948 of waiting - so this is free where it stands.
+   *
+   * It needs only the token count and the weights, neither of which the trunk
+   * produces. Not awaited by the caller; the sampler's first call awaits the
+   * same memoised promise.
+   */
+  async warm(tokens, weights) {
+    this.#transformer ??= new Af3DiffusionTransformerGpu(this.device);
+    await this.#transformer.warm(tokens, this.#transformerWeights(weights));
+  }
+
+  #transformerWeightsFor;
+
   constructor(device, options = {}) {
     this.device = device;
     // Only the transformer's resident weights read a precision here; see the
@@ -622,9 +665,7 @@ export class Af3DiffusionHeadGpu {
     const transformed = await stage("transformer", () =>
       this.#transformer.run(
         act, chained ? chain.condSingle : cond.single, cond.pair, input.seqMask, tokens,
-        this.options?.weightPrecision === undefined
-          ? weights.transformer
-          : { ...weights.transformer, weightPrecision: this.options.weightPrecision },
+        this.#transformerWeights(weights),
         chained ? { validation: deferred, keepOnDevice: true } : {}));
 
     // 🔴 THIS ONE STAYS ON THE CPU, AND THE DIFFERENCE IS THE PROJECTION. With

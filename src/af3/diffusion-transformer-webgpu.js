@@ -1079,13 +1079,35 @@ export class Af3DiffusionTransformerGpu {
    * the first call several times a steady one. That is the weight conversion,
    * and docs/AF3.md records why it cannot be moved either.
    */
+  /**
+   * Compile this stack without running it, so the trunk can pay for it.
+   *
+   * 🔴 THE HEAD'S CONSTRUCTOR COMPILES NOTHING, WHICH fold.js BELIEVED IT DID.
+   * Its comment read "building one compiles its pipelines - 730 ms - and doing
+   * that here overlaps the compile with the trunk"; the constructor stores a
+   * device, an allocator and a cache. Every pipeline was built inside the
+   * FIRST denoiser call, which is why the page's "Folding" band is 311 ms at
+   * 58 residues before a single step reports, and 4.9 s of a 27 s fold at 150.
+   * There is nothing to overlap it with at that point - the trunk is over.
+   */
+  async warm(tokens, weights) {
+    await this.#compile(tokens, weights);
+  }
+
+  /**
+   * 🔴 THE PROMISE, NOT THE RESULT. Storing the settled value means two
+   * concurrent callers both miss and both build the largest WGSL in the model -
+   * which is exactly what warming during the trunk creates, since the sampler
+   * asks for the same shape while the warm may still be in flight. The pipeline
+   * cache stores promises for the same reason.
+   */
   async #compile(tokens, weights) {
     if (this.#compiled?.tokens === tokens && this.#compiled.weights === weights) {
-      return this.#compiled.result;
+      return this.#compiled.promise;
     }
-    const result = await this.#buildCompile(tokens, weights);
-    this.#compiled = { tokens, weights, result };
-    return result;
+    const promise = this.#buildCompile(tokens, weights);
+    this.#compiled = { tokens, weights, promise };
+    return promise;
   }
 
   async #buildCompile(tokens, weights) {
