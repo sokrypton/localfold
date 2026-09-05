@@ -101,7 +101,9 @@ export function transitionChunk(intermediate, tile = 1, width = DEFAULT_WORKGROU
 const GRID_WIDTH = 32_768;
 
 /** The packing order of the four tensors this kernel reads. */
-const ORDER = ["inputLayerNormScale", "inputLayerNormOffset", "transition1", "transition2"];
+export const TRANSITION_ORDER =
+  ["inputLayerNormScale", "inputLayerNormOffset", "transition1", "transition2"];
+const ORDER = TRANSITION_ORDER;
 
 /**
  * @param {"f32"|"f16"} precision the element the packed buffer holds. The

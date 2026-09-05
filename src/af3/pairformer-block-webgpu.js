@@ -43,7 +43,9 @@ import {
   compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
-import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
+import { createTransitionShader, packTransitionWeights, TRANSITION_ORDER }
+  from "./transition-webgpu.js";
+import { residentPackedOnDevice } from "./device-weights.js";
 import { createSingleAttentionShaders, packSingleAttentionWeights } from "./single-attention-webgpu.js";
 
 const SINGLE_CHANNELS = 384;
@@ -499,10 +501,25 @@ export class Af3PairformerStackGpu {
     // 🔴 THE PRECISION IS PART OF THE CACHE KEY, as a variant rather than as
     // part of the label - see residentWeightBuffer. A process running both arms
     // would otherwise hand an f16 pipeline the f32 buffer.
-    const singleTransitionWeights = resident(
-      "w.single-transition",
-      () => packTransitionWeights(block.singleTransition, context.weightPrecision).data,
-      context.weightPrecision);
+    // 🔴 THE SINGLE TRANSITION IS THE BIGGEST LABEL A TRUNK HOLDS AND THE
+    // SLOWEST TO PACK: 162.1 MiB over 48 blocks, and 196 ms of host time cold,
+    // because f16 pays the narrowing on top of the int5 decode. See
+    // src/af3/device-weights.js - it decodes on the GPU instead, bit for bit,
+    // and falls through to the host packer when the weights cannot supply
+    // codes.
+    const singleTransitionOnDevice = context.weightPrecision === "f16"
+      ? await residentPackedOnDevice(this.device, {
+          key: block.singleTransition, label: "w.single-transition",
+          order: TRANSITION_ORDER, weights: block.singleTransition,
+          variant: context.weightPrecision,
+        })
+      : undefined;
+    const singleTransitionWeights = singleTransitionOnDevice !== undefined
+      ? { buffer: singleTransitionOnDevice }
+      : resident(
+        "w.single-transition",
+        () => packTransitionWeights(block.singleTransition, context.weightPrecision).data,
+        context.weightPrecision);
     const singleWeights = resident("w.single",
       () => packSingleAttentionWeights(block.singleAttention, context.weightPrecision).data,
       context.weightPrecision);

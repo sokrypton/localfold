@@ -29,9 +29,13 @@
  * - and either way it is 378 MiB bought with 494 ms. Measured here so that the
  * trade can be made deliberately rather than discovered.
  */
-import { openAf3Store } from "../../src/af3/weights.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights } from "../../src/af3/diffusion-weights.js";
 import { packBlockWeights } from "../../src/af3/diffusion-transformer-webgpu.js";
+import { packTransitionWeights } from "../../src/af3/transition-webgpu.js";
+import { packWeights as packTriangleWeights } from "../../src/triangle/weights.js";
+import { af3TriangleWeights } from "../../src/af3/triangle-webgpu.js";
+import { packGridAttentionWeights } from "../../src/af3/grid-attention-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -61,8 +65,34 @@ export async function main(device, args) {
   for (const block of blocks) packBlockWeights(block, "f32");
   const wideMs = performance.now() - wideStart;
 
+  // 🔴 THE TRUNK PACKS TOO, AND MORE OF IT. Its 48 pairformer blocks keep
+  // about 350 MiB resident against the transformer's 378, through four
+  // different packers - so the same question applies to them, and the answer
+  // decides whether the device decoder is worth extending.
+  const trunk = await trunkWeights(store);
+  const pairformer = trunk.pairformerBlocks;
+  const timeTrunk = (label, run) => {
+    const start = performance.now();
+    let bytes = 0;
+    for (const block of pairformer) bytes += run(block);
+    return { label, ms: Number((performance.now() - start).toFixed(0)),
+             mib: Number((bytes / (1024 * 1024)).toFixed(1)) };
+  };
+  const trunkRows = [
+    timeTrunk("single transition, f16",
+      (block) => packTransitionWeights(block.singleTransition, "f16").data.byteLength),
+    timeTrunk("pair transition, f32",
+      (block) => packTransitionWeights(block.pairTransition, "f32").data.byteLength),
+    timeTrunk("triangle outgoing, f32", (block) => packTriangleWeights(
+      af3TriangleWeights(block.triangleMultiplicationOutgoing, 128), "f32").data.byteLength),
+    timeTrunk("grid attention 1", (block) =>
+      packGridAttentionWeights(block.pairAttention1).data.byteLength),
+  ];
+
   return {
     nativeFloat16: typeof globalThis.Float16Array === "function",
+    trunkBlocks: pairformer.length,
+    trunkRows,
     blocks: blocks.length,
     packedMiB: Number((bytes / (1024 * 1024)).toFixed(1)),
     coldMs: Number(coldMs.toFixed(0)),

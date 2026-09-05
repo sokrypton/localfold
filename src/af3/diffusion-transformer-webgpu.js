@@ -1,5 +1,5 @@
 import { concatenateAs, writeInto } from "../runtime/float16.js";
-import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
+import { residentPackedOnDevice } from "./device-weights.js";
 import { SOURCES } from "./weights.js";
 /**
  * AF3's diffusion token transformer: 24 blocks, AdaLN-conditioned, pair-biased.
@@ -39,8 +39,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
-import { releaseResidentWeights, residentWeightBuffer, residentWeightBufferFilled }
-  from "../runtime/resident.js";
+import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
@@ -75,54 +74,17 @@ function residentBlockBuffer(device, block, pack, variant = "") {
  * The same buffer, decoded on the device when the weights allow it.
  *
  * 🔴 IT IS ~320 ms OF A SESSION'S FIRST FOLD. Packing these 24 blocks on the
- * host measures 437 ms cold against 119 for the GPU, and the two agree on every
- * one of 198 million elements - see tools/gpu/check-block-upload.js. The saving
- * is the int5 decode and the f16 narrowing, neither of which the host has any
- * reason to do.
- *
- * Returns undefined when the plan cannot be made - an eager store with no
- * `tensorSource`, a manifest that is not int5, an odd offset - and the caller
- * falls back to packing.
+ * host measures 440 ms cold against 119 for the GPU, and the two agree on every
+ * one of 198 million elements - see tools/gpu/check-block-upload.js. The shared
+ * machinery is in src/af3/device-weights.js, because the trunk's packers have
+ * the same shape and the same problem.
  */
-async function residentBlockOnDevice(device, block, precision, variant) {
-  if (precision !== "f16" || typeof globalThis.Float16Array !== "function") return undefined;
-  const sources = block[SOURCES];
-  if (sources === undefined) return undefined;
-  const entries = [];
-  let total = 0;
-  for (const name of BLOCK_ORDER) {
-    const thunk = sources[name];
-    // 🔴 LENGTHS FROM THE THUNK, NOT FROM `block[name]`, which would decode the
-    // tensor and undo the point of all of this.
-    if (typeof thunk !== "function" || !Number.isInteger(thunk.count)) return undefined;
-    entries.push({ name, thunk, offset: total, length: thunk.count });
-    total += thunk.count;
-  }
-  const planned = planBlockUpload(entries);
-  if (planned === undefined) return undefined;
-  // 🔴 A PLAN WITH NOTHING FOR THE GPU IS NOT A PLAN. An f32 manifest sends
-  // every tensor to `host`, which would leave an empty uniform table - and a
-  // zero-length buffer is rounded up to four bytes, so the failure is
-  // "Binding size (256) is larger than the size (4)" at the block stack rather
-  // than anything about weights. There is also nothing to win: the host path
-  // for f32 is a copy.
-  if (planned.gpu.params.length === 0) return undefined;
-  return residentWeightBufferFilled(
-    device, block, "difftx.block.resident", Math.ceil(total / 2) * 4,
-    async (buffer) => {
-      for (const entry of planned.host) {
-        const half = new globalThis.Float16Array(entry.length);
-        writeInto(half, block[entry.name], 0);
-        device.queue.writeBuffer(buffer, entry.offset * 2,
-                                 half.buffer, half.byteOffset, half.byteLength);
-      }
-      const release = await runBlockUpload(device, planned.gpu, buffer);
-      // ...the staging buffers are read by work already submitted, and this
-      // module's own idiom is to release after the submit; see flush().
-      await device.queue.onSubmittedWorkDone();
-      release();
-    },
-    variant);
+function residentBlockOnDevice(device, block, precision) {
+  if (precision !== "f16") return Promise.resolve(undefined);
+  return residentPackedOnDevice(device, {
+    key: block, label: "difftx.block.resident", order: BLOCK_ORDER,
+    weights: block, variant: precision,
+  });
 }
 
 /**
@@ -1379,8 +1341,7 @@ export class Af3DiffusionTransformerGpu {
             // residentBlockOnDevice: 437 ms of host packing becomes 119 of
             // compute, bit for bit, and a store or manifest that cannot supply
             // the codes falls straight through.
-            const onDevice = await residentBlockOnDevice(
-              this.device, block, weightPrecision, weightPrecision);
+            const onDevice = await residentBlockOnDevice(this.device, block, weightPrecision);
             blockWeights = {
               buffer: onDevice ?? residentBlockBuffer(
                 this.device, block, () => packBlockWeights(block, weightPrecision),
