@@ -857,6 +857,45 @@ export class Af3DiffusionTransformerGpu {
   #pairNorm;
 
   /**
+   * The last shape this instance compiled for, and everything #compile
+   * derived from it.
+   *
+   * 🔴 #compile BUILDS THE LARGEST WGSL IN THE MODEL, AS STRINGS, and did it
+   * on every denoiser call - eleven shaders plus one per block in a super
+   * block, template-substituted from the shape, and then handed to a pipeline
+   * cache that COMPARES the string it was given against the one it stored.
+   * None of it reads the noise level. A sampler paid for all of it two hundred
+   * times to be told each time that the pipeline was already there.
+   */
+  #compiled;
+
+  /**
+   * Bind groups, keyed by the pass that uses them.
+   *
+   * 🔴 THE STACK CREATES SEVEN PER BLOCK AND HAS TWENTY-FOUR OF THEM. With the
+   * scratch tensors and the resident weights both stable across a schedule,
+   * every one of those 168 descriptors names the same buffers on every step -
+   * and each carries a `getBindGroupLayout` call of its own. The entry stores
+   * the buffers it was built from, so a call whose buffers moved (the
+   * uploading weight path, where a super block's weights are pooled and
+   * recycled) rebuilds rather than binding something else.
+   */
+  #bindGroups = new Map();
+
+  /**
+   * The stack's scratch tensors, kept across calls.
+   *
+   * 🔴 THEIR SIZE IS THE SHAPE'S, NOT THE STEP'S, and this allocator does not
+   * pool - so a schedule created and destroyed eleven buffers per step and
+   * handed every pass a bind group naming addresses that would not exist next
+   * time. Keeping them costs nothing at the PEAK, which is inside a call and
+   * unchanged, and it is what makes #bindGroups hit. Released by dispose(),
+   * which the samplers call in a finally; the confidence head runs after that
+   * and is where an AF3 fold's peak actually is.
+   */
+  #scratch;
+
+  /**
    * @param {{residentWeights?: boolean}} [options] whether the 24 blocks' packed
    *   weights stay on the device between calls. See the note at the upload; a
    *   budget refusal turns this off on its own.
@@ -869,11 +908,55 @@ export class Af3DiffusionTransformerGpu {
   }
 
   /** Give back the normalised pair tensor. Callers that keep an instance own this. */
-  dispose() {
+  /** Give back the normalised pair tensor alone. */
+  #releasePairNorm() {
     if (this.#pairNorm === undefined) return;
     this.#pairNorm.buffer.destroy();
     noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
     this.#pairNorm = undefined;
+    this.#bindGroups.clear();
+  }
+
+  dispose() {
+    this.#bindGroups.clear();
+    if (this.#scratch !== undefined) {
+      for (const [label, entry] of Object.entries(this.#scratch.buffers)) {
+        entry.buffer.destroy();
+        noteDestroy(this.device, entry.bytes, label);
+      }
+      this.#scratch = undefined;
+    }
+    if (this.#pairNorm === undefined) return;
+    this.#pairNorm.buffer.destroy();
+    noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
+    this.#pairNorm = undefined;
+  }
+
+  /**
+   * A scratch tensor that outlives the call, sized by the shape.
+   *
+   * The whole set is dropped and rebuilt when the shape moves, because they
+   * move together and a half-resized set is a bind group naming two different
+   * molecules.
+   */
+  #scratchBuffer(key, label, bytes, usage) {
+    if (this.#scratch?.key !== key) {
+      if (this.#scratch !== undefined) {
+        for (const [name, entry] of Object.entries(this.#scratch.buffers)) {
+          entry.buffer.destroy();
+          noteDestroy(this.device, entry.bytes, name);
+        }
+      }
+      this.#scratch = { key, buffers: {} };
+      this.#bindGroups.clear();
+    }
+    const found = this.#scratch.buffers[label];
+    if (found !== undefined) return { buffer: found.buffer };
+    const size = Math.ceil(bytes / 4) * 4;
+    noteAllocation(this.device, label, size);
+    const buffer = this.device.createBuffer({ label, size, usage });
+    this.#scratch.buffers[label] = { buffer, bytes: size };
+    return { buffer };
   }
 
   /**
@@ -921,6 +1004,15 @@ export class Af3DiffusionTransformerGpu {
    * and docs/AF3.md records why it cannot be moved either.
    */
   async #compile(tokens, weights) {
+    if (this.#compiled?.tokens === tokens && this.#compiled.weights === weights) {
+      return this.#compiled.result;
+    }
+    const result = await this.#buildCompile(tokens, weights);
+    this.#compiled = { tokens, weights, result };
+    return result;
+  }
+
+  async #buildCompile(tokens, weights) {
     const channels = weights.channels;
     const condChannels = weights.condChannels;
     const pairChannels = weights.pairChannels;
@@ -1033,10 +1125,24 @@ export class Af3DiffusionTransformerGpu {
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
-      const actBuffer = keep(this.allocator.upload("difftx.act", Float32Array.from(act),
-        storage | GPUBufferUsage.COPY_SRC));
-      const condBuffer = keep(this.allocator.upload("difftx.cond", cond, storage));
-      const maskBuffer = keep(this.allocator.upload("difftx.mask", mask, storage));
+      // See #scratch. `act` and `cond` are written into their buffers rather
+      // than uploaded into new ones; `mask` is the shape's and is written for
+      // the same price as testing whether it changed.
+      const shapeKey = `${tokens}:${channels}:${condChannels}:${pairChannels}`
+        + `:${width}:${weights.transitionFactor}:${heads}`;
+      const scratch = (label, bytes, usage = storage) =>
+        this.#scratchBuffer(shapeKey, label, bytes, usage);
+      const actBuffer = scratch("difftx.act", tokens * channels * 4,
+        storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+      const condBuffer = scratch("difftx.cond", tokens * condChannels * 4,
+        storage | GPUBufferUsage.COPY_DST);
+      const maskBuffer = scratch("difftx.mask", tokens * 4,
+        storage | GPUBufferUsage.COPY_DST);
+      const write = (allocation, data) => this.device.queue.writeBuffer(
+        allocation.buffer, 0, data.buffer, data.byteOffset, data.byteLength);
+      write(actBuffer, act instanceof Float32Array ? act : Float32Array.from(act));
+      write(condBuffer, cond);
+      write(maskBuffer, mask);
       // See #pairNorm: everything on this line and the two below it is the
       // trunk's, not the step's, and is skipped outright when the caller keeps
       // this instance across a schedule.
@@ -1044,7 +1150,11 @@ export class Af3DiffusionTransformerGpu {
       const buildPairNorm = this.#pairNorm?.pairCond !== pairCond
         || this.#pairNorm?.bytes !== normBytes;
       if (buildPairNorm) {
-        this.dispose();
+        // 🔴 THE PAIR NORM ALONE, NOT dispose(). The scratch set was created
+        // three lines above and its buffers are already bound into this call's
+        // command encoder; dropping it here destroyed a buffer the submit then
+        // used, which WebGPU reports at the end of the stack rather than here.
+        this.#releasePairNorm();
         noteAllocation(this.device, "difftx.pair-norm", normBytes);
         // 🔴 `pairCond` IS NOT SET UNTIL THE PASS THAT FILLS THIS HAS BEEN
         // SUBMITTED. An allocation between here and there can refuse on
@@ -1065,19 +1175,18 @@ export class Af3DiffusionTransformerGpu {
         ? keep(this.allocator.upload("difftx.pair-scale",
                                      weights.pairInputLayerNormScale, storage))
         : undefined;
-      const logits = keep(this.allocator.allocate("difftx.logits", heads * pairs * 4, storage));
+      const logits = scratch("difftx.logits", heads * pairs * 4);
       // The AdaLN pass hands the projection its input through this.
-      const xBuffer = keep(this.allocator.allocate("difftx.x", tokens * channels * 4,
-        storage));
-      const gatedBuffer = keep(this.allocator.allocate("difftx.gated",
-        tokens * channels * weights.transitionFactor * 4, storage));
-      const q = keep(this.allocator.allocate("difftx.q", tokens * width * 4, storage));
-      const k = keep(this.allocator.allocate("difftx.k", tokens * width * 4, storage));
-      const v = keep(this.allocator.allocate("difftx.v", tokens * width * 4, storage));
-      const gate = keep(this.allocator.allocate("difftx.gate", tokens * width * 4, storage));
-      const gathered = keep(this.allocator.allocate("difftx.gathered", tokens * width * 4, storage));
-      const readback = keep(this.allocator.allocate("difftx.readback", tokens * channels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const xBuffer = scratch("difftx.x", tokens * channels * 4);
+      const gatedBuffer = scratch("difftx.gated",
+        tokens * channels * weights.transitionFactor * 4);
+      const q = scratch("difftx.q", tokens * width * 4);
+      const k = scratch("difftx.k", tokens * width * 4);
+      const v = scratch("difftx.v", tokens * width * 4);
+      const gate = scratch("difftx.gate", tokens * width * 4);
+      const gathered = scratch("difftx.gathered", tokens * width * 4);
+      const readback = scratch("difftx.readback", tokens * channels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
 
       const start = performance.now();
       // 🔴 ONE VALIDATION SCOPE PER BLOCK, NONE OF THEM AWAITED IN THE LOOP.
@@ -1117,15 +1226,27 @@ export class Af3DiffusionTransformerGpu {
       // what runs, only how many times the CPU asks the driver to run it.
       validation.begin();
       let encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
-      const run = (label, pipeline, buffers, x, y = 1) => {
+      // See #bindGroups: `key` names the pass, and the entry is rebuilt if the
+      // buffers behind it are not the ones it was made from.
+      const bind = (key, pipeline, buffers) => {
+        const held = buffers.map((allocation) => allocation.buffer);
+        const found = this.#bindGroups.get(key);
+        if (found !== undefined && found.pipeline === pipeline
+            && found.buffers.length === held.length
+            && found.buffers.every((buffer, at) => buffer === held[at])) {
+          return found.group;
+        }
+        const group = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: held.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        });
+        this.#bindGroups.set(key, { pipeline, buffers: held, group });
+        return group;
+      };
+      const run = (label, pipeline, buffers, x, y = 1, key = label) => {
         const pass = encoder.beginComputePass({ label });
         pass.setPipeline(pipeline);
-        pass.setBindGroup(0, this.device.createBindGroup({
-          layout: pipeline.getBindGroupLayout(0),
-          entries: buffers.map((allocation, binding) => ({
-            binding, resource: { buffer: allocation.buffer },
-          })),
-        }));
+        pass.setBindGroup(0, bind(key, pipeline, buffers));
         pass.dispatchWorkgroups(x, y);
         pass.end();
       };
@@ -1186,24 +1307,31 @@ export class Af3DiffusionTransformerGpu {
               packBlockWeights(block, weightPrecision).data, storage));
             pending.push(blockWeights);
           }
+          // 🔴 THE BIND GROUP CACHE IS KEYED BY BLOCK, NOT BY LABEL. Every
+          // block runs the same seven labels against its OWN weights, so one
+          // entry per label would be a cache that misses every time and
+          // rebuilds - or, worse, hits and binds block 0's weights.
+          const at = groupIndex * perSuper + inner;
+          const runBlock = (label, pipeline, buffers, x, y = 1) =>
+            run(label, pipeline, buffers, x, y, `${label}:${at}`);
           const pairGroups = Math.ceil(pairs / 64);
-          run("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
+          runBlock("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
               Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
-          run("adaln", compiled.adaln, [actBuffer, condBuffer, blockWeights, xBuffer],
+          runBlock("adaln", compiled.adaln, [actBuffer, condBuffer, blockWeights, xBuffer],
               Math.ceil(tokens / tile));
-          run("qkvg", compiled.qkvg, [xBuffer, blockWeights, q, k, v, gate],
+          runBlock("qkvg", compiled.qkvg, [xBuffer, blockWeights, q, k, v, gate],
               Math.ceil(tokens / tile), sources.qkvgSplits);
           const slots = tokens * heads;
-          run("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
+          runBlock("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
               Math.min(slots, GRID_WIDTH), Math.ceil(slots / GRID_WIDTH));
-          run("attention-output", compiled.attentionOutput,
+          runBlock("attention-output", compiled.attentionOutput,
               [gathered, gate, condBuffer, blockWeights, actBuffer],
               Math.ceil(tokens / tile), sources.outSplits);
-          run("ffw-adaln", compiled.ffwAdaln,
+          runBlock("ffw-adaln", compiled.ffwAdaln,
               [condBuffer, blockWeights, actBuffer, xBuffer], Math.ceil(tokens / tile));
-          run("ffw-wide", compiled.ffwWide, [xBuffer, blockWeights, gatedBuffer],
+          runBlock("ffw-wide", compiled.ffwWide, [xBuffer, blockWeights, gatedBuffer],
               Math.ceil(tokens / tile), sources.wideSplits);
-          run("ffw-out", compiled.ffwOut,
+          runBlock("ffw-out", compiled.ffwOut,
               [gatedBuffer, condBuffer, blockWeights, actBuffer],
               Math.ceil(tokens / outTile), sources.outSplits);
         }
