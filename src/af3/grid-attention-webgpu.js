@@ -556,6 +556,12 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
     throw new RangeError(`unknown grid attention staged precision ${stagedPrecision}`);
   }
   const tile16 = staged && stagedPrecision === "f16";
+  // 🔴 OFF, MEASURED. See the note in the kernel: skipping the rescale when the
+  // running maximum does not move is arithmetically the obvious win and is a
+  // LOSS on this device. `attendLazyRescale: true` is the arm
+  // bench-grid-attend.js compares against, kept so the result is reproducible
+  // rather than remembered.
+  const lazyRescale = shape.attendLazyRescale === true;
   const tileType = tile16 ? "vec4<f16>" : "vec4<f32>";
   const widen = (e) => (tile16 ? `vec4<f32>(${e})` : e);
   const readK = (t) => (staged ? widen(`k_tile[slot * HD4 + ${t}u]`) : vec4Of("k", `k_base + ${t}u`));
@@ -580,12 +586,39 @@ ${unroll((t) => `    score += dot(qv${t}, ${readK(t)});`)}
     // accumulated is rescaled by exp(old - new) whenever a larger logit
     // arrives, which is algebraically the same as subtracting the final maximum
     // at the end - and is what removes three passes over the keys.
+${lazyRescale ? `    // 🔴 THE ARM THAT DOES NOT PAY, KEPT SO IT STAYS MEASURED. Written straight
+    // through, every key costs acc = acc * previous + weight * v on all
+    // ${vectors} accumulators - a multiply and a fused multiply-add - and on the keys
+    // that do not raise the running maximum, which is nearly all of them once a
+    // few have been seen, previous is exp(0) and the multiply is by one. Making
+    // that conditional takes the inner loop from ${vectors * 3} vector operations a key
+    // to ${vectors * 2} and skips an exp with them, and it is SLOWER:
+    //
+    //     tokens    lazy    always   speedup
+    //        128   11.3 ms   11.6      1.027
+    //        256   44.6      43.3      0.971
+    //        400  131.1     125.5      0.957
+    //
+    // 🔴 BECAUSE THE BRANCH IS NOT PER LANE IN PRACTICE. The 64 lanes of a
+    // workgroup share (row, head) and hold 64 different queries, each with its
+    // own maximum - so the block runs whenever ANY of them needs it, which over
+    // 64 lanes is most keys. What is left is a compare, a lost fused
+    // multiply-add, and the divergence itself.
     let new_max = max(running_max, logit);
+    if (new_max > running_max) {
+      let previous = exp(running_max - new_max);
+      running_sum = running_sum * previous;
+${unroll((t) => `      acc${t} = acc${t} * previous;`)}
+      running_max = new_max;
+    }
+    let weight = exp(logit - running_max);
+    running_sum = running_sum + weight;
+${unroll((t) => `    acc${t} = acc${t} + weight * ${readV(t)};`)}` : `    let new_max = max(running_max, logit);
     let previous = exp(running_max - new_max);
     let weight = exp(logit - new_max);
     running_sum = running_sum * previous + weight;
     running_max = new_max;
-${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`;
+${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`}`;
 
   const loop = staged ? `
   for (var j0 = 0u; j0 < N; j0 += ${keyChunk}u) {
@@ -750,11 +783,15 @@ export class Af3GridSelfAttentionGpu {
 
     const packed = packGridAttentionWeights(weights);
     const stagedPrecision = options.stagedPrecision ?? "f32";
+    // ...forceable, so both arms can be timed in ONE process. See the note on
+    // the lazy rescale in the attend kernel, and bench-grid-attend.js.
+    const attendLazyRescale = options.attendLazyRescale !== false;
     const sources = createGridAttentionShaders(
-      { n, channels, heads, dimension, transpose, stagedPrecision },
+      { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
-      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`;
+      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
+      + `:${attendLazyRescale}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
