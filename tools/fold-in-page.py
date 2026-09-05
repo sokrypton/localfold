@@ -112,7 +112,16 @@ def template_entry(text):
             "source": text}
 
 
-STATUS_LINE = "(document.getElementById('status-message')||{}).textContent"
+# 🔴 AND THE MODEL DIAL BESIDE IT, because the weights now download while the
+# MSA search runs and the status line deliberately says nothing about them.
+# Reading only the line would show a gap exactly where the parallel half of the
+# work is.
+STATUS_LINE = """(() => {
+  const line = (document.getElementById('status-message')||{}).textContent || '';
+  const dial = document.getElementById('model-load');
+  const loading = dial && !dial.hidden ? dial.getAttribute('aria-label') : '';
+  return loading ? line + '  ||  ' + loading : line;
+})()"""
 
 
 def main():
@@ -137,6 +146,11 @@ def main():
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
+    parser.add_argument("--timeline", action="store_true",
+                        help="print when the model shards and the MSA search"
+                             " were each on the wire, and how much they"
+                             " overlapped. The two used to be strictly"
+                             " sequential.")
     parser.add_argument("--template", default="",
                         help="a PDB entry (1abc, 1abc_A), a UniProt accession,"
                              " `auto` to use what the MSA search finds, or"
@@ -225,7 +239,10 @@ def main():
             if (log.length === 0 || log[log.length - 1] !== now) log.push(now);
           }).observe(el, { childList: true, characterData: true, subtree: true });
         })()""")
-        cdp.evaluate(ws, "document.getElementById('predict').click()")
+        # ...stamped before the click so the timeline can tell what the fold
+        # caused from what the page had already fetched. See --timeline.
+        cdp.evaluate(ws, "window.__foldClickedAt = performance.now();"
+                         " document.getElementById('predict').click()")
         cdp.wait_for(ws, """(() => {
           const s = document.getElementById('status-message');
           const text = s ? s.textContent : '';
@@ -234,6 +251,42 @@ def main():
         })()""", timeout=args.timeout, what="the fold to finish",
                      progress=STATUS_LINE)
         time.sleep(1.5)
+
+        # 🔴 THE OVERLAP IS MEASURED, NOT ASSERTED. The weights and the MSA
+        # search were serialised - the download ran inside the fold, which runs
+        # after the alignment - and the fix is invisible from the outside
+        # except as a total. Resource timing says it directly: when the model
+        # shards were on the wire, and when the search was.
+        if args.timeline:
+            print("timeline:", cdp.evaluate(ws, r"""(() => {
+              // 🔴 ONLY WHAT THE FOLD ASKED FOR, MEASURED FROM THE CLICK.
+              // The first version of this filtered the whole resource list by
+              // name and reported a 1.2s "overlap" - which the unchanged tree
+              // reproduced exactly, because both patterns were matching MODULE
+              // fetches from page load: `src/input/mmseqs2-api.js` is a match
+              // for /mmseqs/, and the local weights directory is probed before
+              // the button is ever pressed. A span that starts at 66ms is not
+              // a span of anything a click caused.
+              const since = window.__foldClickedAt ?? 0;
+              const span = (match) => {
+                const hits = performance.getEntriesByType('resource')
+                  .filter((entry) => match.test(entry.name) && entry.startTime >= since);
+                if (hits.length === 0) return null;
+                return {
+                  requests: hits.length,
+                  start: Math.round(Math.min(...hits.map((e) => e.startTime))),
+                  end: Math.round(Math.max(...hits.map((e) => e.responseEnd))),
+                };
+              };
+              // Shard files and the manifest beside them, never a .js module.
+              const model = span(/(weights-\d+[^/]*\.bin|manifest\.json)(\?|$)/);
+              const search = span(/^https?:\/\/[^/]*colabfold/);
+              const overlap = model && search
+                ? Math.round(Math.min(model.end, search.end)
+                             - Math.max(model.start, search.start))
+                : null;
+              return JSON.stringify({ model, search, overlapMs: overlap });
+            })()"""))
 
         print("frames:", cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};

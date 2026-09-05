@@ -399,6 +399,43 @@ in ten seconds. Watch those `...` lines: a wait that prints nothing never
 started. Driving a real complex needs the tool to build one entity per chain
 through `window.__entityList`, which it does not do yet.
 
+🔴 **THE WEIGHTS AND THE MSA SEARCH RUN TOGETHER NOW, AND USED NOT TO.** The
+model was loaded inside the fold, which runs after the alignment - so a cold
+page with the MSA set to search spent the whole MMseqs2 round trip with the
+network otherwise idle, then spent the whole download with the search already
+answered. They need nothing from each other: one is a static file from a CDN,
+the other a query against a server that queues. `startModelPreload` begins the
+load before the templates and the alignment; both loaders memoise, so the fold
+awaiting the same call later gets that promise rather than a second download.
+Measured with `tools/fold-in-page.py --timeline`, which reads resource timing:
+
+| | search | model | overlap |
+|---|---|---|---|
+| before | 795-1426 ms | 1472-1902 ms | **-46 ms** (strictly sequential) |
+| after | 1296-2227 ms | 1359-1844 ms | **+485 ms** |
+
+🔴 **AND A `--timeline` THAT FILTERS BY NAME ALONE MEASURES PAGE LOAD.** The
+first version reported a 1.2-second overlap - and the UNCHANGED tree reproduced
+it exactly, because `/mmseqs/` matches `src/input/mmseqs2-api.js` and the
+weights directory is probed before the button is pressed. Both spans started at
+66 ms, which is not a span of anything a click caused. It stamps
+`window.__foldClickedAt` at the click and ignores everything earlier.
+
+🔴 **AND THE DOWNLOAD MUST NOT WRITE TO THE STATUS LINE ANY MORE.** Two writers
+several times a second, and the message that loses is the one about a server
+that may queue for a minute. It reports on the right instead - a filling dial
+plus `AlphaFold 3 · 92 / 265 MiB` - and appears only once a load reports itself
+partway, so a model already in the shard cache does not flash it.
+
+🔴 **AND THE DIAL IS NEVER LAID OUT UNLESS SOMETHING FORCES IT.** It is
+`hidden` on a bare page, so `tools/mobile-layout.py` had never seen it, and its
+label cannot wrap or shrink: at 320px the label took 171px of a 254px row and
+left the status line **75px**, which fits none of "MSA search · queued
+(PENDING) · 41s". Nothing overflowed, so every fit check passed. The label is
+`display: none` below 560px; the dial and its title carry the bytes there.
+Measured by forcing the dial visible at each width, which is the only way it is
+ever laid out.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring

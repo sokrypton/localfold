@@ -241,6 +241,79 @@
   gap: 6px;
 }
 
+/* THE STATUS LINE AND THE MODEL DIAL SHARE A ROW. The line takes what is
+   left, so a long message pushes nothing off the end; the dial is fixed and
+   sits against the right edge. */
+#status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+#status-line #status-message { flex: 1 1 auto; min-width: 0; }
+
+/* ...and it is `hidden` whenever there is nothing loading, which is most of the
+   time: the attribute is what app.js toggles, so this only has to describe the
+   shown state. */
+#model-load {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 0;
+}
+
+/* 🔴 THE ONE PLACE THE DOWNLOAD SPEAKS. It used to write "Loading AlphaFold 3 ·
+   N MiB" into the status line, which was harmless while it was the only thing
+   running and became a fight once it ran beside the MSA search - two writers,
+   several times a second, and the message that loses is the one about a server
+   that may be queuing for a minute. Here it cannot collide with anything.
+   Smaller and quieter than the line, because it is a secondary job. */
+#model-load-text {
+  font-size: 11px;
+  line-height: 1;
+  color: #6b7280;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 🔴 THE LABEL GOES FIRST ON A PHONE, NOT THE MESSAGE. It cannot wrap and it
+   cannot shrink, so at 320px its 171px took two thirds of a 254px row and left
+   the status line 75px - which fits none of "MSA search · queued (PENDING) ·
+   41s · api.colabfold.com". Nothing overflowed, so a fit check saw nothing
+   wrong; it was measured by forcing the dial visible, which is the only way it
+   is ever laid out. The dial keeps the meaning, and its title keeps the bytes. */
+@media (max-width: 560px) {
+  #model-load-text { display: none; }
+}
+#model-load[hidden] { display: none; }
+#model-load svg { width: 18px; height: 18px; display: block; }
+#model-load circle {
+  fill: none;
+  stroke-width: 3;
+}
+.model-load-track { stroke: #e5e7eb; }
+.model-load-fill {
+  stroke: #3b82f6;
+  stroke-linecap: round;
+  /* The arc is set by app.js as a dash offset; the transition is what makes it
+     sweep rather than jump between shard callbacks. */
+  transition: stroke-dashoffset .2s linear;
+}
+
+/* A load whose total is not known yet spins instead of filling, for the same
+   reason the bar sweeps: a dial frozen at nothing reads as a hang. */
+#model-load[data-state="unknown"] .model-load-fill {
+  stroke-dasharray: 14 43;
+  stroke-dashoffset: 0;
+  transform-origin: 12px 12px;
+  animation: localfold-dial 1s linear infinite;
+}
+@keyframes localfold-dial {
+  from { transform: rotate(-90deg); }
+  to { transform: rotate(270deg); }
+}
+
 #status-row progress {
   width: 100%;
   height: 3px;

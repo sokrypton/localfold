@@ -235,6 +235,92 @@ function describeBudget(error) {
  * removal; a fraction fills it; "waiting" sweeps for the stretches that have
  * nothing to count.
  */
+/**
+ * The model-loading dial, to the right of the status line.
+ *
+ * 🔴 A SECOND INDICATOR BECAUSE THERE ARE NOW TWO JOBS AT ONCE. The weights and
+ * the MSA search used to run one after the other, so a single status line could
+ * narrate both. Started together they would fight over it - each overwriting
+ * the other's message several times a second, which reads as a page that cannot
+ * make up its mind. The dial says how the download is doing without taking the
+ * line away from the search.
+ *
+ * It appears only once a load actually reports itself partway through: a model
+ * already in the shard cache resolves without a single progress callback, and a
+ * dial that flashed on and off for it would be noise about nothing happening.
+ *
+ * @param {number|null} fraction 0..1, NaN for a load with no total, null to hide
+ * @param {string} [detail] the tooltip, e.g. "AlphaFold 3 · 92 / 150 MiB"
+ */
+function modelProgress(fraction, detail = "") {
+  const node = document.getElementById("model-load");
+  if (node === null) return;
+  if (fraction === null) {
+    node.hidden = true;
+    return;
+  }
+  node.hidden = false;
+  node.title = detail;
+  node.setAttribute("aria-label", detail);
+  const label = node.querySelector("#model-load-text");
+  if (label !== null) label.textContent = detail;
+  const fill = node.querySelector(".model-load-fill");
+  if (fill === null) return;
+  // 🔴 THE SAME GUARD THE BAR NEEDED. A non-finite fraction must not be able to
+  // fail a fold; here it means "loading, total unknown", which the stylesheet
+  // paints as a spin rather than an arc.
+  if (!Number.isFinite(fraction)) {
+    node.dataset.state = "unknown";
+    return;
+  }
+  const value = Math.min(Math.max(fraction, 0), 1);
+  // 2πr for the r=9 circle in the markup; the arc is drawn by holding back the
+  // dash rather than by redrawing the path.
+  const circumference = 2 * Math.PI * 9;
+  fill.style.strokeDasharray = `${circumference}`;
+  fill.style.strokeDashoffset = `${circumference * (1 - value)}`;
+  node.dataset.state = "loading";
+}
+
+/**
+ * Begin fetching the model's weights, without waiting for them.
+ *
+ * 🔴 THE DOWNLOAD AND THE SEARCH DO NOT NEED EACH OTHER, AND USED TO WAIT
+ * ANYWAY. The weights were loaded inside the fold, which runs after the
+ * alignment - so a cold page with the MSA set to search spent the whole MMseqs2
+ * round trip with the network otherwise idle, and then spent the whole download
+ * with the search already answered. They are independent: one is a static file
+ * from a CDN and the other is a query against a server that queues. Started
+ * together the slower one sets the pace, which is the best either can do.
+ *
+ * Both loaders memoise their promise, so the fold awaiting the same call later
+ * gets this one rather than a second download.
+ *
+ * @returns {Promise<object>} awaited by whichever fold path runs
+ */
+function startModelPreload(family, signal) {
+  const name = family === "af3" ? "AlphaFold 3" : "AlphaFold 2";
+  const report = ({ loadedBytes = 0, totalBytes = 0 }) => {
+    if (signal.aborted) return;
+    modelProgress(totalBytes === 0 ? NaN : loadedBytes / totalBytes,
+      totalBytes === 0
+        ? `${name} · ${(loadedBytes / 1048576).toFixed(0)} MiB`
+        : `${name} · ${(loadedBytes / 1048576).toFixed(0)}`
+          + ` / ${(totalBytes / 1048576).toFixed(0)} MiB`);
+  };
+  const load = family === "af3"
+    ? loadAf3Weights(report)
+    : loadModel("msa", report, signal, family);
+  // 🔴 A REJECTION HANDLER NOW, OR AN UNHANDLED ONE LATER. Nothing awaits this
+  // promise until the fold reaches it, and a download that fails before then is
+  // an unhandled rejection - which in a page means a console error and, with
+  // some hosts, a reported crash for a fold that goes on to report the failure
+  // properly itself. Attaching a handler marks it handled; the original still
+  // throws where it is awaited.
+  load.then(() => modelProgress(null), () => modelProgress(null));
+  return load;
+}
+
 function progress(fraction) {
   const bar = element("progress");
   if (fraction === null) {
@@ -1030,7 +1116,8 @@ const cheapHash = (text) => {
  * pLDDT and PAE, and that is the frame the page lands on.
  */
 async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes = [],
-                           modifications = [], chainKinds = [], templates = []) {
+                           modifications = [], chainKinds = [], templates = [],
+                           modelLoad = undefined) {
   const sequence = chains.join(":");
   // 🔴 THE COLONS ARE NOT RESIDUES. `sequence` carries them so the featuriser
   // can see the chain split; every length below is the residue count, and a PAE
@@ -1105,13 +1192,17 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // 🔴 A CONTINUATION REWINDS RATHER THAN RESTARTS. Asking for more recycles
   // reuses the trunk and runs only the passes that are missing.
 
-  status("Loading AlphaFold 3 · 0 MiB");
-  const weights = await loadAf3Weights(({ loadedBytes, totalBytes }) => {
-    if (signal.aborted) return;
-    progress(totalBytes === 0 ? 0 : loadedBytes / totalBytes);
-    status(`Loading AlphaFold 3 · ${(loadedBytes / 1048576).toFixed(0)}`
-      + ` / ${(totalBytes / 1048576).toFixed(0)} MiB`);
-  });
+  // 🔴 AWAITED HERE, STARTED LONG AGO. startModelPreload kicked this off before
+  // the templates and the alignment, so on a cold page the 150 MB came down
+  // beside the MMseqs2 round trip rather than after it.
+  //
+  // 🔴 AND IT WRITES NOTHING TO THE STATUS LINE. It used to say "Loading
+  // AlphaFold 3 · N MiB" there, which was fine while the download was the only
+  // thing happening and is not fine now that it runs beside the search: the two
+  // overwrite each other, and the message that loses is the one about the
+  // server that might be queuing for a minute. The download reports itself on
+  // the right instead, dial and label both.
+  const weights = await (modelLoad ?? loadAf3Weights());
   throwIfAborted(signal);
 
   const device = await getDevice();
@@ -1521,6 +1612,15 @@ async function fold(event) {
     let chainKinds = request.chainKinds ?? chains.map(() => "protein");
     const ligandCodes = request.ligandCodes;
     const modifications = request.modifications ?? [];
+    // 🔴 DECIDED BEFORE ANY NETWORK WORK, because the download starts here.
+    // Nothing below changes it: the only reassignment of `chainKinds` is the
+    // pasted-A3M branch, which runs only where `nucleicCount` is already zero
+    // and sets it to the protein it already was.
+    const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
+    const family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
+    // ...and started, not awaited. The templates and the alignment below are
+    // network work of their own; this runs beside them.
+    const modelLoad = startModelPreload(family, signal);
     // 🔴 FETCHED HERE AND NOT INSIDE THE FOLD, so a structure that cannot be
     // reached stops the run with its own message rather than surfacing as a
     // fold that scored badly. AF3 only: AF2's drivers take a template through
@@ -1553,8 +1653,6 @@ async function fold(event) {
         text: structure.text, source });
     }
     let sequence = chains.join("");
-    const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
-    const family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
 
     // 🔴 THE ALIGNMENT COVERS THE PROTEIN CHAINS AND NOTHING ELSE, which is
     // what an A3M can mean and what featuriseProtein reads it as: its columns
@@ -1651,7 +1749,7 @@ async function fold(event) {
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (family === "af3") {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
-                        modifications, chainKinds, templateSources);
+                        modifications, chainKinds, templateSources, modelLoad);
       return;
     }
 
@@ -1665,13 +1763,10 @@ async function fold(event) {
     // single sequence becomes a one-row alignment instead.
     // ...and one weight assembly: the A3M driver always wants the full extra
     // stack, so the "single" variant is no longer reachable from the page.
-    const variant = "msa";
-    const model = await loadModel(variant, (value) => {
-      if (signal.aborted) return;
-      progress(value.totalBytes === 0 ? 0 : value.loadedBytes / value.totalBytes);
-      status(`Loading model · ${(value.loadedBytes / 1048576).toFixed(0)}`
-        + ` / ${(value.totalBytes / 1048576).toFixed(0)} MiB`);
-    }, signal, family);
+    // 🔴 AWAITED, NOT STARTED, and silent on the status line. startModelPreload
+    // began this before the alignment and reports itself on the right; see the
+    // note in foldWithAf3 for why it no longer writes to the line.
+    const model = await modelLoad;
     throwIfAborted(signal);
     progress(null);
     const recycles = recycleCount();

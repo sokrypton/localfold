@@ -421,7 +421,23 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                  when there is nothing to report, filled while a fold runs. The
                  element is always laid out, so nothing below it ever moves. -->
             <div id="status-row">
-                <div id="status-message"></div>
+                <!-- THE LINE AND THE DIAL SHARE A ROW, the bar keeps its own.
+                     The weights download and the MSA search run at the same
+                     time now, so the one status line cannot narrate both: the
+                     line is the fold's, the dial is the download's. -->
+                <div id="status-line">
+                    <div id="status-message"></div>
+                    <div id="model-load" hidden>
+                        <span id="model-load-text"></span>
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <circle class="model-load-track" cx="12" cy="12" r="9"></circle>
+                            <!-- Rotated so the arc starts at twelve o'clock;
+                                 an SVG circle's path begins at three. -->
+                            <circle class="model-load-fill" cx="12" cy="12" r="9"
+                                    transform="rotate(-90 12 12)"></circle>
+                        </svg>
+                    </div>
+                </div>
                 <progress id="progress" max="1" value="0" data-state="idle"></progress>
             </div>
         </div>
