@@ -27,6 +27,7 @@ import { normalFrom } from "../../src/af3/fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
 import { noiseLevels, randomAugmentation, samplerStep } from "../../src/af3/diffusion-sampler-reference.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -56,6 +57,7 @@ export async function main(device, args) {
   };
   const input = {
     shape: batch.shape,
+    dialect: ALPHAFOLD3,
     conditioning: perAtomConditioning({
       positions: batch.refPos, mask: batch.refMask, element: batch.refElement,
       charge: batch.refCharge, atomNameChars: batch.refAtomNameChars,

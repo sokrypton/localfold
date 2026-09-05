@@ -8,6 +8,7 @@
  * a numerical disagreement rather than a missing key.
  */
 import { HttpTensorStore } from "../reference/http-tensor-store.js";
+import { dialectFor } from "./dialect.js";
 
 export const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";
@@ -463,6 +464,7 @@ export async function confidenceWeights(store) {
     }));
   }
   return {
+    dialect: af3Dialect(store),
     pairChannels: 128, singleChannels: 384, targetFeatWidth: 447, blocks,
     leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
     rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
@@ -482,6 +484,30 @@ export async function confidenceWeights(store) {
   };
 }
 
+/**
+ * The dialect a bundle's own manifest names.
+ *
+ * 🔴 THE BUNDLE SAYS WHICH GRAPH IT IS, SO A CALLER CANNOT GET IT WRONG.
+ * `tools/export_af3_model.py` writes `model.name` into every manifest precisely
+ * because AlphaFold 3's parameters and a ported checkpoint build the same
+ * graph, land in the same directory shape, and differ in branches that are
+ * silent when taken wrongly. Deriving the dialect here rather than accepting it
+ * from the caller means the weights and the graph cannot disagree.
+ *
+ * 🔴 AND AN UNNAMED BUNDLE RAISES. Defaulting to stock AF3 would make a
+ * ported bundle with a missing field fold through the wrong branches and
+ * return a structure, which is the failure mode this whole file avoids.
+ */
+export function af3Dialect(store) {
+  const name = store?.manifest?.model?.name;
+  if (typeof name !== "string") {
+    throw new Error("this bundle's manifest does not name its model, so its "
+      + "dialect cannot be derived; re-export it with tools/export_af3_model.py");
+  }
+  return dialectFor(name);
+}
+
+
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
 export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
   const msa = [];
@@ -491,6 +517,7 @@ export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) 
     pairformer.push(await pairformerBlockWeights(store, index));
   }
   return {
+    dialect: af3Dialect(store),
     embedder: await embedderWeights(store),
     template: await templateWeights(store),
     msaBlocks: msa,

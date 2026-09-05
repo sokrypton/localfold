@@ -615,7 +615,7 @@ export class Af3DiffusionHeadGpu {
       conditioner.run({
         tokens, trunkSingle: input.trunkSingle, trunkPair: input.trunkPair,
         targetFeat: input.targetFeat, noiseLevel: input.noiseLevel,
-        features: input.features,
+        features: input.features, dialect: input.dialect,
       }, weights.conditioning, {
         reusePair: cachedPair,
         ...(chained ? { outputs: { single: chain.condSingle }, validation: deferred } : {}),
@@ -642,7 +642,8 @@ export class Af3DiffusionHeadGpu {
       : new Af3AtomEncoderGpu(this.device);
     const encoded = await stage("atom-encoder", () =>
       atomEncoder.run({
-        shape: input.shape, conditioning: input.conditioning, atomMask: input.atomMask,
+        shape: input.shape, dialect: input.dialect,
+        conditioning: input.conditioning, atomMask: input.atomMask,
         refPos: input.refPos, refSpaceUid: input.refSpaceUid,
         tokenAtomsToQueries: input.tokenAtomsToQueries,
         queriesToKeys: input.queriesToKeys,

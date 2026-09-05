@@ -28,6 +28,7 @@
  * summing scores 4.3e-4 and 7.3e-4, 312x and 249x the envelope.
  */
 import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 import { atomDecoder } from "../../src/af3/diffusion-reference.js";
 import { Af3AtomDecoderGpu } from "../../src/af3/atom-decoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
@@ -148,6 +149,7 @@ export async function main(device, args) {
 
   const input = {
     shape: { tokens, dense, subsets, queries, keys },
+    dialect: ALPHAFOLD3,
     // The per-atom conditioning is an INPUT to the encoder, built by
     // _per_atom_conditioning, so a deterministic stand-in exercises the kernel
     // without dragging that module in.

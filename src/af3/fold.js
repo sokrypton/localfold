@@ -38,11 +38,16 @@ import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
 
 /**
- * 🔴 THE DIALECT IS NOT A PREFERENCE. `model='openfold3'` turns on four
- * branches stock AF3 does not have, and a checkpoint has to be read through the
- * graph it was converted for. This is the stock one.
+ * 🔴 THE DIALECT IS NOT A PREFERENCE. A ported checkpoint turns on branches
+ * stock AF3 does not have, and it has to be read through the graph it was
+ * converted for. `src/af3/dialect.js` is the table; this is the stock entry,
+ * re-exported under its old name so that every caller that means "AlphaFold 3"
+ * keeps saying so.
  */
-export const DIALECT = { swapTransposedBias: false };
+import { ALPHAFOLD3 } from "./dialect.js";
+
+export const DIALECT = ALPHAFOLD3;
+export { ALPHAFOLD3, OPENBIND, DIALECTS, dialectFor } from "./dialect.js";
 
 export const THREE_LETTER = {
   A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY",
@@ -312,7 +317,8 @@ export async function buildTargetFeat(batch, weights, device) {
   }, batch.tokens, batch.dense, weights.reference);
 
   const shared = {
-    shape: batch.shape, conditioning, atomMask: batch.refMask,
+    shape: batch.shape, dialect: weights.dialect,
+    conditioning, atomMask: batch.refMask,
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
     tokenAtomsToQueries: batch.tokenAtomsToQueries,
     queriesToKeys: batch.queriesToKeys,
@@ -457,7 +463,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
     atomNameChars: batch.refAtomNameChars,
   }, tokens, dense, weights.atomReference);
   const headInputBase = {
-    shape: batch.shape, conditioning, atomMask: batch.predDenseAtomMask, seqMask,
+    // 🔴 THE DIALECT COMES FROM THE WEIGHTS, NOT FROM A CALLER. See
+    // af3Dialect: a bundle's manifest names the graph it was converted for, so
+    // the two cannot be paired wrongly.
+    shape: batch.shape, dialect: weights.diffusion.dialect,
+    conditioning, atomMask: batch.predDenseAtomMask, seqMask,
     features: batch.features, targetFeat,
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
     tokenAtomsToQueries: batch.tokenAtomsToQueries,
@@ -536,7 +546,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // one place to the left of everything after the first ligand.
       templateSlots: options.templateSlots,
       pairMask, seqMask, previousPair, previousSingle,
-    }, weights.trunk, DIALECT, {
+    }, weights.trunk, weights.trunk.dialect, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
@@ -634,7 +644,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   }
   const scores = await new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
     tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
-  }, weights.confidence, DIALECT);
+  }, weights.confidence, weights.confidence.dialect);
   // 🔴 AND ITS FOUR BLOCKS' WEIGHTS GO BACK TOO. `releaseResidentWeights("w.")`
   // above runs when the TRUNK is done, which is before this head exists - so
   // its own pairformer blocks stayed resident for the life of the page, and a

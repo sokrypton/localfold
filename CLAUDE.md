@@ -952,6 +952,95 @@ its rows sum to `peakBytes`; that is what says which tensor to attack, and it
 is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
 `tools/gpu/fold-af2.js` prints both.
 
+## A second set of weights: the dialect
+
+🔴 **OPENBIND IS NOT OPENFOLD3, AND READING THE OF3 PORTING NOTES WHOLESALE GETS
+TWO THINGS BACKWARDS.** `../alphafold3/OF3_AF3_PORTING_NOTES.md` describes
+OpenFold3 **preview-2** (`of3-p2-155k.pt`). OpenBind is OpenFold3 **v0.5.0**, a
+separate model in that checkout's `model_config.MODELS`, and it moved TOWARD
+AlphaFold 3 in exactly the two places that would have cost the most here:
+
+- **the column attention's pair bias.** Preview-2 computes `Linear(z[k, q])`;
+  AF3's Algorithm 15 says `Linear(z[q, k])`. Upstream's list is
+  `TRANSPOSED_COLUMN_PAIR_BIAS` and **openbind is deliberately not in it**, so
+  `swapTransposedBias` stays **false** - the same value stock AF3 uses. The flag
+  already in `fold.js` reads "stock AF3 is false, the openfold3 lineage true",
+  which is about the OTHER release; taking it as "the non-AF3 dialect" would
+  transpose the bias in the pairformer, the MSA stack, the template embedder and
+  the confidence head against weights that do not want it.
+- **the diffusion transformer's pair LayerNorm**, which preview-2 runs per block
+  and v0.5.0 runs once for the whole stack, as AF3 does. Their release note:
+  "Moved the pair layer norm in the diffusion transformer out of attention pair
+  bias. The pair layer norm is run once to match the AlphaFold3 SI."
+
+🔴 **SO THE RUNTIME PORT IS THREE BRANCHES, NOT THIRTY.** Everything else in
+those notes is absorbed by the weight converter, because it is a row permutation
+of a weight matrix: the residue-alphabet permutation, the i/j crossing between
+AF3's two pair-embedding sites, the SwiGLU gate/value concatenation, and the
+element index shift - `one_hot(e - 1) @ W` is exactly
+`one_hot(e) @ W[max(0, arange - 1)]`, which `converters/common.py` proves to
+max|d| = 0. `src/af3/dialect.js` is the table:
+
+| flag | what changes | where |
+|---|---|---|
+| `symmetriseBonds` | the token bond matrix sets `[j][i]` too | `featurise.js` |
+| `maskPaddedKeys` | `offsets_valid &= keys_mask` in the atom cross-attention | `atom-encoder-{reference,webgpu}.js` |
+| `padSingleCondUnknownDna` | the diffusion single conditioning is 833 channels, not 831 | `diffusion-{reference,conditioning-webgpu}.js` |
+
+🔴 **AND THE BUNDLE NAMES ITS OWN GRAPH, so a caller cannot pair them wrongly.**
+`af3Dialect(store)` reads `manifest.model.name` - which `export_af3_model.py`
+has always written - and `trunkWeights`, `confidenceWeights`, `diffusionWeights`
+and `targetFeatureWeights` each stamp it onto what they return. An unnamed
+bundle RAISES rather than defaulting to stock: a ported checkpoint folded
+through AF3's branches returns a structure, which is the failure this exists to
+prevent.
+
+🔴 **A ZERO COLUMN IS FREE BEFORE A LINEAR AND IS NOT FREE BEFORE A LAYERNORM.**
+That is the whole of the third flag. OpenFold3's restype and profile blocks
+carry 32 classes to AF3's 31, and everywhere else the extra class is dropped
+from the converted weights because a column that is always zero contributes
+nothing to a matrix multiply. The diffusion single conditioning LayerNorms its
+concatenation, so a zero input maps to `-mean/std` AND the width becomes 833:
+upstream measures dropping the two columns at 2.2e-3 against 3.4e-7.
+
+🔴 **AND THE GPU FIX IS A SENTINEL, NOT A NINTH BINDING.** `maskPaddedKeys` is a
+boolean AND in the CPU reference. On the GPU the keys' reference space is
+already in the gathers buffer, real space uids are counters and never negative,
+so writing **-1** into a padded key makes the equality test fail on its own -
+which is `(q == k) && keys_mask` exactly, with no shader change and no extra
+storage buffer. The QUERIES stay at zero: upstream gates on `keys_mask` alone,
+and masking both would be a third model. The comment beside it that says a
+sentinel "is the tidier choice and a different model; it cost 3.1e-2" is about
+the STOCK dialect and is still true there.
+
+🔴 **BOTH ARE CHECKED BY SWEEPING THE DIALECT AS AN AXIS, WITH A DISCRIMINATING
+CONTROL.** Two arms agreeing with their reference says the GPU matches the CPU;
+it does not say the flag reached either. `check-af3-atom-encoder.js` and
+`check-af3-diffusion-conditioning.js` both fail if the openbind arm does not
+DIFFER from the stock one. Measured:
+
+| | openbind vs alphafold3 | each arm vs its reference |
+|---|---|---|
+| atom encoder `pairCond` | **7.77e-2** | 2.48e-7 |
+| ...`tokenAct` | 2.96e-6 | 9.48e-6 |
+| ...`skipConnection` | 3.72e-6 | 2.05e-5 |
+| single conditioning | **1.54e-3** (2370x) | 6.48e-7 |
+
+🔴 **AND THE ENCODER'S OUTPUT BARELY MOVES, WHICH IS NOT A BUG.** The atom pair
+conditioning moves by 7.8e-2 because that is where a padded key's offset term
+lived; almost none of it reaches `tokenAct`, because the attention masks those
+same keys anyway. What leaks is the mask bias being a large FINITE negative
+rather than -infinity, so a padded key keeps a softmax weight of about 1e-6. So
+the control is "some output moved past its envelope", not "every one did" -
+demanding all three fails on a correct implementation.
+
+🔴 **AND THE STOCK PATH IS BIT-IDENTICAL, WHICH IS THE OTHER HALF OF THE GATE.**
+`tools/gpu/fold.js` before and after the dialect work: PDB SHA
+`aef231158a174daf` both ways, mean pLDDT 86.13324126798517 and pTM
+0.7378317753181738 to every digit. Per-stage: target_feat 7.98e-8, denoiser
+1.28e-4, atom encoder 9.48e-6 / 2.05e-5 - every one of them the figure already
+recorded in this file.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring

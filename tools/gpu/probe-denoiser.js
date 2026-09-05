@@ -65,6 +65,7 @@ import { noiseLevels } from "../../src/af3/diffusion-sampler-reference.js";
 import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -136,6 +137,7 @@ export async function main(device, args) {
   const head = new Af3DiffusionHeadGpu(device);
   const headInput = {
     shape: batch.shape, conditioning, atomMask: batch.predDenseAtomMask, seqMask,
+    dialect: ALPHAFOLD3,
     features: batch.features, targetFeat,
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
     tokenAtomsToQueries: batch.tokenAtomsToQueries,

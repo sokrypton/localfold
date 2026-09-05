@@ -16,6 +16,7 @@ import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.j
 import { atomCrossAttentionEncoder, targetFeatures }
   from "../../src/af3/atom-encoder-reference.js";
 import * as B from "./af3-bundle.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const dump = await B.loadDump("oracle-dumps/af3-oracle-atom-f32.json");
 const { tensors } = await B.loadTensors(join(B.ROOT, "model-af3-f32"));
@@ -77,6 +78,7 @@ const blocks = [0,1,2].map(i => ({
 
 const encoded = atomCrossAttentionEncoder({
   shape: { tokens, dense, subsets, queries, keys },
+  dialect: ALPHAFOLD3,
   conditioning,
   atomMask: reference.mask,
   refPos: reference.positions,

@@ -25,6 +25,7 @@ import { atomCrossAttentionEncoder, targetFeatures }
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { runTrunk } from "../../src/af3/trunk-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const EVO = "diffuser/evoformer";
 const MSA = `${EVO}/__layer_stack_no_per_layer/msa_stack`;
@@ -228,6 +229,7 @@ function buildTargetFeat(tensors, dump, tokens) {
   });
   const encoded = atomCrossAttentionEncoder({
     shape: { tokens, dense, subsets, queries, keys },
+    dialect: ALPHAFOLD3,
     conditioning,
     atomMask: reference.mask,
     refPos: reference.positions,

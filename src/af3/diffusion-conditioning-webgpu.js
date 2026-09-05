@@ -38,6 +38,7 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { singleCondPadding, singleCondPaddingWgsl } from "./dialect.js";
 import { createTransitionShader, packTransitionWeights, transitionRowTile }
   from "./transition-webgpu.js";
 
@@ -105,10 +106,11 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 }
 
 export function createConditioningShaders(shape, offsets) {
-  const { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels } = shape;
+  const { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
+          padding } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
-  const singleWidth = seqChannels + targetFeatWidth;
+  const singleWidth = seqChannels + targetFeatWidth + padding.length;
 
   const pairInitial = `
 const TOKENS: u32 = ${tokens}u;
@@ -239,10 +241,16 @@ fn reduce_sum(local: u32, value: f32) -> f32 {
   return reduce_s[0];
 }
 
-/** The concatenation [trunk single | target_feat], read as one row. */
+/** The concatenation [trunk single | target_feat], read as one row.
+ *
+ * The dialect may re-insert OpenFold3's two always-zero unknown-DNA columns,
+ * which shift every later column's source - see singleCondPadding. The body
+ * below is generated from the same list the CPU reference walks.
+ */
 fn feature(token: u32, index: u32) -> f32 {
   if (index < C_SEQ) { return trunk_single[token * C_SEQ + index]; }
-  return target_feat[token * TARGET_WIDTH + index - C_SEQ];
+  var source = index;
+${singleCondPaddingWgsl(padding)}  return target_feat[token * TARGET_WIDTH + source - C_SEQ];
 }
 
 @compute @workgroup_size(64)
@@ -388,10 +396,22 @@ export class Af3DiffusionConditioningGpu {
     // this call must not do.
     const reusePair = options.reusePair;
 
-    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels };
+    // 🔴 THE PADDING IS PART OF THE CACHE KEY, because it changes the generated
+    // `feature()` body while every dimension in the key stays put - the one
+    // shape a shader cache cannot see.
+    const padding = singleCondPadding(input.dialect, seqChannels);
+    const singleWidth = seqChannels + targetFeatWidth + padding.length;
+    if (weights.singleCondInitialNormScale.length !== singleWidth) {
+      throw new Error(`single conditioning is ${singleWidth} channels but its `
+        + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
+        + "the dialect and the weights disagree about the unknown-DNA columns");
+    }
+
+    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
+                    padding };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
-      + `:${noiseChannels}`;
+      + `:${noiseChannels}:${padding.join(",")}`;
     const compiled = {
       pairInitial: reusePair !== undefined ? undefined
         : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),

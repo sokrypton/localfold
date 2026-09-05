@@ -29,6 +29,7 @@ import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.j
 import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -75,6 +76,7 @@ export async function main(device, args) {
 
   const base = {
     shape: batch.shape,
+    dialect: ALPHAFOLD3,
     conditioning: perAtomConditioning({
       positions: batch.refPos, mask: batch.refMask,
       element: batch.refElement, charge: batch.refCharge,

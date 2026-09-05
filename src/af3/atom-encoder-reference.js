@@ -265,6 +265,15 @@ export function atomPairLogits(pair, shape, weights) {
  */
 export function atomCrossAttentionEncoder(input, weights) {
   const { tokens, dense, subsets, queries, keys } = input.shape;
+  // 🔴 THE DIALECT RIDES IN THE INPUT, because this encoder is INJECTED into
+  // the diffusion head as a bare function value (see diffusion-reference.js)
+  // and a fourth positional argument would not survive that. No default: see
+  // `maskPaddedKeys` at the offset validity below for what silently changes.
+  const dialect = input.dialect;
+  if (dialect?.maskPaddedKeys === undefined) {
+    throw new Error("input.dialect.maskPaddedKeys has no default: stock AF3 is "
+      + "false, the openfold3 lineage true");
+  }
   const channels = weights.channels;
   const pairChannels = weights.pairChannels;
   const queryRows = subsets * queries;
@@ -363,7 +372,18 @@ export function atomCrossAttentionEncoder(input, weights) {
         // 🔴 VALIDITY IS "SAME REFERENCE SPACE", not "both atoms real". Two
         // atoms only have a meaningful offset if they came from the same
         // reference conformer; across residues the offset is arbitrary.
-        const valid = queriesSpaceUid[queryIndex] === keysSpaceUid[keyIndex] ? 1 : 0;
+        //
+        // 🔴 ...WHICH LETS PADDED KEYS IN, AND ONE DIALECT SAYS SO. A padded key
+        // slot gathers a zero reference space, and the FIRST reference
+        // conformer's uid is also zero - so every padded key reads as a valid
+        // neighbour of token 0, and the N-terminus is conditioned on a hundred
+        // atoms that do not exist. AF3 was released this way and OpenFold3 was
+        // trained with the mask, so this is a property of the WEIGHTS rather
+        // than a bug either side is free to fix: upstream measures the released
+        // graph putting CA-C at ~0.85 A against an ideal 1.52. See
+        // ../alphafold3 `atom_cross_attention.py`, gated on OPENFOLD3_LINEAGE.
+        const valid = queriesSpaceUid[queryIndex] === keysSpaceUid[keyIndex]
+          && (!dialect.maskPaddedKeys || keysMask[keyIndex] !== 0) ? 1 : 0;
         let squared = 0;
         for (let axis = 0; axis < 3; axis += 1) {
           const difference = queriesRefPos[queryIndex * 3 + axis]

@@ -94,7 +94,7 @@ describe("a ligand's bonds reach the model", () => {
     // because the alternative is running a fold.
     const source = readSource("src/af3/fold.js");
     const call = source.slice(source.indexOf("trunk = await trunkGpu.run({"),
-                              source.indexOf("}, weights.trunk, DIALECT"));
+                              source.indexOf("}, weights.trunk, weights.trunk.dialect"));
     assert.ok(/bondMatrix:\s*batch\.bondMatrix/.test(call),
       "fold.js does not pass the contact matrix to the trunk");
   });

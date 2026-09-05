@@ -30,6 +30,7 @@ import { adaptiveLayerNorm, adaptiveZeroInit, atomPairLogits, convert,
          crossAttentionBlock, layerNormSlow } from "./atom-encoder-reference.js";
 import { linear } from "./pairformer-reference.js";
 import { relativeEncoding } from "./embedder-reference.js";
+import { singleCondPadding, singleCondSource } from "./dialect.js";
 
 /** AF3's assumed data scale, in angstroms. Every noise level is relative to it. */
 export const SIGMA_DATA = 16.0;
@@ -262,16 +263,26 @@ export function diffusionConditioning(input, weights, onStage) {
     for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
   }
 
-  // ...and the trunk single with target_feat. 384 + 447.
-  const singleWidth = seqChannels + weights.targetFeatWidth;
+  // ...and the trunk single with target_feat. 384 + 447, or 384 + 449 where the
+  // dialect re-inserts OpenFold3's two unknown-DNA columns - see
+  // singleCondPadding, and the scale length that asserts the two agree.
+  const padding = singleCondPadding(input.dialect, seqChannels);
+  const singleWidth = seqChannels + weights.targetFeatWidth + padding.length;
+  if (weights.singleCondInitialNormScale.length !== singleWidth) {
+    throw new Error(`single conditioning is ${singleWidth} channels but its `
+      + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
+      + "the dialect and the weights disagree about the unknown-DNA columns");
+  }
   const features1d = new Float32Array(tokens * singleWidth);
   for (let token = 0; token < tokens; token += 1) {
     for (let c = 0; c < seqChannels; c += 1) {
       features1d[token * singleWidth + c] = trunkSingle[token * seqChannels + c];
     }
-    for (let c = 0; c < weights.targetFeatWidth; c += 1) {
-      features1d[token * singleWidth + seqChannels + c] =
-        targetFeat[token * weights.targetFeatWidth + c];
+    for (let c = seqChannels; c < singleWidth; c += 1) {
+      const source = singleCondSource(padding, c);
+      if (source < 0) continue;
+      features1d[token * singleWidth + c] =
+        targetFeat[token * weights.targetFeatWidth + source - seqChannels];
     }
   }
   const single = linear(layerNormSlow(features1d, tokens, singleWidth,
@@ -414,6 +425,7 @@ export function diffusionHead(input, weights, encode, onStage) {
 
   const cond = diffusionConditioning({
     tokens,
+    dialect: input.dialect,
     trunkSingle: input.trunkSingle,
     trunkPair: input.trunkPair,
     targetFeat: input.targetFeat,
@@ -437,6 +449,9 @@ export function diffusionHead(input, weights, encode, onStage) {
 
   const encoded = encode({
     shape: input.shape,
+    // The encoder is injected as a function value, so its dialect travels in
+    // its input rather than as an argument - see atomCrossAttentionEncoder.
+    dialect: input.dialect,
     conditioning: input.conditioning,
     atomMask: input.atomMask,
     refPos: input.refPos,

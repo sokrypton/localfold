@@ -36,6 +36,7 @@ import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -105,6 +106,7 @@ export async function main(device, args) {
   }
   const base = {
     shape: batch.shape, conditioning, atomMask: batch.predDenseAtomMask,
+    dialect: ALPHAFOLD3,
     seqMask: batch.seqMask, features: batch.features,
     targetFeat: floats(lastCapture(dump, "diffuser/evoformer/__call__:target_feat").data),
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,

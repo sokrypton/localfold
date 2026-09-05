@@ -28,6 +28,7 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 import { diffusionHead } from "../../src/af3/diffusion-reference.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -87,6 +88,7 @@ export async function main(device, args) {
   const noiseLevel = Number(at(`${HEAD}/__call__<1`).data[0]);
   const input = {
     shape: batch.shape,
+    dialect: ALPHAFOLD3,
     conditioning: perAtomConditioning({
       positions: batch.refPos, mask: batch.refMask,
       element: batch.refElement, charge: batch.refCharge,

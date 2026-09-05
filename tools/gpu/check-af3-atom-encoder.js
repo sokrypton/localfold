@@ -22,10 +22,35 @@
  * conditioning lands in a slot the gather calls live and the atom mask calls
  * padding. The mask bias being a PRODUCT rather than a sum does have a control:
  * summing scores 4.3e-4 and 7.3e-4, 312x and 249x the envelope.
+ *
+ * 🔴 AND THE DIALECT IS AN AXIS, BECAUSE `maskPaddedKeys` IS IMPLEMENTED TWICE
+ * AND DIFFERENTLY. The reference ANDs the key mask into the offset validity;
+ * the GPU writes -1 into a padded key's reference space so the equality test
+ * fails on its own, which needs no ninth storage binding and no shader change.
+ * Those are the same model only if the sentinel can never collide with a real
+ * reference space, so both arms run and both are held to the envelope. The
+ * openbind arm also has to DIFFER from the stock one on this batch or it is
+ * checking nothing - two thirds of the key slots here are padding, so it does.
+ *
+ * 🔴 AND IT DIFFERS IN ONE OUTPUT, NOT THREE, WHICH IS WORTH KNOWING. Measured
+ * here, openbind against alphafold3:
+ *
+ *     pairCond         7.77e-2
+ *     tokenAct         2.96e-6   (rounding envelope 1.38e-6)
+ *     skipConnection   3.72e-6   (envelope 2.93e-6)
+ *
+ * The atom pair conditioning moves enormously, because that is where a padded
+ * key's offset term lived. Almost none of it reaches the encoder's OUTPUT,
+ * because the attention masks those same keys anyway - what leaks through is
+ * the mask bias being a large finite negative rather than -infinity, so a
+ * padded key keeps a softmax weight of about 1e-6 rather than zero. So the
+ * control is "some output moved well past its envelope", not "every one did":
+ * demanding all three would fail on a correct implementation.
  */
 import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
+import { ALPHAFOLD3, OPENBIND } from "../../src/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
@@ -141,6 +166,7 @@ export async function main(device, args) {
 
   const input = {
     shape: { tokens, dense, subsets, queries, keys },
+    // dialect is set per arm below.
     // The per-atom conditioning is an INPUT to the encoder, built by
     // _per_atom_conditioning, so a deterministic stand-in exercises the kernel
     // without dragging that module in.
@@ -158,32 +184,55 @@ export async function main(device, args) {
     trunkPairCond: deterministic(tokens * tokens * 128, 505),
   };
 
-  const expected = atomCrossAttentionEncoder(input, weights);
-  const gpu = await new Af3AtomEncoderGpu(device).run(input, weights);
-
-  // What rounding alone produces through three cross-attention blocks.
-  const perturbed = { ...input, conditioning: Float32Array.from(input.conditioning) };
-  for (let index = 0; index < perturbed.conditioning.length; index += 1) {
-    perturbed.conditioning[index] *= 1 + 1e-7;
-  }
-  const control = atomCrossAttentionEncoder(perturbed, weights);
-
   const results = {};
+  const references = {};
   let failed = 0;
-  for (const name of ["tokenAct", "skipConnection", "pairCond"]) {
-    const value = relativeRms(gpu[name], expected[name]);
-    const envelope = relativeRms(control[name], expected[name]);
-    const bound = Math.max(1e-5, envelope * 10);
-    const ok = value <= bound;
-    if (!ok) failed += 1;
-    results[name] = { relRms: value, envelope };
-    console.log(`${name}\trelRMS ${value.toExponential(2)}`
-      + `\t(envelope ${envelope.toExponential(2)},`
-      + ` ${(value / Math.max(envelope, 1e-30)).toFixed(1)}x)\t${ok ? "" : "FAIL"}`);
+  for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind", OPENBIND]]) {
+    const arm = { ...input, dialect };
+    const expected = atomCrossAttentionEncoder(arm, weights);
+    const gpu = await new Af3AtomEncoderGpu(device).run(arm, weights);
+    references[label] = expected;
+
+    // What rounding alone produces through three cross-attention blocks.
+    const perturbed = { ...arm, conditioning: Float32Array.from(arm.conditioning) };
+    for (let index = 0; index < perturbed.conditioning.length; index += 1) {
+      perturbed.conditioning[index] *= 1 + 1e-7;
+    }
+    const control = atomCrossAttentionEncoder(perturbed, weights);
+
+    results[label] = {};
+    for (const name of ["tokenAct", "skipConnection", "pairCond"]) {
+      const value = relativeRms(gpu[name], expected[name]);
+      const envelope = relativeRms(control[name], expected[name]);
+      const bound = Math.max(1e-5, envelope * 10);
+      const ok = value <= bound;
+      if (!ok) failed += 1;
+      results[label][name] = { relRms: value, envelope };
+      console.log(`${label}\t${name}\trelRMS ${value.toExponential(2)}`
+        + `\t(envelope ${envelope.toExponential(2)},`
+        + ` ${(value / Math.max(envelope, 1e-30)).toFixed(1)}x)\t${ok ? "" : "FAIL"}`);
+    }
+    console.log(`${label}\t${gpu.elapsedMilliseconds.toFixed(1)} ms`
+      + `\t${(gpu.memory.peakBytes / 2 ** 20).toFixed(1)} MiB`);
   }
-  console.log(`${gpu.elapsedMilliseconds.toFixed(1)} ms`
-    + `\t${(gpu.memory.peakBytes / 2 ** 20).toFixed(1)} MiB`);
+
+  // 🔴 THE DISCRIMINATING CONTROL. Both arms passing says the GPU matches the
+  // reference; it does not say the flag reached either of them. A dialect that
+  // changed nothing would pass this checker twice and ship a model that is
+  // stock AF3 wearing OpenBind's name.
+  const separation = {};
+  for (const name of ["tokenAct", "skipConnection", "pairCond"]) {
+    separation[name] = relativeRms(references.openbind[name], references.alphafold3[name]);
+    console.log(`openbind vs alphafold3\t${name}`
+      + `\trelRMS ${separation[name].toExponential(2)}`);
+  }
+  const moved = Math.max(...Object.values(separation));
 
   if (failed > 0) throw new Error(`${failed} output(s) outside their conditioning envelope`);
-  return { tokens, results };
+  if (moved < 1e-3) {
+    throw new Error(`the dialect moved no output by more than ${moved.toExponential(2)}: `
+      + "maskPaddedKeys did not reach the encoder, so neither arm was checked "
+      + "against anything");
+  }
+  return { tokens, results, separation };
 }

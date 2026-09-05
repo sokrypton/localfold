@@ -308,6 +308,12 @@ export async function foldAf3(options) {
   const batch = featuriseProtein(sequence, {
     ligands,
     modifications,
+    // 🔴 THE BOND MATRIX IS PART OF THE MODEL, NOT OF THE MOLECULE. AF3 sets
+    // contact[i][j] from the CCD's bond table alone; the OpenFold3 lineage was
+    // trained with both directions set, and a ring ligand folded through the
+    // wrong one comes apart (upstream measures ATP's ribose C-C at ~2.0 A
+    // against ~1.5). The weights say which - see af3Dialect.
+    symmetriseBonds: options.weights.trunk.dialect.symmetriseBonds,
     // What each chain's letters mean. Absent, every chain is protein, which is
     // what every caller before nucleic acids meant.
     chainKinds: options.chainKinds,

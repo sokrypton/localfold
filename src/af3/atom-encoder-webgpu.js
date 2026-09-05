@@ -1105,12 +1105,21 @@ export class Af3AtomEncoderGpu {
   }
 
   /**
-   * @param {object} input shape, conditioning, atomMask, refPos, refSpaceUid,
-   *   the five gathers, tokenAtomsAct, trunkSingleCond, trunkPairCond
+   * @param {object} input shape, dialect, conditioning, atomMask, refPos,
+   *   refSpaceUid, the five gathers, tokenAtomsAct, trunkSingleCond,
+   *   trunkPairCond
    * @param {object} weights the pair tensors plus `blocks`
    */
   async run(input, weights, options = {}) {
     const { tokens, dense, subsets, queries, keys } = input.shape;
+    // 🔴 IN THE INPUT AND NOT AN ARGUMENT, to match the CPU reference this is
+    // checked against - which is injected as a bare function value and so has
+    // nowhere else to put it. No default; see the sentinel below.
+    const dialect = input.dialect;
+    if (dialect?.maskPaddedKeys === undefined) {
+      throw new Error("input.dialect.maskPaddedKeys has no default: stock AF3 "
+        + "is false, the openfold3 lineage true");
+    }
     const channels = weights.channels;
     const pairChannels = weights.pairChannels;
     const heads = weights.heads;
@@ -1250,14 +1259,27 @@ export class Af3AtomEncoderGpu {
       // see the note in the shader preamble about the eight-buffer guarantee.
       const queriesSpace = new Int32Array(queryRows);
       const keysSpace = new Int32Array(keyRows);
-      // 🔴 A MASKED SLOT'S REFERENCE SPACE IS ZERO, NOT A SENTINEL. AF3 gathers
-      // with a zero-filling convert, so two PADDED atoms both read 0, compare
-      // equal, and are treated as sharing a reference conformer - which makes
-      // their offset term live. Using -1 and -2 here to mark them "unrelated"
-      // is the tidier choice and a different model; it cost 3.1e-2 on the atom
-      // pair representation.
+      // 🔴 A MASKED SLOT'S REFERENCE SPACE IS ZERO, NOT A SENTINEL, UNDER THE
+      // STOCK DIALECT. AF3 gathers with a zero-filling convert, so two PADDED
+      // atoms both read 0, compare equal, and are treated as sharing a
+      // reference conformer - which makes their offset term live. Using -1 and
+      // -2 here to mark them "unrelated" is the tidier choice and a different
+      // model; it cost 3.1e-2 on the atom pair representation.
+      //
+      // 🔴 AND THAT IS EXACTLY WHAT `maskPaddedKeys` TURNS ON, FOR THE KEYS
+      // ALONE. OpenFold3 trained with `offsets_valid &= keys_mask`, so a padded
+      // KEY is never a valid neighbour of anything. A sentinel expresses it
+      // with no shader change and no ninth binding: real reference spaces are
+      // uid counters and never negative, so a key at -1 fails the equality test
+      // against every query, which is `(q == k) && keys_mask` exactly.
+      //
+      // 🔴 THE QUERIES ARE DELIBERATELY LEFT AT ZERO. Upstream gates on
+      // `keys_mask` only - the padded QUERY rows are discarded downstream - and
+      // masking both would be the tidier-looking choice that is a third model
+      // again. See ../alphafold3 `atom_cross_attention.py`.
       const buildQueriesSpace = () => {
         const flatSpace = ints(input.refSpaceUid);
+        const flatAtomMask = floats(input.atomMask);
         for (let index = 0; index < queryRows; index += 1) {
           queriesSpace[index] = input.tokenAtomsToQueries.mask[index]
             ? flatSpace[Number(input.tokenAtomsToQueries.indices[index])] : 0;
@@ -1265,6 +1287,17 @@ export class Af3AtomEncoderGpu {
         for (let index = 0; index < keyRows; index += 1) {
           keysSpace[index] = input.queriesToKeys.mask[index]
             ? queriesSpace[Number(input.queriesToKeys.indices[index])] : 0;
+        }
+        if (!dialect.maskPaddedKeys) return;
+        // keysMask, built the way the reference builds it: the queries-to-keys
+        // gather's own mask, gated by whether the query it points at is a real
+        // atom.
+        for (let index = 0; index < keyRows; index += 1) {
+          const query = Number(input.queriesToKeys.indices[index]);
+          const live = input.queriesToKeys.mask[index]
+            && input.tokenAtomsToQueries.mask[query]
+            && flatAtomMask[Number(input.tokenAtomsToQueries.indices[query])] !== 0;
+          if (!live) keysSpace[index] = -1;
         }
       };
       const gatherBuffer = persistentUpload("atom.gathers", () => {

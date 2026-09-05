@@ -21,6 +21,9 @@ function recordingStore(asked) {
       + "/pair_logits_projection/weights", [6, 128, 4, 16]],
   ]);
   return {
+    // A bundle names the graph it was converted for, and the loaders read it -
+    // see af3Dialect. Stock AF3, which is what these tensor names are.
+    manifest: { model: { name: "alphafold3" } },
     async tensor(name) {
       asked.add(name);
       const shape = shapes.get(name);

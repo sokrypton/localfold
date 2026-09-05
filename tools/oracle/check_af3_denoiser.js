@@ -23,6 +23,7 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
 import { diffusionHead } from "../../src/af3/diffusion-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const EVO = "diffuser/evoformer";
@@ -226,6 +227,7 @@ async function main() {
 
   const ours = diffusionHead({
     shape,
+    dialect: ALPHAFOLD3,
     positionsNoisy,
     noiseLevel,
     atomMask: reference.mask,

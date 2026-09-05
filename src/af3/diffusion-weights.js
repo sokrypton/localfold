@@ -5,7 +5,7 @@
  * the checkpoint - the trunk's loader is already long, and a typo in one leaf
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
-import { bind, stacked } from "./weights.js";
+import { af3Dialect, bind, stacked } from "./weights.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
@@ -69,6 +69,7 @@ export async function targetFeatureWeights(store) {
     `${encoder}/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoder`;
   const W = (leaf) => store.tensor(`${root}_${leaf}/weights`);
   return {
+    dialect: af3Dialect(store),
     reference: {
       channels: 128,
       embedRefPos: await W("embed_ref_pos"),
@@ -179,6 +180,7 @@ export async function diffusionWeights(store, superBlocks = 6) {
   }
 
   return {
+    dialect: af3Dialect(store),
     seqChannels: 384, perTokenChannels: 768,
     singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),

@@ -46,6 +46,7 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 import { sampleOnGpu } from "../../src/af3/diffusion-sampler-webgpu.js";
 import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/atom-encoder-reference.js";
 import { openAf3Store } from "../../src/af3/weights.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
@@ -163,6 +164,7 @@ export async function main(device, args) {
 
   const input = {
     shape: { tokens, dense, subsets, queries, keys },
+    dialect: ALPHAFOLD3,
     // The per-atom conditioning is an INPUT to the encoder, built by
     // _per_atom_conditioning, so a deterministic stand-in exercises the kernel
     // without dragging that module in.

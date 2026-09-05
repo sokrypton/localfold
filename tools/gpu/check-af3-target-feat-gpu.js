@@ -25,6 +25,7 @@
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
+import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
@@ -72,7 +73,8 @@ export async function main(device, args) {
   }, tokens, dense, weights.reference);
 
   const shared = {
-    shape: batch.shape, conditioning, atomMask: batch.refMask,
+    shape: batch.shape, dialect: ALPHAFOLD3,
+    conditioning, atomMask: batch.refMask,
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
     tokenAtomsToQueries: batch.tokenAtomsToQueries,
     queriesToKeys: batch.queriesToKeys,
