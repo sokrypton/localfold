@@ -361,7 +361,20 @@ async function encodeAttention(
   const key = projected("key");
   const value = projected("value");
   const gate = projected("gate");
-  const weighted = projected("weighted");
+  // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. Read the dispatches below:
+  // the projection is the last pass that reads it - the pair bias, when it
+  // shares the tensor, runs before that - and the flash kernel is the next
+  // pass to write. So the two can be one buffer, and at 512 MSA rows that is
+  // 14.8 MiB per attention, twice a block, of a 396 MiB peak.
+  //
+  // 🔴 ONLY WHEN THEY AGREE ABOUT THE ELEMENT, THOUGH. `normalized` is always
+  // packed and `projected` is packed only where the register-resident flash
+  // kernel accepts it; where it does not, one is half the bytes of the other
+  // and sharing would hand a shader a buffer of the wrong length, which is not
+  // something WebGPU can catch. Falling back to a second tensor there costs
+  // the memory and keeps the fold.
+  const weighted = normalizedStorage === projectedStorage
+    ? normalized : projected("weighted");
   const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
   const attentionNormGrid = execution.rowGrid(rows);
   execution.dispatch(encoder, packedNormalize, [options.source, weights, normParams, normalized],
