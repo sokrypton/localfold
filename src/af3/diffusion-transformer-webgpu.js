@@ -138,12 +138,20 @@ async function residentBlockOnDevice(device, block, precision, variant) {
  * f16 converting it, to read a dozen numbers that are a running sum of lengths.
  */
 export function blockWeightOffsets(block) {
+  // 🔴 THE LENGTHS COME FROM THE THUNKS WHEN THERE ARE ANY. Reading
+  // `block[name].length` MATERIALISES that tensor, so asking a sample block for
+  // a dozen running sums decoded the whole of it - 8.3 million elements out of
+  // int5, once per denoiser call before #compile was memoised and once per fold
+  // after. `stacked` records the range it will read, and that is the length.
+  const sources = block[SOURCES];
   const offsets = {};
   let total = 0;
   for (const name of BLOCK_ORDER) {
-    if (block[name] === undefined) throw new Error(`diffusion block missing ${name}`);
+    const thunk = sources?.[name];
+    const length = Number.isInteger(thunk?.count) ? thunk.count : block[name]?.length;
+    if (length === undefined) throw new Error(`diffusion block missing ${name}`);
     offsets[name] = total;
-    total += block[name].length;
+    total += length;
   }
   return offsets;
 }
