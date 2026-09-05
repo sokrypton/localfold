@@ -49,7 +49,6 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
 import { buildFoldArchive, msasFromArchive } from "./fold-archive.js";
-import { shouldCacheTrunk } from "./trunk-cache.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
@@ -1207,33 +1206,6 @@ let searchCache;
 let trunkCache;
 
 /**
- * Keep this trunk for the next fold, unless it is too big to be worth it.
- *
- * 🔴 THE CACHE USED TO BE UNBOUNDED, AND WHAT IT HOLDS IS tokens^2 x 128
- * FLOATS. See web/trunk-cache.js: 3.4 MB at 58 residues and 1.2 GB at 1530,
- * kept alive after the fold so a re-sample can skip the trunk. At the top of
- * that range it costs the page its heap - measured, cartoon mode refused after
- * a 1530-residue fold because `jsHeapSizeLimit - usedJSHeapSize` had gone
- * NEGATIVE - and a fold that took ten minutes is not one anybody re-samples
- * casually, which is the case the cache is for.
- *
- * 🔴 AND A REFUSAL CLEARS WHAT WAS THERE. Leaving the previous fold's trunk in
- * place would be a cache that cannot serve this fold and still holds the heap.
- */
-function rememberTrunk(key, reusable, stem) {
-  const { keep, bytes, limit } = shouldCacheTrunk(
-    reusable, typeof performance === "undefined" ? undefined : performance);
-  const mib = (value) => (value / 1048576).toFixed(0);
-  if (!keep) {
-    trunkCache = undefined;
-    devNote(`trunk not cached: ${mib(bytes)} MiB, over the ${mib(limit)} MiB`
-      + " this page will hold. A re-fold runs the trunk again.");
-    return;
-  }
-  trunkCache = { key, reusable, stem };
-}
-
-/**
  * The last AlphaFold 2 fold's recycle state, so asking for more continues.
  *
  * 🔴 AF2 HAS NO SAMPLER, SO CONTINUATION IS THE ONLY SAVING THERE IS. Every
@@ -1454,7 +1426,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     onTrunk: (reusable) => {
       // ...the carried previews stay with it: they belong to passes this trunk
       // has already run, and a continuation must not lose them.
-      rememberTrunk(trunkKey, reusable, stem);
+      trunkCache = { key: trunkKey, reusable, stem };
     },
     // Both modes are seeded now: the flow draws its starting positions once at
     // the top of the schedule.
@@ -1535,7 +1507,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // ...`onTrunk` above has already cached this, and it is the same object.
   // Kept for the next fold, and kept even when it was itself reused, so a run
   // of re-samples all skip the trunk rather than only the first.
-  rememberTrunk(trunkKey, result.reusable, stem);
+  trunkCache = { key: trunkKey, reusable: result.reusable, stem };
 
   // 🔴 THE HANDLES ARE ACQUIRED HERE, because nothing during the fold sets
   // them any more. drawLiveFrame reaches the renderer through the registry so
