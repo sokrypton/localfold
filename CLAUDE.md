@@ -73,6 +73,9 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| How small can ESM-C get before ESMFold2 notices? | `tools/esmc/probe-esmc-compression.py` |
+| ...and what does that cost the STRUCTURE? | `.venv-esm/bin/python tools/esmc/probe-esmfold2-structure.py` |
+| Where do I get ESM-C and ESMFold2? | `tools/esmc/fetch.py` (3.0 GB, ungated, MIT) |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
@@ -956,6 +959,46 @@ what CHURNS. `peakByLabel` is what was on the device when it was fullest and
 its rows sum to `peakBytes`; that is what says which tensor to attack, and it
 is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
 `tools/gpu/fold-af2.js` prints both.
+
+## A language model instead of an alignment: ESMFold2
+
+Not shipped, and not started as code. `docs/ESMFOLD2.md` is the investigation:
+whether ESM-C 600M can be compressed enough to fold from a single sequence in a
+browser, which is the case an MSA search cannot serve at all. The three things
+worth knowing without opening it:
+
+🔴 **THE CHECKPOINT IS bfloat16 STORED AS float32**, so the first 2x off a 2.30
+GB download is not compression, it is padding - not one of 95.6M weights sampled
+has any of its low sixteen mantissa bits set, and float16 is lossless on it to
+3.2e-9. Quote a scheme against the 16 bits that are really there.
+
+🔴 **ESM-C QUANTISES LIKE AF3 DOES**, so `tools/quantize_af3.py`'s own int5
+group-32 asymmetric packer transfers: relRMS 3.8e-2 in weight space here against
+4.3e-2 on AF3's six biggest tensors. The tower passes that through at about unit
+gain - 4.4e-2 in the pair representation ESMFold2 receives - and it puts the
+600M tower plus its folding model at **533 MiB**, against `model-af3-int5`'s
+264.6.
+
+🔴 **AND SPENDING BITS WHERE THE LAYER MIX IS HEAVY DOES NOT WORK.** ESMFold2
+takes 58.8% of its softmax from the last three of 37 states, and giving those
+blocks more precision loses to a uniform allocation at every budget tried. The
+mix says where a state is READ, not where precision matters; every block feeds
+every later one.
+
+🔴 **AND MEASURE A SCHEME AGAINST THE SAMPLER'S OWN SPREAD, NOT AGAINST ZERO.**
+Two seeds of the SAME float32 weights move a structure by 0.99 A on average and
+7.06 A at worst over 32 folds, so int5's 0.43 A mean and 3.32 A worst are not a
+cost. Sixteen held-out targets, released after the checkpoint's cutoff, and the
+damage is a TAIL - the median target moves 0.26 A even at three bits and the
+median crystal RMSD is flat at 2.52-2.57 A the whole way down; what changes is
+how many targets flip basin (0 at int8, 2 at int5, 3 at int4, 4 at int3).
+
+🔴 **AND THE COMPRESSIBLE MODEL IS THE WEAK ONE.** ESM-C 300M folds as well as
+600M here (median 2.55 A against 2.52, a third of the seed spread) and puts the
+bundle at 361 MiB - but both are paper ABLATION checkpoints with no confidence
+head at all, and the released ESMFold2-Fast folds from ESM-C 6B, which is 4672
+MiB at int5. Compression is not the obstacle; the accuracy of the checkpoint
+that fits is.
 
 ## A second set of weights: the dialect
 

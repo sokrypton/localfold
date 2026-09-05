@@ -63,3 +63,17 @@ natives
 # tools/gpu/probe-af2-dgram-plddt.js: 108 single-sequence targets over four
 # recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
 /plddt-data/
+
+# ESM-C and ESMFold2, downloaded from Hugging Face by tools/esmc/fetch.py.
+# The tower alone is 2.3 GB of float32 and the point of the work in tools/esmc/
+# is to find out how much smaller it can be; neither belongs in the repository.
+/esmc-600m/
+/esmc-300m/
+/esmfold2-fast-600m/
+/esmfold2-fast-300m/
+/model-esmc-*/
+
+# transformers, installed with --system-site-packages so it shares this
+# machine's torch, purely to have an ORACLE for the hand-written ESM-C forward
+# in tools/esmc/esmc_forward.py. Nothing shipped imports it.
+/.venv-esm/
