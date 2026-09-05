@@ -227,6 +227,81 @@ pTM - see the model table above. LocalFold colours by pLDDT, its scores card is
 built on it, and its archive writer emits it. That is not a small gap to paper
 over.
 
+## Chasing 200 MiB, and where the floor actually is
+
+A 200 MiB bundle is an arithmetic statement before it is an experiment:
+
+| bundle | parameters | bits/weight it allows |
+|---|---:|---:|
+| ESM-C 600M + folding model | 744.5 M | **2.25** |
+| ESM-C 300M + folding model | 504.1 M | **3.33** |
+
+🔴 **SO 200 MiB IS OUT OF REACH FOR THE 600M TOWER BEFORE ANYTHING IS
+MEASURED.** 2.25 bits a weight is int2 at group 128, the far corner of the
+format, and int2 at group 32 - a strictly more generous setting - already reads
+pair relRMS 5.2e-1. There is no training run behind that.
+
+### The half of the bundle that had never been priced
+
+🔴 **THE FOLDING MODEL IS 171 M PARAMETERS AND EVERY TABLE ABOVE IGNORED IT.**
+It is 41% of the 300M bundle at equal bits, so a size target measured on the
+tower alone is a size target for three fifths of the download.
+`--fold-bits` quantises it by the same rule `tools/quantize_af3.py` uses - 379
+tensors touched, 439 kept float32, 99.2% of the parameters reached. Sixteen
+held-out targets, tower held at int5:
+
+| folding model | MiB | median vs crystal |
+|---|---:|---:|
+| float32 | 653 | 2.55 A |
+| int8 g32 | 168 | 2.57 A |
+| int5 g32 | 127 | 2.53 A |
+| int4 g32 | 107 | 2.54 A |
+| **int3 g32** | **86** | **2.58 A** |
+| int3 g128 | 71 | **4.59 A** |
+
+🔴 **IT GIVES UP BITS ALMOST FOR FREE AND WILL NOT GIVE UP ITS GROUP.** Three
+bits at group 32 costs 0.03 A of median; three bits at group 128 costs **two
+angstroms**, and it does so underneath everything else, so a tower ladder run
+on top of it measures the folding model and reports the tower. That is how the
+first version of this table was nearly written. The reason is the one
+`docs/AF3.md` already records for AF3's atom decoder: this model's output is a
+POSITION, in angstroms, and nothing downstream renormalises a relative error
+in it.
+
+### The tower, with a folding model that is not the problem
+
+Folding model pinned at int3 group 32, ESM-C 300M, same sixteen targets:
+
+| tower | bits/w | tower MiB | moved: mean | TM | median vs crystal |
+|---|---:|---:|---:|---:|---:|
+| int5 g32 | 6.00 | 238 | 0.53 A | 0.976 | 2.58 A |
+| **int3 g32** | 4.00 | 159 | 1.15 A | 0.937 | **2.46 A** |
+| **int3 g64** | 3.50 | 139 | 1.44 A | 0.921 | **2.43 A** |
+| int2 g32 | 3.00 | 119 | **8.81 A** | **0.484** | **12.15 A** |
+| int2 g64 | 2.50 | 99 | **10.04 A** | **0.395** | **12.24 A** |
+
+with `no language model` at 11.99 A / TM 0.299 / median 13.30 A.
+
+🔴 **THE THREE-TO-TWO BIT STEP IS A CLIFF, NOT A SLOPE.** int3 group 64 still
+folds - median 2.43 A against the float32 tower's 2.55, inside the sampler's
+own spread - and int2 group 32, half a bit later, is **within a whisker of
+having no language model at all**: 12.15 A median against 13.30 A for feeding
+the trunk nothing. Two bits does not degrade this tower, it deletes it.
+
+### So the floor, by scalar group quantisation, is about 225 MiB
+
+| | tower | folding model | total |
+|---|---:|---:|---:|
+| comfortable | int3 g32, 159 | int3 g32, 86 | **245 MiB** |
+| **tightest that folds** | int3 g64, 139 | int3 g32, 86 | **225 MiB** |
+| under 200, and broken | int2 g64, 99 | int3 g32, 86 | 186 MiB |
+
+🔴 **NOTHING IN THE FORMAT REACHES 200 MiB WHILE STILL FOLDING.** The only
+scalar combinations that fit put two bits on the tower, and two bits is the
+cliff. Getting under 200 needs a different representation - QuIP#-style
+incoherence processing with vector codebooks is the class that makes 2-bit
+language models work - and that is a new WebGPU decoder, not a new packer.
+
 ## Calibrated quantisation, which is what the LLM world does instead
 
 Everything above rounds each weight to the nearest code and looks at nothing
