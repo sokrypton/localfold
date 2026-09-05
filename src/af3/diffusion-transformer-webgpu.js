@@ -43,6 +43,19 @@ import { releaseResidentWeights, residentWeightBuffer } from "../runtime/residen
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
+/**
+ * How much a schedule may hold in cached pair attention biases.
+ *
+ * 🔴 THE CACHE IS 64 x tokens^2 BYTES A BLOCK, so all twenty-four are 61 MiB at
+ * 200 tokens and 246 at 400 - and a long fold is where memory binds, not where
+ * it is spare. The saving is per block and so is the cost, so this caps how
+ * many blocks keep theirs: all of them at 208 tokens or fewer, six of the
+ * twenty-four at 400. Measured at 200 tokens, 16 flow steps, tools/gpu/fold.js
+ * --folds=2: a denoiser call 204 -> 196 ms, a fold 7.5 -> 7.2 s, peak 646 ->
+ * 688 MiB.
+ */
+export const PAIR_LOGITS_CACHE_BYTES = 64 * 1024 * 1024;
+
 const GRID_WIDTH = 32_768;
 
 export const BLOCK_ORDER = [
@@ -884,6 +897,30 @@ export class Af3DiffusionTransformerGpu {
   #pairNorm;
 
   /**
+   * The per-block pair attention biases, for the whole SCHEDULE.
+   *
+   * 🔴 THEY WERE RECOMPUTED ONCE A CALL FOR THE IDENTICAL ANSWER. The
+   * pair-logits pass reads #pairNorm - which is the trunk's, built once and
+   * held - and the super-block's `pairLogitsProjection`, which is a weight.
+   * Neither moves with the noise level, so twenty-four passes an hour of the
+   * fold produced bit-for-bit what the previous call produced. Measured at 200
+   * tokens with tools/gpu/fold.js --profile --profile-from=trunk-done, that is
+   * 0.61 ms a pass and 14.6 ms a call, 8% of a denoiser call's GPU time.
+   *
+   * 🔴 ONE BUFFER PER BLOCK, NOT ONE SLICE OF ONE BUFFER. A slice needs a
+   * 256-byte-aligned offset and a block's logits are 64 x tokens^2 bytes,
+   * which is not a multiple of 256 at odd token counts - 59 is one of the two
+   * sizes checked here. Separate buffers also let the bind-group cache stay as
+   * it is, keyed by block.
+   *
+   * `ready` is set only after the submit that fills them, because run()
+   * restarts the whole call on a budget refusal and a cache that merely EXISTS
+   * would then be handed to attend uninitialised - the same trap #pairNorm's
+   * `pairCond` guards against.
+   */
+  #pairLogits;
+
+  /**
    * The last shape this instance compiled for, and everything #compile
    * derived from it.
    *
@@ -936,7 +973,18 @@ export class Af3DiffusionTransformerGpu {
 
   /** Give back the normalised pair tensor. Callers that keep an instance own this. */
   /** Give back the normalised pair tensor alone. */
+  #releasePairLogits() {
+    if (this.#pairLogits === undefined) return;
+    for (const buffer of this.#pairLogits.buffers) {
+      buffer.destroy();
+      noteDestroy(this.device, this.#pairLogits.bytes, "difftx.pair-logits");
+    }
+    this.#pairLogits = undefined;
+    this.#bindGroups.clear();
+  }
+
   #releasePairNorm() {
+    this.#releasePairLogits();
     if (this.#pairNorm === undefined) return;
     this.#pairNorm.buffer.destroy();
     noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
@@ -945,6 +993,7 @@ export class Af3DiffusionTransformerGpu {
   }
 
   dispose() {
+    this.#releasePairLogits();
     this.#bindGroups.clear();
     if (this.#scratch !== undefined) {
       for (const [label, entry] of Object.entries(this.#scratch.buffers)) {
@@ -1212,7 +1261,41 @@ export class Af3DiffusionTransformerGpu {
         ? keep(this.allocator.upload("difftx.pair-scale",
                                      weights.pairInputLayerNormScale, storage))
         : undefined;
-      const logits = scratch("difftx.logits", heads * pairs * 4);
+      // See #pairLogits: one buffer a block, held for the schedule, because
+      // nothing the pair-logits pass reads moves with the noise level.
+      const logitsBytes = heads * pairs * 4;
+      const blockCount = weights.superBlocks
+        .reduce((count, group) => count + group.blocks.length, 0);
+      // 🔴 AS MANY BLOCKS AS FIT, NOT ALL OR NONE. A block's logits are
+      // 64 x tokens^2 bytes, so caching all twenty-four costs 61 MiB at 200
+      // tokens and 246 at 400 - and length is exactly where memory binds. The
+      // saving is per BLOCK and so is the cost, so keeping the first
+      // PAIR_LOGITS_CACHE_BYTES worth of them buys that fraction of the time
+      // for a bounded amount of memory: every block at 208 tokens or fewer,
+      // a quarter of them at 400.
+      const cached = Math.max(0,
+        Math.min(blockCount, Math.floor(PAIR_LOGITS_CACHE_BYTES / logitsBytes)));
+      const buildPairLogits = buildPairNorm
+        || this.#pairLogits?.ready !== true
+        || this.#pairLogits.bytes !== logitsBytes
+        || this.#pairLogits.buffers.length !== cached;
+      if (buildPairLogits) {
+        this.#releasePairLogits();
+        const buffers = [];
+        for (let at = 0; at < cached; at += 1) {
+          noteAllocation(this.device, "difftx.pair-logits", logitsBytes);
+          buffers.push(this.device.createBuffer({
+            label: `difftx.pair-logits.${at}`, size: logitsBytes, usage: storage,
+          }));
+        }
+        this.#pairLogits = { ready: false, bytes: logitsBytes, buffers };
+      }
+      // ...the blocks past the cache share one scratch buffer and recompute,
+      // which is what every block did before.
+      const spare = cached < blockCount
+        ? scratch("difftx.logits", logitsBytes) : undefined;
+      const logitsFor = (at) =>
+        (at < cached ? { buffer: this.#pairLogits.buffers[at] } : spare);
       // The AdaLN pass hands the projection its input through this.
       const xBuffer = scratch("difftx.x", tokens * channels * 4);
       const gatedBuffer = scratch("difftx.gated",
@@ -1321,10 +1404,17 @@ export class Af3DiffusionTransformerGpu {
         encoder = this.device.createCommandEncoder({ label: "difftx.stack" });
       };
       for (const [groupIndex, group] of weights.superBlocks.entries()) {
-        const projection = this.allocator.upload("difftx.pair-projection",
-          group.pairLogitsProjection, storage);
-        projections.push(projection);
-        if (!this.residentWeights) pending.push(projection);
+        // ...and no upload at all on a call that reuses the logits, since the
+        // projection is read by that one pass and by nothing else.
+        const firstInGroup = groupIndex * group.blocks.length;
+        const projection = buildPairLogits || firstInGroup + group.blocks.length > cached
+          ? this.allocator.upload("difftx.pair-projection",
+              group.pairLogitsProjection, storage)
+          : undefined;
+        if (projection !== undefined) {
+          projections.push(projection);
+          if (!this.residentWeights) pending.push(projection);
+        }
         for (let inner = 0; inner < group.blocks.length; inner += 1) {
           const block = group.blocks[inner];
           // 🔴 THE SAME TRADE AS THE PAIRFORMER'S, AND THE SAME ANSWER: TRY IT
@@ -1364,9 +1454,13 @@ export class Af3DiffusionTransformerGpu {
           const at = groupIndex * perSuper + inner;
           const runBlock = (label, pipeline, buffers, x, y = 1) =>
             run(label, pipeline, buffers, x, y, `${label}:${at}`);
-          const pairGroups = Math.ceil(pairs / 64);
-          runBlock("pair-logits", compiled.pairLogits[inner], [normalized, projection, logits],
-              Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
+          const logits = logitsFor(at);
+          if (buildPairLogits || at >= cached) {
+            const pairGroups = Math.ceil(pairs / 64);
+            runBlock("pair-logits", compiled.pairLogits[inner],
+                [normalized, projection, logits],
+                Math.min(pairGroups, GRID_WIDTH), Math.ceil(pairGroups / GRID_WIDTH));
+          }
           runBlock("adaln", compiled.adaln, [actBuffer, condBuffer, blockWeights, xBuffer],
               Math.ceil(tokens / tile));
           runBlock("qkvg", compiled.qkvg, [xBuffer, blockWeights, q, k, v, gate],
@@ -1402,6 +1496,9 @@ export class Af3DiffusionTransformerGpu {
       }
       this.device.queue.submit([encoder.finish()]);
       validation.end(submits === 0 ? "block stack" : "readback");
+      // ...only now, because a refusal anywhere above restarts the call and a
+      // cache marked ready before it is filled is one attend reads as noise.
+      this.#pairLogits.ready = true;
       // 🔴 THE PAIR PROJECTIONS ARE RELEASED AFTER THE SUBMIT, NOT INSIDE THE
       // LOOP. They are pooled, so releasing one while a later block's encoded
       // pass still refers to it would hand the same buffer to that block's
