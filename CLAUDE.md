@@ -301,6 +301,33 @@ read is not free - so where the bytes are not the bottleneck it is a small
 LOSS taken for the memory. See docs/AF3.md's memory section and
 `TRANSITION_CHUNK_TARGET_BYTES`.
 
+🔴 **AND THE ATOM BLOCKS ARE THE FOURTH ANSWER: NO, ON ACCURACY, NOT ON
+TIME.** They are the one stack with no precision axis, and they are the shape
+the table above says should pay: `output` streams a block's whole 655 KB
+through EVERY workgroup - 600 of them at 200 tokens, 393 MB of weight traffic
+in one pass - and it runs at **148 GFLOP/s against this device's 1220 scalar
+ceiling**, which is a kernel waiting on memory. Narrowing the weights was
+tried and it does not survive the envelopes:
+
+| | f32 | big matrices at f16 precision | all weights f16 |
+|---|---|---|---|
+| encoder `tokenAct` | **9.48e-6** | 6.19e-4 | 1.12e-2 |
+| encoder `skipConnection` | **2.05e-5** | 9.26e-4 | 2.11e-2 |
+| decoder position update | **2.47e-7** | 1.29e-4 | 1.41e-4 |
+| denoiser (bound 4e-4) | **1.28e-4** | 1.18e-3 | 1.47e-3 |
+
+The middle column is the diagnosis: rounding ONLY the tensors over 1024
+elements - so every LayerNorm scale and per-channel bias stays float32 - still
+misses the head's bound by 3x. There is nothing to split off, so a two-buffer
+version would not help either.
+
+🔴 **AND THE REASON GENERALISES.** The diffusion transformer takes f16 weights
+happily (1.88e-2 inside a 4e-2 bound) because what it produces is an
+ACTIVATION, and the LayerNorm after it renormalises most of the error away.
+The atom decoder produces a POSITION UPDATE in angstroms, which nothing
+renormalises: a relative error there is a coordinate error. Ask what a stack's
+output IS before pricing its weights.
+
 🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
 allocator's snapshot cannot see a `Float32Array`, and until
 `src/runtime/device-memory.js` existed nothing counted the buffers created
