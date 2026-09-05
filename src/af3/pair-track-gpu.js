@@ -101,7 +101,11 @@ export async function compilePairTrack(cache, options) {
     // src/af3/transition-webgpu.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
-      undefined, PAIR_SCRATCH_STORAGE[0]);
+      undefined,
+      { normalized: PAIR_SCRATCH_STORAGE[0], hidden: PAIR_SCRATCH_STORAGE[4],
+        // a is scratch[1] and b is scratch[2]; they share one storage because
+        // the incoming direction reads them the other way round.
+        ab: PAIR_SCRATCH_STORAGE[1] });
     // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
@@ -111,7 +115,7 @@ export async function compilePairTrack(cache, options) {
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
-                  + `:${PAIR_SCRATCH_STORAGE[0]}:${name}`,
+                  + `:${PAIR_SCRATCH_STORAGE.join("")}:${name}`,
                   source);
     }
   }
@@ -121,12 +125,15 @@ export async function compilePairTrack(cache, options) {
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision },
       gridOffsets, epsilon, variance, dialect,
-      PAIR_SCRATCH_STORAGE[5], PAIR_SCRATCH_STORAGE[0]);
+      PAIR_SCRATCH_STORAGE[5], PAIR_SCRATCH_STORAGE[0],
+      // q, k, v and the gate are scratch 1, 2, 3 and 4 in that order.
+      { q: PAIR_SCRATCH_STORAGE[1], k: PAIR_SCRATCH_STORAGE[2],
+        v: PAIR_SCRATCH_STORAGE[3], gate: PAIR_SCRATCH_STORAGE[4] });
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
-                  + `:${PAIR_SCRATCH_STORAGE[5]}${PAIR_SCRATCH_STORAGE[0]}:${name}`,
+                  + `:${PAIR_SCRATCH_STORAGE.join("")}:${name}`,
                   source);
     }
   }
@@ -190,7 +197,7 @@ export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrec
  * `grid.attend` and read by `grid.project-out` and by nothing else, which is
  * why it is the one converted first.
  */
-export const PAIR_SCRATCH_STORAGE = ["f16", "f32", "f32", "f32", "f32", "f16", "f32"];
+export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16", "f16", "f32"];
 
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;

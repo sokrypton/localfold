@@ -88,8 +88,22 @@ export function createTriangleShaders(
   projectTile = PROJECT_TILE,
   residual = false,
   contractTile = CONTRACT_TILE_DEFAULT,
-  normalizedStorage = "f32",
+  storage = {},
 ) {
+  // 🔴 THE ACTIVATION STORAGE IS A THIRD AXIS, beside the weight element `tw`
+  // and the arithmetic `precision`/`accumulatePrecision`, and it composes with
+  // both without either knowing. Every field defaults to f32, so AF2's
+  // evoformer and multimer blocks - which share these shaders and pass none of
+  // this - generate exactly the WGSL they generated before.
+  //
+  // `normalized` is the layer-normed pair (the block's scratch[0]); `hidden`
+  // is the normalised contraction that projectOutput reads (scratch[4]).
+  const {
+    normalized: normalizedStorage = "f32",
+    hidden: hiddenStorage = "f32",
+    ab: abStorage = "f32",
+  } = typeof storage === "string" ? { normalized: storage } : storage;
+  const packAB = abStorage === "f16";
   if (variance !== "two-pass" && variance !== "fast") {
     throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
   }
@@ -305,6 +319,51 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
   const MATRICES = [["ap", "LINEARAPWEIGHT", "LINEARAPBIAS"], ["ag", "LINEARAGWEIGHT", "LINEARAGBIAS"],
                     ["bp", "LINEARBPWEIGHT", "LINEARBPBIAS"], ["bg", "LINEARBGWEIGHT", "LINEARBGBIAS"]];
 
+  // 🔴 A THREAD TAKES ADJACENT CHANNELS WHEN a AND b ARE PACKED, not channels
+  // eight apart. They are stored channel-major - a[h][i][j] - so two adjacent
+  // LINEAR indices are two adjacent ROWS, and pairing rows would be wrong for
+  // an odd PAIRS: `h * PAIRS + row` is odd at odd h when n is odd, so the pair
+  // would straddle a word. n = 59 and n = 68 are the sizes every check here
+  // runs at, one of each, and only one of them would have shown it.
+  //
+  // Pairing CHANNELS instead has no parity to get wrong: the word holding
+  // channels h and h+1 of a row is `(h / 2) * PAIRS + row`, whatever PAIRS is.
+  // A thread already owns `columnsPerThread` channels, so owning them adjacent
+  // costs no extra accumulator - unlike the grid projection, where a lane owned
+  // ONE output and had to take two.
+  if (packAB && columnsPerThread % 2 !== 0) {
+    throw new RangeError("a packed a/b projection needs an even columnsPerThread");
+  }
+  // 🔴 THIS BELONGS TO projectAB ALONE. `projectOutput` has a column loop of
+  // the same shape reading the same-shaped weight tile, and a substitution that
+  // matched both left it indexing the tile by the packed mapping while its
+  // store still used the plain one. `a` was right, the contraction was right,
+  // and the fold came out at relRMS 1.42 - the two kernels this touches were
+  // both innocent. tools/gpu/check-triangle-packed.js is what localised it, by
+  // running the whole five-kernel update and not only the two.
+  const columnOf = packAB
+    ? `local.x * ${columnsPerThread}u + column` : `local.x + column * 8u`;
+  const plainStore = `    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
+      let h = h0 + ${columnOf};
+      if (h >= CH) { continue; }
+      let cell = vec4<f32>(acc[r * ${columnsPerThread}u + column]);
+      let index = h * PAIRS + row;
+      a[index] = pair_mask * cell.x * logistic(cell.y);
+      b[index] = pair_mask * cell.z * logistic(cell.w);
+    }`;
+  const gated = (cell, value, gate) => `pair_mask * ${cell}.${value} * logistic(${cell}.${gate})`;
+  const abStore = Array.from({ length: columnsPerThread / 2 }, (_, m) => `    {
+      let h = h0 + local.x * ${columnsPerThread}u + ${m * 2}u;
+      if (h + 1u < CH) {
+        let lo = vec4<f32>(acc[r * ${columnsPerThread}u + ${m * 2}u]);
+        let hi = vec4<f32>(acc[r * ${columnsPerThread}u + ${m * 2 + 1}u]);
+        // The word holding channels h and h+1 of this row; this thread owns both.
+        let word = (h / 2u) * PAIRS + row;
+        a[word] = pack2x16float(vec2<f32>(${gated("lo", "x", "y")}, ${gated("hi", "x", "y")}));
+        b[word] = pack2x16float(vec2<f32>(${gated("lo", "z", "w")}, ${gated("hi", "z", "w")}));
+      }
+    }`).join("\n");
+
   const projectAB = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
@@ -312,8 +371,8 @@ const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 @group(0) @binding(0) var<storage, read> z: array<${storageArray(normalizedStorage)}>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
-@group(0) @binding(3) var<storage, read_write> a: array<f32>;
-@group(0) @binding(4) var<storage, read_write> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> a: array<${storageArray(abStorage)}>;
+@group(0) @binding(4) var<storage, read_write> b: array<${storageArray(abStorage)}>;
 
 var<workgroup> tile_source: array<${projectRowVector}, 64>;
 // 🔴 ONE vec4 A CELL, NOT FOUR ARRAYS. a, b and their two gates are four
@@ -331,12 +390,12 @@ fn main(
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
   let row0 = group.y * TILE_ROWS + local.y;
-  let h0 = group.x * TILE_COLUMNS + local.x;
+  let h0 = group.x * TILE_COLUMNS;
   let tile_index = local.y * 8u + local.x;
   // Each cell accumulates (a, a's gate, b, b's gate).
   var acc: array<${accVector}, ${rowsPerThread * columnsPerThread}>;
   for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-    let h = h0 + column * 8u;
+    let h = h0 + ${columnOf};
     var bias = ${accVector}(0.0);
     if (h < CH) {
       bias = ${accVector}(
@@ -358,8 +417,8 @@ fn main(
       }`)}
     tile_source[tile_index] = staged;
     for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-      let h = h0 + column * 8u;
-      let slot = local.y * TILE_COLUMNS + local.x + column * 8u;
+      let h = h0 + ${columnOf};
+      let slot = local.y * TILE_COLUMNS + ${columnOf};
       var packed = ${accVector}(0.0);
       if (h < CH && weight_c < CZ) {
         let weight_index = h * CZ + weight_c;
@@ -373,7 +432,7 @@ fn main(
     for (var k = 0u; k < 8u; k += 1u) {
       let x = tile_source[local.y * 8u + k];
       for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-        let packed = tile_weight[k * TILE_COLUMNS + local.x + column * 8u];
+        let packed = tile_weight[k * TILE_COLUMNS + ${columnOf}];
         ${overRows((r) =>
           `acc[${r}u * ${columnsPerThread}u + column] += ${rowAt("x", r)} * packed;`)}
       }
@@ -397,14 +456,7 @@ fn main(
     let row = row0 + r * 8u;
     if (row >= PAIRS) { continue; }
     let pair_mask = mask[row];
-    for (var column = 0u; column < ${columnsPerThread}u; column += 1u) {
-      let h = h0 + column * 8u;
-      if (h >= CH) { continue; }
-      let cell = vec4<f32>(acc[r * ${columnsPerThread}u + column]);
-      let index = h * PAIRS + row;
-      a[index] = pair_mask * cell.x * logistic(cell.y);
-      b[index] = pair_mask * cell.z * logistic(cell.w);
-    }
+${packAB ? abStore : plainStore}
   }
 }`;
 
@@ -420,12 +472,15 @@ fn main(
   // Channel-major makes a slice 256 KiB and the lanes contiguous. Measured on
   // an M2, interleaved against the old layout, bitwise-identical output:
   //   L=128 4.7x   L=192 5.5x   L=224 9.1x   L=256 14.5x   L=288 13.9x
+  // The same channel-paired layout projectAB writes; `h` is `group.z` here, so
+  // which half of the word to take is uniform across the whole workgroup.
+  const channelMajor = (name, row) => (packAB
+    ? `unpack2x16float(${name}[(h / 2u) * PAIRS + ${row}])[h & 1u]`
+    : `${name}[h * PAIRS + ${row}]`);
   const loadATile = direction === "outgoing"
-    ? "a[h * PAIRS + i * L + a_k]"
-    : "b[h * PAIRS + a_k * L + i]";
+    ? channelMajor("a", "i * L + a_k") : channelMajor("b", "a_k * L + i");
   const loadBTile = direction === "outgoing"
-    ? "b[h * PAIRS + j * L + b_k]"
-    : "a[h * PAIRS + b_k * L + j]";
+    ? channelMajor("b", "j * L + b_k") : channelMajor("a", "b_k * L + j");
   const CONTRACT_TILE = contractTile;
   // 🔴 THE CONTRACTION HAD THE WORST READ-TO-ARITHMETIC RATIO IN THE FILE: one
   // output a thread meant two workgroup reads bought a single multiply-add, and
@@ -459,8 +514,8 @@ fn main(
 const CONTRACT_ROWS: u32 = ${CONTRACT_TILE.rows}u;
 const CONTRACT_COLUMNS: u32 = ${CONTRACT_TILE.columns}u;
 
-@group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(0) var<storage, read> a: array<${storageArray(abStorage)}>;
+@group(0) @binding(1) var<storage, read> b: array<${storageArray(abStorage)}>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
 // a's rows an invocation owns, and b's columns, each packed into one vector.
@@ -522,7 +577,7 @@ fn main(
   const normalizeHidden = `${common}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<${tw}>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(hiddenStorage)}>;
 // ...READS CHANNEL-MAJOR AND WRITES CHANNEL-MINOR, because this is where the
 // two layouts meet: the contraction upstream wants h slowest, and
 // projectOutput downstream reads a row's channels contiguously. Doing the
@@ -530,14 +585,14 @@ fn main(
 // a dedicated one, and staging it through workgroup memory is what lets BOTH
 // sides be read and written along their own major axis.
 ${stagedLayerNorm("CH", (row, channel) => `source[${channel} * PAIRS + ${row}]`,
-                  "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel")}`;
+                  "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel", hiddenStorage)}`;
 
   const projectOutput = `${common}
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
 @group(0) @binding(0) var<storage, read> z: array<${storageArray(normalizedStorage)}>;
-@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<${storageArray(hiddenStorage)}>;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
@@ -587,7 +642,7 @@ fn main(
         let row = row0 + ${r}u * 8u;
         var x_value = 0.0;
         var z_value = 0.0;
-        if (row < PAIRS && source_k < CH) { x_value = x[row * CH + source_k]; }
+        if (row < PAIRS && source_k < CH) { x_value = ${storedElement(hiddenStorage, "x", "row * CH + source_k")}; }
         if (row < PAIRS && source_k < CZ) { z_value = ${storedElement(normalizedStorage, "z", "row * CZ + source_k")}; }
         ${rowAt("staged_x", r)} = ${accNarrow("x_value")};
         ${rowAt("staged_z", r)} = ${accNarrow("z_value")};
