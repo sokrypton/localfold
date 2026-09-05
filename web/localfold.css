@@ -614,13 +614,31 @@
 }
 .entity-popup-problem { color: #b91c1c; }
 .entity-popup-row { display: flex; align-items: center; gap: 6px; }
-.entity-popup-code { flex: 1 1 auto; min-width: 0; height: 30px; font-size: 12px;
-  border: 1px solid #d1d5db; border-radius: 7px; background: #fff; }
-.entity-popup-typed { width: 6ch; height: 30px; font-size: 12px; text-align: center;
-  text-transform: uppercase; border: 1px solid #d1d5db; border-radius: 7px; }
+/* 🔴 ONE SET OF METRICS FOR EVERY CONTROL IN THIS POPUP. The template section
+   arrived with its own - 28px tall, 4px radius, a grey #f8fafc fill - beside a
+   modification row that is 30px, 7px and white, and its <select> had no rule at
+   all, so it drew as a browser-default control. That is the same mismatch the
+   note on `#foldOptions select` exists to prevent, one popup further in. */
+.entity-popup-code,
+.entity-popup-typed,
+.entity-popup-position,
+.entity-template-kind,
+.entity-template-source,
+.entity-template-chain,
+.entity-template-file {
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 6px;
+  font-size: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 7px;
+  background: #fff;
+  color: inherit;
+}
+.entity-popup-code { flex: 1 1 auto; min-width: 0; }
+.entity-popup-typed { width: 6ch; text-align: center; text-transform: uppercase; }
 .entity-popup-at { font-size: 12px; color: #6b7280; }
-.entity-popup-position { width: 6ch; height: 30px; font-size: 12px; text-align: center;
-  border: 1px solid #d1d5db; border-radius: 7px; }
+.entity-popup-position { width: 6ch; text-align: center; }
 /* The residue actually at that position: a wrong number is then visible here
    rather than as a validation message after pressing Fold. */
 .entity-popup-residue {
@@ -943,22 +961,18 @@
    "from the MSA search" have no control at all, and without this the popup
    changed height by exactly one row - 28px, measured - under the cursor, which
    on the last item moves the menu out from under the pointer.
-   The tallest of the five measures 90px including the section's own gaps, so
-   the content box is reserved at 79 and the popup is exactly the size its
+   The tallest of the five measures 103px including the section's own gaps, so
+   the content box is reserved at 92 and the popup is exactly the size its
    largest source already made it. python3 tools/entity-popup.py is what says
-   so, and what will say when it stops being true. */
-.entity-popup-section-template { min-height: 79px; }
+   so, and what said this number was wrong the moment the controls grew from
+   28px to 30 to match the rest of the popup. */
+.entity-popup-section-template { min-height: 92px; }
 .entity-template-kind { flex: 1 1 auto; min-width: 0; }
 .entity-template-source { flex: 1 1 auto; min-width: 0; }
 /* The file input carries its own button, so it needs room to shrink rather
    than a width - `min-width: 0` is what lets a flex child go below its
    content's size at 320px. */
-.entity-template-file { flex: 1 1 auto; min-width: 0; }
+.entity-template-file { flex: 1 1 auto; min-width: 0; padding: 4px 6px; }
 .entity-template-chain { flex: 0 0 72px; }
-.entity-popup-section input {
-  box-sizing: border-box;
-  height: 28px; padding: 0 6px; font-size: 12px;
-  border: 1px solid #cbd5e1; border-radius: 4px; background: #f8fafc; color: #0f172a;
-}
 .entity-template-status.error { color: #b91c1c; }
 .entity-popup-check { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 6px; }

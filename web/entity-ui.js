@@ -375,18 +375,17 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         // Written by the page once it has fetched: coverage is a fact about a
         // file this list has never seen, and a template covering 17 of 120
         // residues folds perfectly well and says nothing about it.
+        // 🔴 SHORT, BECAUSE THE CONTROL ABOVE ALREADY SAYS MOST OF IT. The
+        // placeholders spell the format - "1abc, or 1abc_A", "P00533" - so
+        // repeating it here was three lines saying what one already showed.
+        // What is left is the one thing the control cannot say: where the
+        // structure comes from, and that coverage is reported after the fetch.
         const waiting = {
-          none: "A structure to show this chain, shown to the model as geometry"
-            + " it should already believe.",
-          pdb: "A PDB entry. Its coverage appears here once it is fetched.",
-          afdb: "A UniProt accession, fetched from AlphaFold DB. Its coverage"
-            + " appears here once it is fetched.",
-          search: "The best hit the MSA search finds. Needs the MSA set to"
-            + " search; its coverage appears here once the fold has run.",
-          upload: template.filename === undefined
-            ? "A structure file from this machine, as PDB or mmCIF."
-            : `${template.filename}. Its coverage appears here once the fold`
-              + " has run.",
+          none: "A known structure to fold this chain against.",
+          pdb: "A PDB entry. Coverage appears once it is fetched.",
+          afdb: "An accession from AlphaFold DB.",
+          search: "The best hit the MSA search finds. Needs the MSA set to search.",
+          upload: template.filename ?? "A PDB or mmCIF file from this machine.",
         };
         status.textContent = template.status ?? waiting[kind];
         section.append(status);
