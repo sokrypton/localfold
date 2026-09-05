@@ -148,6 +148,10 @@ def main():
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--dev-report", action="store_true",
                         help="open the footer's dev panel and print what it says")
+    parser.add_argument("--bar", action="store_true",
+                        help="print every value the progress bar took, with the"
+                             " clock beside it - a bar that stops short is a"
+                             " sequence, not a final state")
     parser.add_argument("--timeline", action="store_true",
                         help="print when the model shards and the MSA search"
                              " were each on the wire, and how much they"
@@ -261,6 +265,29 @@ def main():
             if (log.length === 0 || log[log.length - 1] !== now) log.push(now);
           }).observe(el, { childList: true, characterData: true, subtree: true });
         })()""")
+        # 🔴 AND THE BAR IS SAMPLED THE SAME WAY, because "it only goes half
+        # way" is a claim about a SEQUENCE of values and nothing that reads the
+        # page after the fold can see it - by then the bar is back to idle.
+        # Polled rather than observed: `bar.value = x` is an IDL write, and a
+        # MutationObserver on the element sees nothing at all.
+        cdp.evaluate(ws, """(() => {
+          window.__barLog = [];
+          const bar = document.getElementById('progress');
+          const started = performance.now();
+          setInterval(() => {
+            const state = bar.dataset.state || '';
+            const value = bar.hasAttribute('value') ? bar.value : null;
+            // ...and the download dial beside it, which is a second animation
+            // with a second calibration and the same way of being wrong.
+            const node = document.getElementById('model-load');
+            const dial = node && !node.hidden ? (node.getAttribute('aria-label') || '') : '';
+            const log = window.__barLog;
+            const last = log[log.length - 1];
+            if (last !== undefined && last.value === value
+              && last.state === state && last.dial === dial) return;
+            log.push({ at: Math.round(performance.now() - started), value, state, dial });
+          }, 50);
+        })()""")
         # ...stamped before the click so the timeline can tell what the fold
         # caused from what the page had already fetched. See --timeline.
         cdp.evaluate(ws, "window.__foldClickedAt = performance.now();"
@@ -279,6 +306,12 @@ def main():
         # after the alignment - and the fix is invisible from the outside
         # except as a total. Resource timing says it directly: when the model
         # shards were on the wire, and when the search was.
+        if args.bar:
+            print("bar:", cdp.evaluate(ws, """(() => JSON.stringify(
+              (window.__barLog || []).map((e) =>
+                [e.at, e.value === null ? e.state : Number(e.value.toFixed(3)),
+                 e.dial || undefined])))()"""))
+
         if args.timeline:
             print("timeline:", cdp.evaluate(ws, r"""(() => {
               // 🔴 ONLY WHAT THE FOLD ASKED FOR, MEASURED FROM THE CLICK.
