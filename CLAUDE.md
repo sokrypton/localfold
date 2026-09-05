@@ -592,6 +592,81 @@ it ran a configuration nothing runs. Run the WHOLE update, and sweep the axes
 the caller varies (`direction`, `accumulatePrecision`), or it is a check of
 something else.
 
+🔴 **A STORAGE FORMAT MEASURED ON ONE STACK IS NOT A FACT ABOUT THE OTHER
+TWO.** `PAIR_SCRATCH_STORAGE` was a module constant that every caller of
+`compilePairTrack` inherited, and it was measured on the pairformer. Three
+stacks run that pair track, and two of them were failing their own checkers'
+own bounds the whole time:
+
+| | packed | unpacked | bound |
+|---|---|---|---|
+| `check-af3-msa-block` | 1.82e-3 | **7.16e-6** | 1e-5 |
+| `check-af3-template` | 3.79e-5 | **2.52e-7** | 2e-5 |
+| `check-af3-trunk` pair | 1.04e-4 | **2.18e-5** | 4e-5 |
+
+The layout is a parameter now: the pairformer keeps its packing (190 MiB at 408
+tokens, and `check-af3-block` passes), the MSA stack and the template embedder
+take `UNPACKED_PAIR_SCRATCH`.
+
+🔴 **AND A HALFWAY LAYOUT IS WORSE THAN EITHER, WHICH IS WHY IT WAS TRIED.**
+Bisected on the trunk's pair term, changing only the MSA stack: `a` and `b`
+cost 3x - they are MULTIPLIED against each other in the contraction, so their
+rounding squares - `normalized` costs 1.6x, and `hidden` and grid attention's
+output cost nothing measurable. Keeping only those two passes the TRUNK's bound
+at 3.11e-5 and still misses the MSA block's by 50x. Half the memory is not
+worth a checker that has to be told to expect less.
+
+🔴 **AND THE END-TO-END NUMBER COULD NOT SEE ANY OF IT.** `fold.js --dump`
+reports `pair vs AF3` at 4.03e-4 with the bad packing and 4.04e-4 without it,
+with mean pLDDT 85.6 either way. Forty-eight pairformer blocks are contractive
+enough to swallow a 150x error in the term that feeds them, so the whole-fold
+gate is the WRONG instrument for a change inside one stage - and it is the one
+that gets run. Run the per-stage checkers when a stage changes.
+
+🔴 **AND `scratch[6]` WAS NEVER READ BY ANYTHING.** `encodePairTrack` indexes 0
+to 5, and so does every caller; all three stacks allocated seven pair-sized
+tensors and used six. 19.5 MiB in the MSA stack at 200 tokens, 10.2 in the
+template, held for a pass and touched by nothing.
+
+🔴 **AND A SAMPLER STEP CHANGES TWO INPUTS AND USED TO REBUILD EVERYTHING.**
+The diffusion head is called up to two hundred times down one schedule, and
+only the noisy coordinates and the noise level move. The per-atom conditioning,
+the reference conformer, the ten gathers, the trunk's pair and single, the
+encoder's query and key conditioning and masks, and the pair logits derived
+from them are the FOLD - all of it was rebuilt on the host and written across
+the bus once per step, and three tensors derived from it were recomputed on the
+GPU for the identical answer. `bench-head.js --profile` medians nine calls in
+one process, which is what to measure this with:
+
+| | 59 tokens | 200 tokens |
+|---|---|---|
+| before | 86 ms | 253 ms |
+| after | **71** | **206** |
+
+The mechanism is `persistent` beside `persistentUpload` in the atom encoder and
+decoder - the first keeps a tensor the blocks WRITE, the second keeps one they
+READ - plus `reusePair` in the conditioning module and `#pairNorm` in the
+transformer. The build closure is not called on a cache hit, so the host-side
+gathering inside it does not run either.
+
+🔴 **AND THE ENCODER HANDS THE DECODER DEVICE BUFFERS, NOT ARRAYS.** Its five
+static tensors were read back across the bus and uploaded again to make a
+second copy the peak then carried beside the first: 17 MiB at 59 residues.
+
+🔴 **WHAT IS LEFT IN A DENOISER STEP IS THE FOUR HOST-DEVICE ROUND TRIPS.** At
+59 tokens the stages sum to 71 ms and the labelled compute passes to about 52;
+the rest is one submit and one `mapAsync` per stage, because the head chains
+conditioning -> encoder -> transformer -> decoder through Float32Arrays.
+Caching the transformer's bind groups and scratch tensors bought nothing
+measurable against that - the stage sat at 45-46 ms either way - so the next
+thing there is chaining the stages ON THE DEVICE, not another cache.
+
+🔴 **AND `node tools/gpu-chrome.mjs` SOMETIMES DOES NOT EXIT.** The results file
+is complete and correct and the node process sits there with a headless Chrome
+still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
+"gpu-chrome-"` matches the temporary profile directory and nothing else - not
+the browser you are using. A batch of checkers should carry one between arms.
+
 🔴 **AND `memorySnapshot`'s `byLabel` IS CUMULATIVE, WHICH IS THE WRONG
 QUESTION.** It sums every allocation a label ever made, so a scratch tensor
 taken and returned once a block reads as forty-eight times its size - that is
