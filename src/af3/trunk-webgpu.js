@@ -133,7 +133,15 @@ export class Af3TrunkGpu {
     const tokens = input.tokens;
     const pairs = tokens * tokens;
     const timings = {};
+    // 🔴 ANNOUNCED BEFORE IT RUNS, NOT ONLY AFTER IT FINISHES. `onStage` fires
+    // with a duration, so it can only ever mark a stage that is over - and on a
+    // large protein the MSA stack alone is seconds, which the page spent
+    // sitting on "Trunk · 0%" with nothing to say. `onStageStart` is a separate
+    // signal on purpose: every existing consumer of `onStage` reads the
+    // millisecond figure (tools/gpu/fold.js prints `detail.ms.toFixed(0)`), and
+    // firing that with no duration would break them rather than inform them.
     const stage = async (name, work) => {
+      options.onStageStart?.(name);
       const start = performance.now();
       const value = await work();
       timings[name] = performance.now() - start;

@@ -14,7 +14,8 @@ import { describe, it } from "node:test";
 
 import {
   af2BlockUnits, af2Plan, af2StructureStepUnits, af3DenoiserCallUnits, af3Plan,
-  af3TrunkPassUnits, describeRemaining, planTotal, RuntimeEstimator,
+  af3TrunkPassUnits, af3TrunkStageSpans, AF3_TRUNK_STAGE_SHARES,
+  describeRemaining, planTotal, RuntimeEstimator,
 } from "../src/runtime/cost-model.js";
 
 /** Measured on the reference M2 by tools/gpu/bench-runtime.js. */
@@ -232,5 +233,49 @@ describe("describing what is left", () => {
   it("says nothing when it knows nothing", () => {
     assert.equal(describeRemaining(undefined), undefined);
     assert.equal(describeRemaining(Number.NaN), undefined);
+  });
+});
+
+describe("the trunk's stages, on the bar", () => {
+  // 🔴 WHAT THIS PROTECTS IS "THE BAR MOVES", NOT A TIMING. The shares are
+  // measured at one shape and are only roughly right at another; what must not
+  // regress is that the four stages before the pairformer have somewhere to
+  // go, in the order they run, and that the pairformer does not start at zero.
+  it("spans the whole pass, in order, with no gaps", () => {
+    const spans = af3TrunkStageSpans();
+    assert.deepEqual([...spans.keys()],
+      AF3_TRUNK_STAGE_SHARES.map(([name]) => name));
+    let at = 0;
+    for (const [, span] of spans) {
+      assert.equal(span.from, at, "a stage begins where the last one ended");
+      assert.ok(span.to > span.from, "and covers some of the pass");
+      at = span.to;
+    }
+    assert.ok(Math.abs(at - 1) < 1e-12, "and the last one ends at the pass");
+  });
+
+  it("runs the embedder, the templates and the MSA before the pairformer", () => {
+    const spans = af3TrunkStageSpans();
+    assert.ok(spans.get("embedder").to <= spans.get("template").from);
+    assert.ok(spans.get("template").to <= spans.get("msa-stack").from);
+    assert.ok(spans.get("msa-stack").to <= spans.get("pairformer").from);
+  });
+
+  // 🔴 THE NUMBER THE COMPLAINT WAS ABOUT. Everything before the pairformer
+  // used to be worth nothing on the bar, so the first thing a large fold could
+  // report was block 1 of 48 - after the embedder, the template embedder and
+  // the MSA stack had each run for seconds. That head has to be a visible
+  // fraction of the pass, not a rounding error.
+  it("gives the silent stages a sixth of the pass to move through", () => {
+    const spans = af3TrunkStageSpans();
+    const head = spans.get("pairformer").from;
+    assert.ok(head > 0.1, `the silent stages hold ${head}, which reads as frozen`);
+    assert.ok(head < 0.3, `the silent stages hold ${head}, more than measured`);
+  });
+
+  it("leaves the pairformer the bulk of it", () => {
+    const spans = af3TrunkStageSpans();
+    const pairformer = spans.get("pairformer");
+    assert.ok(pairformer.to - pairformer.from > 0.75);
   });
 });

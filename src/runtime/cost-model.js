@@ -52,6 +52,54 @@ function shape(value, fallback, what) {
 }
 
 /**
+ * What one trunk pass is made of, as a share of the pass, in the order it runs.
+ *
+ * 🔴 THE BAR HAD ONE MILESTONE FOR THE WHOLE PASS AND IT WAS THE LAST STAGE.
+ * `Af3TrunkGpu.run` is five stages - embedder, template, MSA stack, pairformer,
+ * distogram - and only the pairformer reports anything, per block. Everything
+ * before it therefore passed in silence, and the status line sat on "Trunk ·
+ * 0%" for the whole of it. That was a fair trade when the four other stages
+ * were a rounding error; on a large protein they are seconds each, and a bar
+ * that does not move for seconds reads as a page that has died.
+ *
+ * 🔴 MEASURED, AT ONE SHAPE, AND THAT IS THE LIMIT OF IT. From
+ * `tools/gpu/bench-trunk.js --profile --tokens=200 --msa=32`, in milliseconds:
+ * embedder 34, template 95, msa-stack 427, pairformer 2952, distogram 53. The
+ * shares below are those over their total. They are NOT constant in the shape:
+ * the MSA stack grows with alignment depth and the pairformer with tokens
+ * cubed, so at 24 tokens with four blocks the pairformer is a quarter of the
+ * pass rather than five sixths. What they buy is a bar that advances through
+ * the silent stages in roughly the right places - which is a different and much
+ * lower bar than a clock, and the reason the status line names the running
+ * stage as well as showing a number.
+ */
+export const AF3_TRUNK_STAGE_SHARES = [
+  ["embedder", 0.010],
+  ["template", 0.027],
+  ["msa-stack", 0.120],
+  ["pairformer", 0.828],
+  ["distogram", 0.015],
+];
+
+/**
+ * Where each trunk stage begins and ends, as a fraction of one pass.
+ *
+ * The shares are normalised here rather than in the table, so the table can
+ * stay readable as measurements and cannot drift from summing to one.
+ */
+export function af3TrunkStageSpans() {
+  const total = AF3_TRUNK_STAGE_SHARES.reduce((sum, [, share]) => sum + share, 0);
+  const spans = new Map();
+  let at = 0;
+  for (const [name, share] of AF3_TRUNK_STAGE_SHARES) {
+    const width = share / total;
+    spans.set(name, { from: at, to: at + width });
+    at += width;
+  }
+  return spans;
+}
+
+/**
  * One AF3 trunk pass over 48 pairformer blocks and 4 MSA blocks.
  *
  * Fitted as const + L^2 + L^3 + rows*L^2. The pairformer dominates and does not

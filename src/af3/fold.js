@@ -402,6 +402,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
   }
 
   const seqMask = batch.seqMask;
+  // 🔴 THIS IS HOST WORK OVER n^2 AND IT IS INSIDE THE SILENT BAND. At 1500
+  // tokens the loop below is 2.25M iterations and `previousPair` further down
+  // is a 1.15 GB Float32Array allocated and zeroed - both between the last
+  // thing the page was told and the first thing the trunk reports.
+  await stage("trunk-prep", { tokens });
   const pairMask = new Float32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
@@ -533,6 +538,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
       pairMask, seqMask, previousPair, previousSingle,
     }, weights.trunk, DIALECT, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
+      // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
+      // Four of the trunk's five stages report nothing while they run, and on a
+      // large protein each is seconds. See af3TrunkStageSpans.
+      onStageStart: (name) =>
+        stage("trunk-stage", { name, pass, passes: recycles + 1 }),
       onPairformerBlock: (index, total) =>
         stage("pairformer-block", { index, total, pass, passes: recycles + 1 }),
       // 🔴 THE ONE THE STATUS LINE READS. `pairformer-block` fires at encode

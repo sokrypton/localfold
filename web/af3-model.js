@@ -26,7 +26,7 @@ import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
-import { af3Plan, RuntimeEstimator }
+import { af3Plan, af3TrunkStageSpans, RuntimeEstimator }
   from "../src/runtime/cost-model.js";
 
 const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
@@ -198,6 +198,29 @@ function foldPlan({ tokens, rows, passes, calls, atoms }) {
 }
 
 /**
+ * What each trunk stage is called on the status line.
+ *
+ * 🔴 NAMED, BECAUSE THE NUMBER ALONE CANNOT CARRY IT. The shares in
+ * af3TrunkStageSpans are measured at one shape and are only roughly right at
+ * another, so on a long fold the bar may sit near a stage's head for a while.
+ * A line that says "Trunk · MSA stack · 4%" is still visibly working; one that
+ * says "Trunk · 4%" is not, and that is the whole complaint this answers.
+ */
+// 🔴 AND THE PAIRFORMER IS NOT NAMED, DELIBERATELY. It is the one stage that
+// already reports - forty-eight times a pass - so the bar under the line is
+// visibly moving and a third field would be the "Trunk · pass 1 of 4 ·
+// pairformer block 23 of 48" that this line was cut down from. A label here is
+// for a stage that has nothing else to say.
+const TRUNK_STAGE_LABELS = {
+  embedder: "embedder",
+  template: "templates",
+  "msa-stack": "MSA stack",
+  distogram: "distogram",
+};
+
+const TRUNK_SPANS = af3TrunkStageSpans();
+
+/**
  * Fold one chain with AlphaFold 3.
  *
  * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
@@ -349,6 +372,22 @@ export async function foldAf3(options) {
     if (budget === null) { onStatus(phase); return; }
     onStatus(`${phase} · ${Math.round(100 * budget.estimator.fraction())}%`);
   };
+  /**
+   * Where `passesDone` whole trunk passes puts the bar, in plan units.
+   *
+   * `passesDone` is fractional: 1.157 is one pass finished and this one into
+   * its pairformer. Each recycle is another whole trunk, so the band is
+   * divided between them rather than replayed.
+   */
+  const trunkUnits = (passesDone, passes) => {
+    const active = plan();
+    return active.featuresEnd
+      + (active.trunkEnd - active.featuresEnd) * (passesDone / passes);
+  };
+  /** "Trunk 2/4 · MSA stack", or "Trunk · MSA stack" for a single pass. */
+  const trunkPhase = (detail, label) =>
+    (detail.passes > 1 ? `Trunk ${detail.pass + 1}/${detail.passes}` : "Trunk")
+      + (label === undefined ? "" : ` · ${label}`);
   /** Move the bar to a point in the plan, in units. */
   const reached = (units) => {
     const active = plan();
@@ -469,13 +508,40 @@ export async function foldAf3(options) {
         // says nothing. `pairformer-block-done` below is what it paints.
         await yieldToBrowser();
       }
+      // 🔴 THE FOUR SILENT STAGES, WHICH ARE MOST OF A LARGE PROTEIN'S WAIT.
+      // The trunk is five stages and only the pairformer reported anything, so
+      // the embedder, the template embedder and the MSA stack passed with the
+      // line reading "Trunk · 0%" - seconds each at 1500 residues, which reads
+      // as a page that has died. This fires as each STARTS, so the line can
+      // name it while it runs; the bar goes to the head of its span.
+      if (name === "trunk-stage") {
+        const span = TRUNK_SPANS.get(detail.name);
+        if (span !== undefined) {
+          reached(trunkUnits(detail.pass + span.from, detail.passes));
+          say(trunkPhase(detail, TRUNK_STAGE_LABELS[detail.name]));
+          await yieldToBrowser();
+        }
+      }
+      // 🔴 "Trunk · preparing", NOT "Preparing", BECAUSE THE LINE MUST NOT GO
+      // BACKWARDS. `target-feat` has already said "Trunk" by the time this
+      // fires, and featurisation's own band said "Preparing · 0%" before that -
+      // so reusing the word here would read as the fold returning to a stage it
+      // had left. This is the host work between them: an n^2 pair mask and,
+      // when no trunk is cached, a tokens^2 x 128 recycle buffer, which at 1500
+      // residues is 1.15 GB to allocate and zero.
+      if (name === "trunk-prep") {
+        say("Trunk · preparing");
+        await yieldToBrowser();
+      }
       if (name === "pairformer-block-done") {
-        // Each recycle is another whole trunk, so the trunk band is divided
-        // between them rather than replayed.
-        const done = (detail.pass + detail.completed / detail.total) / detail.passes;
-        reached(plan().featuresEnd
-          + (plan().trunkEnd - plan().featuresEnd) * done);
-        say(detail.passes > 1 ? `Trunk ${detail.pass + 1}/${detail.passes}` : "Trunk");
+        // 🔴 THE BLOCKS ARE THE PAIRFORMER'S SPAN, NOT THE WHOLE PASS. This
+        // read `completed / total` as the fraction of the trunk, so block 1 of
+        // 48 put the bar at 2% of a pass that was already a sixth done - and
+        // the four stages before it had no way to move it at all.
+        const span = TRUNK_SPANS.get("pairformer");
+        const within = span.from + (span.to - span.from) * (detail.completed / detail.total);
+        reached(trunkUnits(detail.pass + within, detail.passes));
+        say(trunkPhase(detail));
       }
       if (name === "trunk-done") {
         reached(plan().trunkEnd);
