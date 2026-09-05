@@ -1117,7 +1117,7 @@ export class Af3DiffusionTransformerGpu {
       width, pairs, shape, sources, compiled, tile, splits, outTile, outChunk,
       weightPrecision,
     } = await this.#compile(tokens, weights);
-    if (act.length !== tokens * channels) {
+    if (!(act instanceof GPUBuffer) && act.length !== tokens * channels) {
       throw new Error(`act has ${act.length} elements; expected ${tokens * channels}`);
     }
 
@@ -1132,16 +1132,23 @@ export class Af3DiffusionTransformerGpu {
         + `:${width}:${weights.transitionFactor}:${heads}`;
       const scratch = (label, bytes, usage = storage) =>
         this.#scratchBuffer(shapeKey, label, bytes, usage);
-      const actBuffer = scratch("difftx.act", tokens * channels * 4,
-        storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
-      const condBuffer = scratch("difftx.cond", tokens * condChannels * 4,
-        storage | GPUBufferUsage.COPY_DST);
-      const maskBuffer = scratch("difftx.mask", tokens * 4,
-        storage | GPUBufferUsage.COPY_DST);
+      // 🔴 EITHER A HOST ARRAY OR A DEVICE BUFFER, FOR THE TWO THAT MOVE. The
+      // stack's input and its conditioning are produced on the GPU one stage
+      // earlier by the diffusion head, which keeps them there rather than
+      // draining the pipeline twice a step to copy them out and back.
       const write = (allocation, data) => this.device.queue.writeBuffer(
         allocation.buffer, 0, data.buffer, data.byteOffset, data.byteLength);
-      write(actBuffer, act instanceof Float32Array ? act : Float32Array.from(act));
-      write(condBuffer, cond);
+      const given = (value, label, bytes) => {
+        if (value instanceof GPUBuffer) return { buffer: value };
+        const allocation = scratch(label, bytes,
+          storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST);
+        write(allocation, value instanceof Float32Array ? value : Float32Array.from(value));
+        return allocation;
+      };
+      const actBuffer = given(act, "difftx.act", tokens * channels * 4);
+      const condBuffer = given(cond, "difftx.cond", tokens * condChannels * 4);
+      const maskBuffer = scratch("difftx.mask", tokens * 4,
+        storage | GPUBufferUsage.COPY_DST);
       write(maskBuffer, mask);
       // See #pairNorm: everything on this line and the two below it is the
       // trunk's, not the step's, and is skipped outright when the caller keeps

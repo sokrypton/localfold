@@ -1094,9 +1094,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 export class Af3AtomEncoderGpu {
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device);
+    // 🔴 POOLED WHEN THE CALLER TAKES THE RESULT WITHOUT WAITING. See the
+    // note on Af3DiffusionConditioningGpu's constructor: release() DESTROYS
+    // where the allocator does not pool, and a device-chained caller returns
+    // while the work is still in flight.
+    this.allocator = new GpuBufferAllocator(device, options.pool ?? false);
     this.pipelines = pipelineCacheForDevice(device);
   }
 
@@ -1341,30 +1345,42 @@ export class Af3AtomEncoderGpu {
       // 🔴 READ BEFORE THE READBACKS ARE SIZED, NOT AFTER THE PASSES ARE
       // ENCODED: it decides which of them exist at all.
       const reuseStatic = options.reuseStatic;
+      // 🔴 AND `outputs` DECIDES WHETHER THE OTHER TWO EXIST. `tokenAct` and
+      // the skip connection are the encoder's only per-step results, and both
+      // are read by the next stage on the DEVICE - the transformer's input and
+      // the decoder's. A sampler was draining the pipeline once a step to copy
+      // them to the host and write them straight back.
+      const outputs = options.outputs;
+      // The five static readbacks exist only when a host caller has no other
+      // way to see them: not when the head still holds them, and not when it
+      // is taking the device buffers directly.
+      const wantHostStatics = reuseStatic === undefined && outputs === undefined;
       const readbacks = {
-        tokenAct: keep(this.allocator.allocate("atom.rb-token", tokens * perTokenChannels * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        skipConnection: keep(this.allocator.allocate("atom.rb-skip", queryRows * channels * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        tokenAct: outputs !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-token", tokens * perTokenChannels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        skipConnection: outputs !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-skip", queryRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         // 🔴 ALLOCATED ONLY WHEN THEY ARE COPIED INTO. The five below are the
         // static ones; with `reuseStatic` nothing writes them, and
         // `atom.rb-pair` alone is 12.8 MiB standing in a sampler's peak for
         // the length of a call that never touches it.
-        pairCond: reuseStatic !== undefined ? undefined
+        pairCond: !wantHostStatics ? undefined
           : keep(this.allocator.allocate("atom.rb-pair", pairRows * pairChannels * 4,
               GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         // The decoder reads all four of these, so the head can chain the two
         // without a second encoder run.
-        queriesCond: reuseStatic !== undefined ? undefined
+        queriesCond: !wantHostStatics ? undefined
           : keep(this.allocator.allocate("atom.rb-qcond", queryRows * channels * 4,
               GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        keysCond: reuseStatic !== undefined ? undefined
+        keysCond: !wantHostStatics ? undefined
           : keep(this.allocator.allocate("atom.rb-kcond", keyRows * channels * 4,
               GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        queriesMask: reuseStatic !== undefined ? undefined
+        queriesMask: !wantHostStatics ? undefined
           : keep(this.allocator.allocate("atom.rb-qmask", queryRows * 4,
               GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        keysMask: reuseStatic !== undefined ? undefined
+        keysMask: !wantHostStatics ? undefined
           : keep(this.allocator.allocate("atom.rb-kmask", keyRows * 4,
               GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
       };
@@ -1374,7 +1390,9 @@ export class Af3AtomEncoderGpu {
                                      () => blockPacked[index].data),
       }));
 
-      this.device.pushErrorScope("validation");
+      const deferred = outputs === undefined ? undefined : options.validation;
+      if (deferred === undefined) this.device.pushErrorScope("validation");
+      else deferred.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
       const run = (label, pipeline, buffers, x, y = 1) => {
         const pass = encoder.beginComputePass({ label });
@@ -1440,19 +1458,24 @@ export class Af3AtomEncoderGpu {
           [act, queriesMask, gatherBuffer, atomMask, pairWeights, tokenAct],
           aggregateGroups[0], aggregateGroups[1]);
 
-      encoder.copyBufferToBuffer(tokenAct.buffer, 0, readbacks.tokenAct.buffer, 0,
-                                 tokens * perTokenChannels * 4);
-      encoder.copyBufferToBuffer(act.buffer, 0, readbacks.skipConnection.buffer, 0,
-                                 queryRows * channels * 4);
+      encoder.copyBufferToBuffer(
+        tokenAct.buffer, 0,
+        outputs === undefined ? readbacks.tokenAct.buffer : outputs.tokenAct, 0,
+        tokens * perTokenChannels * 4);
+      encoder.copyBufferToBuffer(
+        act.buffer, 0,
+        outputs === undefined ? readbacks.skipConnection.buffer : outputs.skipConnection, 0,
+        queryRows * channels * 4);
       // 🔴 FIVE OF THE SEVEN READBACKS ARE THE SAME EVERY CALL. pairCond,
       // queriesCond, keysCond and the two masks are built from the reference
       // conformers, the gathers and the trunk - not from the noisy positions
       // and not from the noise level - so a 200-step sampler copied ~14 MB back
       // from the device two hundred times to get identical arrays, and handed
       // them straight back to the decoder. `reuseStatic` is the head saying it
-      // still has them. The GPU still COMPUTES them, because the attention
+      // still has them, and `outputs` is the head saying it would rather have
+      // the DEVICE buffers. The GPU still COMPUTES them, because the attention
       // blocks below read the buffers; only the copy back is skipped.
-      if (reuseStatic === undefined) {
+      if (wantHostStatics) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
                                    pairRows * pairChannels * 4);
         encoder.copyBufferToBuffer(queriesCond.buffer, 0, readbacks.queriesCond.buffer, 0,
@@ -1466,6 +1489,22 @@ export class Af3AtomEncoderGpu {
 
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
+      if (deferred !== undefined) {
+        deferred.end("atom encoder");
+        return {
+          tokenAct: undefined, skipConnection: undefined,
+          pairCond: reuseStatic?.pairCond, queriesCond: reuseStatic?.queriesCond,
+          keysCond: reuseStatic?.keysCond, queriesMask: reuseStatic?.queriesMask,
+          keysMask: reuseStatic?.keysMask,
+          deviceStatics: {
+            pairCond: pair.buffer, queriesCond: queriesCond.buffer,
+            keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
+            keysMask: keysMask.buffer,
+          },
+          elapsedMilliseconds: performance.now() - start,
+          memory: this.allocator.snapshot(),
+        };
+      }
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
       const read = async (a) => {

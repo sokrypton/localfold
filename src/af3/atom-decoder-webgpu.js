@@ -301,9 +301,20 @@ export class Af3AtomDecoderGpu {
         return gathers;
       });
 
-      // The two that move with the noise level.
-      const tokenActBuffer = up("dec.token-act", tokenAct);
-      const skip = up("dec.skip", encoded.skipConnection);
+      // 🔴 THE TWO THAT MOVE WITH THE NOISE LEVEL, AND THE ONLY TWO A DEVICE
+      // CHAIN HAS TO HAND OVER. `options.deviceInputs` is the head saying it
+      // kept them there: the transformer's normalised output and the encoder's
+      // skip connection are both produced on the GPU one stage earlier, and a
+      // sampler was draining the pipeline to copy them to the host and write
+      // them straight back.
+      // ...each independently: the head chains the skip connection before it
+      // chains the token activations, so one may be a buffer while the other
+      // is still an array.
+      const moving = options.deviceInputs ?? {};
+      const tokenActBuffer = moving.tokenAct === undefined
+        ? up("dec.token-act", tokenAct) : { buffer: moving.tokenAct };
+      const skip = moving.skipConnection === undefined
+        ? up("dec.skip", encoded.skipConnection) : { buffer: moving.skipConnection };
       // 🔴 THE ENCODER'S OWN BUFFERS WHEN IT KEPT THEM, A COPY WHEN IT DID
       // NOT. These five are the molecule seen through the atom encoder, and
       // where the head holds both modules' static caches they are the SAME

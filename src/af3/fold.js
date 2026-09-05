@@ -596,6 +596,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // memory that is the packing and not the transfer; see the measurement in
   // the commit that added this.
   releaseResidentWeights(device, "difftx.");
+  // ...and the diffusion conditioning's, which are resident for the same
+  // reason and dead at the same moment.
+  releaseResidentWeights(device, "cond.");
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;

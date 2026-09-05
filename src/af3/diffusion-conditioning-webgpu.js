@@ -37,6 +37,7 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
 import { createTransitionShader, packTransitionWeights, transitionRowTile }
   from "./transition-webgpu.js";
 
@@ -344,9 +345,19 @@ export function noiseEmbedding(scaledNoiseLevel, weight, bias) {
 }
 
 export class Af3DiffusionConditioningGpu {
-  constructor(device) {
+  /**
+   * @param {GPUDevice} device
+   * @param {{pool?: boolean}} [options] pool the allocator. 🔴 A CALLER THAT
+   *   TAKES THE RESULT WITHOUT WAITING FOR THE GPU MUST POOL. `release()`
+   *   DESTROYS a buffer when the allocator does not pool, and returning before
+   *   the submitted work has finished would destroy tensors that work is still
+   *   reading - which WebGPU reports as "used in submit while destroyed" at
+   *   some later, unrelated submit. Pooling hands them back instead, and the
+   *   next call to reuse one is a step later, behind queue ordering.
+   */
+  constructor(device, options = {}) {
     this.device = device;
-    this.allocator = new GpuBufferAllocator(device);
+    this.allocator = new GpuBufferAllocator(device, options.pool ?? false);
     this.pipelines = pipelineCacheForDevice(device);
   }
 
@@ -424,36 +435,60 @@ export class Af3DiffusionConditioningGpu {
       const trunkSingle = up("cond.trunk-single", input.trunkSingle);
       const targetFeat = up("cond.target", input.targetFeat);
       const features = onlyIfNew(() => up("cond.features", featureData));
-      const pairScale = onlyIfNew(() => up("cond.pair-scale", weights.pairCondInitialNormScale));
-      const pairProjection = onlyIfNew(
-        () => up("cond.pair-projection", weights.pairCondInitialProjection));
-      const sums = onlyIfNew(() => up("cond.column-sums", columnSums));
-      const singleScale = up("cond.single-scale", weights.singleCondInitialNormScale);
-      const singleProjection = up("cond.single-projection", weights.singleCondInitialProjection);
+      // 🔴 THE WEIGHT-DERIVED ONES ARE RESIDENT, NOT UPLOADED PER STEP. Six of
+      // these eight are functions of the weight bundle - a sampler was writing
+      // them across the bus two hundred times, and the two transition bundles
+      // alone are 6.8 MiB. `cond.noise` is the exception that makes the module:
+      // it IS the noise level.
+      const resident = (label, build) =>
+        ({ buffer: residentWeightBuffer(this.device, weights, label, build) });
+      const pairScale = onlyIfNew(() => resident("cond.pair-scale",
+        () => weights.pairCondInitialNormScale));
+      const pairProjection = onlyIfNew(() => resident("cond.pair-projection",
+        () => weights.pairCondInitialProjection));
+      const sums = onlyIfNew(() => resident("cond.column-sums", () => columnSums));
+      const singleScale = resident("cond.single-scale",
+        () => weights.singleCondInitialNormScale);
+      const singleProjection = resident("cond.single-projection",
+        () => weights.singleCondInitialProjection);
       const noise = up("cond.noise", embedded);
-      const noiseWeights = up("cond.noise-weights", noisePacked.data);
+      const noiseWeights = resident("cond.noise-weights", () => noisePacked.data);
 
       const pair = onlyIfNew(() => keep(this.allocator.allocate("cond.pair",
         pairs * pairChannels * 4, storage | GPUBufferUsage.COPY_SRC)));
-      const single = keep(this.allocator.allocate("cond.single", tokens * seqChannels * 4,
-        storage | GPUBufferUsage.COPY_SRC));
+      // 🔴 THE CALLER'S BUFFER WHEN IT OFFERS ONE, AND NO READBACK THEN. The
+      // single track is the only thing here that moves with the noise level,
+      // and the diffusion head's next two stages both read it - so a sampler
+      // was draining the pipeline to copy tokens x 384 floats to the host and
+      // writing them straight back. `options.outputs.single` lets the head keep
+      // it on the device; see the note on the head's #chain.
+      const outSingle = options.outputs?.single;
+      const single = outSingle === undefined
+        ? keep(this.allocator.allocate("cond.single", tokens * seqChannels * 4,
+            storage | GPUBufferUsage.COPY_SRC))
+        : { buffer: outSingle };
       const pairScratch = onlyIfNew(() => keep(this.allocator.allocate("cond.pair-scratch",
         pairs * pairChannels * 4, storage)));
       const singleScratch = keep(this.allocator.allocate("cond.single-scratch",
         tokens * seqChannels * 4, storage));
       const readPair = onlyIfNew(() => keep(this.allocator.allocate("cond.rb-pair",
         pairs * pairChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
-      const readSingle = keep(this.allocator.allocate("cond.rb-single", tokens * seqChannels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const readSingle = outSingle !== undefined ? undefined
+        : keep(this.allocator.allocate("cond.rb-single", tokens * seqChannels * 4,
+            GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const transitionWeights = {
         pair: prepared.pairTransitions.map((packed, index) =>
-          onlyIfNew(() => up(`cond.pair-transition-w${index}`, packed.data))),
+          onlyIfNew(() => resident(`cond.pair-transition-w${index}`, () => packed.data))),
         single: prepared.singleTransitions.map((packed, index) =>
-          up(`cond.single-transition-w${index}`, packed.data)),
+          resident(`cond.single-transition-w${index}`, () => packed.data)),
       };
 
-      this.device.pushErrorScope("validation");
+      // The head's, when it has one; otherwise this call's own scope, awaited
+      // below the way it always was.
+      const deferred = outSingle === undefined ? undefined : options.validation;
+      if (deferred === undefined) this.device.pushErrorScope("validation");
+      else deferred.begin();
       const encoder = this.device.createCommandEncoder({ label: "af3-diffusion-conditioning" });
       const run = (label, pipeline, buffers, x, y = 1) => {
         const pass = encoder.beginComputePass({ label });
@@ -509,10 +544,27 @@ export class Af3DiffusionConditioningGpu {
       if (reusePair === undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readPair.buffer, 0, pairs * pairChannels * 4);
       }
-      encoder.copyBufferToBuffer(single.buffer, 0, readSingle.buffer, 0, tokens * seqChannels * 4);
+      if (outSingle === undefined) {
+        encoder.copyBufferToBuffer(single.buffer, 0, readSingle.buffer, 0,
+                                   tokens * seqChannels * 4);
+      }
 
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
+      // 🔴 NOT AWAITED WHEN NOTHING IS READ BACK. popErrorScope resolves when
+      // the submitted work has FINISHED, so awaiting it is a full pipeline
+      // drain - the same one the readback would cost, and pointless when the
+      // caller is about to encode three more stages on top of this one. The
+      // head hands in its own DeferredValidation and settles it once, at the
+      // boundary that already synchronises.
+      if (deferred !== undefined) {
+        deferred.end("diffusion conditioning");
+        return {
+          pair: reusePair, single: undefined, singleBuffer: outSingle,
+          elapsedMilliseconds: performance.now() - start,
+          memory: this.allocator.snapshot(),
+        };
+      }
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
       const read = async (allocation) => {
