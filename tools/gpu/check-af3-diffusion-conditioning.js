@@ -172,7 +172,7 @@ export async function main(device, args) {
   // reference; they do not say the padding reached either. The single
   // conditioning is the only output the flag can move - the pair path does not
   // read target_feat - so that is where it is measured.
-  const separation = relativeRms(singles.openbind, singles.alphafold3);
+  const separation = relativeRms(singles.openbind0, singles.alphafold3);
   console.log(`openbind0 vs alphafold3\tsingle\trelRMS ${separation.toExponential(2)}`);
 
   const bound = 1e-5;

@@ -222,7 +222,7 @@ export async function main(device, args) {
   // stock AF3 wearing OpenBind's name.
   const separation = {};
   for (const name of ["tokenAct", "skipConnection", "pairCond"]) {
-    separation[name] = relativeRms(references.openbind[name], references.alphafold3[name]);
+    separation[name] = relativeRms(references.openbind0[name], references.alphafold3[name]);
     console.log(`openbind0 vs alphafold3\t${name}`
       + `\trelRMS ${separation[name].toExponential(2)}`);
   }

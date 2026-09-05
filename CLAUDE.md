@@ -1122,12 +1122,31 @@ checker can see: `af3-6mrr.json` has 6528 of 6528 keys live, while
 window - which is why `check-af3-atom-encoder.js` measures a 7.77e-2 separation
 and a whole fold measures none.
 
-🔴 **SO THE PADDING IS AVOIDABLE, NOT NECESSARY.** AF3 pads because JAX wants
-static shapes; nothing here does. Sizing the key window to `min(128, atomCount)`
-would leave no padded key at any size and make this branch permanently
-unreachable - and the table above says it should be a no-op, since what a padded
-key contains provably does not reach the encoder's output. Not done: it changes
-the featuriser for stock AF3 as well, so it wants its own before-and-after fold.
+🔴 **AND THE PADDING IS GONE, BECAUSE NOTHING HERE NEEDED IT.** AF3 pads because
+JAX wants static shapes; these kernels are generated per shape and size their
+workgroup storage from `keys`, so the window is `min(128, atomCount)` now and
+**no batch this featuriser produces has a padded key at any size**. The
+`ref_space_uid = 0` collision that OpenFold3 trained around cannot occur here.
+
+Measured before and after, `tools/gpu/fold.js --sequence=`:
+
+| | 68 residues, 574 atoms | 12 residues, 106 atoms |
+|---|---|---|
+| diffusion 50 | **bit-identical** (`1f3a312051898379`) | 84.3979 -> 84.4696 pLDDT |
+| flow 16 | **bit-identical** (`8cd298eb6bd61f82`) | 84.7656 -> 84.8080 |
+
+Exactly the scope the table above predicts: at or above 128 atoms the window was
+already inside the molecule and nothing moves, and below it the padded keys stop
+contributing. Geometry is unchanged either way (N-CA 1.458, CA-CA 3.807 on the
+12-mer).
+
+🔴 **AND `maskPaddedKeys` IS NOT DEAD, WHICH IS WHY IT STAYS.** The differential
+checkers do not use this featuriser - they feed AF3's OWN gathers out of an
+oracle dump, and `af3-oracle-atom-f32.json` is a 97-atom molecule with 279
+padded keys of 1152. So `check-af3-atom-encoder.js` still separates the two
+dialects by 7.77e-2 on `pairCond`, and the flag still decides what a bundle
+converted for OpenBind computes on somebody else's batch. What changed is that
+the SHIPPING path can no longer reach the case.
 
 🔴 **A SECOND MODEL IS MISTAKEN FOR THE FIRST IN A CACHE, NOT IN A LOADER.**
 Two bundles now build AF3's graph, and every memo keyed on something that does

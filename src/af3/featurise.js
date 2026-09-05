@@ -455,27 +455,40 @@ export function featuriseProtein(sequence, options = {}) {
     queriesToTokenAtoms.mask[realAtoms[query]] = 1;
   }
 
-  // queries_to_keys: a contiguous 128-wide window per subset of 32 queries,
-  // centred on it and SHIFTED IN-BOUNDS at the ends rather than truncated -
-  // every subset sees exactly 128 keys.
+  // queries_to_keys: a contiguous window per subset of 32 queries, centred on
+  // it and SHIFTED IN-BOUNDS at the ends rather than truncated - every subset
+  // sees exactly `keys` of them.
   //
   // 🔴 THE WINDOW IS CLAMPED AGAINST THE REAL ATOM COUNT, NOT subsets * 32.
   // The query layout is padded out to the dense grid (51 subsets for 574
   // atoms here), so clamping against the padded length would slide the last
   // windows off the end of the molecule and into masked slots.
-  const queriesToKeys = gather(subsets * KEYS);
+  //
+  // 🔴 AND THE WINDOW NEVER EXCEEDS THE MOLECULE, so there is no such thing as
+  // a padded KEY. AlphaFold 3 pads because JAX wants static shapes; nothing
+  // here does - the kernels are generated per shape and size their workgroup
+  // storage from `keys`. Above 128 atoms the clamp already guaranteed this and
+  // measured it: `tools/gpu/probe-ablate.js` reports zero padded keys at 143
+  // atoms and above. BELOW 128 the window could not fit, and 288 of a
+  // 4-residue chain's 384 key slots were padding, each gathering reference
+  // space ZERO - which collides with the first conformer's own uid and makes
+  // every one of them a valid neighbour of residue 0. That is the released
+  // AF3 bug OpenFold3 trained around, and it cannot occur here at any size
+  // now, so `maskPaddedKeys` has nothing left to switch off.
+  const keys = Math.min(KEYS, atomCount);
+  const queriesToKeys = gather(subsets * keys);
   const tokensToQueries = gather(subsets * QUERIES);
-  const tokensToKeys = gather(subsets * KEYS);
+  const tokensToKeys = gather(subsets * keys);
   const tokenOfQuery = new Int32Array(atomCount);
   for (let query = 0; query < atomCount; query += 1) {
     tokenOfQuery[query] = (realAtoms[query] / DENSE) | 0;
   }
-  const lastStart = Math.max(0, atomCount - KEYS);
+  const lastStart = Math.max(0, atomCount - keys);
   for (let subset = 0; subset < subsets; subset += 1) {
-    const start = Math.min(Math.max(subset * QUERIES - (KEYS - QUERIES) / 2, 0), lastStart);
-    for (let key = 0; key < KEYS; key += 1) {
+    const start = Math.min(Math.max(subset * QUERIES - (keys - QUERIES) / 2, 0), lastStart);
+    for (let key = 0; key < keys; key += 1) {
       const query = start + key;
-      const at = subset * KEYS + key;
+      const at = subset * keys + key;
       if (query >= atomCount) continue;
       queriesToKeys.indices[at] = query;
       queriesToKeys.mask[at] = 1;
@@ -617,7 +630,7 @@ export function featuriseProtein(sequence, options = {}) {
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
-    shape: { tokens, dense: DENSE, subsets, queries: QUERIES, keys: KEYS },
+    shape: { tokens, dense: DENSE, subsets, queries: QUERIES, keys },
     aatype, profile, deletionMean,
     msa, msaMask, deletionMatrix,
     residueIndex, tokenIndex, asymId, entityId, symId, seqMask,
