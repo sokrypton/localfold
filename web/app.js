@@ -903,10 +903,29 @@ function openBlankFold(stem, keep = []) {
     } else {
       renderer.currentObjectName = stem;
     }
-    // ...and the two panels that describe a fold must stop describing the old
+    // ...and the THREE panels that describe a fold must stop describing the old
     // one. The heatmap is told about an object with no frames, which is what
     // makes it hide rather than keep the last matrix up.
+    //
+    // 🔴 THE MSA WAS THE ONE THAT WAS MISSED, and it is the most visible of
+    // them: the panel is populated by py2Dmol's own file ingestion at the END
+    // of a fold, so between pressing Fold and the structure landing the
+    // previous job's alignment sat there for the whole search and the whole
+    // trunk - which on a complex is a minute of a picture of something else.
+    //
+    // 🔴 BY HAND, BECAUSE THE VENDOR'S TWO WAYS OUT ARE BOTH WRONG HERE.
+    // `updateMSAContainerVisibility` reads `#msa-viewer-container`, which is
+    // py2Dmol's own site markup and is not in this page - so calling it is a
+    // no-op that looks like a fix. `clearAllObjects` does hide the right box,
+    // and hides the VIEWER and the sequence strip with it, which is exactly
+    // the blank page between folds the note above this refuses. What is left
+    // is the box and the viewer's own MSA state. The vendor sets this back to
+    // `block` wherever it loads MSA data, so the next fold with an alignment
+    // fills it again through loadIntoViewer, as the first one did.
     updateScoresCard(undefined);
+    const msaPanel = document.getElementById("msa-buttons");
+    if (msaPanel !== null) msaPanel.style.display = "none";
+    try { window.MSA?.clear?.(); } catch { /* the viewer's own state; best effort */ }
     window.Heatmap?.updateFrame(renderer, renderer.objectsData?.[stem], 0);
     renderer.render("blank-fold");
   } catch (cause) {
