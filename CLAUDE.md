@@ -511,6 +511,48 @@ superset and is nearly one - but `index.html` loads `full` while `single.html`
 and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
 the three pages on a stale viewer.
 
+🔴 **ACTIVATIONS CAN BE STORED TWO HALVES TO A WORD, AND `pack2x16float` IS
+CORE WGSL.** Unlike the `f16` TYPE, it needs no device feature, so a tensor
+halves on hardware that cannot compute in half precision at all.
+`src/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
+fourth argument is how a caller asks. A 59-residue fold at 512 MSA rows went
+**603.0 -> 396.4 MiB** across four tensors, for 0.043 pLDDT, and got 4.5%
+faster where the reader re-reads (the flash kernel's key and value); where it
+does not, time is unchanged.
+
+🔴 **AND A WORD IS OWNED BY ONE INVOCATION OR IT IS A RACE.** WGSL cannot write
+sixteen bits, so a lane holding one half would read the word, insert and write
+it back while the lane holding the other half does the same. Every kernel
+converted had to be rearranged so the pair of elements sharing a word is
+produced by one lane: the layer norm walks channel PAIRS, and both tiled GEMMs
+give a lane a run of adjacent columns where they gave it lanesX-strided ones.
+`storedPair` takes a PAIR index and not an element index so a kernel that has
+not been rearranged has nothing to pass it.
+
+🔴 **AND IT IS FREE WHERE THE CONSUMER ALREADY NARROWS.** The transition's
+hidden activation is read by a kernel whose first act is `f16(source[...])`, so
+storing it narrowed loses nothing already lost - the fold came back BIT
+IDENTICAL, coordinates and all, 16 MiB lighter. Look for that shape first.
+
+🔴 **AND BOTH FAILURES WERE SILENT, BECAUSE EVERY SHAPE STILL AGREES.** A
+packed tensor and an f32 one of the same element count differ only in bytes,
+which nothing validates. Reading `normalized` as f32 in the pair-bias shader -
+it is `normalized` itself for the triangle attentions, and a separate tensor
+only for an MSA row attention - folded 59 residues at **pLDDT 27 with 5.3 A
+between consecutive alpha carbons**. Failing to thread `outputStorage` through
+`selectAttentionProjectKernel` had the projection write f32 where the flash
+kernel read packed, and the fold came back **NaN**. The unit test written to
+catch the second passed, because it compared cache KEYS and they already
+differed on the source storage: assert on the generated WGSL.
+
+🔴 **AND `memorySnapshot`'s `byLabel` IS CUMULATIVE, WHICH IS THE WRONG
+QUESTION.** It sums every allocation a label ever made, so a scratch tensor
+taken and returned once a block reads as forty-eight times its size - that is
+what CHURNS. `peakByLabel` is what was on the device when it was fullest and
+its rows sum to `peakBytes`; that is what says which tensor to attack, and it
+is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
+`tools/gpu/fold-af2.js` prints both.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring
