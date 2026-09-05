@@ -129,7 +129,12 @@ export async function compilePairTrack(cache, options) {
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision },
       gridOffsets, epsilon, variance, dialect,
-      scratchStorage[5], scratchStorage[0],
+      // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. See encodePairTrack:
+      // `grid.project` is the last pass that reads scratch[0], and it runs
+      // before `grid.attend` writes it, so the two can share one tensor - and
+      // at 300 tokens that is 43.9 MiB of the largest tensor group a trunk
+      // holds. They are one storage now because they are one buffer.
+      scratchStorage[0], scratchStorage[0],
       // q, k, v and the gate are scratch 1, 2, 3 and 4 in that order.
       { q: scratchStorage[1], k: scratchStorage[2],
         v: scratchStorage[3], gate: scratchStorage[4] });
@@ -229,13 +234,12 @@ export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrec
  * stack, 19.5 MiB in the MSA stack at 200 tokens and 10.2 in the template,
  * held for the length of a pass and touched by nothing.
  *
- * 🔴 AND INDEX 5 IS THE ONLY ONE NO TRIANGLE OPERATION TOUCHES. The other five
- * are shared between the triangle multiplications and the grid attentions, so
- * converting any of them is a change to both at once; this one is written by
- * `grid.attend` and read by `grid.project-out` and by nothing else, which is
- * why it was the one converted first.
+ * 🔴 AND THERE ARE FIVE NOW, NOT SIX. The sixth was the grid attention's
+ * output, and `grid.project` - the last pass that reads scratch[0] - runs
+ * before the pass that writes it, so the two share one tensor. That is a sixth
+ * of the largest tensor group an AF3 trunk holds: 43.9 MiB at 300 tokens.
  */
-export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16", "f16"];
+export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16"];
 
 /**
  * What every stack actually uses: one word an element.
@@ -245,7 +249,7 @@ export const PAIR_SCRATCH_STORAGE = ["f16", "f16", "f16", "f32", "f16", "f16"];
  * nothing throws on. The allocation reads this and so does every shader that
  * touches the buffer.
  */
-export const UNPACKED_PAIR_SCRATCH = ["f32", "f32", "f32", "f32", "f32", "f32"];
+export const UNPACKED_PAIR_SCRATCH = ["f32", "f32", "f32", "f32", "f32"];
 
 /** How many pair-sized scratch tensors a pair-track stack needs. */
 export const PAIR_SCRATCH_COUNT = PAIR_SCRATCH_STORAGE.length;
@@ -254,7 +258,7 @@ export const PAIR_SCRATCH_COUNT = PAIR_SCRATCH_STORAGE.length;
  * Record the five pair updates into an open command encoder.
  *
  * @param {object} context `run(label, pipeline, buffers, x, y, z)` records one
- *   pass; `scratch` is six pair-sized buffers, reused by every operation.
+ *   pass; `scratch` is five pair-sized buffers, reused by every operation.
  */
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;
@@ -297,10 +301,12 @@ export function encodePairTrack(context) {
     //
     // One thread per (query, row, head), which is ceil(N/64) x N x heads
     // workgroups - see the note on the attend kernel.
+    // ...into scratch[0], which `grid.project` above was the last pass to
+    // read. See the note where the shaders are compiled.
     run("grid.attend", p("attend"),
-        [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[5]],
+        [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[0]],
         ceil(n, 64), n, gridHeads);
-    run("grid.project-out", p("project_out"), [scratch[5], scratch[4], w, pair],
+    run("grid.project-out", p("project_out"), [scratch[0], scratch[4], w, pair],
         perOutTile[0], perOutTile[1]);
   }
 

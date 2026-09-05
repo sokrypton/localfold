@@ -117,7 +117,7 @@ export class Af3MsaStackGpu {
       const pairMask = keep(this.allocator.upload("af3-msa.pair-mask", state.pairMask, storage));
       const msaMask = keep(this.allocator.upload("af3-msa.msa-mask", state.msaMask, storage));
 
-      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
+      // 🔴 FIVE PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
       // See UNPACKED_PAIR_SCRATCH for the four checkers that say so. The
       // allocation and the shaders read the SAME array, because a buffer that
       // disagrees with a shader about its element is not something WebGPU can

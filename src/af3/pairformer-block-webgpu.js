@@ -291,7 +291,7 @@ export class Af3PairformerStackGpu {
       const pairMask = keep(this.allocator.upload("af3-block.pair-mask", state.pairMask, storage));
       const seqMask = keep(this.allocator.upload("af3-block.seq-mask", state.seqMask, storage));
 
-      // Six pair-sized scratch buffers, shared by every operation. Their
+      // Five pair-sized scratch buffers, shared by every operation. Their
       // storage is UNPACKED_PAIR_SCRATCH's to say, and the shaders read the
       // same array - a buffer half the bytes of what a shader expects is not
       // something WebGPU can catch. See that constant for what packing them

@@ -416,7 +416,7 @@ export class Af3TemplateEmbedderGpu {
       // The running sum over slots, which the projection reads once at the end.
       const summed = keep(this.allocator.allocate(
         "af3-template.summed", pairs * CHANNELS * 4, storage | GPUBufferUsage.COPY_DST));
-      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
+      // 🔴 FIVE PAIR-SIZED SCRATCH BUFFERS, AND THIS STACK KEEPS THEM WHOLE.
       // See UNPACKED_PAIR_SCRATCH: packing them costs this embedder 150x its
       // agreement with AF3 and saves 26 MiB on a stage that is not the trunk's
       // peak. The allocation and the shaders read the same array, because a
