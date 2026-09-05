@@ -378,6 +378,12 @@ export function createAttentionProjectShader(
   const store = [];
   for (let r = 0; r < rowsPerLane; r += 1) {
     const body = [];
+    // 🔴 THE VALUE REJOINS ITS SIBLINGS WHENEVER IT CAN, so the shader the page
+    // compiles is the one it compiled before this option existed - byte for
+    // byte, which is what was checked. Splitting it unconditionally cost four
+    // extra bounds tests a row for a configuration nothing selects, in a kernel
+    // that is a fifth of an evoformer block.
+    const together = packValue === packOut;
     if (packOut) {
       for (let v = 0; v < columnsPerLane; v += 2) {
         // One word per output, holding this lane's two adjacent columns.
@@ -385,7 +391,8 @@ export function createAttentionProjectShader(
         body.push(`    if (hd_${v + 1} < projected) {
       let word = ${word};
       query[word] = pack2x16float(vec2<f32>(${q(r, v)}, ${q(r, v + 1)}));
-      key[word] = pack2x16float(vec2<f32>(${k(r, v)}, ${k(r, v + 1)}));
+      key[word] = pack2x16float(vec2<f32>(${k(r, v)}, ${k(r, v + 1)}));${together ? `
+      value[word] = pack2x16float(vec2<f32>(${val(r, v)}, ${val(r, v + 1)}));` : ""}
       gate[word] = pack2x16float(vec2<f32>(${g(r, v)}, ${g(r, v + 1)}));
     }`);
       }
@@ -394,12 +401,15 @@ export function createAttentionProjectShader(
         body.push(`    if (hd_${v} < projected) {
       let index = row_${r} * projected + hd_${v};
       query[index] = ${q(r, v)};
-      key[index] = ${k(r, v)};
+      key[index] = ${k(r, v)};${together ? `
+      value[index] = ${val(r, v)};` : ""}
       gate[index] = ${g(r, v)};
     }`);
       }
     }
-    if (packValue) {
+    if (together) {
+      // ...written above, in the same store as its siblings.
+    } else if (packValue) {
       for (let v = 0; v < columnsPerLane; v += 2) {
         body.push(`    if (hd_${v + 1} < projected) {
       value[row_${r} * (projected / 2u) + (hd_${v} / 2u)] =`
