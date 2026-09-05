@@ -362,6 +362,36 @@ GFLOP/s rather than 900-1100 - past the scalar ceiling, because their
 arithmetic is no longer scalar-equivalent - and `opm.contract` at 684 is the
 one left behind. See tools/gpu/profile-af2-block.js.
 
+🔴 **`grid.attend` IS THE BIGGEST KERNEL IN AN AF3 TRUNK AND IT IS ALREADY
+NEAR THIS DEVICE.** It is the only pass that grows as tokens CUBED, so its
+share grows with the protein: 18.3% of the trunk's GPU time at 200 tokens and
+**34.6% at 700**, where it is 203.8 ms a pass. `tools/gpu/bench-grid-attend.js`
+alternates arms in one process. Three plausible wins were tried and all three
+are dead:
+
+| what | at 400 tokens | verdict |
+|---|---|---|
+| skip the softmax rescale when the maximum does not move | 131.1 vs 125.5 ms | **0.957x, a loss** |
+| stage the keys and values in f16 rather than f32 | 127.1 vs 135.0 | 1.06x, so not BYTES |
+| the staged key chunk, 16 / 32 / 64 | 125.7 / 125.3 / 124.4 | nothing, so not BARRIERS |
+
+🔴 **AND THE ARITHMETIC SAYS WHY.** Per lane-key the kernel does about 160
+scalar operations (eight vec4 dot products, sixteen vec4 accumulator updates)
+and **64 scalar workgroup reads** (eight vec4 each of the key and the value).
+At 400 tokens that is 2.56e8 lane-keys, which against this device's measured
+ceilings - 610 G scalar FMA/s, ~400 G workgroup reads/s - is about 67 ms of
+arithmetic and 41 ms of workgroup traffic against 125 measured. It is balanced,
+and both halves are near their limit. That is why halving the tile's BYTES buys
+5% and halving the barriers buys nothing: neither reduces the number of
+operations.
+
+🔴 **SO THE ONLY THINGS LEFT ARE THE TWO EXPENSIVE ONES.** Register-block over
+QUERIES, so one key read serves two or four accumulators and the read term
+halves - which is the same trade `grid.project` records, where too large a
+block spilled and cost 4x. Or f16 ARITHMETIC in the accumulator update, whose
+ceiling is 1.7x and whose bound here is 1e-5. Neither is a tuning change and
+neither has been attempted.
+
 🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
 AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at
 several shapes interleaved in one process, and costs about a second an arm - and

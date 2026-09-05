@@ -81,8 +81,19 @@ const median = (values) => {
 export async function main(device, args) {
   const lengths = option(args, "lengths", "128,256,400").split(",").map(Number);
   const rounds = Number(option(args, "rounds", "5"));
-  const stagedPrecision = option(args, "staged",
-    device.features.has("shader-f16") ? "f16" : "f32");
+  // 🔴 THE STAGED PRECISION IS AN ARM, NOT A SETTING, because it is how this
+  // kernel's bottleneck is identified. Narrowing the tile halves the BYTES read
+  // from workgroup memory and leaves the READ COUNT alone - a lane still reads
+  // eight vec4 of k and eight of v for every key - so a kernel bound on bytes
+  // gets much faster and one bound on read instructions barely moves. See
+  // CLAUDE.md: halving the bytes never halves the reads.
+  const staged = device.features.has("shader-f16") ? "f16" : "f32";
+  // 🔴 AND THE KEY CHUNK, WHICH IS SIZED IN BYTES AGAINST AN f32 TILE. See
+  // attendKeyChunk: the budget is 8 KiB and a vec4 is assumed to be 16 bytes,
+  // but with f16 staging the tile element is EIGHT - so the default chunk uses
+  // half of what it is allowed and takes twice the barriers.
+  const arms = option(args, "chunks", "16,32,64").split(",")
+    .map((chunk) => ({ name: `chunk${chunk}`, staged, chunk: Number(chunk), lazy: false }));
   const runner = new Af3GridSelfAttentionGpu(device);
 
   const rows = [];
@@ -98,14 +109,15 @@ export async function main(device, args) {
     const weights = weightsFor(n);
     const shape = { n, channels: CHANNELS, transpose: false };
 
-    const times = { lazy: [], always: [] };
+    const times = new Map(arms.map((arm) => [arm.name, []]));
     let reference;
     let differ = 0;   // the worst relRms between any two arms
     for (let round = 0; round < rounds; round += 1) {
-      for (const arm of ["lazy", "always"]) {
+      for (const arm of arms) {
         const { output, elapsedMilliseconds } = await runner.run(
           pair, mask, shape, weights, DIALECT,
-          { stagedPrecision, attendLazyRescale: arm === "lazy" });
+          { stagedPrecision: arm.staged, attendLazyRescale: arm.lazy,
+            attendKeyChunk: arm.chunk });
         // ...the first result is the reference and every other is measured
         // against it. See the note above: not equality.
         if (reference === undefined) reference = output;
@@ -119,18 +131,12 @@ export async function main(device, args) {
           }
           differ = Math.max(differ, Math.sqrt(error / Math.max(scale, 1e-30)));
         }
-        times[arm].push(elapsedMilliseconds);
+        times.get(arm.name).push(elapsedMilliseconds);
       }
     }
-    const lazy = median(times.lazy);
-    const always = median(times.always);
-    rows.push({
-      tokens: n, stagedPrecision,
-      lazyMs: Number(lazy.toFixed(2)),
-      alwaysMs: Number(always.toFixed(2)),
-      speedup: Number((always / lazy).toFixed(3)),
-      armsAgreeTo: Number(differ.toExponential(2)),
-    });
+    const ms = {};
+    for (const [name, values] of times) ms[name] = Number(median(values).toFixed(2));
+    rows.push({ tokens: n, ms, armsAgreeTo: Number(differ.toExponential(2)) });
   }
-  return { rounds, stagedPrecision, rows };
+  return { rounds, arms: arms.map((a) => a.name), rows };
 }

@@ -110,6 +110,15 @@ const ORDER = [
  * adapter grants and leaves room for nothing else - this kernel has no other
  * workgroup memory.
  */
+/**
+ * 🔴 THE BUDGET IS COUNTED IN f32 VECTORS WHATEVER THE TILE HOLDS. A staged
+ * vec4<f16> is EIGHT bytes, not sixteen, so with f16 staging this returns a
+ * chunk that uses half the workgroup memory it is allowed. Swept rather than
+ * fixed, because the fix would be a change for nothing: at 400 tokens, chunks
+ * of 16, 32 and 64 measure 125.7, 125.3 and 124.4 ms and agree bit for bit, so
+ * the barriers this halves are not what the kernel is waiting on. Left honest
+ * and conservative; bench-grid-attend.js --chunks is how to re-ask.
+ */
 export function attendKeyChunk(dimension) {
   const vectorsPerKey = 2 * (dimension / 4);
   for (const chunk of [32, 16, 8]) {
@@ -786,12 +795,16 @@ export class Af3GridSelfAttentionGpu {
     // ...forceable, so both arms can be timed in ONE process. See the note on
     // the lazy rescale in the attend kernel, and bench-grid-attend.js.
     const attendLazyRescale = options.attendLazyRescale !== false;
+    // ...and the staged key chunk, so bench-grid-attend.js can sweep it. See
+    // attendKeyChunk for why the default is what it is.
+    const attendKeyChunkSize = options.attendKeyChunk;
     const sources = createGridAttentionShaders(
-      { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale },
+      { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
+        ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
-      + `:${attendLazyRescale}`;
+      + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
