@@ -69,11 +69,27 @@ The weights are fetched from the network on first use, or read from a local
 
 ## Acknowledgments and citation
 
-LocalFold is an independent browser/WebGPU port of AlphaFold2; it does not originate the protein-structure prediction method or model parameters. We thank the AlphaFold team at Google DeepMind for developing AlphaFold2 and releasing its source code and parameters. The scientific method should be credited to the original publication:
+LocalFold began as a fork of **[AlphaFold2 WebGPU](https://github.com/martin-steinegger/alphafold2-webgpu)**
+by Martin Steinegger, which is where running AlphaFold 2 in a browser on WebGPU
+started. The entire codebase this one grew from is his: the first eight commits
+in this repository's history are his commits. The two projects diverged on
+2026-08-30 and are developed independently — AlphaFold2 WebGPU is still going,
+and parts of LocalFold (the MMseqs2 search client, the row-chunked transition)
+are ports of work done there since.
+
+Neither project originates the protein-structure prediction method or the model
+parameters. We thank the AlphaFold team at Google DeepMind for developing
+AlphaFold and releasing its source code and parameters. The scientific method
+should be credited to the original publication:
 
 > Jumper J, Evans R, Pritzel A, et al. Highly accurate protein structure prediction with AlphaFold. *Nature* 596, 583–589 (2021). [doi:10.1038/s41586-021-03819-2](https://doi.org/10.1038/s41586-021-03819-2)
 
 Please also consult and cite the [official AlphaFold repository](https://github.com/google-deepmind/alphafold) as appropriate. The bundled AlphaFold parameters remain subject to DeepMind's [CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE); this repository does not alter their ownership or license.
+
+The alignment search runs against the public ColabFold MMseqs2 server. If you
+use it, please also cite:
+
+> Mirdita M, Schütze K, Moriwaki Y, Heo L, Ovchinnikov S, Steinegger M. ColabFold: making protein folding accessible to all. *Nature Methods* 19, 679–682 (2022). [doi:10.1038/s41592-022-01488-1](https://doi.org/10.1038/s41592-022-01488-1)
 
 The AlphaFold 3 parameters carry DeepMind's Prohibited Use Policy and are not
 redistributed here.
