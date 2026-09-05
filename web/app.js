@@ -295,6 +295,25 @@ function reportModelFromUrl(attempt = 0) {
 const chosenFamily = () => document.getElementById("model-family")?.value ?? "af3";
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 
+/**
+ * What a fold's viewer object and downloaded files are called, per model.
+ *
+ * 🔴 THE OBJECT NAME IS THE ONLY PLACE TWO FOLDS ARE TOLD APART ON SCREEN, and
+ * it did not name the model. Both AF3-graph bundles produced `af3_N` and both
+ * AlphaFold 2 models produced `prediction_N`, so a page holding an AlphaFold 3
+ * fold and an OpenBind-0 fold showed two objects with the same prefix and no
+ * way to say which was which - and the stem also becomes the archive's file
+ * names, so a downloaded `af3_1_model_0.pdb` could be either.
+ *
+ * A FASTA header still wins: a name somebody supplied beats a generated one.
+ */
+const MODEL_STEMS = {
+  af3: "af3",
+  openbind0: "openbind0",
+  monomer: "af2",
+  multimer: "af2_multimer",
+};
+
 /** What to call each model while its weights download. */
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
@@ -1552,7 +1571,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // whole trajectory is the sampler's and it is re-run either way - so the
   // rewind is simply an empty object under the name already on screen.
   const stem = reuse === undefined
-    ? uniqueStem(header !== null ? safeJobName(header) : `af3_${predictionCount}`)
+    ? uniqueStem(header !== null
+      ? safeJobName(header)
+      : `${MODEL_STEMS[family] ?? family}_${predictionCount}`)
     : trunkCache.stem;
   // ...and the view goes blank first, so the trunk is not spent showing the
   // previous fold. See openBlankFold.
@@ -2185,7 +2206,8 @@ async function fold(event) {
     predictionCount += 1;
     const fastaHeader = entityList.header();
     const baseStem = fastaHeader !== null
-      ? safeJobName(fastaHeader) : `prediction_${predictionCount}`;
+      ? safeJobName(fastaHeader)
+      : `${MODEL_STEMS[family] ?? family}_${predictionCount}`;
     // 🔴 uniqueStem READS objectsData; the loop that used to be here read
     // `viewer.objects`, which does not exist on this build.
     const stem = resume === undefined ? uniqueStem(baseStem) : af2Cache.stem;

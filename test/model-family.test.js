@@ -59,6 +59,42 @@ describe("what needs an AlphaFold 3 graph", () => {
   }
 });
 
+describe("what a fold is called", () => {
+  it("gives every model its own stem, so two folds are told apart", () => {
+    // 🔴 THE OBJECT NAME IS THE ONLY PLACE THE MODEL SHOWS ON SCREEN. Both
+    // AF3-graph bundles used to produce `af3_N` and both AlphaFold 2 models
+    // `prediction_N`, so a page holding one of each showed two objects with the
+    // same prefix - and the stem becomes the archive's file names too, so a
+    // downloaded `af3_1_model_0.pdb` could have come from either.
+    const table = app.match(/const MODEL_STEMS = \{([^}]*)\}/s);
+    assert.ok(table !== null, "MODEL_STEMS is not where this test expects");
+    const stems = {};
+    for (const [, key, value] of table[1].matchAll(/(\w+):\s*"([^"]+)"/g)) {
+      stems[key] = value;
+    }
+    // Every family the page offers has one...
+    for (const family of Object.keys(MODEL_BUNDLES)) {
+      assert.ok(family in stems, `${family} has no stem`);
+    }
+    // ...and no two share it, which is the whole point.
+    const used = Object.values(stems);
+    assert.equal(new Set(used).size, used.length,
+      `two models share a stem: ${used.join(", ")}`);
+  });
+
+  it("uses it on both fold paths, not just the AlphaFold 3 one", () => {
+    const uses = [...app.matchAll(/MODEL_STEMS\[family\]/g)];
+    assert.equal(uses.length, 2,
+      "MODEL_STEMS should name the object on the AF3 path and the AF2 path");
+  });
+
+  it("still lets a supplied FASTA header win", () => {
+    // A name somebody typed beats a generated one; the model prefix is the
+    // fallback, not an override.
+    assert.match(app, /safeJobName\(header\)\s*\n\s*:\s*`\$\{MODEL_STEMS/);
+  });
+});
+
 describe("the trunk cache", () => {
   it("keys on the model, or one model's trunk is denoised by the other", () => {
     // 🔴 THE FAULT THIS PINS, AND IT SHIPPED FOR AN HOUR. The cached trunk is a
