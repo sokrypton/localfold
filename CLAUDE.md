@@ -358,6 +358,16 @@ cache. ⌘⇧R clears it. `tools/fold-in-page.py` never sees this because it
 launches a fresh Chrome profile, which is why it can pass while the browser in
 front of you does not.
 
+🔴 **`fold-in-page.py` FOLDS ONE CHAIN, AND A COMPLEX FAILS SILENTLY.** It
+types the whole `--sequence` into a SINGLE entity's field, so a colon-joined
+`A:B` is rejected by the page - "One sequence per entity - use Add entity for
+another chain" - the Fold click does nothing, and the tool waits out its whole
+timeout. Two 25-minute runs went that way before `cdp.wait_for` learned to print
+the page's status line as it changes (`progress=STATUS_LINE`), which answered it
+in ten seconds. Watch those `...` lines: a wait that prints nothing never
+started. Driving a real complex needs the tool to build one entity per chain
+through `window.__entityList`, which it does not do yet.
+
 ## Measuring, without fooling yourself
 
 🔴 **PROFILE, DO NOT BISECT BY DELETION.** Disabling a pass and re-measuring
