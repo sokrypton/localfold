@@ -993,6 +993,19 @@ damage is a TAIL - the median target moves 0.26 A even at three bits and the
 median crystal RMSD is flat at 2.52-2.57 A the whole way down; what changes is
 how many targets flip basin (0 at int8, 2 at int5, 3 at int4, 4 at int3).
 
+🔴 **AND CALIBRATED QUANTISATION IS WORTH ABOUT ONE BIT, ONLY AT THE BOTTOM.**
+GPTQ and llama.cpp's importance matrix both fit LocalFold's existing decoder -
+same asymmetric codes, same float16 scale and zero per group of 32 - and the
+whole 573M tower calibrates in 70 s on an A100 against 288 UniRef50 sequences.
+imatrix int3 at 4.00 bits matches plain int4 at 5.00; GPTQ int4 beats plain
+int4 by 14%; at int5 there is nothing left to win. It does NOT close the
+int4-to-int5 gap, so int5 is still the smallest free scheme. **GPTQ makes the
+WEIGHTS worse (9.78e-2 against 7.91e-2) and the OUTPUT better (7.87e-2 against
+9.42e-2)** - a weight-space study reports it as the worse method - and at THREE
+bits it is the worst arm structurally while still winning on the pair metric,
+which is the sharpest argument in this repository for folding rather than
+trusting a tensor norm. `tools/esmc/gptq.py`.
+
 🔴 **AND THE COMPRESSIBLE MODEL IS THE WEAK ONE.** ESM-C 300M folds as well as
 600M here (median 2.55 A against 2.52, a third of the seed spread) and puts the
 bundle at 361 MiB - but both are paper ABLATION checkpoints with no confidence

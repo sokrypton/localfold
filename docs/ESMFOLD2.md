@@ -227,6 +227,109 @@ pTM - see the model table above. LocalFold colours by pLDDT, its scores card is
 built on it, and its archive writer emits it. That is not a small gap to paper
 over.
 
+## Calibrated quantisation, which is what the LLM world does instead
+
+Everything above rounds each weight to the nearest code and looks at nothing
+else. The methods that made 3- and 4-bit language models usable all ask a
+different question - *what codes keep this LAYER'S OUTPUT the same on real
+data* - and they are cheap enough to be worth trying here. `tools/esmc/gptq.py`
+implements two, `tools/esmc/calibrate-esmc.py` drives them, and the calibration
+set is 288 UniRef50 sequences (three length buckets, 96 each).
+
+| | what it does | cost |
+|---|---|---|
+| **RTN** | nearest code, per-group affine range | free |
+| **imatrix** | keeps RTN's codes, picks each group's RANGE to minimise error weighted by that channel's activation energy. llama.cpp's importance matrix | one forward pass |
+| **GPTQ** | quantise column by column, pushing each column's rounding error into the columns not yet done, along the inverse Hessian of `2 XᵀX` | one forward pass + a Cholesky per matmul |
+| AWQ | search a per-input-channel scale, fold it into the neighbouring op | comparable |
+| SpQR / SqueezeLLM | keep the few extreme weights per group in float16 | measured above: 0.31 bits |
+| QuIP# / AQLM | random rotations to kill outliers, then vector codebooks | **needs a different decoder** |
+| SmoothQuant, LLM.int8() | move activation outliers into the weights | **irrelevant here** - LocalFold quantises STORAGE and computes in f16/f32, so there are no activation outliers to migrate |
+
+🔴 **THE BLOCKS ARE CALIBRATED IN ORDER AND SO ARE THE FOUR MATMULS INSIDE ONE**,
+so every layer corrects for the error its predecessors actually made rather
+than for an error nothing will make. Five passes per block instead of one, and
+the whole 573M tower takes **70 seconds on an A100**.
+
+🔴 **AND NEITHER METHOD CHANGES THE STORAGE FORMAT, WHICH IS WHY THESE TWO AND
+NOT THE OTHERS.** Both emit exactly what `src/runtime/quantised-upload.js`
+already decodes: asymmetric codes, one float16 scale and one float16 zero per
+group of 32. GPTQ's group axis lines up for free - LocalFold groups 32
+CONSECUTIVE elements of a row-major `(out, in)` tensor, which is 32 consecutive
+input channels of one output channel, which is what GPTQ calls `group_size`.
+`act-order` is deliberately not implemented: it is worth a few tenths of a bit
+and it permutes the input axis, so the groups stop being consecutive and the
+shader would need the permutation.
+
+### What they buy
+
+Same sixteen held-out targets, same protocol, same seed yardstick (1.00 A mean,
+7.16 A worst between two seeds of identical weights):
+
+| arm | bits/w | tower | moved: mean | TM | median | worst | past 1 A |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **GPTQ int5** | 6.00 | 410 MiB | **0.39 A** | **0.979** | 0.06 | 3.07 | 2/16 |
+| RTN int5 | 6.00 | 410 MiB | 0.44 A | 0.977 | 0.08 | 3.29 | 2/16 |
+| **GPTQ int4** | 5.00 | 342 MiB | **1.14 A** | **0.947** | 0.10 | 13.33 | 3/16 |
+| imatrix int4 | 5.00 | 342 MiB | 1.16 A | 0.940 | 0.08 | **9.25** | 3/16 |
+| RTN int4 | 5.00 | 342 MiB | 1.29 A | 0.933 | 0.12 | 13.26 | 3/16 |
+| **imatrix int3** | 4.00 | 273 MiB | **1.29 A** | **0.929** | 0.20 | 11.20 | 3/16 |
+| RTN int3 | 4.00 | 273 MiB | 1.72 A | 0.920 | 0.27 | 15.09 | 4/16 |
+| GPTQ int3 | 4.00 | 273 MiB | 1.87 A | 0.904 | 0.60 | 14.03 | **7/16** |
+
+🔴 **GPTQ MAKES THE WEIGHTS WORSE AND THE OUTPUT BETTER, WHICH IS THE WHOLE
+IDEA.** At int4 it moves the weights 9.78e-2 from float32 where plain rounding
+moves them 7.91e-2 - and the pair representation it produces is 7.87e-2 against
+rounding's 9.42e-2. A weight-space study would have reported GPTQ as the worse
+method. `tools/analyse_quantisation.py` is a weight-space study.
+
+🔴 **CALIBRATION IS WORTH ABOUT ONE BIT, AND ONLY AT THE BOTTOM.** `imatrix`
+int3 at **4.00 bits** matches plain int4 at **5.00 bits** on every column - 1.29
+A mean, TM 0.929 against 0.933 - which is a whole bit for one forward pass. At
+int5 there is nothing left to win: GPTQ's 0.39 A against rounding's 0.44 A is
+inside the sampler's own 1.00 A, so both are the same answer.
+
+🔴 **AND IT DOES NOT CLOSE THE int4 -> int5 GAP.** GPTQ int4 is 1.14 A where
+plain int5 is 0.44 A. Calibration recovers about 15% of a bit-step, not a whole
+one, so **int5 remains the smallest scheme that is free** and 533 MiB (600M) /
+361 MiB (300M) stands as the answer.
+
+🔴 **AND GPTQ IS THE WORST ARM AT THREE BITS, WHICH THE PAIR METRIC DOES NOT
+SAY.** Its pair error (1.77e-1) beats plain rounding's (1.92e-1) and its folds
+are worse on every structural column - mean 1.87 A against 1.72, TM 0.904
+against 0.920, and **seven of sixteen targets past the seed noise against four**.
+Pushing a large rounding error down the Hessian spreads it over columns that
+were fine; at three bits there is more error than there is room to put it. The
+two metrics disagree in SIGN here, which is the strongest argument in this file
+for folding the structure rather than trusting a tensor norm.
+
+### Would quantisation-aware TRAINING go further
+
+Probably, by about another bit, and it is not obviously worth it.
+
+The literature's ordering is RTN < imatrix/AWQ < GPTQ < QAT, and the step from
+GPTQ to QAT is worth roughly what the step from RTN to GPTQ is - which here was
+one bit at the bottom and nothing at the top. The right objective would not be
+the masked-LM loss ESM-C was trained on: ESMFold2 never reads the logits. It
+would be **self-distillation against the float32 tower's own hidden states** -
+no labels, just UniRef50 sequences and the teacher already on disk - because
+those are literally the tensors the shim mixes. Straight-through estimator on
+the codes, the scales and zeros left as they are so the format does not move.
+
+Cost on this A100: teacher forward plus student forward and backward, about 3x
+a plain pass, so ~1-2 days for a few thousand steps at 573M parameters. The
+prize is the 600M bundle at 355 MiB instead of 533, or the **300M bundle at
+about 240 MiB - which is AF2 monomer's 227 MB**.
+
+🔴 **BUT THE BINDING CONSTRAINT IS NOT SIZE.** Both towers already fit in the
+same class as what the page ships, the compute is a tenth of an AF3 trunk pass,
+and the checkpoints that fit are paper ablations with **no confidence head at
+all** and a median 2.52 A on held-out targets with two failures in sixteen.
+Spending two days of GPU to move 533 MiB to 355 MiB does not change any of
+that. The experiment to run before any training run is whether ESMFold2-Fast is
+accurate enough to be worth shipping at ALL, and that is a question about the
+model rather than about its bytes.
+
 ## Spending bits where the layer mix is heavy does NOT work
 
 ESMFold2 takes **58.8%** of its softmax from the last three of the 37 states and

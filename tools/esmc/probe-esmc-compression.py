@@ -123,6 +123,9 @@ def main():
     parser.add_argument('--per-layer', action='store_true',
                         help='print the per-state error of every arm')
     parser.add_argument('--device', default='cpu')
+    parser.add_argument('--calibrated', default='',
+                        help='label=path.npz, comma separated - arms whose '
+                             'codes were chosen against real activations')
     arguments = parser.parse_args()
 
     torch.set_grad_enabled(False)
@@ -139,6 +142,11 @@ def main():
                  if not arguments.targets or k in arguments.targets.split(',')}
 
     checkpoint = E.Checkpoint(ROOT / arguments.esmc)
+    for entry in (e for e in arguments.calibrated.split(',') if e.strip()):
+        label, _, where = entry.partition('=')
+        scheme = Q.calibrated(where, label)
+        catalogue[scheme.name] = scheme
+        names.append(scheme.name)
     for spec in extra:
         scheme = Q.mixed(spec, checkpoint.n_layers)
         catalogue[scheme.name] = scheme

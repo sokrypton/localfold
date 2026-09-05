@@ -110,6 +110,8 @@ class Scheme:
 
     def __call__(self, values, key=None):
         flat = np.asarray(values, np.float32).reshape(-1)
+        if self.keyed and key is None:
+            raise ValueError('%s needs the tensor name' % self.name)
         out = self.apply(flat, key) if self.keyed else self.apply(flat)
         return out.reshape(np.asarray(values).shape).astype(np.float32)
 
@@ -142,6 +144,35 @@ def mixed(spec, n_layers, group=32):
 
 
 SEARCH_GRID = np.round(np.arange(0.6, 1.0001, 0.02), 3)
+
+
+def calibrated(path, name=None):
+    """An arm whose codes were chosen against real activations, not in a vacuum.
+
+    `tools/esmc/calibrate-esmc.py` writes one `.npz` of codes, float16 scales
+    and float16 zeros per tensor - the three arrays a shard holds - and this
+    replays them. It is a lookup rather than a computation, which is the point:
+    what is measured is what a bundle would contain.
+
+    🔴 THE ARM MUST FAIL LOUDLY ON A TENSOR IT DOES NOT COVER. A calibrated
+    file that silently fell back to round-to-nearest for the tensors it missed
+    would measure a mixture and report it as a method.
+    """
+    store = np.load(path)
+    meta = store['__meta__'] if '__meta__' in store else None
+    method, bits, group = (meta[0], int(meta[1]), int(meta[2])) if meta is not None \
+        else ('calibrated', 0, 32)
+
+    def apply(values, key):
+        codes = store[key + '.codes'].astype(np.float32)
+        scales = store[key + '.scales'].astype(np.float32)
+        zeros = store[key + '.zeros'].astype(np.float32)
+        rows, inner = codes.shape
+        grouped = codes.reshape(rows, inner // group, group)
+        return (grouped * scales[:, :, None] + zeros[:, :, None]).reshape(-1)
+
+    label = name or '%s int%d g%d' % (method, bits, group)
+    return Scheme(label, bits + 32.0 / group, apply, keyed=True)
 
 
 def catalogue():

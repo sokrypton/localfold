@@ -129,39 +129,65 @@ class Tower:
                                                device=self.device)
         return self._cache[key]
 
+    def block(self, x, layer, positions, record=None):
+        """One ESM-C block. `record` collects each matmul's INPUT, which is
+        what a calibrated quantiser needs and what nothing else here wants.
+
+        Kept as ONE implementation rather than a second copy inside the
+        calibration script: a calibrated arm and its reference must differ in
+        the weights and in nothing else, and two block bodies is exactly how
+        they stop doing that.
+        """
+        ck = self.ck
+        b = lambda leaf, q=True: self._t(ck.block_key(layer, leaf), q)
+        heads, head_dim = ck.n_heads, ck.d_model // ck.n_heads
+        h = _layer_norm(x, b('attn.layernorm_qkv.layer_norm_weight', False),
+                        b('attn.layernorm_qkv.layer_norm_bias', False))
+        if record is not None:
+            record['attn.layernorm_qkv.weight'] = h
+        h = h @ b('attn.layernorm_qkv.weight').T
+        q, k, v = h.split(ck.d_model, dim=-1)
+        q = _layer_norm(q, b('attn.q_ln.weight', False))
+        k = _layer_norm(k, b('attn.k_ln.weight', False))
+        q = _rope(q.reshape(*q.shape[:-1], heads, head_dim), positions)
+        k = _rope(k.reshape(*k.shape[:-1], heads, head_dim), positions)
+        v = v.reshape(*v.shape[:-1], heads, head_dim)
+        context = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(-3, -2), k.transpose(-3, -2), v.transpose(-3, -2))
+        context = context.transpose(-3, -2).reshape(*x.shape[:-1], ck.d_model)
+        if record is not None:
+            record['attn.out_proj.weight'] = context
+        x = x + (context @ b('attn.out_proj.weight').T) / ck.residual_scale
+        h = _layer_norm(x, b('ffn.layer_norm_weight', False),
+                        b('ffn.layer_norm_bias', False))
+        if record is not None:
+            record['ffn.fc1_weight'] = h
+        h = h @ b('ffn.fc1_weight').T
+        gate, value = h.split(h.shape[-1] // 2, dim=-1)
+        hidden = torch.nn.functional.silu(gate) * value
+        if record is not None:
+            record['ffn.fc2_weight'] = hidden
+        return x + (hidden @ b('ffn.fc2_weight').T) / ck.residual_scale
+
+    def embed(self, ids):
+        table = self._t('esmc.embed.weight', quantisable=False)
+        return table[torch.as_tensor(ids, dtype=torch.long, device=self.device)]
+
+    def final_norm(self, x):
+        return _layer_norm(x, self._t('esmc.transformer.norm.weight', False))
+
+    def positions(self, length):
+        return torch.arange(length, dtype=torch.float32, device=self.device)
+
     def hidden_states(self, ids):
         """-> (n_layers + 1, L, d_model), every state ESMFold2 is allowed to mix."""
-        ck = self.ck
-        ids_t = torch.as_tensor(ids, dtype=torch.long, device=self.device)
-        embed = self._t('esmc.embed.weight', quantisable=False)
-        x = embed[ids_t]
-        positions = torch.arange(x.shape[0], dtype=torch.float32, device=self.device)
-        heads, head_dim = ck.n_heads, ck.d_model // ck.n_heads
+        x = self.embed(ids)
+        positions = self.positions(x.shape[-2])
         states = [x]
-        for layer in range(ck.n_layers):
-            b = lambda leaf, q=True: self._t(ck.block_key(layer, leaf), q)
-            h = _layer_norm(x, b('attn.layernorm_qkv.layer_norm_weight', False),
-                            b('attn.layernorm_qkv.layer_norm_bias', False))
-            h = h @ b('attn.layernorm_qkv.weight').T
-            q, k, v = h.split(ck.d_model, dim=-1)
-            q = _layer_norm(q, b('attn.q_ln.weight', False))
-            k = _layer_norm(k, b('attn.k_ln.weight', False))
-            q = _rope(q.reshape(-1, heads, head_dim), positions)
-            k = _rope(k.reshape(-1, heads, head_dim), positions)
-            v = v.reshape(-1, heads, head_dim)
-            context = torch.nn.functional.scaled_dot_product_attention(
-                q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
-            context = context.transpose(0, 1).reshape(-1, ck.d_model)
-            x = x + (context @ b('attn.out_proj.weight').T) / ck.residual_scale
-            h = _layer_norm(x, b('ffn.layer_norm_weight', False),
-                            b('ffn.layer_norm_bias', False))
-            h = h @ b('ffn.fc1_weight').T
-            gate, value = h.split(h.shape[-1] // 2, dim=-1)
-            x = x + ((torch.nn.functional.silu(gate) * value)
-                     @ b('ffn.fc2_weight').T) / ck.residual_scale
+        for layer in range(self.ck.n_layers):
+            x = self.block(x, layer, positions)
             states.append(x)
-        states[-1] = _layer_norm(states[-1],
-                                 self._t('esmc.transformer.norm.weight', False))
+        states[-1] = self.final_norm(states[-1])
         return torch.stack(states)
 
     def logits(self, ids):

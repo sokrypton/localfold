@@ -122,6 +122,9 @@ def main():
     parser.add_argument('--pdb-dir', default=None,
                         help='fold every .pdb here instead, scored against it')
     parser.add_argument('--device', default='cpu')
+    parser.add_argument('--calibrated', default='',
+                        help='label=path.npz, comma separated - arms whose '
+                             'codes were chosen against real activations')
     parser.add_argument('--samples', type=int, default=1)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--seed-spread', type=int, default=0,
@@ -201,6 +204,11 @@ def main():
 
     catalogue = Q.catalogue()
     names = [n.strip() for n in arguments.schemes.split(',') if n.strip()]
+    for entry in (e for e in arguments.calibrated.split(',') if e.strip()):
+        label, _, where = entry.partition('=')
+        scheme = Q.calibrated(where, label)
+        catalogue[scheme.name] = scheme
+        names.append(scheme.name)
     outdir = pathlib.Path(arguments.out) if arguments.out else None
     if outdir:
         outdir.mkdir(parents=True, exist_ok=True)
