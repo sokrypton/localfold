@@ -54,6 +54,52 @@ export function reduceTmScore(term, tokens, selects) {
 }
 
 /**
+ * The per-pair TM term, from the PAE logits.
+ *
+ * 🔴 ONCE PER PREDICTION, NOT ONCE PER SCORE. Every score over one prediction -
+ * pTM, ipTM, and one per chain pair - is the same `tokens^2` expectations
+ * reduced over different pairs, and the expectation is the expensive half:
+ * O(tokens^2 * bins) against the reduction's O(tokens^2), with 64 bins. Doing
+ * it inside each score made AlphaFold 2 pay for it twice, and would have made a
+ * five-chain complex pay for it twelve times.
+ *
+ * 🔴 AND IT IS float64, NOT float32. The values it replaces were doubles held
+ * in a local, so storing them narrower would move published scores in the last
+ * digits - and test/prediction-results.test.js pins AlphaFold 2's to twelve.
+ *
+ * @param {ArrayLike<number>} logits  tokens * tokens * bins
+ * @param {number} tokens
+ * @param {ArrayLike<number>} tmPerBin  bins
+ * @returns {Float64Array} tokens * tokens
+ */
+export function tmTermFromLogits(logits, tokens, tmPerBin) {
+  const bins = tmPerBin.length;
+  if (logits.length !== tokens * tokens * bins) {
+    throw new RangeError(`PAE logits should be ${tokens * tokens * bins} long,`
+      + ` not ${logits.length}`);
+  }
+  const term = new Float64Array(tokens * tokens);
+  for (let pair = 0; pair < term.length; pair += 1) {
+    const base = pair * bins;
+    // Softmax and expectation in one pass, against the largest logit, because
+    // the logits are unbounded and exp() of them is not.
+    let largest = Number.NEGATIVE_INFINITY;
+    for (let bin = 0; bin < bins; bin += 1) {
+      if (logits[base + bin] > largest) largest = logits[base + bin];
+    }
+    let denominator = 0;
+    let numerator = 0;
+    for (let bin = 0; bin < bins; bin += 1) {
+      const probability = Math.exp(logits[base + bin] - largest);
+      denominator += probability;
+      numerator += probability * tmPerBin[bin];
+    }
+    term[pair] = numerator / denominator;
+  }
+  return term;
+}
+
+/**
  * The same score, taking the PAE logits and doing the expectation here.
  *
  * @param {ArrayLike<number>} logits  tokens * tokens * bins, the PAE logits
@@ -65,41 +111,15 @@ export function reduceTmScore(term, tokens, selects) {
  *   anchor - which is what a monomer's ipTM is, and is not zero
  */
 export function bestAlignmentTmScore(logits, tokens, tmPerBin, selects) {
-  const bins = tmPerBin.length;
-  if (logits.length !== tokens * tokens * bins) {
-    throw new RangeError(`PAE logits should be ${tokens * tokens * bins} long,`
-      + ` not ${logits.length}`);
-  }
-  let best = Number.NEGATIVE_INFINITY;
-  let anyAnchor = false;
-  for (let anchor = 0; anchor < tokens; anchor += 1) {
-    let total = 0;
-    let count = 0;
-    for (let other = 0; other < tokens; other += 1) {
-      if (!selects(anchor, other)) continue;
-      const base = (anchor * tokens + other) * bins;
-      // Softmax and expectation in one pass, against the largest logit, because
-      // the logits are unbounded and exp() of them is not.
-      let largest = Number.NEGATIVE_INFINITY;
-      for (let bin = 0; bin < bins; bin += 1) {
-        if (logits[base + bin] > largest) largest = logits[base + bin];
-      }
-      let denominator = 0;
-      let numerator = 0;
-      for (let bin = 0; bin < bins; bin += 1) {
-        const probability = Math.exp(logits[base + bin] - largest);
-        denominator += probability;
-        numerator += probability * tmPerBin[bin];
-      }
-      total += numerator / denominator;
-      count += 1;
-    }
-    if (count === 0) continue;
-    anyAnchor = true;
-    const alignment = total / count;
-    if (alignment > best) best = alignment;
-  }
-  return anyAnchor ? best : Number.NaN;
+  // 🔴 THE EXPECTATION AND THE REDUCTION ARE THE SAME TWO HALVES AS EVERYWHERE
+  // ELSE. This used to inline the softmax inside the reduction loop, which is a
+  // second copy of arithmetic that must agree with tmTermFromLogits to the last
+  // digit or two paths score the same prediction differently. Composed, they
+  // cannot disagree. It evaluates every pair rather than only the selected
+  // ones, which is more work for a narrow selection and the same work for a
+  // broad one - and the callers that reduce a prediction more than once now
+  // build the term themselves and skip this entirely.
+  return reduceTmScore(tmTermFromLogits(logits, tokens, tmPerBin), tokens, selects);
 }
 
 /**

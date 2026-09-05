@@ -10,6 +10,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import { chainPairTmScores, reduceTmScore } from "../src/heads/tm-score.js";
+import { computeTmScores } from "../src/heads/confidence.js";
 
 /** Three chains of `per` tokens each. */
 const layout = (per) => {
@@ -107,5 +108,49 @@ describe("per-chain-pair ipTM", () => {
     const { scores } = chainPairTmScores(values, tokens, shape.asymId, shape.seqMask);
     assert.ok(Math.abs(scores.get("0|1") - 0.7) < 1e-9,
       `the better anchor should win, got ${scores.get("0|1")}`);
+  });
+
+  // 🔴 AND AlphaFold 2 GETS THE SAME BREAKDOWN FROM THE SAME FUNCTION. It had
+  // the pooled ipTM only, which on more than two chains is an average over
+  // every interface - so one good contact and two bad ones report as one
+  // mediocre number, and there was no way to tell that apart from three
+  // mediocre ones. AF2's chains are contiguous blocks rather than asym ids,
+  // which is the only difference, and `chainLengths` already says where they
+  // are.
+  it("gives AlphaFold 2 one score per interface, not one pooled average", () => {
+    const length = 30;
+    const bins = 64;
+    const breaks = Float32Array.from({ length: 63 }, (_, index) => index * 0.5);
+    const logits = new Float32Array(length * length * bins);
+    const chainOf = (index) => Math.floor(index / 10);
+    for (let i = 0; i < length; i += 1) {
+      for (let j = 0; j < length; j += 1) {
+        const a = chainOf(i);
+        const b = chainOf(j);
+        // Chains 0 and 1 meet confidently; everything touching chain 2 does not.
+        const bin = a === b ? 0 : (a + b === 1 ? 2 : 20);
+        logits[(i * length + j) * bins + bin] = 10;
+      }
+    }
+    const scores = computeTmScores(logits, length, breaks, [10, 10, 10]);
+    const pairs = scores.chainPairIptm;
+    assert.deepEqual(Object.keys(pairs).sort(), ["0|1", "0|2", "1|2"]);
+    assert.ok(pairs["0|1"] > 0.4, `AB should be confident, got ${pairs["0|1"]}`);
+    assert.ok(pairs["0|2"] < 0.1, `AC should not be, got ${pairs["0|2"]}`);
+    assert.ok(pairs["1|2"] < 0.1, `BC should not be, got ${pairs["1|2"]}`);
+    // The pooled score is what the breakdown exists to qualify: it sits between
+    // the interfaces and describes none of them.
+    assert.ok(scores.iptm > pairs["0|2"] && scores.iptm < pairs["0|1"],
+      `the pooled ipTM ${scores.iptm} should fall between the interfaces`);
+  });
+
+  // A monomer has no interface, and an empty object would read as "measured,
+  // and there are none" rather than "the question does not apply".
+  it("leaves a single chain with no breakdown at all", () => {
+    const length = 8;
+    const bins = 64;
+    const breaks = Float32Array.from({ length: 63 }, (_, index) => index * 0.5);
+    const logits = new Float32Array(length * length * bins);
+    assert.equal(computeTmScores(logits, length, breaks).chainPairIptm, undefined);
   });
 });

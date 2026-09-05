@@ -1,5 +1,6 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
-import { bestAlignmentTmScore, tmPerBinFor, tmScoreD0 } from "./tm-score.js";
+import { chainPairTmScores, reduceTmScore, tmPerBinFor, tmScoreD0, tmTermFromLogits }
+  from "./tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
 } from "../evoformer/transition.js";
@@ -81,15 +82,34 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
   // The reduction is shared with AlphaFold 3 - see src/heads/tm-score.js. What
   // stays here is AF2's own conventions: bin centres from the model's breaks,
   // and chains as contiguous blocks rather than by asym_id.
-  const ptm = bestAlignmentTmScore(logits, length, tmPerBin, () => true);
+  //
+  // 🔴 THE TERM IS BUILT ONCE AND REDUCED SEVERAL TIMES, which is what lets
+  // this share AF3's `chainPairTmScores` rather than reimplement it. Every
+  // score here is the same expectations averaged over a different set of pairs;
+  // computing them per score made a two-chain fold do the expensive half twice
+  // and would have made a five-chain fold do it twelve times.
+  const term = tmTermFromLogits(logits, length, tmPerBin);
+  const ptm = reduceTmScore(term, length, () => true);
   const iptm = isMultiChain
-    ? bestAlignmentTmScore(logits, length, tmPerBin,
+    ? reduceTmScore(term, length,
       (anchor, other) => chainIndices[anchor] !== chainIndices[other])
+    : undefined;
+
+  // 🔴 ONE SCORE PER INTERFACE, FOR THE REASON AF3 HAS THEM. The pooled ipTM
+  // counts every cross-chain pair equally, so an assembly holding both a native
+  // dimer and a designed binder reports the easy interface's confidence for the
+  // hard one. AF2 had no such breakdown and the arithmetic was already here;
+  // what was missing was calling it. `chainIndices` is AF2's asym_id - chains
+  // are contiguous blocks - and its mask is all ones, because this path has no
+  // padding to exclude.
+  const chainPairIptm = isMultiChain
+    ? Object.fromEntries(chainPairTmScores(
+      term, length, chainIndices, new Uint8Array(length).fill(1)).scores)
     : undefined;
 
   const multimerScore = isMultiChain && iptm !== undefined && !Number.isNaN(iptm)
     ? (0.8 * iptm + 0.2 * ptm) : undefined;
-  return { ptm, iptm, multimerScore };
+  return { ptm, iptm, multimerScore, chainPairIptm };
 }
 
 export function predictedTmScore(logits, length, breaks) {
@@ -226,6 +246,7 @@ export class ConfidenceHeadsGpu {
         ptm: tmScores.ptm,
         iptm: tmScores.iptm,
         multimerScore: tmScores.multimerScore,
+        chainPairIptm: tmScores.chainPairIptm,
       };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index] .release();
