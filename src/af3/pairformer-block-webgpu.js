@@ -315,13 +315,6 @@ export class Af3PairformerStackGpu {
           Math.max(n * singleWidth, n * SINGLE_CHANNELS) * 4, storage)));
       }
 
-      const readbackPair = keep(this.allocator.allocate(
-        "af3-block.readback-pair", pairBytes,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-      const readbackSingle = keep(this.allocator.allocate(
-        "af3-block.readback-single", n * SINGLE_CHANNELS * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-
       // 🔴 SUBMISSION RUNS AHEAD OF THE DEVICE, ON PURPOSE. Every block used to
       // submit, await a validation error scope and await an empty queue before
       // releasing its weights - two full GPU stalls per block, 48 times, so
@@ -390,6 +383,24 @@ export class Af3PairformerStackGpu {
         await options.onBlock?.(index);
       }
       await validation.settle();
+
+      // 🔴 THE READBACKS ARE ALLOCATED AFTER THE SCRATCH IS GONE, NOT BEFORE
+      // THE LOOP. They are written once, here, by a copy this stack has
+      // already waited for - and a pair-sized MAP_READ buffer standing beside
+      // six pair-sized scratch tensors for the whole 48-block loop is 43.9 MiB
+      // of a 699 MiB peak at 300 tokens, held for nothing. `settle()` above
+      // means the device is idle, so releasing the scratch here is safe and
+      // this allocator does not pool: release DESTROYS, which is what makes
+      // the peak move.
+      for (const allocation of [...scratch, ...singleScratch, biasBuffer, pairLogits]) {
+        allocation.release();
+      }
+      const readbackPair = keep(this.allocator.allocate(
+        "af3-block.readback-pair", pairBytes,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const readbackSingle = keep(this.allocator.allocate(
+        "af3-block.readback-single", n * SINGLE_CHANNELS * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const encoder = this.device.createCommandEncoder({ label: "af3-block.readback" });
       encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairBytes);

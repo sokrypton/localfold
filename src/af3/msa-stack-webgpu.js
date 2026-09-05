@@ -144,12 +144,6 @@ export class Af3MsaStackGpu {
           `af3-msa.msa-scratch${index}`, rows * Math.max(msaWidth, msaChannels) * 4, storage)));
       }
 
-      const readbackPair = keep(this.allocator.allocate(
-        "af3-msa.readback-pair", pairs * PAIR_CHANNELS * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-      const readbackMsa = keep(this.allocator.allocate(
-        "af3-msa.readback-msa", rows * msaChannels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
@@ -160,6 +154,22 @@ export class Af3MsaStackGpu {
         });
         options.onBlock?.(index);
       }
+
+      // 🔴 THE READBACKS COME AFTER THE SCRATCH GOES, NOT BEFORE THE LOOP.
+      // They are written once, by the copy below, and a pair-sized MAP_READ
+      // buffer standing beside six pair-sized scratch tensors for the whole
+      // stack is 19.5 MiB at 200 tokens of the peak this stage HOLDS. The
+      // drain is free here: the mapAsync two lines down is one anyway.
+      await this.device.queue.onSubmittedWorkDone();
+      for (const allocation of [...scratch, ...msaScratch, biasBuffer, attention]) {
+        allocation.release();
+      }
+      const readbackPair = keep(this.allocator.allocate(
+        "af3-msa.readback-pair", pairs * PAIR_CHANNELS * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const readbackMsa = keep(this.allocator.allocate(
+        "af3-msa.readback-msa", rows * msaChannels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const encoder = this.device.createCommandEncoder({ label: "af3-msa.readback" });
       encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairs * PAIR_CHANNELS * 4);
