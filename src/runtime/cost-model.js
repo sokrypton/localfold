@@ -68,7 +68,14 @@ function shape(value, fallback, what) {
  * shares below are those over their total. They are NOT constant in the shape:
  * the MSA stack grows with alignment depth and the pairformer with tokens
  * cubed, so at 24 tokens with four blocks the pairformer is a quarter of the
- * pass rather than five sixths. What they buy is a bar that advances through
+ * pass rather than five sixths.
+ *
+ * Corroborated at 700 tokens, where a pass is 65.3 s rather than 3.6, and the
+ * head these shares exist to fill drifts by three points over that range:
+ *
+ *              embedder  template  msa-stack  pairformer  distogram   head
+ *   200 tokens    1.0%      2.7%      12.0%       82.9%       1.5%   15.6%
+ *   700 tokens    0.4%      2.5%      10.0%       85.5%       1.6%   12.9% What they buy is a bar that advances through
  * the silent stages in roughly the right places - which is a different and much
  * lower bar than a clock, and the reason the status line names the running
  * stage as well as showing a number.
