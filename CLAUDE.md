@@ -276,6 +276,32 @@ uses ragged shapes and ragged masks so the bounds checks and the masking are
 actually exercised. They are differential, not oracle: they say the kernel
 computes the operation, not that AlphaFold agrees.
 
+🔴 **CHUNKING THE PAIR SCRATCH LOOKS OBVIOUS AND THE TRIANGLE WILL NOT HAVE
+IT.** The five pair-sized scratch buffers are 5987 MiB of a 9662 MiB fold at
+1530 tokens - 62% - and the budget's only cheaper route gives up WEIGHT
+residency, which is ~567 MiB and does not grow with the protein. So: run the
+track a few hundred rows at a time. The grid attention takes it happily - q, k,
+v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
+a row chunk is a contiguous byte range and binding that SLICE makes the
+existing indexing address it with **no kernel change at all**. `run` in
+src/af3/pairformer-block-webgpu.js accepts a slice for this, and
+`encodePairTrack` has a `rowChunk` that defaults to the whole track.
+
+🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
+CHANNEL-major - `a[h * PAIRS + i * L + k]` - so a row chunk is CH separate
+ranges rather than one, and no binding offset expresses that. Worse, the
+INCOMING direction reads `b[a_k * L + i]`, so chunking the output rows needs a
+strided COLUMN slice of b, which is not a range at any stride. Chunking the
+triangle therefore needs a stride constant in the kernels (and those kernels
+are shared with AF2's evoformer and multimer) or a transposed copy of b, which
+is the buffer the chunking was meant to avoid.
+
+🔴 **AND THE PEAK IS THE WORST CASE, SO HALF THE JOB IS WORTH NOTHING.** The
+triangle and the grid share the five buffers and the allocation is sized for
+whichever needs more, so chunking only the grid leaves the peak exactly where
+it was. It is all or nothing, and the "all" is a restructure of the pair track
+rather than the afternoon it looks like.
+
 🔴 **AND THE TOTALS CANNOT SAY WHICH TENSOR TO ATTACK.** `memorySnapshot`
 returns `byLabel` beside the totals - the allocator was always given a label per
 buffer and threw it away - and `fold.js`, `bench-trunk.js` and `fold-af2.js`
