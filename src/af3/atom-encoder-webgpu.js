@@ -36,6 +36,15 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 
+/**
+ * Which labels in a caller's `staticCache` already hold their contents.
+ *
+ * Kept beside the cache rather than in it: the head owns that object and
+ * destroys every VALUE in it when a fold ends, so a bookkeeping set stored
+ * there would be asked to destroy itself.
+ */
+const STATIC_UPLOADS = new WeakMap();
+
 const GRID_WIDTH = 32_768;
 
 const BLOCK_ORDER = [
@@ -1177,23 +1186,64 @@ export class Af3AtomEncoderGpu {
       staticCache[label] = buffer;
       return { buffer };
     };
+    // 🔴 AND THE CONTENTS ARE STATIC TOO, NOT ONLY THE BUFFER. `persistent`
+    // keeps a tensor the blocks WRITE; this keeps one they READ. The per-atom
+    // conditioning, the reference conformer, the ten gathers and the trunk's
+    // two conditioned tensors are functions of the FOLD and not of the step,
+    // and they were rebuilt on the host and written across the bus once per
+    // sampler step - 2.6 MB a step at 59 tokens, growing as tokens^2 through
+    // `atom.trunk-pair`, into buffers already holding the identical bytes.
+    //
+    // The build closure is not called on a hit, so the host-side gathering
+    // above it - which walks every query and key row - does not run either.
+    const uploaded = staticCache === undefined ? undefined
+      : (STATIC_UPLOADS.get(staticCache) ?? new Set());
+    if (staticCache !== undefined) STATIC_UPLOADS.set(staticCache, uploaded);
+    const persistentUpload = (label, build, extra = 0) => {
+      if (staticCache === undefined) return up(label, build());
+      const found = staticCache[label];
+      if (found !== undefined && uploaded.has(label)) return { buffer: found };
+      const data = build();
+      const size = Math.ceil(data.byteLength / 4) * 4;
+      let buffer = found;
+      if (buffer !== undefined && buffer.size !== size) {
+        buffer.destroy();
+        noteDestroy(this.device, buffer.size, label);
+        buffer = undefined;
+      }
+      if (buffer === undefined) {
+        // A shape that moved under the cache invalidates the computed statics
+        // as well; see the note on buildStatic.
+        buildStatic = true;
+        noteAllocation(this.device, label, size);
+        buffer = this.device.createBuffer({
+          label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
+        });
+        staticCache[label] = buffer;
+      }
+      this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
+      uploaded.add(label);
+      return { buffer };
+    };
     const ints = (source) => Int32Array.from(source, (v) => Number(v));
     const floats = (source) => Float32Array.from(source, (v) => Number(v));
 
     try {
-      const conditioning = up("atom.cond", input.conditioning);
-      const atomMask = up("atom.mask", floats(input.atomMask));
+      const conditioning = persistentUpload("atom.cond", () => input.conditioning);
+      const atomMask = persistentUpload("atom.mask", () => floats(input.atomMask));
       const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
         "atom.pair-weights", () => pairPacked.data) };
-      const trunkSingleCond = up("atom.trunk-single", input.trunkSingleCond);
-      const trunkPairCond = up("atom.trunk-pair", input.trunkPairCond);
+      const trunkSingleCond = persistentUpload("atom.trunk-single",
+        () => input.trunkSingleCond);
+      const trunkPairCond = persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
+      // 🔴 THE ONE INPUT THAT MOVES. Everything else this encoder reads is the
+      // molecule or the trunk; the noisy coordinates are the step.
       const positions = up("atom.positions", input.tokenAtomsAct);
-      const refPos = up("atom.ref-pos", floats(input.refPos));
-      const refSpaceUid = up("atom.ref-space", ints(input.refSpaceUid));
+      const refPos = persistentUpload("atom.ref-pos", () => floats(input.refPos));
+      const refSpaceUid = persistentUpload("atom.ref-space", () => ints(input.refSpaceUid));
 
       // Every gather, and the two reference-space columns, in one i32 buffer -
       // see the note in the shader preamble about the eight-buffer guarantee.
-      const flatSpace = ints(input.refSpaceUid);
       const queriesSpace = new Int32Array(queryRows);
       const keysSpace = new Int32Array(keyRows);
       // 🔴 A MASKED SLOT'S REFERENCE SPACE IS ZERO, NOT A SENTINEL. AF3 gathers
@@ -1202,49 +1252,66 @@ export class Af3AtomEncoderGpu {
       // their offset term live. Using -1 and -2 here to mark them "unrelated"
       // is the tidier choice and a different model; it cost 3.1e-2 on the atom
       // pair representation.
-      for (let index = 0; index < queryRows; index += 1) {
-        queriesSpace[index] = input.tokenAtomsToQueries.mask[index]
-          ? flatSpace[Number(input.tokenAtomsToQueries.indices[index])] : 0;
-      }
-      for (let index = 0; index < keyRows; index += 1) {
-        keysSpace[index] = input.queriesToKeys.mask[index]
-          ? queriesSpace[Number(input.queriesToKeys.indices[index])] : 0;
-      }
-      const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
-      let at = 0;
-      const place = (source) => { gathers.set(ints(source), at); at += source.length; };
-      place(input.tokenAtomsToQueries.indices);
-      place(input.tokenAtomsToQueries.mask);
-      place(input.tokensToQueries.indices);
-      place(input.tokensToQueries.mask);
-      place(input.queriesToKeys.indices);
-      place(input.queriesToKeys.mask);
-      place(input.tokensToKeys.indices);
-      place(input.tokensToKeys.mask);
-      place(input.queriesToTokenAtoms.indices);
-      place(input.queriesToTokenAtoms.mask);
-      gathers.set(queriesSpace, at); at += queryRows;
-      gathers.set(keysSpace, at);
-      const gatherBuffer = up("atom.gathers", gathers);
+      const buildQueriesSpace = () => {
+        const flatSpace = ints(input.refSpaceUid);
+        for (let index = 0; index < queryRows; index += 1) {
+          queriesSpace[index] = input.tokenAtomsToQueries.mask[index]
+            ? flatSpace[Number(input.tokenAtomsToQueries.indices[index])] : 0;
+        }
+        for (let index = 0; index < keyRows; index += 1) {
+          keysSpace[index] = input.queriesToKeys.mask[index]
+            ? queriesSpace[Number(input.queriesToKeys.indices[index])] : 0;
+        }
+      };
+      const gatherBuffer = persistentUpload("atom.gathers", () => {
+        buildQueriesSpace();
+        const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
+        let at = 0;
+        const place = (source) => { gathers.set(ints(source), at); at += source.length; };
+        place(input.tokenAtomsToQueries.indices);
+        place(input.tokenAtomsToQueries.mask);
+        place(input.tokensToQueries.indices);
+        place(input.tokensToQueries.mask);
+        place(input.queriesToKeys.indices);
+        place(input.queriesToKeys.mask);
+        place(input.tokensToKeys.indices);
+        place(input.tokensToKeys.mask);
+        place(input.queriesToTokenAtoms.indices);
+        place(input.queriesToTokenAtoms.mask);
+        gathers.set(queriesSpace, at); at += queryRows;
+        gathers.set(keysSpace, at);
+        return gathers;
+      });
 
       // The reference positions in query and key layout, gathered on the host:
       // three floats each, and the gathers are integer indirection the GPU has
-      // no reason to redo.
-      const queriesRef = new Float32Array(queryRows * 3);
-      const keysRef = new Float32Array(keyRows * 3);
-      const flatRef = floats(input.refPos);
-      for (let index = 0; index < queryRows; index += 1) {
-        if (!input.tokenAtomsToQueries.mask[index]) continue;
-        const from = Number(input.tokenAtomsToQueries.indices[index]) * 3;
-        for (let axis = 0; axis < 3; axis += 1) queriesRef[index * 3 + axis] = flatRef[from + axis];
-      }
-      for (let index = 0; index < keyRows; index += 1) {
-        if (!input.queriesToKeys.mask[index]) continue;
-        const from = Number(input.queriesToKeys.indices[index]) * 3;
-        for (let axis = 0; axis < 3; axis += 1) keysRef[index * 3 + axis] = queriesRef[from + axis];
-      }
-      const queriesRefBuffer = up("atom.q-ref", queriesRef);
-      const keysRefBuffer = up("atom.k-ref", keysRef);
+      // no reason to redo. Built once per fold - the key layout depends on the
+      // molecule and the query one on nothing else either.
+      let referenceLayouts;
+      const layouts = () => {
+        if (referenceLayouts !== undefined) return referenceLayouts;
+        const queriesRef = new Float32Array(queryRows * 3);
+        const keysRef = new Float32Array(keyRows * 3);
+        const flatRef = floats(input.refPos);
+        for (let index = 0; index < queryRows; index += 1) {
+          if (!input.tokenAtomsToQueries.mask[index]) continue;
+          const from = Number(input.tokenAtomsToQueries.indices[index]) * 3;
+          for (let axis = 0; axis < 3; axis += 1) {
+            queriesRef[index * 3 + axis] = flatRef[from + axis];
+          }
+        }
+        for (let index = 0; index < keyRows; index += 1) {
+          if (!input.queriesToKeys.mask[index]) continue;
+          const from = Number(input.queriesToKeys.indices[index]) * 3;
+          for (let axis = 0; axis < 3; axis += 1) {
+            keysRef[index * 3 + axis] = queriesRef[from + axis];
+          }
+        }
+        referenceLayouts = { queriesRef, keysRef };
+        return referenceLayouts;
+      };
+      const queriesRefBuffer = persistentUpload("atom.q-ref", () => layouts().queriesRef);
+      const keysRefBuffer = persistentUpload("atom.k-ref", () => layouts().keysRef);
 
       const trunkSingleProjected = persistent("atom.trunk-single-p", tokens * channels * 4);
       const trunkPairProjected = persistent("atom.trunk-pair-p",
@@ -1271,23 +1338,35 @@ export class Af3AtomEncoderGpu {
       const tokenAct = alloc("atom.token-act", tokens * perTokenChannels * 4,
         GPUBufferUsage.COPY_SRC);
 
+      // 🔴 READ BEFORE THE READBACKS ARE SIZED, NOT AFTER THE PASSES ARE
+      // ENCODED: it decides which of them exist at all.
+      const reuseStatic = options.reuseStatic;
       const readbacks = {
         tokenAct: keep(this.allocator.allocate("atom.rb-token", tokens * perTokenChannels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         skipConnection: keep(this.allocator.allocate("atom.rb-skip", queryRows * channels * 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        pairCond: keep(this.allocator.allocate("atom.rb-pair", pairRows * pairChannels * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        // 🔴 ALLOCATED ONLY WHEN THEY ARE COPIED INTO. The five below are the
+        // static ones; with `reuseStatic` nothing writes them, and
+        // `atom.rb-pair` alone is 12.8 MiB standing in a sampler's peak for
+        // the length of a call that never touches it.
+        pairCond: reuseStatic !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-pair", pairRows * pairChannels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
         // The decoder reads all four of these, so the head can chain the two
         // without a second encoder run.
-        queriesCond: keep(this.allocator.allocate("atom.rb-qcond", queryRows * channels * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        keysCond: keep(this.allocator.allocate("atom.rb-kcond", keyRows * channels * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        queriesMask: keep(this.allocator.allocate("atom.rb-qmask", queryRows * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
-        keysMask: keep(this.allocator.allocate("atom.rb-kmask", keyRows * 4,
-          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        queriesCond: reuseStatic !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-qcond", queryRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysCond: reuseStatic !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-kcond", keyRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        queriesMask: reuseStatic !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-qmask", queryRows * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysMask: reuseStatic !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-kmask", keyRows * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
       };
 
       const blockBuffers = weights.blocks.map((block, index) => ({
@@ -1373,8 +1452,6 @@ export class Af3AtomEncoderGpu {
       // them straight back to the decoder. `reuseStatic` is the head saying it
       // still has them. The GPU still COMPUTES them, because the attention
       // blocks below read the buffers; only the copy back is skipped.
-      const reuseStatic = options.reuseStatic;
-      void reuseStatic;
       if (reuseStatic === undefined) {
         encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
                                    pairRows * pairChannels * 4);
@@ -1405,6 +1482,17 @@ export class Af3AtomEncoderGpu {
         keysCond: reuseStatic?.keysCond ?? await read(readbacks.keysCond),
         queriesMask: reuseStatic?.queriesMask ?? await read(readbacks.queriesMask),
         keysMask: reuseStatic?.keysMask ?? await read(readbacks.keysMask),
+        // 🔴 THE SAME FIVE TENSORS, AS DEVICE BUFFERS. They are already on the
+        // GPU and the decoder's next act was to upload its own copy of them -
+        // 17 MiB of a 59-residue fold held twice, and read back across the bus
+        // once to make the second copy. Offered only when a staticCache keeps
+        // them alive past this call; without one they belong to the pooled
+        // allocator and are recycled the moment this returns.
+        deviceStatics: staticCache === undefined ? undefined : {
+          pairCond: pair.buffer, queriesCond: queriesCond.buffer,
+          keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
+          keysMask: keysMask.buffer,
+        },
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };

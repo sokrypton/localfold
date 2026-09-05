@@ -40,6 +40,46 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { createTransitionShader, packTransitionWeights, transitionRowTile }
   from "./transition-webgpu.js";
 
+/**
+ * The host-side packing this module does to its weights, kept per weight
+ * bundle rather than redone per call.
+ *
+ * 🔴 A SAMPLER CALLS THIS TWO HUNDRED TIMES DOWN ONE SCHEDULE, and none of
+ * `relativeColumnSums`, `packTransitionWeights` or the noise packing reads the
+ * noise level - they are functions of the WEIGHTS alone. Recomputing them per
+ * step copied four transition weight bundles into fresh Float32Arrays and ran
+ * a 128x128 column sum, once per step, for the identical answer. The key is
+ * the weights object's identity: a fold holds one bundle for its whole life,
+ * and a different bundle is a different model.
+ */
+const PREPARED_WEIGHTS = new WeakMap();
+
+function prepareWeights(weights) {
+  const cached = PREPARED_WEIGHTS.get(weights);
+  if (cached !== undefined) return cached;
+  const scale = weights.noiseEmbeddingInitialNormScale;
+  const projection = weights.noiseEmbeddingInitialProjection;
+  const noiseData = new Float32Array(scale.length + projection.length);
+  noiseData.set(scale, 0);
+  noiseData.set(projection, scale.length);
+  const prepared = {
+    columnSums: relativeColumnSums(weights.pairCondInitialNormScale,
+                                   weights.pairCondInitialProjection,
+                                   weights.pairChannels, weights.pairChannels),
+    noisePacked: {
+      data: noiseData,
+      offsets: { noiseEmbeddingInitialNormScale: 0,
+                 noiseEmbeddingInitialProjection: scale.length },
+    },
+    pairTransitions: weights.pairTransitions.map(
+      (w) => packTransitionWeights(asTransitionWeights(w))),
+    singleTransitions: weights.singleTransitions.map(
+      (w) => packTransitionWeights(asTransitionWeights(w))),
+  };
+  PREPARED_WEIGHTS.set(weights, prepared);
+  return prepared;
+}
+
 const GRID_WIDTH = 32_768;
 const SIGMA_DATA = 16.0;
 const MAX_RELATIVE_IDX = 32;
@@ -323,47 +363,44 @@ export class Af3DiffusionConditioningGpu {
     const targetFeatWidth = weights.targetFeatWidth;
     const noiseChannels = weights.fourierWeight.length;
 
+    // 🔴 THE ONLY THING HERE THAT READS THE NOISE LEVEL. Everything else this
+    // call needs from the weights is packed once per bundle; see
+    // prepareWeights.
     const embedded = noiseEmbedding(input.noiseLevel / SIGMA_DATA,
                                     weights.fourierWeight, weights.fourierBias);
-    const columnSums = relativeColumnSums(weights.pairCondInitialNormScale,
-                                          weights.pairCondInitialProjection,
-                                          pairChannels, pairChannels);
-
-    const noisePacked = (() => {
-      const scale = weights.noiseEmbeddingInitialNormScale;
-      const projection = weights.noiseEmbeddingInitialProjection;
-      const data = new Float32Array(scale.length + projection.length);
-      data.set(scale, 0);
-      data.set(projection, scale.length);
-      return { data, offsets: { noiseEmbeddingInitialNormScale: 0,
-                                noiseEmbeddingInitialProjection: scale.length } };
-    })();
+    const prepared = prepareWeights(weights);
+    const columnSums = prepared.columnSums;
+    const noisePacked = prepared.noisePacked;
+    // Hoisted above the uploads: with the pair handed back from a previous
+    // call, the whole pair track - its 1.8 MB trunk upload at 59 tokens, its
+    // three scratch tensors and its two transition weight bundles - is work
+    // this call must not do.
+    const reusePair = options.reusePair;
 
     const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
       + `:${noiseChannels}`;
     const compiled = {
-      pairInitial: await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
+      pairInitial: reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
       singleInitial: await this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
-      addPair: await this.pipelines.get(`${base}:add-pair`,
-        createAddShader(pairs * pairChannels)),
+      addPair: reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
       addSingle: await this.pipelines.get(`${base}:add-single`,
         createAddShader(tokens * seqChannels)),
     };
     // The four unconditioned transitions: the trunk's shader, two-pass variance.
     const transitionPipelines = { pair: [], single: [] };
     for (let index = 0; index < 2; index += 1) {
-      const pairOffsets = packTransitionWeights(asTransitionWeights(weights.pairTransitions[index])).offsets;
-      transitionPipelines.pair.push(await this.pipelines.get(`${base}:pair-transition:${index}`,
-        createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
-                               pairOffsets, 1e-5, "two-pass")));
-      const singleOffsets = packTransitionWeights(
-        asTransitionWeights(weights.singleTransitions[index])).offsets;
+      transitionPipelines.pair.push(reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:pair-transition:${index}`,
+            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
+                                   prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
       transitionPipelines.single.push(await this.pipelines.get(
         `${base}:single-transition:${index}`,
         createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2 },
-                               singleOffsets, 1e-5, "two-pass")));
+                               prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
     }
 
     const featureData = new Int32Array(5 * tokens);
@@ -378,36 +415,42 @@ export class Af3DiffusionConditioningGpu {
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     try {
       const up = (label, data) => keep(this.allocator.upload(label, data, storage));
-      const trunkPair = up("cond.trunk-pair", input.trunkPair);
+      // 🔴 EVERY LINE GUARDED BY `onlyIfNew` IS PAIR-TRACK WORK A REUSED PAIR
+      // MAKES POINTLESS - and `cond.trunk-pair` alone is tokens^2 x 128 floats
+      // written across the bus, 1.8 MB at 59 tokens and 34 MB at 256, once per
+      // sampler step, into a buffer no dispatch was going to read.
+      const onlyIfNew = (build) => (reusePair === undefined ? build() : undefined);
+      const trunkPair = onlyIfNew(() => up("cond.trunk-pair", input.trunkPair));
       const trunkSingle = up("cond.trunk-single", input.trunkSingle);
       const targetFeat = up("cond.target", input.targetFeat);
-      const features = up("cond.features", featureData);
-      const pairScale = up("cond.pair-scale", weights.pairCondInitialNormScale);
-      const pairProjection = up("cond.pair-projection", weights.pairCondInitialProjection);
-      const sums = up("cond.column-sums", columnSums);
+      const features = onlyIfNew(() => up("cond.features", featureData));
+      const pairScale = onlyIfNew(() => up("cond.pair-scale", weights.pairCondInitialNormScale));
+      const pairProjection = onlyIfNew(
+        () => up("cond.pair-projection", weights.pairCondInitialProjection));
+      const sums = onlyIfNew(() => up("cond.column-sums", columnSums));
       const singleScale = up("cond.single-scale", weights.singleCondInitialNormScale);
       const singleProjection = up("cond.single-projection", weights.singleCondInitialProjection);
       const noise = up("cond.noise", embedded);
       const noiseWeights = up("cond.noise-weights", noisePacked.data);
 
-      const pair = keep(this.allocator.allocate("cond.pair", pairs * pairChannels * 4,
-        storage | GPUBufferUsage.COPY_SRC));
+      const pair = onlyIfNew(() => keep(this.allocator.allocate("cond.pair",
+        pairs * pairChannels * 4, storage | GPUBufferUsage.COPY_SRC)));
       const single = keep(this.allocator.allocate("cond.single", tokens * seqChannels * 4,
         storage | GPUBufferUsage.COPY_SRC));
-      const pairScratch = keep(this.allocator.allocate("cond.pair-scratch",
-        pairs * pairChannels * 4, storage));
+      const pairScratch = onlyIfNew(() => keep(this.allocator.allocate("cond.pair-scratch",
+        pairs * pairChannels * 4, storage)));
       const singleScratch = keep(this.allocator.allocate("cond.single-scratch",
         tokens * seqChannels * 4, storage));
-      const readPair = keep(this.allocator.allocate("cond.rb-pair", pairs * pairChannels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      const readPair = onlyIfNew(() => keep(this.allocator.allocate("cond.rb-pair",
+        pairs * pairChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
       const readSingle = keep(this.allocator.allocate("cond.rb-single", tokens * seqChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const transitionWeights = {
-        pair: weights.pairTransitions.map((w, index) =>
-          up(`cond.pair-transition-w${index}`, packTransitionWeights(asTransitionWeights(w)).data)),
-        single: weights.singleTransitions.map((w, index) =>
-          up(`cond.single-transition-w${index}`, packTransitionWeights(asTransitionWeights(w)).data)),
+        pair: prepared.pairTransitions.map((packed, index) =>
+          onlyIfNew(() => up(`cond.pair-transition-w${index}`, packed.data))),
+        single: prepared.singleTransitions.map((packed, index) =>
+          up(`cond.single-transition-w${index}`, packed.data)),
       };
 
       this.device.pushErrorScope("validation");
@@ -432,8 +475,9 @@ export class Af3DiffusionConditioningGpu {
       // hundred times down one schedule and got the identical pair every time.
       // `reusePair` hands back the one a previous call already computed and
       // skips three of the five pipelines here; the head owns the caching,
-      // because only the head knows the trunk has not changed underneath it.
-      const reusePair = options.reusePair;
+      // because only the head knows the trunk has not changed underneath it -
+      // and it is read at the top of this method, because the uploads and the
+      // allocations above it are pair-track work too.
       const pairLinear = spread(Math.ceil(pairs / 64));
       if (reusePair === undefined) {
         run("pair-initial", compiled.pairInitial,

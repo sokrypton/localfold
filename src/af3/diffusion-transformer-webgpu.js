@@ -34,6 +34,7 @@ import { concatenateAs } from "../runtime/float16.js";
  * src/triangle/shaders.js for why that cannot be a global.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
 import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
@@ -839,6 +840,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 export class Af3DiffusionTransformerGpu {
   /**
+   * The normalised pair conditioning, kept across calls.
+   *
+   * 🔴 NEITHER THE PAIR CONDITIONING NOR ITS LAYERNORM READS THE NOISE LEVEL.
+   * The stack's twenty-four blocks all read one normalised pair tensor, built
+   * by a single pass at the top of the call - and a sampler was uploading the
+   * unnormalised tokens^2 x 128 tensor and running that pass again on every
+   * step, for the identical bytes. At 59 tokens that is 1.8 MB across the bus
+   * and a 3481 x 128 layer norm, two hundred times; at 256 tokens, 34 MB.
+   *
+   * Keyed on the array's identity, which is the same question the diffusion
+   * head asks of its own pair cache: a new fold brings a new array. The buffer
+   * lives outside the pooled allocator, because a pooled one is recycled when
+   * the call that took it ends.
+   */
+  #pairNorm;
+
+  /**
    * @param {{residentWeights?: boolean}} [options] whether the 24 blocks' packed
    *   weights stay on the device between calls. See the note at the upload; a
    *   budget refusal turns this off on its own.
@@ -848,6 +866,14 @@ export class Af3DiffusionTransformerGpu {
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
     this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
+  }
+
+  /** Give back the normalised pair tensor. Callers that keep an instance own this. */
+  dispose() {
+    if (this.#pairNorm === undefined) return;
+    this.#pairNorm.buffer.destroy();
+    noteDestroy(this.device, this.#pairNorm.bytes, "difftx.pair-norm");
+    this.#pairNorm = undefined;
   }
 
   /**
@@ -1010,12 +1036,35 @@ export class Af3DiffusionTransformerGpu {
       const actBuffer = keep(this.allocator.upload("difftx.act", Float32Array.from(act),
         storage | GPUBufferUsage.COPY_SRC));
       const condBuffer = keep(this.allocator.upload("difftx.cond", cond, storage));
-      const pairBuffer = keep(this.allocator.upload("difftx.pair", pairCond, storage));
       const maskBuffer = keep(this.allocator.upload("difftx.mask", mask, storage));
-      const pairScale = keep(this.allocator.upload("difftx.pair-scale",
-        weights.pairInputLayerNormScale, storage));
-      const normalized = keep(this.allocator.allocate("difftx.pair-norm",
-        pairs * pairChannels * 4, storage));
+      // See #pairNorm: everything on this line and the two below it is the
+      // trunk's, not the step's, and is skipped outright when the caller keeps
+      // this instance across a schedule.
+      const normBytes = pairs * pairChannels * 4;
+      const buildPairNorm = this.#pairNorm?.pairCond !== pairCond
+        || this.#pairNorm?.bytes !== normBytes;
+      if (buildPairNorm) {
+        this.dispose();
+        noteAllocation(this.device, "difftx.pair-norm", normBytes);
+        // 🔴 `pairCond` IS NOT SET UNTIL THE PASS THAT FILLS THIS HAS BEEN
+        // SUBMITTED. An allocation between here and there can refuse on
+        // budget, and run() retries the whole call - which would find a cache
+        // that matches and skip the norm, handing twenty-four blocks an
+        // uninitialised buffer.
+        this.#pairNorm = {
+          pairCond: undefined, bytes: normBytes,
+          buffer: this.device.createBuffer({
+            label: "difftx.pair-norm", size: normBytes, usage: storage,
+          }),
+        };
+      }
+      const normalized = { buffer: this.#pairNorm.buffer };
+      const pairBuffer = buildPairNorm
+        ? keep(this.allocator.upload("difftx.pair", pairCond, storage)) : undefined;
+      const pairScale = buildPairNorm
+        ? keep(this.allocator.upload("difftx.pair-scale",
+                                     weights.pairInputLayerNormScale, storage))
+        : undefined;
       const logits = keep(this.allocator.allocate("difftx.logits", heads * pairs * 4, storage));
       // The AdaLN pass hands the projection its input through this.
       const xBuffer = keep(this.allocator.allocate("difftx.x", tokens * channels * 4,
@@ -1039,8 +1088,9 @@ export class Af3DiffusionTransformerGpu {
       // block, twenty-four blocks, every denoiser call - and a denoiser call
       // happens up to 200 times a fold.
       const validation = new DeferredValidation(this.device, "diffusion transformer");
-      // The shared pair LayerNorm, once for the whole stack.
-      {
+      // The shared pair LayerNorm, once for the whole stack - and once for the
+      // whole SCHEDULE, since nothing it reads moves with the noise level.
+      if (buildPairNorm) {
         validation.begin();
         const encoder = this.device.createCommandEncoder({ label: "difftx.pair-norm" });
         const pass = encoder.beginComputePass({ label: "pair-norm" });
@@ -1056,6 +1106,7 @@ export class Af3DiffusionTransformerGpu {
         pass.end();
         this.device.queue.submit([encoder.finish()]);
         validation.end("pair layer norm");
+        this.#pairNorm.pairCond = pairCond;
       }
 
       // 🔴 ONE ENCODER AND ONE SUBMIT FOR ALL TWENTY-FOUR BLOCKS. Every block

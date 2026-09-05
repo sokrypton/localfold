@@ -156,6 +156,24 @@ export class Af3DiffusionHeadGpu {
   #encoderBuffers = {};
 
   /**
+   * ...and the decoder's, which are the same molecule seen from the other end:
+   * its gathers, the encoder's conditioning and masks, and the pair logits it
+   * derives from them. Held and dropped with the encoder's, because both are
+   * invalidated by exactly one thing - a new trunk, which is a new fold.
+   */
+  #decoderBuffers = {};
+
+  /**
+   * The transformer, kept rather than rebuilt per call.
+   *
+   * 🔴 IT HOLDS THE NORMALISED PAIR CONDITIONING, and that is the point: a
+   * fresh instance per step has nothing to remember, so the stack re-uploaded
+   * and re-normalised a tokens^2 x 128 tensor on every one of them. See
+   * Af3DiffusionTransformerGpu's #pairNorm.
+   */
+  #transformer;
+
+  /**
    * Release what this head is holding on the device.
    *
    * 🔴 THE STATIC CACHE OUTLIVES A CALL BY DESIGN AND MUST NOT OUTLIVE THE
@@ -166,9 +184,13 @@ export class Af3DiffusionHeadGpu {
    */
   dispose() {
     for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
+    for (const buffer of Object.values(this.#decoderBuffers)) buffer.destroy();
     this.#encoderBuffers = {};
+    this.#decoderBuffers = {};
     this.#encoderStatic = undefined;
     this.#conditioningPair = undefined;
+    this.#transformer?.dispose();
+    this.#transformer = undefined;
   }
 
   constructor(device, options = {}) {
@@ -270,7 +292,9 @@ export class Af3DiffusionHeadGpu {
       // or the next call reuses the previous molecule's conditioning.
       this.#encoderStatic = undefined;
       for (const buffer of Object.values(this.#encoderBuffers)) buffer.destroy();
+      for (const buffer of Object.values(this.#decoderBuffers)) buffer.destroy();
       this.#encoderBuffers = {};
+      this.#decoderBuffers = {};
     }
     this.#conditioningPair = { trunkPair: input.trunkPair, tokens, pair: cond.pair };
 
@@ -324,8 +348,9 @@ export class Af3DiffusionHeadGpu {
     const act = Float32Array.from(encoded.tokenAct);
     for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
 
+    this.#transformer ??= new Af3DiffusionTransformerGpu(this.device);
     const transformed = await stage("transformer", () =>
-      new Af3DiffusionTransformerGpu(this.device).run(
+      this.#transformer.run(
         act, cond.single, cond.pair, input.seqMask, tokens,
         this.options?.weightPrecision === undefined
           ? weights.transformer
@@ -340,7 +365,8 @@ export class Af3DiffusionHeadGpu {
       weights.outputNormScale, null));
 
     const decoded = await stage("atom-decoder", () =>
-      new Af3AtomDecoderGpu(this.device).run(normalised, encoded, input, weights.decoder));
+      new Af3AtomDecoderGpu(this.device).run(normalised, encoded, input, weights.decoder,
+                                             { staticCache: this.#decoderBuffers }));
 
     // 🔴 A BLEND, NOT A PREDICTION.
     const output = new Float32Array(input.positionsNoisy.length);

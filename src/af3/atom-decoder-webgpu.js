@@ -21,9 +21,13 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import {
   createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
 } from "./atom-encoder-webgpu.js";
+
+/** Which labels in a caller's `staticCache` already hold their contents. */
+const STATIC_UPLOADS = new WeakMap();
 
 const GRID_WIDTH = 32_768;
 
@@ -183,7 +187,7 @@ export class Af3AtomDecoderGpu {
    * @param {object} input shape and the gathers
    * @param {object} weights the decoder's own, plus `blocks`
    */
-  async run(tokenAct, encoded, input, weights) {
+  async run(tokenAct, encoded, input, weights, options = {}) {
     const { tokens, dense, subsets, queries, keys } = input.shape;
     const channels = weights.channels;
     const pairChannels = weights.pairChannels;
@@ -233,29 +237,89 @@ export class Af3AtomDecoderGpu {
       keep(this.allocator.allocate(label, bytes, storage | extra));
     const ints = (source) => Int32Array.from(source, (v) => Number(v));
 
-    try {
-      const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
-      let at = 0;
-      const place = (source) => { gathers.set(ints(source), at); at += source.length; };
-      place(input.tokenAtomsToQueries.indices);
-      place(input.tokenAtomsToQueries.mask);
-      place(input.tokensToQueries.indices);
-      place(input.tokensToQueries.mask);
-      place(input.queriesToKeys.indices);
-      place(input.queriesToKeys.mask);
-      place(input.tokensToKeys.indices);
-      place(input.tokensToKeys.mask);
-      place(input.queriesToTokenAtoms.indices);
-      place(input.queriesToTokenAtoms.mask);
-      const gatherBuffer = up("dec.gathers", gathers);
+    // 🔴 A SAMPLER STEP CHANGES TWO OF THIS MODULE'S INPUTS AND RE-UPLOADED
+    // ALL SEVEN. `tokenAct` and the encoder's skip connection move with the
+    // noise; the ten gathers, the query and key conditioning and masks, and
+    // the encoder's pair conditioning are the MOLECULE, and the head already
+    // holds them on the host across the whole schedule. They were rebuilt and
+    // written across the bus once per step anyway.
+    //
+    // 🔴 AND `pair-logits` IS A FUNCTION OF THEM, so it is not dispatched
+    // either. It reads the pair conditioning and this module's own weights and
+    // nothing else, and at 45 subsets it writes 2.2 million floats - the
+    // single most expensive pass in the decoder, run two hundred times for one
+    // answer.
+    const staticCache = options.staticCache;
+    let buildStatic = staticCache === undefined;
+    const uploaded = staticCache === undefined ? undefined
+      : (STATIC_UPLOADS.get(staticCache) ?? new Set());
+    if (staticCache !== undefined) STATIC_UPLOADS.set(staticCache, uploaded);
+    const cached = (label, size, extra) => {
+      const found = staticCache[label];
+      if (found !== undefined && found.size === size) return found;
+      if (found !== undefined) { found.destroy(); noteDestroy(this.device, found.size, label); }
+      buildStatic = true;
+      uploaded.delete(label);
+      noteAllocation(this.device, label, size);
+      const buffer = this.device.createBuffer({
+        label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
+      });
+      staticCache[label] = buffer;
+      return buffer;
+    };
+    const persistent = (label, bytes, extra = 0) => {
+      if (staticCache === undefined) return alloc(label, bytes, extra);
+      return { buffer: cached(label, Math.ceil(bytes / 4) * 4, extra) };
+    };
+    const persistentUpload = (label, build, extra = 0) => {
+      if (staticCache === undefined) return up(label, build());
+      if (staticCache[label] !== undefined && uploaded.has(label)) {
+        return { buffer: staticCache[label] };
+      }
+      const data = build();
+      const buffer = cached(label, Math.ceil(data.byteLength / 4) * 4, extra);
+      this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
+      uploaded.add(label);
+      return { buffer };
+    };
 
+    try {
+      const gatherBuffer = persistentUpload("dec.gathers", () => {
+        const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
+        let at = 0;
+        const place = (source) => { gathers.set(ints(source), at); at += source.length; };
+        place(input.tokenAtomsToQueries.indices);
+        place(input.tokenAtomsToQueries.mask);
+        place(input.tokensToQueries.indices);
+        place(input.tokensToQueries.mask);
+        place(input.queriesToKeys.indices);
+        place(input.queriesToKeys.mask);
+        place(input.tokensToKeys.indices);
+        place(input.tokensToKeys.mask);
+        place(input.queriesToTokenAtoms.indices);
+        place(input.queriesToTokenAtoms.mask);
+        return gathers;
+      });
+
+      // The two that move with the noise level.
       const tokenActBuffer = up("dec.token-act", tokenAct);
       const skip = up("dec.skip", encoded.skipConnection);
-      const queriesMask = up("dec.q-mask", encoded.queriesMask);
-      const keysMask = up("dec.k-mask", encoded.keysMask);
-      const queriesCond = up("dec.q-cond", encoded.queriesCond);
-      const keysCond = up("dec.k-cond", encoded.keysCond);
-      const pairCond = up("dec.pair", encoded.pairCond);
+      // 🔴 THE ENCODER'S OWN BUFFERS WHEN IT KEPT THEM, A COPY WHEN IT DID
+      // NOT. These five are the molecule seen through the atom encoder, and
+      // where the head holds both modules' static caches they are the SAME
+      // TENSORS - so the decoder binds them rather than uploading a second
+      // 17 MiB of them at 59 residues. `encoded.deviceStatics` is offered only
+      // by an encoder run that was given a cache to keep them in.
+      const shared = encoded.deviceStatics;
+      const fromEncoder = (label, buffer, build) =>
+        (buffer === undefined ? persistentUpload(label, build) : { buffer });
+      const queriesMask = fromEncoder("dec.q-mask", shared?.queriesMask,
+                                      () => encoded.queriesMask);
+      const keysMask = fromEncoder("dec.k-mask", shared?.keysMask, () => encoded.keysMask);
+      const queriesCond = fromEncoder("dec.q-cond", shared?.queriesCond,
+                                      () => encoded.queriesCond);
+      const keysCond = fromEncoder("dec.k-cond", shared?.keysCond, () => encoded.keysCond);
+      const pairCond = fromEncoder("dec.pair", shared?.pairCond, () => encoded.pairCond);
       const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
         "dec.pair-weights", () => pairPacked.data) };
       const blockBuffers = weights.blocks.map((block, index) => ({
@@ -264,7 +328,7 @@ export class Af3AtomDecoderGpu {
       }));
 
       const act = alloc("dec.act", queryRows * channels * 4);
-      const logits = alloc("dec.logits",
+      const logits = persistent("dec.logits",
         weights.blocks.length * subsets * heads * queries * keys * 4);
       const q = alloc("dec.q", queryRows * width * 4);
       const k = alloc("dec.k", keyRows * width * 4);
@@ -292,8 +356,10 @@ export class Af3AtomDecoderGpu {
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
       const lin = (count) => spread(Math.ceil(count / 64));
 
-      const pr = lin(pairRows);
-      run("pair-logits", compiled.pairLogits, [pairCond, pairWeights, logits], pr[0], pr[1]);
+      if (buildStatic) {
+        const pr = lin(pairRows);
+        run("pair-logits", compiled.pairLogits, [pairCond, pairWeights, logits], pr[0], pr[1]);
+      }
       const qr = lin(queryRows);
       run("start", compiled.start,
           [tokenActBuffer, skip, queriesMask, gatherBuffer, pairWeights, act], qr[0], qr[1]);
