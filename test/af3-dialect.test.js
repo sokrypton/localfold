@@ -19,7 +19,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  ALPHAFOLD3, DIALECTS, OPENBIND, dialectFor,
+  ALPHAFOLD3, DIALECTS, OPENBIND0, dialectFor,
   singleCondPadding, singleCondPaddingWgsl, singleCondSource,
 } from "../src/af3/dialect.js";
 import { af3Dialect } from "../src/af3/weights.js";
@@ -36,18 +36,18 @@ const LIGAND = {
 };
 
 describe("the dialect table", () => {
-  it("keeps OpenBind on AF3's pair-bias convention, which OpenFold3 changed", () => {
+  it("keeps OpenBind-0 on AF3's pair-bias convention, which OpenFold3 changed", () => {
     // 🔴 THE ONE ASSERTION MOST WORTH HAVING. `swapTransposedBias` is threaded
     // through the pairformer, the MSA stack, the template embedder and the
     // confidence head; upstream's TRANSPOSED_COLUMN_PAIR_BIAS lists openfold3
     // and deliberately not openbind. Turning it on here transposes every
     // column attention's bias against weights that do not want it.
-    assert.equal(OPENBIND.swapTransposedBias, false);
+    assert.equal(OPENBIND0.swapTransposedBias, false);
     assert.equal(ALPHAFOLD3.swapTransposedBias, false);
   });
 
-  it("turns on exactly the three branches OpenBind needs", () => {
-    assert.deepEqual({ ...OPENBIND }, {
+  it("turns on exactly the three branches OpenBind-0 needs", () => {
+    assert.deepEqual({ ...OPENBIND0 }, {
       swapTransposedBias: false,
       symmetriseBonds: true,
       maskPaddedKeys: true,
@@ -76,13 +76,19 @@ describe("the dialect table", () => {
     assert.throws(() => dialectFor("openfold3"), /no AF3 dialect/);
     assert.throws(() => dialectFor(undefined), /no AF3 dialect/);
     assert.equal(dialectFor("alphafold3"), ALPHAFOLD3);
-    assert.equal(dialectFor("openbind"), OPENBIND);
+    assert.equal(dialectFor("openbind0"), OPENBIND0);
+    // 🔴 A LATER RELEASE MUST NOT RESOLVE. The whole reason the number is in
+    // the name is that a bare `openbind` would answer for OpenBind-1 too.
+    assert.throws(() => dialectFor("openbind1"), /no AF3 dialect/);
   });
 });
 
 describe("a bundle names its own graph", () => {
   it("reads the dialect out of the manifest", () => {
-    assert.equal(af3Dialect({ manifest: { model: { name: "openbind" } } }), OPENBIND);
+    assert.equal(af3Dialect({ manifest: { model: { name: "openbind0" } } }), OPENBIND0);
+    // Upstream publishes the blob as `openbind`, and bundles exported before
+    // the rename say so; the alias keeps those loading.
+    assert.equal(af3Dialect({ manifest: { model: { name: "openbind" } } }), OPENBIND0);
     assert.equal(af3Dialect({ manifest: { model: { name: "alphafold3" } } }), ALPHAFOLD3);
   });
 
@@ -106,11 +112,11 @@ describe("the unknown-DNA columns of the diffusion single conditioning", () => {
     // [trunk single 384 | restype 31 | profile 31 | deletion mean 1 | atoms 384]
     // becomes 833 rather than 831, and the two inserted columns sit at the end
     // of the restype block and the end of the profile block.
-    assert.deepEqual(singleCondPadding(OPENBIND, 384), [415, 447]);
+    assert.deepEqual(singleCondPadding(OPENBIND0, 384), [415, 447]);
   });
 
   it("maps every padded column back to the source it reads", () => {
-    const padding = singleCondPadding(OPENBIND, 384);
+    const padding = singleCondPadding(OPENBIND0, 384);
     // The trunk single block is untouched...
     assert.equal(singleCondSource(padding, 0), 0);
     assert.equal(singleCondSource(padding, 383), 383);
@@ -132,7 +138,7 @@ describe("the unknown-DNA columns of the diffusion single conditioning", () => {
     // converter does - splice two zeros in - and assert singleCondSource
     // reproduces it from the source row. A sign error in the shift shows up
     // here and nowhere in the spot checks above.
-    const padding = singleCondPadding(OPENBIND, 384);
+    const padding = singleCondPadding(OPENBIND0, 384);
     const source = Float32Array.from({ length: 831 }, (_, i) => i + 1);
     const spliced = [...source];
     for (const at of padding) spliced.splice(at, 0, 0);
@@ -147,7 +153,7 @@ describe("the unknown-DNA columns of the diffusion single conditioning", () => {
   it("generates WGSL with a guard and a shift for each inserted column", () => {
     // The shader's `feature()` is generated from the same list the reference
     // walks; this is what says the generator did not drop one.
-    const wgsl = singleCondPaddingWgsl(singleCondPadding(OPENBIND, 384));
+    const wgsl = singleCondPaddingWgsl(singleCondPadding(OPENBIND0, 384));
     assert.equal((wgsl.match(/return 0\.0;/g) ?? []).length, 2);
     assert.equal((wgsl.match(/source -= 1u;/g) ?? []).length, 2);
     assert.match(wgsl, /if \(index == 415u\)/);
@@ -182,12 +188,12 @@ describe("the token bond matrix", () => {
     assert.equal(set, LIGAND.bonds.length);
   });
 
-  it("is symmetric under OpenBind, which is what its weights were trained on", () => {
+  it("is symmetric under OpenBind-0, which is what its weights were trained on", () => {
     // 🔴 NOT COSMETIC. Upstream measures a ring ligand folded through the wrong
     // convention coming apart - ATP's ribose C-C at ~2.0 A against ~1.5 - and
     // this matrix goes through a learned linear straight into the pair
     // representation.
-    const { at, set } = ligandMatrix(OPENBIND.symmetriseBonds);
+    const { at, set } = ligandMatrix(OPENBIND0.symmetriseBonds);
     assert.equal(at(0, 1), 1);
     assert.equal(at(1, 0), 1);
     assert.equal(set, LIGAND.bonds.length * 2);

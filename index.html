@@ -157,13 +157,13 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      never choose AF3 - so the newest model was the one you had
                      to know to ask for. It also gave the page a state where
                      what would run was not written anywhere on it. -->
-                <select id="model-family" title="Which model to fold with. AF3 is DeepMind's, under their own terms; OpenBind is OpenFold3 v0.5.0, Apache 2.0.">
+                <select id="model-family" title="Which model to fold with. AF3 is DeepMind's, under their own terms; OpenBind-0 is OpenFold3 v0.5.0, Apache 2.0.">
                   <option value="af3" selected>AF3</option>
-                  <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind runs
+                  <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind-0 runs
                        through foldWithAf3 exactly as AF3 does; what differs is
                        the bundle and the three dialect branches its weights
                        were trained with. See src/af3/dialect.js. -->
-                  <option value="openbind">OpenBind</option>
+                  <option value="openbind0">OpenBind-0</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                 </select>
@@ -987,7 +987,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
           commercial use and carry a prohibited-use policy.
         </p>
         <p class="terms-body">
-          <strong>OpenBind</strong> runs the same architecture under Apache 2.0.
+          <strong>OpenBind-0</strong> runs the same architecture under Apache 2.0.
           It is a different model.
         </p>
         <p class="terms-links">
@@ -997,12 +997,18 @@ AI Context: STANDALONE WEB APP ENTRY POINT
           <a href="https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_PROHIBITED_USE_POLICY.md"
              target="_blank" rel="noopener noreferrer">prohibited use policy</a>
           &middot;
-          <a href="https://github.com/aqlaboratory/openfold-3"
-             target="_blank" rel="noopener noreferrer">OpenBind</a>
+          <!-- 🔴 THE ANNOUNCEMENT, NOT THE REPOSITORY. Somebody reading this
+               dialog is deciding which model to fold with, and the release
+               post says what OpenBind is; the source tree says how to build
+               it. It also names the release we actually ported -
+               openfold-3/releases/tag/v0.5.0 - which is the distinction
+               src/af3/dialect.js exists to keep straight. -->
+          <a href="https://openbind.uk/news/blog-openbind-0-advancing-open-molecular-structure-prediction/"
+             target="_blank" rel="noopener noreferrer">about OpenBind-0</a>
         </p>
         <div class="terms-actions">
-          <button type="submit" value="openbind" class="terms-button terms-button-primary"
-                  id="model-terms-switch">Use OpenBind instead</button>
+          <button type="submit" value="openbind0" class="terms-button terms-button-primary"
+                  id="model-terms-switch">Use OpenBind-0 instead</button>
           <!-- 🔴 A FILLED BUTTON TOO, because an outline beside a filled one
                reads as a cancel rather than as the other half of a choice -
                and this dialog's whole point is that there are two real

@@ -29,7 +29,7 @@
  * fails on its own, which needs no ninth storage binding and no shader change.
  * Those are the same model only if the sentinel can never collide with a real
  * reference space, so both arms run and both are held to the envelope. The
- * openbind arm also has to DIFFER from the stock one on this batch or it is
+ * openbind0 arm also has to DIFFER from the stock one on this batch or it is
  * checking nothing - two thirds of the key slots here are padding, so it does.
  *
  * 🔴 AND IT DIFFERS IN ONE OUTPUT, NOT THREE, WHICH IS WORTH KNOWING. Measured
@@ -50,7 +50,7 @@
 import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
-import { ALPHAFOLD3, OPENBIND } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3, OPENBIND0 } from "../../src/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
@@ -187,7 +187,7 @@ export async function main(device, args) {
   const results = {};
   const references = {};
   let failed = 0;
-  for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind", OPENBIND]]) {
+  for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind0", OPENBIND0]]) {
     const arm = { ...input, dialect };
     const expected = atomCrossAttentionEncoder(arm, weights);
     const gpu = await new Af3AtomEncoderGpu(device).run(arm, weights);
@@ -223,7 +223,7 @@ export async function main(device, args) {
   const separation = {};
   for (const name of ["tokenAct", "skipConnection", "pairCond"]) {
     separation[name] = relativeRms(references.openbind[name], references.alphafold3[name]);
-    console.log(`openbind vs alphafold3\t${name}`
+    console.log(`openbind0 vs alphafold3\t${name}`
       + `\trelRMS ${separation[name].toExponential(2)}`);
   }
   const moved = Math.max(...Object.values(separation));

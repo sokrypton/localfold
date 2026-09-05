@@ -128,7 +128,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence", default=DEFAULT)
     parser.add_argument("--model", default="monomer",
-                        help="the value of the #model select: monomer, multimer, af3 or openbind")
+                        help="the value of the #model select: monomer, multimer, af3 or openbind0")
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--url", default=None,

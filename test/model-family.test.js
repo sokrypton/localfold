@@ -4,8 +4,8 @@
  * 🔴 TWO BUNDLES BUILD AlphaFold 3's GRAPH NOW, and `=== "af3"` stopped meaning
  * what its call sites meant by it the moment the second arrived. Three of them
  * were CAPABILITY checks - ligands, modified residues, nucleic chains - and
- * every one refused those inputs under OpenBind with a message naming a
- * capability the model actually has, because OpenBind runs the same featuriser
+ * every one refused those inputs under OpenBind-0-0 with a message naming a
+ * capability the model actually has, because OpenBind-0 runs the same featuriser
  * and the same token layout. It is the parameters that differ, not the graph.
  *
  * These are read out of the source rather than run, because the alternative is
@@ -24,7 +24,7 @@ const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 
 describe("the AlphaFold 3 families", () => {
   it("lists every bundle that builds that graph, and only those", () => {
-    assert.deepEqual([...AF3_FAMILIES].sort(), ["af3", "openbind"]);
+    assert.deepEqual([...AF3_FAMILIES].sort(), ["af3", "openbind0"]);
     for (const family of AF3_FAMILIES) {
       assert.ok(family in MODEL_BUNDLES, `${family} has no bundle`);
     }
@@ -41,7 +41,7 @@ describe("the AlphaFold 3 families", () => {
 describe("what needs an AlphaFold 3 graph", () => {
   // 🔴 THE FAULT THIS PINS. `choice !== "af3"` here read as "is this DeepMind's
   // checkpoint", and the reported symptom was
-  // "Ligands need AlphaFold 3; the model is set to openbind" - a refusal to
+  // "Ligands need AlphaFold 3; the model is set to openbind0" - a refusal to
   // fold something the selected model handles perfectly well.
   for (const what of ["ligandCount", "modificationCount", "nucleicCount"]) {
     it(`tests the family, not the name, for ${what}`, () => {
@@ -65,7 +65,7 @@ describe("the trunk cache", () => {
     // pair and single representation, and those have the same shapes whichever
     // parameters produced them - so with the family missing from the key, a
     // fold with OpenBind followed by a fold with AlphaFold 3 on the same
-    // sequence handed AF3's diffusion head OpenBind's trunk. Reproduced in the
+    // sequence handed AF3's diffusion head OpenBind-0's trunk. Reproduced in the
     // page: 32 residues came back at pLDDT 41.5 with the status line reading
     // "trunk reused", against 83.3 once the key was fixed. Nothing errors; the
     // chain simply comes apart.
@@ -79,7 +79,7 @@ describe("the trunk cache", () => {
 });
 
 describe("?model= in the URL", () => {
-  it("does not resolve of3 to openbind", () => {
+  it("does not resolve of3 to openbind0", () => {
     // 🔴 THEY ARE DIFFERENT MODELS. OpenFold3's preview-2 and its v0.5.0
     // release differ in forward conventions - see src/af3/dialect.js - so
     // quietly accepting one name for the other hands somebody a model they did
@@ -87,8 +87,10 @@ describe("?model= in the URL", () => {
     const aliases = app.match(/const MODEL_ALIASES = \{([^}]*)\}/s);
     assert.ok(aliases !== null, "MODEL_ALIASES is not where this test expects");
     assert.doesNotMatch(aliases[1], /\bof3\b/);
+    // `openbind` resolves to this release rather than standing for the next.
+    assert.match(aliases[1], /openbind:\s*"openbind0"/);
     assert.doesNotMatch(aliases[1], /openfold3/);
-    assert.match(aliases[1], /ob:\s*"openbind"/);
+    assert.match(aliases[1], /ob:\s*"openbind0"/);
   });
 
   it("cannot accept the licence terms on somebody's behalf", () => {
@@ -103,7 +105,7 @@ describe("?model= in the URL", () => {
 
 describe("the licence dialog", () => {
   it("offers a way past AlphaFold 3's terms, not only a way through them", () => {
-    assert.match(page, /id="model-terms-switch"[^>]*>|value="openbind"/);
+    assert.match(page, /id="model-terms-switch"[^>]*>|value="openbind0"/);
     assert.match(page, /id="model-terms-accept"/);
   });
 

@@ -47,7 +47,7 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
 import { ALPHAFOLD3 } from "./dialect.js";
 
 export const DIALECT = ALPHAFOLD3;
-export { ALPHAFOLD3, OPENBIND, DIALECTS, dialectFor } from "./dialect.js";
+export { ALPHAFOLD3, OPENBIND0, DIALECTS, dialectFor } from "./dialect.js";
 
 export const THREE_LETTER = {
   A: "ALA", R: "ARG", N: "ASN", D: "ASP", C: "CYS", Q: "GLN", E: "GLU", G: "GLY",

@@ -954,6 +954,17 @@ is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
 
 ## A second set of weights: the dialect
 
+🔴 **THE MODEL IS OpenBind-0, AND THE NUMBER IS PART OF THE NAME.** Upstream's
+announcement (openbind.uk, 2026-08-21) calls it that and points at
+`aqlaboratory/openfold-3` releases/tag/v0.5.0, which is the release ported
+here. Their registry's bare `openbind` is a name a LATER release would answer
+to as well - which is exactly how `openfold3` came to mean two models with
+different forward conventions and sent this port reading notes about the wrong
+one. So the family, the dialect, the bundle and the manifest's `model.name` all
+say `openbind0`, and `dialectFor("openbind1")` RAISES rather than resolving.
+`openbind` stays as an alias in two places only - `DIALECT_ALIASES`, because
+upstream publishes the blob under that name, and `MODEL_ALIASES`, for `?model=`.
+
 🔴 **OPENBIND IS NOT OPENFOLD3, AND READING THE OF3 PORTING NOTES WHOLESALE GETS
 TWO THINGS BACKWARDS.** `../alphafold3/OF3_AF3_PORTING_NOTES.md` describes
 OpenFold3 **preview-2** (`of3-p2-155k.pt`). OpenBind is OpenFold3 **v0.5.0**, a

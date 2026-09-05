@@ -61,14 +61,14 @@ BUNDLES = {
         "model": "alphafold3",
     },
     # ...and the Apache-2.0 one, which is the same graph and the same 265 MiB.
-    # OpenBind is OpenFold3's v0.5.0 release; `--model openbind` exports it and
+    # OpenBind-0 is OpenFold3's v0.5.0 release; `--model openbind` exports it and
     # the manifest's model.name carries the dialect into the page, so the two
     # bundles cannot be confused for one another at load time. Nothing gates
     # this one: its weights carry no prohibited-use policy.
-    "openbind": {
-        "export": "model-openbind-int5",
-        "module": "src/reference/manifests/openbind.js",
-        "model": "openbind",
+    "openbind0": {
+        "export": "model-openbind0-int5",
+        "module": "src/reference/manifests/openbind0.js",
+        "model": "openbind0",
     },
 }
 

@@ -18,7 +18,7 @@ Four things are checked, and the third and fourth are the ones worth having:
 
   * pressing Fold with no stored acceptance opens the dialog;
   * accepting stores it, and a second press does NOT open it again;
-  * "Use OpenBind instead" changes the model row, so the page never folds with
+  * "Use OpenBind-0 instead" changes the model row, so the page never folds with
     a model its own controls do not name;
   * dismissing with Escape leaves the model row alone and starts nothing.
 
@@ -113,8 +113,8 @@ def main():
         print("markup:", present)
         if present == "missing":
             return fail(["index.html has no #model-terms dialog"], httpd, proc)
-        if "openbind" not in present:
-            failures.append("the model row does not offer openbind")
+        if "openbind0" not in present:
+            failures.append("the model row does not offer openbind0")
 
         # 1. Fold with no stored acceptance opens it.
         setup(ws, accepted=False)
@@ -136,9 +136,9 @@ def main():
         cdp.wait_for(ws, "!!document.getElementById('model-terms')?.open",
                      what="the terms dialog to open again", timeout=20)
         cdp.evaluate(ws, "document.getElementById('model-terms-switch').click()")
-        cdp.wait_for(ws, "document.getElementById('model-family').value === 'openbind'",
-                     what="the model row to switch to openbind", timeout=20)
-        print("switch: model row now openbind")
+        cdp.wait_for(ws, "document.getElementById('model-family').value === 'openbind0'",
+                     what="the model row to switch to openbind0", timeout=20)
+        print("switch: model row now openbind0")
 
         # 4a. The dialog laid out at a phone's width, which nothing else does.
         ws.call("Emulation.setDeviceMetricsOverride", width=320, height=720,
@@ -207,7 +207,8 @@ def main():
         print("asks again:", asks_again)
 
         # 5. `?model=`, including the one that must NOT work.
-        for query, expected in (("?model=openbind", "openbind"), ("?model=ob", "openbind"),
+        for query, expected in (("?model=openbind0", "openbind0"), ("?model=openbind", "openbind0"),
+                                ("?model=ob", "openbind0"),
                                 ("?model=af2", "monomer"), ("?model=multimer", "multimer"),
                                 ("?model=of3", "af3"), ("", "af3")):
             ws.call("Page.navigate",

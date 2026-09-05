@@ -12,7 +12,7 @@ const CHAIN_MERGES = {
   monomer: mergeUnpairedChainA3ms,
   multimer: mergeChainA3ms,
   af3: mergeRowAlignedChainA3ms,
-  openbind: mergeRowAlignedChainA3ms,
+  openbind0: mergeRowAlignedChainA3ms,
 };
 
 const DEFAULT_API_URL = "https://api.colabfold.com";

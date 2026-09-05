@@ -45,14 +45,21 @@ export const ALPHAFOLD3 = Object.freeze({
 });
 
 /**
- * OpenBind - OpenFold3 v0.5.0, Apache 2.0.
+ * OpenBind-0 - OpenFold3 v0.5.0, Apache 2.0.
  *
  * Three branches, and each one is a real difference in what the model computes:
  * the token bond matrix is symmetric, padded key atoms are excluded from the
  * atom-pair offset validity, and the diffusion single conditioning normalises
  * over 833 channels rather than 831. See each flag's use site.
+ *
+ * 🔴 THE RELEASE NUMBER IS IN THE NAME ON PURPOSE. Upstream calls this model
+ * OpenBind-0, and their registry's bare `openbind` is a name a LATER release
+ * would answer to as well - which is precisely how `openfold3` came to mean two
+ * models with different forward conventions, and cost this port an afternoon of
+ * reading notes about the wrong one. A dialect table is the last place that
+ * ambiguity should be allowed to live.
  */
-export const OPENBIND = Object.freeze({
+export const OPENBIND0 = Object.freeze({
   swapTransposedBias: false,
   symmetriseBonds: true,
   maskPaddedKeys: true,
@@ -61,8 +68,19 @@ export const OPENBIND = Object.freeze({
 
 export const DIALECTS = Object.freeze({
   alphafold3: ALPHAFOLD3,
-  openbind: OPENBIND,
+  openbind0: OPENBIND0,
 });
+
+/**
+ * Names a bundle may carry that mean one of the dialects above.
+ *
+ * 🔴 UPSTREAM PUBLISHES THE BLOB AS `openbind`, and its own registry calls the
+ * model that, so a bundle exported before this rename - or converted by
+ * somebody following upstream's naming - says `openbind` in its manifest. That
+ * has to keep resolving. It is an ALIAS and not a second dialect: both names
+ * reach the same frozen object, so there is no way for them to drift apart.
+ */
+export const DIALECT_ALIASES = Object.freeze({ openbind: "openbind0" });
 
 /**
  * The dialect a model name implies.
@@ -72,7 +90,7 @@ export const DIALECTS = Object.freeze({
  * wrong one - rather than an error.
  */
 export function dialectFor(model) {
-  const dialect = DIALECTS[model];
+  const dialect = DIALECTS[DIALECT_ALIASES[model] ?? model];
   if (dialect === undefined) {
     throw new Error(`no AF3 dialect for model ${JSON.stringify(model)}; `
       + `known: ${Object.keys(DIALECTS).join(", ")}`);

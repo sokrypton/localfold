@@ -67,7 +67,7 @@ export const MODEL_BUNDLES = {
   },
   // The same graph and the same 265 MiB, under the Apache License 2.0.
   //
-  // 🔴 OpenBind IS OpenFold3's v0.5.0 RELEASE, AND NOT ITS PREVIEW-2 WEIGHTS.
+  // 🔴 OpenBind-0 IS OpenFold3's v0.5.0 RELEASE, AND NOT ITS PREVIEW-2 WEIGHTS.
   // The two differ in forward conventions - see src/af3/dialect.js - so they
   // are different models, and this bundle's manifest names `openbind` so the
   // loader picks the right one. Reading the OpenFold3 porting notes as if they
@@ -81,12 +81,17 @@ export const MODEL_BUNDLES = {
   // 🔴 NO `remote` YET. Its shards have not been uploaded, so this bundle is
   // published beside the page. Give it a pinned `remote` the moment they are -
   // a commit SHA, and a trailing slash; see the notes at the top of this file.
-  openbind: {
-    model: "openbind",
-    directory: "./model-openbind-int5/",
-    release: "openbind-int5",
-    variable: "LOCALFOLD_INCLUDE_OPENBIND_MODEL",
-    load: () => import("./openbind.js"),
+  //
+  // 🔴 AND THE RELEASE NUMBER IS PART OF THE NAME. Upstream's announcement
+  // calls the model OpenBind-0; their registry's bare `openbind` is a name a
+  // later release would answer to as well, which is how `openfold3` ended up
+  // meaning two models with different forward conventions. See dialect.js.
+  openbind0: {
+    model: "openbind0",
+    directory: "./model-openbind0-int5/",
+    release: "openbind0-int5",
+    variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
+    load: () => import("./openbind0.js"),
   },
 };
 
@@ -99,7 +104,7 @@ export const MODEL_BUNDLES = {
  * AlphaFold 2 branch at each of them, which is not a failure that announces
  * itself.
  */
-export const AF3_FAMILIES = ["af3", "openbind"];
+export const AF3_FAMILIES = ["af3", "openbind0"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 

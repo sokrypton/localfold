@@ -23,7 +23,7 @@ import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.j
 import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
-import { ALPHAFOLD3, OPENBIND } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3, OPENBIND0 } from "../../src/af3/dialect.js";
 import { asDiffusionShapedWeights } from "./check-af3-target-feat-gpu.js";
 
 const SEQUENCE = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
@@ -95,7 +95,7 @@ async function measure(device, weights, residues) {
   };
 
   const stock = await run(ALPHAFOLD3);
-  const openbindOut = await run(OPENBIND);
+  const openbindOut = await run(OPENBIND0);
   const openbind = openbindOut.tokenAct;
   const pairSeparation = relativeRms(openbindOut.pairCond, stock.pairCond);
   const stockAct = stock.tokenAct;

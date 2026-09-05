@@ -2,7 +2,7 @@
 """Write a LocalFold float32 model directory from AF3-lineage parameters.
 
     python3 tools/export_af3_model.py                     # the trunk, from AF3
-    python3 tools/export_af3_model.py --model openbind    # ...from OpenBind
+    python3 tools/export_af3_model.py --model openbind0   # ...from OpenBind-0
     python3 tools/export_af3_model.py --include diffuser  # everything
 
 The output is the shape tools/quantize_model.py consumes - manifest.json plus
@@ -68,14 +68,22 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # conversion's own coverage record - it reports 406 arrays and 0 missing, and
 # names `of3-ob-174k.pt` as the source.
 #
-# 🔴 openbind IS NOT openfold3, WHATEVER THE LINEAGE SUGGESTS. They are two
+# 🔴 openbind0 IS NOT openfold3, WHATEVER THE LINEAGE SUGGESTS. They are two
 # releases of one project with different forward conventions - see
 # src/af3/dialect.js - so they are two entries, and the manifest's model.name
 # is what carries the difference into the page.
+#
+# 🔴 AND THE RELEASE NUMBER IS PART OF THE NAME. Upstream's announcement calls
+# this model OpenBind-0, and their own registry's bare `openbind` is a name a
+# LATER release would also answer to - which is exactly how `openfold3` came to
+# mean two models with different forward conventions. A bundle named openbind0
+# cannot be mistaken for OpenBind-1 by a loader that has never heard of it.
+# `openbind` is kept as an alias, because that is the name upstream publishes
+# the blob under.
 BLOBS = {
     "alphafold3": "~/af3_official_weights/af3.bin.zst",
     "openfold3": "~/af3_converted_cd2/of3_ported_weights.bin.zst",
-    "openbind": "~/af3_ported/openbind.bin.zst",
+    "openbind0": "~/af3_ported/openbind.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs

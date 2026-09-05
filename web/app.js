@@ -170,17 +170,17 @@ async function agreeModelTerms(family) {
     rememberTermsAccepted();
     return "af3";
   }
-  if (dialog.returnValue === "openbind") {
+  if (dialog.returnValue === "openbind0") {
     // 🔴 THE ROW IS UPDATED, NOT JUST THE FOLD. Folding with a model the
     // control does not name is a page whose state is written nowhere on it -
     // the same fault the "Auto" model setting had before it was removed.
     const select = document.getElementById("model-family");
     if (select !== null) {
-      select.value = "openbind";
+      select.value = "openbind0";
       syncModelControls();
       syncMode();
     }
-    return "openbind";
+    return "openbind0";
   }
   // Escape, or a click on the backdrop. Not an answer, so not a fold.
   return null;
@@ -230,10 +230,13 @@ function rememberTermsAccepted() {
  * fold they get. `of3` is deliberately NOT an alias for `openbind`: OpenFold3's
  * preview-2 and its v0.5.0 release are different models with different forward
  * conventions (see src/af3/dialect.js), so quietly resolving one to the other
- * would hand somebody a model they did not ask for.
+ * would hand somebody a model they did not ask for. `openbind` IS accepted,
+ * because that is the name upstream publishes the blob under and the name this
+ * page used before the release number was added - but it resolves to
+ * `openbind0` rather than standing for whatever OpenBind means next.
  */
-const MODEL_ALIASES = { ob: "openbind", af2: "monomer", mono: "monomer",
-                        multi: "multimer" };
+const MODEL_ALIASES = { openbind: "openbind0", ob: "openbind0", ob0: "openbind0",
+                        af2: "monomer", mono: "monomer", multi: "multimer" };
 
 function applyModelFromUrl() {
   let asked;
@@ -295,7 +298,9 @@ const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 /** What to call each model while its weights download. */
 const MODEL_LABELS = {
   af3: "AlphaFold 3",
-  openbind: "OpenBind",
+  // Upstream's own name for this release. See src/af3/dialect.js for why the
+  // number is not decoration.
+  openbind0: "OpenBind-0",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
 };
@@ -320,7 +325,7 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // structure of the protein alone - which is a different answer to the
   // question that was asked, not a worse one.
   if (ligandCount > 0 && !isAf3Family(choice)) {
-    throw new Error("Ligands need an AlphaFold 3 model - AF3 or OpenBind;"
+    throw new Error("Ligands need an AlphaFold 3 model - AF3 or OpenBind-0;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND A MODIFIED RESIDUE IS AlphaFold 3 ONLY FOR THE SAME REASON. AF2
@@ -330,7 +335,7 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // to the question, not a worse one. The residue COUNT is unchanged either
   // way, so nothing else on the page would have shown the difference.
   if (modificationCount > 0 && !isAf3Family(choice)) {
-    throw new Error("Modified residues need an AlphaFold 3 model - AF3 or OpenBind;"
+    throw new Error("Modified residues need an AlphaFold 3 model - AF3 or OpenBind-0;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND A NUCLEIC CHAIN IS AlphaFold 3 ONLY, WHICH IS THE LOUDEST OF THE
@@ -339,7 +344,7 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // chain folded under AF2 comes back as a confident structure of a short
   // peptide that was never asked for, with nothing anywhere saying so.
   if (nucleicCount > 0 && !isAf3Family(choice)) {
-    throw new Error("DNA and RNA need an AlphaFold 3 model - AF3 or OpenBind;"
+    throw new Error("DNA and RNA need an AlphaFold 3 model - AF3 or OpenBind-0;"
       + ` the model is set to ${choice}`);
   }
   return choice;

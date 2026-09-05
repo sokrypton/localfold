@@ -11,7 +11,7 @@
  * 🔴 AND THE DIALECT IS AN AXIS, because `padSingleCondUnknownDna` is written
  * twice: as a loop over `singleCondSource` in the reference, and as GENERATED
  * WGSL in the shader's `feature()`. Those are the two halves that can disagree,
- * and nothing else in the repository compares them. The openbind arm splices
+ * and nothing else in the repository compares them. The openbind0 arm splices
  * two extra rows into the LayerNorm scale and the projection exactly where the
  * converter puts them, which is what makes the concatenation 833 wide - so the
  * arm tests the real question: does the shader read the same source column the
@@ -36,7 +36,7 @@ import { relativeEncoding } from "../../src/af3/embedder-reference.js";
 import { layerNormSlow } from "../../src/af3/atom-encoder-reference.js";
 import { linear } from "../../src/af3/pairformer-reference.js";
 import { openAf3Store } from "../../src/af3/weights.js";
-import { ALPHAFOLD3, OPENBIND, singleCondPadding } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3, OPENBIND0, singleCondPadding } from "../../src/af3/dialect.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const PAIR_CHANNELS = 128;
@@ -150,7 +150,7 @@ export async function main(device, args) {
 
   const results = {};
   const singles = {};
-  for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind", OPENBIND]]) {
+  for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind0", OPENBIND0]]) {
     const arm = { ...input, dialect };
     const armWeights = padWeights(weights, singleCondPadding(dialect, SEQ_CHANNELS));
     const expected = diffusionConditioning(arm, armWeights);
@@ -173,7 +173,7 @@ export async function main(device, args) {
   // conditioning is the only output the flag can move - the pair path does not
   // read target_feat - so that is where it is measured.
   const separation = relativeRms(singles.openbind, singles.alphafold3);
-  console.log(`openbind vs alphafold3\tsingle\trelRMS ${separation.toExponential(2)}`);
+  console.log(`openbind0 vs alphafold3\tsingle\trelRMS ${separation.toExponential(2)}`);
 
   const bound = 1e-5;
   const worst = Math.max(...Object.values(results).flatMap((r) => Object.values(r)));
