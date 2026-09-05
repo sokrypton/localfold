@@ -20,22 +20,26 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
-const LANES = 64;
-const GRID_WIDTH = 32768;
+export const LANES = 64;
+export const GRID_WIDTH = 32768;
 
 /**
  * LayerNorm over the last axis, one workgroup a row.
  *
- * `offsetBinding` is 0 where the norm has no offset - ESM-C's q_norm, k_norm
- * and final norm are scale-only, and passing a zero vector instead would be one
- * more buffer to get wrong.
+ * 🔴 THE OFFSET BINDING IS DECLARED ONLY WHEN IT IS READ, for the reason the
+ * linear kernel's residual is - and this one was written the other way and
+ * shipped, because the block only ever used the offset form. ESM-C's final norm
+ * is scale-only and the tower is its first caller: the shader compiled, the
+ * compiler dropped the unread binding, and the bind group then had an entry the
+ * layout did not. "binding index 2 not present in the bind group layout", at
+ * dispatch, thirty-six blocks after anything a checker could see.
  */
-function createLayerNormShader({ rows, channels }, hasOffset, epsilon) {
+export function createLayerNormShader({ rows, channels }, hasOffset, epsilon) {
   return `
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
-@group(0) @binding(2) var<storage, read> offset: array<f32>;
-@group(0) @binding(3) var<storage, read_write> destination: array<f32>;
+${hasOffset ? "@group(0) @binding(2) var<storage, read> offset: array<f32>;" : ""}
+@group(0) @binding(${hasOffset ? 3 : 2}) var<storage, read_write> destination: array<f32>;
 
 var<workgroup> sums: array<f32, ${LANES}>;
 var<workgroup> squares: array<f32, ${LANES}>;
@@ -88,7 +92,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * not at compile, and reads as a broken kernel. Binding a one-element dummy
  * instead is the same trap with an extra buffer.
  */
-function createLinearShader({ rows, inner, outer }, withResidual) {
+export function createLinearShader({ rows, inner, outer }, withResidual) {
   return `
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -127,7 +131,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * and write into three separate ones; routing that through a generic kernel
  * means three copies of a tensor that is read once.
  */
-function createPrepareShader({ rows, model, heads }, epsilon, base) {
+export function createPrepareShader({ rows, model, heads }, epsilon, base) {
   const headDim = model / heads;
   return `
 @group(0) @binding(0) var<storage, read> qkv: array<f32>;
@@ -219,7 +223,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * costs `rows` reductions. The second is the obvious shape and it is
  * log2(lanes) times the barriers.
  */
-function createAttentionShader({ rows, model, heads }) {
+export function createAttentionShader({ rows, model, heads }) {
   const headDim = model / heads;
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
@@ -286,7 +290,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 /** LayerNorm, widen to [gate | value], gate, in one pass over the row. */
-function createSwigluShader({ rows, model, ffn }, epsilon) {
+export function createSwigluShader({ rows, model, ffn }, epsilon) {
   return `
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;

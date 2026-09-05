@@ -80,6 +80,7 @@ values means the whole-stack checker, not that file.
 | What should a WebGPU ESM-C agree with? | `oracle-dumps/esmc-59.json`, from `tools/esmc/dump-esmc-oracle.py` |
 | Does the ESM-C CPU reference compute ESM-C? | `node tools/check-esmc-reference.js` |
 | ...and does the WebGPU block? | `tools/gpu/check-esmc-block.js` |
+| ...and the whole 36-block tower, and the shim? | `tools/gpu/check-esmc-tower.js` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
