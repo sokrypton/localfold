@@ -12,6 +12,7 @@ import {
   createAttentionParameters,
   packAttentionWeights,
   buildAttentionFlashKernel,
+  ATTENTION_VALUE_STORAGE,
   selectAttentionFlashKernel,
 
 } from "./attention.js";
@@ -311,13 +312,21 @@ async function encodeAttention(
   // allocated, and what comes back decides, not what was asked for.
   const built = await buildAttentionFlashKernel(
     execution, execution.device, options.channels / options.heads, undefined, undefined,
-    { input: "f16", output: "f16" });
+    { input: "f16", value: options.valueStorage ?? ATTENTION_VALUE_STORAGE, output: "f16" });
   const flashKernel = built.kernel;
   const flash = built.pipeline;
   // A packed pair is two adjacent channels of one row, so a row has to hold a
   // whole number of them. Every attention here projects to 256 or 128.
   const projectedStorage = flashKernel.packedStorageSupported === true
     && options.channels % 2 === 0 ? "f16" : "f32";
+  // 🔴 THE VALUE IS ALLOCATED AT ITS OWN WIDTH, AND THE KERNEL DECIDES IT.
+  // Reading this off what was ASKED FOR rather than off what came back is the
+  // failure the line above already guards against: a fallback kernel that
+  // refused packed storage would be handed a binding holding twice the values
+  // it will read, which WebGPU cannot see. See ATTENTION_VALUE_STORAGE for why
+  // the value is not simply the same as its three siblings.
+  const valueStorage = projectedStorage === "f32"
+    ? "f32" : (flashKernel.valueStorage ?? projectedStorage);
   // 🔴 THE PROJECTION'S TILE TRAVELS WITH ITS SHADER, because the dispatch
   // below divides by it and the two shapes differ by precision - see
   // selectAttentionProjectKernel.
@@ -330,7 +339,8 @@ async function encodeAttention(
   const normalizedStorage = "f16";
   const pairBiasStorage = options.pairBias?.source === "separate" ? "f32" : normalizedStorage;
   const projectKernel = selectAttentionProjectKernel(
-    execution.device, options.projectPrecision ?? "auto", normalizedStorage, projectedStorage);
+    execution.device, options.projectPrecision ?? "auto", normalizedStorage, projectedStorage,
+    valueStorage);
   const outputKernel = selectAttentionOutputKernel(
     execution.device, options.residualTarget !== undefined,
     options.outputPrecision ?? "auto", projectedStorage);
@@ -359,7 +369,8 @@ async function encodeAttention(
     `${options.label}.${name}`, elements, GPUBufferUsage.STORAGE, projectedStorage);
   const query = projected("query");
   const key = projected("key");
-  const value = projected("value");
+  const value = execution.allocate(
+    `${options.label}.value`, elements, GPUBufferUsage.STORAGE, valueStorage);
   const gate = projected("gate");
   // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. Read the dispatches below:
   // the projection is the last pass that reads it - the pair bias, when it

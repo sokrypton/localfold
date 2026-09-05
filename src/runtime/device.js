@@ -36,7 +36,19 @@ const RAISED_LIMITS = [
  */
 export async function requestAlphaFoldDevice(adapter, options = {}) {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
-  const optional = ["subgroups", "subgroup-size-control", "timestamp-query", "shader-f16"];
+  //
+  // 🔴 chromium-experimental-subgroup-matrix IS NOT STANDARDS-COMPLIANT WGSL,
+  // and it is asked for anyway because it is OPTIONAL in exactly the way the
+  // others are: a browser that does not advertise it never sees it requested,
+  // and no kernel may use it without gating on device.features. It is here so
+  // a capability-gated fast path CAN be selected - the matrix units compute
+  // what the f32 kernel computes, accumulating in f32, so where they exist
+  // they beat the f16 arithmetic this repository ships without its rounding.
+  // See tools/gpu/probe-subgroup-matrix.js for what a device offers.
+  const optional = [
+    "subgroups", "subgroup-size-control", "timestamp-query", "shader-f16",
+    "chromium-experimental-subgroup-matrix",
+  ];
   const requiredFeatures = optional.filter(
     (feature) => adapter.features.has(feature),
   );

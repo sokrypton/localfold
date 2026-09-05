@@ -49,6 +49,10 @@ values means the whole-stack checker, not that file.
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
+| Does this device have matrix units, and in what shapes? | `tools/gpu/probe-subgroup-matrix.js` |
+| What do `subgroupMatrixLoad`/`Store` actually mean here? | `tools/gpu/check-subgroup-matrix.js` |
+| Are the matrix units worth it on a dense projection? | `tools/gpu/bench-evoformer-linear.js --arms=8x8@f16/f16,matrix4` |
+| What does packing the attention key cost, and the value? | `tools/gpu/check-attention-packing.js --dense=f32` |
 | What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
@@ -1209,6 +1213,162 @@ before the vendored viewer's own "Ready." line overwrote it, and once before the
 parameter had even been read, because it was called beside the Fold button's
 enabling - which runs EARLIER in the file. It waits for that specific string
 now. `of3` is deliberately not an alias for `openbind`.
+
+## Upstream's optimisation work, tried here
+
+`martin-steinegger/alphafold2-webgpu` is the `upstream` remote. The trees have
+diverged too far to merge - 187 commits there, 518 here, and theirs is
+TypeScript - so what transfers is findings, not code. Three were tried on this
+M2. One is a large win, one does not reproduce, and one is the opposite of what
+their hardware says.
+
+🔴 **THE SUBGROUP MATRIX UNITS EXIST ON THIS DEVICE, AND THEY BEAT THE f16
+KERNEL WHILE COMPUTING THE f32 ONE.** `chromium-experimental-subgroup-matrix` is
+advertised by this adapter and the WGSL compiles;
+`tools/gpu/probe-subgroup-matrix.js` reports what it offers, which is
+**8x8x8 at f32/f32 and 8x8x8 at f16/f16** - note there is no f16-input,
+f32-accumulate configuration here, so the f16 units accumulate in f16 and are a
+different accuracy question. `tools/gpu/gemm-matrix.js` is the candidate kernel
+and `bench-evoformer-linear.js` has `matrix<blocks>` arms. Against the shipped
+dense projection, medians of nine interleaved in one process:
+
+| shape | f32 8x8 | shipped f16 | **matrix f32** | vs f32 | vs shipped |
+|---|---:|---:|---:|---:|---:|
+| MSA transition, first half | 17.14 ms | 14.21 | **12.25** | 1.40x | 1.16x |
+| ...second half | 16.69 | 14.11 | **10.80** | 1.55x | 1.31x |
+| structure/confidence single | 0.188 | 0.150 | **0.088** | 2.14x | 1.70x |
+| a long chain's pair transition | 3.63 | 3.13 | **2.73** | 1.33x | 1.15x |
+
+The matrix arm's relRMS against the f32 kernel is **0**, at every shape and
+every row count tried - it accumulates in f32, so there is no accuracy gate to
+pass. That is the whole point: this repository buys 1.15x-1.31x today by
+rounding to half precision, and the matrix units buy the same or more by not.
+`requestAlphaFoldDevice` now asks for the feature (optionally, so a browser
+without it never sees it requested); nothing in `src/` uses it yet.
+
+🔴 **AND AN OUT-OF-BOUNDS `subgroupMatrixLoad` RETURNS AN ENTIRELY ZERO MATRIX
+HERE, WHICH IS NOT WHAT UPSTREAM'S KERNEL ASSUMES.** Their bounded kernel runs
+the matrix path everywhere and bounds-checks only in the store, on the stated
+reasoning that "loads past the end of a tensor are clamped by WGSL's robustness
+rules, so a partial region computes garbage exactly in the rows and columns that
+do not exist". On this device it does not. `check-subgroup-matrix.js` loads an
+8x8 tile from a buffer holding five rows and **every row comes back zero** -
+relRMS 1.0 across the whole tile, the five present ones included. A scalar read
+of that buffer is clamped; a matrix read of it is refused wholesale. The first
+version of `gemm-matrix.js` was exact whenever M was a multiple of 32 and read
+0.153 at 59 rows, which is what that looks like.
+
+So the load has to stay in range. The last region on each axis **slides back**
+to end on the final row and column instead of hanging over the edge; the overlap
+recomputes rows with the same inputs and writes the same values, and the kernel
+then needs at least one whole region per axis. That is a documented restriction
+rather than a silent wrong answer - which is what the 64x128 arm still gives
+below 64 rows.
+
+🔴 **AND THE SEMANTICS WERE PINNED BEFORE ANYTHING WAS TIMED.** The type
+parameters are `<T, columns, rows>` and at the only shape this device offers -
+8x8x8 - getting that backwards is invisible in the declaration and visible only
+in the answer. `check-subgroup-matrix.js` multiplies one asymmetric 8x8 pair
+whose product is known on the host and scores the seven interpretations a
+transpose could produce: plain row-major `A@B` at **relRMS 0**, everything else
+above 1.1. A bench run before that check would have been timing a transpose.
+
+🔴 **AND THE 64x128 GEOMETRY MEASURED HERE IS A REGISTER SPILL, NOT A RESULT.**
+Upstream reports the shipped-grid geometry at 1.28x-1.66x, worth about a fifth
+of the win, and the arm here reads **122-172 GFLOP/s against 1082-1466** for the
+32x32 one. The difference is the implementation: holding 8x16 accumulator tiles
+is 128 of them, 8192 floats a subgroup, and it spills - the same 4x-the-wrong-way
+`grid.project`'s row tile records at 16. Upstream's version walks sub-regions
+instead of holding them all. Do not quote that row as a fact about the hardware.
+
+🔴 **PACKING THE ATTENTION VALUE COSTS NOTHING HERE, BECAUSE THIS KERNEL HAD
+ALREADY ROUNDED IT.** Upstream found that packing the flash kernel's keys AND
+values moved an evoformer block's MSA output 4.06e-4 from AlphaFold's own
+intermediates against a 5e-5 allowance, with the value alone reproducing 4.05e-4
+- a key's error is normalised away by the softmax, a value's is averaged under
+weights summing to one and lands undamped. They now pack keys only. This tree
+packs all four projected tensors, so it looked like the same bug.
+
+It is not, and the reason is `chunk16`: the default flash kernel stages the key
+and value chunks as `vec4<f16>` in workgroup memory **whatever the tensors are
+stored as**, so the value is half precision by the time it is used either way.
+`tools/gpu/check-attention-packing.js` against a CPU reference, with the dense
+kernels forced to f32 so the storage is the only rounding left:
+
+| | flash f32 | flash chunk16 (the default) |
+|---|---:|---:|
+| nothing packed | 1.9e-7 | 8.97e-5 |
+| query/key/gate packed | 1.30e-4 | 1.53e-4 |
+| **value packed** | 8.09e-5 | **8.97e-5** - unchanged |
+| both | 1.53e-4 | 1.53e-4 |
+
+So unpacking the value buys nothing under the shipped kernel and costs a
+tensor's bytes; `ATTENTION_VALUE_STORAGE` stays `f16`. The mechanism to separate
+them exists now and is threaded through `selectAttentionFlashKernel`,
+`selectAttentionProjectKernel` and `block.js`, because the answer is a property
+of the precision and would change on a device without `shader-f16` - where the
+value costs 8.09e-5 and is the SMALLER of the two terms, not the larger.
+
+🔴 **AND `inputStorage` IS THREE TENSORS, NOT THE KEY.** It is the query, the key
+and the gate, and the query and the gate are read once per invocation rather than
+once per key - so the 1.30e-4 row above is not "what the key costs". Two of those
+three are narrowed for no bandwidth at all.
+
+🔴 **AND `AttentionGpu` HAD NEVER RUN THE STORAGE THE MODEL RUNS.** It took no
+storage option at all, so `check-evoformer-attention.js` - AF2's only attention
+differential - was checking an all-f32 configuration that nothing ships, which
+is the same fault as a checker building its own kernel. Storage is an axis
+there now, and the packing checker asserts its four arms compiled four DIFFERENT
+shaders, because a storage option that never arrives reports perfect agreement.
+
+🔴 **AND A PACKED WORD'S TWO COLUMNS ARE A PROPERTY OF THE LAYOUT, SO EVERY
+PACKED BINDING DECIDES IT.** The projection's column mapping was gated on
+`packOut` alone - the flag for query, key and gate. Packing only the VALUE kept
+the lanesX-strided mapping and then wrote `pack2x16float(hd_0, hd_1)`, two
+columns EIGHT apart, into the word belonging to `hd_0` and `hd_0 + 1`. Every
+shape agreed, nothing was out of bounds, and the attention scored **relRMS
+0.528** against its reference. It follows `packOut || packValue` now.
+
+🔴 **AND TWO QUERIES AN INVOCATION IS 4.8x SLOWER HERE, WHERE UPSTREAM'S OTHER
+DEVICE WANTS IT.** Their `attentionFlashKernelForShape` gives an invocation two
+queries once a shape reaches 128, from a GB10 measurement of 1.17x-1.42x for 128
+to 1024 queries; on their M4 Pro it is 2.2x slower and they replaced the
+threshold with a probe. This kernel has the same knob and selection has never
+used it, and `bench-msa-attention.js` says why - at 512 queries, 59 batch, 8
+heads:
+
+| | q1 | q2 | q4 |
+|---|---:|---:|---:|
+| `auto/c` | 17.03 ms | 82.48 (**0.21x**) | 196.28 (**0.12x**) |
+
+Bit-comparable at 2.84e-7, and catastrophic, which is the same register-spill
+shape AF3's `grid.attend` records at Q=2 and Q=4. So nothing changes here; what
+is worth taking from upstream is that the ratio is a DEVICE property and the
+answer differs by a factor of six between two of them.
+
+🔴 **AND WHERE THE MATRIX UNITS WOULD PAY, BY MODEL.** The share that is a dense
+projection at all, from `profile-af2-block.js --sequences=512` and
+`bench-trunk.js --profile --tokens=200`:
+
+| | AF2 (monomer, multimer) | AF3 (af3, openbind0) |
+|---|---|---|
+| plain GEMM passes | **65%** of an 83.1 ms block | **49%** of a 3372 ms trunk |
+| fused GEMM | - | `pair-transition`, a further 18% |
+| out of reach | the two flash attentions, 20% | `grid.attend`, 19% |
+
+AF2's dense work is `createLinearShader` and the attention's own projection, so
+the table at the top applies to it directly. AF3's five are bespoke and were not
+measured against a matrix arm; `pair-transition` fuses a LayerNorm, two matmuls
+and a gate, and is 59% arithmetic rather than bandwidth, so it is the one most
+likely to move and the one furthest from a drop-in.
+
+🔴 **AND THE CALLERS ARE THE OBSTACLE, NOT THE KERNEL.** `subgroupMatrixLoad`
+cannot consume a WGSL expression: it needs a typed binding, a base offset and a
+stride. Every generated kernel here takes its operands as expressions, which is
+what lets a caller read a packed activation through `unpack2x16float` or window
+a tensor past a binding limit - so the matrix path cannot be made invisible the
+way half precision was. A caller has to declare that its operand IS a plain
+array with a known stride. That is the reason this stops at a measurement.
 
 ## Measuring, without fooling yourself
 

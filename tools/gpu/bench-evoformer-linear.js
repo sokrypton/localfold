@@ -24,6 +24,7 @@
  * match leaves rows unprojected and reads as a speedup.
  */
 import { createLinearShader } from "../../src/evoformer/transition.js";
+import { createMatrixLinearShader } from "./gemm-matrix.js";
 import { float32ToFloat16Array } from "../../src/runtime/float16.js";
 
 const option = (args, name, fallback) => {
@@ -194,7 +195,11 @@ export async function main(device, args) {
   // ...and the same values as halves, for the arms that bind them that way.
   const weightsHalf = device.features.has("shader-f16")
     ? upload(float32ToFloat16Array(weightData)) : weights;
-  const source = upload(random(rows * inner));
+  const sourceData = random(rows * inner);
+  const source = upload(sourceData);
+  // ...and the same values as halves, for the matrix arms that multiply in f16.
+  const sourceHalf = device.features.has("shader-f16")
+    ? upload(float32ToFloat16Array(sourceData)) : source;
   const output = device.createBuffer({
     size: rows * columns * 4, usage: storage | GPUBufferUsage.COPY_SRC,
   });
@@ -236,8 +241,22 @@ export async function main(device, args) {
       results.push({ arm: spec, skipped: "no shader-f16" });
       continue;
     }
-    let shader; let tile;
-    if (tileSpec === "legacy") {
+    let shader; let tile; let matrixElement = null;
+    if (tileSpec.startsWith("matrix")) {
+      // `matrix4` is a 32x32 region per subgroup; `matrix8x16` is the shipped
+      // 64x128 geometry, which is the one a caller keeping the existing
+      // dispatch grid would have to use. `@f16` picks the f16 units, which on
+      // this device ACCUMULATE in f16 - see gemm-matrix.js.
+      if (!device.features.has("chromium-experimental-subgroup-matrix")) {
+        results.push({ arm: spec, skipped: "no chromium-experimental-subgroup-matrix" });
+        continue;
+      }
+      const [blocks, columnBlocks = blocks] = tileSpec.slice("matrix".length).split("x").map(Number);
+      if (!blocks) throw new Error(`arm ${spec} is not a matrix geometry`);
+      matrixElement = precision;
+      shader = createMatrixLinearShader({ blocks, columnBlocks, element: precision });
+      tile = { rows: blocks * 8, columns: columnBlocks * 8 };
+    } else if (tileSpec === "legacy") {
       if (precision !== "f32") throw new Error("the legacy kernel has no precision option");
       shader = LEGACY_SHADER;
       tile = LEGACY_TILE;
@@ -267,7 +286,11 @@ export async function main(device, args) {
     });
     const bindGroup = device.createBindGroup({
       layout: pipeline.getBindGroupLayout(0),
-      entries: [source, weightPrecision === "f16" ? weightsHalf : weights, parameters, output]
+      entries: [
+        matrixElement === "f16" ? sourceHalf : source,
+        (matrixElement === "f16" || weightPrecision === "f16") ? weightsHalf : weights,
+        parameters, output,
+      ]
         .map((buffer, binding) => ({
         binding, resource: { buffer },
       })),

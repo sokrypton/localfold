@@ -237,7 +237,7 @@ export const attentionProjectTileColumns = (tile = ATTENTION_PROJECT_TILE) =>
  */
 export function createAttentionProjectShader(
   tile = ATTENTION_PROJECT_TILE, precision = "f32", weightPrecision = "f32",
-  sourceStorage = "f32", outputStorage = "f32",
+  sourceStorage = "f32", outputStorage = "f32", valueStorage = outputStorage,
 ) {
   // 🔴 THE WEIGHT BUFFER'S ELEMENT, MEASURED AND NOT SHIPPED. This kernel
   // rereads the whole weight set once per row tile - 944 of them at 512 MSA
@@ -268,7 +268,13 @@ export function createAttentionProjectShader(
   const widen = (e) => (half ? `f32(${e})` : e);
   if (rowsPerLane % 4 !== 0) throw new RangeError("project tile rowsPerLane must be a multiple of 4");
   const packOut = outputStorage === "f16";
-  if (packOut && tile.columnsPerLane % 2 !== 0) {
+  // 🔴 THE VALUE CAN BE STORED WIDER THAN ITS THREE SIBLINGS. It is the one of
+  // the four whose rounding is not damped downstream - see the note in
+  // createAttentionRegisterFlashShader - so it is written on its own here
+  // rather than sharing their loop. Everything else about the kernel, the
+  // accumulators included, is unchanged.
+  const packValue = valueStorage === "f16";
+  if ((packOut || packValue) && tile.columnsPerLane % 2 !== 0) {
     // A lane has to hold both halves of a word, and a half is one of its
     // accumulators - so it needs an even number of them to pair up.
     throw new RangeError("a packed projection needs an even columnsPerLane");
@@ -293,7 +299,17 @@ export function createAttentionProjectShader(
   // ADJACENT columns, so under packing a lane takes PAIRS of them: it writes
   // one word where it wrote two floats, and the run across the workgroup is
   // the same length in words that it was in floats.
-  const columnExpr = packOut
+  //
+  // 🔴 AND *ANY* PACKED OUTPUT DECIDES IT, NOT JUST THE THREE THAT SHARE A
+  // FLAG. Gated on packOut alone, a kernel packing only the VALUE kept the
+  // strided mapping and then wrote pack2x16float(hd_0, hd_1) - two columns
+  // EIGHT apart - into the word belonging to hd_0 and hd_0+1. Every shape
+  // agreed, nothing was out of bounds, and the attention scored relRms 0.528
+  // against its reference. A word is owned by one invocation or it is a race,
+  // and which columns share a word is a property of the layout, so it has to
+  // follow whichever binding is packed.
+  const paired = packOut || packValue;
+  const columnExpr = paired
     ? (v) => `pair_origin * 2u + ${Math.floor(v / 2) * lanesX * 2}u + ${v % 2}u`
     : (v) => `column_origin + ${v * lanesX}u`;
   const bias = [];
@@ -370,7 +386,6 @@ export function createAttentionProjectShader(
       let word = ${word};
       query[word] = pack2x16float(vec2<f32>(${q(r, v)}, ${q(r, v + 1)}));
       key[word] = pack2x16float(vec2<f32>(${k(r, v)}, ${k(r, v + 1)}));
-      value[word] = pack2x16float(vec2<f32>(${val(r, v)}, ${val(r, v + 1)}));
       gate[word] = pack2x16float(vec2<f32>(${g(r, v)}, ${g(r, v + 1)}));
     }`);
       }
@@ -380,8 +395,21 @@ export function createAttentionProjectShader(
       let index = row_${r} * projected + hd_${v};
       query[index] = ${q(r, v)};
       key[index] = ${k(r, v)};
-      value[index] = ${val(r, v)};
       gate[index] = ${g(r, v)};
+    }`);
+      }
+    }
+    if (packValue) {
+      for (let v = 0; v < columnsPerLane; v += 2) {
+        body.push(`    if (hd_${v + 1} < projected) {
+      value[row_${r} * (projected / 2u) + (hd_${v} / 2u)] =`
+        + ` pack2x16float(vec2<f32>(${val(r, v)}, ${val(r, v + 1)}));
+    }`);
+      }
+    } else {
+      for (let v = 0; v < columnsPerLane; v += 1) {
+        body.push(`    if (hd_${v} < projected) {
+      value[row_${r} * projected + hd_${v}] = ${val(r, v)};
     }`);
       }
     }
@@ -399,7 +427,7 @@ ${body.join("\n")}
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> query: array<${storageArray(outputStorage)}>;
 @group(0) @binding(4) var<storage, read_write> key: array<${storageArray(outputStorage)}>;
-@group(0) @binding(5) var<storage, read_write> value: array<${storageArray(outputStorage)}>;
+@group(0) @binding(5) var<storage, read_write> value: array<${storageArray(valueStorage)}>;
 @group(0) @binding(6) var<storage, read_write> gate: array<${storageArray(outputStorage)}>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
@@ -415,7 +443,7 @@ fn main(
   let projected = p.heads * p.head_dim;
   let rows = p.batch * p.queries;
   let linear_lane = local.y * ${lanesX}u + local.x;
-${packOut
+${paired
   ? `  let pair_origin = group.x * ${lanesX * (columnsPerLane / 2)}u + local.x;`
   : `  let column_origin = group.x * ${lanesX * columnsPerLane}u + local.x;`}
 ${bias.join("\n")}
@@ -477,6 +505,7 @@ export const ATTENTION_PROJECT_TILE_F16 = {
  */
 export function selectAttentionProjectKernel(
   device, requested = "auto", sourceStorage = "f32", outputStorage = "f32",
+  valueStorage = outputStorage,
 ) {
   const precision = requested !== "auto" ? requested
     : device?.features?.has("shader-f16") ? "f16" : "f32";
@@ -489,10 +518,18 @@ export function selectAttentionProjectKernel(
     // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
     // divides by it: a cache that handed back the other one would leave whole
     // tiles of rows unprojected, which reads as a speedup.
+    // 🔴 THE VALUE'S ELEMENT JOINS THE KEY ONLY WHEN IT DIFFERS from its three
+    // siblings, so an entry made before the value could be separated is still
+    // the entry a caller that does not separate it gets. Two shaders differing
+    // only in the width of one binding is exactly the silent failure this key
+    // exists to prevent: WebGPU cannot see that a buffer holds twice the values
+    // the shader will read out of it.
     cacheKey: `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
+      + (valueStorage === outputStorage ? "" : `-value${valueStorage}`)
       + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`,
     shader: precision === "f16" || sourceStorage !== "f32" || outputStorage !== "f32"
-      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage, outputStorage)
+      || valueStorage !== outputStorage
+      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage, outputStorage, valueStorage)
       : ATTENTION_PROJECT_SHADER,
   };
 }
@@ -721,13 +758,27 @@ export function createAttentionRegisterFlashShader(headDim, keyChunk, options = 
   // change - the staged chunks, the softmax and the accumulators are untouched.
   const packIn = options.inputStorage === "f16";
   const packOut = options.outputStorage === "f16";
+  // 🔴 THE VALUE IS SEPARABLE FROM THE KEY, AND THE TWO DO NOT COST THE SAME.
+  // Both are read once per key, so both halve what the hot loop reads - but a
+  // KEY's rounding lands in a logit, and the softmax normalises most of it
+  // away, while a VALUE is averaged under weights that already sum to one and
+  // lands in the output undamped. Upstream (martin-steinegger/alphafold2-webgpu,
+  // commit 6974112) measured that against AlphaFold's own intermediates on
+  // hardware that has the full captures: keys and values packed moved an
+  // evoformer block's MSA output 4.06e-4 against the 5e-5 that test allows, and
+  // packing the VALUE ALONE reproduced 4.05e-4 - so the value is the whole of
+  // it. This checkout cannot run that gate (see check-evoformer-stack.js), and
+  // tools/gpu/check-attention-packing.js is what it can run instead.
+  const packValue = (options.valueStorage ?? options.inputStorage) === "f16";
   const vec4In = packIn ? "vec2<u32>" : "vec4<f32>";
+  const vec4Value = packValue ? "vec2<u32>" : "vec4<f32>";
   const vec4Out = packOut ? "vec2<u32>" : "vec4<f32>";
   const read4 = (array, index) => (packIn ? `load4(${array}[${index}])` : `${array}[${index}]`);
+  const readValue = (index) => (packValue ? `load4(value[${index}])` : `value[${index}]`);
   const write4 = (array, index, expr) => (packOut
     ? `${array}[${index}] = store4(${expr});`
     : `${array}[${index}] = ${expr};`);
-  const helpers = `${packIn ? `
+  const helpers = `${packIn || packValue ? `
 fn load4(w: vec2<u32>) -> vec4<f32> {
   let lo = unpack2x16float(w.x);
   let hi = unpack2x16float(w.y);
@@ -927,7 +978,7 @@ const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
 @group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
 @group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
-@group(0) @binding(2) var<storage, read> value: array<${vec4In}>;
+@group(0) @binding(2) var<storage, read> value: array<${vec4Value}>;
 @group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
@@ -958,7 +1009,7 @@ ${multiDeclare}
       let k_index = min(k0 + index / HD4, p.queries - 1u);
       let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
       key_chunk[index] = ${chunkType}(${read4("key", "k_base")});
-      value_chunk[index] = ${chunkType}(${read4("value", "k_base")});
+      value_chunk[index] = ${chunkType}(${readValue("k_base")});
     }
     workgroupBarrier();
 ${multiInner}
@@ -1001,7 +1052,7 @@ const HD4: u32 = ${vectors}u;
 const KEY_CHUNK: u32 = ${chunk}u;
 @group(0) @binding(0) var<storage, read> query: array<${vec4In}>;
 @group(0) @binding(1) var<storage, read> key: array<${vec4In}>;
-@group(0) @binding(2) var<storage, read> value: array<${vec4In}>;
+@group(0) @binding(2) var<storage, read> value: array<${vec4Value}>;
 @group(0) @binding(3) var<storage, read> gate: array<${vec4In}>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
 @group(0) @binding(5) var<storage, read> pair_bias: array<f32>;
@@ -1044,7 +1095,7 @@ ${declare("acc", () => `${registerType}(0.0)`)}
       let k_index = min(k0 + index / HD4, p.queries - 1u);
       let k_base = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + index % HD4;
       key_chunk[index] = ${chunkType}(${read4("key", "k_base")});
-      value_chunk[index] = ${chunkType}(${read4("value", "k_base")});
+      value_chunk[index] = ${chunkType}(${readValue("k_base")});
     }
     workgroupBarrier();
 
@@ -1387,6 +1438,57 @@ export function supportsAttentionSubgroup64x64(device, headDim = 32) {
  *
  * @param {{pipelines: {get: (key: string, code: string) => Promise<GPUComputePipeline>}}} execution
  */
+/**
+ * How the flash kernel's VALUE tensor is stored, as against its key.
+ *
+ * 🔴 UPSTREAM'S FINDING IS REAL AND DOES NOT TRANSFER TO THIS KERNEL, WHICH IS
+ * WHY THIS IS f16 AND NOT f32. Upstream (martin-steinegger/alphafold2-webgpu,
+ * commit 6974112) packed the key and the value as half words, and their
+ * comparison against AlphaFold's own intermediates moved an evoformer block's
+ * MSA output 4.06e-4 against a 5e-5 allowance - with the VALUE ALONE
+ * reproducing 4.05e-4. Their reasoning is sound and worth keeping: a key's
+ * rounding becomes a logit error and the softmax divides most of it away, while
+ * a value is averaged under weights that already sum to one and arrives in the
+ * output undamped.
+ *
+ * 🔴 BUT THIS KERNEL ALREADY ROUNDS THE VALUE, AND NOT IN ITS STORAGE. The
+ * default precision here is `chunk16`, which stages the key and the value
+ * chunks as vec4<f16> in workgroup memory whatever the tensors are stored as -
+ * so the value is f16 by the time it is used either way, and packing its
+ * STORAGE adds nothing at all on top. tools/gpu/check-attention-packing.js, at
+ * batch 8, 128 queries, 64 channels, 2 heads, against a CPU reference, with the
+ * dense kernels forced to f32 so the storage is the only rounding left:
+ *
+ *                            flash f32     flash chunk16 (the default)
+ *     nothing packed          1.9e-7            8.97e-5
+ *     query/key/gate packed   1.30e-4           1.53e-4
+ *     value packed            8.09e-5           8.97e-5   <- exactly the same
+ *     both                    1.53e-4           1.53e-4
+ *
+ * The value column is the whole answer: under the shipped kernel, unpacking the
+ * value buys nothing measurable and costs a tensor's worth of bytes and the
+ * bandwidth of reading it. Under an f32 flash kernel - a device with no
+ * shader-f16 - it does cost 8.09e-5, and it is a smaller term there than the
+ * other three, not a larger one. So upstream's split is not reproduced here in
+ * either direction.
+ *
+ * 🔴 AND `input` COVERS THREE TENSORS, NOT ONE. It is the query, the key AND
+ * the gate, and the query and the gate are read once per invocation rather than
+ * once per key - so the middle row above is not "the key costs 1.3e-4". Two of
+ * those three are narrowed for no bandwidth at all, which is the thing actually
+ * worth a second look here.
+ *
+ * 🔴 AND THIS CHECKOUT CANNOT RUN THE GATE THAT WOULD SETTLE IT.
+ * check-evoformer-stack.js is AF2's only comparison against official values on
+ * this machine and test/fixtures/evoformer/ holds 26 of its 530 tensors, so it
+ * 404s. The table above is a differential against a CPU reference on synthetic
+ * activations, and upstream's own episode is the warning about how far that
+ * goes: on synthetic inputs the packing that moved their real model 4e-4 read
+ * 6e-7. It says the value's storage is inert under chunk16, which is a claim
+ * about this kernel's arithmetic; it does not say the model is unharmed.
+ */
+export const ATTENTION_VALUE_STORAGE = "f16";
+
 export async function buildAttentionFlashKernel(
   execution, device, headDim, requested = "auto", precision = "auto", storage = {},
 ) {
@@ -1519,15 +1621,21 @@ export function selectAttentionFlashKernel(
       : device.features?.has("shader-f16") ? "chunk16" : "f32";
     const inputStorage = storage.input ?? "f32";
     const outputStorage = storage.output ?? "f32";
+    // The VALUE follows the other inputs unless a caller separates it. See the
+    // note in createAttentionRegisterFlashShader for why anyone would.
+    const valueStorage = storage.value ?? inputStorage;
     return {
       // The suffix appears only when something is packed, so the key a device
-      // without this path gets is the one it has always had.
+      // without this path gets is the one it has always had - and the value's
+      // element joins it only when it DIFFERS, so separating it cannot collide
+      // with an entry made before this option existed.
       cacheKey: `attention:flash-registers-${headDim}-${precision}`
         + (inputStorage === "f32" && outputStorage === "f32"
-          ? "" : `-storage${inputStorage}${outputStorage}`),
+          ? "" : `-storage${inputStorage}${outputStorage}`)
+        + (valueStorage === inputStorage ? "" : `-value${valueStorage}`),
       shader: createAttentionRegisterFlashShader(
-        headDim, undefined, { precision, inputStorage, outputStorage }),
-      queryTile: 64, variant, packedStorageSupported: true,
+        headDim, undefined, { precision, inputStorage, valueStorage, outputStorage }),
+      queryTile: 64, variant, packedStorageSupported: true, valueStorage,
     };
   }
   return {
@@ -1773,14 +1881,35 @@ export class AttentionGpu {
   async run(input) {
     validate(input);
     const packed = packAttentionWeights(input);
-    const flashKernel = selectAttentionFlashKernel(
-      this.device, input.channels / input.heads, this.options.flashVariant ?? "auto",
-      this.options.flashPrecision ?? "auto",
-    );
+    // 🔴 THE STORAGE IS AN AXIS HERE BECAUSE THE SHIPPED PATH USES ONE AND THIS
+    // CLASS NEVER DID. src/evoformer/block.js runs the projected tensors packed
+    // two halves to a word; this ran them f32 and always had, so the only
+    // differential AF2's attention has - check-evoformer-attention.js - was
+    // checking a configuration nothing runs. That is the same fault as a
+    // checker building its own kernel: see CLAUDE.md.
+    const wanted = this.options.storage ?? {};
+    const headDim = input.channels / input.heads;
+    const variant = this.options.flashVariant ?? "auto";
+    const precision = this.options.flashPrecision ?? "auto";
+    let flashKernel = selectAttentionFlashKernel(this.device, headDim, variant, precision, wanted);
+    // 🔴 THE KERNEL AND THE ALLOCATION MUST BE DECIDED FROM THE SAME ANSWER.
+    // Reading packedStorageSupported off what came BACK and then clamping the
+    // allocation is only half of it: the kernel was already SELECTED from the
+    // request, so a clamp applied afterwards compiles a shader that reads a
+    // tensor packed while the allocator hands it an f32 one - a binding of the
+    // right byte length holding half the values, which WebGPU cannot see. That
+    // scored relRms 105 while every shape agreed. When the request cannot be
+    // served the kernel is re-selected without it, so the two always agree.
+    const packedOk = flashKernel.packedStorageSupported === true && input.channels % 2 === 0;
+    const effective = packedOk ? wanted : {};
+    if (!packedOk) flashKernel = selectAttentionFlashKernel(this.device, headDim, variant, precision);
+    const projectedStorage = effective.input ?? "f32";
+    const valueStorage = effective.value ?? projectedStorage;
+    const weightedStorage = effective.output ?? "f32";
     const projectKernel = selectAttentionProjectKernel(
-      this.device, this.options.projectPrecision ?? "auto");
+      this.device, this.options.projectPrecision ?? "auto", "f32", projectedStorage, valueStorage);
     const outputKernel = selectAttentionOutputKernel(
-      this.device, false, this.options.outputPrecision ?? "auto");
+      this.device, false, this.options.outputPrecision ?? "auto", weightedStorage);
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
@@ -1808,12 +1937,15 @@ export class AttentionGpu {
         rows, input.channels, packed.offsets[0], packed.offsets[1], input.transpose === true,
         input.batch, input.queryLength, input.epsilon ?? 1e-5,
       ), GPUBufferUsage.UNIFORM));
+      // A packed tensor is two elements to a word, so it is half the bytes. The
+      // element count is what the shader indexes; the allocator wants bytes.
+      const bytesFor = (element) => (element === "f16" ? tensorBytes / 2 : tensorBytes);
       const normalized = keep(this.allocator.allocate("attention.normalized", tensorBytes, storage));
-      const query = keep(this.allocator.allocate("attention.query", tensorBytes, storage));
-      const key = keep(this.allocator.allocate("attention.key", tensorBytes, storage));
-      const value = keep(this.allocator.allocate("attention.value", tensorBytes, storage));
-      const gate = keep(this.allocator.allocate("attention.gate", tensorBytes, storage));
-      const weighted = keep(this.allocator.allocate("attention.weighted", tensorBytes, storage));
+      const query = keep(this.allocator.allocate("attention.query", bytesFor(projectedStorage), storage));
+      const key = keep(this.allocator.allocate("attention.key", bytesFor(projectedStorage), storage));
+      const value = keep(this.allocator.allocate("attention.value", bytesFor(valueStorage), storage));
+      const gate = keep(this.allocator.allocate("attention.gate", bytesFor(projectedStorage), storage));
+      const weighted = keep(this.allocator.allocate("attention.weighted", bytesFor(weightedStorage), storage));
       const output = keep(this.allocator.allocate("attention.output", tensorBytes, storage | GPUBufferUsage.COPY_SRC));
       const readback = keep(this.allocator.allocate(
         "attention.readback", tensorBytes, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -1877,7 +2009,16 @@ export class AttentionGpu {
       await readback.buffer.mapAsync(GPUMapMode.READ);
       const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
       readback.buffer.unmap();
-      return { output: result, elapsedMilliseconds: performance.now() - start, memory: this.allocator.snapshot() };
+      return {
+        output: result,
+        elapsedMilliseconds: performance.now() - start,
+        memory: this.allocator.snapshot(),
+        // 🔴 WHAT WAS ACTUALLY BUILT, so a caller sweeping storage can assert
+        // the arms DIFFER rather than trusting that its option arrived. A
+        // toggle that never reaches the kernel reports perfect agreement.
+        storage: { projected: projectedStorage, value: valueStorage, weighted: weightedStorage },
+        shaders: { flash: flashKernel.cacheKey, project: projectKernel.cacheKey },
+      };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index] .release();
     }
