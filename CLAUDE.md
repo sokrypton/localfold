@@ -692,6 +692,37 @@ Caching the transformer's bind groups and scratch tensors bought nothing
 measurable against that - the stage sat at 45-46 ms either way - so the next
 thing there is chaining the stages ON THE DEVICE, not another cache.
 
+🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
+IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
+project it into q/k/v/gate, attend into a fresh one, project out. The
+projection is the LAST pass that reads the normalised tensor and the attention
+is the NEXT pass to write, so they can be one buffer. Worth, per attention, one
+pair- or MSA-sized tensor:
+
+| | peak before | after |
+|---|---|---|
+| AF3 trunk, 300 tokens | 654.8 MiB | **610.8** |
+| AF2, 512 MSA rows | 396.4 | **365.2** |
+| AF2, 128 rows | 156.1 | **147.1** |
+
+`tools/gpu/fold-af2.js`'s checksum is unchanged at both depths and a 68-token
+AF3 fold is bit-identical, which is what says the aliasing is real and not a
+race.
+
+🔴 **AND ONLY WHERE THE TWO AGREE ABOUT THE ELEMENT.** AF2's normalised tensor
+is always packed and its projected ones are packed only where the
+register-resident flash kernel accepts them; where it does not, one is half the
+bytes of the other, and sharing would hand a shader a buffer of the wrong
+length - which is not something WebGPU can catch. The fallback allocates a
+second tensor.
+
+🔴 **AND A READBACK BUFFER IS THE OTHER HALF OF THE SAME HABIT.** Anything
+written once at the END of a stack should be allocated there, not beside the
+scratch at the top - see the trunk note above. Where the copy is encoded into
+the same command buffer as the work (the template embedder, the input
+embedder) it cannot be moved without splitting the submit, and those stages are
+not the peak.
+
 🔴 **PREPARING AN AF2 ALIGNMENT WAS 525 ms OF MAIN-THREAD JAVASCRIPT AND
 NOBODY HAD MEASURED IT.** Three loops, none of them subtle, all of them once
 per residue: `parseA3m` ran a regex and a `toUpperCase` per character and built
