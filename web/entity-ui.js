@@ -31,6 +31,49 @@ import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.
  */
 export function createEntityList(rowsContainer, addButton, options = {}) {
   const notify = options.onChange ?? (() => {});
+  // 🔴 ASKED, NOT READ. "From the MSA search" is the one template source whose
+  // validity depends on a control this module does not own, and reaching for
+  // `document.getElementById("msa-mode")` from here would tie the entity list
+  // to one page's markup. The caller answers; a caller that does not answer
+  // gets the old behaviour, which is to assume it is fine.
+  const msaIsSearch = options.msaIsSearch ?? (() => true);
+
+  /**
+   * Everything the closed ⋮ button has to say about one entity.
+   *
+   * 🔴 ONE PAINTER, BECAUSE THERE WERE TWO AND THEY DISAGREED. `render()` set
+   * the title and the count from the modifications alone, and the fuller
+   * version - which counts the template too - lived inside the popup's
+   * `refreshBadge` and therefore only ran once the popup had been OPENED. So a
+   * template set through the list's own API, or restored into a fresh row,
+   * left the button reading "Modified residues" with no count on it.
+   */
+  const paintBadge = (badge, entity) => {
+    if (badge === null) return;
+    const count = (entity.modifications ?? []).length;
+    // 🔴 THE BADGE COUNTS EVERYTHING BEHIND THE BUTTON, not just the
+    // modifications. A template changes what is folded exactly as much as a
+    // modified residue does, and a closed popup hides both.
+    const templated = templateAsked(entity.template);
+    const total = count + (templated ? 1 : 0);
+    if (total > 0) badge.dataset.count = String(total);
+    else delete badge.dataset.count;
+    const said = [];
+    if (count > 0) said.push(`${count} modified residue${count === 1 ? "" : "s"}`);
+    if (templated) said.push("a template");
+    // 🔴 AND THE ONE COMBINATION THAT CANNOT FOLD, ON THE CLOSED BUTTON. An
+    // automatic template with the MSA not set to search has nothing to draw a
+    // hit from, and the popup that says so is shut. The only way anyone found
+    // out was to press Fold and be told.
+    if (templateKind(entity.template) === "search" && !msaIsSearch()) {
+      badge.dataset.warn = "template";
+      badge.title = "This template needs the MSA set to search";
+    } else {
+      delete badge.dataset.warn;
+      badge.title = said.length === 0 ? "Options" : said.join(" and ");
+    }
+    badge.setAttribute("aria-label", badge.title);
+  };
   /** @type {{type: string, value: string, copies: number}[]} */
   let entities = (options.initial ?? []).length > 0
     ? options.initial.map((entity) => ({ ...entity }))
@@ -75,22 +118,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     // took one character and lost the caret, which is a template that cannot be
     // named. python3 tools/entity-popup.py asserts the caret survives.
     const refreshBadge = () => {
-      const badge = anchor.querySelector(".entity-options");
-      const count = (entity.modifications ?? []).length;
-      // 🔴 THE BADGE COUNTS EVERYTHING BEHIND THE BUTTON, not just the
-      // modifications. A template changes what is folded exactly as much as a
-      // modified residue does, and a closed popup hides both - so the button
-      // has to say that something is set without being opened.
-      const templated = templateAsked(entity.template);
-      if (badge !== null) {
-        const total = count + (templated ? 1 : 0);
-        if (total > 0) badge.dataset.count = String(total);
-        else delete badge.dataset.count;
-        const said = [];
-        if (count > 0) said.push(`${count} modified residue${count === 1 ? "" : "s"}`);
-        if (templated) said.push("a template");
-        badge.title = said.length === 0 ? "Options" : said.join(" and ");
-      }
+      paintBadge(anchor.querySelector(".entity-options"), entity);
       entityPaint.get(entity)?.();
     };
     const draw = () => {
@@ -387,7 +415,19 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
           search: "The best hit the MSA search finds. Needs the MSA set to search.",
           upload: template.filename ?? "A PDB or mmCIF file from this machine.",
         };
-        status.textContent = template.status ?? waiting[kind];
+        // 🔴 A HINT UNTIL IT IS WRONG, AND THEN A WARNING. This line has always
+        // said "Needs the MSA set to search", and the way anyone found out it
+        // was not was to press Fold and be told - the fold reaches the template
+        // loop, finds no hits and throws. The page knows both halves before
+        // anything runs, so it says so here, where the choice is made.
+        const needsSearch = kind === "search" && !msaIsSearch();
+        if (needsSearch && template.status === undefined) {
+          status.className = "entity-popup-problem entity-template-status";
+          status.textContent = "The MSA is not set to search, so there are no hits"
+            + " to take a template from. Set the MSA to search, or name a structure.";
+        } else {
+          status.textContent = template.status ?? waiting[kind];
+        }
         section.append(status);
         popup.append(section);
       }
@@ -649,15 +689,11 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       options = document.createElement("button");
       options.type = "button";
       options.className = "btn btn-grey btn-small entity-options";
-      const count = (entity.modifications ?? []).length;
-      options.title = count === 0
-        ? "Modified residues" : `${count} modified residue${count === 1 ? "" : "s"}`;
-      options.setAttribute("aria-label", options.title);
       options.setAttribute("aria-haspopup", "dialog");
       options.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
-      // ...and it says so without being opened, because a modification changes
-      // what is folded and a closed popup hides it.
-      if (count > 0) options.dataset.count = String(count);
+      // ...and it says so without being opened, because a modification and a
+      // template each change what is folded and a closed popup hides both.
+      paintBadge(options, entity);
       options.addEventListener("click", (event) => {
         event.stopPropagation();
         openModifications(wrapper, entity, index);

@@ -69,7 +69,10 @@ const entityList = createEntityList(
   // The default is the sequence the old textarea shipped with, so the page
   // still has something foldable in it on arrival.
   { initial: [{ type: "protein", copies: 1,
-    value: "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK" }] });
+    value: "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK" }],
+    // See createEntityList: the entity list owns the template kind and this
+    // page owns the MSA control, so it answers rather than reaching for it.
+    msaIsSearch: () => msaMode() === "search" });
 
 // 🔴 EXPOSED FOR tools/fold-in-page.py, WHICH HAS NO OTHER WAY IN. The rows are
 // built by entity-ui.js and their model is a closure; a harness that wrote into
@@ -1439,9 +1442,20 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         // unruled for the whole trunk and grew its lines when the sampler's
         // first frame landed, which reads as the panel changing its mind.
         //
-        // Written only while it is empty: the parser overwrites this the
-        // moment it has a real structure, and that one is authoritative.
-        if ((renderer.chains?.length ?? 0) === 0) renderer.chains = trunkChainIds(chains);
+        // 🔴 AND WRITTEN EVERY TIME, NOT ONLY WHILE IT IS EMPTY. The guard used
+        // to be `if ((renderer.chains?.length ?? 0) === 0)`, to avoid fighting
+        // the parser - but the parser fills `chains` from the last structure it
+        // PARSED, which on a second fold is the PREVIOUS fold's. So a complex
+        // folded after a monomer, or after a complex with different chain
+        // lengths, drew the old fold's divider lines across the new fold's
+        // contact map for the whole trunk, and they snapped into place when the
+        // sampler's first frame landed.
+        //
+        // There is nothing to fight: this path is only reached when the current
+        // object has NO frames - the line above returns otherwise - so nothing
+        // has parsed a structure for this fold and these ids are the only
+        // authority there is. The parser overwrites them the moment it has one.
+        renderer.chains = trunkChainIds(chains);
         renderer.heatmapRenderer.setMaps({ contact: liveContacts });
         window.Heatmap?.updateVisibility?.(renderer);
         renderer.render("trunk-contacts");

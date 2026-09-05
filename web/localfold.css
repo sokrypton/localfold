@@ -594,6 +594,19 @@
   text-align: center;
 }
 
+/* 🔴 AND AMBER WHEN WHAT IS BEHIND THE BUTTON CANNOT FOLD. "From the MSA
+   search" with the MSA not set to search has no hits to draw a template from,
+   and the only way anyone found that out was to press Fold and be told. The
+   count is still the count; the colour is the warning, and the button's title
+   carries the sentence. */
+.entity-options[data-warn]::after {
+  background: #d97706;
+  content: attr(data-count) "!";
+}
+.entity-options[data-warn]:not([data-count])::after {
+  content: "!";
+}
+
 .entity-popup {
   position: absolute;
   top: calc(100% + 6px);
