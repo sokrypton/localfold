@@ -78,10 +78,6 @@ export const MODEL_BUNDLES = {
   // the page's licence dialog offers it as the way past AF3's terms rather than
   // as a second-best.
   //
-  // 🔴 NO `remote` YET. Its shards have not been uploaded, so this bundle is
-  // published beside the page. Give it a pinned `remote` the moment they are -
-  // a commit SHA, and a trailing slash; see the notes at the top of this file.
-  //
   // 🔴 AND THE RELEASE NUMBER IS PART OF THE NAME. Upstream's announcement
   // calls the model OpenBind-0; their registry's bare `openbind` is a name a
   // later release would answer to as well, which is how `openfold3` ended up
@@ -89,6 +85,7 @@ export const MODEL_BUNDLES = {
   openbind0: {
     model: "openbind0",
     directory: "./model-openbind0-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/9ddbadab408d696f43ce84a75ecb03be262a8f6b/openbind0-int5/",
     release: "openbind0-int5",
     variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
     load: () => import("./openbind0.js"),
