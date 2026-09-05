@@ -44,6 +44,18 @@ from safetensors_read import SafeTensors          # noqa: E402
 
 SHARD_LIMIT = 48 * 1024 * 1024
 
+# 🔴 THE PROJECTIONS ARE TRANSPOSED ON THE WAY OUT, INTO (inner, columns).
+# torch stores a Linear as (out_features, in_features) and computes x @ W.T;
+# src/evoformer/transition.js's tiled kernel - the one CLAUDE.md measures at
+# 1140-1550 GFLOP/s - indexes `weights[k * columns + column]`, which is
+# (in_features, out_features). Transposing here is one pass at export time;
+# transposing per fold would be 573 M elements a fold on the main thread, and
+# writing a second kernel to read the other layout would duplicate the fastest
+# dense projection in the repository.
+TRANSPOSED = ("qkv/weights", "attn_out/weights", "fc1/weights", "fc2/weights",
+              "lm/projection/weights", "lm/downproject/weights",
+              "lm/pair_mlp_1/weights", "lm/pair_mlp_2/weights")
+
 # The tower, per block. The name on the right is what the browser asks for; the
 # suffix decides whether tools/quantize_af3.py will touch it.
 BLOCK_TENSORS = (
@@ -135,14 +147,25 @@ def main():
                   if k.startswith('esmc.transformer.blocks.')})
     d_model = tower.shape('esmc.embed.weight')[1]
 
-    writer.add('embed/weights', np.asarray(tower['esmc.embed.weight'], np.float32))
-    writer.add('final_norm/scale',
-               np.asarray(tower['esmc.transformer.norm.weight'], np.float32))
+    def add(name, values):
+        """Transposed where the GPU wants (inner, columns); verbatim otherwise."""
+        values = np.asarray(values, np.float32)
+        leaf = name.split('/', 2)[2] if name.startswith('blocks/') else name
+        if leaf in TRANSPOSED:
+            if values.ndim != 2:
+                raise SystemExit('%s is %dd; only a matrix can be transposed'
+                                 % (name, values.ndim))
+            values = np.ascontiguousarray(values.T)
+        writer.add(name, values)
+
+    add('embed/weights', np.asarray(tower['esmc.embed.weight'], np.float32))
+    add('final_norm/scale',
+        np.asarray(tower['esmc.transformer.norm.weight'], np.float32))
     for layer in range(layers):
         for leaf, name in BLOCK_TENSORS:
             source = 'esmc.transformer.blocks.%d.%s' % (layer, leaf)
-            writer.add('blocks/%d/%s' % (layer, name),
-                       np.asarray(tower[source], np.float32))
+            add('blocks/%d/%s' % (layer, name),
+                np.asarray(tower[source], np.float32))
     if arguments.include_lm_head:
         for leaf, name in (('lm_head.0.weight', 'lm_head/dense/weights'),
                            ('lm_head.0.bias', 'lm_head/dense/bias'),
@@ -150,10 +173,10 @@ def main():
                            ('lm_head.2.bias', 'lm_head/norm/offset'),
                            ('lm_head.3.weight', 'lm_head/decoder/weights'),
                            ('lm_head.3.bias', 'lm_head/decoder/bias')):
-            writer.add(name, np.asarray(tower[leaf], np.float32))
+            add(name, np.asarray(tower[leaf], np.float32))
 
     for leaf, name in SHIM_TENSORS:
-        writer.add(name, np.asarray(fold['language_model.' + leaf], np.float32))
+        add(name, np.asarray(fold['language_model.' + leaf], np.float32))
     writer.close()
 
     parameters = sum(int(np.prod(r['shape'])) for r in writer.records.values())
@@ -174,6 +197,7 @@ def main():
                           'shim': arguments.esmfold2,
                           'layers': layers, 'width': d_model,
                           'mixEntries': layers + 1},
+        'weightLayout': 'inner-major',
         # 🔴 NAMED, BECAUSE THE QUANTISER'S RULE IS ABOUT SUFFIXES AND THESE
         # ARE NOT ABOUT THEIR SUFFIXES. `embed/weights` is the input to all 36
         # blocks; `lm/combine` is 37 numbers that become a softmax over the

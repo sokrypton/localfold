@@ -27,7 +27,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
-  createLinearShader, createPrepareShader, createSwigluShader,
+  createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
 } from "./block-webgpu.js";
 
 /**
@@ -83,9 +83,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   let share = weight[0];
   for (var o = local.x; o < ${pair}u; o += ${LANES}u) {
-    let w = o * ${model}u;
     var sum = 0.0;
-    for (var i = 0u; i < ${model}u; i += 1u) { sum += row_values[i] * projection[w + i]; }
+    for (var i = 0u; i < ${model}u; i += 1u) {
+      sum += row_values[i] * projection[i * ${pair}u + o];
+    }
     accumulator[row * ${pair}u + o] += share * sum;
   }
 }`;
@@ -195,6 +196,13 @@ export class EsmcTowerGpu {
         pass.setBindGroup(0, bind(built, bindings));
         pass.dispatchWorkgroups(Math.min(count, GRID_WIDTH), Math.ceil(count / GRID_WIDTH));
       };
+      // The tiled linear pass means something different by each grid axis.
+      const dispatchLinear = (pass, built, bindings, outer) => {
+        pass.setPipeline(built);
+        pass.setBindGroup(0, bind(built, bindings));
+        const [x, y] = linearGrid(rows, outer);
+        pass.dispatchWorkgroups(x, y);
+      };
 
       const readBack = async (allocation, elements, label) => {
         const readback = this.allocator.allocate(`esmc.read.${label}`, elements * 4,
@@ -271,13 +279,13 @@ export class EsmcTowerGpu {
         const encoder = this.device.createCommandEncoder({ label: `esmc-block-${layer}` });
         const pass = encoder.beginComputePass({ label: `esmc-block-${layer}` });
         dispatchInto(pass, normPipeline, [current, attnScale, attnOffset, normed], rows);
-        dispatchInto(pass, qkvPipeline, [normed, qkvWeights, qkv], rows);
+        dispatchLinear(pass, qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
         dispatchInto(pass, preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
         dispatchInto(pass, attentionPipeline, [query, key, value, context], rows * heads);
-        dispatchInto(pass, outPipeline, [context, attnOut, current, afterAttention], rows);
+        dispatchLinear(pass, outPipeline, [context, attnOut, current, afterAttention], model);
         dispatchInto(pass, swigluPipeline,
           [afterAttention, ffnScale, ffnOffset, fc1, gated], rows);
-        dispatchInto(pass, downPipeline, [gated, fc2, afterAttention, next], rows);
+        dispatchLinear(pass, downPipeline, [gated, fc2, afterAttention, next], model);
         // 🔴 THE LAST STATE IS FINAL-NORMED AND THE OTHER 36 ARE NOT, so the
         // mix reads `next` directly here and a normed copy on the last layer.
         if (layer + 1 < layers) {
@@ -331,7 +339,7 @@ export class EsmcTowerGpu {
       {
         const encoder = this.device.createCommandEncoder({ label: "esmc-single" });
         const pass = encoder.beginComputePass();
-        dispatchInto(pass, singlePipeline, [accumulator, downWeights, single], rows);
+        dispatchLinear(pass, singlePipeline, [accumulator, downWeights, single], pair);
         pass.end();
         this.device.queue.submit([encoder.finish()]);
         await this.device.queue.onSubmittedWorkDone();

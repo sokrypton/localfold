@@ -51,6 +51,13 @@ async function tensor(manifest, name, base) {
   return new Float32Array(buffer.slice(start, start + count * 4));
 }
 
+// 🔴 `args` IS THE RAW ARGV ARRAY, NOT AN OPTIONS OBJECT. Reading a flag off it
+// as a property is undefined and falls through to the default in silence.
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
 const relative = (got, want) => {
   let error = 0, total = 0;
   for (let i = 0; i < want.length; i += 1) {

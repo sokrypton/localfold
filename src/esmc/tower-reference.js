@@ -74,19 +74,25 @@ export function layerNorm(values, rows, channels, scale, offset, eps = 1e-5) {
 }
 
 /**
- * (rows, inner) @ weights^T, with `weights` stored (outer, inner) row-major -
- * which is how torch stores a Linear and how the export writes it.
+ * (rows, inner) @ weights, with `weights` stored (inner, outer) row-major.
+ *
+ * 🔴 THIS IS NOT torch's LAYOUT AND THE EXPORT TRANSPOSES INTO IT. torch stores
+ * a Linear as (out, in) and computes x @ W.T; the tiled kernel this port uses on
+ * the GPU - src/evoformer/transition.js, measured at 1140-1550 GFLOP/s - indexes
+ * `weights[k * columns + column]`, which is (in, out). One layout for the
+ * bundle, the reference and the shader, decided at export; the alternative is a
+ * transpose per fold or a second kernel.
  */
 export function linear(input, rows, inner, weights, outer) {
   const out = new Float32Array(rows * outer);
   for (let row = 0; row < rows; row += 1) {
     const source = row * inner;
     const destination = row * outer;
-    for (let o = 0; o < outer; o += 1) {
-      const w = o * inner;
-      let sum = 0;
-      for (let i = 0; i < inner; i += 1) sum += input[source + i] * weights[w + i];
-      out[destination + o] = sum;
+    for (let i = 0; i < inner; i += 1) {
+      const value = input[source + i];
+      if (value === 0) continue;
+      const w = i * outer;
+      for (let o = 0; o < outer; o += 1) out[destination + o] += value * weights[w + o];
     }
   }
   return out;

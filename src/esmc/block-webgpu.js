@@ -92,34 +92,120 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * not at compile, and reads as a broken kernel. Binding a one-element dummy
  * instead is the same trap with an extra buffer.
  */
+export const ROW_TILE = 4;
+export const COLUMNS_PER_LANE = 4;
+const K_CHUNK = 32;
+
+/**
+ * out = input @ weights (+ residual), tiled over rows AND columns.
+ *
+ * 🔴 THE FIRST VERSION GAVE EACH WORKGROUP ONE ROW AND EVERY ROW RE-READ THE
+ * WHOLE WEIGHT MATRIX. At 300 tokens that was 19.1 GB of weight traffic in
+ * 218 ms - 87.6 GB/s against a device with about 100 - so it sat at the
+ * bandwidth limit doing three hundred times the reads it needed.
+ *
+ * 🔴 TRANSPOSING THE BUNDLE TO (inner, outer) WAS WORTH 3.8x ON ITS OWN, and
+ * not for the reason the traffic arithmetic suggests. It does not reduce the
+ * reads; it makes ADJACENT LANES READ ADJACENT ADDRESSES, so a weight row is
+ * fetched once and shared, and the effective rate went to 331 GB/s - above
+ * DRAM, which is what a cache hit looks like from outside.
+ *
+ * 🔴 WHAT IS LEFT IS ARITHMETIC INTENSITY, WHICH IS WHAT THE TILE BUYS. A
+ * workgroup owns ${ROW_TILE} rows and ${COLUMNS_PER_LANE} columns a lane, so
+ * one staged weight serves ${ROW_TILE} rows and one staged input serves
+ * ${COLUMNS_PER_LANE} columns: ${ROW_TILE * COLUMNS_PER_LANE} multiply-adds per
+ * ${ROW_TILE + COLUMNS_PER_LANE} reads, against one per one before. The
+ * accumulators are ${ROW_TILE * COLUMNS_PER_LANE} per lane, which is the number
+ * that must not grow - src/af3/grid-attention-webgpu.js records a register
+ * spill at 128 costing 4x the wrong way.
+ *
+ * 🔴 AND A ROW TILE OF EIGHT IS SLOWER THAN FOUR, MEASURED. 32 accumulators a
+ * lane against 16: 40.6 ms at 300 tokens against 36.1, and 19.9 against 17.0 at
+ * 61. The same shape transition-webgpu.js records - a tile is only worth taking
+ * where there is occupancy to spare - and the reason this constant is a
+ * measurement rather than a guess.
+ */
+/**
+ * The grid a tiled linear pass wants: column tiles across x, row tiles up y.
+ *
+ * 🔴 NOT THE ROW COUNT. Every other kernel here takes one workgroup a row and
+ * flattens into (x, y) against GRID_WIDTH; this one means something different
+ * by each axis, and dispatching it the old way would leave most of the output
+ * unwritten - which reads as a speedup, not as an error.
+ */
+export function linearGrid(rows, outer) {
+  return [Math.ceil(outer / (LANES * COLUMNS_PER_LANE)), Math.ceil(rows / ROW_TILE)];
+}
+
 export function createLinearShader({ rows, inner, outer }, withResidual) {
+  const columnsPerGroup = LANES * COLUMNS_PER_LANE;
+  const accumulators = [];
+  for (let t = 0; t < ROW_TILE; t += 1) {
+    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
+      accumulators.push(`  var acc_${t}_${j} = 0.0;`);
+    }
+  }
+  const inner_body = [];
+  for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
+    inner_body.push(`      let w_${j} = select(0.0, `
+      + `weights[k_absolute * ${outer}u + column_origin + local.x + ${j * LANES}u], `
+      + `column_origin + local.x + ${j * LANES}u < ${outer}u);`);
+  }
+  for (let t = 0; t < ROW_TILE; t += 1) {
+    inner_body.push(`      let s_${t} = staged[${t}u * ${K_CHUNK}u + k];`);
+    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
+      inner_body.push(`      acc_${t}_${j} += s_${t} * w_${j};`);
+    }
+  }
+  const stores = [];
+  for (let t = 0; t < ROW_TILE; t += 1) {
+    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
+      stores.push(`  {
+    let row = row_origin + ${t}u;
+    let column = column_origin + local.x + ${j * LANES}u;
+    if (row < ${rows}u && column < ${outer}u) {
+      let slot = row * ${outer}u + column;
+      output[slot] = ${withResidual ? `residual[slot] + acc_${t}_${j}` : `acc_${t}_${j}`};
+    }
+  }`);
+    }
+  }
   return `
 @group(0) @binding(0) var<storage, read> input: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 ${withResidual ? "@group(0) @binding(2) var<storage, read> residual: array<f32>;" : ""}
-@group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> destination: array<f32>;
+@group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> output: array<f32>;
 
-var<workgroup> row_values: array<f32, ${inner}>;
+var<workgroup> staged: array<f32, ${ROW_TILE * K_CHUNK}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let row = group.x + group.y * ${GRID_WIDTH}u;
-  if (row >= ${rows}u) { return; }
-  let base = row * ${inner}u;
-  for (var c = local.x; c < ${inner}u; c += ${LANES}u) {
-    row_values[c] = input[base + c];
-  }
-  workgroupBarrier();
-  for (var o = local.x; o < ${outer}u; o += ${LANES}u) {
-    let w = o * ${inner}u;
-    var sum = 0.0;
-    for (var i = 0u; i < ${inner}u; i += 1u) {
-      sum += row_values[i] * weights[w + i];
+  let row_origin = group.y * ${ROW_TILE}u;
+  let column_origin = group.x * ${columnsPerGroup}u;
+  if (row_origin >= ${rows}u) { return; }
+
+${accumulators.join("\n")}
+
+  for (var k0 = 0u; k0 < ${inner}u; k0 += ${K_CHUNK}u) {
+    // The whole workgroup stages this chunk of every row it owns.
+    for (var slot = local.x; slot < ${ROW_TILE * K_CHUNK}u; slot += ${LANES}u) {
+      let t = slot / ${K_CHUNK}u;
+      let k = slot % ${K_CHUNK}u;
+      let row = row_origin + t;
+      staged[slot] = select(0.0, input[row * ${inner}u + k0 + k],
+                            row < ${rows}u && k0 + k < ${inner}u);
     }
-    let slot = row * ${outer}u + o;
-    destination[slot] = ${withResidual ? "residual[slot] + sum" : "sum"};
+    workgroupBarrier();
+    for (var k = 0u; k < ${K_CHUNK}u; k += 1u) {
+      let k_absolute = k0 + k;
+      if (k_absolute >= ${inner}u) { break; }
+${inner_body.join("\n")}
+    }
+    workgroupBarrier();
   }
+
+${stores.join("\n")}
 }`;
 }
 
@@ -338,11 +424,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var c = local.x; c < ${ffn}u; c += ${LANES}u) {
     var gate = 0.0;
     var linear = 0.0;
-    let gateRow = c * ${model}u;
-    let linearRow = (c + ${ffn}u) * ${model}u;
     for (var i = 0u; i < ${model}u; i += 1u) {
-      gate += row_values[i] * weights[gateRow + i];
-      linear += row_values[i] * weights[linearRow + i];
+      let row = i * ${2 * ffn}u;
+      gate += row_values[i] * weights[row + c];
+      linear += row_values[i] * weights[row + ${ffn}u + c];
     }
     destination[row * ${ffn}u + c] = (gate / (1.0 + exp(-gate))) * linear;
   }
@@ -453,24 +538,31 @@ export class EsmcBlockGpu {
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "esmc-block" });
       const pass = encoder.beginComputePass({ label: "esmc-block" });
+      const bindOf = (built, bindings) => this.device.createBindGroup({
+        layout: built.getBindGroupLayout(0),
+        entries: bindings.map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer },
+        })),
+      });
       const dispatch = (built, bindings, count) => {
         pass.setPipeline(built);
-        pass.setBindGroup(0, this.device.createBindGroup({
-          layout: built.getBindGroupLayout(0),
-          entries: bindings.map((allocation, binding) => ({
-            binding, resource: { buffer: allocation.buffer },
-          })),
-        }));
+        pass.setBindGroup(0, bindOf(built, bindings));
         pass.dispatchWorkgroups(Math.min(count, GRID_WIDTH), Math.ceil(count / GRID_WIDTH));
+      };
+      const dispatchLinear = (built, bindings, outer) => {
+        pass.setPipeline(built);
+        pass.setBindGroup(0, bindOf(built, bindings));
+        const [x, y] = linearGrid(rows, outer);
+        pass.dispatchWorkgroups(x, y);
       };
 
       dispatch(normPipeline, [x, attnScale, attnOffset, normed], rows);
-      dispatch(qkvPipeline, [normed, qkvWeights, qkv], rows);
+      dispatchLinear(qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
       dispatch(preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
       dispatch(attentionPipeline, [query, key, value, context], rows * heads);
-      dispatch(outPipeline, [context, attnOutScaled, x, afterAttention], rows);
+      dispatchLinear(outPipeline, [context, attnOutScaled, x, afterAttention], model);
       dispatch(swigluPipeline, [afterAttention, ffnScale, ffnOffset, fc1, gated], rows);
-      dispatch(downPipeline, [gated, fc2Scaled, afterAttention, output], rows);
+      dispatchLinear(downPipeline, [gated, fc2Scaled, afterAttention, output], model);
       pass.end();
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * model * 4);
       encoder.copyBufferToBuffer(normed.buffer, 0, normedReadback.buffer, 0, rows * model * 4);
