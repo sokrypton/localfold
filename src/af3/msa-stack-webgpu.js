@@ -16,10 +16,11 @@
  * src/af3/pair-track-gpu.js.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
-  packPairTrackWeights,
+  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_STORAGE, compilePairTrack, createAddShader,
+  encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import {
   createOuterProductMeanShaders, packOuterProductMeanWeights,
@@ -115,10 +116,25 @@ export class Af3MsaStackGpu {
       const pairMask = keep(this.allocator.upload("af3-msa.pair-mask", state.pairMask, storage));
       const msaMask = keep(this.allocator.upload("af3-msa.msa-mask", state.msaMask, storage));
 
+      // 🔴 SEVEN PAIR-SIZED SCRATCH BUFFERS, AND FIVE OF THEM ARE PACKED.
+      // compilePairTrack builds every shader that touches these from
+      // PAIR_SCRATCH_STORAGE, so they have always been READ two halves to a
+      // word here; only the allocation said otherwise, and a buffer LARGER
+      // than a shader expects is not something WebGPU can catch. At 200 tokens
+      // that was 51 MiB, on the stage that holds an AF3 trunk's peak wasted.
       const scratch = [];
       for (let index = 0; index < 7; index += 1) {
         scratch.push(keep(this.allocator.allocate(
-          `af3-msa.scratch${index}`, pairs * PAIR_CHANNELS * 4, storage)));
+          `af3-msa.scratch${index}`,
+          // 🔴 AND scratch[0] IS BORROWED BY A KERNEL THAT IS NOT THE PAIR
+          // TRACK'S. `opm.contract` writes it and `opm.add` reads it, both in
+          // f32, so it has to be big enough for the WIDER of its two readings.
+          // Sizing it by the packed one alone put the outer product mean's
+          // output half outside its buffer, which WebGPU clamps rather than
+          // refuses: check-af3-trunk went from 4e-5 to relRMS 2.82.
+          index === 0
+            ? pairs * PAIR_CHANNELS * 4
+            : storageBytes(pairs * PAIR_CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-msa.bias", gridHeads * pairs * 4, storage));
