@@ -33,12 +33,14 @@ import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
+import { storageBytes } from "../runtime/storage.js";
 import { releaseWeights } from "./weights.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, compilePairTrack, createAddShader, encodePairTrack,
+  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_STORAGE,
+  compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import { createTransitionShader, packTransitionWeights } from "./transition-webgpu.js";
@@ -289,10 +291,15 @@ export class Af3PairformerStackGpu {
       const pairMask = keep(this.allocator.upload("af3-block.pair-mask", state.pairMask, storage));
       const seqMask = keep(this.allocator.upload("af3-block.seq-mask", state.seqMask, storage));
 
-      // Seven pair-sized scratch buffers, shared by every operation.
+      // Seven pair-sized scratch buffers, shared by every operation. Their
+      // storage is PAIR_SCRATCH_STORAGE's to say, and the shaders read the
+      // same array - a buffer half the bytes of what a shader expects is not
+      // something WebGPU can catch.
       const scratch = [];
       for (let index = 0; index < 7; index += 1) {
-        scratch.push(keep(this.allocator.allocate(`af3-block.scratch${index}`, pairBytes, storage)));
+        scratch.push(keep(this.allocator.allocate(
+          `af3-block.scratch${index}`,
+          storageBytes(pairs * PAIR_CHANNELS, PAIR_SCRATCH_STORAGE[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-block.bias", gridHeads * pairs * 4, storage));

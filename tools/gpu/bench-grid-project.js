@@ -14,6 +14,21 @@
  * Arms are the row tile. Both kernels are timed at each, and every arm is
  * checked against the first, because a tile the dispatch does not match leaves
  * rows unwritten and reads as a speedup.
+ *
+ * 🔴 A `p` SUFFIX PACKS q/k/v/gate TWO HALVES TO A WORD, which is not only a
+ * storage change: `project` gives each lane ONE output channel and consecutive
+ * lanes consecutive channels, so neither half of a packed word is owned by the
+ * lane that would write it. The packed form gives a lane a PAIR of adjacent
+ * channels - half the lanes, twice the accumulators - and twice the
+ * accumulators is exactly where src/evoformer/attention.js records an AF2 tile
+ * getting SLOWER, because sixteen vec4 spill. That is the question this arm
+ * exists to answer:
+ *
+ *     node tools/gpu-chrome.mjs tools/gpu/bench-grid-project.js --arms=8,8p
+ *
+ * A packed arm is EXPECTED to differ from the first in `relRmsVsFirst` - about
+ * 1e-3, which is half precision and not a fault. A tile that leaves rows
+ * unwritten shows up far larger; that is still what the column is for.
  */
 import { createGridAttentionShaders } from "../../src/af3/grid-attention-webgpu.js";
 
@@ -101,12 +116,15 @@ export async function main(device, args) {
   };
   for (const spec of arms_spec) {
     const [shapeSpec, drop] = spec.split(":");
-    const [rows, chunk] = shapeSpec.split("/").map(Number);
+    const packed = shapeSpec.endsWith("p");
+    const [rows, chunk] = (packed ? shapeSpec.slice(0, -1) : shapeSpec).split("/").map(Number);
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose: false,
         projectRows: rows, projectOutRows: rows, attendKeyChunk: chunk,
       },
-      offsets, 1e-5, "fast", DIALECT);
+      // ...gathered and normalized stay f32 here: this bench asks about
+      // q/k/v/gate alone, which is the one that needs the ownership change.
+      offsets, 1e-5, "fast", DIALECT, "f32", "f32", packed ? "f16" : "f32");
     const build = async (source, buffers, tile) => {
       const pipeline = await device.createComputePipelineAsync({
         layout: "auto",

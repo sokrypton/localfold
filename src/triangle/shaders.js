@@ -1,3 +1,4 @@
+import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
 const declaration = (precision) => precision === "f16" ? "enable f16;\n" : "";
 const scalar = (precision) => precision;
 const read = (precision, expression) =>
@@ -87,6 +88,7 @@ export function createTriangleShaders(
   projectTile = PROJECT_TILE,
   residual = false,
   contractTile = CONTRACT_TILE_DEFAULT,
+  normalizedStorage = "f32",
 ) {
   if (variance !== "two-pass" && variance !== "fast") {
     throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
@@ -151,7 +153,13 @@ export function createTriangleShaders(
    * @param {string} scale weight offset name for the scale
    * @param {string} offset weight offset name for the bias
    */
-  const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row") => `
+  // 🔴 THE STORE MAY BE PACKED, AND THE WRITE LOOP IS WHY IT CAN BE. A
+  // workgroup owns a tile of whole rows, so both channels of a packed word are
+  // produced by the same dispatch; walking WORDS rather than channels puts
+  // them in the same INVOCATION, which is what makes it a store and not a
+  // read-modify-write race. See src/runtime/storage.js.
+  const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row",
+                           outputStorage = "f32") => `
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${shape[count === "CZ" ? "cZ" : "cHidden"]}>;
 var<workgroup> partial_sum: array<f32, 64>;
 var<workgroup> partial_squares: array<f32, 64>;
@@ -220,24 +228,34 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var index = local; index < NORMALIZE_ROWS * ${count}; index += 64u) {
-    let row = base_row + index / ${count};
+  // A lane owns a PAIR of channels, so it owns the whole word they share. The
+  // channel count is even in every caller; the pair loop is the assertion.
+  const PAIR_COUNT: u32 = ${count} / 2u;
+  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
+    let slot_of = word / PAIR_COUNT;
+    let row = base_row + slot_of;
     if (row >= PAIRS) { continue; }
-    let channel = index % ${count};
-    let value = (tile[index] - row_mean[index / ${count}])
-      * row_inverse_std[index / ${count}];
-    normalized[row * ${count} + channel] = value
+    let channel = (word % PAIR_COUNT) * 2u;
+    let index = slot_of * ${count} + channel;
+    let scaled = row_inverse_std[slot_of];
+    let centre = row_mean[slot_of];
+    let low = (tile[index] - centre) * scaled
       * ${readWeight(`weights[W_${scale} + channel]`)}
       + ${readWeight(`weights[W_${offset} + channel]`)};
+    let high = (tile[index + 1u] - centre) * scaled
+      * ${readWeight(`weights[W_${scale} + channel + 1u]`)}
+      + ${readWeight(`weights[W_${offset} + channel + 1u]`)};
+    let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
+    ${storedPair(outputStorage, "normalized", "pair_word", "low", "high")}
   }
 }`;
 
   const normalizeInput = `${common}
 @group(0) @binding(0) var<storage, read> source: array<${t}>;
 @group(0) @binding(1) var<storage, read> weights: array<${tw}>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(normalizedStorage)}>;
 ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + ${channel}]`),
-                  "LAYERNORMINWEIGHT", "LAYERNORMINBIAS")}`;
+                  "LAYERNORMINWEIGHT", "LAYERNORMINBIAS", "row", normalizedStorage)}`;
 
   // Where the register block is spent. Each invocation owns ROWS_PER_THREAD
   // pair rows by COLUMNS_PER_THREAD hidden channels, and the workgroup is
@@ -291,7 +309,7 @@ ${stagedLayerNorm("CZ", (row, channel) => read(precision, `source[${row} * CZ + 
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
-@group(0) @binding(0) var<storage, read> z: array<f32>;
+@group(0) @binding(0) var<storage, read> z: array<${storageArray(normalizedStorage)}>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> a: array<f32>;
@@ -335,7 +353,7 @@ fn main(
     ${overRows((r) => `{
         let row = row0 + ${r}u * 8u;
         var value = 0.0;
-        if (row < PAIRS && source_c < CZ) { value = z[row * CZ + source_c]; }
+        if (row < PAIRS && source_c < CZ) { value = ${storedElement(normalizedStorage, "z", "row * CZ + source_c")}; }
         ${rowAt("staged", r)} = ${accNarrow("value")};
       }`)}
     tile_source[tile_index] = staged;
@@ -518,7 +536,7 @@ ${stagedLayerNorm("CH", (row, channel) => `source[${channel} * PAIRS + ${row}]`,
 const TILE_ROWS: u32 = ${PROJECT_TILE_ROWS}u;
 const TILE_COLUMNS: u32 = ${PROJECT_TILE_COLUMNS}u;
 
-@group(0) @binding(0) var<storage, read> z: array<f32>;
+@group(0) @binding(0) var<storage, read> z: array<${storageArray(normalizedStorage)}>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<${tw}>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
@@ -570,7 +588,7 @@ fn main(
         var x_value = 0.0;
         var z_value = 0.0;
         if (row < PAIRS && source_k < CH) { x_value = x[row * CH + source_k]; }
-        if (row < PAIRS && source_k < CZ) { z_value = z[row * CZ + source_k]; }
+        if (row < PAIRS && source_k < CZ) { z_value = ${storedElement(normalizedStorage, "z", "row * CZ + source_k")}; }
         ${rowAt("staged_x", r)} = ${accNarrow("x_value")};
         ${rowAt("staged_z", r)} = ${accNarrow("z_value")};
       }`)}

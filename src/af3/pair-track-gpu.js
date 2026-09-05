@@ -100,7 +100,8 @@ export async function compilePairTrack(cache, options) {
     // of this track's updates do that now; see the note in
     // src/af3/transition-webgpu.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, ...sources } = createTriangleShaders(
-      shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true);
+      shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
+      undefined, PAIR_SCRATCH_STORAGE[0]);
     // 🔴 THE PROJECTION TILE TRAVELS WITH THE SHADERS. encodePairTrack divides
     // its dispatch by exactly this, so the two cannot drift apart the way a
     // constant repeated in both places did once - see src/triangle/shaders.js.
@@ -109,7 +110,8 @@ export async function compilePairTrack(cache, options) {
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`tri:${direction}:${name}`,
-                  `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}:${name}`,
+                  `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
+                  + `:${PAIR_SCRATCH_STORAGE[0]}:${name}`,
                   source);
     }
   }
@@ -118,11 +120,14 @@ export async function compilePairTrack(cache, options) {
     const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision },
-      gridOffsets, epsilon, variance, dialect);
+      gridOffsets, epsilon, variance, dialect,
+      PAIR_SCRATCH_STORAGE[5], PAIR_SCRATCH_STORAGE[0]);
     pipelines.gridTiles = tiles;
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`grid:${key}:${name}`,
-                  `${base}:grid:${key}:${stagedPrecision}:${name}`, source);
+                  `${base}:grid:${key}:${stagedPrecision}`
+                  + `:${PAIR_SCRATCH_STORAGE[5]}${PAIR_SCRATCH_STORAGE[0]}:${name}`,
+                  source);
     }
   }
   // The transition stages two blocks of its own - the layer-normed rows and the
@@ -170,6 +175,23 @@ export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrec
  * @param {object} context `run(label, pipeline, buffers, x, y, z)` records one
  *   pass; `scratch` is seven pair-sized buffers, reused by every operation.
  */
+/**
+ * How each of the block's seven pair-sized scratch buffers is stored.
+ *
+ * 🔴 ONE STATEMENT OF IT, because two would be a buffer of the right element
+ * count and the wrong byte length - which nothing validates and nothing throws
+ * on. The allocation reads this and so does every shader that touches the
+ * buffer; see src/runtime/storage.js for what a packed word costs and for the
+ * rule that one invocation must own both of its halves.
+ *
+ * 🔴 AND INDEX 5 IS THE ONLY ONE NO TRIANGLE OPERATION TOUCHES. The other six
+ * are shared between the triangle multiplications and the grid attentions, so
+ * converting any of them is a change to both at once; this one is written by
+ * `grid.attend` and read by `grid.project-out` and by nothing else, which is
+ * why it is the one converted first.
+ */
+export const PAIR_SCRATCH_STORAGE = ["f16", "f32", "f32", "f32", "f32", "f16", "f32"];
+
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;
   const channels = context.channels ?? PAIR_CHANNELS;

@@ -1,3 +1,4 @@
+import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
 /**
  * AF3's triangle ("grid") self-attention on the GPU.
  *
@@ -177,7 +178,35 @@ export function packGridAttentionWeights(weights, shape = undefined) {
   return { data, offsets };
 }
 
-export function createGridAttentionShaders(shape, offsets, epsilon, variance, dialect) {
+/**
+ * @param {"f32"|"f16"} [normalizedStorage] how the layer-normed pair between
+ *   `normalize` and its three readers - `bias`, `project` and the triangle's
+ *   own projections, which share the buffer - is stored.
+ * @param {"f32"|"f16"} [gatheredStorage] how the attended result between
+ *   `attend` and `project_out` is stored. It is one of the seven pair-sized
+ *   scratch buffers the pairformer block shares, and the ONLY one no other
+ *   operation touches - which is why it is the one converted first. See
+ *   src/runtime/storage.js.
+ */
+export function createGridAttentionShaders(
+  shape, offsets, epsilon, variance, dialect, gatheredStorage = "f32",
+  normalizedStorage = "f32", qkvgStorage = "f32",
+) {
+  const packGathered = gatheredStorage === "f16";
+  const packNormalized = normalizedStorage === "f16";
+  // 🔴 PACKING q/k/v/gate IS A CHANGE TO WHO OWNS AN OUTPUT CHANNEL, not just
+  // to the buffer. `project` gives each lane ONE channel and consecutive lanes
+  // consecutive channels, so the two halves of a packed word are produced by
+  // two different lanes - and WGSL cannot write sixteen bits, so neither could
+  // store its half without reading the other's back. Under packing a lane takes
+  // a PAIR of adjacent channels instead: half the lanes, twice the
+  // accumulators, one word written where two floats were.
+  //
+  // Twice the accumulators is the risk, and it is why this is measured rather
+  // than assumed - src/evoformer/attention.js records a tile in AF2 that got
+  // SLOWER when its accumulators doubled, because sixteen vec4 spill.
+  // tools/gpu/bench-grid-project.js races the two.
+  const packQkvg = qkvgStorage === "f16";
   const { n, channels, heads, dimension, transpose } = shape;
   // 🔴 THE TILES TRAVEL BACK OUT WITH THE SHADERS, as `tiles`, because the
   // dispatch divides by exactly these. A caller that reads the constants
@@ -232,7 +261,7 @@ const NORMALIZE_ROWS: u32 = ${NORMALIZE_ROWS}u;
 const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<storage, read_write> normalized: array<f32>;
+@group(0) @binding(2) var<storage, read_write> normalized: array<${storageArray(normalizedStorage)}>;
 
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${channels}>;
 var<workgroup> partial_sum: array<f32, 64>;
@@ -288,20 +317,30 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += 64u) {
-    let row = base_row + index / CHANNELS;
+  // A lane owns a PAIR of channels, so it owns the whole word they share; see
+  // src/runtime/storage.js. CHANNELS is 128 here and even in every dialect.
+  const PAIR_COUNT: u32 = CHANNELS / 2u;
+  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
+    let slot_of = word / PAIR_COUNT;
+    let row = base_row + slot_of;
     if (row >= PAIRS) { continue; }
-    let c = index % CHANNELS;
-    normalized[row * CHANNELS + c] =
-      (tile[index] - row_mean[index / CHANNELS]) * row_inverse_std[index / CHANNELS]
+    let c = (word % PAIR_COUNT) * 2u;
+    let index = slot_of * CHANNELS + c;
+    let centre = row_mean[slot_of];
+    let scaled = row_inverse_std[slot_of];
+    let low = (tile[index] - centre) * scaled
       * weights[W_NORM_SCALE + c] + weights[W_NORM_OFFSET + c];
+    let high = (tile[index + 1u] - centre) * scaled
+      * weights[W_NORM_SCALE + c + 1u] + weights[W_NORM_OFFSET + c + 1u];
+    let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
+    ${storedPair(normalizedStorage, "normalized", "pair_word", "low", "high")}
   }
 }`;
 
   // bias[h][i][j]. Laid out head-major because the attention pass reads a whole
   // row of it per (row, i, head).
   const biasPass = `${common}
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
+@group(0) @binding(0) var<storage, read> normalized: array<${storageArray(normalizedStorage)}>;
 // ...as vec4, which is why W_BIAS and HEADS must both be multiples of four.
 @group(0) @binding(1) var<storage, read> projection: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> bias: array<f32>;
@@ -319,7 +358,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   ${Array.from({ length: heads / 4 }, (_, h) =>
     `var total${h} = vec4<f32>(0.0);`).join("\n  ")}
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    let value = normalized[base + c];
+    let value = ${storedElement(normalizedStorage, "normalized", "base + c")};
     let column = (W_BIAS + c * HEADS) / 4u;
     ${Array.from({ length: heads / 4 }, (_, h) =>
       `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
@@ -341,17 +380,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // row; measured, it is the largest remaining cost in the pairformer.
   const ROWS = projectRows;
   const overRows = (body) => Array.from({ length: ROWS }, (_, r) => body(r)).join("\n");
+  const projectLanes = packQkvg ? width / 2 : width;
   const project = `${common}
 const ROWS: u32 = ${ROWS}u;
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
+const LANES: u32 = ${projectLanes}u;
+@group(0) @binding(0) var<storage, read> normalized: array<${storageArray(normalizedStorage)}>;
 // 🔴 THE ONLY KERNEL HERE THAT READS THE WEIGHTS AS vec4, and it can because it
 // reads nothing but the interleaved q/k/v/gate block. The other three passes
 // bind the same buffer as scalars.
 @group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> q: array<f32>;
-@group(0) @binding(3) var<storage, read_write> k: array<f32>;
-@group(0) @binding(4) var<storage, read_write> v: array<f32>;
-@group(0) @binding(5) var<storage, read_write> gate: array<f32>;
+@group(0) @binding(2) var<storage, read_write> q: array<${storageArray(qkvgStorage)}>;
+@group(0) @binding(3) var<storage, read_write> k: array<${storageArray(qkvgStorage)}>;
+@group(0) @binding(4) var<storage, read_write> v: array<${storageArray(qkvgStorage)}>;
+@group(0) @binding(5) var<storage, read_write> gate: array<${storageArray(qkvgStorage)}>;
 
 // ROWS rows of activations, shared by every output channel in the workgroup.
 //
@@ -372,7 +413,7 @@ const ROWS: u32 = ${ROWS}u;
 // channel does. Do not transpose the activation tile.
 var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
 
-@compute @workgroup_size(${width})
+@compute @workgroup_size(${projectLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let tile = group.x + group.y * GRID_WIDTH;
@@ -386,13 +427,35 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // and a thread that reads uninitialised workgroup memory for the last tile
     // would write NaN into q, k, v and the gate for real rows in the same tile.
     let source = select(0u, ${sourceRow.replace("row", "row")}, row < PAIRS);
-    for (var c = local; c < CHANNELS; c += WIDTH) {
-      act[r * CHANNELS + c] = select(0.0, normalized[source * CHANNELS + c], row < PAIRS);
+    for (var c = local; c < CHANNELS; c += LANES) {
+      act[r * CHANNELS + c] = select(
+        0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < PAIRS);
     }
   }
   workgroupBarrier();
 
-  // One accumulator a row, holding (q, k, v, gate).
+${packQkvg ? `  // Two accumulators a row: this lane's pair of adjacent channels.
+  let c0 = local * 2u;
+${overRows((r) => `  var lo${r} = vec4<f32>(0.0);
+  var hi${r} = vec4<f32>(0.0);`)}
+
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let base = W_QKVG + c * WIDTH + c0;
+    let wlo = weights[base];
+    let whi = weights[base + 1u];
+${overRows((r) => `    let a${r} = act[${r}u * CHANNELS + c];
+    lo${r} += a${r} * wlo;
+    hi${r} += a${r} * whi;`)}
+  }
+
+${overRows((r) => `  if (first + ${r}u < PAIRS) {
+    // The pair shares one word, and this lane owns both halves of it.
+    let word${r} = (first + ${r}u) * LANES + local;
+    q[word${r}] = pack2x16float(vec2<f32>(lo${r}.x, hi${r}.x));
+    k[word${r}] = pack2x16float(vec2<f32>(lo${r}.y, hi${r}.y));
+    v[word${r}] = pack2x16float(vec2<f32>(lo${r}.z, hi${r}.z));
+    gate[word${r}] = pack2x16float(vec2<f32>(lo${r}.w, hi${r}.w));
+  }`)}` : `  // One accumulator a row, holding (q, k, v, gate).
 ${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
 
   for (var c = 0u; c < CHANNELS; c += 1u) {
@@ -408,7 +471,7 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
     k[index${r}] = acc${r}.y;
     v[index${r}] = acc${r}.z;
     gate[index${r}] = acc${r}.w;
-  }`)}
+  }`)}`}
 }`;
 
   // 🔴 AF2'S ATTENTION KERNEL, REWRITTEN AGAINST AF3'S OWN BINDINGS. AlphaFold
@@ -458,8 +521,10 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
   const tile16 = staged && stagedPrecision === "f16";
   const tileType = tile16 ? "vec4<f16>" : "vec4<f32>";
   const widen = (e) => (tile16 ? `vec4<f32>(${e})` : e);
-  const readK = (t) => staged ? widen(`k_tile[slot * HD4 + ${t}u]`) : `k[k_base + ${t}u]`;
-  const readV = (t) => staged ? widen(`v_tile[slot * HD4 + ${t}u]`) : `v[k_base + ${t}u]`;
+  const direct = (name, t) => (packQkvg
+    ? `load4(${name}[k_base + ${t}u])` : `${name}[k_base + ${t}u]`);
+  const readK = (t) => (staged ? widen(`k_tile[slot * HD4 + ${t}u]`) : direct("k", t));
+  const readV = (t) => (staged ? widen(`v_tile[slot * HD4 + ${t}u]`) : direct("v", t));
   const body = `
 ${staged ? "" : "    let k_base = ((row * N + j) * HEADS + head) * HD4;"}
     var score = 0.0;
@@ -494,8 +559,8 @@ ${unroll((t) => `    acc${t} = acc${t} * previous + weight * ${readV(t)};`)}`;
     for (var index = local; index < ${keyChunk}u * HD4; index += 64u) {
       let j = min(j0 + index / HD4, N - 1u);
       let source = ((row * N + j) * HEADS + head) * HD4 + index % HD4;
-      k_tile[index] = ${tileType}(k[source]);
-      v_tile[index] = ${tileType}(v[source]);
+      k_tile[index] = ${tileType}(${packQkvg ? "load4(k[source])" : "k[source]"});
+      v_tile[index] = ${tileType}(${packQkvg ? "load4(v[source])" : "v[source]"});
     }
     workgroupBarrier();
     for (var slot = 0u; slot < ${keyChunk}u; slot += 1u) {
@@ -509,12 +574,21 @@ ${body}
   }`;
 
   const attend = `${tile16 ? "enable f16;\n" : ""}${common}
-@group(0) @binding(0) var<storage, read> q: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> q: array<${packQkvg ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(1) var<storage, read> k: array<${packQkvg ? "vec2<u32>" : "vec4<f32>"}>;
+@group(0) @binding(2) var<storage, read> v: array<${packQkvg ? "vec2<u32>" : "vec4<f32>"}>;
 @group(0) @binding(3) var<storage, read> bias: array<f32>;
 @group(0) @binding(4) var<storage, read> mask: array<f32>;
-@group(0) @binding(5) var<storage, read_write> gathered: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> gathered: array<${packGathered ? "vec2<u32>" : "vec4<f32>"}>;
+${packGathered ? `
+fn store4(v: vec4<f32>) -> vec2<u32> {
+  return vec2<u32>(pack2x16float(v.xy), pack2x16float(v.zw));
+}` : ""}${packQkvg ? `
+fn load4(w: vec2<u32>) -> vec4<f32> {
+  let lo = unpack2x16float(w.x);
+  let hi = unpack2x16float(w.y);
+  return vec4<f32>(lo.x, lo.y, hi.x, hi.y);
+}` : ""}
 
 const HD4: u32 = ${vectors}u;
 ${staged ? `var<workgroup> k_tile: array<${tileType}, ${keyChunk * vectors}>;
@@ -539,14 +613,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // vec4 units: WIDTH and DIMENSION are both multiples of four, so a head's
   // slice starts on a vector boundary.
   let q_base = ((row * N + select(0u, i, live)) * HEADS + head) * HD4;
-${unroll((t) => `  let qv${t} = q[q_base + ${t}u];`)}
+${unroll((t) => `  let qv${t} = ${packQkvg ? `load4(q[q_base + ${t}u])` : `q[q_base + ${t}u]`};`)}
 ${unroll((t) => `  var acc${t} = vec4<f32>(0.0);`)}
   var running_max = -3.0e38;
   var running_sum = 0.0;
 ${loop}
 
   if (live) {
-${unroll((t) => `    gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
+${unroll((t) => packGathered
+    ? `    gathered[q_base + ${t}u] = store4(acc${t} / running_sum);`
+    : `    gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
   }
 }`;
 
@@ -557,8 +633,8 @@ ${unroll((t) => `    gathered[q_base + ${t}u] = acc${t} / running_sum;`)}
     Array.from({ length: OUT_ROWS }, (_, r) => body(r)).join("\n");
   const project_out = `${common}
 const OUT_ROWS: u32 = ${OUT_ROWS}u;
-@group(0) @binding(0) var<storage, read> gathered: array<f32>;
-@group(0) @binding(1) var<storage, read> gate: array<f32>;
+@group(0) @binding(0) var<storage, read> gathered: array<${storageArray(gatheredStorage)}>;
+@group(0) @binding(1) var<storage, read> gate: array<${storageArray(qkvgStorage)}>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
@@ -579,7 +655,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let row = first + r;
     let index = select(0u, row * WIDTH + local, row < PAIRS);
     gated[r * ${width}u + local] =
-      select(0.0, gathered[index] * logistic(gate[index]), row < PAIRS);
+      select(0.0, ${storedElement(gatheredStorage, "gathered", "index")}
+        * logistic(${storedElement(qkvgStorage, "gate", "index")}), row < PAIRS);
   }
   workgroupBarrier();
 
