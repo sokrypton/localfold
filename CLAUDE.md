@@ -555,13 +555,18 @@ a 272-token fold from **1214 to 671 MiB, 45%, for no time at all** and about hal
 a second on a REPEAT fold, which is the re-packing. Mean pLDDT identical to every
 digit. Do this before reaching for kernels.
 
-🔴 **AND AF3's PACKED ACTIVATIONS COST TIME WHERE AF2's DID NOT.** Five of the
-seven pair scratch buffers are packed: at 408 tokens **1086.5 -> 896.1 MiB,
-17.5%, for no measurable time**; at 272 the peak does not move AT ALL - it is
-the diffusion's there - and it costs about 1.4%. The difference from AF2 is what
-reads the tensor: AF2's flash kernel re-reads its key and value once per query
-tile, so halving the bytes paid for the unpacking twice over; nothing in AF3's
-pair track reads these more than once. **It is a trade taken for LENGTH.**
+🔴 **AF3's PAIR SCRATCH IS NOT PACKED ANY MORE, AND THE PARAGRAPH THAT USED TO
+BE HERE PRICED IT WRONGLY.** It recorded 1086.5 -> 896.1 MiB at 408 tokens for
+no measurable time and called it "a trade taken for LENGTH". Two things were
+missing from that. The COST was never measured on the checkers that could see
+it - see the table below, and a factor of 1200 on the pair representation. And
+the SAVING was mostly memory nothing was using: a seventh scratch buffer no
+code ever read, a readback held across the whole block loop, and a sixth buffer
+the grid attention did not need. With those three gone, unpacking costs 21.5
+MiB of a 610.8 MiB peak at 300 tokens. What survives from that paragraph is
+why AF2's packing DOES pay: its flash kernel re-reads its key and value once
+per query tile, so halving the bytes pays for the unpacking twice over, and
+nothing in AF3's pair track reads these more than once.
 
 🔴 **AND WHO OWNS A WORD IS A DIFFERENT ANSWER IN EVERY KERNEL.** The layer
 norms own whole rows and only had to walk words. `grid.project` gave a lane ONE
@@ -593,20 +598,28 @@ the caller varies (`direction`, `accumulatePrecision`), or it is a check of
 something else.
 
 🔴 **A STORAGE FORMAT MEASURED ON ONE STACK IS NOT A FACT ABOUT THE OTHER
-TWO.** `PAIR_SCRATCH_STORAGE` was a module constant that every caller of
-`compilePairTrack` inherited, and it was measured on the pairformer. Three
-stacks run that pair track, and two of them were failing their own checkers'
-own bounds the whole time:
+THREE.** `PAIR_SCRATCH_STORAGE` was a module constant that every caller of
+`compilePairTrack` inherited, and it was measured on the pairformer's own
+differential checker, which passes either way. FOUR stacks run that pair track,
+and every other checker that reaches one was over its bound the whole time:
 
 | | packed | unpacked | bound |
 |---|---|---|---|
+| `check-af3-confidence` stack pair | 3.71e-3 | **3.12e-6** | |
+| ...its PAE head | 2.88e-3 | **5.75e-6** | 7.1x envelope |
+| ...its PDE head | 3.29e-3 | **7.47e-6** | |
+| ...its pLDDT head | 6.88e-4 | **1.16e-4** | |
 | `check-af3-msa-block` | 1.82e-3 | **7.16e-6** | 1e-5 |
 | `check-af3-template` | 3.79e-5 | **2.52e-7** | 2e-5 |
-| `check-af3-trunk` pair | 1.04e-4 | **2.18e-5** | 4e-5 |
+| `check-af3-trunk` pair | 1.04e-4 | **1.99e-5** | 4e-5 |
 
-The layout is a parameter now: the pairformer keeps its packing (190 MiB at 408
-tokens, and `check-af3-block` passes), the MSA stack and the template embedder
-take `UNPACKED_PAIR_SCRATCH`.
+A factor of 1200 on the pair representation that feeds pLDDT and PAE. The
+CONFIDENCE head is where it shows, because its four blocks amplify and its
+heads have the tightest envelopes in the repository; the trunk's own checker at
+n=24 barely moves, which is exactly why one checker is not enough.
+`UNPACKED_PAIR_SCRATCH` is what `compilePairTrack` defaults to now, and all
+four stacks take it. `PAIR_SCRATCH_STORAGE` stays exported and unused, with
+that table beside it.
 
 🔴 **AND A HALFWAY LAYOUT IS WORSE THAN EITHER, WHICH IS WHY IT WAS TRIED.**
 Bisected on the trunk's pair term, changing only the MSA stack: `a` and `b`
@@ -617,16 +630,34 @@ at 3.11e-5 and still misses the MSA block's by 50x. Half the memory is not
 worth a checker that has to be told to expect less.
 
 🔴 **AND THE END-TO-END NUMBER COULD NOT SEE ANY OF IT.** `fold.js --dump`
-reports `pair vs AF3` at 4.03e-4 with the bad packing and 4.04e-4 without it,
+reports `pair vs AF3` at 4.03e-4 with the bad packing and 3.94e-4 without it,
 with mean pLDDT 85.6 either way. Forty-eight pairformer blocks are contractive
-enough to swallow a 150x error in the term that feeds them, so the whole-fold
+enough to swallow a 1200x error in the term that feeds them, so the whole-fold
 gate is the WRONG instrument for a change inside one stage - and it is the one
 that gets run. Run the per-stage checkers when a stage changes.
 
-🔴 **AND `scratch[6]` WAS NEVER READ BY ANYTHING.** `encodePairTrack` indexes 0
-to 5, and so does every caller; all three stacks allocated seven pair-sized
-tensors and used six. 19.5 MiB in the MSA stack at 200 tokens, 10.2 in the
-template, held for a pass and touched by nothing.
+🔴 **AND THE PAIR TRACK NEEDS FIVE SCRATCH TENSORS, NOT SEVEN.** `scratch[6]`
+was never read by anything - `encodePairTrack` indexes 0 to 5, and so does
+every caller - and `scratch[5]` did not need to exist either: `grid.project` is
+the last pass that reads `scratch[0]` and it is encoded BEFORE the pass that
+wrote `scratch[5]`, so the grid attention writes its output back into
+`normalized`. 43.9 MiB each at 300 tokens.
+
+🔴 **AND A READBACK BUFFER BELONGS AFTER THE SCRATCH, NOT BEFORE THE LOOP.**
+Both pair-track stacks reserved their MAP_READ buffers up front and wrote them
+once, at the end - a pair-sized buffer standing beside the scratch for a whole
+48-block loop, at exactly the moment the trunk is fullest. Releasing the
+scratch first is what makes the peak move, because this allocator does not
+pool: release DESTROYS.
+
+Those three together, on a 300-token trunk pass at 32 MSA rows:
+
+| | peak | af3-block.scratch |
+|---|---|---|
+| packed, six buffers, readback in the peak | 589.3 MiB | 153.8 x6 |
+| unpacked, six, readback in the peak | 699.2 | 263.7 x6 |
+| unpacked, six, readback after | 654.8 | 263.7 x6 |
+| **unpacked, five, readback after** | **610.8** | **219.7 x5** |
 
 🔴 **AND A SAMPLER STEP CHANGES TWO INPUTS AND USED TO REBUILD EVERYTHING.**
 The diffusion head is called up to two hundred times down one schedule, and
