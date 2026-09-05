@@ -173,6 +173,41 @@ export function tmPerBinFor(binCentres, d0) {
  *   `"a|b"` with a < b, holding that interface's ipTM; a pair with no live
  *   cross pairs is absent rather than zero
  */
+/**
+ * pTM and ipTM for each chain on its own.
+ *
+ * 🔴 THE SAME TERM AGAIN, REDUCED OVER TWO MORE SETS OF PAIRS. `chain_ptm[i]`
+ * is the score over pairs BOTH of which are chain i - how well folded that
+ * chain is by itself - and `chain_iptm[i]` is the score over pairs with exactly
+ * one token in chain i, which is how well it sits against everything else. The
+ * AlphaFold 3 server writes both, and on an assembly they are what says whether
+ * a low overall score is one bad chain or one bad interface.
+ *
+ * @returns {{chains: number[], chainPtm: Map<number, number>,
+ *            chainIptm: Map<number, number>}}
+ */
+export function perChainTmScores(term, tokens, asymId, seqMask) {
+  const chains = [];
+  for (let i = 0; i < tokens; i += 1) {
+    if (seqMask[i] > 0 && !chains.includes(asymId[i])) chains.push(asymId[i]);
+  }
+  chains.sort((a, b) => a - b);
+  const chainPtm = new Map();
+  const chainIptm = new Map();
+  for (const chain of chains) {
+    const admitted = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    const within = reduceTmScore(term, tokens, (i, j) => admitted(i, j)
+      && asymId[i] === chain && asymId[j] === chain);
+    if (Number.isFinite(within)) chainPtm.set(chain, within);
+    // ...exactly one side in this chain. Both sides would be the score above,
+    // and neither would be a different chain's business entirely.
+    const across = reduceTmScore(term, tokens, (i, j) => admitted(i, j)
+      && ((asymId[i] === chain) !== (asymId[j] === chain)));
+    if (Number.isFinite(across)) chainIptm.set(chain, across);
+  }
+  return { chains, chainPtm, chainIptm };
+}
+
 export function chainPairTmScores(term, tokens, asymId, seqMask) {
   const chains = [];
   for (let i = 0; i < tokens; i += 1) {

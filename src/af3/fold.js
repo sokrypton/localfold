@@ -31,7 +31,8 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
-import { chainPairTmScores, reduceTmScore } from "../heads/tm-score.js";
+import { chainPairTmScores, perChainTmScores, reduceTmScore }
+  from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
 import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
 
@@ -609,9 +610,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // easy interface's confidence for the hard one. See chainPairTmScores.
   const chainPairIptm = Object.fromEntries(
     chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
+  // ...and each chain on its own: how well it folded, and how well it sits
+  // against everything else. The AlphaFold 3 server writes both.
+  const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
+  const chainPtm = Object.fromEntries(perChain.chainPtm);
+  const chainIptm = Object.fromEntries(perChain.chainIptm);
 
   return {
     positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
+    chainPtm, chainIptm,
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
     reusable: { trunk, targetFeat, recycles },

@@ -582,6 +582,10 @@ export async function foldAf3(options) {
       // more than two chains. Empty for a monomer; the same number as `iptm`
       // for exactly two chains. See src/heads/tm-score.js.
       chainPairIptm: result.chainPairIptm,
+      // ...and per chain: how well each one folded alone, and how well it sits
+      // against the rest. Written into the archive's summary_confidences.
+      chainPtm: result.chainPtm,
+      chainIptm: result.chainIptm,
       predictedAlignedError: result.scores.pae,
     },
   };

@@ -1,6 +1,6 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
-import { chainPairTmScores, reduceTmScore, tmPerBinFor, tmScoreD0, tmTermFromLogits }
-  from "./tm-score.js";
+import { chainPairTmScores, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0,
+  tmTermFromLogits } from "./tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
 } from "../evoformer/transition.js";
@@ -102,14 +102,20 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
   // what was missing was calling it. `chainIndices` is AF2's asym_id - chains
   // are contiguous blocks - and its mask is all ones, because this path has no
   // padding to exclude.
+  const seqMask = isMultiChain ? new Uint8Array(length).fill(1) : undefined;
   const chainPairIptm = isMultiChain
-    ? Object.fromEntries(chainPairTmScores(
-      term, length, chainIndices, new Uint8Array(length).fill(1)).scores)
+    ? Object.fromEntries(chainPairTmScores(term, length, chainIndices, seqMask).scores)
     : undefined;
+  // ...and how each chain scores alone and against the rest, which is what
+  // separates one badly folded chain from one badly placed one.
+  const perChain = isMultiChain
+    ? perChainTmScores(term, length, chainIndices, seqMask) : undefined;
 
   const multimerScore = isMultiChain && iptm !== undefined && !Number.isNaN(iptm)
     ? (0.8 * iptm + 0.2 * ptm) : undefined;
-  return { ptm, iptm, multimerScore, chainPairIptm };
+  return { ptm, iptm, multimerScore, chainPairIptm,
+    chainPtm: perChain && Object.fromEntries(perChain.chainPtm),
+    chainIptm: perChain && Object.fromEntries(perChain.chainIptm) };
 }
 
 export function predictedTmScore(logits, length, breaks) {
@@ -247,6 +253,8 @@ export class ConfidenceHeadsGpu {
         iptm: tmScores.iptm,
         multimerScore: tmScores.multimerScore,
         chainPairIptm: tmScores.chainPairIptm,
+        chainPtm: tmScores.chainPtm,
+        chainIptm: tmScores.chainIptm,
       };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index] .release();

@@ -160,6 +160,19 @@ export function confidenceJson(sequence, confidence) {
   // flat angstroms it draws a matrix eight times too small, silently.
   result.predicted_aligned_error = paeMatrix(confidence.predictedAlignedError, sequence.length);
   result.max_predicted_aligned_error = confidence.maxPredictedAlignedError;
+  // 🔴 THE CONTACTS ARE NESTED THE SAME WAY THE PAE IS, AND FOR THE SAME
+  // REASON. Both are token-by-token matrices whose stride is not the residue
+  // count once a ligand is in the fold, so both recover it from the data -
+  // which is exactly what paeMatrix does, and why this reuses it rather than
+  // flattening a second convention into the file. A consumer that can read one
+  // can read the other.
+  //
+  // Optional because it is optional in the models: AF3 returns it from the
+  // trunk and AF2 computes it from the distogram, but a fold that was aborted
+  // before the trunk finished has a structure and no contacts.
+  if (confidence.contactProbs !== undefined) {
+    result.contact_probs = paeMatrix(confidence.contactProbs, sequence.length);
+  }
   return JSON.stringify(result, null, 2);
 }
 
