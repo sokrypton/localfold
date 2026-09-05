@@ -30,42 +30,73 @@ import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
 
 const RCSB = "https://files.rcsb.org/download";
-const AFDB = "https://alphafold.ebi.ac.uk/files";
+const AFDB_API = "https://alphafold.ebi.ac.uk/api/prediction";
 
 /**
  * What a source string names.
  *
+ * 🔴 THE GUESS IS THE FALLBACK NOW, NOT THE RULE. Four characters is a PDB
+ * entry and anything else an accession - ../mpnn's fetchPDB does the same and
+ * it is right most of the time - but "most of the time" is a bad property for
+ * something that decides which server is asked. The page names the kind
+ * explicitly from its dropdown, and this is what a caller that has not.
+ *
  * @param {string} text `1abc`, `1abc_A`, `P00533`, `P00533_A`
+ * @param {"pdb"|"afdb"} [kind] which database, when the caller knows
  * @returns {{id: string, chain: string|undefined, kind: "pdb"|"afdb"}}
  */
-export function parseSource(text) {
+export function parseSource(text, kind) {
   const trimmed = text.trim();
   const [id, chain] = trimmed.split(/[_:]/, 2);
   return {
     id: id.toUpperCase(),
     chain: chain === undefined || chain === "" ? undefined : chain,
-    // 🔴 FOUR CHARACTERS IS A PDB ENTRY AND ANYTHING ELSE IS AN ACCESSION,
-    // which is the rule ../mpnn's fetchPDB uses and is right often enough to
-    // be worth not asking. A UniProt accession is six or ten.
-    kind: id.length === 4 ? "pdb" : "afdb",
+    kind: kind ?? (id.length === 4 ? "pdb" : "afdb"),
   };
+}
+
+/**
+ * Which file AlphaFold DB is currently serving for an accession.
+ *
+ * 🔴 THE VERSION IS IN THE FILENAME AND IT MOVES. This used to build
+ * `AF-<id>-F1-model_v4.pdb` directly, which worked until AlphaFold DB's v6
+ * release retired v4 - and then every AlphaFold DB template on the page was a
+ * 404 naming a URL nobody had chosen. A pinned version is a fact about a
+ * database that has already changed three times; asking is one request and does
+ * not need revisiting. The failure it leaves is the honest one: an accession
+ * AlphaFold DB does not hold answers with nothing rather than with a file that
+ * exists at some other version.
+ *
+ * @returns {Promise<string>} the .pdb URL for the latest version
+ */
+async function afdbUrl(id, get, signal) {
+  const response = await get(`${AFDB_API}/${id}`, { signal });
+  if (!response.ok) {
+    throw new Error(`${response.status} asking AlphaFold DB about ${id}`);
+  }
+  const entries = await response.json();
+  const url = Array.isArray(entries) ? entries[0]?.pdbUrl : undefined;
+  if (typeof url !== "string") {
+    throw new Error(`AlphaFold DB has no structure for ${id}`);
+  }
+  return url;
 }
 
 /**
  * The structure text for a source, and where it came from.
  *
  * @param {string} text
- * @param {{signal?: AbortSignal, fetch?: typeof fetch}} [options]
+ * @param {{signal?: AbortSignal, fetch?: typeof fetch, kind?: "pdb"|"afdb"}} [options]
  * @returns {Promise<{text: string, url: string, kind: string, chain?: string}>}
  */
 export async function fetchStructure(text, options = {}) {
-  const { id, chain, kind } = parseSource(text);
+  const { id, chain, kind } = parseSource(text, options.kind);
   const get = options.fetch ?? globalThis.fetch;
   const urls = kind === "pdb"
     // ...`.pdb` FIRST, unlike ../mpnn's fetchPDB, which prefers the mmCIF. See
     // the note at the top: this reader is fixed-column.
     ? [`${RCSB}/${id}.pdb`, `${RCSB}/${id}.cif`]
-    : [`${AFDB}/AF-${id}-F1-model_v4.pdb`];
+    : [await afdbUrl(id, get, options.signal)];
   let last;
   for (const url of urls) {
     try {
@@ -125,7 +156,14 @@ export function mapToQuery(structure, query) {
  * @param {(residue: number) => number} [options.tokenOf] which token a residue
  *   of this chain occupies; see templateSlot. A modified residue is several
  *   tokens, so an offset alone is not enough once a chain carries one.
- * @param {number} [options.minConfidence] drop residues below this pLDDT
+ * @param {number} [options.minConfidence] drop residues below this pLDDT.
+ *   🔴 NO LONGER SET FROM THE PAGE. It was a box beside the source, defaulting
+ *   to 70 for AlphaFold DB because a predicted structure has every residue and
+ *   no way to say it did not see one - so a disordered tail arrives as
+ *   geometry. It stays here because that reasoning still holds and the filter
+ *   is a line of code, but a number from 0 to 100 is a modelling choice the
+ *   dropdown cannot explain in the space it has, and nothing on screen said
+ *   what the default had done. A caller that wants it passes it.
  * @param {boolean} [options.spanChains]
  * @returns {{slot: object, sequence: string, coverage: object}}
  */

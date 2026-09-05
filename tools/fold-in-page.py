@@ -84,6 +84,34 @@ def serve(local_weights=True):
 
 # The page's own status line, polled by `cdp.wait_for` so a long fold narrates
 # itself rather than ending in a timeout that names no stage.
+def template_entry(text):
+    """The entity-list template object a --template argument asks for.
+
+    🔴 THE PAGE NO LONGER GUESSES THE DATABASE, so neither does this. The
+    dropdown carries an explicit kind, and `pdb:1abc` / `afdb:P00533` is how a
+    run says which one it means. Bare text keeps the old four-characters rule so
+    existing invocations still work, which is a convenience here and is exactly
+    what stopped being one in the page.
+    """
+    kind, _, rest = text.partition(":")
+    if kind == "upload" and rest:
+        # 🔴 THE FILE PICKER IS NOT THE PATH WORTH CHECKING. What an upload can
+        # break is everything downstream of it - the text reaching the slot
+        # builder, the chain box choosing between a file's chains - and that is
+        # reached by setting what the picker would have set. `path` or
+        # `path@CHAIN`.
+        path, _, chain = rest.partition("@")
+        with open(os.path.expanduser(path)) as handle:
+            return {"kind": "upload", "text": handle.read(),
+                    "filename": os.path.basename(path), "source": chain}
+    if kind in ("pdb", "afdb") and rest:
+        return {"kind": kind, "source": rest}
+    if text == "auto":
+        return {"kind": "search"}
+    return {"kind": "pdb" if len(text.split("_")[0]) == 4 else "afdb",
+            "source": text}
+
+
 STATUS_LINE = "(document.getElementById('status-message')||{}).textContent"
 
 
@@ -110,9 +138,10 @@ def main():
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--template", default="",
-                        help="a PDB entry (1abc, 1abc_A) or UniProt accession"
-                             " to show the first protein entity as a template,"
-                             " or `auto` to use what the MSA search finds."
+                        help="a PDB entry (1abc, 1abc_A), a UniProt accession,"
+                             " `auto` to use what the MSA search finds, or"
+                             " pdb:ID / afdb:ID to name the database outright,"
+                             " or upload:PATH[@CHAIN] for a local structure."
                              " Goes to the network either way.")
     parser.add_argument("--then-sequence", default=None,
                         help="fold a SECOND time on this sequence, which is a"
@@ -159,8 +188,7 @@ def main():
               protein.template = %s;
               list.set(entities);
               return JSON.stringify(list.read().map((e) => e.template || null));
-            })()""" % json.dumps({"auto": True} if args.template == "auto"
-                                  else {"source": args.template})))
+            })()""" % json.dumps(template_entry(args.template))))
 
         cdp.evaluate(ws, """(() => {
           const set = (id, value) => {

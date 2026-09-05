@@ -45,7 +45,7 @@ import { complexSequenceProblem } from "./sequence.js";
 // 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
-import { entitiesProblem, expandEntities } from "./entities.js";
+import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
@@ -1527,23 +1527,30 @@ async function fold(event) {
     // a different path and nothing on this page builds one for them yet.
     const templateSources = [];
     for (const template of request.templates ?? []) {
+      const kind = templateKind(template);
       const source = (template.source ?? "").trim();
-      if (template.auto === true && source === "") {
+      const common = { chain: template.chain, spanChains: template.spanChains === true,
+                       origin: template.origin };
+      if (kind === "search") {
         // Resolved after the search, which is when the hits exist.
-        templateSources.push({ chain: template.chain, auto: true,
-          minConfidence: template.minConfidence ?? 0,
-          spanChains: template.spanChains === true, origin: template.origin });
+        templateSources.push({ ...common, auto: true });
         continue;
       }
-      if (source === "") continue;
+      if (kind === "upload") {
+        // 🔴 NOTHING IS FETCHED, AND THE CHAIN BOX MAY BE EMPTY. An uploaded
+        // file is already text; `chainResidues` takes the first polymer chain
+        // when it is not told which, which is right for the single-chain files
+        // most people upload and wrong silently for the rest - hence the box.
+        templateSources.push({ ...common, text: template.text,
+          chainId: source === "" ? undefined : source,
+          source: template.filename ?? "the uploaded structure" });
+        continue;
+      }
+      if (kind === "none" || source === "") continue;
       status(`Fetching template ${source}`);
-      const structure = await fetchStructure(source, { signal });
-      templateSources.push({
-        chain: template.chain, chainId: structure.chain, text: structure.text,
-        // AlphaFold DB has every residue and no way to say it did not see one.
-        minConfidence: template.minConfidence ?? (structure.kind === "afdb" ? 70 : 0),
-        spanChains: template.spanChains === true, origin: template.origin, source,
-      });
+      const structure = await fetchStructure(source, { signal, kind });
+      templateSources.push({ ...common, chainId: structure.chain,
+        text: structure.text, source });
     }
     let sequence = chains.join("");
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;

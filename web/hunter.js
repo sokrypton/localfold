@@ -29,7 +29,8 @@ import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designe
 import { createEntityList } from "./entity-ui.js";
 import { superposeCycle } from "../src/design/superpose-pdb.js";
 import { followActiveFrame, updateScoresCard } from "./scores-card.js";
-import { NUCLEIC_TYPES, entitiesProblem, expandEntities } from "./entities.js";
+import { NUCLEIC_TYPES, entitiesProblem, expandEntities,
+  templateKind } from "./entities.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
 import { isAbortError } from "../src/runtime/abort.js";
 
@@ -383,24 +384,29 @@ async function loadTemplates(input, signal) {
   // working unusually well.
   const fetched = [];
   for (const template of templates) {
+    const kind = templateKind(template);
     const source = (template.source ?? "").trim();
+    const common = { chain: template.chain, spanChains: template.spanChains === true,
+                     origin: template.origin };
+    // 🔴 NO SEARCH ARM HERE. The hunter's target chains are folded without an
+    // MSA by default, so there are no hits to take a template from; a row set
+    // to "From the MSA search" is skipped rather than silently fetched from
+    // somewhere else.
+    if (kind === "upload") {
+      window.__hunterTemplateLog.push(`uploaded ${template.filename ?? "structure"}`);
+      fetched.push({ ...common, text: template.text,
+        chainId: source === "" ? undefined : source,
+        source: template.filename ?? "the uploaded structure" });
+      continue;
+    }
+    if (kind !== "pdb" && kind !== "afdb") continue;
     if (source === "") continue;
     status(`Fetching template ${source}`);
     window.__hunterTemplateLog.push(`fetching ${source}`);
-    const structure = await fetchStructure(source, { signal });
+    const structure = await fetchStructure(source, { signal, kind });
     window.__hunterTemplateLog.push(
       `got ${structure.text.length} bytes from ${structure.url}`);
-    fetched.push({
-      chain: template.chain,
-      chainId: structure.chain,
-      text: structure.text,
-      // AlphaFold DB has every residue and no way to say it did not see one,
-      // so a floor is the default there and not for a crystal structure.
-      minConfidence: template.minConfidence ?? (structure.kind === "afdb" ? 70 : 0),
-      spanChains: template.spanChains === true,
-      origin: template.origin,
-      source,
-    });
+    fetched.push({ ...common, chainId: structure.chain, text: structure.text, source });
   }
   return fetched.length === 0 ? undefined : fetched;
 }

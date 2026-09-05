@@ -864,8 +864,13 @@
 
 /* The template's own controls, inside the options popup. */
 .entity-popup-section { margin-top: 12px; border-top: 1px solid #e5e7eb; padding-top: 10px; }
+.entity-template-kind { flex: 1 1 auto; min-width: 0; }
 .entity-template-source { flex: 1 1 auto; min-width: 0; }
-.entity-template-floor { flex: 0 0 72px; }
+/* The file input carries its own button, so it needs room to shrink rather
+   than a width - `min-width: 0` is what lets a flex child go below its
+   content's size at 320px. */
+.entity-template-file { flex: 1 1 auto; min-width: 0; }
+.entity-template-chain { flex: 0 0 72px; }
 .entity-popup-section input {
   box-sizing: border-box;
   height: 28px; padding: 0 6px; font-size: 12px;

@@ -79,14 +79,56 @@ describe("fetchStructure", () => {
     expect(asked).toHaveLength(2);
   });
 
-  it("goes to AlphaFold DB for an accession", async () => {
+  // 🔴 THE VERSION COMES FROM AlphaFold DB, NOT FROM US. The version lives in
+  // the filename and it moves: this built `..._v4.pdb` directly until the v6
+  // release retired v4, and then every AlphaFold DB template was a 404 naming a
+  // URL nobody had chosen. Asked for, it cannot go stale.
+  it("asks AlphaFold DB which file it is serving", async () => {
+    const asked = [];
     const result = await fetchStructure("P00533", {
-      fetch: responses({
-        "https://alphafold.ebi.ac.uk/files/AF-P00533-F1-model_v4.pdb": "AFDB",
-      }),
+      fetch: async (url) => {
+        asked.push(url);
+        if (url.includes("/api/prediction/")) {
+          return { ok: true, status: 200,
+            json: async () => [{ pdbUrl: "https://example/AF-P00533-F1-model_v9.pdb" }] };
+        }
+        return { ok: true, status: 200, text: async () => "AFDB" };
+      },
     });
+    expect(asked[0]).toContain("/api/prediction/P00533");
+    expect(asked[1]).toContain("model_v9.pdb");
     expect(result.text).toBe("AFDB");
     expect(result.kind).toBe("afdb");
+  });
+
+  it("says so when AlphaFold DB holds nothing for an accession", async () => {
+    let thrown = null;
+    try {
+      await fetchStructure("P00533", {
+        fetch: async () => ({ ok: true, status: 200, json: async () => [] }),
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown?.message).toContain("no structure for P00533");
+  });
+
+  // 🔴 THE KIND IS THE CALLER'S TO NAME. Counting characters is right most of
+  // the time and silently wrong the rest, which is why the page stopped doing
+  // it - a four-character accession went to the RCSB and a typo'd PDB id to
+  // AlphaFold DB, both without saying so.
+  it("honours an explicit kind over the four-character guess", async () => {
+    const asked = [];
+    await fetchStructure("1abc", {
+      kind: "afdb",
+      fetch: async (url) => {
+        asked.push(url);
+        return url.includes("/api/prediction/")
+          ? { ok: true, status: 200, json: async () => [{ pdbUrl: "https://example/x.pdb" }] }
+          : { ok: true, status: 200, text: async () => "AFDB" };
+      },
+    });
+    expect(asked[0]).toContain("/api/prediction/1ABC");
   });
 
   it("reports the last failure rather than an empty template", async () => {

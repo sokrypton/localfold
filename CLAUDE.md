@@ -358,6 +358,37 @@ cache. ⌘⇧R clears it. `tools/fold-in-page.py` never sees this because it
 launches a fresh Chrome profile, which is why it can pass while the browser in
 front of you does not.
 
+🔴 **AND THE TEMPLATE'S SOURCE IS A MENU NOW, NOT A GUESS.** One box took
+`1abc`, `1abc_A` or an accession and decided which server to ask by counting
+characters - four is the RCSB, anything else AlphaFold DB. It reads well and it
+is right most of the time, and both of its failures are silent: a
+four-character accession goes to the wrong server, and a typo'd PDB id becomes
+an AlphaFold DB lookup whose 404 names a database nobody chose. The dropdown -
+`TEMPLATE_KINDS` in `web/entities.js` - carries **PDB entry**, **AlphaFold
+DB**, **From the MSA search** (which was a checkbox that silently overrode the
+box beside it) and **Upload a structure** (which had no way to be named at
+all). `fetchStructure(text, {kind})` takes the kind; `parseSource`'s
+count-the-characters rule survives only as the fallback for a caller that has
+none.
+
+🔴 **AND AlphaFold DB PUTS ITS VERSION IN THE FILENAME, WHICH MOVES.** The URL
+was built as `AF-<id>-F1-model_v4.pdb`, and AlphaFold DB's v6 release retired
+v4 outright - `curl -I` says 404 for v4 AND v5 on every accession tried - so
+every AlphaFold DB template on the page was a 404 naming a URL the user had not
+chosen. It asks `https://alphafold.ebi.ac.uk/api/prediction/<id>` for `pdbUrl`
+now: one request, CORS open, and nothing to bump at v7. Measured: P61626 covers
+9 of the 58-residue default, 1QYS_A covers 8, and the same file uploaded from
+disk covers 8 - the upload and the download agreeing is the cross-check that
+the two routes reach the same slot builder.
+
+🔴 **AND THE pLDDT FLOOR IS GONE.** It defaulted to 70 for AlphaFold DB, on the
+sound reasoning that a predicted structure has every residue and no way to say
+it did not see one - so a disordered tail arrives as geometry. But nothing on
+screen said the default had done anything, and a number from 0 to 100 is a
+modelling choice the popup cannot explain in the space it has.
+`buildTemplate`'s `minConfidence` option and `filterByConfidence` remain for a
+caller that wants them; no page sets one.
+
 🔴 **`fold-in-page.py` FOLDS ONE CHAIN, AND A COMPLEX FAILS SILENTLY.** It
 types the whole `--sequence` into a SINGLE entity's field, so a colon-joined
 `A:B` is rejected by the page - "One sequence per entity - use Add entity for

@@ -16,7 +16,8 @@
  * not, and update the model in place instead.
  */
 import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
-  MENU_CODES, entitiesFromText, entityProblem, newEntity } from "./entities.js";
+  MENU_CODES, TEMPLATE_KINDS, entitiesFromText, entityProblem, newEntity,
+  templateAsked, templateKind } from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 
 /**
@@ -80,8 +81,7 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       // modifications. A template changes what is folded exactly as much as a
       // modified residue does, and a closed popup hides both - so the button
       // has to say that something is set without being opened.
-      const templated = (entity.template?.source ?? "").trim() !== ""
-        || entity.template?.auto === true;
+      const templated = templateAsked(entity.template);
       if (badge !== null) {
         const total = count + (templated ? 1 : 0);
         if (total > 0) badge.dataset.count = String(total);
@@ -270,69 +270,115 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
         heading.textContent = "Template";
         section.append(heading);
 
-        // 🔴 AUTOMATIC MEANS "USE WHAT THE SEARCH ALREADY FOUND", and it is
-        // only meaningful where a search runs. The MSA job's own tar carries
-        // `pdb70.m8` beside `uniref.a3m` - the hits cost nothing extra - so
-        // this is a switch on data the page has already paid for. Single
-        // sequence has no hits, and the page says so rather than silently
-        // folding without one.
-        const autoLine = document.createElement("label");
-        autoLine.className = "entity-popup-check";
-        const auto = document.createElement("input");
-        auto.type = "checkbox";
-        auto.checked = template.auto === true;
-        auto.addEventListener("change", () => {
-          template.auto = auto.checked;
+        // 🔴 THE SOURCE IS A MENU, BECAUSE "WHICH DATABASE" IS NOT A GUESS.
+        // See TEMPLATE_KINDS in web/entities.js for why the single free-text
+        // box that guessed by length was the wrong shape. Choosing the kind
+        // first also means the field under it can say what it wants - a PDB
+        // entry and a UniProt accession look nothing alike - and that the two
+        // sources with no text at all can be named beside the two that have it.
+        const kindMenu = document.createElement("select");
+        kindMenu.className = "entity-template-kind";
+        kindMenu.setAttribute("aria-label", "Template source");
+        for (const [value, label] of TEMPLATE_KINDS) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          kindMenu.append(option);
+        }
+        const kind = templateKind(template);
+        kindMenu.value = kind;
+        kindMenu.addEventListener("change", () => {
+          template.kind = kindMenu.value;
+          // 🔴 CHANGING THE SOURCE CLEARS WHAT THE OLD ONE HELD. A PDB id left
+          // behind under "AlphaFold DB" is a source the user cannot see and did
+          // not choose, and an uploaded file left behind under "PDB entry" is
+          // worse - it would fold, against a structure nothing on screen names.
+          delete template.source;
+          delete template.text;
+          delete template.filename;
+          delete template.status;
           draw();
           notify();
         });
-        autoLine.append(auto, document.createTextNode(
-          " Use the templates the MSA search finds"));
-        section.append(autoLine);
+        const kindLine = document.createElement("div");
+        kindLine.className = "entity-popup-row";
+        kindLine.append(kindMenu);
+        section.append(kindLine);
 
-        const source = document.createElement("input");
-        source.type = "text";
-        source.className = "entity-template-source";
-        source.placeholder = "1abc_A, or a UniProt accession";
-        source.value = template.source ?? "";
-        source.setAttribute("aria-label", "Template structure");
-        source.addEventListener("input", () => {
-          template.source = source.value;
-          draw();
-          notify();
-        });
+        if (kind === "pdb" || kind === "afdb") {
+          const source = document.createElement("input");
+          source.type = "text";
+          source.className = "entity-template-source";
+          source.placeholder = kind === "pdb" ? "1abc, or 1abc_A" : "P00533";
+          source.value = template.source ?? "";
+          source.setAttribute("aria-label", kind === "pdb"
+            ? "PDB entry" : "UniProt accession");
+          source.addEventListener("input", () => {
+            template.source = source.value;
+            draw();
+            notify();
+          });
+          const line = document.createElement("div");
+          line.className = "entity-popup-row";
+          line.append(source);
+          section.append(line);
+        }
 
-        const floor = document.createElement("input");
-        floor.type = "number";
-        floor.className = "entity-template-floor";
-        floor.min = "0";
-        floor.max = "100";
-        floor.placeholder = "pLDDT";
-        floor.title = "Drop residues below this pLDDT. AlphaFold DB has every"
-          + " residue and no way to say it did not see one, so a disordered"
-          + " tail arrives as geometry unless this is set.";
-        floor.value = template.minConfidence ?? "";
-        floor.addEventListener("input", () => {
-          template.minConfidence = floor.value === "" ? undefined : Number(floor.value);
-          notify();
-        });
-
-        const line = document.createElement("div");
-        line.className = "entity-popup-row";
-        line.append(source, floor);
-        section.append(line);
+        if (kind === "upload") {
+          // 🔴 READ HERE AND CARRIED AS TEXT, because the fold happens long
+          // after the popup has closed and a File handle is not something the
+          // entity list can be serialised through. The chain box matters more
+          // here than anywhere else: a downloaded entry can be asked for as
+          // `1abc_A`, and an uploaded complex has no such spelling.
+          const file = document.createElement("input");
+          file.type = "file";
+          file.className = "entity-template-file";
+          file.accept = ".pdb,.cif,.mmcif,.ent,.txt";
+          file.setAttribute("aria-label", "Template structure file");
+          file.addEventListener("change", async () => {
+            const chosen = file.files?.[0];
+            if (chosen === undefined) return;
+            template.filename = chosen.name;
+            template.text = await chosen.text();
+            delete template.status;
+            draw();
+            notify();
+          });
+          const chain = document.createElement("input");
+          chain.type = "text";
+          chain.className = "entity-template-chain";
+          chain.placeholder = "chain";
+          chain.value = template.source ?? "";
+          chain.setAttribute("aria-label", "Which chain of the file");
+          chain.addEventListener("input", () => {
+            template.source = chain.value;
+            notify();
+          });
+          const line = document.createElement("div");
+          line.className = "entity-popup-row";
+          line.append(file, chain);
+          section.append(line);
+        }
 
         const status = document.createElement("p");
         status.className = "entity-popup-empty entity-template-status";
         // Written by the page once it has fetched: coverage is a fact about a
         // file this list has never seen, and a template covering 17 of 120
         // residues folds perfectly well and says nothing about it.
-        status.textContent = template.status
-          ?? (template.auto === true
-            ? "The best hit from the search will be used. Its coverage appears"
-              + " here once the fold has run."
-            : "A structure to show this chain, or tick the box to use what the"
-              + " search finds. Its coverage appears here once it is fetched.");
+        const waiting = {
+          none: "A structure to show this chain, shown to the model as geometry"
+            + " it should already believe.",
+          pdb: "A PDB entry. Its coverage appears here once it is fetched.",
+          afdb: "A UniProt accession, fetched from AlphaFold DB. Its coverage"
+            + " appears here once it is fetched.",
+          search: "The best hit the MSA search finds. Needs the MSA set to"
+            + " search; its coverage appears here once the fold has run.",
+          upload: template.filename === undefined
+            ? "A structure file from this machine, as PDB or mmCIF."
+            : `${template.filename}. Its coverage appears here once the fold`
+              + " has run.",
+        };
+        status.textContent = template.status ?? waiting[kind];
         section.append(status);
         popup.append(section);
       }

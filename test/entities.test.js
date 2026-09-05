@@ -8,7 +8,8 @@
  */
 import { describe, expect, it } from "./harness.js";
 import {
-  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity, templateProblem,
+  entitiesFromText, entitiesProblem, entityProblem, expandEntities, newEntity,
+  templateAsked, templateKind, templateProblem,
 } from "../web/entities.js";
 
 const protein = (value, copies = 1) => ({ type: "protein", value, copies });
@@ -185,13 +186,26 @@ describe("nucleic entities", () => {
 describe("entity templates", () => {
   const withTemplate = (source, extra = {}) => ({
     type: "protein", value: "ACDEFGHIK", copies: 1, modifications: [],
-    template: { source, ...extra },
+    template: { kind: "pdb", source, ...extra },
   });
 
-  it("accepts a PDB entry, a chain suffix and an accession", () => {
-    for (const source of ["1abc", "1abc_A", "1abc:B", "P00533"]) {
+  it("accepts a PDB entry and a chain suffix", () => {
+    for (const source of ["1abc", "1abc_A", "1abc:B"]) {
       expect(templateProblem(withTemplate(source))).toBe(null);
     }
+  });
+
+  it("accepts an accession once the source says AlphaFold DB", () => {
+    expect(templateProblem(withTemplate("P00533", { kind: "afdb" }))).toBe(null);
+  });
+
+  // 🔴 THE KIND IS WHAT MAKES THESE WRONG, and neither was wrong before it. A
+  // four-character accession went to the PDB and a six-character entry to
+  // AlphaFold DB, both silently, because the old field decided by counting.
+  it("holds each source to its own spelling", () => {
+    expect(templateProblem(withTemplate("P00533"))).toContain("not a PDB entry");
+    expect(templateProblem(withTemplate("1abc", { kind: "afdb" })))
+      .toContain("not a UniProt accession");
   });
 
   it("says so when the source is not one of those", () => {
@@ -210,10 +224,24 @@ describe("entity templates", () => {
     expect(templateProblem({ type: "protein", value: "AC", copies: 1 })).toBe(null);
   });
 
-  it("holds the pLDDT floor to a percentage", () => {
-    expect(templateProblem(withTemplate("P00533", { minConfidence: 70 }))).toBe(null);
-    expect(templateProblem(withTemplate("P00533", { minConfidence: 700 })))
-      .toContain("0 to 100");
+  // 🔴 AN UNFINISHED ROW IS NOT AN ERROR AND IS NOT A TEMPLATE EITHER. Picking
+  // a source and not yet typing under it is the state the dropdown is in for as
+  // long as it takes to type, so it cannot be a problem - but folding as though
+  // it were a template would put an empty slot where a structure is expected.
+  it("asks for a template only once the source has something under it", () => {
+    expect(templateAsked({ kind: "pdb", source: "" })).toBe(false);
+    expect(templateAsked({ kind: "pdb", source: "1abc" })).toBe(true);
+    expect(templateAsked({ kind: "upload" })).toBe(false);
+    expect(templateAsked({ kind: "upload", text: "ATOM..." })).toBe(true);
+    // The search needs nothing typed: the hits are what it uses.
+    expect(templateAsked({ kind: "search" })).toBe(true);
+    expect(templateAsked({ kind: "none", source: "1abc" })).toBe(false);
+    expect(templateAsked(undefined)).toBe(false);
+  });
+
+  it("treats an unknown kind as no template rather than trusting it", () => {
+    expect(templateKind({ kind: "wikipedia", source: "1abc" })).toBe("none");
+    expect(templateAsked({ kind: "wikipedia", source: "1abc" })).toBe(false);
   });
 
   // 🔴 PER CHAIN, NOT PER ENTITY, because copies are expanded - the same rule
@@ -226,5 +254,16 @@ describe("entity templates", () => {
     ]);
     expect(expanded.templates.map((template) => template.chain)).toEqual([0, 1]);
     expect(expanded.templates[0].source).toBe("1abc_A");
+  });
+
+  it("expands an uploaded structure and a search the same way", () => {
+    const expanded = expandEntities([
+      { type: "protein", value: "ACDEF", copies: 1, modifications: [],
+        template: { kind: "upload", text: "ATOM  ...", filename: "mine.pdb" } },
+      { type: "protein", value: "MKVLA", copies: 1, modifications: [],
+        template: { kind: "search" } },
+    ]);
+    expect(expanded.templates.map((template) => template.kind))
+      .toEqual(["upload", "search"]);
   });
 });

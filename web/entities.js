@@ -149,30 +149,72 @@ export function newEntity(type = "protein") {
 }
 
 /**
+ * The template sources a protein chain can be given, in menu order.
+ *
+ * 🔴 ONE FIELD FOR THREE DATABASES WAS A GUESS, AND A GUESS IS THE WRONG SHAPE
+ * FOR THIS. The earlier version took `1abc`, `1abc_A` or an accession in a
+ * single box and decided which server to ask by counting characters - four is
+ * the PDB, anything else AlphaFold DB. It reads well and it is right most of
+ * the time, but "which database" is a question the user can always answer and
+ * the page could only estimate, and the two failures it produces are both
+ * silent: an accession that happens to be four characters goes to the wrong
+ * server, and a typo in a PDB id becomes an AlphaFold DB lookup whose 404 names
+ * a database the user never chose. Asking outright costs one dropdown.
+ *
+ * It also makes room for the two sources that had no way to be named at all: a
+ * file the user has on disk, and the hits the MSA search already found - which
+ * were a checkbox sitting beside a text field that it silently overrode.
+ */
+export const TEMPLATE_KINDS = [
+  ["none", "No template"],
+  ["pdb", "PDB entry"],
+  ["afdb", "AlphaFold DB"],
+  ["search", "From the MSA search"],
+  ["upload", "Upload a structure"],
+];
+
+/** Which source an entity's template asks for; "none" when it asks for none. */
+export function templateKind(template) {
+  const kind = template?.kind;
+  return TEMPLATE_KINDS.some(([name]) => name === kind) ? kind : "none";
+}
+
+/**
+ * Whether a template is filled in enough to be worth fetching.
+ *
+ * 🔴 A KIND WITH NOTHING UNDER IT IS NOT AN ERROR, IT IS AN UNFINISHED ROW.
+ * Picking "PDB entry" and not yet typing an id is the state the dropdown is in
+ * for as long as it takes to type one, so it cannot be a problem - but it is
+ * not a template either, and folding as though it were would put an empty slot
+ * where the user is expecting a structure.
+ */
+export function templateAsked(template) {
+  const kind = templateKind(template);
+  if (kind === "none") return false;
+  if (kind === "search") return true;
+  if (kind === "upload") return (template.text ?? "") !== "";
+  return (template.source ?? "").trim() !== "";
+}
+
+/**
  * What is wrong with an entity's template source, or null.
  *
- * 🔴 THE SOURCE IS ONE FIELD FOR THREE THINGS, because "which structure" is one
- * question: `1abc`, `1abc_A` and a UniProt accession all answer it, and two
- * widgets asking it would be two things to keep in step. Four characters is a
- * PDB entry and anything else an accession - see parseSource in
- * web/template-source.js, which is where the fetching lives.
- *
- * 🔴 AND A TEMPLATE ONLY MEANS ANYTHING ON A POLYMER. AF3's own Template is
+ * 🔴 A TEMPLATE ONLY MEANS ANYTHING ON A POLYMER. AF3's own Template is
  * documented as one protein chain; a ligand has no residues to map onto.
  */
 export function templateProblem(entity) {
   const template = entity.template;
-  if (template === undefined || template === null) return null;
-  const source = (template.source ?? "").trim();
-  if (source === "" && template.auto !== true) return null;
+  const kind = templateKind(template);
+  if (kind === "none") return null;
   if (entity.type !== "protein") return "Only a protein chain can take a template";
+  if (kind === "search" || kind === "upload") return null;
+  const source = (template.source ?? "").trim();
   if (source === "") return null;
-  if (!/^[A-Za-z0-9]{4,12}([_:][A-Za-z0-9])?$/.test(source)) {
-    return `${source} is not a PDB entry (1abc, 1abc_A) or a UniProt accession`;
+  if (kind === "pdb" && !/^[A-Za-z0-9]{4}([_:][A-Za-z0-9]+)?$/.test(source)) {
+    return `${source} is not a PDB entry (1abc, 1abc_A)`;
   }
-  const floor = template.minConfidence;
-  if (floor !== undefined && floor !== "" && !(Number(floor) >= 0 && Number(floor) <= 100)) {
-    return "The pLDDT floor is a number from 0 to 100";
+  if (kind === "afdb" && !/^[A-Za-z0-9]{6,10}([_:][A-Za-z0-9]+)?$/.test(source)) {
+    return `${source} is not a UniProt accession (P00533)`;
   }
   return null;
 }
@@ -337,8 +379,7 @@ export function expandEntities(entities) {
         // reason the modifications are: copies are expanded, so two copies of a
         // templated chain are two chains each carrying it, and the embedder
         // indexes slots by the chain number it will actually see.
-        if ((entity.template?.source || entity.template?.auto === true)
-            && entity.type === "protein") {
+        if (templateAsked(entity.template) && entity.type === "protein") {
           // 🔴 `origin` IS THE ENTITY'S OWN OBJECT, NOT A COPY OF IT. The
           // coverage a template turns out to have - "17 of 120 residues" - is
           // discovered when the structure is fetched, long after this, and the
