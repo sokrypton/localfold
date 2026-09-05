@@ -36,6 +36,7 @@ import { packTransitionWeights } from "../../src/af3/transition-webgpu.js";
 import { packWeights as packTriangleWeights } from "../../src/triangle/weights.js";
 import { af3TriangleWeights } from "../../src/af3/triangle-webgpu.js";
 import { packGridAttentionWeights } from "../../src/af3/grid-attention-webgpu.js";
+import { packSingleAttentionWeights } from "../../src/af3/single-attention-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -87,6 +88,8 @@ export async function main(device, args) {
       af3TriangleWeights(block.triangleMultiplicationOutgoing, 128), "f32").data.byteLength),
     timeTrunk("grid attention 1", (block) =>
       packGridAttentionWeights(block.pairAttention1).data.byteLength),
+    timeTrunk("single attention, f16",
+      (block) => packSingleAttentionWeights(block.singleAttention, "f16").data.byteLength),
   ];
 
   return {

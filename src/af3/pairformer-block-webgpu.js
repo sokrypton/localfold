@@ -46,7 +46,8 @@ import {
 import { createTransitionShader, packTransitionWeights, TRANSITION_ORDER }
   from "./transition-webgpu.js";
 import { residentPackedOnDevice } from "./device-weights.js";
-import { createSingleAttentionShaders, packSingleAttentionWeights } from "./single-attention-webgpu.js";
+import { createSingleAttentionShaders, packSingleAttentionWeights, SINGLE_ATTENTION_ORDER }
+  from "./single-attention-webgpu.js";
 
 const SINGLE_CHANNELS = 384;
 
@@ -520,9 +521,19 @@ export class Af3PairformerStackGpu {
         "w.single-transition",
         () => packTransitionWeights(block.singleTransition, context.weightPrecision).data,
         context.weightPrecision);
-    const singleWeights = resident("w.single",
-      () => packSingleAttentionWeights(block.singleAttention, context.weightPrecision).data,
-      context.weightPrecision);
+    // ...and the second biggest, 67.6 MiB over 48 blocks, by the same route.
+    const singleOnDevice = context.weightPrecision === "f16"
+      ? await residentPackedOnDevice(this.device, {
+          key: block.singleAttention, label: "w.single",
+          order: SINGLE_ATTENTION_ORDER, weights: block.singleAttention,
+          variant: context.weightPrecision,
+        })
+      : undefined;
+    const singleWeights = singleOnDevice !== undefined
+      ? { buffer: singleOnDevice }
+      : resident("w.single",
+        () => packSingleAttentionWeights(block.singleAttention, context.weightPrecision).data,
+        context.weightPrecision);
     const logitsWeights = resident("w.pair-logits", () => packPairLogitsWeights({
       scale: block.singlePairLogitsNormScale,
       offset: block.singlePairLogitsNormOffset,

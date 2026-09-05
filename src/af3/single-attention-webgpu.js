@@ -27,10 +27,11 @@ import { concatenateAs, writeInto } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
-const ORDER = [
+export const SINGLE_ATTENTION_ORDER = [
   "layerNormScale", "layerNormOffset", "qProjection", "qBias",
   "kProjection", "vProjection", "gatingQuery", "outputProjection",
 ];
+const ORDER = SINGLE_ATTENTION_ORDER;
 
 /**
  * @param {"f32"|"f16"} precision the element the packed buffer holds. Offsets
