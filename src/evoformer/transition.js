@@ -1,3 +1,4 @@
+import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
 import { concatenateAs } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -297,6 +298,7 @@ export function packTransitionWeights(input, weightPrecision = "f32") {
  */
 export function createLinearShader(
   tile = LINEAR_TILE, residual = false, precision = "f32", weightPrecision = "f32",
+  sourceStorage = "f32", outputStorage = "f32",
 ) {
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown linear weight precision ${weightPrecision}`);
@@ -327,6 +329,13 @@ export function createLinearShader(
   if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
     throw new RangeError("linear tile rowsPerLane and columnsPerLane must be multiples of 4");
   }
+  // 🔴 A RESIDUAL STORE INTO A PACKED TENSOR IS A READ-MODIFY-WRITE, and this
+  // kernel has no reason to want one: the residual output is the track itself,
+  // which nothing here packs. Refusing the pair is cheaper than the round trip.
+  if (residual && outputStorage === "f16") {
+    throw new RangeError("a packed linear output cannot accumulate a residual");
+  }
+  const packOut = outputStorage === "f16";
   const lanes = lanesX * lanesY;
   const step = lanesY;
   const tileRows = lanesY * rowsPerLane;
@@ -338,6 +347,20 @@ export function createLinearShader(
   // than forbidden - the alternative is a tile shape the sweep cannot reach.
   const sourceTasks = step * rowVectors;
   const sourcePerLane = Math.ceil(sourceTasks / lanes);
+
+  // 🔴 WHO OWNS WHICH COLUMN IS DECIDED BY THE STORAGE, AND ONLY BY IT. In f32
+  // a lane's four accumulator lanes are four columns STRIDED by lanesX, which
+  // is what makes each store instruction a consecutive run across the
+  // workgroup - see the note above, it was measured. Two halves of a packed
+  // word are adjacent columns, so under packing a lane takes a QUAD of
+  // consecutive columns instead, which is two whole words it alone owns. The
+  // f32 path keeps its mapping exactly; nothing about it changes here.
+  const columnExpr = packOut
+    ? (v, j) => `(quad_origin + ${v * lanesX}u) * 4u + ${j}u`
+    : (v, j) => `column_origin + ${(v * 4 + j) * lanesX}u`;
+  const originDeclaration = packOut
+    ? `  let quad_origin = group.x * ${lanesX * (columnsPerLane / 4)}u + local.x;`
+    : `  let column_origin = group.x * ${tileColumns}u + local.x;`;
 
   const accumulator = (r, v) => `acc_${r}_${v}`;
   const block = (r, v) => `blk_${r}_${v}`;
@@ -397,7 +420,7 @@ export function createLinearShader(
       if (k < parameters.inner) {
         for (var j = 0u; j < 4u; j += 1u) {
           let row = row_base + j;
-          if (row < parameters.rows) { staged[j] = ${cast('source[row * parameters.inner + k]')}; }
+          if (row < parameters.rows) { staged[j] = ${cast(storedElement(sourceStorage, "source", "row * parameters.inner + k"))}; }
         }
       }
       tile_source[k_local * ${rowVectors}u + row_group] = staged;
@@ -410,7 +433,9 @@ export function createLinearShader(
       var staged = ${vector}(0.0);
       if (weight_k < parameters.inner) {
         for (var j = 0u; j < 4u; j += 1u) {
-          let output_column = column_origin + (${v}u * 4u + j) * ${lanesX}u;
+          let output_column = ${packOut
+            ? `(quad_origin + ${v * lanesX}u) * 4u + j`
+            : `column_origin + (${v}u * 4u + j) * ${lanesX}u`};
           if (output_column < parameters.columns) {
             staged[j] = ${cast(wf('weights[parameters.weight_offset + weight_k * parameters.columns + output_column]'))};
           }
@@ -424,9 +449,30 @@ export function createLinearShader(
   for (let r = 0; r < rowsPerLane; r += 1) {
     const body = [];
     for (let v = 0; v < columnVectors; v += 1) {
+      if (packOut) {
+        const values = [];
+        for (let c = 0; c < 4; c += 1) {
+          values.push(`        var value_${c} = f32(${accumulator(r, v)}[${c}u])`
+            + `\n          + ${wf(`weights[parameters.bias_offset + column + ${c}u]`)};`);
+        }
+        const relu = [0, 1, 2, 3].map((c) => `value_${c} = max(value_${c}, 0.0);`).join(" ");
+        body.push(`      {
+        let quad = quad_origin + ${v * lanesX}u;
+        let column = quad * 4u;
+        // Four columns at once, so the guard is on the quad. A packed output's
+        // column count is a multiple of four; see the caller's assertion.
+        if (column + 3u < parameters.columns) {
+${values.join("\n")}
+          if (parameters.activation == 1u) { ${relu} }
+          ${storedPair(outputStorage, "output", `word_base_${r} + quad * 2u`, "value_0", "value_1")}
+          ${storedPair(outputStorage, "output", `word_base_${r} + quad * 2u + 1u`, "value_2", "value_3")}
+        }
+      }`);
+        continue;
+      }
       for (let c = 0; c < 4; c += 1) {
         body.push(`      {
-        let output_column = column_origin + ${(v * 4 + c) * lanesX}u;
+        let output_column = ${columnExpr(v, c)};
         if (output_column < parameters.columns) {
           var value = f32(${accumulator(r, v)}[${c}u])
             + ${wf("weights[parameters.bias_offset + output_column]")};
@@ -436,7 +482,10 @@ export function createLinearShader(
       }`);
       }
     }
-    store.push(`  if (row_${r} < parameters.rows) {\n${body.join("\n")}\n  }`);
+    const base = packOut
+      ? `    let word_base_${r} = row_${r} * (parameters.columns / 2u);\n`
+      : "";
+    store.push(`  if (row_${r} < parameters.rows) {\n${base}${body.join("\n")}\n  }`);
   }
 
   const rowNames = [];
@@ -454,10 +503,10 @@ struct MatmulParameters {
   activation: u32,
   padding: vec2<u32>,
 };
-@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(0) var<storage, read> source: array<${storageArray(sourceStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output: array<${storageArray(outputStorage)}>;
 
 // Transposed: four ROWS to a vector, so one read serves four accumulators.
 var<workgroup> tile_source: array<${vector}, ${step * rowVectors}>;
@@ -470,7 +519,7 @@ fn main(
   @builtin(workgroup_id) group: vec3<u32>,
 ) {
   let linear_lane = local.y * ${lanesX}u + local.x;
-  let column_origin = group.x * ${tileColumns}u + local.x;
+${originDeclaration}
 ${rowNames.join("\n")}
 ${declare.join("\n")}
 
@@ -488,8 +537,15 @@ ${store.join("\n")}
 }`;
 }
 
+/**
+ * @param {"f32"|"f16"} [hiddenStorage] how the intermediate between the two
+ *   linear passes is stored. It is the largest tensor a transition holds -
+ *   four times the activation's channels - and it is written by one kernel and
+ *   read by the next, which is the shape a packed tensor wants.
+ */
 export function createTransitionShaders(
   input, offsets, tile = LINEAR_TILE, precision = "f32", weightPrecision = "f32",
+  hiddenStorage = "f32",
 ) {
   void input;
   void offsets;
@@ -560,9 +616,12 @@ fn main(
       + ${wf("weights[parameters.offset_offset + c]")};
   }
 }`;
-  const [linear, linearResidual] = [false, true]
-    .map((residual) => createLinearShader(tile, residual, precision, weightPrecision));
-  return [normalize, linear, linearResidual];
+  // The first pass WRITES the hidden activation and the second READS it, so
+  // the storage appears on opposite sides of the same argument list.
+  const first = createLinearShader(tile, false, precision, weightPrecision, "f32", hiddenStorage);
+  const [second, secondResidual] = [false, true].map((residual) =>
+    createLinearShader(tile, residual, precision, weightPrecision, hiddenStorage, "f32"));
+  return [normalize, first, second, secondResidual];
 }
 
 export function createTransitionNormalizeParameters(input, offsets) {

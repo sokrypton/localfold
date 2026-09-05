@@ -218,10 +218,17 @@ async function encodeTransition(
   const tileColumns = linearTileColumns(tile);
   const shaders = createTransitionShaders(
     descriptor, packed.offsets, tile, precision, weightPrecision);
+  // 🔴 THE RESIDUAL SHADER IS THE LAST OF FOUR, NOT OF THREE. createTransitionShaders
+  // grew a separate FIRST pass when the hidden activation learned to be packed,
+  // and this path still asked for index 2 - which is now the plain second pass.
+  // It would have stored where it should have accumulated: a transition whose
+  // residual silently vanishes, with every shape still agreeing. The monomer
+  // path packs its hidden activation and this one does not yet, so all four
+  // shaders here are the f32 ones.
   const [normalize, linear, linearResidual] = await Promise.all([
     execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
     execution.pipelines.get(`block:transition:linear:${precision}:${weightPrecision}:${tileColumns}`, shaders[1]),
-    execution.pipelines.get(`block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}`, shaders[2]),
+    execution.pipelines.get(`block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}`, shaders[3]),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);

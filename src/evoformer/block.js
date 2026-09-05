@@ -196,12 +196,22 @@ async function encodeTransition(
   });
   const packed = packTransitionWeights(descriptor, weightPrecision);
   const tileColumns = linearTileColumns(tile);
+  // 🔴 THE HIDDEN ACTIVATION IS THE BIGGEST THING A TRANSITION HOLDS and the
+  // shortest-lived: four times the channels, written by the first pass and
+  // read by the second and by nothing else. At 512 MSA rows it was 32 MiB of a
+  // 572 MiB fold, capped there only because TRANSITION_CHUNK_TARGET_BYTES cuts
+  // it into chunks. The store owns whole quads of columns, so a packed word is
+  // never shared between lanes; a column count that is not a multiple of four
+  // has no quad to own, which is what the guard below says.
+  const hiddenStorage = hiddenChannels % 4 === 0 ? "f16" : "f32";
   const shaders = createTransitionShaders(
-    descriptor, packed.offsets, tile, precision, weightPrecision);
-  const [normalize, linear, linearResidual] = await Promise.all([
+    descriptor, packed.offsets, tile, precision, weightPrecision, hiddenStorage);
+  const key = `${precision}:${weightPrecision}:${tileColumns}:${hiddenStorage}`;
+  const [normalize, linearFirst, linear, linearResidual] = await Promise.all([
     execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
-    execution.pipelines.get(`block:transition:linear:${precision}:${weightPrecision}:${tileColumns}`, shaders[1]),
-    execution.pipelines.get(`block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}`, shaders[2]),
+    execution.pipelines.get(`block:transition:linear-first:${key}`, shaders[1]),
+    execution.pipelines.get(`block:transition:linear:${key}`, shaders[2]),
+    execution.pipelines.get(`block:transition:linear-residual:${key}`, shaders[3]),
   ]);
   const weights = execution.upload(`${label}.weights`, packed.data);
   const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
@@ -223,11 +233,12 @@ async function encodeTransition(
       rows, hiddenChannels, channels, packed.offsets[4], packed.offsets[5], 0, 0, 0,
     ]));
     const normalized = execution.allocate(`${label}.normalized`, rows * channels);
-    const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
+    const hidden = execution.allocate(
+      `${label}.hidden`, rows * hiddenChannels, GPUBufferUsage.STORAGE, hiddenStorage);
     const transitionNormGrid = execution.rowGrid(rows);
     execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
       transitionNormGrid[0], transitionNormGrid[1], 1, `${label}.normalize`);
-    execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
+    execution.dispatch(encoder, linearFirst, [normalized, weights, firstParams, hidden],
       Math.ceil(hiddenChannels / tileColumns), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
       `${label}.first`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
@@ -242,7 +253,8 @@ async function encodeTransition(
   // round is which rows of the SOURCE and the OUTPUT are bound - so the big
   // tensors are never bound whole and never need to be bindable whole.
   const normalized = execution.allocate(`${label}.normalized-chunk`, chunkRows * channels);
-  const hidden = execution.allocate(`${label}.hidden-chunk`, chunkRows * hiddenChannels);
+  const hidden = execution.allocate(
+    `${label}.hidden-chunk`, chunkRows * hiddenChannels, GPUBufferUsage.STORAGE, hiddenStorage);
   for (let rowOffset = 0; rowOffset < rows; rowOffset += chunkRows) {
     const count = Math.min(chunkRows, rows - rowOffset);
     // ...the row count in the uniforms is the CHUNK's, not the tensor's: the
@@ -263,7 +275,7 @@ async function encodeTransition(
     const chunkNormGrid = execution.rowGrid(count);
     execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
       chunkNormGrid[0], chunkNormGrid[1], 1, `${label}.normalize-${rowOffset}`);
-    execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
+    execution.dispatch(encoder, linearFirst, [normalizedChunk, weights, firstParams, hiddenChunk],
       Math.ceil(hiddenChannels / tileColumns), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
       `${label}.first-${rowOffset}`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
