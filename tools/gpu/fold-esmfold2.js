@@ -17,7 +17,7 @@
 // peptide bond, and a port with the arithmetic subtly wrong gives a plausible
 // cloud at the wrong scale - and, when a reference structure is supplied, the
 // RMSD after superposition.
-import { readTensor } from "../../src/reference/dtype.js";
+import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 import { foldEsmfold2, SAMPLER_PRESETS } from "../../src/esmfold2/fold.js";
@@ -39,6 +39,9 @@ const option = (args, name, fallback) => {
 const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",
   "q_norm/scale", "k_norm/scale", "attn_out/weights", "ffn_norm/scale",
   "ffn_norm/offset", "fc1/weights", "fc2/weights"];
+/** The four matrices the tower stores at half precision anyway. */
+const NARROW_LEAVES = new Set(["qkv/weights", "attn_out/weights",
+  "fc1/weights", "fc2/weights"]);
 const TOWER_SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/norm/scale",
   "lm/norm/offset", "lm/projection/weights", "lm/downproject/weights",
   "lm/downproject/bias"];
@@ -54,14 +57,16 @@ function reader(bundle) {
     if (table === undefined) table = await (await fetch(`${bundle}/manifest.json`)).json();
     return table;
   };
-  const read = async (name) => {
+  const read = async (name, half = false) => {
     const loaded = await manifest();
     const record = loaded.tensors[name];
     if (record === undefined) throw new Error(`${bundle} has no tensor ${name}`);
     if (!shards.has(record.file)) {
       shards.set(record.file, await (await fetch(`${bundle}/${record.file}`)).arrayBuffer());
     }
-    return readTensor(record, shards.get(record.file), record.byteOffset ?? 0, true);
+    return half
+      ? readTensorAsFloat16(record, shards.get(record.file), record.byteOffset ?? 0)
+      : readTensor(record, shards.get(record.file), record.byteOffset ?? 0, true);
   };
   return { manifest, read };
 }
@@ -156,7 +161,10 @@ export async function main(device, args = []) {
       residualScale: towerManifest.residualScale ?? 1,
     }, async (layer) => {
       const weights = {};
-      for (const leaf of BLOCK_LEAVES) weights[leaf] = await tower.read(`blocks/${layer}/${leaf}`);
+      for (const leaf of BLOCK_LEAVES) {
+        weights[leaf] = await tower.read(`blocks/${layer}/${leaf}`,
+                                         NARROW_LEAVES.has(leaf));
+      }
       return weights;
     }, towerShared, { sequenceId });
     return result.single;

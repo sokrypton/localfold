@@ -35,6 +35,9 @@ const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",
   "q_norm/scale", "k_norm/scale", "attn_out/weights", "ffn_norm/scale",
   "ffn_norm/offset", "fc1/weights", "fc2/weights"];
 /** What the tower needs besides its blocks, plus the shim's single half. */
+/** The leaves worth decoding straight to half precision: the block's matrices. */
+const NARROW_LEAVES = new Set(["qkv/weights", "attn_out/weights",
+  "fc1/weights", "fc2/weights"]);
 const TOWER_SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/norm/scale",
   "lm/norm/offset", "lm/projection/weights", "lm/downproject/weights",
   "lm/downproject/bias"];
@@ -142,10 +145,18 @@ export function loadEsmfold2Weights(onProgress) {
         // 🔴 A BLOCK IS READ WHEN THE TOWER ASKS FOR IT. Reading all 36 first
         // is 2190 MiB of float32 in the tab, which is the thing the streaming
         // design exists to avoid.
+        // 🔴 THE FOUR BIG MATRICES COME BACK ALREADY NARROW. They are 99.6% of
+        // a block and the tower stores them at half precision anyway, so
+        // decoding them to float32 first is a whole extra pass over 573 M
+        // parameters - 723 ms a fold and 2.3 GB of intermediate. The six
+        // vectors stay float32: they are the norms, and the tower uploads them
+        // as they are.
         block: async (layer) => {
           const block = {};
           for (const leaf of BLOCK_LEAVES) {
-            block[leaf] = await towerStore.tensor(`blocks/${layer}/${leaf}`);
+            const name = `blocks/${layer}/${leaf}`;
+            block[leaf] = NARROW_LEAVES.has(leaf)
+              ? await towerStore.tensorAsFloat16(name) : await towerStore.tensor(name);
           }
           return block;
         },

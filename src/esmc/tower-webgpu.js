@@ -142,8 +142,24 @@ export class EsmcTowerGpu {
     // code paths having drifted. Same hazard as a checker that builds its own
     // kernel: what is measured has to be what runs.
     const weightPrecision = options.weightPrecision ?? "f16";
-    const narrow = (values) => (weightPrecision === "f16"
-      ? float32ToFloat16Array(values) : values);
+    // 🔴 AN ALREADY-NARROW ARRAY PASSES THROUGH, WHICH IS HOW A CALLER SKIPS A
+    // WHOLE PASS OVER THE WEIGHTS. Decoding int3 to float32 and narrowing
+    // afterwards reads and writes 573 M elements twice; a caller that asks its
+    // store for `tensorAsFloat16` has already done the narrowing as it
+    // unpacked, and this must not do it again - `float32ToFloat16Array` of a
+    // Float16Array would reinterpret its BITS as numbers.
+    const isNarrow = (values) => values instanceof Uint16Array
+      || (typeof Float16Array === "function" && values instanceof Float16Array);
+    const narrow = (values) => {
+      if (isNarrow(values)) {
+        if (weightPrecision !== "f16") {
+          throw new Error("this tower is compiled for float32 weights and was handed"
+            + " half-precision ones; the shader would read them at twice the stride");
+        }
+        return values;
+      }
+      return weightPrecision === "f16" ? float32ToFloat16Array(values) : values;
+    };
     if (ids.length !== rows) throw new Error(`${ids.length} ids for ${rows} rows`);
 
     const storage = GPUBufferUsage.STORAGE;
@@ -256,12 +272,26 @@ export class EsmcTowerGpu {
       if (capture.has(0)) captured.set(0, await readBack(current, rows * model, "s0"));
 
       const started = performance.now();
+      // 🔴 THE NEXT BLOCK'S WEIGHTS ARE ASKED FOR BEFORE THIS ONE'S GPU WORK IS
+      // AWAITED, AND THAT IS WORTH A THIRD OF A FOLD'S LANGUAGE MODEL. Decoding
+      // one block out of int3 and narrowing it to f16 is HOST work - measured
+      // at 1121 ms and 723 ms respectively across 36 blocks, against 660 ms of
+      // GPU - and the loop used to do it strictly between submits: decode,
+      // upload, submit, wait, decode the next. JavaScript is single-threaded
+      // but the GPU is not, so starting the decode before `onSubmittedWorkDone`
+      // puts it inside the window the device is busy in.
+      //
+      // 🔴 AND ONE BLOCK AHEAD, NOT ALL OF THEM. The whole point of streaming
+      // is that 2190 MiB of float32 never exists at once; prefetching the lot
+      // would defeat it exactly. Two blocks live is 64 MiB.
+      let pending = layers > 0 ? blockWeights(0) : undefined;
       for (let layer = 0; layer < layers; layer += 1) {
         // Awaited, so a caller may stream a block's weights from the network or
         // decode them from a quantised bundle rather than holding 2190 MiB of
         // float32 in the tab. A bench should pre-load and hand back a plain
         // object; a checker should not have to.
-        const weights = await blockWeights(layer);
+        const weights = await pending;
+        pending = layer + 1 < layers ? blockWeights(layer + 1) : undefined;
         const perBlock = [];
         const upload = (name, values) => {
           const allocation = this.allocator.upload(`esmc.b${layer}.${name}`, values, storage);
@@ -276,6 +306,14 @@ export class EsmcTowerGpu {
         };
         const scaled = (values) => {
           if (residualScale === 1) return values;
+          // 🔴 A SCALED WEIGHT CANNOT ARRIVE ALREADY NARROW. This divides
+          // element by element and a Uint16Array holds BITS, so the arithmetic
+          // would be on the encoding. No checkpoint here scales its residual,
+          // which is exactly why this would go unnoticed.
+          if (isNarrow(values)) {
+            throw new Error(`this tower scales its residual by ${residualScale} and was`
+              + " handed half-precision weights, which cannot be scaled elementwise");
+          }
           const out = new Float32Array(values.length);
           for (let i = 0; i < values.length; i += 1) out[i] = values[i] / residualScale;
           return out;

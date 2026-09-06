@@ -13,7 +13,7 @@
 // The export writes tensors in block order, so a sequential pass walks the
 // shards in order too and a window of three is enough - which is 144 MiB live
 // against 2190, the same shape of trade the tower itself makes with weights.
-import { readTensor } from "../../src/reference/dtype.js";
+import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 
 const WINDOW = 3;
@@ -42,14 +42,27 @@ function shardReader(base) {
 // at model-esmc-600m-int5 measures the artefact that would actually ship rather
 // than a float32 stand-in for it. A checker with its own unpacker would be
 // checking its own unpacker.
+//
+// 🔴 AND THE FOUR BIG MATRICES ARE DECODED STRAIGHT TO HALF PRECISION, BECAUSE
+// THAT IS WHAT THE PAGE DOES. The tower stores them at f16 either way; asking
+// the decoder for f16 skips a whole pass over 573 M parameters, and it is a
+// DIFFERENT operation - one rounding instead of two - so a checker reading
+// float32 here would be checking a path nothing runs. Same hazard as a checker
+// that builds its own kernel.
 function tensorReader(manifest, read) {
-  return async (name) => {
+  return async (name, half = false) => {
     const record = manifest.tensors[name];
     if (record === undefined) throw new Error(`bundle has no tensor ${name}`);
     const buffer = await read(record.file);
-    return readTensor(record, buffer, record.byteOffset ?? 0, true);
+    return half
+      ? readTensorAsFloat16(record, buffer, record.byteOffset ?? 0)
+      : readTensor(record, buffer, record.byteOffset ?? 0, true);
   };
 }
+
+/** The leaves the tower narrows anyway. */
+const NARROW_LEAVES = new Set(["qkv/weights", "attn_out/weights",
+  "fc1/weights", "fc2/weights"]);
 
 const relative = (got, want) => {
   let error = 0, total = 0;
@@ -116,7 +129,9 @@ export async function main(device, args = []) {
   // the design by contradicting it. The shard window makes this ~144 MiB live.
   const blockWeights = async (layer) => {
     const weights = {};
-    for (const leaf of BLOCK_LEAVES) weights[leaf] = await read(`blocks/${layer}/${leaf}`);
+    for (const leaf of BLOCK_LEAVES) {
+      weights[leaf] = await read(`blocks/${layer}/${leaf}`, NARROW_LEAVES.has(leaf));
+    }
     return weights;
   };
 

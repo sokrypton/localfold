@@ -187,6 +187,29 @@ export class HttpTensorStore {
   }
 
   /**
+   * The same tensor, decoded straight into half precision.
+   *
+   * 🔴 IT SAVES A WHOLE PASS OVER THE WEIGHTS, and on ESM-C's 573 M parameters
+   * that pass is 723 ms a fold plus 2.3 GB of intermediate float32. Only a
+   * caller that was going to narrow immediately should ask for this; see
+   * readTensorAsFloat16 for what it is and is not identical to.
+   *
+   * 🔴 AND IT IS CACHED SEPARATELY, because the two return different arrays for
+   * the same name and a shared cache would hand whichever was asked for first
+   * to whoever asked second. That is a shape mismatch nothing would catch: a
+   * Float16Array is the right length and half the bytes.
+   */
+  tensorAsFloat16(name) {
+    const key = `${name}\u0000f16`;
+    let value = this.#cache.get(key);
+    if (value === undefined) {
+      value = this.#load(name, Float16Array);
+      this.#cache.set(key, value);
+    }
+    return value;
+  }
+
+  /**
    * Start every shard downloading now, instead of when a tensor in it is first
    * asked for.
    *
@@ -317,7 +340,7 @@ export class HttpTensorStore {
     }
     return readTensorRange(record, buffer, byteOffset, first, count);
   }
-  async #load(name) {
+  async #load(name, Output = Float32Array) {
     const record = this.manifest.tensors[name];
     if (record === undefined) throw new Error(`missing tensor ${name}`);
     let pendingFile = this.#fileCache.get(record.file);
@@ -337,7 +360,7 @@ export class HttpTensorStore {
       this.#loadedTensors += 1;
     }
     this.#reportProgress(name);
-    return readTensor(record, buffer, byteOffset);
+    return readTensor(record, buffer, byteOffset, Output !== Float32Array, Output);
   }
   async #scheduleDownload(file, tensorName) {
     return new Promise((resolve, reject) => {
