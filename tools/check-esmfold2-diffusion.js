@@ -18,8 +18,9 @@ import { join } from "node:path";
 import process from "node:process";
 
 import { readTensor } from "../src/reference/dtype.js";
-import { diffusionConditioning, tokenTransformer }
+import { denoiseStep, diffusionConditioning, tokenTransformer }
   from "../src/esmfold2/diffusion-reference.js";
+import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
@@ -179,7 +180,105 @@ if (dump.block0["diffusion.tokenTransformer"] != null) {
     relative(got, Float32Array.from(record.output)), 5e-6);
 }
 
+// --- and one whole denoise step, which is the assembly rather than the parts.
+if (dump.denoiser != null) {
+  const record = dump.denoiser;
+  const value = (name) => Float32Array.from(record.arguments[name].values);
+  const integers = (name) => Int32Array.from(record.arguments[name].values);
+  const atoms = record.arguments.ref_pos.shape[1];
+  const atomShape = {
+    atoms, tokens,
+    channels: manifest.trunk.atomChannels, heads: manifest.trunk.atomHeads,
+    blocks: manifest.trunk.atomBlocks, tokenChannels: shape.tokenChannels,
+    hidden: manifest.trunk.atomChannels * 2, windowSize: manifest.trunk.atomWindow,
+  };
+  const swaBlocks = (prefix) => {
+    const out = [];
+    for (let layer = 0; layer < atomShape.blocks; layer += 1) {
+      const at = (leaf) => tensors[`${prefix}/blocks/${layer}/${leaf}`];
+      out.push({ adaln: at("adaln"), qkv: at("qkv"), attnGate: at("attnGate"),
+                 attnOut: at("attnOut"), ffnUp: at("ffnUp"), ffnDown: at("ffnDown") });
+    }
+    return out;
+  };
+  // 🔴 THE ELEMENT AND NAME FEATURES COME FROM THE FEATURISER'S ARRAYS, NOT THE
+  // DENOISER'S ARGUMENTS. The module is handed them already one-hot -
+  // `ref_element` at [320, 128] - and `atomFeatures` builds the one-hot itself,
+  // so passing the module's copy makes it read 0s and 1s as element indices.
+  // Every shape conforms and the encoder came back at relRMS 0.89 with corr
+  // 0.72, which reads exactly like a wrong convention in three SWA blocks. It
+  // is the same molecule either way, and the featuriser's checker already shows
+  // the rebuild is bit-identical to what the model was given.
+  const features = {
+    refPos: value("ref_pos"), refCharge: value("ref_charge"), mask: value("ref_mask"),
+    refElement: Int32Array.from(dump.features.ref_element.values),
+    refAtomNameChars: Int32Array.from(dump.features.ref_atom_name_chars.values),
+    refSpaceUid: value("ref_space_uid"), atomToToken: integers("tok_idx"),
+  };
+  const encoder = {
+    embed: (f) => inputsEmbedder({ ...features, ...f }, atomShape, {
+      atomLinear: tensors["diffusionAtomEncoder/linear"],
+      atomNormScale: tensors["diffusionAtomEncoder/norm/scale"],
+      atomNormOffset: tensors["diffusionAtomEncoder/norm/offset"],
+      atomToToken: tensors["diffusionAtomEncoder/toToken"],
+      coordsLinear: tensors["diffusionAtomEncoder/coordsLinear"],
+      blocks: swaBlocks("diffusionAtomEncoder"),
+    }),
+    decode: (tokenAct, embedded) => atomDecoder(
+      tokenAct, embedded.atomState, embedded.conditioning, embedded.rope,
+      features, atomShape, {
+        tokenToAtom: tensors["diffusionAtomDecoder/tokenToAtom"],
+        normScale: tensors["diffusionAtomDecoder/norm/scale"],
+        normOffset: tensors["diffusionAtomDecoder/norm/offset"],
+        outputLinear: tensors["diffusionAtomDecoder/outputLinear"],
+        blocks: swaBlocks("diffusionAtomDecoder"),
+      }),
+  };
+  const denoiseShape = {
+    ...shape, tokenHeads: manifest.trunk.tokenHeads, sigmaData: manifest.trunk.sigmaData,
+  };
+  const tokenBlocks = [];
+  for (let layer = 0; layer < manifest.trunk.tokenBlocks; layer += 1) {
+    const at = (kind, leaf) => tensors[`diffusion/tokenBlocks/${layer}/${kind}/${leaf}`];
+    const adaln = (kind) => ({
+      singleScale: at(kind, "adaln/singleScale"), gateWeights: at(kind, "adaln/gateWeights"),
+      gateBias: at(kind, "adaln/gateBias"), shiftWeights: at(kind, "adaln/shiftWeights"),
+    });
+    tokenBlocks.push({
+      attention: { adaln: adaln("attention"),
+        queryWeights: at("attention", "queryWeights"), queryBias: at("attention", "queryBias"),
+        kvWeights: at("attention", "kvWeights"), gateWeights: at("attention", "gateWeights"),
+        outWeights: at("attention", "outWeights"),
+        outGateWeights: at("attention", "outGateWeights"),
+        outGateBias: at("attention", "outGateBias"),
+        pairNormScale: at("attention", "pairNormScale"),
+        pairNormOffset: at("attention", "pairNormOffset"),
+        pairBiasWeights: at("attention", "pairBiasWeights") },
+      transition: { adaln: adaln("transition"),
+        swishWeights: at("transition", "swishWeights"),
+        outWeights: at("transition", "outWeights"),
+        outGateWeights: at("transition", "outGateWeights"),
+        outGateBias: at("transition", "outGateBias") },
+    });
+  }
+  const got = denoiseStep(
+    value("x_noisy"), record.arguments.t_hat.values[0], features,
+    value("s_inputs"), value("z_trunk"), value("relative_position_encoding"),
+    denoiseShape, {
+      conditioning: weights, tokenBlocks,
+      stepNormScale: tensors["diffusion/stepNorm/scale"],
+      stepNormOffset: tensors["diffusion/stepNorm/offset"],
+      singleToToken: tensors["diffusion/singleToToken"],
+      tokenNormScale: tensors["diffusion/tokenNorm/scale"],
+      tokenNormOffset: tensors["diffusion/tokenNorm/offset"],
+    }, encoder);
+  // The bound is the atom attention's bfloat16 again - this step runs six SWA
+  // blocks, three in the encoder and three in the decoder.
+  report("one denoise step", relative(got.coordinates, Float32Array.from(record.output)),
+         dump.float32Attention ? 5e-6 : 5e-3);
+}
+
 console.log(failures === 0
-  ? "\nthe diffusion conditioning and token transformer agree with ESMFold2"
+  ? "\nESMFold2's denoiser: conditioning, token transformer and a whole step"
   : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

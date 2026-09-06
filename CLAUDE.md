@@ -1142,6 +1142,38 @@ gate first; `DiffusionConditioning`'s `TransitionLayer` has `a_proj` and
 and they are packed the two different ways. **Read the shapes, never the
 family.**
 
+🔴 **AND A WHOLE DENOISE STEP NOW RUNS AT 1.51e-4.** Conditioning, the atom
+encoder with the noisy coordinates, the token transformer, the atom decoder and
+the EDM preconditioning - checked against the module's own first call out of the
+sampler's fifteen. The floor is the atom attention's bfloat16 again, six SWA
+blocks of it this time.
+
+🔴 **THE NOISY COORDINATES ENTER THE ACTIVATION AND NEVER THE CONDITIONING.**
+`q` starts at `c_base + coords_linear([r_l | pred_r1])` while `c` stays
+`c_base`, so the atom stack is conditioned on the reference conformer alone and
+only its running activation knows where the atoms currently are. Adding the
+projection to both is the natural-looking symmetry and a different model.
+`pred_r1` is ZEROS when there is no previous prediction, not absent: the
+projection is six channels wide either way, and feeding it three reads the
+second half of the matrix at the wrong offset. Measured, the same step: with no
+coordinate term at all **1.23e-1**, with the coordinates unscaled **1.02e+2**.
+
+🔴 **AND THE LAST LINE IS EDM PRECONDITIONING, NOT A RESIDUAL.**
+`out = sigma^2/(sigma^2+t^2) * x_noisy + sigma*t/sqrt(sigma^2+t^2) * r_update` -
+at a large noise level the first term is nearly zero and the answer is almost
+all network, at a small one almost all input. Writing it as `x_noisy + r_update`
+runs and converges to something.
+
+🔴 **AND `ref_element` IS INDICES TO THE FEATURISER AND A ONE-HOT TO THE MODEL,
+WHICH COST AN HOUR.** The module is handed `ref_element` at (atoms, 128) and
+`ref_atom_name_chars` at (atoms, 4, 64), already one-hot; the featuriser
+produces them as indices at (atoms,) and (atoms, 4). Both reach a JavaScript
+port as a flat typed array, and passing the one-hot makes `atomFeatures` read
+its first `atoms` entries - all 0 or 1 - as element indices. Every shape
+conforms, nothing throws, and the encoder came back at **relRMS 0.89 with corr
+0.72**, which reads exactly like a wrong convention somewhere in three SWA
+blocks. `atomFeatures` checks the LENGTH now and says which it wants.
+
 🔴 **AND THE FOURIER TABLE IS A BUFFER, WHICH IS STILL TRAINED IN.**
 `register_buffer("w", randn(c))` is drawn once at construction and saved with
 the checkpoint, so a port that redraws it gets a different model that runs. Both

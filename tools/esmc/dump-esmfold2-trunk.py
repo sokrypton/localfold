@@ -91,6 +91,7 @@ def main():
     # verify and the whole trunk is 77; the ladder matters more than the total.
     captured['modules'] = {}
     captured['conditioning'] = []
+    captured['denoiser'] = []
 
     def module_hook(label):
         # 🔴 KEYWORDS TOO, BECAUSE HALF OF THESE TAKE NO POSITIONAL ARGUMENT AT
@@ -179,6 +180,26 @@ def main():
     # helper is right here where it was wrong for the conditioning.
     handles.append(diffusion.token_transformer.register_forward_hook(
         module_hook('diffusion.tokenTransformer'), with_kwargs=True))
+
+    # 🔴 AND THE WHOLE DENOISER, whose output is a DICT rather than a tensor or
+    # a tuple - `{"x_denoised": ..., "token_repr": ..., "atom_intermediates":
+    # ...}` - so module_hook, which reaches for output[0], would index a dict by
+    # an integer and raise. It gets its own hook, and the first of the sampler's
+    # fifteen steps is the one kept.
+    def denoiser_hook(_module, inputs, keywords, output):
+        if captured['denoiser']:
+            return
+        arguments = {}
+        for index, value in enumerate(inputs):
+            if torch.is_tensor(value):
+                arguments[str(index)] = value.detach().clone()
+        for name, value in (keywords or {}).items():
+            if torch.is_tensor(value):
+                arguments[name] = value.detach().clone()
+        captured['denoiser'].append({
+            'output': output['x_denoised'].detach().clone(), 'arguments': arguments})
+
+    handles.append(diffusion.register_forward_hook(denoiser_hook, with_kwargs=True))
 
     for index, block in enumerate(encoder.atom_transformer.blocks):
         handles.append(block.register_forward_hook(
@@ -272,6 +293,12 @@ def main():
             'arguments': {k: {'shape': list(t.shape), 'values': tolist(t)}
                           for k, t in captured['conditioning'][0]['arguments'].items()},
         } if captured['conditioning'] else None,
+        'denoiser': {
+            'output': tolist(captured['denoiser'][0]['output']),
+            'outputShape': list(captured['denoiser'][0]['output'].shape),
+            'arguments': {k: {'shape': list(t.shape), 'values': tolist(t)}
+                          for k, t in captured['denoiser'][0]['arguments'].items()},
+        } if captured['denoiser'] else None,
     }
 
     out = pathlib.Path(arguments.out) if arguments.out else (

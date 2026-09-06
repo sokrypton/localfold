@@ -317,3 +317,69 @@ export function tokenTransformer(activation, single, pair, tokens, channels,
 }
 
 export { layerNorm, linear, constant };
+
+/**
+ * One EDM denoise step: noisy coordinates in, denoised coordinates out.
+ *
+ *     s, z    = conditioning(t_hat, s_inputs, z_trunk, rel_pos)
+ *     r_noisy = x_noisy / sqrt(t^2 + sigma^2)
+ *     a, q, c = atom_encoder(features, r_l = r_noisy)
+ *     a       = a + s_to_token(s_step_norm(s))
+ *     a       = token_norm(token_transformer(a, s, z))
+ *     r       = atom_decoder(a, q, c)
+ *     out     = sigma^2/(sigma^2+t^2) * x_noisy
+ *             + sigma*t/sqrt(sigma^2+t^2) * r
+ *
+ * 🔴 THE LAST LINE IS THE EDM PRECONDITIONING AND IT IS NOT A RESIDUAL. The
+ * network's output is scaled by `sigma*t/sqrt(sigma^2+t^2)` and the noisy input
+ * by `sigma^2/(sigma^2+t^2)`; at a large noise level the second is nearly zero
+ * and the answer is almost all network, at a small one almost all input.
+ * Writing it as `x_noisy + r` runs, converges to something, and is a different
+ * sampler.
+ *
+ * 🔴 AND `z` IS THE SAME FOR EVERY STEP WHILE `s` IS NOT. The caller may pass
+ * `conditioning` back in to skip the pair half; see the note there.
+ */
+// 🔴 NAMED `denoiseStep`, NOT `denoise`, AND NOT FOR TASTE. `denoise` is a
+// PARAMETER of src/af3/diffusion-sampler-reference.js's `sample`, and
+// test/module-references.test.js checks the whole project's exported names
+// against every file's free identifiers - so exporting it here makes that
+// parameter look like a reference to this function. Second time in this
+// repository: `block` and `attend` went the same way.
+export function denoiseStep(noisy, tHat, features, sInputs, zTrunk, relPos,
+                        shape, weights, encoder, cached = undefined) {
+  const sigma = shape.sigmaData;
+  const conditioning = cached ?? diffusionConditioning(
+    zTrunk, relPos, sInputs, tHat, shape, weights.conditioning, sigma);
+  const { single, pair } = conditioning;
+
+  const denominator = Math.sqrt(tHat * tHat + sigma * sigma);
+  const scaled = new Float32Array(noisy.length);
+  for (let i = 0; i < noisy.length; i += 1) scaled[i] = noisy[i] / denominator;
+
+  const embedded = encoder.embed({ ...features, noisyCoordinates: scaled });
+
+  // ...the conditioning single, projected onto the tokens the encoder pooled.
+  const stepped = linear(
+    layerNorm(single, shape.tokens, shape.tokenChannels,
+              weights.stepNormScale, weights.stepNormOffset),
+    shape.tokens, shape.tokenChannels, shape.tokenChannels, weights.singleToToken);
+  const act = new Float32Array(embedded.tokenAct.length);
+  for (let i = 0; i < act.length; i += 1) act[i] = embedded.tokenAct[i] + stepped[i];
+
+  const transformed = tokenTransformer(act, single, pair, shape.tokens,
+    shape.tokenChannels, shape.pairChannels, shape.tokenHeads,
+    shape.tokenChannels * shape.multiplier, weights.tokenBlocks);
+  const normalised = layerNorm(transformed, shape.tokens, shape.tokenChannels,
+                               weights.tokenNormScale, weights.tokenNormOffset);
+
+  const update = encoder.decode(normalised, embedded);
+
+  const sigma2 = sigma * sigma;
+  const t2 = tHat * tHat;
+  const keep = sigma2 / (sigma2 + t2);
+  const take = (sigma * tHat) / Math.sqrt(sigma2 + t2);
+  const out = new Float32Array(noisy.length);
+  for (let i = 0; i < noisy.length; i += 1) out[i] = keep * noisy[i] + take * update[i];
+  return { coordinates: out, conditioning };
+}

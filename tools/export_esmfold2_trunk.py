@@ -116,6 +116,44 @@ def main():
             writer.add('%s/bProjection' % base, transposed('%s.b_proj.weight' % at))
             writer.add('%s/outProjection' % base, transposed('%s.out_proj.weight' % at))
 
+    # The denoiser's own atom encoder and decoder: the SAME SWA primitive as the
+    # inputs embedder, with a coords_linear on the encoder and a
+    # token_to_atom/output_linear pair on the decoder.
+    dm = 'structure_head.diffusion_module'
+    for who, out_name in (('atom_encoder', 'diffusionAtomEncoder'),
+                          ('atom_decoder', 'diffusionAtomDecoder')):
+        at = '%s.%s' % (dm, who)
+        blocks_prefix = '%s.atom_transformer.blocks.' % at
+        n_blocks = len({k[len(blocks_prefix):].split('.')[0] for k in source.keys()
+                        if k.startswith(blocks_prefix)})
+        for leaf, name in (('atom_linear', 'linear'), ('coords_linear', 'coordsLinear'),
+                           ('token_to_atom_linear', 'tokenToAtom'),
+                           ('atom_to_token_linear', 'toToken'),
+                           ('output_linear', 'outputLinear')):
+            key = '%s.%s.weight' % (at, leaf)
+            if key in source.keys():
+                writer.add('%s/%s' % (out_name, name), transposed(key))
+        for leaf, name in (('atom_norm', 'norm'), ('norm', 'norm')):
+            key = '%s.%s.weight' % (at, leaf)
+            if key in source.keys():
+                writer.add('%s/%s/scale' % (out_name, name),
+                           np.asarray(get(key), np.float32))
+                writer.add('%s/%s/offset' % (out_name, name),
+                           np.asarray(get('%s.%s.bias' % (at, leaf)), np.float32))
+        for layer in range(n_blocks):
+            b = '%s%d' % (blocks_prefix, layer)
+            for leaf, name in (('adaln_modulation.1', 'adaln'), ('attn.Wqkv', 'qkv'),
+                               ('attn.gate_proj', 'attnGate'), ('attn.out_proj', 'attnOut'),
+                               ('ffn.w_up', 'ffnUp'), ('ffn.w_down', 'ffnDown')):
+                writer.add('%s/blocks/%d/%s' % (out_name, layer, name),
+                           transposed('%s.%s.weight' % (b, leaf)))
+    for leaf, name in (('s_step_norm', 'stepNorm'), ('token_norm', 'tokenNorm')):
+        writer.add('diffusion/%s/scale' % name,
+                   np.asarray(get('%s.%s.weight' % (dm, leaf)), np.float32))
+        writer.add('diffusion/%s/offset' % name,
+                   np.asarray(get('%s.%s.bias' % (dm, leaf)), np.float32))
+    writer.add('diffusion/singleToToken', transposed('%s.s_to_token.weight' % dm))
+
     # 🔴 THE TOKEN TRANSFORMER'S TWO ModuleLists ARE ZIPPED, NOT INTERLEAVED.
     # `attn_blocks` and `transition_blocks` are each num_blocks long and the
     # forward pairs them, so block i is attn_blocks[i] then transition_blocks[i].

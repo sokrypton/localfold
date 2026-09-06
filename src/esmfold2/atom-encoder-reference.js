@@ -374,6 +374,22 @@ export function swaBlock(activation, conditioning, atoms, channels, heads, weigh
 /** The 389 per-atom features, one-hots masked by the atom mask. */
 export function atomFeatures(features, atoms) {
   const { refPos, refCharge, refElement, refAtomNameChars, mask } = features;
+  // 🔴 INDICES, NOT ONE-HOTS, AND THE LENGTH IS THE ONLY THING THAT SAYS SO.
+  // The MODEL is handed `ref_element` already one-hot at (atoms, 128) and
+  // `ref_atom_name_chars` at (atoms, 4, 64); the FEATURISER produces them as
+  // indices at (atoms,) and (atoms, 4). Both arrive here as a flat typed array,
+  // and passing the one-hot makes this read its first `atoms` entries - all 0
+  // or 1 - as element indices. Every shape conforms, nothing throws, and the
+  // encoder's output comes back at relRMS 0.89 with corr 0.72, which reads
+  // exactly like a wrong convention somewhere in three SWA blocks.
+  if (refElement.length !== atoms) {
+    throw new Error(`ref_element has ${refElement.length} entries for ${atoms} atoms; `
+      + "this wants INDICES, not the one-hot the model is handed");
+  }
+  if (refAtomNameChars.length !== atoms * NAME_LENGTH) {
+    throw new Error(`ref_atom_name_chars has ${refAtomNameChars.length} entries for `
+      + `${atoms} atoms; this wants ${atoms * NAME_LENGTH} INDICES`);
+  }
   const out = new Float32Array(atoms * ATOM_FEATURES);
   const elementBase = 5;
   const charBase = elementBase + MAX_ELEMENT;
@@ -435,9 +451,33 @@ export function inputsEmbedder(features, shape, weights) {
     atomFeatures(features, atoms), atoms, ATOM_FEATURES, channels, weights.atomLinear);
   const start = layerNorm(embedded, atoms, channels,
                           weights.atomNormScale, weights.atomNormOffset);
+  // 🔴 THE DIFFUSION'S COPY OF THIS ENCODER TAKES THE NOISY COORDINATES, AND
+  // THE CONDITIONING DOES NOT MOVE. `q` starts at `c_base` plus a projection of
+  // `[r_l | pred_r1]`, six channels, while `c` stays `c_base` - so the noisy
+  // structure enters the ACTIVATION and never the conditioning. Adding it to
+  // both is the natural-looking symmetry and a different model.
+  //
+  // 🔴 AND `pred_r1` IS ZEROS WHEN THERE IS NO PREVIOUS PREDICTION, not absent.
+  // The projection is 6 channels wide either way; a port that fed it three
+  // would read the second half of the matrix at the wrong offset.
+  let activation = start;
+  if (features.noisyCoordinates !== undefined) {
+    const previous = features.previousCoordinates;
+    const joined = new Float32Array(atoms * 6);
+    for (let atom = 0; atom < atoms; atom += 1) {
+      for (let axis = 0; axis < 3; axis += 1) {
+        joined[atom * 6 + axis] = features.noisyCoordinates[atom * 3 + axis];
+        joined[atom * 6 + 3 + axis] = previous === undefined ? 0
+          : previous[atom * 3 + axis];
+      }
+    }
+    const projected = linear(joined, atoms, 6, channels, weights.coordsLinear);
+    activation = new Float32Array(start.length);
+    for (let i = 0; i < start.length; i += 1) activation[i] = start[i] + projected[i];
+  }
   const rope = buildRope(features.refPos, features.refSpaceUid, atoms, channels / heads,
                          shape.rope);
-  let state = start;
+  let state = activation;
   for (let block = 0; block < blocks; block += 1) {
     state = swaBlock(state, start, atoms, channels, heads, weights.blocks[block],
                      rope, mask, halfWindow, hidden, shape.attentionPrecision ?? "f32");
@@ -454,7 +494,47 @@ export function inputsEmbedder(features, shape, weights) {
     index[atom] = mask[atom] !== 0 ? features.atomToToken[atom] : 0;
   }
   return {
+    // 🔴 `atomState` IS THE SKIP THE DECODER ADDS TO, and it is the
+    // transformer's OUTPUT rather than its input. `conditioning` is `c_base`,
+    // which the decoder reuses unchanged, and the rope table is shared too - so
+    // the decoder builds none of the three for itself.
     atomState: state,
+    conditioning: start,
+    rope,
     tokenAct: scatterMean(projected, index, mask, atoms, tokens, tokenChannels),
   };
+}
+
+/**
+ * The atom decoder: a token representation back onto atoms, and out as a
+ * coordinate update.
+ *
+ *     q = q_skip + gather(token_to_atom(a))
+ *     q = 3 x swaBlock(q, conditioned on c_skip)
+ *     r = output_linear(norm(q))
+ *
+ * 🔴 IT REUSES THE ENCODER'S SKIP, CONDITIONING AND ROPE TABLE. `q_l`, `c_l`
+ * and the attention parameters all come back from the encoder; rebuilding any
+ * of them here would be the same arithmetic done twice and, for the rope, a
+ * second chance to get the bfloat16 table wrong.
+ */
+export function atomDecoder(tokenAct, skip, conditioning, rope, features, shape, weights) {
+  const { atoms, tokens, channels, heads, blocks, hidden, tokenChannels } = shape;
+  const halfWindow = (shape.windowSize ?? 128) >> 1;
+  const mask = features.mask;
+  const perToken = linear(tokenAct, tokens, tokenChannels, channels, weights.tokenToAtom);
+  const state0 = new Float32Array(atoms * channels);
+  for (let atom = 0; atom < atoms; atom += 1) {
+    const from = features.atomToToken[atom] * channels;
+    const to = atom * channels;
+    for (let c = 0; c < channels; c += 1) state0[to + c] = skip[to + c] + perToken[from + c];
+  }
+  let state = state0;
+  for (let block = 0; block < blocks; block += 1) {
+    state = swaBlock(state, conditioning, atoms, channels, heads, weights.blocks[block],
+                     rope, mask, halfWindow, hidden, shape.attentionPrecision ?? "f32");
+  }
+  const normalised = layerNorm(state, atoms, channels,
+                               weights.normScale, weights.normOffset);
+  return linear(normalised, atoms, channels, 3, weights.outputLinear);
 }
