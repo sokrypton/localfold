@@ -98,7 +98,12 @@ export const MODEL_BUNDLES = {
   // is why the ESM-C manifest carries the names of both. `companion` is that
   // link, and a loader that ignored it would fold with a language model whose
   // shim was trained against a different trunk: every shape agrees.
-  esmfold2: {
+  // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE ARCHITECTURE'S. "esmfold2" alone
+  // reads as ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a
+  // different and better model; this is the 600M experimental one, which is the
+  // one that fits a browser. Same reasoning as openbind0's number above, and
+  // `esmfold2` survives as a ?model= alias so a saved link still works.
+  "ef2-fast-600m": {
     model: "esmfold2-trunk",
     directory: "./model-esmfold2-int5/",
     release: "esmfold2-int5",
@@ -144,10 +149,10 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * That exact mistake is recorded in CLAUDE.md for the AF3/OpenBind split; this
  * is the same mistake one model later.
  */
-export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "esmfold2"];
+export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "ef2-fast-600m"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
-export const SINGLE_SEQUENCE_FAMILIES = ["esmfold2"];
+export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m"];
 
 /**
  * The families that build AlphaFold 3's graph, as opposed to AlphaFold 2's.

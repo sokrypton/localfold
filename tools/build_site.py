@@ -125,7 +125,10 @@ def registry_mismatches() -> list[str]:
     that being two files cannot mean being two answers.
     """
     index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
-    in_js = set(re.findall(r"^  (\w+): \{$", index, re.MULTILINE))
+    # ...a key is quoted when it is not a bare identifier, which
+    # `ef2-fast-600m` is not. Matching only unquoted keys made this check
+    # report a family as MISSING from the file it is defined in.
+    in_js = set(re.findall(r'^  "?([\w-]+)"?: \{$', index, re.MULTILINE))
     in_py = set(BUNDLES)
     problems = []
     for family in sorted(in_py - in_js):

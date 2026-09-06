@@ -78,7 +78,11 @@ BUNDLES = {
     # shim that joins them is per folding model - which is why the ESM-C
     # manifest carries both names. MODEL_BUNDLES.esmfold2 names `esmc` as its
     # companion so a page cannot load one without the other.
-    "esmfold2": {
+    # 🔴 THE KEY IS THE CHECKPOINT'S NAME, NOT THE ARCHITECTURE'S: "esmfold2"
+    # alone reads as ESM's released ESMFold2-Fast, which folds from ESM-C 6B.
+    # The bundle DIRECTORY keeps its older name, as openbind0's does - a path is
+    # not the model's name, and renaming it would move 366 MiB for nothing.
+    "ef2-fast-600m": {
         "export": "model-esmfold2-int5",
         "module": "src/reference/manifests/esmfold2.js",
         "model": "esmfold2-trunk",

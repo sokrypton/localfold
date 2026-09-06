@@ -58,7 +58,7 @@ import { complexSequenceProblem } from "./sequence.js";
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
-import { buildFoldArchive, msasFromArchive } from "./fold-archive.js";
+import { buildFoldArchive, tokenLayoutFrom, msasFromArchive } from "./fold-archive.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
@@ -245,7 +245,9 @@ function rememberTermsAccepted() {
  * `openbind0` rather than standing for whatever OpenBind means next.
  */
 const MODEL_ALIASES = { openbind: "openbind0", ob: "openbind0", ob0: "openbind0",
-                        af2: "monomer", mono: "monomer", multi: "multimer" };
+                        af2: "monomer", mono: "monomer", multi: "multimer",
+                        // ...the name this model shipped under first.
+                        esmfold2: "ef2-fast-600m", ef2: "ef2-fast-600m" };
 
 function applyModelFromUrl() {
   let asked;
@@ -330,7 +332,7 @@ const MODEL_STEMS = {
   openbind0: "openbind0",
   monomer: "af2",
   multimer: "af2_multimer",
-  esmfold2: "esmfold2",
+  "ef2-fast-600m": "ef2_fast_600m",
 };
 
 /** What to call each model while its weights download. */
@@ -341,11 +343,12 @@ const MODEL_LABELS = {
   openbind0: "OpenBind-0",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
-  // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone would
-  // read as ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a
-  // different and better model; this is the 600M experimental one, which is the
-  // one that fits a browser.
-  esmfold2: "ESMFold2 600M",
+  // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
+  // ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a different
+  // and better model; this is the 600M experimental one, which is the one that
+  // fits a browser. The dropdown said "ESMFold2" while the status line said
+  // "ESMFold2 600M", so the page was making the confusion twice.
+  "ef2-fast-600m": "EF2-fast 600M",
 };
 
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
@@ -418,7 +421,7 @@ const msaMode = () => {
   // A monomer survived that (the search runs, the result is discarded); an
   // OLIGOMER did not, because a multi-chain search reaches `mergeSearchedChains`
   // before the fold branches by model, and that looks its merge rule up by
-  // family - "unknown model esmfold2: expected monomer, multimer, af3,
+  // family - "unknown model ef2-fast-600m: expected monomer, multimer, af3,
   // openbind0". The control was ignored everywhere except the one place it
   // could still throw.
   if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
@@ -641,7 +644,7 @@ function startModelPreload(family, signal) {
   // licences, so it has its own entry point rather than a family argument to
   // one of the others - and it reports ONE progress stream over both, or the
   // dial resets to zero halfway through a 347 MiB download.
-  const load = family === "esmfold2"
+  const load = family === "ef2-fast-600m"
     ? loadEsmfold2Weights(report)
     : (AF3_FAMILIES.includes(family)
       ? loadAf3Weights(report, family)
@@ -1371,7 +1374,7 @@ function syncModelControls() {
   // so "flow or diffusion, and how many steps" means the same thing under both
   // - what differs is the numbers, which is why the count dial is rebuilt from
   // a per-model table rather than shared.
-  const sampled = af3 || family === "esmfold2";
+  const sampled = af3 || family === "ef2-fast-600m";
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
   // 🔴 THE STEP COUNT IS SHARED AND THE MODE IS NOT. ESMFold2's own sampler is
@@ -1446,9 +1449,9 @@ function syncAf3Count() {
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
   // ...and ESMFold2's table has one mode, so the shared select cannot pick a
   // row that is not there.
-  const esmfold2 = chosenFamily() === "esmfold2";
-  const table = esmfold2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
-  const { label, values, preferred } = table[esmfold2 ? ESMFOLD2_SAMPLER_MODE : mode]
+  const ef2 = chosenFamily() === "ef2-fast-600m";
+  const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
     ?? table.flow ?? table.diffusion;
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
@@ -1459,7 +1462,7 @@ function syncAf3Count() {
   // into 11 - so a dial reading 15 beside a status line reading 11 is the page
   // contradicting itself. The VALUE stays the preset's own number, because that
   // is what names a preset; only the text changes.
-  const shown = esmfold2
+  const shown = ef2
     ? (value) => String(actualSteps(`${ESMFOLD2_SAMPLER_MODE}-${value}`))
     : String;
   select.replaceChildren(...values.map((value) => Object.assign(
@@ -1951,7 +1954,16 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       a3m: alignment,
       chains,
       chainLengths: chains.map((chain) => chain.length),
+      // ...the same one field, so the archive has one thing to read. The
+      // confidence object keeps its own copy because the scores card and the
+      // heatmap take the whole object; this is the archive's single door.
+      contactSource: { contactProbs: result.contactProbs },
       model: modelName,
+      // ...AF3 needs this for exactly the same reason, and nothing had ever set
+      // it: a fold with a ligand or a modified residue has more tokens than
+      // residues, so the archive's own fallback refused it.
+      tokens: result.batch === undefined ? undefined
+        : tokenLayoutFrom(result.batch.asymId, result.batch.residueIndex),
       ...foldContext,
     };
     predictions.set(stem, lastPrediction);
@@ -2127,7 +2139,7 @@ function samplerPreset() {
 }
 
 async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad) {
-  const modelName = MODEL_LABELS.esmfold2;
+  const modelName = MODEL_LABELS["ef2-fast-600m"];
   const sequence = chains.join(":");
   status(`${modelName} · loading`);
   // ...the long name is for the download dial, where provenance matters; the
@@ -2138,7 +2150,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
   for (const code of ligandCodes) {
-    status(`ESMFold2 · fetching ligand ${code}`);
+    status(`${modelName} · fetching ligand ${code}`);
     const response = await fetch(ccdUrl(code), { signal });
     if (!response.ok) {
       throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
@@ -2154,7 +2166,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   predictionCount += 1;
   const header = entityList.header();
   const stem = uniqueStem(header !== null
-    ? safeJobName(header) : `${MODEL_STEMS.esmfold2}_${predictionCount}`);
+    ? safeJobName(header) : `${MODEL_STEMS["ef2-fast-600m"]}_${predictionCount}`);
   openBlankFold(stem);
   viewer = undefined;
   viewerObject = undefined;
@@ -2248,7 +2260,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // word plus a percentage on the line; the fraction drives the bar. The
     // first version wrote a stage name per stage, and a two-millisecond recycle
     // between two multi-second trunk passes made it flicker.
-    onStatus: (text) => { if (!signal.aborted) status(`ESMFold2 · ${text}`); },
+    onStatus: (text) => { if (!signal.aborted) status(`${modelName} · ${text}`); },
     onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
     // 🔴 THE CONTACT MAP EXISTS BEFORE ANY STRUCTURE DOES, because the
     // distogram head runs off the trunk and the sampler has not started. It is
@@ -2363,8 +2375,38 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // prediction's confidence - the scores card, the archive's summary, the PAE
     // panel - asks for fields this checkpoint has no head to compute. An object
     // carrying zeros would be read as the model's opinion.
-    contacts: result.contacts,
-    model: "esmfold2",
+    // 🔴 ONE FIELD FOR THE CONTACT MAP, WHATEVER PRODUCED IT. See the note on
+    // `contactSource` at the download button: this used to be `contacts` here,
+    // `confidence.contactProbs` on the AF3 path and `contactSource` on AF2's,
+    // and the archive knew about two of the three - so the model whose contact
+    // map is its ONLY score wrote an archive without one while the panel on
+    // screen showed it.
+    contactSource: { contactProbs: result.contacts },
+    model: modelName,
+    // 🔴 THE TOKEN LAYOUT, because a ligand is one token per heavy atom and the
+    // archive cannot infer that from the chain lengths - it refuses to guess
+    // and throws. See tokenIdentifiers.
+    tokens: tokenLayoutFrom(result.features.asymId, result.features.residueIndex),
+    // ...and the entities and the templates, which the archive's job request is
+    // made of. Without these "Download all" wrote a request naming no
+    // sequences.
+    ...foldContext,
+    // 🔴 THIS MODEL'S OWN SETTINGS, OVER THE SHARED DIALS'. `foldContext` is
+    // built before the branch and carries the recycle count and the MSA depth
+    // that AF2 and AF3 read - and this model reads NEITHER: it folds from the
+    // sequence alone, which is why the page hides its MSA row, and its trunk
+    // loops a number of times the checkpoint fixes rather than the dial. The
+    // archive said `recycles: 1` and `max msa: 128` for a fold that used one
+    // value of neither.
+    settings: {
+      seed: foldContext.settings?.seed,
+      "trunk passes": loaded.shape.loops,
+      sampler: samplerPreset(),
+      "diffusion steps": result.steps,
+    },
+    // ...and no alignment line, rather than "none", which reads as a choice.
+    msaOrigin: undefined,
+    msas: {},
   };
   element("downloads").style.display = "flex";
 
@@ -2376,7 +2418,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // that stop a number in a pLDDT palette being read as a pLDDT. The rest of
   // the explanation lives in the PDB's REMARK and in the model row's tooltip,
   // where somebody who wants it can find it.
-  status(`ESMFold2 · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
+  status(`${modelName} · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
     + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)} (not pLDDT)`));
   progress(null);
 }
@@ -2591,7 +2633,7 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
-    if (family === "esmfold2") {
+    if (family === "ef2-fast-600m") {
       await foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad);
       return;
     }
@@ -3140,7 +3182,7 @@ element("download-all").addEventListener("click", async () => {
       settings: pred.settings,
       entities: pred.entities,
       msas: pred.msas ?? {},
-      msaOrigin: pred.msaOrigin ?? "none (single sequence)",
+      msaOrigin: pred.msaOrigin,
       templates: pred.templates ?? [],
       prediction: {
         pdb: pred.pdb,
@@ -3154,8 +3196,16 @@ element("download-all").addEventListener("click", async () => {
           // so at the moment the prediction was stored it does not exist yet.
           // By the time anyone presses this it does. `contactSource` is the
           // pass the saved structure came from, which is not always the last.
-          contactProbs: pred.confidence?.contactProbs
-            ?? pred.contactSource?.contactProbs,
+          // 🔴 ONE FIELD, AND IT IS A REFERENCE RATHER THAN A COPY. The three
+          // models produce this at three different MOMENTS - AF3 with the
+          // trunk, EF2-fast with the trunk and no confidence object to put it
+          // in, AF2 in a setTimeout off the saved pass, because its distogram
+          // head costs 131 ms at 128 residues and is deliberately off the
+          // fold's critical path. So `contactSource` holds the OBJECT that
+          // carries them, which for AF2 is still filling in when the
+          // prediction is stored and is filled by the time anyone presses
+          // this. It was three fields and the archive knew two of them.
+          contactProbs: pred.contactSource?.contactProbs,
         },
       },
     });

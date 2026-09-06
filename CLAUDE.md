@@ -653,6 +653,60 @@ omitted because it is a claim about geometry nothing here computes. The
 structure is `.pdb` where the server writes `.cif`, which is the one deliberate
 difference.
 
+🔴 **AND "DOWNLOAD ALL" IS THE ONE PATH NOTHING RAN, SO EVERY FIELD A FOLD
+FORGOT TO STORE FAILED THERE AND NOWHERE ELSE.** It builds the archive out of
+`lastPrediction`, and EF2-fast stores no `confidence` object at all - on purpose,
+since an object of zeros would be read as the model's opinion. The archive
+recovered its TOKEN COUNT from `confidence.predictedAlignedError.length`, so the
+button reported *"Cannot read properties of undefined (reading 'length')"*,
+which names neither the model nor the field. `tools/fold-in-page.py --download`
+presses it, reads the zip BACK through `web/zip.js` and prints its members and
+`full_data`'s keys - because "a zip was written" is not "the fold's numbers are
+in it".
+
+🔴 **AND THE CONTACT MAP WAS IN THREE PLACES, OF WHICH THE ARCHIVE KNEW TWO.**
+AF3 hands it back with its confidence, AF2 fills it in from a `setTimeout` off
+the saved pass (its distogram head costs 131 ms at 128 residues and is
+deliberately off the critical path), and EF2-fast kept it beside the prediction
+in a field of its own - so the model whose contact map is its ONLY score wrote
+an archive without one while the panel on screen showed it. `contactSource` is
+now the single field on every path, and it holds the OBJECT rather than a copy,
+which is what lets AF2's arrive late.
+
+🔴 **AND A README THAT DESCRIBES A CONTROL THE MODEL DOES NOT HAVE IS WRONG, NOT
+MERELY VERBOSE.** EF2-fast's said `recycles: 1` and `max msa: 128` - the shared
+dials' values, reported as though they had been used. It reads neither: it folds
+from the sequence alone, and its trunk loops a number of times the CHECKPOINT
+fixes (four) rather than the dial. `msaOrigin` undefined now means "this model
+does not take one", which drops the alignment line AND the paragraph describing
+a `msas/` directory the archive does not contain.
+
+🔴 **AND `atom_plddts` MUST NOT CARRY SOMETHING THAT IS NOT A pLDDT.** The
+B-factor column is whatever the model put there, and for EF2-fast that is the
+distogram certainty under a REMARK naming it - the page is careful that the word
+pLDDT appears nowhere for that model, and the key would have undone it in the
+one file a reader is most likely to parse. It is `atom_certainty` there, and the
+PAE is omitted rather than written from an absent matrix.
+
+🔴 **AND `chain_pair_max_contact` IS THE ONE SCORE A MODEL WITH NO CONFIDENCE
+HEAD CAN STILL GIVE.** AlphaFold 3 splits intra- from cross-chain too, but only
+through ipTM - `iptm_ichain` and `iptm_xchain` in its own code - and through the
+contact-weighted PDE summaries in `confidences.py`, all of which need the
+confidence head. The strongest predicted contact needs only the TRUNK: the
+diagonal says how sure the model is that a chain touches itself at range, and an
+off-diagonal entry says whether it believes in the interface at all. It is not a
+server field; it is an addition, and it is the reason EF2-fast's summary file is
+worth writing. Measured on a two-chain fold, AF3 reports `chain_pair_max_contact`
+0.73 across the interface while its `iptm` is 0.23 - the distogram believing in
+a contact more than the confidence head believes in the interface.
+
+🔴 **AND SEQUENCE NEIGHBOURS ARE EXCLUDED OR THE DIAGONAL IS ALWAYS 1.00.** A
+token is in contact with itself and with the residue beside it whatever the
+fold. The rule is the one used everywhere else here - the same chain and within
+six RESIDUES, which drops a ligand's whole self-block. A chain shorter than the
+separation reports **null**, not zero: "no pair to measure" is not "the model is
+sure this does not fold".
+
 🔴 **AND THE ALIGNMENT ROUND TRIP WAS BROKEN BEFORE IT, IN A WAY THE PAGE
 ADMITTED IN A COMMENT.** "A pasted or uploaded A3M is one text and cannot be
 split into blocks; it becomes the unpaired one." AF3 reads the paired block
@@ -2316,6 +2370,42 @@ line says so.
 screen would run, take a minute of somebody else's server, and be discarded -
 which is the "quietly ignored control" `syncModelControls` exists to prevent,
 one step worse.
+
+## The model is called EF2-fast 600M, and the name is load-bearing
+
+🔴 **`esmfold2` ALONE READS AS ESM'S RELEASED ESMFold2-Fast, WHICH IS A
+DIFFERENT AND BETTER MODEL.** That one folds from ESM-C 6B; this is the 600M
+experimental checkpoint, which is the one that fits a browser. The page was
+making the confusion twice - the dropdown said "ESMFold2" while the status line
+said "ESMFold2 600M". The family, the manifest key and the download stem all say
+`ef2-fast-600m` now, and `esmfold2` survives as a `?model=` alias so a saved
+link still works - the same shape as openbind0's rename, and for the same
+reason.
+
+🔴 **THE SOURCE DIRECTORY AND THE BUNDLE KEEP THEIR OLD NAMES**, as
+`src/af3/` does for openbind0: a path is not the model's name, and renaming
+`model-esmfold2-int5` would move 366 MiB for nothing.
+
+🔴 **AND A RENAMED KEY BREAKS EVERY LOOKUP THAT WAS SPELLED OUT.**
+`MODEL_LABELS.esmfold2` and `MODEL_STEMS.esmfold2` silently became `undefined` -
+a status line reading "undefined · loading" and a stem of `undefined_1` - and
+`loadManifest("esmfold2")` threw "unknown model family". Two REGEXES also
+matched only bare identifiers, so `"ef2-fast-600m"` needed quoting and both
+stopped seeing it: `test/model-family.test.js` reported a table with one family
+missing, and `build_site.py`'s registry cross-check reported the family as
+absent from the file that defines it.
+
+🔴 **AND THE STEP DIAL IS NAMED FOR THE SAMPLER IT DISCRETISES.** Both arms read
+"Steps", which says nothing - the numbers differ by an order of magnitude
+precisely BECAUSE a flow step walks the whole schedule and a diffusion step
+discretises it. They are "Flow" and "Diffusion" now, which also avoids the
+"Cycles beside Recycles" reading that made them both "Steps" in the first place.
+
+🔴 **AND AF3's DIFFUSION LADDER LANDS ON 200, WHICH IS WHAT IT WAS TRAINED
+WITH.** The powers-of-two ladder (20, 40, 80, 160, 320) never offered the
+model's own setting, so it was the one number the page could not select. It is
+25, 50, 100, 200 - and 25 keeps the floor that was measured, since below twenty
+the sampler does not land and ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A.
 
 ## A language model instead of an alignment: ESMFold2
 

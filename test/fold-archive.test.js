@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "./harness.js";
 import {
   buildFoldArchive, fullDataJson, jobRequestJson, msasFromArchive,
@@ -197,6 +198,101 @@ describe("the fold archive", () => {
   });
 });
 
+describe("an archive from a model with no confidence head", () => {
+  // 🔴 THIS FOLD HAS NO `confidence` OBJECT, AND THAT IS THE HONEST SHAPE. The
+  // EF2-fast checkpoint ships zero confidence_head tensors, so the page stores
+  // no pLDDT, no PAE and no pTM rather than an object of zeros that would be
+  // read as the model's opinion. "Download all" then failed with "Cannot read
+  // properties of undefined (reading 'length')" - the token count was being
+  // recovered from the PAE's own size.
+  // ...ten residues, not four: the max-contact score excludes sequence
+  // neighbours, and a chain shorter than the separation has no pair to report.
+  const chainLengths = [10];
+  const lines = [];
+  for (let residue = 0; residue < 10; residue += 1) {
+    for (const [atom, name] of ["N", "CA", "C"].entries()) {
+      lines.push(`ATOM  ${String(residue * 3 + atom + 1).padStart(5)}  ${name.padEnd(3)}`
+        + ` ALA A${String(residue + 1).padStart(4)}    `
+        + `${"0.000".padStart(8)}${"0.000".padStart(8)}${"0.000".padStart(8)}`
+        + `  1.00 ${"61.20".padStart(5)}          ${name[0]}`);
+    }
+  }
+  const prediction = {
+    pdb: `${lines.join("\n")}\nEND\n`,
+    chainLengths,
+    // ...only what this model produces: a contact map off the trunk.
+    confidence: { contactProbs: Float32Array.from({ length: 100 }, () => 0.25) },
+  };
+  const build = () => buildFoldArchive({
+    stem: "fold_ef2", model: "EF2-fast 600M", settings: { seed: 3 },
+    entities: [{ type: "protein", value: "AAAA", copies: 1 }], prediction,
+  });
+
+  it("builds at all, which is the bug", () => {
+    // ...called for its throw, which is what the report was: the archive read
+    // `confidence.predictedAlignedError.length` on a fold that has no PAE.
+    const files = build();
+    expect([...files.keys()]).toContain("fold_ef2_full_data_0.json");
+    expect([...files.keys()]).toContain("fold_ef2_model_0.pdb");
+  });
+
+  it("omits the fields there is no head to compute", () => {
+    const data = JSON.parse(build().get("fold_ef2_full_data_0.json"));
+    expect("pae" in data).toBe(false);
+    expect(data.contact_probs.length).toBe(10);
+    // ...and the summary holds the one score the trunk can give without a
+    // confidence head, rather than being a file whose entire content is
+    // `chain_ids` - one letter per token and nothing else.
+    const summary = JSON.parse(build().get("fold_ef2_summary_confidences_0.json"));
+    expect("ptm" in summary).toBe(false);
+    expect("fraction_disordered" in summary).toBe(false);
+    expect(summary.chain_pair_max_contact).toEqual([[0.25]]);
+  });
+
+  it("reports no pair rather than a zero when the chain is too short", () => {
+    // 🔴 A CHAIN SHORTER THAN THE SEPARATION HAS NOTHING TO MEASURE, and 0.00
+    // there would read as "the model is sure this does not fold", which is a
+    // claim. Same rule as the certainty's own empty-filter fallback.
+    const short = { ...prediction, chainLengths: [4] };
+    const files = buildFoldArchive({
+      stem: "fold_short", model: "EF2-fast 600M", settings: {},
+      entities: [{ type: "protein", value: "AAAA", copies: 1 }],
+      prediction: {
+        ...short,
+        pdb: `${lines.slice(0, 12).join("\n")}\nEND\n`,
+        confidence: { contactProbs: Float32Array.from({ length: 16 }, () => 0.25) },
+      },
+    });
+    const summary = JSON.parse(files.get("fold_short_summary_confidences_0.json"));
+    expect(summary.chain_pair_max_contact).toEqual([[null]]);
+  });
+
+  it("does not describe controls this model has no use for", () => {
+    // 🔴 `msaOrigin` UNDEFINED MEANS "THIS MODEL DOES NOT TAKE ONE", and it is
+    // what drops both the alignment line and the paragraph describing a `msas/`
+    // directory the archive does not contain. Saying "alignment: none (single
+    // sequence)" reads as a choice that was made.
+    const text = build().get("README.md");
+    expect(text.includes("- alignment:")).toBe(false);
+    expect(text.includes("`msas/` holds")).toBe(false);
+    expect(text).toContain("folds from the sequence alone");
+    // ...and it says why the scores are missing, since a missing summary file
+    // and a B-factor that is not a pLDDT are each surprising on their own.
+    expect(text).toContain("no confidence head");
+    expect(text).toContain("chain_pair_max_contact");
+  });
+
+  it("does not call the B-factor a pLDDT when it is not one", () => {
+    // 🔴 THE COLUMN CARRIES THE DISTOGRAM CERTAINTY HERE, under a REMARK naming
+    // it, and the page is careful that the word pLDDT appears nowhere for this
+    // model. A key called `atom_plddts` would undo that in the one file a
+    // reader is most likely to parse.
+    const data = JSON.parse(build().get("fold_ef2_full_data_0.json"));
+    expect("atom_plddts" in data).toBe(false);
+    expect(data.atom_certainty.length).toBe(30);
+  });
+});
+
 describe("the alignment round trip", () => {
   // Two chains whose paired and unpaired blocks are DIFFERENT, which is the
   // only way the test can tell them apart on the way back.
@@ -253,5 +349,37 @@ describe("the alignment round trip", () => {
     // ...and the paired block is genuinely present, or the comparison above
     // would be two identical nothings.
     expect(fromSearch.blocks.paired).toContain("ACDEFF");
+  });
+});
+
+describe("where a fold's contact map lives", () => {
+  // 🔴 ONE FIELD, THREE MODELS, AND IT WAS THREE FIELDS. AF3 handed the map
+  // back with its confidence, AF2 filled it in later off the saved pass, and
+  // EF2-fast - which has no confidence object at all, having no confidence head
+  // - kept it beside the prediction. The archive read two of the three, so the
+  // model whose contact map is its ONLY score wrote an archive without one
+  // while the panel on screen showed it. This is the guard on the unification,
+  // because nothing else would notice a fourth path arriving with a fourth
+  // convention.
+  const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+
+  it("is read from exactly one field when the archive is built", () => {
+    const handler = app.slice(app.indexOf('element("download-all")'));
+    const call = handler.slice(0, handler.indexOf("downloadBlob"));
+    expect(call).toContain("pred.contactSource?.contactProbs");
+    // ...and not from the two places it used to also look.
+    expect(call.includes("pred.contacts")).toBe(false);
+    expect(call.includes("pred.confidence?.contactProbs")).toBe(false);
+  });
+
+  it("is set by every path that stores a prediction", () => {
+    // Each `lastPrediction = {` block, to its closing brace - at whatever
+    // indent, since AF2's sits one scope deeper than AF3's and a pattern
+    // pinned to two spaces silently checks two of the three paths.
+    const blocks = [...app.matchAll(/lastPrediction = \{\n([\s\S]*?)\n\s*\};/g)];
+    expect(blocks.length).toBe(3);
+    for (const [, body] of blocks) {
+      expect(body).toContain("contactSource");
+    }
   });
 });

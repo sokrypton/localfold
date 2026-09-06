@@ -89,7 +89,10 @@ describe("what a fold is called", () => {
     const table = app.match(/const MODEL_STEMS = \{([^}]*)\}/s);
     assert.ok(table !== null, "MODEL_STEMS is not where this test expects");
     const stems = {};
-    for (const [, key, value] of table[1].matchAll(/(\w+):\s*"([^"]+)"/g)) {
+    // ...a key is quoted when it is not a bare identifier, which `ef2-fast-600m`
+    // is not - and an unquoted-only pattern silently sees a table with one
+    // family missing rather than failing to parse.
+    for (const [, key, value] of table[1].matchAll(/"?([\w-]+)"?:\s*"([^"]+)"/g)) {
       stems[key] = value;
     }
     // Every family the page offers has one...

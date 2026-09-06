@@ -163,6 +163,8 @@ def main():
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--dev-report", action="store_true",
                         help="open the footer's dev panel and print what it says")
+    parser.add_argument("--download", action="store_true",
+                        help="press Download all and report the zip it wrote")
     parser.add_argument("--bar", action="store_true",
                         help="print every value the progress bar took, with the"
                              " clock beside it - a bar that stops short is a"
@@ -513,6 +515,46 @@ def main():
               });
             })()""")
         print("camera1:", camera_before)
+
+        # 🔴 THE DOWNLOAD BUTTON IS A CODE PATH NOTHING RAN. It builds the
+        # archive from `lastPrediction`, so every field a fold forgets to store
+        # fails HERE and nowhere else - and it failed exactly that way on
+        # EF2-fast, whose prediction carries no confidence object, with "Cannot
+        # read properties of undefined (reading 'length')". The handler catches
+        # its own error and writes it to the status line, so a click that
+        # produces no blob and a changed status IS the failure.
+        if args.download:
+            archive = json.loads(cdp.evaluate(ws, """(async () => {
+              // ...the blob is kept and read BACK, because "a zip was written"
+              // is not "the fold's numbers are in it". web/zip.js is a reader
+              // as well as a writer, which is why it is one file.
+              const blobs = [];
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (blob) => { blobs.push(blob); return made.call(URL, blob); };
+              const before = document.getElementById('status')?.textContent ?? '';
+              document.getElementById('download-all').click();
+              await new Promise((done) => setTimeout(done, 3000));
+              URL.createObjectURL = made;
+              const after = document.getElementById('status')?.textContent ?? '';
+              const out = { size: blobs[0]?.size ?? null,
+                            changed: before !== after ? after : null };
+              if (blobs[0] !== undefined) {
+                const { readZip } = await import('/web/zip.js');
+                const files = await readZip(new Uint8Array(await blobs[0].arrayBuffer()));
+                out.members = [...files.keys()];
+                const full = [...files.keys()].find((k) => k.endsWith('full_data_0.json'));
+                const data = full === undefined ? {} : JSON.parse(files.get(full));
+                out.fullData = Object.keys(data);
+                out.contactRows = data.contact_probs?.length ?? null;
+                out.readme = files.get('README.md');
+                const req = [...files.keys()].find((k) => k.endsWith('job_request.json'));
+                out.jobRequest = req === undefined ? null : files.get(req);
+                const sum = [...files.keys()].find((k) => k.endsWith('summary_confidences_0.json'));
+                out.summary = sum === undefined ? null : files.get(sum);
+              }
+              return JSON.stringify(out);
+            })()""", await_promise=True))
+            print("archive:", archive)
         first_object = json.loads(cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
           return JSON.stringify(reg[Object.keys(reg)[0]].renderer.currentObjectName);

@@ -60,13 +60,19 @@ const ALPHABET = "ACDEFGHIKLMNPQRSTVWYX";
  * price for an atom-tokenised residue and not something more steps will fix.
  */
 export const AF3_COUNTS = {
-  // 🔴 BOTH ARE CALLED "Steps" ON THE PAGE, because the dial sits beside
-  // Recycles and "Cycles" beside "Recycles" reads as the same word twice. The
-  // note above still applies to what the numbers MEAN - a flow step walks the
-  // whole schedule, a diffusion step discretises it - which is why the values
-  // differ by an order of magnitude and the dial is rebuilt on a mode change.
-  flow: { label: "Steps", values: [16, 32, 64], preferred: 16 },
-  diffusion: { label: "Steps", values: [20, 40, 80, 160, 320], preferred: 20 },
+  // 🔴 THE DIAL IS NAMED FOR THE SAMPLER IT DISCRETISES, NOT FOR ITS UNIT. Both
+  // arms used to read "Steps", which says nothing: the numbers differ by an
+  // order of magnitude precisely BECAUSE a flow step walks the whole schedule
+  // and a diffusion step discretises it, and a reader seeing 16 in one mode and
+  // 200 in the other has no way to know that from the word. "Cycles" beside
+  // "Recycles" was the earlier objection and these avoid it too.
+  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
+  // 🔴 AND 200 IS ON THE DIAL BECAUSE IT IS WHAT AF3 WAS TRAINED WITH. The
+  // powers-of-two ladder (20, 40, 80, 160, 320) never landed on it, so the
+  // model's own setting was the one number the page could not select. 25 keeps
+  // the floor the note above measured - below twenty the sampler does not land,
+  // and ten gives 5.91 A on 6MRR with a CA-CA of 8.40 A.
+  diffusion: { label: "Diffusion", values: [25, 50, 100, 200], preferred: 25 },
 };
 
 /**

@@ -73,7 +73,7 @@ const TOWER_SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/nor
  * when the levels are too far apart to correct it.
  */
 export const ESMFOLD2_COUNTS = {
-  diffusion: { label: "Steps", values: [15, 32, 64, 200], preferred: 15 },
+  diffusion: { label: "Diffusion", values: [15, 32, 64, 200], preferred: 15 },
 };
 
 /** The sampler mode this model runs, whatever a shared control says. */
@@ -111,7 +111,7 @@ export function loadEsmfold2Weights(onProgress) {
   if (weightsPromise !== undefined) return weightsPromise;
   weightsPromise = (async () => {
     const [foldManifest, towerManifest] = await Promise.all([
-      loadManifest("esmfold2"), loadManifest("esmc"),
+      loadManifest("ef2-fast-600m"), loadManifest("esmc"),
     ]);
     // 🔴 THE SHIM IS PER FOLDING MODEL AND THE ARTEFACTS SAY SO. A tower is
     // interchangeable between releases and a shim is not, so a pairing that
@@ -144,7 +144,7 @@ export function loadEsmfold2Weights(onProgress) {
       onProgress?.({ ...(seen.get(key) ?? {}), loadedBytes, totalBytes });
     };
     const [foldStore, towerStore] = await Promise.all([
-      HttpTensorStore.fromManifest(bundleBaseUrl("esmfold2"), foldManifest,
+      HttpTensorStore.fromManifest(bundleBaseUrl("ef2-fast-600m"), foldManifest,
                                    report("fold")),
       HttpTensorStore.fromManifest(bundleBaseUrl("esmc"), towerManifest,
                                    report("tower")),

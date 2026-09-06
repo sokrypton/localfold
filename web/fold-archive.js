@@ -60,6 +60,30 @@ const MAX_NAMED_CHAINS = 26;
  * one residue is one token, and it refuses rather than guesses when the count
  * says otherwise.
  */
+export function tokenLayoutFrom(asymId, residueIndex) {
+  // 🔴 THE ASYM IDS ARE SORTED AND TAKEN IN ORDER, NOT READ AS INDICES. AF3
+  // numbers chains from ONE and this model's features are zero-based, so an id
+  // used as an index is off by one in one of them - the same mistake
+  // `asymOrder` records making on the score keys. Residue numbers are rebuilt
+  // per chain from the order they appear, which makes one ligand ONE residue
+  // however its atoms were numbered, as the server writes it.
+  const order = [...new Set(asymId)].sort((a, b) => a - b);
+  const chainIds = [];
+  const resIds = [];
+  const numbering = new Map();
+  for (let token = 0; token < asymId.length; token += 1) {
+    const chain = order.indexOf(asymId[token]);
+    chainIds.push(chainLetter(chain));
+    const key = `${chain}:${residueIndex[token]}`;
+    if (!numbering.has(key)) {
+      const seen = [...numbering.keys()].filter((k) => k.startsWith(`${chain}:`)).length;
+      numbering.set(key, seen + 1);
+    }
+    resIds.push(numbering.get(key));
+  }
+  return { chainIds, resIds };
+}
+
 export function tokenIdentifiers(chainLengths, tokens, given) {
   if (given?.chainIds !== undefined && given?.resIds !== undefined) {
     if (given.chainIds.length !== tokens) {
@@ -126,16 +150,27 @@ export function fullDataJson({ confidence, pdb, tokenChainIds, tokenResIds }) {
   // is taking both from the same text - the writer drops an atom whose mask is
   // clear, so an independent walk over the sequence counts different atoms.
   const atoms = coordinateAtoms(pdb);
+  // 🔴 THE B-FACTOR IS NOT ALWAYS A pLDDT, AND THE KEY MUST NOT SAY IT IS. A
+  // model with no confidence head writes something else in that column -
+  // EF2-fast writes the distogram certainty, under a REMARK naming it - and
+  // `atom_plddts` would hand a reader the model's opinion where it has none.
+  // Same rule as `has_clash`: a field we do not compute is omitted, not
+  // guessed. The presence of a pLDDT vector is what says which this is.
+  const scored = confidence.plddt !== undefined;
   const data = {
     atom_chain_ids: atoms.chains,
-    atom_plddts: Array.from(atoms.bFactors, round2),
+    [scored ? "atom_plddts" : "atom_certainty"]: Array.from(atoms.bFactors, round2),
   };
   // ...before the PAE, where the server puts it, and only when the fold
   // actually produced one.
   if (confidence.contactProbs !== undefined) {
     data.contact_probs = matrix2(paeMatrix(confidence.contactProbs, tokens));
   }
-  data.pae = matrix2(paeMatrix(confidence.predictedAlignedError, tokens));
+  // ...and the PAE only where there is one, for the same reason as above. It
+  // was written unconditionally while `contact_probs` beside it was guarded.
+  if (confidence.predictedAlignedError !== undefined) {
+    data.pae = matrix2(paeMatrix(confidence.predictedAlignedError, tokens));
+  }
   data.token_chain_ids = tokenChainIds;
   data.token_res_ids = tokenResIds;
   return `${JSON.stringify(data)}\n`;
@@ -178,7 +213,49 @@ function asymOrder(confidence, chainCount) {
 }
 
 /** The scalar scores, as `summary_confidences_0.json`. */
-export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds }) {
+/**
+ * The strongest contact the model predicts, within each chain and between each
+ * pair - one number per chain pair, off the distogram alone.
+ *
+ * 🔴 IT IS THE ONE SCORE A MODEL WITH NO CONFIDENCE HEAD CAN STILL GIVE.
+ * AlphaFold 3 splits intra- from cross-chain too, but only through ipTM
+ * (`iptm_ichain` and `iptm_xchain` in its own code) and its contact-weighted
+ * PDE summaries - all of which need the confidence head. This needs the trunk,
+ * which every model here has: the diagonal says how sure the model is that the
+ * chain touches itself at range, and an off-diagonal entry says whether it
+ * believes in the interface at all.
+ *
+ * 🔴 AND SEQUENCE NEIGHBOURS ARE EXCLUDED OR THE DIAGONAL IS ALWAYS 1. A token
+ * is in contact with itself and with the residue beside it whatever the fold,
+ * so an unfiltered maximum reports 1.00 for every chain and says nothing. The
+ * rule is the one used everywhere else here - the same chain and within six
+ * RESIDUES, which drops a ligand's whole self-block because its atoms share a
+ * residue number. See ../src/heads/contact-threshold.js for why a token index
+ * would not do.
+ */
+export function chainPairMaxContact(contactProbs, tokenChainIds, tokenResIds, chains) {
+  const tokens = tokenChainIds.length;
+  const index = new Map(chains.map((letter, at) => [letter, at]));
+  const out = chains.map(() => chains.map(() => null));
+  for (let i = 0; i < tokens; i += 1) {
+    const a = index.get(tokenChainIds[i]);
+    if (a === undefined) continue;
+    for (let j = i + 1; j < tokens; j += 1) {
+      const b = index.get(tokenChainIds[j]);
+      if (b === undefined) continue;
+      if (a === b && Math.abs(tokenResIds[i] - tokenResIds[j]) <= 6) continue;
+      const value = contactProbs[i * tokens + j];
+      if (out[a][b] === null || value > out[a][b]) {
+        out[a][b] = value;
+        out[b][a] = value;
+      }
+    }
+  }
+  return out.map((row) => row.map((value) => (value === null ? null : round2(value))));
+}
+
+export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds,
+                                         tokenResIds }) {
   const chains = chainLengths.map((_, index) => chainLetter(index));
   const asym = asymOrder(confidence, chains.length);
   const summary = { chain_ids: tokenChainIds };
@@ -201,6 +278,12 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
   const perChain = (values) => (values === undefined ? undefined
     : chains.map((_, index) => (values[asym[index]] === undefined
       ? null : round2(values[asym[index]]))));
+  // ...before the ipTM scores, because it is the one that exists without a
+  // confidence head and a reader of an EF2-fast archive will find nothing else.
+  if (confidence.contactProbs !== undefined && tokenResIds !== undefined) {
+    summary.chain_pair_max_contact = chainPairMaxContact(
+      confidence.contactProbs, tokenChainIds, tokenResIds, chains);
+  }
   const chainPtm = perChain(confidence.chainPtm);
   const chainIptm = perChain(confidence.chainIptm);
   if (chainPtm !== undefined) summary.chain_ptm = chainPtm;
@@ -254,7 +337,17 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
   return `${JSON.stringify(summary, null, 2)}\n`;
 }
 
-function readme({ stem, model, settings, msaOrigin, templateCount }) {
+/**
+ * 🔴 A README THAT DESCRIBES A CONTROL THE MODEL DOES NOT HAVE IS WRONG, NOT
+ * MERELY VERBOSE. EF2-fast folds from the sequence alone - the page hides its
+ * MSA row for exactly that reason - and its archive still said
+ * `max msa: 128` and `alignment: none (single sequence)`, which are the shared
+ * dials' values reported as though they had been used. `msaOrigin` is
+ * undefined for such a model, and that is what drops both the line and the
+ * paragraph about `msas/` below, which would otherwise describe a directory the
+ * archive does not contain.
+ */
+function readme({ stem, model, settings, msaOrigin, templateCount, scored = true }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -268,22 +361,44 @@ function readme({ stem, model, settings, msaOrigin, templateCount }) {
   for (const [key, value] of Object.entries(settings ?? {})) {
     if (value !== undefined && value !== null && value !== "") lines.push(`- ${key}: ${value}`);
   }
+  if (msaOrigin !== undefined) lines.push(`- alignment: ${msaOrigin}`);
+  lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
+  if (!scored) {
+    // ...said once, plainly, because the B-factor column and a missing summary
+    // are both surprising on their own and neither explains itself.
+    lines.push(
+      "",
+      "This checkpoint has no confidence head, so there is no pLDDT, no PAE and",
+      "no pTM - those fields are absent rather than zero, which would read as",
+      "the model's opinion. What the trunk can still say is in",
+      "`_summary_confidences_0.json` as `chain_pair_max_contact`, and the",
+      "structure's B-factor column carries a distogram-derived certainty; it is",
+      "an ordering, not a calibrated score, and the PDB says so in a REMARK.",
+    );
+  }
   lines.push(
-    `- alignment: ${msaOrigin}`,
-    `- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`,
     "",
     "## Layout",
     "",
     "The AlphaFold 3 server's, with one difference: the structure is written as",
     "PDB rather than mmCIF.",
-    "",
-    "`msas/` holds one alignment per chain, split into the paired and unpaired",
-    "blocks the model reads separately. Drop this whole .zip onto LocalFold's",
-    "alignment upload box to fold again with exactly these alignments - the two",
-    "blocks are not interchangeable, so re-uploading a single merged a3m would",
-    "not reproduce this fold.",
-    "",
   );
+  if (msaOrigin !== undefined) {
+    lines.push(
+      "",
+      "`msas/` holds one alignment per chain, split into the paired and unpaired",
+      "blocks the model reads separately. Drop this whole .zip onto LocalFold's",
+      "alignment upload box to fold again with exactly these alignments - the two",
+      "blocks are not interchangeable, so re-uploading a single merged a3m would",
+      "not reproduce this fold.",
+    );
+  } else {
+    lines.push(
+      "",
+      "There is no `msas/`: this model folds from the sequence alone.",
+    );
+  }
+  lines.push("");
   return lines.join("\n");
 }
 
@@ -294,11 +409,20 @@ function readme({ stem, model, settings, msaOrigin, templateCount }) {
  */
 export function buildFoldArchive({
   stem, model, settings, entities, prediction, msas = {}, templates = [],
-  msaOrigin = "none (single sequence)",
+  msaOrigin,
 }) {
   const name = safeJobName(stem);
   const { confidence, pdb, chainLengths } = prediction;
-  const tokens = Math.round(Math.sqrt(confidence.predictedAlignedError.length));
+  // 🔴 THE TOKEN COUNT DOES NOT COME FROM THE PAE, because a model can have no
+  // confidence head at all. EF2-fast has none - `lastPrediction` carries no
+  // `confidence` object on purpose, since an object of zeros would be read as
+  // the model's opinion - and taking the square root of an absent matrix's
+  // length threw "Cannot read properties of undefined (reading 'length')" on
+  // the download button, which names neither the model nor the field.
+  const tokens = prediction.tokens?.chainIds?.length
+    ?? (confidence.predictedAlignedError !== undefined
+      ? Math.round(Math.sqrt(confidence.predictedAlignedError.length))
+      : chainLengths.reduce((total, length) => total + length, 0));
   const { chainIds, resIds } = tokenIdentifiers(chainLengths, tokens, prediction.tokens);
 
   if (chainLengths.length > MAX_NAMED_CHAINS) {
@@ -311,9 +435,21 @@ export function buildFoldArchive({
     name: stem, seed: settings?.seed, entities,
   }));
   files.set(`${name}_model_0.pdb`, pdb);
-  files.set(`${name}_summary_confidences_0.json`, summaryConfidencesJson({
-    confidence, chainLengths, tokenChainIds: chainIds,
-  }));
+  // 🔴 AND THE SUMMARY IS OMITTED WHEN IT WOULD HOLD ONLY CHAIN LETTERS. Every
+  // score in it is guarded on the field it needs, so a model with no confidence
+  // head produced a file whose entire content was `chain_ids` - 35 copies of
+  // "A" for a 35-residue fold. A field we do not compute is omitted, not
+  // guessed; the same is true of a file.
+  const summary = summaryConfidencesJson({
+    confidence, chainLengths, tokenChainIds: chainIds, tokenResIds: resIds,
+  });
+  // 🔴 TWO DIFFERENT QUESTIONS, AND ONE FLAG WAS ANSWERING BOTH. Whether the
+  // FILE has anything in it decides whether to write it; whether the MODEL has
+  // a confidence head decides what the README explains. They came apart the
+  // moment `chain_pair_max_contact` gave a head-less model something to say.
+  const hasScores = Object.keys(JSON.parse(summary)).some((key) => key !== "chain_ids");
+  if (hasScores) files.set(`${name}_summary_confidences_0.json`, summary);
+  const scored = confidence.plddt !== undefined;
   files.set(`${name}_full_data_0.json`, fullDataJson({
     confidence, pdb, tokenChainIds: chainIds, tokenResIds: resIds,
   }));
@@ -349,7 +485,7 @@ export function buildFoldArchive({
   });
 
   files.set("README.md", readme({
-    stem, model, settings, msaOrigin, templateCount: templates.length,
+    stem, model, settings, msaOrigin, templateCount: templates.length, scored,
   }));
   return files;
 }
