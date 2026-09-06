@@ -162,7 +162,13 @@ def remote_families() -> set[str]:
     families = set()
     family = None
     for line in index.splitlines():
-        opened = re.match(r"^  (\w+): \{$", line)
+        # 🔴 A KEY IS QUOTED WHEN IT IS NOT A BARE IDENTIFIER, and three of the
+        # four EF2 families are. Matching only unquoted keys left this reading
+        # `remote:` lines as belonging to no family at all - so bundles that ARE
+        # hosted were counted as local and would have been published a second
+        # time, spending the Pages allowance on a copy no page fetches. The same
+        # pattern was wrong in registry_mismatches and in two JavaScript tests.
+        opened = re.match(r'^  "?([\w-]+)"?: \{$', line)
         if opened:
             family = opened.group(1)
         elif family is not None and re.match(r"^\s*remote:\s*[\"']", line):

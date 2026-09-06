@@ -106,6 +106,7 @@ export const MODEL_BUNDLES = {
   "ef2-fast-600m": {
     model: "esmfold2-trunk",
     directory: "./model-esmfold2-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/9715c41b28efbbb2e758d013068bd6f3d80e819c/ef2-fast-600m-int5/",
     release: "esmfold2-int5",
     variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
     companion: "esmc",
@@ -124,6 +125,7 @@ export const MODEL_BUNDLES = {
   "ef2-fast-300m": {
     model: "esmfold2-trunk",
     directory: "./model-ef2-fast-300m-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/9715c41b28efbbb2e758d013068bd6f3d80e819c/ef2-fast-300m-int5/",
     release: "ef2-fast-300m-int5",
     variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
     companion: "esmc-300m",
@@ -135,6 +137,7 @@ export const MODEL_BUNDLES = {
   esmc: {
     model: "esmc",
     directory: "./model-esmc-600m-int3/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/9715c41b28efbbb2e758d013068bd6f3d80e819c/esmc-600m-int3/",
     release: "esmc-600m-int3",
     variable: "LOCALFOLD_INCLUDE_ESMC_MODEL",
     companion: undefined,
@@ -145,6 +148,7 @@ export const MODEL_BUNDLES = {
   "esmc-300m": {
     model: "esmc",
     directory: "./model-esmc-300m-int3/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/9715c41b28efbbb2e758d013068bd6f3d80e819c/esmc-300m-int3/",
     release: "esmc-300m-int3",
     variable: "LOCALFOLD_INCLUDE_ESMC_MODEL",
     companion: undefined,

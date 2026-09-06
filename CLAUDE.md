@@ -3266,6 +3266,17 @@ and that is the whole change. Shard URLs are resolved against the bundle's base,
 so the store never learns the difference; `build_site.py` and the Pages workflow
 both ask `build_site.py --is-remote <family>` and stop publishing a copy.
 
+🔴 **AND THE ESM-C BUNDLE IS 54 SHARDS WHERE AF3's IS 8, WHICH IS NOT A
+DECISION.** `export_esmc_model.py`'s `SHARD_LIMIT` is 48 MiB and it is applied
+to the FLOAT32 export - 2190 MiB, so about 46 pieces - and `quantize_af3.py`
+preserves that layout rather than re-sharding, so int3 shrinks each one eightfold
+to a 4.1 MiB median and the count stays. Whether 54 small shards beat 8 large
+ones over the wire is UNMEASURED here; the "eight" this file records elsewhere is
+eight parallel CONNECTIONS and a longest-first order, not a shard count. For this
+bundle the fine sharding may even help, since the tower streams block by block
+during the fold and a block read pulls two 4 MiB shards rather than one of 28.
+**Open.**
+
 🔴 **PIN A COMMIT SHA, NOT `main`.** A shard fetched from a moving branch can
 change under a manifest that did not, which is the failure the shard-cache token
 exists to prevent - and three separate hours have already gone into "<file> has
@@ -3277,16 +3288,25 @@ it. `bundleBaseUrl` adds one; `test/model-bundles.test.js` holds it to that.
 
 Verified against Hugging Face from the browser: CORS passes, the 302 to
 `cdn.hf.co` is followed, `?v=` cache tokens survive, ranges answer 206, and the
-responses come back `type: "cors"` so the shard cache can store them. What is
-NOT verified is a real upload - there were no HF credentials on this machine, so
-the repository and the push are still to do.
+responses come back `type: "cors"` so the shard cache can store them.
 
-To upload:
+🔴 **AND EVERY BUNDLE IS HOSTED NOW, SO THE PAGES BUILD CARRIES NO WEIGHTS AT
+ALL.** `sokrypton/localfold` holds all eight, one directory each. The four
+EF2-fast bundles were the last to go up and were 598.6 MiB of a 1 GB allowance
+until they did; the build now publishes **0.0 MiB** of parameters.
 
 ```
-pip install huggingface_hub && hf auth login
-hf upload USER/REPO model-af3-int5 . --repo-type=model
+hf upload sokrypton/localfold model-esmfold2-int5 ef2-fast-600m-int5 --repo-type=model
 ```
+
+🔴 **AND `remote_families()` MATCHED ONLY UNQUOTED KEYS, WHICH IS THE OPPOSITE
+OF SAFE.** Three of the four EF2 families are quoted in `index.js` - a key is,
+when it is not a bare identifier - so their `remote:` lines were read as
+belonging to no family and the build counted hosted bundles as LOCAL. It would
+have published 375 MiB a second time, on top of the copies the browser fetches
+from Hugging Face: the allowance spent twice for nothing. The same pattern was
+wrong in `registry_mismatches` and in two JavaScript tests, all fixed the same
+way.
 
 DeepMind's AF3 parameters carry a Prohibited Use Policy - `build_site.py`
 already refuses to publish them without `LOCALFOLD_ACCEPT_MODEL_TERMS`. On
