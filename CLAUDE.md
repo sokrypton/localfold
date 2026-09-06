@@ -1812,10 +1812,40 @@ lDDT, and a page reporting either as a number would be inventing the model's
 opinion of its own answer. As a colour it is defensible; as "pLDDT 87" it is
 not.
 
-🔴 **AND BOTH TARGETS ARE FOLDED WELL, WHICH IS THE WEAKNESS OF THE TEST.**
-lDDT-Ca 0.918 and 0.930, tenth percentiles 0.842 and 0.858 - a label with little
-spread. A confidence estimate earns its place on a target the model FAILS, and
-this probe has not seen one.
+🔴 **AND THE HYPERPARAMETERS WERE SWEPT ON SIXTEEN TARGETS, BECAUSE ON THREE
+THE SWEEP LIED.** 288 arms - four sharpness measures, four sequence
+separations, six top-N, three pair cutoffs - over the small monomers
+`plddt-data/` was collected on, crystals fetched from the RCSB. Ranked by the
+MEDIAN Spearman across targets, not by any single score. On three targets the
+winner was `sep 24, top 10, no cutoff`; on sixteen it is not, and two of those
+three axes reverse:
+
+| axis, holding the rest at the winner | |
+|---|---|
+| measure | max 0.570, **w1 0.569**, w2 0.534, negent 0.548 |
+| separation | 0: 0.487, **6: 0.570**, 12: 0.563, 24: 0.532 |
+| top N | 1: 0.453, 5: 0.466, 10: 0.479, 20: 0.487, 40: 0.490, **all: 0.570** |
+| pair cutoff | none: 0.470, **20 A: 0.570**, 12 A: 0.545 |
+
+**TOP-N IS THE WRONG IDEA AND `all` WINS** - truncating to a residue's best
+partners costs 0.08 of Spearman, monotonically. **A PAIR CUTOFF IS THE RIGHT
+IDEA AND 20 A IS WHERE IT SITS** - worth 0.10 over keeping every pair, so "far
+pairs are less informative" is true at 20 A as a filter on the PAIR, and false
+at 8 A as a restriction on the BINS. And the MEASURE barely matters, which is
+the reassuring part.
+
+🔴 **AND THE ARM TO USE IS `w1`, NOT THE BEST MEDIAN.** `max` edges it on the
+median (0.570 against 0.569) and `w1` is far better on the WORST target (0.289
+against 0.159) at the best median Pearson of any arm (0.726). It is also the
+bin-width-robust one: `max` is the height of a mode on a 0.39 A grid nobody
+chose, while `w1` is the mass within 1 A of it. Median lDDT-Ca across the
+sixteen is 0.951 and the neighbour-count baseline's median Spearman is 0.286, so
+this is about twice the baseline.
+
+🔴 **AND THE TARGETS ARE MOSTLY EASY, WHICH IS STILL THE WEAKNESS.** Median
+lDDT-Ca 0.951; only 1i27 (0.826, tenth percentile 0.477), 1lis (0.796, 0.452)
+and 1fna (0.902, 0.691) have real spread. The estimate earns its place on
+targets like those three, and three is not many.
 
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and

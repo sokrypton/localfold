@@ -299,32 +299,78 @@ function contactScore(logits, bias, positions, tokens, bins, mode,
 }
 
 /**
- * The control that decides whether the STRUCTURE is doing any work.
+ * Every per-pair way of asking "how sure is the distogram about this distance",
+ * computed once so the hyperparameter sweep is pure aggregation.
  *
- * 🔴 IF THE DISTOGRAM'S OWN PEAKEDNESS SCORES AS WELL, THE AGREEMENT IS
- * DECORATION. `exp(-CCE)` is the probability the distogram assigns to the
- * distance the sampler produced - but if the sampler simply realises the
- * distogram's mode, that probability IS the mode's height, and the structure
- * has told us nothing the trunk did not already know. This takes the maximum of
- * each pair's distribution instead of the observed bin's, which is the same
- * aggregate over the same pairs with the structure removed. It is also
- * available BEFORE the sampler runs, so if it wins it is strictly better.
+ * 🔴 IT IS THE WHOLE DISTRIBUTION, NOT THE CONTACT BINS. Restricting to contact
+ * was measured and collapses into a buriedness baseline - see CLAUDE.md. A
+ * distance confidently predicted to be LARGE is evidence of confidence too.
+ *
+ * 🔴 AND FOUR MEASURES, BECAUSE `max` IS BIN-WIDTH SENSITIVE. The bin edges
+ * here are BORROWED from the disabled confidence head (2 to 52 A over 128
+ * bins, 0.39 A each), so the height of a mode is partly an artefact of how fine
+ * that grid is. `w1` and `w2` ask instead how much mass lies within 1 A or 2 A
+ * of the mode, which is what "how precisely does it know the distance" means
+ * and is robust to a grid nobody chose. `negent` is `exp(-H)`, the whole
+ * distribution's sharpness rather than its peak's.
  */
-function distogramPeak(logits, bias, tokens, bins, { top = 10, separation = 6 } = {}) {
+function pairMeasures(logits, bias, tokens, bins, edges = CONTACT_EDGES) {
+  const width = (edges.maximum - edges.minimum) / bins;
+  const near1 = Math.max(1, Math.round(1 / width));
+  const near2 = Math.max(1, Math.round(2 / width));
+  const pairs = tokens * tokens;
+  const out = {
+    max: new Float32Array(pairs), w1: new Float32Array(pairs),
+    w2: new Float32Array(pairs), negent: new Float32Array(pairs),
+    mode: new Float32Array(pairs),
+  };
+  const probability = new Float64Array(bins);
+  for (let cell = 0; cell < pairs; cell += 1) {
+    const base = cell * bins;
+    let largest = -Infinity, argmax = 0;
+    for (let b = 0; b < bins; b += 1) {
+      const value = logits[base + b] + bias[b];
+      if (value > largest) { largest = value; argmax = b; }
+    }
+    let total = 0;
+    for (let b = 0; b < bins; b += 1) {
+      probability[b] = Math.exp(logits[base + b] + bias[b] - largest);
+      total += probability[b];
+    }
+    let entropy = 0, within1 = 0, within2 = 0;
+    for (let b = 0; b < bins; b += 1) {
+      const share = probability[b] / total;
+      if (share > 0) entropy -= share * Math.log(share);
+      if (Math.abs(b - argmax) <= near1) within1 += share;
+      if (Math.abs(b - argmax) <= near2) within2 += share;
+    }
+    out.max[cell] = 1 / total;
+    out.w1[cell] = within1;
+    out.w2[cell] = within2;
+    out.negent[cell] = Math.exp(-entropy);
+    out.mode[cell] = edges.minimum + (argmax + 0.5) * width;
+  }
+  return out;
+}
+
+/**
+ * One arm: aggregate a per-pair measure into a per-residue score.
+ *
+ * 🔴 THE PAIR CUTOFF IS ON THE PREDICTED DISTANCE, NOT ON THE BINS. It asks
+ * whether a confidently-predicted 45 A separation is informative about a
+ * residue's reliability or merely easy - which is the honest version of the
+ * "we do not care about far pairs" instinct, and the one that keeps the whole
+ * distribution's sharpness rather than throwing four fifths of it away.
+ */
+function aggregate(measure, mode, tokens, { top, separation, cutoff }) {
   const out = new Float32Array(tokens);
   const scratch = [];
   for (let i = 0; i < tokens; i += 1) {
     scratch.length = 0;
     for (let j = 0; j < tokens; j += 1) {
       if (Math.abs(i - j) <= separation) continue;
-      const base = (i * tokens + j) * bins;
-      let largest = -Infinity;
-      for (let b = 0; b < bins; b += 1) {
-        largest = Math.max(largest, logits[base + b] + bias[b]);
-      }
-      let total = 0;
-      for (let b = 0; b < bins; b += 1) total += Math.exp(logits[base + b] + bias[b] - largest);
-      scratch.push(1 / total);
+      if (Number.isFinite(cutoff) && mode[i * tokens + j] > cutoff) continue;
+      scratch.push(measure[i * tokens + j]);
     }
     if (scratch.length === 0) { out[i] = 0; continue; }
     scratch.sort((a, b) => b - a);
@@ -350,11 +396,16 @@ function neighbourCount(positions, tokens, { separation = 6, radius = 10 } = {})
   return out;
 }
 
+/** The 108 single-sequence targets plddt-data/ was collected over, small first. */
+const DEFAULT_TARGETS = ["1r69", "1enh", "1i27", "1bk2", "1ctf", "1igd", "1poh",
+  "1mjc", "1cc8", "1opd", "1tig", "1ubi", "2igd", "1lis", "1fna", "1pgx"];
+
 export async function main(device, args = []) {
-  const crystalPath = option(args, "crystal", "/tools/fixtures/1qys-crystal.pdb");
-  const wantedChain = option(args, "chain", "A");
+  const targets = option(args, "targets", DEFAULT_TARGETS.join(",")).split(",")
+    .filter((code) => code !== "");
   const seed = Number(option(args, "seed", "0"));
-  const crystal = crystalChain(await (await fetch(crystalPath)).text(), wantedChain);
+  const minResidues = Number(option(args, "min-residues", "40"));
+  const maxResidues = Number(option(args, "max-residues", "180"));
 
   const fold = reader(option(args, "bundle", "/model-esmfold2-int5"));
   const tower = reader(option(args, "esmc", "/model-esmc-600m-int3"));
@@ -385,14 +436,8 @@ export async function main(device, args = []) {
   const towerShared = {};
   for (const name of TOWER_SHARED) towerShared[name] = await tower.read(name);
   const allocator = new GpuBufferAllocator(device);
-
-  const result = await foldEsmfold2(device, {
-    sequence: crystal.sequence, allocator, seed,
-    sampler: option(args, "sampler", "diffusion-15"),
-    distogramLogits: true,
-    shape: { ...M, loops: (M.loops ?? 3) + 1 },
-    weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
-    tower: async (ids, sequenceId) => (await new EsmcTowerGpu(device, allocator).run(ids, {
+  const runTower = async (ids, sequenceId) =>
+    (await new EsmcTowerGpu(device, allocator).run(ids, {
       rows: ids.length, model: language.width,
       heads: language.heads ?? language.width / 64,
       ffn: towerTable.tensors["blocks/0/fc2/weights"].shape[0],
@@ -404,109 +449,139 @@ export async function main(device, args = []) {
         block[leaf] = await tower.read(`blocks/${layer}/${leaf}`, NARROW.has(leaf));
       }
       return block;
-    }, towerShared, { sequenceId })).single,
-  });
+    }, towerShared, { sequenceId })).single;
 
-  // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM, NOT THE ALPHA CARBON.
-  // Upstream's `compute_representative_atoms` takes CB, or CA for glycine - so
-  // scoring CA-CA distances against a CB-CB distribution is scoring the wrong
-  // distances, which would look like a weak estimator rather than a wrong one.
-  const { features, coordinates } = result;
-  const named = (atom, text) => {
-    for (let i = 0; i < 4; i += 1) {
-      const wanted = i < text.length ? text.charCodeAt(i) - 32 : 0;
-      if (features.refAtomNameChars[atom * 4 + i] !== wanted) return false;
-    }
-    return true;
-  };
-  const representative = new Int32Array(result.tokens).fill(-1);
-  const alpha = new Int32Array(result.tokens).fill(-1);
-  for (let atom = 0; atom < result.atoms; atom += 1) {
-    if (features.mask[atom] === 0) continue;
-    const token = features.atomToToken[atom];
-    if (named(atom, "CA")) alpha[token] = atom;
-    if (representative[token] < 0 || named(atom, "CB")) {
-      if (representative[token] < 0 || named(atom, "CB")) representative[token] = atom;
+  // 🔴 THE GRID IS SWEPT ON MANY TARGETS OR IT IS CHERRY-PICKING. Ninety-six
+  // arms against two proteins finds an arm that suits two proteins. What is
+  // reported per arm is the MEDIAN across targets and how many targets it is
+  // best on, not its best single score.
+  const MEASURES = ["max", "w1", "w2", "negent"];
+  const SEPARATIONS = [0, 6, 12, 24];
+  const TOPS = [1, 5, 10, 20, 40, Infinity];
+  const CUTOFFS = [Infinity, 20, 12];
+  const arms = [];
+  for (const measure of MEASURES) {
+    for (const separation of SEPARATIONS) {
+      for (const top of TOPS) {
+        for (const cutoff of CUTOFFS) arms.push({ measure, separation, top, cutoff });
+      }
     }
   }
-  for (let token = 0; token < result.tokens; token += 1) {
-    if (representative[token] < 0) representative[token] = alpha[token];
-  }
-  const gather = (slots) => {
-    const out = new Float32Array(slots.length * 3);
-    slots.forEach((atom, index) => {
-      for (let axis = 0; axis < 3; axis += 1) out[index * 3 + axis] = coordinates[atom * 3 + axis];
+  for (const arm of arms) { arm.pearson = []; arm.spearman = []; }
+
+  const perTarget = [];
+  for (const code of targets) {
+    let text;
+    try {
+      const response = await fetch(`https://files.rcsb.org/download/${code.slice(0, 4)}.pdb`);
+      if (!response.ok) { perTarget.push({ code, skipped: `HTTP ${response.status}` }); continue; }
+      text = await response.text();
+    } catch (error) {
+      perTarget.push({ code, skipped: `unreachable: ${error.message}` });
+      continue;
+    }
+    const crystal = crystalChain(text, "A");
+    if (crystal.sequence.length < minResidues || crystal.sequence.length > maxResidues) {
+      perTarget.push({ code, skipped: `${crystal.sequence.length} residues` });
+      continue;
+    }
+    const result = await foldEsmfold2(device, {
+      sequence: crystal.sequence, allocator, seed,
+      sampler: option(args, "sampler", "diffusion-15"), distogramLogits: true,
+      shape: { ...M, loops: (M.loops ?? 3) + 1 },
+      weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      tower: runTower,
     });
-    return out;
+    const { features, coordinates } = result;
+    const named = (atom, want) => {
+      for (let i = 0; i < 4; i += 1) {
+        const wanted = i < want.length ? want.charCodeAt(i) - 32 : 0;
+        if (features.refAtomNameChars[atom * 4 + i] !== wanted) return false;
+      }
+      return true;
+    };
+    const alpha = new Int32Array(result.tokens).fill(-1);
+    for (let atom = 0; atom < result.atoms; atom += 1) {
+      if (features.mask[atom] !== 0 && named(atom, "CA")) alpha[features.atomToToken[atom]] = atom;
+    }
+    const modelAlpha = new Float32Array(result.tokens * 3);
+    for (let token = 0; token < result.tokens; token += 1) {
+      for (let axis = 0; axis < 3; axis += 1) {
+        modelAlpha[token * 3 + axis] = coordinates[alpha[token] * 3 + axis];
+      }
+    }
+    const lddt = perResidueLddt(modelAlpha, crystal.coordinates, result.tokens);
+    let mean = 0;
+    for (const value of lddt) mean += value;
+    mean /= lddt.length;
+    const sorted = [...lddt].sort((a, b) => a - b);
+    const measures = pairMeasures(result.distogram.logits, result.distogram.bias,
+                                  result.tokens, M.distogramBins);
+    for (const arm of arms) {
+      const score = aggregate(measures[arm.measure], measures.mode, result.tokens, arm);
+      arm.pearson.push(pearson(score, lddt));
+      arm.spearman.push(spearman(score, lddt));
+    }
+    const neighbours = neighbourCount(modelAlpha, result.tokens);
+    perTarget.push({ code, residues: crystal.sequence.length, gaps: crystal.gaps,
+      meanLddt: mean, lddt10: sorted[Math.floor(0.1 * sorted.length)],
+      baselinePearson: pearson(neighbours, lddt),
+      baselineSpearman: spearman(neighbours, lddt) });
+    console.log(`  ${code}  ${String(crystal.sequence.length).padStart(3)} res`
+      + `  lDDT ${mean.toFixed(3)}  (10th ${sorted[Math.floor(0.1 * sorted.length)].toFixed(3)})`);
+  }
+
+  const folded = perTarget.filter((row) => row.skipped === undefined);
+  if (folded.length === 0) throw new Error("no target folded; nothing to sweep");
+  const median = (values) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = sorted.length >> 1;
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
   };
-  const modelAlpha = gather([...alpha]);
-  const modelRepresentative = gather([...representative]);
+  for (const arm of arms) {
+    arm.medianPearson = median(arm.pearson);
+    arm.medianSpearman = median(arm.spearman);
+    arm.worstSpearman = Math.min(...arm.spearman);
+  }
+  // ...ranked by the MEDIAN Spearman, because a colour is an ordering and a
+  // median is what a single bad target cannot buy.
+  const ranked = [...arms].sort((a, b) => b.medianSpearman - a.medianSpearman);
+  const label = (arm) => `${arm.measure.padEnd(6)} sep ${String(arm.separation).padStart(2)}`
+    + `  top ${String(arm.top === Infinity ? "all" : arm.top).padStart(3)}`
+    + `  cut ${arm.cutoff === Infinity ? "none" : String(arm.cutoff).padStart(4)}`;
 
-  const lddt = perResidueLddt(modelAlpha, crystal.coordinates, result.tokens);
-  let meanLddt = 0;
-  for (const value of lddt) meanLddt += value;
-  meanLddt /= lddt.length;
-
-  const rows = [];
-  for (const separation of [6, 12]) {
-    for (const top of [1, 3, 5, 10, 20, 1e9]) {
-      const score = distogramLikelihood(result.distogram.logits, result.distogram.bias,
-        modelRepresentative, result.tokens, M.distogramBins, { top, separation });
-      rows.push({ separation, top: top > 1e8 ? "all" : top,
-                  pearson: pearson(score, lddt), spearman: spearman(score, lddt) });
-    }
+  console.log(`\n  ${folded.length} targets folded, `
+    + `median lDDT-Ca ${median(folded.map((r) => r.meanLddt)).toFixed(3)}`);
+  console.log(`  baseline (neighbour count)   median Spearman `
+    + `${median(folded.map((r) => r.baselineSpearman)).toFixed(3)}\n`);
+  console.log("  best twelve arms, by median Spearman across targets:");
+  console.log("  measure  sep   topN   cutoff   medPearson  medSpearman  worst");
+  for (const arm of ranked.slice(0, 12)) {
+    console.log(`  ${label(arm)}    ${arm.medianPearson.toFixed(3).padStart(7)}`
+      + `      ${arm.medianSpearman.toFixed(3).padStart(7)}   ${arm.worstSpearman.toFixed(3).padStart(6)}`);
   }
-  const neighbours = neighbourCount(modelRepresentative, result.tokens);
-  const baseline = { pearson: pearson(neighbours, lddt), spearman: spearman(neighbours, lddt) };
-  const controls = [];
-  for (const top of [10, 20]) {
-    const peak = distogramPeak(result.distogram.logits, result.distogram.bias,
-      result.tokens, M.distogramBins, { top, separation: 6 });
-    controls.push({ label: `peakedness, top ${top}`,
-                    pearson: pearson(peak, lddt), spearman: spearman(peak, lddt) });
-  }
-  const contact = [];
-  for (const mode of ["binary", "categorical", "kept", "made"]) {
-    for (const top of [5, 10, 20]) {
-      const score = contactScore(result.distogram.logits, result.distogram.bias,
-        modelRepresentative, result.tokens, M.distogramBins, mode,
-        { top, separation: 6 });
-      contact.push({ mode, top,
-                     pearson: pearson(score, lddt), spearman: spearman(score, lddt) });
-    }
+  console.log("\n  each axis at its best, holding the rest at the winner:");
+  const best = ranked[0];
+  for (const [axis, values] of [["measure", MEASURES], ["separation", SEPARATIONS],
+                                ["top", TOPS], ["cutoff", CUTOFFS]]) {
+    const line = values.map((value) => {
+      const found = arms.find((arm) => MEASURES.concat().length
+        && arm.measure === (axis === "measure" ? value : best.measure)
+        && arm.separation === (axis === "separation" ? value : best.separation)
+        && arm.top === (axis === "top" ? value : best.top)
+        && arm.cutoff === (axis === "cutoff" ? value : best.cutoff));
+      const shown = value === Infinity ? "all" : value;
+      return `${shown}:${found.medianSpearman.toFixed(3)}`;
+    }).join("  ");
+    console.log(`  ${axis.padEnd(11)} ${line}`);
   }
 
-  console.log(`  ${crystalPath}  chain ${wantedChain}: ${crystal.sequence.length} observed`
-    + ` residues, ${crystal.gaps} gap(s)`);
-  // 🔴 THE LABEL'S SPREAD IS PART OF THE RESULT. A correlation against a label
-  // that barely varies is a weak test however high it reads, and a target the
-  // model folds at 0.92 has little to be uncertain about. Both of these are
-  // well-folded; a target the model FAILS is where a confidence estimate earns
-  // its place, and this probe has not seen one.
-  const sorted = [...lddt].sort((a, b) => a - b);
-  const at = (q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
-  console.log(`  mean lDDT-Ca against the crystal   ${meanLddt.toFixed(3)}`
-    + `   (10th ${at(0.1).toFixed(3)}, 90th ${at(0.9).toFixed(3)})\n`);
-  console.log("  sep  topN     Pearson   Spearman");
-  for (const row of rows) {
-    console.log(`  ${String(row.separation).padStart(3)}  ${String(row.top).padStart(4)}`
-      + `    ${row.pearson.toFixed(3).padStart(7)}   ${row.spearman.toFixed(3).padStart(8)}`);
-  }
-  console.log("\n  ColabDesign-style, restricted to the contact bins:");
-  console.log("  mode         topN     Pearson   Spearman");
-  for (const row of contact) {
-    console.log(`  ${row.mode.padEnd(12)} ${String(row.top).padStart(4)}`
-      + `    ${row.pearson.toFixed(3).padStart(7)}   ${row.spearman.toFixed(3).padStart(8)}`);
-  }
-  console.log();
-  for (const control of controls) {
-    console.log(`  ${control.label.padEnd(22)} (control)`
-      + `  ${control.pearson.toFixed(3).padStart(7)}   ${control.spearman.toFixed(3).padStart(8)}`);
-  }
-  console.log(`  baseline: neighbour count          `
-    + `${baseline.pearson.toFixed(3).padStart(7)}   ${baseline.spearman.toFixed(3).padStart(8)}`);
-
-  return { crystal: crystalPath, chain: wantedChain, seed,
-           residues: crystal.sequence.length, gaps: crystal.gaps,
-           meanLddt, lddtSpread: [at(0.1), at(0.9)], rows, contact, controls, baseline };
+  return { targets: perTarget, folded: folded.length,
+           best: { ...best, pearson: undefined, spearman: undefined },
+           ranked: ranked.slice(0, 12).map((arm) => ({
+             measure: arm.measure, separation: arm.separation,
+             top: arm.top === Infinity ? "all" : arm.top,
+             cutoff: arm.cutoff === Infinity ? "none" : arm.cutoff,
+             medianPearson: arm.medianPearson, medianSpearman: arm.medianSpearman,
+             worstSpearman: arm.worstSpearman })) };
 }
