@@ -2955,6 +2955,34 @@ bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
 honest than letting a fit discover it - and it is why the estimator's worst
 targets are the ones whose PAE is largest.
 
+🔴 **AND IT IS ON THE PAGE, WHICH IS WHERE IT WAS ASKED FOR.** The heatmap
+panel's tabs are the keys of a frame's `maps`, so the pAE is one: measured in
+the real page, `panel {"tabs": ["pae", "contact"]}` where EF2-fast used to have
+only the contact map. Every frame carries both, because both come off the TRUNK
+and are therefore the same for the whole trajectory - a frame with no maps
+blanks the panel as the play bar reaches it.
+
+🔴 **AND THE MAP IS QUANTISED AGAINST A FIXED 0-32 A, NOT AGAINST ITS OWN
+RANGE.** A PAE plot is read by the shape of its blocks against a scale everybody
+knows; rescaling each fold to its own extremes would make a confident structure
+and a hopeless one look identical. 32 A is the range AlphaFold reports over.
+
+🔴 **AND THE ARCHIVE CALLS IT `estimated_aligned_error`, NOT `pae`.** `pae` is
+the key a reader parses expecting the AF3 server's field, and this is a
+different provenance - read off a distogram rather than produced by a head. Same
+care as `atom_certainty` in the B-factor column, and for the same reason. The
+README says the key is there and what it is, because a deliberately unfamiliar
+name is only honest if something explains it.
+
+🔴 **AND IT TRAVELS BESIDE `confidence`, NOT INSIDE IT.** Every reader that asks
+whether a prediction has a confidence object would conclude this checkpoint has
+a head. `lastPrediction.alignedError` is its own field the whole way through -
+and the first version put it only there and not in the archive's `prediction`,
+so the panel showed it while the download did not. `--download` on
+`tools/fold-in-page.py` is what caught that: it reads the zip BACK and prints
+`full_data`'s keys, which is the difference between "a zip was written" and
+"the fold's numbers are in it".
+
 🔴 **AND A FOLD PRODUCES ONE NOW, NOT ONLY A TOOL.** `foldEsmfold2` returns
 `alignedError`, a tokens^2 matrix. Its three inputs - the distogram's mean,
 spread and effective width in ANGSTROMS - are computed on the DEVICE beside the

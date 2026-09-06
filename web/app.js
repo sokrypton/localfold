@@ -1164,6 +1164,26 @@ function contactMapFor(contactProbs) {
   return { data, n, vmin: 0, vmax: 1 };
 }
 
+/**
+ * The pAE panel's bytes.
+ *
+ * 🔴 IT IS QUANTISED AGAINST A FIXED 0-32 A, NOT AGAINST ITS OWN RANGE. A PAE
+ * plot is read by the SHAPE of its blocks against a scale everybody knows, and
+ * rescaling each fold to its own extremes would make a confident structure and
+ * a hopeless one look identical. 32 A is the range AlphaFold reports over.
+ */
+function paeMapFor(alignedError, maximum = 32) {
+  if (alignedError === undefined) return undefined;
+  const n = Math.round(Math.sqrt(alignedError.length));
+  if (n * n !== alignedError.length) return undefined;
+  const data = new Uint8Array(n * n);
+  for (let index = 0; index < data.length; index += 1) {
+    data[index] = Math.max(0, Math.min(255,
+      Math.round((alignedError[index] / maximum) * 255)));
+  }
+  return { data, n, vmin: 0, vmax: maximum };
+}
+
 let previousFold = undefined;
 
 function alignedToPrevious(sequence, structure) {
@@ -2513,6 +2533,14 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     : fittedPdb(result.features.batch, finalDense, reference,
                 slots ?? alphaCarbons(result.features.batch), bFactors));
   const contactMap = contactMapFor(result.contacts);
+  // 🔴 THIS MODEL HAS NO CONFIDENCE HEAD, SO THE pAE IS ESTIMATED FROM ITS
+  // DISTOGRAM. It is a real predicted aligned error - see
+  // src/esmfold2/aligned-error.js - and it is what says whether two parts of
+  // the fold are placed correctly relative to each other, which neither the
+  // contact map nor the per-token certainty answers. It orders pairs WITHIN
+  // this fold; its absolute angstroms regress to the global mean and do not
+  // compare across folds.
+  const paeMap = paeMapFor(result.alignedError);
   // 🔴 THE CAMERA IS SAVED ACROSS THE RELOAD, OR THE VIEW JUMPS AT THE END.
   // `loadIntoViewer` ingests a FILE, and py2Dmol orients the camera when it
   // parses one - so the trajectory the reader has been watching, and possibly
@@ -2541,6 +2569,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       // and continues "sampler_1" describes two things that are one thing.
       first.name = first.label = first.title = "sampler_0";
       if (contactMap !== undefined) first.maps = { ...first.maps, contact: contactMap };
+      if (paeMap !== undefined) first.maps = { ...first.maps, pae: paeMap };
     }
     // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, as on the AF3
     // path: the last frame IS that step's output, so appending it makes a play
@@ -2549,6 +2578,12 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       const frame = api.frameFromText(text);
       const last = index === framePdbs.length - 2;
       frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+      // ...the same two maps on every frame. They come off the TRUNK, so they
+      // are the same for the whole trajectory; the panel reads whichever frame
+      // the play bar is on, and a frame with no maps blanks it.
+      const maps = { ...(contactMap === undefined ? {} : { contact: contactMap }),
+                     ...(paeMap === undefined ? {} : { pae: paeMap }) };
+      if (Object.keys(maps).length > 0) frame.maps = maps;
       viewer.addFrame(frame, viewerObject);
     }
     // 🔴 THE pLDDT PALETTE ON A NUMBER THAT IS NOT A pLDDT, DELIBERATELY. It is
@@ -2577,6 +2612,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // map is its ONLY score wrote an archive without one while the panel on
     // screen showed it.
     contactSource: { contactProbs: result.contacts },
+    // 🔴 AND THE pAE, WHICH IS NOT A `confidence` FIELD AND MUST NOT BECOME
+    // ONE. It is estimated from the distogram rather than predicted by a head -
+    // see src/esmfold2/aligned-error.js - so putting it under `confidence`
+    // would let every reader that tests for that object conclude this
+    // checkpoint has one, and start looking for the pLDDT and pTM beside it.
+    // It is its own field, named for what it is.
+    alignedError: result.alignedError,
     // 🔴 WITHIN EACH CHAIN AND ACROSS IT, KEPT APART. The certainty a residue
     // wears is about its own chain; the interface is a different question and
     // averaging them gives a number that answers neither. Measured on a
@@ -3410,6 +3452,12 @@ element("download-all").addEventListener("click", async () => {
         pdb: pred.pdb,
         chainLengths: pred.chainLengths,
         tokens: pred.tokens,
+        // 🔴 BESIDE `confidence`, NOT INSIDE IT. A model with no confidence
+        // head still has this - it is estimated from the distogram, not
+        // predicted - and putting it in the object every reader tests for would
+        // make EF2-fast look like it has a head. See fullDataJson, which writes
+        // it under `estimated_aligned_error` for the same reason.
+        alignedError: pred.alignedError,
         confidence: {
           ...pred.confidence,
           // ...a model with no confidence head still has these two.

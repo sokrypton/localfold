@@ -142,7 +142,7 @@ export function jobRequestJson({ name, seed, entities }) {
 }
 
 /** The per-token and per-atom arrays, as `full_data_0.json`. */
-export function fullDataJson({ confidence, pdb, tokenChainIds, tokenResIds }) {
+export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tokenResIds }) {
   const tokens = tokenChainIds.length;
   // 🔴 THE ATOM ARRAYS ARE READ BACK OFF THE STRUCTURE IN THIS ARCHIVE, not
   // recomputed beside it. `atom_plddts` has to line up with the atoms of
@@ -170,6 +170,14 @@ export function fullDataJson({ confidence, pdb, tokenChainIds, tokenResIds }) {
   // was written unconditionally while `contact_probs` beside it was guarded.
   if (confidence.predictedAlignedError !== undefined) {
     data.pae = matrix2(paeMatrix(confidence.predictedAlignedError, tokens));
+  } else if (alignedError !== undefined) {
+    // 🔴 A DIFFERENT KEY, BECAUSE IT IS A DIFFERENT PROVENANCE. This is
+    // estimated from the distogram rather than predicted by a confidence head
+    // (src/esmfold2/aligned-error.js), and `pae` is the key a reader parses
+    // expecting the server's - the same care `atom_certainty` takes with the
+    // B-factor column. It is still a predicted aligned error, and it is still
+    // in angstroms; what it is not is this model's own head's opinion.
+    data.estimated_aligned_error = matrix2(paeMatrix(alignedError, tokens));
   }
   data.token_chain_ids = tokenChainIds;
   data.token_res_ids = tokenResIds;
@@ -356,7 +364,8 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
  * paragraph about `msas/` below, which would otherwise describe a directory the
  * archive does not contain.
  */
-function readme({ stem, model, settings, msaOrigin, templateCount, scored = true }) {
+function readme({ stem, model, settings, msaOrigin, templateCount, scored = true,
+                  alignedError }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -379,13 +388,31 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
     // are both surprising on their own and neither explains itself.
     lines.push(
       "",
-      "This checkpoint has no confidence head, so there is no pLDDT, no PAE and",
-      "no pTM - those fields are absent rather than zero, which would read as",
+      "This checkpoint has no confidence head, so there is no pLDDT, no pTM and",
+      "no PAE - those fields are absent rather than zero, which would read as",
       "the model's opinion. What the trunk can still say is in",
       "`_summary_confidences_0.json` as `chain_pair_max_contact`, and the",
       "structure's B-factor column carries a distogram-derived certainty; it is",
       "an ordering, not a calibrated score, and the PDB says so in a REMARK.",
     );
+    // ...and the estimate, described where somebody reading the file will look
+    // for it. It is named `estimated_aligned_error` rather than `pae` precisely
+    // so a reader parsing the server's format does not pick it up unknowingly,
+    // which means the README has to say it is there.
+    if (alignedError !== undefined) {
+      lines.push(
+        "",
+        "`_full_data_0.json` does carry `estimated_aligned_error`, which is a",
+        "predicted aligned error in angstroms READ OFF THE DISTOGRAM rather than",
+        "produced by a confidence head. It is under its own key, not `pae`, so",
+        "that a reader expecting the server's field does not take it for one.",
+        "",
+        "It orders pairs WITHIN this fold - which parts are placed reliably",
+        "against which, the question a PAE plot is read for - and it does not",
+        "compare between folds: its absolute values regress toward the middle of",
+        "the range, so a mean of it says little. Read the map, not the number.",
+      );
+    }
   }
   lines.push(
     "",
@@ -423,7 +450,7 @@ export function buildFoldArchive({
   msaOrigin,
 }) {
   const name = safeJobName(stem);
-  const { confidence, pdb, chainLengths } = prediction;
+  const { confidence, alignedError, pdb, chainLengths } = prediction;
   // 🔴 THE TOKEN COUNT DOES NOT COME FROM THE PAE, because a model can have no
   // confidence head at all. EF2-fast has none - `lastPrediction` carries no
   // `confidence` object on purpose, since an object of zeros would be read as
@@ -462,7 +489,7 @@ export function buildFoldArchive({
   if (hasScores) files.set(`${name}_summary_confidences_0.json`, summary);
   const scored = confidence.plddt !== undefined;
   files.set(`${name}_full_data_0.json`, fullDataJson({
-    confidence, pdb, tokenChainIds: chainIds, tokenResIds: resIds,
+    confidence, alignedError, pdb, tokenChainIds: chainIds, tokenResIds: resIds,
   }));
 
   // 🔴 ONE FILE PER CHAIN PER BLOCK, WHICH IS THE WHOLE POINT. A merged a3m
@@ -500,7 +527,7 @@ export function buildFoldArchive({
     // cannot take a template at all - `grep -rn template` over the whole
     // upstream package returns nothing - so "templates: none" reported a choice
     // where there was no control. An empty ARRAY still means "none were used".
-    stem, model, settings, msaOrigin, scored,
+    stem, model, settings, msaOrigin, scored, alignedError,
     templateCount: templates === undefined ? undefined : templates.length,
   }));
   return files;
