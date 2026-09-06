@@ -1052,8 +1052,19 @@ blocks - against the native model's own per-loop values:
 | loop 2 | 4.17e-5 | 7.81e-5 |
 | loop 3 | 4.17e-5 | 7.73e-5 |
 
-The floor is the atom attention's own bfloat16, which is why the bound is 2e-3
-here and 2e-5 against a `--float32-attention` dump.
+...and on to the distogram head, which is the trunk's one output today:
+**4.82e-5**, against an unsymmetrised control at 5.29e-1. The floor throughout
+is the atom attention's own bfloat16, which is why the bound is 2e-3 here and
+2e-5 against a `--float32-attention` dump.
+
+🔴 **AND THE DISTOGRAM HEAD SYMMETRISES, WHICH IS PART OF THE HEAD.**
+`distogram_head(z + z.transpose(-2, -3))` - a distance is symmetric and the
+trunk's pair is not. Feeding it `z` alone conforms in shape and returns a
+plausible distogram, which is why the checker runs that as a control rather than
+trusting the reading. **The bin EDGES are not in this checkpoint's config**: 128
+bins and no stated range, while the (absent) confidence head's config carries
+2.0 to 52.0 for its own 128. So the port returns LOGITS and leaves distances to
+a caller with real edges, rather than presenting a guess as a fact.
 
 🔴 **AND IT EXISTS BECAUSE EVERY PER-MODULE CHECK CAN PASS WHILE THE ASSEMBLY IS
 WRONG.** The featuriser's checker says each term of `z_init` matches and the

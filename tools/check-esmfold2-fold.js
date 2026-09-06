@@ -25,6 +25,7 @@ import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
 } from "../src/esmfold2/featuriser-reference.js";
 import { inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
+import { distogramLogits } from "../src/esmfold2/distogram-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
@@ -208,6 +209,24 @@ for (let loop = 0; loop < dump.loops; loop += 1) {
   report(`  loop ${loop}, out of the trunk`,
     relative(pair, Float32Array.from(dump.afterLoop[String(loop)])));
   console.log(`     (${((Date.now() - started) / 1000).toFixed(1)}s)`);
+}
+
+// --- and the one output the trunk has today.
+if (dump.distogram != null) {
+  const bins = manifest.trunk.distogramBins;
+  const got = distogramLogits(pair, n, channels,
+    tensors["distogram/weights"], tensors["distogram/bias"], bins);
+  report("distogram logits", relative(got, Float32Array.from(dump.distogram)));
+  // 🔴 THE CONTROL, because `distogram_head(z)` conforms in shape and returns a
+  // plausible distogram. If this arm did not differ, the check above would pass
+  // whether or not the symmetrisation happened at all.
+  const asymmetric = distogramLogits(pair, n, channels,
+    tensors["distogram/weights"], tensors["distogram/bias"], bins, false);
+  const separation = relative(asymmetric, Float32Array.from(dump.distogram));
+  const discriminates = separation > 1e-2;
+  if (!discriminates) failures += 1;
+  console.log(`  ${"...unsymmetrised (the control)".padEnd(30)} relRMS `
+    + `${separation.toExponential(3)}   ${discriminates ? "discriminates" : "DOES NOT"}`);
 }
 
 console.log(failures === 0

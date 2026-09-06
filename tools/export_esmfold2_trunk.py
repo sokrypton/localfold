@@ -78,6 +78,10 @@ def main():
     writer.add('featuriser/zInit1', transposed('z_init_1.weight'))
     writer.add('featuriser/zInit2', transposed('z_init_2.weight'))
 
+    # The distogram head: two tensors, and the trunk's only output today.
+    writer.add('distogram/weights', transposed('distogram_head.weight'))
+    writer.add('distogram/bias', np.asarray(get('distogram_head.bias'), np.float32))
+
     # 🔴 THE INPUTS EMBEDDER, WHICH IS NOT AF3'S ATOM ENCODER. Sliding-window
     # self-attention over atoms with a 3D rotary embedding built from the
     # reference conformer - see src/esmfold2/atom-encoder-reference.js. Reusing
@@ -117,6 +121,7 @@ def main():
                   'atomBlocks': atom_blocks,
                   'atomHeads': 4,
                   'atomWindow': 128,
+                  'distogramBins': int(source.shape('distogram_head.weight')[0]),
                   'tokenChannels': int(source.shape(
                       '%s.atom_to_token_linear.weight'
                       % 'inputs_embedder.atom_attention_encoder')[0]),
