@@ -2401,10 +2401,20 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // pairs. The seed is in it only when masking is on, because that is the only
   // way the seed reaches the trunk: `lm_mask_pct` is zero in this checkpoint, so
   // asking for a different SAMPLE reuses the trunk here where AF3 re-runs it.
+  // 🔴 AND THE MASK IS IN IT, WITH THE SEED BEHIND IT. `lm_mask_pct` replaces a
+  // fraction of the residues with the mask token BEFORE the tower runs, drawn
+  // from the seed - so with masking on, two seeds are two different trunk
+  // inputs and a key without them hands the second fold the first one's pair.
+  // This checkpoint sets the fraction to 0, so the seed never reaches the trunk
+  // and changing it reuses; but the config class documents single-sequence
+  // checkpoints as setting 0.1, so a future bundle turns this on by existing
+  // and the key has to be right before that rather than after.
+  const lmMask = (loaded.shape.lmMaskPct ?? 0);
   const trunkKey = JSON.stringify({
     family: chosenFamily(), chains, chainKinds, ligandCodes,
     loops: recycleCount() + 1,
     plm: plmChoice(), languageModel: usesLanguageModel(),
+    lmMask, maskSeed: lmMask > 0 ? randomSeed() : null,
   });
   const reuse = esmfold2Trunk?.key === trunkKey ? esmfold2Trunk.reusable : undefined;
   const result = await foldEsmfold2(device, {

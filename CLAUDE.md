@@ -2003,10 +2003,21 @@ what looping through the host would have cost.
 🔴 **AND THE KEY IS WHAT THE TRUNK DEPENDS ON, WHICH IS NOT WHAT THE FOLD
 DEPENDS ON.** The checkpoint, the chains and their kinds, the ligands, the pass
 count, and WHICH language model - "none" and ESM-C 600M share a family and
-produce different pairs, so the family alone is not enough. The seed is in it
-only when `lm_mask_pct` is non-zero, because that is the only route by which a
-seed reaches the trunk: asking for a different SAMPLE therefore reuses the trunk
-here, where AF3 re-runs it. Verified by the misses as much as the hits - 300M,
+produce different pairs, so the family alone is not enough. The MASK is in it, with the seed behind
+it: `lm_mask_pct` replaces a fraction of the residues with the mask token before
+the tower runs, drawn from the seed, so with masking ON two seeds are two
+different trunk inputs. Measured at `--lm-mask=0.1`, seeds 1 and 2 mask eight
+positions each and fold to different structures, with certainty 0.9530 and
+0.9485. This checkpoint sets the fraction to 0 so the seed never reaches the
+trunk and changing it REUSES - where AF3 re-runs - but the config class
+documents single-sequence checkpoints as setting 0.1, so a future bundle turns
+this on by existing and the key has to be right before that rather than after.
+
+🔴 **AND THE FIRST VERSION OF THAT KEY HAD NEITHER THE MASK NOR THE SEED IN
+IT**, while the note beside it claimed the seed was there when it mattered. The
+comment described the intent and the code did not implement it - which on a
+checkpoint that masked would have handed the second seed the first one's pair,
+silently, with every shape agreeing. Verified by the misses as much as the hits - 300M,
 back to 600M and a changed recycle count each re-ran, while a repeat, a step
 change and a seed change each reused.
 
