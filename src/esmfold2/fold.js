@@ -575,6 +575,9 @@ export async function foldEsmfold2(device, options) {
           weights: weights.featuriser.distogramWeights,
           bias: weights.featuriser.distogramBias,
           partners: partnerKeys(features, tokens),
+          // ...so a covalently attached ligand is not scored on the bond it
+          // was given. See the note in createCertaintyShader.
+          bonds: features.tokenBonds,
           molType: features.molType, residueType: features.residueType,
           wantLogits: options.distogramLogits === true,
           retainForFrames: options.frameCertainty === true })));

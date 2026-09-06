@@ -108,7 +108,7 @@ export function partnerKeys({ asymId, residueIndex, molType }, tokens) {
   for (let token = 0; token < tokens; token += 1) {
     keys[token * 4] = asymId[token];
     keys[token * 4 + 1] = residueIndex[token];
-    // ...0 protein, 1 nucleic, 2 ligand. See PARTNER_ANGSTROMS.
+    // ...0 protein, 1 nucleic, 2 nonpolymer. See PARTNER_ANGSTROMS.
     const mol = molType?.[token] ?? MOL_PROTEIN;
     keys[token * 4 + 2] = mol === MOL_NONPOLYMER ? 2 : (mol === MOL_PROTEIN ? 0 : 1);
   }
@@ -144,7 +144,25 @@ export function partnerKeys({ asymId, residueIndex, molType }, tokens) {
  * twice as far, because a base pair's partners are further off than a side
  * chain's.
  */
-export const PARTNER_ANGSTROMS = { protein: 12, nucleic: 24 };
+export const PARTNER_ANGSTROMS = { protein: 12, nucleic: 24, ligand: 12 };
+
+/**
+ * 🔴 AND A LIGAND SCORES AS WELL AS BEING SCORED, WHICH IS WHERE THIS PARTS
+ * COMPANY WITH AF3's lDDT. That loss admits only protein and nucleotide atoms
+ * as the partner index, and a ligand contributes no representative at all -
+ * which is right for a training loss over structures that always have a
+ * polymer, and wrong here the moment somebody folds a ligand ALONE. A heme on
+ * its own had no eligible partner for any of its atoms, so every token reported
+ * -1 and the whole molecule rendered as the worst colour on the scale, next to
+ * a contact map that was confident about it.
+ *
+ * So there is no chemistry test on who may score. The exclusion is the one
+ * thing being asked - is this partner TRIVIALLY close - and it has two forms: a
+ * covalent bond, and a sequence neighbourhood for a chain that has a sequence.
+ * A ligand has no sequence, so bonds are the whole of its exclusion, and its
+ * remaining pairs are the ones that say something. What stays chemistry-shaped
+ * is only how far a partner may REACH, which is AF3's own asymmetry.
+ */
 
 
 export function contactAngstromsFor(molTypeI, molTypeJ, residueTypeI, residueTypeJ) {
@@ -290,10 +308,12 @@ export function createCertaintyShader({ tokens, separation, cutoffBins }) {
 // id, y the residue number and z the chemistry - 0 protein, 1 nucleic, 2
 // ligand. See partnerKeys and PARTNER_ANGSTROMS.
 @group(0) @binding(2) var<storage, read> partner: array<vec4<i32>>;
-@group(0) @binding(3) var<storage, read_write> certainty: array<f32>;
+// ...1 where two tokens are covalently bonded; see the note in the loop.
+@group(0) @binding(3) var<storage, read> bonded: array<f32>;
+@group(0) @binding(4) var<storage, read_write> certainty: array<f32>;
 // ...and the interface reading beside it, which is a different question and is
 // -1 where the token has no cross-chain partner at all.
-@group(0) @binding(4) var<storage, read_write> interface_certainty: array<f32>;
+@group(0) @binding(5) var<storage, read_write> interface_certainty: array<f32>;
 
 var<workgroup> partial_sum: array<f32, ${LANES}>;
 var<workgroup> partial_count: array<f32, ${LANES}>;
@@ -316,18 +336,33 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // residue number, so a gap of zero drops all of them.
     let here = partner[token];
     let there = partner[other];
-    if (here.x == there.x && abs(here.y - there.y) <= ${separation}) { continue; }
-    // 🔴 A LIGAND IS SCORED, NEVER SCORING. AF3's lDDT gives a ligand atom no
-    // representative and admits only protein and nucleotide atoms as the
-    // partner index; this is that rule. It is also what lets a ligand token be
-    // scored at all without a fallback - the polymer around it is its partner
-    // set, under everyone else's cutoff.
-    if (there.z == 2) { continue; }
+    let cell_bond = token * ${tokens}u + other;
+    // 🔴 THE EXCLUSION IS "TRIVIALLY CLOSE", AND SEQUENCE SEPARATION IS ONLY
+    // ONE WAY TO BE. A residue and its i+1 neighbour are 3.8 A apart in every
+    // structure; so are two atoms joined by a covalent bond, and a LIGAND has
+    // no sequence for a separation to be measured along. A covalently attached
+    // ligand - a glycan, a covalent inhibitor - sits at a fixed bond length
+    // from the residue it is attached to, which is exactly as uninformative as
+    // an i+1 neighbour and was being counted as a confident prediction.
+    if (bonded[cell_bond] > 0.0) { continue; }
+    // 🔴 AND A SEQUENCE SEPARATION NEEDS A SEQUENCE. A ligand's atoms all carry
+    // ONE residue number - featurise.js writes 1 - so a rule phrased in
+    // residues excluded every pair inside it, and a heme folded ALONE had no
+    // surviving pair at all: 43 tokens, every one reporting -1, the whole
+    // molecule the worst colour on the scale beside a contact map that was
+    // confident about it. The rule is about a POLYMER's own backbone, so it
+    // applies only where both ends are polymer; for a ligand the bond above is
+    // the whole exclusion, which is what "only the non-bonded neighbours"
+    // means for something with no sequence.
+    if (here.z != 2 && there.z != 2
+        && here.x == there.x && abs(here.y - there.y) <= ${separation}) { continue; }
     let same_chain = here.x == there.x;
     let cell = token * ${tokens}u + other;
     // ...and how far that partner may be is the PARTNER's question, not the
     // pair's: a nucleotide reaches twice as far as a residue does.
-    let reach = select(${cutoffBins.protein}.0, ${cutoffBins.nucleic}.0, there.z == 1);
+    var reach = ${cutoffBins.protein}.0;
+    if (there.z == 1) { reach = ${cutoffBins.nucleic}.0; }
+    if (there.z == 2) { reach = ${cutoffBins.ligand}.0; }
     if (mode[cell] > reach) { continue; }
     // 🔴 THE TWO ARE KEPT APART, WHICH IS AF3's OWN DISTINCTION. A chain can be
     // folded well and docked badly, and one mean over both says neither: on a
@@ -454,7 +489,7 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  * @returns {Float32Array} one probability per token pair
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
-                                                  weights, bias, partners,
+                                                  weights, bias, partners, bonds,
                                                   molType, residueType,
                                                   chunk = 8192,
                                                   wantLogits = false,
@@ -477,7 +512,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   const binOf = (angstroms) =>
     Math.floor((angstroms - CONTACT_EDGES.minimum) / width);
   const cutoffBins = { protein: binOf(PARTNER_ANGSTROMS.protein),
-                       nucleic: binOf(PARTNER_ANGSTROMS.nucleic) };
+                       nucleic: binOf(PARTNER_ANGSTROMS.nucleic),
+                       ligand: binOf(PARTNER_ANGSTROMS.ligand) };
   const certaintyPair = {};
   for (const rows of heights) {
     certaintyPair[rows] = await cache.get(`${key}:certain:${rows}`,
@@ -535,6 +571,14 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     }
     const partnerBuffer = keep(allocator.upload("esmfold2.disto.partners",
       partners, storage));
+    // 🔴 REQUIRED TOO, because "no bonds" and "bonds not passed" are the same
+    // buffer of zeros - and the second is a silent wrong answer on exactly the
+    // input this exists for. A fold with no inter-token bonds passes its own
+    // all-zero matrix, which says so.
+    if (bonds === undefined || bonds.length !== tokens * tokens) {
+      throw new Error("encodeContactMap needs bonds: one token-by-token matrix");
+    }
+    const bondBuffer = keep(allocator.upload("esmfold2.disto.bonds", bonds, storage));
     if (molType === undefined || molType.length !== tokens
         || residueType === undefined || residueType.length !== tokens) {
       throw new Error("encodeContactMap needs molType and residueType per token");
@@ -575,7 +619,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     }
     await submit("esmfold2.certainty", [
       ["certainty", certaintyPass,
-       [mass, modes, partnerBuffer, certainty, interfaceCertainty],
+       [mass, modes, partnerBuffer, bondBuffer, certainty, interfaceCertainty],
        Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
     ]);
     const readback = keep(allocator.allocate("esmfold2.disto.readback", pairs * 4,
@@ -610,7 +654,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     // frame, which names the buffer and not the lifetime.
     const retained = retainForFrames
       ? [logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
-         interfaceCertainty] : [];
+         interfaceCertainty, bondBuffer] : [];
     for (const allocation of retained) {
       const at = held.indexOf(allocation);
       if (at >= 0) held.splice(at, 1);
@@ -618,7 +662,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const frames = retainForFrames ? await framesScorer({
       device, allocator, cache, submit, key, tokens, bins, span, cutoffBins,
       logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
-      interfaceCertainty,
+      interfaceCertainty, bondBuffer,
       release: () => { for (const allocation of retained) allocation.release(); },
     }) : undefined;
     if (!wantLogits) {
@@ -656,7 +700,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
 async function framesScorer(context) {
   const { device, allocator, cache, submit, key, tokens, bins, span } = context;
   const { cutoffBins, logits, biasBuffer, modes, mass, certainty, readCertainty,
-          partnerBuffer, interfaceCertainty } = context;
+          partnerBuffer, interfaceCertainty, bondBuffer } = context;
   const storage = GPUBufferUsage.STORAGE;
   const observed = await cache.get(`${key}:observed:${tokens}`,
     createObservedMassShader({ tokens, bins }, span));
@@ -676,7 +720,7 @@ async function framesScorer(context) {
         ["observed", observed, [logits, biasBuffer, positions, mass],
          ...elementwise(tokens * tokens)],
         ["aggregate", aggregate,
-         [mass, modes, partnerBuffer, certainty, interfaceCertainty],
+         [mass, modes, partnerBuffer, bondBuffer, certainty, interfaceCertainty],
          Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
       ]);
       const encoder = device.createCommandEncoder({ label: "esmfold2.certainty.frame" });

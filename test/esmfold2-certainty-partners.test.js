@@ -37,18 +37,24 @@ describe("the certainty's partner rule", () => {
                                       1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0]);
   });
 
-  it("drops a ligand's whole self-block, whatever the separation", () => {
-    // The shader's own test, applied on the host: same asym, and the residue
-    // numbers within `separation`.
+  it("does not apply a sequence rule to something with no sequence", () => {
+    // 🔴 A LIGAND'S ATOMS ALL CARRY ONE RESIDUE NUMBER, so a rule phrased in
+    // residues excludes every pair inside it - and a heme folded ALONE then has
+    // no surviving pair at all, 43 tokens every one of them "no data", beside a
+    // contact map that is confident about the molecule. The rule is about a
+    // polymer's backbone and applies only where both ends are polymer.
     const keys = partnerKeys({ asymId: [0, 0, 1, 1, 1],
                                residueIndex: [0, 1, 0, 0, 0],
                                molType: [0, 0, 3, 3, 3] }, 5);
-    const excluded = (i, j) => keys[i * 4] === keys[j * 4]
+    const polymer = (t) => keys[t * 4 + 2] !== 2;
+    const excluded = (i, j) => polymer(i) && polymer(j)
+      && keys[i * 4] === keys[j * 4]
       && Math.abs(keys[i * 4 + 1] - keys[j * 4 + 1]) <= CERTAINTY.separation;
-    for (const [i, j] of [[2, 3], [2, 4], [3, 4]]) expect(excluded(i, j)).toBe(true);
-    // ...and keeps every protein-ligand pair, which is the only thing the model
-    // is actually predicting about where the ligand goes.
-    for (const [i, j] of [[0, 2], [0, 4], [1, 3]]) expect(excluded(i, j)).toBe(false);
+    // tokens 2-4 are one ligand: not excluded by the sequence rule, only by
+    // bonds, which the shader applies from the token bond matrix.
+    for (const [i, j] of [[2, 3], [2, 4], [3, 4]]) expect(excluded(i, j)).toBe(false);
+    // ...and two residues of one chain, one apart, still are.
+    expect(excluded(0, 1)).toBe(true);
   });
 
   it("is the token-index rule on one unmodified protein chain", () => {
@@ -72,7 +78,8 @@ describe("the certainty's partner rule", () => {
     // kernel reports agreement with itself; the shape of the mistake this file
     // is about is a token index arriving where a residue number was meant.
     const wgsl = createCertaintyShader({
-      tokens: 8, separation: 3, cutoffBins: { protein: 25, nucleic: 56 } });
+      tokens: 8, separation: 3,
+      cutoffBins: { protein: 25, nucleic: 56, ligand: 25 } });
     expect(wgsl).toContain("partner: array<vec4<i32>>");
     expect(wgsl).toContain("here.x == there.x");
     expect(wgsl).toContain("abs(here.y - there.y) <= 3");
@@ -80,9 +87,16 @@ describe("the certainty's partner rule", () => {
     // 🔴 A LIGAND IS SCORED, NEVER SCORING - AF3's own lDDT admits only protein
     // and nucleotide atoms as the partner index. Without this the rule needs a
     // fallback for the ligand that has no partner of its own.
-    expect(wgsl).toContain("there.z == 2");
+    // 🔴 AND BONDED PAIRS ARE EXCLUDED, WHICH IS THE ONLY EXCLUSION A LIGAND
+    // CAN HAVE. Sequence separation needs a sequence; a covalently attached
+    // ligand sits at a fixed bond length from its residue, as uninformative as
+    // an i+1 neighbour and previously counted as a confident prediction.
+    expect(wgsl).toContain("bonded[cell_bond] > 0.0");
     // ...and the reach is the PARTNER's, not the pair's.
-    expect(wgsl).toContain("select(25.0, 56.0, there.z == 1)");
+    expect(wgsl).toContain("there.z == 1) { reach = 56.0");
+    // ...and nothing refuses to score on chemistry: a ligand folded ALONE has
+    // only its own atoms, and excluding them left every token at -1.
+    expect(wgsl.includes("if (there.z == 2) { continue; }")).toBe(false);
     // ...and nothing falls back to an unfiltered mean any more.
     expect(wgsl.includes("loose")).toBe(false);
   });

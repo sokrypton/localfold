@@ -2219,6 +2219,43 @@ reaches twice as far, because a base pair's partners are further off than a
 side chain's. AF3's own 15/30 is for a different quantity, a distance-difference
 test against a true structure rather than a distogram's peakedness.
 
+🔴 **AND A SEQUENCE SEPARATION NEEDS A SEQUENCE, WHICH A LIGAND HAS NOT GOT.**
+Every atom of a component carries residue number 1, so a rule phrased in
+residues excluded every pair INSIDE it - and a heme folded ALONE then had no
+surviving pair at all: 43 tokens, every one reporting no data, the whole
+molecule the worst colour on the scale, beside a contact map that was confident
+about it. Reported exactly that way. The rule is about a POLYMER's own backbone
+and now applies only where both ends are polymer; for a ligand the covalent
+bond is the whole exclusion. The lone heme reads **0.9878** (0.9365 to 0.9974).
+
+🔴 **AND THE EXCLUSION IS "TRIVIALLY CLOSE", OF WHICH SEQUENCE SEPARATION IS
+ONLY ONE FORM.** A covalent bond is the other: a glycan or a covalent inhibitor
+sits at a fixed bond length from the residue it is attached to, which is exactly
+as uninformative as an i+1 neighbour and was being counted as a confident
+prediction. `features.tokenBonds` is passed to the certainty now and is
+REQUIRED, because "no bonds" and "bonds not passed" are the same buffer of zeros
+and the second is a silent wrong answer on the one input this exists for.
+
+🔴 **AND NOTHING REFUSES TO SCORE ON CHEMISTRY, WHICH IS WHERE THIS PARTS
+COMPANY WITH AF3's lDDT.** That loss admits only protein and nucleotide atoms as
+the partner index and gives a ligand no representative at all - right for a
+training loss over structures that always have a polymer, and wrong the moment
+somebody folds a ligand alone. What stays chemistry-shaped is only how far a
+partner may REACH.
+
+🔴 **AND IT MOVES THE POLYMER'S NUMBER, WHICH HAS TO BE SAID.** With a ligand
+eligible to score, ubiquitin beside ATP reads **0.7493** where excluding the
+ligand gave 0.9215 - a ligand is one token per heavy atom, so ATP is 31 of 66
+tokens and nearly half of every residue's partner set. The same arithmetic that
+made it 62% of the contact metric. Which number is right is not measured here;
+what is measured is that the rule is now the same one for every token.
+
+🔴 **AND A LONE LIGAND'S 0.99 IS MOSTLY THE CONFORMER COMING BACK.** Its
+internal distances were HANDED to the model in `ref_pos`, so reproducing them is
+a copy rather than a prediction - the score is honest about the distogram's
+confidence and says little about whether the placement is right. Read it as
+"the model is sure", not as "the model is correct".
+
 🔴 **AND THE UNFILTERED FALLBACK IS GONE, WHICH IS WHAT MADE A LIGAND'S COLOUR
 THE ODD ONE OUT.** A ligand's atoms share one residue number, so the separation
 rule dropped its whole self-block and it had NO partner - landing on a `loose`
