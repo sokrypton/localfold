@@ -644,8 +644,16 @@ function startModelPreload(family, signal) {
   // licences, so it has its own entry point rather than a family argument to
   // one of the others - and it reports ONE progress stream over both, or the
   // dial resets to zero halfway through a 347 MiB download.
+  // 🔴 A FOLD WITH NO PROTEIN NEEDS NO LANGUAGE MODEL, AND THAT IS 224 MiB.
+  // ESM-C is handed protein tokens only, so a ligand, DNA or RNA input has no
+  // row for it - the fold already skips the call, and this skips the download
+  // too. Read from the entities as they stand: an empty list is a page nobody
+  // has typed into yet, where a protein is much the likeliest thing next.
+  const typed = entityList.read();
+  const needsLanguageModel = typed.length === 0
+    || typed.some((entity) => entity.type === "protein");
   const load = family === "ef2-fast-600m"
-    ? loadEsmfold2Weights(report)
+    ? loadEsmfold2Weights(report, { languageModel: needsLanguageModel })
     : (AF3_FAMILIES.includes(family)
       ? loadAf3Weights(report, family)
       : loadModel("msa", report, signal, family));

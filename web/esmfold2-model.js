@@ -107,7 +107,7 @@ let weightsPromise;
  * first version handed the second family the first one's weights. There is one
  * ESMFold2 bundle; if a second appears, this becomes a Map on the same day.
  */
-export function loadEsmfold2Weights(onProgress) {
+export function loadEsmfold2Weights(onProgress, { languageModel = true } = {}) {
   if (weightsPromise !== undefined) return weightsPromise;
   weightsPromise = (async () => {
     const [foldManifest, towerManifest] = await Promise.all([
@@ -146,11 +146,27 @@ export function loadEsmfold2Weights(onProgress) {
     const [foldStore, towerStore] = await Promise.all([
       HttpTensorStore.fromManifest(bundleBaseUrl("ef2-fast-600m"), foldManifest,
                                    report("fold")),
+      // 🔴 AND ITS PROGRESS IS NOT REGISTERED WHEN IT IS NOT BEING FETCHED, or
+      // the dial promises 346 MiB and stops at a third of it. The reporter sums
+      // `totalBytes` across both stores, so a store that never downloads has to
+      // be absent from the sum rather than merely idle.
       HttpTensorStore.fromManifest(bundleBaseUrl("esmc"), towerManifest,
-                                   report("tower")),
+                                   languageModel ? report("tower") : undefined),
     ]);
     foldStore.prefetch();
-    towerStore.prefetch();
+    // 🔴 224 MiB FOR A TOWER THE FOLD WILL NEVER CALL. ESM-C sees PROTEIN
+    // tokens only - `protein_mask = (mol_type == 0) & token_mask` - so a fold
+    // whose input is a ligand, or DNA, or RNA and nothing else has no row to
+    // give it, and `foldEsmfold2` already skips the call at
+    // `lm.ids.length === 0`. What it could not skip was the download, because
+    // this prefetch starts every shard the moment the model is chosen.
+    //
+    // 🔴 THE SHIM STILL COMES FROM THIS STORE AND IS STILL READ. Its LayerNorm
+    // has an offset and its downprojection a bias, so `shim(0)` is a fixed
+    // NON-ZERO vector and a fold with no protein still needs those tensors -
+    // see shimSingleForZeroState. They are a few hundred KB fetched on demand;
+    // the 36 blocks are the 224 MiB, and those are what go unfetched.
+    if (languageModel) towerStore.prefetch();
 
     const read = (name) => foldStore.tensor(name);
     const M = foldManifest.trunk;

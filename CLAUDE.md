@@ -2503,6 +2503,35 @@ tokens protein - and the fold would still come out, with a protein's threshold
 on every pair and nothing to see. The line reads `contact classes: 40 polymer,
 31 ligand, 0 nucleic`, and it is printed only when there is something to say.
 
+🔴 **AND A FOLD WITH NO PROTEIN DOWNLOADED 224 MiB OF LANGUAGE MODEL IT NEVER
+CALLED.** ESM-C is handed protein tokens only - `protein_mask = (mol_type == 0)
+& token_mask` - so a ligand, DNA or RNA input has no row to give it, and
+`foldEsmfold2` already skips the call at `lm.ids.length === 0`. A lone heme
+spends **2 ms** in the language model band and has no "Language model" phase in
+its trace at all. What it could not skip was the DOWNLOAD: `towerStore.prefetch()`
+starts all 54 shards the moment the model is chosen. `startModelPreload` reads
+the entities and passes `languageModel: false` when none of them is a protein;
+an empty list still fetches, because a page nobody has typed into yet is most
+likely about to hold a protein.
+
+🔴 **AND THE STORE MUST LEAVE THE PROGRESS SUM, NOT MERELY GO IDLE.** The
+reporter adds `totalBytes` across both bundles, so a tower that never downloads
+still promised its 223.6 MiB and the dial would have stopped at a third. It is
+registered only when it is going to be fetched.
+
+🔴 **AND THE SHIM IS STILL READ FROM THAT BUNDLE.** Its LayerNorm has an offset
+and its downprojection a bias, so `shim(0)` is a fixed NON-ZERO vector and a
+fold with no protein still needs those tensors - see `shimSingleForZeroState`.
+They are a few hundred KB fetched on demand; the 36 blocks are the 223.6 MiB,
+and those are what go unfetched.
+
+🔴 **AND THE TRUNK STILL RUNS, WHICH IS NOT WASTE.** It is the pair track, not a
+protein stage: the diffusion conditioning takes `z` from it and the distogram
+head is a projection off it, so a fold without it would condition the structure
+head on `z_init` and be a different model. On the lone heme it is 0.63 s of a
+1.53 s fold, and the protein-specific stage is the one that already skips
+itself.
+
 🔴 **AND THE DIAL HAS TO STOP REPORTING WHEN THE LOAD DOES.** The tower STREAMS
 - its 36 blocks are read during the fold - so its store went on firing progress
 after the weights promise resolved, and `startModelPreload`'s clear was

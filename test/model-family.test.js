@@ -80,6 +80,25 @@ describe("what needs an AlphaFold 3 graph", () => {
 });
 
 describe("what a fold is called", () => {
+  it("does not download a language model for a fold with no protein", () => {
+    // 🔴 ESM-C IS HANDED PROTEIN TOKENS ONLY - `protein_mask = (mol_type == 0)
+    // & token_mask` - so a ligand, DNA or RNA input has no row for it. The fold
+    // already skips the CALL at `lm.ids.length === 0`; what it could not skip
+    // was the 224 MiB download, which `towerStore.prefetch()` starts the moment
+    // the model is chosen. This pins the decision, because nothing else would
+    // notice it silently reverting to always-fetch.
+    assert.ok(app.includes("needsLanguageModel"), "the decision is not made");
+    const preload = app.slice(app.indexOf("function startModelPreload"));
+    const decision = preload.slice(0, preload.indexOf("loadEsmfold2Weights"));
+    assert.ok(decision.includes('entity.type === "protein"'),
+              "the decision does not read the entities");
+    // ...and an empty list is a page nobody has typed into yet, where the
+    // likeliest next thing is a protein - so it fetches.
+    assert.ok(decision.includes("typed.length === 0"), "an empty list must fetch");
+    assert.ok(preload.includes("{ languageModel: needsLanguageModel }"),
+              "the decision does not reach the loader");
+  });
+
   it("gives every model its own stem, so two folds are told apart", () => {
     // 🔴 THE OBJECT NAME IS THE ONLY PLACE THE MODEL SHOWS ON SCREEN. Both
     // AF3-graph bundles used to produce `af3_N` and both AlphaFold 2 models
