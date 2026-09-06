@@ -81,27 +81,50 @@ export class Esmfold2TrunkGpu {
     const hasF16 = this.device.features?.has("shader-f16") === true;
     const stagedPrecision = this.options.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     const weightPrecision = this.options.weightPrecision ?? "f32";
-    // 🔴 THE TRIANGLE'S ACCUMULATORS STAY f32 HERE, WHERE AF3's TRUNK NARROWS
-    // THEM, AND THE REASON IS THE RATIO RATHER THAN THE ERROR. Separating the
-    // two f16 knobs - the transition's staged tiles and the triangle
-    // projection's eight vec4 of accumulators - prices them very differently.
-    // Error against the native model at 40 residues, time swept over lengths
-    // (tools/gpu/check-esmfold2-trunk-gpu.js and bench-esmfold2-trunk.js):
+    // 🔴 BOTH KNOBS ARE f16, AND THE SECOND ONE IS PRICED AGAINST THE SAMPLER
+    // RATHER THAN AGAINST A TENSOR NORM. The transition's staged tiles and the
+    // triangle projection's eight vec4 of accumulators are separate kernels and
+    // separate knobs. Against the native model at 40 residues, timed by
+    // bench-esmfold2-trunk.js at 150:
     //
-    // | staged : accumulate | relRMS | 40 tok | 150 | 300 |
-    // |---|---|---|---|---|
-    // | f32 : f32 | **1.10e-6** | 1.000x | 1.000 | 1.000 |
-    // | f16 : f32 | 5.46e-4 | 1.163 | 1.240 | **1.306** |
-    // | f32 : f16 | 2.62e-3 | 1.102 | 1.088 | 1.151 |
-    // | f16 : f16 | 2.68e-3 | 1.348 | 1.466 | 1.480 |
+    // | staged : accumulate | relRMS | 150 tokens | 300 |
+    // |---|---|---|---|
+    // | f32 : f32 | 1.10e-6 | 1.000x | 1.000 |
+    // | f16 : f32 | 5.46e-4 | 1.074 | **0.951** |
+    // | **f16 : f16** | **2.68e-3** | **1.279** | **1.195** |
     //
-    // The accumulator carries 96% of the error and returns the smaller half of
-    // the speedup, at every length. So this takes 1.31x of the 1.48x available
-    // for a fifth of the error. AF3's trunk answers differently because it was
-    // priced on that kernel alone (1.55x on bench-triangle-project at 118
-    // tokens) rather than against the other knob; here the two were separated
-    // because 24 blocks four times over amplifies whatever they round.
-    const accumulatePrecision = this.options.accumulatePrecision ?? "f32";
+    // 🔴 AND THE OLD DEFAULT WAS A LOSS AT 300 TOKENS. `f16:f32` staged the
+    // transition's tiles narrow and left its arithmetic wide, and after the
+    // tiling fix of this session that tile is half the size it was - so
+    // narrowing what is no longer the bottleneck costs the `f32()` at each read
+    // and buys nothing. It measured 1.306x at 300 tokens before that fix and
+    // 0.951 after. A precision trade priced before a tiling change is not a
+    // trade priced after it, and this is the second time that sentence has been
+    // true in this file.
+    //
+    // The accumulator carries 96% of the error, and for a long time that was
+    // the reason to leave it alone. What settled it was measuring the
+    // STRUCTURE instead: folding the same 150-residue sequence twice at the
+    // same seed, changing only this, and superposing the two answers.
+    //
+    // | what changed | how far the structure moved |
+    // |---|---|
+    // | the SAMPLER'S SEED, nothing else | **6.32 A** |
+    // | f32:f32 -> f16:f32 | 0.008-0.009 |
+    // | f32:f32 -> f16:f16 | **0.034-0.041** |
+    //
+    // 0.04 A against a 6.3 A spread is a factor of 160. This is a stochastic
+    // sampler: a change smaller than its own draw is not a cost, it is below
+    // the resolution of the thing being predicted. Contact precision and recall
+    // are identical across all three arms, to three decimals.
+    //
+    // 🔴 AND THE CHECKER STILL SEPARATES THEM, which is the other half of
+    // taking this. tools/gpu/check-esmfold2-trunk-gpu.js holds each arm to the
+    // bound its own arithmetic implies - 2e-4, 1e-3 and 4e-3 - rather than
+    // raising one to cover all three, because a single loose bound would stop
+    // the f32 path being checked at all.
+    const accumulatePrecision = this.options.accumulatePrecision
+      ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE ATTENTION IS AN AXIS OF THE CACHE KEY, not just of the dispatch.
     // A pipeline cache shared with an AF3 fold in the same page holds shaders
     // compiled for the same n and channels; without this the two stacks would
@@ -172,7 +195,9 @@ export class Esmfold2TrunkGpu {
       for (const allocation of scratch) allocation.release();
       biasBuffer?.release();
       if (options.readback === false) {
-        return { pair: undefined, elapsedMilliseconds: performance.now() - start,
+        return { pair: undefined,
+                 precision: { staged: stagedPrecision, accumulate: accumulatePrecision },
+                 elapsedMilliseconds: performance.now() - start,
                  memory: this.allocator.snapshot() };
       }
       const readback = keep(this.allocator.allocate(
@@ -187,6 +212,12 @@ export class Esmfold2TrunkGpu {
 
       return {
         pair: out,
+        // 🔴 WHAT IT ACTUALLY RAN, NOT WHAT WAS ASKED FOR. A caller that passes
+        // nothing gets the stack's own choice, and a checker holding that arm
+        // to a bound has to know which arithmetic it got - the alternative is
+        // naming the defaults in the checker, which makes it agree with itself
+        // when the defaults move.
+        precision: { staged: stagedPrecision, accumulate: accumulatePrecision },
         elapsedMilliseconds: performance.now() - start,
         memory: this.allocator.snapshot(),
       };

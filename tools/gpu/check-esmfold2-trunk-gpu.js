@@ -154,8 +154,23 @@ export async function main(device, args = []) {
     // moved. It passes no options and lets the stack choose.
     const [staged, accumulate] = precision === "default" ? [undefined, undefined]
       : (precision.includes(":") ? precision.split(":") : [precision, precision]);
-    const limit = (staged === "f32" && accumulate === "f32")
-      ? bound : Number(option(args, "f16-bound", "1e-3"));
+    // 🔴 THREE BOUNDS, NOT TWO, BECAUSE THERE ARE THREE ARITHMETICS. The
+    // transition's staged tiles and the triangle projection's accumulators are
+    // separate kernels and separate knobs, and the accumulator carries most of
+    // the error: measured at 40 residues, f32:f32 is 1.10e-6, f16:f32 is
+    // 5.46e-4 and f16:f16 is 2.68e-3. One bound covering the loosest stops the
+    // other two being checked at all, which is the fault CLAUDE.md records
+    // about a differential checker that raises a bound to cover both arms.
+    //
+    // 🔴 AND IT IS CHOSEN FROM WHAT THE STACK REPORTS HAVING RUN, not from what
+    // was asked for. The `default` arm passes no options on purpose, so naming
+    // the shipped precisions here would make this checker agree with itself
+    // the moment they moved - the same fault as a checker that builds its own
+    // kernel, one level up.
+    const limitFor = (ran) => (ran.accumulate === "f16"
+      ? Number(option(args, "f16-accumulate-bound", "4e-3"))
+      : (ran.staged === "f32" && ran.accumulate === "f32")
+        ? bound : Number(option(args, "f16-bound", "1e-3")));
     const settings = staged === undefined
       ? {} : { stagedPrecision: staged, accumulatePrecision: accumulate };
     const stack = new Esmfold2TrunkGpu(device, settings);
@@ -164,9 +179,11 @@ export async function main(device, args = []) {
       const want = Float32Array.from(dump.afterLoop[key]);
       const skipped = await stack.run({ pair, pairMask }, blocks, { n, channels });
       const score = relative(skipped.pair, want);
+      const limit = limitFor(skipped.precision);
       if (!(score <= limit)) failures += 1;
       const arm = {
-        precision, loop: Number(key), relRms: score, within: score <= limit, bound: limit,
+        precision, ran: `${skipped.precision.staged}:${skipped.precision.accumulate}`,
+        loop: Number(key), relRms: score, within: score <= limit, bound: limit,
         milliseconds: Number(skipped.elapsedMilliseconds.toFixed(1)),
         peakMiB: Number((skipped.memory.peakBytes / 2 ** 20).toFixed(1)),
       };
