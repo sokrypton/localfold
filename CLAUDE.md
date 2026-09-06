@@ -1038,11 +1038,53 @@ the other knob. **Price a precision knob against the other knobs, not against
 f32.**
 
 🔴 **AND THE TRUNK IS THE EXPENSIVE HALF OF THIS MODEL, NOT THE TOWER.** ESM-C
-600M folds 300 residues in 0.91 s. The trunk at 300 tokens is **10.2 s a loop
-and it runs four loops** - 41 s - holding 534 MiB, because `d_pair` is 256 where
+600M folds 300 residues in 0.91 s. The trunk at 300 tokens is **8.7 s a loop and
+it runs four loops** - 35 s - holding 534 MiB, because `d_pair` is 256 where
 AF3's is 128 and 24 blocks x 4 loops is 96 block evaluations where an AF3 trunk
-runs 48. Per block it is 374 ms at 300 tokens. Whatever "is this worth shipping"
-turns on, it is this number and not the language model's.
+runs 48. Whatever "is this worth shipping" turns on, it is this number and not
+the language model's.
+
+🔴 **AND A TILE TUNED AT ONE CHANNEL COUNT IS NOT TUNED AT ANOTHER, WHICH COST
+1.45x OF THE WHOLE TRUNK.** `transitionRowTile` was a function of the ROW COUNT
+alone, and the row count is not what fills the workgroup: the staged block is
+`tile * channels` plus `tile * chunk`, so the CHANNELS decide what a tile costs.
+At AF3's 128 it picked 8, correctly; at ESMFold2's 256 it picked 8 again and
+that is twice what fits well. It takes the channels now, holding both halves of
+the staged block near **1024 floats** - a rule that reproduces every tuned value
+already in the tree (the pair track's 8:128, the MSA stack's, the template
+stack's, both diffusion transitions') and moves only the new shape. Verified by
+hashing the generated WGSL at all seven shapes before and after: **six
+byte-identical, one changed**, which is a stronger statement than a fold
+fingerprint and free. `test/transition-tile.test.js` pins the table, because
+every tile is bit-identical (relRMS 0) so nothing else would notice a
+re-tuning.
+
+The trunk at 300 tokens, profiled with `bench-esmfold2-trunk.js --profile`:
+
+| pass | before | after | GFLOP/s after |
+|---|---|---|---|
+| `pair-transition` | 331.0 ms/block, 62.5% | **169.2, 45.0%** | 837 |
+| `tri.project` | 84.8, 16.0% | 87.3, 23.2% | 1113 |
+| `tri.project-out` | 60.7, 11.5% | 62.3, 16.6% | 777 |
+| `tri.contract` | 33.5, 6.3% | 34.7, 9.2% | 825 |
+| the two normalises | 19.8, 3.7% | 22.2, 5.9% | |
+| **the trunk** | **12.9 s** | **9.2 s** | |
+
+🔴 **AND THE TRIANGLE'S TILE IS *NOT* MIS-TUNED THE SAME WAY, WHICH IS WHY THIS
+WAS WORTH CHECKING RATHER THAN ASSUMING.** The obvious next move after the
+transition was to suspect every other kernel tuned at 128 channels.
+`bench-triangle-project.js --tokens=300 --channels=256` says the shipped
+**32x16 is already the best arm at 256** - 967 GFLOP/s on `project`, and best
+combined with `project-out` (83.2 ms against 32x32's 87.8). A shape-dependent
+tuning bug in one kernel is not evidence of one in its neighbour.
+
+🔴 **AND HALVING THE STAGED BLOCK MADE f16 STAGING WORTH LESS, WHICH IS THE
+TRADE MOVING RATHER THAN BREAKING.** Before the tile fix `f16:f32` was 1.306x
+at 300 tokens; after it is 1.059x. The kernel was waiting on its staged tile,
+the tile is now half the size, and narrowing what is no longer the bottleneck
+buys what narrowing never bottleneck-bound bytes buys. The default stays f16 -
+it is still free of any measurable accuracy cost at 5.46e-4 - but **a precision
+trade priced before a tiling change is not a trade priced after it**.
 
 ## A language model instead of an alignment: ESMFold2
 

@@ -598,7 +598,7 @@ export class Af3PairformerStackGpu {
     run("single.add", pipelines.addSingle, [single, singleScratch[5]], addSingle[0], addSingle[1]);
 
     run("single-transition", pipelines.singleTransition,
-        [single, singleTransitionWeights, singleScratch[0]], ceil(n, transitionRowTile(n)));
+        [single, singleTransitionWeights, singleScratch[0]], ceil(n, transitionRowTile(n, SINGLE_CHANNELS)));
     run("single-transition.add", pipelines.addSingle, [single, singleScratch[0]],
         addSingle[0], addSingle[1]);
 

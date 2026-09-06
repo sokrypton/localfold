@@ -64,12 +64,50 @@ const DEFAULT_WORKGROUP = 128;
  * and not the other silently transitions a fraction of its rows. Both sides
  * call this with the same `rows`, which is why it is a pure function.
  */
-export function transitionRowTile(rows) {
+export function transitionRowTile(rows, channels = STAGED_TILE_FLOATS / 8) {
   for (const tile of [8, 4, 2]) {
-    if (rows / tile >= 220) return tile;
+    if (rows / tile >= 220) return Math.max(1, Math.min(tile, Math.floor(STAGED_TILE_FLOATS / channels)));
   }
   return 1;
 }
+
+/**
+ * How many floats each half of the staged block holds, whatever the shape.
+ *
+ * 🔴 THE TILE WAS A FUNCTION OF THE ROW COUNT ALONE, AND THE ROW COUNT IS NOT
+ * WHAT FILLS THE WORKGROUP. The staged block is `tile * channels` for the
+ * normalised rows plus `tile * chunk` for the gated intermediate, so the
+ * CHANNELS decide what a tile costs - and at 256 channels the tile the row rule
+ * picks is twice what fits well. ESMFold2's trunk runs 256 where AF3's pair
+ * track runs 128, and it is 62.5% of that trunk's GPU time, so it is where this
+ * showed. Swept at 90,000 rows x 256 channels by bench-transition.js, every arm
+ * bit-identical (relRMS 0):
+ *
+ * | tile:chunk | 4:256 | 4:512 | 4:1024 | 8:128 | 8:256 | 2:1024 | 16:128 | 8:512 |
+ * |---|---|---|---|---|---|---|---|---|
+ * | ms | **230.9** | 245.2 | 353.5 | 369.1 | 394.8 | 396.1 | 560.2 | 773.5 |
+ *
+ * 8:256 is what the row rule picked; 4:256 is **1.71x** it.
+ *
+ * 🔴 AND 1024 REPRODUCES EVERY TUNED VALUE ALREADY IN THE TREE, which is the
+ * only reason it is a rule rather than a second special case. AF3's pair track
+ * measured 8:128 optimal at 128 channels and its MSA stack, its template stack
+ * and both diffusion transitions land on exactly what they run today:
+ *
+ * | stack | channels | intermediate | tile | chunk |
+ * |---|---|---|---|---|
+ * | AF3 pair track | 128 | 512 | 8 | 128 |
+ * | AF3 MSA stack | 64 | 256 | 8 | 128 (the workgroup floor) |
+ * | AF3 template stack | 64 | 128 | 8 | 128 (the whole intermediate) |
+ * | diffusion, pair | 128 | 256 | 8 | 128 |
+ * | diffusion, single | 384 | 768 | 1 | 768 (the whole intermediate) |
+ * | **ESMFold2 trunk** | **256** | **1024** | **4** | **256** |
+ *
+ * Only the last row moves. `test/transition-tile.test.js` pins the whole table,
+ * because a rule that quietly re-tunes four shipped stacks while fixing a fifth
+ * is not the change this is.
+ */
+export const STAGED_TILE_FLOATS = 1024;
 
 /**
  * How much of the widened intermediate is resident in workgroup memory at once.
@@ -90,10 +128,10 @@ export function transitionRowTile(rows) {
  * so it stays unchunked.
  */
 export function transitionChunk(intermediate, tile = 1, width = DEFAULT_WORKGROUP) {
-  // Keep the staged block a constant size - two intermediates' worth of floats,
-  // 4 KB for the pair track - so the tile trades weight traffic for occupancy
-  // and not for workgroup memory as well.
-  const wanted = Math.max(width, Math.round(2 * intermediate / tile / width) * width);
+  // Keep the staged block a constant size - see STAGED_TILE_FLOATS. The tile
+  // then trades weight traffic for occupancy and not for workgroup memory as
+  // well, at any channel count rather than at 128 alone.
+  const wanted = Math.max(width, Math.round(STAGED_TILE_FLOATS / tile / width) * width);
   const chunk = Math.min(intermediate, wanted);
   return intermediate % chunk === 0 ? chunk : intermediate;
 }
@@ -128,7 +166,7 @@ export function packTransitionWeights(weights, precision = "f32") {
 export function createTransitionShader(shape, offsets, epsilon, variance) {
   const { rows, channels, factor } = shape;
   const intermediate = channels * factor;
-  const tile = shape.tile ?? transitionRowTile(rows);
+  const tile = shape.tile ?? transitionRowTile(rows, channels);
   const WORKGROUP = shape.width ?? DEFAULT_WORKGROUP;
   const chunk = shape.chunk ?? transitionChunk(intermediate, tile, WORKGROUP);
   if (intermediate % chunk !== 0) {

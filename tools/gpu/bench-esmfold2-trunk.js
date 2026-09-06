@@ -14,6 +14,7 @@
 // across its own shapes - see CLAUDE.md - so a sweep that runs all of one arm
 // and then all of the other is measuring the drift.
 import { Esmfold2TrunkGpu, PAIR_CHANNELS } from "../../src/esmfold2/trunk-webgpu.js";
+import { profileDevice } from "./profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -74,13 +75,45 @@ export async function main(device, args = []) {
   const stacks = new Map();
   const stackFor = (precision) => {
     if (!stacks.has(precision)) {
-      const [staged, accumulate] = precision.includes(":")
-        ? precision.split(":") : [precision, precision];
-      stacks.set(precision, new Esmfold2TrunkGpu(device,
-        { stagedPrecision: staged, accumulatePrecision: accumulate }));
+      // `default` overrides nothing, so the shipped settings are an arm here
+      // too rather than a name this tool would have to keep in step.
+      const [staged, accumulate] = precision === "default" ? [undefined, undefined]
+        : (precision.includes(":") ? precision.split(":") : [precision, precision]);
+      stacks.set(precision, new Esmfold2TrunkGpu(device, staged === undefined ? {}
+        : { stagedPrecision: staged, accumulatePrecision: accumulate }));
     }
     return stacks.get(precision);
   };
+
+  // 🔴 PROFILE, DO NOT BISECT BY DELETION - see CLAUDE.md. Every pass this
+  // track encodes already carries a label, so wrapping the device times all of
+  // them with no kernel change. One shape and one precision, because 24 blocks
+  // is 144 passes and the query set holds 2048.
+  if (args.includes("--profile")) {
+    const n = tokens[0];
+    const precision = precisions[0];
+    const profile = profileDevice(device);
+    if (profile === null) throw new Error("this device has no timestamp-query");
+    const pair = deterministic(n * n * channels, 991 + n);
+    const pairMask = new Float32Array(n * n).fill(1);
+    // ...once to compile, then reset, so the report is a steady pass.
+    await stackFor(precision).run({ pair: Float32Array.from(pair), pairMask },
+                                  blocks, { n, channels });
+    profile.reset();
+    const result = await stackFor(precision).run(
+      { pair: Float32Array.from(pair), pairMask }, blocks, { n, channels });
+    const passes = await profile.report();
+    profile.restore();
+    const total = passes.reduce((sum, p) => sum + p.ms, 0);
+    return {
+      profile: { tokens: n, precision, channels, blocks: blockCount,
+                 wallMilliseconds: Number(result.elapsedMilliseconds.toFixed(1)),
+                 measuredMilliseconds: Number(total.toFixed(1)) },
+      passes: passes.map((p) => ({ ...p,
+        share: Number((p.ms / total).toFixed(4)),
+        perBlockMilliseconds: Number((p.ms / blockCount).toFixed(2)) })),
+    };
+  }
 
   const samples = new Map();
   const key = (n, precision) => `${n}:${precision}`;

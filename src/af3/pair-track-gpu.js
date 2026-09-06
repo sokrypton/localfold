@@ -378,7 +378,7 @@ export function encodePairTrack(context) {
   // 🔴 A TILE OF PAIRS A WORKGROUP. This was 241 ms of a 632 ms pairformer pass
   // - the largest single kernel in the trunk - because each workgroup read the
   // whole 196k-float weight set for one row.
-  const perTransition = spread(Math.ceil(pairs / transitionRowTile(pairs)));
+  const perTransition = spread(Math.ceil(pairs / transitionRowTile(pairs, channels)));
   // ...reads every row it writes into workgroup memory before writing any of
   // them, and no other workgroup touches those rows, so this is in place.
   run("pair-transition", pipelines.pairTransition, [pair, weights.transition],

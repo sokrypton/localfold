@@ -550,14 +550,14 @@ export class Af3DiffusionConditioningGpu {
       const transitionCount = options.transitions ?? 2;
       for (let index = 0; index < transitionCount; index += 1) {
         if (reusePair === undefined) {
-          const perPair = spread(Math.ceil(pairs / transitionRowTile(pairs)));
+          const perPair = spread(Math.ceil(pairs / transitionRowTile(pairs, pairChannels)));
           run(`pair-transition-${index}`, transitionPipelines.pair[index],
               [pair, transitionWeights.pair[index], pairScratch], perPair[0], perPair[1]);
           run(`pair-add-${index}`, compiled.addPair, [pair, pairScratch], pairAdd[0], pairAdd[1]);
         }
         run(`single-transition-${index}`, transitionPipelines.single[index],
             [single, transitionWeights.single[index], singleScratch],
-            Math.ceil(tokens / transitionRowTile(tokens)));
+            Math.ceil(tokens / transitionRowTile(tokens, seqChannels)));
         run(`single-add-${index}`, compiled.addSingle, [single, singleScratch],
             singleAdd[0], singleAdd[1]);
       }

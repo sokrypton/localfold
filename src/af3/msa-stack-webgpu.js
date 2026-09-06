@@ -262,7 +262,7 @@ export class Af3MsaStackGpu {
         perRow[0], perRow[1]);
     run("msa.add", pipelines.addMsa, [msa, msaScratch[2]], addMsaGroups[0], addMsaGroups[1]);
 
-    const perTransition = spread(ceil(rows, transitionRowTile(rows)));
+    const perTransition = spread(ceil(rows, transitionRowTile(rows, msaChannels)));
     run("msa-transition", pipelines.msaTransition, [msa, msaTransitionWeights, msaScratch[0]],
         perTransition[0], perTransition[1]);
     run("msa-transition.add", pipelines.addMsa, [msa, msaScratch[0]],
