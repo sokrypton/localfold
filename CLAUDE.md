@@ -2230,13 +2230,50 @@ contact metric.
 "C4" must not match C4', which every nucleotide also has and which is back out
 on the sugar - a silent 4 A error in the representative.
 
-🔴 **AND AF2 AND AF3 ARE NOT AFFECTED, WHICH WAS WORTH CHECKING RATHER THAN
-ASSUMING.** The report was "this affects all models". It does not:
-`distogramContactProbabilities` in src/heads/distogram.js is per PAIR with no
-separation rule and no aggregation, and `web/prediction-results.js` exports the
-matrix as it stands. Those models take their confidence from a confidence head.
-ESMFold2 is the only one here that DERIVES a confidence from the distogram, so
-it is the only one with an aggregation to get wrong.
+🔴 **AND AF2 AND AF3'S CONFIDENCE IS NOT AFFECTED, BUT AF3's CONTACT MAP IS.**
+The report was "this affects all models". Half of it does. No AGGREGATION is at
+risk: `distogramContactProbabilities` in src/heads/distogram.js is per PAIR with
+no separation rule, `web/prediction-results.js` exports the matrix as it stands,
+and both models take their confidence from a confidence head - so ESMFold2 is
+the only one here that DERIVES a confidence from a distogram. But the THRESHOLD
+is a different question, and AF3 tokenises ligands one heavy atom at a time
+exactly as ESMFold2 does, so its contact map wanted the same table. AF2 does
+not: monomer and multimer are protein-only, every pair is two residues, and 8 A
+is simply right there.
+
+🔴 **SO THE TABLE LIVES IN `src/heads/contact-threshold.js`, WHICH IS NEITHER
+MODEL'S.** `contactAngstromsForClasses` takes two CLASSES - nucleic, ligand, or
+one of the twenty amino acids - and each model maps its own alphabet onto them.
+The two heads then disagree about one thing only, which is where a bin's edge
+is: AF3 counts a bin whose TOP edge is under the threshold and ESMFold2's
+borrowed grid counts one whose CENTRE is. Both are prefixes of an ordered
+binning, so `contactBinsByPair` takes `binsUnder` from the caller and returns a
+COUNT rather than a mask.
+
+🔴 **AND BOTH ALPHABETS ARE THREE-LETTER ALPHABETICAL, WHICH IS WHY ONE TABLE
+SERVES THEM AND IS ASSERTED RATHER THAN TRUSTED.** AF3's
+`ARNDCQEGHILKMFPSTWYV` is one-letter alphabetical and happens to be
+three-letter alphabetical too, so AF3's restype IS the table's index and
+ESMFold2's is that plus two. `test/contact-threshold.test.js` walks all twenty
+rather than spot-checking, because a silently permuted alphabet conforms in
+shape and folds something.
+
+🔴 **AND A LIGAND ATOM AND AN UNKNOWN RESIDUE SHARE AN `aatype`, SO AF3's CLASS
+CANNOT COME FROM THE ALPHABET.** `featurise.js` writes `UNK_AATYPE` for every
+ligand atom and the same value for an X in a protein chain; only `ligandSpans`
+separates them, and reading the alphabet alone gives a ligand a 7 A protein
+threshold, which conforms and is wrong. `af3ContactClasses` is that one join.
+
+🔴 **AND THE HEADS REFUSE TO DEFAULT IT.** A caller with no classes would
+silently get 8 A on every pair back - the convention this exists to correct -
+and the failure would be a plausible contact map rather than an error. Both the
+GPU head and its CPU reference throw; the two AF3 trunk checkers pass
+`CLASS_PROTEIN` for every token EXPLICITLY, with a comment saying their dumps
+are protein-only, which is a stated assumption rather than a silent one.
+
+🔴 **AND AF3's PROTEIN-ONLY FOLD IS UNMOVED.** `tools/gpu/fold.js` on a 40-mer:
+mean pLDDT **77.36664729240613** and pTM **0.5503883067518472**, which are this
+file's own recorded figures to every digit.
 
 🔴 **AND THE DIAL HAS TO STOP REPORTING WHEN THE LOAD DOES.** The tower STREAMS
 - its 36 blocks are read during the fold - so its store went on firing progress

@@ -26,6 +26,7 @@ import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { runTrunk } from "../../src/af3/trunk-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+import { CLASS_PROTEIN } from "../../src/heads/contact-threshold.js";
 
 const EVO = "diffuser/evoformer";
 const MSA = `${EVO}/__layer_stack_no_per_layer/msa_stack`;
@@ -334,6 +335,11 @@ async function main() {
   const trunkInput = {
     tokens,
     sequences,
+    // 🔴 EVERY TOKEN A PLAIN RESIDUE, WHICH IS AN ASSUMPTION AND IS STATED. This
+    // dump is protein-only, so `CLASS_PROTEIN` gives 8 A on every pair - the
+    // pseudo-beta convention, and the right one here. The head refuses to
+    // default it precisely so a ligand-bearing input cannot get 8 A silently.
+    contactClasses: new Int32Array(tokens).fill(CLASS_PROTEIN),
     targetFeat: buildTargetFeat(tensors, dump, tokens),
     // 🔴 CHECKED AS IT IS USED, not only in its own file. check_af3_template.js
     // passes AF3's captured pair and is exact; this passes the pair the trunk

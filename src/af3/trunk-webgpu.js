@@ -29,6 +29,7 @@ import { Af3MsaStackGpu } from "./msa-stack-webgpu.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
 import { Af3TemplateEmbedderGpu } from "./template-webgpu.js";
 import { GRID_WIDTH, PAIR_CHANNELS } from "./pair-track-gpu.js";
+import { af3ContactBins } from "./contact-classes.js";
 
 const NUM_BINS = 64;
 const FIRST_BREAK = 2.3125;
@@ -56,13 +57,6 @@ export function binEdges() {
  * extrapolated by one spacing rather than read from the array.
  */
 export function createDistogramShader(tokens, channels, offset) {
-  const contactBins = [];
-  const breaks = binEdges();
-  const spacing = breaks[breaks.length - 1] - breaks[breaks.length - 2];
-  for (let bin = 0; bin < NUM_BINS; bin += 1) {
-    const top = bin < NUM_BINS - 1 ? breaks[bin] : breaks[breaks.length - 1] + spacing;
-    contactBins.push(top <= CONTACT_THRESHOLD ? "1.0" : "0.0");
-  }
   return `
 const TOKENS: u32 = ${tokens}u;
 const PAIRS: u32 = ${tokens * tokens}u;
@@ -70,13 +64,17 @@ const CHANNELS: u32 = ${channels}u;
 const BINS: u32 = ${NUM_BINS}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const W_HALF: u32 = ${offset}u;
-const CONTACT = array<f32, ${NUM_BINS}>(${contactBins.join(", ")});
 
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> pair_mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
-@group(0) @binding(3) var<storage, read_write> logits: array<f32>;
-@group(0) @binding(4) var<storage, read_write> contact: array<f32>;
+// 🔴 HOW MANY BINS COUNT AS CONTACT IS PER PAIR, NOT A CONSTANT, because 8 A
+// is a pseudo-beta convention and AF3 tokenises ligands one heavy atom at a
+// time. See ../heads/contact-threshold.js; the bins are ordered, so a prefix
+// length says it.
+@group(0) @binding(3) var<storage, read> contact_bins: array<i32>;
+@group(0) @binding(4) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(5) var<storage, read_write> contact: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -102,10 +100,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   var sum = 0.0;
   var contact_total = 0.0;
+  let near_bins = u32(contact_bins[row]);
   for (var b = 0u; b < BINS; b += 1u) {
     let probability = exp(values[b] - largest);
     sum += probability;
-    contact_total += CONTACT[b] * probability;
+    if (b < near_bins) { contact_total += probability; }
   }
   contact[row] = pair_mask[row] * (contact_total / sum);
 }`;
@@ -204,7 +203,8 @@ export class Af3TrunkGpu {
     this.lastPairformerSplit = pairformer.split;
 
     const head = await stage("distogram",
-      () => this.#distogram(pairformer.pair, input.pairMask, tokens, weights.distogram));
+      () => this.#distogram(pairformer.pair, input.pairMask, tokens,
+                            weights.distogram, input.contactClasses));
 
     return {
       pair: pairformer.pair, single: pairformer.single, msa: msa.msa,
@@ -212,7 +212,7 @@ export class Af3TrunkGpu {
     };
   }
 
-  async #distogram(pair, pairMask, tokens, weights) {
+  async #distogram(pair, pairMask, tokens, weights, contactClasses) {
     const pairs = tokens * tokens;
     const packed = new Float32Array(weights.halfLogits.length);
     packed.set(weights.halfLogits, 0);
@@ -226,6 +226,14 @@ export class Af3TrunkGpu {
     try {
       const pairBuffer = keep(this.allocator.upload("af3-disto.pair", pair, storage));
       const maskBuffer = keep(this.allocator.upload("af3-disto.mask", pairMask, storage));
+      // 🔴 REQUIRED, NOT DEFAULTED. A caller with no classes would silently get
+      // 8 A everywhere back, which is the convention this exists to correct -
+      // and the failure would be a plausible contact map.
+      if (contactClasses === undefined || contactClasses.length !== tokens) {
+        throw new Error("the distogram head needs contactClasses, one per token");
+      }
+      const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
+        af3ContactBins(contactClasses, tokens, binEdges()), storage));
       const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
       const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * NUM_BINS * 4,
         storage | GPUBufferUsage.COPY_SRC));
@@ -242,7 +250,8 @@ export class Af3TrunkGpu {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
-        entries: [pairBuffer, maskBuffer, weightBuffer, logits, contact].map(
+        entries: [pairBuffer, maskBuffer, weightBuffer, binsBuffer,
+                  logits, contact].map(
           (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
       }));
       const groups = Math.ceil(pairs / 64);

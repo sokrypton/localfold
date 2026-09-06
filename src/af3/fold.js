@@ -26,6 +26,7 @@
  * were made with.
  */
 import { ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { af3ContactClasses } from "./contact-classes.js";
 import { perAtomConditioning } from "./atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
@@ -546,6 +547,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // one place to the left of everything after the first ligand.
       templateSlots: options.templateSlots,
       pairMask, seqMask, previousPair, previousSingle,
+      // 🔴 WHAT EACH TOKEN IS, so the distogram head can say what a contact
+      // means for it. Eight angstroms is a pseudo-beta convention and AF3
+      // tokenises a ligand one heavy atom at a time; see
+      // ../heads/contact-threshold.js.
+      contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.

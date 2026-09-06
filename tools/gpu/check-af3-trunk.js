@@ -19,6 +19,7 @@ import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { binEdges as binEdgesOf } from "../../src/af3/trunk-webgpu.js";
 import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { CLASS_PROTEIN } from "../../src/heads/contact-threshold.js";
 
 const DIALECT = { swapTransposedBias: false };
 
@@ -70,6 +71,11 @@ function buildInput(tokens, sequences, chains) {
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
+  // 🔴 EVERY TOKEN A PLAIN RESIDUE, WHICH IS AN ASSUMPTION AND IS STATED.
+  // This input is synthetic and protein-only, so `CLASS_PROTEIN` gives 8 A on
+  // every pair - the pseudo-beta convention, and the right one here. The head
+  // refuses to default it so a ligand-bearing input cannot get 8 A silently.
+  const contactClasses = new Int32Array(tokens).fill(CLASS_PROTEIN);
   const msaRows = new Int32Array(sequences * tokens);
   const deletionMatrix = new Float32Array(sequences * tokens);
   const msaMask = new Float32Array(sequences * tokens);
@@ -85,7 +91,7 @@ function buildInput(tokens, sequences, chains) {
     tokens, sequences, templates: 4,
     targetFeat: deterministic(tokens * 447, 11 + tokens),
     features: { residueIndex, tokenIndex: residueIndex, asymId, entityId, symId },
-    msaRows, deletionMatrix, msaMask, pairMask, seqMask,
+    msaRows, deletionMatrix, msaMask, pairMask, seqMask, contactClasses,
     previousPair: new Float32Array(tokens * tokens * 128),
     previousSingle: new Float32Array(tokens * 384),
   };

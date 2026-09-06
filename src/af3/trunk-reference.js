@@ -18,6 +18,7 @@ import { embed } from "./embedder-reference.js";
 import { msaBlock } from "./msa-reference.js";
 import { pairformerBlock } from "./pairformer-reference.js";
 import { linear } from "./pairformer-reference.js";
+import { af3ContactBins } from "./contact-classes.js";
 
 const FIRST_BREAK = 2.3125;
 const LAST_BREAK = 21.6875;
@@ -43,7 +44,8 @@ export function binEdges() {
  * does use a mean, and swapping the two silently sharpens or flattens every
  * contact probability.)
  */
-export function distogramHead(pair, pairMask, tokens, pairChannels, weights) {
+export function distogramHead(pair, pairMask, tokens, pairChannels, weights,
+                              contactClasses) {
   const half = linear(pair, tokens * tokens, pairChannels, NUM_BINS,
                       weights.halfLogits);
   const logits = new Float32Array(tokens * tokens * NUM_BINS);
@@ -61,12 +63,10 @@ export function distogramHead(pair, pairMask, tokens, pairChannels, weights) {
   // 8 A. The last bin's top is extrapolated by one spacing, since the 63 breaks
   // describe 64 bins and the final one is open-ended.
   const breaks = binEdges();
-  const spacing = breaks[breaks.length - 1] - breaks[breaks.length - 2];
-  const contactBin = new Float32Array(NUM_BINS);
-  for (let b = 0; b < NUM_BINS; b += 1) {
-    const top = b < NUM_BINS - 1 ? breaks[b] : breaks[breaks.length - 1] + spacing;
-    contactBin[b] = top <= CONTACT_THRESHOLD ? 1 : 0;
+  if (contactClasses === undefined || contactClasses.length !== tokens) {
+    throw new Error("the distogram head needs contactClasses, one per token");
   }
+  const contactBins = af3ContactBins(contactClasses, tokens, breaks);
 
   const contactProbs = new Float32Array(tokens * tokens);
   for (let index = 0; index < tokens * tokens; index += 1) {
@@ -80,7 +80,7 @@ export function distogramHead(pair, pairMask, tokens, pairChannels, weights) {
     for (let b = 0; b < NUM_BINS; b += 1) {
       const probability = Math.exp(logits[base + b] - largest);
       total += probability;
-      if (contactBin[b] === 1) contact += probability;
+      if (b < contactBins[index]) contact += probability;
     }
     contactProbs[index] = pairMask[index] * (contact / total);
   }
@@ -121,6 +121,7 @@ export function runTrunk(input, weights, dialect, onBlock) {
     pair: state.pair,
     single: state.single,
     ...distogramHead(state.pair, pairMask, tokens,
-                     weights.embedder.pairChannels, weights.distogram),
+                     weights.embedder.pairChannels, weights.distogram,
+                     input.contactClasses),
   };
 }
