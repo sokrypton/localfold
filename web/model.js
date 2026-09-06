@@ -43,13 +43,27 @@ const stores = new Map();
  * `?model=` overrides the monomer path, which is how a page is pointed at a
  * manifest somewhere else without editing it.
  *
+ * 🔴 AND THE SAME PARAMETER NAMES A FAMILY, WHICH IS TWO READERS OF ONE
+ * CONTROL. `applyModelFromUrl` in web/app.js takes `?model=` as the model row's
+ * value - `?model=af3`, `?model=ef2-fast-300m` - and this took it as a manifest
+ * URL whenever the family was monomer. So `?model=monomer`, which is the one
+ * spelling that reaches both, selected AlphaFold 2 and then fetched
+ * `https://localfold.org/monomer`, and the page said "failed to load model
+ * manifest: 404" for a model it had loaded a second earlier by dropdown.
+ *
+ * A path is what this override was for, so a path is what it now requires: a
+ * value with a slash in it, or one ending in `.json`. A bare family name is the
+ * other reader's.
+ *
  * @param {import("../src/reference/manifests/index.js").ModelFamily} family
  */
 export function openStore(onProgress, family = "monomer") {
   const bundle = MODEL_BUNDLES[family];
   if (bundle === undefined) throw new RangeError(`unknown model family ${family}`);
-  const override = family === "monomer"
+  const asked = family === "monomer"
     ? new URLSearchParams(location.search).get("model") : null;
+  const override = asked !== null && (asked.includes("/") || asked.endsWith(".json"))
+    ? asked : null;
   if (override !== null) return HttpTensorStore.open(override, onProgress);
   let store = stores.get(family);
   if (store === undefined) {

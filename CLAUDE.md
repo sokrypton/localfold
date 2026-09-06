@@ -3038,6 +3038,24 @@ forces it open under a 320px device override and asserts it is neither clipped
 nor sideways-scrolling and that its two buttons stack (measured 298px wide,
 buttons 260px, left 11px).
 
+🔴 **AND `?model=` HAD TWO READERS, WHICH IS WORSE THAN BEING IGNORED.**
+`applyModelFromUrl` takes it as the model row's value; `web/model.js` took it as
+a manifest URL whenever the family was monomer, which is how a page is pointed
+at weights somewhere else. `?model=monomer` is the one spelling that reaches
+both - it selected AlphaFold 2 and then fetched `<origin>/monomer`, so the live
+page said **"failed to load model manifest: 404"** for a model that folds
+perfectly well from the dropdown, at pLDDT 96.5. The override now requires a
+PATH - a slash, or a `.json` ending - because a path is what it was for; a bare
+family name belongs to the other reader.
+
+🔴 **AND IT WAS FOUND BY MISTAKING IT FOR SOMETHING ELSE.** The 404 appeared
+minutes after 129.8 MiB of `af2-monomer/*.js` were deleted from Hugging Face, on
+the one bundle those files belonged to, which is as convincing a coincidence as
+this repository has produced. The deletion was innocent - `ScriptTensorStore`
+reads `manifest.js` only under `file://`, and from the bundle's own directory,
+never from a remote - and folding monomer from the dropdown proved it. **A
+regression that appears next to a change is not evidence it came from it.**
+
 🔴 **AND A `?model=` THAT IS IGNORED LOOKS EXACTLY LIKE ONE THAT WORKED.** The
 complaint about an unknown name was written twice before it was visible: once
 before the vendored viewer's own "Ready." line overwrote it, and once before the

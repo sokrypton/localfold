@@ -256,3 +256,32 @@ describe("the licence dialog", () => {
     assert.doesNotMatch(dialog, /academic use only/i);
   });
 });
+
+describe("what ?model= means", () => {
+  // 🔴 ONE PARAMETER, TWO READERS. applyModelFromUrl takes `?model=` as the
+  // model row's value; web/model.js took it as a manifest URL whenever the
+  // family was monomer. `?model=monomer` is the one spelling that reaches both,
+  // and it selected AlphaFold 2 and then fetched `<origin>/monomer` - so the
+  // live page said "failed to load model manifest: 404" for a model it folds
+  // perfectly well from the dropdown. Found by folding it on the deployed site.
+  const model = readFileSync(new URL("../web/model.js", import.meta.url), "utf8");
+
+  it("treats a bare family name as a family, not a manifest URL", () => {
+    const open = model.slice(model.indexOf("export function openStore"));
+    const head = open.slice(0, open.indexOf("HttpTensorStore.open(override"));
+    assert.ok(head.includes('asked.includes("/")') && head.includes('.endsWith(".json")'),
+              "the override does not require a path, so a family name reaches it");
+  });
+
+  it("still allows the path form the override exists for", () => {
+    // A directory or a manifest, which is how a page is pointed at weights
+    // somewhere else without editing it.
+    const looksLikePath = (v) => v.includes("/") || v.endsWith(".json");
+    for (const v of ["./model/", "model/manifest.json", "https://example.org/m/"]) {
+      assert.ok(looksLikePath(v), `${v} should still override`);
+    }
+    for (const v of ["monomer", "multimer", "af3", "ef2-fast-300m"]) {
+      assert.ok(!looksLikePath(v), `${v} should be read as a family`);
+    }
+  });
+});
