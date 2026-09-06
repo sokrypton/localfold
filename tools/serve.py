@@ -1,45 +1,40 @@
 #!/usr/bin/env python3
-"""Serve the checkout for development, with caching turned off.
+"""Serve the checkout with caching turned off.
 
-    python3 tools/serve.py            # http://127.0.0.1:8000
-    python3 tools/serve.py 8402       # ...on another port
+    python3 tools/serve.py [port]
 
-🔴 WHY NOT `python3 -m http.server`. Its responses are cacheable, and a browser
-holding an old copy of web/app.js is indistinguishable from a change that did
-not work. That has now cost three wrong conclusions in one sitting: a flag that
-looked unwired, a dropdown that looked inert, and a fold reported 8 pLDDT lower
-than the code actually produces. Each time the code was already correct and the
-page was not running it.
+🔴 `python3 -m http.server` SENDS NO CACHE HEADERS, AND THAT LOOKS EXACTLY LIKE
+A BROKEN FEATURE. Chrome caches `web/app.js` and every other ES module
+heuristically, and `location.reload()` does not refetch them - so a change lands,
+the page is reloaded, nothing happens, and the code looks wrong. Three separate
+sessions have lost time to it, and `tools/fold-in-page.py` never reproduces it
+because it launches a fresh profile every run: the tool passes while the browser
+in front of you does not.
 
-The workaround was to restart on a fresh port, which changes every module URL.
-That works and is easy to forget, so this sends no-store instead: every reload
-re-fetches, and a reload is enough to see an edit.
+This sends `Cache-Control: no-store` on everything, which is the one header that
+makes a reload a refetch.
 
-Static files only, bound to the loopback address. Not a production server.
+🔴 EXCEPT THE WEIGHTS, WHICH MUST STILL CACHE. A model bundle is 346 MiB and
+re-downloading it on every reload would make the page unusable to develop
+against - which is the opposite of the problem this solves. Shards are served
+with a long max-age instead; they are content-addressed by the manifest and a
+re-export changes their names.
 """
 import functools
 import http.server
 import socketserver
 import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+# Anything a fold streams rather than something a developer edits.
+CACHEABLE = (".bin", ".safetensors", ".zst", ".gz")
 
 
-# 🔴 THE WEIGHTS ARE EXEMPT. no-store on everything means a 97 MiB model is
-# re-fetched on every reload, which turned a twelve-second experiment into a
-# two-minute one and made the page look hung. Weight shards are content that
-# never changes without its manifest changing, so they cache; the code does not.
-CACHEABLE = ("/model/", "/model-multimer/")
-
-
-class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
+class Handler(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
-        if any(self.path.startswith(prefix) for prefix in CACHEABLE):
-            # 🔴 REVALIDATE, DO NOT JUST CACHE. A flat max-age served stale
-            # shards after the model was re-exported, and the reader failed with
-            # "invalid byte length" rather than anything about caching.
-            # no-cache still lets the browser keep the bytes - it just has to
-            # ask first, and Last-Modified turns that into a 304 when nothing
-            # changed, so a 97 MiB model is not re-fetched on every reload.
-            self.send_header("Cache-Control", "no-cache")
+        if self.path.split("?")[0].endswith(CACHEABLE):
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         else:
             self.send_header("Cache-Control", "no-store, must-revalidate")
             self.send_header("Pragma", "no-cache")
@@ -47,23 +42,23 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def log_message(self, fmt, *args):
-        # ...errors only. A fold pulls hundreds of weight shards and the log
-        # buries anything worth reading.
-        if not args or str(args[1]).startswith("2"):
-            return
-        super().log_message(fmt, *args)
+        # ...only failures, so a fold's thousands of shard reads do not bury them.
+        if not args or not str(args[1] if len(args) > 1 else "").startswith(("2", "3")):
+            super().log_message(fmt, *args)
 
 
 def main() -> int:
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    handler = functools.partial(NoCacheHandler, directory=".")
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", port), handler) as server:
-        print(f"serving . at http://127.0.0.1:{port}/  (no-store; reload picks up edits)")
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    handler = functools.partial(Handler, directory=str(ROOT))
+    with socketserver.ThreadingTCPServer(("127.0.0.1", port), handler) as httpd:
+        print(f"serving {ROOT} at http://127.0.0.1:{port}/index.html")
+        print("  modules: no-store, so a plain reload picks up an edit")
+        print(f"  weights: cached for a year ({', '.join(CACHEABLE)})")
         try:
-            server.serve_forever()
+            httpd.serve_forever()
         except KeyboardInterrupt:
-            print()
+            pass
     return 0
 
 

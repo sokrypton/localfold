@@ -500,6 +500,13 @@ each checks every arm's output against the first, because a tile the dispatch
 does not match leaves rows unprocessed and reads as a speedup. Tune with those;
 confirm with `bench-trunk.js`.
 
+🔴 **SO USE `python3 tools/serve.py` AND NOT `python3 -m http.server`.** It
+sends `Cache-Control: no-store` on everything a developer edits and a year's
+`max-age` on the weight shards, which are the one thing that must still cache -
+a bundle is 346 MiB and re-downloading it per reload is the opposite problem.
+The rest of this entry is what happens without it, and it cost three separate
+sessions before the server existed.
+
 🔴 **A PLAIN RELOAD SERVES CACHED ES MODULES, AND THAT LOOKS EXACTLY LIKE A
 BROKEN FEATURE.** `python3 -m http.server` sends no cache headers, so Chrome
 caches `web/app.js`, `src/af3/fold.js` and every other module heuristically -
