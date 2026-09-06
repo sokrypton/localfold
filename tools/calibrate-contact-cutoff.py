@@ -120,12 +120,12 @@ def tokenise(atoms, rule="localfold"):
             else:
                 pick = names.get("CB") or names.get("CA") or group[0]
             tokens.append({"kind": kind, "chain": chain, "seq": seq,
-                           "molecule": (chain, seq),
+                           "comp": comp, "molecule": (chain, seq),
                            "rep": pick["xyz"], "atoms": [a["xyz"] for a in group]})
         else:
             for atom in group:
                 tokens.append({"kind": "ligand", "chain": chain, "seq": seq,
-                               "molecule": (chain, seq),
+                               "comp": comp, "molecule": (chain, seq),
                                "rep": atom["xyz"], "atoms": [atom["xyz"]]})
     return tokens
 
@@ -143,6 +143,115 @@ def pair_kind(a, b):
     if a["kind"] == b["kind"] == "ligand":
         return "ligand-intra" if a["molecule"] == b["molecule"] else "ligand-inter"
     return "-".join(sorted((a["kind"], b["kind"])))
+
+
+def by_residue(entries, truth, thresholds, rule, holdout=False):
+    """The ligand-protein threshold, per amino acid.
+
+    🔴 ONE NUMBER CANNOT SERVE EVERY RESIDUE, because the representative stands
+    at a different depth in each. The ground truth is the pair the question is
+    actually about - ANY heavy atom of the residue, side chain included, within
+    `truth` of the ligand's atom - and the predictor is the one distance a
+    distogram gives: pseudo-beta to that atom.
+    """
+    # 🔴 FITTED AND SCORED ON THE SAME ROWS IS NOT A RESULT. Twenty thresholds
+    # over 6000 contacts is mild, but "per residue beats one number" is exactly
+    # the claim that free parameters manufacture. `--holdout` fits on half the
+    # entries and scores on the other half, which is the arm that means
+    # something.
+    fit_counts = {}
+    counts = {}
+    reach = {}
+    for at, entry in enumerate(entries):
+        try:
+            tokens = tokenise(atom_site(fetch(entry)), rule)
+        except Exception as error:                       # noqa: BLE001
+            print(f"  {entry}: skipped ({error})", file=sys.stderr)
+            continue
+        ligands = [t for t in tokens if t["kind"] == "ligand"]
+        residues = [t for t in tokens if t["kind"] == "protein"]
+        for residue in residues:
+            for atom in ligands:
+                separation = distance(residue["rep"], atom["rep"])
+                if separation > 25:
+                    continue
+                closest = min(distance(p, atom["rep"]) for p in residue["atoms"])
+                target = (fit_counts if holdout and at % 2 == 0 else counts)
+                bucket = target.setdefault(residue["comp"],
+                                           {t: [0, 0, 0] for t in thresholds})
+                if closest < truth:
+                    reach.setdefault(residue["comp"], []).append(separation)
+                for t in thresholds:
+                    cell = bucket[t]
+                    if separation < t:
+                        cell[0] += 1
+                    if closest < truth:
+                        cell[1] += 1
+                    if separation < t and closest < truth:
+                        cell[2] += 1
+    print(f"\nligand-protein, per residue: pseudo-beta to the ligand atom, "
+          f"against any heavy atom within {truth} A\n")
+    print(f"{'res':>4} {'contacts':>9} {'best':>6} {'F1':>6} {'prec':>6} {'rec':>6}"
+          f" {'reach p50':>10} {'p95':>6}")
+    rows = []
+    for comp in sorted(counts):
+        best = None
+        for t in thresholds:
+            called, real, both = counts[comp][t]
+            precision = both / called if called else 0.0
+            recall = both / real if real else 0.0
+            f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+            if best is None or f1 > best[1]:
+                best = (t, f1, precision, recall)
+        seen = sorted(reach.get(comp, []))
+        if not seen:
+            continue
+        median = seen[len(seen) // 2]
+        p95 = seen[int(len(seen) * 0.95)]
+        rows.append((comp, len(seen), *best, median, p95))
+    for comp, n, t, f1, precision, recall, median, p95 in sorted(
+            rows, key=lambda r: -r[6]):
+        print(f"{comp:>4} {n:>9} {t:>6} {f1:>6.3f} {precision:>6.3f} {recall:>6.3f}"
+              f" {median:>10.2f} {p95:>6.2f}")
+
+    # 🔴 POOLED, because twenty per-residue F1 scores do not say whether a table
+    # beats one number - each is fitted on its own rows, so every one of them is
+    # at least as good as the global arm by construction. What settles it is the
+    # confusion matrix over ALL pairs, with the per-residue thresholds applied.
+    best_per_residue = {row[0]: row[2] for row in rows}
+    if holdout:
+        # ...refit on the held-OUT half and score on the other, so no threshold
+        # has seen the rows it is judged on.
+        best_per_residue = {}
+        for comp, bucket in fit_counts.items():
+            best = None
+            for t in thresholds:
+                called, real, both = bucket[t]
+                precision = both / called if called else 0.0
+                recall = both / real if real else 0.0
+                f1 = 0.0 if precision + recall == 0 else \
+                    2 * precision * recall / (precision + recall)
+                if best is None or f1 > best[1]:
+                    best = (t, f1)
+            best_per_residue[comp] = best[0]
+        print("\n(thresholds fitted on the other half of the entries)")
+    print(f"\n{'rule':>22} {'called':>8} {'both':>8} {'prec':>7} {'rec':>7} {'F1':>7}")
+    arms = [(f"one threshold, {t} A", {comp: t for comp in counts})
+            for t in thresholds]
+    arms.append(("per residue", best_per_residue))
+    for name, table in arms:
+        called = both = real = 0
+        for comp, bucket in counts.items():
+            cell = bucket[table.get(comp, thresholds[0])]
+            called += cell[0]
+            real += cell[1]
+            both += cell[2]
+        precision = both / called if called else 0.0
+        recall = both / real if real else 0.0
+        f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+        print(f"{name:>22} {called:>8} {both:>8} {precision:>7.3f} {recall:>7.3f}"
+              f" {f1:>7.3f}")
+    return rows
 
 
 def measure(entries, truth, thresholds, rule):
@@ -194,6 +303,10 @@ def measure(entries, truth, thresholds, rule):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--entries", default=",".join(ENTRIES))
+    parser.add_argument("--holdout", action="store_true",
+                        help="fit the per-residue thresholds on half the entries")
+    parser.add_argument("--by-residue", action="store_true",
+                        help="the ligand-protein threshold, per amino acid")
     parser.add_argument("--representative", default="localfold",
                         choices=["localfold", "af3"],
                         help="CB/CA/first, or AF3's CA and C1' token centres")
@@ -201,6 +314,10 @@ def main():
                         help="heavy-atom distance that IS a contact")
     args = parser.parse_args()
     thresholds = [4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
+    if args.by_residue:
+        by_residue(args.entries.split(","), args.truth, thresholds,
+                   args.representative, args.holdout)
+        return
     counts = measure(args.entries.split(","), args.truth, thresholds,
                      args.representative)
     print(f"\nground truth: any heavy atom within {args.truth} A\n")

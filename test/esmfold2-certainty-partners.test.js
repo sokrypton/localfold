@@ -21,7 +21,8 @@
 // the certainty vector IDENTICAL to every digit, before and after.
 import { describe, expect, it } from "./harness.js";
 import {
-  CERTAINTY, createCertaintyShader, partnerKeys,
+  CERTAINTY, contactAngstromsFor, contactBinCountsByPair, createCertaintyShader,
+  partnerKeys,
 } from "../src/esmfold2/distogram-webgpu.js";
 
 describe("the certainty's partner rule", () => {
@@ -70,5 +71,48 @@ describe("the certainty's partner rule", () => {
     expect(wgsl).toContain("here.x == there.x");
     expect(wgsl).toContain("abs(here.y - there.y) <= 3");
     expect(wgsl.includes("other > token")).toBe(false);
+  });
+});
+
+describe("the contact threshold", () => {
+  const protein = 0, dna = 1, ligand = 3;
+  const ALA = 2, ARG = 3, GLY = 9, TRP = 19;
+
+  it("is the pseudo-beta convention between two residues, and only there", () => {
+    expect(contactAngstromsFor(protein, protein, ALA, ARG)).toBe(8);
+    expect(contactAngstromsFor(dna, protein, 0, ALA)).toBe(10);
+    expect(contactAngstromsFor(dna, dna, 0, 0)).toBe(9);
+    // 🔴 TWO LIGAND ATOMS ARE EXACT, not approximate: the representative IS the
+    // heavy atom, so 5 A is the definition of contact rather than a proxy for
+    // it. That holds inside one molecule and between two.
+    expect(contactAngstromsFor(ligand, ligand, 0, 0)).toBe(5);
+  });
+
+  it("asks the residue, when one end is a ligand", () => {
+    // Ordered by how far the side chain reaches past its own pseudo-beta -
+    // measured, not assumed; see tools/calibrate-contact-cutoff.py.
+    expect(contactAngstromsFor(ligand, protein, 0, GLY)).toBe(5);
+    expect(contactAngstromsFor(ligand, protein, 0, ALA)).toBe(5);
+    expect(contactAngstromsFor(ligand, protein, 0, TRP)).toBe(7);
+    expect(contactAngstromsFor(ligand, protein, 0, ARG)).toBe(8);
+    // ...and either way round, because a pair has no order.
+    expect(contactAngstromsFor(protein, ligand, ARG, 0)).toBe(8);
+  });
+
+  it("falls back to the kind's number for a residue it does not know", () => {
+    // An unknown or modified residue, and the nucleotides, have no side chain
+    // in the table - guessing one would be a claim.
+    expect(contactAngstromsFor(ligand, protein, 0, 22)).toBe(7);
+  });
+
+  it("gives every pair a bin count, and a ligand pair fewer", () => {
+    const molType = Int32Array.from([protein, protein, ligand, ligand]);
+    const residueType = Int32Array.from([ARG, GLY, 0, 0]);
+    const counts = contactBinCountsByPair(molType, residueType, 4, 128);
+    expect(counts.length).toBe(16);
+    const at = (i, j) => counts[i * 4 + j];
+    expect(at(0, 1)).toBeGreaterThan(at(2, 3));      // 8 A against 5 A
+    expect(at(0, 2)).toBeGreaterThan(at(1, 2));      // ARG reaches, GLY does not
+    expect(at(0, 2)).toBe(at(2, 0));
   });
 });

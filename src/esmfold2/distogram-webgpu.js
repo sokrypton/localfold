@@ -19,6 +19,7 @@
  * reported distance would not be.
  */
 import { GRID_WIDTH, LANES, createLinearShader, linearGrid } from "../esmc/block-webgpu.js";
+import { AATYPE_CLASSES } from "./featurise.js";
 
 /** Borrowed from the disabled confidence head's own 128 bins. See above. */
 export const CONTACT_EDGES = { minimum: 2, maximum: 52 };
@@ -60,6 +61,60 @@ export const CONTACT_ANGSTROMS_BY_KIND = {
   "nucleic-nucleic": 9, "ligand-nucleic": 7, "ligand-ligand": 5,
 };
 
+/**
+ * ...and for a ligand against a RESIDUE, per residue, because one number cannot
+ * serve twenty side chains.
+ *
+ * 🔴 THE REPRESENTATIVE STANDS AT A DIFFERENT DEPTH IN EACH RESIDUE. A ligand
+ * touching a tryptophan ring is far from that residue's CB; an alanine's
+ * heavy atoms barely reach past it. `--by-residue` measures the reach directly
+ * - the median pseudo-beta-to-ligand distance among pairs that really are in
+ * contact - and it runs 4.26 A at cysteine to 7.28 A at arginine, monotonic in
+ * side-chain length, with the best threshold tracking it 5 A to 8 A.
+ *
+ * Pooled over every ligand-protein pair in the set, against the best single
+ * threshold there is:
+ *
+ * | rule | precision | recall | F1 |
+ * |---|---|---|---|
+ * | one threshold, 6 A | 0.819 | 0.586 | 0.683 |
+ * | one threshold, 7 A | 0.631 | 0.803 | 0.707 |
+ * | one threshold, 8 A | 0.458 | 0.932 | 0.614 |
+ * | **per residue** | **0.740** | **0.824** | **0.780** |
+ *
+ * It DOMINATES rather than trading, which is what says the residues really do
+ * want different numbers. And `--holdout` fits the table on half the entries
+ * and scores it on the other half - 0.771 against the best single arm's 0.694
+ * there - because "twenty free parameters beat one" is exactly the claim free
+ * parameters manufacture.
+ *
+ * 🔴 AND ANY THRESHOLD AT OR UNDER 5 A IS PERFECTLY PRECISE FOR FREE, because
+ * the representative IS one of the residue's own heavy atoms - so a
+ * representative within 5 A of the ligand atom means the ground truth holds by
+ * construction. Glycine and alanine reading precision 1.000 is that, not a
+ * measurement of the model. The whole question here is how much RECALL a
+ * residue's side chain lets you buy before precision goes.
+ */
+export const LIGAND_PROTEIN_ANGSTROMS = {
+  ALA: 5, ARG: 8, ASN: 7, ASP: 7, CYS: 6, GLN: 7, GLU: 7, GLY: 5, HIS: 8,
+  ILE: 6, LEU: 7, LYS: 7, MET: 8, PHE: 8, PRO: 6, SER: 6, THR: 6, TRP: 7,
+  TYR: 8, VAL: 6,
+};
+
+/**
+ * ESMFold2's residue indices are three-letter alphabetical from 2, so this is
+ * the same table by index - and the order is asserted, not assumed, because a
+ * silently permuted alphabet is the failure this repository has met before.
+ */
+const LIGAND_PROTEIN_BY_RESIDUE = (() => {
+  const order = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
+    "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"];
+  const table = new Float32Array(AATYPE_CLASSES)
+    .fill(CONTACT_ANGSTROMS_BY_KIND["ligand-protein"]);
+  order.forEach((name, at) => { table[at + 2] = LIGAND_PROTEIN_ANGSTROMS[name]; });
+  return table;
+})();
+
 /** protein 0 and 3 for a ligand, as `molType` numbers them. */
 const KIND_NAME = ["protein", "nucleic", "nucleic", "ligand"];
 
@@ -72,19 +127,35 @@ const KIND_NAME = ["protein", "nucleic", "nucleic", "ligand"];
  * no shader arithmetic and no second dispatch; it costs one int per pair, which
  * is the size of the contact map it is computing.
  */
-export function contactBinCountsByPair(molType, tokens, bins,
+/**
+ * The threshold one pair asks for, given both ends' kinds and residue types.
+ *
+ * 🔴 ONE FUNCTION, BECAUSE A METRIC'S TWO HALVES MUST ASK THE SAME QUESTION. A
+ * checker computing "actual" at 8 A against a map computing "predicted" at 7
+ * reports a precision about nothing.
+ */
+export function contactAngstromsFor(molTypeI, molTypeJ, residueTypeI, residueTypeJ) {
+  const a = KIND_NAME[molTypeI] ?? "protein";
+  const b = KIND_NAME[molTypeJ] ?? "protein";
+  if (a === "ligand" && b === "protein") return LIGAND_PROTEIN_BY_RESIDUE[residueTypeJ];
+  if (b === "ligand" && a === "protein") return LIGAND_PROTEIN_BY_RESIDUE[residueTypeI];
+  return CONTACT_ANGSTROMS_BY_KIND[[a, b].sort().join("-")] ?? CONTACT_ANGSTROMS;
+}
+
+export function contactBinCountsByPair(molType, residueType, tokens, bins,
                                        edges = CONTACT_EDGES) {
   const cache = new Map();
+  const binsFor = (angstroms) => {
+    if (!cache.has(angstroms)) {
+      cache.set(angstroms, contactBinCount(bins, edges, angstroms));
+    }
+    return cache.get(angstroms);
+  };
   const out = new Int32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) {
-      const kind = [KIND_NAME[molType[i]] ?? "protein",
-                    KIND_NAME[molType[j]] ?? "protein"].sort().join("-");
-      if (!cache.has(kind)) {
-        cache.set(kind, contactBinCount(bins, edges,
-          CONTACT_ANGSTROMS_BY_KIND[kind] ?? CONTACT_ANGSTROMS));
-      }
-      out[i * tokens + j] = cache.get(kind);
+      out[i * tokens + j] = binsFor(contactAngstromsFor(
+        molType[i], molType[j], residueType[i], residueType[j]));
     }
   }
   return out;
@@ -404,7 +475,8 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  * @returns {Float32Array} one probability per token pair
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
-                                                  weights, bias, partners, molType,
+                                                  weights, bias, partners,
+                                                  molType, residueType,
                                                   chunk = 8192,
                                                   wantLogits = false,
                                                   retainForFrames = false }) {
@@ -478,11 +550,12 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     }
     const partnerBuffer = keep(allocator.upload("esmfold2.disto.partners",
       partners, storage));
-    if (molType === undefined || molType.length !== tokens) {
-      throw new Error("encodeContactMap needs molType, one per token");
+    if (molType === undefined || molType.length !== tokens
+        || residueType === undefined || residueType.length !== tokens) {
+      throw new Error("encodeContactMap needs molType and residueType per token");
     }
     const binCounts = keep(allocator.upload("esmfold2.disto.contact-bins",
-      contactBinCountsByPair(molType, tokens, bins), storage));
+      contactBinCountsByPair(molType, residueType, tokens, bins), storage));
     await submit("esmfold2.distogram", [
       ["symmetrise", symmetrise, [pair, symmetric], ...elementwise(pairs * channels)],
     ]);

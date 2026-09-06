@@ -2171,6 +2171,42 @@ are in one molecule or two; **what differs between intra and inter is what the
 number MEANS**, not where the line sits. Inside a molecule the geometry came
 from the CCD conformer the model was HANDED, so a prediction there is a copy.
 
+🔴 **AND ONE NUMBER CANNOT SERVE TWENTY SIDE CHAINS, WHICH IS THE OTHER HALF OF
+THE SAME POINT.** The representative stands at a different DEPTH in each
+residue: a ligand touching a tryptophan ring is far from that CB, an alanine's
+heavy atoms barely reach past it. `--by-residue` measures the reach - the median
+pseudo-beta-to-ligand distance among pairs that really are in contact - and it
+runs **4.26 A at cysteine to 7.28 A at arginine**, monotonic in side-chain
+length, with the best threshold tracking it 5 A to 8 A. Pooled over every
+ligand-protein pair:
+
+| rule | precision | recall | F1 |
+|---|---|---|---|
+| one threshold, 6 A | 0.819 | 0.586 | 0.683 |
+| one threshold, 7 A | 0.631 | 0.803 | 0.707 |
+| one threshold, 8 A | 0.458 | 0.932 | 0.614 |
+| **per residue** | **0.740** | **0.824** | **0.780** |
+
+It DOMINATES rather than trading, which is what says the residues really do want
+different numbers. `LIGAND_PROTEIN_ANGSTROMS` is that table.
+
+🔴 **AND IT IS HELD OUT, BECAUSE "TWENTY FREE PARAMETERS BEAT ONE" IS WHAT FREE
+PARAMETERS MANUFACTURE.** `--holdout` fits the thresholds on half the entries
+and scores them on the other half: **0.771 against the best single arm's
+0.694**, barely below the fitted 0.780. Fitting and scoring on the same rows
+would have been no result at all.
+
+🔴 **AND ANY THRESHOLD AT OR UNDER 5 A IS PERFECTLY PRECISE FOR FREE**, because
+the representative IS one of the residue's own heavy atoms - so a representative
+within 5 A of the ligand atom satisfies the ground truth by construction.
+Glycine and alanine reading precision 1.000 is that, not a measurement of
+anything. The whole question is how much RECALL a side chain lets you buy before
+precision goes.
+
+🔴 **AND `contactAngstromsFor` IS ONE FUNCTION FOR BOTH HALVES OF A METRIC.** A
+checker computing "actual" at 8 A against a map computing "predicted" at 7
+reports a precision about nothing, and the two halves live in different files.
+
 🔴 **AND A NUCLEOTIDE'S REPRESENTATIVE WAS ITS PHOSPHORUS, WHICH COST A FACTOR
 OF SIX.** `representativeAtoms` was CB, else CA, else the token's first atom - and
 a nucleotide has neither, so it took whatever came first. Across a duplex the

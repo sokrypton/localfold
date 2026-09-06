@@ -31,7 +31,7 @@ import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
 import {
-  CONTACT_ANGSTROMS, CONTACT_ANGSTROMS_BY_KIND, CONTACT_EDGES,
+  CONTACT_EDGES, contactAngstromsFor,
 } from "../../src/esmfold2/distogram-webgpu.js";
 
 const option = (args, name, fallback) => {
@@ -311,8 +311,9 @@ export async function main(device, args = []) {
   // ...and the OBSERVED side takes the same per-kind threshold the contact map
   // does, or the two halves of a precision are answering different questions.
   const KIND = ["protein", "nucleic", "nucleic", "ligand"];
-  const cutoff = (i, j) => CONTACT_ANGSTROMS_BY_KIND[
-    [KIND[molType[i]], KIND[molType[j]]].sort().join("-")] ?? CONTACT_ANGSTROMS;
+  const { residueType } = result.features;
+  const cutoff = (i, j) => contactAngstromsFor(molType[i], molType[j],
+                                               residueType[i], residueType[j]);
   if (result.contacts !== undefined) {
     for (let atom = 0; atom < result.atoms; atom += 1) {
       if (result.features.mask[atom] === 0) continue;
@@ -339,7 +340,9 @@ export async function main(device, args = []) {
     const bucketFor = (i, j) => {
       const name = [KIND[molType[i]], KIND[molType[j]]].sort().join("-");
       if (kinds[name] === undefined) {
-        kinds[name] = { cutoff: cutoff(i, j), predicted: 0, actual: 0, both: 0 };
+        // ...no `cutoff` field: a ligand-protein pair's threshold is the
+        // RESIDUE's, so one number here would be whichever pair came first.
+        kinds[name] = { predicted: 0, actual: 0, both: 0 };
       }
       return kinds[name];
     };
