@@ -35,10 +35,33 @@ describe("the AlphaFold 3 families", () => {
   // the shard cache and the site build all reach it by name - and it is a
   // language model, so offering it in the model picker would be offering it as
   // a structure predictor.
-  it("offers each of them in the model row", () => {
+  // 🔴 AND REACHABLE IS NOT THE SAME AS "IN THE MODEL ROW", SINCE EF2-fast SHIPS
+  // AS TWO CHECKPOINTS UNDER ONE ENTRY. They differ only in the language model
+  // they were trained against, so the PLM row picks between them and the model
+  // row shows one name - see PLM_FAMILIES in web/app.js. What must stay true is
+  // that every folding family is reachable from SOMEWHERE, or it is a bundle
+  // the site publishes and nobody can fold with.
+  it("makes each of them reachable from a control", () => {
+    const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));
+    const table = variants.slice(0, variants.indexOf("};"));
     for (const family of FOLDING_FAMILIES) {
-      assert.match(page, new RegExp(`<option value="${family}"`),
-        `index.html does not offer ${family}`);
+      const inRow = new RegExp(`<option value="${family}"`).test(page);
+      const inVariants = table.includes(`"${family}"`);
+      assert.ok(inRow || inVariants,
+        `${family} is offered by no control in index.html or PLM_FAMILIES`);
+    }
+  });
+
+  // ...and every family a control names has to exist, which is the other
+  // direction: a dropdown offering a family with no bundle fails at load.
+  it("names no family it does not have", () => {
+    const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));
+    for (const [, family] of variants.slice(0, variants.indexOf("};"))
+        .matchAll(/"(ef2-[\w-]+)"/g)) {
+      assert.ok(FOLDING_FAMILIES.includes(family),
+        `PLM_FAMILIES names ${family}, which is not a folding family`);
     }
   });
 });
@@ -95,8 +118,13 @@ describe("what a fold is called", () => {
     // ...and an empty list is a page nobody has typed into yet, where the
     // likeliest next thing is a protein - so it fetches.
     assert.ok(decision.includes("typed.length === 0"), "an empty list must fetch");
-    assert.ok(preload.includes("{ languageModel: needsLanguageModel }"),
+    // ...matched as two facts rather than one literal, because the call also
+    // carries the family now and a one-line pattern breaks on the wrapping.
+    const call = preload.slice(preload.indexOf("loadEsmfold2Weights"));
+    assert.ok(call.slice(0, 200).includes("languageModel: needsLanguageModel"),
               "the decision does not reach the loader");
+    assert.ok(call.slice(0, 200).includes("family"),
+              "the loader is not told which checkpoint to load");
   });
 
   it("gives every model its own stem, so two folds are told apart", () => {

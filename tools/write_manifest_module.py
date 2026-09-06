@@ -96,6 +96,18 @@ BUNDLES = {
         "module": "src/reference/manifests/esmc.js",
         "model": "esmc",
     },
+    # The same folding model against ESM-C 300M - a SEPARATE checkpoint, since
+    # its shim is trained for 30 layers x 960 against the 600M's 36 x 1152.
+    "ef2-fast-300m": {
+        "export": "model-ef2-fast-300m-int5",
+        "module": "src/reference/manifests/ef2-fast-300m.js",
+        "model": "esmfold2-trunk",
+    },
+    "esmc-300m": {
+        "export": "model-esmc-300m-int3",
+        "module": "src/reference/manifests/esmc-300m.js",
+        "model": "esmc",
+    },
 }
 
 

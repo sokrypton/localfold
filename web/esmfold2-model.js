@@ -22,7 +22,7 @@
  * else's server for no reason.
  */
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
-import { bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
@@ -99,19 +99,35 @@ export function actualSteps(preset) {
     churnFactors(schedule, settings.gammaMin, settings.gamma0)).length;
 }
 
-let weightsPromise;
+const weightsPromises = new Map();
 
 /**
  * 🔴 MEMOISED, AND KEYED ON NOTHING, BECAUSE THERE IS ONE OF THESE. AF3's
  * loader is a Map keyed by family because two bundles build that graph and the
  * first version handed the second family the first one's weights. There is one
- * ESMFold2 bundle; if a second appears, this becomes a Map on the same day.
+ * ESMFold2 bundle; a second has appeared, so this is a Map.
+ *
+ * 🔴 KEYED BY FAMILY, BECAUSE A SECOND CHECKPOINT IS MISTAKEN FOR THE FIRST IN
+ * A CACHE AND NOT IN A LOADER. `loadAf3Weights` memoised ONE promise and the
+ * second family's fold got the first family's weights; the shapes agree, so
+ * nothing errors. EF2-fast's two pairs have the same trunk shapes and different
+ * shims, which is the same trap one model over.
  */
-export function loadEsmfold2Weights(onProgress, { languageModel = true } = {}) {
-  if (weightsPromise !== undefined) return weightsPromise;
-  weightsPromise = (async () => {
+export function loadEsmfold2Weights(onProgress,
+                                    { languageModel = true,
+                                      family = "ef2-fast-600m" } = {}) {
+  const memo = weightsPromises.get(family);
+  if (memo !== undefined) return memo;
+  const promise = (async () => {
+    // 🔴 THE COMPANION IS READ FROM THE REGISTRY, NOT WRITTEN DOWN HERE. A
+    // folding bundle names the tower whose shim belongs to it, so a third pair
+    // - ESM-C 6B is published too - is a registry entry rather than a branch.
+    const tower = MODEL_BUNDLES[family]?.companion;
+    if (tower === undefined) {
+      throw new Error(`${family} names no language model bundle`);
+    }
     const [foldManifest, towerManifest] = await Promise.all([
-      loadManifest("ef2-fast-600m"), loadManifest("esmc"),
+      loadManifest(family), loadManifest(tower),
     ]);
     // 🔴 THE SHIM IS PER FOLDING MODEL AND THE ARTEFACTS SAY SO. A tower is
     // interchangeable between releases and a shim is not, so a pairing that
@@ -144,13 +160,13 @@ export function loadEsmfold2Weights(onProgress, { languageModel = true } = {}) {
       onProgress?.({ ...(seen.get(key) ?? {}), loadedBytes, totalBytes });
     };
     const [foldStore, towerStore] = await Promise.all([
-      HttpTensorStore.fromManifest(bundleBaseUrl("ef2-fast-600m"), foldManifest,
+      HttpTensorStore.fromManifest(bundleBaseUrl(family), foldManifest,
                                    report("fold")),
       // 🔴 AND ITS PROGRESS IS NOT REGISTERED WHEN IT IS NOT BEING FETCHED, or
       // the dial promises 346 MiB and stops at a third of it. The reporter sums
       // `totalBytes` across both stores, so a store that never downloads has to
       // be absent from the sum rather than merely idle.
-      HttpTensorStore.fromManifest(bundleBaseUrl("esmc"), towerManifest,
+      HttpTensorStore.fromManifest(bundleBaseUrl(tower), towerManifest,
                                    languageModel ? report("tower") : undefined),
     ]);
     foldStore.prefetch();
@@ -227,7 +243,8 @@ export function loadEsmfold2Weights(onProgress, { languageModel = true } = {}) {
       },
     };
   })();
-  return weightsPromise;
+  weightsPromises.set(family, promise);
+  return promise;
 }
 
 /**

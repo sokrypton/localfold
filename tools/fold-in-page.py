@@ -161,7 +161,8 @@ def main():
     # 🔴 EF2-fast's OWN "single sequence". Its evolutionary information comes
     # from a protein language model rather than an alignment, so turning ESM-C
     # off is the same ablation `--msa-mode none` is for the other models.
-    parser.add_argument("--plm", default="esmc", choices=["esmc", "none"])
+    parser.add_argument("--plm", default="esmc-600m",
+                        choices=["esmc-600m", "esmc-300m", "none"])
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")

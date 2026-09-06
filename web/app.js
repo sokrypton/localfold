@@ -303,7 +303,21 @@ function reportModelFromUrl(attempt = 0) {
   modelFromUrlProblem = undefined;
 }
 
-const chosenFamily = () => document.getElementById("model-family")?.value ?? "af3";
+/**
+ * The family this page will fold with.
+ *
+ * 🔴 THE MODEL ROW IS NOT ALWAYS THE WHOLE ANSWER. EF2-fast ships as two
+ * checkpoints that differ only in the language model they were trained against,
+ * and the model row shows ONE entry for both - so the PLM row decides which,
+ * and everything downstream that keys on a family (the weight cache, the trunk
+ * cache, the download stem, the labels) has to see the resolved one or two
+ * bundles get mistaken for each other. See PLM_FAMILIES.
+ */
+const chosenFamily = () => {
+  const chosen = document.getElementById("model-family")?.value ?? "af3";
+  return SINGLE_SEQUENCE_FAMILIES.includes(chosen)
+    ? (PLM_FAMILIES[plmChoice()] ?? chosen) : chosen;
+};
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
 /**
  * 🔴 "CAN THIS MODEL SEE AN ATOM" IS NOT "IS THIS AN AlphaFold 3 GRAPH", AND
@@ -333,6 +347,7 @@ const MODEL_STEMS = {
   monomer: "af2",
   multimer: "af2_multimer",
   "ef2-fast-600m": "ef2_fast_600m",
+  "ef2-fast-300m": "ef2_fast_300m",
 };
 
 /** What to call each model while its weights download. */
@@ -355,6 +370,9 @@ const MODEL_LABELS = {
   // 300M sibling would be a DIFFERENT fold bundle rather than a tower swap: its
   // shim is trained for 30 layers x 960 against this one's 36 x 1152.
   "ef2-fast-600m": "EF2-fast",
+  // ...the same folding model against the smaller tower, and its own
+  // checkpoint. The label names the tower because that is what differs.
+  "ef2-fast-300m": "EF2-fast (300M)",
 };
 
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
@@ -634,8 +652,31 @@ function modelProgress(fraction, detail = "") {
  */
 function usesLanguageModel(family = chosenFamily()) {
   if (!SINGLE_SEQUENCE_FAMILIES.includes(family)) return false;
-  return (document.getElementById("plm-mode")?.value ?? "esmc") !== "none";
+  return plmChoice() !== "none";
 }
+
+const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m";
+
+/**
+ * Which EF2-fast checkpoint the PLM row is asking for.
+ *
+ * 🔴 THE TOWER AND THE FOLDING MODEL ARE ONE CHOICE, NOT TWO. Biohub publish
+ * `base600M-step1500k` and `base300M-step1500k` as separate checkpoints whose
+ * shims are trained for 36 layers x 1152 and 30 x 960 - so picking a tower
+ * picks a folding bundle with it, and offering them as independent controls
+ * would let a page ask for a pairing that has never existed. The model row
+ * therefore shows ONE "EF2-fast" and this row says which.
+ *
+ * 🔴 AND "None" KEEPS WHICHEVER FOLDING MODEL IS ALREADY THERE, because it is
+ * the folding model that folds: with no tower every token takes
+ * `shimSingleForZeroState`, which each bundle has its own version of. 600M's is
+ * the default and the one the measurements above were made against.
+ */
+const PLM_FAMILIES = {
+  "esmc-600m": "ef2-fast-600m",
+  "esmc-300m": "ef2-fast-300m",
+  none: "ef2-fast-600m",
+};
 
 function startModelPreload(family, signal) {
   const name = MODEL_LABELS[family] ?? "AlphaFold 2";
@@ -672,8 +713,13 @@ function startModelPreload(family, signal) {
   const typed = entityList.read();
   const needsLanguageModel = usesLanguageModel(family)
     && (typed.length === 0 || typed.some((entity) => entity.type === "protein"));
-  const load = family === "ef2-fast-600m"
-    ? loadEsmfold2Weights(report, { languageModel: needsLanguageModel })
+  // 🔴 THE TEST IS THE CAPABILITY, NOT THE CHECKPOINT. EF2-fast ships as two
+  // families and a third is published; `family === "ef2-fast-600m"` sends the
+  // 300M one down AlphaFold 2's branch, which is the `family === "af3"` mistake
+  // this file already records once.
+  const load = SINGLE_SEQUENCE_FAMILIES.includes(family)
+    ? loadEsmfold2Weights(report,
+                          { languageModel: needsLanguageModel, family })
     : (AF3_FAMILIES.includes(family)
       ? loadAf3Weights(report, family)
       : loadModel("msa", report, signal, family));
@@ -1423,7 +1469,7 @@ function syncModelControls() {
   // so "flow or diffusion, and how many steps" means the same thing under both
   // - what differs is the numbers, which is why the count dial is rebuilt from
   // a per-model table rather than shared.
-  const sampled = af3 || family === "ef2-fast-600m";
+  const sampled = af3 || SINGLE_SEQUENCE_FAMILIES.includes(family);
   const countNode = document.getElementById("af3CountGroup");
   if (countNode !== null) countNode.hidden = !sampled;
   // 🔴 THE STEP COUNT IS SHARED AND THE MODE IS NOT. ESMFold2's own sampler is
@@ -1503,7 +1549,7 @@ function syncAf3Count() {
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
   // ...and ESMFold2's table has one mode, so the shared select cannot pick a
   // row that is not there.
-  const ef2 = chosenFamily() === "ef2-fast-600m";
+  const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
   const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
     ?? table.flow ?? table.diffusion;
@@ -2193,7 +2239,7 @@ function samplerPreset() {
 }
 
 async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad) {
-  const modelName = MODEL_LABELS["ef2-fast-600m"];
+  const modelName = MODEL_LABELS[chosenFamily()] ?? "EF2-fast";
   const sequence = chains.join(":");
   status(`${modelName} · loading`);
   // ...the long name is for the download dial, where provenance matters; the
@@ -2212,7 +2258,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     ligands.push(parseCcdComponent(await response.text()));
   }
   throwIfAborted(signal);
-  const loaded = await (modelLoad ?? loadEsmfold2Weights());
+  const loaded = await (modelLoad
+    ?? loadEsmfold2Weights(undefined,
+                           { languageModel: usesLanguageModel(), family: chosenFamily() }));
   throwIfAborted(signal);
   const device = await getDevice();
   throwIfAborted(signal);
@@ -2220,7 +2268,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   predictionCount += 1;
   const header = entityList.header();
   const stem = uniqueStem(header !== null
-    ? safeJobName(header) : `${MODEL_STEMS["ef2-fast-600m"]}_${predictionCount}`);
+    ? safeJobName(header) : `${MODEL_STEMS[chosenFamily()] ?? "ef2_fast"}_${predictionCount}`);
   openBlankFold(stem);
   viewer = undefined;
   viewerObject = undefined;
@@ -2713,7 +2761,7 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
-    if (family === "ef2-fast-600m") {
+    if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
       await foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad);
       return;
     }

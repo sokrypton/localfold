@@ -70,16 +70,21 @@
    model hides the sampler-mode group and so leaves room on the line above -
    PLM was landing at the right-hand end of the Diffusion row instead of beside
    it. Without the auto margin the two pair up as `MSA` and `Max MSA` do. */
-#plmGroup {
-  /* 🔴 ITS OWN LINE, WHICH IS WHERE THE MSA GROUP SITS. This model hides the
-     sampler-mode group, so the line above has room and PLM packed onto the end
-     of it - and `af3CountGroup` GROWS to fill a line it is alone on, 535px of
-     948, which put PLM at x=587 while the MSA row it replaces starts at 42.
-     `flex-basis: 100%` is the same idiom `.fold-option-wide` uses for the
-     alignment box, and it is a break rather than a stretch: the label and the
-     select inside stay left-aligned. */
+/* 🔴 A LINE BREAK THAT IS NOT A WIDTH. PLM stands where the MSA group stands,
+   and this model hides the sampler-mode group, so the line above has room -
+   `af3CountGroup` GROWS to fill a line it is alone on, 535px of 948, which put
+   PLM at x=587 while the MSA row starts at 42. Putting `flex-basis: 100%` on
+   the GROUP fixed the position and stretched it across the whole row, which the
+   MSA group it replaces does not do: that is one column of two. A zero-height
+   full-width item ahead of it wraps the line and leaves the group its measure.
+   The `:has()` is the same idiom `.fold-option-wide` uses two rules up. */
+.fold-option-break {
   flex-basis: 100%;
+  height: 0;
+  margin: 0;
 }
+.fold-option-break:has(+ #plmGroup[hidden]) { display: none; }
+#plmGroup { flex: 0 1 calc(50% - 5px); }
 #msaModeGroup[hidden], #maxMsaGroup[hidden], #plmGroup[hidden] {
   display: none !important;
 }

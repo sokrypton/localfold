@@ -72,6 +72,8 @@ natives
 /esmfold2-fast-600m/
 /esmfold2-fast-300m/
 /model-esmc-*/
+# ...and EF2-fast's own bundles, both sizes.
+/model-ef2-fast-*/
 /model-esmc-600m-f32
 /model-esmc-600m-int5
 

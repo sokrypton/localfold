@@ -111,6 +111,24 @@ export const MODEL_BUNDLES = {
     companion: "esmc",
     load: () => import("./esmfold2.js"),
   },
+  // 🔴 THE SAME FOLDING MODEL AGAINST A SMALLER TOWER, AND A SEPARATE CHECKPOINT
+  // RATHER THAN A SWAP. `base300M-step1500k` is published beside
+  // `base600M-step1500k` and its shim is trained for 30 layers x 960 against
+  // the other's 36 x 1152, so the two towers are not interchangeable over one
+  // set of folding weights - which is why this is a FAMILY with its own
+  // companion and not an option on the loader. The folding model is the same
+  // SIZE in both (171 M), so only the tower's 94 MiB separates the pairs:
+  // 252.1 MiB against 346.1. Measured over sixteen held-out targets in
+  // docs/ESMFOLD2.md, the median is 2.55 A against 2.52 - inside the sampler's
+  // own 0.99-1.10 A seed spread - and the tails are 0.4 A worse.
+  "ef2-fast-300m": {
+    model: "esmfold2-trunk",
+    directory: "./model-ef2-fast-300m-int5/",
+    release: "ef2-fast-300m-int5",
+    variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
+    companion: "esmc-300m",
+    load: () => import("./ef2-fast-300m.js"),
+  },
   // 🔴 NOT A MODEL A PAGE OFFERS, AND THAT IS WHY IT IS NOT IN MODEL_FAMILIES.
   // ESM-C folds nothing on its own; it exists here so the loader, the shard
   // cache, the download dial and build_site.py can all treat it as a bundle.
@@ -122,6 +140,16 @@ export const MODEL_BUNDLES = {
     companion: undefined,
     foldingModel: false,
     load: () => import("./esmc.js"),
+  },
+  // ...and the 300M tower, whose shim belongs to the 300M folding model.
+  "esmc-300m": {
+    model: "esmc",
+    directory: "./model-esmc-300m-int3/",
+    release: "esmc-300m-int3",
+    variable: "LOCALFOLD_INCLUDE_ESMC_MODEL",
+    companion: undefined,
+    foldingModel: false,
+    load: () => import("./esmc-300m.js"),
   },
 };
 
@@ -149,10 +177,11 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * That exact mistake is recorded in CLAUDE.md for the AF3/OpenBind split; this
  * is the same mistake one model later.
  */
-export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "ef2-fast-600m"];
+export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "ef2-fast-600m",
+                                  "ef2-fast-300m"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
-export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m"];
+export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
 
 /**
  * The families that build AlphaFold 3's graph, as opposed to AlphaFold 2's.

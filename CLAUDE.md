@@ -2503,6 +2503,56 @@ tokens protein - and the fold would still come out, with a protein's threshold
 on every pair and nothing to see. The line reads `contact classes: 40 polymer,
 31 ligand, 0 nucleic`, and it is printed only when there is something to say.
 
+🔴 **AND THE PLM ROW PICKS A CHECKPOINT, NOT A TOWER.** Biohub publish
+`base600M-step1500k` and `base300M-step1500k` as separate models whose shims are
+trained for **36 layers x 1152** and **30 x 960** - so a tower is not swappable
+over one set of folding weights, and choosing ESM-C 300M loads a different fold
+bundle with it. The folding model is the same SIZE in both (171 M), so the whole
+difference is the tower: **252.1 MiB against 346.1**, a 27% saving. The model row
+shows one "EF2-fast" and `PLM_FAMILIES` in web/app.js resolves which. A third
+pair is published (ESM-C 6B, 6352 M) and would be a registry entry rather than a
+branch - `companion` in `MODEL_BUNDLES` is the link, and the loader reads it.
+
+| | ubiquitin, against the 600M fold | 6MRR vs crystal | bundle | time |
+|---|---|---|---|---|
+| ESM-C 600M | - | **1.43 A**, TM 0.922 | 346.1 MiB | 4.8 s |
+| ESM-C 300M | **0.74 A** | 1.66 A, TM 0.909 | **252.1 MiB** | 3.8 s |
+| none | 10.96 A | 1.52 A, TM 0.926 | 122.5 MiB | 2.2 s |
+
+0.74 A is inside the sampler's own seed spread, which is what docs/ESMFOLD2.md's
+ablation predicted from its median of 2.55 A against 2.52.
+
+🔴 **AND `loadEsmfold2Weights` IS A MAP NOW, WHICH ITS OWN COMMENT ASKED FOR.**
+It memoised ONE promise and said "if a second appears, this becomes a Map on the
+same day" - and the two pairs have the SAME trunk shapes with different shims,
+so a page folding one then the other would have got the first one's weights with
+nothing to signal it. That is `loadAf3Weights`'s recorded bug, one model over.
+
+🔴 **AND `family === "ef2-fast-600m"` WAS IN FOUR PLACES, WHICH IS THE
+`family === "af3"` MISTAKE AGAIN.** Each meant "is this the single-sequence
+pipeline" and each sent the 300M checkpoint down AlphaFold 2's branch. They ask
+`SINGLE_SEQUENCE_FAMILIES.includes(family)` now.
+
+🔴 **AND A DESIGNED PROTEIN DOES NOT NEED THE LANGUAGE MODEL AT ALL.** Reported
+from the page and confirmed against the crystal: 6MRR folds to **1.52 A, TM
+0.926 with no PLM** against 1.43 A and 0.922 with ESM-C 600M - the tower is
+worth nothing on it, where ubiquitin's fold moves 10.96 A without one. 6MRR is a
+DESIGNED protein, idealised and canonical, so the structure module folds it from
+the sequence embedding alone. **The PLM's value is target-dependent, and a
+single ablation on one target says nothing about the next.**
+
+🔴 **AND THAT REFINES WHAT THE CERTAINTY IS DOING, IN ITS FAVOUR.** It does not
+detect the ABLATION - it tracks the FOLD. On ubiquitin the fold collapsed and it
+fell 0.95 to 0.42; on 6MRR the fold survived and it stayed at 0.95. An estimate
+that dropped whenever an input was removed would have been measuring the setting
+rather than the answer.
+
+🔴 **AND SCORING AGAINST A DEPOSITED STRUCTURE NEEDS THE ALTLOCS DEDUPED.**
+6MRR's chain A has 71 CA records for 68 residues, so a naive walk pairs the model
+against a shifted crystal and reports **4.74 A and TM 0.393** for a fold that is
+really **1.43 A and TM 0.922**. Take one CA per (chain, residue number) and skip
+any `altLoc` outside " " and "A".
+
 🔴 **AND THE LANGUAGE MODEL CAN BE TURNED OFF, WHICH IS THIS MODEL'S "SINGLE
 SEQUENCE".** AF2 and AF3 fold without their alignment; ESM-C is where this model's
 evolutionary information comes from, so switching it off is the same ablation.
