@@ -3328,9 +3328,24 @@ same within this machine's noise either way.
 
 **So the "eight" recorded elsewhere in this file is eight parallel CONNECTIONS
 and a longest-first order, not a shard count** - and a bundle wants comfortably
-more shards than connections, not the same number. What is left open is the
-other direction: whether `af3-int5` would gain a second or two from being
-re-sharded finer, which costs a re-export and a re-upload to find out.
+more shards than connections, not the same number.
+
+🔴 **AND AF3 IS THE EXCEPTION, BECAUSE ITS FLOOR IS A TENSOR AND NOT A LAYOUT.**
+Two of its float32 tensors are **216 MiB** each - the stacked `transition1`
+weights of the diffusion transformer and of the trunk pairformer's single
+transition - which are 40.5 MiB apiece at int5. A tensor is contiguous within
+one file, so 40.5 MiB on one connection is the makespan floor in ANY sharding,
+and the shipped layout already isolates them: tensors per shard reads
+`[1, 1, 65, 66, 66, 68, 69, 70]`. Re-sharding to sixteen produces the same two
+40.5 MiB shards and gains nothing, which is why it was not done. **Its 4.5-5.3 s
+idle tail is those two tensors.**
+
+🔴 **AND af2-monomer's `.js` SHARDS ARE GONE, 129.8 MiB OF THEM.**
+`tools/export-js-weights.py` writes a base64-in-JavaScript copy of every shard
+for `file://` pages, which is why that bundle had eighteen files where the
+others had nine - and `build_site.py` excludes `weights-*.js` and `manifest.js`
+from the site, so nothing ever fetched them over HTTP. They are still generated
+locally for the offline page; they are simply not hosted.
 
 🔴 **PIN A COMMIT SHA, NOT `main`.** A shard fetched from a moving branch can
 change under a manifest that did not, which is the failure the shard-cache token
