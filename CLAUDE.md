@@ -2095,6 +2095,59 @@ which is a claim and the wrong one. It falls back to the unfiltered mean, and
 only a chain shorter than the separation gets nothing. Measured on ubiquitin:
 before the fallback the range was 0.0 to 98.6, after it 49.7 to 98.6.
 
+🔴 **AND A SEQUENCE SEPARATION ON THE TOKEN INDEX IS NOT A SEQUENCE SEPARATION
+WHEN A LIGAND IS ONE TOKEN PER HEAVY ATOM.** Every contact and certainty path
+here excluded a partner when the TOKEN INDICES were close, which is a rule about
+a chain's own neighbours - and a ligand has none. Reproduced by folding
+ubiquitin with and without ATP (76 residues, 31 atoms), which is the measurement
+that was missing: **all 46 sweep targets and all 80 corrupted folds were single
+protein chains**, so nothing in this file had ever borne on a ligand token.
+
+| ubiquitin + ATP | token-index rule | residue rule |
+|---|---|---|
+| contacts predicted | 314, **195 of them the ligand's own** | 112 |
+| ...precision / recall | 0.987 / 0.726 | 1.000 / 0.541 |
+| the LIGAND's mean certainty | 0.8173 | **0.2193** |
+| the PROTEIN's mean certainty | 0.8989 | 0.8989 |
+
+62% of that fold's contacts were ATP's internal pairs, so the precision a
+checker prints was mostly a statement about a conformer the model was HANDED.
+`partnerKeys` in src/esmfold2/distogram-webgpu.js replaces the arithmetic with
+two numbers per token - the asym id and the residue number - and the rule
+becomes "the same chain, and within `separation` RESIDUES". A ligand's atoms
+share one residue number, so a gap of zero drops the whole self-block; two
+chains are never neighbours at all, which fixes a smaller bug in the same line.
+
+🔴 **AND IT IS THE OLD RULE EXACTLY ON ONE UNMODIFIED PROTEIN CHAIN, WHICH IS
+WHAT EVERY CONSTANT WAS TUNED ON.** There the residue number and the token index
+differ by a constant, so their differences agree - and a ubiquitin fold comes
+back with the certainty vector IDENTICAL to every digit. That is the gate;
+`test/esmfold2-certainty-partners.test.js` pins it, and asserts on the generated
+WGSL, because a partner rule that never reaches the kernel agrees with itself.
+
+🔴 **AND THE PROTEIN'S OWN NUMBERS DID NOT MOVE, WHICH REFUTES THE OBVIOUS
+DIAGNOSIS.** Adding ATP shifts the protein's certainties by -0.051 on average
+with one residue moving 0.475 - and it shifts them by **exactly that, to four
+decimals, under BOTH rules**. So the shift is the TRUNK conditioning on a
+molecule that is really there, not the aggregation eating ligand pairs: for a
+protein token only a handful of partners change category. The proposed
+per-chain fix would have been credited with this and deserved none of it.
+
+🔴 **AND THE DISTOGRAM SAYS NOTHING ABOUT WHERE THE LIGAND GOES.** It predicts
+**0** protein-ligand contacts while the structure makes **64**, on the same
+fold, and the honest 0.22 certainty above is that fact reaching the colour. It
+is not settled whether the head cannot speak about ligand pairs or the borrowed
+`CONTACT_EDGES` are wrong for them - **open**, and it is why the ligand-free
+number is the one to trust.
+
+🔴 **AND AF2 AND AF3 ARE NOT AFFECTED, WHICH WAS WORTH CHECKING RATHER THAN
+ASSUMING.** The report was "this affects all models". It does not:
+`distogramContactProbabilities` in src/heads/distogram.js is per PAIR with no
+separation rule and no aggregation, and `web/prediction-results.js` exports the
+matrix as it stands. Those models take their confidence from a confidence head.
+ESMFold2 is the only one here that DERIVES a confidence from the distogram, so
+it is the only one with an aggregation to get wrong.
+
 🔴 **AND THE DIAL HAS TO STOP REPORTING WHEN THE LOAD DOES.** The tower STREAMS
 - its 36 blocks are read during the fold - so its store went on firing progress
 after the weights promise resolved, and `startModelPreload`'s clear was

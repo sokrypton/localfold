@@ -62,6 +62,39 @@ export const CONTACT_ANGSTROMS = 8;
  */
 export const CERTAINTY = { radius: 2, separation: 3, cutoff: 12 };
 
+/**
+ * The two numbers the partner rule needs, one pair per token: `asymId` and
+ * `residueIndex`.
+ *
+ * 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM, SO A SEPARATION ON THE TOKEN INDEX
+ * MEANS NOTHING THERE. Every atom of a component shares one asym id and one
+ * residue number (`featurise.js` writes 1), so this rule drops a ligand's whole
+ * self-block - which is right, because its internal geometry comes from the
+ * CCD conformer that was handed to the model and is not a prediction at all.
+ * Measured on ubiquitin plus ATP, 76 residues and 31 atoms:
+ *
+ * | | no ligand | with ATP, token gap | with ATP, this rule |
+ * |---|---|---|---|
+ * | mean certainty, PROTEIN tokens | 0.9496 | 0.8989 | (see check-esmfold2-certainty) |
+ *
+ * ...a 0.05 shift on the protein's own numbers, with one residue moving 0.47,
+ * caused by a molecule the protein's confidence should not depend on.
+ *
+ * 🔴 AND IT IS EXACTLY THE OLD RULE FOR ONE UNMODIFIED PROTEIN CHAIN, which is
+ * what every measurement behind `CERTAINTY` was made on: there the residue
+ * number and the token index differ by a constant, so their differences agree.
+ * A complex changes: two tokens in different chains are no longer excluded for
+ * being near each other in the array, which they never should have been.
+ */
+export function partnerKeys({ asymId, residueIndex }, tokens) {
+  const keys = new Int32Array(tokens * 2);
+  for (let token = 0; token < tokens; token += 1) {
+    keys[token * 2] = asymId[token];
+    keys[token * 2 + 1] = residueIndex[token];
+  }
+  return keys;
+}
+
 /** `out[i, j] = pair[i, j] + pair[j, i]`, which is what the head is handed. */
 export function createSymmetriseShader({ tokens, channels }) {
   const pairs = tokens * tokens;
@@ -165,7 +198,10 @@ export function createCertaintyShader({ tokens, separation, modeCutoffBin }) {
   return `
 @group(0) @binding(0) var<storage, read> mass: array<f32>;
 @group(0) @binding(1) var<storage, read> mode: array<f32>;
-@group(0) @binding(2) var<storage, read_write> certainty: array<f32>;
+// 🔴 THE PARTNER RULE IS DATA, NOT ARITHMETIC ON THE TOKEN INDEX. Component x
+// is the asym id and y the residue number; see the comment on partnerKeys.
+@group(0) @binding(2) var<storage, read> partner: array<vec2<i32>>;
+@group(0) @binding(3) var<storage, read_write> certainty: array<f32>;
 
 var<workgroup> partial_sum: array<f32, ${LANES}>;
 var<workgroup> partial_count: array<f32, ${LANES}>;
@@ -182,9 +218,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var loose = 0.0;
   var looseCount = 0.0;
   for (var other = local.x; other < ${tokens}u; other += ${LANES}u) {
-    // ...unsigned, so a difference is taken the way round that is positive.
-    let gap = select(token - other, other - token, other > token);
-    if (gap <= ${separation}u) { continue; }
+    // A partner is excluded only when it is a SEQUENCE neighbour: the same
+    // chain, and within 'separation' residues. Across chains there is no
+    // neighbourhood to exclude, and inside one ligand every atom shares the
+    // residue number, so a gap of zero drops all of them.
+    let here = partner[token];
+    let there = partner[other];
+    if (here.x == there.x && abs(here.y - there.y) <= ${separation}) { continue; }
     let cell = token * ${tokens}u + other;
     // 🔴 THE UNFILTERED MEAN IS KEPT AS A FALLBACK, because "no partner inside
     // the cutoff" is NO DATA and zero is a colour. A terminal residue the model
@@ -296,7 +336,8 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  * @returns {Float32Array} one probability per token pair
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
-                                                  weights, bias, chunk = 8192,
+                                                  weights, bias, partners,
+                                                  chunk = 8192,
                                                   wantLogits = false,
                                                   retainForFrames = false }) {
   const { allocator, cache, submit, device } = context;
@@ -362,6 +403,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const modes = keep(allocator.allocate("esmfold2.disto.mode", pairs * 4, storage));
     const certainty = keep(allocator.allocate("esmfold2.disto.certainty",
       Math.max(16, tokens * 4), storage | GPUBufferUsage.COPY_SRC));
+    // 🔴 THE RULE IS REQUIRED, NOT DEFAULTED. A caller with no chain ids would
+    // silently get the token-index rule back, which is the bug this replaced.
+    if (partners === undefined || partners.length !== tokens * 2) {
+      throw new Error("encodeContactMap needs partners: partnerKeys(features, tokens)");
+    }
+    const partnerBuffer = keep(allocator.upload("esmfold2.disto.partners",
+      partners, storage));
     await submit("esmfold2.distogram", [
       ["symmetrise", symmetrise, [pair, symmetric], ...elementwise(pairs * channels)],
     ]);
@@ -394,7 +442,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       ]);
     }
     await submit("esmfold2.certainty", [
-      ["certainty", certaintyPass, [mass, modes, certainty],
+      ["certainty", certaintyPass, [mass, modes, partnerBuffer, certainty],
        Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
     ]);
     const readback = keep(allocator.allocate("esmfold2.disto.readback", pairs * 4,
@@ -418,14 +466,14 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     // "[Buffer esmfold2.disto.certainty-readback] is destroyed" on the first
     // frame, which names the buffer and not the lifetime.
     const retained = retainForFrames
-      ? [logits, biasBuffer, modes, mass, certainty, readCertainty] : [];
+      ? [logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer] : [];
     for (const allocation of retained) {
       const at = held.indexOf(allocation);
       if (at >= 0) held.splice(at, 1);
     }
     const frames = retainForFrames ? await framesScorer({
       device, allocator, cache, submit, key, tokens, bins, span, modeCutoffBin,
-      logits, biasBuffer, modes, mass, certainty, readCertainty,
+      logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
       release: () => { for (const allocation of retained) allocation.release(); },
     }) : undefined;
     if (!wantLogits) return { contacts: out, certainty: perToken, frames };
@@ -459,7 +507,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
  */
 async function framesScorer(context) {
   const { device, allocator, cache, submit, key, tokens, bins, span } = context;
-  const { modeCutoffBin, logits, biasBuffer, modes, mass, certainty, readCertainty } = context;
+  const { modeCutoffBin, logits, biasBuffer, modes, mass, certainty, readCertainty,
+          partnerBuffer } = context;
   const storage = GPUBufferUsage.STORAGE;
   const observed = await cache.get(`${key}:observed:${tokens}`,
     createObservedMassShader({ tokens, bins }, span));
@@ -478,7 +527,7 @@ async function framesScorer(context) {
       await submit("esmfold2.certainty.frame", [
         ["observed", observed, [logits, biasBuffer, positions, mass],
          ...elementwise(tokens * tokens)],
-        ["aggregate", aggregate, [mass, modes, certainty],
+        ["aggregate", aggregate, [mass, modes, partnerBuffer, certainty],
          Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
       ]);
       const encoder = device.createCommandEncoder({ label: "esmfold2.certainty.frame" });

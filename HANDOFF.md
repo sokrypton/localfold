@@ -1,53 +1,27 @@
 # Where this left off
 
 Written at the end of the ESMFold2 WebGPU session. `CLAUDE.md` has the durable
-findings - this file has only what is UNFINISHED, and the one open problem is at
-the top because it is the reason this file exists.
+findings - this file has only what is UNFINISHED. The problem it was written for
+is at the top, now settled, with the one question it left behind.
 
-## OPEN: ligand contacts, and the confidence estimate built on them
+## SETTLED: ligand contacts, and the confidence built on them
 
-🔴 **RAISED BUT NOT INVESTIGATED, AND IT AFFECTS EVERY MODEL.** Reported at the
-end of the session: the contact calculation is wrong for ligands, and the
-estimated confidence that reads it is wrong in consequence. Nothing was changed
-- the report arrived with the context nearly full and the right move was to
-write it down rather than start.
+Reproduced, fixed and measured - see CLAUDE.md's ESMFold2 confidence section for
+the tables. In short: the separation rule ran on the TOKEN index, a ligand is one
+token per heavy atom, and 62% of a ubiquitin+ATP fold's contacts were ATP's own
+internal pairs. `partnerKeys` makes the rule "the same chain, and within
+`separation` RESIDUES", which is bit-identical on one unmodified protein chain.
 
-What is known, and what is only suspected, kept apart:
+Two things that came out of it and are worth carrying:
 
-**Known, because it is how the code is built.** A ligand is ONE TOKEN PER HEAVY
-ATOM, so a ligand of `k` atoms contributes `k` tokens to every token-by-token
-matrix. Two consequences follow arithmetically and neither has been measured:
-
-* Its atoms are all within a few angstroms of each other, so a ligand
-  contributes roughly `k^2` short-range "contacts" that say nothing about
-  anything. On a 60-residue protein with a 40-atom ligand that is 1600 pairs
-  against the protein's 3600.
-* Sequence separation does not mean what it means for a polymer. A `|i - j| > 6`
-  filter, which every contact and confidence path here uses, is designed to
-  exclude a chain's own neighbours - and applied across a ligand it excludes an
-  arbitrary third of its atoms and keeps the rest.
-
-**The proposed quick fix, from the same report: compute confidence PER CHAIN.**
-That is plausible and would sidestep both, since a ligand is its own asym id -
-but it is a guess about a bug nobody has yet reproduced, so REPRODUCE IT FIRST.
-
-**Where to look**, in the order that will settle it fastest:
-
-1. `contactAgreement` in `tools/gpu/fold-esmfold2.js` - it already picks a
-   representative atom per token and already excludes `|i - j| <= 6`. Fold a
-   protein with a ligand (`--ligands=GOL`) and print the contact counts split by
-   whether each partner is polymer or ligand. If the ligand's self-contacts
-   dominate, that is the bug, visible in one run.
-2. `CERTAINTY` in `src/esmfold2/distogram-webgpu.js` - `separation: 3`,
-   `cutoff: 12`. The same two objections apply, and its constants were swept on
-   PROTEIN-ONLY targets (see CLAUDE.md), so nothing about them is known to hold
-   for a ligand token.
-3. `src/heads/` and `web/prediction-results.js` for the AF2/AF3 paths, which is
-   where "affects all models" would show.
-
-🔴 **AND THE SWEEP CANNOT BE REUSED TO SETTLE IT.** All 46 targets and all 80
-corrupted folds were single protein chains. Whatever the right treatment of a
-ligand is, no measurement in this repository currently bears on it.
+* **The proposed per-chain fix would have been credited with something it does
+  not do.** The protein's own certainties shift by -0.051 when ATP is added, and
+  they shift by exactly that under both rules - it is the trunk conditioning on
+  a real molecule, not the metric.
+* **OPEN: the distogram predicts 0 protein-ligand contacts where the structure
+  makes 64.** Either this head does not speak about ligand pairs or the borrowed
+  `CONTACT_EDGES` are wrong for them. Nothing depends on it today beyond the
+  ligand's own (now honest, and very low) certainty.
 
 ## Also open, smaller
 

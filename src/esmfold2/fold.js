@@ -34,7 +34,7 @@ import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffus
 import { buildRope } from "./atom-encoder-reference.js";
 import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
 import { encodeLanguagePair } from "./language-pair-webgpu.js";
-import { encodeContactMap } from "./distogram-webgpu.js";
+import { encodeContactMap, partnerKeys } from "./distogram-webgpu.js";
 import { linear } from "./featuriser-reference.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
@@ -524,6 +524,7 @@ export async function foldEsmfold2(device, options) {
         { tokens, channels, bins: shape.distogramBins, pair,
           weights: weights.featuriser.distogramWeights,
           bias: weights.featuriser.distogramBias,
+          partners: partnerKeys(features, tokens),
           wantLogits: options.distogramLogits === true,
           retainForFrames: options.frameCertainty === true })));
     const contacts = distogram?.contacts;

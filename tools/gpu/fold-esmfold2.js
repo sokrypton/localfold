@@ -300,8 +300,29 @@ export async function main(device, args = []) {
       }
     }
     let both = 0, predicted = 0, actual = 0;
+    // 🔴 SPLIT BY WHAT THE PAIR IS, because a ligand is ONE TOKEN PER HEAVY
+    // ATOM: its atoms are all within a few angstroms of each other, so every
+    // one of its k^2 self-pairs is "in contact" and says nothing, and `j >= i +
+    // 6` - a rule about a chain's own neighbours - excludes an arbitrary
+    // prefix of them rather than a sequence neighbourhood. Counted rather than
+    // argued: `kinds` is polymer/polymer, polymer/ligand, ligand/ligand and
+    // each ligand's own self-pairs.
+    const { molType, asymId, residueIndex } = result.features;
+    const ligand = (t) => molType[t] === 3;
+    // ...the same rule the certainty uses, and for the same reason: a
+    // separation on the TOKEN index is a rule about a chain's neighbours, and a
+    // ligand's atoms are neither.
+    const neighbours = (i, j) => asymId[i] === asymId[j]
+      && Math.abs(residueIndex[i] - residueIndex[j]) <= 6;
+    const kinds = {
+      polymerPolymer: { predicted: 0, actual: 0, both: 0 },
+      polymerLigand: { predicted: 0, actual: 0, both: 0 },
+      ligandLigand: { predicted: 0, actual: 0, both: 0 },
+      ligandSelf: { predicted: 0, actual: 0, both: 0 },
+    };
     for (let i = 0; i < result.tokens; i += 1) {
-      for (let j = i + 6; j < result.tokens; j += 1) {
+      for (let j = i + 1; j < result.tokens; j += 1) {
+        if (neighbours(i, j)) continue;
         const near = result.contacts[i * result.tokens + j] > 0.5;
         if (near) contactPairs += 1;
         const a = representative[i] * 3, b = representative[j] * 3;
@@ -309,11 +330,30 @@ export async function main(device, args = []) {
         if (near) predicted += 1;
         if (close) actual += 1;
         if (near && close) both += 1;
+        const bucket = ligand(i) && ligand(j)
+          ? (asymId[i] === asymId[j] ? kinds.ligandSelf : kinds.ligandLigand)
+          : (ligand(i) || ligand(j) ? kinds.polymerLigand : kinds.polymerPolymer);
+        if (near) bucket.predicted += 1;
+        if (close) bucket.actual += 1;
+        if (near && close) bucket.both += 1;
+      }
+    }
+    // ...and how many pairs the separation rule DROPS inside one ligand, which
+    // is the other half of the objection: for a polymer those are real
+    // neighbours, for a ligand they are an arbitrary third of the molecule.
+    let ligandTokens = 0, ligandPairsKept = 0, ligandPairsDropped = 0;
+    for (let i = 0; i < result.tokens; i += 1) {
+      if (!ligand(i)) continue;
+      ligandTokens += 1;
+      for (let j = i + 1; j < result.tokens; j += 1) {
+        if (!ligand(j) || asymId[i] !== asymId[j]) continue;
+        if (neighbours(i, j)) ligandPairsDropped += 1; else ligandPairsKept += 1;
       }
     }
     agreement = { predicted, actual, both,
                   precision: predicted === 0 ? null : both / predicted,
-                  recall: actual === 0 ? null : both / actual };
+                  recall: actual === 0 ? null : both / actual,
+                  kinds, ligandTokens, ligandPairsKept, ligandPairsDropped };
   }
 
   return {
@@ -336,6 +376,17 @@ export async function main(device, args = []) {
     certainty: result.certainty === undefined ? undefined : {
       mean: [...result.certainty].reduce((t, v) => t + v, 0) / result.certainty.length,
       min: Math.min(...result.certainty), max: Math.max(...result.certainty),
+      // ...and split by what the token IS, plus the whole vector, because the
+      // question a ligand raises is whether it moves the POLYMER's numbers.
+      polymerMean: (() => {
+        const v = [...result.certainty].filter((_, t) => result.features.molType[t] !== 3);
+        return v.length === 0 ? null : v.reduce((a, b) => a + b, 0) / v.length;
+      })(),
+      ligandMean: (() => {
+        const v = [...result.certainty].filter((_, t) => result.features.molType[t] === 3);
+        return v.length === 0 ? null : v.reduce((a, b) => a + b, 0) / v.length;
+      })(),
+      perToken: [...result.certainty].map((v) => Number(v.toFixed(4))),
     },
     contactAgreement: agreement,
     pdb,
