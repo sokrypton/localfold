@@ -58,17 +58,42 @@ def main():
     model = EsmFold2ExperimentalModel.from_pretrained(
         str(ROOT / arguments.esmfold2), load_esmc=False).eval()
 
-    captured = {'loops': [], 'projected': []}
+    captured = {'loops': [], 'projected': [], 'inputs': []}
 
     def after_projection(_module, _inputs, output):
         captured['projected'].append(output.detach().clone())
 
-    def after_trunk(_module, _inputs, output):
+    def after_trunk(_module, inputs, output):
+        # 🔴 THE INPUT AS WELL AS THE OUTPUT, so the check is `trunk(x) == y` and
+        # needs neither z_init nor the recurrence. The first version recorded
+        # only outputs and pair_loop_proj(0), which cannot reproduce loop zero:
+        # z_init never appears in either.
         pair = output[0] if isinstance(output, (tuple, list)) else output
         captured['loops'].append(pair.detach().clone())
+        captured['inputs'].append(inputs[0].detach().clone())
 
+    # 🔴 BLOCK ZERO'S THREE SUB-MODULES TOO, because a whole-trunk check that
+    # fails says only "somewhere in 24 blocks". One tri-mul is a second to
+    # verify and the whole trunk is 77; the ladder matters more than the total.
+    captured['modules'] = {}
+
+    def module_hook(label):
+        def hook(_module, inputs, output):
+            if label in captured['modules']:
+                return                     # the first loop only
+            captured['modules'][label] = {
+                'input': inputs[0].detach().clone(),
+                'output': (output[0] if isinstance(output, (tuple, list))
+                           else output).detach().clone(),
+            }
+        return hook
+
+    first = model.folding_trunk.blocks[0]
     handles = [model.pair_loop_proj.register_forward_hook(after_projection),
-               model.folding_trunk.register_forward_hook(after_trunk)]
+               model.folding_trunk.register_forward_hook(after_trunk),
+               first.tri_mul_out.register_forward_hook(module_hook('tri_mul_out')),
+               first.tri_mul_in.register_forward_hook(module_hook('tri_mul_in')),
+               first.pair_transition.register_forward_hook(module_hook('pair_transition'))]
 
     features = prepare_protein_features(sequence)
     # 🔴 NO LANGUAGE MODEL, DELIBERATELY. lm_z is added to z_init once and is
@@ -83,7 +108,6 @@ def main():
 
     trunk = model.folding_trunk
     blocks = len(trunk.blocks) if hasattr(trunk, 'blocks') else None
-    z_init = captured['projected'][0] - torch.zeros_like(captured['projected'][0])
     payload = {
         'sequence': sequence,
         'esmfold2': arguments.esmfold2,
@@ -93,7 +117,9 @@ def main():
         # The first projection sees a zero z, so its output is
         # pair_loop_proj(0) - the bias path alone - and z_init is what the
         # model added to it. Both are recorded rather than reconstructed.
-        'projectionOfZero': tolist(captured['projected'][0]),
+        'block0': {name: {'input': tolist(v['input']), 'output': tolist(v['output'])}
+                   for name, v in captured['modules'].items()},
+        'intoLoop': {str(i): tolist(v) for i, v in enumerate(captured['inputs'])},
         'afterLoop': {str(i): tolist(v) for i, v in enumerate(captured['loops'])},
         'distogram': tolist(output['distogram_logits'])
         if 'distogram_logits' in output else None,

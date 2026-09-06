@@ -79,3 +79,4 @@ natives
 # machine's torch, purely to have an ORACLE for the hand-written ESM-C forward
 # in tools/esmc/esmc_forward.py. Nothing shipped imports it.
 /.venv-esm/
+/model-esmfold2-trunk-f32
