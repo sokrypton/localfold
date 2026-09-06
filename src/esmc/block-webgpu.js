@@ -140,7 +140,7 @@ export function linearGrid(rows, outer, rowTile = ROW_TILE) {
  */
 export function createLinearShader({ rows, inner, outer }, withResidual,
                                    weightPrecision = "f32", boundsTest = false,
-                                   rowTile = ROW_TILE) {
+                                   rowTile = ROW_TILE, unroll = 4) {
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown weight precision ${weightPrecision}`);
   }
@@ -165,17 +165,38 @@ export function createLinearShader({ rows, inner, outer }, withResidual,
     }
   }`);
   }
-  const body = [];
+  // 🔴 THE k LOOP IS UNROLLED BY FOUR SO THE STAGED INPUT IS READ AS vec4 TOO.
+  // Scalar, the inner loop did one workgroup read per vec4 multiply-add - eight
+  // reads and eight FMAs per k at a row tile of eight - which makes the
+  // workgroup memory, not the arithmetic, the thing being issued. Consecutive k
+  // are adjacent in `staged` for a fixed row, so four of them are one read.
+  //
   // 🔴 NO BOUNDS TEST ON THE WEIGHT READ. The condition is loop-invariant, so
   // testing it inside the k loop paid for it once per k; WGSL has no
   // out-of-bounds access and the STORE is masked. Measured interleaved, keeping
   // the test is 0.946x at 61 tokens and 1.026x at 300 - a wash, so the cheaper
   // form is kept because it is cheaper.
-  body.push(`      let w = ${boundsTest
-    ? `select(vec4<f32>(0.0), ${load("k_absolute * " + vectorColumns + "u + vector_column")}, vector_column < ${vectorColumns}u)`
-    : load(`k_absolute * ${vectorColumns}u + vector_column`)};`);
-  for (let t = 0; t < rowTile; t += 1) {
-    body.push(`      acc_${t} += staged[${t}u * ${K_CHUNK}u + k] * w;`);
+  const body = [];
+  if (unroll > 1) {
+    for (let t = 0; t < rowTile; t += 1) {
+      const parts = [];
+      for (let u = 0; u < unroll; u += 1) {
+        parts.push(`staged[${t}u * ${K_CHUNK}u + k + ${u}u]`);
+      }
+      body.push(`      let s_${t} = vec${unroll}<f32>(${parts.join(", ")});`);
+    }
+  }
+  for (let u = 0; u < unroll; u += 1) {
+    body.push(`      {`);
+    body.push(`        let w = ${boundsTest
+      ? `select(vec4<f32>(0.0), ${load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)}, vector_column < ${vectorColumns}u)`
+      : load(`(k_absolute + ${u}u) * ${vectorColumns}u + vector_column`)};`);
+    for (let t = 0; t < rowTile; t += 1) {
+      body.push(unroll > 1
+        ? `        acc_${t} += s_${t}[${u}] * w;`
+        : `        acc_${t} += staged[${t}u * ${K_CHUNK}u + k] * w;`);
+    }
+    body.push(`      }`);
   }
 
   return `${half ? "enable f16;\n" : ""}
@@ -204,7 +225,7 @@ ${declare.join("\n")}
                             row < ${rows}u && k0 + k < ${inner}u);
     }
     workgroupBarrier();
-    for (var k = 0u; k < ${K_CHUNK}u; k += 1u) {
+    for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
       let k_absolute = k0 + k;
       if (k_absolute >= ${inner}u) { break; }
 ${body.join("\n")}
@@ -521,12 +542,23 @@ export function createSwigluShader({ rows, model, ffn }, weightPrecision = "f32"
   }
   // 🔴 THE GATE HALF IS FIRST: silu(wide[c]) * wide[ffn + c]. Swapped, the block
   // still runs and returns a plausible tensor of the same shape.
-  body.push(`      let wg = ${load(`k_absolute * ${stride}u + vector_column`)};`);
-  body.push(`      let wv = ${load(`k_absolute * ${stride}u + ${vectorFfn}u + vector_column`)};`);
+  // The same four-way k unroll the linear kernel uses, and for the same reason:
+  // scalar, this loop did one workgroup read per multiply-add.
+  const unroll = 4;
   for (let t = 0; t < tile; t += 1) {
-    body.push(`      let s_${t} = staged[${t}u * ${K_CHUNK}u + k];`);
-    body.push(`      gate_${t} += s_${t} * wg;`);
-    body.push(`      value_${t} += s_${t} * wv;`);
+    const parts = [];
+    for (let u = 0; u < unroll; u += 1) parts.push(`staged[${t}u * ${K_CHUNK}u + k + ${u}u]`);
+    body.push(`      let s_${t} = vec4<f32>(${parts.join(", ")});`);
+  }
+  for (let u = 0; u < unroll; u += 1) {
+    body.push(`      {`);
+    body.push(`        let wg = ${load(`(k_absolute + ${u}u) * ${stride}u + vector_column`)};`);
+    body.push(`        let wv = ${load(`(k_absolute + ${u}u) * ${stride}u + ${vectorFfn}u + vector_column`)};`);
+    for (let t = 0; t < tile; t += 1) {
+      body.push(`        gate_${t} += s_${t}[${u}] * wg;`);
+      body.push(`        value_${t} += s_${t}[${u}] * wv;`);
+    }
+    body.push(`      }`);
   }
 
   return `${half ? "enable f16;\n" : ""}
@@ -554,7 +586,7 @@ ${declare.join("\n")}
                             row < ${rows}u && k0 + k < ${model}u);
     }
     workgroupBarrier();
-    for (var k = 0u; k < ${K_CHUNK}u; k += 1u) {
+    for (var k = 0u; k < ${K_CHUNK}u; k += ${unroll}u) {
       let k_absolute = k0 + k;
       if (k_absolute >= ${model}u) { break; }
 ${body.join("\n")}
@@ -607,6 +639,7 @@ export class EsmcBlockGpu {
     const rowTile = options.rowTile ?? ROW_TILE;
     const profile = options.profile ?? false;
     const queryTile = options.queryTile ?? QUERY_TILE;
+    const unroll = options.unroll ?? 4;
     if (input.length !== rows * model) {
       throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
     }
@@ -668,8 +701,8 @@ export class EsmcBlockGpu {
         `esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon));
       const qkvPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}:${rowTile}`,
-        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest, rowTile));
+        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest, rowTile, unroll));
       const preparePipeline = await pipeline(
         `esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase));
@@ -677,14 +710,14 @@ export class EsmcBlockGpu {
         `esmc-attend:${rows}:${model}:${heads}:${queryTile}`,
         createAttentionShader({ rows, model, heads }, queryTile));
       const outPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
-        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile));
+        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile, unroll));
       const swigluPipeline = await pipeline(
         `esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
         createSwigluShader({ rows, model, ffn }, weightPrecision));
       const downPipeline = await pipeline(
-        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
-        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest, rowTile));
+        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}:${unroll}`,
+        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest, rowTile, unroll));
 
       const readback = keep(this.allocator.allocate(
         "esmc.readback", rows * model * 4,
