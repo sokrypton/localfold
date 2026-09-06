@@ -117,6 +117,40 @@ function crystalChain(text, wanted) {
   };
 }
 
+/**
+ * A sequence corrupted at a rate, deterministically.
+ *
+ * 🔴 CORRUPTION IS A DEVICE FOR MAKING FOLDS THE MODEL IS UNSURE ABOUT, which
+ * is the thing 46 real targets did not supply: 43 of them fold at lDDT-Ca above
+ * 0.9, so the label the sweep was fitted against barely varies. Replacing a
+ * fraction of the residues at random walks a target down the confidence scale
+ * on demand.
+ *
+ * 🔴 AND THE LABEL DEGRADES WITH IT, WHICH HAS TO BE SAID. A mutant's true
+ * structure is not the crystal, so at a high rate a low lDDT may mean "this
+ * sequence really does fold differently" rather than "the model is wrong". The
+ * per-residue result is therefore reported PER RATE rather than pooled, and the
+ * cleanest reading is the low rates plus the GLOBAL question - does the
+ * estimate know that a corrupted fold is worse - which does not depend on the
+ * mutant's true structure at all.
+ */
+function corrupt(sequence, rate, seed) {
+  if (rate <= 0) return sequence;
+  const alphabet = "ACDEFGHIKLMNPQRSTVWY";
+  let state = (seed >>> 0) ^ 0x9e3779b9;
+  const next = () => {
+    state ^= state << 13; state >>>= 0;
+    state ^= state >> 17;
+    state ^= state << 5; state >>>= 0;
+    return state / 4294967296;
+  };
+  let out = "";
+  for (const code of sequence) {
+    out += next() < rate ? alphabet[Math.floor(next() * alphabet.length)] : code;
+  }
+  return out;
+}
+
 const distance = (a, i, b, j) => Math.hypot(
   a[i * 3] - b[j * 3], a[i * 3 + 1] - b[j * 3 + 1], a[i * 3 + 2] - b[j * 3 + 2]);
 
@@ -482,6 +516,7 @@ export async function main(device, args = []) {
     .filter((code) => code !== "");
   const seed = Number(option(args, "seed", "0"));
   const minResidues = Number(option(args, "min-residues", "40"));
+  const rates = option(args, "corrupt", "0").split(",").map(Number);
   const maxResidues = Number(option(args, "max-residues", "180"));
 
   const fold = reader(option(args, "bundle", "/model-esmfold2-int5"));
@@ -548,7 +583,10 @@ export async function main(device, args = []) {
   for (const measure of MEASURE_NAMES) {
     for (let s = 0; s < SEPARATIONS.length; s += 1) {
       for (let c = 0; c < CUTOFFS.length; c += 1) {
-        arms.push({ measure, s, c, pearson: [], spearman: [] });
+        // ...one bucket of correlations PER corruption rate, because pooling
+        // them would let the easy folds carry the hard ones.
+        arms.push({ measure, s, c, pearson: [], spearman: [],
+                    byRate: new Map(rates.map((rate) => [rate, []])) });
       }
     }
   }
@@ -572,73 +610,83 @@ export async function main(device, args = []) {
       perTarget.push({ code, skipped: `${crystal.sequence.length} residues` });
       continue;
     }
-    const result = await foldEsmfold2(device, {
-      sequence: crystal.sequence, allocator, seed,
-      sampler: option(args, "sampler", "diffusion-15"), distogramLogits: true,
-      shape: { ...M, loops: (M.loops ?? 3) + 1 },
-      weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
-      tower: runTower,
-    });
-    const { features, coordinates } = result;
-    const named = (atom, want) => {
-      for (let i = 0; i < 4; i += 1) {
-        const wanted = i < want.length ? want.charCodeAt(i) - 32 : 0;
-        if (features.refAtomNameChars[atom * 4 + i] !== wanted) return false;
+    for (const rate of rates) {
+      const sequence = corrupt(crystal.sequence, rate / 100, seed + code.charCodeAt(0));
+      const result = await foldEsmfold2(device, {
+        sequence, allocator, seed,
+        sampler: option(args, "sampler", "diffusion-15"), distogramLogits: true,
+        shape: { ...M, loops: (M.loops ?? 3) + 1 },
+        weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+        tower: runTower,
+      });
+      const { features, coordinates } = result;
+      const named = (atom, want) => {
+        for (let i = 0; i < 4; i += 1) {
+          const wanted = i < want.length ? want.charCodeAt(i) - 32 : 0;
+          if (features.refAtomNameChars[atom * 4 + i] !== wanted) return false;
+        }
+        return true;
+      };
+      const alpha = new Int32Array(result.tokens).fill(-1);
+      const representative = new Int32Array(result.tokens).fill(-1);
+      for (let atom = 0; atom < result.atoms; atom += 1) {
+        if (features.mask[atom] === 0) continue;
+        const token = features.atomToToken[atom];
+        if (named(atom, "CA")) alpha[token] = atom;
+        if (named(atom, "CB")) representative[token] = atom;
       }
-      return true;
-    };
-    // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM AND lDDT IS OVER THE
-    // ALPHA CARBON, so both are gathered. Scoring CA-CA distances against a
-    // CB-CB distribution would read as a weak estimator rather than a wrong
-    // comparison; upstream's `compute_representative_atoms` takes CB, or CA for
-    // glycine.
-    const alpha = new Int32Array(result.tokens).fill(-1);
-    const representative = new Int32Array(result.tokens).fill(-1);
-    for (let atom = 0; atom < result.atoms; atom += 1) {
-      if (features.mask[atom] === 0) continue;
-      const token = features.atomToToken[atom];
-      if (named(atom, "CA")) alpha[token] = atom;
-      if (named(atom, "CB")) representative[token] = atom;
-    }
-    for (let token = 0; token < result.tokens; token += 1) {
-      if (representative[token] < 0) representative[token] = alpha[token];
-    }
-    const gather = (slots) => {
-      const out = new Float32Array(result.tokens * 3);
       for (let token = 0; token < result.tokens; token += 1) {
-        for (let axis = 0; axis < 3; axis += 1) {
-          out[token * 3 + axis] = coordinates[slots[token] * 3 + axis];
+        if (representative[token] < 0) representative[token] = alpha[token];
+      }
+      const gather = (slots) => {
+        const out = new Float32Array(result.tokens * 3);
+        for (let token = 0; token < result.tokens; token += 1) {
+          for (let axis = 0; axis < 3; axis += 1) {
+            out[token * 3 + axis] = coordinates[slots[token] * 3 + axis];
+          }
+        }
+        return out;
+      };
+      const modelAlpha = gather(alpha);
+      const modelRepresentative = gather(representative);
+      const lddt = perResidueLddt(modelAlpha, crystal.coordinates, result.tokens);
+      let mean = 0;
+      for (const value of lddt) mean += value;
+      mean /= lddt.length;
+
+      const measures = pairMeasures(result.distogram.logits, result.distogram.bias,
+        modelRepresentative, result.tokens, M.distogramBins, RADII);
+      for (const measure of MEASURE_NAMES) {
+        const scorer = cumulativeScorer(measures.named.get(measure), measures.mode,
+                                        result.tokens, SEPARATIONS, CUTOFFS);
+        for (const arm of arms) {
+          if (arm.measure !== measure) continue;
+          const score = scorer(arm.s, arm.c);
+          const rho = spearman(score, lddt);
+          arm.pearson.push(pearson(score, lddt));
+          arm.spearman.push(rho);
+          arm.byRate.get(rate).push(rho);
+          // 🔴 THE GLOBAL SIGNAL IS A DIFFERENT QUESTION FROM THE PER-RESIDUE
+          // ONE, AND A MORE USEFUL ONE. "Which residue is least reliable" needs
+          // an ordering inside a fold; "is this fold worth anything" needs one
+          // ACROSS folds, and only the second survives a label that stops
+          // meaning what it did. One point per fold: the mean of the estimate
+          // against the mean lDDT.
+          let total = 0;
+          for (const value of score) total += value;
+          (arm.global ??= []).push([total / score.length, mean]);
         }
       }
-      return out;
-    };
-    const modelAlpha = gather(alpha);
-    const modelRepresentative = gather(representative);
-    const lddt = perResidueLddt(modelAlpha, crystal.coordinates, result.tokens);
-    let mean = 0;
-    for (const value of lddt) mean += value;
-    mean /= lddt.length;
-    const sorted = [...lddt].sort((a, b) => a - b);
-    const measures = pairMeasures(result.distogram.logits, result.distogram.bias,
-      modelRepresentative, result.tokens, M.distogramBins, RADII);
-    // ...one cumulative table at a time, so thirty of them never coexist.
-    for (const measure of MEASURE_NAMES) {
-      const scorer = cumulativeScorer(measures.named.get(measure), measures.mode,
-                                      result.tokens, SEPARATIONS, CUTOFFS);
-      for (const arm of arms) {
-        if (arm.measure !== measure) continue;
-        const score = scorer(arm.s, arm.c);
-        arm.pearson.push(pearson(score, lddt));
-        arm.spearman.push(spearman(score, lddt));
-      }
+      const neighbours = neighbourCount(modelAlpha, result.tokens);
+      const sorted = [...lddt].sort((a, b) => a - b);
+      perTarget.push({ code, rate, residues: crystal.sequence.length, gaps: crystal.gaps,
+        meanLddt: mean, lddt10: sorted[Math.floor(0.1 * sorted.length)],
+        baselinePearson: pearson(neighbours, lddt),
+        baselineSpearman: spearman(neighbours, lddt) });
+      console.log(`  ${code} ${String(rate).padStart(3)}%  `
+        + `${String(crystal.sequence.length).padStart(3)} res  lDDT ${mean.toFixed(3)}`
+        + `  (10th ${sorted[Math.floor(0.1 * sorted.length)].toFixed(3)})`);
     }
-    const neighbours = neighbourCount(modelAlpha, result.tokens);
-    perTarget.push({ code, residues: crystal.sequence.length, gaps: crystal.gaps,
-      meanLddt: mean, lddt10: sorted[Math.floor(0.1 * sorted.length)],
-      baselinePearson: pearson(neighbours, lddt),
-      baselineSpearman: spearman(neighbours, lddt) });
-    console.log(`  ${code}  ${String(crystal.sequence.length).padStart(3)} res`
-      + `  lDDT ${mean.toFixed(3)}  (10th ${sorted[Math.floor(0.1 * sorted.length)].toFixed(3)})`);
   }
 
   const folded = perTarget.filter((row) => row.skipped === undefined);
@@ -682,21 +730,39 @@ export async function main(device, args = []) {
       + `      ${arm.medianSpearman.toFixed(3).padStart(7)}  ${arm.worstSpearman.toFixed(3).padStart(7)}`);
   }
 
-  // Each axis in profile, holding the other two at the robust winner.
-  const best = robust[0];
-  const at = (measure, sIndex, cIndex) => arms.find((arm) => arm.measure === measure
-    && arm.s === sIndex && arm.c === cIndex);
-  const every = (n) => [...Array(n).keys()];
-  console.log("\n  each axis, holding the other two at that winner:");
-  console.log("  measure  " + MEASURE_NAMES.map((measure) =>
-    `${measure.replace(" ", "")}:${at(measure, best.s, best.c).medianSpearman.toFixed(3)}`)
-    .join("  "));
-  console.log("  sep      " + every(SEPARATIONS.length).filter((i) => i % 3 === 0).map((i) =>
-    `${SEPARATIONS[i]}:${at(best.measure, i, best.c).medianSpearman.toFixed(3)}`).join("  "));
-  console.log("  cutoff   " + every(CUTOFFS.length).filter((i) => i % 3 === 0
-    || CUTOFFS[i] === Infinity).map((i) =>
-    `${CUTOFFS[i] === Infinity ? "none" : CUTOFFS[i]}:`
-    + `${at(best.measure, best.s, i).medianSpearman.toFixed(3)}`).join("  "));
+  // 🔴 THE SAME ARM, RATE BY RATE. Pooling the corruptions would let the clean
+  // folds carry the corrupted ones and report a number true of neither.
+  if (rates.length > 1) {
+    console.log("\n  the leading arm, per corruption rate:");
+    console.log("  rate   folds   mean lDDT   median Spearman");
+    for (const rate of rates) {
+      const bucket = ranked[0].byRate.get(rate);
+      const lddts = perTarget.filter((row) => row.rate === rate && row.skipped === undefined)
+        .map((row) => row.meanLddt);
+      if (bucket.length === 0) continue;
+      console.log(`  ${String(rate).padStart(3)}%   ${String(bucket.length).padStart(5)}`
+        + `   ${median(lddts).toFixed(3).padStart(9)}   ${median(bucket).toFixed(3).padStart(15)}`);
+    }
+    // 🔴 AND THE GLOBAL QUESTION, WHICH THE CORRUPTIONS ARE ACTUALLY FOR. Does
+    // a fold's MEAN estimate know that the fold is bad? One point per fold,
+    // across every target and rate - an ordering across folds rather than
+    // inside one, and the question a reader really asks of a colour.
+    const globalRanked = [...arms].map((arm) => {
+      const estimate = Float64Array.from(arm.global.map((row) => row[0]));
+      const truth = Float64Array.from(arm.global.map((row) => row[1]));
+      return { arm, pearson: pearson(estimate, truth), spearman: spearman(estimate, truth) };
+    }).sort((a, b) => b.spearman - a.spearman);
+    console.log(`\n  across folds - does the mean estimate know the fold is bad?`
+      + `  (${globalRanked[0].arm.global.length} folds)`);
+    console.log("  measure   sep    cutoff    Pearson   Spearman");
+    for (const row of globalRanked.slice(0, 8)) {
+      console.log(`  ${name(row.arm)}    ${row.pearson.toFixed(3).padStart(7)}`
+        + `   ${row.spearman.toFixed(3).padStart(8)}`);
+    }
+    const chosen = globalRanked.find((row) => row.arm === ranked[0]);
+    console.log(`  ...the per-residue winner, for comparison: `
+      + `${chosen.pearson.toFixed(3)} / ${chosen.spearman.toFixed(3)}`);
+  }
 
   const describe = (arm) => ({
     measure: arm.measure,

@@ -1819,13 +1819,52 @@ exactly the difference between the winner and `conBin`.
 **The arm: `mode 1, separation 3, cutoff 16 A`** - median Pearson 0.664, median
 Spearman 0.538 against a baseline of 0.262.
 
-🔴 **AND ITS WORST TARGET IS 0.055, WHICH IS THE NUMBER THAT DECIDES WHETHER TO
-SHIP IT.** The best arm by WORST target reaches only 0.112, and it costs a fifth
-of the median to get there. So on the hardest target in 46 this ordering is
-close to uninformative - and the hardest target is precisely where somebody
-looks at a colour and asks whether to trust it. Median lDDT-Ca across the set is
-0.961, so the label is easy nearly everywhere; only 1i27 (0.826), 1lis (0.796)
-and 1luz (0.868) have real spread.
+🔴 **AND THE HARD END WAS MANUFACTURED RATHER THAN WAITED FOR.** 43 of 46 real
+targets fold above lDDT-Ca 0.9, so the label the sweep was fitted against barely
+varied. Replacing a fraction of each sequence's residues at random walks a
+target down the scale on demand: 16 targets at 0, 15, 30, 50 and 80% corruption
+is 80 folds spanning 0.943 to 0.343.
+
+| rate | mean lDDT-Ca | per-residue median Spearman |
+|---|---|---|
+| 0% | 0.943 | 0.534 |
+| 15% | 0.843 | **0.621** |
+| 30% | 0.543 | 0.399 |
+| 50% | 0.362 | 0.303 |
+| 80% | 0.343 | **0.119** |
+
+🔴 **AND THE LABEL DEGRADES WITH THE CORRUPTION, WHICH HAS TO BE SAID.** A
+mutant's true structure is not the crystal, so at 80% a low lDDT may mean "this
+sequence really does fold differently" rather than "the model is wrong". That is
+why the table is per rate rather than pooled, and why the row that carries the
+most weight is 15%: still a protein, and the label finally has spread.
+
+🔴 **SO THE PER-RESIDUE ORDERING SHOULD NOT SHIP.** Median 0.44 over the 80,
+best at mild corruption and collapsing to 0.119 on badly corrupted folds - and
+the WORST individual fold is NEGATIVE for every arm, -0.042 for the most robust
+one and -0.357 for the best-median one. An ordering that is right on average and
+inverted on some particular fold is the worst possible per-residue colour,
+because the fold somebody is staring at is the one they doubt.
+
+🔴 **AND THE GLOBAL ORDERING SHOULD, BECAUSE IT IS A DIFFERENT QUESTION AND IT
+WORKS.** "Which residue is least reliable" needs an ordering INSIDE a fold;
+"is this fold worth anything" needs one ACROSS folds. One point per fold - the
+mean of the estimate against the mean lDDT - over all 80:
+
+| | Pearson | Spearman |
+|---|---|---|
+| best arm (`mode 2, sep 6, cut 12`) | **0.902** | **0.862** |
+| the per-residue winner, for comparison | 0.864 | 0.838 |
+
+0.90 across a set spanning the whole quality range is a usable answer to the
+only confidence question this checkpoint can support. It is still an ORDERING
+and not a pLDDT - there is nothing to calibrate a number against - but "this
+fold is probably not worth looking at" is a claim it earns.
+
+🔴 **AND THE GLOBAL ARM WANTS A WIDER RADIUS THAN THE PER-RESIDUE ONE**, 2 A
+against 0 to 1. Which is a hint about what each is measuring: a per-residue
+ordering wants the sharpest possible discrimination between neighbours, and a
+per-fold one wants a stable average.
 
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and
