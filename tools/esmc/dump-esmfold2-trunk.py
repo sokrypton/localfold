@@ -174,6 +174,12 @@ def main():
     handles.append(diffusion.conditioning.register_forward_hook(
         conditioning_hook, with_kwargs=True))
 
+    # The token transformer, whose twelve blocks are the denoiser's bulk. Its
+    # output IS `output[0]` - it returns (a, intermediates) - so the shared
+    # helper is right here where it was wrong for the conditioning.
+    handles.append(diffusion.token_transformer.register_forward_hook(
+        module_hook('diffusion.tokenTransformer'), with_kwargs=True))
+
     for index, block in enumerate(encoder.atom_transformer.blocks):
         handles.append(block.register_forward_hook(
             module_hook('atom.block%d' % index), with_kwargs=True))

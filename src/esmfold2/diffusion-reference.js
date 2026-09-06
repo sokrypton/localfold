@@ -59,6 +59,7 @@ function linear(input, rows, inChannels, outChannels, weights) {
 }
 
 const silu = (x) => x / (1 + Math.exp(-x));
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 
 /**
  * One `TransitionLayer`, added to its input by the caller.
@@ -147,3 +148,172 @@ export function diffusionConditioning(zTrunk, relPos, sInputs, tHat, shape, weig
   }
   return { single, pair };
 }
+
+// Cached constants, so a per-block adaLN does not allocate two vectors a call.
+// 🔴 SIZE-GENERAL, because the first version seeded the map with 768 alone and
+// `map.get(channels)` returns undefined for anything else - which reaches
+// layerNorm as a missing scale and throws somewhere unrelated.
+const ONES = new Map();
+const ZEROS = new Map();
+const constant = (map, size, fill) => {
+  if (!map.has(size)) map.set(size, new Float32Array(size).fill(fill));
+  return map.get(size);
+};
+
+/**
+ * adaLN-Zero: normalise the activation, and take a scale and a shift from the
+ * conditioning single.
+ *
+ * 🔴 THE TWO LayerNorms ARE NOT THE SAME KIND. The activation's is
+ * affine-FREE - `F.layer_norm(a, (d,), None, None)` - and the conditioning's
+ * has a learned SCALE and no bias, `F.layer_norm(s, (d,), s_scale, None)`.
+ * There is one weight vector between them and it belongs to `s`; giving it to
+ * `a`, or giving either an offset it does not have, conforms in shape.
+ */
+export function adaptiveLayerNorm(activation, single, rows, channels, weights) {
+  const normalisedActivation = layerNorm(activation, rows, channels,
+    constant(ONES, channels, 1), constant(ZEROS, channels, 0));
+  const normalisedSingle = layerNorm(single, rows, channels,
+    weights.singleScale, constant(ZEROS, channels, 0));
+  const gate = linear(normalisedSingle, rows, channels, channels, weights.gateWeights);
+  const shift = linear(normalisedSingle, rows, channels, channels, weights.shiftWeights);
+  const out = new Float32Array(activation.length);
+  for (let row = 0; row < rows; row += 1) {
+    const base = row * channels;
+    for (let c = 0; c < channels; c += 1) {
+      const i = base + c;
+      out[i] = sigmoid(gate[i] + weights.gateBias[c]) * normalisedActivation[i] + shift[i];
+    }
+  }
+  return out;
+}
+
+
+/**
+ * Attention biased by the pair representation, gated twice.
+ *
+ * 🔴 THE SOFTMAX IS OVER THE KEY AXIS OF AN (i, j, head) TENSOR, which is
+ * `dim=-2` upstream and not the last axis. A softmax over the heads instead
+ * sums to one and returns a plausible tensor.
+ *
+ * 🔴 AND THERE ARE TWO GATES, FROM DIFFERENT THINGS. `g_proj` gates the
+ * per-head context from the ADALN-MODULATED activation, and `out_gate` gates
+ * the whole output from the CONDITIONING SINGLE - and only the second has a
+ * bias, initialised to -2 upstream so a fresh block starts nearly closed.
+ */
+export function attentionPairBias(activation, single, pair, tokens, channels,
+                                  pairChannels, heads, weights) {
+  const headDim = channels / heads;
+  const x = adaptiveLayerNorm(activation, single, tokens, channels, weights.adaln);
+
+  const query = linear(x, tokens, channels, channels, weights.queryWeights);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let c = 0; c < channels; c += 1) query[token * channels + c] += weights.queryBias[c];
+  }
+  const kv = linear(x, tokens, channels, channels * 2, weights.kvWeights);
+  const gate = linear(x, tokens, channels, channels, weights.gateWeights);
+
+  // One scalar per (i, j, head), from the pair representation.
+  const pairs = tokens * tokens;
+  const bias = linear(
+    layerNorm(pair, pairs, pairChannels, weights.pairNormScale, weights.pairNormOffset),
+    pairs, pairChannels, heads, weights.pairBiasWeights);
+
+  const scale = 1 / Math.sqrt(headDim);
+  const context = new Float32Array(tokens * channels);
+  const logits = new Float32Array(tokens);
+  for (let head = 0; head < heads; head += 1) {
+    for (let i = 0; i < tokens; i += 1) {
+      const queryBase = i * channels + head * headDim;
+      let largest = -Infinity;
+      for (let j = 0; j < tokens; j += 1) {
+        const keyBase = j * channels * 2 + head * headDim;
+        let total = 0;
+        for (let d = 0; d < headDim; d += 1) total += query[queryBase + d] * kv[keyBase + d];
+        logits[j] = total * scale + bias[(i * tokens + j) * heads + head];
+        if (logits[j] > largest) largest = logits[j];
+      }
+      let sum = 0;
+      for (let j = 0; j < tokens; j += 1) {
+        logits[j] = Math.exp(logits[j] - largest);
+        sum += logits[j];
+      }
+      const outBase = i * channels + head * headDim;
+      for (let j = 0; j < tokens; j += 1) {
+        const weight = logits[j] / sum;
+        // ...the value is the SECOND half of kv, so it starts a whole
+        // `channels` further along the row.
+        const valueBase = j * channels * 2 + channels + head * headDim;
+        for (let d = 0; d < headDim; d += 1) {
+          context[outBase + d] += weight * kv[valueBase + d];
+        }
+      }
+    }
+  }
+  for (let i = 0; i < context.length; i += 1) context[i] *= sigmoid(gate[i]);
+  const out = linear(context, tokens, channels, channels, weights.outWeights);
+  const outGate = linear(single, tokens, channels, channels, weights.outGateWeights);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let c = 0; c < channels; c += 1) {
+      const i = token * channels + c;
+      out[i] *= sigmoid(outGate[i] + weights.outGateBias[c]);
+    }
+  }
+  return out;
+}
+
+/**
+ * The conditioned transition.
+ *
+ * 🔴 AND THIS ONE FUSES ITS GATE WHERE THE CONDITIONING'S DOES NOT, IN THE SAME
+ * MODULE. `lin_swish` is one Linear of `2 * hidden` split in half, gate first;
+ * `DiffusionConditioning`'s `TransitionLayer` has `a_proj` and `b_proj` as two
+ * separate Linears. Both are "a SwiGLU transition in the diffusion module" and
+ * they are packed the two different ways.
+ */
+export function conditionedTransition(activation, single, tokens, channels, hidden, weights) {
+  const x = adaptiveLayerNorm(activation, single, tokens, channels, weights.adaln);
+  const wide = linear(x, tokens, channels, hidden * 2, weights.swishWeights);
+  const gated = new Float32Array(tokens * hidden);
+  for (let token = 0; token < tokens; token += 1) {
+    const wideBase = token * hidden * 2;
+    const base = token * hidden;
+    for (let i = 0; i < hidden; i += 1) {
+      gated[base + i] = silu(wide[wideBase + i]) * wide[wideBase + hidden + i];
+    }
+  }
+  const out = linear(gated, tokens, hidden, channels, weights.outWeights);
+  const outGate = linear(single, tokens, channels, channels, weights.outGateWeights);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let c = 0; c < channels; c += 1) {
+      const i = token * channels + c;
+      out[i] *= sigmoid(outGate[i] + weights.outGateBias[c]);
+    }
+  }
+  return out;
+}
+
+/**
+ * The denoiser's twelve blocks.
+ *
+ * 🔴 THE ATTENTIONS AND THE TRANSITIONS ARE TWO SEPARATE ModuleLists, ZIPPED.
+ * `attn_blocks` and `transition_blocks` are each `num_blocks` long and the
+ * forward pairs them - so block i is `attn_blocks[i]` then
+ * `transition_blocks[i]`, not a single list of alternating modules. A flat
+ * export that interleaved them would load the right count of the wrong things.
+ */
+export function tokenTransformer(activation, single, pair, tokens, channels,
+                                 pairChannels, heads, hidden, blocks) {
+  let a = Float32Array.from(activation);
+  for (const block of blocks) {
+    const attended = attentionPairBias(a, single, pair, tokens, channels,
+                                       pairChannels, heads, block.attention);
+    for (let i = 0; i < a.length; i += 1) a[i] += attended[i];
+    const transitioned = conditionedTransition(a, single, tokens, channels, hidden,
+                                               block.transition);
+    for (let i = 0; i < a.length; i += 1) a[i] += transitioned[i];
+  }
+  return a;
+}
+
+export { layerNorm, linear, constant };

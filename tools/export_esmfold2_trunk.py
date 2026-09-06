@@ -116,6 +116,57 @@ def main():
             writer.add('%s/bProjection' % base, transposed('%s.b_proj.weight' % at))
             writer.add('%s/outProjection' % base, transposed('%s.out_proj.weight' % at))
 
+    # 🔴 THE TOKEN TRANSFORMER'S TWO ModuleLists ARE ZIPPED, NOT INTERLEAVED.
+    # `attn_blocks` and `transition_blocks` are each num_blocks long and the
+    # forward pairs them, so block i is attn_blocks[i] then transition_blocks[i].
+    # A flat export that interleaved them would load the right COUNT of the
+    # wrong things.
+    tt = 'structure_head.diffusion_module.token_transformer'
+    # 🔴 THE INDEX IS THE SEGMENT AFTER THE PREFIX, NOT A COUNT FROM THE END.
+    # `split('.')[-3]` is the layer for `attn_blocks.0.q_proj.weight` and is
+    # `adaln` for `attn_blocks.0.adaln.s_scale`, so the set held twelve numbers
+    # and a word and the count came out thirteen - which then asked for a block
+    # that does not exist.
+    prefix = '%s.attn_blocks.' % tt
+    token_blocks = len({k[len(prefix):].split('.')[0] for k in source.keys()
+                        if k.startswith(prefix)})
+    for layer in range(token_blocks):
+        a = '%s.attn_blocks.%d' % (tt, layer)
+        base = 'diffusion/tokenBlocks/%d/attention' % layer
+        writer.add('%s/adaln/singleScale' % base,
+                   np.asarray(get('%s.adaln.s_scale' % a), np.float32))
+        writer.add('%s/adaln/gateWeights' % base, transposed('%s.adaln.s_gate.weight' % a))
+        writer.add('%s/adaln/gateBias' % base,
+                   np.asarray(get('%s.adaln.s_gate.bias' % a), np.float32))
+        writer.add('%s/adaln/shiftWeights' % base, transposed('%s.adaln.s_shift.weight' % a))
+        writer.add('%s/queryWeights' % base, transposed('%s.q_proj.weight' % a))
+        writer.add('%s/queryBias' % base, np.asarray(get('%s.q_proj.bias' % a), np.float32))
+        writer.add('%s/kvWeights' % base, transposed('%s.kv_proj.weight' % a))
+        writer.add('%s/gateWeights' % base, transposed('%s.g_proj.weight' % a))
+        writer.add('%s/outWeights' % base, transposed('%s.out_proj.weight' % a))
+        writer.add('%s/outGateWeights' % base, transposed('%s.out_gate.weight' % a))
+        writer.add('%s/outGateBias' % base,
+                   np.asarray(get('%s.out_gate.bias' % a), np.float32))
+        writer.add('%s/pairNormScale' % base,
+                   np.asarray(get('%s.pair_norm.weight' % a), np.float32))
+        writer.add('%s/pairNormOffset' % base,
+                   np.asarray(get('%s.pair_norm.bias' % a), np.float32))
+        writer.add('%s/pairBiasWeights' % base, transposed('%s.pair_bias_proj.weight' % a))
+
+        t = '%s.transition_blocks.%d' % (tt, layer)
+        base = 'diffusion/tokenBlocks/%d/transition' % layer
+        writer.add('%s/adaln/singleScale' % base,
+                   np.asarray(get('%s.adaln.s_scale' % t), np.float32))
+        writer.add('%s/adaln/gateWeights' % base, transposed('%s.adaln.s_gate.weight' % t))
+        writer.add('%s/adaln/gateBias' % base,
+                   np.asarray(get('%s.adaln.s_gate.bias' % t), np.float32))
+        writer.add('%s/adaln/shiftWeights' % base, transposed('%s.adaln.s_shift.weight' % t))
+        writer.add('%s/swishWeights' % base, transposed('%s.lin_swish.weight' % t))
+        writer.add('%s/outWeights' % base, transposed('%s.lin_out.weight' % t))
+        writer.add('%s/outGateWeights' % base, transposed('%s.output_gate.weight' % t))
+        writer.add('%s/outGateBias' % base,
+                   np.asarray(get('%s.output_gate.bias' % t), np.float32))
+
     # The distogram head: two tensors, and the trunk's only output today.
     writer.add('distogram/weights', transposed('distogram_head.weight'))
     writer.add('distogram/bias', np.asarray(get('distogram_head.bias'), np.float32))
@@ -163,6 +214,10 @@ def main():
                   'tokenChannels2': int(source.shape(
                       'structure_head.diffusion_module.conditioning.s_proj.weight')[0]),
                   'transitionMultiplier': 2,
+                  'tokenBlocks': token_blocks,
+                  'tokenHeads': int(source.shape(
+                      '%s.attn_blocks.0.pair_bias_proj.weight'
+                      % 'structure_head.diffusion_module.token_transformer')[0]),
                   'sigmaData': 16.0,
                   'tokenChannels': int(source.shape(
                       '%s.atom_to_token_linear.weight'

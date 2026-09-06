@@ -74,7 +74,7 @@ values means the whole-stack checker, not that file.
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
-| Does the diffusion conditioning agree? | `node tools/check-esmfold2-conditioning.js` |
+| Does the diffusion module agree, module by module? | `node tools/check-esmfold2-diffusion.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
 | What dtype is the atom attention actually holding? | `tools/esmc/probe-esmfold2-atom-attention.py` |
@@ -1116,6 +1116,31 @@ synthesising a zero is a different model. The pair inputs are **concatenated**
 (`z_input_norm` is 512 wide, which is what says so), not added, and `z` is
 cached across the sampler's fifteen steps while `s` is not - only `s` depends on
 the noise level.
+
+🔴 **AND THE TOKEN TRANSFORMER IS PORTED TOO: 1.48e-6 ACROSS TWELVE BLOCKS.**
+Attention biased by the pair, then a conditioned transition, both wrapped in
+adaLN-Zero. Four things in it are shaped so that getting them wrong returns a
+plausible tensor:
+
+* **The two LayerNorms in adaLN are not the same kind.** The activation's is
+  affine-FREE and the conditioning's has a learned SCALE and no bias. There is
+  one weight vector between them and it belongs to `s`.
+* **The softmax is over the key axis of an `(i, j, head)` tensor** - `dim=-2`,
+  not the last. Over the heads instead it still sums to one.
+* **There are two gates, from different things.** `g_proj` gates the per-head
+  context from the adaLN-MODULATED activation; `out_gate` gates the whole output
+  from the CONDITIONING SINGLE, and only the second has a bias (initialised to
+  -2, so a fresh block starts nearly closed).
+* **`attn_blocks` and `transition_blocks` are two ModuleLists that the forward
+  ZIPS**, not one alternating list. A flat export interleaving them loads the
+  right count of the wrong things.
+
+🔴 **AND THE TOKEN TRANSITION FUSES ITS GATE WHILE THE CONDITIONING'S DOES NOT,
+IN THE SAME MODULE.** `lin_swish` is one Linear of `2 * hidden` split in half,
+gate first; `DiffusionConditioning`'s `TransitionLayer` has `a_proj` and
+`b_proj` as two Linears. Both are "a SwiGLU transition in the diffusion module"
+and they are packed the two different ways. **Read the shapes, never the
+family.**
 
 🔴 **AND THE FOURIER TABLE IS A BUFFER, WHICH IS STILL TRAINED IN.**
 `register_buffer("w", randn(c))` is drawn once at construction and saved with

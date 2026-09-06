@@ -1,9 +1,9 @@
-// ESMFold2's diffusion conditioning, against the module's own first call.
+// ESMFold2's diffusion module, module by module, against its own recorded calls.
 //
 //     .venv-esm/bin/python tools/esmc/dump-esmfold2-trunk.py \
 //         --sequence-length 40 --esmc esmc-600m --out oracle-dumps/esmfold2-trunk-40-lm.json
 //     python3 tools/export_esmfold2_trunk.py
-//     node tools/check-esmfold2-conditioning.js
+//     node tools/check-esmfold2-diffusion.js
 //
 // 🔴 IT TAKES THE MODULE'S OWN ARGUMENTS, NOT THE TRUNK'S OUTPUT. `z_trunk`,
 // `rel_pos`, `s_inputs` and `t_hat` are all recorded, so this is `f(x) == y` and
@@ -18,7 +18,8 @@ import { join } from "node:path";
 import process from "node:process";
 
 import { readTensor } from "../src/reference/dtype.js";
-import { diffusionConditioning } from "../src/esmfold2/diffusion-reference.js";
+import { diffusionConditioning, tokenTransformer }
+  from "../src/esmfold2/diffusion-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
@@ -132,7 +133,53 @@ for (const [label, mine, theirs] of [
     + `${discriminates ? "discriminates" : "DOES NOT"}`);
 }
 
+// --- the token transformer, against its own recorded call.
+if (dump.block0["diffusion.tokenTransformer"] != null) {
+  const record = dump.block0["diffusion.tokenTransformer"];
+  const channels = shape.tokenChannels;
+  const heads = manifest.trunk.tokenHeads;
+  const blocks = [];
+  for (let layer = 0; layer < manifest.trunk.tokenBlocks; layer += 1) {
+    const at = (kind, leaf) => tensors[`diffusion/tokenBlocks/${layer}/${kind}/${leaf}`];
+    const adaln = (kind) => ({
+      singleScale: at(kind, "adaln/singleScale"),
+      gateWeights: at(kind, "adaln/gateWeights"),
+      gateBias: at(kind, "adaln/gateBias"),
+      shiftWeights: at(kind, "adaln/shiftWeights"),
+    });
+    blocks.push({
+      attention: {
+        adaln: adaln("attention"),
+        queryWeights: at("attention", "queryWeights"),
+        queryBias: at("attention", "queryBias"),
+        kvWeights: at("attention", "kvWeights"),
+        gateWeights: at("attention", "gateWeights"),
+        outWeights: at("attention", "outWeights"),
+        outGateWeights: at("attention", "outGateWeights"),
+        outGateBias: at("attention", "outGateBias"),
+        pairNormScale: at("attention", "pairNormScale"),
+        pairNormOffset: at("attention", "pairNormOffset"),
+        pairBiasWeights: at("attention", "pairBiasWeights"),
+      },
+      transition: {
+        adaln: adaln("transition"),
+        swishWeights: at("transition", "swishWeights"),
+        outWeights: at("transition", "outWeights"),
+        outGateWeights: at("transition", "outGateWeights"),
+        outGateBias: at("transition", "outGateBias"),
+      },
+    });
+  }
+  const got = tokenTransformer(
+    Float32Array.from(record.arguments["0"].values),
+    Float32Array.from(record.arguments["1"].values),
+    Float32Array.from(record.arguments["2"].values),
+    tokens, channels, shape.pairChannels, heads, channels * shape.multiplier, blocks);
+  report(`token transformer (${blocks.length} blocks)`,
+    relative(got, Float32Array.from(record.output)), 5e-6);
+}
+
 console.log(failures === 0
-  ? "\nthe diffusion conditioning agrees with ESMFold2"
+  ? "\nthe diffusion conditioning and token transformer agree with ESMFold2"
   : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);
