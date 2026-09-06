@@ -2385,12 +2385,50 @@ molecule that is really there, not the aggregation eating ligand pairs: for a
 protein token only a handful of partners change category. The proposed
 per-chain fix would have been credited with this and deserved none of it.
 
-🔴 **AND THE DISTOGRAM SAYS NOTHING ABOUT WHERE THE LIGAND GOES.** It predicts
-**0** protein-ligand contacts while the structure makes **64**, on the same
-fold, and the honest 0.22 certainty above is that fact reaching the colour. It
-is not settled whether the head cannot speak about ligand pairs or the borrowed
-`CONTACT_EDGES` are wrong for them - **open**, and it is why the ligand-free
-number is the one to trust.
+🔴 **AND THE DISTOGRAM IS WEAK ON WHERE THE LIGAND GOES, WHICH IS THE MODEL AND
+NOT THE PORT.** Every other reading off the same head is excellent, which is
+what makes the comparison worth having - one fold, one head, four kinds of pair,
+predicted distance against the structure's own:
+
+| pair kind | n | bias | correlation |
+|---|---|---|---|
+| protein-protein | 2415 | +0.21 A | **0.999** |
+| sequence neighbours | 435 | +0.31 | 0.999 |
+| ligand's own atoms | 465 | +0.60 | **0.981** |
+| **ligand-protein** | 2356 | **+2.37** | **0.683** |
+
+So the head reads a ligand's GEOMETRY nearly as well as a protein's - it is
+handed the conformer in `ref_pos` and reproduces it - and reads the protein
+almost perfectly. What it is weak at is the ligand's PLACEMENT against the
+protein, which is the one thing it has to infer.
+
+🔴 **AND IT HEDGES LONG, WHICH THREE ESTIMATORS SHOW BETWEEN THEM.** For
+ligand-protein the mode is +2.37 A with an RMS of 6.64, the mean +4.11 with
+5.00, the median +3.40 with 4.44 - the mode nearest, the mean furthest, which
+is a long RIGHT tail: a peak near the right answer with mass trailing off toward
+"far away". On protein pairs all three agree to a tenth of an angstrom.
+
+🔴 **AND "ZERO PREDICTED CONTACTS" WAS A STATEMENT ABOUT A 0.5 THRESHOLD, UNTIL
+IT WAS CHECKED.** The contact map is a PROBABILITY and the panel draws it, so a
+count of pairs over 0.5 is the checker's convention rather than the head's
+opinion. Read as probabilities on the ATP fold, protein-ligand pairs max at
+**0.131** against protein-protein's 0.997 - so the threshold was not hiding
+anything after all, and the head really does refuse to believe in that contact.
+
+🔴 **BUT IT IS LIGAND-DEPENDENT, WHICH ONE TARGET WOULD HAVE MISSED.** The same
+protein against three components: **ATP 0.131, glycerol 0.211, haem 0.665**. A
+cofactor that appears in a great many structures is placed with some confidence
+and a cryoprotectant is not, which is what training coverage would look like.
+**Do not generalise a ligand result from one ligand.**
+
+🔴 **AND THE BORROWED BIN GRID CANNOT BE IMPROVED FROM THIS DATA, WHICH WAS WORTH
+TRYING.** A predicted distance is linear in the bin index, so regressing the
+expected bin on the OBSERVED distance - that direction, because the noise is in
+the prediction and the other way round is diluted - recovers the grid the head
+was trained with. It disagrees with itself: bin widths of 0.405, 0.417 and 0.449
+from the three reliable pair kinds, implying ranges from 53 to 58 A against the
+borrowed 52. The +0.21 A bias on protein pairs is half a bin at this resolution,
+which is as close as the grid can resolve. `CONTACT_EDGES` stays.
 
 🔴 **AND 8 ANGSTROMS IS A PSEUDO-BETA CONVENTION, SO IT IS THE WRONG NUMBER
 FOR EVERY PAIR THAT IS NOT TWO RESIDUES.** A distogram predicts a distance

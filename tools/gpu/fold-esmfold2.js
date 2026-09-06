@@ -382,7 +382,8 @@ export async function main(device, args = []) {
       if (kinds[name] === undefined) {
         // ...no `cutoff` field: a ligand-protein pair's threshold is the
         // RESIDUE's, so one number here would be whichever pair came first.
-        kinds[name] = { predicted: 0, actual: 0, both: 0 };
+        kinds[name] = { predicted: 0, actual: 0, both: 0,
+                        probability: { max: 0, sum: 0, n: 0 } };
       }
       return kinds[name];
     };
@@ -398,6 +399,13 @@ export async function main(device, args = []) {
         if (close) actual += 1;
         if (near && close) both += 1;
         const bucket = bucketFor(i, j);
+        // ...and what the MAP actually says, which is a probability and not a
+        // yes. "Zero predicted contacts" is a statement about the 0.5 cut, not
+        // about the head, and the panel draws the probability itself.
+        const p = result.contacts[i * result.tokens + j];
+        bucket.probability.max = Math.max(bucket.probability.max, p);
+        bucket.probability.sum += p;
+        bucket.probability.n += 1;
         if (near) bucket.predicted += 1;
         if (close) bucket.actual += 1;
         if (near && close) bucket.both += 1;
@@ -433,14 +441,25 @@ export async function main(device, args = []) {
     const centre = (bin) => CONTACT_EDGES.minimum + (bin + 0.5) * width;
     const thresholds = [4, 5, 6, 8, 10, 12];
     const blank = () => ({ pairs: 0, sums: { x: 0, y: 0, xx: 0, yy: 0, xy: 0 },
+      estimators: { mode: [], mean: [], median: [] },
+      fit: { n: 0, x: 0, y: 0, xx: 0, yy: 0, xy: 0 },
       at: Object.fromEntries(thresholds.map((t) =>
         [t, { predicted: 0, actual: 0, both: 0 }])) });
     const buckets = {};
     const probability = new Float64Array(bins);
     for (let i = 0; i < result.tokens; i += 1) {
       for (let j = i + 1; j < result.tokens; j += 1) {
-        if (neighbours(i, j)) continue;
-        const name = [KIND[molType[i]], KIND[molType[j]]].sort().join("-");
+        // 🔴 THE SWEEP KEEPS THE PAIRS THE CERTAINTY DROPS, because this is
+        // asking what the HEAD knows and not what a score should average. A
+        // ligand's own atoms are the one set of distances the model was HANDED
+        // - `ref_pos` carries the conformer - so how well it predicts them says
+        // whether it can read a ligand at all, which is the control for whether
+        // its protein-ligand answers mean anything.
+        const trivial = neighbours(i, j);
+        const same = [KIND[molType[i]], KIND[molType[j]]].sort().join("-");
+        const name = trivial
+          ? (molType[i] === 3 && molType[j] === 3 ? "ligand-intra" : "sequence-neighbour")
+          : same;
         if (buckets[name] === undefined) buckets[name] = blank();
         const bucket = buckets[name];
         // ...the head symmetrises, so the pair is read once.
@@ -456,14 +475,42 @@ export async function main(device, args = []) {
           probability[bin] = Math.exp(probability[bin] - peak);
           total += probability[bin];
         }
-        let mode = 0, best = -1;
+        // 🔴 THREE READINGS OF ONE DISTRIBUTION, because the mode is not the
+        // only one and a skewed distribution's argmax is not its centre of
+        // mass. `mode` is the bin the model likes best, `mean` its expectation
+        // over the grid, `median` the half-mass point - and which of them a
+        // contact threshold should be applied to is a question the numbers can
+        // answer rather than a convention to inherit.
+        let mode = 0, best = -1, mean = 0, median = -1, run = 0;
         for (let bin = 0; bin < bins; bin += 1) {
           probability[bin] /= total;
           if (probability[bin] > best) { best = probability[bin]; mode = bin; }
+          mean += probability[bin] * centre(bin);
+          run += probability[bin];
+          if (median < 0 && run >= 0.5) median = centre(bin);
         }
         const a = representative[i] * 3, b = representative[j] * 3;
         const observed = Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1], x[b + 2] - x[a + 2]);
         const predictedDistance = centre(mode);
+        // 🔴 AND THE BIN GRID ITSELF IS FITTED, NOT ASSUMED. `CONTACT_EDGES` is
+        // borrowed from the DISABLED confidence head - 2 to 52 over 128 bins -
+        // and nothing has ever checked it against a distance. A predicted
+        // distance is linear in the bin index, so regressing the OBSERVED
+        // distance on the expected bin index recovers the grid the head was
+        // trained with: the intercept is the first bin's centre and the slope
+        // is the bin width. Protein-protein pairs are the ones to fit on, at
+        // r = 0.999.
+        let meanBin = 0;
+        for (let bin = 0; bin < bins; bin += 1) meanBin += probability[bin] * bin;
+        bucket.fit.n += 1;
+        bucket.fit.x += meanBin;
+        bucket.fit.y += observed;
+        bucket.fit.xx += meanBin * meanBin;
+        bucket.fit.yy += observed * observed;
+        bucket.fit.xy += meanBin * observed;
+        bucket.estimators.mode.push(predictedDistance - observed);
+        bucket.estimators.mean.push(mean - observed);
+        bucket.estimators.median.push(median - observed);
         bucket.pairs += 1;
         bucket.sums.x += predictedDistance;
         bucket.sums.y += observed;
@@ -487,8 +534,34 @@ export async function main(device, args = []) {
       .map(([name, v]) => {
         const n = v.pairs, { x: sx, y: sy, xx, yy, xy } = v.sums;
         const denominator = Math.sqrt((n * xx - sx * sx) * (n * yy - sy * sy));
+        const spread = (values) => {
+          const bias = values.reduce((t, v) => t + v, 0) / values.length;
+          const rms = Math.sqrt(values.reduce((t, v) => t + v * v, 0) / values.length);
+          return { bias: Number(bias.toFixed(2)), rms: Number(rms.toFixed(2)) };
+        };
+        // 🔴 REGRESSED THE OTHER WAY ROUND, because the noise is in the
+        // PREDICTION and not in the distance. Fitting observed-on-predicted
+        // attenuates the slope by the predictor's noise - classic regression
+        // dilution - and reads a grid finer than the real one. The observed
+        // distance is a measured coordinate; the expected bin is the model's
+        // guess, so `bin = a + b * distance` is the direction that is not
+        // biased, and the grid is its inverse.
+        const f = v.fit;
+        const denom = f.n * f.yy - f.y * f.y;
+        const perAngstrom = denom === 0 ? null : (f.n * f.xy - f.x * f.y) / denom;
+        const slope = perAngstrom === null || perAngstrom === 0 ? null : 1 / perAngstrom;
+        const intercept = slope === null ? null
+          : -((f.x - perAngstrom * f.y) / f.n) * slope;
         return [name, {
           pairs: n,
+          grid: slope === null ? null : {
+            firstBinCentre: Number(intercept.toFixed(3)),
+            binWidth: Number(slope.toFixed(4)),
+            impliedRange: [Number((intercept - slope / 2).toFixed(2)),
+                           Number((intercept - slope / 2 + slope * 128).toFixed(2))],
+          },
+          estimators: Object.fromEntries(Object.entries(v.estimators)
+            .map(([k, values]) => [k, spread(values)])),
           meanPredicted: sx / n, meanObserved: sy / n,
           distanceCorrelation: denominator === 0 ? null
             : (n * xy - sx * sy) / denominator,
