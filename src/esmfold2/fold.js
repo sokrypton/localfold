@@ -417,12 +417,14 @@ export async function foldEsmfold2(device, options) {
     // denoiser is holding its own pair conditioning and twelve bias tensors by
     // then - so running it here costs nothing and running it at the end raises
     // the peak by a whole pair representation.
-    const contacts = options.contacts === false ? undefined
+    const distogram = options.contacts === false ? undefined
       : await mark("distogram", () => encodeContactMap(
         { device, allocator, cache, submit },
         { tokens, channels, bins: shape.distogramBins, pair,
           weights: weights.featuriser.distogramWeights,
-          bias: weights.featuriser.distogramBias }));
+          bias: weights.featuriser.distogramBias,
+          wantLogits: options.distogramLogits === true }));
+    const contacts = distogram?.contacts ?? distogram;
     await options.onContacts?.(contacts);
 
     // ---- the sampler.
@@ -479,6 +481,7 @@ export async function foldEsmfold2(device, options) {
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts,
+      distogram: options.distogramLogits === true ? distogram : undefined,
       steps: levels.length, scheduleLength: schedule.length, settings,
       elapsedMilliseconds: performance.now() - started, timings, memory,
     };

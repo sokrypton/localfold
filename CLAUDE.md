@@ -81,6 +81,7 @@ values means the whole-stack checker, not that file.
 | Does the featuriser build what ESMFold2 was handed? | `node tools/check-esmfold2-featurise.js` |
 | **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` |
 | Which of a sampler step's two coordinate sets is the picture? | `tools/gpu/probe-esmfold2-trajectory.js` |
+| Can anything stand in for the confidence head this checkpoint lacks? | `tools/gpu/probe-esmfold2-confidence.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
@@ -1744,6 +1745,47 @@ of rigid motion. Superposed, the real movement is 0.02-0.80 A. Unfitted playback
 is a protein tumbling, with the convergence it exists to show invisible
 underneath. `fittedPdb` and `alphaCarbons` are AF3's, exported rather than
 copied.
+
+🔴 **AND THE DISTOGRAM CAN ORDER RESIDUES BY CONFIDENCE, BUT NOT THE WAY IT
+LOOKS LIKE IT SHOULD.** The natural proposal - cross-entropy of the distogram
+against the distances the sampler actually produced, `exp(-CCE)` (which is
+exactly the predicted probability of the observed bin), meaned over the best N
+partners beyond a sequence separation - works, and is beaten by a control that
+ignores the structure entirely. `tools/gpu/probe-esmfold2-confidence.js`,
+against per-residue **lDDT-Ca** because that is the quantity pLDDT predicts:
+
+| | 1QYS (92 res) | 6MRR (68 res) |
+|---|---|---|
+| mean lDDT-Ca | 0.918 | 0.930 |
+| **exp(-CCE), best top-N** | 0.558 / 0.551 | 0.758 / 0.468 |
+| **peakedness alone (control)** | **0.658 / 0.610** | **0.797 / 0.468** |
+| neighbour count (baseline) | 0.284 / 0.315 | 0.036 / -0.154 |
+
+Pearson / Spearman. The proposal beats the buriedness baseline by about 2x, so
+the signal is real - and the distogram's own PEAKEDNESS, the same aggregate over
+the same pairs with the observed bin replaced by the distribution's maximum,
+beats it on both targets and both measures.
+
+🔴 **SO THE STRUCTURE TERM IS NOT REDUNDANT, IT IS HARMFUL.** The sampler
+largely realises the distogram's mode, so `p(observed)` is `p(mode)` minus
+whatever the sampler's own draw moved - and that difference is SAMPLER VARIANCE,
+not model uncertainty, so it dilutes the signal rather than adding to it. The
+control is also cheaper and available EARLIER: it needs no coordinates, so it
+exists as soon as the trunk has run.
+
+🔴 **AND NEITHER IS A pLDDT, WHICH IS THE SAME WALL commit 588b528 HIT.** Four
+distogram-derived estimates were removed from this tree once already, and the
+reason was that almost all of any fit is a two-number calibration that does not
+cross models. `exp(-CCE)` and peakedness are both bounded in [0, 1] so they need
+no affine map to be READ - but that makes them an ORDERING, not a predicted
+lDDT, and a page reporting either as a number would be inventing the model's
+opinion of its own answer. As a colour it is defensible; as "pLDDT 87" it is
+not.
+
+🔴 **AND BOTH TARGETS ARE FOLDED WELL, WHICH IS THE WEAKNESS OF THE TEST.**
+lDDT-Ca 0.918 and 0.930, tenth percentiles 0.842 and 0.858 - a label with little
+spread. A confidence estimate earns its place on a target the model FAILS, and
+this probe has not seen one.
 
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and

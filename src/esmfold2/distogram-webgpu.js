@@ -98,7 +98,8 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  * @returns {Float32Array} one probability per token pair
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
-                                                  weights, bias, chunk = 8192 }) {
+                                                  weights, bias, chunk = 8192,
+                                                  wantLogits = false }) {
   const { allocator, cache, submit, device } = context;
   const pairs = tokens * tokens;
   const storage = GPUBufferUsage.STORAGE;
@@ -128,8 +129,15 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       pairs * channels * 4, storage));
     const projection = keep(allocator.upload("w.esmfold2.disto", weights, storage));
     const biasBuffer = keep(allocator.upload("w.esmfold2.disto-bias", bias, storage));
+    // 🔴 THE LOGITS ARE A CHUNK UNLESS A CALLER WANTS THEM ALL. The contact map
+    // needs one chunk's worth at a time - it collapses 128 bins to one number
+    // per pair as it goes - and keeping every logit is `bins` times the pair
+    // representation, 46 MiB at 300 tokens. A caller scoring a STRUCTURE
+    // against the distribution needs them, because the distances it scores do
+    // not exist until the sampler has run.
     const logits = keep(allocator.allocate("esmfold2.disto.logits",
-      height * bins * 4, storage));
+      (wantLogits ? pairs : height) * bins * 4,
+      storage | (wantLogits ? GPUBufferUsage.COPY_SRC : 0)));
     const contacts = keep(allocator.allocate("esmfold2.disto.contacts",
       pairs * 4, storage | GPUBufferUsage.COPY_SRC));
     await submit("esmfold2.distogram", [
@@ -140,10 +148,17 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       await submit("esmfold2.distogram", [
         ["project", project[rows],
          [{ buffer: symmetric.buffer, byteOffset: start * channels * 4,
-            byteSize: rows * channels * 4 }, projection, logits],
+            byteSize: rows * channels * 4 }, projection,
+          wantLogits
+            ? { buffer: logits.buffer, byteOffset: start * bins * 4,
+                byteSize: rows * bins * 4 }
+            : logits],
          ...linearGrid(rows, bins)],
         ["contacts", contact[rows],
-         [logits, biasBuffer,
+         [wantLogits
+            ? { buffer: logits.buffer, byteOffset: start * bins * 4,
+                byteSize: rows * bins * 4 }
+            : logits, biasBuffer,
           { buffer: contacts.buffer, byteOffset: start * 4, byteSize: rows * 4 }],
          ...elementwise(rows)],
       ]);
@@ -156,7 +171,20 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     await readback.buffer.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(readback.buffer.getMappedRange().slice(0));
     readback.buffer.unmap();
-    return out;
+    if (!wantLogits) return out;
+    // 🔴 THE BIAS IS NOT IN THE BUFFER, because the projection has none and the
+    // contact pass adds it as it reads. A caller taking the logits away has to
+    // be handed the bias too, or it will softmax a distribution missing 128
+    // numbers - which is still a distribution, just the wrong one.
+    const readLogits = keep(allocator.allocate("esmfold2.disto.logits-readback",
+      pairs * bins * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    const second = device.createCommandEncoder({ label: "esmfold2.disto.logits" });
+    second.copyBufferToBuffer(logits.buffer, 0, readLogits.buffer, 0, pairs * bins * 4);
+    device.queue.submit([second.finish()]);
+    await readLogits.buffer.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(readLogits.buffer.getMappedRange().slice(0));
+    readLogits.buffer.unmap();
+    return { contacts: out, logits: values, bias };
   } finally {
     for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();
   }
