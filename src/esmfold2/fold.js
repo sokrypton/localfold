@@ -56,10 +56,32 @@ import {
  * model never sees. `steps` here is the schedule's length before truncation,
  * and `run` reports how many actually ran.
  */
+/**
+ * 🔴 AND SIX STEPS IS NOT "FASTER", IT IS BROKEN, WHICH IS WHY THE TABLE IS
+ * HERE. Measured on ubiquitin's first 40 residues against ESMFold2's own fold,
+ * one seed each - a direction rather than a margin, but the top row is not a
+ * margin:
+ *
+ * | preset | steps run | CA-CA | RMSD |
+ * |---|---|---|---|
+ * | diffusion-8 | 6 | **58.0 A** | **48.1 A** |
+ * | flow-8 | 6 | 4.27 | 1.72 |
+ * | diffusion-15 (shipped) | 11 | 3.806 | 1.05 |
+ * | flow-16 | 12 | 3.804 | 1.01 |
+ * | diffusion-32 | 23 | 3.802 | 1.14 |
+ * | diffusion-200 | 138 | 3.808 | 1.48 |
+ *
+ * A peptide bond is 3.8 A, so `diffusion-8` is not a structure. The churn is
+ * what breaks: `gamma0` re-noises to `sigma * 1.605` and `step_scale` 1.638
+ * then overshoots, and at six steps the gap between noise levels is too wide
+ * for either to be corrected. The flow arm at the same six steps is merely
+ * poor, because it re-noises not at all. More steps than the schedule buy
+ * nothing here - 138 of them is no better than 11 and is eight times the time.
+ */
 export const SAMPLER_PRESETS = {
   /** What the checkpoint ships: 15 scheduled, 11 after the 256 cap. */
   "diffusion-15": { steps: 15, maxSigma: 256 },
-  /** Fewer steps for a quick look; the same schedule, sampled coarsely. */
+  /** Fewer steps for a quick look. See the table: six of them is not a fold. */
   "diffusion-8": { steps: 8, maxSigma: 256 },
   "diffusion-32": { steps: 32, maxSigma: 256 },
   "diffusion-64": { steps: 64, maxSigma: 256 },

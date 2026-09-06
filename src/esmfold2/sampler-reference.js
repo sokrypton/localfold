@@ -326,7 +326,12 @@ export function centreRandomAugmentation(x, mask, atoms, draw) {
  * model's own draw. xorshift32 plus Box-Muller.
  */
 export function gaussians(seed) {
-  let state = (seed >>> 0) || 1;
+  // 🔴 SEED 0 AND SEED 1 GAVE THE SAME STREAM. `(seed >>> 0) || 1` sends zero
+  // to one, so the two commonest seeds a caller reaches for were the same fold
+  // - and it looked like a working seed axis, because seeds 2 and 3 differed.
+  // Mixing with the golden ratio's fractional part keeps every seed distinct
+  // and still cannot produce xorshift's fixed point.
+  let state = ((seed >>> 0) ^ 0x9e3779b9) >>> 0 || 1;
   const uniform = () => {
     state ^= state << 13; state >>>= 0;
     state ^= state >> 17;

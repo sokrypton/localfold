@@ -27,8 +27,8 @@ import {
 } from "../src/esmfold2/featuriser-reference.js";
 import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
 import { denoiseStep } from "../src/esmfold2/diffusion-reference.js";
-import { churnFactors, noiseLevels, noiseSchedule, samplerStep, weightedRigidAlign }
-  from "../src/esmfold2/sampler-reference.js";
+import { centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
+         samplerStep, weightedRigidAlign } from "../src/esmfold2/sampler-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const flag = (name, fallback) => {
@@ -39,25 +39,6 @@ const bundleDirectory = flag("bundle", join(ROOT, "model-esmfold2-trunk-f32"));
 const dumpPath = flag("dump", join(ROOT, "oracle-dumps", "esmfold2-trunk-40-lm.json"));
 const seed = Number(flag("seed", "0"));
 const out = flag("out", join(ROOT, "esmfold2-fold.pdb"));
-
-/** A seeded Gaussian, so a run is reproducible even though it is not the model's. */
-function gaussians(seed) {
-  let state = (seed >>> 0) || 1;
-  const uniform = () => {
-    state ^= state << 13; state >>>= 0;
-    state ^= state >> 17;
-    state ^= state << 5; state >>>= 0;
-    return (state + 1) / 4294967297;
-  };
-  let spare = null;
-  return () => {
-    if (spare !== null) { const value = spare; spare = null; return value; }
-    const u = uniform(), v = uniform();
-    const radius = Math.sqrt(-2 * Math.log(u));
-    spare = radius * Math.sin(2 * Math.PI * v);
-    return radius * Math.cos(2 * Math.PI * v);
-  };
-}
 
 function loadBundle(directory) {
   const manifest = JSON.parse(readFileSync(join(directory, "manifest.json"), "utf8"));
@@ -270,43 +251,11 @@ const denoiserWeights = {
   tokenNormOffset: tensors["diffusion/tokenNorm/offset"],
 };
 
-/** Algorithm 19: centre on the live atoms, rotate randomly, translate randomly. */
-function centreRandomAugmentation(x) {
-  let total = 0;
-  const centre = [0, 0, 0];
-  for (let atom = 0; atom < atoms; atom += 1) {
-    const w = mask[atom];
-    total += w;
-    for (let axis = 0; axis < 3; axis += 1) centre[axis] += w * x[atom * 3 + axis];
-  }
-  for (let axis = 0; axis < 3; axis += 1) centre[axis] /= Math.max(total, 1);
-  // A uniform random rotation from a normalised quaternion, as upstream.
-  const q = [draw(), draw(), draw(), draw()];
-  const scale = Math.hypot(q[0], q[1], q[2], q[3]) * (q[0] < 0 ? -1 : 1);
-  const [r, i, j, k] = q.map((value) => value / scale);
-  const twoS = 2 / (r * r + i * i + j * j + k * k);
-  const R = [
-    1 - twoS * (j * j + k * k), twoS * (i * j - k * r), twoS * (i * k + j * r),
-    twoS * (i * j + k * r), 1 - twoS * (i * i + k * k), twoS * (j * k - i * r),
-    twoS * (i * k - j * r), twoS * (j * k + i * r), 1 - twoS * (i * i + j * j),
-  ];
-  const shift = [draw(), draw(), draw()];
-  const out = new Float32Array(x.length);
-  for (let atom = 0; atom < atoms; atom += 1) {
-    for (let axis = 0; axis < 3; axis += 1) {
-      let sum = 0;
-      for (let d = 0; d < 3; d += 1) sum += (x[atom * 3 + d] - centre[d]) * R[d * 3 + axis];
-      out[atom * 3 + axis] = sum + shift[axis];
-    }
-  }
-  return out;
-}
-
 let x = new Float32Array(atoms * 3);
 for (let i = 0; i < x.length; i += 1) x[i] = schedule[0] * draw();
 let cached;
 for (let step = 0; step < levels.length; step += 1) {
-  x = centreRandomAugmentation(x);
+  x = centreRandomAugmentation(x, mask, atoms, draw);
   const tHat = levels[step];
   const sigmaTm = schedule[step];
   const epsilon = s.noiseScale * Math.sqrt(Math.max(tHat * tHat - sigmaTm * sigmaTm, 0));
