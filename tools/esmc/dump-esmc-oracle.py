@@ -58,6 +58,10 @@ def main():
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
     parser.add_argument('--sequence-length', type=int, default=59)
     parser.add_argument('--out', default=None)
+    # The pair representation is L^2 x 256 floats: 36 MB of JSON at 59 residues
+    # and 1.6 GB at 400. The tower checker never reads it - only the reference
+    # checker builds a pair - so a length sweep skips it.
+    parser.add_argument('--skip-pair', action='store_true')
     arguments = parser.parse_args()
 
     torch.set_grad_enabled(False)
@@ -76,7 +80,7 @@ def main():
 
     states = tower.hidden_states(ids)
     single = shim.single(states[:, 1:-1, :])
-    pair = shim.pair(single)
+    pair = None if arguments.skip_pair else shim.pair(single)
 
     payload = {
         'sequence': sequence,
@@ -96,11 +100,11 @@ def main():
         'states': {str(k): tolist(states[k]) for k in (0, 1, 18, 35, 36)},
         'mix': tolist(shim.combine),
         'single': tolist(single),
-        'pair': tolist(pair),
+        **({} if pair is None else {'pair': tolist(pair)}),
         'shapes': {
             'embedded': list(embedded.shape), 'block0Output': list(first.shape),
             'state': list(states[0].shape), 'single': list(single.shape),
-            'pair': list(pair.shape),
+            **({} if pair is None else {'pair': list(pair.shape)}),
             **{name: list(value.shape) for name, value in record.items()},
         },
     }

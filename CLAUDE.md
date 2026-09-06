@@ -82,6 +82,7 @@ values means the whole-stack checker, not that file.
 | ...and does the WebGPU block? | `tools/gpu/check-esmc-block.js` |
 | ...and the whole 36-block tower, and the shim? | `tools/gpu/check-esmc-tower.js` |
 | What does an ESM-C block cost? | `tools/gpu/bench-esmc-tower.js` |
+| ...and is the tower right at more than one length? | `check-esmc-tower.js --dump=/oracle-dumps/esmc-{59,128,180}.json` |
 
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
 
