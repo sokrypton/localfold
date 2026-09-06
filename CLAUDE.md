@@ -2568,6 +2568,42 @@ under the wrong ones. What was wrong was the LABEL on every bin, which
 `probe-af2-dgram-plddt.js` writes into its dump, and any expected distance a
 future caller takes. Found by reading OpenFold3's loss, not by a failing check.
 
+🔴 **AND THE GATE THAT SHOULD HAVE CAUGHT IT LOOKED AT `tensors` ALONE.**
+`manifest_mismatches` compared the compiled module's tensor table against the
+exporter's `manifest.json` and nothing else, so `distogramHead` - which is a
+sibling of `tensors`, not a member - could differ between them for as long as it
+liked. It compares EVERY key now, `shardDigests` excepted because the writer
+computes that and the exporter does not write it. Held to a negative control:
+put 2.0 back into `model/manifest.json` alone and the build fails naming
+`distogramHead`; under the previous gate the identical corruption is silent.
+
+🔴 **AND IT HAD STOPPED RUNNING AT ALL, BECAUSE CHECKING SAT INSIDE
+PUBLISHING.** The registry check and the manifest check lived under
+`if include_model:`, which was sound while bundles were published from here.
+Every bundle is hosted now and the Pages workflow runs `build_site.py` with no
+`--model`, so the one gate that says the compiled manifest still describes the
+shipped weights ran on no deploy. **What a bundle's manifest SAYS ships with the
+page wherever its shards live; only the COPY is opt-in.** Both checks are out of
+that branch, and a remote family is checked before it is skipped for publishing
+- which is why the two AF2 families, the only two with an exporter manifest to
+compare against, were the two never compared.
+
+🔴 **AND `--model` NOW EXITS 0 WHEN EVERY BUNDLE IS REMOTE.** It skipped all
+eight as hosted, shipped none, and reported *"no export directory exists"* with
+the directories sitting right there - a message naming a cause that is not the
+cause. "Nothing was published" is not "nothing exists".
+
+🔴 **AND ALL EIGHT BUNDLES ARE REPINNED TO ONE SHA, `71ece357`.** The hosted
+`manifest.json` copies carried the wrong breaks too. Nothing fetches them - the
+page reads the compiled module - but a second copy that can disagree is this
+session's own recurring bug, so they were corrected and uploaded. **The upload
+alone would not have changed what is served**: the remotes pin a commit, so the
+old snapshot goes on answering until the pin moves. Verified before repinning by
+comparing the two commits' blob OIDs through the tree API rather than
+downloading anything: **2 files changed across all eight bundles, both of them
+these manifests, every shard the same blob.** Then folded through it - AF2
+monomer at pLDDT 84.5 and EF2-fast at certainty 0.84, both from the new pin.
+
 🔴 **AND `named` MATCHES ALL FOUR NAME CHARACTERS, WHICH IS LOAD-BEARING HERE.**
 "C4" must not match C4', which every nucleotide also has and which is back out
 on the sugar - a silent 4 A error in the representative.

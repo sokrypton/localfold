@@ -222,13 +222,24 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
     # ...the manifest may also still exist beside the weights. When it does it
     # was written by the exporter, so it is the authority and any difference
     # means the committed copy is stale.
+    #
+    # 🔴 EVERY KEY, NOT THE TENSOR TABLE. This compared `tensors` alone, and a
+    # manifest is more than its tensors: `distogramHead` carries AlphaFold 2's
+    # bin breaks, and those were wrong in both AF2 manifests for a long time
+    # with this check looking straight past them. Anything the exporter wrote
+    # and the module copied can drift, so the comparison is over the whole
+    # object. `shardDigests` is the one exception - the writer computes it from
+    # the shards and the exporter does not write it at all.
     on_disk = model / "manifest.json"
     if on_disk.is_file():
         exported = json.loads(on_disk.read_text(encoding="utf-8"))
-        if exported.get("tensors") != tensors:
+        keys = (set(exported) | set(manifest)) - {"shardDigests"}
+        differing = sorted(key for key in keys
+                           if exported.get(key) != manifest.get(key))
+        if differing:
             problems.append(
-                f"{relative} disagrees with {model.name}/manifest.json;"
-                " re-run tools/write_manifest_module.py")
+                f"{relative} disagrees with {model.name}/manifest.json on"
+                f" {', '.join(differing)}; re-run tools/write_manifest_module.py")
 
     # ...the strongest check available, and the one that actually catches the
     # failure this guards: a manifest describing a PREVIOUS export sits at
@@ -360,23 +371,49 @@ def build(include_model: bool) -> int:
         "builtAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     }) + "\n", encoding="utf-8")
 
+    # ...EVERY FAMILY THE REGISTRY KNOWS, on the same terms, WHETHER OR NOT ANY
+    # PARAMETERS ARE BEING PUBLISHED.
+    #
+    # 🔴 CHECKING IS NOT PUBLISHING, AND CONFLATING THEM MADE THIS GATE DEAD.
+    # The registry check and the manifest check used to sit inside `if
+    # include_model:`, which was sound while bundles were published from here.
+    # Every bundle is hosted on Hugging Face now and the Pages workflow runs
+    # `build_site.py` with no --model at all - so the one check that says the
+    # compiled manifest still describes the shipped weights had stopped running
+    # on every deploy. What a bundle's manifest SAYS is shipped with the page
+    # regardless of where its shards live; only the COPY is opt-in.
+    problems = registry_mismatches()
+    if problems:
+        print("the model registries disagree:", file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        return 1
+    remote = remote_families()
+    for family, bundle in sorted(BUNDLES.items()):
+        model = ROOT / bundle["export"]
+        if not model.is_dir():
+            continue
+        # 🔴 A REMOTE BUNDLE IS CHECKED TOO, BECAUSE ITS MODULE STILL SHIPS.
+        # Only its SHARDS live elsewhere. The publish path skipped these before
+        # the check, so the two AF2 families - the only ones with an exporter
+        # manifest to compare against at all - were the two never compared.
+        mismatches = manifest_mismatches(model, ROOT / bundle["module"])
+        if mismatches:
+            print(f"{bundle['module']} does not describe {bundle['export']}/:",
+                  file=sys.stderr)
+            for mismatch in mismatches:
+                print(f"  {mismatch}", file=sys.stderr)
+            print("the site would load tensors at the wrong offsets and fold to"
+                  f" noise; run python3 tools/write_manifest_module.py {family}",
+                  file=sys.stderr)
+            return 1
+
     # THE PARAMETERS ARE OPT-IN, and they are the whole reason the workflow has
     # a repository variable: GitHub Pages is public even when its source
     # repository is private, so a model directory that happens to be lying
     # around in the checkout must not publish itself.
     if include_model:
-        # ...EVERY FAMILY THE REGISTRY KNOWS, on the same terms. The Pages
-        # workflow unpacks each release bundle into dist/ itself, so this path
-        # is for a local build; either way a bundle that is present is checked
-        # and one that is absent is simply not shipped.
-        problems = registry_mismatches()
-        if problems:
-            print("the model registries disagree:", file=sys.stderr)
-            for problem in problems:
-                print(f"  {problem}", file=sys.stderr)
-            return 1
         shipped = 0
-        remote = remote_families()
         for family, bundle in sorted(BUNDLES.items()):
             model = ROOT / bundle["export"]
             if not model.is_dir():
@@ -400,22 +437,18 @@ def build(include_model: bool) -> int:
                       file=sys.stderr)
                 return 1
 
-            mismatches = manifest_mismatches(model, ROOT / bundle["module"])
-            if mismatches:
-                print(f"{bundle['module']} does not describe {bundle['export']}/:",
-                      file=sys.stderr)
-                for mismatch in mismatches:
-                    print(f"  {mismatch}", file=sys.stderr)
-                print("the site would load tensors at the wrong offsets and fold to"
-                      f" noise; run python3 tools/write_manifest_module.py {family}",
-                      file=sys.stderr)
-                return 1
             shutil.copytree(model, OUT / bundle["export"],
                             ignore=shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map",
                                                           "weights-*.js", "manifest.js",
                                                           "manifest.json"))
             shipped += 1
-        if shipped == 0:
+        # 🔴 "NOTHING WAS PUBLISHED" IS NOT "NOTHING EXISTS", NOW THAT EVERY
+        # BUNDLE IS HOSTED. --model asked for parameters and skipped every one
+        # as remote, which is the correct outcome and used to exit 1 saying no
+        # export directory exists - a message naming a cause that is not the
+        # cause, with the directories sitting right there.
+        if shipped == 0 and not any((ROOT / bundle["export"]).is_dir()
+                                    for bundle in BUNDLES.values()):
             print("--model was given but no export directory exists;"
                   " run `node tools/export-web-model.js <manifest>` first", file=sys.stderr)
             return 1
