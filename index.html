@@ -247,12 +247,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    SEPARATE control rather than a third option on the MSA row
                    because web/app.js reads that row's values as alignment
                    modes - see the note there about renaming them. -->
-              <!-- 🔴 A BREAK, NOT A WIDTH. `flex-basis: 100%` on the group
-                   itself both wrapped it and stretched it across the row; the
-                   MSA group it stands in for is one column of two. A
-                   zero-height full-width item before it does the wrapping and
-                   leaves the group its own measure. -->
-              <div class="fold-option-break"></div>
               <div class="fetch-option-group" id="plmGroup" hidden>
                 <span class="fetch-option-title">PLM</span>
                 <select id="plm-mode" title="The protein language model, and with it the folding checkpoint trained against it. 300M is 94 MiB smaller for a median 0.03 A - inside the sampler's own seed spread. Without one, this model has no evolutionary information at all: on a 76-mer the fold moves 11 A and the distogram predicts no long-range contact, though a designed protein like 6MRR folds without it.">
