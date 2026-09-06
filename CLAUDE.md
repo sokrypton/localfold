@@ -80,6 +80,7 @@ values means the whole-stack checker, not that file.
 | Does the sliding-window atom attention compute its reference? | `tools/gpu/check-esmfold2-atom-stack.js` |
 | Does the featuriser build what ESMFold2 was handed? | `node tools/check-esmfold2-featurise.js` |
 | **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` |
+| Which of a sampler step's two coordinate sets is the picture? | `tools/gpu/probe-esmfold2-trajectory.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
@@ -1689,6 +1690,36 @@ destroy the precision first.
 🔴 **AND THE HEAD SYMMETRISES.** `distogram_head(z + z.transpose(-2, -3))` - a
 distance is symmetric and the trunk's pair is not, so `z` alone conforms and
 returns a plausible distogram.
+
+🔴 **A DIFFUSION TRAJECTORY HAS TWO COORDINATE SETS AT EVERY STEP AND ONLY ONE
+OF THEM IS A PICTURE.** `coordinates` is what the sampler carries forward - the
+state at the NEXT noise level - and `denoised` is the model's predicted
+structure at that call, EDM preconditioning included. The first version of the
+page drew the state. `tools/gpu/probe-esmfold2-trajectory.js`, on a 40-mer at
+diffusion-15:
+
+| step | state Rg | denoised Rg | denoised moved: raw / fitted |
+|---|---|---|---|
+| 0 | **35.7 A** | 9.7 | - |
+| 1 | **40.4** | 9.7 | 13.5 / **0.47** |
+| 4 | 12.9 | 9.9 | 18.3 / 0.64 |
+| 8 | 9.9 | 9.9 | 10.2 / 0.17 |
+| 10 | 9.9 | 9.9 | 16.3 / **0.02** |
+
+The state is four times the size at the top of the schedule AND NOT MONOTONIC -
+it grows before it shrinks - so no fixed camera holds it, and the early frames
+are Gaussian noise rather than a structure. The denoised prediction is
+protein-sized in every frame. AF3's path records the same finding at its own
+sigma: a radius of gyration of 1896 A at step 4 against 11.1 at the end.
+
+🔴 **AND THE FRAMES MUST BE RIGIDLY FITTED, WHICH THE LAST COLUMN IS.**
+`centreRandomAugmentation` draws a fresh rotation and translation of the whole
+system at the top of every step - it is how the sampler is equivariant, and the
+model was trained with it in the loop - so consecutive frames differ by 10-26 A
+of rigid motion. Superposed, the real movement is 0.02-0.80 A. Unfitted playback
+is a protein tumbling, with the convergence it exists to show invisible
+underneath. `fittedPdb` and `alphaCarbons` are AF3's, exported rather than
+copied.
 
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and

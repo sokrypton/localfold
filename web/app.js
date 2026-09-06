@@ -35,7 +35,8 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
+import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+  loadAf3Weights, toPoints } from "./af3-model.js";
 import { ESMFOLD2_COUNTS, languageModelRunner, loadEsmfold2Weights }
   from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
@@ -2117,6 +2118,19 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     }
   };
 
+  // 🔴 THE FRAMES MUST BE FITTED, BECAUSE THIS SAMPLER RE-POSES EVERY STEP.
+  // `centreRandomAugmentation` draws a fresh rotation and translation of the
+  // whole system at the top of each step - it is how the sampler is equivariant
+  // and the model was trained with it in the loop - so consecutive frames differ
+  // by a rigid motion far larger than anything the denoiser did, and unfitted
+  // playback is a protein tumbling. AF3's path has fitted its trajectory since
+  // it had one; this is the same function, not a second one.
+  //
+  // 🔴 AND TO THE FIRST FRAME, NOT THE LAST, because the frames are drawn as
+  // they are computed and there is no last one yet.
+  let reference = null;
+  let slots;
+
   const started = performance.now();
   const result = await foldEsmfold2(device, {
     sequence,
@@ -2136,18 +2150,39 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // held until there is a frame to hang it on, exactly as the AF3 path holds
     // its own.
     onContacts: (contacts) => { liveContacts = contactMapFor(contacts); },
-    onStep: (step, total, coordinates, features) => {
+    // 🔴 `denoised` AND NOT `coordinates`, AND THE REASON IS THE CAMERA. The
+    // sampler's own walk starts as Gaussian noise at sigma 411 and ends at a
+    // protein, so no fixed camera holds both and the early frames are not a
+    // picture of anything. `denoised` is the model's predicted structure at each
+    // call - EDM preconditioning included, so at a large noise level it is
+    // almost all network - and is protein-sized in every frame. AF3's path
+    // records the same finding, measured: a radius of gyration of 1896 A at
+    // step 4 against 11.1 at the end.
+    onStep: ({ step, total, denoised, features }) => {
       if (signal.aborted) return;
       progress((step + 1) / total);
-      const pdb = toPdb(features.batch, toDensePositions(features, coordinates));
+      const dense = toDensePositions(features, denoised);
+      if (slots === undefined) slots = alphaCarbons(features.batch);
+      if (reference === null) {
+        reference = toPoints(dense, features.batch.tokens * features.batch.dense);
+      }
+      const pdb = fittedPdb(features.batch, dense, reference, slots, null);
       framePdbs.push(pdb);
       drawLiveFrame(pdb);
     },
   });
   throwIfAborted(signal);
 
-  const pdb = toPdb(result.features.batch,
-                    toDensePositions(result.features, result.coordinates));
+  // 🔴 THE ANSWER IS FITTED ONTO THE SAME REFERENCE AS THE TRAJECTORY, or the
+  // last frame of the play bar jumps by a rigid motion the fold did not make.
+  // It is still `result.coordinates` - the sampler's own answer, not the last
+  // denoiser call - and at the bottom of the schedule the two agree to a
+  // fraction of an angstrom anyway.
+  const finalDense = toDensePositions(result.features, result.coordinates);
+  const pdb = reference === null
+    ? toPdb(result.features.batch, finalDense)
+    : fittedPdb(result.features.batch, finalDense, reference,
+                slots ?? alphaCarbons(result.features.batch), null);
   const contactMap = contactMapFor(result.contacts);
   const live = viewer?.objectsData?.[viewerObject];
   if (live?.frames !== undefined) live.frames.length = 0;

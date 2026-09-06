@@ -458,7 +458,14 @@ export async function foldEsmfold2(device, options) {
       x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
                       schedule[step + 1], settings.stepScale);
       timings[`sampler ${step}`] = performance.now() - at;
-      await options.onStep?.(step, levels.length, x, features);
+      // 🔴 BOTH, BECAUSE A VIEWER WANTS THE ONE THE SAMPLER DOES NOT KEEP.
+      // `coordinates` is the trajectory state at the NEXT noise level - what the
+      // sampler carries forward - and at the top of the schedule that is
+      // Gaussian noise at sigma 411, which is not a picture of anything.
+      // `denoised` is the model's predicted structure at this call, EDM
+      // preconditioning included, and is protein-sized in every frame.
+      await options.onStep?.({ step, total: levels.length, coordinates: x,
+                               denoised, features });
     }
     const memory = allocator.snapshot();
     denoiser.release();

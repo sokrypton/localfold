@@ -132,7 +132,7 @@ export function loadAf3Weights(onProgress, family = "af3") {
 }
 
 /** The dense slot of every alpha carbon, which frames are fitted on. */
-function alphaCarbons(batch) {
+export function alphaCarbons(batch) {
   const slots = [];
   const predicted = [];
   for (let token = 0; token < batch.tokens; token += 1) {
@@ -150,7 +150,7 @@ function alphaCarbons(batch) {
   return slots.length > 0 ? slots : predicted;
 }
 
-const toPoints = (positions, count) => Array.from(
+export const toPoints = (positions, count) => Array.from(
   { length: count }, (_, i) => [positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]]);
 
 /**
@@ -166,7 +166,7 @@ const toPoints = (positions, count) => Array.from(
  * 🔴 FITTED TO THE FIRST FRAME, NOT THE LAST, because the frames are shown as
  * they are computed and there is no last one yet.
  */
-function fittedPdb(batch, positions, reference, slots, plddt) {
+export function fittedPdb(batch, positions, reference, slots, plddt) {
   const api = window.py2Dmol;
   const count = batch.tokens * batch.dense;
   if (api?.superpose === undefined || reference === null) {
