@@ -1764,6 +1764,78 @@ centre positions, four ways - 0.7 mask, 0.1 profile, 0.1 same, 0.1 uniform - so
 two seeds are two different INPUTS. AF3's drives the diffusion sampler.
 EF2-fast's drives its sampler alone.
 
+🔴 **AND IT CANNOT USE AN MSA EITHER, WHICH WAS MEASURED RATHER THAN READ OFF
+THE FLAG.** `disable_msa_features: true` does NOT mean "no alignment was
+given": `experimental.py` falls back to the QUERY ONE-HOT when there is no MSA
+and only then zeroes the profile and the deletion mean, so this checkpoint's
+profile channels are identically zero in TRAINING as at inference. `s_inputs` is
+`[atomPooled 384 | aatype 33 | profile 33 | deletionMean 1]`, and the weights
+that read those 33 columns say what that cost them:
+
+| `zInit1` block | mean column RMS | coefficient of variation |
+|---|---|---|
+| atomPooled 0:384 | 0.308 | 0.450 |
+| aatype 384:417 | **0.688** | **0.289** |
+| **profile 417:450** | **0.027** | **0.029** |
+
+Chance CV for 256 columns of noise is 0.044, so the profile block is FLATTER
+than noise while its neighbour is ten times rougher, and it is **26x smaller**.
+The control that settles it: the 600M and 300M checkpoints have profile columns
+identical to **0.0** while their aatype columns differ by up to 0.075. Two
+separately trained models cannot agree on a shared weight unless no gradient
+ever reached it. Those columns are the initialisation.
+
+🔴 **AND FEEDING A REAL ALIGNMENT CONFIRMS IT, WITH A SCRAMBLE AS THE CONTROL.**
+`tools/gpu/probe-esmfold2-msa-profile.js` folds five arms in one process at
+three seeds - a 59-mer against `tools/fixtures/test.a3m`, 8076 rows, a genuine
+PSSM (columns sum to 1.000, mean peak 0.43, mode agreeing with the query at
+36/59). RMSD from the zero-profile fold after superposition:
+
+| arm | seed 1 | 2 | 3 | mean |
+|---|---|---|---|---|
+| the query one-hot | 0.031 | 0.027 | 0.028 | 0.029 |
+| **a real MSA profile** | 0.020 | 0.021 | 0.019 | **0.020** |
+| **that profile, residue axis PERMUTED** | 0.030 | 0.028 | 0.032 | **0.030** |
+| **the SAMPLER'S SEED, nothing else** | 0.393 | 0.486 | 0.418 | **0.432** |
+
+A real alignment is indistinguishable from a permuted one - both about a
+fifteenth of the sampler's own spread - and certainty is 0.967 on every arm at
+every seed. **A profile is a random projection here, not an input.**
+
+🔴 **AND THE PLUMBING CONTROL IS WHAT MAKES THAT A RESULT.** Every arm runs at
+the same seed, so a profile that never reached the model would move the fold by
+EXACTLY zero - which is also what "the alignment does nothing" looks like if
+only the means are read. The probe asserts both: `profileReachedTheModel` (all
+three arms nonzero) and `alignmentIsDistinguishableFromNoise` (false). Without
+the first, this measures a broken fixture.
+
+🔴 **AND THE REAL PROFILE MOVES THE FOLD LESS THAN THE SCRAMBLE, WHICH IS NOT
+IT WORKING.** 0.020 against 0.030, consistently. The two have identical column
+norms - a permutation - so the difference is which random columns are hit: a
+real profile's mass sits mostly on the residue the aatype one-hot already names,
+so its contribution lands nearer the subspace the trained term occupies. The gap
+is 0.010 A, two percent of the seed spread. Read it as geometry, not as signal.
+
+🔴 **SO MSA SUPPORT IS A DIFFERENT CHECKPOINT, NOT A FLAG - AND THAT IS UNLIKE
+TEMPLATES.** `_MODULE_FLAG_SECTIONS = ("msa_encoder", "lm_encoder", "parcae")`,
+and `EsmFold2MsaEncoderConfig` is documented "Large MSA models only". Neither
+bundle here carries a single `msa_encoder` tensor - 856 tensors, zero matches -
+so a Large MSA release would bring both the encoder AND trained profile columns.
+Templates have no module to disable at all; MSAs have one this checkpoint does
+not include.
+
+🔴 **AND TEMPLATES ARE ABSENT IN A THIRD WAY: THE HOOK EXISTS AND NO WEIGHTS
+CONSUME IT.** `grep -rin template` over the whole `esm/models/esmfold2/` package
+returns **0**, and `z_init` has five terms with none of them one. But
+`prepare_input.py` builds `disto_cond` and `disto_cond_mask` - a binned distance
+matrix over chosen token pairs, on the SAME 2-22 A / 64-bin grid, which is what
+a template reduces to - and `model.py` raises on it with the reason in its own
+comment: *"No released checkpoint carries the disto_conditioning_proj weights
+that would consume these."* `experimental.py`, the class this checkpoint
+instantiates, does not take the argument at all. So somewhere a checkpoint was
+trained with distogram conditioning; none released was. `pocket_feature` is in
+the same state, listed in `_IGNORED_FEATURE_KEYS`.
+
 🔴 **AND EF2-fast DOES NO INPUT MASKING, WHICH THE CONFIG'S OWN DOCSTRING WOULD
 TALK YOU INTO.** `EsmFold2Config` carries `lm_mask_pct` - "Fraction of sequence
 residues randomly replaced with the LM mask token before running the PLM
