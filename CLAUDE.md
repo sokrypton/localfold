@@ -2955,12 +2955,65 @@ bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
 honest than letting a fit discover it - and it is why the estimator's worst
 targets are the ones whose PAE is largest.
 
-🔴 **AND IT IS NOT YET CARRIED TO EF2-fast, WHICH IS THE WHOLE POINT.** The fit
-is on AF3's distogram, which is 64 bins over 2-22 A; EF2-fast's is 128 bins over
-a BORROWED 2-52 A grid, so sigma has a different range and the coefficients
-cannot simply transfer. The test that would settle it is to fold one sequence
-through both, estimate a PAE from EF2-fast's distogram, and score it against
-AF3's real one. **Open.**
+🔴 **AND IT IS CARRIED TO EF2-fast NOW, WHICH IS THE POINT.**
+`src/esmfold2/aligned-error.js` is the estimator and
+`tools/gpu/probe-pae-esmfold2.js` collects the features. It is a **pAE** in the
+literal sense - a predicted aligned error - and the mechanism being a read-off
+rather than a head does not change what the matrix is. Nine sequences folded
+through both models, leave-one-target-out:
+
+| | median Spearman | worst |
+|---|---|---|
+| AF3's own distogram (the ceiling) | 0.881 | 0.718 |
+| **EF2-fast's distogram** | **0.746** | 0.460 |
+| geometry alone | 0.556 | 0.404 |
+
+🔴 **AND THE SPREAD IS EXPLAINED BY WHETHER THE TWO MODELS FOLD THE SAME
+THING.** The target is AF3's PAE, which is about AF3's OWN structure, while the
+estimate is about EF2-fast's - so where they disagree the comparison is invalid
+rather than the estimate wrong. That is not a hand-wave: the correlation between
+the two models' distance matrices predicts the score at **Pearson 0.772**, and
+splitting on it,
+
+| | this estimate | AF3's own head |
+|---|---|---|
+| same fold (agreement >= 0.9, n=4) | **0.790** | 0.900 |
+| different fold (n=5) | 0.548 | - |
+
+so on comparable targets a distogram read-off comes within 0.11 of a dedicated
+confidence head. `tools/pae-transfer.py` prints the agreement column beside
+every score for exactly this reason.
+
+🔴 **EVERY FEATURE IS IN ANGSTROMS, OR ONE FIT COULD NOT SERVE TWO GRIDS.**
+AF3's distogram is 64 bins over 2-22 A and EF2-fast's is 128 over a borrowed
+2-52, so a spread read in BIN INDICES differs by a factor of two between them
+for the same physical uncertainty. Entropy is worse: it is not the same unit at
+all, since a uniform distribution over 128 bins carries log 2 more nats than one
+over 64 for free - so it enters as `exp(H) * binWidth`, an effective width.
+
+🔴 **AND THE UNCONSTRAINED FIT WENT DOWN WHEN THE MODEL GOT LESS SURE.** sigma
+and the mobility terms are strongly correlated - a mobility IS a mean of sigma -
+so least squares gave them large opposite signs, and raising every pair's spread
+by 1 A moved the estimate by **-0.513 A**. Pinning that one aggregate direction
+to zero removes it and IMPROVES the fit, 0.738 -> **0.746**, which is what
+removing a spurious direction looks like. Ridge is the obvious alternative and a
+far worse trade: the slope only turns positive at lambda 1e5, where the median
+has fallen to 0.661. **One bad direction wants one constraint, not blanket
+shrinkage.**
+
+🔴 **AND THE CONSTRAINT HAS TO NAME EVERY FEATURE THAT MOVES.** `effWidth` is
+`exp(H) * binWidth` and a Gaussian's `exp(H)` is `sigma * sqrt(2 pi e)`, so a
+uniform widening moves it by 4.13 per angstrom rather than not at all. A first
+constraint over sigma and the mobilities alone left a residual slope of -0.15 -
+small enough to read as rounding and still the wrong sign. `test/esmfold2-aligned-error.test.js`
+caught it, and asserts the scale-invariance directly.
+
+🔴 **AND THE ESTIMATE IS A CONTRAST, WHICH IS WHAT THE TEST HAD TO BE TAUGHT.**
+Widening every pair a token takes part in raises that token's own mobility
+baseline, which the estimate normalises against - so its row can correctly stay
+put or fall. The property that holds is about ONE pair against its two tokens'
+baselines, and the first version of that test asserted the row and failed
+against correct code.
 
 ## A PAE from a distogram, for a model that has no confidence head
 
