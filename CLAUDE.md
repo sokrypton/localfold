@@ -1983,6 +1983,33 @@ against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
 
+🔴 **AND THE TRUNK IS CACHED, WHICH AF3's PATH HAS DONE SINCE IT HAD ONE AND
+THIS HAD NEVER DONE.** Changing only the sampler's step count re-ran ESM-C and
+all 96 trunk blocks - 85% of a 300-token fold - to arrive at the same pair.
+Reported as "so if a user wants to increase the number of diffusion steps they
+have to rerun the trunk?", which is exactly what it was. Measured on a 76-mer:
+
+| | |
+|---|---|
+| first fold | 4.60 s |
+| again, trunk reused | **0.74 s** |
+| coordinates | **identical, every atom** |
+
+🔴 **AND THE PAIR IS READ BACK ONLY WHEN A CALLER ASKS FOR IT.** It otherwise
+never leaves the device between z_init and the sampler, which is why four trunk
+loops cost no traffic; `wantReusable` buys one readback at the end, a quarter of
+what looping through the host would have cost.
+
+🔴 **AND THE KEY IS WHAT THE TRUNK DEPENDS ON, WHICH IS NOT WHAT THE FOLD
+DEPENDS ON.** The checkpoint, the chains and their kinds, the ligands, the pass
+count, and WHICH language model - "none" and ESM-C 600M share a family and
+produce different pairs, so the family alone is not enough. The seed is in it
+only when `lm_mask_pct` is non-zero, because that is the only route by which a
+seed reaches the trunk: asking for a different SAMPLE therefore reuses the trunk
+here, where AF3 re-runs it. Verified by the misses as much as the hits - 300M,
+back to 600M and a changed recycle count each re-ran, while a repeat, a step
+change and a seed change each reused.
+
 🔴 **AND THE TRUNK NAMES ITS PASS, `Trunk 2/4`, AS AF3's LINE DOES - AND NOT ITS
 BLOCK.** That is AF3's rule and its reason, in its own comment: the pairformer
 is the one stage that already reports 48 times a pass, so the bar under the line

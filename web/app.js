@@ -1662,6 +1662,9 @@ function forcePlddtColours() {
   setColourMode("plddt");
 }
 
+/** EF2-fast's own, keyed the same way and for the same reason. */
+let esmfold2Trunk;
+
 /**
  * The last fold's trunk, so changing only the sampler costs only the sampler.
  *
@@ -2390,7 +2393,23 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const withRemark = (pdb) => `${REMARK}\n${pdb}`;
 
   const started = performance.now();
+  // 🔴 THE SAME CACHE AlphaFold 3's PATH HAS, AND FOR THE SAME REASON: the trunk
+  // is the fold, so changing only the sampler should cost only the sampler. The
+  // key is what the TRUNK depends on and nothing else - the checkpoint, the
+  // chains and their kinds, the ligands, the pass count, and which language
+  // model, since "none" and ESM-C 600M share a family and produce different
+  // pairs. The seed is in it only when masking is on, because that is the only
+  // way the seed reaches the trunk: `lm_mask_pct` is zero in this checkpoint, so
+  // asking for a different SAMPLE reuses the trunk here where AF3 re-runs it.
+  const trunkKey = JSON.stringify({
+    family: chosenFamily(), chains, chainKinds, ligandCodes,
+    loops: recycleCount() + 1,
+    plm: plmChoice(), languageModel: usesLanguageModel(),
+  });
+  const reuse = esmfold2Trunk?.key === trunkKey ? esmfold2Trunk.reusable : undefined;
   const result = await foldEsmfold2(device, {
+    reuse,
+    wantReusable: true,
     sequence,
     entities: { sequence, chainKinds, ligands },
     // 🔴 THE RECYCLE DIAL DRIVES THIS TRUNK TOO, AND USED NOT TO. Its loop
@@ -2588,6 +2607,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   };
   element("downloads").style.display = "flex";
 
+  esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
+    : { key: trunkKey, reusable: result.reusable };
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const mean = certainty === undefined ? undefined
     : [...certainty].reduce((total, value) => total + value, 0) / certainty.length;
@@ -2598,6 +2619,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // spells it out. A parenthesis denying something nothing claimed reads as a
   // disclaimer rather than a result.
   status(`${modelName} · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
+    + (result.trunkReused ? " (trunk reused)" : "")
     + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)}`));
   progress(null);
 }

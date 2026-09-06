@@ -336,9 +336,30 @@ export async function foldEsmfold2(device, options) {
   // ...and how big the tower is, since the band it gets is its bytes. Zero
   // when it is not running at all, which is a ligand-only input or a reader who
   // turned it off.
+  // 🔴 THE TRUNK IS THE FOLD, SO CHANGING ONLY THE SAMPLER SHOULD COST ONLY THE
+  // SAMPLER. AlphaFold 3's path has cached its trunk since it had one - "the
+  // last fold's trunk, so changing only the sampler costs only the sampler" -
+  // and this one re-ran ESM-C and all 96 trunk blocks to change a step count,
+  // which at 300 tokens is 27 s of a 32 s fold thrown away.
+  //
+  // 🔴 AND IT IS VALIDATED ON SHAPE, NOT TRUSTED. A pair of the wrong width or
+  // token count is the shape of every cache bug this repository has recorded -
+  // two models' representations agree in everything but their parameters - so
+  // the KEY is the caller's business and this refuses anything that does not
+  // fit the batch in front of it.
+  const reuse = (() => {
+    const given = options.reuse;
+    if (given === undefined) return undefined;
+    if (given.tokens !== tokens || given.channels !== channels) return undefined;
+    if (given.pair?.length !== tokens * tokens * channels) return undefined;
+    if (given.sInputs?.length !== tokens * shape.singleInputs) return undefined;
+    return given;
+  })();
+
   const plan = esmfold2Plan({
-    tokens, steps: levels.length, loops,
-    languageModelMiB: options.languageModel === false ? 0 : options.languageModelMiB,
+    tokens, steps: levels.length, loops: reuse === undefined ? loops : 0,
+    languageModelMiB: reuse !== undefined || options.languageModel === false
+      ? 0 : options.languageModelMiB,
   });
   let completed = 0;
   let phase = ESMFOLD2_PHASES.languageModel;
@@ -404,7 +425,8 @@ export async function foldEsmfold2(device, options) {
     const maskedTokens = maskLanguageModelInput(
       lm.ids, maskFraction, uniforms((options.seed ?? 0) ^ 0x5bf03635));
     enter(ESMFOLD2_PHASES.languageModel);
-    const single = await mark("language model", async () => {
+    const single = reuse !== undefined ? new Float32Array(0)
+      : await mark("language model", async () => {
       const rows = lm.ids.length === 0 ? new Float32Array(0)
         : await options.tower(lm.ids, lm.sequenceId,
             (layer, layers) => advance(plan.languageModel / layers));
@@ -414,7 +436,7 @@ export async function foldEsmfold2(device, options) {
     // ends exactly where the plan says however many blocks the tower ran.
     completed = Math.max(completed, plan.languageModelEnd);
     enter(ESMFOLD2_PHASES.embedder);
-    await mark("language pair", () => encodeLanguagePair(
+    if (reuse === undefined) await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
       { tokens, channels, single, weights: weights.shim, destination: lmPair }));
 
@@ -427,7 +449,8 @@ export async function foldEsmfold2(device, options) {
     };
     const rope = buildRope(features.refPos, features.refSpaceUid, atoms,
                            shape.atomChannels / shape.atomHeads);
-    const sInputs = await mark("inputs embedder", async () => {
+    const sInputs = reuse !== undefined ? reuse.sInputs
+      : await mark("inputs embedder", async () => {
       const tokenAct = await runInputsEmbedder(
         { device, allocator, cache, rope,
           atomConditioning: atomConditioning(features, atoms, shape.atomChannels,
@@ -521,63 +544,93 @@ export async function foldEsmfold2(device, options) {
       buffer: allocation.buffer, byteOffset: row * channels * 4,
       byteSize: rows * channels * 4,
     });
-    for (let loop = 0; loop < loops; loop += 1) {
-      // ...named per pass, as AF3's line is. The recycle is not announced: it
-      // is two milliseconds and it is the seam between two passes, not a phase.
-      enter(trunkPhase(loop, loops));
-      await mark(`recycle ${loop}`, async () => {
-        const chunk = Math.min(RECYCLE_CHUNK, pairs);
-        for (let start = 0; start < pairs; start += chunk) {
-          const rows = Math.min(chunk, pairs - start);
-          if (rows !== chunk) {
-            // The tail chunk needs its own pipelines; at these sizes it is one
-            // extra compile, and a wrong-sized dispatch leaves rows unwritten -
-            // which reads as a speedup, not as an error.
-            const [norm, project] = await Promise.all([
-              cache.get(`esmfold2-recycle-norm:${rows}:${channels}`,
-                createLayerNormShader({ rows, channels }, true, 1e-5)),
-              cache.get(`esmfold2-recycle-project:${rows}:${channels}`,
-                createLinearShader({ rows, inner: channels, outer: channels }, true)),
-            ]);
+    // 🔴 THE LOOPS, OR THE PAIR THEY WOULD HAVE PRODUCED. On reuse the cached
+    // pair is uploaded straight into the buffer the sampler reads, which is the
+    // whole saving: 96 block evaluations at 256 channels, 85% of a 300-token
+    // fold. `z_init` above still runs because `relPos` comes out of it and the
+    // denoiser wants that; it is four milliseconds and not worth a branch.
+    if (reuse !== undefined) {
+      device.queue.writeBuffer(pair.buffer, 0, reuse.pair);
+    } else {
+      for (let loop = 0; loop < loops; loop += 1) {
+        // ...named per pass, as AF3's line is. The recycle is not announced: it
+        // is two milliseconds and it is the seam between two passes, not a phase.
+        enter(trunkPhase(loop, loops));
+        await mark(`recycle ${loop}`, async () => {
+          const chunk = Math.min(RECYCLE_CHUNK, pairs);
+          for (let start = 0; start < pairs; start += chunk) {
+            const rows = Math.min(chunk, pairs - start);
+            if (rows !== chunk) {
+              // The tail chunk needs its own pipelines; at these sizes it is one
+              // extra compile, and a wrong-sized dispatch leaves rows unwritten -
+              // which reads as a speedup, not as an error.
+              const [norm, project] = await Promise.all([
+                cache.get(`esmfold2-recycle-norm:${rows}:${channels}`,
+                  createLayerNormShader({ rows, channels }, true, 1e-5)),
+                cache.get(`esmfold2-recycle-project:${rows}:${channels}`,
+                  createLinearShader({ rows, inner: channels, outer: channels }, true)),
+              ]);
+              await submit("esmfold2.recycle", [
+                ["norm", norm, [slice(pair, start, rows), recycleScale, recycleOffset,
+                                recycleScratch], ...perRow(rows)],
+                ["project", project, [recycleScratch, recycleWeights,
+                                      slice(zInit, start, rows), slice(pair, start, rows)],
+                 ...linearGrid(rows, channels)],
+              ]);
+              continue;
+            }
             await submit("esmfold2.recycle", [
-              ["norm", norm, [slice(pair, start, rows), recycleScale, recycleOffset,
-                              recycleScratch], ...perRow(rows)],
-              ["project", project, [recycleScratch, recycleWeights,
-                                    slice(zInit, start, rows), slice(pair, start, rows)],
+              ["norm", recycleNorm, [slice(pair, start, rows), recycleScale, recycleOffset,
+                                     recycleScratch], ...perRow(rows)],
+              ["project", recycleProject, [recycleScratch, recycleWeights,
+                                           slice(zInit, start, rows), slice(pair, start, rows)],
                ...linearGrid(rows, channels)],
             ]);
-            continue;
           }
-          await submit("esmfold2.recycle", [
-            ["norm", recycleNorm, [slice(pair, start, rows), recycleScale, recycleOffset,
-                                   recycleScratch], ...perRow(rows)],
-            ["project", recycleProject, [recycleScratch, recycleWeights,
-                                         slice(zInit, start, rows), slice(pair, start, rows)],
-             ...linearGrid(rows, channels)],
-          ]);
-        }
-      });
-      await mark(`trunk ${loop}`, () => trunk.run(
-        { buffer: pair, maskBuffer: pairMask },
-        weights.trunkBlocks,
-        { n: tokens, channels, readback: false,
-          submissionWindow: options.submissionWindow,
-          // 🔴 THE BAR READS `onBlockDone`, NOT `onBlock`. The first fires at
-          // ENCODE time, sixteen at a stride, so a bar driven by it sprints
-          // through a submission window and then sits still. This one settles
-          // when the device has actually finished the block.
-          onBlockDone: () => advance(perBlock),
-          // ...and the encode-time one is where the page gets a chance to
-          // paint. A GPU promise resolves as a microtask, which never returns
-          // control to the browser; `yieldToBrowser` posts a MessageChannel
-          // message, which is a task and is not clamped in a background tab.
-          onBlock: async (index) => {
-            await yieldToBrowser();
-            return options.onBlock?.(loop, index);
-          } }));
+        });
+        await mark(`trunk ${loop}`, () => trunk.run(
+          { buffer: pair, maskBuffer: pairMask },
+          weights.trunkBlocks,
+          { n: tokens, channels, readback: false,
+            submissionWindow: options.submissionWindow,
+            // 🔴 THE BAR READS `onBlockDone`, NOT `onBlock`. The first fires at
+            // ENCODE time, sixteen at a stride, so a bar driven by it sprints
+            // through a submission window and then sits still. This one settles
+            // when the device has actually finished the block.
+            onBlockDone: () => advance(perBlock),
+            // ...and the encode-time one is where the page gets a chance to
+            // paint. A GPU promise resolves as a microtask, which never returns
+            // control to the browser; `yieldToBrowser` posts a MessageChannel
+            // message, which is a task and is not clamped in a background tab.
+            onBlock: async (index) => {
+              await yieldToBrowser();
+              return options.onBlock?.(loop, index);
+            } }));
+      }
+      recycleScratch.release();
     }
-    recycleScratch.release();
     held.splice(held.indexOf(recycleScratch), 1);
+
+    // 🔴 READ BACK ONLY WHEN A CALLER ASKS, because this is the one thing the
+    // fold otherwise never does: the pair stays on the device from z_init to
+    // the sampler, which is why the trunk's four loops cost no traffic at all.
+    // One readback at the end is a quarter of what looping through the host
+    // would have cost, and it buys a fold that changes only its sampler.
+    const reusable = options.wantReusable !== true ? undefined : {
+      tokens, channels, sInputs,
+      pair: await (async () => {
+        const back = allocator.allocate("esmfold2.pair-readback", pairs * channels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        const encoder = device.createCommandEncoder({ label: "esmfold2.pair-readback" });
+        encoder.copyBufferToBuffer(pair.buffer, 0, back.buffer, 0, pairs * channels * 4);
+        device.queue.submit([encoder.finish()]);
+        await back.buffer.mapAsync(GPUMapMode.READ);
+        const copy = new Float32Array(back.buffer.getMappedRange().slice(0));
+        back.buffer.unmap();
+        back.release();
+        return copy;
+      })(),
+    };
 
     // ---- the distogram, which is the trunk's one output besides the pair.
     // 🔴 IT RUNS BEFORE THE DIFFUSION MODULE ALLOCATES, not after the fold.
@@ -674,7 +727,9 @@ export async function foldEsmfold2(device, options) {
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
-      interfaceCertainty,
+      interfaceCertainty, reusable,
+      // ...so a caller can tell a fold that ran the trunk from one that did not.
+      trunkReused: reuse !== undefined,
       lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },
       languageModel: options.languageModel !== false,
       distogram: options.distogramLogits === true ? distogram : undefined,

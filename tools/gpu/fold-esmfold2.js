@@ -130,6 +130,9 @@ export async function main(device, args = []) {
   // alignment; the analogue here is folding without the protein language model,
   // which is where this model's evolutionary information comes from.
   const noPlm = args.includes("--no-plm");
+  // 🔴 FOLD TWICE, THE SECOND TIME REUSING THE TRUNK, which is the only way to
+  // check that the saving is real and that the answer is the same one.
+  const twice = args.includes("--reuse-trunk");
   // 🔴 THE TRUNK'S PASS COUNT, WHICH IS THE PAGE'S RECYCLE DIAL. Upstream runs
   // `range(num_loops + 1)` and this checkpoint's `num_loops` is 3, so the
   // default is four passes and `--recycles=3` is that.
@@ -223,6 +226,7 @@ export async function main(device, args = []) {
     distogramLogits: contactSweep,
     lmMaskFraction: lmMask,
     languageModel: !noPlm,
+    wantReusable: twice,
     // ...the band the bar gives the tower is its bytes; see src/esmfold2/cost.js.
     languageModelMiB: Object.values((await tower.manifest()).tensors)
       .reduce((sum, record) => sum + tensorByteLength(record), 0) / 1048576,
@@ -236,6 +240,23 @@ export async function main(device, args = []) {
       updates.set(phase, (updates.get(phase) ?? 0) + 1);
     },
   });
+
+  // ...and again off the cached trunk, which must agree to the digit.
+  let second;
+  if (twice) {
+    second = await foldEsmfold2(device, {
+      sequence, allocator, seed, sampler,
+      entities: (kinds === "" && ligands.length === 0) ? sequence
+        : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
+            ...(ligands.length === 0 ? {} : { ligands }) },
+      shape: { ...M, loops: recycles + 1 },
+      submissionWindow,
+      weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      tower: runTower,
+      languageModel: !noPlm,
+      reuse: result.reusable,
+    });
+  }
 
   // ---- what came out.
   const alphas = alphaCarbons(result.features);
@@ -553,6 +574,12 @@ export async function main(device, args = []) {
   return {
     sequence, sampler, seed, trunkPrecision, contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,
+    reuseCheck: second === undefined ? undefined : {
+      trunkReused: second.trunkReused,
+      firstSeconds: result.elapsedMilliseconds / 1000,
+      secondSeconds: second.elapsedMilliseconds / 1000,
+      sameCoordinates: [...result.coordinates].every((v, i) => v === second.coordinates[i]),
+    },
     languageModel: result.languageModel,
     // ...what the shipped shader now separates, so the host arm above and the
     // kernel can be compared rather than trusted.
