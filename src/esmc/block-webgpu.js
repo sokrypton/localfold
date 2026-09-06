@@ -93,39 +93,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * not at compile, and reads as a broken kernel. Binding a one-element dummy
  * instead is the same trap with an extra buffer.
  */
-export const ROW_TILE = 4;
+export const ROW_TILE = 8;
+/** Columns a lane owns, as one vec4. */
 export const COLUMNS_PER_LANE = 4;
 const K_CHUNK = 32;
 
-/**
- * out = input @ weights (+ residual), tiled over rows AND columns.
- *
- * 🔴 THE FIRST VERSION GAVE EACH WORKGROUP ONE ROW AND EVERY ROW RE-READ THE
- * WHOLE WEIGHT MATRIX. At 300 tokens that was 19.1 GB of weight traffic in
- * 218 ms - 87.6 GB/s against a device with about 100 - so it sat at the
- * bandwidth limit doing three hundred times the reads it needed.
- *
- * 🔴 TRANSPOSING THE BUNDLE TO (inner, outer) WAS WORTH 3.8x ON ITS OWN, and
- * not for the reason the traffic arithmetic suggests. It does not reduce the
- * reads; it makes ADJACENT LANES READ ADJACENT ADDRESSES, so a weight row is
- * fetched once and shared, and the effective rate went to 331 GB/s - above
- * DRAM, which is what a cache hit looks like from outside.
- *
- * 🔴 WHAT IS LEFT IS ARITHMETIC INTENSITY, WHICH IS WHAT THE TILE BUYS. A
- * workgroup owns ${ROW_TILE} rows and ${COLUMNS_PER_LANE} columns a lane, so
- * one staged weight serves ${ROW_TILE} rows and one staged input serves
- * ${COLUMNS_PER_LANE} columns: ${ROW_TILE * COLUMNS_PER_LANE} multiply-adds per
- * ${ROW_TILE + COLUMNS_PER_LANE} reads, against one per one before. The
- * accumulators are ${ROW_TILE * COLUMNS_PER_LANE} per lane, which is the number
- * that must not grow - src/af3/grid-attention-webgpu.js records a register
- * spill at 128 costing 4x the wrong way.
- *
- * 🔴 AND A ROW TILE OF EIGHT IS SLOWER THAN FOUR, MEASURED. 32 accumulators a
- * lane against 16: 40.6 ms at 300 tokens against 36.1, and 19.9 against 17.0 at
- * 61. The same shape transition-webgpu.js records - a tile is only worth taking
- * where there is occupancy to spare - and the reason this constant is a
- * measurement rather than a guess.
- */
 /**
  * The grid a tiled linear pass wants: column tiles across x, row tiles up y.
  *
@@ -134,91 +106,97 @@ const K_CHUNK = 32;
  * by each axis, and dispatching it the old way would leave most of the output
  * unwritten - which reads as a speedup, not as an error.
  */
-export function linearGrid(rows, outer) {
-  return [Math.ceil(outer / (LANES * COLUMNS_PER_LANE)), Math.ceil(rows / ROW_TILE)];
+export function linearGrid(rows, outer, rowTile = ROW_TILE) {
+  return [Math.ceil(outer / (LANES * COLUMNS_PER_LANE)), Math.ceil(rows / rowTile)];
 }
 
+/**
+ * out = input @ weights (+ residual), tiled over rows and columns, vectorised.
+ *
+ * 🔴 THE FIRST VERSION GAVE EACH WORKGROUP ONE ROW AND EVERY ROW RE-READ THE
+ * WHOLE WEIGHT MATRIX - 19.1 GB of weight traffic at 300 tokens, 87.6 GB/s
+ * against a device with about 100.
+ *
+ * 🔴 TRANSPOSING THE BUNDLE TO (inner, outer) WAS WORTH 3.8x, and not by
+ * reducing the reads. It makes ADJACENT LANES READ ADJACENT ADDRESSES, so a
+ * weight row is fetched once and shared; the effective rate went to 331 GB/s,
+ * above DRAM, which is what a cache hit looks like from outside.
+ *
+ * 🔴 A LANE OWNS FOUR CONSECUTIVE COLUMNS AS ONE vec4, which is what lets the
+ * weight arrive in one load and the multiply-add issue four at a time. It also
+ * requires `outer` to be a multiple of four - 3456, 1152 and 256 all are - and
+ * the check is here rather than in a comment because a shape that is not would
+ * read three quarters of a matrix and look plausible.
+ *
+ * 🔴 THE ROW TILE IS EIGHT, AND IT WAS FOUR AN HOUR AGO. With SCALAR
+ * accumulators a tile of eight was slower - 40.6 ms at 300 tokens against
+ * four's 36.1 - because eight rows times four columns is 32 registers a lane.
+ * As vec4 the same tile is 8 registers holding 32 floats, and it wins: 1.086x
+ * at 61 tokens and 1.026x at 300, measured interleaved. Sixteen is 0.86x, so
+ * the ceiling is real and close.
+ *
+ * 🔴 WHICH IS WHY THE TILE IS NOT A CONSTANT TO BE REASONED ABOUT. It interacts
+ * with the vector width, and the right answer reversed when that changed.
+ */
 export function createLinearShader({ rows, inner, outer }, withResidual,
-                                   weightPrecision = "f32", boundsTest = false) {
+                                   weightPrecision = "f32", boundsTest = false,
+                                   rowTile = ROW_TILE) {
   if (!["f32", "f16"].includes(weightPrecision)) {
     throw new RangeError(`unknown weight precision ${weightPrecision}`);
   }
-  // 🔴 THE ACCUMULATOR STAYS f32 WHATEVER THE WEIGHTS ARE. Narrowing the STORAGE
-  // halves the bytes a bandwidth-bound kernel moves; narrowing the SUM would put
-  // a 1152- or 3072-long dot product into ten mantissa bits. The repository has
-  // the general form of this already: the diffusion transformer takes f16
-  // weights happily because a LayerNorm renormalises after it, and the atom
-  // decoder does not because its output is a position in angstroms.
+  if (outer % 4 !== 0) {
+    throw new RangeError(`vectorised linear needs a multiple of four columns; got ${outer}`);
+  }
   const half = weightPrecision === "f16";
-  const readWeight = (e) => (half ? `f32(${e})` : e);
-  const columnsPerGroup = LANES * COLUMNS_PER_LANE;
-  const accumulators = [];
-  for (let t = 0; t < ROW_TILE; t += 1) {
-    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
-      accumulators.push(`  var acc_${t}_${j} = 0.0;`);
-    }
-  }
-  // 🔴 NO BOUNDS TEST ON THE WEIGHT READ, AND THAT IS SAFE RATHER THAN SLOPPY.
-  // The condition is loop-INVARIANT - it depends on the lane and the column
-  // tile, not on k - so testing it inside the k loop paid for it 1152 times a
-  // column. WGSL has no out-of-bounds access: a storage read past the end is
-  // clamped by the runtime, and the value it returns is discarded because the
-  // STORE is masked. That is what the repository's other kernels do; the reason
-  // to write it down is that the same trick is NOT safe for the staged input,
-  // whose values are shared across columns.
-  //
-  // 🔴 AND IT IS A WASH, MEASURED INTERLEAVED: 0.946x at 61 tokens and 1.026x
-  // at 300 against keeping the test. Two separate runs had said 8% each way,
-  // which is this machine's drift and not a kernel property. The cheaper form
-  // is kept because it is cheaper, not because it was shown to be faster.
-  const inner_body = [];
-  for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
-    const read = readWeight(
-      `weights[k_absolute * ${outer}u + column_origin + local.x + ${j * LANES}u]`);
-    inner_body.push(boundsTest
-      ? `      let w_${j} = select(0.0, ${read}, `
-        + `column_origin + local.x + ${j * LANES}u < ${outer}u);`
-      : `      let w_${j} = ${read};`);
-  }
-  for (let t = 0; t < ROW_TILE; t += 1) {
-    inner_body.push(`      let s_${t} = staged[${t}u * ${K_CHUNK}u + k];`);
-    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
-      inner_body.push(`      acc_${t}_${j} += s_${t} * w_${j};`);
-    }
-  }
+  const vectorColumns = outer / 4;
+  const load = half
+    ? (e) => `vec4<f32>(weights[${e}])`
+    : (e) => `weights[${e}]`;
+
+  const declare = [];
   const stores = [];
-  for (let t = 0; t < ROW_TILE; t += 1) {
-    for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
-      stores.push(`  {
+  for (let t = 0; t < rowTile; t += 1) {
+    declare.push(`  var acc_${t} = vec4<f32>(0.0);`);
+    stores.push(`  {
     let row = row_origin + ${t}u;
-    let column = column_origin + local.x + ${j * LANES}u;
-    if (row < ${rows}u && column < ${outer}u) {
-      let slot = row * ${outer}u + column;
-      output[slot] = ${withResidual ? `residual[slot] + acc_${t}_${j}` : `acc_${t}_${j}`};
+    if (row < ${rows}u && vector_column < ${vectorColumns}u) {
+      let slot = row * ${vectorColumns}u + vector_column;
+      output[slot] = ${withResidual ? `residual[slot] + acc_${t}` : `acc_${t}`};
     }
   }`);
-    }
   }
+  const body = [];
+  // 🔴 NO BOUNDS TEST ON THE WEIGHT READ. The condition is loop-invariant, so
+  // testing it inside the k loop paid for it once per k; WGSL has no
+  // out-of-bounds access and the STORE is masked. Measured interleaved, keeping
+  // the test is 0.946x at 61 tokens and 1.026x at 300 - a wash, so the cheaper
+  // form is kept because it is cheaper.
+  body.push(`      let w = ${boundsTest
+    ? `select(vec4<f32>(0.0), ${load("k_absolute * " + vectorColumns + "u + vector_column")}, vector_column < ${vectorColumns}u)`
+    : load(`k_absolute * ${vectorColumns}u + vector_column`)};`);
+  for (let t = 0; t < rowTile; t += 1) {
+    body.push(`      acc_${t} += staged[${t}u * ${K_CHUNK}u + k] * w;`);
+  }
+
   return `${half ? "enable f16;\n" : ""}
 @group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
-${withResidual ? "@group(0) @binding(2) var<storage, read> residual: array<f32>;" : ""}
-@group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> output: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+${withResidual ? "@group(0) @binding(2) var<storage, read> residual: array<vec4<f32>>;" : ""}
+@group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> output: array<vec4<f32>>;
 
-var<workgroup> staged: array<f32, ${ROW_TILE * K_CHUNK}>;
+var<workgroup> staged: array<f32, ${rowTile * K_CHUNK}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let row_origin = group.y * ${ROW_TILE}u;
-  let column_origin = group.x * ${columnsPerGroup}u;
+  let row_origin = group.y * ${rowTile}u;
+  let vector_column = group.x * ${LANES}u + local.x;
   if (row_origin >= ${rows}u) { return; }
 
-${accumulators.join("\n")}
+${declare.join("\n")}
 
   for (var k0 = 0u; k0 < ${inner}u; k0 += ${K_CHUNK}u) {
-    // The whole workgroup stages this chunk of every row it owns.
-    for (var slot = local.x; slot < ${ROW_TILE * K_CHUNK}u; slot += ${LANES}u) {
+    for (var slot = local.x; slot < ${rowTile * K_CHUNK}u; slot += ${LANES}u) {
       let t = slot / ${K_CHUNK}u;
       let k = slot % ${K_CHUNK}u;
       let row = row_origin + t;
@@ -229,7 +207,7 @@ ${accumulators.join("\n")}
     for (var k = 0u; k < ${K_CHUNK}u; k += 1u) {
       let k_absolute = k0 + k;
       if (k_absolute >= ${inner}u) { break; }
-${inner_body.join("\n")}
+${body.join("\n")}
     }
     workgroupBarrier();
   }
@@ -499,6 +477,7 @@ export class EsmcBlockGpu {
     // summed in ten mantissa bits.
     const weightPrecision = options.weightPrecision ?? "f16";
     const boundsTest = options.boundsTest ?? false;
+    const rowTile = options.rowTile ?? ROW_TILE;
     if (input.length !== rows * model) {
       throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
     }
@@ -559,8 +538,8 @@ export class EsmcBlockGpu {
         `esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon));
       const qkvPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}`,
-        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest));
+        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}:${rowTile}`,
+        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest, rowTile));
       const preparePipeline = await pipeline(
         `esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase));
@@ -568,14 +547,14 @@ export class EsmcBlockGpu {
         `esmc-attend:${rows}:${model}:${heads}`,
         createAttentionShader({ rows, model, heads }));
       const outPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}`,
-        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest));
+        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
+        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile));
       const swigluPipeline = await pipeline(
         `esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}:${weightPrecision}`,
         createSwigluShader({ rows, model, ffn }, epsilon, weightPrecision));
       const downPipeline = await pipeline(
-        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}`,
-        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest));
+        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
+        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest, rowTile));
 
       const readback = keep(this.allocator.allocate(
         "esmc.readback", rows * model * 4,
@@ -606,7 +585,7 @@ export class EsmcBlockGpu {
       const dispatchLinear = (built, bindings, outer) => {
         pass.setPipeline(built);
         pass.setBindGroup(0, bindOf(built, bindings));
-        const [x, y] = linearGrid(rows, outer);
+        const [x, y] = linearGrid(rows, outer, rowTile);
         pass.dispatchWorkgroups(x, y);
       };
 
