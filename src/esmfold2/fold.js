@@ -567,6 +567,7 @@ export async function foldEsmfold2(device, options) {
       const frameCertainty = frames === undefined ? undefined
         : await frames.score(gatherPositions(denoised, representative, tokens));
       timings[`sampler ${step}`] = performance.now() - at;
+      advance(plan.perStep);
       // 🔴 BOTH, BECAUSE A VIEWER WANTS THE ONE THE SAMPLER DOES NOT KEEP.
       // `coordinates` is the trajectory state at the NEXT noise level - what the
       // sampler carries forward - and at the top of the schedule that is

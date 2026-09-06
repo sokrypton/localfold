@@ -855,16 +855,29 @@ async function alignmentText(chains, signal, family) {
  * hydrophobicity, plus anything in `window.py2dmol_customColors`.
  */
 function setColourMode(mode) {
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  // 🔴 THROUGH py2Dmol's OWN SELECT FIRST, because that keeps the dropdown the
+  // reader can see in step with what is drawn. Its change handler validates the
+  // mode, sets `colorMode` and both dirty flags, and renders - so this is the
+  // whole job, and it is what the AF3 path has always done.
+  const select = renderer?.colorSelect;
+  if (select !== undefined && select !== null) {
+    try {
+      select.value = mode;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      if (renderer.colorMode === mode) return true;
+    } catch { /* fall through to the API */ }
+  }
   const api = window.py2Dmol;
   if (typeof api?.setColor === "function") {
     try { api.setColor(mode); return true; } catch (error) {
       console.warn(`colour mode ${mode} refused:`, error);
-      return false;
     }
   }
-  // ...the manual path, for a bundle without the helper. Same three effects.
-  const registry = window.py2dmol_viewers ?? {};
-  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  // ...and the manual path, which is what setColor does anyway. Setting
+  // `colorMode` alone leaves the cached colours in place, which is a silent
+  // no-op of its own - the flags and the render are the operative part.
   if (renderer === undefined) return false;
   renderer.colorMode = mode;
   renderer.colorsNeedUpdate = true;
@@ -1498,16 +1511,11 @@ function orientBestView(renderer = viewer) {
  * belong to the embed build - and reaching past the control into the colour
  * arrays is what made an earlier attempt at this silently do nothing.
  */
-function forcePlddtColours(renderer = viewer) {
-  // ...for the same reason orientBestView takes one: the previews are drawn
-  // before `viewer` exists, and without this they are painted by `auto`, which
-  // resolves to rainbow rather than to the pLDDT ramp they are coloured for.
-  const select = renderer?.colorSelect;
-  if (select === undefined || select === null) return;
-  try {
-    select.value = "plddt";
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-  } catch { /* a palette is not worth losing the structure over */ }
+function forcePlddtColours() {
+  // ...one implementation. This was the only one that worked - it goes through
+  // py2Dmol's own select - and `setColourMode` now starts there for every
+  // caller, so this is the same call under the name the AF3 path uses.
+  setColourMode("plddt");
 }
 
 /**
@@ -1752,7 +1760,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         // tilt nobody asked for. The centre and the focal length still follow
         // the molecule, because a re-sample really does land somewhere else.
         if (reuse === undefined) orientBestView(renderer);
-        forcePlddtColours(renderer);
+        forcePlddtColours();
         oriented = true;
       }
       renderer.render("live-frame");
@@ -2154,6 +2162,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const api = window.py2Dmol;
   let liveContacts;
   let drawn = 0;
+  let colouring = false;
   const framePdbs = [];
   const drawLiveFrame = (pdb) => {
     if (signal.aborted || api?.frameFromText === undefined) return;
@@ -2168,6 +2177,25 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
       renderer.addFrame(frame, renderer.currentObjectName);
       renderer.setFrame(object.frames.length - 1);
+      // 🔴 THE COLOUR MODE IS SET ON THE FIRST LIVE FRAME, NOT AT THE END. It
+      // was only set after the fold finished, so every frame drawn WHILE the
+      // sampler ran came up in `auto`, which resolves to rainbow - and the
+      // whole point of a per-frame certainty is watching it during the fold.
+      // Reported as "frames added during diffusion still showing rainbow".
+      //
+      // 🔴 AND ONCE, NOT PER FRAME. The select's change handler renders, so
+      // calling it eleven times is eleven extra renders for one state change.
+      //
+      // 🔴 AND THE VIEW IS FOUND ON THE FIRST FRAME, WHICH THIS PATH NEVER DID.
+      // py2Dmol orients when it INGESTS A FILE, and this path draws frames
+      // instead - so the whole trajectory ran at whatever camera the blank
+      // object happened to have, and then `loadIntoViewer` orientated at the
+      // very end. That is both halves of what was reported: no best view on the
+      // first frame, and a different angle on the last.
+      if (!colouring) {
+        colouring = setColourMode(certainty === undefined ? "chain" : "plddt");
+        orientBestView(renderer);
+      }
     } catch (error) {
       console.warn("live frame skipped:", error);
     }
@@ -2284,12 +2312,17 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // rotating, snaps to a new angle the moment the last frame lands. The AF3
   // path has saved and restored it since it had a trajectory; this one had
   // not. Reported as "the frames change angle when last frame is added".
-  const camera = { ...(viewer?.viewerState ?? {}) };
-  const live = viewer?.objectsData?.[viewerObject];
+  // ...taken off the RENDERER, not off `viewer`, which is undefined until
+  // loadIntoViewer runs and therefore held no camera to save.
+  const registry = window.py2dmol_viewers ?? {};
+  const liveRenderer = registry[Object.keys(registry)[0]]?.renderer;
+  const camera = { ...(liveRenderer?.viewerState ?? {}) };
+  const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
   if (live?.frames !== undefined) live.frames.length = 0;
   await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb, scores: {} });
   if (viewer !== undefined && Object.keys(camera).length > 0) {
     Object.assign(viewer.viewerState, camera);
+    viewer.render?.("localfold.restore-camera");
   }
   if (api?.frameFromText !== undefined && viewer !== undefined) {
     const object = viewer.objectsData?.[viewerObject];
@@ -2317,6 +2350,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // appearing anywhere, which is why the status line names the quantity and
     // the file carries a REMARK. With no certainty at all it falls back to
     // chain colours rather than colouring a zero B-factor as no confidence.
+    // ...again at the end, because loadIntoViewer's own ingestion resets the
+    // renderer's data and recomputes its colours.
     setColourMode(certainty === undefined ? "chain" : "plddt");
     viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
   }

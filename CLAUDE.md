@@ -1908,26 +1908,40 @@ single jump falls from **0.53 to 0.09** over 45 samples, monotonic throughout.
 cannot be laid out - so the sampler's settings and schedule are resolved at the
 top of the fold. They depend on nothing the fold computes.
 
-🔴 **AND `setColorScheme` / `colorBy` DO NOT EXIST ON py2Dmol's RENDERER, SO
-NOTHING HAD EVER BEEN COLOURED BY THEM.** Both call sites were guarded by
-`typeof === "function"`, which turned a wrong API into a silent no-op: the
-viewer stayed on `colorMode: "auto"`, which resolves to **rainbow** for a single
-chain with no confidence data. The B-factors were in every frame the whole time
-and nothing was reading them, so a probe that checked the VALUES passed while
-the screen showed a rainbow.
+🔴 **AND `setColorScheme` / `colorBy` DO NOT EXIST ON py2Dmol's RENDERER.** Both
+call sites in `loadIntoViewer` were guarded by `typeof === "function"`, which
+turned a wrong API into a silent no-op - so the viewer stayed on
+`colorMode: "auto"`, which resolves to **rainbow** for a single chain with no
+confidence data.
 
-The real API is **`py2Dmol.setColor(mode)`**, and what makes it work is not the
-assignment but the three lines after it:
+🔴 **THE AF3 PATH SURVIVED THAT BY ACCIDENT, THROUGH `forcePlddtColours`**,
+which sets `renderer.colorSelect.value` and dispatches a change - and py2Dmol's
+own handler is what validates the mode, sets `colorMode`, marks both dirty flags
+and renders. So the working route was always the SELECT, and the dead API beside
+it looked like the one doing the job. There is one `setColourMode` now and it
+starts there, which also keeps the visible dropdown in step with what is drawn.
 
-    e.colorMode = t;
-    e.colorsNeedUpdate = true;
-    e.plddtColorsNeedUpdate = true;
-    e.render("py2Dmol.setColor");
+The other route is `py2Dmol.setColor(mode)`. Either way what matters is not the
+assignment but the three things after it - `colorsNeedUpdate`,
+`plddtColorsNeedUpdate`, `render()` - because setting `colorMode` alone leaves
+the cached colours in place, which is a second silent no-op. Valid modes are
+`auto, chain, rainbow, plddt, deepmind, entropy, object, hydrophobicity` plus
+anything in `window.py2dmol_customColors`.
 
-Setting `colorMode` alone leaves the cached colours in place, which is a second
-silent no-op. The valid modes are `auto, chain, rainbow, plddt, deepmind,
-entropy, object, hydrophobicity` plus anything in
-`window.py2dmol_customColors`.
+🔴 **AND THE MODE HAS TO BE SET ON THE FIRST LIVE FRAME, NOT AT THE END.**
+Setting it after the fold left every frame drawn WHILE the sampler ran in
+rainbow, which is the whole point of a per-frame certainty. Reported separately
+from the first colour bug, after it was fixed.
+
+🔴 **AND py2Dmol ORIENTS WHEN IT INGESTS A FILE, WHICH THIS PATH NEVER DOES.**
+The ESMFold2 fold draws FRAMES, so nothing ever found a best view: the whole
+trajectory ran at whatever camera the blank object had, and then the final
+`loadIntoViewer` orientated at the very end. That is both halves of "best view
+is not being applied to first frame" and "last frame is different angle" -
+one cause, reported as two symptoms. `orientBestView` on the first frame, and
+the camera saved across the reload off the RENDERER rather than off `viewer`,
+which is undefined until that reload and therefore held no camera to save.
+Measured: `0.94, 0.35, 0.05` during the fold and `0.936, 0.348, 0.052` after.
 
 🔴 **AND A PROBE THAT READS THE DATA IS NOT A PROBE THAT READS THE PICTURE.**
 `tools/fold-in-page.py`'s `bfactor:` line reported 46.4-98.5 per frame while the

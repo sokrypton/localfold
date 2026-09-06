@@ -116,11 +116,26 @@ def template_entry(text):
 # MSA search runs and the status line deliberately says nothing about them.
 # Reading only the line would show a gap exactly where the parallel half of the
 # work is.
+# 🔴 AND THE COLOUR MODE RIDES ALONG, BECAUSE THE END STATE IS NOT THE STORY.
+# The mode was set only when the fold FINISHED, so every frame drawn while the
+# sampler ran came up in `auto` - which resolves to rainbow - and a probe that
+# looked afterwards saw `plddt` and passed. Sampling it from the wait loop is
+# what makes "frames added during diffusion still showing rainbow" visible to
+# the tool rather than only to the eye.
 STATUS_LINE = """(() => {
   const line = (document.getElementById('status-message')||{}).textContent || '';
   const dial = document.getElementById('model-load');
   const loading = dial && !dial.hidden ? dial.getAttribute('aria-label') : '';
-  return loading ? line + '  ||  ' + loading : line;
+  const reg = window.py2dmol_viewers || {};
+  const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+  const frames = v && v.objectsData && v.objectsData[v.currentObjectName]
+    ? v.objectsData[v.currentObjectName].frames.length : 0;
+  const mode = v ? (v.colorMode === 'auto' ? 'auto->' + v.resolvedAutoColor : v.colorMode) : '-';
+  // ...and the camera, so "the last frame is a different angle" is a number.
+  const r = v && v.viewerState && v.viewerState.rotation;
+  const rot = r ? ' ' + r[0].map((x) => x.toFixed(2)).join(',') : '';
+  const drawn = frames > 0 ? `  [${frames}f ${mode}${rot}]` : '';
+  return (loading ? line + '  ||  ' + loading : line) + drawn;
 })()"""
 
 
@@ -408,6 +423,10 @@ def main():
         # the renderer's colour SCHEME, and a page can set it and have py2Dmol
         # set it back. Reported as "still not seeing colors, though certainty is
         # showing up in the status" - with the B-factor probe above passing.
+        # 🔴 AND THE MODE DURING THE FOLD, NOT ONLY AFTER IT. The end-state
+        # probe passed while every frame drawn WHILE the sampler ran was in
+        # rainbow, because the page set the mode only once the fold finished.
+        # `liveColour` is sampled from the wait loop below.
         print("colour:", cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
           const entry = reg[Object.keys(reg)[0]];
