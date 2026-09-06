@@ -120,6 +120,10 @@ export async function main(device, args = []) {
   // MiB at 300 tokens - and reports, per pair KIND, what each threshold would
   // call a contact and how well the head predicts a DISTANCE at all.
   const contactSweep = args.includes("--contact-sweep");
+  // 🔴 `lm_mask_pct`, WHICH THIS CHECKPOINT SETS TO ZERO. The knob exists so the
+  // port is complete for a checkpoint that does set it, and so the cost of the
+  // training-time corruption can be MEASURED rather than guessed at.
+  const lmMask = Number(option(args, "lm-mask", "0"));
   if (SAMPLER_PRESETS[sampler] === undefined) {
     throw new Error(`unknown sampler ${sampler}; `
       + `expected one of ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -207,6 +211,7 @@ export async function main(device, args = []) {
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
     distogramLogits: contactSweep,
+    lmMaskFraction: lmMask,
     onStatus: (label) => { progress.push(label); },
     // 🔴 COUNTED PER PHASE, because "does the trunk report block by block" is a
     // number and not an impression. A bar sampled from the page cannot answer
@@ -461,6 +466,7 @@ export async function main(device, args = []) {
 
   return {
     sequence, sampler, seed, trunkPrecision, contactSweep: sweep,
+    lmMask: result.lmMask,
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,
     caSpacing: spacing.length === 0 ? null

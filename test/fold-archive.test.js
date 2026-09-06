@@ -223,6 +223,8 @@ describe("an archive from a model with no confidence head", () => {
     // ...only what this model produces: a contact map off the trunk.
     confidence: { contactProbs: Float32Array.from({ length: 100 }, () => 0.25) },
   };
+  // ...no `templates` and no `msaOrigin`, which is how a caller says "this
+  // model has neither control" as opposed to "neither was used".
   const build = () => buildFoldArchive({
     stem: "fold_ef2", model: "EF2-fast 600M", settings: { seed: 3 },
     entities: [{ type: "protein", value: "AAAA", copies: 1 }], prediction,
@@ -280,6 +282,9 @@ describe("an archive from a model with no confidence head", () => {
     // and a B-factor that is not a pLDDT are each surprising on their own.
     expect(text).toContain("no confidence head");
     expect(text).toContain("chain_pair_max_contact");
+    // ...and no template line either: this model cannot take one, so "none"
+    // would report a choice where there is no control.
+    expect(text.includes("- templates:")).toBe(false);
   });
 
   it("does not call the B-factor a pLDDT when it is not one", () => {

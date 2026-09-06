@@ -325,19 +325,28 @@ export function centreRandomAugmentation(x, mask, atoms, draw) {
  * A seeded standard normal, so a fold is reproducible even though it is not the
  * model's own draw. xorshift32 plus Box-Muller.
  */
-export function gaussians(seed) {
+export function uniforms(seed) {
   // 🔴 SEED 0 AND SEED 1 GAVE THE SAME STREAM. `(seed >>> 0) || 1` sends zero
   // to one, so the two commonest seeds a caller reaches for were the same fold
   // - and it looked like a working seed axis, because seeds 2 and 3 differed.
   // Mixing with the golden ratio's fractional part keeps every seed distinct
   // and still cannot produce xorshift's fixed point.
   let state = ((seed >>> 0) ^ 0x9e3779b9) >>> 0 || 1;
-  const uniform = () => {
+  return () => {
     state ^= state << 13; state >>>= 0;
     state ^= state >> 17;
     state ^= state << 5; state >>>= 0;
     return (state + 1) / 4294967297;
   };
+}
+
+export function gaussians(seed) {
+  // 🔴 SEED 0 AND SEED 1 GAVE THE SAME STREAM. `(seed >>> 0) || 1` sends zero
+  // to one, so the two commonest seeds a caller reaches for were the same fold
+  // - and it looked like a working seed axis, because seeds 2 and 3 differed.
+  // Mixing with the golden ratio's fractional part keeps every seed distinct
+  // and still cannot produce xorshift's fixed point.
+  const uniform = uniforms(seed);
   let spare = null;
   return () => {
     if (spare !== null) { const value = spare; spare = null; return value; }

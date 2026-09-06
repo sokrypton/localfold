@@ -2404,9 +2404,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       sampler: samplerPreset(),
       "diffusion steps": result.steps,
     },
-    // ...and no alignment line, rather than "none", which reads as a choice.
+    // ...and no alignment or template line, rather than "none", which reads as
+    // a choice. This model takes neither: `grep -rn template` over ESMFold2's
+    // whole upstream package returns nothing, and `z_init` has five terms with
+    // none of them one.
     msaOrigin: undefined,
     msas: {},
+    templates: undefined,
   };
   element("downloads").style.display = "flex";
 
@@ -3183,7 +3187,10 @@ element("download-all").addEventListener("click", async () => {
       entities: pred.entities,
       msas: pred.msas ?? {},
       msaOrigin: pred.msaOrigin,
-      templates: pred.templates ?? [],
+      // 🔴 NOT `?? []`, WHICH IS THE DIFFERENCE BETWEEN "none were used" AND
+      // "this model has no such control". Defaulting it here silently undid
+      // the distinction the archive was taught to make.
+      templates: pred.templates,
       prediction: {
         pdb: pred.pdb,
         chainLengths: pred.chainLengths,

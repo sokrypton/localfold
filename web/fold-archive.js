@@ -362,7 +362,9 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
     if (value !== undefined && value !== null && value !== "") lines.push(`- ${key}: ${value}`);
   }
   if (msaOrigin !== undefined) lines.push(`- alignment: ${msaOrigin}`);
-  lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
+  if (templateCount !== undefined) {
+    lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
+  }
   if (!scored) {
     // ...said once, plainly, because the B-factor column and a missing summary
     // are both surprising on their own and neither explains itself.
@@ -408,7 +410,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  * @returns {Map<string, string>}
  */
 export function buildFoldArchive({
-  stem, model, settings, entities, prediction, msas = {}, templates = [],
+  stem, model, settings, entities, prediction, msas = {}, templates,
   msaOrigin,
 }) {
   const name = safeJobName(stem);
@@ -473,7 +475,7 @@ export function buildFoldArchive({
   // back that there is nothing to reconstruct.
   if (msas.merged) files.set(`msas/${name}_merged_msa.a3m`, msas.merged);
 
-  templates.forEach((template, index) => {
+  (templates ?? []).forEach((template, index) => {
     if (!template?.text) return;
     // ...named by what it IS. The server's are always mmCIF; ours come from
     // the RCSB as PDB, from AlphaFold DB as PDB and from the MMseqs2 template
@@ -485,7 +487,12 @@ export function buildFoldArchive({
   });
 
   files.set("README.md", readme({
-    stem, model, settings, msaOrigin, templateCount: templates.length, scored,
+    // 🔴 UNDEFINED MEANS "THIS MODEL HAS NONE", AS `msaOrigin` DOES. EF2-fast
+    // cannot take a template at all - `grep -rn template` over the whole
+    // upstream package returns nothing - so "templates: none" reported a choice
+    // where there was no control. An empty ARRAY still means "none were used".
+    stem, model, settings, msaOrigin, scored,
+    templateCount: templates === undefined ? undefined : templates.length,
   }));
   return files;
 }

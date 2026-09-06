@@ -25,7 +25,8 @@
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
   from "../esmc/block-webgpu.js";
 import {
-  featuriseForEsmfold2, languageModelInput, MOL_DNA, MOL_RNA,
+  featuriseForEsmfold2, languageModelInput, maskLanguageModelInput,
+  MOL_DNA, MOL_RNA,
 } from "./featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
@@ -44,7 +45,7 @@ import {
 } from "./pair-features-webgpu.js";
 import {
   centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
-  samplerStep,
+  samplerStep, uniforms,
 } from "./sampler-reference.js";
 import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
 
@@ -374,6 +375,16 @@ export async function foldEsmfold2(device, options) {
     // ---- the language model, first and released before anything pair-sized.
     const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
     const lm = languageModelInput(features);
+    // 🔴 `lm_mask_pct`, ON A STREAM OF ITS OWN. Zero for this checkpoint - see
+    // maskLanguageModelInput for why the config class's docstring says
+    // otherwise - so nothing is drawn and a fold is bit-identical to one
+    // before this existed. Where a caller does ask for it, the draws must not
+    // come from the sampler's stream: sharing one would make the STRUCTURE
+    // change at mask fraction zero, since a conditional draw shifts every
+    // later value.
+    const maskFraction = options.lmMaskFraction ?? shape.lmMaskPct ?? 0;
+    const maskedTokens = maskLanguageModelInput(
+      lm.ids, maskFraction, uniforms((options.seed ?? 0) ^ 0x5bf03635));
     enter(ESMFOLD2_PHASES.languageModel);
     const single = await mark("language model", async () => {
       const rows = lm.ids.length === 0 ? new Float32Array(0)
@@ -639,6 +650,7 @@ export async function foldEsmfold2(device, options) {
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
+      lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },
       distogram: options.distogramLogits === true ? distogram : undefined,
       steps: levels.length, scheduleLength: schedule.length, settings,
       elapsedMilliseconds: performance.now() - started, timings, memory,

@@ -157,7 +157,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                      never choose AF3 - so the newest model was the one you had
                      to know to ask for. It also gave the page a state where
                      what would run was not written anywhere on it. -->
-                <select id="model-family" title="Which model to fold with. AF3 is DeepMind's, under their own terms; OpenBind-0 is OpenFold3 v0.5.0, Apache 2.0; ESMFold2 folds from a single sequence with no alignment and reports no confidence.">
+                <select id="model-family" title="Which model to fold with. AF3 is DeepMind's, under their own terms; OpenBind-0 is OpenFold3 v0.5.0, Apache 2.0; EF2-fast 600M folds from a single sequence with no alignment and reports no confidence.">
                   <option value="af3" selected>AF3</option>
                   <!-- 🔴 THE SAME GRAPH, DIFFERENT PARAMETERS. OpenBind-0 runs
                        through foldWithAf3 exactly as AF3 does; what differs is
@@ -167,7 +167,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                   <!-- 🔴 NO ALIGNMENT AND NO TEMPLATE, WHICH IS THE POINT.
-                       ESMFold2 folds from ONE sequence through a protein
+                       EF2-fast folds from ONE sequence through a protein
                        language model, so it serves the case an MSA search
                        cannot serve at all - and it has no confidence head in
                        this checkpoint, so it reports no pLDDT and no PAE. It

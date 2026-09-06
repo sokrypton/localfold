@@ -39,6 +39,8 @@ export const ESM_ALPHABET = ["<cls>", "<pad>", "<eos>", "<unk>",
   "L", "A", "G", "V", "S", "E", "R", "T", "I", "D", "P", "K", "Q", "N", "F", "Y",
   "M", "H", "W", "C", "X", "B", "U", "Z", "O", ".", "-", "<null_1>", "<mask>"];
 export const ESM_BOS = 0, ESM_PAD = 1, ESM_EOS = 2, ESM_UNK = 3;
+/** `<mask>`, the last entry - checked against ESM-C's own tokenizer.json. */
+export const ESM_MASK = 32;
 /**
  * 🔴 A NON-PROTEIN TOKEN'S STRUCTURE ID IS 24 AND IT NEVER REACHES THE TOWER.
  * `DNA_RNA_LIGAND_INPUT_ID = 24` is carried in `input_ids` so the feature has a
@@ -341,4 +343,40 @@ export function spreadOverAtoms(features, perToken, scale = 1) {
     dense[slot] = perToken[features.atomToToken[atom]] * scale;
   }
   return dense;
+}
+
+/**
+ * `lm_mask_pct`: replace a fraction of the language model's residues with its
+ * mask token, as the training-time input corruption did.
+ *
+ * 🔴 THIS CHECKPOINT SETS IT TO ZERO AND THE CONFIG CLASS'S DOCSTRING SAYS
+ * OTHERWISE. `EsmFold2Config` documents `lm_mask_pct` as "Single-sequence
+ * checkpoints set this to 0.1" - and base600M-step1500k is a single-sequence
+ * checkpoint (`disable_msa_features: true`) that does NOT set it, so it takes
+ * the 0.0 default and upstream's `if lm_mask_pct:` never fires. A port that
+ * took the docstring's word for it would mask a tenth of every sequence, get a
+ * plausible structure and be a different model. Read the checkpoint's config,
+ * not the config class's documentation.
+ *
+ * 🔴 AND THE SPECIALS ARE EXEMPT, which is not a detail: the ids are the PACKED
+ * run `[BOS] A [EOS BOS] B [EOS]`, so a mask landing on a separator would merge
+ * two chains for the tower. Upstream excludes bos, eos and pad by value and so
+ * does this.
+ *
+ * @param ids the packed input ids, modified in place
+ * @param fraction 0 for this checkpoint; upstream's own default is 0 too
+ * @param random a uniform [0, 1) stream, so a fold stays reproducible
+ * @returns how many positions were masked
+ */
+export function maskLanguageModelInput(ids, fraction, random) {
+  if (!(fraction > 0)) return 0;
+  let masked = 0;
+  for (let at = 0; at < ids.length; at += 1) {
+    const id = ids[at];
+    if (id === ESM_BOS || id === ESM_EOS || id === ESM_PAD) continue;
+    if (random() >= fraction) continue;
+    ids[at] = ESM_MASK;
+    masked += 1;
+  }
+  return masked;
 }

@@ -1757,6 +1757,61 @@ breaks - `gamma0` re-noises to `sigma * 1.605` and `step_scale` 1.638 overshoots
 flow arm re-noises not at all and is merely poor. **More steps than the schedule
 buy nothing**: 138 is no better than 11 and eight times the time.
 
+🔴 **AND THE SEED MEANS SOMETHING DIFFERENT IN EACH MODEL, WHICH IS WHY THE
+ARCHIVE'S SETTINGS ARE PER MODEL.** AF2's is load-bearing before the model
+runs: `a3m-features.js` shuffles the extra pool and BERT-masks 15% of the
+centre positions, four ways - 0.7 mask, 0.1 profile, 0.1 same, 0.1 uniform - so
+two seeds are two different INPUTS. AF3's drives the diffusion sampler.
+EF2-fast's drives its sampler alone.
+
+🔴 **AND EF2-fast DOES NO INPUT MASKING, WHICH THE CONFIG'S OWN DOCSTRING WOULD
+TALK YOU INTO.** `EsmFold2Config` carries `lm_mask_pct` - "Fraction of sequence
+residues randomly replaced with the LM mask token before running the PLM
+backbone, matching the training-time input corruption" - and its docstring says
+**"Single-sequence checkpoints set this to 0.1"**. This checkpoint IS a
+single-sequence one (`disable_msa_features: true`) and does NOT set it:
+
+| knob | base600M-step1500k |
+|---|---|
+| `lm_mask_pct` | **absent, so the 0.0 default**, and `hf_adapter` guards it with `if lm_mask_pct:` |
+| `lm_dropout` | **0.0** |
+| `force_lm_dropout_during_inference` | **False** |
+
+So the only randomness in an EF2-fast fold is the sampler's rotation,
+translation and noise. A port that took the docstring's word for it would mask a
+tenth of every sequence before ESM-C, get a plausible structure, and be a
+different model - and nothing in the shapes would say so. **Read the
+checkpoint's config, not the config class's documentation.**
+
+🔴 **AND IT IS IMPLEMENTED ANYWAY, AT ZERO, BECAUSE A KNOB THAT DOES NOT EXIST
+CANNOT BE PRICED.** `maskLanguageModelInput` is upstream's `_mask_input_ids` -
+a uniform draw per position against the fraction, the specials exempt, the rest
+replaced by `<mask>` (id 32, checked against ESM-C's own tokenizer.json). The
+default is `shape.lmMaskPct ?? 0`, so this checkpoint is untouched: the
+certainty vector of a 76-residue fold is IDENTICAL to every digit against the
+tree before it existed. `tools/gpu/fold-esmfold2.js --lm-mask=` is the arm.
+
+| `--lm-mask` | masked | CA-CA | mean certainty |
+|---|---|---|---|
+| 0 (the checkpoint) | 0 / 78 | 3.797 | 0.9496 |
+| 0.1 | 7 / 78 | 3.797 | 0.9542 |
+| 0.3 | 17 / 78 | 3.797 | 0.9528 |
+
+Ubiquitin is an easy target and the language model recovers, so read that as
+"the mechanism works and this target does not care", not as a licence.
+
+🔴 **AND THE MASK DRAWS FROM ITS OWN STREAM.** Sharing the sampler's would make
+the STRUCTURE move at fraction zero, because a conditional draw shifts every
+later value - so `uniforms(seed ^ 0x5bf03635)` is a second stream, and at zero
+nothing is drawn at all. `uniforms` is now exported beside `gaussians`, which
+builds on it rather than repeating xorshift.
+
+🔴 **AND THE SPECIALS ARE EXEMPT, WHICH IS NOT A DETAIL.** The ids are one
+PACKED run - `[BOS] A [EOS BOS] B [EOS]` - so a mask landing on a separator
+merges two chains for the tower. Upstream excludes bos, eos and pad by value;
+so does this, and the test asserts it at fraction 1 where every residue is
+masked and no separator is.
+
 🔴 **AND `(seed >>> 0) || 1` MADE SEED 0 AND SEED 1 THE SAME FOLD.** Zero maps to
 one, so the two commonest seeds drew the identical stream - and it looked like a
 working seed axis, because seeds 2 and 3 differed.
