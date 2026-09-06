@@ -125,6 +125,9 @@ def main():
     parser.add_argument('--calibrated', default='',
                         help='label=path.npz, comma separated - arms whose '
                              'codes were chosen against real activations')
+    parser.add_argument('--bundle', default='',
+                        help='label=directory - a SHIPPED bundle, read the way '
+                             'the browser reads it')
     parser.add_argument('--fold-bits', type=int, default=0,
                         help='also quantise the FOLDING model at this many bits')
     parser.add_argument('--fold-group', type=int, default=32)
@@ -233,6 +236,20 @@ def main():
 
     catalogue = Q.catalogue()
     names = [n.strip() for n in arguments.schemes.split(',') if n.strip()]
+    # 🔴 A BUNDLE IS NOT THE SAME QUANTISATION AS THE SCHEME THAT NAMES IT. The
+    # export transposes the projections into (inner, outer) and the packer then
+    # groups over THAT flattened order, so its group boundaries fall on
+    # different weights than an in-memory "int3 g128" arm does. Alike in
+    # statistics, not identical - and only one of them is what would ship.
+    from bundle_reader import Bundle
+    for entry in (e for e in arguments.bundle.split(',') if e.strip()):
+        label, _, where = entry.partition('=')
+        loaded = Bundle(where if where.startswith('/') else ROOT / where)
+        scheme = Q.Scheme('%s (%s g%s)' % (label, loaded.encoding, loaded.group),
+                          0.0, (lambda values, key, b=loaded: b[key].reshape(-1)),
+                          keyed=True)
+        catalogue[scheme.name] = scheme
+        names.append(scheme.name)
     for entry in (e for e in arguments.calibrated.split(',') if e.strip()):
         label, _, where = entry.partition('=')
         # A codebook file carries its table under __codebook__; a scalar one
