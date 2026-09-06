@@ -1766,6 +1766,36 @@ the signal is real - and the distogram's own PEAKEDNESS, the same aggregate over
 the same pairs with the observed bin replaced by the distribution's maximum,
 beats it on both targets and both measures.
 
+🔴 **AND RESTRICTING TO THE CONTACT BINS MAKES IT WORSE, WHICH IS THE OPPOSITE
+OF WHAT IT SHOULD DO.** The reasoning is sound - most pairs are not in contact,
+a distogram gets that right everywhere, and scoring it separates nothing - and
+it is exactly what ColabDesign's `_get_con_loss` does, in two forms (`binary`,
+the mass below a cutoff; `categorical`, that mass renormalised and
+cross-entropied against the full distribution), with `min_k` keeping only a
+residue's most confident partners. All four arms, ranked and scored as upstream
+ranks and scores them:
+
+| mode | 1QYS | 6MRR |
+|---|---|---|
+| binary | 0.265 / 0.281 | 0.076 / **-0.186** |
+| categorical | 0.355 / 0.341 | 0.136 / -0.123 |
+| kept (p x made) | 0.303 / 0.317 | 0.110 / -0.091 |
+| made (outcome only) | 0.256 / 0.314 | 0.039 / -0.101 |
+| **peakedness, whole distribution** | **0.658 / 0.610** | **0.797 / 0.448** |
+| neighbour count (baseline) | 0.284 / 0.315 | 0.036 / -0.154 |
+
+On 6MRR the contact arms COLLAPSE INTO THE BASELINE - `binary` at
+0.076 / -0.186 against the neighbour count's 0.036 / -0.154 - and the mechanism
+is plain once seen: "the mean of a residue's top-N contact probabilities" IS a
+soft neighbour count. It measures how buried a residue is.
+
+🔴 **BECAUSE `con` IS A DESIGN OBJECTIVE, NOT A CONFIDENCE ESTIMATE.** Its job
+is to PUSH residues into contact - one minimises `-log p(contact)` - so a high
+value is a target, not a statement about reliability. Confidence is the opposite
+question, and **a distance confidently predicted to be LARGE is evidence of
+confidence too**. Discarding the non-contact bins discards most of the signal,
+which is why the arm that keeps them wins by 2-10x.
+
 🔴 **SO THE STRUCTURE TERM IS NOT REDUNDANT, IT IS HARMFUL.** The sampler
 largely realises the distogram's mode, so `p(observed)` is `p(mode)` minus
 whatever the sampler's own draw moved - and that difference is SAMPLER VARIANCE,

@@ -31,7 +31,7 @@ import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
 import { foldEsmfold2 } from "../../src/esmfold2/fold.js";
-import { CONTACT_EDGES } from "../../src/esmfold2/distogram-webgpu.js";
+import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../src/esmfold2/distogram-webgpu.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,
@@ -208,6 +208,97 @@ function distogramLikelihood(logits, bias, positions, tokens, bins,
 }
 
 /**
+ * ColabDesign's contact losses, as scores.
+ *
+ * 🔴 THE POINT IS THAT MOST PAIRS ARE NOT IN CONTACT AND SAYING SO IS FREE.
+ * Scoring every pair's whole distribution spends nearly all of its evidence on
+ * "these two residues are far apart, and they are" - which a distogram gets
+ * right everywhere and which therefore separates nothing. ColabDesign's
+ * `_get_con_loss` restricts to the bins below a cutoff, and `min_k` then keeps
+ * only a residue's most confident partners, so the uninformative mass is
+ * excluded twice over.
+ *
+ * The two upstream forms are different quantities and both are here:
+ *
+ *   binary       -log( sum of px over the contact bins )
+ *                "how much does the model believe these two touch"
+ *   categorical  -( px_ * log_softmax(dgram) ).sum(), where px_ is the
+ *                distogram RENORMALISED inside the contact bins
+ *                "...and how sharply, within the contact region"
+ *
+ * The categorical form simplifies: with `px_` summing to one it is
+ * `logsumexp(dgram) - sum(px_ * dgram)`, so neither needs a second softmax.
+ *
+ * 🔴 AND `made` RANKS BY THE PREDICTION AND SCORES BY THE OUTCOME, which is the
+ * only arm here that is an AGREEMENT rather than a belief. Ranking by the thing
+ * being scored would select for its own answer.
+ *
+ * @param mode "binary" | "categorical" | "kept" | "made"
+ */
+function contactScore(logits, bias, positions, tokens, bins, mode,
+                      { top = 10, separation = 6, cutoff = CONTACT_ANGSTROMS,
+                        edges = CONTACT_EDGES } = {}) {
+  const width = (edges.maximum - edges.minimum) / bins;
+  let contactBins = 0;
+  for (let b = 0; b < bins; b += 1) {
+    if (edges.minimum + (b + 0.5) * width < cutoff) contactBins += 1;
+  }
+  const out = new Float32Array(tokens);
+  const scratch = [];
+  for (let i = 0; i < tokens; i += 1) {
+    scratch.length = 0;
+    for (let j = 0; j < tokens; j += 1) {
+      if (Math.abs(i - j) <= separation) continue;
+      const base = (i * tokens + j) * bins;
+      let largest = -Infinity;
+      for (let b = 0; b < bins; b += 1) {
+        largest = Math.max(largest, logits[base + b] + bias[b]);
+      }
+      let total = 0, contact = 0;
+      let contactLargest = -Infinity;
+      for (let b = 0; b < bins; b += 1) {
+        const weight = Math.exp(logits[base + b] + bias[b] - largest);
+        total += weight;
+        if (b < contactBins) {
+          contact += weight;
+          contactLargest = Math.max(contactLargest, logits[base + b] + bias[b]);
+        }
+      }
+      const pContact = contact / total;
+      let value = pContact;
+      if (mode === "categorical") {
+        // px_ over the contact bins alone, then its cross-entropy with the full
+        // log-softmax. logsumexp(dgram) is `largest + log(total)`.
+        let restricted = 0;
+        for (let b = 0; b < contactBins; b += 1) {
+          restricted += Math.exp(logits[base + b] + bias[b] - contactLargest);
+        }
+        let expectation = 0;
+        for (let b = 0; b < contactBins; b += 1) {
+          const share = Math.exp(logits[base + b] + bias[b] - contactLargest) / restricted;
+          expectation += share * (logits[base + b] + bias[b]);
+        }
+        value = Math.exp(expectation - (largest + Math.log(total)));
+      }
+      if (mode === "kept" || mode === "made") {
+        const made = distance(positions, i, positions, j) < cutoff ? 1 : 0;
+        // ...ranked by the PREDICTION, scored by the outcome.
+        scratch.push({ rank: pContact, value: mode === "made" ? made : pContact * made });
+        continue;
+      }
+      scratch.push({ rank: value, value });
+    }
+    if (scratch.length === 0) { out[i] = 0; continue; }
+    scratch.sort((a, b) => b.rank - a.rank);
+    const take = Math.min(top, scratch.length);
+    let sum = 0;
+    for (let k = 0; k < take; k += 1) sum += scratch[k].value;
+    out[i] = sum / take;
+  }
+  return out;
+}
+
+/**
  * The control that decides whether the STRUCTURE is doing any work.
  *
  * 🔴 IF THE DISTOGRAM'S OWN PEAKEDNESS SCORES AS WELL, THE AGREEMENT IS
@@ -371,7 +462,18 @@ export async function main(device, args = []) {
   for (const top of [10, 20]) {
     const peak = distogramPeak(result.distogram.logits, result.distogram.bias,
       result.tokens, M.distogramBins, { top, separation: 6 });
-    controls.push({ top, pearson: pearson(peak, lddt), spearman: spearman(peak, lddt) });
+    controls.push({ label: `peakedness, top ${top}`,
+                    pearson: pearson(peak, lddt), spearman: spearman(peak, lddt) });
+  }
+  const contact = [];
+  for (const mode of ["binary", "categorical", "kept", "made"]) {
+    for (const top of [5, 10, 20]) {
+      const score = contactScore(result.distogram.logits, result.distogram.bias,
+        modelRepresentative, result.tokens, M.distogramBins, mode,
+        { top, separation: 6 });
+      contact.push({ mode, top,
+                     pearson: pearson(score, lddt), spearman: spearman(score, lddt) });
+    }
   }
 
   console.log(`  ${crystalPath}  chain ${wantedChain}: ${crystal.sequence.length} observed`
@@ -390,8 +492,15 @@ export async function main(device, args = []) {
     console.log(`  ${String(row.separation).padStart(3)}  ${String(row.top).padStart(4)}`
       + `    ${row.pearson.toFixed(3).padStart(7)}   ${row.spearman.toFixed(3).padStart(8)}`);
   }
+  console.log("\n  ColabDesign-style, restricted to the contact bins:");
+  console.log("  mode         topN     Pearson   Spearman");
+  for (const row of contact) {
+    console.log(`  ${row.mode.padEnd(12)} ${String(row.top).padStart(4)}`
+      + `    ${row.pearson.toFixed(3).padStart(7)}   ${row.spearman.toFixed(3).padStart(8)}`);
+  }
+  console.log();
   for (const control of controls) {
-    console.log(`  peakedness only, top ${String(control.top).padStart(2)} (control) `
+    console.log(`  ${control.label.padEnd(22)} (control)`
       + `  ${control.pearson.toFixed(3).padStart(7)}   ${control.spearman.toFixed(3).padStart(8)}`);
   }
   console.log(`  baseline: neighbour count          `
@@ -399,5 +508,5 @@ export async function main(device, args = []) {
 
   return { crystal: crystalPath, chain: wantedChain, seed,
            residues: crystal.sequence.length, gaps: crystal.gaps,
-           meanLddt, lddtSpread: [at(0.1), at(0.9)], rows, controls, baseline };
+           meanLddt, lddtSpread: [at(0.1), at(0.9)], rows, contact, controls, baseline };
 }
