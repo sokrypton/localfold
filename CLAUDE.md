@@ -1866,6 +1866,52 @@ against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
 
+🔴 **SO THE COLOUR SHIPS, AND IT IS THE ARM THAT DOES NOT USE THE STRUCTURE.**
+`CERTAINTY` in src/esmfold2/distogram-webgpu.js: the mass within **2 A of the
+distogram's mode**, meaned over every pair at sequence separation above **3**
+whose predicted distance is under **12 A**. Ranked on realistic corruption rates
+(0 and 15%) by WORST fold, the two families are a tie -
+
+| family | median | worst |
+|---|---|---|
+| `mode 1.5, sep 3, cut 12` | 0.537 | 0.361 |
+| `obs 3, sep 15, cut 14` | 0.535 | **0.363** |
+| `negent, sep 5, cut 12` | 0.572 | 0.288 |
+| `conBin, sep 3, cut 8` | 0.456 | 0.239 |
+
+- and `mode` is taken because it needs NO COORDINATES. It comes off the trunk's
+distogram, so it exists before the sampler runs: the live frames are coloured
+from the first one, and a caller could gate whether to sample at all on it.
+`obs` cannot do either, for a tie.
+
+🔴 **AND EVERY INVERSION WAS AT 40% CORRUPTION OR WORSE.** The objection to
+colouring - "the worst fold is negative" - was measured over folds nobody would
+make. On 0 and 15% the worst of forty folds is **+0.31**, and the negatives live
+where the fold is garbage AND the label is meaningless, since a heavily mutated
+sequence's true structure is not the crystal.
+
+🔴 **AND IT GOES IN THE B-FACTOR UNDER THE pLDDT PALETTE, WITH THREE THINGS
+STOPPING IT BEING READ AS ONE.** The B-factor is the only column a viewer can
+colour from and the palette is the one every reader of this page knows, so the
+guards are elsewhere: the status line says `certainty 0.94 (not pLDDT)`, the
+downloaded PDB carries a `REMARK` naming the quantity and the missing head, and
+the word pLDDT appears nowhere. With no certainty at all it falls back to chain
+colours rather than painting a zero B-factor as no confidence.
+
+🔴 **AND "NO PARTNER INSIDE THE CUTOFF" IS NO DATA, NOT ZERO CONFIDENCE.** A
+terminal residue the model places away from everything has an empty filtered
+mean; writing 0 there paints it as the least reliable residue in the structure,
+which is a claim and the wrong one. It falls back to the unfiltered mean, and
+only a chain shorter than the separation gets nothing. Measured on ubiquitin:
+before the fallback the range was 0.0 to 98.6, after it 49.7 to 98.6.
+
+🔴 **AND THE DIAL HAS TO STOP REPORTING WHEN THE LOAD DOES.** The tower STREAMS
+- its 36 blocks are read during the fold - so its store went on firing progress
+after the weights promise resolved, and `startModelPreload`'s clear was
+immediately undone by the next shard. The dial stuck at "346 / 346 MiB" for the
+rest of the session. What it means is the DOWNLOAD; the streaming is the fold's
+own business and the status line narrates it.
+
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and
 the same all-atom representation, so a guard asking "is this AlphaFold 3"

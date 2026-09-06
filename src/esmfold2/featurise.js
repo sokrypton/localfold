@@ -324,3 +324,21 @@ export function toDensePositions(features, coordinates) {
   }
   return dense;
 }
+
+/**
+ * A per-token value spread onto the dense atom slots `toPdb` writes.
+ *
+ * 🔴 THE B-FACTOR COLUMN IS PER ATOM AND THIS ESTIMATE IS PER RESIDUE, so every
+ * atom of a residue carries its residue's value - which is what AlphaFold does
+ * with pLDDT too, and what makes a cartoon colour evenly rather than banding
+ * along a side chain.
+ */
+export function spreadOverAtoms(features, perToken, scale = 1) {
+  const dense = new Float32Array(features.tokens * features.dense);
+  for (let atom = 0; atom < features.atoms; atom += 1) {
+    const slot = features.denseSlot[atom];
+    if (slot < 0) continue;
+    dense[slot] = perToken[features.atomToToken[atom]] * scale;
+  }
+  return dense;
+}

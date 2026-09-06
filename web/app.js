@@ -40,7 +40,7 @@ import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
 import { ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
-import { toDensePositions } from "../src/esmfold2/featurise.js";
+import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
@@ -2082,13 +2082,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const modelName = MODEL_LABELS.esmfold2;
   const sequence = chains.join(":");
   status(`${modelName} · loading`);
+  // ...the long name is for the download dial, where provenance matters; the
+  // status line uses the short one, because it is written many times a fold.
   // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED, exactly as on the AF3
   // path - and from the same place, because these are the same components. A
   // fold touches only the codes its ligands name and the PDB serves each as one
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
   for (const code of ligandCodes) {
-    status(`${modelName} · fetching ligand ${code}`);
+    status(`ESMFold2 · fetching ligand ${code}`);
     const response = await fetch(ccdUrl(code), { signal });
     if (!response.ok) {
       throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
@@ -2143,6 +2145,18 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // they are computed and there is no last one yet.
   let reference = null;
   let slots;
+  // 🔴 THE COLOUR IS THE DISTOGRAM'S CERTAINTY, NOT A pLDDT, AND THE PDB SAYS
+  // SO IN A REMARK. This checkpoint has no confidence head - 820 tensors and
+  // not one named confidence, plddt, pae or pde - so what goes in the B-factor
+  // is an ORDERING with nothing to calibrate a number against. It is written
+  // there because that is the only column a viewer can colour from, and a
+  // downloaded file that carried an uncommented pLDDT-shaped column would be
+  // read as one. See CERTAINTY in src/esmfold2/distogram-webgpu.js for the
+  // sweep that chose its three constants.
+  let certainty;
+  const REMARK = "REMARK   1 B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT."
+    + "\nREMARK   1 THIS ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD.";
+  const withRemark = (pdb) => `${REMARK}\n${pdb}`;
 
   const started = performance.now();
   const result = await foldEsmfold2(device, {
@@ -2156,13 +2170,16 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     seed: randomSeed(),
     onProgress: (label) => {
       if (signal.aborted) return;
-      status(`${modelName} · ${label}`);
+      status(`ESMFold2 · ${label}`);
     },
     // 🔴 THE CONTACT MAP EXISTS BEFORE ANY STRUCTURE DOES, because the
     // distogram head runs off the trunk and the sampler has not started. It is
     // held until there is a frame to hang it on, exactly as the AF3 path holds
     // its own.
-    onContacts: (contacts) => { liveContacts = contactMapFor(contacts); },
+    onContacts: (contacts, trunkCertainty) => {
+      liveContacts = contactMapFor(contacts);
+      certainty = trunkCertainty;
+    },
     // 🔴 `denoised` AND NOT `coordinates`, AND THE REASON IS THE CAMERA. The
     // sampler's own walk starts as Gaussian noise at sigma 411 and ends at a
     // protein, so no fixed camera holds both and the early frames are not a
@@ -2179,7 +2196,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       if (reference === null) {
         reference = toPoints(dense, features.batch.tokens * features.batch.dense);
       }
-      const pdb = fittedPdb(features.batch, dense, reference, slots, null);
+      // ...the certainty is the TRUNK's and does not change per step, so every
+      // frame carries the same colouring. That is honest: nothing about a
+      // sampler step changes what the distogram knows.
+      const pdb = withRemark(fittedPdb(features.batch, dense, reference, slots,
+        certainty === undefined ? null : spreadOverAtoms(features, certainty, 100)));
       framePdbs.push(pdb);
       drawLiveFrame(pdb);
     },
@@ -2191,11 +2212,14 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // It is still `result.coordinates` - the sampler's own answer, not the last
   // denoiser call - and at the bottom of the schedule the two agree to a
   // fraction of an angstrom anyway.
+  certainty = result.certainty ?? certainty;
+  const bFactors = certainty === undefined
+    ? null : spreadOverAtoms(result.features, certainty, 100);
   const finalDense = toDensePositions(result.features, result.coordinates);
-  const pdb = reference === null
-    ? toPdb(result.features.batch, finalDense)
+  const pdb = withRemark(reference === null
+    ? toPdb(result.features.batch, finalDense, bFactors)
     : fittedPdb(result.features.batch, finalDense, reference,
-                slots ?? alphaCarbons(result.features.batch), null);
+                slots ?? alphaCarbons(result.features.batch), bFactors));
   const contactMap = contactMapFor(result.contacts);
   const live = viewer?.objectsData?.[viewerObject];
   if (live?.frames !== undefined) live.frames.length = 0;
@@ -2220,8 +2244,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
       viewer.addFrame(frame, viewerObject);
     }
-    // 🔴 CHAIN COLOURS, NOT pLDDT. See the note at the top of this function.
-    if (typeof viewer.setColorScheme === "function") viewer.setColorScheme("chain");
+    // 🔴 THE pLDDT PALETTE ON A NUMBER THAT IS NOT A pLDDT, DELIBERATELY. It is
+    // the right palette for a 0-100 confidence-like scale and every reader of
+    // this page already knows how to read it; what must not happen is the WORD
+    // appearing anywhere, which is why the status line names the quantity and
+    // the file carries a REMARK. With no certainty at all it falls back to
+    // chain colours rather than colouring a zero B-factor as no confidence.
+    if (typeof viewer.setColorScheme === "function") {
+      viewer.setColorScheme(certainty === undefined ? "chain" : "plddt");
+    }
     viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
   }
 
@@ -2238,9 +2269,15 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   element("downloads").style.display = "flex";
 
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
-  status(`${modelName} · ${result.tokens} tokens · ${result.steps} `
-    + `${result.settings.gamma0 === 0 ? "flow" : "diffusion"} steps · ${seconds}s`
-    + " · no confidence head in this checkpoint");
+  const mean = certainty === undefined ? undefined
+    : [...certainty].reduce((total, value) => total + value, 0) / certainty.length;
+  // 🔴 SHORT, BUT "(not pLDDT)" STAYS. The line was a sentence long and read as
+  // a disclaimer rather than a result; what it cannot lose is the three words
+  // that stop a number in a pLDDT palette being read as a pLDDT. The rest of
+  // the explanation lives in the PDB's REMARK and in the model row's tooltip,
+  // where somebody who wants it can find it.
+  status(`ESMFold2 · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
+    + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)} (not pLDDT)`));
   progress(null);
 }
 

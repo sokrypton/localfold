@@ -101,7 +101,17 @@ export function loadEsmfold2Weights(onProgress) {
     // 🔴 ONE PROGRESS STREAM OVER TWO STORES, or the dial resets to zero in the
     // middle of a 347 MiB download. The two are reported as one total.
     const seen = new Map();
+    // 🔴 REPORTING STOPS WHEN THE LOAD DOES, OR THE DIAL NEVER CLEARS. The
+    // tower STREAMS - its 36 blocks are read one at a time during the fold, by
+    // the callback the tower calls - so its store goes on firing progress long
+    // after this promise resolves. `startModelPreload` clears the dial when the
+    // promise settles, and the next shard read put it straight back, at
+    // "346 / 346 MiB", where it stayed for the rest of the session. What the
+    // dial means is the DOWNLOAD; the streaming is the fold's own business and
+    // the status line already narrates it.
+    let loading = true;
     const report = (key) => (progress) => {
+      if (!loading) return;
       seen.set(key, progress);
       let loadedBytes = 0, totalBytes = 0;
       for (const value of seen.values()) {
@@ -149,6 +159,7 @@ export function loadEsmfold2Weights(onProgress) {
     const towerShared = {};
     for (const name of TOWER_SHARED) towerShared[name] = await towerStore.tensor(name);
 
+    loading = false;
     return {
       shape: { ...M, loops: (M.loops ?? 3) + 1 },
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },

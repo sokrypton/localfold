@@ -424,8 +424,14 @@ export async function foldEsmfold2(device, options) {
           weights: weights.featuriser.distogramWeights,
           bias: weights.featuriser.distogramBias,
           wantLogits: options.distogramLogits === true }));
-    const contacts = distogram?.contacts ?? distogram;
-    await options.onContacts?.(contacts);
+    const contacts = distogram?.contacts;
+    const certainty = distogram?.certainty;
+    // 🔴 THE CERTAINTY GOES OUT WITH THE CONTACTS, BEFORE THE SAMPLER RUNS.
+    // Both come off the trunk's distogram, so a caller colouring its live
+    // frames has them from the first one - and the first version assigned it
+    // only from the RESULT, which left every frame but the last at a zero
+    // B-factor and therefore the colour of no confidence at all.
+    await options.onContacts?.(contacts, certainty);
 
     // ---- the sampler.
     const settings = { ...SAMPLER_DEFAULTS,
@@ -480,7 +486,7 @@ export async function foldEsmfold2(device, options) {
     denoiser.release();
 
     return {
-      coordinates: x, features, sequence, tokens, atoms, sInputs, contacts,
+      coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
       distogram: options.distogramLogits === true ? distogram : undefined,
       steps: levels.length, scheduleLength: schedule.length, settings,
       elapsedMilliseconds: performance.now() - started, timings, memory,

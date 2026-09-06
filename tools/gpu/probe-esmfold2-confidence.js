@@ -733,15 +733,51 @@ export async function main(device, args = []) {
   // 🔴 THE SAME ARM, RATE BY RATE. Pooling the corruptions would let the clean
   // folds carry the corrupted ones and report a number true of neither.
   if (rates.length > 1) {
+    // 🔴 THE WORST CASE PER RATE, NOT POOLED, BECAUSE THAT IS WHERE THE
+    // OBJECTION LIVES. A negative worst case over all 80 folds is only a reason
+    // not to colour a structure if the inversions happen on folds a reader
+    // would actually look at. At 80% corruption the fold is garbage AND the
+    // label is meaningless - the mutant's true structure is not the crystal -
+    // so an inversion there says nothing about colouring a real prediction.
+    //
+    // 🔴 AND THE ARM IS CHOSEN ON THE REALISTIC RATES, for the same reason.
+    // Ranking on all 80 optimises partly for folds nobody will make.
+    const realistic = rates.filter((rate) => rate <= 15);
+    const inBucket = (arm, chosen) => chosen.flatMap((rate) => arm.byRate.get(rate));
+    for (const arm of arms) arm.realistic = inBucket(arm, realistic);
+    const forColour = [...arms].sort((a, b) => {
+      const worst = Math.min(...b.realistic) - Math.min(...a.realistic);
+      return worst !== 0 ? worst : median(b.realistic) - median(a.realistic);
+    });
     console.log("\n  the leading arm, per corruption rate:");
-    console.log("  rate   folds   mean lDDT   median Spearman");
+    console.log("  rate   folds   mean lDDT   median Spearman   worst   25th");
     for (const rate of rates) {
       const bucket = ranked[0].byRate.get(rate);
       const lddts = perTarget.filter((row) => row.rate === rate && row.skipped === undefined)
         .map((row) => row.meanLddt);
       if (bucket.length === 0) continue;
+      const sorted = [...bucket].sort((a, b) => a - b);
       console.log(`  ${String(rate).padStart(3)}%   ${String(bucket.length).padStart(5)}`
-        + `   ${median(lddts).toFixed(3).padStart(9)}   ${median(bucket).toFixed(3).padStart(15)}`);
+        + `   ${median(lddts).toFixed(3).padStart(9)}   ${median(bucket).toFixed(3).padStart(15)}`
+        + `  ${sorted[0].toFixed(3).padStart(6)}  ${sorted[Math.floor(0.25 * sorted.length)].toFixed(3).padStart(6)}`);
+    }
+    console.log(`\n  best ten for COLOURING - ranked on rates <= 15% by WORST fold:`);
+    console.log("  measure   sep    cutoff    median   worst    25th");
+    const show = (arm) => {
+      const sorted = [...arm.realistic].sort((a, b) => a - b);
+      console.log(`  ${name(arm)}    ${median(arm.realistic).toFixed(3).padStart(6)}`
+        + `  ${sorted[0].toFixed(3).padStart(6)}  ${sorted[Math.floor(0.25 * sorted.length)].toFixed(3).padStart(6)}`);
+    };
+    for (const arm of forColour.slice(0, 10)) show(arm);
+    // 🔴 AND THE BEST OF EACH FAMILY, BECAUSE A TOP TEN THAT IS ALL ONE FAMILY
+    // does not say by how much the other lost. `mode` uses the distogram alone
+    // and `obs` scores the distance the SAMPLER produced; the difference
+    // between them is what "does the structure help" means, and the top ten
+    // being all `mode` is only an answer if the margin is shown.
+    console.log("  ...the best arm of each family, on the same ranking:");
+    for (const family of ["mode", "obs", "negent", "conBin", "conCat"]) {
+      const best = forColour.find((arm) => arm.measure.split(" ")[0] === family);
+      if (best !== undefined) show(best);
     }
     // 🔴 AND THE GLOBAL QUESTION, WHICH THE CORRUPTIONS ARE ACTUALLY FOR. Does
     // a fold's MEAN estimate know that the fold is bad? One point per fold,
