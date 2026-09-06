@@ -2275,6 +2275,20 @@ are protein-only, which is a stated assumption rather than a silent one.
 mean pLDDT **77.36664729240613** and pTM **0.5503883067518472**, which are this
 file's own recorded figures to every digit.
 
+🔴 **AND `tools/gpu/fold.js` TAKES `--ligands` AND `--kinds` NOW, BECAUSE THE
+LIGAND BRANCHES HAD UNIT TESTS AND NO END-TO-END RUN.** AF3's featuriser has
+handled ligands and nucleic chains for a long time and the only route to one was
+the page, so the case the contact threshold is entirely ABOUT could not be
+folded from a shell. Ubiquitin's first 40 residues with ATP: 71 tokens, 343
+atoms, mean pLDDT 89.5, pTM 0.719, ipTM 0.678.
+
+🔴 **AND IT PRINTS A CONTACT-CLASS CENSUS, BECAUSE "IT FOLDED" DOES NOT SAY THE
+LIGAND WAS SEEN AS ONE.** A ligand atom and an unknown residue share an
+`aatype`, so a class taken from the alphabet alone would call all 31 of ATP's
+tokens protein - and the fold would still come out, with a protein's threshold
+on every pair and nothing to see. The line reads `contact classes: 40 polymer,
+31 ligand, 0 nucleic`, and it is printed only when there is something to say.
+
 🔴 **AND THE DIAL HAS TO STOP REPORTING WHEN THE LOAD DOES.** The tower STREAMS
 - its 36 blocks are read during the fold - so its store went on firing progress
 after the weights promise resolved, and `startModelPreload`'s clear was

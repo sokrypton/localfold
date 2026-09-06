@@ -14,6 +14,9 @@
  * the page, because the page has to run what was measured.
  */
 import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";import { featuriseProtein } from "../../src/af3/featurise.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
+import { af3ContactClasses } from "../../src/af3/contact-classes.js";
+import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
@@ -109,6 +112,16 @@ export async function main(device, args) {
   const samplerMode = option(args, "mode", "diffusion");
   const blocks = Number(option(args, "blocks", "48"));
   const sequenceArg = option(args, "sequence", "");
+  // 🔴 A LIGAND IS THE CASE THE CONTACT MAP'S THRESHOLD IS ABOUT, and until
+  // this flag existed there was no way to fold one through AF3 from a shell -
+  // so the ligand branches of the featuriser and the distogram head had unit
+  // tests and no end-to-end run. Codes are comma-separated CCD names and their
+  // geometry comes from the dictionary, over the network. `--kinds` names each
+  // colon-joined chain, since the letters cannot say: A, C and G are alanine,
+  // cysteine and glycine in a protein and adenine, cytosine and guanine in a
+  // nucleic one.
+  const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
+  const chainKinds = option(args, "kinds", "");
 
   // 🔴 AF3's DIFFUSION SAMPLER NEEDS ITS WHOLE SCHEDULE, AND STOPPING EARLY
   // LOOKS EXACTLY LIKE A BROKEN MODEL. `--steps` sets the discretisation, not a
@@ -155,9 +168,15 @@ export async function main(device, args) {
     : af3MsaFromA3m({ paired: mergeFor(pairedTexts), unpaired: mergeFor(unpairedTexts) },
                     { maxSequences: Number(option(args, "max-msa", "512")) });
 
+  const ligands = [];
+  for (const code of ligandCodes) {
+    ligands.push(parseCcdComponent(await (await fetch(ccdUrl(code))).text()));
+  }
   const batch = sequenceArg !== ""
     ? featuriseProtein(sequenceArg,
-      { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom })
+      { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
+        ...(ligands.length === 0 ? {} : { ligands }),
+        ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }) })
     : batchFromDump(dump);
   if (rows.depth > 1) {
     console.log(`MSA ${rows.depth} rows, unpaired block starts at ${rows.unpairedFrom}`);
@@ -171,6 +190,18 @@ export async function main(device, args) {
   console.log(sequenceArg !== ""
     ? "featurised in JavaScript from the sequence"
     : "featurised by AF3, read from the dump");
+  // 🔴 A CENSUS, BECAUSE "IT FOLDED" DOES NOT SAY THE LIGAND WAS SEEN AS ONE.
+  // A ligand atom and an unknown residue share an aatype, so a class derived
+  // from the alphabet alone would call all 31 of ATP's tokens protein - and
+  // the fold would still come out, with a protein's contact threshold on every
+  // pair. Printed only when there is something to say.
+  const classes = af3ContactClasses(batch, batch.tokens);
+  const ligandTokens = classes.filter((c) => c === CLASS_LIGAND).length;
+  const nucleicTokens = classes.filter((c) => c === CLASS_NUCLEIC).length;
+  if (ligandTokens > 0 || nucleicTokens > 0) {
+    console.log(`contact classes: ${batch.tokens - ligandTokens - nucleicTokens}`
+      + ` polymer, ${ligandTokens} ligand, ${nucleicTokens} nucleic`);
+  }
 
   // --quant=int5:g32:asym[:search] round-trips every learned weight through a
   // storage precision before the fold, so the cost is measured in ANGSTROMS
