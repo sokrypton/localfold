@@ -29,6 +29,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
+  swigluGrid,
 } from "./block-webgpu.js";
 
 /**
@@ -157,8 +158,8 @@ export class EsmcTowerGpu {
       pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}`,
         createLinearShader({ rows, inner: model, outer: model }, true,
           weightPrecision)),
-      pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}:${weightPrecision}`,
-        createSwigluShader({ rows, model, ffn }, epsilon, weightPrecision)),
+      pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, weightPrecision)),
       pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}`,
         createLinearShader({ rows, inner: ffn, outer: model }, true,
           weightPrecision)),
@@ -273,6 +274,7 @@ export class EsmcTowerGpu {
         const value = scratch("value", rows * model);
         const context = scratch("context", rows * model);
         const afterAttention = scratch("afterAttention", rows * model);
+        const ffnNormed = scratch("ffnNormed", rows * model);
         const gated = scratch("gated", rows * ffn);
         const next = keepPersistent(this.allocator.allocate(`esmc.x.${layer}`,
           rows * model * 4, storage | GPUBufferUsage.COPY_SRC));
@@ -295,8 +297,14 @@ export class EsmcTowerGpu {
         dispatchInto(pass, preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
         dispatchInto(pass, attentionPipeline, [query, key, value, context], rows * heads);
         dispatchLinear(pass, outPipeline, [context, attnOut, current, afterAttention], model);
-        dispatchInto(pass, swigluPipeline,
-          [afterAttention, ffnScale, ffnOffset, fc1, gated], rows);
+        dispatchInto(pass, normPipeline,
+          [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
+        pass.setPipeline(swigluPipeline);
+        pass.setBindGroup(0, bind(swigluPipeline, [ffnNormed, fc1, gated]));
+        {
+          const [gx, gy] = swigluGrid(rows, ffn);
+          pass.dispatchWorkgroups(gx, gy);
+        }
         dispatchLinear(pass, downPipeline, [gated, fc2, afterAttention, next], model);
         // 🔴 THE LAST STATE IS FINAL-NORMED AND THE OTHER 36 ARE NOT, so the
         // mix reads `next` directly here and a normed copy on the last layer.

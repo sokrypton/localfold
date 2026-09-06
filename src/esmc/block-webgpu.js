@@ -408,66 +408,100 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
-/** LayerNorm, widen to [gate | value], gate, in one pass over the row. */
-export function createSwigluShader({ rows, model, ffn }, epsilon,
-                                   weightPrecision = "f32") {
+/**
+ * The SwiGLU widening, tiled and vectorised like the other projections.
+ *
+ * 🔴 THIS KERNEL HELD 44% OF A BLOCK'S WEIGHTS AND NONE OF ITS OPTIMISATION.
+ * fc1 is 7.08 M of a block's 15.93 M parameters, and while `createLinearShader`
+ * was transposed, tiled and vectorised into 320 GFLOP/s this one stayed as it
+ * was written: one workgroup a row, scalar, every row re-reading the whole
+ * matrix. At those two rates fc1 is 84% of the block's time for 44% of its
+ * work - which is what comes of tuning the kernels one has been thinking about
+ * rather than the ones holding the weights.
+ *
+ * 🔴 THE LayerNorm MOVED OUT, because a row tile cannot stage what it needs.
+ * The old kernel normalised in workgroup memory and kept the row there, which
+ * costs ${ROW_TILE} x model floats at a tile of ${ROW_TILE} - 36 KB against a
+ * 16 KB limit. Normalising into its own buffer first costs one pass and
+ * rows x model floats, and lets the widening tile like everything else.
+ *
+ * 🔴 AND BOTH HALVES ARE COMPUTED IN REGISTERS, so the (rows, 2 * ffn)
+ * intermediate never exists. That is the property the old kernel had and the
+ * one worth keeping: at 1500 tokens it would be 36.9 MB written to be read
+ * once.
+ */
+export function createSwigluShader({ rows, model, ffn }, weightPrecision = "f32") {
+  if (ffn % 4 !== 0) {
+    throw new RangeError(`vectorised SwiGLU needs a multiple of four columns; got ${ffn}`);
+  }
   const half = weightPrecision === "f16";
-  const readWeight = (e) => (half ? `f32(${e})` : e);
-  return `${half ? "enable f16;\n" : ""}
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> scale: array<f32>;
-@group(0) @binding(2) var<storage, read> offset: array<f32>;
-@group(0) @binding(3) var<storage, read> weights: array<${weightPrecision}>;
-@group(0) @binding(4) var<storage, read_write> destination: array<f32>;
+  const load = half ? (e) => `vec4<f32>(weights[${e}])` : (e) => `weights[${e}]`;
+  const vectorFfn = ffn / 4;
+  const stride = (2 * ffn) / 4;
+  const tile = 4;   // gate and value both accumulate, so half the linear tile
 
-var<workgroup> row_values: array<f32, ${model}>;
-var<workgroup> sums: array<f32, ${LANES}>;
-var<workgroup> squares: array<f32, ${LANES}>;
+  const declare = [], body = [], stores = [];
+  for (let t = 0; t < tile; t += 1) {
+    declare.push(`  var gate_${t} = vec4<f32>(0.0);`);
+    declare.push(`  var value_${t} = vec4<f32>(0.0);`);
+    stores.push(`  {
+    let row = row_origin + ${t}u;
+    if (row < ${rows}u && vector_column < ${vectorFfn}u) {
+      let activated = gate_${t} / (vec4<f32>(1.0) + exp(-gate_${t}));
+      destination[row * ${vectorFfn}u + vector_column] = activated * value_${t};
+    }
+  }`);
+  }
+  // 🔴 THE GATE HALF IS FIRST: silu(wide[c]) * wide[ffn + c]. Swapped, the block
+  // still runs and returns a plausible tensor of the same shape.
+  body.push(`      let wg = ${load(`k_absolute * ${stride}u + vector_column`)};`);
+  body.push(`      let wv = ${load(`k_absolute * ${stride}u + ${vectorFfn}u + vector_column`)};`);
+  for (let t = 0; t < tile; t += 1) {
+    body.push(`      let s_${t} = staged[${t}u * ${K_CHUNK}u + k];`);
+    body.push(`      gate_${t} += s_${t} * wg;`);
+    body.push(`      value_${t} += s_${t} * wv;`);
+  }
+
+  return `${half ? "enable f16;\n" : ""}
+@group(0) @binding(0) var<storage, read> normalised: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<vec4<${weightPrecision}>>;
+@group(0) @binding(2) var<storage, read_write> destination: array<vec4<f32>>;
+
+var<workgroup> staged: array<f32, ${tile * K_CHUNK}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let row = group.x + group.y * ${GRID_WIDTH}u;
-  if (row >= ${rows}u) { return; }
-  let base = row * ${model}u;
-  var total = 0.0;
-  var square = 0.0;
-  for (var c = local.x; c < ${model}u; c += ${LANES}u) {
-    let v = source[base + c];
-    total += v;
-    square += v * v;
-  }
-  sums[local.x] = total;
-  squares[local.x] = square;
-  workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) {
-      sums[local.x] += sums[local.x + stride];
-      squares[local.x] += squares[local.x + stride];
+  let row_origin = group.y * ${tile}u;
+  let vector_column = group.x * ${LANES}u + local.x;
+  if (row_origin >= ${rows}u) { return; }
+
+${declare.join("\n")}
+
+  for (var k0 = 0u; k0 < ${model}u; k0 += ${K_CHUNK}u) {
+    for (var slot = local.x; slot < ${tile * K_CHUNK}u; slot += ${LANES}u) {
+      let t = slot / ${K_CHUNK}u;
+      let k = slot % ${K_CHUNK}u;
+      let row = row_origin + t;
+      staged[slot] = select(0.0, normalised[row * ${model}u + k0 + k],
+                            row < ${rows}u && k0 + k < ${model}u);
+    }
+    workgroupBarrier();
+    for (var k = 0u; k < ${K_CHUNK}u; k += 1u) {
+      let k_absolute = k0 + k;
+      if (k_absolute >= ${model}u) { break; }
+${body.join("\n")}
     }
     workgroupBarrier();
   }
-  let mean = sums[0] / ${model}.0;
-  let variance = max(squares[0] / ${model}.0 - mean * mean, 0.0);
-  let inverse = inverseSqrt(variance + ${epsilon});
-  for (var c = local.x; c < ${model}u; c += ${LANES}u) {
-    row_values[c] = (source[base + c] - mean) * inverse * scale[c] + offset[c];
-  }
-  workgroupBarrier();
 
-  // 🔴 THE GATE HALF IS FIRST: silu(wide[c]) * wide[${ffn} + c]. Swapped, the
-  // block still runs and returns a plausible tensor of the same shape.
-  for (var c = local.x; c < ${ffn}u; c += ${LANES}u) {
-    var gate = 0.0;
-    var linear = 0.0;
-    for (var i = 0u; i < ${model}u; i += 1u) {
-      let row = i * ${2 * ffn}u;
-      gate += row_values[i] * ${readWeight("weights[row + c]")};
-      linear += row_values[i] * ${readWeight(`weights[row + ${ffn}u + c]`)};
-    }
-    destination[row * ${ffn}u + c] = (gate / (1.0 + exp(-gate))) * linear;
-  }
+${stores.join("\n")}
 }`;
+}
+
+/** The grid the tiled SwiGLU wants. Its row tile is half the linear kernel's. */
+export function swigluGrid(rows, ffn) {
+  return [Math.ceil(ffn / 4 / LANES), Math.ceil(rows / 4)];
 }
 
 export class EsmcBlockGpu {
@@ -524,6 +558,7 @@ export class EsmcBlockGpu {
       const value = scratch("value", rows * model);
       const context = scratch("context", rows * model);
       const afterAttention = scratch("afterAttention", rows * model);
+      const ffnNormed = scratch("ffnNormed", rows * model);
       const gated = scratch("gated", rows * ffn);
       const output = scratch("output", rows * model);
 
@@ -576,8 +611,8 @@ export class EsmcBlockGpu {
         `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
         createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile));
       const swigluPipeline = await pipeline(
-        `esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}:${weightPrecision}`,
-        createSwigluShader({ rows, model, ffn }, epsilon, weightPrecision));
+        `esmc-swiglu:${rows}:${model}:${ffn}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, weightPrecision));
       const downPipeline = await pipeline(
         `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
         createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest, rowTile));
@@ -620,7 +655,13 @@ export class EsmcBlockGpu {
       dispatch(preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
       dispatch(attentionPipeline, [query, key, value, context], rows * heads);
       dispatchLinear(outPipeline, [context, attnOutScaled, x, afterAttention], model);
-      dispatch(swigluPipeline, [afterAttention, ffnScale, ffnOffset, fc1, gated], rows);
+      dispatch(normPipeline, [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
+      pass.setPipeline(swigluPipeline);
+      pass.setBindGroup(0, bindOf(swigluPipeline, [ffnNormed, fc1, gated]));
+      {
+        const [gx, gy] = swigluGrid(rows, ffn);
+        pass.dispatchWorkgroups(gx, gy);
+      }
       dispatchLinear(downPipeline, [gated, fc2Scaled, afterAttention, output], model);
       pass.end();
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * model * 4);
