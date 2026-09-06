@@ -76,6 +76,10 @@ values means the whole-stack checker, not that file.
 | **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
 | Does the diffusion module agree, module by module? | `node tools/check-esmfold2-diffusion.js` |
+| ...and on the GPU, a whole denoise step? | `tools/gpu/check-esmfold2-diffusion-gpu.js` |
+| Does the sliding-window atom attention compute its reference? | `tools/gpu/check-esmfold2-atom-stack.js` |
+| Does the featuriser build what ESMFold2 was handed? | `node tools/check-esmfold2-featurise.js` |
+| **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |

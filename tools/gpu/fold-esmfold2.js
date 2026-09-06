@@ -96,6 +96,12 @@ export async function main(device, args = []) {
   // RDKit rather than through mmCIF, and takes the ideal conformer for the same
   // reason.
   const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
+  // 🔴 PRICED AGAINST THE SAMPLER'S OWN SPREAD, NOT AGAINST ZERO. The trunk's
+  // two f16 knobs - the transition's staged tiles and the triangle projection's
+  // accumulators - are worth 1.09x and 1.17x at 150 tokens, and the question is
+  // not what they cost a tensor norm but whether the STRUCTURE notices. Written
+  // `staged:accumulate`, or one name for both.
+  const trunkPrecision = option(args, "trunk-precision", "");
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
   const sampler = option(args, "sampler", "diffusion-15");
@@ -183,6 +189,10 @@ export async function main(device, args = []) {
       : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
           ...(ligands.length === 0 ? {} : { ligands }) },
     shape: { ...M, loops: (M.loops ?? 3) + 1 },
+    trunk: trunkPrecision === "" ? {} : {
+      stagedPrecision: trunkPrecision.split(":")[0],
+      accumulatePrecision: trunkPrecision.split(":")[1] ?? trunkPrecision.split(":")[0],
+    },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
     onProgress: (label) => { progress.push(label); },
@@ -296,7 +306,7 @@ export async function main(device, args = []) {
   }
 
   return {
-    sequence, sampler, seed,
+    sequence, sampler, seed, trunkPrecision,
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,
     caSpacing: spacing.length === 0 ? null
