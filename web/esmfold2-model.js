@@ -29,6 +29,9 @@ import {
 } from "../src/esmfold2/weights.js";
 import { SHIM_PAIR_TENSORS } from "../src/esmfold2/language-pair-webgpu.js";
 import { EsmcTowerGpu } from "../src/esmc/tower-webgpu.js";
+import { SAMPLER_DEFAULTS, SAMPLER_PRESETS } from "../src/esmfold2/fold.js";
+import { churnFactors, noiseLevels, noiseSchedule }
+  from "../src/esmfold2/sampler-reference.js";
 
 /** The ten tensors an ESM-C block holds, under the names its exporter writes. */
 const BLOCK_LEAVES = ["attn_norm/scale", "attn_norm/offset", "qkv/weights",
@@ -75,6 +78,26 @@ export const ESMFOLD2_COUNTS = {
 
 /** The sampler mode this model runs, whatever a shared control says. */
 export const ESMFOLD2_SAMPLER_MODE = "diffusion";
+
+/**
+ * How many steps a preset ACTUALLY runs, which is not the number in its name.
+ *
+ * 🔴 `max_inference_sigma` DROPS EVERY SCHEDULE ENTRY ABOVE 256 AND PREPENDS
+ * THE CAP, so the checkpoint's `inference_num_steps: 15` runs ELEVEN. The dial
+ * offering "15" beside a status line reading "11 steps" is the page
+ * contradicting itself, and the config number is the one with no operational
+ * meaning. Computed from the schedule rather than tabulated, so it stays true
+ * if the sampler constants move.
+ */
+export function actualSteps(preset) {
+  const settings = { ...SAMPLER_DEFAULTS, ...(SAMPLER_PRESETS[preset] ?? {}) };
+  const schedule = noiseSchedule({
+    steps: settings.steps, sMax: settings.sMax, sMin: settings.sMin,
+    p: settings.p, sigmaData: settings.sigmaData, maxSigma: settings.maxSigma,
+  });
+  return noiseLevels(schedule,
+    churnFactors(schedule, settings.gammaMin, settings.gamma0)).length;
+}
 
 let weightsPromise;
 

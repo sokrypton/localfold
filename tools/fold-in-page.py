@@ -403,6 +403,29 @@ def main():
               max: Math.max(...b).toFixed(1) };
           }));
         })()"""))
+        # 🔴 THE VALUES BEING PRESENT IS NOT THE COLOUR BEING APPLIED. `plddts`
+        # on a frame says the B-factors parsed; what decides what is drawn is
+        # the renderer's colour SCHEME, and a page can set it and have py2Dmol
+        # set it back. Reported as "still not seeing colors, though certainty is
+        # showing up in the status" - with the B-factor probe above passing.
+        print("colour:", cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          const entry = reg[Object.keys(reg)[0]];
+          const v = entry && entry.renderer;
+          if (!v) return 'no viewer';
+          const keys = Object.keys(v).filter((k) => /colou?r|scheme/i.test(k));
+          const state = {};
+          for (const k of keys) {
+            const value = v[k];
+            state[k] = (typeof value === 'object' && value !== null)
+              ? Object.keys(value).slice(0, 8) : String(value);
+          }
+          return JSON.stringify({
+            state,
+            hasSetColorScheme: typeof v.setColorScheme === 'function',
+            hasColorBy: typeof v.colorBy === 'function',
+          });
+        })()"""))
         print("panel :", cdp.evaluate(ws, """(() => {
           const c = document.getElementById('heatmapContainer');
           return JSON.stringify({

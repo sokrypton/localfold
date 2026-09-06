@@ -1873,6 +1873,49 @@ against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
 
+🔴 **AND `setColorScheme` / `colorBy` DO NOT EXIST ON py2Dmol's RENDERER, SO
+NOTHING HAD EVER BEEN COLOURED BY THEM.** Both call sites were guarded by
+`typeof === "function"`, which turned a wrong API into a silent no-op: the
+viewer stayed on `colorMode: "auto"`, which resolves to **rainbow** for a single
+chain with no confidence data. The B-factors were in every frame the whole time
+and nothing was reading them, so a probe that checked the VALUES passed while
+the screen showed a rainbow.
+
+The real API is **`py2Dmol.setColor(mode)`**, and what makes it work is not the
+assignment but the three lines after it:
+
+    e.colorMode = t;
+    e.colorsNeedUpdate = true;
+    e.plddtColorsNeedUpdate = true;
+    e.render("py2Dmol.setColor");
+
+Setting `colorMode` alone leaves the cached colours in place, which is a second
+silent no-op. The valid modes are `auto, chain, rainbow, plddt, deepmind,
+entropy, object, hydrophobicity` plus anything in
+`window.py2dmol_customColors`.
+
+🔴 **AND A PROBE THAT READS THE DATA IS NOT A PROBE THAT READS THE PICTURE.**
+`tools/fold-in-page.py`'s `bfactor:` line reported 46.4-98.5 per frame while the
+structure was drawn in rainbow. It now prints `colour:` as well - the renderer's
+`colorMode` and `resolvedAutoColor` - because what is DRAWN is the thing that
+was wrong. Same rule as "sample what is drawn, not what was computed", one panel
+over.
+
+🔴 **AND THE CAMERA HAS TO BE SAVED ACROSS THE FINAL RELOAD.** `loadIntoViewer`
+ingests a FILE and py2Dmol orients the camera when it parses one, so the
+trajectory a reader has been watching - and possibly rotating - snaps to a new
+angle the moment the last frame lands. The AF3 path has saved and restored
+`viewerState` since it had a trajectory; the ESMFold2 one had not. Reported as
+"the frames change angle when last frame is added".
+
+🔴 **AND THE STEP DIAL MUST SHOW WHAT RUNS, NOT WHAT THE CONFIG CALLS IT.** The
+dial offered 15 beside a status line reading 11 steps, which is the page
+contradicting itself - and the config's number is the one with no operational
+meaning, since `max_inference_sigma` drops every schedule entry above 256. The
+option's VALUE stays the preset's own number, because that is what names a
+preset; only its text changes, and it is computed from the schedule rather than
+tabulated: 15 -> 11, 32 -> 23, 64 -> 45, 200 -> 138.
+
 🔴 **AND THE TRAJECTORY IS COLOURED FRAME BY FRAME, WHICH IS WHAT THE `obs` ARM
 BUYS.** `mode` needs no coordinates and is therefore FIXED for a fold: every
 frame would wear the same colour, and the interesting thing about a trajectory

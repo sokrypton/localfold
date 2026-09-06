@@ -37,7 +37,7 @@ import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints } from "./af3-model.js";
-import { ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
+import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
@@ -835,6 +835,44 @@ async function alignmentText(chains, signal, family) {
  * The alignment is passed only when there is one - handing the app an A3M for a
  * single-sequence fold would draw a one-row MSA panel that says nothing.
  */
+/**
+ * Set py2Dmol's colour mode, through the API that exists.
+ *
+ * 🔴 `setColorScheme` AND `colorBy` DO NOT EXIST ON THIS RENDERER, AND BOTH
+ * CALL SITES WERE GUARDED BY `typeof === "function"` - so they were silent
+ * no-ops that had never coloured anything. The viewer stayed on `colorMode:
+ * "auto"`, which resolves to `rainbow` for a single chain with no confidence
+ * data. Reported as "still not seeing colors, though certainty is showing up in
+ * the status", with the B-factor probe passing: the values were in every frame
+ * and nothing was reading them.
+ *
+ * 🔴 THE REAL ONE IS `py2Dmol.setColor`, and what makes it work is not the
+ * assignment but the three lines after it: `colorsNeedUpdate`,
+ * `plddtColorsNeedUpdate` and a `render()`. Setting `colorMode` alone leaves
+ * the cached colours in place, which is a different silent no-op.
+ *
+ * Valid modes are auto, chain, rainbow, plddt, deepmind, entropy, object and
+ * hydrophobicity, plus anything in `window.py2dmol_customColors`.
+ */
+function setColourMode(mode) {
+  const api = window.py2Dmol;
+  if (typeof api?.setColor === "function") {
+    try { api.setColor(mode); return true; } catch (error) {
+      console.warn(`colour mode ${mode} refused:`, error);
+      return false;
+    }
+  }
+  // ...the manual path, for a bundle without the helper. Same three effects.
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  if (renderer === undefined) return false;
+  renderer.colorMode = mode;
+  renderer.colorsNeedUpdate = true;
+  renderer.plddtColorsNeedUpdate = true;
+  renderer.render?.("localfold.setColourMode");
+  return true;
+}
+
 async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence }) {
   const load = window.py2dmolLoadFiles;
   if (typeof load !== "function") {
@@ -870,13 +908,7 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence 
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
-  if (viewer !== undefined) {
-    if (typeof viewer.setColorScheme === "function") {
-      viewer.setColorScheme("plddt");
-    } else if (typeof viewer.colorBy === "function") {
-      viewer.colorBy("plddt");
-    }
-  }
+  if (viewer !== undefined) setColourMode("plddt");
   if (viewer !== undefined && !viewer._scoresHookAttached) {
     viewer._scoresHookAttached = true;
     const origSetFrame = viewer.setFrame.bind(viewer);
@@ -1409,9 +1441,17 @@ function syncAf3Count() {
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
   if (select === null) return;
+  // 🔴 THE OPTION SHOWS WHAT RUNS AND CARRIES WHAT THE MODEL CALLS IT. For
+  // ESMFold2 the two differ - `max_inference_sigma` turns a 15-step schedule
+  // into 11 - so a dial reading 15 beside a status line reading 11 is the page
+  // contradicting itself. The VALUE stays the preset's own number, because that
+  // is what names a preset; only the text changes.
+  const shown = esmfold2
+    ? (value) => String(actualSteps(`${ESMFOLD2_SAMPLER_MODE}-${value}`))
+    : String;
   select.replaceChildren(...values.map((value) => Object.assign(
     document.createElement("option"),
-    { value: String(value), textContent: String(value), selected: value === preferred })));
+    { value: String(value), textContent: shown(value), selected: value === preferred })));
   select.value = String(preferred);
 }
 
@@ -2237,9 +2277,19 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     : fittedPdb(result.features.batch, finalDense, reference,
                 slots ?? alphaCarbons(result.features.batch), bFactors));
   const contactMap = contactMapFor(result.contacts);
+  // 🔴 THE CAMERA IS SAVED ACROSS THE RELOAD, OR THE VIEW JUMPS AT THE END.
+  // `loadIntoViewer` ingests a FILE, and py2Dmol orients the camera when it
+  // parses one - so the trajectory the reader has been watching, and possibly
+  // rotating, snaps to a new angle the moment the last frame lands. The AF3
+  // path has saved and restored it since it had a trajectory; this one had
+  // not. Reported as "the frames change angle when last frame is added".
+  const camera = { ...(viewer?.viewerState ?? {}) };
   const live = viewer?.objectsData?.[viewerObject];
   if (live?.frames !== undefined) live.frames.length = 0;
   await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb, scores: {} });
+  if (viewer !== undefined && Object.keys(camera).length > 0) {
+    Object.assign(viewer.viewerState, camera);
+  }
   if (api?.frameFromText !== undefined && viewer !== undefined) {
     const object = viewer.objectsData?.[viewerObject];
     const first = object?.frames?.[0];
@@ -2266,9 +2316,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // appearing anywhere, which is why the status line names the quantity and
     // the file carries a REMARK. With no certainty at all it falls back to
     // chain colours rather than colouring a zero B-factor as no confidence.
-    if (typeof viewer.setColorScheme === "function") {
-      viewer.setColorScheme(certainty === undefined ? "chain" : "plddt");
-    }
+    setColourMode(certainty === undefined ? "chain" : "plddt");
     viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
   }
 
