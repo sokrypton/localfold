@@ -74,6 +74,7 @@ values means the whole-stack checker, not that file.
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
+| Does the diffusion conditioning agree? | `node tools/check-esmfold2-conditioning.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
 | What dtype is the atom attention actually holding? | `tools/esmc/probe-esmfold2-atom-attention.py` |
@@ -1090,6 +1091,36 @@ raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
 **affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
 rotation. Nothing in the shapes says any of this: both are "an atom transformer
 at 128 channels". `src/esmfold2/atom-encoder-reference.js`.
+
+🔴 **THE DIFFUSION MODULE IS `structure_head`, AND ITS CONDITIONING IS PORTED.**
+345 tensors, and the shape of it: conditioning, then the SAME SWA atom encoder
+the inputs embedder uses (with a `coords_linear` of 6 = `r_l | pred_r1`
+appended), a 12-block 16-head token transformer at 768 channels, an atom
+decoder, and 15 EDM steps at `sigma_data` 16. So the expensive primitive was
+already done. The conditioning measures **9.37e-8** on the pair and **7.98e-8**
+on the single against the module's own first call.
+
+🔴 **AND ITS TRANSITIONS DO NOT FUSE THEIR GATE, WHERE EVERY OTHER TRANSITION
+HERE DOES.** AF3's and ESMFold2's own pair transition pack both halves into one
+`w12` and split it, so the only question is which half is the gate.
+`TransitionLayer` has `a_proj` and `b_proj` as two Linears and computes
+`out_proj(silu(a) * b)`. Reading it as a fused pair indexes one matrix at half
+its stride. Swapping the two scores **3.41** and **3.54**, which is the control
+that says the checker can see it.
+
+🔴 **AND THERE IS NO `s_trunk` ANYWHERE IN THIS MODEL.** The conditioning takes
+one and is handed `None`: the trunk has no single track, so `s_inputs` - the 451
+channels the inputs embedder produced - is the only single representation in the
+graph. An AF3-shaped port reaches for a trunk single, does not find one, and
+synthesising a zero is a different model. The pair inputs are **concatenated**
+(`z_input_norm` is 512 wide, which is what says so), not added, and `z` is
+cached across the sampler's fifteen steps while `s` is not - only `s` depends on
+the noise level.
+
+🔴 **AND THE FOURIER TABLE IS A BUFFER, WHICH IS STILL TRAINED IN.**
+`register_buffer("w", randn(c))` is drawn once at construction and saved with
+the checkpoint, so a port that redraws it gets a different model that runs. Both
+`w` and `b` are exported.
 
 🔴 **AND ITS ROTARY TABLE IS bfloat16 IN A float32 MODEL, WHICH IS WORTH 2.4e-3
 AND LOOKS EXACTLY LIKE A CONVENTION BUG.** The whole module read **2.8e-4**

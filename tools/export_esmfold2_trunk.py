@@ -78,6 +78,44 @@ def main():
     writer.add('featuriser/zInit1', transposed('z_init_1.weight'))
     writer.add('featuriser/zInit2', transposed('z_init_2.weight'))
 
+    # The diffusion conditioning. The rest of the structure head - the atom
+    # encoder, the twelve-block token transformer and the atom decoder - is the
+    # next port; this is the piece that turns the trunk's answer into what the
+    # denoiser reads, and it is checkable on its own.
+    cond = 'structure_head.diffusion_module.conditioning'
+    writer.add('diffusion/zInputNorm/scale',
+               np.asarray(get('%s.z_input_norm.weight' % cond), np.float32))
+    writer.add('diffusion/zInputNorm/offset',
+               np.asarray(get('%s.z_input_norm.bias' % cond), np.float32))
+    writer.add('diffusion/zProjection', transposed('%s.z_proj.weight' % cond))
+    writer.add('diffusion/sInputNorm/scale',
+               np.asarray(get('%s.s_input_norm.weight' % cond), np.float32))
+    writer.add('diffusion/sInputNorm/offset',
+               np.asarray(get('%s.s_input_norm.bias' % cond), np.float32))
+    writer.add('diffusion/sProjection', transposed('%s.s_proj.weight' % cond))
+    # 🔴 THE FOURIER TABLE IS A BUFFER, NOT A PARAMETER, and it is still
+    # trained-in: `register_buffer("w", randn(c))` is drawn once at construction
+    # and saved with the checkpoint, so a port that redraws it gets a different
+    # model that runs. Both halves are exported.
+    writer.add('diffusion/fourier/weights', np.asarray(get('%s.fourier.w' % cond), np.float32))
+    writer.add('diffusion/fourier/offsets', np.asarray(get('%s.fourier.b' % cond), np.float32))
+    writer.add('diffusion/noiseNorm/scale',
+               np.asarray(get('%s.noise_norm.weight' % cond), np.float32))
+    writer.add('diffusion/noiseNorm/offset',
+               np.asarray(get('%s.noise_norm.bias' % cond), np.float32))
+    writer.add('diffusion/noiseProjection', transposed('%s.noise_proj.weight' % cond))
+    for kind in ('z', 's'):
+        for layer in range(2):
+            at = '%s.%s_transitions.%d' % (cond, kind, layer)
+            base = 'diffusion/%sTransitions/%d' % (kind, layer)
+            writer.add('%s/norm/scale' % base,
+                       np.asarray(get('%s.norm.weight' % at), np.float32))
+            writer.add('%s/norm/offset' % base,
+                       np.asarray(get('%s.norm.bias' % at), np.float32))
+            writer.add('%s/aProjection' % base, transposed('%s.a_proj.weight' % at))
+            writer.add('%s/bProjection' % base, transposed('%s.b_proj.weight' % at))
+            writer.add('%s/outProjection' % base, transposed('%s.out_proj.weight' % at))
+
     # The distogram head: two tensors, and the trunk's only output today.
     writer.add('distogram/weights', transposed('distogram_head.weight'))
     writer.add('distogram/bias', np.asarray(get('distogram_head.bias'), np.float32))
@@ -122,6 +160,10 @@ def main():
                   'atomHeads': 4,
                   'atomWindow': 128,
                   'distogramBins': int(source.shape('distogram_head.weight')[0]),
+                  'tokenChannels2': int(source.shape(
+                      'structure_head.diffusion_module.conditioning.s_proj.weight')[0]),
+                  'transitionMultiplier': 2,
+                  'sigmaData': 16.0,
                   'tokenChannels': int(source.shape(
                       '%s.atom_to_token_linear.weight'
                       % 'inputs_embedder.atom_attention_encoder')[0]),

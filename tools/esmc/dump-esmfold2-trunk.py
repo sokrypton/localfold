@@ -90,6 +90,7 @@ def main():
     # fails says only "somewhere in 24 blocks". One tri-mul is a second to
     # verify and the whole trunk is 77; the ladder matters more than the total.
     captured['modules'] = {}
+    captured['conditioning'] = []
 
     def module_hook(label):
         # 🔴 KEYWORDS TOO, BECAUSE HALF OF THESE TAKE NO POSITIONAL ARGUMENT AT
@@ -143,6 +144,36 @@ def main():
                           ('atom.norm', encoder.atom_norm),
                           ('atom.toToken', encoder.atom_to_token_linear)):
         handles.append(module.register_forward_hook(module_hook(label), with_kwargs=True))
+    # 🔴 AND THE DIFFUSION CONDITIONING, whose FIRST call is the one recorded.
+    # The sampler runs fifteen steps and caches `z` across them while `s`
+    # depends on the noise level, so a hook that kept the last call would record
+    # a different t_hat from the one it also recorded as an argument.
+    # 🔴 AND IT RETURNS A TUPLE (s, z), SO module_hook WOULD DROP HALF OF IT.
+    # That helper keeps `output[0]` for the modules that wrap their answer in a
+    # tuple; here both elements ARE the answer, and recording only `s` would
+    # leave the pair conditioning - the larger and more easily wrong half -
+    # unchecked while every check passed.
+    diffusion = model.structure_head.diffusion_module
+
+    def conditioning_hook(_module, inputs, keywords, output):
+        if captured['conditioning']:
+            return                                    # the first step only
+        single, pair = output
+        arguments = {}
+        for index, value in enumerate(inputs):
+            if torch.is_tensor(value):
+                arguments[str(index)] = value.detach().clone()
+        for name, value in (keywords or {}).items():
+            if torch.is_tensor(value):
+                arguments[name] = value.detach().clone()
+        captured['conditioning'].append({
+            'single': single.detach().clone(), 'pair': pair.detach().clone(),
+            'arguments': arguments,
+        })
+
+    handles.append(diffusion.conditioning.register_forward_hook(
+        conditioning_hook, with_kwargs=True))
+
     for index, block in enumerate(encoder.atom_transformer.blocks):
         handles.append(block.register_forward_hook(
             module_hook('atom.block%d' % index), with_kwargs=True))
@@ -223,6 +254,18 @@ def main():
         'afterLoop': {str(i): tolist(v) for i, v in enumerate(captured['loops'])},
         'distogram': tolist(output['distogram_logits'])
         if 'distogram_logits' in output else None,
+        # The sampler's answer, which is the only thing a structure port can be
+        # finally wrong against.
+        'coordinates': tolist(output['sample_atom_coords'])
+        if 'sample_atom_coords' in output else None,
+        'conditioning': {
+            'single': tolist(captured['conditioning'][0]['single']),
+            'singleShape': list(captured['conditioning'][0]['single'].shape),
+            'pair': tolist(captured['conditioning'][0]['pair']),
+            'pairShape': list(captured['conditioning'][0]['pair'].shape),
+            'arguments': {k: {'shape': list(t.shape), 'values': tolist(t)}
+                          for k, t in captured['conditioning'][0]['arguments'].items()},
+        } if captured['conditioning'] else None,
     }
 
     out = pathlib.Path(arguments.out) if arguments.out else (
