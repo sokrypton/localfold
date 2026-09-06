@@ -23,8 +23,11 @@ import { denoiseStep, diffusionConditioning, tokenTransformer }
 import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
-const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
-const dumpPath = process.argv[3] ?? join(ROOT, "oracle-dumps", "esmfold2-trunk-40-lm.json");
+// 🔴 POSITIONAL ARGUMENTS SKIP FLAGS, because `--steps=2` in argv[2] was read
+// as the bundle directory and the failure named `--steps=2/manifest.json`.
+const positional = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const bundleDirectory = positional[0] ?? join(ROOT, "model-esmfold2-trunk-f32");
+const dumpPath = positional[1] ?? join(ROOT, "oracle-dumps", "esmfold2-trunk-40-lm.json");
 const BOUND = 2e-6;
 
 function loadBundle(directory) {
@@ -261,21 +264,51 @@ if (dump.denoiser != null) {
         outGateBias: at("transition", "outGateBias") },
     });
   }
-  const got = denoiseStep(
-    value("x_noisy"), record.arguments.t_hat.values[0], features,
-    value("s_inputs"), value("z_trunk"), value("relative_position_encoding"),
-    denoiseShape, {
+  const denoiserWeights = {
       conditioning: weights, tokenBlocks,
       stepNormScale: tensors["diffusion/stepNorm/scale"],
       stepNormOffset: tensors["diffusion/stepNorm/offset"],
       singleToToken: tensors["diffusion/singleToToken"],
       tokenNormScale: tensors["diffusion/tokenNorm/scale"],
       tokenNormOffset: tensors["diffusion/tokenNorm/offset"],
-    }, encoder);
-  // The bound is the atom attention's bfloat16 again - this step runs six SWA
-  // blocks, three in the encoder and three in the decoder.
-  report("one denoise step", relative(got.coordinates, Float32Array.from(record.output)),
-         dump.float32Attention ? 5e-6 : 5e-3);
+  };
+  const bound = dump.float32Attention ? 5e-6 : 5e-3;
+
+  // 🔴 EVERY SAMPLER STEP, NOT ONE. The dump records `x_noisy` and the model's
+  // answer at each of the eleven noise levels, and they span five orders of
+  // magnitude - t_hat runs from 411 down to 0.0064. A denoiser checked at one
+  // level says nothing about the others, and the EDM preconditioning weights
+  // the network's output by `sigma*t/sqrt(sigma^2+t^2)`: at the LAST step that
+  // factor is ~0.0064 and the answer is almost all input, so a badly wrong
+  // network still scores well there. The FIRST step is where the network is
+  // load-bearing, and the sweep shows both.
+  //
+  // 🔴 AND IT IS TEACHER-FORCED, DELIBERATELY. Each step is run on the model's
+  // own `x_noisy` rather than on the previous step's output, so eleven
+  // independent `f(x) == y` checks - not one trajectory whose first error
+  // contaminates the rest, and not a comparison that would need the sampler's
+  // random draws.
+  const flag = process.argv.slice(2).find((a) => a.startsWith("--steps="));
+  const only = flag === undefined ? 0 : Number(flag.slice("--steps=".length));
+  const steps = dump.sampler?.perStep ?? [];
+  const chosen = only > 0 ? steps.slice(0, only) : steps;
+  let worst = 0;
+  for (let index = 0; index < chosen.length; index += 1) {
+    const step = chosen[index];
+    const got = denoiseStep(
+      Float32Array.from(step.xNoisy), step.tHat, features,
+      value("s_inputs"), value("z_trunk"), value("relative_position_encoding"),
+      denoiseShape, denoiserWeights, encoder);
+    const score = relative(got.coordinates, Float32Array.from(step.xDenoised));
+    worst = Math.max(worst, score);
+    const ok = score <= bound;
+    if (!ok) failures += 1;
+    console.log(`  step ${String(index).padStart(2)}  t_hat `
+      + `${step.tHat.toExponential(3)}   relRMS ${score.toExponential(3)}   `
+      + `${ok ? "ok" : "FAILED"}`);
+  }
+  console.log(`  ${`${chosen.length} denoise steps`.padEnd(32)} worst `
+    + `${worst.toExponential(3)}   bound ${bound.toExponential(0)}`);
 }
 
 console.log(failures === 0

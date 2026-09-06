@@ -1143,6 +1143,21 @@ gate first; `DiffusionConditioning`'s `TransitionLayer` has `a_proj` and
 and they are packed the two different ways. **Read the shapes, never the
 family.**
 
+🔴 **THE DENOISER IS CHECKED AT EVERY NOISE LEVEL THE SAMPLER VISITS, NOT ONE.**
+Eleven steps spanning five orders of magnitude, teacher-forced on the model's
+own `x_noisy` so each is an independent `f(x) == y` rather than a trajectory
+whose first error contaminates the rest:
+
+| t_hat | 411 | 278 | 142 | 68.7 | 30.8 | 12.6 | 2.89 | 0.918 | 0.241 | 0.048 | 0.0064 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| relRMS | 1.5e-4 | 1.1e-4 | 1.6e-4 | 6.1e-5 | 4.5e-5 | 6.3e-5 | 1.6e-4 | 1.9e-4 | 1.6e-4 | 1.4e-4 | 3.4e-5 |
+
+Flat, at the atom attention's bfloat16 floor throughout. **One level would have
+said very little**: the EDM preconditioning weights the network's output by
+`sigma*t/sqrt(sigma^2+t^2)`, which at the last step is about 0.0064 - so a badly
+wrong network still scores well there, and the first step is where it is
+load-bearing.
+
 🔴 **AND A WHOLE DENOISE STEP NOW RUNS AT 1.51e-4.** Conditioning, the atom
 encoder with the noisy coordinates, the token transformer, the atom decoder and
 the EDM preconditioning - checked against the module's own first call out of the
