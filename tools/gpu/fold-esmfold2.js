@@ -28,6 +28,8 @@ import {
 import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
 import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
+import { toDensePositions } from "../../src/esmfold2/featurise.js";
+import { toPdb } from "../../src/af3/fold.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -239,10 +241,51 @@ export async function main(device, args = []) {
     }
     rmsd = Math.sqrt(squared / live);
   }
-  const lines = alphas.map((atom, index) =>
-    `ATOM  ${String(index + 1).padStart(5)}  CA  GLY A${String(index + 1).padStart(4)}    `
-    + [0, 1, 2].map((axis) => x[atom * 3 + axis].toFixed(3).padStart(8)).join("")
-    + "  1.00  0.00           C");
+  // 🔴 THE STRUCTURE GOES THROUGH AF3's WRITER, NOT A SECOND ONE. `toPdb`
+  // already knows a ligand is HETATM under its component's code, that a
+  // nucleotide is " DA" rather than "ALA", that a modified residue takes its
+  // own code, and that a complex needs one chain letter per asym id. Permuting
+  // the coordinates back into its dense layout is cheaper than any of that.
+  const pdb = toPdb(result.features.batch, toDensePositions(result.features, x));
+
+  // 🔴 THE DISTOGRAM AND THE STRUCTURE ARE TWO INDEPENDENT READINGS OF ONE
+  // TRUNK, so their agreement is a gate neither can give alone. The distogram
+  // head is a single projection off the pair; the coordinates came through the
+  // conditioning, twelve token blocks, two atom stacks and a stochastic
+  // sampler. If the borrowed bin edges were badly wrong, or either head were
+  // mis-wired, the two would not agree - and a fold can be geometrically
+  // perfect while being the wrong fold, which CA-CA cannot see.
+  let contactPairs = 0;
+  let agreement;
+  if (result.contacts !== undefined) {
+    const representative = new Int32Array(result.tokens).fill(-1);
+    for (let atom = 0; atom < result.atoms; atom += 1) {
+      if (result.features.mask[atom] === 0) continue;
+      const token = result.features.atomToToken[atom];
+      // CB where there is one, else CA, else the token's first atom - which is
+      // the usual pseudo-beta rule and what a ligand token has anyway.
+      if (representative[token] < 0) representative[token] = atom;
+      if (named(atom, "CB")) representative[token] = atom;
+      else if (named(atom, "CA") && !named(representative[token], "CB")) {
+        representative[token] = atom;
+      }
+    }
+    let both = 0, predicted = 0, actual = 0;
+    for (let i = 0; i < result.tokens; i += 1) {
+      for (let j = i + 6; j < result.tokens; j += 1) {
+        const near = result.contacts[i * result.tokens + j] > 0.5;
+        if (near) contactPairs += 1;
+        const a = representative[i] * 3, b = representative[j] * 3;
+        const close = Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1], x[b + 2] - x[a + 2]) < 8;
+        if (near) predicted += 1;
+        if (close) actual += 1;
+        if (near && close) both += 1;
+      }
+    }
+    agreement = { predicted, actual, both,
+                  precision: predicted === 0 ? null : both / predicted,
+                  recall: actual === 0 ? null : both / actual };
+  }
 
   return {
     sequence, sampler, seed,
@@ -259,6 +302,8 @@ export async function main(device, args = []) {
     timings: result.timings,
     peakMebibytes: result.memory.peakBytes / 1048576,
     stages: progress,
-    pdb: lines.join("\n"),
+    longRangeContacts: contactPairs,
+    contactAgreement: agreement,
+    pdb,
   };
 }

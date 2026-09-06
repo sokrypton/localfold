@@ -33,6 +33,7 @@ import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffus
 import { buildRope } from "./atom-encoder-reference.js";
 import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
 import { encodeLanguagePair } from "./language-pair-webgpu.js";
+import { encodeContactMap } from "./distogram-webgpu.js";
 import { linear } from "./featuriser-reference.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
@@ -403,6 +404,20 @@ export async function foldEsmfold2(device, options) {
     recycleScratch.release();
     held.splice(held.indexOf(recycleScratch), 1);
 
+    // ---- the distogram, which is the trunk's one output besides the pair.
+    // 🔴 IT RUNS BEFORE THE DIFFUSION MODULE ALLOCATES, not after the fold.
+    // Its symmetrised copy of the pair is another 92 MiB at 300 tokens, and the
+    // denoiser is holding its own pair conditioning and twelve bias tensors by
+    // then - so running it here costs nothing and running it at the end raises
+    // the peak by a whole pair representation.
+    const contacts = options.contacts === false ? undefined
+      : await mark("distogram", () => encodeContactMap(
+        { device, allocator, cache, submit },
+        { tokens, channels, bins: shape.distogramBins, pair,
+          weights: weights.featuriser.distogramWeights,
+          bias: weights.featuriser.distogramBias }));
+    await options.onContacts?.(contacts);
+
     // ---- the sampler.
     const settings = { ...SAMPLER_DEFAULTS,
                        ...(SAMPLER_PRESETS[options.sampler ?? "diffusion-15"] ?? {}),
@@ -449,7 +464,7 @@ export async function foldEsmfold2(device, options) {
     denoiser.release();
 
     return {
-      coordinates: x, features, sequence, tokens, atoms, sInputs,
+      coordinates: x, features, sequence, tokens, atoms, sInputs, contacts,
       steps: levels.length, scheduleLength: schedule.length, settings,
       elapsedMilliseconds: performance.now() - started, timings, memory,
     };

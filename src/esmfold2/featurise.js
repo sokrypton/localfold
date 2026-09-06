@@ -166,6 +166,12 @@ export function featuriseForEsmfold2(input, options = {}) {
   const refSpaceUid = new Int32Array(atoms);
   const atomToToken = new Int32Array(atoms);
   const mask = new Float32Array(atoms);
+  // 🔴 THE RAGGED-TO-DENSE MAP IS RECORDED HERE OR IT IS RE-DERIVED LATER. AF3's
+  // `toPdb` writes a DENSE batch, so a structure this model predicts has to go
+  // back through this permutation to be written - and re-deriving it at the far
+  // end means a second copy of the packing rule, which is exactly the kind of
+  // thing that agrees for a monomer and not for a ligand.
+  const denseSlot = new Int32Array(atoms).fill(-1);
   let at = 0;
   for (let token = 0; token < tokens; token += 1) {
     for (let slot = 0; slot < dense; slot += 1) {
@@ -186,6 +192,7 @@ export function featuriseForEsmfold2(input, options = {}) {
       // free. AF3 counts these from zero, and so does this model.
       refSpaceUid[at] = batch.refSpaceUid[from];
       atomToToken[at] = token;
+      denseSlot[at] = from;
       mask[at] = 1;
       at += 1;
     }
@@ -211,7 +218,7 @@ export function featuriseForEsmfold2(input, options = {}) {
     return out;
   };
   return {
-    tokens, atoms, liveAtoms: live, batch,
+    tokens, atoms, liveAtoms: live, batch, dense, denseSlot,
     refPos, refCharge, refElement, refAtomNameChars, refSpaceUid, atomToToken, mask,
     aatype, residueType, molType, inputIds,
     profile: options.profile ?? new Float32Array(tokens * AATYPE_CLASSES),
@@ -294,4 +301,26 @@ export function languageModelInput(features) {
   }
   return { ids: Int32Array.from(ids), sequenceId: Int32Array.from(sequenceId),
            tokenToRow, rows: rows.length, chains: chainOrder.length };
+}
+
+/**
+ * Ragged coordinates back into AF3's dense layout, so `toPdb` can write them.
+ *
+ * 🔴 A STRUCTURE WRITER IS NOT WORTH HAVING TWICE. src/af3/fold.js's `toPdb`
+ * already knows that a ligand is HETATM and carries its component's code, that
+ * a modified residue takes its own code rather than the letter at its token
+ * index, that a nucleotide is " DA" and not "ALA", and that a complex needs one
+ * chain letter per asym id - four things that each returned a plausible PDB
+ * when they were wrong. Permuting 3n floats is cheaper than any of that.
+ */
+export function toDensePositions(features, coordinates) {
+  const dense = new Float32Array(features.tokens * features.dense * 3);
+  for (let atom = 0; atom < features.atoms; atom += 1) {
+    const slot = features.denseSlot[atom];
+    if (slot < 0) continue;
+    dense[slot * 3] = coordinates[atom * 3];
+    dense[slot * 3 + 1] = coordinates[atom * 3 + 1];
+    dense[slot * 3 + 2] = coordinates[atom * 3 + 2];
+  }
+  return dense;
 }
