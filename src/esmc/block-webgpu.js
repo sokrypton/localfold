@@ -315,6 +315,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
  * a lane and two tree reductions in total; reducing across lanes for every key
  * costs `rows` reductions. The second is the obvious shape and it is
  * log2(lanes) times the barriers.
+ *
+ * 🔴 AND A FLASH-STYLE VERSION WAS BUILT, MEASURED AND REVERTED. This kernel
+ * re-reads the whole of K and V for every query row, which at 1500 tokens is
+ * 20.7 GB a block against the projections' 6.0 - so staging a chunk of keys and
+ * values across a tile of eight queries, with the online softmax that forces,
+ * should have divided it by eight. It is SLOWER at every length that matters:
+ *
+ *     tokens   this kernel   staged   ratio
+ *        300       37.7 ms   38.8 ms   1.03x
+ *        600       66.0       86.3     0.76x
+ *       1000      138.6      180.2     0.77x
+ *       1500      279.9      351.5     0.80x
+ *
+ * 🔴 BECAUSE THE 20.7 GB IS NOT DRAM TRAFFIC. K and V for one head at 1500
+ * tokens are 750 KB together, which is L2-resident on this M2, so the re-reads
+ * were already cache hits and staging bought traffic nobody was paying for. It
+ * cost lane utilisation instead: a chunk of 16 keys leaves three quarters of a
+ * 64-lane workgroup idle in the phase that computes logits, and widening the
+ * chunk to 64 needs 32 KB of workgroup memory against a 16 KB limit.
+ *
+ * Reverted rather than kept behind a flag, for the reason src/af3's grid
+ * attention gives for the same decision: parameterising a hot kernel over an
+ * arm nobody should use costs every later reader, and the numbers are worth
+ * more than the switch. Apparent traffic is not DRAM traffic when the working
+ * set fits in cache - which is the same lesson the (inner, outer) transpose
+ * taught, from the other direction.
  */
 export function createAttentionShader({ rows, model, heads }) {
   const headDim = model / heads;
