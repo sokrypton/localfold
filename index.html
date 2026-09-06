@@ -253,6 +253,20 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="upload">Upload file</option>
                 </select>
               </div>
+              <!-- 🔴 THE SAME SLOT AS THE MSA ROW, WHICH IS HIDDEN WHEN THIS
+                   SHOWS. This model has no alignment; what it has instead is a
+                   protein language model, and turning that off is its
+                   equivalent of folding from a single sequence. It is a
+                   SEPARATE control rather than a third option on the MSA row
+                   because web/app.js reads that row's values as alignment
+                   modes - see the note there about renaming them. -->
+              <div class="fetch-option-group" id="plmGroup" hidden>
+                <span class="fetch-option-title">PLM</span>
+                <select id="plm-mode" title="The protein language model. Without it this model has no evolutionary information at all: measured on a 76-mer, the fold moves 11 A and the distogram predicts no long-range contact.">
+                  <option value="esmc" selected>ESM-C 600M</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
               <div class="fetch-option-group" id="maxMsaGroup">
                 <span class="fetch-option-title">Max MSA</span>
                 <select id="max-msa" title="MSA subsampling depth (clusters:extra sequences)">

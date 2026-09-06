@@ -158,6 +158,10 @@ def main():
     # search is a minute of somebody else's server. `--msa-mode search` is
     # needed for `--template auto`, which has nothing to draw on without one.
     parser.add_argument("--msa-mode", default="none", choices=["none", "search"])
+    # 🔴 EF2-fast's OWN "single sequence". Its evolutionary information comes
+    # from a protein language model rather than an alignment, so turning ESM-C
+    # off is the same ablation `--msa-mode none` is for the other models.
+    parser.add_argument("--plm", default="esmc", choices=["esmc", "none"])
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
@@ -258,6 +262,7 @@ def main():
           set('recycles', %s);
           set('af3-count', %s);
           set('msa-mode', %s);
+          set('plm-mode', %s);
           // 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
           // parameters are gated behind an acknowledgement, and it opens in
           // front of `predict` - so without this the Fold press opens a modal,
@@ -271,12 +276,13 @@ def main():
             localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted');
           } catch (e) { /* asked again, which the dialog check covers */ }
         })()""" % (json.dumps(args.model), json.dumps(args.recycles),
-                   json.dumps(args.steps), json.dumps(args.msa_mode)))
+                   json.dumps(args.steps), json.dumps(args.msa_mode),
+                   json.dumps(args.plm)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;
           return JSON.stringify({ model: v('model-family'), recycles: v('recycles'),
-            msa: v('msa-mode'), af3count: v('af3-count') });
+            msa: v('msa-mode'), plm: v('plm-mode'), af3count: v('af3-count') });
         })()"""))
 
         # 🔴 THE STATUS LINE IS SAMPLED, NOT GLANCED AT. A line that alternates

@@ -617,6 +617,20 @@ function modelProgress(fraction, detail = "") {
  *
  * @returns {Promise<object>} awaited by whichever fold path runs
  */
+/**
+ * Whether this fold runs the protein language model.
+ *
+ * 🔴 THE ANSWER IS READ, NOT ASSUMED, EVEN WHERE THE ROW IS HIDDEN - which is
+ * the lesson `msaMode` records one function above: hiding a control does not
+ * change its value, and a select left on "none" behind a hidden row goes on
+ * returning "none". For a family that has no such row the answer is simply no,
+ * because none of them has a language model to run.
+ */
+function usesLanguageModel(family = chosenFamily()) {
+  if (!SINGLE_SEQUENCE_FAMILIES.includes(family)) return false;
+  return (document.getElementById("plm-mode")?.value ?? "esmc") !== "none";
+}
+
 function startModelPreload(family, signal) {
   const name = MODEL_LABELS[family] ?? "AlphaFold 2";
   // 🔴 THE LABEL MUST NOT CHANGE WIDTH WHILE IT COUNTS. `tabular-nums` holds
@@ -650,8 +664,8 @@ function startModelPreload(family, signal) {
   // too. Read from the entities as they stand: an empty list is a page nobody
   // has typed into yet, where a protein is much the likeliest thing next.
   const typed = entityList.read();
-  const needsLanguageModel = typed.length === 0
-    || typed.some((entity) => entity.type === "protein");
+  const needsLanguageModel = usesLanguageModel(family)
+    && (typed.length === 0 || typed.some((entity) => entity.type === "protein"));
   const load = family === "ef2-fast-600m"
     ? loadEsmfold2Weights(report, { languageModel: needsLanguageModel })
     : (AF3_FAMILIES.includes(family)
@@ -1423,6 +1437,11 @@ function syncModelControls() {
     const node = document.getElementById(id);
     if (node !== null) node.hidden = singleSequence;
   }
+  // ...and the row that replaces them, which is the same question for a model
+  // whose evolutionary information comes from a language model rather than an
+  // alignment. Shown exactly where the MSA row is not.
+  const plmNode = document.getElementById("plmGroup");
+  if (plmNode !== null) plmNode.hidden = !singleSequence;
   // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
   // hidden, so choosing AF3 and going back to AF2 left the page with no
   // Recycles until it was reloaded.
@@ -2278,6 +2297,12 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
                                loaded.shape.pairChannels),
     sampler: samplerPreset(),
     seed: randomSeed(),
+    // 🔴 THIS MODEL'S "SINGLE SEQUENCE". Without ESM-C it has no evolutionary
+    // information at all - measured on a 76-mer, the fold moves 10.96 A, the
+    // distogram predicts NO long-range contact, and the certainty falls from
+    // 0.95 to 0.42, which is the confidence estimate correctly reporting that
+    // the answer is worthless.
+    languageModel: usesLanguageModel(),
     // 🔴 EACH FRAME GETS ITS OWN COLOUR, WHICH NEEDS THE DISTOGRAM RESIDENT.
     // The trunk's own certainty is fixed for a fold, so every frame would wear
     // the same one - and the interesting thing about a trajectory is watching
@@ -2437,6 +2462,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     settings: {
       seed: foldContext.settings?.seed,
       "trunk passes": loaded.shape.loops,
+      "language model": usesLanguageModel() ? "ESM-C 600M" : "none",
       sampler: samplerPreset(),
       "diffusion steps": result.steps,
     },

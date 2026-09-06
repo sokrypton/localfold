@@ -2503,6 +2503,39 @@ tokens protein - and the fold would still come out, with a protein's threshold
 on every pair and nothing to see. The line reads `contact classes: 40 polymer,
 31 ligand, 0 nucleic`, and it is printed only when there is something to say.
 
+🔴 **AND THE LANGUAGE MODEL CAN BE TURNED OFF, WHICH IS THIS MODEL'S "SINGLE
+SEQUENCE".** AF2 and AF3 fold without their alignment; ESM-C is where this model's
+evolutionary information comes from, so switching it off is the same ablation.
+It is not a matter of zeroing anything - `tokenToRow` of -1 already means "no
+row", the path every ligand and nucleotide token takes, and
+`shimSingleForZeroState` supplies the fixed NON-ZERO vector the shim's offset and
+bias produce. Substituting zeros would be a different model. `--no-plm` on the
+tool, a `PLM` row on the page in the slot the MSA row leaves empty, and
+`--plm none` on `fold-in-page.py`. Measured on a 76-mer:
+
+| | CA-CA | certainty | contacts predicted | time |
+|---|---|---|---|---|
+| ESM-C 600M | 3.797 | **0.9496** | 114, precision 1.000 | 4.8 s |
+| none | 3.755 | **0.4165** | **0** | 2.7 s |
+
+...and the two structures are **10.96 A apart**. The geometry stays valid either
+way, which is the point: without the language model it makes a CHAIN it cannot
+FOLD, and a reader looking only at CA-CA would not know.
+
+🔴 **AND THE CERTAINTY CATCHES IT, WHICH IS EVIDENCE FOR THE CERTAINTY.** 0.95 to
+0.42 on an ablation nobody tuned it against - the sweep that chose its constants
+corrupted SEQUENCES, and this removes a whole input. An estimate that tracked
+fold quality only on the perturbation it was fitted to would not have moved.
+
+🔴 **BUT IT DOES NOT CATCH IT ON A SHORT ONE, AND THAT IS A REAL BLIND SPOT.** On
+a 35-mer the same ablation takes the contact count from 27 to **zero** while the
+certainty reads 0.8978 against 0.8922 - unmoved. The filter keeps pairs the model
+places under 12 A, and with no language model it places almost everything
+further, so the mean is taken over the handful of near-neighbours that survive,
+which are trivially peaked. **A certainty over very few pairs is not a certainty
+about the fold**, and nothing on the page says how many pairs it rested on. The
+contact count and `chain_pair_max_contact` do tell the truth there. **Open.**
+
 🔴 **AND A FOLD WITH NO PROTEIN DOWNLOADED 224 MiB OF LANGUAGE MODEL IT NEVER
 CALLED.** ESM-C is handed protein tokens only - `protein_mask = (mol_type == 0)
 & token_mask` - so a ligand, DNA or RNA input has no row to give it, and

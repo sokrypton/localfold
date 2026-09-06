@@ -374,7 +374,19 @@ export async function foldEsmfold2(device, options) {
   try {
     // ---- the language model, first and released before anything pair-sized.
     const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
-    const lm = languageModelInput(features);
+    // 🔴 THE LANGUAGE MODEL CAN BE TURNED OFF, WHICH IS THIS MODEL'S "SINGLE
+    // SEQUENCE". AF2 and AF3 can be run without their alignment; the analogue
+    // here is running without the protein language model, since ESM-C is where
+    // this model's evolutionary information comes from. It is not a matter of
+    // zeroing anything: `tokenToRow` of -1 already means "no row", which is the
+    // path every ligand and nucleotide token takes, and
+    // `shimSingleForZeroState` gives it the fixed NON-ZERO vector the shim's
+    // own offset and bias produce. Substituting zeros instead would be a
+    // different model.
+    const lm = options.languageModel === false
+      ? { ids: new Int32Array(0), sequenceId: new Int32Array(0),
+          tokenToRow: new Int32Array(tokens).fill(-1), rows: 0, chains: 0 }
+      : languageModelInput(features);
     // 🔴 `lm_mask_pct`, ON A STREAM OF ITS OWN. Zero for this checkpoint - see
     // maskLanguageModelInput for why the config class's docstring says
     // otherwise - so nothing is drawn and a fold is bit-identical to one
@@ -658,6 +670,7 @@ export async function foldEsmfold2(device, options) {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
       interfaceCertainty,
       lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },
+      languageModel: options.languageModel !== false,
       distogram: options.distogramLogits === true ? distogram : undefined,
       steps: levels.length, scheduleLength: schedule.length, settings,
       elapsedMilliseconds: performance.now() - started, timings, memory,

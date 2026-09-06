@@ -124,6 +124,10 @@ export async function main(device, args = []) {
   // port is complete for a checkpoint that does set it, and so the cost of the
   // training-time corruption can be MEASURED rather than guessed at.
   const lmMask = Number(option(args, "lm-mask", "0"));
+  // 🔴 THIS MODEL'S "SINGLE SEQUENCE" ARM. AF2 and AF3 fold without an
+  // alignment; the analogue here is folding without the protein language model,
+  // which is where this model's evolutionary information comes from.
+  const noPlm = args.includes("--no-plm");
   if (SAMPLER_PRESETS[sampler] === undefined) {
     throw new Error(`unknown sampler ${sampler}; `
       + `expected one of ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -212,6 +216,7 @@ export async function main(device, args = []) {
     tower: runTower,
     distogramLogits: contactSweep,
     lmMaskFraction: lmMask,
+    languageModel: !noPlm,
     onStatus: (label) => { progress.push(label); },
     // 🔴 COUNTED PER PHASE, because "does the trunk report block by block" is a
     // number and not an impression. A bar sampled from the page cannot answer
@@ -539,6 +544,7 @@ export async function main(device, args = []) {
   return {
     sequence, sampler, seed, trunkPrecision, contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,
+    languageModel: result.languageModel,
     // ...what the shipped shader now separates, so the host arm above and the
     // kernel can be compared rather than trusted.
     shippedByChain: result.interfaceCertainty === undefined ? undefined
