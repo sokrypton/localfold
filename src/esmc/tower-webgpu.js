@@ -24,6 +24,7 @@
 // same note; it is the kind of thing that survives a shape check and moves a
 // fold.
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
@@ -126,6 +127,14 @@ export class EsmcTowerGpu {
     const epsilon = (options.epsilon ?? 1e-5).toExponential();
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
     const capture = new Set(options.capture ?? []);
+    // 🔴 THE TOWER HAS ITS OWN UPLOAD PATH AND HAD ITS OWN DEFAULT. Setting f16
+    // as the block's default changed nothing here and the tower's numbers came
+    // back byte-identical - which looked like f16 costing nothing and was two
+    // code paths having drifted. Same hazard as a checker that builds its own
+    // kernel: what is measured has to be what runs.
+    const weightPrecision = options.weightPrecision ?? "f16";
+    const narrow = (values) => (weightPrecision === "f16"
+      ? float32ToFloat16Array(values) : values);
     if (ids.length !== rows) throw new Error(`${ids.length} ids for ${rows} rows`);
 
     const storage = GPUBufferUsage.STORAGE;
@@ -138,18 +147,21 @@ export class EsmcTowerGpu {
       finalNormPipeline, singlePipeline] = await Promise.all([
       pipeline(`esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon)),
-      pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0`,
-        createLinearShader({ rows, inner: model, outer: 3 * model }, false)),
+      pipeline(`esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}`,
+        createLinearShader({ rows, inner: model, outer: 3 * model }, false,
+          weightPrecision)),
       pipeline(`esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase)),
       pipeline(`esmc-attend:${rows}:${model}:${heads}`,
         createAttentionShader({ rows, model, heads })),
-      pipeline(`esmc-linear:${rows}:${model}:${model}:1`,
-        createLinearShader({ rows, inner: model, outer: model }, true)),
-      pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}`,
-        createSwigluShader({ rows, model, ffn }, epsilon)),
-      pipeline(`esmc-linear:${rows}:${ffn}:${model}:1`,
-        createLinearShader({ rows, inner: ffn, outer: model }, true)),
+      pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}`,
+        createLinearShader({ rows, inner: model, outer: model }, true,
+          weightPrecision)),
+      pipeline(`esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, epsilon, weightPrecision)),
+      pipeline(`esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}`,
+        createLinearShader({ rows, inner: ffn, outer: model }, true,
+          weightPrecision)),
       pipeline(`esmc-mix:${rows}:${model}:${pair}:${epsilon}`,
         createMixShader({ rows, model, pair }, epsilon)),
       pipeline(`esmc-ln-nooffset:${rows}:${model}:${epsilon}`,
@@ -267,14 +279,14 @@ export class EsmcTowerGpu {
 
         const attnScale = upload("attn_norm/scale", weights["attn_norm/scale"]);
         const attnOffset = upload("attn_norm/offset", weights["attn_norm/offset"]);
-        const qkvWeights = upload("qkv", weights["qkv/weights"]);
+        const qkvWeights = upload("qkv", narrow(weights["qkv/weights"]));
         const qScale = upload("q_norm", weights["q_norm/scale"]);
         const kScale = upload("k_norm", weights["k_norm/scale"]);
-        const attnOut = upload("attn_out", scaled(weights["attn_out/weights"]));
+        const attnOut = upload("attn_out", narrow(scaled(weights["attn_out/weights"])));
         const ffnScale = upload("ffn_norm/scale", weights["ffn_norm/scale"]);
         const ffnOffset = upload("ffn_norm/offset", weights["ffn_norm/offset"]);
-        const fc1 = upload("fc1", weights["fc1/weights"]);
-        const fc2 = upload("fc2", scaled(weights["fc2/weights"]));
+        const fc1 = upload("fc1", narrow(weights["fc1/weights"]));
+        const fc2 = upload("fc2", narrow(scaled(weights["fc2/weights"])));
 
         const encoder = this.device.createCommandEncoder({ label: `esmc-block-${layer}` });
         const pass = encoder.beginComputePass({ label: `esmc-block-${layer}` });

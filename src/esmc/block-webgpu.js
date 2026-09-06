@@ -18,6 +18,7 @@
 // shape; see src/esmc/tower-reference.js, where the alternatives are measured at
 // 1.2e-1 and 2.8e-1 against 5.9e-7 for these.
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 export const LANES = 64;
@@ -137,7 +138,19 @@ export function linearGrid(rows, outer) {
   return [Math.ceil(outer / (LANES * COLUMNS_PER_LANE)), Math.ceil(rows / ROW_TILE)];
 }
 
-export function createLinearShader({ rows, inner, outer }, withResidual) {
+export function createLinearShader({ rows, inner, outer }, withResidual,
+                                   weightPrecision = "f32", boundsTest = false) {
+  if (!["f32", "f16"].includes(weightPrecision)) {
+    throw new RangeError(`unknown weight precision ${weightPrecision}`);
+  }
+  // 🔴 THE ACCUMULATOR STAYS f32 WHATEVER THE WEIGHTS ARE. Narrowing the STORAGE
+  // halves the bytes a bandwidth-bound kernel moves; narrowing the SUM would put
+  // a 1152- or 3072-long dot product into ten mantissa bits. The repository has
+  // the general form of this already: the diffusion transformer takes f16
+  // weights happily because a LayerNorm renormalises after it, and the atom
+  // decoder does not because its output is a position in angstroms.
+  const half = weightPrecision === "f16";
+  const readWeight = (e) => (half ? `f32(${e})` : e);
   const columnsPerGroup = LANES * COLUMNS_PER_LANE;
   const accumulators = [];
   for (let t = 0; t < ROW_TILE; t += 1) {
@@ -145,11 +158,27 @@ export function createLinearShader({ rows, inner, outer }, withResidual) {
       accumulators.push(`  var acc_${t}_${j} = 0.0;`);
     }
   }
+  // 🔴 NO BOUNDS TEST ON THE WEIGHT READ, AND THAT IS SAFE RATHER THAN SLOPPY.
+  // The condition is loop-INVARIANT - it depends on the lane and the column
+  // tile, not on k - so testing it inside the k loop paid for it 1152 times a
+  // column. WGSL has no out-of-bounds access: a storage read past the end is
+  // clamped by the runtime, and the value it returns is discarded because the
+  // STORE is masked. That is what the repository's other kernels do; the reason
+  // to write it down is that the same trick is NOT safe for the staged input,
+  // whose values are shared across columns.
+  //
+  // 🔴 AND IT IS A WASH, MEASURED INTERLEAVED: 0.946x at 61 tokens and 1.026x
+  // at 300 against keeping the test. Two separate runs had said 8% each way,
+  // which is this machine's drift and not a kernel property. The cheaper form
+  // is kept because it is cheaper, not because it was shown to be faster.
   const inner_body = [];
   for (let j = 0; j < COLUMNS_PER_LANE; j += 1) {
-    inner_body.push(`      let w_${j} = select(0.0, `
-      + `weights[k_absolute * ${outer}u + column_origin + local.x + ${j * LANES}u], `
-      + `column_origin + local.x + ${j * LANES}u < ${outer}u);`);
+    const read = readWeight(
+      `weights[k_absolute * ${outer}u + column_origin + local.x + ${j * LANES}u]`);
+    inner_body.push(boundsTest
+      ? `      let w_${j} = select(0.0, ${read}, `
+        + `column_origin + local.x + ${j * LANES}u < ${outer}u);`
+      : `      let w_${j} = ${read};`);
   }
   for (let t = 0; t < ROW_TILE; t += 1) {
     inner_body.push(`      let s_${t} = staged[${t}u * ${K_CHUNK}u + k];`);
@@ -170,9 +199,9 @@ export function createLinearShader({ rows, inner, outer }, withResidual) {
   }`);
     }
   }
-  return `
+  return `${half ? "enable f16;\n" : ""}
 @group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
 ${withResidual ? "@group(0) @binding(2) var<storage, read> residual: array<f32>;" : ""}
 @group(0) @binding(${withResidual ? 3 : 2}) var<storage, read_write> output: array<f32>;
 
@@ -376,12 +405,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }
 
 /** LayerNorm, widen to [gate | value], gate, in one pass over the row. */
-export function createSwigluShader({ rows, model, ffn }, epsilon) {
-  return `
+export function createSwigluShader({ rows, model, ffn }, epsilon,
+                                   weightPrecision = "f32") {
+  const half = weightPrecision === "f16";
+  const readWeight = (e) => (half ? `f32(${e})` : e);
+  return `${half ? "enable f16;\n" : ""}
 @group(0) @binding(0) var<storage, read> source: array<f32>;
 @group(0) @binding(1) var<storage, read> scale: array<f32>;
 @group(0) @binding(2) var<storage, read> offset: array<f32>;
-@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<${weightPrecision}>;
 @group(0) @binding(4) var<storage, read_write> destination: array<f32>;
 
 var<workgroup> row_values: array<f32, ${model}>;
@@ -426,8 +458,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     var linear = 0.0;
     for (var i = 0u; i < ${model}u; i += 1u) {
       let row = i * ${2 * ffn}u;
-      gate += row_values[i] * weights[row + c];
-      linear += row_values[i] * weights[row + ${ffn}u + c];
+      gate += row_values[i] * ${readWeight("weights[row + c]")};
+      linear += row_values[i] * ${readWeight(`weights[row + ${ffn}u + c]`)};
     }
     destination[row * ${ffn}u + c] = (gate / (1.0 + exp(-gate))) * linear;
   }
@@ -450,6 +482,23 @@ export class EsmcBlockGpu {
     const residualScale = shape.residualScale ?? 1;
     const epsilon = (options.epsilon ?? 1e-5).toExponential();
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
+    // 🔴 f16 WEIGHTS BY DEFAULT: 1.26x FASTER AND EXACTLY FREE, because the
+    // CHECKPOINT IS bfloat16. ESM-C is trained in bf16 and widened to float32
+    // on the way out - see docs/ESMFOLD2.md - so every weight carries 7 mantissa
+    // bits and float16 holds 10. Narrowing is lossless: relRMS 1.58e-8 over two
+    // million of fc1's weights, against 2.08e-4 for random float32 of the same
+    // scale.
+    //
+    // 🔴 SO THE BENCH'S DIVERGENCE COLUMN OVERSTATES WHAT THIS COSTS. It
+    // synthesises full-precision weights and reads max|f16-f32| = 3.1e-5; the
+    // real block moves 3.49e-7 -> 3.47e-7 against the oracle, which is nothing.
+    // A synthetic weight is the right thing to TIME and the wrong thing to
+    // price precision against.
+    //
+    // The accumulator stays f32 either way: a 3072-long dot product is not
+    // summed in ten mantissa bits.
+    const weightPrecision = options.weightPrecision ?? "f16";
+    const boundsTest = options.boundsTest ?? false;
     if (input.length !== rows * model) {
       throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
     }
@@ -473,17 +522,22 @@ export class EsmcBlockGpu {
       const gated = scratch("gated", rows * ffn);
       const output = scratch("output", rows * model);
 
+      // 🔴 ONLY THE FOUR PROJECTIONS NARROW. The norms are 0.04% of a block's
+      // bytes and are where an error is not averaged away by a matmul, which is
+      // the rule tools/quantize_af3.py applies for the same reason.
+      const narrow = (values) => (weightPrecision === "f16"
+        ? float32ToFloat16Array(values) : values);
       const w = (leaf) => upload(leaf, weights[leaf]);
       const attnScale = w("attn_norm/scale");
       const attnOffset = w("attn_norm/offset");
-      const qkvWeights = w("qkv/weights");
+      const qkvWeights = upload("qkv/weights", narrow(weights["qkv/weights"]));
       const qScale = w("q_norm/scale");
       const kScale = w("k_norm/scale");
-      const attnOut = w("attn_out/weights");
+      const attnOut = upload("attn_out/weights", narrow(weights["attn_out/weights"]));
       const ffnScale = w("ffn_norm/scale");
       const ffnOffset = w("ffn_norm/offset");
-      const fc1 = w("fc1/weights");
-      const fc2 = w("fc2/weights");
+      const fc1 = upload("fc1/weights", narrow(weights["fc1/weights"]));
+      const fc2 = upload("fc2/weights", narrow(weights["fc2/weights"]));
 
       // 🔴 THE RESIDUAL SCALE IS FOLDED INTO THE PROJECTION WEIGHTS, not applied
       // as a separate pass. It is sqrt(layers / 36), which is exactly 1 at 36
@@ -496,17 +550,17 @@ export class EsmcBlockGpu {
         return out;
       };
       const attnOutScaled = residualScale === 1 ? attnOut
-        : upload("attn_out/scaled", scaled(weights["attn_out/weights"]));
+        : upload("attn_out/scaled", narrow(scaled(weights["attn_out/weights"])));
       const fc2Scaled = residualScale === 1 ? fc2
-        : upload("fc2/scaled", scaled(weights["fc2/weights"]));
+        : upload("fc2/scaled", narrow(scaled(weights["fc2/weights"])));
 
       const pipeline = async (name, source) => this.pipelines.get(name, source);
       const normPipeline = await pipeline(
         `esmc-ln:${rows}:${model}:${epsilon}`,
         createLayerNormShader({ rows, channels: model }, true, epsilon));
       const qkvPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${3 * model}:0`,
-        createLinearShader({ rows, inner: model, outer: 3 * model }, false));
+        `esmc-linear:${rows}:${model}:${3 * model}:0:${weightPrecision}:${boundsTest}`,
+        createLinearShader({ rows, inner: model, outer: 3 * model }, false, weightPrecision, boundsTest));
       const preparePipeline = await pipeline(
         `esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase));
@@ -514,14 +568,14 @@ export class EsmcBlockGpu {
         `esmc-attend:${rows}:${model}:${heads}`,
         createAttentionShader({ rows, model, heads }));
       const outPipeline = await pipeline(
-        `esmc-linear:${rows}:${model}:${model}:1`,
-        createLinearShader({ rows, inner: model, outer: model }, true));
+        `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}`,
+        createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest));
       const swigluPipeline = await pipeline(
-        `esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}`,
-        createSwigluShader({ rows, model, ffn }, epsilon));
+        `esmc-swiglu:${rows}:${model}:${ffn}:${epsilon}:${weightPrecision}`,
+        createSwigluShader({ rows, model, ffn }, epsilon, weightPrecision));
       const downPipeline = await pipeline(
-        `esmc-linear:${rows}:${ffn}:${model}:1`,
-        createLinearShader({ rows, inner: ffn, outer: model }, true));
+        `esmc-linear:${rows}:${ffn}:${model}:1:${weightPrecision}:${boundsTest}`,
+        createLinearShader({ rows, inner: ffn, outer: model }, true, weightPrecision, boundsTest));
 
       const readback = keep(this.allocator.allocate(
         "esmc.readback", rows * model * 4,
