@@ -107,6 +107,14 @@ const weightsPromises = new Map();
  * first version handed the second family the first one's weights. There is one
  * ESMFold2 bundle; a second has appeared, so this is a Map.
  *
+ * 🔴 KEYED BY FAMILY, AND THE `languageModel` FLAG RIDES ON THE FIRST CALL.
+ * That flag only decides whether the tower PREFETCHES, so a second fold of the
+ * same family that does want it still gets its weights - the store fetches on
+ * demand and the tower streams its blocks during the fold anyway. What it
+ * costs is the head start and the download dial, in the order "fold a ligand,
+ * then fold a protein". Left as it is because the alternative is a second key
+ * on a flag that changes no weights.
+ *
  * 🔴 KEYED BY FAMILY, BECAUSE A SECOND CHECKPOINT IS MISTAKEN FOR THE FIRST IN
  * A CACHE AND NOT IN A LOADER. `loadAf3Weights` memoised ONE promise and the
  * second family's fold got the first family's weights; the shapes agree, so
