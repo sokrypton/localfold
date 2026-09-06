@@ -78,24 +78,66 @@ def main():
     captured['modules'] = {}
 
     def module_hook(label):
-        def hook(_module, inputs, output):
+        # 🔴 KEYWORDS TOO, BECAUSE HALF OF THESE TAKE NO POSITIONAL ARGUMENT AT
+        # ALL. `rel_pos` and `inputs_embedder` are called entirely by keyword,
+        # so a hook reading `inputs[0]` raises IndexError on them - and the
+        # tempting fix, skipping a module with no positional input, would
+        # silently drop exactly the two modules that most need recording.
+        def hook(_module, inputs, keywords, output):
             if label in captured['modules']:
                 return                     # the first loop only
+            arguments = {}
+            for index, value in enumerate(inputs):
+                if torch.is_tensor(value):
+                    arguments[str(index)] = value.detach().clone()
+            for name, value in (keywords or {}).items():
+                if torch.is_tensor(value):
+                    arguments[name] = value.detach().clone()
+            first = next(iter(arguments.values())) if arguments else None
             captured['modules'][label] = {
-                'input': inputs[0].detach().clone(),
+                'input': first,
+                'arguments': arguments,
                 'output': (output[0] if isinstance(output, (tuple, list))
                            else output).detach().clone(),
             }
         return hook
 
+    # 🔴 EVERY ADDEND OF z_init, NOT JUST z_init. It is a sum of five terms -
+    # two projections of the atom encoder's output, a relative position
+    # encoding, a token-bond encoding and the language model's pair - and each
+    # is its own port. A checker that only sees the total can say the sum is
+    # wrong and nothing else; these say which term.
     first = model.folding_trunk.blocks[0]
     handles = [model.pair_loop_proj.register_forward_hook(after_projection),
                model.folding_trunk.register_forward_hook(after_trunk),
-               first.tri_mul_out.register_forward_hook(module_hook('tri_mul_out')),
-               first.tri_mul_in.register_forward_hook(module_hook('tri_mul_in')),
-               first.pair_transition.register_forward_hook(module_hook('pair_transition'))]
+               first.tri_mul_out.register_forward_hook(module_hook('tri_mul_out'), with_kwargs=True),
+               first.tri_mul_in.register_forward_hook(module_hook('tri_mul_in'), with_kwargs=True),
+               first.pair_transition.register_forward_hook(module_hook('pair_transition'), with_kwargs=True),
+               model.inputs_embedder.register_forward_hook(module_hook('inputs_embedder'), with_kwargs=True),
+               model.z_init_1.register_forward_hook(module_hook('z_init_1'), with_kwargs=True),
+               model.z_init_2.register_forward_hook(module_hook('z_init_2'), with_kwargs=True),
+               model.rel_pos.register_forward_hook(module_hook('rel_pos'), with_kwargs=True),
+               model.token_bonds.register_forward_hook(module_hook('token_bonds'), with_kwargs=True),
+               model.language_model.register_forward_hook(module_hook('language_model'), with_kwargs=True)]
 
     features = prepare_protein_features(sequence)
+    # 🔴 AND THE FEATURES THEMSELVES, because rel_pos is a pure function of five
+    # integer arrays and the atom encoder of seven. A JavaScript featuriser that
+    # builds them differently is a fault this dump can localise only if it
+    # records what the model was actually given.
+    captured['features'] = {}
+    for name in ('residue_index', 'asym_id', 'sym_id', 'entity_id', 'token_index',
+                 'token_bonds', 'mol_type', 'atom_to_token', 'ref_pos',
+                 'ref_space_uid', 'ref_charge', 'ref_element',
+                 'ref_atom_name_chars', 'atom_attention_mask',
+                 'token_attention_mask', 'input_ids'):
+        value = features.get(name)
+        if value is None:
+            continue
+        captured['features'][name] = {
+            'shape': list(value.shape),
+            'values': np.asarray(value.detach().cpu()).reshape(-1).tolist(),
+        }
     # 🔴 NO LANGUAGE MODEL, DELIBERATELY. lm_z is added to z_init once and is
     # this port's OTHER half; leaving it out makes the trunk's own arithmetic
     # the only thing recorded, and the tower already has its own oracle.
@@ -117,8 +159,14 @@ def main():
         # The first projection sees a zero z, so its output is
         # pair_loop_proj(0) - the bias path alone - and z_init is what the
         # model added to it. Both are recorded rather than reconstructed.
-        'block0': {name: {'input': tolist(v['input']), 'output': tolist(v['output'])}
+        'block0': {name: {
+            'input': tolist(v['input']) if v['input'] is not None else None,
+            'arguments': {k: {'shape': list(t.shape), 'values': tolist(t)}
+                          for k, t in v['arguments'].items()},
+            'output': tolist(v['output']),
+            'outputShape': list(v['output'].shape)}
                    for name, v in captured['modules'].items()},
+        'features': captured['features'],
         'intoLoop': {str(i): tolist(v) for i, v in enumerate(captured['inputs'])},
         'afterLoop': {str(i): tolist(v) for i, v in enumerate(captured['loops'])},
         'distogram': tolist(output['distogram_logits'])

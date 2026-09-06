@@ -1037,6 +1037,34 @@ alone - 1.55x on `bench-triangle-project.js` at 118 tokens - rather than against
 the other knob. **Price a precision knob against the other knobs, not against
 f32.**
 
+🔴 **`model.py` IS A DIFFERENT MODEL FROM `experimental.py`, AND ITS RECURRENCE
+IS NOT THIS ONE.** Both live in `esm/models/esmfold2/`, both define a
+`folding_trunk` and a `z_init`, and the class this repository loads is
+`EsmFold2ExperimentalModel` from the second. Reading the first gives:
+
+```python
+delta = F.softplus(self.parcae_log_delta)                    # model.py
+a = torch.exp(-delta * torch.exp(self.parcae_log_a))
+z = a * z + F.linear(self.parcae_input_norm(z_inject), b_mat)
+```
+
+a diagonal state-space recurrence with a learned decay, an input matrix, a
+readout and a second `FoldingTrunk` as a coda. What the experimental model
+actually runs is:
+
+```python
+z = torch.zeros_like(z_init)                                 # experimental.py
+for loop_num in range(n_loops + 1):
+    z = z_init + self.pair_loop_proj(z)
+    z = self.folding_trunk(z, pair_attention_mask=pair_mask)
+```
+
+`pair_loop_proj` is `Sequential(LayerNorm, Linear)` with the Linear
+**zero-initialised**, and `z` starts at zero rather than at noise. Neither file
+names the other; both are "ESMFold2's trunk loop" to a reader, and porting the
+wrong one gives a model that folds. Check the CLASS the checkpoint instantiates,
+not the file with the likelier name.
+
 🔴 **AND THE TRUNK IS THE EXPENSIVE HALF OF THIS MODEL, NOT THE TOWER.** ESM-C
 600M folds 300 residues in 0.91 s. The trunk at 300 tokens is **8.7 s a loop and
 it runs four loops** - 35 s - holding 534 MiB, because `d_pair` is 256 where

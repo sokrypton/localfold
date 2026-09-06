@@ -66,6 +66,17 @@ def main():
     writer.add('recycle/norm/offset', np.asarray(get('pair_loop_proj.0.bias'), np.float32))
     writer.add('recycle/projection', np.ascontiguousarray(
         np.asarray(get('pair_loop_proj.1.weight'), np.float32).T))
+    # 🔴 EVERYTHING THAT BUILDS z_init EXCEPT THE ATOM ENCODER AND THE LANGUAGE
+    # MODEL. z_init is a sum of five terms and these are the three cheap ones;
+    # the shim's pair term is already in the ESM-C bundle, and the atom
+    # encoder's is its own port. Exporting them separately is what lets the
+    # featuriser be checked before the expensive half of it exists.
+    transposed = lambda name: np.ascontiguousarray(
+        np.asarray(get(name), np.float32).T)
+    writer.add('featuriser/relPos', transposed('rel_pos.embed.weight'))
+    writer.add('featuriser/tokenBonds', transposed('token_bonds.weight'))
+    writer.add('featuriser/zInit1', transposed('z_init_1.weight'))
+    writer.add('featuriser/zInit2', transposed('z_init_2.weight'))
     writer.close()
 
     parameters = sum(int(np.prod(r['shape'])) for r in writer.records.values())
@@ -80,6 +91,8 @@ def main():
                   # 🔴 THE LAYOUT, IN THE ARTEFACT. A bundle that outlives a
                   # change to its exporter decodes cleanly into the wrong thing -
                   # which is exactly what the stale int5 ESM-C bundle did.
+                  'singleInputs': int(source.shape('z_init_1.weight')[1]),
+                  'relativeFeatures': int(source.shape('rel_pos.embed.weight')[1]),
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',
                   'transitionDoubleWidth': 'blocked-gate-first'},
