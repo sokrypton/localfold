@@ -321,6 +321,10 @@ export async function main(device, args = []) {
     peakMebibytes: result.memory.peakBytes / 1048576,
     stages: progress,
     longRangeContacts: contactPairs,
+    certainty: result.certainty === undefined ? undefined : {
+      mean: [...result.certainty].reduce((t, v) => t + v, 0) / result.certainty.length,
+      min: Math.min(...result.certainty), max: Math.max(...result.certainty),
+    },
     contactAgreement: agreement,
     pdb,
   };
