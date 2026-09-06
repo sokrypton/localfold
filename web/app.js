@@ -409,6 +409,18 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
 // FOLDED rather than what is missing - it used to say "None", which reads as
 // an absent setting rather than a choice about the input.
 const msaMode = () => {
+  // 🔴 A SINGLE-SEQUENCE MODEL DECIDES THIS, NOT THE SELECT, AND HIDING THE ROW
+  // IS NOT ENOUGH. `syncModelControls` hides the MSA controls for ESMFold2
+  // because it has no alignment to take - `disable_msa_features` is true in its
+  // checkpoint - but hiding a control does not change its VALUE, so a page that
+  // had been set to Search kept returning "search" from behind the hidden row.
+  // A monomer survived that (the search runs, the result is discarded); an
+  // OLIGOMER did not, because a multi-chain search reaches `mergeSearchedChains`
+  // before the fold branches by model, and that looks its merge rule up by
+  // family - "unknown model esmfold2: expected monomer, multimer, af3,
+  // openbind0". The control was ignored everywhere except the one place it
+  // could still throw.
+  if (SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily())) return "single";
   const chosen = element("msa-mode").value;
   return chosen === "none" ? "single" : chosen;
 };
@@ -2196,8 +2208,10 @@ async function fold(event) {
   const { signal } = controller;
   activeFold = controller;
   setFoldButton("running");
+  // ...`msaMode()` and not the select, so the dev log records what the fold
+  // will actually do rather than what a hidden control still says.
   devBeginRun(`fold · ${element("model-family").value}`
-    + ` · alignment ${element("msa-mode").value}`
+    + ` · alignment ${msaMode()}`
     + ` · ${element("recycles").value} recycles`);
   // 🔴 THE LAST FOLD'S NUMBERS GO BEFORE THIS ONE STARTS. The card kept showing
   // a mean pLDDT and a pTM for a structure that was no longer being computed,
