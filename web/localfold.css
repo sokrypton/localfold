@@ -944,8 +944,14 @@
      `0 0` - a lone MSA select with Max MSA hidden takes the line. */
   #modelGroup, #recyclesGroup, #seedGroup { flex: 1 1 calc(33.333% - 9px); }
   #af3ModeGroup, #af3CountGroup,
+  /* ...and PLM is one of the halves, for the same reason MSA is: it is the
+     other half of the line Diffusion starts. Left out, it kept its content
+     width while Diffusion grew to fill the rest, so the two controls of one
+     question were different sizes on a phone. */
+  #plmGroup,
   #msaModeGroup, #maxMsaGroup { flex: 1 1 calc(50% - 7px); }
   #foldOptions > .fetch-option-group + .fetch-option-group,
+  #plmGroup,
   #msaModeGroup {
     border-left: 0;
     padding-left: 0;
