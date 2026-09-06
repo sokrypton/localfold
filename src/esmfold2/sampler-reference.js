@@ -279,3 +279,66 @@ export function samplerStep(noisy, denoised, weights, atoms, tHat, sigmaT, stepS
   }
   return out;
 }
+
+/**
+ * Algorithm 19: centre on the live atoms, rotate randomly, translate randomly.
+ *
+ * 🔴 IT RUNS BEFORE EVERY STEP, NOT ONCE. The sampler is equivariant only
+ * because the structure is re-posed each time, and the model was trained with
+ * this in the loop - so a port that centres once at the start converges to
+ * something and is a different sampler.
+ *
+ * @param draw a standard normal generator, so a caller owns the randomness
+ */
+export function centreRandomAugmentation(x, mask, atoms, draw) {
+  let total = 0;
+  const centre = [0, 0, 0];
+  for (let atom = 0; atom < atoms; atom += 1) {
+    const w = mask[atom];
+    total += w;
+    for (let axis = 0; axis < 3; axis += 1) centre[axis] += w * x[atom * 3 + axis];
+  }
+  for (let axis = 0; axis < 3; axis += 1) centre[axis] /= Math.max(total, 1);
+  // A uniform random rotation from a normalised quaternion, as upstream.
+  const q = [draw(), draw(), draw(), draw()];
+  const scale = Math.hypot(q[0], q[1], q[2], q[3]) * (q[0] < 0 ? -1 : 1);
+  const [r, i, j, k] = q.map((value) => value / scale);
+  const twoS = 2 / (r * r + i * i + j * j + k * k);
+  const R = [
+    1 - twoS * (j * j + k * k), twoS * (i * j - k * r), twoS * (i * k + j * r),
+    twoS * (i * j + k * r), 1 - twoS * (i * i + k * k), twoS * (j * k - i * r),
+    twoS * (i * k - j * r), twoS * (j * k + i * r), 1 - twoS * (i * i + j * j),
+  ];
+  const shift = [draw(), draw(), draw()];
+  const out = new Float32Array(x.length);
+  for (let atom = 0; atom < atoms; atom += 1) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      let sum = 0;
+      for (let d = 0; d < 3; d += 1) sum += (x[atom * 3 + d] - centre[d]) * R[d * 3 + axis];
+      out[atom * 3 + axis] = sum + shift[axis];
+    }
+  }
+  return out;
+}
+
+/**
+ * A seeded standard normal, so a fold is reproducible even though it is not the
+ * model's own draw. xorshift32 plus Box-Muller.
+ */
+export function gaussians(seed) {
+  let state = (seed >>> 0) || 1;
+  const uniform = () => {
+    state ^= state << 13; state >>>= 0;
+    state ^= state >> 17;
+    state ^= state << 5; state >>>= 0;
+    return (state + 1) / 4294967297;
+  };
+  let spare = null;
+  return () => {
+    if (spare !== null) { const value = spare; spare = null; return value; }
+    const u = uniform(), v = uniform();
+    const radius = Math.sqrt(-2 * Math.log(u));
+    spare = radius * Math.sin(2 * Math.PI * v);
+    return radius * Math.cos(2 * Math.PI * v);
+  };
+}

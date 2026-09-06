@@ -146,6 +146,14 @@ def main():
     layers = len({k.split('.')[3] for k in tower.keys()
                   if k.startswith('esmc.transformer.blocks.')})
     d_model = tower.shape('esmc.embed.weight')[1]
+    # 🔴 ESM-C's HEAD DIMENSION IS 64 AT EVERY WIDTH, which is the only reason
+    # the head count is derivable: no tensor's shape carries it, and 1152
+    # channels reads just as well as 16 heads of 72.
+    heads = d_model // 64
+    # 🔴 AND THE RESIDUAL SCALE IS A CONFIG FIELD, NOT A TENSOR. It is 1 in the
+    # 300M and 600M checkpoints this exports; a checkpoint that scales its
+    # residual would need this read from its config rather than assumed.
+    residual_scale = 1.0
 
     def add(name, values):
         """Transposed where the GPU wants (inner, columns); verbatim otherwise."""
@@ -193,9 +201,15 @@ def main():
         # 🔴 THE PAIRING, IN THE ARTEFACT. A tower is interchangeable between
         # releases and a shim is not, so which folding model this shim came
         # from has to survive the export.
+        # 🔴 THE HEAD COUNT AND THE RESIDUAL SCALE BELONG HERE TOO. They are
+        # not derivable from any tensor's shape - 1152 channels is 18 heads of
+        # 64 and would read just as well as 16 of 72 - so a loader without them
+        # has to guess, and the wrong guess builds an attention kernel that
+        # compiles and mixes the wrong channels together.
         'languageModel': {'tower': arguments.esmc,
                           'shim': arguments.esmfold2,
                           'layers': layers, 'width': d_model,
+                          'heads': heads, 'residualScale': residual_scale,
                           'mixEntries': layers + 1},
         'weightLayout': 'inner-major',
         # 🔴 NAMED, BECAUSE THE QUANTISER'S RULE IS ABOUT SUFFIXES AND THESE

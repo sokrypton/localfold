@@ -64,8 +64,11 @@ export class Esmfold2TrunkGpu {
     const n = options.n ?? Math.round(Math.sqrt(state.pairMask.length));
     const pairs = n * n;
     const channels = options.channels ?? PAIR_CHANNELS;
-    if (state.pair.length !== pairs * channels) {
+    if (state.buffer === undefined && state.pair.length !== pairs * channels) {
       throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * channels}`);
+    }
+    if (state.buffer !== undefined && options.n === undefined) {
+      throw new Error("a borrowed pair buffer carries no shape; pass options.n");
     }
     if (blocks.length === 0) throw new Error("a trunk with no blocks");
     const epsilon = options.epsilon ?? 1e-5;
@@ -123,9 +126,15 @@ export class Esmfold2TrunkGpu {
     });
 
     try {
-      const pair = keep(this.allocator.upload(
+      // 🔴 A CALLER MAY OWN THE PAIR BUFFER, AND A FOLD DOES. Four loops that
+      // each upload the pair and read it back is 736 MB of traffic at 300
+      // tokens for a tensor that never leaves the device between them - and the
+      // recycle projection in between is itself a GPU pass. `state.buffer` is
+      // that path; `state.pair` is the standalone one a checker wants.
+      const borrowed = state.buffer !== undefined;
+      const pair = borrowed ? state.buffer : keep(this.allocator.upload(
         "esmfold2-trunk.pair", state.pair, storage | GPUBufferUsage.COPY_SRC));
-      const pairMask = keep(this.allocator.upload(
+      const pairMask = state.maskBuffer ?? keep(this.allocator.upload(
         "esmfold2-trunk.pair-mask", state.pairMask, storage));
       const scratch = [];
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
@@ -162,6 +171,10 @@ export class Esmfold2TrunkGpu {
       // pool, so releasing DESTROYS and the peak actually moves.
       for (const allocation of scratch) allocation.release();
       biasBuffer?.release();
+      if (options.readback === false) {
+        return { pair: undefined, elapsedMilliseconds: performance.now() - start,
+                 memory: this.allocator.snapshot() };
+      }
       const readback = keep(this.allocator.allocate(
         "esmfold2-trunk.readback", pairBytes,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));

@@ -1,0 +1,382 @@
+/**
+ * A whole ESMFold2 fold on the GPU: a sequence in, a structure out.
+ *
+ *     ids      -> ESM-C's 36 blocks -> a mixed single -> lm_z
+ *     z_init    = z_init_1[i] + z_init_2[j] + rel_pos + token_bonds + lm_z
+ *     z         = 0;  repeat loops:  z = trunk(z_init + pair_loop_proj(z))
+ *     structure = sampler(denoiser(z, s_inputs))
+ *
+ * 🔴 THE PAIR NEVER LEAVES THE DEVICE BETWEEN THE LOOPS. The trunk's own driver
+ * will upload and read back a pair for a caller that wants one, and four loops
+ * of that is 736 MB of traffic at 300 tokens for a tensor the recycle
+ * projection - itself a GPU pass - is the only thing between. `state.buffer`
+ * is the borrowed path.
+ *
+ * 🔴 AND THE LANGUAGE MODEL IS THE FIRST THING, NOT THE LAST. ESM-C streams one
+ * block's weights at a time and holds 2190 MiB if it does not, so it runs and
+ * is released before the trunk allocates anything pair-sized. Its 37 hidden
+ * states are never materialised at all - see src/esmc/tower-webgpu.js.
+ *
+ * 🔴 AND `lm_shim(0)` IS NOT ZERO, so "fold without the language model" is not
+ * a mode this offers. The shim's biases make the term non-zero for a zero
+ * input, so substituting zeros is a different model that folds; a caller
+ * without ESM-C has no ESMFold2 to run.
+ */
+import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
+  from "../esmc/block-webgpu.js";
+import { sequenceIds } from "../esmc/tower-reference.js";
+import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
+import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
+import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffusion-webgpu.js";
+import { buildRope } from "./atom-encoder-reference.js";
+import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
+import { encodeLanguagePair } from "./language-pair-webgpu.js";
+import { featuriseForEsmfold2 } from "./featurise.js";
+import { linear } from "./featuriser-reference.js";
+import {
+  createBondShader, createRelativePositionShader, createZInitShader,
+  relativeLayout, relativeRows,
+} from "./pair-features-webgpu.js";
+import {
+  centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
+  samplerStep,
+} from "./sampler-reference.js";
+
+/**
+ * The sampler settings a caller can name, the way AF3's page offers
+ * `diffusion-200` and `flow-16`.
+ *
+ * 🔴 THE STEP COUNT IS AN OUTPUT OF THE SCHEDULE, NOT AN INPUT TO IT.
+ * `max_inference_sigma` is a DEFAULT ARGUMENT of `sample`, not a config field,
+ * and it drops every schedule entry above the cap and prepends the cap itself -
+ * so upstream's `inference_num_steps: 15` runs ELEVEN steps. Reading the config
+ * number as the step count gives a sampler that visits four noise levels the
+ * model never sees. `steps` here is the schedule's length before truncation,
+ * and `run` reports how many actually ran.
+ */
+export const SAMPLER_PRESETS = {
+  /** What the checkpoint ships: 15 scheduled, 11 after the 256 cap. */
+  "diffusion-15": { steps: 15, maxSigma: 256 },
+  /** Fewer steps for a quick look; the same schedule, sampled coarsely. */
+  "diffusion-8": { steps: 8, maxSigma: 256 },
+  "diffusion-32": { steps: 32, maxSigma: 256 },
+  "diffusion-64": { steps: 64, maxSigma: 256 },
+  "diffusion-200": { steps: 200, maxSigma: 256 },
+  /**
+   * 🔴 A FLOW ARM IS THE SAME SCHEDULE WITH THE CHURN AND THE NOISE TURNED OFF,
+   * WHICH MAKES IT DETERMINISTIC GIVEN ITS START. `gamma0 = 0` makes `t_hat`
+   * equal `sigma` at every step, so no noise is re-injected and the update is a
+   * plain Euler step down the probability-flow ODE. It is not a different
+   * sampler and it is not free: the model was trained with churn, so few-step
+   * flow arms trade accuracy for time exactly as AF3's do.
+   */
+  "flow-16": { steps: 16, maxSigma: 256, gamma0: 0, noiseScale: 0 },
+  "flow-8": { steps: 8, maxSigma: 256, gamma0: 0, noiseScale: 0 },
+  "flow-32": { steps: 32, maxSigma: 256, gamma0: 0, noiseScale: 0 },
+};
+
+/** ESMFold2's own sampler constants, from the checkpoint's config. */
+export const SAMPLER_DEFAULTS = {
+  sigmaData: 16, gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901,
+  stepScale: 1.638, sMax: 160, sMin: 4e-4, p: 8, steps: 15, maxSigma: 256,
+};
+
+const perRow = (rows) => [Math.min(GRID_WIDTH, rows), Math.ceil(rows / GRID_WIDTH)];
+const elementwise = (elements) => {
+  const groups = Math.ceil(elements / LANES);
+  return [Math.min(GRID_WIDTH, groups), Math.ceil(groups / GRID_WIDTH)];
+};
+
+/** How many pair rows the recycle projection walks at once. */
+export const RECYCLE_CHUNK = 8192;
+
+/**
+ * `s_inputs`: the pooled atom representation, the residue one-hot, the MSA
+ * profile and the deletion mean, in that order.
+ *
+ * 🔴 THE PROFILE AND THE DELETION MEAN ARE ZERO FOR A SINGLE SEQUENCE, and that
+ * is a fact about this model rather than a placeholder. ESMFold2 folds without
+ * an alignment; the two blocks exist because the featuriser is shared, and the
+ * dumps record them as zeros. Filling the profile with the sequence one-hot
+ * instead - the plausible-looking thing - is a different input.
+ */
+export function assembleSingleInputs(tokenAct, features, tokens, tokenChannels,
+                                     classes, singleInputs) {
+  const out = new Float32Array(tokens * singleInputs);
+  for (let token = 0; token < tokens; token += 1) {
+    const to = token * singleInputs;
+    for (let c = 0; c < tokenChannels; c += 1) out[to + c] = tokenAct[token * tokenChannels + c];
+    for (let c = 0; c < classes; c += 1) {
+      out[to + tokenChannels + c] = features.aatype[token * classes + c];
+      out[to + tokenChannels + classes + c] = features.profile[token * classes + c];
+    }
+    out[to + singleInputs - 1] = features.deletionMean[token];
+  }
+  return out;
+}
+
+/**
+ * @param device   a WebGPU device
+ * @param options  { sequence, tower, weights, sampler, seed, onProgress }
+ *   `tower` is { ids -> single }: the ESM-C half, given separately because it
+ *   is a different bundle with a different licence and a caller may already
+ *   have run it.
+ */
+export async function foldEsmfold2(device, options) {
+  const { sequence, weights, shape } = options;
+  const allocator = options.allocator ?? new GpuBufferAllocator(device);
+  const cache = pipelineCacheForDevice(device);
+  const storage = GPUBufferUsage.STORAGE;
+  const report = options.onProgress ?? (() => {});
+  const started = performance.now();
+  const timings = {};
+  const mark = async (label, work) => {
+    await report(label);
+    const at = performance.now();
+    const value = await work();
+    timings[label] = performance.now() - at;
+    return value;
+  };
+
+  const features = featuriseForEsmfold2(sequence, options.features);
+  const tokens = features.tokens;
+  const atoms = features.atoms;
+  const pairs = tokens * tokens;
+  const channels = shape.pairChannels;
+  const held = [];
+  const keep = (allocation) => { held.push(allocation); return allocation; };
+
+  const submit = async (label, passes) => {
+    const encoder = device.createCommandEncoder({ label });
+    for (const [name, pipeline, buffers, x, y] of passes) {
+      const pass = encoder.beginComputePass({ label: name });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((entry, binding) => ({
+          binding,
+          resource: entry.byteOffset === undefined
+            ? { buffer: entry.buffer }
+            : { buffer: entry.buffer, offset: entry.byteOffset, size: entry.byteSize },
+        })),
+      }));
+      pass.dispatchWorkgroups(x, y ?? 1, 1);
+      pass.end();
+    }
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  };
+
+  try {
+    // ---- the language model, first and released before anything pair-sized.
+    const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
+    const single = await mark("language model", async () => {
+      const mixed = await options.tower(sequenceIds(sequence));
+      // The tower's rows include BOS and EOS; the shim mixes the residues only.
+      return mixed.subarray(channels, mixed.length - channels);
+    });
+    if (single.length !== tokens * channels) {
+      throw new Error(`the tower returned ${single.length / channels} residues `
+        + `for a ${tokens}-residue sequence`);
+    }
+    await mark("language pair", () => encodeLanguagePair(
+      { device, allocator, cache, submit },
+      { tokens, channels, single, weights: weights.shim, destination: lmPair }));
+
+    // ---- the inputs embedder, whose pooled output is most of `s_inputs`.
+    const atomShape = {
+      atoms, tokens, channels: shape.atomChannels, heads: shape.atomHeads,
+      blocks: shape.atomBlocks, hidden: shape.atomChannels * 2,
+      tokenChannels: shape.tokenChannels, window: shape.atomWindow,
+      precision: options.attentionPrecision ?? "bf16",
+    };
+    const rope = buildRope(features.refPos, features.refSpaceUid, atoms,
+                           shape.atomChannels / shape.atomHeads);
+    const sInputs = await mark("inputs embedder", async () => {
+      const tokenAct = await runInputsEmbedder(
+        { device, allocator, cache, rope,
+          atomConditioning: atomConditioning(features, atoms, shape.atomChannels,
+                                             weights.inputsEmbedder) },
+        { features, shape: atomShape, weights: weights.inputsEmbedder });
+      return assembleSingleInputs(tokenAct, features, tokens, shape.tokenChannels,
+                                  features.aatype.length / tokens, shape.singleInputs);
+    });
+
+    // ---- z_init's other four terms.
+    const layout = relativeLayout();
+    const [relative, bond, zInitShader, recycleNorm, recycleProject, addPair] =
+      await Promise.all([
+        cache.get(`esmfold2-rel:${pairs}:${channels}`,
+          createRelativePositionShader({ pairs, channels, entityBase: layout.entityBase })),
+        cache.get(`esmfold2-bond:${pairs}:${channels}`,
+          createBondShader({ pairs, channels })),
+        cache.get(`esmfold2-zinit:${tokens}:${channels}`,
+          createZInitShader({ tokens, channels, hasBonds: true, hasLanguageModel: true })),
+        cache.get(`esmfold2-recycle-norm:${Math.min(RECYCLE_CHUNK, pairs)}:${channels}`,
+          createLayerNormShader(
+            { rows: Math.min(RECYCLE_CHUNK, pairs), channels }, true, 1e-5)),
+        cache.get(`esmfold2-recycle-project:${Math.min(RECYCLE_CHUNK, pairs)}:${channels}`,
+          createLinearShader(
+            { rows: Math.min(RECYCLE_CHUNK, pairs), inner: channels, outer: channels }, true)),
+        cache.get(`esmfold2-pair-add:${pairs * channels}`,
+          createAddShader(pairs * channels)),
+      ]);
+
+    const relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
+    const zInit = keep(allocator.allocate("esmfold2.z-init", pairs * channels * 4, storage));
+    const pair = keep(allocator.allocate("esmfold2.pair", pairs * channels * 4,
+      storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
+    await mark("z_init", async () => {
+      const bins = keep(allocator.upload("esmfold2.rel-bins",
+        relativeRows(features, tokens), storage));
+      const relWeights = keep(allocator.upload("w.esmfold2.rel-pos",
+        weights.featuriser.relPos, storage));
+      const bondValues = keep(allocator.upload("esmfold2.bonds", features.tokenBonds, storage));
+      const bondWeights = keep(allocator.upload("w.esmfold2.token-bonds",
+        weights.featuriser.tokenBonds, storage));
+      const bonds = keep(allocator.allocate("esmfold2.bond-term",
+        pairs * channels * 4, storage));
+      // 🔴 PROJECT THEN BROADCAST. The two per-token projections are 2n rows of
+      // 451 channels on the host; broadcasting first would make them 2n^2.
+      const rows = keep(allocator.upload("esmfold2.z-rows",
+        linear(sInputs, tokens, shape.singleInputs, channels,
+               weights.featuriser.zInit1), storage));
+      const columns = keep(allocator.upload("esmfold2.z-columns",
+        linear(sInputs, tokens, shape.singleInputs, channels,
+               weights.featuriser.zInit2), storage));
+      await submit("esmfold2.z-init", [
+        ["rel-pos", relative, [bins, relWeights, relPos], ...elementwise(pairs * channels)],
+        ["bonds", bond, [bondValues, bondWeights, bonds], ...elementwise(pairs * channels)],
+        ["z-init", zInitShader, [rows, columns, relPos, bonds, lmPair, zInit],
+         ...elementwise(pairs * channels)],
+      ]);
+      for (const allocation of [bins, relWeights, bondValues, bondWeights, bonds,
+                                rows, columns, lmPair]) {
+        allocation.release();
+        held.splice(held.indexOf(allocation), 1);
+      }
+    });
+
+    // ---- the trunk, `loops` times over a pair that stays on the device.
+    const pairMask = keep(allocator.upload("esmfold2.pair-mask",
+      new Float32Array(pairs).fill(1), storage));
+    const recycleScale = keep(allocator.upload("w.esmfold2.recycle-scale",
+      weights.featuriser.recycleScale, storage));
+    const recycleOffset = keep(allocator.upload("w.esmfold2.recycle-offset",
+      weights.featuriser.recycleOffset, storage));
+    const recycleWeights = keep(allocator.upload("w.esmfold2.recycle-projection",
+      weights.featuriser.recycleProjection, storage));
+    const recycleScratch = keep(allocator.allocate("esmfold2.recycle-scratch",
+      Math.min(RECYCLE_CHUNK, pairs) * channels * 4, storage));
+    // 🔴 `z` STARTS AT ZERO AND `pair_loop_proj(0)` IS NOT ZERO. Its Linear is
+    // zero-INITIALISED upstream and then trained, and the LayerNorm in front of
+    // it has an offset - so the first loop's input is z_init plus a real
+    // vector. Skipping the projection on the first loop is the natural
+    // shortcut and a different model.
+    device.queue.writeBuffer(pair.buffer, 0, new Float32Array(pairs * channels));
+    const trunk = new Esmfold2TrunkGpu(device, { allocator, ...options.trunk });
+    const slice = (allocation, row, rows) => ({
+      buffer: allocation.buffer, byteOffset: row * channels * 4,
+      byteSize: rows * channels * 4,
+    });
+    const loops = shape.loops ?? 4;
+    for (let loop = 0; loop < loops; loop += 1) {
+      await mark(`recycle ${loop}`, async () => {
+        const chunk = Math.min(RECYCLE_CHUNK, pairs);
+        for (let start = 0; start < pairs; start += chunk) {
+          const rows = Math.min(chunk, pairs - start);
+          if (rows !== chunk) {
+            // The tail chunk needs its own pipelines; at these sizes it is one
+            // extra compile, and a wrong-sized dispatch leaves rows unwritten -
+            // which reads as a speedup, not as an error.
+            const [norm, project] = await Promise.all([
+              cache.get(`esmfold2-recycle-norm:${rows}:${channels}`,
+                createLayerNormShader({ rows, channels }, true, 1e-5)),
+              cache.get(`esmfold2-recycle-project:${rows}:${channels}`,
+                createLinearShader({ rows, inner: channels, outer: channels }, true)),
+            ]);
+            await submit("esmfold2.recycle", [
+              ["norm", norm, [slice(pair, start, rows), recycleScale, recycleOffset,
+                              recycleScratch], ...perRow(rows)],
+              ["project", project, [recycleScratch, recycleWeights,
+                                    slice(zInit, start, rows), slice(pair, start, rows)],
+               ...linearGrid(rows, channels)],
+            ]);
+            continue;
+          }
+          await submit("esmfold2.recycle", [
+            ["norm", recycleNorm, [slice(pair, start, rows), recycleScale, recycleOffset,
+                                   recycleScratch], ...perRow(rows)],
+            ["project", recycleProject, [recycleScratch, recycleWeights,
+                                         slice(zInit, start, rows), slice(pair, start, rows)],
+             ...linearGrid(rows, channels)],
+          ]);
+        }
+      });
+      await mark(`trunk ${loop}`, () => trunk.run(
+        { buffer: pair, maskBuffer: pairMask },
+        weights.trunkBlocks,
+        { n: tokens, channels, readback: false,
+          onBlock: options.onBlock && ((index) => options.onBlock(loop, index)) }));
+    }
+    recycleScratch.release();
+    held.splice(held.indexOf(recycleScratch), 1);
+
+    // ---- the sampler.
+    const settings = { ...SAMPLER_DEFAULTS,
+                       ...(SAMPLER_PRESETS[options.sampler ?? "diffusion-15"] ?? {}),
+                       ...(options.samplerOverrides ?? {}) };
+    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache);
+    await mark("conditioning", () => denoiser.prepare({
+      shape: {
+        tokens, atoms,
+        pairChannels: channels, singleInputs: shape.singleInputs,
+        tokenChannels: shape.tokenChannels2, tokenHeads: shape.tokenHeads,
+        multiplier: shape.transitionMultiplier, sigmaData: settings.sigmaData,
+        atomChannels: shape.atomChannels, atomHeads: shape.atomHeads,
+        atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
+        window: shape.atomWindow, attentionPrecision: options.attentionPrecision ?? "bf16",
+      },
+      weights: weights.denoiser, features, sInputs, pair, relPos,
+    }));
+
+    const schedule = noiseSchedule({ steps: settings.steps, sMax: settings.sMax,
+                                     sMin: settings.sMin, p: settings.p,
+                                     sigmaData: settings.sigmaData,
+                                     maxSigma: settings.maxSigma });
+    const gammas = churnFactors(schedule, settings.gammaMin, settings.gamma0);
+    const levels = noiseLevels(schedule, gammas);
+    const draw = gaussians(options.seed ?? 0);
+    let x = new Float32Array(atoms * 3);
+    for (let i = 0; i < x.length; i += 1) x[i] = schedule[0] * draw();
+    for (let step = 0; step < levels.length; step += 1) {
+      await report(`sampler ${step + 1} of ${levels.length}`);
+      const at = performance.now();
+      x = centreRandomAugmentation(x, features.mask, atoms, draw);
+      const tHat = levels[step];
+      const epsilon = settings.noiseScale
+        * Math.sqrt(Math.max(tHat * tHat - schedule[step] * schedule[step], 0));
+      const noisy = new Float32Array(x.length);
+      for (let i = 0; i < noisy.length; i += 1) noisy[i] = x[i] + epsilon * draw();
+      const denoised = await denoiser.denoise(noisy, tHat);
+      x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
+                      schedule[step + 1], settings.stepScale);
+      timings[`sampler ${step}`] = performance.now() - at;
+      await options.onStep?.(step, levels.length, x);
+    }
+    const memory = allocator.snapshot();
+    denoiser.release();
+
+    return {
+      coordinates: x, features, sequence, tokens, atoms, sInputs,
+      steps: levels.length, scheduleLength: schedule.length, settings,
+      elapsedMilliseconds: performance.now() - started, timings, memory,
+    };
+  } finally {
+    for (let at = held.length - 1; at >= 0; at -= 1) {
+      try { held[at].release(); } catch { /* already released */ }
+    }
+  }
+}

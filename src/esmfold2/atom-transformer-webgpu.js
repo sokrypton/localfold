@@ -571,3 +571,108 @@ export function encodeAtomStack({ run, pipelines, state, scratch, weights }) {
         [scratch.delta, scratch.modulation, state.activation], ...rows(atoms * channels));
   }
 }
+
+/**
+ * The inputs embedder, standalone: features in, one pooled vector per token out.
+ *
+ * 🔴 IT RUNS ONCE A FOLD, SO IT ALLOCATES AND READS BACK. The diffusion
+ * module's copy of this stack runs once per sampler step and is therefore
+ * recorded rather than rebuilt (see src/esmfold2/diffusion-webgpu.js); this one
+ * has nothing to amortise, and giving it the same machinery would be a second
+ * place for the atom conditioning to be built differently.
+ *
+ * 🔴 AND IT HAS NO `coords_linear`. The noisy coordinates are the diffusion
+ * copy's alone: this embedder is the model's view of the molecule before any
+ * structure exists.
+ *
+ * @param context { device, allocator, cache, atomConditioning }
+ */
+export async function runInputsEmbedder(context, { features, shape, weights }) {
+  const { device, allocator, cache } = context;
+  const { atoms, tokens, channels, heads, blocks, hidden, tokenChannels, window } = shape;
+  const storage = GPUBufferUsage.STORAGE;
+  const halfWindow = window >> 1;
+  const bounds = atomWindows(features.mask, atoms, halfWindow);
+  const stagedWindow = widestWindow(bounds, atoms);
+  const ranges = tokenRanges(features.atomToToken, features.mask, atoms, tokens);
+  const pipelines = await compileAtomStack(cache, {
+    atoms, tokens, channels, heads, blocks, hidden, window: stagedWindow,
+    precision: shape.precision ?? "bf16",
+  });
+  const [toToken, pool] = await Promise.all([
+    cache.get(`esmfold2-embed-to-token:${atoms}:${channels}:${tokenChannels}`,
+      createLinearShader({ rows: atoms, inner: channels, outer: tokenChannels }, false)),
+    cache.get(`esmfold2-embed-pool:${tokens}:${tokenChannels}`,
+      createPoolShader({ tokens, channels: tokenChannels })),
+  ]);
+
+  const held = [];
+  const keep = (allocation) => { held.push(allocation); return allocation; };
+  try {
+    const conditioning = keep(allocator.upload("esmfold2.embed.c-base",
+      context.atomConditioning, storage | GPUBufferUsage.COPY_SRC));
+    const activation = keep(allocator.allocate("esmfold2.embed.act",
+      atoms * channels * 4, storage | GPUBufferUsage.COPY_DST));
+    // 🔴 THE ACTIVATION STARTS AT THE CONDITIONING ITSELF, not at zero:
+    // `atom_stack(c0, c0)` passes the same tensor as the running activation and
+    // as the conditioning, and only the first is updated.
+    const copy = device.createCommandEncoder({ label: "esmfold2.embed.start" });
+    copy.copyBufferToBuffer(conditioning.buffer, 0, activation.buffer, 0, atoms * channels * 4);
+    device.queue.submit([copy.finish()]);
+
+    const state = {
+      activation, conditioning,
+      cos: keep(allocator.upload("esmfold2.embed.cos", context.rope.cos, storage)),
+      sin: keep(allocator.upload("esmfold2.embed.sin", context.rope.sin, storage)),
+      bounds: keep(allocator.upload("esmfold2.embed.bounds", bounds, storage)),
+      valid: keep(allocator.upload("esmfold2.embed.valid", features.mask, storage)),
+    };
+    const scratch = {};
+    for (const [name, elements] of Object.entries(
+      atomStackScratch({ atoms, channels, heads, hidden }))) {
+      scratch[name] = keep(allocator.allocate(`esmfold2.embed.${name}`,
+        Math.max(16, elements * 4), storage));
+    }
+    const blockBuffers = weights.blocks.map((block, index) => {
+      const at = (leaf) => keep(allocator.upload(
+        `w.esmfold2.embed.${index}.${leaf}`, block[leaf], storage));
+      return { adaln: at("adaln"), qkv: at("qkv"), attnGate: at("attnGate"),
+               attnOut: at("attnOut"), ffnUp: at("ffnUp"), ffnDown: at("ffnDown") };
+    });
+    const projected = keep(allocator.allocate("esmfold2.embed.projected",
+      atoms * tokenChannels * 4, storage));
+    const tokenAct = keep(allocator.allocate("esmfold2.embed.token-act",
+      tokens * tokenChannels * 4, storage | GPUBufferUsage.COPY_SRC));
+    const ranged = keep(allocator.upload("esmfold2.embed.ranges", ranges, storage));
+    const toTokenWeights = keep(allocator.upload("w.esmfold2.embed.to-token",
+      weights.atomToToken, storage));
+
+    const encoder = device.createCommandEncoder({ label: "esmfold2.embed" });
+    const run = (label, pipeline, buffers, x, y = 1) => {
+      const pass = encoder.beginComputePass({ label });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: buffers.map((entry, binding) => ({ binding, resource: { buffer: entry.buffer } })),
+      }));
+      pass.dispatchWorkgroups(x, y, 1);
+      pass.end();
+    };
+    encodeAtomStack({ run, pipelines, state, scratch, weights: blockBuffers });
+    run("esmfold2.embed.to-token", toToken, [activation, toTokenWeights, projected],
+        ...linearGrid(atoms, tokenChannels));
+    run("esmfold2.embed.pool", pool, [projected, state.valid, ranged, tokenAct],
+        Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH));
+    const readback = keep(allocator.allocate("esmfold2.embed.readback",
+      tokens * tokenChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    encoder.copyBufferToBuffer(tokenAct.buffer, 0, readback.buffer, 0,
+                               tokens * tokenChannels * 4);
+    device.queue.submit([encoder.finish()]);
+    await readback.buffer.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(readback.buffer.getMappedRange().slice(0));
+    readback.buffer.unmap();
+    return out;
+  } finally {
+    for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();
+  }
+}
