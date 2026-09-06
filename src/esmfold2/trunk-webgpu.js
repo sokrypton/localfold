@@ -57,6 +57,9 @@ export class Esmfold2TrunkGpu {
    * `num_loops: 3` means four iterations. The projection and the recurrence
    * belong to the caller; what a trunk pass IS, is this.
    *
+   * @param options `onBlock(index)` fires when a block is ENCODED and is
+   *   awaited so a caller may yield; `onBlockDone(completed, total)` fires when
+   *   the DEVICE has finished one and is what a progress bar should read.
    * @param {{pair: Float32Array, pairMask: Float32Array}} state
    * @param {object[]} blocks each with the three sub-modules' weights
    */
@@ -182,9 +185,30 @@ export class Esmfold2TrunkGpu {
         });
         validation.end(`block ${index}`);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
+        // 🔴 WHEN THE DEVICE REACHES THIS BLOCK, REPORTED WITHOUT WAITING FOR
+        // IT. `onBlock` below fires when a block is ENCODED, and sixteen of
+        // those happen in the time the GPU takes over one - so a bar driven by
+        // it sprints to the end of the submission window and then sits still,
+        // which is what "the bar is not smooth" is. `onSubmittedWorkDone`
+        // resolves once everything submitted so far has finished, so one taken
+        // HERE settles exactly when this block is done.
+        //
+        // 🔴 AND IT IS NOT AWAITED, WHICH IS THE WHOLE TRICK. The loop carries
+        // on encoding and the pipelining that makes this stack fast is
+        // untouched; awaiting per block costs 14% of the trunk, measured at 150
+        // residues - 7294 ms against 6406 - for a bar that this gets for
+        // nothing. They resolve in submission order, so the count cannot go
+        // backwards. AF3's pairformer has done this since it had a status line,
+        // and it took it from AF2's evoformer stack.
+        const submitted = index + 1;
+        void this.device.queue.onSubmittedWorkDone()
+          .then(() => options.onBlockDone?.(submitted, blocks.length));
         if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
           await this.device.queue.onSubmittedWorkDone();
         }
+        // 🔴 AWAITED, SO A CALLER CAN YIELD. Every await above resolves from a
+        // GPU promise, which is a microtask - so a page that only moved a
+        // progress bar here would write it and never paint it.
         await options.onBlock?.(index);
       }
       await validation.settle();

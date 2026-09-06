@@ -27,6 +27,7 @@ import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGri
 import { featuriseForEsmfold2, languageModelInput } from "./featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
 import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffusion-webgpu.js";
@@ -492,8 +493,18 @@ export async function foldEsmfold2(device, options) {
         { buffer: pair, maskBuffer: pairMask },
         weights.trunkBlocks,
         { n: tokens, channels, readback: false,
-          onBlock: (index) => {
-            advance(perBlock);
+          submissionWindow: options.submissionWindow,
+          // 🔴 THE BAR READS `onBlockDone`, NOT `onBlock`. The first fires at
+          // ENCODE time, sixteen at a stride, so a bar driven by it sprints
+          // through a submission window and then sits still. This one settles
+          // when the device has actually finished the block.
+          onBlockDone: () => advance(perBlock),
+          // ...and the encode-time one is where the page gets a chance to
+          // paint. A GPU promise resolves as a microtask, which never returns
+          // control to the browser; `yieldToBrowser` posts a MessageChannel
+          // message, which is a task and is not clamped in a background tab.
+          onBlock: async (index) => {
+            await yieldToBrowser();
             return options.onBlock?.(loop, index);
           } }));
     }

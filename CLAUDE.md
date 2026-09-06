@@ -1914,6 +1914,39 @@ of a short fold's predicted time and completed in a single step, so the bar went
 from zero to a half. `EsmcTowerGpu` reports per block now; measured, the largest
 single jump falls from **0.53 to 0.09** over 45 samples, monotonic throughout.
 
+🔴 **AND THE BAR READS `onBlockDone`, NOT `onBlock`, WHICH IS AF3's IDIOM AND
+THE DIFFERENCE BETWEEN SMOOTH AND NOT.** `onBlock` fires when a block is
+ENCODED, and sixteen of those happen in the time the device takes over one - so
+a bar driven by it sprints to the end of the submission window and then sits
+still. Reported as the bar not being smooth.
+
+The fix is a NON-AWAITED `onSubmittedWorkDone()` taken per block: it resolves
+once everything submitted so far has finished, so one taken at block i settles
+exactly when block i is done, and not awaiting it leaves the encode loop and its
+pipelining untouched. They resolve in submission order, so the count cannot go
+backwards. AF3's pairformer has done this since it had a status line and took it
+from AF2's evoformer stack.
+
+🔴 **AND AWAITING PER BLOCK INSTEAD COSTS 14%, MEASURED.** The obvious fix is to
+shrink the submission window until the bar is smooth. At 150 residues:
+
+| submission window | 16 | 8 | 4 | 2 | 1 |
+|---|---|---|---|---|---|
+| trunk | **6406 ms** | 6452 | 6740 | 6848 | **7294** |
+
+The non-awaited promise gets the same smoothness for nothing: 6464 ms with it,
+against 6406 without any reporting at all.
+
+🔴 **AND `onBlock` IS STILL AWAITED, BECAUSE THAT IS WHERE THE PAGE PAINTS.** A
+GPU promise resolves as a MICROTASK, which returns control to the microtask
+queue and never to the browser - so a page that only moved a bar there would
+write it and never paint it. `yieldToBrowser` posts a MessageChannel message,
+which is a task and is not clamped to a second in a background tab the way
+`setTimeout` is. See src/runtime/yield.js.
+
+Measured in the page, 150 residues: **140 bar samples, largest jump 0.047**,
+monotonic from 0.01 to 1.00 - against 45 samples and a 0.53 leap before.
+
 🔴 **AND EVERY BAND REPORTS PER UNIT OF ITS OWN WORK, WHICH IS A COUNT AND NOT
 AN IMPRESSION.** `tools/gpu/fold-esmfold2.js` returns `progressEvents`, because
 a bar sampled from the page cannot answer "does the trunk report block by

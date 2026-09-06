@@ -102,6 +102,7 @@ export async function main(device, args = []) {
   // not what they cost a tensor norm but whether the STRUCTURE notices. Written
   // `staged:accumulate`, or one name for both.
   const trunkPrecision = option(args, "trunk-precision", "");
+  const submissionWindow = Number(option(args, "submission-window", "16"));
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
   const sampler = option(args, "sampler", "diffusion-15");
@@ -190,6 +191,7 @@ export async function main(device, args = []) {
       : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
           ...(ligands.length === 0 ? {} : { ligands }) },
     shape: { ...M, loops: (M.loops ?? 3) + 1 },
+    submissionWindow,
     trunk: trunkPrecision === "" ? {} : {
       stagedPrecision: trunkPrecision.split(":")[0],
       accumulatePrecision: trunkPrecision.split(":")[1] ?? trunkPrecision.split(":")[0],
