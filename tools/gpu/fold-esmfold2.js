@@ -258,6 +258,33 @@ export async function main(device, args = []) {
     });
   }
 
+  // 🔴 THE pAE, WHICH THIS CHECKPOINT HAS NO HEAD FOR. Reported as a summary
+  // rather than a matrix - the matrix is tokens^2 and belongs in the archive -
+  // and named for what it is: a predicted aligned error read off the distogram,
+  // fitted against AlphaFold 3's own. See src/esmfold2/aligned-error.js.
+  const pae = result.alignedError;
+  let alignedError;
+  if (pae !== undefined) {
+    const n = result.tokens;
+    const off = [];
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) if (i !== j) off.push(pae[i * n + j]);
+    }
+    off.sort((a, b) => a - b);
+    alignedError = {
+      mean: Number((off.reduce((s2, v) => s2 + v, 0) / off.length).toFixed(3)),
+      median: Number(off[off.length >> 1].toFixed(3)),
+      min: Number(off[0].toFixed(3)),
+      max: Number(off[off.length - 1].toFixed(3)),
+      // 🔴 THE SUMMARY IS THE LEAST USEFUL READING OF IT, and is printed only
+      // so a shell run can see the estimate exists. It orders pairs WITHIN a
+      // fold (0.746) and is nearly constant BETWEEN folds (Spearman 0.117), so
+      // a mean is close to meaningless - see aligned-error.js. The map is what
+      // carries the information.
+      note: "orders pairs within this fold; the mean does not compare across folds",
+    };
+  }
+
   // ---- what came out.
   const alphas = alphaCarbons(result.features);
   const x = result.coordinates;
@@ -674,7 +701,7 @@ export async function main(device, args = []) {
           interface: mean(result.interfaceCertainty, (v) => v >= 0) };
       }),
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
-    alphaCarbons: alphas.length,
+    alphaCarbons: alphas.length, alignedError,
     caSpacing: spacing.length === 0 ? null
       : { mean, min: Math.min(...spacing), max: Math.max(...spacing) },
     phosphodiester: phosphodiester.length === 0 ? null : {

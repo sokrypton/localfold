@@ -2955,6 +2955,45 @@ bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
 honest than letting a fit discover it - and it is why the estimator's worst
 targets are the ones whose PAE is largest.
 
+🔴 **AND A FOLD PRODUCES ONE NOW, NOT ONLY A TOOL.** `foldEsmfold2` returns
+`alignedError`, a tokens^2 matrix. Its three inputs - the distogram's mean,
+spread and effective width in ANGSTROMS - are computed on the DEVICE beside the
+contacts by `createMomentsShader`, riding the same projected chunk so the
+distogram is still projected exactly once; taking them on the host would mean
+reading back `pairs * bins * 4`, **46 MiB at 300 tokens for a quantity three
+numbers wide**. The estimate itself is assembled after the sampler, because half
+its features are distances and those do not exist until there is a structure.
+
+🔴 **AND THE MOMENT BUFFERS NEED COPY_SRC, WHICH THE SCRATCH TENSORS DO NOT.**
+`storage` alone is what every other tensor in that function takes, and a buffer
+that is read back is not one of them: *"[Buffer esmfold2.disto.mean] usage
+(BufferUsage::Storage) doesn't include BufferUsage::CopySrc"* on the first fold.
+
+🔴 **AND IT ORDERS PAIRS INSIDE ONE FOLD AND SAYS ALMOST NOTHING ACROSS FOLDS -
+THE OPPOSITE WAY ROUND FROM THE CERTAINTY.** One point per fold, the mean
+estimate against the mean true PAE over the nine matched targets: **Pearson
+0.340, Spearman 0.117**, with a range of 8.68-9.50 A where the truth's is
+3.04-12.71. It is nearly a constant between folds. Within a fold it orders pairs
+at 0.746.
+
+| | across folds | within one |
+|---|---|---|
+| the distogram certainty | **0.90** | 0.44 median, worst NEGATIVE |
+| **the pAE** | **0.117** | **0.746** |
+
+So the two answer different questions and neither substitutes for the other -
+the pAE for "which parts of THIS fold are placed relative to which", the
+certainty for "is this fold worth looking at". Which is how a real PAE is read
+anyway: nobody compares the mean PAE of two targets, they look at the block
+structure of one.
+
+🔴 **SO THE ANGSTROMS ARE A REGRESSION ONTO ANGSTROMS AND NOT A CALIBRATION.**
+Per-target bias runs **-3.88 to +5.99 A** with a mean of +0.69, because it
+regresses to the global mean: 6MRR reads 8.68 against a true 3.40, and the
+hardest target reads 8.84 against 12.71. **Report the MAP, not the number** -
+`fold-esmfold2.js` prints a summary only so a shell run can see the estimate
+exists, and says so in the field beside it.
+
 🔴 **AND IT IS CARRIED TO EF2-fast NOW, WHICH IS THE POINT.**
 `src/esmfold2/aligned-error.js` is the estimator and
 `tools/gpu/probe-pae-esmfold2.js` collects the features. It is a **pAE** in the

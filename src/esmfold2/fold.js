@@ -39,6 +39,7 @@ import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
 import { encodeLanguagePair } from "./language-pair-webgpu.js";
 import { encodeContactMap, partnerKeys } from "./distogram-webgpu.js";
 import { linear } from "./featuriser-reference.js";
+import { alignedErrorFromDistogram } from "./aligned-error.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
   relativeLayout, relativeRows,
@@ -651,8 +652,14 @@ export async function foldEsmfold2(device, options) {
           bonds: features.tokenBonds,
           molType: features.molType, residueType: features.residueType,
           wantLogits: options.distogramLogits === true,
+          // 🔴 THE pAE NEEDS THE STRUCTURE, SO ONLY ITS INPUTS COME OFF THE
+          // TRUNK HERE. The moments are three floats a pair and are computed on
+          // the device beside the contacts; the estimate itself is assembled
+          // after the sampler, because half its features are distances.
+          wantMoments: options.alignedError !== false,
           retainForFrames: options.frameCertainty === true })));
     const contacts = distogram?.contacts;
+    const distogramMoments = distogram?.moments;
     const certainty = distogram?.certainty;
     // ...the same reading across the interface, -1 per token where there is
     // no other chain. A monomer's is all -1 and means nothing.
@@ -725,9 +732,32 @@ export async function foldEsmfold2(device, options) {
     // after the last frame.
     frames?.release();
 
+    // 🔴 THE pAE IS ASSEMBLED AFTER THE SAMPLER, because half its features are
+    // DISTANCES and those do not exist until there is a structure. The other
+    // half came off the trunk with the contacts. See aligned-error.js for what
+    // it is and what it is not: a predicted aligned error, fitted against
+    // AlphaFold 3's, and a CONTRAST rather than a calibrated angstrom.
+    let alignedError;
+    if (distogramMoments !== undefined) {
+      // ...between the REPRESENTATIVE atoms the distogram is defined on, not
+      // alpha carbons: a distogram scores the pair it was trained on, and
+      // measuring a different pair is a plausible matrix computed from the
+      // wrong geometry.
+      const rep = representativeAtoms(features, tokens);
+      const separations = new Float32Array(tokens * tokens);
+      for (let i = 0; i < tokens; i += 1) {
+        for (let j = 0; j < tokens; j += 1) {
+          const a = rep[i] * 3, b = rep[j] * 3;
+          separations[i * tokens + j] = Math.hypot(
+            x[a] - x[b], x[a + 1] - x[b + 1], x[a + 2] - x[b + 2]);
+        }
+      }
+      alignedError = alignedErrorFromDistogram(distogramMoments, separations, tokens);
+    }
+
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
-      interfaceCertainty, reusable,
+      interfaceCertainty, alignedError, reusable,
       // ...so a caller can tell a fold that ran the trunk from one that did not.
       trunkReused: reuse !== undefined,
       lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },

@@ -257,6 +257,66 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /**
+ * Per pair: the distogram's mean, its spread and its effective width, all in
+ * ANGSTROMS - the three numbers the aligned-error estimate reads.
+ *
+ * 🔴 THREE FLOATS A PAIR, NOT `bins` OF THEM. The moments could be taken on the
+ * host from the logits, and that means reading back `pairs * bins * 4` bytes -
+ * 46 MiB at 300 tokens, for a quantity that is three numbers wide. This pass
+ * exists so the readback is 1 MiB instead, and it is the same reason
+ * `createContactShader` reduces on the device rather than handing the logits
+ * out.
+ *
+ * 🔴 AND THE BIAS IS ADDED HERE TOO. The projection has none; a softmax over
+ * the logits alone is still a distribution, just the wrong one - the same trap
+ * the contact shader documents.
+ *
+ * 🔴 AND THE WIDTH IS `exp(H) * binWidth`, NOT `H`. Entropy in nats is not
+ * comparable across grids: a uniform distribution over 128 bins carries log 2
+ * more than one over 64 for free, so a coefficient fitted against one bin count
+ * would silently mean something else against another. Exponentiating and
+ * scaling by the bin width gives an angstrom, which is a fact about the
+ * molecule rather than about the discretisation.
+ */
+export function createMomentsShader({ pairs, bins }, edges = CONTACT_EDGES) {
+  const width = (edges.maximum - edges.minimum) / bins;
+  return `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read_write> mean: array<f32>;
+@group(0) @binding(3) var<storage, read_write> sigma: array<f32>;
+@group(0) @binding(4) var<storage, read_write> width: array<f32>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let cell = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (cell >= ${pairs}u) { return; }
+  let base = cell * ${bins}u;
+  var largest = -3.0e38;
+  for (var b = 0u; b < ${bins}u; b += 1u) {
+    largest = max(largest, logits[base + b] + bias[b]);
+  }
+  var total = 0.0;
+  for (var b = 0u; b < ${bins}u; b += 1u) {
+    total += exp(logits[base + b] + bias[b] - largest);
+  }
+  var first = 0.0;
+  var second = 0.0;
+  var entropy = 0.0;
+  for (var b = 0u; b < ${bins}u; b += 1u) {
+    let p = exp(logits[base + b] + bias[b] - largest) / max(total, 1.0e-30);
+    let centre = ${edges.minimum.toFixed(6)} + ${width.toFixed(9)} * (f32(b) + 0.5);
+    first += p * centre;
+    second += p * centre * centre;
+    if (p > 1.0e-12) { entropy -= p * log(p); }
+  }
+  mean[cell] = first;
+  sigma[cell] = sqrt(max(0.0, second - first * first));
+  width[cell] = exp(entropy) * ${width.toFixed(9)};
+}`;
+}
+
+/**
  * Per pair: the mass within `radius` of the mode, and where the mode is.
  *
  * Both are needed by the aggregation below - the first is the quantity, the
@@ -493,6 +553,11 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
                                                   molType, residueType,
                                                   chunk = 8192,
                                                   wantLogits = false,
+                                                  // 🔴 THREE FLOATS A PAIR, NOT `bins` OF THEM. See
+                                                  // createMomentsShader: taking the moments on the
+                                                  // host means reading back 46 MiB at 300 tokens for
+                                                  // a quantity three numbers wide.
+                                                  wantMoments = false,
                                                   retainForFrames = false }) {
   const { allocator, cache, submit, device } = context;
   const pairs = tokens * tokens;
@@ -530,11 +595,19 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   const project = {};
   const contact = {};
 
+  // ...the moments, only when a caller wants an aligned error off them. They
+  // ride the same projected chunk as the contact and certainty passes, so the
+  // distogram is still projected exactly once.
+  const moments = {};
   for (const rows of heights) {
     project[rows] = await cache.get(`${key}:project:${rows}`,
       createLinearShader({ rows, inner: channels, outer: bins }, false));
     contact[rows] = await cache.get(`${key}:contact:${rows}`,
       createContactShader({ pairs: rows, bins }));
+    if (wantMoments) {
+      moments[rows] = await cache.get(`${key}:moments:${rows}`,
+        createMomentsShader({ pairs: rows, bins }));
+    }
   }
 
   const held = [];
@@ -589,6 +662,14 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
         || residueType === undefined || residueType.length !== tokens) {
       throw new Error("encodeContactMap needs molType and residueType per token");
     }
+    // ...COPY_SRC because they are read back; `storage` alone is what the
+    // scratch tensors take and it is not enough for a buffer that leaves.
+    const momentUsage = storage | GPUBufferUsage.COPY_SRC;
+    const momentBuffers = !wantMoments ? null : {
+      mean: keep(allocator.allocate("esmfold2.disto.mean", pairs * 4, momentUsage)),
+      sigma: keep(allocator.allocate("esmfold2.disto.sigma", pairs * 4, momentUsage)),
+      width: keep(allocator.allocate("esmfold2.disto.width", pairs * 4, momentUsage)),
+    };
     const binCounts = keep(allocator.upload("esmfold2.disto.contact-bins",
       contactBinCountsByPair(molType, residueType, tokens, bins), storage));
     await submit("esmfold2.distogram", [
@@ -621,6 +702,15 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
           { buffer: binCounts.buffer, byteOffset: start * 4, byteSize: rows * 4 },
           { buffer: contacts.buffer, byteOffset: start * 4, byteSize: rows * 4 }],
          ...elementwise(rows)],
+        ...(!wantMoments ? [] : [["moments", moments[rows],
+         [wholeLogits
+            ? { buffer: logits.buffer, byteOffset: start * bins * 4,
+                byteSize: rows * bins * 4 }
+            : logits, biasBuffer,
+          { buffer: momentBuffers.mean.buffer, byteOffset: start * 4, byteSize: rows * 4 },
+          { buffer: momentBuffers.sigma.buffer, byteOffset: start * 4, byteSize: rows * 4 },
+          { buffer: momentBuffers.width.buffer, byteOffset: start * 4, byteSize: rows * 4 }],
+         ...elementwise(rows)]]),
       ]);
     }
     await submit("esmfold2.certainty", [
@@ -634,11 +724,20 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       Math.max(16, tokens * 4), GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     const readInterface = keep(allocator.allocate("esmfold2.disto.interface-readback",
       Math.max(16, tokens * 4), GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    const readMoments = !wantMoments ? null : ["mean", "sigma", "width"].map((name) =>
+      keep(allocator.allocate(`esmfold2.disto.${name}-readback`, pairs * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)));
     const encoder = device.createCommandEncoder({ label: "esmfold2.disto.readback" });
     encoder.copyBufferToBuffer(contacts.buffer, 0, readback.buffer, 0, pairs * 4);
     encoder.copyBufferToBuffer(certainty.buffer, 0, readCertainty.buffer, 0, tokens * 4);
     encoder.copyBufferToBuffer(interfaceCertainty.buffer, 0, readInterface.buffer, 0,
                                tokens * 4);
+    if (wantMoments) {
+      for (const [at, name] of ["mean", "sigma", "width"].entries()) {
+        encoder.copyBufferToBuffer(momentBuffers[name].buffer, 0,
+                                   readMoments[at].buffer, 0, pairs * 4);
+      }
+    }
     device.queue.submit([encoder.finish()]);
     await readback.buffer.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(readback.buffer.getMappedRange().slice(0));
@@ -652,6 +751,16 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const perTokenInterface = new Float32Array(
       readInterface.buffer.getMappedRange().slice(0));
     readInterface.buffer.unmap();
+    let moment;
+    if (wantMoments) {
+      const read = [];
+      for (const buffer of readMoments) {
+        await buffer.buffer.mapAsync(GPUMapMode.READ);
+        read.push(new Float32Array(buffer.buffer.getMappedRange().slice(0)));
+        buffer.buffer.unmap();
+      }
+      moment = { mean: read[0], sigma: read[1], effectiveWidth: read[2] };
+    }
     // 🔴 THE RETAINED BUFFERS LEAVE `held` NOW, NOT WHEN THEY ARE RELEASED. The
     // first version handed the scorer a closure that spliced them out of the
     // release list - and that closure runs when the CALLER is finished, long
@@ -672,7 +781,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       release: () => { for (const allocation of retained) allocation.release(); },
     }) : undefined;
     if (!wantLogits) {
-      return { contacts: out, certainty: perToken, interface: perTokenInterface, frames };
+      return { contacts: out, certainty: perToken, interface: perTokenInterface,
+               frames, moments: moment };
     }
     // 🔴 THE BIAS IS NOT IN THE BUFFER, because the projection has none and the
     // contact pass adds it as it reads. A caller taking the logits away has to
@@ -687,7 +797,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const values = new Float32Array(readLogits.buffer.getMappedRange().slice(0));
     readLogits.buffer.unmap();
     return { contacts: out, certainty: perToken, interface: perTokenInterface,
-             frames, logits: values, bias };
+             frames, moments: moment, logits: values, bias };
   } finally {
     for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();
   }

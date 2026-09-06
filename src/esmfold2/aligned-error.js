@@ -50,6 +50,28 @@
  * not as a calibrated PAE in angstroms.
  */
 
+/**
+ * 🔴 IT ORDERS PAIRS INSIDE ONE FOLD AND SAYS ALMOST NOTHING ACROSS FOLDS, AND
+ * THAT IS THE OPPOSITE WAY ROUND FROM THE CERTAINTY. Measured over the nine
+ * matched targets, one point per fold - the mean estimate against the mean true
+ * PAE - it reads Pearson **0.340** and Spearman **0.117**, and its range is
+ * 8.68 to 9.50 A where the truth's is 3.04 to 12.71. It is nearly a constant
+ * between folds. Within a fold it orders pairs at 0.746.
+ *
+ * The certainty in distogram-webgpu.js is the exact complement: 0.90 across
+ * folds and a median 0.44 within one, which is why its per-residue colour was
+ * measured and not shipped. **So the two answer different questions and neither
+ * substitutes for the other** - the pAE for "which parts of THIS fold are
+ * placed relative to which", the certainty for "is this fold worth looking at".
+ * That is also how a real PAE is read: nobody compares the mean PAE of two
+ * different targets, they look at the block structure of one.
+ *
+ * 🔴 SO THE ANGSTROMS ARE A REGRESSION ONTO ANGSTROMS AND NOT A CALIBRATION.
+ * Per-target bias runs -3.88 to +5.99 A with a mean of +0.69: it regresses to
+ * the global mean, so an easy target reads far too high and a hard one too low.
+ * Report the MAP, not the number.
+ */
+
 /** Bin centres in ANGSTROMS. See the note on `CONTACT_EDGES`. */
 function binCentres(bins, edges) {
   const width = (edges.maximum - edges.minimum) / bins;
