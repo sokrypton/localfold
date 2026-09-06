@@ -284,6 +284,15 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
     summary.chain_pair_max_contact = chainPairMaxContact(
       confidence.contactProbs, tokenChainIds, tokenResIds, chains);
   }
+  // ...and the per-chain certainty, for a model that has no pTM to report. The
+  // two are kept apart for AF3's own reason: a chain can be folded well and
+  // docked badly, and one mean over both says neither.
+  if (confidence.chainCertainty !== undefined) {
+    summary.chain_certainty = confidence.chainCertainty;
+  }
+  if (confidence.chainInterfaceCertainty !== undefined && chains.length > 1) {
+    summary.chain_interface_certainty = confidence.chainInterfaceCertainty;
+  }
   const chainPtm = perChain(confidence.chainPtm);
   const chainIptm = perChain(confidence.chainIptm);
   if (chainPtm !== undefined) summary.chain_ptm = chainPtm;

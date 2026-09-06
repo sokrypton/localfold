@@ -580,6 +580,9 @@ export async function foldEsmfold2(device, options) {
           retainForFrames: options.frameCertainty === true })));
     const contacts = distogram?.contacts;
     const certainty = distogram?.certainty;
+    // ...the same reading across the interface, -1 per token where there is
+    // no other chain. A monomer's is all -1 and means nothing.
+    const interfaceCertainty = distogram?.interface;
     const frames = distogram?.frames;
     // 🔴 THE CERTAINTY GOES OUT WITH THE CONTACTS, BEFORE THE SAMPLER RUNS.
     // Both come off the trunk's distogram, so a caller colouring its live
@@ -650,6 +653,7 @@ export async function foldEsmfold2(device, options) {
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,
+      interfaceCertainty,
       lmMask: { fraction: maskFraction, masked: maskedTokens, of: lm.ids.length },
       distogram: options.distogramLogits === true ? distogram : undefined,
       steps: levels.length, scheduleLength: schedule.length, settings,

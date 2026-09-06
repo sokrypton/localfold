@@ -2197,6 +2197,53 @@ downloaded PDB carries a `REMARK` naming the quantity and the missing head, and
 the word pLDDT appears nowhere. With no certainty at all it falls back to chain
 colours rather than painting a zero B-factor as no confidence.
 
+🔴 **AND THE CERTAINTY IS WITHIN THE CHAIN, WITH THE INTERFACE BESIDE IT RATHER
+THAN INSIDE IT.** The rule excludes only same-chain sequence neighbours, so a
+residue on a complex used to be judged partly on pairs across the interface -
+and a chain can be folded well and docked badly, which is why AF3 keeps pTM and
+ipTM apart. Measured on a two-chain fold, recomputed on the host over the same
+distogram three ways:
+
+| chain | mixed | within | across |
+|---|---|---|---|
+| A (35 tokens) | 0.451 | 0.477 | 0.343 |
+| B (68 tokens) | **0.630** | **0.712** | 0.370 |
+
+So the number a reader saw was pulled down by a question they had not asked.
+`certainty` is the within-chain mean now and `interface_certainty` the
+cross-chain one, -1 where a token has no other chain - which on a monomer is
+every token, and a mean that included them would report a good fold as a bad
+one. **A monomer's certainty vector is unchanged to every digit**, since it has
+no cross-chain pairs to have been mixing in.
+
+🔴 **AND IT SHOWS UP WITH A LIGAND, WHICH IS WHERE IT WAS FIRST REPORTED.**
+Ubiquitin with ATP: the protein reads **0.9215** within its own chain against
+0.8989 when the ligand's pairs were averaged in. The protein is no longer
+marked down for the model's uncertainty about where the ligand goes.
+
+🔴 **AND A LIGAND'S OWN COLOUR COMES FROM THE FALLBACK, NOT FROM THE RULE.** Its
+atoms share one residue number, so the separation rule drops its whole
+self-block and it has NO within-chain partner at all - `count` is zero and it
+lands on the unfiltered `loose` branch, which is a mean over every protein
+partner at any distance, the 12 A cutoff included. ATP reads 0.3562 and every
+digit of that is the fallback. Two things make it the weakest number on the
+page: it averages over pairs the model places forty angstroms apart, which is
+what the cutoff exists to exclude, and this head predicts **0** protein-ligand
+contacts against the structure's 64 while running 2.4 A long. **Open**, and the
+coherent fix is to score a token on the partners it can HAVE - within its chain
+where it has any, across chains otherwise - which is one rule rather than a
+fallback.
+
+🔴 **AND `chain_certainty` AND `chain_interface_certainty` GO IN THE ARCHIVE**,
+beside `chain_pair_max_contact`, which is AF3's `chain_ptm`/`chain_iptm` shape
+for a model that has neither.
+
+🔴 **AND "(not pLDDT)" IS GONE FROM THE STATUS LINE.** It denied something the
+line never claimed - it says `certainty`, not pLDDT - and a parenthesis
+refusing a reading nobody offered reads as a disclaimer rather than a result.
+The caveat still lives where somebody looking for it will find it: the model
+row's tooltip, the PDB's REMARK and the archive's README.
+
 🔴 **AND "NO PARTNER INSIDE THE CUTOFF" IS NO DATA, NOT ZERO CONFIDENCE.** A
 terminal residue the model places away from everything has an empty filtered
 mean; writing 0 there paints it as the least reliable residue in the structure,

@@ -464,9 +464,97 @@ export async function main(device, args = []) {
       }));
   }
 
+  // 🔴 THE CERTAINTY MIXES INTRA- AND INTER-CHAIN PARTNERS, AND NOTHING HAS
+  // EVER CHECKED WHETHER IT SHOULD. The shader excludes only same-chain
+  // SEQUENCE neighbours, so a residue on a complex is judged partly on pairs
+  // across the interface - and every target in the 11,400-arm sweep that chose
+  // its constants was a single protein chain. This recomputes it on the host
+  // three ways over the same distogram, which is the comparison that says
+  // whether the mixing changes the answer.
+  let certaintyByChain;
+  if (contactSweep && result.distogram !== undefined) {
+    const { logits, bias } = result.distogram;
+    const bins = bias.length;
+    const width = (CONTACT_EDGES.maximum - CONTACT_EDGES.minimum) / bins;
+    const centre = (bin) => CONTACT_EDGES.minimum + (bin + 0.5) * width;
+    const RADIUS = 2, SEPARATION = 3, CUTOFF = 12;
+    const n = result.tokens;
+    const probability = new Float64Array(bins);
+    // ...one pass over the pairs, three accumulators per token.
+    const arms = ["all", "intra", "inter"];
+    const sums = Object.fromEntries(arms.map((a) => [a, new Float64Array(n)]));
+    const counts = Object.fromEntries(arms.map((a) => [a, new Float64Array(n)]));
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) {
+        if (i === j) continue;
+        const sameChain = asymId[i] === asymId[j];
+        if (sameChain && Math.abs(residueIndex[i] - residueIndex[j]) <= SEPARATION) continue;
+        const base = (i * n + j) * bins;
+        let peak = -Infinity;
+        for (let bin = 0; bin < bins; bin += 1) {
+          const value = logits[base + bin] + bias[bin];
+          probability[bin] = value;
+          if (value > peak) peak = value;
+        }
+        let total = 0;
+        for (let bin = 0; bin < bins; bin += 1) {
+          probability[bin] = Math.exp(probability[bin] - peak);
+          total += probability[bin];
+        }
+        let mode = 0, best = -1;
+        for (let bin = 0; bin < bins; bin += 1) {
+          probability[bin] /= total;
+          if (probability[bin] > best) { best = probability[bin]; mode = bin; }
+        }
+        if (centre(mode) >= CUTOFF) continue;
+        let mass = 0;
+        for (let bin = 0; bin < bins; bin += 1) {
+          if (Math.abs(centre(bin) - centre(mode)) <= RADIUS) mass += probability[bin];
+        }
+        for (const arm of arms) {
+          if (arm === "intra" && !sameChain) continue;
+          if (arm === "inter" && sameChain) continue;
+          sums[arm][i] += mass;
+          counts[arm][i] += 1;
+        }
+      }
+    }
+    const chains = [...new Set(asymId)].sort((a, b) => a - b);
+    certaintyByChain = chains.map((chain) => {
+      const row = { chain, tokens: 0 };
+      for (const arm of arms) {
+        let sum = 0, seen = 0;
+        for (let i = 0; i < n; i += 1) {
+          if (asymId[i] !== chain || counts[arm][i] === 0) continue;
+          sum += sums[arm][i] / counts[arm][i];
+          seen += 1;
+        }
+        row[arm] = seen === 0 ? null : Number((sum / seen).toFixed(4));
+        if (arm === "all") row.tokens = seen;
+      }
+      return row;
+    });
+  }
+
   return {
-    sequence, sampler, seed, trunkPrecision, contactSweep: sweep,
+    sequence, sampler, seed, trunkPrecision, contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,
+    // ...what the shipped shader now separates, so the host arm above and the
+    // kernel can be compared rather than trusted.
+    shippedByChain: result.interfaceCertainty === undefined ? undefined
+      : [...new Set(asymId)].sort((a, b) => a - b).map((chain) => {
+        const mean = (values, keep) => {
+          let sum = 0, seen = 0;
+          for (let t = 0; t < result.tokens; t += 1) {
+            if (asymId[t] !== chain || !keep(values[t])) continue;
+            sum += values[t]; seen += 1;
+          }
+          return seen === 0 ? null : Number((sum / seen).toFixed(4));
+        };
+        return { chain,
+          within: mean(result.certainty, (v) => v >= 0),
+          across: mean(result.interfaceCertainty, (v) => v >= 0) };
+      }),
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,
     caSpacing: spacing.length === 0 ? null

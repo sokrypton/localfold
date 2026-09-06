@@ -256,9 +256,14 @@ export function createCertaintyShader({ tokens, separation, modeCutoffBin }) {
 // is the asym id and y the residue number; see the comment on partnerKeys.
 @group(0) @binding(2) var<storage, read> partner: array<vec2<i32>>;
 @group(0) @binding(3) var<storage, read_write> certainty: array<f32>;
+// ...and the interface reading beside it, which is a different question and is
+// -1 where the token has no cross-chain partner at all.
+@group(0) @binding(4) var<storage, read_write> interface_certainty: array<f32>;
 
 var<workgroup> partial_sum: array<f32, ${LANES}>;
 var<workgroup> partial_count: array<f32, ${LANES}>;
+var<workgroup> partial_cross: array<f32, ${LANES}>;
+var<workgroup> partial_cross_count: array<f32, ${LANES}>;
 var<workgroup> partial_loose: array<f32, ${LANES}>;
 var<workgroup> partial_loose_count: array<f32, ${LANES}>;
 
@@ -269,6 +274,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (token >= ${tokens}u) { return; }
   var total = 0.0;
   var count = 0.0;
+  var cross = 0.0;
+  var crossCount = 0.0;
   var loose = 0.0;
   var looseCount = 0.0;
   for (var other = local.x; other < ${tokens}u; other += ${LANES}u) {
@@ -279,6 +286,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let here = partner[token];
     let there = partner[other];
     if (here.x == there.x && abs(here.y - there.y) <= ${separation}) { continue; }
+    let same_chain = here.x == there.x;
     let cell = token * ${tokens}u + other;
     // 🔴 THE UNFILTERED MEAN IS KEPT AS A FALLBACK, because "no partner inside
     // the cutoff" is NO DATA and zero is a colour. A terminal residue the model
@@ -288,11 +296,23 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     loose += mass[cell];
     looseCount += 1.0;
     if (mode[cell] > ${modeCutoffBin}.0) { continue; }
-    total += mass[cell];
-    count += 1.0;
+    // 🔴 THE TWO ARE KEPT APART, WHICH IS AF3's OWN DISTINCTION. A chain can be
+    // folded well and docked badly, and one mean over both says neither: on a
+    // two-chain fold, chain B read 0.712 within itself, 0.370 across the
+    // interface, and 0.630 mixed - so the number a reader saw was pulled down
+    // by an interface question they had not asked.
+    if (same_chain) {
+      total += mass[cell];
+      count += 1.0;
+    } else {
+      cross += mass[cell];
+      crossCount += 1.0;
+    }
   }
   partial_sum[local.x] = total;
   partial_count[local.x] = count;
+  partial_cross[local.x] = cross;
+  partial_cross_count[local.x] = crossCount;
   partial_loose[local.x] = loose;
   partial_loose_count[local.x] = looseCount;
   workgroupBarrier();
@@ -300,6 +320,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     if (local.x < stride) {
       partial_sum[local.x] += partial_sum[local.x + stride];
       partial_count[local.x] += partial_count[local.x + stride];
+      partial_cross[local.x] += partial_cross[local.x + stride];
+      partial_cross_count[local.x] += partial_cross_count[local.x + stride];
       partial_loose[local.x] += partial_loose[local.x + stride];
       partial_loose_count[local.x] += partial_loose_count[local.x + stride];
     }
@@ -308,6 +330,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (local.x == 0u) {
     // ...the cutoff where there is anything inside it, every pair where there
     // is not, and only a chain shorter than the separation gets nothing.
+    interface_certainty[token] = select(-1.0,
+      partial_cross[0] / max(partial_cross_count[0], 1.0), partial_cross_count[0] > 0.0);
+    // 🔴 ONE RULE: WITHIN THE CHAIN. "How well is this residue placed" is a
+    // question about its own chain, and averaging the interface into it answers
+    // neither - measured on a two-chain fold, chain B reads 0.712 within
+    // itself, 0.370 across, and 0.630 mixed, so the number a reader saw was
+    // pulled down by a question they had not asked. The interface is reported
+    // beside it rather than folded into it, which is AF3's own pTM/ipTM split.
     if (partial_count[0] > 0.0) {
       certainty[token] = partial_sum[0] / partial_count[0];
     } else if (partial_loose_count[0] > 0.0) {
@@ -458,6 +488,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const modes = keep(allocator.allocate("esmfold2.disto.mode", pairs * 4, storage));
     const certainty = keep(allocator.allocate("esmfold2.disto.certainty",
       Math.max(16, tokens * 4), storage | GPUBufferUsage.COPY_SRC));
+    const interfaceCertainty = keep(allocator.allocate("esmfold2.disto.interface",
+      Math.max(16, tokens * 4), storage | GPUBufferUsage.COPY_SRC));
     // 🔴 THE RULE IS REQUIRED, NOT DEFAULTED. A caller with no chain ids would
     // silently get the token-index rule back, which is the bug this replaced.
     if (partners === undefined || partners.length !== tokens * 2) {
@@ -504,16 +536,21 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       ]);
     }
     await submit("esmfold2.certainty", [
-      ["certainty", certaintyPass, [mass, modes, partnerBuffer, certainty],
+      ["certainty", certaintyPass,
+       [mass, modes, partnerBuffer, certainty, interfaceCertainty],
        Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
     ]);
     const readback = keep(allocator.allocate("esmfold2.disto.readback", pairs * 4,
       GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     const readCertainty = keep(allocator.allocate("esmfold2.disto.certainty-readback",
       Math.max(16, tokens * 4), GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+    const readInterface = keep(allocator.allocate("esmfold2.disto.interface-readback",
+      Math.max(16, tokens * 4), GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
     const encoder = device.createCommandEncoder({ label: "esmfold2.disto.readback" });
     encoder.copyBufferToBuffer(contacts.buffer, 0, readback.buffer, 0, pairs * 4);
     encoder.copyBufferToBuffer(certainty.buffer, 0, readCertainty.buffer, 0, tokens * 4);
+    encoder.copyBufferToBuffer(interfaceCertainty.buffer, 0, readInterface.buffer, 0,
+                               tokens * 4);
     device.queue.submit([encoder.finish()]);
     await readback.buffer.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(readback.buffer.getMappedRange().slice(0));
@@ -521,6 +558,12 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     await readCertainty.buffer.mapAsync(GPUMapMode.READ);
     const perToken = new Float32Array(readCertainty.buffer.getMappedRange().slice(0));
     readCertainty.buffer.unmap();
+    await readInterface.buffer.mapAsync(GPUMapMode.READ);
+    // ...-1 where a token has no cross-chain partner, which a monomer's every
+    // token does. A caller reads that as "not applicable", not as a low score.
+    const perTokenInterface = new Float32Array(
+      readInterface.buffer.getMappedRange().slice(0));
+    readInterface.buffer.unmap();
     // 🔴 THE RETAINED BUFFERS LEAVE `held` NOW, NOT WHEN THEY ARE RELEASED. The
     // first version handed the scorer a closure that spliced them out of the
     // release list - and that closure runs when the CALLER is finished, long
@@ -528,7 +571,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     // "[Buffer esmfold2.disto.certainty-readback] is destroyed" on the first
     // frame, which names the buffer and not the lifetime.
     const retained = retainForFrames
-      ? [logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer] : [];
+      ? [logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
+         interfaceCertainty] : [];
     for (const allocation of retained) {
       const at = held.indexOf(allocation);
       if (at >= 0) held.splice(at, 1);
@@ -536,9 +580,12 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const frames = retainForFrames ? await framesScorer({
       device, allocator, cache, submit, key, tokens, bins, span, modeCutoffBin,
       logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
+      interfaceCertainty,
       release: () => { for (const allocation of retained) allocation.release(); },
     }) : undefined;
-    if (!wantLogits) return { contacts: out, certainty: perToken, frames };
+    if (!wantLogits) {
+      return { contacts: out, certainty: perToken, interface: perTokenInterface, frames };
+    }
     // 🔴 THE BIAS IS NOT IN THE BUFFER, because the projection has none and the
     // contact pass adds it as it reads. A caller taking the logits away has to
     // be handed the bias too, or it will softmax a distribution missing 128
@@ -551,7 +598,8 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     await readLogits.buffer.mapAsync(GPUMapMode.READ);
     const values = new Float32Array(readLogits.buffer.getMappedRange().slice(0));
     readLogits.buffer.unmap();
-    return { contacts: out, certainty: perToken, frames, logits: values, bias };
+    return { contacts: out, certainty: perToken, interface: perTokenInterface,
+             frames, logits: values, bias };
   } finally {
     for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();
   }
@@ -570,7 +618,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
 async function framesScorer(context) {
   const { device, allocator, cache, submit, key, tokens, bins, span } = context;
   const { modeCutoffBin, logits, biasBuffer, modes, mass, certainty, readCertainty,
-          partnerBuffer } = context;
+          partnerBuffer, interfaceCertainty } = context;
   const storage = GPUBufferUsage.STORAGE;
   const observed = await cache.get(`${key}:observed:${tokens}`,
     createObservedMassShader({ tokens, bins }, span));
@@ -589,7 +637,8 @@ async function framesScorer(context) {
       await submit("esmfold2.certainty.frame", [
         ["observed", observed, [logits, biasBuffer, positions, mass],
          ...elementwise(tokens * tokens)],
-        ["aggregate", aggregate, [mass, modes, partnerBuffer, certainty],
+        ["aggregate", aggregate,
+         [mass, modes, partnerBuffer, certainty, interfaceCertainty],
          Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
       ]);
       const encoder = device.createCommandEncoder({ label: "esmfold2.certainty.frame" });

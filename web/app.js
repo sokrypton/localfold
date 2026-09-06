@@ -1293,6 +1293,27 @@ function refreshHeatmap() {
  * appended has no distogram section, and losing the contact map is the right
  * price for that - losing the fold is not.
  */
+/**
+ * One mean per chain, skipping the tokens a reading does not apply to.
+ *
+ * 🔴 -1 IS "NOT APPLICABLE", NOT A LOW SCORE. The interface reading is -1 for
+ * every token with no cross-chain partner, which on a monomer is all of them -
+ * so a mean that included them would report a confident fold as a bad one.
+ */
+function meanByChain(asymId, values) {
+  if (values === undefined) return undefined;
+  const chains = [...new Set(asymId)].sort((a, b) => a - b);
+  return chains.map((chain) => {
+    let sum = 0, seen = 0;
+    for (let token = 0; token < asymId.length; token += 1) {
+      if (asymId[token] !== chain || !(values[token] >= 0)) continue;
+      sum += values[token];
+      seen += 1;
+    }
+    return seen === 0 ? null : Math.round((sum / seen) * 100) / 100;
+  });
+}
+
 function attachContactMap(frame, recycle, weights, length) {
   if (weights?.distogram === undefined || recycle.pair === undefined) return;
   setTimeout(() => {
@@ -2382,6 +2403,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // map is its ONLY score wrote an archive without one while the panel on
     // screen showed it.
     contactSource: { contactProbs: result.contacts },
+    // 🔴 WITHIN EACH CHAIN AND ACROSS IT, KEPT APART. The certainty a residue
+    // wears is about its own chain; the interface is a different question and
+    // averaging them gives a number that answers neither. Measured on a
+    // two-chain fold: 0.712 within, 0.370 across, 0.630 mixed.
+    chainCertainty: meanByChain(result.features.asymId, certainty),
+    chainInterfaceCertainty: meanByChain(result.features.asymId,
+                                         result.interfaceCertainty),
     model: modelName,
     // 🔴 THE TOKEN LAYOUT, because a ligand is one token per heavy atom and the
     // archive cannot infer that from the chain lengths - it refuses to guess
@@ -2417,13 +2445,14 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   const mean = certainty === undefined ? undefined
     : [...certainty].reduce((total, value) => total + value, 0) / certainty.length;
-  // 🔴 SHORT, BUT "(not pLDDT)" STAYS. The line was a sentence long and read as
-  // a disclaimer rather than a result; what it cannot lose is the three words
-  // that stop a number in a pLDDT palette being read as a pLDDT. The rest of
-  // the explanation lives in the PDB's REMARK and in the model row's tooltip,
-  // where somebody who wants it can find it.
+  // 🔴 THE WORD "certainty" IS THE DISCLAIMER NOW. "(not pLDDT)" was here to
+  // stop a number under a pLDDT palette being read as one - but the line never
+  // says pLDDT, the model row's tooltip says the model reports no confidence,
+  // the PDB carries a REMARK naming the quantity, and the archive's README
+  // spells it out. A parenthesis denying something nothing claimed reads as a
+  // disclaimer rather than a result.
   status(`${modelName} · ${result.tokens} res · ${result.steps} steps · ${seconds}s`
-    + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)} (not pLDDT)`));
+    + (mean === undefined ? "" : ` · certainty ${mean.toFixed(2)}`));
   progress(null);
 }
 
@@ -3197,6 +3226,9 @@ element("download-all").addEventListener("click", async () => {
         tokens: pred.tokens,
         confidence: {
           ...pred.confidence,
+          // ...a model with no confidence head still has these two.
+          chainCertainty: pred.chainCertainty,
+          chainInterfaceCertainty: pred.chainInterfaceCertainty,
           // 🔴 RESOLVED HERE, NOT WHEN THE FOLD FINISHED. AlphaFold 2 computes
           // its contact map in a setTimeout - the distogram head costs 131 ms
           // at 128 residues and is deliberately off the fold's critical path -
