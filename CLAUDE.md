@@ -1387,15 +1387,25 @@ the featuriser, the inputs embedder, 24 trunk blocks four times over, the
 conditioning, the token transformer, the atom decoder and the sampler.
 Ubiquitin's first 40 residues, against the CPU fold that preceded it:
 
-| | CPU, 6.5 min | GPU, 4.8 s |
+| | CPU, 6.5 min | GPU, 3.3 s |
 |---|---|---|
 | CA-CA spacing | 3.809 A | 3.806 A (3.781-3.838) |
-| RMSD to ESMFold2 | 0.598 A | 1.072 A |
+| RMSD to ESMFold2 | 0.598 A | 1.048 A |
 
 The GPU arm additionally runs the language model at THREE BITS where the CPU one
-took its pair term from the dump, so 1.07 A includes the quantisation. Whole
-ubiquitin, 76 residues, is 6.6 s at 578 MiB. Time goes: 3.7 s language model,
-0.6 s trunk, 0.3 s conditioning, **34 ms a sampler step**.
+took its pair term from the dump, so 1.05 A includes the quantisation.
+
+| length | time | peak | where it goes |
+|---|---|---|---|
+| 40 | 3.3 s | 521 MiB | the language model |
+| 76 (ubiquitin) | 4.6 s | 578 MiB | |
+| 150 | 9.7 s | 677 MiB | trunk 6.5 s, LM 1.9 s, sampler 0.8 s |
+| 300 | 32.3 s | 992 MiB | **trunk 85%** |
+
+🔴 **SO THE TRUNK IS THE MODEL AT ANY LENGTH WORTH FOLDING, AND THE LANGUAGE
+MODEL IS NOT.** ESM-C 600M is 1.9 s at 150 residues and does not grow with n^2;
+the trunk is 96 block evaluations at 256 channels where an AF3 trunk runs 48 at
+128. Whatever "is this worth shipping" turns on, it is that number.
 
 🔴 **THE ONE KERNEL WITH NO AF3 ANALOGUE IS THE SLIDING-WINDOW ATOM ATTENTION,
 AND THE REASON IS THE POSITIONAL SIGNAL RATHER THAN THE SHAPE.** AF3's atom
@@ -1438,6 +1448,85 @@ tokens is 640 MiB of scratch for arithmetic that is purely row-wise. Eight
 thousand rows at a time costs nothing measurable and bounds it at 132 MiB. The
 language-model shim and the distogram head are chunked the same way and for the
 same reason.
+
+🔴 **THE LANGUAGE MODEL WAS 26% HOST ARITHMETIC, AND PROFILING SAID SO WHERE
+GUESSING WOULD NOT HAVE.** At 150 residues the fold spent 3.5 s in ESM-C and
+`bench-esmc-tower.js` says the tower's COMPUTE at that length is 0.66 s. The
+rest was the host, in two measurable places: **1121 ms** decoding int3 across 36
+blocks and **723 ms** narrowing float32 to float16. Both are fixed and neither
+needed a kernel:
+
+* **The loop decoded between submits.** `await blockWeights(layer)` ran after
+  the previous block's `onSubmittedWorkDone`, so host and GPU work strictly
+  alternated. Asking for block N+1 BEFORE awaiting block N's submit puts the
+  decode inside the window the device is busy in. One block ahead, not all of
+  them - the point of streaming is that 2190 MiB of float32 never exists at
+  once.
+* **`readTensorAsFloat16` writes half precision as the codes are unpacked**, so
+  there is one pass instead of two and no 2.3 GB of intermediate. It is not the
+  same operation - float64 to float32 to float16 rounds twice - so it was
+  measured: **0 of 14,894,208 elements differ**, and the tower's checker reports
+  2.1473020359613994e-06 before and after, to every digit.
+
+3476 ms to **2116**, and 1903 once the trunk stopped competing for the machine.
+
+🔴 **AND AN ALREADY-NARROW ARRAY MUST NOT BE NARROWED AGAIN.**
+`float32ToFloat16Array` returns a Uint16Array of BITS, so a second pass would
+read the encoding as numbers. The tower's `narrow` passes it through and refuses
+it outright if it was compiled for float32 weights; `scaled` refuses it too,
+because dividing a Uint16Array elementwise divides the bits. No checkpoint here
+scales its residual, which is exactly why that would have gone unnoticed.
+
+🔴 **AND `BYTES` IN dtype.js AND `DTYPE_BYTES` IN build_site.py EACH KNEW ABOUT
+ONE PACKED WIDTH, AND IT WAS int5.** Neither entry was read for anything but a
+presence check, and the ESM-C bundle ships int3 - so a correct manifest failed
+with "unsupported tensor dtype int3" from a reader that decodes int1 through
+int7, and the site build told a reader to regenerate a file that would have come
+out identical. Both derive the width from the name now.
+
+🔴 **THE TRUNK'S TWO f16 KNOBS ARE BOTH ON, AND THE SECOND WAS PRICED AGAINST
+THE SAMPLER RATHER THAN AGAINST A TENSOR NORM.** The accumulator carries 96% of
+the error, which for a long time was the reason to leave it alone. What settled
+it was folding the same 150-residue sequence twice at the same seed, changing
+only this, and superposing:
+
+| what changed | how far the structure moved |
+|---|---|
+| the SAMPLER'S SEED, nothing else | **6.32 A** |
+| f32:f32 -> f16:f32 | 0.008-0.009 |
+| f32:f32 -> f16:f16 | **0.034-0.041** |
+
+0.04 A against a 6.3 A spread is a factor of 160: below the resolution of the
+thing being predicted. Contact precision and recall are identical across all
+three arms to three decimals.
+
+🔴 **AND THE OLD DEFAULT WAS A LOSS AT 300 TOKENS.** Interleaved in one process,
+which is the only instrument this machine's drift does not defeat:
+
+| staged : accumulate | relRMS | 150 tokens | 300 |
+|---|---|---|---|
+| f32 : f32 | 1.10e-6 | 1.000x | 1.000 |
+| f16 : f32 (the old default) | 5.46e-4 | 1.074 | **0.951** |
+| **f16 : f16** | **2.68e-3** | **1.279** | **1.195** |
+
+`f16:f32` measured 1.306x at 300 tokens BEFORE this session's transition-tiling
+fix and 0.951 after: the staged tile is half the size it was, so narrowing what
+is no longer the bottleneck costs the `f32()` at each read and buys nothing. **A
+precision trade priced before a tiling change is not a trade priced after it** -
+the second time that is true in this file.
+
+🔴 **AND THE CHECKER STILL SEPARATES ALL THREE ARMS, WHICH IS THE OTHER HALF OF
+TAKING IT.** Each is held to the bound its own arithmetic implies - 2e-4, 1e-3,
+4e-3 - rather than one loose bound covering them, and the bound is chosen from
+what the stack REPORTS having run rather than from what was asked for: the
+`default` arm passes no options on purpose, so naming the shipped precisions in
+the checker would make it agree with itself the moment they moved.
+
+🔴 **AND AF3 IS UNMOVED BY EVERYTHING SHARED.** `terminalAtoms` defaults to the
+AF3 rule, the dtype guard is a presence check, and the tower's prefetch is
+ESM-C's alone. `tools/gpu/fold.js` on a 40-mer: pLDDT 77.36664729240613 and pTM
+0.55038830675185 with the original `featurise.js` and `dtype.js` and with these,
+to every digit.
 
 🔴 **THE bf16 ARM IS MORE ACCURATE THAN THE f32 ONE, WHICH IS NOT WHAT A
 PRECISION AXIS USUALLY MEANS.** `SWA3DRoPEAttention.forward` downcasts q, k and
