@@ -101,6 +101,48 @@ def pack(codes, bits=BITS):
     return np.packbits(stream, axis=1, bitorder="little").astype(np.uint8)
 
 
+# 🔴 A SHARD COUNT IS A MULTIPLE OF THE CONNECTION COUNT, AND THE SIZES ARE
+# BALANCED. Measured against Hugging Face at eight connections, longest first:
+# `af3-int5`'s EIGHT shards spent 4.5-5.3 s of a 9 s download with a connection
+# idle, because eight shards on eight connections is one shard each - the first
+# to finish has nothing else to do and the load ends when the slowest single
+# shard does. `esmc-600m-int3`'s fifty-four spent 0.6-1.7 s, at the same
+# throughput and 1.8 s of request overhead against 0.27 (a shard request costs a
+# measured 271 ms, the 307 to cdn.hf.co included).
+#
+# So the tail comes from IMBALANCE, not from count: n shards of equal size on n
+# connections finish together and leave no tail at all. What costs is a ragged
+# last round. This picks a multiple of CONNECTIONS near a 16 MiB target and
+# packs longest-first into the emptiest bin, which is the standard makespan
+# heuristic and the same reasoning HttpTensorStore.prefetch already applies to
+# the ORDER it starts them in.
+CONNECTIONS = 8
+SHARD_TARGET = 16 * 1024 * 1024
+
+
+def shard_count(total_bytes, connections=CONNECTIONS, target=SHARD_TARGET):
+    """How many files to write, as a multiple of `connections`."""
+    rounds = max(1, round(total_bytes / target / connections))
+    return min(64, connections * rounds)
+
+
+def pack_shards(payloads, count):
+    """Assign each (index, nbytes) to a bin, longest first into the emptiest.
+
+    🔴 A TENSOR IS INDIVISIBLE, so a bundle with one very large tensor cannot be
+    balanced better than that tensor - AF3's stacked single-transition weights
+    are 40.5 MiB against a 7.9 MiB median. Greedy longest-first is what there is;
+    it is optimal to within 4/3 of the best possible makespan.
+    """
+    bins = [[] for _ in range(count)]
+    loads = [0] * count
+    for index, nbytes in sorted(payloads, key=lambda p: -p[1]):
+        at = loads.index(min(loads))
+        bins[at].append(index)
+        loads[at] += nbytes
+    return [b for b in bins if b], loads
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="model-af3-full-f32")
@@ -138,39 +180,33 @@ def main():
     for record in tensors.values():
         shards.setdefault(record["file"], []).append(record)
 
-    # 🔴 THE SHARDS ARE RENAMED, BECAUSE THEY ARE NO LONGER WHAT THEY SAY.
-    # The float32 export writes weights-NN.f32.bin and this used to reuse that
-    # name for its output, so a 265 MiB int5 bundle shipped 26 files each
-    # claiming to be float32. Nothing reads the extension - the manifest carries
-    # the dtype and names the file - so it was a lie that cost nothing and
-    # misinformed everyone who looked.
-    renamed = {name: name.replace(".f32.bin", f".int{bits}.bin")
-               for name in shards}
-
+    # 🔴 THE OUTPUT SHARDS ARE NOT THE INPUT'S. This used to write one file per
+    # source shard, so an int3 bundle inherited a layout chosen for float32 -
+    # `export_esmc_model.py` caps a shard at 48 MiB and quantisation shrinks each
+    # eightfold, which left ESM-C 600M as 54 files of 4.1 MiB. The sizes are only
+    # known HERE, after packing, so this is the one place that can choose. See
+    # shard_count and pack_shards.
+    #
+    # 🔴 AND THE BYTES ARE UNCHANGED, WHICH IS WHAT MAKES IT SAFE. Quantisation
+    # is deterministic and only the grouping into files moves, so a fold before
+    # and after must be identical - which is the check to run, not a tolerance.
     kept = quantised = 0
     kept_bytes = quantised_bytes = source_bytes = 0
+    built = []                      # (name, record, payload) in manifest order
     for filename, records in sorted(shards.items()):
         blob = (source / filename).read_bytes()
-        pieces = []
-        cursor = 0
         for record in sorted(records, key=lambda r: r.get("byteOffset", 0)):
             count = int(np.prod(record["shape"]))
             start = record.get("byteOffset", 0)
             values = np.frombuffer(blob, dtype="<f4", count=count, offset=start)
             source_bytes += count * 4
-
-            # Every tensor restarts on a four-byte boundary, as the f32 export does.
-            pad = (-cursor) % 4
-            if pad:
-                pieces.append(b"\x00" * pad)
-                cursor += pad
-            record["byteOffset"] = cursor
-
             name = next(n for n, r in tensors.items() if r is record)
-            record["file"] = renamed[filename]
             if KEEP_FLOAT32.search(name) or name in named_float32:
                 payload = np.ascontiguousarray(values, dtype="<f4").tobytes()
                 record["dtype"] = "float32"
+                record.pop("block", None)
+                record.pop("scaleOffset", None)
+                record.pop("zeroOffset", None)
                 kept += 1
                 kept_bytes += len(payload)
             else:
@@ -179,16 +215,40 @@ def main():
                 scale_pad = (-len(packed)) % 4
                 record["dtype"] = f"int{bits}"
                 record["block"] = group
-                record["scaleOffset"] = cursor + len(packed) + scale_pad
+                # ...offsets WITHIN the payload; the shard offset is added below,
+                # once packing has decided where this payload starts.
+                record["scaleOffset"] = len(packed) + scale_pad
                 record["zeroOffset"] = record["scaleOffset"] + scales.nbytes
                 payload = (packed + b"\x00" * scale_pad
                            + scales.astype("<f2").tobytes()
                            + zeros.astype("<f2").tobytes())
                 quantised += 1
                 quantised_bytes += len(payload)
+            built.append((name, record, payload))
+        del blob
+
+    total = sum(len(p) for _, _, p in built)
+    bins, loads = pack_shards([(i, len(p)) for i, (_, _, p) in enumerate(built)],
+                              shard_count(total))
+    for shard, members in enumerate(bins):
+        pieces = []
+        cursor = 0
+        # ...in manifest order inside the file, so a reader stepping through it
+        # walks forwards; the packing chose WHICH file, not the order within.
+        for index in sorted(members):
+            _, record, payload = built[index]
+            pad = (-cursor) % 4          # every tensor restarts four-byte aligned
+            if pad:
+                pieces.append(b"\x00" * pad)
+                cursor += pad
+            record["file"] = f"weights-{shard:02d}.int{bits}.bin"
+            record["byteOffset"] = cursor
+            if "scaleOffset" in record:
+                record["scaleOffset"] += cursor
+                record["zeroOffset"] += cursor
             pieces.append(payload)
             cursor += len(payload)
-        (out / renamed[filename]).write_bytes(b"".join(pieces))
+        (out / f"weights-{shard:02d}.int{bits}.bin").write_bytes(b"".join(pieces))
 
     manifest["quantisation"] = {
         "scheme": "asymmetric-per-group", "bits": bits, "group": group,

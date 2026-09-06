@@ -86,3 +86,10 @@ natives
 /model-esmfold2-*/
 /model-esmfold2-trunk-f32
 /esmfold2-fold.pdb
+
+# 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, not deleted. Both pages were
+# built against a model row that has moved under them; they stay on disk while
+# that is sorted out, and tools/build_site.py and tools/mobile-layout.py skip a
+# page they cannot find rather than failing on it.
+/single.html
+/proteinhunter.html

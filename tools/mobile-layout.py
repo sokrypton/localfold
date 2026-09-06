@@ -317,8 +317,15 @@ def main():
     arguments = parser.parse_args()
 
     write_probe()
-    write_probe("single.html", os.path.join(ROOT, "_mobile-single.html"))
-    write_probe("proteinhunter.html", os.path.join(ROOT, "_mobile-hunter.html"))
+    # 🔴 A PAGE THAT IS NOT THERE IS SKIPPED, NOT FAILED. single.html and
+    # proteinhunter.html are held out of the repository until they are fixed and
+    # checked; the probes stay so they are measured again the day they return.
+    has_single = os.path.exists(os.path.join(ROOT, "single.html"))
+    has_hunter = os.path.exists(os.path.join(ROOT, "proteinhunter.html"))
+    if has_single:
+        write_probe("single.html", os.path.join(ROOT, "_mobile-single.html"))
+    if has_hunter:
+        write_probe("proteinhunter.html", os.path.join(ROOT, "_mobile-hunter.html"))
     httpd = serve()
     proc = ws = None
     results = {}
@@ -351,21 +358,22 @@ def main():
             # fold in headless Chrome - there is no WebGPU device here - so
             # what is measured is the page as a reader first meets it: does it
             # fit, and is the viewer box the width of the screen.
-            ws.call("Page.navigate", url="http://127.0.0.1:%d/_mobile-single.html" % PORT)
-            wait_for(ws, "!!document.getElementById('predict')",
-                     what="single.html to load")
-            evaluate(ws, "new Promise(r => requestAnimationFrame("
-                         "() => setTimeout(() => r(1), 300)))")
-            single[name] = evaluate(ws, """(() => ({
-                viewport: innerWidth,
-                overflow: document.documentElement.scrollWidth - innerWidth,
-                shell: Math.round(document.getElementById('viewer-root')
-                                          .getBoundingClientRect().width),
-                viewer: Math.round(document.getElementById('canvasContainer')
-                                           .getBoundingClientRect().width),
-                sequence: Math.round(document.getElementById('sequence')
-                                             .getBoundingClientRect().width)}))()""", False)
-            single[name]["asked"] = w
+            if has_single:
+                ws.call("Page.navigate", url="http://127.0.0.1:%d/_mobile-single.html" % PORT)
+                wait_for(ws, "!!document.getElementById('predict')",
+                         what="single.html to load")
+                evaluate(ws, "new Promise(r => requestAnimationFrame("
+                             "() => setTimeout(() => r(1), 300)))")
+                single[name] = evaluate(ws, """(() => ({
+                    viewport: innerWidth,
+                    overflow: document.documentElement.scrollWidth - innerWidth,
+                    shell: Math.round(document.getElementById('viewer-root')
+                                              .getBoundingClientRect().width),
+                    viewer: Math.round(document.getElementById('canvasContainer')
+                                               .getBoundingClientRect().width),
+                    sequence: Math.round(document.getElementById('sequence')
+                                                 .getBoundingClientRect().width)}))()""", False)
+                single[name]["asked"] = w
             # ===== AND THE DESIGN PAGE, which is the same shell again with a
             # grid of controls and a results table under the viewer. The table
             # is the new risk: a designed sequence is 150 monospace characters
@@ -374,80 +382,81 @@ def main():
             # as the whole page zoomed out rather than as anything overflowing.
             # Measured with the table EMPTY, because that is the page as it is
             # first met; the rule that contains it is on the card either way.
-            ws.call("Page.navigate", url="http://127.0.0.1:%d/_mobile-hunter.html" % PORT)
-            wait_for(ws, "!!document.getElementById('hunt')",
-                     what="proteinhunter.html to load")
-            evaluate(ws, "new Promise(r => requestAnimationFrame("
-                         "() => setTimeout(() => r(1), 300)))")
-            # 🔴 AND WITH A TARGET ENTITY ROW, which is the element that has
-            # already done this once: index.html's entity row put its sequence
-            # box on a `1fr` grid track and measured 0px at 320 with "PIA" set
-            # one letter per line, while every fit check passed. This page
-            # reuses that row, so it inherits both the layout and the trap, and
-            # it starts EMPTY - so a probe that did not add one would measure a
-            # page with no entity row in it at all.
-            evaluate(ws, """(() => {
-                if (!window.__hunterTargets) return 'no entity list';
-                window.__hunterTargets.set([
-                    { type: 'protein', value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEK', copies: 2 },
-                    { type: 'ligand', value: 'HEM', copies: 1 },
-                ]);
-                return window.__hunterTargets.read().length;
-            })()""", False)
-            # 🔴 WITH A ROW IN IT. An empty table cannot squeeze anything,
-            # and the row is the whole risk: eight cells of `white-space:
-            # nowrap` with a 150-character monospace sequence in the last one.
-            # Measured empty this check passed while the populated page pushed
-            # the layout viewport to 1100 on a 320px phone.
-            evaluate(ws, """(() => {
-                const body = document.getElementById('results-body');
-                const cells = ['1', '3', '0.812', 'iptm', '87.4', '0.812', '5%',
-                    'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
-                    + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
-                    + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'];
-                for (let i = 0; i < 4; i += 1) {
-                    const row = document.createElement('tr');
-                    for (const [index, text] of cells.entries()) {
-                        const cell = document.createElement('td');
-                        cell.textContent = text;
-                        if (index === cells.length - 1) cell.className = 'sequence';
-                        row.append(cell);
+            if has_hunter:
+                ws.call("Page.navigate", url="http://127.0.0.1:%d/_mobile-hunter.html" % PORT)
+                wait_for(ws, "!!document.getElementById('hunt')",
+                         what="proteinhunter.html to load")
+                evaluate(ws, "new Promise(r => requestAnimationFrame("
+                             "() => setTimeout(() => r(1), 300)))")
+                # 🔴 AND WITH A TARGET ENTITY ROW, which is the element that has
+                # already done this once: index.html's entity row put its sequence
+                # box on a `1fr` grid track and measured 0px at 320 with "PIA" set
+                # one letter per line, while every fit check passed. This page
+                # reuses that row, so it inherits both the layout and the trap, and
+                # it starts EMPTY - so a probe that did not add one would measure a
+                # page with no entity row in it at all.
+                evaluate(ws, """(() => {
+                    if (!window.__hunterTargets) return 'no entity list';
+                    window.__hunterTargets.set([
+                        { type: 'protein', value: 'GWSTELEKHREELKEFLKKEGITLGFTNAEK', copies: 2 },
+                        { type: 'ligand', value: 'HEM', copies: 1 },
+                    ]);
+                    return window.__hunterTargets.read().length;
+                })()""", False)
+                # 🔴 WITH A ROW IN IT. An empty table cannot squeeze anything,
+                # and the row is the whole risk: eight cells of `white-space:
+                # nowrap` with a 150-character monospace sequence in the last one.
+                # Measured empty this check passed while the populated page pushed
+                # the layout viewport to 1100 on a 320px phone.
+                evaluate(ws, """(() => {
+                    const body = document.getElementById('results-body');
+                    const cells = ['1', '3', '0.812', 'iptm', '87.4', '0.812', '5%',
+                        'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
+                        + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'
+                        + 'DEVKKELEEIKEFIKKEKEKDEVKKELEEIKEFIKKEKEK'];
+                    for (let i = 0; i < 4; i += 1) {
+                        const row = document.createElement('tr');
+                        for (const [index, text] of cells.entries()) {
+                            const cell = document.createElement('td');
+                            cell.textContent = text;
+                            if (index === cells.length - 1) cell.className = 'sequence';
+                            row.append(cell);
+                        }
+                        body.append(row);
                     }
-                    body.append(row);
-                }
-                document.getElementById('results').hidden = false;
-                document.getElementById('downloads').hidden = false;
-                return body.children.length;
-            })()""", False)
-            evaluate(ws, "new Promise(r => requestAnimationFrame("
-                         "() => setTimeout(() => r(1), 200)))")
-            hunter[name] = evaluate(ws, """(() => {
-                const box = (id) => Math.round(
-                    document.getElementById(id).getBoundingClientRect().width);
-                return {
-                    viewport: innerWidth,
-                    overflow: document.documentElement.scrollWidth - innerWidth,
-                    shell: box('viewer-root'),
-                    viewer: box('canvasContainer'),
-                    // The entity row's own sequence box, which is the one that
-                    // has measured 0px before. `.entity-field` is entity-ui's.
-                    target: Math.min(...[...document.querySelectorAll(
-                        '#entity-rows .entity-field')].map((el) =>
-                            Math.round(el.getBoundingClientRect().width))),
-                    // 🔴 THE NARROWEST FIELD OF THE CONTROL GRID, NOT THE GRID.
-                    // A `1fr` track squeezed to nothing is invisible to every
-                    // fit check - the entity row's sequence box measured 0px at
-                    // 320 while every one of them passed - and an auto-fit grid
-                    // is exactly the construct that does it.
-                    // ...text and number fields only. A checkbox is 13px on
-                    // purpose and would be the minimum at every width, which
-                    // is a floor that can never move and so measures nothing.
-                    field: Math.min(...[...document.querySelectorAll(
-                        '.hunt-field input:not([type=checkbox])')].map((el) =>
-                            Math.round(el.getBoundingClientRect().width))),
-                };
-            })()""", False)
-            hunter[name]["asked"] = w
+                    document.getElementById('results').hidden = false;
+                    document.getElementById('downloads').hidden = false;
+                    return body.children.length;
+                })()""", False)
+                evaluate(ws, "new Promise(r => requestAnimationFrame("
+                             "() => setTimeout(() => r(1), 200)))")
+                hunter[name] = evaluate(ws, """(() => {
+                    const box = (id) => Math.round(
+                        document.getElementById(id).getBoundingClientRect().width);
+                    return {
+                        viewport: innerWidth,
+                        overflow: document.documentElement.scrollWidth - innerWidth,
+                        shell: box('viewer-root'),
+                        viewer: box('canvasContainer'),
+                        // The entity row's own sequence box, which is the one that
+                        // has measured 0px before. `.entity-field` is entity-ui's.
+                        target: Math.min(...[...document.querySelectorAll(
+                            '#entity-rows .entity-field')].map((el) =>
+                                Math.round(el.getBoundingClientRect().width))),
+                        // 🔴 THE NARROWEST FIELD OF THE CONTROL GRID, NOT THE GRID.
+                        // A `1fr` track squeezed to nothing is invisible to every
+                        // fit check - the entity row's sequence box measured 0px at
+                        // 320 while every one of them passed - and an auto-fit grid
+                        // is exactly the construct that does it.
+                        // ...text and number fields only. A checkbox is 13px on
+                        // purpose and would be the minimum at every width, which
+                        // is a floor that can never move and so measures nothing.
+                        field: Math.min(...[...document.querySelectorAll(
+                            '.hunt-field input:not([type=checkbox])')].map((el) =>
+                                Math.round(el.getBoundingClientRect().width))),
+                    };
+                })()""", False)
+                hunter[name]["asked"] = w
     finally:
         if proc: proc.kill()
         httpd.shutdown()
@@ -576,8 +585,10 @@ def main():
             bad.append("%s: the play bar broke across %d lines: %s"
                        % (name, len(play), play))
 
-    print("single.html:")
-    for name in ("320px", "360px", "390px", "desktop"):
+    # ...and a page held out of the repository is reported as held out, rather
+    # than silently contributing no checks.
+    print("single.html:" if single else "single.html: not present, skipped")
+    for name in ("320px", "360px", "390px", "desktop") if single else ():
         S = single[name]
         print("   %-8s asked %d, innerWidth %d, shell %d, viewer %d, sequence box %d"
               % (name, S["asked"], S["viewport"], S["shell"], S["viewer"], S["sequence"]))
@@ -595,8 +606,9 @@ def main():
             bad.append("single.html on the desktop: shell %d, viewer %d - both were 948"
                        % (S["shell"], S["viewer"]))
 
-    print("proteinhunter.html:")
-    for name in ("320px", "360px", "390px", "desktop"):
+    print("proteinhunter.html:" if hunter
+          else "proteinhunter.html: not present, skipped")
+    for name in ("320px", "360px", "390px", "desktop") if hunter else ():
         H = hunter[name]
         print("   %-8s asked %d, innerWidth %d, shell %d, viewer %d,"
               " narrowest entity box %d, narrowest field %d"

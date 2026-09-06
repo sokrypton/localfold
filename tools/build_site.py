@@ -38,7 +38,14 @@ DOMAIN = "localfold.org"
 
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
-FILES = [".nojekyll", "index.html", "single.html", "proteinhunter.html", "dev.html"]
+FILES = [".nojekyll", "index.html", "dev.html"]
+# 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, NOT DELETED. `single.html` and
+# `proteinhunter.html` are out of the repository and out of the site while the
+# model row they were built against moves under them; the files stay on disk and
+# gitignored, and every tool that touches them SKIPS a page it cannot find
+# rather than dropping its probe - so putting them back is one line here and the
+# gates come back with them.
+OPTIONAL = ["single.html", "proteinhunter.html"]
 DIRECTORIES = ["web", "src"]
 
 # ...and never these, wherever they appear.
@@ -327,6 +334,10 @@ def build(include_model: bool) -> int:
             print(f"missing {name}", file=sys.stderr)
             return 1
         shutil.copy2(source, OUT / name)
+    for name in OPTIONAL:
+        source = ROOT / name
+        if source.exists():
+            shutil.copy2(source, OUT / name)
 
     for name in DIRECTORIES:
         source = ROOT / name

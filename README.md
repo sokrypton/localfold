@@ -10,7 +10,6 @@ machine. No account, no queue, no upload of your sequence to a fold server.
 | Page | What it is for |
 |---|---|
 | **[localfold.org](https://localfold.org)** | Fold a protein, a complex, a ligand or a nucleic acid with AlphaFold 2 or AlphaFold 3 |
-| **[/single.html](https://localfold.org/single.html)** | The same fold, stripped to one sequence box |
 
 Paste a sequence and press Fold. The structure appears as it is being built,
 and you can play the trajectory back.
