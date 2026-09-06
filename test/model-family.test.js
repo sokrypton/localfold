@@ -41,6 +41,27 @@ describe("the AlphaFold 3 families", () => {
   // row shows one name - see PLM_FAMILIES in web/app.js. What must stay true is
   // that every folding family is reachable from SOMEWHERE, or it is a bundle
   // the site publishes and nobody can fold with.
+  // 🔴 ONE READER OF THE MODEL ROW, OR TWO ANSWERS. EF2-fast's checkpoints share
+  // an <option> and the PLM row picks between them, so `chosenFamily()` is the
+  // resolution and anything reading `model-family` directly gets the other
+  // answer. `modelFamily()` did, which is what runFold preloads and folds with -
+  // so the page folded the 600M pair while every label, stem and archive field
+  // said 300M, and the two settings produced byte-identical structures. Nothing
+  // errors; the fold is simply of a model the page did not report.
+  it("resolves the family in one place, so the fold matches its label", () => {
+    const body = app.slice(app.indexOf("const modelFamily = "));
+    const head = body.slice(0, body.indexOf("\n};"));
+    assert.ok(head.includes("chosenFamily()"),
+              "modelFamily does not resolve through chosenFamily");
+    assert.ok(!/getElementById\("model-family"\)\?\.value/.test(head),
+              "modelFamily reads the model row directly, which skips the PLM row");
+    // ...and runFold folds with what modelFamily returned, not a second read.
+    const run = app.slice(app.indexOf("let family = modelFamily("));
+    const preload = run.slice(0, run.indexOf("startModelPreload("));
+    assert.ok(!preload.includes('getElementById("model-family")'),
+              "runFold re-reads the model row between resolving and preloading");
+  });
+
   it("makes each of them reachable from a control", () => {
     const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
     const variants = app.slice(app.indexOf("const PLM_FAMILIES = {"));

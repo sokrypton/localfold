@@ -107,13 +107,12 @@ const weightsPromises = new Map();
  * first version handed the second family the first one's weights. There is one
  * ESMFold2 bundle; a second has appeared, so this is a Map.
  *
- * 🔴 KEYED BY FAMILY, AND THE `languageModel` FLAG RIDES ON THE FIRST CALL.
- * That flag only decides whether the tower PREFETCHES, so a second fold of the
- * same family that does want it still gets its weights - the store fetches on
- * demand and the tower streams its blocks during the fold anyway. What it
- * costs is the head start and the download dial, in the order "fold a ligand,
- * then fold a protein". Left as it is because the alternative is a second key
- * on a flag that changes no weights.
+ * 🔴 KEYED BY FAMILY, AND THE `languageModel` FLAG DOES NOT BELONG IN THE KEY.
+ * It changes no weights - only whether the tower's shards are fetched ahead of
+ * time - and keying on it would download the FOLDING bundle twice for one
+ * family. The decision can change after the promise is cached, so the loaded
+ * object carries `language.prefetch()` for a caller that later finds it does
+ * want the tower; see the note there.
  *
  * 🔴 KEYED BY FAMILY, BECAUSE A SECOND CHECKPOINT IS MISTAKEN FOR THE FIRST IN
  * A CACHE AND NOT IN A LOADER. `loadAf3Weights` memoised ONE promise and the
@@ -190,7 +189,11 @@ export function loadEsmfold2Weights(onProgress,
     // NON-ZERO vector and a fold with no protein still needs those tensors -
     // see shimSingleForZeroState. They are a few hundred KB fetched on demand;
     // the 36 blocks are the 224 MiB, and those are what go unfetched.
-    if (languageModel) towerStore.prefetch();
+    let towerPrefetched = false;
+    if (languageModel) {
+      towerPrefetched = true;
+      towerStore.prefetch();
+    }
 
     const read = (name) => foldStore.tensor(name);
     const M = foldManifest.trunk;
@@ -229,6 +232,19 @@ export function loadEsmfold2Weights(onProgress,
       language: {
         manifest: towerManifest.languageModel,
         shared: towerShared,
+        // 🔴 A LATE PREFETCH, BECAUSE THE MEMO OUTLIVES THE DECISION. Whether
+        // the tower is worth downloading depends on the ENTITIES and the PLM
+        // row, and both can change after this promise is built and cached -
+        // fold a ligand, then a protein, and the second inherited the first
+        // one's "no language model" and lost its head start. The store still
+        // serves it either way, so this is a head start rather than a
+        // correctness fix; it is idempotent, and after the load has finished
+        // its progress goes unreported, which is what the dial means.
+        prefetch: () => {
+          if (towerPrefetched) return;
+          towerPrefetched = true;
+          towerStore.prefetch();
+        },
         ffn: towerManifest.tensors["blocks/0/fc2/weights"].shape[0],
         // 🔴 A BLOCK IS READ WHEN THE TOWER ASKS FOR IT. Reading all 36 first
         // is 2190 MiB of float32 in the tab, which is the thing the streaming

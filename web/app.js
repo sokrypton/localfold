@@ -400,7 +400,15 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // default for everything and could never choose AF3, so the newest model was
   // the one a reader had to know to ask for. It also meant the page had a
   // state in which what would run was written nowhere on it.
-  const choice = document.getElementById("model-family")?.value ?? "af3";
+  // 🔴 THE RESOLVED FAMILY, NOT THE ROW'S RAW VALUE. This is what `runFold`
+  // preloads and folds with, and EF2-fast's two checkpoints share one <option>
+  // - so reading the select directly folded the 600M pair while every label,
+  // stem and archive field came from `chosenFamily()` and said 300M. The page
+  // reported a model it had not run, and the structures were byte-identical
+  // across the two settings, which is how it was caught. A cache is the easiest
+  // place for a second model to be mistaken for the first; so is a second
+  // reader of the same control.
+  const choice = chosenFamily();
   // 🔴 A LIGAND IS AlphaFold 3 ONLY, and choosing otherwise is refused rather
   // than quietly corrected.
   //
@@ -2294,6 +2302,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const loaded = await (modelLoad
     ?? loadEsmfold2Weights(undefined,
                            { languageModel: usesLanguageModel(), family: chosenFamily() }));
+  // 🔴 ASKED AGAIN HERE, BECAUSE THE PRELOAD DECIDED IT EARLIER AND THE MEMO
+  // OUTLIVES BOTH. `startModelPreload` skips the tower's 223.6 MiB when the
+  // entities hold no protein or the PLM row says none - and either can have
+  // changed since, or the promise can have been built for a previous fold that
+  // did not want it. Idempotent, and it is a head start rather than a
+  // correctness fix: the store serves the blocks on demand either way.
+  if (usesLanguageModel()) loaded.language.prefetch?.();
   throwIfAborted(signal);
   const device = await getDevice();
   throwIfAborted(signal);

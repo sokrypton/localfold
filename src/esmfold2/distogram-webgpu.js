@@ -519,7 +519,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     certaintyPair[rows] = await cache.get(`${key}:certain:${rows}`,
       createCertaintyPairShader({ pairs: rows, bins }, span));
   }
-  const certaintyPass = await cache.get(`${key}:certain-token:${tokens}`,
+  // 🔴 THE RULE'S CONSTANTS ARE IN THE KEY, THOUGH THEY ARE CONSTANTS TODAY. A
+  // generated shader cached under a key that does not name what generated it is
+  // stale the moment somebody makes one of them an option - and the failure is
+  // a plausible number from the previous setting, not an error.
+  const certaintyKey = `${key}:certain-token:${tokens}:${CERTAINTY.separation}`
+    + `:${cutoffBins.protein}:${cutoffBins.nucleic}:${cutoffBins.ligand}`;
+  const certaintyPass = await cache.get(certaintyKey,
     createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
   const project = {};
   const contact = {};
@@ -662,7 +668,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     const frames = retainForFrames ? await framesScorer({
       device, allocator, cache, submit, key, tokens, bins, span, cutoffBins,
       logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
-      interfaceCertainty, bondBuffer,
+      interfaceCertainty, bondBuffer, certaintyKey,
       release: () => { for (const allocation of retained) allocation.release(); },
     }) : undefined;
     if (!wantLogits) {
@@ -704,7 +710,7 @@ async function framesScorer(context) {
   const storage = GPUBufferUsage.STORAGE;
   const observed = await cache.get(`${key}:observed:${tokens}`,
     createObservedMassShader({ tokens, bins }, span));
-  const aggregate = await cache.get(`${key}:certain-token:${tokens}`,
+  const aggregate = await cache.get(context.certaintyKey,
     createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
   const positions = allocator.allocate("esmfold2.disto.frame-positions",
     Math.max(16, tokens * 3 * 4), storage | GPUBufferUsage.COPY_DST);
