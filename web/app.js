@@ -2412,6 +2412,9 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // 0.95 to 0.42, which is the confidence estimate correctly reporting that
     // the answer is worthless.
     languageModel: usesLanguageModel(),
+    // ...and how big it is, so the bar's language band is this tower's and not
+    // the one the constants were fitted against.
+    languageModelMiB: loaded.language.megabytes,
     // 🔴 EACH FRAME GETS ITS OWN COLOUR, WHICH NEEDS THE DISTOGRAM RESIDENT.
     // The trunk's own certainty is fixed for a fold, so every frame would wear
     // the same one - and the interesting thing about a trajectory is watching

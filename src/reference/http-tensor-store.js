@@ -180,6 +180,19 @@ export class HttpTensorStore {
     store.#reportProgress();
     return store;
   }
+  /**
+   * How many bytes this bundle holds, which is what a cost model wants.
+   *
+   * 🔴 IT WAS ALREADY COUNTED AND NOT REACHABLE. The progress dial has always
+   * needed the total, so the store sums it in the constructor; a caller pricing
+   * a DOWNLOAD had to write the number down again, and src/esmfold2/cost.js did
+   * - as a constant fitted to the only tower there was, which then charged a
+   * second tower and an absent one for weights they never fetch.
+   */
+  get totalBytes() {
+    return this.#totalBytes;
+  }
+
   tensor(name) {
     let value = this.#cache.get(name);
     if (value === undefined) { value = this.#load(name); this.#cache.set(name, value); }

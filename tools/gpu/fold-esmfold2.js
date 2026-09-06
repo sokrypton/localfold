@@ -17,7 +17,9 @@
 // peptide bond, and a port with the arithmetic subtly wrong gives a plausible
 // cloud at the wrong scale - and, when a reference structure is supplied, the
 // RMSD after superposition.
-import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
+import {
+  readTensor, readTensorAsFloat16, tensorByteLength,
+} from "../../src/reference/dtype.js";
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 import { foldEsmfold2, SAMPLER_PRESETS } from "../../src/esmfold2/fold.js";
@@ -221,6 +223,9 @@ export async function main(device, args = []) {
     distogramLogits: contactSweep,
     lmMaskFraction: lmMask,
     languageModel: !noPlm,
+    // ...the band the bar gives the tower is its bytes; see src/esmfold2/cost.js.
+    languageModelMiB: Object.values((await tower.manifest()).tensors)
+      .reduce((sum, record) => sum + tensorByteLength(record), 0) / 1048576,
     onStatus: (label) => { progress.push(label); },
     // 🔴 COUNTED PER PHASE, because "does the trunk report block by block" is a
     // number and not an impression. A bar sampled from the page cannot answer

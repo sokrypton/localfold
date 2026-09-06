@@ -333,7 +333,13 @@ export async function foldEsmfold2(device, options) {
   const onStatus = options.onStatus ?? (() => {});
   const onProgress = options.onProgress ?? (() => {});
   const loops = shape.loops ?? 4;
-  const plan = esmfold2Plan({ tokens, steps: levels.length, loops });
+  // ...and how big the tower is, since the band it gets is its bytes. Zero
+  // when it is not running at all, which is a ligand-only input or a reader who
+  // turned it off.
+  const plan = esmfold2Plan({
+    tokens, steps: levels.length, loops,
+    languageModelMiB: options.languageModel === false ? 0 : options.languageModelMiB,
+  });
   let completed = 0;
   let phase = ESMFOLD2_PHASES.languageModel;
   const say = () => onStatus(`${phase} · ${Math.round(100 * completed / plan.total)}%`);

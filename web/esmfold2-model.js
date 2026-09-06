@@ -231,6 +231,9 @@ export function loadEsmfold2Weights(onProgress,
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
       language: {
         manifest: towerManifest.languageModel,
+        // ...what the language band in src/esmfold2/cost.js is priced on, taken
+        // from the store that already counted it rather than written down.
+        megabytes: towerStore.totalBytes / 1048576,
         shared: towerShared,
         // 🔴 A LATE PREFETCH, BECAUSE THE MEMO OUTLIVES THE DECISION. Whether
         // the tower is worth downloading depends on the ENTITIES and the PLM

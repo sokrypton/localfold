@@ -30,14 +30,40 @@
  * above the lengths measured here.
  */
 
+/** ESM-C 600M at int3: the tower the constants here were fitted against. */
+export const TOWER_MIB = 223.6;
+
 /** Milliseconds, predicted. Units and time are the same thing in this plan. */
-export function esmfold2Plan({ tokens, steps, loops = 4 }) {
+export function esmfold2Plan({ tokens, steps, loops = 4,
+                              languageModelMiB = TOWER_MIB }) {
   const squared = tokens * tokens;
   // 🔴 MILLISECONDS THROUGHOUT. The first version wrote the trunk's constant in
   // SECONDS per n^2 and the rest in milliseconds, which put the trunk at 2% of
   // a 300-residue fold where it is 85%. The bar would have crawled through the
   // language model and then jumped.
-  const languageModel = 2100;
+  // 🔴 THE BAND IS THE TOWER'S BYTES, AND IT WAS A CONSTANT FITTED TO THE ONLY
+  // TOWER THERE WAS. A second checkpoint and an off switch arrived after it and
+  // were charged 2100 ms each: measured on a 76-mer, ESM-C 600M costs 2145 ms,
+  // 300M costs 1355, and no language model at all costs 36. So the bar stood
+  // still through two fifths of a fold's predicted time while nothing ran.
+  //
+  // 🔴 AND IT SCALES BY BYTES, NOT BY LAYERS, which is the same fact the note
+  // above records - at these lengths the band is weight streaming and decoding
+  // rather than arithmetic. 30 layers against 36 is 0.83 and would predict the
+  // 300M tower 30% slow; 129.7 MiB against 223.6 is 0.58, and the measured
+  // ratio is 0.63.
+  //
+  // 🔴 TWO POINTS AND TWO PARAMETERS, SO THE FIT IS EXACT BY CONSTRUCTION and
+  // says only that the line passes through both towers this page can load. A
+  // second run of the same three folds read 1972, 919 and 63 ms against the
+  // fitted 2145, 1355 and 0 - so the constants carry this machine's own drift,
+  // which the note at the top of this file puts at up to 3.2x. That is fine for
+  // a BAR and is why the line reports a percentage rather than a time.
+  //
+  // 🔴 AND THE OFF ARM IS NOT FREE, IT IS 63 ms - the shim's zero state still
+  // runs, because `shim(0)` is a fixed non-zero vector rather than nothing. It
+  // is charged to the band after it, which is 2% out and not worth a term.
+  const languageModel = languageModelMiB <= 0 ? 0 : 264 + 8.41 * languageModelMiB;
   const embedder = 150 + 0.003 * squared;
   const trunk = 0.075 * squared * loops;
   const conditioning = 307 + 0.008 * squared;
