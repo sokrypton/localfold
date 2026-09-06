@@ -691,6 +691,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
 
   return {
     positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
+    // ...the representative coordinates the confidence head was given. Returned
+    // because anything comparing a per-pair prediction against the PAE needs
+    // the SAME points the PAE is about, and recomputing them is a second
+    // reading of `tokenAtomsToPseudoBeta` that can drift from this one.
+    pseudoBeta,
     chainPtm, chainIptm,
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.

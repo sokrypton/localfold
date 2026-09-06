@@ -2896,6 +2896,170 @@ screen would run, take a minute of somebody else's server, and be discarded -
 which is the "quietly ignored control" `syncModelControls` exists to prevent,
 one step worse.
 
+## A PAE from a distogram, for a model that has no confidence head
+
+🔴 **IT WORKS, OUT OF SAMPLE, AND THE CONTROL IS WHAT SAYS SO.** EF2-fast has no
+confidence head at all, and PAE is the score people read off a complex - it is
+what says whether two parts are placed correctly against each other, which
+neither pLDDT nor a contact map answers. AlphaFold 3 produces a distogram AND a
+real PAE out of ONE fold, so an estimator can be scored before being carried to
+the model that lacks one. 13 targets, `tools/gpu/probe-pae-from-distogram.js` to
+collect and `tools/pae-from-distogram.py` to score, **leave-one-target-out
+throughout**:
+
+| | median Spearman | worst |
+|---|---|---|
+| `d_ij` alone (the baseline) | 0.658 | 0.509 |
+| geometry only, sigma removed from the fit | 0.658 | 0.509 |
+| **the distogram's own moments, fitted** | **0.876** | **0.734** |
+| ...with sigma attached to the WRONG PAIRS | **0.450** | 0.346 |
+
+Median RMSE **2.86 A** against a quantity running 0 to 32.
+
+🔴 **THE SHUFFLED ARM IS THE EXPERIMENT, AND IT LANDS BELOW THE GEOMETRY.** Same
+sigma values, same marginal distribution, attached to the wrong pairs: 0.450
+against geometry-alone's 0.658. A wrong distogram is WORSE than no distogram, so
+the correspondence between a pair and its spread is what is being used - not
+the mere presence of another feature to fit. Without that arm "0.876 beats
+0.658" is what any extra column does to a least squares.
+
+🔴 **AND THE BASELINE HAD TO BE THE GEOMETRY.** PAE grows with distance whatever
+the model believes, so `d_ij` alone already reads 0.658 and an estimator quoted
+against zero would look four times better than it is. The `no sigma` arm scores
+**identically** to `d_ij` - which is the check that the fit adds nothing by
+being a fit.
+
+🔴 **AND THE DYNAMIC RANGE WAS MANUFACTURED, AS THE CERTAINTY SWEEP'S WAS.** A
+well-folded monomer has almost no PAE to rank - 6MRR reads mean 3.36 with sd
+3.03 - so the same sequence is folded again SPLIT INTO TWO CHAINS, which puts
+real block structure in: intra-chain PAE 5.81 against inter-chain 10.20 on that
+same 68-mer. Thirteen targets are five monomers, five splits and three
+protein-plus-peptide complexes.
+
+🔴 **AND THE PRINCIPLED ESTIMATOR LOST TO ADDING TWO RANKS TOGETHER.** PAE
+decomposes into a radial error - which IS the distogram's spread - and a
+tangential one, `d_ij * dtheta`, and dtheta is set by triangulation against i's
+neighbours. Differentiating the cosine rule gives a tangential displacement of
+`sigma_kj * d_kj / (r_ik * sin theta)`, independent of `d_ij`, which is the
+check that the algebra is right. Taking the best-determined neighbour (a MIN,
+which is why a mean over the neighbourhood underperformed) scores median
+**0.749** - beating sigma alone at 0.586 and the distance at 0.646, with no
+fitted parameters, and LOSING to `rank(sigma) + rank(d)` at **0.818** on eleven
+of thirteen targets. The min is brittle: one accidentally small `sigma_kj`
+discards every other constraint, and the errors it assumes are independent are
+not. **A derivation is a hypothesis, not a result.**
+
+🔴 **AND THE DISTOGRAM IS BLIND PAST 22 ANGSTROMS, BY CONSTRUCTION.** Its last
+bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
+`min(d, 22)` is a feature for that reason - saying where the grid stops is more
+honest than letting a fit discover it - and it is why the estimator's worst
+targets are the ones whose PAE is largest.
+
+🔴 **AND IT IS NOT YET CARRIED TO EF2-fast, WHICH IS THE WHOLE POINT.** The fit
+is on AF3's distogram, which is 64 bins over 2-22 A; EF2-fast's is 128 bins over
+a BORROWED 2-52 A grid, so sigma has a different range and the coefficients
+cannot simply transfer. The test that would settle it is to fold one sequence
+through both, estimate a PAE from EF2-fast's distogram, and score it against
+AF3's real one. **Open.**
+
+## A PAE from a distogram, for a model that has no confidence head
+
+🔴 **PAE AND A DISTOGRAM ARE NOT THE SAME KIND OF OBJECT, AND THE ARITHMETIC
+SAYS EXACTLY HOW THEY DIFFER.** Aligning on token i's frame, let
+`Delta_ij = dx_j - dx_i` be the relative displacement error. Then
+
+    PAE(i,j)^2  ~  E||Delta_ij||^2          the full 3-D magnitude
+    sigma_ij^2  =  E[(u_ij . Delta_ij)^2]   ONE radial projection of it
+
+So a distogram supplies one scalar projection, along a known direction, of a
+3-vector - and the direction it cannot see is the tangential one, which is
+precisely how a domain ROTATION displaces things. That is the mechanism behind
+sigma systematically under-reading inter-domain error, and it is why no
+per-pair function of sigma alone can be the answer.
+
+🔴 **AND PAE^2 IS A SQUARED-DISTANCE MATRIX, SO IT IS LOW-RANK BY
+CONSTRUCTION.** `E||Delta_ij||^2 = g_ii + g_jj - 2 g_ij` for `g` the Gram matrix
+of displacement covariances, so double-centring PAE^2 gives a Gram matrix whose
+rank is the number of collective modes. Measured over thirteen targets rather
+than assumed:
+
+| | |
+|---|---|
+| components for 90% of PAE's energy | **6-10** |
+| ...of `sigma`'s, at the same sizes | **13-33** |
+| PAE's asymmetry, `mean|asym| / mean|sym|` | **0.12** (0.09-0.29) |
+| energy of double-centred PAE^2 in THREE eigenvalues | **0.61-0.88** |
+
+**The distogram is a high-rank per-pair signal and PAE is a low-rank collective
+one.** The frame term that makes PAE asymmetric is a 12% correction, not the
+substance.
+
+🔴 **SO THE FEATURES ARE THE GRAM TERMS, AND EACH HALF IS WORTH MEASURING
+SEPARATELY.** `g_ii + g_jj` is a PER-TOKEN mobility - read off the distogram as
+how uncertain a token's distances are in general - and `g_ij` is the pair
+coupling, which is sigma itself. Leave-one-target-out throughout, so the fit
+never sees the target it is scored on:
+
+| | median Spearman | worst |
+|---|---|---|
+| `d_ij` alone (the baseline) | 0.658 | 0.509 |
+| geometry only, distogram removed from the fit | 0.658 | 0.509 |
+| **mobility, with no pair term at all** | **0.745** | 0.618 |
+| the distogram per pair | 0.876 | **0.734** |
+| **both: mobility + coupling** | **0.885** | 0.728 |
+| ...with sigma attached to the WRONG PAIRS | **0.450** | 0.346 |
+
+Median RMSE **2.76 A** against a quantity running 0 to 32.
+
+🔴 **THE SHUFFLED ARM IS THE EXPERIMENT, AND IT LANDS BELOW THE GEOMETRY.** Same
+sigma values, same marginal distribution, wrong pairs: 0.450 against
+geometry-alone's 0.658. A wrong distogram is WORSE than no distogram, so what is
+used is the correspondence between a pair and its spread - not the presence of
+another column for a least squares to lean on. Without that arm, "0.885 beats
+0.658" is what any extra feature does to a fit.
+
+🔴 **AND `d_ij` IS ALREADY THE LOW-RANK COLLECTIVE SIGNAL, WHICH IS WHY
+EXPLICIT LOW-RANK MACHINERY BUYS NOTHING.** A squared-distance matrix of 3-D
+points has rank at most 5, so handing the fit the predicted structure's own
+distances already gives it the collective frame. Reconstructing sigma^2 by
+classical MDS - double-centre, truncate, read the distances back - is a real
+improvement **on sigma alone**, median 0.600 -> 0.705 and worst **0.082 ->
+0.470**, because it recovers directions no single pair measured. Added on top of
+a fit that already has `d_ij`, it is redundant: 0.876 -> 0.874. Projecting the
+finished prediction onto rank 4 or 8 is slightly WORSE (0.858, 0.862). **The
+low-rank structure is real and is already being supplied by the geometry.**
+
+🔴 **AND THE PRINCIPLED PER-PAIR ESTIMATOR LOST TO ADDING TWO RANKS TOGETHER.**
+Differentiating the cosine rule gives the tangential displacement from a
+neighbour k as `sigma_kj * d_kj / (r_ik * sin theta)`, independent of `d_ij` -
+which is the check that the algebra is right, since an angular error scaling
+with distance must give a displacement that does not depend on how the angle was
+measured. Taking the best-determined neighbour (a MIN, which is why a mean over
+the neighbourhood scored worse) gives median **0.749** with no fitted parameters
+- beating sigma alone at 0.586 and the distance at 0.646, and LOSING to
+`rank(sigma) + rank(d)` at **0.818** on eleven of thirteen targets. The min is
+brittle: one accidentally small `sigma_kj` discards every other constraint, and
+the errors it treats as independent are not. **A derivation is a hypothesis.**
+
+🔴 **AND THE DISTOGRAM IS BLIND PAST 22 ANGSTROMS, BY CONSTRUCTION.** Its last
+bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
+`min(d, 22)` is a feature for that reason, and it is why the worst-scoring
+targets are the ones whose PAE is largest.
+
+🔴 **AND THE DYNAMIC RANGE WAS MANUFACTURED, AS THE CERTAINTY SWEEP'S WAS.** A
+well-folded monomer has almost no PAE to rank - 6MRR reads mean 3.36, sd 3.03 -
+so each sequence is folded again SPLIT INTO TWO CHAINS, which puts real block
+structure in: intra-chain 5.81 against inter-chain 10.20 on that same 68-mer.
+The thirteen are five monomers, five splits and three protein-plus-peptide
+complexes.
+
+🔴 **AND IT IS NOT YET CARRIED TO EF2-fast, WHICH IS THE WHOLE POINT.** The fit
+is on AF3's distogram, 64 bins over 2-22 A; EF2-fast's is 128 bins over a
+BORROWED 2-52 A grid, so sigma has a different range and the coefficients cannot
+transfer as they stand. The test that would settle it is to fold ONE sequence
+through both, estimate a PAE from EF2-fast's distogram, and score it against
+AF3's real one. **Open.**
+
 ## The model is called EF2-fast 600M, and the name is load-bearing
 
 🔴 **`esmfold2` ALONE READS AS ESM'S RELEASED ESMFold2-Fast, WHICH IS A
