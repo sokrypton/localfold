@@ -676,6 +676,21 @@ function usesLanguageModel(family = chosenFamily()) {
 const plmChoice = () => document.getElementById("plm-mode")?.value ?? "esmc-600m";
 
 /**
+ * What to call the language model in a record of the fold.
+ *
+ * 🔴 READ OFF THE CONTROL, NOT WRITTEN DOWN TWICE. This was the literal
+ * "ESM-C 600M", which the archive then reported for a fold that had run against
+ * the 300M tower - a settings block naming an input the fold did not use, which
+ * is the thing that whole section exists to prevent. The option's own text is
+ * what the reader chose and needs no second table to drift from.
+ */
+function plmLabel() {
+  if (!usesLanguageModel()) return "none";
+  const select = document.getElementById("plm-mode");
+  return select?.selectedOptions?.[0]?.textContent?.trim() ?? plmChoice();
+}
+
+/**
  * Which EF2-fast checkpoint the PLM row is asking for.
  *
  * 🔴 THE TOWER AND THE FOLDING MODEL ARE ONE CHOICE, NOT TWO. Biohub publish
@@ -2541,7 +2556,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     settings: {
       seed: foldContext.settings?.seed,
       "trunk passes": recycleCount() + 1,
-      "language model": usesLanguageModel() ? "ESM-C 600M" : "none",
+      "language model": plmLabel(),
       sampler: samplerPreset(),
       "diffusion steps": result.steps,
     },
