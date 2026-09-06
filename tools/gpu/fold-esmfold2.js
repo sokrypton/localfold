@@ -30,6 +30,9 @@ import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
+import {
+  CONTACT_ANGSTROMS, CONTACT_ANGSTROMS_BY_KIND, CONTACT_EDGES,
+} from "../../src/esmfold2/distogram-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -112,6 +115,11 @@ export async function main(device, args = []) {
   // own RNG, so the honest comparison is RMSD after superposition and a few
   // angstroms is what agreement LOOKS like here.
   const reference = option(args, "reference", "");
+  // 🔴 THE 8 A CONTACT THRESHOLD IS A RESIDUE-RESIDUE CONVENTION AND A LIGAND
+  // TOKEN IS NOT A RESIDUE. `--contact-sweep` keeps the whole distogram - 46
+  // MiB at 300 tokens - and reports, per pair KIND, what each threshold would
+  // call a contact and how well the head predicts a DISTANCE at all.
+  const contactSweep = args.includes("--contact-sweep");
   if (SAMPLER_PRESETS[sampler] === undefined) {
     throw new Error(`unknown sampler ${sampler}; `
       + `expected one of ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -198,6 +206,7 @@ export async function main(device, args = []) {
     },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
+    distogramLogits: contactSweep,
     onStatus: (label) => { progress.push(label); },
     // 🔴 COUNTED PER PHASE, because "does the trunk report block by block" is a
     // number and not an impression. A bar sampled from the page cannot answer
@@ -286,8 +295,25 @@ export async function main(device, args = []) {
   // perfect while being the wrong fold, which CA-CA cannot see.
   let contactPairs = 0;
   let agreement;
+  // 🔴 THE REPRESENTATIVE ATOM AND THE PARTNER RULE ARE SHARED, because the
+  // threshold sweep below scores the same pairs this does. Two copies of a
+  // pseudo-beta rule is two chances to disagree with the distogram's own
+  // convention, and a comparison against the wrong representative compares
+  // nothing.
+  const representative = new Int32Array(result.tokens).fill(-1);
+  const { molType, asymId, residueIndex } = result.features;
+  const ligand = (t) => molType[t] === 3;
+  // ...the same rule the certainty uses, and for the same reason: a separation
+  // on the TOKEN index is a rule about a chain's neighbours, and a ligand's
+  // atoms are neither.
+  const neighbours = (i, j) => asymId[i] === asymId[j]
+    && Math.abs(residueIndex[i] - residueIndex[j]) <= 6;
+  // ...and the OBSERVED side takes the same per-kind threshold the contact map
+  // does, or the two halves of a precision are answering different questions.
+  const KIND = ["protein", "nucleic", "nucleic", "ligand"];
+  const cutoff = (i, j) => CONTACT_ANGSTROMS_BY_KIND[
+    [KIND[molType[i]], KIND[molType[j]]].sort().join("-")] ?? CONTACT_ANGSTROMS;
   if (result.contacts !== undefined) {
-    const representative = new Int32Array(result.tokens).fill(-1);
     for (let atom = 0; atom < result.atoms; atom += 1) {
       if (result.features.mask[atom] === 0) continue;
       const token = result.features.atomToToken[atom];
@@ -307,18 +333,15 @@ export async function main(device, args = []) {
     // prefix of them rather than a sequence neighbourhood. Counted rather than
     // argued: `kinds` is polymer/polymer, polymer/ligand, ligand/ligand and
     // each ligand's own self-pairs.
-    const { molType, asymId, residueIndex } = result.features;
-    const ligand = (t) => molType[t] === 3;
-    // ...the same rule the certainty uses, and for the same reason: a
-    // separation on the TOKEN index is a rule about a chain's neighbours, and a
-    // ligand's atoms are neither.
-    const neighbours = (i, j) => asymId[i] === asymId[j]
-      && Math.abs(residueIndex[i] - residueIndex[j]) <= 6;
-    const kinds = {
-      polymerPolymer: { predicted: 0, actual: 0, both: 0 },
-      polymerLigand: { predicted: 0, actual: 0, both: 0 },
-      ligandLigand: { predicted: 0, actual: 0, both: 0 },
-      ligandSelf: { predicted: 0, actual: 0, both: 0 },
+    // ...the same six names `tools/calibrate-contact-cutoff.py` reports, so the
+    // fold's numbers and the calibration's are read side by side.
+    const kinds = {};
+    const bucketFor = (i, j) => {
+      const name = [KIND[molType[i]], KIND[molType[j]]].sort().join("-");
+      if (kinds[name] === undefined) {
+        kinds[name] = { cutoff: cutoff(i, j), predicted: 0, actual: 0, both: 0 };
+      }
+      return kinds[name];
     };
     for (let i = 0; i < result.tokens; i += 1) {
       for (let j = i + 1; j < result.tokens; j += 1) {
@@ -326,13 +349,12 @@ export async function main(device, args = []) {
         const near = result.contacts[i * result.tokens + j] > 0.5;
         if (near) contactPairs += 1;
         const a = representative[i] * 3, b = representative[j] * 3;
-        const close = Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1], x[b + 2] - x[a + 2]) < 8;
+        const close = Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1],
+                                 x[b + 2] - x[a + 2]) < cutoff(i, j);
         if (near) predicted += 1;
         if (close) actual += 1;
         if (near && close) both += 1;
-        const bucket = ligand(i) && ligand(j)
-          ? (asymId[i] === asymId[j] ? kinds.ligandSelf : kinds.ligandLigand)
-          : (ligand(i) || ligand(j) ? kinds.polymerLigand : kinds.polymerPolymer);
+        const bucket = bucketFor(i, j);
         if (near) bucket.predicted += 1;
         if (close) bucket.actual += 1;
         if (near && close) bucket.both += 1;
@@ -356,8 +378,86 @@ export async function main(device, args = []) {
                   kinds, ligandTokens, ligandPairsKept, ligandPairsDropped };
   }
 
+  // 🔴 THE THRESHOLD, SWEPT PER KIND, plus whether the head predicts a DISTANCE
+  // for the pairs at all - which is the question a threshold cannot answer. A
+  // head that says nothing about protein-ligand pairs gives a flat correlation
+  // at every threshold, and one whose threshold is merely wrong does not.
+  let sweep;
+  if (contactSweep && result.distogram !== undefined) {
+    const { logits, bias } = result.distogram;
+    const bins = bias.length;
+    const width = (CONTACT_EDGES.maximum - CONTACT_EDGES.minimum) / bins;
+    const centre = (bin) => CONTACT_EDGES.minimum + (bin + 0.5) * width;
+    const thresholds = [4, 5, 6, 8, 10, 12];
+    const blank = () => ({ pairs: 0, sums: { x: 0, y: 0, xx: 0, yy: 0, xy: 0 },
+      at: Object.fromEntries(thresholds.map((t) =>
+        [t, { predicted: 0, actual: 0, both: 0 }])) });
+    const buckets = {};
+    const probability = new Float64Array(bins);
+    for (let i = 0; i < result.tokens; i += 1) {
+      for (let j = i + 1; j < result.tokens; j += 1) {
+        if (neighbours(i, j)) continue;
+        const name = [KIND[molType[i]], KIND[molType[j]]].sort().join("-");
+        if (buckets[name] === undefined) buckets[name] = blank();
+        const bucket = buckets[name];
+        // ...the head symmetrises, so the pair is read once.
+        const base = (i * result.tokens + j) * bins;
+        let peak = -Infinity;
+        for (let bin = 0; bin < bins; bin += 1) {
+          const value = logits[base + bin] + bias[bin];
+          probability[bin] = value;
+          if (value > peak) peak = value;
+        }
+        let total = 0;
+        for (let bin = 0; bin < bins; bin += 1) {
+          probability[bin] = Math.exp(probability[bin] - peak);
+          total += probability[bin];
+        }
+        let mode = 0, best = -1;
+        for (let bin = 0; bin < bins; bin += 1) {
+          probability[bin] /= total;
+          if (probability[bin] > best) { best = probability[bin]; mode = bin; }
+        }
+        const a = representative[i] * 3, b = representative[j] * 3;
+        const observed = Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1], x[b + 2] - x[a + 2]);
+        const predictedDistance = centre(mode);
+        bucket.pairs += 1;
+        bucket.sums.x += predictedDistance;
+        bucket.sums.y += observed;
+        bucket.sums.xx += predictedDistance * predictedDistance;
+        bucket.sums.yy += observed * observed;
+        bucket.sums.xy += predictedDistance * observed;
+        for (const threshold of thresholds) {
+          let mass = 0;
+          for (let bin = 0; bin < bins; bin += 1) {
+            if (centre(bin) < threshold) mass += probability[bin];
+          }
+          const cell = bucket.at[threshold];
+          if (mass > 0.5) cell.predicted += 1;
+          if (observed < threshold) cell.actual += 1;
+          if (mass > 0.5 && observed < threshold) cell.both += 1;
+        }
+      }
+    }
+    sweep = Object.fromEntries(Object.entries(buckets)
+      .filter(([, v]) => v.pairs > 0)
+      .map(([name, v]) => {
+        const n = v.pairs, { x: sx, y: sy, xx, yy, xy } = v.sums;
+        const denominator = Math.sqrt((n * xx - sx * sx) * (n * yy - sy * sy));
+        return [name, {
+          pairs: n,
+          meanPredicted: sx / n, meanObserved: sy / n,
+          distanceCorrelation: denominator === 0 ? null
+            : (n * xy - sx * sy) / denominator,
+          at: Object.fromEntries(Object.entries(v.at).map(([t, c]) => [t, {
+            ...c, precision: c.predicted === 0 ? null : c.both / c.predicted,
+            recall: c.actual === 0 ? null : c.both / c.actual }])),
+        }];
+      }));
+  }
+
   return {
-    sequence, sampler, seed, trunkPrecision,
+    sequence, sampler, seed, trunkPrecision, contactSweep: sweep,
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,
     caSpacing: spacing.length === 0 ? null

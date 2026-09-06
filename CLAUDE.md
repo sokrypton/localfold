@@ -2140,6 +2140,60 @@ is not settled whether the head cannot speak about ligand pairs or the borrowed
 `CONTACT_EDGES` are wrong for them - **open**, and it is why the ligand-free
 number is the one to trust.
 
+🔴 **AND 8 ANGSTROMS IS A PSEUDO-BETA CONVENTION, SO IT IS THE WRONG NUMBER
+FOR EVERY PAIR THAT IS NOT TWO RESIDUES.** A distogram predicts a distance
+between one representative atom per TOKEN, and for a residue that atom stands in
+for a side chain's reach while for a ligand it IS the atom. Calibrated rather
+than argued: `tools/calibrate-contact-cutoff.py` downloads real depositions,
+takes REAL atomic contact as the ground truth - any heavy atom pair under 5 A -
+and sweeps which representative-distance threshold reproduces it. 14 entries,
+41,000 real contacts, best F1:
+
+| pair | cutoff | F1 | at 8 A |
+|---|---|---|---|
+| protein-protein | **8 A** | 0.767 | the convention, confirmed |
+| ligand-protein | **7 A** | 0.707 | 0.629 |
+| ligand-nucleic | **7 A** | 0.764 | |
+| nucleic-protein | **10 A** | 0.607 | 0.444 |
+| nucleic-nucleic | **9 A** | 0.777 | |
+| ligand-ligand | **5 A** | **1.000** | 0.696 |
+
+`CONTACT_ANGSTROMS_BY_KIND` is that table, and the contact shader reads a
+PAIRS-SIZED array of bin counts rather than a constant - the pass is chunked
+over a slice of the logits, so its cell index is chunk-relative and cannot
+recover i and j to look a kind up.
+
+🔴 **AND THE LIGAND ROW IS EXACT, WHICH IS THE POINT AND NOT A FLUKE.** Both
+representatives ARE the heavy atoms, so the representative distance is not an
+approximation of the ground truth - it IS the ground truth, and 8 A was doing
+nothing there but being the wrong definition. That holds whether the two atoms
+are in one molecule or two; **what differs between intra and inter is what the
+number MEANS**, not where the line sits. Inside a molecule the geometry came
+from the CCD conformer the model was HANDED, so a prediction there is a copy.
+
+🔴 **AND A NUCLEOTIDE'S REPRESENTATIVE WAS ITS PHOSPHORUS, WHICH COST A FACTOR
+OF SIX.** `representativeAtoms` was CB, else CA, else the token's first atom - and
+a nucleotide has neither, so it took whatever came first. Across a duplex the
+phosphates are eighteen angstroms apart while the bases stack, so **no threshold
+recovers the contact**: nucleic-nucleic reads F1 0.125 at its best arm, which is
+the widest one offered. AF3's own `RESTYPE_PSEUDOBETA_INDEX` says CB (CA for
+glycine), then **C4 for a purine and C2 for a pyrimidine** - not C1', which is
+the obvious guess and a different atom. With that table the same row reads
+**0.777**, and ligand-nucleic 0.617 -> 0.764.
+
+🔴 **AND IT IS A GEOMETRIC FACT, WHICH IS WHY IT COULD BE FIXED WITHOUT AN
+ORACLE.** The calibration never runs a model: it asks whether a threshold on a
+representative distance reproduces real atomic contact in a deposited
+structure. There is no dump saying which convention ESMFold2 was trained with,
+and two independent arguments - AF3's table, and a 6x geometric improvement -
+point the same way. The shipped certainty does not move either way (it reads
+the distogram's MODE, not coordinates); what changes is the `obs` arm and every
+contact metric.
+
+🔴 **AND `named` MATCHES ALL FOUR NAME CHARACTERS, WHICH IS LOAD-BEARING HERE.**
+"C4" must not match C4', which every nucleotide also has and which is back out
+on the sugar - a silent 4 A error in the representative.
+
 🔴 **AND AF2 AND AF3 ARE NOT AFFECTED, WHICH WAS WORTH CHECKING RATHER THAN
 ASSUMING.** The report was "this affects all models". It does not:
 `distogramContactProbabilities` in src/heads/distogram.js is per PAIR with no

@@ -26,6 +26,71 @@ export const CONTACT_EDGES = { minimum: 2, maximum: 52 };
 export const CONTACT_ANGSTROMS = 8;
 
 /**
+ * ...and what it should be when the two ends are not both residues.
+ *
+ * 🔴 8 ANGSTROMS IS A PSEUDO-BETA CONVENTION AND A LIGAND TOKEN HAS NO SIDE
+ * CHAIN. The distogram predicts a distance between one representative atom per
+ * token, and for a residue that atom stands in for a whole side chain's reach
+ * while for a ligand it IS the atom. So the threshold that means "these touch"
+ * differs by what the pair is, and it is measured rather than reasoned:
+ * `tools/calibrate-contact-cutoff.py` sweeps it against real depositions, with
+ * real atomic contact - any heavy atom pair under 5 A - as the ground truth.
+ * Best F1 over 14 entries and 41,000 real contacts:
+ *
+ * | pair | cutoff | F1 | at 8 A |
+ * |---|---|---|---|
+ * | protein-protein | **8 A** | 0.767 | the convention, confirmed |
+ * | ligand-protein | **7 A** | 0.707 | 0.629 |
+ * | ligand-nucleic | **7 A** | 0.764 | |
+ * | nucleic-protein | **10 A** | 0.607 | 0.444 |
+ * | nucleic-nucleic | **9 A** | 0.777 | |
+ * | ligand-ligand | **5 A** | **1.000** | 0.696 |
+ *
+ * 🔴 AND THE LIGAND-LIGAND ROW IS EXACT, WHICH IS THE POINT RATHER THAN A
+ * FLUKE. Both representatives ARE the heavy atoms, so the representative
+ * distance is not an approximation of the ground truth - it is the ground
+ * truth, and the only thing 8 A was doing there was being the wrong
+ * definition. That holds whether the two atoms are in one molecule or two;
+ * what differs between those is what the number MEANS - inside a molecule the
+ * geometry came from the CCD conformer the model was handed, so a "prediction"
+ * there is a copy - and not where the line sits.
+ */
+export const CONTACT_ANGSTROMS_BY_KIND = {
+  "protein-protein": 8, "nucleic-protein": 10, "ligand-protein": 7,
+  "nucleic-nucleic": 9, "ligand-nucleic": 7, "ligand-ligand": 5,
+};
+
+/** protein 0 and 3 for a ligand, as `molType` numbers them. */
+const KIND_NAME = ["protein", "nucleic", "nucleic", "ligand"];
+
+/**
+ * The number of bins under the threshold THIS PAIR's kinds ask for, per pair.
+ *
+ * 🔴 IT IS A PAIRS-SIZED ARRAY BECAUSE THE PASS IS CHUNKED. The contact shader
+ * reads a slice of the logits, so its cell index is chunk-relative and it
+ * cannot recover i and j to look a kind up. An array sliced the same way needs
+ * no shader arithmetic and no second dispatch; it costs one int per pair, which
+ * is the size of the contact map it is computing.
+ */
+export function contactBinCountsByPair(molType, tokens, bins,
+                                       edges = CONTACT_EDGES) {
+  const cache = new Map();
+  const out = new Int32Array(tokens * tokens);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const kind = [KIND_NAME[molType[i]] ?? "protein",
+                    KIND_NAME[molType[j]] ?? "protein"].sort().join("-");
+      if (!cache.has(kind)) {
+        cache.set(kind, contactBinCount(bins, edges,
+          CONTACT_ANGSTROMS_BY_KIND[kind] ?? CONTACT_ANGSTROMS));
+      }
+      out[i * tokens + j] = cache.get(kind);
+    }
+  }
+  return out;
+}
+
+/**
  * How sharply the distogram knows a distance, per residue - swept, not chosen.
  *
  * 🔴 THIS IS NOT A pLDDT AND MUST NEVER BE SHOWN AS ONE. This checkpoint has no
@@ -124,17 +189,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * still a distribution because the softmax renormalises - it just puts its mass
  * in the wrong bins.
  */
-export function createContactShader({ pairs, bins }, contactBins) {
+export function createContactShader({ pairs, bins }) {
   return `
 @group(0) @binding(0) var<storage, read> logits: array<f32>;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
-@group(0) @binding(2) var<storage, read_write> contacts: array<f32>;
+// ...how many bins are under THIS pair's threshold; see CONTACT_ANGSTROMS_BY_KIND.
+@group(0) @binding(2) var<storage, read> contactBins: array<i32>;
+@group(0) @binding(3) var<storage, read_write> contacts: array<f32>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let cell = id.x + id.y * ${GRID_WIDTH * LANES}u;
   if (cell >= ${pairs}u) { return; }
   let base = cell * ${bins}u;
+  let near_bins = u32(contactBins[cell]);
   var largest = -3.0e38;
   for (var b = 0u; b < ${bins}u; b += 1u) {
     largest = max(largest, logits[base + b] + bias[b]);
@@ -144,7 +212,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var b = 0u; b < ${bins}u; b += 1u) {
     let weight = exp(logits[base + b] + bias[b] - largest);
     total += weight;
-    if (b < ${contactBins}u) { near += weight; }
+    if (b < near_bins) { near += weight; }
   }
   contacts[cell] = near / max(total, 1.0e-30);
 }`;
@@ -336,7 +404,7 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  * @returns {Float32Array} one probability per token pair
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
-                                                  weights, bias, partners,
+                                                  weights, bias, partners, molType,
                                                   chunk = 8192,
                                                   wantLogits = false,
                                                   retainForFrames = false }) {
@@ -364,12 +432,12 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     createCertaintyShader({ tokens, separation: CERTAINTY.separation, modeCutoffBin }));
   const project = {};
   const contact = {};
-  const near = contactBinCount(bins);
+
   for (const rows of heights) {
     project[rows] = await cache.get(`${key}:project:${rows}`,
       createLinearShader({ rows, inner: channels, outer: bins }, false));
     contact[rows] = await cache.get(`${key}:contact:${rows}`,
-      createContactShader({ pairs: rows, bins }, near));
+      createContactShader({ pairs: rows, bins }));
   }
 
   const held = [];
@@ -410,6 +478,11 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     }
     const partnerBuffer = keep(allocator.upload("esmfold2.disto.partners",
       partners, storage));
+    if (molType === undefined || molType.length !== tokens) {
+      throw new Error("encodeContactMap needs molType, one per token");
+    }
+    const binCounts = keep(allocator.upload("esmfold2.disto.contact-bins",
+      contactBinCountsByPair(molType, tokens, bins), storage));
     await submit("esmfold2.distogram", [
       ["symmetrise", symmetrise, [pair, symmetric], ...elementwise(pairs * channels)],
     ]);
@@ -437,6 +510,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
             ? { buffer: logits.buffer, byteOffset: start * bins * 4,
                 byteSize: rows * bins * 4 }
             : logits, biasBuffer,
+          { buffer: binCounts.buffer, byteOffset: start * 4, byteSize: rows * 4 },
           { buffer: contacts.buffer, byteOffset: start * 4, byteSize: rows * 4 }],
          ...elementwise(rows)],
       ]);
