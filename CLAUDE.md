@@ -73,6 +73,10 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
+| ...and does the CPU reference? | `node tools/check-esmfold2-trunk.js` (77 s a loop) |
+| Which convention does one ESMFold2 module want? | `node tools/check-esmfold2-modules.js` |
+| What does ESMFold2's trunk cost, by length? | `tools/gpu/bench-esmfold2-trunk.js` |
 | How small can ESM-C get before ESMFold2 notices? | `tools/esmc/probe-esmc-compression.py` |
 | ...and what does that cost the STRUCTURE? | `.venv-esm/bin/python tools/esmc/probe-esmfold2-structure.py` |
 | Where do I get ESM-C and ESMFold2? | `tools/esmc/fetch.py` (3.0 GB, ungated, MIT) |
@@ -966,6 +970,79 @@ what CHURNS. `peakByLabel` is what was on the device when it was fullest and
 its rows sum to `peakBytes`; that is what says which tensor to attack, and it
 is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
 `tools/gpu/fold-af2.js` prints both.
+
+## ESMFold2's trunk: AF3's pair track, minus two of its five
+
+🔴 **IT IS AF3's PAIRFORMER BLOCK WITH THE GRID ATTENTIONS AND THE SINGLE TRACK
+REMOVED, AND THAT IS MEASURED.** `tools/check-esmfold2-trunk.js` composes
+`src/af3/pairformer-reference.js`'s three surviving pieces 24 times and scores
+them against the values the native model recorded going into and coming out of
+its trunk at each of its four recycles: **relRMS 1.4e-6** against a 2e-4 bound.
+So the port needed no new arithmetic, only the weights in AF3's shapes -
+`tools/esmc/esmfold2_trunk_weights.py`, exported by
+`tools/export_esmfold2_trunk.py`.
+
+🔴 **AND THE TWO TRIANGLES NEED OPPOSITE CONVERSIONS, WHICH NOTHING IN THE
+SHAPES SAYS.** ESMFold2 runs both directions through ONE engine and tells them
+apart by which half of `proj_bundle` is the left operand; AF3 keeps the halves
+fixed and changes the einsum. The modules are the same class with the same
+shapes, so a converter that treats them alike gets the incoming one exactly
+backwards. Swept rather than read, by `tools/check-esmfold2-modules.js`:
+
+| | halves in order | halves swapped |
+|---|---|---|
+| `tri_mul_out` -> outgoing | **2.83e-7** | 3.69e-1 |
+| `tri_mul_in` -> incoming | 3.24e-1 | **2.86e-7** |
+
+Every wrong-DIRECTION arm scores 0.32 or worse, which is what says the sweep
+discriminates rather than blessing whatever it was handed.
+
+🔴 **AND `pair_transition` RETURNS ITS RESIDUAL WHILE THE TRIANGLES RETURN
+THEIR DELTA, IN THE SAME BLOCK.** `x + ffn(norm(x))` against
+`proj_emit(...)` - so a correct transition scored against the recorded output
+reads **9.01e-1**, which looks exactly like wrong arithmetic and sent an
+afternoon into re-reading two implementations that already agreed.
+`rms(output - input)` 1.48 against `rms(output)` 12.3 is what settled it. Ask
+what a recorded tensor IS before scoring against it.
+
+🔴 **AND THE GRID ATTENTION IS SKIPPED, NOT ZEROED.** An attention whose output
+projection is zero adds zero, so a zeroed AF3 block already IS ESMFold2's block
+and needs no graph code at all. It is also pure waste: `grid.attend` is the
+largest kernel in an AF3 trunk and this trunk runs 24 blocks four times over.
+`compilePairTrack`/`encodePairTrack` take a `gridAttention` flag (default true,
+so no existing caller moves) and `src/esmfold2/trunk-webgpu.js` sets it false.
+Worth **1.42x**, and `tools/gpu/check-esmfold2-trunk-gpu.js` runs both arms over
+the same weights at the same shapes and asserts **0 differing elements** - not a
+tolerance, because dropping passes from a track whose five updates each read the
+pair as the last one left it is precisely the change that returns a plausible
+tensor. The zeroed weights are synthesised by the checker; shipping them would
+be 37.7 MiB of zeros in the bundle.
+
+🔴 **AND THE TWO f16 KNOBS ARE PRICED VERY DIFFERENTLY, SO THIS TRUNK ANSWERS
+DIFFERENTLY FROM AF3's.** The transition's staged tiles and the triangle
+projection's eight vec4 of accumulators are separate kernels, and AF3 narrows
+both. Separated - error against the native model at 40 residues, time swept by
+`bench-esmfold2-trunk.js`:
+
+| staged : accumulate | relRMS | 40 tokens | 150 | 300 |
+|---|---|---|---|---|
+| f32 : f32 | **1.10e-6** | 1.000x | 1.000 | 1.000 |
+| **f16 : f32** (shipped) | **5.46e-4** | 1.163 | 1.240 | **1.306** |
+| f32 : f16 | 2.62e-3 | 1.102 | 1.088 | 1.151 |
+| f16 : f16 | 2.68e-3 | 1.348 | 1.466 | 1.480 |
+
+The ACCUMULATOR carries 96% of the error and returns the smaller half of the
+speedup, at every length. AF3 keeps it because it was priced on that kernel
+alone - 1.55x on `bench-triangle-project.js` at 118 tokens - rather than against
+the other knob. **Price a precision knob against the other knobs, not against
+f32.**
+
+🔴 **AND THE TRUNK IS THE EXPENSIVE HALF OF THIS MODEL, NOT THE TOWER.** ESM-C
+600M folds 300 residues in 0.91 s. The trunk at 300 tokens is **10.2 s a loop
+and it runs four loops** - 41 s - holding 534 MiB, because `d_pair` is 256 where
+AF3's is 128 and 24 blocks x 4 loops is 96 block evaluations where an AF3 trunk
+runs 48. Per block it is 374 ms at 300 tokens. Whatever "is this worth shipping"
+turns on, it is this number and not the language model's.
 
 ## A language model instead of an alignment: ESMFold2
 

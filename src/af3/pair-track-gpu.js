@@ -81,10 +81,24 @@ export async function compilePairTrack(cache, options) {
   const shape = {
     length: n, cZ: channels, cHidden: channels, weightPrecision, accumulatePrecision,
   };
+  // 🔴 A STACK WITHOUT THE GRID ATTENTION IS THIS TRACK MINUS TWO OF ITS FIVE
+  // UPDATES, AND THAT IS ESMFold2's TRUNK EXACTLY. Its block is a pairformer
+  // block with the two grid attentions and the single track removed - checked
+  // at relRMS 1.4e-6 per recycle by tools/check-esmfold2-trunk.js - so the
+  // arithmetic transfers whole and only the SEQUENCE changes.
+  //
+  // 🔴 AND SKIPPING BEATS ZEROING, WHICH IS THE OBVIOUS WAY TO DO IT. An
+  // attention whose output projection is zero adds zero, so a zeroed block IS
+  // ESMFold2's block and needs no code at all - but grid.attend is the largest
+  // kernel in an AF3 trunk (34.6% of its GPU time at 700 tokens) and it would
+  // run 24 times a loop, four loops, to add zero. The zeroed arm stays as the
+  // thing this is checked bit-identical against; see check-esmfold2-trunk-gpu.js.
+  const gridAttention = options.gridAttention ?? true;
   const triangleOffsets = packTriangleWeights(
     af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels),
     weightPrecision).offsets;
-  const gridOffsets = packGridAttentionWeights(sample.pairAttention1).offsets;
+  const gridOffsets = gridAttention
+    ? packGridAttentionWeights(sample.pairAttention1).offsets : null;
   const transitionOffsets = packTransitionWeights(sample.pairTransition).offsets;
 
   const pipelines = {};
@@ -124,8 +138,9 @@ export async function compilePairTrack(cache, options) {
                   source);
     }
   }
-  for (const [key, attention, transpose] of
-       [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]) {
+  for (const [key, attention, transpose] of (gridAttention
+       ? [["false", sample.pairAttention1, false], ["true", sample.pairAttention2, true]]
+       : [])) {
     const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
         residual: true, stagedPrecision },
@@ -174,14 +189,19 @@ export async function compilePairTrack(cache, options) {
 }
 
 /** Pack one block's pair-track weights, ready to upload. */
-export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrecision = "f32") {
+export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrecision = "f32",
+                                    gridAttention = true) {
   return {
     outgoing: packTriangleWeights(
       af3TriangleWeights(block.triangleMultiplicationOutgoing, channels), weightPrecision).data,
     incoming: packTriangleWeights(
       af3TriangleWeights(block.triangleMultiplicationIncoming, channels), weightPrecision).data,
-    grid1: packGridAttentionWeights(block.pairAttention1).data,
-    grid2: packGridAttentionWeights(block.pairAttention2).data,
+    // ...and a block with no grid attention has no such tensors to pack. See
+    // compilePairTrack's gridAttention.
+    ...(gridAttention ? {
+      grid1: packGridAttentionWeights(block.pairAttention1).data,
+      grid2: packGridAttentionWeights(block.pairAttention2).data,
+    } : {}),
     transition: packTransitionWeights(block.pairTransition, weightPrecision).data,
   };
 }
@@ -327,7 +347,9 @@ export function encodePairTrack(context) {
         ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
   }
 
-  for (const [key, w] of [["false", weights.grid1], ["true", weights.grid2]]) {
+  // Two of the five updates, or none of them - see compilePairTrack.
+  for (const [key, w] of ((context.gridAttention ?? true)
+       ? [["false", weights.grid1], ["true", weights.grid2]] : [])) {
     const p = (name) => pipelines[`grid:${key}:${name}`];
     const linear = spread(ceil(pairs, 64));
     const perNormalize = spread(ceil(pairs, pipelines.gridTiles.normalizeRows));
