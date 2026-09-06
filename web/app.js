@@ -345,10 +345,16 @@ const MODEL_LABELS = {
   multimer: "AlphaFold 2",
   // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
   // ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a different
-  // and better model; this is the 600M experimental one, which is the one that
-  // fits a browser. The dropdown said "ESMFold2" while the status line said
-  // "ESMFold2 600M", so the page was making the confusion twice.
-  "ef2-fast-600m": "EF2-fast 600M",
+  // and better model; this is an experimental one sized to fit a browser.
+  //
+  // 🔴 AND THE SIZE IS NOT IN THE LABEL, BECAUSE THE PLM ROW SAYS IT. "600M"
+  // names the TOWER, not the folding model - which is 171 M in every published
+  // variant - so carrying it in the model name said the wrong thing twice over
+  // once a row appeared naming the language model outright. The family id keeps
+  // it (`ef2-fast-600m` is the checkpoint `base600M-step1500k`), because a
+  // 300M sibling would be a DIFFERENT fold bundle rather than a tower swap: its
+  // shim is trained for 30 layers x 960 against this one's 36 x 1152.
+  "ef2-fast-600m": "EF2-fast",
 };
 
 const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,

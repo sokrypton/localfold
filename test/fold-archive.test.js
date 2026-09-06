@@ -226,7 +226,7 @@ describe("an archive from a model with no confidence head", () => {
   // ...no `templates` and no `msaOrigin`, which is how a caller says "this
   // model has neither control" as opposed to "neither was used".
   const build = () => buildFoldArchive({
-    stem: "fold_ef2", model: "EF2-fast 600M", settings: { seed: 3 },
+    stem: "fold_ef2", model: "EF2-fast", settings: { seed: 3 },
     entities: [{ type: "protein", value: "AAAA", copies: 1 }], prediction,
   });
 
@@ -257,7 +257,7 @@ describe("an archive from a model with no confidence head", () => {
     // claim. Same rule as the certainty's own empty-filter fallback.
     const short = { ...prediction, chainLengths: [4] };
     const files = buildFoldArchive({
-      stem: "fold_short", model: "EF2-fast 600M", settings: {},
+      stem: "fold_short", model: "EF2-fast", settings: {},
       entities: [{ type: "protein", value: "AAAA", copies: 1 }],
       prediction: {
         ...short,
