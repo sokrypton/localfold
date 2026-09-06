@@ -77,6 +77,26 @@ def main():
     writer.add('featuriser/tokenBonds', transposed('token_bonds.weight'))
     writer.add('featuriser/zInit1', transposed('z_init_1.weight'))
     writer.add('featuriser/zInit2', transposed('z_init_2.weight'))
+
+    # 🔴 THE INPUTS EMBEDDER, WHICH IS NOT AF3'S ATOM ENCODER. Sliding-window
+    # self-attention over atoms with a 3D rotary embedding built from the
+    # reference conformer - see src/esmfold2/atom-encoder-reference.js. Reusing
+    # AF3's windowed pair-biased encoder would have been the obvious wrong move;
+    # nothing in the shapes says they differ.
+    atom = 'inputs_embedder.atom_attention_encoder'
+    writer.add('atom/linear', transposed('%s.atom_linear.weight' % atom))
+    writer.add('atom/norm/scale', np.asarray(get('%s.atom_norm.weight' % atom), np.float32))
+    writer.add('atom/norm/offset', np.asarray(get('%s.atom_norm.bias' % atom), np.float32))
+    writer.add('atom/toToken', transposed('%s.atom_to_token_linear.weight' % atom))
+    atom_blocks = len({k.split('.')[5] for k in source.keys()
+                       if k.startswith('%s.atom_transformer.blocks.' % atom)})
+    for layer in range(atom_blocks):
+        at = '%s.atom_transformer.blocks.%d' % (atom, layer)
+        for leaf, name in (('adaln_modulation.1', 'adaln'), ('attn.Wqkv', 'qkv'),
+                           ('attn.gate_proj', 'attnGate'), ('attn.out_proj', 'attnOut'),
+                           ('ffn.w_up', 'ffnUp'), ('ffn.w_down', 'ffnDown')):
+            writer.add('atom/blocks/%d/%s' % (layer, name),
+                       transposed('%s.%s.weight' % (at, leaf)))
     writer.close()
 
     parameters = sum(int(np.prod(r['shape'])) for r in writer.records.values())
@@ -92,6 +112,14 @@ def main():
                   # change to its exporter decodes cleanly into the wrong thing -
                   # which is exactly what the stale int5 ESM-C bundle did.
                   'singleInputs': int(source.shape('z_init_1.weight')[1]),
+                  'atomChannels': int(source.shape(
+                      '%s.atom_linear.weight' % 'inputs_embedder.atom_attention_encoder')[0]),
+                  'atomBlocks': atom_blocks,
+                  'atomHeads': 4,
+                  'atomWindow': 128,
+                  'tokenChannels': int(source.shape(
+                      '%s.atom_to_token_linear.weight'
+                      % 'inputs_embedder.atom_attention_encoder')[0]),
                   'relativeFeatures': int(source.shape('rel_pos.embed.weight')[1]),
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',

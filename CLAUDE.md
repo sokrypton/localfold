@@ -1037,6 +1037,51 @@ alone - 1.55x on `bench-triangle-project.js` at 118 tokens - rather than against
 the other knob. **Price a precision knob against the other knobs, not against
 f32.**
 
+🔴 **THE INPUTS EMBEDDER IS NOT AF3's ATOM ENCODER, AND REUSING IT WOULD HAVE
+BEEN THE OBVIOUS WRONG MOVE.** AF3 runs 32-query/128-key windowed atom attention
+biased by a pair representation. ESMFold2 runs plain **sliding-window
+self-attention** over atoms, half-window 64, whose only positional signal is a
+**3D rotary embedding built from the reference conformer**: `ref_pos` x 3 axes x
+2 pairs at base 20, plus `ref_space_uid` x 10 pairs at base 10000, filling
+`head_dim / 2 = 16` exactly. The window is over **rank among valid atoms**, not
+raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
+**affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
+rotation. Nothing in the shapes says any of this: both are "an atom transformer
+at 128 channels". `src/esmfold2/atom-encoder-reference.js`.
+
+🔴 **AND ITS ROTARY TABLE IS bfloat16 IN A float32 MODEL, WHICH IS WORTH 2.4e-3
+AND LOOKS EXACTLY LIKE A CONVENTION BUG.** The whole module read **2.8e-4**
+against the native one. Every primitive was then verified twice - against the
+torch source and against ../alphafold3's independently written JAX reference -
+and nine convention arms were swept (`half_window` 32/64/128, rank against raw
+index, the diagonal, the rotation, `qk_norm`, three epsilons). **Not one of them
+moved the residual.** What did was capturing the module's own intermediates,
+which report:
+
+    cos  bfloat16 [1, 320, 16]
+    sin  bfloat16 [1, 320, 16]
+
+`build_3d_rope` computes in float32 and the table reaches the attention at eight
+mantissa bits. Rounding this reference's own table to bfloat16 reproduces the
+native one on **all 5120 entries, bit for bit** - so the table was right the
+whole time and only its PRECISION was not.
+
+🔴 **AND THE ATTENTION ITSELF DOWNCASTS TOO, WHICH IS WHY THE CHECK HAS TWO
+ARMS.** `SWA3DRoPEAttention.forward` runs `if q.dtype not in (float16,
+bfloat16): q, k, v = q.bfloat16(), ...` unconditionally, so a float32 port
+cannot agree with the shipping model below about 2e-4 however right it is.
+`dump-esmfold2-trunk.py --float32-attention` neutralises the cast and is the arm
+that says the arithmetic is right; the dump records which arm it is so a checker
+cannot be handed the wrong bound. Measured, same code both ways:
+
+| | control (f32 attention) | shipping (bf16) |
+|---|---|---|
+| the atom transformer's pooled output | **7.0e-8** | 2.1e-4 |
+| one block's attention | 4.1e-7 | 2.4e-3 |
+
+**A residual that survives every convention sweep is a PRECISION fact, and the
+way to find it is to ask the module what dtype it is holding.**
+
 🔴 **`model.py` IS A DIFFERENT MODEL FROM `experimental.py`, AND ITS RECURRENCE
 IS NOT THIS ONE.** Both live in `esm/models/esmfold2/`, both define a
 `folding_trunk` and a `z_init`, and the class this repository loads is

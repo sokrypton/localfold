@@ -22,6 +22,7 @@ import { readTensor } from "../src/reference/dtype.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
 } from "../src/esmfold2/featuriser-reference.js";
+import { inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");
@@ -99,6 +100,99 @@ const report = (label, score, note = "") => {
       + "     so all this says is that zero in gives zero out. A ligand or a\n"
       + "     modified residue is what would exercise it.");
   }
+}
+
+// --- the inputs embedder: the atom transformer and its pooling.
+{
+  const feature = (name) => Float32Array.from(dump.features[name].values);
+  const integers = (name) => Int32Array.from(dump.features[name].values);
+  const atoms = dump.features.ref_pos.shape[1];
+  const embedderArgs = module("inputs_embedder").arguments;
+  const shape = {
+    atoms, tokens: n,
+    channels: manifest.trunk.atomChannels, heads: manifest.trunk.atomHeads,
+    blocks: manifest.trunk.atomBlocks, tokenChannels: manifest.trunk.tokenChannels,
+    hidden: manifest.trunk.atomChannels * 2, windowSize: manifest.trunk.atomWindow,
+  };
+  const blockWeights = [];
+  for (let layer = 0; layer < shape.blocks; layer += 1) {
+    const at = (leaf) => tensors[`atom/blocks/${layer}/${leaf}`];
+    blockWeights.push({
+      adaln: at("adaln"), qkv: at("qkv"), attnGate: at("attnGate"),
+      attnOut: at("attnOut"), ffnUp: at("ffnUp"), ffnDown: at("ffnDown"),
+    });
+  }
+  const { tokenAct } = inputsEmbedder({
+    refPos: feature("ref_pos"), refCharge: feature("ref_charge"),
+    refElement: integers("ref_element"),
+    refAtomNameChars: integers("ref_atom_name_chars"),
+    refSpaceUid: feature("ref_space_uid"),
+    atomToToken: integers("atom_to_token"),
+    mask: feature("atom_attention_mask"),
+  }, shape, {
+    atomLinear: tensors["atom/linear"],
+    atomNormScale: tensors["atom/norm/scale"],
+    atomNormOffset: tensors["atom/norm/offset"],
+    atomToToken: tensors["atom/toToken"],
+    blocks: blockWeights,
+  });
+
+  // 🔴 THE MODULE'S OUTPUT IS s_inputs, NOT THE POOLING: 451 channels, of which
+  // the first `tokenChannels` are the atom transformer's and the rest are the
+  // residue one-hot, the profile and the deletion mean. Those three come from
+  // the module's own arguments rather than being rebuilt here - what is under
+  // test is the atom transformer, and a featuriser that also built the one-hots
+  // would be testing two things and localising neither.
+  const want = Float32Array.from(module("inputs_embedder").output);
+  const width = dump.block0.inputs_embedder.outputShape[2];
+  const pooled = new Float32Array(n * shape.tokenChannels);
+  for (let token = 0; token < n; token += 1) {
+    for (let c = 0; c < shape.tokenChannels; c += 1) {
+      pooled[token * shape.tokenChannels + c] = want[token * width + c];
+    }
+  }
+  // 🔴 THE ATOM ATTENTION COMPUTES IN bfloat16 IN A float32 MODEL, SO THE BOUND
+  // DEPENDS ON WHICH DUMP THIS IS. `SWA3DRoPEAttention.forward` casts q, k and
+  // v unconditionally - `if q.dtype not in (float16, bfloat16): q, k, v =
+  // q.bfloat16(), ...` - so a float32 port cannot agree below about 2e-4, and
+  // that residual looks exactly like a convention bug. It is not one: against
+  // `dump-esmfold2-trunk.py --float32-attention`, which neutralises the cast,
+  // the same code reads 7.0e-8.
+  const control = dump.float32Attention === true;
+  const atomBound = control ? 2e-6 : 5e-4;
+  const atomScore = relative(tokenAct, pooled);
+  const atomOk = atomScore <= atomBound;
+  if (!atomOk) failures += 1;
+  console.log(`  ${"inputs_embedder (the atom half)".padEnd(34)} relRMS `
+    + `${atomScore.toExponential(3)}   bound ${atomBound.toExponential(0)}   `
+    + `${atomOk ? "ok" : "FAILED"}   ${control ? "(float32 control)" : "(bf16 attention)"}`);
+  if (!control) {
+    console.log("  🔴 this is the SHIPPING arm and its floor is the module's own\n"
+      + "     bfloat16 downcast, not this port. --float32-attention is the arm\n"
+      + "     that says the arithmetic is right, and it reads 7.0e-8.");
+  }
+
+  // ...and the tail, so the concatenation's own layout is pinned too.
+  const aatype = Float32Array.from(embedderArgs.aatype.values);
+  const profile = Float32Array.from(embedderArgs.profile.values);
+  const deletion = Float32Array.from(embedderArgs.deletion_mean.values);
+  const classes = embedderArgs.aatype.shape[2];
+  let worstTail = 0;
+  for (let token = 0; token < n; token += 1) {
+    for (let c = 0; c < classes; c += 1) {
+      worstTail = Math.max(worstTail, Math.abs(
+        want[token * width + shape.tokenChannels + c] - aatype[token * classes + c]));
+      worstTail = Math.max(worstTail, Math.abs(
+        want[token * width + shape.tokenChannels + classes + c]
+        - profile[token * classes + c]));
+    }
+    worstTail = Math.max(worstTail, Math.abs(
+      want[token * width + width - 1] - deletion[token]));
+  }
+  const tailOk = worstTail < 1e-6;
+  if (!tailOk) failures += 1;
+  console.log(`  ${"...its [aatype | profile | deletion] tail".padEnd(34)} max `
+    + `${worstTail.toExponential(3)}   ${tailOk ? "ok" : "FAILED"}`);
 }
 
 // --- z_init_1 and z_init_2, against the x_inputs the model itself produced.

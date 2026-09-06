@@ -47,9 +47,20 @@ def main():
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
     parser.add_argument('--sequence-length', type=int, default=40)
     parser.add_argument('--out', default=None)
+    parser.add_argument('--float32-attention', action='store_true',
+                        help='the CONTROL: neutralise the atom attention\'s '
+                             'unconditional bfloat16 downcast')
     arguments = parser.parse_args()
 
     torch.set_grad_enabled(False)
+    if arguments.float32_attention:
+        # 🔴 SWA3DRoPEAttention CASTS q, k AND v TO bfloat16 WHATEVER THE MODEL'S
+        # DTYPE - `if q.dtype not in (float16, bfloat16): q, k, v = q.bfloat16()...`
+        # - so a float32 port cannot agree with it below about 1e-4 and the
+        # residual looks exactly like a convention bug. Neutralising the cast is
+        # the control that tells the two apart. It is global and deliberately
+        # crude: this arm exists to answer one question, not to fold.
+        torch.Tensor.bfloat16 = lambda self: self
     torch.set_num_threads(8)
     from esm.models.esmfold2 import EsmFold2ExperimentalModel
     from esm.models.esmfold2.protein_utils import prepare_protein_features
@@ -120,6 +131,21 @@ def main():
                model.token_bonds.register_forward_hook(module_hook('token_bonds'), with_kwargs=True),
                model.language_model.register_forward_hook(module_hook('language_model'), with_kwargs=True)]
 
+    # 🔴 AND INSIDE THE ATOM ENCODER, BECAUSE ITS OUTPUT ALONE SAYS "SOMEWHERE
+    # IN THREE BLOCKS AND A POOLING". The whole-module check read 2e-4 with
+    # every primitive verified by reading, which is exactly when a ladder is
+    # worth more than another re-reading.
+    encoder = model.inputs_embedder.atom_attention_encoder
+    for label, module in (('atom.linear', encoder.atom_linear),
+                          ('atom.norm', encoder.atom_norm),
+                          ('atom.toToken', encoder.atom_to_token_linear)):
+        handles.append(module.register_forward_hook(module_hook(label), with_kwargs=True))
+    for index, block in enumerate(encoder.atom_transformer.blocks):
+        handles.append(block.register_forward_hook(
+            module_hook('atom.block%d' % index), with_kwargs=True))
+        handles.append(block.attn.register_forward_hook(
+            module_hook('atom.block%d.attn' % index), with_kwargs=True))
+
     features = prepare_protein_features(sequence)
     # 🔴 AND THE FEATURES THEMSELVES, because rel_pos is a pure function of five
     # integer arrays and the atom encoder of seven. A JavaScript featuriser that
@@ -154,6 +180,10 @@ def main():
         'sequence': sequence,
         'esmfold2': arguments.esmfold2,
         'loops': len(captured['loops']),
+        # 🔴 WHICH ARM THIS IS, IN THE ARTEFACT. A port that agrees with the
+        # control to 7e-8 and with the shipping model to 2e-4 is CORRECT, and a
+        # checker handed the wrong dump with the wrong bound says the opposite.
+        'float32Attention': bool(arguments.float32_attention),
         'blocks': blocks,
         'shapes': {'pair': list(captured['loops'][0].shape)},
         # The first projection sees a zero z, so its output is
