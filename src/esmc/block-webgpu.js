@@ -374,7 +374,19 @@ export const QUERY_TILE = 8;
  * was worth taking from that attempt is the ONLINE SOFTMAX, which is what lets
  * a tile of queries hold only the current chunk's logits instead of all L.
  */
-export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_TILE) {
+/**
+ * 🔴 AND `chainAware` IS WHAT A COMPLEX NEEDS, WHICH IS NOT A FLAG ABOUT
+ * SPEED. ESMFold2 hands ESM-C every chain in one packed array -
+ * `[BOS] chain1 [EOS BOS] chain2 ... [EOS]` - with a `sequence_id` per chain,
+ * and the attention is `seq_id[i] == seq_id[j]`: a key in another chain is
+ * excluded outright. Running the tower once per chain instead is NOT the same
+ * model, because the rotary positions are ABSOLUTE over the packed array with
+ * no per-chain reset - chain two's first residue sits at `len(chain one) + 3`,
+ * and giving it position 1 changes the phase on every head while conforming in
+ * every shape.
+ */
+export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_TILE,
+                                      chainAware = false) {
   const headDim = model / heads;
   if (headDim !== LANES) {
     throw new RangeError(`this kernel assumes headDim == ${LANES}; got ${headDim}`);
@@ -391,8 +403,11 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
   }
   const writeLogits = [];
   for (let t = 0; t < queryTile; t += 1) {
+    // ...one liveness per QUERY when the chains matter, because the test is
+    // between this query and this key rather than about the key alone.
+    const alive = chainAware ? `live && q_sequence[${t}u] == key_sequence` : "live";
     writeLogits.push(`      chunk[${t}u * ${LANES}u + local.x] = `
-      + `select(-3.0e38, dot_${t} * ${(1 / Math.sqrt(headDim)).toPrecision(9)}, live);`);
+      + `select(-3.0e38, dot_${t} * ${(1 / Math.sqrt(headDim)).toPrecision(9)}, ${alive});`);
   }
   const accumulate = [];
   for (let t = 0; t < queryTile; t += 1) {
@@ -404,6 +419,7 @@ export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
 @group(0) @binding(3) var<storage, read_write> destination: array<f32>;
+${chainAware ? "@group(0) @binding(4) var<storage, read> sequence: array<i32>;" : ""}
 
 var<workgroup> q_tile: array<f32, ${queryTile * headDim}>;
 var<workgroup> chunk: array<f32, ${queryTile * LANES}>;
@@ -411,6 +427,7 @@ var<workgroup> peak: array<f32, ${queryTile}>;
 var<workgroup> rescale_of: array<f32, ${queryTile}>;
 var<workgroup> total: array<f32, ${queryTile}>;
 var<workgroup> running: array<f32, ${queryTile}>;
+${chainAware ? `var<workgroup> q_sequence: array<i32, ${queryTile}>;` : ""}
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -429,6 +446,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (local.x < ${queryTile}u) {
     peak[local.x] = -3.0e38;
     running[local.x] = 0.0;
+${chainAware ? `    q_sequence[local.x] = select(-1, sequence[row_origin + local.x],
+                                row_origin + local.x < ${rows}u);` : ""}
   }
   workgroupBarrier();
 
@@ -437,6 +456,7 @@ ${accumulators.join("\n")}
   for (var k0 = 0u; k0 < ${rows}u; k0 += ${LANES}u) {
     let j = k0 + local.x;
     let live = j < ${rows}u;
+${chainAware ? `    let key_sequence = select(-2, sequence[j], live);` : ""}
     // Phase one: a lane owns a KEY. Each key value it reads is used by all
     // ${queryTile} queries, which is the whole point of the tile.
 ${logits.join("\n")}

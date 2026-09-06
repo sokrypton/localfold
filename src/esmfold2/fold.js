@@ -24,7 +24,7 @@
  */
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader, linearGrid }
   from "../esmc/block-webgpu.js";
-import { sequenceIds } from "../esmc/tower-reference.js";
+import { featuriseForEsmfold2, languageModelInput } from "./featurise.js";
 import { EsmcTowerGpu } from "../esmc/tower-webgpu.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -33,7 +33,6 @@ import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffus
 import { buildRope } from "./atom-encoder-reference.js";
 import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
 import { encodeLanguagePair } from "./language-pair-webgpu.js";
-import { featuriseForEsmfold2 } from "./featurise.js";
 import { linear } from "./featuriser-reference.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
@@ -140,6 +139,66 @@ export function assembleSingleInputs(tokenAct, features, tokens, tokenChannels,
 }
 
 /**
+ * What the shim's single half returns for a hidden state of all zeros.
+ *
+ * 🔴 A NON-PROTEIN TOKEN'S HIDDEN STATE IS ZERO, WHICH IS NOT THE SAME AS
+ * ABSENT. `compute_lm_hidden_states` fills a zero tensor and writes only the
+ * protein positions, so a ligand atom or a nucleotide reaches the shim as
+ * zeros - and the shim's LayerNorm has an OFFSET and its downprojection a
+ * BIAS, so its answer there is a fixed non-zero vector rather than nothing.
+ * Dropping those tokens from the pair term instead is a different model.
+ *
+ * LayerNorm(0) is the offset exactly, the mix weights sum to one, and the
+ * projection is shared across the 37 states - so the whole thing collapses to
+ * one row of arithmetic, done once.
+ */
+export function shimSingleForZeroState(weights, model, pair) {
+  const offset = weights["lm/norm/offset"];
+  const projection = weights["lm/projection/weights"];
+  const accumulated = new Float32Array(pair);
+  for (let i = 0; i < model; i += 1) {
+    const value = offset[i];
+    if (value === 0) continue;
+    const base = i * pair;
+    for (let c = 0; c < pair; c += 1) accumulated[c] += value * projection[base + c];
+  }
+  const down = weights["lm/downproject/weights"];
+  const out = Float32Array.from(weights["lm/downproject/bias"]);
+  for (let i = 0; i < pair; i += 1) {
+    const value = accumulated[i];
+    if (value === 0) continue;
+    const base = i * pair;
+    for (let c = 0; c < pair; c += 1) out[c] += value * down[base + c];
+  }
+  return out;
+}
+
+/**
+ * The tower's rows, placed back on the tokens that asked for them.
+ *
+ * 🔴 THE TOWER'S ROWS ARE NOT THE MODEL'S TOKENS, in three ways at once. A
+ * non-protein token was never sent; an atom-tokenised residue sent ONE row for
+ * all of its tokens; and every chain contributes a BOS and an EOS that are rows
+ * of the tower's output and not tokens of anything. `tokenToRow` is the map,
+ * and -1 is what it says for a token the tower did not see.
+ */
+export function scatterLanguageSingle(rows, lm, tokens, pair, shim) {
+  const zero = shimSingleForZeroState(shim, shim["lm/norm/offset"].length, pair);
+  const out = new Float32Array(tokens * pair);
+  for (let token = 0; token < tokens; token += 1) {
+    const row = lm.tokenToRow[token];
+    const base = token * pair;
+    if (row < 0) { out.set(zero, base); continue; }
+    if ((row + 1) * pair > rows.length) {
+      throw new Error(`the tower returned ${rows.length / pair} rows; token ${token} `
+        + `wants row ${row}`);
+    }
+    out.set(rows.subarray(row * pair, (row + 1) * pair), base);
+  }
+  return out;
+}
+
+/**
  * @param device   a WebGPU device
  * @param options  { sequence, tower, weights, sampler, seed, onProgress }
  *   `tower` is { ids -> single }: the ESM-C half, given separately because it
@@ -162,7 +221,8 @@ export async function foldEsmfold2(device, options) {
     return value;
   };
 
-  const features = featuriseForEsmfold2(sequence, options.features);
+  const features = options.featuresOverride
+    ?? featuriseForEsmfold2(options.entities ?? sequence, options.features);
   const tokens = features.tokens;
   const atoms = features.atoms;
   const pairs = tokens * tokens;
@@ -194,15 +254,12 @@ export async function foldEsmfold2(device, options) {
   try {
     // ---- the language model, first and released before anything pair-sized.
     const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
+    const lm = languageModelInput(features);
     const single = await mark("language model", async () => {
-      const mixed = await options.tower(sequenceIds(sequence));
-      // The tower's rows include BOS and EOS; the shim mixes the residues only.
-      return mixed.subarray(channels, mixed.length - channels);
+      const rows = lm.ids.length === 0 ? new Float32Array(0)
+        : await options.tower(lm.ids, lm.sequenceId);
+      return scatterLanguageSingle(rows, lm, tokens, channels, weights.shim);
     });
-    if (single.length !== tokens * channels) {
-      throw new Error(`the tower returned ${single.length / channels} residues `
-        + `for a ${tokens}-residue sequence`);
-    }
     await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
       { tokens, channels, single, weights: weights.shim, destination: lmPair }));

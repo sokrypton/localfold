@@ -264,6 +264,23 @@ def main():
                   'weightLayout': 'af3-pairformer-in-out',
                   'triangleDoubleWidth': 'interleaved',
                   'transitionDoubleWidth': 'blocked-gate-first'},
+        # 🔴 EVERY RANK-1 TENSOR STAYS float32, AND THIS BUNDLE HAS TO SAY SO
+        # ITSELF. tools/quantize_af3.py keeps a tensor whose name ends in
+        # `/scale`, `/offset` or `/bias`, which is how AF3 spells its norms;
+        # this export spells them `leftNormInputScale`, `gateBias`,
+        # `singleScale` - so 350 of its 377 vectors would have been group
+        # quantised, and a 128-wide LayerNorm scale at group 32 is four scales
+        # carrying the tensor whose job is to set the scale of everything after
+        # it. The `float32Tensors` field exists for exactly this.
+        #
+        # 🔴 AND THE FOURIER TABLE TOO, WHICH IS NOT A NORM. `w` and `b` are a
+        # `register_buffer` drawn once at construction and trained in, and they
+        # are read inside `cos(2 * pi * (t * w + b))` - so an error in them is
+        # an error in a PHASE, which does not shrink with the weight. 512
+        # numbers.
+        'float32Tensors': sorted(
+            [name for name, record in writer.records.items() if len(record['shape']) == 1]
+            + ['diffusion/fourier/weights', 'diffusion/fourier/offsets']),
         'tensors': writer.records,
     }
     (out_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

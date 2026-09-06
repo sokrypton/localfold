@@ -27,6 +27,7 @@ import {
 } from "../../src/esmfold2/weights.js";
 import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
 import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -75,8 +76,19 @@ function alphaCarbons(features) {
 }
 
 export async function main(device, args = []) {
+  // 🔴 CHAINS ARE COLON-JOINED AND THEIR KINDS ARE A SEPARATE LIST, because
+  // the letters cannot say which is which: `A`, `C` and `G` are alanine,
+  // cysteine and glycine in a protein chain and adenine, cytosine and guanine
+  // in a nucleic one.
   const sequence = option(args, "sequence",
     "MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQ");
+  const kinds = option(args, "kinds", "");
+  // 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM AND ITS GEOMETRY COMES FROM THE
+  // CCD, over the network. `parseCcdComponent` is AF3's reader and the
+  // components are the same ones - ESMFold2 reads the same dictionary through
+  // RDKit rather than through mmCIF, and takes the ideal conformer for the same
+  // reason.
+  const ligandCodes = option(args, "ligands", "").split(",").filter((c) => c !== "");
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
   const sampler = option(args, "sampler", "diffusion-15");
@@ -102,8 +114,15 @@ export async function main(device, args = []) {
   }
   const M = manifest.trunk;
 
+  // 🔴 THE SHIM'S SINGLE HALF IS NEEDED EVEN THOUGH THE TOWER COMPUTES IT.
+  // A non-protein token never reaches the tower, and its hidden state is ZERO
+  // rather than absent - so the fold has to evaluate the shim's single half at
+  // zero itself. Three tensors, one row of arithmetic, once.
   const shim = {};
-  for (const name of SHIM_PAIR_TENSORS) shim[name] = await tower.read(name);
+  for (const name of [...SHIM_PAIR_TENSORS, "lm/norm/offset", "lm/projection/weights",
+                      "lm/downproject/weights", "lm/downproject/bias"]) {
+    shim[name] = await tower.read(name);
+  }
   const [featuriser, inputsEmbedder, denoiser, encoder, decoder] = await Promise.all([
     featuriserWeights(fold.read),
     atomEncoderWeights(fold.read, "atom", M.atomBlocks),
@@ -125,7 +144,7 @@ export async function main(device, args = []) {
   const towerShared = {};
   for (const name of TOWER_SHARED) towerShared[name] = await tower.read(name);
   const allocator = new GpuBufferAllocator(device);
-  const runTower = async (ids) => {
+  const runTower = async (ids, sequenceId) => {
     const engine = new EsmcTowerGpu(device, allocator);
     const result = await engine.run(ids, {
       rows: ids.length, model: towerManifest.width,
@@ -137,13 +156,22 @@ export async function main(device, args = []) {
       const weights = {};
       for (const leaf of BLOCK_LEAVES) weights[leaf] = await tower.read(`blocks/${layer}/${leaf}`);
       return weights;
-    }, towerShared);
+    }, towerShared, { sequenceId });
     return result.single;
   };
+
+  const ligands = [];
+  for (const code of ligandCodes) {
+    const text = await (await fetch(ccdUrl(code))).text();
+    ligands.push(parseCcdComponent(text));
+  }
 
   const progress = [];
   const result = await foldEsmfold2(device, {
     sequence, allocator, seed, sampler,
+    entities: (kinds === "" && ligands.length === 0) ? sequence
+      : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
+          ...(ligands.length === 0 ? {} : { ligands }) },
     shape: { ...M, loops: (M.loops ?? 3) + 1 },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
@@ -153,12 +181,45 @@ export async function main(device, args = []) {
   // ---- what came out.
   const alphas = alphaCarbons(result.features);
   const x = result.coordinates;
+  // 🔴 THE SPACING IS WITHIN A CHAIN, NOT ALONG THE ARRAY. Two chains are two
+  // molecules and the distance across the break is whatever the sampler placed
+  // them at - 22.9 A on the first complex run here, which read as a broken fold
+  // and is the metric walking off the end of chain one.
+  const chainOfAtom = result.features.asymId;
+  const tokenOfAtom = result.features.atomToToken;
   const spacing = [];
   for (let i = 1; i < alphas.length; i += 1) {
-    const a = alphas[i - 1] * 3, b = alphas[i] * 3;
+    const previous = alphas[i - 1], atom = alphas[i];
+    if (chainOfAtom[tokenOfAtom[previous]] !== chainOfAtom[tokenOfAtom[atom]]) continue;
+    const a = previous * 3, b = atom * 3;
     spacing.push(Math.hypot(x[b] - x[a], x[b + 1] - x[a + 1], x[b + 2] - x[a + 2]));
   }
-  const mean = spacing.reduce((t, v) => t + v, 0) / spacing.length;
+  const mean = spacing.length === 0 ? NaN
+    : spacing.reduce((t, v) => t + v, 0) / spacing.length;
+  // 🔴 A NUCLEIC CHAIN'S GEOMETRY GATE IS THE PHOSPHODIESTER BOND, NOT CA-CA.
+  // O3' of one nucleotide to P of the next is about 1.6 A, and it is the same
+  // kind of statement 3.8 A is for a peptide: a covalent distance no torsion
+  // can change, which a port with the arithmetic subtly wrong gets wrong.
+  const named = (atom, text) => {
+    const chars = result.features.refAtomNameChars;
+    for (let i = 0; i < 4; i += 1) {
+      const wanted = i < text.length ? text.charCodeAt(i) - 32 : 0;
+      if (chars[atom * 4 + i] !== wanted) return false;
+    }
+    return true;
+  };
+  const phosphodiester = [];
+  for (let atom = 1; atom < result.atoms; atom += 1) {
+    if (!named(atom, "P")) continue;
+    for (let back = atom - 1; back >= 0 && back > atom - 30; back -= 1) {
+      if (!named(back, "O3'")) continue;
+      const token = result.features.atomToToken;
+      if (result.features.asymId[token[back]] !== result.features.asymId[token[atom]]) break;
+      phosphodiester.push(Math.hypot(x[atom * 3] - x[back * 3],
+        x[atom * 3 + 1] - x[back * 3 + 1], x[atom * 3 + 2] - x[back * 3 + 2]));
+      break;
+    }
+  }
   let rmsd;
   if (reference !== "") {
     const dump = await (await fetch(reference)).json();
@@ -187,7 +248,12 @@ export async function main(device, args = []) {
     sequence, sampler, seed,
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,
-    caSpacing: { mean, min: Math.min(...spacing), max: Math.max(...spacing) },
+    caSpacing: spacing.length === 0 ? null
+      : { mean, min: Math.min(...spacing), max: Math.max(...spacing) },
+    phosphodiester: phosphodiester.length === 0 ? null : {
+      bonds: phosphodiester.length,
+      mean: phosphodiester.reduce((t, v) => t + v, 0) / phosphodiester.length,
+      min: Math.min(...phosphodiester), max: Math.max(...phosphodiester) },
     rmsdToReference: rmsd,
     elapsedSeconds: result.elapsedMilliseconds / 1000,
     timings: result.timings,

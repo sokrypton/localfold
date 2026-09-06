@@ -127,9 +127,16 @@ export function featuriseProtein(sequence, options = {}) {
         // 🔴 THE TERMINAL RULE IS AT THE OTHER END FOR A NUCLEOTIDE. A protein
         // residue takes its extra atom (OXT) at the chain's LAST residue; a
         // nucleotide takes its extra atom (OP3) at the FIRST.
-        terminal: chainKinds[chainIndex] === "protein"
-          ? at === chain.length - 1
-          : at === 0,
+        //
+        // 🔴 AND NOT EVERY MODEL HAS ONE. ESMFold2's featuriser uses the
+        // internal atom set at both ends of every chain - its DNA_HEAVY_ATOMS
+        // list has no OP3 and its dumps carry no OXT - so `terminalAtoms:
+        // false` is what a caller building for it passes. It is off only when
+        // asked, because every AF3-shaped caller means the AF3 rule.
+        terminal: options.terminalAtoms === false ? false
+          : (chainKinds[chainIndex] === "protein"
+            ? at === chain.length - 1
+            : at === 0),
         modification,
         tokens: modification === null ? 1 : modification.atoms.length,
       });

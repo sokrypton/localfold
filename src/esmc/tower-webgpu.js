@@ -128,6 +128,14 @@ export class EsmcTowerGpu {
     const epsilon = (options.epsilon ?? 1e-5).toExponential();
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
     const capture = new Set(options.capture ?? []);
+    // 🔴 ONE PACKED RUN WITH A MASK, NOT ONE RUN A CHAIN. See
+    // createAttentionShader: the rotary positions are absolute over the packed
+    // array, so per-chain runs are a different model however the attention is
+    // masked. `sequenceId` is one entry a row, and PAD is -1.
+    const sequenceId = options.sequenceId;
+    if (sequenceId !== undefined && sequenceId.length !== ids.length) {
+      throw new Error(`${sequenceId.length} sequence ids for ${ids.length} tokens`);
+    }
     // 🔴 THE TOWER HAS ITS OWN UPLOAD PATH AND HAD ITS OWN DEFAULT. Setting f16
     // as the block's default changed nothing here and the tower's numbers came
     // back byte-identical - which looked like f16 costing nothing and was two
@@ -153,8 +161,12 @@ export class EsmcTowerGpu {
           weightPrecision)),
       pipeline(`esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase)),
-      pipeline(`esmc-attend:${rows}:${model}:${heads}`,
-        createAttentionShader({ rows, model, heads })),
+      // 🔴 CHAIN-AWARE IS PART OF THE CACHE KEY, NOT JUST OF THE BINDINGS. The
+      // two shaders differ by a binding and a test, and a page that folds a
+      // monomer and then a complex at the same length would otherwise reuse the
+      // monomer's pipeline and quietly let the chains attend to each other.
+      pipeline(`esmc-attend:${rows}:${model}:${heads}:${sequenceId === undefined ? "flat" : "chains"}`,
+        createAttentionShader({ rows, model, heads }, QUERY_TILE, sequenceId !== undefined)),
       pipeline(`esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}`,
         createLinearShader({ rows, inner: model, outer: model }, true,
           weightPrecision)),
@@ -191,6 +203,8 @@ export class EsmcTowerGpu {
         "esmc.lm.offset", shared["lm/norm/offset"], storage));
       const mixProjection = keepPersistent(this.allocator.upload(
         "esmc.lm.projection", shared["lm/projection/weights"], storage));
+      const sequenceBuffer = sequenceId === undefined ? undefined
+        : keepPersistent(this.allocator.upload("esmc.sequence-id", sequenceId, storage));
       const mix = layerMix(shared["lm/combine"]);
       const shares = [];
       for (let k = 0; k < mix.length; k += 1) {
@@ -296,7 +310,9 @@ export class EsmcTowerGpu {
         dispatchLinear(pass, qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
         dispatchInto(pass, preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
         pass.setPipeline(attentionPipeline);
-        pass.setBindGroup(0, bind(attentionPipeline, [query, key, value, context]));
+        pass.setBindGroup(0, bind(attentionPipeline, sequenceId === undefined
+          ? [query, key, value, context]
+          : [query, key, value, context, sequenceBuffer]));
         pass.dispatchWorkgroups(Math.ceil(rows / QUERY_TILE), heads);
         dispatchLinear(pass, outPipeline, [context, attnOut, current, afterAttention], model);
         dispatchInto(pass, normPipeline,
