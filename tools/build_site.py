@@ -65,12 +65,13 @@ SCRIPT_SRC = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
 # The manifest is a checked-in JS module, so nothing regenerates it when the
 # shards are re-exported. These are the bytes per element it describes.
 DTYPE_BYTES = {"int8": 1, "float16": 2, "float32": 4}
-# 🔴 int5 IS NOT A WHOLE NUMBER OF BYTES, which is why it is not in the table
-# above. Thirty-two five-bit codes are exactly 160 bits, so a group is exactly
-# 20 bytes and no group straddles another - see tools/quantize_af3.py, where
-# that is the reason group 32 was chosen. The reader may take two bytes for a
-# code ending on the final one, so there is one trailing byte of slack.
-INT5_GROUP_BYTES = 20
+# 🔴 A PACKED WIDTH IS NOT A WHOLE NUMBER OF BYTES, which is why none of them is
+# in the table above. Thirty-two five-bit codes are exactly 160 bits, so a group
+# is exactly 20 bytes and no group straddles another - see tools/quantize_af3.py,
+# where that is the reason group 32 was chosen - and thirty-two three-bit codes
+# are 12. The reader may take two bytes for a code ending on the final one, so
+# there is one trailing byte of slack. `manifest_mismatches` derives the span
+# from the width in the dtype's name rather than knowing one of them.
 
 # ...imported rather than restated: tools/write_manifest_module.py owns the
 # Python-side description of a bundle, and a second copy here would be one more
@@ -234,19 +235,32 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
     required: dict[str, int] = {}
     for name, tensor in tensors.items():
         dtype = tensor.get("dtype")
-        if dtype not in DTYPE_BYTES and dtype != "int5":
+        # 🔴 ANY PACKED WIDTH, NOT int5 ALONE. This tested for the literal string
+        # because int5 was the only packed dtype when it was written, and the
+        # ESM-C bundle ships int3 - so a correct manifest was rejected with
+        # "unknown dtype 'int3'" and advice to regenerate it, which would have
+        # produced the identical file. src/reference/dtype.js has decoded int1
+        # through int7 the whole time; this is the second place that knew about
+        # one width, after `BYTES` in that same file.
+        packed = re.fullmatch(r"int([1-7])", dtype or "")
+        if dtype not in DTYPE_BYTES and packed is None:
             problems.append(f"{name}: unknown dtype {dtype!r}")
             continue
         elements = 1
         for extent in tensor["shape"]:
             elements *= extent
-        if dtype == "int5":
+        if packed is not None:
             # ...packed groups plus the slack byte, then a float16 scale AND a
-            # float16 zero point per group: int5 here is asymmetric, so there
-            # are two tables after the codes and not one.
+            # float16 zero point per group: these are asymmetric, so there are
+            # two tables after the codes and not one.
+            bits = int(packed.group(1))
             block = tensor["block"]
+            if (block * bits) % 8:
+                problems.append(f"{name}: {dtype} at group {block} does not pack"
+                                " into whole bytes")
+                continue
             blocks = -(-elements // block)
-            end = tensor["byteOffset"] + blocks * INT5_GROUP_BYTES + 1
+            end = tensor["byteOffset"] + blocks * (block * bits // 8) + 1
             end = max(end, tensor["zeroOffset"] + blocks * 2)
         else:
             end = tensor["byteOffset"] + elements * DTYPE_BYTES[dtype]
