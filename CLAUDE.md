@@ -73,7 +73,10 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
+| Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
+| What dtype is the atom attention actually holding? | `tools/esmc/probe-esmfold2-atom-attention.py` |
 | ...and does the CPU reference? | `node tools/check-esmfold2-trunk.js` (77 s a loop) |
 | Which convention does one ESMFold2 module want? | `node tools/check-esmfold2-modules.js` |
 | What does ESMFold2's trunk cost, by length? | `tools/gpu/bench-esmfold2-trunk.js` |
@@ -1036,6 +1039,34 @@ speedup, at every length. AF3 keeps it because it was priced on that kernel
 alone - 1.55x on `bench-triangle-project.js` at 118 tokens - rather than against
 the other knob. **Price a precision knob against the other knobs, not against
 f32.**
+
+🔴 **AND IT FOLDS END TO END NOW: SEQUENCE IN, ESMFold2's PAIR REPRESENTATION
+OUT.** `tools/check-esmfold2-fold.js` runs the whole assembly - ESM-C's 37
+hidden states, the shim's pair, all five terms of `z_init`, and four loops of 24
+blocks - against the native model's own per-loop values:
+
+| | into the trunk | out of it |
+|---|---|---|
+| loop 0 | 4.12e-5 | 7.93e-5 |
+| loop 1 | 4.17e-5 | 7.98e-5 |
+| loop 2 | 4.17e-5 | 7.81e-5 |
+| loop 3 | 4.17e-5 | 7.73e-5 |
+
+The floor is the atom attention's own bfloat16, which is why the bound is 2e-3
+here and 2e-5 against a `--float32-attention` dump.
+
+🔴 **AND IT EXISTS BECAUSE EVERY PER-MODULE CHECK CAN PASS WHILE THE ASSEMBLY IS
+WRONG.** The featuriser's checker says each term of `z_init` matches and the
+trunk's says the 24 blocks do. Neither says the five terms are SUMMED, that the
+language model's pair reaches them, that the loop runs `num_loops + 1` times, or
+that `z` starts at zero - and every one of those is a plausible tensor when
+wrong. `--esmc <dir>` is what makes the language model's term exist at all: the
+checkpoint does not carry ESM-C (`esmc_id` names a separate 2.3 GB artefact), so
+the dump injects `lm_hidden_states` from `tools/esmc/esmc_forward.py` - the same
+tower the WebGPU port is checked against. **And a dump without it is not "the LM
+contributing zero"**: the shim's biases make `lm_shim(0)` non-zero, so
+substituting zeros is a different model. The checker refuses such a dump rather
+than quietly scoring four terms of five.
 
 🔴 **THE INPUTS EMBEDDER IS NOT AF3's ATOM ENCODER, AND REUSING IT WOULD HAVE
 BEEN THE OBVIOUS WRONG MOVE.** AF3 runs 32-query/128-key windowed atom attention

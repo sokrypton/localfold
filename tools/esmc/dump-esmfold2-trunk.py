@@ -47,6 +47,9 @@ def main():
     parser.add_argument('--esmfold2', default='esmfold2-fast-600m')
     parser.add_argument('--sequence-length', type=int, default=40)
     parser.add_argument('--out', default=None)
+    parser.add_argument('--esmc', default=None,
+                        help="ESM-C checkpoint directory; supplies lm_hidden_states "
+                             "so the LANGUAGE MODEL's term of z_init is exercised")
     parser.add_argument('--float32-attention', action='store_true',
                         help='the CONTROL: neutralise the atom attention\'s '
                              'unconditional bfloat16 downcast')
@@ -147,6 +150,22 @@ def main():
             module_hook('atom.block%d.attn' % index), with_kwargs=True))
 
     features = prepare_protein_features(sequence)
+    # 🔴 THE HIDDEN STATES ARE INJECTED, NOT LOADED. `esmc_id` names a separate
+    # 2.3 GB artefact this checkpoint does not carry, and `load_esmc=True` would
+    # fetch it - while the forward already accepts `lm_hidden_states` directly.
+    # tools/esmc/esmc_forward.py's tower is the one this repository has checked
+    # against transformers (2.1e-6) and against `esm`'s own language model
+    # (3.2e-7), so injecting from it also makes the ESM-C half of the pipeline
+    # the SAME code the WebGPU port is checked against.
+    lm_hidden_states = None
+    if arguments.esmc is not None:
+        from esmc_forward import Checkpoint, Tower
+        tower = Tower(Checkpoint(arguments.esmc))
+        ids = np.asarray(features['input_ids'].detach().cpu()).reshape(-1)
+        states = tower.hidden_states(ids)                 # (layers + 1, L, d_model)
+        lm_hidden_states = states.permute(1, 0, 2).unsqueeze(0)   # (1, L, layers+1, d)
+        print('  lm_hidden_states %s from %s'
+              % (list(lm_hidden_states.shape), arguments.esmc))
     # 🔴 AND THE FEATURES THEMSELVES, because rel_pos is a pure function of five
     # integer arrays and the atom encoder of seven. A JavaScript featuriser that
     # builds them differently is a fault this dump can localise only if it
@@ -167,6 +186,8 @@ def main():
     # 🔴 NO LANGUAGE MODEL, DELIBERATELY. lm_z is added to z_init once and is
     # this port's OTHER half; leaving it out makes the trunk's own arithmetic
     # the only thing recorded, and the tower already has its own oracle.
+    if lm_hidden_states is not None:
+        features['lm_hidden_states'] = lm_hidden_states
     output = model(**features, num_diffusion_samples=1, seed=0)
     for handle in handles:
         handle.remove()
@@ -184,6 +205,7 @@ def main():
         # control to 7e-8 and with the shipping model to 2e-4 is CORRECT, and a
         # checker handed the wrong dump with the wrong bound says the opposite.
         'float32Attention': bool(arguments.float32_attention),
+        'languageModel': arguments.esmc,
         'blocks': blocks,
         'shapes': {'pair': list(captured['loops'][0].shape)},
         # The first projection sees a zero z, so its output is
