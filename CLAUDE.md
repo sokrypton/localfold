@@ -2522,6 +2522,23 @@ tool, a `PLM` row on the page in the slot the MSA row leaves empty, and
 way, which is the point: without the language model it makes a CHAIN it cannot
 FOLD, and a reader looking only at CA-CA would not know.
 
+🔴 **AND THE RECYCLE DIAL DRIVES THIS TRUNK NOW, WHICH IT DID NOT.** Its loop
+count came from the checkpoint - `{ ...M, loops: (M.loops ?? 3) + 1 }` - while
+the Recycles control sat on screen beside it doing nothing, which is the
+"quietly ignored control" `syncModelControls` exists to prevent and the reason
+the MSA row is hidden for this family rather than left showing. The mapping is
+exact and the default does not move: upstream runs `range(num_loops + 1)`, this
+checkpoint's `num_loops` is 3, and 3 is the dial's own default, so a default
+fold is the same four passes it always was. Measured, `--recycles=` on the tool:
+1 gives `Trunk 1/2, 2/2` and 3 gives `Trunk 1/4 ... 4/4`.
+
+🔴 **AND THE PLM ROW HAD TO BE GIVEN A LINE OF ITS OWN.** It sits where the MSA
+row sits - it IS that row for this model - but this family also hides the
+sampler-MODE group, so the line above has room, and `af3CountGroup` GROWS to
+fill a line it is alone on: 535px of 948, which left PLM at x=587 against the
+MSA row's 42. `flex-basis: 100%` is the break, the same idiom `.fold-option-wide`
+uses for the alignment box. Measured: PLM at 42,278 against AF3's MSA at 42,278.
+
 🔴 **AND THE CERTAINTY CATCHES IT, WHICH IS EVIDENCE FOR THE CERTAINTY.** 0.95 to
 0.42 on an ablation nobody tuned it against - the sweep that chose its constants
 corrupted SEQUENCES, and this removes a whole input. An estimate that tracked

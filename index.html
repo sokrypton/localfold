@@ -240,19 +240,6 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    in the footer badge, which switches to "MSA via colabfold.com"
                    for this mode; PRIVACY_NOTE in web/app.js is the other half of
                    this decision and the two must not drift. -->
-              <div class="fetch-option-group" id="msaModeGroup">
-                <span class="fetch-option-title">MSA</span>
-                <select id="msa-mode">
-                  <!-- 🔴 THE LABELS MOVED AND THE VALUES DID NOT. web/app.js
-                       reads "none" and "search" - and translates "none" to
-                       "single" for the driver - so renaming a value here
-                       silently changes which alignment a fold gets. -->
-                  <option value="none">Single Sequence</option>
-                  <option value="search" selected>MMseqs2</option>
-                  <option value="paste">Paste A3M</option>
-                  <option value="upload">Upload file</option>
-                </select>
-              </div>
               <!-- 🔴 THE SAME SLOT AS THE MSA ROW, WHICH IS HIDDEN WHEN THIS
                    SHOWS. This model has no alignment; what it has instead is a
                    protein language model, and turning that off is its
@@ -265,6 +252,19 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 <select id="plm-mode" title="The protein language model. Without it this model has no evolutionary information at all: measured on a 76-mer, the fold moves 11 A and the distogram predicts no long-range contact.">
                   <option value="esmc" selected>ESM-C 600M</option>
                   <option value="none">None</option>
+                </select>
+              </div>
+              <div class="fetch-option-group" id="msaModeGroup">
+                <span class="fetch-option-title">MSA</span>
+                <select id="msa-mode">
+                  <!-- 🔴 THE LABELS MOVED AND THE VALUES DID NOT. web/app.js
+                       reads "none" and "search" - and translates "none" to
+                       "single" for the driver - so renaming a value here
+                       silently changes which alignment a fold gets. -->
+                  <option value="none">Single Sequence</option>
+                  <option value="search" selected>MMseqs2</option>
+                  <option value="paste">Paste A3M</option>
+                  <option value="upload">Upload file</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="maxMsaGroup">

@@ -2291,7 +2291,14 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   const result = await foldEsmfold2(device, {
     sequence,
     entities: { sequence, chainKinds, ligands },
-    shape: loaded.shape,
+    // 🔴 THE RECYCLE DIAL DRIVES THIS TRUNK TOO, AND USED NOT TO. Its loop
+    // count came from the checkpoint and the control beside it did nothing -
+    // the "quietly ignored control" syncModelControls exists to prevent, which
+    // is why the MSA row is hidden here rather than left on screen. The mapping
+    // is exact: upstream runs `range(num_loops + 1)` and this checkpoint's
+    // `num_loops` is 3, which is the dial's own default, so the default fold is
+    // the same four passes it always was.
+    shape: { ...loaded.shape, loops: recycleCount() + 1 },
     weights: loaded.weights,
     tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
                                loaded.shape.pairChannels),
@@ -2461,7 +2468,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // value of neither.
     settings: {
       seed: foldContext.settings?.seed,
-      "trunk passes": loaded.shape.loops,
+      "trunk passes": recycleCount() + 1,
       "language model": usesLanguageModel() ? "ESM-C 600M" : "none",
       sampler: samplerPreset(),
       "diffusion steps": result.steps,

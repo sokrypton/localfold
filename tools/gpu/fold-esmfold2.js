@@ -128,6 +128,10 @@ export async function main(device, args = []) {
   // alignment; the analogue here is folding without the protein language model,
   // which is where this model's evolutionary information comes from.
   const noPlm = args.includes("--no-plm");
+  // 🔴 THE TRUNK'S PASS COUNT, WHICH IS THE PAGE'S RECYCLE DIAL. Upstream runs
+  // `range(num_loops + 1)` and this checkpoint's `num_loops` is 3, so the
+  // default is four passes and `--recycles=3` is that.
+  const recycles = Number(option(args, "recycles", "3"));
   if (SAMPLER_PRESETS[sampler] === undefined) {
     throw new Error(`unknown sampler ${sampler}; `
       + `expected one of ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
@@ -206,7 +210,7 @@ export async function main(device, args = []) {
     entities: (kinds === "" && ligands.length === 0) ? sequence
       : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
           ...(ligands.length === 0 ? {} : { ligands }) },
-    shape: { ...M, loops: (M.loops ?? 3) + 1 },
+    shape: { ...M, loops: recycles + 1 },
     submissionWindow,
     trunk: trunkPrecision === "" ? {} : {
       stagedPrecision: trunkPrecision.split(":")[0],

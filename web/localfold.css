@@ -64,7 +64,23 @@
   border-left: 1px solid #e5e7eb;
   padding-left: 16px;
 }
-#msaModeGroup[hidden], #maxMsaGroup[hidden] {
+/* 🔴 AND THE PLM ROW TAKES THE MSA ROW'S PLACE WITHOUT ITS `margin-left: auto`,
+   which pushes a group to the far RIGHT of whatever line it lands on. That is
+   right for the MSA group, whose line it starts; it is wrong here, because this
+   model hides the sampler-mode group and so leaves room on the line above -
+   PLM was landing at the right-hand end of the Diffusion row instead of beside
+   it. Without the auto margin the two pair up as `MSA` and `Max MSA` do. */
+#plmGroup {
+  /* 🔴 ITS OWN LINE, WHICH IS WHERE THE MSA GROUP SITS. This model hides the
+     sampler-mode group, so the line above has room and PLM packed onto the end
+     of it - and `af3CountGroup` GROWS to fill a line it is alone on, 535px of
+     948, which put PLM at x=587 while the MSA row it replaces starts at 42.
+     `flex-basis: 100%` is the same idiom `.fold-option-wide` uses for the
+     alignment box, and it is a break rather than a stretch: the label and the
+     select inside stay left-aligned. */
+  flex-basis: 100%;
+}
+#msaModeGroup[hidden], #maxMsaGroup[hidden], #plmGroup[hidden] {
   display: none !important;
 }
 
