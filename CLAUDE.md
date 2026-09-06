@@ -76,7 +76,7 @@ values means the whole-stack checker, not that file.
 | How small can ESM-C get before ESMFold2 notices? | `tools/esmc/probe-esmc-compression.py` |
 | ...and what does that cost the STRUCTURE? | `.venv-esm/bin/python tools/esmc/probe-esmfold2-structure.py` |
 | Where do I get ESM-C and ESMFold2? | `tools/esmc/fetch.py` (3.0 GB, ungated, MIT) |
-| Turn ESM-C into a bundle the browser reads | `tools/export_esmc_model.py`, then `tools/quantize_af3.py` |
+| Turn ESM-C into a bundle the browser reads | `tools/export_esmc_model.py`, then `tools/quantize_af3.py --bits 3 --group 128` |
 | What should a WebGPU ESM-C agree with? | `oracle-dumps/esmc-59.json`, from `tools/esmc/dump-esmc-oracle.py` |
 | Does the ESM-C CPU reference compute ESM-C? | `node tools/check-esmc-reference.js` |
 | ...and does the WebGPU block? | `tools/gpu/check-esmc-block.js` |

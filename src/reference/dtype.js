@@ -23,6 +23,21 @@
 
 const BYTES = { float32: 4, float16: 2, int8: 1, int5: 1 };
 
+/**
+ * The width of a sub-byte packed integer dtype, or null.
+ *
+ * 🔴 NINE BITS IS THE LIMIT AND IT IS NOT ARBITRARY. A code starting at bit
+ * offset 7 and running to nine bits ends at bit 16, so two bytes always hold
+ * it; past that the reader would need a third and every loop below would grow
+ * a case. Nothing here wants more than six.
+ */
+export function packedBits(dtype) {
+  const match = /^int([1-9])$/.exec(dtype);
+  if (match === null) return null;
+  const bits = Number(match[1]);
+  return bits < 8 ? bits : null;
+}
+
 // 32 five-bit codes are exactly 160 bits, so a group is exactly 20 bytes and no
 // group straddles another. That is why the AF3 export uses group 32.
 const INT5_GROUP_BYTES = 20;
@@ -60,7 +75,9 @@ export function tensorByteLength(record) {
   const width = BYTES[record.dtype];
   if (width === undefined) throw new Error(`unsupported tensor dtype ${record.dtype}`);
   const elements = tensorElements(record);
-  if (record.dtype !== "int8" && record.dtype !== "int5") return elements * width;
+  if (record.dtype !== "int8" && packedBits(record.dtype) === null) {
+    return elements * width;
+  }
   const { block, scaleOffset, byteOffset = 0 } = record;
   if (!Number.isInteger(block) || block <= 0) {
     throw new Error(`${record.dtype} tensor has no block size`);
@@ -69,8 +86,9 @@ export function tensorByteLength(record) {
     throw new Error(`${record.dtype} tensor has no scale offset`);
   }
   const groups = Math.ceil(elements / block);
-  // int5 carries a zero point per group as well as a scale.
-  const trailing = record.dtype === "int5" ? groups * 4 : groups * 2;
+  // A packed asymmetric dtype carries a zero point per group as well as a
+  // scale; int8 is symmetric and carries only the scale.
+  const trailing = packedBits(record.dtype) === null ? groups * 2 : groups * 4;
   return (scaleOffset - byteOffset) + trailing;
 }
 
@@ -141,6 +159,53 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
       for (let index = start; index < end; index += 1) output[index - base] = codes[index] * scale;
     }
     return output.subarray(first - base, first - base + count);
+  }
+
+  // 🔴 THE GENERAL PATH, FOR EVERY PACKED WIDTH BUT FIVE. int5's loop below is
+  // hand-unrolled - eight codes out of exactly five bytes - and hoisting it took
+  // decoding a bundle from 5.3 s to 1.5. That unrolling is per width, so rather
+  // than write it four times this reads a running bit position: about two more
+  // operations an element, on a path a page walks once. The group loop is
+  // hoisted the same way, which is where nearly all of that 3.8 s came from.
+  const bits = packedBits(record.dtype);
+  if (bits !== null && bits !== 5) {
+    const { block } = record;
+    const base = record.byteOffset ?? 0;
+    const scaleAt = byteOffset + (record.scaleOffset - base);
+    const zeroAt = byteOffset + (record.zeroOffset - base);
+    if (!Number.isInteger(record.zeroOffset)) {
+      throw new Error(`${record.dtype} tensor has no zero offset; it is asymmetric`);
+    }
+    if (typeof Float16Array !== "function") {
+      throw new Error("this runtime has no Float16Array, and the model scales are float16");
+    }
+    const groups = Math.ceil(elements / block);
+    const groupBytes = (block * bits) / 8;
+    if (!Number.isInteger(groupBytes)) {
+      throw new Error(`${record.dtype} at group ${block} does not pack into whole bytes`);
+    }
+    const codes = new Uint8Array(buffer, byteOffset, groups * groupBytes + 1);
+    const scales = view(Float16Array, buffer, scaleAt, groups);
+    const zeros = view(Float16Array, buffer, zeroAt, groups);
+    const mask = (1 << bits) - 1;
+    const firstGroup = Math.floor(first / block);
+    const lastGroup = Math.min(groups, Math.ceil((first + count) / block));
+    const outputBase = firstGroup * block;
+    const output = new Float32Array(Math.min(elements, lastGroup * block) - outputBase);
+    for (let group = firstGroup; group < lastGroup; group += 1) {
+      const scale = scales[group];
+      const zero = zeros[group];
+      const start = group * block;
+      const end = Math.min(start + block, elements);
+      let bit = group * groupBytes * 8;
+      for (let index = start; index < end; index += 1) {
+        const byte = bit >> 3;
+        const value = ((codes[byte] | (codes[byte + 1] << 8)) >> (bit & 7)) & mask;
+        output[index - outputBase] = value * scale + zero;
+        bit += bits;
+      }
+    }
+    return output.subarray(first - outputBase, first - outputBase + count);
   }
 
   if (record.dtype === "int5") {

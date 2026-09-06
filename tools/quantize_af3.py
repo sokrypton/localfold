@@ -48,6 +48,10 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
+# Defaults, not constants: --bits and --group set them. int5 group 32 is the
+# scheme the AF3 and OpenBind bundles ship under and the one the table above
+# prices; ESM-C measured int3 at group 128 landing on float32's median crystal
+# RMSD, which is 303 MiB against 491 for the same pair.
 GROUP = 32
 BITS = 5
 KEEP_FLOAT32 = re.compile(r"/(scale|offset|bias)$|_bias$|_weight$|/output_b$")
@@ -76,15 +80,24 @@ def quantise(values, group=GROUP, bits=BITS):
     return codes, scales.reshape(-1), zeros.reshape(-1)
 
 
-def pack(codes):
-    """32 five-bit codes into 20 bytes, least significant bit first.
+def pack(codes, bits=BITS):
+    """`group` codes of `bits` bits each, least significant bit first.
 
     One trailing byte of slack, so a reader may always take two bytes for a
-    code that ends on the final one without walking off the buffer.
+    code that ends on the final one without walking off the buffer - which is
+    why the width is capped at nine in src/reference/dtype.js.
+
+    🔴 THE GROUP MUST PACK INTO WHOLE BYTES. 32 codes of 5 bits is exactly 20,
+    of 3 bits exactly 12, of 6 bits exactly 24 - but 32 of 7 is 28 exactly too,
+    while 24 of 5 is 15 and a group of 24 would need a case for a code split
+    across the boundary. The caller is checked rather than trusted.
     """
     groups, group = codes.shape
-    bits = np.unpackbits(codes[:, :, None], axis=2, count=BITS, bitorder="little")
-    stream = bits.reshape(groups, group * BITS)
+    if (group * bits) % 8:
+        raise SystemExit("group %d of %d bits does not pack into whole bytes"
+                         % (group, bits))
+    unpacked = np.unpackbits(codes[:, :, None], axis=2, count=bits, bitorder="little")
+    stream = unpacked.reshape(groups, group * bits)
     return np.packbits(stream, axis=1, bitorder="little").astype(np.uint8)
 
 
@@ -92,7 +105,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default="model-af3-full-f32")
     parser.add_argument("--out", default="model-af3-int5")
+    parser.add_argument("--bits", type=int, default=BITS)
+    parser.add_argument("--group", type=int, default=GROUP)
     arguments = parser.parse_args()
+    bits, group = arguments.bits, arguments.group
+    if not 1 <= bits <= 7:
+        raise SystemExit("--bits must be 1..7; eight and above are not packed")
 
     source = ROOT / arguments.source
     out = ROOT / arguments.out
@@ -126,7 +144,7 @@ def main():
     # claiming to be float32. Nothing reads the extension - the manifest carries
     # the dtype and names the file - so it was a lie that cost nothing and
     # misinformed everyone who looked.
-    renamed = {name: name.replace(".f32.bin", f".int{BITS}.bin")
+    renamed = {name: name.replace(".f32.bin", f".int{bits}.bin")
                for name in shards}
 
     kept = quantised = 0
@@ -156,11 +174,11 @@ def main():
                 kept += 1
                 kept_bytes += len(payload)
             else:
-                codes, scales, zeros = quantise(values)
-                packed = pack(codes).tobytes() + b"\x00"
+                codes, scales, zeros = quantise(values, group, bits)
+                packed = pack(codes, bits).tobytes() + b"\x00"
                 scale_pad = (-len(packed)) % 4
-                record["dtype"] = f"int{BITS}"
-                record["block"] = GROUP
+                record["dtype"] = f"int{bits}"
+                record["block"] = group
                 record["scaleOffset"] = cursor + len(packed) + scale_pad
                 record["zeroOffset"] = record["scaleOffset"] + scales.nbytes
                 payload = (packed + b"\x00" * scale_pad
@@ -173,13 +191,13 @@ def main():
         (out / renamed[filename]).write_bytes(b"".join(pieces))
 
     manifest["quantisation"] = {
-        "scheme": "asymmetric-per-group", "bits": BITS, "group": GROUP,
+        "scheme": "asymmetric-per-group", "bits": bits, "group": group,
         "scaleDtype": "float16", "zeroDtype": "float16",
     }
     (out / "manifest.json").write_text(json.dumps(manifest))
 
     total = kept_bytes + quantised_bytes
-    print(f"{quantised} tensors quantised to int{BITS} group {GROUP} asymmetric")
+    print(f"{quantised} tensors quantised to int{bits} group {group} asymmetric")
     print(f"{kept} tensors kept float32 ({kept_bytes / 2**20:.1f} MiB - norms and biases)")
     print(f"{source_bytes / 2**20:.1f} MiB -> {total / 2**20:.1f} MiB"
           f"   {source_bytes / total:.2f}x")
