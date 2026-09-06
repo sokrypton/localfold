@@ -1874,6 +1874,16 @@ against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
 
+🔴 **AND THE TRUNK NAMES ITS PASS, `Trunk 2/4`, AS AF3's LINE DOES - AND NOT ITS
+BLOCK.** That is AF3's rule and its reason, in its own comment: the pairformer
+is the one stage that already reports 48 times a pass, so the bar under the line
+is visibly moving, and a third field would be the "Trunk · pass 1 of 4 ·
+pairformer block 23 of 48" the line was cut down from. A number that changes 96
+times sits next to two that barely move and the eye tracks the one part that
+does not matter. **The bar is where block-by-block belongs; the line says which
+pass.** Measured: the line still changes 7 times over 4 shapes, and the trunk's
+96 progress events are 24 per pass.
+
 🔴 **THE STATUS LINE IS THREE PHASES AND A PERCENTAGE, AS AF3's IS.** It used
 to name every stage, which gave "recycle 0", "trunk 0", "recycle 1", "trunk
 1" - and a recycle is two milliseconds against a trunk loop's several seconds,

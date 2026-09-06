@@ -43,7 +43,7 @@ import {
   centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
   samplerStep,
 } from "./sampler-reference.js";
-import { ESMFOLD2_PHASES, esmfold2Plan } from "./cost.js";
+import { ESMFOLD2_PHASES, esmfold2Plan, trunkPhase } from "./cost.js";
 
 /**
  * The sampler settings a caller can name, the way AF3's page offers
@@ -429,7 +429,6 @@ export async function foldEsmfold2(device, options) {
     // 🔴 THE BAR MOVES PER BLOCK AND THE LINE SAYS "Trunk", ONCE. Ninety-six
     // block evaluations is the one part of this fold with enough events to make
     // a bar move smoothly, and none of them is worth a line of its own.
-    enter(ESMFOLD2_PHASES.trunk);
     const trunkBlocks = weights.trunkBlocks.length;
     const perBlock = plan.trunk / (loops * Math.max(1, trunkBlocks));
     const pairMask = keep(allocator.upload("esmfold2.pair-mask",
@@ -454,6 +453,9 @@ export async function foldEsmfold2(device, options) {
       byteSize: rows * channels * 4,
     });
     for (let loop = 0; loop < loops; loop += 1) {
+      // ...named per pass, as AF3's line is. The recycle is not announced: it
+      // is two milliseconds and it is the seam between two passes, not a phase.
+      enter(trunkPhase(loop, loops));
       await mark(`recycle ${loop}`, async () => {
         const chunk = Math.min(RECYCLE_CHUNK, pairs);
         for (let start = 0; start < pairs; start += chunk) {

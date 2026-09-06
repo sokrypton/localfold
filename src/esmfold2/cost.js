@@ -68,3 +68,17 @@ export const ESMFOLD2_PHASES = {
   conditioning: "Preparing",
   sampler: "Folding",
 };
+
+/**
+ * "Trunk 2/4", the way AF3's line writes its own pass.
+ *
+ * 🔴 AND NOT THE BLOCK NUMBER, WHICH IS AF3's RULE AND ITS REASON. Its comment:
+ * the pairformer is the one stage that already reports - 48 times a pass - so
+ * the bar under the line is visibly moving, and a third field would be the
+ * "Trunk · pass 1 of 4 · pairformer block 23 of 48" that line was cut down
+ * from. A number that changes 96 times sits next to two that barely move and
+ * the eye tracks the one part that does not matter. The BAR is where block-by-
+ * block belongs; the line says which pass.
+ */
+export const trunkPhase = (loop, loops) =>
+  (loops > 1 ? `${ESMFOLD2_PHASES.trunk} ${loop + 1}/${loops}` : ESMFOLD2_PHASES.trunk);
