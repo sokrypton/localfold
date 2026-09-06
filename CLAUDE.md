@@ -3266,16 +3266,33 @@ and that is the whole change. Shard URLs are resolved against the bundle's base,
 so the store never learns the difference; `build_site.py` and the Pages workflow
 both ask `build_site.py --is-remote <family>` and stop publishing a copy.
 
-🔴 **AND THE ESM-C BUNDLE IS 54 SHARDS WHERE AF3's IS 8, WHICH IS NOT A
-DECISION.** `export_esmc_model.py`'s `SHARD_LIMIT` is 48 MiB and it is applied
-to the FLOAT32 export - 2190 MiB, so about 46 pieces - and `quantize_af3.py`
-preserves that layout rather than re-sharding, so int3 shrinks each one eightfold
-to a 4.1 MiB median and the count stays. Whether 54 small shards beat 8 large
-ones over the wire is UNMEASURED here; the "eight" this file records elsewhere is
-eight parallel CONNECTIONS and a longest-first order, not a shard count. For this
-bundle the fine sharding may even help, since the tower streams block by block
-during the fold and a block read pulls two 4 MiB shards rather than one of 28.
-**Open.**
+🔴 **THE ESM-C BUNDLE IS 54 SHARDS WHERE AF3's IS 8, AND MEASURED, THE 8 IS THE
+ONE THAT COSTS.** `export_esmc_model.py`'s `SHARD_LIMIT` is 48 MiB applied to the
+FLOAT32 export - 2190 MiB, about 46 pieces - and `quantize_af3.py` preserves that
+layout rather than re-sharding, so int3 shrinks each eightfold to a 4.1 MiB
+median while the count stays. That looked like an oversight and is not.
+
+Fetched from Hugging Face at eight connections, longest first, two interleaved
+passes:
+
+| bundle | shards | MiB/s | with a connection idle |
+|---|---|---|---|
+| `af3-int5` | 8 | 27.9 / 30.1 | **5.30 / 4.52 s** |
+| `esmc-600m-int3` | 54 | 24.0 / 28.1 | **1.70 / 0.62 s** |
+
+🔴 **EIGHT SHARDS ON EIGHT CONNECTIONS IS NO PACKING AT ALL.** Every connection
+takes one shard, the first to finish has nothing else to do, and the load ends
+when the single SLOWEST shard does - which is half the download running
+under-parallel. Fifty-four costs 1.83 s of request overhead against eight's 0.27
+(the fixed cost of a shard request is a measured **271 ms**, the 307 to
+`cdn.hf.co` included) and recovers more than that in packing. Throughput is the
+same within this machine's noise either way.
+
+**So the "eight" recorded elsewhere in this file is eight parallel CONNECTIONS
+and a longest-first order, not a shard count** - and a bundle wants comfortably
+more shards than connections, not the same number. What is left open is the
+other direction: whether `af3-int5` would gain a second or two from being
+re-sharded finer, which costs a re-export and a re-upload to find out.
 
 🔴 **PIN A COMMIT SHA, NOT `main`.** A shard fetched from a moving branch can
 change under a manifest that did not, which is the failure the shard-cache token
