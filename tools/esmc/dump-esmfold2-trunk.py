@@ -92,6 +92,7 @@ def main():
     captured['modules'] = {}
     captured['conditioning'] = []
     captured['denoiser'] = []
+    captured['steps'] = []
 
     def module_hook(label):
         # 🔴 KEYWORDS TOO, BECAUSE HALF OF THESE TAKE NO POSITIONAL ARGUMENT AT
@@ -201,6 +202,24 @@ def main():
 
     handles.append(diffusion.register_forward_hook(denoiser_hook, with_kwargs=True))
 
+    # 🔴 EVERY SAMPLER STEP'S INPUTS AND ITS ANSWER, because the sampler is
+    # STOCHASTIC and a port cannot reproduce its coordinates. It centres,
+    # randomly rotates and translates `x` every step, then adds noise - all from
+    # torch's global RNG - so the only honest check of the update algebra is
+    # `f(x_noisy, x_denoised) == x`, with the draws taken from the model rather
+    # than made again. What CAN be reproduced exactly is the schedule, the
+    # gammas, the Kabsch alignment and the step itself.
+    captured['steps'] = []
+
+    def step_hook(_module, inputs, keywords, output):
+        captured['steps'].append({
+            'xNoisy': keywords['x_noisy'].detach().clone(),
+            'tHat': float(keywords['t_hat'].reshape(-1)[0].item()),
+            'xDenoised': output['x_denoised'].detach().clone(),
+        })
+
+    handles.append(diffusion.register_forward_hook(step_hook, with_kwargs=True))
+
     for index, block in enumerate(encoder.atom_transformer.blocks):
         handles.append(block.register_forward_hook(
             module_hook('atom.block%d' % index), with_kwargs=True))
@@ -299,6 +318,24 @@ def main():
             'arguments': {k: {'shape': list(t.shape), 'values': tolist(t)}
                           for k, t in captured['denoiser'][0]['arguments'].items()},
         } if captured['denoiser'] else None,
+        'sampler': {
+            'sigmaData': float(model.structure_head.sigma_data),
+            'gamma0': float(model.structure_head.gamma_0),
+            'gammaMin': float(model.structure_head.gamma_min),
+            'noiseScale': float(model.structure_head.noise_scale),
+            'stepScale': float(model.structure_head.step_scale),
+            'sMax': float(model.structure_head.inference_s_max),
+            'sMin': float(model.structure_head.inference_s_min),
+            'p': float(model.structure_head.inference_p),
+            'steps': int(model.structure_head.inference_num_steps),
+            'schedule': np.asarray(
+                model.structure_head.inference_noise_schedule().detach().cpu(),
+                np.float32).reshape(-1).tolist(),
+            'perStep': [{'tHat': v['tHat'],
+                         'xNoisy': tolist(v['xNoisy']),
+                         'xDenoised': tolist(v['xDenoised'])}
+                        for v in captured['steps']],
+        },
     }
 
     out = pathlib.Path(arguments.out) if arguments.out else (

@@ -75,6 +75,7 @@ values means the whole-stack checker, not that file.
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
 | Does the diffusion module agree, module by module? | `node tools/check-esmfold2-diffusion.js` |
+| Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
 | What dtype is the atom attention actually holding? | `tools/esmc/probe-esmfold2-atom-attention.py` |
@@ -1173,6 +1174,51 @@ its first `atoms` entries - all 0 or 1 - as element indices. Every shape
 conforms, nothing throws, and the encoder came back at **relRMS 0.89 with corr
 0.72**, which reads exactly like a wrong convention somewhere in three SWA
 blocks. `atomFeatures` checks the LENGTH now and says which it wants.
+
+🔴 **THE SAMPLER IS STOCHASTIC, SO "THE SAME STRUCTURE" IS NOT A GATE.** Every
+step centres the coordinates, rotates them by a RANDOM rotation, translates them
+by a random vector and adds Gaussian noise - four draws from torch's global RNG
+per step - so a JavaScript port cannot reproduce its coordinates and a checker
+that tried would be measuring the RNG. What is deterministic is checked exactly
+instead:
+
+| | |
+|---|---|
+| the noise schedule | 2.78e-7 over 16 entries |
+| steps after truncation | 11, against the model's 11 |
+| `t_hat` per step | 1.49e-6 worst relative |
+| **the last step, against the fold** | **1.19e-7** |
+| ...without the alignment (control) | 1.38e-3 |
+
+🔴 **AND `max_inference_sigma` IS A DEFAULT ARGUMENT, NOT A CONFIG FIELD, AND IT
+TURNS FIFTEEN STEPS INTO ELEVEN.** `sample(..., max_inference_sigma=256.0)`
+drops every schedule entry above the cap and prepends the cap itself, so four of
+the sixteen go. Reading `inference_num_steps` off the config gives a sampler
+that takes four extra steps at noise levels the model never sees. **The step
+count is an output of the schedule, not an input to it.**
+
+🔴 **AND STEP i TAKES `gammas[i + 1]`.** Upstream zips `schedule[:-1]` with
+`schedule[1:]` and `gammas[1:]`, so the churn applied to `sigma_tm` is decided
+by the NEXT noise level. Off by one it still runs; the first step's `t_hat` is
+the tell, 256 x 1.605 = 410.88 against 256.
+
+🔴 **AND THE LAST STEP'S OUTPUT IS THE FOLD**, which is what makes any of this
+checkable. No augmentation follows it, so `align(x_noisy, x_denoised)` plus the
+update, on the recorded pair, must equal `sample_atom_coords` exactly - and it
+does, at 1.19e-7. The alignment moves the NOISY copy onto the denoised answer
+and not the other way round; swapped, it walks the structure away.
+
+🔴 **AND THE 3x3 SVD IS py2Dmol's `svd3`, NOT A SECOND ONE.** The first version
+written here tested for a zero singular value AFTER the square root, which
+halves the exponent - so a numerically-zero eigenvalue of 8e-15 against 196
+becomes 9e-8, clears any absolute floor, gets divided by, and leaves that column
+of U non-orthonormal. py2Dmol's `src/io/math.js` records being bitten by exactly
+that and guards it three ways: the floor is on the EIGENVALUE and is RELATIVE to
+the largest, each recovered column is verified to be a unit vector, and any
+column the division could not give is completed orthonormally against the ones
+it could. A flat or linear point cloud is not a corner case for a sampler whose
+input starts as noise. `test/esmfold2-kabsch.test.js` pins it - generic, flat,
+linear, four scales, and a mirrored pair that must NOT be fitted exactly.
 
 🔴 **AND THE FOURIER TABLE IS A BUFFER, WHICH IS STILL TRAINED IN.**
 `register_buffer("w", randn(c))` is drawn once at construction and saved with
