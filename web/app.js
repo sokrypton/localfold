@@ -261,6 +261,24 @@ function applyModelFromUrl() {
   if (select === null) return;
   const wanted = MODEL_ALIASES[asked.trim().toLowerCase()] ?? asked.trim().toLowerCase();
   const offered = [...select.options].map((option) => option.value);
+  // 🔴 A FAMILY THE MODEL ROW DOES NOT OFFER MAY STILL BE REACHABLE. EF2-fast's
+  // two checkpoints share one entry and the PLM row picks between them, so
+  // `?model=ef2-fast-300m` names a real family that is not an <option> - and
+  // without this it took the "no model called that" branch, which is the
+  // silently-ignored parameter this function exists to prevent, wearing a
+  // complaint that names a family the page really does have.
+  const viaPlm = Object.entries(PLM_FAMILIES)
+    .find(([, family]) => family === wanted && wanted !== PLM_FAMILIES.none);
+  const plm = document.getElementById("plm-mode");
+  if (viaPlm !== undefined && plm !== null) {
+    const host = [...select.options].map((option) => option.value)
+      .find((value) => SINGLE_SEQUENCE_FAMILIES.includes(value));
+    if (host !== undefined) {
+      select.value = host;
+      plm.value = viaPlm[0];
+      return;
+    }
+  }
   if (!offered.includes(wanted)) {
     // 🔴 RECORDED, NOT WRITTEN HERE. The viewer's own "Ready." message lands
     // asynchronously AFTER this runs and overwrites the status line, so a
@@ -3212,6 +3230,14 @@ if (familySelect !== null) {
   familySelect.addEventListener("change", () => { syncModelControls(); syncMode(); });
 }
 document.getElementById("af3-mode")?.addEventListener("change", syncAf3Count);
+// 🔴 THE PLM ROW CHANGES THE FAMILY, so everything the model row's own listener
+// refreshes has to refresh here too - `chosenFamily()` reads this select, and a
+// control left showing the other checkpoint's options is the same
+// quietly-wrong state syncModelControls exists to prevent.
+document.getElementById("plm-mode")?.addEventListener("change", () => {
+  syncModelControls();
+  syncAf3Count();
+});
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
 // brought back into agreement exactly as a change event would - and

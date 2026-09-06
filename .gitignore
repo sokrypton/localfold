@@ -71,6 +71,8 @@ natives
 /esmc-300m/
 /esmfold2-fast-600m/
 /esmfold2-fast-300m/
+# ...and the 6B fold half, downloaded to read its architecture.
+/esmfold2-fast-6b/
 /model-esmc-*/
 # ...and EF2-fast's own bundles, both sizes.
 /model-ef2-fast-*/

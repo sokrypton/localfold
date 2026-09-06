@@ -59,7 +59,14 @@
   flex-shrink: 0;
 }
 
-#msaModeGroup {
+/* 🔴 PLM SITS WHERE THE MSA GROUP SITS, AND TAKES ITS RULE RATHER THAN ONE OF
+   ITS OWN. Exactly one of the two is ever shown - it is that row for a model
+   whose evolutionary input is a language model - so the separator and the
+   push to the right belong to whichever is up. Sizing them by hand was the
+   mistake: three attempts at a half-row basis all measured well in a narrow
+   window and wrapped the desktop row, which `tools/mobile-layout.py` holds to
+   one line. Everything here is content-sized; leave it that way. */
+#msaModeGroup, #plmGroup {
   margin-left: auto;
   border-left: 1px solid #e5e7eb;
   padding-left: 16px;
@@ -77,11 +84,7 @@
    model, which hides the sampler-mode group beside it. That pushed PLM to the
    far end at x=587, and giving PLM a line of its own instead left it alone on
    one. Half a row each, and the pair sits like every other pair. */
-/* ...and ONLY where PLM is showing, or this reaches every other model's row.
-   `tools/mobile-layout.py` holds the desktop fold options to a single line, and
-   giving af3CountGroup a half-row basis unconditionally wrapped them. */
-#foldOptions:has(#plmGroup:not([hidden])) > #af3CountGroup,
-#plmGroup { flex: 0 1 calc(50% - 5px); }
+
 #msaModeGroup[hidden], #maxMsaGroup[hidden], #plmGroup[hidden] {
   display: none !important;
 }
