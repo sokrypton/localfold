@@ -551,9 +551,12 @@ export async function main(device, args = []) {
           }
           return seen === 0 ? null : Number((sum / seen).toFixed(4));
         };
+        // ...`certainty` is over EVERY eligible partner, as AF3's lDDT is;
+        // `interface` is the cross-chain subset, which is a per-chain question
+        // rather than a per-residue one.
         return { chain,
-          within: mean(result.certainty, (v) => v >= 0),
-          across: mean(result.interfaceCertainty, (v) => v >= 0) };
+          certainty: mean(result.certainty, (v) => v >= 0),
+          interface: mean(result.interfaceCertainty, (v) => v >= 0) };
       }),
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length,

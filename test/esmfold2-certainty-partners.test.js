@@ -30,17 +30,21 @@ describe("the certainty's partner rule", () => {
     // A two-residue chain, then a three-atom ligand: AF3's featuriser gives
     // every atom of a component the same residue number.
     const keys = partnerKeys({ asymId: [0, 0, 1, 1, 1],
-                               residueIndex: [0, 1, 0, 0, 0] }, 5);
-    expect(Array.from(keys)).toEqual([0, 0, 0, 1, 1, 0, 1, 0, 1, 0]);
+                               residueIndex: [0, 1, 0, 0, 0],
+                               molType: [0, 0, 3, 3, 3] }, 5);
+    // asym, residue, chemistry (0 protein, 1 nucleic, 2 ligand), unused.
+    expect(Array.from(keys)).toEqual([0, 0, 0, 0, 0, 1, 0, 0,
+                                      1, 0, 2, 0, 1, 0, 2, 0, 1, 0, 2, 0]);
   });
 
   it("drops a ligand's whole self-block, whatever the separation", () => {
     // The shader's own test, applied on the host: same asym, and the residue
     // numbers within `separation`.
     const keys = partnerKeys({ asymId: [0, 0, 1, 1, 1],
-                               residueIndex: [0, 1, 0, 0, 0] }, 5);
-    const excluded = (i, j) => keys[i * 2] === keys[j * 2]
-      && Math.abs(keys[i * 2 + 1] - keys[j * 2 + 1]) <= CERTAINTY.separation;
+                               residueIndex: [0, 1, 0, 0, 0],
+                               molType: [0, 0, 3, 3, 3] }, 5);
+    const excluded = (i, j) => keys[i * 4] === keys[j * 4]
+      && Math.abs(keys[i * 4 + 1] - keys[j * 4 + 1]) <= CERTAINTY.separation;
     for (const [i, j] of [[2, 3], [2, 4], [3, 4]]) expect(excluded(i, j)).toBe(true);
     // ...and keeps every protein-ligand pair, which is the only thing the model
     // is actually predicting about where the ligand goes.
@@ -52,11 +56,12 @@ describe("the certainty's partner rule", () => {
     const keys = partnerKeys({
       asymId: new Int32Array(tokens),
       residueIndex: Int32Array.from({ length: tokens }, (_, t) => t),
+      molType: new Int32Array(tokens),
     }, tokens);
     for (let i = 0; i < tokens; i += 1) {
       for (let j = 0; j < tokens; j += 1) {
-        const byResidue = keys[i * 2] === keys[j * 2]
-          && Math.abs(keys[i * 2 + 1] - keys[j * 2 + 1]) <= CERTAINTY.separation;
+        const byResidue = keys[i * 4] === keys[j * 4]
+          && Math.abs(keys[i * 4 + 1] - keys[j * 4 + 1]) <= CERTAINTY.separation;
         expect(byResidue).toBe(Math.abs(i - j) <= CERTAINTY.separation);
       }
     }
@@ -66,11 +71,20 @@ describe("the certainty's partner rule", () => {
     // 🔴 ASSERT ON THE GENERATED WGSL. A partner rule that never reaches the
     // kernel reports agreement with itself; the shape of the mistake this file
     // is about is a token index arriving where a residue number was meant.
-    const wgsl = createCertaintyShader({ tokens: 8, separation: 3, modeCutoffBin: 25 });
-    expect(wgsl).toContain("partner: array<vec2<i32>>");
+    const wgsl = createCertaintyShader({
+      tokens: 8, separation: 3, cutoffBins: { protein: 25, nucleic: 56 } });
+    expect(wgsl).toContain("partner: array<vec4<i32>>");
     expect(wgsl).toContain("here.x == there.x");
     expect(wgsl).toContain("abs(here.y - there.y) <= 3");
     expect(wgsl.includes("other > token")).toBe(false);
+    // 🔴 A LIGAND IS SCORED, NEVER SCORING - AF3's own lDDT admits only protein
+    // and nucleotide atoms as the partner index. Without this the rule needs a
+    // fallback for the ligand that has no partner of its own.
+    expect(wgsl).toContain("there.z == 2");
+    // ...and the reach is the PARTNER's, not the pair's.
+    expect(wgsl).toContain("select(25.0, 56.0, there.z == 1)");
+    // ...and nothing falls back to an unfiltered mean any more.
+    expect(wgsl.includes("loose")).toBe(false);
   });
 });
 

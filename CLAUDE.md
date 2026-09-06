@@ -2197,8 +2197,45 @@ downloaded PDB carries a `REMARK` naming the quantity and the missing head, and
 the word pLDDT appears nowhere. With no certainty at all it falls back to chain
 colours rather than painting a zero B-factor as no confidence.
 
-🔴 **AND THE CERTAINTY IS WITHIN THE CHAIN, WITH THE INTERFACE BESIDE IT RATHER
-THAN INSIDE IT.** The rule excludes only same-chain sequence neighbours, so a
+🔴 **AND THE PARTNER RULE IS AF3's OWN lDDT, WHICH IS NOT SYMMETRIC.**
+OpenFold3's `all_atom_plddt_loss` builds its pair mask as
+
+    (dx_gt < 15) * protein_atom_mask[..., None, :]
+  + (dx_gt < 30) * nucleotide_atom_mask[..., None, :]
+
+- the radius is chosen by the kind of the atom in the SECOND index, the one
+doing the scoring, and a ligand atom appears in NEITHER term. Its `rep_index`
+says the same thing from the other side: CA for a standard protein residue, C1'
+for a standard nucleotide, and a padding sentinel for a ligand or an atomized
+residue. **Every atom is SCORED; only polymer representatives do the SCORING.**
+
+That is what "treat a ligand like a protein" means, and taking it removed the
+fallback by construction rather than by adding a tier: a ligand token has
+partners - the polymer around it - under everyone else's cutoff.
+`PARTNER_ANGSTROMS` is **12 A for a protein partner and 24 A for a nucleic
+one**: the protein number is the one this repository's own 11,400-arm sweep
+peaked at (12-14 A), and what is taken from AF3 is the SHAPE - a nucleotide
+reaches twice as far, because a base pair's partners are further off than a
+side chain's. AF3's own 15/30 is for a different quantity, a distance-difference
+test against a true structure rather than a distogram's peakedness.
+
+🔴 **AND THE UNFILTERED FALLBACK IS GONE, WHICH IS WHAT MADE A LIGAND'S COLOUR
+THE ODD ONE OUT.** A ligand's atoms share one residue number, so the separation
+rule dropped its whole self-block and it had NO partner - landing on a `loose`
+branch that averaged every partner at any distance, the 12 A cutoff included.
+ATP read 0.3562 and every digit of that was the fallback: the only number on
+the page computed a different way from the rest. It reads **0.3107** now, under
+the same rule as everything else. **Nothing falls back any more**, and a token
+with no eligible partner reports -1, which the caller reads as no data rather
+than as no confidence.
+
+🔴 **AND THE PER-RESIDUE SCORE DOES NOT SPLIT WITHIN FROM ACROSS, BECAUSE pLDDT
+DOES NOT.** A local score is about a token's neighbourhood, and a residue at an
+interface really does have neighbours in the other chain - AF3's lDDT admits
+them. The pTM/ipTM question is a PER-CHAIN one and is answered per chain
+instead:
+
+🔴 **AND THE PER-CHAIN SUMMARY DOES SPLIT THEM, WHICH IS AF3's OTHER SHAPE.** The rule excludes only same-chain sequence neighbours, so a
 residue on a complex used to be judged partly on pairs across the interface -
 and a chain can be folded well and docked badly, which is why AF3 keeps pTM and
 ipTM apart. Measured on a two-chain fold, recomputed on the host over the same
@@ -2209,34 +2246,18 @@ distogram three ways:
 | A (35 tokens) | 0.451 | 0.477 | 0.343 |
 | B (68 tokens) | **0.630** | **0.712** | 0.370 |
 
-So the number a reader saw was pulled down by a question they had not asked.
-`certainty` is the within-chain mean now and `interface_certainty` the
-cross-chain one, -1 where a token has no other chain - which on a monomer is
-every token, and a mean that included them would report a good fold as a bad
-one. **A monomer's certainty vector is unchanged to every digit**, since it has
-no cross-chain pairs to have been mixing in.
+A chain can be folded well and docked badly, and one number over both says
+neither - so `chain_certainty` and `chain_interface_certainty` go in the
+archive beside `chain_pair_max_contact`. `interface_certainty` is -1 where a
+token has no eligible partner in another chain, which on a monomer is every
+token and next to a LIGAND is every protein token too, since a ligand cannot
+score. **A monomer's certainty vector is unchanged to every digit** through all
+of this.
 
 🔴 **AND IT SHOWS UP WITH A LIGAND, WHICH IS WHERE IT WAS FIRST REPORTED.**
-Ubiquitin with ATP: the protein reads **0.9215** within its own chain against
-0.8989 when the ligand's pairs were averaged in. The protein is no longer
-marked down for the model's uncertainty about where the ligand goes.
-
-🔴 **AND A LIGAND'S OWN COLOUR COMES FROM THE FALLBACK, NOT FROM THE RULE.** Its
-atoms share one residue number, so the separation rule drops its whole
-self-block and it has NO within-chain partner at all - `count` is zero and it
-lands on the unfiltered `loose` branch, which is a mean over every protein
-partner at any distance, the 12 A cutoff included. ATP reads 0.3562 and every
-digit of that is the fallback. Two things make it the weakest number on the
-page: it averages over pairs the model places forty angstroms apart, which is
-what the cutoff exists to exclude, and this head predicts **0** protein-ligand
-contacts against the structure's 64 while running 2.4 A long. **Open**, and the
-coherent fix is to score a token on the partners it can HAVE - within its chain
-where it has any, across chains otherwise - which is one rule rather than a
-fallback.
-
-🔴 **AND `chain_certainty` AND `chain_interface_certainty` GO IN THE ARCHIVE**,
-beside `chain_pair_max_contact`, which is AF3's `chain_ptm`/`chain_iptm` shape
-for a model that has neither.
+Ubiquitin with ATP: the protein reads **0.9215** against 0.8989 before, because
+a ligand is no longer an eligible partner and so can no longer mark the protein
+down for the model's uncertainty about where it goes.
 
 🔴 **AND "(not pLDDT)" IS GONE FROM THE STATUS LINE.** It denied something the
 line never claimed - it says `certainty`, not pLDDT - and a parenthesis

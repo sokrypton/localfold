@@ -103,14 +103,48 @@ export const CERTAINTY = { radius: 2, separation: 3, cutoff: 12 };
  * A complex changes: two tokens in different chains are no longer excluded for
  * being near each other in the array, which they never should have been.
  */
-export function partnerKeys({ asymId, residueIndex }, tokens) {
-  const keys = new Int32Array(tokens * 2);
+export function partnerKeys({ asymId, residueIndex, molType }, tokens) {
+  const keys = new Int32Array(tokens * 4);
   for (let token = 0; token < tokens; token += 1) {
-    keys[token * 2] = asymId[token];
-    keys[token * 2 + 1] = residueIndex[token];
+    keys[token * 4] = asymId[token];
+    keys[token * 4 + 1] = residueIndex[token];
+    // ...0 protein, 1 nucleic, 2 ligand. See PARTNER_ANGSTROMS.
+    const mol = molType?.[token] ?? MOL_PROTEIN;
+    keys[token * 4 + 2] = mol === MOL_NONPOLYMER ? 2 : (mol === MOL_PROTEIN ? 0 : 1);
   }
   return keys;
 }
+
+/**
+ * How far away a partner can be and still say something, by what the PARTNER
+ * is - and which tokens may be partners at all.
+ *
+ * 🔴 AF3's OWN lDDT IS SHAPED THIS WAY, AND IT IS NOT SYMMETRIC.
+ * `all_atom_plddt_loss` in OpenFold3 builds its pair mask as
+ *
+ *     (dx_gt < 15) * protein_atom_mask[..., None, :]
+ *   + (dx_gt < 30) * nucleotide_atom_mask[..., None, :]
+ *
+ * - the radius is chosen by the kind of the atom in the SECOND index, the one
+ * doing the scoring, and a ligand atom appears in neither term. Its `rep_index`
+ * says the same thing from the other side: CA for a standard protein residue,
+ * C1' for a standard nucleotide, and a padding sentinel for a ligand or an
+ * atomized residue, so those contribute no representative atom. **Every atom is
+ * SCORED; only polymer representatives do the SCORING.**
+ *
+ * That is what "treat a ligand like a protein" actually means, and it removes
+ * the fallback by construction rather than by adding a tier: a ligand token has
+ * partners - the polymer around it - under the same rule as everyone else.
+ *
+ * 🔴 AND THE PROTEIN RADIUS STAYS AT THE ONE THAT WAS SWEPT HERE. AF3's 15 A is
+ * for a different quantity (a distance-difference test against a true
+ * structure, not a distogram's peakedness), and this repository's own sweep
+ * peaked at 12-14 A over 11,400 arms - close enough to be reassuring and not a
+ * reason to move. What is taken from AF3 is the SHAPE: a nucleotide reaches
+ * twice as far, because a base pair's partners are further off than a side
+ * chain's.
+ */
+export const PARTNER_ANGSTROMS = { protein: 12, nucleic: 24 };
 
 
 export function contactAngstromsFor(molTypeI, molTypeJ, residueTypeI, residueTypeJ) {
@@ -248,13 +282,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * 🔴 EVERY KEPT PAIR, NOT A TOP-N. Truncating to a residue's best partners cost
  * 0.08 of Spearman in the sweep and got worse the harder it truncated.
  */
-export function createCertaintyShader({ tokens, separation, modeCutoffBin }) {
+export function createCertaintyShader({ tokens, separation, cutoffBins }) {
   return `
 @group(0) @binding(0) var<storage, read> mass: array<f32>;
 @group(0) @binding(1) var<storage, read> mode: array<f32>;
-// 🔴 THE PARTNER RULE IS DATA, NOT ARITHMETIC ON THE TOKEN INDEX. Component x
-// is the asym id and y the residue number; see the comment on partnerKeys.
-@group(0) @binding(2) var<storage, read> partner: array<vec2<i32>>;
+// 🔴 THE PARTNER RULE IS DATA, NOT ARITHMETIC ON THE TOKEN INDEX. x is the asym
+// id, y the residue number and z the chemistry - 0 protein, 1 nucleic, 2
+// ligand. See partnerKeys and PARTNER_ANGSTROMS.
+@group(0) @binding(2) var<storage, read> partner: array<vec4<i32>>;
 @group(0) @binding(3) var<storage, read_write> certainty: array<f32>;
 // ...and the interface reading beside it, which is a different question and is
 // -1 where the token has no cross-chain partner at all.
@@ -264,8 +299,6 @@ var<workgroup> partial_sum: array<f32, ${LANES}>;
 var<workgroup> partial_count: array<f32, ${LANES}>;
 var<workgroup> partial_cross: array<f32, ${LANES}>;
 var<workgroup> partial_cross_count: array<f32, ${LANES}>;
-var<workgroup> partial_loose: array<f32, ${LANES}>;
-var<workgroup> partial_loose_count: array<f32, ${LANES}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -276,8 +309,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var count = 0.0;
   var cross = 0.0;
   var crossCount = 0.0;
-  var loose = 0.0;
-  var looseCount = 0.0;
   for (var other = local.x; other < ${tokens}u; other += ${LANES}u) {
     // A partner is excluded only when it is a SEQUENCE neighbour: the same
     // chain, and within 'separation' residues. Across chains there is no
@@ -286,16 +317,18 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let here = partner[token];
     let there = partner[other];
     if (here.x == there.x && abs(here.y - there.y) <= ${separation}) { continue; }
+    // 🔴 A LIGAND IS SCORED, NEVER SCORING. AF3's lDDT gives a ligand atom no
+    // representative and admits only protein and nucleotide atoms as the
+    // partner index; this is that rule. It is also what lets a ligand token be
+    // scored at all without a fallback - the polymer around it is its partner
+    // set, under everyone else's cutoff.
+    if (there.z == 2) { continue; }
     let same_chain = here.x == there.x;
     let cell = token * ${tokens}u + other;
-    // 🔴 THE UNFILTERED MEAN IS KEPT AS A FALLBACK, because "no partner inside
-    // the cutoff" is NO DATA and zero is a colour. A terminal residue the model
-    // places away from everything has an empty filtered mean, and writing 0
-    // there paints it as the least confident residue in the structure - which
-    // is a claim, and the wrong one.
-    loose += mass[cell];
-    looseCount += 1.0;
-    if (mode[cell] > ${modeCutoffBin}.0) { continue; }
+    // ...and how far that partner may be is the PARTNER's question, not the
+    // pair's: a nucleotide reaches twice as far as a residue does.
+    let reach = select(${cutoffBins.protein}.0, ${cutoffBins.nucleic}.0, there.z == 1);
+    if (mode[cell] > reach) { continue; }
     // 🔴 THE TWO ARE KEPT APART, WHICH IS AF3's OWN DISTINCTION. A chain can be
     // folded well and docked badly, and one mean over both says neither: on a
     // two-chain fold, chain B read 0.712 within itself, 0.370 across the
@@ -313,8 +346,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   partial_count[local.x] = count;
   partial_cross[local.x] = cross;
   partial_cross_count[local.x] = crossCount;
-  partial_loose[local.x] = loose;
-  partial_loose_count[local.x] = looseCount;
   workgroupBarrier();
   for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
     if (local.x < stride) {
@@ -322,8 +353,6 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       partial_count[local.x] += partial_count[local.x + stride];
       partial_cross[local.x] += partial_cross[local.x + stride];
       partial_cross_count[local.x] += partial_cross_count[local.x + stride];
-      partial_loose[local.x] += partial_loose[local.x + stride];
-      partial_loose_count[local.x] += partial_loose_count[local.x + stride];
     }
     workgroupBarrier();
   }
@@ -332,19 +361,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // is not, and only a chain shorter than the separation gets nothing.
     interface_certainty[token] = select(-1.0,
       partial_cross[0] / max(partial_cross_count[0], 1.0), partial_cross_count[0] > 0.0);
-    // 🔴 ONE RULE: WITHIN THE CHAIN. "How well is this residue placed" is a
-    // question about its own chain, and averaging the interface into it answers
-    // neither - measured on a two-chain fold, chain B reads 0.712 within
-    // itself, 0.370 across, and 0.630 mixed, so the number a reader saw was
-    // pulled down by a question they had not asked. The interface is reported
-    // beside it rather than folded into it, which is AF3's own pTM/ipTM split.
-    if (partial_count[0] > 0.0) {
-      certainty[token] = partial_sum[0] / partial_count[0];
-    } else if (partial_loose_count[0] > 0.0) {
-      certainty[token] = partial_loose[0] / partial_loose_count[0];
-    } else {
-      certainty[token] = 0.0;
-    }
+    // 🔴 ONE RULE FOR EVERY TOKEN, AND NO FALLBACK UNDER IT - WHICH IS AF3's
+    // OWN lDDT. A token is scored on every partner it is not TRIVIALLY close to
+    // and that is allowed to score, whatever chain that partner is in. The
+    // trivial exclusion says the same thing about all three chemistries, which
+    // is why they need no branch: a residue's i+1 neighbour is 3.8 A apart in
+    // every structure, and a ligand's atoms sit at the spacing the CCD
+    // conformer HANDED the model, so both are an input rather than a
+    // prediction. What differs is only which partners survive, and that is a
+    // fact about the molecule rather than a special case in the code.
+    //
+    // 🔴 AND IT DOES NOT SPLIT WITHIN FROM ACROSS, BECAUSE pLDDT DOES NOT. A
+    // local score is about a token's neighbourhood, and a residue at an
+    // interface really does have neighbours in the other chain - AF3's lDDT
+    // admits them and so does this. The pTM/ipTM question is a PER-CHAIN one
+    // and it is answered per chain, by interface_certainty beside this.
+    let scored = partial_sum[0] + partial_cross[0];
+    let scoredCount = partial_count[0] + partial_cross_count[0];
+    certainty[token] = select(-1.0, scored / max(scoredCount, 1.0), scoredCount > 0.0);
   }
 }`;
 }
@@ -439,14 +473,18 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
   // be a second pass over the largest tensor in the fold.
   const width = (CONTACT_EDGES.maximum - CONTACT_EDGES.minimum) / bins;
   const span = Math.round(CERTAINTY.radius / width);
-  const modeCutoffBin = Math.floor((CERTAINTY.cutoff - CONTACT_EDGES.minimum) / width);
+  // ...one bin cutoff per partner chemistry; see PARTNER_ANGSTROMS.
+  const binOf = (angstroms) =>
+    Math.floor((angstroms - CONTACT_EDGES.minimum) / width);
+  const cutoffBins = { protein: binOf(PARTNER_ANGSTROMS.protein),
+                       nucleic: binOf(PARTNER_ANGSTROMS.nucleic) };
   const certaintyPair = {};
   for (const rows of heights) {
     certaintyPair[rows] = await cache.get(`${key}:certain:${rows}`,
       createCertaintyPairShader({ pairs: rows, bins }, span));
   }
   const certaintyPass = await cache.get(`${key}:certain-token:${tokens}`,
-    createCertaintyShader({ tokens, separation: CERTAINTY.separation, modeCutoffBin }));
+    createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
   const project = {};
   const contact = {};
 
@@ -492,7 +530,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       Math.max(16, tokens * 4), storage | GPUBufferUsage.COPY_SRC));
     // 🔴 THE RULE IS REQUIRED, NOT DEFAULTED. A caller with no chain ids would
     // silently get the token-index rule back, which is the bug this replaced.
-    if (partners === undefined || partners.length !== tokens * 2) {
+    if (partners === undefined || partners.length !== tokens * 4) {
       throw new Error("encodeContactMap needs partners: partnerKeys(features, tokens)");
     }
     const partnerBuffer = keep(allocator.upload("esmfold2.disto.partners",
@@ -578,7 +616,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
       if (at >= 0) held.splice(at, 1);
     }
     const frames = retainForFrames ? await framesScorer({
-      device, allocator, cache, submit, key, tokens, bins, span, modeCutoffBin,
+      device, allocator, cache, submit, key, tokens, bins, span, cutoffBins,
       logits, biasBuffer, modes, mass, certainty, readCertainty, partnerBuffer,
       interfaceCertainty,
       release: () => { for (const allocation of retained) allocation.release(); },
@@ -617,13 +655,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
  */
 async function framesScorer(context) {
   const { device, allocator, cache, submit, key, tokens, bins, span } = context;
-  const { modeCutoffBin, logits, biasBuffer, modes, mass, certainty, readCertainty,
+  const { cutoffBins, logits, biasBuffer, modes, mass, certainty, readCertainty,
           partnerBuffer, interfaceCertainty } = context;
   const storage = GPUBufferUsage.STORAGE;
   const observed = await cache.get(`${key}:observed:${tokens}`,
     createObservedMassShader({ tokens, bins }, span));
   const aggregate = await cache.get(`${key}:certain-token:${tokens}`,
-    createCertaintyShader({ tokens, separation: CERTAINTY.separation, modeCutoffBin }));
+    createCertaintyShader({ tokens, separation: CERTAINTY.separation, cutoffBins }));
   const positions = allocator.allocate("esmfold2.disto.frame-positions",
     Math.max(16, tokens * 3 * 4), storage | GPUBufferUsage.COPY_DST);
   const elementwise = (elements) => {
