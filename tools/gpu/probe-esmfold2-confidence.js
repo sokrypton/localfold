@@ -299,87 +299,164 @@ function contactScore(logits, bias, positions, tokens, bins, mode,
 }
 
 /**
- * Every per-pair way of asking "how sure is the distogram about this distance",
- * computed once so the hyperparameter sweep is pure aggregation.
+ * Every per-pair quantity anyone has proposed, computed in one pass.
  *
- * 🔴 IT IS THE WHOLE DISTRIBUTION, NOT THE CONTACT BINS. Restricting to contact
- * was measured and collapses into a buriedness baseline - see CLAUDE.md. A
- * distance confidently predicted to be LARGE is evidence of confidence too.
+ * 🔴 THEY MUST SHARE AN AGGREGATION OR THE COMPARISON IS RIGGED. The first pass
+ * at this scored the contact arms with a top-N ranked by their own prediction
+ * and the sharpness arms with a plain mean, then reported that sharpness won -
+ * which is partly a statement about two aggregations. Everything here is a
+ * per-pair number and the caller means all of them the same way.
  *
- * 🔴 AND FOUR MEASURES, BECAUSE `max` IS BIN-WIDTH SENSITIVE. The bin edges
- * here are BORROWED from the disabled confidence head (2 to 52 A over 128
- * bins, 0.39 A each), so the height of a mode is partly an artefact of how fine
- * that grid is. `w1` and `w2` ask instead how much mass lies within 1 A or 2 A
- * of the mode, which is what "how precisely does it know the distance" means
- * and is robust to a grid nobody chose. `negent` is `exp(-H)`, the whole
- * distribution's sharpness rather than its peak's.
+ * The families:
+ *
+ *   mode r     mass within r A of the distribution's MODE. r = 0 is the mode's
+ *              own height, which is what "peakedness" meant.
+ *   obs r      mass within r A of the distance the SAMPLER PRODUCED. r = 0 is
+ *              exactly `exp(-CCE)`, the probability of the observed bin.
+ *   negent     `exp(-H)` over the whole distribution.
+ *   conBin     ColabDesign's binary contact loss as a probability: the mass
+ *              below 8 A. `exp(-con_loss_bin_ent)`.
+ *   conCat     its categorical form: the distribution renormalised inside the
+ *              contact bins, cross-entropied against the full one.
+ *
+ * 🔴 AND THE RADIUS IS SWEPT IN ANGSTROMS, NOT IN BINS. The bin edges are
+ * BORROWED from the disabled confidence head - 2 to 52 A over 128 bins, 0.39 A
+ * each - so a mode's height is partly an artefact of a grid nobody chose. A
+ * radius in angstroms is not.
  */
-function pairMeasures(logits, bias, tokens, bins, edges = CONTACT_EDGES) {
+function pairMeasures(logits, bias, positions, tokens, bins, radii,
+                      { cutoff = CONTACT_ANGSTROMS, edges = CONTACT_EDGES } = {}) {
   const width = (edges.maximum - edges.minimum) / bins;
-  const near1 = Math.max(1, Math.round(1 / width));
-  const near2 = Math.max(1, Math.round(2 / width));
-  const pairs = tokens * tokens;
-  const out = {
-    max: new Float32Array(pairs), w1: new Float32Array(pairs),
-    w2: new Float32Array(pairs), negent: new Float32Array(pairs),
-    mode: new Float32Array(pairs),
-  };
-  const probability = new Float64Array(bins);
-  for (let cell = 0; cell < pairs; cell += 1) {
-    const base = cell * bins;
-    let largest = -Infinity, argmax = 0;
-    for (let b = 0; b < bins; b += 1) {
-      const value = logits[base + b] + bias[b];
-      if (value > largest) { largest = value; argmax = b; }
-    }
-    let total = 0;
-    for (let b = 0; b < bins; b += 1) {
-      probability[b] = Math.exp(logits[base + b] + bias[b] - largest);
-      total += probability[b];
-    }
-    let entropy = 0, within1 = 0, within2 = 0;
-    for (let b = 0; b < bins; b += 1) {
-      const share = probability[b] / total;
-      if (share > 0) entropy -= share * Math.log(share);
-      if (Math.abs(b - argmax) <= near1) within1 += share;
-      if (Math.abs(b - argmax) <= near2) within2 += share;
-    }
-    out.max[cell] = 1 / total;
-    out.w1[cell] = within1;
-    out.w2[cell] = within2;
-    out.negent[cell] = Math.exp(-entropy);
-    out.mode[cell] = edges.minimum + (argmax + 0.5) * width;
+  const spans = radii.map((radius) => Math.round(radius / width));
+  let contactBins = 0;
+  for (let b = 0; b < bins; b += 1) {
+    if (edges.minimum + (b + 0.5) * width < cutoff) contactBins += 1;
   }
-  return out;
+  const pairs = tokens * tokens;
+  const named = new Map();
+  const make = (label) => { const array = new Float32Array(pairs); named.set(label, array); return array; };
+  const modeMass = radii.map((radius) => make(`mode ${radius}`));
+  const observedMass = radii.map((radius) => make(`obs ${radius}`));
+  const negent = make("negent");
+  const conBin = make("conBin");
+  const conCat = make("conCat");
+  const mode = new Float32Array(pairs);
+  const probability = new Float64Array(bins);
+
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const cell = i * tokens + j;
+      const base = cell * bins;
+      let largest = -Infinity, argmax = 0;
+      for (let b = 0; b < bins; b += 1) {
+        const value = logits[base + b] + bias[b];
+        if (value > largest) { largest = value; argmax = b; }
+      }
+      let total = 0;
+      for (let b = 0; b < bins; b += 1) {
+        probability[b] = Math.exp(logits[base + b] + bias[b] - largest);
+        total += probability[b];
+      }
+      const observed = Math.max(0, Math.min(bins - 1,
+        Math.floor((distance(positions, i, positions, j) - edges.minimum) / width)));
+      let entropy = 0, contact = 0, contactLargest = -Infinity;
+      for (let r = 0; r < spans.length; r += 1) { modeMass[r][cell] = 0; observedMass[r][cell] = 0; }
+      for (let b = 0; b < bins; b += 1) {
+        const share = probability[b] / total;
+        if (share > 0) entropy -= share * Math.log(share);
+        if (b < contactBins) {
+          contact += share;
+          contactLargest = Math.max(contactLargest, logits[base + b] + bias[b]);
+        }
+        const fromMode = Math.abs(b - argmax);
+        const fromObserved = Math.abs(b - observed);
+        for (let r = 0; r < spans.length; r += 1) {
+          if (fromMode <= spans[r]) modeMass[r][cell] += share;
+          if (fromObserved <= spans[r]) observedMass[r][cell] += share;
+        }
+      }
+      negent[cell] = Math.exp(-entropy);
+      conBin[cell] = contact;
+      // ...px_ renormalised inside the contact bins, cross-entropied against the
+      // full log-softmax. logsumexp(dgram) is `largest + log(total)`.
+      let restricted = 0;
+      for (let b = 0; b < contactBins; b += 1) {
+        restricted += Math.exp(logits[base + b] + bias[b] - contactLargest);
+      }
+      let expectation = 0;
+      for (let b = 0; b < contactBins; b += 1) {
+        const share = Math.exp(logits[base + b] + bias[b] - contactLargest) / restricted;
+        expectation += share * (logits[base + b] + bias[b]);
+      }
+      conCat[cell] = Math.exp(expectation - (largest + Math.log(total)));
+      mode[cell] = edges.minimum + (argmax + 0.5) * width;
+    }
+  }
+  return { named, mode };
 }
 
 /**
- * One arm: aggregate a per-pair measure into a per-residue score.
+ * Every (separation, cutoff) arm at once, in one pass over the pairs.
  *
- * 🔴 THE PAIR CUTOFF IS ON THE PREDICTED DISTANCE, NOT ON THE BINS. It asks
- * whether a confidently-predicted 45 A separation is informative about a
- * residue's reliability or merely easy - which is the honest version of the
- * "we do not care about far pairs" instinct, and the one that keeps the whole
- * distribution's sharpness rather than throwing four fifths of it away.
+ * 🔴 BOTH AXES ARE THRESHOLDS, SO A 2D CUMULATIVE TABLE ANSWERS ALL OF THEM.
+ * A pair is kept when `|i - j| > separation` AND `mode <= cutoff`, so bucketing
+ * each pair once by those two numbers and then taking a suffix sum over one
+ * axis and a prefix sum over the other gives every combination in constant time
+ * per residue. Without it a fine grid is a nested loop over the pairs per arm,
+ * and the sweep costs more than the sixteen folds it is sweeping.
+ *
+ * 🔴 AND `top` IS FIXED AT ALL, WHICH THE COARSE SWEEP EARNED. Truncating to a
+ * residue's best partners cost 0.08 of Spearman and got worse the harder it
+ * truncated; keeping every pair is also what makes this table possible, since a
+ * top-N needs a sort per arm.
+ *
+ * @returns {(separation: number, cutoff: number) => Float32Array}
  */
-function aggregate(measure, mode, tokens, { top, separation, cutoff }) {
-  const out = new Float32Array(tokens);
-  const scratch = [];
+function cumulativeScorer(measure, mode, tokens, separations, cutoffs) {
+  const S = separations.length, C = cutoffs.length;
+  const sums = new Float64Array(tokens * S * C);
+  const counts = new Float64Array(tokens * S * C);
+  // ...bucketed by the SMALLEST separation and cutoff it satisfies, so the
+  // cumulative pass below can widen it to every larger one.
   for (let i = 0; i < tokens; i += 1) {
-    scratch.length = 0;
     for (let j = 0; j < tokens; j += 1) {
-      if (Math.abs(i - j) <= separation) continue;
-      if (Number.isFinite(cutoff) && mode[i * tokens + j] > cutoff) continue;
-      scratch.push(measure[i * tokens + j]);
+      const gap = Math.abs(i - j);
+      let sBucket = -1;
+      for (let s = 0; s < S; s += 1) if (gap > separations[s]) sBucket = s;
+      if (sBucket < 0) continue;
+      const distance = mode[i * tokens + j];
+      let cBucket = -1;
+      for (let c = 0; c < C; c += 1) { if (distance <= cutoffs[c]) { cBucket = c; break; } }
+      if (cBucket < 0) continue;
+      const at = (i * S + sBucket) * C + cBucket;
+      sums[at] += measure[i * tokens + j];
+      counts[at] += 1;
     }
-    if (scratch.length === 0) { out[i] = 0; continue; }
-    scratch.sort((a, b) => b - a);
-    const take = Math.min(top, scratch.length);
-    let sum = 0;
-    for (let k = 0; k < take; k += 1) sum += scratch[k];
-    out[i] = sum / take;
   }
-  return out;
+  for (let i = 0; i < tokens; i += 1) {
+    // separations: a pair kept at separation s is kept at every SMALLER one.
+    for (let s = S - 2; s >= 0; s -= 1) {
+      for (let c = 0; c < C; c += 1) {
+        const at = (i * S + s) * C + c, above = (i * S + s + 1) * C + c;
+        sums[at] += sums[above]; counts[at] += counts[above];
+      }
+    }
+    // cutoffs: a pair kept at cutoff c is kept at every LARGER one.
+    for (let s = 0; s < S; s += 1) {
+      for (let c = 1; c < C; c += 1) {
+        const at = (i * S + s) * C + c, below = (i * S + s) * C + c - 1;
+        sums[at] += sums[below]; counts[at] += counts[below];
+      }
+    }
+  }
+  return (sIndex, cIndex) => {
+    const out = new Float32Array(tokens);
+    for (let i = 0; i < tokens; i += 1) {
+      const at = (i * S + sIndex) * C + cIndex;
+      out[i] = counts[at] === 0 ? 0 : sums[at] / counts[at];
+    }
+    return out;
+  };
 }
 
 /** The baseline that must be beaten: how many partners a residue has at all. */
@@ -451,23 +528,33 @@ export async function main(device, args = []) {
       return block;
     }, towerShared, { sequenceId })).single;
 
-  // 🔴 THE GRID IS SWEPT ON MANY TARGETS OR IT IS CHERRY-PICKING. Ninety-six
-  // arms against two proteins finds an arm that suits two proteins. What is
-  // reported per arm is the MEDIAN across targets and how many targets it is
-  // best on, not its best single score.
-  const MEASURES = ["max", "w1", "w2", "negent"];
-  const SEPARATIONS = [0, 6, 12, 24];
-  const TOPS = [1, 5, 10, 20, 40, Infinity];
-  const CUTOFFS = [Infinity, 20, 12];
+  // 🔴 THE GRID IS SWEPT ON MANY TARGETS OR IT IS CHERRY-PICKING. On three
+  // targets the coarse sweep's winner was `sep 24, top 10, no cutoff`; on
+  // sixteen, two of those three axes reverse. What is reported per arm is the
+  // MEDIAN across targets and its WORST target, never its best single score.
+  //
+  // 🔴 AND IT IS FINE, BECAUSE THE FOLD IS THE EXPENSIVE PART AND IT IS ALREADY
+  // PAID FOR. Once the distogram exists the aggregation is host arithmetic over
+  // a cumulative table, so a 1000-arm grid costs no more than a 96-arm one.
+  const RADII = [0, 0.5, 1, 1.5, 2, 3, 4, 6];
+  const SEPARATIONS = [];
+  for (let value = 0; value <= 24; value += 1) SEPARATIONS.push(value);
+  const CUTOFFS = [];
+  for (let value = 8; value <= 52; value += 2) CUTOFFS.push(value);
+  CUTOFFS.push(Infinity);
+  const MEASURE_NAMES = [...RADII.map((r) => `mode ${r}`), ...RADII.map((r) => `obs ${r}`),
+                         "negent", "conBin", "conCat"];
   const arms = [];
-  for (const measure of MEASURES) {
-    for (const separation of SEPARATIONS) {
-      for (const top of TOPS) {
-        for (const cutoff of CUTOFFS) arms.push({ measure, separation, top, cutoff });
+  for (const measure of MEASURE_NAMES) {
+    for (let s = 0; s < SEPARATIONS.length; s += 1) {
+      for (let c = 0; c < CUTOFFS.length; c += 1) {
+        arms.push({ measure, s, c, pearson: [], spearman: [] });
       }
     }
   }
-  for (const arm of arms) { arm.pearson = []; arm.spearman = []; }
+  console.log(`  ${MEASURE_NAMES.length} measures x ${SEPARATIONS.length} separations`
+    + ` x ${CUTOFFS.length} cutoffs = ${arms.length} arms,`
+    + ` over ${targets.length} candidate targets\n`);
 
   const perTarget = [];
   for (const code of targets) {
@@ -500,27 +587,50 @@ export async function main(device, args = []) {
       }
       return true;
     };
+    // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM AND lDDT IS OVER THE
+    // ALPHA CARBON, so both are gathered. Scoring CA-CA distances against a
+    // CB-CB distribution would read as a weak estimator rather than a wrong
+    // comparison; upstream's `compute_representative_atoms` takes CB, or CA for
+    // glycine.
     const alpha = new Int32Array(result.tokens).fill(-1);
+    const representative = new Int32Array(result.tokens).fill(-1);
     for (let atom = 0; atom < result.atoms; atom += 1) {
-      if (features.mask[atom] !== 0 && named(atom, "CA")) alpha[features.atomToToken[atom]] = atom;
+      if (features.mask[atom] === 0) continue;
+      const token = features.atomToToken[atom];
+      if (named(atom, "CA")) alpha[token] = atom;
+      if (named(atom, "CB")) representative[token] = atom;
     }
-    const modelAlpha = new Float32Array(result.tokens * 3);
     for (let token = 0; token < result.tokens; token += 1) {
-      for (let axis = 0; axis < 3; axis += 1) {
-        modelAlpha[token * 3 + axis] = coordinates[alpha[token] * 3 + axis];
-      }
+      if (representative[token] < 0) representative[token] = alpha[token];
     }
+    const gather = (slots) => {
+      const out = new Float32Array(result.tokens * 3);
+      for (let token = 0; token < result.tokens; token += 1) {
+        for (let axis = 0; axis < 3; axis += 1) {
+          out[token * 3 + axis] = coordinates[slots[token] * 3 + axis];
+        }
+      }
+      return out;
+    };
+    const modelAlpha = gather(alpha);
+    const modelRepresentative = gather(representative);
     const lddt = perResidueLddt(modelAlpha, crystal.coordinates, result.tokens);
     let mean = 0;
     for (const value of lddt) mean += value;
     mean /= lddt.length;
     const sorted = [...lddt].sort((a, b) => a - b);
     const measures = pairMeasures(result.distogram.logits, result.distogram.bias,
-                                  result.tokens, M.distogramBins);
-    for (const arm of arms) {
-      const score = aggregate(measures[arm.measure], measures.mode, result.tokens, arm);
-      arm.pearson.push(pearson(score, lddt));
-      arm.spearman.push(spearman(score, lddt));
+      modelRepresentative, result.tokens, M.distogramBins, RADII);
+    // ...one cumulative table at a time, so thirty of them never coexist.
+    for (const measure of MEASURE_NAMES) {
+      const scorer = cumulativeScorer(measures.named.get(measure), measures.mode,
+                                      result.tokens, SEPARATIONS, CUTOFFS);
+      for (const arm of arms) {
+        if (arm.measure !== measure) continue;
+        const score = scorer(arm.s, arm.c);
+        arm.pearson.push(pearson(score, lddt));
+        arm.spearman.push(spearman(score, lddt));
+      }
     }
     const neighbours = neighbourCount(modelAlpha, result.tokens);
     perTarget.push({ code, residues: crystal.sequence.length, gaps: crystal.gaps,
@@ -546,42 +656,56 @@ export async function main(device, args = []) {
   // ...ranked by the MEDIAN Spearman, because a colour is an ordering and a
   // median is what a single bad target cannot buy.
   const ranked = [...arms].sort((a, b) => b.medianSpearman - a.medianSpearman);
-  const label = (arm) => `${arm.measure.padEnd(6)} sep ${String(arm.separation).padStart(2)}`
-    + `  top ${String(arm.top === Infinity ? "all" : arm.top).padStart(3)}`
-    + `  cut ${arm.cutoff === Infinity ? "none" : String(arm.cutoff).padStart(4)}`;
+  const name = (arm) => arm.measure.padEnd(9)
+    + `sep ${String(SEPARATIONS[arm.s]).padStart(2)}`
+    + `  cut ${CUTOFFS[arm.c] === Infinity ? "none" : String(CUTOFFS[arm.c]).padStart(4)}`;
 
   console.log(`\n  ${folded.length} targets folded, `
     + `median lDDT-Ca ${median(folded.map((r) => r.meanLddt)).toFixed(3)}`);
   console.log(`  baseline (neighbour count)   median Spearman `
     + `${median(folded.map((r) => r.baselineSpearman)).toFixed(3)}\n`);
-  console.log("  best twelve arms, by median Spearman across targets:");
-  console.log("  measure  sep   topN   cutoff   medPearson  medSpearman  worst");
-  for (const arm of ranked.slice(0, 12)) {
-    console.log(`  ${label(arm)}    ${arm.medianPearson.toFixed(3).padStart(7)}`
-      + `      ${arm.medianSpearman.toFixed(3).padStart(7)}   ${arm.worstSpearman.toFixed(3).padStart(6)}`);
+  console.log("  best ten arms, by median Spearman across targets:");
+  console.log("  measure   sep    cutoff   medPearson  medSpearman   worst");
+  for (const arm of ranked.slice(0, 10)) {
+    console.log(`  ${name(arm)}    ${arm.medianPearson.toFixed(3).padStart(7)}`
+      + `      ${arm.medianSpearman.toFixed(3).padStart(7)}  ${arm.worstSpearman.toFixed(3).padStart(7)}`);
   }
-  console.log("\n  each axis at its best, holding the rest at the winner:");
-  const best = ranked[0];
-  for (const [axis, values] of [["measure", MEASURES], ["separation", SEPARATIONS],
-                                ["top", TOPS], ["cutoff", CUTOFFS]]) {
-    const line = values.map((value) => {
-      const found = arms.find((arm) => MEASURES.concat().length
-        && arm.measure === (axis === "measure" ? value : best.measure)
-        && arm.separation === (axis === "separation" ? value : best.separation)
-        && arm.top === (axis === "top" ? value : best.top)
-        && arm.cutoff === (axis === "cutoff" ? value : best.cutoff));
-      const shown = value === Infinity ? "all" : value;
-      return `${shown}:${found.medianSpearman.toFixed(3)}`;
-    }).join("  ");
-    console.log(`  ${axis.padEnd(11)} ${line}`);
+  // 🔴 AND THE ARM TO SHIP IS THE BEST WORST CASE, NOT THE BEST MEDIAN. A
+  // colour that is right on fifteen targets and inverted on the sixteenth is
+  // worse than one that is merely good everywhere, because the one it inverts
+  // on is the one somebody is looking at when they wonder whether to trust it.
+  const robust = [...arms].sort((a, b) => b.worstSpearman - a.worstSpearman);
+  console.log("\n  best ten by WORST target, which is what a colour needs:");
+  console.log("  measure   sep    cutoff   medPearson  medSpearman   worst");
+  for (const arm of robust.slice(0, 10)) {
+    console.log(`  ${name(arm)}    ${arm.medianPearson.toFixed(3).padStart(7)}`
+      + `      ${arm.medianSpearman.toFixed(3).padStart(7)}  ${arm.worstSpearman.toFixed(3).padStart(7)}`);
   }
 
-  return { targets: perTarget, folded: folded.length,
-           best: { ...best, pearson: undefined, spearman: undefined },
-           ranked: ranked.slice(0, 12).map((arm) => ({
-             measure: arm.measure, separation: arm.separation,
-             top: arm.top === Infinity ? "all" : arm.top,
-             cutoff: arm.cutoff === Infinity ? "none" : arm.cutoff,
-             medianPearson: arm.medianPearson, medianSpearman: arm.medianSpearman,
-             worstSpearman: arm.worstSpearman })) };
+  // Each axis in profile, holding the other two at the robust winner.
+  const best = robust[0];
+  const at = (measure, sIndex, cIndex) => arms.find((arm) => arm.measure === measure
+    && arm.s === sIndex && arm.c === cIndex);
+  const every = (n) => [...Array(n).keys()];
+  console.log("\n  each axis, holding the other two at that winner:");
+  console.log("  measure  " + MEASURE_NAMES.map((measure) =>
+    `${measure.replace(" ", "")}:${at(measure, best.s, best.c).medianSpearman.toFixed(3)}`)
+    .join("  "));
+  console.log("  sep      " + every(SEPARATIONS.length).filter((i) => i % 3 === 0).map((i) =>
+    `${SEPARATIONS[i]}:${at(best.measure, i, best.c).medianSpearman.toFixed(3)}`).join("  "));
+  console.log("  cutoff   " + every(CUTOFFS.length).filter((i) => i % 3 === 0
+    || CUTOFFS[i] === Infinity).map((i) =>
+    `${CUTOFFS[i] === Infinity ? "none" : CUTOFFS[i]}:`
+    + `${at(best.measure, best.s, i).medianSpearman.toFixed(3)}`).join("  "));
+
+  const describe = (arm) => ({
+    measure: arm.measure,
+    separation: SEPARATIONS[arm.s],
+    cutoff: CUTOFFS[arm.c] === Infinity ? "none" : CUTOFFS[arm.c],
+    medianPearson: arm.medianPearson, medianSpearman: arm.medianSpearman,
+    worstSpearman: arm.worstSpearman,
+  });
+  return { targets: perTarget, folded: folded.length, arms: arms.length,
+           byMedian: ranked.slice(0, 10).map(describe),
+           byWorst: robust.slice(0, 10).map(describe) };
 }

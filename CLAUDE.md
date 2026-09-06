@@ -1766,86 +1766,66 @@ the signal is real - and the distogram's own PEAKEDNESS, the same aggregate over
 the same pairs with the observed bin replaced by the distribution's maximum,
 beats it on both targets and both measures.
 
-🔴 **AND RESTRICTING TO THE CONTACT BINS MAKES IT WORSE, WHICH IS THE OPPOSITE
-OF WHAT IT SHOULD DO.** The reasoning is sound - most pairs are not in contact,
-a distogram gets that right everywhere, and scoring it separates nothing - and
-it is exactly what ColabDesign's `_get_con_loss` does, in two forms (`binary`,
-the mass below a cutoff; `categorical`, that mass renormalised and
-cross-entropied against the full distribution), with `min_k` keeping only a
-residue's most confident partners. All four arms, ranked and scored as upstream
-ranks and scores them:
+🔴 **SO EVERY PROPOSAL WAS PUT ON ONE GRID, OVER 46 TARGETS, AND THE FIRST TWO
+ROUNDS OF CONCLUSIONS WERE BOTH PARTLY WRONG.** 19 per-pair measures x 25
+sequence separations x 24 pair cutoffs = 11,400 arms, aggregated identically -
+a plain mean over every kept pair - so no measure is helped or hurt by its
+aggregation. The measures: `mode r` (mass within r A of the distribution's
+MODE), `obs r` (mass within r A of the distance the SAMPLER PRODUCED, so
+`obs 0` is exactly `exp(-CCE)`), `negent` (`exp(-H)`), and ColabDesign's two
+contact losses as probabilities.
 
-| mode | 1QYS | 6MRR |
-|---|---|---|
-| binary | 0.265 / 0.281 | 0.076 / **-0.186** |
-| categorical | 0.355 / 0.341 | 0.136 / -0.123 |
-| kept (p x made) | 0.303 / 0.317 | 0.110 / -0.091 |
-| made (outcome only) | 0.256 / 0.314 | 0.039 / -0.101 |
-| **peakedness, whole distribution** | **0.658 / 0.610** | **0.797 / 0.448** |
-| neighbour count (baseline) | 0.284 / 0.315 | 0.036 / -0.154 |
+Median Spearman against per-residue lDDT-Ca, holding the other two axes at the
+winner:
 
-On 6MRR the contact arms COLLAPSE INTO THE BASELINE - `binary` at
-0.076 / -0.186 against the neighbour count's 0.036 / -0.154 - and the mechanism
-is plain once seen: "the mean of a residue's top-N contact probabilities" IS a
-soft neighbour count. It measures how buried a residue is.
+| measure | 0 | 0.5 | 1 | 1.5 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|---|---|---|
+| `mode r` | 0.415 | **0.426** | 0.417 | 0.411 | 0.408 | 0.387 | 0.373 | 0.314 |
+| `obs r` | **0.282** | 0.398 | **0.420** | 0.418 | 0.417 | 0.386 | 0.368 | 0.313 |
 
-🔴 **BECAUSE `con` IS A DESIGN OBJECTIVE, NOT A CONFIDENCE ESTIMATE.** Its job
-is to PUSH residues into contact - one minimises `-log p(contact)` - so a high
-value is a target, not a statement about reliability. Confidence is the opposite
-question, and **a distance confidently predicted to be LARGE is evidence of
-confidence too**. Discarding the non-contact bins discards most of the signal,
-which is why the arm that keeps them wins by 2-10x.
-
-🔴 **SO THE STRUCTURE TERM IS NOT REDUNDANT, IT IS HARMFUL.** The sampler
-largely realises the distogram's mode, so `p(observed)` is `p(mode)` minus
-whatever the sampler's own draw moved - and that difference is SAMPLER VARIANCE,
-not model uncertainty, so it dilutes the signal rather than adding to it. The
-control is also cheaper and available EARLIER: it needs no coordinates, so it
-exists as soon as the trunk has run.
-
-🔴 **AND NEITHER IS A pLDDT, WHICH IS THE SAME WALL commit 588b528 HIT.** Four
-distogram-derived estimates were removed from this tree once already, and the
-reason was that almost all of any fit is a two-number calibration that does not
-cross models. `exp(-CCE)` and peakedness are both bounded in [0, 1] so they need
-no affine map to be READ - but that makes them an ORDERING, not a predicted
-lDDT, and a page reporting either as a number would be inventing the model's
-opinion of its own answer. As a colour it is defensible; as "pLDDT 87" it is
-not.
-
-🔴 **AND THE HYPERPARAMETERS WERE SWEPT ON SIXTEEN TARGETS, BECAUSE ON THREE
-THE SWEEP LIED.** 288 arms - four sharpness measures, four sequence
-separations, six top-N, three pair cutoffs - over the small monomers
-`plddt-data/` was collected on, crystals fetched from the RCSB. Ranked by the
-MEDIAN Spearman across targets, not by any single score. On three targets the
-winner was `sep 24, top 10, no cutoff`; on sixteen it is not, and two of those
-three axes reverse:
-
-| axis, holding the rest at the winner | |
+| | |
 |---|---|
-| measure | max 0.570, **w1 0.569**, w2 0.534, negent 0.548 |
-| separation | 0: 0.487, **6: 0.570**, 12: 0.563, 24: 0.532 |
-| top N | 1: 0.453, 5: 0.466, 10: 0.479, 20: 0.487, 40: 0.490, **all: 0.570** |
-| pair cutoff | none: 0.470, **20 A: 0.570**, 12 A: 0.545 |
+| `negent` | 0.409 |
+| `conCat` | 0.302 |
+| **`conBin`** | **0.175** |
+| neighbour-count baseline | 0.262 |
 
-**TOP-N IS THE WRONG IDEA AND `all` WINS** - truncating to a residue's best
-partners costs 0.08 of Spearman, monotonically. **A PAIR CUTOFF IS THE RIGHT
-IDEA AND 20 A IS WHERE IT SITS** - worth 0.10 over keeping every pair, so "far
-pairs are less informative" is true at 20 A as a filter on the PAIR, and false
-at 8 A as a restriction on the BINS. And the MEASURE barely matters, which is
-the reassuring part.
+🔴 **`exp(-CCE)` WAS HANDICAPPED BY THE EXACT BIN, NOT BY THE IDEA.** `obs 0` is
+the worst of the non-contact family at 0.282; `obs 1` is 0.420, which is the
+best measure in the table. The bins are 0.39 A on a BORROWED grid, so demanding
+the exact one is demanding a precision nobody chose. Widen it to a radius and
+the agreement family becomes competitive.
 
-🔴 **AND THE ARM TO USE IS `w1`, NOT THE BEST MEDIAN.** `max` edges it on the
-median (0.570 against 0.569) and `w1` is far better on the WORST target (0.289
-against 0.159) at the best median Pearson of any arm (0.726). It is also the
-bin-width-robust one: `max` is the height of a mode on a 0.39 A grid nobody
-chose, while `w1` is the mass within 1 A of it. Median lDDT-Ca across the
-sixteen is 0.951 and the neighbour-count baseline's median Spearman is 0.286, so
-this is about twice the baseline.
+🔴 **AND "THE STRUCTURE TERM IS HARMFUL" WAS TRUE ONLY AT RADIUS ZERO.** At
+radius 1 `mode` and `obs` are 0.417 and 0.420 - a tie. The structure neither
+helps nor hurts; what it costs is availability, since `mode` needs no
+coordinates and exists as soon as the trunk has run. That is the reason to
+prefer it, and it is a different reason from the one recorded before.
 
-🔴 **AND THE TARGETS ARE MOSTLY EASY, WHICH IS STILL THE WEAKNESS.** Median
-lDDT-Ca 0.951; only 1i27 (0.826, tenth percentile 0.477), 1lis (0.796, 0.452)
-and 1fna (0.902, 0.691) have real spread. The estimate earns its place on
-targets like those three, and three is not many.
+🔴 **THE CONTACT RESTRICTION REALLY DOES FAIL, AND NOW FAIRLY.** `conBin` at
+0.175 is BELOW the neighbour-count baseline's 0.262, on the same aggregation as
+everything else. `con` is a design objective - one minimises `-log p(contact)`
+to PUSH residues together - so a high value is a target, not a claim about
+reliability, and a distance confidently predicted to be LARGE is evidence of
+confidence too.
+
+🔴 **AND BOTH REMAINING AXES HAVE REAL OPTIMA.** Sequence separation is flat
+and best at 3-9 (0.418 at 3, 0.397 at 9, 0.291 at 24). The pair cutoff peaks
+sharply: **14 A 0.493, 20 A 0.481, 26 A 0.444, 32 A and beyond 0.39**, equal to
+no cutoff at all. So "far pairs are less informative" is TRUE at 14-20 A as a
+filter on the PAIR and FALSE at 8 A as a restriction on the BINS - which is
+exactly the difference between the winner and `conBin`.
+
+**The arm: `mode 1, separation 3, cutoff 16 A`** - median Pearson 0.664, median
+Spearman 0.538 against a baseline of 0.262.
+
+🔴 **AND ITS WORST TARGET IS 0.055, WHICH IS THE NUMBER THAT DECIDES WHETHER TO
+SHIP IT.** The best arm by WORST target reaches only 0.112, and it costs a fifth
+of the median to get there. So on the hardest target in 46 this ordering is
+close to uninformative - and the hardest target is precisely where somebody
+looks at a colour and asks whether to trust it. Median lDDT-Ca across the set is
+0.961, so the label is easy nearly everywhere; only 1i27 (0.826), 1lis (0.796)
+and 1luz (0.868) have real spread.
 
 🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
 THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and
