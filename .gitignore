@@ -80,3 +80,4 @@ natives
 # in tools/esmc/esmc_forward.py. Nothing shipped imports it.
 /.venv-esm/
 /model-esmfold2-trunk-f32
+/esmfold2-fold.pdb

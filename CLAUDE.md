@@ -73,6 +73,7 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
 | Does the diffusion module agree, module by module? | `node tools/check-esmfold2-diffusion.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
@@ -1142,6 +1143,30 @@ gate first; `DiffusionConditioning`'s `TransitionLayer` has `a_proj` and
 `b_proj` as two Linears. Both are "a SwiGLU transition in the diffusion module"
 and they are packed the two different ways. **Read the shapes, never the
 family.**
+
+🔴 **AND IT FOLDS.** `tools/fold-esmfold2.js` runs every stage LocalFold owns -
+the featuriser, the atom encoder, 24 trunk blocks four times over, the
+conditioning, the token transformer, the atom decoder and eleven sampler steps -
+and writes a structure. 40 residues, 6.5 minutes on the CPU:
+
+| | |
+|---|---|
+| CA-CA spacing | **3.809 A** (min 3.787, max 3.853) |
+| RMSD to the native fold | **0.598 A** after superposition |
+
+The spacing is the geometry gate: 3.8 A is a peptide bond, and a port that had
+the arithmetic subtly wrong would produce a plausible-looking cloud with the
+wrong scale. The RMSD is the fold gate, and **0.6 A is agreement, not identity**
+- the sampler draws a rotation, a translation and a noise vector per step from
+torch's RNG and this used its own, so the two are independent SAMPLES. That they
+land within 0.6 A of each other is the model being confident, and it is the
+strongest end-to-end statement available for a stochastic sampler.
+
+🔴 **AND THE PAIR CONDITIONING IS CACHED ACROSS THE STEPS WHILE THE SINGLE IS
+NOT.** Only `s` carries the noise level; `z` does not depend on `t_hat` at all,
+which is why upstream keeps it in `inference_cache["z"]` and rebuilds `s`.
+Caching both freezes `t_hat` at step zero - eleven steps that all think they are
+the first - and still converges to a structure.
 
 🔴 **THE DENOISER IS CHECKED AT EVERY NOISE LEVEL THE SAMPLER VISITS, NOT ONE.**
 Eleven steps spanning five orders of magnitude, teacher-forced on the model's

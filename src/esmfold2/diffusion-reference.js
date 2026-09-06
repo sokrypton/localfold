@@ -98,7 +98,7 @@ export function fourierEmbedding(t, weights, offsets) {
  * @returns {{single: Float32Array, pair: Float32Array}}
  */
 export function diffusionConditioning(zTrunk, relPos, sInputs, tHat, shape, weights,
-                                      sigmaData = SIGMA_DATA) {
+                                      sigmaData = SIGMA_DATA, cachedPair = undefined) {
   const { tokens, pairChannels, singleInputs, tokenChannels, multiplier } = shape;
   const pairs = tokens * tokens;
 
@@ -113,13 +113,16 @@ export function diffusionConditioning(zTrunk, relPos, sInputs, tHat, shape, weig
       joined[to + pairChannels + c] = relPos[from + c];
     }
   }
-  const normalised = layerNorm(joined, pairs, pairChannels * 2,
-                               weights.zInputNormScale, weights.zInputNormOffset);
-  let pair = linear(normalised, pairs, pairChannels * 2, pairChannels, weights.zProjection);
-  for (const block of weights.zTransitions) {
-    const delta = transitionLayer(pair, pairs, pairChannels,
-                                  pairChannels * multiplier, block);
-    for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
+  let pair = cachedPair;
+  if (pair === undefined) {
+    const normalised = layerNorm(joined, pairs, pairChannels * 2,
+                                 weights.zInputNormScale, weights.zInputNormOffset);
+    pair = linear(normalised, pairs, pairChannels * 2, pairChannels, weights.zProjection);
+    for (const block of weights.zTransitions) {
+      const delta = transitionLayer(pair, pairs, pairChannels,
+                                    pairChannels * multiplier, block);
+      for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
+    }
   }
 
   let single = linear(
@@ -347,10 +350,16 @@ export { layerNorm, linear, constant };
 // parameter look like a reference to this function. Second time in this
 // repository: `block` and `attend` went the same way.
 export function denoiseStep(noisy, tHat, features, sInputs, zTrunk, relPos,
-                        shape, weights, encoder, cached = undefined) {
+                        shape, weights, encoder, cachedPair = undefined) {
   const sigma = shape.sigmaData;
-  const conditioning = cached ?? diffusionConditioning(
-    zTrunk, relPos, sInputs, tHat, shape, weights.conditioning, sigma);
+  // 🔴 ONLY THE PAIR IS CACHEABLE. `s` carries the noise level and changes
+  // every step; `z` does not depend on `t_hat` at all, which is why upstream
+  // keeps it in `inference_cache["z"]` and recomputes `s`. Caching the pair
+  // and the single together would freeze the noise level at step zero - eleven
+  // steps that all think they are the first, which still converges to
+  // something.
+  const conditioning = diffusionConditioning(
+    zTrunk, relPos, sInputs, tHat, shape, weights.conditioning, sigma, cachedPair);
   const { single, pair } = conditioning;
 
   const denominator = Math.sqrt(tHat * tHat + sigma * sigma);
