@@ -281,7 +281,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var c = local.x; c < ${model}u; c += ${LANES}u) {
       let scale = select(kScale[c], qScale[c], side == 0u);
       let normalised = (qkv[origin + c] - mean) * inverse * scale;
-      if (side == 0u) { query[out + c] = normalised; } else { key[out + c] = normalised; }
+      // 🔴 THE KEY IS WRITTEN (head, dim, row) AND THE VALUE (row, head, dim),
+      // because the two are read by different phases of the attention with
+      // different lanes. Attention's logit phase gives a lane a KEY, so it
+      // wants consecutive rows adjacent; its accumulation phase gives a lane a
+      // CHANNEL, so it wants consecutive dims adjacent. One buffer cannot suit
+      // both and they do not have to: the same kernel writes them.
+      if (side == 0u) {
+        query[out + c] = normalised;
+      } else {
+        let head = c / ${headDim}u;
+        let d = c % ${headDim}u;
+        key[(head * ${headDim}u + d) * ${rows}u + row] = normalised;
+      }
     }
     workgroupBarrier();
   }
@@ -300,9 +312,13 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let q0 = query[first]; let q1 = query[second];
     query[first] = q0 * c - q1 * s;
     query[second] = q0 * s + q1 * c;
-    let k0 = key[first]; let k1 = key[second];
-    key[first] = k0 * c - k1 * s;
-    key[second] = k0 * s + k1 * c;
+    // The key lives at (head, dim, row), so its two rotated channels are a
+    // whole row-stride apart rather than headDim/2 elements.
+    let kFirst = (head * ${headDim}u + d) * ${rows}u + row;
+    let kSecond = kFirst + ${headDim / 2}u * ${rows}u;
+    let k0 = key[kFirst]; let k1 = key[kSecond];
+    key[kFirst] = k0 * c - k1 * s;
+    key[kSecond] = k0 * s + k1 * c;
   }
 }`;
 }
@@ -368,9 +384,15 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   var largest = -3.0e38;
   for (var j = local.x; j < ${rows}u; j += ${LANES}u) {
-    let kBase = j * ${model}u + head * ${headDim}u;
+    // 🔴 COALESCED: at a fixed d, adjacent lanes hold adjacent j and therefore
+    // read adjacent addresses. Read as (row, head, dim) the lanes were a whole
+    // row apart - 4.6 KB - which is the same uncoalesced pattern the weight
+    // transpose fixed for the projections, and it is why this kernel ran at
+    // 58 GFLOP/s against their 320.
     var dot = 0.0;
-    for (var d = 0u; d < ${headDim}u; d += 1u) { dot += staged[d] * key[kBase + d]; }
+    for (var d = 0u; d < ${headDim}u; d += 1u) {
+      dot += staged[d] * key[(head * ${headDim}u + d) * ${rows}u + j];
+    }
     let logit = dot * ${(1 / Math.sqrt(headDim)).toPrecision(9)};
     logits[j] = logit;
     largest = max(largest, logit);
@@ -538,6 +560,7 @@ export class EsmcBlockGpu {
     const weightPrecision = options.weightPrecision ?? "f16";
     const boundsTest = options.boundsTest ?? false;
     const rowTile = options.rowTile ?? ROW_TILE;
+    const profile = options.profile ?? false;
     if (input.length !== rows * model) {
       throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
     }
@@ -629,9 +652,19 @@ export class EsmcBlockGpu {
         "esmc.readback.normed", rows * model * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
+      // 🔴 ONE PASS PER DISPATCH ONLY WHEN PROFILING. tools/gpu/profile.js times
+      // LABELLED passes, and seven dispatches in one pass is one label - so the
+      // attribution this port has been arguing from arithmetic was never
+      // measurable. Separate passes cost a little scheduling, so the totals
+      // under --profile are not the shipped totals; the shares are.
       this.device.pushErrorScope("validation");
       const encoder = this.device.createCommandEncoder({ label: "esmc-block" });
-      const pass = encoder.beginComputePass({ label: "esmc-block" });
+      let pass = encoder.beginComputePass({ label: "esmc-block" });
+      const stage = (label) => {
+        if (!profile) return;
+        pass.end();
+        pass = encoder.beginComputePass({ label: `esmc.${label}` });
+      };
       const bindOf = (built, bindings) => this.device.createBindGroup({
         layout: built.getBindGroupLayout(0),
         entries: bindings.map((allocation, binding) => ({
@@ -650,18 +683,26 @@ export class EsmcBlockGpu {
         pass.dispatchWorkgroups(x, y);
       };
 
+      stage("attn-norm");
       dispatch(normPipeline, [x, attnScale, attnOffset, normed], rows);
+      stage("qkv");
       dispatchLinear(qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
+      stage("prepare");
       dispatch(preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
+      stage("attend");
       dispatch(attentionPipeline, [query, key, value, context], rows * heads);
+      stage("attn-out");
       dispatchLinear(outPipeline, [context, attnOutScaled, x, afterAttention], model);
+      stage("ffn-norm");
       dispatch(normPipeline, [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);
+      stage("swiglu");
       pass.setPipeline(swigluPipeline);
       pass.setBindGroup(0, bindOf(swigluPipeline, [ffnNormed, fc1, gated]));
       {
         const [gx, gy] = swigluGrid(rows, ffn);
         pass.dispatchWorkgroups(gx, gy);
       }
+      stage("fc2");
       dispatchLinear(downPipeline, [gated, fc2Scaled, afterAttention, output], model);
       pass.end();
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, rows * model * 4);
