@@ -183,6 +183,7 @@ export async function main(device, args = []) {
   }
 
   const progress = [];
+  const updates = new Map();
   const result = await foldEsmfold2(device, {
     sequence, allocator, seed, sampler,
     entities: (kinds === "" && ligands.length === 0) ? sequence
@@ -196,6 +197,14 @@ export async function main(device, args = []) {
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
     onStatus: (label) => { progress.push(label); },
+    // 🔴 COUNTED PER PHASE, because "does the trunk report block by block" is a
+    // number and not an impression. A bar sampled from the page cannot answer
+    // it: 96 block updates inside two seconds are far more frequent than any
+    // poll, so the trace shows a handful of values whatever the code does.
+    onProgress: () => {
+      const phase = progress[progress.length - 1]?.split(" · ")[0] ?? "?";
+      updates.set(phase, (updates.get(phase) ?? 0) + 1);
+    },
   });
 
   // ---- what came out.
@@ -319,7 +328,8 @@ export async function main(device, args = []) {
     elapsedSeconds: result.elapsedMilliseconds / 1000,
     timings: result.timings,
     peakMebibytes: result.memory.peakBytes / 1048576,
-    stages: progress,
+    stages: [...new Set(progress.map((p) => p.split(" · ")[0]))],
+    progressEvents: Object.fromEntries(updates),
     longRangeContacts: contactPairs,
     certainty: result.certainty === undefined ? undefined : {
       mean: [...result.certainty].reduce((t, v) => t + v, 0) / result.certainty.length,

@@ -1904,6 +1904,19 @@ of a short fold's predicted time and completed in a single step, so the bar went
 from zero to a half. `EsmcTowerGpu` reports per block now; measured, the largest
 single jump falls from **0.53 to 0.09** over 45 samples, monotonic throughout.
 
+🔴 **AND EVERY BAND REPORTS PER UNIT OF ITS OWN WORK, WHICH IS A COUNT AND NOT
+AN IMPRESSION.** `tools/gpu/fold-esmfold2.js` returns `progressEvents`, because
+a bar sampled from the page cannot answer "does the trunk report block by
+block": 96 updates inside two seconds are far more frequent than any poll, so
+the trace shows a handful of values whatever the code does. Counted on a 76-mer:
+
+| phase | events | what one is |
+|---|---|---|
+| Language model | 36 | an ESM-C block |
+| Preparing | 2 | the two ends of the embedder |
+| **Trunk** | **96** | a pairformer block - 24 blocks x 4 loops |
+| Folding | 11 | a sampler step |
+
 🔴 **AND THE STEP COUNT HAS TO BE KNOWN BEFORE THE TRUNK RUNS**, or the plan
 cannot be laid out - so the sampler's settings and schedule are resolved at the
 top of the fold. They depend on nothing the fold computes.
