@@ -29,7 +29,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
-  swigluGrid,
+  swigluGrid, QUERY_TILE,
 } from "./block-webgpu.js";
 
 /**
@@ -295,7 +295,9 @@ export class EsmcTowerGpu {
         dispatchInto(pass, normPipeline, [current, attnScale, attnOffset, normed], rows);
         dispatchLinear(pass, qkvPipeline, [normed, qkvWeights, qkv], 3 * model);
         dispatchInto(pass, preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
-        dispatchInto(pass, attentionPipeline, [query, key, value, context], rows * heads);
+        pass.setPipeline(attentionPipeline);
+        pass.setBindGroup(0, bind(attentionPipeline, [query, key, value, context]));
+        pass.dispatchWorkgroups(Math.ceil(rows / QUERY_TILE), heads);
         dispatchLinear(pass, outPipeline, [context, attnOut, current, afterAttention], model);
         dispatchInto(pass, normPipeline,
           [afterAttention, ffnScale, ffnOffset, ffnNormed], rows);

@@ -63,11 +63,12 @@ export async function main(device, args = []) {
   const block = new EsmcBlockGpu(device);
   // An arm is a kernel configuration; they are timed round-robin so the drift
   // lands on all of them equally.
-  const arms = option(args, "arms", "f16,f16-t8,f16-t16").split(",").map((name) => ({
+  const arms = option(args, "arms", "f16-q4,f16-q8,f16-q16").split(",").map((name) => ({
     name,
     weightPrecision: name.startsWith("f16") ? "f16" : "f32",
     boundsTest: name.endsWith("-bounds"),
     rowTile: Number((name.match(/-t(\d+)/) ?? [, "4"])[1]),
+    queryTile: Number((name.match(/-q(\d+)/) ?? [, "4"])[1]),
   }));
   const rows = [];
   for (const tokens of tokenCounts) {

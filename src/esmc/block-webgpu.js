@@ -323,110 +323,155 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
+export const QUERY_TILE = 8;
+
 /**
- * Full self-attention, one workgroup per (row, head), one lane per channel.
+ * Self-attention: one workgroup per (query tile, head), one lane per key then
+ * per channel.
  *
- * 🔴 THE LOGITS ARE COMPUTED BY LANE-OVER-KEYS, NOT BY REDUCING PER KEY. Giving
- * each lane a stride of keys and a whole dot product costs `rows` multiply-adds
- * a lane and two tree reductions in total; reducing across lanes for every key
- * costs `rows` reductions. The second is the obvious shape and it is
- * log2(lanes) times the barriers.
+ * 🔴 THE KEY IS READ AS (head, dim, row) AND THE VALUE AS (row, head, dim).
+ * The logit phase gives a lane a KEY, so it wants consecutive rows adjacent;
+ * the accumulation phase gives a lane a CHANNEL, so it wants consecutive dims
+ * adjacent. Read the key the other way and the lanes are a whole row apart -
+ * 4.6 KB - which cost this kernel 2.8x and is the same uncoalesced pattern the
+ * weight transpose fixed for the projections.
  *
- * 🔴 AND A FLASH-STYLE VERSION WAS BUILT, MEASURED AND REVERTED. This kernel
- * re-reads the whole of K and V for every query row, which at 1500 tokens is
- * 20.7 GB a block against the projections' 6.0 - so staging a chunk of keys and
- * values across a tile of eight queries, with the online softmax that forces,
- * should have divided it by eight. It is SLOWER at every length that matters:
+ * 🔴 A TILE OF ${QUERY_TILE} QUERIES, SO A READ SERVES ${QUERY_TILE} OF THEM.
+ * Untiled, this kernel did one multiply-add per global read - the worst
+ * arithmetic intensity in the block - and ran at 164 GFLOP/s against the
+ * projections' 320. Swept interleaved: 8 is 1.047x on 4 at 300 tokens and
+ * 0.998x at 1500, and 16 is 0.86x / 0.91x. The block now measures 579 GFLOP/s
+ * at 1500 tokens against this device's ~610 G scalar fused multiply-adds a
+ * second, so there is not much left to take here without changing the
+ * arithmetic itself.
  *
- *     tokens   this kernel   staged   ratio
- *        300       37.7 ms   38.8 ms   1.03x
- *        600       66.0       86.3     0.76x
- *       1000      138.6      180.2     0.77x
- *       1500      279.9      351.5     0.80x
- *
- * 🔴 BECAUSE THE 20.7 GB IS NOT DRAM TRAFFIC. K and V for one head at 1500
- * tokens are 750 KB together, which is L2-resident on this M2, so the re-reads
- * were already cache hits and staging bought traffic nobody was paying for. It
- * cost lane utilisation instead: a chunk of 16 keys leaves three quarters of a
- * 64-lane workgroup idle in the phase that computes logits, and widening the
- * chunk to 64 needs 32 KB of workgroup memory against a 16 KB limit.
- *
- * Reverted rather than kept behind a flag, for the reason src/af3's grid
- * attention gives for the same decision: parameterising a hot kernel over an
- * arm nobody should use costs every later reader, and the numbers are worth
- * more than the switch. Apparent traffic is not DRAM traffic when the working
- * set fits in cache - which is the same lesson the (inner, outer) transpose
- * taught, from the other direction.
+ * 🔴 AND K AND V ARE NOT STAGED IN WORKGROUP MEMORY, WHICH A FIRST ATTEMPT DID
+ * AND WAS 0.8x FOR IT. Their working set is 750 KB a head at 1500 tokens, which
+ * is L2-resident, so the re-reads were already cache hits; staging bought
+ * traffic nobody was paying and cost lane utilisation, because a chunk small
+ * enough to fit 16 KB leaves three quarters of a 64-lane workgroup idle. What
+ * was worth taking from that attempt is the ONLINE SOFTMAX, which is what lets
+ * a tile of queries hold only the current chunk's logits instead of all L.
  */
-export function createAttentionShader({ rows, model, heads }) {
+export function createAttentionShader({ rows, model, heads }, queryTile = QUERY_TILE) {
   const headDim = model / heads;
+  if (headDim !== LANES) {
+    throw new RangeError(`this kernel assumes headDim == ${LANES}; got ${headDim}`);
+  }
+  const logits = [], rescales = [], accumulators = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    logits.push(`      var dot_${t} = 0.0;`);
+    accumulators.push(`  var acc_${t} = 0.0;`);
+    rescales.push(t);
+  }
+  const dots = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    dots.push(`        dot_${t} += q_tile[${t}u * ${headDim}u + d] * k;`);
+  }
+  const writeLogits = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    writeLogits.push(`      chunk[${t}u * ${LANES}u + local.x] = `
+      + `select(-3.0e38, dot_${t} * ${(1 / Math.sqrt(headDim)).toPrecision(9)}, live);`);
+  }
+  const accumulate = [];
+  for (let t = 0; t < queryTile; t += 1) {
+    accumulate.push(`      acc_${t} = acc_${t} * rescale_${t} + part_${t};`);
+  }
+
   return `
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> key: array<f32>;
 @group(0) @binding(2) var<storage, read> value: array<f32>;
 @group(0) @binding(3) var<storage, read_write> destination: array<f32>;
 
-var<workgroup> logits: array<f32, ${rows}>;
-var<workgroup> staged: array<f32, ${headDim}>;
-var<workgroup> partial: array<f32, ${LANES}>;
+var<workgroup> q_tile: array<f32, ${queryTile * headDim}>;
+var<workgroup> chunk: array<f32, ${queryTile * LANES}>;
+var<workgroup> peak: array<f32, ${queryTile}>;
+var<workgroup> rescale_of: array<f32, ${queryTile}>;
+var<workgroup> total: array<f32, ${queryTile}>;
+var<workgroup> running: array<f32, ${queryTile}>;
 
 @compute @workgroup_size(${LANES})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local: vec3<u32>) {
-  let flat = group.x + group.y * ${GRID_WIDTH}u;
-  if (flat >= ${rows * heads}u) { return; }
-  let row = flat / ${heads}u;
-  let head = flat % ${heads}u;
-  let qBase = row * ${model}u + head * ${headDim}u;
+  let row_origin = group.x * ${queryTile}u;
+  let head = group.y;
+  if (row_origin >= ${rows}u) { return; }
 
-  for (var d = local.x; d < ${headDim}u; d += ${LANES}u) { staged[d] = query[qBase + d]; }
-  workgroupBarrier();
-
-  var largest = -3.0e38;
-  for (var j = local.x; j < ${rows}u; j += ${LANES}u) {
-    // 🔴 COALESCED: at a fixed d, adjacent lanes hold adjacent j and therefore
-    // read adjacent addresses. Read as (row, head, dim) the lanes were a whole
-    // row apart - 4.6 KB - which is the same uncoalesced pattern the weight
-    // transpose fixed for the projections, and it is why this kernel ran at
-    // 58 GFLOP/s against their 320.
-    var dot = 0.0;
-    for (var d = 0u; d < ${headDim}u; d += 1u) {
-      dot += staged[d] * key[(head * ${headDim}u + d) * ${rows}u + j];
-    }
-    let logit = dot * ${(1 / Math.sqrt(headDim)).toPrecision(9)};
-    logits[j] = logit;
-    largest = max(largest, logit);
+  for (var slot = local.x; slot < ${queryTile * headDim}u; slot += ${LANES}u) {
+    let t = slot / ${headDim}u;
+    let d = slot % ${headDim}u;
+    let row = row_origin + t;
+    q_tile[slot] = select(0.0, query[row * ${model}u + head * ${headDim}u + d],
+                          row < ${rows}u);
   }
-  partial[local.x] = largest;
+  if (local.x < ${queryTile}u) {
+    peak[local.x] = -3.0e38;
+    running[local.x] = 0.0;
+  }
   workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) { partial[local.x] = max(partial[local.x], partial[local.x + stride]); }
+
+${accumulators.join("\n")}
+
+  for (var k0 = 0u; k0 < ${rows}u; k0 += ${LANES}u) {
+    let j = k0 + local.x;
+    let live = j < ${rows}u;
+    // Phase one: a lane owns a KEY. Each key value it reads is used by all
+    // ${queryTile} queries, which is the whole point of the tile.
+${logits.join("\n")}
+    if (live) {
+      for (var d = 0u; d < ${headDim}u; d += 1u) {
+        let k = key[(head * ${headDim}u + d) * ${rows}u + j];
+${dots.join("\n")}
+      }
+    }
+${writeLogits.join("\n")}
+    workgroupBarrier();
+
+    // The chunk's maximum per query, and the flash rescale of what came before.
+    if (local.x < ${queryTile}u) {
+      let t = local.x;
+      var largest = -3.0e38;
+      for (var l = 0u; l < ${LANES}u; l += 1u) {
+        largest = max(largest, chunk[t * ${LANES}u + l]);
+      }
+      let previous = peak[t];
+      let combined = max(previous, largest);
+      // exp(-inf - -inf) is NaN, and the first chunk has no previous maximum.
+      let r = select(exp(previous - combined), 0.0, previous <= -3.0e38);
+      rescale_of[t] = r;
+      running[t] = running[t] * r;
+      peak[t] = combined;
+      var sum = 0.0;
+      for (var l = 0u; l < ${LANES}u; l += 1u) {
+        sum += exp(chunk[t * ${LANES}u + l] - combined);
+      }
+      running[t] += sum;
+    }
+    workgroupBarrier();
+
+    // Phase two: a lane owns a CHANNEL. Each value it reads is used by all
+    // ${queryTile} queries too.
+${Array.from({ length: queryTile }, (_, t) =>
+    `    let rescale_${t} = rescale_of[${t}u];\n    var part_${t} = 0.0;`).join("\n")}
+    for (var l = 0u; l < ${LANES}u; l += 1u) {
+      let source = k0 + l;
+      if (source >= ${rows}u) { break; }
+      let v = value[source * ${model}u + head * ${headDim}u + local.x];
+${Array.from({ length: queryTile }, (_, t) =>
+    `      part_${t} += exp(chunk[${t}u * ${LANES}u + l] - peak[${t}u]) * v;`).join("\n")}
+    }
+${accumulate.join("\n")}
     workgroupBarrier();
   }
-  let peak = partial[0];
-  workgroupBarrier();
 
-  var total = 0.0;
-  for (var j = local.x; j < ${rows}u; j += ${LANES}u) {
-    let w = exp(logits[j] - peak);
-    logits[j] = w;
-    total += w;
-  }
-  partial[local.x] = total;
-  workgroupBarrier();
-  for (var stride = ${LANES / 2}u; stride > 0u; stride >>= 1u) {
-    if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
-    workgroupBarrier();
-  }
-  let sum = partial[0];
-
-  for (var d = local.x; d < ${headDim}u; d += ${LANES}u) {
-    var accumulated = 0.0;
-    for (var j = 0u; j < ${rows}u; j += 1u) {
-      accumulated += logits[j] * value[j * ${model}u + head * ${headDim}u + d];
+${Array.from({ length: queryTile }, (_, t) => `  {
+    let row = row_origin + ${t}u;
+    if (row < ${rows}u) {
+      destination[row * ${model}u + head * ${headDim}u + local.x] =
+        acc_${t} / running[${t}u];
     }
-    destination[row * ${model}u + head * ${headDim}u + d] = accumulated / sum;
-  }
+  }`).join("\n")}
 }`;
 }
 
@@ -561,6 +606,7 @@ export class EsmcBlockGpu {
     const boundsTest = options.boundsTest ?? false;
     const rowTile = options.rowTile ?? ROW_TILE;
     const profile = options.profile ?? false;
+    const queryTile = options.queryTile ?? QUERY_TILE;
     if (input.length !== rows * model) {
       throw new Error(`input has ${input.length} elements; expected ${rows * model}`);
     }
@@ -628,8 +674,8 @@ export class EsmcBlockGpu {
         `esmc-prepare:${rows}:${model}:${heads}:${epsilon}:${ropeBase}`,
         createPrepareShader({ rows, model, heads }, epsilon, ropeBase));
       const attentionPipeline = await pipeline(
-        `esmc-attend:${rows}:${model}:${heads}`,
-        createAttentionShader({ rows, model, heads }));
+        `esmc-attend:${rows}:${model}:${heads}:${queryTile}`,
+        createAttentionShader({ rows, model, heads }, queryTile));
       const outPipeline = await pipeline(
         `esmc-linear:${rows}:${model}:${model}:1:${weightPrecision}:${boundsTest}:${rowTile}`,
         createLinearShader({ rows, inner: model, outer: model }, true, weightPrecision, boundsTest, rowTile));
@@ -690,7 +736,9 @@ export class EsmcBlockGpu {
       stage("prepare");
       dispatch(preparePipeline, [qkv, qScale, kScale, query, key, value], rows);
       stage("attend");
-      dispatch(attentionPipeline, [query, key, value, context], rows * heads);
+      pass.setPipeline(attentionPipeline);
+      pass.setBindGroup(0, bindOf(attentionPipeline, [query, key, value, context]));
+      pass.dispatchWorkgroups(Math.ceil(rows / queryTile), heads);
       stage("attn-out");
       dispatchLinear(outPipeline, [context, attnOutScaled, x, afterAttention], model);
       stage("ffn-norm");
