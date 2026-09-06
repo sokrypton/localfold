@@ -1866,7 +1866,42 @@ against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
 
-🔴 **SO THE COLOUR SHIPS, AND IT IS THE ARM THAT DOES NOT USE THE STRUCTURE.**
+🔴 **AND THE TRAJECTORY IS COLOURED FRAME BY FRAME, WHICH IS WHAT THE `obs` ARM
+BUYS.** `mode` needs no coordinates and is therefore FIXED for a fold: every
+frame would wear the same colour, and the interesting thing about a trajectory
+is watching it become confident. `obs` centres on the distance the sampler
+produced, so it changes every step. The two scored a tie - median 0.537 against
+0.535, worst fold 0.361 against 0.363 - so this costs nothing in accuracy and
+buys a per-frame reading. Measured on ubiquitin, the B-factor range per frame:
+46.4-98.5, then 40.1-98.0, then 48.4, 48.2, 49.1... - it moves, and it settles.
+
+🔴 **THE FRAME IS SCORED ON THE DENOISED PREDICTION, WHICH IS WHAT IS DRAWN.**
+The sampler's own state is Gaussian noise at the top of the schedule; colouring
+the state while drawing the prediction would put one frame's colour on another
+frame's structure.
+
+🔴 **AND THE FILTER STAYS ON THE MODE WHILE THE QUANTITY MOVES.** The pairs a
+residue is judged on come from what the model PREDICTS, which does not change
+between frames; only the mass being averaged is recomputed. A score whose
+denominator moves is not comparable down a trajectory.
+
+🔴 **AND `mode` IS STILL THERE, AS THE FALLBACK AND AS THE PRE-SAMPLER READING.**
+It comes off the trunk, so a caller could gate whether to sample at all on it -
+and the finished structure keeps the LAST FRAME's score rather than the trunk's,
+or the play bar would step to a different colour on its final frame and read as
+the fold changing its mind at the end.
+
+🔴 **IT COSTS THE DISTOGRAM STAYING RESIDENT: `bins` TIMES THE PAIR
+REPRESENTATION, 46 MiB at 300 tokens**, released with the last frame.
+
+🔴 **AND A RETAINED BUFFER HAS TO LEAVE THE RELEASE LIST WHEN IT IS RETAINED,
+NOT WHEN IT IS FREED.** The first version handed the scorer a closure that
+spliced the buffers out of `held` - and that closure runs when the CALLER is
+finished, long after the function's own `finally` has freed them. The failure was
+"[Buffer esmfold2.disto.certainty-readback] is destroyed" on the first frame,
+which names the buffer and not the lifetime.
+
+🔴 **SO THE COLOUR SHIPS, AND THE PRE-SAMPLER ARM DOES NOT USE THE STRUCTURE.**
 `CERTAINTY` in src/esmfold2/distogram-webgpu.js: the mass within **2 A of the
 distogram's mode**, meaned over every pair at sequence separation above **3**
 whose predicted distance is under **12 A**. Ranked on realistic corruption rates

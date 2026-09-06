@@ -112,6 +112,47 @@ export const SAMPLER_DEFAULTS = {
   stepScale: 1.638, sMax: 160, sMin: 4e-4, p: 8, steps: 15, maxSigma: 256,
 };
 
+/**
+ * The dense-layout atom each token is represented by: CB, or CA where there is
+ * none, or the token's first atom for a ligand.
+ */
+export function representativeAtoms(features, tokens) {
+  const named = (atom, want) => {
+    for (let i = 0; i < 4; i += 1) {
+      const wanted = i < want.length ? want.charCodeAt(i) - 32 : 0;
+      if (features.refAtomNameChars[atom * 4 + i] !== wanted) return false;
+    }
+    return true;
+  };
+  const alpha = new Int32Array(tokens).fill(-1);
+  const beta = new Int32Array(tokens).fill(-1);
+  const first = new Int32Array(tokens).fill(-1);
+  for (let atom = 0; atom < features.atoms; atom += 1) {
+    if (features.mask[atom] === 0) continue;
+    const token = features.atomToToken[atom];
+    if (first[token] < 0) first[token] = atom;
+    if (named(atom, "CA")) alpha[token] = atom;
+    if (named(atom, "CB")) beta[token] = atom;
+  }
+  const out = new Int32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    out[token] = beta[token] >= 0 ? beta[token]
+      : (alpha[token] >= 0 ? alpha[token] : Math.max(0, first[token]));
+  }
+  return out;
+}
+
+/** Those atoms' coordinates out of a full atom array. */
+export function gatherPositions(coordinates, slots, tokens) {
+  const out = new Float32Array(tokens * 3);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      out[token * 3 + axis] = coordinates[slots[token] * 3 + axis];
+    }
+  }
+  return out;
+}
+
 const perRow = (rows) => [Math.min(GRID_WIDTH, rows), Math.ceil(rows / GRID_WIDTH)];
 const elementwise = (elements) => {
   const groups = Math.ceil(elements / LANES);
@@ -423,9 +464,11 @@ export async function foldEsmfold2(device, options) {
         { tokens, channels, bins: shape.distogramBins, pair,
           weights: weights.featuriser.distogramWeights,
           bias: weights.featuriser.distogramBias,
-          wantLogits: options.distogramLogits === true }));
+          wantLogits: options.distogramLogits === true,
+          retainForFrames: options.frameCertainty === true }));
     const contacts = distogram?.contacts;
     const certainty = distogram?.certainty;
+    const frames = distogram?.frames;
     // 🔴 THE CERTAINTY GOES OUT WITH THE CONTACTS, BEFORE THE SAMPLER RUNS.
     // Both come off the trunk's distogram, so a caller colouring its live
     // frames has them from the first one - and the first version assigned it
@@ -451,6 +494,12 @@ export async function foldEsmfold2(device, options) {
       weights: weights.denoiser, features, sInputs, pair, relPos,
     }));
 
+    // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM - CB, or CA for glycine,
+    // or a ligand token's only atom - so a frame is scored on those and not on
+    // alpha carbons. Gathered once: the slots do not move, only the coordinates.
+    const representative = frames === undefined ? undefined
+      : representativeAtoms(features, tokens);
+
     const schedule = noiseSchedule({ steps: settings.steps, sMax: settings.sMax,
                                      sMin: settings.sMin, p: settings.p,
                                      sigmaData: settings.sigmaData,
@@ -472,6 +521,12 @@ export async function foldEsmfold2(device, options) {
       const denoised = await denoiser.denoise(noisy, tHat);
       x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
                       schedule[step + 1], settings.stepScale);
+      // 🔴 SCORED ON THE DENOISED PREDICTION, WHICH IS WHAT IS DRAWN. The
+      // sampler's own state is Gaussian noise at the top of the schedule and is
+      // not what a viewer shows; colouring the state while drawing the
+      // prediction would put one frame's colour on another frame's structure.
+      const frameCertainty = frames === undefined ? undefined
+        : await frames.score(gatherPositions(denoised, representative, tokens));
       timings[`sampler ${step}`] = performance.now() - at;
       // 🔴 BOTH, BECAUSE A VIEWER WANTS THE ONE THE SAMPLER DOES NOT KEEP.
       // `coordinates` is the trajectory state at the NEXT noise level - what the
@@ -480,10 +535,13 @@ export async function foldEsmfold2(device, options) {
       // `denoised` is the model's predicted structure at this call, EDM
       // preconditioning included, and is protein-sized in every frame.
       await options.onStep?.({ step, total: levels.length, coordinates: x,
-                               denoised, features });
+                               denoised, features, certainty: frameCertainty });
     }
     const memory = allocator.snapshot();
     denoiser.release();
+    // ...the retained distogram is 46 MiB at 300 tokens and nothing reads it
+    // after the last frame.
+    frames?.release();
 
     return {
       coordinates: x, features, sequence, tokens, atoms, sInputs, contacts, certainty,

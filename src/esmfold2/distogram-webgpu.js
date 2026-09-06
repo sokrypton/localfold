@@ -225,6 +225,59 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
+/**
+ * Per pair: the mass within `radius` of the distance THIS STRUCTURE has.
+ *
+ * 🔴 THE OTHER ONE ASKS WHAT THE MODEL EXPECTS; THIS ONE ASKS WHETHER IT GOT
+ * IT. `createCertaintyPairShader` centres on the distribution's mode and needs
+ * no coordinates, so it is fixed for a fold. This centres on the distance the
+ * SAMPLER produced, so it changes every step - which is what lets a trajectory
+ * be coloured by its own agreement rather than by the final answer's, and a
+ * frame that has not converged says so instead of wearing the last frame's
+ * colour.
+ *
+ * They scored a tie on the sweep - median 0.537 against 0.535, worst fold 0.361
+ * against 0.363 - so this costs nothing in accuracy and buys a per-frame
+ * reading.
+ */
+export function createObservedMassShader({ tokens, bins }, span, edges = CONTACT_EDGES) {
+  const width = (edges.maximum - edges.minimum) / bins;
+  return `
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> bias: array<f32>;
+@group(0) @binding(2) var<storage, read> positions: array<f32>;
+@group(0) @binding(3) var<storage, read_write> mass: array<f32>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let cell = id.x + id.y * ${GRID_WIDTH * LANES}u;
+  if (cell >= ${tokens * tokens}u) { return; }
+  let i = cell / ${tokens}u;
+  let j = cell % ${tokens}u;
+  let dx = positions[i * 3u] - positions[j * 3u];
+  let dy = positions[i * 3u + 1u] - positions[j * 3u + 1u];
+  let dz = positions[i * 3u + 2u] - positions[j * 3u + 2u];
+  let separation = sqrt(dx * dx + dy * dy + dz * dz);
+  let raw = (separation - ${edges.minimum}.0) / ${width};
+  let observed = u32(clamp(raw, 0.0, ${bins - 1}.0));
+
+  let base = cell * ${bins}u;
+  var largest = -3.0e38;
+  for (var b = 0u; b < ${bins}u; b += 1u) {
+    largest = max(largest, logits[base + b] + bias[b]);
+  }
+  var total = 0.0;
+  var near = 0.0;
+  for (var b = 0u; b < ${bins}u; b += 1u) {
+    let weight = exp(logits[base + b] + bias[b] - largest);
+    total += weight;
+    let away = select(observed - b, b - observed, b > observed);
+    if (away <= ${span}u) { near += weight; }
+  }
+  mass[cell] = near / max(total, 1.0e-30);
+}`;
+}
+
 /** How many of `bins` have their centre inside `CONTACT_ANGSTROMS`. */
 export function contactBinCount(bins, edges = CONTACT_EDGES,
                                 threshold = CONTACT_ANGSTROMS) {
@@ -244,7 +297,8 @@ export function contactBinCount(bins, edges = CONTACT_EDGES,
  */
 export async function encodeContactMap(context, { tokens, channels, bins, pair,
                                                   weights, bias, chunk = 8192,
-                                                  wantLogits = false }) {
+                                                  wantLogits = false,
+                                                  retainForFrames = false }) {
   const { allocator, cache, submit, device } = context;
   const pairs = tokens * tokens;
   const storage = GPUBufferUsage.STORAGE;
@@ -294,8 +348,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     // representation, 46 MiB at 300 tokens. A caller scoring a STRUCTURE
     // against the distribution needs them, because the distances it scores do
     // not exist until the sampler has run.
+    // 🔴 THE WHOLE THING IS KEPT WHEN THE FRAMES WILL BE SCORED, which is
+    // `bins` times the pair representation - 46 MiB at 300 tokens - and is the
+    // price of colouring a trajectory by its own agreement rather than by the
+    // final answer's. It is released the moment the sampler finishes.
+    const wholeLogits = wantLogits || retainForFrames;
     const logits = keep(allocator.allocate("esmfold2.disto.logits",
-      (wantLogits ? pairs : height) * bins * 4,
+      (wholeLogits ? pairs : height) * bins * 4,
       storage | (wantLogits ? GPUBufferUsage.COPY_SRC : 0)));
     const contacts = keep(allocator.allocate("esmfold2.disto.contacts",
       pairs * 4, storage | GPUBufferUsage.COPY_SRC));
@@ -312,13 +371,13 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
         ["project", project[rows],
          [{ buffer: symmetric.buffer, byteOffset: start * channels * 4,
             byteSize: rows * channels * 4 }, projection,
-          wantLogits
+          wholeLogits
             ? { buffer: logits.buffer, byteOffset: start * bins * 4,
                 byteSize: rows * bins * 4 }
             : logits],
          ...linearGrid(rows, bins)],
         ["certainty-pair", certaintyPair[rows],
-         [wantLogits
+         [wholeLogits
             ? { buffer: logits.buffer, byteOffset: start * bins * 4,
                 byteSize: rows * bins * 4 }
             : logits, biasBuffer,
@@ -326,7 +385,7 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
           { buffer: modes.buffer, byteOffset: start * 4, byteSize: rows * 4 }],
          ...elementwise(rows)],
         ["contacts", contact[rows],
-         [wantLogits
+         [wholeLogits
             ? { buffer: logits.buffer, byteOffset: start * bins * 4,
                 byteSize: rows * bins * 4 }
             : logits, biasBuffer,
@@ -352,7 +411,24 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     await readCertainty.buffer.mapAsync(GPUMapMode.READ);
     const perToken = new Float32Array(readCertainty.buffer.getMappedRange().slice(0));
     readCertainty.buffer.unmap();
-    if (!wantLogits) return { contacts: out, certainty: perToken };
+    // 🔴 THE RETAINED BUFFERS LEAVE `held` NOW, NOT WHEN THEY ARE RELEASED. The
+    // first version handed the scorer a closure that spliced them out of the
+    // release list - and that closure runs when the CALLER is finished, long
+    // after this function's `finally` has already freed them. The failure was
+    // "[Buffer esmfold2.disto.certainty-readback] is destroyed" on the first
+    // frame, which names the buffer and not the lifetime.
+    const retained = retainForFrames
+      ? [logits, biasBuffer, modes, mass, certainty, readCertainty] : [];
+    for (const allocation of retained) {
+      const at = held.indexOf(allocation);
+      if (at >= 0) held.splice(at, 1);
+    }
+    const frames = retainForFrames ? await framesScorer({
+      device, allocator, cache, submit, key, tokens, bins, span, modeCutoffBin,
+      logits, biasBuffer, modes, mass, certainty, readCertainty,
+      release: () => { for (const allocation of retained) allocation.release(); },
+    }) : undefined;
+    if (!wantLogits) return { contacts: out, certainty: perToken, frames };
     // 🔴 THE BIAS IS NOT IN THE BUFFER, because the projection has none and the
     // contact pass adds it as it reads. A caller taking the logits away has to
     // be handed the bias too, or it will softmax a distribution missing 128
@@ -365,8 +441,54 @@ export async function encodeContactMap(context, { tokens, channels, bins, pair,
     await readLogits.buffer.mapAsync(GPUMapMode.READ);
     const values = new Float32Array(readLogits.buffer.getMappedRange().slice(0));
     readLogits.buffer.unmap();
-    return { contacts: out, certainty: perToken, logits: values, bias };
+    return { contacts: out, certainty: perToken, frames, logits: values, bias };
   } finally {
     for (let at = held.length - 1; at >= 0; at -= 1) held[at].release();
   }
+}
+
+/**
+ * A closure that scores one structure at a time against the retained distogram.
+ *
+ * 🔴 IT REUSES THE AGGREGATION AND ONLY THE PER-PAIR PASS CHANGES. The filter
+ * is still on the MODE - what the model predicts, which does not move between
+ * frames - and only the quantity being averaged is recomputed against where the
+ * sampler currently has the atoms. Recomputing the filter too would let a frame
+ * change which pairs it is judged on, and a score whose denominator moves is
+ * not comparable down a trajectory.
+ */
+async function framesScorer(context) {
+  const { device, allocator, cache, submit, key, tokens, bins, span } = context;
+  const { modeCutoffBin, logits, biasBuffer, modes, mass, certainty, readCertainty } = context;
+  const storage = GPUBufferUsage.STORAGE;
+  const observed = await cache.get(`${key}:observed:${tokens}`,
+    createObservedMassShader({ tokens, bins }, span));
+  const aggregate = await cache.get(`${key}:certain-token:${tokens}`,
+    createCertaintyShader({ tokens, separation: CERTAINTY.separation, modeCutoffBin }));
+  const positions = allocator.allocate("esmfold2.disto.frame-positions",
+    Math.max(16, tokens * 3 * 4), storage | GPUBufferUsage.COPY_DST);
+  const elementwise = (elements) => {
+    const groups = Math.ceil(elements / LANES);
+    return [Math.min(GRID_WIDTH, groups), Math.ceil(groups / GRID_WIDTH)];
+  };
+  return {
+    /** @param {Float32Array} representative one xyz per token */
+    async score(representative) {
+      device.queue.writeBuffer(positions.buffer, 0, representative);
+      await submit("esmfold2.certainty.frame", [
+        ["observed", observed, [logits, biasBuffer, positions, mass],
+         ...elementwise(tokens * tokens)],
+        ["aggregate", aggregate, [mass, modes, certainty],
+         Math.min(GRID_WIDTH, tokens), Math.ceil(tokens / GRID_WIDTH)],
+      ]);
+      const encoder = device.createCommandEncoder({ label: "esmfold2.certainty.frame" });
+      encoder.copyBufferToBuffer(certainty.buffer, 0, readCertainty.buffer, 0, tokens * 4);
+      device.queue.submit([encoder.finish()]);
+      await readCertainty.buffer.mapAsync(GPUMapMode.READ);
+      const out = new Float32Array(readCertainty.buffer.getMappedRange().slice(0));
+      readCertainty.buffer.unmap();
+      return out;
+    },
+    release() { positions.release(); context.release(); },
+  };
 }

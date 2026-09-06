@@ -2154,6 +2154,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // read as one. See CERTAINTY in src/esmfold2/distogram-webgpu.js for the
   // sweep that chose its three constants.
   let certainty;
+  let lastFrameCertainty;
   const REMARK = "REMARK   1 B-FACTOR IS DISTOGRAM CERTAINTY (0-100), NOT pLDDT."
     + "\nREMARK   1 THIS ESMFOLD2 CHECKPOINT HAS NO CONFIDENCE HEAD.";
   const withRemark = (pdb) => `${REMARK}\n${pdb}`;
@@ -2168,6 +2169,13 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
                                loaded.shape.pairChannels),
     sampler: samplerPreset(),
     seed: randomSeed(),
+    // 🔴 EACH FRAME GETS ITS OWN COLOUR, WHICH NEEDS THE DISTOGRAM RESIDENT.
+    // The trunk's own certainty is fixed for a fold, so every frame would wear
+    // the same one - and the interesting thing about a trajectory is watching
+    // it become confident. Scoring each frame against the distogram costs the
+    // logits staying on the device, 46 MiB at 300 tokens, released with the
+    // last frame.
+    frameCertainty: true,
     onProgress: (label) => {
       if (signal.aborted) return;
       status(`ESMFold2 · ${label}`);
@@ -2188,7 +2196,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // almost all network - and is protein-sized in every frame. AF3's path
     // records the same finding, measured: a radius of gyration of 1896 A at
     // step 4 against 11.1 at the end.
-    onStep: ({ step, total, denoised, features }) => {
+    onStep: ({ step, total, denoised, features, certainty: frameCertainty }) => {
       if (signal.aborted) return;
       progress((step + 1) / total);
       const dense = toDensePositions(features, denoised);
@@ -2196,13 +2204,17 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
       if (reference === null) {
         reference = toPoints(dense, features.batch.tokens * features.batch.dense);
       }
-      // ...the certainty is the TRUNK's and does not change per step, so every
-      // frame carries the same colouring. That is honest: nothing about a
-      // sampler step changes what the distogram knows.
+      // ...this frame's OWN agreement with the distogram, so an early frame
+      // that has not converged is coloured as one rather than wearing the
+      // finished structure's confidence. The trunk's mode-based certainty is
+      // the fallback, and it is the same quantity measured a different way -
+      // the two scored a tie on the sweep.
+      const shown = frameCertainty ?? certainty;
       const pdb = withRemark(fittedPdb(features.batch, dense, reference, slots,
-        certainty === undefined ? null : spreadOverAtoms(features, certainty, 100)));
+        shown === undefined ? null : spreadOverAtoms(features, shown, 100)));
       framePdbs.push(pdb);
       drawLiveFrame(pdb);
+      lastFrameCertainty = shown;
     },
   });
   throwIfAborted(signal);
@@ -2212,7 +2224,11 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // It is still `result.coordinates` - the sampler's own answer, not the last
   // denoiser call - and at the bottom of the schedule the two agree to a
   // fraction of an angstrom anyway.
-  certainty = result.certainty ?? certainty;
+  // 🔴 THE FINISHED STRUCTURE KEEPS THE LAST FRAME'S SCORE, not the trunk's.
+  // The two are the same quantity read two ways, but the play bar would step
+  // from a per-frame colour to a different one on its last frame, which reads
+  // as the fold changing its mind at the end.
+  certainty = lastFrameCertainty ?? result.certainty ?? certainty;
   const bFactors = certainty === undefined
     ? null : spreadOverAtoms(result.features, certainty, 100);
   const finalDense = toDensePositions(result.features, result.coordinates);
