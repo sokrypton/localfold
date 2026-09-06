@@ -1652,6 +1652,30 @@ but satisfying a presence check, and the ESM-C bundle's int3 failed it with
 Found only by loading the bundle through `HttpTensorStore`, which is the page's
 path and not any checker's.
 
+🔴 **AND THE PAGE OFFERS NO FLOW ARM, BECAUSE FLOW BUYS NOTHING FOR THIS
+MODEL.** For AF3 the flow/diffusion switch is a twelve-fold saving: that model's
+diffusion default is 200 steps and flow-16 is sixteen. ESMFold2's own sampler is
+**eleven** steps - `inference_num_steps: 15` truncated by
+`max_inference_sigma = 256` - so there is nothing to escape from, and `gamma0 = 0`
+stops noise being re-injected without making a step cheaper. Counted:
+
+| preset | asked | steps actually run |
+|---|---|---|
+| diffusion-15 (the checkpoint's own) | 15 | **11** |
+| flow-16 | 16 | **12** |
+| diffusion-32 / flow-32 | 32 | 23 each |
+
+The flow arm at its usual setting runs MORE steps than the shipped sampler, for
+a sampler the model was not trained with. `SAMPLER_PRESETS` keeps them - the
+measurements are worth having - and the page shows only the step dial. **A
+choice whose every option is equivalent-or-worse is the same fault as a control
+that is ignored.**
+
+🔴 **AND THE MODE IS FORCED IN CODE, NOT ONLY HIDDEN.** That is the lesson the
+MSA row taught an hour earlier: hiding a control does not change its value, and
+the shared `#af3-mode` select still reads "flow" behind a hidden row.
+`samplerPreset` reads `ESMFOLD2_SAMPLER_MODE` and never the select.
+
 🔴 **THE SAMPLER PRESETS ARE PRICED, AND SIX STEPS IS NOT "FASTER".** Measured
 on the 40-mer against ESMFold2's own fold, one seed each:
 

@@ -43,24 +43,38 @@ const TOWER_SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/nor
   "lm/downproject/bias"];
 
 /**
- * The step counts the sampler dial offers, per mode.
+ * The step counts the sampler dial offers.
  *
- * 🔴 SIX STEPS IS NOT "FASTER", IT IS BROKEN, so `diffusion-8` is measured and
- * not offered. See SAMPLER_PRESETS in src/esmfold2/fold.js: it gives a CA-CA
- * spacing of 58 A where a peptide bond is 3.8. The churn is what breaks -
- * gamma0 re-noises to sigma * 1.605 and step_scale 1.638 overshoots - and at
- * six steps the levels are too far apart for either to be corrected. The flow
- * arm re-noises not at all and is merely poor there, so it starts at 16 too.
+ * 🔴 DIFFUSION ONLY, AND THE FLOW ARM IS NOT OFFERED BECAUSE IT SAVES NOTHING.
+ * For AF3 the flow/diffusion switch earns its place: that model's diffusion
+ * default is 200 steps and flow-16 is a twelve-fold saving. ESMFold2's own
+ * sampler is ELEVEN steps - `inference_num_steps: 15` truncated by
+ * `max_inference_sigma` - so there is nothing to escape from, and a step costs
+ * the same either way. `gamma0 = 0` stops noise being re-injected; it does not
+ * make a step cheaper. Counted:
  *
- * 🔴 AND THE NUMBER ON THE DIAL IS THE SCHEDULE'S LENGTH, NOT THE STEP COUNT.
- * `max_inference_sigma` drops every entry above 256 and prepends the cap, so
- * the checkpoint's 15 runs eleven. The dial says what the model's own config
- * says; the status line reports what actually ran.
+ * | preset | asked | steps actually run |
+ * |---|---|---|
+ * | diffusion-15 (the checkpoint's own) | 15 | **11** |
+ * | flow-16 | 16 | **12** |
+ * | diffusion-32 / flow-32 | 32 | 23 each |
+ *
+ * So the flow arm at its usual setting runs MORE steps than the shipped
+ * sampler, for a sampler the model was not trained with. It stays in
+ * SAMPLER_PRESETS - the measurements are worth keeping and a tool may ask for
+ * it - and the page does not offer a choice whose every option is
+ * equivalent-or-worse.
+ *
+ * 🔴 AND SIX STEPS IS NOT "FASTER", IT IS BROKEN, so `diffusion-8` is measured
+ * and not offered: CA-CA 58 A where a peptide bond is 3.8. The churn overshoots
+ * when the levels are too far apart to correct it.
  */
 export const ESMFOLD2_COUNTS = {
-  flow: { label: "Steps", values: [16, 32], preferred: 16 },
   diffusion: { label: "Steps", values: [15, 32, 64, 200], preferred: 15 },
 };
+
+/** The sampler mode this model runs, whatever a shared control says. */
+export const ESMFOLD2_SAMPLER_MODE = "diffusion";
 
 let weightsPromise;
 

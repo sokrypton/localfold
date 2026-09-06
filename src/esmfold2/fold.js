@@ -87,12 +87,19 @@ export const SAMPLER_PRESETS = {
   "diffusion-64": { steps: 64, maxSigma: 256 },
   "diffusion-200": { steps: 200, maxSigma: 256 },
   /**
-   * 🔴 A FLOW ARM IS THE SAME SCHEDULE WITH THE CHURN AND THE NOISE TURNED OFF,
-   * WHICH MAKES IT DETERMINISTIC GIVEN ITS START. `gamma0 = 0` makes `t_hat`
-   * equal `sigma` at every step, so no noise is re-injected and the update is a
-   * plain Euler step down the probability-flow ODE. It is not a different
-   * sampler and it is not free: the model was trained with churn, so few-step
-   * flow arms trade accuracy for time exactly as AF3's do.
+   * 🔴 A FLOW ARM IS THE SAME SCHEDULE WITH THE CHURN AND THE NOISE TURNED OFF.
+   * `gamma0 = 0` makes `t_hat` equal `sigma` at every step, so no noise is
+   * re-injected and the update is a plain Euler step down the probability-flow
+   * ODE.
+   *
+   * 🔴 AND IT BUYS NOTHING HERE, WHICH IS WHY THE PAGE DOES NOT OFFER IT. For
+   * AF3 the switch is a twelve-fold saving - that model's diffusion default is
+   * 200 steps and flow-16 is sixteen. ESMFold2's own sampler is ELEVEN steps
+   * (`inference_num_steps: 15` truncated by `max_inference_sigma`), so there is
+   * nothing to escape from, and a step costs the same either way: `flow-16`
+   * runs TWELVE steps, one MORE than the shipped `diffusion-15`, and at 32 the
+   * two run 23 each. These stay because the measurement is worth keeping and a
+   * tool may ask for one; see ESMFOLD2_COUNTS in web/esmfold2-model.js.
    */
   "flow-16": { steps: 16, maxSigma: 256, gamma0: 0, noiseScale: 0 },
   "flow-8": { steps: 8, maxSigma: 256, gamma0: 0, noiseScale: 0 },

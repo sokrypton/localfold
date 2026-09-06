@@ -37,8 +37,8 @@ import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints } from "./af3-model.js";
-import { ESMFOLD2_COUNTS, languageModelRunner, loadEsmfold2Weights }
-  from "./esmfold2-model.js";
+import { ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
+  loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
 import { toDensePositions } from "../src/esmfold2/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
@@ -1327,10 +1327,15 @@ function syncModelControls() {
   // - what differs is the numbers, which is why the count dial is rebuilt from
   // a per-model table rather than shared.
   const sampled = af3 || family === "esmfold2";
-  for (const id of ["af3ModeGroup", "af3CountGroup"]) {
-    const node = document.getElementById(id);
-    if (node !== null) node.hidden = !sampled;
-  }
+  const countNode = document.getElementById("af3CountGroup");
+  if (countNode !== null) countNode.hidden = !sampled;
+  // 🔴 THE STEP COUNT IS SHARED AND THE MODE IS NOT. ESMFold2's own sampler is
+  // eleven steps, so a flow arm has nothing to escape from and runs MORE of
+  // them than the shipped one - see ESMFOLD2_COUNTS. Offering a choice whose
+  // every option is equivalent-or-worse is the same fault as offering one that
+  // is ignored, so the mode row is hidden for it.
+  const modeNode = document.getElementById("af3ModeGroup");
+  if (modeNode !== null) modeNode.hidden = !af3;
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
   // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
   // screen would run, take a minute of somebody else's server, and be
@@ -1394,8 +1399,12 @@ function syncMaxMsa() {
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
-  const table = chosenFamily() === "esmfold2" ? ESMFOLD2_COUNTS : AF3_COUNTS;
-  const { label, values, preferred } = table[mode] ?? table.flow;
+  // ...and ESMFold2's table has one mode, so the shared select cannot pick a
+  // row that is not there.
+  const esmfold2 = chosenFamily() === "esmfold2";
+  const table = esmfold2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  const { label, values, preferred } = table[esmfold2 ? ESMFOLD2_SAMPLER_MODE : mode]
+    ?? table.flow ?? table.diffusion;
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
@@ -2046,7 +2055,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
  * of thing that gains a value on the page before it gains one in the code.
  */
 function samplerPreset() {
-  const mode = document.getElementById("af3-mode")?.value || "diffusion";
+  // 🔴 THE MODEL DECIDES THE MODE, NOT THE HIDDEN SELECT. Hiding a control does
+  // not change its value - that is what put "unknown model esmfold2" in front
+  // of somebody folding an oligomer - so this reads the model's own answer and
+  // never the shared row.
+  const mode = ESMFOLD2_SAMPLER_MODE;
   // 🔴 AN EMPTY DIAL IS "NOTHING CHOSEN", NOT AN UNKNOWN CHOICE. A `<select>`
   // assigned a value none of its options carry reports "" - which is what
   // happens whenever the count dial has not been rebuilt for this model yet, or
