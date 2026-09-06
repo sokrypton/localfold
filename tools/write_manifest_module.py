@@ -70,6 +70,28 @@ BUNDLES = {
         "module": "src/reference/manifests/openbind0.js",
         "model": "openbind0",
     },
+    # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
+    # and the whole structure head, at int5 group 32. 122 MiB.
+    #
+    # 🔴 IT IS HALF A MODEL AND CANNOT FOLD ALONE. The language model is a
+    # SEPARATE 224 MiB bundle with its own licence and its own exporter, and the
+    # shim that joins them is per folding model - which is why the ESM-C
+    # manifest carries both names. MODEL_BUNDLES.esmfold2 names `esmc` as its
+    # companion so a page cannot load one without the other.
+    "esmfold2": {
+        "export": "model-esmfold2-int5",
+        "module": "src/reference/manifests/esmfold2.js",
+        "model": "esmfold2-trunk",
+    },
+    # ESM-C 600M at int3 group 128, plus the shim that turns its 37 hidden
+    # states into ESMFold2's pair term. Three bits, because the structural
+    # damage was measured against the SAMPLER's own seed spread rather than
+    # against zero - see docs/ESMFOLD2.md.
+    "esmc": {
+        "export": "model-esmc-600m-int3",
+        "module": "src/reference/manifests/esmc.js",
+        "model": "esmc",
+    },
 }
 
 

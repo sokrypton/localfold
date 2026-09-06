@@ -21,7 +21,17 @@
  * stride, which produces not an error but a different protein.
  */
 
-const BYTES = { float32: 4, float16: 2, int8: 1, int5: 1 };
+/**
+ * 🔴 A PACKED WIDTH IS NOT IN THIS TABLE AND MUST NOT NEED TO BE. It listed
+ * `int5: 1` because int5 was the only packed dtype that existed when it was
+ * written, and the entry is never READ - the packed branch below returns before
+ * it is used - so it was doing nothing but satisfying the presence check on the
+ * line after. The ESM-C bundle ships int3, and the whole of this file handles
+ * it: `packedBits` matches any width from one to seven, `readTensor` decodes
+ * any of them, and the only thing that refused was this lookup, with
+ * "unsupported tensor dtype int3" from a reader that supports it.
+ */
+const BYTES = { float32: 4, float16: 2, int8: 1 };
 
 /**
  * The width of a sub-byte packed integer dtype, or null.
@@ -72,10 +82,13 @@ export function tensorElements(record) {
  * from where the tensor starts rather than recomputed from a padding rule.
  */
 export function tensorByteLength(record) {
+  const packed = packedBits(record.dtype);
   const width = BYTES[record.dtype];
-  if (width === undefined) throw new Error(`unsupported tensor dtype ${record.dtype}`);
+  if (width === undefined && packed === null) {
+    throw new Error(`unsupported tensor dtype ${record.dtype}`);
+  }
   const elements = tensorElements(record);
-  if (record.dtype !== "int8" && packedBits(record.dtype) === null) {
+  if (record.dtype !== "int8" && packed === null) {
     return elements * width;
   }
   const { block, scaleOffset, byteOffset = 0 } = record;

@@ -458,7 +458,7 @@ export async function foldEsmfold2(device, options) {
       x = samplerStep(noisy, denoised, features.mask, atoms, tHat,
                       schedule[step + 1], settings.stepScale);
       timings[`sampler ${step}`] = performance.now() - at;
-      await options.onStep?.(step, levels.length, x);
+      await options.onStep?.(step, levels.length, x, features);
     }
     const memory = allocator.snapshot();
     denoiser.release();

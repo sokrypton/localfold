@@ -36,8 +36,16 @@ import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, foldAf3, loadAf3Weights } from "./af3-model.js";
+import { ESMFOLD2_COUNTS, languageModelRunner, loadEsmfold2Weights }
+  from "./esmfold2-model.js";
+import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
+import { toDensePositions } from "../src/esmfold2/featurise.js";
+import { toPdb } from "../src/af3/fold.js";
+import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
+import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
-import { AF3_FAMILIES } from "../src/reference/manifests/index.js";
+import { AF3_FAMILIES, ALL_ATOM_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
+  from "../src/reference/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
@@ -294,6 +302,15 @@ function reportModelFromUrl(attempt = 0) {
 
 const chosenFamily = () => document.getElementById("model-family")?.value ?? "af3";
 const isAf3Family = (family) => AF3_FAMILIES.includes(family);
+/**
+ * 🔴 "CAN THIS MODEL SEE AN ATOM" IS NOT "IS THIS AN AlphaFold 3 GRAPH", AND
+ * THE SECOND MODEL THAT NEEDED THEM SPLIT THEM. ESMFold2 runs a different graph
+ * and the same all-atom representation, so a guard written as `!isAf3Family`
+ * refuses a ligand under a model that has ligand tokens - with a message naming
+ * a capability it has. That is the mistake recorded in CLAUDE.md for the
+ * AF3/OpenBind split, one model later, and this is the name that prevents it.
+ */
+const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family);
 
 /**
  * What a fold's viewer object and downloaded files are called, per model.
@@ -312,6 +329,7 @@ const MODEL_STEMS = {
   openbind0: "openbind0",
   monomer: "af2",
   multimer: "af2_multimer",
+  esmfold2: "esmfold2",
 };
 
 /** What to call each model while its weights download. */
@@ -322,9 +340,15 @@ const MODEL_LABELS = {
   openbind0: "OpenBind-0",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
+  // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone would
+  // read as ESM's released ESMFold2-Fast, which folds from ESM-C 6B and is a
+  // different and better model; this is the 600M experimental one, which is the
+  // one that fits a browser.
+  esmfold2: "ESMFold2 600M",
 };
 
-const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) => {
+const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
+                     templateCount = 0) => {
   // 🔴 THE CHOICE IS ALWAYS EXPLICIT NOW. "Auto" used to read the chain count
   // and pick between the two AlphaFold 2 models - which made AF2 the silent
   // default for everything and could never choose AF3, so the newest model was
@@ -343,8 +367,8 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // complex with one under AF2 would drop it silently and return a confident
   // structure of the protein alone - which is a different answer to the
   // question that was asked, not a worse one.
-  if (ligandCount > 0 && !isAf3Family(choice)) {
-    throw new Error("Ligands need an AlphaFold 3 model - AF3 or OpenBind-0;"
+  if (ligandCount > 0 && !supportsAllAtom(choice)) {
+    throw new Error("Ligands need AF3, OpenBind-0 or ESMFold2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND A MODIFIED RESIDUE IS AlphaFold 3 ONLY FOR THE SAME REASON. AF2
@@ -353,8 +377,8 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // a confident structure of the unmodified chain - which is a different answer
   // to the question, not a worse one. The residue COUNT is unchanged either
   // way, so nothing else on the page would have shown the difference.
-  if (modificationCount > 0 && !isAf3Family(choice)) {
-    throw new Error("Modified residues need an AlphaFold 3 model - AF3 or OpenBind-0;"
+  if (modificationCount > 0 && !supportsAllAtom(choice)) {
+    throw new Error("Modified residues need AF3, OpenBind-0 or ESMFold2;"
       + ` the model is set to ${choice}`);
   }
   // 🔴 AND A NUCLEIC CHAIN IS AlphaFold 3 ONLY, WHICH IS THE LOUDEST OF THE
@@ -362,8 +386,18 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0) =
   // there, it is READ - as alanine, cysteine, glycine, threonine - so a DNA
   // chain folded under AF2 comes back as a confident structure of a short
   // peptide that was never asked for, with nothing anywhere saying so.
-  if (nucleicCount > 0 && !isAf3Family(choice)) {
-    throw new Error("DNA and RNA need an AlphaFold 3 model - AF3 or OpenBind-0;"
+  if (nucleicCount > 0 && !supportsAllAtom(choice)) {
+    throw new Error("DNA and RNA need AF3, OpenBind-0 or ESMFold2;"
+      + ` the model is set to ${choice}`);
+  }
+  // 🔴 AND A TEMPLATE IS THE ONE THING ESMFold2 REALLY CANNOT DO. `grep -rn
+  // template` over its whole upstream package returns nothing and z_init has
+  // five terms with no template among them - so a template set on an entity row
+  // would be fetched, aligned, and silently dropped. It is the same refusal as
+  // the three above and for the opposite reason: those were a capability the
+  // model has and the guard denied, this is one it does not.
+  if (templateCount > 0 && !isAf3Family(choice)) {
+    throw new Error("Templates need AF3 or OpenBind-0;"
       + ` the model is set to ${choice}`);
   }
   return choice;
@@ -589,9 +623,16 @@ function startModelPreload(family, signal) {
         : `${name} · ${mib(loadedBytes).padStart(total.length, "\u2007")}`
           + ` / ${total} MiB`);
   };
-  const load = AF3_FAMILIES.includes(family)
-    ? loadAf3Weights(report, family)
-    : loadModel("msa", report, signal, family);
+  // 🔴 THREE LOADERS NOW, AND THE THIRD IS TWO BUNDLES. ESMFold2 reads a
+  // folding bundle and a language model with separate manifests and separate
+  // licences, so it has its own entry point rather than a family argument to
+  // one of the others - and it reports ONE progress stream over both, or the
+  // dial resets to zero halfway through a 347 MiB download.
+  const load = family === "esmfold2"
+    ? loadEsmfold2Weights(report)
+    : (AF3_FAMILIES.includes(family)
+      ? loadAf3Weights(report, family)
+      : loadModel("msa", report, signal, family));
   // 🔴 A REJECTION HANDLER NOW, OR AN UNHANDLED ONE LATER. Nothing awaits this
   // promise until the fold reaches it, and a download that fails before then is
   // an unhandled rejection - which in a page means a console error and, with
@@ -1265,10 +1306,27 @@ function setFoldButton(state) {
  * put, so the row keeps one order.
  */
 function syncModelControls() {
-  const af3 = isAf3Family(chosenFamily());
+  const family = chosenFamily();
+  const af3 = isAf3Family(family);
+  // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
+  // structure head is an EDM sampler with a churn factor, exactly as AF3's is,
+  // so "flow or diffusion, and how many steps" means the same thing under both
+  // - what differs is the numbers, which is why the count dial is rebuilt from
+  // a per-model table rather than shared.
+  const sampled = af3 || family === "esmfold2";
   for (const id of ["af3ModeGroup", "af3CountGroup"]) {
     const node = document.getElementById(id);
-    if (node !== null) node.hidden = !af3;
+    if (node !== null) node.hidden = !sampled;
+  }
+  // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
+  // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
+  // screen would run, take a minute of somebody else's server, and be
+  // discarded - which is the "quietly ignored control" this function exists to
+  // prevent, one step worse.
+  const singleSequence = SINGLE_SEQUENCE_FAMILIES.includes(family);
+  for (const id of ["msaModeGroup", "maxMsaGroup"]) {
+    const node = document.getElementById(id);
+    if (node !== null) node.hidden = singleSequence;
   }
   // 🔴 A HIDDEN CONTROL HAS TO BE RESTORED. The first version only ever SET
   // hidden, so choosing AF3 and going back to AF2 left the page with no
@@ -1283,7 +1341,7 @@ function syncModelControls() {
   // controls two owners that disagree - so they are not touched here at all,
   // and they mean the same thing for all three models.
   syncMaxMsa();
-  if (af3) syncAf3Count();
+  if (sampled) syncAf3Count();
 }
 
 /**
@@ -1323,7 +1381,8 @@ function syncMaxMsa() {
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
-  const { label, values, preferred } = AF3_COUNTS[mode] ?? AF3_COUNTS.flow;
+  const table = chosenFamily() === "esmfold2" ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  const { label, values, preferred } = table[mode] ?? table.flow;
   const title = document.getElementById("af3-count-label");
   if (title !== null) title.textContent = label;
   const select = document.getElementById("af3-count");
@@ -1948,6 +2007,183 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   status(`${modelName} · ${what.join(" + ")} · ${detail.join(" · ")}`);
 }
 
+/**
+ * A whole ESMFold2 fold, from the page.
+ *
+ * 🔴 IT IS THE SHORTEST FOLD PATH HERE, BECAUSE THE MODEL HAS THE FEWEST
+ * INPUTS. No alignment, no template, no recycle setting a reader can turn -
+ * `num_loops` is the checkpoint's - and no confidence head, so there is no PAE
+ * panel, no pLDDT colouring and no scores card. What it does have is ligands,
+ * DNA, RNA and complexes, because its featuriser is AF3's.
+ *
+ * 🔴 AND THE COLOUR SCHEME IS NOT pLDDT. Every other fold on this page is
+ * coloured by the confidence head's per-atom answer; this model has no such
+ * head, and a structure drawn under the pLDDT scheme with a zero B-factor is
+ * uniformly the colour of NO confidence - which reads as a terrible fold rather
+ * than as an absent measurement. It is coloured by chain instead, and the
+ * status line says the model reports no confidence rather than leaving a reader
+ * to notice the card is missing.
+ */
+/**
+ * The sampler row, as one of SAMPLER_PRESETS.
+ *
+ * 🔴 IT REFUSES A COMBINATION IT CANNOT NAME rather than falling back to the
+ * default. A dial that silently ignores what it was set to is the failure
+ * syncModelControls exists to prevent, and a preset table is exactly the kind
+ * of thing that gains a value on the page before it gains one in the code.
+ */
+function samplerPreset() {
+  const mode = document.getElementById("af3-mode")?.value || "diffusion";
+  // 🔴 AN EMPTY DIAL IS "NOTHING CHOSEN", NOT AN UNKNOWN CHOICE. A `<select>`
+  // assigned a value none of its options carry reports "" - which is what
+  // happens whenever the count dial has not been rebuilt for this model yet, or
+  // a caller sets a step count from another model's table. The first version
+  // threw on it and the message named a sampler called `flow-`, which describes
+  // the symptom and not the cause.
+  const chosen = document.getElementById("af3-count")?.value;
+  const steps = chosen === undefined || chosen === ""
+    ? String(ESMFOLD2_COUNTS[mode]?.preferred ?? ESMFOLD2_COUNTS.diffusion.preferred)
+    : chosen;
+  const name = `${mode}-${steps}`;
+  if (SAMPLER_PRESETS[name] === undefined) {
+    throw new Error(`no ESMFold2 sampler called ${name}; `
+      + `known: ${Object.keys(SAMPLER_PRESETS).join(", ")}`);
+  }
+  return name;
+}
+
+async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad) {
+  const modelName = MODEL_LABELS.esmfold2;
+  const sequence = chains.join(":");
+  status(`${modelName} · loading`);
+  // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED, exactly as on the AF3
+  // path - and from the same place, because these are the same components. A
+  // fold touches only the codes its ligands name and the PDB serves each as one
+  // small mmCIF; the 21 polymer components stay baked.
+  const ligands = [];
+  for (const code of ligandCodes) {
+    status(`${modelName} · fetching ligand ${code}`);
+    const response = await fetch(ccdUrl(code), { signal });
+    if (!response.ok) {
+      throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
+    }
+    ligands.push(parseCcdComponent(await response.text()));
+  }
+  throwIfAborted(signal);
+  const loaded = await (modelLoad ?? loadEsmfold2Weights());
+  throwIfAborted(signal);
+  const device = await getDevice();
+  throwIfAborted(signal);
+
+  predictionCount += 1;
+  const header = entityList.header();
+  const stem = uniqueStem(header !== null
+    ? safeJobName(header) : `${MODEL_STEMS.esmfold2}_${predictionCount}`);
+  openBlankFold(stem);
+  viewer = undefined;
+  viewerObject = undefined;
+
+  const api = window.py2Dmol;
+  let liveContacts;
+  let drawn = 0;
+  const framePdbs = [];
+  const drawLiveFrame = (pdb) => {
+    if (signal.aborted || api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      if (object.frames.length === 0) revealViewer(renderer);
+      const frame = api.frameFromText(pdb);
+      frame.name = frame.label = frame.title = `sampler_${drawn++}`;
+      if (liveContacts !== undefined) frame.maps = { contact: liveContacts };
+      renderer.addFrame(frame, renderer.currentObjectName);
+      renderer.setFrame(object.frames.length - 1);
+    } catch (error) {
+      console.warn("live frame skipped:", error);
+    }
+  };
+
+  const started = performance.now();
+  const result = await foldEsmfold2(device, {
+    sequence,
+    entities: { sequence, chainKinds, ligands },
+    shape: loaded.shape,
+    weights: loaded.weights,
+    tower: languageModelRunner(device, new GpuBufferAllocator(device), loaded,
+                               loaded.shape.pairChannels),
+    sampler: samplerPreset(),
+    seed: randomSeed(),
+    onProgress: (label) => {
+      if (signal.aborted) return;
+      status(`${modelName} · ${label}`);
+    },
+    // 🔴 THE CONTACT MAP EXISTS BEFORE ANY STRUCTURE DOES, because the
+    // distogram head runs off the trunk and the sampler has not started. It is
+    // held until there is a frame to hang it on, exactly as the AF3 path holds
+    // its own.
+    onContacts: (contacts) => { liveContacts = contactMapFor(contacts); },
+    onStep: (step, total, coordinates, features) => {
+      if (signal.aborted) return;
+      progress((step + 1) / total);
+      const pdb = toPdb(features.batch, toDensePositions(features, coordinates));
+      framePdbs.push(pdb);
+      drawLiveFrame(pdb);
+    },
+  });
+  throwIfAborted(signal);
+
+  const pdb = toPdb(result.features.batch,
+                    toDensePositions(result.features, result.coordinates));
+  const contactMap = contactMapFor(result.contacts);
+  const live = viewer?.objectsData?.[viewerObject];
+  if (live?.frames !== undefined) live.frames.length = 0;
+  await loadIntoViewer({ stem, pdb: framePdbs[0] ?? pdb, scores: {} });
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    const first = object?.frames?.[0];
+    if (first !== undefined) {
+      // 🔴 py2Dmol NAMES THE FRAME IT INGESTED `recycle_0`, WHICH THIS MODEL
+      // HAS NONE OF. Its file path assumes an AlphaFold 2 trajectory; every
+      // frame here is a sampler step, and a play bar that starts at "recycle_0"
+      // and continues "sampler_1" describes two things that are one thing.
+      first.name = first.label = first.title = "sampler_0";
+      if (contactMap !== undefined) first.maps = { ...first.maps, contact: contactMap };
+    }
+    // 🔴 THE FINISHED STRUCTURE REPLACES THE LAST SAMPLER FRAME, as on the AF3
+    // path: the last frame IS that step's output, so appending it makes a play
+    // bar that ends on the same picture twice.
+    for (const [index, text] of [...framePdbs.slice(1, -1), pdb].entries()) {
+      const frame = api.frameFromText(text);
+      const last = index === framePdbs.length - 2;
+      frame.name = frame.label = frame.title = last ? "final" : `sampler_${index + 1}`;
+      viewer.addFrame(frame, viewerObject);
+    }
+    // 🔴 CHAIN COLOURS, NOT pLDDT. See the note at the top of this function.
+    if (typeof viewer.setColorScheme === "function") viewer.setColorScheme("chain");
+    viewer.setFrame((viewer.objectsData?.[viewerObject]?.frames?.length ?? 1) - 1);
+  }
+
+  lastPrediction = {
+    stem, pdb, chains,
+    chainLengths: chains.map((chain) => chain.length),
+    // 🔴 NO `confidence`, AND THAT IS THE HONEST SHAPE. Everything that reads a
+    // prediction's confidence - the scores card, the archive's summary, the PAE
+    // panel - asks for fields this checkpoint has no head to compute. An object
+    // carrying zeros would be read as the model's opinion.
+    contacts: result.contacts,
+    model: "esmfold2",
+  };
+  element("downloads").style.display = "flex";
+
+  const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  status(`${modelName} · ${result.tokens} tokens · ${result.steps} `
+    + `${result.settings.gamma0 === 0 ? "flow" : "diffusion"} steps · ${seconds}s`
+    + " · no confidence head in this checkpoint");
+  progress(null);
+}
+
 async function fold(event) {
   event?.preventDefault();
   if (activeFold !== undefined) {
@@ -1991,7 +2227,8 @@ async function fold(event) {
     // pasted-A3M branch, which runs only where `nucleicCount` is already zero
     // and sets it to the protein it already was.
     const nucleicCount = chainKinds.filter((kind) => kind !== "protein").length;
-    let family = modelFamily(ligandCodes.length, modifications.length, nucleicCount);
+    let family = modelFamily(ligandCodes.length, modifications.length, nucleicCount,
+                             (request.templates ?? []).length);
     // 🔴 THE TERMS ARE ASKED BEFORE THE DOWNLOAD, NOT BEFORE THE PAGE. AF3's
     // parameters carry DeepMind's own terms, and the moment they apply is the
     // moment the bytes are fetched - which is the next line. Asking on page
@@ -2155,6 +2392,10 @@ async function fold(event) {
     // and that is the point: search, paste and upload, the query-wins rule and
     // the pairing decision are one implementation for all three models. What
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
+    if (family === "esmfold2") {
+      await foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLoad);
+      return;
+    }
     if (isAf3Family(family)) {
       await foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCodes,
                         modifications, chainKinds, templateSources, modelLoad, family);

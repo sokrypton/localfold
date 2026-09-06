@@ -1375,6 +1375,249 @@ buys what narrowing never bottleneck-bound bytes buys. The default stays f16 -
 it is still free of any measurable accuracy cost at 5.46e-4 - but **a precision
 trade priced before a tiling change is not a trade priced after it**.
 
+## ESMFold2 on the GPU: what transferred, and the one kernel that did not
+
+🔴 **IT FOLDS END TO END IN THE PAGE NOW, AND THE ONLY INPUT IS THE SEQUENCE.**
+`tools/gpu/fold-esmfold2.js` runs ESM-C's 36 int3 blocks, the shim's pair term,
+the featuriser, the inputs embedder, 24 trunk blocks four times over, the
+conditioning, the token transformer, the atom decoder and the sampler.
+Ubiquitin's first 40 residues, against the CPU fold that preceded it:
+
+| | CPU, 6.5 min | GPU, 4.8 s |
+|---|---|---|
+| CA-CA spacing | 3.809 A | 3.806 A (3.781-3.838) |
+| RMSD to ESMFold2 | 0.598 A | 1.072 A |
+
+The GPU arm additionally runs the language model at THREE BITS where the CPU one
+took its pair term from the dump, so 1.07 A includes the quantisation. Whole
+ubiquitin, 76 residues, is 6.6 s at 578 MiB. Time goes: 3.7 s language model,
+0.6 s trunk, 0.3 s conditioning, **34 ms a sampler step**.
+
+🔴 **THE ONE KERNEL WITH NO AF3 ANALOGUE IS THE SLIDING-WINDOW ATOM ATTENTION,
+AND THE REASON IS THE POSITIONAL SIGNAL RATHER THAN THE SHAPE.** AF3's atom
+encoder is 32-query / 128-key windowed attention biased by a pair
+representation; this is plain sliding-window self-attention whose only
+positional signal is a rotary embedding built from the REFERENCE CONFORMER.
+Both are "an atom transformer at 128 channels".
+`src/esmfold2/atom-transformer-webgpu.js` is four new shaders - `modulate`,
+`prepare`, `attend`, `gated` - and everything that is a plain projection comes
+from `src/esmc/block-webgpu.js`, whose tiled GEMM and fused SwiGLU are exactly
+the shapes `ffnUp` and `lin_swish` are packed in.
+
+🔴 **AND THE WINDOW IS RESOLVED ON THE HOST, BECAUSE IT IS OVER RANK.** Two
+atoms 64 apart in the array are adjacent in rank if everything between them is
+padding, so the allowed set is not `|i - j| <= 64`. Rank is monotonic, so the
+allowed set IS a contiguous range and `atomWindows` computes the bounds once.
+The validity test stays in the shader because a padded atom can sit INSIDE a
+live range, and the diagonal is allowed unconditionally so a masked atom still
+has something for its softmax to normalise.
+
+🔴 **A DENOISE STEP IS RECORDED, NOT REBUILT, AND THAT IS THE WHOLE DESIGN.**
+Every buffer a step reads is allocated in `prepare()`, so the pipelines, the
+bind groups and the dispatch sizes are constants of the fold: a step is two
+`writeBuffer`s, one submit of ~300 recorded passes and one readback. Cold and
+warm are both 35 ms at 40 tokens, which is what says nothing is being rebuilt.
+AF3's head learned this the expensive way; see the note above about its four
+host-device round trips.
+
+🔴 **THREE THINGS ARE CONSTANT ACROSS THE WHOLE SAMPLER AND ONLY ONE OF THEM
+LOOKS IT.** The pair conditioning `z` does not depend on the noise level, which
+upstream says out loud by caching it. Less obviously nor does the pair BIAS
+every token block reads - twelve `(n, n, heads)` tensors derived from `z` alone
+- and nor does `s_proj(s_input_norm(s_inputs))`, because the noise enters as a
+broadcast vector ADDED after that projection. All three are built once. At 200
+steps and 300 tokens that is 12 GFLOP a step against zero.
+
+🔴 **AND THE PAIR CONDITIONING IS BUILT IN ROW CHUNKS.** Its transitions widen
+256 channels to 512 and hold four tensors of that shape at once, which at 300
+tokens is 640 MiB of scratch for arithmetic that is purely row-wise. Eight
+thousand rows at a time costs nothing measurable and bounds it at 132 MiB. The
+language-model shim and the distogram head are chunked the same way and for the
+same reason.
+
+🔴 **THE bf16 ARM IS MORE ACCURATE THAN THE f32 ONE, WHICH IS NOT WHAT A
+PRECISION AXIS USUALLY MEANS.** `SWA3DRoPEAttention.forward` downcasts q, k and
+v whatever the model's dtype, so an f32 attention is a more accurate computation
+of something the checkpoint does not do. Against the module's own recorded call
+(`tools/gpu/check-esmfold2-diffusion-gpu.js`):
+
+| attention | relRMS |
+|---|---|
+| bf16, which is what the checkpoint does | **7.08e-5** |
+| f32 (the control) | 1.52e-4 |
+
+The control is that f32 is WORSE. If the two arms ever agree, the downcast has
+stopped reaching the kernel - which a bound alone cannot see. And the f32 number
+reproduces the CPU reference's 1.51e-4 to three digits, which is what says the
+two paths are the same arithmetic.
+
+🔴 **THE PAIR NEVER LEAVES THE DEVICE BETWEEN THE TRUNK'S LOOPS.** The trunk
+driver takes a borrowed buffer (`state.buffer`) and the recycle projection
+between the loops is itself a GPU pass. Four loops of upload-and-read-back would
+be 736 MB of traffic at 300 tokens for a tensor nothing on the host touches.
+
+🔴 **AND `z` STARTS AT ZERO WHILE `pair_loop_proj(0)` IS NOT ZERO.** Its Linear
+is zero-INITIALISED upstream and then trained, and the LayerNorm in front of it
+has an offset - so the first loop's input is `z_init` plus a real vector.
+Skipping the projection on the first loop is the natural shortcut and a
+different model.
+
+## ESMFold2 does ligands, DNA and RNA - and this port read the config and said otherwise
+
+🔴 **THE CONFIG IS ABOUT MSAs AND CONFIDENCE, NOT ABOUT CHEMISTRY.**
+`disable_msa_features: true` and `confidence_head.enabled: false` are true and
+say nothing about what the model can hold. ESMFold2's own constants:
+
+    MOL_TYPE_PROTEIN 0  DNA 1  RNA 2  NONPOLYMER 3
+    PROTEIN 2..21 (UNK 22)   RNA 23..27   DNA 28..32
+
+and `prepare_input.py` has `tokenize_ligand_ccd` and `tokenize_ligand_smiles` at
+one token per heavy atom. The 33-class `aatype` reverse-engineered from a
+protein dump had its whole tail read as padding when it is RNA and DNA.
+**Templates really are absent**: `grep -rn template` over the whole upstream
+package returns nothing, and `z_init` has five terms with none of them one.
+
+🔴 **SO THE FEATURISER IS AN ADAPTER OVER AF3's, NOT A SECOND FEATURISER.** AF3
+already tokenises complexes, nucleic chains, ligands from the CCD and modified
+residues at one token per atom, and ESMFold2 uses AF3's all-atom representation
+term for term. What is genuinely different is three things:
+
+1. **The atom layout is RAGGED**, not 24 dense slots a token. Reading AF3's
+   slots in increasing order reproduces conformer order exactly - checked, no
+   conformer in either table has non-monotonic slots.
+2. **The alphabets differ and both are one-hots**, so neither complains. AF3's
+   twenty amino acids map to ESMFold2's by **`+ 2`** - both are alphabetical by
+   THREE-letter code - and nothing after them does: AF3's gap at 21 has no slot,
+   its RNA runs 22-25 against 23-26, its DNA 26-29 against 28-31.
+3. **There is no terminal atom.** No OXT, no OP3; `terminalAtoms: false` is the
+   new option on `featuriseProtein`, and it is what takes ubiquitin's first 40
+   residues from 312 atoms to the 311 the model was handed.
+
+`tools/check-esmfold2-featurise.js` holds all fifteen discrete features to
+IDENTICAL against the dump. `ref_pos` cannot match and says so - both models
+draw a torsion per residue instance - so the check there is the N-CA bond
+instead (1.4737 A against 1.4656).
+
+🔴 **AND THE LANGUAGE MODEL NEEDED THREE THINGS A MONOMER NEVER SHOWED.**
+
+* **Only PROTEIN tokens are sent.** `protein_mask = (mol_type == 0) & token_mask`,
+  and a nucleotide's or ligand atom's hidden state stays ZERO - which is not
+  absent, because the shim's LayerNorm has an offset and its downprojection a
+  bias, so `shim(0)` is a fixed non-zero vector. `shimSingleForZeroState` is
+  that one row of arithmetic.
+* **An atom-tokenised residue collapses to ONE LM row** - several structure
+  tokens share one `(asym_id, residue_index)` - and the answer scatters back.
+* **A complex is ONE packed run** `[BOS] A [EOS BOS] B [EOS]` with a per-chain
+  `sequence_id` mask.
+
+🔴 **AND "RUN ESM-C ONCE PER CHAIN" IS THE OBVIOUS WRONG MOVE.** The attention
+IS per chain - `seq_id[i] == seq_id[j]` excludes every cross-chain key - but the
+ROTARY POSITIONS ARE ABSOLUTE over the packed array with no per-chain reset, so
+chain two's first residue sits at `len(chain one) + 3`. Running the tower
+separately per chain gives it position 1: the same shapes, a plausible tensor, a
+different phase on every head. `createAttentionShader`'s `chainAware` arm is the
+mask, and it is part of the pipeline key so a page that folds a monomer and then
+a complex at the same length cannot reuse the wrong shader.
+
+Measured, one fold each:
+
+| input | tokens | geometry |
+|---|---|---|
+| 40-mer (the regression) | 40 | CA-CA 3.806, RMSD 1.050 A |
+| two protein chains | 65 | CA-CA 3.786 (3.739-3.827) |
+| protein + 12-mer DNA + glycerol | 58 | CA-CA 3.794, **O3'-P 1.588 A** |
+
+The phosphodiester bond is the nucleic gate the way 3.8 A is the peptide one: a
+covalent distance no torsion can change.
+
+🔴 **AND A CA-CA METRIC THAT WALKS THE ARRAY IS WRONG ON A COMPLEX.** The first
+two-chain run reported a 22.9 A maximum, which is the distance across the chain
+break - the metric walking off the end of chain one, not a broken fold.
+
+🔴 **AND `float32Tensors` IS NOT OPTIONAL FOR THIS BUNDLE.** `quantize_af3.py`
+keeps a tensor whose name ends in `/scale`, `/offset` or `/bias`, which is how
+AF3 spells its norms; this export spells them `leftNormInputScale`, `gateBias`,
+`singleScale` - so **350 of its 377 vectors would have been group-quantised**,
+and a 128-wide LayerNorm scale at group 32 is four scales carrying the tensor
+whose job is to set the scale of everything after it. The Fourier table goes in
+the list too, and it is not a norm: `w` and `b` are read inside
+`cos(2 * pi * (t * w + b))`, so an error in them is an error in a PHASE.
+
+| bundle | size | RMSD to ESMFold2 |
+|---|---|---|
+| float32 | 651 MiB | 1.050 A |
+| **int5 g32** | **122.5 MiB** | 1.238 |
+| int4 g32 | 102.2 | 1.750 |
+
+With ESM-C at int3 (224 MiB) the pair is **347 MiB**, against AF3's shipped 265.
+
+🔴 **AND `BYTES` IN dtype.js LISTED `int5` AND NOTHING ELSE PACKED.** The entry
+is never read - the packed branch returns before it - so it was doing nothing
+but satisfying a presence check, and the ESM-C bundle's int3 failed it with
+"unsupported tensor dtype int3" from a reader that decodes int1 through int7.
+Found only by loading the bundle through `HttpTensorStore`, which is the page's
+path and not any checker's.
+
+🔴 **THE SAMPLER PRESETS ARE PRICED, AND SIX STEPS IS NOT "FASTER".** Measured
+on the 40-mer against ESMFold2's own fold, one seed each:
+
+| preset | steps run | CA-CA | RMSD |
+|---|---|---|---|
+| diffusion-8 | 6 | **58.0 A** | **48.1 A** |
+| flow-8 | 6 | 4.27 | 1.72 |
+| diffusion-15 (shipped) | 11 | 3.806 | 1.05 |
+| flow-16 | 12 | 3.804 | 1.01 |
+| diffusion-32 | 23 | 3.802 | 1.14 |
+| diffusion-200 | 138 | 3.808 | 1.48 |
+
+A peptide bond is 3.8 A, so `diffusion-8` is not a structure. The churn is what
+breaks - `gamma0` re-noises to `sigma * 1.605` and `step_scale` 1.638 overshoots
+- and at six steps the levels are too far apart for either to be corrected. The
+flow arm re-noises not at all and is merely poor. **More steps than the schedule
+buy nothing**: 138 is no better than 11 and eight times the time.
+
+🔴 **AND `(seed >>> 0) || 1` MADE SEED 0 AND SEED 1 THE SAME FOLD.** Zero maps to
+one, so the two commonest seeds drew the identical stream - and it looked like a
+working seed axis, because seeds 2 and 3 differed.
+
+🔴 **THE DISTOGRAM AND THE STRUCTURE ARE TWO INDEPENDENT READINGS OF ONE TRUNK,
+WHICH IS A GATE NEITHER GIVES ALONE.** The distogram head is one projection off
+the pair; the coordinates came through the conditioning, twelve token blocks,
+two atom stacks and a stochastic sampler. On ubiquitin, over pairs at least six
+apart: **predicted 121, actual 148, both 121 - precision 1.00, recall 0.82**. A
+fold can be geometrically perfect and be the wrong fold, which CA-CA cannot see.
+
+🔴 **AND THE DISTOGRAM'S BIN EDGES ARE BORROWED, WHICH THE PRECISION ALSO
+TESTS.** `distogram_bins: 128` is stated for this head and no RANGE is; the
+DISABLED confidence head carries `min_dist: 2.0, max_dist: 52.0` for its own
+128. `CONTACT_EDGES` is that, borrowed, and says so - a badly wrong range would
+destroy the precision first.
+
+🔴 **AND THE HEAD SYMMETRISES.** `distogram_head(z + z.transpose(-2, -3))` - a
+distance is symmetric and the trunk's pair is not, so `z` alone conforms and
+returns a plausible distogram.
+
+🔴 **THE PAGE'S CAPABILITY GUARDS ARE `supportsAllAtom`, NOT `isAf3Family`, AND
+THAT IS THE SAME MISTAKE ONE MODEL LATER.** ESMFold2 runs a different GRAPH and
+the same all-atom representation, so a guard asking "is this AlphaFold 3"
+refuses a ligand under a model that has ligand tokens - with a message naming a
+capability it has, which is exactly what the AF3/OpenBind split recorded above.
+Templates are the one thing that is still an AF3 question and stay on
+`isAf3Family`.
+
+🔴 **AND A MODEL WITH NO CONFIDENCE HEAD MUST NOT BE COLOURED BY pLDDT.** Every
+other fold here is coloured by the confidence head's per-atom answer; this
+checkpoint has ZERO `confidence_head.*` tensors, and a structure drawn under the
+pLDDT scheme with a zero B-factor is uniformly the colour of NO confidence -
+which reads as a terrible fold rather than an absent measurement. It is coloured
+by chain, `lastPrediction` carries no `confidence` object at all, and the status
+line says so.
+
+🔴 **AND THE MSA ROW IS HIDDEN FOR IT RATHER THAN IGNORED.** A search left on
+screen would run, take a minute of somebody else's server, and be discarded -
+which is the "quietly ignored control" `syncModelControls` exists to prevent,
+one step worse.
+
 ## A language model instead of an alignment: ESMFold2
 
 Not shipped, and not started as code. `docs/ESMFOLD2.md` is the investigation:

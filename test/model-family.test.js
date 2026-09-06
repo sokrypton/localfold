@@ -17,7 +17,8 @@ import { strict as assert } from "node:assert";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
-import { AF3_FAMILIES, MODEL_BUNDLES } from "../src/reference/manifests/index.js";
+import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES }
+  from "../src/reference/manifests/index.js";
 
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
@@ -30,8 +31,12 @@ describe("the AlphaFold 3 families", () => {
     }
   });
 
+  // 🔴 THE FOLDING FAMILIES, NOT EVERY BUNDLE. ESM-C is a bundle - the loader,
+  // the shard cache and the site build all reach it by name - and it is a
+  // language model, so offering it in the model picker would be offering it as
+  // a structure predictor.
   it("offers each of them in the model row", () => {
-    for (const family of Object.keys(MODEL_BUNDLES)) {
+    for (const family of FOLDING_FAMILIES) {
       assert.match(page, new RegExp(`<option value="${family}"`),
         `index.html does not offer ${family}`);
     }
@@ -43,6 +48,11 @@ describe("what needs an AlphaFold 3 graph", () => {
   // checkpoint", and the reported symptom was
   // "Ligands need AlphaFold 3; the model is set to openbind0" - a refusal to
   // fold something the selected model handles perfectly well.
+  // 🔴 THE GUARD IS `supportsAllAtom`, NOT `isAf3Family`, AND THE DIFFERENCE IS
+  // THE POINT. ESMFold2 runs a different GRAPH and the same all-atom
+  // representation, so a guard asking "is this AlphaFold 3" refuses a ligand
+  // under a model that has ligand tokens. Templates are the one thing that is
+  // still an AF3 question, and they are tested separately below.
   for (const what of ["ligandCount", "modificationCount", "nucleicCount"]) {
     it(`tests the family, not the name, for ${what}`, () => {
       // The condition runs to the end of the line, and it CONTAINS brackets -
@@ -51,12 +61,22 @@ describe("what needs an AlphaFold 3 graph", () => {
       const guard = new RegExp(`if \\(${what} > 0 && (.+)\\) \\{`);
       const found = app.match(guard);
       assert.ok(found !== null, `no guard found for ${what}`);
-      assert.match(found[1], /isAf3Family\(/,
-        `${what} is gated on something other than isAf3Family: ${found[1]}`);
+      assert.match(found[1], /supportsAllAtom\(/,
+        `${what} is gated on something other than supportsAllAtom: ${found[1]}`);
       assert.doesNotMatch(found[1], /"af3"/,
         `${what} still compares against the literal "af3"`);
     });
   }
+
+  // 🔴 AND A TEMPLATE STILL IS AN AlphaFold 3 QUESTION. ESMFold2 has no template
+  // module at all - z_init has five terms and none of them is one - so a
+  // template set on an entity row would be fetched, aligned and dropped.
+  it("keeps templates on isAf3Family, which is the one that is still true", () => {
+    const found = app.match(/if \(templateCount > 0 && (.+)\) \{/);
+    assert.ok(found !== null, "no guard found for templateCount");
+    assert.match(found[1], /isAf3Family\(/,
+      `templateCount is gated on something else: ${found[1]}`);
+  });
 });
 
 describe("what a fold is called", () => {
@@ -73,7 +93,7 @@ describe("what a fold is called", () => {
       stems[key] = value;
     }
     // Every family the page offers has one...
-    for (const family of Object.keys(MODEL_BUNDLES)) {
+    for (const family of FOLDING_FAMILIES) {
       assert.ok(family in stems, `${family} has no stem`);
     }
     // ...and no two share it, which is the whole point.

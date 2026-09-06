@@ -90,7 +90,64 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
     load: () => import("./openbind0.js"),
   },
+  // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
+  //
+  // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
+  // half is 122 MiB and the LANGUAGE MODEL it reads is a separate 224 MiB with
+  // its own exporter - and the shim that joins them is per folding model, which
+  // is why the ESM-C manifest carries the names of both. `companion` is that
+  // link, and a loader that ignored it would fold with a language model whose
+  // shim was trained against a different trunk: every shape agrees.
+  esmfold2: {
+    model: "esmfold2-trunk",
+    directory: "./model-esmfold2-int5/",
+    release: "esmfold2-int5",
+    variable: "LOCALFOLD_INCLUDE_ESMFOLD2_MODEL",
+    companion: "esmc",
+    load: () => import("./esmfold2.js"),
+  },
+  // 🔴 NOT A MODEL A PAGE OFFERS, AND THAT IS WHY IT IS NOT IN MODEL_FAMILIES.
+  // ESM-C folds nothing on its own; it exists here so the loader, the shard
+  // cache, the download dial and build_site.py can all treat it as a bundle.
+  esmc: {
+    model: "esmc",
+    directory: "./model-esmc-600m-int3/",
+    release: "esmc-600m-int3",
+    variable: "LOCALFOLD_INCLUDE_ESMC_MODEL",
+    companion: undefined,
+    foldingModel: false,
+    load: () => import("./esmc.js"),
+  },
 };
+
+/**
+ * The families a page may be SET to, as opposed to the bundles it can load.
+ *
+ * 🔴 A COMPANION IS A BUNDLE AND NOT A CHOICE. ESM-C is in MODEL_BUNDLES so the
+ * loader and the site build can reach it by name; offering it in the model
+ * picker would be offering a language model as a structure predictor.
+ */
+export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
+  .filter(([, bundle]) => bundle.foldingModel !== false)
+  .map(([family]) => family);
+
+/**
+ * The families whose featuriser has ligand tokens, nucleic chains and modified
+ * residues - which is not the same question as whose GRAPH is AlphaFold 3's.
+ *
+ * 🔴 THIS USED TO BE `AF3_FAMILIES` DOING BOTH JOBS, AND THE SECOND MODEL THAT
+ * NEEDED THEM SPLIT IT. ESMFold2 runs a different graph and the SAME all-atom
+ * representation - `ref_pos`, `ref_element`, `ref_charge`,
+ * `ref_atom_name_chars`, `ref_space_uid`, `atom_to_token`, `token_bonds` - so
+ * a capability guard written as "is this an AF3 family" refuses a ligand under
+ * a model that has ligand tokens, with a message naming a capability it has.
+ * That exact mistake is recorded in CLAUDE.md for the AF3/OpenBind split; this
+ * is the same mistake one model later.
+ */
+export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "esmfold2"];
+
+/** Which models fold from a single sequence and take no alignment at all. */
+export const SINGLE_SEQUENCE_FAMILIES = ["esmfold2"];
 
 /**
  * The families that build AlphaFold 3's graph, as opposed to AlphaFold 2's.
