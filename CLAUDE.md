@@ -2516,6 +2516,58 @@ point the same way. The shipped certainty does not move either way (it reads
 the distogram's MODE, not coordinates); what changes is the `obs` arm and every
 contact metric.
 
+🔴 **AND OpenFold3's TRAINING LOSS CONFIRMS THE REPRESENTATIVE TABLE AND
+REFUTES ANY CHEMISTRY IN THE HEAD.** `openfold3/core/loss/distogram.py`'s
+`all_atom_distogram_loss` is the loss everyone in this lineage trains against,
+and it is four lines: take one representative atom per token, bin the Euclidean
+distance, cross-entropy. `get_token_representative_atoms`'s own docstring is the
+table, verbatim - **Cb for standard amino acids (Ca for glycine), C4 for
+purines, C2 for pyrimidines, and the first and only atom for anything atomized**,
+which is every ligand and every modified residue. So `representativeAtoms` is
+right for the reason it was fixed, and now it is right on an upstream statement
+rather than on AF3's feature table plus a 6x geometric argument.
+
+🔴 **AND THE PAIR MASK IS RESOLVED-ATOM PRESENCE AND NOTHING ELSE.** No
+`dna_weight`, no `ligand_weight` - the diffusion loss beside it has all three
+(5.0, 5.0, 10.0) and the distogram has none, so **every token pair is trained
+identically whatever the two molecules are**. There is no per-chemistry
+threshold, no per-chemistry bin grid and no per-chemistry weight anywhere in the
+head. All the chemistry lives in WHICH ATOM the token is represented by.
+
+🔴 **SO `CONTACT_ANGSTROMS_BY_KIND` IS A DEPARTURE FROM UPSTREAM, DELIBERATELY,
+AND A READER COMPARING THE TWO WILL SEE THAT.** OpenFold3 reads a contact off
+the same head as **a flat 8 A for every pair** - `distogram_bins_8A =
+distogram_bin_ends <= 8.0` in `core/metrics/confidence.py`, which is the TOP-EDGE
+rule this repository already uses, confirmed. That number weights its gPDE; it
+is not a claim that 8 A means the same thing for two ligand atoms as for two
+pseudo-betas. Our table is a post-hoc calibration of exactly that, measured
+against real atomic contact in deposited structures, and the upstream flat 8 A is
+the arm it beats. **Both are right about different questions**: theirs is a
+weight inside a ranking metric, ours is a contact map somebody reads.
+
+🔴 **AND AF2's BIN BREAKS WERE 2 AND 22 IN TWO MANIFESTS AND THEY ARE 2.3125 AND
+21.6875.** AlphaFold's `config.py` says `first_break: 2.3125, last_break:
+21.6875` and its head is `linspace(first, last, num_bins - 1)`, an exact
+0.3125 A grid. `add_distogram_head.py` wrote 2.0 and 22.0, and both AF2 bundles
+carried them - a first break a third of a bin low and every edge off by up to
+0.3125 A.
+
+🔴 **AND THE ROUND NUMBERS ARE REAL, THEY ARE JUST THE OTHER FORM OF THE GRID.**
+OpenFold3 states the identical binning as `bin_min 2.0, bin_max 22.0, no_bins 64`
+with **nearest-centre** assignment (`binned_one_hot` is `argmin |d - centre|`), so
+its centres are `2.15625 + 0.3125 b` and the midpoints between them are
+`2.3125 + 0.3125 b` - **AlphaFold's breaks, to 0.0**. Two independent statements
+of one grid, and 2 and 22 belong to the CENTRE form. `test/distogram-head.test.js`
+asserts the two coincide, because that identity is what says neither reading was
+a guess.
+
+🔴 **AND THE SHIPPED CONTACT MAP DOES NOT MOVE, WHICH IS WHY THIS SURVIVED.**
+Both grids put **19 bins under 8 A** - 7.9375 and 7.806 are the last edges that
+qualify - so the only quantity anything computes from these numbers was correct
+under the wrong ones. What was wrong was the LABEL on every bin, which
+`probe-af2-dgram-plddt.js` writes into its dump, and any expected distance a
+future caller takes. Found by reading OpenFold3's loss, not by a failing check.
+
 🔴 **AND `named` MATCHES ALL FOUR NAME CHARACTERS, WHICH IS LOAD-BEARING HERE.**
 "C4" must not match C4', which every nucleotide also has and which is back out
 on the sugar - a silent 4 A error in the representative.

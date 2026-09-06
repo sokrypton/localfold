@@ -10,8 +10,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { distogramBreaks, distogramContactProbabilities, distogramLogits }
-  from "../src/heads/distogram.js";
+import { distogramBreaks, distogramContactProbabilities, distogramLogits,
+  FIRST_BREAK, LAST_BREAK } from "../src/heads/distogram.js";
 
 const CHANNELS = 4;
 const BINS = 6;
@@ -44,6 +44,30 @@ describe("the distogram head's bins", () => {
     for (let i = 1; i < breaks.length; i += 1) {
       assert.ok(Math.abs((breaks[i] - breaks[i - 1]) - step) < 1e-12);
     }
+  });
+});
+
+describe("the distogram head's grid, against OpenFold3", () => {
+  // 🔴 THE GRID IS STATED TWO WAYS UPSTREAM AND THEY MUST COINCIDE. AlphaFold
+  // gives 63 BREAKS from 2.3125 to 21.6875; OpenFold3's all-atom distogram loss
+  // gives 64 CENTRES over [2, 22] assigned by nearest centre. The midpoints
+  // between those centres are the breaks, exactly - which is what says the
+  // round numbers belong to the centre form and are not breaks. Reading them as
+  // breaks shifts every edge by up to a whole bin, and the shipped contact map
+  // does NOT notice: both grids put 19 bins under 8 A, which is why this went
+  // unread until OpenFold3's loss was.
+  it("agrees with OpenFold3's centre form of the same grid", () => {
+    const bins = 64;
+    const breaks = distogramBreaks(FIRST_BREAK, LAST_BREAK, bins);
+    const width = (22 - 2) / bins;
+    const centre = (b) => 2 + width / 2 + b * width;
+    for (let b = 0; b < bins - 1; b += 1) {
+      assert.ok(Math.abs(breaks[b] - (centre(b) + centre(b + 1)) / 2) < 1e-12,
+        `break ${b}: ${breaks[b]}`);
+    }
+    const under = (edges) => edges.filter((edge) => edge <= 8).length;
+    assert.equal(under([...breaks]), 19);
+    assert.equal(under([...distogramBreaks(2, 22, bins)]), 19);
   });
 });
 

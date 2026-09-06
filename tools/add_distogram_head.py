@@ -50,11 +50,20 @@ BIAS = "alphafold/alphafold_iteration/distogram_head/half_logits//bias"
 WEIGHTS_TENSOR = "af2DistogramHalfLogitsWeights"
 BIAS_TENSOR = "af2DistogramHalfLogitsBias"
 
-# AlphaFold 2's distogram: 64 bins with 63 breaks from 2 to 22 A. The head
-# itself carries no bin edges, so they are written into the manifest here -
-# the same shape the PAE breaks are stored in, so nothing downstream has to
-# know a second convention.
-FIRST_BREAK, LAST_BREAK, BINS = 2.0, 22.0, 64
+# AlphaFold 2's distogram: 64 bins with 63 breaks, `linspace(2.3125, 21.6875,
+# 63)`. The head itself carries no bin edges, so they are written into the
+# manifest here - the same shape the PAE breaks are stored in, so nothing
+# downstream has to know a second convention.
+#
+# 🔴 THEY ARE NOT 2 AND 22, WHICH IS WHAT THE ROUND NUMBERS INVITE. AlphaFold's
+# own config says 2.3125 and 21.6875 (config.py, `heads.distogram`), which put
+# the breaks on an EXACT 0.3125 A grid; 2 and 22 give 0.32258 and a first break
+# a third of a bin low. OpenFold3's all-atom loss writes the identical grid the
+# other way round - `bin_min 2.0, bin_max 22.0, no_bins 64` with NEAREST-CENTRE
+# assignment, so its centres are 2.15625 + 0.3125 i and the midpoints between
+# them are exactly these breaks. Two independent statements of one grid, and
+# the round numbers belong to the centre form, not the break form.
+FIRST_BREAK, LAST_BREAK, BINS = 2.3125, 21.6875, 64
 CHANNELS = 128
 
 

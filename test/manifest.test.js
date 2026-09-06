@@ -21,8 +21,13 @@ describe("DEFAULT_MANIFEST", () => {
     const head = DEFAULT_MANIFEST.distogramHead;
     expect(typeof head).toBe("object");
     expect(head.bins).toBe(64);
-    expect(head.firstBreak).toBe(2);
-    expect(head.lastBreak).toBe(22);
+    // 🔴 AND ITS BREAKS ARE ALPHAFOLD'S OWN, NOT THE ROUND NUMBERS. `config.py`
+    // says `first_break: 2.3125, last_break: 21.6875`, which is an exact
+    // 0.3125 A grid; the manifest said 2 and 22 for a long time, which is the
+    // same grid's CENTRE form misread as its break form and shifts every edge
+    // by up to a bin. See src/heads/distogram.js.
+    expect(head.firstBreak).toBe(2.3125);
+    expect(head.lastBreak).toBe(21.6875);
     // 🔴 IT NAMES TENSORS, IT DOES NOT CARRY BYTES. The head was 44 KB of
     // base64 in this manifest for a while, which existed only to avoid
     // rewriting published shards - and the cost was a bundle that was not the

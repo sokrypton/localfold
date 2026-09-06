@@ -7,10 +7,20 @@
  *     half   = pair @ W + b          (L, L, 64)
  *     logits = half + half^T         transposed over the PAIR axes only
  *
- * The bins are 63 breaks evenly spaced from 2 to 22 A, so bin b covers
- * [breaks[b-1], breaks[b]) with the first open below 2 and the last open above
- * 22. That is the whole head; AlphaFold has always had it, and it is what the
- * contact map in every AlphaFold figure is drawn from.
+ * The bins are 63 breaks evenly spaced from 2.3125 to 21.6875 A, so bin b
+ * covers [breaks[b-1], breaks[b]) with the first open below 2.3125 and the last
+ * open above 21.6875. That is the whole head; AlphaFold has always had it, and
+ * it is what the contact map in every AlphaFold figure is drawn from.
+ *
+ * 🔴 THE BREAKS ARE NOT 2 AND 22, WHICH IS WHAT THE ROUND NUMBERS INVITE.
+ * AlphaFold's own config says `first_break: 2.3125, last_break: 21.6875`
+ * (config.py, `heads.distogram`), and those put the breaks on an exact
+ * 0.3125 A grid. OpenFold3's all-atom distogram loss states the identical grid
+ * the other way round - `bin_min 2.0, bin_max 22.0, no_bins 64` assigned by
+ * NEAREST CENTRE, so its centres are 2.15625 + 0.3125 b and the midpoints
+ * between them are exactly these breaks. The round numbers belong to the
+ * CENTRE form; reading them as breaks shifts every edge by up to a third of a
+ * bin, which is a plausible distogram and the wrong one.
  *
  * 🔴 THE SYMMETRISATION IS OVER i AND j, NOT OVER THE BINS. `half` is not
  * symmetric - the projection sees pair[i][j], which differs from pair[j][i] -
@@ -27,6 +37,10 @@
  * a contact map drawn from coordinates would answer it while looking
  * identical.
  */
+
+/** AlphaFold's own `heads.distogram` breaks; see the note above. */
+export const FIRST_BREAK = 2.3125;
+export const LAST_BREAK = 21.6875;
 
 /** The bin edges: `count - 1` breaks, evenly spaced. */
 export function distogramBreaks(first, last, count) {
@@ -58,7 +72,7 @@ export function distogramContactProbabilities(pair, weights, bias, length, optio
   const channels = options.channels ?? 128;
   const bins = options.bins ?? 64;
   const threshold = options.threshold ?? 8;
-  const breaks = distogramBreaks(options.first ?? 2, options.last ?? 22, bins);
+  const breaks = distogramBreaks(options.first ?? FIRST_BREAK, options.last ?? LAST_BREAK, bins);
   if (pair.length !== length * length * channels) {
     throw new RangeError(`pair is ${pair.length}; expected ${length * length * channels}`);
   }
