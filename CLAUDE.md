@@ -81,6 +81,7 @@ values means the whole-stack checker, not that file.
 | Does the featuriser build what ESMFold2 was handed? | `node tools/check-esmfold2-featurise.js` |
 | **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` |
 | Which of a sampler step's two coordinate sets is the picture? | `tools/gpu/probe-esmfold2-trajectory.js` |
+| What does an ESMFold2 fold cost, by band? | `src/esmfold2/cost.js` (fitted at 40, 150, 300) |
 | Can anything stand in for the confidence head this checkpoint lacks? | `tools/gpu/probe-esmfold2-confidence.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
 | Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
@@ -1872,6 +1873,40 @@ fold is probably not worth looking at" is a claim it earns.
 against 0 to 1. Which is a hint about what each is measuring: a per-residue
 ordering wants the sharpest possible discrimination between neighbours, and a
 per-fold one wants a stable average.
+
+🔴 **THE STATUS LINE IS THREE PHASES AND A PERCENTAGE, AS AF3's IS.** It used
+to name every stage, which gave "recycle 0", "trunk 0", "recycle 1", "trunk
+1" - and a recycle is two milliseconds against a trunk loop's several seconds,
+so the line flickered between two stages whose costs differ by a thousand.
+Reported as exactly that. **A recycle is not a phase; it is the seam between two
+trunk passes.** Measured on a 76-mer, the line now changes 7 times over 4 shapes
+where it changed 17 over 11.
+
+🔴 **AND THE BAR RUNS OFF A COST MODEL FITTED THIS SESSION**, `src/esmfold2/cost.js`:
+
+| band | at 40 | at 150 | at 300 | the shape |
+|---|---|---|---|---|
+| language model | 2.4 s | 1.9 | 2.3 | **flat** - it is weight streaming, not n |
+| trunk, 4 loops | 0.6 | 6.5 | 27.3 | 0.075 ms * n^2 * loops |
+| conditioning | 0.32 | 0.38 | 1.03 | 307 ms + 0.008 * n^2 |
+| a sampler step | 34 ms | 72 | 156 | 32 ms + 1.38e-3 * n^2 |
+
+Predicted totals 3.4 / 10.2 / 32.3 s against measured 3.7 / 9.6 / 32.3.
+
+🔴 **AND THE LANGUAGE MODEL IS FLAT IN THE SEQUENCE LENGTH, WHICH LOOKS WRONG
+AND IS NOT.** ESM-C's 36 blocks are streamed from a 224 MiB bundle and decoded
+on the host, and at these lengths that dominates its own arithmetic - so the
+band is about the WEIGHTS and not about the protein. It stops being flat
+somewhere above 300 residues.
+
+🔴 **AND A BAND WITH NOTHING TO SAY IS THE ONE THAT JUMPS.** The tower was 53%
+of a short fold's predicted time and completed in a single step, so the bar went
+from zero to a half. `EsmcTowerGpu` reports per block now; measured, the largest
+single jump falls from **0.53 to 0.09** over 45 samples, monotonic throughout.
+
+🔴 **AND THE STEP COUNT HAS TO BE KNOWN BEFORE THE TRUNK RUNS**, or the plan
+cannot be laid out - so the sampler's settings and schedule are resolved at the
+top of the fold. They depend on nothing the fold computes.
 
 🔴 **AND `setColorScheme` / `colorBy` DO NOT EXIST ON py2Dmol's RENDERER, SO
 NOTHING HAD EVER BEEN COLOURED BY THEM.** Both call sites were guarded by

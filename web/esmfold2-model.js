@@ -223,7 +223,7 @@ export function loadEsmfold2Weights(onProgress) {
  * different phase - the same shapes, a plausible tensor, a different model.
  */
 export function languageModelRunner(device, allocator, loaded, pairChannels) {
-  return async (ids, sequenceId) => {
+  return async (ids, sequenceId, onBlock) => {
     const tower = new EsmcTowerGpu(device, allocator);
     const result = await tower.run(ids, {
       rows: ids.length,
@@ -233,7 +233,7 @@ export function languageModelRunner(device, allocator, loaded, pairChannels) {
       layers: loaded.language.manifest.layers,
       pair: pairChannels,
       residualScale: loaded.language.manifest.residualScale ?? 1,
-    }, loaded.language.block, loaded.language.shared, { sequenceId });
+    }, loaded.language.block, loaded.language.shared, { sequenceId, onBlock });
     return result.single;
   };
 }

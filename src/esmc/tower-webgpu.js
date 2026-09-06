@@ -384,6 +384,11 @@ export class EsmcTowerGpu {
         // embedding upload after the first block.
         current.release();
         current = next;
+        // 🔴 THE TOWER IS THE LARGEST BAND WITH NOTHING TO SAY, so it says this.
+        // At 76 residues it is 53% of a fold's predicted time and it used to
+        // complete in one step, which put the progress bar at zero and then
+        // straight to a half. Thirty-six blocks is plenty to move a bar with.
+        await options.onBlock?.(layer, layers);
       }
 
       // The final norm, then the last state's contribution to the mix.

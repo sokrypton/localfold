@@ -157,7 +157,7 @@ export async function main(device, args = []) {
   const towerShared = {};
   for (const name of TOWER_SHARED) towerShared[name] = await tower.read(name);
   const allocator = new GpuBufferAllocator(device);
-  const runTower = async (ids, sequenceId) => {
+  const runTower = async (ids, sequenceId, onBlock) => {
     const engine = new EsmcTowerGpu(device, allocator);
     const result = await engine.run(ids, {
       rows: ids.length, model: towerManifest.width,
@@ -172,7 +172,7 @@ export async function main(device, args = []) {
                                          NARROW_LEAVES.has(leaf));
       }
       return weights;
-    }, towerShared, { sequenceId });
+    }, towerShared, { sequenceId, onBlock });
     return result.single;
   };
 
@@ -195,7 +195,7 @@ export async function main(device, args = []) {
     },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
-    onProgress: (label) => { progress.push(label); },
+    onStatus: (label) => { progress.push(label); },
   });
 
   // ---- what came out.

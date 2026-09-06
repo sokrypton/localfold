@@ -2216,10 +2216,12 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // logits staying on the device, 46 MiB at 300 tokens, released with the
     // last frame.
     frameCertainty: true,
-    onProgress: (label) => {
-      if (signal.aborted) return;
-      status(`ESMFold2 · ${label}`);
-    },
+    // 🔴 THE LINE AND THE BAR ARE TWO CALLBACKS NOW, AS AF3's ARE. One phase
+    // word plus a percentage on the line; the fraction drives the bar. The
+    // first version wrote a stage name per stage, and a two-millisecond recycle
+    // between two multi-second trunk passes made it flicker.
+    onStatus: (text) => { if (!signal.aborted) status(`ESMFold2 · ${text}`); },
+    onProgress: (fraction) => { if (!signal.aborted) progress(fraction); },
     // 🔴 THE CONTACT MAP EXISTS BEFORE ANY STRUCTURE DOES, because the
     // distogram head runs off the trunk and the sampler has not started. It is
     // held until there is a frame to hang it on, exactly as the AF3 path holds
@@ -2236,9 +2238,8 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     // almost all network - and is protein-sized in every frame. AF3's path
     // records the same finding, measured: a radius of gyration of 1896 A at
     // step 4 against 11.1 at the end.
-    onStep: ({ step, total, denoised, features, certainty: frameCertainty }) => {
+    onStep: ({ denoised, features, certainty: frameCertainty }) => {
       if (signal.aborted) return;
-      progress((step + 1) / total);
       const dense = toDensePositions(features, denoised);
       if (slots === undefined) slots = alphaCarbons(features.batch);
       if (reference === null) {

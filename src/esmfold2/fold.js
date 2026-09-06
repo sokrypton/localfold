@@ -43,6 +43,7 @@ import {
   centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
   samplerStep,
 } from "./sampler-reference.js";
+import { ESMFOLD2_PHASES, esmfold2Plan } from "./cost.js";
 
 /**
  * The sampler settings a caller can name, the way AF3's page offers
@@ -259,16 +260,8 @@ export async function foldEsmfold2(device, options) {
   const allocator = options.allocator ?? new GpuBufferAllocator(device);
   const cache = pipelineCacheForDevice(device);
   const storage = GPUBufferUsage.STORAGE;
-  const report = options.onProgress ?? (() => {});
   const started = performance.now();
   const timings = {};
-  const mark = async (label, work) => {
-    await report(label);
-    const at = performance.now();
-    const value = await work();
-    timings[label] = performance.now() - at;
-    return value;
-  };
 
   const features = options.featuresOverride
     ?? featuriseForEsmfold2(options.entities ?? sequence, options.features);
@@ -276,6 +269,43 @@ export async function foldEsmfold2(device, options) {
   const atoms = features.atoms;
   const pairs = tokens * tokens;
   const channels = shape.pairChannels;
+
+  // 🔴 THE SAMPLER'S SETTINGS ARE RESOLVED FIRST, BECAUSE THE PLAN NEEDS THE
+  // STEP COUNT. They depend on nothing the fold computes - the schedule is a
+  // function of six constants - and the bar cannot be laid out until it knows
+  // how many denoiser calls are coming.
+  const settings = { ...SAMPLER_DEFAULTS,
+                     ...(SAMPLER_PRESETS[options.sampler ?? "diffusion-15"] ?? {}),
+                     ...(options.samplerOverrides ?? {}) };
+  const schedule = noiseSchedule({ steps: settings.steps, sMax: settings.sMax,
+                                   sMin: settings.sMin, p: settings.p,
+                                   sigmaData: settings.sigmaData,
+                                   maxSigma: settings.maxSigma });
+  const gammas = churnFactors(schedule, settings.gammaMin, settings.gamma0);
+  const levels = noiseLevels(schedule, gammas);
+
+  // 🔴 A COARSE PHASE AND A PERCENTAGE, NOT A STAGE NAME PER STAGE. Reporting
+  // each stage gave "recycle 0", "trunk 0", "recycle 1", "trunk 1" - and a
+  // recycle is two milliseconds against a trunk loop's several seconds, so the
+  // line flickered between two stages whose costs differ by a thousand. The
+  // recycle is not a phase; it is the seam between two trunk passes.
+  const onStatus = options.onStatus ?? (() => {});
+  const onProgress = options.onProgress ?? (() => {});
+  const loops = shape.loops ?? 4;
+  const plan = esmfold2Plan({ tokens, steps: levels.length, loops });
+  let completed = 0;
+  let phase = ESMFOLD2_PHASES.languageModel;
+  const say = () => onStatus(`${phase} · ${Math.round(100 * completed / plan.total)}%`);
+  const enter = (name) => { phase = name; say(); };
+  const advance = (units) => { completed = Math.min(plan.total, completed + units); say();
+                               onProgress(completed / plan.total); };
+  const mark = async (label, work) => {
+    const at = performance.now();
+    const value = await work();
+    timings[label] = performance.now() - at;
+    return value;
+  };
+
   const held = [];
   const keep = (allocation) => { held.push(allocation); return allocation; };
 
@@ -304,11 +334,17 @@ export async function foldEsmfold2(device, options) {
     // ---- the language model, first and released before anything pair-sized.
     const lmPair = keep(allocator.allocate("esmfold2.lm-pair", pairs * channels * 4, storage));
     const lm = languageModelInput(features);
+    enter(ESMFOLD2_PHASES.languageModel);
     const single = await mark("language model", async () => {
       const rows = lm.ids.length === 0 ? new Float32Array(0)
-        : await options.tower(lm.ids, lm.sequenceId);
+        : await options.tower(lm.ids, lm.sequenceId,
+            (layer, layers) => advance(plan.languageModel / layers));
       return scatterLanguageSingle(rows, lm, tokens, channels, weights.shim);
     });
+    // ...whatever the per-block reporting did not account for, so the band
+    // ends exactly where the plan says however many blocks the tower ran.
+    completed = Math.max(completed, plan.languageModelEnd);
+    enter(ESMFOLD2_PHASES.embedder);
     await mark("language pair", () => encodeLanguagePair(
       { device, allocator, cache, submit },
       { tokens, channels, single, weights: weights.shim, destination: lmPair }));
@@ -387,7 +423,15 @@ export async function foldEsmfold2(device, options) {
       }
     });
 
+    advance(plan.embedder);
+
     // ---- the trunk, `loops` times over a pair that stays on the device.
+    // 🔴 THE BAR MOVES PER BLOCK AND THE LINE SAYS "Trunk", ONCE. Ninety-six
+    // block evaluations is the one part of this fold with enough events to make
+    // a bar move smoothly, and none of them is worth a line of its own.
+    enter(ESMFOLD2_PHASES.trunk);
+    const trunkBlocks = weights.trunkBlocks.length;
+    const perBlock = plan.trunk / (loops * Math.max(1, trunkBlocks));
     const pairMask = keep(allocator.upload("esmfold2.pair-mask",
       new Float32Array(pairs).fill(1), storage));
     const recycleScale = keep(allocator.upload("w.esmfold2.recycle-scale",
@@ -409,7 +453,6 @@ export async function foldEsmfold2(device, options) {
       buffer: allocation.buffer, byteOffset: row * channels * 4,
       byteSize: rows * channels * 4,
     });
-    const loops = shape.loops ?? 4;
     for (let loop = 0; loop < loops; loop += 1) {
       await mark(`recycle ${loop}`, async () => {
         const chunk = Math.min(RECYCLE_CHUNK, pairs);
@@ -447,7 +490,10 @@ export async function foldEsmfold2(device, options) {
         { buffer: pair, maskBuffer: pairMask },
         weights.trunkBlocks,
         { n: tokens, channels, readback: false,
-          onBlock: options.onBlock && ((index) => options.onBlock(loop, index)) }));
+          onBlock: (index) => {
+            advance(perBlock);
+            return options.onBlock?.(loop, index);
+          } }));
     }
     recycleScratch.release();
     held.splice(held.indexOf(recycleScratch), 1);
@@ -459,13 +505,14 @@ export async function foldEsmfold2(device, options) {
     // then - so running it here costs nothing and running it at the end raises
     // the peak by a whole pair representation.
     const distogram = options.contacts === false ? undefined
-      : await mark("distogram", () => encodeContactMap(
+      : await mark("distogram", () => (enter(ESMFOLD2_PHASES.conditioning),
+        encodeContactMap(
         { device, allocator, cache, submit },
         { tokens, channels, bins: shape.distogramBins, pair,
           weights: weights.featuriser.distogramWeights,
           bias: weights.featuriser.distogramBias,
           wantLogits: options.distogramLogits === true,
-          retainForFrames: options.frameCertainty === true }));
+          retainForFrames: options.frameCertainty === true })));
     const contacts = distogram?.contacts;
     const certainty = distogram?.certainty;
     const frames = distogram?.frames;
@@ -477,9 +524,6 @@ export async function foldEsmfold2(device, options) {
     await options.onContacts?.(contacts, certainty);
 
     // ---- the sampler.
-    const settings = { ...SAMPLER_DEFAULTS,
-                       ...(SAMPLER_PRESETS[options.sampler ?? "diffusion-15"] ?? {}),
-                       ...(options.samplerOverrides ?? {}) };
     const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache);
     await mark("conditioning", () => denoiser.prepare({
       shape: {
@@ -500,17 +544,12 @@ export async function foldEsmfold2(device, options) {
     const representative = frames === undefined ? undefined
       : representativeAtoms(features, tokens);
 
-    const schedule = noiseSchedule({ steps: settings.steps, sMax: settings.sMax,
-                                     sMin: settings.sMin, p: settings.p,
-                                     sigmaData: settings.sigmaData,
-                                     maxSigma: settings.maxSigma });
-    const gammas = churnFactors(schedule, settings.gammaMin, settings.gamma0);
-    const levels = noiseLevels(schedule, gammas);
+    advance(plan.conditioning);
+    enter(ESMFOLD2_PHASES.sampler);
     const draw = gaussians(options.seed ?? 0);
     let x = new Float32Array(atoms * 3);
     for (let i = 0; i < x.length; i += 1) x[i] = schedule[0] * draw();
     for (let step = 0; step < levels.length; step += 1) {
-      await report(`sampler ${step + 1} of ${levels.length}`);
       const at = performance.now();
       x = centreRandomAugmentation(x, features.mask, atoms, draw);
       const tHat = levels[step];
