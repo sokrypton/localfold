@@ -32,6 +32,13 @@ import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-refere
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
+import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
+import { Af3StructuralExpanderGpu } from "./structural-expander-webgpu.js";
+import { structuralAttentionBias, structuralPairFeatures }
+  from "./structural-expander-reference.js";
+import { structuralBatch, structuralLayout, structuralToResidue }
+  from "./structural-tokens.js";
+import { diffusionConditioning } from "./diffusion-reference.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
@@ -381,6 +388,81 @@ export function normalFrom(seed) {
  * units of sigmaData, so the walk starts at `sigmaData * sigmaMax` angstroms -
  * and folding leaves it unset, which is AF3's own 160.
  */
+
+/**
+ * OpenDDE's structural-token stage: expand, refine, and rebuild the head input.
+ *
+ * 🔴 IT REPLACES THE BATCH THE DIFFUSION SEES, WHICH IS THE WHOLE POINT. The
+ * trunk ran on residues; from here on the token space is subtokens, so every
+ * gather, mask and conditioning the head reads is the structural batch's. The
+ * coordinates are mapped back the moment the sampler returns.
+ */
+async function expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage) {
+  const layout = structuralLayout(batch);
+  const structuralFeatures = structuralPairFeatures(layout, batch.asymId);
+  const structural = structuralBatch(batch, layout);
+  const expander = weights.expander;
+  // `stage` NOTIFIES, it does not wrap - see its definition in foldBatch.
+  stage("structural-expand", { tokens: layout.tokens });
+  const expanded = await new Af3StructuralExpanderGpu(device).run(
+    layout, { single: trunk.single, pair: trunk.pair, targetFeat, asymId: batch.asymId },
+    expander, structuralFeatures, batch.tokens);
+
+  // A subtoken's target_feat is its parent's plus a role embedding - the same
+  // rule the expander applies to the single, on the other representation.
+  const inputWidth = expander.singleInputChannels;
+  const structuralTargetFeat = new Float32Array(layout.tokens * inputWidth);
+  for (let i = 0; i < layout.tokens; i += 1) {
+    const from = layout.parent[i] * inputWidth;
+    const role = layout.role[i] * inputWidth;
+    for (let c = 0; c < inputWidth; c += 1) {
+      structuralTargetFeat[i * inputWidth + c] =
+        targetFeat[from + c] + expander.singleInputRoleEmbedding[role + c];
+    }
+  }
+
+  const n = layout.tokens;
+  const seqMask = structural.seqMask;
+  const pairMask = new Float32Array(n * n);
+  for (let i = 0; i < n; i += 1) {
+    for (let j = 0; j < n; j += 1) pairMask[i * n + j] = seqMask[i] * seqMask[j];
+  }
+  const attentionBias = structuralAttentionBias(layout, structuralFeatures, expander);
+  stage("structural-refine", { tokens: n });
+  const refined = await new Af3PairformerStackGpu(device, {}).run(
+    { tokens: n, pair: expanded.pair, single: expanded.single, pairMask, seqMask },
+    weights.refiner, weights.trunk.dialect, { extraPairBias: attentionBias });
+
+  const conditioning = perAtomConditioning({
+    positions: structural.refPos, mask: structural.refMask,
+    element: structural.refElement, charge: structural.refCharge,
+    atomNameChars: structural.refAtomNameChars,
+  }, n, batch.dense, weights.atomReference);
+  stage("structural-conditioning", { tokens: n });
+  const pairConditioning = diffusionConditioning({
+      tokens: n, trunkSingle: refined.single, trunkPair: refined.pair,
+      targetFeat: structuralTargetFeat, noiseLevel: 1, features: structural.features,
+      dialect: weights.diffusion.dialect,
+    }, weights.diffusion.conditioning).pair;
+
+  return {
+    layout, structural,
+    headInput: {
+      shape: structural.shape, dialect: weights.diffusion.dialect,
+      conditioning, atomMask: structural.predDenseAtomMask, seqMask,
+      features: structural.features, targetFeat: structuralTargetFeat,
+      refPos: structural.refPos, refSpaceUid: structural.refSpaceUid,
+      tokenAtomsToQueries: structural.tokenAtomsToQueries,
+      queriesToKeys: structural.queriesToKeys,
+      queriesToTokenAtoms: structural.queriesToTokenAtoms,
+      tokensToQueries: structural.tokensToQueries,
+      tokensToKeys: structural.tokensToKeys,
+      trunkSingle: refined.single, trunkPair: refined.pair,
+      pairConditioning,
+    },
+  };
+}
+
 export async function foldBatch(device, batch, weights, options = {}) {
   const steps = options.steps ?? 200;
   const { tokens, dense } = batch;
@@ -596,7 +678,23 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // themselves; only a LATER fold's trunk pays, and it pays in packing.
   releaseResidentWeights(device, "w.");
 
-  const headInput = { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair };
+  // 🔴 OpenDDE RE-TOKENISES BETWEEN THE TRUNK AND THE DIFFUSION, AND THIS IS
+  // WHERE. Every other model here folds one token space end to end; OpenDDE
+  // expands each standard residue into a backbone and a sidechain subtoken,
+  // refines those, and runs the diffusion on THEM - so the batch the sampler
+  // sees is not the batch the trunk saw, and the coordinates come back through
+  // `structuralToResidue` before anything else looks at them.
+  //
+  // The branch lives here rather than in a second driver because everything
+  // around it is shared: the recycles, the contact map, the trunk cache, the
+  // stage callbacks the page's progress bar reads, and the PDB the viewer
+  // draws. A separate driver would have to reproduce all of it.
+  const structural = weights.trunk.dialect.structuralTokens
+    ? await expandToStructuralTokens(device, batch, trunk, targetFeat, weights, stage)
+    : undefined;
+  const headInput = structural === undefined
+    ? { ...headInputBase, trunkSingle: trunk.single, trunkPair: trunk.pair }
+    : structural.headInput;
 
   // 🔴 TWO WAYS TO TURN THE TRUNK INTO COORDINATES, AND THEY ARE NOT THE SAME
   // KIND OF THING. "diffusion" is AF3's own stochastic sampler: noise is
@@ -605,7 +703,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // accuracy on the two proteins it has been measured on. Both take a seed;
   // the flow's spread across seeds is the narrower of the two, because one
   // draw is not the same as noise at every step.
-  const positions = options.mode === "diffusion"
+  const sampled = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
         steps, stopAfter: options.stopAfter, head,
         normal: normalFrom(options.seed ?? 20260831),
@@ -640,17 +738,41 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // reason and dead at the same moment.
   releaseResidentWeights(device, "cond.");
 
+  // 🔴 BACK TO RESIDUE TOKENS BEFORE ANYTHING ELSE READS THEM. The sampler
+  // returned coordinates over the STRUCTURAL layout; the PDB writer, the
+  // pseudo-beta gather, the geometry and the viewer all index (residue token,
+  // atom slot). `residueAtomGather` is the inverse of the regrouping and was
+  // built with it, so this is a scatter and not a reconstruction.
+  const positions = structural === undefined ? sampled
+    : structuralToResidue(sampled, structural.layout, tokens, dense);
+
+  const confidenceFor = async () => {
+    const gather = batch.tokenAtomsToPseudoBeta;
+    const pseudoBeta = new Float32Array(tokens * 3);
+    for (let token = 0; token < tokens; token += 1) {
+      if (!gather.mask[token]) continue;
+      const from = Number(gather.indices[token]) * 3;
+      for (let axis = 0; axis < 3; axis += 1) {
+        pseudoBeta[token * 3 + axis] = positions[from + axis];
+      }
+    }
+    return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
+      tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+    }, weights.confidence, weights.confidence.dialect);
+  };
+
+  // 🔴 AND OpenDDE HAS NO CONFIDENCE HEAD THIS GRAPH CAN RUN. Its own is a
+  // different design on a different distance grid - 51 tensors under
+  // `confidence_head/pairformer_stack`, none of AlphaFold 3's names - so there
+  // is no pLDDT and no PAE, and the keys are ABSENT rather than zero. A zero
+  // pLDDT would be drawn as the colour of no confidence, which is a claim; the
+  // page already has this path for EF2-fast, which has no head either.
+  const scores = structural !== undefined ? undefined
+    : await confidenceFor();
+
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;
-  const pseudoBeta = new Float32Array(tokens * 3);
-  for (let token = 0; token < tokens; token += 1) {
-    if (!beta.mask[token]) continue;
-    const from = Number(beta.indices[token]) * 3;
-    for (let axis = 0; axis < 3; axis += 1) pseudoBeta[token * 3 + axis] = positions[from + axis];
-  }
-  const scores = await new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
-    tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
-  }, weights.confidence, weights.confidence.dialect);
+
   // 🔴 AND ITS FOUR BLOCKS' WEIGHTS GO BACK TOO. `releaseResidentWeights("w.")`
   // above runs when the TRUNK is done, which is before this head exists - so
   // its own pairformer blocks stayed resident for the life of the page, and a
@@ -659,35 +781,64 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // are given back every fold, so these are too.
   releaseResidentWeights(device, "w.");
 
-  let total = 0;
-  let count = 0;
-  for (let index = 0; index < tokens * dense; index += 1) {
-    if (!batch.predDenseAtomMask[index]) continue;
-    total += scores.plddt[index];
-    count += 1;
-  }
+  // 🔴 EVERYTHING BELOW IS THE CONFIDENCE HEAD'S, SO IT IS ABSENT WHERE THE
+  // HEAD IS. A model without one returns no pLDDT, no pTM and no per-chain
+  // scores - not zeros, which every consumer would draw as a confident
+  // failure. `pseudoBeta` goes with them: it exists to let a caller compare a
+  // per-pair prediction against the PAE, and there is no PAE.
+  let meanPlddt;
+  let atoms = 0;
+  let ptm;
+  let iptm;
+  let chainPairIptm;
+  let chainPtm;
+  let chainIptm;
+  let pseudoBeta;
+  if (scores !== undefined) {
+    let total = 0;
+    for (let index = 0; index < tokens * dense; index += 1) {
+      if (!batch.predDenseAtomMask[index]) continue;
+      total += scores.plddt[index];
+      atoms += 1;
+    }
+    meanPlddt = total / atoms;
 
-  // pTM and ipTM, from the TM term the confidence head wrote. The reduction is
-  // shared with AlphaFold 2 - see src/heads/tm-score.js - and only the chain
-  // identity differs: AF3 has asym_id, so chains need not be contiguous.
-  const asymId = batch.asymId;
-  const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
-  const ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
-  // NaN for one chain, because there is no interface to score. Zero would read
-  // as a confident failure rather than an inapplicable question.
-  const iptm = reduceTmScore(scores.tmAdjusted, tokens,
-    (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
-  // 🔴 AND ONE SCORE PER INTERFACE, BECAUSE THE POOLED ONE AVERAGES THEM. On
-  // more than two chains `iptm` counts every cross-chain pair equally, so an
-  // assembly holding both a native dimer and a designed binder reports the
-  // easy interface's confidence for the hard one. See chainPairTmScores.
-  const chainPairIptm = Object.fromEntries(
-    chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
-  // ...and each chain on its own: how well it folded, and how well it sits
-  // against everything else. The AlphaFold 3 server writes both.
-  const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
-  const chainPtm = Object.fromEntries(perChain.chainPtm);
-  const chainIptm = Object.fromEntries(perChain.chainIptm);
+    // pTM and ipTM, from the TM term the confidence head wrote. The reduction
+    // is shared with AlphaFold 2 - see src/heads/tm-score.js - and only the
+    // chain identity differs: AF3 has asym_id, so chains need not be
+    // contiguous.
+    const asymId = batch.asymId;
+    const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
+    // NaN for one chain, because there is no interface to score. Zero would
+    // read as a confident failure rather than an inapplicable question.
+    iptm = reduceTmScore(scores.tmAdjusted, tokens,
+      (i, j) => selected(i, j) && asymId[i] !== asymId[j]);
+    // 🔴 AND ONE SCORE PER INTERFACE, BECAUSE THE POOLED ONE AVERAGES THEM. On
+    // more than two chains `iptm` counts every cross-chain pair equally, so an
+    // assembly holding both a native dimer and a designed binder reports the
+    // easy interface's confidence for the hard one. See chainPairTmScores.
+    chainPairIptm = Object.fromEntries(
+      chainPairTmScores(scores.tmAdjusted, tokens, asymId, seqMask).scores);
+    // ...and each chain on its own: how well it folded, and how well it sits
+    // against everything else. The AlphaFold 3 server writes both.
+    const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
+    chainPtm = Object.fromEntries(perChain.chainPtm);
+    chainIptm = Object.fromEntries(perChain.chainIptm);
+
+    pseudoBeta = new Float32Array(tokens * 3);
+    for (let token = 0; token < tokens; token += 1) {
+      if (!beta.mask[token]) continue;
+      const from = Number(beta.indices[token]) * 3;
+      for (let axis = 0; axis < 3; axis += 1) {
+        pseudoBeta[token * 3 + axis] = positions[from + axis];
+      }
+    }
+  } else {
+    for (let index = 0; index < tokens * dense; index += 1) {
+      if (batch.predDenseAtomMask[index]) atoms += 1;
+    }
+  }
 
   return {
     positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
@@ -700,8 +851,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
     reusable: { trunk, targetFeat, recycles },
-    meanPlddt: total / count, atoms: count,
+    meanPlddt, atoms,
+    // The structural-token count, where there was one; a caller that reports
+    // what a fold did has no other way to see the second token space.
+    structuralTokens: structural?.layout.tokens,
     geometry: backboneGeometry(batch, positions),
-    pdb: toPdb(batch, positions, scores.plddt),
+    pdb: toPdb(batch, positions, scores?.plddt ?? null),
   };
 }

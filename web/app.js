@@ -45,7 +45,8 @@ import { toPdb } from "../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
-import { AF3_FAMILIES, ALL_ATOM_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
+import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODELS_WITHOUT_CONFIDENCE,
+  SINGLE_SEQUENCE_FAMILIES }
   from "../src/reference/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -362,6 +363,7 @@ const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family);
 const MODEL_STEMS = {
   af3: "af3",
   openbind0: "openbind0",
+  opendde: "opendde",
   monomer: "af2",
   multimer: "af2_multimer",
   "ef2-fast-600m": "ef2_fast_600m",
@@ -374,6 +376,7 @@ const MODEL_LABELS = {
   // Upstream's own name for this release. See src/af3/dialect.js for why the
   // number is not decoration.
   openbind0: "OpenBind-0",
+  opendde: "OpenDDE",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
   // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
@@ -1039,7 +1042,12 @@ async function loadIntoViewer({ stem, pdb, scores, a3m, pae, length, confidence 
   const registry = window.py2dmol_viewers ?? {};
   viewer = registry[Object.keys(registry)[0]]?.renderer;
   viewerObject = viewer?.currentObjectName;
-  if (viewer !== undefined) setColourMode("plddt");
+  // 🔴 pLDDT ONLY WHERE THERE IS A pLDDT. `loadIntoViewer` is handed `scores`
+  // exactly when the model has a confidence head, and painting the pLDDT ramp
+  // over an absent B-factor makes every residue the colour of NO CONFIDENCE -
+  // which reads as a terrible fold rather than an absent measurement. Chain
+  // colours are what EF2-fast uses for the same reason.
+  if (viewer !== undefined) setColourMode(scores === undefined ? "chain" : "plddt");
   if (viewer !== undefined && !viewer._scoresHookAttached) {
     viewer._scoresHookAttached = true;
     const origSetFrame = viewer.setFrame.bind(viewer);
@@ -1675,11 +1683,21 @@ function orientBestView(renderer = viewer) {
  * belong to the embed build - and reaching past the control into the colour
  * arrays is what made an earlier attempt at this silently do nothing.
  */
-function forcePlddtColours() {
+function forcePlddtColours(scored = true) {
   // ...one implementation. This was the only one that worked - it goes through
   // py2Dmol's own select - and `setColourMode` now starts there for every
   // caller, so this is the same call under the name the AF3 path uses.
-  setColourMode("plddt");
+  //
+  // 🔴 AND `scored` IS NOT DECORATION. OpenDDE has no confidence head, so its
+  // B-factor column is zero everywhere - and the pLDDT ramp paints zero RED,
+  // which reads as a uniformly terrible fold rather than an absent
+  // measurement. EF2-fast takes chain colours for the same reason.
+  setColourMode(scored ? "plddt" : "chain");
+}
+
+/** Whether the model now selected produces a pLDDT at all. */
+function hasConfidenceHead() {
+  return !MODELS_WITHOUT_CONFIDENCE.includes(chosenFamily());
 }
 
 /** EF2-fast's own, keyed the same way and for the same reason. */
@@ -1927,7 +1945,10 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
         // tilt nobody asked for. The centre and the focal length still follow
         // the molecule, because a re-sample really does land somewhere else.
         if (reuse === undefined) orientBestView(renderer);
-        forcePlddtColours();
+        // ...pLDDT only where there is one; see setColourMode's call in
+        // loadIntoViewer. A model with no confidence head paints a zero
+        // B-factor as the colour of no confidence.
+        forcePlddtColours(hasConfidenceHead());
         oriented = true;
       }
       renderer.render("live-frame");
@@ -2084,14 +2105,21 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     // twice, once wrong.
     const live = viewer?.objectsData?.[viewerObject];
     if (live?.frames !== undefined) live.frames.length = 0;
+    // 🔴 A MODEL WITHOUT A CONFIDENCE HEAD HANDS THE VIEWER NO SCORES AND NO
+    // PAE. OpenDDE's head is its own design on its own distance grid, so a
+    // fold returns a structure and a contact map and nothing else - and the
+    // pLDDT palette over an absent B-factor paints a uniform "no confidence",
+    // which is a claim rather than a blank. EF2-fast established the shape:
+    // colour by chain, and say so on the status line.
+    const scored = result.confidence !== undefined;
+    const pae = scored ? result.confidence.predictedAlignedError : undefined;
     await loadIntoViewer({
       stem, pdb: timeline[0],
-      scores: confidenceJson(chains.join(""), result.confidence),
+      scores: scored ? confidenceJson(chains.join(""), result.confidence) : undefined,
       a3m: alignment,
       chainLengths: chains.map((chain) => chain.length),
-      pae: paeMatrix(result.confidence.predictedAlignedError,
-        paeSize(result.confidence.predictedAlignedError)),
-      length: paeSize(result.confidence.predictedAlignedError),
+      ...(pae === undefined ? {}
+        : { pae: paeMatrix(pae, paeSize(pae)), length: paeSize(pae) }),
       confidence: result.confidence,
     });
     // 🔴 AND THE PREDICTION IS REGISTERED, WHICH AF3 NEVER DID. The download
@@ -2112,9 +2140,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // ...the contacts travel WITH the confidence, because everything that
       // reads one reads the other: the scores file, the archive's full_data,
       // and the heatmap all want the same token-by-token matrices.
-      confidence: { ...result.confidence, contactProbs: result.contactProbs },
-      scores: confidenceJson(chains.join(""),
-        { ...result.confidence, contactProbs: result.contactProbs }),
+      // ...and with no confidence head, the contacts travel ALONE - which is
+      // what EF2-fast's archive does, and why `contactSource` is one field on
+      // every path rather than a copy inside the confidence object.
+      confidence: scored
+        ? { ...result.confidence, contactProbs: result.contactProbs } : undefined,
+      scores: scored ? confidenceJson(chains.join(""),
+        { ...result.confidence, contactProbs: result.contactProbs }) : undefined,
       a3m: alignment,
       chains,
       chainLengths: chains.map((chain) => chain.length),
@@ -2143,10 +2175,12 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // ...and frame zero's own estimate too. It is built by loadIntoViewer
       // rather than by the loop below, so it is easy to leave carrying whatever
       // that put there.
-      first.confidence = {
+      // ...and nothing at all where the model has no confidence head; see the
+      // note at `scored` above.
+      first.confidence = scored ? {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
-      };
+      } : undefined;
       // ...and frame zero's contact map, which is the finished trunk's: every
       // recycle is over before the sampler emits anything.
       const contact = result.contactProbs === undefined
@@ -2175,11 +2209,11 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
       // on every frame, and then a distogram estimate labelled as a pLDDT;
       // both told the reader something the frame does not support. It shows a
       // dash for all three instead.
-      frame.confidence = last ? result.confidence : {
+      frame.confidence = !scored ? undefined : last ? result.confidence : {
         predictedAlignedError: result.confidence.predictedAlignedError,
         plddt: result.confidence.plddt,
       };
-      if (last) {
+      if (last && scored) {
         // The PAE rides on the frame the page lands on, so scrubbing away and
         // back does not blank a matrix that was on screen a moment earlier.
         const size = paeSize(result.confidence.predictedAlignedError);
@@ -2190,7 +2224,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     }
     const object = viewer.objects?.find((entry) => entry.name === viewerObject);
     if (object?.frames?.length) viewer.setFrame(object.frames.length - 1);
-    forcePlddtColours();
+    forcePlddtColours(scored);
     viewer.render("af3-final");
   }
   updateScoresCard(result.confidence);
@@ -2231,7 +2265,13 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     detail.push(result.depth > 1 ? `${result.depth} MSA rows` : "single sequence");
   }
   detail.push(`${recycles + 1} pass${recycles === 0 ? "" : "es"}`);
-  detail.push(`pLDDT ${result.meanPlddt.toFixed(1)}`);
+  // 🔴 ONLY WHERE THE MODEL HAS A CONFIDENCE HEAD. OpenDDE returns no pLDDT,
+  // and `undefined.toFixed` is what the status line said instead of a result.
+  if (result.meanPlddt !== undefined) {
+    detail.push(`pLDDT ${result.meanPlddt.toFixed(1)}`);
+  } else {
+    detail.push("no confidence head");
+  }
   // 🔴 THE COVERAGE GOES BACK ON THE ROW THAT ASKED FOR IT, and is the only
   // thing that says a template arrived: a fold that lost one folds and scores,
   // and the number is merely different. `origin` is the entity's own object -

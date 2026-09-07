@@ -107,15 +107,6 @@ export const MODEL_BUNDLES = {
     release: "opendde-int5",
     variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
     load: () => import("./opendde.js"),
-    // 🔴 IT FOLDS, AND IT IS STILL false, BECAUSE THE PAGE HAS NO ROUTE TO ITS
-    // DRIVER. `FOLDING_FAMILIES` is what the model row offers, and the page
-    // folds through `foldBatch` - AlphaFold 3's single-token-space pipeline.
-    // Selecting OpenDDE there would run the trunk and then hand the diffusion
-    // residue tokens where it wants structural ones: every shape conforms and
-    // a structure comes out. Turning this true is one branch in web/app.js
-    // routing to foldOpendde, and it must land WITH that branch rather than
-    // before it. `tools/gpu/fold-opendde.js` is the working route today.
-    foldingModel: false,
   },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
@@ -208,8 +199,20 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * That exact mistake is recorded in CLAUDE.md for the AF3/OpenBind split; this
  * is the same mistake one model later.
  */
-export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "ef2-fast-600m",
+export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "ef2-fast-600m",
                                   "ef2-fast-300m"];
+
+/**
+ * The families that predict a structure and nothing about it.
+ *
+ * 🔴 A MODEL WITHOUT A CONFIDENCE HEAD MUST NOT BE COLOURED BY pLDDT. Its
+ * B-factor column is zero everywhere, and the pLDDT ramp paints zero RED - so
+ * the whole structure reads as a uniformly terrible fold rather than an absent
+ * measurement. EF2-fast has no head in its checkpoint at all; OpenDDE has one
+ * of its own design, on its own distance grid, which this graph does not run.
+ * Both colour by chain and say so.
+ */
+export const MODELS_WITHOUT_CONFIDENCE = ["opendde", "ef2-fast-600m", "ef2-fast-300m"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
 export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
@@ -223,7 +226,7 @@ export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
  * AlphaFold 2 branch at each of them, which is not a failure that announces
  * itself.
  */
-export const AF3_FAMILIES = ["af3", "openbind0"];
+export const AF3_FAMILIES = ["af3", "openbind0", "opendde"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 

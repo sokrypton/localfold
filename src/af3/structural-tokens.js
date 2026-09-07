@@ -217,6 +217,27 @@ export function structuralLayout(batch) {
 }
 
 /**
+ * The diffusion's coordinates, scattered back onto the residue layout.
+ *
+ * 🔴 THE STRUCTURE EVERY CONSUMER READS IS THE RESIDUE ONE. The PDB writer, the
+ * geometry checks and anything comparing against a deposition all index
+ * (residue token, atom slot); handing them 91 structural tokens where they
+ * expect 47 residues is where the writer stops. `residueAtomGather` is the
+ * inverse of the regrouping and was built with it.
+ */
+export function structuralToResidue(positions, layout, residueTokens, dense) {
+  const out = new Float32Array(residueTokens * dense * 3);
+  for (let index = 0; index < residueTokens * dense; index += 1) {
+    const from = layout.residueAtomGather[index];
+    if (from < 0) continue;
+    out[index * 3] = positions[from * 3];
+    out[index * 3 + 1] = positions[from * 3 + 1];
+    out[index * 3 + 2] = positions[from * 3 + 2];
+  }
+  return out;
+}
+
+/**
  * A batch over OpenDDE's structural tokens, from AlphaFold 3's residue batch.
  *
  * Shaped exactly like `featuriseProtein`'s output, because the diffusion head,

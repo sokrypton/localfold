@@ -11,8 +11,7 @@
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
-import { foldOpendde } from "../../src/af3/fold-opendde.js";
-import { toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import {
   openAf3Store, structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
@@ -129,14 +128,21 @@ export async function main(device, args) {
 
   const timings = {};
   const started = performance.now();
-  const fold = await foldOpendde(device, batch, weights, {
+  // 🔴 THE SAME DRIVER EVERY OTHER AlphaFold 3-graph MODEL USES. The
+  // structural-token stage is a branch inside foldBatch gated on the dialect,
+  // not a second driver - so the recycles, the contact map, the trunk cache
+  // and the stage callbacks are shared rather than reproduced.
+  const fold = await foldBatch(device, batch, weights, {
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     mode: option(args, "mode", "diffusion"),
-    onStage: (name, ms) => { timings[name] = Math.round(ms); },
+    onStage: (name, detail) => {
+      timings[name] = typeof detail === "number" ? Math.round(detail)
+        : Math.round(detail?.ms ?? 0);
+    },
   });
   const wholeMs = Math.round(performance.now() - started);
 
-  const geometry = backboneGeometry(batch, fold.positions);
+  const geometry = fold.geometry;
   // The model's alpha carbons, in residue order.
   const modelCa = [];
   for (let token = 0; token < batch.tokens; token += 1) {
@@ -160,11 +166,12 @@ export async function main(device, args) {
   return {
     target, sequence: sequence.length,
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
+    meanPlddt: fold.meanPlddt ?? null,
     steps, recycles, wholeMs, timings,
     geometry,
     scored: scored && { rmsd: Number(scored.rmsd.toFixed(3)),
                         tm: Number(scored.tm.toFixed(4)), pairs: scored.pairs },
-    finite: fold.positions.every(Number.isFinite), stages: fold.stages,
+    finite: fold.positions.every(Number.isFinite),
     pdb: args.includes("--pdb") ? toPdb(batch, fold.positions, null) : undefined,
     deviceMemory: memorySnapshot(device),
   };

@@ -18,7 +18,8 @@ import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
-import { confidenceWeights, trunkWeights } from "../src/af3/weights.js";
+import { confidenceWeights, structuralExpanderWeights, structuralRefinerWeights,
+  trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -124,12 +125,25 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // and idles through every dequantisation. See HttpTensorStore.prefetch.
       // This path reads the whole model, so there is nothing to be careful about.
       store.prefetch();
+      const trunk = await trunkWeights(store, 48, 4);
+      // 🔴 OpenDDE HAS TWO STACKS THE OTHER TWO DO NOT, AND LACKS ONE THEY
+      // HAVE. It re-tokenises between the trunk and the diffusion, so it needs
+      // the structural-token expander and the four-block refiner; and its
+      // confidence head is its own design on its own distance grid, so
+      // `confidenceWeights` REFUSES this bundle rather than loading a partial
+      // one. The fold returns no pLDDT and no PAE, which the page already
+      // handles for EF2-fast.
+      const structural = trunk.dialect.structuralTokens;
       return {
-        trunk: await trunkWeights(store, 48, 4),
+        trunk,
         diffusion: await diffusionWeights(store),
-        confidence: await confidenceWeights(store),
+        confidence: structural ? undefined : await confidenceWeights(store),
         atomReference: await atomReference(store),
         targetFeat: await targetFeatureWeights(store),
+        ...(structural ? {
+          expander: await structuralExpanderWeights(store),
+          refiner: await structuralRefinerWeights(store),
+        } : {}),
       };
     })();
     weightsPromises.set(family, promise);
@@ -621,7 +635,8 @@ export async function foldAf3(options) {
   // 🔴 THE VIEWER WANTS ONE pLDDT A RESIDUE AND THE HEAD GIVES ONE AN ATOM.
   // Taking the alpha carbon's is what AlphaFold 2's own per-residue pLDDT means
   // here, and it is the value the cartoon is coloured by.
-  const plddt = slots.map((slot) => result.scores.plddt[slot]);
+  const plddt = result.scores === undefined ? undefined
+    : slots.map((slot) => result.scores.plddt[slot]);
 
   // 🔴 A FRAME WHOSE CONFIDENCE IS NOT KNOWN IS COLOURED AS ZERO, WHICH THE
   // pLDDT RAMP PAINTS RED. AF3's confidence head runs ONCE, on the finished
@@ -641,7 +656,8 @@ export async function foldAf3(options) {
     (positions) => fittedPdb(batch, positions, reference, slots, null));
   // ...and the finished structure keeps the REAL pLDDT, which is the one
   // number here that is a claim about the prediction rather than a colour.
-  const finalPdb = fittedPdb(batch, result.positions, reference, slots, result.scores.plddt);
+  const finalPdb = fittedPdb(batch, result.positions, reference, slots,
+                             result.scores?.plddt ?? null);
 
   return {
     batch,
@@ -663,7 +679,13 @@ export async function foldAf3(options) {
     meanPlddt: result.meanPlddt,
     geometry: result.geometry,
     seconds: (performance.now() - started) / 1000,
-    confidence: {
+    // 🔴 ABSENT WHERE THE MODEL HAS NO CONFIDENCE HEAD, NOT ZEROED. OpenDDE's
+    // is its own design on its own distance grid, so there is no pLDDT, no pTM
+    // and no PAE - and an object of zeros would be drawn as the model's
+    // opinion. EF2-fast established this shape: `lastPrediction` carries no
+    // `confidence`, the structure is coloured by chain, and the status line
+    // says so.
+    confidence: result.scores === undefined ? undefined : {
       plddt,
       meanPlddt: result.meanPlddt,
       ptm: result.ptm,

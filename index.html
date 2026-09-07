@@ -164,6 +164,14 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        the bundle and the three dialect branches its weights
                        were trained with. See src/af3/dialect.js. -->
                   <option value="openbind0">OpenBind-0</option>
+                  <!-- 🔴 TWO TOKEN SPACES, AND NO CONFIDENCE HEAD. OpenDDE
+                       re-tokenises each residue into a backbone and a sidechain
+                       subtoken between the trunk and the diffusion, which is a
+                       branch inside foldBatch rather than a second driver; and
+                       its confidence head is its own design, so a fold returns
+                       a structure and a contact map with no pLDDT or PAE - the
+                       same shape as EF2-fast. See docs/OPENDDE.md. -->
+                  <option value="opendde">OpenDDE</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                   <!-- 🔴 NO ALIGNMENT AND NO TEMPLATE, WHICH IS THE POINT.
