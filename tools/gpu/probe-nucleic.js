@@ -33,9 +33,8 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch, atomName } from "../../src/af3/fold.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
 import { nucleicConformers } from "../../src/af3/reference-conformers-nucleic.js";
-import { openAf3Store, trunkWeights, confidenceWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights, diffusionWeights, atomReference }
-  from "../../src/af3/diffusion-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
+import { foldWeights } from "../../src/af3/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -54,8 +53,6 @@ export async function main(device, args) {
   const protein = option(args, "sequence", "");
   const mode = option(args, "mode", "flow");
   const steps = Number(option(args, "steps", "16"));
-  if (dna === "" && rna === "") throw new Error("pass --dna= or --rna=");
-
   // Protein first, because featuriseProtein numbers asym straight through and
   // the polymers come before the ligands; the order here is the order of the
   // kinds below.
@@ -64,13 +61,15 @@ export async function main(device, args) {
   if (protein !== "") { chains.push(protein.toUpperCase()); chainKinds.push("protein"); }
   if (dna !== "") { chains.push(dna.toUpperCase()); chainKinds.push("dna"); }
   if (rna !== "") { chains.push(rna.toUpperCase()); chainKinds.push("rna"); }
+  // 🔴 NO NUCLEIC CHAIN IS A VALID ARM, and it is the control the nucleic
+  // numbers need. Part 3 below scores the PROTEIN residues against the same
+  // conformer dictionary, so dropping the chain turns this into "is this
+  // model's chemistry right at all" - which is what separates "the nucleic
+  // chain is wrong" from "this model is 15% short everywhere".
+  if (chains.length === 0) throw new Error("pass --dna=, --rna= or --sequence=");
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
-  const weights = {
-    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
-    confidence: await confidenceWeights(store), atomReference: await atomReference(store),
-    targetFeat: await targetFeatureWeights(store),
-  };
+  const weights = await foldWeights(store);
 
   const batch = featuriseProtein(chains.join(":"), { chainKinds });
   const result = await foldBatch(device, batch, weights, {
@@ -180,8 +179,11 @@ export async function main(device, args) {
     // 🔴 THE MEDIAN RATIO IS THE HEADLINE, as in probe-modified: the side-chain
     // failure read 0.927 where AF3 itself reads 1.017. Anything near 1 is the
     // chemistry the conformer table asked for.
-    nucleicBondRatio: Number((median(ratios) ?? 0).toFixed(3)),
-    proteinBondRatio: Number((median(controlRatios) ?? 0).toFixed(3)),
+    // ...null rather than zero when an arm has no residues of that kind, so a
+    // protein-only control does not read as a ratio of 0.
+    nucleicBondRatio: median(ratios) === null ? null : Number(median(ratios).toFixed(3)),
+    proteinBondRatio:
+      median(controlRatios) === null ? null : Number(median(controlRatios).toFixed(3)),
     nucleicPairs: ratios.length,
     // ~1.6 A each, or the chain is not a chain.
     backboneBonds: backbone,

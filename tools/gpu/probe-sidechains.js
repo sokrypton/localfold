@@ -47,9 +47,8 @@
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { atomName, foldBatch } from "../../src/af3/fold.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
+import { foldWeights } from "../../src/af3/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -73,11 +72,7 @@ export async function main(device, args) {
   const steps = Number(option(args, "steps", "8"));
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
-  const weights = {
-    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
-    confidence: await confidenceWeights(store), atomReference: await atomReference(store),
-    targetFeat: await targetFeatureWeights(store),
-  };
+  const weights = await foldWeights(store);
 
   const batch = featuriseProtein(sequence, {});
   const result = await foldBatch(device, batch, weights, {

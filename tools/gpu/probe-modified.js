@@ -34,9 +34,8 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch, atomName } from "../../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent, polymerResidue } from "../../src/af3/ccd-component.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
-import { openAf3Store, trunkWeights, confidenceWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights, diffusionWeights, atomReference }
-  from "../../src/af3/diffusion-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
+import { foldWeights } from "../../src/af3/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -57,11 +56,7 @@ export async function main(device, args) {
   const steps = Number(option(args, "steps", "8"));
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
-  const weights = {
-    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
-    confidence: await confidenceWeights(store), atomReference: await atomReference(store),
-    targetFeat: await targetFeatureWeights(store),
-  };
+  const weights = await foldWeights(store);
 
   const response = await fetch(ccdUrl(code));
   if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);

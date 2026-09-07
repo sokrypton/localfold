@@ -57,9 +57,8 @@
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+import { openAf3Store } from "../../src/af3/weights.js";
+import { foldWeights } from "../../src/af3/diffusion-weights.js";
 
 /** sigmaMax is in units of sigmaData, so the walk starts at sigmaData*sigmaMax. */
 const SIGMA_DATA = 16;
@@ -112,14 +111,18 @@ export function ligandBondError(batch, positions, components) {
  *
  * @param {{device: GPUDevice, weights: object,
  *          components: object[], sequence?: string,
- *          startSigmas: number[], stepCounts: number[],
+ *          startSigmas: number[], stepCounts: number[], mode?: string,
  *          seed?: number, recycles?: number,
  *          onResult?: (row: object) => void}} options
- *   `startSigmas` are absolute angstroms; AF3's own top of schedule is 2560.
+ *   `startSigmas` are absolute angstroms; AF3's own top of schedule is 2560,
+ *   and they apply to the flow only - any other `mode` runs one cell per step
+ *   count on the sampler's own schedule.
  * @returns {Promise<object[]>} one row per (sigma0, steps) pair
  */
 export async function sweepLigandFlow(options) {
-  const { device, weights, components, startSigmas, stepCounts } = options;
+  const { device, weights, components, stepCounts } = options;
+  const mode = options.mode ?? "flow";
+  const startSigmas = mode === "flow" ? options.startSigmas : [null];
   const sequence = options.sequence ?? "";
   const batch = featuriseProtein(sequence, { ligands: components });
   const rows = [];
@@ -127,7 +130,7 @@ export async function sweepLigandFlow(options) {
     for (const steps of stepCounts) {
       const started = performance.now();
       const result = await foldBatch(device, batch, weights, {
-        mode: "flow",
+        mode,
         steps,
         recycles: options.recycles ?? 0,
         seed: options.seed ?? 20260831,
@@ -135,7 +138,7 @@ export async function sweepLigandFlow(options) {
         // first draw, so holding the seed fixed makes the grid a comparison of
         // schedules rather than of draws - which at one sample per cell is the
         // difference between a measurement and a lottery.
-        schedule: { sigmaMax: sigma0 / SIGMA_DATA },
+        ...(sigma0 === null ? {} : { schedule: { sigmaMax: sigma0 / SIGMA_DATA } }),
       });
       const error = ligandBondError(batch, result.positions, components);
       const row = {
@@ -165,15 +168,17 @@ export async function main(device, args) {
   }
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
-  const weights = {
-    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
-    confidence: await confidenceWeights(store), atomReference: await atomReference(store),
-    targetFeat: await targetFeatureWeights(store),
-  };
+  const weights = await foldWeights(store);
 
   return sweepLigandFlow({
     device, weights, components,
     sequence: option(args, "sequence", ""),
+    // 🔴 THE SWEEP IS ABOUT THE FLOW, THE BOND MEASUREMENT IS NOT. `--mode=`
+    // exists so a model that has no flow sampler can still be asked the only
+    // question here that generalises: did the component come out as itself?
+    // Under any other mode the sigma column is the sampler's own schedule and
+    // `startSigmas` is ignored, so it is collapsed to one cell.
+    mode: option(args, "mode", "flow"),
     startSigmas: option(args, "sigmas", "2560,640,160,56,16").split(",").map(Number),
     stepCounts: option(args, "steps", "2,4,6,8,16").split(",").map(Number),
     seed: Number(option(args, "seed", "20260831")),
