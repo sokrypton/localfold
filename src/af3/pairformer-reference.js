@@ -435,7 +435,7 @@ export function singleAttention(single, pairLogits, seqMask, n, channels, weight
  * @param {object} weights  one block's tensors, already sliced out of the stack
  * @param {{swapTransposedBias: boolean}} dialect
  */
-export function pairformerBlock(state, weights, dialect) {
+export function pairformerBlock(state, weights, dialect, extraPairBias = undefined) {
   const { pairMask, seqMask, tokens } = state;
   const pairChannels = weights.pairChannels;
   const singleChannels = weights.singleChannels;
@@ -464,8 +464,13 @@ export function pairformerBlock(state, weights, dialect) {
                       weights.singlePairLogitsProjection);
   const pairLogits = new Float32Array(heads * tokens * tokens);
   for (let index = 0; index < tokens * tokens; index += 1) {
+    // 🔴 OpenDDE's REFINER ADDS A PRECOMPUTED BIAS HERE, BROADCAST OVER HEADS.
+    // It comes from the structural-token expander - same parent, twin,
+    // chain-adjacent backbone, role pair - and every block of the refiner adds
+    // the same one. No other pairformer in this tree has it.
+    const extra = extraPairBias === undefined ? 0 : extraPairBias[index];
     for (let head = 0; head < heads; head += 1) {
-      pairLogits[head * tokens * tokens + index] = flat[index * heads + head];
+      pairLogits[head * tokens * tokens + index] = flat[index * heads + head] + extra;
     }
   }
 

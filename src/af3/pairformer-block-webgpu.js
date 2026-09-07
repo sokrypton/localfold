@@ -64,7 +64,16 @@ const AF3_SINGLE_CHANNELS = 384;
  * one scalar per head, and write it HEAD-MAJOR, which is the layout the
  * attention kernel reads a row of.
  */
-function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance) {
+/**
+ * @param {boolean} [extraBias] add a precomputed per-PAIR bias, broadcast over
+ *   heads. OpenDDE's structural-token refiner is the only caller that wants
+ *   one: the expander derives it from the structural relationships between
+ *   subtokens - same parent, twin, chain-adjacent backbone, role pair - and
+ *   every block of the refiner adds the SAME bias to its single attention.
+ *   None for every other pairformer here.
+ */
+function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance,
+                                extraBias = false) {
   const pairs = n * n;
   // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR - and
   // the normalisation belongs outside them. This looped heads OUTSIDE channels
@@ -91,6 +100,7 @@ const W_PROJECT: u32 = ${offsets.projection}u;
 // ...as vec4, which is why W_PROJECT and HEADS must both be multiples of four.
 @group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> logits: array<f32>;
+${extraBias ? "@group(0) @binding(4) var<storage, read> extra_bias: array<f32>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -122,8 +132,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let column = (W_PROJECT + c * HEADS) / 4u;
     ${overHeadVectors((h) => `sum${h} += value * projection[column + ${h}u];`)}
   }
+${extraBias ? "  let extra = extra_bias[row];\n" : ""}\
   ${overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>
-    `logits[(${h * 4 + l}u) * PAIRS + row] = sum${h}.${"xyzw"[l]};`).join("\n  "))}
+    `logits[(${h * 4 + l}u) * PAIRS + row] = sum${h}.${"xyzw"[l]}`
+      + `${extraBias ? " + extra" : ""};`).join("\n  "))}
 }`;
 }
 
@@ -214,6 +226,13 @@ export class Af3PairformerStackGpu {
     // heads where AlphaFold 3 has 128 and 4, and a declared width loads it
     // without complaint - see src/af3/weights.js. They go in the shader cache
     // key below for the same reason.
+    // 🔴 OpenDDE's REFINER ADDS A PRECOMPUTED PAIR BIAS TO ITS SINGLE
+    // ATTENTION, and the same one to every block - it is a property of the
+    // structural-token layout, not of a block. It goes in the shader cache key
+    // because its presence changes the kernel's BINDINGS, and a key that could
+    // not tell the two apart would hand a four-binding bind group to a
+    // three-binding layout.
+    const extraPairBiasData = options.extraPairBias;
     const pairChannels = blocks[0].pairChannels;
     const singleChannels = blocks[0].singleChannels ?? AF3_SINGLE_CHANNELS;
     if (!(pairChannels > 0)) {
@@ -236,7 +255,8 @@ export class Af3PairformerStackGpu {
 
     // The pair track, shared with the MSA stack.
     const base = `af3-block:${n}:${pairChannels}:${singleChannels}`
-      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
+      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`
+      + `:${extraPairBiasData === undefined ? "nobias" : "bias"}`;
     const hasF16 = this.device.features?.has("shader-f16") === true;
     const stagedPrecision = this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE RESIDENT WEIGHTS ARE THE MEMORY, AND THE SINGLE TRACK IS THE
@@ -304,7 +324,8 @@ export class Af3PairformerStackGpu {
       into(`single:${name}`, `${base}:single:${weightPrecision}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
-      createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance));
+      createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,
+                             extraPairBiasData !== undefined));
     into("addSingle", `${base}:add-single`, createAddShader(n * singleChannels));
     await Promise.all(compiling);
 
@@ -327,6 +348,10 @@ export class Af3PairformerStackGpu {
           `af3-block.scratch${index}`,
           storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
+      // Uploaded once for the stack, not per block: it is the same tensor for
+      // all four of the refiner's blocks.
+      const extraPairBias = extraPairBiasData === undefined ? undefined
+        : keep(this.allocator.upload("af3-block.extra-pair-bias", extraPairBiasData, storage));
       const biasBuffer = keep(this.allocator.allocate(
         "af3-block.bias", gridHeads * pairs * 4, storage));
       const pairLogits = keep(this.allocator.allocate(
@@ -374,7 +399,7 @@ export class Af3PairformerStackGpu {
         const encodeStart = performance.now();
         await this.#encodeBlock({
           block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
-          pairChannels, singleChannels,
+          pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
@@ -456,7 +481,7 @@ export class Af3PairformerStackGpu {
   /** One block, submitted as one command buffer. */
   async #encodeBlock(context) {
     const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
-    const { pairChannels, singleChannels } = context;
+    const { pairChannels, singleChannels, extraPairBias } = context;
     const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch } = context;
 
     // 🔴 RELEASED IMMEDIATELY, AND THAT IS SAFE BECAUSE THE QUEUE IS ORDERED.
@@ -608,7 +633,10 @@ export class Af3PairformerStackGpu {
     // ...the weights are bound twice, as scalars and as the vec4 view the head
     // projection is read through.
     run("pair-logits", pipelines.pairLogits,
-        [pair, logitsWeights, logitsWeights, pairLogits], linear[0], linear[1]);
+        extraPairBias === undefined
+          ? [pair, logitsWeights, logitsWeights, pairLogits]
+          : [pair, logitsWeights, logitsWeights, pairLogits, extraPairBias],
+        linear[0], linear[1]);
 
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],

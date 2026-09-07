@@ -20,7 +20,10 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import {
   structuralBatch, structuralLayout, atomNameAt, NO_TWIN,
 } from "../../src/af3/structural-tokens.js";
-import { expandStructural } from "../../src/af3/structural-expander-reference.js";
+import {
+  expandStructural, structuralPairFeatures,
+} from "../../src/af3/structural-expander-reference.js";
+import { Af3StructuralExpanderGpu } from "../../src/af3/structural-expander-webgpu.js";
 import {
   openAf3Store, structuralExpanderWeights, structuralRefinerWeights,
 } from "../../src/af3/weights.js";
@@ -99,6 +102,27 @@ export async function main(device, args) {
     representatives[key] = (representatives[key] ?? 0) + 1;
   }
 
+  // 🔴 THE GPU AGAINST THE REFERENCE, which is the only arm here that is a
+  // CHECK rather than an assertion about the layout. The expander is
+  // n^2 * c^2, so the host arm is 1.8 s at 91 tokens and the kernel is where
+  // this actually runs - and a kernel indexing 49 matrices by a role pair is
+  // exactly the shape that returns a plausible tensor when the stride is wrong.
+  const features = structuralPairFeatures(layout, batch.asymId);
+  const gpuStarted = performance.now();
+  const gpu = await new Af3StructuralExpanderGpu(device).run(
+    layout, embeddings, weights, features, residueTokens);
+  const gpuMs = Math.round(performance.now() - gpuStarted);
+  const relativeRms = (actual, expected) => {
+    let error = 0;
+    let scale = 0;
+    for (let i = 0; i < expected.length; i += 1) {
+      const d = actual[i] - expected[i];
+      error += d * d;
+      scale += expected[i] * expected[i];
+    }
+    return Number(Math.sqrt(error / Math.max(scale, 1e-30)).toExponential(3));
+  };
+
   const rms = (a) => Number(Math.sqrt(a.reduce((s, v) => s + v * v, 0) / a.length).toFixed(4));
   const finite = (a) => a.every(Number.isFinite);
 
@@ -116,6 +140,11 @@ export async function main(device, args) {
       pairRms: rms(expanded.pair), biasRms: rms(expanded.attentionBias),
       finite: finite(expanded.single) && finite(expanded.pair)
         && finite(expanded.attentionBias),
+    },
+    gpu: {
+      ms: gpuMs, hostMs: expandMs,
+      pair: relativeRms(gpu.pair, expanded.pair),
+      single: relativeRms(gpu.single, expanded.single),
     },
     refiner: {
       blocks: refiner.length,
