@@ -380,10 +380,27 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   // bias[h][i][j]. Laid out head-major because the attention pass reads a whole
   // row of it per (row, i, head).
+  // 🔴 THE VECTORISED FORM NEEDS FOUR HEADS TO A VECTOR AND OpenDDE's TEMPLATE
+  // STACK HAS TWO. `Array.from({ length: heads / 4 })` is EMPTY at heads = 2,
+  // so this kernel used to generate a loop with no body and a `main` that
+  // touched none of its bindings - and WebGPU infers a bind group layout from
+  // the bindings a shader USES, so the layout came back with one entry against
+  // a bind group of three and the failure named neither the kernel nor the head
+  // count. Every head count in this repository before OpenDDE was 4, 8, 12 or
+  // 16, so nothing had ever taken the remainder.
+  //
+  // The scalar arm below is what a non-multiple of four gets. It reads one
+  // weight per multiply-add, which is what the vector arm exists to avoid - so
+  // it is the slow path, taken by a two-head stack that runs twice per template
+  // slot and is not where a fold's time goes.
+  const vectorHeads = heads % 4 === 0;
   const biasPass = `${common}
 @group(0) @binding(0) var<storage, read> normalized: array<${storageArray(normalizedStorage)}>;
-// ...as vec4, which is why W_BIAS and HEADS must both be multiples of four.
-@group(0) @binding(1) var<storage, read> projection: array<vec4<f32>>;
+${vectorHeads
+  ? "// ...as vec4, which is why W_BIAS and HEADS must both be multiples of four.\n"
+    + "@group(0) @binding(1) var<storage, read> projection: array<vec4<f32>>;"
+  : "// ...scalar, because HEADS is not a multiple of four; see above.\n"
+    + "@group(0) @binding(1) var<storage, read> projection: array<f32>;"}
 @group(0) @binding(2) var<storage, read_write> bias: array<f32>;
 
 @compute @workgroup_size(64)
@@ -396,7 +413,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR. This
   // looped heads OUTSIDE channels, re-reading the normalised row for each of
   // them and reading one weight per multiply-add.
-  ${Array.from({ length: heads / 4 }, (_, h) =>
+${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
     `var total${h} = vec4<f32>(0.0);`).join("\n  ")}
   for (var c = 0u; c < CHANNELS; c += 1u) {
     let value = ${storedElement(normalizedStorage, "normalized", "base + c")};
@@ -405,8 +422,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
   }
   ${Array.from({ length: heads / 4 }, (_, h) => Array.from({ length: 4 }, (_, l) =>
-    `bias[(${h * 4 + l}u) * PAIRS + row] = total${h}.${"xyzw"[l]};`).join("\n  ")).join("\n  ")}
+    `bias[(${h * 4 + l}u) * PAIRS + row] = total${h}.${"xyzw"[l]};`).join("\n  ")).join("\n  ")}`
+: `  ${Array.from({ length: heads }, (_, h) =>
+    `var total${h} = 0.0;`).join("\n  ")}
+  for (var c = 0u; c < CHANNELS; c += 1u) {
+    let value = ${storedElement(normalizedStorage, "normalized", "base + c")};
+    let column = W_BIAS + c * HEADS;
+    ${Array.from({ length: heads }, (_, h) =>
+      `total${h} += value * projection[column + ${h}u];`).join("\n    ")}
+  }
+  ${Array.from({ length: heads }, (_, h) =>
+    `bias[(${h}u) * PAIRS + row] = total${h};`).join("\n  ")}`}
 }`;
+  // 🔴 AND IT CAN NEVER AGAIN GENERATE NOTHING. An empty body is what the bug
+  // above WAS, and it is invisible until a bind group is built from it.
+  if (!/total0/.test(biasPass)) {
+    throw new Error(`the grid attention's bias kernel generated no body at `
+      + `${heads} heads; this is the empty-Array.from bug, not a shape`);
+  }
 
   // One workgroup per pair row; thread w owns output channel w of q, k, v and
   // the gate at once, so the normalised row is read from shared memory four

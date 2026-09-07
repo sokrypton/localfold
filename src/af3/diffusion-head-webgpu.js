@@ -571,9 +571,18 @@ export class Af3DiffusionHeadGpu {
     // new fold brings a new array. Nothing here could tell a MUTATED array
     // apart, which is why the key is identity rather than a hash - the callers
     // never mutate one, and a hash would cost more than the work it saves.
-    const cachedPair = this.#conditioningPair?.trunkPair === input.trunkPair
-      && this.#conditioningPair?.tokens === tokens
-      ? this.#conditioningPair.pair : undefined;
+    // 🔴 A CALLER MAY SUPPLY THE PAIR CONDITIONING, WHICH IS HOW OpenDDE GETS
+    // ITS OWN. That model compresses the trunk pair and the relative encoding
+    // SEPARATELY before concatenating them, where AlphaFold 3 concatenates the
+    // trunk pair with the RAW relative features - a different function, over a
+    // trunk pair that is 384 wide here and 128 there. The result does not
+    // depend on the noise level, so it is computed once for the fold and
+    // handed in, exactly as the cache below hands back the one this module
+    // computed. Nothing else changes: from here on it IS the pair conditioning.
+    const cachedPair = input.pairConditioning ?? (
+      this.#conditioningPair?.trunkPair === input.trunkPair
+        && this.#conditioningPair?.tokens === tokens
+        ? this.#conditioningPair.pair : undefined);
 
     // 🔴 THE CHAIN ONLY RUNS ONCE THE PAIR CACHE IS WARM. See #chain: the
     // first call of a fold has to read the pair conditioning back, because it

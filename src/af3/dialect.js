@@ -42,6 +42,15 @@ export const ALPHAFOLD3 = Object.freeze({
   symmetriseBonds: false,
   maskPaddedKeys: false,
   padSingleCondUnknownDna: false,
+  pairInitFromSingle: false,
+  msaUpdateBeforeOuterProduct: false,
+  distogramBias: false,
+  keyMaskedAtomAttention: false,
+  perBlockPairLayerNorm: false,
+  perBlockAtomPairLayerNorm: false,
+  chainedAtomLayerNorm: false,
+  splitPairConditioning: false,
+  structuralTokens: false,
 });
 
 /**
@@ -64,11 +73,99 @@ export const OPENBIND0 = Object.freeze({
   symmetriseBonds: true,
   maskPaddedKeys: true,
   padSingleCondUnknownDna: true,
+  pairInitFromSingle: false,
+  msaUpdateBeforeOuterProduct: false,
+  distogramBias: false,
+  keyMaskedAtomAttention: false,
+  perBlockPairLayerNorm: false,
+  perBlockAtomPairLayerNorm: false,
+  chainedAtomLayerNorm: false,
+  splitPairConditioning: false,
+  structuralTokens: false,
+});
+
+
+/**
+ * OpenDDE (Aureka Research), Apache-2.0 - an independent PyTorch
+ * reimplementation in the AlphaFold 3 family, with its own pairformer and
+ * primitives rather than DeepMind's.
+ *
+ * 🔴 IT IS THE FIRST BUNDLE HERE WHOSE WIDTHS ARE NOT AlphaFold 3's, which is
+ * why `src/af3/weights.js` derives every width from the tensor that states it
+ * rather than declaring it. The pair track is 384 channels against AF3's 128,
+ * the MSA 128 against 64, the triangle attention 12 heads against 4 (and 2 in
+ * the template stack against 4), and the distogram 96 bins against 64. Every
+ * one of those loads through a declared width without complaint.
+ *
+ * 🔴 AND ITS LINEAGE DOES NOT PREDICT ITS CONVENTIONS, WHICH IS THE TRAP THIS
+ * TABLE EXISTS FOR - twice over, in opposite directions from OpenBind-0:
+ *
+ *   - `swapTransposedBias` is TRUE here and FALSE for OpenBind-0. Both are
+ *     OpenFold3-lineage; upstream's `TRANSPOSED_COLUMN_PAIR_BIAS` lists
+ *     opendde and deliberately omits openbind.
+ *   - `padSingleCondUnknownDna` is FALSE here and TRUE for OpenBind-0, even
+ *     though OpenDDE's native single conditioning is 833 wide exactly as
+ *     OpenFold3's is. The converter collapses it to 831 by remapping the
+ *     32-class vocabulary onto AF3's 31 rather than padding it (upstream's
+ *     `converters/opendde.py`, `_remap_s_inputs_vec`), so what reaches this
+ *     graph is 831 and stock AF3's arithmetic is correct. Reading "833 in the
+ *     checkpoint" as "pad the conditioning" would LayerNorm over two columns
+ *     the converter already folded away.
+ *
+ * Everything else here is a branch OpenBind-0 does not take. Each is silent
+ * when wrong in the way this file's header describes - the shapes agree and a
+ * structure comes out - so each is named at its use site and keyed into the
+ * shader cache.
+ */
+export const OPENDDE = Object.freeze({
+  // Upstream `TRANSPOSED_COLUMN_PAIR_BIAS`: a column attention's pair bias is
+  // `Linear(z[k, q])`, the pair transposed BEFORE the projection.
+  swapTransposedBias: true,
+  // OPENFOLD3_LINEAGE, both of these.
+  symmetriseBonds: true,
+  maskPaddedKeys: true,
+  // ...but NOT this one; see the note above.
+  padSingleCondUnknownDna: false,
+  // The pair track is initialised from the single embedding `s_init` rather
+  // than from `target_feat`, so `single_activations` is computed BEFORE the
+  // pair init instead of after the MSA stack, and left/right_single are
+  // 384 -> pair rather than 447 -> pair. Their shapes say so.
+  pairInitFromSingle: true,
+  // An MSA block updates the MSA FIRST and feeds the UPDATED rows to the outer
+  // product mean; AF3 takes the outer product off the pre-update MSA. The
+  // difference compounds over the blocks.
+  msaUpdateBeforeOuterProduct: true,
+  // The distogram's half-logit projection carries a trained bias.
+  distogramBias: true,
+  // The atom attention's mask bias is an OR over the two masks rather than
+  // AF3's AND, so a real query cannot attend to a padded key at all.
+  keyMaskedAtomAttention: true,
+  // The pair conditioning is LayerNormed and projected once per block in the
+  // token transformer, and once per block in the atom transformer. AF3 runs
+  // each once for the whole stack.
+  perBlockPairLayerNorm: true,
+  perBlockAtomPairLayerNorm: true,
+  // The atom cross-attention's two adaptive LayerNorms are CHAINED: the keys'
+  // normalisation reads the already-normalised queries, not the raw input.
+  chainedAtomLayerNorm: true,
+  // The diffusion conditioning compresses the trunk pair and the relative
+  // encoding SEPARATELY to the pair width and concatenates them, rather than
+  // projecting one concatenation of the pair and the RAW relative features.
+  splitPairConditioning: true,
+  // 🔴 AND THE DIFFUSION RUNS ON AN EXPANDED TOKEN SET, WHICH IS THE ONE
+  // DIFFERENCE THAT IS NOT A BRANCH. Between the trunk and the diffusion
+  // OpenDDE expands each residue into about two "structural tokens" - a
+  // backbone token and a sidechain one, glycine staying single - and runs the
+  // diffusion and its confidence head on those. That is a second token space
+  // threaded through the atom layouts, not a flag, so this says only that the
+  // bundle wants one. See `src/af3/structural-tokens.js`.
+  structuralTokens: true,
 });
 
 export const DIALECTS = Object.freeze({
   alphafold3: ALPHAFOLD3,
   openbind0: OPENBIND0,
+  opendde: OPENDDE,
 });
 
 /**

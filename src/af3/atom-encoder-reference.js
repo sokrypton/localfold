@@ -127,6 +127,15 @@ export function adaptiveZeroInit(x, cond, rows, channels, weights, prefix,
  *
  * @param {object} shape {subsets, queries, keys, channels, heads, dimension}
  */
+/** The one dialect flag a block's attention reads, required rather than assumed. */
+function dialectOf(weights) {
+  if (weights.keyMaskedAtomAttention === undefined) {
+    throw new Error("weights.keyMaskedAtomAttention has no default: AF3 masks a "
+      + "pair only when query AND key are padded, OpenDDE when either is");
+  }
+  return weights;
+}
+
 export function crossAttentionBlock(queriesAct, state, shape, weights) {
   const { subsets, queries, keys, channels, heads, dimension } = shape;
   const { queriesToKeys, queriesMask, keysMask, queriesCond, keysCond, pairLogits } = state;
@@ -134,8 +143,24 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
   const keyRows = subsets * keys;
   const scale = 1 / Math.sqrt(dimension);
 
-  const keysAct = convert(queriesToKeys, queriesAct, channels);
+  // 🔴 THE TWO ADAPTIVE LAYERNORMS ARE PARALLEL OR CHAINED, AND THAT IS THE
+  // MODEL. AlphaFold 3 normalises the RAW activation twice, once per side.
+  // OpenDDE reassigns: its `AttentionPairBias` in cross-attention mode runs
+  //
+  //     a  = layernorm_a(a, s)     // the queries
+  //     kv = layernorm_kv(a, s)    // <- the ALREADY-NORMALISED a
+  //
+  // so the gather onto the key layout happens BETWEEN the two, and the second
+  // norm re-centres and re-scales a tensor whose statistics the first already
+  // fixed - while seeing the first one's learned scale. Two chained LayerNorms
+  // are not one, and neither arrangement changes a shape.
+  if (weights.chainedAtomLayerNorm === undefined) {
+    throw new Error("weights.chainedAtomLayerNorm has no default: AF3 "
+      + "normalises the raw activation on both sides, OpenDDE chains them");
+  }
   const xq = adaptiveLayerNorm(queriesAct, queriesCond, queryRows, channels, weights, "q");
+  const keysAct = convert(queriesToKeys,
+                          weights.chainedAtomLayerNorm ? xq : queriesAct, channels);
   const xk = adaptiveLayerNorm(keysAct, keysCond, keyRows, channels, weights, "k");
 
   const width = heads * dimension;
@@ -156,12 +181,20 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
           for (let d = 0; d < dimension; d += 1) {
             dot += q[queryBase + d] * k[keyIndex * width + head * dimension + d];
           }
-          // 🔴 THE MASK BIAS IS A PRODUCT, NOT A SUM. AF3 penalises a pair only
-          // when the query AND the key are padded, so a real query can still
-          // attend to a padded key. (RoseTTAFold3 adds them instead, which is
-          // an OR; the difference is large in a mostly-empty window.)
-          const maskBias = 1e9 * (queriesMask[queryIndex] - 1)
-            * (keysMask[keyIndex] - 1);
+          // 🔴 THE MASK BIAS IS A PRODUCT, NOT A SUM - UNDER AlphaFold 3. It
+          // penalises a pair only when the query AND the key are padded, so a
+          // real query can still attend to a padded key. OpenDDE, Protenix and
+          // RoseTTAFold3 ADD the two instead, which is an OR: a real query
+          // cannot attend to a padded key at all. The difference is large in a
+          // mostly-empty window - a lone ligand's 16 atoms sit in a 32-query,
+          // 128-key window - and it is nothing at all when every key is real,
+          // which is every batch THIS featuriser produces (the window is
+          // `min(128, atomCount)`; see CLAUDE.md). It is implemented because
+          // the differential checkers feed AF3's own gathers out of an oracle
+          // dump, where padded keys do occur.
+          const maskBias = dialectOf(weights).keyMaskedAtomAttention
+            ? -1e9 * ((1 - queriesMask[queryIndex]) + (1 - keysMask[keyIndex]))
+            : 1e9 * (queriesMask[queryIndex] - 1) * (keysMask[keyIndex] - 1);
           logits[key] = dot * scale + maskBias
             + pairLogits[((subset * heads + head) * queries + query) * keys + key];
         }
@@ -231,14 +264,46 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
  * projection's output is (blocks, heads) rather than heads. Recomputing it per
  * block would read the same weights and give the same answer; splitting it the
  * wrong way round gives every block the biases meant for another.
+ *
+ * 🔴 ...UNDER AlphaFold 3. OpenDDE NORMALISES AND PROJECTS PER BLOCK, with its
+ * own scale and its own matrix each time - `pair_input_layer_norm/scale` is
+ * [3, 16] there and [16] here, and the projection [3, 16, 4] against [16, 12].
+ * The MEAN and VARIANCE are the same either way (they come from the pair, which
+ * does not change), so the difference is entirely in which scale and which
+ * matrix a block reads. That makes it invisible to every shape check and to any
+ * test that runs one block.
  */
 export function atomPairLogits(pair, shape, weights) {
   const { subsets, queries, keys, pairChannels, heads, blocks } = shape;
   const pairRows = subsets * queries * keys;
-  const normalised = layerNormSlow(pair, pairRows, pairChannels,
-                                   weights.pairInputLayerNormScale, null);
-  const flat = linear(normalised, pairRows, pairChannels, blocks * heads,
-                      weights.pairLogitsProjection);
+  if (weights.pairNormPerBlock === undefined) {
+    throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+      + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+  }
+  // Per block: its own scale, its own matrix, `heads` outputs. Shared: one
+  // scale, one matrix, `blocks * heads` outputs read at a block's offset. The
+  // loop below indexes `flat` identically in both cases, which is what keeps
+  // the two arms one function.
+  let flat;
+  if (weights.pairNormPerBlock) {
+    flat = new Float32Array(pairRows * blocks * heads);
+    for (let block = 0; block < blocks; block += 1) {
+      const normalised = layerNormSlow(pair, pairRows, pairChannels,
+                                       weights.pairInputLayerNormScales[block], null);
+      const projected = linear(normalised, pairRows, pairChannels, heads,
+                               weights.pairLogitsProjections[block]);
+      for (let row = 0; row < pairRows; row += 1) {
+        for (let head = 0; head < heads; head += 1) {
+          flat[row * blocks * heads + block * heads + head] = projected[row * heads + head];
+        }
+      }
+    }
+  } else {
+    const normalised = layerNormSlow(pair, pairRows, pairChannels,
+                                     weights.pairInputLayerNormScale, null);
+    flat = linear(normalised, pairRows, pairChannels, blocks * heads,
+                  weights.pairLogitsProjection);
+  }
   const output = [];
   for (let block = 0; block < blocks; block += 1) {
     const perBlock = new Float32Array(subsets * heads * queries * keys);

@@ -70,6 +70,30 @@ BUNDLES = {
         "module": "src/reference/manifests/openbind0.js",
         "model": "openbind0",
     },
+    # OpenDDE, whole: the trunk, the distogram head, the structural-token
+    # expander and refiner, the diffusion, and OpenDDE's own confidence head.
+    # 481 tensors, 655.8 M parameters - which is upstream's published
+    # parameter_count exactly - at int5 group 32, 473 MiB in TWELVE shards.
+    #
+    # 🔴 TWELVE, AND SIZED ON THE PACKED BYTES. The float32 export's 48 MiB
+    # shard cap is discarded; what decides the count is the largest TENSOR,
+    # because a tensor is indivisible. OpenDDE has three 216 MiB float32
+    # tensors, 40.5 MiB apiece at int5, so no sharding beats 40.5 MiB and
+    # twelve is the fewest that reaches it. AlphaFold 3's bundle has the same
+    # 40.5 MiB cap from two such tensors and is 8 shards only because it is
+    # 265 MiB rather than 473. See quantize_af3.py's shard_count.
+    #
+    # 🔴 IT IS A TRUNK AND NOT A FOLD, which MODEL_BUNDLES records as
+    # `foldingModel: false`. OpenDDE expands each residue into about two
+    # structural tokens between the trunk and the diffusion and runs the
+    # diffusion and its own confidence head on that expanded set, so the parts
+    # that make COORDINATES are a second token space rather than a branch. The
+    # distogram is what this bundle answers with. See docs/OPENDDE.md.
+    "opendde": {
+        "export": "model-opendde-int5",
+        "module": "src/reference/manifests/opendde.js",
+        "model": "opendde",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #
@@ -90,7 +114,7 @@ BUNDLES = {
     # ESM-C 600M at int3 group 128, plus the shim that turns its 37 hidden
     # states into ESMFold2's pair term. Three bits, because the structural
     # damage was measured against the SAMPLER's own seed spread rather than
-    # against zero - see docs/ESMFOLD2.md.
+    # against zero - see docs/EF2FAST.md.
     "esmc": {
         "export": "model-esmc-600m-int3",
         "module": "src/reference/manifests/esmc.js",

@@ -68,7 +68,12 @@ export async function compilePairTrack(cache, options) {
   // TRANSITION, where the trunk runs 128 and factor 4. Both are "a pairformer
   // block"; only the weight shapes say which, so a wrong factor reads
   // transition1 at the wrong stride rather than failing.
-  const channels = options.channels ?? PAIR_CHANNELS;
+  // Required for the same reason `encodePairTrack` requires it: these two
+  // resolve the SAME number, and a default in either is how they drift.
+  const { channels } = options;
+  if (!(channels > 0)) {
+    throw new Error("compilePairTrack needs the track's channel count");
+  }
   const transitionFactor = options.transitionFactor ?? 4;
   const pairs = n * n;
   // 🔴 THE TRIANGLE PROJECTION'S ACCUMULATORS, WHICH ARE A THIRD FORMAT AGAIN.
@@ -309,7 +314,26 @@ export function pairScratchCount(gridAttention = true) {
  */
 export function encodePairTrack(context) {
   const { run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer, weights } = context;
-  const channels = context.channels ?? PAIR_CHANNELS;
+  // 🔴 THE WIDTH IS REQUIRED, AND USED TO DEFAULT TO 128. That default is what
+  // broke OpenDDE: `compilePairTrack` was given 384 and generated kernels for
+  // it, while THIS function sized every dispatch for AlphaFold 3's 128 - so two
+  // thirds of every pair row went unprocessed, on a track whose kernels each
+  // check out at 6e-7 in isolation. The block's relRMS against its own CPU
+  // reference was 1.293 and the contact map scored BELOW chance, with nothing
+  // out of range and no validation error anywhere.
+  //
+  // This is the second time a shape resolved in two places has done this here;
+  // CLAUDE.md's closing habit records the first, where "shaders tiling by four
+  // under a dispatch dividing by eight" left half the tokens unprocessed and
+  // read as a 30% speedup. A default is what let the two drift, so there is
+  // none: every caller states it, and a caller that forgets is an error rather
+  // than a silently truncated track.
+  const { channels } = context;
+  if (!(channels > 0)) {
+    throw new Error("encodePairTrack needs the track's channel count; it is the "
+      + "bundle's, not a constant, and sizing the dispatch for the wrong one "
+      + "leaves rows unprocessed with no validation error");
+  }
   const pairs = n * n;
   const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
   // 🔴 THE TRIANGLE KERNELS FOLD AT THEIR OWN WIDTH, NOT THIS FILE'S. They

@@ -1,0 +1,718 @@
+# Kernels, memory and precision, measured on this M2
+
+Findings that are about the machine rather than about a model: what the device
+can do, where the memory goes, what half precision is worth where, and which
+optimisations were tried and did not survive. See CLAUDE.md's "Measuring,
+without fooling yourself" before trusting any number here.
+
+🔴 **AND A DIFFERENTIAL CHECKER THAT BUILDS ITS OWN KERNEL TESTS WHATEVER IT
+BUILT.** Four of them did this session, each found the same way: a shipped path
+learned to pick between an f32 and an f16 kernel, the checker went on
+constructing the f32 one from a module constant, and the arm labelled "f32" was
+either testing a kernel nothing runs or - once - silently testing the f16 one
+and failing. Ask the selection function for the kernel, take the precision as
+an axis, and hold each arm to the bound its own arithmetic implies. Raising one
+bound to cover both stops the f32 path being checked at all.
+
+## Where the memory goes, and what f16 weights are worth where
+
+🔴 **CHUNKING THE PAIR SCRATCH LOOKS OBVIOUS AND THE TRIANGLE WILL NOT HAVE
+IT.** The five pair-sized scratch buffers are 5987 MiB of a 9662 MiB fold at
+1530 tokens - 62% - and the budget's only cheaper route gives up WEIGHT
+residency, which is ~567 MiB and does not grow with the protein. So: run the
+track a few hundred rows at a time. The grid attention takes it happily - q, k,
+v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
+a row chunk is a contiguous byte range and binding that SLICE makes the
+existing indexing address it with **no kernel change at all**. `run` in
+src/af3/pairformer-block-webgpu.js accepts a slice for this, and
+`encodePairTrack` has a `rowChunk` that defaults to the whole track.
+
+🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
+CHANNEL-major - `a[h * PAIRS + i * L + k]` - so a row chunk is CH separate
+ranges rather than one, and no binding offset expresses that. Worse, the
+INCOMING direction reads `b[a_k * L + i]`, so chunking the output rows needs a
+strided COLUMN slice of b, which is not a range at any stride. Chunking the
+triangle therefore needs a stride constant in the kernels (and those kernels
+are shared with AF2's evoformer and multimer) or a transposed copy of b, which
+is the buffer the chunking was meant to avoid.
+
+🔴 **AND THE PEAK IS THE WORST CASE, SO HALF THE JOB IS WORTH NOTHING.** The
+triangle and the grid share the five buffers and the allocation is sized for
+whichever needs more, so chunking only the grid leaves the peak exactly where
+it was. It is all or nothing, and the "all" is a restructure of the pair track
+rather than the afternoon it looks like.
+
+🔴 **AND THE TOTALS CANNOT SAY WHICH TENSOR TO ATTACK.** `memorySnapshot`
+returns `byLabel` beside the totals - the allocator was always given a label per
+buffer and threw it away - and `fold.js`, `bench-trunk.js` and `fold-af2.js`
+print it. The two models fail differently and the breakdown is what says so:
+AF3 keeps its WEIGHTS resident (three tensors were 1216 MiB of a 1406 MiB fold)
+and AF2 keeps none, so AF2's peak is all ACTIVATIONS (`msa-transition.hidden`
+alone was 118 MiB of 681). Both are now smaller - a 59-token AF3 fold holds
+**798 MiB against 1406**, and an AF2 fold at 512 MSA rows peaks at **573 MiB
+against 681**.
+
+🔴 **AND THE SAME DIFFERENCE DECIDES WHETHER f16 WEIGHTS BUY TIME.** The
+question has no answer except one about the traffic, and it was asked three
+times here with three answers:
+
+| where | how the weights are read | f16 storage is worth |
+|---|---|---|
+| AF3's trunk | resident, one scalar at a time | **-2%** (377 vs 378 on the pair track; 163-166 vs 166-168 on the single track) |
+| AF2's transition | uploaded every pass, re-read 944 times | **+8%** of the kernel, plus half the upload |
+| AF3's diffusion transformer | streamed once per token tile | **+14%** (48 -> 41 ms at 59 tokens, 103 -> 89 at 150) |
+
+Halving the bytes never halves the read INSTRUCTIONS, and the `f32()` at each
+read is not free - so where the bytes are not the bottleneck it is a small
+LOSS taken for the memory. See docs/AF3.md's memory section and
+`TRANSITION_CHUNK_TARGET_BYTES`.
+
+🔴 **AND THE ATOM BLOCKS ARE THE FOURTH ANSWER: NO, ON ACCURACY, NOT ON
+TIME.** They are the one stack with no precision axis, and they are the shape
+the table above says should pay: `output` streams a block's whole 655 KB
+through EVERY workgroup - 600 of them at 200 tokens, 393 MB of weight traffic
+in one pass - and it runs at **148 GFLOP/s against this device's 1220 scalar
+ceiling**, which is a kernel waiting on memory. Narrowing the weights was
+tried and it does not survive the envelopes:
+
+| | f32 | big matrices at f16 precision | all weights f16 |
+|---|---|---|---|
+| encoder `tokenAct` | **9.48e-6** | 6.19e-4 | 1.12e-2 |
+| encoder `skipConnection` | **2.05e-5** | 9.26e-4 | 2.11e-2 |
+| decoder position update | **2.47e-7** | 1.29e-4 | 1.41e-4 |
+| denoiser (bound 4e-4) | **1.28e-4** | 1.18e-3 | 1.47e-3 |
+
+The middle column is the diagnosis: rounding ONLY the tensors over 1024
+elements - so every LayerNorm scale and per-channel bias stays float32 - still
+misses the head's bound by 3x. There is nothing to split off, so a two-buffer
+version would not help either.
+
+🔴 **AND THE REASON GENERALISES.** The diffusion transformer takes f16 weights
+happily (1.88e-2 inside a 4e-2 bound) because what it produces is an
+ACTIVATION, and the LayerNorm after it renormalises most of the error away.
+The atom decoder produces a POSITION UPDATE in angstroms, which nothing
+renormalises: a relative error there is a coordinate error. Ask what a stack's
+output IS before pricing its weights.
+
+🔴 **MEMORY HAS TWO HALVES AND THE BENCHES ONLY EVER SHOWED ONE.** The GPU
+allocator's snapshot cannot see a `Float32Array`, and until
+`src/runtime/device-memory.js` existed nothing counted the buffers created
+outside the allocator - which are most of them by size. Host heap comes from
+`tools/gpu/probe-memory.js` (it forces a collection first, or the reading
+carries 300 MiB of garbage); device memory from `memorySnapshot(device)`,
+which `fold.js`, `bench-trunk.js` and `fold-af2.js` print. A 31-residue fold
+held **305 MiB of heap and 1390 MiB on the device** before the f16 weight work
+of 2026-09-04 and holds about 800 MiB on the device after it; 1190 MiB of the
+1390 was weights kept
+resident on purpose, which `--budget` makes the code give up when it must.
+
+## This device's ceilings, and the biggest kernel in a trunk
+
+🔴 **KNOW THE CEILING BEFORE CHASING IT.** `tools/gpu/probe-alu.js` runs
+multiply-adds out of registers with no memory in the way. On this M2 it reports
+**about 1220-1260 GFLOP/s scalar, 2420-2470 vec2, 4870-4980 vec4**, and ~400
+billion workgroup reads a second - so a vec4 multiply-add is 4x a scalar one,
+and every one of those is about 640 G instructions a second. **In f16 it reports
+2045-2121, 4090-4295 and 8279-8590.**
+
+🔴 **THE RATIO IS THE STABLE PART, NOT THE ABSOLUTES.** Two runs of this probe
+an hour apart differ by 3-4% on every arm, so a kernel quoted against one of
+them is quoted to about that. What does not move is that an f16 multiply-add
+issues at **1.7x** an f32 one for the same instruction. `shader-f16` is now
+requested by `requestAlphaFoldDevice`. Read a kernel's number against THAT, not
+against a specification sheet: the trunk's kernels sat at 900 GFLOP/s to
+1.1 TFLOP/s, which is 70-85% of the scalar ceiling and a quarter of the vector
+one. It is an instruction-count machine.
+
+🔴 **AND HALF PRECISION MOVED THAT CEILING, so the sentence above is about f32
+only.** After the f16 work of 2026-09-04 AF2's dense kernels run at 1140-1550
+GFLOP/s rather than 900-1100 - past the scalar ceiling, because their
+arithmetic is no longer scalar-equivalent - and `opm.contract` at 684 is the
+one left behind. See tools/gpu/profile-af2-block.js.
+
+🔴 **`grid.attend` IS THE BIGGEST KERNEL IN AN AF3 TRUNK AND IT IS ALREADY
+NEAR THIS DEVICE.** It is the only pass that grows as tokens CUBED, so its
+share grows with the protein: 18.3% of the trunk's GPU time at 200 tokens and
+**34.6% at 700**, where it is 203.8 ms a pass. `tools/gpu/bench-grid-attend.js`
+alternates arms in one process. Three plausible wins were tried and all three
+are dead:
+
+| what | at 400 tokens | verdict |
+|---|---|---|
+| skip the softmax rescale when the maximum does not move | 131.1 vs 125.5 ms | **0.957x, a loss** |
+| stage the keys and values in f16 rather than f32 | 127.1 vs 135.0 | 1.06x, so not BYTES |
+| the staged key chunk, 16 / 32 / 64 | 125.7 / 125.3 / 124.4 | nothing, so not BARRIERS |
+
+🔴 **AND THE ARITHMETIC SAYS WHY.** Per lane-key the kernel does about 160
+scalar operations (eight vec4 dot products, sixteen vec4 accumulator updates)
+and **64 scalar workgroup reads** (eight vec4 each of the key and the value).
+At 400 tokens that is 2.56e8 lane-keys, which against this device's measured
+ceilings - 610 G scalar FMA/s, ~400 G workgroup reads/s - is about 67 ms of
+arithmetic and 41 ms of workgroup traffic against 125 measured. It is balanced,
+and both halves are near their limit. That is why halving the tile's BYTES buys
+5% and halving the barriers buys nothing: neither reduces the number of
+operations.
+
+🔴 **AND THE REGISTER BLOCK WAS ATTEMPTED, AND IS THE WORST OF THE FOUR.**
+Giving a lane Q queries so one key read serves all of them divides the read
+term by Q and leaves the arithmetic alone, which is the right idea. It is
+bit-identical - checked at n=128 and n=192 against the reference, where Q of 1,
+2 and 4 agree to every digit - and it is catastrophically slower:
+
+| tokens | Q=1 | Q=2 | Q=4 |
+|---|---|---|---|
+| 256 | 45.1 ms | 78.8 (**0.57x**) | 166.5 (**0.27x**) |
+| 400 | 131.6 | 330.8 (**0.40x**) | 745.2 (**0.18x**) |
+
+Q x 8 vec4 of accumulators and Q x 8 of the query is 128 registers at Q=2, and
+it spills - the same 4x-the-wrong-way that `grid.project`'s row tile records at
+16. The code was reverted rather than kept behind a flag: parameterising the
+hottest kernel in the trunk over an arm nobody should use costs every later
+reader, and these numbers are worth more than the switch. **What is left is f16
+ARITHMETIC in the accumulator update**, whose ceiling is 1.7x - and see the
+next entry before trusting a bound on it.
+
+🔴 **AND check-af3-grid-attention.js WAS PASSING BY LUCK.** It builds its input
+as `deterministic(n * n * CHANNELS, 991 + n)` - a different random pair for
+every n - and it had only ever been run at its default of **24 tokens**. Run
+anywhere else, the f16 staged arm fails the 2e-3 bound that n=24 happens to
+give:
+
+| n | 24 | 32 | 33 | 36 | 48 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| f16 | 5.5e-4 | 1.1e-3 | 6.0e-4 | 1.2e-2 | 1.4e-2 | 7.1e-3 | 7.4e-3 |
+| f32 | 9.6e-7 | | | | 1.0e-6 | 1.2e-6 | 1.3e-6 |
+
+Not a trend in n - n=28 is worse than n=33 - but a spread over DRAWS, a factor
+of 26 wide. The f32 arm is flat at about 1e-6 throughout. So the bound measured
+one lucky input. It takes the worst of four draws now and the f16 bound is
+3e-2, which is what this input costs.
+
+🔴 **AND THE INPUT IS HARSHER THAN A FOLD, WHICH IS WHY THE SHIPPING PATH IS
+FINE.** f16 holds eleven mantissa bits, so a staged key is good to ~5e-4 - but
+the error lands in a LOGIT, and `exp` turns an absolute logit error into a
+relative weight error. Uniform noise makes large, poorly conditioned logits; a
+real pair representation does not, and the whole trunk still agrees with AF3 to
+**3.94e-4 end to end** with this same path on. Do not read 1e-2 here as a fold's
+error.
+
+🔴 **AND ONE DRAW AT n=192 PUTS THE f32 ARM AT 3.99e-4, WHICH IS 400x ITS NORM
+AND IS NOT EXPLAINED.** Only the UNTRANSPOSED module, and only draw 2 of four;
+the transposed module sees the same pair and measures 1.13e-6. It is the
+shipping kernel - the checker is what changed - so it is a real property of
+`pair_attention1` on some inputs at that size, found the day the checker
+stopped running at one shape. **Open.** `--n=192 --seeds=3 --precision=f32` is
+the reproduction.
+
+🔴 **THE FOUR KERNEL BENCHES EXIST BECAUSE bench-trunk.js COSTS FORTY SECONDS
+AND AVERAGES 48 BLOCKS.** Each synthesises its weights, runs one shader at
+several shapes interleaved in one process, and costs about a second an arm - and
+each checks every arm's output against the first, because a tile the dispatch
+does not match leaves rows unprocessed and reads as a speedup. Tune with those;
+confirm with `bench-trunk.js`.
+
+## Packed activations, the pair scratch, and buffers that can be one buffer
+
+🔴 **ACTIVATIONS CAN BE STORED TWO HALVES TO A WORD, AND `pack2x16float` IS
+CORE WGSL.** Unlike the `f16` TYPE, it needs no device feature, so a tensor
+halves on hardware that cannot compute in half precision at all.
+`src/runtime/storage.js` is the whole mechanism and `execution.allocate`'s
+fourth argument is how a caller asks. A 59-residue fold at 512 MSA rows went
+**603.0 -> 396.4 MiB** across four tensors, for 0.043 pLDDT, and got 4.5%
+faster where the reader re-reads (the flash kernel's key and value); where it
+does not, time is unchanged.
+
+🔴 **AND A WORD IS OWNED BY ONE INVOCATION OR IT IS A RACE.** WGSL cannot write
+sixteen bits, so a lane holding one half would read the word, insert and write
+it back while the lane holding the other half does the same. Every kernel
+converted had to be rearranged so the pair of elements sharing a word is
+produced by one lane: the layer norm walks channel PAIRS, and both tiled GEMMs
+give a lane a run of adjacent columns where they gave it lanesX-strided ones.
+`storedPair` takes a PAIR index and not an element index so a kernel that has
+not been rearranged has nothing to pass it.
+
+🔴 **AND IT IS FREE WHERE THE CONSUMER ALREADY NARROWS.** The transition's
+hidden activation is read by a kernel whose first act is `f16(source[...])`, so
+storing it narrowed loses nothing already lost - the fold came back BIT
+IDENTICAL, coordinates and all, 16 MiB lighter. Look for that shape first.
+
+🔴 **AND BOTH FAILURES WERE SILENT, BECAUSE EVERY SHAPE STILL AGREES.** A
+packed tensor and an f32 one of the same element count differ only in bytes,
+which nothing validates. Reading `normalized` as f32 in the pair-bias shader -
+it is `normalized` itself for the triangle attentions, and a separate tensor
+only for an MSA row attention - folded 59 residues at **pLDDT 27 with 5.3 A
+between consecutive alpha carbons**. Failing to thread `outputStorage` through
+`selectAttentionProjectKernel` had the projection write f32 where the flash
+kernel read packed, and the fold came back **NaN**. The unit test written to
+catch the second passed, because it compared cache KEYS and they already
+differed on the source storage: assert on the generated WGSL.
+
+🔴 **AN AF3 FOLD'S PEAK IS IN THE CONFIDENCE HEAD, NOT THE TRUNK OR THE
+DIFFUSION.** It runs four more pairformer blocks after the sampler, so it
+allocates the whole pair scratch again while the diffusion transformer's 378 MiB
+of resident weights are still held and unreadable by anything.
+`releaseResidentWeights(device, prefix)` gives a stage's residency back when the
+stage is over - `"w."` after the trunk, `"difftx."` after the sampler - and took
+a 272-token fold from **1214 to 671 MiB, 45%, for no time at all** and about half
+a second on a REPEAT fold, which is the re-packing. Mean pLDDT identical to every
+digit. Do this before reaching for kernels.
+
+🔴 **AF3's PAIR SCRATCH IS NOT PACKED ANY MORE, AND THE PARAGRAPH THAT USED TO
+BE HERE PRICED IT WRONGLY.** It recorded 1086.5 -> 896.1 MiB at 408 tokens for
+no measurable time and called it "a trade taken for LENGTH". Two things were
+missing from that. The COST was never measured on the checkers that could see
+it - see the table below, and a factor of 1200 on the pair representation. And
+the SAVING was mostly memory nothing was using: a seventh scratch buffer no
+code ever read, a readback held across the whole block loop, and a sixth buffer
+the grid attention did not need. With those three gone, unpacking costs 21.5
+MiB of a 610.8 MiB peak at 300 tokens. What survives from that paragraph is
+why AF2's packing DOES pay: its flash kernel re-reads its key and value once
+per query tile, so halving the bytes pays for the unpacking twice over, and
+nothing in AF3's pair track reads these more than once.
+
+🔴 **AND WHO OWNS A WORD IS A DIFFERENT ANSWER IN EVERY KERNEL.** The layer
+norms own whole rows and only had to walk words. `grid.project` gave a lane ONE
+output channel, so it had to take a PAIR - twice the accumulators - and its row
+tile had to fall from 8 to 4: bench-grid-project.js's `p` arms put packed at
+8.21 ms against 8.16 at rows 4, **11.01 against 7.54 at 8, and 42.64 against
+10.14 at 16**, which is the same register spill AF2's projection sweep records.
+The triangle's a and b pair by CHANNEL instead, because they are channel-major
+and `h * PAIRS + row` is odd at odd h when n is odd - n = 59 and n = 68 are the
+two sizes checked here, one of each, so half the suite would have passed.
+`scratch[3]` is still f32: it is the contraction's output, where `h` is group.z
+and one workgroup owns one channel.
+
+🔴 **AND A SUBSTITUTION ACROSS GENERATED SHADERS FAILS SILENTLY IN BOTH
+DIRECTIONS.** Two of them in one file in one afternoon: one matched NOTHING,
+because the indentation differed, and left a bias loop on the old column
+mapping; one matched TWICE, because `tile_weight[k * TILE_COLUMNS + local.x +
+column * 8u]` is in projectAB and in projectOutput, and broke the kernel that
+was not being changed. `a` was right, the contraction was right, and the fold
+came out at relRMS 1.42.
+
+🔴 **AND A DIFFERENTIAL THAT TESTS TWO KERNELS CANNOT FIND A BUG IN THE FIFTH.**
+tools/gpu/check-triangle-packed.js was wrong twice before it was right: first it
+unpacked with the generic `i >> 1` layout while the kernel pairs by channel -
+a permutation, reported as relRMS 1.39 against a correct kernel - and then,
+corrected, it declared both kernels sound while the fold stayed broken, because
+it ran a configuration nothing runs. Run the WHOLE update, and sweep the axes
+the caller varies (`direction`, `accumulatePrecision`), or it is a check of
+something else.
+
+🔴 **A STORAGE FORMAT MEASURED ON ONE STACK IS NOT A FACT ABOUT THE OTHER
+THREE.** `PAIR_SCRATCH_STORAGE` was a module constant that every caller of
+`compilePairTrack` inherited, and it was measured on the pairformer's own
+differential checker, which passes either way. FOUR stacks run that pair track,
+and every other checker that reaches one was over its bound the whole time:
+
+| | packed | unpacked | bound |
+|---|---|---|---|
+| `check-af3-confidence` stack pair | 3.71e-3 | **3.12e-6** | |
+| ...its PAE head | 2.88e-3 | **5.75e-6** | 7.1x envelope |
+| ...its PDE head | 3.29e-3 | **7.47e-6** | |
+| ...its pLDDT head | 6.88e-4 | **1.16e-4** | |
+| `check-af3-msa-block` | 1.82e-3 | **7.16e-6** | 1e-5 |
+| `check-af3-template` | 3.79e-5 | **2.52e-7** | 2e-5 |
+| `check-af3-trunk` pair | 1.04e-4 | **1.99e-5** | 4e-5 |
+
+A factor of 1200 on the pair representation that feeds pLDDT and PAE. The
+CONFIDENCE head is where it shows, because its four blocks amplify and its
+heads have the tightest envelopes in the repository; the trunk's own checker at
+n=24 barely moves, which is exactly why one checker is not enough.
+`UNPACKED_PAIR_SCRATCH` is what `compilePairTrack` defaults to now, and all
+four stacks take it. `PAIR_SCRATCH_STORAGE` stays exported and unused, with
+that table beside it.
+
+🔴 **AND A HALFWAY LAYOUT IS WORSE THAN EITHER, WHICH IS WHY IT WAS TRIED.**
+Bisected on the trunk's pair term, changing only the MSA stack: `a` and `b`
+cost 3x - they are MULTIPLIED against each other in the contraction, so their
+rounding squares - `normalized` costs 1.6x, and `hidden` and grid attention's
+output cost nothing measurable. Keeping only those two passes the TRUNK's bound
+at 3.11e-5 and still misses the MSA block's by 50x. Half the memory is not
+worth a checker that has to be told to expect less.
+
+🔴 **AND THE END-TO-END NUMBER COULD NOT SEE ANY OF IT.** `fold.js --dump`
+reports `pair vs AF3` at 4.03e-4 with the bad packing and 3.94e-4 without it,
+with mean pLDDT 85.6 either way. Forty-eight pairformer blocks are contractive
+enough to swallow a 1200x error in the term that feeds them, so the whole-fold
+gate is the WRONG instrument for a change inside one stage - and it is the one
+that gets run. Run the per-stage checkers when a stage changes.
+
+🔴 **AND THE PAIR TRACK NEEDS FIVE SCRATCH TENSORS, NOT SEVEN.** `scratch[6]`
+was never read by anything - `encodePairTrack` indexes 0 to 5, and so does
+every caller - and `scratch[5]` did not need to exist either: `grid.project` is
+the last pass that reads `scratch[0]` and it is encoded BEFORE the pass that
+wrote `scratch[5]`, so the grid attention writes its output back into
+`normalized`. 43.9 MiB each at 300 tokens.
+
+🔴 **AND A READBACK BUFFER BELONGS AFTER THE SCRATCH, NOT BEFORE THE LOOP.**
+Both pair-track stacks reserved their MAP_READ buffers up front and wrote them
+once, at the end - a pair-sized buffer standing beside the scratch for a whole
+48-block loop, at exactly the moment the trunk is fullest. Releasing the
+scratch first is what makes the peak move, because this allocator does not
+pool: release DESTROYS.
+
+Those three together, on a 300-token trunk pass at 32 MSA rows:
+
+| | peak | af3-block.scratch |
+|---|---|---|
+| packed, six buffers, readback in the peak | 589.3 MiB | 153.8 x6 |
+| unpacked, six, readback in the peak | 699.2 | 263.7 x6 |
+| unpacked, six, readback after | 654.8 | 263.7 x6 |
+| **unpacked, five, readback after** | **610.8** | **219.7 x5** |
+
+🔴 **AND A SAMPLER STEP CHANGES TWO INPUTS AND USED TO REBUILD EVERYTHING.**
+The diffusion head is called up to two hundred times down one schedule, and
+only the noisy coordinates and the noise level move. The per-atom conditioning,
+the reference conformer, the ten gathers, the trunk's pair and single, the
+encoder's query and key conditioning and masks, and the pair logits derived
+from them are the FOLD - all of it was rebuilt on the host and written across
+the bus once per step, and three tensors derived from it were recomputed on the
+GPU for the identical answer. `bench-head.js --profile` medians nine calls in
+one process, which is what to measure this with:
+
+| | 59 tokens | 200 tokens |
+|---|---|---|
+| before | 86 ms | 253 ms |
+| after | **71** | **206** |
+
+The mechanism is `persistent` beside `persistentUpload` in the atom encoder and
+decoder - the first keeps a tensor the blocks WRITE, the second keeps one they
+READ - plus `reusePair` in the conditioning module and `#pairNorm` in the
+transformer. The build closure is not called on a cache hit, so the host-side
+gathering inside it does not run either.
+
+🔴 **AND THE ENCODER HANDS THE DECODER DEVICE BUFFERS, NOT ARRAYS.** Its five
+static tensors were read back across the bus and uploaded again to make a
+second copy the peak then carried beside the first: 17 MiB at 59 residues.
+
+🔴 **WHAT IS LEFT IN A DENOISER STEP IS THE FOUR HOST-DEVICE ROUND TRIPS.** At
+59 tokens the stages sum to 71 ms and the labelled compute passes to about 52;
+the rest is one submit and one `mapAsync` per stage, because the head chains
+conditioning -> encoder -> transformer -> decoder through Float32Arrays.
+Caching the transformer's bind groups and scratch tensors bought nothing
+measurable against that - the stage sat at 45-46 ms either way - so the next
+thing there is chaining the stages ON THE DEVICE, not another cache.
+
+🔴 **AN ATTENTION'S OUTPUT CAN LIVE IN ITS NORMALISED INPUT, AND THAT IS TRUE
+IN BOTH MODELS.** The shape is the same everywhere: normalise into a tensor,
+project it into q/k/v/gate, attend into a fresh one, project out. The
+projection is the LAST pass that reads the normalised tensor and the attention
+is the NEXT pass to write, so they can be one buffer. Worth, per attention, one
+pair- or MSA-sized tensor:
+
+| | peak before | after |
+|---|---|---|
+| AF3 trunk, 300 tokens | 654.8 MiB | **610.8** |
+| AF2, 512 MSA rows | 396.4 | **365.2** |
+| AF2, 128 rows | 156.1 | **147.1** |
+
+`tools/gpu/fold-af2.js`'s checksum is unchanged at both depths and a 68-token
+AF3 fold is bit-identical, which is what says the aliasing is real and not a
+race.
+
+🔴 **AND ONLY WHERE THE TWO AGREE ABOUT THE ELEMENT.** AF2's normalised tensor
+is always packed and its projected ones are packed only where the
+register-resident flash kernel accepts them; where it does not, one is half the
+bytes of the other, and sharing would hand a shader a buffer of the wrong
+length - which is not something WebGPU can catch. The fallback allocates a
+second tensor.
+
+🔴 **AND A READBACK BUFFER IS THE OTHER HALF OF THE SAME HABIT.** Anything
+written once at the END of a stack should be allocated there, not beside the
+scratch at the top - see the trunk note above. Where the copy is encoded into
+the same command buffer as the work (the template embedder, the input
+embedder) it cannot be moved without splitting the submit, and those stages are
+not the peak.
+
+## Uploading weights, and what the host was doing while the device waited
+
+🔴 **AND THE OTHER TWO PREP PATHS ARE NOT WORTH TOUCHING, MEASURED.** AF3's
+`featuriseProtein` is **1 ms** at 200 tokens, and `perAtomConditioning` - which
+fold.js's own comment calls out as 119 ms - is **4 ms at 59 tokens and 17 at
+240**. That comment is stale; the one-hot it describes was fixed. Writing the
+archive is 28 ms for a 2 MB alignment.
+
+🔴 **QUANTISED WEIGHTS CAN BE DECODED ON THE GPU, AND IT IS 3.7x.** The path to
+a resident f16 buffer used to be: decode int5 into float32 on the main thread,
+narrow the lot into a Float16Array, upload. `src/runtime/quantised-upload.js`
+uploads the CODES instead - an eighth of the bytes - and decodes them into the
+destination with one dispatch per tensor. 437 ms of host packing becomes 119 of
+compute for the diffusion transformer's 24 blocks, and a real page fold went
+**3.31 s to 2.30**. `src/af3/device-weights.js` is the shared entry point;
+docs/AF3.md has the per-packer table.
+
+🔴 **AND BIT-IDENTITY WAS THE FIRST THING MEASURED, NOT THE LAST.** JavaScript
+computes `code * scale + zero` in f64 and WGSL has no f64. The product is exact
+in both - a 5-bit code times an f16 scale needs at most 16 mantissa bits - but
+the SUM can need more than f32's 24. `tools/gpu/check-int5-gpu.js` answered it
+on 131,072 synthetic elements spanning 10^-4 to 10^4 before any of the
+plumbing existed; `tools/gpu/check-block-upload.js` answers it on whole real
+blocks against the shipping packer. Both read **0 differ**.
+
+🔴 **AND ON A LAZILY BOUND WEIGHT OBJECT, `.length` IS THE DECODE.** Reading
+`block[name].length` materialises that tensor. `blockWeightOffsets` existed
+precisely to avoid building a buffer and was doing it anyway; the device
+planner would have undone its own point; and in the checker it silently made
+the host arm WARM and flattered the GPU by 234 ms of work it had itself caused.
+`stacked` records the range it will read, and that is the length.
+
+🔴 **AND `Float16Array.set` FROM A Float32Array IS NOT A MEMMOVE.** 8M elements
+measure 9.4 ms through `set`, 6.1 through a plain loop and 4.4 unrolled eight
+ways - bit-identical. `writeInto` in src/runtime/float16.js is that loop, and
+it leaves same-element copies to `set`, which really is a memmove. On real
+shapes it is 26% of the narrowing rather than 52%: a block is forty tensors
+averaging 200k elements, so per-call overhead is a much larger share than the
+microbenchmark suggests.
+
+🔴 **AND `memorySnapshot`'s `byLabel` IS CUMULATIVE, WHICH IS THE WRONG
+QUESTION.** It sums every allocation a label ever made, so a scratch tensor
+taken and returned once a block reads as forty-eight times its size - that is
+what CHURNS. `peakByLabel` is what was on the device when it was fullest and
+its rows sum to `peakBytes`; that is what says which tensor to attack, and it
+is what said ten tensors of 29.5 MiB were 295 MiB of a 552 MiB fold.
+`tools/gpu/fold-af2.js` prints both.
+
+## Where the other two models' memory is, measured rather than assumed
+
+🔴 **AF3 IS DONE, AND IT IS ONE TENSOR.** A 76-token fold peaks at **486.4
+MiB** and `difftx.block.resident` is **378.2 of it - 78%**, across 24 blocks.
+That is already the f16 form (it was 756 MiB in f32) and it has to stay
+resident: the diffusion transformer is called once per sampler step, 50 to 200
+times a fold, so streaming it per block would re-upload 378 MiB per step and
+decoding it from int5 per step is 119 ms x 50 against a 5 s fold. Everything
+else is under 15 MiB. There is no second thing to take.
+
+🔴 **AND AF2 IS FLAT, WHICH IS A DIFFERENT KIND OF DONE.** 59 residues at 512
+MSA rows with a recycle peaks at **365.2 MiB** - this file's own recorded
+figure - and the largest row is `embed.msa` at **16%**, with a long tail of
+attention tensors at 4% each. 128 rows reads 147.1 MiB, also the recorded
+figure. A flat profile has no single thing to attack, which is what the
+aliasing and packing work already recorded here left behind.
+
+🔴 **THE ONE CANDIDATE LEFT IS `embed.msa` UNDER RECYCLING, AND IT IS 8%.**
+Two live allocations carry that label at 512 rows with a recycle and one at
+128 rows without - the previous pass's MSA is the embedder's INPUT while the
+new one is its output. The previous is read exactly once, into
+`embed.previous-msa-normalized`, by the first dispatch of the encoder; every
+later dispatch writes the new one. So they could be one buffer, ordered within
+the encoder, for 29.5 MiB of 365. It is not taken because it is an ownership
+change through TWO recycle loops (`src/evoformer/input-embedder.js` and
+`src/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
+(-2047044 at 512 rows and one recycle) is what would have to gate it.
+
+🔴 **SO THE EF2 RESULT DOES NOT GENERALISE, AND THE REASON IS INSTRUCTIVE.**
+EF2-fast gave up 45% because nobody had ever read its peak by label - its fold
+tool printed a total and nothing else, where AF3's and AF2's have printed
+`peakByLabel` for a long time. The win was not that EF2 was written worse; it
+was that it had never been looked at with the instrument the other two had.
+**Check whether a thing has been measured before concluding it is optimal.**
+
+## Upstream's optimisation work, tried here
+
+`martin-steinegger/alphafold2-webgpu` is the `upstream` remote. The trees have
+diverged too far to merge - 187 commits there, 518 here, and theirs is
+TypeScript - so what transfers is findings, not code. Three were tried on this
+M2. One is a large win, one does not reproduce, and one is the opposite of what
+their hardware says.
+
+🔴 **THE SUBGROUP MATRIX UNITS EXIST ON THIS DEVICE, AND THEY BEAT THE f16
+KERNEL WHILE COMPUTING THE f32 ONE.** `chromium-experimental-subgroup-matrix` is
+advertised by this adapter and the WGSL compiles;
+`tools/gpu/probe-subgroup-matrix.js` reports what it offers, which is
+**8x8x8 at f32/f32 and 8x8x8 at f16/f16** - note there is no f16-input,
+f32-accumulate configuration here, so the f16 units accumulate in f16 and are a
+different accuracy question. `tools/gpu/gemm-matrix.js` is the candidate kernel
+and `bench-evoformer-linear.js` has `matrix<blocks>` arms. Against the shipped
+dense projection, medians of nine interleaved in one process:
+
+| shape | f32 8x8 | shipped f16 | **matrix f32** | vs f32 | vs shipped |
+|---|---:|---:|---:|---:|---:|
+| MSA transition, first half | 17.14 ms | 14.21 | **12.25** | 1.40x | 1.16x |
+| ...second half | 16.69 | 14.11 | **10.80** | 1.55x | 1.31x |
+| structure/confidence single | 0.188 | 0.150 | **0.088** | 2.14x | 1.70x |
+| a long chain's pair transition | 3.63 | 3.13 | **2.73** | 1.33x | 1.15x |
+
+The matrix arm's relRMS against the f32 kernel is **0**, at every shape and
+every row count tried - it accumulates in f32, so there is no accuracy gate to
+pass. That is the whole point: this repository buys 1.15x-1.31x today by
+rounding to half precision, and the matrix units buy the same or more by not.
+`requestAlphaFoldDevice` now asks for the feature (optionally, so a browser
+without it never sees it requested); nothing in `src/` uses it yet.
+
+🔴 **AND THE SECOND ROW OF THAT TABLE IS NOT A SHIPPABLE 1.31x, BECAUSE THAT
+KERNEL'S SOURCE IS PACKED.** Every arm in `bench-evoformer-linear.js` reads an
+f32 source, so the arms compare fairly with each other and only the FIRST half's
+shape is the configuration that ships: `block.js` stores the transition's hidden
+activation as `f16` whenever `hiddenChannels % 4 == 0`, which the MSA
+transition's 1024 and the pair transition's are, and the second matmul reads it
+through `storedElement` - an `unpack2x16float` expression. `subgroupMatrixLoad`
+cannot consume an expression. So taking the matrix path there means storing
+`hidden` unpacked, which src/runtime/storage.js records as 16 MiB at 512 MSA
+rows for a BIT-IDENTICAL fold - a free win being given back. That is a real
+trade to weigh, not a number to quote.
+
+🔴 **AND AN OUT-OF-BOUNDS `subgroupMatrixLoad` RETURNS AN ENTIRELY ZERO MATRIX
+HERE, WHICH IS NOT WHAT UPSTREAM'S KERNEL ASSUMES.** Their bounded kernel runs
+the matrix path everywhere and bounds-checks only in the store, on the stated
+reasoning that "loads past the end of a tensor are clamped by WGSL's robustness
+rules, so a partial region computes garbage exactly in the rows and columns that
+do not exist". On this device it does not. `check-subgroup-matrix.js` loads an
+8x8 tile from a buffer holding five rows and **every row comes back zero** -
+relRMS 1.0 across the whole tile, the five present ones included. A scalar read
+of that buffer is clamped; a matrix read of it is refused wholesale. The first
+version of `gemm-matrix.js` was exact whenever M was a multiple of 32 and read
+0.153 at 59 rows, which is what that looks like.
+
+So the load has to stay in range. The last region on each axis **slides back**
+to end on the final row and column instead of hanging over the edge; the overlap
+recomputes rows with the same inputs and writes the same values, and the kernel
+then needs at least one whole region per axis. That is a documented restriction
+rather than a silent wrong answer - which is what the 64x128 arm still gives
+below 64 rows.
+
+🔴 **AND THE SEMANTICS WERE PINNED BEFORE ANYTHING WAS TIMED.** The type
+parameters are `<T, columns, rows>` and at the only shape this device offers -
+8x8x8 - getting that backwards is invisible in the declaration and visible only
+in the answer. `check-subgroup-matrix.js` multiplies one asymmetric 8x8 pair
+whose product is known on the host and scores the seven interpretations a
+transpose could produce: plain row-major `A@B` at **relRMS 0**, everything else
+above 1.1. A bench run before that check would have been timing a transpose.
+
+🔴 **AND THE 64x128 GEOMETRY IS A REAL LOSS HERE, WHICH TOOK TWO GOES TO SAY.**
+Upstream reports the shipped-grid geometry at 1.28x-1.66x, worth about a fifth
+of the win. The first arm written here read 122-172 GFLOP/s against 1082-1466
+for the 32x32 one, and that was an implementation fault, not a device fact:
+holding 8x16 accumulator tiles is 128 of them, 8192 floats a subgroup, and it
+spills - the same 4x-the-wrong-way `grid.project`'s row tile records at 16.
+`subBlocks`/`subColumnBlocks` walk the region a sub-region at a time instead, so
+the register budget is flat and the geometry is the caller's; `matrix8x16x4x4`
+is that arm, and it is exact (relRMS 0 at 64 and at 128 rows).
+
+It is still a loss, by a factor of four, and now the number means something:
+
+| shape | 32x32 | 64x64, walked 4x4 | 64x128, walked 4x4 | 64x128, walked 8x8 |
+|---|---:|---:|---:|---:|
+| transition, first half | **1284** | 590 | 306 | 210 |
+| ...second half | **1456** | 717 | 361 | 250 |
+| a long chain's pair transition | **1082** | 441 | 230 | 167 |
+
+One workgroup is one subgroup - the store's uniformity requirement - so a 64x128
+region is an EIGHTH of the workgroups doing eight times the sequential work, and
+this device would rather have the occupancy. Upstream's M4 Pro would not, which
+is the same shape of disagreement as the queries-per-invocation one below. **So
+the grid-compatibility problem is not a fifth of the win here, it is all of it**:
+a caller taking this path needs a matrix-specific dispatch grid, not the one
+`gemmGrid` derives from the shipped tile.
+
+🔴 **AND AF3's PROJECTIONS ARE ALREADY AT THE MATRIX CEILING, SO THE WIN IS
+AF2's ALONE.** The trunk's two hottest dense passes were measured against a
+matrix GEMM of identical M, K and N - 40000 x 128 x 512 at 200 tokens - **timed
+in the same process**, because a comparison drawn across two runs of anything
+here is inside this machine's drift, and the cross-process version of exactly
+this comparison read 4.14 against 4.70 ms and would have said the opposite:
+
+| | shipped | matrix f32 | |
+|---|---:|---:|---|
+| `grid.project` (row tile 8) | **1287 GFLOP/s** | 1131 | the fused kernel wins by 1.14x |
+| `tri.project` (32x16) | 1073 | **1125** | 1.05x, inside the noise |
+
+`--matrix=1` on `bench-grid-project.js` and `bench-triangle-project.js` is that
+arm. Both AF3 kernels are FUSED - one read of the normalised pair
+representation, four projections out of it, two of them through a sigmoid gate -
+and that fusion is worth about what the matrix units are. AF2's transition is a
+generic unfused `createLinearShader`, which is exactly why the matrix path beats
+it by 1.16x-1.31x and does not beat these. **Ask what a kernel already fuses
+before pricing its arithmetic.**
+
+🔴 **PACKING THE ATTENTION VALUE COSTS NOTHING HERE, BECAUSE THIS KERNEL HAD
+ALREADY ROUNDED IT.** Upstream found that packing the flash kernel's keys AND
+values moved an evoformer block's MSA output 4.06e-4 from AlphaFold's own
+intermediates against a 5e-5 allowance, with the value alone reproducing 4.05e-4
+- a key's error is normalised away by the softmax, a value's is averaged under
+weights summing to one and lands undamped. They now pack keys only. This tree
+packs all four projected tensors, so it looked like the same bug.
+
+It is not, and the reason is `chunk16`: the default flash kernel stages the key
+and value chunks as `vec4<f16>` in workgroup memory **whatever the tensors are
+stored as**, so the value is half precision by the time it is used either way.
+`tools/gpu/check-attention-packing.js` against a CPU reference, with the dense
+kernels forced to f32 so the storage is the only rounding left:
+
+| | flash f32 | flash chunk16 (the default) |
+|---|---:|---:|
+| nothing packed | 1.9e-7 | 8.97e-5 |
+| query/key/gate packed | 1.30e-4 | 1.53e-4 |
+| **value packed** | 8.09e-5 | **8.97e-5** - unchanged |
+| both | 1.53e-4 | 1.53e-4 |
+
+So unpacking the value buys nothing under the shipped kernel and costs a
+tensor's bytes; `ATTENTION_VALUE_STORAGE` stays `f16`. The mechanism to separate
+them exists now and is threaded through `selectAttentionFlashKernel`,
+`selectAttentionProjectKernel` and `block.js`, because the answer is a property
+of the precision and would change on a device without `shader-f16` - where the
+value costs 8.09e-5 and is the SMALLER of the two terms, not the larger.
+
+🔴 **AND `inputStorage` IS THREE TENSORS, NOT THE KEY.** It is the query, the key
+and the gate, and the query and the gate are read once per invocation rather than
+once per key - so the 1.30e-4 row above is not "what the key costs". Two of those
+three are narrowed for no bandwidth at all.
+
+🔴 **AND `AttentionGpu` HAD NEVER RUN THE STORAGE THE MODEL RUNS.** It took no
+storage option at all, so `check-evoformer-attention.js` - AF2's only attention
+differential - was checking an all-f32 configuration that nothing ships, which
+is the same fault as a checker building its own kernel. Storage is an axis
+there now, and the packing checker asserts its four arms compiled four DIFFERENT
+shaders, because a storage option that never arrives reports perfect agreement.
+
+🔴 **AND A PACKED WORD'S TWO COLUMNS ARE A PROPERTY OF THE LAYOUT, SO EVERY
+PACKED BINDING DECIDES IT.** The projection's column mapping was gated on
+`packOut` alone - the flag for query, key and gate. Packing only the VALUE kept
+the lanesX-strided mapping and then wrote `pack2x16float(hd_0, hd_1)`, two
+columns EIGHT apart, into the word belonging to `hd_0` and `hd_0 + 1`. Every
+shape agreed, nothing was out of bounds, and the attention scored **relRMS
+0.528** against its reference. It follows `packOut || packValue` now.
+
+🔴 **AND TWO QUERIES AN INVOCATION IS 4.8x SLOWER HERE, WHERE UPSTREAM'S OTHER
+DEVICE WANTS IT.** Their `attentionFlashKernelForShape` gives an invocation two
+queries once a shape reaches 128, from a GB10 measurement of 1.17x-1.42x for 128
+to 1024 queries; on their M4 Pro it is 2.2x slower and they replaced the
+threshold with a probe. This kernel has the same knob and selection has never
+used it, and `bench-msa-attention.js` says why - at 512 queries, 59 batch, 8
+heads:
+
+| | q1 | q2 | q4 |
+|---|---:|---:|---:|
+| `auto/c` | 17.03 ms | 82.48 (**0.21x**) | 196.28 (**0.12x**) |
+
+Bit-comparable at 2.84e-7, and catastrophic, which is the same register-spill
+shape AF3's `grid.attend` records at Q=2 and Q=4. So nothing changes here; what
+is worth taking from upstream is that the ratio is a DEVICE property and the
+answer differs by a factor of six between two of them.
+
+🔴 **AND WHERE THE MATRIX UNITS WOULD PAY, BY MODEL.** The share that is a dense
+projection at all, from `profile-af2-block.js --sequences=512` and
+`bench-trunk.js --profile --tokens=200`:
+
+| | AF2 (monomer, multimer) | AF3 (af3, openbind0) |
+|---|---|---|
+| plain GEMM passes | **65%** of an 83.1 ms block | **49%** of a 3372 ms trunk |
+| fused GEMM | - | `pair-transition`, a further 18% |
+| out of reach | the two flash attentions, 20% | `grid.attend`, 19% |
+
+AF2's dense work is `createLinearShader` and the attention's own projection, so
+the table at the top applies to it directly. AF3's two hottest were measured and
+are at the ceiling already - see above - which leaves `pair-transition` as the
+only one that might still move: it fuses a LayerNorm, two matmuls and a gate,
+and is 59% arithmetic rather than bandwidth. It is also the furthest from a
+drop-in, and the two that WERE measured both say fusion is worth as much as the
+units are.
+
+🔴 **AND THE CALLERS ARE THE OBSTACLE, NOT THE KERNEL.** `subgroupMatrixLoad`
+cannot consume a WGSL expression: it needs a typed binding, a base offset and a
+stride. Every generated kernel here takes its operands as expressions, which is
+what lets a caller read a packed activation through `unpack2x16float` or window
+a tensor past a binding limit - so the matrix path cannot be made invisible the
+way half precision was. A caller has to declare that its operand IS a plain
+array with a known stride. That is the reason this stops at a measurement.
+

@@ -65,6 +65,96 @@ function gather(count) {
 }
 
 /**
+ * The six atom gathers, from a token layout and its compacted atom list.
+ *
+ * 🔴 EXTRACTED SO THE STRUCTURAL TOKENISER CAN REUSE IT RATHER THAN COPY IT.
+ * OpenDDE folds a REGROUPING of these same atoms (see structural-tokens.js), so
+ * it needs exactly this construction over a different (token, slot) layout -
+ * and a second copy of a windowing rule this delicate is how the two would
+ * drift. Everything here is a function of its arguments; nothing reads the
+ * enclosing featuriser.
+ *
+ * @param {{tokens: number, dense: number, realAtoms: ArrayLike<number>,
+ *          pseudoBetaSlot: ArrayLike<number>}} layout
+ */
+export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot }) {
+  const atomCount = realAtoms.length;
+  const subsets = Math.ceil((tokens * dense) / QUERIES);
+  // token_atoms_to_queries: query slot -> flat token-atom, the compacted list.
+  const tokenAtomsToQueries = gather(subsets * QUERIES);
+  for (let query = 0; query < atomCount; query += 1) {
+    tokenAtomsToQueries.indices[query] = realAtoms[query];
+    tokenAtomsToQueries.mask[query] = 1;
+  }
+
+  // queries_to_token_atoms: its inverse, laid out over the dense (token, slot)
+  // grid, masked exactly where an atom is real.
+  const queriesToTokenAtoms = gather(tokens * dense);
+  for (let query = 0; query < atomCount; query += 1) {
+    queriesToTokenAtoms.indices[realAtoms[query]] = query;
+    queriesToTokenAtoms.mask[realAtoms[query]] = 1;
+  }
+
+  // queries_to_keys: a contiguous window per subset of 32 queries, centred on
+  // it and SHIFTED IN-BOUNDS at the ends rather than truncated - every subset
+  // sees exactly `keys` of them.
+  //
+  // 🔴 THE WINDOW IS CLAMPED AGAINST THE REAL ATOM COUNT, NOT subsets * 32.
+  // The query layout is padded out to the dense grid (51 subsets for 574
+  // atoms here), so clamping against the padded length would slide the last
+  // windows off the end of the molecule and into masked slots.
+  //
+  // 🔴 AND THE WINDOW NEVER EXCEEDS THE MOLECULE, so there is no such thing as
+  // a padded KEY. AlphaFold 3 pads because JAX wants static shapes; nothing
+  // here does - the kernels are generated per shape and size their workgroup
+  // storage from `keys`. Above 128 atoms the clamp already guaranteed this and
+  // measured it: `tools/gpu/probe-ablate.js` reports zero padded keys at 143
+  // atoms and above. BELOW 128 the window could not fit, and 288 of a
+  // 4-residue chain's 384 key slots were padding, each gathering reference
+  // space ZERO - which collides with the first conformer's own uid and makes
+  // every one of them a valid neighbour of residue 0. That is the released
+  // AF3 bug OpenFold3 trained around, and it cannot occur here at any size
+  // now, so `maskPaddedKeys` has nothing left to switch off.
+  const keys = Math.min(KEYS, atomCount);
+  const queriesToKeys = gather(subsets * keys);
+  const tokensToQueries = gather(subsets * QUERIES);
+  const tokensToKeys = gather(subsets * keys);
+  const tokenOfQuery = new Int32Array(atomCount);
+  for (let query = 0; query < atomCount; query += 1) {
+    tokenOfQuery[query] = (realAtoms[query] / dense) | 0;
+  }
+  const lastStart = Math.max(0, atomCount - keys);
+  for (let subset = 0; subset < subsets; subset += 1) {
+    const start = Math.min(Math.max(subset * QUERIES - (keys - QUERIES) / 2, 0), lastStart);
+    for (let key = 0; key < keys; key += 1) {
+      const query = start + key;
+      const at = subset * keys + key;
+      if (query >= atomCount) continue;
+      queriesToKeys.indices[at] = query;
+      queriesToKeys.mask[at] = 1;
+      tokensToKeys.indices[at] = tokenOfQuery[query];
+      tokensToKeys.mask[at] = 1;
+    }
+    for (let slot = 0; slot < QUERIES; slot += 1) {
+      const query = subset * QUERIES + slot;
+      if (query >= atomCount) continue;
+      const at = subset * QUERIES + slot;
+      tokensToQueries.indices[at] = tokenOfQuery[query];
+      tokensToQueries.mask[at] = 1;
+    }
+  }
+
+  const tokenAtomsToPseudoBeta = gather(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    tokenAtomsToPseudoBeta.indices[token] = token * dense + pseudoBetaSlot[token];
+    tokenAtomsToPseudoBeta.mask[token] = pseudoBetaSlot[token] >= 0 ? 1 : 0;
+  }
+
+  return { subsets, keys, atomCount, tokenAtomsToQueries, queriesToTokenAtoms,
+           queriesToKeys, tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta };
+}
+
+/**
  * @param {string} sequence one-letter codes; anything unrecognised becomes UNK
  * @param {{msa?: number[][], deletionMatrix?: number[][], unpairedFrom?: number}}
  *   [options] extra MSA rows, each already tokenised to AF3 aatypes and the
@@ -447,75 +537,10 @@ export function featuriseProtein(sequence, options = {}) {
 
   const atomCount = realAtoms.length;
 
-  // token_atoms_to_queries: query slot -> flat token-atom, the compacted list.
-  const tokenAtomsToQueries = gather(subsets * QUERIES);
-  for (let query = 0; query < atomCount; query += 1) {
-    tokenAtomsToQueries.indices[query] = realAtoms[query];
-    tokenAtomsToQueries.mask[query] = 1;
-  }
-
-  // queries_to_token_atoms: its inverse, laid out over the dense (token, slot)
-  // grid, masked exactly where an atom is real.
-  const queriesToTokenAtoms = gather(tokens * DENSE);
-  for (let query = 0; query < atomCount; query += 1) {
-    queriesToTokenAtoms.indices[realAtoms[query]] = query;
-    queriesToTokenAtoms.mask[realAtoms[query]] = 1;
-  }
-
-  // queries_to_keys: a contiguous window per subset of 32 queries, centred on
-  // it and SHIFTED IN-BOUNDS at the ends rather than truncated - every subset
-  // sees exactly `keys` of them.
-  //
-  // 🔴 THE WINDOW IS CLAMPED AGAINST THE REAL ATOM COUNT, NOT subsets * 32.
-  // The query layout is padded out to the dense grid (51 subsets for 574
-  // atoms here), so clamping against the padded length would slide the last
-  // windows off the end of the molecule and into masked slots.
-  //
-  // 🔴 AND THE WINDOW NEVER EXCEEDS THE MOLECULE, so there is no such thing as
-  // a padded KEY. AlphaFold 3 pads because JAX wants static shapes; nothing
-  // here does - the kernels are generated per shape and size their workgroup
-  // storage from `keys`. Above 128 atoms the clamp already guaranteed this and
-  // measured it: `tools/gpu/probe-ablate.js` reports zero padded keys at 143
-  // atoms and above. BELOW 128 the window could not fit, and 288 of a
-  // 4-residue chain's 384 key slots were padding, each gathering reference
-  // space ZERO - which collides with the first conformer's own uid and makes
-  // every one of them a valid neighbour of residue 0. That is the released
-  // AF3 bug OpenFold3 trained around, and it cannot occur here at any size
-  // now, so `maskPaddedKeys` has nothing left to switch off.
-  const keys = Math.min(KEYS, atomCount);
-  const queriesToKeys = gather(subsets * keys);
-  const tokensToQueries = gather(subsets * QUERIES);
-  const tokensToKeys = gather(subsets * keys);
-  const tokenOfQuery = new Int32Array(atomCount);
-  for (let query = 0; query < atomCount; query += 1) {
-    tokenOfQuery[query] = (realAtoms[query] / DENSE) | 0;
-  }
-  const lastStart = Math.max(0, atomCount - keys);
-  for (let subset = 0; subset < subsets; subset += 1) {
-    const start = Math.min(Math.max(subset * QUERIES - (keys - QUERIES) / 2, 0), lastStart);
-    for (let key = 0; key < keys; key += 1) {
-      const query = start + key;
-      const at = subset * keys + key;
-      if (query >= atomCount) continue;
-      queriesToKeys.indices[at] = query;
-      queriesToKeys.mask[at] = 1;
-      tokensToKeys.indices[at] = tokenOfQuery[query];
-      tokensToKeys.mask[at] = 1;
-    }
-    for (let slot = 0; slot < QUERIES; slot += 1) {
-      const query = subset * QUERIES + slot;
-      if (query >= atomCount) continue;
-      const at = subset * QUERIES + slot;
-      tokensToQueries.indices[at] = tokenOfQuery[query];
-      tokensToQueries.mask[at] = 1;
-    }
-  }
-
-  const tokenAtomsToPseudoBeta = gather(tokens);
-  for (let token = 0; token < tokens; token += 1) {
-    tokenAtomsToPseudoBeta.indices[token] = token * DENSE + pseudoBetaSlot[token];
-    tokenAtomsToPseudoBeta.mask[token] = pseudoBetaSlot[token] >= 0 ? 1 : 0;
-  }
+  const {
+    keys, tokenAtomsToQueries, queriesToTokenAtoms, queriesToKeys,
+    tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
+  } = atomGathers({ tokens, dense: DENSE, realAtoms, pseudoBetaSlot });
 
   // The MSA. Row zero is the query; anything the caller supplies follows.
   const extra = options.msa ?? [];

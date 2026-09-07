@@ -1459,3 +1459,310 @@ sampler sweep can and cannot tell you:
 
 Still to re-run: the flow-versus-diffusion step counts, and the ligand-only
 HEM-forms-by-8-steps observation the default was chosen from.
+
+## Templates, and where the slots are placed
+
+🔴 **AND foldAf3 PLACES THE SLOTS, BECAUSE ONLY THE FEATURISER KNOWS THE TOKEN
+LAYOUT.** A slot is indexed by TOKEN; a modified residue is one token PER ATOM
+and a ligand is a chain of its own, so a chain's first token is not the sum of
+the preceding chains' residue counts. Callers hand over TEXT and a chain index,
+and `batch.chainOfResidue` / `batch.residueOfToken` do the placing. The earlier
+offset version had a matching bug:
+
+🔴 **A SLOT BUILT BEFORE THE BINDER'S LENGTH IS KNOWN IS BUILT AT THE WRONG
+OFFSET.** Protein Hunter draws its designed chain inside the loop, so
+`chains[0].length` is 0 when the templates are fetched - which made the complex
+53 tokens instead of 69 and put the target's template across the binder. It
+folded, and it moved ipTM from 0.324 to **0.533**, which looks like a template
+working well. The binder's length is passed in now.
+
+🔴 **AND THE TEMPLATE EMBEDDER IS NO LONGER UNCHECKABLE.**
+`tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a
+real structure as its template and captures the module's inputs and its
+per-slot outputs. That answers the objection at the top of
+`src/af3/template-reference.js` - "with no template the six geometry features
+are identically zero, so nothing here can tell a correct implementation of them
+from a wrong one" - which was true and is the reason only the empty-slot path
+exists. See docs/AF3.md's template entry for the numbers.
+
+It writes the template's mmCIF from the PDB's OWN ATOM NAMES rather than
+through atom37. ColabDesign2's `_mmcif_for` does the same job but reaches AF2's
+`residue_constants`, which imports `dm-tree` - not installed here, and not
+worth installing to copy 37 strings that every PDB line already spells out.
+
+## A second set of weights: the dialect
+
+🔴 **THE MODEL IS OpenBind-0, AND THE NUMBER IS PART OF THE NAME.** Upstream's
+announcement (openbind.uk, 2026-08-21) calls it that and points at
+`aqlaboratory/openfold-3` releases/tag/v0.5.0, which is the release ported
+here. Their registry's bare `openbind` is a name a LATER release would answer
+to as well - which is exactly how `openfold3` came to mean two models with
+different forward conventions and sent this port reading notes about the wrong
+one. So the family, the dialect, the bundle and the manifest's `model.name` all
+say `openbind0`, and `dialectFor("openbind1")` RAISES rather than resolving.
+`openbind` stays as an alias in two places only - `DIALECT_ALIASES`, because
+upstream publishes the blob under that name, and `MODEL_ALIASES`, for `?model=`.
+
+🔴 **OPENBIND IS NOT OPENFOLD3, AND READING THE OF3 PORTING NOTES WHOLESALE GETS
+TWO THINGS BACKWARDS.** `../alphafold3/OF3_AF3_PORTING_NOTES.md` describes
+OpenFold3 **preview-2** (`of3-p2-155k.pt`). OpenBind is OpenFold3 **v0.5.0**, a
+separate model in that checkout's `model_config.MODELS`, and it moved TOWARD
+AlphaFold 3 in exactly the two places that would have cost the most here:
+
+- **the column attention's pair bias.** Preview-2 computes `Linear(z[k, q])`;
+  AF3's Algorithm 15 says `Linear(z[q, k])`. Upstream's list is
+  `TRANSPOSED_COLUMN_PAIR_BIAS` and **openbind is deliberately not in it**, so
+  `swapTransposedBias` stays **false** - the same value stock AF3 uses. The flag
+  already in `fold.js` reads "stock AF3 is false, the openfold3 lineage true",
+  which is about the OTHER release; taking it as "the non-AF3 dialect" would
+  transpose the bias in the pairformer, the MSA stack, the template embedder and
+  the confidence head against weights that do not want it.
+- **the diffusion transformer's pair LayerNorm**, which preview-2 runs per block
+  and v0.5.0 runs once for the whole stack, as AF3 does. Their release note:
+  "Moved the pair layer norm in the diffusion transformer out of attention pair
+  bias. The pair layer norm is run once to match the AlphaFold3 SI."
+
+🔴 **SO THE RUNTIME PORT IS THREE BRANCHES, NOT THIRTY.** Everything else in
+those notes is absorbed by the weight converter, because it is a row permutation
+of a weight matrix: the residue-alphabet permutation, the i/j crossing between
+AF3's two pair-embedding sites, the SwiGLU gate/value concatenation, and the
+element index shift - `one_hot(e - 1) @ W` is exactly
+`one_hot(e) @ W[max(0, arange - 1)]`, which `converters/common.py` proves to
+max|d| = 0. `src/af3/dialect.js` is the table:
+
+| flag | what changes | where |
+|---|---|---|
+| `symmetriseBonds` | the token bond matrix sets `[j][i]` too | `featurise.js` |
+| `maskPaddedKeys` | `offsets_valid &= keys_mask` in the atom cross-attention | `atom-encoder-{reference,webgpu}.js` |
+| `padSingleCondUnknownDna` | the diffusion single conditioning is 833 channels, not 831 | `diffusion-{reference,conditioning-webgpu}.js` |
+
+🔴 **AND THE BUNDLE NAMES ITS OWN GRAPH, so a caller cannot pair them wrongly.**
+`af3Dialect(store)` reads `manifest.model.name` - which `export_af3_model.py`
+has always written - and `trunkWeights`, `confidenceWeights`, `diffusionWeights`
+and `targetFeatureWeights` each stamp it onto what they return. An unnamed
+bundle RAISES rather than defaulting to stock: a ported checkpoint folded
+through AF3's branches returns a structure, which is the failure this exists to
+prevent.
+
+🔴 **A ZERO COLUMN IS FREE BEFORE A LINEAR AND IS NOT FREE BEFORE A LAYERNORM.**
+That is the whole of the third flag. OpenFold3's restype and profile blocks
+carry 32 classes to AF3's 31, and everywhere else the extra class is dropped
+from the converted weights because a column that is always zero contributes
+nothing to a matrix multiply. The diffusion single conditioning LayerNorms its
+concatenation, so a zero input maps to `-mean/std` AND the width becomes 833:
+upstream measures dropping the two columns at 2.2e-3 against 3.4e-7.
+
+🔴 **AND THE GPU FIX IS A SENTINEL, NOT A NINTH BINDING.** `maskPaddedKeys` is a
+boolean AND in the CPU reference. On the GPU the keys' reference space is
+already in the gathers buffer, real space uids are counters and never negative,
+so writing **-1** into a padded key makes the equality test fail on its own -
+which is `(q == k) && keys_mask` exactly, with no shader change and no extra
+storage buffer. The QUERIES stay at zero: upstream gates on `keys_mask` alone,
+and masking both would be a third model. The comment beside it that says a
+sentinel "is the tidier choice and a different model; it cost 3.1e-2" is about
+the STOCK dialect and is still true there.
+
+🔴 **BOTH ARE CHECKED BY SWEEPING THE DIALECT AS AN AXIS, WITH A DISCRIMINATING
+CONTROL.** Two arms agreeing with their reference says the GPU matches the CPU;
+it does not say the flag reached either. `check-af3-atom-encoder.js` and
+`check-af3-diffusion-conditioning.js` both fail if the openbind arm does not
+DIFFER from the stock one. Measured:
+
+| | openbind vs alphafold3 | each arm vs its reference |
+|---|---|---|
+| atom encoder `pairCond` | **7.77e-2** | 2.48e-7 |
+| ...`tokenAct` | 2.96e-6 | 9.48e-6 |
+| ...`skipConnection` | 3.72e-6 | 2.05e-5 |
+| single conditioning | **1.54e-3** (2370x) | 6.48e-7 |
+
+🔴 **AND THE ENCODER'S OUTPUT BARELY MOVES, WHICH IS NOT A BUG.** The atom pair
+conditioning moves by 7.8e-2 because that is where a padded key's offset term
+lived; almost none of it reaches `tokenAct`, because the attention masks those
+same keys anyway. What leaks is the mask bias being a large FINITE negative
+rather than -infinity, so a padded key keeps a softmax weight of about 1e-6. So
+the control is "some output moved past its envelope", not "every one did" -
+demanding all three fails on a correct implementation.
+
+🔴 **AND THE STOCK PATH IS BIT-IDENTICAL, WHICH IS THE OTHER HALF OF THE GATE.**
+`tools/gpu/fold.js` before and after the dialect work: PDB SHA
+`aef231158a174daf` both ways, mean pLDDT 86.13324126798517 and pTM
+0.7378317753181738 to every digit. Per-stage: target_feat 7.98e-8, denoiser
+1.28e-4, atom encoder 9.48e-6 / 2.05e-5 - every one of them the figure already
+recorded in this file.
+
+🔴 **AND OpenBind FOLDS, WITH ITS OWN NUMBERS.** `openbind.bin.zst` is
+published already converted, `read_blob` in `tools/export_af3_model.py` now
+reads that format directly - no torch, no 2.3 GB checkpoint, no second checkout
+- and the two existing tools do the rest:
+
+```
+python3 tools/export_af3_model.py --model openbind --include diffuser \
+  --out model-openbind-full-f32           # 406 tensors, 368.4 M, 1405 MiB
+python3 tools/quantize_af3.py --source model-openbind-full-f32 \
+  --out model-openbind-int5               # 264.6 MiB, 5.31x
+node tools/gpu-chrome.mjs tools/gpu/fold.js --model=/model-openbind-int5/manifest.json
+```
+
+Scored against `tools/fixtures/6mrr-crystal.pdb`, both bundles at int5:
+
+| | RMSD | TM | pLDDT | CA-CA |
+|---|---|---|---|---|
+| alphafold3 | **0.67 A** | **0.952** | 85.8 | 3.82 |
+| openbind | 1.99 | 0.833 | 79.4 | 3.78 |
+| openbind, `swapTransposedBias` forced TRUE | 2.03 | 0.820 | 76.7 | 3.78 |
+
+The AF3 row reproduces this file's own quantisation table (0.66 / 0.953), which
+is what says the harness is sound. **The third row is the experiment that
+matters**: it turns on the convention OpenFold3 preview-2 was trained with, and
+it is WORSE on every measure - so `swapTransposedBias: false` is confirmed
+against the weights themselves rather than against a reading of somebody else's
+table. One target, so read it as a direction and not a margin.
+
+🔴 **AND THE SHAPES CONFIRM THE WHOLE ANALYSIS INDEPENDENTLY.** `openbind.shapes.json`
+against the AF3 bundle: **406 arrays each, identical names, exactly two shape
+differences** - `single_cond_initial_norm/scale` 833 against 831 and
+`single_cond_initial_projection/weights` [833, 384] against [831, 384]. Nothing
+else. Preview-2's per-block diffusion pair LayerNorm would have added
+twenty-four tensors and does not appear, which is the tree agreeing with the
+release note.
+
+🔴 **`--ablate` AND `--enable` PRICE A DIALECT BRANCH, because a branch that is
+silent when wrong cannot be trusted on a reading.** `tools/gpu/fold.js
+--ablate=maskPaddedKeys` turns one off and `--enable=swapTransposedBias` turns
+one on. `padSingleCondUnknownDna` cannot be ablated: it changes the LayerNorm's
+WIDTH, so the bundle's 833-long scale stops matching and the conditioning
+throws - the structural gate doing its job, and the reason that branch needs no
+measurement.
+
+🔴 **A PADDED KEY ONLY EXISTS BELOW 128 ATOMS, AND EVEN THERE IT REACHES
+NOTHING.** `featurise.js` clamps the 128-wide key window against the REAL atom
+count, so at 128 atoms or more every key lands on a real atom and the key mask
+is identically one. `tools/gpu/probe-ablate.js` sweeps the boundary:
+
+| residues | atoms | padded keys | `pairCond` | `tokenAct` | control |
+|---|---|---|---|---|---|
+| 4 | 32 | 288 of 384 | **4.13e-1** | **0.00e+0** | 1.04e-6 |
+| 8 | 67 | 366 of 768 | 2.72e-1 | 0.00e+0 | |
+| 12 | 106 | 198 of 1152 | 1.37e-1 | 0.00e+0 | 1.03e-6 |
+| 16 | 143 | **0** of 1536 | 0.00e+0 | 0.00e+0 | |
+| 68 | 574 | **0** of 6528 | 0.00e+0 | 0.00e+0 | 1.00e-6 |
+
+So the branch moves the atom PAIR conditioning by up to 41% and the encoder's
+OUTPUT by exactly nothing. The control column is a 1e-6 nudge to the
+conditioning, and it is there because "relRMS 0.00e+0" is also what a broken
+comparison says.
+
+🔴 **WHICH IS WHY AN ABLATION ON 6MRR CAME BACK BIT-IDENTICAL.** Same PDB, same
+pLDDT to every digit, with `maskPaddedKeys` off - because 6MRR has 574 atoms and
+therefore no padded keys at all. The dumps differ on this and it decides what a
+checker can see: `af3-6mrr.json` has 6528 of 6528 keys live, while
+`af3-oracle-atom-f32.json` has 873 of 1152 - a 97-atom molecule, under the
+window - which is why `check-af3-atom-encoder.js` measures a 7.77e-2 separation
+and a whole fold measures none.
+
+🔴 **AND THE PADDING IS GONE, BECAUSE NOTHING HERE NEEDED IT.** AF3 pads because
+JAX wants static shapes; these kernels are generated per shape and size their
+workgroup storage from `keys`, so the window is `min(128, atomCount)` now and
+**no batch this featuriser produces has a padded key at any size**. The
+`ref_space_uid = 0` collision that OpenFold3 trained around cannot occur here.
+
+Measured before and after, `tools/gpu/fold.js --sequence=`:
+
+| | 68 residues, 574 atoms | 12 residues, 106 atoms |
+|---|---|---|
+| diffusion 50 | **bit-identical** (`1f3a312051898379`) | 84.3979 -> 84.4696 pLDDT |
+| flow 16 | **bit-identical** (`8cd298eb6bd61f82`) | 84.7656 -> 84.8080 |
+
+Exactly the scope the table above predicts: at or above 128 atoms the window was
+already inside the molecule and nothing moves, and below it the padded keys stop
+contributing. Geometry is unchanged either way (N-CA 1.458, CA-CA 3.807 on the
+12-mer).
+
+🔴 **AND `maskPaddedKeys` IS NOT DEAD, WHICH IS WHY IT STAYS.** The differential
+checkers do not use this featuriser - they feed AF3's OWN gathers out of an
+oracle dump, and `af3-oracle-atom-f32.json` is a 97-atom molecule with 279
+padded keys of 1152. So `check-af3-atom-encoder.js` still separates the two
+dialects by 7.77e-2 on `pairCond`, and the flag still decides what a bundle
+converted for OpenBind computes on somebody else's batch. What changed is that
+the SHIPPING path can no longer reach the case.
+
+🔴 **A SECOND MODEL IS MISTAKEN FOR THE FIRST IN A CACHE, NOT IN A LOADER.**
+Two bundles now build AF3's graph, and every memo keyed on something that does
+not distinguish them is a silent wrong answer. Two were found, one of them the
+hard way:
+
+* `loadAf3Weights` memoised ONE promise, so the second family's fold got the
+  first family's weights. Caught while writing it - `weightsPromises` is a Map
+  keyed by family.
+* **`trunkKey` did not include the family.** The cached trunk is a pair and a
+  single representation, and those have the same shapes whichever parameters
+  produced them - so folding with OpenBind and then AlphaFold 3 on the same
+  sequence matched every other field and handed AF3's diffusion head OpenBind's
+  trunk. Reproduced in the page at 32 residues: **pLDDT 41.5 with the status
+  line reading "trunk reused", against 83.3 once `family` was in the key.**
+  Nothing errors, nothing warns; the chain comes apart, which is how it was
+  reported ("atoms are no longer attached").
+
+Neither is findable by folding one model. The reproduction is
+openbind -> af3 -> openbind in one page session, which
+`test/model-family.test.js` pins by asserting the key names the family.
+
+🔴 **AND "IS THIS AF3" IS NOT `family === "af3"` ANY MORE.** That comparison sat
+in five places and every one meant "is this the AF3 pipeline", not "is this
+DeepMind's checkpoint" - so a second AF3-graph family took the AlphaFold 2
+branch at each. Three of them were CAPABILITY guards, and they refused ligands,
+modified residues and nucleic chains under OpenBind with a message naming a
+capability the model has: *"Ligands need AlphaFold 3; the model is set to
+openbind"*. `AF3_FAMILIES` in `src/reference/manifests/index.js` is the list;
+`isAf3Family` is the test.
+
+🔴 **AND THE DIALOG SAYS "NOT AVAILABLE FOR COMMERCIAL USE" AND NOT "ACADEMIC
+USE ONLY".** The second is the phrase that comes to hand and it is wrong twice:
+DeepMind's terms cover non-profits, research institutes, journalism and
+government bodies as well as universities, and they exclude a researcher
+employed by a commercial organisation. The short form has to stay TRUE while
+being short; the linked terms carry the detail. "Not open source" was the
+earlier version of the same mistake - the CODE is openly licensed and it is the
+PARAMETERS that are restricted.
+
+🔴 **THE LICENCE DIALOG ASKS THE PERSON FOLDING, NOT THE DEPLOYER.**
+`build_site.py` already refuses to publish DeepMind's parameters without
+`LOCALFOLD_ACCEPT_MODEL_TERMS`; the page's `#model-terms` dialog gates the first
+AF3 fold and remembers the answer in `localStorage`. It offers OpenBind as the
+alternative rather than only an "I agree", because a dialog with one button
+teaches people to click it. `tools/model-terms.py` is the check - it drives the
+real page and asserts the dialog opens, remembers, switches the model row, and
+**still opens for `?model=af3`**, since a URL must not be able to accept
+somebody else's terms.
+
+🔴 **AND A `<dialog>` IS NEVER LAID OUT UNTIL IT IS OPENED**, which is the load
+dial's blind spot again: `tools/mobile-layout.py` cannot see it. `model-terms.py`
+forces it open under a 320px device override and asserts it is neither clipped
+nor sideways-scrolling and that its two buttons stack (measured 298px wide,
+buttons 260px, left 11px).
+
+🔴 **AND `?model=` HAD TWO READERS, WHICH IS WORSE THAN BEING IGNORED.**
+`applyModelFromUrl` takes it as the model row's value; `web/model.js` took it as
+a manifest URL whenever the family was monomer, which is how a page is pointed
+at weights somewhere else. `?model=monomer` is the one spelling that reaches
+both - it selected AlphaFold 2 and then fetched `<origin>/monomer`, so the live
+page said **"failed to load model manifest: 404"** for a model that folds
+perfectly well from the dropdown, at pLDDT 96.5. The override now requires a
+PATH - a slash, or a `.json` ending - because a path is what it was for; a bare
+family name belongs to the other reader.
+
+🔴 **AND IT WAS FOUND BY MISTAKING IT FOR SOMETHING ELSE.** The 404 appeared
+minutes after 129.8 MiB of `af2-monomer/*.js` were deleted from Hugging Face, on
+the one bundle those files belonged to, which is as convincing a coincidence as
+this repository has produced. The deletion was innocent - `ScriptTensorStore`
+reads `manifest.js` only under `file://`, and from the bundle's own directory,
+never from a remote - and folding monomer from the dropdown proved it. **A
+regression that appears next to a change is not evidence it came from it.**
+
+🔴 **AND A `?model=` THAT IS IGNORED LOOKS EXACTLY LIKE ONE THAT WORKED.** The
+complaint about an unknown name was written twice before it was visible: once
+before the vendored viewer's own "Ready." line overwrote it, and once before the
+parameter had even been read, because it was called beside the Fold button's
+enabling - which runs EARLIER in the file. It waits for that specific string
+now. `of3` is deliberately not an alias for `openbind`.
+

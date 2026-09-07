@@ -120,8 +120,25 @@ CONNECTIONS = 8
 SHARD_TARGET = 16 * 1024 * 1024
 
 
-def shard_count(total_bytes, connections=CONNECTIONS, target=SHARD_TARGET):
-    """How many files to write, as a multiple of `connections`."""
+def shard_count(total_bytes, connections=CONNECTIONS, target=SHARD_TARGET,
+                override=None):
+    """How many files to write, as a multiple of `connections`.
+
+    🔴 THE COUNT IS SIZED ON THE PACKED BYTES, NEVER ON THE FLOAT32 EXPORT.
+    `export_af3_model.py` caps a shard at 48 MiB of float32 and this discards
+    that layout entirely - an int5 bundle inheriting a float32 one is how a
+    265 MiB bundle ended up in 26 pieces chosen for 1405 MiB.
+
+    🔴 AND `override` IS NOT FREE, WHICH IS WHY IT HAS TO BE ASKED FOR. A count
+    that is not a multiple of `connections` leaves the last round ragged: 12
+    shards on 8 connections is one full round and then four, with four
+    connections idle for the whole of it. The floor is a different constraint
+    again - a tensor is indivisible, and no sharding beats the largest one - so
+    below `total / largest tensor` the count buys nothing and above
+    `connections` it costs a round. See pack_shards.
+    """
+    if override is not None:
+        return max(1, min(64, int(override)))
     rounds = max(1, round(total_bytes / target / connections))
     return min(64, connections * rounds)
 
@@ -148,6 +165,9 @@ def main():
     parser.add_argument("--source", default="model-af3-full-f32")
     parser.add_argument("--out", default="model-af3-int5")
     parser.add_argument("--bits", type=int, default=BITS)
+    parser.add_argument("--shards", type=int, default=None,
+                        help="force the shard count; sized on the PACKED bytes "
+                             "either way. Not a multiple of 8 leaves a ragged round.")
     parser.add_argument("--group", type=int, default=GROUP)
     arguments = parser.parse_args()
     bits, group = arguments.bits, arguments.group
@@ -229,7 +249,7 @@ def main():
 
     total = sum(len(p) for _, _, p in built)
     bins, loads = pack_shards([(i, len(p)) for i, (_, _, p) in enumerate(built)],
-                              shard_count(total))
+                              shard_count(total, override=arguments.shards))
     for shard, members in enumerate(bins):
         pieces = []
         cursor = 0

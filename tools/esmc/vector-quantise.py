@@ -4,7 +4,7 @@
 
 Everything else in this directory keeps LocalFold's existing shader: asymmetric
 scalar codes, one float16 scale and zero per group. That format has a floor -
-`docs/ESMFOLD2.md` measures two bits per weight destroying the tower - and the
+`docs/EF2FAST.md` measures two bits per weight destroying the tower - and the
 only way under it is the representation the 2-bit language-model work uses:
 quantise a short VECTOR of weights to an entry in a learned codebook, so the
 codebook can put its levels where the weights actually are instead of on a

@@ -202,7 +202,8 @@ export function msaAttention(msa, msaMask, pair, sequences, tokens, msaChannels,
  * @param {{msa: Float32Array, pair: Float32Array, msaMask: Float32Array,
  *          pairMask: Float32Array, sequences: number, tokens: number}} state
  * @param {object} weights
- * @param {{swapTransposedBias: boolean}} dialect
+ * @param {{swapTransposedBias: boolean,
+ *          msaUpdateBeforeOuterProduct: boolean}} dialect
  */
 export function msaBlock(state, weights, dialect) {
   const { msaMask, pairMask, sequences, tokens } = state;
@@ -219,13 +220,31 @@ export function msaBlock(state, weights, dialect) {
     for (let index = 0; index < msa.length; index += 1) msa[index] += delta[index];
   };
 
-  // ...the outer product of the MSA AS IT ARRIVED, before the update below.
-  addPair(outerProductMean(msa, msaMask, sequences, tokens, msaChannels, pairChannels,
-                           weights.outerProductMean));
-  // ...and then the MSA update, against the pair the outer product just changed.
-  addMsa(msaAttention(msa, msaMask, pair, sequences, tokens, msaChannels, pairChannels,
-                      weights.msaAttention1));
-  addMsa(transition(msa, rows, msaChannels, weights.msaTransition));
+  // The two crossing lines from the header. Which runs first is the model, not
+  // an implementation detail: both orderings typecheck, both produce a
+  // plausible representation, and the difference compounds over the blocks.
+  const outerProduct = () => addPair(
+    outerProductMean(msa, msaMask, sequences, tokens, msaChannels, pairChannels,
+                     weights.outerProductMean));
+  // Upstream keeps the transition inside `_msa_update`, so it moves with the
+  // attention rather than staying put between the two halves.
+  const updateMsa = () => {
+    addMsa(msaAttention(msa, msaMask, pair, sequences, tokens, msaChannels, pairChannels,
+                        weights.msaAttention1));
+    addMsa(transition(msa, rows, msaChannels, weights.msaTransition));
+  };
+  if (dialect?.msaUpdateBeforeOuterProduct === undefined) {
+    throw new Error("dialect.msaUpdateBeforeOuterProduct has no default: AF3 "
+      + "takes the outer product off the pre-update MSA and OpenDDE off the "
+      + "updated one");
+  }
+  if (dialect.msaUpdateBeforeOuterProduct) {
+    updateMsa();
+    outerProduct();
+  } else {
+    outerProduct();
+    updateMsa();
+  }
 
   addPair(triangleMultiplication(pair, pairMask, tokens, pairChannels, "outgoing",
                                  weights.triangleMultiplicationOutgoing));

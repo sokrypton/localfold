@@ -90,6 +90,33 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
     load: () => import("./openbind0.js"),
   },
+  // 🔴 OpenDDE FOLDS, AND ITS PIPELINE HAS TWO TOKEN SPACES. It is an
+  // independent PyTorch reimplementation in the AlphaFold 3 family (Aureka
+  // Research, Apache-2.0): the trunk runs on residues, and between the trunk
+  // and the diffusion each standard residue is re-tokenised into a backbone
+  // and a sidechain token, which the diffusion and its confidence head run on.
+  // `src/af3/fold-opendde.js` is that driver; every stage inside it is the
+  // AlphaFold 3 code at OpenDDE's widths.
+  //
+  // 481 tensors, 655.8 M parameters - upstream's own published count - at int5
+  // in twelve shards, 473 MiB. Measured on 6MRR against the deposited
+  // structure: RMSD 1.68 A, TM 0.865, CA-CA 3.68 A.
+  opendde: {
+    model: "opendde",
+    directory: "./model-opendde-int5/",
+    release: "opendde-int5",
+    variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
+    load: () => import("./opendde.js"),
+    // 🔴 IT FOLDS, AND IT IS STILL false, BECAUSE THE PAGE HAS NO ROUTE TO ITS
+    // DRIVER. `FOLDING_FAMILIES` is what the model row offers, and the page
+    // folds through `foldBatch` - AlphaFold 3's single-token-space pipeline.
+    // Selecting OpenDDE there would run the trunk and then hand the diffusion
+    // residue tokens where it wants structural ones: every shape conforms and
+    // a structure comes out. Turning this true is one branch in web/app.js
+    // routing to foldOpendde, and it must land WITH that branch rather than
+    // before it. `tools/gpu/fold-opendde.js` is the working route today.
+    foldingModel: false,
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -120,7 +147,7 @@ export const MODEL_BUNDLES = {
   // companion and not an option on the loader. The folding model is the same
   // SIZE in both (171 M), so only the tower's 94 MiB separates the pairs:
   // 252.1 MiB against 346.1. Measured over sixteen held-out targets in
-  // docs/ESMFOLD2.md, the median is 2.55 A against 2.52 - inside the sampler's
+  // docs/EF2FAST.md, the median is 2.55 A against 2.52 - inside the sampler's
   // own 0.99-1.10 A seed spread - and the tails are 0.4 A worse.
   "ef2-fast-300m": {
     model: "esmfold2-trunk",

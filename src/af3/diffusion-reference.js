@@ -240,17 +240,43 @@ export function diffusionConditioning(input, weights, onStage) {
   const pairChannels = weights.pairChannels;
   const seqChannels = weights.seqChannels;
 
-  // ...the trunk pair and the RAW relative encoding, concatenated. 128 + 139.
+  // 🔴 THE PAIR CONDITIONING IS ONE CONCATENATION OR TWO COMPRESSIONS, AND
+  // THE NORM'S LENGTH SAYS WHICH. AlphaFold 3 concatenates the trunk pair with
+  // the RAW relative encoding and normalises the lot: 128 + 139 = 267, which is
+  // what `pair_cond_initial_norm` is there. OpenDDE compresses each to the pair
+  // width SEPARATELY - `z_trunk_projection` [384, 128] and `relpe_projection`
+  // [139, 128] - and concatenates those: 128 + 128 = 256, which is what its
+  // norm is. The joint LayerNorm over the widened concatenation couples the two
+  // terms, so this is a different function and not a re-association; and under
+  // OpenDDE the trunk pair arriving here is 384 wide, which no fixed 128 would
+  // survive.
   const relative = relativeEncoding(tokens, input.features);
-  const width = pairChannels + weights.relativeWidth;
+  const split = weights.zTrunkProjection !== undefined;
+  const trunkPairChannels = weights.trunkPairChannels ?? pairChannels;
+  const width = split ? 2 * pairChannels : trunkPairChannels + weights.relativeWidth;
   const features2d = new Float32Array(pairs * width);
-  for (let index = 0; index < pairs; index += 1) {
-    for (let c = 0; c < pairChannels; c += 1) {
-      features2d[index * width + c] = trunkPair[index * pairChannels + c];
+  if (split) {
+    const compressedTrunk = linear(
+      layerNormSlow(trunkPair, pairs, trunkPairChannels, weights.zTrunkNormScale, null),
+      pairs, trunkPairChannels, pairChannels, weights.zTrunkProjection);
+    const compressedRelative = linear(
+      relative, pairs, weights.relativeWidth, pairChannels, weights.relpeProjection);
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < pairChannels; c += 1) {
+        features2d[index * width + c] = compressedTrunk[index * pairChannels + c];
+        features2d[index * width + pairChannels + c] =
+          compressedRelative[index * pairChannels + c];
+      }
     }
-    for (let c = 0; c < weights.relativeWidth; c += 1) {
-      features2d[index * width + pairChannels + c] =
-        relative[index * weights.relativeWidth + c];
+  } else {
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < trunkPairChannels; c += 1) {
+        features2d[index * width + c] = trunkPair[index * trunkPairChannels + c];
+      }
+      for (let c = 0; c < weights.relativeWidth; c += 1) {
+        features2d[index * width + trunkPairChannels + c] =
+          relative[index * weights.relativeWidth + c];
+      }
     }
   }
   let pair = linear(layerNormSlow(features2d, pairs, width,

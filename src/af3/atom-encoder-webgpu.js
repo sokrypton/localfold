@@ -104,16 +104,33 @@ const PAIR_ORDER = [
   "atomPositionsToFeatures", "projectAtomFeaturesForAggr",
 ];
 
+/** One Float32Array from several, in order. */
+function concatenate(parts) {
+  const out = new Float32Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
 export function packAtomPairWeights(weights) {
+  // 🔴 THE TWO PAIR-NORM ENTRIES ARE ONE TENSOR OR THREE. AlphaFold 3 shares a
+  // LayerNorm scale and a projection across the atom stack; OpenDDE trains one
+  // of each PER BLOCK. Packing the three back to back keeps one buffer and one
+  // binding, and the shader indexes them by block - see `pairLogits`.
+  const source = weights.pairNormPerBlock
+    ? { ...weights,
+        pairInputLayerNormScale: concatenate(weights.pairInputLayerNormScales),
+        pairLogitsProjection: concatenate(weights.pairLogitsProjections) }
+    : weights;
   const offsets = {};
   let total = 0;
   for (const name of PAIR_ORDER) {
-    if (weights[name] === undefined) throw new Error(`atom encoder missing ${name}`);
+    if (source[name] === undefined) throw new Error(`atom encoder missing ${name}`);
     offsets[name] = total;
-    total += weights[name].length;
+    total += source[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of PAIR_ORDER) data.set(weights[name], offsets[name]);
+  for (const name of PAIR_ORDER) data.set(source[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -126,6 +143,11 @@ export function createAtomCommon(shape, pairOffsets, blockOffsets) {
   const { tokens, dense, subsets, queries, keys, channels, pairChannels,
           heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
           blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -184,6 +206,11 @@ export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
   const { tokens, dense, subsets, queries, keys, channels, pairChannels,
           heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
           blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -450,9 +477,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var head = 0u; head < HEADS; head += 1u) {
       var value = 0.0;
       for (var c = 0u; c < C_PAIR; c += 1u) {
+        // 🔴 THE SCALE AND THE MATRIX ARE PER BLOCK UNDER OpenDDE. The mean and
+        // the variance are not - they come from the pair, which does not change
+        // - so the whole difference is these two indices, and both arms read
+        // the same buffer.
         value += (pair[base + c] - mean) * inverse
-          * weights[P_pairInputLayerNormScale + c]
-          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];
+${perBlockPair
+  ? `          * weights[P_pairInputLayerNormScale + block * C_PAIR + c]
+          * weights[P_pairLogitsProjection + (block * C_PAIR + c) * HEADS + head];`
+  : `          * weights[P_pairInputLayerNormScale + c]
+          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];`}
       }
       let out = ((block * SUBSETS + subset) * HEADS + head) * QUERIES * KEYS
         + query * KEYS + key;
@@ -489,6 +523,9 @@ export function createAtomBlockShaders(common, shape) {
   const outputRowTile = shape.outputRowTile
     ?? outputRowTileFor(shape.subsets * shape.queries);
   const { channels, keys } = shape;
+  // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
+  // OpenDDE. See the note at `attendFor`.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const intermediate = channels * 2;
   const rowWidth = Math.min(4, outputRowTile);
   const rowGroups = outputRowTile / rowWidth;
@@ -723,6 +760,98 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     v[row * WIDTH + out] = v_total;
   }
 }`;
+  // 🔴 OpenDDE CHAINS THE TWO ADAPTIVE LAYERNORMS, AND THIS IS THE FIRST HALF
+  // WRITTEN OUT. AlphaFold 3 normalises the RAW activation once per side;
+  // OpenDDE's `AttentionPairBias` reassigns - `a = layernorm_a(a, s)` then
+  // `kv = layernorm_kv(a, s)` reading the ALREADY-NORMALISED a. The key
+  // projection below fuses its own normalisation into itself, so the way to
+  // chain without touching it is to hand it a pre-normalised activation: this
+  // kernel writes `adaLN_q(act)` and the caller binds that in place of `act`.
+  // The QUERY projection still reads the raw one, which is what makes it a
+  // chain rather than a substitution.
+  //
+  // Written one workgroup per row rather than over a tile like its fused
+  // sibling: it runs once per block on the query rows alone, and a shape this
+  // simple is one that can be read against the reference.
+  const normaliseQueries = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> normalised: array<f32>;
+
+var<workgroup> cond: array<f32, ${channels}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+  let base = row * C;
+
+  // The activation's own mean and variance, and the conditioning's.
+  var sum_a = 0.0;
+  var sum_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    sum_a += act[base + c];
+    sum_b += queries_cond[base + c];
+  }
+  reduce_a[local] = sum_a;
+  reduce_b[local] = sum_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C);
+  let cond_mean = reduce_b[0] / f32(C);
+  workgroupBarrier();
+
+  var var_a = 0.0;
+  var var_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    let d = act[base + c] - mean;
+    let e = queries_cond[base + c] - cond_mean;
+    var_a += d * d;
+    var_b += e * e;
+  }
+  reduce_a[local] = var_a;
+  reduce_b[local] = var_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let inverse = inverseSqrt(reduce_a[0] / f32(C) + EPSILON);
+  let cond_inverse = inverseSqrt(reduce_b[0] / f32(C) + EPSILON);
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    cond[c] = (queries_cond[base + c] - cond_mean) * cond_inverse
+      * weights[W_qSingleCondLayerNormScale + c];
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    var scale_value = weights[W_qSingleCondScaleBias + c];
+    var shift = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      scale_value += cond[d] * weights[W_qSingleCondScaleWeights + d * C + c];
+      shift += cond[d] * weights[W_qSingleCondBias + d * C + c];
+    }
+    normalised[base + c] = 1.0 / (1.0 + exp(-scale_value))
+      * ((act[base + c] - mean) * inverse) + shift;
+  }
+}`;
+
   const projectKeysAtoms = conditionedProject("k", {
     bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
@@ -802,7 +931,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       dot += q[query_base + d] * k[key_index * WIDTH + head * DIMENSION + d];
     }
     // 🔴 A PRODUCT, NOT A SUM: only a padded query AND a padded key is penalised.
-    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);
+    // A product under AlphaFold 3 and a SUM under OpenDDE; see the note in
+    // atom-encoder-reference.js for which models take which and why it is
+    // inert on every batch this featuriser produces.
+${keyMasked
+  ? "    let bias = -1.0e9 * ((1.0 - queries_mask[query_index]) + (1.0 - keys_mask[key_index]));"
+  : "    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);"}
     logits[key] = dot * SCALE + bias
       + pair_logits[(((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS + key];
   }
@@ -1089,7 +1223,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  return { project, projectKeys, projectKeysAtoms, expandKeys,
+  return { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
            attendFor, output, maskAct, aggregate, outputRowTile };
 }
 
@@ -1133,14 +1267,41 @@ export class Af3AtomEncoderGpu {
     const pairPacked = packCached(weights, "atom.pair", () => packAtomPairWeights(weights));
     const blockPacked = weights.blocks.map(
       (block) => packCached(block, "atom.block", () => packAtomBlockWeights(block)));
+    // 🔴 A PER-BLOCK PAIR NORM GENERATES A DIFFERENT KERNEL, SO IT IS IN THE
+    // KEY. The two arms index the same buffer differently and produce the same
+    // shapes; a key that could not tell them apart would hand an OpenDDE
+    // encoder AlphaFold 3's shader, which runs.
+    if (weights.pairNormPerBlock === undefined) {
+      throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+        + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+    }
+    const perBlockPair = weights.pairNormPerBlock;
+    // 🔴 THE CHAINING IS THE BLOCK'S, AND EVERY BLOCK IN A STACK AGREES. It is
+    // read off block 0 and asserted across the rest, because a stack whose
+    // blocks disagreed would be a bundle assembled from two dialects - which
+    // nothing else here would notice.
+    const keyMasked = weights.blocks[0]?.keyMaskedAtomAttention;
+    if (keyMasked === undefined) {
+      throw new Error("atom blocks carry no keyMaskedAtomAttention");
+    }
+    const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
+    if (chainedNorm === undefined) {
+      throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
+        + "normalises the raw activation on both sides, OpenDDE chains them");
+    }
+    if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
+      throw new Error("this atom stack's blocks disagree about chainedAtomLayerNorm");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
+      perBlockPair, keyMaskedAtomAttention: keyMasked,
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
-      + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`;
+      + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -1368,6 +1529,9 @@ export class Af3AtomEncoderGpu {
       const k = alloc("atom.k", keyRows * width * 4);
       const v = alloc("atom.v", keyRows * width * 4);
       // ...one row an ATOM, expanded into the key layout below.
+      // Only where the dialect chains; see the note at the dispatch.
+      const normalisedQueries = chainedNorm
+        ? alloc("atom.normalised-queries", queryRows * channels * 4) : null;
       const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
@@ -1471,8 +1635,19 @@ export class Af3AtomEncoderGpu {
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project,
             [act, queriesCond, w, q, gate], perOutput[0], perOutput[1]);
+        // 🔴 CHAINED, SO THE KEYS NORMALISE THE NORMALISED QUERIES. Under stock
+        // AF3 both sides read `act` and this extra pass does not run at all,
+        // which is what keeps that path unchanged.
+        let keySource = act;
+        if (chainedNorm) {
+          const perQueryRow = spread(queryRows);
+          run(`normalise-queries-${index}`, compiled.normaliseQueries,
+              [act, queriesCond, w, normalisedQueries],
+              perQueryRow[0], perQueryRow[1]);
+          keySource = normalisedQueries;
+        }
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
+            [keySource, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);

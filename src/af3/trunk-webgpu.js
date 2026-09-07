@@ -31,16 +31,26 @@ import { Af3TemplateEmbedderGpu } from "./template-webgpu.js";
 import { GRID_WIDTH, PAIR_CHANNELS } from "./pair-track-gpu.js";
 import { af3ContactBins } from "./contact-classes.js";
 
+/**
+ * AlphaFold 3's own bin count, and the DEFAULT rather than the rule.
+ *
+ * 🔴 OpenDDE'S DISTOGRAM HAS 96 BINS, and nothing but `half_logits`' own shape
+ * says so. Upstream leaves the two BREAKS at AlphaFold 3's 2.3125 and 21.6875
+ * and changes only the count, so OpenDDE's grid is 95 edges over the same span
+ * - a finer grid of the same reach, not a longer one. That is upstream's
+ * reading and it is the only stated source: OpenDDE's published config.json is
+ * metadata and carries no distogram range. See docs/OPENDDE.md.
+ */
 const NUM_BINS = 64;
 const FIRST_BREAK = 2.3125;
 const LAST_BREAK = 21.6875;
 const CONTACT_THRESHOLD = 8.0 + 1e-3;
 
 /** The distogram bin edges: 63 of them, evenly spaced. */
-export function binEdges() {
-  const breaks = new Float32Array(NUM_BINS - 1);
-  for (let index = 0; index < NUM_BINS - 1; index += 1) {
-    breaks[index] = FIRST_BREAK + (LAST_BREAK - FIRST_BREAK) * index / (NUM_BINS - 2);
+export function binEdges(bins = NUM_BINS) {
+  const breaks = new Float32Array(bins - 1);
+  for (let index = 0; index < bins - 1; index += 1) {
+    breaks[index] = FIRST_BREAK + (LAST_BREAK - FIRST_BREAK) * index / (bins - 2);
   }
   return breaks;
 }
@@ -55,13 +65,24 @@ export function binEdges() {
  * 🔴 A BIN COUNTS AS CONTACT WHEN ITS TOP EDGE IS AT OR BELOW 8 A. The 63
  * breaks describe 64 bins, so the final bin is open-ended and its top has to be
  * extrapolated by one spacing rather than read from the array.
+ *
+ * 🔴 AND A TRAINED BIAS ENTERS THIS SUM TWICE, WHICH IS WHY IT IS NOT SIMPLY
+ * ADDED. Stock AlphaFold 3's `half_logits` is bias-free; OpenDDE's carries one,
+ * and this head computes `half(i,j) + half(j,i)` - so a bias that is added once
+ * per half is added twice per logit. OpenDDE symmetrises AFTER its own linear
+ * exactly as this does, so the doubling is what its training saw and the
+ * converter passes the bias straight across. Two of the four families upstream
+ * lists need their bias HALVED instead, because their natives symmetrise the
+ * pair FIRST - so this is a fact about the checkpoint, not about the name of
+ * the tensor.
  */
-export function createDistogramShader(tokens, channels, offset) {
+export function createDistogramShader(tokens, channels, offset,
+                                      { bins = NUM_BINS, biasOffset = -1 } = {}) {
   return `
 const TOKENS: u32 = ${tokens}u;
 const PAIRS: u32 = ${tokens * tokens}u;
 const CHANNELS: u32 = ${channels}u;
-const BINS: u32 = ${NUM_BINS}u;
+const BINS: u32 = ${bins}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const W_HALF: u32 = ${offset}u;
 
@@ -85,7 +106,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let transposed = j * TOKENS + i;
 
   var largest = -3.0e38;
-  var values: array<f32, ${NUM_BINS}>;
+  var values: array<f32, ${bins}>;
   for (var b = 0u; b < BINS; b += 1u) {
     var total = 0.0;
     for (var c = 0u; c < CHANNELS; c += 1u) {
@@ -93,6 +114,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       total += (pair[row * CHANNELS + c] + pair[transposed * CHANNELS + c])
         * weights[W_HALF + c * BINS + b];
     }
+${biasOffset >= 0 ? `    total += 2.0 * weights[${biasOffset}u + b];\n` : ""}\
     values[b] = total;
     logits[row * BINS + b] = total;
     largest = max(largest, total);
@@ -208,17 +230,29 @@ export class Af3TrunkGpu {
 
     return {
       pair: pairformer.pair, single: pairformer.single, msa: msa.msa,
-      ...head, binEdges: binEdges(), timings,
+      ...head, binEdges: binEdges(weights.distogram.bins ?? NUM_BINS), timings,
     };
   }
 
   async #distogram(pair, pairMask, tokens, weights, contactClasses) {
     const pairs = tokens * tokens;
-    const packed = new Float32Array(weights.halfLogits.length);
+    // 🔴 THE HEAD'S THREE NUMBERS ARE THE TENSOR'S. `half_logits` is
+    // [pairChannels, bins], so AlphaFold 3's 128x64 and OpenDDE's 384x96 are
+    // both read off it rather than declared - see src/af3/weights.js. The bias
+    // is the fourth, and it exists only where the checkpoint trained one.
+    const channels = weights.pairChannels ?? PAIR_CHANNELS;
+    const bins = weights.bins ?? NUM_BINS;
+    const bias = weights.halfLogitsBias;
+    if (bias !== undefined && bias.length !== bins) {
+      throw new Error(`distogram bias has ${bias.length} entries; expected ${bins}`);
+    }
+    const biasOffset = bias === undefined ? -1 : weights.halfLogits.length;
+    const packed = new Float32Array(weights.halfLogits.length + (bias?.length ?? 0));
     packed.set(weights.halfLogits, 0);
+    if (bias !== undefined) packed.set(bias, biasOffset);
     const pipeline = await this.pipelines.get(
-      `af3-distogram:${tokens}:${PAIR_CHANNELS}`,
-      createDistogramShader(tokens, PAIR_CHANNELS, 0));
+      `af3-distogram:${tokens}:${channels}:${bins}:${biasOffset}`,
+      createDistogramShader(tokens, channels, 0, { bins, biasOffset }));
 
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -232,15 +266,22 @@ export class Af3TrunkGpu {
       if (contactClasses === undefined || contactClasses.length !== tokens) {
         throw new Error("the distogram head needs contactClasses, one per token");
       }
+      // 🔴 THE EDGES ARE THIS HEAD'S, NOT THE DEFAULT'S. `af3ContactBins` turns
+      // a per-pair angstrom threshold into a COUNT of bins, so handing it
+      // AlphaFold 3's 64-bin grid for OpenDDE's 96-bin head returns a count
+      // against the wrong ruler - and a count is what the shader compares, so
+      // nothing would be out of range and the contact map would simply be
+      // wrong. Same shape of mistake as the AF2 manifests that carried 2 and 22
+      // where the head's breaks are 2.3125 and 21.6875.
       const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
-        af3ContactBins(contactClasses, tokens, binEdges()), storage));
+        af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
       const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
-      const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * NUM_BINS * 4,
+      const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const contact = keep(this.allocator.allocate("af3-disto.contact", pairs * 4,
         storage | GPUBufferUsage.COPY_SRC));
       const readLogits = keep(this.allocator.allocate("af3-disto.rb-logits",
-        pairs * NUM_BINS * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+        pairs * bins * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
       const readContact = keep(this.allocator.allocate("af3-disto.rb-contact",
         pairs * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
@@ -257,7 +298,7 @@ export class Af3TrunkGpu {
       const groups = Math.ceil(pairs / 64);
       pass.dispatchWorkgroups(Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH));
       pass.end();
-      encoder.copyBufferToBuffer(logits.buffer, 0, readLogits.buffer, 0, pairs * NUM_BINS * 4);
+      encoder.copyBufferToBuffer(logits.buffer, 0, readLogits.buffer, 0, pairs * bins * 4);
       encoder.copyBufferToBuffer(contact.buffer, 0, readContact.buffer, 0, pairs * 4);
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();

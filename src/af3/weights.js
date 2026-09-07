@@ -271,11 +271,68 @@ export async function layer(store, name, index) {
 }
 
 /**
+ * A tensor's shape, as the SOURCE of a width rather than a literal beside it.
+ *
+ * 🔴 EVERY WIDTH IN THIS FILE USED TO BE A NUMBER TYPED NEXT TO THE TENSOR IT
+ * DESCRIBES, and AlphaFold 3 is not the only checkpoint this graph reads. A
+ * declared width is right for exactly one model and silent for every other: a
+ * bundle whose pair representation is 384 channels wide loads through
+ * `pairChannels: 128` without complaint, and what comes out is a kernel
+ * dispatched over a third of its own tensor. Deriving it turns fifteen
+ * declarations into fifteen assertions, and costs a shape lookup the store
+ * already has in memory.
+ */
+/**
+ * Whether a bundle carries a tensor at all, without raising if it does not.
+ *
+ * 🔴 A STORE'S `shape` THROWS ON A MISSING NAME, deliberately - every other
+ * caller wants that. An OPTIONAL tensor is the one case that does not, and
+ * there is exactly one: the distogram head's bias, which stock AlphaFold 3 has
+ * not and OpenDDE has.
+ */
+function hasTensor(store, name) {
+  return store.manifest?.tensors?.[name] !== undefined;
+}
+
+export function dims(store, name) {
+  const shape = store.shape(name);
+  if (shape === undefined || shape.length === 0) {
+    throw new Error(`no shape for ${name}; a width cannot be derived from it`);
+  }
+  return shape;
+}
+
+/**
+ * A pairformer stack's four widths, from the two tensors that state them.
+ *
+ * `single_attention_q_projection/weights` is
+ * `[blocks, singleChannels, heads, dimension]` and `single_pair_logits_norm`
+ * is the pair representation the logits are read from. The two stacks that
+ * have a single track - the trunk pairformer and the confidence head's - are
+ * the only callers, and OpenDDE's structural-token refiner is a third with
+ * heads 8x48 where both of these are 16x24.
+ */
+function singleAttentionDims(store, root) {
+  const [, singleChannels, heads, dimension] =
+    dims(store, `${root}/single_attention_q_projection/weights`);
+  const [, pairChannels] = dims(store, `${root}/single_pair_logits_norm/scale`);
+  return [pairChannels, singleChannels, heads, dimension];
+}
+
+/**
  * The five pair-track modules, which every stack shares - as a DESCRIPTOR whose
  * leaves are thunks, not as decoded arrays. bind() turns one into an object.
+ *
+ * 🔴 THE GRID ATTENTION'S HEADS AND DIMENSION COME FROM ITS OWN PROJECTION.
+ * `q_projection/weights` is `[blocks, heads, dimension, channels]`, so all
+ * three numbers are in one shape - which is why they used to be passed in as
+ * two arguments and why the four call sites each carried a different pair (the
+ * trunk 4x32, the template stack 4x16). OpenDDE's are 12x32 in the trunk and
+ * 2x32 in the template stack, and nothing but the tensor says so.
  */
-function pairTrack(store, root, index, gridHeads, gridDimension) {
+function pairTrack(store, root, index) {
   const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
+  const [, gridHeads, gridDimension] = dims(store, `${root}/pair_attention1/q_projection/weights`);
   const triangle = (direction) => ({
     leftNormInputScale: at(`triangle_multiplication_${direction}/left_norm_input/scale`),
     leftNormInputOffset: at(`triangle_multiplication_${direction}/left_norm_input/offset`),
@@ -313,9 +370,17 @@ function pairTrack(store, root, index, gridHeads, gridDimension) {
 
 export async function embedderWeights(store) {
   const T = (name) => store.tensor(`${EVO}/${name}`);
+  // 🔴 THE RELATIVE ENCODING STATES BOTH ITS INPUT AND THE PAIR'S WIDTH. Its
+  // projection is `[relativeWidth, pairChannels]`, and it is the one tensor
+  // every AF3-lineage bundle has that names the pair track's width without
+  // going through a block stack.
+  const [relativeWidth, pairChannels] =
+    dims(store, `${EVO}/~_relative_encoding/position_activations/weights`);
+  const [, singleChannels] = dims(store, `${EVO}/single_activations/weights`);
+  const [targetFeatWidth, msaChannels] = dims(store, `${EVO}/extra_msa_target_feat/weights`);
   return {
-    pairChannels: 128, singleChannels: 384, msaChannels: 64,
-    targetFeatWidth: 447, relativeWidth: 139,
+    pairChannels, singleChannels, msaChannels,
+    targetFeatWidth, relativeWidth,
     leftSingle: await T("left_single/weights"),
     rightSingle: await T("right_single/weights"),
     prevEmbeddingNormScale: await T("prev_embedding_layer_norm/scale"),
@@ -337,12 +402,21 @@ export async function embedderWeights(store) {
 
 export async function templateWeights(store) {
   const T = (name) => store.tensor(name);
-  // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS 4 HEADS OF 16, not the trunk's
-  // 4 of 32: 64 channels rather than 128.
-  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0, 4, 16)),
-                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1, 4, 16))];
+  // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS NARROWER THAN THE TRUNK'S, and
+  // by a different factor in every checkpoint: AF3's is 4 heads of 16 against
+  // the trunk's 4 of 32, and OpenDDE's is 2 of 32 against the trunk's 12 of 32.
+  // Both come out at 64 channels and neither number is derivable from the
+  // other, so `pairTrack` reads them off `pair_attention1/q_projection`.
+  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0)),
+                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1))];
+  // 🔴 AND THE QUERY WIDTH IS THE TRUNK PAIR'S, NOT THE STACK'S. The embedder
+  // reads the trunk's pair representation, normalises it and projects it DOWN
+  // into the stack - so `queryChannels` is 128 here and 384 under OpenDDE,
+  // while the stack it feeds stays 64 in both. `query_embedding_norm/scale` is
+  // the one tensor that states the input width on its own.
+  const [queryChannels] = dims(store, `${TEMPLATE_SINGLE}/query_embedding_norm/scale`);
   return {
-    queryChannels: 128, blocks,
+    queryChannels, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
@@ -369,11 +443,19 @@ export async function templateWeights(store) {
 
 export async function msaBlockWeights(store, index) {
   const at = (leaf) => stacked(store, `${MSA_STACK}/${leaf}`, index);
+  // `pair_logits/weights` is [blocks, pairChannels, heads] and `v_projection`
+  // [blocks, msaChannels, heads, valueDim] - so the MSA attention's own two
+  // widths and both of its head counts come out of its own tensors.
+  const [, pairChannels] = dims(store, `${MSA_STACK}/msa_attention1/pair_logits/weights`);
+  const [, msaChannels, msaHeads, msaDimension] =
+    dims(store, `${MSA_STACK}/msa_attention1/v_projection/weights`);
+  const [, , outerChannels] =
+    dims(store, `${MSA_STACK}/outer_product_mean/left_projection/weights`);
   return bind(store, {
-    pairChannels: 128, msaChannels: 64,
-    ...pairTrack(store, MSA_STACK, index, 4, 32),
+    pairChannels, msaChannels,
+    ...pairTrack(store, MSA_STACK, index),
     outerProductMean: {
-      outerChannels: 32,
+      outerChannels,
       layerNormInputScale: at("outer_product_mean/layer_norm_input/scale"),
       layerNormInputOffset: at("outer_product_mean/layer_norm_input/offset"),
       leftProjection: at("outer_product_mean/left_projection/weights"),
@@ -382,7 +464,7 @@ export async function msaBlockWeights(store, index) {
       outputB: at("outer_product_mean/output_b"),
     },
     msaAttention1: {
-      heads: 8, dimension: 8,
+      heads: msaHeads, dimension: msaDimension,
       actNormScale: at("msa_attention1/act_norm/scale"),
       actNormOffset: at("msa_attention1/act_norm/offset"),
       pairNormScale: at("msa_attention1/pair_norm/scale"),
@@ -401,16 +483,27 @@ export async function msaBlockWeights(store, index) {
   });
 }
 
-export async function pairformerBlockWeights(store, index) {
-  const at = (leaf) => stacked(store, `${PAIRFORMER}/${leaf}`, index);
+/**
+ * @param {object} store
+ * @param {number} index the block
+ * @param {string} [root] which stack - the trunk's by default, and OpenDDE's
+ *   structural-token REFINER is the other. It is the same block at a different
+ *   shape: 8 single heads of 48 where the trunk has 16 of 24, and a pair
+ *   transition of factor 2 where the trunk's is 4. Every one of those is
+ *   derived from the weights, so this is a path and nothing else.
+ */
+export async function pairformerBlockWeights(store, index, root = PAIRFORMER) {
+  const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
+  const [pairChannels, singleChannels, singleHeads, singleDimension] =
+    singleAttentionDims(store, root);
   return bind(store, {
-    pairChannels: 128, singleChannels: 384,
-    ...pairTrack(store, PAIRFORMER, index, 4, 32),
+    pairChannels, singleChannels,
+    ...pairTrack(store, root, index),
     singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
     singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
     singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
     singleAttention: {
-      heads: 16, dimension: 24,
+      heads: singleHeads, dimension: singleDimension,
       layerNormScale: at("single_attention_layer_norm/scale"),
       layerNormOffset: at("single_attention_layer_norm/offset"),
       qProjection: at("single_attention_q_projection/weights"),
@@ -429,23 +522,60 @@ export async function pairformerBlockWeights(store, index) {
   });
 }
 
-export async function distogramWeights(store) {
-  return { halfLogits: await store.tensor("diffuser/distogram_head/half_logits/weights") };
+/**
+ * The distogram head: one projection, and for some checkpoints a bias.
+ *
+ * 🔴 STOCK AF3's `half_logits` IS BIAS-FREE AND OpenDDE's IS NOT, and the head
+ * symmetrises by adding its own transpose - so a bias present here is applied
+ * TWICE per logit. That is what OpenDDE trained with (it symmetrises after its
+ * own linear, exactly as this graph does), which is why the bias crosses
+ * unchanged; two of the four families upstream lists need theirs HALVED by the
+ * converter instead, because their natives symmetrise the pair first. The
+ * tensor's presence is the gate, not the model name - but the dialect has to
+ * AGREE with it, or a bundle silently loses a term that spreads its softmax
+ * across every bin.
+ */
+export async function distogramWeights(store, dialect = af3Dialect(store)) {
+  const name = "diffuser/distogram_head/half_logits/weights";
+  const [pairChannels, bins] = dims(store, name);
+  const biasName = "diffuser/distogram_head/half_logits/bias";
+  // 🔴 `shape` THROWS ON A MISSING TENSOR RATHER THAN RETURNING undefined, which
+  // is right for every other caller and wrong for an optional one. Asking the
+  // manifest is the presence check; asking the store is the error.
+  const present = hasTensor(store, biasName);
+  if (dialect?.distogramBias === undefined) {
+    throw new Error("dialect.distogramBias has no default: stock AF3 trains no "
+      + "bias on half_logits and OpenDDE does");
+  }
+  if (present !== dialect.distogramBias) {
+    throw new Error(`this bundle ${present ? "carries" : "does not carry"} `
+      + `${biasName}, and its dialect says ${dialect.distogramBias}; one of the `
+      + "two is wrong and the fold would be silently different either way");
+  }
+  return {
+    halfLogits: await store.tensor(name), pairChannels, bins,
+    ...(present ? { halfLogitsBias: await store.tensor(biasName) } : {}),
+  };
 }
 
 export async function confidenceWeights(store) {
   const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
+  const [stackPairChannels, stackSingleChannels, stackSingleHeads, stackSingleDimension] =
+    singleAttentionDims(store, CONFIDENCE_STACK);
+  const [targetFeatWidth, pairChannels] =
+    dims(store, `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
+  const [singleChannels] = dims(store, `${CONFIDENCE}/plddt_logits_ln/scale`);
   const blocks = [];
   for (let index = 0; index < 4; index += 1) {
     const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
     blocks.push(await bind(store, {
-      pairChannels: 128, singleChannels: 384,
-      ...pairTrack(store, CONFIDENCE_STACK, index, 4, 32),
+      pairChannels: stackPairChannels, singleChannels: stackSingleChannels,
+      ...pairTrack(store, CONFIDENCE_STACK, index),
       singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
       singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
       singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
       singleAttention: {
-        heads: 16, dimension: 24,
+        heads: stackSingleHeads, dimension: stackSingleDimension,
         layerNormScale: at("single_attention_layer_norm/scale"),
         layerNormOffset: at("single_attention_layer_norm/offset"),
         qProjection: at("single_attention_q_projection/weights"),
@@ -465,7 +595,7 @@ export async function confidenceWeights(store) {
   }
   return {
     dialect: af3Dialect(store),
-    pairChannels: 128, singleChannels: 384, targetFeatWidth: 447, blocks,
+    pairChannels, singleChannels, targetFeatWidth, blocks,
     leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
     rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
     distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
@@ -508,6 +638,57 @@ export function af3Dialect(store) {
 }
 
 
+
+/** OpenDDE's structural-token stacks: the expander, and the refiner's root. */
+export const STRUCTURAL_EXPANDER = "diffuser/structural_token_expander";
+export const STRUCTURAL_REFINER = "diffuser/structural_token_refiner/trunk_pairformer";
+
+/**
+ * The seventeen tensors OpenDDE expands its residue representations with.
+ *
+ * 🔴 THE PAIR PROJECTION IS THE BIGGEST TENSOR IN THE MODEL AFTER THE TRUNK'S.
+ * `pair_block_proj` is [49, 384, 384] - one matrix per ORDERED role pair, so 49
+ * and not 28 - which is 7.2 M parameters and 28.9 MiB in float32.
+ */
+export async function structuralExpanderWeights(store) {
+  const T = (name) => store.tensor(`${STRUCTURAL_EXPANDER}/${name}`);
+  const [roles, singleInputChannels] = dims(store, `${STRUCTURAL_EXPANDER}/single_input_role_embedding`);
+  const [, pairChannels] = dims(store, `${STRUCTURAL_EXPANDER}/same_parent_embedding`);
+  const [, singleChannels] = dims(store, `${STRUCTURAL_EXPANDER}/single_role_embedding`);
+  return {
+    roles, singleInputChannels, singleChannels, pairChannels,
+    singleInputRoleEmbedding: await T("single_input_role_embedding"),
+    singleRoleEmbedding: await T("single_role_embedding"),
+    singleSplitNormScale: await T("single_split_norm/scale"),
+    singleSplitNormOffset: await T("single_split_norm/offset"),
+    singleSplit1: await T("single_split_1/weights"),
+    singleSplit2: await T("single_split_2/weights"),
+    pairBlockProj: await T("pair_block_proj"),
+    sameParentEmbedding: await T("same_parent_embedding"),
+    sameResidueTwinEmbedding: await T("same_residue_twin_embedding"),
+    prevBbChainEmbedding: await T("prev_bb_chain_embedding"),
+    nextBbChainEmbedding: await T("next_bb_chain_embedding"),
+    rolePairTypeEmbedding: await T("role_pair_type_embedding"),
+    // 🔴 FOUR OF THESE ARE RANK-ZERO, which a reader expecting a vector will
+    // index as [0] and a reader expecting a scalar will not. They arrive as
+    // one-element arrays; the reference takes [0].
+    attnBiasSameParent: await T("attn_bias_same_parent"),
+    attnBiasSameResidueTwin: await T("attn_bias_same_residue_twin"),
+    attnBiasPrevBbChain: await T("attn_bias_prev_bb_chain"),
+    attnBiasNextBbChain: await T("attn_bias_next_bb_chain"),
+    attnBiasRolePairType: await T("attn_bias_role_pair_type"),
+  };
+}
+
+/** The refiner: four pairformer blocks on the structural tokens. */
+export async function structuralRefinerWeights(store, blocks = 4) {
+  const out = [];
+  for (let index = 0; index < blocks; index += 1) {
+    out.push(await pairformerBlockWeights(store, index, STRUCTURAL_REFINER));
+  }
+  return out;
+}
+
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
 export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
   const msa = [];
@@ -516,12 +697,18 @@ export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) 
   for (let index = 0; index < pairformerBlocks; index += 1) {
     pairformer.push(await pairformerBlockWeights(store, index));
   }
+  // 🔴 THE DIALECT IS STAMPED ON THE EMBEDDER TOO, because the embedder is
+  // where it decides something: OpenDDE builds the pair from `s_init` and stock
+  // AF3 from `target_feat`, and the reference and the shader both read it off
+  // the weights they were handed rather than from a caller who might not pass
+  // one. Deriving it once here keeps a single source.
+  const dialect = af3Dialect(store);
   return {
-    dialect: af3Dialect(store),
-    embedder: await embedderWeights(store),
+    dialect,
+    embedder: { ...await embedderWeights(store), dialect },
     template: await templateWeights(store),
     msaBlocks: msa,
     pairformerBlocks: pairformer,
-    distogram: await distogramWeights(store),
+    distogram: await distogramWeights(store, dialect),
   };
 }

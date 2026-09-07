@@ -39,7 +39,7 @@ import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
 import { transitionRowTile } from "./transition-webgpu.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
+  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
@@ -49,14 +49,31 @@ import { residentPackedOnDevice } from "./device-weights.js";
 import { createSingleAttentionShaders, packSingleAttentionWeights, SINGLE_ATTENTION_ORDER }
   from "./single-attention-webgpu.js";
 
-const SINGLE_CHANNELS = 384;
+/**
+ * 🔴 THE WIDTHS COME FROM THE WEIGHTS, NOT FROM HERE. A block carries its own
+ * `pairChannels` and `singleChannels` because `src/af3/weights.js` derives them
+ * from the tensors that state them, and OpenDDE's pair track is 384 channels
+ * where AlphaFold 3's is 128. These two remain only as the SHAPES A STATE
+ * OBJECT IS CHECKED AGAINST when a caller hands one in, and both checks read
+ * the block's number rather than these - see `#runStack`.
+ */
+const AF3_SINGLE_CHANNELS = 384;
 
 /**
  * The pair logits that bias single attention: LayerNorm the pair, project to
  * one scalar per head, and write it HEAD-MAJOR, which is the layout the
  * attention kernel reads a row of.
  */
-function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance) {
+/**
+ * @param {boolean} [extraBias] add a precomputed per-PAIR bias, broadcast over
+ *   heads. OpenDDE's structural-token refiner is the only caller that wants
+ *   one: the expander derives it from the structural relationships between
+ *   subtokens - same parent, twin, chain-adjacent backbone, role pair - and
+ *   every block of the refiner adds the SAME bias to its single attention.
+ *   None for every other pairformer here.
+ */
+function createPairLogitsShader(n, channels, heads, offsets, epsilon, variance,
+                                extraBias = false) {
   const pairs = n * n;
   // 🔴 THE HEADS ARE CONTIGUOUS IN THE PROJECTION, SO THEY ARE THE VECTOR - and
   // the normalisation belongs outside them. This looped heads OUTSIDE channels
@@ -83,6 +100,7 @@ const W_PROJECT: u32 = ${offsets.projection}u;
 // ...as vec4, which is why W_PROJECT and HEADS must both be multiples of four.
 @group(0) @binding(2) var<storage, read> projection: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> logits: array<f32>;
+${extraBias ? "@group(0) @binding(4) var<storage, read> extra_bias: array<f32>;" : ""}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -114,8 +132,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let column = (W_PROJECT + c * HEADS) / 4u;
     ${overHeadVectors((h) => `sum${h} += value * projection[column + ${h}u];`)}
   }
+${extraBias ? "  let extra = extra_bias[row];\n" : ""}\
   ${overHeadVectors((h) => Array.from({ length: 4 }, (_, l) =>
-    `logits[(${h * 4 + l}u) * PAIRS + row] = sum${h}.${"xyzw"[l]};`).join("\n  "))}
+    `logits[(${h * 4 + l}u) * PAIRS + row] = sum${h}.${"xyzw"[l]}`
+      + `${extraBias ? " + extra" : ""};`).join("\n  "))}
 }`;
 }
 
@@ -201,11 +221,29 @@ export class Af3PairformerStackGpu {
     if (dialect?.swapTransposedBias === undefined) {
       throw new Error("dialect.swapTransposedBias has no default");
     }
-    if (state.pair.length !== pairs * PAIR_CHANNELS) {
-      throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * PAIR_CHANNELS}`);
+    // 🔴 EVERY WIDTH IN THIS STACK IS THE BLOCK'S, NOT A MODULE CONSTANT.
+    // OpenDDE runs this same graph at a 384-channel pair track and 12 grid
+    // heads where AlphaFold 3 has 128 and 4, and a declared width loads it
+    // without complaint - see src/af3/weights.js. They go in the shader cache
+    // key below for the same reason.
+    // 🔴 OpenDDE's REFINER ADDS A PRECOMPUTED PAIR BIAS TO ITS SINGLE
+    // ATTENTION, and the same one to every block - it is a property of the
+    // structural-token layout, not of a block. It goes in the shader cache key
+    // because its presence changes the kernel's BINDINGS, and a key that could
+    // not tell the two apart would hand a four-binding bind group to a
+    // three-binding layout.
+    const extraPairBiasData = options.extraPairBias;
+    const pairChannels = blocks[0].pairChannels;
+    const singleChannels = blocks[0].singleChannels ?? AF3_SINGLE_CHANNELS;
+    if (!(pairChannels > 0)) {
+      throw new Error("pairformer blocks carry no pairChannels; they are built "
+        + "by src/af3/weights.js, which derives it from the weights");
     }
-    if (state.single.length !== n * SINGLE_CHANNELS) {
-      throw new Error(`single has ${state.single.length} elements; expected ${n * SINGLE_CHANNELS}`);
+    if (state.pair.length !== pairs * pairChannels) {
+      throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * pairChannels}`);
+    }
+    if (state.single.length !== n * singleChannels) {
+      throw new Error(`single has ${state.single.length} elements; expected ${n * singleChannels}`);
     }
 
     const heads = blocks[0].singleAttention.heads;
@@ -213,10 +251,12 @@ export class Af3PairformerStackGpu {
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
-    const pairBytes = pairs * PAIR_CHANNELS * 4;
+    const pairBytes = pairs * pairChannels * 4;
 
     // The pair track, shared with the MSA stack.
-    const base = `af3-block:${n}:${epsilon}:${variance}:${dialect.swapTransposedBias}`;
+    const base = `af3-block:${n}:${pairChannels}:${singleChannels}`
+      + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`
+      + `:${extraPairBiasData === undefined ? "nobias" : "bias"}`;
     const hasF16 = this.device.features?.has("shader-f16") === true;
     const stagedPrecision = this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE RESIDENT WEIGHTS ARE THE MEMORY, AND THE SINGLE TRACK IS THE
@@ -251,7 +291,8 @@ export class Af3PairformerStackGpu {
       throw new Error("f16 weights and staged tiles require the shader-f16 feature");
     }
     const pipelines = await compilePairTrack(this.pipelines, {
-      n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
+      n, channels: pairChannels, sample: blocks[0], epsilon, variance, dialect, base,
+      stagedPrecision,
       weightPrecision: pairWeightPrecision, accumulatePrecision,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js. `compile`
@@ -271,10 +312,10 @@ export class Af3PairformerStackGpu {
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
     into("singleTransition", `${base}:single-transition:${weightPrecision}`,
-      createTransitionShader({ rows: n, channels: SINGLE_CHANNELS, factor: 4, weightPrecision },
+      createTransitionShader({ rows: n, channels: singleChannels, factor: 4, weightPrecision },
                              singleTransitionOffsets, epsilon, variance));
     const { projectSplits, ...singleSources } = createSingleAttentionShaders(
-      { n, channels: SINGLE_CHANNELS, heads, dimension: blocks[0].singleAttention.dimension,
+      { n, channels: singleChannels, heads, dimension: blocks[0].singleAttention.dimension,
         weightPrecision },
       singleOffsets, epsilon, variance);
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
@@ -283,8 +324,9 @@ export class Af3PairformerStackGpu {
       into(`single:${name}`, `${base}:single:${weightPrecision}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
-      createPairLogitsShader(n, PAIR_CHANNELS, heads, logitsOffsets, epsilon, variance));
-    into("addSingle", `${base}:add-single`, createAddShader(n * SINGLE_CHANNELS));
+      createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,
+                             extraPairBiasData !== undefined));
+    into("addSingle", `${base}:add-single`, createAddShader(n * singleChannels));
     await Promise.all(compiling);
 
     try {
@@ -304,8 +346,12 @@ export class Af3PairformerStackGpu {
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-block.scratch${index}`,
-          storageBytes(pairs * PAIR_CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
+      // Uploaded once for the stack, not per block: it is the same tensor for
+      // all four of the refiner's blocks.
+      const extraPairBias = extraPairBiasData === undefined ? undefined
+        : keep(this.allocator.upload("af3-block.extra-pair-bias", extraPairBiasData, storage));
       const biasBuffer = keep(this.allocator.allocate(
         "af3-block.bias", gridHeads * pairs * 4, storage));
       const pairLogits = keep(this.allocator.allocate(
@@ -315,7 +361,7 @@ export class Af3PairformerStackGpu {
       for (let index = 0; index < 6; index += 1) {
         singleScratch.push(keep(this.allocator.allocate(
           `af3-block.single-scratch${index}`,
-          Math.max(n * singleWidth, n * SINGLE_CHANNELS) * 4, storage)));
+          Math.max(n * singleWidth, n * singleChannels) * 4, storage)));
       }
 
       // 🔴 SUBMISSION RUNS AHEAD OF THE DEVICE, ON PURPOSE. Every block used to
@@ -353,6 +399,7 @@ export class Af3PairformerStackGpu {
         const encodeStart = performance.now();
         await this.#encodeBlock({
           block: blocks[index], n, pairs, heads, gridHeads, pipelines, storage, keep, pending,
+          pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
         });
@@ -402,12 +449,12 @@ export class Af3PairformerStackGpu {
         "af3-block.readback-pair", pairBytes,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
       const readbackSingle = keep(this.allocator.allocate(
-        "af3-block.readback-single", n * SINGLE_CHANNELS * 4,
+        "af3-block.readback-single", n * singleChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const encoder = this.device.createCommandEncoder({ label: "af3-block.readback" });
       encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairBytes);
-      encoder.copyBufferToBuffer(single.buffer, 0, readbackSingle.buffer, 0, n * SINGLE_CHANNELS * 4);
+      encoder.copyBufferToBuffer(single.buffer, 0, readbackSingle.buffer, 0, n * singleChannels * 4);
       this.device.queue.submit([encoder.finish()]);
       await readbackPair.buffer.mapAsync(GPUMapMode.READ);
       const outPair = new Float32Array(readbackPair.buffer.getMappedRange().slice(0));
@@ -434,6 +481,7 @@ export class Af3PairformerStackGpu {
   /** One block, submitted as one command buffer. */
   async #encodeBlock(context) {
     const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
+    const { pairChannels, singleChannels, extraPairBias } = context;
     const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch } = context;
 
     // 🔴 RELEASED IMMEDIATELY, AND THAT IS SAFE BECAUSE THE QUEUE IS ORDERED.
@@ -465,7 +513,7 @@ export class Af3PairformerStackGpu {
     // once per block, and only while the misses are being filled.
     let packedPair;
     const packedFor = () => (packedPair ??= packPairTrackWeights(
-      block, PAIR_CHANNELS, context.pairWeightPrecision));
+      block, pairChannels, context.pairWeightPrecision));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
@@ -575,7 +623,8 @@ export class Af3PairformerStackGpu {
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
     encodePairTrack({
-      run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer,
+      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
+      scratch, biasBuffer,
       weights: pairTrackWeights,
     });
 
@@ -584,7 +633,10 @@ export class Af3PairformerStackGpu {
     // ...the weights are bound twice, as scalars and as the vec4 view the head
     // projection is read through.
     run("pair-logits", pipelines.pairLogits,
-        [pair, logitsWeights, logitsWeights, pairLogits], linear[0], linear[1]);
+        extraPairBias === undefined
+          ? [pair, logitsWeights, logitsWeights, pairLogits]
+          : [pair, logitsWeights, logitsWeights, pairLogits, extraPairBias],
+        linear[0], linear[1]);
 
     run("single.project", pipelines["single:project"],
         [single, singleWeights, singleScratch[0], singleScratch[1], singleScratch[2],
@@ -594,11 +646,12 @@ export class Af3PairformerStackGpu {
          singleScratch[4]], n * heads);
     run("single.project-out", pipelines["single:project_out"],
         [singleScratch[4], singleScratch[3], singleWeights, singleScratch[5]], n);
-    const addSingle = spread(ceil(n * SINGLE_CHANNELS, 64));
+    const addSingle = spread(ceil(n * singleChannels, 64));
     run("single.add", pipelines.addSingle, [single, singleScratch[5]], addSingle[0], addSingle[1]);
 
     run("single-transition", pipelines.singleTransition,
-        [single, singleTransitionWeights, singleScratch[0]], ceil(n, transitionRowTile(n, SINGLE_CHANNELS)));
+        [single, singleTransitionWeights, singleScratch[0]],
+        ceil(n, transitionRowTile(n, singleChannels)));
     run("single-transition.add", pipelines.addSingle, [single, singleScratch[0]],
         addSingle[0], addSingle[1]);
 
