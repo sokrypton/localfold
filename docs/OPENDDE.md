@@ -129,9 +129,47 @@ away. **Lineage is provenance; a convention is a separate question.**
   `__layer_stack_no_per_layer` rather than `__layer_stack_with_per_layer`, so
   reading either convention without the other finds no tensors at all.
 
+* **`chainedAtomLayerNorm`** - the atom cross-attention's two adaptive
+  LayerNorms are CHAINED: `a = layernorm_a(a, s)` then
+  `kv = layernorm_kv(a, s)` reading the ALREADY-NORMALISED a, so the gather
+  onto the key layout happens between them and the second norm sees the first
+  one's learned scale. AlphaFold 3 normalises the raw activation twice, once
+  per side. The GPU's key projection fuses its own normalisation into itself,
+  so chaining means handing it a pre-normalised activation - `normaliseQueries`
+  writes `adaLN_q(act)` and the caller binds that in place of `act`, while the
+  QUERY projection still reads the raw one.
+* **`keyMaskedAtomAttention`** - the attention's mask bias is a SUM rather than
+  AlphaFold 3's PRODUCT, so a real query cannot attend to a padded key at all
+  where AF3 penalises a pair only when both ends are padded.
+
 `test/opendde-branches.test.js` runs BOTH arms of the first two over one set of
 weights and asserts they differ, because a flag that never reaches the
-arithmetic agrees with itself.
+arithmetic agrees with itself. `test/opendde-shaders.test.js` does the same for
+the GPU arms by asserting on the generated WGSL - comparing cache keys is not
+comparing kernels, which this repository records a unit test passing for while
+the fold came back NaN.
+
+### What the last two branches are worth, measured
+
+| branch | moves the trunk | moves the contact map |
+|---|---|---|
+| `chainedAtomLayerNorm` | pairRms 21.6072 against 21.6139, single 12.8431 against 12.8054 | **no** - 0.605 / 0.953 / 0.718 either way |
+| `keyMaskedAtomAttention` | **nothing at all**, to every digit | no |
+
+🔴 **AND THE SECOND ONE IS INERT BY CONSTRUCTION, NOT BY LUCK.** The key window
+is `min(128, atomCount)`, so no key this featuriser produces is ever padded,
+`mask_k` is identically one and the two forms agree exactly. It is implemented
+because the differential checkers do NOT use this featuriser - they feed
+AlphaFold 3's own gathers out of an oracle dump, where padded keys do occur -
+and the same reasoning is already recorded here for `maskPaddedKeys`.
+
+🔴 **AND A NULL RESULT IS ONLY WORTH HAVING IF THE FLAG REACHED THE KERNEL**,
+which is why both rows above are backed by a WGSL assertion rather than by the
+measurement alone. The first two ablations run here were silently dropped: the
+atom blocks carry their OWN copy of these flags, stamped at load time, so
+changing the caller's dialect left the bundle's own answer in place and both
+arms reported the same number - which is also what "the branch does not matter"
+looks like.
 
 ### The distogram bias, which is applied twice
 
@@ -178,6 +216,14 @@ template embedder share every name and differ only in width; the diffusion
 shares 51 of 53; the confidence head shares nothing usable.
 
 So the exported bundle is the trunk and the distogram head, and stops there.
+
+🔴 **AND NOTHING CAN RUN THE ABSENT HALVES BY ACCIDENT.** `diffusionWeights`
+and `confidenceWeights` on this bundle both refuse by naming the first tensor
+they cannot find, rather than loading a partial graph - which is the structural
+gate doing its job, and the reason four of the dialect's flags
+(`perBlockPairLayerNorm` on the token transformer, `splitPairConditioning`, and
+the two heads above) are declared and unreachable rather than declared and
+silently ignored.
 
 ## The bundle
 
