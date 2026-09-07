@@ -152,6 +152,27 @@ function exact(name, ours, theirs) {
 function gatherMatches(name, ours, prefix) {
   const theirIndices = Array.from(input(`${prefix}:gather_idxs`), Number);
   const theirMask = Array.from(input(`${prefix}:gather_mask`), Number);
+  // 🔴 AF3's ATOM AXIS IS PADDED TO THE DENSE GRID AND OURS IS NOT, so ours is
+  // a PREFIX of AF3's rather than the same length. AF3 sizes its subsets from
+  // tokens * 24 because JAX wants a static shape - 51 of them for 574 atoms,
+  // where 18 hold an atom - and comparing the full arrays would report a shape
+  // disagreement where the disagreement is entirely subsets nothing reads.
+  //
+  // 🔴 AND THE CLAIM IS ABOUT THE QUERIES, NOT ABOUT THE DROPPED ELEMENTS. On
+  // a key axis the tail is NOT masked: the window is clamped to the last
+  // in-bounds start, so even a subset whose every query is padding still
+  // gathers 128 real keys. Those keys are attended only by that subset's own
+  // queries, and every one of those is masked - which is the statement
+  // asserted here, against AF3's OWN query mask.
+  if (ours.mask.length < theirMask.length) {
+    const queryMask = Array.from(input("token_atoms_to_queries:gather_mask"), Number);
+    const firstDropped = Math.round(queryMask.length * ours.mask.length / theirMask.length);
+    report(`${name} dropped subsets hold no query`,
+           `${theirMask.length - ours.mask.length} elements past ours`,
+           queryMask.slice(firstDropped).every((value) => value === 0));
+    theirIndices.length = ours.mask.length;
+    theirMask.length = ours.mask.length;
+  }
   exact(`${name} mask`, ours.mask, theirMask);
   const mine = [];
   const yours = [];

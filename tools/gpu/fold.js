@@ -52,6 +52,12 @@ function relativeRms(actual, expected) {
 export function batchFromDump(dump) {
   const tokens = dump.tokens;
   const dense = 24;
+  // 🔴 PADDED, DELIBERATELY, AND ONLY HERE. The featuriser sizes its subsets
+  // from the real atom count; this path does not, because its gathers ARE
+  // AF3's - read straight out of the dump, at the dense grid's width - and a
+  // subset count that disagreed with the arrays beside it is the failure this
+  // repository keeps meeting. The two paths differ in shape and agree to every
+  // digit in what they fold, which is what the padding was worth.
   const subsets = Math.ceil((tokens * dense) / 32);
   const raw = (name) => dump.inputs[name].data;
   // 🔴 count IS NOT DECORATION. convert() in atom-encoder-reference.js sizes its

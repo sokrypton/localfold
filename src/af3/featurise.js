@@ -79,7 +79,16 @@ function gather(count) {
  */
 export function atomGathers({ tokens, dense, realAtoms, pseudoBetaSlot }) {
   const atomCount = realAtoms.length;
-  const subsets = Math.ceil((tokens * dense) / QUERIES);
+  // 🔴 SUBSETS COUNT THE REAL ATOMS, NOT THE PADDED GRID. The query layout is
+  // the compacted list of real atoms, so a subset past `atomCount / 32` holds
+  // 32 masked queries, gathers nothing, scatters nowhere and computes a full
+  // 32 x `keys` attention over padding. Sizing it from `tokens * dense` made
+  // that the common case: 51 subsets for 574 atoms on a 68-residue chain where
+  // 18 carry an atom, and OpenDDE's structural layout - the same atoms in
+  // twice the tokens - took 98. The atom encoder and decoder run once per
+  // diffusion step and every buffer they hold is `subsets * queries * keys`
+  // wide, so the padding was the majority of both.
+  const subsets = Math.max(1, Math.ceil(atomCount / QUERIES));
   // token_atoms_to_queries: query slot -> flat token-atom, the compacted list.
   const tokenAtomsToQueries = gather(subsets * QUERIES);
   for (let query = 0; query < atomCount; query += 1) {
@@ -262,7 +271,6 @@ export function featuriseProtein(sequence, options = {}) {
   const polymerTokens = residues.reduce((sum, residue) => sum + residue.tokens, 0);
   const tokens = polymerTokens + ligandTokens;
   if (tokens === 0) throw new Error("featuriseProtein: empty sequence");
-  const subsets = Math.ceil((tokens * DENSE) / QUERIES);
   const chainLengths = chains.map((chain) => chain.length);
   // 🔴 NOT COMPUTED WHEN THERE ARE NO RESIDUES. A ligand on its own is a valid
   // fold - AF3 accepts one - and both of these reject a zero-length sequence,
@@ -537,8 +545,14 @@ export function featuriseProtein(sequence, options = {}) {
 
   const atomCount = realAtoms.length;
 
+  // 🔴 `subsets` COMES FROM HERE AND NOWHERE ELSE. It used to be computed a
+  // second time, three hundred lines above, from `tokens * DENSE` - so the
+  // batch's `shape.subsets` and the gathers sized beside it were two
+  // derivations of one number, which is the failure this repository keeps
+  // meeting: a dispatch sized for one width against buffers built for another.
+  // They agreed only while both were wrong.
   const {
-    keys, tokenAtomsToQueries, queriesToTokenAtoms, queriesToKeys,
+    subsets, keys, tokenAtomsToQueries, queriesToTokenAtoms, queriesToKeys,
     tokensToQueries, tokensToKeys, tokenAtomsToPseudoBeta,
   } = atomGathers({ tokens, dense: DENSE, realAtoms, pseudoBetaSlot });
 
