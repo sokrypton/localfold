@@ -541,3 +541,32 @@ the box, which is why it is measured separately.
 **Not yet exercised through a session:** a multi-chain or ligand fold (the
 `chainLengths` and `tokens` round trip), OpenDDE and OpenBind-0, and anything
 long enough for the n^2 matrices and the frame count to matter together.
+
+### A complex and a ligand through a session
+
+🔴 **A LIGAND IS THE CASE THE ARCHIVE REFUSES TO GUESS.** It is one token per
+heavy atom, so a fold with one has MORE TOKENS THAN RESIDUES, and
+`tokenIdentifiers` throws rather than numbering them - "this fold's token
+layout must be passed in, not inferred". That makes it the sharpest test of a
+session carrying `tokens` back: 58 residues plus GOL is **64 tokens**, the
+restored PAE is 64 wide, and the archive is written rather than refused. Had
+`tokens` been lost, the token count would still have come out as 64 from the
+PAE's own length and the builder would have thrown against 58 residues.
+`fold-in-page.py --ligand GOL` drives it.
+
+🔴 **AND THE COMPLEX EXERCISES THE KEYING THAT WAS ONCE WRONG.** Per-chain
+scores are keyed by ASYM ID, which AlphaFold 3 numbers from one and AlphaFold 2
+from zero - read as indices they produced `chain_pair_iptm` all null while
+every unit test passed. Measured through a saved session, on a 58 + 76 fold:
+
+| | |
+|---|---|
+| chains | `[58, 76]`, 134 residues |
+| token layout | 134 tokens, chains `['A','B']`, last residue id **76** - numbering restarts per chain |
+| `chain_ptm` | `[0.46, 0.54]` |
+| `chain_pair_max_contact` | `[[0.61, 0.2], [0.2, 1]]` |
+| `pae` | diagonal 0.8, off-diagonal 19.3, max 28.9 |
+| PDB | 84,458 B, 1,069 atoms |
+
+**Still not exercised through a session:** OpenDDE and OpenBind-0, and anything
+long enough for the n^2 matrices and the frame count to matter together.
