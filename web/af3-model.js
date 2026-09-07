@@ -94,6 +94,18 @@ export const AF3_COUNTS = {
  * The ladder keeps 25 and up so the AlphaFold 3 settings remain selectable and
  * comparable; what moves is which one a fold takes when nobody chooses.
  */
+/**
+ * 🔴 OpenDDE TAKES THE DIFFUSION SAMPLER, AND THE FLOW ARM IS A LOSS AT THE
+ * SAME PRICE. On 6MRR at sixteen steps, two seeds each: diffusion TM 0.9044
+ * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s. AlphaFold 3
+ * prefers flow because its diffusion default is 200 steps and flow-16 reaches
+ * it in a twelfth of the calls; OpenDDE's sampler is already best at sixteen,
+ * so there is nothing for a flow arm to escape and escaping it loses the
+ * structure. The mode row is hidden for this family AND the value forced, so a
+ * stale select cannot reintroduce it.
+ */
+export const OPENDDE_SAMPLER_MODE = "diffusion";
+
 export const OPENDDE_COUNTS = {
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
   diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },

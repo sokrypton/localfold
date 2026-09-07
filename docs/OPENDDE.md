@@ -438,6 +438,30 @@ quadratic in them, so OpenDDE pays about four times AF3's sampler cost for the
 same protein. The structural expansion is what buys the accuracy; it is also
 what costs the time.
 
+### The sampler: diffusion, sixteen steps
+
+🔴 **THE FLOW ARM IS A LOSS AT THE SAME PRICE, WHICH IS THE OPPOSITE OF WHAT IT
+IS FOR AlphaFold 3.** On 6MRR at sixteen steps, two seeds each:
+
+| | TM | RMSD | time |
+|---|---|---|---|
+| **diffusion-16** | **0.9044, 0.9169** | 1.498, 1.399 | 16.1 s |
+| flow-16 | 0.8307, 0.8601 | 1.828, 1.641 | 16.1 s |
+
+AlphaFold 3 prefers flow because its diffusion default is 200 steps and flow-16
+reaches it in a twelfth of the calls. OpenDDE's sampler is already best at
+SIXTEEN, so a flow arm has nothing to escape from - and escaping the re-noising
+is what loses the structure. The mode row is hidden for this family and the
+value FORCED, because hiding a control does not change it: the shared
+`#af3-mode` select still reads "flow" behind a hidden row, which
+docs/EF2FAST.md records catching an hour after hiding its own.
+
+🔴 **AND THE PAGE HAD BEEN RUNNING THE WORSE ONE.** Every measurement in this
+section was taken in diffusion mode through the shell tool, while the page
+defaulted to flow - so the deployed site folded OpenDDE at TM 0.83-0.86 where
+it can do 0.90-0.92, for the same twenty seconds. Measure the arm the PAGE
+runs, not the one the tool defaults to.
+
 ### More sampler steps are WORSE, on two targets and nine folds
 
 TM against the deposition, one column per seed:

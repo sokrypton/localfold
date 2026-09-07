@@ -35,7 +35,7 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, OPENDDE_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
@@ -1546,8 +1546,14 @@ function syncModelControls() {
   // them than the shipped one - see ESMFOLD2_COUNTS. Offering a choice whose
   // every option is equivalent-or-worse is the same fault as offering one that
   // is ignored, so the mode row is hidden for it.
+  // 🔴 AND OpenDDE HIDES IT FOR THE SAME REASON, MEASURED ON ITS OWN SAMPLER.
+  // Flow and diffusion cost it the SAME 16.1 s at sixteen steps and flow is
+  // plainly worse - TM 0.8307 and 0.8601 against 0.9044 and 0.9169 on 6MRR,
+  // two seeds each and no overlap. Its sampler re-noises every step, which is
+  // what a flow arm exists to escape, and escaping it here loses the structure
+  // rather than buying time. See OPENDDE_SAMPLER_MODE.
   const modeNode = document.getElementById("af3ModeGroup");
-  if (modeNode !== null) modeNode.hidden = !af3;
+  if (modeNode !== null) modeNode.hidden = !af3 || family === "opendde";
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
   // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
   // screen would run, take a minute of somebody else's server, and be
@@ -1814,8 +1820,14 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     if (problem !== null) throw new Error(problem);
   }
 
-  const mode = document.getElementById("af3-mode")?.value ?? "flow";
-  const counts = chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
+  // 🔴 FORCED IN CODE, NOT ONLY HIDDEN. Hiding a control does not change its
+  // value: the shared `#af3-mode` select still reads "flow" behind a hidden
+  // row, which is the trap docs/EF2FAST.md records for that model an hour
+  // after hiding its own.
+  const opendde = chosenFamily() === "opendde";
+  const mode = opendde ? OPENDDE_SAMPLER_MODE
+    : (document.getElementById("af3-mode")?.value ?? "flow");
+  const counts = opendde ? OPENDDE_COUNTS : AF3_COUNTS;
   const asked = Number(document.getElementById("af3-count")?.value)
     || counts[mode].preferred;
   // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
