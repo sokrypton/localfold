@@ -647,11 +647,15 @@ sampler. `probe-ligand-flow.js --ligand=GOL --mode=diffusion --steps=64` is a
 twenty-five-second reproduction; AlphaFold 3 through the same tool is 0.033 A
 where OpenDDE is 0.349.
 
-🔴 **AND THE CONFIDENCE HEAD IS ANTICORRELATED WITH IT.** OpenDDE reports a
-HIGHER mean pLDDT than AlphaFold 3 on every arm measured while being the worse
-structure on every one. This is worse than the "uncalibrated" note below and
-supersedes it: until it is calibrated the page should not present the number as
-a quality score.
+🔴 **AND THE CONFIDENCE HEAD'S LEVEL IS WORTH ONE CHECK, NOT AN ALARM.** Its
+within-fold ranking is -0.31 where AlphaFold 3's on the same target is -0.35,
+so it tracks error about as well as the reference does; what differs is the
+level. The one port-side suspect is `plddt_weight`, which is `[24, c_s, 50]` -
+indexed by an atom's DENSE SLOT. Under the structural layout a slot is the
+atom's position within its STRUCTURAL token, so a sidechain token's first atom
+reads slot 0's matrix where a residue layout would give that matrix to N. That
+is either right or badly wrong depending on which space upstream indexes, and
+like everything else on the diffusion side it needs a dump to settle.
 
 🔴 **AND THE 250-RESIDUE CEILING IS WHAT A USER MEETS FIRST**, before any
 optimisation matters to them. See the regime section above: it is the
@@ -662,11 +666,13 @@ residues by 14.6% and at 200 by NOTHING, because the high-water mark there is
 the trunk's pair scratch. So the ceiling is unchanged and now measured to be
 somebody else's problem.
 
-🔴 **THE pLDDT IS WIRED AND UNCALIBRATED.** Per-residue Spearman against real
-deviation is -0.19 to -0.29 on two near-perfect targets - the right sign, and
-measured where there is almost no error to rank. A real statement needs
-docs/EF2FAST.md's corruption sweep, which manufactures the hard end rather than
-waiting for it. See the anticorrelation above before trusting the sign.
+🔴 **THE pLDDT IS WIRED, AND RANKS AS WELL AS AlphaFold 3's DOES HERE.**
+Per-residue Spearman against real deviation is -0.17 to -0.31 on two
+near-perfect targets, against AlphaFold 3's own -0.35 on one of them through
+the same tool. The right sign, roughly the reference's strength, and measured
+where there is almost no error to rank. A statement about calibration - the
+LEVEL, which is the part that does differ - needs docs/EF2FAST.md's corruption
+sweep, which manufactures the hard end rather than waiting for it.
 
 🔴 **AND pTM IS ABSENT AND SHOULD STAY ABSENT** until something emits a TM
 term. OpenDDE's head does not; deriving one from the PAE would be a different
@@ -757,13 +763,33 @@ ideal conformer, `probe-ligand-flow.js --ligand=GOL --mode=diffusion
 --steps=64`: AlphaFold 3 rms **0.033 A** (max 0.055), OpenDDE rms **0.349 A**
 (max 0.641). Five bonds, one component, twenty-five seconds.
 
-🔴 **AND THE CONFIDENCE HEAD IS HIGHEST WHERE THE CHEMISTRY IS WORST.** OpenDDE
-reports mean pLDDT 94.3 on the ligand job to AlphaFold 3's 89.8, 92.1 to 85.9
-on the protein alone, and 91.6 to 88.1 on the complex - higher than AlphaFold 3
-on every arm while being the worse structure on every arm. The uncalibrated
-note above understates it: on this evidence the number is not merely unranked,
-it is confidently wrong, and nothing in the page should present it as a
-quality score until it is calibrated.
+🔴 **THE CONFIDENCE HEAD'S LEVEL IS HIGH, AND ITS RANKING IS FINE - AND AN
+EARLIER ENTRY HERE CLAIMED OTHERWISE BECAUSE IT NEVER RAN THE CONTROL.** The
+level really is high: OpenDDE reports mean pLDDT 94.3 on the ligand job to
+AlphaFold 3's 89.8, 92.1 to 85.9 on the protein alone, 91.6 to 88.1 on the
+complex - higher on every arm while being the worse structure on every arm.
+
+But "higher mean than another model" is not "does not track error", and the two
+were conflated. What a pLDDT claims is that THIS residue is placed well, so the
+question is the within-fold ranking, which `fold-opendde.js` has always
+reported as `plddtVsError` - a Spearman where negative is correct:
+
+| 6MRR, 64 steps, recycles 0 | plddtVsError | RMSD |
+|---|---|---|
+| AlphaFold 3 int5, through the same tool | **-0.3484** | 0.774 |
+| OpenBind-0 | **-0.4984** | 1.963 |
+| OpenDDE | **-0.3063** | 1.676 |
+| OpenDDE, 1QYS | -0.1668 | 1.052 |
+
+🔴 **AlphaFold 3's OWN RANKING ON THIS TARGET IS -0.35.** OpenDDE's -0.31 is
+the same number. The -0.19 to -0.29 recorded further down as "weak" was weak
+against nothing - the control had never been measured, and measured, it is
+where AlphaFold 3 sits too. Two near-perfect targets give any head very little
+error to rank, which is a property of the targets and not of the port.
+
+So what is left is a LEVEL offset, and nothing here says whether that is the
+port or the model. A differently trained head is entitled to a different level.
+The one concrete port-side suspect is named below.
 
 🔴 **AND THE REASON IT SURVIVED IS THAT THERE IS NO OpenDDE ORACLE DUMP.**
 `oracle-dumps/` holds nine AlphaFold 3 captures - embedder, MSA, stack, trunk,
