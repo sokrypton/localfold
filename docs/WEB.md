@@ -892,3 +892,58 @@ a restored fold:
 
 The offer row says no pLDDT rather than `pLDDT 0.0`, which is the whole rule in
 one line.
+
+## The alignment travels now
+
+The session deliberately dropped the MSA, because it is 96.8% of a fold archive
+- 3.0 MB of ubiquitin's 3.1 MB. That reasoning was about an a3m's RAW size,
+which is not what gets stored: an alignment is thousands of near-identical rows,
+about the most compressible thing in the record. The reference archive's four
+real blocks are 1,288,080 bytes and gzip to 280,784, a ratio of 4.6.
+
+What it buys is the difference between a fold that can be **reproduced** and one
+that can only be looked at - a re-search finds different hits, so without it a
+restored fold's archive has to carry the "may find different hits" caveat.
+Measured on ubiquitin, 76 residues, MMseqs2:
+
+| | before | after |
+|---|---|---|
+| session record | ~250 KB raw / ~55 KB gz | **9,244,617 raw / 2,756,924 gz** |
+| restored archive | 19 KB, no `msas/` | **1,233,759 B, with `msas/`** |
+| README | "may find different hits" | no caveat: it reproduces |
+
+🔴 **AND IT IS THE ONE FIELD ALLOWED TO BE DROPPED.** Everything else in the
+record is bounded by the fold; an alignment is bounded by what a public server
+returned. So a `"quota"` save retries WITHOUT it and says
+`saved without its alignment - there was no room for it`, rather than letting
+one deep MSA cost the whole session. That is also the first thing that has ever
+exercised the quota branch's neighbourhood.
+
+🔴 **THE OFFER ROW READS A SEPARATE RECORD NOW, AND HAS TO.** It needs a model
+name, a residue count, a score and a timestamp - and it was getting them by
+ungzipping the entire session on every page load. That was 52 KB before; after
+this it is 2.8 MB of gzip over 9.2 MB of JSON, on a phone, to decide whether to
+show one line. `current-meta` is written in the SAME transaction as the session
+so the two cannot disagree, and it is named by what it DROPS - the alignment,
+the structure, the templates - because a summary built by listing what it keeps
+goes stale the moment `jobMeta` gains a field.
+
+### The fourth README state, which every single-sequence archive got wrong
+
+Found while making `archiveFor` ask what is actually held rather than where the
+prediction came from. The "here is `msas/`" branch was reached by any model with
+an alignment CONTROL - so a fold that deliberately used none described a
+directory that was not in the file and told the reader to drop the zip back "to
+fold again with exactly these alignments". **Every single-sequence archive this
+page has ever written said that**, and it is live on the site right now.
+
+Whether the archive CARRIES an alignment is a different question from whether
+the model TAKES one, and they are asked separately now - the carrying half
+answered by looking at the files that were written, not by a caller's flag:
+
+| the fold | the README |
+|---|---|
+| searched, alignment carried | ``msas/`` holds one alignment per chain |
+| searched, alignment dropped | left out, "may find different hits" |
+| ran on the single sequence | **ran on the sequence alone; folding it again reproduces it** |
+| model takes no alignment | folds from the sequence alone |

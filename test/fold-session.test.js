@@ -78,6 +78,30 @@ describe("the job behind a saved session", () => {
    * web/app.js reads them back; what stays here is the summary, which is not
    * in any frame and is a handful of numbers.
    */
+  /**
+   * 🔴 THE ALIGNMENT TRAVELS, AND IT IS THE ONE FIELD ALLOWED TO GO. Without it
+   * a restored fold can be looked at and not REPRODUCED - a re-search finds
+   * different hits - so it is stored; it is also the only field bounded by what
+   * a public server returned rather than by the fold, so `rememberSession`
+   * drops it and saves again rather than losing the session to one deep MSA.
+   */
+  it("carries the alignment when it was given one", () => {
+    const meta = jobMeta({ stem: "af3_1", model: "AlphaFold 3",
+      prediction: prediction([4]), sequence: "ACDE",
+      msaOrigin: "MMseqs2 search at api.colabfold.com",
+      msas: { unpaired: [">q\nACDE\n"], paired: [undefined] } });
+    expect(meta.msas.unpaired[0]).toBe(">q\nACDE\n");
+    expect(meta.msaOrigin).toBe("MMseqs2 search at api.colabfold.com");
+  });
+
+  // ...and absent stays absent, so a session saved without room for one
+  // restores into the archive's omitted state rather than an empty `msas/`.
+  it("leaves the alignment absent when there was none", () => {
+    const meta = jobMeta({ stem: "ef2_1", model: "ESMFold2",
+      prediction: prediction([4]), sequence: "ACDE" });
+    expect(meta.msas).toBe(undefined);
+  });
+
   it("keeps the summary and not the matrices", () => {
     const meta = jobMeta({ stem: "af3_1", model: "AlphaFold 3",
       prediction: prediction([4]), sequence: "ACDE" });
@@ -163,6 +187,25 @@ describe("what the README says about an alignment", () => {
   });
 
   /**
+   * 🔴 THE FOURTH STATE, AND EVERY SINGLE-SEQUENCE ARCHIVE GOT IT WRONG. The
+   * "here is `msas/`" branch was reached by any model with an alignment
+   * CONTROL, so a fold that deliberately used none described a directory that
+   * was not in the file and told the reader to drop the zip back "to fold again
+   * with exactly these alignments". Whether the archive carries an alignment is
+   * a different question from whether the model takes one.
+   */
+  it("says a single-sequence fold ran on the sequence alone", () => {
+    const text = readmeOf({ msaOrigin: "none (single sequence)", msas: {} });
+    expect(text.includes("ran on the sequence alone")).toBe(true);
+    expect(text.includes("`msas/` holds one alignment per chain")).toBe(false);
+    // ...and NOT the omitted caveat: there was nothing to omit, and saying so
+    // sends the reader looking for an archive that carries it.
+    expect(text.includes("may find different hits")).toBe(false);
+    // ...while the line under "What ran" still names what the fold was given.
+    expect(text.includes("- alignment: none (single sequence)")).toBe(true);
+  });
+
+  /**
    * The state that must not exist: an archive with no `msas/` member whose
    * README tells the reader to drop it on the upload box to reproduce the
    * fold. This is the assertion that would have caught the bug.
@@ -171,6 +214,13 @@ describe("what the README says about an alignment", () => {
     for (const extra of [
       { msaOrigin: "MMseqs2 search at api.colabfold.com", msas: {}, alignmentOmitted: true },
       { msaOrigin: undefined, msas: {} },
+      // ...and the one that was wrong: a model that HAS the control, on a fold
+      // that used none.
+      { msaOrigin: "none (single sequence)", msas: {} },
+      // ...and a caller asking for the alignment branch while passing no a3m,
+      // which is how the bug reached every such archive: the flag said one
+      // thing and the file held another. What was WRITTEN decides now.
+      { msaOrigin: "MMseqs2 search at api.colabfold.com", msas: {} },
     ]) {
       const files = buildFoldArchive({ ...base, ...extra });
       const hasMsas = [...files.keys()].some((name) => name.startsWith("msas/"));

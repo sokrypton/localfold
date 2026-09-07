@@ -62,6 +62,19 @@ export const chainLetter = (index) => CHAIN_IDS[index] ?? "?";
 const MAX_NAMED_CHAINS = 26;
 
 /**
+ * What `msaOrigin` says when the fold ran on the query alone.
+ *
+ * 🔴 A FOLD THAT USED NO ALIGNMENT IS NOT A MODEL THAT TAKES NONE, and the
+ * README had no way to tell them apart: `msaOrigin` answers "does this model
+ * have the control", so a single-sequence AF3 fold - which HAS the control and
+ * chose not to use it - fell into the branch that describes an `msas/`, and
+ * every such archive told the reader to drop it back "to fold again with
+ * exactly these alignments" while carrying none. The string lives here, beside
+ * the file that reasons about it, rather than being spelled twice.
+ */
+export const SINGLE_SEQUENCE_ORIGIN = "none (single sequence)";
+
+/**
  * Per-token chain letters and residue numbers.
  *
  * 🔴 DERIVED ONLY WHEN THE TOKENS ARE THE RESIDUES, AND CHECKED EITHER WAY.
@@ -353,7 +366,8 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
  * archive does not contain.
  */
 function readme({ stem, model, settings, msaOrigin, templateCount, scored = true,
-                  alignedError, alignmentOmitted = false }) {
+                  alignedError, alignmentOmitted = false,
+                  carriesAlignment = false }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -442,7 +456,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
       "one without reproducing it. Use \"Download all\" on a live fold to get an",
       "archive that carries its alignment and restores exactly.",
     );
-  } else if (msaOrigin !== undefined) {
+  } else if (carriesAlignment) {
     lines.push(
       "",
       "`msas/` holds one alignment per chain, split into the paired and unpaired",
@@ -450,6 +464,19 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
       "alignment upload box to fold again with exactly these alignments - the two",
       "blocks are not interchangeable, so re-uploading a single merged a3m would",
       "not reproduce this fold.",
+    );
+  } else if (msaOrigin !== undefined) {
+    // 🔴 THE FOURTH STATE, AND THE ONE THAT WAS WRONG IN EVERY ARCHIVE A
+    // SINGLE-SEQUENCE FOLD EVER WROTE. The branch above used to be reached by
+    // any model that HAS an alignment control, so a fold that deliberately used
+    // none described an `msas/` that was not in the file and told the reader to
+    // drop the zip back "to fold again with exactly these alignments". Whether
+    // the archive CARRIES one is a different question from whether the model
+    // takes one, and now they are asked separately.
+    lines.push(
+      "",
+      "There is no `msas/`: this fold ran on the sequence alone, with the",
+      "alignment set to none. Folding it again the same way reproduces it.",
     );
   } else {
     lines.push(
@@ -549,6 +576,9 @@ export function buildFoldArchive({
     // upstream package returns nothing - so "templates: none" reported a choice
     // where there was no control. An empty ARRAY still means "none were used".
     stem, model, settings, msaOrigin, scored, alignedError, alignmentOmitted,
+    // ...answered by looking at what was written, not by a caller's flag: the
+    // loop above is the only thing that knows whether an a3m survived.
+    carriesAlignment: [...files.keys()].some((path) => path.startsWith("msas/")),
     templateCount: templates === undefined ? undefined : templates.length,
   }));
   return files;

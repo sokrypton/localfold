@@ -59,10 +59,11 @@ import { complexSequenceProblem } from "./sequence.js";
 // own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
-import { buildFoldArchive, tokenLayoutFrom, msasFromArchive } from "./fold-archive.js";
+import { buildFoldArchive, tokenLayoutFrom, msasFromArchive,
+         SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
 import { jobFromJson } from "./job-json.js";
 import {
-  clearSession, jobMeta, readSession, saveSession,
+  clearSession, jobMeta, readSession, readSessionMeta, saveSession,
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
@@ -2940,7 +2941,7 @@ async function fold(event) {
       templates: templateSources,
       msas: archiveMsas(chains, alignment),
       msaOrigin: {
-        single: "none (single sequence)",
+        single: SINGLE_SEQUENCE_ORIGIN,
         search: "MMseqs2 search at api.colabfold.com",
         paste: "pasted by hand",
         upload: uploadedMsas === undefined ? "uploaded a3m" : "uploaded archive",
@@ -3587,20 +3588,35 @@ element("download-pdb").addEventListener("click", () => {
  * Empty `msas` without the flag writes a file telling the reader to drop it on
  * the upload box to reproduce the fold, describing an `msas/` that is absent.
  */
+/** Whether an alignment set has anything in it, in either of its two shapes. */
+function holdsAlignment(msas) {
+  if (msas === undefined || msas === null) return false;
+  if (typeof msas.merged === "string" && msas.merged !== "") return true;
+  return (msas.unpaired ?? []).some((text) => typeof text === "string" && text !== "");
+}
+
 function archiveFor(pred, { includeAlignment = true } = {}) {
-  // 🔴 A RESTORED SESSION HAS NO ALIGNMENT TO INCLUDE, whatever the caller
-  // asked for. "Download all" asks for one because a live fold has one; the
-  // README must still say the archive does not carry it rather than describing
-  // an `msas/` that is absent - the third state, see web/fold-archive.js.
-  const holds = includeAlignment && pred.restored !== true;
+  // 🔴 WHAT IS ACTUALLY HELD DECIDES, NOT WHERE THE PREDICTION CAME FROM. This
+  // read `pred.restored !== true`, from when a restored session never carried
+  // an alignment: now one usually does, and a flag about its provenance would
+  // have thrown away the alignment it had and written the caveat anyway. The
+  // question the archive asks is "is there an a3m to put in `msas/`", and that
+  // is answerable by looking. A restored session whose alignment was dropped
+  // for space still lands in the third state, correctly - see
+  // web/fold-archive.js.
+  const holds = includeAlignment && holdsAlignment(pred.msas);
   return buildFoldArchive({
     stem: pred.stem,
     model: pred.model ?? "AlphaFold",
     settings: pred.settings,
     entities: pred.entities,
-    msas: holds ? (pred.msas ?? {}) : {},
+    msas: holds ? pred.msas : {},
     msaOrigin: pred.msaOrigin,
-    alignmentOmitted: !holds && pred.msaOrigin !== undefined,
+    // 🔴 OMITTED MEANS THERE WAS ONE AND IT IS NOT HERE. A fold that ran on the
+    // single sequence has nothing to omit, and saying it was left out invites
+    // the reader to go looking for an archive that carries it.
+    alignmentOmitted: !holds && pred.msaOrigin !== undefined
+      && pred.msaOrigin !== SINGLE_SEQUENCE_ORIGIN,
       // 🔴 NOT `?? []`, WHICH IS THE DIFFERENCE BETWEEN "none were used" AND
       // "this model has no such control". Defaulting it here silently undid
       // the distinction the archive was taught to make.
@@ -3726,9 +3742,27 @@ async function rememberSession(pred) {
       settings: pred.settings,
       entities: pred.entities,
       msaOrigin: pred.msaOrigin,
+      // 🔴 THE ALIGNMENT, so a restored fold can be REPRODUCED rather than only
+      // looked at. See the note in web/fold-session.js for why it is affordable
+      // now and was not before, and why it is the one field allowed to go.
+      msas: pred.msas,
     });
     state.localfold.framesAtSave = held;
-    const saved = await saveSession(state);
+    let saved = await saveSession(state);
+    // 🔴 THE ALIGNMENT IS DROPPED AND THE SESSION IS SAVED AGAIN, rather than
+    // the whole session being lost to one deep MSA. Everything else in the
+    // record is bounded by the fold; an alignment is bounded by whatever a
+    // public server returned, so it is the field that can make a save fail -
+    // and a session without its alignment is exactly what this used to store,
+    // which the archive already knows how to describe. Said out loud, because
+    // the difference is whether the fold can be reproduced.
+    if (saved === "quota" && state.localfold.msas !== undefined) {
+      delete state.localfold.msas;
+      saved = await saveSession(state);
+      if (saved !== "quota") {
+        status("saved without its alignment - there was no room for it", true);
+      }
+    }
     if (saved === "quota") {
       status("no room to save this session - clear site data to save again", true);
       return;
@@ -3767,8 +3801,10 @@ function agoLabel(then, now = Date.now()) {
 async function offerSession() {
   const row = element("session");
   if (row === null) return;
-  const saved = await readSession();
-  const meta = saved?.localfold;
+  // 🔴 THE SUMMARY, NOT THE SESSION. This read the whole record to draw one
+  // line - fine at 52 KB, and 2.8 MB of gzip over 9.2 MB of JSON once the
+  // alignment travelled, on every page load, to decide whether to show a row.
+  const meta = await readSessionMeta();
   if (meta === undefined || predictions.has(meta.stem)) {
     row.hidden = true;
     return;
@@ -3937,8 +3973,12 @@ async function restoreSession() {
     // builder over it - the structure, the token layout, the confidences and
     // the contact map - so a restored prediction missing any of them is a
     // button that fails when pressed rather than one that is not offered.
-    // `msas` is deliberately absent: the alignment was never saved, and the
-    // archive says so through `alignmentOmitted` rather than pretending.
+    // 🔴 `msas` COMES BACK WHEN IT WAS SAVED AND IS ABSENT WHEN IT WAS NOT, and
+    // the archive reads that difference itself rather than being told by a
+    // flag. A session written before the alignment travelled, or one whose
+    // alignment was dropped for space, restores without it and its README
+    // carries the "may find different hits" caveat; one that has it writes a
+    // real `msas/` and reproduces.
     const restored = {
       stem,
       pdb: meta?.pdb,
@@ -3946,6 +3986,7 @@ async function restoreSession() {
       settings: meta?.settings,
       entities: meta?.entities,
       msaOrigin: meta?.msaOrigin,
+      msas: meta?.msas,
       chains: (meta?.sequence ?? "").split(":").filter(Boolean),
       chainLengths: meta?.chainLengths ?? [],
       tokens: meta?.tokens,
