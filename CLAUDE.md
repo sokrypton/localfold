@@ -1661,6 +1661,76 @@ ADD UP.** Releasing `relPos` after the conditioning was worth 66 MiB and not
 the fullest moment simply moved earlier. Read `peakByLabel` again after every
 change; the row that was second is not the row that is first.
 
+🔴 **AND THE WHOLE ARC IS 45%, WITH THE PEAK MOVING THREE TIMES.** Every step
+is bit-identical or priced against the sampler's own spread, on a 300-token
+fold:
+
+| | peak | what moved |
+|---|---|---|
+| before | **991.5 MiB** | |
+| `z_init` released when the trunk loop ends | 903.6 | |
+| the twelve pair biases built after `relPos` is dead | 837.5 | |
+| the conditioning written INTO `relPos` | 815.7 | |
+| the conditioning's widened scratch released before the biases | 799.2 | |
+| **the token transformer's weights in f16** | **629.9** | the peak leaves the diffusion |
+| `relPos` rebuilt after the trunk; the pair released | **543.5** | the peak is the TRUNK |
+
+76 tokens goes 577.7 -> **317.9** over the same steps. The structure is
+unchanged throughout except where f16 weights move it by 0.0017 A, and the
+76-mer's certainty is still 0.9496183936533175 with 114 contacts.
+
+🔴 **AND THE FLOOR IS SIX PAIR-SIZED TENSORS, WHICH IS 527 OF THE 543.** Four
+triangle scratch, `z_init` and the pair, all live at once by construction.
+Going below it needs the pair track chunked, which this file records as
+all-or-nothing and blocked at the triangle.
+
+🔴 **THE DENOISER'S TOKEN TRANSFORMER TAKES f16 WEIGHTS AND ITS ATOM STACKS DO
+NOT, AND THE SIZES ARE WHY THE QUESTION IS WORTH ASKING AT ALL.** The twelve
+token blocks are **459 MiB** of a 799 MiB fold; the two atom stacks are **6.4
+MiB together**. So the stack this file's own rule forbids narrowing is not
+worth arguing about, and the stack it permits is more than half the model. The
+rule is what a stack PRODUCES: the token transformer's output is an activation
+an adaLN renormalises, an atom stack's is a position update in angstroms that
+nothing renormalises - AF3 records the identical split at 1.88e-2 inside a
+4e-2 bound against its atom blocks missing 4e-4 by 3x.
+
+| | peak | sampler step | denoiser relRMS |
+|---|---|---|---|
+| f32 weights | 799.2 MiB | ~398 ms | 7.08e-5 |
+| **f16 weights** | **629.9** | **~344** | 1.47e-4 |
+
+🔴 **AND IT IS FASTER, WHICH THE MEMORY ARGUMENT DOES NOT PREDICT.** These
+weights stream once per sampler step, so halving their bytes is the one shape
+this file's f16-weight table says pays - unlike AF3's trunk, where they are
+resident and read one scalar at a time for a 2% LOSS. Ask how a stack READS
+its weights before pricing their width.
+
+🔴 **AND IT IS PRICED AGAINST THE SAMPLER'S OWN SPREAD.** The structure moves
+**0.0017 A**; changing the SEED alone moves it **12.05 A**. A factor of 7000,
+with the certainty, the contact count and the CA-CA spacing unmoved.
+`check-esmfold2-diffusion-gpu.js --weights=f32,f16` is the axis, and each arm
+is held to the bound its own arithmetic implies rather than one loosened to
+cover both - the f32-weight arms reproduce this file's recorded 7.08e-5 and
+1.52e-4 exactly, which is what says the plumbing is sound rather than the
+bound generous.
+
+🔴 **AND AN IN-PLACE TRANSFORM MUST BE ASKED FOR.** `prepare()` wrote the pair
+conditioning into `relPos` unconditionally for one commit, and the denoiser's
+checker prepares TWO arms from one uploaded encoding - so the second arm read
+the first arm's conditioning and scored **1.77e-1 against a 4.5e-4 bound**.
+`reuseRelPos` is opt-in and the fold is its only caller. The checker caught it
+because it runs two arms off one buffer, which is exactly the shape that finds
+a destructive input.
+
+🔴 **AND THE PEAK MOVES WHEN YOU TAKE A TENSOR OUT OF IT, SO THE SAVINGS DO NOT
+ADD UP.** Releasing `relPos` after the conditioning was worth 66 MiB and not
+87.9, because the twelve pair biases are allocated just after it and the
+fullest moment moved earlier. Releasing the pair was worth **nothing at all**
+on its own, because by then the peak had moved into the trunk. Read
+`peakByLabel` again after every change; the row that was second is not the row
+that is first, and `peakGroups` in fold-esmfold2.js is what says which STAGE
+to price.
+
 🔴 **AND THE PAIR TRACK NEEDS FOUR SCRATCH TENSORS WITHOUT THE GRID ATTENTION,
 NOT FIVE.** `tri.contract` is the last pass to read `a`, and it runs before
 `tri.normalize-hidden` writes - so the normalised hidden goes back into `a`.
