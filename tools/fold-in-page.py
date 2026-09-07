@@ -821,6 +821,47 @@ def main():
         # 🔴 THE SECOND FOLD IS THE ONE THAT REWINDS. Asking for more recycles
         # with everything else unchanged should keep the frames the earlier
         # passes already produced and append to them - not start an object over.
+        # 🔴 FORGET IS A PATH TOO, AND IT HAD A BUG NO OTHER ARM COULD SEE.
+        # The session lives in TWO records now - the fold, and the summary the
+        # offer row reads without unpacking it - and `clearSession` deleted only
+        # the first. So "Forget" removed the fold, the row stayed on screen
+        # advertising it, and pressing Restore found nothing. A reload is what
+        # makes it visible: the row is redrawn from the store rather than from
+        # whatever the click left in memory.
+        if args.session:
+            print("forget:", cdp.evaluate(ws, """(async () => {
+              const before = !document.getElementById('session').hidden;
+              document.getElementById('session-forget').click();
+              await new Promise((done) => setTimeout(done, 800));
+              const hidden = document.getElementById('session').hidden;
+              const rows = await new Promise((resolve) => {
+                const open = indexedDB.open('localfold-session');
+                open.onsuccess = () => {
+                  const db = open.result;
+                  const store = db.transaction('session', 'readonly')
+                    .objectStore('session');
+                  const keys = store.getAllKeys();
+                  keys.onsuccess = () => { db.close(); resolve(keys.result); };
+                  keys.onerror = () => { db.close(); resolve('error'); };
+                };
+                open.onerror = () => resolve('no db');
+              });
+              return JSON.stringify({ offeredBefore: before, hiddenAfter: hidden,
+                                      keysLeft: rows });
+            })()""", await_promise=True))
+            ws.call("Page.reload")
+            cdp.wait_for(ws, "typeof window.processFiles === 'function'",
+                         what="the page to come back after forgetting")
+            print("after forget:", cdp.evaluate(ws, """(async () => {
+              await new Promise((done) => setTimeout(done, 1200));
+              const row = document.getElementById('session');
+              return JSON.stringify({
+                // 🔴 THE ROW MUST BE GONE ON A FRESH PAGE, which is the whole
+                // assertion: a stale summary redraws it from the store.
+                offered: row !== null && !row.hidden && row.offsetParent !== null,
+                text: document.getElementById('session-text')?.textContent ?? '' });
+            })()""", await_promise=True))
+
         if args.then_recycles is not None or args.then_sequence is not None:
             if args.then_sequence is not None:
                 cdp.evaluate(ws, """(() => {

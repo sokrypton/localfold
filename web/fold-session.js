@@ -320,6 +320,13 @@ export async function clearSession() {
     transaction.oncomplete = () => { db.close(); resolve(true); };
     transaction.onerror = () => { db.close(); resolve(false); };
     transaction.onabort = () => { db.close(); resolve(false); };
-    transaction.objectStore(STORE).delete(KEY);
+    // 🔴 BOTH RECORDS, IN ONE TRANSACTION. Deleting only the session left the
+    // summary behind - so "Forget" removed the fold and the offer row stayed on
+    // screen advertising it, and pressing Restore then found nothing and said
+    // "there is no saved session to restore". A second record is a second thing
+    // to delete, and the write path already knew that; this one did not.
+    const store = transaction.objectStore(STORE);
+    store.delete(KEY);
+    store.delete(META_KEY);
   });
 }

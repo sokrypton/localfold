@@ -947,3 +947,20 @@ answered by looking at the files that were written, not by a caller's flag:
 | searched, alignment dropped | left out, "may find different hits" |
 | ran on the single sequence | **ran on the sequence alone; folding it again reproduces it** |
 | model takes no alignment | folds from the sequence alone |
+
+### Forget deletes both records, and did not
+
+A second record is a second thing to delete, and only the write path knew it.
+`clearSession` removed the session and left the summary, so **Forget** deleted
+the fold while the offer row stayed on screen advertising it - and pressing
+Restore then said "there is no saved session to restore". Both are deleted in
+one transaction now.
+
+🔴 **AND A GATE ARM RELOADS AFTERWARDS, because the click alone cannot show
+this.** The row hides itself on the click, from memory; it is only redrawn from
+the store on the next page load, which is where a stale summary reappears. The
+arm also reads the store's remaining keys directly - `keysLeft: []` is the
+assertion, since "the row is hidden" was true even while the bug was there.
+
+    forget:       {"hiddenAfter": true, "keysLeft": []}
+    after forget: {"offered": false, "text": ""}
