@@ -105,7 +105,21 @@ values means the whole-stack checker, not that file.
 | What does an ESM-C block cost? | `tools/gpu/bench-esmc-tower.js` |
 | ...and is the tower right at more than one length? | `check-esmc-tower.js --dump=/oracle-dumps/esmc-{59,128,180}.json` |
 
+| Does OpenDDE's trunk predict a real fold's contacts? | `tools/gpu/trunk-opendde.js` (**and `--model=/model-af3-int5/manifest.json` is the control**) |
+| Does a pairformer block match its reference at THIS bundle's widths? | `tools/gpu/check-af3-block-any.js --model=` |
+| ...and which pair-track kernel is the one that does not? | `tools/gpu/probe-opendde-kernels.js --model=` |
+
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **AND EVERY ONE OF THEM EXCEPT THE TWO ABOVE IS PINNED TO AlphaFold 3's
+CONSTANTS.** `check-af3-triangle.js` has `const CHANNELS = 128`,
+`check-af3-grid-attention.js` has 128 with 4 heads of 32, and
+`check-af3-block.js` hand-builds its weight dict with `heads: 4` and
+`pairChannels: 128` typed into it. So the differential suite is blind to a
+second bundle's widths, which is exactly where a second bundle breaks - see
+docs/OPENDDE.md, where a dispatch sized for 128 against kernels compiled for
+384 left two thirds of every pair row unprocessed and every per-kernel checker
+passing.
 
 ## The traps that repeat
 
@@ -229,6 +243,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
+| `docs/OPENDDE.md` | the OpenDDE port: the trunk transfers at different widths and the structural-token stage does not, the dialect's two disagreements with OpenBind-0, and the dispatch bug that scored below chance |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |
 | `docs/DEVELOPING.md` | the older orientation notes |
 | `docs/HANDOFF.md` | the pLDDT-from-distogram attempt whose code was deleted, kept so the next attempt does not repeat it |
