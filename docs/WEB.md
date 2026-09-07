@@ -618,3 +618,52 @@ And the state machine: folding again after a restore works - the button is
 live, `uniqueStem` gives `af3_1_2` rather than colliding with the restored
 `af3_1`, the record is overwritten with the new fold, and the offer row is
 re-asked so it does not go on advertising the old one.
+
+### State, for whoever picks up the saved session
+
+**Where it lives.** `web/fold-session.js` is the store, `rememberSessionWhenSettled`
+/ `offerSession` / `restoreSession` in `web/app.js` are the three verbs, and the
+row is `#session` in `index.html`, under the status line and outside
+`#viewer-container` on purpose. Upstream: `py2Dmol 6ee50b8` split
+`buildViewerState` from the download and exported both; `py2Dmol db883b6` fixed
+the Multi guard that hid the heatmap panel.
+
+**The gate** is `python3 tools/fold-in-page.py --model <m> --session`. It folds,
+reads the record out of the real IndexedDB, RELOADS, restores, presses both
+download buttons and reads the zip back, then folds something else to check the
+offer does not go stale. `--session-hidden` drives a `visibilitychange` first,
+the other save signal. `--ligand GOL` and `--template 1QYS_A` are the two input
+shapes worth re-running after any change here.
+
+🔴 **THE GATE MUST RELOAD THE WAY A READER DOES.** It drove its own
+`visibilitychange` before reloading once, and was green for two rounds while a
+plain reload restored one frame of sixteen. If a change here needs the gate
+adjusted, check first whether the adjustment is the bug.
+
+**Numbers to compare against** - AF3, the page's default 58-mer, no MSA:
+
+| | |
+|---|---|
+| session | 226,641 B raw, **51,968** gzipped, 16 frames |
+| restore | 16 frames, `pae: 58`, contact, card 71.2 / 0.39, panel `['pae','contact']` |
+| PDB button | 36,896 B, 467 ATOM records |
+| All button | ~19 KB zip, 5 members, README saying the alignment is not included |
+| 152 residues | 723,105 B raw, 166,223 gzipped |
+
+**Open, in order:**
+
+1. **Modified residues** (`--code SEP`), the one input shape not yet round
+   tripped. A modified residue is several TOKENS for one residue, like a ligand
+   - `probe-modified.js` is the chemistry side - so it lands on the same
+   `tokens` path the ligand exercises, and is expected to pass. Worth one run
+   rather than an assumption; `fold-in-page.py` has no flag for it yet, so it
+   needs one, beside `--ligand`.
+2. **A quota-exhausted save.** `saveSession` returns `"quota"` and the page says
+   so, and that branch has never run.
+3. **The no-`CompressionStream` fallback.** `pack`/`unpack` decide by TYPE, so an
+   uncompressed record still reads; untested in a browser that lacks it.
+4. **Nothing longer than 152 residues** has been saved. The n^2 matrices and the
+   frame count compound; a 500-mer is expected around 1-2 MB gzipped.
+
+**Not deployed.** Nine commits here and two in py2Dmol are unpushed as of this
+note.
