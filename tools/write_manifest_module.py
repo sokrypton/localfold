@@ -82,7 +82,7 @@ BUNDLES = {
     # that make COORDINATES are a second token space rather than a branch. The
     # distogram is what this bundle answers with. See docs/OPENDDE.md.
     "opendde": {
-        "export": "model-opendde-trunk-int5",
+        "export": "model-opendde-int5",
         "module": "src/reference/manifests/opendde.js",
         "model": "opendde",
     },

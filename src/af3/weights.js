@@ -483,13 +483,22 @@ export async function msaBlockWeights(store, index) {
   });
 }
 
-export async function pairformerBlockWeights(store, index) {
-  const at = (leaf) => stacked(store, `${PAIRFORMER}/${leaf}`, index);
+/**
+ * @param {object} store
+ * @param {number} index the block
+ * @param {string} [root] which stack - the trunk's by default, and OpenDDE's
+ *   structural-token REFINER is the other. It is the same block at a different
+ *   shape: 8 single heads of 48 where the trunk has 16 of 24, and a pair
+ *   transition of factor 2 where the trunk's is 4. Every one of those is
+ *   derived from the weights, so this is a path and nothing else.
+ */
+export async function pairformerBlockWeights(store, index, root = PAIRFORMER) {
+  const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
   const [pairChannels, singleChannels, singleHeads, singleDimension] =
-    singleAttentionDims(store, PAIRFORMER);
+    singleAttentionDims(store, root);
   return bind(store, {
     pairChannels, singleChannels,
-    ...pairTrack(store, PAIRFORMER, index),
+    ...pairTrack(store, root, index),
     singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
     singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
     singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
@@ -628,6 +637,57 @@ export function af3Dialect(store) {
   return dialectFor(name);
 }
 
+
+
+/** OpenDDE's structural-token stacks: the expander, and the refiner's root. */
+export const STRUCTURAL_EXPANDER = "diffuser/structural_token_expander";
+export const STRUCTURAL_REFINER = "diffuser/structural_token_refiner/trunk_pairformer";
+
+/**
+ * The seventeen tensors OpenDDE expands its residue representations with.
+ *
+ * 🔴 THE PAIR PROJECTION IS THE BIGGEST TENSOR IN THE MODEL AFTER THE TRUNK'S.
+ * `pair_block_proj` is [49, 384, 384] - one matrix per ORDERED role pair, so 49
+ * and not 28 - which is 7.2 M parameters and 28.9 MiB in float32.
+ */
+export async function structuralExpanderWeights(store) {
+  const T = (name) => store.tensor(`${STRUCTURAL_EXPANDER}/${name}`);
+  const [roles, singleInputChannels] = dims(store, `${STRUCTURAL_EXPANDER}/single_input_role_embedding`);
+  const [, pairChannels] = dims(store, `${STRUCTURAL_EXPANDER}/same_parent_embedding`);
+  const [, singleChannels] = dims(store, `${STRUCTURAL_EXPANDER}/single_role_embedding`);
+  return {
+    roles, singleInputChannels, singleChannels, pairChannels,
+    singleInputRoleEmbedding: await T("single_input_role_embedding"),
+    singleRoleEmbedding: await T("single_role_embedding"),
+    singleSplitNormScale: await T("single_split_norm/scale"),
+    singleSplitNormOffset: await T("single_split_norm/offset"),
+    singleSplit1: await T("single_split_1/weights"),
+    singleSplit2: await T("single_split_2/weights"),
+    pairBlockProj: await T("pair_block_proj"),
+    sameParentEmbedding: await T("same_parent_embedding"),
+    sameResidueTwinEmbedding: await T("same_residue_twin_embedding"),
+    prevBbChainEmbedding: await T("prev_bb_chain_embedding"),
+    nextBbChainEmbedding: await T("next_bb_chain_embedding"),
+    rolePairTypeEmbedding: await T("role_pair_type_embedding"),
+    // 🔴 FOUR OF THESE ARE RANK-ZERO, which a reader expecting a vector will
+    // index as [0] and a reader expecting a scalar will not. They arrive as
+    // one-element arrays; the reference takes [0].
+    attnBiasSameParent: await T("attn_bias_same_parent"),
+    attnBiasSameResidueTwin: await T("attn_bias_same_residue_twin"),
+    attnBiasPrevBbChain: await T("attn_bias_prev_bb_chain"),
+    attnBiasNextBbChain: await T("attn_bias_next_bb_chain"),
+    attnBiasRolePairType: await T("attn_bias_role_pair_type"),
+  };
+}
+
+/** The refiner: four pairformer blocks on the structural tokens. */
+export async function structuralRefinerWeights(store, blocks = 4) {
+  const out = [];
+  for (let index = 0; index < blocks; index += 1) {
+    out.push(await pairformerBlockWeights(store, index, STRUCTURAL_REFINER));
+  }
+  return out;
+}
 
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
 export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
