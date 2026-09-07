@@ -861,3 +861,34 @@ has been computed and written for some time - it is the minimum over ordered
 pairs of a PAE we already have, with the server's own values quoted in the code
 beside it. The comment was corrected, and it names the two keys that are ours
 rather than the server's: `chain_pair_max_contact` and `mean_plddt`.
+
+### Every model on the page, through the round trip
+
+The reader and the offer row are model-independent by construction, which is an
+argument and not a measurement. All six were run:
+
+| model | archive | what came back |
+|---|---|---|
+| AF3, `SEP@3` + `GOL` | 26,079 B | sequence, modification, ligand, copies, seed |
+| AF3, two chains | 40,408 B | both chains, in order |
+| AF2-mono | 20,112 B | sequence and seed |
+| OpenBind-0 | 22,462 B | sequence and seed |
+| OpenDDE | 20,737 B | sequence and seed |
+| EF2-fast | 13,468 B | sequence and seed |
+
+🔴 **AND EF2-fast WENT THROUGH THE SESSION TOO, BECAUSE IT IS THE SHARP CASE.**
+It has no confidence head, and the discipline the archive was taught about
+absent scores has to survive a save, a reload and a restore - it would be very
+easy for a round trip to put zeros where the model has no opinion. Measured, on
+a restored fold:
+
+    offer row   Last fold: EF2-fast · 58 residues · just now
+    score box   hidden, cells "-"
+    panel tabs  ['contact']            - no PAE tab, because there is no PAE
+    full_data   atom_certainty         - NOT atom_plddts
+    summary     chain_pair_max_contact only
+    README      no "not in this archive" line: this model takes no alignment
+    frames      11 restored
+
+The offer row says no pLDDT rather than `pLDDT 0.0`, which is the whole rule in
+one line.
