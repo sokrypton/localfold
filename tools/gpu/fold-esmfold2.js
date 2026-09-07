@@ -722,7 +722,7 @@ export async function main(device, args = []) {
     // fold.js and fold-af2.js have printed this for a long time and this tool
     // did not, which is why a 92 MiB saving inside the trunk could be measured
     // and its absence from the fold's peak could not be explained.
-    peakByLabel: memorySnapshot(device).peakByLabel.slice(0, 12).map((entry) => ({
+    peakByLabel: memorySnapshot(device).peakByLabel.slice(0, 20).map((entry) => ({
       label: entry.label,
       mib: Number((entry.bytes / 1048576).toFixed(2)),
       count: entry.count,

@@ -830,6 +830,16 @@ export class Esmfold2DenoiserGpu {
       }
       await this.#now("esmfold2.diff.pair-conditioning", passes);
     }
+    // 🔴 THE WIDENED SCRATCH GOES BACK BEFORE THE BIASES ARE ALLOCATED, NOT
+    // AFTER. Only `scratchNorm` is read again (the bias loop normalises the
+    // conditioning through it); the transition's four are dead here, and they
+    // are 56 MiB of chunk-sized buffers standing beside the twelve per-block
+    // pair biases that are allocated next. This allocator does not pool -
+    // release DESTROYS - so where a release sits is where the peak is.
+    for (const allocation of [scratchA, scratchB, scratchG, scratchD]) {
+      allocation.release();
+      this.allocations.splice(this.allocations.indexOf(allocation), 1);
+    }
 
     b.bias = weights.tokenBlocks.map((_, index) =>
       this.#alloc(`esmfold2.diff.bias.${index}`, pairs * tokenHeads));
@@ -852,13 +862,7 @@ export class Esmfold2DenoiserGpu {
       }
     }
     scratchNorm.release();
-    scratchA.release();
-    scratchB.release();
-    scratchG.release();
-    scratchD.release();
-    for (const allocation of [scratchNorm, scratchA, scratchB, scratchG, scratchD]) {
-      this.allocations.splice(this.allocations.indexOf(allocation), 1);
-    }
+    this.allocations.splice(this.allocations.indexOf(scratchNorm), 1);
 
     // ---- the single conditioning's noise-independent half, once.
     b.singleBase = this.#alloc("esmfold2.diff.single-base", tokens * tokenChannels,
