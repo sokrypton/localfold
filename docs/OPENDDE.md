@@ -406,6 +406,76 @@ The same 40-mer folds to mean pLDDT **72.19283791929007** and pTM
 **0.5096721043810248** on this tree and on the tree before any of this work, to
 every digit. `npm test` is 833 passing.
 
+## Where a fold's time and memory go
+
+Measured on 6MRR, 68 residues becoming 130 structural tokens, at 50 sampler
+steps. `tools/gpu/fold-opendde.js` prints both.
+
+| | |
+|---|---|
+| peak | **1198.3 MiB** |
+| whole fold | 20.4 s |
+| trunk (48 blocks) | 3.6 s |
+| structural refine | 0.8 s |
+| structural expand | 0.065 s |
+| **the sampler** | **~15.6 s, 77%** |
+
+🔴 **THE PEAK IS 90% RESIDENT TRUNK WEIGHTS, AND THE SAMPLER IS 77% OF THE
+TIME - SO THEY ARE TWO DIFFERENT PROBLEMS.** `peakByLabel` reads
+`w.pair-transition` 324 MiB, `w.grid` 272, `w.tri.out` 163, `w.tri.in` 163,
+`w.single-transition` 162: 1084 of 1198, against 34 MiB of scratch. That is
+three times AlphaFold 3's because these weights go as the SQUARE of the channel
+count and the pair track is 384 rather than 128.
+
+🔴 **AND THE SAMPLER IS EXPENSIVE FOR A REASON NO KERNEL WILL FIX: IT RUNS ON
+130 TOKENS WHERE AlphaFold 3 RUNS ON 68.** The denoiser's token transformer is
+quadratic in them, so OpenDDE pays about four times AF3's sampler cost for the
+same protein. The structural expansion is what buys the accuracy; it is also
+what costs the time.
+
+### More sampler steps are WORSE, measured against the seed spread
+
+| steps | time | RMSD | TM |
+|---|---|---|---|
+| **16** | **15.9 s** | 1.498, 1.399, 1.639 | **0.9044, 0.9169, 0.9039** |
+| 25 | 17.3 | 1.625 | 0.8925 |
+| 50 | 20.2 | 1.681 | 0.8887 |
+| 100 | 26.3 | 1.603, 1.714 | 0.8884, 0.8828 |
+
+🔴 **AND THE SEED SPREAD IS WHAT MAKES THAT A RESULT.** Three seeds at 16 steps
+and two at 100: every 16-step fold has a better TM than every 100-step fold and
+the ranges do not overlap, on a quantity whose seed-to-seed spread within an arm
+is 0.013. It is 40% faster as well. docs/EF2FAST.md records the same shape for
+that model - "more steps than the schedule buy nothing" - so this is the second
+time here. **One target, so read it as a direction and not a margin**; the
+default is unchanged pending more.
+
+### f16 resident pair weights: 27% of the peak, and not yet reachable
+
+| | peak | time | RMSD | pLDDT |
+|---|---|---|---|---|
+| OpenDDE f32 | 1198.3 MiB | 20.4 s | 1.680 | 92.051 |
+| OpenDDE `--pair-weights=f16` | **873.5** | 20.4 | 1.681 | 92.051 |
+| AlphaFold 3 f32 | 476.0 | 4.2 | 0.682 | 85.621 |
+| AlphaFold 3 f16 | 476.0 | 4.1 | 0.683 | 85.639 |
+
+Free in time and in accuracy, worth 27% of OpenDDE's peak and NOTHING of
+AlphaFold 3's - whose peak is the diffusion transformer's 378 MiB, not the
+trunk's.
+
+🔴 **AND MAKING IT THE DEFAULT PRODUCES NaN.** The flag reaches the TRUNK's
+stack; the default also reaches the structural-token refiner and the confidence
+head, which build their own `Af3PairformerStackGpu` with no options - and every
+coordinate comes back NaN. So the 27% is real and the route to it is not a
+one-line default. **Open**: which of those two stacks, and why f16 weights are
+safe in the trunk and not there.
+
+🔴 **AND THE GRID'S 272 MiB DOES NOT TAKE THE FLAG AT ALL.** `w.tri.out`,
+`w.tri.in` and `w.pair-transition` are passed `pairWeightPrecision` and
+`w.grid1`/`w.grid2` are not, which is exactly why the observed saving is 325
+MiB rather than 461. Narrowing them needs the grid shaders to read f16 weights,
+which they cannot today.
+
 ## Open
 
 🔴 **`tools/gpu/check-af3-block.js` FAILS ON STOCK AlphaFold 3, AND DID BEFORE

@@ -141,6 +141,7 @@ export async function main(device, args) {
   // a protein: a 68-residue chain is about 11 A, and scrambled atoms are not.
   const frames = [];
   const unmapped = [];
+  let lastStage = null;
   const timings = {};
   const started = performance.now();
   // 🔴 THE SAME DRIVER EVERY OTHER AlphaFold 3-graph MODEL USES. The
@@ -148,6 +149,9 @@ export async function main(device, args) {
   // not a second driver - so the recycles, the contact map, the trunk cache
   // and the stage callbacks are shared rather than reproduced.
   const fold = await foldBatch(device, batch, weights, {
+    // The resident trunk weights' element; see the measurement in docs.
+    weightPrecision: option(args, "weights", undefined),
+    pairWeightPrecision: option(args, "pair-weights", undefined),
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     mode: option(args, "mode", "diffusion"),
     onStep: ({ step, denoised, structuralDenoised }) => {
@@ -170,7 +174,10 @@ export async function main(device, args) {
         }
         return Number(Math.sqrt(s / n).toFixed(2));
       };
-      unmapped.push({ step, rg: rgOf(structuralDenoised) });
+      // ...absent for a model with one token space, which is every other one.
+      if (structuralDenoised !== undefined) {
+        unmapped.push({ step, rg: rgOf(structuralDenoised) });
+      }
       let cx = 0;
       let cy = 0;
       let cz = 0;
@@ -189,9 +196,15 @@ export async function main(device, args) {
       }
       frames.push({ step, rg: Number(Math.sqrt(squared / n).toFixed(2)) });
     },
-    onStage: (name, detail) => {
-      timings[name] = typeof detail === "number" ? Math.round(detail)
-        : Math.round(detail?.ms ?? 0);
+    // 🔴 foldBatch's `onStage` NOTIFIES, it does not time - so the clock is
+    // here. Each stage's cost is the gap between its announcement and the next.
+    onStage: (name) => {
+      const now = performance.now();
+      if (lastStage !== null) {
+        timings[lastStage.name] = (timings[lastStage.name] ?? 0)
+          + Math.round(now - lastStage.at);
+      }
+      lastStage = { name, at: now };
     },
   });
   const wholeMs = Math.round(performance.now() - started);
@@ -255,7 +268,18 @@ export async function main(device, args) {
     target, sequence: sequence.length,
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
     meanPlddt: fold.meanPlddt ?? null,
-    steps, recycles, wholeMs, timings,
+    steps, recycles, wholeMs,
+    timings: Object.fromEntries(Object.entries(timings)
+      .filter(([, ms]) => ms >= 20).sort((a, b) => b[1] - a[1])),
+    plddtSpread: fold.perResiduePlddt === undefined ? undefined : (() => {
+      const v = fold.perResiduePlddt.filter((x) => x !== undefined);
+      const mean = v.reduce((a, b) => a + b, 0) / v.length;
+      const sd = Math.sqrt(v.reduce((s, x) => s + (x - mean) ** 2, 0) / v.length);
+      return { min: Number(Math.min(...v).toFixed(2)), max: Number(Math.max(...v).toFixed(2)),
+               sd: Number(sd.toFixed(3)) };
+    })(),
+    coordinateCheck: fold.scores?.coordinateCheck,
+    peakMiB: Number((memorySnapshot(device).peakBytes / 2 ** 20).toFixed(1)),
     geometry,
     frameGyration: frames.filter((f, i) => i % 6 === 0 || i === frames.length - 1),
     frameGyrationUnmapped: unmapped.filter((f, i) => i % 6 === 0 || i === unmapped.length - 1),

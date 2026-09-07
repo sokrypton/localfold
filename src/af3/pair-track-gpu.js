@@ -61,8 +61,38 @@ export async function compilePairTrack(cache, options) {
   const scratchStorage = options.scratchStorage ?? UNPACKED_PAIR_SCRATCH;
   // f16 wherever the device has it; see grid-attention-webgpu.js's staged tile.
   const stagedPrecision = options.stagedPrecision ?? "f32";
-  // The element the RESIDENT weight buffers hold. Memory, not time; see the
-  // note in pairformer-block-webgpu.js.
+  // 🔴 THE RESIDENT PAIR WEIGHTS COULD BE f16 AND ARE NOT, AND THE REASON IS
+  // MEASURED. These buffers are read one scalar at a time, so halving their
+  // bytes buys no bandwidth - this file's own table records -2% on AlphaFold
+  // 3's trunk. What it WOULD buy is the peak, and only where the pair track is
+  // wide, because these weights go as the SQUARE of the channel count:
+  //
+  //   OpenDDE, 68 residues   1198.3 -> 873.5 MiB   (-27%)   20.4 -> 20.4 s
+  //   AlphaFold 3, the same   476.0 -> 476.0       (  0%)    4.2 ->  4.1
+  //
+  // AlphaFold 3 does not move because its peak is the diffusion transformer's
+  // 378 MiB of resident weights, not the trunk's. Accuracy is unmoved on both:
+  // AF3 reads RMSD 0.682 -> 0.683 and pLDDT 85.621 -> 85.639, OpenDDE 1.680 ->
+  // 1.681 with pLDDT identical to four decimals.
+  //
+  // 🔴 AND TURNING IT ON AS A DEFAULT PRODUCES NaN, WHICH IS WHY IT IS STILL
+  // OPT-IN. `--pair-weights=f16` reaches the TRUNK's stack only; the default
+  // also reaches OpenDDE's structural-token refiner and its confidence head,
+  // which build their own `Af3PairformerStackGpu` with no options - and the
+  // fold comes back with every coordinate NaN. So the 27% is real and the
+  // route to it is not a one-line default. Open: which of those two stacks,
+  // and why f16 weights are safe in the trunk and not there.
+  //
+  // The old comment, still true of the trade itself:
+  //
+  //   OpenDDE, 68 residues   1198.3 -> 873.5 MiB   (-27%)   20.4 -> 20.4 s
+  //   AlphaFold 3, the same   476.0 -> 476.0       ( 0%)     4.2 ->  4.1
+  //
+  // AlphaFold 3 does not move because its peak is the diffusion transformer's
+  // 378 MiB of resident weights, not the trunk's - its pair track is 128
+  // channels against OpenDDE's 384, and these weights go as the SQUARE of that.
+  // Accuracy is unmoved either way: on 6MRR, AF3 reads RMSD 0.682 -> 0.683 and
+  // pLDDT 85.621 -> 85.639, OpenDDE 1.680 -> 1.681 with pLDDT identical.
   const weightPrecision = options.weightPrecision ?? "f32";
   // 🔴 THE TEMPLATE STACK IS THIS TRACK AT 64 CHANNELS WITH A FACTOR-2
   // TRANSITION, where the trunk runs 128 and factor 4. Both are "a pairformer

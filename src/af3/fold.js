@@ -833,7 +833,17 @@ export async function foldBatch(device, batch, weights, options = {}) {
     for (let i = 0; i < tokens; i += 1) {
       for (let j = 0; j < tokens; j += 1) pae[i * tokens + j] = raw.pae[rep[i] * n + rep[j]];
     }
-    return { plddt, pae, tmAdjusted: undefined, opendde: raw };
+    // 🔴 A DIAGNOSTIC, because a confidence that does not move with the
+    // structure is a confidence that is not reading it.
+    let span = 0;
+    let live = 0;
+    for (let token = 0; token < n; token += 1) {
+      if (!beta.mask[token]) continue;
+      live += 1;
+      span = Math.max(span, Math.abs(coordinates[token * 3]));
+    }
+    return { plddt, pae, tmAdjusted: undefined, opendde: raw,
+             coordinateCheck: { live, tokens: n, span: Number(span.toFixed(3)) } };
   };
 
   // 🔴 AND A MODEL MAY STILL HAVE NO CONFIDENCE HEAD AT ALL. Its own is a
@@ -934,7 +944,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // What a caller hands back to skip the trunk next time. Returned even when
     // it was reused, so the cache survives a chain of re-samples.
     reusable: { trunk, targetFeat, recycles },
-    meanPlddt, atoms,
+    meanPlddt, atoms, scores,
     // Per RESIDUE, from the alpha carbon - which is what pLDDT means when it is
     // shown on a cartoon, and what a per-residue check has to compare against.
     perResiduePlddt: scores === undefined ? undefined
