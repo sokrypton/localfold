@@ -12,10 +12,15 @@ and the diffusion runs on those. `src/af3/fold-opendde.js` is that driver and
 
     node tools/gpu-chrome.mjs tools/gpu/fold-opendde.js --target=6mrr
 
-| target | residues -> tokens | CA-CA | Rg | RMSD | TM |
-|---|---|---|---|---|---|
-| 6MRR | 68 -> 130 | **3.680 A** | 10.96 A | **1.678 A** | **0.865** |
-| 1QYS | 92 -> 179 | 3.670 | 11.95 | 2.573 | 0.726 |
+| target | residues -> tokens | RMSD | TM |
+|---|---|---|---|
+| 6MRR | 68 -> 130 | **1.399-1.639 A** | **0.904-0.917** |
+| 1QYS | 92 -> 179 | **0.902-0.956** | **0.939-0.945** |
+
+...at the sampler's own default of 16 steps, over three seeds and two. The
+earlier figures here (6MRR 1.678 / 0.865, 1QYS 2.573 / 0.726) were taken at 200
+steps and before the pair transition's factor was derived from the weights;
+both of those cost real accuracy and both are fixed.
 
 🔴 **THE GEOMETRY IS THE GATE BEFORE THE FOLD IS.** A peptide bond is 3.8 A: a
 port with the arithmetic subtly wrong produces a plausible cloud at the wrong
@@ -433,14 +438,22 @@ quadratic in them, so OpenDDE pays about four times AF3's sampler cost for the
 same protein. The structural expansion is what buys the accuracy; it is also
 what costs the time.
 
-### More sampler steps are WORSE, measured against the seed spread
+### More sampler steps are WORSE, on two targets and nine folds
 
-| steps | time | RMSD | TM |
-|---|---|---|---|
-| **16** | **15.9 s** | 1.498, 1.399, 1.639 | **0.9044, 0.9169, 0.9039** |
-| 25 | 17.3 | 1.625 | 0.8925 |
-| 50 | 20.2 | 1.681 | 0.8887 |
-| 100 | 26.3 | 1.603, 1.714 | 0.8884, 0.8828 |
+TM against the deposition, one column per seed:
+
+| | 16 steps | 100 steps |
+|---|---|---|
+| 6MRR | **0.9044, 0.9169, 0.9039** | 0.8884, 0.8828 |
+| 1QYS | **0.9449, 0.9394** | 0.9285, 0.9319 |
+
+and on 6MRR the whole ladder, one seed: 16 -> 0.9146, 25 -> 0.8925,
+50 -> 0.8887, 100 -> 0.8785.
+
+**The ranges do not overlap on either target**, and 16 is 32-40% faster
+(15.9 s against 26.3 on 6MRR, 29.6 against 43.2 on 1QYS). `OPENDDE_COUNTS`
+carries 16 as the preferred value; the AlphaFold 3 settings stay on the ladder
+so they remain selectable and comparable.
 
 🔴 **AND THE SEED SPREAD IS WHAT MAKES THAT A RESULT.** Three seeds at 16 steps
 and two at 100: every 16-step fold has a better TM than every 100-step fold and
@@ -483,6 +496,14 @@ shifts (mean pLDDT 72.19283791929007 -> 72.17922675038298), which is well
 inside a seed's spread and still a change for no gain. 256 is not a measured
 optimum: the two points are 128 (nothing) and 384 (27%), and it should move
 when a third exists.
+
+🔴 **AND f16 ON THE MSA AND TEMPLATE STACKS IS FREE AND WORTHLESS, MEASURED.**
+Now that their packing agrees with their kernels, both are finite and identical
+to f32 (RMSD 1.570, TM 0.9146) - and the peak does not move at all, because
+their weights are not AT it: the fullest moment is inside the 48-block
+pairformer, by which time the MSA stack's four blocks and the template's two
+have been released. A saving that is not at the peak is not a saving, which is
+this file's own recurring lesson one stack further along.
 
 🔴 **AND THE GRID'S 272 MiB STILL DOES NOT TAKE IT.** `w.tri.out`,
 `w.tri.in` and `w.pair-transition` are passed `pairWeightPrecision` and

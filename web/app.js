@@ -35,7 +35,7 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+import { AF3_COUNTS, OPENDDE_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
@@ -1619,7 +1619,10 @@ function syncAf3Count() {
   // ...and ESMFold2's table has one mode, so the shared select cannot pick a
   // row that is not there.
   const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
-  const table = ef2 ? ESMFOLD2_COUNTS : AF3_COUNTS;
+  // ...and OpenDDE's own, because more steps make its fold worse; see
+  // OPENDDE_COUNTS for the two targets and nine folds that say so.
+  const table = ef2 ? ESMFOLD2_COUNTS
+    : chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
   const { label, values, preferred } = table[ef2 ? ESMFOLD2_SAMPLER_MODE : mode]
     ?? table.flow ?? table.diffusion;
   const title = document.getElementById("af3-count-label");
@@ -1812,8 +1815,9 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
 
   const mode = document.getElementById("af3-mode")?.value ?? "flow";
+  const counts = chosenFamily() === "opendde" ? OPENDDE_COUNTS : AF3_COUNTS;
   const asked = Number(document.getElementById("af3-count")?.value)
-    || AF3_COUNTS[mode].preferred;
+    || counts[mode].preferred;
   // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
   // insurance rather than policy - a stale stored value or a hand-edited option
   // is the only way below it now. AF3_COUNTS carries the measurements and the
