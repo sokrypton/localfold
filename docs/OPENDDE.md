@@ -601,6 +601,72 @@ this file's own recurring lesson one stack further along.
 MiB rather than 461. Narrowing them needs the grid shaders to read f16 weights,
 which they cannot today.
 
+## State, for whoever picks this up
+
+Live at localfold.org and in the model row. The bundle is 481 tensors and
+655.8 M parameters - upstream's own published count - at int5 in twelve shards
+(473 MiB), hosted at `sokrypton/localfold`, pinned to
+`d9e5e9c3cdaf941f5dd3e57ccdffdcd98e81bff8`.
+
+**The local export is NOT in the checkout** and is gitignored in all four
+shapes. To get it back:
+
+    hf download sokrypton/localfold --include 'opendde-int5/*' --local-dir /tmp/dde-dl
+    ln -sfn /tmp/dde-dl/opendde-int5 model-opendde-int5
+
+...or rebuild from `~/af3_ported/opendde.bin.zst` through
+`tools/export_af3_model.py --model opendde --include diffuser` and
+`tools/quantize_af3.py --shards 12`.
+
+**The gates**, all of which must hold:
+
+| | |
+|---|---|
+| AF3 fold, bit-identical | mean pLDDT **72.19283791929007**, pTM **0.5096721043810248** |
+| AF2 checksum | **-2105827** at 128 rows, **-2047044** at 512 with a recycle |
+| `npm test` | 844 |
+| OpenDDE, 6MRR | RMSD **1.399-1.639 A**, TM **0.904-0.917** |
+| OpenDDE, 1QYS | RMSD **0.902-0.956**, TM **0.939-0.945** |
+
+`tools/gpu/fold-opendde.js` is the end-to-end tool and takes `--target`,
+`--length`, `--steps`, `--mode`, `--seed`, `--resident` / `--no-resident`,
+`--pair-weights` and `--model` (AlphaFold 3 runs through it as the control).
+
+## Open, in the order worth doing
+
+🔴 **THE UNTESTED SURFACES ARE NOW THE BIGGER RISK THAN THE UNTAKEN
+OPTIMISATIONS.** Ligands, nucleic chains and complexes all pass through
+`structural-tokens.js` BY CONSTRUCTION - role 0 one token per atom, nucleic
+backbone/base with purine and pyrimidine centres, chain-aware prev/next parents
+- and not one has been folded. Every measurement in this file is a single
+protein chain at MSA depth 1. A ligand's atoms landing in the wrong subtoken
+would be silent.
+
+🔴 **AND THE 250-RESIDUE CEILING IS WHAT A USER MEETS FIRST**, before any
+optimisation matters to them. See the regime section above: it is the
+structural expansion, it is quadratic, and the only lever left is the pair-track
+chunking CLAUDE.md already priced and rejected.
+
+🔴 **THE pLDDT IS WIRED AND UNCALIBRATED.** Per-residue Spearman against real
+deviation is -0.19 to -0.29 on two near-perfect targets - the right sign, and
+measured where there is almost no error to rank. A real statement needs
+docs/EF2FAST.md's corruption sweep, which manufactures the hard end rather than
+waiting for it.
+
+🔴 **AND pTM IS ABSENT AND SHOULD STAY ABSENT** until something emits a TM
+term. OpenDDE's head does not; deriving one from the PAE would be a different
+quantity wearing pTM's name.
+
+🔴 **THE GRID'S RESIDENT WEIGHTS ARE THE LAST OPTIMISATION, AND THE LENGTH
+SWEEP DEVALUED IT.** `w.tri.out`, `w.tri.in` and `w.pair-transition` take
+`pairWeightPrecision` and `w.grid1`/`w.grid2` do not, because
+`createGridAttentionShaders` has no weight-precision plumbing at all where the
+triangle has a clean pattern to copy. It is worth ~135 MiB of 648 at 68
+residues and ~23 MiB of 1507 at 200 - so it was never the right target. It also
+needs a two-buffer split rather than a flag: the grid's weights are ONE
+interleaved buffer, so narrowing it narrows the LayerNorm scales with it, which
+the triangle's own notes say to avoid.
+
 ## Open
 
 🔴 **`tools/gpu/check-af3-block.js` FAILS ON STOCK AlphaFold 3, AND DID BEFORE

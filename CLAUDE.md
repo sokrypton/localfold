@@ -245,7 +245,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
-| `docs/OPENDDE.md` | the OpenDDE port: two token spaces, the dialect's two disagreements with OpenBind-0, the dispatch bug that scored below chance, and the per-block pair norm that collapsed a fold to a 0.27 A cloud |
+| `docs/OPENDDE.md` | the OpenDDE port, and the place to START on it: two token spaces, its own confidence head, the gates it must hold, and what is open |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |
 | `docs/DEVELOPING.md` | the older orientation notes |
 | `docs/HANDOFF.md` | the pLDDT-from-distogram attempt whose code was deleted, kept so the next attempt does not repeat it |
