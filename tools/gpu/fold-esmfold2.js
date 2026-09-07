@@ -131,6 +131,9 @@ export async function main(device, args = []) {
   // alignment; the analogue here is folding without the protein language model,
   // which is where this model's evolutionary information comes from.
   const noPlm = args.includes("--no-plm");
+  // The element the denoiser's token blocks hold their weights in; see
+  // src/esmfold2/diffusion-webgpu.js. Unset lets the fold choose.
+  const denoiserWeightElement = option(args, "denoiser-weights", "");
   // 🔴 FOLD TWICE, THE SECOND TIME REUSING THE TRUNK, which is the only way to
   // check that the saving is real and that the answer is the same one.
   const twice = args.includes("--reuse-trunk");
@@ -213,6 +216,7 @@ export async function main(device, args = []) {
   const updates = new Map();
   const result = await foldEsmfold2(device, {
     sequence, allocator, seed, sampler,
+    ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
     entities: (kinds === "" && ligands.length === 0) ? sequence
       : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
           ...(ligands.length === 0 ? {} : { ligands }) },
@@ -249,6 +253,7 @@ export async function main(device, args = []) {
   if (twice) {
     second = await foldEsmfold2(device, {
       sequence, allocator, seed, sampler,
+      ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
       entities: (kinds === "" && ligands.length === 0) ? sequence
         : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
             ...(ligands.length === 0 ? {} : { ligands }) },
@@ -715,6 +720,30 @@ export async function main(device, args = []) {
     elapsedSeconds: result.elapsedMilliseconds / 1000,
     timings: result.timings,
     peakMebibytes: result.memory.peakBytes / 1048576,
+    // 🔴 AND GROUPED, BECAUSE TWENTY ROWS STOPPED REACHING THE ANSWER. With the
+    // pair tensors down, the peak is a long tail of per-block weight tensors -
+    // twelve token blocks times six tensors each - and no row-listing shows
+    // that a THIRD of the fold is the denoiser's parameters in float32. The
+    // group is what says which stage to price, the rows say which tensor.
+    peakGroups: (() => {
+      const groups = new Map();
+      for (const entry of memorySnapshot(device).peakByLabel) {
+        // 🔴 SPLIT THE WEIGHTS BY STACK, NOT BY TENSOR. Half a fold is
+        // `w.esmfold2.*` and the question a precision trade asks is which
+        // STACK it is in: the token transformer produces an activation a
+        // LayerNorm renormalises and the atom stacks produce a position
+        // update in angstroms, which nothing does. `b0.swish` and `b11.swish`
+        // are one stack, so the block index is stripped.
+        const key = entry.label.startsWith("w.esmfold2.")
+          ? `weights: ${entry.label.slice("w.esmfold2.".length).split(".")[0]
+              .replace(/\d+$/, "")}`
+          : entry.label.split(".").slice(0, 2).join(".");
+        groups.set(key, (groups.get(key) ?? 0) + entry.bytes);
+      }
+      return [...groups.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([label, bytes]) => ({ label, mib: Number((bytes / 1048576).toFixed(2)) }));
+    })(),
     // 🔴 AND WHICH TENSOR IT IS, WHICH THE TOTAL CANNOT SAY. `peakByLabel` is
     // what was on the DEVICE when it was fullest and its rows sum to the peak;
     // `byLabel` sums every allocation a label ever made, so a scratch tensor

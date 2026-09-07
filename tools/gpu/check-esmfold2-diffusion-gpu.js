@@ -46,6 +46,13 @@ export async function main(device, args = []) {
   const dumpPath = option(args, "dump", "/oracle-dumps/esmfold2-trunk-40-lm.json");
   const bound = Number(option(args, "bound", "1.5e-4"));
   const precisions = option(args, "precision", "bf16,f32").split(",");
+  // 🔴 AND THE WEIGHT ELEMENT IS A SECOND AXIS, because the token transformer
+  // is 459 MiB of a 799 MiB fold and holding it in f16 is the largest single
+  // memory trade this model has. It is separate from the ATTENTION precision
+  // above: that one asks what the checkpoint computes in, this one asks what
+  // the weights are stored as. An arm is `bf16/f16`; a bare `bf16` leaves the
+  // denoiser to pick, which is what the page runs.
+  const weightArms = option(args, "weights", "").split(",").filter(Boolean);
 
   const dump = await (await fetch(dumpPath)).json();
   const manifest = await (await fetch(`${bundle}/manifest.json`)).json();
@@ -106,8 +113,13 @@ export async function main(device, args = []) {
 
   const results = [];
   let failures = 0;
-  for (const precision of precisions) {
-    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache);
+  const arms = weightArms.length === 0
+    ? precisions.map((precision) => ({ precision, weightPrecision: undefined }))
+    : precisions.flatMap((precision) =>
+        weightArms.map((weightPrecision) => ({ precision, weightPrecision })));
+  for (const { precision, weightPrecision } of arms) {
+    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache,
+                                             weightPrecision ? { weightPrecision } : {});
     await denoiser.prepare({
       shape: {
         tokens, atoms,
@@ -137,13 +149,20 @@ export async function main(device, args = []) {
     // would be a checker reporting a fault in its own setup. Its ceiling is
     // three times the bound, which is loose enough to be about the arithmetic
     // being right at all and tight enough to catch a broken kernel.
-    const limit = precision === "f32" ? bound * 3 : bound;
+    // 🔴 AND f16 WEIGHTS GET THEIR OWN BOUND, not a loosened shared one. The
+    // token transformer's output is an activation that an adaLN renormalises,
+    // so the error it carries is not the error its weights carry - and a single
+    // bound wide enough for both would stop checking the f32 path at all.
+    const limit = (precision === "f32" ? bound * 3 : bound)
+      * (weightPrecision === "f16" ? 8 : 1);
     const ok = score <= limit;
     if (!ok) failures += 1;
-    results.push({ precision, relRMS: score, ok, bound: limit,
+    results.push({ precision, weightPrecision: weightPrecision ?? "default",
+                   relRMS: score, ok, bound: limit,
                    firstStepMilliseconds: elapsed, warmStepMilliseconds: warm,
                    peakMebibytes: memory.peakBytes / 1048576 });
     console.log(`  ${precision.padEnd(6)} relRMS ${score.toExponential(3)}   `
+      + `weights ${(weightPrecision ?? "default").padEnd(7)} `
       + `bound ${limit.toExponential(1)}   ${ok ? "ok" : "FAILED"}   `
       + `${elapsed.toFixed(0)} ms cold, ${warm.toFixed(0)} ms warm`);
   }

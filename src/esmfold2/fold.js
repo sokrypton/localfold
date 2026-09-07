@@ -691,7 +691,13 @@ export async function foldEsmfold2(device, options) {
     await options.onContacts?.(contacts, certainty);
 
     // ---- the sampler.
-    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache);
+    // 🔴 THE ELEMENT THE TOKEN TRANSFORMER'S WEIGHTS ARE HELD IN. Twelve
+    // blocks are 459 MiB of a 799 MiB fold; see the note in
+    // src/esmfold2/diffusion-webgpu.js for why this stack takes f16 and the
+    // atom stacks do not.
+    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache,
+      options.denoiserWeightPrecision === undefined ? {}
+        : { weightPrecision: options.denoiserWeightPrecision });
     await mark("conditioning", () => denoiser.prepare({
       shape: {
         tokens, atoms,
@@ -708,7 +714,7 @@ export async function foldEsmfold2(device, options) {
       // prepare() in src/esmfold2/diffusion-webgpu.js for why the row chunking
       // makes that safe. relPos stays in `held`, because it is now the
       // conditioning and the sampler reads it at every step.
-      weights: weights.denoiser, features, sInputs, pair, relPos,
+      weights: weights.denoiser, features, sInputs, pair, relPos, reuseRelPos: true,
     }));
 
     // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM - CB, or CA for glycine,

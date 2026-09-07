@@ -30,6 +30,7 @@
  */
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
          createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
+import { float32ToFloat16Array } from "../runtime/float16.js";
 import {
   atomStackScratch, atomWindows, compileAtomStack, createBroadcastShader,
   createPoolShader, encodeAtomStack, tokenRanges, widestWindow,
@@ -482,6 +483,25 @@ export class Esmfold2DenoiserGpu {
 
   #keep(allocation) { this.allocations.push(allocation); return allocation; }
 
+  /**
+   * The element the token side's weights are held in - resolved here because
+   * the shaders are built in one method and the weights uploaded in another,
+   * and the two disagreeing is a buffer of the right element count at twice
+   * the bytes, which nothing validates.
+   */
+  #weightPrecision() {
+    const precision = this.options.weightPrecision
+      ?? (this.device.features.has("shader-f16") ? "f16" : "f32");
+    if (!["f32", "f16"].includes(precision)) {
+      throw new RangeError(`unknown denoiser weight precision ${precision}`);
+    }
+    return precision;
+  }
+
+  #narrow(values) {
+    return this.#weightPrecision() === "f16" ? float32ToFloat16Array(values) : values;
+  }
+
   #upload(label, data, usage = GPUBufferUsage.STORAGE) {
     return this.#keep(this.allocator.upload(label, data, usage));
   }
@@ -552,8 +572,24 @@ export class Esmfold2DenoiserGpu {
     const chunk = Math.min(PAIR_CHUNK, pairs);
     const tail = pairs % chunk;
     const epsilon = 1e-5;
+    // 🔴 THE ELEMENT THE TOKEN SIDE'S WEIGHTS ARE HELD IN, AND IT IS THE
+    // BIGGEST NUMBER IN THIS MODEL. The twelve token blocks are 459 MiB of a
+    // 799 MiB fold at 300 tokens - 57% - against the two atom stacks' 6.4
+    // together, so this is where a precision trade is worth having and the atom
+    // stacks are not worth arguing about. What decides it is what the stack
+    // PRODUCES: the token transformer's output is an activation and an adaLN
+    // renormalises most of a weight's error away, while an atom stack produces
+    // a position update in angstroms and nothing renormalises that. AF3 records
+    // the same split - its diffusion transformer takes f16 weights at 1.88e-2
+    // inside a 4e-2 bound, and its atom blocks miss their 4e-4 bound by 3x.
+    //
+    // 🔴 IT IS IN THE PIPELINE KEY, because the shader declares
+    // `array<vec4<f16>>` and a cache that ignored this would hand an f16
+    // pipeline the f32 buffer - the right element count at twice the bytes,
+    // which nothing validates.
+    const weightPrecision = this.#weightPrecision();
     const key = `esmfold2-diff:${tokens}:${atoms}:${pairChannels}:${tokenChannels}:`
-      + `${tokenHeads}:${multiplier}:${atomChannels}:${atomHeads}:${window}`;
+      + `${tokenHeads}:${multiplier}:${atomChannels}:${atomHeads}:${window}:${weightPrecision}`;
     const get = (name, code) => this.cache.get(`${key}:${name}`, code);
     const hidden = tokenChannels * multiplier;
 
@@ -568,16 +604,23 @@ export class Esmfold2DenoiserGpu {
         createLayerNormShader({ rows: tokens, channels: tokenChannels }, true, epsilon)),
       normScaleOnly: get("token-norm-scale",
         createLayerNormShader({ rows: tokens, channels: tokenChannels }, false, epsilon)),
+      // ...these five read the narrowed weights; every other pipeline here
+      // reads a norm, a bias or an atom stack's tensor and stays f32.
       wide: get("wide",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden }, false)),
+        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden },
+                           false, weightPrecision)),
       square: get("square",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels }, false)),
+        createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
+                           false, weightPrecision)),
       squareResidual: get("square-residual",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels }, true)),
+        createLinearShader({ rows: tokens, inner: tokenChannels, outer: tokenChannels },
+                           true, weightPrecision)),
       narrow: get("narrow",
-        createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels }, false)),
+        createLinearShader({ rows: tokens, inner: hidden, outer: tokenChannels },
+                           false, weightPrecision)),
       swishWide: get("swish-wide",
-        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden * 2 }, false)),
+        createLinearShader({ rows: tokens, inner: tokenChannels, outer: hidden * 2 },
+                           false, weightPrecision)),
       gatedSingle: get("gated-single", createGatedProductShader(tokens * hidden)),
       addSingle: get("add-single", createAddShader(tokens * tokenChannels)),
       adaptive: get("adaptive",
@@ -588,7 +631,8 @@ export class Esmfold2DenoiserGpu {
       gatedAdd: get("gated-add",
         createGatedAddShader({ rows: tokens, channels: tokenChannels })),
       swiglu: get("swiglu",
-        createSwigluShader({ rows: tokens, model: tokenChannels, ffn: hidden })),
+        createSwigluShader({ rows: tokens, model: tokenChannels, ffn: hidden },
+                           weightPrecision)),
       tokenToAtom: get("token-to-atom",
         createLinearShader({ rows: tokens, inner: tokenChannels, outer: atomChannels }, false)),
       coordsProject: get("coords",
@@ -658,6 +702,13 @@ export class Esmfold2DenoiserGpu {
    * @param pair     the trunk's final pair, as a device allocation
    * @param relPos   the same relative-position encoding z_init used, on device
    *
+   * @param reuseRelPos write the pair conditioning INTO `relPos` rather than
+   *   allocating for it. OFF by default, because it DESTROYS the caller's
+   *   buffer: `check-esmfold2-diffusion-gpu.js` prepares two arms from one
+   *   uploaded encoding, and with this on unconditionally the second arm read
+   *   the first arm's conditioning and scored 1.77e-1 against a 4.5e-4 bound.
+   *   An in-place transform is asked for, never assumed.
+   *
    * 🔴 THE CONDITIONING IS WRITTEN INTO `relPos` ITSELF. The pair conditioning walks the pair in ROW
    * CHUNKS, and within a chunk `joined-norm` is the last pass to read `relPos`
    * and it runs before `z-project` writes the output - so chunk k's output can
@@ -670,7 +721,7 @@ export class Esmfold2DenoiserGpu {
    * same element count alias without complaint, so the gate is the STRUCTURE:
    * a 300-token fold's PDB is sha256 83c0530b02f867ac with and without this.
    */
-  async prepare({ shape, weights, features, sInputs, pair, relPos }) {
+  async prepare({ shape, weights, features, sInputs, pair, relPos, reuseRelPos = false }) {
     const { tokens, atoms, pairChannels, singleInputs, tokenChannels, tokenHeads,
             multiplier, atomChannels, atomHeads, atomBlocks, atomHidden, window } = shape;
     const pairs = tokens * tokens;
@@ -716,6 +767,7 @@ export class Esmfold2DenoiserGpu {
                           storage | GPUBufferUsage.COPY_DST);
 
     const upload = (label, data) => this.#upload(`w.esmfold2.${label}`, data);
+    const narrow = (values) => this.#narrow(values);
     const stack = (blocks, label) => blocks.map((block, index) => ({
       adaln: upload(`${label}.${index}.adaln`, block.adaln),
       qkv: upload(`${label}.${index}.qkv`, block.qkv),
@@ -735,7 +787,8 @@ export class Esmfold2DenoiserGpu {
       outputLinear: upload("output-linear", weights.decoder.outputLinear),
       stepNormScale: upload("step-norm-scale", weights.stepNormScale),
       stepNormOffset: upload("step-norm-offset", weights.stepNormOffset),
-      singleToToken: upload("single-to-token", weights.singleToToken),
+      // ...read by `squareResidual`, which is one of the five.
+      singleToToken: upload("single-to-token", narrow(weights.singleToToken)),
       tokenNormScale: upload("token-norm-scale", weights.tokenNormScale),
       tokenNormOffset: upload("token-norm-offset", weights.tokenNormOffset),
     };
@@ -743,9 +796,12 @@ export class Esmfold2DenoiserGpu {
     const sTransitions = condition.sTransitions.map((block, index) => ({
       normScale: upload(`s-trans.${index}.norm-scale`, block.normScale),
       normOffset: upload(`s-trans.${index}.norm-offset`, block.normOffset),
-      aProjection: upload(`s-trans.${index}.a`, block.aProjection),
-      bProjection: upload(`s-trans.${index}.b`, block.bProjection),
-      outProjection: upload(`s-trans.${index}.out`, block.outProjection),
+      // ...the single conditioning's transitions share `wide` and `narrow` with
+      // the token blocks, so they take the same element. They are 27 MiB and
+      // they too produce an activation the next norm renormalises.
+      aProjection: upload(`s-trans.${index}.a`, narrow(block.aProjection)),
+      bProjection: upload(`s-trans.${index}.b`, narrow(block.bProjection)),
+      outProjection: upload(`s-trans.${index}.out`, narrow(block.outProjection)),
     }));
     // 🔴 THE adaLN GATE AND SHIFT ARE ONE MATRIX HERE AND TWO IN THE
     // CHECKPOINT. They are two projections of the SAME normalised single, so
@@ -755,26 +811,26 @@ export class Esmfold2DenoiserGpu {
     const tokenBlocks = weights.tokenBlocks.map((block, index) => {
       const adaln = (kind, source) => ({
         singleScale: upload(`b${index}.${kind}.single-scale`, source.adaln.singleScale),
-        gateShift: upload(`b${index}.${kind}.gate-shift`, concatenateColumns(
-          source.adaln.gateWeights, source.adaln.shiftWeights, tokenChannels, tokenChannels)),
+        gateShift: upload(`b${index}.${kind}.gate-shift`, narrow(concatenateColumns(
+          source.adaln.gateWeights, source.adaln.shiftWeights, tokenChannels, tokenChannels))),
         gateBias: upload(`b${index}.${kind}.gate-bias`, source.adaln.gateBias),
       });
       return {
         attention: {
           adaln: adaln("attn", block.attention),
-          queryWeights: upload(`b${index}.query`, block.attention.queryWeights),
+          queryWeights: upload(`b${index}.query`, narrow(block.attention.queryWeights)),
           queryBias: upload(`b${index}.query-bias`, block.attention.queryBias),
-          kvWeights: upload(`b${index}.kv`, block.attention.kvWeights),
-          gateWeights: upload(`b${index}.gate`, block.attention.gateWeights),
-          outWeights: upload(`b${index}.out`, block.attention.outWeights),
-          outGateWeights: upload(`b${index}.out-gate`, block.attention.outGateWeights),
+          kvWeights: upload(`b${index}.kv`, narrow(block.attention.kvWeights)),
+          gateWeights: upload(`b${index}.gate`, narrow(block.attention.gateWeights)),
+          outWeights: upload(`b${index}.out`, narrow(block.attention.outWeights)),
+          outGateWeights: upload(`b${index}.out-gate`, narrow(block.attention.outGateWeights)),
           outGateBias: upload(`b${index}.out-gate-bias`, block.attention.outGateBias),
         },
         transition: {
           adaln: adaln("ffn", block.transition),
-          swishWeights: upload(`b${index}.swish`, block.transition.swishWeights),
-          outWeights: upload(`b${index}.ffn-out`, block.transition.outWeights),
-          outGateWeights: upload(`b${index}.ffn-out-gate`, block.transition.outGateWeights),
+          swishWeights: upload(`b${index}.swish`, narrow(block.transition.swishWeights)),
+          outWeights: upload(`b${index}.ffn-out`, narrow(block.transition.outWeights)),
+          outGateWeights: upload(`b${index}.ffn-out-gate`, narrow(block.transition.outGateWeights)),
           outGateBias: upload(`b${index}.ffn-out-gate-bias`, block.transition.outGateBias),
         },
       };
@@ -783,7 +839,8 @@ export class Esmfold2DenoiserGpu {
     // ---- the pair conditioning, in row chunks, and the twelve biases from it.
     // ...into `relPos`, which the conditioning is the last reader of; see the
     // note on prepare. A caller that does not hand one over gets its own.
-    b.pairCond = relPos ?? this.#alloc("esmfold2.diff.pair-cond", pairs * pairChannels);
+    b.pairCond = reuseRelPos
+      ? relPos : this.#alloc("esmfold2.diff.pair-cond", pairs * pairChannels);
     const chunk = pipelines.chunks[0];
     const scratchNorm = this.#alloc("esmfold2.diff.pair-joined", chunk * pairChannels * 2);
     const scratchA = this.#alloc("esmfold2.diff.pair-a", chunk * pairChannels * multiplier);
