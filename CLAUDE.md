@@ -105,6 +105,8 @@ values means the whole-stack checker, not that file.
 | What does an ESM-C block cost? | `tools/gpu/bench-esmc-tower.js` |
 | ...and is the tower right at more than one length? | `check-esmc-tower.js --dump=/oracle-dumps/esmc-{59,128,180}.json` |
 
+| **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) |
+| Does its structural-token expansion conserve the atoms? | `tools/gpu/check-opendde-expander.js` |
 | Does OpenDDE's trunk predict a real fold's contacts? | `tools/gpu/trunk-opendde.js` (**and `--model=/model-af3-int5/manifest.json` is the control**) |
 | Does a pairformer block match its reference at THIS bundle's widths? | `tools/gpu/check-af3-block-any.js --model=` |
 | ...and which pair-track kernel is the one that does not? | `tools/gpu/probe-opendde-kernels.js --model=` |
@@ -243,7 +245,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
-| `docs/OPENDDE.md` | the OpenDDE port: the trunk transfers at different widths and the structural-token stage does not, the dialect's two disagreements with OpenBind-0, and the dispatch bug that scored below chance |
+| `docs/OPENDDE.md` | the OpenDDE port: two token spaces, the dialect's two disagreements with OpenBind-0, the dispatch bug that scored below chance, and the per-block pair norm that collapsed a fold to a 0.27 A cloud |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |
 | `docs/DEVELOPING.md` | the older orientation notes |
 | `docs/HANDOFF.md` | the pLDDT-from-distogram attempt whose code was deleted, kept so the next attempt does not repeat it |

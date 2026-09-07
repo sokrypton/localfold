@@ -1,13 +1,30 @@
-# OpenDDE: the trunk transfers, the way it makes coordinates does not
+# OpenDDE: two token spaces, and a fold
 
 OpenDDE (Aureka Research, Apache-2.0) is an independent PyTorch
 reimplementation in the AlphaFold 3 family - its own pairformer and its own
 primitives, not DeepMind's code at different widths. This is the port's state:
 what runs, what it is worth, and what is deliberately absent.
 
-**It is not a folding model here.** `MODEL_BUNDLES.opendde` says
-`foldingModel: false`, the page does not offer it, and the reason is in the
-weights rather than in the schedule - see "What does not transfer" below.
+**It folds.** The trunk runs on residues; between the trunk and the diffusion
+each standard residue is re-tokenised into a backbone and a sidechain token,
+and the diffusion runs on those. `src/af3/fold-opendde.js` is that driver and
+`tools/gpu/fold-opendde.js` runs it.
+
+    node tools/gpu-chrome.mjs tools/gpu/fold-opendde.js --target=6mrr
+
+| target | residues -> tokens | CA-CA | Rg | RMSD | TM |
+|---|---|---|---|---|---|
+| 6MRR | 68 -> 130 | **3.680 A** | 10.96 A | **1.678 A** | **0.865** |
+| 1QYS | 92 -> 179 | 3.670 | 11.95 | 2.573 | 0.726 |
+
+🔴 **THE GEOMETRY IS THE GATE BEFORE THE FOLD IS.** A peptide bond is 3.8 A: a
+port with the arithmetic subtly wrong produces a plausible cloud at the wrong
+scale, and an RMSD alone does not say which. TM above 0.5 is the same fold.
+
+**`foldingModel` is still `false`**, because the PAGE has no route to this
+driver - it folds through `foldBatch`, which would hand the diffusion residue
+tokens where it wants structural ones. Every shape conforms and a structure
+comes out, so that branch has to land before the flag does.
 
 ## What it does
 
@@ -215,7 +232,16 @@ By group, of the 240 shared: the trunk pairformer, the MSA stack and the
 template embedder share every name and differ only in width; the diffusion
 shares 51 of 53; the confidence head shares nothing usable.
 
-So the exported bundle is the trunk and the distogram head, and stops there.
+So the port is a second token space threaded through the atom layouts, which
+is what `src/af3/structural-tokens.js` and `src/af3/fold-opendde.js` are. The
+bundle is the whole model: 481 tensors, 655.8 M parameters, upstream's own
+published `parameter_count` exactly.
+
+🔴 **AND THE CONFIDENCE HEAD IS THE ONE PART STILL UNPORTED.** OpenDDE's is its
+own design - 51 tensors under `confidence_head/pairformer_stack`, with none of
+AlphaFold 3's names, on its own 39-bin distance grid (3.25 to 52.0, step 1.25)
+- so a fold returns coordinates and a contact map and no pLDDT or PAE. The
+trunk's distogram is what scores a fold today.
 
 🔴 **AND NOTHING CAN RUN THE ABSENT HALVES BY ACCIDENT.** `diffusionWeights`
 and `confidenceWeights` on this bundle both refuse by naming the first tensor
@@ -256,6 +282,47 @@ rather than a code change.
 int5; the float32 bundle scores the same. That was measured first, because
 "the port is wrong" and "int5 is too coarse for this checkpoint" look identical
 from a bad contact map.
+
+## The three branches the diffusion needed
+
+| | AlphaFold 3 | OpenDDE |
+|---|---|---|
+| `pair_cond_initial_norm` | [267] = trunk pair 128 + RAW relative 139 | **[256]** = two compressions of 128 |
+| token transformer pair norm | shared, [128] beside the stack | **per block, [6, 4, 128] inside it** |
+| atom stacks' pair norm | shared, [16] beside the stack | **per block, [3, 16] inside it** |
+
+🔴 **THE PAIR CONDITIONING IS TWO COMPRESSIONS, NOT ONE CONCATENATION.**
+AlphaFold 3 concatenates the trunk pair with the RAW relative encoding and
+LayerNorms the lot; OpenDDE compresses each to the pair width SEPARATELY -
+`z_trunk_projection` [384, 128] and `relpe_projection` [139, 128] - and
+concatenates those. The joint norm over the widened concatenation couples the
+two terms, so this is a different function and not a re-association. It does
+not depend on the noise level, which is why the head already cached it across
+the sampler's steps and why `pairConditioning` on its input is enough.
+
+🔴 **AND THE STACK'S NAME FOLLOWS THE CONVENTION.** haiku calls a layer stack
+`__layer_stack_no_per_layer` when it carries no per-layer inputs, so a per-block
+pair norm moves the PATH as well as the RANK - and reading one convention
+without the other finds no tensors at all rather than the wrong ones.
+
+🔴 **AND THE TOKEN TRANSFORMER'S PER-BLOCK NORM IS WHAT MADE IT COLLAPSE.**
+Loaded and not applied, its [6, 4, 128] scale was read as [128] and its
+[6, 4, 128, 16] projection at AlphaFold 3's [6, 128, 4, 16] layout - the same
+element count, a different meaning. The fold came out finite, shape-correct and
+with a radius of gyration of **0.27 A**: atoms placed sensibly WITHIN a token,
+and tokens not placed relative to one another at all. That is exactly what a
+garbage pair bias does, and it is why the symptom localised the cause.
+
+🔴 **AND IT NEEDED NO KERNEL, BECAUSE A PER-BLOCK SCALE IS A PER-BLOCK
+PROJECTION.** This LayerNorm has no offset, so `LN(z) * scale_b @ W_b` is
+`LN(z) @ (diag(scale_b) W_b)` exactly - the mean and variance it removes do not
+depend on the scale. The scales fold into the projections in the loader,
+transposing from OpenDDE's [block, channels, head] to AlphaFold 3's
+[channels, block, head], and the shared-scale kernel then computes OpenDDE.
+
+🔴 **AND THE WHOLE DIFFUSION IS SHAPE-IDENTICAL TO AlphaFold 3's APART FROM
+THOSE TWO CONDITIONING TENSORS**, which is what said the remaining fault had to
+be a forward branch rather than a width, and stopped the search being a sweep.
 
 ## What went wrong on the way, and what it cost
 
