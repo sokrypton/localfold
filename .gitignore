@@ -52,6 +52,12 @@ __pycache__/
 # the same two tools with --model openbind.
 /model-openbind0-full-f32
 /model-openbind0-int5
+# OpenDDE's exports, in the four shapes the port produces. The bundle is
+# hosted (see MODEL_BUNDLES.opendde); the checkout keeps none of it.
+/model-opendde-full-f32
+/model-opendde-int5
+/model-opendde-trunk-f32
+/model-opendde-trunk-int5
 
 # A saved copy of Google's AlphaFold Server page, kept locally as a reference
 # for the entity interface. Not ours to redistribute, and not repo content.
