@@ -156,6 +156,9 @@ export async function main(device, args) {
     // The resident trunk weights' element; see the measurement in docs.
     weightPrecision: option(args, "weights", undefined),
     pairWeightPrecision: option(args, "pair-weights", undefined),
+    // ...undefined unless asked, so the width rule in foldBatch decides.
+    residentWeights: args.includes("--no-resident") ? false
+      : args.includes("--resident") ? true : undefined,
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     mode: option(args, "mode", "diffusion"),
     onStep: ({ step, denoised, structuralDenoised }) => {
@@ -272,6 +275,9 @@ export async function main(device, args) {
     target, sequence: sequence.length,
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
     meanPlddt: fold.meanPlddt ?? null,
+    // ...undefined unless asked, so the width rule in foldBatch decides.
+    residentWeights: args.includes("--no-resident") ? false
+      : args.includes("--resident") ? true : undefined,
     steps, recycles, wholeMs,
     timings: Object.fromEntries(Object.entries(timings)
       .filter(([, ms]) => ms >= 20).sort((a, b) => b[1] - a[1])),

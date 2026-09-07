@@ -487,6 +487,38 @@ that model - "more steps than the schedule buy nothing" - so this is the second
 time here. **One target, so read it as a direction and not a margin**; the
 default is unchanged pending more.
 
+### The peak, 1198 -> 648 MiB, in two decisions keyed on one number
+
+Both are the same trade - what the trunk's block weights cost against what they
+buy - and both flip between AlphaFold 3's 128 channels and OpenDDE's 384,
+because these weights go as the SQUARE of that. `WIDE_PAIR_TRACK` is the
+threshold, at 256, and it is a line between two measured points rather than an
+optimum.
+
+| | peak | time |
+|---|---|---|
+| as first written | 1198.3 MiB | 16.1 s |
+| f16 resident pair weights | 873.5 | 16.1 |
+| **...and not resident at all** | **647.6** | **16.0** |
+
+**-46%, and the structure does not move**: RMSD 1.570 and TM 0.9146 at every
+step. AlphaFold 3 takes neither and is bit-identical (mean pLDDT
+72.19283791929007), AlphaFold 2 is unmoved (checksum -2105827).
+
+### Residency buys a second pass and costs the whole peak
+
+| recycles | resident | non-resident |
+|---|---|---|
+| 0 | 873.5 MiB, 16.1 s | **647.6 MiB, 16.1 s** |
+| 1 | 894.4, 19.5 | **647.6, 19.6** |
+| 3 | 894.4, 26.4 | **647.6, 26.8** |
+
+🔴 **247 MiB TO BUY AT MOST 0.4 SECONDS.** Residency exists so a SECOND trunk
+pass does not re-upload 48 blocks - and at OpenDDE's widths the re-upload is
+1.5% of a three-recycle fold while holding them is 28% of the peak. AlphaFold 3
+keeps its residency: its block weights are a ninth of these, and its peak is
+the diffusion transformer regardless, so there is nothing to buy.
+
 ### f16 resident pair weights: 27% of the peak, taken
 
 | | peak | time | RMSD | pLDDT |
