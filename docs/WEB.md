@@ -652,12 +652,24 @@ adjusted, check first whether the adjustment is the bug.
 
 **Open, in order:**
 
-1. **Modified residues** (`--code SEP`), the one input shape not yet round
-   tripped. A modified residue is several TOKENS for one residue, like a ligand
-   - `probe-modified.js` is the chemistry side - so it lands on the same
-   `tokens` path the ligand exercises, and is expected to pass. Worth one run
-   rather than an assumption; `fold-in-page.py` has no flag for it yet, so it
-   needs one, beside `--ligand`.
+1. ~~**Modified residues**~~ - done, and it found a bug that was not in the
+   session at all. `fold-in-page.py --modify SEP@3` sets the modification on the
+   entity the way the row's `⋮` popup does, and the round trip is clean: 67
+   tokens for 58 residues, PAE 67 wide, `token_res_ids` ending at 58, both
+   download buttons working. But **`job_request.json` did not name the
+   modification**, on a live fold as much as a restored one - the request is the
+   file a reader hands back to reproduce a job, and one listing the parent
+   sequence alone describes a different fold. Silently, because a modified
+   residue changes no residue COUNT: `SEP3` shows in the status line and nowhere
+   in the archive. Now written in the server's own dialect,
+   `{ptmType: "CCD_SEP", ptmPosition: 3}`, and ABSENT rather than `[]` on an
+   unmodified chain, since an empty array claims the chain was checked. The gate
+   reads it back off the zip.
+
+   The same argument reached the offer row, which said "58 residues" for a fold
+   whose parent would say exactly the same thing - so it names the ligands and
+   the modifications now, capped at three, the way the status line does:
+   `Last fold: AlphaFold 3 · 58 residues + SEP3 · pLDDT 72.1 · just now`.
 2. **A quota-exhausted save.** `saveSession` returns `"quota"` and the page says
    so, and that branch has never run.
 3. **The no-`CompressionStream` fallback.** `pack`/`unpack` decide by TYPE, so an

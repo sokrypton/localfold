@@ -87,6 +87,29 @@ describe("the fold archive", () => {
     expect(request[0].dialect).toBe("alphafoldserver");
   });
 
+  /**
+   * 🔴 A MODIFIED RESIDUE IS INPUT, AND THE REQUEST IS WHAT REPRODUCES A JOB.
+   * The request listed the parent sequence alone, so an archive for a
+   * phosphorylated fold handed a reader a job that folds something else -
+   * and silently, because SEP3 shows in the status line and nowhere in the
+   * file. Same rule as the templates line.
+   */
+  it("names a modified residue in the request", () => {
+    const request = JSON.parse(jobRequestJson({ name: "j", seed: 0, entities: [
+      { type: "protein", value: "ACSE", copies: 1,
+        modifications: [{ code: "sep", position: 3 }] },
+    ] }));
+    expect(request[0].sequences[0].proteinChain.modifications)
+      .toEqual([{ ptmType: "CCD_SEP", ptmPosition: 3 }]);
+  });
+
+  // ...and absent, not empty, on a chain that carries none: `modifications: []`
+  // is a claim that the chain was checked, which no fold before this made.
+  it("says nothing at all when a chain is unmodified", () => {
+    const request = JSON.parse(jobRequestJson({ name: "j", seed: 0, entities }));
+    expect("modifications" in request[0].sequences[0].proteinChain).toBe(false);
+  });
+
   it("nests the contacts exactly as it nests the PAE", () => {
     const data = JSON.parse(fullDataJson({
       ...prediction(), tokenChainIds: ["A", "A", "B", "B"],

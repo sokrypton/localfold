@@ -122,7 +122,23 @@ export function jobRequestJson({ name, seed, entities }) {
     if (value === "") continue;
     const count = Math.max(1, Number(entity.copies) || 1);
     if (entity.type === "protein") {
+      // 🔴 A MODIFIED RESIDUE IS PART OF THE JOB, NOT A RENDERING OF IT. The
+      // request is what a reader hands back to reproduce the fold, and one
+      // that lists the parent sequence alone describes a DIFFERENT job - the
+      // same mistake as dropping the templates line. The server's dialect
+      // names them `ptmType`/`ptmPosition`, with the CCD code prefixed, so
+      // they are written the way the server would read them back.
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          ptmType: `CCD_${modification.code.trim().toUpperCase()}`,
+          ptmPosition: modification.position,
+        }));
       sequences.push({ proteinChain: { sequence: value, count,
+        // ...absent rather than empty, because `modifications: []` is a claim
+        // that the chain was checked and carries none, and every unmodified
+        // fold this page has ever written says nothing at all.
+        ...(modifications.length === 0 ? {} : { modifications }),
         useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
     } else if (entity.type === "dna" || entity.type === "rna") {
       sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });

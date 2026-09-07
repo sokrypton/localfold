@@ -3707,9 +3707,26 @@ async function offerSession() {
   const residues = `${meta.residues} residue${meta.residues === 1 ? "" : "s"}`;
   const plddt = meta.confidence?.meanPlddt;
   const score = plddt === undefined ? "" : ` · pLDDT ${plddt.toFixed(1)}`;
+  // 🔴 THE LIGAND AND THE MODIFICATION ARE NAMED, for the reason the status
+  // line names them: neither changes the residue COUNT, so a phosphorylated
+  // fold and its parent produce the same row and the offer describes the wrong
+  // one of the two. The row is the only thing the reader has to recognise it
+  // by; the sequence is in the tooltip and says nothing about either.
+  const extras = [];
+  for (const entity of meta.entities ?? []) {
+    if (entity.type === "ligand" && (entity.value ?? "").trim() !== "") {
+      extras.push(entity.value.trim().toUpperCase());
+    }
+    for (const one of entity.modifications ?? []) {
+      if ((one.code ?? "").trim() !== "") extras.push(`${one.code}${one.position}`);
+    }
+  }
+  const named = extras.length === 0 ? ""
+    : ` + ${extras.length > 3 ? `${extras.slice(0, 3).join(", ")} +${extras.length - 3}`
+      : extras.join(", ")}`;
   // 🔴 textContent, NEVER innerHTML: the sequence is user input.
   element("session-text").textContent =
-    `Last fold: ${meta.model} · ${residues}${score} · ${agoLabel(meta.savedAt)}`;
+    `Last fold: ${meta.model} · ${residues}${named}${score} · ${agoLabel(meta.savedAt)}`;
   element("session-text").title = meta.sequence ?? "";
   row.hidden = false;
 }
