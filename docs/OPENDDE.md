@@ -237,11 +237,37 @@ is what `src/af3/structural-tokens.js` and `src/af3/fold-opendde.js` are. The
 bundle is the whole model: 481 tensors, 655.8 M parameters, upstream's own
 published `parameter_count` exactly.
 
-🔴 **AND THE CONFIDENCE HEAD IS THE ONE PART STILL UNPORTED.** OpenDDE's is its
-own design - 51 tensors under `confidence_head/pairformer_stack`, with none of
-AlphaFold 3's names, on its own 39-bin distance grid (3.25 to 52.0, step 1.25)
-- so a fold returns coordinates and a contact map and no pLDDT or PAE. The
-trunk's distogram is what scores a fold today.
+🔴 **AND THE CONFIDENCE HEAD IS PORTED, AS ITS OWN PARAMETRISATION.** It shares
+not one tensor name with AlphaFold 3's: it initialises its pair from `s_inputs`
+as a row and a column, adds a distance embedding of the structure the SAMPLER
+PRODUCED - so unlike AF3's it cannot run before the sampler - runs four
+pairformer blocks of its own shape, and reads pLDDT and experimentally-resolved
+as a per-ATOM einsum against a [24, c_s, bins] tensor selected by the atom's
+dense SLOT. Broadcasting that instead of selecting gives every atom of a token
+the same pLDDT, which looks right on a backbone and is wrong everywhere else.
+
+Measured on 6MRR against the deposition, with AlphaFold 3 through the same tool
+as the control:
+
+| | RMSD | TM | mean pLDDT | pLDDT vs error |
+|---|---|---|---|---|
+| AlphaFold 3 | 0.642 A | 0.956 | 84.21 | **-0.405** |
+| **OpenDDE** | 1.655 | 0.885 | **92.05** | **-0.186** |
+
+The last column is Spearman of per-residue pLDDT against per-residue deviation
+after superposition, so NEGATIVE is the head working - confident where the
+error is small. Both are negative and AlphaFold 3's is the stronger, on a fold
+that is also the better one. **OpenDDE is the more optimistic of the two**: it
+reports 92 on a 1.65 A fold where AlphaFold 3 reports 84 on a 0.64 A one. On a
+target this good there is little error to rank, which docs/EF2FAST.md records
+as the reason its own certainty sweep had to manufacture a hard end - so read
+-0.19 as "the head is wired correctly", not as a calibration.
+
+🔴 **AND WHAT IT STILL DOES NOT REPORT IS pTM.** That needs a TM term;
+AlphaFold 3's head emits one beside the PAE and OpenDDE's emits pLDDT, PAE, PDE
+and experimentally-resolved and nothing else. Deriving one from the PAE would
+be a different quantity wearing pTM's name, so pTM and ipTM are ABSENT rather
+than approximated.
 
 🔴 **AND NOTHING CAN RUN THE ABSENT HALVES BY ACCIDENT.** `diffusionWeights`
 and `confidenceWeights` on this bundle both refuse by naming the first tensor

@@ -14,7 +14,8 @@ import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import {
-  openAf3Store, structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
+  confidenceWeights, openAf3Store, openddeConfidenceWeights,
+  structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
 } from "../../src/af3/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
@@ -96,14 +97,16 @@ function superpose(model, truth) {
   let squared = 0;
   const d0 = 1.24 * Math.cbrt(Math.max(n - 15, 1)) - 1.8;
   let tm = 0;
+  const deviations = [];
   for (const [a, b] of pairs) {
     const moved = [0, 1, 2].map((i) =>
       [0, 1, 2].reduce((s, k) => s + (a[k] - cm[k]) * rotation[k][i], 0) + ct[i]);
     const d2 = [0, 1, 2].reduce((s, i) => s + (moved[i] - b[i]) ** 2, 0);
     squared += d2;
+    deviations.push(Math.sqrt(d2));
     tm += 1 / (1 + d2 / (d0 * d0));
   }
-  return { rmsd: Math.sqrt(squared / n), tm: tm / n, pairs: n };
+  return { rmsd: Math.sqrt(squared / n), tm: tm / n, pairs: n, deviations };
 }
 
 export async function main(device, args) {
@@ -117,11 +120,17 @@ export async function main(device, args) {
 
   const batch = featuriseProtein(sequence, {});
   const store = await openAf3Store(manifest);
+  const trunk = await trunkWeights(store, Number(option(args, "blocks", "48")), 4);
   const weights = {
-    trunk: await trunkWeights(store, Number(option(args, "blocks", "48")), 4),
+    trunk,
     targetFeat: await targetFeatureWeights(store),
-    expander: await structuralExpanderWeights(store),
-    refiner: await structuralRefinerWeights(store),
+    // The structural stacks exist only in a bundle whose dialect says so; AF3
+    // and OpenBind-0 run this same tool as the control and have none.
+    ...(trunk.dialect.structuralTokens ? {
+      expander: await structuralExpanderWeights(store),
+      refiner: await structuralRefinerWeights(store),
+      openddeConfidence: await openddeConfidenceWeights(store),
+    } : { confidence: await confidenceWeights(store) }),
     diffusion: await diffusionWeights(store),
     atomReference: await atomReference(store),
   };
@@ -163,6 +172,40 @@ export async function main(device, args) {
   const scored = sequence === crystal.sequence
     ? superpose(modelCa, crystal.alphaCarbons) : undefined;
 
+  // 🔴 A pLDDT IN THE RIGHT RANGE IS NOT A pLDDT THAT MEANS ANYTHING. What it
+  // claims is that a residue is placed well, so the check is whether it tracks
+  // the residue's actual deviation from the deposition - a head read at the
+  // wrong bin grid, or with `plddt_weight` broadcast instead of selected per
+  // atom, still lands in 0-100 and still averages to something plausible.
+  // Negative Spearman is the expectation: high pLDDT, low error.
+  let plddtVsError;
+  if (scored !== undefined && fold.perResiduePlddt !== undefined) {
+    const pairs = [];
+    for (let i = 0; i < batch.tokens; i += 1) {
+      if (scored.deviations[i] === undefined || fold.perResiduePlddt[i] === undefined) continue;
+      pairs.push([fold.perResiduePlddt[i], scored.deviations[i]]);
+    }
+    const rank = (values) => {
+      const order = values.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+      const out = new Array(values.length);
+      order.forEach(([, i], at) => { out[i] = at; });
+      return out;
+    };
+    const a = rank(pairs.map((p) => p[0]));
+    const b = rank(pairs.map((p) => p[1]));
+    const n = pairs.length;
+    const mean = (n - 1) / 2;
+    let num = 0;
+    let da = 0;
+    let db = 0;
+    for (let i = 0; i < n; i += 1) {
+      num += (a[i] - mean) * (b[i] - mean);
+      da += (a[i] - mean) ** 2;
+      db += (b[i] - mean) ** 2;
+    }
+    plddtVsError = Number((num / Math.sqrt(da * db)).toFixed(4));
+  }
+
   return {
     target, sequence: sequence.length,
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
@@ -171,6 +214,9 @@ export async function main(device, args) {
     geometry,
     scored: scored && { rmsd: Number(scored.rmsd.toFixed(3)),
                         tm: Number(scored.tm.toFixed(4)), pairs: scored.pairs },
+    // Spearman of per-residue pLDDT against per-residue deviation. NEGATIVE is
+    // the model working: high confidence where the error is small.
+    plddtVsError,
     finite: fold.positions.every(Number.isFinite),
     pdb: args.includes("--pdb") ? toPdb(batch, fold.positions, null) : undefined,
     deviceMemory: memorySnapshot(device),

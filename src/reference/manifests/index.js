@@ -212,11 +212,15 @@ export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "ef2-fast-600m"
  * 🔴 A MODEL WITHOUT A CONFIDENCE HEAD MUST NOT BE COLOURED BY pLDDT. Its
  * B-factor column is zero everywhere, and the pLDDT ramp paints zero RED - so
  * the whole structure reads as a uniformly terrible fold rather than an absent
- * measurement. EF2-fast has no head in its checkpoint at all; OpenDDE has one
- * of its own design, on its own distance grid, which this graph does not run.
- * Both colour by chain and say so.
+ * measurement.
+ *
+ * 🔴 OpenDDE IS NOT ON THIS LIST ANY MORE. Its head is its own
+ * parametrisation - see src/af3/opendde-confidence.js - and it is ported, so a
+ * fold reports a pLDDT and a PAE. What it still does NOT report is pTM: that
+ * needs a TM term, which AlphaFold 3's head emits and OpenDDE's does not, and
+ * deriving one from the PAE would be a different quantity wearing pTM's name.
  */
-export const MODELS_WITHOUT_CONFIDENCE = ["opendde", "ef2-fast-600m", "ef2-fast-300m"];
+export const MODELS_WITHOUT_CONFIDENCE = ["ef2-fast-600m", "ef2-fast-300m"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
 export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];

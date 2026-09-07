@@ -18,8 +18,8 @@ import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
 import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
-import { confidenceWeights, structuralExpanderWeights, structuralRefinerWeights,
-  trunkWeights } from "../src/af3/weights.js";
+import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
+  structuralRefinerWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -137,12 +137,17 @@ export function loadAf3Weights(onProgress, family = "af3") {
       return {
         trunk,
         diffusion: await diffusionWeights(store),
+        // 🔴 AlphaFold 3's HEAD, WHERE THERE IS ONE. OpenDDE's is a different
+        // parametrisation entirely and loads through openddeConfidenceWeights
+        // below; `confidenceWeights` REFUSES this bundle rather than loading a
+        // partial one.
         confidence: structural ? undefined : await confidenceWeights(store),
         atomReference: await atomReference(store),
         targetFeat: await targetFeatureWeights(store),
         ...(structural ? {
           expander: await structuralExpanderWeights(store),
           refiner: await structuralRefinerWeights(store),
+          openddeConfidence: await openddeConfidenceWeights(store),
         } : {}),
       };
     })();

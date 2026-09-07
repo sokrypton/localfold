@@ -680,6 +680,65 @@ export async function structuralExpanderWeights(store) {
   };
 }
 
+export const OPENDDE_CONFIDENCE = "diffuser/confidence_head";
+export const OPENDDE_CONFIDENCE_STACK =
+  `${OPENDDE_CONFIDENCE}/pairformer_stack/trunk_pairformer`;
+
+/**
+ * OpenDDE's confidence head, which is its own parametrisation and not AF3's.
+ *
+ * 🔴 IT SHARES NOT ONE TENSOR NAME WITH AlphaFold 3's HEAD. AF3 embeds
+ * target_feat and a distogram into a pair, runs four pairformer blocks and
+ * reads out with `~_embed_features/*`; OpenDDE initialises its pair from
+ * `s_inputs` as a row and a column, adds a distance embedding of the PREDICTED
+ * structure, runs its own four blocks, and reads pLDDT and
+ * experimentally-resolved as a per-ATOM einsum against a [24, c_s, bins]
+ * tensor selected by the atom's dense slot. `confidenceWeights` refuses this
+ * bundle for that reason, and this is the other loader.
+ *
+ * 🔴 AND ITS PAIRFORMER IS A FOURTH SHAPE AGAIN: 16 single heads of 24 like
+ * the trunk's, 12 grid heads like everything else here, and a pair transition
+ * of factor 4 - where the structural-token REFINER, four blocks of the same
+ * module, is 8 heads of 48 at factor 2. Every one is read off the weights.
+ */
+export async function openddeConfidenceWeights(store, blocks = 4) {
+  const T = (name) => store.tensor(`${OPENDDE_CONFIDENCE}/${name}`);
+  const [distanceBins, pairChannels] = dims(store, `${OPENDDE_CONFIDENCE}/linear_no_bias_d/weights`);
+  const [singleInputChannels] = dims(store, `${OPENDDE_CONFIDENCE}/linear_no_bias_s1/weights`);
+  const [, paeBins] = dims(store, `${OPENDDE_CONFIDENCE}/linear_no_bias_pae/weights`);
+  const [, pdeBins] = dims(store, `${OPENDDE_CONFIDENCE}/linear_no_bias_pde/weights`);
+  const [denseSlots, singleChannels, plddtBins] =
+    dims(store, `${OPENDDE_CONFIDENCE}/plddt_weight`);
+  const [, , resolvedBins] = dims(store, `${OPENDDE_CONFIDENCE}/resolved_weight`);
+  const stack = [];
+  for (let index = 0; index < blocks; index += 1) {
+    stack.push(await pairformerBlockWeights(store, index, OPENDDE_CONFIDENCE_STACK));
+  }
+  return {
+    pairChannels, singleChannels, singleInputChannels,
+    distanceBins, paeBins, pdeBins, plddtBins, resolvedBins, denseSlots,
+    inputStrunkLnScale: await T("input_strunk_ln/scale"),
+    inputStrunkLnOffset: await T("input_strunk_ln/offset"),
+    s1: await T("linear_no_bias_s1/weights"),
+    s2: await T("linear_no_bias_s2/weights"),
+    distance: await T("linear_no_bias_d/weights"),
+    distanceRaw: await T("linear_no_bias_d_wo_onehot/weights"),
+    paeLnScale: await T("pae_ln/scale"),
+    paeLnOffset: await T("pae_ln/offset"),
+    pae: await T("linear_no_bias_pae/weights"),
+    pdeLnScale: await T("pde_ln/scale"),
+    pdeLnOffset: await T("pde_ln/offset"),
+    pde: await T("linear_no_bias_pde/weights"),
+    plddtLnScale: await T("plddt_ln/scale"),
+    plddtLnOffset: await T("plddt_ln/offset"),
+    plddtWeight: await T("plddt_weight"),
+    resolvedLnScale: await T("resolved_ln/scale"),
+    resolvedLnOffset: await T("resolved_ln/offset"),
+    resolvedWeight: await T("resolved_weight"),
+    blocks: stack,
+  };
+}
+
 /** The refiner: four pairformer blocks on the structural tokens. */
 export async function structuralRefinerWeights(store, blocks = 4) {
   const out = [];

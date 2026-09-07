@@ -254,7 +254,17 @@ export class Af3PairformerStackGpu {
     const pairBytes = pairs * pairChannels * 4;
 
     // The pair track, shared with the MSA stack.
+    // 🔴 THE HEAD COUNTS ARE IN THE KEY, AND WITHOUT THEM TWO STACKS OF ONE
+    // MODEL COLLIDE. OpenDDE's structural-token refiner is 8 single heads of 48
+    // and its confidence head is 16 of 24 - the same 384 channels, the same
+    // token count, the same pair bias - so a key that named only the WIDTHS
+    // asked the cache for the wrong shader. The cache reported a collision
+    // rather than serving it, which is what that check is for; the grid's
+    // counts go in for the same reason, though every stack here happens to
+    // agree on 12.
     const base = `af3-block:${n}:${pairChannels}:${singleChannels}`
+      + `:${heads}x${blocks[0].singleAttention.dimension}`
+      + `:${gridHeads}x${blocks[0].pairAttention1.dimension}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`
       + `:${extraPairBiasData === undefined ? "nobias" : "bias"}`;
     const hasF16 = this.device.features?.has("shader-f16") === true;

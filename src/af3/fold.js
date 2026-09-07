@@ -39,6 +39,7 @@ import { structuralAttentionBias, structuralPairFeatures }
 import { structuralBatch, structuralLayout, structuralToResidue }
   from "./structural-tokens.js";
 import { diffusionConditioning } from "./diffusion-reference.js";
+import { openddeConfidence } from "./opendde-confidence.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
@@ -446,7 +447,7 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
     }, weights.diffusion.conditioning).pair;
 
   return {
-    layout, structural,
+    layout, structural, attentionBias,
     headInput: {
       shape: structural.shape, dialect: weights.diffusion.dialect,
       conditioning, atomMask: structural.predDenseAtomMask, seqMask,
@@ -761,14 +762,70 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }, weights.confidence, weights.confidence.dialect);
   };
 
-  // 🔴 AND OpenDDE HAS NO CONFIDENCE HEAD THIS GRAPH CAN RUN. Its own is a
+  /**
+   * OpenDDE's confidence, mapped back onto the residue layout.
+   *
+   * The head reports per STRUCTURAL atom and per structural PAIR;
+   * `residueAtomGather` puts the atoms back where every consumer expects them,
+   * and `residueRepToken` picks the subtoken that stands for a residue in the
+   * per-pair matrices - its FIRST, which is the one carrying the backbone role.
+   */
+  const openddeScores = async () => {
+    const layout = structural.layout;
+    const n = layout.tokens;
+    const beta = structural.structural.tokenAtomsToPseudoBeta;
+    const coordinates = new Float32Array(n * 3);
+    for (let token = 0; token < n; token += 1) {
+      if (!beta.mask[token]) continue;
+      const from = Number(beta.indices[token]) * 3;
+      for (let axis = 0; axis < 3; axis += 1) {
+        coordinates[token * 3 + axis] = sampled[from + axis];
+      }
+    }
+    const atomToToken = new Int32Array(n * dense);
+    const atomToSlot = new Int32Array(n * dense);
+    for (let token = 0; token < n; token += 1) {
+      for (let slot = 0; slot < dense; slot += 1) {
+        atomToToken[token * dense + slot] = token;
+        atomToSlot[token * dense + slot] = slot;
+      }
+    }
+    const raw = await openddeConfidence(device, {
+      tokens: n, singleInputs: structural.headInput.targetFeat,
+      single: structural.headInput.trunkSingle, pair: structural.headInput.trunkPair,
+      coordinates, seqMask: structural.structural.seqMask,
+      atomToToken, atomToSlot, atomCount: n * dense,
+      extraPairBias: structural.attentionBias,
+    }, weights.openddeConfidence, weights.trunk.dialect);
+
+    // Per-atom scores, scattered onto the residue layout.
+    const plddt = new Float32Array(tokens * dense);
+    for (let index = 0; index < tokens * dense; index += 1) {
+      const from = layout.residueAtomGather[index];
+      if (from >= 0) plddt[index] = raw.plddt[from];
+    }
+    // Per-pair matrices, on the residue tokens that represent them.
+    const rep = layout.residueRepToken;
+    const pae = new Float32Array(tokens * tokens);
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) pae[i * tokens + j] = raw.pae[rep[i] * n + rep[j]];
+    }
+    return { plddt, pae, tmAdjusted: undefined, opendde: raw };
+  };
+
+  // 🔴 AND A MODEL MAY STILL HAVE NO CONFIDENCE HEAD AT ALL. Its own is a
   // different design on a different distance grid - 51 tensors under
   // `confidence_head/pairformer_stack`, none of AlphaFold 3's names - so there
   // is no pLDDT and no PAE, and the keys are ABSENT rather than zero. A zero
   // pLDDT would be drawn as the colour of no confidence, which is a claim; the
   // page already has this path for EF2-fast, which has no head either.
-  const scores = structural !== undefined ? undefined
-    : await confidenceFor();
+  // 🔴 OpenDDE's OWN HEAD, ON THE STRUCTURAL TOKENS AND ON THE STRUCTURE THE
+  // SAMPLER PRODUCED. It initialises its pair from a distance embedding of the
+  // PREDICTION, so unlike AlphaFold 3's it cannot run before the sampler - and
+  // it runs on the structural token set, so its pLDDT is per structural atom
+  // and comes back through the same gather the coordinates do.
+  const scores = structural === undefined ? await confidenceFor()
+    : await openddeScores();
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;
@@ -803,12 +860,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }
     meanPlddt = total / atoms;
 
-    // pTM and ipTM, from the TM term the confidence head wrote. The reduction
-    // is shared with AlphaFold 2 - see src/heads/tm-score.js - and only the
-    // chain identity differs: AF3 has asym_id, so chains need not be
-    // contiguous.
+    // 🔴 pTM NEEDS A TM TERM, AND NOT EVERY HEAD WRITES ONE. AlphaFold 3's
+    // confidence head emits one alongside the PAE; OpenDDE's emits pLDDT, PAE,
+    // PDE and experimentally-resolved and nothing else - so pTM and ipTM are
+    // ABSENT there rather than derived from the PAE, which would be a
+    // different quantity wearing pTM's name.
     const asymId = batch.asymId;
     const selected = (i, j) => seqMask[i] > 0 && seqMask[j] > 0;
+    if (scores.tmAdjusted !== undefined) {
     ptm = reduceTmScore(scores.tmAdjusted, tokens, selected);
     // NaN for one chain, because there is no interface to score. Zero would
     // read as a confident failure rather than an inapplicable question.
@@ -825,6 +884,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     const perChain = perChainTmScores(scores.tmAdjusted, tokens, asymId, seqMask);
     chainPtm = Object.fromEntries(perChain.chainPtm);
     chainIptm = Object.fromEntries(perChain.chainIptm);
+    }
 
     pseudoBeta = new Float32Array(tokens * 3);
     for (let token = 0; token < tokens; token += 1) {
@@ -852,6 +912,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // it was reused, so the cache survives a chain of re-samples.
     reusable: { trunk, targetFeat, recycles },
     meanPlddt, atoms,
+    // Per RESIDUE, from the alpha carbon - which is what pLDDT means when it is
+    // shown on a cartoon, and what a per-residue check has to compare against.
+    perResiduePlddt: scores === undefined ? undefined
+      : Array.from({ length: tokens }, (_, token) => {
+        const gather = batch.tokenAtomsToPseudoBeta;
+        if (!gather.mask[token]) return undefined;
+        return scores.plddt[Number(gather.indices[token])];
+      }),
     // The structural-token count, where there was one; a caller that reports
     // what a fold did has no other way to see the second token space.
     structuralTokens: structural?.layout.tokens,

@@ -74,7 +74,21 @@ export async function compilePairTrack(cache, options) {
   if (!(channels > 0)) {
     throw new Error("compilePairTrack needs the track's channel count");
   }
-  const transitionFactor = options.transitionFactor ?? 4;
+  // 🔴 THE TRANSITION'S FACTOR IS THE WEIGHTS', NOT A DEFAULT. `transition2` is
+  // [hidden, channels], so the factor is `hidden / channels` and every stack
+  // states its own: AlphaFold 3's pair transition is 4, the template stack's is
+  // 2, and OpenDDE's structural-token REFINER is 2 where its trunk and its
+  // confidence head are 4. Defaulting to 4 reads a factor-2 `transition1` at
+  // twice its stride - which does not fail, because the buffer is merely
+  // shorter than the kernel thinks. Only the template stack ever passed one.
+  const derivedFactor = sample.pairTransition?.transition2 === undefined ? undefined
+    : sample.pairTransition.transition2.length / (channels * channels);
+  const transitionFactor = options.transitionFactor ?? derivedFactor ?? 4;
+  if (!Number.isInteger(transitionFactor)) {
+    throw new Error(`pair transition factor ${transitionFactor} is not an integer; `
+      + `transition2 has ${sample.pairTransition?.transition2?.length} elements `
+      + `at ${channels} channels`);
+  }
   const pairs = n * n;
   // 🔴 THE TRIANGLE PROJECTION'S ACCUMULATORS, WHICH ARE A THIRD FORMAT AGAIN.
   // It holds eight vec4 in a WGSL array - the thing a driver spills first - and
@@ -176,8 +190,15 @@ export async function compilePairTrack(cache, options) {
   // The transition stages two blocks of its own - the layer-normed rows and the
   // gated intermediate - and narrowing them is the same trade as the attention
   // tile above, on the largest kernel in the trunk. See transition-webgpu.js.
+  // 🔴 THE FACTOR IS IN THE KEY, BECAUSE TWO STACKS OF ONE MODEL DIFFER ON IT.
+  // OpenDDE's structural-token refiner and its confidence head are both four
+  // pairformer blocks at 384 channels over the same token count with the same
+  // extra pair bias - and their pair transitions are factor 2 and factor 4. The
+  // key could not tell them apart, so the second asked the cache for the first
+  // one's shader and the cache reported a COLLISION rather than serving it,
+  // which is the whole reason that check exists.
   compileInto("pairTransition",
-    `${base}:pair-transition:${stagedPrecision}:${weightPrecision}`,
+    `${base}:pair-transition:${transitionFactor}:${stagedPrecision}:${weightPrecision}`,
     createTransitionShader(
       // 🔴 THE TRANSITION'S RUNNING SUM STAYS f32, WHERE THE TRIANGLE'S DOES
       // NOT, AND THE DIFFERENCE IS THE RATIO. Narrowing it measures 3.938 ->
