@@ -501,10 +501,37 @@ export async function pairformerBlockWeights(store, index) {
   });
 }
 
-export async function distogramWeights(store) {
+/**
+ * The distogram head: one projection, and for some checkpoints a bias.
+ *
+ * 🔴 STOCK AF3's `half_logits` IS BIAS-FREE AND OpenDDE's IS NOT, and the head
+ * symmetrises by adding its own transpose - so a bias present here is applied
+ * TWICE per logit. That is what OpenDDE trained with (it symmetrises after its
+ * own linear, exactly as this graph does), which is why the bias crosses
+ * unchanged; two of the four families upstream lists need theirs HALVED by the
+ * converter instead, because their natives symmetrise the pair first. The
+ * tensor's presence is the gate, not the model name - but the dialect has to
+ * AGREE with it, or a bundle silently loses a term that spreads its softmax
+ * across every bin.
+ */
+export async function distogramWeights(store, dialect = af3Dialect(store)) {
   const name = "diffuser/distogram_head/half_logits/weights";
   const [pairChannels, bins] = dims(store, name);
-  return { halfLogits: await store.tensor(name), pairChannels, bins };
+  const biasName = "diffuser/distogram_head/half_logits/bias";
+  const present = store.shape(biasName) !== undefined;
+  if (dialect?.distogramBias === undefined) {
+    throw new Error("dialect.distogramBias has no default: stock AF3 trains no "
+      + "bias on half_logits and OpenDDE does");
+  }
+  if (present !== dialect.distogramBias) {
+    throw new Error(`this bundle ${present ? "carries" : "does not carry"} `
+      + `${biasName}, and its dialect says ${dialect.distogramBias}; one of the `
+      + "two is wrong and the fold would be silently different either way");
+  }
+  return {
+    halfLogits: await store.tensor(name), pairChannels, bins,
+    ...(present ? { halfLogitsBias: await store.tensor(biasName) } : {}),
+  };
 }
 
 export async function confidenceWeights(store) {

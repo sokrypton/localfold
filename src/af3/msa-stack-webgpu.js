@@ -19,7 +19,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
-  GRID_WIDTH, PAIR_CHANNELS, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
+  GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
   encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
 import {
@@ -48,7 +48,17 @@ export class Af3MsaStackGpu {
     const n = state.tokens;
     const sequences = state.sequences;
     const pairs = n * n;
-    const msaChannels = options.msaChannels ?? 64;
+    // 🔴 BOTH WIDTHS ARE THE BLOCK'S. OpenDDE's MSA track is 128 channels and
+    // its pair track 384, against AlphaFold 3's 64 and 128, and a declared
+    // width loads either bundle without complaint - see src/af3/weights.js.
+    // `options.msaChannels` survives for a caller that is checking a stack in
+    // isolation; the weights win when they say anything.
+    const msaChannels = blocks[0].msaChannels ?? options.msaChannels ?? 64;
+    const pairChannels = blocks[0].pairChannels;
+    if (!(pairChannels > 0)) {
+      throw new Error("MSA blocks carry no pairChannels; they are built by "
+        + "src/af3/weights.js, which derives it from the weights");
+    }
     const rows = sequences * n;
     const epsilon = options.epsilon ?? 1e-5;
     const variance = options.variance ?? "fast";
@@ -58,8 +68,8 @@ export class Af3MsaStackGpu {
     if (state.msa.length !== rows * msaChannels) {
       throw new Error(`msa has ${state.msa.length} elements; expected ${rows * msaChannels}`);
     }
-    if (state.pair.length !== pairs * PAIR_CHANNELS) {
-      throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * PAIR_CHANNELS}`);
+    if (state.pair.length !== pairs * pairChannels) {
+      throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * pairChannels}`);
     }
 
     const sample = blocks[0];
@@ -72,7 +82,7 @@ export class Af3MsaStackGpu {
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
 
-    const base = `af3-msa:${n}:${sequences}:${msaChannels}:${epsilon}:${variance}`
+    const base = `af3-msa:${n}:${sequences}:${msaChannels}:${pairChannels}:${epsilon}:${variance}`
       + `:${dialect.swapTransposedBias}`;
     const pipelines = await compilePairTrack(this.pipelines, {
       scratchStorage: UNPACKED_PAIR_SCRATCH,
@@ -86,7 +96,7 @@ export class Af3MsaStackGpu {
     };
 
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
-                       pairChannels: PAIR_CHANNELS };
+                       pairChannels };
     const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
       opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
     // ...the contraction's dispatch is one workgroup per (i, j) block of token
@@ -96,7 +106,7 @@ export class Af3MsaStackGpu {
       into(`opm:${name}`, `${base}:opm:${name}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
-      { sequences, tokens: n, msaChannels, pairChannels: PAIR_CHANNELS,
+      { sequences, tokens: n, msaChannels, pairChannels,
         heads: msaHeads, dimension: msaDimension },
       packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
     for (const [name, source] of Object.entries(attentionSources)) {
@@ -126,7 +136,7 @@ export class Af3MsaStackGpu {
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-msa.scratch${index}`,
-          storageBytes(pairs * PAIR_CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-msa.bias", gridHeads * pairs * 4, storage));
@@ -149,6 +159,7 @@ export class Af3MsaStackGpu {
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
+          pairChannels,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
           left, right, opmCounts, keyMask, attention, msaScratch,
         });
@@ -165,14 +176,14 @@ export class Af3MsaStackGpu {
         allocation.release();
       }
       const readbackPair = keep(this.allocator.allocate(
-        "af3-msa.readback-pair", pairs * PAIR_CHANNELS * 4,
+        "af3-msa.readback-pair", pairs * pairChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
       const readbackMsa = keep(this.allocator.allocate(
         "af3-msa.readback-msa", rows * msaChannels * 4,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const encoder = this.device.createCommandEncoder({ label: "af3-msa.readback" });
-      encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairs * PAIR_CHANNELS * 4);
+      encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairs * pairChannels * 4);
       encoder.copyBufferToBuffer(msa.buffer, 0, readbackMsa.buffer, 0, rows * msaChannels * 4);
       this.device.queue.submit([encoder.finish()]);
       await readbackPair.buffer.mapAsync(GPUMapMode.READ);
@@ -194,6 +205,7 @@ export class Af3MsaStackGpu {
 
   async #encodeBlock(context) {
     const { block, n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads } = context;
+    const { pairChannels } = context;
     const { pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer } = context;
     const { left, right, opmCounts, keyMask, attention, msaScratch } = context;
 
@@ -244,7 +256,7 @@ export class Af3MsaStackGpu {
     const perBlock = spread(pipelines.opmBlocks);
     run("opm.contract", pipelines["opm:contract"],
         [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
-    const addPairGroups = spread(ceil(pairs * PAIR_CHANNELS, 64));
+    const addPairGroups = spread(ceil(pairs * pairChannels, 64));
     run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
 
     // ...and the MSA update reads the pair the outer product just changed.

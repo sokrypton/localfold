@@ -19,7 +19,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  ALPHAFOLD3, DIALECTS, OPENBIND0, dialectFor,
+  ALPHAFOLD3, DIALECTS, OPENBIND0, OPENDDE, dialectFor,
   singleCondPadding, singleCondPaddingWgsl, singleCondSource,
 } from "../src/af3/dialect.js";
 import { af3Dialect } from "../src/af3/weights.js";
@@ -46,13 +46,47 @@ describe("the dialect table", () => {
     assert.equal(ALPHAFOLD3.swapTransposedBias, false);
   });
 
+  /** The flags a dialect turns ON, which is the whole of what it says. */
+  const on = (dialect) => Object.entries(dialect)
+    .filter(([, value]) => value).map(([flag]) => flag).sort();
+
   it("turns on exactly the three branches OpenBind-0 needs", () => {
-    assert.deepEqual({ ...OPENBIND0 }, {
-      swapTransposedBias: false,
-      symmetriseBonds: true,
-      maskPaddedKeys: true,
-      padSingleCondUnknownDna: true,
-    });
+    assert.deepEqual(on(OPENBIND0),
+      ["maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
+  });
+
+  /**
+   * 🔴 OpenDDE's LINEAGE DOES NOT PREDICT ITS CONVENTIONS, AND THE TWO
+   * DISAGREEMENTS WITH OpenBind-0 POINT IN OPPOSITE DIRECTIONS. Both models are
+   * OpenFold3-lineage. Upstream's `TRANSPOSED_COLUMN_PAIR_BIAS` lists opendde
+   * and omits openbind, so the transposed pair bias is ON here and OFF there;
+   * and OpenDDE's native single conditioning is 833 wide exactly as
+   * OpenFold3's is, but its converter collapses it to 831 by remapping the
+   * 32-class vocabulary rather than padding it, so the padding is OFF here and
+   * ON there. Deriving either flag from the lineage gets one of them wrong.
+   */
+  it("disagrees with OpenBind-0 in both directions, which is the point", () => {
+    assert.equal(OPENDDE.swapTransposedBias, true);
+    assert.equal(OPENBIND0.swapTransposedBias, false);
+    assert.equal(OPENDDE.padSingleCondUnknownDna, false);
+    assert.equal(OPENBIND0.padSingleCondUnknownDna, true);
+  });
+
+  it("turns on the branches OpenDDE needs, and no others", () => {
+    assert.deepEqual(on(OPENDDE), [
+      "chainedAtomLayerNorm",
+      "distogramBias",
+      "keyMaskedAtomAttention",
+      "maskPaddedKeys",
+      "msaUpdateBeforeOuterProduct",
+      "pairInitFromSingle",
+      "perBlockAtomPairLayerNorm",
+      "perBlockPairLayerNorm",
+      "splitPairConditioning",
+      "structuralTokens",
+      "swapTransposedBias",
+      "symmetriseBonds",
+    ]);
   });
 
   it("leaves stock AlphaFold 3 with none of them", () => {

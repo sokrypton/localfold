@@ -80,10 +80,37 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # cannot be mistaken for OpenBind-1 by a loader that has never heard of it.
 # `openbind` is kept as an alias, because that is the name upstream publishes
 # the blob under.
+# 🔴 opendde IS DOWNLOADED THE SAME WAY, AND IT IS A DIFFERENT KIND OF PORT.
+# OpenBind-0 is AlphaFold 3's graph with AlphaFold 3's widths - 406 arrays, the
+# same names, two shape differences. OpenDDE is an independent PyTorch
+# reimplementation in the same family, and the blob says so: 481 arrays against
+# AF3's 406, of which 240 share a name and only 123 share a SHAPE.
+#
+#     mkdir -p ~/af3_ported && cd ~/af3_ported
+#     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/\
+#       13db85d4867fd0d7f7d91f24f9e20c36eca78004/opendde/opendde.bin.zst
+#
+# 🔴 AND ITS TRUNK IS THE PART THAT TRANSFERS. Every pairformer, MSA-stack and
+# template tensor has AlphaFold 3's name and a different WIDTH - the pair track
+# is 384 channels rather than 128, the MSA 128 rather than 64, the triangle
+# attention 12 heads rather than 4 (2 rather than 4 in the template stack) and
+# the distogram 96 bins rather than 64. That is why src/af3/weights.js derives
+# every width from the tensor that states it: this bundle loads through
+# AlphaFold 3's declared widths without complaint and dispatches every kernel
+# over a third of its own tensor.
+#
+# 🔴 WHAT DOES NOT TRANSFER IS THE CONFIDENCE HEAD AND THE TOKEN SET. OpenDDE
+# expands each residue into about two "structural tokens" between the trunk and
+# the diffusion (`structural_token_expander`, `structural_token_refiner`) and
+# runs a confidence head of its own design on them - 51 tensors under
+# `confidence_head/pairformer_stack` with none of AlphaFold 3's names. So the
+# trunk and the distogram head are exported and the rest is not yet; see
+# docs/OPENDDE.md.
 BLOBS = {
     "alphafold3": "~/af3_official_weights/af3.bin.zst",
     "openfold3": "~/af3_converted_cd2/of3_ported_weights.bin.zst",
     "openbind0": "~/af3_ported/openbind.bin.zst",
+    "opendde": "~/af3_ported/opendde.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
