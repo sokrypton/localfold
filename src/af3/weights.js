@@ -294,7 +294,7 @@ function hasTensor(store, name) {
   return store.manifest?.tensors?.[name] !== undefined;
 }
 
-function dims(store, name) {
+export function dims(store, name) {
   const shape = store.shape(name);
   if (shape === undefined || shape.length === 0) {
     throw new Error(`no shape for ${name}; a width cannot be derived from it`);

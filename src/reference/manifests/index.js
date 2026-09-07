@@ -90,30 +90,31 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
     load: () => import("./openbind0.js"),
   },
-  // 🔴 OpenDDE IS A TRUNK, NOT YET A FOLD, AND `foldingModel: false` IS THAT
-  // FACT RATHER THAN A TODO. It is an independent PyTorch reimplementation in
-  // the AlphaFold 3 family (Aureka Research, Apache-2.0), and its blob carries
-  // 481 arrays against AlphaFold 3's 406 - of which 240 share a name and only
-  // 123 share a shape.
+  // 🔴 OpenDDE FOLDS, AND ITS PIPELINE HAS TWO TOKEN SPACES. It is an
+  // independent PyTorch reimplementation in the AlphaFold 3 family (Aureka
+  // Research, Apache-2.0): the trunk runs on residues, and between the trunk
+  // and the diffusion each standard residue is re-tokenised into a backbone
+  // and a sidechain token, which the diffusion and its confidence head run on.
+  // `src/af3/fold-opendde.js` is that driver; every stage inside it is the
+  // AlphaFold 3 code at OpenDDE's widths.
   //
-  // What transfers is the pairformer, the MSA stack, the template embedder and
-  // the distogram head: AlphaFold 3's own module tree at OpenDDE's widths, which
-  // is why src/af3/weights.js derives every width from the weights. What does
-  // NOT transfer is the way it makes coordinates. Between the trunk and the
-  // diffusion OpenDDE expands each residue into about two "structural tokens"
-  // and runs the diffusion and a confidence head of its own design on that
-  // expanded set - a second token space, not a branch - so this bundle exports
-  // the trunk and the distogram and stops there.
-  //
-  // So what it can answer is the distogram's question: a contact map, and the
-  // certainty derived from one. That is exactly what EF2-fast ships on, and it
-  // reuses that machinery rather than a second copy. See docs/OPENDDE.md.
+  // 481 tensors, 655.8 M parameters - upstream's own published count - at int5
+  // in twelve shards, 473 MiB. Measured on 6MRR against the deposited
+  // structure: RMSD 1.68 A, TM 0.865, CA-CA 3.68 A.
   opendde: {
     model: "opendde",
     directory: "./model-opendde-int5/",
     release: "opendde-int5",
     variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
     load: () => import("./opendde.js"),
+    // 🔴 IT FOLDS, AND IT IS STILL false, BECAUSE THE PAGE HAS NO ROUTE TO ITS
+    // DRIVER. `FOLDING_FAMILIES` is what the model row offers, and the page
+    // folds through `foldBatch` - AlphaFold 3's single-token-space pipeline.
+    // Selecting OpenDDE there would run the trunk and then hand the diffusion
+    // residue tokens where it wants structural ones: every shape conforms and
+    // a structure comes out. Turning this true is one branch in web/app.js
+    // routing to foldOpendde, and it must land WITH that branch rather than
+    // before it. `tools/gpu/fold-opendde.js` is the working route today.
     foldingModel: false,
   },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
