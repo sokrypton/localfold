@@ -500,3 +500,44 @@ The record, over three shapes of the same session:
 | the answer alone, uncompressed | 188,767 | 188,767 |
 | structure and matrices, gzipped | 358,152 | 103,372 |
 | structure, matrices rebuilt, gzipped | 226,641 | **51,968** |
+
+### The three models, and the one that caught a regression
+
+🔴 **A MODEL WITH NO CONFIDENCE HEAD STILL HAS A CONTACT MAP, AND IT IS ITS
+ONLY SCORE.** The restore collapsed its whole confidence object to undefined
+whenever the summary was absent - which threw away the matrices just recovered
+from the frames, so EF2-fast's restored archive lost `contact_probs` AND its
+`_summary_confidences_0.json` entirely, the one file `chain_pair_max_contact`
+lives in. The summary being absent says nothing about the maps. Caught by
+running the gate on all three models rather than on AF3 alone, which is this
+repository's recurring lesson in a new place.
+
+🔴 **AND pLDDT IS ATTACHED ONLY WHERE THERE IS ONE.** `fullDataJson` chooses
+`atom_plddts` over `atom_certainty` on exactly that field's presence, so
+handing it EF2-fast's B-factors - a distogram certainty, under a REMARK saying
+so - would label them as the model's pLDDT in the file a reader is most likely
+to parse. Restored EF2-fast still writes `atom_certainty`, and its score card
+stays hidden rather than drawing dashes.
+
+| after a reload and restore | AF3 | AF2-mono | EF2-fast |
+|---|---|---|---|
+| frames | 16 | 2 | 11 |
+| panel tabs | pae, contact | pae, contact | contact |
+| score card | 71.2 / 0.39 | 61.9 / 0.32 | **hidden** |
+| PDB | 36,896 B, 467 atoms | 36,862 B, 466 | 36,940 B, 466 |
+| archive | 5 members | 5 | 5, `atom_certainty` |
+| stored | 51,968 B | 31,255 B | 36,429 B |
+| gzip ratio | 4.36 | 3.42 | 6.53 |
+
+The saved-session row is measured at phone widths with its text forced on, for
+the same reason the download dial's label is - `hidden` until there is a
+session to offer, and a box that is not laid out cannot overflow. At 320px the
+row is 254px with the text at 79 and Restore's right edge at 205 against the
+row's 287: `overflows: false`. `mobile-layout.py` names `#session` as refusing
+to shrink below 575px, which is the same min-content false positive the tool
+reports for any `white-space: nowrap` text - what decides is the row against
+the box, which is why it is measured separately.
+
+**Not yet exercised through a session:** a multi-chain or ligand fold (the
+`chainLengths` and `tokens` round trip), OpenDDE and OpenBind-0, and anything
+long enough for the n^2 matrices and the frame count to matter together.

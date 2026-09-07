@@ -3815,9 +3815,27 @@ async function restoreSession() {
     // archive's own two-decimal rounding absorbs entirely for the contacts and
     // costs the PAE one digit.
     const recovered = matricesFromFrames(renderer);
-    const savedConfidence = meta?.confidence === undefined ? undefined : {
-      ...meta.confidence,
-      ...recovered,
+
+    // 🔴 A MODEL WITH NO CONFIDENCE HEAD STILL HAS A CONTACT MAP, AND IT IS ITS
+    // ONLY SCORE. This collapsed the whole object to undefined whenever the
+    // summary was absent, which threw away the matrices just recovered from the
+    // frames - so EF2-fast's restored archive lost `contact_probs` and its
+    // `_summary_confidences_0.json` entirely, the one file
+    // `chain_pair_max_contact` lives in. The summary being absent says nothing
+    // about the maps.
+    const scored = meta?.confidence?.meanPlddt !== undefined;
+    const savedConfidence = {
+      ...(meta?.confidence ?? {}),
+      ...(recovered.predictedAlignedError === undefined ? {}
+        : { predictedAlignedError: recovered.predictedAlignedError }),
+      ...(recovered.contactProbs === undefined ? {}
+        : { contactProbs: recovered.contactProbs }),
+      // 🔴 AND pLDDT IS ATTACHED ONLY WHERE THERE IS ONE. `fullDataJson` picks
+      // `atom_plddts` over `atom_certainty` on exactly this field's presence,
+      // so handing it EF2-fast's B-factors - which are a distogram certainty,
+      // under a REMARK saying so - would label them as the model's pLDDT in
+      // the one file a reader is most likely to parse.
+      ...(scored && recovered.plddt !== undefined ? { plddt: recovered.plddt } : {}),
     };
 
     // 🔴 EVERYTHING BOTH DOWNLOAD BUTTONS READ, or they are on screen and
@@ -3853,7 +3871,10 @@ async function restoreSession() {
     viewer = renderer;
     viewerObject = renderer?.currentObjectName ?? stem;
 
-    updateScoresCard(savedConfidence);
+    // ...and the card is shown only where there are scores to put in it: an
+    // object carrying just a contact map would otherwise draw the box with
+    // dashes, claiming a fold was scored and the numbers lost.
+    updateScoresCard(scored ? savedConfidence : undefined);
     // 🔴 AND THE PANEL IS TOLD. loadViewerState calls Heatmap.syncToDrawn, but
     // this page's panel is driven by `refreshHeatmap` off the module's own
     // handles - which is what the fold path calls and what the restore has to
