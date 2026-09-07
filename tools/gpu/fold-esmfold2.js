@@ -32,6 +32,7 @@ import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
+import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import {
   CONTACT_EDGES, contactAngstromsFor,
 } from "../../src/esmfold2/distogram-webgpu.js";
@@ -714,6 +715,18 @@ export async function main(device, args = []) {
     elapsedSeconds: result.elapsedMilliseconds / 1000,
     timings: result.timings,
     peakMebibytes: result.memory.peakBytes / 1048576,
+    // 🔴 AND WHICH TENSOR IT IS, WHICH THE TOTAL CANNOT SAY. `peakByLabel` is
+    // what was on the DEVICE when it was fullest and its rows sum to the peak;
+    // `byLabel` sums every allocation a label ever made, so a scratch tensor
+    // taken and returned once a block reads as ninety-six times its size. AF3's
+    // fold.js and fold-af2.js have printed this for a long time and this tool
+    // did not, which is why a 92 MiB saving inside the trunk could be measured
+    // and its absence from the fold's peak could not be explained.
+    peakByLabel: memorySnapshot(device).peakByLabel.slice(0, 12).map((entry) => ({
+      label: entry.label,
+      mib: Number((entry.bytes / 1048576).toFixed(2)),
+      count: entry.count,
+    })),
     stages: [...new Set(progress.map((p) => p.split(" · ")[0]))],
     progressEvents: Object.fromEntries(updates),
     longRangeContacts: contactPairs,

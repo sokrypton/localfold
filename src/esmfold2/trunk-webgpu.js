@@ -33,7 +33,7 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { storageBytes } from "../runtime/storage.js";
 import {
-  PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
+  pairScratchCount, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, encodePairTrack, packPairTrackWeights,
 } from "../af3/pair-track-gpu.js";
 
@@ -163,7 +163,9 @@ export class Esmfold2TrunkGpu {
       const pairMask = state.maskBuffer ?? keep(this.allocator.upload(
         "esmfold2-trunk.pair-mask", state.pairMask, storage));
       const scratch = [];
-      for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
+      // ...four of them without the grid attention, not five; see
+      // pairScratchCount in src/af3/pair-track-gpu.js.
+      for (let index = 0; index < pairScratchCount(gridAttention); index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `esmfold2-trunk.scratch${index}`,
           storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index]), storage)));

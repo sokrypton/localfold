@@ -120,7 +120,13 @@ export async function compilePairTrack(cache, options) {
     const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
       shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
       undefined,
-      { normalized: scratchStorage[0], hidden: scratchStorage[4],
+      // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
+      // `tri.contract` is the last pass that reads scratch[1] and scratch[2],
+      // and it runs before `tri.normalize-hidden` writes one of them - so the
+      // triangle needs FOUR pair-sized tensors and not five. Only the grid
+      // attention ever wanted a fifth (it holds q, k, v and a gate at once),
+      // which is why pairScratchCount asks whether the track runs one.
+      { normalized: scratchStorage[0], hidden: scratchStorage[1],
         // a is scratch[1] and b is scratch[2]; they share one storage because
         // the incoming direction reads them the other way round.
         ab: scratchStorage[1] });
@@ -276,6 +282,26 @@ export const UNPACKED_PAIR_SCRATCH = ["f32", "f32", "f32", "f32", "f32"];
 export const PAIR_SCRATCH_COUNT = PAIR_SCRATCH_STORAGE.length;
 
 /**
+ * How many of them a track that may or may not run the grid attention needs.
+ *
+ * 🔴 THE GRID IS WHAT WANTS THE FIFTH, AND ESMFold2's TRUNK DOES NOT RUN ONE.
+ * `grid.project` writes q, k, v and a gate and all four are live at once; the
+ * triangle's longest overlap is the normalised pair, a, b and the contraction's
+ * output, which is four. So a trunk with the grid attention off holds one
+ * pair-sized tensor fewer - 43.9 MiB at 300 tokens, on the largest tensor group
+ * this model has.
+ *
+ * 🔴 AND IT IS A FUNCTION AND NOT A SECOND CONSTANT, because the count and the
+ * STORAGE list have to describe the same buffers: a caller that allocated four
+ * and compiled shaders against a five-entry storage array would bind a tensor
+ * of the right element count and the wrong byte length, which nothing
+ * validates. Both come off the same array.
+ */
+export function pairScratchCount(gridAttention = true) {
+  return gridAttention ? PAIR_SCRATCH_COUNT : PAIR_SCRATCH_COUNT - 1;
+}
+
+/**
  * Record the five pair updates into an open command encoder.
  *
  * @param {object} context `run(label, pipeline, buffers, x, y, z)` records one
@@ -339,11 +365,13 @@ export function encodePairTrack(context) {
         ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
     run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
         ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
-    run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[4]],
+    // ...into scratch[1], which `tri.contract` was the last pass to read; see
+    // the note where the triangle's shaders are compiled.
+    run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[1]],
         perNormalizeTile[0], perNormalizeTile[1]);
     // ...straight into the pair representation, which nothing has read since
     // tri.normalize consumed it into scratch[0].
-    run("tri.project-out", p("projectOutput"), [scratch[0], scratch[4], w, pair],
+    run("tri.project-out", p("projectOutput"), [scratch[0], scratch[1], w, pair],
         ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
   }
 

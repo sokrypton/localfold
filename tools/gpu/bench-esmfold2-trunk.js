@@ -91,23 +91,44 @@ export async function main(device, args = []) {
   // is 144 passes and the query set holds 2048.
   if (args.includes("--profile")) {
     const n = tokens[0];
-    const precision = precisions[0];
     const profile = profileDevice(device);
     if (profile === null) throw new Error("this device has no timestamp-query");
     const pair = deterministic(n * n * channels, 991 + n);
     const pairMask = new Float32Array(n * n).fill(1);
-    // ...once to compile, then reset, so the report is a steady pass.
-    await stackFor(precision).run({ pair: Float32Array.from(pair), pairMask },
-                                  blocks, { n, channels });
-    profile.reset();
-    const result = await stackFor(precision).run(
-      { pair: Float32Array.from(pair), pairMask }, blocks, { n, channels });
-    const passes = await profile.report();
+    // 🔴 EVERY PRECISION, NOT THE FIRST, so two arms can be compared per KERNEL
+    // rather than per wall clock. The wall figure at 300 tokens moves by more
+    // between two runs of one arm than the arms differ by; the device's own
+    // timestamps do not.
+    const reports = [];
+    for (const precision of precisions) {
+      // ...once to compile, then reset, so the report is a steady pass.
+      await stackFor(precision).run({ pair: Float32Array.from(pair), pairMask },
+                                    blocks, { n, channels });
+      profile.reset();
+      const result = await stackFor(precision).run(
+        { pair: Float32Array.from(pair), pairMask }, blocks, { n, channels });
+      const passes = await profile.report();
+      const total = passes.reduce((sum, p) => sum + p.ms, 0);
+      reports.push({
+        precision,
+        wallMilliseconds: Number(result.elapsedMilliseconds.toFixed(1)),
+        gpuMilliseconds: Number(total.toFixed(1)),
+        passes: passes.map((p) => ({
+          label: p.label, ms: Number(p.ms.toFixed(2)),
+          share: Number((p.ms / total).toFixed(4)),
+        })),
+      });
+    }
     profile.restore();
-    const total = passes.reduce((sum, p) => sum + p.ms, 0);
+    if (reports.length > 1) {
+      return { tokens: n, channels, blocks: blockCount, arms: reports };
+    }
+    const { passes } = reports[0];
+    const total = reports[0].gpuMilliseconds;
+    const precision = precisions[0];
     return {
       profile: { tokens: n, precision, channels, blocks: blockCount,
-                 wallMilliseconds: Number(result.elapsedMilliseconds.toFixed(1)),
+                 wallMilliseconds: reports[0].wallMilliseconds,
                  measuredMilliseconds: Number(total.toFixed(1)) },
       passes: passes.map((p) => ({ ...p,
         share: Number((p.ms / total).toFixed(4)),

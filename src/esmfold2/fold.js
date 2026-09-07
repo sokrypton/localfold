@@ -612,6 +612,20 @@ export async function foldEsmfold2(device, options) {
     }
     held.splice(held.indexOf(recycleScratch), 1);
 
+    // 🔴 z_init IS DEAD WHEN THE LOOP ENDS AND THE FOLD'S PEAK IS AFTER IT.
+    // `z = z_init + pair_loop_proj(z)` is its only reader, once a loop; it was
+    // held to the end of the fold for nothing. It is PAIR-SIZED - 87.9 MiB at
+    // 300 tokens - and the fullest moment of a fold is the diffusion
+    // conditioning, where four pair-sized f32 tensors are live at once and this
+    // was one of them. Same shape as AF3's releaseResidentWeights: give a
+    // stage's memory back when the stage is over, before reaching for kernels.
+    //
+    // 🔴 AND ON BOTH BRANCHES, because the reuse path allocates it too - z_init
+    // still runs there, since `relPos` comes out of the same pass and the
+    // denoiser wants that.
+    zInit.release();
+    held.splice(held.indexOf(zInit), 1);
+
     // 🔴 READ BACK ONLY WHEN A CALLER ASKS, because this is the one thing the
     // fold otherwise never does: the pair stays on the device from z_init to
     // the sampler, which is why the trunk's four loops cost no traffic at all.
