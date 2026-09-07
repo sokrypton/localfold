@@ -452,3 +452,51 @@ Measured after a reload and restore, with both buttons actually pressed:
 | All | 21,589 B zip, five members, `full_data` with `contact_probs` and `pae` |
 | README | says the alignment is not in this archive |
 | panel | visible, tabs `['pae','contact']` |
+
+### The matrices are read back out of the frames, not stored twice
+
+🔴 **py2Dmol'S SESSION ALREADY HOLDS THE PAE AND THE CONTACT MAP**, so keeping
+float copies beside them wrote every pair twice - and n^2 is the term that
+grows fastest with chain length, which makes this the copy worth not making.
+Both invert exactly enough:
+
+| | how it is stored | recovered to | what the archive writes |
+|---|---|---|---|
+| PAE | float rows, rounded to 1 dp by the session writer | 0.05 A | 2 dp - loses one digit |
+| contact | bytes, `round(p * 255)`, vmin 0 vmax 1 | 0.004 | 2 dp - **no practical loss** |
+| pLDDT | `frame.plddts`, rounded to integers | 1 | feeds only `fraction_disordered`, threshold 50 |
+
+The per-ATOM pLDDTs the archive writes come off the stored PDB's B-factor
+column rather than from any of this, so they are unrounded.
+
+🔴 **AND THE DECODE USES THE MAP'S OWN BOUNDS, NOT A CONSTANT.** `contactMapFor`
+writes vmin 0 / vmax 1 and `paeMapFor` writes vmin 0 / vmax 32 - quantised
+against a fixed range rather than its own, so two folds are comparable - and
+`mapsOfFrame` normalises every producer to the same `{data, n, vmin, vmax}`.
+Reading the bounds from the entry is what keeps this right for a map some other
+path encoded differently; a hard-coded 255 would fill the key with plausible
+nonsense instead of failing.
+
+🔴 **AND THE FIRST FRAME THAT HAS ONE WINS.** A trajectory carries coordinates
+on every frame and a contact map on one - AF3 attaches it to `flow_0` - so a
+search that looked only at the frame on screen would find nothing on the
+fifteenth.
+
+Measured, on the archive a restored session writes:
+
+| | |
+|---|---|
+| `pae` | diagonal **0.8**, off-diagonal **19.9**, max 23 |
+| `contact_probs` | diagonal **1**, range 0-1 |
+| `atom_plddts` | 63.23 to 84.24, against the fold's 71.2 mean |
+
+Present is not correct, which is why these are values and not key names: a
+decode against the wrong bounds fills the file with a plausible matrix.
+
+The record, over three shapes of the same session:
+
+| | raw | stored |
+|---|---|---|
+| the answer alone, uncompressed | 188,767 | 188,767 |
+| structure and matrices, gzipped | 358,152 | 103,372 |
+| structure, matrices rebuilt, gzipped | 226,641 | **51,968** |

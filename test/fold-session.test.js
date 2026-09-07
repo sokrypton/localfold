@@ -71,22 +71,47 @@ describe("the job behind a saved session", () => {
   });
 
   /**
-   * 🔴 THE MATRICES GO IN AS PLAIN ARRAYS, because this record is gzipped
-   * through JSON and a Float32Array does not survive that: it comes back as
-   * `{"0":1.2,...}`, an object with numeric keys that every reader here treats
-   * as a matrix of undefined. Converted on the way in, so there is one shape
-   * to restore rather than two to tell apart.
+   * 🔴 THE MATRICES ARE NOT IN THIS RECORD, AND THAT IS THE POINT. py2Dmol's
+   * session already carries the PAE on `frame.pae` and the contact map in
+   * `frame.maps`, so a float copy here writes every pair twice - and n^2 is
+   * the term that grows fastest with chain length. `matricesFromFrames` in
+   * web/app.js reads them back; what stays here is the summary, which is not
+   * in any frame and is a handful of numbers.
    */
-  it("stores the confidence matrices as plain arrays", () => {
+  it("keeps the summary and not the matrices", () => {
     const meta = jobMeta({ stem: "af3_1", model: "AlphaFold 3",
       prediction: prediction([4]), sequence: "ACDE" });
-    expect(Array.isArray(meta.confidence.predictedAlignedError)).toBe(true);
-    expect(Array.isArray(meta.confidence.contactProbs)).toBe(true);
-    expect(meta.confidence.predictedAlignedError).toHaveLength(16);
-    // ...and they survive the round trip this record actually takes.
-    const back = JSON.parse(JSON.stringify(meta));
-    expect(back.confidence.predictedAlignedError).toHaveLength(16);
-    expect(back.confidence.predictedAlignedError[0]).toBe(1);
+    expect(meta.confidence.meanPlddt).toBe(91.08);
+    expect(meta.confidence.ptm).toBe(0.84);
+    expect(meta.confidence.predictedAlignedError).toBe(undefined);
+    expect(meta.confidence.contactProbs).toBe(undefined);
+    expect(meta.confidence.plddt).toBe(undefined);
+  });
+
+  /**
+   * 🔴 AND NOTHING IN THE RECORD MAY BE A TYPED ARRAY, because it is gzipped
+   * through JSON: a Float32Array survives structuredClone and does NOT survive
+   * JSON.stringify - it returns as `{"0":1.2,...}`, an object with numeric
+   * keys that every reader treats as a matrix of undefined. The matrices were
+   * the only typed arrays that ever reached here; this is what catches the
+   * next one.
+   */
+  it("holds nothing that JSON would turn into an object of indices", () => {
+    const meta = jobMeta({ stem: "af3_1", model: "AlphaFold 3",
+      prediction: prediction([4]), sequence: "ACDE" });
+    const offenders = [];
+    const walk = (value, path) => {
+      if (ArrayBuffer.isView(value)) { offenders.push(path); return; }
+      if (Array.isArray(value)) value.forEach((v, i) => walk(v, `${path}[${i}]`));
+      else if (value && typeof value === "object") {
+        for (const [key, v] of Object.entries(value)) walk(v, `${path}.${key}`);
+      }
+    };
+    walk(meta, "meta");
+    // ...named, so a failure says which field rather than that one exists.
+    expect(offenders).toEqual([]);
+    // ...and the whole record survives the trip it actually takes.
+    expect(JSON.parse(JSON.stringify(meta)).confidence.ptm).toBe(0.84);
   });
 });
 

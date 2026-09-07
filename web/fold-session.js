@@ -81,12 +81,6 @@ export function jobMeta({ stem, model, prediction, sequence, settings, entities,
                           msaOrigin, savedAt = Date.now() }) {
   const chainLengths = prediction?.chainLengths ?? [];
   const confidence = prediction?.confidence;
-  // 🔴 PLAIN ARRAYS, BECAUSE THIS IS GZIPPED THROUGH JSON. A Float32Array
-  // survives structuredClone and does NOT survive JSON.stringify - it comes
-  // back as `{"0":1.2,"1":3.4,...}`, an object with numeric keys, which every
-  // reader here treats as a matrix of undefined. Converted on the way in, so
-  // there is one shape to restore rather than two to tell apart.
-  const plain = (values) => (values === undefined ? undefined : Array.from(values));
   return {
     stem,
     model,
@@ -109,6 +103,24 @@ export function jobMeta({ stem, model, prediction, sequence, settings, entities,
     tokens: prediction?.tokens,
     // ...and everything `buildFoldArchive` reads, so "Download all" on a
     // restored session writes the same archive a live fold does.
+    // 🔴 THE SUMMARY ONLY - THE MATRICES ARE ALREADY IN THE FRAMES. Storing
+    // our own float copies of the PAE and the contact map wrote every pair
+    // TWICE: once as py2Dmol's frame data, once here. Both are recoverable
+    // from what the frames already hold, and the loss is bounded and small:
+    //
+    //   pae      2D float rows rounded to 1 decimal    -> 0.05 A
+    //   contact  bytes, round(p * 255), vmin 0 vmax 1  -> 0.004
+    //   plddt    per-residue, rounded to integers      -> 1
+    //
+    // The archive rounds everything to TWO decimals when it writes it, so the
+    // contact grid is finer than what is written either way and costs nothing;
+    // the PAE gives up one decimal place. pLDDT feeds only
+    // `fraction_disordered`, whose threshold is 50, and the per-ATOM pLDDTs the
+    // archive writes come off the stored PDB's B-factor column rather than
+    // from here. n^2 per matrix is also the term that grows fastest with chain
+    // length, so this is the copy worth not making.
+    //
+    // What cannot be recovered is what is not in a frame: the scalars.
     confidence: confidence === undefined ? undefined : {
       meanPlddt: confidence.meanPlddt,
       ptm: confidence.ptm,
@@ -118,9 +130,6 @@ export function jobMeta({ stem, model, prediction, sequence, settings, entities,
       chainPtm: confidence.chainPtm,
       chainIptm: confidence.chainIptm,
       maxPredictedAlignedError: confidence.maxPredictedAlignedError,
-      plddt: plain(confidence.plddt),
-      predictedAlignedError: plain(confidence.predictedAlignedError),
-      contactProbs: plain(confidence.contactProbs ?? prediction?.contactSource?.contactProbs),
     },
   };
 }

@@ -3719,6 +3719,53 @@ async function offerSession() {
  * the next fold rather than restoring the last one - which is why this needed a
  * reader of its own rather than the one already there.
  */
+/**
+ * The PAE, the contact map and the per-residue pLDDT, out of the frames.
+ *
+ * 🔴 THE FRAMES ALREADY HOLD ALL THREE, so the saved session does not carry a
+ * second copy. This page writes `frame.pae` as float ROWS (see `paeMatrix`)
+ * and py2Dmol's session rounds them to one decimal; a map in `frame.maps` is
+ * bytes with the bounds it was encoded against, which inverts exactly -
+ * `contactMapFor` writes `round(p * 255)` with vmin 0 and vmax 1, and
+ * `mapsOfFrame` normalises every producer to that same `{data, n, vmin, vmax}`
+ * shape. Decoding through the map's OWN bounds rather than a constant here is
+ * what keeps this correct for a map some other path encoded differently.
+ *
+ * 🔴 AND THE FIRST FRAME THAT HAS ONE WINS, because a trajectory carries a
+ * contact map on one frame and coordinates on all of them - AF3 attaches it to
+ * `flow_0` - so a search that looked only at the frame on screen would find
+ * nothing on the fifteenth.
+ */
+function matricesFromFrames(renderer) {
+  const frames = renderer?.objectsData?.[renderer?.currentObjectName]?.frames ?? [];
+  const out = {};
+  const decode = (entry) => {
+    const raw = entry?.data ?? entry;
+    if (raw === undefined || raw === null || typeof raw === "string") return undefined;
+    const low = Number(entry?.vmin ?? 0);
+    const high = Number(entry?.vmax ?? 1);
+    const span = (high - low) / 255;
+    const values = new Float32Array(raw.length);
+    for (let index = 0; index < raw.length; index += 1) values[index] = low + raw[index] * span;
+    return values;
+  };
+  for (const frame of frames) {
+    if (out.predictedAlignedError === undefined && Array.isArray(frame.pae) && frame.pae.length > 0) {
+      // ...rows from this page, a flat vector from anything that wrote one.
+      out.predictedAlignedError = Array.isArray(frame.pae[0])
+        ? Float32Array.from(frame.pae.flat())
+        : Float32Array.from(frame.pae);
+    }
+    if (out.contactProbs === undefined && frame.maps?.contact !== undefined) {
+      out.contactProbs = decode(frame.maps.contact);
+    }
+    if (out.plddt === undefined && frame.plddts?.length > 0) {
+      out.plddt = Float32Array.from(frame.plddts);
+    }
+  }
+  return out;
+}
+
 async function restoreSession() {
   const state = await readSession();
   if (state === undefined) {
@@ -3760,16 +3807,17 @@ async function restoreSession() {
     // not carry it. Without this the structure returns with a blank score card:
     // `updateScoresCard` hides its box outright when handed undefined, and the
     // frames know coordinates and maps but not what the confidence head said.
-    // 🔴 THE MATRICES COME BACK AS Float32Array, NOT AS THE ARRAYS JSON HELD.
-    // `paeMatrix` recovers the stride with `Math.sqrt(values.length)` and every
-    // other reader takes a flat typed vector; a plain Array works by accident
-    // in some of them and not in others, which is worse than failing.
-    const typed = (values) => (values === undefined ? undefined : Float32Array.from(values));
+    // 🔴 THE MATRICES ARE READ BACK OUT OF THE FRAMES, NOT STORED TWICE. See
+    // `jobMeta`: the PAE and the contact map are already in py2Dmol's session,
+    // so keeping float copies beside them wrote every pair a second time - and
+    // n^2 is the term that grows fastest with chain length. What comes back is
+    // quantised (1 decimal for the PAE, 1/255 for the contacts), which the
+    // archive's own two-decimal rounding absorbs entirely for the contacts and
+    // costs the PAE one digit.
+    const recovered = matricesFromFrames(renderer);
     const savedConfidence = meta?.confidence === undefined ? undefined : {
       ...meta.confidence,
-      plddt: typed(meta.confidence.plddt),
-      predictedAlignedError: typed(meta.confidence.predictedAlignedError),
-      contactProbs: typed(meta.confidence.contactProbs),
+      ...recovered,
     };
 
     // 🔴 EVERYTHING BOTH DOWNLOAD BUTTONS READ, or they are on screen and
