@@ -702,6 +702,12 @@ export async function foldEsmfold2(device, options) {
         atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
         window: shape.atomWindow, attentionPrecision: options.attentionPrecision ?? "bf16",
       },
+      // 🔴 AND THE CONDITIONING IS WRITTEN BACK INTO relPos. It is the last
+      // pass that reads it, chunk by chunk, and the fold is at its fullest
+      // exactly there - three pair-sized f32 tensors where two will do. See
+      // prepare() in src/esmfold2/diffusion-webgpu.js for why the row chunking
+      // makes that safe. relPos stays in `held`, because it is now the
+      // conditioning and the sampler reads it at every step.
       weights: weights.denoiser, features, sInputs, pair, relPos,
     }));
 

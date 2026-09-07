@@ -657,6 +657,18 @@ export class Esmfold2DenoiserGpu {
    * @param sInputs  the 451 channels the inputs embedder produced
    * @param pair     the trunk's final pair, as a device allocation
    * @param relPos   the same relative-position encoding z_init used, on device
+   *
+   * 🔴 THE CONDITIONING IS WRITTEN INTO `relPos` ITSELF. The pair conditioning walks the pair in ROW
+   * CHUNKS, and within a chunk `joined-norm` is the last pass to read `relPos`
+   * and it runs before `z-project` writes the output - so chunk k's output can
+   * go where chunk k's input was, and chunk k+1 reads rows chunk k never
+   * touched. It is the same aliasing the two models already do where an
+   * attention writes into its own normalised input; here it is worth a third
+   * pair-sized tensor, 87.9 MiB at 300 tokens, at the fold's fullest moment.
+   *
+   * 🔴 THE ORDER IS LOAD-BEARING AND NOTHING VALIDATES IT. Two tensors of the
+   * same element count alias without complaint, so the gate is the STRUCTURE:
+   * a 300-token fold's PDB is sha256 83c0530b02f867ac with and without this.
    */
   async prepare({ shape, weights, features, sInputs, pair, relPos }) {
     const { tokens, atoms, pairChannels, singleInputs, tokenChannels, tokenHeads,
@@ -769,7 +781,9 @@ export class Esmfold2DenoiserGpu {
     });
 
     // ---- the pair conditioning, in row chunks, and the twelve biases from it.
-    b.pairCond = this.#alloc("esmfold2.diff.pair-cond", pairs * pairChannels);
+    // ...into `relPos`, which the conditioning is the last reader of; see the
+    // note on prepare. A caller that does not hand one over gets its own.
+    b.pairCond = relPos ?? this.#alloc("esmfold2.diff.pair-cond", pairs * pairChannels);
     const chunk = pipelines.chunks[0];
     const scratchNorm = this.#alloc("esmfold2.diff.pair-joined", chunk * pairChannels * 2);
     const scratchA = this.#alloc("esmfold2.diff.pair-a", chunk * pairChannels * multiplier);
