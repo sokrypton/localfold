@@ -1619,6 +1619,41 @@ has an offset - so the first loop's input is `z_init` plus a real vector.
 Skipping the projection on the first loop is the natural shortcut and a
 different model.
 
+## Where the other two models' memory is, measured rather than assumed
+
+🔴 **AF3 IS DONE, AND IT IS ONE TENSOR.** A 76-token fold peaks at **486.4
+MiB** and `difftx.block.resident` is **378.2 of it - 78%**, across 24 blocks.
+That is already the f16 form (it was 756 MiB in f32) and it has to stay
+resident: the diffusion transformer is called once per sampler step, 50 to 200
+times a fold, so streaming it per block would re-upload 378 MiB per step and
+decoding it from int5 per step is 119 ms x 50 against a 5 s fold. Everything
+else is under 15 MiB. There is no second thing to take.
+
+🔴 **AND AF2 IS FLAT, WHICH IS A DIFFERENT KIND OF DONE.** 59 residues at 512
+MSA rows with a recycle peaks at **365.2 MiB** - this file's own recorded
+figure - and the largest row is `embed.msa` at **16%**, with a long tail of
+attention tensors at 4% each. 128 rows reads 147.1 MiB, also the recorded
+figure. A flat profile has no single thing to attack, which is what the
+aliasing and packing work already recorded here left behind.
+
+🔴 **THE ONE CANDIDATE LEFT IS `embed.msa` UNDER RECYCLING, AND IT IS 8%.**
+Two live allocations carry that label at 512 rows with a recycle and one at
+128 rows without - the previous pass's MSA is the embedder's INPUT while the
+new one is its output. The previous is read exactly once, into
+`embed.previous-msa-normalized`, by the first dispatch of the encoder; every
+later dispatch writes the new one. So they could be one buffer, ordered within
+the encoder, for 29.5 MiB of 365. It is not taken because it is an ownership
+change through TWO recycle loops (`src/evoformer/input-embedder.js` and
+`src/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
+(-2047044 at 512 rows and one recycle) is what would have to gate it.
+
+🔴 **SO THE EF2 RESULT DOES NOT GENERALISE, AND THE REASON IS INSTRUCTIVE.**
+EF2-fast gave up 45% because nobody had ever read its peak by label - its fold
+tool printed a total and nothing else, where AF3's and AF2's have printed
+`peakByLabel` for a long time. The win was not that EF2 was written worse; it
+was that it had never been looked at with the instrument the other two had.
+**Check whether a thing has been measured before concluding it is optimal.**
+
 ## EF2-fast's memory, and a transition optimisation that was not one
 
 🔴 **A FOLD'S PEAK IS NOT IN THE TRUNK, WHICH IS WHERE ALL THE TIME IS.** The
