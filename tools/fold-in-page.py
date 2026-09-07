@@ -190,6 +190,13 @@ def main():
                              " the case the archive refuses to infer a layout for"
                              " and the sharpest test of a session carrying"
                              " `tokens` back.")
+    parser.add_argument("--job-round-trip", action="store_true",
+                        help="write the archive, WIPE THE ENTITY ROWS, drop the"
+                             " archive back on the upload box, and compare what"
+                             " comes back with what folded. 🔴 THE WIPE IS"
+                             " THE TEST: the rows are still on screen from the"
+                             " fold, so 'they match' is true of a page that read"
+                             " nothing at all.")
     parser.add_argument("--modify", default="",
                         help="a modified residue on the protein entity, as"
                              " CODE@POSITION - e.g. SEP@3, counting from 1."
@@ -618,6 +625,109 @@ def main():
         # the real database, RELOAD, and restore it. "A record was written" is
         # not "the session comes back", the same distinction --download draws
         # for the archive.
+        # 🔴 THE ARCHIVE'S OWN PROMISE, CHECKED. Its README tells the reader to
+        # drop the .zip back on the page to fold again, and until the job
+        # reader existed that restored the ALIGNMENT and nothing else - the
+        # sequence, the copies, the ligands, the modifications and the seed all
+        # had to be retyped. So: fold, write the archive, wipe the rows, drop
+        # the archive back, and compare the entity list with what folded.
+        #
+        # 🔴 THE ROWS ARE WIPED FIRST, or the check passes on a page that read
+        # nothing: the entities are still on screen from the fold that just
+        # ran, and "they match afterwards" is true of a no-op.
+        if args.job_round_trip:
+            print("round trip:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              const seedInput = document.getElementById('random-seed');
+              const before = { entities: list.read(), seed: seedInput?.value ?? null };
+              const blobs = [];
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (blob) => { blobs.push(blob); return made.call(URL, blob); };
+              document.getElementById('download-all').click();
+              await new Promise((done) => setTimeout(done, 3000));
+              URL.createObjectURL = made;
+              if (blobs[0] === undefined) return JSON.stringify({ error: 'no archive' });
+              const bytes = new Uint8Array(await blobs[0].arrayBuffer());
+              list.set([{ type: 'protein', value: 'AAAAAAAA', copies: 1, modifications: [] }]);
+              if (seedInput) seedInput.value = '999';
+              const input = document.getElementById('msa-file');
+              const carrier = new DataTransfer();
+              carrier.items.add(new File([bytes], 'fold.zip', { type: 'application/zip' }));
+              input.files = carrier.files;
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              await new Promise((done) => setTimeout(done, 1500));
+              const after = { entities: list.read(), seed: seedInput?.value ?? null };
+              // 🔴 COMPARED ON THE FIELDS THE JOB FILE CAN CARRY, not on the
+              // whole row: a restored row has no `template.origin` and no
+              // coverage status, which are discovered when a template is
+              // FETCHED and are not part of the job. Comparing raw objects
+              // would fail on things the format never claimed to hold.
+              const shape = (entities) => entities.map((e) => ({
+                type: e.type, value: e.value, copies: e.copies,
+                modifications: (e.modifications ?? []).map(
+                  (m) => m.code + '@' + m.position),
+                template: e.template?.kind ?? 'none' }));
+              return JSON.stringify({
+                status: document.getElementById('status-message')?.textContent ?? '',
+                zipBytes: bytes.length,
+                before: shape(before.entities), after: shape(after.entities),
+                same: JSON.stringify(shape(before.entities))
+                      === JSON.stringify(shape(after.entities)),
+                seedBefore: before.seed, seedAfter: after.seed,
+                seedSame: before.seed === after.seed,
+              });
+            })()""", await_promise=True))
+
+            # 🔴 AND THE OTHER DIALECT, HAND WRITTEN, because the archive only
+            # ever exercises the one this page WRITES - a reader that passed
+            # the round trip could still be blind to every file an AlphaFold 3
+            # pipeline produces, which is half the reason for reading JSON at
+            # all. Fed as a .json file to the same box.
+            print("open dialect:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              const seedInput = document.getElementById('random-seed');
+              const mode = document.getElementById('msa-mode');
+              mode.value = 'search'; mode.dispatchEvent(new Event('change'));
+              const drop = async (text, name) => {
+                const input = document.getElementById('msa-file');
+                const carrier = new DataTransfer();
+                carrier.items.add(new File([text], name, { type: 'application/json' }));
+                input.files = carrier.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                await new Promise((done) => setTimeout(done, 900));
+                return document.getElementById('status-message')?.textContent ?? '';
+              };
+              const job = { name: 'pipeline', modelSeeds: [1234], version: 2,
+                sequences: [
+                  { ligand: { id: 'C', ccdCodes: ['ATP'] } },
+                  { protein: { id: ['A', 'B'], sequence: 'ACDEFGHIKLMNPQRSTVWY',
+                               unpairedMsa: '', pairedMsa: '' } }] };
+              const loaded = await drop(JSON.stringify(job), 'job.json');
+              const after = list.read().map((e) => e.type + ':' + e.value + 'x' + e.copies);
+              const out = { loaded, after, msaMode: mode.value,
+                            seed: seedInput?.value ?? null };
+              // 🔴 AND A REFUSAL LEAVES THE ROWS ALONE. A file naming chemistry
+              // this page does not build must not half-load: the sequence in it
+              // folds perfectly well without the bonds, which is exactly the
+              // silent wrong answer the reader exists to prevent.
+              const bad = { ...job, bondedAtomPairs: [[['A', 1, 'CA'], ['B', 1, 'CA']]] };
+              out.refusal = await drop(JSON.stringify(bad), 'bad.json');
+              out.rowsAfterRefusal =
+                list.read().map((e) => e.type + ':' + e.value + 'x' + e.copies);
+              out.unchanged = JSON.stringify(out.after) === JSON.stringify(out.rowsAfterRefusal);
+              // 🔴 AND ONE OF AlphaFold 3'S OWN FILES, THROUGH THE REAL BOX.
+              // test/af3-example-jobs.test.js reads all fourteen, but it calls
+              // the reader directly - which says nothing about the file input,
+              // the handler, or the rows being repainted. This is the same
+              // file arriving the way a person would send it.
+              const real = await (await fetch(
+                '/tools/fixtures/af3-jobs/tetr_dimer_tetracycline.json')).text();
+              out.exampleStatus = await drop(real, 'tetr_dimer_tetracycline.json');
+              out.exampleRows =
+                list.read().map((e) => e.type + ':' + e.value.length + 'x' + e.copies);
+              return JSON.stringify(out);
+            })()""", await_promise=True))
+
         if args.session:
             probe = cdp.evaluate(ws, """(async () => {
               const out = { build: typeof window.buildViewerState,

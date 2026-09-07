@@ -22,6 +22,7 @@
  * asked; a zero is an answer.
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
+import { jobRequestJson } from "./job-json.js";
 import { coordinateAtoms } from "../src/design/superpose-pdb.js";
 
 /**
@@ -108,54 +109,13 @@ export function tokenIdentifiers(chainLengths, tokens, given) {
 }
 
 /**
- * The request that produced this fold, in the server's own dialect.
- *
- * 🔴 COPIES STAY A COUNT. `expandEntities` turns two copies into two chains
- * because that is what the model is given, but the server's request says
- * `count: 2` on one entry - and a request that listed the same sequence twice
- * would come back from the server as a different job than the one that ran.
+ * 🔴 THE REQUEST FILE'S FORMAT LIVES IN web/job-json.js, WITH ITS READER. It
+ * was written here and read nowhere, which is how the templates and then the
+ * modifications came to reach the fold and not the file. Re-exported because
+ * the archive is what everything asks for its request, and the archive is
+ * still where the file is named and placed.
  */
-export function jobRequestJson({ name, seed, entities }) {
-  const sequences = [];
-  for (const entity of entities ?? []) {
-    const value = (entity.value ?? "").trim();
-    if (value === "") continue;
-    const count = Math.max(1, Number(entity.copies) || 1);
-    if (entity.type === "protein") {
-      // 🔴 A MODIFIED RESIDUE IS PART OF THE JOB, NOT A RENDERING OF IT. The
-      // request is what a reader hands back to reproduce the fold, and one
-      // that lists the parent sequence alone describes a DIFFERENT job - the
-      // same mistake as dropping the templates line. The server's dialect
-      // names them `ptmType`/`ptmPosition`, with the CCD code prefixed, so
-      // they are written the way the server would read them back.
-      const modifications = (entity.modifications ?? [])
-        .filter((modification) => (modification.code ?? "").trim() !== "")
-        .map((modification) => ({
-          ptmType: `CCD_${modification.code.trim().toUpperCase()}`,
-          ptmPosition: modification.position,
-        }));
-      sequences.push({ proteinChain: { sequence: value, count,
-        // ...absent rather than empty, because `modifications: []` is a claim
-        // that the chain was checked and carries none, and every unmodified
-        // fold this page has ever written says nothing at all.
-        ...(modifications.length === 0 ? {} : { modifications }),
-        useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
-    } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });
-    } else {
-      sequences.push({ ligand: { ligand: value.toUpperCase(), count } });
-    }
-  }
-  return `${JSON.stringify([{
-    name,
-    // A string, as the server writes it, and an array because a job may carry
-    // several seeds. This page folds one at a time.
-    modelSeeds: [String(seed ?? 0)],
-    sequences,
-    dialect: "alphafoldserver",
-    version: 3,
-  }], null, 2)}\n`;
-}
+export { jobRequestJson } from "./job-json.js";
 
 /** The per-token and per-atom arrays, as `full_data_0.json`. */
 export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tokenResIds }) {
@@ -443,6 +403,17 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
     "",
     "The AlphaFold 3 server's, with one difference: the structure is written as",
     "PDB rather than mmCIF.",
+    "",
+    // 🔴 SAID IN EVERY README, NOT ONLY THE ONE WITH AN `msas/`. The request
+    // file is in the archive whether or not the alignment is, so a fold that
+    // used no alignment at all still restores its sequence, its ligands, its
+    // modifications and its seed from one drop.
+    "`_job_request.json` is the job itself, in the AlphaFold Server's dialect.",
+    "Drop this .zip - or that one file - onto LocalFold's alignment upload box",
+    "and the page fills the entity rows back in: the sequences, the copies, the",
+    "ligands, the modified residues and the seed. LocalFold also reads the",
+    "open-source `alphafold3` dialect there, so a job written for the pipeline",
+    "loads too.",
   );
   if (msaOrigin !== undefined && alignmentOmitted) {
     // 🔴 THE THIRD STATE. `msaOrigin` alone answered "does this MODEL take an

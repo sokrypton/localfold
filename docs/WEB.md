@@ -679,3 +679,103 @@ adjusted, check first whether the adjustment is the bug.
 
 **Not deployed.** Nine commits here and two in py2Dmol are unpushed as of this
 note.
+
+## The job JSON, read as well as written
+
+The archive has written a `*_job_request.json` since it existed, and its README
+told the reader to drop the .zip back on the page "to fold again with exactly
+these alignments". That restored the **alignment and nothing else**: the
+sequence, the copies, the ligands, the modified residues and the seed all had
+to be retyped out of the request file by hand. A format written in one place
+and read in none drifts, which is how the templates and then the modifications
+came to reach the fold and not the file, twice in a week.
+
+`web/job-json.js` now holds both halves - `jobRequestJson` moved there out of
+`fold-archive.js`, which re-exports it - and `jobFromJson` reads a job back.
+
+🔴 **"THE AlphaFold 3 FORMAT" IS TWO FORMATS.** They differ in every field that
+matters, and reading one as the other is silent rather than loud:
+
+| | server dialect | open-source dialect |
+|---|---|---|
+| marker | `dialect: "alphafoldserver"`, `version: 3` | `dialect: "alphafold3"` or absent, `version` 1-4 |
+| seeds | `["7"]`, strings | `[7]`, integers |
+| a chain | `proteinChain: {sequence, count}` | `protein: {id: "A", sequence}` |
+| copies | `count` | the LENGTH of an `id` list |
+| a template | `useStructureTemplate: true`, and nothing about which | `templates: [{mmcif, queryIndices, templateIndices}]` |
+| an alignment | not expressible | `unpairedMsa` / `pairedMsa`, inline or by path |
+
+Both are read. **Only the server one is written**, because the archive's whole
+justification is matching `tools/fixtures/fold_2026_09_01_10_17.zip` file for
+file - trading that for a marginal gain is a bad trade.
+
+### What it refuses, and why refusing is the point
+
+Every unsupported field parses perfectly well as far as the sequence, so a
+reader that read past it would fold a real structure of the right protein
+**without the inhibitor bonded to it**, or with unmethylated DNA, and report it
+as the job that was asked for. So each is refused by name:
+`bondedAtomPairs`, `userCCD`, a `smiles` ligand, `ccdCodes` with several
+components (that is one bonded chain, not several ligands), `unpairedMsaPath`,
+an inline `unpairedMsa`, `queryIndices`/`templateIndices` (they set the
+template's residue mapping and this page computes its own), modified bases, and
+a sequence-entry key the page has never heard of.
+
+🔴 **AN EMPTY `unpairedMsa` IS AN INSTRUCTION, NOT AN ABSENT FIELD.** AlphaFold
+3 reads `""` as "fold this chain with no alignment" and an absent field as "go
+and search" - opposite jobs, several minutes apart. `""` sets the MSA dial to
+none and says so in the status line.
+
+### AlphaFold 3's own examples are the corpus
+
+`tools/fixtures/af3-jobs/` holds all thirteen `examples/*.json` from
+google-deepmind/alphafold3 plus its kitchen-sink `alphafold_input.json`,
+vendored under Apache 2.0, and `test/af3-example-jobs.test.js` runs the reader
+over every one. **These are the only inputs here we did not write** - the rest
+of `test/job-json.test.js` checks the reader against our own reading of the
+spec, which is the same mistake the archive made from the writing side. They
+carry things our fixtures did not think to: `version: 4`, an `id` LIST standing
+for four calcium ions, `description` keys inside a chain body, and
+`modificationType`/`basePosition` where a protein says `ptmType`.
+
+**Eight of the fourteen load. Six do not**, and the split is the roadmap:
+
+| | files | why |
+|---|---|---|
+| loads | 8 | complexes, homodimers by `id` list, ions, CCD ligands, protein PTMs, DNA and RNA chains |
+| bonded chemistry | 3 | `bondedAtomPairs` - a covalent inhibitor, a glycan, the kitchen sink |
+| modified bases | 2 | `5CM` on DNA, `PSU`/`5MC`/`OMG` on RNA |
+| SMILES | 1 | a ligand named by structure rather than code |
+
+All fourteen behaved as predicted on the first run, including ERK2's `TPO@185`
+and `PTR@187` passing the page's own parent-residue validator against a real
+360-residue sequence - an independent check of `modificationProblem` that
+nothing else here provided.
+
+### The gate
+
+    python3 tools/fold-in-page.py --model af3 --modify SEP@3 --ligand GOL \
+      --job-round-trip
+
+🔴 **IT WIPES THE ENTITY ROWS BEFORE DROPPING THE ARCHIVE BACK.** The rows are
+still on screen from the fold that just ran, so "they match afterwards" is true
+of a page that read nothing at all. It sets them to `AAAAAAAA` and the seed to
+999 first, then drops the zip and compares. Measured, all green:
+
+| arm | result |
+|---|---|
+| archive round trip | 26,079 B zip; sequence, `SEP@3`, `GOL`, copies and seed all back |
+| open dialect, hand written | `2 chains + 1 ligand · seed 1234 · MSA off`, dial actually moved |
+| a refusal | `bondedAtomPairs describes chemistry this page does not build`, rows unchanged |
+| one of AF3's own example files | dropped on the real input, not passed to the reader |
+
+Compared on the fields the job file can carry, not on the whole row: a restored
+row has no `template.origin` and no coverage status, which are discovered when
+a template is FETCHED and were never part of the job.
+
+🔴 **AND THE SERVER DIALECT LOSES WHICH TEMPLATE.** `1QYS_A` goes in and
+"search for a template" comes back, because `useStructureTemplate` is a boolean.
+That is a real loss, asserted in `test/job-json.test.js` rather than left to be
+discovered by somebody whose re-fold used a different structure than the one
+they picked. The open-source dialect could carry it; writing that one would
+cost the archive's file-for-file claim.

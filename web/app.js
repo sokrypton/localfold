@@ -60,6 +60,7 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
 import { buildFoldArchive, tokenLayoutFrom, msasFromArchive } from "./fold-archive.js";
+import { jobFromJson } from "./job-json.js";
 import {
   clearSession, jobMeta, readSession, saveSession,
 } from "./fold-session.js";
@@ -3431,6 +3432,44 @@ syncMode();
 // and said nothing, which is the same silence it was written to fix.
 reportModelFromUrl();
 
+/**
+ * A job JSON, applied to the page: the entities, the seed, and the alignment
+ * dial when the file asked for none.
+ *
+ * 🔴 IT SETS CONTROLS, AND SAYS WHICH ONES. Loading a file that silently moved
+ * the seed and the MSA dial is how somebody folds a job they did not ask for
+ * and cannot see - so everything it touched goes into the status line, along
+ * with anything the file said that this page answered differently.
+ *
+ * 🔴 AND IT DOES NOT PICK THE MODEL. A ligand, a nucleic chain or a modified
+ * residue needs AF3, and the guard that says so already exists at fold time
+ * with a message naming the model that is set. A second decision here would be
+ * a second reader of the same control - the mistake `chosenFamily` was written
+ * to end.
+ */
+function applyJob(job) {
+  entityList.set(job.entities);
+  const said = [];
+  if (job.seed !== undefined) {
+    const input = document.getElementById("random-seed");
+    if (input !== null && String(job.seed) !== input.value) {
+      input.value = String(job.seed);
+      said.push(`seed ${job.seed}`);
+    }
+  }
+  if (job.singleSequence && modeSelect.value !== "none") {
+    modeSelect.value = "none";
+    syncMode();
+    said.push("MSA off");
+  }
+  const chains = job.entities.reduce(
+    (total, entity) => total + (entity.type === "ligand" ? 0 : entity.copies), 0);
+  const ligands = job.entities.filter((entity) => entity.type === "ligand").length;
+  said.unshift(`${chains} chain${chains === 1 ? "" : "s"}`
+    + (ligands === 0 ? "" : ` + ${ligands} ligand${ligands === 1 ? "" : "s"}`));
+  return [...said, ...job.notes].join(" · ");
+}
+
 element("msa-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];
   if (file === undefined) return;
@@ -3442,27 +3481,57 @@ element("msa-file").addEventListener("change", (event) => {
     const bytes = new Uint8Array(buffer);
     try {
       if (looksLikeZip(bytes)) {
-        const restored = msasFromArchive(await readZip(bytes));
+        const files = await readZip(bytes);
+        // 🔴 AND THE JOB, NOT ONLY THE ALIGNMENT. The README in this very
+        // archive tells the reader to drop it back "to fold again with exactly
+        // these alignments" - and until now that restored the a3m and nothing
+        // else: the sequence, the ligands, the modifications and the seed all
+        // had to be retyped from the request file by hand. The two belong
+        // together in any case, since an archive's alignment is FOR its own
+        // sequence and attaching it to a different one is the query-wins rule
+        // papering over a mismatch.
+        let loadedJob;
+        const requestName = [...files.keys()].find(
+          (path) => path.endsWith("job_request.json"));
+        if (requestName !== undefined) {
+          // ...a refusal here is reported and does not cost the alignment: an
+          // archive from a newer format still carries usable a3m files.
+          try { loadedJob = applyJob(jobFromJson(files.get(requestName))); }
+          catch (error) { loadedJob = `job not loaded: ${error.message}`; }
+        }
+        const restored = msasFromArchive(files);
         if (restored.chains === 0 && restored.merged === undefined) {
+          if (loadedJob !== undefined) { status(`archive · ${loadedJob}`); return; }
           throw new Error("that archive holds no alignments");
         }
+        const alsoJob = loadedJob === undefined ? "" : ` · ${loadedJob}`;
         if (restored.chains === 0) {
           // An archive whose fold was given one merged alignment carries it
           // back as exactly that, with no split to restore.
           uploadedMsas = { merged: restored.merged };
           uploadedA3m = restored.merged;
           const described = parseA3m(restored.merged);
-          status(`archive · ${described.depth} sequences · ${described.length} columns`);
+          status(`archive · ${described.depth} sequences`
+            + ` · ${described.length} columns${alsoJob}`);
           return;
         }
         uploadedMsas = restored;
         uploadedA3m = "";
         const paired = restored.pairedA3ms.size;
         status(`archive · ${restored.chains} chain${restored.chains === 1 ? "" : "s"}`
-          + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`);
+          + `${paired > 0 ? `, ${paired} with paired rows` : ", no paired rows"}`
+          + alsoJob);
         return;
       }
       const text = new TextDecoder().decode(bytes);
+      // 🔴 THE BYTES DECIDE HERE TOO. A job JSON and an a3m are both text, and
+      // parseA3m reads `[{"name": ...` as a record whose sequence is the file -
+      // no error, a "1 sequence" status, and a fold against an alignment made
+      // of punctuation. The first non-space character is what separates them.
+      if (/^\s*[[{]/.test(text)) {
+        status(`job · ${applyJob(jobFromJson(text))}`);
+        return;
+      }
       const described = parseA3m(text);
       uploadedA3m = text;
       uploadedMsas = undefined;
