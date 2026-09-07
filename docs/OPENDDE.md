@@ -656,7 +656,11 @@ a quality score.
 🔴 **AND THE 250-RESIDUE CEILING IS WHAT A USER MEETS FIRST**, before any
 optimisation matters to them. See the regime section above: it is the
 structural expansion, it is quadratic, and the only lever left is the pair-track
-chunking CLAUDE.md already priced and rejected.
+chunking CLAUDE.md already priced and rejected. The atom stack's padding has
+since been removed - docs/PERF.md prices it - and it moved the peak at 68
+residues by 14.6% and at 200 by NOTHING, because the high-water mark there is
+the trunk's pair scratch. So the ceiling is unchanged and now measured to be
+somebody else's problem.
 
 🔴 **THE pLDDT IS WIRED AND UNCALIBRATED.** Per-residue Spearman against real
 deviation is -0.19 to -0.29 on two near-perfect targets - the right sign, and
