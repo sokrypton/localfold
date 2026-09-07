@@ -282,6 +282,18 @@ export async function layer(store, name, index) {
  * declarations into fifteen assertions, and costs a shape lookup the store
  * already has in memory.
  */
+/**
+ * Whether a bundle carries a tensor at all, without raising if it does not.
+ *
+ * 🔴 A STORE'S `shape` THROWS ON A MISSING NAME, deliberately - every other
+ * caller wants that. An OPTIONAL tensor is the one case that does not, and
+ * there is exactly one: the distogram head's bias, which stock AlphaFold 3 has
+ * not and OpenDDE has.
+ */
+function hasTensor(store, name) {
+  return store.manifest?.tensors?.[name] !== undefined;
+}
+
 function dims(store, name) {
   const shape = store.shape(name);
   if (shape === undefined || shape.length === 0) {
@@ -518,7 +530,10 @@ export async function distogramWeights(store, dialect = af3Dialect(store)) {
   const name = "diffuser/distogram_head/half_logits/weights";
   const [pairChannels, bins] = dims(store, name);
   const biasName = "diffuser/distogram_head/half_logits/bias";
-  const present = store.shape(biasName) !== undefined;
+  // 🔴 `shape` THROWS ON A MISSING TENSOR RATHER THAN RETURNING undefined, which
+  // is right for every other caller and wrong for an optional one. Asking the
+  // manifest is the presence check; asking the store is the error.
+  const present = hasTensor(store, biasName);
   if (dialect?.distogramBias === undefined) {
     throw new Error("dialect.distogramBias has no default: stock AF3 trains no "
       + "bias on half_logits and OpenDDE does");

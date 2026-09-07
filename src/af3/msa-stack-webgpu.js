@@ -92,7 +92,10 @@ export class Af3MsaStackGpu {
       + `:${dialect.swapTransposedBias}`;
     const pipelines = await compilePairTrack(this.pipelines, {
       scratchStorage: UNPACKED_PAIR_SCRATCH,
-      n, sample, epsilon, variance, dialect, base,
+      // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
+      // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's
+      // [384, 768] triangle projection at AF3's stride.
+      n, channels: pairChannels, sample, epsilon, variance, dialect, base,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compile = (key, source) => this.pipelines.get(key, source);
@@ -221,7 +224,8 @@ export class Af3MsaStackGpu {
       blockAllocations.push(allocation);
       return allocation;
     };
-    const packedPair = packPairTrackWeights(block);
+    // The block's own width; the default is AlphaFold 3's 128.
+    const packedPair = packPairTrackWeights(block, pairChannels);
     const pairTrackWeights = {
       outgoing: upload("w.tri.out", packedPair.outgoing),
       incoming: upload("w.tri.in", packedPair.incoming),
@@ -307,7 +311,8 @@ export class Af3MsaStackGpu {
     }
 
     encodePairTrack({
-      run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer,
+      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
+      scratch, biasBuffer,
       weights: pairTrackWeights,
     });
 

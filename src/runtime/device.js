@@ -27,6 +27,16 @@ const RAISED_LIMITS = [
   // adapter tested reports. It is the difference between reading the block's
   // weights once per four tokens and once per eight.
   "maxComputeWorkgroupStorageSize",
+  // 🔴 A WORKGROUP IS ONE THREAD PER PAIR CHANNEL IN THE GRID PROJECTION, AND
+  // OpenDDE HAS 384 OF THEM. The spec default is 256 in X and 256 invocations
+  // per workgroup, so a 384-channel pair track fails to create the pipeline -
+  // "workgroup_size(384) exceeds the maximum allowed (256)" - while this
+  // adapter reports 1024 for both. AlphaFold 3 at 128 channels never came near
+  // either, which is why neither was asked for until a second bundle's widths
+  // arrived. Both have to be raised: the X extent alone is not enough, because
+  // the total invocation count is capped separately.
+  "maxComputeWorkgroupSizeX",
+  "maxComputeInvocationsPerWorkgroup",
 ];
 
 /**

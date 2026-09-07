@@ -271,7 +271,8 @@ export class Af3PairformerStackGpu {
       throw new Error("f16 weights and staged tiles require the shader-f16 feature");
     }
     const pipelines = await compilePairTrack(this.pipelines, {
-      n, sample: blocks[0], epsilon, variance, dialect, base, stagedPrecision,
+      n, channels: pairChannels, sample: blocks[0], epsilon, variance, dialect, base,
+      stagedPrecision,
       weightPrecision: pairWeightPrecision, accumulatePrecision,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js. `compile`
@@ -597,7 +598,8 @@ export class Af3PairformerStackGpu {
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
     encodePairTrack({
-      run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer,
+      run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
+      scratch, biasBuffer,
       weights: pairTrackWeights,
     });
 

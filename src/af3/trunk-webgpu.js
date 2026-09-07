@@ -266,8 +266,15 @@ export class Af3TrunkGpu {
       if (contactClasses === undefined || contactClasses.length !== tokens) {
         throw new Error("the distogram head needs contactClasses, one per token");
       }
+      // 🔴 THE EDGES ARE THIS HEAD'S, NOT THE DEFAULT'S. `af3ContactBins` turns
+      // a per-pair angstrom threshold into a COUNT of bins, so handing it
+      // AlphaFold 3's 64-bin grid for OpenDDE's 96-bin head returns a count
+      // against the wrong ruler - and a count is what the shader compares, so
+      // nothing would be out of range and the contact map would simply be
+      // wrong. Same shape of mistake as the AF2 manifests that carried 2 and 22
+      // where the head's breaks are 2.3125 and 21.6875.
       const binsBuffer = keep(this.allocator.upload("af3-disto.contact-bins",
-        af3ContactBins(contactClasses, tokens, binEdges()), storage));
+        af3ContactBins(contactClasses, tokens, binEdges(bins)), storage));
       const weightBuffer = keep(this.allocator.upload("af3-disto.weights", packed, storage));
       const logits = keep(this.allocator.allocate("af3-disto.logits", pairs * bins * 4,
         storage | GPUBufferUsage.COPY_SRC));
