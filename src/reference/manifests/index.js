@@ -120,7 +120,7 @@ export const MODEL_BUNDLES = {
   // companion and not an option on the loader. The folding model is the same
   // SIZE in both (171 M), so only the tower's 94 MiB separates the pairs:
   // 252.1 MiB against 346.1. Measured over sixteen held-out targets in
-  // docs/ESMFOLD2.md, the median is 2.55 A against 2.52 - inside the sampler's
+  // docs/EF2FAST.md, the median is 2.55 A against 2.52 - inside the sampler's
   // own 0.99-1.10 A seed spread - and the tails are 0.4 A worse.
   "ef2-fast-300m": {
     model: "esmfold2-trunk",

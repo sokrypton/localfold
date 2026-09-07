@@ -42,4 +42,4 @@ size for three fifths of the download.
 package, so that an arm and its reference do not share a forward pass. It agrees
 with `transformers`' own ESMC to **2.1e-6** on every one of the 37 hidden states
 and to 1.0e-6 on the logits, which is float32 accumulation-order noise - see
-`docs/ESMFOLD2.md` for what that check pins down.
+`docs/EF2FAST.md` for what that check pins down.

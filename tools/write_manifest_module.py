@@ -90,7 +90,7 @@ BUNDLES = {
     # ESM-C 600M at int3 group 128, plus the shim that turns its 37 hidden
     # states into ESMFold2's pair term. Three bits, because the structural
     # damage was measured against the SAMPLER's own seed spread rather than
-    # against zero - see docs/ESMFOLD2.md.
+    # against zero - see docs/EF2FAST.md.
     "esmc": {
         "export": "model-esmc-600m-int3",
         "module": "src/reference/manifests/esmc.js",

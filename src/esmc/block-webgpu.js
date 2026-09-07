@@ -641,7 +641,7 @@ export class EsmcBlockGpu {
     const ropeBase = (options.ropeBase ?? 10000).toFixed(1);
     // 🔴 f16 WEIGHTS BY DEFAULT: 1.26x FASTER AND EXACTLY FREE, because the
     // CHECKPOINT IS bfloat16. ESM-C is trained in bf16 and widened to float32
-    // on the way out - see docs/ESMFOLD2.md - so every weight carries 7 mantissa
+    // on the way out - see docs/EF2FAST.md - so every weight carries 7 mantissa
     // bits and float16 holds 10. Narrowing is lossless: relRMS 1.58e-8 over two
     // million of fc1's weights, against 2.08e-4 for random float32 of the same
     // scale.
