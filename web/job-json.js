@@ -334,6 +334,39 @@ function readEntry(entry, index, state) {
 }
 
 /**
+ * 🔴 THE TWO DIALECTS NUMBER THEIR VERSIONS SEPARATELY, AND UPSTREAM AND THE
+ * SERVER DISAGREE ABOUT ONE OF THEM. `folding_input.py` has
+ * `ALPHAFOLDSERVER_JSON_VERSION = 1` and RAISES on anything else - while the
+ * real AlphaFold Server writes `"version": 3` in the archive it hands you, as
+ * `tools/fixtures/fold_2026_09_01_10_17.zip` does. So the reference archive is
+ * refused by the reference parser, which is upstream's own split and not one
+ * this page invented. Both are read here, because both are files people have.
+ * The open-source dialect's own `JSON_VERSIONS` is (1, 2, 3, 4).
+ *
+ * 🔴 AND A VERSION WE HAVE NOT SEEN IS REFUSED RATHER THAN ASSUMED. A later
+ * one may give a field we already read a different meaning, which is precisely
+ * the failure that cannot be noticed from the outside.
+ */
+const KNOWN_VERSIONS = { alphafoldserver: [1, 3], alphafold3: [1, 2, 3, 4] };
+
+function checkVersion(job, dialect) {
+  const hasDialect = job.dialect !== undefined && job.dialect !== null;
+  const hasVersion = job.version !== undefined && job.version !== null;
+  // Upstream's rule exactly: both, or neither (in which case it is the
+  // server's dialect at its own version 1).
+  if (hasDialect !== hasVersion) {
+    refuse("a job carries both `dialect` and `version` or neither, and this"
+      + ` one has only \`${hasDialect ? "dialect" : "version"}\``);
+  }
+  if (!hasVersion) return;
+  const known = KNOWN_VERSIONS[dialect];
+  if (!known.includes(Number(job.version))) {
+    refuse(`version ${job.version} of the ${dialect} dialect is not one this`
+      + ` page reads (${known.join(", ")})`);
+  }
+}
+
+/**
  * An AlphaFold 3 job JSON, in either dialect, as this page's entity list.
  *
  * @returns {{name: string|undefined, seed: number|undefined,
@@ -367,8 +400,18 @@ export function jobFromJson(text) {
         + " to fold the rest");
     }
   }
-  const dialect = job.dialect === "alphafoldserver" ? "alphafoldserver"
-    : "alphafold3";
+  // 🔴 ABSENT MEANS THE SERVER'S, WHICH IS UPSTREAM'S RULE AND NOT AN OBVIOUS
+  // ONE: a job with neither `dialect` nor `version` is read by folding_input.py
+  // as `alphafoldserver` at version 1. Defaulting the other way put such a file
+  // under the open-source version table, where its version would be checked
+  // against the wrong list.
+  if (job.dialect !== undefined && job.dialect !== null
+      && job.dialect !== "alphafoldserver" && job.dialect !== "alphafold3") {
+    refuse(`dialect "${job.dialect}" is not one this page reads`
+      + " (alphafoldserver, alphafold3)");
+  }
+  const dialect = job.dialect === "alphafold3" ? "alphafold3" : "alphafoldserver";
+  checkVersion(job, dialect);
   const entries = job.sequences;
   if (!Array.isArray(entries) || entries.length === 0) {
     refuse("no `sequences` in that job");

@@ -728,6 +728,15 @@ none and says so in the status line.
 
 ### AlphaFold 3's own examples are the corpus
 
+🔴 **AND THE REFERENCE ARCHIVE ITSELF IS FED BACK NOW.**
+`tools/fixtures/fold_2026_09_01_10_17.zip` is the real AlphaFold Server export
+this whole format was read off, and until this gate nothing ever handed it to
+the page - so the reader was only ever checked against the archive we write,
+which shares its source. Dropped on the upload box it comes back as
+`archive · 2 chains, 2 with paired rows · 2 chains · seed 819505351`, with rows
+`protein:146x1` and `protein:74x1`. That is a file DeepMind wrote, restoring
+both the job and four alignment blocks.
+
 `tools/fixtures/af3-jobs/` holds all thirteen `examples/*.json` from
 google-deepmind/alphafold3 plus its kitchen-sink `alphafold_input.json`,
 vendored under Apache 2.0, and `test/af3-example-jobs.test.js` runs the reader
@@ -794,6 +803,30 @@ reads these files**. The writer came out clean:
 | `useStructureTemplate: false` | read as "use no templates" - a meaningful false, not noise |
 | `ptmType: "CCD_SEP"` | `mod['ptmType'].removeprefix('CCD_')` |
 | `full_data_0.json` keys | identical set and order to the reference archive's |
+
+🔴 **WITH ONE EXCEPTION, AND IT IS UPSTREAM'S OWN SPLIT RATHER THAN OURS.**
+`folding_input.py` sets `ALPHAFOLDSERVER_JSON_VERSION = 1` and RAISES on
+anything else - while the real AlphaFold Server stamps `"version": 3` on the
+archive it hands you, as `tools/fixtures/fold_2026_09_01_10_17.zip` does. **So
+the reference parser refuses the reference archive**, and it refuses ours for
+the same reason and the same value. The writer stays at 3: this archive's whole
+justification is being the server's file for file, and a job request nobody
+else writes is worth less than one the pipeline needs a version bump to read.
+Worth knowing before somebody hands `_job_request.json` to `run_alphafold.py`
+and reads "unsupported version: 3, expected 1" as our bug.
+
+The reader takes both numberings - server 1 and 3, open-source 1 through 4,
+which is upstream's own `JSON_VERSIONS` - and refuses anything else by number,
+because a later version may give a field we already read a different meaning.
+It also follows upstream's both-or-neither rule for `dialect` and `version`,
+and its **absent-means-the-server's** default, which is not the obvious one:
+defaulting the other way put such a file under the wrong version table.
+
+🔴 **AND THAT RULE CAUGHT A FLAW IN OUR OWN TESTS.** The `open()` helper in
+`test/job-json.test.js` wrote `version` with no `dialect` beside it and leaned
+on our default - so every open-dialect case below it had been written against a
+file AlphaFold 3 itself would refuse. All fourteen of its example files carry
+both fields; the helper does now too.
 
 🔴 **AND THE SAME READING FOUND THREE BUGS IN THE READER, NONE OF WHICH THE
 EXAMPLE CORPUS COULD CATCH** - all fourteen of those files are the open-source

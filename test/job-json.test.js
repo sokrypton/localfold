@@ -15,8 +15,13 @@ const server = (sequences, extra = {}) => JSON.stringify([{
   name: "j", modelSeeds: ["7"], sequences,
   dialect: "alphafoldserver", version: 3, ...extra,
 }]);
+// 🔴 `dialect` AND `version` TOGETHER, because upstream's own reader demands
+// both for this dialect and all fourteen of its example files carry both. The
+// helper omitted the dialect and leaned on our default, which meant every test
+// below was written against a file AlphaFold 3 itself would refuse.
 const open = (sequences, extra = {}) => JSON.stringify({
-  name: "j", modelSeeds: [7], sequences, version: 2, ...extra,
+  name: "j", modelSeeds: [7], sequences,
+  dialect: "alphafold3", version: 2, ...extra,
 });
 const refusal = (text) => {
   try { jobFromJson(text); } catch (error) { return error.message; }
@@ -258,6 +263,58 @@ describe("what it refuses, and what it names", () => {
     expect(refusal(server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1,
       modifications: [{ ptmType: "CCD_SEP", ptmPosition: 2 }] } }])))
       .toContain("SEP");
+  });
+});
+
+/**
+ * 🔴 THE TWO DIALECTS NUMBER THEIR VERSIONS SEPARATELY, AND THE REFERENCE
+ * PARSER REFUSES THE REFERENCE ARCHIVE. `folding_input.py` sets
+ * `ALPHAFOLDSERVER_JSON_VERSION = 1` and raises on anything else - while the
+ * real AlphaFold Server stamps `"version": 3` on the archive it hands you, as
+ * `tools/fixtures/fold_2026_09_01_10_17.zip` does. So a genuine server export
+ * cannot be fed to the open-source pipeline unedited. That is upstream's own
+ * split; this page reads both, because both are files people have.
+ */
+describe("the version, and the two numberings", () => {
+  const versioned = (dialect, version) => JSON.stringify([{
+    name: "j", modelSeeds: ["1"], dialect, version,
+    sequences: [dialect === "alphafoldserver"
+      ? { proteinChain: { sequence: "ACDEFGHIK", count: 1 } }
+      : { protein: { id: "A", sequence: "ACDEFGHIK" } }],
+  }]);
+
+  it("reads the version the real server writes, and the one upstream expects", () => {
+    for (const version of [1, 3]) {
+      expect(jobFromJson(versioned("alphafoldserver", version)).seed).toBe(1);
+    }
+  });
+
+  it("reads every open-source version upstream lists", () => {
+    for (const version of [1, 2, 3, 4]) {
+      expect(jobFromJson(versioned("alphafold3", version)).seed).toBe(1);
+    }
+  });
+
+  // ...and refuses one it has not seen, because a later version may give a
+  // field we already read a different meaning - the failure that cannot be
+  // noticed from the outside.
+  it("refuses a version it has not seen", () => {
+    expect(refusal(versioned("alphafold3", 9))).toContain("version 9");
+    expect(refusal(versioned("alphafoldserver", 2))).toContain("version 2");
+  });
+
+  /**
+   * 🔴 BOTH OR NEITHER, which is upstream's rule verbatim. Neither means the
+   * server's dialect at its version 1; one without the other is a file someone
+   * hand-edited, and reading it means guessing which half was meant.
+   */
+  it("takes both fields or neither", () => {
+    expect(refusal(JSON.stringify([{ name: "j", modelSeeds: ["1"], version: 3,
+      sequences: [{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }] }])))
+      .toContain("only `version`");
+    const neither = jobFromJson(JSON.stringify([{ name: "j", modelSeeds: ["1"],
+      sequences: [{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }] }]));
+    expect(neither.dialect).toBe("alphafoldserver");
   });
 });
 

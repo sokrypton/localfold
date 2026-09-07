@@ -697,7 +697,12 @@ def main():
                 await new Promise((done) => setTimeout(done, 900));
                 return document.getElementById('status-message')?.textContent ?? '';
               };
-              const job = { name: 'pipeline', modelSeeds: [1234], version: 2,
+              // \U0001f534 BOTH `dialect` AND `version`, which is upstream's own rule
+              // and which this fixture broke - it carried a version with no
+              // dialect beside it, so it was a file AlphaFold 3 itself would
+              // refuse. The same flaw was in test/job-json.test.js's helper.
+              const job = { name: 'pipeline', modelSeeds: [1234],
+                dialect: 'alphafold3', version: 2,
                 sequences: [
                   { ligand: { id: 'C', ccdCodes: ['ATP'] } },
                   { protein: { id: ['A', 'B'], sequence: 'ACDEFGHIKLMNPQRSTVWY',
@@ -725,6 +730,26 @@ def main():
               out.exampleStatus = await drop(real, 'tetr_dimer_tetracycline.json');
               out.exampleRows =
                 list.read().map((e) => e.type + ':' + e.value.length + 'x' + e.copies);
+              // 🔴 AND A REAL AlphaFold SERVER ARCHIVE, WHICH DEEPMIND WROTE.
+              // tools/fixtures/fold_2026_09_01_10_17.zip is the file this whole
+              // format was reverse engineered from, and until now nothing ever
+              // fed it BACK to the page - so the reader was checked against the
+              // archive we write, which is the same source as the reader. It
+              // carries two chains, a job request, and four a3m blocks.
+              const zip = await (await fetch(
+                '/tools/fixtures/fold_2026_09_01_10_17.zip')).arrayBuffer();
+              const box = document.getElementById('msa-file');
+              const held = new DataTransfer();
+              held.items.add(new File([new Uint8Array(zip)], 'server.zip',
+                                      { type: 'application/zip' }));
+              box.files = held.files;
+              box.dispatchEvent(new Event('change', { bubbles: true }));
+              await new Promise((done) => setTimeout(done, 2500));
+              out.serverArchive =
+                document.getElementById('status-message')?.textContent ?? '';
+              out.serverRows =
+                list.read().map((e) => e.type + ':' + e.value.length + 'x' + e.copies);
+              out.serverSeed = seedInput?.value ?? null;
               return JSON.stringify(out);
             })()""", await_promise=True))
 
