@@ -306,3 +306,70 @@ superset and is nearly one - but `index.html` loads `full` while `single.html`
 and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
 the three pages on a stale viewer.
 
+
+## Saving the session, which is py2Dmol's and not ours
+
+🔴 **py2Dmol ALREADY SERIALISES A SESSION, AND WRITING A SECOND FORMAT WOULD
+HAVE RESTORED LESS.** `buildViewerState` produces exactly what its Save button
+writes to a `.py2dmol.json` - every frame, the camera, the colour mode, the
+style, the side chains, the PAE, every heatmap, the MSA - and `loadViewerState`
+has always been the reader for a dropped one. A first attempt stored a fold
+ARCHIVE instead and restored **one frame** where this restores **sixteen**: the
+archive holds the answer, not the trajectory.
+
+Both were reachable only through a file - the builder downloaded its result and
+the loader was not exported - so the change upstream is to split the two
+(`py2Dmol 6ee50b8`).
+
+🔴 **AND THE EXPORT MUST BE THE FUNCTION, NOT AN ARROW THAT CALLS IT BY NAME.**
+The bundle is concatenated rather than module-scoped, so a top-level
+`function buildViewerState` IS `window.buildViewerState`; assigning
+`window.buildViewerState = () => buildViewerState()` replaces the global with an
+arrow whose body resolves to the arrow. It recursed until the stack ended, and
+the only symptom was `RangeError: Maximum call stack size exceeded` from a
+function that reads correctly. The stack - the same frame nine times - is what
+named it.
+
+🔴 **WHAT py2Dmol DOES NOT CARRY IS THE JOB, AND THAT HALF IS OURS.** Its frames
+know coordinates and maps; nothing in them says which model ran, against which
+sequence, with which alignment, or what the confidence head said. That goes
+under a `localfold` key, which the loader ignores and a round trip preserves.
+Without it the structure comes back with a blank score card, because
+`updateScoresCard` hides its box outright when handed undefined.
+
+🔴 **AND THE SESSION IS SAVED WHEN THE READER LEAVES, NOT WHEN THE FOLD ENDS.**
+Measured: at the moment a fold completes the viewer object holds ONE frame -
+`framesAtSave: 1` against the sixteen it ends with - because the trajectory
+lands in it after the prediction is stored, and AF2's contact map arrives later
+still in a `setTimeout` off the finished pass. Saving at completion captured a
+session that was not yet the one on screen, and every fix for that is a guessed
+delay. `visibilitychange` needs no guess: whatever is on screen when the tab is
+hidden IS the session, with the camera and colour mode the reader chose. The
+save at completion stays as a floor. With that, the record went from 26,641
+bytes and 1 frame to **188,767 bytes and 16**, contact map included.
+
+🔴 **AND `loadViewerState` RESOLVES BEFORE IT IS FINISHED.** Its last act is a
+`setTimeout(..., 100)` that picks the current object and syncs the heatmap, so
+`refreshHeatmap` straight after the await runs while `currentObjectName` is
+still unset and returns at its first guard. The restore waits for the condition
+rather than sleeping on it.
+
+### What is verified, and what is not
+
+Gated by `tools/fold-in-page.py --session`, which folds, drives
+`visibilitychange`, reads the record out of the real IndexedDB, **reloads**, and
+restores:
+
+| | |
+|---|---|
+| saved | 16 frames, PAE and maps on them, camera, `colorMode: plddt`, 188,767 B |
+| job | stem, model, 58 residues, pLDDT 71.18, the MSA origin |
+| offer | `Last fold: AlphaFold 3 · 58 residues · pLDDT 71.2 · just now` |
+| restored | 16 frames, `pae: 58`, `contact: true`, score card 71.2 / 0.39 |
+
+🔴 **THE HEATMAP PANEL DOES NOT COME BACK, AND THIS IS OPEN.** `panelShown:
+false` and no tabs, with the maps demonstrably ON the restored frames
+(`contact: true`). py2Dmol's `Heatmap.updateVisibility` shows the container when
+the object has map data and is reached through `_show`, guarded on
+`heatmapRenderer` existing; which of those is false after a restore has not been
+established. Everything else on the list above is measured green.

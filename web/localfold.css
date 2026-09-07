@@ -1090,3 +1090,22 @@
   .terms-actions { flex-direction: column; }
   .terms-button { min-width: 0; }
 }
+
+/* The saved-session line: one row, under the status line.
+   🔴 THE TEXT TRUNCATES AND THE BUTTONS DO NOT. It carries a sequence, which
+   is one unbreakable word of arbitrary length; letting the row shrink from the
+   right put Restore off the edge at 320px, which is the only control on it
+   that matters. min-width:0 is what lets the ellipsis engage at all - a flex
+   item's automatic minimum size is its CONTENT, not zero. */
+.session-row {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; margin-top: 8px;
+  font-size: 12px;
+}
+.session-row[hidden] { display: none !important; }
+#session-text {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  opacity: 0.85;
+}
+#session-restore, #session-forget { flex: 0 0 auto; }

@@ -168,6 +168,8 @@ def main():
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--dev-report", action="store_true",
                         help="open the footer's dev panel and print what it says")
+    parser.add_argument("--session", action="store_true",
+                        help="save the session, reload, restore it, read the panels back")
     parser.add_argument("--download", action="store_true",
                         help="press Download all and report the zip it wrote")
     parser.add_argument("--bar", action="store_true",
@@ -562,6 +564,50 @@ def main():
               return JSON.stringify(out);
             })()""", await_promise=True))
             print("archive:", archive)
+        # 🔴 INDEXEDDB AND py2Dmol'S SESSION EXIST ONLY IN A BROWSER, so this
+        # is the whole gate on saving one: fold, read the record back out of
+        # the real database, RELOAD, and restore it. "A record was written" is
+        # not "the session comes back", the same distinction --download draws
+        # for the archive.
+        if args.session:
+            probe = cdp.evaluate(ws, """(async () => {
+              const out = { build: typeof window.buildViewerState,
+                            load: typeof window.loadViewerState,
+                            idb: typeof indexedDB };
+              try {
+                const state = window.buildViewerState();
+                out.built = state !== null && state !== undefined;
+                out.objects = (state?.objects ?? []).length;
+                out.json = JSON.stringify(state).length;
+                // 🔴 IndexedDB STORES A STRUCTURED CLONE, NOT JSON. A value that
+                // stringifies fine can still be unclonable, and `put` throws
+                // synchronously when it is - which is the one failure a
+                // save-and-forget wrapper turns into silence.
+                try { structuredClone(state); out.cloneable = true; }
+                catch (e) { out.cloneable = false; out.cloneError = String(e).slice(0, 200); }
+              } catch (e) { out.buildError = String(e).slice(0, 200);
+                             out.stack = String(e.stack ?? '').slice(0, 900); }
+              return JSON.stringify(out);
+            })()""", await_promise=True)
+            print("api   :", probe)
+            # 🔴 HIDE THE TAB FIRST, because that is when a session is saved:
+            # at fold completion the viewer still holds one frame. This is the
+            # signal a reader closing the tab sends, driven rather than waited
+            # for.
+            cdp.evaluate(ws, """(() => {
+              Object.defineProperty(document, 'visibilityState',
+                { configurable: true, get: () => 'hidden' });
+              document.dispatchEvent(new Event('visibilitychange'));
+              return 1;
+            })()""")
+            time.sleep(3)
+            saved = json.loads(cdp.evaluate(ws, "(async () => {\n              const { readSession } = await import('/web/fold-session.js');\n              const state = await readSession();\n              if (!state) return JSON.stringify({ saved: false });\n              const objects = state.objects || [];\n              return JSON.stringify({\n                saved: true,\n                version: state.version,\n                objects: objects.map((o) => o.name),\n                // 🔴 THE WHOLE TRAJECTORY, which is the point of reusing\n                // py2Dmol's own session: our archive carried the answer alone.\n                frames: objects[0]?.frames?.length ?? 0,\n                framePae: objects[0]?.frames?.some((f) => f.pae !== undefined),\n                frameMaps: objects[0]?.frames?.some(\n                  (f) => f.maps && Object.keys(f.maps).length > 0),\n                hasCamera: state.viewer_state?.rotation_matrix !== undefined,\n                colorMode: state.viewer_state?.color_mode,\n                // ...and the half py2Dmol does not know about.\n                job: state.localfold ? {\n                  stem: state.localfold.stem,\n                  model: state.localfold.model,\n                  residues: state.localfold.residues,\n                  plddt: state.localfold.confidence?.meanPlddt,\n                  msaOrigin: state.localfold.msaOrigin,\n                  framesAtSave: state.localfold.framesAtSave,\n                } : null,\n                bytes: JSON.stringify(state).length,\n              });\n            })()", await_promise=True))
+            print("saved:", saved)
+            cdp.evaluate(ws, "location.reload()")
+            time.sleep(5)
+            back = json.loads(cdp.evaluate(ws, '(async () => {\n              await new Promise((done) => setTimeout(done, 1200));\n              const row = document.getElementById(\'session\');\n              const offered = row !== null && !row.hidden && row.offsetParent !== null;\n              const text = document.getElementById(\'session-text\')?.textContent ?? \'\';\n              document.getElementById(\'session-restore\')?.click();\n              await new Promise((done) => setTimeout(done, 3000));\n              const reg = window.py2dmol_viewers || {};\n              const renderer = reg[Object.keys(reg)[0]]?.renderer;\n              const name = renderer?.currentObjectName;\n              const frames = renderer?.objectsData?.[name]?.frames ?? [];\n              const heat = document.getElementById(\'heatmapContainer\');\n              return JSON.stringify({\n                offered, offerText: text,\n                object: name,\n                frames: frames.length,\n                pae: frames[0]?.pae_n ?? null,\n                contact: frames[0]?.maps?.contact !== undefined,\n                scoreBox: getComputedStyle(\n                  document.getElementById(\'predictionScoresBox\')).display !== \'none\',\n                plddtCell: document.getElementById(\'metricMeanPlddt\')?.textContent ?? \'\',\n                ptmCell: document.getElementById(\'metricPtm\')?.textContent ?? \'\',\n                panelShown: heat !== null && getComputedStyle(heat).display !== \'none\',\n                panelTabs: [...document.querySelectorAll(\'#heatmapContainer [role="tab"]\')]\n                  .map((t) => t.dataset.mapKey),\n                stillOffering: !document.getElementById(\'session\').hidden,\n                status: document.getElementById(\'status-message\')?.textContent ?? \'\',\n              });\n            })()', await_promise=True))
+            print("restored:", back)
+
         first_object = json.loads(cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
           return JSON.stringify(reg[Object.keys(reg)[0]].renderer.currentObjectName);

@@ -475,6 +475,28 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                 </div>
                 <progress id="progress" max="1" value="0" data-state="idle"></progress>
             </div>
+
+            <!-- 🔴 OUTSIDE #viewer-container, WHICH IS display:none UNTIL A FOLD
+                 FINISHES. A restore offer that only appears after you fold is
+                 an offer to the one person who does not need it. This sits
+                 under the status line, which is on screen from load.
+
+                 ONE FOLD, NOT A LIST. py2Dmol already does multi-object - the
+                 picker, prev/next and Multi are further down the page - so a
+                 list here would be a second selector for the same set. What
+                 the page cannot do without this is survive a reload. -->
+            <div id="session" class="session-row" hidden>
+                <span id="session-text"></span>
+                <button id="session-restore" class="btn btn-secondary btn-small"
+                    title="Put this fold back on screen. Its alignment was not
+                           saved, so folding again will search afresh.">
+                    <i class="fa-solid fa-rotate-left"></i><span>Restore</span>
+                </button>
+                <button id="session-forget" class="btn btn-grey btn-small"
+                    title="Forget the saved fold">
+                    <i class="fa-solid fa-xmark"></i><span>Forget</span>
+                </button>
+            </div>
         </div>
 
         <div id="viewer-container" class="py2dmol-viewer-instance" style="display: none;">

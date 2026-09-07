@@ -365,7 +365,7 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
  * archive does not contain.
  */
 function readme({ stem, model, settings, msaOrigin, templateCount, scored = true,
-                  alignedError }) {
+                  alignedError, alignmentOmitted = false }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -379,7 +379,14 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
   for (const [key, value] of Object.entries(settings ?? {})) {
     if (value !== undefined && value !== null && value !== "") lines.push(`- ${key}: ${value}`);
   }
-  if (msaOrigin !== undefined) lines.push(`- alignment: ${msaOrigin}`);
+  if (msaOrigin !== undefined) {
+    // 🔴 AND "IT IS NOT HERE" IS PART OF WHAT RAN. The saved session drops the
+    // alignment because it is 96.8% of the bytes - measured on ubiquitin,
+    // 3,001,450 of 3,101,347, against a fold's own ~100 KB - and a reader who
+    // cannot tell an omitted alignment from an absent one will re-search and
+    // quietly get a different fold.
+    lines.push(`- alignment: ${msaOrigin}${alignmentOmitted ? " (not in this archive)" : ""}`);
+  }
   if (templateCount !== undefined) {
     lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
   }
@@ -421,7 +428,22 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
     "The AlphaFold 3 server's, with one difference: the structure is written as",
     "PDB rather than mmCIF.",
   );
-  if (msaOrigin !== undefined) {
+  if (msaOrigin !== undefined && alignmentOmitted) {
+    // 🔴 THE THIRD STATE. `msaOrigin` alone answered "does this MODEL take an
+    // alignment", and the paragraph below assumed that taking one means
+    // carrying one. A saved session takes one and carries none, so keying on
+    // the origin alone described an `msas/` that is not in the file - the same
+    // class of wrong README as the one that claimed EF2-fast reads the MSA
+    // dial. A re-search reproduces a fold, not THIS fold.
+    lines.push(
+      "",
+      "There is no `msas/`: this fold used an alignment, and it was left out to",
+      "keep the file small. Folding this sequence again will search afresh and",
+      "may find different hits, so the structure it produces will resemble this",
+      "one without reproducing it. Use \"Download all\" on a live fold to get an",
+      "archive that carries its alignment and restores exactly.",
+    );
+  } else if (msaOrigin !== undefined) {
     lines.push(
       "",
       "`msas/` holds one alignment per chain, split into the paired and unpaired",
@@ -447,7 +469,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  */
 export function buildFoldArchive({
   stem, model, settings, entities, prediction, msas = {}, templates,
-  msaOrigin,
+  msaOrigin, alignmentOmitted = false,
 }) {
   const name = safeJobName(stem);
   const { confidence, alignedError, pdb, chainLengths } = prediction;
@@ -527,7 +549,7 @@ export function buildFoldArchive({
     // cannot take a template at all - `grep -rn template` over the whole
     // upstream package returns nothing - so "templates: none" reported a choice
     // where there was no control. An empty ARRAY still means "none were used".
-    stem, model, settings, msaOrigin, scored, alignedError,
+    stem, model, settings, msaOrigin, scored, alignedError, alignmentOmitted,
     templateCount: templates === undefined ? undefined : templates.length,
   }));
   return files;

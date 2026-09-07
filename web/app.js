@@ -60,6 +60,9 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesProblem, expandEntities, templateKind } from "./entities.js";
 import { buildFoldArchive, tokenLayoutFrom, msasFromArchive } from "./fold-archive.js";
+import {
+  clearSession, jobMeta, readSession, saveSession,
+} from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
 import { describeCoverage, fetchStructure } from "./template-source.js";
@@ -1477,6 +1480,11 @@ function attachContactMap(frame, recycle, weights, length) {
       // numbers AlphaFold 3 does, so it wants what the head produced.
       recycle.contactProbs = contacts;
       refreshHeatmap();
+      // 🔴 AND THE SAVED COPY IS REWRITTEN, because it was written before this
+      // arrived. AF2's contact map is the panel its archive is worth keeping
+      // for, and the fold was already saved without it by the time this runs.
+      // One record, so this replaces rather than adds.
+      if (lastPrediction?.contactSource === recycle) void rememberSession(lastPrediction);
     } catch (cause) {
       console.warn("contact map unavailable for this pass", cause);
     }
@@ -2180,6 +2188,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     };
     predictions.set(stem, lastPrediction);
     element("downloads").style.display = "flex";
+    void rememberSession(lastPrediction);
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
     if (viewer !== undefined) Object.assign(viewer.viewerState, camera);
@@ -2719,6 +2728,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     templates: undefined,
   };
   element("downloads").style.display = "flex";
+    void rememberSession(lastPrediction);
 
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
@@ -3260,6 +3270,7 @@ async function fold(event) {
     }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
+    void rememberSession(lastPrediction);
     // 🔴 THE CARD SCORES WHAT WILL BE SAVED, which is the best pass and not
     // always the last. Showing the last pass's numbers beside a download of the
     // best one is the kind of disagreement nobody reads a status line closely
@@ -3492,19 +3503,30 @@ element("download-pdb").addEventListener("click", () => {
 // floor - the alignment, the templates, the request - so a fold could not be
 // reproduced or handed on once the tab was closed. See web/fold-archive.js for
 // the layout and why it is the AlphaFold 3 server's.
-element("download-all").addEventListener("click", async () => {
-  const pred = activePrediction();
-  if (!pred) return;
-  const button = element("download-all");
-  button.disabled = true;
-  try {
-    const files = buildFoldArchive({
-      stem: pred.stem,
-      model: pred.model ?? "AlphaFold",
-      settings: pred.settings,
-      entities: pred.entities,
-      msas: pred.msas ?? {},
-      msaOrigin: pred.msaOrigin,
+/**
+ * The archive for a prediction, with or without the alignment it used.
+ *
+ * 🔴 ONE BUILDER FOR THE BUTTON AND THE SAVED SESSION. The download path reads
+ * more of `lastPrediction` than anything else does, and it is where every
+ * field a fold forgot to store has surfaced - a second copy of this call would
+ * be a second place for a model's missing field to go unnoticed. The only
+ * difference between the two is the alignment, and it is a parameter.
+ *
+ * 🔴 AND `alignmentOmitted` IS NOT THE SAME AS AN ABSENT `msaOrigin`. The
+ * first says "this fold used one and it is not in here", the second says "this
+ * model does not take one", and the README says something different for each.
+ * Empty `msas` without the flag writes a file telling the reader to drop it on
+ * the upload box to reproduce the fold, describing an `msas/` that is absent.
+ */
+function archiveFor(pred, { includeAlignment = true } = {}) {
+  return buildFoldArchive({
+    stem: pred.stem,
+    model: pred.model ?? "AlphaFold",
+    settings: pred.settings,
+    entities: pred.entities,
+    msas: includeAlignment ? (pred.msas ?? {}) : {},
+    msaOrigin: pred.msaOrigin,
+    alignmentOmitted: !includeAlignment && pred.msaOrigin !== undefined,
       // 🔴 NOT `?? []`, WHICH IS THE DIFFERENCE BETWEEN "none were used" AND
       // "this model has no such control". Defaulting it here silently undid
       // the distinction the archive was taught to make.
@@ -3538,7 +3560,16 @@ element("download-all").addEventListener("click", async () => {
           contactProbs: pred.contactSource?.contactProbs,
         },
       },
-    });
+  });
+}
+
+element("download-all").addEventListener("click", async () => {
+  const pred = activePrediction();
+  if (!pred) return;
+  const button = element("download-all");
+  button.disabled = true;
+  try {
+    const files = archiveFor(pred, { includeAlignment: true });
     downloadBlob(`${pred.stem}.zip`, await writeZip(files), "application/zip");
   } catch (error) {
     status(error instanceof Error ? error.message : String(error), true);
@@ -3546,3 +3577,211 @@ element("download-all").addEventListener("click", async () => {
     button.disabled = false;
   }
 });
+
+/**
+ * Keep this fold, so closing the tab does not lose it.
+ *
+ * 🔴 CALLED TWICE ON THE AF2 PATH, ON PURPOSE. AlphaFold 2 computes its
+ * contact map in a `setTimeout` off the finished pass - the distogram head
+ * costs 131 ms at 128 residues and is deliberately off the critical path - so
+ * a fold saved the instant it finishes has no contacts in it, and for a model
+ * whose contact map is the panel a reader looks at, that is most of what they
+ * wanted kept. `contactSource` holds the OBJECT rather than a copy, so calling
+ * this again once the map lands rewrites the one record with it. Delaying the
+ * save by a guessed interval would be the bisect-by-guessing this repository
+ * has been wrong with before.
+ */
+async function rememberSession(pred) {
+  if (!pred?.pdb) return;
+  try {
+    // 🔴 py2Dmol BUILDS THIS, NOT US. `buildViewerState` is what its own Save
+    // button writes, so the session carries every frame - the whole sampler
+    // trajectory - with the camera, colour mode, style, side chains, PAE and
+    // every heatmap already on them. Our own serialiser would have restored
+    // one frame and been a second description of the viewer to keep in step.
+    const state = globalThis.buildViewerState?.();
+    if (!state) return;
+    // ...what the viewer actually held when this ran, so a session that comes
+    // back with fewer frames than the fold had names the moment it was taken.
+    const held = viewer?.objectsData?.[pred.stem]?.frames?.length;
+    // ...and the half py2Dmol has no idea about: which model ran, against what,
+    // and what the confidence head said. The loader ignores unknown keys.
+    state.localfold = jobMeta({
+      stem: pred.stem,
+      model: pred.model ?? "AlphaFold",
+      prediction: pred,
+      sequence: (pred.chains ?? []).join(":"),
+      settings: pred.settings,
+      entities: pred.entities,
+      msaOrigin: pred.msaOrigin,
+    });
+    state.localfold.framesAtSave = held;
+    const saved = await saveSession(state);
+    if (saved === "quota") {
+      status("no room to save this session - clear site data to save again", true);
+    }
+  } catch (error) {
+    // ...a fold that cannot be saved is still a fold on screen.
+    console.warn("could not save this session", error);
+  }
+}
+
+/** How long ago, in the units a person would say it in. */
+function agoLabel(then, now = Date.now()) {
+  const seconds = Math.max(0, Math.round((now - then) / 1000));
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+/**
+ * Offer the saved fold, if there is one and it is not already on screen.
+ *
+ * 🔴 IT HIDES ONCE THE FOLD IT DESCRIBES IS THE FOLD IN THE VIEWER. Otherwise
+ * the page finishes a fold and immediately offers to restore the thing the
+ * reader is looking at, which reads as the page not knowing what it is doing.
+ */
+async function offerSession() {
+  const row = element("session");
+  if (row === null) return;
+  const saved = await readSession();
+  const meta = saved?.localfold;
+  if (meta === undefined || predictions.has(meta.stem)) {
+    row.hidden = true;
+    return;
+  }
+  const residues = `${meta.residues} residue${meta.residues === 1 ? "" : "s"}`;
+  const plddt = meta.confidence?.meanPlddt;
+  const score = plddt === undefined ? "" : ` · pLDDT ${plddt.toFixed(1)}`;
+  // 🔴 textContent, NEVER innerHTML: the sequence is user input.
+  element("session-text").textContent =
+    `Last fold: ${meta.model} · ${residues}${score} · ${agoLabel(meta.savedAt)}`;
+  element("session-text").title = meta.sequence ?? "";
+  row.hidden = false;
+}
+
+/**
+ * Put the saved fold back on screen.
+ *
+ * 🔴 THIS IS NOT A RE-FOLD. What comes back is the structure the model
+ * produced with its PAE and contacts, read out of the archive rather than
+ * recomputed. What does not come back is the alignment, so folding again
+ * searches afresh - the status line says so, and so does the saved README.
+ *
+ * 🔴 AND THE UPLOAD BOX'S ZIP PATH IS NOT THIS PATH. `msasFromArchive` reads an
+ * archive for its ALIGNMENTS and drops the structure on the floor - it feeds
+ * the next fold rather than restoring the last one - which is why this needed a
+ * reader of its own rather than the one already there.
+ */
+async function restoreSession() {
+  const state = await readSession();
+  if (state === undefined) {
+    status("there is no saved session to restore", true);
+    return;
+  }
+  if (typeof globalThis.loadViewerState !== "function") {
+    status("this build cannot restore a session", true);
+    return;
+  }
+  try {
+    // 🔴 py2Dmol'S OWN LOADER, WHICH IS NOT THE UPLOAD BOX'S PATH.
+    // `msasFromArchive` reads a fold ARCHIVE for its alignments and drops the
+    // structure on the floor - it feeds the next fold rather than restoring
+    // the last one. This is the reader that has always handled a dropped
+    // `.py2dmol.json`, and it puts back every frame, the camera, the colour
+    // mode, the style, the side chains, the PAE and every heatmap.
+    await globalThis.loadViewerState(state);
+
+    // 🔴 AND WAITED FOR, NOT SLEPT ON. `loadViewerState` resolves BEFORE it is
+    // finished: its last act is a `setTimeout(..., 100)` that picks the current
+    // object, syncs the heatmap and renders. Calling `refreshHeatmap` straight
+    // after the await therefore runs while `currentObjectName` is still unset,
+    // and it returns at its first guard - the structure appears and the panel
+    // does not. This waits for the condition rather than guessing an interval,
+    // which is the failure mode this repository keeps rediscovering.
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    for (let tries = 0; tries < 60; tries += 1) {
+      const name = renderer?.currentObjectName;
+      if (name !== undefined && renderer?.objectsData?.[name]?.frames?.length > 0) break;
+      await new Promise((done) => setTimeout(done, 50));
+    }
+
+    const meta = state.localfold;
+    const stem = meta?.stem ?? state.current_object ?? "session";
+
+    // 🔴 AND THE JOB COMES BACK FROM OUR OWN KEY, because py2Dmol's frames do
+    // not carry it. Without this the structure returns with a blank score card:
+    // `updateScoresCard` hides its box outright when handed undefined, and the
+    // frames know coordinates and maps but not what the confidence head said.
+    const restored = {
+      stem,
+      pdb: undefined,
+      model: meta?.model ?? "saved session",
+      settings: meta?.settings,
+      entities: meta?.entities,
+      msaOrigin: meta?.msaOrigin,
+      chains: (meta?.sequence ?? "").split(":").filter(Boolean),
+      chainLengths: meta?.chainLengths ?? [],
+      confidence: meta?.confidence,
+      restored: true,
+    };
+    predictions.set(stem, restored);
+    lastPrediction = restored;
+
+    // 🔴 THE MODULE'S OWN HANDLES ARE RE-POINTED. `refreshHeatmap` reads
+    // `viewer` and `viewerObject`, which are set when a FOLD loads a structure
+    // and are undefined on a fresh page - so the panel had no object to draw
+    // and returned at its first guard.
+    viewer = renderer;
+    viewerObject = renderer?.currentObjectName ?? stem;
+
+    updateScoresCard(meta?.confidence);
+    // 🔴 AND THE PANEL IS TOLD. loadViewerState calls Heatmap.syncToDrawn, but
+    // this page's panel is driven by `refreshHeatmap` off the module's own
+    // handles - which is what the fold path calls and what the restore has to
+    // call too, or the maps are on the frames and nothing draws them.
+    refreshHeatmap();
+    element("session").hidden = true;
+    const plddt = meta?.confidence?.meanPlddt;
+    status(`restored ${stem}`
+      + (plddt === undefined ? "" : ` · pLDDT ${plddt.toFixed(1)}`)
+      + (meta?.msaOrigin === undefined ? ""
+        : " · alignment not saved, so folding again will search afresh"));
+  } catch (error) {
+    status(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+element("session-restore")?.addEventListener("click", () => void restoreSession());
+element("session-forget")?.addEventListener("click", async () => {
+  await clearSession();
+  element("session").hidden = true;
+});
+
+/**
+ * 🔴 THE SESSION IS SAVED WHEN THE READER LEAVES, NOT WHEN THE FOLD ENDS.
+ * Measured: at the moment a fold completes the viewer object holds ONE frame -
+ * `framesAtSave: 1` against the sixteen the object ends up with - because the
+ * trajectory lands in it after the prediction is stored. AlphaFold 2's contact
+ * map arrives later still, in a `setTimeout` off the finished pass. Saving at
+ * completion therefore captures a session that is not yet the one on screen,
+ * and every fix for that is a guessed delay - which is the bisect-by-guessing
+ * this repository has been wrong with twice.
+ *
+ * `visibilitychange` needs no guess: whatever is on screen when the tab is
+ * hidden IS the session, trajectory settled, contact map arrived, and with the
+ * camera and colour mode the reader chose rather than the ones the fold ended
+ * on. The save at completion stays as a floor, for a tab that is killed
+ * without ever being hidden.
+ */
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "hidden") return;
+  const pred = activePrediction();
+  if (pred !== undefined && pred !== null) void rememberSession(pred);
+});
+
+void offerSession();

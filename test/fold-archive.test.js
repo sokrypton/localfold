@@ -368,9 +368,16 @@ describe("where a fold's contact map lives", () => {
   // convention.
   const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 
+  // 🔴 ANCHORED ON THE BUILDER, NOT ON THE BUTTON. This used to slice from
+  // `element("download-all")` to `downloadBlob`, which held the whole
+  // `buildFoldArchive` call until the saved session needed the same archive
+  // without its alignment and the call moved into `archiveFor`. The guard is
+  // about where the contact map is READ, and that is the builder wherever it
+  // sits: pinned to the handler, a refactor that KEPT the property still
+  // failed, and a later one that moved the read elsewhere would pass.
   it("is read from exactly one field when the archive is built", () => {
-    const handler = app.slice(app.indexOf('element("download-all")'));
-    const call = handler.slice(0, handler.indexOf("downloadBlob"));
+    const builder = app.slice(app.indexOf("function archiveFor("));
+    const call = builder.slice(0, builder.indexOf("\n}"));
     expect(call).toContain("pred.contactSource?.contactProbs");
     // ...and not from the two places it used to also look.
     expect(call.includes("pred.contacts")).toBe(false);
