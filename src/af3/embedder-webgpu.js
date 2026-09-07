@@ -73,6 +73,9 @@ export function packEmbedderWeights(weights) {
 export function createEmbedderShaders(shape, offsets, epsilon, variance,
                                       relative = "gather") {
   const { tokens, sequences, featureWidth, pairChannels, singleChannels, msaChannels } = shape;
+  // Stock AF3 builds the pair from target_feat; OpenDDE from the single
+  // embedding. See `projectTokens`.
+  const pairSourceWidth = shape.pairInitFromSingle ? singleChannels : featureWidth;
 
   const common = `
 const TOKENS: u32 = ${tokens}u;
@@ -105,24 +108,35 @@ const W_BOND: u32 = ${offsets.bondEmbedding}u;
 fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
 `;
 
-  // Per token: the two pair projections and the MSA-from-target projection.
+  // 🔴 THE PAIR'S SOURCE IS A BINDING, NOT target_feat. OpenDDE initialises the
+  // pair from the single embedding `s_init` rather than from target_feat, so
+  // `left_single` is [384, 384] where AlphaFold 3's is [447, 128]. The MSA
+  // projection beside it reads target_feat under BOTH dialects, which is why
+  // this kernel takes two source buffers rather than one: binding 0 is always
+  // target_feat and binding 5 is whatever the pair is built from. Under stock
+  // AF3 the caller binds target_feat to both and PAIR_SOURCE_WIDTH is
+  // FEATURE_WIDTH, so the generated code is unchanged.
   const projectTokens = `${common}
+const PAIR_SOURCE_WIDTH: u32 = ${pairSourceWidth}u;
+
 @group(0) @binding(0) var<storage, read> target_feat: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<storage, read_write> left: array<f32>;
 @group(0) @binding(3) var<storage, read_write> right: array<f32>;
 @group(0) @binding(4) var<storage, read_write> msa_from_target: array<f32>;
+@group(0) @binding(5) var<storage, read> pair_source: array<f32>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let token = id.x;
   if (token >= TOKENS) { return; }
   let base = token * FEATURE_WIDTH;
+  let pair_base = token * PAIR_SOURCE_WIDTH;
   for (var c = 0u; c < C_Z; c += 1u) {
     var left_total = 0.0;
     var right_total = 0.0;
-    for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
-      let value = target_feat[base + f];
+    for (var f = 0u; f < PAIR_SOURCE_WIDTH; f += 1u) {
+      let value = pair_source[pair_base + f];
       left_total += value * weights[W_LEFT + f * C_Z + c];
       right_total += value * weights[W_RIGHT + f * C_Z + c];
     }
@@ -135,6 +149,30 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       total += target_feat[base + f] * weights[W_MSA_TARGET + f * C_M + c];
     }
     msa_from_target[token * C_M + c] = total;
+  }
+}`;
+
+  // 🔴 s_init WITHOUT THE RECYCLED TERM, which is why this is not
+  // `assembleSingle`. Upstream hoists ONE `single_activations` projection above
+  // the pair init and adds `s_prev` to it only afterwards, so the pair is built
+  // from the un-recycled embedding. Feeding it the recycled single would be a
+  // different model on every pass after the first, and identical on the first -
+  // which is exactly the kind of difference a single-pass check cannot see.
+  const projectSingleInit = `${common}
+@group(0) @binding(0) var<storage, read> target_feat: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> single_init: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let token = id.x;
+  if (token >= TOKENS) { return; }
+  for (var c = 0u; c < C_S; c += 1u) {
+    var value = 0.0;
+    for (var f = 0u; f < FEATURE_WIDTH; f += 1u) {
+      value += target_feat[token * FEATURE_WIDTH + f] * weights[W_SINGLE + f * C_S + c];
+    }
+    single_init[token * C_S + c] = value;
   }
 }`;
 
@@ -378,7 +416,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { projectTokens, assemblePair, assembleMsa, assembleSingle };
+  return { projectTokens, projectSingleInit, assemblePair, assembleMsa, assembleSingle };
 }
 
 export class Af3EmbedderGpu {
@@ -414,13 +452,24 @@ export class Af3EmbedderGpu {
         + `expected ${pairs}`);
     }
 
+    // 🔴 THE PAIR'S SOURCE IS A DIALECT QUESTION AND GOES IN THE CACHE KEY.
+    // Two bundles at the same shape generate DIFFERENT kernels here - the pair
+    // projection reads 384 channels of s_init under OpenDDE and 447 of
+    // target_feat under stock AF3 - and a key that could not tell them apart
+    // would hand the second bundle the first one's shader.
+    if (weights.dialect?.pairInitFromSingle === undefined) {
+      throw new Error("weights.dialect.pairInitFromSingle has no default: stock "
+        + "AF3 builds the pair from target_feat and OpenDDE from s_init");
+    }
+    const pairInitFromSingle = weights.dialect.pairInitFromSingle;
     const packed = packEmbedderWeights(weights);
-    const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels, msaChannels };
+    const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels,
+                    msaChannels, pairInitFromSingle };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`
       + `:${singleChannels}:${msaChannels}:${epsilon}:${variance}`
-      + `:${options.relative ?? "gather"}`;
+      + `:${options.relative ?? "gather"}:${pairInitFromSingle}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${key}:${name}`, source);
@@ -494,8 +543,21 @@ export class Af3EmbedderGpu {
       };
       const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
 
+      // 🔴 UNDER OpenDDE THE PAIR IS BUILT FROM s_init, SO s_init HAS TO EXIST
+      // FIRST. Under stock AF3 target_feat is bound to both slots and this
+      // extra pass does not run at all, which is what keeps that path
+      // bit-identical.
+      let pairSource = targetFeat;
+      if (pairInitFromSingle) {
+        const singleInit = keep(this.allocator.allocate(
+          "af3-embed.single-init", tokens * singleChannels * 4, storage));
+        run("embed.project-single-init", compiled.projectSingleInit,
+            [targetFeat, weightBuffer, singleInit], Math.ceil(tokens / 64));
+        pairSource = singleInit;
+      }
       run("embed.project-tokens", compiled.projectTokens,
-          [targetFeat, weightBuffer, left, right, msaFromTarget], Math.ceil(tokens / 64));
+          [targetFeat, weightBuffer, left, right, msaFromTarget, pairSource],
+          Math.ceil(tokens / 64));
       const perPair = spread(pairs);
       run("embed.assemble-pair", compiled.assemblePair,
           [left, right, previousPair, features, weightBuffer, bondMatrix, pair],

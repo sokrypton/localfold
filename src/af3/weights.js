@@ -622,12 +622,18 @@ export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) 
   for (let index = 0; index < pairformerBlocks; index += 1) {
     pairformer.push(await pairformerBlockWeights(store, index));
   }
+  // 🔴 THE DIALECT IS STAMPED ON THE EMBEDDER TOO, because the embedder is
+  // where it decides something: OpenDDE builds the pair from `s_init` and stock
+  // AF3 from `target_feat`, and the reference and the shader both read it off
+  // the weights they were handed rather than from a caller who might not pass
+  // one. Deriving it once here keeps a single source.
+  const dialect = af3Dialect(store);
   return {
-    dialect: af3Dialect(store),
-    embedder: await embedderWeights(store),
+    dialect,
+    embedder: { ...await embedderWeights(store), dialect },
     template: await templateWeights(store),
     msaBlocks: msa,
     pairformerBlocks: pairformer,
-    distogram: await distogramWeights(store),
+    distogram: await distogramWeights(store, dialect),
   };
 }

@@ -114,9 +114,25 @@ export function embed(input, weights) {
   const featureWidth = weights.targetFeatWidth;
   const pairs = tokens * tokens;
 
-  const left = linear(targetFeat, tokens, featureWidth, pairChannels,
+  // 🔴 OpenDDE INITIALISES THE PAIR FROM THE SINGLE EMBEDDING, NOT FROM
+  // target_feat, so `single_activations` is computed HERE rather than after the
+  // MSA stack and left/right_single are 384 -> pair rather than 447 -> pair.
+  // Their shapes say which: AlphaFold 3's `left_single` is [447, 128] and
+  // OpenDDE's is [384, 384]. Reading the dialect and the shape both, because a
+  // bundle whose flag and weights disagree would otherwise multiply a 447-wide
+  // feature by a 384-wide matrix and read off the end of neither.
+  if (weights.dialect?.pairInitFromSingle === undefined) {
+    throw new Error("weights.dialect.pairInitFromSingle has no default: stock "
+      + "AF3 builds the pair from target_feat and OpenDDE from s_init");
+  }
+  const fromSingle = weights.dialect.pairInitFromSingle;
+  const pairSource = fromSingle
+    ? linear(targetFeat, tokens, featureWidth, singleChannels, weights.singleActivations)
+    : targetFeat;
+  const pairSourceWidth = fromSingle ? singleChannels : featureWidth;
+  const left = linear(pairSource, tokens, pairSourceWidth, pairChannels,
                       weights.leftSingle);
-  const right = linear(targetFeat, tokens, featureWidth, pairChannels,
+  const right = linear(pairSource, tokens, pairSourceWidth, pairChannels,
                        weights.rightSingle);
   const pair = new Float32Array(pairs * pairChannels);
   for (let i = 0; i < tokens; i += 1) {
@@ -180,8 +196,14 @@ export function embed(input, weights) {
     }
   }
 
-  const single = linear(targetFeat, tokens, featureWidth, singleChannels,
-                        weights.singleActivations);
+  // ...and where the pair init already built it, it is the SAME tensor rather
+  // than a second projection: upstream hoists the one call, it does not repeat
+  // it. Recomputing would be correct arithmetically and wasteful; sharing is
+  // what says the two really are one embedding.
+  const single = fromSingle
+    ? pairSource.slice()
+    : linear(targetFeat, tokens, featureWidth, singleChannels,
+             weights.singleActivations);
   const previousSingle = input.previousSingle
     ?? new Float32Array(tokens * singleChannels);
   const recycledSingle = linear(

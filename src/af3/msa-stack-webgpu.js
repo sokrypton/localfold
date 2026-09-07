@@ -55,6 +55,12 @@ export class Af3MsaStackGpu {
     // isolation; the weights win when they say anything.
     const msaChannels = blocks[0].msaChannels ?? options.msaChannels ?? 64;
     const pairChannels = blocks[0].pairChannels;
+    if (dialect?.msaUpdateBeforeOuterProduct === undefined) {
+      throw new Error("dialect.msaUpdateBeforeOuterProduct has no default: AF3 "
+        + "takes the outer product off the pre-update MSA and OpenDDE off the "
+        + "updated one");
+    }
+    const { msaUpdateBeforeOuterProduct } = dialect;
     if (!(pairChannels > 0)) {
       throw new Error("MSA blocks carry no pairChannels; they are built by "
         + "src/af3/weights.js, which derives it from the weights");
@@ -159,7 +165,7 @@ export class Af3MsaStackGpu {
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
-          pairChannels,
+          pairChannels, msaUpdateBeforeOuterProduct,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
           left, right, opmCounts, keyMask, attention, msaScratch,
         });
@@ -246,39 +252,59 @@ export class Af3MsaStackGpu {
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
-    // 🔴 THE OUTER PRODUCT READS THE MSA FIRST, before either MSA update below.
-    const rowGroups = spread(ceil(rows, 64));
-    run("opm.project", pipelines["opm:project"],
-        [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
-    const countGroups = spread(ceil(pairs, 64));
-    run("opm.counts", pipelines["opm:counts"], [msaMask, opmCounts],
-        countGroups[0], countGroups[1]);
-    const perBlock = spread(pipelines.opmBlocks);
-    run("opm.contract", pipelines["opm:contract"],
-        [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
-    const addPairGroups = spread(ceil(pairs * pairChannels, 64));
-    run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
+    // 🔴 THE TWO HALVES OF AN MSA BLOCK, AND WHICH RUNS FIRST IS THE MODEL.
+    // AlphaFold 3 takes the outer product off the PRE-update MSA and then
+    // updates the rows against the pair that outer product just changed;
+    // OpenDDE updates the rows FIRST and feeds the UPDATED MSA to the outer
+    // product (upstream's `MSABlock.forward`, gated as
+    // `msaUpdateBeforeOuterProduct`). Neither ordering changes a shape and both
+    // produce a plausible representation, so nothing but this flag distinguishes
+    // them - and the difference compounds over every block of every pass.
+    const outerProduct = () => {
+      const rowGroups = spread(ceil(rows, 64));
+      run("opm.project", pipelines["opm:project"],
+          [msa, msaMask, opmWeights, left, right], rowGroups[0], rowGroups[1]);
+      const countGroups = spread(ceil(pairs, 64));
+      run("opm.counts", pipelines["opm:counts"], [msaMask, opmCounts],
+          countGroups[0], countGroups[1]);
+      const perBlock = spread(pipelines.opmBlocks);
+      run("opm.contract", pipelines["opm:contract"],
+          [left, right, opmCounts, opmWeights, scratch[0]], perBlock[0], perBlock[1]);
+      const addPairGroups = spread(ceil(pairs * pairChannels, 64));
+      run("opm.add", pipelines.addPair, [pair, scratch[0]], addPairGroups[0], addPairGroups[1]);
+    };
 
-    // ...and the MSA update reads the pair the outer product just changed.
-    const addMsaGroups = spread(ceil(rows * msaChannels, 64));
-    run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
-    const weightGroups = spread(msaHeads * n);
-    run("msa.attention-weights", pipelines["msa:attentionWeights"],
-        [pair, keyMask, attentionWeights, attention], weightGroups[0], weightGroups[1]);
-    const perRow = spread(rows);
-    // ...one workgroup a row now; see the note on the kernel.
-    run("msa.project", pipelines["msa:project"],
-        [msa, attentionWeights, msaScratch[0], msaScratch[1]], perRow[0], perRow[1]);
-    run("msa.average", pipelines["msa:average"],
-        [attention, msaScratch[0], msaScratch[1], attentionWeights, msaScratch[2]],
-        perRow[0], perRow[1]);
-    run("msa.add", pipelines.addMsa, [msa, msaScratch[2]], addMsaGroups[0], addMsaGroups[1]);
+    // The row update: the pair-weighted average, then the transition. Upstream
+    // keeps the transition inside `_msa_update`, so it moves with it.
+    const updateMsa = () => {
+      const addMsaGroups = spread(ceil(rows * msaChannels, 64));
+      run("msa.key-mask", pipelines["msa:keyMask"], [msaMask, keyMask], ceil(n, 64));
+      const weightGroups = spread(msaHeads * n);
+      run("msa.attention-weights", pipelines["msa:attentionWeights"],
+          [pair, keyMask, attentionWeights, attention], weightGroups[0], weightGroups[1]);
+      const perRow = spread(rows);
+      // ...one workgroup a row now; see the note on the kernel.
+      run("msa.project", pipelines["msa:project"],
+          [msa, attentionWeights, msaScratch[0], msaScratch[1]], perRow[0], perRow[1]);
+      run("msa.average", pipelines["msa:average"],
+          [attention, msaScratch[0], msaScratch[1], attentionWeights, msaScratch[2]],
+          perRow[0], perRow[1]);
+      run("msa.add", pipelines.addMsa, [msa, msaScratch[2]], addMsaGroups[0], addMsaGroups[1]);
 
-    const perTransition = spread(ceil(rows, transitionRowTile(rows, msaChannels)));
-    run("msa-transition", pipelines.msaTransition, [msa, msaTransitionWeights, msaScratch[0]],
-        perTransition[0], perTransition[1]);
-    run("msa-transition.add", pipelines.addMsa, [msa, msaScratch[0]],
-        addMsaGroups[0], addMsaGroups[1]);
+      const perTransition = spread(ceil(rows, transitionRowTile(rows, msaChannels)));
+      run("msa-transition", pipelines.msaTransition, [msa, msaTransitionWeights, msaScratch[0]],
+          perTransition[0], perTransition[1]);
+      run("msa-transition.add", pipelines.addMsa, [msa, msaScratch[0]],
+          addMsaGroups[0], addMsaGroups[1]);
+    };
+
+    if (context.msaUpdateBeforeOuterProduct) {
+      updateMsa();
+      outerProduct();
+    } else {
+      outerProduct();
+      updateMsa();
+    }
 
     encodePairTrack({
       run, pipelines, n, gridHeads, pair, pairMask, scratch, biasBuffer,
