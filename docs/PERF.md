@@ -716,3 +716,46 @@ a tensor past a binding limit - so the matrix path cannot be made invisible the
 way half precision was. A caller has to declare that its operand IS a plain
 array with a known stride. That is the reason this stops at a measurement.
 
+
+## The atom stack was sized by the padded grid, and it was mostly padding
+
+🔴 **`subsets` COUNTED (token, slot) CELLS WHERE THE AXIS IT INDEXES IS THE
+COMPACTED LIST OF REAL ATOMS.** The atom encoder and decoder run once per
+diffusion step and every buffer they hold is `subsets * 32 * 128` wide, so a
+subset that holds no atom still allocates a full attention and dispatches over
+it. What that cost, by shape:
+
+| | real atoms | subsets before | needed |
+|---|---|---|---|
+| AlphaFold 3, 68 residues | 574 | 51 | **18** |
+| OpenDDE, the same 68 residues | 574 | 98 | **18** |
+| AlphaFold 3, 250 residues | 2101 | 188 | **66** |
+| OpenDDE, 250 residues | 2101 | 358 | **66** |
+
+OpenDDE is worse by construction: the structural layout is the same atoms in
+twice the tokens, so it doubled a count that was already 2.8x too big.
+
+🔴 **AND THE WIN IS IN CHURN AND TIME, NOT IN THE PEAK, EXCEPT WHERE THE TRUNK
+IS SMALL.** Both folds are bit-identical after the change - AlphaFold 3 mean
+pLDDT 85.93504804019729, OpenDDE RMSD 1.676 and TM 0.8839 - and:
+
+| | peak | wall |
+|---|---|---|
+| AlphaFold 3, 68 residues | 499.1 -> **458.8 MB** (-8.1%) | 4.69 -> 4.48 s |
+| OpenDDE, 6MRR, 64 steps | 647.6 -> **553.2 MiB** (-14.6%) | 22.1 -> 19.6 s |
+| OpenDDE, 200 residues, 32 steps | 1507.4 -> **1507.4 MiB** (nothing) | 149.1 -> **130.6 s** |
+
+🔴 **THE 200-RESIDUE PEAK DOES NOT MOVE, AND THAT IS THE USEFUL PART OF THE
+RESULT.** Its `peakByLabel` is `af3-block.scratch` at 1132 MB plus
+`af3-block.pair` at 226 - the TRUNK, which has finished before the diffusion
+starts. The atom stack is nowhere near the high-water mark at that length; it
+only reaches it at 68 residues, where the trunk is small. So the 250-residue
+ceiling is the pair scratch and nothing about the atom stack was ever going to
+move it.
+
+What does move is everything the diffusion allocates and re-allocates fifty or
+two hundred times. Cumulative bytes at 200 residues: `atom.k` and `atom.v`
+613.8 MB each -> 103.8, `dec.k`/`dec.v` 604.0 -> 100.7, `atom.pair` 114.8 ->
+25.2, `atom.logits` 86.1 -> 18.9. The wall time falls 11-12% on two different
+shapes, which is one run each on a machine that drifts by up to 3.2x - so read
+the direction and the mechanism, not the digits.
