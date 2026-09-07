@@ -107,6 +107,8 @@ values means the whole-stack checker, not that file.
 
 | **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) |
 | Does its structural-token expansion conserve the atoms? | `tools/gpu/check-opendde-expander.js` |
+| **Are a model's BOND LENGTHS right, not just its fold?** | `tools/gpu/probe-nucleic.js --sequence= --model=` (RMSD cannot see this; OpenDDE is 15% short) |
+| ...and a ligand's? | `tools/gpu/probe-ligand-flow.js --ligand=GOL --mode=diffusion` |
 | Does OpenDDE's trunk predict a real fold's contacts? | `tools/gpu/trunk-opendde.js` (**and `--model=/model-af3-int5/manifest.json` is the control**) |
 | Does a pairformer block match its reference at THIS bundle's widths? | `tools/gpu/check-af3-block-any.js --model=` |
 | ...and which pair-track kernel is the one that does not? | `tools/gpu/probe-opendde-kernels.js --model=` |

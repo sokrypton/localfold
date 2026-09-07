@@ -624,9 +624,13 @@ shapes. To get it back:
 |---|---|
 | AF3 fold, bit-identical | mean pLDDT **72.19283791929007**, pTM **0.5096721043810248** |
 | AF2 checksum | **-2105827** at 128 rows, **-2047044** at 512 with a recycle |
-| `npm test` | 844 |
+| `npm test` | 860 |
 | OpenDDE, 6MRR | RMSD **1.399-1.639 A**, TM **0.904-0.917** |
 | OpenDDE, 1QYS | RMSD **0.902-0.956**, TM **0.939-0.945** |
+| AlphaFold 3 chemistry, the control | protein bond ratio **1.009**, ligand rms **0.033 A** |
+
+...and the one that was missing, which is why the section below exists: a gate
+on RMSD and TM cannot see a bond length.
 
 `tools/gpu/fold-opendde.js` is the end-to-end tool and takes `--target`,
 `--length`, `--steps`, `--mode`, `--seed`, `--resident` / `--no-resident`,
@@ -634,13 +638,20 @@ shapes. To get it back:
 
 ## Open, in the order worth doing
 
-🔴 **THE UNTESTED SURFACES ARE NOW THE BIGGER RISK THAN THE UNTAKEN
-OPTIMISATIONS.** Ligands, nucleic chains and complexes all pass through
-`structural-tokens.js` BY CONSTRUCTION - role 0 one token per atom, nucleic
-backbone/base with purine and pyrimidine centres, chain-aware prev/next parents
-- and not one has been folded. Every measurement in this file is a single
-protein chain at MSA depth 1. A ligand's atoms landing in the wrong subtoken
-would be silent.
+🔴 **THE 15% CHEMISTRY DEFICIT IS THE FIRST THING WORTH DOING, AND IT IS A
+CORRECTNESS BUG RATHER THAN A LIMITATION.** Measured, controlled and localised
+two sections below: the atom geometry inside a structural token is ~15% short
+while the peptide bond between two of them is 1.03, so the suspect is the atom
+decoder over the structural layout, not the trunk, the tokeniser or the
+sampler. `probe-ligand-flow.js --ligand=GOL --mode=diffusion --steps=64` is a
+twenty-five-second reproduction; AlphaFold 3 through the same tool is 0.033 A
+where OpenDDE is 0.349.
+
+🔴 **AND THE CONFIDENCE HEAD IS ANTICORRELATED WITH IT.** OpenDDE reports a
+HIGHER mean pLDDT than AlphaFold 3 on every arm measured while being the worse
+structure on every one. This is worse than the "uncalibrated" note below and
+supersedes it: until it is calibrated the page should not present the number as
+a quality score.
 
 🔴 **AND THE 250-RESIDUE CEILING IS WHAT A USER MEETS FIRST**, before any
 optimisation matters to them. See the regime section above: it is the
@@ -651,7 +662,7 @@ chunking CLAUDE.md already priced and rejected.
 deviation is -0.19 to -0.29 on two near-perfect targets - the right sign, and
 measured where there is almost no error to rank. A real statement needs
 docs/EF2FAST.md's corruption sweep, which manufactures the hard end rather than
-waiting for it.
+waiting for it. See the anticorrelation above before trusting the sign.
 
 🔴 **AND pTM IS ABSENT AND SHOULD STAY ABSENT** until something emits a TM
 term. OpenDDE's head does not; deriving one from the PAE would be a different
@@ -667,7 +678,93 @@ needs a two-buffer split rather than a flag: the grid's weights are ONE
 interleaved buffer, so narrowing it narrows the LayerNorm scales with it, which
 the triangle's own notes say to avoid.
 
-## Open
+## The chemistry is 15% short, and RMSD could never have said so
+
+🔴 **OpenDDE'S ATOMS ARE ABOUT 15% TOO CLOSE TOGETHER, ON EVERY INPUT SHAPE,
+AND EVERY GATE IN THIS FILE PASSED THROUGH IT.** The gates were RMSD and TM
+against a crystal, which score where the backbone GOES; nothing scored what the
+model builds once it is there. Measured with `probe-nucleic.js`'s median rigid-
+pair ratio against the same conformer dictionary the featuriser read - 1.0 is
+the dictionary's own chemistry - at 64 steps, recycles 0, one seed:
+
+| arm | protein | nucleic | phosphodiester O3'-P |
+|---|---|---|---|
+| AlphaFold 3 f32, 68-residue chain alone | **1.009** | - | - |
+| AlphaFold 3 f32, + a 4-nt DNA chain | **1.009** | **1.007** | 1.53-1.59 A |
+| OpenDDE int5, the same chain alone | **0.892** | - | - |
+| OpenDDE int5, the same chain, 200 steps | **0.889** | - | - |
+| OpenDDE int5, + the same DNA chain | **0.849** | **0.797** | 1.85-2.03 A |
+
+🔴 **AND IT IS NOT THE SAMPLER, NOT THE QUANTISATION AND NOT THE STEP COUNT.**
+Each was ruled out by running AlphaFold 3 through the identical arm, since a
+difference between two models measured at different settings is a difference
+between the settings:
+
+| control | protein | nucleic |
+|---|---|---|
+| AF3 f32, flow, 32 steps | 1.009 | 1.012 |
+| AF3 f32, **diffusion**, 32 steps | 1.006 | 1.009 |
+| AF3 **int5**, diffusion, 32 steps | 1.006 | 1.006 |
+| AF3 int5, flow, 32 steps | 1.007 | 1.004 |
+
+AlphaFold 3 lands on 1.004-1.012 in all four. Nothing about the EDM sampler or
+about int5 compresses a bond, and OpenDDE at 200 steps is 0.889 where it is
+0.892 at 64 - so it is converged onto the wrong chemistry rather than short of
+it.
+
+🔴 **THE DEFICIT IS INSIDE A TOKEN, NOT BETWEEN TOKENS, WHICH IS WHY TM = 0.9
+SURVIVED IT.** Ratios of OpenDDE's own measurements to AlphaFold 3's on one
+31-residue sequence, `probe-sidechains.js`:
+
+| what | OpenDDE / AF3 |
+|---|---|
+| aromatic ring bonds, 33 of them (all role-2 sidechain tokens) | **0.848** |
+| N-CA and CA-C, inside a role-1 backbone token | 0.943, 0.973 |
+| C-N, the peptide bond BETWEEN two backbone tokens | **1.032** |
+| CA-CA spacing along the chain | 0.964 |
+
+So the chain's trace is close to right and the geometry within a structural
+token is compressed, worst in the sidechain token. That is the same shape as
+the side-chain bug docs/AF3.md records - "everything short at once" - and it
+points at the atom decoder over the structural layout rather than at the trunk,
+the tokeniser or the sampler. A uniform coordinate scale is RULED OUT: a scale
+would move CA-CA and the peptide bond by the same factor as the ring, and the
+peptide bond is 1.03.
+
+🔴 **A LIGAND SHOWS IT TEN TIMES OVER, AND IS THE CHEAPEST REPRODUCTION.**
+Glycerol beside the same 68-residue chain, bond error against the dictionary's
+ideal conformer, `probe-ligand-flow.js --ligand=GOL --mode=diffusion
+--steps=64`: AlphaFold 3 rms **0.033 A** (max 0.055), OpenDDE rms **0.349 A**
+(max 0.641). Five bonds, one component, twenty-five seconds.
+
+🔴 **AND THE CONFIDENCE HEAD IS HIGHEST WHERE THE CHEMISTRY IS WORST.** OpenDDE
+reports mean pLDDT 94.3 on the ligand job to AlphaFold 3's 89.8, 92.1 to 85.9
+on the protein alone, and 91.6 to 88.1 on the complex - higher than AlphaFold 3
+on every arm while being the worse structure on every arm. The uncalibrated
+note above understates it: on this evidence the number is not merely unranked,
+it is confidently wrong, and nothing in the page should present it as a
+quality score until it is calibrated.
+
+## The untested surfaces, now tested
+
+The tokeniser's own branches are covered without a GPU by
+`test/opendde-structural-tokens.test.js` - sixteen tests over a ligand, a DNA
+chain, an RNA chain, a two-chain complex, a modified residue and a plain
+protein. They are conservation laws, because the regrouping moves atoms between
+(token, slot) rather than changing them: the map is a bijection onto the live
+atoms, `residueAtomGather` agrees with the `sources` it was built beside, no
+atom changes position, element, charge, name or reference space, twins are
+mutual and share their residue's space, chain adjacency stops at a chain
+boundary, and the round trip back to the residue layout is the identity. Plus
+the four things a shape cannot see: role, centre, twin and adjacency - including
+the purine N9 / pyrimidine N1 distinction upstream records as costing a tRNA
+fold 4.5 A, which no protein test can reach.
+
+🔴 **AND ALL SIXTEEN PASS, WHICH IS WHY THE FOLD NUMBERS ABOVE ARE A MODEL
+PROBLEM AND NOT A TOKENISER ONE.** The atoms arrive in the right tokens; what
+happens to them afterwards is 15% short.
+
+## Still open, and pre-existing
 
 🔴 **`tools/gpu/check-af3-block.js` FAILS ON STOCK AlphaFold 3, AND DID BEFORE
 ANY OF THIS.** At its own defaults - staged f16, accumulate f16, weights f16 -
@@ -682,14 +779,8 @@ arms did in commit 21840ee. Not investigated further: the end-to-end fold is
 unaffected, and re-deriving a bound is a decision about what the kernel is
 allowed to cost.
 
-🔴 **THE STRUCTURAL-TOKEN STAGE IS THE WHOLE OF WHAT WOULD MAKE THIS A FOLDING
-MODEL**, and it is a second token space rather than a branch: a featuriser that
-splits residues into backbone and sidechain tokens, atom layouts over that set,
-and a confidence head with none of AlphaFold 3's names. Upstream's
-`structural_tokens.py` is 168 lines of JAX and `opendde_confidence.py` 151, but
-the featurisation around them (`attach_structural_batch`) is the larger half.
-
-🔴 **AND IT HAS ONLY BEEN SCORED ON ONE TARGET, AT MSA DEPTH 1.** 6MRR is a
-DESIGNED protein - idealised and canonical, which docs/EF2FAST.md records as
-the reason it folds well from a single sequence where ubiquitin does not. Read
-0.718 as "the trunk is assembled correctly", not as a benchmark.
+🔴 **AND THE FOLD HAS ONLY BEEN SCORED ON TWO TARGETS, AT MSA DEPTH 1.** 6MRR
+and 1QYS are both DESIGNED proteins - idealised and canonical, which
+docs/EF2FAST.md records as the reason they fold well from a single sequence
+where ubiquitin does not. Read the TM scores as "the trunk is assembled
+correctly", not as a benchmark.
