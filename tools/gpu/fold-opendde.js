@@ -135,6 +135,12 @@ export async function main(device, args) {
     atomReference: await atomReference(store),
   };
 
+  // 🔴 THE TRAJECTORY IS MEASURED, NOT LOOKED AT. A frame drawn from the wrong
+  // token space has the right ATOM COUNT and the wrong atoms, so it renders as
+  // a plausible cloud - and the radius of gyration is what separates that from
+  // a protein: a 68-residue chain is about 11 A, and scrambled atoms are not.
+  const frames = [];
+  const unmapped = [];
   const timings = {};
   const started = performance.now();
   // 🔴 THE SAME DRIVER EVERY OTHER AlphaFold 3-graph MODEL USES. The
@@ -144,6 +150,45 @@ export async function main(device, args) {
   const fold = await foldBatch(device, batch, weights, {
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     mode: option(args, "mode", "diffusion"),
+    onStep: ({ step, denoised, structuralDenoised }) => {
+      // 🔴 THE CONTROL: the SAME frame read the way the page read it before -
+      // structural-layout coordinates indexed by the residue mask. It has the
+      // right atom count and the wrong atoms.
+      const rgOf = (coordinates) => {
+        let cx = 0; let cy = 0; let cz = 0; let n = 0;
+        for (let index = 0; index < batch.tokens * batch.dense; index += 1) {
+          if (!batch.predDenseAtomMask[index]) continue;
+          cx += coordinates[index * 3]; cy += coordinates[index * 3 + 1];
+          cz += coordinates[index * 3 + 2]; n += 1;
+        }
+        cx /= n; cy /= n; cz /= n;
+        let s = 0;
+        for (let index = 0; index < batch.tokens * batch.dense; index += 1) {
+          if (!batch.predDenseAtomMask[index]) continue;
+          s += (coordinates[index * 3] - cx) ** 2 + (coordinates[index * 3 + 1] - cy) ** 2
+            + (coordinates[index * 3 + 2] - cz) ** 2;
+        }
+        return Number(Math.sqrt(s / n).toFixed(2));
+      };
+      unmapped.push({ step, rg: rgOf(structuralDenoised) });
+      let cx = 0;
+      let cy = 0;
+      let cz = 0;
+      let n = 0;
+      for (let index = 0; index < batch.tokens * batch.dense; index += 1) {
+        if (!batch.predDenseAtomMask[index]) continue;
+        cx += denoised[index * 3]; cy += denoised[index * 3 + 1]; cz += denoised[index * 3 + 2];
+        n += 1;
+      }
+      cx /= n; cy /= n; cz /= n;
+      let squared = 0;
+      for (let index = 0; index < batch.tokens * batch.dense; index += 1) {
+        if (!batch.predDenseAtomMask[index]) continue;
+        squared += (denoised[index * 3] - cx) ** 2 + (denoised[index * 3 + 1] - cy) ** 2
+          + (denoised[index * 3 + 2] - cz) ** 2;
+      }
+      frames.push({ step, rg: Number(Math.sqrt(squared / n).toFixed(2)) });
+    },
     onStage: (name, detail) => {
       timings[name] = typeof detail === "number" ? Math.round(detail)
         : Math.round(detail?.ms ?? 0);
@@ -212,6 +257,8 @@ export async function main(device, args) {
     meanPlddt: fold.meanPlddt ?? null,
     steps, recycles, wholeMs, timings,
     geometry,
+    frameGyration: frames.filter((f, i) => i % 6 === 0 || i === frames.length - 1),
+    frameGyrationUnmapped: unmapped.filter((f, i) => i % 6 === 0 || i === unmapped.length - 1),
     scored: scored && { rmsd: Number(scored.rmsd.toFixed(3)),
                         tm: Number(scored.tm.toFixed(4)), pairs: scored.pairs },
     // Spearman of per-residue pLDDT against per-residue deviation. NEGATIVE is

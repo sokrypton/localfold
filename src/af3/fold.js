@@ -704,16 +704,39 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // accuracy on the two proteins it has been measured on. Both take a seed;
   // the flow's spread across seeds is the narrower of the two, because one
   // draw is not the same as noise at every step.
+  // 🔴 EVERY FRAME THE SAMPLER EMITS IS IN THE TOKEN SPACE IT RUNS ON, AND FOR
+  // OpenDDE THAT IS NOT THE ONE A VIEWER DRAWS. The final coordinates are
+  // scattered back after the loop; the per-step ones were not, so a caller
+  // rendering them indexed 130 structural tokens' atom slots as though they
+  // were 68 residues' - the wrong atom in every position, which on screen is
+  // indistinguishable from watching the noise the sampler carries.
+  //
+  // Both sets are mapped, not just the one the page happens to draw: `denoised`
+  // is the frame worth watching (see the sampler), and `positions` is the state
+  // - a caller that asked for the state should get the state, in the layout it
+  // asked about.
+  const mapFrame = structural === undefined ? undefined
+    : (frame) => structuralToResidue(frame, structural.layout, tokens, dense);
+  const onStep = options.onStep === undefined ? undefined
+    : (mapFrame === undefined ? options.onStep : async (detail) => options.onStep({
+      ...detail,
+      positions: mapFrame(detail.positions),
+      denoised: mapFrame(detail.denoised),
+      // ...and the structural-layout originals, for a caller that wants the
+      // token space the sampler actually ran in.
+      structuralPositions: detail.positions, structuralDenoised: detail.denoised,
+    }));
+
   const sampled = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
         steps, stopAfter: options.stopAfter, head,
         normal: normalFrom(options.seed ?? 20260831),
-        onStep: options.onStep,
+        onStep,
         ...(options.schedule ?? {}),
       })
     : await flowOnGpu(device, headInput, weights.diffusion, {
         cycles: steps, head, normal: normalFrom(options.seed ?? 20260831),
-        onStep: options.onStep,
+        onStep,
         // The schedule reaches noiseLevels through here, and both samplers
         // already forward their options to it.
         ...(options.schedule ?? {}),
