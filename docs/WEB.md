@@ -383,14 +383,28 @@ contact map keeps its own re-save where it arrives.
 | maps on frames | none | **pae + contact** |
 | bytes | 26,641 | 188,767 |
 
-🔴 **THE HEATMAP PANEL STILL DOES NOT COME BACK, AND THIS IS OPEN.**
-`panelShown: false` with no tabs. It is NOT a visibility guard and NOT missing
-data - measured after a restore, `hasRenderer: true`, `hasContainer: true`,
-`mapKeysOf` returns **`['pae', 'contact']`**, frame 0's contact map is a proper
-`{data, n: 58}` and its `pae` is an array of 58. What is empty is
-`heatmapRenderer.maps`, which `_show` fills from
-`resolveMapFrame(object, frame, key)` - so the backward search from the current
-frame (the last) to frame 0, where the maps live, finds nothing after a restore
-though it works during a live fold. A `syncToDrawn` by hand does not fix it
-either. The next step is `resolveMapFrame` upstream, not this page. Everything
-else in the table above is measured green.
+🔴 **AND THE HEATMAP PANEL WAS HIDDEN BY A MULTI-MODE GUARD, ON A VIEWER
+SHOWING ONE OBJECT.** `heatmapObjectName` returned null for ANY `shownObjects`
+Set, and a restored session has a Set of exactly one - so the panel had no
+object to describe. Its own rule is "the matrix belongs to one, so it waits
+until the viewer is back to one", and a one-element set is back to one; the
+guard made the panel depend on HOW the viewer arrived at one object rather than
+on whether it is showing one. Fixed in `py2Dmol db883b6`.
+
+🔴 **AND IT FAILED ONLY ON A RESTORE, WHICH IS WHAT MADE IT HARD TO SEE.**
+`updateVisibility` runs when the panel is asked to change, so a live page that
+showed the panel while the set was still null keeps it on screen once the set
+becomes a Set - visible by inertia, with nothing to recompute it. Loading a
+session recomputes from nothing, and the panel that had been on screen all
+along did not come back. Everything measurable said the data was fine -
+`hasData: true`, `mapKeysOf: ['pae','contact']`, frame 0 holding a well-formed
+`{data, n: 58}` and a 58-wide `pae` - and `heatmapRenderer.maps` was empty
+because `heatmapObjectName` had already answered null. `heatName` is what named
+it.
+
+Restored now: `panelShown: true`, `panelTabs: ['pae','contact']`,
+`heatName: 'af3_1'`, `rendererMaps: ['pae','contact']`. The old open note:
+it blamed `resolveMapFrame`'s backward search, which was wrong - the search was
+never reached. `heatmapObjectName` had returned null before it, so `_show` had
+no object at all. Reasoning down the call chain named the wrong function; the
+probe that printed `heatName` named the right one in a single run.
