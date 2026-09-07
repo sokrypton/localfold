@@ -1619,6 +1619,98 @@ has an offset - so the first loop's input is `z_init` plus a real vector.
 Skipping the projection on the first loop is the natural shortcut and a
 different model.
 
+## EF2-fast's memory, and a transition optimisation that was not one
+
+🔴 **A FOLD'S PEAK IS NOT IN THE TRUNK, WHICH IS WHERE ALL THE TIME IS.** The
+trunk is 85% of a 300-token fold's SECONDS and its own peak is 446 MiB; the
+fold's is 992. Nothing said so until `tools/gpu/fold-esmfold2.js` printed
+`peakByLabel` - AF3's `fold.js` and `fold-af2.js` have printed it for a long
+time and this tool had only the total, so a 92 MiB saving inside the trunk
+could be measured and its complete absence from the fold's peak could not be
+explained. The rows at the peak were four pair-sized f32 tensors at 87.9 MiB
+each - `rel-pos`, `z-init`, `pair`, `diff.pair-cond` - and two of them were
+dead.
+
+| | 300 tokens | 76 |
+|---|---|---|
+| before | 991.5 MiB | 577.7 |
+| `z_init` released when the trunk loop ends | 903.6 | |
+| the conditioning written into `relPos` | **815.7** | **566.5** |
+
+**17.7%**, and the structure does not move: PDB sha256 `83c0530b02f867ac` at
+300 tokens and `181a74e78959fe5e` at 76, certainty and contacts identical to
+every digit at both, time unchanged.
+
+🔴 **`z_init` HAS ONE READER AND IT IS INSIDE THE LOOP.** `z = z_init +
+pair_loop_proj(z)` reads it once a loop and nothing after the trunk does. It
+was held to the end of the fold, through the diffusion, which is where the
+fold is fullest. Same shape as AF3's `releaseResidentWeights`: give a stage's
+memory back when the stage is over, before reaching for kernels.
+
+🔴 **AND THE CONDITIONING CAN LIVE IN THE ENCODING IT EATS, BECAUSE IT IS ROW
+CHUNKED.** `joined-norm` is the last pass to read `relPos` and it runs before
+`z-project` writes - within a chunk. So chunk k's output goes where chunk k's
+input was and chunk k+1 reads rows chunk k never touched. It is the aliasing
+both models already do where an attention writes into its normalised input;
+what is new is that this one crosses a STAGE boundary, so the caller hands the
+buffer over rather than the callee allocating one.
+
+🔴 **AND THE PEAK MOVES WHEN YOU TAKE A TENSOR OUT OF IT, SO THE SAVINGS DO NOT
+ADD UP.** Releasing `relPos` after the conditioning was worth 66 MiB and not
+87.9, because the twelve per-block pair biases are allocated just after it and
+the fullest moment simply moved earlier. Read `peakByLabel` again after every
+change; the row that was second is not the row that is first.
+
+🔴 **AND THE PAIR TRACK NEEDS FOUR SCRATCH TENSORS WITHOUT THE GRID ATTENTION,
+NOT FIVE.** `tri.contract` is the last pass to read `a`, and it runs before
+`tri.normalize-hidden` writes - so the normalised hidden goes back into `a`.
+Only the grid attention ever wanted a fifth, because `grid.project` writes q,
+k, v and a gate and all four are live at once. `pairScratchCount(gridAttention)`
+is the rule. Worth 92 MiB of the TRUNK's peak at 300 tokens (538 -> 446) and
+nothing at all of the fold's, per the entry above. AF3 is unmoved:
+`check-af3-trunk` reports pair relRMS **1.99e-5**, this file's own figure.
+
+🔴 **THE TRANSITION IS NOT WEIGHT-READ BOUND, WHICH TOOK THREE INSTRUMENTS TO
+ESTABLISH AND CONTRADICTS bench-transition.js's OWN BREAKDOWN.** `pair-transition`
+is 47-50% of this trunk and reads one scalar weight per multiply-add, and that
+tool's comment attributes 19% of the kernel to the first matmul's two weight
+reads. Halving those reads - a blocked slot mapping, so a lane owns ADJACENT
+intermediate slots and reads them together - changes the kernel by **nothing**:
+
+| arm, normalised by the untouched `tri.project` in the same profile | |
+|---|---|
+| the shipped kernel | **2.454** |
+| one slot a lane, blocked mapping (two runs) | 2.512, 2.475 |
+| two adjacent slots a lane (two runs) | 2.397, 2.394 |
+
+Reverted. Every weight read that could be removed was already overlapped with
+the arithmetic.
+
+🔴 **AND A SECOND, ALIASED BINDING OF THE WEIGHT BUFFER COSTS 2.3x.** The first
+version read the adjacent pair through a `vec2<f32>` view of the same buffer -
+two read-only bindings on one GPUBuffer, which WebGPU allows and which is
+bit-identical. Normalised the same way, the aliased scalar arm is **5.2-5.7**
+against the shipped kernel's 2.454, and the aliased vec2 arm 2.7. Two read-only
+views beside a `read_write` input cost this kernel more than a wide load saves
+it. Reading `weights[k]` and `weights[k + 1]` and leaving the merge to the
+compiler keeps the aliasing information the second binding takes away.
+
+🔴 **AND THAT ALIASED PAIR IS WHAT MANUFACTURED A 1.9x.** With the extra binding
+in BOTH arms, `bench-transition.js` reported 312 -> 162 ms and the trunk 1.94x -
+which is the vec2 load winning back the cost of the binding it was delivered
+in, and nothing else. **An A/B where both arms carry the same new defect
+measures the defect.** The control that caught it was normalising against a
+kernel the change does not touch.
+
+🔴 **AND THE FIRST ARM MEASURED IN `bench-esmfold2-trunk.js --profile` RUNS
+COLD.** Every kernel in it, including ones nothing touched, reads 1.5-1.9x slow:
+`tri.project` measured 3807 ms in the first arm of a run and 2002, 2551 and 2078
+in the other three. A baseline-then-candidate A/B therefore invents a speedup of
+about that size. `--profile` sweeps every arm now rather than the first, and the
+number to read is a RATIO against an untouched pass in the same report - the
+wall figure at 300 tokens moves more between two runs of one arm than the arms
+differ by.
+
 ## ESMFold2 does ligands, DNA and RNA - and this port read the config and said otherwise
 
 🔴 **THE CONFIG IS ABOUT MSAs AND CONFIDENCE, NOT ABOUT CHEMISTRY.**
