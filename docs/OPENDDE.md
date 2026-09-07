@@ -745,6 +745,21 @@ note above understates it: on this evidence the number is not merely unranked,
 it is confidently wrong, and nothing in the page should present it as a
 quality score until it is calibrated.
 
+🔴 **AND THE REASON IT SURVIVED IS THAT THERE IS NO OpenDDE ORACLE DUMP.**
+`oracle-dumps/` holds nine AlphaFold 3 captures - embedder, MSA, stack, trunk,
+atom, denoiser, diffusion, confidence - and every AF3 module was checked
+against one. OpenDDE has none: the port was built from the checkpoint's tensor
+names plus a dialect, and validated only end to end against crystals. So the
+whole diffusion side has never been compared to anything module by module,
+which is exactly where this sits. `check-opendde-expander.js` covers the
+expander and stops there.
+
+A fix wants a capture of upstream's own denoiser - its inputs, since
+`--capture-args` is what makes the answer reproducible - at the shape the
+structural layout produces, then `check-af3-diffusion-head.js`'s treatment
+applied to it. Everything short of that is guessing at a convention, and this
+file already records what guessing at a convention costs.
+
 ## The untested surfaces, now tested
 
 The tokeniser's own branches are covered without a GPU by
