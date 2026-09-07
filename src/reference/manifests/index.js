@@ -110,8 +110,8 @@ export const MODEL_BUNDLES = {
   // reuses that machinery rather than a second copy. See docs/OPENDDE.md.
   opendde: {
     model: "opendde",
-    directory: "./model-opendde-trunk-int5/",
-    release: "opendde-trunk-int5",
+    directory: "./model-opendde-int5/",
+    release: "opendde-int5",
     variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
     load: () => import("./opendde.js"),
     foldingModel: false,

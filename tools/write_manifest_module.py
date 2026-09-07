@@ -70,10 +70,18 @@ BUNDLES = {
         "module": "src/reference/manifests/openbind0.js",
         "model": "openbind0",
     },
-    # OpenDDE's TRUNK, which is all of OpenDDE that this graph can run: the
-    # pairformer, the MSA stack, the template embedder and the distogram head,
-    # at int5 group 32. 278 MiB - larger than AlphaFold 3's whole 265 MiB
-    # bundle, because the pair track is 384 channels rather than 128.
+    # OpenDDE, whole: the trunk, the distogram head, the structural-token
+    # expander and refiner, the diffusion, and OpenDDE's own confidence head.
+    # 481 tensors, 655.8 M parameters - which is upstream's published
+    # parameter_count exactly - at int5 group 32, 473 MiB in TWELVE shards.
+    #
+    # 🔴 TWELVE, AND SIZED ON THE PACKED BYTES. The float32 export's 48 MiB
+    # shard cap is discarded; what decides the count is the largest TENSOR,
+    # because a tensor is indivisible. OpenDDE has three 216 MiB float32
+    # tensors, 40.5 MiB apiece at int5, so no sharding beats 40.5 MiB and
+    # twelve is the fewest that reaches it. AlphaFold 3's bundle has the same
+    # 40.5 MiB cap from two such tensors and is 8 shards only because it is
+    # 265 MiB rather than 473. See quantize_af3.py's shard_count.
     #
     # 🔴 IT IS A TRUNK AND NOT A FOLD, which MODEL_BUNDLES records as
     # `foldingModel: false`. OpenDDE expands each residue into about two
