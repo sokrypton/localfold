@@ -735,6 +735,22 @@ the tokeniser or the sampler. A uniform coordinate scale is RULED OUT: a scale
 would move CA-CA and the peptide bond by the same factor as the ring, and the
 peptide bond is 1.03.
 
+🔴 **AND OpenBind-0 IS THE CONTROL THAT NAMES THE STAGE.** It is a second
+non-AlphaFold bundle through the SAME tool, the same trunk code, the same
+diffusion head and the same sampler - and the one thing it does not have is a
+structural-token stage. Its backbone chemistry is right:
+
+| `fold-opendde.js --target=6mrr --steps=32` | N-CA | CA-C | CA-CA |
+|---|---|---|---|
+| ideal | 1.458 | 1.525 | 3.80 |
+| OpenBind-0 | **1.458** | 1.493 | 3.771 |
+| OpenDDE | **1.363** | 1.493 | 3.664 |
+
+So the shared AlphaFold 3 diffusion path is not what compresses a bond; the
+second token space is. That narrows the suspect list to the expander, the
+refiner, and the atom encoder and decoder as they run over the structural
+layout.
+
 🔴 **A LIGAND SHOWS IT TEN TIMES OVER, AND IS THE CHEAPEST REPRODUCTION.**
 Glycerol beside the same 68-residue chain, bond error against the dictionary's
 ideal conformer, `probe-ligand-flow.js --ligand=GOL --mode=diffusion
