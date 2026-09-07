@@ -487,6 +487,40 @@ that model - "more steps than the schedule buy nothing" - so this is the second
 time here. **One target, so read it as a direction and not a margin**; the
 default is unchanged pending more.
 
+### The memory regime INVERTS with length, and both are worth knowing
+
+Every optimisation above was measured at 68 residues. At 200 it is a different
+machine:
+
+| | 68 residues, 130 tokens | 200 residues, 384 tokens |
+|---|---|---|
+| peak | 647.6 MiB | **1507.4 MiB** |
+| whole fold, 16 steps | 16.0 s | **129.5 s** |
+| resident trunk weights | **90% of the peak** | ~9% |
+| pair scratch | 34 MiB | **1080 MiB, 72%** |
+
+🔴 **SO THE SMALL-PROTEIN WINS ARE REAL AND THEY ARE NOT THE WHOLE PICTURE.**
+The trunk's block weights are a CONSTANT - about 1084 MiB in f32, 542 in f16 -
+so at 68 residues they are everything and at 200 they are a ninth. The five
+pair-sized scratch tensors are quadratic in STRUCTURAL tokens, and OpenDDE has
+about two of those per residue, so they overtake the weights somewhere near 150
+residues. Both decisions above still help at 200 (they remove a fixed 542 MiB
+that would otherwise sit on top of the scratch); neither is the lever there.
+
+🔴 **AND THAT PUTS OpenDDE's CEILING AT ROUGHLY HALF AlphaFold 3's, BY
+CONSTRUCTION.** The structural expansion doubles the token count and the scratch
+is quadratic in it, so a 300-residue chain is about 576 tokens and its scratch
+alone extrapolates to 2.4 GiB. AlphaFold 3 folds 1530 tokens on this device;
+OpenDDE reaches about 250 residues. The expansion is what buys the accuracy - it
+is also what costs the memory, and there is no setting that separates them.
+
+🔴 **AND CHUNKING THE SCRATCH IS THE ONLY LEVER LEFT AT THAT END, WHICH THIS
+REPOSITORY HAS ALREADY PRICED AND REJECTED.** CLAUDE.md records it: the grid
+attention takes a row chunk for free, the TRIANGLE will not - its intermediates
+are channel-major and the incoming direction needs a strided column slice - and
+the two share the allocation, so chunking one leaves the peak where it was. It
+is all-or-nothing and the "all" is a restructure of the pair track.
+
 ### The peak, 1198 -> 648 MiB, in two decisions keyed on one number
 
 Both are the same trade - what the trunk's block weights cost against what they

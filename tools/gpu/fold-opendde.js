@@ -110,10 +110,18 @@ function superpose(model, truth) {
 }
 
 export async function main(device, args) {
+  // 🔴 A LENGTH ARM, because every measurement in this port so far is 68-92
+  // residues - the regime where the resident weights dominate. The pair scratch
+  // is quadratic in STRUCTURAL tokens and OpenDDE has about two per residue, so
+  // whatever is true at 68 need not be true at 300.
+  const synth = Number(option(args, "length", "0"));
   const target = option(args, "target", "6mrr");
   const crystalText = await (await fetch(`/tools/fixtures/${target}-crystal.pdb`)).text();
   const crystal = readChain(crystalText, option(args, "chain", "A"));
-  const sequence = option(args, "sequence", crystal.sequence);
+  const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
+  const sequence = synth > 0
+    ? Array.from({ length: synth }, (_, i) => ALPHABET[i % ALPHABET.length]).join("")
+    : option(args, "sequence", crystal.sequence);
   const steps = Number(option(args, "steps", "200"));
   const recycles = Number(option(args, "recycles", "0"));
   const manifest = option(args, "model", "/model-opendde-int5/manifest.json");
@@ -290,6 +298,9 @@ export async function main(device, args) {
     })(),
     coordinateCheck: fold.scores?.coordinateCheck,
     peakMiB: Number((memorySnapshot(device).peakBytes / 2 ** 20).toFixed(1)),
+    peakRows: memorySnapshot(device).peakByLabel.slice(0, 6)
+      .map((r) => ({ label: r.label, MiB: Number((r.bytes / 2 ** 20).toFixed(1)),
+                     count: r.count })),
     geometry,
     frameGyration: frames.filter((f, i) => i % 6 === 0 || i === frames.length - 1),
     frameGyrationUnmapped: unmapped.filter((f, i) => i % 6 === 0 || i === unmapped.length - 1),
