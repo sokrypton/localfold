@@ -5,7 +5,7 @@
  * the checkpoint - the trunk's loader is already long, and a typo in one leaf
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
-import { af3Dialect, bind, stacked } from "./weights.js";
+import { af3Dialect, bind, layer, stacked } from "./weights.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
@@ -65,11 +65,55 @@ function atomBlock(store, root, index) {
 export async function targetFeatureWeights(store) {
   const root = "diffuser/evoformer_conditioning";
   const encoder = `${root}_atom_transformer_encoder`;
-  const stack =
-    `${encoder}/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoder`;
+  const dialect = af3Dialect(store);
+  // 🔴 THE PAIR LAYERNORM IS SHARED OR PER BLOCK, AND THE STACK'S NAME SAYS
+  // WHICH. AlphaFold 3 normalises the atom-pair conditioning ONCE for the whole
+  // stack, so `pair_input_layer_norm/scale` sits beside the stack, unstacked, at
+  // [16]. OpenDDE normalises it inside every block, so the same tensor is
+  // [3, 16] and lives INSIDE the layer stack - and haiku names the stack
+  // `__layer_stack_no_per_layer` rather than `__layer_stack_with_per_layer`
+  // because of it. Two different paths and two different ranks for one tensor;
+  // reading either without the other loads nothing and reports a missing name.
+  const perBlockPair = dialect.perBlockAtomPairLayerNorm;
+  if (perBlockPair === undefined) {
+    throw new Error("dialect.perBlockAtomPairLayerNorm has no default: AF3 "
+      + "normalises the atom-pair conditioning once for the stack, OpenDDE "
+      + "once per block");
+  }
+  const stack = perBlockPair
+    ? `${encoder}/__layer_stack_no_per_layer/evoformer_conditioning_atom_transformer_encoder`
+    : `${encoder}/__layer_stack_with_per_layer/evoformer_conditioning_atom_transformer_encoder`;
+  const stackRoot = perBlockPair
+    ? `${encoder}/__layer_stack_no_per_layer`
+    : encoder;
   const W = (leaf) => store.tensor(`${root}_${leaf}/weights`);
+  /**
+   * The stack's pair LayerNorm and logits projection, per block or shared.
+   *
+   * Returned as an ARRAY of three either way, so the encoder reads
+   * `pairNorm[block]` with no branch of its own; under AF3 the three entries
+   * are the same tensor, which is what "shared" means.
+   */
+  const pairNormFor = async () => {
+    const scaleName = `${stackRoot}/pair_input_layer_norm/scale`;
+    const projectionName = `${stackRoot}/pair_logits_projection/weights`;
+    if (!perBlockPair) {
+      const scale = await store.tensor(scaleName);
+      const projection = await store.tensor(projectionName);
+      return { perBlock: false, scale: [scale, scale, scale],
+               projection: [projection, projection, projection] };
+    }
+    const scale = [];
+    const projection = [];
+    for (let index = 0; index < 3; index += 1) {
+      scale.push(await layer(store, scaleName, index));
+      projection.push(await layer(store, projectionName, index));
+    }
+    return { perBlock: true, scale, projection };
+  };
+  const pairNorm = await pairNormFor();
   return {
-    dialect: af3Dialect(store),
+    dialect,
     reference: {
       channels: 128,
       embedRefPos: await W("embed_ref_pos"),
@@ -92,8 +136,15 @@ export async function targetFeatureWeights(store) {
       pairMlp1: await W("pair_mlp_1"),
       pairMlp2: await W("pair_mlp_2"),
       pairMlp3: await W("pair_mlp_3"),
-      pairInputLayerNormScale: await store.tensor(`${encoder}/pair_input_layer_norm/scale`),
-      pairLogitsProjection: await store.tensor(`${encoder}/pair_logits_projection/weights`),
+      // The first entry is the shared tensor under stock AF3 and block 0's
+      // under OpenDDE; `pairNormPerBlock` beside them says which, and a caller
+      // that ignores it gets AlphaFold 3's behaviour on an OpenDDE bundle -
+      // which is a plausible encoder, so the encoder asserts on the flag.
+      pairInputLayerNormScale: pairNorm.scale[0],
+      pairLogitsProjection: pairNorm.projection[0],
+      pairNormPerBlock: pairNorm.perBlock,
+      pairInputLayerNormScales: pairNorm.scale,
+      pairLogitsProjections: pairNorm.projection,
       projectAtomFeaturesForAggr: await W("project_atom_features_for_aggr"),
       blocks: [await bind(store, atomBlock(store, stack, 0)),
                await bind(store, atomBlock(store, stack, 1)),
@@ -231,6 +282,13 @@ export async function diffusionWeights(store, superBlocks = 6) {
       pairMlp3: await T("diffusion_pair_mlp_3/weights"),
       pairInputLayerNormScale: await store.tensor(`${ENCODER}/pair_input_layer_norm/scale`),
       pairLogitsProjection: await store.tensor(`${ENCODER}/pair_logits_projection/weights`),
+      // 🔴 SHARED, AND SAID SO RATHER THAN LEFT UNSET. The atom encoder throws
+      // on an absent flag; these are AlphaFold 3's own diffusion stacks, whose
+      // pair norm is one tensor for the stack. OpenDDE exports no diffusion at
+      // all, so nothing reaches here with the other convention yet - and when
+      // something does, this line is where it has to be decided rather than
+      // defaulted.
+      pairNormPerBlock: false,
       lnormTrunkSingleCondScale: await T("diffusion_lnorm_trunk_single_cond/scale"),
       embedTrunkSingleCond: await T("diffusion_embed_trunk_single_cond/weights"),
       lnormTrunkPairCondScale: await T("diffusion_lnorm_trunk_pair_cond/scale"),
@@ -245,6 +303,13 @@ export async function diffusionWeights(store, superBlocks = 6) {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 768,
       pairInputLayerNormScale: await store.tensor(`${DECODER}/pair_input_layer_norm/scale`),
       pairLogitsProjection: await store.tensor(`${DECODER}/pair_logits_projection/weights`),
+      // 🔴 SHARED, AND SAID SO RATHER THAN LEFT UNSET. The atom encoder throws
+      // on an absent flag; these are AlphaFold 3's own diffusion stacks, whose
+      // pair norm is one tensor for the stack. OpenDDE exports no diffusion at
+      // all, so nothing reaches here with the other convention yet - and when
+      // something does, this line is where it has to be decided rather than
+      // defaulted.
+      pairNormPerBlock: false,
       projectTokenFeaturesForBroadcast:
         await T("diffusion_project_token_features_for_broadcast/weights"),
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),

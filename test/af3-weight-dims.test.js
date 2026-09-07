@@ -24,6 +24,7 @@ import {
 } from "../src/af3/weights.js";
 import { MANIFEST as AF3 } from "../src/reference/manifests/af3.js";
 import { MANIFEST as OPENBIND0 } from "../src/reference/manifests/openbind0.js";
+import { MANIFEST as OPENDDE } from "../src/reference/manifests/opendde.js";
 
 /**
  * A store that answers shapes truthfully and tensors with zeros.
@@ -135,3 +136,76 @@ for (const [family, manifest] of [["af3", AF3], ["openbind0", OPENBIND0]]) {
     });
   });
 }
+
+
+/**
+ * OpenDDE, which is the reason any of the above is derived rather than declared.
+ *
+ * 🔴 THESE NUMBERS ARE UPSTREAM'S, NOT OURS. Every one is stated independently
+ * in `model_registry.OPENDDE_SETTINGS` - pair 384, MSA 128, trunk and MSA and
+ * confidence triangle attention 12 heads, template 2, head dim 32, distogram 96
+ * bins - and every one is READ HERE off the tensor that carries it. Two
+ * independent statements of one profile agreeing is what says the derivation is
+ * a measurement rather than a restatement.
+ */
+describe("AF3 weight widths, derived (opendde)", () => {
+  const store = shapeOnlyStore(OPENDDE);
+
+  it("reads OpenDDE's own widths, not AlphaFold 3's", async () => {
+    const w = await embedderWeights(store);
+    assert.equal(w.pairChannels, 384);
+    assert.equal(w.msaChannels, 128);
+    assert.equal(w.singleChannels, 384);
+    // Unchanged from AF3: the feature widths are the FEATURISER's, and OpenDDE
+    // rides AlphaFold 3's featurisation here.
+    assert.equal(w.targetFeatWidth, 447);
+    assert.equal(w.relativeWidth, 139);
+  });
+
+  it("reads 12 triangle-attention heads in the trunk and 2 in the template stack",
+    async () => {
+      const trunk = await pairformerBlockWeights(store, 0);
+      assert.equal(trunk.pairAttention1.heads, 12);
+      assert.equal(trunk.pairAttention1.dimension, 32);
+      const template = await templateWeights(store);
+      // 🔴 2 x 32, WHERE AlphaFold 3's IS 4 x 16. Both come to 64 channels, and
+      // neither number can be derived from the other or from the trunk's - which
+      // is why the stack reads its own projection rather than inheriting.
+      assert.equal(template.blocks[0].pairAttention1.heads, 2);
+      assert.equal(template.blocks[0].pairAttention1.dimension, 32);
+      // ...and the template embedder's INPUT is the trunk pair, so it moves too.
+      assert.equal(template.queryChannels, 384);
+    });
+
+  it("reads an MSA value dim that is NOT msaChannels / heads", async () => {
+    // 🔴 THE CASE ALPHAFOLD 3 COULD NEVER HAVE SHOWN. AF3 is 64 channels and 8
+    // heads with a value dim of 8, so 64/8 = 8 and the two rules agree.
+    // OpenDDE is 128 channels and 8 heads with a value dim of STILL 8 -
+    // upstream calls it a decoupled per-head width - so dividing gives 16 and
+    // reads twice its own tensor.
+    const w = await msaBlockWeights(store, 0);
+    assert.equal(w.msaChannels, 128);
+    assert.equal(w.msaAttention1.heads, 8);
+    assert.equal(w.msaAttention1.dimension, 8);
+    assert.notEqual(w.msaAttention1.dimension, w.msaChannels / w.msaAttention1.heads);
+    assert.equal(w.pairAttention1.heads, 12);
+  });
+
+  it("reads 96 distogram bins and the trained bias AlphaFold 3 has not", async () => {
+    const w = await distogramWeights(store);
+    assert.equal(w.pairChannels, 384);
+    assert.equal(w.bins, 96);
+    assert.equal(w.halfLogitsBias.length, 96);
+  });
+
+  it("refuses a bundle whose bias and dialect disagree", async () => {
+    // The bias is applied TWICE by the symmetrisation, so losing it silently
+    // spreads the softmax across every bin. Presence and dialect must agree.
+    await assert.rejects(
+      () => distogramWeights(store, { distogramBias: false }),
+      /carries .*half_logits\/bias/);
+    await assert.rejects(
+      () => distogramWeights(shapeOnlyStore(AF3), { distogramBias: true }),
+      /does not carry .*half_logits\/bias/);
+  });
+});

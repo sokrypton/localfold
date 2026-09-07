@@ -90,6 +90,32 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_OPENBIND0_MODEL",
     load: () => import("./openbind0.js"),
   },
+  // 🔴 OpenDDE IS A TRUNK, NOT YET A FOLD, AND `foldingModel: false` IS THAT
+  // FACT RATHER THAN A TODO. It is an independent PyTorch reimplementation in
+  // the AlphaFold 3 family (Aureka Research, Apache-2.0), and its blob carries
+  // 481 arrays against AlphaFold 3's 406 - of which 240 share a name and only
+  // 123 share a shape.
+  //
+  // What transfers is the pairformer, the MSA stack, the template embedder and
+  // the distogram head: AlphaFold 3's own module tree at OpenDDE's widths, which
+  // is why src/af3/weights.js derives every width from the weights. What does
+  // NOT transfer is the way it makes coordinates. Between the trunk and the
+  // diffusion OpenDDE expands each residue into about two "structural tokens"
+  // and runs the diffusion and a confidence head of its own design on that
+  // expanded set - a second token space, not a branch - so this bundle exports
+  // the trunk and the distogram and stops there.
+  //
+  // So what it can answer is the distogram's question: a contact map, and the
+  // certainty derived from one. That is exactly what EF2-fast ships on, and it
+  // reuses that machinery rather than a second copy. See docs/OPENDDE.md.
+  opendde: {
+    model: "opendde",
+    directory: "./model-opendde-trunk-int5/",
+    release: "opendde-trunk-int5",
+    variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
+    load: () => import("./opendde.js"),
+    foldingModel: false,
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding

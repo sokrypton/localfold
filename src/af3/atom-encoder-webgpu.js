@@ -104,16 +104,33 @@ const PAIR_ORDER = [
   "atomPositionsToFeatures", "projectAtomFeaturesForAggr",
 ];
 
+/** One Float32Array from several, in order. */
+function concatenate(parts) {
+  const out = new Float32Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
 export function packAtomPairWeights(weights) {
+  // 🔴 THE TWO PAIR-NORM ENTRIES ARE ONE TENSOR OR THREE. AlphaFold 3 shares a
+  // LayerNorm scale and a projection across the atom stack; OpenDDE trains one
+  // of each PER BLOCK. Packing the three back to back keeps one buffer and one
+  // binding, and the shader indexes them by block - see `pairLogits`.
+  const source = weights.pairNormPerBlock
+    ? { ...weights,
+        pairInputLayerNormScale: concatenate(weights.pairInputLayerNormScales),
+        pairLogitsProjection: concatenate(weights.pairLogitsProjections) }
+    : weights;
   const offsets = {};
   let total = 0;
   for (const name of PAIR_ORDER) {
-    if (weights[name] === undefined) throw new Error(`atom encoder missing ${name}`);
+    if (source[name] === undefined) throw new Error(`atom encoder missing ${name}`);
     offsets[name] = total;
-    total += weights[name].length;
+    total += source[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of PAIR_ORDER) data.set(weights[name], offsets[name]);
+  for (const name of PAIR_ORDER) data.set(source[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -126,6 +143,9 @@ export function createAtomCommon(shape, pairOffsets, blockOffsets) {
   const { tokens, dense, subsets, queries, keys, channels, pairChannels,
           heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
           blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -184,6 +204,9 @@ export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
   const { tokens, dense, subsets, queries, keys, channels, pairChannels,
           heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
           blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -450,9 +473,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var head = 0u; head < HEADS; head += 1u) {
       var value = 0.0;
       for (var c = 0u; c < C_PAIR; c += 1u) {
+        // 🔴 THE SCALE AND THE MATRIX ARE PER BLOCK UNDER OpenDDE. The mean and
+        // the variance are not - they come from the pair, which does not change
+        // - so the whole difference is these two indices, and both arms read
+        // the same buffer.
         value += (pair[base + c] - mean) * inverse
-          * weights[P_pairInputLayerNormScale + c]
-          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];
+${perBlockPair
+  ? `          * weights[P_pairInputLayerNormScale + block * C_PAIR + c]
+          * weights[P_pairLogitsProjection + (block * C_PAIR + c) * HEADS + head];`
+  : `          * weights[P_pairInputLayerNormScale + c]
+          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];`}
       }
       let out = ((block * SUBSETS + subset) * HEADS + head) * QUERIES * KEYS
         + query * KEYS + key;
@@ -1133,14 +1163,25 @@ export class Af3AtomEncoderGpu {
     const pairPacked = packCached(weights, "atom.pair", () => packAtomPairWeights(weights));
     const blockPacked = weights.blocks.map(
       (block) => packCached(block, "atom.block", () => packAtomBlockWeights(block)));
+    // 🔴 A PER-BLOCK PAIR NORM GENERATES A DIFFERENT KERNEL, SO IT IS IN THE
+    // KEY. The two arms index the same buffer differently and produce the same
+    // shapes; a key that could not tell them apart would hand an OpenDDE
+    // encoder AlphaFold 3's shader, which runs.
+    if (weights.pairNormPerBlock === undefined) {
+      throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+        + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+    }
+    const perBlockPair = weights.pairNormPerBlock;
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
+      perBlockPair,
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
-      + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`;
+      + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
+      + `:${perBlockPair}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];

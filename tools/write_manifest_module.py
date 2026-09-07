@@ -70,6 +70,22 @@ BUNDLES = {
         "module": "src/reference/manifests/openbind0.js",
         "model": "openbind0",
     },
+    # OpenDDE's TRUNK, which is all of OpenDDE that this graph can run: the
+    # pairformer, the MSA stack, the template embedder and the distogram head,
+    # at int5 group 32. 278 MiB - larger than AlphaFold 3's whole 265 MiB
+    # bundle, because the pair track is 384 channels rather than 128.
+    #
+    # 🔴 IT IS A TRUNK AND NOT A FOLD, which MODEL_BUNDLES records as
+    # `foldingModel: false`. OpenDDE expands each residue into about two
+    # structural tokens between the trunk and the diffusion and runs the
+    # diffusion and its own confidence head on that expanded set, so the parts
+    # that make COORDINATES are a second token space rather than a branch. The
+    # distogram is what this bundle answers with. See docs/OPENDDE.md.
+    "opendde": {
+        "export": "model-opendde-trunk-int5",
+        "module": "src/reference/manifests/opendde.js",
+        "model": "opendde",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

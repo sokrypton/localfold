@@ -231,14 +231,46 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
  * projection's output is (blocks, heads) rather than heads. Recomputing it per
  * block would read the same weights and give the same answer; splitting it the
  * wrong way round gives every block the biases meant for another.
+ *
+ * 🔴 ...UNDER AlphaFold 3. OpenDDE NORMALISES AND PROJECTS PER BLOCK, with its
+ * own scale and its own matrix each time - `pair_input_layer_norm/scale` is
+ * [3, 16] there and [16] here, and the projection [3, 16, 4] against [16, 12].
+ * The MEAN and VARIANCE are the same either way (they come from the pair, which
+ * does not change), so the difference is entirely in which scale and which
+ * matrix a block reads. That makes it invisible to every shape check and to any
+ * test that runs one block.
  */
 export function atomPairLogits(pair, shape, weights) {
   const { subsets, queries, keys, pairChannels, heads, blocks } = shape;
   const pairRows = subsets * queries * keys;
-  const normalised = layerNormSlow(pair, pairRows, pairChannels,
-                                   weights.pairInputLayerNormScale, null);
-  const flat = linear(normalised, pairRows, pairChannels, blocks * heads,
-                      weights.pairLogitsProjection);
+  if (weights.pairNormPerBlock === undefined) {
+    throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+      + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+  }
+  // Per block: its own scale, its own matrix, `heads` outputs. Shared: one
+  // scale, one matrix, `blocks * heads` outputs read at a block's offset. The
+  // loop below indexes `flat` identically in both cases, which is what keeps
+  // the two arms one function.
+  let flat;
+  if (weights.pairNormPerBlock) {
+    flat = new Float32Array(pairRows * blocks * heads);
+    for (let block = 0; block < blocks; block += 1) {
+      const normalised = layerNormSlow(pair, pairRows, pairChannels,
+                                       weights.pairInputLayerNormScales[block], null);
+      const projected = linear(normalised, pairRows, pairChannels, heads,
+                               weights.pairLogitsProjections[block]);
+      for (let row = 0; row < pairRows; row += 1) {
+        for (let head = 0; head < heads; head += 1) {
+          flat[row * blocks * heads + block * heads + head] = projected[row * heads + head];
+        }
+      }
+    }
+  } else {
+    const normalised = layerNormSlow(pair, pairRows, pairChannels,
+                                     weights.pairInputLayerNormScale, null);
+    flat = linear(normalised, pairRows, pairChannels, blocks * heads,
+                  weights.pairLogitsProjection);
+  }
   const output = [];
   for (let block = 0; block < blocks; block += 1) {
     const perBlock = new Float32Array(subsets * heads * queries * keys);
