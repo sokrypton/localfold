@@ -127,6 +127,15 @@ export function adaptiveZeroInit(x, cond, rows, channels, weights, prefix,
  *
  * @param {object} shape {subsets, queries, keys, channels, heads, dimension}
  */
+/** The one dialect flag a block's attention reads, required rather than assumed. */
+function dialectOf(weights) {
+  if (weights.keyMaskedAtomAttention === undefined) {
+    throw new Error("weights.keyMaskedAtomAttention has no default: AF3 masks a "
+      + "pair only when query AND key are padded, OpenDDE when either is");
+  }
+  return weights;
+}
+
 export function crossAttentionBlock(queriesAct, state, shape, weights) {
   const { subsets, queries, keys, channels, heads, dimension } = shape;
   const { queriesToKeys, queriesMask, keysMask, queriesCond, keysCond, pairLogits } = state;
@@ -172,12 +181,20 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
           for (let d = 0; d < dimension; d += 1) {
             dot += q[queryBase + d] * k[keyIndex * width + head * dimension + d];
           }
-          // 🔴 THE MASK BIAS IS A PRODUCT, NOT A SUM. AF3 penalises a pair only
-          // when the query AND the key are padded, so a real query can still
-          // attend to a padded key. (RoseTTAFold3 adds them instead, which is
-          // an OR; the difference is large in a mostly-empty window.)
-          const maskBias = 1e9 * (queriesMask[queryIndex] - 1)
-            * (keysMask[keyIndex] - 1);
+          // 🔴 THE MASK BIAS IS A PRODUCT, NOT A SUM - UNDER AlphaFold 3. It
+          // penalises a pair only when the query AND the key are padded, so a
+          // real query can still attend to a padded key. OpenDDE, Protenix and
+          // RoseTTAFold3 ADD the two instead, which is an OR: a real query
+          // cannot attend to a padded key at all. The difference is large in a
+          // mostly-empty window - a lone ligand's 16 atoms sit in a 32-query,
+          // 128-key window - and it is nothing at all when every key is real,
+          // which is every batch THIS featuriser produces (the window is
+          // `min(128, atomCount)`; see CLAUDE.md). It is implemented because
+          // the differential checkers feed AF3's own gathers out of an oracle
+          // dump, where padded keys do occur.
+          const maskBias = dialectOf(weights).keyMaskedAtomAttention
+            ? -1e9 * ((1 - queriesMask[queryIndex]) + (1 - keysMask[keyIndex]))
+            : 1e9 * (queriesMask[queryIndex] - 1) * (keysMask[keyIndex] - 1);
           logits[key] = dot * scale + maskBias
             + pairLogits[((subset * heads + head) * queries + query) * keys + key];
         }

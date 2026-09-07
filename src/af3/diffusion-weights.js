@@ -71,9 +71,14 @@ function atomBlock(store, root, index) {
  * mean three signatures changing for a value that never varies within a stack.
  * A block that reaches the reference without it raises.
  */
-async function atomBlockWith(store, stack, index, chainedAtomLayerNorm) {
+async function atomBlockWith(store, stack, index, dialect) {
   const block = await bind(store, atomBlock(store, stack, index));
-  block.chainedAtomLayerNorm = chainedAtomLayerNorm;
+  block.chainedAtomLayerNorm = dialect.chainedAtomLayerNorm;
+  block.keyMaskedAtomAttention = dialect.keyMaskedAtomAttention;
+  if (block.chainedAtomLayerNorm === undefined
+      || block.keyMaskedAtomAttention === undefined) {
+    throw new Error("an atom block's dialect flags have no defaults");
+  }
   return block;
 }
 
@@ -89,10 +94,6 @@ export async function targetFeatureWeights(store) {
   // `__layer_stack_no_per_layer` rather than `__layer_stack_with_per_layer`
   // because of it. Two different paths and two different ranks for one tensor;
   // reading either without the other loads nothing and reports a missing name.
-  const chained = dialect.chainedAtomLayerNorm;
-  if (chained === undefined) {
-    throw new Error("dialect.chainedAtomLayerNorm has no default");
-  }
   const perBlockPair = dialect.perBlockAtomPairLayerNorm;
   if (perBlockPair === undefined) {
     throw new Error("dialect.perBlockAtomPairLayerNorm has no default: AF3 "
@@ -165,9 +166,9 @@ export async function targetFeatureWeights(store) {
       pairInputLayerNormScales: pairNorm.scale,
       pairLogitsProjections: pairNorm.projection,
       projectAtomFeaturesForAggr: await W("project_atom_features_for_aggr"),
-      blocks: [await atomBlockWith(store, stack, 0, chained),
-               await atomBlockWith(store, stack, 1, chained),
-               await atomBlockWith(store, stack, 2, chained)],
+      blocks: [await atomBlockWith(store, stack, 0, dialect),
+               await atomBlockWith(store, stack, 1, dialect),
+               await atomBlockWith(store, stack, 2, dialect)],
       // 🔴 THREE WEIGHTS THIS ENCODER DOES NOT HAVE, AT THE RIGHT LENGTHS AND
       // FULL OF ZEROS. Af3AtomEncoderGpu is a superset of this module: it also
       // adds the trunk's single, the trunk's pair and an embedding of the noisy
@@ -204,11 +205,8 @@ export async function atomReference(store) {
 
 export async function diffusionWeights(store, superBlocks = 6) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
-  // The atom stacks' one dialect flag; see `atomBlockWith`.
-  const chained = af3Dialect(store).chainedAtomLayerNorm;
-  if (chained === undefined) {
-    throw new Error("dialect.chainedAtomLayerNorm has no default");
-  }
+  // The atom stacks' dialect flags; see `atomBlockWith`.
+  const dialect = af3Dialect(store);
   const transition = async (prefix) => ({
     ffwLayerNormScale: await T(`${prefix}ffw_layer_norm/scale`),
     ffwLayerNormOffset: await T(`${prefix}ffw_layer_norm/offset`),
@@ -319,9 +317,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
       embedTrunkPairCond: await T("diffusion_embed_trunk_pair_cond/weights"),
       atomPositionsToFeatures: await T("diffusion_atom_positions_to_features/weights"),
       projectAtomFeaturesForAggr: await T("diffusion_project_atom_features_for_aggr/weights"),
-      blocks: [await atomBlockWith(store, ENCODER_STACK, 0, chained),
-               await atomBlockWith(store, ENCODER_STACK, 1, chained),
-               await atomBlockWith(store, ENCODER_STACK, 2, chained)],
+      blocks: [await atomBlockWith(store, ENCODER_STACK, 0, dialect),
+               await atomBlockWith(store, ENCODER_STACK, 1, dialect),
+               await atomBlockWith(store, ENCODER_STACK, 2, dialect)],
     },
     decoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 768,
@@ -338,9 +336,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
         await T("diffusion_project_token_features_for_broadcast/weights"),
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),
       atomFeaturesToPositionUpdate: await T("diffusion_atom_features_to_position_update/weights"),
-      blocks: [await atomBlockWith(store, DECODER_STACK, 0, chained),
-               await atomBlockWith(store, DECODER_STACK, 1, chained),
-               await atomBlockWith(store, DECODER_STACK, 2, chained)],
+      blocks: [await atomBlockWith(store, DECODER_STACK, 0, dialect),
+               await atomBlockWith(store, DECODER_STACK, 1, dialect),
+               await atomBlockWith(store, DECODER_STACK, 2, dialect)],
     },
   };
 }

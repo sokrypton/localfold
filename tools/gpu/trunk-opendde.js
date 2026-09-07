@@ -149,6 +149,7 @@ export async function main(device, args) {
   // branch does not matter" also looks like.
   for (const block of weights.targetFeat.encoder.blocks) {
     block.chainedAtomLayerNorm = dialect.chainedAtomLayerNorm;
+    block.keyMaskedAtomAttention = dialect.keyMaskedAtomAttention;
   }
   const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
 

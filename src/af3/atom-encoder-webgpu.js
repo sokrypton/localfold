@@ -146,6 +146,8 @@ export function createAtomCommon(shape, pairOffsets, blockOffsets) {
   // Whether the atom-pair LayerNorm and its projection are per block; see
   // `pairLogits` below and src/af3/dialect.js.
   const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -207,6 +209,8 @@ export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
   // Whether the atom-pair LayerNorm and its projection are per block; see
   // `pairLogits` below and src/af3/dialect.js.
   const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const width = heads * dimension;
   const queryRows = subsets * queries;
   const keyRows = subsets * keys;
@@ -519,6 +523,9 @@ export function createAtomBlockShaders(common, shape) {
   const outputRowTile = shape.outputRowTile
     ?? outputRowTileFor(shape.subsets * shape.queries);
   const { channels, keys } = shape;
+  // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
+  // OpenDDE. See the note at `attendFor`.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
   const intermediate = channels * 2;
   const rowWidth = Math.min(4, outputRowTile);
   const rowGroups = outputRowTile / rowWidth;
@@ -924,7 +931,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       dot += q[query_base + d] * k[key_index * WIDTH + head * DIMENSION + d];
     }
     // 🔴 A PRODUCT, NOT A SUM: only a padded query AND a padded key is penalised.
-    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);
+    // A product under AlphaFold 3 and a SUM under OpenDDE; see the note in
+    // atom-encoder-reference.js for which models take which and why it is
+    // inert on every batch this featuriser produces.
+${keyMasked
+  ? "    let bias = -1.0e9 * ((1.0 - queries_mask[query_index]) + (1.0 - keys_mask[key_index]));"
+  : "    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);"}
     logits[key] = dot * SCALE + bias
       + pair_logits[(((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS + key];
   }
@@ -1268,6 +1280,10 @@ export class Af3AtomEncoderGpu {
     // read off block 0 and asserted across the rest, because a stack whose
     // blocks disagreed would be a bundle assembled from two dialects - which
     // nothing else here would notice.
+    const keyMasked = weights.blocks[0]?.keyMaskedAtomAttention;
+    if (keyMasked === undefined) {
+      throw new Error("atom blocks carry no keyMaskedAtomAttention");
+    }
     const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
     if (chainedNorm === undefined) {
       throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
@@ -1280,12 +1296,12 @@ export class Af3AtomEncoderGpu {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
-      perBlockPair,
+      perBlockPair, keyMaskedAtomAttention: keyMasked,
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
-      + `:${perBlockPair}:${chainedNorm}`;
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
