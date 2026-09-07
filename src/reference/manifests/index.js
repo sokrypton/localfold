@@ -104,6 +104,10 @@ export const MODEL_BUNDLES = {
   opendde: {
     model: "opendde",
     directory: "./model-opendde-int5/",
+    // 🔴 PINNED TO A COMMIT, NOT A BRANCH. A shard fetched from a moving branch
+    // can change under a manifest that did not, and the failure names neither
+    // half - see docs/HOSTING.md, where three hours went into exactly that.
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/d9e5e9c3cdaf941f5dd3e57ccdffdcd98e81bff8/opendde-int5/",
     release: "opendde-int5",
     variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
     load: () => import("./opendde.js"),
