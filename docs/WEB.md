@@ -367,9 +367,30 @@ restores:
 | offer | `Last fold: AlphaFold 3 · 58 residues · pLDDT 71.2 · just now` |
 | restored | 16 frames, `pae: 58`, `contact: true`, score card 71.2 / 0.39 |
 
-🔴 **THE HEATMAP PANEL DOES NOT COME BACK, AND THIS IS OPEN.** `panelShown:
-false` and no tabs, with the maps demonstrably ON the restored frames
-(`contact: true`). py2Dmol's `Heatmap.updateVisibility` shows the container when
-the object has map data and is reached through `_show`, guarded on
-`heatmapRenderer` existing; which of those is false after a restore has not been
-established. Everything else on the list above is measured green.
+🔴 **AND SAVING AT FOLD COMPLETION WAS STILL WRONG, WHICH THE GATE HID BY
+DRIVING THE EVENT.** `visibilitychange` catches a settled session, but only for
+a reader who hides the tab; press reload straight after a fold and that signal
+never comes, so the only save that ran was the floor at completion - one frame
+of sixteen, no contact map. The gate drove a `visibilitychange` before
+reloading and was green throughout. It now reloads the way a reader does, and
+`--session-hidden` is the other arm. The save waits for the FRAME COUNT TO STOP
+GROWING - six still checks - rather than for a guessed interval, and AF2's
+contact map keeps its own re-save where it arrives.
+
+| | reload, no hide (before) | after |
+|---|---|---|
+| frames | 1 | **16** |
+| maps on frames | none | **pae + contact** |
+| bytes | 26,641 | 188,767 |
+
+🔴 **THE HEATMAP PANEL STILL DOES NOT COME BACK, AND THIS IS OPEN.**
+`panelShown: false` with no tabs. It is NOT a visibility guard and NOT missing
+data - measured after a restore, `hasRenderer: true`, `hasContainer: true`,
+`mapKeysOf` returns **`['pae', 'contact']`**, frame 0's contact map is a proper
+`{data, n: 58}` and its `pae` is an array of 58. What is empty is
+`heatmapRenderer.maps`, which `_show` fills from
+`resolveMapFrame(object, frame, key)` - so the backward search from the current
+frame (the last) to frame 0, where the maps live, finds nothing after a restore
+though it works during a live fold. A `syncToDrawn` by hand does not fix it
+either. The next step is `resolveMapFrame` upstream, not this page. Everything
+else in the table above is measured green.

@@ -2188,7 +2188,7 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     };
     predictions.set(stem, lastPrediction);
     element("downloads").style.display = "flex";
-    void rememberSession(lastPrediction);
+    void rememberSessionWhenSettled(lastPrediction);
     // ...and the reader keeps the view they had. A reload flies to its own,
     // which after watching a fold reads as the structure jumping at the end.
     if (viewer !== undefined) Object.assign(viewer.viewerState, camera);
@@ -2728,7 +2728,7 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     templates: undefined,
   };
   element("downloads").style.display = "flex";
-    void rememberSession(lastPrediction);
+    void rememberSessionWhenSettled(lastPrediction);
 
   esmfold2Trunk = result.reusable === undefined ? esmfold2Trunk
     : { key: trunkKey, reusable: result.reusable };
@@ -3270,7 +3270,7 @@ async function fold(event) {
     }
     // ...shown beside the PAE panel, which appears at the same moment.
     element("downloads").style.display = "flex";
-    void rememberSession(lastPrediction);
+    void rememberSessionWhenSettled(lastPrediction);
     // 🔴 THE CARD SCORES WHAT WILL BE SAVED, which is the best pass and not
     // always the last. Showing the last pass's numbers beside a download of the
     // best one is the kind of disagreement nobody reads a status line closely
@@ -3591,6 +3591,44 @@ element("download-all").addEventListener("click", async () => {
  * save by a guessed interval would be the bisect-by-guessing this repository
  * has been wrong with before.
  */
+/**
+ * Save once the viewer has stopped changing.
+ *
+ * 🔴 A FOLD IS NOT FINISHED WHEN ITS PREDICTION IS STORED. Measured: at the
+ * moment `predictions.set` runs, the viewer object holds ONE frame - the
+ * sampler's trajectory is added to it afterwards - so a save fired there wrote
+ * a session with 1 frame of 16 and no contact map, and the reader who reloaded
+ * got exactly that back. `visibilitychange` catches the settled state, but only
+ * for someone who hides the tab first: press reload straight after a fold and
+ * that signal never comes, which is the case this got wrong.
+ *
+ * So this waits for the COUNT TO STOP GROWING rather than for a guessed
+ * interval - the bisect-by-guessing this repository has been wrong with twice -
+ * and saves when it has been still for six checks. AF2's contact map lands
+ * later still, in a `setTimeout` off the finished pass, and has its own re-save
+ * where it arrives.
+ */
+async function rememberSessionWhenSettled(pred) {
+  if (!pred?.pdb) return;
+  const registry = window.py2dmol_viewers ?? {};
+  const renderer = registry[Object.keys(registry)[0]]?.renderer;
+  const count = () => renderer?.objectsData?.[pred.stem]?.frames?.length ?? 0;
+  let last = -1;
+  let still = 0;
+  for (let tries = 0; tries < 200; tries += 1) {
+    const now = count();
+    if (now > 0 && now === last) {
+      still += 1;
+      if (still >= 6) break;
+    } else {
+      still = 0;
+      last = now;
+    }
+    await new Promise((done) => setTimeout(done, 50));
+  }
+  await rememberSession(pred);
+}
+
 async function rememberSession(pred) {
   if (!pred?.pdb) return;
   try {
