@@ -450,7 +450,7 @@ that model - "more steps than the schedule buy nothing" - so this is the second
 time here. **One target, so read it as a direction and not a margin**; the
 default is unchanged pending more.
 
-### f16 resident pair weights: 27% of the peak, and not yet reachable
+### f16 resident pair weights: 27% of the peak, taken
 
 | | peak | time | RMSD | pLDDT |
 |---|---|---|---|---|
@@ -463,14 +463,28 @@ Free in time and in accuracy, worth 27% of OpenDDE's peak and NOTHING of
 AlphaFold 3's - whose peak is the diffusion transformer's 378 MiB, not the
 trunk's.
 
-🔴 **AND MAKING IT THE DEFAULT PRODUCES NaN.** The flag reaches the TRUNK's
-stack; the default also reaches the structural-token refiner and the confidence
-head, which build their own `Af3PairformerStackGpu` with no options - and every
-coordinate comes back NaN. So the 27% is real and the route to it is not a
-one-line default. **Open**: which of those two stacks, and why f16 weights are
-safe in the trunk and not there.
+🔴 **AND MAKING IT A GLOBAL DEFAULT PRODUCED NaN, WHICH WAS A PACKING BUG AND
+NOT AN ARITHMETIC ONE.** Bisected across the five stacks that run this track -
+the trunk pairformer, the MSA stack, the template embedder, the structural
+refiner and the confidence head - it was the MSA stack, and the template
+embedder was quietly wrong beside it (finite, but RMSD 2.009 against 1.570).
 
-🔴 **AND THE GRID'S 272 MiB DOES NOT TAKE THE FLAG AT ALL.** `w.tri.out`,
+Both call `packPairTrackWeights` WITHOUT a precision while `compilePairTrack`
+generates kernels that read one. So an f16 kernel read f32 bytes as pairs of
+halves. Same shape as the dispatch sized for 128 channels against kernels built
+for 384, and the same cause: one decision made in two places. Both now read a
+single local, and at f16 the MSA stack is finite and RMSD 1.570 - identical to
+f32.
+
+🔴 **AND IT IS ON WHERE IT PAYS, BY WIDTH RATHER THAN BY NAME.** `foldBatch`
+takes f16 when the pair track is at least 256 channels. AlphaFold 3 at 128
+gains NOTHING - its peak is the diffusion transformer - and at f16 its fold
+shifts (mean pLDDT 72.19283791929007 -> 72.17922675038298), which is well
+inside a seed's spread and still a change for no gain. 256 is not a measured
+optimum: the two points are 128 (nothing) and 384 (27%), and it should move
+when a third exists.
+
+🔴 **AND THE GRID'S 272 MiB STILL DOES NOT TAKE IT.** `w.tri.out`,
 `w.tri.in` and `w.pair-transition` are passed `pairWeightPrecision` and
 `w.grid1`/`w.grid2` are not, which is exactly why the observed saving is 325
 MiB rather than 461. Narrowing them needs the grid shaders to read f16 weights,

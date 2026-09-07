@@ -310,9 +310,13 @@ export class Af3TemplateEmbedderGpu {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
     }
     // The template stack: the shared pair track at 64 channels, factor 2.
+    // ...one variable for the shader and the packing; see the note in
+    // msa-stack-webgpu.js for what their disagreeing costs.
+    const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
     const trackPipelines = await compilePairTrack(this.pipelines, {
       scratchStorage: UNPACKED_PAIR_SCRATCH,
       n: tokens, channels: CHANNELS, transitionFactor: 2,
+      weightPrecision: pairWeightPrecision,
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
     });
 
@@ -466,7 +470,7 @@ export class Af3TemplateEmbedderGpu {
       // and the release below would then have to know which upload belonged to
       // which pass.
       const blockWeights = weights.blocks.map((block, index) => {
-        const packedTrack = packPairTrackWeights(block, CHANNELS);
+        const packedTrack = packPairTrackWeights(block, CHANNELS, pairWeightPrecision);
         return {
           outgoing: upload(`w.tri.out.${index}`, packedTrack.outgoing),
           incoming: upload(`w.tri.in.${index}`, packedTrack.incoming),

@@ -61,6 +61,14 @@ export class Af3MsaStackGpu {
         + "updated one");
     }
     const { msaUpdateBeforeOuterProduct } = dialect;
+    // 🔴 ONE VARIABLE FOR THE SHADER AND FOR THE PACKING, because they are the
+    // same decision made twice. `compilePairTrack` generates kernels that read
+    // the weights at this element and `packPairTrackWeights` writes them at
+    // it - and this stack compiled at one and packed at the other, so an f16
+    // kernel read f32 bytes as pairs of halves. Every coordinate came back NaN.
+    // Same shape as the dispatch that was sized for 128 while the kernels were
+    // built for 384; a value resolved in two places is how they drift.
+    const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
     if (!(pairChannels > 0)) {
       throw new Error("MSA blocks carry no pairChannels; they are built by "
         + "src/af3/weights.js, which derives it from the weights");
@@ -96,6 +104,7 @@ export class Af3MsaStackGpu {
       // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's
       // [384, 768] triangle projection at AF3's stride.
       n, channels: pairChannels, sample, epsilon, variance, dialect, base,
+      weightPrecision: pairWeightPrecision,
     });
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compile = (key, source) => this.pipelines.get(key, source);
@@ -168,7 +177,7 @@ export class Af3MsaStackGpu {
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
-          pairChannels, msaUpdateBeforeOuterProduct,
+          pairChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
           left, right, opmCounts, keyMask, attention, msaScratch,
         });
@@ -225,7 +234,8 @@ export class Af3MsaStackGpu {
       return allocation;
     };
     // The block's own width; the default is AlphaFold 3's 128.
-    const packedPair = packPairTrackWeights(block, pairChannels);
+    const packedPair = packPairTrackWeights(block, pairChannels,
+                                            context.pairWeightPrecision);
     const pairTrackWeights = {
       outgoing: upload("w.tri.out", packedPair.outgoing),
       incoming: upload("w.tri.in", packedPair.incoming),

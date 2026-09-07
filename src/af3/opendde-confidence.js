@@ -120,7 +120,8 @@ export async function openddeConfidence(device, input, weights, dialect) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
-  const refined = await new Af3PairformerStackGpu(device, {}).run(
+  const refined = await new Af3PairformerStackGpu(
+    device, { pairWeightPrecision: weights.weightPrecision }).run(
     { tokens, pair, single, pairMask, seqMask }, weights.blocks, dialect,
     { extraPairBias: input.extraPairBias });
 

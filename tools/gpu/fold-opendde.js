@@ -129,9 +129,13 @@ export async function main(device, args) {
     ...(trunk.dialect.structuralTokens ? {
       expander: await structuralExpanderWeights(store),
       refiner: await structuralRefinerWeights(store),
-      openddeConfidence: await openddeConfidenceWeights(store),
+      openddeConfidence: {
+        ...await openddeConfidenceWeights(store),
+        weightPrecision: option(args, "confidence-weights", undefined),
+      },
     } : { confidence: await confidenceWeights(store) }),
     diffusion: await diffusionWeights(store),
+    refinerWeightPrecision: option(args, "refiner-weights", undefined),
     atomReference: await atomReference(store),
   };
 

@@ -430,7 +430,8 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   }
   const attentionBias = structuralAttentionBias(layout, structuralFeatures, expander);
   stage("structural-refine", { tokens: n });
-  const refined = await new Af3PairformerStackGpu(device, {}).run(
+  const refined = await new Af3PairformerStackGpu(
+    device, { pairWeightPrecision: weights.refinerWeightPrecision }).run(
     { tokens: n, pair: expanded.pair, single: expanded.single, pairMask, seqMask },
     weights.refiner, weights.trunk.dialect, { extraPairBias: attentionBias });
 
@@ -530,7 +531,28 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const precision = {
     stagedPrecision: options.stagedPrecision,
     weightPrecision: options.weightPrecision,
-    pairWeightPrecision: options.pairWeightPrecision,
+    // 🔴 THE RESIDENT PAIR WEIGHTS ARE f16 WHERE THE PAIR TRACK IS WIDE, AND
+    // THE RULE IS THE MEASUREMENT. These buffers are read one scalar at a time,
+    // so halving them buys no bandwidth - what it buys is the peak, and the
+    // peak is only made of them when the track is wide, because they go as the
+    // SQUARE of the channel count:
+    //
+    //   OpenDDE, 384 channels   1198.3 -> 873.5 MiB  (-27%)  15.9 -> 15.9 s
+    //   AlphaFold 3, 128         476.0 ->  476.0     (  0%)
+    //
+    // AlphaFold 3 does not move because its peak is the diffusion transformer's
+    // 378 MiB of resident weights, not the trunk's - so there is nothing to buy
+    // and it is not made to pay: at f16 its fold shifts (mean pLDDT
+    // 72.19283791929007 -> 72.17922675038298), which is well inside a seed's
+    // spread and still a change for no gain.
+    //
+    // 🔴 AND IT IS A WIDTH TEST RATHER THAN A MODEL NAME, so a future bundle
+    // collects it by being wide rather than by being listed. 256 is the
+    // threshold because the two measured points are 128 (nothing) and 384
+    // (27%); it is not a measured optimum and should move when a third point
+    // exists.
+    pairWeightPrecision: options.pairWeightPrecision
+      ?? (weights.trunk.embedder.pairChannels >= 256 ? "f16" : "f32"),
     accumulatePrecision: options.accumulatePrecision,
   };
   const trunkGpu = new Af3TrunkGpu(device, precision);
