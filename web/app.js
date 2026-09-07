@@ -3863,6 +3863,10 @@ async function restoreSession() {
       chains: (meta?.sequence ?? "").split(":").filter(Boolean),
       chainLengths: meta?.chainLengths ?? [],
       tokens: meta?.tokens,
+      // ...and undefined rather than [] when the record predates this, so an
+      // older session still says "this model has no such control" instead of
+      // claiming a template-taking model used none.
+      templates: meta?.templates,
       confidence: savedConfidence,
       contactSource: { contactProbs: savedConfidence?.contactProbs },
       restored: true,

@@ -101,6 +101,21 @@ export function jobMeta({ stem, model, prediction, sequence, settings, entities,
     // exact and, gzipped, costs almost nothing.
     pdb: prediction?.pdb,
     tokens: prediction?.tokens,
+    // 🔴 THE TEMPLATES TRAVEL, BECAUSE THEY ARE INPUT AND NOT OUTPUT. Losing
+    // them left `templates: undefined` on the restored prediction, and an
+    // absent array means "this model has no such control" - which is what
+    // drops the README's templates line entirely, on a model that HAS the
+    // control and used it. An empty array means "none were used"; neither
+    // means "there were some and they are gone". Unlike the alignment these
+    // are small - a structure or three, not a 3 MB a3m - and they are a chosen
+    // input, so a fold that silently forgot which template it was given is a
+    // different job than the one that ran.
+    //
+    // `text` and `chain` are what the archive writes; `source` is what names
+    // the hit. `origin` is deliberately dropped: it carries the live fetch's
+    // status, which is about a request that is long finished.
+    templates: (prediction?.templates ?? []).map(
+      ({ text, chain, source }) => ({ text, chain, source })),
     // ...and everything `buildFoldArchive` reads, so "Download all" on a
     // restored session writes the same archive a live fold does.
     // 🔴 THE SUMMARY ONLY - THE MATRICES ARE ALREADY IN THE FRAMES. Storing

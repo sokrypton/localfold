@@ -570,3 +570,51 @@ every unit test passed. Measured through a saved session, on a 58 + 76 fold:
 
 **Still not exercised through a session:** OpenDDE and OpenBind-0, and anything
 long enough for the n^2 matrices and the frame count to matter together.
+
+### Templates travel; the alignment does not
+
+🔴 **A TEMPLATE IS INPUT, AND LOSING IT DESCRIBED A DIFFERENT JOB.** The record
+did not carry `templates`, so a restored prediction had `templates: undefined` -
+and by this file's own rule an ABSENT array means "this model has no such
+control", which is what drops the README's templates line entirely. An empty
+array means "none were used". Neither means "there were some and they are
+gone", which is what had happened. The archive also lost the template
+structures themselves.
+
+They travel now. Unlike the alignment they are small - a structure or three
+rather than a 3 MB a3m - and unlike the alignment they are a CHOSEN input: a
+fold that quietly forgot which template it was given is a different job from
+the one that ran, where a re-searched MSA is at least the same question asked
+again. `text` and `chain` are what the archive writes and `source` names the
+hit; `origin` is dropped, because it carries the live fetch's status and that
+request is long finished.
+
+Measured, `--template 1QYS_A` through a save and reload:
+
+| | |
+|---|---|
+| archive member | `templates/af3_1_template_hit_0_chains_a.pdb` |
+| README | `- templates: 1 used` |
+| session | 310,669 B raw, **70,458** gzipped |
+
+against 226,641 / 51,968 for the same fold with no template - so a template
+costs about 18 KB stored.
+
+### Every model and shape now through a session
+
+| | frames | panel | card | archive |
+|---|---|---|---|---|
+| AF3 | 16 | pae, contact | 71.2 / 0.39 | 5 members |
+| AF2-monomer | 2 | pae, contact | 61.9 / 0.32 | 5 |
+| AF2-multimer, 2 chains | 2 | pae, contact | 45.1 / 0.28 | 5 |
+| EF2-fast | 11 | contact | **hidden** | 5, `atom_certainty` |
+| OpenBind-0 | 16 | pae, contact | 61.3 / 0.34 | 5 |
+| OpenDDE | 16 | pae, contact | 83.6 / **no pTM** | 5 |
+| complex 58+76 | 16 | pae, contact | 50.3 / 0.33 | 5, `chain_ptm` [0.46, 0.54] |
+| ligand GOL | 16 | pae, contact | 75.7 / 0.48 | 5, **64 tokens** for 58 residues |
+| template 1QYS_A | 16 | pae, contact | 67.9 / 0.38 | 6, with `templates/` |
+
+And the state machine: folding again after a restore works - the button is
+live, `uniqueStem` gives `af3_1_2` rather than colliding with the restored
+`af3_1`, the record is overwritten with the new fold, and the offer row is
+re-asked so it does not go on advertising the old one.
