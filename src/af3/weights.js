@@ -271,11 +271,56 @@ export async function layer(store, name, index) {
 }
 
 /**
+ * A tensor's shape, as the SOURCE of a width rather than a literal beside it.
+ *
+ * 🔴 EVERY WIDTH IN THIS FILE USED TO BE A NUMBER TYPED NEXT TO THE TENSOR IT
+ * DESCRIBES, and AlphaFold 3 is not the only checkpoint this graph reads. A
+ * declared width is right for exactly one model and silent for every other: a
+ * bundle whose pair representation is 384 channels wide loads through
+ * `pairChannels: 128` without complaint, and what comes out is a kernel
+ * dispatched over a third of its own tensor. Deriving it turns fifteen
+ * declarations into fifteen assertions, and costs a shape lookup the store
+ * already has in memory.
+ */
+function dims(store, name) {
+  const shape = store.shape(name);
+  if (shape === undefined || shape.length === 0) {
+    throw new Error(`no shape for ${name}; a width cannot be derived from it`);
+  }
+  return shape;
+}
+
+/**
+ * A pairformer stack's four widths, from the two tensors that state them.
+ *
+ * `single_attention_q_projection/weights` is
+ * `[blocks, singleChannels, heads, dimension]` and `single_pair_logits_norm`
+ * is the pair representation the logits are read from. The two stacks that
+ * have a single track - the trunk pairformer and the confidence head's - are
+ * the only callers, and OpenDDE's structural-token refiner is a third with
+ * heads 8x48 where both of these are 16x24.
+ */
+function singleAttentionDims(store, root) {
+  const [, singleChannels, heads, dimension] =
+    dims(store, `${root}/single_attention_q_projection/weights`);
+  const [, pairChannels] = dims(store, `${root}/single_pair_logits_norm/scale`);
+  return [pairChannels, singleChannels, heads, dimension];
+}
+
+/**
  * The five pair-track modules, which every stack shares - as a DESCRIPTOR whose
  * leaves are thunks, not as decoded arrays. bind() turns one into an object.
+ *
+ * 🔴 THE GRID ATTENTION'S HEADS AND DIMENSION COME FROM ITS OWN PROJECTION.
+ * `q_projection/weights` is `[blocks, heads, dimension, channels]`, so all
+ * three numbers are in one shape - which is why they used to be passed in as
+ * two arguments and why the four call sites each carried a different pair (the
+ * trunk 4x32, the template stack 4x16). OpenDDE's are 12x32 in the trunk and
+ * 2x32 in the template stack, and nothing but the tensor says so.
  */
-function pairTrack(store, root, index, gridHeads, gridDimension) {
+function pairTrack(store, root, index) {
   const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
+  const [, gridHeads, gridDimension] = dims(store, `${root}/pair_attention1/q_projection/weights`);
   const triangle = (direction) => ({
     leftNormInputScale: at(`triangle_multiplication_${direction}/left_norm_input/scale`),
     leftNormInputOffset: at(`triangle_multiplication_${direction}/left_norm_input/offset`),
@@ -313,9 +358,17 @@ function pairTrack(store, root, index, gridHeads, gridDimension) {
 
 export async function embedderWeights(store) {
   const T = (name) => store.tensor(`${EVO}/${name}`);
+  // 🔴 THE RELATIVE ENCODING STATES BOTH ITS INPUT AND THE PAIR'S WIDTH. Its
+  // projection is `[relativeWidth, pairChannels]`, and it is the one tensor
+  // every AF3-lineage bundle has that names the pair track's width without
+  // going through a block stack.
+  const [relativeWidth, pairChannels] =
+    dims(store, `${EVO}/~_relative_encoding/position_activations/weights`);
+  const [, singleChannels] = dims(store, `${EVO}/single_activations/weights`);
+  const [targetFeatWidth, msaChannels] = dims(store, `${EVO}/extra_msa_target_feat/weights`);
   return {
-    pairChannels: 128, singleChannels: 384, msaChannels: 64,
-    targetFeatWidth: 447, relativeWidth: 139,
+    pairChannels, singleChannels, msaChannels,
+    targetFeatWidth, relativeWidth,
     leftSingle: await T("left_single/weights"),
     rightSingle: await T("right_single/weights"),
     prevEmbeddingNormScale: await T("prev_embedding_layer_norm/scale"),
@@ -337,12 +390,21 @@ export async function embedderWeights(store) {
 
 export async function templateWeights(store) {
   const T = (name) => store.tensor(name);
-  // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS 4 HEADS OF 16, not the trunk's
-  // 4 of 32: 64 channels rather than 128.
-  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0, 4, 16)),
-                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1, 4, 16))];
+  // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS NARROWER THAN THE TRUNK'S, and
+  // by a different factor in every checkpoint: AF3's is 4 heads of 16 against
+  // the trunk's 4 of 32, and OpenDDE's is 2 of 32 against the trunk's 12 of 32.
+  // Both come out at 64 channels and neither number is derivable from the
+  // other, so `pairTrack` reads them off `pair_attention1/q_projection`.
+  const blocks = [await bind(store, pairTrack(store, TEMPLATE_STACK, 0)),
+                  await bind(store, pairTrack(store, TEMPLATE_STACK, 1))];
+  // 🔴 AND THE QUERY WIDTH IS THE TRUNK PAIR'S, NOT THE STACK'S. The embedder
+  // reads the trunk's pair representation, normalises it and projects it DOWN
+  // into the stack - so `queryChannels` is 128 here and 384 under OpenDDE,
+  // while the stack it feeds stays 64 in both. `query_embedding_norm/scale` is
+  // the one tensor that states the input width on its own.
+  const [queryChannels] = dims(store, `${TEMPLATE_SINGLE}/query_embedding_norm/scale`);
   return {
-    queryChannels: 128, blocks,
+    queryChannels, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
@@ -369,11 +431,19 @@ export async function templateWeights(store) {
 
 export async function msaBlockWeights(store, index) {
   const at = (leaf) => stacked(store, `${MSA_STACK}/${leaf}`, index);
+  // `pair_logits/weights` is [blocks, pairChannels, heads] and `v_projection`
+  // [blocks, msaChannels, heads, valueDim] - so the MSA attention's own two
+  // widths and both of its head counts come out of its own tensors.
+  const [, pairChannels] = dims(store, `${MSA_STACK}/msa_attention1/pair_logits/weights`);
+  const [, msaChannels, msaHeads, msaDimension] =
+    dims(store, `${MSA_STACK}/msa_attention1/v_projection/weights`);
+  const [, , outerChannels] =
+    dims(store, `${MSA_STACK}/outer_product_mean/left_projection/weights`);
   return bind(store, {
-    pairChannels: 128, msaChannels: 64,
-    ...pairTrack(store, MSA_STACK, index, 4, 32),
+    pairChannels, msaChannels,
+    ...pairTrack(store, MSA_STACK, index),
     outerProductMean: {
-      outerChannels: 32,
+      outerChannels,
       layerNormInputScale: at("outer_product_mean/layer_norm_input/scale"),
       layerNormInputOffset: at("outer_product_mean/layer_norm_input/offset"),
       leftProjection: at("outer_product_mean/left_projection/weights"),
@@ -382,7 +452,7 @@ export async function msaBlockWeights(store, index) {
       outputB: at("outer_product_mean/output_b"),
     },
     msaAttention1: {
-      heads: 8, dimension: 8,
+      heads: msaHeads, dimension: msaDimension,
       actNormScale: at("msa_attention1/act_norm/scale"),
       actNormOffset: at("msa_attention1/act_norm/offset"),
       pairNormScale: at("msa_attention1/pair_norm/scale"),
@@ -403,14 +473,16 @@ export async function msaBlockWeights(store, index) {
 
 export async function pairformerBlockWeights(store, index) {
   const at = (leaf) => stacked(store, `${PAIRFORMER}/${leaf}`, index);
+  const [pairChannels, singleChannels, singleHeads, singleDimension] =
+    singleAttentionDims(store, PAIRFORMER);
   return bind(store, {
-    pairChannels: 128, singleChannels: 384,
-    ...pairTrack(store, PAIRFORMER, index, 4, 32),
+    pairChannels, singleChannels,
+    ...pairTrack(store, PAIRFORMER, index),
     singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
     singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
     singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
     singleAttention: {
-      heads: 16, dimension: 24,
+      heads: singleHeads, dimension: singleDimension,
       layerNormScale: at("single_attention_layer_norm/scale"),
       layerNormOffset: at("single_attention_layer_norm/offset"),
       qProjection: at("single_attention_q_projection/weights"),
@@ -430,22 +502,29 @@ export async function pairformerBlockWeights(store, index) {
 }
 
 export async function distogramWeights(store) {
-  return { halfLogits: await store.tensor("diffuser/distogram_head/half_logits/weights") };
+  const name = "diffuser/distogram_head/half_logits/weights";
+  const [pairChannels, bins] = dims(store, name);
+  return { halfLogits: await store.tensor(name), pairChannels, bins };
 }
 
 export async function confidenceWeights(store) {
   const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
+  const [stackPairChannels, stackSingleChannels, stackSingleHeads, stackSingleDimension] =
+    singleAttentionDims(store, CONFIDENCE_STACK);
+  const [targetFeatWidth, pairChannels] =
+    dims(store, `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
+  const [singleChannels] = dims(store, `${CONFIDENCE}/plddt_logits_ln/scale`);
   const blocks = [];
   for (let index = 0; index < 4; index += 1) {
     const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
     blocks.push(await bind(store, {
-      pairChannels: 128, singleChannels: 384,
-      ...pairTrack(store, CONFIDENCE_STACK, index, 4, 32),
+      pairChannels: stackPairChannels, singleChannels: stackSingleChannels,
+      ...pairTrack(store, CONFIDENCE_STACK, index),
       singlePairLogitsNormScale: at("single_pair_logits_norm/scale"),
       singlePairLogitsNormOffset: at("single_pair_logits_norm/offset"),
       singlePairLogitsProjection: at("single_pair_logits_projection/weights"),
       singleAttention: {
-        heads: 16, dimension: 24,
+        heads: stackSingleHeads, dimension: stackSingleDimension,
         layerNormScale: at("single_attention_layer_norm/scale"),
         layerNormOffset: at("single_attention_layer_norm/offset"),
         qProjection: at("single_attention_q_projection/weights"),
@@ -465,7 +544,7 @@ export async function confidenceWeights(store) {
   }
   return {
     dialect: af3Dialect(store),
-    pairChannels: 128, singleChannels: 384, targetFeatWidth: 447, blocks,
+    pairChannels, singleChannels, targetFeatWidth, blocks,
     leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
     rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
     distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
