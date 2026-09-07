@@ -57,9 +57,36 @@ describe("the job behind a saved session", () => {
   it("leaves a scoreless model's score absent", () => {
     const meta = jobMeta({ stem: "ef2_1", model: "ESMFold2",
       prediction: { chainLengths: [40], pdb: "END\n" }, sequence: "M" });
-    expect(meta.confidence.meanPlddt).toBe(undefined);
-    expect(meta.confidence.ptm).toBe(undefined);
+    // 🔴 THE WHOLE OBJECT IS ABSENT, not an object of undefined fields.
+    // EF2-fast stores no `confidence` at all - on purpose, since an object of
+    // zeros reads as the model's opinion - and `updateScoresCard` hides its
+    // box outright when handed undefined, which is the right answer for a
+    // model with no confidence head. A shell of undefined keys would instead
+    // draw the card with dashes in it, claiming the fold was scored and the
+    // numbers were lost.
+    expect(meta.confidence).toBe(undefined);
     expect(meta.residues).toBe(40);
+    // ...and the structure still travels, so its PDB button still works.
+    expect(meta.pdb).toBe("END\n");
+  });
+
+  /**
+   * 🔴 THE MATRICES GO IN AS PLAIN ARRAYS, because this record is gzipped
+   * through JSON and a Float32Array does not survive that: it comes back as
+   * `{"0":1.2,...}`, an object with numeric keys that every reader here treats
+   * as a matrix of undefined. Converted on the way in, so there is one shape
+   * to restore rather than two to tell apart.
+   */
+  it("stores the confidence matrices as plain arrays", () => {
+    const meta = jobMeta({ stem: "af3_1", model: "AlphaFold 3",
+      prediction: prediction([4]), sequence: "ACDE" });
+    expect(Array.isArray(meta.confidence.predictedAlignedError)).toBe(true);
+    expect(Array.isArray(meta.confidence.contactProbs)).toBe(true);
+    expect(meta.confidence.predictedAlignedError).toHaveLength(16);
+    // ...and they survive the round trip this record actually takes.
+    const back = JSON.parse(JSON.stringify(meta));
+    expect(back.confidence.predictedAlignedError).toHaveLength(16);
+    expect(back.confidence.predictedAlignedError[0]).toBe(1);
   });
 });
 

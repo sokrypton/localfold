@@ -408,3 +408,47 @@ it blamed `resolveMapFrame`'s backward search, which was wrong - the search was
 never reached. `heatmapObjectName` had returned null before it, so `_show` had
 no object at all. Reasoning down the call chain named the wrong function; the
 probe that printed `heatName` named the right one in a single run.
+
+### The structure travels, and the record is gzipped
+
+🔴 **BOTH DOWNLOAD BUTTONS WERE ON SCREEN AND BROKEN AFTER A RESTORE.**
+py2Dmol's session carries coordinates, element symbols and residue numbers -
+enough to DRAW a fold and not the text the fold produced - and both buttons
+read `prediction.pdb`. "PDB" wrote the word `undefined` into a file and "All"
+threw inside the archive builder. Rebuilding the text from the frames would be
+a second PDB writer to keep in step with the first, so the record carries the
+one the fold wrote, along with everything `buildFoldArchive` reads: the token
+layout, the confidences, the PAE and the contact map.
+
+🔴 **AND THE MATRICES GO IN AS PLAIN ARRAYS, BECAUSE THE RECORD IS JSON.** A
+Float32Array survives `structuredClone` and does not survive `JSON.stringify` -
+it returns as `{"0":1.2,...}`, an object with numeric keys that every reader
+here treats as a matrix of undefined. Converted going in and typed coming out,
+so there is one shape to restore rather than two to tell apart.
+
+🔴 **AND A RESTORED SESSION HAS NO ALIGNMENT TO INCLUDE, WHATEVER THE BUTTON
+ASKS FOR.** "Download all" asks for one because a live fold has one; the README
+still has to say the archive does not carry it rather than describe an `msas/`
+that is absent. `archiveFor` forces `alignmentOmitted` on a restored
+prediction - measured, `readmeOmits: true`.
+
+🔴 **GZIP IS WORTH 3.5x AND IS IN THE BROWSER ALREADY.** `CompressionStream`,
+measured on a real session: 358,152 bytes of JSON become **103,372**. The
+payload is rounded decimal coordinates repeated over every frame of a
+trajectory, and it grows with both the chain length and the sampler's step
+count - py2Dmol's own note records a 212 MB session for a 305,004-position
+structure, so this is not a small-case optimisation. The record went from
+188,767 bytes holding the answer alone to 103,372 holding the structure, the
+matrices and the whole trajectory. A stored `Uint8Array` also skips IndexedDB's
+structured clone of a deep object graph. Where `CompressionStream` is missing
+the object is stored as it is, and the reader tells the two apart by TYPE
+rather than by a flag that could disagree with the bytes.
+
+Measured after a reload and restore, with both buttons actually pressed:
+
+| | |
+|---|---|
+| PDB | 36,896 B, 467 ATOM records, no `undefined` |
+| All | 21,589 B zip, five members, `full_data` with `contact_probs` and `pae` |
+| README | says the alignment is not in this archive |
+| panel | visible, tabs `['pae','contact']` |

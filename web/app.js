@@ -3519,14 +3519,19 @@ element("download-pdb").addEventListener("click", () => {
  * the upload box to reproduce the fold, describing an `msas/` that is absent.
  */
 function archiveFor(pred, { includeAlignment = true } = {}) {
+  // 🔴 A RESTORED SESSION HAS NO ALIGNMENT TO INCLUDE, whatever the caller
+  // asked for. "Download all" asks for one because a live fold has one; the
+  // README must still say the archive does not carry it rather than describing
+  // an `msas/` that is absent - the third state, see web/fold-archive.js.
+  const holds = includeAlignment && pred.restored !== true;
   return buildFoldArchive({
     stem: pred.stem,
     model: pred.model ?? "AlphaFold",
     settings: pred.settings,
     entities: pred.entities,
-    msas: includeAlignment ? (pred.msas ?? {}) : {},
+    msas: holds ? (pred.msas ?? {}) : {},
     msaOrigin: pred.msaOrigin,
-    alignmentOmitted: !includeAlignment && pred.msaOrigin !== undefined,
+    alignmentOmitted: !holds && pred.msaOrigin !== undefined,
       // 🔴 NOT `?? []`, WHICH IS THE DIFFERENCE BETWEEN "none were used" AND
       // "this model has no such control". Defaulting it here silently undid
       // the distinction the archive was taught to make.
@@ -3755,20 +3760,43 @@ async function restoreSession() {
     // not carry it. Without this the structure returns with a blank score card:
     // `updateScoresCard` hides its box outright when handed undefined, and the
     // frames know coordinates and maps but not what the confidence head said.
+    // 🔴 THE MATRICES COME BACK AS Float32Array, NOT AS THE ARRAYS JSON HELD.
+    // `paeMatrix` recovers the stride with `Math.sqrt(values.length)` and every
+    // other reader takes a flat typed vector; a plain Array works by accident
+    // in some of them and not in others, which is worse than failing.
+    const typed = (values) => (values === undefined ? undefined : Float32Array.from(values));
+    const savedConfidence = meta?.confidence === undefined ? undefined : {
+      ...meta.confidence,
+      plddt: typed(meta.confidence.plddt),
+      predictedAlignedError: typed(meta.confidence.predictedAlignedError),
+      contactProbs: typed(meta.confidence.contactProbs),
+    };
+
+    // 🔴 EVERYTHING BOTH DOWNLOAD BUTTONS READ, or they are on screen and
+    // broken. "PDB" writes `prediction.pdb` and "All" runs the whole archive
+    // builder over it - the structure, the token layout, the confidences and
+    // the contact map - so a restored prediction missing any of them is a
+    // button that fails when pressed rather than one that is not offered.
+    // `msas` is deliberately absent: the alignment was never saved, and the
+    // archive says so through `alignmentOmitted` rather than pretending.
     const restored = {
       stem,
-      pdb: undefined,
+      pdb: meta?.pdb,
       model: meta?.model ?? "saved session",
       settings: meta?.settings,
       entities: meta?.entities,
       msaOrigin: meta?.msaOrigin,
       chains: (meta?.sequence ?? "").split(":").filter(Boolean),
       chainLengths: meta?.chainLengths ?? [],
-      confidence: meta?.confidence,
+      tokens: meta?.tokens,
+      confidence: savedConfidence,
+      contactSource: { contactProbs: savedConfidence?.contactProbs },
       restored: true,
     };
     predictions.set(stem, restored);
     lastPrediction = restored;
+    // ...and the buttons are shown only when there is something behind them.
+    element("downloads").style.display = restored.pdb === undefined ? "none" : "flex";
 
     // 🔴 THE MODULE'S OWN HANDLES ARE RE-POINTED. `refreshHeatmap` reads
     // `viewer` and `viewerObject`, which are set when a FOLD loads a structure
@@ -3777,7 +3805,7 @@ async function restoreSession() {
     viewer = renderer;
     viewerObject = renderer?.currentObjectName ?? stem;
 
-    updateScoresCard(meta?.confidence);
+    updateScoresCard(savedConfidence);
     // 🔴 AND THE PANEL IS TOLD. loadViewerState calls Heatmap.syncToDrawn, but
     // this page's panel is driven by `refreshHeatmap` off the module's own
     // handles - which is what the fold path calls and what the restore has to
