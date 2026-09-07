@@ -624,13 +624,29 @@ shapes. To get it back:
 |---|---|
 | AF3 fold, bit-identical | mean pLDDT **72.19283791929007**, pTM **0.5096721043810248** |
 | AF2 checksum | **-2105827** at 128 rows, **-2047044** at 512 with a recycle |
-| `npm test` | 860 |
-| OpenDDE, 6MRR | RMSD **1.399-1.639 A**, TM **0.904-0.917** |
-| OpenDDE, 1QYS | RMSD **0.902-0.956**, TM **0.939-0.945** |
+| `npm test` | **866** |
+| OpenDDE, 6MRR | RMSD **1.399-1.676 A**, TM **0.884-0.917** |
+| OpenDDE, 1QYS | RMSD **0.902-1.052**, TM **0.925-0.945** |
 | AlphaFold 3 chemistry, the control | protein bond ratio **1.009**, ligand rms **0.033 A** |
+| pLDDT ranking, `plddtVsError` | AF3 **-0.3484**, OpenDDE **-0.3063** on 6MRR |
 
 ...and the one that was missing, which is why the section below exists: a gate
 on RMSD and TM cannot see a bond length.
+
+**The other three models must stay bit-identical**, and are the gate on any
+change to `src/af3/featurise.js`, which all of them share:
+
+| | |
+|---|---|
+| ESMFold2, `tools/gpu/fold-esmfold2.js` | CA-CA **3.8060627434251515**, certainty **0.7924301467835904**, 27/27 contacts, peak 272.76 MiB |
+| OpenBind-0, `fold-opendde.js --model=/model-openbind0-int5/manifest.json` | pLDDT **77.3932004390278**, RMSD **1.963**, TM **0.82** |
+| AlphaFold 3, `fold.js --sequence=<6MRR>` | mean pLDDT **85.93504804019729**, pTM **0.7368081900126794** |
+| a ligand, `probe-ligand-flow.js --ligand=GOL --mode=diffusion --steps=64` | rms **0.03339435515711982** |
+| a modified residue, `probe-modified.js --code=SEP --at=3` | **0.838** against control **1.003** |
+
+🔴 **AND `tools/fold-in-page.py --model af3` / `--model opendde` IS THE ONE
+THAT CATCHES WHAT THE TOOLS CANNOT.** Three page-level TypeErrors in this port
+were found by driving the real page and by nothing else.
 
 `tools/gpu/fold-opendde.js` is the end-to-end tool and takes `--target`,
 `--length`, `--steps`, `--mode`, `--seed`, `--resident` / `--no-resident`,
