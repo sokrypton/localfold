@@ -481,15 +481,28 @@ export async function foldEsmfold2(device, options) {
           createAddShader(pairs * channels)),
       ]);
 
-    const relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
+    // 🔴 THE RELATIVE-POSITION ENCODING IS RECOMPUTED AFTER THE TRUNK, NOT
+    // HELD THROUGH IT. It is pair-sized - 87.9 MiB at 300 tokens - and it has
+    // exactly two readers: `z_init` here, and the diffusion conditioning after
+    // 96 block evaluations during which it sits idle. Holding it made it 14% of
+    // the fold's peak, which is now the TRUNK; recomputing it is one
+    // elementwise pass over a small table, about four milliseconds.
+    //
+    // 🔴 SO THE TABLE AND ITS WEIGHTS OUTLIVE `z_init` WHERE THE OTHER FOUR
+    // TERMS' INPUTS DO NOT. They are a few hundred KB against the 87.9 MiB
+    // they let go, which is the whole trade.
+    let relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
+    const relBins = keep(allocator.upload("esmfold2.rel-bins",
+      relativeRows(features, tokens), storage));
+    const relWeights = keep(allocator.upload("w.esmfold2.rel-pos",
+      weights.featuriser.relPos, storage));
+    const buildRelativePositions = () => submit("esmfold2.rel-pos", [
+      ["rel-pos", relative, [relBins, relWeights, relPos], ...elementwise(pairs * channels)],
+    ]);
     const zInit = keep(allocator.allocate("esmfold2.z-init", pairs * channels * 4, storage));
     const pair = keep(allocator.allocate("esmfold2.pair", pairs * channels * 4,
       storage | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST));
     await mark("z_init", async () => {
-      const bins = keep(allocator.upload("esmfold2.rel-bins",
-        relativeRows(features, tokens), storage));
-      const relWeights = keep(allocator.upload("w.esmfold2.rel-pos",
-        weights.featuriser.relPos, storage));
       const bondValues = keep(allocator.upload("esmfold2.bonds", features.tokenBonds, storage));
       const bondWeights = keep(allocator.upload("w.esmfold2.token-bonds",
         weights.featuriser.tokenBonds, storage));
@@ -504,16 +517,18 @@ export async function foldEsmfold2(device, options) {
         linear(sInputs, tokens, shape.singleInputs, channels,
                weights.featuriser.zInit2), storage));
       await submit("esmfold2.z-init", [
-        ["rel-pos", relative, [bins, relWeights, relPos], ...elementwise(pairs * channels)],
+        ["rel-pos", relative, [relBins, relWeights, relPos], ...elementwise(pairs * channels)],
         ["bonds", bond, [bondValues, bondWeights, bonds], ...elementwise(pairs * channels)],
         ["z-init", zInitShader, [rows, columns, relPos, bonds, lmPair, zInit],
          ...elementwise(pairs * channels)],
       ]);
-      for (const allocation of [bins, relWeights, bondValues, bondWeights, bonds,
-                                rows, columns, lmPair]) {
+      for (const allocation of [bondValues, bondWeights, bonds, rows, columns, lmPair]) {
         allocation.release();
         held.splice(held.indexOf(allocation), 1);
       }
+      // ...and the encoding itself, until the conditioning wants it back.
+      relPos.release();
+      held.splice(held.indexOf(relPos), 1);
     });
 
     advance(plan.embedder);
@@ -691,6 +706,16 @@ export async function foldEsmfold2(device, options) {
     await options.onContacts?.(contacts, certainty);
 
     // ---- the sampler.
+    // ...and the relative-position encoding comes back, into the buffer that
+    // becomes the pair conditioning. The table and its weights are what were
+    // kept through the trunk in its place; see where it is first built.
+    relPos = keep(allocator.allocate("esmfold2.rel-pos", pairs * channels * 4, storage));
+    await buildRelativePositions();
+    for (const allocation of [relBins, relWeights]) {
+      allocation.release();
+      held.splice(held.indexOf(allocation), 1);
+    }
+
     // 🔴 THE ELEMENT THE TOKEN TRANSFORMER'S WEIGHTS ARE HELD IN. Twelve
     // blocks are 459 MiB of a 799 MiB fold; see the note in
     // src/esmfold2/diffusion-webgpu.js for why this stack takes f16 and the
@@ -715,6 +740,14 @@ export async function foldEsmfold2(device, options) {
       // makes that safe. relPos stays in `held`, because it is now the
       // conditioning and the sampler reads it at every step.
       weights: weights.denoiser, features, sInputs, pair, relPos, reuseRelPos: true,
+      // 🔴 AND THE TRUNK'S PAIR IS DEAD ONCE THE CONDITIONING HAS READ IT. The
+      // distogram head ran before the denoiser and nothing after the sampler
+      // touches it, so the fold holds ONE pair-sized tensor through the
+      // sampler where it held three.
+      releasePair: () => {
+        pair.release();
+        held.splice(held.indexOf(pair), 1);
+      },
     }));
 
     // 🔴 THE DISTOGRAM IS OVER THE REPRESENTATIVE ATOM - CB, or CA for glycine,

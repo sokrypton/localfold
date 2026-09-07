@@ -702,6 +702,12 @@ export class Esmfold2DenoiserGpu {
    * @param pair     the trunk's final pair, as a device allocation
    * @param relPos   the same relative-position encoding z_init used, on device
    *
+   * @param releasePair called once the pair conditioning has consumed the
+   *   trunk's `pair`, which is the last pass here that reads it - the distogram
+   *   head ran before the denoiser and the per-block biases are derived from
+   *   the CONDITIONING, not from the pair. Another 87.9 MiB at 300 tokens, and
+   *   with the conditioning living in `relPos` it takes the sampler's
+   *   pair-sized residency from two tensors to one. The caller owns it.
    * @param reuseRelPos write the pair conditioning INTO `relPos` rather than
    *   allocating for it. OFF by default, because it DESTROYS the caller's
    *   buffer: `check-esmfold2-diffusion-gpu.js` prepares two arms from one
@@ -721,7 +727,8 @@ export class Esmfold2DenoiserGpu {
    * same element count alias without complaint, so the gate is the STRUCTURE:
    * a 300-token fold's PDB is sha256 83c0530b02f867ac with and without this.
    */
-  async prepare({ shape, weights, features, sInputs, pair, relPos, reuseRelPos = false }) {
+  async prepare({ shape, weights, features, sInputs, pair, relPos, reuseRelPos = false,
+                  releasePair }) {
     const { tokens, atoms, pairChannels, singleInputs, tokenChannels, tokenHeads,
             multiplier, atomChannels, atomHeads, atomBlocks, atomHidden, window } = shape;
     const pairs = tokens * tokens;
@@ -887,6 +894,8 @@ export class Esmfold2DenoiserGpu {
       }
       await this.#now("esmfold2.diff.pair-conditioning", passes);
     }
+    // ...and the trunk's pair is finished with; see `releasePair`.
+    releasePair?.();
     // 🔴 THE WIDENED SCRATCH GOES BACK BEFORE THE BIASES ARE ALLOCATED, NOT
     // AFTER. Only `scratchNorm` is read again (the bias loop normalises the
     // conditioning through it); the transition's four are dead here, and they
