@@ -753,6 +753,98 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     v[row * WIDTH + out] = v_total;
   }
 }`;
+  // 🔴 OpenDDE CHAINS THE TWO ADAPTIVE LAYERNORMS, AND THIS IS THE FIRST HALF
+  // WRITTEN OUT. AlphaFold 3 normalises the RAW activation once per side;
+  // OpenDDE's `AttentionPairBias` reassigns - `a = layernorm_a(a, s)` then
+  // `kv = layernorm_kv(a, s)` reading the ALREADY-NORMALISED a. The key
+  // projection below fuses its own normalisation into itself, so the way to
+  // chain without touching it is to hand it a pre-normalised activation: this
+  // kernel writes `adaLN_q(act)` and the caller binds that in place of `act`.
+  // The QUERY projection still reads the raw one, which is what makes it a
+  // chain rather than a substitution.
+  //
+  // Written one workgroup per row rather than over a tile like its fused
+  // sibling: it runs once per block on the query rows alone, and a shape this
+  // simple is one that can be read against the reference.
+  const normaliseQueries = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> normalised: array<f32>;
+
+var<workgroup> cond: array<f32, ${channels}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+  let base = row * C;
+
+  // The activation's own mean and variance, and the conditioning's.
+  var sum_a = 0.0;
+  var sum_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    sum_a += act[base + c];
+    sum_b += queries_cond[base + c];
+  }
+  reduce_a[local] = sum_a;
+  reduce_b[local] = sum_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C);
+  let cond_mean = reduce_b[0] / f32(C);
+  workgroupBarrier();
+
+  var var_a = 0.0;
+  var var_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    let d = act[base + c] - mean;
+    let e = queries_cond[base + c] - cond_mean;
+    var_a += d * d;
+    var_b += e * e;
+  }
+  reduce_a[local] = var_a;
+  reduce_b[local] = var_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let inverse = inverseSqrt(reduce_a[0] / f32(C) + EPSILON);
+  let cond_inverse = inverseSqrt(reduce_b[0] / f32(C) + EPSILON);
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    cond[c] = (queries_cond[base + c] - cond_mean) * cond_inverse
+      * weights[W_qSingleCondLayerNormScale + c];
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    var scale_value = weights[W_qSingleCondScaleBias + c];
+    var shift = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      scale_value += cond[d] * weights[W_qSingleCondScaleWeights + d * C + c];
+      shift += cond[d] * weights[W_qSingleCondBias + d * C + c];
+    }
+    normalised[base + c] = 1.0 / (1.0 + exp(-scale_value))
+      * ((act[base + c] - mean) * inverse) + shift;
+  }
+}`;
+
   const projectKeysAtoms = conditionedProject("k", {
     bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
@@ -1119,7 +1211,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  return { project, projectKeys, projectKeysAtoms, expandKeys,
+  return { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
            attendFor, output, maskAct, aggregate, outputRowTile };
 }
 
@@ -1172,6 +1264,18 @@ export class Af3AtomEncoderGpu {
         + "the atom-pair conditioning once for the stack, OpenDDE once per block");
     }
     const perBlockPair = weights.pairNormPerBlock;
+    // 🔴 THE CHAINING IS THE BLOCK'S, AND EVERY BLOCK IN A STACK AGREES. It is
+    // read off block 0 and asserted across the rest, because a stack whose
+    // blocks disagreed would be a bundle assembled from two dialects - which
+    // nothing else here would notice.
+    const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
+    if (chainedNorm === undefined) {
+      throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
+        + "normalises the raw activation on both sides, OpenDDE chains them");
+    }
+    if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
+      throw new Error("this atom stack's blocks disagree about chainedAtomLayerNorm");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
@@ -1181,7 +1285,7 @@ export class Af3AtomEncoderGpu {
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
-      + `:${perBlockPair}`;
+      + `:${perBlockPair}:${chainedNorm}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -1409,6 +1513,9 @@ export class Af3AtomEncoderGpu {
       const k = alloc("atom.k", keyRows * width * 4);
       const v = alloc("atom.v", keyRows * width * 4);
       // ...one row an ATOM, expanded into the key layout below.
+      // Only where the dialect chains; see the note at the dispatch.
+      const normalisedQueries = chainedNorm
+        ? alloc("atom.normalised-queries", queryRows * channels * 4) : null;
       const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
@@ -1512,8 +1619,19 @@ export class Af3AtomEncoderGpu {
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project,
             [act, queriesCond, w, q, gate], perOutput[0], perOutput[1]);
+        // 🔴 CHAINED, SO THE KEYS NORMALISE THE NORMALISED QUERIES. Under stock
+        // AF3 both sides read `act` and this extra pass does not run at all,
+        // which is what keeps that path unchanged.
+        let keySource = act;
+        if (chainedNorm) {
+          const perQueryRow = spread(queryRows);
+          run(`normalise-queries-${index}`, compiled.normaliseQueries,
+              [act, queriesCond, w, normalisedQueries],
+              perQueryRow[0], perQueryRow[1]);
+          keySource = normalisedQueries;
+        }
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
+            [keySource, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);

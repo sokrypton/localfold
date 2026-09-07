@@ -142,6 +142,14 @@ export async function main(device, args) {
   // dialect off the weights rather than from the caller), so an ablation has to
   // reach it too or it would silently keep the bundle's own answer.
   weights.trunk.embedder = { ...weights.trunk.embedder, dialect };
+  // 🔴 AND THE ATOM BLOCKS, WHICH CARRY THEIR OWN COPY. They are stamped at
+  // load time from the bundle's dialect, so an ablation that changed only the
+  // caller's copy would leave the target_feat encoder running the bundle's own
+  // answer - and both arms would report the same number, which is what "the
+  // branch does not matter" also looks like.
+  for (const block of weights.targetFeat.encoder.blocks) {
+    block.chainedAtomLayerNorm = dialect.chainedAtomLayerNorm;
+  }
   const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
 
   const pairChannels = weights.trunk.embedder.pairChannels;

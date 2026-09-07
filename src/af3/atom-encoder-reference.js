@@ -134,8 +134,24 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
   const keyRows = subsets * keys;
   const scale = 1 / Math.sqrt(dimension);
 
-  const keysAct = convert(queriesToKeys, queriesAct, channels);
+  // 🔴 THE TWO ADAPTIVE LAYERNORMS ARE PARALLEL OR CHAINED, AND THAT IS THE
+  // MODEL. AlphaFold 3 normalises the RAW activation twice, once per side.
+  // OpenDDE reassigns: its `AttentionPairBias` in cross-attention mode runs
+  //
+  //     a  = layernorm_a(a, s)     // the queries
+  //     kv = layernorm_kv(a, s)    // <- the ALREADY-NORMALISED a
+  //
+  // so the gather onto the key layout happens BETWEEN the two, and the second
+  // norm re-centres and re-scales a tensor whose statistics the first already
+  // fixed - while seeing the first one's learned scale. Two chained LayerNorms
+  // are not one, and neither arrangement changes a shape.
+  if (weights.chainedAtomLayerNorm === undefined) {
+    throw new Error("weights.chainedAtomLayerNorm has no default: AF3 "
+      + "normalises the raw activation on both sides, OpenDDE chains them");
+  }
   const xq = adaptiveLayerNorm(queriesAct, queriesCond, queryRows, channels, weights, "q");
+  const keysAct = convert(queriesToKeys,
+                          weights.chainedAtomLayerNorm ? xq : queriesAct, channels);
   const xk = adaptiveLayerNorm(keysAct, keysCond, keyRows, channels, weights, "k");
 
   const width = heads * dimension;
