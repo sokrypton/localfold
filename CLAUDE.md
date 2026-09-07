@@ -77,6 +77,9 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| ...and a MODIFIED residue? | `tools/fold-in-page.py --model af3 --modify SEP@3` |
+| **Does the archive describe the job it wrote?** | `tools/fold-in-page.py --job-round-trip` (folds, WIPES the rows, drops the zip back) |
+| Which of AlphaFold 3's own example jobs load here? | `node --test test/af3-example-jobs.test.js` (8 of 14; the other 6 name their field) |
 | **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
 | Does the diffusion module agree, module by module? | `node tools/check-esmfold2-diffusion.js` |
