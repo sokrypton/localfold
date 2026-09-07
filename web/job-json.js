@@ -108,11 +108,66 @@ function ptmCode(type, where) {
  * chains fold perfectly well on their own.
  */
 const ENTRY_TYPES = {
-  protein: "protein", proteinChain: "protein",
-  dna: "dna", dnaSequence: "dna",
-  rna: "rna", rnaSequence: "rna",
-  ligand: "ligand",
+  proteinChain: { type: "protein", dialect: "alphafoldserver" },
+  dnaSequence: { type: "dna", dialect: "alphafoldserver" },
+  rnaSequence: { type: "rna", dialect: "alphafoldserver" },
+  // 🔴 AN ION IS ITS OWN ENTRY IN THE SERVER'S DIALECT. `{"ion": {"ion": "MG"}}`
+  // is how AlphaFold Server spells a magnesium - `Ligand.from_alphafoldserver_dict`
+  // takes `ligand` or `ion` and treats them alike - and reading only `ligand`
+  // refused every real server job with a metal in it, which is half of what the
+  // ligand menu here exists for. The example corpus could not catch this: all
+  // fourteen of those files are the OTHER dialect.
+  ion: { type: "ligand", dialect: "alphafoldserver" },
+  // 🔴 `ligand` IS THE ONE KEY BOTH DIALECTS USE, and they mean different
+  // bodies by it: `{"ligand": "GOL", "count": 1}` on the server against
+  // `{"id": "B", "ccdCodes": ["GOL"]}` in the open-source one. Which set of
+  // fields is legal therefore comes from the BODY, not from the entry key -
+  // resolved in readEntry.
+  ligand: { type: "ligand", dialect: null },
+  protein: { type: "protein", dialect: "alphafold3" },
+  dna: { type: "dna", dialect: "alphafold3" },
+  rna: { type: "rna", dialect: "alphafold3" },
 };
+
+/**
+ * The keys each kind of entry may carry, copied from AlphaFold 3's own
+ * `folding_input.py`.
+ *
+ * 🔴 AN UNKNOWN KEY IS REFUSED, BECAUSE ALPHAFOLD 3 REFUSES IT. Every one of
+ * these classes calls `_validate_keys` and raises on anything else, so being
+ * lenient here is not being generous - it is folding a job the reference
+ * implementation would not have run, from a file whose extra key was probably a
+ * typo for one that matters. `glycans` and `maxTemplateDate` are in the
+ * server's list AND refused by name below, exactly as upstream does it.
+ */
+const ALLOWED_KEYS = {
+  alphafoldserver: {
+    protein: ["sequence", "glycans", "modifications", "count",
+              "maxTemplateDate", "useStructureTemplate"],
+    dna: ["sequence", "modifications", "count"],
+    rna: ["sequence", "modifications", "count"],
+    ligand: ["ligand", "ion", "count"],
+  },
+  alphafold3: {
+    protein: ["id", "sequence", "modifications", "description", "unpairedMsa",
+              "unpairedMsaPath", "pairedMsa", "pairedMsaPath", "templates"],
+    dna: ["id", "sequence", "modifications", "description"],
+    rna: ["id", "sequence", "modifications", "description", "unpairedMsa",
+          "unpairedMsaPath"],
+    ligand: ["id", "ccdCodes", "smiles", "description"],
+  },
+};
+
+/** The keys a template entry may carry, likewise from folding_input.py. */
+const TEMPLATE_KEYS = ["mmcif", "mmcifPath", "queryIndices", "templateIndices"];
+
+function checkKeys(body, allowed, where) {
+  const unknown = Object.keys(body).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    refuse(`${where}: ${unknown.join(", ")} is not a field of this entry`
+      + ` - AlphaFold 3 takes ${allowed.join(", ")}`);
+  }
+}
 
 /** How many copies an entry asks for: a `count`, or the length of an id list. */
 function copiesOf(body, where) {
@@ -179,6 +234,7 @@ function readTemplates(body, where) {
     refuse(`${where}: mmcifPath points at a file beside the JSON, which a page`
       + " cannot read - inline the mmCIF or pick a template on the row");
   }
+  checkKeys(template, TEMPLATE_KEYS, `${where} template`);
   for (const field of ["queryIndices", "templateIndices"]) {
     if (template[field] !== undefined && template[field] !== null) {
       refuse(`${where}: ${field} sets the template's residue mapping, and this`
@@ -201,12 +257,29 @@ function readEntry(entry, index, state) {
       + " kind of chain");
   }
   const [key] = keys;
-  const type = ENTRY_TYPES[key];
-  if (type === undefined) {
+  const entryType = ENTRY_TYPES[key];
+  if (entryType === undefined) {
     refuse(`sequences[${index}]: "${key}" is not a chain kind this page reads`);
   }
+  const { type } = entryType;
   const body = entry[key] ?? {};
   const where = `sequences[${index}] (${key})`;
+  const dialect = entryType.dialect
+    ?? (body.ligand !== undefined || body.ion !== undefined
+        ? "alphafoldserver" : "alphafold3");
+  checkKeys(body, ALLOWED_KEYS[dialect][type], where);
+  // 🔴 REFUSED BY NAME, THE WAY UPSTREAM REFUSES THEM. Both are in the server's
+  // allowed set and both raise in folding_input.py: a glycan is chemistry this
+  // page does not build, and a template date CHANGES WHICH TEMPLATE IS FOUND,
+  // so honouring the sequence and dropping the date folds a different job.
+  if (body.glycans !== undefined && body.glycans !== null) {
+    refuse(`${where}: \`glycans\` is not supported in this dialect, upstream`
+      + " included");
+  }
+  if (body.maxTemplateDate !== undefined && body.maxTemplateDate !== null) {
+    refuse(`${where}: \`maxTemplateDate\` chooses which template is found, and`
+      + " this page has no such control");
+  }
   const copies = copiesOf(body, where);
 
   if (type === "ligand") {
@@ -214,7 +287,12 @@ function readEntry(entry, index, state) {
       refuse(`${where}: \`smiles\` names a ligand by structure, and this page`
         + " folds ligands by CCD code");
     }
-    const codes = body.ccdCodes ?? (body.ligand === undefined ? [] : [body.ligand]);
+    // 🔴 THE SERVER'S OWN SPELLING CARRIES A `CCD_` PREFIX, WHICH UPSTREAM
+    // STRIPS. `Ligand.from_alphafoldserver_dict` does `removeprefix('CCD_')`,
+    // so `"ligand": "CCD_ATP"` is ATP - kept whole it becomes a five-letter
+    // code this page would go and fetch a component for, and not find.
+    const named = body.ligand ?? body.ion;
+    const codes = body.ccdCodes ?? (named === undefined ? [] : [named]);
     const list = Array.isArray(codes) ? codes : [codes];
     if (list.length === 0) refuse(`${where}: a ligand with no code`);
     // 🔴 SEVERAL CODES IN ONE ENTRY IS ONE CHAIN OF SEVERAL COMPONENTS, not
@@ -225,8 +303,8 @@ function readEntry(entry, index, state) {
       refuse(`${where}: ccdCodes lists ${list.length} components as one bonded`
         + " chain, and this page folds one code per ligand");
     }
-    return { type: "ligand", value: String(list[0]).trim().toUpperCase(),
-             copies, modifications: [] };
+    const code = String(list[0]).trim().toUpperCase().replace(/^CCD_/, "");
+    return { type: "ligand", value: code, copies, modifications: [] };
   }
 
   const sequence = body.sequence;

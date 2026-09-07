@@ -16,10 +16,22 @@
  * DeepMind's service. Shipping it verbatim out of a different program would
  * misstate who is promising what to whom. README.md says what actually ran.
  *
- * 🔴 A FIELD WE DO NOT COMPUTE IS LEFT OUT, NOT FILLED IN. `has_clash` and
- * `chain_pair_pae_min` are both cheap to invent and would be read as the
- * model's opinion of the structure. An absent key is a question that was not
- * asked; a zero is an answer.
+ * 🔴 A FIELD WE DO NOT COMPUTE IS LEFT OUT, NOT FILLED IN. `has_clash` is
+ * cheap to invent and would be read as the model's opinion of the structure.
+ * An absent key is a question that was not asked; a zero is an answer.
+ *
+ * 🔴 THIS ENTRY USED TO NAME `chain_pair_pae_min` TOO, AND HAD STOPPED BEING
+ * TRUE. That one is not invented - it is the minimum over ordered pairs of a
+ * PAE we already have - so it is computed and written, and checked against the
+ * server's own values for the reference archive. Found by diffing what this
+ * file WRITES against that archive rather than by reading this comment.
+ *
+ * 🔴 AND TWO KEYS ARE OURS, NOT THE SERVER'S: `chain_pair_max_contact`, which
+ * is what a model with no confidence head can still say about an interface,
+ * and `mean_plddt`, which the server leaves for the reader to average. Extra
+ * keys are safe where a missing one is not - a reader of the server's format
+ * ignores what it does not know - but they are named here so nobody takes this
+ * file for byte-identical.
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
 import { jobRequestJson } from "./job-json.js";

@@ -64,6 +64,88 @@ describe("reading the server's own dialect", () => {
   });
 });
 
+/**
+ * 🔴 CHECKED AGAINST AlphaFold 3'S OWN PARSER, NOT AGAINST THE DOCUMENTATION.
+ * These four came out of reading `folding_input.py` - the code that actually
+ * reads these files - after the writer was checked against it. Every one of
+ * them is a real AlphaFold Server export this reader got wrong, and NOT ONE
+ * could be caught by the example corpus, because all fourteen of those files
+ * are the other dialect.
+ */
+describe("what AlphaFold 3's own parser does with the server's files", () => {
+  // 🔴 AN ION IS ITS OWN ENTRY. `Ligand.from_alphafoldserver_dict` takes
+  // `ligand` or `ion` alike, and reading only the first refused every server
+  // job with a magnesium in it - which is half of what the ligand menu here is
+  // for. See COMMON_IONS in web/entities.js.
+  it("reads an ion entry as a ligand", () => {
+    const job = jobFromJson(server([
+      { proteinChain: { sequence: "ACDEFGHIK", count: 1 } },
+      { ion: { ion: "MG", count: 2 } },
+    ]));
+    expect(job.entities[1].type).toBe("ligand");
+    expect(job.entities[1].value).toBe("MG");
+    expect(job.entities[1].copies).toBe(2);
+  });
+
+  // ...and upstream strips the prefix, so a code kept whole would be a
+  // five-letter component this page fetches and does not find.
+  it("strips the CCD_ prefix upstream strips", () => {
+    const job = jobFromJson(server([
+      { proteinChain: { sequence: "ACDEFGHIK", count: 1 } },
+      { ligand: { ligand: "CCD_ATP", count: 1 } },
+    ]));
+    expect(job.entities[1].value).toBe("ATP");
+  });
+
+  // Both of these are in the server's allowed key set AND raise in
+  // folding_input.py. A glycan is chemistry this page does not build; a
+  // template date changes which template is found, so dropping it folds a
+  // different job with the same sequence.
+  for (const [field, value] of [["glycans", [{ residues: "NAG" }]],
+                                ["maxTemplateDate", "2021-09-30"]]) {
+    it(`refuses ${field}, as upstream does`, () => {
+      expect(refusal(server([{ proteinChain: {
+        sequence: "ACDEFGHIK", count: 1, [field]: value } }]))).toContain(field);
+    });
+  }
+
+  /**
+   * 🔴 AN UNKNOWN KEY IS REFUSED BECAUSE ALPHAFOLD 3 REFUSES IT. Every chain
+   * class upstream calls `_validate_keys` and raises on anything else, so
+   * reading past one is not generosity - it folds a job the reference
+   * implementation would not have run, from a file whose stray key is most
+   * likely a misspelling of one that matters.
+   */
+  it("refuses a key AlphaFold 3 would refuse", () => {
+    expect(refusal(server([{ proteinChain: {
+      sequence: "ACDEFGHIK", count: 1, useStructureTemplates: true } }])))
+      .toContain("useStructureTemplates");
+  });
+
+  // ...and the same for a template's own keys.
+  it("refuses an unknown template key", () => {
+    expect(refusal(open([{ protein: { id: "A", sequence: "ACDEFGHIK",
+      templates: [{ mmcif: "data_T", maxDate: "2021-09-30" }] } }])))
+      .toContain("maxDate");
+  });
+
+  /**
+   * 🔴 AND `ligand` IS THE ONE KEY BOTH DIALECTS USE, meaning different bodies.
+   * Which fields are legal comes from the body, not the entry key - keyed off
+   * the key alone, this page's OWN archive stopped being readable.
+   */
+  it("reads a ligand in either dialect's spelling", () => {
+    const fromServer = jobFromJson(server([
+      { proteinChain: { sequence: "ACDEFGHIK", count: 1 } },
+      { ligand: { ligand: "GOL", count: 1 } }]));
+    const fromOpen = jobFromJson(open([
+      { protein: { id: "A", sequence: "ACDEFGHIK" } },
+      { ligand: { id: "B", ccdCodes: ["GOL"] } }]));
+    expect(fromServer.entities[1].value).toBe("GOL");
+    expect(fromOpen.entities[1].value).toBe("GOL");
+  });
+});
+
 describe("reading the open-source dialect", () => {
   it("reads a chain and an integer seed", () => {
     const job = jobFromJson(open([{ protein: { id: "A", sequence: "ACDEFGHIK" } }]));

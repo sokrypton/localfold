@@ -779,3 +779,52 @@ That is a real loss, asserted in `test/job-json.test.js` rather than left to be
 discovered by somebody whose re-fold used a different structure than the one
 they picked. The open-source dialect could carry it; writing that one would
 cost the archive's file-for-file claim.
+
+### Checked against AlphaFold 3's parser, not against its documentation
+
+The writer was diffed against `tools/fixtures/fold_2026_09_01_10_17.zip` and
+against `src/alphafold3/common/folding_input.py` - **the code that actually
+reads these files**. The writer came out clean:
+
+| written | upstream says |
+|---|---|
+| top-level `name, modelSeeds, sequences, dialect, version` | exactly its allowed set, and `dialect`+`version` must both be present or both absent |
+| `modelSeeds: ["42"]` | `int(seed)` over the list, so strings are right |
+| `count` on a chain | how it expands copies |
+| `useStructureTemplate: false` | read as "use no templates" - a meaningful false, not noise |
+| `ptmType: "CCD_SEP"` | `mod['ptmType'].removeprefix('CCD_')` |
+| `full_data_0.json` keys | identical set and order to the reference archive's |
+
+🔴 **AND THE SAME READING FOUND THREE BUGS IN THE READER, NONE OF WHICH THE
+EXAMPLE CORPUS COULD CATCH** - all fourteen of those files are the open-source
+dialect, and every one of these is about the server's:
+
+1. **An `ion` entry was refused.** AlphaFold Server spells a magnesium
+   `{"ion": {"ion": "MG", "count": 1}}`, and `Ligand.from_alphafoldserver_dict`
+   takes `ligand` or `ion` alike. Reading only `ligand` refused every real
+   server job with a metal in it - half of what `COMMON_IONS` exists for.
+2. **`CCD_ATP` stayed whole.** Upstream does `removeprefix('CCD_')`; kept, it
+   is a five-letter code this page would fetch a component for and not find.
+3. **`glycans` and `maxTemplateDate` were ignored.** Both are in the server's
+   allowed key set and both RAISE upstream. A glycan is chemistry this page does
+   not build; a template date changes which template is found, so honouring the
+   sequence and dropping the date folds a different job.
+
+Unknown keys are refused now, per entry kind, with the allowed sets copied from
+`folding_input.py` - upstream calls `_validate_keys` and raises, so leniency
+here would fold a job the reference implementation would not have run.
+
+🔴 **`ligand` IS THE ONE ENTRY KEY BOTH DIALECTS USE** and they mean different
+bodies by it - `{"ligand": "GOL", "count": 1}` against
+`{"id": "B", "ccdCodes": ["GOL"]}`. Which fields are legal comes from the BODY.
+Keyed off the entry name alone, this page's own archive stopped being readable,
+which is how the mistake surfaced.
+
+### One stale comment, found by diffing rather than reading
+
+`fold-archive.js`'s header claimed `has_clash` **and** `chain_pair_pae_min`
+were both left out as uncomputed. `has_clash` still is. `chain_pair_pae_min`
+has been computed and written for some time - it is the minimum over ordered
+pairs of a PAE we already have, with the server's own values quoted in the code
+beside it. The comment was corrected, and it names the two keys that are ours
+rather than the server's: `chain_pair_max_contact` and `mean_plddt`.
