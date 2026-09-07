@@ -3662,7 +3662,15 @@ async function rememberSession(pred) {
     const saved = await saveSession(state);
     if (saved === "quota") {
       status("no room to save this session - clear site data to save again", true);
+      return;
     }
+    // 🔴 AND THE OFFER IS RE-ASKED, because the record it describes has just
+    // been replaced. A page that restored a session and then folded something
+    // else left the row on screen still advertising the OLD fold - by then the
+    // save had already overwritten it, so pressing Restore would have brought
+    // back the new fold under the old fold's description. Re-asking hides the
+    // row, which is the right answer: what is saved is what is on screen.
+    void offerSession();
   } catch (error) {
     // ...a fold that cannot be saved is still a fold on screen.
     console.warn("could not save this session", error);
