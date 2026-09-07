@@ -153,16 +153,19 @@ export async function main(device, args = []) {
     // token transformer's output is an activation that an adaLN renormalises,
     // so the error it carries is not the error its weights carry - and a single
     // bound wide enough for both would stop checking the f32 path at all.
-    const limit = (precision === "f32" ? bound * 3 : bound)
-      * (weightPrecision === "f16" ? 8 : 1);
+    // 🔴 AND FROM WHAT THE DENOISER SAYS IT RAN, not from what this asked for.
+    // A bare arm leaves the precision to the stack, and naming the shipped one
+    // here would make this agree with itself the moment that default moved.
+    const ran = denoiser.weightPrecision;
+    const limit = (precision === "f32" ? bound * 3 : bound) * (ran === "f16" ? 8 : 1);
     const ok = score <= limit;
     if (!ok) failures += 1;
-    results.push({ precision, weightPrecision: weightPrecision ?? "default",
+    results.push({ precision, weightPrecision: weightPrecision ?? "default", ran,
                    relRMS: score, ok, bound: limit,
                    firstStepMilliseconds: elapsed, warmStepMilliseconds: warm,
                    peakMebibytes: memory.peakBytes / 1048576 });
     console.log(`  ${precision.padEnd(6)} relRMS ${score.toExponential(3)}   `
-      + `weights ${(weightPrecision ?? "default").padEnd(7)} `
+      + `weights ${ran.padEnd(4)} `
       + `bound ${limit.toExponential(1)}   ${ok ? "ok" : "FAILED"}   `
       + `${elapsed.toFixed(0)} ms cold, ${warm.toFixed(0)} ms warm`);
   }

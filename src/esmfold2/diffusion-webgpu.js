@@ -588,6 +588,10 @@ export class Esmfold2DenoiserGpu {
     // pipeline the f32 buffer - the right element count at twice the bytes,
     // which nothing validates.
     const weightPrecision = this.#weightPrecision();
+    // 🔴 REPORTED, NOT ASKED FOR. A checker that names the shipped precision in
+    // its own bound agrees with itself the moment the default moves; one that
+    // reads what the stack RAN does not. See check-esmfold2-diffusion-gpu.js.
+    this.weightPrecision = weightPrecision;
     const key = `esmfold2-diff:${tokens}:${atoms}:${pairChannels}:${tokenChannels}:`
       + `${tokenHeads}:${multiplier}:${atomChannels}:${atomHeads}:${window}:${weightPrecision}`;
     const get = (name, code) => this.cache.get(`${key}:${name}`, code);
