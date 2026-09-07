@@ -2533,14 +2533,19 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
     : fittedPdb(result.features.batch, finalDense, reference,
                 slots ?? alphaCarbons(result.features.batch), bFactors));
   const contactMap = contactMapFor(result.contacts);
-  // 🔴 THIS MODEL HAS NO CONFIDENCE HEAD, SO THE pAE IS ESTIMATED FROM ITS
-  // DISTOGRAM. It is a real predicted aligned error - see
-  // src/esmfold2/aligned-error.js - and it is what says whether two parts of
-  // the fold are placed correctly relative to each other, which neither the
-  // contact map nor the per-token certainty answers. It orders pairs WITHIN
-  // this fold; its absolute angstroms regress to the global mean and do not
-  // compare across folds.
-  const paeMap = paeMapFor(result.alignedError);
+  // 🔴 THE ESTIMATED pAE IS NOT DRAWN, AND THE REASON IS MEASURED. It orders
+  // pairs WITHIN a fold at 0.746 against AlphaFold 3's real PAE - genuinely
+  // useful - and ACROSS folds it is INVERTED, at -0.867. Three random sequences
+  // that fold to nothing (0-3 contacts, certainty 0.53-0.62) score 6.6-7.1 A
+  // where two real proteins that fold well score 8.7-8.8; ubiquitin with its
+  // language model removed collapses to 0 contacts and certainty 0.42 and its
+  // pAE IMPROVES, 8.84 -> 7.97. A panel that looks BETTER on a failed fold is
+  // the worst possible panel, because the fold somebody checks the PAE on is
+  // the one they doubt - the same reason the per-residue certainty colour was
+  // measured and not shipped. `src/esmfold2/aligned-error.js` and
+  // `tools/pae-transfer.py` keep the estimator and the numbers; nothing draws
+  // it until the inversion is fixed.
+  const paeMap = undefined;
   // 🔴 THE CAMERA IS SAVED ACROSS THE RELOAD, OR THE VIEW JUMPS AT THE END.
   // `loadIntoViewer` ingests a FILE, and py2Dmol orients the camera when it
   // parses one - so the trajectory the reader has been watching, and possibly
@@ -3452,12 +3457,8 @@ element("download-all").addEventListener("click", async () => {
         pdb: pred.pdb,
         chainLengths: pred.chainLengths,
         tokens: pred.tokens,
-        // 🔴 BESIDE `confidence`, NOT INSIDE IT. A model with no confidence
-        // head still has this - it is estimated from the distogram, not
-        // predicted - and putting it in the object every reader tests for would
-        // make EF2-fast look like it has a head. See fullDataJson, which writes
-        // it under `estimated_aligned_error` for the same reason.
-        alignedError: pred.alignedError,
+        // ...no `alignedError`: it inverts across folds. See the note at
+        // `paeMap` in the EF2-fast path, and aligned-error.js.
         confidence: {
           ...pred.confidence,
           // ...a model with no confidence head still has these two.

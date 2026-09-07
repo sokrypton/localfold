@@ -656,7 +656,11 @@ export async function foldEsmfold2(device, options) {
           // TRUNK HERE. The moments are three floats a pair and are computed on
           // the device beside the contacts; the estimate itself is assembled
           // after the sampler, because half its features are distances.
-          wantMoments: options.alignedError !== false,
+          // 🔴 OPT-IN, because nothing draws it. See aligned-error.js: the
+          // estimate inverts across folds, so the page does not show it, and a
+          // pass plus three pair-sized buffers for a matrix nobody reads is
+          // pure cost. `tools/pae-transfer.py` is what asks for it.
+          wantMoments: options.alignedError === true,
           retainForFrames: options.frameCertainty === true })));
     const contacts = distogram?.contacts;
     const distogramMoments = distogram?.moments;

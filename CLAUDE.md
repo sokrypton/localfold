@@ -2955,33 +2955,60 @@ bin is open-ended, so it cannot tell 30 A from 60 while PAE runs to 32.
 honest than letting a fit discover it - and it is why the estimator's worst
 targets are the ones whose PAE is largest.
 
-🔴 **AND IT IS ON THE PAGE, WHICH IS WHERE IT WAS ASKED FOR.** The heatmap
-panel's tabs are the keys of a frame's `maps`, so the pAE is one: measured in
-the real page, `panel {"tabs": ["pae", "contact"]}` where EF2-fast used to have
-only the contact map. Every frame carries both, because both come off the TRUNK
-and are therefore the same for the whole trajectory - a frame with no maps
-blanks the panel as the play bar reaches it.
+🔴 **AND IT DOES NOT SHIP, BECAUSE IT IS INVERTED ACROSS FOLDS.** It was put on
+the page - the heatmap panel gained a `pae` tab - and taken off again the moment
+it was folded on inputs nothing had tested: single sequences and random ones.
+Five folds at 68-76 residues:
 
-🔴 **AND THE MAP IS QUANTISED AGAINST A FIXED 0-32 A, NOT AGAINST ITS OWN
-RANGE.** A PAE plot is read by the shape of its blocks against a scale everybody
-knows; rescaling each fold to its own extremes would make a confident structure
-and a hopeless one look identical. 32 A is the range AlphaFold reports over.
+| | contacts | certainty | **pAE** |
+|---|---|---|---|
+| 6MRR | 73 | 0.9199 | **8.678** |
+| ubiquitin | 121 | 0.9496 | **8.836** |
+| random 1 | 1 | 0.6151 | **6.557** |
+| random 2 | 0 | 0.6124 | **7.056** |
+| random 3 | 3 | 0.5285 | **6.906** |
 
-🔴 **AND THE ARCHIVE CALLS IT `estimated_aligned_error`, NOT `pae`.** `pae` is
-the key a reader parses expecting the AF3 server's field, and this is a
-different provenance - read off a distogram rather than produced by a head. Same
-care as `atom_certainty` in the B-factor column, and for the same reason. The
-README says the key is there and what it is, because a deliberately unfamiliar
-name is only honest if something explains it.
+**A sequence that folds to nothing scores BETTER than a real protein.** And
+sharper, the same target either way - ubiquitin with the language model removed
+loses every contact and drops to certainty 0.4165, and its pAE IMPROVES from
+8.836 to **7.969**.
 
-🔴 **AND IT TRAVELS BESIDE `confidence`, NOT INSIDE IT.** Every reader that asks
-whether a prediction has a confidence object would conclude this checkpoint has
-a head. `lastPrediction.alignedError` is its own field the whole way through -
-and the first version put it only there and not in the archive's `prediction`,
-so the panel showed it while the download did not. `--download` on
-`tools/fold-in-page.py` is what caught that: it reads the zip BACK and prints
-`full_data`'s keys, which is the difference between "a zip was written" and
-"the fold's numbers are in it".
+🔴 **AND IT IS NOT THE DISTANCE FEATURES, WHICH IS WHAT MAKES IT FATAL RATHER
+THAN FIXABLE.** One point per target, refitted leave-one-out, against the mean
+true PAE:
+
+| | within a fold | across folds |
+|---|---|---|
+| shipped (all eight features) | 0.738 | **-0.867** |
+| without `d` and `min(d,22)` | 0.645 | -0.667 |
+| the distogram terms only | 0.627 | -0.683 |
+| `sigma` alone | 0.644 | -0.467 |
+
+Every arm is negative. The mechanism is that a failed fold COLLAPSES - short
+distances, and a distogram that is confidently wrong rather than uncertain - so
+every term points the wrong way at once.
+
+🔴 **SO IT IS WITHHELD ON THIS FILE'S OWN PRECEDENT.** The per-residue certainty
+colour was measured and not shipped because "an ordering that is right on
+average and inverted on some particular fold is the worst possible per-residue
+colour, because the fold somebody is staring at is the one they doubt". **A PAE
+panel that looks better on a failed fold is the same fault and worse**, because
+a PAE is what people check precisely when they suspect a fold. `alignedError` is
+opt-in on `foldEsmfold2` and nothing on the page passes it; the estimator, the
+fit and the numbers stay in `src/esmfold2/aligned-error.js` and
+`tools/pae-transfer.py`.
+
+🔴 **AND THE CERTAINTY CAUGHT EVERY ONE OF THESE CASES, WHICH IS THE OTHER HALF
+OF THE RESULT.** 0.92-0.95 on the two real proteins, 0.53-0.62 on the randoms,
+0.42 on the ablation - the complement holds up exactly as its own sweep said it
+would (0.90 across folds). **The page is not missing a global score. It is
+missing a per-pair one.**
+
+🔴 **AND THE TEST THAT FOUND IT COST FIVE FOLDS AND WAS NOT IN ANY SWEEP.** The
+46-target sweep, the 80 corrupted folds and the 13 PAE targets were all
+sequences that FOLD. "Generate a few random predictions with no MSA or PLM" is
+the input class none of them covered, and it inverted the headline result.
+`tools/gpu/probe-pae-esmfold2.js --summary --no-plm` is that arm.
 
 🔴 **AND A FOLD PRODUCES ONE NOW, NOT ONLY A TOOL.** `foldEsmfold2` returns
 `alignedError`, a tokens^2 matrix. Its three inputs - the distogram's mean,

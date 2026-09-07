@@ -1,6 +1,11 @@
 /**
  * A predicted aligned error for a model that has no confidence head.
  *
+ * 🔴 IT IS NOT SHIPPED, AND THE REASON IS AT THE BOTTOM OF THIS COMMENT: IT
+ * INVERTS ACROSS FOLDS. It orders pairs WITHIN one fold well and reports a
+ * FAILED fold as better than a good one. Nothing on the page draws it. Read the
+ * last three notes before using it for anything.
+ *
  * WHAT IT IS. EF2-fast ships with `confidence_head.enabled: false` and carries
  * zero confidence tensors, so it has no pLDDT and no PAE. It does have a
  * distogram, and a PAE is what says whether two parts of a structure are placed
@@ -51,20 +56,40 @@
  */
 
 /**
- * 🔴 IT ORDERS PAIRS INSIDE ONE FOLD AND SAYS ALMOST NOTHING ACROSS FOLDS, AND
- * THAT IS THE OPPOSITE WAY ROUND FROM THE CERTAINTY. Measured over the nine
- * matched targets, one point per fold - the mean estimate against the mean true
- * PAE - it reads Pearson **0.340** and Spearman **0.117**, and its range is
- * 8.68 to 9.50 A where the truth's is 3.04 to 12.71. It is nearly a constant
- * between folds. Within a fold it orders pairs at 0.746.
+ * 🔴 IT ORDERS PAIRS INSIDE ONE FOLD AND IS INVERTED ACROSS FOLDS. Within a
+ * fold it reaches 0.746 Spearman against AlphaFold 3's real PAE. Across folds -
+ * one point per target, refitted leave-one-out - it is **-0.867**, and that is
+ * not a property of one feature set:
  *
- * The certainty in distogram-webgpu.js is the exact complement: 0.90 across
- * folds and a median 0.44 within one, which is why its per-residue colour was
- * measured and not shipped. **So the two answer different questions and neither
- * substitutes for the other** - the pAE for "which parts of THIS fold are
- * placed relative to which", the certainty for "is this fold worth looking at".
- * That is also how a real PAE is read: nobody compares the mean PAE of two
- * different targets, they look at the block structure of one.
+ *     shipped (all eight features)      within 0.738   across -0.867
+ *     without the distance features     within 0.645   across -0.667
+ *     the distogram terms only          within 0.627   across -0.683
+ *     sigma alone                       within 0.644   across -0.467
+ *
+ * 🔴 AND IT REPORTS A FAILED FOLD AS BETTER THAN A GOOD ONE, WHICH IS HOW IT
+ * WAS CAUGHT. Three random sequences fold to nothing - 0 to 3 contacts,
+ * certainty 0.53-0.62 - and score **6.6 to 7.1 A**, where 6MRR and ubiquitin
+ * fold well at certainty 0.92-0.95 and score **8.7-8.8**. Sharper still,
+ * ubiquitin with its language model removed loses every contact and drops to
+ * certainty 0.4165, and its pAE IMPROVES: **8.836 -> 7.969**. The mechanism is
+ * that a failed fold COLLAPSES, so its distances are short and its distogram is
+ * confidently wrong rather than uncertain, and every term points the wrong way
+ * at once.
+ *
+ * 🔴 SO IT DOES NOT SHIP, ON THIS REPOSITORY'S OWN PRECEDENT. The per-residue
+ * certainty colour was measured and withheld because "an ordering that is right
+ * on average and inverted on some particular fold is the worst possible
+ * per-residue colour, because the fold somebody is staring at is the one they
+ * doubt". A PAE panel that looks BETTER on a failed fold is the same fault and
+ * worse: a PAE is the thing people check precisely when they suspect a fold.
+ * The estimator, the fit and the numbers stay here and in
+ * tools/pae-transfer.py; `alignedError: true` is opt-in and nothing on the page
+ * passes it.
+ *
+ * 🔴 AND THE CERTAINTY IS THE COMPLEMENT AND DOES WORK ACROSS FOLDS, at 0.90 -
+ * it catches every one of these cases, 0.95 -> 0.42 on the ablation and
+ * 0.53-0.62 on the randoms. So the page is not missing a global score; it is
+ * missing a per-pair one.
  *
  * 🔴 SO THE ANGSTROMS ARE A REGRESSION ONTO ANGSTROMS AND NOT A CALIBRATION.
  * Per-target bias runs -3.88 to +5.99 A with a mean of +0.69: it regresses to

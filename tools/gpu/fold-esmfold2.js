@@ -224,6 +224,8 @@ export async function main(device, args = []) {
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
     distogramLogits: contactSweep,
+    // ...measured and not drawn; see src/esmfold2/aligned-error.js.
+    alignedError: true,
     lmMaskFraction: lmMask,
     languageModel: !noPlm,
     wantReusable: twice,

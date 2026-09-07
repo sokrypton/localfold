@@ -117,6 +117,13 @@ export async function main(device, args = []) {
     throw new Error("--targets= or --sequence= is required");
   }
   const seed = Number(option(args, "seed", "1"));
+  // 🔴 THE LANGUAGE MODEL IS THIS MODEL'S "SINGLE SEQUENCE". AF2 and AF3 fold
+  // without their alignment; ESM-C is where EF2-fast's evolutionary information
+  // comes from, so switching it off is the same ablation - and it is the case a
+  // confidence estimate has to survive, because the fold really does collapse.
+  const noPlm = args.includes("--no-plm");
+  // ...matrices are tokens^2 and a calibration run wants none of them.
+  const summaryOnly = args.includes("--summary");
   const sampler = option(args, "sampler", "diffusion-15");
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
@@ -185,10 +192,46 @@ export async function main(device, args = []) {
       shape: M,
       weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
       tower: runTower,
-      distogramLogits: true,
+      languageModel: !noPlm,
+      alignedError: true,
+      distogramLogits: !summaryOnly,
     });
 
     const tokens = result.tokens;
+
+    // 🔴 A CALIBRATION RUN WANTS NO MATRICES. Summaries only, so a dozen folds
+    // fit in one process and one stdout - and `distogramLogits` is left off,
+    // which is what makes the fold cheap rather than what makes it different.
+    if (summaryOnly) {
+      const pae = result.alignedError;
+      const off = [];
+      for (let i = 0; i < tokens; i += 1) {
+        for (let j = 0; j < tokens; j += 1) if (i !== j) off.push(pae[i * tokens + j]);
+      }
+      off.sort((a, b) => a - b);
+      const live = [...result.certainty].filter((v) => v >= 0);
+      let contacts = 0;
+      for (let i = 0; i < tokens; i += 1) {
+        for (let j = i + 6; j < tokens; j += 1) {
+          if (result.contacts[i * tokens + j] > 0.5) contacts += 1;
+        }
+      }
+      const summary = {
+        name, tokens, languageModel: !noPlm,
+        paeMean: Number((off.reduce((a, v) => a + v, 0) / off.length).toFixed(3)),
+        paeMedian: Number(off[off.length >> 1].toFixed(3)),
+        paeMin: Number(off[0].toFixed(3)),
+        paeMax: Number(off[off.length - 1].toFixed(3)),
+        certainty: live.length === 0 ? null
+          : Number((live.reduce((a, v) => a + v, 0) / live.length).toFixed(4)),
+        contacts,
+      };
+      out.push(summary);
+      console.log(`${name}: ${tokens} tokens, pAE ${summary.paeMean}`
+        + `, certainty ${summary.certainty}, ${contacts} contacts`);
+      continue;
+    }
+
     const bins = M.distogramBins;
     const { mean, sigma, entropy } = moments(result.distogram.logits,
                                              result.distogram.bias, tokens, bins,
