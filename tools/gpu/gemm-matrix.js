@@ -70,7 +70,8 @@
 export function matrixLinearFits(shape, geometry = {}) {
   const blocks = geometry.blocks ?? 4;
   const columnBlocks = geometry.columnBlocks ?? blocks;
-  return shape.rows >= blocks * 8 && shape.columns >= columnBlocks * 8;
+  const tile = geometry.tile ?? { M: 8, N: 8, K: 8 };
+  return shape.rows >= blocks * tile.M && shape.columns >= columnBlocks * tile.N;
 }
 
 /**
@@ -98,6 +99,15 @@ export function createMatrixLinearShader(options = {}) {
   const subBlocks = options.subBlocks ?? blocks;
   const subColumnBlocks = options.subColumnBlocks ?? subBlocks;
   const element = options.element ?? "f32";
+  // 🔴 THE TILE IS THE DEVICE'S, NOT A CONSTANT. An M2 offers 8x8x8 and this
+  // file was written to it; an A100 offers 16x16x16 and NO f32 tile at all, so
+  // a hardcoded eight is both the wrong shape and, in f32, an unsupported one.
+  // `deviceMatrixConfig` in src/runtime/device-profile.js resolves it.
+  const tile = options.tile ?? { M: 8, N: 8, K: 8 };
+  const { M, N, K } = tile;
+  if (![M, N, K].every((v) => Number.isInteger(v) && v > 0)) {
+    throw new RangeError("the tile needs positive integer M, N and K");
+  }
   if (!Number.isInteger(blocks) || blocks < 1) throw new RangeError("blocks must be a positive integer");
   if (!Number.isInteger(columnBlocks) || columnBlocks < 1) {
     throw new RangeError("columnBlocks must be a positive integer");
@@ -116,8 +126,8 @@ export function createMatrixLinearShader(options = {}) {
     throw new RangeError("the sub-region must divide the region on both axes");
   }
   if (element !== "f32" && element !== "f16") throw new RangeError(`unknown element ${element}`);
-  const rowsPerGroup = blocks * 8;
-  const columnsPerGroup = columnBlocks * 8;
+  const rowsPerGroup = blocks * M;
+  const columnsPerGroup = columnBlocks * N;
   const stage = rowsPerGroup * columnsPerGroup;
   // The epilogue walks the staged region with 32 lanes, so it needs a whole
   // number of elements each; every geometry here is a multiple of 8x8.
@@ -129,7 +139,13 @@ export function createMatrixLinearShader(options = {}) {
   // The staged result is always f32: the epilogue adds a bias and may clamp,
   // and an f16 accumulator's narrowness is a question about the MULTIPLY, not
   // about what is written out.
-  const result = element === "f16" ? "f16" : "f32";
+  // 🔴 f16 OPERANDS DO NOT OBLIGE AN f16 ACCUMULATOR. This file used to assume
+  // they did, because the M2's f16 config accumulates in f16. An A100 offers
+  // BOTH f16->f16 and f16->f32 at the same 310 TFLOP/s, so the wide accumulator
+  // is free and is the default; `options.result` is how a caller asks for the
+  // narrow one, and a device that only offers narrow must say so.
+  const result = options.result ?? (element === "f16" ? "f16" : "f32");
+  if (result !== "f32" && result !== "f16") throw new RangeError(`unknown result ${result}`);
 
   const rowSteps = blocks / subBlocks;
   const columnSteps = columnBlocks / subColumnBlocks;
@@ -142,13 +158,17 @@ export function createMatrixLinearShader(options = {}) {
   const columnOrigin = walked ? "sub_column" : "0u";
 
   const loads = [];
+  // 🔴 THE TYPE PARAMETERS ARE <T, COLUMNS, ROWS>. Invisible at 8x8x8, which is
+  // why it went unmeasured for so long; at the A100's M16 N8 K16 the other
+  // reading is rejected outright. tools/gpu/check-subgroup-matrix-shapes.js
+  // demonstrates it per shape.
   for (let m = 0; m < subBlocks; m += 1) {
-    loads.push(`      let left_${m} = subgroupMatrixLoad<subgroup_matrix_left<${element}, 8, 8>>(`
-      + `&source, row_base + (${rowOrigin} + ${m * 8}u) * parameters.inner + k0, false, parameters.inner);`);
+    loads.push(`      let left_${m} = subgroupMatrixLoad<subgroup_matrix_left<${element}, ${K}, ${M}>>(`
+      + `&source, row_base + (${rowOrigin} + ${m * M}u) * parameters.inner + k0, false, parameters.inner);`);
   }
   for (let n = 0; n < subColumnBlocks; n += 1) {
-    loads.push(`      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${element}, 8, 8>>(`
-      + `&weights, k0 * parameters.columns + column_base + ${columnOrigin} + ${n * 8}u, false, parameters.columns);`);
+    loads.push(`      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${element}, ${N}, ${K}>>(`
+      + `&weights, k0 * parameters.columns + column_base + ${columnOrigin} + ${n * N}u, false, parameters.columns);`);
   }
   const macs = [];
   const declarations = [];
@@ -156,21 +176,21 @@ export function createMatrixLinearShader(options = {}) {
   for (let m = 0; m < subBlocks; m += 1) {
     for (let n = 0; n < subColumnBlocks; n += 1) {
       macs.push(`      acc_${m}_${n} = subgroupMatrixMultiplyAccumulate(left_${m}, right_${n}, acc_${m}_${n});`);
-      declarations.push(`    var acc_${m}_${n} = subgroup_matrix_result<${result}, 8, 8>();`);
-      stores.push(`    subgroupMatrixStore(&staged, (${rowOrigin} + ${m * 8}u) * ${columnsPerGroup}u`
-        + ` + ${columnOrigin} + ${n * 8}u, acc_${m}_${n}, false, ${columnsPerGroup}u);`);
+      declarations.push(`    var acc_${m}_${n} = subgroup_matrix_result<${result}, ${N}, ${M}>();`);
+      stores.push(`    subgroupMatrixStore(&staged, (${rowOrigin} + ${m * M}u) * ${columnsPerGroup}u`
+        + ` + ${columnOrigin} + ${n * N}u, acc_${m}_${n}, false, ${columnsPerGroup}u);`);
     }
   }
 
   const inner = `${declarations.join("\n")}
-    for (var k0 = 0u; k0 < whole; k0 += 8u) {
+    for (var k0 = 0u; k0 < whole; k0 += ${K}u) {
 ${loads.join("\n")}
 ${macs.join("\n")}
     }
 ${stores.join("\n")}`;
   const body = walked
-    ? `  for (var sub_row = 0u; sub_row < ${rowsPerGroup}u; sub_row += ${subBlocks * 8}u) {
-  for (var sub_column = 0u; sub_column < ${columnsPerGroup}u; sub_column += ${subColumnBlocks * 8}u) {
+    ? `  for (var sub_row = 0u; sub_row < ${rowsPerGroup}u; sub_row += ${subBlocks * M}u) {
+  for (var sub_column = 0u; sub_column < ${columnsPerGroup}u; sub_column += ${subColumnBlocks * N}u) {
 ${inner}
   }
   }`
@@ -213,7 +233,7 @@ fn main(
   // bias sits past it. A tail k0 past inner would read the BIAS as if it
   // were a weight row, so the loop stops on a whole tile and the remainder is
   // handled below.
-  let whole = parameters.inner - (parameters.inner % 8u);
+  let whole = parameters.inner - (parameters.inner % ${K}u);
 ${body}
   workgroupBarrier();
   // The epilogue: bias, activation, bounds. It runs per invocation over the
@@ -226,7 +246,7 @@ ${body}
     let column = column_origin + local_column;
     if (row < parameters.rows && column < parameters.columns) {
       var value = f32(staged[i]);
-      // The ragged K tail, if the inner dimension is not a multiple of eight.
+      // The ragged K tail, if the inner dimension is not a multiple of the tile.
       for (var k = whole; k < parameters.inner; k += 1u) {
         value += f32(source[row * parameters.inner + k]) * f32(weights[k * parameters.columns + column]);
       }

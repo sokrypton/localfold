@@ -29,6 +29,7 @@ import { normalFrom } from "../../src/af3/fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
 import { profileDevice } from "./profile.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
@@ -41,6 +42,46 @@ const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "59"));
+  // 🔴 THE TOKEN TILE, FORCED. The shipped rule pins it to 1 below 175 tokens,
+  // and the question this flag exists to ask is whether that is still right now
+  // that the weight traffic, not the workgroup count, looks like the binding
+  // constraint - a tile of 1 gives one workgroup per TOKEN, and each of them
+  // re-reads the projection's whole weight slice.
+  // `--splitk=8/4` is splits/tile; `--splitk=off` disables it.
+  const splitArg = option(args, "splitk", null);
+  if (splitArg !== null) {
+    setDeviceTuning(device, {
+      diffusionSplitK: splitArg === "off" ? null
+        : (() => {
+          const [splits, t] = splitArg.split("/").map(Number);
+          return { splits, tile: t, crossover: 1e9 };
+        })(),
+    });
+  }
+  // `--atomtile=1` forces it, `--atomtile=off` restores the shipped rule.
+  const lanesArg = option(args, "lanes", null);
+  if (lanesArg !== null) setDeviceTuning(device, { diffusionLanes: Number(lanesArg) });
+  const outchunkArg = option(args, "outchunk", null);
+  const atomArg = option(args, "atomtile", null);
+  if (atomArg !== null) {
+    setDeviceTuning(device, {
+      atomRowTile: atomArg === "off" ? null
+        : { below: Number(atomArg), atOrAbove: Number(atomArg), crossover: 0 },
+    });
+  }
+  const splitNormArg = option(args, "normsplit", null);
+  if (splitNormArg !== null) {
+    setDeviceTuning(device, { diffusionNormSplit: splitNormArg !== "off" });
+  }
+  const normArg = option(args, "normsg", null);
+  if (normArg !== null) {
+    setDeviceTuning(device, { diffusionNormSubgroups: normArg !== "off" });
+  }
+  const tileArg = option(args, "tile", null);
+  if (tileArg !== null) {
+    const t = Number(tileArg);
+    setDeviceTuning(device, { diffusionTokenTile: { below: t, atOrAbove: t, crossover: 0 } });
+  }
   const calls = Number(option(args, "calls", "9"));
   // 🔴 SIXTEEN WAS NOT ENOUGH TO SEE THE ATOM BLOCKS. They are 106 ms of a
   // 261 ms call at 150 tokens and most of their passes fell off the end of the
@@ -85,7 +126,15 @@ export async function main(device, args) {
 
   // --profile times every labelled compute pass; see tools/gpu/profile.js.
   const profile = args.includes("--profile") ? profileDevice(device) : null;
-  const head = new Af3DiffusionHeadGpu(device);
+  // 🔴 THE DENOISER'S WEIGHT PRECISION, WHICH DEFAULTS TO f32 WHERE THE TRUNK'S
+  // DEFAULTS TO f16. pairformer-block-webgpu.js takes f16 whenever the device
+  // has it; diffusion-transformer-webgpu.js takes f32 unless a caller asks
+  // otherwise, and no caller does. These kernels are weight-bandwidth-bound -
+  // one multiply-add per weight loaded - so that is twice the bytes on the
+  // exact passes that dominate a step.
+  const weightPrecision = option(args, "weights", null);
+  const head = new Af3DiffusionHeadGpu(device,
+    weightPrecision === null ? undefined : { weightPrecision });
   const rows = [];
   for (let call = 0; call < calls; call += 1) {
     // ...the last call only, so pipeline compilation is out of the numbers.
@@ -98,6 +147,9 @@ export async function main(device, args) {
     });
   }
   const gpuPasses = profile === null ? undefined : await profile.report();
+  // ...and how much of the last call the GPU spent doing nothing. See
+  // profile.js's summary(): the sum of the passes cannot see the gaps.
+  const gpuSummary = profile === null ? undefined : await profile.summary();
   profile?.restore();
   const after = rows.slice(1);
   const mean = (pick) => {
@@ -110,7 +162,7 @@ export async function main(device, args) {
   };
   return {
     tokens, atoms: tokens * dense, subsets: batch.shape.subsets, weightLoadMs: loadMs,
-    ...(gpuPasses === undefined ? {} : { gpuPasses: gpuPasses.slice(0, passCount) }),
+    ...(gpuPasses === undefined ? {} : { gpuSummary, gpuPasses: gpuPasses.slice(0, passCount) }),
     rows,
     range: {
       whole: spread((r) => r.whole),

@@ -99,3 +99,6 @@ natives
 # page they cannot find rather than failing on it.
 /single.html
 /proteinhunter.html
+
+# tools/gpu/bench-jaxjs-matmul.js wants @jax-js/jax's dist copied here.
+/.jaxjs-tmp

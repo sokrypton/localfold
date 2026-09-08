@@ -29,6 +29,7 @@
  * 🔴 THE SINGLE TRACK READS THE PAIR AFTER ALL FIVE PAIR UPDATES, not before.
  * Reading it earlier is a plausible-looking reordering that still converges.
  */
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -46,7 +47,8 @@ import {
 import { createTransitionShader, packTransitionWeights, TRANSITION_ORDER }
   from "./transition-webgpu.js";
 import { residentPackedOnDevice } from "./device-weights.js";
-import { createSingleAttentionShaders, packSingleAttentionWeights, SINGLE_ATTENTION_ORDER }
+import { createSingleAttentionShaders, packSingleAttentionWeights,
+  singleProjectSplits, SINGLE_ATTENTION_ORDER }
   from "./single-attention-webgpu.js";
 
 /**
@@ -267,7 +269,7 @@ export class Af3PairformerStackGpu {
       + `:${gridHeads}x${blocks[0].pairAttention1.dimension}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}`
       + `:${extraPairBiasData === undefined ? "nobias" : "bias"}`;
-    const hasF16 = this.device.features?.has("shader-f16") === true;
+    const hasF16 = halfPrecisionAvailable(this.device);
     const stagedPrecision = this.options?.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     // 🔴 THE RESIDENT WEIGHTS ARE THE MEMORY, AND THE SINGLE TRACK IS THE
     // WEIGHTS. Broken down by label, the 567 MiB an AF3 TRUNK keeps resident is
@@ -301,6 +303,8 @@ export class Af3PairformerStackGpu {
       throw new Error("f16 weights and staged tiles require the shader-f16 feature");
     }
     const pipelines = await compilePairTrack(this.pipelines, {
+      // The device's answer, or undefined for the shared default.
+      triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
       n, channels: pairChannels, sample: blocks[0], epsilon, variance, dialect, base,
       stagedPrecision,
       weightPrecision: pairWeightPrecision, accumulatePrecision,
@@ -322,16 +326,30 @@ export class Af3PairformerStackGpu {
       projection: blocks[0].singlePairLogitsProjection,
     }).offsets;
     into("singleTransition", `${base}:single-transition:${weightPrecision}`,
-      createTransitionShader({ rows: n, channels: singleChannels, factor: 4, weightPrecision },
+      createTransitionShader({ rows: n, channels: singleChannels, factor: 4, weightPrecision,
+                               // The single track is `n` rows, not n^2 - the
+                               // shortest dispatch in the trunk.
+                               threadTarget: deviceTuning(this.device).transitionThreadTarget },
                              singleTransitionOffsets, epsilon, variance));
-    const { projectSplits, ...singleSources } = createSingleAttentionShaders(
-      { n, channels: singleChannels, heads, dimension: blocks[0].singleAttention.dimension,
-        weightPrecision },
+    // 🔴 THE SPLIT COUNT IS AN OCCUPANCY CHOICE, SO THE DEVICE MAKES IT.
+    const singleTuning = deviceTuning(this.device);
+    const singleDimension = blocks[0].singleAttention.dimension;
+    // 🔴 EVERY NON-SHADER FIELD HAS TO COME OUT OF THIS REST, because the loop
+    // below compiles whatever is left. Adding `projectLanes` to the factory's
+    // return handed CreateShaderModule the number 64 as a shader.
+    const { projectSplits, projectLanes: _lanes, projectOutLanes: _outLanes,
+      ...singleSources } = createSingleAttentionShaders(
+      { n, channels: singleChannels, heads, dimension: singleDimension,
+        weightPrecision,
+        projectSplits: singleProjectSplits(n, heads * singleDimension,
+          singleTuning.singleProjectWorkgroupTarget, singleTuning.singleProjectMaxSplits),
+        projectLanes: singleTuning.singleProjectLanes ?? undefined,
+        projectOutLanes: singleTuning.singleProjectOutLanes ?? undefined },
       singleOffsets, epsilon, variance);
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
-      into(`single:${name}`, `${base}:single:${weightPrecision}:${name}`, source);
+      into(`single:${name}`, `${base}:single:${weightPrecision}:${singleTuning.singleProjectLanes ?? 64}:${singleTuning.singleProjectOutLanes ?? 64}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
       createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,
@@ -390,7 +408,8 @@ export class Af3PairformerStackGpu {
       // wait is a full pipeline drain, so a narrow window spends most of the
       // stack refilling; past sixteen the curve is flat and the remaining
       // waits are cheap insurance against an unbounded queue.
-      const submissionWindow = options.submissionWindow ?? 16;
+      const submissionWindow = options.submissionWindow
+        ?? deviceTuning(this.device).pairformerSubmissionWindow ?? 16;
       const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
       // 🔴 WHERE THE STACK'S WALL TIME ACTUALLY GOES, REPORTED RATHER THAN

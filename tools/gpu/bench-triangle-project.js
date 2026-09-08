@@ -18,6 +18,8 @@
  */
 import { createTriangleShaders } from "../../src/triangle/shaders.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
+import { createStagedMatrixShader, stagedMatrixStorage } from "../../src/runtime/matrix-linear.js";
+import { deviceMatrixConfig, recordAdapter } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -180,15 +182,40 @@ export async function main(device, args) {
       new Uint32Array(matrixParams.getMappedRange()).set(
         [pairs, cZ, columns, 0, cZ * columns, 0, 0, 0]);
       matrixParams.unmap();
+      // 🔴 THE f32 8x8 KERNEL DOES NOT EXIST ON EVERY DEVICE. An A100 offers no
+      // f32 matrix config at all and rejects the pipeline outright, so this
+      // asks the adapter and takes the staged f16 kernel where the old one
+      // cannot run. `--matrix=staged` forces the staged arm anywhere.
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+      recordAdapter(device, adapter);
+      const config = deviceMatrixConfig(device, { element: "f16" });
+      const wantStaged = option(args, "matrix", "0") === "staged" || config !== null;
+      let block = 32;
+      let code;
+      if (wantStaged && config !== null) {
+        const geometry = {
+          blockRows: 128, blockColumns: 128, blockInner: 16,
+          subgroupRows: 1, subgroupColumns: 8,
+          tile: { M: config.M, N: config.N, K: config.K },
+          result: config.resultComponentType,
+        };
+        if (stagedMatrixStorage(geometry) <= device.limits.maxComputeWorkgroupStorageSize) {
+          block = 128;
+          code = createStagedMatrixShader({
+            ...geometry,
+            sourcePrecision: "f32", weightPrecision: "f32", outputPrecision: "f32",
+            vectorStaging: cZ % 4 === 0 && columns % 4 === 0,
+          });
+        }
+      }
+      if (code === undefined) code = createMatrixLinearShader({ blocks: 4 });
       const pipeline = await device.createComputePipelineAsync({
         layout: "auto",
-        compute: {
-          module: device.createShaderModule({ code: createMatrixLinearShader({ blocks: 4 }) }),
-          entryPoint: "main",
-        },
+        compute: { module: device.createShaderModule({ code }), entryPoint: "main" },
       });
       matrixArm = {
         columns,
+        staged: block === 128,
         kernel: {
           pipeline,
           bindGroup: device.createBindGroup({
@@ -196,7 +223,7 @@ export async function main(device, args) {
             entries: [z, matrixWeights, matrixParams, matrixOut].map(
               (buffer, binding) => ({ binding, resource: { buffer } })),
           }),
-          x: Math.ceil(columns / 32), y: Math.ceil(pairs / 32),
+          x: Math.ceil(columns / block), y: Math.ceil(pairs / block),
         },
         times: [],
       };

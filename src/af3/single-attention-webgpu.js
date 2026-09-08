@@ -79,12 +79,32 @@ export function packSingleAttentionWeights(weights, precision = "f32") {
  * Every one of those is the smallest split that reaches about 110 workgroups,
  * which is what this returns.
  */
-export function singleProjectSplits(n, width) {
-  for (const splits of [1, 2, 3]) {
+export function singleProjectSplits(n, width, target = 110, maxSplits = 3) {
+  // 🔴 110 IS AN M2's NUMBER, AND THE SHAPE OF THE RULE IS NOT. "The smallest
+  // split that reaches about 110 workgroups" is right on a device with ten
+  // cores and badly wrong on one with 108: an A100 wants about **1200**, and
+  // the candidate list has to reach 6 to get there. Measured on
+  // bench-single-project.js, shipped against best:
+  //
+  //     n=59   splits 2  0.1422 ms  ->  splits 6  0.0578   2.46x
+  //     n=128  splits 1  0.1406    ->  splits 6  0.0563   2.50x
+  //     n=200  splits 1  0.1422    ->  splits 6  0.0734   1.94x
+  //     n=400  splits 1  0.1594    ->  splits 3  0.1094   1.46x
+  //
+  // The same rule with target 1200 and maxSplits 6 picks the best arm at all
+  // four. Both stay parameters rather than becoming the new constants, because
+  // the M2 table above this comment shows 6 LOSING there at every n it was
+  // measured at - see src/runtime/device-profile.js.
+  const candidates = [1, 2, 3, 6].filter((splits) => splits <= maxSplits);
+  for (const splits of candidates) {
     if (width % (64 * splits) !== 0) continue;
-    if (n * splits >= 110) return splits;
+    if (n * splits >= target) return splits;
   }
-  return width % (64 * 3) === 0 ? 3 : 1;
+  // Nothing reaches the target, so take the most workgroups available.
+  for (const splits of [...candidates].reverse()) {
+    if (width % (64 * splits) === 0) return splits;
+  }
+  return 1;
 }
 
 export function createSingleAttentionShaders(shape, offsets, epsilon, variance) {
@@ -112,7 +132,32 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
     throw new Error(`width ${width} is not a multiple of 64 * ${splits} splits`);
   }
   const perSplit = width / splits;
-  const perThread = perSplit / 64;
+  // 🔴 THE WORKGROUP WIDTH IS A DEVICE CHOICE, AND IT WAS 64 EVERYWHERE.
+  // `project` runs one workgroup per (token, split) and `project_out` one per
+  // token, so at 200 tokens and splits 1 they are 200 workgroups of 64 lanes -
+  // 12,800 threads where this A100 holds 221,184, and the profile puts them at
+  // 4% and 2.9% of its arithmetic ceiling. Widening adds threads WITHOUT adding
+  // weight reads, which is the distinction `projectSplits` gets wrong: more
+  // splits is more workgroups, and every one of them re-reads the whole weight
+  // set. See docs/A100.md and the transition's `transitionWidth`.
+  //
+  // 🔴 AND THE TWO ARE NOT THE SAME NUMBER. `project` blocks its outputs
+  // `perThread` deep, so its width has to DIVIDE `perSplit`; `project_out`
+  // strides bounded loops and takes any width. They are resolved separately so
+  // the constraint on one does not cap the other.
+  const projectLanes = shape.projectLanes ?? 64;
+  const projectOutLanes = shape.projectOutLanes ?? 64;
+  for (const [name, lanes] of [["projectLanes", projectLanes],
+                               ["projectOutLanes", projectOutLanes]]) {
+    if (!Number.isInteger(lanes) || lanes < 1 || (lanes & (lanes - 1)) !== 0) {
+      throw new RangeError(`${name} ${lanes} is not a power of two`);
+    }
+  }
+  if (perSplit % projectLanes !== 0) {
+    throw new Error(`the projection's ${perSplit} outputs a split do not divide`
+      + ` into ${projectLanes} lanes`);
+  }
+  const perThread = perSplit / projectLanes;
 
   const common = `${enableF16}
 const N: u32 = ${n}u;
@@ -144,10 +189,10 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 @group(0) @binding(5) var<storage, read_write> gate: array<f32>;
 
 var<workgroup> act: array<f32, ${channels}>;
-var<workgroup> reduce_a: array<f32, 64>;
-var<workgroup> reduce_b: array<f32, 64>;
+var<workgroup> reduce_a: array<f32, ${projectLanes}>;
+var<workgroup> reduce_b: array<f32, ${projectLanes}>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${projectLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let token = group.x / ${splits}u;
@@ -158,7 +203,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   var total = 0.0;
   var squares = 0.0;
-  for (var c = local; c < CHANNELS; c += 64u) {
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     let value = single[base + c];
     total += value;
     squares += value * value;
@@ -166,7 +211,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   reduce_a[local] = total;
   reduce_b[local] = squares;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) {
       reduce_a[local] += reduce_a[local + stride];
       reduce_b[local] += reduce_b[local + stride];
@@ -177,7 +222,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${variance === "fast"
     ? "let variance = reduce_b[0] / f32(CHANNELS) - mean * mean;"
     : `var centered = 0.0;
-  for (var c = local; c < CHANNELS; c += 64u) {
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     let d = single[base + c] - mean;
     centered += d * d;
   }
@@ -189,7 +234,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
   reduce_a[local] = centered;
   workgroupBarrier();
-  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+  for (var stride = ${projectLanes / 2}u; stride > 0u; stride >>= 1u) {
     if (local < stride) { reduce_a[local] += reduce_a[local + stride]; }
     workgroupBarrier();
   }
@@ -197,7 +242,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();
 
-  for (var c = local; c < CHANNELS; c += 64u) {
+  for (var c = local; c < CHANNELS; c += ${projectLanes}u) {
     act[c] = (single[base + c] - mean) * inverse_std * ${wf("weights[W_NORM_SCALE + c]")}
       + ${wf("weights[W_NORM_OFFSET + c]")};
   }
@@ -216,7 +261,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   var v_total: array<f32, ${perThread}>;
   var gate_total: array<f32, ${perThread}>;
   for (var b = 0u; b < ${perThread}u; b += 1u) {
-    q_total[b] = ${wf("weights[W_QBIAS + out0 + b * 64u]")};   // ...and only q has one.
+    q_total[b] = ${wf(`weights[W_QBIAS + out0 + b * ${projectLanes}u]`)};   // ...and only q has one.
     k_total[b] = 0.0;
     v_total[b] = 0.0;
     gate_total[b] = 0.0;
@@ -225,7 +270,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let x = act[c];
     let row = c * WIDTH;
     for (var b = 0u; b < ${perThread}u; b += 1u) {
-      let out = row + out0 + b * 64u;
+      let out = row + out0 + b * ${projectLanes}u;
       q_total[b] += x * ${wf("weights[W_Q + out]")};
       k_total[b] += x * ${wf("weights[W_K + out]")};
       v_total[b] += x * ${wf("weights[W_V + out]")};
@@ -233,7 +278,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
   }
   for (var b = 0u; b < ${perThread}u; b += 1u) {
-    let index = token * WIDTH + out0 + b * 64u;
+    let index = token * WIDTH + out0 + b * ${projectLanes}u;
     q[index] = q_total[b];
     k[index] = k_total[b];
     v[index] = v_total[b];
@@ -317,19 +362,19 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
 var<workgroup> gated: array<f32, ${width}>;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(${projectOutLanes})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let token = group.x;
   if (token >= N) { return; }
   let local = local_id.x;
-  for (var w = local; w < WIDTH; w += 64u) {
+  for (var w = local; w < WIDTH; w += ${projectOutLanes}u) {
     let index = token * WIDTH + w;
     gated[w] = gathered[index] * logistic(gate[index]);
   }
   workgroupBarrier();
 
-  for (var c = local; c < CHANNELS; c += 64u) {
+  for (var c = local; c < CHANNELS; c += ${projectOutLanes}u) {
     var sum = 0.0;
     for (var wi = 0u; wi < WIDTH; wi += 1u) {
       sum += gated[wi] * ${wf("weights[W_OUT + wi * CHANNELS + c]")};
@@ -338,7 +383,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { project, attend, project_out, projectSplits: splits };
+  return { project, attend, project_out, projectSplits: splits,
+           projectLanes, projectOutLanes };
 }
 
 export class Af3SingleAttentionGpu {

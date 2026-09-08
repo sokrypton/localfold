@@ -12,6 +12,7 @@
  * adapter's, not one equal to it.
  */
 import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
+import { recordAdapter } from "./device-profile.js";
 
 const RAISED_LIMITS = [
   // The MSA activations at a large complex: rows x residues x channels x 4.
@@ -70,6 +71,11 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
     }
   }
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+  // 🔴 THE ADAPTER IS THE ONLY THING THAT KNOWS WHAT THIS IS, AND KERNELS ARE
+  // HANDED A DEVICE. `adapter.info` does not survive onto the GPUDevice, so
+  // the identity is recorded here - the one place both are in scope - and
+  // src/runtime/device-profile.js is where a selection function asks for it.
+  recordAdapter(device, adapter);
   // 🔴 A DEVICE THAT ACCEPTS AN ALLOCATION IT CANNOT AFFORD FREEZES THE MACHINE.
   // Metal takes buffers well past the point where macOS starts paging, and a
   // phone's driver takes them and is then killed by the system - in neither

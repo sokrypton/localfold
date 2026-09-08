@@ -15,6 +15,7 @@
  * The five pair updates are shared with the pairformer stack; see
  * src/af3/pair-track-gpu.js.
  */
+import { deviceTuning } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -99,6 +100,8 @@ export class Af3MsaStackGpu {
     const base = `af3-msa:${n}:${sequences}:${msaChannels}:${pairChannels}:${epsilon}:${variance}`
       + `:${dialect.swapTransposedBias}`;
     const pipelines = await compilePairTrack(this.pipelines, {
+      // The device's answer, or undefined for the shared default.
+      triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
       scratchStorage: UNPACKED_PAIR_SCRATCH,
       // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
       // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's

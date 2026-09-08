@@ -37,7 +37,10 @@ import {
   createTransitionNormalizeParameters,
   createTransitionShaders,
   chooseLinearKernel,
+  linearKernelRows,
+  linearKernelColumns,
   linearTileColumns,
+  linearTileRows,
   packTransitionWeights,
   transitionChunkRows,
   TRANSITION_TILE_ROWS,
@@ -192,11 +195,27 @@ async function encodeTransition(
   // shape the first shape's pipeline - dispatched with the wrong column stride,
   // which leaves columns unprojected and reads as a speedup.
   // 🔴 THE TILE AND THE PRECISION ARE ONE CHOICE - see chooseLinearKernel.
-  const { tile, precision, weightPrecision } = chooseLinearKernel({
-    rows, columns: Math.max(channels, hiddenChannels), device: execution.device,
+  const { tile, precision, weightPrecision, matrix } = chooseLinearKernel({
+    rows,
+    columns: Math.max(channels, hiddenChannels),
+    inner: Math.min(channels, hiddenChannels),
+    device: execution.device,
   });
   const packed = packTransitionWeights(descriptor, weightPrecision);
-  const tileColumns = linearTileColumns(tile);
+  // 🔴 THE GRID IS THE CHOSEN KERNEL'S, NOT THE TILE'S. The matrix path owns a
+  // 128x128 region per workgroup and has no lane tile at all, so reading the
+  // grid off `tile` would dispatch a 128-wide kernel four times per 32 columns
+  // - which recomputes rather than corrupts, and so reads as a slowdown with
+  // every checker still passing. See the note on tileRows below, which is the
+  // same mistake made once already.
+  const tileColumns = linearKernelColumns({ tile, matrix });
+  // 🔴 AND THE ROW COUNT IS THE TILE'S TOO. This was TRANSITION_TILE_ROWS, a
+  // module constant equal to LINEAR_TILE's 32 - safe only because both shipped
+  // tiles had 32 rows, which the comment beside it said outright. A taller tile
+  // under that constant is dispatched ceil(rows/32) times and recomputes its own
+  // rows: correct, and redundant by the ratio. It measured as a 3.2x regression
+  // on the transitions before this line existed. See docs/A100.md.
+  const tileRows = linearKernelRows({ tile, matrix });
   // 🔴 THE HIDDEN ACTIVATION IS THE BIGGEST THING A TRANSITION HOLDS and the
   // shortest-lived: four times the channels, written by the first pass and
   // read by the second and by nothing else. At 512 MSA rows it was 32 MiB of a
@@ -206,8 +225,13 @@ async function encodeTransition(
   // has no quad to own, which is what the guard below says.
   const hiddenStorage = hiddenChannels % 4 === 0 ? "f16" : "f32";
   const shaders = createTransitionShaders(
-    descriptor, packed.offsets, tile, precision, weightPrecision, hiddenStorage);
-  const key = `${precision}:${weightPrecision}:${tileColumns}:${hiddenStorage}`;
+    descriptor, packed.offsets, tile, precision, weightPrecision, hiddenStorage, matrix ?? null);
+  // The geometry is part of the shader, so it is part of the key - a matrix
+  // pipeline handed to a vector dispatch is the corruption the note above is
+  // about.
+  const key = `${precision}:${weightPrecision}:${tileColumns}:${hiddenStorage}`
+    + `:${matrix ? `m${matrix.blockRows}x${matrix.blockColumns}x${matrix.blockInner}`
+      + `x${matrix.subgroupRows}x${matrix.subgroupColumns}${matrix.vectorStaging ? "v" : ""}` : "t"}`;
   const [normalize, linearFirst, linear, linearResidual] = await Promise.all([
     execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
     execution.pipelines.get(`block:transition:linear-first:${key}`, shaders[1]),
@@ -222,6 +246,7 @@ async function encodeTransition(
   const chunkRows = transitionChunkRows(
     rows, channels, hiddenChannels, execution.transitionBufferLimit,
     execution.device.limits.minStorageBufferOffsetAlignment,
+    tileRows,
   );
 
   if (chunkRows === rows) {
@@ -240,11 +265,11 @@ async function encodeTransition(
     execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
       transitionNormGrid[0], transitionNormGrid[1], 1, `${label}.normalize`);
     execution.dispatch(encoder, linearFirst, [normalized, weights, firstParams, hidden],
-      Math.ceil(hiddenChannels / tileColumns), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(rows / tileRows), 1,
       `${label}.first`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
       [hidden, weights, secondParams, output],
-      Math.ceil(channels / tileColumns), Math.ceil(rows / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(channels / tileColumns), Math.ceil(rows / tileRows), 1,
       `${label}.second`);
     return output;
   }
@@ -277,11 +302,11 @@ async function encodeTransition(
     execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
       chunkNormGrid[0], chunkNormGrid[1], 1, `${label}.normalize-${rowOffset}`);
     execution.dispatch(encoder, linearFirst, [normalizedChunk, weights, firstParams, hiddenChunk],
-      Math.ceil(hiddenChannels / tileColumns), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(count / tileRows), 1,
       `${label}.first-${rowOffset}`);
     execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
       [hiddenChunk, weights, secondParams, outputChunk],
-      Math.ceil(channels / tileColumns), Math.ceil(count / TRANSITION_TILE_ROWS), 1,
+      Math.ceil(channels / tileColumns), Math.ceil(count / tileRows), 1,
       `${label}.second-${rowOffset}`);
   }
   return output;

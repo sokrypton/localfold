@@ -63,6 +63,10 @@ export async function main(device, args) {
     // is the one place where halving their BYTES might also halve a cost.
     weightPrecision: option(args, "weights", undefined),
     lanes: args.some((a) => a.startsWith("--lanes=")) ? Number(option(args, "lanes", "")) : undefined,
+    attendSubgroups: args.includes("--attend-subgroups") ? true : undefined,
+    attendStageKeys: args.includes("--attend-stage-keys") ? true : undefined,
+    attendKeyChunk: args.some((a) => a.startsWith("--attend-key-chunk="))
+      ? Number(option(args, "attend-key-chunk", "")) : undefined,
     tile: args.some((a) => a.startsWith("--tile=")) ? Number(option(args, "tile", "")) : undefined,
     splits: args.some((a) => a.startsWith("--splits=")) ? Number(option(args, "splits", "")) : undefined,
     outTile: args.some((a) => a.startsWith("--out-tile="))

@@ -41,6 +41,7 @@ import { structuralBatch, structuralLayout, structuralToResidue }
 import { diffusionConditioning } from "./diffusion-reference.js";
 import { openddeConfidence } from "./opendde-confidence.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
 import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
@@ -699,7 +700,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
   //
   // The confidence head's four blocks are a different weight object and cache
   // themselves; only a LATER fold's trunk pays, and it pays in packing.
-  releaseResidentWeights(device, "w.");
+  //
+  // 🔴 AND ON A DEVICE WITH ROOM, "a LATER fold pays" IS THE WHOLE COST OF A
+  // WARM FOLD. Measured at 68 tokens on an A100: re-uploading these is 561 MiB
+  // in 1341 writeBuffer calls, waited for inside the pairformer's
+  // onSubmittedWorkDone rather than in any compute pass - which is why
+  // tools/gpu/profile.js saw 144 ms of a 1300 ms fold and the rest looked like
+  // nothing. `keepTrunkWeights` is a per-device prior, null everywhere the
+  // trade has not been measured.
+  if (deviceTuning(device).keepTrunkWeights !== true) releaseResidentWeights(device, "w.");
 
   // 🔴 OpenDDE RE-TOKENISES BETWEEN THE TRUNK AND THE DIFFUSION, AND THIS IS
   // WHERE. Every other model here folds one token space end to end; OpenDDE
@@ -779,10 +788,18 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // The cost is that the NEXT fold packs and uploads them again. On unified
   // memory that is the packing and not the transfer; see the measurement in
   // the commit that added this.
-  releaseResidentWeights(device, "difftx.");
-  // ...and the diffusion conditioning's, which are resident for the same
-  // reason and dead at the same moment.
-  releaseResidentWeights(device, "cond.");
+  //
+  // 🔴 AND ON A DEVICE WITH ROOM THAT COST IS THE POINT. Measured at 68 tokens
+  // on an A100 with the trunk's weights already kept: 325 MiB and 24
+  // int5-upload passes are still re-done every fold, and the host waits for
+  // them on the queue rather than in any compute pass. `keepSamplerWeights` is
+  // the same shape of prior as `keepTrunkWeights` and null for the same reason.
+  if (deviceTuning(device).keepSamplerWeights !== true) {
+    releaseResidentWeights(device, "difftx.");
+    // ...and the diffusion conditioning's, which are resident for the same
+    // reason and dead at the same moment.
+    releaseResidentWeights(device, "cond.");
+  }
 
   // 🔴 BACK TO RESIDUE TOKENS BEFORE ANYTHING ELSE READS THEM. The sampler
   // returned coordinates over the STRUCTURAL layout; the PDB writer, the
@@ -891,7 +908,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // second fold began with 52 blocks' weights on the device where the first
   // began with 48. They are the same prefix and the same policy: the trunk's
   // are given back every fold, so these are too.
-  releaseResidentWeights(device, "w.");
+  if (deviceTuning(device).keepTrunkWeights !== true) releaseResidentWeights(device, "w.");
 
   // 🔴 EVERYTHING BELOW IS THE CONFIDENCE HEAD'S, SO IT IS ABSENT WHERE THE
   // HEAD IS. A model without one returns no pLDDT, no pTM and no per-chain

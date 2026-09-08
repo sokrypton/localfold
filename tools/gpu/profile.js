@@ -53,6 +53,9 @@ export function profileDevice(device, options = {}) {
   // calls of 24 blocks is 384. The report carries this now; a caller with a
   // non-zero `dropped` is reading a prefix, not a fold.
   let dropped = 0;
+  let submits = 0;
+  const submit = device.queue.submit.bind(device.queue);
+  device.queue.submit = (buffers) => { submits += 1; return submit(buffers); };
   const createCommandEncoder = device.createCommandEncoder.bind(device);
 
   device.createCommandEncoder = (descriptor) => {
@@ -69,10 +72,24 @@ export function profileDevice(device, options = {}) {
       const at = next;
       next += 2;
       used = true;
-      spans.push({ label: pass.label ?? "(unlabelled)", at });
-      return beginComputePass({ ...pass, timestampWrites: {
+      const span = { label: pass.label ?? "(unlabelled)", at, groups: 0 };
+      spans.push(span);
+      const timed = beginComputePass({ ...pass, timestampWrites: {
         querySet, beginningOfPassWriteIndex: at, endOfPassWriteIndex: at + 1,
       } });
+      // 🔴 HOW MANY WORKGROUPS A PASS ASKED FOR, which is the question a pass
+      // TIME cannot answer and the one that found this model's worst kernel.
+      // The atom decoder's `start` was 1.89 ms in 26 workgroups - under 1% of
+      // this device - and nothing in a duration says so; a slow pass and an
+      // empty one look alike. Recorded per pass and summed per label by
+      // report(), so an underfilled kernel is visible without guessing which
+      // to suspect.
+      const dispatchWorkgroups = timed.dispatchWorkgroups.bind(timed);
+      timed.dispatchWorkgroups = (x = 1, y = 1, z = 1) => {
+        span.groups += x * y * z;
+        return dispatchWorkgroups(x, y, z);
+      };
+      return timed;
     };
     encoder.finish = (descriptorIn) => {
       // 🔴 RESOLVED BEFORE finish AND OUTSIDE ANY PASS, which is the only place
@@ -85,11 +102,53 @@ export function profileDevice(device, options = {}) {
   };
 
   return {
-    reset() { next = 0; spans = []; dropped = 0; },
+    reset() { next = 0; spans = []; dropped = 0; submits = 0; },
     /** Passes that found no slot. Non-zero means the report is a prefix. */
     dropped: () => dropped,
     capacityPasses: Math.floor(capacity / 2),
-    restore() { device.createCommandEncoder = createCommandEncoder; },
+    restore() {
+      device.createCommandEncoder = createCommandEncoder;
+      device.queue.submit = submit;
+    },
+    /**
+     * 🔴 THE SUM OF THE PASSES IS NOT HOW LONG THE GPU WAS BUSY FOR. `report`
+     * adds up each pass's own duration, which says nothing about the GAPS
+     * between them - and a gap is the GPU idle, waiting for a host that has
+     * not submitted the next thing yet. On unified memory those gaps are
+     * small; on a discrete card behind an IPC boundary they are where the time
+     * goes, and no per-pass total can see them.
+     *
+     * `span` is the first pass's start to the last pass's end, in GPU time.
+     * `idle` is that minus the sum, which is the bubble - and `submits` is how
+     * many times the host handed work over, because a bubble divided by the
+     * submits is what one hand-over costs.
+     */
+    async summary() {
+      const encoder = createCommandEncoder({ label: "profile.summary" });
+      encoder.copyBufferToBuffer(resolved, 0, readback, 0, capacity * 8);
+      submit([encoder.finish()]);
+      await readback.mapAsync(GPUMapMode.READ);
+      const stamps = new BigInt64Array(readback.getMappedRange().slice(0));
+      readback.unmap();
+      let first = null; let last = null; let sum = 0; let counted = 0;
+      for (const { at } of spans) {
+        const start = stamps[at]; const end = stamps[at + 1];
+        const ns = Number(end - start);
+        if (!Number.isFinite(ns) || ns < 0) continue;
+        sum += ns; counted += 1;
+        if (first === null || start < first) first = start;
+        if (last === null || end > last) last = end;
+      }
+      const spanNs = first === null ? 0 : Number(last - first);
+      return {
+        passes: counted,
+        submits,
+        sumMs: Number((sum / 1e6).toFixed(2)),
+        spanMs: Number((spanNs / 1e6).toFixed(2)),
+        idleMs: Number(((spanNs - sum) / 1e6).toFixed(2)),
+        idleShare: spanNs > 0 ? Number(((spanNs - sum) / spanNs).toFixed(3)) : 0,
+      };
+    },
     async report() {
       const encoder = createCommandEncoder({ label: "profile.readback" });
       encoder.copyBufferToBuffer(resolved, 0, readback, 0, capacity * 8);
@@ -98,16 +157,23 @@ export function profileDevice(device, options = {}) {
       const stamps = new BigInt64Array(readback.getMappedRange().slice(0));
       readback.unmap();
       const totals = new Map();
-      for (const { label, at } of spans) {
+      for (const { label, at, groups } of spans) {
         const nanoseconds = Number(stamps[at + 1] - stamps[at]);
         if (!Number.isFinite(nanoseconds) || nanoseconds < 0) continue;
-        const found = totals.get(label) ?? { label, ms: 0, passes: 0 };
+        const found = totals.get(label) ?? { label, ms: 0, passes: 0, groups: 0 };
         found.ms += nanoseconds / 1e6;
         found.passes += 1;
+        found.groups += groups ?? 0;
         totals.set(label, found);
       }
       return [...totals.values()]
-        .map((row) => ({ ...row, ms: Number(row.ms.toFixed(2)) }))
+        .map((row) => ({
+          ...row,
+          ms: Number(row.ms.toFixed(2)),
+          // The average dispatch, which is what "is this kernel filling the
+          // device" is asked of.
+          groupsPerPass: Math.round(row.groups / Math.max(row.passes, 1)),
+        }))
         .sort((a, b) => b.ms - a.ms);
     },
   };

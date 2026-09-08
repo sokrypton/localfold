@@ -1,4 +1,8 @@
 import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
+import {
+  deviceTuning, halfPrecisionAvailable, deviceMatrixConfig,
+} from "../runtime/device-profile.js";
+import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
 import { concatenateAs, writeInto } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -34,6 +38,19 @@ export const LINEAR_TILE = {
  */
 export const LINEAR_TILE_WIDE = { ...LINEAR_TILE, columnsPerLane: 8 };
 
+/**
+ * 🔴 128 ROWS AND 256 LANES, WHICH THE COMMENT ON chooseLinearTile SAYS IS
+ * SLOWER - AND IS, ON AN M2. On an A100 it is the fastest arm measured:
+ * 1.067 ms against the wide tile's 1.655 at 30208 x 256 x 1024, relRMS 0, and
+ * a whole AF2 fold comes back bit identical. The difference is occupancy - 64
+ * invocations is two warps of a machine that wants far more in flight - and
+ * that is why this is a per-device choice and not a replacement. See
+ * docs/A100.md, and src/runtime/device-profile.js for who decides.
+ */
+export const LINEAR_TILE_TALL = Object.freeze({
+  lanesX: 16, lanesY: 16, rowsPerLane: 8, columnsPerLane: 4,
+});
+
 export const linearTileRows = (tile = LINEAR_TILE) => tile.lanesY * tile.rowsPerLane;
 export const linearTileColumns = (tile = LINEAR_TILE) => tile.lanesX * tile.columnsPerLane;
 
@@ -54,10 +71,14 @@ export const linearTileColumns = (tile = LINEAR_TILE) => tile.lanesX * tile.colu
  * at every shape measured - so this is not a bandwidth story and a third tile
  * is not the next move.
  */
-export function chooseLinearTile({ rows, columns }) {
+export function chooseLinearTile({ rows, columns, device = undefined }) {
   const wide = Math.ceil(rows / linearTileRows(LINEAR_TILE_WIDE))
     * Math.ceil(columns / linearTileColumns(LINEAR_TILE_WIDE));
-  return wide >= 512 ? LINEAR_TILE_WIDE : LINEAR_TILE;
+  if (wide < 512) return LINEAR_TILE;
+  // The tall tile answers the same question the wide one does - what to do
+  // when the device is full - and answers it for a device with far more of it.
+  return device !== undefined && deviceTuning(device).linearTallTile
+    ? LINEAR_TILE_TALL : LINEAR_TILE_WIDE;
 }
 
 /**
@@ -87,11 +108,131 @@ export function chooseLinearTile({ rows, columns }) {
  * - they build the default shader once, at module level - so this only ever
  * decides for a block's transitions, which is where the rows are.
  */
-export function chooseLinearKernel({ rows, columns, device, requested = "auto" }) {
+/**
+ * The matrix-unit geometry for a projection, or null if this device cannot run
+ * one.
+ *
+ * 🔴 THE UNITS TAKE HALVES AND NOTHING ELSE ON NVIDIA, so this follows the f16
+ * flag rather than sitting beside it: an A100 offers no f32 component type at
+ * all and `--f16=off` must reach this too, or the switch stops being one
+ * switch. On an M2, which has f32 tiles, the same call simply returns null
+ * because that device reports 8x8x8 f32 configs and the geometry below is
+ * built for 16x16x16 - see docs/A100.md, and note that nothing here is a
+ * regression for it: it keeps createLinearShader.
+ *
+ * 🔴 AND THE SHAPE NO LONGER CONSTRAINS IT. Every edge of the staged kernel is
+ * zero-padded, so a 59-row track and a 30208-row alignment are the same case
+ * and the residual is safe on both. What is still a constraint is workgroup
+ * storage, which is checked here rather than by the pipeline.
+ *
+ * @returns {null | {blockRows: number, blockColumns: number, blockInner: number,
+ *   subgroupRows: number, subgroupColumns: number, tile: object, result: string,
+ *   vectorStaging: boolean}}
+ */
+/**
+ * 🔴 BELOW ABOUT A BILLION MULTIPLY-ACCUMULATES THE MATRIX PATH IS NOT FASTER,
+ * AND CAN BE HALF THE SPEED. It has a fixed cost a small shape cannot amortise:
+ * a workgroup stages a whole panel before it multiplies anything, and a device
+ * with 108 multiprocessors wants hundreds of workgroups before that pipeline is
+ * full. Swept on a 768x768 projection (bench-evoformer-linear.js --shape=difftx
+ * --rows=), matrix against the f16 vector kernel:
+ *
+ *     1920 rows (1.1 GMAC)   1.00x      7680 (4.5)   1.65x
+ *     3840      (2.3)        1.50x     30720 (18)    1.89x
+ *
+ * and below that the bench cannot resolve it, but the diffusion transformer
+ * can: at 240 x 768 -> 768, 0.14 GMAC, the best of six staged geometries
+ * reaches 1.88 TFLOP/s against the shipped FUSED kernel's 3.9 - half the speed,
+ * and raising the workgroup count from 12 to 192 moves it from 1.21 to 1.32.
+ * The shape is too small, not too serial.
+ */
+const MATRIX_LINEAR_MINIMUM_MACS = 1e9;
+
+export function chooseMatrixLinear({ inner, columns, device }) {
+  if (device === undefined) return null;
+  if (!halfPrecisionAvailable(device)) return null;
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return null;
+  const tile = { M: config.M, N: config.N, K: config.K };
+  // 🔴 OPT-IN PER ARCHITECTURE, because "has matrix units" is not "measured on
+  // matrix units". An M2 reports f32 and f16 configs at 8x8x8 and would
+  // otherwise be switched onto a kernel whose block was sized for 16x16x16.
+  const wanted = deviceTuning(device).matrixLinear;
+  if (wanted === null || wanted === undefined) return null;
+  // 🔴 AND THE BLOCK IS DERIVED FROM THE TILE, NOT WRITTEN DOWN. Eight
+  // accumulators a subgroup is what saturates the units - 308.6 TFLOP/s at 8
+  // against 310.9 at 32, tools/gpu/probe-matrix-ceiling.js - and more than that
+  // spills. Fixing the BLOCK instead of the accumulator count makes the budget
+  // a function of the device's tile, which is how a 128x128 block sized for
+  // 16x16x16 becomes 32 accumulators on a device offering 8x8x8. Derived, this
+  // reproduces the swept Ampere geometry exactly: 8 x 16 = 128 rows, 8 x 16 =
+  // 128 columns.
+  const subgroupRows = wanted.subgroupRows ?? 1;
+  const subgroupColumns = wanted.subgroupColumns ?? 8;
+  const {
+    blockRows = 8 * tile.M * subgroupRows,
+    blockColumns = subgroupColumns * tile.N,
+    blockInner = Math.max(16, tile.K),
+  } = wanted;
+  const geometry = {
+    blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns,
+    tile, result: config.resultComponentType, matrixElement: config.componentType,
+    // A vec4 read is 8-byte aligned, so every offset it forms must divide by
+    // four. It was worth 1.24 -> 0.70 ms, and the scalar path is correct
+    // whenever it does not hold.
+    vectorStaging: inner % 4 === 0 && columns % 4 === 0
+      && blockInner % 4 === 0 && blockColumns % 4 === 0,
+  };
+  const limit = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  if (stagedMatrixStorage(geometry) > limit) return null;
+  const threads = geometry.subgroupRows * geometry.subgroupColumns * 32;
+  if (threads > (device.limits?.maxComputeInvocationsPerWorkgroup ?? 256)) return null;
+  return geometry;
+}
+
+/** The dispatch grid a choice wants, whichever kernel it named. */
+export const linearKernelRows = (choice) =>
+  (choice.matrix ? choice.matrix.blockRows : linearTileRows(choice.tile));
+export const linearKernelColumns = (choice) =>
+  (choice.matrix ? choice.matrix.blockColumns : linearTileColumns(choice.tile));
+
+export function chooseLinearKernel({ rows, columns, inner, device, requested = "auto" }) {
   if (requested === "f32") {
     return {
-      tile: chooseLinearTile({ rows, columns }), precision: "f32", weightPrecision: "f32",
+      tile: chooseLinearTile({ rows, columns, device }), precision: "f32", weightPrecision: "f32",
     };
+  }
+  // 🔴 THE MATRIX PATH IS TRIED BEFORE EITHER f16 VECTOR BRANCH AND AFTER THE
+  // f32 REQUEST, because it IS the f16 path where the units exist: it takes
+  // halves and nothing else. On AF2's transition shapes it is 1.73x the f16
+  // vector kernel on the first and 1.57x on the second, at a FIFTH of the
+  // error - it accumulates in f32 where the vector kernel accumulates in f16.
+  //
+  // 🔴 AND IT HAS TO SIT ABOVE THE `requested === "f16"` BRANCH, NOT BELOW IT.
+  // Below, that branch returns first and the matrix path is unreachable for
+  // every caller that names f16 - which is the differential checker, so the
+  // one device with the units would have tested none of this. The `narrow >=
+  // 128` threshold further down is about a conversion the matrix path does not
+  // do, so it does not gate this either.
+  if (requested !== "f32") {
+    // 🔴 `inner` IS THE k EXTENT AND IT IS NOT `rows`. It only decides whether
+    // the vec4 staging path is legal, so getting it wrong is a silent 1.7x
+    // rather than a wrong answer - which is exactly the kind of thing that
+    // survives a checker. A transition runs two projections with the two
+    // channel counts swapped, so a caller passes the SMALLER as `inner` and
+    // the larger as `columns` and both passes are covered by one test.
+    // 🔴 THE SIZE GATE IS ON AUTOMATIC SELECTION ONLY, which is the same rule
+    // the f16 switch follows: a caller that NAMES f16 gets the matrix kernel
+    // at any size, so the differential checker keeps testing it on the 37-row
+    // shape it uses. Gated for every caller, the one device with the units
+    // would test none of this again.
+    const macs = rows * (inner ?? 0) * columns;
+    const bigEnough = requested !== "auto" || macs >= MATRIX_LINEAR_MINIMUM_MACS;
+    const matrix = inner === undefined || !bigEnough
+      ? null : chooseMatrixLinear({ inner, columns, device });
+    if (matrix !== null) {
+      return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16", matrix };
+    }
   }
   const narrow = Math.ceil(rows / linearTileRows(LINEAR_TILE))
     * Math.ceil(columns / linearTileColumns(LINEAR_TILE));
@@ -101,7 +242,7 @@ export function chooseLinearKernel({ rows, columns, device, requested = "auto" }
     }
     return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
   }
-  if (device?.features?.has("shader-f16") === true && narrow >= 128) {
+  if (halfPrecisionAvailable(device) && narrow >= 128) {
     // 🔴 THE WEIGHT BUFFER NARROWS WITH THE k LOOP, and it is a separate win
     // from it: this kernel re-reads the whole weight set once per row tile -
     // 944 times for a 512-row alignment, about 2 GB against a 2 MiB working
@@ -111,7 +252,7 @@ export function chooseLinearKernel({ rows, columns, device, requested = "auto" }
     // AF2 uploads per block, which it does on every pass of every recycle.
     return { tile: LINEAR_TILE, precision: "f16", weightPrecision: "f16" };
   }
-  return { tile: chooseLinearTile({ rows, columns }), precision: "f32", weightPrecision: "f32" };
+  return { tile: chooseLinearTile({ rows, columns, device }), precision: "f32", weightPrecision: "f32" };
 }
 
 export const TRANSITION_TILE_COLUMNS = linearTileColumns();
@@ -156,8 +297,11 @@ const gcd = (left, right) => {
  * when it is bound. Splitting the rows is what makes long sequences possible.
  *
  * 🔴 THE CHUNK IS ALIGNED TWICE OVER, and both alignments are load-bearing:
- *   - to TRANSITION_TILE_ROWS, because the linear kernels tile rows by 16 and a
- *     chunk that is not a whole number of tiles would leave a ragged edge;
+ *   - to the TILE's row count, because the linear kernels tile rows and a chunk
+ *     that is not a whole number of tiles would leave a ragged edge. This was
+ *     TRANSITION_TILE_ROWS, a module constant - correct only while every tile
+ *     had 32 rows, which LINEAR_TILE_TALL is the first not to. It is a
+ *     parameter now and the caller passes `linearTileRows(tile)`;
  *   - to minStorageBufferOffsetAlignment (256 bytes), because each chunk BINDS
  *     at a row offset, and a binding offset that is not a multiple of 256 is a
  *     validation error rather than a slow path.
@@ -175,6 +319,7 @@ export function transitionChunkRows(
   hiddenChannels,
   maxStorageBufferBindingSize,
   minStorageBufferOffsetAlignment = 256,
+  tileRows = TRANSITION_TILE_ROWS,
 ) {
   if (![rows, channels, hiddenChannels, maxStorageBufferBindingSize, minStorageBufferOffsetAlignment]
     .every((value) => Number.isSafeInteger(value) && value > 0)) {
@@ -188,8 +333,8 @@ export function transitionChunkRows(
   const sourceRowBytes = channels * Float32Array.BYTES_PER_ELEMENT;
   const offsetRowAlignment = minStorageBufferOffsetAlignment
     / gcd(sourceRowBytes, minStorageBufferOffsetAlignment);
-  const rowAlignment = TRANSITION_TILE_ROWS * offsetRowAlignment
-    / gcd(TRANSITION_TILE_ROWS, offsetRowAlignment);
+  const rowAlignment = tileRows * offsetRowAlignment
+    / gcd(tileRows, offsetRowAlignment);
   if (rows <= capacity) return rows;
   if (capacity < rowAlignment) {
     throw new RangeError("WebGPU storage binding cannot hold one aligned transition chunk");
@@ -545,10 +690,9 @@ ${store.join("\n")}
  */
 export function createTransitionShaders(
   input, offsets, tile = LINEAR_TILE, precision = "f32", weightPrecision = "f32",
-  hiddenStorage = "f32",
+  hiddenStorage = "f32", matrix = null,
 ) {
   void input;
-  void offsets;
   // The normalize pass binds the SAME buffer as the two linear passes, so it
   // narrows with them or reads half the values at twice the stride.
   const weight16 = weightPrecision === "f16";
@@ -618,6 +762,28 @@ fn main(
 }`;
   // The first pass WRITES the hidden activation and the second READS it, so
   // the storage appears on opposite sides of the same argument list.
+  if (matrix !== null) {
+    // The same three shaders, on the matrix units. The normalize pass is
+    // untouched - it is a row reduction, not a projection.
+    // 🔴 THE WEIGHT BASE DECIDES WHETHER THE VEC4 PATH IS LEGAL, AND IT IS
+    // DIFFERENT FOR THE TWO PASSES. Both projections live in one packed buffer
+    // at offsets[2] and offsets[4]; a vec4 read at an unaligned base returns
+    // the four elements of the containing quad, which shifts the whole weight
+    // panel and is wrong rather than slow. So this is asked per pass, and a
+    // pass that cannot have it gets the scalar staging and stays correct.
+    const staged = (residual, sourcePrecision, outputPrecision, weightBase) =>
+      createStagedMatrixShader({
+        ...matrix,
+        vectorStaging: matrix.vectorStaging && weightBase % 4 === 0,
+        residual, sourcePrecision, weightPrecision, outputPrecision,
+      });
+    return [
+      normalize,
+      staged(false, "f32", hiddenStorage, offsets[2]),
+      staged(false, hiddenStorage, "f32", offsets[4]),
+      staged(true, hiddenStorage, "f32", offsets[4]),
+    ];
+  }
   const first = createLinearShader(tile, false, precision, weightPrecision, "f32", hiddenStorage);
   const [second, secondResidual] = [false, true].map((residual) =>
     createLinearShader(tile, residual, precision, weightPrecision, hiddenStorage, "f32"));
@@ -654,16 +820,20 @@ export class TransitionGpu {
     // The same choice the block encoders make, so this path - and the
     // differential checker that drives it - exercises whichever tile a fold of
     // this shape would actually run.
-    const { tile, precision, weightPrecision } = chooseLinearKernel({
-      rows: input.rows, columns: Math.max(input.channels, input.hiddenChannels),
+    const choice = chooseLinearKernel({
+      rows: input.rows,
+      columns: Math.max(input.channels, input.hiddenChannels),
+      inner: Math.min(input.channels, input.hiddenChannels),
       device: this.device, requested: this.options?.precision ?? "auto",
     });
+    const { tile, precision, weightPrecision, matrix } = choice;
     const packed = packTransitionWeights(input, weightPrecision);
-    const tileColumns = linearTileColumns(tile);
+    const tileColumns = linearKernelColumns(choice);
     const code = createTransitionShaders(
-      input, packed.offsets, tile, precision, weightPrecision);
+      input, packed.offsets, tile, precision, weightPrecision, "f32", matrix ?? null);
     const key = `transition:${input.rows}:${input.channels}:${input.hiddenChannels}`
-      + `:${input.epsilon ?? 1e-5}:${tileColumns}:${precision}:${weightPrecision}`;
+      + `:${input.epsilon ?? 1e-5}:${tileColumns}:${precision}:${weightPrecision}`
+      + `:${matrix ? `m${matrix.blockRows}x${matrix.blockInner}` : "t"}`;
     const pipelines = [];
     for (let index = 0; index < code.length; index += 1) {
       pipelines.push(await this.pipelines.get(`${key}:${index}`, code[index]));
@@ -707,9 +877,9 @@ export class TransitionGpu {
       pass(pipelines[0], [source.buffer, weights.buffer, layerNormParameters.buffer, normalized.buffer],
         Math.min(input.rows, GRID_WIDTH), ceilDivide(input.rows, GRID_WIDTH));
       pass(pipelines[1], [normalized.buffer, weights.buffer, firstParameters.buffer, hidden.buffer],
-        ceilDivide(input.hiddenChannels, tileColumns), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
+        ceilDivide(input.hiddenChannels, tileColumns), ceilDivide(input.rows, linearKernelRows(choice)));
       pass(pipelines[1], [hidden.buffer, weights.buffer, secondParameters.buffer, output.buffer],
-        ceilDivide(input.channels, tileColumns), ceilDivide(input.rows, TRANSITION_TILE_ROWS));
+        ceilDivide(input.channels, tileColumns), ceilDivide(input.rows, linearKernelRows(choice)));
       encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, input.rows * input.channels * 4);
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

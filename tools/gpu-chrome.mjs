@@ -29,7 +29,55 @@ import { extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+// 🔴 THE BROWSER IS NOT ALWAYS AT THE MAC PATH. This was a hard-coded
+// /Applications path, which makes every GPU tool in this repository - the
+// benches, the probes, the differential checkers - unrunnable anywhere but a
+// Mac. LOCALFOLD_CHROME overrides it; otherwise it is the Mac bundle on darwin
+// and `google-chrome` on the PATH elsewhere.
+const CHROME = process.env.LOCALFOLD_CHROME
+  ?? (process.platform === "darwin"
+    ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    : "google-chrome");
+
+// 🔴 AND ON LINUX/NVIDIA THE DEFAULTS GET YOU SwiftShader, SILENTLY. Chrome
+// answers `requestAdapter` with its software fallback and the page runs - at
+// about 1/1000 of the device - so a bench that has not checked
+// `adapter.info.vendor` is measuring a CPU. Four things are needed together
+// and the discovery order was: `--enable-features=Vulkan --use-vulkan=native`
+// to bring up Dawn's Vulkan backend at all; a Vulkan LOADER new enough to know
+// `VK_EXT_surface_maintenance1` (Ubuntu 22.04's 1.3.204 predates the extension
+// and `vkCreateInstance` fails -7, VK_ERROR_EXTENSION_NOT_PRESENT); and then -
+// the one that costs the most time to find - NO `--headless=new`, because
+// headless Chrome demands `VK_EXT_headless_surface`, which the NVIDIA driver
+// does not implement and Mesa's llvmpipe does. So it runs HEADFUL against an
+// X server, which on a GPU box means Xvfb. `LOCALFOLD_HEADLESS=1` forces the
+// headless flag back on for a machine whose driver does have that extension.
+const LINUX_HEADLESS = process.env.LOCALFOLD_HEADLESS === "1";
+//
+// 🔴 AND `shader-f16` IS OFF ON EVERY NVIDIA GPU UNTIL A DAWN TOGGLE SAYS
+// OTHERWISE. This is not the driver and not the hardware. Dawn's
+// PhysicalDeviceVk.cpp passes this device on all four of its stated
+// conditions - `VK_KHR_shader_float16_int8`, `shaderFloat16`, `shaderInt16`
+// and `storageBuffer16BitAccess` are all true here, checked against the exact
+// structs it reads - and then refuses anyway, a few hundred lines further
+// down, in a second gate nothing in the first hints at:
+//
+//     // TODO(crbug.com/42251215): Investigate f16 CTS test failures ...
+//     if (gpu_info::IsNvidia(mVendorId) &&
+//         !toggles.IsEnabled(Toggle::VulkanEnableF16OnNvidia)) { ... }
+//
+// So it is a policy block on the whole vendor pending a CTS investigation,
+// and `vulkan_enable_f16_on_nvidia` lifts it. With the toggle this adapter
+// advertises 24 features instead of 23 and the whole f16 path in src/ - which
+// is most of this repository's fast path - switches back on. It carries
+// Dawn's own caveat: they turned it off because f16 CTS tests were failing.
+// docs/A100.md records what this repository's differential checkers say
+// about that, which is the only evidence here that bears on it.
+const PLATFORM_FLAGS = process.platform === "linux"
+  ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
+     "--ignore-gpu-blocklist", "--no-sandbox",
+     "--enable-dawn-features=vulkan_enable_f16_on_nvidia"]
+  : [];
 const TYPES = {
   ".js": "text/javascript", ".mjs": "text/javascript", ".html": "text/html",
   ".json": "application/json", ".wgsl": "text/plain", ".bin": "application/octet-stream",
@@ -75,6 +123,21 @@ try {
   device.addEventListener("uncapturederror", (event) => {
     post({ ok: false, error: "uncaptured: " + event.error.message, logs });
   });
+  // 🔴 ONE SWITCH, AND EVERY TOOL GETS IT. --f16=off forces the f32 path on a
+  // device that HAS shader-f16, so the two arms can be compared without
+  // relaunching the browser - which is what makes them comparable at all on a
+  // machine that drifts. --f16=on is the default and is accepted so a script
+  // can name both arms symmetrically. NOTE: no backticks in this comment; it
+  // is inside the runner page's template literal and one would end it.
+  const f16Arg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--f16="));
+  if (f16Arg !== undefined) {
+    const { setHalfPrecision } = await import("/src/runtime/device-profile.js");
+    const wanted = f16Arg.slice("--f16=".length);
+    if (wanted !== "on" && wanted !== "off") throw new Error("--f16 takes on or off, not " + wanted);
+    setHalfPrecision(device, wanted === "on");
+    console.log("[gpu-chrome] half precision forced " + wanted
+      + " (device " + (device.features.has("shader-f16") ? "has" : "lacks") + " shader-f16)");
+  }
   const module = await import(${JSON.stringify(modulePath)});
   if (typeof module.main !== "function") throw new Error("module exports no main(device, args)");
   const value = await module.main(device, ${JSON.stringify(moduleArgs)});
@@ -132,7 +195,9 @@ async function main() {
   // fail in a way that looks like a GPU error.
   const profile = join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
   const chrome = spawn(CHROME, [
-    "--headless=new", "--enable-unsafe-webgpu", "--disable-gpu-sandbox",
+    ...(process.platform === "linux" && !LINUX_HEADLESS ? [] : ["--headless=new"]),
+    "--enable-unsafe-webgpu", "--disable-gpu-sandbox",
+    ...PLATFORM_FLAGS,
     // performance.memory rounds to 100 KiB without this, which is too coarse to
     // see a tensor cache being dropped. It affects nothing else.
     "--enable-precise-memory-info",

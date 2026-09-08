@@ -99,6 +99,10 @@ export async function main(device, args) {
       tokens, sequences: rows, templates: 4, targetFeat, features: batch.features,
       msaRows: msa, deletionMatrix, msaMask,
       bondMatrix: batch.bondMatrix, pairMask, seqMask, previousPair, previousSingle,
+      // 🔴 THE DISTOGRAM HEAD NEEDS ONE CLASS PER TOKEN and this bench never
+      // passed any, so every run of it died in #distogram before reaching a
+      // number. All-protein is what a single chain of amino acids is.
+      contactClasses: new Int32Array(tokens),
     }, weights.trunk, DIALECT, { onStage: (name, ms) => { timings[name] = Math.round(ms); } });
     previousPair = trunk.pair;
     previousSingle = trunk.single;

@@ -19,6 +19,7 @@
  * The blocks are src/af3/atom-encoder-webgpu.js's, with the decoder's weights.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
@@ -103,25 +104,37 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
 @group(0) @binding(5) var<storage, read_write> act: array<f32>;
 
+// 🔴 ONE INVOCATION PER (ROW, CHANNEL), NOT PER ROW. This used to give a
+// thread a whole row and loop C x C_TOKEN inside it - 128 x 768, about 98,000
+// multiply-adds serially - so a 1632-atom structure ran on 1632 threads in 26
+// workgroups. On a device with 108 multiprocessors that is under 1% occupancy,
+// and it measured 0.17 TFLOP/s: the single slowest kernel in the model by a
+// wide margin, and the largest single pass in a denoiser step at 1.89 ms.
+//
+// Splitting the channel out gives QUERY_ROWS x C invocations - 208,896 here,
+// which is about what this device has slots for - and costs nothing: the
+// token activation a row reads is now shared by the C threads of that row
+// rather than reloaded per channel, and consecutive threads take consecutive
+// channels, which is the coalesced direction in the weight matrix.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let row = id.x + id.y * GRID_WIDTH * 64u;
-  if (row >= QUERY_ROWS) { return; }
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= QUERY_ROWS * C) { return; }
+  let row = index / C;
+  let c = index % C;
   let live = gathers[G_TA_MASK + row] != 0;
   // The gather is into token-atom layout; the token is that slot / DENSE.
   let slot = u32(max(gathers[G_TA_IDX + row], 0));
   let token = slot / DENSE;
 
-  for (var c = 0u; c < C; c += 1u) {
-    var value = 0.0;
-    if (live) {
-      for (var d = 0u; d < C_TOKEN; d += 1u) {
-        value += token_act[token * C_TOKEN + d]
-          * weights[P_projectTokenFeaturesForBroadcast + d * C + c];
-      }
+  var value = 0.0;
+  if (live) {
+    for (var d = 0u; d < C_TOKEN; d += 1u) {
+      value += token_act[token * C_TOKEN + d]
+        * weights[P_projectTokenFeaturesForBroadcast + d * C + c];
     }
-    act[row * C + c] = (value + skip[row * C + c]) * queries_mask[row];
   }
+  act[row * C + c] = (value + skip[row * C + c]) * queries_mask[row];
 }`;
 
   // Mask, LayerNorm, project to three, and scatter back to token-atom layout.
@@ -207,9 +220,11 @@ export class Af3AtomDecoderGpu {
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
       blocks: weights.blocks.length,
+      atomRowTile: deviceTuning(this.device).atomRowTile ?? undefined,
     };
     const sources = createAtomDecoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`
+      + `:rt${shape.outputRowTile ?? "d"}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
@@ -371,7 +386,8 @@ export class Af3AtomDecoderGpu {
         const pr = lin(pairRows);
         run("pair-logits", compiled.pairLogits, [pairCond, pairWeights, logits], pr[0], pr[1]);
       }
-      const qr = lin(queryRows);
+      // ...and the grid follows: one invocation per (row, channel).
+      const qr = lin(queryRows * channels);
       run("start", compiled.start,
           [tokenActBuffer, skip, queriesMask, gatherBuffer, pairWeights, act], qr[0], qr[1]);
 

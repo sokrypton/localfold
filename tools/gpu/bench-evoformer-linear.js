@@ -25,6 +25,8 @@
  */
 import { createLinearShader } from "../../src/evoformer/transition.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
+import { deviceMatrixConfig } from "../../src/runtime/device-profile.js";
+import { createStagedMatrixShader, stagedMatrixFits, stagedMatrixStorage } from "./gemm-matrix-staged.js";
 import { float32ToFloat16Array } from "../../src/runtime/float16.js";
 
 const option = (args, name, fallback) => {
@@ -151,6 +153,16 @@ const SHAPES = {
   single: { rows: 59, inner: 384, columns: 384, activation: 1 },
   // A long chain's pair transition, which is the same kernel again.
   pair: { rows: 150 * 150, inner: 128, columns: 512, activation: 1 },
+  // 🔴 THE DIFFUSION TRANSFORMER'S qkvg, AS A PLAIN GEMM. Its own fused kernel
+  // runs this at about 21% of the device's arithmetic ceiling and the question
+  // that shape raises is whether a BETTER kernel would do better - which is
+  // the same question as "would a compiler, or a framework, close the gap to
+  // JAX". This arm answers it with the best generic GEMM in the tree at the
+  // same M, K and N.
+  difftx: { rows: 240, inner: 768, columns: 768, activation: 0 },
+  // A square one, so this kernel has a number comparable with anybody's
+  // matmul benchmark - jax-js's, for instance.
+  square: { rows: 2048, inner: 2048, columns: 2048, activation: 0 },
 };
 
 export async function main(device, args) {
@@ -242,7 +254,60 @@ export async function main(device, args) {
       continue;
     }
     let shader; let tile; let matrixElement = null;
-    if (tileSpec.startsWith("matrix")) {
+    if (tileSpec.startsWith("staged")) {
+      // `staged128x128x32` is blockRows x blockColumns x blockInner, with the
+      // subgroup grid appended: `staged128x128x32x2x4` is eight subgroups as
+      // two down by four across. See gemm-matrix-staged.js.
+      if (!device.features.has("chromium-experimental-subgroup-matrix")) {
+        results.push({ arm: spec, skipped: "no chromium-experimental-subgroup-matrix" });
+        continue;
+      }
+      const config = deviceMatrixConfig(device, { element: precision });
+      if (config === null) {
+        results.push({ arm: spec, skipped: `no ${precision} matrix config on this device` });
+        continue;
+      }
+      const [blockRows = 128, blockColumns = 128, blockInner = 32, subgroupRows = 2,
+        subgroupColumns = 4] = tileSpec.slice("staged".length).replace(/v$/, "").split("x").map(Number);
+      if (!stagedMatrixFits({ rows, columns }, { blockRows, blockColumns })) {
+        results.push({
+          arm: spec,
+          skipped: `a ${blockRows}x${blockColumns} region does not fit ${rows}x${columns}`,
+        });
+        continue;
+      }
+      const bytes = stagedMatrixStorage({
+        blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns,
+        tile: { M: config.M, N: config.N, K: config.K }, result: config.resultComponentType,
+      });
+      if (bytes > device.limits.maxComputeWorkgroupStorageSize) {
+        results.push({
+          arm: spec,
+          skipped: `staging ${bytes} B over the ${device.limits.maxComputeWorkgroupStorageSize} B limit`,
+        });
+        continue;
+      }
+      matrixElement = precision;
+      // A vec4 read is 8-byte aligned, so every offset it forms must divide by
+      // four. `staged...v` asks for it; the arm is skipped rather than made
+      // quietly wrong when the shape cannot promise it.
+      const vectorStaging = tileSpec.endsWith("v");
+      if (vectorStaging && (inner % 4 !== 0 || columns % 4 !== 0)) {
+        results.push({ arm: spec, skipped: `vector staging needs inner and columns divisible by 4` });
+        continue;
+      }
+      shader = createStagedMatrixShader({
+        blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns,
+        result: config.resultComponentType, matrixElement: config.componentType,
+        vectorStaging,
+        // 🔴 THE BINDING DECIDES, NOT THE SPEC. The bench hands the HALF weight
+        // buffer to any arm whose matrix element is f16, so the shader has to
+        // declare it that way or read every other value at twice the stride.
+        sourcePrecision: precision, weightPrecision: precision,
+        tile: { M: config.M, N: config.N, K: config.K },
+      });
+      tile = { rows: blockRows, columns: blockColumns };
+    } else if (tileSpec.startsWith("matrix")) {
       // `matrix4` is a 32x32 region per subgroup; `matrix8x16` is the shipped
       // 64x128 geometry, which is the one a caller keeping the existing
       // dispatch grid would have to use. `@f16` picks the f16 units, which on
@@ -258,20 +323,48 @@ export async function main(device, args) {
       const [blocks, columnBlocks = blocks, subBlocks = blocks, subColumnBlocks = subBlocks] =
         tileSpec.slice("matrix".length).split("x").map(Number);
       if (!blocks) throw new Error(`arm ${spec} is not a matrix geometry`);
-      // A region larger than the tensor cannot slide back and reads as a
-      // moderate wrong answer rather than an error; skip loudly instead.
-      if (!matrixLinearFits({ rows, columns }, { blocks, columnBlocks })) {
+      // 🔴 THE TILE IS THE DEVICE'S. An M2 offers 8x8x8 in f32 and f16; an A100
+      // offers 16x16x16 in f16 ONLY, and asking it for an f32 tile does not
+      // degrade - the pipeline is rejected. So the geometry numbers count
+      // TILES, and what a tile is comes from the adapter.
+      const config = deviceMatrixConfig(device, { element: precision });
+      if (config === null) {
         results.push({
           arm: spec,
-          skipped: `a ${blocks * 8}x${columnBlocks * 8} region does not fit ${rows}x${columns}`,
+          skipped: `no ${precision} matrix config on this device`,
+        });
+        continue;
+      }
+      const matrixTile = { M: config.M, N: config.N, K: config.K };
+      // A region larger than the tensor cannot slide back and reads as a
+      // moderate wrong answer rather than an error; skip loudly instead.
+      if (!matrixLinearFits({ rows, columns }, { blocks, columnBlocks, tile: matrixTile })) {
+        results.push({
+          arm: spec,
+          skipped: `a ${blocks * matrixTile.M}x${columnBlocks * matrixTile.N} region`
+            + ` does not fit ${rows}x${columns}`,
+        });
+        continue;
+      }
+      // 🔴 A REGION IS STAGED IN WORKGROUP MEMORY, AND THE LIMIT BINDS SOONER
+      // WITH A 16x16 TILE. `matrix8` is 64x64 on an M2 and 128x128 here, which
+      // is 64 KiB of f32 against a 48 KiB limit - a sweep that does not check
+      // this dies on one arm and reports none of the others.
+      const stagedBytes = blocks * matrixTile.M * columnBlocks * matrixTile.N
+        * (config.resultComponentType === "f32" ? 4 : 2);
+      if (stagedBytes > device.limits.maxComputeWorkgroupStorageSize) {
+        results.push({
+          arm: spec,
+          skipped: `staging ${stagedBytes} B over the ${device.limits.maxComputeWorkgroupStorageSize} B limit`,
         });
         continue;
       }
       matrixElement = precision;
       shader = createMatrixLinearShader({
         blocks, columnBlocks, subBlocks, subColumnBlocks, element: precision,
+        tile: matrixTile, result: config.resultComponentType,
       });
-      tile = { rows: blocks * 8, columns: columnBlocks * 8 };
+      tile = { rows: blocks * matrixTile.M, columns: columnBlocks * matrixTile.N };
     } else if (tileSpec === "legacy") {
       if (precision !== "f32") throw new Error("the legacy kernel has no precision option");
       shader = LEGACY_SHADER;

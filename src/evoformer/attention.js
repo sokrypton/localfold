@@ -1,4 +1,5 @@
 import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
+import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -518,7 +519,7 @@ export function selectAttentionProjectKernel(
   valueStorage = outputStorage,
 ) {
   const precision = requested !== "auto" ? requested
-    : device?.features?.has("shader-f16") ? "f16" : "f32";
+    : halfPrecisionAvailable(device) ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
     throw new Error("the f16 attention projection requires the shader-f16 feature");
   }
@@ -1628,7 +1629,20 @@ export function selectAttentionFlashKernel(
     // smallest single gain. bench-msa-attention.js's `auto/h` arm is the
     // measurement.
     const precision = requestedPrecision !== "auto" ? requestedPrecision
-      : device.features?.has("shader-f16") ? "chunk16" : "f32";
+      : halfPrecisionAvailable(device) ? "chunk16" : "f32";
+    // 🔴 HOW MANY KEYS SHARE A RESCALE IS A DEVICE PROPERTY, AND NOTHING USED
+    // TO ASK. `createAttentionRegisterFlashShader` has taken `group` and
+    // `vectorScore` for as long as bench-msa-attention.js has had arms for
+    // them, and this function passed neither - so every device got `group: 1`
+    // whatever it wanted. On an A100 `g4v` measures **1.226x** on the largest
+    // kernel in an evoformer block (1.494 ms against 1.831), flat across key
+    // chunks of 16, 32 and 64, so it is the grouped rescale and not the
+    // staging. It reassociates the online softmax - relRMS 3e-7 against the
+    // ungrouped arm, and an AF2 fold moves mean pLDDT 58.775 -> 58.753 - which
+    // is the same class of difference the key chunk already carries, and is
+    // why it is gated on check-evoformer-attention.js rather than a stopwatch.
+    // The M2's answer is the default; see src/runtime/device-profile.js.
+    const { attentionGroup: group, attentionVectorScore: vectorScore } = deviceTuning(device);
     const inputStorage = storage.input ?? "f32";
     const outputStorage = storage.output ?? "f32";
     // The VALUE follows the other inputs unless a caller separates it. See the
@@ -1642,9 +1656,14 @@ export function selectAttentionFlashKernel(
       cacheKey: `attention:flash-registers-${headDim}-${precision}`
         + (inputStorage === "f32" && outputStorage === "f32"
           ? "" : `-storage${inputStorage}${outputStorage}`)
-        + (valueStorage === inputStorage ? "" : `-value${valueStorage}`),
+        + (valueStorage === inputStorage ? "" : `-value${valueStorage}`)
+        // ...and the softmax shape, which is a DEVICE choice - see below. It
+        // joins the key only when it differs from the one every device had, so
+        // an entry made before this option existed cannot collide.
+        + (group === 1 && !vectorScore ? "" : `-g${group}${vectorScore ? "v" : ""}`),
       shader: createAttentionRegisterFlashShader(
-        headDim, undefined, { precision, inputStorage, valueStorage, outputStorage }),
+        headDim, undefined, { precision, inputStorage, valueStorage, outputStorage,
+          group, vectorScore }),
       queryTile: 64, variant, packedStorageSupported: true, valueStorage,
     };
   }
@@ -1860,7 +1879,7 @@ export function selectAttentionOutputKernel(
   device, residual, requested = "auto", sourceStorage = "f32",
 ) {
   const precision = requested !== "auto" ? requested
-    : device?.features?.has("shader-f16") ? "f16" : "f32";
+    : halfPrecisionAvailable(device) ? "f16" : "f32";
   if (precision === "f16" && device?.features?.has("shader-f16") !== true) {
     throw new Error("the f16 attention output projection requires the shader-f16 feature");
   }

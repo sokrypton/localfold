@@ -32,6 +32,7 @@
  * key's own.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
@@ -512,16 +513,32 @@ ${perBlockPair
  * 16 and 22, tile 8 gives 20 and 26. A real protein has thousands of atoms and
  * wants the larger tile.
  */
-export function outputRowTileFor(queryRows) {
+export function outputRowTileFor(queryRows, target = 256) {
   for (const tile of [8, 4, 2]) {
-    if (queryRows / tile >= 256) return tile;
+    if (queryRows / tile >= target) return tile;
   }
   return 1;
 }
 
 export function createAtomBlockShaders(common, shape) {
+  // 🔴 THE 256 IS A WORKGROUP TARGET AND IT IS AN M2'S. This rule takes the
+  // largest row tile that still leaves 256 workgroups, which is the right
+  // number for a device with a handful of cores and not for one with 108: at
+  // 1632 atoms it picks a tile of four, 408 workgroups of 64 lanes, 26k threads
+  // against ~221k slots. `workgroupTarget` is the same rule with the number
+  // named, so a device prior can raise it. See src/runtime/device-profile.js.
+  // 🔴 A DIRECT TILE WITH A CROSSOVER, WHERE A DEVICE ASKS FOR ONE. The default
+  // rule below takes the largest tile leaving 256 workgroups, which is right
+  // for a device with a handful of cores. An A100 wants tile 1 on a small
+  // structure and tile 8 on a large one, and no workgroup target expresses
+  // both - see src/runtime/device-profile.js, including the tile-4 cliff that
+  // makes this name tiles rather than a target.
+  const queryRows = shape.subsets * shape.queries;
+  const rowRule = shape.atomRowTile;
   const outputRowTile = shape.outputRowTile
-    ?? outputRowTileFor(shape.subsets * shape.queries);
+    ?? (rowRule === undefined
+      ? outputRowTileFor(queryRows)
+      : (queryRows < rowRule.crossover ? rowRule.below : rowRule.atOrAbove));
   const { channels, keys } = shape;
   // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
   // OpenDDE. See the note at `attendFor`.
@@ -1297,9 +1314,11 @@ export class Af3AtomEncoderGpu {
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
       perBlockPair, keyMaskedAtomAttention: keyMasked,
+      atomRowTile: deviceTuning(this.device).atomRowTile ?? undefined,
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
+      + `:rt${shape.outputRowTile ?? "d"}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
       + `:${perBlockPair}:${chainedNorm}:${keyMasked}`;
     const compiled = {};

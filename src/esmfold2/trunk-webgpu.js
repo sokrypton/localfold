@@ -28,6 +28,7 @@
  * recycles; if this trunk's four loops make it pay, it is one call to
  * residentWeightBuffer, the way src/af3/pairformer-block-webgpu.js does it.
  */
+import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -81,7 +82,7 @@ export class Esmfold2TrunkGpu {
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     const pairBytes = pairs * channels * 4;
 
-    const hasF16 = this.device.features?.has("shader-f16") === true;
+    const hasF16 = halfPrecisionAvailable(this.device);
     const stagedPrecision = this.options.stagedPrecision ?? (hasF16 ? "f16" : "f32");
     const weightPrecision = this.options.weightPrecision ?? "f32";
     // 🔴 BOTH KNOBS ARE f16, AND THE SECOND ONE IS PRICED AGAINST THE SAMPLER

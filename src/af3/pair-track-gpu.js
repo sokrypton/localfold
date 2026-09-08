@@ -167,7 +167,11 @@ export async function compilePairTrack(cache, options) {
     // of this track's updates do that now; see the note in
     // src/af3/transition-webgpu.js for what the add pass was costing.
     const { projectTile, contractTile, normalizeRows, projectGridWidth, ...sources } = createTriangleShaders(
-      shape, "f32", triangleOffsets, epsilon, direction, variance, undefined, true,
+      shape, "f32", triangleOffsets, epsilon, direction, variance,
+      // 🔴 THE PROJECTION TILE IS THE CALLER'S, because it is an occupancy
+      // choice and this file cannot see the device. undefined keeps
+      // src/triangle/shaders.js's default, which is every device but ampere.
+      options.triangleProjectTile ?? undefined, true,
       undefined,
       // 🔴 THE NORMALISED HIDDEN GOES BACK INTO `a`, WHICH IS DEAD BY THEN.
       // `tri.contract` is the last pass that reads scratch[1] and scratch[2],

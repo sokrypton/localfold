@@ -23,7 +23,11 @@ import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
 import { profileDevice } from "./profile.js";
+import { profileBuffers } from "./buffer-profile.js";
+import { setDeviceTuning, deviceTuning, DEFAULT_TUNING }
+  from "../../src/runtime/device-profile.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -284,6 +288,192 @@ export async function main(device, args) {
   // measures a cold process, which is the slowest fold there is. `--folds=2`
   // runs it twice and reports both, so the two can be told apart.
   const folds = Number(option(args, "folds", "1"));
+  const keepTrajectory = option(args, "trajectory", "on") !== "off";
+  // 🔴 SO THE SPLIT PATH'S COMPILATION COST CAN BE SEEN. Splitting K adds three
+  // pipelines a block, and pipeline compilation is most of a cold fold's
+  // one-time cost - so the arm that makes a warm fold faster could make a cold
+  // one slower, and only a cold/warm pair says which.
+  if (option(args, "splitk", null) === "off") {
+    setDeviceTuning(device, { diffusionSplitK: null });
+  }
+  // 🔴 THE CONTROL ARM FOR keepTrunkWeights. On a device whose prior sets it,
+  // --keep-weights=off restores the shipped behaviour (give the trunk's
+  // weights back every fold) so the two can be measured in one build.
+  // 🔴 AND `=on` IS THE ARM A DEVICE WITHOUT THE PRIOR NEEDS. keepTrunkWeights
+  // is null everywhere it has not been measured, so on an M2 the only way to
+  // find out what it is worth is to force it. The trade is 561 MiB of re-upload
+  // and re-PACKING against ~379 MiB of resident memory, and only the upload
+  // half is bus - on unified memory the bus is free (probe-bus.js) but the
+  // packing is not, so the answer there is not predictable from here.
+  // 🔴 FORCE ANY TUNING KNOB, BECAUSE A KNOB NO GATE ENTERS IS A KNOB NOBODY
+  // HAS CHECKED. `normSplits` was reachable, wrong and invisible for exactly
+  // that reason - the prior sets it to 1, so a whole-fold gate never took the
+  // path. Auditing the rest needed a bespoke flag per knob; this is the general
+  // one. `--tune=key=value,key=value`, values parsed as JSON so numbers,
+  // booleans, null and objects all work:
+  //
+  //     --tune=singleProjectLanes=128
+  //     --tune=attentionQueriesPerLane=2,diffusionLanes=64
+  //
+  // The test is degeneracy: a knob that only changes HOW something is computed
+  // must leave pLDDT and pTM bit-identical.
+  // 🔴 REPLAY A REAL DENOISER STEP'S INPUTS THROUGH BOTH SPLIT SETTINGS.
+  // check-difftx-splits.js drives the transformer with synthesised noise and
+  // passes every one of 106 arms, including the fold's EXACT 24-field shape,
+  // while a fold with normSplits=2 diverges on its FIRST denoiser step at
+  // relRMS 0.538. The one difference left is the tensor VALUES. This wraps the
+  // transformer, lets the fold's first (unchained, host-array) call through,
+  // and then re-runs that call's real inputs at normKSplits 1 and 2 on fresh
+  // instances. If they differ here it is the data; if they agree, the fault is
+  // outside the transformer and the head's plumbing is next.
+  if (args.includes("--replay-difftx")) {
+    const proto = Af3DiffusionTransformerGpu.prototype;
+    const original = proto.run;
+    let captured = false;
+    proto.run = async function replaying(act, cond, pairCond, mask, tokens, w, opts) {
+      const result = await original.call(this, act, cond, pairCond, mask, tokens, w, opts);
+      if (!captured && act instanceof Float32Array && cond instanceof Float32Array) {
+        captured = true;
+        const stat = (v) => {
+          let lo = Infinity; let hi = -Infinity; let sum = 0;
+          for (const x of v) { if (x < lo) lo = x; if (x > hi) hi = x; sum += x; }
+          return { min: Number(lo.toPrecision(4)), max: Number(hi.toPrecision(4)),
+                   mean: Number((sum / v.length).toPrecision(4)) };
+        };
+        const rel = (rawX, rawY) => {
+          const x = rawX?.output ?? rawX;
+          const y = rawY?.output ?? rawY;
+          if (!(x instanceof Float32Array) || !(y instanceof Float32Array)) return NaN;
+          let n = 0; let d = 0;
+          for (let i = 0; i < x.length; i += 1) { n += (x[i] - y[i]) ** 2; d += y[i] ** 2; }
+          return Math.sqrt(n / Math.max(d, 1e-30));
+        };
+        const at = async (normKSplits) => original.call(
+          new Af3DiffusionTransformerGpu(device), act, cond, pairCond, mask, tokens,
+          { ...w, normKSplits }, {});
+        const one = await at(1);
+        const two = await at(2);
+        // 🔴 A CHECKSUM, NOT min/max/mean. Those matched across both arms to
+        // four figures while the outputs differed, which is suggestive and not
+        // proof - two different arrays can share all three.
+        // 🔴 UNWRAP. run() resolves to {output, ...}; feeding the object to a
+        // length-indexed loop silently compared nothing and reported 0.
+        const sums = (raw) => {
+          const v = raw?.output ?? raw;
+          if (!(v instanceof Float32Array)) return `NOT-AN-ARRAY(${typeof v})`;
+          let sum = 0;
+          let sumsq = 0;
+          for (const x of v) { sum += x; sumsq += x * x; }
+          return `sum=${sum.toPrecision(12)} sumsq=${sumsq.toPrecision(12)}`;
+        };
+        console.log(`REPLAY IN act      ${sums(act)}`);
+        console.log(`REPLAY IN cond     ${sums(cond)}`);
+        console.log(`REPLAY IN pairCond ${sums(pairCond)}`);
+        // 🔴 AND THE FOLD'S OWN CONFIGURATION ON A FRESH INSTANCE. Not
+        // `{...w, normKSplits}` - `w` itself, exactly what the fold passed. If
+        // this reproduces the fold's own output then instance state is
+        // irrelevant; if it produces the OTHER arm's output, the fold's
+        // instance is the whole difference.
+        const asFold = await original.call(
+          new Af3DiffusionTransformerGpu(device), act, cond, pairCond, mask, tokens, w, {});
+        const asFoldOut = asFold?.output ?? asFold;
+        if (asFoldOut instanceof Float32Array) {
+          console.log(`REPLAY fresh instance, the FOLD'S OWN weights: ${sums(asFoldOut)}`);
+        }
+        console.log(`REPLAY act ${JSON.stringify(stat(act))}`);
+        console.log(`REPLAY cond ${JSON.stringify(stat(cond))}`);
+        console.log(`REPLAY pairCond ${JSON.stringify(stat(pairCond))}`);
+        console.log(`REPLAY tokens=${tokens} maskAllOnes=${mask.every((m) => m === 1)}`);
+        // 🔴 ABSOLUTE, NOT RELATIVE. Comparing at(1) to at(2) inside one process
+        // says they agree with EACH OTHER and nothing about whether either is
+        // right - and in the arm where the device rule is normSplits=2 they can
+        // both be wrong together, which is exactly what relRMS 0 would look
+        // like. Checksums are comparable ACROSS processes; a relRMS is not.
+        console.log(`REPLAY at(normKSplits=1) ${sums(one)}`);
+        console.log(`REPLAY at(normKSplits=2) ${sums(two)}`);
+        console.log(`REPLAY normKSplits 2 vs 1 on the FOLD'S OWN INPUTS:`
+          + ` relRMS ${rel(two, one).toExponential(3)}`);
+        // 🔴 AND THE FOLD'S OWN OUTPUT, WHICH IS THE THING THAT DIVERGES. The
+        // replay above uses a FRESH instance; the fold uses one that warm()
+        // touched during the trunk and that carries a compile memo, a scratch
+        // cache and a bind-group cache. If this checksum differs between arms
+        // while the replay does not, the fault is that instance state and not
+        // the shaders, the shape or the data - all three of which are now
+        // eliminated. Compared across two runs, whose inputs are identical
+        // because the seed and the trunk are.
+        const out = result?.output ?? result;
+        if (out instanceof Float32Array) {
+          let sum = 0;
+          let sumsq = 0;
+          for (const v of out) { sum += v; sumsq += v * v; }
+          console.log(`REPLAY fold's own transformer output:`
+            + ` n=${out.length} sum=${sum.toPrecision(12)} sumsq=${sumsq.toPrecision(12)}`);
+        } else {
+          console.log(`REPLAY fold's own output is not a host array (${typeof out})`);
+        }
+      }
+      return result;
+    };
+  }
+  const tune = option(args, "tune", "");
+  if (tune !== "") {
+    const forced = {};
+    for (const pair of tune.split(",").filter(Boolean)) {
+      const at = pair.indexOf("=");
+      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+      const key = pair.slice(0, at);
+      const raw = pair.slice(at + 1);
+      if (!(key in DEFAULT_TUNING)) {
+        throw new Error(`--tune names ${key}, which is not a tuning knob. `
+          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
+      }
+      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
+    }
+    setDeviceTuning(device, forced);
+    console.log(`tuning forced: ${JSON.stringify(forced)}`);
+  }
+  const keepWeights = option(args, "keep-weights", null);
+  if (keepWeights === "off") setDeviceTuning(device, { keepTrunkWeights: null });
+  if (keepWeights === "on") setDeviceTuning(device, { keepTrunkWeights: true });
+  const keepSampler = option(args, "keep-sampler-weights", null);
+  if (keepSampler === "off") setDeviceTuning(device, { keepSamplerWeights: null });
+  if (keepSampler === "on") setDeviceTuning(device, { keepSamplerWeights: true });
+  // 🔴 THE TWO SPLIT COUNTS THE PRIOR LEAVES AT ONE. attention-output, adaln and
+  // ffw-adaln are the three largest labels in a denoiser step and none of them
+  // is split; the prior sets attnSplits and normSplits to 1. Those were chosen
+  // while the crossover logic was still being debugged and against a target
+  // (33x on the diffusion) that turned out to be wrong by 17x, so they are
+  // worth re-sweeping. These patch the device's rule in place.
+  const attnSplits = option(args, "attn-splits", null);
+  const normSplits = option(args, "norm-splits", null);
+  // 🔴 THE PER-KERNEL TOKEN TILES, which --tune cannot reach: they live inside
+  // the diffusionSplitK object and --tune splits its argument on commas. A tile
+  // only moves when the matching K split is on - the split is what pays for it.
+  const attnTile = option(args, "attn-tile", null);
+  const outTileArg = option(args, "out-tile", null);
+  // 🔴 THE CROSSOVER, so the 175 can be re-asked. It was set from a measurement
+  // at 240 tokens - "the step is 46.63 ms against 46.68 before, unchanged" -
+  // taken before the conditioning hoist and the per-kernel tiles existed, and
+  // above it EVERY split disengages at once.
+  const crossover = option(args, "crossover", null);
+  if (attnSplits !== null || normSplits !== null
+      || attnTile !== null || outTileArg !== null || crossover !== null) {
+    const rule = deviceTuning(device).diffusionSplitK;
+    if (rule === null || rule === undefined) {
+      throw new Error("--attn-splits/--norm-splits/--attn-tile/--out-tile need "
+        + "a device with a diffusionSplitK rule");
+    }
+    setDeviceTuning(device, { diffusionSplitK: { ...rule,
+      ...(attnSplits === null ? {} : { attnSplits: Number(attnSplits) }),
+      ...(normSplits === null ? {} : { normSplits: Number(normSplits) }),
+      ...(attnTile === null ? {} : { attnTile: Number(attnTile) }),
+      ...(outTileArg === null ? {} : { outTile: Number(outTileArg) }),
+      ...(crossover === null ? {} : { crossover: Number(crossover) }) } });
+  }
+  const window = option(args, "submission-window", null);
+  if (window !== null) {
+    setDeviceTuning(device, { pairformerSubmissionWindow: Number(window) });
+  }
   // 🔴 --profile TIMES THE WHOLE FOLD, WHICH NOTHING ELSE DID. bench-trunk,
   // bench-head and bench-confidence each profile ONE stage against synthesised
   // inputs, so each says where its own time goes and none of them says what
@@ -294,6 +484,12 @@ export async function main(device, args) {
   // WARM one - the pipelines and the resident weights are cached for the life
   // of the device, and a cold process is not the fold the page shows twice.
   const profile = args.includes("--profile") ? profileDevice(device) : null;
+  // 🔴 --buffers ANSWERS THE QUESTION --profile CANNOT. profile.js wraps
+  // beginComputePass, which at 68 tokens is 10% of a fold; the other 90% is
+  // byte-proportional work outside every compute pass (forcing f32 adds 2.87 s
+  // of wall and 4 ms of compute). This times createBuffer, writeBuffer,
+  // copyBufferToBuffer, mapAsync and submit, so the remainder gets a name.
+  const buffers = args.includes("--buffers") ? profileBuffers(device) : null;
   // 🔴 A WHOLE FOLD DOES NOT FIT IN ONE PROFILE, and the device says so: the
   // query set is capped at 4096 timestamps, which is 2048 passes, and a
   // 200-token trunk alone uses all of them. `--profile-from=<stage>` resets at
@@ -309,6 +505,7 @@ export async function main(device, args) {
   let lastDenoised = null;
   for (let attempt = 0; attempt < folds; attempt += 1) {
   if (profile !== null && attempt === folds - 1) profile.reset();
+  if (buffers !== null && attempt === folds - 1) buffers.reset();
   const started = performance.now();
   trajectory.length = 0;
   lastDenoised = null;
@@ -384,6 +581,12 @@ export async function main(device, args) {
     },
     onStep: ({ step, noiseLevel, denoised, positions }) => {
       lastDenoised = denoised;
+      // 🔴 THE TRAJECTORY IS THE TOOL, AND IT IS INSIDE THE TIMED REGION.
+      // `foldSeconds` wraps foldBatch, callbacks included, so the two
+      // Array.from calls below are charged to the model. --trajectory=off
+      // turns them off, which is how a fold's number is separated from this
+      // file's contribution to it.
+      if (!keepTrajectory) return;
       // Every frame for a short run, every fourth for a long one - the whole
       // trajectory at 200 steps is 200 * 68 * 24 * 3 floats.
       if (steps <= 60 || step % 4 === 0 || step === steps) {
@@ -462,6 +665,33 @@ export async function main(device, args) {
       console.log(`    ${row.ms.toFixed(0).padStart(6)} ms x${String(row.passes).padEnd(5)} ${row.label}`);
     }
     profile.restore();
+  }
+
+  if (buffers !== null) {
+    const traffic = buffers.report();
+    const wall = foldSeconds[foldSeconds.length - 1] * 1000;
+    console.log(`buffer traffic: ${traffic.totalMs.toFixed(0)} ms of ${wall.toFixed(0)} ms wall`
+      + ` (${(100 * traffic.totalMs / wall).toFixed(0)}%)`);
+    // 🔴 REPORTED APART FROM THE SUM BECAUSE IT IS A UNION, NOT AN ADDEND.
+    // Dozens of onSubmittedWorkDone promises are outstanding at once, so this
+    // is how much of the fold had at least one wait pending - overlapping the
+    // rows above rather than adding to them.
+    console.log(`  queue drain: ${traffic.queueWait.unionMs.toFixed(0)} ms`
+      + ` (${(100 * traffic.queueWait.unionMs / wall).toFixed(0)}% of wall)`
+      + ` over ${traffic.queueWait.calls} onSubmittedWorkDone, union not sum`);
+    for (const row of traffic.byKind) {
+      console.log(`  ${row.ms.toFixed(0).padStart(6)} ms`
+        + ` ${(100 * row.ms / wall).toFixed(1).padStart(5)}%`
+        + ` x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB  ${row.kind}`);
+    }
+    console.log("  the twelve costliest, by buffer:");
+    for (const row of traffic.rows.slice(0, 12)) {
+      console.log(`    ${row.ms.toFixed(0).padStart(6)} ms x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB`
+        + `  ${row.kind} ${row.label}`);
+    }
+    buffers.restore();
   }
 
   // 🔴 THE DENOISED PREDICTION IS NOT THE SAMPLE, and at a coarse schedule they

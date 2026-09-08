@@ -163,11 +163,54 @@ export function packTransitionWeights(weights, precision = "f32") {
   return { data, offsets };
 }
 
+/**
+ * How wide the workgroup should be, from how many of them there will be.
+ *
+ * 🔴 THE DISPATCH IS ROWS ONLY, SO A SHORT TRACK CANNOT FILL A LARGE DEVICE.
+ * `main` takes `base_row = (group.x + group.y * GRID_WIDTH) * TILE`, and that
+ * is the whole grid - there is no second axis. So the thread count is
+ * `ceil(rows / tile) * WORKGROUP` and nothing else, and at 128 the AF3 trunk's
+ * SINGLE transition gets 200 rows x 128 = 25,600 threads on a device that
+ * holds 221,184. It measured 2.3% of this device's arithmetic ceiling while
+ * being 13.6% of the trunk's GPU time.
+ *
+ * Widening the workgroup is the only axis left, and it is enough. Measured on
+ * bench-transition.js at the two shapes the AF3 trunk actually runs:
+ *
+ *     single, 200 rows x 384 x 1536:   128 -> 0.594 ms   512 -> 0.208   2.86x
+ *     pair, 40000 rows x 128 x 512:    128 -> 1.098      512 -> 1.567   0.70x
+ *
+ * The pair track already has 5000 workgroups and a wider one only costs it
+ * occupancy, so the rule has to be a function of the workgroup COUNT rather
+ * than a new constant - which is what `threadTarget` is. On a device that
+ * wants ~25,000 threads (an M2) it returns the 128 it always did.
+ *
+ * 🔴 AND 768 IS NOT A CHOICE, IT IS A WRONG ANSWER. The bench reports width
+ * 768 at relRMS **0.55** against the same kernel at 128 - not slower, wrong -
+ * so the widths here are powers of two and `createTransitionShader` rejects
+ * anything else rather than trusting a caller. Whatever the reduction assumes,
+ * it assumes it of a power of two.
+ */
+export function transitionWidth(rows, tile, threadTarget, width = DEFAULT_WORKGROUP) {
+  if (!threadTarget) return width;
+  const groups = Math.max(1, Math.ceil(rows / tile));
+  for (const candidate of [512, 256]) {
+    if (groups * candidate <= threadTarget * 2) return candidate;
+  }
+  return width;
+}
+
 export function createTransitionShader(shape, offsets, epsilon, variance) {
   const { rows, channels, factor } = shape;
   const intermediate = channels * factor;
   const tile = shape.tile ?? transitionRowTile(rows, channels);
-  const WORKGROUP = shape.width ?? DEFAULT_WORKGROUP;
+  const WORKGROUP = shape.width
+    ?? transitionWidth(rows, tile, shape.threadTarget);
+  // 🔴 A POWER OF TWO OR NOTHING - see transitionWidth. 768 compiles, runs, and
+  // returns relRMS 0.55.
+  if ((WORKGROUP & (WORKGROUP - 1)) !== 0) {
+    throw new Error(`transition workgroup ${WORKGROUP} is not a power of two`);
+  }
   const chunk = shape.chunk ?? transitionChunk(intermediate, tile, WORKGROUP);
   if (intermediate % chunk !== 0) {
     throw new Error(`chunk ${chunk} does not divide intermediate ${intermediate}`);

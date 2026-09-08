@@ -104,6 +104,7 @@
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { EvoformerStackGpu } from "../../src/evoformer/stack.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -114,6 +115,22 @@ export async function main(device, args) {
   const length = Number(option(args, "length", "59"));
   const sequences = Number(option(args, "sequences", "5"));
   const block = Number(option(args, "block", "1"));
+  // 🔴 THE MATRIX BLOCK, SWEPT IN SITU RATHER THAN IN A BENCH. The isolated
+  // bench and a real block disagree about this kernel - the bench predicted
+  // 1.73x and a block measured 2.22x, because in situ the first pass reads an
+  // f32 activation and writes an f16 hidden one and the bench's arms all wrote
+  // f32. So the geometry is picked here. `--matrix=128x128x16x1x8`, or
+  // `--matrix=off` for the vector kernel.
+  const matrixArg = option(args, "matrix", null);
+  if (matrixArg === "off") {
+    setDeviceTuning(device, { halfPrecision: false });
+  } else if (matrixArg !== null) {
+    const [blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns] =
+      matrixArg.split("x").map(Number);
+    setDeviceTuning(device, {
+      matrixLinear: { blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns },
+    });
+  }
   const cM = 256;
 
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");

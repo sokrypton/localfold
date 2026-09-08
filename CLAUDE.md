@@ -36,6 +36,7 @@ values means the whole-stack checker, not that file.
 |---|---|
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
+| ...and did a KNOB change the structure, which pLDDT will not tell you? | `python3 tools/diff-fold-coords.py --b="--attn-splits=4"` - **`meanPlddt` matched to sixteen digits across an arm that moves 33 atoms** |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
 | What does AF2 predict, distogram and pLDDT, per recycle? | `tools/gpu/probe-af2-dgram-plddt.js --sample=10` |
 | Is the sampler converged at this step count? | `tools/gpu/probe-flow-sigma-by-size.js --panel=churn` |
@@ -49,11 +50,23 @@ values means the whole-stack checker, not that file.
 | What does AF2's column attention cost alone? | `tools/gpu/bench-msa-attention.js` |
 | What does a sampler step cost besides the denoiser? | `tools/gpu/probe-sampler-overhead.js` |
 | Where does a denoiser call's time go? | `tools/gpu/bench-head.js --profile` |
+| ...and is a pass filling the device, or just slow? | the same, and read `groupsPerPass` |
+| ...and where does the 90% that is NOT a compute pass go? | `tools/gpu/fold.js --buffers` (profile.js sees 10% of a fold) |
+| Does the sample dimension leave the one-sample path alone? | `tools/gpu/check-difftx-samples.js` |
+| ...and does the batched path compute the same thing S times? | `tools/gpu/check-difftx-batched.js` |
+| ...and does every K-split, tile and hoist compute the UNSPLIT answer? | `tools/gpu/check-difftx-splits.js` (**150 arms**; tiles and the conditioning hoist are held to relRms EXACTLY 0, K-splits to 1e-3) |
+| ...and does that checker's reference say "off" for the thing under test? | it must - the prior turns `batchedGates` ON, so a reference naming only the split counts compared the hoisted path **against itself**. Falsify every arm you add. |
+| ...and is a split worth its pass, below the drift? | `tools/gpu/bench-difftx-splits.js` (paired, interleaved, withholds a timing if the arms disagree) |
+| Comparing two tensors in a new checker? | `tools/gpu/relative-rms.js` - **an unguarded relRMS over a non-array returns exactly 0**, which is a perfect score from comparing nothing |
 | Where does a trunk pass's time go? | `tools/gpu/bench-trunk.js --profile --msa=1024` |
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
 | Does this device have matrix units, and in what shapes? | `tools/gpu/probe-subgroup-matrix.js` |
+| ...and what do its type parameters MEAN at a non-square shape? | `tools/gpu/check-subgroup-matrix-shapes.js` |
+| What do those matrix units ISSUE at? | `tools/gpu/probe-matrix-ceiling.js` |
+| Does the staged matrix projection compute a projection, in every precision? | `tools/gpu/check-staged-matrix.js` |
+| Is a projection short of threads, short of arithmetic intensity, or neither? | `tools/gpu/probe-split-k.js` |
 | What do `subgroupMatrixLoad`/`Store` actually mean here? | `tools/gpu/check-subgroup-matrix.js` |
 | Are the matrix units worth it on a dense projection? | `tools/gpu/bench-evoformer-linear.js --arms=8x8@f16/f16,matrix4` |
 | ...and against AF3's own fused projections? | `bench-{grid,triangle}-project.js --tokens=200 --matrix=1` |
@@ -61,11 +74,22 @@ values means the whole-stack checker, not that file.
 | What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
+| What does NATIVE AF3 cost, at settings LocalFold can match? | `tools/oracle/bench_af3_native.py --steps=1 --recycles=0 --num-msa=1` |
+| ...and why is sweeping `--num_diffusion_samples` the wrong way to ask? | the same file's header - samples are a vmap axis, not extra trajectories |
 | Does the template embedder match AF3 with a REAL template? | `tools/oracle/check_af3_template_geometry.js` |
 | Does AF2-multimer's template term match its reference? | `tools/gpu/check-multimer-template.js` |
 | ...and AF2-MONOMER's? | `tools/gpu/check-monomer-template.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
-| What is this device's actual ceiling? | `tools/gpu/probe-alu.js` |
+| What is this device's actual ceiling? | `tools/gpu/probe-alu.js` (raise `--iterations` on anything faster than an M2) |
+| ...and is its VECTOR ceiling real, or dead lanes? | `tools/gpu/probe-alu-lanes.js` |
+| Which per-device kernel knobs does THIS device want? | `tools/gpu/probe-tuning.js` |
+| ...and does forcing one still fold the SAME structure? | `tools/gpu/fold.js --tune=key=value` (a knob no gate enters is a knob nobody has checked) |
+| ...and the PER-KERNEL tiles and splits, which `--tune` cannot reach? | `fold.js --attn-tile= --out-tile= --attn-splits= --norm-splits=` (they live inside `diffusionSplitK` and `--tune` splits its argument on commas) |
+| Is a conditioning projection still inside the block loop? | it should not be - see `packZeroGateWeights`, and `--tune=diffusionBatchedGates=false` is the arm without it |
+| What is the f16 path worth, on any tool? | add `--f16=off` / `--f16=on` to it (one switch, all models) |
+| Is bfloat16 usable, and would it beat the f16 storage? | `tools/gpu/probe-bf16.js` |
+| What does the host-device bus cost, each way? | `tools/gpu/probe-bus.js` (**free on an M2, not on a discrete GPU**) |
+| What is `grid.attend` alone, without the copies? | `tools/gpu/bench-grid-attend-passes.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
 | Is an AF3 fold's f16 path still worth it? | `tools/gpu/fold.js --staged= --weights=` (both arms, one shell) |
@@ -153,6 +177,30 @@ is complete and correct and the node process sits there with a headless Chrome
 still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
 "gpu-chrome-"` matches the temporary profile directory and nothing else - not
 the browser you are using. A batch of checkers should carry one between arms.
+
+🔴 **AND `meanPlddt` IS NOT A BIT-EXACTNESS GATE, however many digits it
+prints.** A night of kernel work reported it identical to SIXTEEN DIGITS -
+84.20887255253277 - on every arm, including one that moves thirty-three atoms.
+It is a PREDICTED confidence averaged over every atom in the structure, and it
+is flat well past the digits a small coordinate change reaches. Measured at 68
+tokens, 200 steps, with `tools/diff-fold-coords.py`:
+
+| arm | max \|dx\| | atoms identical |
+|---|---:|---:|
+| a token tile, which reorders nothing | 0.000000 A | 574/574 |
+| hoisting the conditioning projections | 0.000000 A | 574/574 |
+| `attnSplits` 1 -> 4, which regroups a sum | 0.001000 A | **541/574** |
+
+So "pLDDT unchanged" means "not obviously broken", never "bit-exact". For that,
+compare coordinates, or take relRMS on the raw tensor with
+`tools/gpu/bench-difftx-splits.js`.
+
+🔴 **AND A DIFFERENTIAL GATE IS ONLY DIFFERENTIAL IN WHAT YOU ACTUALLY VARIED.**
+Comparing the conditioning hoist on against off ALSO flips `normKSplits`,
+because the shader factory forces it to 1 when the projection is batched. The
+naive comparison reads 538/574 and looks like the hoist is inexact; pinning
+`--norm-splits=1` on both sides gives 574/574. Two knobs moved, one conclusion
+drawn, and it was the wrong one until the second knob was held.
 
 ## Measuring, without fooling yourself
 
@@ -244,6 +292,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/EF2FAST.md` | the ESMFold2 600M port end to end: the trunk, the diffusion module, ligands and nucleic chains, the certainty estimate that replaces an absent confidence head, the pAE that was measured and withheld, and the compression study that preceded all of it |
 | `docs/AF2.md` | the multimer and monomer template terms and the three dialects they are, the end-to-end fold gate, the four differential gates, and the alignment prep |
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
+| `docs/A100.md` | the same kernels on an **A100**: how to get a real WebGPU adapter on Linux/NVIDIA at all, what this repository's M2-measured conclusions do here, and the four that invert |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
 | `docs/OPENDDE.md` | the OpenDDE port: two token spaces, the dialect's two disagreements with OpenBind-0, the dispatch bug that scored below chance, and the per-block pair norm that collapsed a fold to a 0.27 A cloud |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |

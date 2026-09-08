@@ -28,6 +28,7 @@
  * once for a fold and shared by every sampler step. Uploading it beats teaching
  * a kernel to build a one-hot it will immediately contract away.
  */
+import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
          createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
@@ -491,7 +492,7 @@ export class Esmfold2DenoiserGpu {
    */
   #weightPrecision() {
     const precision = this.options.weightPrecision
-      ?? (this.device.features.has("shader-f16") ? "f16" : "f32");
+      ?? (halfPrecisionAvailable(this.device) ? "f16" : "f32");
     if (!["f32", "f16"].includes(precision)) {
       throw new RangeError(`unknown denoiser weight precision ${precision}`);
     }
