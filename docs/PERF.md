@@ -759,3 +759,111 @@ two hundred times. Cumulative bytes at 200 residues: `atom.k` and `atom.v`
 25.2, `atom.logits` 86.1 -> 18.9. The wall time falls 11-12% on two different
 shapes, which is one run each on a machine that drifts by up to 3.2x - so read
 the direction and the mechanism, not the digits.
+
+## The A100 branch, measured back on this M2
+
+The A100 campaign (docs/A100.md) is a large branch tuned on a card with ten
+times the cores, and the question it leaves open is what it does to the machine
+this file is about. Every number here is this M2, `a100` against `main` at
+`d19e2a7`, folds run one after another rather than side by side.
+
+🔴 **THE ANSWER IS "NOTHING", AND THAT IS THE PROFILE WORKING AS DESIGNED.**
+`DEFAULT_TUNING` is every knob at its pre-branch value and the priors are keyed
+on architecture, so a part with no entry computes what it always did. Checked
+rather than assumed, and checked on COORDINATES because this repository has
+already recorded `meanPlddt` matching to sixteen digits across an arm that moved
+thirty-three atoms:
+
+| model | a100 against main, on this M2 |
+|---|---|
+| AF3, `fold.js` | **bit identical** - 574 atoms, 0 moved, sampled and denoised |
+| ESMFold2, `fold-esmfold2.js` | **bit identical** - `alphaCarbons` equal, certainty to 16 digits |
+| AF3 peak device memory | 476.0 -> 476.1 MiB |
+| CPU suite | 954 pass |
+
+🔴 **AND AF2 GOT 3.25x FASTER AND 40% SMALLER WITHOUT A KNOB, BECAUSE THE THING
+THAT MOVED WAS A DELETED CONSTANT.** The outer product mean's 64 MiB cap stopped
+the fast contraction at 128 residues, so every protein longer than that fell to
+`opm.accumulate`. At 200 residues and 128 rows:
+
+| | main | a100 |
+|---|---|---|
+| fold | 26.56 s | **8.18 s** |
+| peak device memory | 779.1 MiB | **465.4 MiB** |
+| `opm.intermediate` | 103.13 MiB x2 | 64 MiB x1 |
+
+The memory falls because the fallback was the expensive path in both senses: it
+allocated a 103 MiB tile buffer twice, where the blocked contraction holds one
+64 MiB working set at any length. `check-opm-paths.js --length=400
+--sequences=512 --cz=128` agrees at depth - 14.7x over the tiled arm, the
+blocked arm at relRMS exactly 0, and the f16 arm finite at the 512 rows upstream
+records overflowing.
+
+🔴 **THE ONE PATH THAT MOVED AND HAS NO GATE ANYWHERE IS THE MULTIMER.**
+`fold-af2.js --family=multimer --chains=30,29` shifts systematically, and a seed
+sweep is what says "systematically" rather than "noisily":
+
+| seed | main | a100 | delta |
+|---|---|---|---|
+| 0 | 51.214 | 54.265 | +3.05 |
+| 1 | 50.410 | 52.668 | +2.26 |
+| 2 | 50.995 | 54.067 | +3.07 |
+
+Main's own seed-to-seed spread is 0.80, the gap is 2.3-3.1 and one-directional,
+and pTM and ipTM move with it. The monomer at the same length moves 0.068, so
+this is not shared-kernel drift. Every per-kernel differential gate passes here
+(transition 0.0017 against a 0.004 bound, attention 0.0012, OPM 2.1e-7, triangle
+1.1e-7) and the multimer template term matches its JAX reference at 6.5e-5, so
+what is left is summation reordering - the staged OPM output projection, the
+rewritten global attention, the hoisted pair bias - accumulating over 48 blocks
+on a low-confidence synthetic complex. It is unresolved, and it is unresolved
+EVERYWHERE: docs/A100.md records that box has no multimer weights, so
+`--family=multimer` cannot run there at all. Nothing has ever gated this path
+end to end. `check-evoformer-stack.js` cannot settle it either - the fixture in
+this checkout has the features and not `stackInputMsa`, on both branches.
+
+## Two A100 knobs, asked here, and one of them is a win
+
+🔴 **`keepTrunkWeights` DOES NOT CARRY, AGAINST docs/A100.md's OWN PREDICTION.**
+That file reasons "most of the win is not the bus, so it should carry to an M2"
+and adds `--keep-weights=on` so an M2 can settle it in one command. Settled,
+with `fold.js --folds=3`:
+
+| arm | warm folds | peak |
+|---|---|---|
+| `off`, the shipped default | 4.018, 4.011 s | 476.1 MiB |
+| `on` | 4.153, 4.024 s | **855.9 MiB** |
+
+Nothing, for +380 MiB - 1.8x the peak. The A100's 1.95x is the PCIe transfer and
+unified memory has no transfer to avoid. `null` is right here and is now
+measured rather than inherited.
+
+🔴 **`attentionMatrix` DOES NOT COMPILE HERE, AND FAILS LOUDLY.**
+`--tune=attentionMatrix=true` throws `GPUPipelineError: the MSL backend only
+supports 8x8 subgroup matrices`. The `ampere` prior wants a 4x32 tile and Metal
+will not have it. This is the good failure - a pipeline that refuses, not a
+kernel that computes something else - and it is the concrete case behind
+`matrixLinear`'s note that an M2 reporting matrix configs is not an M2 that
+wants an unmeasured kernel.
+
+🔴 **`opmMatrixContract` IS A WIN HERE AND IS NOW A `metal-3` PRIOR.** The one
+kernel whose shape suits 8x8x8 units: a plain GEMM with the model's deepest K.
+Swept with `profile-af2-block.js --sweep`, which interleaves its arms:
+
+| length x rows | block off | block on | speedup | `opm.project-output` |
+|---|---|---|---|---|
+| 59 x 128 | 22.87 ms | 21.55 | 1.06x | 2.017 -> 0.927 |
+| 128 x 64 | 49.50 | 44.45 | 1.11x | 9.023 -> 4.171 |
+| 200 x 128 | 152.35 | 136.52 | 1.12x | 22.272 -> 10.120 |
+| 400 x 256 | 766.50 | 665.71 | 1.15x | 94.242 -> 40.115 |
+
+Monotone across a 34x range of block cost, never inverting. Most of it is the
+output projection, which follows the contraction unless `opmMatrixOutput` turns
+it off; the contraction itself is 1.32x at 200x128. End to end a 200-residue
+fold goes 8135 -> 7446 ms with the prior live, CA-CA gate holding, mean pLDDT
+moving 0.035 and peak memory 465.4 -> 464.8 MiB.
+
+🔴 **AND IT IS ONE M2.** `metal-3` spans parts with very different core counts,
+and this repository's own `attentionQueriesPerLane` spread - M2 0.21x, M4 Pro
+0.45x, GB10 1.17-1.42x - is the standing warning that the badge does not predict
+the number. Re-sweep before trusting it on another Apple part.

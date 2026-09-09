@@ -608,11 +608,54 @@ const PRIORS = new Map([
     // the devices that do, and for the day the matrix path is bisected out.
     opmProjectOutputPairs: 4,
   }],
+  // Apple M2, 10 cores, macOS 13.2, Chrome 152 - the machine docs/PERF.md is
+  // measured on, reporting {vendor: "apple", architecture: "metal-3"}.
+  //
+  // 🔴 ONE KNOB, AND THE REST OF THIS DEVICE'S ANSWERS REMAIN THE DEFAULTS.
+  // This entry exists because "the M2's answers ARE the defaults" was true when
+  // every default was measured here and stopped being true when the matrix
+  // path arrived: the units are REACHABLE on this part - it reports
+  // `chromium-experimental-subgroup-matrix`, f32 and f16, both 8x8x8 - and the
+  // outer product mean's contraction is the one kernel whose shape suits them
+  // at that size.
+  ["metal-3", {
+    // 🔴 SWEPT IN SITU WITH tools/gpu/profile-af2-block.js --sweep, WHICH
+    // INTERLEAVES ITS ARMS - this machine drifts up to 3.2x between runs and a
+    // sweep is exactly the shape that hides it. Block milliseconds, false
+    // against true, and the output projection that follows the contraction:
+    //
+    //   length x rows   block off   block on   speedup   opm.project-output
+    //   59  x 128           22.87      21.55     1.06x    2.017 ->  0.927
+    //   128 x  64           49.50      44.45     1.11x    9.023 ->  4.171
+    //   200 x 128          152.35     136.52     1.12x   22.272 -> 10.120
+    //   400 x 256          766.50     665.71     1.15x   94.242 -> 40.115
+    //
+    // Monotone across a 34x range of block cost and it never inverts, which is
+    // why it is a prior rather than a size rule. The contraction itself is
+    // 1.32x at 200x128; most of the block win is the output projection at
+    // 2.2-2.4x, which follows this knob unless `opmMatrixOutput` turns it off.
+    //
+    // 🔴 CORRECTNESS, NOT ONLY SPEED. tools/gpu/check-opm-paths.js --length=400
+    // --sequences=512 --cz=128 passes here with the blocked arm at relRMS
+    // exactly 0 and the f16 arm finite at the depth upstream records
+    // overflowing; fold-af2.js at 200 residues holds its CA-CA gate and moves
+    // mean pLDDT by 0.084.
+    //
+    // 🔴 AND THIS IS ONE M2. "metal-3" spans parts with very different core
+    // counts, and this repository's own attentionQueriesPerLane spread - M2
+    // 0.21x, M4 Pro 0.45x, GB10 1.17-1.42x - is the standing warning that the
+    // badge does not predict the number. The direction here is mechanism (a
+    // GEMM with the model's deepest K onto units that exist) rather than a
+    // tuned constant, but re-sweep before trusting it on another Apple part.
+    opmMatrixContract: true,
+  }],
 ], );
 
 const VENDOR_PRIORS = new Map([
   // 🔴 NOTHING FOR "apple" ON PURPOSE. Its measurements ARE the defaults above,
   // and an entry that restated them would be a second place for them to drift.
+  // The one knob an Apple part does NOT want at its default is in PRIORS under
+  // "metal-3", because it was measured on a part and not on a vendor.
 ]);
 
 const RECORDED = new WeakMap();
