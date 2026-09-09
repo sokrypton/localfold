@@ -21,7 +21,7 @@
  *
  *     node tools/gpu-chrome.mjs tools/gpu/bench-triangle.js --lengths=300,600
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createReadStream, rmSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -38,6 +38,38 @@ const CHROME = process.env.LOCALFOLD_CHROME
   ?? (process.platform === "darwin"
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "google-chrome");
+
+// 🔴 THE SAME HARNESS, ON A PHONE. `LOCALFOLD_GPU_ANDROID=1` runs the module in
+// Chrome on a USB-attached Android device instead of locally, and it needs no
+// remote-debugging protocol at all: everything here is already one HTTP origin
+// - the runner page, every ES module under src/, the weight shards and the
+// POST that carries the result back - so `adb reverse` pointing the phone's
+// 127.0.0.1 at this server is the whole of the port.
+//
+// It matters because PRIORS has two entries. Every other GPU in the world takes
+// DEFAULT_TUNING, which costs 1.5x on AF2 and ESMFold2 (see --no-prior), and
+// the device class most users actually hold has never run a kernel from this
+// repository.
+const ANDROID = process.env.LOCALFOLD_GPU_ANDROID === "1";
+const ADB = process.env.LOCALFOLD_ADB
+  ?? `${process.env.HOME}/Library/Android/sdk/platform-tools/adb`;
+// 🔴 A FIXED PORT, BECAUSE THE INTENT HAS TO NAME IT. The desktop path listens
+// on 0 and lets the OS choose, which is right when the launcher is this same
+// process; `adb reverse` has to be told a number before Chrome is started.
+const ANDROID_PORT = Number(process.env.LOCALFOLD_GPU_PORT ?? 8974);
+const SERIAL = process.env.LOCALFOLD_ANDROID_SERIAL;
+
+/** adb, with the serial if one was named, failing loudly. */
+function adb(...argv) {
+  const result = spawnSync(ADB, [...(SERIAL ? ["-s", SERIAL] : []), ...argv],
+                           { encoding: "utf8" });
+  if (result.error) throw new Error(`${ADB}: ${result.error.message}`);
+  if (result.status !== 0) {
+    throw new Error(`adb ${argv.join(" ")} failed (${result.status}): `
+      + `${(result.stderr || result.stdout || "").trim()}`);
+  }
+  return result.stdout;
+}
 
 // 🔴 AND ON LINUX/NVIDIA THE DEFAULTS GET YOU SwiftShader, SILENTLY. Chrome
 // answers `requestAdapter` with its software fallback and the page runs - at
@@ -200,19 +232,31 @@ async function main() {
       response.writeHead(200, {
         "content-type": TYPES[extname(target)] ?? "application/octet-stream",
         "content-length": info.size,
+        // 🔴 NO-STORE, BECAUSE THE ANDROID PATH REUSES THE USER'S OWN CHROME
+        // PROFILE. The desktop path gets a fresh user-data-dir every run and so
+        // could never see this, but on the phone a second run would be served
+        // yesterday's src/ out of the HTTP cache and the change would look like
+        // it had not landed - which is the trap CLAUDE.md records costing three
+        // sessions on the page. Costs the desktop nothing: its cache is empty.
+        "cache-control": "no-store",
       });
       createReadStream(target).pipe(response);
     }).catch(() => response.writeHead(404).end("not found"));
   });
 
-  await new Promise((res) => server.listen(0, "127.0.0.1", res));
+  await new Promise((res) => server.listen(ANDROID ? ANDROID_PORT : 0, "127.0.0.1", res));
   const port = server.address().port;
 
   // 🔴 A FRESH PROFILE EVERY RUN. Chrome refuses a second headless instance on
   // a profile already in use, so a shared one would make two concurrent tests
   // fail in a way that looks like a GPU error.
-  const profile = join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
-  const chrome = spawn(CHROME, [
+  //
+  // The phone gets neither: its Chrome is the user's own, with the user's
+  // profile, and nothing here may take it away from them. That is also why the
+  // server sends no-store above.
+  const profile = ANDROID ? null
+    : join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
+  const chrome = ANDROID ? null : spawn(CHROME, [
     ...(process.platform === "linux" && !LINUX_HEADLESS ? [] : ["--headless=new"]),
     "--enable-unsafe-webgpu", "--disable-gpu-sandbox",
     ...PLATFORM_FLAGS,
@@ -227,10 +271,25 @@ async function main() {
   ], { stdio: ["ignore", "ignore", "pipe"] });
 
   const stderr = [];
-  chrome.stderr.on("data", (chunk) => stderr.push(chunk.toString("utf8")));
-  chrome.on("exit", (code) => {
-    settle({ ok: false, error: `Chrome exited (${code}) before reporting\n${stderr.join("")}` });
-  });
+  if (chrome !== null) {
+    chrome.stderr.on("data", (chunk) => stderr.push(chunk.toString("utf8")));
+    chrome.on("exit", (code) => {
+      settle({ ok: false, error: `Chrome exited (${code}) before reporting\n${stderr.join("")}` });
+    });
+  } else {
+    // 🔴 THE REVERSE TUNNEL BEFORE THE INTENT, or the page loads against
+    // nothing and Chrome shows its own offline error - which reaches this
+    // process as a timeout naming no cause at all.
+    adb("reverse", `tcp:${port}`, `tcp:${port}`);
+    // 🔴 AND THE SCREEN HAS TO STAY ON. Android throttles and then suspends a
+    // backgrounded tab; a fold that takes minutes will simply stop, and the
+    // result POST never comes. This is the phone's own setting and it is left
+    // as it was found - see the teardown.
+    adb("shell", "svc", "power", "stayon", "usb");
+    adb("shell", "am", "start", "-a", "android.intent.action.VIEW",
+        "-n", "com.android.chrome/com.google.android.apps.chrome.Main",
+        "-d", `http://127.0.0.1:${port}/__runner`);
+  }
 
   const timeoutMs = Number(process.env.LOCALFOLD_GPU_TIMEOUT_MS ?? 600_000);
   const timer = setTimeout(() => {
@@ -239,8 +298,18 @@ async function main() {
 
   const result = await finished;
   clearTimeout(timer);
-  chrome.removeAllListeners("exit");
-  chrome.kill("SIGKILL");
+  if (chrome !== null) {
+    chrome.removeAllListeners("exit");
+    chrome.kill("SIGKILL");
+  } else {
+    // Best effort, all of it: a failed run must still print WHY it failed
+    // rather than an adb error raised while tidying up after it.
+    for (const argv of [["shell", "am", "force-stop", "com.android.chrome"],
+                        ["shell", "svc", "power", "stayon", "false"],
+                        ["reverse", "--remove", `tcp:${port}`]]) {
+      try { adb(...argv); } catch { /* best effort */ }
+    }
+  }
   server.close();
 
   // 🔴 AND THEN DELETE THE PROFILE, WHICH THIS DID NOT DO FOR A YEAR. A fresh
@@ -252,7 +321,9 @@ async function main() {
   // every redirection producing an empty file, naming nothing.
   //
   // rmSync after the kill, not before: Chrome writes on the way out.
-  try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
+  if (profile !== null) {
+    try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 
   for (const line of result.logs ?? []) console.log(line);
   if (!result.ok) {

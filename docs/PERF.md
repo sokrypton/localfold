@@ -1080,3 +1080,98 @@ moving 0.035 and peak memory 465.4 -> 464.8 MiB.
 and this repository's own `attentionQueriesPerLane` spread - M2 0.21x, M4 Pro
 0.45x, GB10 1.17-1.42x - is the standing warning that the badge does not predict
 the number. Re-sweep before trusting it on another Apple part.
+
+## A phone, for the first time: a Pixel 9 on Valhall
+
+`PRIORS` has two entries. Every other GPU in the world takes `DEFAULT_TUNING`,
+which CLAUDE.md prices at 1.5x on AF2 and ESMFold2 - and the device class most
+users actually hold had never run a kernel from this repository. It can now:
+`LOCALFOLD_GPU_ANDROID=1` on any GPU tool runs it in Chrome on a USB-attached
+phone, because this harness was already one localhost origin and `adb reverse`
+is the whole of the port.
+
+Pixel 9, Tensor G4, `arm` / `valhall`, Android 16, Chrome 152:
+
+| | M2 | Pixel 9 |
+|---|---|---|
+| `shader-f16` | yes | **yes** |
+| `timestamp-query` | yes | yes |
+| subgroup min/max | 32 / 32 | **16 / 16**, so `supportsSubgroups` is false |
+| subgroup matrix | 8x8x8 | **none** |
+| AF2 59-residue fold | 1.25 s | **8.43 s**, peak 386.9 MiB, `caca ok` |
+
+pLDDT 57.267 against the M2's 57.213, and a different checksum, which is what
+two GPUs with different f16 reduction orders must give. Nothing fell back,
+nothing refused, no OOM. Every matrix-unit knob - all seven of `ampere`'s and
+`metal-3`'s `opmMatrixContract` - is irrelevant on a part with no matrix units,
+so whatever wins here will be different wins.
+
+### 🔴 `probe-tuning`'s recommendations DO NOT SURVIVE THE STACK
+
+It disagrees with the defaults on three knobs and measures `linearTallTile` at
+**2.008x**, bit-exact, relRMS 0 - a tile, not a reordering. In real work:
+
+| arm | 59x128 fold, `mainStack` x3 | 200x256 block, wall x2 |
+|---|---|---|
+| default | 6.30 / 6.29 / 6.27 s | 1474.9 / 1543.1 ms |
+| all three recommended | 6.36 / 6.36 / 6.34 s | - |
+| `linearTallTile` alone | - | 1472.9 / 1500.9 ms |
+| `attentionGroup=4` + `attentionVectorScore` | - | 1476.7 / 1548.9 ms |
+
+The tall tile is worth between 0.1% and 2.7%, inside the drift; the attention
+pair is consistently worse; all three together are a 1% LOSS. The knobs are
+live - the checksum moves -1877818 to -1891033 and pLDDT 57.267 to 57.241,
+which is the two attention knobs reordering sums. So **no `valhall` prior is
+written**, because a 2x microbenchmark the stack values at 0% is exactly what
+this file's own rule says not to believe. Round 2 is slower than round 1 on
+every arm: a phone throttles DOWNWARD monotonically, which is a nastier shape
+than this M2's random 3.2x drift, and arms must be alternated within a round.
+
+### 🔴 AND GPU TIMESTAMPS ON VALHALL ARE INFLATED 21x
+
+| | timestamp `blockMs` | the tool's own `wallPerBlockMs` | ratio |
+|---|---:|---:|---:|
+| M2 | 22.01 | 28.5 | 0.77 |
+| Pixel 9 | 3542.03 | 168 | **21.08** |
+
+A ratio above 1 claims more GPU time than wall time elapsed, which is
+impossible; 0.77 is what a healthy profiler looks like, the summed passes being
+a little less than wall. So `--sweep`, per-kernel attribution and everything
+downstream of `beginTimestampProfile` are unusable on this GPU, and only
+whole-fold wall clock can be trusted - which is why the table above is wall.
+`profile-af2-block.js` has printed `blockMs` and `wallPerBlockMs` side by side
+since it was written and nothing compared them; on the two machines that had
+priors the ratio was always ~0.8, so it never mattered. **A number a tool prints
+is not a gate until something fails on it**, again.
+
+### What the A100 branch was worth here
+
+The Pixel ran both sides of the merge, with the harness patch held in place
+across the checkout - the first arm of this was run wrong, with `git checkout`
+taking the harness with it, so it silently measured the Mac and reproduced the
+M2's numbers exactly. Check which machine an arm ran on.
+
+| | pre-merge `c881283` | merged |
+|---|---:|---:|
+| AF2 wall | 8685 ms | 8223 / **7814 ms** |
+| AF2 weight load | 575 ms | 146 / **215 ms** |
+| AF2 `mainStack` | 6.43 s | 6.41 / 6.28 s |
+| AF2 checksum | -1877818 | -1877818 |
+| ESMFold2 whole fold | 12.35 s | **9.41 s** (1.31x) |
+| ESMFold2 language model | 4316 ms | **2014 ms** (2.14x) |
+| ESMFold2 host peak | 272.8 MiB | **35.8 MiB** |
+| ESMFold2 PDB | `4b9a0176…` | `4b9a0176…` |
+
+Both folds bit-identical across the merge. AF2's win is 5-10% and all of it is
+the weight load; its compute stack does not move. ESMFold2 is 1.31x where the
+M2 got 1.97x, and the phone's share is concentrated in the ESM-C tower's weight
+handling rather than the trunk, whose `trunk 0` went the wrong way, 1062 ->
+1235 ms. None of it needed matrix units, which is why it carried to a part that
+has none.
+
+🔴 **AND THE HOST-WORK FINDING IS UNTESTED HERE.** `shader-source-cache.js` was
+kept on the A100 explicitly because 18 MiB of generated-and-discarded WGSL a
+fold "is not free on a phone", having been measured at 86 ms and entirely
+hidden behind that card's GPU. On this Pixel an AF2 fold is 7.8-8.7 s of wall
+against 6.3 s of `mainStack`, so 1.5-2 s a fold sits outside the stack and that
+is where such a cost would live. Nobody has measured it there yet.
