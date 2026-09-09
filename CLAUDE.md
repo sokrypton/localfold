@@ -119,6 +119,9 @@ values means the whole-stack checker, not that file.
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` - **and it runs on Linux now**, headful under `DISPLAY=:99`; it was pinned to a macOS Chrome path and `--headless=new`, which is why the contact overlay could break here unnoticed |
 | ...and does a template reach it? | `tools/fold-in-page.py --model af3 --template 1QYS_A` |
+| ...and a MODIFIED residue? | `tools/fold-in-page.py --model af3 --modify SEP@3` |
+| **Does the archive describe the job it wrote?** | `tools/fold-in-page.py --job-round-trip` (folds, WIPES the rows, drops the zip back) |
+| Which of AlphaFold 3's own example jobs load here? | `node --test test/af3-example-jobs.test.js` (8 of 14; the other 6 name their field) |
 | **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
 | Is a fold from ANY of the four models actually a chain? | they all assert on it now - `tools/gpu/chain-geometry.js` holds the one band, `--allow-broken-geometry` is the escape hatch, and `test/chain-geometry.test.js` gates the rule where the weights are not |
 | **Does LocalFold fold a sequence the way ESMFold2 does?** | `node tools/check-esmfold2-fold.js` |
@@ -151,6 +154,8 @@ values means the whole-stack checker, not that file.
 
 | **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) - and its bundle wants **`export_af3_model.py --include diffuser`**, because the default is trunk plus distogram head and this tool needs `structural_token_expander` |
 | Does its structural-token expansion conserve the atoms? | `tools/gpu/check-opendde-expander.js` |
+| **Are a model's BOND LENGTHS right, not just its fold?** | `tools/gpu/probe-nucleic.js --sequence= --model=` (RMSD cannot see this; OpenDDE is 15% short) |
+| ...and a ligand's? | `tools/gpu/probe-ligand-flow.js --ligand=GOL --mode=diffusion` |
 | Does OpenDDE's trunk predict a real fold's contacts? | `tools/gpu/trunk-opendde.js` (**and `--model=/model-af3-int5/manifest.json` is the control**) |
 | Does a pairformer block match its reference at THIS bundle's widths? | `tools/gpu/check-af3-block-any.js --model=` |
 | ...and which pair-track kernel is the one that does not? | `tools/gpu/probe-opendde-kernels.js --model=` |
@@ -441,7 +446,7 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/PERF.md` | this device's ceilings, where the memory goes in each model, what f16 is worth **where**, the pair-scratch and aliasing work, and upstream's optimisations tried here |
 | `docs/A100.md` | the same kernels on an **A100**: how to get a real WebGPU adapter on Linux/NVIDIA at all, what this repository's M2-measured conclusions do here, and the four that invert |
 | `docs/WEB.md` | the page: mobile layout, the template source menu, the download dial, the archive round trip, and the viewer |
-| `docs/OPENDDE.md` | the OpenDDE port: two token spaces, the dialect's two disagreements with OpenBind-0, the dispatch bug that scored below chance, and the per-block pair norm that collapsed a fold to a 0.27 A cloud |
+| `docs/OPENDDE.md` | the OpenDDE port, and the place to START on it: two token spaces, its own confidence head, the gates it must hold, and what is open |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |
 | `docs/DEVELOPING.md` | the older orientation notes |
 | `docs/HANDOFF.md` | the pLDDT-from-distogram attempt whose code was deleted, kept so the next attempt does not repeat it |

@@ -87,6 +87,29 @@ describe("the fold archive", () => {
     expect(request[0].dialect).toBe("alphafoldserver");
   });
 
+  /**
+   * 🔴 A MODIFIED RESIDUE IS INPUT, AND THE REQUEST IS WHAT REPRODUCES A JOB.
+   * The request listed the parent sequence alone, so an archive for a
+   * phosphorylated fold handed a reader a job that folds something else -
+   * and silently, because SEP3 shows in the status line and nowhere in the
+   * file. Same rule as the templates line.
+   */
+  it("names a modified residue in the request", () => {
+    const request = JSON.parse(jobRequestJson({ name: "j", seed: 0, entities: [
+      { type: "protein", value: "ACSE", copies: 1,
+        modifications: [{ code: "sep", position: 3 }] },
+    ] }));
+    expect(request[0].sequences[0].proteinChain.modifications)
+      .toEqual([{ ptmType: "CCD_SEP", ptmPosition: 3 }]);
+  });
+
+  // ...and absent, not empty, on a chain that carries none: `modifications: []`
+  // is a claim that the chain was checked, which no fold before this made.
+  it("says nothing at all when a chain is unmodified", () => {
+    const request = JSON.parse(jobRequestJson({ name: "j", seed: 0, entities }));
+    expect("modifications" in request[0].sequences[0].proteinChain).toBe(false);
+  });
+
   it("nests the contacts exactly as it nests the PAE", () => {
     const data = JSON.parse(fullDataJson({
       ...prediction(), tokenChainIds: ["A", "A", "B", "B"],
@@ -368,9 +391,16 @@ describe("where a fold's contact map lives", () => {
   // convention.
   const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 
+  // 🔴 ANCHORED ON THE BUILDER, NOT ON THE BUTTON. This used to slice from
+  // `element("download-all")` to `downloadBlob`, which held the whole
+  // `buildFoldArchive` call until the saved session needed the same archive
+  // without its alignment and the call moved into `archiveFor`. The guard is
+  // about where the contact map is READ, and that is the builder wherever it
+  // sits: pinned to the handler, a refactor that KEPT the property still
+  // failed, and a later one that moved the read elsewhere would pass.
   it("is read from exactly one field when the archive is built", () => {
-    const handler = app.slice(app.indexOf('element("download-all")'));
-    const call = handler.slice(0, handler.indexOf("downloadBlob"));
+    const builder = app.slice(app.indexOf("function archiveFor("));
+    const call = builder.slice(0, builder.indexOf("\n}"));
     expect(call).toContain("pred.contactSource?.contactProbs");
     // ...and not from the two places it used to also look.
     expect(call.includes("pred.contacts")).toBe(false);

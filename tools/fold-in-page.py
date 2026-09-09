@@ -168,6 +168,10 @@ def main():
                              " (~150 MB) instead of ./model-af3-int5/")
     parser.add_argument("--dev-report", action="store_true",
                         help="open the footer's dev panel and print what it says")
+    parser.add_argument("--session-hidden", action="store_true",
+                        help="hide the tab before reloading, the other save signal")
+    parser.add_argument("--session", action="store_true",
+                        help="save the session, reload, restore it, read the panels back")
     parser.add_argument("--download", action="store_true",
                         help="press Download all and report the zip it wrote")
     parser.add_argument("--bar", action="store_true",
@@ -179,6 +183,30 @@ def main():
                              " were each on the wire, and how much they"
                              " overlapped. The two used to be strictly"
                              " sequential.")
+    parser.add_argument("--ligand", default="",
+                        help="a CCD code folded alongside the sequence, e.g. GOL."
+                             " 🔴 A LIGAND IS ONE TOKEN PER HEAVY ATOM, so a fold"
+                             " with one has MORE TOKENS THAN RESIDUES - which is"
+                             " the case the archive refuses to infer a layout for"
+                             " and the sharpest test of a session carrying"
+                             " `tokens` back.")
+    parser.add_argument("--job-round-trip", action="store_true",
+                        help="write the archive, WIPE THE ENTITY ROWS, drop the"
+                             " archive back on the upload box, and compare what"
+                             " comes back with what folded. 🔴 THE WIPE IS"
+                             " THE TEST: the rows are still on screen from the"
+                             " fold, so 'they match' is true of a page that read"
+                             " nothing at all.")
+    parser.add_argument("--modify", default="",
+                        help="a modified residue on the protein entity, as"
+                             " CODE@POSITION - e.g. SEP@3, counting from 1."
+                             " Comma-separate for several. 🔴 A MODIFIED RESIDUE"
+                             " IS SEVERAL TOKENS FOR ONE RESIDUE, so like a"
+                             " ligand it makes tokens outnumber residues - and"
+                             " unlike a ligand it does so INSIDE a chain, which"
+                             " is the layout `tokenIdentifiers` refuses to"
+                             " infer. It is also INPUT, so a session that drops"
+                             " it describes a different job.")
     parser.add_argument("--template", default="",
                         help="a PDB entry (1abc, 1abc_A), a UniProt accession,"
                              " `auto` to use what the MSA search finds, or"
@@ -235,6 +263,36 @@ def main():
               field.dispatchEvent(new Event('input', { bubbles: true }));
               return field.tagName;
             })()""" % (json.dumps(args.sequence), json.dumps(args.sequence)))
+
+        # 🔴 THE MODIFICATION GOES ON THE ENTITY, like the template below, and
+        # not on a control: the popup behind the row's ⋮ writes into the same
+        # entity model, so the list's own API is the shape a paste would take.
+        if args.modify:
+            mods = []
+            for piece in args.modify.split(","):
+                code, _, position = piece.strip().partition("@")
+                mods.append({"code": code.strip().upper(), "position": int(position)})
+            print("modify:", cdp.evaluate(ws, """(() => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const entities = list.read();
+              const protein = entities.find((e) => e.type === 'protein');
+              if (!protein) return 'no protein entity';
+              protein.modifications = %s;
+              list.set(entities);
+              return JSON.stringify(list.read().map(
+                (e) => (e.modifications ?? []).map((m) => m.code + '@' + m.position)));
+            })()""" % json.dumps(mods)))
+
+        if args.ligand:
+            print("ligand:", cdp.evaluate(ws, """(() => {
+              const list = window.__entityList;
+              if (!list) return 'no entity list';
+              const entities = list.read();
+              entities.push({ type: 'ligand', value: %s, copies: 1, modifications: [] });
+              list.set(entities);
+              return JSON.stringify(list.read().map((e) => e.type + ':' + e.value));
+            })()""" % json.dumps(args.ligand)))
 
         # 🔴 THE TEMPLATE GOES ON THE ENTITY, NOT ON A CONTROL. It lives behind
         # the row's ⋮ beside the modified residues, in the entity model that
@@ -562,6 +620,199 @@ def main():
               return JSON.stringify(out);
             })()""", await_promise=True))
             print("archive:", archive)
+        # 🔴 INDEXEDDB AND py2Dmol'S SESSION EXIST ONLY IN A BROWSER, so this
+        # is the whole gate on saving one: fold, read the record back out of
+        # the real database, RELOAD, and restore it. "A record was written" is
+        # not "the session comes back", the same distinction --download draws
+        # for the archive.
+        # 🔴 THE ARCHIVE'S OWN PROMISE, CHECKED. Its README tells the reader to
+        # drop the .zip back on the page to fold again, and until the job
+        # reader existed that restored the ALIGNMENT and nothing else - the
+        # sequence, the copies, the ligands, the modifications and the seed all
+        # had to be retyped. So: fold, write the archive, wipe the rows, drop
+        # the archive back, and compare the entity list with what folded.
+        #
+        # 🔴 THE ROWS ARE WIPED FIRST, or the check passes on a page that read
+        # nothing: the entities are still on screen from the fold that just
+        # ran, and "they match afterwards" is true of a no-op.
+        if args.job_round_trip:
+            print("round trip:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              const seedInput = document.getElementById('random-seed');
+              const before = { entities: list.read(), seed: seedInput?.value ?? null };
+              const blobs = [];
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (blob) => { blobs.push(blob); return made.call(URL, blob); };
+              document.getElementById('download-all').click();
+              await new Promise((done) => setTimeout(done, 3000));
+              URL.createObjectURL = made;
+              if (blobs[0] === undefined) return JSON.stringify({ error: 'no archive' });
+              const bytes = new Uint8Array(await blobs[0].arrayBuffer());
+              list.set([{ type: 'protein', value: 'AAAAAAAA', copies: 1, modifications: [] }]);
+              if (seedInput) seedInput.value = '999';
+              const input = document.getElementById('msa-file');
+              const carrier = new DataTransfer();
+              carrier.items.add(new File([bytes], 'fold.zip', { type: 'application/zip' }));
+              input.files = carrier.files;
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              await new Promise((done) => setTimeout(done, 1500));
+              const after = { entities: list.read(), seed: seedInput?.value ?? null };
+              // 🔴 COMPARED ON THE FIELDS THE JOB FILE CAN CARRY, not on the
+              // whole row: a restored row has no `template.origin` and no
+              // coverage status, which are discovered when a template is
+              // FETCHED and are not part of the job. Comparing raw objects
+              // would fail on things the format never claimed to hold.
+              const shape = (entities) => entities.map((e) => ({
+                type: e.type, value: e.value, copies: e.copies,
+                modifications: (e.modifications ?? []).map(
+                  (m) => m.code + '@' + m.position),
+                template: e.template?.kind ?? 'none' }));
+              return JSON.stringify({
+                status: document.getElementById('status-message')?.textContent ?? '',
+                zipBytes: bytes.length,
+                before: shape(before.entities), after: shape(after.entities),
+                same: JSON.stringify(shape(before.entities))
+                      === JSON.stringify(shape(after.entities)),
+                seedBefore: before.seed, seedAfter: after.seed,
+                seedSame: before.seed === after.seed,
+              });
+            })()""", await_promise=True))
+
+            # 🔴 AND THE OTHER DIALECT, HAND WRITTEN, because the archive only
+            # ever exercises the one this page WRITES - a reader that passed
+            # the round trip could still be blind to every file an AlphaFold 3
+            # pipeline produces, which is half the reason for reading JSON at
+            # all. Fed as a .json file to the same box.
+            print("open dialect:", cdp.evaluate(ws, """(async () => {
+              const list = window.__entityList;
+              const seedInput = document.getElementById('random-seed');
+              const mode = document.getElementById('msa-mode');
+              mode.value = 'search'; mode.dispatchEvent(new Event('change'));
+              const drop = async (text, name) => {
+                const input = document.getElementById('msa-file');
+                const carrier = new DataTransfer();
+                carrier.items.add(new File([text], name, { type: 'application/json' }));
+                input.files = carrier.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                await new Promise((done) => setTimeout(done, 900));
+                return document.getElementById('status-message')?.textContent ?? '';
+              };
+              // \U0001f534 BOTH `dialect` AND `version`, which is upstream's own rule
+              // and which this fixture broke - it carried a version with no
+              // dialect beside it, so it was a file AlphaFold 3 itself would
+              // refuse. The same flaw was in test/job-json.test.js's helper.
+              const job = { name: 'pipeline', modelSeeds: [1234],
+                dialect: 'alphafold3', version: 2,
+                sequences: [
+                  { ligand: { id: 'C', ccdCodes: ['ATP'] } },
+                  { protein: { id: ['A', 'B'], sequence: 'ACDEFGHIKLMNPQRSTVWY',
+                               unpairedMsa: '', pairedMsa: '' } }] };
+              const loaded = await drop(JSON.stringify(job), 'job.json');
+              const after = list.read().map((e) => e.type + ':' + e.value + 'x' + e.copies);
+              const out = { loaded, after, msaMode: mode.value,
+                            seed: seedInput?.value ?? null };
+              // 🔴 AND A REFUSAL LEAVES THE ROWS ALONE. A file naming chemistry
+              // this page does not build must not half-load: the sequence in it
+              // folds perfectly well without the bonds, which is exactly the
+              // silent wrong answer the reader exists to prevent.
+              const bad = { ...job, bondedAtomPairs: [[['A', 1, 'CA'], ['B', 1, 'CA']]] };
+              out.refusal = await drop(JSON.stringify(bad), 'bad.json');
+              out.rowsAfterRefusal =
+                list.read().map((e) => e.type + ':' + e.value + 'x' + e.copies);
+              out.unchanged = JSON.stringify(out.after) === JSON.stringify(out.rowsAfterRefusal);
+              // 🔴 AND ONE OF AlphaFold 3'S OWN FILES, THROUGH THE REAL BOX.
+              // test/af3-example-jobs.test.js reads all fourteen, but it calls
+              // the reader directly - which says nothing about the file input,
+              // the handler, or the rows being repainted. This is the same
+              // file arriving the way a person would send it.
+              const real = await (await fetch(
+                '/tools/fixtures/af3-jobs/tetr_dimer_tetracycline.json')).text();
+              out.exampleStatus = await drop(real, 'tetr_dimer_tetracycline.json');
+              out.exampleRows =
+                list.read().map((e) => e.type + ':' + e.value.length + 'x' + e.copies);
+              // 🔴 AND A REAL AlphaFold SERVER ARCHIVE, WHICH DEEPMIND WROTE.
+              // tools/fixtures/fold_2026_09_01_10_17.zip is the file this whole
+              // format was reverse engineered from, and until now nothing ever
+              // fed it BACK to the page - so the reader was checked against the
+              // archive we write, which is the same source as the reader. It
+              // carries two chains, a job request, and four a3m blocks.
+              const zip = await (await fetch(
+                '/tools/fixtures/fold_2026_09_01_10_17.zip')).arrayBuffer();
+              const box = document.getElementById('msa-file');
+              const held = new DataTransfer();
+              held.items.add(new File([new Uint8Array(zip)], 'server.zip',
+                                      { type: 'application/zip' }));
+              box.files = held.files;
+              box.dispatchEvent(new Event('change', { bubbles: true }));
+              await new Promise((done) => setTimeout(done, 2500));
+              out.serverArchive =
+                document.getElementById('status-message')?.textContent ?? '';
+              out.serverRows =
+                list.read().map((e) => e.type + ':' + e.value.length + 'x' + e.copies);
+              out.serverSeed = seedInput?.value ?? null;
+              return JSON.stringify(out);
+            })()""", await_promise=True))
+
+        if args.session:
+            probe = cdp.evaluate(ws, """(async () => {
+              const out = { build: typeof window.buildViewerState,
+                            load: typeof window.loadViewerState,
+                            idb: typeof indexedDB };
+              try {
+                const state = window.buildViewerState();
+                out.built = state !== null && state !== undefined;
+                out.objects = (state?.objects ?? []).length;
+                out.json = JSON.stringify(state).length;
+                // 🔴 IndexedDB STORES A STRUCTURED CLONE, NOT JSON. A value that
+                // stringifies fine can still be unclonable, and `put` throws
+                // synchronously when it is - which is the one failure a
+                // save-and-forget wrapper turns into silence.
+                try { structuredClone(state); out.cloneable = true; }
+                catch (e) { out.cloneable = false; out.cloneError = String(e).slice(0, 200); }
+              } catch (e) { out.buildError = String(e).slice(0, 200);
+                             out.stack = String(e.stack ?? '').slice(0, 900); }
+              return JSON.stringify(out);
+            })()""", await_promise=True)
+            print("api   :", probe)
+            # 🔴 NO visibilitychange IS DRIVEN HERE, ON PURPOSE. Driving one
+            # made this gate green while the page was broken: a reader who
+            # folds and then presses reload never hides the tab, so the only
+            # save that ran was the one at fold completion - and that one
+            # captures ONE frame, because the trajectory lands afterwards.
+            # The gate reloads the way a reader does. `--session-hidden` is
+            # the other arm, for the tab that really is hidden first.
+            if args.session_hidden:
+                cdp.evaluate(ws, """(() => {
+                  Object.defineProperty(document, 'visibilityState',
+                    { configurable: true, get: () => 'hidden' });
+                  document.dispatchEvent(new Event('visibilitychange'));
+                  return 1;
+                })()""")
+                time.sleep(3)
+            saved = json.loads(cdp.evaluate(ws, "(async () => {\n              const { readSession } = await import('/web/fold-session.js');\n              const state = await readSession();\n              if (!state) return JSON.stringify({ saved: false });\n              const objects = state.objects || [];\n              return JSON.stringify({\n                saved: true,\n                version: state.version,\n                objects: objects.map((o) => o.name),\n                // 🔴 THE WHOLE TRAJECTORY, which is the point of reusing\n                // py2Dmol's own session: our archive carried the answer alone.\n                frames: objects[0]?.frames?.length ?? 0,\n                framePae: objects[0]?.frames?.some((f) => f.pae !== undefined),\n                frameMaps: objects[0]?.frames?.some(\n                  (f) => f.maps && Object.keys(f.maps).length > 0),\n                hasCamera: state.viewer_state?.rotation_matrix !== undefined,\n                colorMode: state.viewer_state?.color_mode,\n                // ...and the half py2Dmol does not know about.\n                job: state.localfold ? {\n                  stem: state.localfold.stem,\n                  model: state.localfold.model,\n                  residues: state.localfold.residues,\n                  plddt: state.localfold.confidence?.meanPlddt,\n                  msaOrigin: state.localfold.msaOrigin,\n                  framesAtSave: state.localfold.framesAtSave,\n                } : null,\n                bytes: JSON.stringify(state).length,\n                gzip: await (async () => {\n                  // 🔴 MEASURED, NOT ASSUMED. The payload is rounded decimal\n                  // coordinates repeated over every frame of a trajectory, which\n                  // is about as compressible as text gets - but how much is a\n                  // number, and CompressionStream is in the browser already.\n                  if (typeof CompressionStream !== \'function\') return null;\n                  const json = JSON.stringify(state);\n                  const raw = new TextEncoder().encode(json);\n                  const out = new Blob([raw]).stream()\n                    .pipeThrough(new CompressionStream(\'gzip\'));\n                  const packed = new Uint8Array(await new Response(out).arrayBuffer());\n                  return { raw: raw.length, gzip: packed.length,\n                           ratio: +(raw.length / packed.length).toFixed(2) };\n                })(),\n              });\n            })()", await_promise=True))
+            print("saved:", saved)
+            cdp.evaluate(ws, "location.reload()")
+            time.sleep(5)
+            back = json.loads(cdp.evaluate(ws, '(async () => {\n              await new Promise((done) => setTimeout(done, 1200));\n              const row = document.getElementById(\'session\');\n              const offered = row !== null && !row.hidden && row.offsetParent !== null;\n              const text = document.getElementById(\'session-text\')?.textContent ?? \'\';\n              document.getElementById(\'session-restore\')?.click();\n              await new Promise((done) => setTimeout(done, 3000));\n              const reg = window.py2dmol_viewers || {};\n              const renderer = reg[Object.keys(reg)[0]]?.renderer;\n              const name = renderer?.currentObjectName;\n              const frames = renderer?.objectsData?.[name]?.frames ?? [];\n              const heat = document.getElementById(\'heatmapContainer\');\n              return JSON.stringify({\n                offered, offerText: text,\n                object: name,\n                frames: frames.length,\n                pae: frames[0]?.pae_n ?? null,\n                contact: frames[0]?.maps?.contact !== undefined,\n                scoreBox: getComputedStyle(\n                  document.getElementById(\'predictionScoresBox\')).display !== \'none\',\n                plddtCell: document.getElementById(\'metricMeanPlddt\')?.textContent ?? \'\',\n                ptmCell: document.getElementById(\'metricPtm\')?.textContent ?? \'\',\n                panelShown: heat !== null && getComputedStyle(heat).display !== \'none\',\n                panelTabs: [...document.querySelectorAll(\'#heatmapContainer [role="tab"]\')]\n                  .map((t) => t.dataset.mapKey),\n                stillOffering: !document.getElementById(\'session\').hidden,\n                downloads: (() => { const d = document.getElementById(\'downloads\');\n                  return d ? getComputedStyle(d).display : null; })(),\n                // 🔴 BOTH BUTTONS ARE PRESSED, not merely looked at. A restored\n                // session used to show them and fail on click: PDB wrote the word\n                // undefined into a file and All threw inside the archive builder.\n                // The blob is caught and read back, because \'a zip was written\'\n                // is not \'the fold is in it\'.\n                pressed: await (async () => {\n                  const blobs = [];\n                  const made = URL.createObjectURL;\n                  URL.createObjectURL = (b) => { blobs.push(b); return made.call(URL, b); };\n                  document.getElementById(\'download-pdb\')?.click();\n                  await new Promise((r) => setTimeout(r, 600));\n                  document.getElementById(\'download-all\')?.click();\n                  await new Promise((r) => setTimeout(r, 2500));\n                  URL.createObjectURL = made;\n                  const out = { blobs: blobs.length, pdbBytes: blobs[0]?.size ?? null,\n                                zipBytes: blobs[1]?.size ?? null };\n                  if (blobs[0]) { const t = await blobs[0].text();\n                    out.pdbAtoms = (t.match(/^ATOM/gm) || []).length;\n                    out.pdbUndefined = t.includes(\'undefined\'); }\n                  if (blobs[1]) { const { readZip } = await import(\'/web/zip.js\');\n                    const f = await readZip(new Uint8Array(await blobs[1].arrayBuffer()));\n                    out.members = [...f.keys()];\n                    // \U0001f534 AND THE JOB REQUEST NAMES THE MODIFICATION.\n                    // It is INPUT, and the request is the file a reader hands\n                    // back to reproduce the fold - one listing the parent\n                    // sequence alone describes a different job, silently,\n                    // since a modified residue changes no residue COUNT.\n                    const jr = [...f.keys()].find((k) => k.endsWith(\'job_request.json\'));\n                    out.requestMods = jr\n                      ? JSON.parse(f.get(jr))[0]?.sequences?.[0]?.proteinChain?.modifications ?? null\n                      : null;\n                    const fd = [...f.keys()].find((k) => k.endsWith(\'full_data_0.json\'));\n                    out.fullData = fd ? Object.keys(JSON.parse(f.get(fd))) : null;\n                    // 🔴 AND THE VALUES, NOT ONLY THE KEYS. The matrices are\n                    // rebuilt from the frames now, so \'contact_probs exists\' is\n                    // not \'contact_probs is the fold\'s\': a decode with the wrong\n                    // bounds fills the key with plausible nonsense.\n                    if (fd) { const d = JSON.parse(f.get(fd));\n                      const flat = (m) => m ? m.flat() : [];\n                      const pae = flat(d.pae), con = flat(d.contact_probs);\n                      out.paeCheck = { diag: d.pae?.[0]?.[0], far: d.pae?.[0]?.[57],\n                                       max: Math.max(...pae), min: Math.min(...pae) };\n                      out.contactCheck = { diag: d.contact_probs?.[0]?.[0],\n                                           max: Math.max(...con), min: Math.min(...con) };\n                      // 🔴 AND THE TOKEN LAYOUT, which is what a ligand breaks.\n                      // More tokens than residues is the case tokenIdentifiers\n                      // REFUSES to infer, so a session that lost `tokens` throws\n                      // here rather than writing a quietly wrong file.\n                      out.layout = { tokens: d.token_chain_ids?.length,\n                                     chains: [...new Set(d.token_chain_ids || [])],\n                                     lastResId: d.token_res_ids?.[d.token_res_ids.length - 1] };\n                      const sm = [...f.keys()].find((k) => k.endsWith(\'summary_confidences_0.json\'));\n                      if (sm) { const q = JSON.parse(f.get(sm));\n                        out.summaryCheck = { chainPtm: q.chain_ptm,\n                                             pairContact: q.chain_pair_max_contact,\n                                             ptm: q.ptm, meanPlddt: q.mean_plddt }; }\n                      out.plddtCheck = { first: d.atom_plddts?.[0],\n                                         max: Math.max(...(d.atom_plddts || [])) }; }\n                    out.readmeOmits = (f.get(\'README.md\') || \'\').includes(\'not in this archive\');\n                    // 🔴 AND THE TEMPLATES, which are INPUT: an absent array\n                    // means \'this model has no such control\' and drops the\n                    // README line entirely, so a restored fold that used one\n                    // would quietly describe a different job.\n                    out.templateMembers = [...f.keys()].filter(\n                      (k) => k.startsWith(\'templates/\'));\n                    out.readmeTemplates = ((f.get(\'README.md\') || \'\')\n                      .match(/^- templates: .*$/m) || [null])[0]; }\n                  return out; })(),\n                heat: (() => { const reg = window.py2dmol_viewers || {};\n                  const r = reg[Object.keys(reg)[0]]?.renderer;\n                  const box = document.getElementById(\'heatmapContainer\');\n                  const info = { hasRenderer: !!r?.heatmapRenderer,\n                                 hasContainer: !!r?.heatmapContainer,\n                                 rendererMaps: Object.keys(r?.heatmapRenderer?.maps || {}),\n                                 shown: (r?.shownObjects instanceof Set)\n                                   ? [...r.shownObjects] : String(r?.shownObjects),\n                                 heatName: (() => { try {\n                                   return r?.heatmapObjectName ? String(r.heatmapObjectName()) : \'no fn\'; }\n                                   catch (e) { return String(e).slice(0,80); } })(),\n                                 curObj: String(r?.currentObjectName),\n                                 curFrame: String(r?.currentFrame),\n                                 hasDataSays: (() => { try { const o = r?.objectsData?.[r.currentObjectName];\n                                   return window.Heatmap?.hasData?.(o); } catch (e) { return String(e).slice(0,60); } })(),\n                                 mapKeys: (() => { try { const o = r?.objectsData?.[r.currentObjectName];\n                                   return window.Heatmap?.mapKeysOf?.(o) ?? \'no mapKeysOf\'; }\n                                   catch (e) { return String(e).slice(0,80); } })(),\n                                 frame0Maps: (() => { const o = r?.objectsData?.[r.currentObjectName];\n                                   const f = o?.frames?.[0]; if (!f?.maps) return null;\n                                   const k = Object.keys(f.maps)[0];\n                                   const m = f.maps[k];\n                                   return { key: k, type: typeof m,\n                                            hasData: m && m.data !== undefined,\n                                            dataType: typeof m?.data,\n                                            n: m?.n }; })(),\n                                 paeType: (() => { const o = r?.objectsData?.[r.currentObjectName];\n                                   const f = o?.frames?.[0];\n                                   return { pae: Array.isArray(f?.pae) ? \'array\' : typeof f?.pae, n: f?.pae_n }; })(),\n                                 display: box ? getComputedStyle(box).display : null };\n                  try { window.Heatmap?.syncToDrawn(r);\n                        info.afterSync = box ? getComputedStyle(box).display : null; }\n                  catch (e) { info.syncError = String(e).slice(0, 140); }\n                  return info; })(),\n                status: document.getElementById(\'status-message\')?.textContent ?? \'\',\n              });\n            })()', await_promise=True))
+            print("restored:", back)
+
+            # 🔴 AND CAN THE PAGE FOLD AGAIN AFTER A RESTORE? loadViewerState
+            # calls clearAllObjects, so the viewer a new fold opens into is one
+            # this page did not build. The offer also describes a record the
+            # next save overwrites - a row left on screen would advertise the
+            # old fold while Restore brought back the new one - so it must be
+            # gone once what is saved is what is on screen.
+            #
+            # Clicked here and polled from Python: awaiting a whole fold inside
+            # one cdp.evaluate outlives the call and returns nothing at all,
+            # which reads as a probe that did not run.
+            print("refold:", cdp.evaluate(ws, "(() => {\n              const field = document.querySelector('.entity-field [contenteditable],'\n                + ' .entity-field textarea, .entity-field input');\n              if (!field) return 'no field';\n              const other = 'MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQQRLIFAGK';\n              if ('value' in field && field.tagName !== 'DIV') field.value = other;\n              else field.textContent = other;\n              field.dispatchEvent(new Event('input', { bubbles: true }));\n              const button = document.getElementById('predict');\n              if (!button) return 'no button';\n              if (button.disabled) return 'button disabled';\n              button.click();\n              return 'clicked';\n            })()"))
+            cdp.wait_for(ws, "/pLDDT|certainty/.test("
+                             "(document.getElementById('status-message')||{}).textContent||'')",
+                         what="the second fold to finish", timeout=args.timeout)
+            time.sleep(5)
+            print("after :", json.loads(cdp.evaluate(ws, "(async () => {\n              const { readSession } = await import('/web/fold-session.js');\n              const now = await readSession();\n              const row = document.getElementById('session');\n              return JSON.stringify({\n                offerHidden: row === null ? null : row.hidden,\n                offerText: document.getElementById('session-text')?.textContent ?? '',\n                savedResidues: now?.localfold?.residues,\n                savedStem: now?.localfold?.stem,\n                status: document.getElementById('status-message')?.textContent ?? '',\n              });\n            })()", await_promise=True)))
+
         first_object = json.loads(cdp.evaluate(ws, """(() => {
           const reg = window.py2dmol_viewers || {};
           return JSON.stringify(reg[Object.keys(reg)[0]].renderer.currentObjectName);
@@ -570,6 +821,47 @@ def main():
         # 🔴 THE SECOND FOLD IS THE ONE THAT REWINDS. Asking for more recycles
         # with everything else unchanged should keep the frames the earlier
         # passes already produced and append to them - not start an object over.
+        # 🔴 FORGET IS A PATH TOO, AND IT HAD A BUG NO OTHER ARM COULD SEE.
+        # The session lives in TWO records now - the fold, and the summary the
+        # offer row reads without unpacking it - and `clearSession` deleted only
+        # the first. So "Forget" removed the fold, the row stayed on screen
+        # advertising it, and pressing Restore found nothing. A reload is what
+        # makes it visible: the row is redrawn from the store rather than from
+        # whatever the click left in memory.
+        if args.session:
+            print("forget:", cdp.evaluate(ws, """(async () => {
+              const before = !document.getElementById('session').hidden;
+              document.getElementById('session-forget').click();
+              await new Promise((done) => setTimeout(done, 800));
+              const hidden = document.getElementById('session').hidden;
+              const rows = await new Promise((resolve) => {
+                const open = indexedDB.open('localfold-session');
+                open.onsuccess = () => {
+                  const db = open.result;
+                  const store = db.transaction('session', 'readonly')
+                    .objectStore('session');
+                  const keys = store.getAllKeys();
+                  keys.onsuccess = () => { db.close(); resolve(keys.result); };
+                  keys.onerror = () => { db.close(); resolve('error'); };
+                };
+                open.onerror = () => resolve('no db');
+              });
+              return JSON.stringify({ offeredBefore: before, hiddenAfter: hidden,
+                                      keysLeft: rows });
+            })()""", await_promise=True))
+            ws.call("Page.reload")
+            cdp.wait_for(ws, "typeof window.processFiles === 'function'",
+                         what="the page to come back after forgetting")
+            print("after forget:", cdp.evaluate(ws, """(async () => {
+              await new Promise((done) => setTimeout(done, 1200));
+              const row = document.getElementById('session');
+              return JSON.stringify({
+                // 🔴 THE ROW MUST BE GONE ON A FRESH PAGE, which is the whole
+                // assertion: a stale summary redraws it from the store.
+                offered: row !== null && !row.hidden && row.offsetParent !== null,
+                text: document.getElementById('session-text')?.textContent ?? '' });
+            })()""", await_promise=True))
+
         if args.then_recycles is not None or args.then_sequence is not None:
             if args.then_sequence is not None:
                 cdp.evaluate(ws, """(() => {

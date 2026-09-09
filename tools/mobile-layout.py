@@ -26,7 +26,7 @@ the alignment is synthesised from its own sequence - tools/fixtures/test.a3m is 
 protein, so py2Dmol matched no chain and drew a warning where the MSA panel
 should have been.
 """
-import argparse, base64, http.server, os, re, socketserver, sys, threading, time
+import argparse, base64, http.server, json, os, re, socketserver, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdp import launch, evaluate, wait_for  # noqa: E402
 
@@ -299,8 +299,38 @@ def measure(ws, w, h, shot=None):
     # that is wider than a phone and it does not exist until it is asked for.
     evaluate(ws, "(() => { const b = document.querySelector('.entity-options');"
                  " if (b) b.click(); return 1; })()", False)
+    # 🔴 THE SAVED-SESSION ROW IS FORCED VISIBLE, because it is `hidden` until
+    # there is a session to offer and a box that is not laid out cannot
+    # overflow. Same reason the download dial's label is forced on at each
+    # width. Its text carries a MODEL NAME and a residue count, and the two
+    # buttons beside it must stay on screen at 320px - they are the only
+    # controls on the row.
+    evaluate(ws, """(() => {
+      const row = document.getElementById('session');
+      if (row === null) return 0;
+      row.hidden = false;
+      document.getElementById('session-text').textContent =
+        'Last fold: AlphaFold 2 (multimer) · 1284 residues · pLDDT 71.2 · 3h ago';
+      return 1;
+    })()""", False)
     evaluate(ws, "window.__asked = %d" % w, False)
     R = evaluate(ws, MEASURE, False)
+    R["session"] = json.loads(evaluate(ws, """(() => {
+      const row = document.getElementById('session');
+      if (row === null) return JSON.stringify(null);
+      const text = document.getElementById('session-text');
+      const restore = document.getElementById('session-restore');
+      const box = row.getBoundingClientRect();
+      const btn = restore ? restore.getBoundingClientRect() : null;
+      return JSON.stringify({
+        row: Math.round(box.width),
+        text: Math.round(text.getBoundingClientRect().width),
+        // the button must be fully inside the row, not pushed past its edge
+        restoreRight: btn ? Math.round(btn.right) : null,
+        rowRight: Math.round(box.right),
+        overflows: btn ? Math.round(btn.right) > Math.round(box.right) + 1 : null,
+      });
+    })()""", False))
     R["asked"] = w
     if shot is not None:
         data = ws.call("Page.captureScreenshot", format="png",
@@ -478,6 +508,8 @@ def main():
         print("   panel column %s, msa header %s, msa canvas %s, popup %s"
               % (R["panelCol"], R["msaBox"], R["msa"], R["popup"]))
         print("   entity row %s" % R["entityWidths"])
+        if R.get("session"):
+            print("   session %s" % R["session"])
         for c in R["canvases"]:
             print("   canvas %-16s store %-5s css %-5s in %s" % tuple(c))
         for st in R["stiff"]:

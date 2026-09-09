@@ -306,3 +306,661 @@ superset and is nearly one - but `index.html` loads `full` while `single.html`
 and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
 the three pages on a stale viewer.
 
+
+## Saving the session, which is py2Dmol's and not ours
+
+🔴 **py2Dmol ALREADY SERIALISES A SESSION, AND WRITING A SECOND FORMAT WOULD
+HAVE RESTORED LESS.** `buildViewerState` produces exactly what its Save button
+writes to a `.py2dmol.json` - every frame, the camera, the colour mode, the
+style, the side chains, the PAE, every heatmap, the MSA - and `loadViewerState`
+has always been the reader for a dropped one. A first attempt stored a fold
+ARCHIVE instead and restored **one frame** where this restores **sixteen**: the
+archive holds the answer, not the trajectory.
+
+Both were reachable only through a file - the builder downloaded its result and
+the loader was not exported - so the change upstream is to split the two
+(`py2Dmol 6ee50b8`).
+
+🔴 **AND THE EXPORT MUST BE THE FUNCTION, NOT AN ARROW THAT CALLS IT BY NAME.**
+The bundle is concatenated rather than module-scoped, so a top-level
+`function buildViewerState` IS `window.buildViewerState`; assigning
+`window.buildViewerState = () => buildViewerState()` replaces the global with an
+arrow whose body resolves to the arrow. It recursed until the stack ended, and
+the only symptom was `RangeError: Maximum call stack size exceeded` from a
+function that reads correctly. The stack - the same frame nine times - is what
+named it.
+
+🔴 **WHAT py2Dmol DOES NOT CARRY IS THE JOB, AND THAT HALF IS OURS.** Its frames
+know coordinates and maps; nothing in them says which model ran, against which
+sequence, with which alignment, or what the confidence head said. That goes
+under a `localfold` key, which the loader ignores and a round trip preserves.
+Without it the structure comes back with a blank score card, because
+`updateScoresCard` hides its box outright when handed undefined.
+
+🔴 **AND THE SESSION IS SAVED WHEN THE READER LEAVES, NOT WHEN THE FOLD ENDS.**
+Measured: at the moment a fold completes the viewer object holds ONE frame -
+`framesAtSave: 1` against the sixteen it ends with - because the trajectory
+lands in it after the prediction is stored, and AF2's contact map arrives later
+still in a `setTimeout` off the finished pass. Saving at completion captured a
+session that was not yet the one on screen, and every fix for that is a guessed
+delay. `visibilitychange` needs no guess: whatever is on screen when the tab is
+hidden IS the session, with the camera and colour mode the reader chose. The
+save at completion stays as a floor. With that, the record went from 26,641
+bytes and 1 frame to **188,767 bytes and 16**, contact map included.
+
+🔴 **AND `loadViewerState` RESOLVES BEFORE IT IS FINISHED.** Its last act is a
+`setTimeout(..., 100)` that picks the current object and syncs the heatmap, so
+`refreshHeatmap` straight after the await runs while `currentObjectName` is
+still unset and returns at its first guard. The restore waits for the condition
+rather than sleeping on it.
+
+### What is verified, and what is not
+
+Gated by `tools/fold-in-page.py --session`, which folds, drives
+`visibilitychange`, reads the record out of the real IndexedDB, **reloads**, and
+restores:
+
+| | |
+|---|---|
+| saved | 16 frames, PAE and maps on them, camera, `colorMode: plddt`, 188,767 B |
+| job | stem, model, 58 residues, pLDDT 71.18, the MSA origin |
+| offer | `Last fold: AlphaFold 3 · 58 residues · pLDDT 71.2 · just now` |
+| restored | 16 frames, `pae: 58`, `contact: true`, score card 71.2 / 0.39 |
+
+🔴 **AND SAVING AT FOLD COMPLETION WAS STILL WRONG, WHICH THE GATE HID BY
+DRIVING THE EVENT.** `visibilitychange` catches a settled session, but only for
+a reader who hides the tab; press reload straight after a fold and that signal
+never comes, so the only save that ran was the floor at completion - one frame
+of sixteen, no contact map. The gate drove a `visibilitychange` before
+reloading and was green throughout. It now reloads the way a reader does, and
+`--session-hidden` is the other arm. The save waits for the FRAME COUNT TO STOP
+GROWING - six still checks - rather than for a guessed interval, and AF2's
+contact map keeps its own re-save where it arrives.
+
+| | reload, no hide (before) | after |
+|---|---|---|
+| frames | 1 | **16** |
+| maps on frames | none | **pae + contact** |
+| bytes | 26,641 | 188,767 |
+
+🔴 **AND THE HEATMAP PANEL WAS HIDDEN BY A MULTI-MODE GUARD, ON A VIEWER
+SHOWING ONE OBJECT.** `heatmapObjectName` returned null for ANY `shownObjects`
+Set, and a restored session has a Set of exactly one - so the panel had no
+object to describe. Its own rule is "the matrix belongs to one, so it waits
+until the viewer is back to one", and a one-element set is back to one; the
+guard made the panel depend on HOW the viewer arrived at one object rather than
+on whether it is showing one. Fixed in `py2Dmol db883b6`.
+
+🔴 **AND IT FAILED ONLY ON A RESTORE, WHICH IS WHAT MADE IT HARD TO SEE.**
+`updateVisibility` runs when the panel is asked to change, so a live page that
+showed the panel while the set was still null keeps it on screen once the set
+becomes a Set - visible by inertia, with nothing to recompute it. Loading a
+session recomputes from nothing, and the panel that had been on screen all
+along did not come back. Everything measurable said the data was fine -
+`hasData: true`, `mapKeysOf: ['pae','contact']`, frame 0 holding a well-formed
+`{data, n: 58}` and a 58-wide `pae` - and `heatmapRenderer.maps` was empty
+because `heatmapObjectName` had already answered null. `heatName` is what named
+it.
+
+Restored now: `panelShown: true`, `panelTabs: ['pae','contact']`,
+`heatName: 'af3_1'`, `rendererMaps: ['pae','contact']`. The old open note:
+it blamed `resolveMapFrame`'s backward search, which was wrong - the search was
+never reached. `heatmapObjectName` had returned null before it, so `_show` had
+no object at all. Reasoning down the call chain named the wrong function; the
+probe that printed `heatName` named the right one in a single run.
+
+### The structure travels, and the record is gzipped
+
+🔴 **BOTH DOWNLOAD BUTTONS WERE ON SCREEN AND BROKEN AFTER A RESTORE.**
+py2Dmol's session carries coordinates, element symbols and residue numbers -
+enough to DRAW a fold and not the text the fold produced - and both buttons
+read `prediction.pdb`. "PDB" wrote the word `undefined` into a file and "All"
+threw inside the archive builder. Rebuilding the text from the frames would be
+a second PDB writer to keep in step with the first, so the record carries the
+one the fold wrote, along with everything `buildFoldArchive` reads: the token
+layout, the confidences, the PAE and the contact map.
+
+🔴 **AND THE MATRICES GO IN AS PLAIN ARRAYS, BECAUSE THE RECORD IS JSON.** A
+Float32Array survives `structuredClone` and does not survive `JSON.stringify` -
+it returns as `{"0":1.2,...}`, an object with numeric keys that every reader
+here treats as a matrix of undefined. Converted going in and typed coming out,
+so there is one shape to restore rather than two to tell apart.
+
+🔴 **AND A RESTORED SESSION HAS NO ALIGNMENT TO INCLUDE, WHATEVER THE BUTTON
+ASKS FOR.** "Download all" asks for one because a live fold has one; the README
+still has to say the archive does not carry it rather than describe an `msas/`
+that is absent. `archiveFor` forces `alignmentOmitted` on a restored
+prediction - measured, `readmeOmits: true`.
+
+🔴 **GZIP IS WORTH 3.5x AND IS IN THE BROWSER ALREADY.** `CompressionStream`,
+measured on a real session: 358,152 bytes of JSON become **103,372**. The
+payload is rounded decimal coordinates repeated over every frame of a
+trajectory, and it grows with both the chain length and the sampler's step
+count - py2Dmol's own note records a 212 MB session for a 305,004-position
+structure, so this is not a small-case optimisation. The record went from
+188,767 bytes holding the answer alone to 103,372 holding the structure, the
+matrices and the whole trajectory. A stored `Uint8Array` also skips IndexedDB's
+structured clone of a deep object graph. Where `CompressionStream` is missing
+the object is stored as it is, and the reader tells the two apart by TYPE
+rather than by a flag that could disagree with the bytes.
+
+Measured after a reload and restore, with both buttons actually pressed:
+
+| | |
+|---|---|
+| PDB | 36,896 B, 467 ATOM records, no `undefined` |
+| All | 21,589 B zip, five members, `full_data` with `contact_probs` and `pae` |
+| README | says the alignment is not in this archive |
+| panel | visible, tabs `['pae','contact']` |
+
+### The matrices are read back out of the frames, not stored twice
+
+🔴 **py2Dmol'S SESSION ALREADY HOLDS THE PAE AND THE CONTACT MAP**, so keeping
+float copies beside them wrote every pair twice - and n^2 is the term that
+grows fastest with chain length, which makes this the copy worth not making.
+Both invert exactly enough:
+
+| | how it is stored | recovered to | what the archive writes |
+|---|---|---|---|
+| PAE | float rows, rounded to 1 dp by the session writer | 0.05 A | 2 dp - loses one digit |
+| contact | bytes, `round(p * 255)`, vmin 0 vmax 1 | 0.004 | 2 dp - **no practical loss** |
+| pLDDT | `frame.plddts`, rounded to integers | 1 | feeds only `fraction_disordered`, threshold 50 |
+
+The per-ATOM pLDDTs the archive writes come off the stored PDB's B-factor
+column rather than from any of this, so they are unrounded.
+
+🔴 **AND THE DECODE USES THE MAP'S OWN BOUNDS, NOT A CONSTANT.** `contactMapFor`
+writes vmin 0 / vmax 1 and `paeMapFor` writes vmin 0 / vmax 32 - quantised
+against a fixed range rather than its own, so two folds are comparable - and
+`mapsOfFrame` normalises every producer to the same `{data, n, vmin, vmax}`.
+Reading the bounds from the entry is what keeps this right for a map some other
+path encoded differently; a hard-coded 255 would fill the key with plausible
+nonsense instead of failing.
+
+🔴 **AND THE FIRST FRAME THAT HAS ONE WINS.** A trajectory carries coordinates
+on every frame and a contact map on one - AF3 attaches it to `flow_0` - so a
+search that looked only at the frame on screen would find nothing on the
+fifteenth.
+
+Measured, on the archive a restored session writes:
+
+| | |
+|---|---|
+| `pae` | diagonal **0.8**, off-diagonal **19.9**, max 23 |
+| `contact_probs` | diagonal **1**, range 0-1 |
+| `atom_plddts` | 63.23 to 84.24, against the fold's 71.2 mean |
+
+Present is not correct, which is why these are values and not key names: a
+decode against the wrong bounds fills the file with a plausible matrix.
+
+The record, over three shapes of the same session:
+
+| | raw | stored |
+|---|---|---|
+| the answer alone, uncompressed | 188,767 | 188,767 |
+| structure and matrices, gzipped | 358,152 | 103,372 |
+| structure, matrices rebuilt, gzipped | 226,641 | **51,968** |
+
+### The three models, and the one that caught a regression
+
+🔴 **A MODEL WITH NO CONFIDENCE HEAD STILL HAS A CONTACT MAP, AND IT IS ITS
+ONLY SCORE.** The restore collapsed its whole confidence object to undefined
+whenever the summary was absent - which threw away the matrices just recovered
+from the frames, so EF2-fast's restored archive lost `contact_probs` AND its
+`_summary_confidences_0.json` entirely, the one file `chain_pair_max_contact`
+lives in. The summary being absent says nothing about the maps. Caught by
+running the gate on all three models rather than on AF3 alone, which is this
+repository's recurring lesson in a new place.
+
+🔴 **AND pLDDT IS ATTACHED ONLY WHERE THERE IS ONE.** `fullDataJson` chooses
+`atom_plddts` over `atom_certainty` on exactly that field's presence, so
+handing it EF2-fast's B-factors - a distogram certainty, under a REMARK saying
+so - would label them as the model's pLDDT in the file a reader is most likely
+to parse. Restored EF2-fast still writes `atom_certainty`, and its score card
+stays hidden rather than drawing dashes.
+
+| after a reload and restore | AF3 | AF2-mono | EF2-fast |
+|---|---|---|---|
+| frames | 16 | 2 | 11 |
+| panel tabs | pae, contact | pae, contact | contact |
+| score card | 71.2 / 0.39 | 61.9 / 0.32 | **hidden** |
+| PDB | 36,896 B, 467 atoms | 36,862 B, 466 | 36,940 B, 466 |
+| archive | 5 members | 5 | 5, `atom_certainty` |
+| stored | 51,968 B | 31,255 B | 36,429 B |
+| gzip ratio | 4.36 | 3.42 | 6.53 |
+
+The saved-session row is measured at phone widths with its text forced on, for
+the same reason the download dial's label is - `hidden` until there is a
+session to offer, and a box that is not laid out cannot overflow. At 320px the
+row is 254px with the text at 79 and Restore's right edge at 205 against the
+row's 287: `overflows: false`. `mobile-layout.py` names `#session` as refusing
+to shrink below 575px, which is the same min-content false positive the tool
+reports for any `white-space: nowrap` text - what decides is the row against
+the box, which is why it is measured separately.
+
+**Not yet exercised through a session:** a multi-chain or ligand fold (the
+`chainLengths` and `tokens` round trip), OpenDDE and OpenBind-0, and anything
+long enough for the n^2 matrices and the frame count to matter together.
+
+### A complex and a ligand through a session
+
+🔴 **A LIGAND IS THE CASE THE ARCHIVE REFUSES TO GUESS.** It is one token per
+heavy atom, so a fold with one has MORE TOKENS THAN RESIDUES, and
+`tokenIdentifiers` throws rather than numbering them - "this fold's token
+layout must be passed in, not inferred". That makes it the sharpest test of a
+session carrying `tokens` back: 58 residues plus GOL is **64 tokens**, the
+restored PAE is 64 wide, and the archive is written rather than refused. Had
+`tokens` been lost, the token count would still have come out as 64 from the
+PAE's own length and the builder would have thrown against 58 residues.
+`fold-in-page.py --ligand GOL` drives it.
+
+🔴 **AND THE COMPLEX EXERCISES THE KEYING THAT WAS ONCE WRONG.** Per-chain
+scores are keyed by ASYM ID, which AlphaFold 3 numbers from one and AlphaFold 2
+from zero - read as indices they produced `chain_pair_iptm` all null while
+every unit test passed. Measured through a saved session, on a 58 + 76 fold:
+
+| | |
+|---|---|
+| chains | `[58, 76]`, 134 residues |
+| token layout | 134 tokens, chains `['A','B']`, last residue id **76** - numbering restarts per chain |
+| `chain_ptm` | `[0.46, 0.54]` |
+| `chain_pair_max_contact` | `[[0.61, 0.2], [0.2, 1]]` |
+| `pae` | diagonal 0.8, off-diagonal 19.3, max 28.9 |
+| PDB | 84,458 B, 1,069 atoms |
+
+**Still not exercised through a session:** OpenDDE and OpenBind-0, and anything
+long enough for the n^2 matrices and the frame count to matter together.
+
+### Templates travel; the alignment does not
+
+🔴 **A TEMPLATE IS INPUT, AND LOSING IT DESCRIBED A DIFFERENT JOB.** The record
+did not carry `templates`, so a restored prediction had `templates: undefined` -
+and by this file's own rule an ABSENT array means "this model has no such
+control", which is what drops the README's templates line entirely. An empty
+array means "none were used". Neither means "there were some and they are
+gone", which is what had happened. The archive also lost the template
+structures themselves.
+
+They travel now. Unlike the alignment they are small - a structure or three
+rather than a 3 MB a3m - and unlike the alignment they are a CHOSEN input: a
+fold that quietly forgot which template it was given is a different job from
+the one that ran, where a re-searched MSA is at least the same question asked
+again. `text` and `chain` are what the archive writes and `source` names the
+hit; `origin` is dropped, because it carries the live fetch's status and that
+request is long finished.
+
+Measured, `--template 1QYS_A` through a save and reload:
+
+| | |
+|---|---|
+| archive member | `templates/af3_1_template_hit_0_chains_a.pdb` |
+| README | `- templates: 1 used` |
+| session | 310,669 B raw, **70,458** gzipped |
+
+against 226,641 / 51,968 for the same fold with no template - so a template
+costs about 18 KB stored.
+
+### Every model and shape now through a session
+
+| | frames | panel | card | archive |
+|---|---|---|---|---|
+| AF3 | 16 | pae, contact | 71.2 / 0.39 | 5 members |
+| AF2-monomer | 2 | pae, contact | 61.9 / 0.32 | 5 |
+| AF2-multimer, 2 chains | 2 | pae, contact | 45.1 / 0.28 | 5 |
+| EF2-fast | 11 | contact | **hidden** | 5, `atom_certainty` |
+| OpenBind-0 | 16 | pae, contact | 61.3 / 0.34 | 5 |
+| OpenDDE | 16 | pae, contact | 83.6 / **no pTM** | 5 |
+| complex 58+76 | 16 | pae, contact | 50.3 / 0.33 | 5, `chain_ptm` [0.46, 0.54] |
+| ligand GOL | 16 | pae, contact | 75.7 / 0.48 | 5, **64 tokens** for 58 residues |
+| template 1QYS_A | 16 | pae, contact | 67.9 / 0.38 | 6, with `templates/` |
+
+And the state machine: folding again after a restore works - the button is
+live, `uniqueStem` gives `af3_1_2` rather than colliding with the restored
+`af3_1`, the record is overwritten with the new fold, and the offer row is
+re-asked so it does not go on advertising the old one.
+
+### State, for whoever picks up the saved session
+
+**Where it lives.** `web/fold-session.js` is the store, `rememberSessionWhenSettled`
+/ `offerSession` / `restoreSession` in `web/app.js` are the three verbs, and the
+row is `#session` in `index.html`, under the status line and outside
+`#viewer-container` on purpose. Upstream: `py2Dmol 6ee50b8` split
+`buildViewerState` from the download and exported both; `py2Dmol db883b6` fixed
+the Multi guard that hid the heatmap panel.
+
+**The gate** is `python3 tools/fold-in-page.py --model <m> --session`. It folds,
+reads the record out of the real IndexedDB, RELOADS, restores, presses both
+download buttons and reads the zip back, then folds something else to check the
+offer does not go stale. `--session-hidden` drives a `visibilitychange` first,
+the other save signal. `--ligand GOL` and `--template 1QYS_A` are the two input
+shapes worth re-running after any change here.
+
+🔴 **THE GATE MUST RELOAD THE WAY A READER DOES.** It drove its own
+`visibilitychange` before reloading once, and was green for two rounds while a
+plain reload restored one frame of sixteen. If a change here needs the gate
+adjusted, check first whether the adjustment is the bug.
+
+**Numbers to compare against** - AF3, the page's default 58-mer, no MSA:
+
+| | |
+|---|---|
+| session | 226,641 B raw, **51,968** gzipped, 16 frames |
+| restore | 16 frames, `pae: 58`, contact, card 71.2 / 0.39, panel `['pae','contact']` |
+| PDB button | 36,896 B, 467 ATOM records |
+| All button | ~19 KB zip, 5 members, README saying the alignment is not included |
+| 152 residues | 723,105 B raw, 166,223 gzipped |
+
+**Open, in order:**
+
+1. ~~**Modified residues**~~ - done, and it found a bug that was not in the
+   session at all. `fold-in-page.py --modify SEP@3` sets the modification on the
+   entity the way the row's `⋮` popup does, and the round trip is clean: 67
+   tokens for 58 residues, PAE 67 wide, `token_res_ids` ending at 58, both
+   download buttons working. But **`job_request.json` did not name the
+   modification**, on a live fold as much as a restored one - the request is the
+   file a reader hands back to reproduce a job, and one listing the parent
+   sequence alone describes a different fold. Silently, because a modified
+   residue changes no residue COUNT: `SEP3` shows in the status line and nowhere
+   in the archive. Now written in the server's own dialect,
+   `{ptmType: "CCD_SEP", ptmPosition: 3}`, and ABSENT rather than `[]` on an
+   unmodified chain, since an empty array claims the chain was checked. The gate
+   reads it back off the zip.
+
+   The same argument reached the offer row, which said "58 residues" for a fold
+   whose parent would say exactly the same thing - so it names the ligands and
+   the modifications now, capped at three, the way the status line does:
+   `Last fold: AlphaFold 3 · 58 residues + SEP3 · pLDDT 72.1 · just now`.
+2. **A quota-exhausted save.** `saveSession` returns `"quota"` and the page says
+   so, and that branch has never run.
+3. **The no-`CompressionStream` fallback.** `pack`/`unpack` decide by TYPE, so an
+   uncompressed record still reads; untested in a browser that lacks it.
+4. **Nothing longer than 152 residues** has been saved. The n^2 matrices and the
+   frame count compound; a 500-mer is expected around 1-2 MB gzipped.
+
+**Not deployed.** Nine commits here and two in py2Dmol are unpushed as of this
+note.
+
+## The job JSON, read as well as written
+
+The archive has written a `*_job_request.json` since it existed, and its README
+told the reader to drop the .zip back on the page "to fold again with exactly
+these alignments". That restored the **alignment and nothing else**: the
+sequence, the copies, the ligands, the modified residues and the seed all had
+to be retyped out of the request file by hand. A format written in one place
+and read in none drifts, which is how the templates and then the modifications
+came to reach the fold and not the file, twice in a week.
+
+`web/job-json.js` now holds both halves - `jobRequestJson` moved there out of
+`fold-archive.js`, which re-exports it - and `jobFromJson` reads a job back.
+
+🔴 **"THE AlphaFold 3 FORMAT" IS TWO FORMATS.** They differ in every field that
+matters, and reading one as the other is silent rather than loud:
+
+| | server dialect | open-source dialect |
+|---|---|---|
+| marker | `dialect: "alphafoldserver"`, `version: 3` | `dialect: "alphafold3"` or absent, `version` 1-4 |
+| seeds | `["7"]`, strings | `[7]`, integers |
+| a chain | `proteinChain: {sequence, count}` | `protein: {id: "A", sequence}` |
+| copies | `count` | the LENGTH of an `id` list |
+| a template | `useStructureTemplate: true`, and nothing about which | `templates: [{mmcif, queryIndices, templateIndices}]` |
+| an alignment | not expressible | `unpairedMsa` / `pairedMsa`, inline or by path |
+
+Both are read. **Only the server one is written**, because the archive's whole
+justification is matching `tools/fixtures/fold_2026_09_01_10_17.zip` file for
+file - trading that for a marginal gain is a bad trade.
+
+### What it refuses, and why refusing is the point
+
+Every unsupported field parses perfectly well as far as the sequence, so a
+reader that read past it would fold a real structure of the right protein
+**without the inhibitor bonded to it**, or with unmethylated DNA, and report it
+as the job that was asked for. So each is refused by name:
+`bondedAtomPairs`, `userCCD`, a `smiles` ligand, `ccdCodes` with several
+components (that is one bonded chain, not several ligands), `unpairedMsaPath`,
+an inline `unpairedMsa`, `queryIndices`/`templateIndices` (they set the
+template's residue mapping and this page computes its own), modified bases, and
+a sequence-entry key the page has never heard of.
+
+🔴 **AN EMPTY `unpairedMsa` IS AN INSTRUCTION, NOT AN ABSENT FIELD.** AlphaFold
+3 reads `""` as "fold this chain with no alignment" and an absent field as "go
+and search" - opposite jobs, several minutes apart. `""` sets the MSA dial to
+none and says so in the status line.
+
+### AlphaFold 3's own examples are the corpus
+
+🔴 **AND THE REFERENCE ARCHIVE ITSELF IS FED BACK NOW.**
+`tools/fixtures/fold_2026_09_01_10_17.zip` is the real AlphaFold Server export
+this whole format was read off, and until this gate nothing ever handed it to
+the page - so the reader was only ever checked against the archive we write,
+which shares its source. Dropped on the upload box it comes back as
+`archive · 2 chains, 2 with paired rows · 2 chains · seed 819505351`, with rows
+`protein:146x1` and `protein:74x1`. That is a file DeepMind wrote, restoring
+both the job and four alignment blocks.
+
+`tools/fixtures/af3-jobs/` holds all thirteen `examples/*.json` from
+google-deepmind/alphafold3 plus its kitchen-sink `alphafold_input.json`,
+vendored under Apache 2.0, and `test/af3-example-jobs.test.js` runs the reader
+over every one. **These are the only inputs here we did not write** - the rest
+of `test/job-json.test.js` checks the reader against our own reading of the
+spec, which is the same mistake the archive made from the writing side. They
+carry things our fixtures did not think to: `version: 4`, an `id` LIST standing
+for four calcium ions, `description` keys inside a chain body, and
+`modificationType`/`basePosition` where a protein says `ptmType`.
+
+**Eight of the fourteen load. Six do not**, and the split is the roadmap:
+
+| | files | why |
+|---|---|---|
+| loads | 8 | complexes, homodimers by `id` list, ions, CCD ligands, protein PTMs, DNA and RNA chains |
+| bonded chemistry | 3 | `bondedAtomPairs` - a covalent inhibitor, a glycan, the kitchen sink |
+| modified bases | 2 | `5CM` on DNA, `PSU`/`5MC`/`OMG` on RNA |
+| SMILES | 1 | a ligand named by structure rather than code |
+
+All fourteen behaved as predicted on the first run, including ERK2's `TPO@185`
+and `PTR@187` passing the page's own parent-residue validator against a real
+360-residue sequence - an independent check of `modificationProblem` that
+nothing else here provided.
+
+### The gate
+
+    python3 tools/fold-in-page.py --model af3 --modify SEP@3 --ligand GOL \
+      --job-round-trip
+
+🔴 **IT WIPES THE ENTITY ROWS BEFORE DROPPING THE ARCHIVE BACK.** The rows are
+still on screen from the fold that just ran, so "they match afterwards" is true
+of a page that read nothing at all. It sets them to `AAAAAAAA` and the seed to
+999 first, then drops the zip and compares. Measured, all green:
+
+| arm | result |
+|---|---|
+| archive round trip | 26,079 B zip; sequence, `SEP@3`, `GOL`, copies and seed all back |
+| open dialect, hand written | `2 chains + 1 ligand · seed 1234 · MSA off`, dial actually moved |
+| a refusal | `bondedAtomPairs describes chemistry this page does not build`, rows unchanged |
+| one of AF3's own example files | dropped on the real input, not passed to the reader |
+
+Compared on the fields the job file can carry, not on the whole row: a restored
+row has no `template.origin` and no coverage status, which are discovered when
+a template is FETCHED and were never part of the job.
+
+🔴 **AND THE SERVER DIALECT LOSES WHICH TEMPLATE.** `1QYS_A` goes in and
+"search for a template" comes back, because `useStructureTemplate` is a boolean.
+That is a real loss, asserted in `test/job-json.test.js` rather than left to be
+discovered by somebody whose re-fold used a different structure than the one
+they picked. The open-source dialect could carry it; writing that one would
+cost the archive's file-for-file claim.
+
+### Checked against AlphaFold 3's parser, not against its documentation
+
+The writer was diffed against `tools/fixtures/fold_2026_09_01_10_17.zip` and
+against `src/alphafold3/common/folding_input.py` - **the code that actually
+reads these files**. The writer came out clean:
+
+| written | upstream says |
+|---|---|
+| top-level `name, modelSeeds, sequences, dialect, version` | exactly its allowed set, and `dialect`+`version` must both be present or both absent |
+| `modelSeeds: ["42"]` | `int(seed)` over the list, so strings are right |
+| `count` on a chain | how it expands copies |
+| `useStructureTemplate: false` | read as "use no templates" - a meaningful false, not noise |
+| `ptmType: "CCD_SEP"` | `mod['ptmType'].removeprefix('CCD_')` |
+| `full_data_0.json` keys | identical set and order to the reference archive's |
+
+🔴 **WITH ONE EXCEPTION, AND IT IS UPSTREAM'S OWN SPLIT RATHER THAN OURS.**
+`folding_input.py` sets `ALPHAFOLDSERVER_JSON_VERSION = 1` and RAISES on
+anything else - while the real AlphaFold Server stamps `"version": 3` on the
+archive it hands you, as `tools/fixtures/fold_2026_09_01_10_17.zip` does. **So
+the reference parser refuses the reference archive**, and it refuses ours for
+the same reason and the same value. The writer stays at 3: this archive's whole
+justification is being the server's file for file, and a job request nobody
+else writes is worth less than one the pipeline needs a version bump to read.
+Worth knowing before somebody hands `_job_request.json` to `run_alphafold.py`
+and reads "unsupported version: 3, expected 1" as our bug.
+
+The reader takes both numberings - server 1 and 3, open-source 1 through 4,
+which is upstream's own `JSON_VERSIONS` - and refuses anything else by number,
+because a later version may give a field we already read a different meaning.
+It also follows upstream's both-or-neither rule for `dialect` and `version`,
+and its **absent-means-the-server's** default, which is not the obvious one:
+defaulting the other way put such a file under the wrong version table.
+
+🔴 **AND THAT RULE CAUGHT A FLAW IN OUR OWN TESTS.** The `open()` helper in
+`test/job-json.test.js` wrote `version` with no `dialect` beside it and leaned
+on our default - so every open-dialect case below it had been written against a
+file AlphaFold 3 itself would refuse. All fourteen of its example files carry
+both fields; the helper does now too.
+
+🔴 **AND THE SAME READING FOUND THREE BUGS IN THE READER, NONE OF WHICH THE
+EXAMPLE CORPUS COULD CATCH** - all fourteen of those files are the open-source
+dialect, and every one of these is about the server's:
+
+1. **An `ion` entry was refused.** AlphaFold Server spells a magnesium
+   `{"ion": {"ion": "MG", "count": 1}}`, and `Ligand.from_alphafoldserver_dict`
+   takes `ligand` or `ion` alike. Reading only `ligand` refused every real
+   server job with a metal in it - half of what `COMMON_IONS` exists for.
+2. **`CCD_ATP` stayed whole.** Upstream does `removeprefix('CCD_')`; kept, it
+   is a five-letter code this page would fetch a component for and not find.
+3. **`glycans` and `maxTemplateDate` were ignored.** Both are in the server's
+   allowed key set and both RAISE upstream. A glycan is chemistry this page does
+   not build; a template date changes which template is found, so honouring the
+   sequence and dropping the date folds a different job.
+
+Unknown keys are refused now, per entry kind, with the allowed sets copied from
+`folding_input.py` - upstream calls `_validate_keys` and raises, so leniency
+here would fold a job the reference implementation would not have run.
+
+🔴 **`ligand` IS THE ONE ENTRY KEY BOTH DIALECTS USE** and they mean different
+bodies by it - `{"ligand": "GOL", "count": 1}` against
+`{"id": "B", "ccdCodes": ["GOL"]}`. Which fields are legal comes from the BODY.
+Keyed off the entry name alone, this page's own archive stopped being readable,
+which is how the mistake surfaced.
+
+### One stale comment, found by diffing rather than reading
+
+`fold-archive.js`'s header claimed `has_clash` **and** `chain_pair_pae_min`
+were both left out as uncomputed. `has_clash` still is. `chain_pair_pae_min`
+has been computed and written for some time - it is the minimum over ordered
+pairs of a PAE we already have, with the server's own values quoted in the code
+beside it. The comment was corrected, and it names the two keys that are ours
+rather than the server's: `chain_pair_max_contact` and `mean_plddt`.
+
+### Every model on the page, through the round trip
+
+The reader and the offer row are model-independent by construction, which is an
+argument and not a measurement. All six were run:
+
+| model | archive | what came back |
+|---|---|---|
+| AF3, `SEP@3` + `GOL` | 26,079 B | sequence, modification, ligand, copies, seed |
+| AF3, two chains | 40,408 B | both chains, in order |
+| AF2-mono | 20,112 B | sequence and seed |
+| OpenBind-0 | 22,462 B | sequence and seed |
+| OpenDDE | 20,737 B | sequence and seed |
+| EF2-fast | 13,468 B | sequence and seed |
+
+🔴 **AND EF2-fast WENT THROUGH THE SESSION TOO, BECAUSE IT IS THE SHARP CASE.**
+It has no confidence head, and the discipline the archive was taught about
+absent scores has to survive a save, a reload and a restore - it would be very
+easy for a round trip to put zeros where the model has no opinion. Measured, on
+a restored fold:
+
+    offer row   Last fold: EF2-fast · 58 residues · just now
+    score box   hidden, cells "-"
+    panel tabs  ['contact']            - no PAE tab, because there is no PAE
+    full_data   atom_certainty         - NOT atom_plddts
+    summary     chain_pair_max_contact only
+    README      no "not in this archive" line: this model takes no alignment
+    frames      11 restored
+
+The offer row says no pLDDT rather than `pLDDT 0.0`, which is the whole rule in
+one line.
+
+## The alignment travels now
+
+The session deliberately dropped the MSA, because it is 96.8% of a fold archive
+- 3.0 MB of ubiquitin's 3.1 MB. That reasoning was about an a3m's RAW size,
+which is not what gets stored: an alignment is thousands of near-identical rows,
+about the most compressible thing in the record. The reference archive's four
+real blocks are 1,288,080 bytes and gzip to 280,784, a ratio of 4.6.
+
+What it buys is the difference between a fold that can be **reproduced** and one
+that can only be looked at - a re-search finds different hits, so without it a
+restored fold's archive has to carry the "may find different hits" caveat.
+Measured on ubiquitin, 76 residues, MMseqs2:
+
+| | before | after |
+|---|---|---|
+| session record | ~250 KB raw / ~55 KB gz | **9,244,617 raw / 2,756,924 gz** |
+| restored archive | 19 KB, no `msas/` | **1,233,759 B, with `msas/`** |
+| README | "may find different hits" | no caveat: it reproduces |
+
+🔴 **AND IT IS THE ONE FIELD ALLOWED TO BE DROPPED.** Everything else in the
+record is bounded by the fold; an alignment is bounded by what a public server
+returned. So a `"quota"` save retries WITHOUT it and says
+`saved without its alignment - there was no room for it`, rather than letting
+one deep MSA cost the whole session. That is also the first thing that has ever
+exercised the quota branch's neighbourhood.
+
+🔴 **THE OFFER ROW READS A SEPARATE RECORD NOW, AND HAS TO.** It needs a model
+name, a residue count, a score and a timestamp - and it was getting them by
+ungzipping the entire session on every page load. That was 52 KB before; after
+this it is 2.8 MB of gzip over 9.2 MB of JSON, on a phone, to decide whether to
+show one line. `current-meta` is written in the SAME transaction as the session
+so the two cannot disagree, and it is named by what it DROPS - the alignment,
+the structure, the templates - because a summary built by listing what it keeps
+goes stale the moment `jobMeta` gains a field.
+
+### The fourth README state, which every single-sequence archive got wrong
+
+Found while making `archiveFor` ask what is actually held rather than where the
+prediction came from. The "here is `msas/`" branch was reached by any model with
+an alignment CONTROL - so a fold that deliberately used none described a
+directory that was not in the file and told the reader to drop the zip back "to
+fold again with exactly these alignments". **Every single-sequence archive this
+page has ever written said that**, and it is live on the site right now.
+
+Whether the archive CARRIES an alignment is a different question from whether
+the model TAKES one, and they are asked separately now - the carrying half
+answered by looking at the files that were written, not by a caller's flag:
+
+| the fold | the README |
+|---|---|
+| searched, alignment carried | ``msas/`` holds one alignment per chain |
+| searched, alignment dropped | left out, "may find different hits" |
+| ran on the single sequence | **ran on the sequence alone; folding it again reproduces it** |
+| model takes no alignment | folds from the sequence alone |
+
+### Forget deletes both records, and did not
+
+A second record is a second thing to delete, and only the write path knew it.
+`clearSession` removed the session and left the summary, so **Forget** deleted
+the fold while the offer row stayed on screen advertising it - and pressing
+Restore then said "there is no saved session to restore". Both are deleted in
+one transaction now.
+
+🔴 **AND A GATE ARM RELOADS AFTERWARDS, because the click alone cannot show
+this.** The row hides itself on the click, from memory; it is only redrawn from
+the store on the next page load, which is where a stale summary reappears. The
+arm also reads the store's remaining keys directly - `keysLeft: []` is the
+assertion, since "the row is hidden" was true even while the bug was there.
+
+    forget:       {"hiddenAfter": true, "keysLeft": []}
+    after forget: {"offered": false, "text": ""}

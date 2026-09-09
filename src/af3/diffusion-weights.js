@@ -5,7 +5,11 @@
  * the checkpoint - the trunk's loader is already long, and a typo in one leaf
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
-import { af3Dialect, bind, dims, layer, stacked } from "./weights.js";
+import {
+  af3Dialect, bind, dims, layer, stacked,
+  trunkWeights, confidenceWeights,
+  structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights,
+} from "./weights.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
@@ -469,5 +473,40 @@ export async function diffusionWeights(store, superBlocks = 6) {
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 1, dialect),
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 2, dialect)],
     },
+  };
+}
+
+/**
+ * Every weight `foldBatch` needs, for whichever model the manifest describes.
+ *
+ * 🔴 A TOOL THAT BUILDS THIS BY HAND IS PINNED TO AlphaFold 3, AND READS AS IF
+ * IT IS NOT. `--model=` takes a manifest, so every probe here LOOKS
+ * model-agnostic; the five lines each of them wrote out - trunk, diffusion,
+ * `confidenceWeights`, atom reference, target features - name AlphaFold 3's
+ * confidence head unconditionally and know nothing of a structural stack. The
+ * same shape as the per-module checkers pinned to `CHANNELS = 128`, which is
+ * where OpenDDE's first bundle broke while every one of them passed.
+ *
+ * The dialect decides, once, here: a bundle whose dialect says `structuralTokens`
+ * gets the expander, the refiner and OpenDDE's own confidence head; everything
+ * else gets AlphaFold 3's.
+ */
+export async function foldWeights(store, options = {}) {
+  const trunk = await trunkWeights(store, options.blocks ?? 48, options.msaBlocks ?? 4);
+  return {
+    trunk,
+    targetFeat: await targetFeatureWeights(store),
+    diffusion: await diffusionWeights(store),
+    atomReference: await atomReference(store),
+    ...(trunk.dialect.structuralTokens ? {
+      expander: await structuralExpanderWeights(store),
+      refiner: await structuralRefinerWeights(store),
+      openddeConfidence: {
+        ...await openddeConfidenceWeights(store),
+        weightPrecision: options.confidenceWeightPrecision,
+      },
+    } : { confidence: await confidenceWeights(store) }),
+    ...(options.refinerWeightPrecision === undefined
+      ? {} : { refinerWeightPrecision: options.refinerWeightPrecision }),
   };
 }

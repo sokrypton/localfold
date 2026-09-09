@@ -77,6 +77,41 @@ export const AF3_COUNTS = {
 };
 
 /**
+ * OpenDDE's own step counts, because more steps make its fold WORSE.
+ *
+ * 🔴 MEASURED ON TWO TARGETS AND NINE FOLDS, AGAINST THE SEED SPREAD. TM
+ * against the deposition, seeds within an arm:
+ *
+ *   6MRR   16 steps  0.9044 0.9169 0.9039   100 steps  0.8884 0.8828
+ *   1QYS   16        0.9449 0.9394          100        0.9285 0.9319
+ *
+ * The ranges do not overlap on either target, and 16 is 32-40% faster. This is
+ * the second model here to say it - docs/EF2FAST.md records "more steps than
+ * the schedule buy nothing" for that one - and the mechanism is the same:
+ * OpenDDE's sampler re-noises at every step, so a longer schedule is more
+ * chances to wander, not a finer approach.
+ *
+ * The ladder keeps 25 and up so the AlphaFold 3 settings remain selectable and
+ * comparable; what moves is which one a fold takes when nobody chooses.
+ */
+/**
+ * 🔴 OpenDDE TAKES THE DIFFUSION SAMPLER, AND THE FLOW ARM IS A LOSS AT THE
+ * SAME PRICE. On 6MRR at sixteen steps, two seeds each: diffusion TM 0.9044
+ * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s. AlphaFold 3
+ * prefers flow because its diffusion default is 200 steps and flow-16 reaches
+ * it in a twelfth of the calls; OpenDDE's sampler is already best at sixteen,
+ * so there is nothing for a flow arm to escape and escaping it loses the
+ * structure. The mode row is hidden for this family AND the value forced, so a
+ * stale select cannot reintroduce it.
+ */
+export const OPENDDE_SAMPLER_MODE = "diffusion";
+
+export const OPENDDE_COUNTS = {
+  flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
+  diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },
+};
+
+/**
  * 🔴 ONLY THE 20 AMINO ACIDS AND X. featurise.js maps anything else to UNK,
  * which is a silent four-atom residue - so a sequence carrying a nucleotide
  * alphabet would fold as a chain of blanks and look merely disappointing.

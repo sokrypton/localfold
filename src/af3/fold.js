@@ -57,6 +57,17 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
 import { ALPHAFOLD3 } from "./dialect.js";
 
 export const DIALECT = ALPHAFOLD3;
+
+/**
+ * The pair width above which the trunk's block weights stop being cheap.
+ *
+ * 🔴 IT IS A THRESHOLD BETWEEN TWO MEASURED POINTS, NOT AN OPTIMUM. These
+ * weights go as the SQUARE of the channel count, so at AlphaFold 3's 128 they
+ * are a ninth of what they are at OpenDDE's 384 - and every trade about them
+ * flips between the two. Both knobs it gates are measured at exactly those two
+ * widths and nowhere between, so 256 should move when a third bundle exists.
+ */
+const WIDE_PAIR_TRACK = 256;
 export { ALPHAFOLD3, OPENBIND0, DIALECTS, dialectFor } from "./dialect.js";
 
 export const THREE_LETTER = {
@@ -556,15 +567,33 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // spread and still a change for no gain.
     //
     // 🔴 AND IT IS A WIDTH TEST RATHER THAN A MODEL NAME, so a future bundle
-    // collects it by being wide rather than by being listed. 256 is the
-    // threshold because the two measured points are 128 (nothing) and 384
-    // (27%); it is not a measured optimum and should move when a third point
-    // exists.
+    // collects it by being wide rather than by being listed. See
+    // WIDE_PAIR_TRACK for what the threshold is and is not.
     pairWeightPrecision: options.pairWeightPrecision
-      ?? (weights.trunk.embedder.pairChannels >= 256 ? "f16" : "f32"),
+      ?? (weights.trunk.embedder.pairChannels >= WIDE_PAIR_TRACK ? "f16" : "f32"),
     accumulatePrecision: options.accumulatePrecision,
   };
-  const trunkGpu = new Af3TrunkGpu(device, precision);
+  // 🔴 A WIDE PAIR TRACK DOES NOT KEEP ITS BLOCK WEIGHTS RESIDENT, AND THE
+  // TRADE IS THE SAME ONE THE f16 RULE ABOVE PRICES. Residency exists so a
+  // SECOND pass does not re-upload 48 blocks; what it costs is holding all of
+  // them at once, and that cost goes as the square of the channel count while
+  // the saving does not. Measured on OpenDDE at 384 channels, 6MRR:
+  //
+  //   recycles  resident            non-resident
+  //   0         873.5 MiB, 16.1 s   647.6 MiB, 16.1 s
+  //   1         894.4     , 19.5     647.6     , 19.6
+  //   3         894.4     , 26.4     647.6     , 26.8
+  //
+  // 247 MiB to buy at most 0.4 s, and the structure is identical throughout
+  // (RMSD 1.528, TM 0.9139 at three recycles either way). AlphaFold 3 at 128
+  // channels keeps its residency: its block weights are a ninth of these and
+  // its peak is the diffusion transformer regardless, so there is nothing to
+  // buy and re-uploading would be a cost for no gain.
+  const wideTrack = weights.trunk.embedder.pairChannels >= WIDE_PAIR_TRACK;
+  const trunkGpu = new Af3TrunkGpu(device, {
+    ...precision,
+    residentWeights: options.residentWeights ?? !wideTrack,
+  });
   // 🔴 THE CONDITIONING AND THE HEAD INPUT DO NOT DEPEND ON THE TRUNK, so they
   // are built once, above the recycle loop. Only `trunkSingle` and `trunkPair`
   // move.

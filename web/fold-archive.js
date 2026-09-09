@@ -16,12 +16,25 @@
  * DeepMind's service. Shipping it verbatim out of a different program would
  * misstate who is promising what to whom. README.md says what actually ran.
  *
- * 🔴 A FIELD WE DO NOT COMPUTE IS LEFT OUT, NOT FILLED IN. `has_clash` and
- * `chain_pair_pae_min` are both cheap to invent and would be read as the
- * model's opinion of the structure. An absent key is a question that was not
- * asked; a zero is an answer.
+ * 🔴 A FIELD WE DO NOT COMPUTE IS LEFT OUT, NOT FILLED IN. `has_clash` is
+ * cheap to invent and would be read as the model's opinion of the structure.
+ * An absent key is a question that was not asked; a zero is an answer.
+ *
+ * 🔴 THIS ENTRY USED TO NAME `chain_pair_pae_min` TOO, AND HAD STOPPED BEING
+ * TRUE. That one is not invented - it is the minimum over ordered pairs of a
+ * PAE we already have - so it is computed and written, and checked against the
+ * server's own values for the reference archive. Found by diffing what this
+ * file WRITES against that archive rather than by reading this comment.
+ *
+ * 🔴 AND TWO KEYS ARE OURS, NOT THE SERVER'S: `chain_pair_max_contact`, which
+ * is what a model with no confidence head can still say about an interface,
+ * and `mean_plddt`, which the server leaves for the reader to average. Extra
+ * keys are safe where a missing one is not - a reader of the server's format
+ * ignores what it does not know - but they are named here so nobody takes this
+ * file for byte-identical.
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
+import { jobRequestJson } from "./job-json.js";
 import { coordinateAtoms } from "../src/design/superpose-pdb.js";
 
 /**
@@ -47,6 +60,19 @@ export const chainLetter = (index) => CHAIN_IDS[index] ?? "?";
  * than one that was not written. Nothing on this page folds 27 chains.
  */
 const MAX_NAMED_CHAINS = 26;
+
+/**
+ * What `msaOrigin` says when the fold ran on the query alone.
+ *
+ * 🔴 A FOLD THAT USED NO ALIGNMENT IS NOT A MODEL THAT TAKES NONE, and the
+ * README had no way to tell them apart: `msaOrigin` answers "does this model
+ * have the control", so a single-sequence AF3 fold - which HAS the control and
+ * chose not to use it - fell into the branch that describes an `msas/`, and
+ * every such archive told the reader to drop it back "to fold again with
+ * exactly these alignments" while carrying none. The string lives here, beside
+ * the file that reasons about it, rather than being spelled twice.
+ */
+export const SINGLE_SEQUENCE_ORIGIN = "none (single sequence)";
 
 /**
  * Per-token chain letters and residue numbers.
@@ -108,38 +134,13 @@ export function tokenIdentifiers(chainLengths, tokens, given) {
 }
 
 /**
- * The request that produced this fold, in the server's own dialect.
- *
- * 🔴 COPIES STAY A COUNT. `expandEntities` turns two copies into two chains
- * because that is what the model is given, but the server's request says
- * `count: 2` on one entry - and a request that listed the same sequence twice
- * would come back from the server as a different job than the one that ran.
+ * 🔴 THE REQUEST FILE'S FORMAT LIVES IN web/job-json.js, WITH ITS READER. It
+ * was written here and read nowhere, which is how the templates and then the
+ * modifications came to reach the fold and not the file. Re-exported because
+ * the archive is what everything asks for its request, and the archive is
+ * still where the file is named and placed.
  */
-export function jobRequestJson({ name, seed, entities }) {
-  const sequences = [];
-  for (const entity of entities ?? []) {
-    const value = (entity.value ?? "").trim();
-    if (value === "") continue;
-    const count = Math.max(1, Number(entity.copies) || 1);
-    if (entity.type === "protein") {
-      sequences.push({ proteinChain: { sequence: value, count,
-        useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
-    } else if (entity.type === "dna" || entity.type === "rna") {
-      sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });
-    } else {
-      sequences.push({ ligand: { ligand: value.toUpperCase(), count } });
-    }
-  }
-  return `${JSON.stringify([{
-    name,
-    // A string, as the server writes it, and an array because a job may carry
-    // several seeds. This page folds one at a time.
-    modelSeeds: [String(seed ?? 0)],
-    sequences,
-    dialect: "alphafoldserver",
-    version: 3,
-  }], null, 2)}\n`;
-}
+export { jobRequestJson } from "./job-json.js";
 
 /** The per-token and per-atom arrays, as `full_data_0.json`. */
 export function fullDataJson({ confidence, alignedError, pdb, tokenChainIds, tokenResIds }) {
@@ -365,7 +366,8 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
  * archive does not contain.
  */
 function readme({ stem, model, settings, msaOrigin, templateCount, scored = true,
-                  alignedError }) {
+                  alignedError, alignmentOmitted = false,
+                  carriesAlignment = false }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -379,7 +381,14 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
   for (const [key, value] of Object.entries(settings ?? {})) {
     if (value !== undefined && value !== null && value !== "") lines.push(`- ${key}: ${value}`);
   }
-  if (msaOrigin !== undefined) lines.push(`- alignment: ${msaOrigin}`);
+  if (msaOrigin !== undefined) {
+    // 🔴 AND "IT IS NOT HERE" IS PART OF WHAT RAN. The saved session drops the
+    // alignment because it is 96.8% of the bytes - measured on ubiquitin,
+    // 3,001,450 of 3,101,347, against a fold's own ~100 KB - and a reader who
+    // cannot tell an omitted alignment from an absent one will re-search and
+    // quietly get a different fold.
+    lines.push(`- alignment: ${msaOrigin}${alignmentOmitted ? " (not in this archive)" : ""}`);
+  }
   if (templateCount !== undefined) {
     lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
   }
@@ -420,8 +429,34 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
     "",
     "The AlphaFold 3 server's, with one difference: the structure is written as",
     "PDB rather than mmCIF.",
+    "",
+    // 🔴 SAID IN EVERY README, NOT ONLY THE ONE WITH AN `msas/`. The request
+    // file is in the archive whether or not the alignment is, so a fold that
+    // used no alignment at all still restores its sequence, its ligands, its
+    // modifications and its seed from one drop.
+    "`_job_request.json` is the job itself, in the AlphaFold Server's dialect.",
+    "Drop this .zip - or that one file - onto LocalFold's alignment upload box",
+    "and the page fills the entity rows back in: the sequences, the copies, the",
+    "ligands, the modified residues and the seed. LocalFold also reads the",
+    "open-source `alphafold3` dialect there, so a job written for the pipeline",
+    "loads too.",
   );
-  if (msaOrigin !== undefined) {
+  if (msaOrigin !== undefined && alignmentOmitted) {
+    // 🔴 THE THIRD STATE. `msaOrigin` alone answered "does this MODEL take an
+    // alignment", and the paragraph below assumed that taking one means
+    // carrying one. A saved session takes one and carries none, so keying on
+    // the origin alone described an `msas/` that is not in the file - the same
+    // class of wrong README as the one that claimed EF2-fast reads the MSA
+    // dial. A re-search reproduces a fold, not THIS fold.
+    lines.push(
+      "",
+      "There is no `msas/`: this fold used an alignment, and it was left out to",
+      "keep the file small. Folding this sequence again will search afresh and",
+      "may find different hits, so the structure it produces will resemble this",
+      "one without reproducing it. Use \"Download all\" on a live fold to get an",
+      "archive that carries its alignment and restores exactly.",
+    );
+  } else if (carriesAlignment) {
     lines.push(
       "",
       "`msas/` holds one alignment per chain, split into the paired and unpaired",
@@ -429,6 +464,19 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
       "alignment upload box to fold again with exactly these alignments - the two",
       "blocks are not interchangeable, so re-uploading a single merged a3m would",
       "not reproduce this fold.",
+    );
+  } else if (msaOrigin !== undefined) {
+    // 🔴 THE FOURTH STATE, AND THE ONE THAT WAS WRONG IN EVERY ARCHIVE A
+    // SINGLE-SEQUENCE FOLD EVER WROTE. The branch above used to be reached by
+    // any model that HAS an alignment control, so a fold that deliberately used
+    // none described an `msas/` that was not in the file and told the reader to
+    // drop the zip back "to fold again with exactly these alignments". Whether
+    // the archive CARRIES one is a different question from whether the model
+    // takes one, and now they are asked separately.
+    lines.push(
+      "",
+      "There is no `msas/`: this fold ran on the sequence alone, with the",
+      "alignment set to none. Folding it again the same way reproduces it.",
     );
   } else {
     lines.push(
@@ -447,7 +495,7 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  */
 export function buildFoldArchive({
   stem, model, settings, entities, prediction, msas = {}, templates,
-  msaOrigin,
+  msaOrigin, alignmentOmitted = false,
 }) {
   const name = safeJobName(stem);
   const { confidence, alignedError, pdb, chainLengths } = prediction;
@@ -527,7 +575,10 @@ export function buildFoldArchive({
     // cannot take a template at all - `grep -rn template` over the whole
     // upstream package returns nothing - so "templates: none" reported a choice
     // where there was no control. An empty ARRAY still means "none were used".
-    stem, model, settings, msaOrigin, scored, alignedError,
+    stem, model, settings, msaOrigin, scored, alignedError, alignmentOmitted,
+    // ...answered by looking at what was written, not by a caller's flag: the
+    // loop above is the only thing that knows whether an a3m survived.
+    carriesAlignment: [...files.keys()].some((path) => path.startsWith("msas/")),
     templateCount: templates === undefined ? undefined : templates.length,
   }));
   return files;
