@@ -5,6 +5,7 @@ import {
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { shaderSource } from "../runtime/shader-source-cache.js";
 
 const GRID_WIDTH = 32_768;
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
@@ -550,6 +551,9 @@ export function selectAttentionProjectKernel(
     throw new Error("the f16 attention projection requires the shader-f16 feature");
   }
   const tile = precision === "f16" ? ATTENTION_PROJECT_TILE_F16 : ATTENTION_PROJECT_TILE;
+  const cacheKey = `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
+    + (valueStorage === outputStorage ? "" : `-value${valueStorage}`)
+    + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`;
   return {
     precision, tile,
     // 🔴 THE TILE IS IN THE KEY AS WELL AS THE PRECISION, because the dispatch
@@ -561,12 +565,11 @@ export function selectAttentionProjectKernel(
     // only in the width of one binding is exactly the silent failure this key
     // exists to prevent: WebGPU cannot see that a buffer holds twice the values
     // the shader will read out of it.
-    cacheKey: `block:attention:project:${precision}:${sourceStorage}${outputStorage}`
-      + (valueStorage === outputStorage ? "" : `-value${valueStorage}`)
-      + `:${attentionProjectTileRows(tile)}x${attentionProjectTileColumns(tile)}`,
+    cacheKey,
     shader: precision === "f16" || sourceStorage !== "f32" || outputStorage !== "f32"
       || valueStorage !== outputStorage
-      ? createAttentionProjectShader(tile, precision, "f32", sourceStorage, outputStorage, valueStorage)
+      ? shaderSource(device, cacheKey, () => createAttentionProjectShader(
+        tile, precision, "f32", sourceStorage, outputStorage, valueStorage))
       : ATTENTION_PROJECT_SHADER,
   };
 }
@@ -1618,10 +1621,12 @@ export function selectAttentionFlashKernel(
     const input = storage.input ?? "f32";
     const output = storage.output ?? "f32";
     const value = storage.value ?? input;
+    const matrixKey = `attention:flash-matrix-${headDim}-${input}${value}${output}`
+      + `-${matrixTile.subgroups}x${matrixTile.keyTile}`;
     return {
-      cacheKey: `attention:flash-matrix-${headDim}-${input}${value}${output}`
-        + `-${matrixTile.subgroups}x${matrixTile.keyTile}`,
-      shader: createAttentionMatrixFlashShader(headDim, { input, value, output }, matrixTile),
+      cacheKey: matrixKey,
+      shader: shaderSource(device, matrixKey,
+        () => createAttentionMatrixFlashShader(headDim, { input, value, output }, matrixTile)),
       queryTile: matrixTile.rows,
       variant: "matrix",
       packedStorageSupported: true,
@@ -1743,22 +1748,23 @@ export function selectAttentionFlashKernel(
     // The VALUE follows the other inputs unless a caller separates it. See the
     // note in createAttentionRegisterFlashShader for why anyone would.
     const valueStorage = storage.value ?? inputStorage;
+    const registerKey = `attention:flash-registers-${headDim}-${precision}`
+      + (inputStorage === "f32" && outputStorage === "f32"
+        ? "" : `-storage${inputStorage}${outputStorage}`)
+      + (valueStorage === inputStorage ? "" : `-value${valueStorage}`)
+      // ...and the softmax shape, which is a DEVICE choice - see below. It
+      // joins the key only when it differs from the one every device had, so
+      // an entry made before this option existed cannot collide.
+      + (group === 1 && !vectorScore ? "" : `-g${group}${vectorScore ? "v" : ""}`);
     return {
       // The suffix appears only when something is packed, so the key a device
       // without this path gets is the one it has always had - and the value's
       // element joins it only when it DIFFERS, so separating it cannot collide
       // with an entry made before this option existed.
-      cacheKey: `attention:flash-registers-${headDim}-${precision}`
-        + (inputStorage === "f32" && outputStorage === "f32"
-          ? "" : `-storage${inputStorage}${outputStorage}`)
-        + (valueStorage === inputStorage ? "" : `-value${valueStorage}`)
-        // ...and the softmax shape, which is a DEVICE choice - see below. It
-        // joins the key only when it differs from the one every device had, so
-        // an entry made before this option existed cannot collide.
-        + (group === 1 && !vectorScore ? "" : `-g${group}${vectorScore ? "v" : ""}`),
-      shader: createAttentionRegisterFlashShader(
+      cacheKey: registerKey,
+      shader: shaderSource(device, registerKey, () => createAttentionRegisterFlashShader(
         headDim, undefined, { precision, inputStorage, valueStorage, outputStorage,
-          group, vectorScore }),
+          group, vectorScore })),
       queryTile: 64, variant, packedStorageSupported: true, valueStorage,
     };
   }
@@ -1979,13 +1985,15 @@ export function selectAttentionOutputKernel(
     throw new Error("the f16 attention output projection requires the shader-f16 feature");
   }
   const tile = precision === "f16" ? ATTENTION_OUTPUT_TILE_F16 : ATTENTION_OUTPUT_TILE;
+  const cacheKey = `block:attention:output${residual ? "-residual" : ""}:${precision}:${sourceStorage}`
+    + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`;
   return {
     precision, tile,
     // The tile is in the key with the precision: the dispatch divides by it.
-    cacheKey: `block:attention:output${residual ? "-residual" : ""}:${precision}:${sourceStorage}`
-      + `:${attentionOutputTileRows(tile)}x${attentionOutputTileColumns(tile)}`,
+    cacheKey,
     shader: precision === "f16" || sourceStorage !== "f32"
-      ? createAttentionOutputShader(tile, residual, precision, sourceStorage)
+      ? shaderSource(device, cacheKey,
+        () => createAttentionOutputShader(tile, residual, precision, sourceStorage))
       : (residual ? ATTENTION_OUTPUT_RESIDUAL_SHADER : ATTENTION_OUTPUT_SHADER),
   };
 }

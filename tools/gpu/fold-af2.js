@@ -48,6 +48,7 @@ import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../../src/multimer/model.js";
+import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -128,6 +129,13 @@ export async function main(device, args) {
   // `--budget`: without it, a failure under a budget cannot be told apart from
   // a failure the resident weights caused.
   if (args.includes("--no-resident")) noteResidencyRefused(device);
+  // 🔴 THE GATE FOR THE SHADER SOURCE MEMO. Memoising a generated source by its
+  // pipeline key makes ComputePipelineCache's collision check compare a string
+  // with itself, so the check that a key names everything its source depends on
+  // moves into the memo - and a check nothing runs is not a check. This flag
+  // rebuilds every source on every hit and throws where the two differ, which
+  // is the whole-fold version of test/shader-source-cache.test.js.
+  if (args.includes("--verify-sources")) setShaderSourceVerification(true);
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
   const family = option(args, "family", "monomer");
   if (family !== "monomer" && family !== "multimer") {

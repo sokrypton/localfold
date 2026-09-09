@@ -76,6 +76,7 @@ import {
 
 import { packWeights as packTriangleWeights, trianglePackOrder }
   from "../triangle/weights.js";
+import { shaderSourceSet } from "../runtime/shader-source-cache.js";
 
 const GLOBAL_ATTENTION_COMMON = `
 struct Parameters {
@@ -380,14 +381,22 @@ async function encodeTransition(
   // never shared between lanes; a column count that is not a multiple of four
   // has no quad to own, which is what the guard below says.
   const hiddenStorage = hiddenChannels % 4 === 0 ? "f16" : "f32";
-  const shaders = createTransitionShaders(
-    descriptor, packedOffsets, tile, precision, weightPrecision, hiddenStorage, matrix ?? null);
   // The geometry is part of the shader, so it is part of the key - a matrix
   // pipeline handed to a vector dispatch is the corruption the note above is
   // about.
   const key = `${precision}:${weightPrecision}:${tileColumns}:${hiddenStorage}`
     + `:${matrix ? `m${matrix.blockRows}x${matrix.blockColumns}x${matrix.blockInner}`
       + `x${matrix.subgroupRows}x${matrix.subgroupColumns}${matrix.vectorStaging ? "v" : ""}` : "t"}`;
+  // 🔴 GENERATED ONCE, NOT ONCE A BLOCK A RECYCLE. These three sources are a
+  // function of the shape, the storage choices and the packing's offsets, and
+  // nothing else - so the pipeline key plus those is the memo key. The
+  // pipeline key alone is NOT enough: `createTransitionShaders` reads the row
+  // count and the epsilon off the descriptor and neither is in it.
+  const shaders = shaderSourceSet(execution.device,
+    `block:transition:${key}:${descriptor.rows}:${descriptor.channels}`
+    + `:${descriptor.hiddenChannels}:${descriptor.epsilon}:${JSON.stringify(packedOffsets)}`,
+    () => createTransitionShaders(
+      descriptor, packedOffsets, tile, precision, weightPrecision, hiddenStorage, matrix ?? null));
   const [normalize, linearFirst, linear, linearResidual] = await Promise.all([
     execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
     execution.pipelines.get(`block:transition:linear-first:${key}`, shaders[1]),
@@ -564,13 +573,13 @@ async function encodeAttention(
       execution.device.limits?.maxComputeWorkgroupStorageSize ?? 49152);
   const [normalize, packedNormalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
-    execution.pipelines.get(`block:attention:normalize:${normalizedStorage}`,
-      createAttentionNormalizeShader(normalizedStorage)),
+    execution.shaderPipeline(`block:attention:normalize:${normalizedStorage}`,
+      () => createAttentionNormalizeShader(normalizedStorage)),
     projectMatrixFits
-      ? execution.pipelines.get(
+      ? execution.shaderPipeline(
         `block:attention:project-matrix:${options.channels}:${options.heads}`
         + `:${normalizedStorage}${projectedStorage}:${JSON.stringify(projectMatrix)}`,
-        createAttentionProjectMatrixShader(
+        () => createAttentionProjectMatrixShader(
           { channels: options.channels, heads: options.heads },
           { source: normalizedStorage, weight: "f32", output: projectedStorage },
           projectMatrix))
@@ -579,14 +588,14 @@ async function encodeAttention(
     // source, so its storage is the normalised one in exactly that case.
     // ...the HEAD COUNT is in the key because the shader unrolls it; see
     // createAttentionPairBiasShader.
-    execution.pipelines.get(`block:attention:pair-bias:${pairBiasStorage}:${options.heads}`,
-      createAttentionPairBiasShader(pairBiasStorage, options.heads)),
+    execution.shaderPipeline(`block:attention:pair-bias:${pairBiasStorage}:${options.heads}`,
+      () => createAttentionPairBiasShader(pairBiasStorage, options.heads)),
     outputMatrixFits
-      ? execution.pipelines.get(
+      ? execution.shaderPipeline(
         `block:attention:output-matrix:${options.channels}:${projectedStorage}`
         + `:${options.transpose === true}:${options.residualTarget !== undefined}`
         + `:${JSON.stringify(outputMatrix)}`,
-        createAttentionOutputMatrixShader(
+        () => createAttentionOutputMatrixShader(
           { channels: options.channels, transpose: options.transpose === true },
           { source: projectedStorage, weight: "f32" }, outputMatrix,
           options.residualTarget !== undefined))
@@ -818,31 +827,31 @@ async function encodeOuterProductMean(
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
     matrixContract === null
       ? execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER)
-      : execution.pipelines.get("block:opm:project-transposed",
-        createOuterProductMeanProjectShader(undefined, true)),
+      : execution.shaderPipeline("block:opm:project-transposed",
+        () => createOuterProductMeanProjectShader(undefined, true)),
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
     execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER),
     matrixContract === null
-      ? execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
-        createOuterProductMeanContractShader(input.cOuter, contractPrecision))
-      : execution.pipelines.get(
+      ? execution.shaderPipeline(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
+        () => createOuterProductMeanContractShader(input.cOuter, contractPrecision))
+      : execution.shaderPipeline(
         `block:opm:contract-matrix:${input.cOuter}:${matrixContract.blockRows}`
           + `x${matrixContract.blockColumns}x${matrixContract.blockInner}`,
-        createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
+        () => createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
     matrixOutput === null
-      ? execution.pipelines.get(
+      ? execution.shaderPipeline(
         outerFirst && residualTarget !== undefined
           ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
           : `block:opm:project-output:${input.cOuter}:${outputPairs}`,
-        createOuterProductMeanProjectOutputShader(
+        () => createOuterProductMeanProjectOutputShader(
           input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
       )
-      : execution.pipelines.get(
+      : execution.shaderPipeline(
         `block:opm:project-output-matrix:${input.cOuter}:${matrixContract.blockRows}`
           + `:${residualTarget !== undefined}`,
-        createOuterProductMeanMatrixOutputShader(
+        () => createOuterProductMeanMatrixOutputShader(
           matrixContract, residualTarget !== undefined),
       ),
   ]);
@@ -1011,22 +1020,36 @@ async function encodeTriangleMultiplication(
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
   const projectTile = deviceTuning(execution.device).trianglePairProjectTile ?? undefined;
-  const shaders = createTriangleShaders(
-    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile);
+  // 🔴 SEVEN SOURCES, TWICE, ONCE A BLOCK A RECYCLE. `encodeTriangleMultiplication`
+  // runs twice a block and 48 blocks a recycle, and regenerated every one of
+  // these strings each time for a pipeline that already existed. The shape, the
+  // direction, the requested tile and the packing's offsets are everything they
+  // depend on. Alongside them the RESIDUAL set, which differs only in its
+  // writeback and is a second full generation.
+  const sourceKey = `block:triangle:${direction}:${JSON.stringify(shape)}`
+    + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
+  const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(
+    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile));
   // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
   // replacement on the finished WGSL; when the kernel's writeback was rewritten
   // the pattern stopped matching, and a replacement that matches nothing throws
   // nothing - the block would have OVERWRITTEN the pair representation instead
   // of adding to it, on the shipped AF2 path only.
-  const residualShaders = createTriangleShaders(
-    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true);
+  const residualShaders = shaderSourceSet(execution.device, `${sourceKey}:residual`,
+    () => createTriangleShaders(
+      shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
-  const outMatrixSources = matrixFits ? createTriangleProjectOutMatrixShaders(
-    { cZ: input.cZ, cHidden: input.triangleHidden },
-    { normalized: "f32", hidden: "f32", gate: "f32", weight: "f32" },
-    triangleMatrix) : null;
+  const outMatrixSources = matrixFits
+    ? shaderSourceSet(execution.device,
+      `block:triangle:out-matrix:${input.cZ}:${input.triangleHidden}`
+      + `:${JSON.stringify(triangleMatrix)}`,
+      () => createTriangleProjectOutMatrixShaders(
+        { cZ: input.cZ, cHidden: input.triangleHidden },
+        { normalized: "f32", hidden: "f32", gate: "f32", weight: "f32" },
+        triangleMatrix))
+    : null;
   const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput, projectOutGate]
     = await Promise.all([
       execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
