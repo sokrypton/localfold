@@ -34,7 +34,7 @@ values means the whole-stack checker, not that file.
 
 | Question | Tool |
 |---|---|
-| Does the GPU diffusion conditioning match the reference, at THIS bundle's widths? | `tools/gpu/check-af3-diffusion-conditioning.js --model=` - and it FAILS on OpenDDE now, saying which side: BOTH, 73728/73728 non-finite, so it is the fixture at 384 pair channels and not a kernel. 🔴 It passed for as long as that bundle existed because `NaN > 1e-5` is FALSE. Every comparison written `if (x > bound) throw` here has the same hole |
+| Does the GPU diffusion conditioning match the reference, at THIS bundle's widths? | `tools/gpu/check-af3-diffusion-conditioning.js --model=` - it passes on af3, openbind0 and opendde now, at 1e-5 with a separation control of 1232-2362x. 🔴 It passed for as long as OpenDDE's bundle existed WITHOUT COMPUTING ANYTHING, because `NaN > 1e-5` is FALSE; every comparison written `if (x > bound) throw` here has the same hole. 🔴 AND IT SWEEPS TWO DIALECTS OVER ONE BUNDLE, so it must re-cut the weights BOTH ways - it could only splice the openfold3 columns in, never strip them, and an openbind0 bundle's own 833 columns then tripped the LayerNorm assertion inside the kernel it was there to measure |
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | ...and did a KNOB change the structure, which pLDDT will not tell you? | `python3 tools/diff-fold-coords.py --b="--attn-splits=4"` - **`meanPlddt` matched to sixteen digits across an arm that moves 33 atoms** |

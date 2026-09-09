@@ -108,7 +108,12 @@ export async function main(device, args) {
   }
 
   const input = {
-    tokens, noiseLevel, dialect: ALPHAFOLD3,
+    // 🔴 THE BUNDLE'S OWN DIALECT, NOT STOCK AF3'S. The bare pair arm below runs
+    // the bundle's weights unmodified, and the single conditioning's LayerNorm
+    // scale is asserted against the dialect on every call - so naming AF3 here
+    // stopped an openbind0 bundle at its 833rd column before the pair kernel
+    // this arm exists to isolate had run at all. The sweep overrides it per arm.
+    tokens, noiseLevel, dialect: dialectOfBundle,
     trunkPair: deterministic(tokens * tokens * TRUNK_PAIR_CHANNELS, 71 + tokens),
     trunkSingle: deterministic(tokens * SEQ_CHANNELS, 72 + tokens),
     targetFeat: deterministic(tokens * TARGET_WIDTH, 73 + tokens),
@@ -182,8 +187,9 @@ export async function main(device, args) {
   const singles = {};
   for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind0", OPENBIND0]]) {
     const arm = { ...input, dialect };
-    const armWeights = padWeights(weights, singleCondPadding(dialect, SEQ_CHANNELS),
-                                  SEQ_CHANNELS, TARGET_WIDTH);
+    const armWeights = retargetWeights(
+      weights, singleCondPadding(dialectOfBundle, SEQ_CHANNELS),
+      singleCondPadding(dialect, SEQ_CHANNELS), SEQ_CHANNELS, TARGET_WIDTH);
     const expected = diffusionConditioning(arm, armWeights);
     const gpu = await new Af3DiffusionConditioningGpu(device).run(arm, armWeights);
     singles[label] = expected.single;
@@ -253,16 +259,74 @@ export async function main(device, args) {
 }
 
 /**
+ * The bundle's single conditioning, re-cut for the arm's dialect.
+ *
+ * 🔴 THE SWEEP RUNS BOTH DIALECTS OVER ONE BUNDLE, AND ONLY ONE OF THEM IS THE
+ * BUNDLE'S OWN. Splicing rows in is enough when the bundle is stock AlphaFold 3
+ * and the other arm is OpenFold3's; it is not enough the other way round, and
+ * an openbind0 bundle took the stock arm's 831-wide dialect with its own
+ * 833-wide tensors and tripped the LayerNorm-scale assertion in
+ * src/af3/diffusion-conditioning-webgpu.js. That looked like a broken kernel
+ * and was a checker that could only count upwards.
+ *
+ * So both directions go through the bare 831: strip whatever the bundle
+ * carries, then splice whatever the arm wants.
+ */
+function retargetWeights(weights, from, to, SEQ_CHANNELS, TARGET_WIDTH) {
+  if (from.length === to.length) return weights;
+  return padWeights(stripWeights(weights, from, SEQ_CHANNELS, TARGET_WIDTH),
+                    to, SEQ_CHANNELS, TARGET_WIDTH);
+}
+
+/**
+ * The bundle's padded columns removed, leaving the concatenation stock
+ * AlphaFold 3 LayerNorms - 831 wide rather than 833.
+ *
+ * The rows it drops are trained ones, so this is not the inverse of padWeights
+ * below and nothing round-trips through the pair. It does not need to be: the
+ * arm it feeds is the one whose dialect says those columns are not there.
+ */
+function stripWeights(weights, padding, SEQ_CHANNELS, TARGET_WIDTH) {
+  if (padding.length === 0) return weights;
+  const width = SEQ_CHANNELS + TARGET_WIDTH;
+  const stored = width + padding.length;
+  if (weights.singleCondInitialNormScale.length !== stored) {
+    throw new Error(`this bundle's single_cond_initial_norm scale is `
+      + `${weights.singleCondInitialNormScale.length} and its dialect says `
+      + `${stored}; nothing here can tell which columns are the padded ones`);
+  }
+  const scale = new Float32Array(width);
+  const projection = new Float32Array(width * SEQ_CHANNELS);
+  let target = 0;
+  for (let index = 0; index < stored; index += 1) {
+    if (padding.includes(index)) continue;
+    scale[target] = weights.singleCondInitialNormScale[index];
+    for (let c = 0; c < SEQ_CHANNELS; c += 1) {
+      projection[target * SEQ_CHANNELS + c] =
+        weights.singleCondInitialProjection[index * SEQ_CHANNELS + c];
+    }
+    target += 1;
+  }
+  return { ...weights, singleCondInitialNormScale: scale,
+           singleCondInitialProjection: projection };
+}
+
+/**
  * The single conditioning's LayerNorm scale and projection, with a row spliced
  * in at each padded column - which is what a converted OpenFold3 bundle carries
  * and what makes the concatenation 833 wide rather than 831.
  *
  * An empty padding list returns the weights unchanged, so the stock arm is the
- * bundle exactly as the store served it.
+ * bundle exactly as the store served it. It takes a BARE 831 - see
+ * retargetWeights, which is what guarantees that.
  */
 function padWeights(weights, padding, SEQ_CHANNELS, TARGET_WIDTH) {
   if (padding.length === 0) return weights;
   const width = SEQ_CHANNELS + TARGET_WIDTH;
+  if (weights.singleCondInitialNormScale.length !== width) {
+    throw new Error(`padWeights wants the bare ${width} columns and was given `
+      + `${weights.singleCondInitialNormScale.length}`);
+  }
   const scale = new Float32Array(width + padding.length);
   const projection = new Float32Array((width + padding.length) * SEQ_CHANNELS);
   // 🔴 DETERMINISTIC STAND-INS AT THE SCALE OF THEIR NEIGHBOURS, NOT AT AN
