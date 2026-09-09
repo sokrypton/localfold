@@ -16,6 +16,7 @@
  * src/af3/pair-track-gpu.js.
  */
 import { deviceTuning } from "../runtime/device-profile.js";
+import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -102,6 +103,8 @@ export class Af3MsaStackGpu {
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
+      attendMatrix: resolveGridAttendMatrix(
+        this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,
       // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
       // Omitting it fell back to AlphaFold 3's 128 and split OpenDDE's
@@ -259,8 +262,18 @@ export class Af3MsaStackGpu {
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
+        // 🔴 byteOffset AND byteSize ARE HONOURED, as they are in the other two
+        // stacks that encode this track. Dropping them binds the WHOLE buffer
+        // where the caller asked for a range, which is silent: every index the
+        // shader forms is then relative to the wrong base. The split pair
+        // transition binds the pair at a row offset per chunk and is the first
+        // caller here to need it; the inconsistency predates it.
         entries: buffers.map((allocation, binding) => ({
-          binding, resource: { buffer: allocation.buffer },
+          binding,
+          resource: allocation.byteOffset === undefined
+            ? { buffer: allocation.buffer }
+            : { buffer: allocation.buffer,
+                offset: allocation.byteOffset, size: allocation.byteSize },
         })),
       }));
       pass.dispatchWorkgroups(x, y, z);

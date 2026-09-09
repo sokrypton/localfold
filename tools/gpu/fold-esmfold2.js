@@ -36,6 +36,7 @@ import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import {
   CONTACT_EDGES, contactAngstromsFor,
 } from "../../src/esmfold2/distogram-webgpu.js";
+import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -311,6 +312,22 @@ export async function main(device, args = []) {
   }
   const mean = spacing.length === 0 ? NaN
     : spacing.reduce((t, v) => t + v, 0) / spacing.length;
+  // 🔴 AND THE SPACING IS A GATE NOW, NOT A REPORT. It was reported "instead of
+  // the RNG" precisely because it is the number that says whether this is a
+  // chain, and nothing failed on it - the state fold-af2.js was in when an
+  // 825-residue collapse passed for a whole campaign. The MEAN is not what is
+  // gated: one link thrown across the box moves a mean by a residue's worth and
+  // a median not at all, so the rule takes both the median and the worst. See
+  // tools/gpu/chain-geometry.js.
+  //
+  // 🔴 A NUCLEIC-ONLY FOLD HAS NO ALPHA CARBONS and the verdict says so rather
+  // than passing on a NaN comparison; the phosphodiester distance below is that
+  // chain's equivalent statement and is still reported, not gated.
+  const chainGeometry = chainGeometryOf(spacing);
+  assertChainGeometry(chainGeometry, {
+    doc: "docs/EF2FAST.md and docs/AF2.md",
+    allow: args.includes("--allow-broken-geometry"),
+  });
   // 🔴 A NUCLEIC CHAIN'S GEOMETRY GATE IS THE PHOSPHODIESTER BOND, NOT CA-CA.
   // O3' of one nucleotide to P of the next is about 1.6 A, and it is the same
   // kind of statement 3.8 A is for a peptide: a covalent distance no torsion
@@ -710,8 +727,12 @@ export async function main(device, args = []) {
       }),
     tokens: result.tokens, atoms: result.atoms, steps: result.steps,
     alphaCarbons: alphas.length, alignedError,
+    // ...median and worst beside the mean, because those two are what the gate
+    // reads and a report that does not show what was gated is a report nobody
+    // can check. See tools/gpu/chain-geometry.js.
     caSpacing: spacing.length === 0 ? null
-      : { mean, min: Math.min(...spacing), max: Math.max(...spacing) },
+      : { mean, median: chainGeometry.caca, worst: chainGeometry.worstCaca,
+          min: Math.min(...spacing), max: Math.max(...spacing) },
     phosphodiester: phosphodiester.length === 0 ? null : {
       bonds: phosphodiester.length,
       mean: phosphodiester.reduce((t, v) => t + v, 0) / phosphodiester.length,

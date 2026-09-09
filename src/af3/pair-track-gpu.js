@@ -22,10 +22,19 @@
 import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../triangle/shaders.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
+import { stagedMatrixStorage } from "../runtime/matrix-linear.js";
+import {
+  createTriangleProjectMatrixShader, createTriangleProjectOutMatrixShaders,
+  createTriangleContractMatrixShader, triangleContractMatrixDispatch,
+  triangleProjectMatrixDispatch, triangleProjectOutMatrixDispatch,
+  triangleProjectMatrixFits, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
+} from "../triangle/project-matrix.js";
 import { createGridAttentionShaders, packGridAttentionWeights }
   from "./grid-attention-webgpu.js";
-import { createTransitionShader, packTransitionWeights, transitionRowTile }
-  from "./transition-webgpu.js";
+import {
+  createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
+  transitionRowTile, transitionSplitChunkRows,
+} from "./transition-webgpu.js";
 
 export const PAIR_CHANNELS = 128;
 export const GRID_WIDTH = 32_768;
@@ -143,9 +152,24 @@ export async function compilePairTrack(cache, options) {
   // run 24 times a loop, four loops, to add zero. The zeroed arm stays as the
   // thing this is checked bit-identical against; see check-esmfold2-trunk-gpu.js.
   const gridAttention = options.gridAttention ?? true;
+  // 🔴 THE TRIANGLE PROJECTION ON THE MATRIX UNITS, WHICH IS THE LARGEST KERNEL
+  // LEFT IN AN ESMFold2 TRUNK: 130.6 ms of 494 once the transition is split.
+  // It needs no new memory - its source and both its outputs are pair-sized
+  // scratch the track already holds - but it does need the four projection
+  // matrices INTERLEAVED, so the layout and the offsets below are resolved from
+  // the same flag. A packed a/b keeps the vector kernel: see the note in
+  // src/triangle/project-matrix.js.
+  const abPacked = scratchStorage[1] === "f16" || scratchStorage[2] === "f16";
+  const projectMatrix = options.triangleProjectMatrix !== undefined
+    && options.triangleProjectMatrix !== false && !abPacked
+    ? options.triangleProjectMatrix : false;
+  const abLayout = projectMatrix === false ? "blocked" : "interleaved";
+  // ...and the output projection's two matrices, which the same knob moves and
+  // which need a transpose rather than an interleave. See project-matrix.js.
+  const zgLayout = projectMatrix === false ? "blocked" : "transposed";
   const triangleOffsets = packTriangleWeights(
     af3TriangleWeights(sample.triangleMultiplicationOutgoing, channels),
-    weightPrecision).offsets;
+    weightPrecision, { abLayout, zgLayout, cHidden: channels, cZ: channels }).offsets;
   const gridOffsets = gridAttention
     ? packGridAttentionWeights(sample.pairAttention1).offsets : null;
   const transitionOffsets = packTransitionWeights(sample.pairTransition).offsets;
@@ -191,10 +215,47 @@ export async function compilePairTrack(cache, options) {
     pipelines.normalizeRows = normalizeRows;
     pipelines.contractTile = contractTile;
     for (const [name, source] of Object.entries(sources)) {
+      // ...and the vector projection is not compiled at all where the matrix
+      // one replaces it, because its weights are no longer in the buffer.
+      if (["projectAB", "projectOutput", "contract"].includes(name)
+          && projectMatrix !== false) continue;
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
                   + `:${scratchStorage.join("")}:${name}`,
                   source);
+    }
+    if (projectMatrix !== false) {
+      const geometry = { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...projectMatrix };
+      if (!triangleProjectMatrixFits(
+        geometry, options.maxComputeWorkgroupStorageSize ?? 49152)) {
+        throw new RangeError("the matrix triangle projection does not fit this device");
+      }
+      pipelines.projectMatrix = triangleProjectMatrixDispatch(
+        { rows: pairs, cHidden: channels }, projectMatrix);
+      const matrixKey = `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
+        + `:${scratchStorage.join("")}:project-matrix:${JSON.stringify(projectMatrix)}`;
+      compileInto(`tri:${direction}:projectAB`, `${matrixKey}:ab`,
+                  createTriangleProjectMatrixShader(
+                    { cZ: channels, cHidden: channels },
+                    { normalized: scratchStorage[0], ab: "f32", weight: weightPrecision },
+                    projectMatrix));
+      const outSources = createTriangleProjectOutMatrixShaders(
+        { cZ: channels, cHidden: channels },
+        { normalized: scratchStorage[0], hidden: scratchStorage[1], gate: "f32",
+          weight: weightPrecision },
+        projectMatrix);
+      pipelines.projectOutMatrix = triangleProjectOutMatrixDispatch(
+        { rows: pairs, cZ: channels }, projectMatrix);
+      compileInto(`tri:${direction}:projectOutGate`, `${matrixKey}:out-gate`, outSources.gate);
+      compileInto(`tri:${direction}:projectOut`, `${matrixKey}:out`, outSources.project);
+      // ...and the contraction, which is a BATCHED product over the channels
+      // and transposes a different operand in each direction.
+      pipelines.contractMatrix = triangleContractMatrixDispatch(
+        { length: n, channels }, projectMatrix);
+      compileInto(`tri:${direction}:contract`, `${matrixKey}:contract`,
+                  createTriangleContractMatrixShader(
+                    { length: n, channels }, direction,
+                    { ab: "f32" }, projectMatrix));
     }
   }
   for (const [key, attention, transpose] of (gridAttention
@@ -202,7 +263,13 @@ export async function compilePairTrack(cache, options) {
        : [])) {
     const { tiles, ...sources } = createGridAttentionShaders(
       { n, channels, heads: attention.heads, dimension: attention.dimension, transpose,
-        residual: true, stagedPrecision },
+        residual: true, stagedPrecision,
+        // 🔴 `grid.attend` IS THE LARGEST KERNEL IN THE TRUNK AND THE ONLY
+        // CUBIC ONE, which is why the matrix units are pointed at this one
+        // first. Off unless the caller asks; the device profile decides, and
+        // the geometry is swept per kernel and never inherited. See
+        // src/af3/grid-attention-matrix.js.
+        attendMatrix: options.attendMatrix ?? false },
       gridOffsets, epsilon, variance, dialect,
       // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. See encodePairTrack:
       // `grid.project` is the last pass that reads scratch[0], and it runs
@@ -217,7 +284,7 @@ export async function compilePairTrack(cache, options) {
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
-                  + `:${scratchStorage.join("")}:${name}`,
+                  + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}:${name}`,
                   source);
     }
   }
@@ -231,6 +298,42 @@ export async function compilePairTrack(cache, options) {
   // key could not tell them apart, so the second asked the cache for the first
   // one's shader and the cache reported a COLLISION rather than serving it,
   // which is the whole reason that check exists.
+  // 🔴 THE SPLIT TRANSITION, WHICH IS A CHANNEL-WIDTH DECISION AND NOT A DEVICE
+  // ONE ALONE. The fused kernel below holds the WIDENED row in workgroup
+  // memory, so its row tile - all of its weight-read amortisation - halves each
+  // time the channels double: measured against its own best tile at 200 tokens,
+  // the split is 1.13x at 128 channels, 2.77x at 256 and 3.71x at 384. AF3's
+  // trunk is 128 and ESMFold2's is 256 and OpenDDE's is 384, so the same knob
+  // means something different in each. See createTransitionSplitShaders.
+  const splitTransition = options.pairTransitionSplit ?? false;
+  if (splitTransition !== false) {
+    const matrix = splitTransition === true ? {} : splitTransition;
+    const split = createTransitionSplitShaders(
+      { rows: pairs, channels, factor: transitionFactor },
+      transitionOffsets, epsilon, variance,
+      { weightPrecision, matrix });
+    // The caller must not have asked for a geometry this device cannot stage.
+    const bytes = stagedMatrixStorage({ ...split.geometry, ...matrix });
+    if (bytes > (options.maxComputeWorkgroupStorageSize ?? 49152)) {
+      throw new RangeError(`a split transition stages ${bytes} B, over the limit`);
+    }
+    pipelines.transitionSplit = {
+      tiles: split.tiles,
+      chunkRows: transitionSplitChunkRows(pairs, channels, transitionFactor, {
+        maxStorageBufferBindingSize: options.maxStorageBufferBindingSize,
+        minStorageBufferOffsetAlignment: options.minStorageBufferOffsetAlignment,
+        blockRows: split.tiles.blockRows,
+      }),
+      intermediate: channels * transitionFactor,
+    };
+    for (const [name, source] of Object.entries(
+      { normalize: split.normalize, wide: split.wide, down: split.down })) {
+      compileInto(`pairTransitionSplit:${name}`,
+        `${base}:pair-transition-split:${transitionFactor}:${weightPrecision}`
+        + `:${JSON.stringify(matrix)}:${name}`,
+        source);
+    }
+  }
   compileInto("pairTransition",
     `${base}:pair-transition:${transitionFactor}:${stagedPrecision}:${weightPrecision}`,
     createTransitionShader(
@@ -256,12 +359,21 @@ export async function compilePairTrack(cache, options) {
 
 /** Pack one block's pair-track weights, ready to upload. */
 export function packPairTrackWeights(block, channels = PAIR_CHANNELS, weightPrecision = "f32",
-                                    gridAttention = true) {
+                                    gridAttention = true, abLayout = "blocked") {
+  // 🔴 THE LAYOUT IS THE PATH'S, AND THE TWO MUST AGREE. `interleaved` swaps the
+  // four projection matrices for one transposed, interleaved block, which is
+  // what the matrix `tri.project` reads and the vector one cannot; the element
+  // count is identical either way, so this is a reshape rather than a cost. The
+  // offsets `compilePairTrack` resolves come from the SAME call with the SAME
+  // flag - see triangleOffsets there - because a pack and an offset table that
+  // disagree is a finite, plausible tensor.
+  const triangle = (weights) => packTriangleWeights(
+    af3TriangleWeights(weights, channels), weightPrecision,
+    { abLayout, zgLayout: abLayout === "interleaved" ? "transposed" : "blocked",
+      cHidden: channels, cZ: channels }).data;
   return {
-    outgoing: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationOutgoing, channels), weightPrecision).data,
-    incoming: packTriangleWeights(
-      af3TriangleWeights(block.triangleMultiplicationIncoming, channels), weightPrecision).data,
+    outgoing: triangle(block.triangleMultiplicationOutgoing),
+    incoming: triangle(block.triangleMultiplicationIncoming),
     // ...and a block with no grid attention has no such tensors to pack. See
     // compilePairTrack's gridAttention.
     ...(gridAttention ? {
@@ -439,19 +551,60 @@ export function encodePairTrack(context) {
         perNormalizeTile[0], perNormalizeTile[1]);
     // ...rows folded over y and z: x is the channel tile, so the pair rows have
     // nowhere else to go and there are n^2 of them. See the note in the kernel.
+    // ...the vector row tile, which `tri.project-out` still uses whichever
+    // kernel does the projection: only projectAB moves to the units.
     const perProjectTile = spreadTriangle(ceil(pairs, pipelines.projectTile.rows));
-    run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
-        ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
-    run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
-        ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
+    if (pipelines.projectMatrix !== undefined) {
+      // 🔴 THE SAME THREE BUFFERS, A DIFFERENT KERNEL. Source, `a` and `b` are
+      // the pair-sized scratch the vector kernel used; only the weight LAYOUT
+      // and the dispatch change. See src/triangle/project-matrix.js.
+      const uniform = context.projectMatrix;
+      if (uniform === undefined) {
+        throw new Error("the matrix triangle projection needs its uniform; "
+          + "see allocateTriangleProjectMatrix");
+      }
+      run("tri.project", p("projectAB"),
+          [scratch[0], w, uniform.parameters, scratch[1], pairMask, scratch[2]],
+          pipelines.projectMatrix.x, pipelines.projectMatrix.y);
+    } else {
+      run("tri.project", p("projectAB"), [scratch[0], pairMask, w, scratch[1], scratch[2]],
+          ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
+    }
+    if (pipelines.contractMatrix !== undefined) {
+      // 🔴 a IS THE LEFT OPERAND OUTGOING AND THE RIGHT ONE INCOMING, which is
+      // the whole difference between the two directions here - the shader
+      // transposes whichever of the two it has to. Swapping them returns a
+      // finite tensor of the same shape.
+      const swap = direction === "incoming";
+      const c = pipelines.contractMatrix;
+      run("tri.contract", p("contract"),
+          [swap ? scratch[2] : scratch[1], swap ? scratch[1] : scratch[2],
+           context.projectMatrix.contract, scratch[3]],
+          c.x, c.y, c.z);
+    } else {
+      run("tri.contract", p("contract"), [scratch[1], scratch[2], scratch[3]],
+          ceil(n, pipelines.contractTile.columns), ceil(n, pipelines.contractTile.rows), channels);
+    }
     // ...into scratch[1], which `tri.contract` was the last pass to read; see
     // the note where the triangle's shaders are compiled.
     run("tri.normalize-hidden", p("normalizeHidden"), [scratch[3], w, scratch[1]],
         perNormalizeTile[0], perNormalizeTile[1]);
     // ...straight into the pair representation, which nothing has read since
     // tri.normalize consumed it into scratch[0].
-    run("tri.project-out", p("projectOutput"), [scratch[0], scratch[1], w, pair],
-        ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
+    if (pipelines.projectOutMatrix !== undefined) {
+      // 🔴 THE GATE GOES IN scratch[2], WHICH IS DEAD BY HERE. `tri.contract`
+      // was the last reader of `b` and `tri.normalize-hidden` has already
+      // consumed the contraction, so the second GEMM's target costs nothing.
+      const uniform = context.projectMatrix;
+      const out = pipelines.projectOutMatrix;
+      run("tri.project-out.gate", p("projectOutGate"),
+          [scratch[0], w, uniform.outGate, scratch[2]], out.x, out.y);
+      run("tri.project-out", p("projectOut"),
+          [scratch[1], w, uniform.outProject, pair, scratch[2]], out.x, out.y);
+    } else {
+      run("tri.project-out", p("projectOutput"), [scratch[0], scratch[1], w, pair],
+          ceil(channels, pipelines.projectTile.columns), perProjectTile[0], perProjectTile[1]);
+    }
   }
 
   // Two of the five updates, or none of them - see compilePairTrack.
@@ -471,13 +624,15 @@ export function encodePairTrack(context) {
     // against 16, and the shader's bounds check makes the wrong one correct but
     // oversubscribed.
     //
-    // One thread per (query, row, head), which is ceil(N/64) x N x heads
-    // workgroups - see the note on the attend kernel.
+    // One thread per (query, row, head) on the scalar kernel, one WORKGROUP per
+    // tile of `attendRows` of them on the matrix one - so the x extent comes
+    // from the tile the shaders were generated with and is not a constant here.
+    // See the note on the attend kernel and src/af3/grid-attention-matrix.js.
     // ...into scratch[0], which `grid.project` above was the last pass to
     // read. See the note where the shaders are compiled.
     run("grid.attend", p("attend"),
         [scratch[1], scratch[2], scratch[3], biasBuffer, pairMask, scratch[0]],
-        ceil(n, 64), n, gridHeads);
+        ceil(n, pipelines.gridTiles.attendRows), n, gridHeads);
     run("grid.project-out", p("project_out"), [scratch[0], scratch[4], w, pair],
         perOutTile[0], perOutTile[1]);
   }
@@ -485,6 +640,50 @@ export function encodePairTrack(context) {
   // 🔴 A TILE OF PAIRS A WORKGROUP. This was 241 ms of a 632 ms pairformer pass
   // - the largest single kernel in the trunk - because each workgroup read the
   // whole 196k-float weight set for one row.
+  if (pipelines.transitionSplit !== undefined) {
+    // 🔴 THREE PASSES OVER A CHUNK OF ROWS, AND THE PAIR IS BOUND AT AN OFFSET.
+    // The widened activation is 369 MiB at 300 ESMFold2 tokens, so it is sized
+    // for ONE chunk and the pair moves past it - which is only legal because
+    // transitionSplitChunkRows aligns the chunk to the binding alignment as
+    // well as to the block. See createTransitionSplitShaders for why this is
+    // three passes and not two.
+    const split = pipelines.transitionSplit;
+    const scratchSplit = context.transitionSplit;
+    if (scratchSplit === undefined) {
+      throw new Error("a split pair transition needs its buffers; see allocateTransitionSplit");
+    }
+    const p = (name) => pipelines[`pairTransitionSplit:${name}`];
+    for (let start = 0; start < pairs; start += split.chunkRows) {
+      const count = Math.min(split.chunkRows, pairs - start);
+      const parameters = scratchSplit.parameters.get(count);
+      if (parameters === undefined) {
+        throw new Error(`no split transition uniform for a chunk of ${count} rows`);
+      }
+      // 🔴 AN ALLOCATION, NOT A BUFFER. `run` takes the pair track's allocation
+      // shape and reads `byteOffset`/`byteSize` off it, and an allocation is
+      // itself often a sub-range of a pooled buffer - so the chunk's offset is
+      // added to the one the allocation already has rather than replacing it.
+      const at = (allocation) => ({
+        buffer: allocation.buffer,
+        byteOffset: (allocation.byteOffset ?? 0) + start * channels * 4,
+        byteSize: count * channels * 4,
+      });
+      const perNormalize = spread(Math.ceil(count / split.tiles.normalizeRows));
+      run("pair-transition.normalize", p("normalize"),
+          [at(pair), weights.transition, scratchSplit.normalized, parameters.normalize],
+          perNormalize[0], perNormalize[1]);
+      run("pair-transition.wide", p("wide"),
+          [scratchSplit.normalized, weights.transition, parameters.wide, scratchSplit.wide],
+          Math.ceil(split.intermediate * 2 / split.tiles.blockColumns),
+          Math.ceil(count / split.tiles.blockRows));
+      // ...residual, straight into the pair, which is what the fused kernel does.
+      run("pair-transition.down", p("down"),
+          [scratchSplit.wide, weights.transition, parameters.down, at(pair)],
+          Math.ceil(channels / split.tiles.blockColumns),
+          Math.ceil(count / split.tiles.blockRows));
+    }
+    return;
+  }
   const perTransition = spread(Math.ceil(pairs / transitionRowTile(pairs, channels)));
   // ...reads every row it writes into workgroup memory before writing any of
   // them, and no other workgroup touches those rows, so this is in place.

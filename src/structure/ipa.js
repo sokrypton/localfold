@@ -359,7 +359,13 @@ export class InvariantPointAttentionGpu {
           input.length * input.length, input.pairChannels, packed.offsets[0], packed.offsets[1],
           false, 1, input.length * input.length, 1e-5,
         ), GPUBufferUsage.UNIFORM);
-        pairSource = this.allocator.upload("ipa.pair", input.pair, GPUBufferUsage.STORAGE);
+        // 🔴 A DEVICE TENSOR IF THE CALLER HAS ONE. The pair representation is
+        // `L^2 * 128` floats - 348 MB at 825 residues - and the model that calls
+        // this already has it on the GPU; reading it back and uploading it again
+        // is 0.8 s of a 19.7 s fold. A host array still works and is what every
+        // checker passes.
+        pairSource = input.pair?.allocation ?? this.allocator.upload(
+          "ipa.pair", input.pair, GPUBufferUsage.STORAGE);
         const encoder = this.device.createCommandEncoder({ label: "ipa.prepare" });
         const compute = encoder.beginComputePass();
         compute.setPipeline(pipelines[0]);
@@ -380,7 +386,8 @@ export class InvariantPointAttentionGpu {
         if (error !== null) throw new Error(`WebGPU IPA preparation failed: ${error.message}`);
         await this.device.queue.onSubmittedWorkDone();
       } finally {
-        pairSource?.release();
+        // ...only if it was OURS; a caller's tensor is the caller's to free.
+        if (input.pair?.allocation === undefined) pairSource?.release();
         pairNormParams?.release();
       }
       return prepared;

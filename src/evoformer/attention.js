@@ -1,4 +1,7 @@
 import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
+import {
+  attentionMatrixGeometry, createAttentionMatrixFlashShader, supportsAttentionMatrix,
+} from "./attention-matrix.js";
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -555,29 +558,60 @@ export function selectAttentionProjectKernel(
  * packed tensor as f32 here folded 59 residues at pLDDT 27 with 5.3 A between
  * consecutive alpha carbons: every shape still agreed, so nothing threw.
  */
-export function createAttentionPairBiasShader(pairStorage = "f32") {
+/**
+ * The pair bias: one projection of a normalised pair row onto the heads.
+ *
+ * 🔴 IT READ THE PAIR ROW ONCE PER HEAD, WHICH IS THE ONLY THING WRONG WITH IT.
+ * A thread owned an (i, j, head) and swept all c_z channels of `pair[i][j]` for
+ * it - so the eight heads of an MSA row attention each streamed the WHOLE pair
+ * track. At 825 residues that is 2.79 GB a dispatch to consume 348 MB, and it
+ * measured **8.72 ms of a 379 ms block for 1.4 GFLOP** - 0.16 TFLOP/s, the
+ * least efficient kernel in the block by two orders of magnitude.
+ *
+ * A thread owns a PAIR now and carries one accumulator per head, so the row is
+ * read once and the weight read - `heads` consecutive floats, identical across
+ * the workgroup - is what repeats instead. That needs the head count at
+ * generation time; it is unrolled, so the accumulators stay in registers.
+ *
+ * 🔴 AND THE HOST MUST PASS THE SAME COUNT IT GENERATED FOR, because the shader
+ * no longer reads `p.heads` in the loop. The count is in the pipeline cache key
+ * at both call sites for exactly that reason.
+ */
+export function createAttentionPairBiasShader(pairStorage = "f32", heads = 1) {
+  if (!Number.isSafeInteger(heads) || heads < 1 || heads > 32) {
+    throw new RangeError(`the pair bias wants 1..32 heads; got ${heads}`);
+  }
+  const overHeads = (body) => Array.from({ length: heads }, (_, h) => body(h)).join("\n");
   return `${COMMON}
 @group(0) @binding(0) var<storage, read> pair: array<${storageArray(pairStorage)}>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 
+const HEADS: u32 = ${heads}u;
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.heads * p.queries * p.queries) { return; }
-  let k = index % p.queries;
-  let q = (index / p.queries) % p.queries;
-  let head = index / (p.queries * p.queries);
-  var result = 0.0;
+  let pair_index = id.x + id.y * GRID_WIDTH * 64u;
+  let pairs = p.queries * p.queries;
+  if (pair_index >= pairs) { return; }
+  let base = pair_index * p.pair_channels;
+${overHeads((h) => `  var result${h} = 0.0;`)}
   for (var c = 0u; c < p.pair_channels; c += 1u) {
-    result += ${storedElement(pairStorage, "pair", "(q * p.queries + k) * p.pair_channels + c")}
-      * weights[p.pair_weight + c * p.heads + head];
+    let value = ${storedElement(pairStorage, "pair", "base + c")};
+    let w = p.pair_weight + c * HEADS;
+${overHeads((h) => `    result${h} += value * weights[w + ${h}u];`)}
   }
-  output[index] = result;
+  // ...the output is head-major, so each head's store is still consecutive
+  // across the workgroup; only the stride between them changed.
+${overHeads((h) => `  output[${h}u * pairs + pair_index] = result${h};`)}
 }`;
 }
 
+/**
+ * The one-head form, kept because the differential checkers name it. Anything
+ * with more than one head must generate its own; see the note above.
+ */
 export const ATTENTION_PAIR_BIAS_SHADER = createAttentionPairBiasShader();
 
 export const ATTENTION_FLASH_SHADER = `${COMMON}
@@ -1536,6 +1570,44 @@ export function selectAttentionFlashKernel(
   requestedPrecision = "auto",
   storage = {},
 ) {
+  // 🔴 THE MATRIX UNITS, WHERE THE DEVICE HAS THEM AND THE PRIOR ASKS. See
+  // src/evoformer/attention-matrix.js: the units contract sixteen queries
+  // against sixteen keys in one instruction, so a staged key tile is read once
+  // for sixteen queries where this kernel's register-resident sibling reads it
+  // once per lane - which docs/A100.md prices as most of what that one costs.
+  //
+  // Opt-in per architecture like every other matrix path here. `auto` reaches
+  // it only through the tuning knob, and a caller may name it outright.
+  const tuning = deviceTuning(device);
+  const wantsMatrix = requested === "matrix"
+    || (requested === "auto" && tuning.attentionMatrix === true);
+  // 🔴 THE GEOMETRY IS IN THE CACHE KEY. `attentionMatrixTile` changes the
+  // shader AND the dispatch tile, and a key that named only the head width
+  // would hand a sweep's second arm the first arm's pipeline - which
+  // ComputePipelineCache refuses rather than answers wrongly, but only because
+  // it is checked. See the project-ab collision in docs/AF2.md.
+  // ...resolved only where it is wanted: this runs on every kernel selection on
+  // every device, and a device that will never compile the kernel should not be
+  // able to fail here over a knob it does not read.
+  const matrixTile = wantsMatrix
+    ? attentionMatrixGeometry(tuning.attentionMatrixTile ?? undefined) : null;
+  if (wantsMatrix && supportsAttentionMatrix(device, headDim, matrixTile)) {
+    const input = storage.input ?? "f32";
+    const output = storage.output ?? "f32";
+    const value = storage.value ?? input;
+    return {
+      cacheKey: `attention:flash-matrix-${headDim}-${input}${value}${output}`
+        + `-${matrixTile.subgroups}x${matrixTile.keyTile}`,
+      shader: createAttentionMatrixFlashShader(headDim, { input, value, output }, matrixTile),
+      queryTile: matrixTile.rows,
+      variant: "matrix",
+      packedStorageSupported: true,
+      valueStorage: value,
+    };
+  }
+  if (requested === "matrix") {
+    throw new Error("the matrix attention kernel is unsupported by this device");
+  }
   const subgroup = supportsAttentionSubgroups(device, headDim);
   const subgroup64 = supportsAttentionSubgroup64x64(device, headDim);
   // 🔴 THE REGISTER-RESIDENT KERNEL IS THE DEFAULT, AND THE SUBGROUP ONES ARE
@@ -1942,7 +2014,8 @@ export class AttentionGpu {
     const [normalize, project, pairProject, flash, outputProject] = await Promise.all([
       this.pipelines.get("attention:normalize", ATTENTION_NORMALIZE_SHADER),
       this.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
-      this.pipelines.get("attention:pair-bias", ATTENTION_PAIR_BIAS_SHADER),
+      this.pipelines.get(`attention:pair-bias:${input.heads}`,
+        createAttentionPairBiasShader("f32", input.heads)),
       this.pipelines.get(flashKernel.cacheKey, flashKernel.shader),
       this.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
     ]);

@@ -215,6 +215,89 @@ export const DEFAULT_TUNING = Object.freeze({
   // null keeps that. See createSingleAttentionShaders.
   singleProjectLanes: null,
   singleProjectOutLanes: null,
+  // 🔴 HOW MANY BYTES OF PAIRS THE OUTER PRODUCT MEAN'S FAST PATH HOLDS AT ONCE.
+  // null is OPM_PAIR_BLOCK_BYTES. It is a WORKING SET, not a limit: the path
+  // runs at every length on every device whatever this says, and the number
+  // only decides how many blocks it takes. Clamped down by what the device can
+  // actually bind, so a phone gets more blocks rather than a failed fold. It is
+  // a knob because the answer trades dispatch count against occupancy and that
+  // trade is a property of the device - see docs/AF2.md for the A100 sweep.
+  opmPairBlockBytes: null,
+  // 🔴 HOW MANY PAIRS ONE OUTER-PRODUCT-MEAN OUTPUT WORKGROUP CARRIES. null is
+  // OPM_PROJECT_OUTPUT_PAIRS. It is here rather than a constant because the
+  // measurement that fixed the constant at 2 was taken on an M2, where 4 costs
+  // more occupancy than it saves traffic - and this kernel is bound by the
+  // WEIGHT read, which every pair in a workgroup shares, so the trade is
+  // entirely a property of the device's workgroup storage against its L2.
+  opmProjectOutputPairs: null,
+  // 🔴 FLASH ATTENTION ON THE MATRIX UNITS. The four flash kernels are 38% of an
+  // AF2 block at 825 residues and the units do the query-key reduction in
+  // hardware. See src/evoformer/attention-matrix.js - and note that a GEMM
+  // benchmark at K = head_dim predicts the opposite and asks a different
+  // question: a flash attention's reuse is in its loop, not in K.
+  attentionMatrix: null,
+  // Subgroups a workgroup and keys a tile for that kernel; null takes its
+  // default. Both are fixed costs the tile amortises - see attention-matrix.js.
+  attentionMatrixTile: null,
+  // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
+  // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
+  // CUBIC one, so it leads by more on every longer chain; OpenDDE runs the same
+  // track and gets it too. Separate from `attentionMatrix` because the two
+  // bodies differ - no gate, no uniform, a bias that is always present - and
+  // because the geometry that suits one is 5-6% wrong for the other. See
+  // src/af3/grid-attention-matrix.js.
+  gridAttendMatrix: null,
+  // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
+  gridAttendMatrixTile: null,
+  // 🔴 THE PAIR TRANSITION AS THREE PASSES INSTEAD OF ONE, ON THE MATRIX UNITS.
+  // Whether it pays is a CHANNEL WIDTH question and not only a device one: the
+  // fused kernel holds the widened row in workgroup memory, so its row tile
+  // halves each time the channels double. Measured at 200 tokens against the
+  // fused kernel's own best tile - 1.13x at AF3's 128 channels, 2.77x at
+  // ESMFold2's 256, 3.71x at OpenDDE's 384. It brings back the widened tensor
+  // the fusion exists to avoid, chunked over rows. See
+  // src/af3/transition-webgpu.js.
+  pairTransitionSplit: null,
+  // 🔴 HOW BIG THE SPLIT TRANSITION'S WIDENED ACTIVATION MAY GET, in MiB; null
+  // is 64. It is a SPEED knob as well as a memory one - a chunk is its own
+  // dispatch, and one that does not fill the device leaves it idle - so a card
+  // with room should raise it. See transitionSplitChunkRows.
+  pairTransitionChunkBytes: null,
+  // 🔴 AND THE TRIANGLE PROJECTION ON THE SAME UNITS, which with the transition
+  // split is the LARGEST kernel left in an ESMFold2 trunk - 130.6 ms of 494.
+  // Unlike the transition it needs no new memory: its source and both its
+  // outputs are pair-sized scratch the track already holds. It does need the
+  // four projection matrices interleaved, which is a reshape at pack time and
+  // costs no bytes. See src/triangle/project-matrix.js.
+  triangleProjectMatrix: null,
+  // 🔴 THE BLOCK THE STAGED MATRIX GEMMs SHARE, "BMxBNxBKxSRxSC"; null is
+  // 128x128x32x2x4. Four kernels use it now - the transition's two halves and
+  // the triangle's two projections - and after the split and the projections
+  // landed they are the top four of an ESMFold2 trunk within 8% of each other,
+  // so the geometry is the next thing to move rather than another kernel. It is
+  // ONE knob until a sweep shows the four want different answers.
+  stagedMatrixBlock: null,
+  // 🔴 THE OUTER PRODUCT MEAN'S CONTRACTION IN f16, null meaning f32. Only the
+  // STAGED TILE and a per-chunk accumulator narrow; the running total stays
+  // f32, so the sum a half carries is bounded by the chunk however deep the MSA
+  // gets. That is the distinction alphafold2-webgpu's own source draws, and
+  // theirs is on the wrong side of it: a whole-contraction f16 accumulator
+  // takes a 508-row prediction from 96.80 pLDDT to 69.94. Needs `shader-f16`.
+  // 🔴 AND IT DOES NOTHING ON THE MATRIX PATH, WHICH IS WHERE AMPERE IS. Swept
+  // in an 825-residue block: opm.contract is 29.878 ms at null and 29.954 at
+  // "f16", and the block 262.96 against 262.80. The staged matrix contraction
+  // already narrows its tile to halves because the units take nothing else, so
+  // this knob only reaches the hand-tiled vector kernel.
+  opmContractPrecision: null,
+  // 🔴 THE OUTER PRODUCT MEAN'S CONTRACTION ON THE MATRIX UNITS. It is the
+  // biggest kernel in an AF2 block and it is a plain GEMM with the deepest K in
+  // the model, which is docs/A100.md's own rule for when the units pay. Opt-in
+  // per architecture, like matrixLinear and for the same reason.
+  opmMatrixContract: null,
+  // ...and its OUTPUT PROJECTION, which is a second GEMM with the same operands
+  // one step on. Separate from the contraction so either can be measured, or
+  // bisected, without the other.
+  opmMatrixOutput: null,
 });
 
 /**
@@ -342,6 +425,58 @@ const PRIORS = new Map([
     linearTallTile: true,
     attentionGroup: 4,
     attentionVectorScore: true,
+    // 🔴 THE FLASH ATTENTIONS RUN ON THE MATRIX UNITS HERE. Swept in situ in
+    // an 825-residue, 512-row block, which is the only place the answer is
+    // legible: the four attentions go 116.9 -> 69.3 ms (1.69x) and the block
+    // 310.9 -> 263.5 (1.18x). The tile is a joint optimum between the scalar
+    // softmax per key and the workgroup bytes per lane, and it MOVED when the
+    // softmax got cheaper - 6x16 before the hoists, 4x32 after. Re-sweep it
+    // before trusting it on another part; see src/evoformer/attention-matrix.js.
+    attentionMatrix: true,
+    attentionMatrixTile: "4x32",
+    // 🔴 AND AF3's `grid.attend` ON THE SAME UNITS, SWEPT IN THE TRUNK. It is
+    // the largest pass in the pairformer and the only cubic one; measured as
+    // GPU pass time over eight blocks, at 32 MSA rows, medians reproducible
+    // across processes to 0.15%:
+    //
+    //     tokens      200    300    384    400    512    640
+    //     scalar    17.16  45.24  90.71 108.02 208.06 405.85
+    //     2x16      11.23  34.31  71.01  74.57 165.36 321.44
+    //     4x32      11.41  31.29  64.79  81.77 148.60 289.39
+    //
+    // 1.40x to 1.53x, and 4x32 wins four of the six. 400 is where it loses:
+    // 400/64 is 6.25, so the row tile costs a seventh workgroup where 384
+    // needs six, and the key tile is ragged on top of that.
+    //
+    // 🔴 AND AF2's TILE RULE DOES NOT GOVERN HERE, WHICH IS THE FINDING. That
+    // kernel's five geometries ranked EXACTLY by workgroup bytes a lane. These
+    // do not rank by it at all - at 512 the order is 4x32 (169 bytes a lane)
+    // 148.6, 4x16 (136) 162.4, 2x16 (154) 165.4, 6x16 (130) 166.1 - and the
+    // winner is the one that takes the MOST. AF2's kernel was occupancy-starved
+    // and this one is not: a pairformer pass launches n x heads workgroups per
+    // block, 16384 of them at 512 tokens over eight blocks, so the device is
+    // full either way and the fixed costs a bigger tile amortises are what is
+    // left to win. Re-sweep on any device that is not this one.
+    gridAttendMatrix: true,
+    gridAttendMatrixTile: "4x32",
+    pairTransitionSplit: true,
+    triangleProjectMatrix: true,
+    // 🔴 SWEPT IN THE TRUNK, WHERE THE FOUR KERNELS THAT SHARE IT RUN. Total
+    // GPU time of an ESMFold2 trunk at 300 tokens, 24 blocks:
+    //
+    //     64x128x16x1x8    349.8      128x128x16x2x4   386.7
+    //     64x128x16x1x4    364.8      64x128x32x1x8    388.0
+    //     64x64x16x1x4     373.8      128x128x32x2x4   405.4  (the old default)
+    //     128x128x16x1x8   386.7      32x128x16x1x8    416.4
+    //                                 256x128x16x1x8   503.2
+    //
+    // 1.16x for a knob. Two things move it and they pull the same way: a
+    // smaller K panel (16 beat 32 and 64 at every block, which is what
+    // matrix-linear.js's own note already said) and fewer accumulators a lane -
+    // 64x128 with eight subgroups gives each lane FOUR results where 128x128
+    // with 2x4 gives it eight, and this kernel is occupancy-bound the way
+    // `grid.attend` is not. Re-sweep on another device.
+    stagedMatrixBlock: "64x128x16x1x8",
     diffusionTokenTile: { below: 1, atOrAbove: 2, crossover: 175 },
     singleProjectOutLanes: 256,
     trianglePairProjectTile: { rows: 32, columns: 32 },
@@ -453,6 +588,25 @@ const PRIORS = new Map([
     keepTrunkWeights: true,
     keepSamplerWeights: true,
     transitionThreadTarget: 100000,
+    // ...and the outer product mean's contraction, which is the biggest kernel
+    // in an AF2 block and the deepest K in the model. See opmMatrixContract.
+    opmMatrixContract: true,
+    // 🔴 FOUR PAIRS AN OUTPUT WORKGROUP, AGAINST THE M2'S TWO. The kernel is
+    // bound by a weight read every pair in the workgroup shares, and what
+    // limits P is workgroup storage: 4 KiB a pair against 32 KiB on an M2 and
+    // 48 here. Swept at 825 residues and 512 rows, interleaved, as this
+    // kernel's own time - 1: 71.1 ms, 2: 40.9, **4: 26.2**, 8: 28.6. Eight
+    // turns back up because 32 KiB of staged cells is one workgroup a core.
+    // Bit-exact in P: fold-af2.js returns checksum -1805925 at all four.
+    //
+    // 🔴 AND IT STOPPED MATTERING WHEN THE OUTPUT PROJECTION WENT ON THE UNITS.
+    // Re-swept at the same shape with opmMatrixContract on - and so
+    // opmMatrixOutput with it, since that follows unless turned off by itself -
+    // the kernel is 12.46, 12.40 and 12.47 ms at P = 2, 4 and 8. The matrix
+    // output kernel has its own geometry and does not read P at all, so this
+    // knob now only steers a path this device no longer takes. Left at 4 for
+    // the devices that do, and for the day the matrix path is bisected out.
+    opmProjectOutputPairs: 4,
   }],
 ], );
 

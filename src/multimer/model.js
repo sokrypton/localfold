@@ -193,13 +193,18 @@ export class AlphaFoldUnifiedGpu {
       // three-recycle run and a five-recycle one, and a continuation lands on
       // the structure the longer run would have produced.
       const resume = recycleOptions.resume;
-      let previousMsa = execution.upload("monomer.recycle-msa-zero",
-        resume?.msa ?? new Float32Array(length * 256));
-      let previousPair = execution.upload("monomer.recycle-pair-zero",
-        resume?.pair ?? new Float32Array(length * length * 128));
-      let previousPositions = execution.upload(
-        "monomer.recycle-positions-zero", resume?.atom37 ?? new Float32Array(length * 37 * 3),
-      );
+      // 🔴 ALLOCATED, NOT UPLOADED, when there is no continuation; see the note
+      // in src/model/monomer.js. 348 MB of JavaScript zeros at 825 residues.
+      const zeros = (label, elements) => execution.allocate(label, elements);
+      let previousMsa = resume?.msa === undefined
+        ? zeros("monomer.recycle-msa-zero", length * 256)
+        : execution.upload("monomer.recycle-msa", resume.msa);
+      let previousPair = resume?.pair === undefined
+        ? zeros("monomer.recycle-pair-zero", length * length * 128)
+        : execution.upload("monomer.recycle-pair", resume.pair);
+      let previousPositions = resume?.atom37 === undefined
+        ? zeros("monomer.recycle-positions-zero", length * 37 * 3)
+        : execution.upload("monomer.recycle-positions", resume.atom37);
       let previousAtom37 = resume?.atom37 ?? new Float32Array(length * 37 * 3);
 
     // 🔴 A WAY TO SEE INSIDE THE TRUNK, for the oracle to bisect against.
@@ -367,16 +372,21 @@ export class AlphaFoldUnifiedGpu {
       // The state the next continuation needs. Read back BEFORE the finally
       // releases the allocator, and only these two: atom37 is already on the
       // CPU, and previousPositions is re-uploaded from it.
-      const stateEncoder = encode("recycle-state");
-      const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
-      const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
-      await submit(stateEncoder, "recycle state readback");
-      const resumable = {
-        msa: await execution.mapFloat32(msaReadback),
-        pair: await execution.mapFloat32(pairReadback),
-        atom37: previousAtom37,
-        recycles: firstRecycle + results.length - 1,
-      };
+      //
+      // 🔴 AND IT IS OPT-IN, because it is 781 MB at 825 residues that most
+      // folds never read. See the note in src/model/monomer.js.
+      let resumable = { atom37: previousAtom37, recycles: firstRecycle + results.length - 1 };
+      if (recycleOptions.resumable === true) {
+        const stateEncoder = encode("recycle-state");
+        const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
+        const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
+        await submit(stateEncoder, "recycle state readback");
+        resumable = {
+          ...resumable,
+          msa: await execution.mapFloat32(msaReadback),
+          pair: await execution.mapFloat32(pairReadback),
+        };
+      }
       return {
         recycles: results, final: results[results.length - 1], resumable,
         elapsedMilliseconds: performance.now() - start,

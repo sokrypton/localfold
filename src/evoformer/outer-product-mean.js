@@ -1,5 +1,8 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { memoryTotals } from "../runtime/device-memory.js";
+import { deviceTuning, halfPrecisionAvailable, deviceMatrixConfig } from "../runtime/device-profile.js";
+import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -191,7 +194,18 @@ export const opmProjectTileColumns = (tile = OPM_PROJECT_TILE) => tile.lanesX * 
  * they stay one kernel rather than becoming two. The source tile and its whole
  * staging cost are shared; splitting them would read it twice.
  */
-export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE) {
+/**
+ * @param {boolean} [transposeLeft] write `left` channel-major -
+ *   `left[(residue * c_outer + channel) * sequences + sequence]` - which is what
+ *   the matrix contraction wants as its SOURCE. The contraction is a GEMM whose
+ *   rows are `(i, cl)` and whose inner extent is the sequence, and the staged
+ *   matrix kernel reads its source row-major; writing the transpose here is one
+ *   index, where transposing afterwards is another pass over 54 MB. `right` is
+ *   untouched: sequence-major is exactly the `[inner][columns]` the kernel wants
+ *   of its weight side.
+ */
+export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE,
+                                                    transposeLeft = false) {
   const { lanesX, lanesY, rowsPerLane, columnsPerLane } = tile;
   if (rowsPerLane % 4 !== 0 || columnsPerLane % 4 !== 0) {
     throw new RangeError("OPM project tile must be a multiple of 4 each way");
@@ -293,7 +307,10 @@ export function createOuterProductMeanProjectShader(tile = OPM_PROJECT_TILE) {
         let outer = column_origin + ${(v * 4 + c) * lanesX}u;
         if (outer < p.c_outer) {
           let index = row_${r} * p.c_outer + outer;
-          left[index] = keep_${r} * acc_left_${r}_${v}[${c}u];
+          ${transposeLeft
+            ? `left[((row_${r} % p.length) * p.c_outer + outer) * p.sequences`
+              + ` + row_${r} / p.length] = keep_${r} * acc_left_${r}_${v}[${c}u];`
+            : `left[index] = keep_${r} * acc_left_${r}_${v}[${c}u];`}
           right[index] = keep_${r} * acc_right_${r}_${v}[${c}u];
         }
       }`);
@@ -412,6 +429,14 @@ const OPM_TILE_COMMON = `${COMMON}
 struct TileParameters { offset: u32, count: u32, padding0: u32, padding1: u32 };
 `;
 
+// The outer-first path's own block descriptor. Same two fields as
+// TileParameters and a different axis: that one blocks the SEQUENCES the tiled
+// fallback accumulates over, this one blocks the PAIRS the fast path holds an
+// intermediate for. See createOuterProductMeanContractShader.
+const OPM_PAIR_BLOCK = `${COMMON}
+struct PairBlock { offset: u32, count: u32, padding0: u32, padding1: u32 };
+`;
+
 export const OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER = `${OPM_TILE_COMMON}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -496,7 +521,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  * measures is most of what this cost. Staged, a chunk's reads are shared by the
  * whole workgroup and a thread's sixteen cells come out of eight of them.
  */
-export function createOuterProductMeanContractShader(cOuter) {
+/**
+ * @param {"f32"|"f16"} precision what the STAGED TILE and the chunk accumulator
+ *   are. The running total is f32 in both, which is the whole safety argument;
+ *   see the note below.
+ */
+export function createOuterProductMeanContractShader(cOuter, precision = "f32") {
+  if (precision !== "f32" && precision !== "f16") {
+    throw new RangeError(`unknown OPM contraction precision ${precision}`);
+  }
+  const half = precision === "f16";
   const cells = cOuter * cOuter;
   // 🔴 EIGHT IS MEASURED, AND IT WAS A HARDCODED GUESS UNTIL IT WAS. Swept
   // through profile-af2-block.js at 512 MSA rows, in runs where every untouched
@@ -509,7 +543,12 @@ export function createOuterProductMeanContractShader(cOuter) {
   // is not obvious that it would be: a bigger chunk halves the barriers, and
   // this kernel takes 128 of them per workgroup at 512 rows. It is not what
   // governs.
-  const chunk = 8;
+  // 🔴 AND THE f16 PATH WANTS A LONGER ONE, because it pays a promotion at each
+  // chunk boundary that the f32 path does not. See the accumulator note below:
+  // 8 sequences is 32 vec4 multiply-adds a lane against 8 conversions, 25%
+  // overhead on the thing the precision was bought to speed up; 32 sequences is
+  // 6%, and the staged tile is still only 4 KiB.
+  const chunk = half ? 32 : 8;
   // Both operands are read four channels at a time, so the staged rows are
   // padded up to a whole vector and the tail staged as zero - which contributes
   // exactly zero to a product and needs no guard in the inner loop.
@@ -518,11 +557,15 @@ export function createOuterProductMeanContractShader(cOuter) {
   const blocksPerLane = Math.ceil(blocks / 64);
   const overBlocks = (body) =>
     Array.from({ length: blocksPerLane }, (_, slot) => body(slot)).join("\n    ");
-  return `${COMMON}
+  const acc = half ? "vec4<f16>" : "vec4<f32>";
+  const stage = half ? "vec4<f16>" : "vec4<f32>";
+  const narrow = (value) => (half ? `f16(${value})` : value);
+  return `${half ? "enable f16;\n" : ""}${OPM_PAIR_BLOCK}
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
 @group(0) @binding(3) var<storage, read_write> outer: array<f32>;
+@group(0) @binding(4) var<uniform> blk: PairBlock;
 
 const OPM_CHUNK: u32 = ${chunk}u;
 const C_OUTER: u32 = ${cOuter}u;
@@ -530,14 +573,19 @@ const CELLS: u32 = ${cells}u;
 const VECTORS: u32 = ${vectors}u;
 const BLOCKS: u32 = ${blocks}u;
 
-var<workgroup> left_tile: array<vec4<f32>, ${chunk * vectors}>;
-var<workgroup> right_tile: array<vec4<f32>, ${chunk * vectors}>;
+var<workgroup> left_tile: array<${stage}, ${chunk * vectors}>;
+var<workgroup> right_tile: array<${stage}, ${chunk * vectors}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let pair = group.x + group.y * GRID_WIDTH;
-  if (pair >= p.length * p.length) { return; }
+  // 🔴 THE INTERMEDIATE IS INDEXED BY THE LOCAL PAIR AND THE OPERANDS BY THE
+  // GLOBAL ONE. That one substitution is the whole of pair blocking: the buffer
+  // holds blk.count pairs wherever the block sits, so its size stops being a
+  // function of the protein.
+  let local_pair = group.x + group.y * GRID_WIDTH;
+  if (local_pair >= blk.count) { return; }
+  let pair = blk.offset + local_pair;
   let i = pair / p.length;
   let j = pair % p.length;
   let local = local_id.x;
@@ -558,14 +606,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var index = local; index < OPM_CHUNK * VECTORS; index += 64u) {
       let s = s0 + index / VECTORS;
       let v = index % VECTORS;
-      var l = vec4<f32>(0.0);
-      var r = vec4<f32>(0.0);
+      var l = ${stage}(0.0);
+      var r = ${stage}(0.0);
       if (s < p.sequences) {
         for (var c = 0u; c < 4u; c += 1u) {
           let o = v * 4u + c;
           if (o < C_OUTER) {
-            l[c] = left[(s * p.length + i) * C_OUTER + o];
-            r[c] = right[(s * p.length + j) * C_OUTER + o];
+            l[c] = ${narrow("left[(s * p.length + i) * C_OUTER + o]")};
+            r[c] = ${narrow("right[(s * p.length + j) * C_OUTER + o]")};
           }
         }
       }
@@ -575,15 +623,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     workgroupBarrier();
 
     let available = min(OPM_CHUNK, p.sequences - s0);
+    // 🔴 THE CHUNK ACCUMULATES IN ${precision} AND THE TOTAL IN f32, WHICH IS THE
+    // WHOLE SAFETY ARGUMENT. martin-steinegger/alphafold2-webgpu records in its
+    // own source that accumulating a whole contraction in f16 is the fastest
+    // arrangement and is unsafe: on a 508-row alignment it takes pLDDT from
+    // 96.80 to 69.94 and pTM to NaN. It overflows because the sum runs over
+    // every sequence. This one runs over OPM_CHUNK of them and is promoted, so
+    // the running value is bounded by the chunk however deep the MSA is - and
+    // f16 is exactly 2.0x f32 on this card, which is what makes it worth the
+    // conversion at all.
+${half ? `    ${overBlocks((slot) => `var chunk${slot}_0 = vec4<f16>(0.0);
+    var chunk${slot}_1 = vec4<f16>(0.0);
+    var chunk${slot}_2 = vec4<f16>(0.0);
+    var chunk${slot}_3 = vec4<f16>(0.0);`)}` : ""}
     for (var t = 0u; t < available; t += 1u) {
       let base = t * VECTORS;
       ${overBlocks((slot) => `let lv${slot} = left_tile[base + left_block${slot}];
       let rv${slot} = right_tile[base + right_block${slot}];
-      acc${slot}_0 += lv${slot}[0] * rv${slot};
-      acc${slot}_1 += lv${slot}[1] * rv${slot};
-      acc${slot}_2 += lv${slot}[2] * rv${slot};
-      acc${slot}_3 += lv${slot}[3] * rv${slot};`)}
+      ${half ? "chunk" : "acc"}${slot}_0 += lv${slot}[0] * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_1 += lv${slot}[1] * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_2 += lv${slot}[2] * rv${slot};
+      ${half ? "chunk" : "acc"}${slot}_3 += lv${slot}[3] * rv${slot};`)}
     }
+${half ? `    ${overBlocks((slot) => `acc${slot}_0 += vec4<f32>(chunk${slot}_0);
+    acc${slot}_1 += vec4<f32>(chunk${slot}_1);
+    acc${slot}_2 += vec4<f32>(chunk${slot}_2);
+    acc${slot}_3 += vec4<f32>(chunk${slot}_3);`)}` : ""}
   }
 
   ${overBlocks((slot) => `if (live${slot}) {
@@ -596,7 +661,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
           if (a == 3u) { row = acc${slot}_3; }
           for (var b = 0u; b < 4u; b += 1u) {
             let cr = right_block${slot} * 4u + b;
-            if (cr < C_OUTER) { outer[pair * CELLS + cl * C_OUTER + cr] = row[b]; }
+            if (cr < C_OUTER) { outer[local_pair * CELLS + cl * C_OUTER + cr] = row[b]; }
           }
         }
       }
@@ -629,6 +694,32 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 export const OPM_PROJECT_OUTPUT_PAIRS = 2;
 
 /**
+ * ...and what THIS device wants, which is not the same question.
+ *
+ * 🔴 THE SWEEP ABOVE WAS TAKEN ON AN M2 AND ITS ANSWER DOES NOT TRAVEL. What P
+ * buys is weight-read amortisation and what it costs is workgroup storage, and
+ * an A100 has 48 KiB of that against Apple's 32 - so the tile that left two
+ * workgroups a core there leaves room here. See docs/AF2.md for the A100 sweep.
+ */
+/**
+ * Whether this device's OPM contraction runs its staged tile in half precision.
+ *
+ * Gated on the feature AND on the whole-f16 switch, like every other automatic
+ * f16 choice here - a caller that names a precision still gets it, so the
+ * differential checker can test the path the default is not using.
+ */
+export function opmContractPrecision(device) {
+  const requested = deviceTuning(device).opmContractPrecision;
+  if (requested === "f32" || requested === null || requested === undefined) return "f32";
+  if (requested !== "f16") throw new RangeError(`unknown OPM contraction precision ${requested}`);
+  return halfPrecisionAvailable(device) ? "f16" : "f32";
+}
+
+export function opmProjectOutputPairs(device) {
+  return deviceTuning(device).opmProjectOutputPairs ?? OPM_PROJECT_OUTPUT_PAIRS;
+}
+
+/**
  * The output projection, generated for one c_outer.
  *
  * 🔴 IT RECOMPUTED THE DENOMINATOR ONCE PER OUTPUT CHANNEL. The count of
@@ -659,90 +750,370 @@ export function createOuterProductMeanProjectOutputShader(
 ) {
   const cells = cOuter * cOuter;
   const pairs = pairsPerGroup;
-  if (!Number.isSafeInteger(pairs) || pairs < 1 || pairs > 4) {
-    throw new RangeError(`OPM output pairs must be 1..4; got ${pairsPerGroup}`);
+  // 🔴 THE CEILING IS WORKGROUP STORAGE AND THE SHADER SAYS SO. A group stages
+  // `CELLS * P` floats, 4 KiB a pair at AlphaFold's widths, against a limit of
+  // 32 KiB on an M2 and 48 on this card - so 8 is the largest that fits
+  // anywhere and 16 fits nowhere. Powers of two only, because the accumulator
+  // is chunked into vec4s.
+  if (![1, 2, 4, 8].includes(pairs)) {
+    throw new RangeError(`OPM output pairs must be 1, 2, 4 or 8; got ${pairsPerGroup}`);
   }
-  // A vector over the pairs a workgroup holds, so one weight read multiplies
-  // into all of them at once.
-  const vector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[pairs];
-  if (vector === undefined) throw new RangeError(`OPM output pairs ${pairs} is not 1, 2 or 4`);
-  const at = (name, p) => (pairs === 1 ? name : `${name}.${"xyzw"[p]}`);
-  const overPairs = (body) => Array.from({ length: pairs }, (_, p) => body(p)).join("\n");
+  // Chunks of at most four pairs, so one weight read multiplies into a whole
+  // vector of them. Eight is two vec4s rather than a wider type WGSL lacks.
+  const chunks = [];
+  for (let rest = pairs; rest > 0;) {
+    const width = rest >= 4 ? 4 : rest;
+    chunks.push({ width, first: pairs - rest });
+    rest -= width;
+  }
+  const vector = (width) => ({ 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" })[width];
+  const at = (name, chunk, lane) => (chunk.width === 1 ? name : `${name}.${"xyzw"[lane]}`);
+  const overChunks = (body) => chunks.map((chunk, index) => body(chunk, index)).join("\n");
+  const overPairs = (body) => chunks
+    .map((chunk, index) => Array.from({ length: chunk.width },
+      (_, lane) => body(chunk.first + lane, chunk, index, lane)).join("\n"))
+    .join("\n");
 
-  return `${COMMON}
+  return `${OPM_PAIR_BLOCK}
 @group(0) @binding(0) var<storage, read> outer: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+@group(0) @binding(5) var<uniform> blk: PairBlock;
 
 const CELLS: u32 = ${cells}u;
 const PAIRS_PER_GROUP: u32 = ${pairs}u;
 
-// One vector a cell, holding that cell's value for each pair in the group.
-var<workgroup> staged: array<${vector}, ${cells}>;
-var<workgroup> reduce: array<f32, 64>;
+// One vector a cell per chunk, holding that cell's value for each pair.
+${overChunks((chunk, index) => `var<workgroup> staged${index}: array<${vector(chunk.width)}, ${cells}>;
+var<workgroup> reduce${index}: array<${vector(chunk.width)}, 64>;`)}
 var<workgroup> scales: array<f32, ${pairs}>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
-  let total_pairs = p.length * p.length;
-  let first_pair = (group.x + group.y * GRID_WIDTH) * PAIRS_PER_GROUP;
-  if (first_pair >= total_pairs) { return; }
+  let first_local = (group.x + group.y * GRID_WIDTH) * PAIRS_PER_GROUP;
+  if (first_local >= blk.count) { return; }
   let local = local_id.x;
 
-  // ...a pair past the end is clamped rather than skipped, so every lane
-  // reaches every barrier below; it is dropped at the write.
-${overPairs((n) => `  let pair${n} = min(first_pair + ${n}u, total_pairs - 1u);
-  let live${n} = first_pair + ${n}u < total_pairs;`)}
+  // ...a pair past the end of the BLOCK is clamped rather than skipped, so
+  // every lane reaches every barrier below; it is dropped at the write. The
+  // staged read is local to the block, the mask and the write are global.
+${overPairs((n) => `  let local_pair${n} = min(first_local + ${n}u, blk.count - 1u);
+  let pair${n} = blk.offset + local_pair${n};
+  let live${n} = first_local + ${n}u < blk.count;`)}
 
   for (var cell = local; cell < CELLS; cell += 64u) {
-    var value = ${vector}(0.0);
-${overPairs((n) => `    ${at("value", n)} = outer[pair${n} * CELLS + cell];`)}
-    staged[cell] = value;
+${overChunks((chunk, index) => `    var value${index} = ${vector(chunk.width)}(0.0);`)}
+${overPairs((n, chunk, index, lane) =>
+    `    ${at(`value${index}`, chunk, lane)} = outer[local_pair${n} * CELLS + cell];`)}
+${overChunks((chunk, index) => `    staged${index}[cell] = value${index};`)}
   }
   workgroupBarrier();
 
-  // ...the denominator, once for each pair rather than once per channel.
-${overPairs((n) => `  {
-    let i = pair${n} / p.length;
-    let j = pair${n} % p.length;
-    var count = 0.0;
+  // 🔴 ONE BARRIER TREE FOR ALL P DENOMINATORS, NOT P OF THEM. The count of
+  // sequences covering both tokens depends on the PAIR alone - so it is
+  // computed once per pair rather than once per output channel, which is what
+  // it used to be. But a group carrying eight pairs then ran eight sequential
+  // 64-lane reductions, six barriers each: 48 barriers to produce eight floats,
+  // and the sweep's fixed cost was exactly that. The counts reduce as a VECTOR
+  // instead, one tree whatever P is, and the mask read for the row index is
+  // shared by every pair in the chunk.
+${overChunks((chunk, index) => `  {
+${Array.from({ length: chunk.width }, (_, lane) => {
+      const n = chunk.first + lane;
+      return `    let i${n} = pair${n} / p.length;\n    let j${n} = pair${n} % p.length;`;
+    }).join("\n")}
+    var count = ${vector(chunk.width)}(0.0);
     for (var sequence = local; sequence < p.sequences; sequence += 64u) {
-      count += mask[sequence * p.length + i] * mask[sequence * p.length + j];
+      let row = sequence * p.length;
+${Array.from({ length: chunk.width }, (_, lane) => {
+      const n = chunk.first + lane;
+      return `      ${at("count", chunk, lane)} += mask[row + i${n}] * mask[row + j${n}];`;
+    }).join("\n")}
     }
-    reduce[local] = count;
+    reduce${index}[local] = count;
     workgroupBarrier();
     for (var stride = 32u; stride > 0u; stride >>= 1u) {
-      if (local < stride) { reduce[local] += reduce[local + stride]; }
+      if (local < stride) { reduce${index}[local] += reduce${index}[local + stride]; }
       workgroupBarrier();
     }
-    if (local == 0u) { scales[${n}u] = 1.0 / (p.normalization_epsilon + reduce[0]); }
-    workgroupBarrier();
+    if (local == 0u) {
+${Array.from({ length: chunk.width }, (_, lane) => `      scales[${chunk.first + lane}u] = `
+      + `1.0 / (p.normalization_epsilon + ${at(`reduce${index}[0]`, chunk, lane)});`).join("\n")}
+    }
   }`)}
+  workgroupBarrier();
 
   // 🔴 CELL OUTSIDE CHANNEL. A lane's channels share the staged value, and all
   // PAIRS_PER_GROUP pairs share the weight read - which is the whole point of
-  // carrying more than one.
+  // carrying more than one. That read is this kernel's cost: a workgroup sweeps
+  // the whole CELLS x c_z output matrix once, 512 KiB at AlphaFold's widths, and
+  // divides it among P pairs. Doubling P halves the traffic, which is why the
+  // measured curve is 70.9 / 43.2 / 30.2 ms at P = 1, 2, 4.
   for (var z = local; z < p.c_z; z += 64u) {
-    var acc = ${vector}(weights[p.output_bias + z]);
+${overChunks((chunk, index) => `    var acc${index} = ${vector(chunk.width)}(weights[p.output_bias + z]);`)}
     for (var cell = 0u; cell < CELLS; cell += 1u) {
-      acc += staged[cell] * weights[p.output_weight + cell * p.c_z + z];
+      let w = weights[p.output_weight + cell * p.c_z + z];
+${overChunks((chunk, index) => `      acc${index} += staged${index}[cell] * w;`)}
     }
-${overPairs((n) => `    if (live${n}) {
-      output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at("acc", n)} * scales[${n}u];
+${overPairs((n, chunk, index, lane) => `    if (live${n}) {
+      output[pair${n} * p.c_z + z] ${residual ? "+=" : "="} ${at(`acc${index}`, chunk, lane)} * scales[${n}u];
     }`)}
   }
 }`;
 }
 
+// 🔴 64 MiB WAS A NUMBER, NOT A DEVICE, AND IT COST 6.8x ON EVERY REAL PROTEIN.
+// The outer-first intermediate is `L^2 * cOuter^2 * 4`, so a 64 MiB cap stops
+// at **L = 128** - past which every fold fell back to `opm.accumulate`, a naive
+// triple loop with one invocation per (i, j, z) that re-reads `right` for all
+// 128 channels. Measured at 400 residues and 512 rows, one evoformer block:
+//
+//   64 MiB cap, tiled fallback   591.2 ms   opm.accumulate 552.7 (93.5%)
+//   the device's own limit       86.9 ms    opm.contract 15.2 + project-out 10.1
+//
+// **6.8x on the block, 22x on the kernel**, and at 825 residues the fallback is
+// 93.7% of a block and 102 s of a 150 s fold.
+//
+// 🔴 THE DEVICE'S BINDING LIMIT IS THE RIGHT CAP BECAUSE IT SCALES WITH THE
+// DEVICE. `maxStorageBufferBindingSize` is ~128 MiB on a phone and 2 GiB here,
+// so the same rule keeps a small device on the tiled path and lets a large one
+// take the fast one. It is also a HARD limit: 2.79 GB at 825 residues is
+// refused by WebGPU outright ("larger than the maximum storage buffer binding
+// size"), which is why the fallback still has to exist above L = 724.
 const OUTER_FIRST_LIMIT_BYTES = 64 * 1024 * 1024;
 
-export function useOuterFirstContraction(input
-  ) {
-  const bytes = input.length * input.length * input.cOuter * input.cOuter * 4;
-  return input.sequences >= input.cOuter && bytes <= OUTER_FIRST_LIMIT_BYTES;
+/**
+ * The largest outer-first intermediate this device can actually take.
+ *
+ * 🔴 TWO REAL CONSTRAINTS AND NO INVENTED ONE. A binding limit is a hard
+ * refusal - 2.79 GB at 825 residues is rejected outright - and the memory
+ * budget is what src/runtime/device-memory.js already exists to answer, with
+ * its own note that "the only thing it is used for is choosing between two
+ * paths that both work". What is left unclaimed is the honest test of whether
+ * the fast path fits, because the allocator THROWS on a budget overrun rather
+ * than falling back: picking the fast path when it does not fit is a failed
+ * fold, not a slow one.
+ */
+export function outerFirstLimitBytes(device) {
+  const limits = device?.limits;
+  if (limits === undefined) return OUTER_FIRST_LIMIT_BYTES;
+  const bindable = Math.min(limits.maxStorageBufferBindingSize ?? OUTER_FIRST_LIMIT_BYTES,
+                            limits.maxBufferSize ?? Number.MAX_SAFE_INTEGER);
+  const { budgetBytes, residentBytes } = memoryTotals(device);
+  if (budgetBytes === undefined) return bindable;
+  return Math.max(0, Math.min(bindable, budgetBytes - residentBytes));
+}
+
+/**
+ * How much of the outer-first intermediate to hold at once.
+ *
+ * 🔴 IT IS A TILE, NOT A LIMIT, WHICH IS THE WHOLE POINT. The intermediate used
+ * to be `L^2 * cOuter^2 * 4` - all the pairs at once - so a device that could
+ * not bind 2.79 GB fell off the fast path entirely at 825 residues and paid 6.8x
+ * for it. Blocked, the buffer holds `OPM_PAIR_BLOCK_BYTES` worth of pairs
+ * wherever the block sits and the protein's length leaves the allocation
+ * completely: **every device takes the fast path at every length**, and the
+ * device limit only decides how many blocks it takes to get there.
+ *
+ * 64 MiB is a working set, chosen so the buffer is small enough to reuse and
+ * large enough that the dispatch count is noise. At AlphaFold's cOuter = 32 a
+ * pair is 4 KiB, so a block is 16,384 pairs - 16,384 contraction workgroups,
+ * which fills any device this runs on - and 825 residues takes 42 of them, 84
+ * dispatches against a kernel that costs hundreds of milliseconds.
+ */
+export const OPM_PAIR_BLOCK_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The contraction as a GEMM on the matrix units.
+ *
+ * 🔴 IT IS THE BIGGEST KERNEL IN AN AF2 BLOCK AND IT IS A PLAIN MATMUL.
+ * `outer[i][j][cl][cr] = sum_s left[s][i][cl] * right[s][j][cr]` is
+ * `C[(i,cl)][(j,cr)] = sum_s A[s][(i,cl)] * B[s][(j,cr)]` - rows and columns of
+ * `L * c_outer`, an inner extent of the whole alignment. At 825 residues and 512
+ * sequences that is 26,400 x 26,400 x 512, **713 GFLOP**, and the hand-tiled
+ * kernel runs it at 10.6 TFLOP/s: 67.3 ms, 18.7% of a block. docs/A100.md's rule
+ * for when the matrix units pay is "the operand is materialised, the problem is
+ * past a billion multiply-accumulates, and K is deep" - and this is the deepest
+ * K in the model.
+ *
+ * 🔴 AND IT NEEDS NO LAYOUT MIGRATION, WHICH IS THE ONLY REASON IT IS CHEAP. The
+ * store writes by PAIR rather than row-major, so `opm.project-output` and the
+ * pair blocking are untouched; the only requirement is that a pair block is a
+ * whole number of `i` rows, which outerFirstPairBlocks now rounds to. `left` is
+ * written transposed by the projection that produces it, and `right` is already
+ * the `[inner][columns]` the kernel wants.
+ */
+/**
+ * Whether this device runs the OPM contraction on its matrix units, and with
+ * what geometry. `null` is the hand-tiled vector kernel.
+ */
+export function opmMatrixContract(device, input) {
+  if (deviceTuning(device).opmMatrixContract !== true) return null;
+  if (!halfPrecisionAvailable(device)) return null;
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return null;
+  const tile = { M: config.M, N: config.N, K: config.K };
+  const subgroupRows = 1;
+  const subgroupColumns = 8;
+  const geometry = {
+    blockRows: 8 * tile.M * subgroupRows,
+    blockColumns: subgroupColumns * tile.N,
+    blockInner: Math.max(16, tile.K),
+    subgroupRows, subgroupColumns, tile,
+    result: config.resultComponentType, matrixElement: config.componentType,
+    // 🔴 A vec4 READ OF BOTH OPERANDS, which docs/A100.md prices at 1.24 -> 0.70
+    // ms on the transition - the largest single thing in that kernel after the
+    // units themselves. Every extent here divides by four: the alignment depth,
+    // `length * c_outer`, and both block extents.
+    vectorStaging: input !== undefined
+      && input.sequences % 4 === 0 && (input.length * input.cOuter) % 4 === 0,
+  };
+  // ...the same two device limits chooseMatrixLinear checks, for the same
+  // reasons; a geometry that does not fit is not a slower path, it is a refused
+  // pipeline.
+  const limit = device.limits?.maxComputeWorkgroupStorageSize ?? 16384;
+  if (stagedMatrixStorage(geometry) > limit) return null;
+  const threads = subgroupRows * subgroupColumns * 32;
+  if (threads > (device.limits?.maxComputeInvocationsPerWorkgroup ?? 256)) return null;
+  // 🔴 THE BLOCK HAS TO DIVIDE A ROW OF THE OUTPUT, because the store indexes by
+  // PAIR: a column block that straddled two `j` values would be fine, but a ROW
+  // block that straddled two `i` values would need the pair block to know. The
+  // pair block is rounded to whole rows of `i` instead, which is cheaper.
+  if (input !== undefined && (input.length * input.cOuter) % geometry.blockColumns !== 0) {
+    // ...not a refusal: the kernel guards its own edges. Kept as a note.
+  }
+  return geometry;
+}
+
+/**
+ * The per-pair denominator: how many sequences cover both tokens.
+ *
+ * 🔴 ITS OWN PASS, because the output projection is a GEMM now and a GEMM has
+ * nowhere to put a cooperative reduction. It used to be computed inside
+ * `opm.project-output`, once per pair per workgroup; the total work is the same
+ * either way - `L^2 * sequences` mask products - and src/af3/
+ * outer-product-mean-webgpu.js already made this exact move for the same reason
+ * ("it is PAIRS x SEQUENCES multiply-adds in total, a thousandth of the
+ * contraction's, so it is cheaper to compute once into a buffer than to carry").
+ *
+ * It emits the RECIPROCAL, so the projection multiplies where it used to divide.
+ */
+export const OUTER_PRODUCT_MEAN_SCALE_SHADER = `${COMMON}
+@group(0) @binding(0) var<storage, read> mask: array<f32>;
+@group(0) @binding(1) var<uniform> p: Parameters;
+@group(0) @binding(2) var<storage, read_write> scale: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let pair = id.x + id.y * GRID_WIDTH * 64u;
+  if (pair >= p.length * p.length) { return; }
+  let i = pair / p.length;
+  let j = pair % p.length;
+  var count = 0.0;
+  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
+    let row = sequence * p.length;
+    count += mask[row + i] * mask[row + j];
+  }
+  scale[pair] = 1.0 / (p.normalization_epsilon + count);
+}`;
+
+/**
+ * The output projection as a GEMM on the matrix units.
+ *
+ * 🔴 IT IS A MATMUL TOO, AND A DEEP ONE. `output[pair][z] = (bias + sum_cell
+ * outer[pair][cell] * W[cell][z]) / count[pair]`: rows are the block's pairs,
+ * the inner extent is `c_outer^2` - 1024 at AlphaFold's widths - and the columns
+ * are `c_z`. The intermediate is already `[localPair][cell]` row-major and the
+ * weight is already `[cell][z]`, so unlike the contraction this one needs no
+ * transpose at all; the scale is the only thing a plain GEMM lacks, and
+ * `scaleIndex` supplies it.
+ */
+export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
+  return createStagedMatrixShader({
+    ...geometry,
+    sourcePrecision: "f32",
+    weightPrecision: "f32",
+    outputPrecision: "f32",
+    residual,
+    bias: true,
+    // 🔴 AT THE OPERAND, NOT THE RESULT. The intermediate is a sum over the whole
+    // alignment and leaves f16's range at 1024 sequences; see rowScaleOffset.
+    // 🔴 AND BY THE GLOBAL PAIR, so the whole scale buffer is bound and no view
+    // is needed - a view would have to start on a 256-byte boundary, and a pair
+    // block is a whole number of `i` rows, which at an odd length is not one.
+    rowScaleOffset: "parameters.padding.x",
+    // ...the block's pairs are contiguous in the pair index, so the output row
+    // is the local one plus the block's offset, carried in the spare parameter.
+    outputIndex: "(parameters.padding.x + row) * parameters.columns + column",
+  });
+}
+
+export function createOuterProductMeanMatrixContractShader(cOuter, geometry) {
+  return createStagedMatrixShader({
+    ...geometry,
+    sourcePrecision: "f32",
+    weightPrecision: "f32",
+    outputPrecision: "f32",
+    // ...NOT `sourceTransposed`: the projection writes `left` channel-major, so
+    // it is already the `[rows][inner]` the kernel reads by default. The option
+    // exists for a caller whose operand is the other way round.
+    bias: false,
+    // ...row is (local i, cl) and column is (j, cr); the intermediate is
+    // indexed by the pair within the block, exactly as the vector kernel
+    // leaves it.
+    outputIndex: `((row / ${cOuter}u) * parameters.padding.x + column / ${cOuter}u)`
+      + ` * ${cOuter * cOuter}u + (row % ${cOuter}u) * ${cOuter}u + (column % ${cOuter}u)`,
+  });
+}
+
+/**
+ * The pairs one outer-first block carries, clamped to what the device can bind.
+ *
+ * Never zero: a single pair is `cOuter^2 * 4` bytes - 4 KiB at AlphaFold's
+ * widths - and a device that cannot bind that cannot run any of this.
+ */
+export function outerFirstPairsPerBlock(input, limitBytes = OUTER_FIRST_LIMIT_BYTES,
+                                        targetBytes = OPM_PAIR_BLOCK_BYTES,
+                                        multiple = 1) {
+  const bytesPerPair = input.cOuter * input.cOuter * 4;
+  const budget = Math.min(limitBytes, targetBytes ?? OPM_PAIR_BLOCK_BYTES);
+  const fits = Math.max(1, Math.floor(budget / bytesPerPair));
+  // 🔴 A WHOLE NUMBER OF `i` ROWS WHEN THE MATRIX PATH TAKES IT, because that
+  // kernel's row index is local to the block and its store divides by c_outer to
+  // recover `i`. A block ending mid-row would put the wrong pair in the wrong
+  // cell, silently. `multiple` is 1 for the vector kernel, which does not care.
+  const aligned = Math.max(multiple, Math.floor(fits / multiple) * multiple);
+  return Math.min(aligned, input.length * input.length);
+}
+
+/**
+ * The blocks of pairs the outer-first path runs, as `[offset, count]` pairs.
+ */
+export function outerFirstPairBlocks(input, limitBytes = OUTER_FIRST_LIMIT_BYTES,
+                                     targetBytes = OPM_PAIR_BLOCK_BYTES,
+                                     multiple = 1) {
+  targetBytes = targetBytes ?? OPM_PAIR_BLOCK_BYTES;
+  const pairs = input.length * input.length;
+  const perBlock = outerFirstPairsPerBlock(input, limitBytes, targetBytes, multiple);
+  const blocks = [];
+  for (let offset = 0; offset < pairs; offset += perBlock) {
+    blocks.push([offset, Math.min(perBlock, pairs - offset)]);
+  }
+  return blocks;
+}
+
+/**
+ * 🔴 THE LENGTH IS GONE FROM THIS DECISION. What is left is the one thing that
+ * was ever algebraic about it - the outer-first order contracts the sequence
+ * axis first, which only wins when there are more sequences than outer channels
+ * - plus the honest question of whether a SINGLE pair fits, which is the only
+ * way a device can genuinely be too small for the path.
+ */
+export function useOuterFirstContraction(input, limitBytes = OUTER_FIRST_LIMIT_BYTES) {
+  const bytesPerPair = input.cOuter * input.cOuter * 4;
+  return input.sequences >= input.cOuter && bytesPerPair <= limitBytes;
 }
 
 export class OuterProductMeanGpu {
@@ -759,7 +1130,13 @@ export class OuterProductMeanGpu {
   async run(input) {
     validate(input);
     const packed = packOuterProductMeanWeights(input);
-    const outerFirst = useOuterFirstContraction(input);
+    // 🔴 A TEST SEAM, so a checker can force EITHER path at ONE size and compare
+    // them. The two are algebraically identical and numerically different - they
+    // contract the sequence axis in a different order - so the only honest gate
+    // is running both on the same input, which needs the limit to be movable.
+    const outerFirst = useOuterFirstContraction(
+      input, input.outerFirstLimitBytes ?? outerFirstLimitBytes(this.device));
+    const contractPrecision = input.contractPrecision ?? opmContractPrecision(this.device);
     const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
       contractPipeline, projectOutputPipeline] = await Promise.all([
       this.pipelines.get("opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
@@ -767,10 +1144,11 @@ export class OuterProductMeanGpu {
       this.pipelines.get("opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
       this.pipelines.get("opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
       this.pipelines.get("opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-      this.pipelines.get(`opm:contract:${input.cOuter}`,
-        createOuterProductMeanContractShader(input.cOuter)),
-      this.pipelines.get(`opm:project-output:${input.cOuter}`,
-        createOuterProductMeanProjectOutputShader(input.cOuter)),
+      this.pipelines.get(`opm:contract:${input.cOuter}:${contractPrecision}`,
+        createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
+      this.pipelines.get(`opm:project-output:${input.cOuter}:${opmProjectOutputPairs(this.device)}`,
+        createOuterProductMeanProjectOutputShader(
+          input.cOuter, false, opmProjectOutputPairs(this.device))),
     ]);
     const storage = GPUBufferUsage.STORAGE;
     const allocations = [];
@@ -795,8 +1173,11 @@ export class OuterProductMeanGpu {
       const right = keep(this.allocator.allocate("opm.right", rows * input.cOuter * 4, storage));
       const tileCapacity = outerProductMeanTileCapacity(
         input, this.device.limits.maxStorageBufferBindingSize);
+      const pairBlocks = outerFirstPairBlocks(
+        input, input.outerFirstLimitBytes ?? outerFirstLimitBytes(this.device),
+        deviceTuning(this.device).opmPairBlockBytes);
       const intermediateElements = outerFirst
-        ? input.length * input.length * input.cOuter * input.cOuter
+        ? pairBlocks[0][1] * input.cOuter * input.cOuter
         : tileCapacity * input.length * input.cOuter * input.cZ;
       const intermediate = keep(this.allocator.allocate("opm.intermediate", intermediateElements * 4, storage));
       const output = keep(this.allocator.allocate(
@@ -829,21 +1210,32 @@ export class OuterProductMeanGpu {
         projectGrid[0], projectGrid[1], Math.ceil(input.cOuter / opmProjectTileColumns()));
       const outputGrid = linearGrid(pairElements);
       if (outerFirst) {
-        // ...one workgroup per PAIR now, not per element; see the note on the
-        // contraction kernel.
-        const pairs = input.length * input.length;
-        const outerGrid = [Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH)];
-        pass(contractPipeline, [left.buffer, right.buffer, params.buffer, intermediate.buffer],
-          outerGrid[0], outerGrid[1]);
-        // ...several pairs a workgroup now; see the note on the kernel. This is
-        // the path check-evoformer-opm.js drives, so its grid has to agree with
-        // the block encoders' or the gate would test a dispatch no fold uses.
-        const outputGroups = Math.ceil(pairs / OPM_PROJECT_OUTPUT_PAIRS);
-        const projectOutputGrid = [
-          Math.min(outputGroups, GRID_WIDTH), Math.ceil(outputGroups / GRID_WIDTH)];
-        pass(projectOutputPipeline,
-          [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer],
-          projectOutputGrid[0], projectOutputGrid[1]);
+        // ...a block of pairs at a time, and one block on anything but a huge
+        // protein; see outerFirstPairBlocks. Each block is a contraction and a
+        // projection over the SAME intermediate buffer, so they serialise
+        // naturally - the projection reads what the contraction just wrote.
+        for (const [offset, count] of pairBlocks) {
+          const blk = keep(this.allocator.upload(
+            `opm.pair-block-${offset}`, new Uint32Array([offset, count, 0, 0]),
+            GPUBufferUsage.UNIFORM,
+          ));
+          // ...one workgroup per PAIR, not per element; see the contraction kernel.
+          const outerGrid = [Math.min(count, GRID_WIDTH), Math.ceil(count / GRID_WIDTH)];
+          pass(contractPipeline,
+            [left.buffer, right.buffer, params.buffer, intermediate.buffer, blk.buffer],
+            outerGrid[0], outerGrid[1]);
+          // ...several pairs a workgroup; see the note on the kernel. This is
+          // the path check-evoformer-opm.js drives, so its grid has to agree
+          // with the block encoders' or the gate would test a dispatch no fold
+          // uses.
+          const outputGroups = Math.ceil(count / opmProjectOutputPairs(this.device));
+          const projectOutputGrid = [
+            Math.min(outputGroups, GRID_WIDTH), Math.ceil(outputGroups / GRID_WIDTH)];
+          pass(projectOutputPipeline,
+            [intermediate.buffer, mask.buffer, weights.buffer, params.buffer, output.buffer,
+              blk.buffer],
+            projectOutputGrid[0], projectOutputGrid[1]);
+        }
       } else {
         encoder.clearBuffer(output.buffer);
         for (let offset = 0; offset < input.sequences; offset += tileCapacity) {

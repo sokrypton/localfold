@@ -19,6 +19,9 @@ export class WebGpuExecution {
   allocator;
   pipelines;
   #allocations = [];
+  // 🔴 WHICH OF THEM CAME FROM writeBuffer, WHICH IS THE ONE THING THAT CANNOT
+  // BE RECYCLED INSIDE AN ENCODER. See releaseScratchSince.
+  #uploaded = new WeakSet();
   #timestamps;
   #activeEncoder;
   #activePass;
@@ -74,6 +77,7 @@ export class WebGpuExecution {
   upload(label, data, usage = GPUBufferUsage.STORAGE) {
     const allocation = this.allocator.upload(label, data, usage);
     this.#allocations.push(allocation);
+    this.#uploaded.add(allocation);
     return { allocation, elements: data.byteLength / 4, storage: "f32" };
   }
 
@@ -285,6 +289,45 @@ export class WebGpuExecution {
   }
 
   checkpoint() { return this.#allocations.length; }
+
+  /**
+   * Release only the buffers this execution ALLOCATED, keeping the uploaded
+   * ones, so a sub-layer's scratch can be recycled without waiting for the
+   * encoder to be submitted.
+   *
+   * 🔴 `queue.writeBuffer` IS ORDERED AGAINST THE QUEUE, NOT THE ENCODER, AND
+   * THAT DISTINCTION IS A WRONG ANSWER. A block encodes every sub-layer into
+   * ONE command buffer and submits it at the end, but each sub-layer's weight
+   * upload goes onto the queue as it is encoded - so ALL of a block's
+   * writeBuffers run before ANY of its dispatches. Recycle an uploaded buffer
+   * mid-block and the second sub-layer's weights land in it before the first
+   * sub-layer's dispatch ever reads it: `fold-af2.js` went checksum -1805925 to
+   * -1207195 and pLDDT 57.280 to 56.109, which is a plausible-looking structure
+   * and a silently wrong one.
+   *
+   * Allocated scratch has no such hazard. Nothing writes it but a dispatch, and
+   * dispatches in one pass are ordered - so the reader was encoded before the
+   * writer that reuses the buffer, and WebGPU keeps them in that order.
+   *
+   * `releaseSince` stays what a stack calls between blocks, where the previous
+   * block's submit already separates the two sets of writeBuffers.
+   */
+  releaseScratchSince(checkpoint) {
+    if (!Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > this.#allocations.length) {
+      throw new RangeError(`invalid GPU allocation checkpoint ${checkpoint}`);
+    }
+    const kept = [];
+    for (let index = this.#allocations.length - 1; index >= checkpoint; index -= 1) {
+      const allocation = this.#allocations[index];
+      if (this.#uploaded.has(allocation)) kept.push(allocation);
+      else allocation.release();
+    }
+    this.#allocations.length = checkpoint;
+    // ...in the order they were made, so a later checkpoint is still a suffix.
+    for (let index = kept.length - 1; index >= 0; index -= 1) {
+      this.#allocations.push(kept[index]);
+    }
+  }
 
   releaseSince(checkpoint) {
     if (!Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > this.#allocations.length) {

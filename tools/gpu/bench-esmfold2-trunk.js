@@ -15,6 +15,7 @@
 // and then all of the other is measuring the drift.
 import { Esmfold2TrunkGpu, PAIR_CHANNELS } from "../../src/esmfold2/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -59,6 +60,18 @@ function syntheticBlock(channels) {
 }
 
 export async function main(device, args = []) {
+  // 🔴 `--tune=key=value`, THE SAME FLAG fold.js CARRIES. A knob no gate enters
+  // is a knob nobody has checked, and both of this file's kernels choices -
+  // `gridAttendMatrix` and `pairTransitionSplit` - are device-profile knobs.
+  for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
+       .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const tokens = option(args, "tokens", "40,150,300").split(",").map(Number);
   const channels = Number(option(args, "channels", String(PAIR_CHANNELS)));
   const blockCount = Number(option(args, "blocks", "24"));

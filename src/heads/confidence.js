@@ -1,6 +1,6 @@
 import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
-import { chainPairTmScores, perChainTmScores, reduceTmScore, tmPerBinFor, tmScoreD0,
-  tmTermFromLogits } from "./tm-score.js";
+import { chainPairTmScores, perChainTmScores, reduceTmScore, softmaxExpectations,
+  tmPerBinFor, tmScoreD0, tmTermFromLogits } from "./tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
 } from "../evoformer/transition.js";
@@ -21,6 +21,64 @@ import { yieldToBrowser } from "../runtime/yield.js";
  */
 
 const LINEAR_SHADER = createTransitionShaders({}, [])[1];
+
+/**
+ * Two expectations of one softmax over the PAE bins, on the device.
+ *
+ * 🔴 IT WAS 790 ms OF `Math.exp` ON THE MAIN THREAD, on logits that were already
+ * on the GPU. `predictedAlignedError` is the expectation of the bin centres and
+ * the pTM term is the expectation of `1 / (1 + centre^2 / d0^2)`; at 825
+ * residues and 64 bins that is 43.6 million exponentials, and the host does them
+ * one at a time on the thread that also has to paint the page. The device has
+ * already computed the logits and can do both reductions in the time it takes to
+ * write the answer.
+ *
+ * 🔴 AND IT MOVES pTM's LAST DIGITS, WHICH IS THE PRICE. The host accumulated in
+ * a Float64Array; this accumulates in f32, so the score changes by about 1e-7
+ * relative - four orders below the four decimals anybody reads, and the same
+ * class of change docs/A100.md accepted for `attentionGroup`'s reassociated
+ * softmax at 3e-7. `softmaxExpectations` stays for the CPU reference and the
+ * tests that pin it.
+ *
+ * Generated for one bin count so the loops have constant bounds; CLAUDE.md
+ * records what a runtime trip count costs in a short body.
+ */
+export function createPaeExpectationShader(bins) {
+  if (!Number.isSafeInteger(bins) || bins < 1) {
+    throw new RangeError(`the PAE expectation wants a positive bin count; got ${bins}`);
+  }
+  return `
+const GRID_WIDTH: u32 = 32768u;
+const BINS: u32 = ${bins}u;
+struct Shape { rows: u32, padding0: u32, padding1: u32, padding2: u32 };
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read> first_weights: array<f32>;
+@group(0) @binding(2) var<storage, read> second_weights: array<f32>;
+@group(0) @binding(3) var<uniform> shape: Shape;
+@group(0) @binding(4) var<storage, read_write> first: array<f32>;
+@group(0) @binding(5) var<storage, read_write> second: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= shape.rows) { return; }
+  let base = row * BINS;
+  // Against the largest logit, because the logits are unbounded and exp() of
+  // them is not - the same guard the host version has.
+  var largest = -1e30;
+  for (var bin = 0u; bin < BINS; bin += 1u) { largest = max(largest, logits[base + bin]); }
+  var denominator = 0.0;
+  var first_total = 0.0;
+  var second_total = 0.0;
+  for (var bin = 0u; bin < BINS; bin += 1u) {
+    let probability = exp(logits[base + bin] - largest);
+    denominator += probability;
+    first_total += probability * first_weights[bin];
+    second_total += probability * second_weights[bin];
+  }
+  first[row] = first_total / denominator;
+  second[row] = second_total / denominator;
+}`;
+}
 const RELU_SHADER = `
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read> source: array<f32>;
@@ -68,6 +126,29 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
   // would move a published number.
   const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));
 
+  // The reduction is shared with AlphaFold 3 - see src/heads/tm-score.js. What
+  // stays here is AF2's own conventions: bin centres from the model's breaks,
+  // and chains as contiguous blocks rather than by asym_id.
+  //
+  // 🔴 THE TERM IS BUILT ONCE AND REDUCED SEVERAL TIMES, which is what lets
+  // this share AF3's `chainPairTmScores` rather than reimplement it. Every
+  // score here is the same expectations averaged over a different set of pairs;
+  // computing them per score made a two-chain fold do the expensive half twice
+  // and would have made a five-chain fold do it twelve times.
+  return tmScoresFromTerm(tmTermFromLogits(logits, length, tmPerBin), length, chainLengths);
+}
+
+/**
+ * ...and the same scores from a term that has already been computed.
+ *
+ * 🔴 IT EXISTS SO THE PAE HEAD TAKES ONE SOFTMAX AND NOT TWO. The term is the
+ * expectation of `1 / (1 + centre^2 / d0^2)` over the PAE bins and
+ * `predictedAlignedError` is the expectation of the centres - the same
+ * probabilities, weighted differently - and taking them separately meant 43.6
+ * million `Math.exp` calls twice at 825 residues, 1.46 s on the main thread.
+ * See softmaxExpectations.
+ */
+export function tmScoresFromTerm(term, length, chainLengths = undefined) {
   const isMultiChain = Array.isArray(chainLengths) && chainLengths.length > 1;
   let chainIndices = null;
   if (isMultiChain) {
@@ -78,17 +159,6 @@ export function computeTmScores(logits, length, breaks, chainLengths = undefined
       offset += chainLen;
     });
   }
-
-  // The reduction is shared with AlphaFold 3 - see src/heads/tm-score.js. What
-  // stays here is AF2's own conventions: bin centres from the model's breaks,
-  // and chains as contiguous blocks rather than by asym_id.
-  //
-  // 🔴 THE TERM IS BUILT ONCE AND REDUCED SEVERAL TIMES, which is what lets
-  // this share AF3's `chainPairTmScores` rather than reimplement it. Every
-  // score here is the same expectations averaged over a different set of pairs;
-  // computing them per score made a two-chain fold do the expensive half twice
-  // and would have made a five-chain fold do it twelve times.
-  const term = tmTermFromLogits(logits, length, tmPerBin);
   const ptm = reduceTmScore(term, length, () => true);
   const iptm = isMultiChain
     ? reduceTmScore(term, length,
@@ -150,7 +220,10 @@ export class ConfidenceHeadsGpu {
   ) {
     throwIfAborted(signal);
     const structureChannels = structureRepresentation.length / length;
-    const pairChannels = pairRepresentation.length / (length * length);
+    // 🔴 A DEVICE TENSOR OR A HOST ARRAY; see the note in src/structure/ipa.js.
+    const pairTensor = pairRepresentation?.allocation === undefined ? undefined : pairRepresentation;
+    const pairChannels = (pairTensor === undefined
+      ? pairRepresentation.length : pairTensor.elements) / (length * length);
     const hiddenChannels = lddtWeights.act0Bias.length;
     const lddtBins = lddtWeights.logitsBias.length;
     const paeBins = paeWeights.logitsBias.length;
@@ -169,13 +242,16 @@ export class ConfidenceHeadsGpu {
     const allocate = (label, elements, usage = GPUBufferUsage.STORAGE) =>
       keep(this.allocator.allocate(label, elements * 4, usage));
     try {
-      const [linear, normalize, relu] = await Promise.all([
+      const [linear, normalize, relu, paeExpectation] = await Promise.all([
         this.pipelines.get("confidence:linear", LINEAR_SHADER),
         this.pipelines.get("confidence:normalize", ATTENTION_NORMALIZE_SHADER),
         this.pipelines.get("confidence:relu", RELU_SHADER),
+        this.pipelines.get(`confidence:pae-expectation:${paeBins}`,
+          createPaeExpectationShader(paeBins)),
       ]);
       const structure = upload("confidence.structure", structureRepresentation);
-      const pair = upload("confidence.pair", pairRepresentation);
+      const pair = pairTensor === undefined
+        ? upload("confidence.pair", pairRepresentation) : pairTensor.allocation;
       const weights = upload("confidence.weights", packed);
       const normParams = upload("confidence.norm-params", createAttentionNormParameters(
         length, structureChannels, offsets[0], offsets[1], false, 1, length, 1e-5,
@@ -217,7 +293,24 @@ export class ConfidenceHeadsGpu {
       dispatch(relu, [act1Raw, act1], Math.ceil(act1Raw.byteLength / 4 / 64));
       linearDispatch(act1, params[2], lddtLogits, length, lddtBins);
       linearDispatch(pair, params[3], paeLogits, length * length, paeBins);
-      const readbacks = [lddtLogits, paeLogits].map((source, index) => {
+      // ...and both PAE expectations, where the logits already are.
+      const centers = paeCenters(breaks);
+      const tmPerBin = tmPerBinFor(centers, tmScoreD0(length));
+      const centersBuffer = upload("confidence.pae-centers", centers);
+      const tmPerBinBuffer = upload("confidence.pae-tm-per-bin", Float32Array.from(tmPerBin));
+      const expectationShape = upload("confidence.pae-expectation-shape",
+        new Uint32Array([length * length, 0, 0, 0]), GPUBufferUsage.UNIFORM);
+      const paeExpected = allocate("confidence.pae-expected", length * length,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const tmTermBuffer = allocate("confidence.pae-tm-term", length * length,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      {
+        const groups = Math.ceil(length * length / 64);
+        dispatch(paeExpectation,
+          [paeLogits, centersBuffer, tmPerBinBuffer, expectationShape, paeExpected, tmTermBuffer],
+          Math.min(groups, 32768), Math.ceil(groups / 32768));
+      }
+      const readbacks = [lddtLogits, paeLogits, paeExpected, tmTermBuffer].map((source, index) => {
         const target = allocate(`confidence.readback-${index}`, source.byteLength / 4,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
         encoder.copyBufferToBuffer(source.buffer, 0, target.buffer, 0, source.byteLength); return target;
@@ -230,20 +323,18 @@ export class ConfidenceHeadsGpu {
       });
       const lddtLogitValues = values[0];
       const paeLogitValues = values[1];
+      const predictedAlignedError = values[2];
+      const tmTerm = values[3];
       onStage?.("reading confidence");
       const lddtCenters = Float32Array.from({ length: lddtBins }, (_, index) => (index + 0.5) / lddtBins * 100);
       const plddt = softmaxExpected(lddtLogitValues, length, lddtBins, lddtCenters);
-      const centers = paeCenters(breaks);
-      const predictedAlignedError = softmaxExpected(paeLogitValues, length * length, paeBins, centers);
-      // 🔴 A YIELD BEFORE THE ONE PIECE OF REAL CPU WORK IN THE MODEL.
-      // predictedTmScore is O(L^2 * bins) on the main thread - at L=221 that is
-      // some millions of iterations with no await in them, so the page cannot
-      // paint and the progress bar appears frozen at whatever it last said.
-      // One macrotask costs about a millisecond and lets the bar show where it
-      // actually is before the thread is taken.
+      // 🔴 A YIELD BEFORE WHAT IS LEFT OF THE CPU WORK IN THE MODEL. The two PAE
+      // expectations are on the device now - see createPaeExpectationShader -
+      // and the reduction over pairs that turns the term into pTM is not, so
+      // this still takes the thread for O(L^2) with no await in it.
       onStage?.("scoring");
       await yieldToBrowser();
-      const tmScores = computeTmScores(paeLogitValues, length, breaks, chainLengths);
+      const tmScores = tmScoresFromTerm(tmTerm, length, chainLengths);
       return {
         lddtLogits: lddtLogitValues, plddt,
         meanPlddt: plddt.reduce((sum, value) => sum + value, 0) / length,

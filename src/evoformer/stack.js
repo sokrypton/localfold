@@ -63,6 +63,7 @@ export class EvoformerStackGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
       let timestampProfile;
+      let encodeMilliseconds = 0;
       const requestedWindow = input.submissionWindow ?? (input.signal !== undefined ? 8 : input.blockWeights.length);
       if (!Number.isSafeInteger(requestedWindow) || requestedWindow < 1) {
         throw new RangeError("submissionWindow must be a positive safe integer");
@@ -73,13 +74,21 @@ export class EvoformerStackGpu {
         throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `evoformer-stack.block-${block}` });
         const profiling = input.profileBlock === block;
-        if (profiling) execution.beginTimestampProfile();
+        // 🔴 256 DISPATCHES IS A 59-RESIDUE BLOCK, NOT A LONG ONE. The
+        // transitions chunk with the length, so an 825-residue block at 512
+        // rows overflows the query set and the profiler dies with "GPU
+        // timestamp query capacity exceeded" - at exactly the size worth
+        // profiling. A query is 8 bytes; 2048 of them is 32 KiB.
+        if (profiling) execution.beginTimestampProfile(2048);
         validation.begin();
+        // ...and the host's own share; see the note in ExtraMsaStackGpu.
+        const encodeStart = performance.now();
         await encodeEvoformerBlock(execution, encoder, {
           ...input,
           weights: input.blockWeights[block],
         }, msa, pair, msaMask, pairMask);
         execution.endComputePass(encoder);
+        encodeMilliseconds += performance.now() - encodeStart;
         const pendingProfile = profiling ? execution.finishTimestampProfile(encoder) : undefined;
         this.device.queue.submit([encoder.finish()]);
         validation.end(`block ${block}`);
@@ -135,6 +144,7 @@ export class EvoformerStackGpu {
         pair: pairOutput,
         pairTensor: pair,
         elapsedMilliseconds: performance.now() - start,
+        encodeMilliseconds,
         memory: execution.snapshot(),
         blocks: input.blockWeights.length,
         ...(timestampProfile === undefined ? {} : { timestampProfile }),
@@ -247,15 +257,37 @@ export class ExtraMsaStackGpu {
       const pairMask = execution.upload("extra-full-stack.pair-mask", input.pairMask);
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
+      // 🔴 THE EXTRA STACK GETS THE PROFILER TOO, and it needed it more than the
+      // main one did: a fold at 825 residues spends 6.20 s in FOUR of these
+      // blocks against 17.28 in forty-eight of the others - 1549 ms a block
+      // against 360 - and nothing here could say which kernel that was. Same
+      // contract as the main stack's `profileBlock`: a pass per dispatch for the
+      // chosen block, so the labels survive the batching.
+      let timestampProfile;
+      let encodeMilliseconds = 0;
       const validation = new DeferredValidation(this.device, "extra-MSA stack");
       for (let block = 0; block < input.blockWeights.length; block += 1) {
         throwIfAborted(input.signal);
         const encoder = this.device.createCommandEncoder({ label: `extra-msa-stack.block-${block}` });
+        const profiling = input.profileBlock === block;
+        if (profiling) execution.beginTimestampProfile(2048);
         validation.begin();
+        // 🔴 HOW LONG THE HOST SPENDS ENCODING, which neither profiler can see.
+        // The timestamp profiler times GPU passes and `elapsedMilliseconds` times
+        // the wall, and a fold at 825 residues had 23% of itself in the gap
+        // between them: weight packing, uploads, pipeline lookups and the
+        // allocator, all on the thread that also has to paint.
+        const encodeStart = performance.now();
         await encodeExtraMsaBlock(execution, encoder, input, input.blockWeights[block], msa, pair, msaMask, pairMask);
         execution.endComputePass(encoder);
+        encodeMilliseconds += performance.now() - encodeStart;
+        const pendingProfile = profiling ? execution.finishTimestampProfile(encoder) : undefined;
         this.device.queue.submit([encoder.finish()]);
         validation.end(`block ${block}`);
+        if (pendingProfile !== undefined) {
+          await this.device.queue.onSubmittedWorkDone();
+          timestampProfile = await execution.readTimestampProfile(pendingProfile);
+        }
         throwIfAborted(input.signal);
         execution.releaseSince(persistentCheckpoint);
       }
@@ -270,7 +302,7 @@ export class ExtraMsaStackGpu {
       ]), input.signal);
       throwIfAborted(input.signal);
       return { msa: msaOutput, pair: pairOutput, elapsedMilliseconds: performance.now() - start,
-        memory: execution.snapshot() };
+        encodeMilliseconds, timestampProfile, memory: execution.snapshot() };
     } finally { execution.release(); }
   }
 }

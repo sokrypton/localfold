@@ -1047,6 +1047,14 @@ kernel in the trunk by half again. Staged it is 21.7 and 318, second at both,
 but the exponent has not changed and it will lead again on a longer chain.
 Anything further should be measured at 150, not at 59.
 
+🔴 **AND ON A DEVICE WITH MATRIX UNITS THIS KERNEL IS NOW A DIFFERENT ONE.**
+`src/af3/grid-attention-matrix.js` is the same online-softmax flash attention
+AF2 runs, and it is 1.40x to 1.53x over the staged scalar kernel below across
+200 to 640 tokens on an A100 - the whole measurement, and the AF2 tile rule that
+does NOT transfer to it, are in docs/A100.md. It is off unless
+`gridAttendMatrix` is set, and everything in this section is still what runs
+everywhere else.
+
 **Staging is what fixed it, and the reason generalises.** The dispatch gives a
 workgroup one (pair row, head) and sixty-four queries, and the key loop runs over
 the same axis for all of them - so each of the `2 * dimension/4` vectors a key
@@ -1221,6 +1229,11 @@ in an `if` - is the same expression and measures **relRMS 2.24e-1** against the
 CPU reference where the `if` measures 9.63e-7. Deterministic, and identical to
 the last digit whichever of the two rewrites is used, so it is a real difference
 and not noise. It was not run down. Do not rewrite it.
+
+The matrix kernel routes around it rather than resolving it: it hoists the
+mask's READ out of the per-query-row loop into a staged per-key array, which is
+what the redundancy was, and leaves the conditional itself written exactly as it
+is here. Whatever this is, it is still unexplained.
 
 What paid, in order of size:
 

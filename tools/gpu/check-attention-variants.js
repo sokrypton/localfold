@@ -16,14 +16,19 @@
  * against the default and the time.
  */
 import { AttentionGpu, selectAttentionFlashKernel } from "../../src/evoformer/attention.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
+// 🔴 "matrix" IS IN THE LIST NOW, and it is the one variant whose ARITHMETIC
+// differs: the units multiply in f16 with an f32 accumulator where every other
+// variant multiplies in f32, so it is held to the f16 bar and not to the 1e-6
+// the reassociating ones agree to. See src/evoformer/attention-matrix.js.
 const VARIANTS = ["portable", "subgroup-4x8", "subgroup-key32", "subgroup-8x64",
-                  "subgroup-16x64", "subgroup-32x64", "subgroup-64x64"];
+                  "subgroup-16x64", "subgroup-32x64", "subgroup-64x64", "matrix"];
 
 function noise(count, seed) {
   const values = new Float32Array(count);
@@ -36,6 +41,16 @@ function noise(count, seed) {
 }
 
 export async function main(device, args) {
+  // `--tune=attentionMatrixTile=6x16x1` - the matrix arm has a geometry, and a
+  // geometry that no checker has run is a geometry nobody has checked.
+  for (const pair of option(args, "tune", "").split(",").filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const sequences = Number(option(args, "sequences", "512"));
   const length = Number(option(args, "length", "59"));
   const channels = Number(option(args, "channels", "256"));

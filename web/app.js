@@ -3157,8 +3157,17 @@ async function fold(event) {
     const prediction = await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
       .predictA3m(
         alignmentForDriver, model.weights, model.featureTables,
+        // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
+        // is the only caller that wants it. It is the trunk's MSA and pair
+        // representation copied to the host - 781 MB at 825 residues, 1.26 s of
+        // a 25.7 s fold - and it exists for `af2Cache`, so that raising the
+        // recycle count continues rather than restarts. Every other caller
+        // (the CLI tools, the differential gates, an embedder) folds once and
+        // used to pay for it anyway.
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
-          resume, ...regime },
+        // ...and `pairHost: true` for the distogram contact overlay, which is
+        // the only reader of the host copy of the pair representation.
+          resume, resumable: true, pairHost: true, ...regime },
         model.paeBreaks, onRecycle, runProgress);
 
     progress(null);

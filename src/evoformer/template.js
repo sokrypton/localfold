@@ -200,9 +200,16 @@ export class QueryOnlyTemplateGpu {
       const persistentCheckpoint = execution.checkpoint();
       const start = performance.now();
 
+      // 🔴 THE TEMPLATE STACK GETS THE PROFILER TOO. It is 1.04 s of a 20.4 s
+      // fold at 825 residues - two pair blocks at 64 channels, which the
+      // arithmetic says should be a fifth of that - and nothing could see into
+      // it. Same contract as the two Evoformer stacks' `profileBlock`.
+      let timestampProfile;
       for (let block = 0; block < input.weights.blockWeights.length; block += 1) {
         encoder = this.device.createCommandEncoder({ label: `template.block-${block}` });
         this.device.pushErrorScope("validation");
+        const profiling = input.profileBlock === block;
+        if (profiling) execution.beginTimestampProfile(2048);
         await encodeTemplatePairBlock(execution, encoder, {
           sequences: 1,
           length: input.length,
@@ -212,7 +219,12 @@ export class QueryOnlyTemplateGpu {
           triangleHidden: input.weights.blockWeights[block] .triangleMultiplicationOutgoing.linearAPBias.length,
         }, input.weights.blockWeights[block], pair, pairMask);
         execution.endComputePass(encoder);
+        const pendingProfile = profiling ? execution.finishTimestampProfile(encoder) : undefined;
         this.device.queue.submit([encoder.finish()]);
+        if (pendingProfile !== undefined) {
+          await this.device.queue.onSubmittedWorkDone();
+          timestampProfile = await execution.readTimestampProfile(pendingProfile);
+        }
         const error = await this.device.popErrorScope();
         if (error !== null) throw new Error(`WebGPU template block ${block} failed: ${error.message}`);
         execution.releaseSince(persistentCheckpoint);
@@ -228,7 +240,12 @@ export class QueryOnlyTemplateGpu {
       const normalized = execution.allocate("template.normalized", pair.elements);
       const projected = input.weights.valueWeight.length / input.templateChannels;
       const value = execution.allocate("template.value", pairs * projected);
-      const output = execution.allocate(
+      // 🔴 THE CALLER'S TENSOR WHEN IT HAS ONE, so the pair update never leaves
+      // the device. At 825 residues it is `L^2 * 128` floats - **348 MB read
+      // back to the host, turned into a JavaScript Float32Array, and uploaded
+      // straight again** by the model that asked for it. The GPU work in this
+      // whole class is 130 ms at that size and the call takes 1040.
+      const output = input.outputTensor ?? execution.allocate(
         "template.output", pairs * input.pairChannels, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
       );
       const valueWeight = execution.upload("template.value-weight", input.weights.valueWeight);
@@ -253,13 +270,18 @@ export class QueryOnlyTemplateGpu {
       const outputGrid = execution.linearGrid(output.elements);
       execution.dispatch(encoder, outputPipeline, [value, outputWeight, outputBias, params, output],
         outputGrid[0], outputGrid[1], 1, "template.output");
-      const readback = execution.createReadback("template.readback", output, encoder);
+      // ...`createReadback` ended the pass as a side effect; without it nothing
+      // does, and the encoder refuses to finish.
+      execution.endComputePass(encoder);
+      const readback = input.outputTensor === undefined
+        ? execution.createReadback("template.readback", output, encoder) : undefined;
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();
       if (error !== null) throw new Error(`WebGPU template output failed: ${error.message}`);
       return {
-        pairUpdate: await execution.mapFloat32(readback),
+        pairUpdate: readback === undefined ? undefined : await execution.mapFloat32(readback),
         elapsedMilliseconds: performance.now() - start,
+        timestampProfile,
         memory: execution.snapshot(),
       };
     } finally {

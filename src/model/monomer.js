@@ -47,10 +47,28 @@ export class AlphaFoldMonomerGpu {
   async predictA3m(a3mText, weights, featureTables,
     options = {}, paeBreaks,
     onRecycle, onProgress) {
-    return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
-      onRecycle, onProgress,
-      { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths,
-        resume: options.resume });
+    // 🔴 THE ALIGNMENT PREP IS TIMED TOO, because it is main-thread JavaScript
+    // outside every GPU clock and docs/AF2.md has already had to rewrite it once.
+    const featureStart = performance.now();
+    const features = makeA3mFeatures(a3mText, featureTables, options);
+    const featureMilliseconds = performance.now() - featureStart;
+    // 🔴 FORWARD THE WHOLE OPTIONS OBJECT, for the reason src/multimer/model.js
+    // gives at the same seam and this one had to learn separately. The
+    // hand-copied allow-list here went stale the moment `pairHost` was added:
+    // web/app.js asks for it through this method for the distogram contact
+    // overlay, the list dropped it, `recycle.pair` came back undefined, and
+    // `attachContactMap` returns early on exactly that - so the overlay
+    // silently disappeared from the shipped page and nothing raised.
+    // tools/gpu/probe-af2-contacts.js, the one gate that would have caught it,
+    // was broken by the same change in the same way.
+    // An allow-list of options is a list that goes stale every time one is
+    // added; the feature-building keys predict() does not read are harmless.
+    const prediction = await this.predict(features, weights, paeBreaks,
+      onRecycle, onProgress, options);
+    if (prediction.stageMilliseconds !== undefined) {
+      prediction.stageMilliseconds.features = featureMilliseconds;
+    }
+    return prediction;
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]
@@ -65,14 +83,22 @@ export class AlphaFoldMonomerGpu {
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
+    // 🔴 THE CLOCK STARTS HERE, BEFORE THE PAIR MASK AND THE TEMPLATE. Those two
+    // ran outside every phase and outside the progress stream - a 680,625-element
+    // JavaScript loop and a whole template pair track - and showed up only as the
+    // gap between the phases and the wall.
+    const stageMilliseconds = {
+      pairMask: 0, template: 0, setup: 0,
+      embedder: 0, extraStack: 0, mainStack: 0, trunkReadback: 0,
+      structure: 0, confidence: 0, convergence: 0, resumable: 0,
+    };
+    let phaseStart = performance.now();
     const pairMask = new Float32Array(length * length);
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = featuresByRecycle[0] .seqMask[i] * featuresByRecycle[0] .seqMask[j];
     }
-    const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
-      length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
-    }), signal);
-    throwIfAborted(signal);
+    stageMilliseconds.pairMask = performance.now() - phaseStart;
+    phaseStart = performance.now();
     if (weights.extraStack.length === 0 || weights.mainStack.length === 0) {
       throw new RangeError("AlphaFold monomer requires non-empty extra and main Evoformer stacks");
     }
@@ -116,6 +142,8 @@ export class AlphaFoldMonomerGpu {
     // string instead made `completed` NaN, which reached the progress element
     // as "the provided double value is non-finite" and failed the fold. A label
     // means "one step of whatever I am", which is the structure module's step.
+    stageMilliseconds.setup = performance.now() - phaseStart;
+    phaseStart = performance.now();
     const step = (units) => {
       completed += Number.isFinite(units) ? units : STRUCTURE_STEP;
       onProgress?.({ completed, total: totalSteps, waiting: false });
@@ -135,7 +163,20 @@ export class AlphaFoldMonomerGpu {
     };
     const releaseTensor = (tensor) => tensor.allocation.release();
     try {
-      const templateUpdate = execution.upload("monomer.template-update", template.pairUpdate);
+      // 🔴 THE TEMPLATE WRITES STRAIGHT INTO THIS, so its pair update never
+      // leaves the device. It used to come back as a host Float32Array -
+      // `L^2 * 128` floats, **348 MB at 825 residues** - and go up again on the
+      // next line. The GPU work in the whole template embedder is 130 ms at
+      // that size; the call took 1040.
+      const templateUpdate = execution.allocate(
+        "monomer.template-update", length * length * 128);
+      await withAbort(new QueryOnlyTemplateGpu(this.device).run({
+        length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
+        outputTensor: templateUpdate,
+      }), signal);
+      stageMilliseconds.template = performance.now() - phaseStart;
+      phaseStart = performance.now();
+      throwIfAborted(signal);
       const pairMaskTensor = execution.upload("monomer.pair-mask", pairMask);
       // 🔴 A RECYCLE'S STATE IS FOUR THINGS, and `resume` is all four from a
       // previous run - so asking for more recycles runs the difference rather
@@ -145,13 +186,22 @@ export class AlphaFoldMonomerGpu {
       // three-recycle run and a five-recycle one, and a continuation lands on
       // the structure the longer run would have produced.
       const resume = recycleOptions.resume;
-      let previousMsa = execution.upload("monomer.recycle-msa-zero",
-        resume?.msa ?? new Float32Array(length * 256));
-      let previousPair = execution.upload("monomer.recycle-pair-zero",
-        resume?.pair ?? new Float32Array(length * length * 128));
-      let previousPositions = execution.upload(
-        "monomer.recycle-positions-zero", resume?.atom37 ?? new Float32Array(length * 37 * 3),
-      );
+      // 🔴 A ZERO BUFFER IS ALLOCATED, NOT UPLOADED. Without a continuation the
+      // recycle state is all zeros, and this built them in JavaScript and pushed
+      // them across the bus: at 825 residues the pair state alone is
+      // **348 MB of zeros**, a Float32Array of 87 million elements and a
+      // writeBuffer of the same. WebGPU zero-initialises a new buffer, so the
+      // whole thing is one allocation the driver already had to do.
+      const zeros = (label, elements) => execution.allocate(label, elements);
+      let previousMsa = resume?.msa === undefined
+        ? zeros("monomer.recycle-msa-zero", length * 256)
+        : execution.upload("monomer.recycle-msa", resume.msa);
+      let previousPair = resume?.pair === undefined
+        ? zeros("monomer.recycle-pair-zero", length * length * 128)
+        : execution.upload("monomer.recycle-pair", resume.pair);
+      let previousPositions = resume?.atom37 === undefined
+        ? zeros("monomer.recycle-positions-zero", length * 37 * 3)
+        : execution.upload("monomer.recycle-positions", resume.atom37);
       let previousAtom37 = resume?.atom37 ?? new Float32Array(length * 37 * 3);
 
       // Features are built for every pass and only the outstanding ones run;
@@ -185,6 +235,8 @@ export class AlphaFoldMonomerGpu {
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };
+        stageMilliseconds.embedder += performance.now() - phaseStart;
+        phaseStart = performance.now();
         const windowSize = signal !== undefined ? 8 : weights.mainStack.length;
         const validation = new DeferredValidation(this.device, `recycle ${recycle}`);
         for (let block = 0; block < weights.extraStack.length; block += 1) {
@@ -202,6 +254,8 @@ export class AlphaFoldMonomerGpu {
           if (endOfWindow) await withAbort(this.device.queue.onSubmittedWorkDone(), signal);
           void this.device.queue.onSubmittedWorkDone().then(() => step(EXTRA_BLOCK));
         }
+        stageMilliseconds.extraStack += performance.now() - phaseStart;
+        phaseStart = performance.now();
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
         const mainDescriptor = {
@@ -228,6 +282,8 @@ export class AlphaFoldMonomerGpu {
         }
 
         await validation.settle();
+        stageMilliseconds.mainStack += performance.now() - phaseStart;
+        phaseStart = performance.now();
         const readbackEncoder = encode(`monomer.readback-${recycle}`);
         const msaFirstRowTensor = execution.allocate(
           `monomer.msa-first-row-readback-${recycle}`, length * 256,
@@ -237,29 +293,50 @@ export class AlphaFoldMonomerGpu {
         readbackEncoder.copyBufferToBuffer(
           embedding.msa.allocation.buffer, 0, msaFirstRowTensor.allocation.buffer, 0, length * 256 * 4,
         );
-        const pairReadback = execution.createReadback(
-          `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder,
-        );
+        // 🔴 THE PAIR REPRESENTATION STAYS ON THE DEVICE UNLESS SOMEBODY ASKS
+        // FOR IT. `L^2 * 128` floats is 348 MB at 825 residues, read back to a
+        // JavaScript array and uploaded again by the structure module and the
+        // confidence heads that take it - 0.82 s of a 19.7 s fold for a copy of
+        // something already on the GPU. Both take a device tensor now.
+        //
+        // The one caller that needs the host copy is `web/app.js`, for the
+        // distogram contact overlay, and it asks: `pairHost: true`. The same
+        // shape as `resumable`.
+        const wantsPairHost = recycleOptions.pairHost === true;
+        const pairReadback = wantsPairHost
+          ? execution.createReadback(
+            `monomer.pair-readback-${recycle}`, embedding.pairWithoutTemplates, readbackEncoder)
+          : undefined;
         await submit(readbackEncoder, `readback recycle ${recycle}`);
         const [msaFirstRow, pair] = await withAbort(Promise.all([
-          execution.mapFloat32(msaFirstRowTensor), execution.mapFloat32(pairReadback),
+          execution.mapFloat32(msaFirstRowTensor),
+          pairReadback === undefined ? undefined : execution.mapFloat32(pairReadback),
         ]), signal);
         throwIfAborted(signal);
-        releaseTensor(msaFirstRowTensor); releaseTensor(pairReadback); releaseTensor(msaMask);
+        releaseTensor(msaFirstRowTensor); releaseTensor(msaMask);
+        if (pairReadback !== undefined) releaseTensor(pairReadback);
 
+        stageMilliseconds.trunkReadback += performance.now() - phaseStart;
+        phaseStart = performance.now();
         const structure = await withAbort(new StructureModuleGpu(this.device).run({
-          msaFirstRow, pair, mask: features.seqMask, aatype: features.aatype,
+          msaFirstRow, pair: embedding.pairWithoutTemplates,
+          mask: features.seqMask, aatype: features.aatype,
           atom37ToAtom14: features.atom37ToAtom14, atom37Mask: features.atom37Mask,
           length, weights: weights.structure, geometry: weights.geometry,
           signal,
           onStep: step,
         }), signal);
         throwIfAborted(signal);
+        stageMilliseconds.structure += performance.now() - phaseStart;
+        phaseStart = performance.now();
         const confidence = await withAbort(new ConfidenceHeadsGpu(this.device).run(
-          structure.finalRepresentation, pair, length, weights.lddt, weights.pae, paeBreaks,
+          structure.finalRepresentation, embedding.pairWithoutTemplates,
+          length, weights.lddt, weights.pae, paeBreaks,
           () => step(CONFIDENCE_STEP), signal, recycleOptions.chainLengths,
         ), signal);
         throwIfAborted(signal);
+        stageMilliseconds.confidence += performance.now() - phaseStart;
+        phaseStart = performance.now();
         const recycleDistance = recycleConvergenceDistance(
           previousAtom37, structure.atom37, features.seqMask,
         );
@@ -278,18 +355,31 @@ export class AlphaFoldMonomerGpu {
       // The state the next continuation needs. Read back BEFORE the finally
       // releases the allocator, and only these two: atom37 is already on the
       // CPU, and previousPositions is re-uploaded from it.
-      const stateEncoder = encode("recycle-state");
-      const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
-      const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
-      await submit(stateEncoder, "recycle state readback");
-      const resumable = {
-        msa: await execution.mapFloat32(msaReadback),
-        pair: await execution.mapFloat32(pairReadback),
-        atom37: previousAtom37,
-        recycles: firstRecycle + results.length - 1,
-      };
+      //
+      // 🔴 AND IT IS 781 MB AT 825 RESIDUES THAT MOST FOLDS NEVER READ. The MSA
+      // and the pair representation come back to the host so `web/app.js` can
+      // CONTINUE a fold at more recycles - one cache, one caller - and every
+      // other fold pays a device-to-host copy of both plus the JavaScript arrays
+      // to hold them. At 0 recycles that is the whole of the cost and none of
+      // the benefit. So it is a thunk: the buffers stay alive until the
+      // execution is released, and `resume()` is what copies them.
+      const stateStart = performance.now();
+      let resumable = { atom37: previousAtom37, recycles: firstRecycle + results.length - 1 };
+      if (recycleOptions.resumable === true) {
+        const stateEncoder = encode("recycle-state");
+        const msaReadback = execution.createReadback("state.msa", previousMsa, stateEncoder);
+        const pairReadback = execution.createReadback("state.pair", previousPair, stateEncoder);
+        await submit(stateEncoder, "recycle state readback");
+        resumable = {
+          ...resumable,
+          msa: await execution.mapFloat32(msaReadback),
+          pair: await execution.mapFloat32(pairReadback),
+        };
+      }
+      stageMilliseconds.resumable = performance.now() - stateStart;
       return {
         recycles: results, final: results[results.length - 1], resumable,
+        stageMilliseconds,
         elapsedMilliseconds: performance.now() - start,
       };
     } finally {

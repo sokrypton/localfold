@@ -29,7 +29,49 @@
  * 🔴 THE SINGLE TRACK READS THE PAIR AFTER ALL FIVE PAIR UPDATES, not before.
  * Reading it earlier is a plausible-looking reordering that still converges.
  */
-import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
+import {
+  deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
+} from "../runtime/device-profile.js";
+import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
+import {
+  allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
+} from "../triangle/project-matrix.js";
+import { packWeights as packTriangleWeights } from "../triangle/weights.js";
+import { af3TriangleWeights } from "./triangle-webgpu.js";
+
+/**
+ * The matrix configuration a split transition wants, or false.
+ *
+ * 🔴 IT IS A DEVICE QUESTION AND A WIDTH QUESTION, AND BOTH ARE HERE. The
+ * measurement that sets the width is TRANSITION_SPLIT_MIN_CHANNELS in
+ * src/af3/transition-webgpu.js; at AF3's 128 the split is 1.8% of a trunk for
+ * 72 MiB and this declines it, at OpenDDE's 384 it is 3.71x on the kernel.
+ */
+function matrixTile(device) {
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return null;
+  return { result: config.resultComponentType, matrixElement: config.componentType,
+           tile: { M: config.M, N: config.N, K: config.K } };
+}
+
+function splitTransitionConfig(device, channels) {
+  if (deviceTuning(device).pairTransitionSplit !== true) return false;
+  if (channels < TRANSITION_SPLIT_MIN_CHANNELS) return false;
+  return matrixTile(device) ?? false;
+}
+
+/**
+ * 🔴 A SEPARATE KNOB FROM THE TRANSITION'S, AND IT WAS BRIEFLY NOT. Deriving
+ * this one from `splitTransitionConfig` made `triangleProjectMatrix=true`
+ * silently inert whenever `pairTransitionSplit` was false - which is exactly
+ * the arm a checker isolating the two would reach for, and it read as "the
+ * kernel changes nothing" rather than as "the flag did nothing".
+ */
+function projectMatrixConfig(device, channels) {
+  if (deviceTuning(device).triangleProjectMatrix !== true) return false;
+  if (channels < TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS) return false;
+  return matrixTile(device) ?? false;
+}
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -44,8 +86,10 @@ import {
   compilePairTrack, createAddShader, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
-import { createTransitionShader, packTransitionWeights, TRANSITION_ORDER }
-  from "./transition-webgpu.js";
+import {
+  allocateTransitionSplit, createTransitionShader, packTransitionWeights,
+  TRANSITION_ORDER, TRANSITION_SPLIT_MIN_CHANNELS,
+} from "./transition-webgpu.js";
 import { residentPackedOnDevice } from "./device-weights.js";
 import { createSingleAttentionShaders, packSingleAttentionWeights,
   singleProjectSplits, SINGLE_ATTENTION_ORDER }
@@ -305,6 +349,23 @@ export class Af3PairformerStackGpu {
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
+      // 🔴 THE HEAD WIDTH IS THIS BUNDLE'S, NOT AF3's. OpenDDE runs this same
+      // pairformer at its own widths, and a geometry the device cannot hold at
+      // one of them resolves to false rather than throwing.
+      attendMatrix: resolveGridAttendMatrix(
+        this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
+      // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
+      // 128 gets 1.13x and OpenDDE's 384 gets 3.71x from the same knob, because
+      // the fused kernel's row tile halves as the widened row grows. See
+      // src/af3/transition-webgpu.js.
+      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels),
+      pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      // ...and the triangle projection, which has no width rule because it
+      // costs no memory. See src/triangle/project-matrix.js.
+      triangleProjectMatrix: projectMatrixConfig(this.device, pairChannels),
+      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
+      minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
       n, channels: pairChannels, sample: blocks[0], epsilon, variance, dialect, base,
       stagedPrecision,
       weightPrecision: pairWeightPrecision, accumulatePrecision,
@@ -370,6 +431,24 @@ export class Af3PairformerStackGpu {
       // something WebGPU can catch. See that constant for what packing them
       // cost: a factor of 1200 on the pair representation this stack produces,
       // which is what the confidence head reads.
+      const projectMatrix = pipelines.projectMatrix === undefined ? undefined
+        : allocateTriangleProjectMatrix(this.allocator, {
+          rows: n * n, cZ: pairChannels, cHidden: pairChannels,
+          offsets: packTriangleWeights(
+            af3TriangleWeights(blocks[0].triangleMultiplicationOutgoing, pairChannels),
+            this.options?.pairWeightPrecision ?? "f32",
+            { abLayout: "interleaved", zgLayout: "transposed",
+              cHidden: pairChannels, cZ: pairChannels }).offsets,
+          label: "af3-block.tri-project",
+        }, keep);
+      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+        : allocateTransitionSplit(this.allocator, {
+          rows: n * n, channels: pairChannels,
+          factor: blocks[0].pairTransition.transition2.length / (pairChannels * pairChannels),
+          chunkRows: pipelines.transitionSplit.chunkRows,
+          offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
+          label: "af3-block.transition",
+        }, keep);
       const scratch = [];
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
@@ -431,6 +510,7 @@ export class Af3PairformerStackGpu {
           pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
+          transitionSplit, projectMatrix,
         });
         encodeMilliseconds += performance.now() - encodeStart;
         validation.end(`block ${index}`);
@@ -511,7 +591,8 @@ export class Af3PairformerStackGpu {
   async #encodeBlock(context) {
     const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
     const { pairChannels, singleChannels, extraPairBias } = context;
-    const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch } = context;
+    const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
+            transitionSplit, projectMatrix } = context;
 
     // 🔴 RELEASED IMMEDIATELY, AND THAT IS SAFE BECAUSE THE QUEUE IS ORDERED.
     // Each block's weights are about 12 MB, so they cannot be held for all 48.
@@ -541,8 +622,11 @@ export class Af3PairformerStackGpu {
     // heap 1.1 GiB for a 59-token fold. This packs on demand instead: at most
     // once per block, and only while the misses are being filled.
     let packedPair;
+    // 🔴 THE a/b LAYOUT MUST MATCH THE KERNEL THAT WAS COMPILED. `projectMatrix`
+    // exists exactly when compilePairTrack chose the interleaved projection.
     const packedFor = () => (packedPair ??= packPairTrackWeights(
-      block, pairChannels, context.pairWeightPrecision));
+      block, pairChannels, context.pairWeightPrecision, true,
+      context.projectMatrix === undefined ? "blocked" : "interleaved"));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
@@ -653,7 +737,7 @@ export class Af3PairformerStackGpu {
 
     encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
-      scratch, biasBuffer,
+      scratch, biasBuffer, transitionSplit, projectMatrix,
       weights: pairTrackWeights,
     });
 

@@ -20,6 +20,7 @@ import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.j
 import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { assertChainGeometry } from "./chain-geometry.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
@@ -617,12 +618,20 @@ export async function main(device, args) {
 
   // 🔴 GEOMETRY IS THE CHECK THAT MATTERS HERE, not pLDDT - see the note on
   // backboneGeometry.
-  const { nca, cac, caca, gyration, residues } = result.geometry;
+  const { nca, cac, caca, worstCaca, gyration, residues } = result.geometry;
   console.log(`backbone  N-CA ${nca.toFixed(2)} A (ideal 1.46)`
     + `   CA-C ${cac.toFixed(2)} A (ideal 1.52)`
-    + `   CA-CA ${caca.toFixed(2)} A (ideal 3.80)`);
+    + `   CA-CA ${caca.toFixed(2)} A (ideal 3.80, worst ${worstCaca.toFixed(2)})`);
   console.log(`radius of gyration ${gyration.toFixed(1)} A over ${residues} CA`
     + `   (a compact 68-mer is about 11-12 A)`);
+  // 🔴 AND NOW IT IS A GATE. The comment above has said "geometry is the check
+  // that matters here" since this tool was written, and nothing failed on it -
+  // which is exactly the state fold-af2.js was in when an 825-residue collapse
+  // walked through it for a whole campaign. See tools/gpu/chain-geometry.js.
+  assertChainGeometry(result.geometry, {
+    plddt: result.meanPlddt, doc: "docs/AF3.md and docs/AF2.md",
+    allow: args.includes("--allow-broken-geometry"),
+  });
   console.log(`total ${foldSeconds[foldSeconds.length - 1].toFixed(1)} s`);
   // 🔴 GROUPED BY THE LABEL'S FIRST WORD, because that is the STAGE. Every
   // pass here is labelled `<stage>.<pass>` - af3-block, difftx, atom, cond,

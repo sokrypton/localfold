@@ -31,6 +31,8 @@ import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
  * q and k carry AF3's `transpose_weights` and v does not; the exported shapes
  * say so, (heads, dimension, channels) against (channels, heads, dimension).
  */
+import { createGridAttendMatrixShader, gridAttendMatrixGeometry }
+  from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -786,8 +788,24 @@ ${overOutRows((r) => `    if (first + ${r}u < PAIRS) {
   }
 }`;
 
-  return { normalize, bias: biasPass, project, attend, project_out,
-           tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS } };
+  // 🔴 THE MATRIX ATTEND IS A SWAP OF THIS ONE SHADER AND NOTHING ELSE. It
+  // keeps all six bindings and their order; only the dispatch's x extent moves,
+  // from ceil(n / 64) to ceil(n / attendRows), which is why the row tile
+  // travels back out with the shaders rather than being re-derived at the
+  // dispatch. See the note above `tiles`: a kernel here once processed half its
+  // rows because the caller divided by a constant the shader was not built
+  // from.
+  const matrixGeometry = shape.attendMatrix
+    ? gridAttendMatrixGeometry(shape.attendMatrix === true ? undefined : shape.attendMatrix)
+    : null;
+  const attendShader = matrixGeometry === null ? attend : createGridAttendMatrixShader(
+    { n, heads, dimension, transpose },
+    { q: store4.q, k: store4.k, v: store4.v, gathered: gatheredStorage },
+    matrixGeometry);
+
+  return { normalize, bias: biasPass, project, attend: attendShader, project_out,
+           tiles: { projectRows, projectOutRows, normalizeRows: NORMALIZE_ROWS,
+                    attendRows: matrixGeometry === null ? 64 : matrixGeometry.rows } };
 }
 
 export class Af3GridSelfAttentionGpu {
@@ -831,13 +849,18 @@ export class Af3GridSelfAttentionGpu {
     // ...and the staged key chunk, so bench-grid-attend.js can sweep it. See
     // attendKeyChunk for why the default is what it is.
     const attendKeyChunkSize = options.attendKeyChunk;
+    // ...and the matrix attend, off unless asked for: a geometry, `true` for
+    // the default one, or absent. See src/af3/grid-attention-matrix.js.
+    const attendMatrix = options.attendMatrix ?? false;
     const sources = createGridAttentionShaders(
       { n, channels, heads, dimension, transpose, stagedPrecision, attendLazyRescale,
+        attendMatrix,
         ...(attendKeyChunkSize === undefined ? {} : { attendKeyChunk: attendKeyChunkSize }) },
       packed.offsets, epsilon, variance, dialect);
     const key = `af3-grid:${n}:${channels}:${heads}:${dimension}:${transpose}`
       + `:${epsilon}:${variance}:${dialect.swapTransposedBias}:${stagedPrecision}`
-      + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`;
+      + `:${attendLazyRescale}:${attendKeyChunkSize ?? "d"}`
+      + `:m${attendMatrix === false ? "0" : JSON.stringify(attendMatrix)}`;
     const [normalize, bias, project, attend, projectOut] = await Promise.all([
       this.pipelines.get(`${key}:normalize`, sources.normalize),
       this.pipelines.get(`${key}:bias`, sources.bias),
@@ -889,9 +912,11 @@ export class Af3GridSelfAttentionGpu {
       // One workgroup per tile of PROJECT_ROWS pair rows - see the kernel.
       runPass("project", project, [normalized, weightBuffer, q, k, v, gate],
               linear2d(Math.ceil(pairs / sources.tiles.projectRows)));
-      // One thread per (query, row, head) - see the note on the kernel.
+      // One thread per (query, row, head) on the scalar kernel, one workgroup
+      // per tile of `attendRows` of them on the matrix one - which is the whole
+      // difference at the dispatch.
       runPass("attend", attend, [q, k, v, biasBuffer, maskBuffer, gathered],
-              [Math.ceil(n / 64), n, heads]);
+              [Math.ceil(n / sources.tiles.attendRows), n, heads]);
       // One workgroup per tile of PROJECT_OUT_ROWS pair rows - see the kernel.
       runPass("project-out", projectOut, [gathered, gate, weightBuffer, output],
               linear2d(Math.ceil(pairs / sources.tiles.projectOutRows)));

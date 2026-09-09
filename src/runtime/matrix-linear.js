@@ -60,6 +60,26 @@
  */
 
 /**
+ * A staged GEMM block, as `blockRows x blockColumns x blockInner x subgroupRows
+ * x subgroupColumns`.
+ *
+ * 🔴 IT IS ONE STRING BECAUSE `--tune=` SPLITS ITS ARGUMENT ON COMMAS and so
+ * cannot carry an object - the same reason `attentionMatrixTile` is "4x32".
+ * Four kernels now share one geometry and none of them has been swept at its
+ * own shape; this is what makes that a knob rather than a recompile.
+ */
+export function stagedMatrixBlock(spec) {
+  if (spec === null || spec === undefined) return {};
+  if (typeof spec === "object") return spec;
+  const parts = String(spec).split("x").map(Number);
+  if (parts.length !== 5 || !parts.every((v) => Number.isSafeInteger(v) && v > 0)) {
+    throw new RangeError(`a staged matrix block reads "BMxBNxBKxSRxSC"; got ${spec}`);
+  }
+  const [blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns] = parts;
+  return { blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns };
+}
+
+/**
  * Whether a geometry can serve a shape at all.
  *
  * 🔴 IT ALWAYS CAN, NOW, and this stays as a named fact rather than being
@@ -138,7 +158,139 @@ export function createStagedMatrixShader(options = {}) {
   const weightPrecision = options.weightPrecision ?? "f16";
   const outputPrecision = options.outputPrecision ?? "f32";
   const residual = options.residual ?? false;
-  const vectorStaging = options.vectorStaging ?? false;
+  // 🔴 PER OPERAND, NOT PER KERNEL, BECAUSE A TRIANGLE CONTRACTION TRANSPOSES
+  // EXACTLY ONE OF THE TWO. `true` means both, which is every caller that
+  // predates this. A transposed operand walks the axis it is not stored on, so
+  // its four consecutive elements are `columns` apart and it cannot be
+  // vec4-read - but the OTHER one still can, and docs/A100.md prices the win as
+  // almost entirely this.
+  const staging = options.vectorStaging ?? false;
+  const vectorSource = typeof staging === "object" ? staging.source === true : staging === true;
+  const vectorWeights = typeof staging === "object" ? staging.weights === true : staging === true;
+  const vectorStaging = vectorSource || vectorWeights;
+  // 🔴 THREE OPTIONS THE OUTER PRODUCT MEAN NEEDS AND A DENSE PROJECTION DOES
+  // NOT. Its contraction is a GEMM - `outer[(i,cl)][(j,cr)] = sum_s
+  // left[s][(i,cl)] * right[s][(j,cr)]` - with the deepest K in the model, but
+  // its left operand is stored sequence-major, it has no bias, and its output
+  // is indexed by PAIR rather than by row-major (row, column). All three are
+  // one line each here and a layout migration anywhere else.
+  const sourceTransposed = options.sourceTransposed ?? false;
+  const bias = options.bias ?? true;
+  const outputIndex = options.outputIndex ?? "row * parameters.columns + column";
+  // 🔴 A PER-ROW SCALE APPLIED BEFORE THE RESIDUAL, which is what turns the
+  // outer product mean's output projection into a GEMM. Its result is
+  // `(bias + sum) / count` where the count depends on the PAIR - the row - so
+  // without this the kernel would need an epilogue pass over the whole pair
+  // track. `scaleIndex` is a WGSL expression in `row`; the binding is optional
+  // and unread when it is absent, which matters because `layout: "auto"` drops
+  // a binding a shader does not use.
+  const scaleIndex = options.scaleIndex ?? null;
+  // 🔴 AND THE SCALE HAS TO REACH THE OPERAND, NOT JUST THE RESULT, WHENEVER THE
+  // OPERAND IS A SUM. The outer product mean's intermediate is a sum over the
+  // WHOLE ALIGNMENT before its divide, so at 1024 sequences and 400 residues it
+  // leaves f16's range and the staged copy becomes inf: the fold came back with
+  // every coordinate NaN, at 512 sequences and at 200 residues it did not, and
+  // that shape of threshold is always this. Scaling at the staging keeps the
+  // operand O(1) whatever the depth, and the bias is scaled with it so the
+  // result is the same `(bias + sum) * s` the vector kernel computes.
+  //
+  // `rowScaleOffset` is a WGSL expression added to the row; null is no scale.
+  const rowScaleOffset = options.rowScaleOffset ?? null;
+  if (rowScaleOffset !== null && scaleIndex !== null) {
+    throw new RangeError("a row scale is applied at the operand OR the result, not both");
+  }
+  // 🔴 THE SWIGLU GATE, APPLIED AT THE OPERAND, WHICH IS WHAT REMOVES A WHOLE
+  // TENSOR. A transition's second projection contracts `swish(wide[k]) *
+  // wide[hidden + k]` - two columns of the widened activation, `hidden` apart.
+  // Fusing that into the FIRST projection's epilogue is impossible at any block
+  // width, because the two columns land in different workgroups; doing it as
+  // its own elementwise pass costs a pass and a rows x hidden tensor. Doing it
+  // HERE costs one extra vec4 read in a loop that already runs, because the
+  // staging reads the operand element by element anyway.
+  //
+  // `{stride, offset}` are the widened row's stride and the distance to the
+  // value half, and they are BAKED AS LITERALS rather than taken from
+  // `parameters`: the shader is already generated per shape, `parameters.inner`
+  // is the contracted extent (the hidden width) and not the row stride, and
+  // adding two runtime fields would change the struct for every caller.
+  // 🔴 A GROUP OF ADJACENT OUTPUT COLUMNS IS ONE OUTPUT CHANNEL, WHICH IS WHAT
+  // A GATED PROJECTION IS. AF3's triangle projection contracts FOUR matrices
+  // over one source - a, a's gate, b, b's gate - and writes
+  // `mask * a * logistic(a_gate)` and the same for b, in CHANNEL-MAJOR order.
+  // Fusing that needs column `4h` and column `4h+1` in the same lane's reach,
+  // which is why the weights are packed interleaved for this path: the four
+  // roles of one channel are four ADJACENT columns and therefore always inside
+  // one subgroup's flush block, where the epilogue already reads them out of
+  // workgroup memory.
+  //
+  // `{size, stores}`: `size` adjacent columns are one channel and each store is
+  // a `[value, gate]` pair of indices within the group. Two stores means two
+  // output bindings. `rowMask` adds a per-row multiplier read from its own
+  // binding, which is the pair mask.
+  const outputGroup = options.outputGroup ?? null;
+  const rowMask = options.rowMask ?? false;
+  if (outputGroup !== null) {
+    if (!Number.isSafeInteger(outputGroup.size) || outputGroup.size < 2) {
+      throw new RangeError("outputGroup.size wants an integer of at least two");
+    }
+    if (!Array.isArray(outputGroup.stores) || outputGroup.stores.length === 0) {
+      throw new RangeError("outputGroup wants at least one [value, gate] store");
+    }
+    if (residual) throw new RangeError("a grouped output does not add into its target");
+    if (scaleIndex !== null) throw new RangeError("a grouped output takes no result scale");
+  }
+  // 🔴 A GATE COMPUTED BY A DIFFERENT GEMM, READ AT THE SAME OUTPUT CELL. AF3's
+  // triangle OUTPUT projection is `logistic(z . Wg) * (x . Wz)` - two
+  // contractions over two DIFFERENT sources, which is not one GEMM and cannot
+  // be made into one by any column trick. Two staged sources with two
+  // accumulator sets would fit the workgroup budget and then spend about 128
+  // registers a lane on the accumulators; reading the FIRST pass's result in
+  // the second pass's epilogue costs one global read an output cell and no
+  // registers at all. The modulator is addressed by the same `outputIndex` the
+  // store uses, so it is the same cell by construction.
+  const outputModulate = options.outputModulate ?? false;
+  // 🔴 A BATCH ON group.z, WHICH IS WHAT A TRIANGLE MULTIPLICATION IS. AF3's
+  // contraction is `out[h][i][j] = sum_k a[h][i][k] * b[h][j][k]` - one n x n
+  // by n x n product PER CHANNEL, 256 of them, all with the same shape and the
+  // same stride. That is a batched GEMM and not a big one, so the batch index
+  // is a dispatch dimension rather than 256 dispatches. The stride is in
+  // ELEMENTS and is the same for all three tensors here; it is a compile-time
+  // literal because the shader is generated per shape anyway.
+  const batchStride = options.batchStride ?? null;
+  if (batchStride !== null && !Number.isSafeInteger(batchStride)) {
+    throw new RangeError("batchStride wants an element count");
+  }
+  // 🔴 AND THE RIGHT OPERAND CAN BE TRANSPOSED, which the OUTGOING direction
+  // needs and the incoming one does not. `sourceTransposed` has existed for the
+  // left operand since the outer product mean; this is its mirror, and the two
+  // directions of one op need one each.
+  const weightsTransposed = options.weightsTransposed ?? false;
+  if (weightsTransposed && vectorWeights) {
+    // A transposed read walks k, which is the slow axis of the stored operand,
+    // so four consecutive elements of the vec4 are `columns` apart. Refused
+    // rather than made quietly wrong.
+    throw new RangeError("a transposed right operand cannot be vector-staged");
+  }
+  if (sourceTransposed && vectorSource) {
+    throw new RangeError("a transposed left operand cannot be vector-staged");
+  }
+  const sourceGate = options.sourceGate ?? null;
+  if (sourceGate !== null) {
+    for (const key of ["stride", "offset"]) {
+      if (!Number.isSafeInteger(sourceGate[key]) || sourceGate[key] <= 0) {
+        throw new RangeError(`sourceGate.${key} wants a positive integer`);
+      }
+    }
+    if (sourceTransposed) throw new RangeError("a gated operand is not transposed here");
+    if (rowScaleOffset !== null) throw new RangeError("a gated operand takes no row scale");
+    // A vec4 read at element i returns i & ~3 .. i & ~3 + 3, so an odd stride
+    // or offset silently shifts the value half against the gate half.
+    if (vectorStaging && (sourceGate.stride % 4 !== 0 || sourceGate.offset % 4 !== 0)) {
+      throw new RangeError("vector staging needs the gate's stride and offset divisible by 4");
+    }
+  }
+  const scaled = (value, row) => (rowScaleOffset === null
+    ? value : `(${value}) * scale[${rowScaleOffset} + ${row}]`);
 
   const subgroups = SGY * SGX;
   const threads = subgroups * lanes;
@@ -153,6 +305,12 @@ export function createStagedMatrixShader(options = {}) {
   const accRows = rowsPerSubgroup / M;
   const accColumns = columnsPerSubgroup / N;
   const flushWidth = accColumns * N;
+  // ...checked here rather than beside the option, because the flush width is
+  // what a group has to fit inside and it is derived from the geometry.
+  if (outputGroup !== null && flushWidth % outputGroup.size !== 0) {
+    throw new RangeError(
+      `an output group of ${outputGroup.size} does not divide the flush width ${flushWidth}`);
+  }
 
   const stagedSource = BM * BK;
   const stagedWeights = BK * BN;
@@ -169,12 +327,13 @@ export function createStagedMatrixShader(options = {}) {
   if (half !== "f16" && half !== "f32") {
     throw new RangeError(`unknown matrix element ${half}`);
   }
-  const sourceElement = vectorStaging ? `vec4<${sourcePrecision}>` : sourcePrecision;
-  const weightElement = vectorStaging ? `vec4<${weightPrecision}>` : weightPrecision;
+  const sourceElement = vectorSource ? `vec4<${sourcePrecision}>` : sourcePrecision;
+  const weightElement = vectorWeights ? `vec4<${weightPrecision}>` : weightPrecision;
 
   const declarations = [];
   const stores = [];
-  const biasRead = vectorStaging
+  // ...the bias lives in the WEIGHT buffer, so its read follows that binding.
+  const biasRead = vectorWeights
     ? "weights[(parameters.bias_offset + column) / 4u][(parameters.bias_offset + column) % 4u]"
     : "weights[parameters.bias_offset + column]";
 
@@ -185,19 +344,39 @@ export function createStagedMatrixShader(options = {}) {
       block.push(`  subgroupMatrixStore(&scratch, sg * ${M * flushWidth}u + ${n * N}u,`
         + ` acc_${m}_${n}, false, ${flushWidth}u);`);
     }
+    if (outputGroup !== null) {
     stores.push(`${block.join("\n")}
-  workgroupBarrier();
-  for (var i = lane; i < ${M * flushWidth}u; i += ${lanes}u) {
-    let row = row_origin + sg_row + ${m * M}u + i / ${flushWidth}u;
-    let column = column_origin + sg_column + i % ${flushWidth}u;
-    if (row >= parameters.rows || column >= parameters.columns) { continue; }
-    var value = f32(scratch[sg * ${M * flushWidth}u + i]);
-    value += f32(${biasRead});
-    if (parameters.activation == 1u) { value = max(value, 0.0); }
-    let at = row * parameters.columns + column;
-${residual ? `    value += f32(output[at]);\n` : ""}    output[at] = ${outputPrecision}(value);
-  }
-  workgroupBarrier();`);
+    workgroupBarrier();
+    for (var g = lane; g < ${M * flushWidth / (outputGroup?.size ?? 1)}u; g += ${lanes}u) {
+      let i = g * ${outputGroup.size}u;
+      let row = row_origin + sg_row + ${m * M}u + i / ${flushWidth}u;
+      let column = column_origin + sg_column + i % ${flushWidth}u;
+      if (row >= parameters.rows || column >= parameters.columns) { continue; }
+      // The channel this group of ${outputGroup.size} columns is.
+      let channel = column / ${outputGroup.size}u;
+  ${Array.from({ length: outputGroup.size }, (_, r) => `    let v${r} = f32(scratch[sg * ${M * flushWidth}u + i + ${r}u])`
+      + (bias ? ` + f32(${vectorWeights
+      ? `weights[(parameters.bias_offset + column + ${r}u) / 4u][(parameters.bias_offset + column + ${r}u) % 4u]`
+      : `weights[parameters.bias_offset + column + ${r}u]`})` : "") + ";").join("\n")}
+  ${rowMask ? "    let row_mask = mask[row];\n" : ""}    let at = ${outputIndex};
+  ${outputGroup.stores.map(([value, gate], index) => `    ${index === 0 ? "output" : `output${index + 1}`}[at] = `
+      + `${outputPrecision}(${rowMask ? "row_mask * " : ""}v${value} * (1.0 / (1.0 + exp(-v${gate}))));`).join("\n")}
+    }
+    workgroupBarrier();`);
+    } else {
+    stores.push(`${block.join("\n")}
+    workgroupBarrier();
+    for (var i = lane; i < ${M * flushWidth}u; i += ${lanes}u) {
+      let row = row_origin + sg_row + ${m * M}u + i / ${flushWidth}u;
+      let column = column_origin + sg_column + i % ${flushWidth}u;
+      if (row >= parameters.rows || column >= parameters.columns) { continue; }
+      var value = f32(scratch[sg * ${M * flushWidth}u + i]);
+  ${bias ? `    value += f32(${scaled(biasRead, "row")});\n` : ""}    if (parameters.activation == 1u) { value = max(value, 0.0); }
+  ${scaleIndex === null ? "" : `    value *= scale[${scaleIndex}];\n`}    let at = ${outputIndex};
+  ${outputModulate ? "    value *= 1.0 / (1.0 + exp(-f32(modulator[at])));\n" : ""}${residual ? `    value += f32(output[at]);\n` : ""}    output[at] = ${outputPrecision}(value);
+    }
+    workgroupBarrier();`);
+    }
   }
 
   // The inner k step: each subgroup reads its own rows and columns out of the
@@ -219,23 +398,45 @@ ${residual ? `    value += f32(output[at]);\n` : ""}    output[at] = ${outputPre
 
   // Consecutive threads take consecutive columns, which is the coalesced
   // direction in both tensors, and with vector staging each takes four.
-  const stagingLoops = vectorStaging
-    ? `    for (var i = tid; i < ${stagedSource / 4}u; i += ${threads}u) {
+  // Consecutive threads take consecutive columns, which is the coalesced
+  // direction in both tensors, and with vector staging each takes four.
+  // 🔴 THE TWO OPERANDS CHOOSE SEPARATELY - see vectorSource/vectorWeights.
+  const stagingLoops = (vectorSource
+    ? `for (var i = tid; i < ${stagedSource / 4}u; i += ${threads}u) {
       let k = k0 + (i % ${BK / 4}u) * 4u;
       let r = row_origin + i / ${BK / 4}u;
-      let v = select(vec4<${sourcePrecision}>(0),
-        source[(r * parameters.inner + k) / 4u], k < parameters.inner && r < parameters.rows);
+      let v = ${sourceGate === null
+        ? scaled(`select(vec4<${sourcePrecision}>(0),
+        source[(${batchStride === null ? "" : "batch_base + "}r * parameters.inner + k) / 4u], k < parameters.inner && r < parameters.rows)`,
+        "min(r, parameters.rows - 1u)")
+        : `select(vec4<f32>(0.0), swish_gate4(
+        vec4<f32>(source[(r * ${sourceGate.stride}u + k) / 4u]),
+        vec4<f32>(source[(r * ${sourceGate.stride}u + ${sourceGate.offset}u + k) / 4u])),
+        k < parameters.inner && r < parameters.rows)`};
       let at = i * 4u;
       staged_source[at] = ${half}(v.x);
       staged_source[at + 1u] = ${half}(v.y);
       staged_source[at + 2u] = ${half}(v.z);
       staged_source[at + 3u] = ${half}(v.w);
-    }
-    for (var i = tid; i < ${stagedWeights / 4}u; i += ${threads}u) {
+    }`
+    : `    for (var i = tid; i < ${stagedSource}u; i += ${threads}u) {
+      let k = k0 + i % ${BK}u;
+      let r = row_origin + i / ${BK}u;
+      staged_source[i] = select(${half}(0),
+        ${half}(${sourceGate === null
+          ? scaled(`source[${batchStride === null ? "" : "batch_base + "}${sourceTransposed
+            ? "k * parameters.rows + r" : "r * parameters.inner + k"}]`,
+          "min(r, parameters.rows - 1u)")
+          : `swish_gate(f32(source[r * ${sourceGate.stride}u + k]),
+             f32(source[r * ${sourceGate.stride}u + ${sourceGate.offset}u + k]))`}),
+        k < parameters.inner && r < parameters.rows);
+    }`)
+    + (vectorWeights
+    ? `\n    for (var i = tid; i < ${stagedWeights / 4}u; i += ${threads}u) {
       let k = k0 + i / ${BN / 4}u;
       let c = column_origin + (i % ${BN / 4}u) * 4u;
       let v = select(vec4<${weightPrecision}>(0),
-        weights[(parameters.weight_offset + k * parameters.columns + c) / 4u],
+        weights[(parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}k * parameters.columns + c) / 4u],
         k < parameters.inner && c < parameters.columns);
       let at = i * 4u;
       staged_weights[at] = ${half}(v.x);
@@ -243,20 +444,14 @@ ${residual ? `    value += f32(output[at]);\n` : ""}    output[at] = ${outputPre
       staged_weights[at + 2u] = ${half}(v.z);
       staged_weights[at + 3u] = ${half}(v.w);
     }`
-    : `    for (var i = tid; i < ${stagedSource}u; i += ${threads}u) {
-      let k = k0 + i % ${BK}u;
-      let r = row_origin + i / ${BK}u;
-      staged_source[i] = select(${half}(0),
-        ${half}(source[r * parameters.inner + k]), k < parameters.inner && r < parameters.rows);
-    }
-    for (var i = tid; i < ${stagedWeights}u; i += ${threads}u) {
+    : `\n    for (var i = tid; i < ${stagedWeights}u; i += ${threads}u) {
       let k = k0 + i / ${BN}u;
       let c = column_origin + i % ${BN}u;
       staged_weights[i] = select(${half}(0),
-        ${half}(weights[parameters.weight_offset + k * parameters.columns + c]),
+        ${half}(weights[parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}${
+          weightsTransposed ? "c * parameters.inner + k" : "k * parameters.columns + c"}]),
         k < parameters.inner && c < parameters.columns);
-    }`;
-
+    }`);
   const usesHalf = [half, result, sourcePrecision, weightPrecision, outputPrecision]
     .includes("f16");
   return `${usesHalf ? "enable f16;\n" : ""}enable chromium_experimental_subgroup_matrix;
@@ -274,7 +469,46 @@ struct MatmulParameters {
 @group(0) @binding(1) var<storage, read> weights: array<${weightElement}>;
 @group(0) @binding(2) var<uniform> parameters: MatmulParameters;
 @group(0) @binding(3) var<storage, read_write> output: array<${outputPrecision}>;
+${scaleIndex === null && rowScaleOffset === null
+  ? "" : "@group(0) @binding(4) var<storage, read> scale: array<f32>;"}
+${(() => {
+  // 🔴 THE OPTIONAL BINDINGS ARE CONSECUTIVE, WITH NO GAP. `layout: "auto"`
+  // would accept a hole at 4, but every caller in this repository binds by
+  // mapping an ARRAY over its index - so a hole means the caller has to build a
+  // sparse entry list, and the one that forgets binds the mask as the output.
+  // The order is fixed and documented: scale, mask, then the extra outputs.
+  let binding = 4;
+  const lines = [];
+  if (scaleIndex !== null || rowScaleOffset !== null) binding += 1;
+  if (rowMask) {
+    lines.push("// The pair mask, one float a ROW, multiplied into every gated store.");
+    lines.push(`@group(0) @binding(${binding}) var<storage, read> mask: array<f32>;`);
+    binding += 1;
+  }
+  if (outputModulate) {
+    lines.push("// Another GEMM's result at the same cell, through a logistic.");
+    lines.push(`@group(0) @binding(${binding}) var<storage, read> `
+      + `modulator: array<${options.modulatePrecision ?? "f32"}>;`);
+    binding += 1;
+  }
+  for (let index = 1; index < (outputGroup?.stores ?? []).length; index += 1) {
+    lines.push(`@group(0) @binding(${binding}) var<storage, read_write> `
+      + `output${index + 1}: array<${outputPrecision}>;`);
+    binding += 1;
+  }
+  return lines.join("\n");
+})()}
 
+${sourceGate === null ? "" : `// swish(gate) * value, the transition's SwiGLU, computed where the operand is
+// staged. In f32 whatever the buffer holds: the gate half leaves f16's range on
+// a wide activation and the multiply is one instruction either way.
+fn swish_gate(gate: f32, value: f32) -> f32 {
+  return (gate / (1.0 + exp(-gate))) * value;
+}
+fn swish_gate4(gate: vec4<f32>, value: vec4<f32>) -> vec4<f32> {
+  return (gate / (vec4<f32>(1.0) + exp(-gate))) * value;
+}
+`}
 var<workgroup> staged_source: array<${half}, ${stagedSource}>;
 var<workgroup> staged_weights: array<${half}, ${stagedWeights}>;
 // One ${M}-row block per subgroup, which is all the result staging this needs.
@@ -291,6 +525,8 @@ fn main(
   // and a partial region is normal rather than forbidden.
   let row_origin = group.y * ${BM}u;
   let column_origin = group.x * ${BN}u;
+${batchStride === null ? "" : `  // The batch this workgroup belongs to, one channel of a triangle product.
+  let batch_base = group.z * ${batchStride}u;`}
   let sg_row = (sg / ${SGX}u) * ${rowsPerSubgroup}u;
   let sg_column = (sg % ${SGX}u) * ${columnsPerSubgroup}u;
 

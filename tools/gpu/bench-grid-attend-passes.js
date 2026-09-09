@@ -15,8 +15,21 @@
  *
  * This wraps the same call in `profileDevice`, which timestamps every labelled
  * compute pass, so `attend` is reported on its own and the copies fall out.
+ *
+ * 🔴 AND `--arms=` RACES THE MATRIX KERNEL AGAINST THE SCALAR ONE, INTERLEAVED.
+ * An arm is either `scalar` or a matrix geometry written `subgroupsXkeys`:
+ *
+ *     --arms=scalar,4x32,2x32,6x16,8x32
+ *
+ * The arms alternate WITHIN each round rather than each running its own sweep,
+ * because this box drifts by up to 3.2x between runs and a two-minute sweep
+ * accumulates that drift across its shapes - see CLAUDE.md. Every arm's
+ * geometry must be re-swept per kernel: AF2's optimum moved from 6x16 to 4x32
+ * when the scalar work in its body changed, with each 5-6% worse at the
+ * other's tile.
  */
 import { Af3GridSelfAttentionGpu } from "../../src/af3/grid-attention-webgpu.js";
+import { supportsGridAttendMatrix } from "../../src/af3/grid-attention-matrix.js";
 import { profileDevice } from "./profile.js";
 
 const DIALECT = { swapTransposedBias: false };
@@ -64,6 +77,9 @@ export async function main(device, args) {
   const chunk = Number(option(args, "chunk", "32"));
   const staged = device.features.has("shader-f16") ? "f16" : "f32";
   const runner = new Af3GridSelfAttentionGpu(device);
+  const arms = option(args, "arms", "scalar").split(",").filter(Boolean)
+    .filter((arm) => arm === "scalar" || supportsGridAttendMatrix(device, DIMENSION, arm));
+  if (arms.length === 0) throw new Error("no arm this device supports");
 
   const rows = [];
   for (const n of lengths) {
@@ -76,43 +92,53 @@ export async function main(device, args) {
     }
     const weights = weightsFor(n);
     const shape = { n, channels: CHANNELS, transpose: false };
-    const options = { stagedPrecision: staged, attendLazyRescale: false,
-                      attendKeyChunk: chunk };
+    const optionsFor = (arm) => ({
+      stagedPrecision: staged, attendLazyRescale: false, attendKeyChunk: chunk,
+      ...(arm === "scalar" ? {} : { attendMatrix: arm }),
+    });
 
-    // Warm the pipelines before anything is timed.
-    await runner.run(pair, mask, shape, weights, DIALECT, options);
+    // Warm every arm's pipelines before anything is timed.
+    for (const arm of arms) await runner.run(pair, mask, shape, weights, DIALECT, optionsFor(arm));
 
-    const wall = [];
-    const byLabel = new Map();
+    const wall = new Map(arms.map((arm) => [arm, []]));
+    const byLabel = new Map(arms.map((arm) => [arm, new Map()]));
     for (let round = 0; round < rounds; round += 1) {
-      const profile = profileDevice(device);
-      const { elapsedMilliseconds } = await runner.run(
-        pair, mask, shape, weights, DIALECT, options);
-      wall.push(elapsedMilliseconds);
-      const report = await profile.report();
-      profile.restore();
-      for (const entry of report) {
-        const label = entry.label ?? "(unlabelled)";
-        if (!byLabel.has(label)) byLabel.set(label, []);
-        byLabel.get(label).push(entry.ms ?? entry.milliseconds ?? 0);
+      for (const arm of arms) {
+        const profile = profileDevice(device);
+        const { elapsedMilliseconds } = await runner.run(
+          pair, mask, shape, weights, DIALECT, optionsFor(arm));
+        wall.get(arm).push(elapsedMilliseconds);
+        const report = await profile.report();
+        profile.restore();
+        for (const entry of report) {
+          const label = entry.label ?? "(unlabelled)";
+          const labels = byLabel.get(arm);
+          if (!labels.has(label)) labels.set(label, []);
+          labels.get(label).push(entry.ms ?? entry.milliseconds ?? 0);
+        }
       }
     }
-    const passes = {};
-    let gpuTotal = 0;
-    for (const [label, values] of byLabel) {
-      const ms = median(values);
-      passes[label] = Number(ms.toFixed(3));
-      gpuTotal += ms;
+    for (const arm of arms) {
+      const passes = {};
+      let gpuTotal = 0;
+      for (const [label, values] of byLabel.get(arm)) {
+        const ms = median(values);
+        passes[label] = Number(ms.toFixed(3));
+        gpuTotal += ms;
+      }
+      const wallMs = median(wall.get(arm));
+      rows.push({
+        tokens: n,
+        arm,
+        wallMs: Number(wallMs.toFixed(2)),
+        gpuMs: Number(gpuTotal.toFixed(2)),
+        offDeviceMs: Number((wallMs - gpuTotal).toFixed(2)),
+        pairMiB: Number((n * n * CHANNELS * 4 / 1048576).toFixed(1)),
+        passes,
+      });
+      console.log(`${n}\t${arm}\tattend ${(passes.attend ?? 0).toFixed(3)} ms`
+        + `\tgpu ${gpuTotal.toFixed(2)}`);
     }
-    const wallMs = median(wall);
-    rows.push({
-      tokens: n,
-      wallMs: Number(wallMs.toFixed(2)),
-      gpuMs: Number(gpuTotal.toFixed(2)),
-      offDeviceMs: Number((wallMs - gpuTotal).toFixed(2)),
-      pairMiB: Number((n * n * CHANNELS * 4 / 1048576).toFixed(1)),
-      passes,
-    });
   }
-  return { rounds, chunk, staged, rows };
+  return { rounds, chunk, staged, arms, rows };
 }

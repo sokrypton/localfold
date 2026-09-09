@@ -28,7 +28,18 @@
  * recycles; if this trunk's four loops make it pay, it is one call to
  * residentWeightBuffer, the way src/af3/pairformer-block-webgpu.js does it.
  */
-import { halfPrecisionAvailable } from "../runtime/device-profile.js";
+import {
+  deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
+} from "../runtime/device-profile.js";
+import { stagedMatrixBlock } from "../runtime/matrix-linear.js";
+import {
+  allocateTransitionSplit, packTransitionWeights, TRANSITION_SPLIT_MIN_CHANNELS,
+} from "../af3/transition-webgpu.js";
+import {
+  allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
+} from "../triangle/project-matrix.js";
+import { packWeights as packTriangleWeights } from "../triangle/weights.js";
+import { af3TriangleWeights } from "../af3/triangle-webgpu.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -142,13 +153,42 @@ export class Esmfold2TrunkGpu {
     const gridAttention = options.gridAttention ?? false;
     const base = `esmfold2-trunk:${n}:${channels}:${epsilon}:${variance}:`
       + `${gridAttention ? "zeroed-grid" : "no-grid"}`;
+    // 🔴 THE SPLIT TRANSITION IS WHERE THIS TRUNK'S TIME IS. `pair-transition`
+    // is 419.88 ms of a 743.8 ms trunk at 300 tokens - 56.5%, more than the
+    // other five kernels together - and at this track's 256 channels the fused
+    // kernel loses to the split by 2.89x. See src/af3/transition-webgpu.js.
+    const transitionFactor = options.transitionFactor ?? 4;
+    const tuning = deviceTuning(this.device);
+    const splitConfig = deviceMatrixConfig(this.device, { element: "f16" });
+    // ...and the block the staged GEMMs share, from the profile; see
+    // `stagedMatrixBlock` in src/runtime/device-profile.js.
+    const block = stagedMatrixBlock(tuning.stagedMatrixBlock);
+    // 🔴 ITS OWN KNOB, not derived from the transition's - see the note on
+    // projectMatrixConfig in src/af3/pairformer-block-webgpu.js - and its own
+    // width rule, which is about precision rather than memory.
+    const triangleProjectMatrix = tuning.triangleProjectMatrix === true && splitConfig !== null
+      && channels >= TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS
+      ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
+          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block }
+      : false;
+    const pairTransitionSplit = tuning.pairTransitionSplit === true && splitConfig !== null
+      && channels >= TRANSITION_SPLIT_MIN_CHANNELS
+      ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
+          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block }
+      : false;
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, base, channels,
       // The grid attention is what needs a dialect; without it there is no
       // transposed bias to have a convention about.
       dialect: { swapTransposedBias: false },
       gridAttention,
-      transitionFactor: options.transitionFactor ?? 4,
+      transitionFactor,
+      pairTransitionSplit,
+      pairTransitionChunkBytes: tuning.pairTransitionChunkBytes,
+      triangleProjectMatrix,
+      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
+      minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
       stagedPrecision, weightPrecision, accumulatePrecision,
     });
 
@@ -171,6 +211,26 @@ export class Esmfold2TrunkGpu {
           `esmfold2-trunk.scratch${index}`,
           storageBytes(pairs * channels, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
+      // ...and the split transition's two intermediates, sized for one chunk of
+      // rows. The widened one is 369 MiB at 300 tokens unchunked, which is the
+      // tensor the fused kernel existed to avoid; see transitionSplitChunkRows.
+      const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+        : allocateTransitionSplit(this.allocator, {
+          rows: pairs, channels, factor: transitionFactor,
+          chunkRows: pipelines.transitionSplit.chunkRows,
+          offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
+          label: "esmfold2-trunk.transition",
+        }, keep);
+      const projectMatrix = pipelines.projectMatrix === undefined ? undefined
+        : allocateTriangleProjectMatrix(this.allocator, {
+          rows: pairs, cZ: channels, cHidden: channels,
+          offsets: packTriangleWeights(
+            af3TriangleWeights(blocks[0].triangleMultiplicationOutgoing, channels),
+            weightPrecision,
+            { abLayout: "interleaved", zgLayout: "transposed",
+              cHidden: channels, cZ: channels }).offsets,
+          label: "esmfold2-trunk.tri-project",
+        }, keep);
       const gridHeads = gridAttention ? blocks[0].pairAttention1.heads : 0;
       const biasBuffer = gridAttention
         ? keep(this.allocator.allocate("esmfold2-trunk.bias", gridHeads * pairs * 4, storage))
@@ -184,7 +244,8 @@ export class Esmfold2TrunkGpu {
         validation.begin();
         this.#encodeBlock({
           block: blocks[index], n, channels, pipelines, storage, pending, weightPrecision,
-          pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer,
+          pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer, transitionSplit,
+          projectMatrix,
         });
         validation.end(`block ${index}`);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
@@ -256,13 +317,18 @@ export class Esmfold2TrunkGpu {
   /** One block, submitted as one command buffer. */
   #encodeBlock(context) {
     const { block, n, channels, pipelines, storage, pending, weightPrecision } = context;
-    const { pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer } = context;
+    const { pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer,
+            transitionSplit, projectMatrix } = context;
     const upload = (label, data) => {
       const allocation = this.allocator.upload(label, data, storage);
       pending.push(allocation);
       return allocation;
     };
-    const packed = packPairTrackWeights(block, channels, weightPrecision, gridAttention);
+    // 🔴 THE LAYOUT MUST MATCH THE KERNEL THAT WAS COMPILED. `projectMatrix`
+    // exists exactly when compilePairTrack chose the interleaved projection,
+    // so it is the one thing that decides both.
+    const packed = packPairTrackWeights(block, channels, weightPrecision, gridAttention,
+                                        projectMatrix === undefined ? "blocked" : "interleaved");
     const weights = {
       outgoing: upload("w.tri.out", packed.outgoing),
       incoming: upload("w.tri.in", packed.incoming),
@@ -292,7 +358,7 @@ export class Esmfold2TrunkGpu {
     };
     encodePairTrack({
       run, pipelines, n, channels, pair, pairMask, scratch, weights,
-      gridAttention, gridHeads, biasBuffer,
+      gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix,
     });
     this.device.queue.submit([encoder.finish()]);
   }

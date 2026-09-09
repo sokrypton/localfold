@@ -18,7 +18,7 @@ loop, and --virtual-time-budget does not end one either.
 No dependency: the WebSocket framing below is about sixty lines, against
 adding websockets/playwright to a project that has none.
 """
-import base64, json, os, socket, struct, subprocess, time, urllib.request, shutil
+import base64, json, os, socket, struct, subprocess, sys, time, urllib.request, shutil
 
 
 class WS:
@@ -79,10 +79,52 @@ class WS:
                 return m.get("result", {})
 
 
+# 🔴 THE HARDCODED /Applications PATH MADE EVERY PAGE TOOL MAC-ONLY, and
+# tools/gpu-chrome.mjs had already been through this and fixed it for the
+# GPU tools. This file had not, so fold-in-page.py - the gate that exists
+# BECAUSE a contact map failed to appear three times in a row - could not run
+# on Linux at all, and the contact overlay broke again and nothing caught it.
+# LOCALFOLD_CHROME overrides; otherwise the Mac bundle on darwin and the first
+# Chrome on PATH elsewhere.
+def chrome_binary():
+    override = os.environ.get("LOCALFOLD_CHROME")
+    if override:
+        return override
+    if sys.platform == "darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise RuntimeError("no Chrome found; set LOCALFOLD_CHROME to its path")
+
+
+# 🔴 AND ON LINUX/NVIDIA `--headless=new` GETS YOU NO ADAPTER AT ALL. Headless
+# Chrome wants VK_EXT_headless_surface, which the NVIDIA driver does not
+# implement, so the page reports "No compatible WebGPU adapter was found" and
+# the fold never starts. It has to run HEADFUL against an X server, which on a
+# GPU box means Xvfb and DISPLAY=:99. These are the same flags
+# tools/gpu-chrome.mjs arrived at; the note at its top has the whole discovery
+# order. LOCALFOLD_HEADLESS=1 forces headless back on.
+LINUX_FLAGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
+               "--ignore-gpu-blocklist", "--no-sandbox",
+               "--enable-dawn-features=vulkan_enable_f16_on_nvidia"]
+
+
+def chrome_flags():
+    # 🔴 macOS KEEPS EXACTLY THE FLAGS IT HAD. That path works and is the one
+    # the project's own machine runs; only Linux, which could not launch at
+    # all, gets anything new.
+    if not sys.platform.startswith("linux"):
+        return ["--headless=new"]
+    headless = ["--headless=new"] if os.environ.get("LOCALFOLD_HEADLESS") == "1" else []
+    return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
+
+
 def launch(port, profile):
     shutil.rmtree(profile, ignore_errors=True)
-    p = subprocess.Popen(["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "--headless=new", "--user-data-dir=" + profile, "--no-first-run",
+    p = subprocess.Popen([chrome_binary()] + chrome_flags() + [
+        "--user-data-dir=" + profile, "--no-first-run",
         "--hide-scrollbars", "--remote-debugging-port=%d" % port, "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + 25

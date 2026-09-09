@@ -34,6 +34,7 @@ import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
 import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
@@ -44,6 +45,19 @@ const option = (args, name, fallback) => {
 const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 export async function main(device, args) {
+  // 🔴 `--tune=key=value`, THE SAME FLAG fold.js CARRIES. A knob no gate enters
+  // is a knob nobody has checked, and this is the only tool that can see what
+  // one costs INSIDE the trunk - which is the only place a pairformer kernel's
+  // answer is legible. Repeat the flag or comma-separate it.
+  for (const pair of args.filter((a) => a.startsWith("--tune="))
+       .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const tokens = Number(option(args, "tokens", "59"));
   const rows = Number(option(args, "msa", "32"));
   const passes = Number(option(args, "passes", "3"));

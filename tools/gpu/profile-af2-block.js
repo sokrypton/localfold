@@ -103,7 +103,7 @@
  */
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { EvoformerStackGpu } from "../../src/evoformer/stack.js";
+import { EvoformerStackGpu, ExtraMsaStackGpu } from "../../src/evoformer/stack.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
@@ -121,6 +121,18 @@ export async function main(device, args) {
   // f32 activation and writes an f16 hidden one and the bench's arms all wrote
   // f32. So the geometry is picked here. `--matrix=128x128x16x1x8`, or
   // `--matrix=off` for the vector kernel.
+  // `--tune=attentionMatrix=true,attentionMatrixTile=4x64` sets the base tuning
+  // a sweep varies from. Values go through JSON.parse and fall back to the raw
+  // string, so `true`, `4` and `4x64` all arrive as the right thing - and a
+  // knob whose value NEEDS a comma cannot be written here.
+  for (const pair of option(args, "tune", "").split(",").filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const matrixArg = option(args, "matrix", null);
   if (matrixArg === "off") {
     setDeviceTuning(device, { halfPrecision: false });
@@ -131,12 +143,23 @@ export async function main(device, args) {
       matrixLinear: { blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns },
     });
   }
-  const cM = 256;
+  // 🔴 `--stack=extra` PROFILES THE OTHER ONE, and it is where a long fold's
+  // surprise was. At 825 residues a fold spends 6.20 s in FOUR extra-MSA blocks
+  // against 17.28 in forty-eight main ones - **1549 ms a block against 360** -
+  // for a stack with a QUARTER the MSA channels. Its pair half is the same code
+  // as the main stack's; only the three MSA passes differ, and one of them is
+  // the global column attention that only this stack runs.
+  const stack = option(args, "stack", "main");
+  if (stack !== "main" && stack !== "extra") {
+    throw new RangeError(`--stack wants "main" or "extra"; got ${stack}`);
+  }
+  const extra = stack === "extra";
+  const cM = extra ? 64 : 256;
 
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
   const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer")));
-  const blockWeights = await fixture.mainStackWeights();
+  const blockWeights = extra ? await fixture.extraStackWeights() : await fixture.mainStackWeights();
 
   // 🔴 SYNTHETIC ACTIVATIONS, WHICH IS SOUND FOR TIMING AND ONLY FOR TIMING.
   // Every dispatch is the same size whatever the numbers are and nothing here
@@ -153,33 +176,83 @@ export async function main(device, args) {
     return values;
   };
 
-  const result = await new EvoformerStackGpu(device).run({
-    msa: noise(sequences * length * cM, 1),
-    pair: noise(length * length * 128, 2),
-    msaMask: new Float32Array(sequences * length).fill(1),
-    pairMask: new Float32Array(length * length).fill(1),
-    sequences, length, cM, cZ: 128, cOuter: 32, triangleHidden: 128, blockWeights,
-    // ...block 1, not 0: the first compiles every pipeline.
-    profileBlock: block,
-  });
+  const once = async () => {
+    const Stack = extra ? ExtraMsaStackGpu : EvoformerStackGpu;
+    const result = await new Stack(device).run({
+      msa: noise(sequences * length * cM, 1),
+      pair: noise(length * length * 128, 2),
+      msaMask: new Float32Array(sequences * length).fill(1),
+      pairMask: new Float32Array(length * length).fill(1),
+      sequences, length, cM, cZ: 128, cOuter: 32, triangleHidden: 128, blockWeights,
+      // ...block 1, not 0: the first compiles every pipeline.
+      profileBlock: block,
+    });
+    const profile = result.timestampProfile ?? [];
+    const totals = new Map();
+    for (const { label, nanoseconds } of profile) {
+      const found = totals.get(label) ?? { label, ms: 0, dispatches: 0 };
+      found.ms += nanoseconds / 1e6;
+      found.dispatches += 1;
+      totals.set(label, found);
+    }
+    const kernels = [...totals.values()]
+      .map((row) => ({ ...row, ms: Number(row.ms.toFixed(3)) }))
+      .sort((a, b) => b.ms - a.ms);
+    return { kernels, dispatches: profile.length,
+      blockMs: kernels.reduce((sum, row) => sum + row.ms, 0),
+      // 🔴 THE WALL AND THE HOST'S SHARE OF IT, beside the GPU's. A stack short
+      // enough not to pipeline - the extra-MSA stack is FOUR blocks - cannot
+      // hide its encoding behind its compute, and neither profiler could see
+      // that: one times GPU passes and the other times nothing at all.
+      wallMs: result.elapsedMilliseconds,
+      encodeMs: result.encodeMilliseconds,
+      blocksRun: blockWeights.length };
+  };
 
-  const profile = result.timestampProfile ?? [];
-  const totals = new Map();
-  for (const { label, nanoseconds } of profile) {
-    const found = totals.get(label) ?? { label, ms: 0, dispatches: 0 };
-    found.ms += nanoseconds / 1e6;
-    found.dispatches += 1;
-    totals.set(label, found);
+  // 🔴 A TUNING SWEEP, INTERLEAVED, because this machine drifts by up to 3.2x
+  // between runs and a sweep is exactly the shape that hides it - see CLAUDE.md.
+  // `--sweep=opmProjectOutputPairs=1,2,4` runs each value twice, alternating,
+  // and reports the MINIMUM per arm; the weights are loaded once for all of
+  // them, so an arm costs one stack and not a browser launch.
+  //
+  // `--watch=opm.contract,opm.project-output` names the kernels to report
+  // beside the block total, so a sweep says WHICH kernel moved rather than only
+  // that something did.
+  const sweep = option(args, "sweep", null);
+  if (sweep !== null) {
+    const at = sweep.indexOf("=");
+    if (at < 0) throw new Error(`--sweep wants knob=v1,v2,..., got ${sweep}`);
+    const knob = sweep.slice(0, at);
+    const values = sweep.slice(at + 1).split(",").map((raw) => {
+      try { return JSON.parse(raw); } catch { return raw; }
+    });
+    const watch = option(args, "watch", "opm.contract,opm.project-output")
+      .split(",").filter(Boolean);
+    const best = new Map();
+    for (let round = 0; round < 2; round += 1) {
+      for (const value of values) {
+        setDeviceTuning(device, { [knob]: value });
+        const run = await once();
+        const of = (label) => run.kernels.find((k) => k.label === label) ?? { ms: 0, dispatches: 0 };
+        const row = { [knob]: value, blockMs: Number(run.blockMs.toFixed(2)) };
+        for (const label of watch) row[label] = of(label).ms;
+        const key = JSON.stringify(value);
+        const seen = best.get(key);
+        if (seen === undefined || row.blockMs < seen.blockMs) best.set(key, row);
+      }
+    }
+    return { length, sequences, knob, arms: [...best.values()] };
   }
-  const kernels = [...totals.values()]
-    .map((row) => ({ ...row, ms: Number(row.ms.toFixed(3)) }))
-    .sort((a, b) => b.ms - a.ms);
-  const blockMs = kernels.reduce((sum, row) => sum + row.ms, 0);
+
+  const run = await once();
+  const { kernels, blockMs } = run;
   return {
     length, sequences, block, blocks: blockWeights.length,
-    dispatches: profile.length,
+    dispatches: run.dispatches,
     blockMs: Number(blockMs.toFixed(2)),
+    wallPerBlockMs: Number((run.wallMs / run.blocksRun).toFixed(1)),
+    encodePerBlockMs: Number((run.encodeMs / run.blocksRun).toFixed(1)),
     stackMs: Number((blockMs * blockWeights.length).toFixed(0)),
-    kernels: kernels.slice(0, 20),
+    kernels: kernels.slice(0, Number(option(args, "top", "20"))),
   };
 }

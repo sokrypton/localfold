@@ -29,7 +29,11 @@
  * default; see CLAUDE.md's table on where f16 weights buy time and where they
  * do not.
  */
-import { createTransitionShader, packTransitionWeights } from "../../src/af3/transition-webgpu.js";
+import {
+  createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
+} from "../../src/af3/transition-webgpu.js";
+import { stagedMatrixStorage } from "../../src/runtime/matrix-linear.js";
+import { deviceMatrixConfig } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -116,7 +120,8 @@ export async function main(device, args) {
     t2: [/let w = weights\[W_T2 \+ \(chunk0 \+ slot\) \* CHANNELS \+ c\];/,
          "let w = f32(slot) * 1e-6;"],
   };
-  for (const spec of arms_spec) {
+  // ...the fused arms; `split` is a different shape of arm and is built below.
+  for (const spec of arms_spec.filter((a) => a.split("@")[0] !== "split")) {
     // `8:128@f16` names the tile and chunk, then the element the two staged
     // blocks are held in. The suffix is optional and f32 is what every arm
     // meant before it existed.
@@ -151,17 +156,84 @@ export async function main(device, args) {
       entries: [inputBuffer, weightPrecision === "f16" ? halfWeightBuffer : weightBuffer,
                 outputBuffer].map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
-    arms.push({ spec, pipeline, bindGroup, groups: Math.ceil(rows / Number(tile)), times: [] });
+    arms.push({ spec, passes: [{ pipeline, bindGroup, x: Math.ceil(rows / Number(tile)), y: 1 }],
+                times: [] });
+  }
+
+  // 🔴 `split` IS THE SAME TRANSITION AS THREE PASSES, AND IT IS THE ARM THAT
+  // ANSWERS WHETHER THE FUSION IS STILL PAYING. See the note at the top of
+  // createTransitionSplitShaders: the fused kernel holds the WIDENED row in
+  // workgroup memory, so its row tile - which is all of its weight-read
+  // amortisation - halves every time the channel count doubles. At AF3's 128 it
+  // still wins; at ESMFold2's 256 it does not. `split` takes the buffer
+  // precisions as `split@f16` or `split@f32`, which narrows the two
+  // intermediates and nothing the units do.
+  for (const spec of arms_spec.filter((a) => a.split("@")[0] === "split")) {
+    const [, precision = "f16"] = spec.split("@");
+    const config = deviceMatrixConfig(device, { element: "f16" });
+    if (config === null) continue;
+    const split = createTransitionSplitShaders(
+      { rows, channels, factor }, packed.offsets, 1e-5, "fast",
+      { normalizedStorage: precision, wideStorage: precision,
+        matrix: { result: config.resultComponentType, matrixElement: config.componentType,
+                  tile: { M: config.M, N: config.N, K: config.K } } });
+    const bytes = stagedMatrixStorage({
+      ...split.geometry, tile: { M: config.M, N: config.N, K: config.K },
+      result: config.resultComponentType });
+    if (bytes > device.limits.maxComputeWorkgroupStorageSize) continue;
+    const width = precision === "f16" ? 2 : 4;
+    const normalized = device.createBuffer({ size: rows * channels * width, usage: storage });
+    const wideBuffer = device.createBuffer({
+      size: rows * intermediate * 2 * width, usage: storage });
+    const params = (inner, columns, offset) => upload(
+      new Uint32Array([rows, inner, columns, offset, 0, 0, 0, 0]), GPUBufferUsage.UNIFORM);
+    const built = await Promise.all([split.normalize, split.wide, split.down].map(
+      (code) => device.createComputePipelineAsync({
+        layout: "auto",
+        compute: { module: device.createShaderModule({ code }), entryPoint: "main" } })));
+    const bind = (pipeline, buffers) => device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+    // 🔴 THE THIRD PASS IS RESIDUAL AND THIS BENCH'S OUTPUT IS NOT CLEARED
+    // BETWEEN ROUNDS, so its VALUES drift upward over the timing loop. That is
+    // deliberate and it is why this arm is excluded from the agreement check
+    // below rather than compared against the fused one: the timing is what it
+    // is here and the correctness is check-transition-split.js's job.
+    arms.push({
+      spec, residualDrift: true, times: [],
+      passes: [
+        { pipeline: built[0],
+          bindGroup: bind(built[0], [inputBuffer, weightBuffer, normalized,
+                                     upload(new Uint32Array([rows, channels, 0, 0]),
+                                            GPUBufferUsage.UNIFORM)]),
+          x: Math.ceil(rows / split.tiles.normalizeRows), y: 1 },
+        { pipeline: built[1],
+          bindGroup: bind(built[1], [normalized, weightBuffer,
+                                     params(channels, intermediate * 2, packed.offsets.transition1),
+                                     wideBuffer]),
+          x: Math.ceil(intermediate * 2 / split.tiles.blockColumns),
+          y: Math.ceil(rows / split.tiles.blockRows) },
+        { pipeline: built[2],
+          bindGroup: bind(built[2], [wideBuffer, weightBuffer,
+                                     params(intermediate, channels, packed.offsets.transition2),
+                                     outputBuffer]),
+          x: Math.ceil(channels / split.tiles.blockColumns),
+          y: Math.ceil(rows / split.tiles.blockRows) },
+      ],
+    });
   }
 
   const once = async (arm) => {
     const encoder = device.createCommandEncoder();
     for (let i = 0; i < iterations; i += 1) {
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(arm.pipeline);
-      pass.setBindGroup(0, arm.bindGroup);
-      pass.dispatchWorkgroups(arm.groups);
-      pass.end();
+      for (const step of arm.passes) {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(step.pipeline);
+        pass.setBindGroup(0, step.bindGroup);
+        pass.dispatchWorkgroups(step.x, step.y);
+        pass.end();
+      }
     }
     const start = performance.now();
     device.queue.submit([encoder.finish()]);
@@ -178,20 +250,24 @@ export async function main(device, args) {
   // computes a fraction of the rows and looks like a speedup.
   const outputs = [];
   for (const arm of arms) {
+    if (arm.residualDrift) { outputs.push(null); continue; }
     const encoder = device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(arm.pipeline);
-    pass.setBindGroup(0, arm.bindGroup);
-    pass.dispatchWorkgroups(arm.groups);
-    pass.end();
+    for (const step of arm.passes) {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(step.pipeline);
+      pass.setBindGroup(0, step.bindGroup);
+      pass.dispatchWorkgroups(step.x, step.y);
+      pass.end();
+    }
     encoder.copyBufferToBuffer(outputBuffer, 0, readback, 0, rows * channels * 4);
     device.queue.submit([encoder.finish()]);
     await readback.mapAsync(GPUMapMode.READ);
     outputs.push(new Float32Array(readback.getMappedRange().slice(0)));
     readback.unmap();
   }
-  const reference = outputs[0];
+  const reference = outputs.find((out) => out !== null);
   const relRms = outputs.map((out) => {
+    if (out === null) return null;
     let error = 0, scale = 0;
     for (let i = 0; i < reference.length; i += 1) {
       error += (out[i] - reference[i]) ** 2;
@@ -208,7 +284,10 @@ export async function main(device, args) {
       workgroups: arm.groups,
       ms: Number(median(arm.times).toFixed(3)),
       range: [Math.min(...arm.times), Math.max(...arm.times)].map((v) => Number(v.toFixed(3))),
-      relRmsVsFirst: Number(relRms[index].toExponential(2)),
+      // ...null for the split arm, whose target is residual and therefore
+      // drifts across the timing loop; check-transition-split.js is where it
+      // is compared, on a cleared target.
+      relRmsVsFirst: relRms[index] === null ? null : Number(relRms[index].toExponential(2)),
     })),
   };
 }

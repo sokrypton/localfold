@@ -42,6 +42,7 @@
  * cannot fake, so it is printed with its worst outlier.
  */
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
+import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
@@ -81,6 +82,38 @@ const trimMemory = (snapshot, rows = 12) => ({
 /** 59 residues with side chains of every length; the shape the benches use. */
 const DEFAULT_SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
+/**
+ * The progress stream, bucketed into stages by the size of each step.
+ *
+ * A stage's unit size is its signature - af2Plan gives extra-stack, main-stack,
+ * structure and confidence different ones - so consecutive steps of the same
+ * size are one stage, and a change of size is a boundary. That is enough to
+ * name where a fold's minutes go without the model reporting stage names it
+ * does not currently have.
+ */
+function summariseStages(marks, started) {
+  if (marks.length === 0) return undefined;
+  const runs = [];
+  let previousAt = started;
+  let previousCompleted = 0;
+  for (const [at, completed] of marks) {
+    const units = Math.round(completed - previousCompleted);
+    const last = runs[runs.length - 1];
+    if (last !== undefined && last.units === units) {
+      last.steps += 1;
+      last.ms += at - previousAt;
+    } else {
+      runs.push({ units, steps: 1, ms: at - previousAt });
+    }
+    previousAt = at;
+    previousCompleted = completed;
+  }
+  return runs.map(({ units, steps, ms }) => ({
+    units, steps, seconds: Number((ms / 1000).toFixed(2)),
+    msPerStep: Number((ms / steps).toFixed(1)),
+  }));
+}
+
 export async function main(device, args) {
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
   const family = option(args, "family", "monomer");
@@ -89,9 +122,37 @@ export async function main(device, args) {
   }
   const chainLengths = option(args, "chains", "").split(",").filter(Boolean).map(Number);
   const rows = Number(option(args, "rows", "128"));
+  // 🔴 AF2's TWO STACKS HAVE TWO DEPTHS AND THIS TOOL CONFLATED THEM. The
+  // monomer runs an EXTRA-MSA stack and then the main evoformer, and AlphaFold's
+  // own monomer preset is 512 clusters against 1024 extra - so a single --rows
+  // could express 512/512 or 1024/1024 and not the setting anybody runs.
+  const extraRows = Number(option(args, "extra-rows", String(rows)));
   const recycles = Number(option(args, "recycles", "0"));
   const seed = Number(option(args, "seed", "0"));
+  // 🔴 `--tune=key=value,...`, THE SAME FLAG tools/gpu/fold.js CARRIES, because
+  // AF2 had no way to reach a tuning knob at all - and CLAUDE.md's rule is that
+  // a knob no gate enters is a knob nobody has checked. The checksum below is
+  // the gate: a knob that only reorders work has to leave it untouched.
+  const tune = option(args, "tune", "");
+  if (tune !== "") {
+    const forced = {};
+    for (const pair of tune.split(",").filter(Boolean)) {
+      const at = pair.indexOf("=");
+      if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+      const key = pair.slice(0, at);
+      if (!(key in DEFAULT_TUNING)) {
+        throw new Error(`--tune names ${key}, which is not a tuning knob. `
+          + `Known: ${Object.keys(DEFAULT_TUNING).sort().join(", ")}`);
+      }
+      const raw = pair.slice(at + 1);
+      try { forced[key] = JSON.parse(raw); } catch { forced[key] = raw; }
+    }
+    setDeviceTuning(device, forced);
+  }
   if (!Number.isSafeInteger(rows) || rows < 1) throw new RangeError("rows must be a positive integer");
+  if (!Number.isSafeInteger(extraRows) || extraRows < 1) {
+    throw new RangeError("extra-rows must be a positive integer");
+  }
 
   // ...the LOCAL bundle, by directory rather than through web/model.js's
   // loadModel: that resolves the monomer family to its remote base, and this
@@ -121,7 +182,11 @@ export async function main(device, args) {
   const loadMs = Math.round(performance.now() - loadStart);
 
   const lines = [">query", sequence];
-  for (let row = 1; row < rows; row += 1) {
+  // 🔴 DEEP ENOUGH FOR BOTH CAPS, NOT THE LARGER OF THEM. The clusters are
+  // taken first and the extra rows come out of what is left, so a
+  // max(512, 1024) = 1024-row alignment at 512 clusters leaves only 512 extra -
+  // half the extra stack's work, while the report still says 1024.
+  for (let row = 1; row < rows + extraRows; row += 1) {
     lines.push(`>synthetic${row}`);
     lines.push([...sequence].map((code, column) =>
       (column % (row % 11 + 3) === 0 ? "-" : code)).join(""));
@@ -137,13 +202,26 @@ export async function main(device, args) {
   const regime = multimer
     ? { outerProductMeanFirst: true, positionScale: 20, chainAware: true, chainSequences: chains }
     : {};
+  // 🔴 WHERE A FOLD'S TIME GOES BY STAGE, from the progress stream. The block
+  // profiler sees one evoformer block; a fold is FOUR extra-MSA blocks at the
+  // deeper alignment, then 48 main ones, then the structure module and the
+  // heads, and nothing here said what those four cost. `onProgress` fires once
+  // per block with a running unit count, and a stage's unit size is its
+  // signature - af2Plan gives extra-stack and main-stack different ones - so
+  // the deltas name the stage without the model having to report it. Submission
+  // is windowed and each window ends on `onSubmittedWorkDone`, so this is
+  // GPU-paced to about a window.
+  const stageMarks = [];
+  const onProgress = ({ completed }) => {
+    stageMarks.push([performance.now(), completed]);
+  };
   const started = performance.now();
   const prediction = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
     .predictA3m(
       a3m, weights, featureTables,
-      { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: rows,
+      { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows,
         chainLengths: chains, ...regime },
-      paeBreaks,
+      paeBreaks, undefined, onProgress,
     );
   const elapsed = Math.round(performance.now() - started);
   const final = prediction.final;
@@ -180,10 +258,28 @@ export async function main(device, args) {
     checksum = (checksum + Math.round(atom37[index] * 1000)) | 0;
   }
 
+  // 🔴 AND NOW IT IS A GATE, NOT A REPORT. This tool has printed `caca` since it
+  // was written and nothing ever asserted on it, so an 825-residue fold whose
+  // whole chain had collapsed into a ball two angstroms across - consecutive
+  // alpha carbons 0.06 A apart - passed as "the same fold" for the length of a
+  // campaign, while pLDDT climbed to 69.31 and pTM to 0.9672 and said it was
+  // fine. See docs/AF2.md. Consecutive CA are 3.80 A apart in any real chain;
+  // the bands below are wide enough for a bad PREDICTION and far too narrow for
+  // a broken one. Measured, healthy: median 3.485 to 3.972, worst 1.69 to 4.55.
+  // Measured, broken: median 1.44 to 3.41, worst 0.06 or 7.73 to 70.45.
+  const chainOk = median >= 3.4 && median <= 4.2 && Math.abs(worst - 3.8) <= 2.8;
+  if (!chainOk && option(args, "allow-broken-geometry", null) === null) {
+    throw new Error(
+      `the fold is not a chain: consecutive CA median ${median.toFixed(3)} A, worst `
+      + `${worst.toFixed(2)} A, against 3.80 expected. pLDDT says `
+      + `${final.confidence.meanPlddt.toFixed(2)} and it is not a correctness gate - see `
+      + "docs/AF2.md. Pass --allow-broken-geometry to report anyway.");
+  }
+
   const round = (value, places = 4) => Number(value.toFixed(places));
   return {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
-    family, chains, length, rows, recycles, seed,
+    family, chains, length, rows, extraRows, recycles, seed,
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
     // What the fold left on the device, and in what - the totals alone cannot
     // say which tensor to attack. See src/runtime/device-memory.js.
@@ -191,7 +287,11 @@ export async function main(device, args) {
     meanPlddt: round(final.confidence.meanPlddt, 3),
     ptm: round(final.confidence.ptm, 4),
     ...(final.confidence.iptm === undefined ? {} : { iptm: round(final.confidence.iptm, 4) }),
-    caca: { median: round(median, 3), worst: round(worst, 3) },
+    caca: { median: round(median, 3), worst: round(worst, 3), ok: chainOk },
+    stages: summariseStages(stageMarks, started),
+    phases: prediction.stageMilliseconds === undefined ? undefined
+      : Object.fromEntries(Object.entries(prediction.stageMilliseconds)
+        .map(([name, ms]) => [name, Number((ms / 1000).toFixed(2))])),
     checksum,
     // The first and last CA, so a difference has somewhere to be looked at.
     firstCa: [0, 1, 2].map((axis) => round(atom37[1 * 3 + axis], 3)),

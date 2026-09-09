@@ -12,7 +12,9 @@
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { assertChainGeometry } from "./chain-geometry.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import {
   confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
@@ -110,6 +112,18 @@ function superpose(model, truth) {
 }
 
 export async function main(device, args) {
+  // 🔴 `--tune=key=value`, THE SAME FLAG fold.js CARRIES. A knob no gate enters
+  // is a knob nobody has checked, and both of this file's kernels choices -
+  // `gridAttendMatrix` and `pairTransitionSplit` - are device-profile knobs.
+  for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
+       .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const target = option(args, "target", "6mrr");
   const crystalText = await (await fetch(`/tools/fixtures/${target}-crystal.pdb`)).text();
   const crystal = readChain(crystalText, option(args, "chain", "A"));
@@ -214,6 +228,14 @@ export async function main(device, args) {
   const wholeMs = Math.round(performance.now() - started);
 
   const geometry = fold.geometry;
+  // 🔴 AND IT GATES NOW. This file's own opening line is "the geometry is the
+  // gate before the fold is", and until this it was the gate before nothing:
+  // the number was computed, reported and never asserted on. See
+  // tools/gpu/chain-geometry.js for what that cost AF2.
+  assertChainGeometry(geometry, {
+    plddt: fold.meanPlddt, doc: "docs/OPENDDE.md and docs/AF2.md",
+    allow: args.includes("--allow-broken-geometry"),
+  });
   // The model's alpha carbons, in residue order.
   const modelCa = [];
   for (let token = 0; token < batch.tokens; token += 1) {

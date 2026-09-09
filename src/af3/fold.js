@@ -301,8 +301,16 @@ export function backboneGeometry(batch, positions) {
     for (let axis = 0; axis < 3; axis += 1) gyration += (positions[ca * 3 + axis] - centre[axis]) ** 2;
   }
 
+  // 🔴 THE WORST CA-CA TRAVELS WITH THE MEDIAN, BECAUSE A COLLAPSE IS NOT
+  // ALWAYS A MEDIAN. AF2's 825-residue collapse had a median of 1.44 and a
+  // worst of 0.06, but the band that catches the other shape of failure - a
+  // chain that is mostly right with one link thrown across the box - is on the
+  // worst alone. See assertChainGeometry in tools/gpu/chain-geometry.js.
+  const worstCaca = caca.reduce(
+    (far, value) => (Math.abs(value - 3.8) > Math.abs(far - 3.8) ? value : far),
+    caca.length === 0 ? NaN : 3.8);
   return {
-    nca: median(nca), cac: median(cac), caca: median(caca),
+    nca: median(nca), cac: median(cac), caca: median(caca), worstCaca,
     gyration: Math.sqrt(gyration / count), residues: count,
   };
 }

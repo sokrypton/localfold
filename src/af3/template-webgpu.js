@@ -434,11 +434,20 @@ export class Af3TemplateEmbedderGpu {
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-template.bias", gridHeads * pairs * 4, storage));
-      const output = keep(this.allocator.allocate(
-        "af3-template.output", pairs * queryChannels * 4, storage | GPUBufferUsage.COPY_SRC));
-      const readback = keep(this.allocator.allocate(
-        "af3-template.readback", pairs * queryChannels * 4,
-        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      // 🔴 `output` AND `readback` ARE ALLOCATED AFTER THE BLOCK LOOP HAS RUN,
+      // WHICH IS WORTH A THIRD OF AN AF3 TRUNK'S PEAK. This stage was the
+      // largest holder of device memory in the whole trunk - 508 MiB of a 575
+      // MiB peak at 400 tokens, against the pairformer's own 66 - because it
+      // allocated everything up front and released it in one `finally`. Its
+      // five pair-sized scratch buffers are DEAD once the last slot has
+      // accumulated, and these two are not needed until after that; taking
+      // them in that order, with a submit between so the encoded passes are
+      // done with the scratch, means the two sets never coexist.
+      //
+      // 🔴 THE SUBMIT IS WHAT MAKES THE RELEASE LEGAL. A released allocation is
+      // destroyed (this allocator does not pool), and destroying a buffer an
+      // encoded-but-unsubmitted pass still references is a use-after-free that
+      // WebGPU reports as a validation error at submit time and not before.
 
       const blockAllocations = [];
       const upload = (label, data) => {
@@ -493,10 +502,6 @@ export class Af3TemplateEmbedderGpu {
         run(`template.accumulate.${slot}`, compiled.accumulate,
             [act, weightBuffer, summed, slotBuffers[slot].repeat], linear[0], linear[1]);
       }
-      run("template.output", compiled.output, [summed, weightBuffer, output],
-          linear[0], linear[1]);
-      encoder.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * queryChannels * 4);
-
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);
       const error = await this.device.popErrorScope();
@@ -504,7 +509,39 @@ export class Af3TemplateEmbedderGpu {
       for (let index = blockAllocations.length - 1; index >= 0; index -= 1) {
         blockAllocations[index].release();
       }
+      // ...the five pair-sized scratch tensors, now that the device is done
+      // with them and before the two output-sized ones exist. See above.
+      for (let index = scratch.length - 1; index >= 0; index -= 1) {
+        scratch[index].release();
+        allocations.splice(allocations.indexOf(scratch[index]), 1);
+      }
+      biasBuffer.release();
+      allocations.splice(allocations.indexOf(biasBuffer), 1);
       if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+
+      const output = keep(this.allocator.allocate(
+        "af3-template.output", pairs * queryChannels * 4, storage | GPUBufferUsage.COPY_SRC));
+      const readback = keep(this.allocator.allocate(
+        "af3-template.readback", pairs * queryChannels * 4,
+        GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+      this.device.pushErrorScope("validation");
+      const finish = this.device.createCommandEncoder({ label: "af3-template-output" });
+      const pass = finish.beginComputePass({ label: "template.output" });
+      pass.setPipeline(compiled.output);
+      pass.setBindGroup(0, this.device.createBindGroup({
+        layout: compiled.output.getBindGroupLayout(0),
+        entries: [summed, weightBuffer, output].map((allocation, binding) => ({
+          binding, resource: { buffer: allocation.buffer },
+        })),
+      }));
+      pass.dispatchWorkgroups(linear[0], linear[1]);
+      pass.end();
+      finish.copyBufferToBuffer(output.buffer, 0, readback.buffer, 0, pairs * queryChannels * 4);
+      this.device.queue.submit([finish.finish()]);
+      const outputError = await this.device.popErrorScope();
+      if (outputError !== null) {
+        throw new Error(`WebGPU validation failed: ${outputError.message}`);
+      }
       await readback.buffer.mapAsync(GPUMapMode.READ);
       const result = new Float32Array(readback.buffer.getMappedRange().slice(0));
       readback.buffer.unmap();

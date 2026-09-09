@@ -26,11 +26,19 @@ import {
   createOuterProductMeanProjectOutputShader,
   OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
   OUTER_PRODUCT_MEAN_PROJECT_SHADER,
-  OPM_PROJECT_OUTPUT_PAIRS,
+  opmProjectOutputPairs,
+  OUTER_PRODUCT_MEAN_SCALE_SHADER,
+  createOuterProductMeanMatrixOutputShader,
+  opmMatrixContract,
+  createOuterProductMeanMatrixContractShader,
+  createOuterProductMeanProjectShader,
+  opmContractPrecision,
   opmProjectTileRows,
   opmProjectTileColumns,
   packOuterProductMeanWeights,
   useOuterFirstContraction,
+  outerFirstLimitBytes,
+  outerFirstPairBlocks,
 
 } from "./outer-product-mean.js";
 import {
@@ -47,7 +55,8 @@ import {
 
 } from "./transition.js";
 import { WebGpuExecution } from "../runtime/execution.js";
-import { createTriangleShaders } from "../triangle/shaders.js";
+import { deviceTuning } from "../runtime/device-profile.js";
+import { createTriangleShaders, LINEAR_GRID_WIDTH } from "../triangle/shaders.js";
 
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 
@@ -57,6 +66,10 @@ struct Parameters {
   query_weight: u32, key_weight: u32, value_weight: u32, gating_weight: u32,
   gating_bias: u32, output_weight: u32, output_bias: u32,
 };
+// 🔴 THE SAME 32768 execution.linearGrid AND execution.rowGrid FOLD AT. A grid
+// is folded into y past this many workgroups in x, so every shader those two
+// dispatch has to put the y term back. See the note on the kv kernel.
+const GRID_WIDTH: u32 = 32768u;
 `;
 
 const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
@@ -67,7 +80,17 @@ const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(4) var<storage, read_write> values: array<f32>;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
+  // 🔴 THE y TERM, WITHOUT WHICH THIS KERNEL SILENTLY STOPPED AT 2,097,152
+  // ELEMENTS. Its dispatch is execution.linearGrid, which folds into y past
+  // 32768 workgroups, and this read id.x alone: every workgroup with a nonzero
+  // y recomputed the FIRST 32768 * 64 elements instead of its own, so the keys
+  // and values past that index were never written at all and the global column
+  // attention read whatever the recycled scratch held. head_dim is 8 here, so
+  // the cap is length * sequences = 262,144 - reached by an extra alignment of
+  // 1024 rows at 256 residues. It cost an 825-residue fold its whole structure:
+  // the chain collapsed into a ball two angstroms across while pLDDT rose to
+  // 69.31. docs/AF2.md has the measurements.
+  let index = id.x + id.y * GRID_WIDTH * 64u;
   if (index >= p.length * p.sequences * p.head_dim) { return; }
   let d = index % p.head_dim; let row = index / p.head_dim;
   var key = 0.0; var value = 0.0;
@@ -79,29 +102,84 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   keys[index] = key; values[index] = value;
 }`;
 
-const GLOBAL_ATTENTION_QUERY_SHADER = `${GLOBAL_ATTENTION_COMMON}
+/**
+ * The global column attention's query: the masked mean over sequences,
+ * projected onto the heads.
+ *
+ * 🔴 THE SAME FAULT THE OUTPUT PROJECTION HAD, one pass earlier. A thread owned
+ * one (column, head, d) and recomputed the column's MEAN OVER EVERY SEQUENCE for
+ * each of the `channels` it contracts - but that mean depends on (column, c)
+ * alone, so all `heads * head_dim` threads of a column computed the same
+ * `channels` means, each a sweep of the whole alignment. At 825 residues and
+ * 1024 rows that is 3.46 G multiply-accumulates issued for 57 M of work,
+ * **60x**, and it measured 34.66 ms.
+ *
+ * A workgroup owns a COLUMN now: it reduces the means once into workgroup
+ * memory - a lane per channel, sweeping the sequences - and then a lane per
+ * (head, d) contracts them. Generated for one shape, like the output kernel.
+ */
+export function createGlobalAttentionQueryShader(channels, heads, headDim) {
+  const gates = heads * headDim;
+  return `${GLOBAL_ATTENTION_COMMON}
+const CHANNELS: u32 = ${channels}u;
+const GATES: u32 = ${gates}u;
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> mask: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> query: array<f32>;
+
+// The column's masked mean, one per channel, computed once for every head.
+var<workgroup> means: array<f32, ${channels}>;
+var<workgroup> reduce: array<f32, 64>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x;
-  if (index >= p.length * p.heads * p.head_dim) { return; }
-  let d = index % p.head_dim; let head = (index / p.head_dim) % p.heads; let column = index / (p.head_dim * p.heads);
-  var denominator = 1e-10; var result = 0.0;
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) { denominator += mask[sequence * p.length + column]; }
-  for (var c = 0u; c < p.channels; c += 1u) {
-    var average = 0.0;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let column = group.x;
+  if (column >= p.length) { return; }
+  let local = local_id.x;
+
+  // ...the denominator, cooperatively and once, where every thread of the
+  // column used to sweep the whole mask for it.
+  var count = 0.0;
+  for (var sequence = local; sequence < p.sequences; sequence += 64u) {
+    count += mask[sequence * p.length + column];
+  }
+  reduce[local] = count;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce[local] += reduce[local + stride]; }
+    workgroupBarrier();
+  }
+  let denominator = 1e-10 + reduce[0];
+
+  // 🔴 A LANE PER CHANNEL, SWEEPING THE SEQUENCES. The alternative - a lane per
+  // sequence, reducing per channel - is CHANNELS barrier trees where this is
+  // none, and the read is the same either way: consecutive lanes take
+  // consecutive channels, which is the contiguous axis of the normalised MSA.
+  for (var c = local; c < CHANNELS; c += 64u) {
+    var total = 0.0;
     for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-      average += normalized[(column * p.sequences + sequence) * p.channels + c]
+      total += normalized[(column * p.sequences + sequence) * CHANNELS + c]
         * mask[sequence * p.length + column];
     }
-    result += average / denominator * weights[p.query_weight + (c * p.heads + head) * p.head_dim + d];
+    means[c] = total / denominator;
   }
-  query[index] = result * inverseSqrt(f32(p.head_dim));
+  workgroupBarrier();
+
+  let scale = inverseSqrt(f32(p.head_dim));
+  for (var slot = local; slot < GATES; slot += 64u) {
+    let head = slot / ${headDim}u;
+    let d = slot % ${headDim}u;
+    var result = 0.0;
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      result += means[c] * weights[p.query_weight + (c * p.heads + head) * p.head_dim + d];
+    }
+    query[column * GATES + slot] = result * scale;
+  }
 }`;
+}
 
 const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;
@@ -139,37 +217,90 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-const GLOBAL_ATTENTION_OUTPUT_SHADER = `${GLOBAL_ATTENTION_COMMON}
-const GRID_WIDTH: u32 = 32768u;
+/**
+ * The global column attention's gated output projection.
+ *
+ * 🔴 IT RECOMPUTED THE GATE ONCE PER OUTPUT CHANNEL, and the gate is a whole
+ * `channels`-long dot product. A thread owned one (row, c_out) and ran
+ *
+ *     for head, for d:  gate = bias + sum_c normalized[row][c] * W[c][head][d]
+ *
+ * inside its own loop - but `gate` does not depend on `c_out`, so all `channels`
+ * threads of a row computed the same `heads * head_dim` gates, each of them
+ * `channels` multiply-adds. At AF2's extra-MSA widths that is 64 threads x 64
+ * gates x 64 terms where 64 gates x 64 terms is the whole job: **33x the
+ * arithmetic**, and it measured **289.93 ms of a 681.61 ms extra-MSA block at
+ * 825 residues and 1024 rows** - 42.5%, the largest kernel in the whole fold and
+ * 450 GFLOP issued to compute 13.8.
+ *
+ * A WORKGROUP owns a row now. It stages the row once, computes one gated value
+ * per lane, and then each lane takes one output channel out of the shared
+ * result. Two 64-term dot products a lane instead of sixty-five.
+ *
+ * 🔴 GENERATED FOR ONE SHAPE, because the staged arrays have to be sized and the
+ * loops want constant bounds - see CLAUDE.md on what a runtime trip count costs
+ * in a short body. The shape is in the pipeline cache key.
+ */
+export function createGlobalAttentionOutputShader(channels, heads, headDim, residual = false) {
+  for (const [name, value] of [["channels", channels], ["heads", heads], ["headDim", headDim]]) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RangeError(`global attention ${name} must be a positive integer; got ${value}`);
+    }
+  }
+  const gates = heads * headDim;
+  // GRID_WIDTH comes from GLOBAL_ATTENTION_COMMON now; it used to be declared
+  // here, which is how the kernel beside this one came to be missing it.
+  return `${GLOBAL_ATTENTION_COMMON}
+const CHANNELS: u32 = ${channels}u;
+const GATES: u32 = ${gates}u;
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> attended: array<f32>;
 @group(0) @binding(2) var<storage, read> weights: array<f32>;
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+// The row, read once for every gate and every output channel that wants it.
+var<workgroup> staged: array<f32, ${channels}>;
+// ...and the gated value per (head, head_dim), which is what the projection
+// contracts over. Computed once instead of once per output channel.
+var<workgroup> gated: array<f32, ${gates}>;
+
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.sequences * p.length * p.channels) { return; }
-  let c_out = index % p.channels; let row = index / p.channels;
-  let column = row % p.length; let sequence = row / p.length;
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= p.sequences * p.length) { return; }
+  let local = local_id.x;
+  let column = row % p.length;
+  let sequence = row / p.length;
+  // ...the normalised tensor is column-major; see the query kernel.
   let normalized_row = column * p.sequences + sequence;
-  var result = weights[p.output_bias + c_out];
-  for (var head = 0u; head < p.heads; head += 1u) {
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      var gate = weights[p.gating_bias + head * p.head_dim + d];
-      for (var c = 0u; c < p.channels; c += 1u) {
-        gate += normalized[normalized_row * p.channels + c]
-          * weights[p.gating_weight + (c * p.heads + head) * p.head_dim + d];
-      }
-      let gated = attended[(column * p.heads + head) * p.head_dim + d] / (1.0 + exp(-gate));
-      result += gated * weights[p.output_weight + (head * p.head_dim + d) * p.channels + c_out];
-    }
+
+  for (var c = local; c < CHANNELS; c += 64u) {
+    staged[c] = normalized[normalized_row * CHANNELS + c];
   }
-  output[index] = result;
+  workgroupBarrier();
+
+  for (var slot = local; slot < GATES; slot += 64u) {
+    let head = slot / ${headDim}u;
+    let d = slot % ${headDim}u;
+    var gate = weights[p.gating_bias + slot];
+    for (var c = 0u; c < CHANNELS; c += 1u) {
+      gate += staged[c] * weights[p.gating_weight + (c * p.heads + head) * p.head_dim + d];
+    }
+    gated[slot] = attended[(column * p.heads + head) * p.head_dim + d] / (1.0 + exp(-gate));
+  }
+  workgroupBarrier();
+
+  for (var c_out = local; c_out < CHANNELS; c_out += 64u) {
+    var result = weights[p.output_bias + c_out];
+    for (var slot = 0u; slot < GATES; slot += 1u) {
+      result += gated[slot] * weights[p.output_weight + slot * CHANNELS + c_out];
+    }
+    output[row * CHANNELS + c_out] ${residual ? "+=" : "="} result;
+  }
 }`;
-const GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER = GLOBAL_ATTENTION_OUTPUT_SHADER.replace(
-  "output[index] = result;", "output[index] += result;",
-);
+}
 
 function uniform(execution, label, data) {
   return execution.upload(label, data, GPUBufferUsage.UNIFORM);
@@ -376,8 +507,10 @@ async function encodeAttention(
     execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
     // The bias reads `normalized` itself unless the caller gave a separate
     // source, so its storage is the normalised one in exactly that case.
-    execution.pipelines.get(`block:attention:pair-bias:${pairBiasStorage}`,
-      createAttentionPairBiasShader(pairBiasStorage)),
+    // ...the HEAD COUNT is in the key because the shader unrolls it; see
+    // createAttentionPairBiasShader.
+    execution.pipelines.get(`block:attention:pair-bias:${pairBiasStorage}:${options.heads}`,
+      createAttentionPairBiasShader(pairBiasStorage, options.heads)),
     execution.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
   ]);
   const rows = options.batch * options.queries;
@@ -479,11 +612,15 @@ async function encodeGlobalAttention(
   const [normalize, kvPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
     execution.pipelines.get("block:global-attention:normalize", ATTENTION_NORMALIZE_SHADER),
     execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
-    execution.pipelines.get("block:global-attention:query", GLOBAL_ATTENTION_QUERY_SHADER),
+    execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
+      createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
     execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    // ...the SHAPE is in the key because the kernel is generated for it; see
+    // createGlobalAttentionOutputShader.
     execution.pipelines.get(
-      residualTarget === undefined ? "block:global-attention:output" : "block:global-attention:output-residual",
-      residualTarget === undefined ? GLOBAL_ATTENTION_OUTPUT_SHADER : GLOBAL_ATTENTION_OUTPUT_RESIDUAL_SHADER,
+      `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}`
+        + `:${shape.cM}:${w.heads}:${headDim}`,
+      createGlobalAttentionOutputShader(shape.cM, w.heads, headDim, residualTarget !== undefined),
     ),
   ]);
   const weights = execution.upload(`${label}.weights`, packed);
@@ -504,14 +641,16 @@ async function encodeGlobalAttention(
   let grid = execution.linearGrid(shape.length * shape.sequences * headDim);
   execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
     grid[0], grid[1], 1, `${label}.kv`);
-  grid = execution.linearGrid(shape.length * w.heads * headDim);
+  // ...ONE WORKGROUP A COLUMN now, not one thread per (column, head, d).
   execution.dispatch(encoder, queryPipeline, [normalized, mask, weights, parameters, query],
-    grid[0], grid[1], 1, `${label}.query`);
+    shape.length, 1, 1, `${label}.query`);
   execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
     shape.length, w.heads, 1, `${label}.flash`);
-  grid = execution.linearGrid(shape.sequences * shape.length * shape.cM);
+  // ...ONE WORKGROUP A ROW now, not one thread an element; see the kernel.
+  const outputRows = shape.sequences * shape.length;
+  const outputGrid = execution.rowGrid(outputRows);
   execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
-    grid[0], grid[1], 1, `${label}.output`);
+    outputGrid[0], outputGrid[1], 1, `${label}.output`);
   return output;
 }
 
@@ -530,24 +669,52 @@ async function encodeOuterProductMean(
     weights: weightsValue,
   };
   const packed = packOuterProductMeanWeights(descriptor);
-  const outerFirst = useOuterFirstContraction(descriptor);
+  // ...against what THIS device will bind, not a 64 MiB constant; see the
+  // note in outer-product-mean.js. Worth 6.8x on a block at 400 residues.
+  const outerFirst = useOuterFirstContraction(
+    descriptor, outerFirstLimitBytes(execution.device));
+  const outputPairs = opmProjectOutputPairs(execution.device);
+  const contractPrecision = opmContractPrecision(execution.device);
+  // 🔴 THE CONTRACTION ON THE MATRIX UNITS, or null for the hand-tiled vector
+  // kernel; see opmMatrixContract. It only applies on the outer-first path,
+  // where the contraction is the GEMM it needs to be.
+  const matrixContract = outerFirst ? opmMatrixContract(execution.device, input) : null;
+  // ...the output projection follows the contraction unless it is turned off on
+  // its own; they are one geometry and two independent kernels.
+  const matrixOutput = deviceTuning(execution.device).opmMatrixOutput === false
+    ? null : matrixContract;
   const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
-    contractPipeline, projectOutputPipeline] = await Promise.all([
+    scalePipeline, contractPipeline, projectOutputPipeline] = await Promise.all([
     execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
-    execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
+    matrixContract === null
+      ? execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER)
+      : execution.pipelines.get("block:opm:project-transposed",
+        createOuterProductMeanProjectShader(undefined, true)),
     execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
     execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
     execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
-    execution.pipelines.get(`block:opm:contract:${input.cOuter}`,
-      createOuterProductMeanContractShader(input.cOuter)),
-    execution.pipelines.get(
-      outerFirst && residualTarget !== undefined
-        ? `block:opm:project-output-residual:${input.cOuter}`
-        : `block:opm:project-output:${input.cOuter}`,
-      outerFirst && residualTarget !== undefined
-        ? createOuterProductMeanProjectOutputShader(input.cOuter, true)
-        : createOuterProductMeanProjectOutputShader(input.cOuter),
-    ),
+    execution.pipelines.get("block:opm:scale", OUTER_PRODUCT_MEAN_SCALE_SHADER),
+    matrixContract === null
+      ? execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
+        createOuterProductMeanContractShader(input.cOuter, contractPrecision))
+      : execution.pipelines.get(
+        `block:opm:contract-matrix:${input.cOuter}:${matrixContract.blockRows}`
+          + `x${matrixContract.blockColumns}x${matrixContract.blockInner}`,
+        createOuterProductMeanMatrixContractShader(input.cOuter, matrixContract)),
+    matrixOutput === null
+      ? execution.pipelines.get(
+        outerFirst && residualTarget !== undefined
+          ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
+          : `block:opm:project-output:${input.cOuter}:${outputPairs}`,
+        createOuterProductMeanProjectOutputShader(
+          input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
+      )
+      : execution.pipelines.get(
+        `block:opm:project-output-matrix:${input.cOuter}:${matrixContract.blockRows}`
+          + `:${residualTarget !== undefined}`,
+        createOuterProductMeanMatrixOutputShader(
+          matrixContract, residualTarget !== undefined),
+      ),
   ]);
   const rows = input.sequences * input.length;
   const pairElements = input.length * input.length * input.cZ;
@@ -558,8 +725,15 @@ async function encodeOuterProductMean(
   const right = execution.allocate("opm.right", rows * input.cOuter);
   const tileCapacity = outerProductMeanTileCapacity(
     input, execution.device.limits.maxStorageBufferBindingSize);
+  // 🔴 A BLOCK OF PAIRS, NOT ALL OF THEM. The intermediate is sized by
+  // outerFirstPairBlocks and no longer by the protein - which is what lets the
+  // fast path run at 825 residues on a device that cannot bind its 2.79 GB.
+  const pairBlocks = outerFirstPairBlocks(
+    descriptor, outerFirstLimitBytes(execution.device),
+    deviceTuning(execution.device).opmPairBlockBytes,
+    matrixContract === null ? 1 : input.length);
   const intermediateElements = outerFirst
-    ? input.length * input.length * input.cOuter * input.cOuter
+    ? pairBlocks[0][1] * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;
   const intermediate = execution.allocate("opm.intermediate", intermediateElements);
   const output = outerFirst && residualTarget !== undefined ? residualTarget
@@ -579,16 +753,60 @@ async function encodeOuterProductMean(
     "opm.project");
   const outputGrid = execution.linearGrid(pairElements);
   if (outerFirst) {
-    // ...both are one workgroup per PAIR; see outer-product-mean.js.
-    const pairGrid = execution.linearGrid(input.length * input.length * 64);
-    execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate],
-      pairGrid[0], pairGrid[1], 1, "opm.contract");
-    // ...its OWN grid, because it carries several pairs a workgroup where the
-    // contraction carries one; they shared `pairGrid` when both were one.
-    const projectOutputGrid = execution.linearGrid(
-      Math.ceil(input.length * input.length / OPM_PROJECT_OUTPUT_PAIRS) * 64);
-    execution.dispatch(encoder, projectOutputPipeline, [intermediate, msaMask, weights, params, output],
-      projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
+    // ...the denominator once for every pair, where project-output used to
+    // compute it per workgroup; see OUTER_PRODUCT_MEAN_SCALE_SHADER.
+    const scale = matrixOutput === null ? undefined
+      : execution.allocate("opm.scale", input.length * input.length);
+    if (scale !== undefined) {
+      const scaleGrid = execution.linearGrid(input.length * input.length);
+      execution.dispatch(encoder, scalePipeline, [msaMask, params, scale],
+        scaleGrid[0], scaleGrid[1], 1, "opm.scale");
+    }
+    for (const [offset, count] of pairBlocks) {
+      const blk = uniform(execution, `opm.pair-block-${offset}`,
+        new Uint32Array([offset, count, 0, 0]));
+      if (matrixContract === null) {
+        // ...both are one workgroup per PAIR; see outer-product-mean.js.
+        const pairGrid = execution.linearGrid(count * 64);
+        execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],
+          pairGrid[0], pairGrid[1], 1, "opm.contract");
+      } else {
+        // 🔴 A GEMM OVER THE BLOCK'S ROWS OF `i`. The block is a whole number of
+        // them, so `left` is bound as a VIEW starting at this block's first
+        // residue and the kernel's row index is local - which is what lets the
+        // store index by pair and leaves project-output alone.
+        const blockRows = (count / input.length) * input.cOuter;
+        const columns = input.length * input.cOuter;
+        const matrixParams = uniform(execution, `opm.matmul-${offset}`, new Uint32Array([
+          blockRows, input.sequences, columns, 0, 0, 0, input.length, 0,
+        ]));
+        const first = (offset / input.length) * input.cOuter * input.sequences;
+        execution.dispatch(encoder, contractPipeline,
+          [execution.view(left, first, blockRows * input.sequences), right, matrixParams,
+            intermediate],
+          Math.ceil(columns / matrixContract.blockColumns),
+          Math.ceil(blockRows / matrixContract.blockRows), 1, "opm.contract");
+      }
+      if (matrixOutput === null) {
+        // ...its OWN grid, because it carries several pairs a workgroup where
+        // the contraction carries one; they shared `pairGrid` when both were one.
+        const projectOutputGrid = execution.linearGrid(
+          Math.ceil(count / outputPairs) * 64);
+        execution.dispatch(encoder, projectOutputPipeline,
+          [intermediate, msaMask, weights, params, output, blk],
+          projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
+      } else {
+        // 🔴 THE SAME GEMM SHAPE AS THE CONTRACTION, one step on: rows are this
+        // block's pairs, the inner extent is c_outer^2, the columns are c_z.
+        const matrixOutputParams = uniform(execution, `opm.matmul-out-${offset}`,
+          new Uint32Array([count, input.cOuter * input.cOuter, input.cZ,
+            packed.offsets[6], packed.offsets[7], 0, offset, 0]));
+        execution.dispatch(encoder, projectOutputPipeline,
+          [intermediate, weights, matrixOutputParams, output, scale],
+          Math.ceil(input.cZ / matrixContract.blockColumns),
+          Math.ceil(count / matrixContract.blockRows), 1, "opm.project-output");
+      }
+    }
   } else {
     execution.endComputePass(encoder);
     encoder.clearBuffer(output.allocation.buffer);
@@ -620,7 +838,15 @@ async function encodeTriangleMultiplication(
 ) {
   const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
   const packed = packTriangleWeights(weightsValue, "f32");
-  const shaders = createTriangleShaders(shape, "f32", packed.offsets, 1e-5, direction);
+  // 🔴 THE PROJECTION TILE IS THE DEVICE'S, WHICH AF3 HAS ASKED FOR SINCE THE
+  // KNOB EXISTED AND AF2 NEVER DID. It is an occupancy choice - the same two
+  // kernels, the same arithmetic in the same order, relRMS 0 - and this path
+  // was taking src/triangle/shaders.js's default on every device while the
+  // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
+  // so a device with no prior is unchanged.
+  const projectTile = deviceTuning(execution.device).trianglePairProjectTile ?? undefined;
+  const shaders = createTriangleShaders(
+    shape, "f32", packed.offsets, 1e-5, direction, "two-pass", projectTile);
   // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
   // replacement on the finished WGSL; when the kernel's writeback was rewritten
   // the pattern stopped matching, and a replacement that matches nothing throws
@@ -628,7 +854,8 @@ async function encodeTriangleMultiplication(
   // of adding to it, on the shipped AF2 path only.
   const residualShaders = createTriangleShaders(
     shape, "f32", packed.offsets, 1e-5, direction, "two-pass", shaders.projectTile, true);
-  const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`;
+  const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
+    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
   const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput] = await Promise.all([
     execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
     execution.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),
@@ -647,23 +874,42 @@ async function encodeTriangleMultiplication(
   const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
   const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
   const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
-  const normalizeGroups = Math.ceil(pairs / shaders.normalizeRows);
-  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized], normalizeGroups, 1, 1,
+  // 🔴 FOLDED OVER x AND y, for the same reason the projection below is folded
+  // over y and z: there are n^2 pair rows and `ceil(pairs / normalizeRows)`
+  // passes 65535 at 825 residues. The kernel reads
+  // `base_row = (group.x + group.y * LINEAR_GRID_WIDTH) * NORMALIZE_ROWS`, and
+  // rowGrid's width is that same 32768.
+  const normalizeGrid = execution.rowGrid(Math.ceil(pairs / shaders.normalizeRows));
+  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized],
+    normalizeGrid[0], normalizeGrid[1], 1,
     `triangle.${direction}.normalize-input`);
   let grid = execution.linearGrid(pairs * input.triangleHidden);
+  // 🔴 ROWS OVER y AND z, WHICH src/multimer/block.js HAS DONE ALL ALONG AND
+  // THIS DID NOT. x is the channel tile, so n^2 pair rows have nowhere else to
+  // go, and `ceil(pairs / projectTile.rows)` passes the 65535 a dimension
+  // allows at **725 residues** with a row tile of 8 - so an 825-residue monomer
+  // refused with "needs 85079 workgroups in y". The SHADER has always folded
+  // (`row0 = (group.y + group.z * PROJECT_GRID_WIDTH) * TILE_ROWS`); only this
+  // caller had not, and its multimer twin twenty files away had. The two paths
+  // share these shaders and diverged in the dispatch, which is the hazard
+  // AGENTS.md names in the other direction.
+  const projectWidth = shaders.projectGridWidth ?? LINEAR_GRID_WIDTH;
+  const projectTiles = Math.ceil(pairs / shaders.projectTile.rows);
+  const projectRows = [Math.min(projectTiles, projectWidth),
+                       Math.ceil(projectTiles / projectWidth)];
   execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
     Math.ceil(input.triangleHidden / shaders.projectTile.columns),
-    Math.ceil(pairs / shaders.projectTile.rows), 1,
+    projectRows[0], projectRows[1],
     `triangle.${direction}.project`);
   execution.dispatch(encoder, contract, [a, b, contracted],
     Math.ceil(input.length / shaders.contractTile.columns),
     Math.ceil(input.length / shaders.contractTile.rows),
     input.triangleHidden, `triangle.${direction}.contract`);
   execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
-    normalizeGroups, 1, 1, `triangle.${direction}.normalize-hidden`);
+    normalizeGrid[0], normalizeGrid[1], 1, `triangle.${direction}.normalize-hidden`);
   execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
     Math.ceil(input.cZ / shaders.projectTile.columns),
-    Math.ceil(pairs / shaders.projectTile.rows), 1,
+    projectRows[0], projectRows[1],
     `triangle.${direction}.output`);
   return output;
 }
@@ -678,7 +924,7 @@ export async function encodeEvoformerBlock(
   pairMask,
 ) {
   const row = input.weights.msaRowAttention;
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
     channels: input.cM, heads: row.heads, transpose: false, weights: row.attention,
     pairBias: {
@@ -687,52 +933,81 @@ export async function encodeEvoformerBlock(
       projectionWeight: row.pairProjectionWeight,
     },
     label: "msa-row-attention", residualTarget: msa,
-  });
+  }));
 
   const column = input.weights.msaColumnAttention;
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, batch: input.length, queries: input.sequences,
     channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
     label: "msa-column-attention", residualTarget: msa,
-  });
+  }));
 
-  await encodeTransition(
+  await staged(execution, () => encodeTransition(
     execution, encoder, msa, input.sequences * input.length, input.cM,
     input.weights.msaTransition, "msa-transition", msa,
-  );
+  ));
 
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  await staged(execution, async() => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  });
 
-  await encodeTriangleMultiplication(
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
-  );
-  await encodeTriangleMultiplication(
+  ));
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationIncoming, "incoming", pair,
-  );
+  ));
 
   const starting = input.weights.triangleAttentionStarting;
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: input.length, queries: input.length,
     channels: input.cZ, heads: starting.heads, transpose: false, weights: starting.attention,
     pairBias: { source: "normalized-input", projectionWeight: starting.pairProjectionWeight },
     label: "triangle-attention-starting", residualTarget: pair,
-  });
+  }));
 
   const ending = input.weights.triangleAttentionEnding;
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: input.length, queries: input.length,
     channels: input.cZ, heads: ending.heads, transpose: true, weights: ending.attention,
     pairBias: { source: "normalized-input", projectionWeight: ending.pairProjectionWeight },
     label: "triangle-attention-ending", residualTarget: pair,
-  });
+  }));
 
-  await encodeTransition(
+  await staged(execution, () => encodeTransition(
     execution, encoder, pair, input.length * input.length, input.cZ,
     input.weights.pairTransition, "pair-transition", pair,
-  );
+  ));
+}
+
+/**
+ * A sub-layer's scratch, released the moment its residual write is encoded.
+ *
+ * 🔴 THE PAIR TRACK HELD TEN 332 MiB SCRATCH TENSORS AT 825 RESIDUES AND NEEDED
+ * FIVE. Both triangle multiplications write their result into `pair` and run one
+ * after the other, so the outgoing direction's `normalized`, `a`, `b`,
+ * `contracted` and `hidden-normalized` are dead before the incoming direction
+ * allocates its own five - and nothing released them, so the pool grew to hold
+ * both. The same is true of the two triangle attentions and of every residual
+ * sub-layer in the block: each one's scratch dies at its own write.
+ *
+ * 🔴 AND RELEASING INTO THE POOL MID-ENCODER IS SAFE FOR THE REASON THE BLOCK
+ * LOOP ALREADY RELIES ON. A pooled buffer is reused, not destroyed, and the
+ * dispatches that read it were encoded BEFORE the ones that overwrite it - in
+ * the same compute pass, where WebGPU orders dispatches and makes each one's
+ * writes visible to the next. src/evoformer/stack.js does exactly this between
+ * blocks and says so; this does it between sub-layers.
+ *
+ * src/af3/pair-track-gpu.js reached the same conclusion from the other side and
+ * counted its scratch down to five, one of which is shared - see
+ * PAIR_SCRATCH_COUNT.
+ */
+export async function staged(execution, body) {
+  const checkpoint = execution.checkpoint();
+  try { return await body(); } finally { execution.releaseScratchSince(checkpoint); }
 }
 
 export async function encodeEvoformerPairBlock(
@@ -745,17 +1020,19 @@ export async function encodeEvoformerPairBlock(
   msaMask,
   pairMask,
 ) {
-  let update = await encodeOuterProductMean(
-    execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
-  );
-  if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
-  await encodeTriangleMultiplication(
+  await staged(execution, async() => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    );
+    if (update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  });
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
-  );
-  await encodeTriangleMultiplication(
+  ));
+  await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
-  );
-  await encodeAttention(execution, encoder, {
+  ));
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
     weights: weights.triangleAttentionStarting.attention,
@@ -763,8 +1040,8 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionStarting.pairProjectionWeight,
     },
     label: "extra.triangle-attention-starting", residualTarget: pair,
-  });
-  await encodeAttention(execution, encoder, {
+  }));
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
     weights: weights.triangleAttentionEnding.attention,
@@ -772,11 +1049,11 @@ export async function encodeEvoformerPairBlock(
       source: "normalized-input", projectionWeight: weights.triangleAttentionEnding.pairProjectionWeight,
     },
     label: "extra.triangle-attention-ending", residualTarget: pair,
-  });
-  await encodeTransition(
+  }));
+  await staged(execution, () => encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
     weights.pairTransition, "extra.pair-transition", pair,
-  );
+  ));
 }
 
 export async function encodeExtraMsaBlock(
@@ -790,7 +1067,7 @@ export async function encodeExtraMsaBlock(
   pairMask,
 ) {
   const row = weights.msaRowAttention;
-  await encodeAttention(execution, encoder, {
+  await staged(execution, () => encodeAttention(execution, encoder, {
     source: msa, mask: msaMask, pairSource: pair, batch: shape.sequences, queries: shape.length,
     channels: shape.cM, heads: row.heads, transpose: false, weights: row.attention,
     pairBias: {
@@ -799,15 +1076,15 @@ export async function encodeExtraMsaBlock(
       projectionWeight: row.pairProjectionWeight,
     },
     label: "extra.msa-row-attention", residualTarget: msa,
-  });
-  await encodeGlobalAttention(
+  }));
+  await staged(execution, () => encodeGlobalAttention(
     execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,
     "extra.msa-column-global-attention", msa,
-  );
-  await encodeTransition(
+  ));
+  await staged(execution, () => encodeTransition(
     execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
     "extra.msa-transition", msa,
-  );
+  ));
   await encodeEvoformerPairBlock(execution, encoder, shape, weights, msa, pair, msaMask, pairMask);
 }
 

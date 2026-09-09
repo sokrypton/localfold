@@ -76,6 +76,11 @@ export async function main(device, args) {
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
   const recycles = Number(option(args, "recycles", "1"));
   const rows = Number(option(args, "rows", "128"));
+  // 🔴 THE EXTRA ALIGNMENT IS ITS OWN AXIS, and it is the one that breaks a
+  // long fold - see the collapse section in docs/AF2.md. This tool could only
+  // ever set both depths to the same number, so the shape that fails could not
+  // be asked about at all.
+  const extraRows = Number(option(args, "extra", String(rows)));
 
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
@@ -98,15 +103,19 @@ export async function main(device, args) {
   };
 
   const lines = [">query", sequence];
-  for (let row = 1; row < rows; row += 1) {
+  for (let row = 1; row < rows + extraRows; row += 1) {
     lines.push(`>synthetic${row}`);
     lines.push([...sequence].map((code, column) =>
       (column % (row % 11 + 3) === 0 ? "-" : code)).join(""));
   }
   const result = await new AlphaFoldMonomerGpu(device).predictA3m(
     `${lines.join("\n")}\n`, weights, featureTables,
-    { recycles, randomSeed: 0, maxMsaSequences: rows, maxExtraSequences: rows,
-      chainLengths: [sequence.length] },
+    // 🔴 `pairHost: true` OR THERE IS NO PAIR REPRESENTATION TO SCORE. It stays
+    // on the device now - 348 MB at 825 residues that the structure module and
+    // the confidence heads no longer round-trip - and this is the same request
+    // web/app.js makes for the contact overlay.
+    { recycles, randomSeed: 0, maxMsaSequences: rows, maxExtraSequences: extraRows,
+      chainLengths: [sequence.length], pairHost: true },
     paeBreaks,
   );
 

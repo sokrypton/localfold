@@ -16,7 +16,8 @@
  * rather than imported, because a reference sharing code with the thing it
  * checks tests nothing.
  */
-import { AttentionGpu } from "../../src/evoformer/attention.js";
+import { AttentionGpu, selectAttentionFlashKernel } from "../../src/evoformer/attention.js";
+import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -159,6 +160,16 @@ export async function main(device, args) {
   // for q, k, v and the gate; AF2's own inference runs in bfloat16, whose eight
   // mantissa bits are looser again.
   const bounds = { f32: 1e-5, chunk16: 4e-3, f16: 8e-3 };
+  // 🔴 AND THE MATRIX KERNEL IS AN ARITHMETIC CHANGE, NOT A STORAGE ONE, so the
+  // bound follows the KERNEL and not the requested precision. It contracts in
+  // f16 with an f32 accumulator whatever the buffers hold, so an f32 arm that
+  // lands on it measures 2.5e-4 against a bar of 1e-5 - which is not a bug in
+  // either, it is the f32 arm asking for f32 and being handed halves. Where the
+  // device picks it, the f32 arm is ALSO run with it forced off, so whichever
+  // f32 kernel the device would otherwise use keeps a gate at 1e-5 instead of
+  // quietly losing one. On this A100 that arm resolves to the portable kernel
+  // and reads 2.2e-7, which is the number the f32 arm used to report.
+  const matrixBound = 4e-3;
   const results = [];
   let failed = 0;
   for (const requested of precisions) {
@@ -166,7 +177,13 @@ export async function main(device, args) {
       : device.features.has("shader-f16") ? "chunk16" : "f32";
     if (precision !== "f32" && !device.features.has("shader-f16")) continue;
     if (results.some((r) => r.precision === precision)) continue;
-    results.push(await check(device, input, precision, bounds[precision]));
+    results.push(await check(device, input, precision, bounds[precision], matrixBound));
+  }
+  if (deviceTuning(device).attentionMatrix === true) {
+    const previous = deviceTuning(device).attentionMatrix;
+    setDeviceTuning(device, { attentionMatrix: false });
+    results.push(await check(device, input, "f32", bounds.f32, matrixBound, "f32/matrix-off"));
+    setDeviceTuning(device, { attentionMatrix: previous });
   }
   for (const result of results) if (!result.ok) failed += 1;
   if (failed > 0) {
@@ -175,8 +192,16 @@ export async function main(device, args) {
   return { batch, queryLength, channels, heads, results };
 }
 
-async function check(device, input, precision, bound) {
+async function check(device, input, precision, bound, matrixBound, label = null) {
   const { batch, queryLength, channels, heads } = input;
+  // Which kernel this arm actually gets, which is what sets its bar.
+  const variant = selectAttentionFlashKernel(
+    device, channels / heads, "auto",
+    precision === "f32" ? "f32" : "chunk16",
+    precision === "f32" ? {} : { input: "f16", value: "f16", output: "f16" },
+  ).variant;
+  if (variant === "matrix") bound = Math.max(bound, matrixBound);
+  const arm = label ?? `${precision}/${variant}`;
   // 🔴 ONE WORD FOR BOTH HALVES. The flash kernel stages its key and value in
   // f16 and the projection accumulates in it; an arm that narrowed one and not
   // the other would report a number belonging to neither shipped path, and an
@@ -197,8 +222,8 @@ async function check(device, input, precision, bound) {
   }
   const relRms = Math.sqrt(error / scale);
   const ok = relRms <= bound;
-  console.log(`${ok ? "PASS" : "FAIL"}\t${precision}\tbatch ${batch} queries ${queryLength}`
+  console.log(`${ok ? "PASS" : "FAIL"}\t${arm}\tbatch ${batch} queries ${queryLength}`
     + ` heads ${heads}\trelRMS ${relRms.toExponential(2)}\tworst ${worst.toExponential(2)}`
     + `\tbound ${bound.toExponential(0)}`);
-  return { precision, bound, relRms, worst, ok };
+  return { precision, arm, variant, bound, relRms, worst, ok };
 }

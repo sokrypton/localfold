@@ -72,31 +72,87 @@ export function reduceTmScore(term, tokens, selects) {
  * @param {ArrayLike<number>} tmPerBin  bins
  * @returns {Float64Array} tokens * tokens
  */
+/**
+ * Several expectations of ONE softmax over the same logits.
+ *
+ * 🔴 THE PAE HEAD TOOK THE SAME SOFTMAX TWICE, AND IT IS THE SLOWEST THING ON
+ * THE MAIN THREAD. `predictedAlignedError` is the expectation of the bin
+ * CENTRES and the pTM term is the expectation of `1 / (1 + centre^2 / d0^2)` -
+ * the same probabilities, weighted differently - and they were two passes over
+ * `tokens^2 * bins` logits, each calling `Math.exp` on every one. At 825
+ * residues and 64 bins that is **43.6 million exp() calls, twice**: measured
+ * 726 ms and 729 ms, 1.46 s of a 26.4 s fold, on the thread that also has to
+ * paint the page.
+ *
+ * One pass, several weight vectors. The arithmetic per output is unchanged -
+ * same maximum, same denominator, same order - so every score is bit-identical.
+ */
+export function softmaxExpectations(logits, rows, bins, weightSets) {
+  if (logits.length !== rows * bins) {
+    throw new RangeError(`logits should be ${rows * bins} long, not ${logits.length}`);
+  }
+  const outputs = weightSets.map(() => new Float64Array(rows));
+  const sets = weightSets.length;
+  // 🔴 THE ACCUMULATORS ARE LOCALS, WHICH IS WORTH 19% AGAINST 100%. Written
+  // generally - `outputs[set][row] += ...` inside the bin loop - fusing two
+  // expectations cost 1224 ms against 994 for one, when the whole point is that
+  // the second should be nearly free: the exp() calls are shared and only the
+  // multiply-add is not. Typed-array element accumulation is what ate it. The
+  // one and two cases are written out; nothing calls this with more.
+  if (sets === 1 || sets === 2) {
+    const first = outputs[0];
+    const second = sets === 2 ? outputs[1] : first;
+    const firstWeights = weightSets[0];
+    const secondWeights = sets === 2 ? weightSets[1] : firstWeights;
+    for (let row = 0; row < rows; row += 1) {
+      const base = row * bins;
+      // Against the largest logit, because the logits are unbounded and exp()
+      // of them is not.
+      let largest = Number.NEGATIVE_INFINITY;
+      for (let bin = 0; bin < bins; bin += 1) {
+        if (logits[base + bin] > largest) largest = logits[base + bin];
+      }
+      let denominator = 0;
+      let firstTotal = 0;
+      let secondTotal = 0;
+      for (let bin = 0; bin < bins; bin += 1) {
+        const probability = Math.exp(logits[base + bin] - largest);
+        denominator += probability;
+        firstTotal += probability * firstWeights[bin];
+        secondTotal += probability * secondWeights[bin];
+      }
+      first[row] = firstTotal / denominator;
+      if (sets === 2) second[row] = secondTotal / denominator;
+    }
+    return outputs;
+  }
+  for (let row = 0; row < rows; row += 1) {
+    const base = row * bins;
+    let largest = Number.NEGATIVE_INFINITY;
+    for (let bin = 0; bin < bins; bin += 1) {
+      if (logits[base + bin] > largest) largest = logits[base + bin];
+    }
+    let denominator = 0;
+    for (let set = 0; set < sets; set += 1) outputs[set][row] = 0;
+    for (let bin = 0; bin < bins; bin += 1) {
+      const probability = Math.exp(logits[base + bin] - largest);
+      denominator += probability;
+      for (let set = 0; set < sets; set += 1) {
+        outputs[set][row] += probability * weightSets[set][bin];
+      }
+    }
+    for (let set = 0; set < sets; set += 1) outputs[set][row] /= denominator;
+  }
+  return outputs;
+}
+
 export function tmTermFromLogits(logits, tokens, tmPerBin) {
   const bins = tmPerBin.length;
   if (logits.length !== tokens * tokens * bins) {
     throw new RangeError(`PAE logits should be ${tokens * tokens * bins} long,`
       + ` not ${logits.length}`);
   }
-  const term = new Float64Array(tokens * tokens);
-  for (let pair = 0; pair < term.length; pair += 1) {
-    const base = pair * bins;
-    // Softmax and expectation in one pass, against the largest logit, because
-    // the logits are unbounded and exp() of them is not.
-    let largest = Number.NEGATIVE_INFINITY;
-    for (let bin = 0; bin < bins; bin += 1) {
-      if (logits[base + bin] > largest) largest = logits[base + bin];
-    }
-    let denominator = 0;
-    let numerator = 0;
-    for (let bin = 0; bin < bins; bin += 1) {
-      const probability = Math.exp(logits[base + bin] - largest);
-      denominator += probability;
-      numerator += probability * tmPerBin[bin];
-    }
-    term[pair] = numerator / denominator;
-  }
-  return term;
+  return softmaxExpectations(logits, tokens * tokens, bins, [tmPerBin])[0];
 }
 
 /**

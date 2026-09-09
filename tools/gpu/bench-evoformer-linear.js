@@ -163,6 +163,58 @@ const SHAPES = {
   // A square one, so this kernel has a number comparable with anybody's
   // matmul benchmark - jax-js's, for instance.
   square: { rows: 2048, inner: 2048, columns: 2048, activation: 0 },
+  // 🔴 A FLASH ATTENTION'S INNER EXTENT, WHICH IS THE HEAD DIMENSION. The four
+  // flash kernels are 38% of an AF2 block at 825 residues and the only thing
+  // left big enough to close the gap to alphafold2-webgpu - and the question
+  // before writing a tensor-core flash attention is whether the units are any
+  // good at K = 32. docs/A100.md already has 28.2 TFLOP/s at K = 256 and 14.9
+  // at K = 128; this is the next point on that curve, at the M and N a query
+  // tile against a key chunk actually has.
+  headdim: { rows: 824 * 8, inner: 32, columns: 824, activation: 0 },
+  // 🔴 AF2's ATTENTION q/k/v/GATE PROJECTION, WHICH IS FOUR OF THESE. Now that
+  // the flash attentions are on the matrix units, the projections that feed
+  // them are the largest thing in the block that is not: 37.3 ms of q/k/v/gate
+  // and 21.9 of output projection out of 264, at 16.8 TFLOP/s against the 36.0
+  // this card's f16 vector path can reach and the 28.2 its staged matrix form
+  // does. K is 256 and divides by four, which is every condition docs/A100.md
+  // sets. This asks the question before anybody writes the kernel.
+  //
+  // 🔴 AND THE ANSWER IS NO, WHICH SAVED WRITING IT. Measured here:
+  //
+  //     8x8@f16/f16, the vector kernel      3.400 ms   16284 GFLOP/s
+  //     staged128x128x16x1x8@f16            3.675      15065
+  //     staged128x128x32x2x4@f16            4.338      12764
+  //     staged64x64x32x1x4@f16              4.613      12003
+  //     staged128x64x32x2x2@f16             5.963       9286
+  //     staged256x128x32x2x4@f16            6.363       8702
+  //
+  // The 28.2 TFLOP/s in src/runtime/matrix-linear.js is at a WIDER N. At 256
+  // columns a 128-wide block leaves two column blocks to fill an SM with and
+  // the staged form never gets its panel amortised. The shipped projection
+  // beats all of these anyway: it fuses all four matrices over ONE source read
+  // and does 4 x 2.77e10 MACs in 13.17 ms, which is 3.29 ms a matrix against
+  // this best-generic-GEMM's 3.40. There is nothing here to take.
+  qkvg: { rows: 512 * 825, inner: 256, columns: 256, activation: 0 },
+  // 🔴 THE TWO HALVES OF ESMFold2's PAIR TRANSITION, WHICH IS 47-50% OF ITS
+  // TRUNK. docs/A100.md item 9 declined AF3's transitions because they are
+  // FUSED - the widened tensor never reaches global memory - and item 13 asks
+  // whether a staged matrix form could stay fused and still be worth it. Before
+  // anybody writes that kernel, the question is whether the units are any good
+  // at ITS shapes at all, which is what these two are: 300 tokens of a
+  // 256-channel pair track, widened to 2048 and contracted from 1024.
+  //
+  // These are PLAIN GEMMs and the shipped kernel is not one, so a matrix arm
+  // that loses here settles the question and a matrix arm that wins does not -
+  // it only says the fused version is worth costing out. The same asymmetry
+  // `qkvg` above has, and there the answer was no.
+  ef2wide: { rows: 300 * 300, inner: 256, columns: 2048, activation: 1 },
+  ef2down: { rows: 300 * 300, inner: 1024, columns: 256, activation: 0 },
+  // ...and AF3's own pair transition, at 200 tokens, which is the SAME kernel
+  // at half the width. The pair of them is the control: if the fused form only
+  // stops paying at 256 channels then the two models want different answers,
+  // and item 9's conclusion is right for AF3 and wrong for ESMFold2.
+  af3wide: { rows: 200 * 200, inner: 128, columns: 1024, activation: 1 },
+  af3down: { rows: 200 * 200, inner: 512, columns: 128, activation: 0 },
 };
 
 export async function main(device, args) {

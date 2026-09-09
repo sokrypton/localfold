@@ -66,9 +66,15 @@ export class AlphaFoldQueryOnlyGpu {
     onRecycle,
     onProgress,
   ) {
+    // 🔴 THE WHOLE OBJECT, NOT A LIST OF THREE KEYS. This seam has gone stale
+    // twice in this repository already: `src/multimer/model.js` dropped the
+    // multimer regime and ran multimer weights on the monomer graph, and
+    // `predictA3m` dropped `pairHost` when it was added, which took the contact
+    // overlay off the shipped page and broke the one probe that scores it.
+    // `predict` reads the three keys it knows and ignores the rest, so
+    // forwarding the object cannot go stale and an allow-list always can.
     return this.predict(makeQueryOnlyFeatures(sequence, featureTables, options), weights,
-      paeBreaks, onRecycle, onProgress,
-      { tolerance: options.tolerance, signal: options.signal, chainLengths: options.chainLengths });
+      paeBreaks, onRecycle, onProgress, options);
   }
 
   /**

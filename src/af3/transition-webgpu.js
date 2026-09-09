@@ -28,6 +28,7 @@ import { concatenateAs, writeInto } from "../runtime/float16.js";
  * bytes: 1.47 GB at 600 tokens, for a value read once. AF2's kernel chunks rows
  * to survive that; this one never allocates it.
  */
+import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -586,4 +587,317 @@ export class Af3TransitionGpu {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
     }
   }
+}
+
+/**
+ * The same transition, as three passes instead of one.
+ *
+ * 🔴 THE FUSION STOPS PAYING AT 256 CHANNELS, WHICH IS MEASURED AND NOT
+ * ASSUMED. docs/A100.md item 9 declined splitting AF3's transitions because the
+ * fused kernel keeps the widened activation out of global memory, and at AF3's
+ * 128 channels that is right: split into two plain GEMMs it is a WASH (1.134 ms
+ * against 1.138 at 40,000 rows) and the split pays two intermediates for
+ * nothing. At ESMFold2's 256 the same comparison is 7.82 ms against 16.07 - the
+ * fused kernel loses by 2.05x before any matrix units are involved.
+ *
+ * The mechanism is the thing the fusion is for. What it holds in workgroup
+ * memory is the WIDENED row, `2 * channels * factor` floats: 4 KB at 128
+ * channels with a row tile of 16, 8 KB at 256 with the tile collapsed to 4 -
+ * and the tile is the whole of its weight-read amortisation. Per row it is
+ * 28.5 ns for AF3 and 178.6 for ESMFold2 at exactly four times the work, which
+ * is 1.57x worse per multiply-add. The fusion's cost scales with the channel
+ * count and its benefit does not.
+ *
+ * 🔴 AND THE SWISH GATE IS NOT A PASS. Fusing it into the FIRST projection's
+ * epilogue is impossible at any block width - it pairs column `i` with column
+ * `i + hidden`, `hidden` columns apart, which is a different workgroup - and as
+ * its own elementwise pass it costs a rows x hidden tensor and 553 MB of
+ * traffic at 300 tokens. `createStagedMatrixShader`'s `sourceGate` applies it
+ * where the SECOND projection stages its operand, which is one extra vec4 read
+ * in a loop that already runs. So it is three passes: normalise, widen,
+ * contract-with-the-gate.
+ *
+ * @param {{rows, channels, factor}} shape
+ * @param {object} offsets from packTransitionWeights
+ * @param {{normalizedStorage?, wideStorage?, geometry?, weightPrecision?, matrix?}} [options]
+ */
+export function createTransitionSplitShaders(shape, offsets, epsilon, variance, options = {}) {
+  const { rows, channels, factor } = shape;
+  const intermediate = channels * factor;
+  const wide = intermediate * 2;
+  const normalizedStorage = options.normalizedStorage ?? "f16";
+  const wideStorage = options.wideStorage ?? "f16";
+  const weightPrecision = options.weightPrecision ?? "f32";
+  const matrix = options.matrix ?? {};
+  // 🔴 THE VEC4 STAGING NEEDS EVERY EXTENT IT FORMS AN OFFSET FROM DIVISIBLE BY
+  // FOUR, AND THAT INCLUDES THE GATE'S. A vec4 read at element i returns
+  // i & ~3 upward, so an odd stride shifts the value half against the gate.
+  const vectorStaging = [channels, intermediate, wide].every((v) => v % 4 === 0);
+
+  // 🔴 THE NORMALISE IS ITS OWN PASS BECAUSE A LAYER NORM IS A ROW REDUCTION
+  // AND THE GEMM STAGES A K-SLICE. There is no hook in a staged matmul that can
+  // see a whole row, so this is the one part of the fused kernel that has to
+  // come out whole. It is cheap: `tri.normalize` is 1.5% of an ESMFold2 trunk
+  // at the same shape and this is the same kernel.
+  const NORMALIZE_ROWS = 8;
+  const LANES = 64;
+  const LANES_PER_ROW = LANES / NORMALIZE_ROWS;
+  const w = (expression) => (weightPrecision === "f16" ? `f32(${expression})` : expression);
+  const normalizeVariance = variance === "fast"
+    ? "let variance = row_squares[slot] / f32(CHANNELS) - mean * mean;"
+    : `var centered = 0.0;
+    for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
+      let d = tile[slot * CHANNELS + c] - mean;
+      centered += d * d;
+    }
+    partial_sum[local] = centered;
+    workgroupBarrier();
+    for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
+      if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
+      workgroupBarrier();
+    }
+    let variance = partial_sum[slot * LANES_PER_ROW] / f32(CHANNELS);`;
+
+  const normalize = `${normalizedStorage === "f16" || weightPrecision === "f16" ? "enable f16;\n" : ""}
+// 🔴 THE ROW COUNT IS A UNIFORM, NOT A CONSTANT, BECAUSE THE ROWS ARE CHUNKED.
+// The widened activation is 369 MiB at 300 ESMFold2 tokens, so a caller walks
+// the rows in chunks and the last one is ragged - see
+// transitionSplitChunkRows. Baking the count would need a second shader for
+// the tail, and the two would then be a pair that can drift.
+struct NormalizeParameters { rows: u32, channels: u32, padding: vec2<u32> };
+const CHANNELS: u32 = ${channels}u;
+const NORMALIZE_ROWS: u32 = ${NORMALIZE_ROWS}u;
+const LANES_PER_ROW: u32 = ${LANES_PER_ROW}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+const EPSILON: f32 = ${epsilon};
+const W_SCALE: u32 = ${offsets.inputLayerNormScale}u;
+const W_OFFSET: u32 = ${offsets.inputLayerNormOffset}u;
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightPrecision}>;
+@group(0) @binding(2) var<storage, read_write> normalized: array<${normalizedStorage}>;
+@group(0) @binding(3) var<uniform> p: NormalizeParameters;
+
+// 🔴 A ROW A THREAD IS THE WRONG SHAPE FOR A LAYER NORM - a thread walking its
+// own row reads CHANNELS * 4 bytes from its neighbours and pulls a cache line
+// to use four bytes of it. Staged, both the load and the writeback are
+// consecutive-lane-consecutive-address. Same finding as grid.normalize and
+// src/triangle/shaders.js's input normalisation.
+var<workgroup> tile: array<f32, ${NORMALIZE_ROWS * channels}>;
+var<workgroup> partial_sum: array<f32, ${LANES}>;
+var<workgroup> row_squares: array<f32, ${NORMALIZE_ROWS}>;
+var<workgroup> row_mean: array<f32, ${NORMALIZE_ROWS}>;
+var<workgroup> row_inverse_std: array<f32, ${NORMALIZE_ROWS}>;
+
+@compute @workgroup_size(${LANES})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  // 🔴 THE FOLDED GRID'S y TERM. Past 32768 workgroups the caller folds into y,
+  // and a kernel that reads only .x recomputes the first row block once per y
+  // row and never writes its own - silently. See CLAUDE.md.
+  let base_row = (group.x + group.y * GRID_WIDTH) * NORMALIZE_ROWS;
+  if (base_row >= p.rows) { return; }
+  let local = local_id.x;
+
+  // The tail is zeroed rather than skipped: the reduction runs over the whole
+  // staged block.
+  for (var index = local; index < NORMALIZE_ROWS * CHANNELS; index += ${LANES}u) {
+    let row = base_row + index / CHANNELS;
+    tile[index] = select(0.0, input[row * CHANNELS + index % CHANNELS], row < p.rows);
+  }
+  workgroupBarrier();
+
+  let slot = local / LANES_PER_ROW;
+  let lane = local % LANES_PER_ROW;
+  var total = 0.0;
+  var squares = 0.0;
+  for (var c = lane; c < CHANNELS; c += LANES_PER_ROW) {
+    let value = tile[slot * CHANNELS + c];
+    total += value;
+    squares += value * value;
+  }
+  partial_sum[local] = total;
+  workgroupBarrier();
+  for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
+    if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
+    workgroupBarrier();
+  }
+  let mean = partial_sum[slot * LANES_PER_ROW] / f32(CHANNELS);
+  workgroupBarrier();
+  partial_sum[local] = squares;
+  workgroupBarrier();
+  for (var step = LANES_PER_ROW / 2u; step > 0u; step >>= 1u) {
+    if (lane < step) { partial_sum[local] += partial_sum[local + step]; }
+    workgroupBarrier();
+  }
+  if (lane == 0u) { row_squares[slot] = partial_sum[local]; }
+  workgroupBarrier();
+  ${normalizeVariance}
+  if (lane == 0u) {
+    row_mean[slot] = mean;
+    row_inverse_std[slot] = inverseSqrt(variance + EPSILON);
+  }
+  workgroupBarrier();
+
+  // 🔴 A LANE OWNS A PAIR OF CHANNELS, WHICH IS THE WHOLE 32-BIT WORD THEY
+  // SHARE. Writing one f16 at a time makes two lanes write the two halves of
+  // one word, and the hardware turns that into a read-modify-write it does not
+  // charge for anywhere legible. The triangle's own layer norm beside this has
+  // always paired them and says so; this did not, and measured 408 GB/s against
+  // its 815 on the same shape.
+  const PAIR_COUNT: u32 = CHANNELS / 2u;
+  for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += ${LANES}u) {
+    let slot_of = word / PAIR_COUNT;
+    let row = base_row + slot_of;
+    if (row >= p.rows) { continue; }
+    let c = (word % PAIR_COUNT) * 2u;
+    let index = slot_of * CHANNELS + c;
+    let centre = row_mean[slot_of];
+    let inverse = row_inverse_std[slot_of];
+    let low = (tile[index] - centre) * inverse
+      * ${w("weights[W_SCALE + c]")} + ${w("weights[W_OFFSET + c]")};
+    let high = (tile[index + 1u] - centre) * inverse
+      * ${w("weights[W_SCALE + c + 1u]")} + ${w("weights[W_OFFSET + c + 1u]")};
+    normalized[row * CHANNELS + c] = ${normalizedStorage}(low);
+    normalized[row * CHANNELS + c + 1u] = ${normalizedStorage}(high);
+  }
+}`;
+
+  const geometry = {
+    blockRows: 128, blockColumns: 128, blockInner: 32,
+    subgroupRows: 2, subgroupColumns: 4, ...matrix,
+  };
+  const staged = (extra) => createStagedMatrixShader({
+    ...geometry, vectorStaging, bias: false, weightPrecision, ...extra,
+  });
+
+  return {
+    normalize,
+    // normalized (rows x channels) x transition1 (channels x wide) -> wide.
+    wide: staged({
+      sourcePrecision: normalizedStorage, outputPrecision: wideStorage,
+    }),
+    // ...and the gate is applied HERE, where the operand is staged, so the
+    // hidden activation never exists as a tensor at all.
+    down: staged({
+      sourcePrecision: wideStorage, outputPrecision: "f32", residual: true,
+      sourceGate: { stride: wide, offset: intermediate },
+    }),
+    shape: { rows, channels, intermediate, wide },
+    geometry,
+    tiles: { normalizeRows: NORMALIZE_ROWS, blockRows: geometry.blockRows,
+             blockColumns: geometry.blockColumns },
+  };
+}
+
+/**
+ * The channel width at which splitting the transition starts to pay.
+ *
+ * 🔴 IT IS A WIDTH RULE BECAUSE THE MEASUREMENT IS MONOTONE IN THE WIDTH, and
+ * the reason is mechanical: the fused kernel holds the WIDENED row in workgroup
+ * memory, so its row tile - all of its weight-read amortisation - halves each
+ * time the channels double. Against the fused kernel's own best tile at 200
+ * tokens (tools/gpu/bench-transition.js --channels=N --arms=4,8:128,16:128,split):
+ *
+ *     channels    fused    split   speedup   who runs it
+ *          128    1.100    0.969      1.13   AlphaFold 3
+ *          256    7.156    2.588      2.77   ESMFold2
+ *          384   19.606    5.288      3.71   OpenDDE
+ *
+ * 🔴 AND THE SPLIT IS NOT FREE: it brings back the widened activation the
+ * fusion exists to avoid, chunked, which is 72 MiB of device memory at the
+ * default chunk. At 256 channels that buys 1.51x on an ESMFold2 trunk; at AF3's
+ * 128 it buys 1.19x on the kernel and **1.8% of the trunk** (390.7 -> 383.9 ms
+ * of GPU at 400 tokens), which is not worth 72 MiB on a device that has a
+ * budget. So the default declines it at 128 and takes it from 192 up, and
+ * `bench-transition.js`'s `split` arm reaches the kernel either way.
+ */
+export const TRANSITION_SPLIT_MIN_CHANNELS = 192;
+
+/**
+ * How many rows one pass of the split transition may cover at once.
+ *
+ * 🔴 THE WIDENED ACTIVATION IS THE WHOLE REASON THE FUSED KERNEL EXISTS, and
+ * the split brings it back: `rows * 2 * channels * factor`, which at ESMFold2's
+ * 300 tokens is 369 MiB in f16 and at 600 is 1.47 GiB. Chunking the rows is
+ * what keeps the split from trading a 2.9x for an allocation nothing can hold -
+ * the same trade `transitionChunkRows` makes for AF2, and for the same reason.
+ *
+ * 🔴 AND THE CHUNK IS A SPEED KNOB AS WELL AS A MEMORY ONE, which the first
+ * version of this did not say. A chunk is dispatched on its own, so a chunk
+ * that does not fill the device leaves it idle - 16,384 rows is 2,048
+ * workgroups of the normalise, 59% of what this card holds, six times a block.
+ * Measured on an ESMFold2 trunk at 300 tokens, GPU time of the three passes:
+ *
+ *     budget    chunk rows   normalise   wide    down    trunk    peak
+ *      64 MiB       16,384        7.77   72.2    57.8    332.7   517.8 MiB
+ *     512 MiB       90,000        5.12   69.1    40.8    310.2   see below
+ *
+ * The `down` pass loses most - 29% - because it is the one whose dispatch is
+ * smallest. So the budget is a tuning knob, `pairTransitionChunkBytes`, and a
+ * device with room should raise it.
+ *
+ * 🔴 AND THE CHUNK IS ALIGNED TO THE BINDING, NOT ONLY TO THE TILE. Each chunk
+ * BINDS the pair at a row offset, and an offset that is not a multiple of
+ * `minStorageBufferOffsetAlignment` is a validation error rather than a slow
+ * path. `channels * 4` is the pair's row stride, so how many rows reach a
+ * 256-byte boundary depends on it.
+ */
+const gcd = (first, second) => {
+  let a = first; let b = second;
+  while (b !== 0) { const remainder = a % b; a = b; b = remainder; }
+  return a;
+};
+
+export function transitionSplitChunkRows(rows, channels, factor, limits = {}) {
+  const targetBytes = limits.targetBytes ?? 64 * 1024 * 1024;
+  const alignment = limits.minStorageBufferOffsetAlignment ?? 256;
+  const blockRows = limits.blockRows ?? 128;
+  // The widened row, in f16 - the biggest of the three tensors a chunk holds.
+  const rowBytes = channels * factor * 2 * 2;
+  const ceiling = Math.min(limits.maxStorageBufferBindingSize ?? Infinity, targetBytes);
+  if (rows * rowBytes <= ceiling) return rows;
+  const pairRowBytes = channels * 4;
+  const offsetRows = alignment / gcd(pairRowBytes, alignment);
+  const step = blockRows * offsetRows / gcd(blockRows, offsetRows);
+  const capacity = Math.floor(ceiling / rowBytes);
+  if (capacity < step) {
+    throw new RangeError("a split transition chunk cannot be aligned inside the binding limit");
+  }
+  return Math.min(rows, Math.floor(capacity / step) * step);
+}
+
+/**
+ * The buffers a split transition needs beyond the pair track's own scratch.
+ *
+ * 🔴 THE CALLER ALLOCATES, BECAUSE encodePairTrack HAS NO ALLOCATOR AND SHOULD
+ * NOT GROW ONE. Three stacks compile this track and each already owns its
+ * buffers' lifetimes; handing the encoder a bag it did not make is how the pair
+ * scratch works and this follows it.
+ *
+ * `parameters` is indexed by ROW COUNT, because a ragged tail chunk is a
+ * different `rows` in the matmul uniform and there are at most two of them.
+ */
+export function allocateTransitionSplit(allocator, shape, keep = (a) => a) {
+  const { rows, channels, factor, chunkRows, precision = "f16", offsets, label = "transition" } = shape;
+  const intermediate = channels * factor;
+  const width = precision === "f16" ? 2 : 4;
+  const normalized = keep(allocator.allocate(
+    `${label}.normalized`, chunkRows * channels * width, GPUBufferUsage.STORAGE));
+  const wide = keep(allocator.allocate(
+    `${label}.wide`, chunkRows * intermediate * 2 * width, GPUBufferUsage.STORAGE));
+  const parameters = new Map();
+  for (const count of new Set([chunkRows, rows % chunkRows].filter((c) => c > 0))) {
+    parameters.set(count, {
+      normalize: keep(allocator.upload(`${label}.p-norm-${count}`,
+        new Uint32Array([count, channels, 0, 0]), GPUBufferUsage.UNIFORM)),
+      wide: keep(allocator.upload(`${label}.p-wide-${count}`,
+        new Uint32Array([count, channels, intermediate * 2, offsets.transition1, 0, 0, 0, 0]),
+        GPUBufferUsage.UNIFORM)),
+      down: keep(allocator.upload(`${label}.p-down-${count}`,
+        new Uint32Array([count, intermediate, channels, offsets.transition2, 0, 0, 0, 0]),
+        GPUBufferUsage.UNIFORM)),
+    });
+  }
+  return { normalized, wide, parameters, chunkRows, precision };
 }
