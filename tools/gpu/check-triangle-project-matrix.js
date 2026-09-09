@@ -72,6 +72,20 @@ export async function main(device, args) {
   const cHidden = Number(option(args, "hidden", String(cZ)));
   const tokens = option(args, "tokens", "40,37,16").split(",").map(Number);
   const bound = Number(option(args, "bound", "8e-3"));
+  // 🔴 THE MATRIX ARM'S WEIGHT BUFFER, AND ITS SECOND INDEXING PATH.
+  // `stagedMatrixDirectWeights` reads the right operand out of the weight
+  // buffer instead of staging it, which needs that buffer to already hold
+  // halves - so the two are one arm here. The VECTOR reference keeps its f32
+  // weights either way, so this arm's residue includes the weights' own
+  // rounding; `--bound=` is what admits it.
+  const weightPrecision = option(args, "weights", "f32");
+  const direct = option(args, "direct", "0") === "1";
+  // The staged GEMM's accumulator width. The device config's own answer is
+  // f32 here and f16 halves the registers it costs, which is the occupancy
+  // this kernel is bound by - so it is a speed knob whose price is exactly
+  // this number.
+  const resultType = option(args, "result", "");
+  const prefetch = option(args, "prefetch", "0") === "1";
 
   const config = deviceMatrixConfig(device, { element: "f16" });
   if (config === null) return { skipped: "no f16 subgroup matrix configuration" };
@@ -82,6 +96,16 @@ export async function main(device, args) {
                    tile: { M: config.M, N: config.N, K: config.K },
                    ...stagedMatrixBlock(option(args, "block", null)
                      ?? deviceTuning(device).stagedMatrixBlock) };
+  if (direct) matrix.directWeights = true;
+  if (prefetch) matrix.prefetch = true;
+  // 🔴 THE CONTRACTION KEEPS THE DEVICE'S OWN RESULT TYPE, which is the rule
+  // the trunk follows and so is the rule this has to check. Its K is the
+  // protein's length where the three projections contract a channel count, and
+  // narrowing it takes a fold to 2178 NaN coordinates - so an arm that narrowed
+  // all four would be checking a configuration nothing may ship.
+  if (resultType !== "") matrix.result = resultType;
+  const contractResult = option(args, "contract-result", config.resultComponentType);
+  const contractMatrix = { ...matrix, result: contractResult };
   const geometry = { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...matrix };
   if (!triangleProjectMatrixFits(geometry, device.limits.maxComputeWorkgroupStorageSize)) {
     return { skipped: "the geometry does not fit this device's workgroup storage" };
@@ -101,7 +125,7 @@ export async function main(device, args) {
     linearGWeight: mk(cZ * cZ, 21), linearGBias: mk(cZ, 22),
   };
   const blocked = packWeights(weights, "f32");
-  const interleaved = packWeights(weights, "f32",
+  const interleaved = packWeights(weights, weightPrecision,
     { abLayout: "interleaved", zgLayout: "transposed", cHidden, cZ });
 
   const storage = GPUBufferUsage.STORAGE;
@@ -143,7 +167,8 @@ export async function main(device, args) {
     const { projectTile, projectGridWidth, ...sources } = createTriangleShaders(
       { length: n, cZ, cHidden }, "f32", blocked.offsets, 1e-5, "outgoing", "two-pass",
       undefined, true);
-    const matrixSource = createTriangleProjectMatrixShader({ cZ, cHidden }, {}, matrix);
+    const matrixSource = createTriangleProjectMatrixShader(
+      { cZ, cHidden }, { weight: weightPrecision }, matrix);
     const [vectorPipe, matrixPipe, outVectorPipe] = await Promise.all(
       [sources.projectAB, matrixSource, sources.projectOutput].map(
         (code) => device.createComputePipelineAsync({
@@ -206,7 +231,8 @@ export async function main(device, args) {
     const outMatrix = upload(seedValues, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
     const hidden = upload(deterministic(pairs * cHidden, 777 + n));
     const gateScratch = device.createBuffer({ size: pairs * cZ * 4, usage: storage });
-    const outSources = createTriangleProjectOutMatrixShaders({ cZ, cHidden }, {}, matrix);
+    const outSources = createTriangleProjectOutMatrixShaders(
+      { cZ, cHidden }, { weight: weightPrecision }, matrix);
     const [gatePipe, projectPipe] = await Promise.all(
       [outSources.gate, outSources.project].map((code) => device.createComputePipelineAsync({
         layout: "auto",
@@ -278,7 +304,7 @@ export async function main(device, args) {
       const { contractTile, ...directed } = createTriangleShaders(
         { length: n, cZ, cHidden }, "f32", blocked.offsets, 1e-5, direction, "two-pass");
       const source = createTriangleContractMatrixShader(
-        { length: n, channels: cHidden }, direction, {}, matrix);
+        { length: n, channels: cHidden }, direction, {}, contractMatrix);
       const [vecPipe, matPipe] = await Promise.all(
         [directed.contract, source].map((code) => device.createComputePipelineAsync({
           layout: "auto",

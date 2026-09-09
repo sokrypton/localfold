@@ -45,14 +45,23 @@ function relativeRms(actual, expected) {
   return Math.sqrt(error / (scale || 1));
 }
 
-export async function main(device) {
+const option = (args, name, fallback) => {
+  const prefix = `--${name}=`;
+  return (args ?? []).find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+export async function main(device, args) {
   // 🔴 THE f32 BUNDLE, NOT THE SHIPPED ONE, AND THAT IS THE WHOLE DIFFERENCE
   // BETWEEN A BUG AND A TOLERANCE. `model-multimer` is int8 at block 64 -
   // `dtype: "int8"` in its manifest - and the numpy reference reads the
   // float32 parameters, so comparing the two reports relRMS 6e-3 on the input
   // term alone and 1.1e-2 at the output. Neither number is a fault in either
   // implementation; both are what int8 costs. Measured both ways below.
-  const store = await HttpTensorStore.open("/model-multimer-f32/manifest.json");
+  // 🔴 A DEFAULT, NOT A CONSTANT - the fourth checker here pinned to a bundle a
+  // box may not have. `/model-multimer/` is the published int8 one; the f32
+  // bundle is a build artefact. See check-af3-msa-block.js for the same fix.
+  const store = await HttpTensorStore.open(
+    option(args, "model", "/model-multimer-f32/manifest.json"));
   const weights = await AlphaFoldFixture.fromStore(store).templateEmbeddingWeights();
   if (weights === undefined) throw new Error("this bundle carries no template embedder");
 

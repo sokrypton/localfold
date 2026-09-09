@@ -59,13 +59,21 @@ function validate(input) {
   }
 }
 
+/**
+ * The properties this packer concatenates, in order.
+ *
+ * 🔴 EXPORTED SO THE DEVICE PATH CANNOT DRIFT FROM THE HOST ONE, the reason
+ * TRANSITION_PACK_ORDER is. Nothing here is reshaped - the outer product mean
+ * indexes every one of its eight tensors in the layout the bundle stores - so
+ * the device pack is this list and nothing else.
+ */
+export const OUTER_PRODUCT_MEAN_PACK_ORDER = [
+  "layerNormScale", "layerNormOffset", "leftWeight", "leftBias",
+  "rightWeight", "rightBias", "outputWeight", "outputBias",
+];
+
 export function packOuterProductMeanWeights(input) {
-  const tensors = [
-    input.weights.layerNormScale, input.weights.layerNormOffset,
-    input.weights.leftWeight, input.weights.leftBias,
-    input.weights.rightWeight, input.weights.rightBias,
-    input.weights.outputWeight, input.weights.outputBias,
-  ];
+  const tensors = OUTER_PRODUCT_MEAN_PACK_ORDER.map((name) => input.weights[name]);
   const offsets = [];
   let size = 0;
   for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
@@ -963,7 +971,17 @@ export function opmMatrixContract(device, input) {
     blockColumns: subgroupColumns * tile.N,
     blockInner: Math.max(16, tile.K),
     subgroupRows, subgroupColumns, tile,
-    result: config.resultComponentType, matrixElement: config.componentType,
+    // 🔴 ONE GEOMETRY, TWO KERNELS, AND ONLY ONE OF THEM MAY NARROW. The output
+    // projection contracts `c_outer^2` - a channel count - and the contraction
+    // contracts the ALIGNMENT DEPTH, which is an input size: its partial sums
+    // are the ones `rowScaleOffset` already exists to keep inside f16's range
+    // at the operand, and an f16 accumulator would put them back outside it.
+    // So `contractResult` carries the device's own answer through to the
+    // contraction whatever the knob says. Same rule as the triangle's.
+    result: deviceTuning(device).stagedMatrixResult ?? config.resultComponentType,
+    contractResult: config.resultComponentType,
+    prefetch: deviceTuning(device).stagedMatrixPrefetch === true,
+    matrixElement: config.componentType,
     // 🔴 A vec4 READ OF BOTH OPERANDS, which docs/A100.md prices at 1.24 -> 0.70
     // ms on the transition - the largest single thing in that kernel after the
     // units themselves. Every extent here divides by four: the alignment depth,
@@ -1053,6 +1071,7 @@ export function createOuterProductMeanMatrixOutputShader(geometry, residual) {
 export function createOuterProductMeanMatrixContractShader(cOuter, geometry) {
   return createStagedMatrixShader({
     ...geometry,
+    ...(geometry.contractResult === undefined ? {} : { result: geometry.contractResult }),
     sourcePrecision: "f32",
     weightPrecision: "f32",
     outputPrecision: "f32",

@@ -129,6 +129,24 @@ try {
   // machine that drifts. --f16=on is the default and is accepted so a script
   // can name both arms symmetrically. NOTE: no backticks in this comment; it
   // is inside the runner page's template literal and one would end it.
+  // 🔴 --no-prior MAKES THIS DEVICE ANSWER AS AN UNRECOGNISED ONE. Two
+  // architectures have priors and every other GPU takes DEFAULT_TUNING; this is
+  // how a machine that HAS a prior measures what the machines that do not are
+  // getting. See ignoreDevicePrior in src/runtime/device-profile.js.
+  // --no-prior alone drops every prior knob; --no-prior=a,b keeps those two AT
+  // THE PRIOR'S OWN VALUES and drops the rest, which is how a sweep asks what
+  // one knob is worth without having to spell an object on a command line.
+  // NOTE: no backticks anywhere in this comment - it is inside the runner
+  // page's template literal and one would end it, which it just did.
+  const priorArg = ${JSON.stringify(moduleArgs)}.find((a) => a === "--no-prior" || a.startsWith("--no-prior="));
+  if (priorArg !== undefined) {
+    const { ignoreDevicePrior } = await import("/src/runtime/device-profile.js");
+    const keep = priorArg.includes("=")
+      ? priorArg.slice("--no-prior=".length).split(",").filter(Boolean) : [];
+    ignoreDevicePrior(device, keep);
+    console.log("[gpu-chrome] device priors ignored"
+      + (keep.length === 0 ? "" : ", keeping " + keep.join(" ")));
+  }
   const f16Arg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--f16="));
   if (f16Arg !== undefined) {
     const { setHalfPrecision } = await import("/src/runtime/device-profile.js");

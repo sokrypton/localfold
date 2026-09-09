@@ -95,6 +95,20 @@ export const DEFAULT_TUNING = Object.freeze({
   // for: past a few hundred tokens the tile no longer starves the device and
   // the split is pure cost. See docs/A100.md.
   diffusionSplitK: null,
+  // 🔴 A STACK'S DISPATCHES SHARE ONE COMPUTE PASS. WebGPU orders them and
+  // makes each one's writes visible to the next, so this is a pure encoding
+  // change - AF3 at 200 steps is 3.03-3.11 s against 3.12-3.16, pLDDT identical.
+  // `profileDevice` sets it false, because one pass a dispatch is the only
+  // shape profile.js can attribute; the profiled number is the slower one.
+  batchComputePasses: true,
+  // 🔴 A DEVICE PACK THAT REFUSES STOPS THE FOLD, unless this says otherwise.
+  // The alternative is what it used to do: fall back to packing on the host,
+  // which is correct, silent, and 300 ms slower - a bug with no symptom but a
+  // number. A bundle that genuinely cannot be decoded on the device (float32,
+  // or a fixture built over plain arrays rather than a store) sets this once;
+  // a descriptor that merely lost its sources on the way through a spread
+  // should fail loudly instead. See DeviceWeightRefusal.
+  allowHostWeightPacking: null,
   // One key per softmax rescale, scalar q.k reduction.
   attentionGroup: 1,
   attentionVectorScore: false,
@@ -277,6 +291,57 @@ export const DEFAULT_TUNING = Object.freeze({
   // so the geometry is the next thing to move rather than another kernel. It is
   // ONE knob until a sweep shows the four want different answers.
   stagedMatrixBlock: null,
+  // 🔴 READ THE RIGHT OPERAND OUT OF THE WEIGHT BUFFER INSTEAD OF STAGING IT.
+  // With `subgroupRows` 1 - which the swept block above has - every subgroup
+  // owns its own columns, so the staged weight panel is read exactly once and
+  // the workgroup memory is a detour; the source panel, which eight subgroups
+  // share, still pays for itself. It is two thirds of the staging, and
+  // tools/gpu/probe-staged-gemm-parts.js prices the staging loop at 3.10 ms of
+  // a 4.58 ms kernel. It needs the weight BUFFER to hold halves, so it comes
+  // with `weightPrecision: "f16"` or it does nothing at all - see
+  // directWeightsAllowed in src/runtime/matrix-linear.js, which is what turns
+  // this request into an answer per kernel.
+  stagedMatrixDirectWeights: null,
+  // 🔴 THE ACCUMULATOR'S WIDTH, null meaning the device config's own. It is not
+  // a throughput knob - probe-matrix-ceiling.js measures 309.7 TFLOP/s into f32
+  // against 310.9 into f16, so the units accumulate in f32 for free - it is a
+  // REGISTER knob. Four f32 results of 16x16 are 32 registers a lane before
+  // anything else, and eight workgroups of 256 threads need 32 registers a
+  // thread in total to fill this card. Halving the accumulator is the only
+  // lever left on the occupancy this kernel is bound by.
+  stagedMatrixResult: null,
+  // 🔴 DOUBLE-BUFFER THE STAGING: issue the next K panel's global reads BEFORE
+  // this panel's multiplies, so their latency is covered by work the workgroup
+  // already has rather than by whatever else the SM happens to hold. Bit-exact
+  // - the same reads in the same order, held in registers for one panel - and
+  // 1.43x on the standalone GEMM with staged weights, 1.33x on top of the
+  // direct read. It needs neither f16 weights nor a narrower accumulator, so it
+  // is the one of these three that costs nothing at all.
+  stagedMatrixPrefetch: null,
+  // 🔴 THE TWO WIDTH RULES, AS KNOBS, BECAUSE THEY WERE CALIBRATED AGAINST A
+  // SLOWER GEMM. TRANSITION_SPLIT_MIN_CHANNELS and
+  // TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS are 192 because at AF3's 128 the split
+  // was 1.8% of a trunk for 72 MiB - measured when the staged matrix kernel ran
+  // at 20.6 TFLOP/s. It runs at 39.3 now, so the width at which the matrix path
+  // starts to pay has moved and nothing could re-measure it without these.
+  // null means the constant in the module that owns the rule.
+  pairTransitionSplitMinChannels: null,
+  triangleProjectMatrixMinChannels: null,
+  // 🔴 GRID ATTENTION'S q/k/v/gate PROJECTION ON THE UNITS. It is the biggest
+  // single pass in an OpenDDE trunk - 386 ms of 1876 at 256 tokens, ahead of
+  // grid.attend - and 58 of AF3's 463. Unlike the triangle's, its weights are
+  // ALREADY interleaved [k][4w + role], because the vector kernel wanted one
+  // vec4 a cell; so this is a shader and not a layout migration. It refuses a
+  // PACKED q/k/v/gate, which is two channels to a word and needs the vector
+  // kernel's ownership rule. See src/af3/grid-project-matrix.js.
+  gridProjectMatrix: null,
+  // 🔴 AF2's q/k/v/gate PROJECTION ON THE UNITS. It is 20% of an evoformer
+  // block at 400 residues and 512 sequences - 12.73 ms of 78.01, the largest
+  // thing in the block still on the vector path - and as one packed GEMM the
+  // same work prices at 3.659 ms against 6.364. It reaches the four matrices
+  // through `weightIndex` rather than a repack, because that buffer is bound by
+  // five shaders. See src/evoformer/attention-project-matrix.js.
+  attentionProjectMatrix: null,
   // 🔴 THE OUTER PRODUCT MEAN'S CONTRACTION IN f16, null meaning f32. Only the
   // STAGED TILE and a per-chunk accumulator narrow; the running total stays
   // f32, so the sum a half carries is bounded by the chunk however deep the MSA
@@ -477,6 +542,46 @@ const PRIORS = new Map([
     // with 2x4 gives it eight, and this kernel is occupancy-bound the way
     // `grid.attend` is not. Re-sweep on another device.
     stagedMatrixBlock: "64x128x16x1x8",
+    // 🔴 ON BY DEFAULT BECAUSE IT IS BIT-EXACT AND FREE. Double-buffering the
+    // staging is the same reads in the same order, held in named registers for
+    // one panel, so check-staged-matrix.js reads relRMS 0 across all 384 cases
+    // and AF2's fold returns the same atom checksum to the integer. Measured
+    // here: ESMFold2's trunk 332.3 -> 276.0 ms, OpenDDE's 2122.4 -> 1876.3,
+    // AF2 at 400 residues 4.418 -> 4.120 s warm. The other two staged-matrix
+    // knobs are trades and stay off; this one is not.
+    stagedMatrixPrefetch: true,
+    // 🔴 THE TWO WIDTH RULES MOVED WHEN THE GEMM GOT FASTER, AND THIS IS WHERE
+    // THAT LANDS. Both constants are 192 because at AF3's 128 pair channels the
+    // matrix path was worth 1.8% for 72 MiB - measured against a staged kernel
+    // running at 20.6 TFLOP/s. It runs at 39.3 now. Re-measured on the AF3
+    // trunk at 256 tokens: 529.6 ms of GPU at 192/192, 493.6 with the split,
+    // 500.6 with the projection, 463.1 with both - 1.14x, and the warm pass
+    // 1040 -> 966 ms.
+    //
+    // 🔴 AND IT IS MORE ACCURATE, NOT LESS. check-af3-block-any.js on that
+    // bundle reads pair 1.15e-1 against a 1.5e-1 bound with the vector kernels
+    // and 3.21e-2 with the matrix ones, single 1.47e-3 against 2.42e-4: the
+    // staged path accumulates in f32 where the vector triangle accumulates in
+    // f16. AF3's default was within 24% of failing its own gate.
+    //
+    // It costs 63.5 MiB at 256 tokens - 545.3 -> 608.8 peak - which is why it
+    // is a PRIOR and not a new constant. A device that has the room says so.
+    pairTransitionSplitMinChannels: 128,
+    triangleProjectMatrixMinChannels: 128,
+    // 🔴 THE BIGGEST SINGLE PASS IN AN OpenDDE TRUNK, HALVED. grid.project
+    // 385.9 -> 192.0 ms there (2.01x) and 58.5 -> 36.0 on AF3 (1.63x); the
+    // trunks 1877.1 -> 1685.9 and 463.9 -> 441.1. It costs no memory and the
+    // differential does not move - AF3's pair 3.21e-2 -> 3.09e-2, OpenDDE's
+    // 1.23e-2 -> 1.30e-2 against a 1.5e-1 bound.
+    gridProjectMatrix: true,
+    // 🔴 AF2's LARGEST REMAINING VECTOR KERNEL. The two q/k/v/gate projections
+    // are 12.75 ms of a 72.31 ms block at 400 residues and 512 sequences; on
+    // the units they are 8.33, so the block is 67.29 and the stack 3471 -> 3230
+    // ms. A warm fold at that shape is 4.123 -> 3.880 s. pLDDT 57.28 -> 57.29
+    // and the first alpha carbon moves 0.13 A, which is the f16 multiply the
+    // matrix units do and the same order as every other kernel here that made
+    // that trade.
+    attentionProjectMatrix: true,
     diffusionTokenTile: { below: 1, atOrAbove: 2, crossover: 175 },
     singleProjectOutLanes: 256,
     trianglePairProjectTile: { rows: 32, columns: 32 },
@@ -661,6 +766,34 @@ const VENDOR_PRIORS = new Map([
 const RECORDED = new WeakMap();
 const OVERRIDES = new WeakMap();
 const CACHE = new WeakMap();
+const UNRECOGNISED = new WeakSet();
+const KEPT = new WeakMap();
+
+/**
+ * Treat this device as one no prior has ever been measured on.
+ *
+ * 🔴 IT IS NOT A TEST HOOK, IT IS THE ONLY WAY TO SEE WHAT MOST USERS GET.
+ * PRIORS has two entries - `ampere` and `metal-3` - and every other GPU in the
+ * world takes DEFAULT_TUNING, which is one M2's answers. Nothing in this
+ * repository could measure what that costs, because the two machines that run
+ * it both HAVE priors. This makes either of them answer as an unrecognised
+ * device does, which is what a probe has to beat and what a probe has to be
+ * measured against.
+ *
+ * `--no-prior` on any GPU tool reaches it; see tools/gpu-chrome.mjs.
+ */
+export function ignoreDevicePrior(device, keep = []) {
+  // 🔴 THE KEPT KNOBS TAKE THEIR VALUES FROM THE PRIOR, NOT FROM THE CALLER,
+  // which is the only way to sweep the object-valued ones. `--tune` splits its
+  // argument on commas and `diffusionTokenTile` is `{below, atOrAbove,
+  // crossover}`, so a knob like that cannot be written on a command line at
+  // all. Naming it here says "restore whatever the prior says" and the value
+  // never has to be spelled.
+  UNRECOGNISED.add(device);
+  KEPT.set(device, new Set(keep));
+  CACHE.delete(device);
+  return device;
+}
 
 /**
  * Remembers what the adapter said about itself, so code holding only a
@@ -710,7 +843,10 @@ export function deviceProfile(device) {
   // CPU at a thousandth of the speed.
   const software = vendor === "google" || architecture === "swiftshader"
     || architecture === "software" || vendor === "mesa";
-  const prior = PRIORS.get(architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
+  const measured = PRIORS.get(architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
+  const kept = KEPT.get(device);
+  const prior = !UNRECOGNISED.has(device) ? measured
+    : Object.fromEntries(Object.entries(measured).filter(([key]) => kept?.has(key)));
   const profile = Object.freeze({
     vendor,
     architecture,

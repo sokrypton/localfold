@@ -22,6 +22,7 @@
  * else's server for no reason.
  */
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
+import { readTensor } from "../src/reference/dtype.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
@@ -195,7 +196,18 @@ export function loadEsmfold2Weights(onProgress,
       towerStore.prefetch();
     }
 
+    // 🔴 AND IT CARRIES THE TWO HALVES A LAZY LOADER NEEDS. `source` hands the
+    // bytes over undecoded so the GPU can dequantise them, and `decode` is the
+    // synchronous host fallback a getter can call. See
+    // src/esmfold2/weights.js: without these the loaders behave exactly as they
+    // did, and with them the denoiser's 1.17 s of int5 decoding and 880 ms of
+    // narrowing both stop happening on the main thread.
     const read = (name) => foldStore.tensor(name);
+    read.source = async (name) => {
+      await foldStore.open(name);
+      return foldStore.tensorSource(name);
+    };
+    read.decode = (source) => readTensor(source.record, source.buffer, source.byteOffset, true);
     const M = foldManifest.trunk;
     const [featuriser, inputsEmbedder, denoiser, encoder, decoder] = await Promise.all([
       featuriserWeights(read),
@@ -258,12 +270,29 @@ export function loadEsmfold2Weights(onProgress,
         // parameters - 723 ms a fold and 2.3 GB of intermediate. The six
         // vectors stay float32: they are the norms, and the tower uploads them
         // as they are.
+        // 🔴 AND THE FOUR ARE OFFERED AS CODES, NOT DECODED. `sources` is what
+        // lets the tower decode them on the DEVICE - measured on a first
+        // ESMFold2 fold, the block reads were 5482 ms of a 7990 ms wall and
+        // this takes the fold to 3.3 s. The getters stay as the fallback for a
+        // bundle the device decoder refuses, and they must be getters or the
+        // decode this exists to skip happens anyway.
         block: async (layer) => {
-          const block = {};
+          const block = { sources: {} };
           for (const leaf of BLOCK_LEAVES) {
             const name = `blocks/${layer}/${leaf}`;
-            block[leaf] = NARROW_LEAVES.has(leaf)
-              ? await towerStore.tensorAsFloat16(name) : await towerStore.tensor(name);
+            if (!NARROW_LEAVES.has(leaf)) {
+              block[leaf] = await towerStore.tensor(name);
+              continue;
+            }
+            await towerStore.open(name);
+            let source;
+            try { source = towerStore.tensorSource(name); } catch { source = undefined; }
+            if (source !== undefined) block.sources[leaf] = source;
+            let decoded;
+            Object.defineProperty(block, leaf, {
+              enumerable: true,
+              get() { return (decoded ??= towerStore.tensorAsFloat16Sync(name)); },
+            });
           }
           return block;
         },

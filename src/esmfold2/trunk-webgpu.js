@@ -21,24 +21,36 @@
  * survives as the thing this is checked bit-identical against, which is the
  * only way to say the skipping skipped nothing else.
  *
- * 🔴 NO RESIDENT WEIGHTS, DELIBERATELY. The whole trunk is 37.9M parameters -
- * 144 MiB in f32, against the 567 MiB an AF3 trunk keeps resident for its
- * single track alone - so the upload is small and the block loop is short.
- * Residency is a trade that pays when the same weights are re-read across
- * recycles; if this trunk's four loops make it pay, it is one call to
- * residentWeightBuffer, the way src/af3/pairformer-block-webgpu.js does it.
+ * 🔴 THIS SAID "NO RESIDENT WEIGHTS, DELIBERATELY" AND THE REASONING WAS WRONG.
+ * It read: the whole trunk is 37.9M parameters, 144 MiB in f32 against the 567
+ * an AF3 trunk keeps resident for its single track alone, so the upload is
+ * small and the block loop is short. That is true of the UPLOAD and says
+ * nothing about the PACK, which is where the time was: packing 24 blocks into
+ * the interleaved layout the matrix projection reads costs **232 ms of host
+ * time** at 256 channels, measured, and this ran it on every pass of every
+ * recycle over weights that never change. A trunk pass was 275.7 ms of GPU in
+ * 701.1 of wall; with residency it is 275.8 in **501.3**.
+ *
+ * A hypothesis written in the same voice as a measurement, and then cited -
+ * which is the failure docs/A100.md exists to prevent and has now recorded
+ * about itself twice.
  */
 import {
   deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
 } from "../runtime/device-profile.js";
 import { stagedMatrixBlock } from "../runtime/matrix-linear.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
+import { residencyAllowed } from "../runtime/device-memory.js";
 import {
   allocateTransitionSplit, packTransitionWeights, TRANSITION_SPLIT_MIN_CHANNELS,
+  TRANSITION_ORDER,
 } from "../af3/transition-webgpu.js";
 import {
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
 } from "../triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
+import { residentPairTrackOnDevice } from "../af3/pair-track-device-weights.js";
+import { residentPackedOnDevice } from "../af3/device-weights.js";
 import { af3TriangleWeights } from "../af3/triangle-webgpu.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
@@ -56,6 +68,15 @@ export class Esmfold2TrunkGpu {
   constructor(device, options = {}) {
     this.device = device;
     this.options = options;
+    // 🔴 THE SAME DEFAULT AF3's PAIRFORMER TAKES, and the same escape: a device
+    // with a memory budget that refuses an allocation drops back to uploading
+    // per pass. See residencyAllowed in src/runtime/device-memory.js.
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
+    // 🔴 THE ARM. A device path with no host path beside it is a path nothing
+    // can be compared against - `check-esmfold2-trunk-pack.js` runs the trunk
+    // both ways over one input and holds them to ZERO differing elements,
+    // because the decode is bit-identical and the layouts are the same.
+    this.devicePairTrack = options.devicePairTrack ?? true;
     this.pipelines = pipelineCacheForDevice(device);
     this.allocator = options.allocator ?? new GpuBufferAllocator(device);
   }
@@ -162,19 +183,47 @@ export class Esmfold2TrunkGpu {
     const splitConfig = deviceMatrixConfig(this.device, { element: "f16" });
     // ...and the block the staged GEMMs share, from the profile; see
     // `stagedMatrixBlock` in src/runtime/device-profile.js.
-    const block = stagedMatrixBlock(tuning.stagedMatrixBlock);
+    const block = {
+      ...stagedMatrixBlock(tuning.stagedMatrixBlock),
+      // A request, not a decision: each kernel asks directWeightsAllowed
+      // whether its own contracted extent and weight buffer can take it.
+      directWeights: tuning.stagedMatrixDirectWeights === true,
+      prefetch: tuning.stagedMatrixPrefetch === true,
+    };
+    // 🔴 THE ACCUMULATOR MAY NARROW WHERE K IS A CHANNEL COUNT AND NOT WHERE IT
+    // IS THE PROTEIN'S LENGTH, and that rule was bisected out of a fold that
+    // came back with every coordinate NaN. `stagedMatrixResult: "f16"` halves
+    // the registers the results cost and is worth 1.19x - and applied to all
+    // five staged GEMMs it destroys the structure. Folding 1QYS one kernel
+    // group at a time: the transition's two projections are fine, the
+    // triangle's three projections are fine, and `tri.contract` alone is 2178
+    // NaN coordinates. Its K is the protein's LENGTH and its operands are two
+    // gated projections multiplied against each other, so its partial sums are
+    // the only ones in the track not bounded by a width - which is the same
+    // distinction the outer product mean's f16 contraction draws.
+    //
+    // So the contraction keeps the device config's own result type whatever the
+    // knob says, and `contractResult` is how that reaches it.
+    const narrowed = (tuning.stagedMatrixResult === null
+      || tuning.stagedMatrixResult === undefined)
+      ? {} : { result: tuning.stagedMatrixResult,
+               contractResult: splitConfig?.resultComponentType };
     // 🔴 ITS OWN KNOB, not derived from the transition's - see the note on
     // projectMatrixConfig in src/af3/pairformer-block-webgpu.js - and its own
     // width rule, which is about precision rather than memory.
     const triangleProjectMatrix = tuning.triangleProjectMatrix === true && splitConfig !== null
-      && channels >= TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS
+      && channels >= (tuning.triangleProjectMatrixMinChannels
+        ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)
       ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
-          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block }
+          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
+          ...narrowed }
       : false;
     const pairTransitionSplit = tuning.pairTransitionSplit === true && splitConfig !== null
-      && channels >= TRANSITION_SPLIT_MIN_CHANNELS
+      && channels >= (tuning.pairTransitionSplitMinChannels
+        ?? TRANSITION_SPLIT_MIN_CHANNELS)
       ? { result: splitConfig.resultComponentType, matrixElement: splitConfig.componentType,
-          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block }
+          tile: { M: splitConfig.M, N: splitConfig.N, K: splitConfig.K }, ...block,
+          ...narrowed }
       : false;
     const pipelines = await compilePairTrack(this.pipelines, {
       n, sample: blocks[0], epsilon, variance, base, channels,
@@ -242,7 +291,8 @@ export class Esmfold2TrunkGpu {
       for (let index = 0; index < blocks.length; index += 1) {
         const pending = [];
         validation.begin();
-        this.#encodeBlock({
+        // eslint-disable-next-line no-await-in-loop
+        await this.#encodeBlock({
           block: blocks[index], n, channels, pipelines, storage, pending, weightPrecision,
           pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer, transitionSplit,
           projectMatrix,
@@ -315,7 +365,7 @@ export class Esmfold2TrunkGpu {
   }
 
   /** One block, submitted as one command buffer. */
-  #encodeBlock(context) {
+  async #encodeBlock(context) {
     const { block, n, channels, pipelines, storage, pending, weightPrecision } = context;
     const { pair, pairMask, scratch, gridAttention, gridHeads, biasBuffer,
             transitionSplit, projectMatrix } = context;
@@ -327,21 +377,91 @@ export class Esmfold2TrunkGpu {
     // 🔴 THE LAYOUT MUST MATCH THE KERNEL THAT WAS COMPILED. `projectMatrix`
     // exists exactly when compilePairTrack chose the interleaved projection,
     // so it is the one thing that decides both.
-    const packed = packPairTrackWeights(block, channels, weightPrecision, gridAttention,
-                                        projectMatrix === undefined ? "blocked" : "interleaved");
+    //
+    // 🔴 AND IT IS PACKED ON DEMAND AND UPLOADED ONCE, EVER, which AF3's
+    // pairformer has done for a long time and this trunk had not. Packing 24
+    // blocks costs **232 ms of host time** on the interleaved layout - measured
+    // on this box, at 256 channels - and this ran it on every pass of every
+    // recycle over weights that never change. A trunk pass is 275.7 ms of GPU
+    // in 701.1 of wall; that packing was more than half of the difference, and
+    // the ~168 MB of writeBuffer behind it was the rest.
+    //
+    // 🔴 RESIDENT IS A TRADE AND THE BUDGET ANSWERS IT, not a guess made in
+    // advance - see the long note in src/af3/pairformer-block-webgpu.js. A
+    // device with no budget set never takes this path.
+    const resident = this.residentWeights
+      ? (label, pack, variant) => ({
+        buffer: residentWeightBuffer(this.device, block, label, pack, variant),
+      })
+      : (label, pack) => upload(label, pack());
+    // 🔴 PACKED LAZILY AND NOT HELD, because residentWeightBuffer calls pack()
+    // only on a MISS: after a block's first encode nothing reads these arrays
+    // again, and a WeakMap keeping them alive cost AF3's page 350 MiB of heap
+    // for nothing.
+    let packedPair;
+    const want = { transition: true, triangles: true, grids: gridAttention };
+    const packedFor = () => (packedPair ??= packPairTrackWeights(
+      block, channels, weightPrecision, gridAttention,
+      projectMatrix === undefined ? "blocked" : "interleaved", want));
+    // The precision and the layout are the cache VARIANT rather than part of
+    // the label, so a device-memory breakdown still reads one row per tensor
+    // and a run that switched either cannot be handed the other's buffer.
+    const variant = `${weightPrecision}:${projectMatrix === undefined ? "b" : "i"}`;
+    // 🔴 THE SAME DEVICE DECODE AF3's PAIRFORMER TAKES, on the same packer.
+    // This trunk shares `packPairTrackWeights` with three AF3 stacks and was
+    // the one caller still building all five on the HOST - measured as 828 ms
+    // in `trunk 0` against 32 for the same block warm, out of a 2.7 s first
+    // fold. `residentPairTrackOnDevice` is that decode, and `want` is what it
+    // could not take, because the packer returns all five from one call and a
+    // caller that stopped binding a buffer was still paying to build it.
+    const onDevice = await residentPairTrackOnDevice(this.device, block, {
+      channels, pairWeightPrecision: weightPrecision,
+      abLayout: projectMatrix === undefined ? "blocked" : "interleaved",
+      resident: this.residentWeights && this.devicePairTrack,
+    });
+    want.triangles = onDevice.want.triangles;
+    want.grids = gridAttention && onDevice.want.grids;
+    // 🔴 AND THE TRANSITION, which is the last host packer this trunk had:
+    // `residentPackStats` measures it at 159 ms of a 1.75 s ESMFold2 fold, over
+    // 24 blocks. It lays four tensors end to end in TRANSITION_ORDER and
+    // reshapes nothing, so it is the contiguous case the decoder started with.
+    const transitionOnDevice = this.residentWeights && this.devicePairTrack
+      ? await residentPackedOnDevice(this.device, {
+          key: block.pairTransition, label: "w.pair-transition",
+          order: TRANSITION_ORDER, weights: block.pairTransition, variant,
+          destination: weightPrecision === "f16" ? "f16" : "f32",
+        })
+      : undefined;
+    want.transition = transitionOnDevice === undefined;
+    const pairTransitionOnDevice = transitionOnDevice === undefined
+      ? undefined : { buffer: transitionOnDevice };
     const weights = {
-      outgoing: upload("w.tri.out", packed.outgoing),
-      incoming: upload("w.tri.in", packed.incoming),
-      transition: upload("w.pair-transition", packed.transition),
+      outgoing: onDevice.buffers.outgoing
+        ?? resident("w.tri.out", () => packedFor().outgoing, variant),
+      incoming: onDevice.buffers.incoming
+        ?? resident("w.tri.in", () => packedFor().incoming, variant),
+      transition: pairTransitionOnDevice ?? resident(
+        "w.pair-transition", () => packedFor().transition, variant),
       ...(gridAttention ? {
-        grid1: upload("w.grid1", packed.grid1),
-        grid2: upload("w.grid2", packed.grid2),
+        grid1: onDevice.buffers.grid1 ?? resident("w.grid1", () => packedFor().grid1, variant),
+        grid2: onDevice.buffers.grid2 ?? resident("w.grid2", () => packedFor().grid2, variant),
       } : {}),
     };
 
     const encoder = this.device.createCommandEncoder({ label: "esmfold2-trunk-block" });
+    // 🔴 ONE PASS A BLOCK, NOT ONE A DISPATCH. WebGPU orders dispatches inside
+    // a compute pass and makes each one's writes visible to the next - which is
+    // what AF2's evoformer stack has always relied on. A block is about thirty
+    // dispatches and an OpenDDE trunk is 1723 of them a pass.
+    // `batchComputePasses` off restores one pass a dispatch, which is what
+    // profile.js needs to attribute anything; see profileDevice.
+    const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+    let openPass = null;
+    const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
-      const pass = encoder.beginComputePass({ label });
+      const pass = batchPasses
+        ? (openPass ??= encoder.beginComputePass({ label: `${label.split(".")[0]}.block` }))
+        : encoder.beginComputePass({ label });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -354,12 +474,13 @@ export class Esmfold2TrunkGpu {
         })),
       }));
       pass.dispatchWorkgroups(x, y, z);
-      pass.end();
+      if (!batchPasses) pass.end();
     };
     encodePairTrack({
       run, pipelines, n, channels, pair, pairMask, scratch, weights,
       gridAttention, gridHeads, biasBuffer, transitionSplit, projectMatrix,
     });
+    endPass();
     this.device.queue.submit([encoder.finish()]);
   }
 }

@@ -52,6 +52,9 @@ function relativeRms(actual, expected) {
 }
 
 export async function main(device, args) {
+  // The pair track's weight element; see bench-trunk.js for why it is its own
+  // knob and why the measurement behind its default is stale.
+  const pairWeightPrecision = option(args, "pair-weights", undefined);
   // 🔴 `--tune=key=value`, BECAUSE A KNOB NO GATE ENTERS IS A KNOB NOBODY HAS
   // CHECKED. Several of this block's kernels are chosen by the device profile -
   // `gridAttendMatrix` among them - and without this flag the only arm ever
@@ -94,11 +97,16 @@ export async function main(device, args) {
   }
 
   const accumulate = option(args, "accumulate", undefined);
+  // 🔴 `--resident` BECAUSE RESIDENCY IS A DIFFERENT WEIGHT PATH, NOT A CACHE.
+  // With it the pair transition is decoded from its int5 codes on the DEVICE
+  // and the host packer never builds it; without it every tensor is packed on
+  // the host. Two paths, and only one of them was ever checked here.
   const stack = new Af3PairformerStackGpu(device, {
-    residentWeights: false,
+    residentWeights: args.includes("--resident"),
     stagedPrecision: option(args, "staged", undefined),
     accumulatePrecision: accumulate,
     weightPrecision: option(args, "weights", undefined),
+    pairWeightPrecision,
   });
   const actual = await stack.run(state, blocks, dialect, {});
 
@@ -143,7 +151,7 @@ export async function main(device, args) {
 
   return {
     model: manifest,
-    n, blocks: count, bound,
+    n, blocks: count, bound, resident: args.includes("--resident"),
     widths: { pairChannels, singleChannels,
               gridHeads: blocks[0].pairAttention1.heads,
               gridDimension: blocks[0].pairAttention1.dimension,

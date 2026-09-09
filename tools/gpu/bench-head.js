@@ -29,7 +29,7 @@ import { normalFrom } from "../../src/af3/fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
 import { profileDevice } from "./profile.js";
-import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
@@ -50,11 +50,18 @@ export async function main(device, args) {
   // `--splitk=8/4` is splits/tile; `--splitk=off` disables it.
   const splitArg = option(args, "splitk", null);
   if (splitArg !== null) {
+    // 🔴 MERGED OVER THIS DEVICE'S OWN SETTING, NOT WRITTEN OVER IT. The prior
+    // carries six fields - splits, tile, crossover, outSplits, attnSplits,
+    // attnTile, normSplits - and replacing the object with two of them moves
+    // five knobs while claiming to sweep one, which is this repository's
+    // recorded way of drawing the wrong conclusion from a clean-looking arm.
+    const current = deviceTuning(device).diffusionSplitK ?? {};
     setDeviceTuning(device, {
       diffusionSplitK: splitArg === "off" ? null
         : (() => {
           const [splits, t] = splitArg.split("/").map(Number);
-          return { splits, tile: t, crossover: 1e9 };
+          return { ...current, splits,
+                   ...(Number.isFinite(t) ? { tile: t } : {}), crossover: 1e9 };
         })(),
     });
   }

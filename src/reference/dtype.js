@@ -261,6 +261,19 @@ export function readTensorRange(record, buffer, byteOffset, first, count, copy =
     if (typeof Float16Array !== "function") {
       throw new Error("this runtime has no Float16Array, and the model scales are float16");
     }
+    // 🔴 THIS PATH IS int5 AT A GROUP OF 32 AND NOTHING ELSE. INT5_GROUP_BYTES
+    // is 20 because 32 x 5 is 160 bits, and the loop below strides by it - so a
+    // bundle exported at any other group would be read at the wrong stride and
+    // decode into a finite, plausible, wrong tensor. The GENERIC branch above
+    // handles any (bits, group) that packs into whole bytes and is only skipped
+    // here because five bits at 32 has an unrolled fast path worth 3.8 s on a
+    // bundle. Caught by tools/gpu/check-quantised-upload.js, which found the
+    // GPU decoder and this one disagreeing by 104,170 of 131,072 elements at
+    // int5 group 64 - and it was this side that was wrong.
+    if (block !== 32) {
+      throw new Error(`int5 at group ${block} is not this decoder's layout;`
+        + " it reads a 20-byte group. Export at group 32 or widen this path.");
+    }
     const groups = Math.ceil(elements / block);
     const codes = new Uint8Array(buffer, byteOffset,
                                  groups * INT5_GROUP_BYTES + 1);

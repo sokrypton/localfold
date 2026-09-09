@@ -35,13 +35,17 @@ import { Af3DiffusionConditioningGpu } from "../../src/af3/diffusion-conditionin
 import { relativeEncoding } from "../../src/af3/embedder-reference.js";
 import { layerNormSlow } from "../../src/af3/atom-encoder-reference.js";
 import { linear } from "../../src/af3/pairformer-reference.js";
-import { openAf3Store } from "../../src/af3/weights.js";
+import { openAf3Store, af3Dialect } from "../../src/af3/weights.js";
+import { conditioningWeights } from "../../src/af3/diffusion-weights.js";
 import { ALPHAFOLD3, OPENBIND0, singleCondPadding } from "../../src/af3/dialect.js";
 
-const HEAD = "diffuser/~/diffusion_head";
-const PAIR_CHANNELS = 128;
-const SEQ_CHANNELS = 384;
-const TARGET_WIDTH = 447;
+// 🔴 NOT CONSTANTS ANY MORE, AND THAT WAS THE WHOLE BUG. These were
+// `PAIR_CHANNELS = 128`, `SEQ_CHANNELS = 384`, `TARGET_WIDTH = 447` typed in
+// from AlphaFold 3, so pointing this checker at OpenDDE's bundle built a
+// fixture at AF3's widths against tensors at OpenDDE's: the reference read off
+// the end of a 256-row projection, both sides went NaN, and `NaN > bound` is
+// false. The widths come from `conditioningWeights` now, which is the loader
+// the fold uses.
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -76,32 +80,19 @@ export async function main(device, args) {
   const tokens = Number(option(args, "n", "24"));
   const chains = Number(option(args, "chains", "3"));
   const noiseLevel = Number(option(args, "noise", "56.0"));
-  const store = await openAf3Store();
-  const T = (name) => store.tensor(`${HEAD}/${name}`);
-
-  const transition = async (prefix) => ({
-    ffwLayerNormScale: await T(`${prefix}ffw_layer_norm/scale`),
-    ffwLayerNormOffset: await T(`${prefix}ffw_layer_norm/offset`),
-    ffwTransition1: await T(`${prefix}ffw_transition1/weights`),
-    ffwTransition2: await T(`${prefix}ffw_transition2/weights`),
-  });
-
-  const weights = {
-    pairChannels: PAIR_CHANNELS, seqChannels: SEQ_CHANNELS,
-    targetFeatWidth: TARGET_WIDTH, relativeWidth: 139,
-    pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
-    pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
-    pairTransitions: [await transition("pair_transition_0"),
-                      await transition("pair_transition_1")],
-    singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
-    singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
-    singleTransitions: [await transition("single_transition_0"),
-                        await transition("single_transition_1")],
-    fourierWeight: await T("fourier_embedding_weight"),
-    fourierBias: await T("fourier_embedding_bias"),
-    noiseEmbeddingInitialNormScale: await T("noise_embedding_initial_norm/scale"),
-    noiseEmbeddingInitialProjection: await T("noise_embedding_initial_projection/weights"),
-  };
+  // 🔴 A DEFAULT, NOT A CONSTANT - the same fault check-af3-msa-block.js and
+  // check-af3-template.js had. Pinned to the float32 bundle this 404s on a box
+  // that has the published int5 one, and this is the checker that answers
+  // whether the GPU conditioning may replace the host one in the
+  // structural-token path. See docs/A100.md.
+  const store = await openAf3Store(option(args, "model", undefined));
+  const dialectOfBundle = af3Dialect(store);
+  const weights = await conditioningWeights(store, dialectOfBundle);
+  const PAIR_CHANNELS = weights.pairChannels;
+  const SEQ_CHANNELS = weights.seqChannels;
+  const TARGET_WIDTH = weights.targetFeatWidth;
+  const TRUNK_PAIR_CHANNELS = weights.trunkPairChannels;
+  const split = weights.zTrunkProjection !== undefined;
 
   const perChain = Math.ceil(tokens / chains);
   const residueIndex = new Int32Array(tokens);
@@ -118,7 +109,7 @@ export async function main(device, args) {
 
   const input = {
     tokens, noiseLevel, dialect: ALPHAFOLD3,
-    trunkPair: deterministic(tokens * tokens * PAIR_CHANNELS, 71 + tokens),
+    trunkPair: deterministic(tokens * tokens * TRUNK_PAIR_CHANNELS, 71 + tokens),
     trunkSingle: deterministic(tokens * SEQ_CHANNELS, 72 + tokens),
     targetFeat: deterministic(tokens * TARGET_WIDTH, 73 + tokens),
     features: { residueIndex, tokenIndex: residueIndex, asymId, entityId, symId },
@@ -127,17 +118,44 @@ export async function main(device, args) {
   // The pair's initial projection on its own. The reference runs a fixed two
   // transitions, so this rebuilds just the first step from its own pieces
   // rather than trying to switch them off.
+  //
+  // 🔴 AND IT IS A GATE NOW, not a printed number. This is the ONE arm that
+  // isolates the pair kernel from the two transitions stacked on it, and it
+  // printed a residual nothing read - which is how a bundle whose pair
+  // conditioning the GPU does not implement at all reached a fold.
+  let initialPair;
   {
     const relative = relativeEncoding(tokens, input.features);
-    const width = PAIR_CHANNELS + 139;
     const pairs = tokens * tokens;
+    // 🔴 TWO COMPRESSIONS OR ONE CONCATENATION, and the bundle says which. See
+    // diffusion-reference.js: OpenDDE LayerNorms the trunk pair on its own
+    // width, projects it to the pair width, projects the relative encoding
+    // separately, and concatenates THOSE.
+    const width = split ? 2 * PAIR_CHANNELS : TRUNK_PAIR_CHANNELS + 139;
     const features2d = new Float32Array(pairs * width);
-    for (let index = 0; index < pairs; index += 1) {
-      for (let c = 0; c < PAIR_CHANNELS; c += 1) {
-        features2d[index * width + c] = input.trunkPair[index * PAIR_CHANNELS + c];
+    if (split) {
+      const compressedTrunk = linear(
+        layerNormSlow(input.trunkPair, pairs, TRUNK_PAIR_CHANNELS,
+                      weights.zTrunkNormScale, null),
+        pairs, TRUNK_PAIR_CHANNELS, PAIR_CHANNELS, weights.zTrunkProjection);
+      const compressedRelative = linear(relative, pairs, 139, PAIR_CHANNELS,
+                                        weights.relpeProjection);
+      for (let index = 0; index < pairs; index += 1) {
+        for (let c = 0; c < PAIR_CHANNELS; c += 1) {
+          features2d[index * width + c] = compressedTrunk[index * PAIR_CHANNELS + c];
+          features2d[index * width + PAIR_CHANNELS + c] =
+            compressedRelative[index * PAIR_CHANNELS + c];
+        }
       }
-      for (let c = 0; c < 139; c += 1) {
-        features2d[index * width + PAIR_CHANNELS + c] = relative[index * 139 + c];
+    } else {
+      for (let index = 0; index < pairs; index += 1) {
+        for (let c = 0; c < TRUNK_PAIR_CHANNELS; c += 1) {
+          features2d[index * width + c] =
+            input.trunkPair[index * TRUNK_PAIR_CHANNELS + c];
+        }
+        for (let c = 0; c < 139; c += 1) {
+          features2d[index * width + TRUNK_PAIR_CHANNELS + c] = relative[index * 139 + c];
+        }
       }
     }
     const reference = linear(
@@ -145,17 +163,34 @@ export async function main(device, args) {
       pairs, width, PAIR_CHANNELS, weights.pairCondInitialProjection);
     const gpuBare = await new Af3DiffusionConditioningGpu(device)
       .run(input, weights, { transitions: 0 });
-    console.log(`  initial pair   ${relativeRms(gpuBare.pair, reference).toExponential(2)}`);
+    initialPair = relativeRms(gpuBare.pair, reference);
+    console.log(`  initial pair   ${initialPair.toExponential(2)}`);
+    if (!(initialPair <= 1e-5)) {
+      const bad = (values) => {
+        let count = 0;
+        for (let i = 0; i < values.length; i += 1) if (!Number.isFinite(values[i])) count += 1;
+        return `${count}/${values.length} non-finite`;
+      };
+      throw new Error(`the pair conditioning's initial projection is `
+        + `${initialPair} against its own reference, over 1e-5. `
+        + `GPU: ${bad(gpuBare.pair)}; reference: ${bad(reference)}`);
+    }
   }
 
   const results = {};
+  const tensors = {};
   const singles = {};
   for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind0", OPENBIND0]]) {
     const arm = { ...input, dialect };
-    const armWeights = padWeights(weights, singleCondPadding(dialect, SEQ_CHANNELS));
+    const armWeights = padWeights(weights, singleCondPadding(dialect, SEQ_CHANNELS),
+                                  SEQ_CHANNELS, TARGET_WIDTH);
     const expected = diffusionConditioning(arm, armWeights);
     const gpu = await new Af3DiffusionConditioningGpu(device).run(arm, armWeights);
     singles[label] = expected.single;
+    tensors[label] = {
+      pair: { gpu: gpu.pair, expected: expected.pair },
+      single: { gpu: gpu.single, expected: expected.single },
+    };
     results[label] = {
       pair: relativeRms(gpu.pair, expected.pair),
       single: relativeRms(gpu.single, expected.single),
@@ -177,16 +212,44 @@ export async function main(device, args) {
 
   const bound = 1e-5;
   const worst = Math.max(...Object.values(results).flatMap((r) => Object.values(r)));
+  // 🔴 A NaN PASSES `worst > bound`, AND ONE WAS PASSING. `NaN > 1e-5` is
+  // FALSE, so a residual that is not a number reads as within bound - and on
+  // OpenDDE's bundle the PAIR arm has been NaN, reported as `null` through
+  // JSON and read by nobody. Every comparison in this repository that is
+  // written `if (x > bound) throw` has the same hole; this one says what it
+  // means instead. See docs/A100.md: it is why the structural-token path still
+  // computes its conditioning on the host.
+  for (const [label, arm] of Object.entries(results)) {
+    for (const [name, value] of Object.entries(arm)) {
+      if (!Number.isFinite(value)) {
+        // 🔴 AND IT SAYS WHICH SIDE, because "NaN" alone sends the next person
+        // to the wrong file. A relRMS is NaN when the GPU's values are, when
+        // the REFERENCE's are, or when both are - and those are three different
+        // bugs in three different places.
+        const side = (values) => {
+          let bad = 0;
+          for (let i = 0; i < values.length; i += 1) if (!Number.isFinite(values[i])) bad += 1;
+          return `${bad}/${values.length} non-finite`;
+        };
+        throw new Error(`${label}'s ${name} residual is ${value}, not a number.`
+          + ` GPU: ${side(tensors[label][name].gpu)};`
+          + ` reference: ${side(tensors[label][name].expected)}`);
+      }
+    }
+  }
   console.log(`separation is ${(separation / Math.max(worst, 1e-30)).toFixed(0)}x `
     + "the error each arm is held to");
-  if (worst > bound) throw new Error(`relRMS ${worst.toExponential(2)} exceeds ${bound}`);
+  if (!(worst <= bound)) throw new Error(`relRMS ${worst.toExponential(2)} exceeds ${bound}`);
   if (separation < worst * 100) {
     throw new Error(`the dialect moved the single conditioning by `
       + `${separation.toExponential(2)}, under 100x the ${worst.toExponential(2)} `
       + "each arm is held to: padSingleCondUnknownDna did not reach it, so "
       + "neither arm was checked against anything");
   }
-  return { tokens, chains, noiseLevel, results, separation };
+  return { tokens, chains, noiseLevel, split, results, separation, initialPair,
+           widths: { pairChannels: PAIR_CHANNELS, seqChannels: SEQ_CHANNELS,
+                     targetFeatWidth: TARGET_WIDTH,
+                     trunkPairChannels: TRUNK_PAIR_CHANNELS } };
 }
 
 /**
@@ -197,7 +260,7 @@ export async function main(device, args) {
  * An empty padding list returns the weights unchanged, so the stock arm is the
  * bundle exactly as the store served it.
  */
-function padWeights(weights, padding) {
+function padWeights(weights, padding, SEQ_CHANNELS, TARGET_WIDTH) {
   if (padding.length === 0) return weights;
   const width = SEQ_CHANNELS + TARGET_WIDTH;
   const scale = new Float32Array(width + padding.length);

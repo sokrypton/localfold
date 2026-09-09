@@ -181,6 +181,24 @@ function fieldNames(fields, into = []) {
  * - the GPU block encoder, once the weights are resident on the device - can
  * say so with releaseWeights and get the memory back.
  */
+/** A descriptor's shape, with zeros where its values would be; see `bind`. */
+function standIn(fields) {
+  const object = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (typeof value === "function") {
+      if (!Number.isInteger(value.count)) {
+        throw new Error(`${value.tensorName ?? key} has no count; a stand-in needs one`);
+      }
+      object[key] = new Float32Array(value.count);
+    } else if (value !== null && typeof value === "object" && !ArrayBuffer.isView(value)) {
+      object[key] = standIn(value);
+    } else {
+      object[key] = value;
+    }
+  }
+  return object;
+}
+
 function materialise(fields, memo) {
   const object = {};
   Object.defineProperty(object, SOURCES, { value: fields });
@@ -213,7 +231,12 @@ const RELEASE = Symbol("release decoded weights");
  * enumerable properties and a string key here would look like another tensor
  * to it, and to every loop that iterates a weight object.
  */
-export const SOURCES = Symbol("weight sources");
+// One symbol for every loader; see src/runtime/weight-sources.js for what two
+// of them cost. Imported AND re-exported, because a bare `export ... from`
+// does not bind the name in this module and every use here is local.
+import { SOURCES } from "../runtime/weight-sources.js";
+
+export { SOURCES };
 
 /**
  * Let go of everything a lazily loaded weight object has decoded.
@@ -233,7 +256,25 @@ export function releaseWeights(weights) {
  * of one. Where it cannot, the descriptor is materialised eagerly from whole
  * tensors, which is what this did before and is still correct - just larger.
  */
-export async function bind(store, fields) {
+export async function bind(store, fields, options = {}) {
+  // 🔴 SHAPES ONLY, FOR A COMPILE THAT MUST NOT WAIT FOR THE DOWNLOAD. Every
+  // shader in the pairformer is generated from WIDTHS and OFFSET TABLES, and an
+  // offset table is a running sum of tensor LENGTHS - which `stacked` already
+  // knows from `store.shape` alone, before a single byte of any shard has
+  // arrived. So a stand-in tree of correctly sized ZEROS compiles bit for bit
+  // the same pipelines as the real weights, and it can be built at the moment
+  // the manifest lands.
+  //
+  // 🔴 ZEROS AND NOT `{length}`, because that is what makes it free of every
+  // packer. `packTransitionWeights(x).offsets` sums lengths and then
+  // concatenates; handed real arrays it just concatenates zeros and the
+  // offsets are right, and nothing has to learn a second way to be measured.
+  // The tree is one block's, so it is a few tens of MiB and transient.
+  //
+  // 🔴 AND A WARM THAT GETS IT WRONG IS WASTED WORK, NEVER A WRONG ANSWER: the
+  // run still asks the pipeline cache for its own keys. A stand-in that
+  // disagrees compiles shaders nobody uses.
+  if (options.shapesOnly === true) return standIn(fields);
   if (typeof store.tensorRangeSync !== "function" || typeof store.open !== "function") {
     const eager = {};
     for (const [key, value] of Object.entries(fields)) {
@@ -492,7 +533,7 @@ export async function msaBlockWeights(store, index) {
  *   transition of factor 2 where the trunk's is 4. Every one of those is
  *   derived from the weights, so this is a path and nothing else.
  */
-export async function pairformerBlockWeights(store, index, root = PAIRFORMER) {
+export async function pairformerBlockWeights(store, index, root = PAIRFORMER, options = {}) {
   const at = (leaf) => stacked(store, `${root}/${leaf}`, index);
   const [pairChannels, singleChannels, singleHeads, singleDimension] =
     singleAttentionDims(store, root);
@@ -519,7 +560,7 @@ export async function pairformerBlockWeights(store, index, root = PAIRFORMER) {
       transition1: at("single_transition/transition1/weights"),
       transition2: at("single_transition/transition2/weights"),
     },
-  });
+  }, options);
 }
 
 /**

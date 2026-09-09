@@ -13,11 +13,79 @@
 /** The six tensors one sliding-window atom block holds. */
 const SWA_LEAVES = ["adaln", "qkv", "attnGate", "attnOut", "ffnUp", "ffnDown"];
 
+/**
+ * Where a weight object's tensors came from, for a caller that wants the CODES
+ * rather than the values.
+ *
+ * 🔴 A SYMBOL, SO IT IS NOT A FIELD. Every loop in this port walks a weight
+ * object's own enumerable properties - `Object.values(part)` in the denoiser's
+ * byte accounting, for one - and a string key here would look like another
+ * tensor to all of them.
+ */
+// One symbol for every loader; see src/runtime/weight-sources.js for what two
+// of them cost. Imported AND re-exported, because a bare `export ... from`
+// does not bind the name in this module and every use here is local.
+import { SOURCES } from "../runtime/weight-sources.js";
+
+export { SOURCES };
+
+/**
+ * 🔴 LAZY WHEN THE READER OFFERS A SOURCE, AND EAGER OTHERWISE. Decoding an
+ * int5 bundle's denoiser on the main thread is 1.17 seconds before a fold's own
+ * clock starts, and narrowing the same tensors to f16 inside `prepare` is
+ * another 880 ms - and the GPU can do both. A reader that carries `.source`
+ * (the bytes, undecoded) and `.decode` (the host fallback, synchronous) gets
+ * getters and a `SOURCES` map; one that does not gets exactly what it always
+ * got, which is every CPU checker in this port.
+ */
 const gather = async (read, entries) => {
   const out = {};
-  await Promise.all(entries.map(async ([name, path]) => { out[name] = await read(path); }));
+  if (typeof read.source !== "function" || typeof read.decode !== "function") {
+    await Promise.all(entries.map(async ([name, path]) => { out[name] = await read(path); }));
+    return out;
+  }
+  const sources = {};
+  await Promise.all(entries.map(async ([name, path]) => {
+    // 🔴 IN THE SHAPE THE DEVICE DECODER READS, not only in the shape `decode`
+    // does. `planBlockUpload` wants a store, a tensor name and a range; it
+    // never calls the entry, so hanging those four off the source object is
+    // enough to let AF3's pair-track packer take an ESMFold2 block - which is
+    // 828 ms of `trunk 0` against 32 for the same block warm. See
+    // src/runtime/weight-sources.js.
+    const source = await read.source(path);
+    source.store = { tensorSource: () => source };
+    source.tensorName = path;
+    source.first = 0;
+    source.count = (source.record?.shape ?? []).reduce((total, extent) => total * extent, 1);
+    sources[name] = source;
+  }));
+  for (const [name] of entries) {
+    let decoded;
+    Object.defineProperty(out, name, {
+      enumerable: true,
+      get() { return (decoded ??= read.decode(sources[name])); },
+    });
+  }
+  Object.defineProperty(out, SOURCES, { value: sources });
   return out;
 };
+
+/**
+ * `gathered` with extra fields on it, WITHOUT spreading.
+ *
+ * 🔴 A SPREAD OVER A LAZY OBJECT IS AN EAGER DECODE. `{ ...gathered, blocks }`
+ * copies enumerable own properties, which for a getter means calling it - so
+ * every one of these lines decoded the tensor it was trying to defer, and threw
+ * the `SOURCES` symbol away on the way past. It cost 932 ms at load and left
+ * the token blocks taking the host path with no sign that anything was wrong,
+ * because the answer was right either way.
+ */
+function extend(gathered, fields) {
+  for (const [name, value] of Object.entries(fields)) {
+    Object.defineProperty(gathered, name, { value, enumerable: true, configurable: true });
+  }
+  return gathered;
+}
 
 /** `blocks` sliding-window blocks under one prefix. */
 export async function atomStackBlocks(read, prefix, blocks) {
@@ -42,19 +110,17 @@ export async function atomEncoderWeights(read, prefix, blocks, { withCoordinates
     ["atomToToken", `${prefix}/toToken`],
   ];
   if (withCoordinates) entries.push(["coordsLinear", `${prefix}/coordsLinear`]);
-  return { ...await gather(read, entries), blocks: await atomStackBlocks(read, prefix, blocks) };
+  return extend(await gather(read, entries),
+                { blocks: await atomStackBlocks(read, prefix, blocks) });
 }
 
 export async function atomDecoderWeights(read, prefix, blocks) {
-  return {
-    ...await gather(read, [
-      ["tokenToAtom", `${prefix}/tokenToAtom`],
-      ["normScale", `${prefix}/norm/scale`],
-      ["normOffset", `${prefix}/norm/offset`],
-      ["outputLinear", `${prefix}/outputLinear`],
-    ]),
-    blocks: await atomStackBlocks(read, prefix, blocks),
-  };
+  return extend(await gather(read, [
+    ["tokenToAtom", `${prefix}/tokenToAtom`],
+    ["normScale", `${prefix}/norm/scale`],
+    ["normOffset", `${prefix}/norm/offset`],
+    ["outputLinear", `${prefix}/outputLinear`],
+  ]), { blocks: await atomStackBlocks(read, prefix, blocks) });
 }
 
 const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale",
@@ -126,7 +192,7 @@ export async function conditioningWeights(read, { pairTransitions = 2, singleTra
     Promise.all(Array.from({ length: pairTransitions }, (_, l) => transition("zTransitions", l))),
     Promise.all(Array.from({ length: singleTransitions }, (_, l) => transition("sTransitions", l))),
   ]);
-  return { ...base, zTransitions, sTransitions };
+  return extend(base, { zTransitions, sTransitions });
 }
 
 /** One token-transformer block: an attention half and a transition half. */
@@ -149,8 +215,8 @@ export async function tokenBlockWeights(read, layer) {
     adaln("transition"),
   ]);
   return {
-    attention: { ...attention, adaln: attentionAdaln },
-    transition: { ...transition, adaln: transitionAdaln },
+    attention: extend(attention, { adaln: attentionAdaln }),
+    transition: extend(transition, { adaln: transitionAdaln }),
   };
 }
 
@@ -167,5 +233,5 @@ export async function denoiserWeights(read, { tokenBlocks }) {
       ["tokenNormOffset", "diffusion/tokenNorm/offset"],
     ]),
   ]);
-  return { conditioning, tokenBlocks: blocks, ...rest };
+  return extend(rest, { conditioning, tokenBlocks: blocks });
 }

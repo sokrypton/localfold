@@ -174,7 +174,7 @@ export class Af3TrunkGpu {
       () => new Af3EmbedderGpu(this.device).run(input, weights.embedder, options));
 
     // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
-    const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device).run(
+    const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device, this.options).run(
       { pair: embedded.pair, pairMask: input.pairMask, tokens,
         templates: input.templates ?? 4,
         // Absent, every slot is empty - which is what a de novo fold has, and
@@ -197,7 +197,7 @@ export class Af3TrunkGpu {
     const pair = embedded.pair;
     for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
 
-    const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device).run(
+    const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
       { pair, msa: embedded.msa, pairMask: input.pairMask, msaMask: input.msaMask,
         tokens, sequences: input.sequences },
       weights.msaBlocks, dialect, options));

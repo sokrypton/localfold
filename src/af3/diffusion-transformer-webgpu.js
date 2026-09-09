@@ -133,6 +133,24 @@ function residentBlockOnDevice(device, block, precision) {
  * @param {readonly object[]} blocks in dispatch order - z indexes this array
  * @param {"f32"|"f16"} precision must match the shader's weight word
  */
+/**
+ * A block's twelve zero-gate tensors, in the order the kernel addresses them.
+ *
+ * 🔴 EXPORTED SO THE DEVICE PATH CANNOT DRIFT FROM THE HOST ONE. ZG_* in the
+ * shader are running sums of these lengths; a list written twice is a list that
+ * ends up written differently, and here that reads a neighbouring tensor -
+ * a wrong fold and not a crash.
+ *   0-3  the two zero gates      (attention-output's, ffw-out's)
+ *   4-7  adaln's conditioned norm    ln scale, scale weights, bias, scale bias
+ *   8-11 ffw-adaln's, the same four
+ */
+export const ZERO_GATE_ORDER = ["AdaptiveZeroCondWeights", "AdaptiveZeroCondBias",
+  "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
+  "SingleCondLayerNormScale", "SingleCondScaleWeights",
+  "SingleCondBias", "SingleCondScaleBias",
+  "ffwSingleCondLayerNormScale", "ffwSingleCondScaleWeights",
+  "ffwSingleCondBias", "ffwSingleCondScaleBias"];
+
 export function packZeroGateWeights(blocks, precision = "f32") {
   const first = blocks[0];
   if (first === undefined) throw new Error("no diffusion blocks to pack");
@@ -146,12 +164,7 @@ export function packZeroGateWeights(blocks, precision = "f32") {
   //   0-3  the two zero gates      (attention-output's, ffw-out's)
   //   4-7  adaln's conditioned norm    ln scale, scale weights, bias, scale bias
   //   8-11 ffw-adaln's, the same four
-  const NAMES = ["AdaptiveZeroCondWeights", "AdaptiveZeroCondBias",
-                 "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
-                 "SingleCondLayerNormScale", "SingleCondScaleWeights",
-                 "SingleCondBias", "SingleCondScaleBias",
-                 "ffwSingleCondLayerNormScale", "ffwSingleCondScaleWeights",
-                 "ffwSingleCondBias", "ffwSingleCondScaleBias"];
+  const NAMES = ZERO_GATE_ORDER;
   const span = NAMES.reduce((total, name) => total + first[name].length, 0);
   // 🔴 CHECKED BEFORE ANYTHING IS WRITTEN, NOT AFTER. The shader finds a block
   // by multiplying this span by the block index, so a block that disagrees with
@@ -2503,8 +2516,24 @@ export class Af3DiffusionTransformerGpu {
       // the 204 the epilogue it replaces ran, twenty-four times a step.
       const allBlocks = batchedGates
         ? weights.superBlocks.flatMap((group) => group.blocks) : [];
+      // 🔴 ON THE DEVICE FIRST, BECAUSE THE HOST PACK IS 496 ms OF AN AF3 FIRST
+      // FOLD. Measured with `residentPackStats`: one call, 81.2 MiB, 496 ms -
+      // the largest single item in a fold, and larger than every other host
+      // packer put together. It is a plain concatenation of twenty-four blocks'
+      // twelve gate tensors, so the decoder takes it whole; what it needed was
+      // an order entry that can name its OWN holder, since this is one buffer
+      // over twenty-four SOURCES maps. See src/af3/device-weights.js.
+      const zeroGateOnDevice = batchedGates && weightPrecision === "f16"
+        ? await residentPackedOnDevice(this.device, {
+            key: weights, label: "difftx.zerogate.resident", variant: weightPrecision,
+            order: allBlocks.flatMap((block) =>
+              ZERO_GATE_ORDER.map((name) => ({ name, weights: block }))),
+            weights: allBlocks[0],
+          })
+        : undefined;
       const zeroGateWeights = batchedGates
-        ? { buffer: residentWeightBuffer(this.device, weights, "difftx.zerogate.resident",
+        ? { buffer: zeroGateOnDevice ?? residentWeightBuffer(
+              this.device, weights, "difftx.zerogate.resident",
               () => packZeroGateWeights(allBlocks, weightPrecision), weightPrecision) }
         : undefined;
       // Per token and per block; the gate does not read the sample.
@@ -2587,12 +2616,36 @@ export class Af3DiffusionTransformerGpu {
                                     offsets: resources.map((r) => r.offset ?? 0) });
         return group;
       };
+      // 🔴 ONE PASS, NOT ONE A DISPATCH. WebGPU orders dispatches inside a
+      // compute pass and makes each one's writes visible to the next, which is
+      // what AF2's evoformer stack has always relied on - see CLAUDE.md, where
+      // "profile.js cannot see into AF2" is that same choice. A denoiser call
+      // is 318 passes at 59 tokens and a fold is two hundred of them; measured
+      // on AF3 at 200 steps over two interleaved rounds, the warm fold is
+      // 3.03-3.11 s batched against 3.12-3.16 per dispatch, pLDDT 84.2848
+      // either way.
+      //
+      // 🔴 AND `batchComputePasses: false` IS WHAT `profileDevice` SETS, because
+      // one pass a dispatch is the only shape `tools/gpu/profile.js` can
+      // attribute. So the profiled number is 2.5% slower than the shipped one -
+      // which is this file's own rule about the profiler costing something,
+      // written down where the next person will hit it.
+      const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+      let openPass = null;
+      const passFor = (label) => {
+        if (!batchPasses) return encoder.beginComputePass({ label });
+        if (openPass === null) openPass = encoder.beginComputePass({ label: "difftx.blocks" });
+        return openPass;
+      };
+      const endPass = () => {
+        if (openPass !== null) { openPass.end(); openPass = null; }
+      };
       const run = (label, pipeline, buffers, x, y = 1, key = label, z = 1) => {
-        const pass = encoder.beginComputePass({ label });
+        const pass = passFor(label);
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bind(key, pipeline, buffers));
         pass.dispatchWorkgroups(x, y, z);
-        pass.end();
+        if (!batchPasses) pass.end();
       };
       // This block's window onto the batched ffw gate, or the raw conditioning
       // when it was not batched - whichever the kernel was compiled to read.
@@ -2622,6 +2675,7 @@ export class Af3DiffusionTransformerGpu {
        * pairformer stack's idiom, for the same reason.
        */
       const flush = (label) => {
+        endPass();
         this.device.queue.submit([encoder.finish()]);
         validation.end(label);
         for (let at = pending.length - 1; at >= 0; at -= 1) pending[at].release();
@@ -2788,6 +2842,7 @@ export class Af3DiffusionTransformerGpu {
         // falling back. Resident runs are untouched and still submit once.
         if (!this.residentWeights) flush(`super-block ${groupIndex}`);
       }
+      endPass();
       // ...and the readback rides the same submit, when there is one.
       if (!keepOnDevice) {
         encoder.copyBufferToBuffer(actBuffer.buffer, 0, readback.buffer, 0, tokens * channels * 4);

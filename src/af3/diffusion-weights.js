@@ -236,6 +236,71 @@ export async function atomReference(store) {
   };
 }
 
+/**
+ * The diffusion conditioning's weights, on their own.
+ *
+ * 🔴 ITS OWN FUNCTION SO A CHECKER CAN GO THROUGH IT. This used to be an object
+ * literal inside `diffusionWeights`, so the one tool that checks the
+ * conditioning hand-built its weight dict with `pairChannels: 128` and
+ * `targetFeatWidth: 447` typed in - which is exactly the fault CLAUDE.md
+ * records costing months on the side chains, and here it cost the OpenDDE fold
+ * ten seconds a fold: the arm that should have said "the GPU conditioning has
+ * no split-pair branch" instead read every tensor at AF3's widths, produced
+ * NaN on both sides, and passed.
+ *
+ * @param {object} store
+ * @param {object} dialect from `af3Dialect(store)`
+ */
+export async function conditioningWeights(store, dialect) {
+  const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const transition = async (prefix) => ({
+    ffwLayerNormScale: await T(`${prefix}ffw_layer_norm/scale`),
+    ffwLayerNormOffset: await T(`${prefix}ffw_layer_norm/offset`),
+    ffwTransition1: await T(`${prefix}ffw_transition1/weights`),
+    ffwTransition2: await T(`${prefix}ffw_transition2/weights`),
+  });
+  const splitPair = dialect.splitPairConditioning;
+  if (splitPair === undefined) {
+    throw new Error("dialect.splitPairConditioning has no default");
+  }
+  const hasSplit = store.manifest?.tensors?.[`${HEAD}/z_trunk_projection/weights`] !== undefined;
+  if (hasSplit !== splitPair) {
+    throw new Error(`this bundle ${hasSplit ? "carries" : "does not carry"} `
+      + "z_trunk_projection and its dialect says otherwise");
+  }
+  return {
+    // 🔴 EVERY WIDTH HERE IS THE TENSOR'S. `pair_cond_initial_projection` is
+    // [267, 128] under AlphaFold 3 and [256, 128] under OpenDDE, because the
+    // second compresses its two inputs separately before concatenating them -
+    // and OpenDDE's trunk pair arriving here is 384 wide, not 128.
+    pairChannels: dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[1],
+    seqChannels: dims(store, `${HEAD}/single_cond_initial_projection/weights`)[1],
+    targetFeatWidth: 447, relativeWidth: 139,
+    trunkPairChannels: splitPair
+      ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
+      : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
+    pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
+    pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
+    // OpenDDE's two separate compressions; absent under AlphaFold 3, and the
+    // reference branches on their presence.
+    ...(splitPair ? {
+      zTrunkNormScale: await T("z_trunk_norm/scale"),
+      zTrunkProjection: await T("z_trunk_projection/weights"),
+      relpeProjection: await T("relpe_projection/weights"),
+    } : {}),
+    pairTransitions: [await transition("pair_transition_0"),
+                      await transition("pair_transition_1")],
+    singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
+    singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
+    singleTransitions: [await transition("single_transition_0"),
+                        await transition("single_transition_1")],
+    fourierWeight: await T("fourier_embedding_weight"),
+    fourierBias: await T("fourier_embedding_bias"),
+    noiseEmbeddingInitialNormScale: await T("noise_embedding_initial_norm/scale"),
+    noiseEmbeddingInitialProjection: await T("noise_embedding_initial_projection/weights"),
+  };
+}
+
 export async function diffusionWeights(store, superBlocks = 6) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
   // The atom stacks' dialect flags; see `atomBlockWith`.
@@ -271,15 +336,8 @@ export async function diffusionWeights(store, superBlocks = 6) {
   // AGREE WITH IT. OpenDDE carries `z_trunk_projection` and `relpe_projection`
   // and AlphaFold 3 does not, so presence and flag are cross-checked - a
   // bundle where they disagreed would silently condition on the wrong thing.
-  const splitPair = dialect.splitPairConditioning;
-  if (splitPair === undefined) {
-    throw new Error("dialect.splitPairConditioning has no default");
-  }
-  const hasSplit = store.manifest?.tensors?.[`${HEAD}/z_trunk_projection/weights`] !== undefined;
-  if (hasSplit !== splitPair) {
-    throw new Error(`this bundle ${hasSplit ? "carries" : "does not carry"} `
-      + "z_trunk_projection and its dialect says otherwise");
-  }
+  // The pair conditioning's shape is a dialect question; conditioningWeights
+  // cross-checks the flag against the tensors.
   const atomPerBlock = dialect.perBlockAtomPairLayerNorm;
   if (atomPerBlock === undefined) {
     throw new Error("dialect.perBlockAtomPairLayerNorm has no default");
@@ -371,37 +429,7 @@ export async function diffusionWeights(store, superBlocks = 6) {
     singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),
     outputNormScale: await T("output_norm/scale"),
-    conditioning: {
-      // 🔴 EVERY WIDTH HERE IS THE TENSOR'S. `pair_cond_initial_projection` is
-      // [267, 128] under AlphaFold 3 and [256, 128] under OpenDDE, because the
-      // second compresses its two inputs separately before concatenating them -
-      // and OpenDDE's trunk pair arriving here is 384 wide, not 128.
-      pairChannels: dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[1],
-      seqChannels: dims(store, `${HEAD}/single_cond_initial_projection/weights`)[1],
-      targetFeatWidth: 447, relativeWidth: 139,
-      trunkPairChannels: splitPair
-        ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
-        : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
-      pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
-      pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
-      // OpenDDE's two separate compressions; absent under AlphaFold 3, and the
-      // reference branches on their presence.
-      ...(splitPair ? {
-        zTrunkNormScale: await T("z_trunk_norm/scale"),
-        zTrunkProjection: await T("z_trunk_projection/weights"),
-        relpeProjection: await T("relpe_projection/weights"),
-      } : {}),
-      pairTransitions: [await transition("pair_transition_0"),
-                        await transition("pair_transition_1")],
-      singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
-      singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
-      singleTransitions: [await transition("single_transition_0"),
-                          await transition("single_transition_1")],
-      fourierWeight: await T("fourier_embedding_weight"),
-      fourierBias: await T("fourier_embedding_bias"),
-      noiseEmbeddingInitialNormScale: await T("noise_embedding_initial_norm/scale"),
-      noiseEmbeddingInitialProjection: await T("noise_embedding_initial_projection/weights"),
-    },
+    conditioning: await conditioningWeights(store, dialect),
     transformer: {
       channels: 768, condChannels: 384, pairChannels: 128, heads: 16, dimension: 48,
       transitionFactor: 2, blocksPerSuperBlock: 4,

@@ -160,6 +160,14 @@ const SHAPES = {
   // JAX". This arm answers it with the best generic GEMM in the tree at the
   // same M, K and N.
   difftx: { rows: 240, inner: 768, columns: 768, activation: 0 },
+  // 🔴 THE SHAPES A DENOISER STEP ACTUALLY RUNS, at OpenDDE's 130 structural
+  // tokens: qkvg is 768 -> 3072 and the transition's two halves are 768 -> 3072
+  // and 1536 -> 768. Asked because `attend`, `qkvg`, `ffw-wide` and `ffw-out`
+  // are 13.25 ms of a 17.8 ms denoiser call and the obvious next move is the
+  // matrix units. They are a WASH here - see docs/A100.md - and the reason is
+  // in the `workgroups` column, not in the arithmetic.
+  difftxqkvg: { rows: 130, inner: 768, columns: 3072, activation: 0 },
+  difftxout: { rows: 130, inner: 1536, columns: 768, activation: 0 },
   // A square one, so this kernel has a number comparable with anybody's
   // matmul benchmark - jax-js's, for instance.
   square: { rows: 2048, inner: 2048, columns: 2048, activation: 0 },
@@ -213,6 +221,14 @@ const SHAPES = {
   // at half the width. The pair of them is the control: if the fused form only
   // stops paying at 256 channels then the two models want different answers,
   // and item 9's conclusion is right for AF3 and wrong for ESMFold2.
+  // 🔴 THE OUTER PRODUCT MEAN'S TWO GEMMs, WHICH ARE THE ONE PAIR THIS FILE
+  // PREDICTED CORRECTLY. Its contraction's K is the ALIGNMENT DEPTH - 512 at an
+  // 825-residue fold's default - which is the deepest K in the model and the
+  // reason the units suit it; the output projection contracts the outer
+  // channels. Both are here so the standalone prediction can be scored against
+  // the in-situ verdict rather than remembered. See docs/PERF.md.
+  opmcontract: { rows: 825 * 32, inner: 512, columns: 32 * 32, activation: 0 },
+  opmoutput: { rows: 825 * 825, inner: 32 * 32, columns: 128, activation: 0 },
   af3wide: { rows: 200 * 200, inner: 128, columns: 1024, activation: 1 },
   af3down: { rows: 200 * 200, inner: 512, columns: 128, activation: 0 },
 };

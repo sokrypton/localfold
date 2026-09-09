@@ -18,24 +18,34 @@
 import { deviceTuning } from "../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
+import { residencyAllowed } from "../runtime/device-memory.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, createAddShader,
   encodePairTrack, packPairTrackWeights,
 } from "./pair-track-gpu.js";
+import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
+import { residentPackedOnDevice } from "./device-weights.js";
 import {
   createOuterProductMeanShaders, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
 import { createMsaAttentionShaders, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
-import { createTransitionShader, packTransitionWeights, transitionRowTile }
-  from "./transition-webgpu.js";
+import { allocateGridProjectMatrix, gridProjectMatrixConfig }
+  from "./grid-project-matrix.js";
+import {
+  allocateTransitionSplit, createTransitionShader, packTransitionWeights,
+  splitTransitionConfig, transitionRowTile, TRANSITION_ORDER,
+} from "./transition-webgpu.js";
 
 export class Af3MsaStackGpu {
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    // The same default and the same escape the pairformer takes.
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
 
   /**
@@ -111,7 +121,34 @@ export class Af3MsaStackGpu {
       // [384, 768] triangle projection at AF3's stride.
       n, channels: pairChannels, sample, epsilon, variance, dialect, base,
       weightPrecision: pairWeightPrecision,
+      // 🔴 THIS STACK RUNS THE SAME PAIR TRACK AND HAD NONE OF ITS KERNEL
+      // CHOICES. `grid.project`'s 108 passes in an AF3 trunk are 96 pairformer,
+      // 8 MSA and 4 template - so a knob wired only into the pairformer leaves
+      // an eighth of that kernel on the vector path for no reason. It costs no
+      // memory and reads the layout this pack already writes.
+      gridProjectMatrix: gridProjectMatrixConfig(this.device),
+      // 🔴 AND THE SPLIT TRANSITION, WHICH THIS STACK ALSO NEVER HAD. Four of
+      // an AF3 trunk's `pair-transition` passes are this stack's, and at
+      // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
+      // the whole reason the pairformer takes it. Same width rule, same knob.
+      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels),
+      pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
+      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
+      minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
     });
+    const gridProjectMatrix = pipelines.gridProjectMatrix === undefined ? undefined
+      : allocateGridProjectMatrix(this.allocator, {
+        ...pipelines.gridProjectMatrix, label: "af3-msa.grid-project",
+      }, keep);
+    const transitionSplit = pipelines.transitionSplit === undefined ? undefined
+      : allocateTransitionSplit(this.allocator, {
+        rows: n * n, channels: pairChannels,
+        factor: sample.pairTransition.transition2.length / (pairChannels * pairChannels),
+        chunkRows: pipelines.transitionSplit.chunkRows,
+        offsets: packTransitionWeights(sample.pairTransition).offsets,
+        label: "af3-msa.transition",
+      }, keep);
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compile = (key, source) => this.pipelines.get(key, source);
     const compiling = [];
@@ -185,7 +222,8 @@ export class Af3MsaStackGpu {
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
           pairChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
-          left, right, opmCounts, keyMask, attention, msaScratch,
+          left, right, opmCounts, keyMask, attention, msaScratch, gridProjectMatrix,
+          transitionSplit,
         });
         options.onBlock?.(index);
       }
@@ -232,6 +270,7 @@ export class Af3MsaStackGpu {
     const { pairChannels } = context;
     const { pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer } = context;
     const { left, right, opmCounts, keyMask, attention, msaScratch } = context;
+    const { gridProjectMatrix, transitionSplit } = context;
 
     const blockAllocations = [];
     const upload = (label, data) => {
@@ -239,21 +278,61 @@ export class Af3MsaStackGpu {
       blockAllocations.push(allocation);
       return allocation;
     };
-    // The block's own width; the default is AlphaFold 3's 128.
-    const packedPair = packPairTrackWeights(block, pairChannels,
-                                            context.pairWeightPrecision);
+    // 🔴 PACKED ON DEMAND AND UPLOADED ONCE, EVER, which the pairformer beside
+    // this has done for a long time and this stack had not. It is four blocks
+    // rather than forty-eight, and the pair-track pack alone is about 10 ms of
+    // host time a block at AF3's width and more at OpenDDE's - on every pass of
+    // every recycle, over weights that never change. See the note in
+    // src/af3/pairformer-block-webgpu.js for why residency is a trade the
+    // BUDGET answers rather than a choice made in advance.
+    const resident = this.residentWeights
+      ? (label, key, pack, variant) => ({
+        buffer: residentWeightBuffer(this.device, key, label, pack, variant),
+      })
+      : (label, key, pack) => upload(label, pack());
+    // Lazily, and not held: residentWeightBuffer calls pack() only on a miss.
+    // The four the device can pack itself; see src/af3/pair-track-device-weights.js
+    // for why a transpose and an interleave could not go the contiguous way.
+    const onDevice = await residentPairTrackOnDevice(this.device, block, {
+      channels: pairChannels, pairWeightPrecision: context.pairWeightPrecision,
+      resident: this.residentWeights,
+    });
+    let packedPair;
+    const w = context.pairWeightPrecision;
+    const pairTransitionOnDevice = this.residentWeights
+      ? await residentPackedOnDevice(this.device, {
+          key: block.pairTransition, label: "w.pair-transition",
+          order: TRANSITION_ORDER, weights: block.pairTransition, variant: w,
+          destination: w === "f16" ? "f16" : "f32",
+        }).then((buffer) => (buffer === undefined ? undefined : { buffer }))
+      : undefined;
+    // ...and asked BEFORE the pack, because `packPairTrackWeights` builds all
+    // five from one call: a caller that stopped binding one was still paying to
+    // build it. See src/af3/pair-track-device-weights.js.
+    const want = { ...onDevice.want, transition: pairTransitionOnDevice === undefined };
+    const packedFor = () => (packedPair ??= packPairTrackWeights(
+      block, pairChannels, context.pairWeightPrecision, true, "blocked", want));
     const pairTrackWeights = {
-      outgoing: upload("w.tri.out", packedPair.outgoing),
-      incoming: upload("w.tri.in", packedPair.incoming),
-      grid1: upload("w.grid1", packedPair.grid1),
-      grid2: upload("w.grid2", packedPair.grid2),
-      transition: upload("w.pair-transition", packedPair.transition),
+      outgoing: onDevice.buffers.outgoing
+        ?? resident("w.tri.out", block, () => packedFor().outgoing, w),
+      incoming: onDevice.buffers.incoming
+        ?? resident("w.tri.in", block, () => packedFor().incoming, w),
+      grid1: onDevice.buffers.grid1 ?? resident("w.grid1", block, () => packedFor().grid1),
+      grid2: onDevice.buffers.grid2 ?? resident("w.grid2", block, () => packedFor().grid2),
+      // 🔴 THE ONE PAIR-TRACK TENSOR THE CONTIGUOUS DECODER CAN TAKE, and the
+      // pairformer has taken it for a while. This stack had not: measured with
+      // `residentPackStats`, `w.pair-transition` is 56 calls and 92 ms of an
+      // AF3 fold and 12 calls and 130 ms of an OpenDDE one, and four of those
+      // calls are this loop.
+      transition: pairTransitionOnDevice
+        ?? resident("w.pair-transition", block, () => packedFor().transition, w),
     };
-    const opmWeights = upload("w.opm", packOuterProductMeanWeights(block.outerProductMean).data);
-    const attentionWeights = upload("w.msa-attn",
-      packMsaAttentionWeights(block.msaAttention1).data);
-    const msaTransitionWeights = upload("w.msa-transition",
-      packTransitionWeights(block.msaTransition).data);
+    const opmWeights = resident("w.opm", block,
+      () => packOuterProductMeanWeights(block.outerProductMean).data);
+    const attentionWeights = resident("w.msa-attn", block,
+      () => packMsaAttentionWeights(block.msaAttention1).data);
+    const msaTransitionWeights = resident("w.msa-transition", block,
+      () => packTransitionWeights(block.msaTransition).data);
 
     this.device.pushErrorScope("validation");
     const encoder = this.device.createCommandEncoder({ label: "af3-msa-block" });
@@ -338,7 +417,7 @@ export class Af3MsaStackGpu {
 
     encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
-      scratch, biasBuffer,
+      scratch, biasBuffer, gridProjectMatrix, transitionSplit,
       weights: pairTrackWeights,
     });
 

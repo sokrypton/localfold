@@ -24,6 +24,8 @@
  */
 import { layerNorm, linear } from "./pairformer-reference.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
+import { openddeAtomReadouts, openddePairInit, openddePairReadouts }
+  from "./opendde-confidence-webgpu.js";
 
 /** OpenDDE's distance bins: 3.25 to 52.0 in steps of 1.25, the last open. */
 const BIN_START = 3.25;
@@ -99,7 +101,7 @@ export function confidencePairInit(pair, singleInputs, coordinates, tokens, weig
  * @param {object} weights from openddeConfidenceWeights
  * @param {object} dialect
  */
-export async function openddeConfidence(device, input, weights, dialect) {
+export async function openddeConfidence(device, input, weights, dialect, options = {}) {
   const { tokens } = input;
   const c = weights.pairChannels;
   const cs = weights.singleChannels;
@@ -112,44 +114,113 @@ export async function openddeConfidence(device, input, weights, dialect) {
   const single = layerNorm(clamped, tokens, cs,
                            weights.inputStrunkLnScale, weights.inputStrunkLnOffset);
 
-  const pair = confidencePairInit(input.pair, input.singleInputs, input.coordinates,
-                                  tokens, weights);
   const seqMask = input.seqMask;
   const pairMask = new Float32Array(tokens * tokens);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
-  const refined = await new Af3PairformerStackGpu(
-    device, { pairWeightPrecision: weights.weightPrecision }).run(
+  // 🔴 THE PER-PAIR HALF ON THE DEVICE, AND ITS RESULT STAYS THERE. Only the
+  // four-block stack reads it, and the stack takes a buffer now - so a
+  // `tokens^2 x 384` tensor is neither read back nor uploaded. The per-TOKEN
+  // projections stay on the host: they are n and not n^2, which is what the
+  // note above this function meant and is true of them.
+  const stack = new Af3PairformerStackGpu(
+    device, { pairWeightPrecision: weights.weightPrecision });
+  const onHost = options.hostReadouts === true;
+  const built = onHost ? undefined : await openddePairInit(device, {
+    tokens, channels: c, pair: input.pair, pairBuffer: input.pairBuffer,
+    s1: linear(input.singleInputs, tokens, weights.singleInputChannels, c, weights.s1),
+    s2: linear(input.singleInputs, tokens, weights.singleInputChannels, c, weights.s2),
+    coordinates: input.coordinates, binStart: BIN_START, binStep: BIN_STEP,
+  }, weights, stack.allocator);
+  const pair = onHost
+    ? confidencePairInit(input.pair, input.singleInputs, input.coordinates, tokens, weights)
+    : new Float32Array(0);
+
+  // 🔴 AND THE REFINED PAIR STAYS ON THE DEVICE TOO. PAE and PDE are the only
+  // readers and both are kernels now, so reading `tokens^2 x 384` back to
+  // upload it again was the last round trip in this head. The stack updates
+  // `built.allocation` in place - a pair track is a residual chain - so the
+  // pair init's buffer is what the readouts bind and what is released below.
+  const refined = await stack.run(
     { tokens, pair, single, pairMask, seqMask }, weights.blocks, dialect,
-    { extraPairBias: input.extraPairBias });
+    { extraPairBias: input.extraPairBias,
+      ...(built === undefined ? {} : { pairBuffer: built.allocation.buffer, keepPair: true }) });
 
   const pairs = tokens * tokens;
   // PAE from the pair; PDE from the SYMMETRISED pair - a distance error is
   // symmetric and an aligned error is not, which is the whole difference.
+  //
+  // 🔴 ON THE GPU, AND THE HOST PATH IS THE REFERENCE. These two were 1.6
+  // seconds of a 13.5-second OpenDDE fold - 138 million multiply-accumulates
+  // each at 130 structural tokens - under a comment calling this head's host
+  // half "the cheap half". `--host-readouts` is what
+  // check-opendde-confidence.js compares against.
+  const pairReadouts = options.hostReadouts === true
+    ? hostPairReadouts(refined.pair, tokens, c, weights)
+    : await openddePairReadouts(device, { pairBuffer: built.allocation.buffer,
+                                          tokens, channels: c }, weights);
+  built?.release();
+
+  // pLDDT and resolved: per ATOM, against the matrix its dense SLOT names.
+  //
+  // 🔴 ON THE GPU, AND THE HOST PATH IS THE REFERENCE. At 130 structural tokens
+  // and 24 dense slots these two are 3120 atoms x 384 channels x {50, 2} bins
+  // with a LayerNorm each, and they measured 148 ms inside a fold.
+  const atoms = input.atomCount;
+  const atomReadouts = options.hostReadouts === true
+    ? hostAtomReadouts(refined.single, atoms, cs, input, weights)
+    : await openddeAtomReadouts(device, {
+      single: refined.single, atoms, channels: cs,
+      atomToToken: input.atomToToken, atomToSlot: input.atomToSlot,
+    }, weights);
+
+  // 🔴 THE REDUCTIONS ARE OpenDDE's OWN BINS. pLDDT is 50 bins over [0, 1] and
+  // is scaled by 100; PAE and PDE are 64 over [0, 32]. Reading any of them on
+  // AlphaFold 3's grid gives a number in the right range and the wrong place.
+  const { pae, pde } = pairReadouts;
+  const { plddt, resolved } = atomReadouts;
+
+  return { plddt, pae, pde, resolved };
+}
+
+/**
+ * The PAE and PDE readouts on the host: what the GPU pair readouts replaced,
+ * kept as the reference check-opendde-confidence.js holds them to.
+ */
+export function hostPairReadouts(pair, tokens, c, weights) {
+  const pairs = tokens * tokens;
   const paeLogits = linear(
-    layerNorm(refined.pair, pairs, c, weights.paeLnScale, weights.paeLnOffset),
+    layerNorm(pair, pairs, c, weights.paeLnScale, weights.paeLnOffset),
     pairs, c, weights.paeBins, weights.pae);
   const symmetric = new Float32Array(pairs * c);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) {
       for (let d = 0; d < c; d += 1) {
         symmetric[(i * tokens + j) * c + d] =
-          refined.pair[(i * tokens + j) * c + d] + refined.pair[(j * tokens + i) * c + d];
+          pair[(i * tokens + j) * c + d] + pair[(j * tokens + i) * c + d];
       }
     }
   }
   const pdeLogits = linear(
     layerNorm(symmetric, pairs, c, weights.pdeLnScale, weights.pdeLnOffset),
     pairs, c, weights.pdeBins, weights.pde);
+  return {
+    pae: expectedFromLogits(paeLogits, pairs, weights.paeBins, 0, 32),
+    pde: expectedFromLogits(pdeLogits, pairs, weights.pdeBins, 0, 32),
+  };
+}
 
-  // pLDDT and resolved: per ATOM, against the matrix its dense SLOT names.
-  const atoms = input.atomCount;
+/**
+ * pLDDT and "resolved" on the host: what the GPU atom readouts replaced, kept
+ * as the reference check-opendde-confidence.js holds them to.
+ */
+export function hostAtomReadouts(single, atoms, cs, input, weights) {
   const gathered = new Float32Array(atoms * cs);
   for (let atom = 0; atom < atoms; atom += 1) {
     const from = input.atomToToken[atom] * cs;
-    for (let d = 0; d < cs; d += 1) gathered[atom * cs + d] = refined.single[from + d];
+    for (let d = 0; d < cs; d += 1) gathered[atom * cs + d] = single[from + d];
   }
   const readout = (scale, offset, table, bins) => {
     const normalised = layerNorm(gathered, atoms, cs, scale, offset);
@@ -170,15 +241,8 @@ export async function openddeConfidence(device, input, weights, dialect) {
                               weights.plddtWeight, weights.plddtBins);
   const resolvedLogits = readout(weights.resolvedLnScale, weights.resolvedLnOffset,
                                  weights.resolvedWeight, weights.resolvedBins);
-
-  // 🔴 THE REDUCTIONS ARE OpenDDE's OWN BINS. pLDDT is 50 bins over [0, 1] and
-  // is scaled by 100; PAE and PDE are 64 over [0, 32]. Reading any of them on
-  // AlphaFold 3's grid gives a number in the right range and the wrong place.
   const plddt = expectedFromLogits(plddtLogits, atoms, weights.plddtBins, 0, 1);
   for (let index = 0; index < plddt.length; index += 1) plddt[index] *= 100;
-  const pae = expectedFromLogits(paeLogits, pairs, weights.paeBins, 0, 32);
-  const pde = expectedFromLogits(pdeLogits, pairs, weights.pdeBins, 0, 32);
-
   const resolved = new Float32Array(atoms);
   for (let atom = 0; atom < atoms; atom += 1) {
     const a = resolvedLogits[atom * 2];
@@ -186,6 +250,5 @@ export async function openddeConfidence(device, input, weights, dialect) {
     const largest = Math.max(a, b);
     resolved[atom] = Math.exp(b - largest) / (Math.exp(a - largest) + Math.exp(b - largest));
   }
-
-  return { plddt, pae, pde, resolved, paeLogits, pdeLogits, plddtLogits };
+  return { plddt, resolved };
 }

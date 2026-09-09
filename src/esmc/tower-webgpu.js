@@ -24,8 +24,13 @@
 // same note; it is the kind of thing that survives a shape check and moves a
 // fold.
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import {
+  GpuMemoryBudgetError, memoryBudgetBytes, noteAllocation, noteDestroy,
+  noteResidencyRefused, residencyAllowed,
+} from "../runtime/device-memory.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
@@ -106,6 +111,83 @@ export function layerMix(combine) {
   }
   for (let i = 0; i < out.length; i += 1) out[i] /= total;
   return out;
+}
+
+/**
+ * A block's weight buffers, kept on the device for the model's lifetime.
+ *
+ * 🔴 STREAMING IS THE RIGHT TRADE ONCE AND THE WRONG ONE AFTERWARDS. This tower
+ * decodes each block out of int3 and narrows it to f16 on the host - 1121 ms
+ * and 723 ms across 36 blocks, against 660 ms of GPU - and releases the buffers
+ * as it goes, so 2190 MiB of float32 never exists at once. That is what makes
+ * the FIRST fold possible on a small device. It also means every fold after it
+ * pays the whole 1.8 seconds again, over weights that never change, which on a
+ * card with room is pure loss - the same shape as `keepTrunkWeights` in AF3 and
+ * the residency added to every other stack here.
+ *
+ * 🔴 AND A HIT SKIPS THE DECODE, NOT JUST THE UPLOAD, which is why this cannot
+ * be `residentWeightBuffer`. That one takes a `pack` thunk and calls it on a
+ * miss, and by then the caller has already awaited `blockWeights(layer)` - the
+ * 1121 ms. This is asked BEFORE the weights are requested, and a hit means the
+ * layer's promise is never created.
+ *
+ * Keyed on a caller-supplied object, which is the model: the tower instance is
+ * built fresh per fold and cannot be it.
+ */
+const RESIDENT_BLOCKS = new WeakMap();
+
+function residentBlocks(device, key) {
+  let forDevice = RESIDENT_BLOCKS.get(device);
+  if (forDevice === undefined) {
+    forDevice = new WeakMap();
+    RESIDENT_BLOCKS.set(device, forDevice);
+  }
+  let forKey = forDevice.get(key);
+  if (forKey === undefined) {
+    forKey = new Map();
+    forDevice.set(key, forKey);
+  }
+  return forKey;
+}
+
+/**
+ * One of the tower's four big matrices, decoded from its quantisation codes on
+ * the DEVICE and written straight into `destination` as f16.
+ *
+ * 🔴 THIS IS 4.8 SECONDS OF AN ESMFold2 FIRST FOLD. `readTensorAsFloat16`
+ * decodes int3-at-128 into halves on the main thread; measured inside a fold,
+ * the tower's block reads were 5482 ms of a 7990 ms wall, and the four matrices
+ * are 99.6% of a block. The GPU decoder has understood this codec since it
+ * stopped being int5-at-32 only, and nothing was pointed at it.
+ *
+ * Returns false when the tensor cannot be decoded this way - an f32 bundle, a
+ * store with no `tensorSource`, a shard not open yet - and the caller decodes
+ * on the host as it always did.
+ *
+ * @param {{record: object, buffer: ArrayBuffer, byteOffset: number}} source
+ */
+async function decodeIntoOnDevice(device, source, elements, destination) {
+  if (source === undefined || source === null) return false;
+  // A thunk in the shape planBlockUpload reads: it never calls it, it only
+  // wants the store, the name and the range. See src/af3/weights.js.
+  const thunk = () => { throw new Error("the device decoder does not call the thunk"); };
+  thunk.store = { tensorSource: () => source };
+  thunk.tensorName = "tower";
+  thunk.first = 0;
+  thunk.count = elements;
+  const planned = planBlockUpload([{ name: "tower", thunk, offset: 0, length: elements }]);
+  if (planned === undefined || planned.gpu.params.length === 0) return false;
+  const release = await runBlockUpload(device, planned.gpu, destination);
+  // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here would
+  // put a host-device synchronisation inside the block loop, which is the one
+  // thing this loop is written to avoid. See src/af3/device-weights.js.
+  void device.queue.onSubmittedWorkDone().then(release);
+  return true;
+}
+
+/** How many elements a manifest record holds. */
+function elementsOf(record) {
+  return (record.shape ?? []).reduce((total, extent) => total * extent, 1);
 }
 
 export class EsmcTowerGpu {
@@ -284,16 +366,79 @@ export class EsmcTowerGpu {
       // 🔴 AND ONE BLOCK AHEAD, NOT ALL OF THEM. The whole point of streaming
       // is that 2190 MiB of float32 never exists at once; prefetching the lot
       // would defeat it exactly. Two blocks live is 64 MiB.
-      let pending = layers > 0 ? blockWeights(0) : undefined;
+      // 🔴 RESIDENT IF THE CALLER NAMES A MODEL AND THE DEVICE HAS NO CEILING.
+      // See residentBlocks: a hit skips the DECODE and not just the upload, so
+      // it is asked before the layer's promise is created. A device with a
+      // budget streams as it always did, which is what makes the first fold
+      // possible on a phone; a card with room pays 1.8 s once instead of once a
+      // fold. The same rule uploadResident takes in src/runtime/execution.js.
+      //
+      // 🔴 AND A CEILING IS ANSWERED BY SIZE, NOT BY REFUSING OUTRIGHT. The
+      // page is the caller that matters and it ALWAYS sets a budget - `null`
+      // in web/model.js means "guess one from navigator.deviceMemory" - so a
+      // rule of "no budget, no residency" would give this to a bench and to
+      // nobody else. What the weights actually cost is known here: ten tensors
+      // a block, the four big ones being qkv, attn_out, fc1 and fc2, in halves.
+      // A quarter of the ceiling is the line: a 16 GiB desktop guesses about
+      // 5.5 GiB and takes it, a 4 GiB phone guesses 1.3 and streams as before.
+      const blockBytes = 2 * (4 * model * model + 2 * model * ffn) + 8 * model * 2;
+      const residentBytes = blockBytes * layers;
+      const budget = memoryBudgetBytes(this.device);
+      const affordable = budget === undefined || budget >= residentBytes * 4;
+      const resident = options.weightKey !== undefined
+        && residencyAllowed(this.device) && affordable
+        ? residentBlocks(this.device, options.weightKey) : null;
+      const cached = (layer) => (resident === null ? undefined : resident.get(layer));
+      const want = (layer) => (layer < layers && cached(layer) === undefined
+        ? blockWeights(layer) : undefined);
+      let pending = layers > 0 ? want(0) : undefined;
       for (let layer = 0; layer < layers; layer += 1) {
         // Awaited, so a caller may stream a block's weights from the network or
         // decode them from a quantised bundle rather than holding 2190 MiB of
         // float32 in the tab. A bench should pre-load and hand back a plain
         // object; a checker should not have to.
-        const weights = await pending;
-        pending = layer + 1 < layers ? blockWeights(layer + 1) : undefined;
+        const held = cached(layer);
+        const weights = held === undefined ? await pending : undefined;
+        pending = want(layer + 1);
         const perBlock = [];
-        const upload = (name, values) => {
+        const store = held ?? (resident === null ? undefined : {});
+        if (held === undefined && store !== undefined) resident.set(layer, store);
+        // 🔴 THE VALUE IS A THUNK, because on a cache hit `weights` is undefined
+        // and JavaScript evaluates an argument before the function can decide
+        // it does not need it. That is the whole saving: `narrow(...)` and
+        // `scaled(...)` are the 723 ms.
+        const upload = (name, make) => {
+          if (store !== undefined && store[name] !== undefined) return store[name];
+          const values = make();
+          // 🔴 NOT THROUGH THE POOLED ALLOCATOR WHEN IT IS KEPT, because the
+          // pool recycles at the end of the run that made it and this has to
+          // outlive every run - the same rule src/runtime/resident.js states.
+          if (store !== undefined) {
+            // 🔴 AND THE BUDGET STILL GETS THE LAST WORD. The estimate above is
+            // an estimate; if an allocation crosses the ceiling anyway,
+            // noteAllocation raises before createBuffer, this device gives up
+            // on residency for good and every block from here streams. Partial
+            // residency is safe because a block's buffers are independent.
+            try {
+              noteAllocation(this.device, `esmc.${name}`,
+                             Math.ceil(values.byteLength / 4) * 4);
+            } catch (error) {
+              if (!(error instanceof GpuMemoryBudgetError)) throw error;
+              noteResidencyRefused(this.device);
+              resident.delete(layer);
+              const fallback = this.allocator.upload(
+                `esmc.b${layer}.${name}`, values, storage);
+              perBlock.push(fallback);
+              return fallback;
+            }
+            const buffer = this.device.createBuffer({
+              label: `esmc.${name}`, size: Math.ceil(values.byteLength / 4) * 4,
+              usage: storage | GPUBufferUsage.COPY_DST });
+            this.device.queue.writeBuffer(buffer, 0, values.buffer,
+                                          values.byteOffset, values.byteLength);
+            store[name] = { buffer };
+            return store[name];
+          }
           const allocation = this.allocator.upload(`esmc.b${layer}.${name}`, values, storage);
           perBlock.push(allocation);
           return allocation;
@@ -331,16 +476,72 @@ export class EsmcTowerGpu {
         const next = keepPersistent(this.allocator.allocate(`esmc.x.${layer}`,
           rows * model * 4, storage | GPUBufferUsage.COPY_SRC));
 
-        const attnScale = upload("attn_norm/scale", weights["attn_norm/scale"]);
-        const attnOffset = upload("attn_norm/offset", weights["attn_norm/offset"]);
-        const qkvWeights = upload("qkv", narrow(weights["qkv/weights"]));
-        const qScale = upload("q_norm", weights["q_norm/scale"]);
-        const kScale = upload("k_norm", weights["k_norm/scale"]);
-        const attnOut = upload("attn_out", narrow(scaled(weights["attn_out/weights"])));
-        const ffnScale = upload("ffn_norm/scale", weights["ffn_norm/scale"]);
-        const ffnOffset = upload("ffn_norm/offset", weights["ffn_norm/offset"]);
-        const fc1 = upload("fc1", narrow(weights["fc1/weights"]));
-        const fc2 = upload("fc2", narrow(scaled(weights["fc2/weights"])));
+        // 🔴 THE FOUR BIG MATRICES GO THROUGH THE DEVICE DECODER WHEN THE
+        // CALLER OFFERS THEIR CODES. `sources` is a leaf name to
+        // `{record, buffer, byteOffset}`, exactly what HttpTensorStore's
+        // `tensorSource` returns - and a caller that does not offer one gets
+        // the host path unchanged, which is every checker and every bench.
+        // Measured: the tower's block reads were 5482 ms of a 7990 ms first
+        // ESMFold2 fold, and this is 99.6% of them.
+        //
+        // 🔴 AND A SCALED RESIDUAL CANNOT TAKE IT, for the reason `scaled`
+        // already gives: the division is elementwise over floats and these
+        // never become floats here. No checkpoint in this repository scales,
+        // so the branch is a guard rather than a path.
+        const sources = residualScale === 1 ? weights?.sources : undefined;
+        const uploadNarrow = async (name, leaf, make) => {
+          if (store !== undefined && store[name] !== undefined) return store[name];
+          const source = sources?.[leaf];
+          if (source !== undefined) {
+            const elements = elementsOf(source.record);
+            const bytes = Math.ceil(elements / 2) * 4;
+            // The resident path owns its buffer for the model's lifetime; the
+            // streaming one hands it to the pool, as `upload` does.
+            if (store !== undefined) {
+              try {
+                noteAllocation(this.device, `esmc.${name}`, bytes);
+              } catch (error) {
+                if (!(error instanceof GpuMemoryBudgetError)) throw error;
+                noteResidencyRefused(this.device);
+                resident.delete(layer);
+                return upload(name, make);
+              }
+              const buffer = this.device.createBuffer({
+                label: `esmc.${name}`, size: bytes,
+                usage: storage | GPUBufferUsage.COPY_DST });
+              if (await decodeIntoOnDevice(this.device, source, elements, buffer)) {
+                store[name] = { buffer };
+                return store[name];
+              }
+              buffer.destroy();
+              noteDestroy(this.device, bytes, `esmc.${name}`);
+              return upload(name, make);
+            }
+            const allocation = this.allocator.allocate(
+              `esmc.b${layer}.${name}`, bytes, storage | GPUBufferUsage.COPY_DST);
+            if (await decodeIntoOnDevice(this.device, source, elements, allocation.buffer)) {
+              perBlock.push(allocation);
+              return allocation;
+            }
+            allocation.release();
+          }
+          return upload(name, make);
+        };
+
+        const attnScale = upload("attn_norm/scale", () => weights["attn_norm/scale"]);
+        const attnOffset = upload("attn_norm/offset", () => weights["attn_norm/offset"]);
+        const qkvWeights = await uploadNarrow("qkv", "qkv/weights",
+          () => narrow(weights["qkv/weights"]));
+        const qScale = upload("q_norm", () => weights["q_norm/scale"]);
+        const kScale = upload("k_norm", () => weights["k_norm/scale"]);
+        const attnOut = await uploadNarrow("attn_out", "attn_out/weights",
+          () => narrow(scaled(weights["attn_out/weights"])));
+        const ffnScale = upload("ffn_norm/scale", () => weights["ffn_norm/scale"]);
+        const ffnOffset = upload("ffn_norm/offset", () => weights["ffn_norm/offset"]);
+        const fc1 = await uploadNarrow("fc1", "fc1/weights",
+          () => narrow(weights["fc1/weights"]));
+        const fc2 = await uploadNarrow("fc2", "fc2/weights",
+          () => narrow(scaled(weights["fc2/weights"])));
 
         const encoder = this.device.createCommandEncoder({ label: `esmc-block-${layer}` });
         const pass = encoder.beginComputePass({ label: `esmc-block-${layer}` });

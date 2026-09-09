@@ -201,7 +201,7 @@ export class Af3StructuralExpanderGpu {
    * @param {object} weights from structuralExpanderWeights
    * @param {object} features from structuralPairFeatures
    */
-  async run(layout, embeddings, weights, features, residueTokens) {
+  async run(layout, embeddings, weights, features, residueTokens, options = {}) {
     const tokens = layout.tokens;
     const channels = weights.pairChannels;
     const singleChannels = weights.singleChannels;
@@ -269,12 +269,20 @@ export class Af3StructuralExpanderGpu {
                tokens * tokens);
       dispatch(singlePipeline, [singleIn, parent, role, singleWeightBuffer, singleOut], tokens);
 
-      const readPair = keep(this.allocator.allocate("expand.read-pair",
+      // 🔴 THE EXPANDED PAIR MAY STAY WHERE IT IS. Its only reader is the
+      // structural refiner, which is a pairformer stack that takes a buffer -
+      // so this was `tokens^2 x 384` read back and uploaded again between two
+      // GPU stages. Measured in a 200-residue OpenDDE fold: `expand.read-pair`
+      // 343 ms for 216 MiB, at 0.6 GB/s. The caller owns what comes back.
+      const keepPair = options.keepPair === true;
+      const readPair = keepPair ? undefined : keep(this.allocator.allocate("expand.read-pair",
         tokens * tokens * channels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
       const readSingle = keep(this.allocator.allocate("expand.read-single",
         tokens * singleChannels * 4, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
-      encoder.copyBufferToBuffer(pairOut.buffer, 0, readPair.buffer, 0,
-                                 tokens * tokens * channels * 4);
+      if (!keepPair) {
+        encoder.copyBufferToBuffer(pairOut.buffer, 0, readPair.buffer, 0,
+                                   tokens * tokens * channels * 4);
+      }
       encoder.copyBufferToBuffer(singleOut.buffer, 0, readSingle.buffer, 0,
                                  tokens * singleChannels * 4);
       this.device.queue.submit([encoder.finish()]);
@@ -285,6 +293,11 @@ export class Af3StructuralExpanderGpu {
         allocation.buffer.unmap();
         return copy;
       };
+      if (keepPair) {
+        const owned = allocations.indexOf(pairOut);
+        if (owned >= 0) allocations.splice(owned, 1);
+        return { pair: undefined, pairAllocation: pairOut, single: await read(readSingle) };
+      }
       return { pair: await read(readPair), single: await read(readSingle) };
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();

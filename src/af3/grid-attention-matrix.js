@@ -147,32 +147,69 @@ export function createGridAttendMatrixShader(shape, store4 = {}, geometry) {
   // column direction and mask[(row,j)] otherwise.
   const maskIndex = transpose ? "k_index * N + row" : "row * N + k_index";
 
-  const tileBody = (checked) => `    workgroupBarrier();
-    for (var i = local; i < ${KEYS}u * ${HD4}u; i += ${LANES}u) {
-      let ki = i / ${HD4}u;
-      let c4 = i % ${HD4}u;
-      let k_index = k0 + ki;
-      var kv = vec4<f32>(0.0);
-      var vv = vec4<f32>(0.0);
-      ${checked ? "if (k_index < N) {" : "{"}
-        let at = ((row * N + k_index) * HEADS + head) * ${HD4}u + c4;
-        kv = ${read4("k", packK, "at")};
-        vv = ${read4("v", packV, "at")};
+  // 🔴 THE GLOBAL READS COME BEFORE THE BARRIER, NOT AFTER IT. This tile used to
+  // be barrier, read global, write workgroup, barrier, compute - so every key
+  // tile exposed a full memory latency with nothing of this workgroup's own to
+  // cover it. Reading into REGISTERS first and moving the barrier between the
+  // read and the write puts that latency underneath the TAIL OF THE PREVIOUS
+  // TILE'S compute. The same change is worth 1.43x on the staged GEMM and 5% on
+  // AF2's flash attention; see `prefetch` in src/runtime/matrix-linear.js.
+  //
+  // 🔴 AND THE HELD TILE IS UNROLLED INTO NAMED VARIABLES, because a dynamic
+  // index into a WGSL array is addressable memory and not registers - the trap
+  // CLAUDE.md records, and the one that made the GEMM's first prefetch SLOWER
+  // than no prefetch at all.
+  const stageCount = KEYS * HD4;
+  const stageIterations = Math.ceil(stageCount / LANES);
+  const stageExact = stageCount % LANES === 0;
+  const maskIterations = Math.ceil(KEYS / LANES);
+  const maskExact = KEYS % LANES === 0;
+  const tileBody = (checked) => `${lines(stageIterations, (j) => `    var kv_${j} = vec4<f32>(0.0);
+    var vv_${j} = vec4<f32>(0.0);
+    {
+      let i = local + ${j * LANES}u;
+      ${stageExact ? "{" : `if (i < ${stageCount}u) {`}
+        let ki = i / ${HD4}u;
+        let c4 = i % ${HD4}u;
+        let k_index = k0 + ki;
+        ${checked ? "if (k_index < N) {" : "{"}
+          let at = ((row * N + k_index) * HEADS + head) * ${HD4}u + c4;
+          kv_${j} = ${read4("k", packK, "at")};
+          vv_${j} = ${read4("v", packV, "at")};
+        }
       }
-      // The key goes in transposed and the value does not.
-${lines(4, (c) => `      staged_kt[(c4 * 4u + ${c}u) * S_KEY + ki] = f16(kv${[".x", ".y", ".z", ".w"][c]});`)}
-${lines(4, (c) => `      staged_v[ki * S_HEAD + c4 * 4u + ${c}u] = f16(vv${[".x", ".y", ".z", ".w"][c]});`)}
-    }
+    }`)}
+${lines(maskIterations, (j) => `    var km_${j} = 0.0;
+    {
+      let i = local + ${j * LANES}u;
+      ${maskExact ? "{" : `if (i < ${KEYS}u) {`}
+        let k_index = k0 + i;
+        ${checked
+          ? `km_${j} = select(0.0, mask[${maskIndex}], k_index < N);`
+          : `km_${j} = mask[${maskIndex}];`}
+      }
+    }`)}
+    workgroupBarrier();
+${lines(stageIterations, (j) => `    {
+      let i = local + ${j * LANES}u;
+      ${stageExact ? "{" : `if (i < ${stageCount}u) {`}
+        let ki = i / ${HD4}u;
+        let c4 = i % ${HD4}u;
+        // The key goes in transposed and the value does not.
+${lines(4, (c) => `        staged_kt[(c4 * 4u + ${c}u) * S_KEY + ki] = f16(kv_${j}${[".x", ".y", ".z", ".w"][c]});`)}
+${lines(4, (c) => `        staged_v[ki * S_HEAD + c4 * 4u + ${c}u] = f16(vv_${j}${[".x", ".y", ".z", ".w"][c]});`)}
+      }
+    }`)}
     // 🔴 THE MASK IS PER KEY AND THE SCALAR KERNEL READ IT PER QUERY ROW. All
     // ${ROWS} rows of this workgroup want the same global float for the same
     // key. Stage it once - ${KEYS} floats against ${ROWS} redundant loads a key
     // - and leave the conditional it feeds alone; see the note at the top.
-    for (var i = local; i < ${KEYS}u; i += ${LANES}u) {
-      let k_index = k0 + i;
-      ${checked
-        ? `key_mask[i] = select(0.0, mask[${maskIndex}], k_index < N);`
-        : `key_mask[i] = mask[${maskIndex}];`}
-    }
+${lines(maskIterations, (j) => `    {
+      let i = local + ${j * LANES}u;
+      ${maskExact ? "{" : `if (i < ${KEYS}u) {`}
+        key_mask[i] = km_${j};
+      }
+    }`)}
 ${HEAD === dimension ? "" : `    for (var i = local; i < ${HEAD - dimension}u * ${KEYS}u; i += ${LANES}u) {
       staged_kt[(${dimension}u + i / ${KEYS}u) * S_KEY + i % ${KEYS}u] = f16(0.0);
       staged_v[(i % ${KEYS}u) * S_HEAD + ${dimension}u + i / ${KEYS}u] = f16(0.0);

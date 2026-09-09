@@ -80,6 +80,24 @@ export function stagedMatrixBlock(spec) {
 }
 
 /**
+ * Whether a geometry's `directWeights` may actually be taken at this shape.
+ *
+ * 🔴 THE KNOB IS A REQUEST AND THIS IS THE ANSWER, because two of the three
+ * conditions are the CALLER's and not the device's. The weight buffer has to
+ * already hold the matrix element - a direct read has no staging copy left to
+ * convert in - and the contracted extent has to divide by the K panel, because
+ * the buffer is bound as [weights | bias] and a tail panel would read the bias
+ * as a weight row. A caller that sets the knob and skips this gets a kernel
+ * that returns a plausible tensor.
+ */
+export function directWeightsAllowed(geometry, shape) {
+  if (geometry?.directWeights !== true) return false;
+  if (geometry.weightsTransposed === true) return false;
+  if (shape.weightPrecision !== (geometry.matrixElement ?? "f16")) return false;
+  return shape.inner % (geometry.blockInner ?? 16) === 0;
+}
+
+/**
  * Whether a geometry can serve a shape at all.
  *
  * 🔴 IT ALWAYS CAN, NOW, and this stays as a named fact rather than being
@@ -105,7 +123,8 @@ export function stagedMatrixStorage(geometry = {}) {
     subgroupRows = 1, subgroupColumns = 8,
     tile = { M: 16, N: 16, K: 16 }, result = "f32",
   } = geometry;
-  const panels = (blockRows * blockInner + blockInner * blockColumns) * 2;
+  const panels = (blockRows * blockInner
+    + (geometry.directWeights ? 0 : blockInner * blockColumns)) * 2;
   const scratch = subgroupRows * subgroupColumns * tile.M * (blockColumns / subgroupColumns)
     * (result === "f32" ? 4 : 2);
   return panels + scratch;
@@ -175,6 +194,27 @@ export function createStagedMatrixShader(options = {}) {
   // is indexed by PAIR rather than by row-major (row, column). All three are
   // one line each here and a layout migration anywhere else.
   const sourceTransposed = options.sourceTransposed ?? false;
+  // 🔴 THE ROW THE SOURCE IS READ FROM NEED NOT BE THE ROW BEING WRITTEN, and
+  // AF3's grid attention is where that shows: the transposed direction reads
+  // `(row % n) * n + row / n`, a pair transpose, and writes at `row`. That is
+  // not `sourceTransposed`, which swaps the two AXES of a matrix; it is a
+  // permutation of the row index alone. A WGSL expression in `r`; null is `r`.
+  const sourceRowIndex = options.sourceRowIndex ?? null;
+  // 🔴 AND THE WEIGHT'S INDEX CAN BE AN EXPRESSION TOO, WHICH IS AN INTERLEAVE
+  // WITHOUT A REPACK. AF2's q/k/v/gate projection holds its four matrices
+  // SEPARATELY and contiguously - `[role][k][out]` - where `outputGroup` wants
+  // `[k][4 * out + role]`. AF3's triangle projection solved the same mismatch
+  // by re-laying its weights at pack time; here the roles are one stride apart
+  // in one buffer, so the mapping is arithmetic and the pack can stay as it is
+  // - which keeps the four other shaders binding that buffer untouched.
+  //
+  // A WGSL expression in `$k` and `$c`, relative to `weight_offset`; null is
+  // the plain row-major `$k * parameters.columns + $c`. It cannot be
+  // vec4-staged, because four consecutive columns are no longer four
+  // consecutive elements, and that is refused rather than made quietly wrong.
+  const weightIndex = options.weightIndex ?? null;
+  const sourceRow = (r) => (sourceRowIndex === null
+    ? r : `(${sourceRowIndex.replaceAll("$row", r)})`);
   const bias = options.bias ?? true;
   const outputIndex = options.outputIndex ?? "row * parameters.columns + column";
   // 🔴 A PER-ROW SCALE APPLIED BEFORE THE RESIDUAL, which is what turns the
@@ -234,7 +274,53 @@ export function createStagedMatrixShader(options = {}) {
       throw new RangeError("outputGroup.size wants an integer of at least two");
     }
     if (!Array.isArray(outputGroup.stores) || outputGroup.stores.length === 0) {
-      throw new RangeError("outputGroup wants at least one [value, gate] store");
+      throw new RangeError("outputGroup wants at least one store");
+    }
+    // 🔴 A STORE IS EITHER GATED OR PLAIN. `[value, gate]` writes
+    // `value * logistic(gate)`, which is AF3's triangle projection; a bare
+    // index writes that lane as it is, which is grid attention's q/k/v/gate -
+    // four outputs off one source read, no gate applied here at all. Both are
+    // the same epilogue over the same interleaved weight block.
+    for (const [lane, expression] of Object.entries(outputGroup.laneBias ?? {})) {
+      // 🔴 ONE LANE OF THE GROUP HAS A BIAS AND THE OTHERS DO NOT, which is
+      // AF2's projection: q, k and v have none and the gate's rides in the w
+      // lane. The generic `bias` adds `weights[bias_offset + column]` to EVERY
+      // lane of the group, which here would add the gate's bias to the query.
+      // A WGSL expression in `$channel`, per lane, read from the weight buffer.
+      if (!(Number(lane) >= 0 && Number(lane) < outputGroup.size)
+          || typeof expression !== "string") {
+        throw new RangeError("outputGroup.laneBias maps a lane of the group to a WGSL expression");
+      }
+    }
+    if (outputGroup.pack === true) {
+      // 🔴 A PACKED OUTPUT IS TWO CHANNELS TO A WORD, AND ONE LANE HAS TO OWN
+      // BOTH HALVES. Every other caller here refuses a packed target for
+      // exactly that reason - this epilogue owns one channel of one row. It can
+      // own two: make the GROUP twice as wide, so `size` adjacent columns are
+      // TWO output channels of every role, and the lane that writes the word
+      // holds both. Each store is then a PAIR of WGSL expressions, low half
+      // first, and the binding is u32 rather than a float.
+      if (outputGroup.size % 2 !== 0) {
+        throw new RangeError("a packed output group holds two channels, so its size is even");
+      }
+      for (const store of outputGroup.stores) {
+        if (!Array.isArray(store) || store.length !== 2
+            || !store.every((e) => typeof e === "string")) {
+          throw new RangeError("a packed outputGroup store is [low, high] WGSL expressions");
+        }
+      }
+    } else
+    for (const store of outputGroup.stores) {
+      // 🔴 ...OR A WGSL EXPRESSION IN `v0..v{size-1}`, which is what AF2's
+      // projection needs: its four lanes are the query TIMES 1/sqrt(head_dim),
+      // the key and the value plain, and the gate through a logistic. Three
+      // forms, one epilogue, because they are all "what to write from a group
+      // of adjacent columns".
+      const plain = Number.isSafeInteger(store) || typeof store === "string";
+      if (!plain && !(Array.isArray(store) && store.length === 2)) {
+        throw new RangeError(
+          "an outputGroup store is a lane index, a WGSL expression, or a [value, gate] pair");
+      }
     }
     if (residual) throw new RangeError("a grouped output does not add into its target");
     if (scaleIndex !== null) throw new RangeError("a grouped output takes no result scale");
@@ -264,7 +350,42 @@ export function createStagedMatrixShader(options = {}) {
   // needs and the incoming one does not. `sourceTransposed` has existed for the
   // left operand since the outer product mean; this is its mirror, and the two
   // directions of one op need one each.
+  // 🔴 STAGING THE RIGHT OPERAND BUYS NOTHING WHEN `subgroupRows` IS ONE, AND
+  // IT IS TWO THIRDS OF THE STAGING. A workgroup stages BM x BK of the source
+  // and BK x BN of the weights; at 64x128x16 that is 1024 halves against 2048.
+  // The source is shared - with SGY = 1 every subgroup has sg_row 0 and reads
+  // the same rows, so one staged panel feeds eight subgroups. The WEIGHTS are
+  // not: subgroup `sg` owns columns `sg * BN/SGX ..`, which no other subgroup
+  // touches, so the staged copy is read exactly once and the workgroup memory
+  // is a detour. `subgroupMatrixLoad` takes a storage pointer, so the tile can
+  // come straight out of the weight buffer at stride `parameters.columns` -
+  // the same layout the staged panel has, at a different stride.
+  //
+  // What it costs: `tools/gpu/probe-staged-gemm-parts.js` prices the staging
+  // loop at 3.10 ms of a 4.58 ms kernel and the matrix issue at 1.69.
+  //
+  // 🔴 IT NEEDS `inner % blockInner == 0` AND THE CALLER IS WHAT KNOWS THAT.
+  // The weight buffer is bound as [weights | bias], so a tail panel reading
+  // past the inner extent picks the bias up as a weight row - which is the
+  // trap the zero-padded staging loop exists to avoid, and there is no padding
+  // in a direct read. Every caller that sets this contracts a channel count,
+  // which is a multiple of sixteen; the outer product mean's K is an alignment
+  // depth and the triangle contraction's is a protein length, and neither may.
+  const directWeights = options.directWeights ?? false;
+  // 🔴 STAGE THE NEXT PANEL'S GLOBAL READS BEFORE THIS PANEL'S MULTIPLIES.
+  // Without it every panel is barrier, read global, barrier, multiply - so the
+  // global latency is exposed once per panel and covered only by whatever other
+  // workgroups the SM happens to hold. The reads go into REGISTERS first, which
+  // costs BM * BK / threads of them - four halves a lane at 64x128x16 with 256
+  // threads, one vec4 - and the workgroup write moves after the multiply.
+  const prefetch = options.prefetch ?? false;
   const weightsTransposed = options.weightsTransposed ?? false;
+  if (directWeights) {
+    if (weightsTransposed) throw new RangeError("a transposed right operand is staged, not direct");
+    if (weightPrecision !== (options.matrixElement ?? "f16")) {
+      throw new RangeError("a direct right operand is read as the matrix element, so the buffer must hold it");
+    }
+  }
   if (weightsTransposed && vectorWeights) {
     // A transposed read walks k, which is the slow axis of the stored operand,
     // so four consecutive elements of the vec4 are `columns` apart. Refused
@@ -274,6 +395,14 @@ export function createStagedMatrixShader(options = {}) {
   if (sourceTransposed && vectorSource) {
     throw new RangeError("a transposed left operand cannot be vector-staged");
   }
+  // 🔴 A GATE IN ITS OWN BUFFER, AT THE SAME INDEX AS THE SOURCE. `sourceGate`
+  // above is the SwiGLU's - two halves of one widened row, a fixed distance
+  // apart. AF3's grid attention wants the other shape: `gathered[i] *
+  // logistic(gate[i])`, where the gate is a separate tensor the projection
+  // kernel binds. Applying it at the staging costs one extra read in a loop
+  // that already runs and removes an elementwise pass over `rows x width`.
+  const sourceModulate = options.sourceModulate ?? false;
+  const sourceModulatePrecision = options.sourceModulatePrecision ?? "f32";
   const sourceGate = options.sourceGate ?? null;
   if (sourceGate !== null) {
     for (const key of ["stride", "offset"]) {
@@ -328,12 +457,24 @@ export function createStagedMatrixShader(options = {}) {
     throw new RangeError(`unknown matrix element ${half}`);
   }
   const sourceElement = vectorSource ? `vec4<${sourcePrecision}>` : sourcePrecision;
-  const weightElement = vectorWeights ? `vec4<${weightPrecision}>` : weightPrecision;
+  // A direct read needs the binding to BE the matrix element, so it cannot also
+  // be a vec4 - and it has no staging loop left to vectorise.
+  if (weightIndex !== null && vectorWeights) {
+    throw new RangeError("an indexed right operand cannot be vector-staged");
+  }
+  if (weightIndex !== null && directWeights) {
+    throw new RangeError("an indexed right operand is staged, not read directly");
+  }
+  const weightAt = (k, c) => (weightIndex === null
+    ? `${k} * parameters.columns + ${c}`
+    : `(${weightIndex.replaceAll("$k", `(${k})`).replaceAll("$c", `(${c})`)})`);
+  const weightVector = vectorWeights && !directWeights;
+  const weightElement = weightVector ? `vec4<${weightPrecision}>` : weightPrecision;
 
   const declarations = [];
   const stores = [];
   // ...the bias lives in the WEIGHT buffer, so its read follows that binding.
-  const biasRead = vectorWeights
+  const biasRead = weightVector
     ? "weights[(parameters.bias_offset + column) / 4u][(parameters.bias_offset + column) % 4u]"
     : "weights[parameters.bias_offset + column]";
 
@@ -355,12 +496,21 @@ export function createStagedMatrixShader(options = {}) {
       // The channel this group of ${outputGroup.size} columns is.
       let channel = column / ${outputGroup.size}u;
   ${Array.from({ length: outputGroup.size }, (_, r) => `    let v${r} = f32(scratch[sg * ${M * flushWidth}u + i + ${r}u])`
-      + (bias ? ` + f32(${vectorWeights
+      + (outputGroup.laneBias?.[r] === undefined ? ""
+        : ` + f32(weights[${outputGroup.laneBias[r].replaceAll("$channel", "channel")}])`)
+      + (bias ? ` + f32(${weightVector
       ? `weights[(parameters.bias_offset + column + ${r}u) / 4u][(parameters.bias_offset + column + ${r}u) % 4u]`
       : `weights[parameters.bias_offset + column + ${r}u]`})` : "") + ";").join("\n")}
   ${rowMask ? "    let row_mask = mask[row];\n" : ""}    let at = ${outputIndex};
-  ${outputGroup.stores.map(([value, gate], index) => `    ${index === 0 ? "output" : `output${index + 1}`}[at] = `
-      + `${outputPrecision}(${rowMask ? "row_mask * " : ""}v${value} * (1.0 / (1.0 + exp(-v${gate}))));`).join("\n")}
+  ${outputGroup.stores.map((store, index) => (outputGroup.pack === true
+      ? `    ${index === 0 ? "output" : `output${index + 1}`}[at] = `
+        + `pack2x16float(vec2<f32>(${store[0]}, ${store[1]}));`
+      : `    ${index === 0 ? "output" : `output${index + 1}`}[at] = `
+      + `${outputPrecision}(${rowMask ? "row_mask * " : ""}${typeof store === "string"
+        ? `(${store})`
+        : Number.isSafeInteger(store)
+          ? `v${store}`
+          : `v${store[0]} * (1.0 / (1.0 + exp(-v${store[1]})))`});`)).join("\n")}
     }
     workgroupBarrier();`);
     } else {
@@ -387,8 +537,13 @@ export function createStagedMatrixShader(options = {}) {
       + `&staged_source, (sg_row + ${m * M}u) * ${BK}u + kk, false, ${BK}u);`);
   }
   for (let n = 0; n < accColumns; n += 1) {
-    inner.push(`      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${half}, ${N}, ${K}>>(`
-      + `&staged_weights, kk * ${BN}u + sg_column + ${n * N}u, false, ${BN}u);`);
+    inner.push(directWeights
+      ? `      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${half}, ${N}, ${K}>>(`
+        + `&weights, parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}`
+        + `(k0 + kk) * parameters.columns + column_origin + sg_column + ${n * N}u,`
+        + ` false, parameters.columns);`
+      : `      let right_${n} = subgroupMatrixLoad<subgroup_matrix_right<${half}, ${N}, ${K}>>(`
+        + `&staged_weights, kk * ${BN}u + sg_column + ${n * N}u, false, ${BN}u);`);
   }
   for (let m = 0; m < accRows; m += 1) {
     for (let n = 0; n < accColumns; n += 1) {
@@ -401,57 +556,129 @@ export function createStagedMatrixShader(options = {}) {
   // Consecutive threads take consecutive columns, which is the coalesced
   // direction in both tensors, and with vector staging each takes four.
   // 🔴 THE TWO OPERANDS CHOOSE SEPARATELY - see vectorSource/vectorWeights.
-  const stagingLoops = (vectorSource
-    ? `for (var i = tid; i < ${stagedSource / 4}u; i += ${threads}u) {
-      let k = k0 + (i % ${BK / 4}u) * 4u;
-      let r = row_origin + i / ${BK / 4}u;
-      let v = ${sourceGate === null
-        ? scaled(`select(vec4<${sourcePrecision}>(0),
-        source[(${batchStride === null ? "" : "batch_base + "}r * parameters.inner + k) / 4u], k < parameters.inner && r < parameters.rows)`,
+  // Each loop's body is generated once and its DESTINATION varies: straight
+  // into workgroup memory, or into a register array the next barrier writes
+  // out. `i / threads` is the iteration number, because i starts at tid < threads
+  // and steps by threads - so the register index needs no separate counter.
+  const sourceCount = vectorSource ? stagedSource / 4 : stagedSource;
+  const weightCount = vectorWeights ? stagedWeights / 4 : stagedWeights;
+  const sourceIter = Math.ceil(sourceCount / threads);
+  const weightIter = Math.ceil(weightCount / threads);
+  // `logistic(gate[i]) *` where the source is modulated, nothing otherwise.
+  const modulated = (value, index, wide) => (!sourceModulate ? value
+    : wide
+      ? `(${value}) * (${wide}(1.0) / (${wide}(1.0)`
+        + ` + exp(-${wide}(source_gate[${index}]))))`
+      : `(${value}) * (1.0 / (1.0 + exp(-f32(source_gate[${index}]))))`);
+  const sourceValue = vectorSource
+    ? `${sourceGate === null
+        ? scaled(`select(vec4<f32>(0.0),
+        ${modulated(`vec4<f32>(source[(${batchStride === null ? "" : "batch_base + "}${sourceRow("r")} * parameters.inner + k) / 4u])`,
+          `(${sourceRow("r")} * parameters.inner + k) / 4u`, "vec4<f32>")}, k < parameters.inner && r < parameters.rows)`,
         "min(r, parameters.rows - 1u)")
         : `select(vec4<f32>(0.0), swish_gate4(
         vec4<f32>(source[(r * ${sourceGate.stride}u + k) / 4u]),
         vec4<f32>(source[(r * ${sourceGate.stride}u + ${sourceGate.offset}u + k) / 4u])),
-        k < parameters.inner && r < parameters.rows)`};
-      let at = i * 4u;
-      staged_source[at] = ${half}(v.x);
-      staged_source[at + 1u] = ${half}(v.y);
-      staged_source[at + 2u] = ${half}(v.z);
-      staged_source[at + 3u] = ${half}(v.w);
-    }`
-    : `    for (var i = tid; i < ${stagedSource}u; i += ${threads}u) {
-      let k = k0 + i % ${BK}u;
-      let r = row_origin + i / ${BK}u;
-      staged_source[i] = select(${half}(0),
+        k < parameters.inner && r < parameters.rows)`}`
+    : `select(${half}(0),
         ${half}(${sourceGate === null
-          ? scaled(`source[${batchStride === null ? "" : "batch_base + "}${sourceTransposed
-            ? "k * parameters.rows + r" : "r * parameters.inner + k"}]`,
+          ? scaled(modulated(
+            `f32(source[${batchStride === null ? "" : "batch_base + "}${sourceTransposed
+              ? `k * parameters.rows + ${sourceRow("r")}` : `${sourceRow("r")} * parameters.inner + k`}])`,
+            sourceTransposed
+              ? `k * parameters.rows + ${sourceRow("r")}` : `${sourceRow("r")} * parameters.inner + k`),
           "min(r, parameters.rows - 1u)")
           : `swish_gate(f32(source[r * ${sourceGate.stride}u + k]),
              f32(source[r * ${sourceGate.stride}u + ${sourceGate.offset}u + k]))`}),
-        k < parameters.inner && r < parameters.rows);
-    }`)
-    + (vectorWeights
-    ? `\n    for (var i = tid; i < ${stagedWeights / 4}u; i += ${threads}u) {
-      let k = k0 + i / ${BN / 4}u;
-      let c = column_origin + (i % ${BN / 4}u) * 4u;
-      let v = select(vec4<${weightPrecision}>(0),
+        k < parameters.inner && r < parameters.rows)`;
+  const weightValue = vectorWeights
+    ? `select(vec4<${weightPrecision}>(0),
         weights[(parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}k * parameters.columns + c) / 4u],
-        k < parameters.inner && c < parameters.columns);
-      let at = i * 4u;
+        k < parameters.inner && c < parameters.columns)`
+    : `select(${half}(0),
+        ${half}(weights[parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}${
+          weightsTransposed ? "c * parameters.inner + k" : weightAt("k", "c")}]),
+        k < parameters.inner && c < parameters.columns)`;
+
+  // One staged element (or vec4), from global memory into `target` - a named
+  // register when it is given, workgroup memory when it is null.
+  const sourceBody = (panel, target) => {
+    const head = `      let k = ${panel}${vectorSource ? ` + (i % ${BK / 4}u) * 4u` : ` + i % ${BK}u`};
+      let r = row_origin + i / ${vectorSource ? BK / 4 : BK}u;
+      let v = ${sourceValue};`;
+    if (target !== null) {
+      return `${head}\n      ${target} = ${vectorSource
+        ? `vec4<${half}>(${half}(v.x), ${half}(v.y), ${half}(v.z), ${half}(v.w))` : "v"};`;
+    }
+    return `${head}\n${vectorSource ? `      let at = i * 4u;
+      staged_source[at] = ${half}(v.x);
+      staged_source[at + 1u] = ${half}(v.y);
+      staged_source[at + 2u] = ${half}(v.z);
+      staged_source[at + 3u] = ${half}(v.w);` : "      staged_source[i] = v;"}`;
+  };
+  const weightBody = (panel, target) => {
+    const head = `      let k = ${panel} + i / ${vectorWeights ? BN / 4 : BN}u;
+      let c = column_origin${vectorWeights ? ` + (i % ${BN / 4}u) * 4u` : ` + i % ${BN}u`};
+      let v = ${weightValue};`;
+    if (target !== null) {
+      return `${head}\n      ${target} = ${vectorWeights
+        ? `vec4<${half}>(${half}(v.x), ${half}(v.y), ${half}(v.z), ${half}(v.w))` : "v"};`;
+    }
+    return `${head}\n${vectorWeights ? `      let at = i * 4u;
       staged_weights[at] = ${half}(v.x);
       staged_weights[at + 1u] = ${half}(v.y);
       staged_weights[at + 2u] = ${half}(v.z);
-      staged_weights[at + 3u] = ${half}(v.w);
+      staged_weights[at + 3u] = ${half}(v.w);` : "      staged_weights[i] = v;"}`;
+  };
+  // `into` is "workgroup" or "registers"; `panel` is the WGSL expression for
+  // the panel's first k.
+  //
+  // 🔴 THE REGISTER FORM IS UNROLLED AND THE REASON IS THIS FILE'S OWN TRAP. A
+  // held panel written as `array<vec4<f16>, n>` indexed by `i / threads` is a
+  // DYNAMIC index into an array, so WGSL puts it in addressable memory instead
+  // of registers - the same fault CLAUDE.md records for `unpack2x16float(w)[at
+  // & 1u]`, and it measured the same way: prefetching into an array took the
+  // kernel 3.190 -> 4.202 ms, worse than not prefetching at all. Unrolled into
+  // named variables it is registers, which is the whole point of holding it.
+  const each = (count, body) => Array.from({ length: Math.ceil(count / threads) },
+    (_, it) => `    {
+      let i = tid + ${it * threads}u;
+${count % threads === 0 && it < Math.floor(count / threads)
+      ? body(it) : `      if (i < ${count}u) {\n${body(it)}\n      }`}
+    }`).join("\n");
+  const sourceLoop = (into, panel) => (into === "workgroup"
+    ? `    for (var i = tid; i < ${sourceCount}u; i += ${threads}u) {
+${sourceBody(panel, null)}
     }`
-    : `\n    for (var i = tid; i < ${stagedWeights}u; i += ${threads}u) {
-      let k = k0 + i / ${BN}u;
-      let c = column_origin + i % ${BN}u;
-      staged_weights[i] = select(${half}(0),
-        ${half}(weights[parameters.weight_offset + ${batchStride === null ? "" : "batch_base + "}${
-          weightsTransposed ? "c * parameters.inner + k" : "k * parameters.columns + c"}]),
-        k < parameters.inner && c < parameters.columns);
-    }`);
+    : each(sourceCount, (it) => sourceBody(panel, `src_r${it}`)));
+  const sourceFlush = () => each(sourceCount, (it) => (vectorSource
+    ? `        let at${it} = i * 4u;
+        staged_source[at${it}] = src_r${it}.x;
+        staged_source[at${it} + 1u] = src_r${it}.y;
+        staged_source[at${it} + 2u] = src_r${it}.z;
+        staged_source[at${it} + 3u] = src_r${it}.w;`
+    : `        staged_source[i] = src_r${it};`));
+  const weightLoop = (into, panel) => (directWeights ? "" : (into === "workgroup"
+    ? `\n    for (var i = tid; i < ${weightCount}u; i += ${threads}u) {
+${weightBody(panel, null)}
+    }`
+    : `\n${each(weightCount, (it) => weightBody(panel, `w_r${it}`))}`));
+  const weightFlush = () => (directWeights ? "" : `\n${each(weightCount, (it) => (vectorWeights
+    ? `        let bt${it} = i * 4u;
+        staged_weights[bt${it}] = w_r${it}.x;
+        staged_weights[bt${it} + 1u] = w_r${it}.y;
+        staged_weights[bt${it} + 2u] = w_r${it}.z;
+        staged_weights[bt${it} + 3u] = w_r${it}.w;`
+    : `        staged_weights[i] = w_r${it};`))}`);
+  const registerDeclarations = !prefetch ? "" : [
+    ...Array.from({ length: sourceIter }, (_, it) =>
+      `  var src_r${it}: ${vectorSource ? `vec4<${half}>` : half};`),
+    ...(directWeights ? [] : Array.from({ length: weightIter }, (_, it) =>
+      `  var w_r${it}: ${vectorWeights ? `vec4<${half}>` : half};`)),
+  ].join("\n");
+
+  const stagingLoops = sourceLoop("workgroup", "k0") + weightLoop("workgroup", "k0");
+
   const usesHalf = [half, result, sourcePrecision, weightPrecision, outputPrecision]
     .includes("f16");
   return `${usesHalf ? "enable f16;\n" : ""}enable chromium_experimental_subgroup_matrix;
@@ -491,6 +718,13 @@ ${(() => {
       + `modulator: array<${options.modulatePrecision ?? "f32"}>;`);
     binding += 1;
   }
+  if (sourceModulate) {
+    lines.push("// A gate at the SOURCE's own index, through a logistic - see sourceModulate.");
+    lines.push(`@group(0) @binding(${binding}) var<storage, read> `
+      + `source_gate: array<${vectorSource
+        ? `vec4<${sourceModulatePrecision}>` : sourceModulatePrecision}>;`);
+    binding += 1;
+  }
   for (let index = 1; index < (outputGroup?.stores ?? []).length; index += 1) {
     lines.push(`@group(0) @binding(${binding}) var<storage, read_write> `
       + `output${index + 1}: array<${outputPrecision}>;`);
@@ -510,7 +744,8 @@ fn swish_gate4(gate: vec4<f32>, value: vec4<f32>) -> vec4<f32> {
 }
 `}
 var<workgroup> staged_source: array<${half}, ${stagedSource}>;
-var<workgroup> staged_weights: array<${half}, ${stagedWeights}>;
+${directWeights ? "// The right operand is read straight out of the weight buffer - see directWeights."
+  : `var<workgroup> staged_weights: array<${half}, ${stagedWeights}>;`}
 // One ${M}-row block per subgroup, which is all the result staging this needs.
 var<workgroup> scratch: array<${result}, ${scratch}>;
 
@@ -542,7 +777,29 @@ ${declarations.join("\n")}
   // [weight | bias], and a panel reading past the inner extent would otherwise
   // pick the bias up as if it were a weight row.
   let panels = (parameters.inner + ${BK}u - 1u) / ${BK}u;
+${prefetch ? `${registerDeclarations}
+  // The first panel, then one panel ahead of the multiplies from there on.
+${sourceLoop("registers", "0u")}${weightLoop("registers", "0u")}
+  workgroupBarrier();
+${sourceFlush()}${weightFlush()}
+  workgroupBarrier();
   for (var p = 0u; p < panels; p += 1u) {
+    let k0 = p * ${BK}u;
+    // 🔴 THE NEXT PANEL'S GLOBAL READS ARE ISSUED BEFORE THIS PANEL'S
+    // MULTIPLIES, so their latency is covered by work this workgroup has rather
+    // than by whatever else the SM happens to hold.
+    if (p + 1u < panels) {
+${sourceLoop("registers", `(p + 1u) * ${BK}u`)}${weightLoop("registers", `(p + 1u) * ${BK}u`)}
+    }
+    for (var kk = 0u; kk < ${BK}u; kk += ${K}u) {
+${inner.join("\n")}
+    }
+    workgroupBarrier();
+    if (p + 1u < panels) {
+${sourceFlush()}${weightFlush()}
+    }
+    workgroupBarrier();
+  }` : `  for (var p = 0u; p < panels; p += 1u) {
     let k0 = p * ${BK}u;
     workgroupBarrier();
 ${stagingLoops}
@@ -550,7 +807,7 @@ ${stagingLoops}
     for (var kk = 0u; kk < ${BK}u; kk += ${K}u) {
 ${inner.join("\n")}
     }
-  }
+  }`}
   workgroupBarrier();
 ${stores.join("\n")}
 }`;

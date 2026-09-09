@@ -33,14 +33,16 @@ import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3TrunkGpu } from "./trunk-webgpu.js";
 import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
 import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
+import { af3Dialect, pairformerBlockWeights } from "./weights.js";
 import { Af3StructuralExpanderGpu } from "./structural-expander-webgpu.js";
 import { structuralAttentionBias, structuralPairFeatures }
   from "./structural-expander-reference.js";
 import { structuralBatch, structuralLayout, structuralToResidue }
   from "./structural-tokens.js";
-import { diffusionConditioning } from "./diffusion-reference.js";
+import { Af3DiffusionConditioningGpu } from "./diffusion-conditioning-webgpu.js";
 import { openddeConfidence } from "./opendde-confidence.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
+import { memoryBudgetBytes, residencyAllowed } from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
@@ -339,6 +341,10 @@ export function backboneGeometry(batch, positions) {
  * verify this path have no device of their own to lend it.
  */
 export async function buildTargetFeat(batch, weights, device) {
+  // 🔴 THE EXPANDED PAIR GOES BACK AS SOON AS THE REFINER HAS RUN. The refiner
+  // writes its residuals into that same buffer - it takes it as `pairBuffer` -
+  // so releasing it here is releasing the refiner's own output... which is why
+  // it is NOT released here. See the release after the confidence head.
   const conditioning = perAtomConditioning({
     positions: batch.refPos, mask: batch.refMask,
     element: batch.refElement, charge: batch.refCharge,
@@ -425,9 +431,11 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   const expander = weights.expander;
   // `stage` NOTIFIES, it does not wrap - see its definition in foldBatch.
   stage("structural-expand", { tokens: layout.tokens });
+  // ...and its pair goes straight into the refiner below without a round trip;
+  // see the note on `keepPair` in structural-expander-webgpu.js.
   const expanded = await new Af3StructuralExpanderGpu(device).run(
     layout, { single: trunk.single, pair: trunk.pair, targetFeat, asymId: batch.asymId },
-    expander, structuralFeatures, batch.tokens);
+    expander, structuralFeatures, batch.tokens, { keepPair: true });
 
   // A subtoken's target_feat is its parent's plus a role embedding - the same
   // rule the expander applies to the single, on the other representation.
@@ -450,22 +458,48 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
   }
   const attentionBias = structuralAttentionBias(layout, structuralFeatures, expander);
   stage("structural-refine", { tokens: n });
+  // 🔴 THE REFINED PAIR STAYS ON THE DEVICE. Its only two readers are the
+  // diffusion conditioning and OpenDDE's confidence head, both of which run on
+  // the GPU - so reading `tokens^2 x 384` back and uploading it twice was a
+  // round trip of a tensor that never needed to be host-side at all. Measured
+  // in a 200-residue fold's buffer profile: `af3-block.readback-pair` is 389 ms
+  // over three stacks at 490.6 MiB, mapAsync running at 1.26 GB/s.
   const refined = await new Af3PairformerStackGpu(
     device, { pairWeightPrecision: weights.refinerWeightPrecision }).run(
     { tokens: n, pair: expanded.pair, single: expanded.single, pairMask, seqMask },
-    weights.refiner, weights.trunk.dialect, { extraPairBias: attentionBias });
+    weights.refiner, weights.trunk.dialect,
+    { extraPairBias: attentionBias, keepPair: true,
+      pairBuffer: expanded.pairAllocation.buffer });
 
+  // 🔴 THE EXPANDED PAIR GOES BACK AS SOON AS THE REFINER HAS RUN. The refiner
+  // writes its residuals into that same buffer - it takes it as `pairBuffer` -
+  // so releasing it here is releasing the refiner's own output... which is why
+  // it is NOT released here. See the release after the confidence head.
   const conditioning = perAtomConditioning({
     positions: structural.refPos, mask: structural.refMask,
     element: structural.refElement, charge: structural.refCharge,
     atomNameChars: structural.refAtomNameChars,
   }, n, batch.dense, weights.atomReference);
   stage("structural-conditioning", { tokens: n });
-  const pairConditioning = diffusionConditioning({
-      tokens: n, trunkSingle: refined.single, trunkPair: refined.pair,
+  // 🔴 THIS WAS THE HOST IMPLEMENTATION AND IT WAS HALF OF AN OpenDDE FOLD.
+  // 10.1 seconds of 20.8 at 130 structural tokens and 384 pair channels,
+  // unattributed until `sample-start` gave the stage after it a name - see
+  // docs/A100.md.
+  //
+  // 🔴 AND THE FIRST SWAP TO THE GPU MADE THE FOLD NON-FINITE, WHICH WAS NOT
+  // THE CALL SITE. `Af3DiffusionConditioningGpu` had no split-pair branch at
+  // all: OpenDDE LayerNorms the trunk pair on its own 384 channels, projects it
+  // to 128, projects the relative encoding to 128 separately and concatenates
+  // THOSE, and the shader knew only AlphaFold 3's one concatenation of 128 and
+  // the raw 139. It ran anyway, on a 256-row projection indexed as 267, and the
+  // checker that should have said so had `PAIR_CHANNELS = 128` typed into it -
+  // so both sides of its comparison were NaN and `NaN > bound` is false.
+  const pairConditioning = (await new Af3DiffusionConditioningGpu(device).run({
+      tokens: n, trunkSingle: refined.single,
+      trunkPairBuffer: expanded.pairAllocation.buffer,
       targetFeat: structuralTargetFeat, noiseLevel: 1, features: structural.features,
       dialect: weights.diffusion.dialect,
-    }, weights.diffusion.conditioning).pair;
+    }, weights.diffusion.conditioning)).pair;
 
   return {
     layout, structural, attentionBias,
@@ -479,10 +513,107 @@ async function expandToStructuralTokens(device, batch, trunk, targetFeat, weight
       queriesToTokenAtoms: structural.queriesToTokenAtoms,
       tokensToQueries: structural.tokensToQueries,
       tokensToKeys: structural.tokensToKeys,
-      trunkSingle: refined.single, trunkPair: refined.pair,
+      trunkSingle: refined.single,
+      // 🔴 A MARKER AND NOT A TENSOR. With `pairConditioning` given the head
+      // never reads this - see the cache in Af3DiffusionHeadGpu - and the
+      // refined pair is a device buffer now. `refinedPair` is what the
+      // confidence head binds; the fold releases it once that has run.
+      // 🔴 THE EXPANDER'S ALLOCATION, NOT THE REFINER'S RETURN. The refiner was
+      // handed this buffer and updates it IN PLACE - a pairformer block's pair
+      // track is a residual chain - so the expander is what owns it and what
+      // must release it.
+      trunkPair: undefined, refinedPair: expanded.pairAllocation,
       pairConditioning,
     },
   };
+}
+
+/**
+ * What a pairformer stack's block weights would occupy on the device.
+ *
+ * The tensors as loaded, halved where the pair track is kept in f16 - which is
+ * near enough for a rule that only chooses between two paths that both work,
+ * and is a real number rather than a threshold on the channel count.
+ */
+const RESIDENT_BYTES = new WeakMap();
+
+function pairTrackResidentBytes(blocks, pairWeightPrecision) {
+  if (blocks.length === 0) return 0;
+  const cached = RESIDENT_BYTES.get(blocks);
+  if (cached !== undefined) return cached[pairWeightPrecision === "f16" ? 1 : 0];
+  // 🔴 ONE BLOCK, TIMES THE COUNT - because walking all 48 costs 2.2 SECONDS.
+  // A block's properties are not all plain arrays; touching every one of them
+  // on every fold showed up as `msa-depth` going 25 ms -> 2197, in the stage
+  // before the walk runs. The blocks are identical in shape, which is the whole
+  // reason one stack compiles one set of pipelines for all of them.
+  let total = 0;
+  const seen = new Set();
+  const add = (value, depth) => {
+    if (ArrayBuffer.isView(value)) { total += value.byteLength; return; }
+    if (value === null || typeof value !== "object" || depth === 0 || seen.has(value)) return;
+    seen.add(value);
+    for (const inner of Object.values(value)) add(inner, depth - 1);
+  };
+  add(blocks[0], 4);
+  total *= blocks.length;
+  RESIDENT_BYTES.set(blocks, [total, total / 2]);
+  return pairWeightPrecision === "f16" ? total / 2 : total;
+}
+
+/**
+ * Compile the pairformer's pipelines while the weights are still downloading.
+ *
+ * 🔴 A FOLD WAITS FOR ITS SHADERS AND THE COMPILER IS IDLE THROUGH THE
+ * DOWNLOAD. Measured on this box: an OpenDDE fold is 1.74 s of weight load and
+ * then 2.93 s of folding, of which **1.23 s is shader compilation** with
+ * fourteen pipelines in flight while busy - the compiler pool saturated, so
+ * more concurrency cannot help and only moving it earlier can. AF3's is 0.80 s
+ * of a 2.47 s fold.
+ *
+ * Nothing a shader is generated from is a weight VALUE: the widths come from
+ * `store.shape` and an offset table is a running sum of tensor LENGTHS, which
+ * `stacked` also takes from the shape. So `bind(..., { shapesOnly: true })`
+ * builds one block of correctly sized ZEROS out of the manifest alone and this
+ * compiles against that, at the moment the manifest lands.
+ *
+ * Not awaited by the caller and safe to get wrong: the stack still asks the
+ * pipeline cache for its own keys when it runs, so a stand-in that disagrees
+ * has compiled shaders nobody binds. Pass the SAME constructor options the fold
+ * will use, or that is what happens.
+ *
+ * @param {number} tokens the token count the stack will run at - for a
+ *   structural-token bundle the refiner's is different, so this is the caller's
+ *   to say. See `structuralLayout`.
+ */
+/**
+ * The pair track's weight precision when a caller has not chosen one.
+ *
+ * 🔴 EXPORTED SO THE WARM CANNOT DISAGREE WITH THE FOLD. It compiled sixteen
+ * f32 triangles and transitions for OpenDDE by defaulting differently, which is
+ * pure waste contending with the shaders the fold does want - and the only way
+ * to see it is to count what a fold compiles with the warm and without
+ * (`--no-warm`). See WIDE_PAIR_TRACK for what the threshold is and is not.
+ */
+export function defaultPairWeightPrecision(pairChannels) {
+  return pairChannels >= WIDE_PAIR_TRACK ? "f16" : "f32";
+}
+
+export async function warmTrunkPipelines(device, store, tokens, options = {}) {
+  // 🔴 THE ROOT AND BOTH OPTION SETS, BECAUSE A WARM THAT GUESSES THEM COMPILES
+  // SHADERS NOBODY BINDS. Warming OpenDDE's structural stack with the TRUNK's
+  // root took its pipeline count from 269 to 322 - 53 shaders built and thrown
+  // away, and the fold no faster for having contended with them. The refiner
+  // has its own root, its own widths and an `extraPairBias` whose presence
+  // changes a kernel's bindings; all three are in the key.
+  const { root, stack = {}, run = {} } = options;
+  const sample = await pairformerBlockWeights(store, 0, root, { shapesOnly: true });
+  // ...and the same precision rule the fold applies, unless the caller has
+  // already chosen. The refiner's is the caller's to pass: it comes off the
+  // weights rather than off a width.
+  const resolved = "pairWeightPrecision" in stack ? stack
+    : { ...stack, pairWeightPrecision: defaultPairWeightPrecision(sample.pairChannels) };
+  await new Af3PairformerStackGpu(device, resolved)
+    .warm({ tokens }, [sample], af3Dialect(store), run);
 }
 
 export async function foldBatch(device, batch, weights, options = {}) {
@@ -570,7 +701,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // collects it by being wide rather than by being listed. See
     // WIDE_PAIR_TRACK for what the threshold is and is not.
     pairWeightPrecision: options.pairWeightPrecision
-      ?? (weights.trunk.embedder.pairChannels >= WIDE_PAIR_TRACK ? "f16" : "f32"),
+      ?? defaultPairWeightPrecision(weights.trunk.embedder.pairChannels),
     accumulatePrecision: options.accumulatePrecision,
   };
   // 🔴 A WIDE PAIR TRACK DOES NOT KEEP ITS BLOCK WEIGHTS RESIDENT, AND THE
@@ -589,10 +720,39 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // channels keeps its residency: its block weights are a ninth of these and
   // its peak is the diffusion transformer regardless, so there is nothing to
   // buy and re-uploading would be a cost for no gain.
+  //
+  // 🔴 AND THAT MEASUREMENT WAS OF ONE FOLD, WHICH IS THE ONE FOLD RESIDENCY
+  // CANNOT PAY FOR. Inside a single fold the first pass packs and uploads all
+  // 48 blocks either way, so what residency buys is the recycles - 0.4 s of
+  // 26 - and the table above is right about that and blind to the rest. The
+  // row a user sees is the SECOND fold, and there residency is the difference
+  // between packing 48 blocks again and packing none. Measured on 6MRR,
+  // recycles 0, with the interleaved pack the matrix triangle projection needs:
+  //
+  //                  first fold   second fold   its `pairformer-block`
+  //   non-resident      12.0 s        7.47 s          2890 ms
+  //   resident          12.1 s        4.49 s            29 ms
+  //
+  // Same structure to the bit (RMSD 1.655, TM 0.8845, worst displacement 0).
+  // Sixty milliseconds a block, forty-eight blocks, on every fold after the
+  // first - and the 247 MiB is the same 247 MiB it always was.
+  //
+  // 🔴 SO THE WIDTH IS NOT THE QUESTION, THE DEVICE'S ROOM IS. A wide track
+  // asks for more, and a device with a ceiling may not have it; one with no
+  // ceiling declared has no reason to refuse. `pairTrackResidentBytes` is what
+  // it would actually hold, so the rule is arithmetic rather than a threshold.
   const wideTrack = weights.trunk.embedder.pairChannels >= WIDE_PAIR_TRACK;
+  const budget = memoryBudgetBytes(device);
+  const wideBytes = wideTrack
+    ? pairTrackResidentBytes(weights.trunk.pairformerBlocks, precision.pairWeightPrecision) : 0;
+  // Three times, not once: the fold's peak is these weights plus the pair
+  // scratch that runs beside them, and a residency that just fits is a
+  // residency that makes everything after it fail.
+  const affordsWide = residencyAllowed(device)
+    && (budget === undefined || budget >= wideBytes * 3);
   const trunkGpu = new Af3TrunkGpu(device, {
     ...precision,
-    residentWeights: options.residentWeights ?? !wideTrack,
+    residentWeights: options.residentWeights ?? (!wideTrack || affordsWide),
   });
   // 🔴 THE CONDITIONING AND THE HEAD INPUT DO NOT DEPEND ON THE TRUNK, so they
   // are built once, above the recycle loop. Only `trunkSingle` and `trunkPair`
@@ -601,6 +761,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // 🔴 THE DIFFUSION HEAD HAS ITS OWN FIVE REFERENCE EMBEDDINGS - same shapes
   // as the conditioning module's, different weights. Reusing one for both
   // type-checks and is a different model.
+  // 🔴 THE EXPANDED PAIR GOES BACK AS SOON AS THE REFINER HAS RUN. The refiner
+  // writes its residuals into that same buffer - it takes it as `pairBuffer` -
+  // so releasing it here is releasing the refiner's own output... which is why
+  // it is NOT released here. See the release after the confidence head.
   const conditioning = perAtomConditioning({
     positions: batch.refPos, mask: batch.refMask,
     element: batch.refElement, charge: batch.refCharge,
@@ -649,7 +813,22 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // memoised promise. The catch is only so that a compile that fails before
   // anything awaits it is not an unhandled rejection; the real failure still
   // arrives where the sampler asks.
-  head?.warm(tokens, weights.diffusion).catch(() => {});
+  //
+  // 🔴 AND AT THE TOKEN COUNT THE HEAD WILL ACTUALLY RUN AT, which for a
+  // structural-token bundle is not `tokens`: OpenDDE expands 68 residues into
+  // 130 structural tokens between the trunk and the diffusion.
+  // `structuralLayout` reads the batch and not the trunk, so the count is known
+  // here.
+  //
+  // 🔴 IT IS WORTH NOTHING MEASURABLE, AND THAT IS THE FINDING. An OpenDDE fold
+  // is 7047 ms against 7081 with the wrong count - inside the drift. The compile
+  // is off the main thread and the trunk leaves the host idle for seconds, so
+  // whichever set it compiles is ready long before the sampler asks. Kept
+  // because warming what will actually run is the honest version, not because
+  // it bought anything.
+  const warmTokens = weights.trunk.dialect.structuralTokens === true
+    ? structuralLayout(batch).tokens : tokens;
+  head?.warm(warmTokens, weights.diffusion, weights.diffusion.dialect).catch(() => {});
 
   let trunk = reused?.trunk;
   let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
@@ -795,6 +974,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
       structuralPositions: detail.positions, structuralDenoised: detail.denoised,
     }));
 
+  // 🔴 NOTHING WAS NAMED AFTER trunk-done, AND THAT IS WHERE THE TIME IS. A
+  // caller's `onStage` clock attributes the gap between two stages to the
+  // earlier one, so a stage that never fires makes its work invisible: an
+  // OpenDDE fold at 6MRR is 23.5 s and its named stages sum to 7.2. Measured by
+  // dropping the step count, only 2.9 s of the rest is the sampler - 200 steps
+  // at 14.5 ms - and the other ten seconds had no name at all.
+  stage("sample-start", { steps: options.steps });
   const sampled = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
         steps, stopAfter: options.stopAfter, head,
@@ -846,6 +1032,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const positions = structural === undefined ? sampled
     : structuralToResidue(sampled, structural.layout, tokens, dense);
 
+  stage("sample-done", { tokens });
   const confidenceFor = async () => {
     const gather = batch.tokenAtomsToPseudoBeta;
     const pseudoBeta = new Float32Array(tokens * 3);
@@ -891,7 +1078,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }
     const raw = await openddeConfidence(device, {
       tokens: n, singleInputs: structural.headInput.targetFeat,
-      single: structural.headInput.trunkSingle, pair: structural.headInput.trunkPair,
+      single: structural.headInput.trunkSingle,
+      pairBuffer: structural.headInput.refinedPair.buffer,
       coordinates, seqMask: structural.structural.seqMask,
       atomToToken, atomToSlot, atomCount: n * dense,
       extraPairBias: structural.attentionBias,
@@ -935,6 +1123,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // and comes back through the same gather the coordinates do.
   const scores = structural === undefined ? await confidenceFor()
     : await openddeScores();
+  // 🔴 AND THE REFINED PAIR GOES BACK HERE, not when the refiner returned. It
+  // is the confidence head's last input and the head runs after the sampler, so
+  // this is the one point at which nothing can still read it. At 384 structural
+  // tokens it is 216 MiB.
+  structural?.headInput.refinedPair.release();
 
   // The confidence head reads the sample back.
   const beta = batch.tokenAtomsToPseudoBeta;

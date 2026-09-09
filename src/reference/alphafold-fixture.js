@@ -1,3 +1,5 @@
+import { readTensorRange } from "./dtype.js";
+
 function transpose(input, rows, columns) {
   const output = new Float32Array(input.length);
   for (let row = 0; row < rows; row += 1) {
@@ -7,6 +9,20 @@ function transpose(input, rows, columns) {
   }
   return output;
 }
+
+/**
+ * Where a descriptor's tensors came from, for a caller that wants the CODES.
+ *
+ * 🔴 A SYMBOL, SO IT IS NOT A FIELD, for the reason src/esmfold2/weights.js
+ * gives: every packer here walks a descriptor's own properties and a string key
+ * would look like another tensor to all of them.
+ */
+// One symbol for every loader; see src/runtime/weight-sources.js for what two
+// of them cost. Imported AND re-exported, because a bare `export ... from`
+// does not bind the name in this module and every use here is local.
+import { SOURCES } from "../runtime/weight-sources.js";
+
+export { SOURCES };
 
 export class AlphaFoldFixture {
   store;
@@ -38,6 +54,64 @@ export class AlphaFoldFixture {
     return value.subarray(block * size, (block + 1) * size);
   }
 
+  /**
+   * A descriptor's tensors, LAZILY when the store can hand over their bytes.
+   *
+   * 🔴 AF2's BUNDLE IS int8 AND DECODING IT IS 445 ms BEFORE A FOLD BEGINS.
+   * 283 of its 337 tensors are int8 at a group of 64 and 93.1 M elements, and
+   * the host loop that widens them is already at JavaScript's floor - benched,
+   * `out[i] = codes[i]` with no arithmetic at all is 263 Melem/s against the
+   * shipped 254. So the way out is not to run it: the GPU decoder takes int8
+   * now, and every packer that can bind codes instead of values leaves this
+   * getter uncalled.
+   *
+   * The eager path is what a store with no `tensorSource` gets, which is every
+   * fixture built over a plain object rather than an HTTP store.
+   *
+   * @param {[string, string, string][]} entries [property, module, key]
+   * @param {(name: string) => object} [reshape] per property, a mapping the
+   *   host applies and the device path must reproduce - see `transposed`.
+   */
+  async #gather(parameters, block, blocks, entries, reshape) {
+    const out = {};
+    const sources = {};
+    const lazy = typeof this.store.tensorSource === "function"
+      && typeof this.store.open === "function";
+    for (const [property, module, key] of entries) {
+      const tensorName = parameters[module]?.[key];
+      if (tensorName === undefined) throw new Error(`missing ${module}/${key}`);
+      const shaped = reshape?.(property);
+      if (!lazy) {
+        const value = await this.#parameter(parameters, module, key, block, blocks);
+        out[property] = shaped === undefined
+          ? value : transpose(value, shaped.rows, shaped.columns);
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await this.store.open(tensorName);
+      const source = this.store.tensorSource(tensorName);
+      const elements = (source.record.shape ?? []).reduce((a, b) => a * b, 1);
+      const count = block === undefined ? elements : elements / blocks;
+      const first = block === undefined ? 0 : block * count;
+      sources[property] = { ...source, tensorName, first, count,
+                            ...(shaped === undefined ? {} : { transpose: shaped }) };
+      let decoded;
+      Object.defineProperty(out, property, {
+        enumerable: true,
+        get() {
+          if (decoded !== undefined) return decoded;
+    const range = readTensorRange(source.record, source.buffer, source.byteOffset,
+                                        first, count, true);
+          decoded = shaped === undefined
+            ? range : transpose(range, shaped.rows, shaped.columns);
+          return decoded;
+        },
+      });
+    }
+    if (lazy) Object.defineProperty(out, SOURCES, { value: sources });
+    return out;
+  }
+
   #parameterShape(parameters, module, name, stacked) {
     const tensorName = parameters[module]?.[name];
     if (tensorName === undefined) throw new Error(`missing ${module}/${name}`);
@@ -48,20 +122,18 @@ export class AlphaFoldFixture {
   async #attention(
     parameters, root, block, blocks,
   ) {
-    const parameter = (module, name) =>
-      this.#parameter(parameters, module, name, block, blocks);
     const attentionRoot = `${root}/attention`;
-    const weights = {
-      queryNormScale: await parameter(`${root}/query_norm`, "scale"),
-      queryNormOffset: await parameter(`${root}/query_norm`, "offset"),
-      queryWeight: await parameter(attentionRoot, "query_w"),
-      keyWeight: await parameter(attentionRoot, "key_w"),
-      valueWeight: await parameter(attentionRoot, "value_w"),
-      gatingWeight: await parameter(attentionRoot, "gating_w"),
-      gatingBias: await parameter(attentionRoot, "gating_b"),
-      outputWeight: await parameter(attentionRoot, "output_w"),
-      outputBias: await parameter(attentionRoot, "output_b"),
-    };
+    const weights = await this.#gather(parameters, block, blocks, [
+      ["queryNormScale", `${root}/query_norm`, "scale"],
+      ["queryNormOffset", `${root}/query_norm`, "offset"],
+      ["queryWeight", attentionRoot, "query_w"],
+      ["keyWeight", attentionRoot, "key_w"],
+      ["valueWeight", attentionRoot, "value_w"],
+      ["gatingWeight", attentionRoot, "gating_w"],
+      ["gatingBias", attentionRoot, "gating_b"],
+      ["outputWeight", attentionRoot, "output_w"],
+      ["outputBias", attentionRoot, "output_b"],
+    ]);
     return {
       heads: this.#parameterShape(parameters, attentionRoot, "gating_b", true)[0],
       attention: weights,
@@ -72,70 +144,84 @@ export class AlphaFoldFixture {
     parameters, root, block, blocks,
   ) {
     const result = await this.#attention(parameters, root, block, blocks);
-    return {
-      ...result,
-      pairProjectionWeight: await this.#parameter(parameters, root, "feat_2d_weights", block, blocks),
-    };
+    // 🔴 SPREAD, WHICH IS SAFE HERE AND WOULD NOT BE ONE LEVEL DOWN. `result`
+    // holds `heads` and a REFERENCE to the gathered attention object, so
+    // copying it copies the reference; spreading the gathered object itself
+    // would call every getter and decode the block. See src/esmfold2/weights.js,
+    // where exactly that cost a second.
+    // 🔴 NAMED THE WAY THE PAIR-BIAS DESCRIPTOR NAMES IT, not the way this
+    // object does. `packAttentionWeights` reads `pairBias.projectionWeight`, so
+    // the gathered object IS that descriptor's base - see `pairBiasFrom` in
+    // src/evoformer/block.js - and `pairProjectionWeight` is a getter onto it
+    // for the readers that predate this.
+    const pairBias = await this.#gather(parameters, block, blocks, [
+      ["projectionWeight", root, "feat_2d_weights"],
+    ]);
+    return { ...result, pairBias,
+             get pairProjectionWeight() { return pairBias.projectionWeight; } };
   }
 
   async #transition(
     parameters, root, block, blocks,
   ) {
-    const parameter = (module, name) =>
-      this.#parameter(parameters, module, name, block, blocks);
-    return {
-      layerNormScale: await parameter(`${root}/input_layer_norm`, "scale"),
-      layerNormOffset: await parameter(`${root}/input_layer_norm`, "offset"),
-      firstWeight: await parameter(`${root}/transition1`, "weights"),
-      firstBias: await parameter(`${root}/transition1`, "bias"),
-      secondWeight: await parameter(`${root}/transition2`, "weights"),
-      secondBias: await parameter(`${root}/transition2`, "bias"),
-    };
+    return this.#gather(parameters, block, blocks, [
+      ["layerNormScale", `${root}/input_layer_norm`, "scale"],
+      ["layerNormOffset", `${root}/input_layer_norm`, "offset"],
+      ["firstWeight", `${root}/transition1`, "weights"],
+      ["firstBias", `${root}/transition1`, "bias"],
+      ["secondWeight", `${root}/transition2`, "weights"],
+      ["secondBias", `${root}/transition2`, "bias"],
+    ]);
   }
 
   async #triangle(
     parameters, root, channels, block, blocks,
   ) {
-    const parameter = (module, name) =>
-      this.#parameter(parameters, module, name, block, blocks);
     const hidden = this.#parameterShape(parameters, `${root}/left_projection`, "bias", true)[0];
-    const projection = async(module, inputChannels, outputChannels) =>
-      transpose(await parameter(`${root}/${module}`, "weights"), inputChannels, outputChannels);
-    return {
-      layerNormInWeight: await parameter(`${root}/layer_norm_input`, "scale"),
-      layerNormInBias: await parameter(`${root}/layer_norm_input`, "offset"),
-      linearAPWeight: await projection("left_projection", channels, hidden),
-      linearAPBias: await parameter(`${root}/left_projection`, "bias"),
-      linearAGWeight: await projection("left_gate", channels, hidden),
-      linearAGBias: await parameter(`${root}/left_gate`, "bias"),
-      linearBPWeight: await projection("right_projection", channels, hidden),
-      linearBPBias: await parameter(`${root}/right_projection`, "bias"),
-      linearBGWeight: await projection("right_gate", channels, hidden),
-      linearBGBias: await parameter(`${root}/right_gate`, "bias"),
-      layerNormOutWeight: await parameter(`${root}/center_layer_norm`, "scale"),
-      layerNormOutBias: await parameter(`${root}/center_layer_norm`, "offset"),
-      linearZWeight: await projection("output_projection", hidden, channels),
-      linearZBias: await parameter(`${root}/output_projection`, "bias"),
-      linearGWeight: await projection("gating_linear", channels, channels),
-      linearGBias: await parameter(`${root}/gating_linear`, "bias"),
+    // Every projection is stored `[in][out]` and every kernel indexes
+    // `[out][in]`, so all six are transposes - which `#gather` records on the
+    // source so the device packer can reproduce them, or cancel them.
+    const shapes = {
+      linearAPWeight: { rows: channels, columns: hidden },
+      linearAGWeight: { rows: channels, columns: hidden },
+      linearBPWeight: { rows: channels, columns: hidden },
+      linearBGWeight: { rows: channels, columns: hidden },
+      linearZWeight: { rows: hidden, columns: channels },
+      linearGWeight: { rows: channels, columns: channels },
     };
+    return this.#gather(parameters, block, blocks, [
+      ["layerNormInWeight", `${root}/layer_norm_input`, "scale"],
+      ["layerNormInBias", `${root}/layer_norm_input`, "offset"],
+      ["linearAPWeight", `${root}/left_projection`, "weights"],
+      ["linearAPBias", `${root}/left_projection`, "bias"],
+      ["linearAGWeight", `${root}/left_gate`, "weights"],
+      ["linearAGBias", `${root}/left_gate`, "bias"],
+      ["linearBPWeight", `${root}/right_projection`, "weights"],
+      ["linearBPBias", `${root}/right_projection`, "bias"],
+      ["linearBGWeight", `${root}/right_gate`, "weights"],
+      ["linearBGBias", `${root}/right_gate`, "bias"],
+      ["layerNormOutWeight", `${root}/center_layer_norm`, "scale"],
+      ["layerNormOutBias", `${root}/center_layer_norm`, "offset"],
+      ["linearZWeight", `${root}/output_projection`, "weights"],
+      ["linearZBias", `${root}/output_projection`, "bias"],
+      ["linearGWeight", `${root}/gating_linear`, "weights"],
+      ["linearGBias", `${root}/gating_linear`, "bias"],
+    ], (name) => shapes[name]);
   }
 
   async #outerProductMean(
     parameters, block, blocks,
   ) {
-    const parameter = (module, name) =>
-      this.#parameter(parameters, module, name, block, blocks);
-    return {
-      layerNormScale: await parameter("outer_product_mean/layer_norm_input", "scale"),
-      layerNormOffset: await parameter("outer_product_mean/layer_norm_input", "offset"),
-      leftWeight: await parameter("outer_product_mean/left_projection", "weights"),
-      leftBias: await parameter("outer_product_mean/left_projection", "bias"),
-      rightWeight: await parameter("outer_product_mean/right_projection", "weights"),
-      rightBias: await parameter("outer_product_mean/right_projection", "bias"),
-      outputWeight: await parameter("outer_product_mean", "output_w"),
-      outputBias: await parameter("outer_product_mean", "output_b"),
-    };
+    return this.#gather(parameters, block, blocks, [
+      ["layerNormScale", "outer_product_mean/layer_norm_input", "scale"],
+      ["layerNormOffset", "outer_product_mean/layer_norm_input", "offset"],
+      ["leftWeight", "outer_product_mean/left_projection", "weights"],
+      ["leftBias", "outer_product_mean/left_projection", "bias"],
+      ["rightWeight", "outer_product_mean/right_projection", "weights"],
+      ["rightBias", "outer_product_mean/right_projection", "bias"],
+      ["outputWeight", "outer_product_mean", "output_w"],
+      ["outputBias", "outer_product_mean", "output_b"],
+    ]);
   }
 
   async mainStackWeights(pairChannels = 128) {
@@ -143,17 +229,19 @@ export class AlphaFoldFixture {
     const result = [];
     for (let block = 0; block < blocks; block += 1) {
       const rowBase = await this.#attention(parameters, "msa_row_attention_with_pair_bias", block, blocks);
+      // ...its three pair-bias tensors gathered too, so the whole attention
+      // pack can bind codes; see attentionPackOrder.
+      const rowPairBias = await this.#gather(parameters, block, blocks, [
+        ["layerNormScale", "msa_row_attention_with_pair_bias/feat_2d_norm", "scale"],
+        ["layerNormOffset", "msa_row_attention_with_pair_bias/feat_2d_norm", "offset"],
+        ["projectionWeight", "msa_row_attention_with_pair_bias", "feat_2d_weights"],
+      ]);
       const row = {
         ...rowBase,
-        pairLayerNormScale: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "scale", block, blocks,
-        ),
-        pairLayerNormOffset: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias/feat_2d_norm", "offset", block, blocks,
-        ),
-        pairProjectionWeight: await this.#parameter(
-          parameters, "msa_row_attention_with_pair_bias", "feat_2d_weights", block, blocks,
-        ),
+        pairBias: rowPairBias,
+        get pairLayerNormScale() { return rowPairBias.layerNormScale; },
+        get pairLayerNormOffset() { return rowPairBias.layerNormOffset; },
+        get pairProjectionWeight() { return rowPairBias.projectionWeight; },
       };
       result.push({
         msaRowAttention: row,
@@ -267,6 +355,11 @@ export class AlphaFoldFixture {
     const result = [];
     for (let block = 0; block < blocks; block += 1) {
       const rowBase = await this.#attention(parameters, "msa_row_attention_with_pair_bias", block, blocks);
+      const rowPairBias = await this.#gather(parameters, block, blocks, [
+        ["layerNormScale", "msa_row_attention_with_pair_bias/feat_2d_norm", "scale"],
+        ["layerNormOffset", "msa_row_attention_with_pair_bias/feat_2d_norm", "offset"],
+        ["projectionWeight", "msa_row_attention_with_pair_bias", "feat_2d_weights"],
+      ]);
       const root = "msa_column_global_attention";
       const attention = `${root}/attention`;
       const parameter = (module, name) => this.#parameter(parameters, module, name, block, blocks);
@@ -274,9 +367,10 @@ export class AlphaFoldFixture {
         ...pairWeights[block],
         msaRowAttention: {
           ...rowBase,
-          pairLayerNormScale: await parameter("msa_row_attention_with_pair_bias/feat_2d_norm", "scale"),
-          pairLayerNormOffset: await parameter("msa_row_attention_with_pair_bias/feat_2d_norm", "offset"),
-          pairProjectionWeight: await parameter("msa_row_attention_with_pair_bias", "feat_2d_weights"),
+          pairBias: rowPairBias,
+          get pairLayerNormScale() { return rowPairBias.layerNormScale; },
+          get pairLayerNormOffset() { return rowPairBias.layerNormOffset; },
+          get pairProjectionWeight() { return rowPairBias.projectionWeight; },
         },
         msaColumnGlobalAttention: {
           queryNormScale: await parameter(`${root}/query_norm`, "scale"),

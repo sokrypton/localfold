@@ -77,6 +77,12 @@ export async function main(device, args = []) {
   const blockCount = Number(option(args, "blocks", "24"));
   const repeats = Number(option(args, "repeats", "3"));
   const precisions = option(args, "precision", "f32,f16:f32,f32:f16,f16").split(",");
+  // 🔴 THE WEIGHT BUFFER'S OWN TYPE, WHICH IS NEITHER OF THE TWO ABOVE. The
+  // trunk defaults it to f32 and nothing had ever measured the other arm; the
+  // staged matrix kernels convert it to f16 as they stage it, so for THEM an
+  // f16 buffer is the same arithmetic at half the traffic - and it is what
+  // lets the right operand be read without staging at all.
+  const weightPrecision = option(args, "weights", "f32");
 
   // 🔴 ONE SET OF WEIGHTS FOR EVERY BLOCK, WHICH IS FINE HERE AND NOWHERE ELSE.
   // These kernels' cost is their shapes; the values only matter to the answer,
@@ -92,8 +98,11 @@ export async function main(device, args = []) {
       // too rather than a name this tool would have to keep in step.
       const [staged, accumulate] = precision === "default" ? [undefined, undefined]
         : (precision.includes(":") ? precision.split(":") : [precision, precision]);
-      stacks.set(precision, new Esmfold2TrunkGpu(device, staged === undefined ? {}
-        : { stagedPrecision: staged, accumulatePrecision: accumulate }));
+      stacks.set(precision, new Esmfold2TrunkGpu(device, {
+        weightPrecision,
+        ...(staged === undefined ? {}
+          : { stagedPrecision: staged, accumulatePrecision: accumulate }),
+      }));
     }
     return stacks.get(precision);
   };
@@ -180,7 +189,7 @@ export async function main(device, args = []) {
       });
     }
   }
-  return { channels, blocks: blockCount, repeats, precisions,
+  return { channels, blocks: blockCount, repeats, precisions, weightPrecision,
            note: "timing only; the error bound is check-esmfold2-trunk-gpu.js's",
            rows };
 }

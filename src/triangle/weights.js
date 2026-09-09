@@ -103,6 +103,48 @@ export function packWeights(weights, precision, options = {}) {
   return packOrder(merged, order, precision);
 }
 
+/**
+ * The same pack, described for the DEVICE decoder: an ordered list of order
+ * entries naming sources rather than values.
+ *
+ * 🔴 THE INTERLEAVE'S TRANSPOSE CANCELS THE FIXTURE'S, WHICH IS WHY THIS IS
+ * FOUR CONTIGUOUS PARTS AND NOT A STRIDE. `interleaveAB` reads
+ * `source[h * cZ + c]` out of an array the loader already transposed from the
+ * stored `[c][h]`, and writes it at `c * 4cH + 4h + role`. Composed, the
+ * destination element `d` of role `d % 4` is source element `d / 4` of that
+ * role's RAW tensor - a plain copy, four parts alternating element by element.
+ * `transposeZG` cancels in the same way, so both output matrices are raw too.
+ *
+ * A blocked pack cancels nothing: there each projection is the loader's
+ * transpose, which the source carries and the entry inherits.
+ *
+ * 🔴 AND THE ORDER IS THE HOST PACKER'S, taken from the same two arrays, for
+ * the reason TRANSITION_PACK_ORDER is exported: a list written twice is a list
+ * that ends up written differently, and here that is an offset table pointing
+ * at the wrong matrix.
+ */
+export function trianglePackOrder(options = {}) {
+  const interleaved = options.abLayout === "interleaved";
+  const transposed = options.zgLayout === "transposed";
+  let order = ORDER.map((name) => name);
+  if (interleaved) {
+    order = order.filter((name) => !/^linear[AB][PG]/.test(name));
+    order.splice(order.indexOf("layerNormOutWeight"), 0,
+      { name: "linearABWeight", map: "contiguous", partRun: 1,
+        names: ["linearAPWeight", "linearAGWeight", "linearBPWeight", "linearBGWeight"] },
+      { name: "linearABBias", map: "contiguous", partRun: 1,
+        names: ["linearAPBias", "linearAGBias", "linearBPBias", "linearBGBias"] });
+  }
+  if (transposed) {
+    for (let index = 0; index < order.length; index += 1) {
+      if (order[index] === "linearZWeight" || order[index] === "linearGWeight") {
+        order[index] = { name: order[index], map: "contiguous" };
+      }
+    }
+  }
+  return order;
+}
+
 function packOrder(weights, order, precision) {
   const offsets = {};
   let elementCount = 0;

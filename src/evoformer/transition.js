@@ -2,7 +2,9 @@ import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
 import {
   deviceTuning, halfPrecisionAvailable, deviceMatrixConfig,
 } from "../runtime/device-profile.js";
-import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
+import {
+  createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
+} from "../runtime/matrix-linear.js";
 import { concatenateAs, writeInto } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -176,7 +178,15 @@ export function chooseMatrixLinear({ inner, columns, device }) {
   } = wanted;
   const geometry = {
     blockRows, blockColumns, blockInner, subgroupRows, subgroupColumns,
-    tile, result: config.resultComponentType, matrixElement: config.componentType,
+    tile,
+    // 🔴 THE ACCUMULATOR IS A REGISTER KNOB AND THIS IS A K-BOUNDED KERNEL. A
+    // transition contracts a CHANNEL COUNT, so narrowing its results is the
+    // occupancy trade docs/A100.md prices and not the overflow the outer
+    // product mean's contraction hits. See stagedMatrixResult.
+    result: deviceTuning(device).stagedMatrixResult ?? config.resultComponentType,
+    directWeights: deviceTuning(device).stagedMatrixDirectWeights === true,
+    prefetch: deviceTuning(device).stagedMatrixPrefetch === true,
+    matrixElement: config.componentType,
     // A vec4 read is 8-byte aligned, so every offset it forms must divide by
     // four. It was worth 1.24 -> 0.70 ms, and the scalar path is correct
     // whenever it does not hold.
@@ -367,15 +377,21 @@ function validate(input) {
  *   offsets are in ELEMENTS and do not depend on it; a caller that packs one way
  *   and builds the shaders the other reads half the values at twice the stride.
  */
+/**
+ * The properties this packer concatenates, in order.
+ *
+ * 🔴 EXPORTED SO THE DEVICE PATH CANNOT DRIFT FROM THE HOST ONE. The two build
+ * the same buffer from the same tensors, and a list written twice is a list
+ * that ends up written differently - which here would be a plausible tensor in
+ * the wrong order. See src/runtime/device-pack.js.
+ */
+export const TRANSITION_PACK_ORDER = [
+  "layerNormScale", "layerNormOffset", "firstWeight", "firstBias",
+  "secondWeight", "secondBias",
+];
+
 export function packTransitionWeights(input, weightPrecision = "f32") {
-  const values = [
-    input.weights.layerNormScale,
-    input.weights.layerNormOffset,
-    input.weights.firstWeight,
-    input.weights.firstBias,
-    input.weights.secondWeight,
-    input.weights.secondBias,
-  ];
+  const values = TRANSITION_PACK_ORDER.map((name) => input.weights[name]);
   const offsets = [];
   let length = 0;
   for (const value of values) {
@@ -692,7 +708,6 @@ export function createTransitionShaders(
   input, offsets, tile = LINEAR_TILE, precision = "f32", weightPrecision = "f32",
   hiddenStorage = "f32", matrix = null,
 ) {
-  void input;
   // The normalize pass binds the SAME buffer as the two linear passes, so it
   // narrows with them or reads half the values at twice the stride.
   const weight16 = weightPrecision === "f16";
@@ -771,17 +786,27 @@ fn main(
     // the four elements of the containing quad, which shifts the whole weight
     // panel and is wrong rather than slow. So this is asked per pass, and a
     // pass that cannot have it gets the scalar staging and stays correct.
-    const staged = (residual, sourcePrecision, outputPrecision, weightBase) =>
+    // 🔴 AND THE DIRECT WEIGHT READ IS ASKED PER PASS FOR THE SAME REASON THE
+    // VEC4 IS: the two contract DIFFERENT extents, and the condition is that
+    // the extent divides the K panel. This buffer is packed
+    // [W1 | b1 | W2 | b2], so a tail panel would read the next tensor rather
+    // than a bias - a plausible answer, not an error. The matrix path already
+    // returns weightPrecision "f16" (see chooseLinearKernel), which is the
+    // other condition, so on this path it costs nothing to hold.
+    const staged = (residual, sourcePrecision, outputPrecision, weightBase, inner) =>
       createStagedMatrixShader({
         ...matrix,
         vectorStaging: matrix.vectorStaging && weightBase % 4 === 0,
+        directWeights: directWeightsAllowed(matrix, { inner, weightPrecision }),
         residual, sourcePrecision, weightPrecision, outputPrecision,
       });
+    const channels = input?.channels;
+    const hidden = input?.hiddenChannels;
     return [
       normalize,
-      staged(false, "f32", hiddenStorage, offsets[2]),
-      staged(false, hiddenStorage, "f32", offsets[4]),
-      staged(true, hiddenStorage, "f32", offsets[4]),
+      staged(false, "f32", hiddenStorage, offsets[2], channels),
+      staged(false, hiddenStorage, "f32", offsets[4], hidden),
+      staged(true, hiddenStorage, "f32", offsets[4], hidden),
     ];
   }
   const first = createLinearShader(tile, false, precision, weightPrecision, "f32", hiddenStorage);

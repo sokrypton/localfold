@@ -27,8 +27,9 @@
  * `outputIndex` hook is what expresses it, with `channel` in scope.
  */
 import {
-  createStagedMatrixShader, stagedMatrixStorage,
+  createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
 } from "../runtime/matrix-linear.js";
+import { deviceMatrixConfig, deviceTuning } from "../runtime/device-profile.js";
 
 /**
  * 🔴 SWEPT PER KERNEL AND NEVER INHERITED - see docs/A100.md on AF2's tile
@@ -103,14 +104,16 @@ export function createTriangleProjectMatrixShader(shape, storage = {}, matrix = 
   }
   const columns = 4 * cHidden;
   const geometry = { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...matrix };
+  const weightPrecision = storage.weight ?? "f32";
   return createStagedMatrixShader({
     ...geometry,
     // The interleaved block is [k][4h + role], so a vec4 read needs both the
     // contracted extent and the column count divisible by four. `columns` is
     // 4 * cHidden and always is; cZ is the one to check.
     vectorStaging: cZ % 4 === 0,
+    directWeights: directWeightsAllowed(geometry, { inner: cZ, weightPrecision }),
     sourcePrecision: storage.normalized ?? "f32",
-    weightPrecision: storage.weight ?? "f32",
+    weightPrecision,
     outputPrecision: abStorage,
     bias: true,
     rowMask: true,
@@ -151,6 +154,7 @@ export function createTriangleProjectOutMatrixShaders(shape, storage = {}, matri
     gate: createStagedMatrixShader({
       ...geometry,
       vectorStaging: cZ % 4 === 0,
+      directWeights: directWeightsAllowed(geometry, { inner: cZ, weightPrecision }),
       sourcePrecision: storage.normalized ?? "f32",
       weightPrecision,
       outputPrecision: gateStorage,
@@ -160,6 +164,7 @@ export function createTriangleProjectOutMatrixShaders(shape, storage = {}, matri
     project: createStagedMatrixShader({
       ...geometry,
       vectorStaging: cHidden % 4 === 0 && cZ % 4 === 0,
+      directWeights: directWeightsAllowed(geometry, { inner: cHidden, weightPrecision }),
       sourcePrecision: storage.hidden ?? "f32",
       weightPrecision,
       outputPrecision: "f32",
@@ -272,7 +277,14 @@ export function createTriangleContractMatrixShader(shape, direction, storage = {
   if (direction !== "outgoing" && direction !== "incoming") {
     throw new RangeError(`unknown triangle direction ${direction}`);
   }
-  const geometry = { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...matrix };
+  // 🔴 THE ACCUMULATOR IS THIS KERNEL'S OWN, and it takes it from the geometry
+  // rather than from a caller, because three callers share these shaders and
+  // two of them got it right by copying the third. Its K is the PROTEIN'S
+  // LENGTH where the three projections contract a channel count, so a narrowed
+  // result overflows here and nowhere else - measured as 2178 NaN coordinates.
+  const geometry = { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...matrix,
+                     ...(matrix.contractResult === undefined
+                       ? {} : { result: matrix.contractResult }) };
   return createStagedMatrixShader({
     ...geometry,
     // 🔴 ONE OPERAND EACH, WHICH IS WHAT THE RULE ACTUALLY ALLOWS. The
@@ -282,6 +294,13 @@ export function createTriangleContractMatrixShader(shape, direction, storage = {
     // has to be off is what made this kernel look like a wash.
     vectorStaging: length % 4 !== 0 ? false
       : (direction === "outgoing" ? { source: true } : { weights: true }),
+    // 🔴 AND NEITHER DIRECTION MAY READ ITS RIGHT OPERAND DIRECTLY, so the
+    // geometry's request is refused here rather than spread through. Outgoing
+    // transposes it, and both contract the PROTEIN'S LENGTH - which is not a
+    // multiple of the K panel at most lengths, and `b` is not a weight buffer
+    // with a bias after it but a pair-sized tensor, so a tail panel would read
+    // the next channel's rows.
+    directWeights: false,
     batchStride: length * length,
     sourceTransposed: direction === "incoming",
     weightsTransposed: direction === "outgoing",
@@ -314,5 +333,37 @@ export function triangleContractMatrixDispatch(shape, matrix = {}) {
     x: Math.ceil(shape.length / geometry.blockColumns),
     y: Math.ceil(shape.length / geometry.blockRows),
     z: shape.channels,
+  };
+}
+
+/**
+ * This device's answer for these three kernels: a geometry, or false.
+ *
+ * 🔴 IT LIVES HERE BECAUSE THREE CALLERS ASK IT NOW - AF3's pairformer,
+ * AF3's MSA stack and AF2's own evoformer block, which share every one of
+ * these shaders through src/triangle/. A rule written into one of them is a
+ * rule the other two do not get, which this repository has now paid for twice
+ * in one session: see `splitTransitionConfig` and `gridProjectMatrixConfig`.
+ *
+ * 🔴 AND ITS WIDTH RULE IS ABOUT PRECISION, NOT MEMORY - see
+ * TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS. `triangleProjectMatrixMinChannels` is
+ * what a device that has re-measured it says instead.
+ */
+export function triangleProjectMatrixConfig(device, channels) {
+  const tuning = deviceTuning(device);
+  if (tuning.triangleProjectMatrix !== true) return false;
+  if (channels < (tuning.triangleProjectMatrixMinChannels
+    ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return false;
+  return {
+    result: tuning.stagedMatrixResult ?? config.resultComponentType,
+    // 🔴 THE CONTRACTION KEEPS THE DEVICE'S OWN, whatever the knob says: its K
+    // is the protein's length, not a channel count. See stagedMatrixResult.
+    contractResult: config.resultComponentType,
+    matrixElement: config.componentType,
+    tile: { M: config.M, N: config.N, K: config.K },
+    prefetch: tuning.stagedMatrixPrefetch === true,
+    directWeights: tuning.stagedMatrixDirectWeights === true,
   };
 }

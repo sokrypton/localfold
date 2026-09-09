@@ -64,10 +64,17 @@ function prepareWeights(weights) {
   const noiseData = new Float32Array(scale.length + projection.length);
   noiseData.set(scale, 0);
   noiseData.set(projection, scale.length);
+  // 🔴 THE CLOSED FORM IS A PROPERTY OF THE JOINT LayerNorm, SO THE SPLIT
+  // DIALECT HAS NO USE FOR IT - and asking for it there reads `scale[128+c]`
+  // off the end of a 256-long norm and hands the shader a buffer of NaN.
+  // OpenDDE's pair conditioning normalises each term separately; see the
+  // `split` branch of createConditioningShaders.
+  const split = weights.zTrunkProjection !== undefined;
   const prepared = {
-    columnSums: relativeColumnSums(weights.pairCondInitialNormScale,
-                                   weights.pairCondInitialProjection,
-                                   weights.pairChannels, weights.pairChannels),
+    columnSums: split ? new Float32Array(weights.pairChannels)
+      : relativeColumnSums(weights.pairCondInitialNormScale,
+                           weights.pairCondInitialProjection,
+                           weights.pairChannels, weights.pairChannels),
     noisePacked: {
       data: noiseData,
       offsets: { noiseEmbeddingInitialNormScale: 0,
@@ -107,7 +114,7 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 
 export function createConditioningShaders(shape, offsets) {
   const { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
-          padding } = shape;
+          padding, split = false, trunkPairChannels = pairChannels } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
   const singleWidth = seqChannels + targetFeatWidth + padding.length;
@@ -306,7 +313,156 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { pairInitial, singleInitial };
+  // 🔴 THE SPLIT DIALECT IS A DIFFERENT FUNCTION, NOT A RESHAPE. OpenDDE
+  // normalises the trunk pair on its OWN width and projects it to the pair
+  // width, projects the relative encoding to the pair width separately, and
+  // only then concatenates and runs the joint LayerNorm - so the closed form
+  // above, which exists because the raw one-hot columns share a LayerNorm with
+  // the trunk pair, has nothing to be a closed form OF. See
+  // diffusion-reference.js's `split` branch, which this mirrors line for line.
+  //
+  // 🔴 AND IT IS ONE DISPATCH, because the 2*C_PAIR concatenation is 1 KiB and
+  // fits in workgroup memory. Materialising it would be `tokens^2 x 256`
+  // floats - 92 MB at 300 tokens - written and read back for no reason.
+  //
+  // One workgroup per pair row rather than one lane, because the trunk
+  // compression alone is C_TRUNK*C_PAIR multiply-accumulates: 49,152 at
+  // OpenDDE's widths against the joint path's 16,384, and a lane-per-row
+  // kernel reads the trunk row once per output column.
+  const pairInitialSplit = `
+const PAIRS: u32 = ${pairs}u;
+const TOKENS: u32 = ${tokens}u;
+const C_PAIR: u32 = ${pairChannels}u;
+const C_TRUNK: u32 = ${trunkPairChannels}u;
+const WIDTH: u32 = ${2 * pairChannels}u;
+const RELATIVE_WIDTH: u32 = ${RELATIVE_WIDTH}u;
+const POSITION_BINS: u32 = ${POSITION_BINS}u;
+const MAX_RELATIVE_IDX: i32 = ${MAX_RELATIVE_IDX};
+const MAX_RELATIVE_CHAIN: i32 = ${MAX_RELATIVE_CHAIN};
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+const LANES: u32 = 64u;
+const EPSILON: f32 = 1.0e-5;
+
+@group(0) @binding(0) var<storage, read> trunk_pair: array<f32>;
+@group(0) @binding(1) var<storage, read> features: array<i32>;
+@group(0) @binding(2) var<storage, read> z_scale: array<f32>;
+@group(0) @binding(3) var<storage, read> z_projection: array<f32>;
+@group(0) @binding(4) var<storage, read> relpe_projection: array<f32>;
+@group(0) @binding(5) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read> projection: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pair: array<f32>;
+
+var<workgroup> reduce: array<f32, LANES>;
+var<workgroup> concatenated: array<f32, WIDTH>;
+
+fn residue_index(t: u32) -> i32 { return features[t]; }
+fn token_index(t: u32) -> i32 { return features[TOKENS + t]; }
+fn asym_id(t: u32) -> i32 { return features[2u * TOKENS + t]; }
+fn entity_id(t: u32) -> i32 { return features[3u * TOKENS + t]; }
+fn sym_id(t: u32) -> i32 { return features[4u * TOKENS + t]; }
+fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
+
+// A whole-workgroup sum. The caller puts a barrier between two of these: the
+// read of reduce[0] below is ordered before that barrier, so the next call's
+// write cannot race it.
+fn total_of(lane: u32, value: f32) -> f32 {
+  reduce[lane] = value;
+  workgroupBarrier();
+  for (var stride = LANES / 2u; stride > 0u; stride >>= 1u) {
+    if (lane < stride) { reduce[lane] += reduce[lane + stride]; }
+    workgroupBarrier();
+  }
+  return reduce[0];
+}
+
+@compute @workgroup_size(LANES)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= PAIRS) { return; }
+  let lane = local.x;
+  let base = row * C_TRUNK;
+
+  // LayerNorm over the trunk pair's own width.
+  var partial = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) { partial += trunk_pair[base + c]; }
+  let mean = total_of(lane, partial) / f32(C_TRUNK);
+  workgroupBarrier();
+  var squares = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) {
+    let d = trunk_pair[base + c] - mean;
+    squares += d * d;
+  }
+  let inverse_std = inverseSqrt(total_of(lane, squares) / f32(C_TRUNK) + EPSILON);
+  workgroupBarrier();
+
+  // ...projected to the pair width, into the first half of the concatenation.
+  for (var out = lane; out < C_PAIR; out += LANES) {
+    var value = 0.0;
+    for (var c = 0u; c < C_TRUNK; c += 1u) {
+      value += (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        * z_projection[c * C_PAIR + out];
+    }
+    concatenated[out] = value;
+  }
+
+  // The relative encoding, projected on its own and with no LayerNorm. It is
+  // one-hot in three or four of 139 columns, so the projection is a gather of
+  // those rows rather than a matrix multiply - exact, not an approximation.
+  let i = row / TOKENS;
+  let j = row % TOKENS;
+  let same_chain = asym_id(i) == asym_id(j);
+  let same_entity = entity_id(i) == entity_id(j);
+  var bin_a = u32(2 * MAX_RELATIVE_IDX + 1);
+  if (same_chain) {
+    bin_a = u32(clamp_bin(residue_index(i) - residue_index(j) + MAX_RELATIVE_IDX,
+                          2 * MAX_RELATIVE_IDX));
+  }
+  var bin_b = u32(2 * MAX_RELATIVE_IDX + 1);
+  if (same_chain && residue_index(i) == residue_index(j)) {
+    bin_b = u32(clamp_bin(token_index(i) - token_index(j) + MAX_RELATIVE_IDX,
+                          2 * MAX_RELATIVE_IDX));
+  }
+  var bin_c = u32(2 * MAX_RELATIVE_CHAIN + 1);
+  if (same_entity) {
+    bin_c = u32(clamp_bin(sym_id(i) - sym_id(j) + MAX_RELATIVE_CHAIN,
+                          2 * MAX_RELATIVE_CHAIN));
+  }
+  let row_b = POSITION_BINS + bin_b;
+  let row_entity = POSITION_BINS * 2u;
+  let row_c = POSITION_BINS * 2u + 1u + bin_c;
+  for (var out = lane; out < C_PAIR; out += LANES) {
+    var value = relpe_projection[bin_a * C_PAIR + out]
+      + relpe_projection[row_b * C_PAIR + out]
+      + relpe_projection[row_c * C_PAIR + out];
+    if (same_entity) { value += relpe_projection[row_entity * C_PAIR + out]; }
+    concatenated[C_PAIR + out] = value;
+  }
+  workgroupBarrier();
+
+  // The joint LayerNorm over the two halves, and the output projection.
+  var joint = 0.0;
+  for (var c = lane; c < WIDTH; c += LANES) { joint += concatenated[c]; }
+  let joint_mean = total_of(lane, joint) / f32(WIDTH);
+  workgroupBarrier();
+  var joint_squares = 0.0;
+  for (var c = lane; c < WIDTH; c += LANES) {
+    let d = concatenated[c] - joint_mean;
+    joint_squares += d * d;
+  }
+  let joint_inverse = inverseSqrt(total_of(lane, joint_squares) / f32(WIDTH) + EPSILON);
+
+  for (var out = lane; out < C_PAIR; out += LANES) {
+    var value = 0.0;
+    for (var c = 0u; c < WIDTH; c += 1u) {
+      value += (concatenated[c] - joint_mean) * joint_inverse * scale[c]
+        * projection[c * C_PAIR + out];
+    }
+    pair[row * C_PAIR + out] = value;
+  }
+}`;
+
+  return { pairInitial: split ? pairInitialSplit : pairInitial, singleInitial };
 }
 
 /**
@@ -369,6 +525,64 @@ export class Af3DiffusionConditioningGpu {
     this.pipelines = pipelineCacheForDevice(device);
   }
 
+
+  /**
+   * This shape's pipelines, without any of the fold's tensors.
+   *
+   * 🔴 SO THEY CAN BE COMPILED WHILE THE TRUNK RUNS. A cold denoiser call at
+   * 130 tokens is 1360 ms against 16 warm, and `conditioning` is 189 of that -
+   * all of it `createComputePipelineAsync`, which compiles off the main thread
+   * and needs only a token count, the weights and the dialect. See
+   * Af3DiffusionHeadGpu.warm, which already does this for the transformer.
+   */
+  async warm(tokens, weights, dialect) {
+    await this.#compileFor(tokens, weights, dialect, undefined);
+  }
+
+  async #compileFor(tokens, weights, dialect, reusePair) {
+    const pairs = tokens * tokens;
+    const pairChannels = weights.pairChannels;
+    const seqChannels = weights.seqChannels;
+    const targetFeatWidth = weights.targetFeatWidth;
+    const noiseChannels = weights.fourierWeight.length;
+    const prepared = prepareWeights(weights);
+    const noisePacked = prepared.noisePacked;
+    const padding = singleCondPadding(dialect, seqChannels);
+    // 🔴 THE TRUNK PAIR'S WIDTH IS NOT THE CONDITIONING'S under the split
+    // dialect - OpenDDE hands 384 channels to a 128-channel conditioning - so
+    // the two are separate here and the cache key carries both.
+    const split = weights.zTrunkProjection !== undefined;
+    const trunkPairChannels = split
+      ? (weights.trunkPairChannels ?? pairChannels) : pairChannels;
+    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
+                    padding, split, trunkPairChannels };
+    const sources = createConditioningShaders(shape, noisePacked.offsets);
+    const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
+      + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`;
+    const compiled = {
+      pairInitial: reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
+      singleInitial: await this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
+      addPair: reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
+      addSingle: await this.pipelines.get(`${base}:add-single`,
+        createAddShader(tokens * seqChannels)),
+    };
+    // The four unconditioned transitions: the trunk's shader, two-pass variance.
+    const transitionPipelines = { pair: [], single: [] };
+    for (let index = 0; index < 2; index += 1) {
+      transitionPipelines.pair.push(reusePair !== undefined ? undefined
+        : await this.pipelines.get(`${base}:pair-transition:${index}`,
+            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
+                                   prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
+      transitionPipelines.single.push(await this.pipelines.get(
+        `${base}:single-transition:${index}`,
+        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2 },
+                               prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
+    }
+    return { shape, base, compiled, transitionPipelines };
+  }
+
   /**
    * @param {{tokens: number, trunkSingle, trunkPair, targetFeat, noiseLevel,
    *          features: {residueIndex, tokenIndex, asymId, entityId, symId}}} input
@@ -407,33 +621,9 @@ export class Af3DiffusionConditioningGpu {
         + "the dialect and the weights disagree about the unknown-DNA columns");
     }
 
-    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
-                    padding };
-    const sources = createConditioningShaders(shape, noisePacked.offsets);
-    const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
-      + `:${noiseChannels}:${padding.join(",")}`;
-    const compiled = {
-      pairInitial: reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
-      singleInitial: await this.pipelines.get(`${base}:single-initial`, sources.singleInitial),
-      addPair: reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:add-pair`, createAddShader(pairs * pairChannels)),
-      addSingle: await this.pipelines.get(`${base}:add-single`,
-        createAddShader(tokens * seqChannels)),
-    };
-    // The four unconditioned transitions: the trunk's shader, two-pass variance.
-    const transitionPipelines = { pair: [], single: [] };
-    for (let index = 0; index < 2; index += 1) {
-      transitionPipelines.pair.push(reusePair !== undefined ? undefined
-        : await this.pipelines.get(`${base}:pair-transition:${index}`,
-            createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
-                                   prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
-      transitionPipelines.single.push(await this.pipelines.get(
-        `${base}:single-transition:${index}`,
-        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2 },
-                               prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
-    }
-
+    const { shape, base, compiled, transitionPipelines } =
+      await this.#compileFor(tokens, weights, input.dialect, reusePair);
+    const { split } = shape;
     const featureData = new Int32Array(5 * tokens);
     ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"].forEach((name, index) => {
       const source = input.features[name];
@@ -451,7 +641,12 @@ export class Af3DiffusionConditioningGpu {
       // written across the bus, 1.8 MB at 59 tokens and 34 MB at 256, once per
       // sampler step, into a buffer no dispatch was going to read.
       const onlyIfNew = (build) => (reusePair === undefined ? build() : undefined);
-      const trunkPair = onlyIfNew(() => up("cond.trunk-pair", input.trunkPair));
+      // 🔴 THE CALLER'S BUFFER WHEN IT HAS ONE. On the structural-token path
+      // the trunk pair comes straight out of a pairformer stack that can leave
+      // it on the device, and this was a `tokens^2 x 384` upload of a tensor
+      // that had just been read back for the purpose.
+      const trunkPair = onlyIfNew(() => (input.trunkPairBuffer !== undefined
+        ? { buffer: input.trunkPairBuffer } : up("cond.trunk-pair", input.trunkPair)));
       const trunkSingle = up("cond.trunk-single", input.trunkSingle);
       const targetFeat = up("cond.target", input.targetFeat);
       const features = onlyIfNew(() => up("cond.features", featureData));
@@ -467,6 +662,15 @@ export class Af3DiffusionConditioningGpu {
       const pairProjection = onlyIfNew(() => resident("cond.pair-projection",
         () => weights.pairCondInitialProjection));
       const sums = onlyIfNew(() => resident("cond.column-sums", () => columnSums));
+      const zScale = split
+        ? onlyIfNew(() => resident("cond.z-scale", () => weights.zTrunkNormScale))
+        : undefined;
+      const zProjection = split
+        ? onlyIfNew(() => resident("cond.z-projection", () => weights.zTrunkProjection))
+        : undefined;
+      const relpeProjection = split
+        ? onlyIfNew(() => resident("cond.relpe-projection", () => weights.relpeProjection))
+        : undefined;
       const singleScale = resident("cond.single-scale",
         () => weights.singleCondInitialNormScale);
       const singleProjection = resident("cond.single-projection",
@@ -533,10 +737,14 @@ export class Af3DiffusionConditioningGpu {
       // because only the head knows the trunk has not changed underneath it -
       // and it is read at the top of this method, because the uploads and the
       // allocations above it are pair-track work too.
-      const pairLinear = spread(Math.ceil(pairs / 64));
+      // The split kernel is a workgroup per pair row; the joint one is a lane.
+      const pairLinear = spread(split ? pairs : Math.ceil(pairs / 64));
       if (reusePair === undefined) {
         run("pair-initial", compiled.pairInitial,
-            [trunkPair, features, pairScale, pairProjection, sums, pair],
+            split
+              ? [trunkPair, features, zScale, zProjection, relpeProjection,
+                 pairScale, pairProjection, pair]
+              : [trunkPair, features, pairScale, pairProjection, sums, pair],
             pairLinear[0], pairLinear[1]);
       }
       run("single-initial", compiled.singleInitial,

@@ -13,10 +13,21 @@
 import { msaBlock } from "../../src/af3/msa-reference.js";
 import { Af3MsaStackGpu } from "../../src/af3/msa-stack-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
+// 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
+// int5 bundle and not the f32 one the checker 404s instead of running - and
+// two whole stacks' kernel choices went ungated here for exactly that reason.
+// `--model=` picks the bundle; the bound follows, because an int5 bundle is
+// quantised and its residue against a float32 oracle is not the f32 one's.
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";
-const DIALECT = { swapTransposedBias: false };
+// 🔴 THE OUTER PRODUCT'S INPUT IS A DIALECT AND HAS NO DEFAULT. AF3 takes it
+// off the PRE-update MSA and OpenDDE off the updated one, and src/af3/
+// msa-reference.js throws rather than guess - which is what this file was
+// doing by omission. AF3's answer here; `--msa-update-before-opm=false` is
+// OpenDDE's, and it is the arm that makes this checker reach that bundle.
+const DIALECT = { swapTransposedBias: false, msaUpdateBeforeOuterProduct: false };
 const MSA_CHANNELS = 64;
 const PAIR_CHANNELS = 128;
 
@@ -53,7 +64,17 @@ export async function main(device, args) {
   const n = Number(option(args, "n", "24"));
   const sequences = Number(option(args, "sequences", "16"));
   const count = Number(option(args, "blocks", "1"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  const model = option(args, "model", MANIFEST);
+  const dialect = {
+    ...DIALECT,
+    msaUpdateBeforeOuterProduct:
+      option(args, "msa-update-before-opm", "false") !== "false",
+  };
+  // The device's own answers, so the matrix arm runs what SHIPS rather than a
+  // set this file names - the fault CLAUDE.md records about a checker that
+  // spells out the shipped settings and then agrees with itself.
+  const shipped = { ...deviceTuning(device) };
+  const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {
     const name = `${STACK}/${leaf}`;
@@ -150,20 +171,71 @@ export async function main(device, args) {
 
   let cpu = { pair: state.pair, msa: state.msa };
   for (const weights of blocks) {
-    cpu = msaBlock({ ...cpu, pairMask, msaMask, sequences, tokens: n }, weights, DIALECT);
+    cpu = msaBlock({ ...cpu, pairMask, msaMask, sequences, tokens: n }, weights, dialect);
   }
 
-  const gpu = await new Af3MsaStackGpu(device).run(state, blocks, DIALECT);
-  const pairRms = relativeRms(gpu.pair, cpu.pair);
-  const msaRms = relativeRms(gpu.msa, cpu.msa);
+  // 🔴 TWO ARMS, BECAUSE THIS STACK HAS TWO ARITHMETICS AND ONE BOUND WOULD
+  // STOP CHECKING THE TIGHTER ONE. Three device-profile knobs move the pair
+  // track's kernels onto the SUBGROUP MATRIX UNITS, which multiply in f16
+  // whatever the buffers hold; the reference here is a float32 CPU one, so the
+  // matrix arm cannot reach the vector arm's residue and a bound raised to
+  // admit it would let a real fault through on the arm that can. Measured on
+  // this box, one block at n=24 against the int5 bundle:
+  //
+  //     every knob off                       pair 5.40e-6
+  //     + pairTransitionSplit at 128 channels     1.23e-4
+  //     + gridAttendMatrix                        6.84e-4
+  //     + gridProjectMatrix                       1.43e-3
+  //     the shipped ampere profile                1.75e-3
+  //
+  // 🔴 AND THE OPPOSITE IS TRUE ONE STACK OVER. check-af3-block-any.js reads
+  // the PAIRFORMER's pair at 1.15e-1 with the vector kernels and 3.21e-2 with
+  // the matrix ones, because there the vector triangle accumulates in f16 and
+  // the staged path accumulates in f32. Same knobs, opposite sign, because the
+  // thing each is compared against is different. Neither number alone is the
+  // answer to "are the matrix kernels more accurate".
+  const MATRIX_KNOBS = ["gridProjectMatrix", "gridAttendMatrix", "pairTransitionSplit",
+                        "triangleProjectMatrix"];
+  const arms = [];
+  for (const matrix of [false, true]) {
+    if (!matrix) setDeviceTuning(device, Object.fromEntries(MATRIX_KNOBS.map((k) => [k, null])));
+    else {
+      setDeviceTuning(device, Object.fromEntries(MATRIX_KNOBS.map((k) => [k, shipped[k]])));
+      if (MATRIX_KNOBS.every((k) => shipped[k] !== true)) continue;
+    }
+    const gpu = await new Af3MsaStackGpu(device).run(state, blocks, dialect);
+    arms.push({
+      matrix,
+      pairRms: relativeRms(gpu.pair, cpu.pair),
+      msaRms: relativeRms(gpu.msa, cpu.msa),
+      milliseconds: Number(gpu.elapsedMilliseconds.toFixed(1)),
+      peakMiB: Number((gpu.memory.peakBytes / 2 ** 20).toFixed(1)),
+    });
+  }
   console.log(`${count} MSA block(s), n=${n}, ${sequences} sequences`);
-  console.log(`pair\trelRMS ${pairRms.toExponential(2)}`);
-  console.log(`msa\trelRMS ${msaRms.toExponential(2)}`);
-  console.log(`${gpu.elapsedMilliseconds.toFixed(1)} ms`
-    + `\t${(gpu.memory.peakBytes / 2 ** 20).toFixed(1)} MiB peak`);
-
-  const bound = 1e-5;
-  const worst = Math.max(pairRms, msaRms);
-  if (worst > bound) throw new Error(`relRMS ${worst.toExponential(2)} exceeds ${bound}`);
-  return { n, sequences, blocks: count, pairRms, msaRms };
+  // ...and each bound follows the BUNDLE as well as the arm, for the reason
+  // check-af3-template.js records: an int5 bundle's residue against a float32
+  // reference is not a float32 bundle's.
+  const int5 = model !== MANIFEST;
+  const bounds = {
+    false: Number(option(args, "bound", int5 ? "1e-4" : "1e-5")),
+    true: Number(option(args, "matrix-bound", int5 ? "4e-3" : "4e-3")),
+  };
+  let failed = 0;
+  for (const arm of arms) {
+    arm.bound = bounds[arm.matrix];
+    arm.ok = Math.max(arm.pairRms, arm.msaRms) <= arm.bound;
+    if (!arm.ok) failed += 1;
+    console.log(`${arm.matrix ? "matrix" : "vector"} kernels`
+      + `\tpair ${arm.pairRms.toExponential(2)}`
+      + `\tmsa ${arm.msaRms.toExponential(2)}`
+      + `\tbound ${arm.bound}\t${arm.ok ? "ok" : "FAILED"}`
+      + `\t${arm.milliseconds} ms\t${arm.peakMiB} MiB`);
+  }
+  if (failed > 0) {
+    throw new Error(`${failed} of ${arms.length} arms over bound: `
+      + arms.filter((a) => !a.ok).map((a) => `${a.matrix ? "matrix" : "vector"} `
+        + `${Math.max(a.pairRms, a.msaRms).toExponential(2)}`).join(", "));
+  }
+  return { n, sequences, blocks: count, model, arms };
 }

@@ -409,9 +409,20 @@ export class Af3DiffusionHeadGpu {
    * produces. Not awaited by the caller; the sampler's first call awaits the
    * same memoised promise.
    */
-  async warm(tokens, weights) {
+  async warm(tokens, weights, dialect) {
     this.#transformer ??= new Af3DiffusionTransformerGpu(this.device);
-    await this.#transformer.warm(tokens, this.#transformerWeights(weights));
+    // 🔴 THE CONDITIONING TOO, WHICH IS THE SECOND BIGGEST HALF OF A COLD CALL.
+    // Measured with `bench-head.js --tokens=130`: call 0 is 1360 ms against 16
+    // steady, and it splits transformer 946, conditioning 189, atom encoder 133,
+    // atom decoder 66. Only the transformer was warmed. The conditioning needs
+    // a token count, the weights and the dialect and nothing else - the atom
+    // stacks need the layout, which is why they are not here yet.
+    this.#conditioner ??= new Af3DiffusionConditioningGpu(this.device, { pool: true });
+    await Promise.all([
+      this.#transformer.warm(tokens, this.#transformerWeights(weights)),
+      dialect === undefined ? undefined
+        : this.#conditioner.warm(tokens, weights.conditioning, dialect),
+    ]);
   }
 
   #transformerWeightsFor;
@@ -509,8 +520,17 @@ export class Af3DiffusionHeadGpu {
       const keep = (allocation) => { held.push(allocation); return allocation; };
       const inputBuffer = input instanceof GPUBuffer
         ? { buffer: input } : keep(allocator.upload("np.input", input, storage));
-      const scaleBuffer = keep(allocator.upload("np.scale", scale, storage));
-      const weightBuffer = keep(allocator.upload("np.projection", projection, storage));
+      // 🔴 THESE TWO ARE WEIGHTS AND WERE UPLOADED ONCE A STEP. `scale` and
+      // `projection` are `singleCondEmbeddingNormScale` and
+      // `singleCondEmbeddingProjection` - a 384-vector and a 384x768 matrix
+      // that no noise level moves - and a two-hundred-step sampler wrote the
+      // matrix across the bus two hundred times. Measured in a 6MRR fold's
+      // buffer profile: `np.projection` 96 ms over 200 calls, 225.0 MiB. The
+      // key is the array itself, which a fold holds for its whole life.
+      const scaleBuffer = { buffer: residentWeightBuffer(
+        this.device, scale, "np.scale", () => scale) };
+      const weightBuffer = { buffer: residentWeightBuffer(
+        this.device, projection, "np.projection", () => projection) };
       const output = into !== undefined ? { buffer: into }
         : keep(allocator.allocate("np.output", rows * outChannels * 4,
             storage | GPUBufferUsage.COPY_SRC));

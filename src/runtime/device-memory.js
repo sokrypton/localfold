@@ -173,6 +173,11 @@ export function residencyAllowed(device) {
   return !refusedResidency.has(device);
 }
 
+/** The ceiling this device was given, or undefined if it has none. */
+export function memoryBudgetBytes(device) {
+  return accountFor(device).budgetBytes;
+}
+
 /**
  * Everything on this device right now.
  *

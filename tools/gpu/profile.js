@@ -21,6 +21,8 @@
  * does not.
  */
 
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+
 /**
  * @param {GPUDevice} device
  * @returns {{report: () => Promise<object[]>, reset: () => void,
@@ -28,6 +30,13 @@
  */
 export function profileDevice(device, options = {}) {
   if (!device.features.has("timestamp-query")) return null;
+  // 🔴 PROFILING CHANGES THE ENCODING, AND THIS IS WHERE IT SAYS SO. This
+  // attributes time by PASS, so a stack that puts thirty dispatches in one pass
+  // is one row with one label - which is no profile at all. `batchComputePasses`
+  // off gives every dispatch its own pass, and costs about 2.5% on the
+  // diffusion transformer. That is on top of the 2-4% a trunk pass pays for the
+  // timestamps themselves and the 45% a denoiser call pays; see docs/A100.md.
+  setDeviceTuning(device, { batchComputePasses: false });
   // 🔴 4096 IS A DEVICE MAXIMUM, NOT A CHOICE. createQuerySet rejects anything
   // larger, and the rejection is an uncaptured device error rather than a
   // throw - so a bench that asked for more simply died with no stack. A stack

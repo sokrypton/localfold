@@ -35,12 +35,17 @@
  * factor-2 transition; see src/af3/pair-track-gpu.js.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
+import { residencyAllowed } from "../runtime/device-memory.js";
 import { storageBytes } from "../runtime/storage.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import {
   GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH, compilePairTrack, encodePairTrack,
   packPairTrackWeights,
 } from "./pair-track-gpu.js";
+import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
+import { allocateGridProjectMatrix, gridProjectMatrixConfig }
+  from "./grid-project-matrix.js";
 import {
   GEOMETRY_STRIDE, coverageOf, multichainMaskFor, packTemplateGeometry, templateGeometry,
 } from "./template-features.js";
@@ -261,10 +266,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 export class Af3TemplateEmbedderGpu {
-  constructor(device) {
+  constructor(device, options = {}) {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    // The same default and the same escape the pairformer takes.
+    this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
 
   /**
@@ -318,7 +325,15 @@ export class Af3TemplateEmbedderGpu {
       n: tokens, channels: CHANNELS, transitionFactor: 2,
       weightPrecision: pairWeightPrecision,
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
+      // ...the same pair track, so the same kernel choice. Four of an AF3
+      // trunk's 108 `grid.project` passes are this stack's.
+      gridProjectMatrix: gridProjectMatrixConfig(this.device),
+      maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
     });
+    const gridProjectMatrix = trackPipelines.gridProjectMatrix === undefined ? undefined
+      : allocateGridProjectMatrix(this.allocator, {
+        ...trackPipelines.gridProjectMatrix, label: "af3-template.grid-project",
+      }, (a) => a);
 
     const gridHeads = weights.blocks[0].pairAttention1.heads;
     const storage = GPUBufferUsage.STORAGE;
@@ -478,16 +493,42 @@ export class Af3TemplateEmbedderGpu {
       // per slot would repack 1.4 MiB four times for four identical buffers -
       // and the release below would then have to know which upload belonged to
       // which pass.
-      const blockWeights = weights.blocks.map((block, index) => {
-        const packedTrack = packPairTrackWeights(block, CHANNELS, pairWeightPrecision);
-        return {
-          outgoing: upload(`w.tri.out.${index}`, packedTrack.outgoing),
-          incoming: upload(`w.tri.in.${index}`, packedTrack.incoming),
-          grid1: upload(`w.grid1.${index}`, packedTrack.grid1),
-          grid2: upload(`w.grid2.${index}`, packedTrack.grid2),
-          transition: upload(`w.transition.${index}`, packedTrack.transition),
-        };
-      });
+      // 🔴 PACKED ON DEMAND AND UPLOADED ONCE, EVER, the way the pairformer and
+      // the MSA stack do it. This stack's blocks are re-encoded once per
+      // template SLOT as well as once per pass, so the same weights were being
+      // packed and written four times over on a four-template job.
+      const resident = this.residentWeights
+        ? (label, key, pack, variant) => ({
+          buffer: residentWeightBuffer(this.device, key, label, pack, variant),
+        })
+        : (label, key, pack) => upload(label, pack());
+      const blockWeights = [];
+      for (const block of weights.blocks) {
+        // The four the device can pack itself; see pair-track-device-weights.js.
+        // eslint-disable-next-line no-await-in-loop
+        const onDevice = await residentPairTrackOnDevice(this.device, block, {
+          channels: CHANNELS, pairWeightPrecision, resident: this.residentWeights,
+        });
+        // Lazily, and not held: residentWeightBuffer calls pack() only on a
+        // miss, so after the first encode nothing reads these arrays again.
+        let packed;
+        const packedFor = () => (packed ??= packPairTrackWeights(
+          block, CHANNELS, pairWeightPrecision, true, "blocked", onDevice.want));
+        // 🔴 THE LABEL DROPS THE BLOCK INDEX AND THE CACHE KEY IS THE BLOCK
+        // OBJECT, which is the right way round: a device-memory breakdown reads
+        // one row per tensor instead of one per block, and two blocks cannot
+        // share a buffer because they are not the same object.
+        const w = pairWeightPrecision;
+        blockWeights.push({
+          outgoing: onDevice.buffers.outgoing
+            ?? resident("w.tri.out", block, () => packedFor().outgoing, w),
+          incoming: onDevice.buffers.incoming
+            ?? resident("w.tri.in", block, () => packedFor().incoming, w),
+          grid1: onDevice.buffers.grid1 ?? resident("w.grid1", block, () => packedFor().grid1),
+          grid2: onDevice.buffers.grid2 ?? resident("w.grid2", block, () => packedFor().grid2),
+          transition: resident("w.transition", block, () => packedFor().transition, w),
+        });
+      }
 
       for (let slot = 0; slot < slotBuffers.length; slot += 1) {
         run(`template.embed.${slot}`, compiled.embed,
@@ -497,6 +538,7 @@ export class Af3TemplateEmbedderGpu {
           encodePairTrack({
             run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
             pair: act, pairMask, scratch, biasBuffer, weights: blockWeights[index],
+            gridProjectMatrix,
           });
         }
         run(`template.accumulate.${slot}`, compiled.accumulate,

@@ -312,6 +312,22 @@ export async function foldEsmfold2(device, options) {
   const pairs = tokens * tokens;
   const channels = shape.pairChannels;
 
+  // 🔴 THE DENOISER IS BUILT HERE AND ITS PIPELINES ARE COMPILED HERE, not
+  // beside the `prepare` that needs them. Everything `#compile` reads is a
+  // shape and the shape is known from the FEATURES, which exist before the
+  // language model has run; `createComputePipelineAsync` compiles off the main
+  // thread and the trunk leaves the host waiting for seconds. Measured on a
+  // 40-residue fold: `conditioning` 966 ms on a first fold and 55 on a second,
+  // and all of that difference is the compile.
+  //
+  // 🔴 THE WARM-UP IS NOT AWAITED AND ITS SHAPE IS CHECKED. `prepare` takes the
+  // memoised promise only when the key matches what it resolved for itself; a
+  // warm-up that guessed wrong compiles again rather than handing back
+  // pipelines for the wrong molecule.
+  const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache,
+    options.denoiserWeightPrecision === undefined ? {}
+      : { weightPrecision: options.denoiserWeightPrecision });
+
   // 🔴 THE SAMPLER'S SETTINGS ARE RESOLVED FIRST, BECAUSE THE PLAN NEEDS THE
   // STEP COUNT. They depend on nothing the fold computes - the schedule is a
   // function of six constants - and the bar cannot be laid out until it knows
@@ -325,6 +341,21 @@ export async function foldEsmfold2(device, options) {
                                    maxSigma: settings.maxSigma });
   const gammas = churnFactors(schedule, settings.gammaMin, settings.gamma0);
   const levels = noiseLevels(schedule, gammas);
+
+  // ...and the denoiser's shape, which needs `settings.sigmaData` and nothing
+  // the fold computes.
+  const denoiserShape = {
+    tokens, atoms,
+    pairChannels: channels, singleInputs: shape.singleInputs,
+    tokenChannels: shape.tokenChannels2, tokenHeads: shape.tokenHeads,
+    multiplier: shape.transitionMultiplier, sigmaData: settings.sigmaData,
+    atomChannels: shape.atomChannels, atomHeads: shape.atomHeads,
+    atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
+    window: shape.atomWindow, attentionPrecision: options.attentionPrecision ?? "bf16",
+  };
+  // The catch is only so a compile that fails before anything awaits it is not
+  // an unhandled rejection; the real failure still arrives at `prepare`.
+  denoiser.warm(denoiserShape, features).catch(() => {});
 
   // 🔴 A COARSE PHASE AND A PERCENTAGE, NOT A STAGE NAME PER STAGE. Reporting
   // each stage gave "recycle 0", "trunk 0", "recycle 1", "trunk 1" - and a
@@ -720,19 +751,8 @@ export async function foldEsmfold2(device, options) {
     // blocks are 459 MiB of a 799 MiB fold; see the note in
     // src/esmfold2/diffusion-webgpu.js for why this stack takes f16 and the
     // atom stacks do not.
-    const denoiser = new Esmfold2DenoiserGpu(device, allocator, cache,
-      options.denoiserWeightPrecision === undefined ? {}
-        : { weightPrecision: options.denoiserWeightPrecision });
     await mark("conditioning", () => denoiser.prepare({
-      shape: {
-        tokens, atoms,
-        pairChannels: channels, singleInputs: shape.singleInputs,
-        tokenChannels: shape.tokenChannels2, tokenHeads: shape.tokenHeads,
-        multiplier: shape.transitionMultiplier, sigmaData: settings.sigmaData,
-        atomChannels: shape.atomChannels, atomHeads: shape.atomHeads,
-        atomBlocks: shape.atomBlocks, atomHidden: shape.atomChannels * 2,
-        window: shape.atomWindow, attentionPrecision: options.attentionPrecision ?? "bf16",
-      },
+      shape: denoiserShape,
       // 🔴 AND THE CONDITIONING IS WRITTEN BACK INTO relPos. It is the last
       // pass that reads it, chunk by chunk, and the fold is at its fullest
       // exactly there - three pair-sized f32 tensors where two will do. See

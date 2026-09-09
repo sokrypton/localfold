@@ -26,22 +26,19 @@ const option = (args, name, fallback) => {
 };
 
 export async function main(device, args) {
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-  const required = ["chromium-experimental-subgroup-matrix", "shader-f16", "subgroups", "timestamp-query"]
-    .filter((f) => adapter.features.has(f));
-  if (!required.includes("chromium-experimental-subgroup-matrix")) return { skipped: "no matrix units" };
-  // 🔴 THE STORAGE LIMIT IS NOT THE ADAPTER'S UNLESS YOU ASK. requestDevice
-  // hands out 16384 bytes by default even where the adapter supports 49152,
-  // and a staged kernel is exactly the thing that notices.
-  const gpu = await adapter.requestDevice({
-    requiredFeatures: required,
-    requiredLimits: {
-      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
-    },
-  });
-  const { recordAdapter } = await import("/src/runtime/device-profile.js");
-  recordAdapter(gpu, adapter);
+  // 🔴 IT USED TO REQUEST ITS OWN DEVICE, AND EVERY ARM READ 0.000 ms. A second
+  // GPUDevice off a fresh adapter is handed out LOST here: buffers, pipelines
+  // and submits all succeed as no-ops, `resolveQuerySet` writes nothing, and
+  // the timestamp pair subtracts to exactly zero. Nothing throws, so the probe
+  // reported four identical zeroes as a result. The runner's device already
+  // asks for every feature and every raised limit this needs - including
+  // maxComputeWorkgroupStorageSize, which was the reason the private device
+  // existed - so take the one that is passed in.
+  const gpu = device;
+  if (!gpu.features.has("chromium-experimental-subgroup-matrix")) {
+    return { skipped: "no matrix units" };
+  }
+  if (!gpu.features.has("timestamp-query")) return { skipped: "no timestamp-query" };
   const config = deviceMatrixConfig(gpu, { element: "f16" });
   if (config === null) return { skipped: "no f16 matrix config" };
 
@@ -54,7 +51,23 @@ export async function main(device, args) {
   const SGY = Number(option(args, "subgroupRows", "1"));
   const SGX = Number(option(args, "subgroupColumns", "8"));
 
+  // Read the right operand straight out of the weight buffer instead of
+  // staging it. It needs inner % blockInner == 0, which is asserted here rather
+  // than discovered as a wrong answer.
+  const direct = option(args, "direct", "0") === "1";
+  if (direct && inner % BK !== 0) throw new Error("--direct wants inner divisible by blockInner");
+
+  // The accumulator's width; the device config's own unless named. It is a
+  // register knob, so it moves the occupancy and not the arithmetic rate.
+  const resultType = option(args, "result", "");
+  // Double-buffer the staging: the next panel's global reads are issued before
+  // this panel's multiplies. 🔴 THE `noMac` AND `noStage` ARMS DO NOT APPLY to
+  // it - they are textual cuts against the single-loop form - so with this on,
+  // read `full` and nothing else.
+  const prefetch = option(args, "prefetch", "0") === "1";
   const base = createStagedMatrixShader({
+    directWeights: direct, prefetch,
+    ...(resultType === "" ? {} : { result: resultType }),
     blockRows: BM, blockColumns: BN, blockInner: BK, subgroupRows: SGY, subgroupColumns: SGX,
     element: "f16", result: config.resultComponentType,
     tile: { M: config.M, N: config.N, K: config.K },
@@ -113,11 +126,29 @@ export async function main(device, args) {
       if (validation && !results[name]) results[name] = { error: validation.message.split("\n")[0] };
       continue;
     }
-    const bindGroup = gpu.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [source, weights, parameters, output]
-        .map((buffer, binding) => ({ binding, resource: { buffer } })),
-    });
+    // 🔴 A NEUTERED ARM DROPS A BINDING, AND `layout: "auto"` DROPS IT TOO.
+    // `noStage` deletes the source staging loop, so nothing reads binding 0 and
+    // the reflected layout has three entries where the bind group has four -
+    // which is a validation error, not a slow arm. Bind only what this arm's
+    // own layout asks for.
+    const layout = pipeline.getBindGroupLayout(0);
+    const buffers = [source, weights, parameters, output];
+    const entries = [];
+    for (let binding = 0; binding < buffers.length; binding += 1) {
+      gpu.pushErrorScope("validation");
+      const probe = gpu.createBindGroup({
+        layout, entries: [{ binding, resource: { buffer: buffers[binding] } }],
+      });
+      void probe;
+      // A binding the layout does not have fails on THAT entry; one it does
+      // have fails only because the others are missing. Either way the message
+      // names the reason, so read it rather than guessing from the shader text.
+      const why = await gpu.popErrorScope();
+      if (why === null || !why.message.includes(`binding index ${binding} not present`)) {
+        entries.push({ binding, resource: { buffer: buffers[binding] } });
+      }
+    }
+    const bindGroup = gpu.createBindGroup({ layout, entries });
     const once = async () => {
       const encoder = gpu.createCommandEncoder();
       const pass = encoder.beginComputePass({
@@ -149,7 +180,7 @@ export async function main(device, args) {
     if (r.ms) r.tflops = Number((flops / (r.ms / 1000) / 1e12).toPrecision(4));
   }
   return {
-    rows, inner, columns, block: `${BM}x${BN}x${BK}x${SGY}x${SGX}`,
+    rows, inner, columns, block: `${BM}x${BN}x${BK}x${SGY}x${SGX}`, direct, resultType, prefetch,
     workgroups: Math.ceil(columns / BN) * Math.ceil(rows / BM),
     config, results,
   };

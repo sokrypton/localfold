@@ -278,6 +278,26 @@ export class AlphaFoldUnifiedGpu {
         };
         const windowSize = signal !== undefined ? 8 : weights.mainStack.length;
         const validation = new DeferredValidation(this.device, `recycle ${recycle}`);
+        const mainDescriptor = {
+          msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
+          pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
+          outerProductMeanFirst,
+          cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
+          triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
+        };
+        // The two stacks' pipelines, asked for all at once before either runs;
+        // see the same block in src/model/monomer.js for what it is worth.
+        if (recycle === 0) {
+          await execution.warm(async() => {
+            await Promise.all([
+              encodeExtraMsaBlock(execution, undefined, extraShape, weights.extraStack[0],
+                embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor),
+              encodeEvoformerBlock(execution, undefined, {
+                ...mainDescriptor, weights: weights.mainStack[0],
+              }, embedding.msa, embedding.pairWithoutTemplates, msaMask, pairMaskTensor),
+            ]);
+          });
+        }
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
@@ -296,13 +316,6 @@ export class AlphaFoldUnifiedGpu {
         await capturePair("extra-stack", embedding.pairWithoutTemplates);
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
-        const mainDescriptor = {
-          msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
-          pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
-          outerProductMeanFirst,
-          cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
-          triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
-        };
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();

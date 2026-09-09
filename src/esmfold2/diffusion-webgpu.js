@@ -32,6 +32,13 @@ import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
          createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
+import { residentWeightBuffer } from "../runtime/resident.js";
+import { residentTensorOnDevice, residentPairOnDevice, elementsOf }
+  from "./device-weights.js";
+import { SOURCES } from "./weights.js";
+import {
+  GpuMemoryBudgetError, memoryBudgetBytes, noteResidencyRefused, residencyAllowed,
+} from "../runtime/device-memory.js";
 import {
   atomStackScratch, atomWindows, compileAtomStack, createBroadcastShader,
   createPoolShader, encodeAtomStack, tokenRanges, widestWindow,
@@ -470,6 +477,20 @@ export function concatenateColumns(left, right, inner, outer) {
  * tokens would be 640 MiB of scratch for arithmetic that is purely row-wise.
  * Eight thousand rows at a time costs nothing measurable and bounds it.
  */
+/**
+ * Everything `#compile` reads off a shape, as one string.
+ *
+ * 🔴 SO A WARM-UP CANNOT HAND BACK THE WRONG PIPELINES. The warm path derives
+ * `stagedWindow` from the same features the real call does, but "derives it the
+ * same way" is a claim and this is the check.
+ */
+function pipelineKeyOf(shape) {
+  return [shape.tokens, shape.atoms, shape.pairChannels, shape.singleInputs,
+          shape.tokenChannels, shape.tokenHeads, shape.multiplier, shape.atomChannels,
+          shape.atomHeads, shape.atomBlocks, shape.atomHidden, shape.stagedWindow,
+          shape.attentionPrecision].join(":");
+}
+
 export class Esmfold2DenoiserGpu {
   constructor(device, allocator, pipelineCache, options = {}) {
     this.device = device;
@@ -732,6 +753,32 @@ export class Esmfold2DenoiserGpu {
    * same element count alias without complaint, so the gate is the STRUCTURE:
    * a 300-token fold's PDB is sha256 83c0530b02f867ac with and without this.
    */
+  /**
+   * Compile this shape's pipelines, without any of the fold's tensors.
+   *
+   * 🔴 BECAUSE `prepare` IS AFTER THE TRUNK AND THE COMPILE DOES NOT HAVE TO
+   * BE. Everything `#compile` reads is a shape, and the shape is known from the
+   * FEATURES - which exist before the language model runs. Measured on a 40-
+   * residue ESMFold2 fold, `conditioning` is 966 ms on a first fold and 55 on a
+   * second, and all of that difference is here: `createComputePipelineAsync`
+   * compiles off the main thread, and the trunk leaves the host waiting for
+   * seconds. Not awaited by the caller; `prepare` awaits the same memoised
+   * promise.
+   *
+   * @param {object} shape the same object `prepare` is given, plus the mask
+   *   `stagedWindow` is derived from.
+   */
+  warm(shape, features) {
+    const { atoms, window } = shape;
+    const staged = { ...shape,
+                     stagedWindow: widestWindow(atomWindows(features.mask, atoms, window >> 1),
+                                                atoms) };
+    this.#warming ??= { key: pipelineKeyOf(staged), promise: this.#compile(staged) };
+    return this.#warming.promise;
+  }
+
+  #warming;
+
   async prepare({ shape, weights, features, sInputs, pair, relPos, reuseRelPos = false,
                   releasePair }) {
     const { tokens, atoms, pairChannels, singleInputs, tokenChannels, tokenHeads,
@@ -751,7 +798,12 @@ export class Esmfold2DenoiserGpu {
     // walk four times the keys that exist. It is part of the shape and
     // therefore part of the pipeline key.
     this.shape = { ...shape, stagedWindow: widestWindow(bounds, atoms) };
-    const pipelines = await this.#compile(this.shape);
+    // 🔴 THE WARMED PROMISE WHEN IT IS FOR THIS SHAPE, and a fresh compile when
+    // it is not - a warm-up that guessed wrong must not hand back the wrong
+    // pipelines, which is the whole hazard of compiling ahead of the caller.
+    const key = pipelineKeyOf(this.shape);
+    const pipelines = this.#warming?.key === key
+      ? await this.#warming.promise : await this.#compile(this.shape);
     this.pipelines = pipelines;
     // 🔴 THE ROPE TABLE IS bfloat16 IN A float32 MODEL, and that is worth 2.4e-3
     // through the attention. `build_3d_rope` computes in float32 and the table
@@ -778,18 +830,131 @@ export class Esmfold2DenoiserGpu {
     b.noise = this.#alloc("esmfold2.diff.noise", tokenChannels,
                           storage | GPUBufferUsage.COPY_DST);
 
+    // 🔴 THE WEIGHTS ARE THE SAME ON EVERY FOLD AND WERE UPLOADED ON EVERY
+    // FOLD. `prepare` runs once per fold and pushed all of them through the
+    // pooled allocator, narrowing the token blocks to f16 as it went; measured
+    // on a second fold at 91 tokens, `conditioning` was 891 ms of a 1841 ms
+    // fold - 48% - and this is what it was. Residency is keyed on the weight
+    // OBJECT, which the loader builds once and reuses, so the cache lives
+    // exactly as long as the model.
+    //
+    // 🔴 AND IT IS SIZED AGAINST THE BUDGET, NOT REFUSED BY ITS PRESENCE - the
+    // page always sets one. See the same rule in src/esmc/tower-webgpu.js.
+    // 🔴 SIZED FROM THE SOURCES WHERE THERE ARE ANY, BECAUSE READING A LEAF
+    // DECODES IT. With a lazy loader every one of these properties is a getter,
+    // so asking a block how big it is used to decode the whole denoiser to
+    // answer - the same trap `pairTrackResidentBytes` walked into in
+    // src/af3/fold.js. `SOURCES` carries the manifest record, which states the
+    // shape without touching a byte.
+    const sizeOf = (holder, name) => {
+      const source = holder?.[SOURCES]?.[name];
+      if (source !== undefined) return elementsOf(source.record) * 4;
+      return holder?.[name]?.byteLength ?? 0;
+    };
+    const weightBytes = (values) => (values?.byteLength ?? 0);
+    let residentBytes = 0;
+    for (const source of [weights.encoder.blocks, weights.decoder.blocks]) {
+      for (const block of source) {
+        for (const name of ["adaln", "qkv", "attnGate", "attnOut", "ffnUp", "ffnDown"]) {
+          residentBytes += sizeOf(block, name);
+        }
+      }
+    }
+    for (const block of weights.tokenBlocks ?? []) {
+      for (const part of [block.attention, block.transition]) {
+        for (const name of Object.keys(part ?? {})) {
+          if (name === "adaln") continue;
+          residentBytes += sizeOf(part, name);
+        }
+        for (const name of Object.keys(part?.adaln ?? {})) {
+          residentBytes += sizeOf(part.adaln, name);
+        }
+      }
+    }
+    void weightBytes;
+    const ceiling = memoryBudgetBytes(this.device);
+    const keepWeights = residencyAllowed(this.device)
+      && (ceiling === undefined || ceiling >= residentBytes * 4);
+    // 🔴 AND THE DEVICE DECODES WHAT IT CAN, which is every tensor the reader
+    // offered codes for. `SOURCES` is present only when the loader was handed a
+    // reader carrying `.source` - see src/esmfold2/weights.js - so a checker
+    // with a plain reader, or an f32 bundle, takes the host path unchanged.
+    // Measured on the int5 bundle: the denoiser's weight load is 1.17 s before
+    // the fold's clock starts and `conditioning` is 880 ms of narrowing inside
+    // it, and neither needs a host.
+    const fromDevice = async (key, label, holder, name, destination, make) => {
+      if (!keepWeights) return this.#upload(`w.esmfold2.${label}`, make());
+      const source = holder?.[SOURCES]?.[name];
+      if (source !== undefined) {
+        try {
+          const buffer = await residentTensorOnDevice(this.device, {
+            key, label: `w.esmfold2.${label}`, variant: this.#weightPrecision(),
+            source, destination,
+          });
+          if (buffer !== undefined) return { buffer };
+        } catch (error) {
+          if (!(error instanceof GpuMemoryBudgetError)) throw error;
+          noteResidencyRefused(this.device);
+          return this.#upload(`w.esmfold2.${label}`, make());
+        }
+      }
+      return resident(key, label, make);
+    };
+    /** Two tensors concatenated along their columns, decoded on the device. */
+    const concatenatedOnDevice = async (key, label, holder, names, columns,
+                                        destination, make) => {
+      if (!keepWeights) return this.#upload(`w.esmfold2.${label}`, make());
+      const sources = names.map((name) => holder?.[SOURCES]?.[name]);
+      if (sources.every((source) => source !== undefined)) {
+        try {
+          const buffer = await residentPairOnDevice(this.device, {
+            key, label: `w.esmfold2.${label}`, variant: this.#weightPrecision(),
+            sources, columns, destination,
+          });
+          if (buffer !== undefined) return { buffer };
+        } catch (error) {
+          if (!(error instanceof GpuMemoryBudgetError)) throw error;
+          noteResidencyRefused(this.device);
+          return this.#upload(`w.esmfold2.${label}`, make());
+        }
+      }
+      return resident(key, label, make);
+    };
+    // `make` is a thunk so a hit never runs the narrowing, which is the other
+    // half of what this costs.
+    const resident = (key, label, make) => {
+      if (!keepWeights) return this.#upload(`w.esmfold2.${label}`, make());
+      try {
+        return { buffer: residentWeightBuffer(this.device, key, `w.esmfold2.${label}`,
+                                              make, this.#weightPrecision()) };
+      } catch (error) {
+        if (!(error instanceof GpuMemoryBudgetError)) throw error;
+        noteResidencyRefused(this.device);
+        return this.#upload(`w.esmfold2.${label}`, make());
+      }
+    };
     const upload = (label, data) => this.#upload(`w.esmfold2.${label}`, data);
     const narrow = (values) => this.#narrow(values);
-    const stack = (blocks, label) => blocks.map((block, index) => ({
-      adaln: upload(`${label}.${index}.adaln`, block.adaln),
-      qkv: upload(`${label}.${index}.qkv`, block.qkv),
-      attnGate: upload(`${label}.${index}.attn-gate`, block.attnGate),
-      attnOut: upload(`${label}.${index}.attn-out`, block.attnOut),
-      ffnUp: upload(`${label}.${index}.ffn-up`, block.ffnUp),
-      ffnDown: upload(`${label}.${index}.ffn-down`, block.ffnDown),
-    }));
-    const encoderBlocks = stack(weights.encoder.blocks, "atom-encoder");
-    const decoderBlocks = stack(weights.decoder.blocks, "atom-decoder");
+    // 🔴 THE ATOM STACKS ARE f32 ON THE DEVICE and the token blocks are f16, so
+    // the two take different destinations from the same decoder. See
+    // src/runtime/quantised-upload.js: an f32 element is a whole word, which is
+    // why only that mode may stride and why it needs no even offsets.
+    const stack = async (blocks, label) => {
+      const out = [];
+      for (const block of blocks) {
+        // eslint-disable-next-line no-await-in-loop
+        out.push(Object.fromEntries(await Promise.all([
+          ["adaln", "adaln"], ["qkv", "qkv"], ["attnGate", "attn-gate"],
+          ["attnOut", "attn-out"], ["ffnUp", "ffn-up"], ["ffnDown", "ffn-down"],
+        ].map(async ([name, leaf]) => [name, await fromDevice(
+          block, `${label}.${leaf}`, block, name, "f32", () => block[name])]))));
+      }
+      return out;
+    };
+    const [encoderBlocks, decoderBlocks] = await Promise.all([
+      stack(weights.encoder.blocks, "atom-encoder"),
+      stack(weights.decoder.blocks, "atom-decoder"),
+    ]);
     const w = {
       coordsLinear: upload("coords", weights.encoder.coordsLinear),
       toToken: upload("to-token", weights.encoder.atomToToken),
@@ -805,48 +970,73 @@ export class Esmfold2DenoiserGpu {
       tokenNormOffset: upload("token-norm-offset", weights.tokenNormOffset),
     };
     const condition = weights.conditioning;
-    const sTransitions = condition.sTransitions.map((block, index) => ({
-      normScale: upload(`s-trans.${index}.norm-scale`, block.normScale),
-      normOffset: upload(`s-trans.${index}.norm-offset`, block.normOffset),
+    const element = this.#weightPrecision();
+    const sTransitions = await Promise.all(condition.sTransitions.map(async (block) => ({
+      normScale: resident(block, "s-trans.norm-scale", () => block.normScale),
+      normOffset: resident(block, "s-trans.norm-offset", () => block.normOffset),
       // ...the single conditioning's transitions share `wide` and `narrow` with
       // the token blocks, so they take the same element. They are 27 MiB and
       // they too produce an activation the next norm renormalises.
-      aProjection: upload(`s-trans.${index}.a`, narrow(block.aProjection)),
-      bProjection: upload(`s-trans.${index}.b`, narrow(block.bProjection)),
-      outProjection: upload(`s-trans.${index}.out`, narrow(block.outProjection)),
-    }));
+      aProjection: await fromDevice(block, "s-trans.a", block, "aProjection", element,
+        () => narrow(block.aProjection)),
+      bProjection: await fromDevice(block, "s-trans.b", block, "bProjection", element,
+        () => narrow(block.bProjection)),
+      outProjection: await fromDevice(block, "s-trans.out", block, "outProjection", element,
+        () => narrow(block.outProjection)),
+    })));
     // 🔴 THE adaLN GATE AND SHIFT ARE ONE MATRIX HERE AND TWO IN THE
     // CHECKPOINT. They are two projections of the SAME normalised single, so
     // side by side they are one dispatch; `concatenateColumns` is where the two
     // halves are decided, and `createAdaptiveCombineShader` reads the gate
     // first because that is the order it is written in.
-    const tokenBlocks = weights.tokenBlocks.map((block, index) => {
-      const adaln = (kind, source) => ({
-        singleScale: upload(`b${index}.${kind}.single-scale`, source.adaln.singleScale),
-        gateShift: upload(`b${index}.${kind}.gate-shift`, narrow(concatenateColumns(
-          source.adaln.gateWeights, source.adaln.shiftWeights, tokenChannels, tokenChannels))),
-        gateBias: upload(`b${index}.${kind}.gate-bias`, source.adaln.gateBias),
+    const tokenBlocks = await Promise.all(weights.tokenBlocks.map(async (block) => {
+      // 🔴 KEYED ON THE SUB-OBJECT AND LABELLED WITHOUT THE INDEX. The key is
+      // `block.attention` or `block.transition`, which are distinct objects per
+      // block, so two blocks cannot share a buffer - and a device-memory
+      // breakdown then reads one row per tensor rather than one per block.
+      // 🔴 `gateShift` IS TWO MATRICES CONCATENATED ALONG THEIR COLUMNS, which
+      // the decoder can now say: two sources and a `partRun` of the column
+      // count, so a part owns a whole row rather than one element. It is 54 MiB
+      // over twelve blocks and it was a host copy and a narrowing.
+      const adaln = async (kind, source) => ({
+        singleScale: resident(source, `${kind}.single-scale`, () => source.adaln.singleScale),
+        gateShift: await concatenatedOnDevice(
+          source, `${kind}.gate-shift`, source.adaln, ["gateWeights", "shiftWeights"],
+          tokenChannels, element,
+          () => narrow(concatenateColumns(source.adaln.gateWeights,
+                                          source.adaln.shiftWeights,
+                                          tokenChannels, tokenChannels))),
+        gateBias: resident(source, `${kind}.gate-bias`, () => source.adaln.gateBias),
       });
+      const a = block.attention;
+      const f = block.transition;
+      // 🔴 `gateShift` IS NOT HERE AND CANNOT BE. It is two matrices
+      // concatenated along their COLUMNS, so its destination interleaves them
+      // in blocks of a row rather than element by element - which the decoder's
+      // stride triple cannot say, and an f16 destination cannot stride anyway.
+      // It is 54 MiB of the 459 and it stays on the host.
+      const narrowed = async (holder, label, name) => fromDevice(
+        holder, label, holder, name, element, () => narrow(holder[name]));
       return {
         attention: {
-          adaln: adaln("attn", block.attention),
-          queryWeights: upload(`b${index}.query`, narrow(block.attention.queryWeights)),
-          queryBias: upload(`b${index}.query-bias`, block.attention.queryBias),
-          kvWeights: upload(`b${index}.kv`, narrow(block.attention.kvWeights)),
-          gateWeights: upload(`b${index}.gate`, narrow(block.attention.gateWeights)),
-          outWeights: upload(`b${index}.out`, narrow(block.attention.outWeights)),
-          outGateWeights: upload(`b${index}.out-gate`, narrow(block.attention.outGateWeights)),
-          outGateBias: upload(`b${index}.out-gate-bias`, block.attention.outGateBias),
+          adaln: await adaln("attn", a),
+          queryWeights: await narrowed(a, "query", "queryWeights"),
+          queryBias: resident(a, "query-bias", () => a.queryBias),
+          kvWeights: await narrowed(a, "kv", "kvWeights"),
+          gateWeights: await narrowed(a, "gate", "gateWeights"),
+          outWeights: await narrowed(a, "out", "outWeights"),
+          outGateWeights: await narrowed(a, "out-gate", "outGateWeights"),
+          outGateBias: resident(a, "out-gate-bias", () => a.outGateBias),
         },
         transition: {
-          adaln: adaln("ffn", block.transition),
-          swishWeights: upload(`b${index}.swish`, narrow(block.transition.swishWeights)),
-          outWeights: upload(`b${index}.ffn-out`, narrow(block.transition.outWeights)),
-          outGateWeights: upload(`b${index}.ffn-out-gate`, narrow(block.transition.outGateWeights)),
-          outGateBias: upload(`b${index}.ffn-out-gate-bias`, block.transition.outGateBias),
+          adaln: await adaln("ffn", f),
+          swishWeights: await narrowed(f, "swish", "swishWeights"),
+          outWeights: await narrowed(f, "ffn-out", "outWeights"),
+          outGateWeights: await narrowed(f, "ffn-out-gate", "outGateWeights"),
+          outGateBias: resident(f, "ffn-out-gate-bias", () => f.outGateBias),
         },
       };
-    });
+    }));
 
     // ---- the pair conditioning, in row chunks, and the twelve biases from it.
     // ...into `relPos`, which the conditioning is the last reader of; see the

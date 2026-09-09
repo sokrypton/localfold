@@ -50,12 +50,35 @@ function validate(input) {
   }
 }
 
+/**
+ * The properties this packer concatenates, in order, as `{sources, name}`.
+ *
+ * 🔴 EXPORTED SO THE DEVICE PATH CANNOT DRIFT FROM THE HOST ONE, and built from
+ * the SAME descriptor the host packer reads - the two lists below are one list.
+ * Its entries name their own holder because the pair-bias tensors live in a
+ * second object; see src/runtime/device-pack.js.
+ */
+export function attentionPackOrder(input, sourcesOf) {
+  const order = ATTENTION_WEIGHT_NAMES.map((name) => ({ sources: sourcesOf(input.weights), name }));
+  const pair = input.pairBias;
+  if (pair?.source === "separate") {
+    for (const name of ["layerNormScale", "layerNormOffset", "projectionWeight"]) {
+      order.push({ sources: sourcesOf(pair), name });
+    }
+  } else if (pair !== undefined) {
+    order.push({ sources: sourcesOf(pair), name: "projectionWeight" });
+  }
+  return order;
+}
+
+const ATTENTION_WEIGHT_NAMES = [
+  "queryNormScale", "queryNormOffset", "queryWeight", "keyWeight", "valueWeight",
+  "gatingWeight", "gatingBias", "outputWeight", "outputBias",
+];
+
 export function packAttentionWeights(input) {
   const w = input.weights;
-  const tensors = [
-    w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
-    w.gatingWeight, w.gatingBias, w.outputWeight, w.outputBias,
-  ];
+  const tensors = ATTENTION_WEIGHT_NAMES.map((name) => w[name]);
   const pair = input.pairBias;
   if (pair?.source === "separate") {
     tensors.push(pair.layerNormScale, pair.layerNormOffset, pair.projectionWeight);

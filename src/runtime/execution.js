@@ -1,4 +1,12 @@
 import { GpuBufferAllocator } from "./allocator.js";
+import { DeviceWeightRefusal, packedBytesOf, residentPackFromSources }
+  from "./device-pack.js";
+import { residentPack } from "./resident.js";
+import {
+  GpuMemoryBudgetError, memoryBudgetBytes, memoryTotals, noteResidencyRefused,
+  residencyAllowed,
+} from "./device-memory.js";
+import { deviceTuning } from "./device-profile.js";
 import { pipelineCacheForDevice } from "./pipeline-cache.js";
 import { storageBytes, storageWords } from "./storage.js";
 
@@ -36,6 +44,25 @@ export class WebGpuExecution {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device, true);
     this.pipelines = pipelineCacheForDevice(device);
+    /**
+     * True while an encode path is being run for its PIPELINES only.
+     *
+     * 🔴 95 COMPILES, ASKED FOR ONE AT A TIME, ARE AF2's WHOLE FIRST FOLD. The
+     * span from the first `createComputePipelineAsync` to the last settle is
+     * 1133 ms of a 1163 ms first fold, and the sum of their individual waits is
+     * 1662 - so an average of 1.47 were ever in flight, because an encode asks
+     * for a pipeline at the moment it needs it and the block's ten operations
+     * run one after another. This browser compiles 32 pipelines 5.4x faster
+     * concurrently than serially, measured, so the fix is to ask for all of
+     * them before encoding anything.
+     *
+     * Every encode function returns early once its pipelines are requested when
+     * this is set. Nothing below that point in any of them touches the encoder,
+     * and everything above is derivation plus the resident weight upload, which
+     * is cached and wanted either way.
+     */
+    this.warming = false;
+    this.pendingWarm = [];
     // 🔴 A TENSOR CAN FIT IN A BUFFER AND STILL NOT BE BINDABLE. maxBufferSize
     // and maxStorageBufferBindingSize are different limits, and the second is
     // the smaller one - so a transition over 508 MSA rows of a long sequence
@@ -91,6 +118,173 @@ export class WebGpuExecution {
     const allocation = this.allocator.allocate(label, storageBytes(elements, storage), usage);
     this.#allocations.push(allocation);
     return { allocation, elements, storage };
+  }
+
+  /**
+   * The same upload, kept on the device for the model's lifetime.
+   *
+   * 🔴 THIS IS THE REVISIT THE NOTE BELOW ASKS FOR, and it is a different
+   * machine's answer. That measurement was taken on an M2 - shared memory,
+   * writeBuffer close to free, a GPU-bound fold - and it concluded "memory
+   * spent for no time saved". On a discrete GPU the same traffic crosses PCIe,
+   * and more to the point the PACK is host work that no amount of shared
+   * memory makes free: 232 ms for 24 ESMFold2 blocks, measured, and that
+   * trunk's wall went 701 -> 501 ms when it stopped paying it per pass.
+   *
+   * `pack` runs only on a MISS, so the packed array is transient on the first
+   * pass and never allocated again. `elements` comes off the buffer rather
+   * than off `pack`, because on a hit there is no array to ask - and the
+   * OFFSETS are kept beside it, because every caller needs those on every pass
+   * and fetching them would otherwise run the pack anyway.
+   */
+  /**
+   * `uploadResident`, but decoding the tensors on the DEVICE when the caller
+   * can say which they are.
+   *
+   * 🔴 THE ONLY REASON IT IS ASYNC. Filling a buffer from codes means a compute
+   * pass, and `createComputePipelineAsync` is a promise; every AF2 caller of
+   * this is already inside an `async` encode function, so the cost is a
+   * microtask and not a redesign.
+   *
+   * @param {{sources: object, order: string[], precision: string}} plan
+   */
+  async uploadResidentPacked(label, key, pack, variant, plan) {
+    // 🔴 A BUDGET DOES NOT DISQUALIFY THIS ONE, WHICH IS THE DIFFERENCE FROM
+    // `uploadResident` BELOW. That one declines under a ceiling because the
+    // POOLED allocator evicts to make room and can evict a buffer an in-flight
+    // submit still names; this allocates through `noteAllocation`, which RAISES
+    // before `createBuffer` and never evicts anything. The page ALWAYS sets a
+    // budget, so gating on its absence gave the whole device path to the tools
+    // and none of it to the shipped page - measured as a 2.5 s page fold
+    // becoming 3.0.
+    //
+    // 🔴 AND A QUARTER OF THE CEILING IS THE LINE, the same rule
+    // src/esmc/tower-webgpu.js takes. A device with room keeps everything; a
+    // 200 MiB one keeps nothing and streams as it always did, because filling a
+    // tight ceiling with resident weights is exactly what makes the pooled
+    // allocator evict something in flight - `--budget=200` reproduced that in
+    // one run without this line.
+    const ceiling = memoryBudgetBytes(this.device);
+    const wanted = plan?.order === undefined ? undefined
+      : packedBytesOf(plan.order, plan.sources, plan.precision);
+    const affordable = ceiling === undefined || (wanted !== undefined
+      && memoryTotals(this.device).residentBytes + wanted <= ceiling / 4);
+    if (plan?.order !== undefined && residencyAllowed(this.device) && affordable) {
+      try {
+        const built = await residentPackFromSources(this.device, {
+          key, label, variant, sources: plan.sources, order: plan.order,
+          precision: plan.precision,
+        });
+        return {
+          weights: { allocation: { buffer: built.buffer },
+                     elements: built.buffer.size / 4, storage: "f32" },
+          // 🔴 THE OFFSET TABLE'S SHAPE IS THE HOST PACKER'S. AF2's transition
+          // and attention packers return a positional array and the triangle's
+          // returns an object keyed by name, because that is what its shader
+          // factory indexes; a device path that returned the other one hands a
+          // kernel `undefined` for every offset, which WGSL then compiles as
+          // the string "undefined" and fails to parse. `named` says which.
+          offsets: plan.named === true ? built.offsetsByName : built.offsets,
+        };
+      } catch (error) {
+        if (error instanceof GpuMemoryBudgetError) {
+          noteResidencyRefused(this.device);
+        } else if (error instanceof DeviceWeightRefusal) {
+          // 🔴 THE FALLBACK IS OPT-IN, because a silent one is a bug that looks
+          // like a slow machine. A bundle that genuinely cannot be decoded on
+          // the device - float32, or a fixture built over plain arrays - says
+          // so once by setting `allowHostWeightPacking`; anything else is a
+          // descriptor that lost its sources and should stop the fold.
+          if (deviceTuning(this.device).allowHostWeightPacking !== true) throw error;
+        } else {
+          throw error;
+        }
+      }
+    }
+    return this.uploadResident(label, key, pack, variant);
+  }
+
+  /**
+   * Run `body` for its pipelines and its resident weights, encoding nothing.
+   *
+   * 🔴 IT IS A MODE AND NOT A SEPARATE LIST OF KERNELS, which is the whole
+   * point: a warm written as its own enumeration of shader keys is a list
+   * written twice, and the copy that goes stale is the one nobody runs. This
+   * drives the SAME encode functions the fold does, so a kernel that exists is
+   * a kernel that gets warmed.
+   *
+   * Not re-entrant, and it must not overlap real encoding - the flag is on the
+   * execution, so a fold that started warming halfway through would silently
+   * skip the rest of its dispatches. Callers warm, then fold.
+   */
+  async warm(body) {
+    if (this.warming) throw new Error("Execution.warm is already running");
+    const checkpoint = this.checkpoint();
+    this.warming = true;
+    this.pendingWarm = [];
+    try {
+      await body();
+      // ...drained in rounds, because a warmed operation may register more.
+      while (this.pendingWarm.length > 0) {
+        const batch = this.pendingWarm;
+        this.pendingWarm = [];
+        await Promise.all(batch);
+      }
+    } finally {
+      this.warming = false;
+      this.pendingWarm = [];
+      this.releaseScratchSince(checkpoint);
+    }
+  }
+
+  /**
+   * Register a warm that is running, so `warm` can await it at the end.
+   *
+   * 🔴 THIS IS WHERE THE CONCURRENCY COMES FROM. `staged` awaits its body in a
+   * fold because the encoder is ordered; in a warm there is no encoder, so it
+   * hands the promise here and returns, and the block's ten operations request
+   * their pipelines in the same tick instead of ten waits apart.
+   */
+  notePending(promise) {
+    if (!this.warming) throw new Error("notePending outside a warm");
+    const tracked = Promise.resolve(promise);
+    // ...so a rejection that the drain has not reached yet is not an unhandled
+    // one; the drain still sees it, because `tracked` is what is pushed.
+    tracked.catch(() => {});
+    this.pendingWarm.push(tracked);
+  }
+
+  uploadResident(label, key, pack, variant = "") {
+    // 🔴 RESIDENCY IS A TRADE AND THE BUDGET ANSWERS IT. Keeping an evoformer
+    // stack's weights costs 280 MiB of a 387 MiB fold at 59 residues; on this
+    // card that is nothing and on a phone it is the difference between folding
+    // and not. A device with a budget raises GpuMemoryBudgetError from the
+    // first allocation that would cross it, and from then on this whole device
+    // uploads per pass instead - which is the same policy AF3's pairformer
+    // takes, expressed once here so every AF2 caller inherits it.
+    // 🔴 AND A DEVICE WITH A CEILING DOES NOT TAKE IT AT ALL, which is stricter
+    // than AF3's pairformer and has to be. That stack catches
+    // GpuMemoryBudgetError and RESTARTS itself without residency; AF2's has no
+    // restart, and under a 200 MiB budget the allocator instead evicts pooled
+    // buffers to make room for the 280 MiB of resident weights - and evicts one
+    // that an in-flight command buffer still names: "[Buffer
+    // msa-row-attention.value] used in submit while destroyed". Measured. With
+    // residency declined, the same fold under the same budget is 108.5 MiB and
+    // the same answer to the checksum.
+    if (residencyAllowed(this.device) && memoryBudgetBytes(this.device) === undefined) {
+      try {
+        const { buffer, offsets } = residentPack(this.device, key, label, pack, variant);
+        return {
+          weights: { allocation: { buffer }, elements: buffer.size / 4, storage: "f32" },
+          offsets,
+        };
+      } catch (error) {
+        if (!(error instanceof GpuMemoryBudgetError)) throw error;
+        noteResidencyRefused(this.device);
+      }
+    }
+    const packed = pack();
+    return { weights: this.upload(label, packed.data), offsets: packed.offsets };
   }
 
   // 🔴 WEIGHTS ARE NOT CACHED ACROSS PASSES, and that was measured, not assumed.

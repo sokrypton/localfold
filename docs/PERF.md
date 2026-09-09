@@ -792,6 +792,144 @@ experiment with a method already written down.
 TypeScript, and the two findings worth passing on are measurements of their own
 port that their harness structurally hides.
 
+## What an unrecognised GPU costs, which is 1.5x and was never measured
+
+The section above says their runtime probe is the thing this port's device
+profile is missing, and that a two-entry lookup table is a bet that every user
+runs hardware somebody here owns. That was an argument. This is the number.
+
+🔴 **NOTHING IN THIS REPOSITORY COULD MEASURE IT, BECAUSE BOTH MACHINES THAT RUN
+IT HAVE PRIORS.** `PRIORS` has `ampere` and `metal-3`; every other GPU in the
+world takes `DEFAULT_TUNING`, which is one M2's answers. `ignoreDevicePrior`
+makes a machine that HAS a prior answer as one that does not, and `--no-prior`
+on any GPU tool reaches it. On this A100, prior against no prior:
+
+| | with the prior | unrecognised | |
+|---|---:|---:|---:|
+| AF2, 400 residues, 512/1024, warm | 4.417 s | 6.760 | **1.53x** |
+| ESMFold2 trunk, 300 tokens | 661 ms | 1014 | **1.53x** |
+| AlphaFold 3, a whole 68-token fold | 3.5 s | 4.4 | 1.26x |
+| AF3 trunk alone, 400 tokens, 8 blocks | 1450 ms | 1504 | 1.04x |
+
+🔴 **AND THE TRUNK-ONLY ROW IS THE INTERESTING ONE.** AF3's trunk barely moves
+because eighteen of the ampere prior's twenty-five knobs are diffusion-side or
+AF2-side; the trunk's own kernels are close to their defaults. So the 1.5x is
+not spread evenly over the model - it is concentrated in the parts that were
+tuned, which is exactly where a probe would have to look and exactly where a
+wrong default hurts.
+
+**The peak moves too, and not always the wrong way.** The unrecognised ESMFold2
+trunk peaks at 445.8 MiB against the prior's 517.8, because
+`pairTransitionSplit` is one of the knobs it does not get: it is slower and
+smaller. A probe that optimises time alone would take that memory without
+asking, which is the trade `TRANSITION_SPLIT_MIN_CHANNELS` exists to make
+deliberately.
+
+### Which knobs carry it: three on AF2, two on ESMFold2, and all of them one question
+
+`--no-prior=a,b` restores exactly the named knobs AT THE PRIOR'S OWN VALUES and
+drops the rest, which is what lets a sweep price one knob without spelling an
+object on a command line - `diffusionTokenTile` is `{below, atOrAbove,
+crossover}` and `--tune` splits its argument on commas.
+
+**AF2, 400 residues, 512/1024, warm.** Baseline 6.752 s, all 25 knobs 4.430:
+
+| knob restored alone | warm | saves | % of the gap |
+|---|---:|---:|---:|
+| `opmMatrixContract` | 5.891 | 0.861 | **37%** |
+| `matrixLinear` | 6.014 | 0.738 | **32%** |
+| `attentionMatrix` + tile | 6.085 | 0.667 | **29%** |
+| `opmProjectOutputPairs` | 6.568 | 0.184 | 8% |
+| `attentionGroup` | 6.578 | 0.174 | 7% |
+| `attentionVectorScore` | 6.697 | 0.055 | 2% |
+| `trianglePairProjectTile` | 6.710 | 0.042 | 2% |
+| `linearTallTile` | 6.759 | -0.007 | -0% |
+| `keepTrunkWeights` | 6.764 | -0.012 | -1% |
+| `transitionThreadTarget` | 6.774 | -0.022 | -1% |
+
+**ESMFold2 trunk, 300 tokens.** Baseline 1019.3 ms, all 25 knobs 655.5:
+
+| restored | ms | saves | % of the gap | peak MiB |
+|---|---:|---:|---:|---:|
+| the three below plus `stagedMatrixBlock` | 654.4 | 364.9 | **100%** | 517.8 |
+| `pairTransitionSplit` + `triangleProjectMatrix` | 701.4 | 317.9 | 87% | 517.8 |
+| `pairTransitionSplit` (+chunk bytes) | 769.0 | 250.3 | 69% | 517.8 |
+| `triangleProjectMatrix` | 945.3 | 74.0 | 20% | 445.8 |
+| `trianglePairProjectTile` | 1017.6 | 1.7 | 0% | 445.8 |
+| `transitionThreadTarget` | 1017.9 | 1.4 | 0% | 445.8 |
+| `gridAttendMatrix` + tile | 1019.1 | 0.2 | 0% | 445.8 |
+| `matrixLinear` | 1020.9 | -1.6 | -0% | 445.8 |
+| `stagedMatrixBlock` | 1021.8 | -2.5 | -1% | 445.8 |
+
+🔴 **THE ZEROS ARE TRUSTWORTHY BECAUSE ONE OF THEM HAS TO BE ZERO.**
+`gridAttendMatrix` saves 0.2 ms on ESMFold2 and provably cannot do anything -
+an ESMFold2 block is a pairformer block with both grid attentions removed. A
+sweep that reported a number there would be measuring its own noise.
+
+🔴 **AND `stagedMatrixBlock` IS -2.5 ms ALONE AND 47 ms IN COMBINATION**, which
+is the finding that decides what a probe can be. Restored by itself it is the
+block geometry for kernels that are switched off, so it correctly measures
+nothing; added to the three that are on it takes 701.4 to 654.4. AF2 says the
+same thing from the other side - its ten individual savings sum to 2.680 s
+against a joint gap of 2.322, **115%**, because three kernels contend for the
+same units and the same occupancy.
+
+**So a probe cannot be "measure each knob, keep the winners".** It would set
+`stagedMatrixBlock` to null on a correct measurement, and it would over-credit
+AF2's three matrix knobs by 15%. It has to be ordered - settle the matrix-unit
+question first, then tune the block for whatever turned on - or measure a few
+whole configurations rather than knobs.
+
+**The search is small, though.** On both models every knob that carries the gap
+is the same question: `opmMatrixContract`, `matrixLinear`, `attentionMatrix`,
+`pairTransitionSplit`, `triangleProjectMatrix` are all "should this kernel use
+the subgroup matrix units", and `stagedMatrixBlock` is "at what geometry". Two
+decisions, not twenty-five - and the same two that upstream's single attention
+probe is answering.
+
+### And a standalone GEMM cannot answer either of them
+
+The obvious cheap probe follows from that paragraph: if every knob that carries
+the gap asks "do the matrix units pay for this kernel", time one matrix GEMM
+against one vector GEMM at each kernel's shape and read off the answers.
+`bench-evoformer-linear.js` already does exactly that, so it costs nothing to
+check the prediction against the verdicts the sweeps above measured in situ.
+It gets two of five WRONG, and in opposite directions:
+
+| kernel | shape | standalone | in situ | |
+|---|---|---:|---:|---|
+| `attentionMatrix` | `headdim` | **1.00x** | **1.69x** | **miss** |
+| `matrixLinear` | `qkvg` | **1.49x** | **0.93x** | **miss** |
+| `opmMatrixContract` | `opmcontract` | 1.58x | 2.26x | right, understates |
+| `triangleProjectMatrix` | `pair` | 1.20x | 1.53x | right, understates |
+| `pairTransitionSplit` | `ef2wide`/`ef2down` | 1.51x/1.65x | 2.89x | right, understates |
+
+🔴 **AND OPPOSITE DIRECTIONS IS THE FAILURE A MARGIN CANNOT REPAIR.** A
+threshold set high enough to reject `qkvg`'s false 1.49x also rejects the
+attention's true 1.69x, whose standalone reading is 1.00x. There is no cutoff
+that gets both.
+
+Each miss has a cause, and both are the same cause seen twice - **the standalone
+bench models a kernel that is not the one that ships**:
+
+- **The attention is not a GEMM.** A GEMM at K = 32 amortises its panel over two
+  k steps; the flash kernel stages the query tile ONCE and reuses it across the
+  whole key sequence. The reuse is in the loop, not in K. This is the third time
+  in this repository that a standalone GEMM at `head_dim` has been read as a
+  verdict on the attention, and the third time it was wrong.
+- **The projection is four GEMMs, already fused.** `qkvg` times ONE matrix. The
+  shipped kernel reads the source once and writes q, k, v and the gate from it,
+  so the thing a matrix arm would replace is ~4x cheaper than the bench's model
+  of it - which is why the standalone arm looks like a win and loses in place.
+
+The three it gets right it understates by 1.3-1.9x, for the ordinary reason: in
+situ these kernels also move occupancy, buffer traffic and what the kernels
+around them contend for, and none of that is in a single dispatch.
+
+So the probe cannot be a synthetic GEMM at a representative shape. It is the
+actual kernel or nothing - which is what upstream's attention probe does, and it
+is why theirs costs about a second.
+
 ## The atom stack was sized by the padded grid, and it was mostly padding
 
 🔴 **`subsets` COUNTED (token, slot) CELLS WHERE THE AXIS IT INDEXES IS THE

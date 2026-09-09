@@ -28,6 +28,7 @@
 // would be paying to say something this checker says for free.
 import { readTensor } from "../../src/reference/dtype.js";
 import { Esmfold2TrunkGpu } from "../../src/esmfold2/trunk-webgpu.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale",
   "centerNormOffset", "outputProjection", "gatingLinear", "projection", "gate"];
@@ -94,6 +95,21 @@ export async function main(device, args = []) {
   // eight vec4 of accumulators - and bundling them under one word hides which
   // of the two is paying for the error.
   const precisions = option(args, "precision", "f32,default").split(",");
+  // 🔴 THE WEIGHT BUFFER'S TYPE IS A THIRD ARITHMETIC AND HAD NO ARM. The two
+  // above are the staged tile and the accumulator; this is what the weights
+  // are STORED as, which the matrix kernels round to halves anyway and the
+  // layer norms do not. It is also what `stagedMatrixDirectWeights` needs, so
+  // the two are checked together or neither is.
+  const weightPrecision = option(args, "weights", "");
+  for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
+       .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
 
   const dump = await (await fetch(dumpPath)).json();
   const manifest = await (await fetch(`${bundle}/manifest.json`)).json();
@@ -171,8 +187,10 @@ export async function main(device, args = []) {
       ? Number(option(args, "f16-accumulate-bound", "4e-3"))
       : (ran.staged === "f32" && ran.accumulate === "f32")
         ? bound : Number(option(args, "f16-bound", "1e-3")));
-    const settings = staged === undefined
-      ? {} : { stagedPrecision: staged, accumulatePrecision: accumulate };
+    const settings = {
+      ...(weightPrecision === "" ? {} : { weightPrecision }),
+      ...(staged === undefined ? {} : { stagedPrecision: staged, accumulatePrecision: accumulate }),
+    };
     const stack = new Esmfold2TrunkGpu(device, settings);
     for (const key of keys) {
       const pair = Float32Array.from(dump.intoLoop[key]);

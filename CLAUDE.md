@@ -34,10 +34,12 @@ values means the whole-stack checker, not that file.
 
 | Question | Tool |
 |---|---|
+| Does the GPU diffusion conditioning match the reference, at THIS bundle's widths? | `tools/gpu/check-af3-diffusion-conditioning.js --model=` - and it FAILS on OpenDDE now, saying which side: BOTH, 73728/73728 non-finite, so it is the fixture at 384 pair channels and not a kernel. 🔴 It passed for as long as that bundle existed because `NaN > 1e-5` is FALSE. Every comparison written `if (x > bound) throw` here has the same hole |
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
 | ...and did a KNOB change the structure, which pLDDT will not tell you? | `python3 tools/diff-fold-coords.py --b="--attn-splits=4"` - **`meanPlddt` matched to sixteen digits across an arm that moves 33 atoms** |
 | Is a MODIFIED residue the right shape? | `tools/gpu/probe-modified.js --code=SEP --at=3` |
+| **Is a fold the SAME fold twice in one process?** | `tools/gpu/bench-af2-warm.js` - it checksums every pass and throws unless they match, because three predictions of one graph over one input in one process share their pipelines, their buffers and their clocks, so a difference is a RACE and not a precision question. It caught one in the matrix flash attention; `--allow-nondeterminism` is the escape |
 | What does AF2 predict, distogram and pLDDT, per recycle? | `tools/gpu/probe-af2-dgram-plddt.js --sample=10` |
 | Is the sampler converged at this step count? | `tools/gpu/probe-flow-sigma-by-size.js --panel=churn` |
 | Do recycles help a complex? | `tools/gpu/probe-recycles-on-complexes.js` |
@@ -49,12 +51,14 @@ values means the whole-stack checker, not that file.
 | ...and is the f16 contraction still flat in MSA DEPTH? | the same tool, and **run it at `--sequences=512`**: depth is the only axis that arm's risk lives on, and at `--sequences=8` it proves nothing |
 | ...and which path is a fold actually taking? | `useOuterFirstContraction` - it was capped at 64 MiB, i.e. **128 residues**, and the fallback is 93.7% of a block at 825 |
 | Does AF2 still fold the SAME structure? | `tools/gpu/fold-af2.js` - and it FAILS now if the chain is not a chain, which is the gate a collapsed 825-residue fold walked through for a whole campaign |
+| **Does the MULTIMER still fold, and what does a repeat cost?** | `tools/gpu/fold-af2.js --family=multimer --chains=30,29 --repeat=3` - the repeat is the only number that prices weight residency, because a first fold is mostly pipeline compilation (1485 ms against 214 for a repeat), and every repeat is held to the first fold's atom checksum. The bundle is `af2-multimer/` in the registry and needs a manifest.json generated from src/reference/manifests/multimer.js |
 | ...and does forcing an AF2 knob still fold the same one? | `tools/gpu/fold-af2.js --tune=key=value`, the same flag `fold.js` carries. A knob no gate enters is a knob nobody has checked |
 | Does AF2's distogram head agree with AF2's structure? | `tools/gpu/probe-af2-contacts.js` |
 | Which register tile does AF2's dense projection want? | `tools/gpu/bench-evoformer-linear.js` |
 | What does AF2's column attention cost alone? | `tools/gpu/bench-msa-attention.js` |
 | What does a sampler step cost besides the denoiser? | `tools/gpu/probe-sampler-overhead.js` |
-| Where does a denoiser call's time go? | `tools/gpu/bench-head.js --profile` |
+| Where does a denoiser call's time go? | `tools/gpu/bench-head.js --profile`, and `--calls=4` for the COLD one: at 68 tokens call 0 is 1218 ms against 10 steady, and 904 of it is the transformer's resident weights - not its compile, which `probe-warm.js` measures at 71 ms |
+| Where does an AF3 FOLD's time go, by stage? | `tools/gpu/fold.js --folds=2` and read `stageMilliseconds` - a caller's clock attributes the gap between two stages to the EARLIER one, so a fold whose named stages stopped at `trunk-done` hid 2.0 s of a 3.2 s first fold |
 | ...and is a pass filling the device, or just slow? | the same, and read `groupsPerPass` |
 | ...and where does the 90% that is NOT a compute pass go? | `tools/gpu/fold.js --buffers` (profile.js sees 10% of a fold) |
 | Does the sample dimension leave the one-sample path alone? | `tools/gpu/check-difftx-samples.js` |
@@ -64,6 +68,7 @@ values means the whole-stack checker, not that file.
 | ...and is a split worth its pass, below the drift? | `tools/gpu/bench-difftx-splits.js` (paired, interleaved, withholds a timing if the arms disagree) |
 | Comparing two tensors in a new checker? | `tools/gpu/relative-rms.js` - **an unguarded relRMS over a non-array returns exactly 0**, which is a perfect score from comparing nothing |
 | Where does a trunk pass's time go? | `tools/gpu/bench-trunk.js --profile --msa=1024` |
+| Where does an OpenDDE FOLD's time go, and is it even GPU? | `tools/gpu/fold-opendde.js --profile --buffers --repeat=2` - the trunk phase is **96.3% GPU-idle**, and the second fold is the row a user sees |
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | ...and ALL of it, not the top twenty? | the same, `--top=200` - a block's transitions alone are fifty labels, one a chunk, and 15 ms of pair bias hid under them |
 | ...and which value of an AF2 knob does this block want? | `profile-af2-block.js --sweep=opmProjectOutputPairs=1,2,4 --watch=opm.project-output` - arms interleaved, two rounds, minimum per arm, weights loaded once |
@@ -71,23 +76,34 @@ values means the whole-stack checker, not that file.
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
 | Does AF3's `grid.attend` on the MATRIX units still compute `grid.attend`? | `tools/gpu/check-grid-attend-matrix.js` - it takes NO bundle, so OpenDDE's head width of 8 and the template embedder's 16 are checked on a box that has only AF3's weights, and it sweeps the token count across both of the kernel's tails |
 | ...and which geometry does it want? | `bench-grid-attend-passes.js --arms=scalar,4x32,2x16`, arms interleaved - but the answer that counts is `bench-trunk.js --profile --tune=gridAttendMatrix=true`, in the trunk |
-| Does a pairformer block still match its reference, under a forced knob? | `tools/gpu/check-af3-block-any.js --tune=key=value` - and it FAILS now, on a bound that follows the arm |
+| Does a pairformer block still match its reference, under a forced knob? | `tools/gpu/check-af3-block-any.js --tune=key=value` - and `--resident`, because residency is a different WEIGHT PATH (the pair transition is decoded on the device) and not a cache - and it FAILS now, on a bound that follows the arm |
 | Do all eight attention kernels agree, the matrix one included? | `tools/gpu/check-attention-variants.js` - and it takes `--tune=attentionMatrixTile=4x32`, because the matrix arm has a GEOMETRY and one no checker has run is one nobody has checked. Its bar is f16 (~1e-3), not the 5e-5 the f32 variants hold |
 | ...and does the f32 attention path still compute f32? | `check-evoformer-attention.js` - where the device picks the matrix kernel, its f32 arm runs a SECOND time with `attentionMatrix` off, because the bound follows the KERNEL and not the requested storage |
 | Does this device have matrix units, and in what shapes? | `tools/gpu/probe-subgroup-matrix.js` |
 | ...and what do its type parameters MEAN at a non-square shape? | `tools/gpu/check-subgroup-matrix-shapes.js` |
 | What do those matrix units ISSUE at? | `tools/gpu/probe-matrix-ceiling.js` |
 | Does the staged matrix projection compute a projection, in every precision? | `tools/gpu/check-staged-matrix.js` |
+| Does a REAL bundle's int5/int3/int8 decode the same on the device as on the host? | `tools/gpu/check-bundle-device-decode.js --bundle=` - and `check-quantised-upload.js` cannot answer it, because it lays out its own shard. Four reshape arms too: transpose, two-way interleave, column concatenation, and an f32 strided lane |
+| A weight buffer is slower than it was and nothing errored? | 🔴 **the device packer refused and fell back.** It throws `DeviceWeightRefusal` naming the tensor now, because a silent fallback is a bug that looks like a slow machine - `allowHostWeightPacking` is the opt-in for a bundle that genuinely cannot be decoded. Ten descriptors in AF2 copied their tensors into a literal instead of deriving them, which READS the getter and decodes the block |
 | Is a projection short of threads, short of arithmetic intensity, or neither? | `tools/gpu/probe-split-k.js` |
 | What do `subgroupMatrixLoad`/`Store` actually mean here? | `tools/gpu/check-subgroup-matrix.js` |
 | Are the matrix units worth it on a dense projection? | `tools/gpu/bench-evoformer-linear.js --arms=8x8@f16/f16,matrix4` |
 | ...and against AF3's own fused projections? | `bench-{grid,triangle}-project.js --tokens=200 --matrix=1` |
 | What does packing the attention key cost, and the value? | `tools/gpu/check-attention-packing.js --dense=f32` |
 | What does a dispatch cost before it computes? | `tools/gpu/probe-dispatch.js` |
+| **Did a speculative WARM compile the right shaders?** | count them: `tools/gpu/fold.js --no-warm` and `fold-opendde.js --no-warm` against the same run without the flag, through `probe-compiles.js`. A warm compiling against a shapes-only stand-in cannot give a wrong ANSWER - the stack still asks the cache for its own keys - so the only failure is silent WASTE. OpenDDE went 269 -> 322 pipelines warming its refiner with the trunk's root, and 285 with the wrong pair precision, before it went back to 269 |
+| **Is a first fold waiting on SHADER COMPILATION?** | `tools/gpu/probe-compiles.js --tool=fold-af2` - it wraps another tool's `main`, so any gate can be measured without ceasing to be one. Read **`busyMs`**, the union of the intervals, and never the sum: twenty pipelines compiled at once and twenty compiled in turn have the same sum. AF2's first fold WAS its compile queue (1133 ms of span in a 1163 ms fold, 1.47 ever in flight); AF3's and OpenDDE's were already packed at ~14 |
+| ...and what does a first AF2 fold consist of otherwise? | `tools/gpu/probe-af2-warmup.js` - pipelines, shader modules, buffers, writeBuffer bytes and the on-device weight decode, against the wall and the repeat |
+| What does the on-device weight decode cost the HOST? | `blockUploadStats` in src/runtime/quantised-upload.js - staging assembly, submits and buffers, none of which is inside a compute pass and so none of which `profile.js` can see |
+| ...and what is still DECODED on the host under those packers? | `tensorDecodeStats` in src/reference/http-tensor-store.js, printed as `hostDecode`. After this session: AF2 5 ms, AF3 32, ESMFold2 0, OpenDDE 84 |
+| **A device weight path fell back and said nothing - what did that cost?** | `residentPackStats` in src/runtime/resident.js, printed by `probe-compiles.js` as `hostPack` with a per-label table. Every AF3-side device decode falls back to a host `pack()` SILENTLY by design, and one that costs 400 ms of a fold looks exactly like a slow machine: it found `difftx.zerogate.resident` at 496 ms in ONE call, and `w.pair-transition` at 56 calls because `residentPackedOnDevice` wrote halves only while AF3's pair track is f32 |
 | What does the page cost per frame? | `tools/gpu/bench-frame.js` |
 | Which tile does a pairformer kernel want? | `tools/gpu/bench-{triangle-project,grid-project,transition,single-project,opm}.js` |
 | Why is one layer norm at half another's bandwidth? | probably its CHUNK, not its reduction - a chunk is its own dispatch and 2048 workgroups is 59% of an A100. `pairTransitionChunkBytes` raises it, and on this box that is a 6% GPU win and a 1% WALL loss for 144 MiB |
+| What do the staged matrix GEMM's three knobs cost? | `stagedMatrixPrefetch` is bit-exact and ON (1.20x on an ESMFold2 trunk, 1.13x OpenDDE, 1.07x AF2); `stagedMatrixDirectWeights` needs an f16 weight BUFFER and is bit-exact given one; `stagedMatrixResult: "f16"` halves the accumulator registers and is 1.19x, and applied to `tri.contract` - whose K is the protein's length - it is 2178 NaN coordinates |
 | Which block do the staged matrix GEMMs want? | `stagedMatrixBlock`, swept with `bench-esmfold2-trunk.js --profile --tune=stagedMatrixBlock=64x128x16x1x8` - **1.16x**, and the block that won the standalone GEMM bench is 16% off in the trunk |
+| Does AF2's matrix q/k/v/gate projection compute the vector one's answer? | `tools/gpu/check-attention-project-matrix.js` - no bundle, three widths, and BOTH target storages, because a packed one doubles the column group so a lane owns both halves of its word. The four outputs are four different epilogues - the query scaled, the key and value plain, the gate a logistic of the only bias any of them has - so all four are compared and named |
+| Does the matrix GRID projection compute the vector one's answer? | `tools/gpu/check-grid-project-matrix.js` - no bundle, both DIRECTIONS (the transposed one reads `(row % n) * n + row / n` and writes at `row`, and a wrong mapping returns a tensor of the right shape and magnitude), and OpenDDE's 8 heads as well as AF3's 4 |
 | Does the matrix triangle projection compute the vector one's answer? | `tools/gpu/check-triangle-project-matrix.js` - the interleaved weight pack is inside the comparison, because an interleave off by a role returns a plausible tensor |
 | Which pair transition does a stack take, and why? | `pairTransitionSplit` plus `TRANSITION_SPLIT_MIN_CHANNELS` - the split is 1.51x on an ESMFold2 trunk's GPU time and **1.8% of an AF3 one** for the same 72 MiB, so the default declines it below 192 channels |
 | Is a transition still worth FUSING at this channel width? | `bench-transition.js --channels=N --arms=4,8:128,16:128,split` - the fused kernel holds the WIDENED row in workgroup memory, so its row tile halves as the channels double. 128: 1.13x for the split, 256: 2.77x, 384: 3.71x |
@@ -101,12 +117,15 @@ values means the whole-stack checker, not that file.
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` (raise `--iterations` on anything faster than an M2) |
 | ...and is its VECTOR ceiling real, or dead lanes? | `tools/gpu/probe-alu-lanes.js` |
 | Which per-device kernel knobs does THIS device want? | `tools/gpu/probe-tuning.js` |
+| What does a GPU with NO prior get? | `--no-prior` on any GPU tool - `PRIORS` has two entries and every other GPU takes `DEFAULT_TUNING`, which costs **1.5x** on AF2 and ESMFold2. Neither machine that runs this repository could measure that without the switch, because both have priors |
 | ...and does forcing one still fold the SAME structure? | `tools/gpu/fold.js --tune=key=value` (a knob no gate enters is a knob nobody has checked) |
 | ...and the PER-KERNEL tiles and splits, which `--tune` cannot reach? | `fold.js --attn-tile= --out-tile= --attn-splits= --norm-splits=` (they live inside `diffusionSplitK` and `--tune` splits its argument on commas) |
 | Is a conditioning projection still inside the block loop? | it should not be - see `packZeroGateWeights`, and `--tune=diffusionBatchedGates=false` is the arm without it |
 | What is the f16 path worth, on any tool? | add `--f16=off` / `--f16=on` to it (one switch, all models) |
 | Is bfloat16 usable, and would it beat the f16 storage? | `tools/gpu/probe-bf16.js` |
 | What does the host-device bus cost, each way? | `tools/gpu/probe-bus.js` (**free on an M2, not on a discrete GPU**) |
+| How fast can this browser read a weight shard at all? | `tools/gpu/probe-shard-read.js --bundle=` - **371 MB/s**, and `arrayBuffer()` and the store's streamed read measure the SAME, so the chunk loop the progress dial needs costs nothing. Python reads the same shards from the same server at 2129 MB/s: the cap is six HTTP/1.1 connections |
+| ...and how much of a first fold is it? | `weightSeconds` on `fold-af2.js`, `fold-esmfold2.js` and `fold-opendde.js` - **the fold's own clock starts after the weights are loaded and a user's does not.** OpenDDE 1.73 s, AF2 0.88, ESMFold2 0.35 |
 | What is `grid.attend` alone, without the copies? | `tools/gpu/bench-grid-attend-passes.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
@@ -114,7 +133,10 @@ values means the whole-stack checker, not that file.
 | Does the progress bar move at the fold's speed? | `tools/gpu/probe-progress-bar.js` |
 | Does a failed fold keep its trunk for the retry? | `tools/gpu/probe-trunk-reuse-after-failure.js` |
 | What does a fold hold on the DEVICE? | `tools/gpu/fold.js --budget=0` (prints per stage) |
-| Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200` |
+| ...and does AF2 still fold under a CEILING? | `tools/gpu/fold-af2.js --budget=200`, with `--no-resident` as its control - 108.5 MiB against 386.9, the same checksum. 🔴 With residency AND a budget the allocator evicts a buffer an in-flight submit still names; `uploadResident` declines residency on a device with a budget for that reason, and the eviction path is still wrong |
+| Does it still fold on a small device? | `tools/gpu/bench-trunk.js --budget=200 --model=` - **its default bundle is the float32 one, which is not on this box**, so without `--model=` it 404s rather than measuring |
+| ...and a whole AF3 FOLD under one? | it does not, on this branch or on main: `fold.js --budget=200` dies at `difftx.block needs 15.8 MiB`. 400 MiB of diffusion weights will not stream through a 200 MiB device beside the trunk's scratch. Not a regression, and not a gate |
+| 🔴 A device weight pack that ignores `residentWeights` KILLS THE FOLD | `residentPackedOnDevice` raises over a budget, and the pairformer's `run` catches exactly ONE of those before restarting without residency. A second raise out of the restart is uncaught - measured as `w.single-transition needs 3.4 MiB` at `--budget=200`. Gate every one of them on `this.residentWeights` |
 | Does the page fit a phone? | `python3 tools/mobile-layout.py` |
 | Do the heatmap panel's tabs still work after a vendor bump? | `python3 tools/heatmap-panel.py` |
 | Does a REAL fold put contacts on its frames? | `python3 tools/fold-in-page.py --model af3` - **and it runs on Linux now**, headful under `DISPLAY=:99`; it was pinned to a macOS Chrome path and `--headless=new`, which is why the contact overlay could break here unnoticed |
@@ -129,12 +151,14 @@ values means the whole-stack checker, not that file.
 | ...and on the GPU, a whole denoise step? | `tools/gpu/check-esmfold2-diffusion-gpu.js` |
 | Does the sliding-window atom attention compute its reference? | `tools/gpu/check-esmfold2-atom-stack.js` |
 | Does the featuriser build what ESMFold2 was handed? | `node tools/check-esmfold2-featurise.js` |
-| **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` |
+| **Does ESMFold2 fold on the GPU, sequence in, structure out?** | `tools/gpu/fold-esmfold2.js` - and 🔴 its default bundle is `model-esmfold2-trunk-f32`, which is **not what the page loads**: the registry points `ef2-fast-600m` at `model-esmfold2-int5`, so a timing taken with the default is not a user's path. `--bundle=/model-esmfold2-int5` |
+| ...and what does the SECOND fold cost, which is what a page pays? | `fold-esmfold2.js --repeat=3` - folds from the top reusing nothing, and ASSERTS the alpha carbons match the first fold. 8.26 s then 1.86 and 1.85, because the ESM-C tower keeps its weights now. `--budget=2000` is the arm where it declines to and streams |
 | Which of a sampler step's two coordinate sets is the picture? | `tools/gpu/probe-esmfold2-trajectory.js` |
 | What does an ESMFold2 fold cost, by band? | `src/esmfold2/cost.js` (fitted at 40, 150, 300) |
 | Can anything stand in for the confidence head this checkpoint lacks? | `tools/gpu/probe-esmfold2-confidence.js` |
 | Does the EDM sampler's schedule and step agree? | `node tools/check-esmfold2-sampler.js` |
-| Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` |
+| Does ESMFold2's trunk still compute ESMFold2's trunk? | `tools/gpu/check-esmfold2-trunk-gpu.js` - 🔴 it needs `oracle-dumps/esmfold2-trunk-*.json`, which needs torch, which does not fit on this box |
+| ...and does its DEVICE-decoded pair track compute the host packer's answer? | `tools/gpu/check-esmfold2-trunk-pack.js` - both arms in one process over one pair, bar ZERO differing elements (the decode is bit-identical and the layout is the same), and it asserts the device arm actually decoded, because two host arms would agree perfectly |
 | Does z_init's every term agree? | `node tools/check-esmfold2-featuriser.js` |
 | What dtype is the atom attention actually holding? | `tools/esmc/probe-esmfold2-atom-attention.py` |
 | ...and does the CPU reference? | `node tools/check-esmfold2-trunk.js` (77 s a loop) |
@@ -142,6 +166,7 @@ values means the whole-stack checker, not that file.
 | What does ESMFold2's trunk cost, by length? | `tools/gpu/bench-esmfold2-trunk.js` |
 | How small can ESM-C get before ESMFold2 notices? | `tools/esmc/probe-esmc-compression.py` |
 | ...and what does that cost the STRUCTURE? | `.venv-esm/bin/python tools/esmc/probe-esmfold2-structure.py` |
+| Does the GPU dequantiser decode what the host decodes, at every codec? | `tools/gpu/check-quantised-upload.js` - it drives the SHIPPED `planBlockUpload`/`runBlockUpload` rather than a copy of the shader, sweeps six (bits, group) pairs, and its bar is ZERO differing elements. It found `readTensorRange`'s int5 path reading a 20-byte group whatever the record said |
 | Where do I get any model's WEIGHTS? | **already built and published** - `src/reference/manifests/index.js` has a `remote:` per family, all under `huggingface.co/sokrypton/localfold/resolve/<sha>/<family>/`. Download those; the export pipelines below are for making a NEW bundle, not for getting an existing one |
 | Where do I get ESM-C and ESMFold2, to build one? | `tools/esmc/fetch.py` (3.0 GB, ungated, MIT) |
 | Turn ESM-C into a bundle the browser reads | `tools/export_esmc_model.py`, then `tools/quantize_af3.py --bits 3 --group 128` - **that group is ESM-C's alone.** AF3's and OpenDDE's bundles are `--group 32`, which is the default, and OpenDDE at 128 folds 6MRR into a 3283 A explosion at pLDDT 46.69 |
@@ -152,15 +177,27 @@ values means the whole-stack checker, not that file.
 | What does an ESM-C block cost? | `tools/gpu/bench-esmc-tower.js` |
 | ...and is the tower right at more than one length? | `check-esmc-tower.js --dump=/oracle-dumps/esmc-{59,128,180}.json` |
 
-| **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) - and its bundle wants **`export_af3_model.py --include diffuser`**, because the default is trunk plus distogram head and this tool needs `structural_token_expander` |
+| **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) - and its bundle wants **`export_af3_model.py --include diffuser`**, because the default is trunk plus distogram head and this tool needs `structural_token_expander`. 🔴 **AND ITS DEFAULT IS 200 STEPS WHERE THE PAGE RUNS 16** - `OPENDDE_COUNTS` prefers 16 and docs/OPENDDE.md shows more steps are WORSE - so a timing taken with the default is 4 s of sampler a user never waits for: `--steps=16` is the page's path (a warm fold 4.09 s -> 1.26) |
 | Does its structural-token expansion conserve the atoms? | `tools/gpu/check-opendde-expander.js` |
+| Does its CONFIDENCE head still compute its PAE and PDE? | `tools/gpu/check-opendde-confidence.js` - the head's only gate, and a fold's geometry check cannot see a confidence number |
 | **Are a model's BOND LENGTHS right, not just its fold?** | `tools/gpu/probe-nucleic.js --sequence= --model=` (RMSD cannot see this; OpenDDE is 15% short) |
 | ...and a ligand's? | `tools/gpu/probe-ligand-flow.js --ligand=GOL --mode=diffusion` |
 | Does OpenDDE's trunk predict a real fold's contacts? | `tools/gpu/trunk-opendde.js` (**and `--model=/model-af3-int5/manifest.json` is the control**) |
 | Does a pairformer block match its reference at THIS bundle's widths? | `tools/gpu/check-af3-block-any.js --model=` |
 | ...and which pair-track kernel is the one that does not? | `tools/gpu/probe-opendde-kernels.js --model=` |
 
+| Does the MSA stack still compute the MSA stack, on BOTH arithmetics? | `tools/gpu/check-af3-msa-block.js --model=` - two arms, because three device knobs move that pair track onto the matrix units and one bound would stop checking the vector one: 5.40e-6 with the knobs off and 1.75e-3 with the shipped profile, and 28.5 ms against 16.0 |
+| ...and does the template embedder? | `tools/gpu/check-af3-template.js --model=` |
+
 `tools/gpu/check-af3-*.js` are the per-module AF3 oracle checkers.
+
+🔴 **AND THEY USED TO BE PINNED TO A BUNDLE THAT IS NOT ON EVERY BOX.**
+`check-af3-msa-block.js` and `check-af3-template.js` opened
+`/model-af3-full-f32/manifest.json` as a CONSTANT, so on a machine with the
+published int5 bundle and not the float32 one they 404 rather than skip - and
+two whole stacks' kernel choices went ungated for exactly that reason. Both take
+`--model=` now, and both take a bound that follows the bundle, because an int5
+bundle's residue against a float32 reference is not a float32 bundle's.
 
 🔴 **AND EVERY ONE OF THEM EXCEPT THE TWO ABOVE IS PINNED TO AlphaFold 3's
 CONSTANTS.** `check-af3-triangle.js` has `const CHANNELS = 128`,
@@ -202,6 +239,30 @@ is complete and correct and the node process sits there with a headless Chrome
 still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
 "gpu-chrome-"` matches the temporary profile directory and nothing else - not
 the browser you are using. A batch of checkers should carry one between arms.
+
+🔴 **AND A BUNDLE THE CLI LIKES CAN BE ONE THE PAGE CANNOT LOAD.** The command
+tools read the `manifest.json` sitting next to the shards; the PAGE reads the
+manifest baked into `src/reference/manifests/<family>.js`, which is pinned to a
+commit. A bundle downloaded from a different export satisfies the first and not
+the second: `model-opendde-int5/` here was a 32-shard export against a registry
+that pins 12, so every `fold-opendde.js` gate passed and
+`fold-in-page.py --model opendde` died at "weights-08.int5.bin has an invalid
+byte length" at 122/472 MiB, having never reached a fold. Check a bundle against
+the MODULE, not against the JSON beside it.
+
+🔴 **AND EVERY ONE OF THOSE KILLS LEAVES ITS PROFILE DIRECTORY BEHIND.** The
+harness cleans up `/tmp/gpu-chrome-<pid>-<stamp>` when it exits normally and
+cannot when it is killed, so a session that runs hundreds of arms leaves
+hundreds of directories at 15-500 MB each. Measured on this box: **2217 of them,
+34 GB**, on a machine whose disk is the binding constraint and had 2.2 GB free
+by the time anything noticed. Sweep them when a batch is over:
+
+```
+find /tmp -maxdepth 1 -name 'gpu-chrome-*' -type d -mmin +5 -print0 | xargs -0 -r rm -rf
+```
+
+`-mmin +5` is what keeps it from deleting a profile a running browser is still
+using.
 
 🔴 **AND `meanPlddt` IS NOT A BIT-EXACTNESS GATE, however many digits it
 prints.** A night of kernel work reported it identical to SIXTEEN DIGITS -

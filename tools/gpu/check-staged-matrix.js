@@ -86,7 +86,27 @@ export async function main(device, args = []) {
         for (const activation of [0, 1]) {
           for (const residual of [false, true]) {
             for (const weightBase of [4, 3]) {
-              cases.push({ ...shape, sourcePrecision, outputPrecision, activation, residual, weightBase });
+              // 🔴 AND THE RIGHT OPERAND READ WITHOUT STAGING, which is a
+              // second indexing path through the same kernel: it forms its
+              // own global offset from weight_offset, the panel and the block
+              // origin where the staged form read a workgroup panel at a
+              // different stride. An off-by-one there is a plausible tensor.
+              // It needs the contracted extent to divide by the K panel - the
+              // buffer is [weights | bias] and a tail panel would read the
+              // bias as a weight row - so the ragged shape checks that the
+              // caller's gate refuses it rather than that the kernel survives.
+              for (const directWeights of [false, true]) {
+                // 🔴 AND THE DOUBLE-BUFFERED STAGING, which is a THIRD path
+                // through the same loop: the reads are unrolled into named
+                // registers and written out after the multiplies, so the panel
+                // index, the bounds and the flush are all separate code from
+                // the single-loop form. It should be bit-identical and the
+                // point of the arm is that "should" is not a measurement.
+                for (const prefetch of [false, true]) {
+                  cases.push({ ...shape, sourcePrecision, outputPrecision, activation,
+                               residual, weightBase, directWeights, prefetch });
+                }
+              }
             }
           }
         }
@@ -97,10 +117,16 @@ export async function main(device, args = []) {
   const results = [];
   for (const c of cases) {
     const { rows, inner, columns, sourcePrecision, outputPrecision, activation, residual } = c;
+    const directWeights = c.directWeights === true;
+    const prefetch = c.prefetch === true;
     const geometry = {
       blockRows: 128, blockColumns: 128, blockInner: 16, subgroupRows: 1, subgroupColumns: 8,
       tile, result: config.resultComponentType, matrixElement: config.componentType,
     };
+    if (directWeights && inner % geometry.blockInner !== 0) {
+      results.push({ ...c, skipped: "inner does not divide the K panel" });
+      continue;
+    }
     if (!stagedMatrixFits({ rows, columns }, { ...geometry, residual })) {
       results.push({ ...c, skipped: "refused by stagedMatrixFits" });
       continue;
@@ -116,7 +142,11 @@ export async function main(device, args = []) {
     // by AF2's differential checker, at relRMS 1.85, after the kernel had
     // already been called correct. A base of 3 also exercises the vec4 path's
     // alignment gate, since 3 % 4 is not 0.
-    const weightBase = 3;
+    // 🔴 AND IT IS THE CASE'S OWN, WHICH IT WAS NOT. The loop above enumerates
+    // 4 and 3 and this line pinned it to 3, so half the cases were duplicates
+    // of the other half and the ALIGNED base - the one the vec4 path actually
+    // takes in the transition - was never checked.
+    const weightBase = c.weightBase;
     const source = new Float32Array(rows * inner);
     const weightData = new Float32Array(weightBase + inner * columns + columns);
     for (let i = 0; i < source.length; i += 1) source[i] = half(((i * 37) % 19 - 9) / 8);
@@ -165,6 +195,7 @@ export async function main(device, args = []) {
     const code = createStagedMatrixShader({
       ...geometry, sourcePrecision, weightPrecision: "f16", outputPrecision, residual,
       vectorStaging: vectorStaging && weightBase % 4 === 0,
+      directWeights, prefetch,
     });
     gpu.pushErrorScope("validation");
     let pipeline = null;
@@ -219,6 +250,7 @@ export async function main(device, args = []) {
     const relRms = Math.sqrt(num / Math.max(den, 1e-30));
     results.push({
       ...c, vectorStaging,
+      directWeights, prefetch,
       relRms: Number(relRms.toPrecision(3)),
       ok: relRms < (outputPrecision === "f16" ? 3e-3 : 1e-3),
     });

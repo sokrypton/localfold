@@ -101,6 +101,12 @@ export async function main(device, args) {
   const trunkGpu = new Af3TrunkGpu(device, {
     residentWeights, stagedPrecision: option(args, "staged", undefined),
     weightPrecision: option(args, "weights", undefined),
+    // 🔴 THE PAIR TRACK'S OWN, WHICH IS A DIFFERENT KNOB AND A DIFFERENT TRADE.
+    // It defaults to f32 on a measurement taken when every kernel reading it
+    // was a VECTOR one; most of them are staged matrix GEMMs now, and those
+    // round their weights to halves on the way in whatever the buffer holds.
+    // See src/af3/pairformer-block-webgpu.js.
+    pairWeightPrecision: option(args, "pair-weights", undefined),
     accumulatePrecision: option(args, "accumulate", undefined),
   });
   let previousPair = new Float32Array(tokens * tokens * 128);

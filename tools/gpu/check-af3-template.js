@@ -12,6 +12,11 @@ import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TemplateEmbedderGpu } from "../../src/af3/template-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 
+// 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
+// int5 bundle and not the f32 one the checker 404s instead of running - and
+// two whole stacks' kernel choices went ungated here for exactly that reason.
+// `--model=` picks the bundle; the bound follows, because an int5 bundle is
+// quantised and its residue against a float32 oracle is not the f32 one's.
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const ROOT = "diffuser/evoformer/template_embedding";
 const SINGLE = `${ROOT}/single_template_embedding`;
@@ -60,7 +65,9 @@ function standardDeviation(values) {
 export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "32"));
   const templates = Number(option(args, "templates", "4"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  const model = option(args, "model", MANIFEST);
+  const bound = Number(option(args, "bound", model === MANIFEST ? "2e-5" : "1e-4"));
+  const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {
     const name = `${STACK}/${leaf}`;
@@ -194,7 +201,12 @@ export async function main(device, args) {
       + `\trelRMS ${relRms.toExponential(2)}`
       + `\t${gpu.elapsedMilliseconds.toFixed(1)} ms`
       + `\tstd ${standardDeviation(gpu.output).toFixed(2)}`);
-    if (!(relRms < 2e-5)) {
+    // 🔴 THE BOUND FOLLOWS THE BUNDLE. 2e-5 is a float32 bundle's residue
+    // against a float32 oracle; the published int5 bundle is quantised, and at
+    // 0 occupied slots it reads 2.41e-5 - larger for a reason that has nothing
+    // to do with this kernel. `--bound=` is what says so, rather than a number
+    // raised until both pass, which would stop checking the f32 one.
+    if (!(relRms < bound)) {
       throw new Error(`template with ${occupied} occupied slots`
         + `${spanChains ? " spanning" : ""}: relRMS ${relRms}`);
     }

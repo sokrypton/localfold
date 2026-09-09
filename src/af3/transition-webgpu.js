@@ -28,7 +28,10 @@ import { concatenateAs, writeInto } from "../runtime/float16.js";
  * bytes: 1.47 GB at 600 tokens, for a value read once. AF2's kernel chunks rows
  * to survive that; this one never allocates it.
  */
-import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
+import {
+  createStagedMatrixShader, directWeightsAllowed, stagedMatrixStorage,
+} from "../runtime/matrix-linear.js";
+import { deviceMatrixConfig, deviceTuning } from "../runtime/device-profile.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
@@ -767,19 +770,24 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     blockRows: 128, blockColumns: 128, blockInner: 32,
     subgroupRows: 2, subgroupColumns: 4, ...matrix,
   };
-  const staged = (extra) => createStagedMatrixShader({
-    ...geometry, vectorStaging, bias: false, weightPrecision, ...extra,
+  // The right operand is read out of the weight buffer without staging where
+  // the geometry asks and the shape allows - see directWeightsAllowed. The two
+  // passes contract DIFFERENT extents, so they answer separately.
+  const staged = (inner, extra) => createStagedMatrixShader({
+    ...geometry, vectorStaging, bias: false, weightPrecision,
+    directWeights: directWeightsAllowed(geometry, { inner, weightPrecision }),
+    ...extra,
   });
 
   return {
     normalize,
     // normalized (rows x channels) x transition1 (channels x wide) -> wide.
-    wide: staged({
+    wide: staged(channels, {
       sourcePrecision: normalizedStorage, outputPrecision: wideStorage,
     }),
     // ...and the gate is applied HERE, where the operand is staged, so the
     // hidden activation never exists as a tensor at all.
-    down: staged({
+    down: staged(intermediate, {
       sourcePrecision: wideStorage, outputPrecision: "f32", residual: true,
       sourceGate: { stride: wide, offset: intermediate },
     }),
@@ -900,4 +908,37 @@ export function allocateTransitionSplit(allocator, shape, keep = (a) => a) {
     });
   }
   return { normalized, wide, parameters, chunkRows, precision };
+}
+
+/**
+ * This device's answer for the split transition: a geometry, or false.
+ *
+ * 🔴 IT LIVES HERE FOR THE REASON gridProjectMatrixConfig DOES. Two stacks
+ * compile this pair track and run its transition - the pairformer and the MSA
+ * stack - and the rule was written into one of them, so four of an AF3 trunk's
+ * `pair-transition` passes kept the fused kernel however the knob was set. A
+ * selection rule belongs to the kernel, not to one of its callers.
+ *
+ * The width rule is real and is measured in src/af3/transition-webgpu.js's
+ * TRANSITION_SPLIT_MIN_CHANNELS: the fused kernel holds the WIDENED row in
+ * workgroup memory, so its row tile halves as the channels double.
+ * `pairTransitionSplitMinChannels` is what a device that has re-measured it
+ * says instead.
+ */
+export function splitTransitionConfig(device, channels) {
+  const tuning = deviceTuning(device);
+  if (tuning.pairTransitionSplit !== true) return false;
+  if (channels < (tuning.pairTransitionSplitMinChannels ?? TRANSITION_SPLIT_MIN_CHANNELS)) {
+    return false;
+  }
+  const config = deviceMatrixConfig(device, { element: "f16" });
+  if (config === null) return false;
+  return {
+    result: tuning.stagedMatrixResult ?? config.resultComponentType,
+    contractResult: config.resultComponentType,
+    matrixElement: config.componentType,
+    tile: { M: config.M, N: config.N, K: config.K },
+    prefetch: tuning.stagedMatrixPrefetch === true,
+    directWeights: tuning.stagedMatrixDirectWeights === true,
+  };
 }

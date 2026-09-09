@@ -33,10 +33,14 @@ import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { setMemoryBudget } from "../../src/runtime/device-memory.js";
 import {
   CONTACT_EDGES, contactAngstromsFor,
 } from "../../src/esmfold2/distogram-webgpu.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
+
+import { profileBuffers } from "./buffer-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -53,7 +57,7 @@ const TOWER_SHARED = ["embed/weights", "final_norm/scale", "lm/combine", "lm/nor
   "lm/norm/offset", "lm/projection/weights", "lm/downproject/weights",
   "lm/downproject/bias"];
 
-function reader(bundle) {
+export function reader(bundle) {
   const shards = new Map();
   let table;
   // 🔴 CLOSURES, NOT METHODS, BECAUSE `read` IS PASSED AROUND. Every weight
@@ -64,18 +68,62 @@ function reader(bundle) {
     if (table === undefined) table = await (await fetch(`${bundle}/manifest.json`)).json();
     return table;
   };
-  const read = async (name, half = false) => {
+  // 🔴 ONE FETCH A SHARD, EVEN WITH TEN READS IN FLIGHT. Ten leaves of a block
+  // live in one shard and are asked for together; storing the PROMISE rather
+  // than the buffer is what stops ten concurrent reads each fetching it.
+  const openShard = async (record) => {
+    if (!shards.has(record.file)) {
+      shards.set(record.file, (async () =>
+        (await fetch(`${bundle}/${record.file}`)).arrayBuffer())());
+    }
+    return shards.get(record.file);
+  };
+  const recordFor = async (name) => {
     const loaded = await manifest();
     const record = loaded.tensors[name];
     if (record === undefined) throw new Error(`${bundle} has no tensor ${name}`);
-    if (!shards.has(record.file)) {
-      shards.set(record.file, await (await fetch(`${bundle}/${record.file}`)).arrayBuffer());
-    }
-    return half
-      ? readTensorAsFloat16(record, shards.get(record.file), record.byteOffset ?? 0)
-      : readTensor(record, shards.get(record.file), record.byteOffset ?? 0, true);
+    return record;
   };
-  return { manifest, read };
+  const read = async (name, half = false) => {
+    const record = await recordFor(name);
+    const shard = await openShard(record);
+    return half
+      ? readTensorAsFloat16(record, shard, record.byteOffset ?? 0)
+      : readTensor(record, shard, record.byteOffset ?? 0, true);
+  };
+  // 🔴 WHERE THE BYTES ARE, WITHOUT DECODING ANY OF THEM - the same contract
+  // HttpTensorStore.tensorSource has, so the GPU dequantiser can take these.
+  // See src/esmc/tower-webgpu.js: the tower's four big matrices are 4.8 seconds
+  // of host int3 decoding on a first fold, and this is how they skip it.
+  const source = async (name) => {
+    const record = await recordFor(name);
+    const shard = await openShard(record);
+    return { record, buffer: shard, byteOffset: record.byteOffset ?? 0 };
+  };
+  // 🔴 HUNG OFF `read`, BECAUSE THAT IS WHAT THE LOADERS ARE HANDED. Every
+  // ESMFold2 weight helper takes a bare `read` function - see the note in
+  // src/esmfold2/weights.js about methods losing `this` - so the two halves a
+  // lazy loader needs travel as properties of it: `source` for the bytes and
+  // `decode` for the host fallback, synchronous so it can sit behind a getter.
+  read.source = source;
+  read.decode = (s) => readTensor(s.record, s.buffer, s.byteOffset, true);
+  // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES AND THIS DID NOT. The
+  // tower streams its 36 blocks and asks for a shard when it reaches one, so
+  // its fetches were effectively serial: measured, 522 ms of a 934 ms tower
+  // pass was `await pending` - the NEXT block's weights, i.e. the download.
+  // web/esmfold2-model.js has called `towerStore.prefetch()` since it was
+  // written, so that 522 ms was a property of this tool and not of a fold, and
+  // a tool whose shape differs from the page's is a tool measuring the wrong
+  // thing. See the note on --bundle above, which is the same mistake.
+  const prefetch = async () => {
+    const loaded = await manifest();
+    const files = new Set(Object.values(loaded.tensors).map((record) => record.file));
+    for (const file of files) {
+      if (shards.has(file)) continue;
+      shards.set(file, (async () => (await fetch(`${bundle}/${file}`)).arrayBuffer())());
+    }
+  };
+  return { manifest, read, source, prefetch };
 }
 
 /** Alpha carbons, by name: 'CA' is [35, 33, 0, 0] under chr(code + 32). */
@@ -109,6 +157,19 @@ export async function main(device, args = []) {
   // not what they cost a tensor norm but whether the STRUCTURE notices. Written
   // `staged:accumulate`, or one name for both.
   const trunkPrecision = option(args, "trunk-precision", "");
+  // The element the TRUNK's weight buffers hold, which is neither of the two
+  // above and is what stagedMatrixDirectWeights needs - see the note on
+  // weightPrecision in src/esmfold2/trunk-webgpu.js.
+  const trunkWeights = option(args, "trunk-weights", "");
+  for (const pair of (args ?? []).filter((a) => a.startsWith("--tune="))
+       .flatMap((a) => a.slice("--tune=".length).split(",")).filter(Boolean)) {
+    const at = pair.indexOf("=");
+    if (at < 0) throw new Error(`--tune wants key=value, got ${pair}`);
+    const raw = pair.slice(at + 1);
+    let value;
+    try { value = JSON.parse(raw); } catch { value = raw; }
+    setDeviceTuning(device, { [pair.slice(0, at)]: value });
+  }
   const submissionWindow = Number(option(args, "submission-window", "16"));
   const foldBundle = option(args, "bundle", "/model-esmfold2-trunk-f32");
   const towerBundle = option(args, "esmc", "/model-esmc-600m-int3");
@@ -138,6 +199,18 @@ export async function main(device, args = []) {
   // 🔴 FOLD TWICE, THE SECOND TIME REUSING THE TRUNK, which is the only way to
   // check that the saving is real and that the answer is the same one.
   const twice = args.includes("--reuse-trunk");
+  // 🔴 FOLD THE WHOLE THING AGAIN, REUSING NOTHING, which is what a page does
+  // when a user pastes a second sequence. `--reuse-trunk` skips the language
+  // model entirely and so cannot see what a second fold actually costs; this
+  // repeats the fold from the top and reports each one's timings, which is the
+  // only way to price the tower's weight residency.
+  const repeat = Number(option(args, "repeat", "1"));
+  // 🔴 A CEILING, SO THE TOWER'S RESIDENCY REFUSAL CAN BE MADE TO FIRE. Its 36
+  // blocks are about 890 MiB in halves and it keeps them only when the budget
+  // is at least four times that; below the line it streams as it always did.
+  // A fallback nothing has taken is a fallback nobody has checked.
+  const budgetMiB = Number(option(args, "budget", "0"));
+  if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
   // 🔴 THE TRUNK'S PASS COUNT, WHICH IS THE PAGE'S RECYCLE DIAL. Upstream runs
   // `range(num_loops + 1)` and this checkpoint's `num_loops` is 3, so the
   // default is four passes and `--recycles=3` is that.
@@ -149,6 +222,10 @@ export async function main(device, args = []) {
 
   const fold = reader(foldBundle);
   const tower = reader(towerBundle);
+  // Started, not awaited: the point is that they are in flight while the
+  // manifests, the pipelines and the ESMFold2 weights are being dealt with.
+  void fold.prefetch();
+  void tower.prefetch();
   const manifest = await fold.manifest();
   const towerTable = await tower.manifest();
   const towerManifest = towerTable.languageModel ?? {};
@@ -167,6 +244,7 @@ export async function main(device, args = []) {
                       "lm/downproject/weights", "lm/downproject/bias"]) {
     shim[name] = await tower.read(name);
   }
+  const weightsAt = performance.now();
   const [featuriser, inputsEmbedder, denoiser, encoder, decoder] = await Promise.all([
     featuriserWeights(fold.read),
     atomEncoderWeights(fold.read, "atom", M.atomBlocks),
@@ -177,10 +255,13 @@ export async function main(device, args = []) {
   ]);
   denoiser.encoder = encoder;
   denoiser.decoder = decoder;
+  const denoiserWeightMs = Math.round(performance.now() - weightsAt);
+  const trunkBlocksAt = performance.now();
   const trunkBlocks = [];
   for (let layer = 0; layer < M.blocks; layer += 1) {
     trunkBlocks.push(await trunkBlockWeights(fold.read, layer));
   }
+  const trunkBlockMs = Math.round(performance.now() - trunkBlocksAt);
 
   // 🔴 THE TOWER STREAMS ITS BLOCKS AND THIS MUST NOT DEFEAT THAT. Reading all
   // 36 up front is 2190 MiB of float32 in the tab, which is the thing the
@@ -197,13 +278,38 @@ export async function main(device, args = []) {
       layers: towerManifest.layers, pair: M.pairChannels,
       residualScale: towerManifest.residualScale ?? 1,
     }, async (layer) => {
-      const weights = {};
+      // 🔴 THE FOUR NARROW LEAVES ARE OFFERED AS CODES AND DECODED ON DEMAND.
+      // `sources` lets the tower decode them on the device; the getters are the
+      // fallback for a bundle the device decoder cannot take, and they must be
+      // getters rather than values or the decode this exists to skip happens
+      // anyway. The six vectors are norms and stay eager - they are 0.4% of a
+      // block.
+      // 🔴 `--host-decode` IS THE ARM, and it exists because a device path with
+      // no host path beside it is a path nothing can be compared against.
+      const weights = args.includes("--host-decode") ? {} : { sources: {} };
       for (const leaf of BLOCK_LEAVES) {
-        weights[leaf] = await tower.read(`blocks/${layer}/${leaf}`,
-                                         NARROW_LEAVES.has(leaf));
+        const name = `blocks/${layer}/${leaf}`;
+        if (!NARROW_LEAVES.has(leaf)) {
+          weights[leaf] = await tower.read(name, false);
+          continue;
+        }
+        const source = await tower.source(name);
+        if (weights.sources !== undefined) weights.sources[leaf] = source;
+        let decoded;
+        Object.defineProperty(weights, leaf, {
+          enumerable: true,
+          get() {
+            return (decoded ??= readTensorAsFloat16(
+              source.record, source.buffer, source.byteOffset));
+          },
+        });
       }
       return weights;
-    }, towerShared, { sequenceId, onBlock });
+    // 🔴 `towerShared` IS THE MODEL, AND THAT IS WHAT KEYS THE RESIDENCY. The
+    // tower is constructed fresh per fold and cannot be the key; this object is
+    // built once from the bundle and lives as long as it does. See
+    // residentBlocks in src/esmc/tower-webgpu.js.
+    }, towerShared, { sequenceId, onBlock, weightKey: towerShared });
     return result.single;
   };
 
@@ -215,6 +321,10 @@ export async function main(device, args = []) {
 
   const progress = [];
   const updates = new Map();
+  // 🔴 `--buffers` BECAUSE A FIRST FOLD IS 8 SECONDS AND A SECOND IS 0.85, and
+  // nothing here could say which side of the bus the difference was on. It
+  // wraps the device rather than the kernels; see tools/gpu/buffer-profile.js.
+  const buffers = args.includes("--buffers") ? profileBuffers(device) : null;
   const result = await foldEsmfold2(device, {
     sequence, allocator, seed, sampler,
     ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
@@ -223,9 +333,12 @@ export async function main(device, args = []) {
           ...(ligands.length === 0 ? {} : { ligands }) },
     shape: { ...M, loops: recycles + 1 },
     submissionWindow,
-    trunk: trunkPrecision === "" ? {} : {
-      stagedPrecision: trunkPrecision.split(":")[0],
-      accumulatePrecision: trunkPrecision.split(":")[1] ?? trunkPrecision.split(":")[0],
+    trunk: {
+      ...(trunkWeights === "" ? {} : { weightPrecision: trunkWeights }),
+      ...(trunkPrecision === "" ? {} : {
+        stagedPrecision: trunkPrecision.split(":")[0],
+        accumulatePrecision: trunkPrecision.split(":")[1] ?? trunkPrecision.split(":")[0],
+      }),
     },
     weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
     tower: runTower,
@@ -249,6 +362,26 @@ export async function main(device, args = []) {
     },
   });
 
+  if (buffers !== null) {
+    const traffic = buffers.report();
+    const wall = result.elapsedMilliseconds;
+    console.log(`buffer traffic: ${traffic.totalMs.toFixed(0)} ms of ${wall.toFixed(0)} ms wall`
+      + ` (${(100 * traffic.totalMs / wall).toFixed(0)}%)`);
+    console.log(`  queue drain: ${traffic.queueWait.unionMs.toFixed(0)} ms over `
+      + `${traffic.queueWait.calls} onSubmittedWorkDone, union not sum`);
+    for (const row of traffic.byKind) {
+      console.log(`  ${row.ms.toFixed(0).padStart(6)} ms`
+        + ` ${(100 * row.ms / wall).toFixed(1).padStart(5)}%`
+        + ` x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB  ${row.kind}`);
+    }
+    for (const row of traffic.rows.slice(0, 12)) {
+      console.log(`    ${row.ms.toFixed(0).padStart(6)} ms x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB  ${row.kind} ${row.label}`);
+    }
+    buffers.restore();
+  }
+
   // ...and again off the cached trunk, which must agree to the digit.
   let second;
   if (twice) {
@@ -265,6 +398,59 @@ export async function main(device, args = []) {
       languageModel: !noPlm,
       reuse: result.reusable,
     });
+  }
+
+  const repeats = [];
+  for (let again = 1; again < repeat; again += 1) {
+    const started = performance.now();
+    const other = await foldEsmfold2(device, {
+      sequence, allocator, seed, sampler,
+      ...(denoiserWeightElement === "" ? {} : { denoiserWeightPrecision: denoiserWeightElement }),
+      entities: (kinds === "" && ligands.length === 0) ? sequence
+        : { sequence, ...(kinds === "" ? {} : { chainKinds: kinds.split(",") }),
+            ...(ligands.length === 0 ? {} : { ligands }) },
+      shape: { ...M, loops: recycles + 1 },
+      submissionWindow,
+      trunk: {
+        ...(trunkWeights === "" ? {} : { weightPrecision: trunkWeights }),
+        ...(trunkPrecision === "" ? {} : {
+          stagedPrecision: trunkPrecision.split(":")[0],
+          accumulatePrecision: trunkPrecision.split(":")[1] ?? trunkPrecision.split(":")[0],
+        }),
+      },
+      weights: { featuriser, inputsEmbedder, trunkBlocks, denoiser, shim },
+      tower: runTower,
+      languageModel: !noPlm,
+      lmMaskFraction: lmMask,
+    });
+    // 🔴 AND WHAT IT FOLDED, NOT JUST HOW LONG IT TOOK. A repeat exists to
+    // price the weight residency, and residency that returned a different
+    // structure would be invisible in a stopwatch. The alpha carbons are
+    // compared to the first fold's, which is the same sequence and the same
+    // seed and so must be the same fold to the bit.
+    const carbons = (fold) => Array.from(fold.alphaCarbons ?? []);
+    const first = carbons(result);
+    const mine = carbons(other);
+    let worst = 0;
+    for (let i = 0; i < Math.min(first.length, mine.length); i += 1) {
+      worst = Math.max(worst, Math.abs(first[i] - mine[i]));
+    }
+    repeats.push({
+      seconds: Number(((performance.now() - started) / 1000).toFixed(3)),
+      languageModelMs: Math.round(other.timings?.["language model"] ?? -1),
+      // ...and the whole breakdown, because a repeat is the only place the
+      // steady-state cost of each stage is visible: a first fold's numbers are
+      // all compilation and first touch.
+      timings: Object.fromEntries(Object.entries(other.timings ?? {})
+        .map(([k, v]) => [k, Math.round(v)])),
+      alphaCarbons: mine.length,
+      worstDisplacement: worst,
+      sameFold: mine.length === first.length && worst === 0,
+    });
+    if (mine.length !== first.length || worst !== 0) {
+      throw new Error(`fold ${again + 1} differs from the first by ${worst} A;`
+        + " the same sequence at the same seed must fold identically");
+    }
   }
 
   // 🔴 THE pAE, WHICH THIS CHECKPOINT HAS NO HEAD FOR. Reported as a summary
@@ -697,7 +883,8 @@ export async function main(device, args = []) {
   }
 
   return {
-    sequence, sampler, seed, trunkPrecision, contactSweep: sweep, certaintyByChain,
+    sequence, sampler, seed, trunkPrecision, trunkWeights, repeats,
+    contactSweep: sweep, certaintyByChain,
     lmMask: result.lmMask,
     reuseCheck: second === undefined ? undefined : {
       trunkReused: second.trunkReused,
@@ -738,9 +925,21 @@ export async function main(device, args = []) {
       mean: phosphodiester.reduce((t, v) => t + v, 0) / phosphodiester.length,
       min: Math.min(...phosphodiester), max: Math.max(...phosphodiester) },
     rmsdToReference: rmsd,
+    // 🔴 THE FOLD'S CLOCK STARTS AFTER THE WEIGHTS ARE LOADED, and a user's
+    // does not. `weightSeconds` is the int5 decode of every bundle this tool
+    // opens, on the main thread, before `elapsedSeconds` begins.
+    weightSeconds: Number(((denoiserWeightMs + trunkBlockMs) / 1000).toFixed(3)),
+    weightSplit: { denoiser: denoiserWeightMs, trunkBlocks: trunkBlockMs },
     elapsedSeconds: result.elapsedMilliseconds / 1000,
     timings: result.timings,
+    // 🔴 THE ALLOCATOR'S PEAK IS NO LONGER THE DEVICE'S. Resident weights are
+    // created outside the pool - they have to outlive the run that made them -
+    // so `allocator.snapshot()` stopped counting the largest thing a fold
+    // holds: it read 344 MiB before the ESM-C tower and the denoiser kept
+    // theirs and 94 after, while the device held MORE. Both are reported now,
+    // and the device's is the one that answers "will this fit".
     peakMebibytes: result.memory.peakBytes / 1048576,
+    devicePeakMebibytes: Number((memorySnapshot(device).peakBytes / 1048576).toFixed(1)),
     // 🔴 AND GROUPED, BECAUSE TWENTY ROWS STOPPED REACHING THE ANSWER. With the
     // pair tensors down, the peak is a long tail of per-block weight tensors -
     // twelve token blocks times six tensors each - and no row-listing shows
@@ -796,6 +995,17 @@ export async function main(device, args = []) {
       perToken: [...result.certainty].map((v) => Number(v.toFixed(4))),
     },
     contactAgreement: agreement,
+    // 🔴 A CHECKSUM OF EVERY ATOM, so an arm that changed the fold says so. A
+    // fold tool that prints a pLDDT and a contact count can watch a structure
+    // move and report the same two numbers; see the note on meanPlddt in
+    // CLAUDE.md, which is the same lesson on AF3.
+    atomChecksum: (() => {
+      let sum = 0;
+      for (let i = 0; i < result.coordinates.length; i += 1) {
+        sum = (sum + Math.round(result.coordinates[i] * 1000)) | 0;
+      }
+      return sum;
+    })(),
     pdb,
   };
 }

@@ -13,6 +13,7 @@
  */
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
 import { profileDevice } from "./profile.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

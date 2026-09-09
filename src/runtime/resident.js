@@ -19,6 +19,12 @@
  */
 import { noteAllocation, noteDestroy } from "./device-memory.js";
 
+/**
+ * What `pack()` has cost on this page: the HOST packers behind every resident
+ * weight buffer, which no compute-pass profiler can see.
+ */
+export const residentPackStats = { calls: 0, ms: 0, bytes: 0, byLabel: new Map() };
+
 const byDevice = new WeakMap();
 
 /**
@@ -104,7 +110,21 @@ export function residentWeightBuffer(device, key, label, pack, variant = "") {
   const slot = variant === "" ? label : `${label}\u0000${variant}`;
   const found = forKey.get(slot);
   if (found !== undefined) return found;
+  // 🔴 WHAT THE HOST PACKERS STILL COST, WHICH NOTHING COULD SEE. Every device
+  // decode falls back to one of these when it cannot take a tensor, silently
+  // by design on the AF3 side - and a fallback that costs 400 ms of a first
+  // fold looks exactly like a slow machine. `fold-af2.js` has reported
+  // `packBy` since the same question was asked there; this is the same
+  // accounting one level down, so every model gets it.
+  const packedAt = performance.now();
   const data = pack();
+  residentPackStats.calls += 1;
+  residentPackStats.bytes += data.byteLength;
+  residentPackStats.ms += performance.now() - packedAt;
+  const byLabel = residentPackStats.byLabel;
+  const row = byLabel.get(label) ?? { calls: 0, ms: 0, bytes: 0 };
+  row.calls += 1; row.bytes += data.byteLength; row.ms += performance.now() - packedAt;
+  byLabel.set(label, row);
   const size = Math.ceil(data.byteLength / 4) * 4;
   noteAllocation(device, label, size);
   const buffer = device.createBuffer({
@@ -159,4 +179,39 @@ export function releaseResidentWeights(device, prefix) {
   if (kept.length === 0) heldByDevice.delete(device);
   else heldByDevice.set(device, kept);
   return bytes;
+}
+
+/**
+ * A packed weight buffer AND the offsets that came with it, packed once.
+ *
+ * 🔴 THE OFFSETS ARE WHY A RESIDENT PACK IS NOT JUST A RESIDENT UPLOAD. Every
+ * packer in this repository returns `{data, offsets}` and the caller needs the
+ * offsets on EVERY pass, for the uniform - so caching only the buffer would
+ * still run the pack to get them, which is the host work that costs the time.
+ * The offsets are a handful of integers; they are kept, and the array of
+ * weights is not.
+ *
+ * Keyed on the weight object like everything else here, and by `variant`
+ * within it, because a pack in a different precision or layout has different
+ * offsets as well as different bytes.
+ */
+const offsetsByKey = new WeakMap();
+
+export function residentPack(device, key, label, pack, variant = "") {
+  let forKey = offsetsByKey.get(key);
+  if (forKey === undefined) {
+    forKey = new Map();
+    offsetsByKey.set(key, forKey);
+  }
+  const slot = `${label}\u0000${variant}`;
+  const buffer = residentWeightBuffer(device, key, label, () => {
+    const packed = pack();
+    forKey.set(slot, packed.offsets);
+    return packed.data;
+  }, variant);
+  // A hit on the buffer with a miss on the offsets cannot happen - they are
+  // written together - but a caller that swapped one cache for the other would
+  // find out here rather than by reading zeros out of a uniform.
+  if (!forKey.has(slot)) forKey.set(slot, pack().offsets);
+  return { buffer, offsets: forKey.get(slot) };
 }

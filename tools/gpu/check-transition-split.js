@@ -90,6 +90,26 @@ export async function main(device, args) {
     transition2: deterministic(intermediate * channels, 6),
   };
   const packed = packTransitionWeights(weights);
+  // 🔴 THE SPLIT ARM MAY HOLD ITS WEIGHTS AS HALVES AND THE FUSED REFERENCE MAY
+  // NOT. `createTransitionShader` has no precision parameter - it reads f32 -
+  // so the two arms get two buffers of the same values, and the residue this
+  // reports then includes the weights' own rounding. That is the point:
+  // `stagedMatrixDirectWeights` reads the right operand straight out of the
+  // buffer and so requires it to hold the matrix element, and a checker that
+  // could not pack halves could not reach that path at all.
+  const splitWeightPrecision = option(args, "weights", "f32");
+  const direct = option(args, "direct", "0") === "1";
+  // The staged GEMM's accumulator width. The device config's own answer is
+  // f32 here and f16 halves the registers it costs, which is the occupancy
+  // this kernel is bound by - so it is a speed knob whose price is exactly
+  // this number.
+  const resultType = option(args, "result", "");
+  // 🔴 THE GATED SOURCE IS STAGED INSIDE THE PREFETCH, and check-staged-matrix
+  // has no sourceGate - so the SwiGLU read into a held register is a path only
+  // this checker reaches.
+  const prefetch = option(args, "prefetch", "0") === "1";
+  const splitPacked = splitWeightPrecision === "f32"
+    ? packed : packTransitionWeights(weights, splitWeightPrecision);
 
   const storage = GPUBufferUsage.STORAGE;
   const upload = (data, usage) => {
@@ -101,6 +121,8 @@ export async function main(device, args) {
     return buffer;
   };
   const weightBuffer = upload(packed.data, storage);
+  const splitWeightBuffer = splitPacked === packed
+    ? weightBuffer : upload(splitPacked.data, storage);
 
   const rows_ = [];
   let failed = 0;
@@ -118,12 +140,15 @@ export async function main(device, args) {
 
     const split = createTransitionSplitShaders(
       { rows, channels, factor }, packed.offsets, epsilon, variance,
-      { normalizedStorage, wideStorage,
+      { normalizedStorage, wideStorage, weightPrecision: splitWeightPrecision,
         // ...at the block that SHIPS, unless --block= says otherwise.
         matrix: { result: config.resultComponentType, matrixElement: config.componentType,
                   tile: { M: config.M, N: config.N, K: config.K },
                   ...stagedMatrixBlock(option(args, "block", null)
-                    ?? deviceTuning(device).stagedMatrixBlock) } });
+                    ?? deviceTuning(device).stagedMatrixBlock),
+                  ...(direct ? { directWeights: true } : {}),
+                  ...(prefetch ? { prefetch: true } : {}),
+                  ...(resultType === "" ? {} : { result: resultType }) } });
     const bytes = stagedMatrixStorage({
       ...split.geometry, tile: { M: config.M, N: config.N, K: config.K },
       result: config.resultComponentType });
@@ -198,13 +223,13 @@ export async function main(device, args) {
                          0, 0, 0, 0]), GPUBufferUsage.UNIFORM);
       held.push(normalizeParams, wideParams, downParams);
       pass(normalizePipe,
-           [at(inputBuffer, channels * 4), weightBuffer, normalized, normalizeParams],
+           [at(inputBuffer, channels * 4), splitWeightBuffer, normalized, normalizeParams],
            ...spread(Math.ceil(count / split.tiles.normalizeRows)));
-      pass(widePipe, [normalized, weightBuffer, wideParams, wideBuffer],
+      pass(widePipe, [normalized, splitWeightBuffer, wideParams, wideBuffer],
            Math.ceil(intermediate * 2 / split.tiles.blockColumns),
            Math.ceil(count / split.tiles.blockRows));
       pass(downPipe,
-           [wideBuffer, weightBuffer, downParams,
+           [wideBuffer, splitWeightBuffer, downParams,
             at(splitOut, channels * 4)],
            Math.ceil(channels / split.tiles.blockColumns),
            Math.ceil(count / split.tiles.blockRows));

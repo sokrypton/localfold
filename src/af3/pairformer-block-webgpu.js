@@ -50,15 +50,24 @@ import { af3TriangleWeights } from "./triangle-webgpu.js";
 function matrixTile(device) {
   const config = deviceMatrixConfig(device, { element: "f16" });
   if (config === null) return null;
-  return { result: config.resultComponentType, matrixElement: config.componentType,
-           tile: { M: config.M, N: config.N, K: config.K } };
+  const tuning = deviceTuning(device);
+  return { result: tuning.stagedMatrixResult ?? config.resultComponentType,
+           // 🔴 AND THE CONTRACTION KEEPS THE DEVICE'S OWN, whatever the knob
+           // says: its K is the protein's length, not a channel count, and
+           // narrowing it overflows. See stagedMatrixResult in
+           // src/runtime/device-profile.js.
+           contractResult: config.resultComponentType,
+           matrixElement: config.componentType,
+           tile: { M: config.M, N: config.N, K: config.K },
+           // A request; each kernel asks directWeightsAllowed whether its own
+           // contracted extent and weight buffer can take it. This track's
+           // weights are already halves where the device has f16, which is the
+           // condition the ESMFold2 trunk has to opt into.
+           directWeights: tuning.stagedMatrixDirectWeights === true,
+           prefetch: tuning.stagedMatrixPrefetch === true };
 }
 
-function splitTransitionConfig(device, channels) {
-  if (deviceTuning(device).pairTransitionSplit !== true) return false;
-  if (channels < TRANSITION_SPLIT_MIN_CHANNELS) return false;
-  return matrixTile(device) ?? false;
-}
+
 
 /**
  * 🔴 A SEPARATE KNOB FROM THE TRANSITION'S, AND IT WAS BRIEFLY NOT. Deriving
@@ -69,7 +78,8 @@ function splitTransitionConfig(device, channels) {
  */
 function projectMatrixConfig(device, channels) {
   if (deviceTuning(device).triangleProjectMatrix !== true) return false;
-  if (channels < TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS) return false;
+  if (channels < (deviceTuning(device).triangleProjectMatrixMinChannels
+    ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
   return matrixTile(device) ?? false;
 }
 import { DeferredValidation } from "../runtime/validation.js";
@@ -80,7 +90,9 @@ import { storageBytes } from "../runtime/storage.js";
 import { releaseWeights } from "./weights.js";
 import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
   from "../runtime/device-memory.js";
-import { transitionRowTile } from "./transition-webgpu.js";
+import { splitTransitionConfig, transitionRowTile } from "./transition-webgpu.js";
+import { allocateGridProjectMatrix, gridProjectMatrixConfig }
+  from "./grid-project-matrix.js";
 import {
   GRID_WIDTH, PAIR_SCRATCH_COUNT, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, createAddShader, encodePairTrack,
@@ -91,6 +103,7 @@ import {
   TRANSITION_ORDER, TRANSITION_SPLIT_MIN_CHANNELS,
 } from "./transition-webgpu.js";
 import { residentPackedOnDevice } from "./device-weights.js";
+import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
 import { createSingleAttentionShaders, packSingleAttentionWeights,
   singleProjectSplits, SINGLE_ATTENTION_ORDER }
   from "./single-attention-webgpu.js";
@@ -104,6 +117,8 @@ import { createSingleAttentionShaders, packSingleAttentionWeights,
  * the block's number rather than these - see `#runStack`.
  */
 const AF3_SINGLE_CHANNELS = 384;
+/** A warm's state: `#runStack` reads no activation before it has compiled. */
+const EMPTY = new Float32Array(0);
 
 /**
  * The pair logits that bias single attention: LayerNorm the pair, project to
@@ -259,6 +274,30 @@ export class Af3PairformerStackGpu {
     }
   }
 
+  /**
+   * Compile this stack's pipelines and encode nothing.
+   *
+   * 🔴 A WARM THAT GETS THE SHAPE WRONG IS WASTED WORK, NEVER A WRONG ANSWER.
+   * The run still asks the pipeline cache for its own keys; a stand-in that
+   * disagrees just compiles shaders nobody binds. So this is safe to call
+   * speculatively, and `catch` is the caller's business.
+   *
+   * @param {{tokens: number}} shape
+   * @param {object[]} blocks one stand-in block, from `pairformerBlockWeights`
+   *   with `{ shapesOnly: true }`
+   */
+  async warm(shape, blocks, dialect, options = {}) {
+    const n = shape.tokens;
+    // 🔴 NO STATE AT ALL. `#runStack`'s two length checks are skipped under
+    // `compilingOnly` rather than satisfied, because satisfying them means
+    // allocating the pair representation - 245 MiB at 400 tokens - to compile
+    // a shader that never reads it.
+    const state = { tokens: n, pair: EMPTY, single: EMPTY };
+    this.compilingOnly = true;
+    try { await this.#runStack(state, blocks, dialect, options); }
+    finally { this.compilingOnly = false; }
+  }
+
   async #runStack(state, blocks, dialect, options = {}) {
     const n = state.tokens;
     const pairs = n * n;
@@ -285,10 +324,15 @@ export class Af3PairformerStackGpu {
       throw new Error("pairformer blocks carry no pairChannels; they are built "
         + "by src/af3/weights.js, which derives it from the weights");
     }
-    if (state.pair.length !== pairs * pairChannels) {
+    // 🔴 A WARM HAS NO STATE AND MUST NOT BE MADE TO INVENT ONE. These two are
+    // the run's checks; satisfying them with real arrays would mean allocating
+    // `n^2 * pairChannels` floats to compile a shader - **245 MiB at 400 tokens
+    // and 1.5 GiB at 1000**, for two comparisons. See `warm`.
+    if (!this.compilingOnly && options.pairBuffer === undefined
+      && state.pair.length !== pairs * pairChannels) {
       throw new Error(`pair has ${state.pair.length} elements; expected ${pairs * pairChannels}`);
     }
-    if (state.single.length !== n * singleChannels) {
+    if (!this.compilingOnly && state.single.length !== n * singleChannels) {
       throw new Error(`single has ${state.single.length} elements; expected ${n * singleChannels}`);
     }
 
@@ -363,6 +407,9 @@ export class Af3PairformerStackGpu {
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See src/triangle/project-matrix.js.
       triangleProjectMatrix: projectMatrixConfig(this.device, pairChannels),
+      // ...and grid attention's projection, which has no width rule: it costs
+      // no memory and reads the layout the vector kernel already packs.
+      gridProjectMatrix: gridProjectMatrixConfig(this.device),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,
@@ -417,10 +464,27 @@ export class Af3PairformerStackGpu {
                              extraPairBiasData !== undefined));
     into("addSingle", `${base}:add-single`, createAddShader(n * singleChannels));
     await Promise.all(compiling);
+    // 🔴 A WARM STOPS HERE. Everything above is widths, offset tables and
+    // shader sources - all of it derivable from the manifest's shapes, none of
+    // it from a weight's VALUES - and everything below allocates and encodes.
+    // `warm` runs this half against a stand-in built by `bind(store, fields,
+    // { shapesOnly: true })` the moment the manifest lands, so the compiler
+    // works through the 1.7 s of weight download instead of after it. See
+    // Execution.warm for the same shape of thing on AF2, and note that the
+    // AF2 one is a MODE for the same reason this is: a warm written as its own
+    // list of shader keys is a list written twice.
+    if (this.compilingOnly) return undefined;
 
     try {
       // Resident state.
-      const pair = keep(this.allocator.upload("af3-block.pair", state.pair, storage | GPUBufferUsage.COPY_SRC));
+      // 🔴 THE CALLER'S BUFFER WHEN IT HAS ONE. OpenDDE's confidence head builds
+      // its pair on the device - `tokens^2 x 384` - and handing it back as a
+      // host array meant a 26 MB readback and a 26 MB upload for a tensor that
+      // never needed to leave. The caller owns it and releases it.
+      const pair = options.pairBuffer !== undefined
+        ? { buffer: options.pairBuffer }
+        : keep(this.allocator.upload("af3-block.pair", state.pair,
+                                     storage | GPUBufferUsage.COPY_SRC));
       const single = keep(this.allocator.upload("af3-block.single", state.single, storage | GPUBufferUsage.COPY_SRC));
       const pairMask = keep(this.allocator.upload("af3-block.pair-mask", state.pairMask, storage));
       const seqMask = keep(this.allocator.upload("af3-block.seq-mask", state.seqMask, storage));
@@ -440,6 +504,10 @@ export class Af3PairformerStackGpu {
             { abLayout: "interleaved", zgLayout: "transposed",
               cHidden: pairChannels, cZ: pairChannels }).offsets,
           label: "af3-block.tri-project",
+        }, keep);
+      const gridProjectMatrix = pipelines.gridProjectMatrix === undefined ? undefined
+        : allocateGridProjectMatrix(this.allocator, {
+          ...pipelines.gridProjectMatrix, label: "af3-block.grid-project",
         }, keep);
       const transitionSplit = pipelines.transitionSplit === undefined ? undefined
         : allocateTransitionSplit(this.allocator, {
@@ -510,7 +578,7 @@ export class Af3PairformerStackGpu {
           pairChannels, singleChannels, extraPairBias,
           weightPrecision, pairWeightPrecision,
           pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
-          transitionSplit, projectMatrix,
+          transitionSplit, projectMatrix, gridProjectMatrix,
         });
         encodeMilliseconds += performance.now() - encodeStart;
         validation.end(`block ${index}`);
@@ -527,9 +595,15 @@ export class Af3PairformerStackGpu {
         // is done. It is NOT awaited: the loop carries on encoding and the
         // pipelining that makes this stack fast is untouched. They resolve in
         // submission order, so the count cannot go backwards.
-        const submitted = index + 1;
-        void this.device.queue.onSubmittedWorkDone()
-          .then(() => options.onBlockDone?.(submitted, blocks.length));
+        // 🔴 AND ONLY WHEN SOMEBODY IS LISTENING. A fence a block is 48 fences
+        // a pass; taking one whose result is thrown away is asking the driver
+        // for a signal nothing reads. The page passes onBlockDone and every
+        // bench and checker does not.
+        if (options.onBlockDone !== undefined) {
+          const submitted = index + 1;
+          void this.device.queue.onSubmittedWorkDone()
+            .then(() => options.onBlockDone(submitted, blocks.length));
+        }
         if ((index + 1) % submissionWindow === 0 || index === blocks.length - 1) {
           const waitStart = performance.now();
           await this.device.queue.onSubmittedWorkDone();
@@ -554,7 +628,18 @@ export class Af3PairformerStackGpu {
       for (const allocation of [...scratch, ...singleScratch, biasBuffer, pairLogits]) {
         allocation.release();
       }
-      const readbackPair = keep(this.allocator.allocate(
+      // 🔴 THE PAIR MAY STAY WHERE IT IS. Every reader of this stack's pair on
+      // the structural-token path is a GPU stage - the diffusion conditioning
+      // and the confidence head's own pair init - and handing it back as a host
+      // array meant a `tokens^2 x 384` readback and the same tensor uploaded
+      // again. Measured on a 200-residue OpenDDE fold: 389 ms of
+      // `af3-block.readback-pair` over three stacks at 490.6 MiB, at 1.26 GB/s,
+      // and mapAsync is the slowest row in the profile after the sampler.
+      //
+      // The caller owns what comes back and must release it. `single` is
+      // tokens x 384 and is read back as it always was.
+      const keepPair = options.keepPair === true;
+      const readbackPair = keepPair ? undefined : keep(this.allocator.allocate(
         "af3-block.readback-pair", pairBytes,
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
       const readbackSingle = keep(this.allocator.allocate(
@@ -562,18 +647,33 @@ export class Af3PairformerStackGpu {
         GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
 
       const encoder = this.device.createCommandEncoder({ label: "af3-block.readback" });
-      encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairBytes);
+      if (!keepPair) {
+        encoder.copyBufferToBuffer(pair.buffer, 0, readbackPair.buffer, 0, pairBytes);
+      }
       encoder.copyBufferToBuffer(single.buffer, 0, readbackSingle.buffer, 0, n * singleChannels * 4);
       this.device.queue.submit([encoder.finish()]);
-      await readbackPair.buffer.mapAsync(GPUMapMode.READ);
-      const outPair = new Float32Array(readbackPair.buffer.getMappedRange().slice(0));
-      readbackPair.buffer.unmap();
+      let outPair;
+      if (!keepPair) {
+        await readbackPair.buffer.mapAsync(GPUMapMode.READ);
+        outPair = new Float32Array(readbackPair.buffer.getMappedRange().slice(0));
+        readbackPair.buffer.unmap();
+      }
       await readbackSingle.buffer.mapAsync(GPUMapMode.READ);
       const outSingle = new Float32Array(readbackSingle.buffer.getMappedRange().slice(0));
       readbackSingle.buffer.unmap();
+      // 🔴 TAKEN OUT OF THIS ALLOCATOR'S LIST, so the `finally` below does not
+      // destroy the buffer it just handed out. A caller asking for the pair on
+      // the device owns it.
+      const owned = allocations.indexOf(pair);
+      if (keepPair && owned >= 0) allocations.splice(owned, 1);
 
       return {
         pair: outPair, single: outSingle,
+        // 🔴 ONLY WHEN THIS STACK OWNS IT. Given `options.pairBuffer` the pair
+        // is the CALLER's and this updates it in place, so handing back
+        // something with no `release` would be a footgun with a plausible
+        // shape.
+        ...(keepPair && owned >= 0 ? { pairAllocation: pair } : {}),
         elapsedMilliseconds: performance.now() - start,
         split: {
           encodeMilliseconds: Number(encodeMilliseconds.toFixed(1)),
@@ -592,7 +692,7 @@ export class Af3PairformerStackGpu {
     const { block, n, pairs, heads, gridHeads, pipelines, storage } = context;
     const { pairChannels, singleChannels, extraPairBias } = context;
     const { pair, single, pairMask, seqMask, scratch, biasBuffer, pairLogits, singleScratch,
-            transitionSplit, projectMatrix } = context;
+            transitionSplit, projectMatrix, gridProjectMatrix } = context;
 
     // 🔴 RELEASED IMMEDIATELY, AND THAT IS SAFE BECAUSE THE QUEUE IS ORDERED.
     // Each block's weights are about 12 MB, so they cannot be held for all 48.
@@ -624,9 +724,17 @@ export class Af3PairformerStackGpu {
     let packedPair;
     // 🔴 THE a/b LAYOUT MUST MATCH THE KERNEL THAT WAS COMPILED. `projectMatrix`
     // exists exactly when compilePairTrack chose the interleaved projection.
+    // 🔴 THE TRANSITION IS ASKED FOR SEPARATELY, because it may already be on
+    // the device - see pairTransitionOnDevice below. `packedFor` is one call
+    // that packs all five, so a transition nothing binds is still 229.6 MiB of
+    // int5 decoded and narrowed on the main thread over 48 blocks.
+    let packTransition = true;
+    let packTriangles = true;
+    let packGrids = true;
+    const abLayout = context.projectMatrix === undefined ? "blocked" : "interleaved";
     const packedFor = () => (packedPair ??= packPairTrackWeights(
-      block, pairChannels, context.pairWeightPrecision, true,
-      context.projectMatrix === undefined ? "blocked" : "interleaved"));
+      block, pairChannels, context.pairWeightPrecision, true, abLayout,
+      { transition: packTransition, triangles: packTriangles, grids: packGrids }));
     // 🔴 UPLOADED ONCE PER BLOCK, EVER, LIKE THE PACKING ABOVE. The packing was
     // already cached and the WRITE was not: eight buffers a block, 48 blocks, on
     // every pass of every recycle of every fold, over weights that never change.
@@ -652,13 +760,60 @@ export class Af3PairformerStackGpu {
         buffer: residentWeightBuffer(this.device, block, label, pack, variant),
       })
       : (label, pack) => ({ buffer: upload(label, pack()).buffer });
+    // 🔴 THE PAIR TRANSITION IS THE ONE PAIR-TRACK TENSOR THE DEVICE DECODER
+    // CAN TAKE. Its packer lays the four tensors end to end in TRANSITION_ORDER
+    // and reshapes nothing; the triangles and the grid attentions do not - the
+    // matrix path INTERLEAVES the four projections and transposes the two
+    // output matrices, and `runBlockUpload` writes each tensor as a contiguous
+    // run. So this one goes the way the single transition already goes, and the
+    // other four still pack on the host.
+    //
+    // 🔴 ASKED BEFORE THE OTHER FOUR ARE PACKED, because `packPairTrackWeights`
+    // packs all five in one call: a caller that stopped BINDING the transition
+    // was still paying to build it - 229.6 MiB of f16 over 48 blocks at 384
+    // channels, decoded out of int5 and narrowed on the main thread.
+    //
+    // 🔴 AND ONLY WHERE THIS STACK IS KEEPING ITS WEIGHTS. `residentPackedOnDevice`
+    // allocates through `noteAllocation`, which RAISES over a budget rather than
+    // falling back - so taking it on a stack that has decided to stream would
+    // turn the small-device path into an exception. The wide pair track is
+    // exactly the stack that streams when a device is too small; see foldBatch.
+    // ...at whatever precision this stack packs its pair track in. AF3's is
+    // deliberately f32 - see the measurement that declined f16 pair weights -
+    // and gating this on f16 left all 48 blocks packing on the host.
+    const pairTransitionOnDevice = this.residentWeights
+      ? await residentPackedOnDevice(this.device, {
+          key: block.pairTransition, label: "w.pair-transition",
+          order: TRANSITION_ORDER, weights: block.pairTransition,
+          variant: context.pairWeightPrecision,
+          destination: context.pairWeightPrecision === "f16" ? "f16" : "f32",
+        })
+      : undefined;
+    if (pairTransitionOnDevice !== undefined) packTransition = false;
+
+    // 🔴 AND THE TWO TRIANGLES AND THE TWO GRID ATTENTIONS, WHICH ARE THE
+    // OTHER 3.4 SECONDS. Their packs are transposes and interleaves around the
+    // int5 decode, which is why they could not go the way the transition just
+    // did - the decoder wrote one contiguous run per tensor. It reshapes now;
+    // see src/af3/pair-track-device-weights.js for the table of mappings.
+    const onDevice = await residentPairTrackOnDevice(this.device, block, {
+      channels: pairChannels, pairWeightPrecision: context.pairWeightPrecision,
+      abLayout, resident: this.residentWeights,
+    });
+    packTriangles = onDevice.want.triangles;
+    packGrids = onDevice.want.grids;
+
     const pairTrackWeights = {
-      outgoing: resident("w.tri.out", () => packedFor().outgoing, context.pairWeightPrecision),
-      incoming: resident("w.tri.in", () => packedFor().incoming, context.pairWeightPrecision),
-      grid1: resident("w.grid1", () => packedFor().grid1),
-      grid2: resident("w.grid2", () => packedFor().grid2),
-      transition: resident(
-        "w.pair-transition", () => packedFor().transition, context.pairWeightPrecision),
+      outgoing: onDevice.buffers.outgoing
+        ?? resident("w.tri.out", () => packedFor().outgoing, context.pairWeightPrecision),
+      incoming: onDevice.buffers.incoming
+        ?? resident("w.tri.in", () => packedFor().incoming, context.pairWeightPrecision),
+      grid1: onDevice.buffers.grid1 ?? resident("w.grid1", () => packedFor().grid1),
+      grid2: onDevice.buffers.grid2 ?? resident("w.grid2", () => packedFor().grid2),
+      transition: pairTransitionOnDevice !== undefined
+        ? { buffer: pairTransitionOnDevice }
+        : resident("w.pair-transition", () => packedFor().transition,
+                   context.pairWeightPrecision),
     };
     // 🔴 THE PRECISION IS PART OF THE CACHE KEY, as a variant rather than as
     // part of the label - see residentWeightBuffer. A process running both arms
@@ -669,11 +824,20 @@ export class Af3PairformerStackGpu {
     // src/af3/device-weights.js - it decodes on the GPU instead, bit for bit,
     // and falls through to the host packer when the weights cannot supply
     // codes.
-    const singleTransitionOnDevice = context.weightPrecision === "f16"
+    // 🔴 ONLY WHERE THIS STACK IS KEEPING ITS WEIGHTS, which the pair
+    // transition above says too. `residentPackedOnDevice` allocates through
+    // `noteAllocation`, which RAISES over a budget - and `run` catches that
+    // once, drops residency and restarts, so a second raise from a path that
+    // ignored `residentWeights` is uncaught and the fold dies. It did: at
+    // `--budget=200`, `w.single-transition needs 3.4 MiB` out of the RESTART.
+    // The old `weightPrecision === "f16"` gate hid this on a device with no
+    // shader-f16, which is every device this repository measures on.
+    const singleTransitionOnDevice = this.residentWeights
       ? await residentPackedOnDevice(this.device, {
           key: block.singleTransition, label: "w.single-transition",
           order: TRANSITION_ORDER, weights: block.singleTransition,
           variant: context.weightPrecision,
+          destination: context.weightPrecision === "f16" ? "f16" : "f32",
         })
       : undefined;
     const singleTransitionWeights = singleTransitionOnDevice !== undefined
@@ -683,11 +847,12 @@ export class Af3PairformerStackGpu {
         () => packTransitionWeights(block.singleTransition, context.weightPrecision).data,
         context.weightPrecision);
     // ...and the second biggest, 67.6 MiB over 48 blocks, by the same route.
-    const singleOnDevice = context.weightPrecision === "f16"
+    const singleOnDevice = this.residentWeights
       ? await residentPackedOnDevice(this.device, {
           key: block.singleAttention, label: "w.single",
           order: SINGLE_ATTENTION_ORDER, weights: block.singleAttention,
           variant: context.weightPrecision,
+          destination: context.weightPrecision === "f16" ? "f16" : "f32",
         })
       : undefined;
     const singleWeights = singleOnDevice !== undefined
@@ -716,8 +881,19 @@ export class Af3PairformerStackGpu {
     // binding alignment - so handing a shader the slice for rows [r0, r1)
     // makes its existing indexing address the chunk with no change to any
     // kernel. See encodePairTrack's rowChunk, and slice() beside it.
+    // 🔴 ONE PASS A BLOCK, NOT ONE A DISPATCH. WebGPU orders dispatches inside
+    // a compute pass and makes each one's writes visible to the next - which is
+    // what AF2's evoformer stack has always relied on. A block is about thirty
+    // dispatches and an OpenDDE trunk is 1723 of them a pass.
+    // `batchComputePasses` off restores one pass a dispatch, which is what
+    // profile.js needs to attribute anything; see profileDevice.
+    const batchPasses = deviceTuning(this.device).batchComputePasses !== false;
+    let openPass = null;
+    const endPass = () => { if (openPass !== null) { openPass.end(); openPass = null; } };
     const run = (label, pipeline, buffers, x, y = 1, z = 1) => {
-      const pass = encoder.beginComputePass({ label });
+      const pass = batchPasses
+        ? (openPass ??= encoder.beginComputePass({ label: `${label.split(".")[0]}.block` }))
+        : encoder.beginComputePass({ label });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, this.device.createBindGroup({
         layout: pipeline.getBindGroupLayout(0),
@@ -730,14 +906,14 @@ export class Af3PairformerStackGpu {
         })),
       }));
       pass.dispatchWorkgroups(x, y, z);
-      pass.end();
+      if (!batchPasses) pass.end();
     };
     const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
     const ceil = (value, divisor) => Math.ceil(value / divisor);
 
     encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
-      scratch, biasBuffer, transitionSplit, projectMatrix,
+      scratch, biasBuffer, transitionSplit, projectMatrix, gridProjectMatrix,
       weights: pairTrackWeights,
     });
 
@@ -770,6 +946,7 @@ export class Af3PairformerStackGpu {
 
     // Submitted, not awaited: the queue keeps the work in order, and the batch
     // this block belongs to drains once for all of them.
+    endPass();
     this.device.queue.submit([encoder.finish()]);
   }
 }

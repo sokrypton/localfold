@@ -1,4 +1,5 @@
-import { readTensor, readTensorRange, tensorByteLength } from "./dtype.js";
+import { readTensor, readTensorAsFloat16, readTensorRange, tensorByteLength }
+  from "./dtype.js";
 /**
  * @typedef {object} TensorDownloadProgress
  * @property {number} loadedBytes
@@ -29,6 +30,15 @@ async function fetchWithRetry(url, label) {
   }
   throw new Error(`failed to load ${label}: ${lastStatus}`);
 }
+
+/**
+ * What this page has decoded on the HOST, out of shards, tensor by tensor.
+ *
+ * The counterpart to `residentPackStats`: that one prices the packers, this one
+ * prices the decodes underneath them and every eager `store.tensor(name)`
+ * besides.
+ */
+export const tensorDecodeStats = { calls: 0, elements: 0, ms: 0 };
 
 // --- the shard cache --------------------------------------------------------
 //
@@ -130,6 +140,8 @@ export class HttpTensorStore {
   #loadedTensors = 0;
   #shardCache;
   #shardQuery = "";
+  /** How many bytes the last short read got, so the error can say. */
+  #lastStreamBytes = 0;
   constructor(manifestUrl, manifest, onProgress, shardCache, shardQuery = "") {
     this.manifestUrl = manifestUrl; this.manifest = manifest; this.#onProgress = onProgress;
     this.#shardCache = shardCache; this.#shardQuery = shardQuery;
@@ -220,6 +232,44 @@ export class HttpTensorStore {
       this.#cache.set(key, value);
     }
     return value;
+  }
+
+  /**
+   * The same tensor as float32, decoded from a shard that is already open.
+   *
+   * 🔴 THE f32 SIBLING OF `tensorAsFloat16Sync`, and for the same reason: a
+   * lazy weight leaf is a GETTER, and a getter cannot await. Await `open(name)`
+   * first.
+   */
+  tensorSync(name) {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    const buffer = this.#fileBuffers.get(record.file);
+    if (buffer === undefined) {
+      throw new Error(`${name} is in ${record.file}, which is not open yet - `
+        + "await store.open(name)");
+    }
+    return readTensor(record, buffer, record.byteOffset ?? 0, true);
+  }
+
+  /**
+   * The same tensor, decoded from a shard that is already open, synchronously.
+   *
+   * 🔴 SO IT CAN SIT BEHIND A PROPERTY GETTER, which is what makes a lazy leaf
+   * lazy. A caller offering `tensorSource` to the GPU decoder still needs a
+   * host fallback for a bundle the decoder refuses, and an `async` fallback
+   * would have to be awaited - which means deciding before the decoder has
+   * been asked, which means decoding. Await `open(name)` first.
+   */
+  tensorAsFloat16Sync(name) {
+    const record = this.manifest.tensors[name];
+    if (record === undefined) throw new Error(`missing tensor ${name}`);
+    const buffer = this.#fileBuffers.get(record.file);
+    if (buffer === undefined) {
+      throw new Error(`${name} is in ${record.file}, which is not open yet - `
+        + "await store.open(name)");
+    }
+    return readTensorAsFloat16(record, buffer, record.byteOffset ?? 0);
   }
 
   /**
@@ -373,7 +423,18 @@ export class HttpTensorStore {
       this.#loadedTensors += 1;
     }
     this.#reportProgress(name);
-    return readTensor(record, buffer, byteOffset, Output !== Float32Array, Output);
+    // 🔴 WHAT THIS STORE STILL DECODES ON THE HOST. Everything the device
+    // decoder took is a `tensorSource` and never reaches here, so what is left
+    // is the tensors no device path can bind - and 426 ms of an OpenDDE fold's
+    // 1.76 s weight load is not the download (373 MB/s, measured by
+    // probe-shard-read.js) and is not the packers (`residentPackStats` says 23
+    // ms). Counting it is one object and no branch.
+    const decodeAt = performance.now();
+    const values = readTensor(record, buffer, byteOffset, Output !== Float32Array, Output);
+    tensorDecodeStats.calls += 1;
+    tensorDecodeStats.elements += values.length;
+    tensorDecodeStats.ms += performance.now() - decodeAt;
+    return values;
   }
   async #scheduleDownload(file, tensorName) {
     return new Promise((resolve, reject) => {
@@ -402,22 +463,49 @@ export class HttpTensorStore {
       // ...a short or corrupt entry: drop it and fall through to the network.
       await this.#cacheDelete(url);
     }
-    const response = await fetchWithRetry(url, `tensor ${tensorName}`);
-    // The cache copy is taken BEFORE the body is read, because a Response body
-    // can only be consumed once and the clone has to be made while it is intact.
-    // Storing it is best-effort: over quota the put throws and the load carries
-    // on, one slow page instead of a broken one.
-    void this.#cachePut(url, response.clone());
-    if (response.body === null) {
-      const buffer = await response.arrayBuffer();
-      if (buffer.byteLength !== expectedLength) throw new Error(`${file} has an invalid byte length`);
-      this.#loadedBytes += buffer.byteLength;
-      this.#reportProgress();
-      return buffer;
+    // 🔴 A SHORT BODY IS RETRIED, NOT A FAILED FOLD. `fetchWithRetry` retries a
+    // bad STATUS; a 200 whose stream ends early is a different failure and used
+    // to throw straight out of the loader. It is not hypothetical and it is not
+    // rare on the biggest bundle: OpenDDE is 472 MiB in 32 shards, and on this
+    // repository's own page harness the fold died at
+    // "weights-08.int5.bin has an invalid byte length ... OpenDDE 122 / 472 MiB"
+    // on every attempt, at the same shard, with the file on disk and the
+    // manifest agreeing to the byte and the server delivering the whole thing
+    // to curl. Thirty-two parallel downloads and one of them gets cut off.
+    //
+    // Three attempts, backing off, and only then the error - which now says how
+    // many bytes arrived, because "invalid byte length" names neither half and
+    // this file already has a note about exactly that.
+    let arrived;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await fetchWithRetry(url, `tensor ${tensorName}`);
+      // The cache copy is taken BEFORE the body is read, because a Response
+      // body can only be consumed once and the clone has to be made while it is
+      // intact. Storing it is best-effort: over quota the put throws and the
+      // load carries on, one slow page instead of a broken one.
+      void this.#cachePut(url, response.clone());
+      if (response.body === null) {
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength === expectedLength) {
+          this.#loadedBytes += buffer.byteLength;
+          this.#reportProgress();
+          return buffer;
+        }
+        arrived = buffer.byteLength;
+      } else {
+        const bytes = await this.#readStream(response, file, expectedLength);
+        if (bytes !== undefined) return bytes;
+        arrived = this.#lastStreamBytes;
+      }
+      // 🔴 AND THE CACHE COPY GOES WITH IT. The clone above was stored while the
+      // body was intact, but a truncated stream means the clone is truncated
+      // too - so leaving it would make the retry read the same short bytes back
+      // out of the cache, forever.
+      await this.#cacheDelete(url);
+      if (attempt < 2) await delay(250 * 2 ** attempt);
     }
-    const bytes = await this.#readStream(response, file, expectedLength);
-    if (bytes === undefined) throw new Error(`${file} has an invalid byte length`);
-    return bytes;
+    throw new Error(`${file} has an invalid byte length: ${arrived} bytes arrived `
+      + `where the manifest says ${expectedLength}, after three attempts`);
   }
 
   /**
@@ -447,6 +535,7 @@ export class HttpTensorStore {
     } catch {
       offset = -1;                                   // a torn cache entry reads as a failure
     }
+    this.#lastStreamBytes = Math.max(0, offset);
     if (offset === output.byteLength) return output.buffer;
     this.#loadedBytes = Math.max(0, this.#loadedBytes - Math.max(0, offset));
     this.#reportProgress();

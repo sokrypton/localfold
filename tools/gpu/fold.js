@@ -22,6 +22,7 @@ import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { warmTrunkPipelines } from "../../src/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
@@ -239,6 +240,21 @@ export async function main(device, args) {
   if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"),
                                    quant);
+  // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
+  // because a bench that reads four blocks should not pull the whole manifest -
+  // but this tool loads a whole model, so a run without it measures a download
+  // pattern no user has: shards arrive as tensors are asked for, which leaves
+  // most of the connection idle most of the time. Measured on the ESMFold2
+  // tool, which had the same hole: a fold 2.25 s -> 1.75.
+  store.prefetch();
+  // 🔴 THE PAIRFORMER'S SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. A fold's
+  // compilation is 0.80 s of AF3's 2.47 and 1.23 of OpenDDE's 2.93, the
+  // compiler pool is saturated while it runs, and the weight load in front of
+  // it leaves that pool completely idle. Not awaited; see warmTrunkPipelines.
+  // `--no-warm` is the arm; see fold-opendde.js.
+  if (!args.includes("--no-warm")) {
+    void warmTrunkPipelines(device, store, batch.tokens).catch(() => {});
+  }
   const weights = {
     trunk: await trunkWeights(store, blocks, 4),
     diffusion: await diffusionWeights(store),
@@ -507,6 +523,9 @@ export async function main(device, args) {
   const foldSeconds = [];
   let result;
   let trunkStarted = 0;
+  let stageAt = 0;
+  let lastStage = "";
+  const stageMilliseconds = {};
   let diffusionStarted = 0;
   const trajectory = [];
   let lastDenoised = null;
@@ -528,6 +547,18 @@ export async function main(device, args) {
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {
+      // 🔴 EVERY STAGE'S OWN MILLISECONDS, WHICH THIS TOOL PRINTED FOR THE
+      // TRUNK AND NOTHING ELSE. A caller's clock attributes the gap between two
+      // stages to the EARLIER one, so a fold whose named stages stop at
+      // `trunk-done` hides everything after it - which for AF3 at 68 tokens is
+      // 2.0 s of a 3.2 s first fold. fold-opendde.js has reported this since
+      // the same lesson was learned there.
+      const now = performance.now();
+      if (stageAt !== 0) {
+        stageMilliseconds[lastStage] = (stageMilliseconds[lastStage] ?? 0) + (now - stageAt);
+      }
+      stageAt = now;
+      lastStage = name === "trunk" ? `trunk:${detail.name}` : name;
       if (profile !== null && name === profileFrom && attempt === folds - 1) profile.reset();
       if (name === "target-feat") {
         const theirs = dump?.outputs["diffuser/evoformer/__call__:target_feat"];
@@ -726,6 +757,9 @@ export async function main(device, args) {
   return {
     // Both folds, so a cold process and a warm one can be told apart.
     foldSeconds,
+    stageMilliseconds: Object.fromEntries(Object.entries(stageMilliseconds)
+      .map(([k, v]) => [k, Math.round(v)]).filter(([, v]) => v > 0)
+      .sort((a, b) => b[1] - a[1])),
     sequence: batch.sequence, tokens: batch.tokens, steps,
     denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
     meanPlddt: result.meanPlddt,

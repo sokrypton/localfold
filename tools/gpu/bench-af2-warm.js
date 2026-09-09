@@ -100,16 +100,37 @@ export async function main(device, args) {
 
   const runner = new AlphaFoldMonomerGpu(device);
   const times = [];
+  // 🔴 A CHECKSUM PER PASS, AND THEY HAVE TO AGREE. This tool ran three
+  // predictions and reported the LAST one's atoms, which threw away the one
+  // comparison it was already paying for: three runs of the same graph over the
+  // same inputs in one process, where the pipelines and the buffers are
+  // identical and only the SCHEDULING differs. That is a race detector, and it
+  // caught one - see docs/A100.md on the matrix flash attention's staging.
+  //
+  // Cross-process is not the same test and is much weaker: two invocations
+  // differ in warm-up, allocation order and clocks as well, so a difference
+  // there is ambiguous and a match there is luck.
+  const checksums = [];
+  const checksumOf = (atoms) => {
+    let sum = 0;
+    for (let i = 0; i < atoms.length; i += 1) sum = (sum + Math.round(atoms[i] * 1000)) | 0;
+    return sum;
+  };
   let prediction;
   for (let pass = 0; pass < passes; pass += 1) {
     const started = performance.now();
     prediction = await runner.predict(features, weights, paeBreaks);
     times.push(performance.now() - started);
+    checksums.push(checksumOf(prediction.final.structure.atom37));
   }
   const round = (v) => Number((v / 1000).toFixed(3));
-  const atom37 = prediction.final.structure.atom37;
-  let checksum = 0;
-  for (let i = 0; i < atom37.length; i += 1) checksum = (checksum + Math.round(atom37[i] * 1000)) | 0;
+  const checksum = checksums[checksums.length - 1];
+  const deterministic = checksums.every((value) => value === checksums[0]);
+  if (!deterministic && !args.includes("--allow-nondeterminism")) {
+    throw new Error(`${passes} passes of the same graph over the same inputs returned `
+      + `${new Set(checksums).size} different structures: ${checksums.join(", ")}. `
+      + "That is a race, not a precision difference - see docs/A100.md.");
+  }
   return {
     length, clustered: rows, extra: extraRows, passes,
     featureSeconds: round(featureMs),
@@ -117,6 +138,6 @@ export async function main(device, args) {
     warmSeconds: round(Math.min(...times.slice(1))),
     allSeconds: times.map(round),
     meanPlddt: Number(prediction.final.confidence.meanPlddt.toFixed(2)),
-    checksum,
+    checksum, checksums, deterministic,
   };
 }

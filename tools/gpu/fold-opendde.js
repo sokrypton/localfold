@@ -11,10 +11,16 @@
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
 import { featuriseProtein } from "../../src/af3/featurise.js";
-import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
+import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
+  from "../../src/af3/fold.js";
+import { structuralLayout } from "../../src/af3/structural-tokens.js";
+import { STRUCTURAL_REFINER } from "../../src/af3/weights.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+import { profileDevice } from "./profile.js";
+import { profileBuffers } from "./buffer-profile.js";
+import { setMemoryBudget } from "../../src/runtime/device-memory.js";
 import {
   confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
@@ -142,8 +148,38 @@ export async function main(device, args) {
   const manifest = option(args, "model", "/model-opendde-int5/manifest.json");
 
   const batch = featuriseProtein(sequence, {});
+  const openedAt = performance.now();
   const store = await openAf3Store(manifest);
+  // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
+  // because a bench that reads four blocks should not pull the whole manifest -
+  // but this tool loads a whole model, so a run without it measures a download
+  // pattern no user has: shards arrive as tensors are asked for, which leaves
+  // most of the connection idle most of the time. Measured on the ESMFold2
+  // tool, which had the same hole: a fold 2.25 s -> 1.75.
+  store.prefetch();
+  // 🔴 AND THE PAIRFORMER'S SHADERS, WHILE THE SHARDS ARE STILL ARRIVING.
+  // OpenDDE's fold is 1.23 s of shader compilation out of 2.93, with the
+  // compiler pool saturated while it runs and completely idle through the 1.74
+  // s of weight load in front of it. It runs the stack at TWO token counts -
+  // the residues and the structural tokens the expander produces - so both are
+  // warmed. Not awaited; see warmTrunkPipelines.
+  const structuralTokens = structuralLayout(batch).tokens;
+  // 🔴 `--no-warm` IS THE ARM. A warm with no control beside it is a warm
+  // nobody has priced, and this one is speculative by construction: it compiles
+  // against a stand-in and can only be checked by counting what the fold
+  // compiled with it and without.
+  if (!args.includes("--no-warm")) void Promise.all([
+    warmTrunkPipelines(device, store, batch.tokens),
+    // ...and the refiner, which is a different root at a different token count
+    // with a pair bias its kernels bind. See warmTrunkPipelines.
+    warmTrunkPipelines(device, store, structuralTokens, {
+      root: STRUCTURAL_REFINER, stack: { pairWeightPrecision: undefined },
+      run: { extraPairBias: new Float32Array(0), keepPair: true },
+    }),
+  ]).catch(() => {});
+  const storeMs = Math.round(performance.now() - openedAt);
   const trunk = await trunkWeights(store, Number(option(args, "blocks", "48")), 4);
+  const trunkMs = Math.round(performance.now() - openedAt) - storeMs;
   const weights = {
     trunk,
     targetFeat: await targetFeatureWeights(store),
@@ -161,15 +197,62 @@ export async function main(device, args) {
     refinerWeightPrecision: option(args, "refiner-weights", undefined),
     atomReference: await atomReference(store),
   };
+  // 🔴 AND IT IS THE DOWNLOAD, NOT A DECODE. `openAf3Store` is 12 ms - the
+  // manifest - and the loaders are 1.75 s, of which `trunkWeights` is 1.54. The
+  // AF3 loaders are lazy: they build thunks and OPEN the shards, and 495 MB at
+  // the **371 MB/s this browser's fetch reaches** is 1.33 s of it.
+  //
+  // 🔴 AND 371 MB/s IS THE BROWSER, NOT THE SERVER. The same twelve shards read
+  // with python from the same server are 2129 MB/s; `probe-shard-read.js`
+  // measures both paths inside Chrome and they agree with each other -
+  // `arrayBuffer()` 371, the streamed read the store uses 371 - so the chunk
+  // loop costs nothing and the cap is six HTTP/1.1 connections at about 62 MB/s
+  // each. The lever is fewer bytes or more connections, not fewer instructions;
+  // see docs/HOSTING.md.
+  const weightSplit = { store: storeMs, trunk: trunkMs,
+                        loaders: Math.round(performance.now() - openedAt) - storeMs };
 
   // 🔴 THE TRAJECTORY IS MEASURED, NOT LOOKED AT. A frame drawn from the wrong
   // token space has the right ATOM COUNT and the wrong atoms, so it renders as
   // a plausible cloud - and the radius of gyration is what separates that from
   // a protein: a 68-residue chain is about 11 A, and scrambled atoms are not.
+  const closeTimings = () => {
+    // 🔴 THE LAST STAGE NEVER CLOSES ITSELF. `onStage` attributes the gap
+    // between two notifications to the earlier one, so whatever runs after the
+    // final stage - the confidence head, the readbacks - was never counted at
+    // all, and the timings summed to 7.2 s of a 23.5 s fold.
+    if (lastStage !== null) {
+      timings[lastStage.name] = (timings[lastStage.name] ?? 0)
+        + Math.round(performance.now() - lastStage.at);
+      lastStage = null;
+    }
+  };
   const frames = [];
   const unmapped = [];
   let lastStage = null;
   const timings = {};
+  // 🔴 THE FOLD'S CLOCK STARTS AFTER THE WEIGHTS ARE LOADED, AND A USER'S DOES
+  // NOT. See fold-esmfold2.js, where that gap was 1.4 seconds nobody was
+  // measuring. `weightSeconds` is everything above this line.
+  const weightSeconds = Number(((performance.now() - openedAt) / 1000).toFixed(3));
+  // 🔴 `--profile` SO THE FOLD'S GPU TIME IS ATTRIBUTABLE AT ALL. The stage
+  // clock says which STAGE the wall time is in; it cannot say whether a stage
+  // is compute or the host waiting, and two of this fold's five biggest stages
+  // turned out to be host arithmetic. The query set holds 2048 passes, so a
+  // whole fold overflows it - read `gpuDropped`, and drop the step count to
+  // profile the sampler.
+  const profile = args.includes("--profile") ? profileDevice(device) : null;
+  // 🔴 AND `--buffers` ANSWERS WHAT `--profile` CANNOT: how much of the wall is
+  // the host on the bus or waiting on a drain. An OpenDDE fold's pairformer is
+  // 4.4 seconds of wall against a few hundred milliseconds of labelled compute,
+  // and only this says where the difference is.
+  const buffers = args.includes("--buffers") ? profileBuffers(device) : null;
+  // 🔴 A CEILING, SO THE WIDE TRACK'S RESIDENCY REFUSAL CAN BE MADE TO FIRE.
+  // The rule in foldBatch keeps 48 blocks of a 384-channel pair track on the
+  // device when the device has room and declines when it does not; a fallback
+  // nothing has taken is a fallback nobody has checked.
+  const budgetMiB = Number(option(args, "budget", "0"));
+  if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
   const started = performance.now();
   // 🔴 THE SAME DRIVER EVERY OTHER AlphaFold 3-graph MODEL USES. The
   // structural-token stage is a branch inside foldBatch gated on the dialect,
@@ -237,7 +320,55 @@ export async function main(device, args) {
       lastStage = { name, at: now };
     },
   });
+  closeTimings();
   const wholeMs = Math.round(performance.now() - started);
+
+  // 🔴 FOLD THE WHOLE THING AGAIN, REUSING NOTHING. A first fold's numbers are
+  // all pipeline compilation and first touch - measured here, `pairformer-block`
+  // is 4.4 seconds of wall against about 250 ms of labelled GPU and does not
+  // move when the recycles go from 3 to 0, which is what a one-time cost looks
+  // like. The row a user sees is the SECOND fold, and nothing was measuring it.
+  //
+  // The atoms are compared to the first fold's: a repeat exists to price the
+  // residency, and residency that returned a different structure would be
+  // invisible in a stopwatch.
+  const repeat = Number(option(args, "repeat", "1"));
+  // Snapshotted before the repeats, which reuse the same clock.
+  const firstTimings = { ...timings };
+  const repeats = [];
+  for (let again = 1; again < repeat; again += 1) {
+    for (const key of Object.keys(timings)) delete timings[key];
+    lastStage = null;
+    const at = performance.now();
+    const other = await foldBatch(device, batch, weights, {
+      weightPrecision: option(args, "weights", undefined),
+      pairWeightPrecision: option(args, "pair-weights", undefined),
+      residentWeights: args.includes("--no-resident") ? false
+        : args.includes("--resident") ? true : undefined,
+      steps, recycles, seed: Number(option(args, "seed", "20260831")),
+      mode: option(args, "mode", "diffusion"),
+      onStage: (name) => {
+        const now = performance.now();
+        if (lastStage !== null) {
+          timings[lastStage.name] = (timings[lastStage.name] ?? 0)
+            + Math.round(now - lastStage.at);
+        }
+        lastStage = { name, at: now };
+      },
+    });
+    closeTimings();
+    let worst = 0;
+    for (let index = 0; index < fold.positions.length; index += 1) {
+      worst = Math.max(worst, Math.abs(fold.positions[index] - other.positions[index]));
+    }
+    repeats.push({
+      wholeMs: Math.round(performance.now() - at),
+      worstDisplacement: Number(worst.toFixed(6)),
+      sameFold: worst === 0,
+      timings: Object.fromEntries(Object.entries(timings)
+        .filter(([, ms]) => ms >= 20).sort((a, b) => b[1] - a[1])),
+    });
+  }
 
   const geometry = fold.geometry;
   // 🔴 AND IT GATES NOW. This file's own opening line is "the geometry is the
@@ -302,15 +433,47 @@ export async function main(device, args) {
     plddtVsError = Number((num / Math.sqrt(da * db)).toFixed(4));
   }
 
+  const gpuSummary = profile === null ? undefined : await profile.summary();
+  const profiled = profile === null ? undefined : await profile.report();
+  profile?.restore();
+  if (buffers !== null) {
+    const traffic = buffers.report();
+    console.log(`buffer traffic: ${traffic.totalMs.toFixed(0)} ms of ${wholeMs} ms wall`
+      + ` (${(100 * traffic.totalMs / wholeMs).toFixed(0)}%)`);
+    console.log(`  queue drain: ${traffic.queueWait.unionMs.toFixed(0)} ms`
+      + ` (${(100 * traffic.queueWait.unionMs / wholeMs).toFixed(0)}% of wall)`
+      + ` over ${traffic.queueWait.calls} onSubmittedWorkDone, union not sum`);
+    for (const row of traffic.byKind) {
+      console.log(`  ${row.ms.toFixed(0).padStart(6)} ms`
+        + ` ${(100 * row.ms / wholeMs).toFixed(1).padStart(5)}%`
+        + ` x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB  ${row.kind}`);
+    }
+    for (const row of traffic.rows.slice(0, 14)) {
+      console.log(`    ${row.ms.toFixed(0).padStart(6)} ms x${String(row.calls).padEnd(6)}`
+        + ` ${(row.bytes / (1024 * 1024)).toFixed(1).padStart(9)} MiB`
+        + `  ${row.kind} ${row.label}`);
+    }
+    buffers.restore();
+  }
+
   return {
     target, sequence: sequence.length,
+    ...(profiled === undefined ? {} : {
+      gpuSummary,
+      gpuTotalMs: Number(profiled.reduce((t, e) => t + e.ms, 0).toFixed(1)),
+      gpuPasses: profiled.slice(0, 24),
+      gpuLabels: profiled.length,
+      gpuDispatches: profiled.reduce((t, e) => t + e.passes, 0),
+    }),
     residueTokens: batch.tokens, structuralTokens: fold.structuralTokens,
     meanPlddt: fold.meanPlddt ?? null,
     // ...undefined unless asked, so the width rule in foldBatch decides.
     residentWeights: args.includes("--no-resident") ? false
       : args.includes("--resident") ? true : undefined,
-    steps, recycles, wholeMs,
-    timings: Object.fromEntries(Object.entries(timings)
+    steps, recycles, wholeMs, budgetMiB, weightSeconds, weightSplit,
+    ...(repeats.length === 0 ? {} : { repeats }),
+    timings: Object.fromEntries(Object.entries(firstTimings)
       .filter(([, ms]) => ms >= 20).sort((a, b) => b[1] - a[1])),
     plddtSpread: fold.perResiduePlddt === undefined ? undefined : (() => {
       const v = fold.perResiduePlddt.filter((x) => x !== undefined);

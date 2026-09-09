@@ -23,6 +23,7 @@
  * any of it was written, not assumed.
  */
 import { SOURCES } from "./weights.js";
+import { bindable } from "../runtime/weight-sources.js";
 import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
 import { residentWeightBufferFilled } from "../runtime/resident.js";
 import { writeInto } from "../runtime/float16.js";
@@ -38,33 +39,62 @@ import { writeInto } from "../runtime/float16.js";
  *   be decoded this way, and the caller should pack on the host
  */
 export async function residentPackedOnDevice(device, options) {
-  const { key, label, order, weights, variant = "" } = options;
-  if (typeof globalThis.Float16Array !== "function") return undefined;
-  const sources = weights?.[SOURCES];
-  if (sources === undefined) return undefined;
+  const { key, label, order, weights, variant = "", destination = "f16" } = options;
+  // 🔴 f32 IS A DESTINATION TOO, AND REFUSING IT LEFT THE PAIR TRACK ON THE
+  // HOST. This wrote halves only, so every caller gated itself on
+  // `precision === "f16"` - and AF3's pair track is deliberately f32 (see the
+  // measurement that declined f16 pair weights), which is why
+  // `w.pair-transition` was still 56 host packs and 95 ms of a fold with the
+  // pairformer, the MSA stack and the confidence head all asking for it. The
+  // decoder has taken an f32 destination since it was written; only this
+  // wrapper had not.
+  if (destination === "f16" && typeof globalThis.Float16Array !== "function") return undefined;
+
+  // 🔴 AN ORDER ENTRY MAY NAME ITS OWN HOLDER, because not every packed buffer
+  // comes from one descriptor. The diffusion transformer's batched zero gate is
+  // twenty-four BLOCKS' twelve tensors laid end to end - one buffer, twenty-four
+  // SOURCES maps - and packing it on the host is 496 ms of an AF3 first fold,
+  // the single largest item in it, because concatenating those tensors decodes
+  // every one of the blocks this path exists to leave undecoded.
+  const holders = [];
+  for (const item of order) {
+    const holder = typeof item === "string" ? weights : item.weights;
+    const name = typeof item === "string" ? item : item.name;
+    const sources = holder?.[SOURCES];
+    if (sources === undefined) return undefined;
+    holders.push({ name, holder, sources });
+  }
 
   const entries = [];
   let total = 0;
-  for (const name of order) {
+  for (const { name, holder, sources } of holders) {
     const thunk = sources[name];
     // 🔴 LENGTHS FROM THE THUNK. `weights[name].length` materialises the tensor,
     // which is the decode this exists to avoid.
-    if (typeof thunk !== "function" || !Number.isInteger(thunk.count)) return undefined;
-    entries.push({ name, thunk, offset: total, length: thunk.count });
+    if (!bindable(thunk)) return undefined;
+    entries.push({ name, holder, thunk, offset: total, length: thunk.count });
     total += thunk.count;
   }
-  const planned = planBlockUpload(entries);
+  const planned = planBlockUpload(entries, destination);
   if (planned === undefined) return undefined;
   // Nothing for the GPU is not a plan: an f32 manifest sends every tensor to
   // the host list, and there is no time to win there anyway.
   if (planned.gpu.params.length === 0) return undefined;
 
   return residentWeightBufferFilled(
-    device, key, label, Math.ceil(total / 2) * 4,
+    device, key, label,
+    destination === "f32" ? total * 4 : Math.ceil(total / 2) * 4,
     async (buffer) => {
       for (const entry of planned.host) {
+        const values = (entry.holder ?? weights)[entry.name];
+        if (destination === "f32") {
+          // f32 in, f32 out: the tensor's own bytes, no narrowing.
+          device.queue.writeBuffer(buffer, entry.offset * 4,
+                                   values.buffer, values.byteOffset, values.byteLength);
+          continue;
+        }
         const half = new globalThis.Float16Array(entry.length);
-        writeInto(half, weights[entry.name], 0);
+        writeInto(half, values, 0);
         device.queue.writeBuffer(buffer, entry.offset * 2,
                                  half.buffer, half.byteOffset, half.byteLength);
       }

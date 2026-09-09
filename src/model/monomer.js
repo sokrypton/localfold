@@ -89,7 +89,7 @@ export class AlphaFoldMonomerGpu {
     // gap between the phases and the wall.
     const stageMilliseconds = {
       pairMask: 0, template: 0, setup: 0,
-      embedder: 0, extraStack: 0, mainStack: 0, trunkReadback: 0,
+      embedder: 0, warm: 0, extraStack: 0, mainStack: 0, trunkReadback: 0,
       structure: 0, confidence: 0, convergence: 0, resumable: 0,
     };
     let phaseStart = performance.now();
@@ -239,6 +239,36 @@ export class AlphaFoldMonomerGpu {
         phaseStart = performance.now();
         const windowSize = signal !== undefined ? 8 : weights.mainStack.length;
         const validation = new DeferredValidation(this.device, `recycle ${recycle}`);
+        const mainDescriptor = {
+          msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
+          pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
+          cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
+          triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
+        };
+        // 🔴 THE TWO STACKS' PIPELINES, ASKED FOR ALL AT ONCE, BEFORE EITHER
+        // RUNS. A first fold used to be its own compile queue: 95 pipelines
+        // requested at the moment each kernel was first encoded, an average of
+        // 1.47 ever in flight, and a span of 1133 ms inside a 1163 ms fold.
+        // This drives the same two block functions in warm mode - no encoder,
+        // no dispatch, just their pipelines and their resident weights - so
+        // this browser's compiler gets all of them together, which it does 5.4x
+        // faster. Recycle 0 only: by the second the cache is full.
+        // 🔴 AND IT WARMS BLOCK 0 OF EACH, WHICH IS EVERY KEY BOTH STACKS USE.
+        // The blocks differ in their WEIGHTS and not in their shapes, and a
+        // pipeline key is shapes; 48 main blocks share one set.
+        if (recycle === 0) {
+          await execution.warm(async() => {
+            await Promise.all([
+              encodeExtraMsaBlock(execution, undefined, extraShape, weights.extraStack[0],
+                embedding.extraMsa, embedding.pairWithoutTemplates, extraMsaMask, pairMaskTensor),
+              encodeEvoformerBlock(execution, undefined, {
+                ...mainDescriptor, weights: weights.mainStack[0],
+              }, embedding.msa, embedding.pairWithoutTemplates, msaMask, pairMaskTensor),
+            ]);
+          });
+          stageMilliseconds.warm += performance.now() - phaseStart;
+          phaseStart = performance.now();
+        }
         for (let block = 0; block < weights.extraStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();
@@ -258,12 +288,6 @@ export class AlphaFoldMonomerGpu {
         phaseStart = performance.now();
         releaseTensor(embedding.extraMsa); releaseTensor(extraMsaMask);
 
-        const mainDescriptor = {
-          msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
-          pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
-          cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
-          triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
-        };
         for (let block = 0; block < weights.mainStack.length; block += 1) {
           throwIfAborted(signal);
           const checkpoint = execution.checkpoint();

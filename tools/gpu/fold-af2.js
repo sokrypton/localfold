@@ -42,6 +42,7 @@
  * cannot fake, so it is printed with its worst outlier.
  */
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
+import { noteResidencyRefused, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
@@ -115,6 +116,18 @@ function summariseStages(marks, started) {
 }
 
 export async function main(device, args) {
+  // 🔴 A CEILING, SO THE RESIDENCY FALLBACK CAN BE MADE TO FIRE. AF2 keeps its
+  // block weights on the device now - 280 MiB of a 387 MiB fold at 59 residues
+  // - and drops back to uploading per pass when an allocation would cross the
+  // budget. A fallback nothing has ever taken is a fallback nobody has checked;
+  // `--budget=200` is small enough to take it and large enough to fold.
+  const budgetMiB = Number(option(args, "budget", "0"));
+  if (budgetMiB > 0) setMemoryBudget(device, budgetMiB * 1024 * 1024);
+  // ...and the arm without residency at all, which is what a device that
+  // refused it once gets for the rest of its life. It is the control for
+  // `--budget`: without it, a failure under a budget cannot be told apart from
+  // a failure the resident weights caused.
+  if (args.includes("--no-resident")) noteResidencyRefused(device);
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
   const family = option(args, "family", "monomer");
   if (family !== "monomer" && family !== "multimer") {
@@ -160,6 +173,13 @@ export async function main(device, args) {
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES[family].directory, await loadManifest(family));
+  // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
+  // because a bench that reads four blocks should not pull the whole manifest -
+  // but this tool loads a whole model, so a run without it measures a download
+  // pattern no user has: shards arrive as tensors are asked for, which leaves
+  // most of the connection idle most of the time. Measured on the ESMFold2
+  // tool, which had the same hole: a fold 2.25 s -> 1.75.
+  store.prefetch();
   const fixture = AlphaFoldFixture.fromStore(store);
   const loadStart = performance.now();
   // ...the same split web/model.js makes: multimer's embedder runs its template
@@ -224,6 +244,38 @@ export async function main(device, args) {
       paeBreaks, undefined, onProgress,
     );
   const elapsed = Math.round(performance.now() - started);
+  // 🔴 FOLD IT AGAIN, REUSING NOTHING, WHICH IS WHAT A PAGE DOES. The first
+  // fold in a process is mostly pipeline compilation and first touch - at 59
+  // residues it is 1.14 s of which 0.95 is warm-up - so a single number cannot
+  // price weight residency at all, and residency is what a second fold gets.
+  // Every repeat is held to the FIRST fold's atoms: same input, same seed, same
+  // structure, or the residency returned something else and the clock would
+  // have called that a win.
+  const repeat = Number(option(args, "repeat", "1"));
+  const repeats = [];
+  const checksumOf = (atoms) => {
+    let sum = 0;
+    for (let i = 0; i < atoms.length; i += 1) sum = (sum + Math.round(atoms[i] * 1000)) | 0;
+    return sum;
+  };
+  const firstChecksum = checksumOf(prediction.final.structure.atom37);
+  for (let again = 1; again < repeat; again += 1) {
+    const at = performance.now();
+    const other = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+      .predictA3m(
+        a3m, weights, featureTables,
+        { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows,
+          chainLengths: chains, ...regime },
+        paeBreaks, undefined, undefined,
+      );
+    const checksum = checksumOf(other.final.structure.atom37);
+    repeats.push({ milliseconds: Math.round(performance.now() - at), checksum,
+                   sameFold: checksum === firstChecksum });
+    if (checksum !== firstChecksum) {
+      throw new Error(`fold ${again + 1} returned checksum ${checksum} where the first`
+        + ` returned ${firstChecksum}; the same input at the same seed must fold the same`);
+    }
+  }
   const final = prediction.final;
   const length = sequence.length;
   const atom37 = final.structure.atom37;
@@ -280,7 +332,8 @@ export async function main(device, args) {
   return {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
     family, chains, length, rows, extraRows, recycles, seed,
-    weightLoadMs: loadMs, elapsedMilliseconds: elapsed,
+    weightLoadMs: loadMs, elapsedMilliseconds: elapsed, repeats,
+    packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
     // say which tensor to attack. See src/runtime/device-memory.js.
     deviceMemory: trimMemory(memorySnapshot(device)),
