@@ -18,17 +18,54 @@ It serves the repo over HTTP, drives headless Chrome, and calls the module's
 `export async function main(device, args)`. Whatever `main` returns is printed
 as JSON. Anything under `tools/gpu/` is written to that shape.
 
-🔴 **`npm run test:gpu` DOES NOT WORK ON THIS MACHINE AND NEVER HAS.** The Dawn
-node binding fails to load - *"built for macOS 26.0 which is newer than running
-OS"* - so every `test/*.gpu.test.js` is unrunnable locally. That is the whole
-reason `tools/gpu-chrome.mjs` exists. `npm test` (the CPU suite) does run, and
-must pass.
+🔴 **`npm run test:gpu` NEEDS A DAWN BUILT FOR THIS GLIBC, AND THE SHIPPED ONE
+IS NOT.** `webgpu@0.6.0`'s `linux-x64` binary wants `GLIBC_2.38`; this box has
+2.35, so `import("webgpu")` throws and every `test/*.gpu.test.js` was
+unrunnable. That is the whole reason `tools/gpu-chrome.mjs` exists - and it is
+NOT the reason the note here used to give, which was a macOS message from the
+other machine.
 
-🔴 **AND ONE `.gpu.test.js` NAMES A FIXTURE THAT IS NOT IN THE REPOSITORY.**
-`test/evoformer-attention.gpu.test.js` wants
-`test/fixtures/evoformer/model1-query-59-block0`, which does not exist; only
-`model1-query-59-stack` does. So checking an attention change against official
-values means the whole-stack checker, not that file.
+**`webgpu@0.4.0`'s Linux binary wants only `GLIBC_2.34` and loads here**, on the
+real adapter: `nvidia / ampere / nvidia-a100-sxm4-40gb`, with
+`chromium-experimental-subgroup-matrix` and four matrix configurations.
+
+```
+npm i webgpu@0.4.0 --no-save     # not the pin: macOS wants 0.6.0
+XDG_RUNTIME_DIR=/tmp/xdg npm run test:gpu
+```
+
+🔴 **AND ITS ADAPTER HAS NO `shader-f16`, WHERE CHROME'S DOES.** That is where
+this file's old claim that neither machine has the feature came from - it was
+measured through Dawn. Chrome on this same card reports `shader-f16` on both the
+adapter and the device, and the fold uses it: the f16 paths run here and always
+have. Two suites skip their f16 arms under Dawn and must be run through
+`tools/gpu-chrome.mjs` instead.
+
+`npm test` (the CPU suite) does run, and must pass.
+
+🔴 **AND IT NEEDS `--js-float16array` ON A NODE THAT LACKS `Float16Array`.**
+Twelve tests did not FAIL on node 22, they never RAN - `ReferenceError:
+Float16Array is not defined` out of `float16.test.js`, `int5-tensor.test.js` and
+their neighbours, reported as twelve known failures for long enough to become
+folklore. V8 has the type behind a flag, and with it the suite is **971 pass, 0
+fail**. `npm test` asks for the flag only when this node lacks the type and its
+V8 lists the flag, so a node that already ships it and a node too old to know it
+both run unchanged. Do not polyfill it: `float16.test.js` exists to check this
+repository's conversion against the platform's own.
+
+🔴 **AND MOST OF THAT SUITE NAMES FIXTURES THAT ARE NOT IN THE REPOSITORY.**
+Run for the first time on this box: 42 tests, 3 pass, 25 fail. **24 of the 25
+are `ENOENT`** - `test/fixtures/evoformer/model1-query-59-block0` and
+`model1-a3m-59-stack` are absent whole, and ten `*_haiku_*.f32.bin` weights are
+missing from the `model1-query-59-stack` that IS present. So checking an
+attention change against official values still means the whole-stack checker,
+not `test/evoformer-attention.gpu.test.js`. Two more failures are the missing
+`shader-f16` above.
+
+🔴 **THE TWENTY-FIFTH WAS A REAL KERNEL BUG, NINE MONTHS OLD AND NEVER RUN.**
+See the triangle rows below: `TriangleMultiplicationOutgoing` missed its
+OpenFold reference by 8.26e-2 against a 1e-5 bound while three AlphaFold
+fixtures passed, because the fixture is **cZ 7 and every shipped width is even**.
 
 ## The tools, by what they answer
 
@@ -114,6 +151,8 @@ values means the whole-stack checker, not that file.
 | Does AF2-multimer's template term match its reference? | `tools/gpu/check-multimer-template.js` |
 | ...and AF2-MONOMER's? | `tools/gpu/check-monomer-template.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
+| **Does the triangle multiplication match a reference that is NOT AlphaFold's?** | `tools/gpu/check-triangle.js` - OpenFold's recorded output at cZ 7, and this repository's own CPU path. It is the Chrome-lane twin of `test/triangle-multiplication-outgoing.gpu.test.js` and it is the ONLY independent reference this kernel has. 🔴 It was failing at 8.26e-2 against 1e-5 and is not in any gate list, so nothing ran it - on this branch and at `c881283` alike |
+| ...and at which WIDTHS? | `tools/gpu/check-triangle-shapes.js` - the sweep that named it. Every ODD `cZ` was wrong and every even one right: the staged LayerNorm stores in PAIRS and took `count / 2u` words a row, so at cZ 7 it wrote three where the projection read four, dropping the last channel AND aligning every row one channel early. `CZ_STRIDE`/`CH_STRIDE` are the rounded-up row stride now, the tail guard is emitted only where the count is odd, and the two normalised buffers are sized to it |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` (raise `--iterations` on anything faster than an M2) |
 | ...and is its VECTOR ceiling real, or dead lanes? | `tools/gpu/probe-alu-lanes.js` |
 | Which per-device kernel knobs does THIS device want? | `tools/gpu/probe-tuning.js` |

@@ -6,7 +6,8 @@
   "description": "Differentially tested WebGPU kernels for AlphaFold 2 inference",
   "//": "Nothing here is required to run the demo or the CPU tests - see README. This file exists for `type: module` and for the two optional lanes below, which genuinely need packages: headless GPU tests (Dawn) and browser tests (Playwright).",
   "scripts": {
-    "test": "node --test --test-concurrency=1 $(ls test/*.test.js | grep -v '\\.gpu\\.')",
+    "//test": "--js-float16array is asked for ONLY when this node lacks Float16Array and its V8 lists the flag, so a node that already ships the type and a node too old to know the flag both run unchanged. Without it twelve tests do not fail, they never RUN - see CLAUDE.md.",
+    "test": "node $(node --v8-options 2>/dev/null | grep -qe '--js-float16array' && node -e 'process.exit(typeof Float16Array === \"undefined\" ? 0 : 1)' && echo --js-float16array) --test --test-concurrency=1 $(ls test/*.test.js | grep -v '\\.gpu\\.')",
     "test:gpu": "LOCALFOLD_GPU_TESTS=1 node --test --test-concurrency=1 test/*.gpu.test.js",
     "test:browser": "playwright test",
     "serve": "python3 -m http.server 4173",
