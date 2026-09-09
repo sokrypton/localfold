@@ -717,6 +717,81 @@ way half precision was. A caller has to declare that its operand IS a plain
 array with a known stride. That is the reason this stops at a measurement.
 
 
+## What would go the other way, and the seven things that would not
+
+The section above is what was taken FROM `martin-steinegger/alphafold2-webgpu`.
+This is the reverse question, asked after the A100 work took AF2 from 150 s to
+15.7 at 825 residues: which of those gains is something they do not have? Read
+from their source at the divergence point, checked one by one.
+
+🔴 **SEVEN OF THEM ARE THINGS THEY ALREADY DO, AND THAT IS THE FINDING.** The
+AF2 campaign's headline numbers were mostly this port recovering from its own
+regressions, not passing theirs:
+
+| what this port gained | their source |
+|---|---|
+| the PAE softmax taken twice, 1.19 -> 0.51 s | their production path reduces PAE and pTM on the GPU in one pass; the double softmax is only their non-reduced fallback |
+| the pair bias read once per head, 15.4 -> 2.4 ms | `createAttentionPairBiasShader` accumulates every head from ONE read of the pair row |
+| a folded grid a shader ignored, which collapsed every fold past ~500 residues | their bias shader is `id.x + id.y * GRID_WIDTH * 64u` - correct |
+| the running output in registers, not workgroup memory | theirs is in registers (`out_${j}`) |
+| the two-lane row reduction by `subgroupShuffleXor(v, 1u)` | they have it, at lines 404 and 411 |
+| the outer product mean through a general tiled GEMM | that is their architecture: one calibrated GEMM serves every dense projection |
+| releasing scratch when it dies rather than at the end | `releaseScratch` in `evoformer/execution-scratch.ts` |
+
+🔴 **AND THEIR KEY TILE WAS SWEPT, WITH OUR LESSON ALREADY IN IT.** `KEY_TILE`
+is 32 and the comment above it records one, two, three and four units measured
+**in the stack** - 51.0 -> 47.5 ms at 800 residues, 69.6 and 70.4 past the
+occupancy cliff - and ends "Measure this against the stack, not against a
+standalone dispatch", which is docs/A100.md's own rule reached independently. It
+even records that an earlier note said the opposite on a microbenchmark whose
+tensors fit in L2.
+
+### What is left, and it is measurements of THEIR port rather than kernels
+
+🔴 **THEIR COLD START IS 0.92 TO 4.10 SECONDS AND GROWS WITH THE SHAPE; THIS
+PORT'S IS 0.394 TO 0.527 AND IS FLAT.** Over the twelve shapes in docs/AF2.md's
+grid - 59 to 825 residues, two alignment depths, a 22x range of work - cold
+minus warm:
+
+| | smallest | largest |
+|---|---:|---:|
+| LocalFold | 0.394 s | 0.527 |
+| alphafold2-webgpu | 0.920 | 4.100 |
+
+At 256 residues and a shallow alignment that is **3.33x on the number a user
+folding one sequence actually experiences**. It is worth telling them because
+their own harness cannot see it: `bench/bench825.js` reports the MINIMUM OF THE
+LAST TWO of three passes, so the cold pass is measured and then discarded. The
+likely cost is what buys them their warm figure - `planMonomerDevice` sizing
+limits from the shape, the `fitScratchBudgetScale` search, and a wider set of
+specialised pipelines to compile.
+
+🔴 **AND BELOW 256 RESIDUES THEIR FOLD DOES NOT NOTICE THE ALIGNMENT.** Going
+from 128 clustered / 256 extra to 512 / 1024 at the same length:
+
+| | 59 | 128 | 256 | 400 | 600 | 825 |
+|---|---:|---:|---:|---:|---:|---:|
+| ours | 1.05 | **1.50** | 2.10 | 1.86 | 1.67 | 1.54 |
+| theirs | 1.01 | **1.03** | 1.73 | 1.85 | 1.65 | 1.60 |
+
+From 256 up the two agree within 8%, so the extra-MSA stack costs them what it
+costs us. At 128 residues four times the rows costs this port 1.50x and theirs
+1.03x - their short fold is still dominated by something that does not scale
+with depth. Same cause as the row above, from another angle.
+
+🔴 **AND ONE AXIS OF THEIR MATRIX FLASH ATTENTION IS UNSWEPT.** `SUBGROUPS = 2`
+is a module constant; the sweep in the comment varies the KEY tile at that fixed
+value. This port swept both and 4x32 beat 2x32 by 341.0 -> 324.6 ms on an
+825-residue block, with the five geometries ranking exactly by workgroup bytes a
+lane. Their kernel holds more in workgroup memory than this one does - the three
+row statistics are still arrays there, about 6 bytes a lane - so their optimum
+need not be ours, and on an L40S it need not be either. It is one cheap
+experiment with a method already written down.
+
+**Nothing here is code.** The trees diverged on 2026-08-30, theirs is
+TypeScript, and the two findings worth passing on are measurements of their own
+port that their harness structurally hides.
+
 ## The atom stack was sized by the padded grid, and it was mostly padding
 
 🔴 **`subsets` COUNTED (token, slot) CELLS WHERE THE AXIS IT INDEXES IS THE
