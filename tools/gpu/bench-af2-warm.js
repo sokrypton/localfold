@@ -18,6 +18,16 @@
  * read off against each other at either temperature. Everything else is
  * `fold-af2.js`: the same synthetic alignment, which is character-for-character
  * the one their harness builds.
+ *
+ * 🔴 `--passes` MEANS SOMETHING ELSE IN THEIR HARNESS, AND THE MISTAKE IS A
+ * SILENT 3x AGAINST THEM. Here it is the number of TIMED REPETITIONS: three,
+ * one cold and two warm. In `bench/bench825.js` the repetition count is
+ * hardcoded at three and `--passes` is read as `recycles: passes - 1` - the
+ * number of TRUNK PASSES INSIDE ONE PREDICTION. So `--passes=3` on both sides
+ * times the same three repetitions here and three RECYCLES there, and their
+ * 59-residue figure goes 1.24 s to 3.65 while ours does not move. Run theirs
+ * with no `--passes` at all, which is 0 recycles and the three repetitions its
+ * loop always does; that is what this tool's default matches.
  */
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";

@@ -893,35 +893,75 @@ way their `bench825.js` does, times `predict` alone with the features built
 outside the clock as theirs does, and builds the character-for-character
 identical synthetic alignment. Both on this A100, one trunk pass, no recycles:
 
+🔴 **AND `--passes` MEANS THE OPPOSITE THING IN THE TWO HARNESSES, WHICH IS A
+SILENT 3x AGAINST THEM.** Here it is the number of TIMED REPETITIONS. In
+`bench/bench825.js` the repetition count is hardcoded at three and `--passes` is
+read as `recycles: passes - 1` - trunk passes INSIDE one prediction. So
+`--passes=3` on both sides times three repeats here and three RECYCLES there,
+and their 59-residue figure goes 1.24 s to 3.65 while this one does not move.
+It cost an hour of looking for a machine fault that was not there: the clocks
+were locked, nothing else held the GPU, and the number was still 3x its
+recorded value. Run theirs with no `--passes` at all.
+
+The full grid, both ports at three repetitions and zero recycles:
+
 | | ours warm | theirs warm | | ours cold | theirs cold | |
 |---|---:|---:|---:|---:|---:|---:|
 | **128 clustered / 256 extra** | | | | | | |
-| 59 residues | **0.587** | 1.220 | **2.08x** | **1.104** | 2.680 | **2.43x** |
-| 128 | **0.674** | 1.270 | **1.88x** | **1.177** | 3.850 | **3.27x** |
-| 256 | **1.085** | 1.270 | **1.17x** | **1.504** | 3.650 | **2.43x** |
-| 512 | 3.715 | **3.520** | 0.95x | **4.171** | 7.770 | **1.86x** |
+| 59 residues | **0.631** | 1.24 | **1.97x** | **1.065** | 2.42 | **2.27x** |
+| 128 | **0.661** | 1.22 | **1.85x** | **1.158** | 3.54 | **3.06x** |
+| 256 | **1.087** | 1.31 | **1.21x** | **1.591** | 5.30 | **3.33x** |
+| 400 | 2.389 | 2.38 | 1.00x | **2.813** | 3.70 | **1.32x** |
+| 600 | 5.016 | 5.07 | 1.01x | **5.475** | 9.17 | **1.67x** |
+| 825 | 9.556 | **9.20** | 0.96x | 10.083 | 10.14 | 1.01x |
 | **512 clustered / 1024 extra** | | | | | | |
-| 59 residues | **0.675** | 1.270 | **1.88x** | **1.131** | 2.510 | **2.22x** |
-| 200 | 1.707 | 1.700 | 1.00x | **2.152** | 4.890 | **2.27x** |
-| 400 | 4.422 | 4.390 | 0.99x | **4.809** | 5.620 | **1.17x** |
-| 825 | 14.682 | 14.690 | 1.00x | **15.192** | 18.790 | **1.24x** |
+| 59 residues | **0.662** | 1.25 | **1.89x** | **1.088** | 2.17 | **1.99x** |
+| 128 | **0.992** | 1.26 | **1.27x** | **1.398** | 2.21 | **1.58x** |
+| 256 | 2.278 | 2.26 | 0.99x | **2.688** | 3.61 | **1.34x** |
+| 400 | 4.435 | 4.40 | 0.99x | **4.829** | 6.49 | **1.34x** |
+| 600 | 8.399 | 8.38 | 1.00x | **8.831** | 9.62 | 1.09x |
+| 825 | 14.688 | 14.71 | 1.00x | **15.155** | 15.96 | 1.05x |
 
 🔴 **THE ADVANTAGE IS AT SHORT LENGTHS AND IN COLD START, AND IT IS NOT SMALL.**
-Warm, this port is **1.9x-2.1x** up to 128 residues, 1.17x at 256, and level
-from 200 upwards - at 825 the two are 14.682 against 14.690, which is inside a
-single run's noise. Cold, this port is ahead at **every length measured**, from
-1.17x to 3.27x.
+Warm, this port is **1.85x-1.97x** to 128 residues, 1.21x-1.27x at 256, and
+level from 400 up - at 825 with a full alignment the two are 14.688 against
+14.71, inside a single run's noise. The one shape where they lead is **825 with
+a SHALLOW alignment**, 9.20 against 9.556, and that is the one place their
+whole-tensor f16 packing has the most to work with and the fewest MSA rows to
+lose accuracy on. Cold, this port is ahead at every length and depth measured,
+from 1.01x to 3.33x.
+
+🔴 **AND THE TWO PORTS PRICE THE ALIGNMENT DIFFERENTLY.** What the deeper
+alignment costs, as the ratio of 512/1024 to 128/256 at the same length:
+
+| | 59 | 128 | 256 | 400 | 600 | 825 |
+|---|---:|---:|---:|---:|---:|---:|
+| ours | 1.05 | **1.50** | **2.10** | 1.86 | 1.67 | 1.54 |
+| theirs | 1.01 | **1.03** | 1.73 | 1.85 | 1.65 | 1.60 |
+
+From 256 up the two agree to within 8%, which says the extra-MSA stack costs
+both of them the same. Below that they do not: at 128 residues four times the
+rows costs this port 1.50x and theirs 1.03x. Their fold at that size is still
+dominated by something that does not scale with depth, and ours is not - which
+is the same fixed cost the cold column shows, seen from the other side.
+
+**And the length scaling is nowhere near the exponent the kernels have.** Ours
+at 512/1024, normalised to 59 residues: 1.5x at 128, 3.4x at 256, 6.7x at 400,
+12.7x at 600, 22.2x at 825 - against 195x for L^2 and 2734x for L^3. A trunk
+pass is quadratic in the pair track and cubic in the triangle, and at these
+lengths it is still mostly neither: the fixed cost per pass dominates to about
+256 residues and the growth only approaches L^2 past 600.
 
 🔴 **AND THE REASON IS A FIXED COST THEY PAY AND THIS DOES NOT.** Cold minus
-warm, across those eight shapes:
+warm, across all twelve shapes:
 
 | | smallest | largest |
 |---|---:|---:|
-| LocalFold | 0.387 s | 0.517 |
-| alphafold2-webgpu | 1.230 | 4.250 |
+| LocalFold | 0.394 s | 0.527 |
+| alphafold2-webgpu | 0.920 | 4.100 |
 
-Theirs is one to four seconds and GROWS with the shape; ours is about half a
-second and flat. That is what a `planMonomerDevice` that sizes limits from the
+Theirs is one to four seconds and GROWS with the shape; ours is 0.394 to 0.527
+and is flat in both length and depth - a 22x range of work either side of it. That is what a `planMonomerDevice` that sizes limits from the
 shape, a `fitScratchBudgetScale` search, and a wider set of specialised
 pipelines cost on the first pass - the same machinery docs/AF2.md credits for
 their warm 825 number, priced on the other side. **For a user folding one
