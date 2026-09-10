@@ -724,6 +724,20 @@ const PRIORS = new Map([
   // outer product mean's contraction is the one kernel whose shape suits them
   // at that size.
   ["metal-3", {
+    // 🔴 THE CAPABILITY LAYER'S ANSWER IS WRONG ON 8x8 UNITS, AND A PRIOR IS
+    // WHERE THAT GETS SAID. `matrixCapabilityTuning` turns this on for any
+    // device announcing subgroup matrices with an f16 configuration, which is
+    // true of this M2 - and AF2's q/k/v/gate projection on 8x8 units is a LOSS
+    // here where it is 1.53x on the A100's 16x16. Measured on a 59-residue
+    // fold, two rounds, the block stack: 1.37/1.38 s with it against 1.19/1.18
+    // without, and it is the WHOLE of the capability layer's cost on this part
+    // - `matrixLinear` and `stagedMatrixPrefetch` move neither the time nor the
+    // checksum at this shape, so neither is named here.
+    //
+    // It also changes the arithmetic, which is how it was isolated: on it the
+    // fold is -1876396 and pLDDT 57.249, off it -1848346 and 57.213, which is
+    // this repository's answer before the capability layer existed.
+    attentionProjectMatrix: false,
     // 🔴 SWEPT IN SITU WITH tools/gpu/profile-af2-block.js --sweep, WHICH
     // INTERLEAVES ITS ARMS - this machine drifts up to 3.2x between runs and a
     // sweep is exactly the shape that hides it. Block milliseconds, false
