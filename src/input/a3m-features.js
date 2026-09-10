@@ -1,6 +1,7 @@
 import { parseA3m } from "./a3m.js";
 import { makeQueryOnlyFeatures } from "./query-only-features.js";
 import { assignNearestCentres } from "./nearest-centres-webgpu.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 
 /**
  * @typedef {object} A3mFeatureOptions
@@ -400,3 +401,29 @@ function writeGapSegment(msaFeatures, row, offset, span, width) {
   }
 }
 
+
+/**
+ * The features, by whichever route is cheaper for THIS alignment.
+ *
+ * 🔴 ONE PLACE, BECAUSE THE SEAM HAS TWO CALLERS. src/model/monomer.js and
+ * src/multimer/model.js both chose between the two paths with the same
+ * expression, and this file's own history is what says not to leave a rule in
+ * two homes - see the allow-list that went stale at exactly this seam and took
+ * the contact overlay off the shipped page with it.
+ *
+ * The device path is flat in alignment depth and the host path is linear, so
+ * below `deviceFeaturisationMinBytes` the dispatch costs more than the search;
+ * see that knob for the table. Both return the same features.
+ *
+ * 🔴 `options.hostFeaturisation` STILL FORCES THE HOST, and still means what it
+ * meant: the control arm for a differential, not a fallback. A device that
+ * cannot run the kernel raises - this routes on SIZE, and never on failure.
+ */
+export async function makeA3mFeaturesFor(device, a3mText, tables, options = {}) {
+  const minBytes = deviceTuning(device).deviceFeaturisationMinBytes;
+  const small = typeof minBytes === "number"
+    && typeof a3mText === "string" && a3mText.length < minBytes;
+  return options.hostFeaturisation === true || small
+    ? makeA3mFeatures(a3mText, tables, options)
+    : await makeA3mFeaturesOnDevice(device, a3mText, tables, options);
+}

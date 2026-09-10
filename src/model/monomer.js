@@ -13,7 +13,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "./recycle-convergence.js";
 
-import { makeA3mFeatures, makeA3mFeaturesOnDevice } from "../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../input/a3m-features.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult
@@ -55,9 +55,8 @@ export class AlphaFoldMonomerGpu {
     // is serial with the fold, so it is main-thread time the GPU sits out.
     // `options.hostFeaturisation` is the control arm, not a fallback: a device
     // that cannot run the kernel raises rather than quietly reverting.
-    const features = options.hostFeaturisation === true
-      ? makeA3mFeatures(a3mText, featureTables, options)
-      : await makeA3mFeaturesOnDevice(this.device, a3mText, featureTables, options);
+    const features = await makeA3mFeaturesFor(
+      this.device, a3mText, featureTables, options);
     const featureMilliseconds = performance.now() - featureStart;
     // 🔴 FORWARD THE WHOLE OPTIONS OBJECT, for the reason src/multimer/model.js
     // gives at the same seam and this one had to learn separately. The

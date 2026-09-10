@@ -101,6 +101,29 @@ export const DEFAULT_TUNING = Object.freeze({
   // `profileDevice` sets it false, because one pass a dispatch is the only
   // shape profile.js can attribute; the profiled number is the slower one.
   batchComputePasses: true,
+  // 🔴 THE ALIGNMENT SIZE AT WHICH THE NEAREST-CENTRE SEARCH IS WORTH A
+  // DISPATCH, in bytes of a3m text - which is rows x length to within the
+  // headers, and costs nothing to ask where counting the rows would cost a
+  // parse. The device path is FLAT and the host path is LINEAR in depth, so
+  // this is a crossover and not a preference. Measured on an M2 at 59
+  // residues, the `features` phase of a fold:
+  //
+  //     rows    device    host
+  //      128    0.060 s   0.010 s
+  //      512    0.080     0.020
+  //     1024    0.080     0.050
+  //     2048    0.040     0.140
+  //
+  // - host by 50 ms at the shipped default and device by 100 ms at 2048, which
+  // puts the crossover near 100,000 cells. That agrees with the other datum
+  // there is: src/model/monomer.js records the device path saving 640 ms of
+  // 1072 at 825 residues, and 825 x 128 is 105,600 - the same side of the line.
+  // Both paths return the SAME features, checksum for checksum at every size
+  // measured, so this only ever chooses what it costs.
+  //
+  // null routes everything to the device, which is what this branch did before
+  // the rule existed.
+  deviceFeaturisationMinBytes: 100000,
   // 🔴 A DEVICE PACK THAT REFUSES STOPS THE FOLD, unless this says otherwise.
   // The alternative is what it used to do: fall back to packing on the host,
   // which is correct, silent, and 300 ms slower - a bug with no symptom but a

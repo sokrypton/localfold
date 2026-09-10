@@ -22,7 +22,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "../model/recycle-convergence.js";
 
-import { makeA3mFeatures, makeA3mFeaturesOnDevice } from "../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
 import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
 
@@ -68,9 +68,8 @@ export class AlphaFoldUnifiedGpu {
     // is added; the extra feature-building keys predict() does not read are
     // harmless.
     // The nearest-centre search on the device; see the monomer's note.
-    const features = options.hostFeaturisation === true
-      ? makeA3mFeatures(a3mText, featureTables, options)
-      : await makeA3mFeaturesOnDevice(this.device, a3mText, featureTables, options);
+    const features = await makeA3mFeaturesFor(
+      this.device, a3mText, featureTables, options);
     return this.predict(features, weights, paeBreaks, onRecycle, onProgress, options);
   }
   /**
