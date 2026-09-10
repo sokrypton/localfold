@@ -183,6 +183,21 @@ try {
     console.log("[gpu-chrome] answering as a device of "
       + occupancyArg.slice("--occupancy=".length) + " workgroups");
   }
+  // 🔴 --tune-json IS HOW AN OBJECT-VALUED KNOB IS REACHED AT ALL. Each tool's
+  // own --tune splits its argument on commas, so a knob whose value is an
+  // object or a list - matrixLinear, diffusionSplitK, atomRowTile,
+  // diffusionTokenTile, trianglePairProjectTile - could not be written on a
+  // command line and was therefore never in any arm. matrixLinear being one of
+  // them is exactly how its missing off position survived: the audit that would
+  // have caught it could not express the knob. One JSON object, parsed whole.
+  //     --tune-json={"matrixLinear":false}
+  const tuneJson = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--tune-json="));
+  if (tuneJson !== undefined) {
+    const { setDeviceTuning } = await import("/src/runtime/device-profile.js");
+    const patch = JSON.parse(tuneJson.slice("--tune-json=".length));
+    setDeviceTuning(device, patch);
+    console.log("[gpu-chrome] tuning patched with " + JSON.stringify(patch));
+  }
   const f16Arg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--f16="));
   if (f16Arg !== undefined) {
     const { setHalfPrecision } = await import("/src/runtime/device-profile.js");

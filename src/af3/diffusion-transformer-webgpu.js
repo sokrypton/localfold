@@ -47,6 +47,7 @@ import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
 import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 /**
  * How much a schedule may hold in cached pair attention biases.
  *
@@ -2324,7 +2325,7 @@ export class Af3DiffusionTransformerGpu {
     // pipeline creation rather than running slowly. `fits` is the same helper
     // the other tiles use.
     const wantedGateTile = weights.gateTile
-      ?? deviceTuning(this.device).diffusionGateTile ?? 8;
+      ?? shapedKnob(deviceTuning(this.device).diffusionGateTile) ?? 8;
     const gateTileRoom = fits(condChannels);
     const gateTile = Math.max(1, Math.min(wantedGateTile, gateTileRoom >= 4
       ? gateTileRoom - (gateTileRoom % 4) : (gateTileRoom >= 2 ? 2 : 1)));
@@ -2360,7 +2361,7 @@ export class Af3DiffusionTransformerGpu {
                     // A bigger chunk is fewer staging barriers AND more lanes in
                     // the key dot loop, against fewer workgroups resident.
                     attendKeyChunk: weights.attendKeyChunk
-                      ?? deviceTuning(this.device).diffusionAttendKeyChunk ?? undefined,
+                      ?? shapedKnob(deviceTuning(this.device).diffusionAttendKeyChunk),
                     attendStageKeys: weights.attendStageKeys
                       ?? deviceTuning(this.device).diffusionAttendStageKeys ?? undefined,
                     factor: weights.transitionFactor,
@@ -2368,7 +2369,7 @@ export class Af3DiffusionTransformerGpu {
                     // 256 is another number chosen on a device with a handful of
                     // cores. It sets the output split (range / lanes) and so the
                     // workgroup count, which is what has been binding all day.
-                    lanes: weights.lanes ?? deviceTuning(this.device).diffusionLanes ?? undefined,
+                    lanes: weights.lanes ?? shapedKnob(deviceTuning(this.device).diffusionLanes),
                     tile, splits, outTile, outChunk, weightPrecision, kSplits, qkvgTile,
                     wideTile, outKSplits, attnKSplits, normKSplits, batchedGates, gateTile,
                     attnOutTile, channelChunk: weights.channelChunk };

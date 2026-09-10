@@ -8,6 +8,7 @@ import {
 import { concatenateAs, writeInto } from "../runtime/float16.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 
 const ceilDivide = (value, divisor) => Math.ceil(value / divisor);
 const GRID_WIDTH = 32_768;
@@ -189,7 +190,7 @@ export function chooseMatrixLinear({ inner, columns, device }) {
     // transition contracts a CHANNEL COUNT, so narrowing its results is the
     // occupancy trade docs/A100.md prices and not the overflow the outer
     // product mean's contraction hits. See stagedMatrixResult.
-    result: deviceTuning(device).stagedMatrixResult ?? config.resultComponentType,
+    result: shapedKnob(deviceTuning(device).stagedMatrixResult) ?? config.resultComponentType,
     directWeights: deviceTuning(device).stagedMatrixDirectWeights === true,
     prefetch: deviceTuning(device).stagedMatrixPrefetch === true,
     matrixElement: config.componentType,

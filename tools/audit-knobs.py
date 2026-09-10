@@ -48,9 +48,31 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # own blind spot rather than a finding, so they are named here instead.
 PRECISIONS = ("opmContractPrecision", "stagedMatrixResult", "opmMatrixOutput")
 
+# 🔴 THE KNOBS `--tune` CANNOT EXPRESS, AND WHAT TO TRY INSTEAD. A tile is a
+# string with no comma and could always have been written; the tool simply had
+# no way to GUESS a second value for it, which is a different failure and left
+# four knobs unaudited. An object-valued knob genuinely could not be written -
+# --tune splits on commas - and those go through --tune-json, added to
+# gpu-chrome.mjs for exactly this. matrixLinear was in that second group, which
+# is how its missing off position survived an audit that could not name it.
+NAMED = {
+    "attentionMatrixTile": ["2x32", "4x16"],
+    "gridAttendMatrixTile": ["2x16", "4x16"],
+    "stagedMatrixBlock": ["128x128x32x2x4", "64x128x32x1x8"],
+    "halfPrecision": [False],
+    "matrixLinear": [False],
+    "trianglePairProjectTile": [False],
+    "atomRowTile": [{"below": 4, "atOrAbove": 8, "crossover": 3000}],
+    "diffusionTokenTile": [{"below": 2, "atOrAbove": 2, "crossover": 175}],
+    "diffusionSplitK": [{"splits": 8, "tile": 4, "crossover": 512, "outSplits": 4,
+                         "attnSplits": 4, "attnTile": 2, "normSplits": 4}],
+}
+
 
 def alternatives(name, value):
     """Values worth trying for a knob currently resolved to `value`."""
+    if name in NAMED:
+        return [v for v in NAMED[name] if v != value]
     if name in PRECISIONS and not isinstance(value, bool):
         return ["f16", "f32"] if name != "opmMatrixOutput" else [not bool(value)]
     if isinstance(value, bool):
@@ -70,7 +92,11 @@ def run(tool, extra, tune):
     args = ["node", "tools/gpu-chrome.mjs", "tools/gpu/probe-compiles.js", "--tool=" + tool]
     args += [a for a in extra if a]
     if tune is not None:
-        args.append("--tune=" + tune)
+        # An object or a boolean-for-an-object goes through --tune-json, which
+        # is parsed whole; everything else through the tool's own --tune.
+        name, _, value = tune.partition("=")
+        args.append(f"--tune-json={json.dumps({name: json.loads(value)})}"
+                    if name in NAMED else "--tune=" + tune)
     done = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=1800)
     text = "\n".join(l for l in done.stdout.split("\n") if not l.startswith("[gpu-chrome]"))
     at = text.find("\n{")

@@ -38,6 +38,7 @@ import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 
 /**
  * Which labels in a caller's `staticCache` already hold their contents.
@@ -1347,7 +1348,7 @@ export class Af3AtomEncoderGpu {
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
       perBlockPair, keyMaskedAtomAttention: keyMasked,
-      atomRowTile: deviceTuning(this.device).atomRowTile ?? undefined,
+      atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);

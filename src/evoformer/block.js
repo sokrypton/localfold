@@ -77,6 +77,7 @@ import {
 import { packWeights as packTriangleWeights, trianglePackOrder }
   from "../triangle/weights.js";
 import { shaderSourceSet } from "../runtime/shader-source-cache.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 
 const GLOBAL_ATTENTION_COMMON = `
 struct Parameters {
@@ -1019,7 +1020,7 @@ async function encodeTriangleMultiplication(
   // was taking src/triangle/shaders.js's default on every device while the
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
-  const projectTile = deviceTuning(execution.device).trianglePairProjectTile ?? undefined;
+  const projectTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
   // 🔴 SEVEN SOURCES, TWICE, ONCE A BLOCK A RECYCLE. `encodeTriangleMultiplication`
   // runs twice a block and 48 blocks a recycle, and regenerated every one of
   // these strings each time for a pipeline that already existed. The shape, the

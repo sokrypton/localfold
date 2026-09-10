@@ -15,7 +15,7 @@
  * The five pair updates are shared with the pairformer stack; see
  * src/af3/pair-track-gpu.js.
  */
-import { deviceTuning } from "../runtime/device-profile.js";
+import { deviceTuning, shapedKnob } from "../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
@@ -112,7 +112,7 @@ export class Af3MsaStackGpu {
       + `:${dialect.swapTransposedBias}`;
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
-      triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
+      triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       attendMatrix: resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,

@@ -1042,6 +1042,27 @@ export function deviceProfile(device) {
   return profile;
 }
 
+/**
+ * A knob's value where `false` means "unset", for a knob that takes a SHAPE.
+ *
+ * 🔴 `?? undefined` DOES NOT TREAT `false` AS OFF, AND THAT HAS BITTEN TWICE.
+ * `matrixLinear: false` fell straight through into the matrix path, so every
+ * arm ever measured with that knob off was measured ON; and
+ * `trianglePairProjectTile: false` reaches the tile resolver as a boolean,
+ * where `false.rows` is undefined and AF2 dies with "projectTile
+ * undefinedxundefined is not a multiple of the 8x8 workgroup" - an error that
+ * names the symptom and not the cause. Both were found by
+ * tools/audit-knobs.py, which could not express either knob until --tune-json
+ * existed.
+ *
+ * A knob whose value is a tile, an object or a count has no meaningful `false`,
+ * so this reads it as "nobody set one". A BOOLEAN knob is the opposite -
+ * `attentionMatrix: false` means do not use the matrix kernel - and must not go
+ * through here.
+ */
+export const shapedKnob = (value) =>
+  (value === false || value === null ? undefined : value);
+
 /** Shorthand, because every caller wants one knob and not the object. */
 export const deviceTuning = (device) => deviceProfile(device).tuning;
 
