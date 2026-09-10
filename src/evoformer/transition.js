@@ -160,7 +160,13 @@ export function chooseMatrixLinear({ inner, columns, device }) {
   // matrix units". An M2 reports f32 and f16 configs at 8x8x8 and would
   // otherwise be switched onto a kernel whose block was sized for 16x16x16.
   const wanted = deviceTuning(device).matrixLinear;
-  if (wanted === null || wanted === undefined) return null;
+  // 🔴 `false` IS AN ANSWER AND IT MEANT "YES". This tested only null and
+  // undefined, so a prior or a --tune saying `matrixLinear: false` fell
+  // straight through into the matrix path - and `false.subgroupRows` is
+  // undefined rather than an error, so the geometry below was built from the
+  // defaults and the kernel ran. The knob had no off position, which is worse
+  // than having no knob: every arm measured with it "off" was measured on.
+  if (wanted === null || wanted === undefined || wanted === false) return null;
   // 🔴 AND THE BLOCK IS DERIVED FROM THE TILE, NOT WRITTEN DOWN. Eight
   // accumulators a subgroup is what saturates the units - 308.6 TFLOP/s at 8
   // against 310.9 at 32, tools/gpu/probe-matrix-ceiling.js - and more than that

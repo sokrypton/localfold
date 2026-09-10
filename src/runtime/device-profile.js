@@ -761,6 +761,19 @@ const PRIORS = new Map([
     // fold is -1876396 and pLDDT 57.249, off it -1848346 and 57.213, which is
     // this repository's answer before the capability layer existed.
     attentionProjectMatrix: false,
+    // 🔴 AND THE TRANSITION'S PROJECTIONS FOR THE SAME REASON. The capability
+    // layer turns `matrixLinear` on for any device announcing an f16 matrix
+    // configuration, and src/evoformer/transition.js then DERIVES the block
+    // from this part's 8x8x8 tile rather than assuming 16x16x16 - so it runs,
+    // correctly, and slower. It is the whole of AF2's regression on this M2:
+    // warm folds 1198-1226 ms with it against 1124-1133 without, which is what
+    // this repository folded before the capability layer existed, at the same
+    // checksum -1848346.
+    //
+    // It took seven wrong hypotheses to find because the knob had no OFF: the
+    // gate tested only null and undefined, so every arm measured with
+    // `matrixLinear=false` was measured with it ON. Fixed at that gate too.
+    matrixLinear: false,
     // 🔴 SWEPT IN SITU WITH tools/gpu/profile-af2-block.js --sweep, WHICH
     // INTERLEAVES ITS ARMS - this machine drifts up to 3.2x between runs and a
     // sweep is exactly the shape that hides it. Block milliseconds, false
