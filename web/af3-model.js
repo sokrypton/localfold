@@ -162,6 +162,20 @@ const weightsPromises = new Map();
  * weights on purpose: `warmTrunkPipelines` compiles against a shapes-only
  * stand-in and never reads a value.
  */
+/**
+ * Where a page's weight load goes, by phase.
+ *
+ * 🔴 A RETURNING VISITOR PAYS 2.8 s BEFORE THE FOLD'S CLOCK STARTS, AND
+ * NOTHING SAID WHAT OF. `fold-in-page.py --keep-profile` measures OpenDDE at
+ * 5.86 s whole against a status line of 3 s, and `--timeline` reports
+ * `model: null` - no shard touched the wire, so none of that gap is download.
+ * The fold tools cannot see it either: their `weightSeconds` is one number over
+ * the whole load, taken against a local server that is not a disk cache.
+ *
+ * Read from the page by `fold-in-page.py`, which prints it as `weightPhases`.
+ */
+export const af3LoadMilliseconds = {};
+
 const storeGates = new Map();
 
 function storeGate(family) {
@@ -203,8 +217,22 @@ export function loadAf3Weights(onProgress, family = "af3") {
   let promise = weightsPromises.get(family);
   if (promise === undefined) {
     promise = (async () => {
+      const started = performance.now();
+      let mark = started;
+      /** Time one awaited phase, by name. */
+      const after = async (name, run) => {
+        const value = await run();
+        af3LoadMilliseconds[name] = Math.round(performance.now() - mark);
+        mark = performance.now();
+        return value;
+      };
+      const phase = (name) => {
+        af3LoadMilliseconds[name] = Math.round(performance.now() - mark);
+        mark = performance.now();
+      };
       const store = await HttpTensorStore.fromManifest(
         bundleBaseUrl(family), await loadManifest(family), onProgress);
+      phase("open");
       // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
       // and await each one - so without this the network runs one shard at a time
       // and idles through every dequantisation. See HttpTensorStore.prefetch.
@@ -214,6 +242,7 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // shards still arriving. See warmAf3Pipelines.
       storeGate(family).resolve(store);
       const trunk = await trunkWeights(store, 48, 4);
+      phase("trunk");
       // 🔴 OpenDDE HAS TWO STACKS THE OTHER TWO DO NOT, AND LACKS ONE THEY
       // HAVE. It re-tokenises between the trunk and the diffusion, so it needs
       // the structural-token expander and the four-block refiner; and its
@@ -222,22 +251,26 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // one. The fold returns no pLDDT and no PAE, which the page already
       // handles for EF2-fast.
       const structural = trunk.dialect.structuralTokens;
-      return {
+      const built = {
         trunk,
-        diffusion: await diffusionWeights(store),
+        diffusion: await after("diffusion", () => diffusionWeights(store)),
         // 🔴 AlphaFold 3's HEAD, WHERE THERE IS ONE. OpenDDE's is a different
         // parametrisation entirely and loads through openddeConfidenceWeights
         // below; `confidenceWeights` REFUSES this bundle rather than loading a
         // partial one.
-        confidence: structural ? undefined : await confidenceWeights(store),
-        atomReference: await atomReference(store),
-        targetFeat: await targetFeatureWeights(store),
+        confidence: structural ? undefined
+          : await after("confidence", () => confidenceWeights(store)),
+        atomReference: await after("atomReference", () => atomReference(store)),
+        targetFeat: await after("targetFeat", () => targetFeatureWeights(store)),
         ...(structural ? {
-          expander: await structuralExpanderWeights(store),
-          refiner: await structuralRefinerWeights(store),
-          openddeConfidence: await openddeConfidenceWeights(store),
+          expander: await after("expander", () => structuralExpanderWeights(store)),
+          refiner: await after("refiner", () => structuralRefinerWeights(store)),
+          openddeConfidence:
+            await after("openddeConfidence", () => openddeConfidenceWeights(store)),
         } : {}),
       };
+      af3LoadMilliseconds.total = Math.round(performance.now() - started);
+      return built;
     })();
     weightsPromises.set(family, promise);
   }

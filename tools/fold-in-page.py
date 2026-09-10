@@ -535,6 +535,18 @@ def main():
         # the click for --timeline, so the same stamp gives the fold's own wall.
         print("elapsedMs:", cdp.evaluate(ws,
             "Math.round(performance.now() - (window.__foldClickedAt || 0))"))
+        # 🔴 WHERE THE WEIGHT LOAD WENT, which on a RETURNING visit is the whole
+        # gap between the click and the fold's own clock - 2.8 s of an OpenDDE
+        # page with no shard on the wire. See af3LoadMilliseconds.
+        print("weightPhases:", cdp.evaluate(ws, """(async () => {
+          try {
+            const m = await import('/web/af3-model.js');
+            const s = await import('/src/reference/http-tensor-store.js');
+            const d = s.tensorDecodeStats || {};
+            return JSON.stringify({ ...(m.af3LoadMilliseconds || {}),
+              hostDecodeMs: Math.round(d.ms || 0), hostDecodeCalls: d.calls || 0 });
+          } catch (error) { return 'unavailable: ' + error.message; }
+        })()""", await_promise=True))
         if args.dev_report:
             # 🔴 THROUGH THE BUTTON, NOT THE MODULE. The panel is built the
             # first time it is opened, so calling devReport() directly would

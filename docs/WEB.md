@@ -998,6 +998,34 @@ impression and it is not what a returning user waits for. The weight download
 does not get cheaper in the same proportion, which leaves it the dominant term
 in both cases and puts bundle SIZE where docs/HOSTING.md already says it is.
 
+### And where the load itself goes, which is one phase
+
+`af3LoadMilliseconds` times each half of `loadAf3Weights`, read back by
+`fold-in-page.py` as `weightPhases`. OpenDDE:
+
+| phase | first visit | returning |
+|---|---:|---:|
+| open the store | 9 ms | 9 |
+| **trunk** | **1780** | **747** |
+| diffusion | 25 | 24 |
+| the structural expander | 63 | 62 |
+| atomReference, targetFeat, refiner, confidence | 8 | 8 |
+| **total** | **1884** | **849** |
+| ...of which host tensor decode | - | **95** (138 calls) |
+
+The whole load is the trunk phase, and on a returning visit it is 747 ms of
+which only 95 is decoding: the other ~650 is moving 472 MiB out of Chrome's
+disk cache and onto the GPU, which is about 725 MB/s and close to what that
+path can do. `--timeline` reports `model: null` on that visit, so none of it is
+network.
+
+🔴 **SO A RETURNING VISITOR'S LOAD IS ALREADY NEAR ITS FLOOR, AND THE FLOOR IS
+THE BYTE COUNT.** 472 MiB costs 650 ms even from local disk. Nothing in the
+decode path is worth attacking - 95 ms - and the download is already cached.
+The only thing that moves this number is a smaller bundle, which is where
+docs/HOSTING.md already points and which needs the float32 exports and a
+re-publish.
+
 Two things this does NOT say. It is one browser on one machine, and a shader
 cache is a heuristic with an eviction policy nobody here controls. And
 `--keep-profile` must never become the default for a checker: the whole reason
