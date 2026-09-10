@@ -1406,3 +1406,47 @@ checksum from 195329 to 199057 - a wrong answer that still looks like a
 histogram. `~(((x & 0x7f7f7f7f) + 0x7f7f7f7f) | x) & 0x80808080` has no borrow
 between bytes.
 
+## The outer product mean's working set was an M2's, and it costs 2% at 825
+
+🔴 **THE PRIORS WERE SWEPT AT 400 RESIDUES AND BELOW, AND ONE OF THEM MOVES.**
+A block at 825 residues and 512 sequences is 192.81 ms and the four flash
+attentions are 35.8% of it - already on the matrix units, and `attentionMatrix`'s
+tile is confirmed right there too (4x32 gives 199.66 ms against 2x32's 206.14,
+4x16's 205.98 and 6x16's 214.81). The outer product mean is the next family at
+16.3%, and its WORKING SET was not swept at this length.
+
+`opmPairBlockBytes` decides how many pairs the fast path holds at once. It is
+not a limit - the path runs at every length whatever it says - so it trades
+dispatch count against occupancy, which is a length question. Swept in situ,
+block milliseconds and `opm.contract`:
+
+| MiB | block | contract | | MiB | block | contract |
+|---:|---:|---:|---|---:|---:|---:|
+| 32 | 211.20 | 24.809 | | 256 | **195.43** | **17.972** |
+| 64 (shipped) | 199.81 | 19.436 | | 512 | 194.01 | 17.527 |
+| 128 | 198.25 | 18.571 | | 1024 | 193.53 | 17.196 |
+
+**256 is the knee.** 64 -> 256 is 2.2% of a whole block and 1.08x on the
+contraction; 256 -> 1024 buys 1.9 ms more for four times the memory.
+
+In a fold at 825 residues, 512 clusters and 1024 extras, two pairs alternating:
+
+| | main stack | whole fold | peak |
+|---|---:|---:|---:|
+| 64 MiB | 9.53 / 9.53 s | 12220 / 12236 ms | 6610.1 MiB |
+| **256 MiB** | **9.36 / 9.36** | **12048 / 12039** | 6803.4 |
+
+**180 ms for 193 MiB**, which is the working set exactly as predicted and 0.5%
+of this card. At 59 residues it is inert - 966/947 ms against 971/952, repeat
+415/421 against 416/417 - because the whole pair tensor is smaller than either
+value there.
+
+🔴 **AND IT REORDERS NO SUM, so there is no accuracy question to ask.** The fold
+checksum is -67537339 and pLDDT 25.628 on both arms; check-opm-paths.js holds
+the blocked arm to relRMS EXACTLY 0 because a pair's contraction is untouched
+and only where it lands in the intermediate moves.
+
+Two knobs swept at the same shape that do NOT move, recorded so nobody sweeps
+them again: `attentionMatrixTile` (above) and `opmProjectOutputPairs`, which is
+9.153 / 9.170 / 9.155 / 9.157 ms at 1, 2, 4 and 8 - flat to the third digit,
+because the matrix output projection does not read it.

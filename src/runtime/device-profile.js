@@ -719,6 +719,23 @@ const PRIORS = new Map([
     // ...and the outer product mean's contraction, which is the biggest kernel
     // in an AF2 block and the deepest K in the model. See opmMatrixContract.
     opmMatrixContract: true,
+    // 🔴 THE OUTER PRODUCT MEAN'S WORKING SET, RAISED FROM THE SHIPPED 64 MiB.
+    // It is a working set and not a limit - the path runs at every length
+    // whatever this says, and the number only decides how many blocks it takes
+    // - so a card with room should hold more pairs at once and dispatch fewer
+    // times. Swept in situ at 825 residues and 512 sequences, which is where
+    // the blocking actually bites, block milliseconds and `opm.contract`:
+    //
+    //    32 MiB  211.20  24.809      256 MiB  195.43  17.972
+    //    64      199.81  19.436      512      194.01  17.527
+    //   128      198.25  18.571     1024      193.53  17.196
+    //
+    // 256 is the knee: 64 -> 256 is 2.2% of a whole block and 1.08x on the
+    // contraction, and 256 -> 1024 buys 1.9 ms more for four times the memory.
+    // 🔴 AND IT REORDERS NO SUM, so this is free of any accuracy question:
+    // check-opm-paths.js holds the blocked arm to relRMS EXACTLY 0 because a
+    // pair's contraction is untouched and only where it lands moves.
+    opmPairBlockBytes: 256 * 1024 * 1024,
     // 🔴 FOUR PAIRS AN OUTPUT WORKGROUP, AGAINST THE M2'S TWO. The kernel is
     // bound by a weight read every pair in the workgroup shares, and what
     // limits P is workgroup storage: 4 KiB a pair against 32 KiB on an M2 and
