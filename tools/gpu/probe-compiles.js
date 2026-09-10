@@ -28,7 +28,11 @@ const option = (args, name, fallback) => {
 
 export function instrumentCompiles(device) {
   const intervals = [];
-  const modules = { count: 0, ms: 0, bytes: 0 };
+  // 🔴 AND WHETHER THE SAME WGSL IS COMPILED TWICE. One module is made per
+  // pipeline, and two cache keys that happen to generate identical source pay
+  // for it twice - which nothing measured, because the source memo added in
+  // this branch keys on the pipeline key and so cannot see across keys.
+  const modules = { count: 0, ms: 0, bytes: 0, sizes: [], hashes: new Map() };
   const sync = { count: 0, ms: 0 };
   const makeModule = device.createShaderModule.bind(device);
   device.createShaderModule = (descriptor) => {
@@ -36,6 +40,15 @@ export function instrumentCompiles(device) {
     const built = makeModule(descriptor);
     modules.count += 1;
     modules.ms += performance.now() - at;
+    const code = typeof descriptor.code === "string" ? descriptor.code : "";
+    // A cheap content hash; a collision here would only merge two rows of a
+    // diagnostic, never change a shader.
+    let hash = 2166136261;
+    for (let at2 = 0; at2 < code.length; at2 += 1) {
+      hash = Math.imul(hash ^ code.charCodeAt(at2), 16777619);
+    }
+    modules.hashes.set(hash, (modules.hashes.get(hash) ?? 0) + 1);
+    modules.sizes.push([descriptor.label ?? "?", code.length]);
     // 🔴 HOW MUCH WGSL THIS FOLD WROTE. Generating a shader's SOURCE is host
     // work on the critical path and no profiler here can see it: it happens in
     // a template literal before `createShaderModule` is called. The byte count
@@ -215,6 +228,7 @@ export async function main(device, args) {
     // that were used. `wastedSourceMiB` is what was generated for a pipeline
     // that already existed.
     pipelineCache: { hits: pipelineCacheStats.hits, misses: pipelineCacheStats.misses,
+                     shared: pipelineCacheStats.shared,
                      wastedSourceMiB:
                        Math.round(pipelineCacheStats.hitSourceBytes / 1048576 * 10) / 10,
                      byKey: [...pipelineCacheStats.byKey.entries()]
@@ -229,6 +243,12 @@ export async function main(device, args) {
                         builtMiB: Math.round(shaderSourceStats.bytes / 1048576 * 100) / 100,
                         reusedMiB: Math.round(shaderSourceStats.hitBytes / 1048576 * 10) / 10 },
     shaderModules: instrument.modules.count,
+    // Distinct WGSL texts against modules made: the gap is source compiled twice.
+    distinctSources: instrument.modules.hashes.size,
+    duplicateModules: instrument.modules.count - instrument.modules.hashes.size,
+    largestSources: instrument.modules.sizes
+      .sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([label, bytes]) => [String(label).slice(0, 58), bytes]),
     shaderModuleMs: Math.round(instrument.modules.ms * 10) / 10,
     shaderSourceMiB: Math.round(instrument.modules.bytes / 1048576 * 100) / 100,
     synchronousPipelines: instrument.sync.count,

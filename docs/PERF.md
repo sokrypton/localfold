@@ -1080,3 +1080,58 @@ moving 0.035 and peak memory 465.4 -> 464.8 MiB.
 and this repository's own `attentionQueriesPerLane` spread - M2 0.21x, M4 Pro
 0.45x, GB10 1.17-1.42x - is the standing warning that the badge does not predict
 the number. Re-sweep before trusting it on another Apple part.
+
+## Two cache keys, one shader: 29% of a first fold's pipelines were duplicates
+
+🔴 **269 PIPELINES, 191 DISTINCT SHADERS.** `probe-compiles.js` reports
+`distinctSources` now - the number of unique WGSL texts against the number of
+modules made - and OpenDDE's first fold compiled 78 kernels it had already
+compiled under a different cache key. Every model does it:
+
+| | pipelines before | after | shared |
+|---|---:|---:|---:|
+| OpenDDE | 269 | **191** | 78 (29%) |
+| AlphaFold 3 | 223 | **156** | 67 (30%) |
+| AF2 monomer | 96 | **73** | 23 (24%) |
+| ESMFold2 | 95 | **82** | 13 (14%) |
+
+The keys differ for good reasons - they carry a token count, a direction, a
+geometry, a precision - and two different shapes can still generate
+character-for-character the same kernel. Nothing had ever compared the SOURCES,
+only the keys.
+
+`ComputePipelineCache` keeps a second index by `entryPoint + source` and hands
+back the pipeline it already built. Alternating arms, three pairs, OpenDDE at
+16 steps:
+
+| | shared | plain |
+|---|---:|---:|
+| whole fold | 2404 / 2403 / 2382 ms | 2540 / 2552 / 2603 |
+
+**~160 ms, and every pair separates.** pLDDT 92.0505 and peak 1823.9 MiB in all
+six. On the page, cold: monomer 3418 -> **3141 ms**, AF3 4896 -> 4823, OpenDDE's
+status line crosses from "in 4 s" to "in 3 s".
+
+🔴 **THE SPAN MOVES LESS THAN THE WORK, WHICH IS WHAT A SATURATED POOL LOOKS
+LIKE.** `sumMs` falls 45.0 s to 33.2 and `busyMs` only 1765 ms to 1522: removing
+29% of the compiles shortens the union of their intervals by 14%, because the
+pool was never idle. That is also why this shows up in the FOLD's time rather
+than only in the compile's - the work removed was competing with everything else
+the host was doing.
+
+🔴 **THE SOURCE IS THE KEY, NOT A HASH OF IT.** A hash collision here would hand
+a caller somebody else's kernel; the texts are already retained by the source
+memo, so keying on them costs nothing new. And it is safe only because the
+layout is `auto` and therefore derived from the source: two pipelines built from
+identical WGSL with the same entry point have the same bind group layouts by
+construction. The label differs and is cosmetic - profile.js times labelled
+compute PASSES, not pipelines.
+
+Where the duplicates come from is worth knowing before trying to remove them at
+the source: OpenDDE runs its pairformer at TWO token counts, 68 residues and 130
+structural tokens, and `af3-block` is 111 of the 269 with 86% of the compile
+work. Many of those kernels do not actually depend on the token count, so they
+generate the same text under two keys. Deduplicating them here is a cure for the
+symptom that costs nothing; making the key honest would be a cure for the cause,
+and would need each kernel checked for whether the count is a loop bound - which
+docs/AF2.md prices at 4.3x when it becomes a runtime one.
