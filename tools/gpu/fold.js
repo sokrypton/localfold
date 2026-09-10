@@ -479,6 +479,18 @@ export async function main(device, args) {
   // taken before the conditioning hoist and the per-kernel tiles existed, and
   // above it EVERY split disengages at once.
   const crossover = option(args, "crossover", null);
+  // 🔴 AND THE WHOLE RULE AS JSON, because the two knobs that carry most of it
+  // - `splits` and `tile` - had no flag at all, and the patch below needs a
+  // rule to already exist so `--no-prior` could not reach any of them. Pricing
+  // what a device with no prior is missing needs exactly that combination.
+  //     --split-k='{"splits":16,"tile":4,"crossover":512,"outSplits":4,
+  //                 "attnSplits":4,"attnTile":2,"normSplits":4}'
+  //     --split-k=off
+  const splitKArg = option(args, "split-k", null);
+  if (splitKArg !== null) {
+    setDeviceTuning(device, { diffusionSplitK:
+      splitKArg === "off" ? null : JSON.parse(splitKArg) });
+  }
   if (attnSplits !== null || normSplits !== null
       || attnTile !== null || outTileArg !== null || crossover !== null) {
     const rule = deviceTuning(device).diffusionSplitK;

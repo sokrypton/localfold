@@ -18,6 +18,8 @@
 import { blockUploadStats } from "../../src/runtime/quantised-upload.js";
 import { residentPackStats } from "../../src/runtime/resident.js";
 import { tensorDecodeStats } from "../../src/reference/http-tensor-store.js";
+import { pipelineCacheStats } from "../../src/runtime/pipeline-cache.js";
+import { shaderSourceStats } from "../../src/runtime/shader-source-cache.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -208,6 +210,24 @@ export async function main(device, args) {
     hostDecode: { calls: tensorDecodeStats.calls,
                   ms: Math.round(tensorDecodeStats.ms),
                   megaElements: Math.round(tensorDecodeStats.elements / 1e6 * 10) / 10 },
+    // 🔴 THE SOURCE A CACHE HIT THREW AWAY, which is the half `shaderSourceMiB`
+    // cannot see: it counts what reached `createShaderModule`, i.e. the sources
+    // that were used. `wastedSourceMiB` is what was generated for a pipeline
+    // that already existed.
+    pipelineCache: { hits: pipelineCacheStats.hits, misses: pipelineCacheStats.misses,
+                     wastedSourceMiB:
+                       Math.round(pipelineCacheStats.hitSourceBytes / 1048576 * 10) / 10,
+                     byKey: [...pipelineCacheStats.byKey.entries()]
+                       .map(([key, row]) => ({ key, hits: row.hits,
+                         mib: Math.round(row.bytes / 1048576 * 10) / 10 }))
+                       .sort((a, b) => b.mib - a.mib).slice(0, 40) },
+    // What the memo actually generated, and what it cost. `misses` is the
+    // number of sources built; `hits` is the number of times a fold asked for
+    // one it already had.
+    shaderGeneration: { built: shaderSourceStats.misses, reused: shaderSourceStats.hits,
+                        ms: Math.round(shaderSourceStats.ms),
+                        builtMiB: Math.round(shaderSourceStats.bytes / 1048576 * 100) / 100,
+                        reusedMiB: Math.round(shaderSourceStats.hitBytes / 1048576 * 10) / 10 },
     shaderModules: instrument.modules.count,
     shaderModuleMs: Math.round(instrument.modules.ms * 10) / 10,
     shaderSourceMiB: Math.round(instrument.modules.bytes / 1048576 * 100) / 100,

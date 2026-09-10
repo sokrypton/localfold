@@ -48,6 +48,8 @@ import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../../src/multimer/model.js";
+import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
+import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -128,6 +130,17 @@ export async function main(device, args) {
   // `--budget`: without it, a failure under a budget cannot be told apart from
   // a failure the resident weights caused.
   if (args.includes("--no-resident")) noteResidencyRefused(device);
+  // 🔴 THE GATE FOR THE SHADER SOURCE MEMO. Memoising a generated source by its
+  // pipeline key makes ComputePipelineCache's collision check compare a string
+  // with itself, so the check that a key names everything its source depends on
+  // moves into the memo - and a check nothing runs is not a check. This flag
+  // rebuilds every source on every hit and throws where the two differ, which
+  // is the whole-fold version of test/shader-source-cache.test.js.
+  if (args.includes("--verify-sources")) setShaderSourceVerification(true);
+  // 🔴 THE CONTROL ARM FOR THE DEVICE FEATURISATION, and the way its answer is
+  // checked end to end: the nearest-centre search decides the cluster profile,
+  // so the two arms must agree on the fold's CHECKSUM and not merely finish.
+  const hostFeaturisation = args.includes("--host-features");
   const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
   const family = option(args, "family", "monomer");
   if (family !== "monomer" && family !== "multimer") {
@@ -235,11 +248,12 @@ export async function main(device, args) {
   const onProgress = ({ completed }) => {
     stageMarks.push([performance.now(), completed]);
   };
+  resetFeatureStats();
   const started = performance.now();
   const prediction = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
     .predictA3m(
       a3m, weights, featureTables,
-      { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows,
+      { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
         chainLengths: chains, ...regime },
       paeBreaks, undefined, onProgress,
     );
@@ -264,7 +278,7 @@ export async function main(device, args) {
     const other = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
       .predictA3m(
         a3m, weights, featureTables,
-        { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows,
+        { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
           chainLengths: chains, ...regime },
         paeBreaks, undefined, undefined,
       );
@@ -333,6 +347,9 @@ export async function main(device, args) {
     sequence: sequence.length > 24 ? `${sequence.slice(0, 24)}...(${length})` : sequence,
     family, chains, length, rows, extraRows, recycles, seed,
     weightLoadMs: loadMs, elapsedMilliseconds: elapsed, repeats,
+    // Where "features" in the phase table actually goes; see featureStats.
+    featureMilliseconds: Object.fromEntries(Object.entries(featureStats)
+      .map(([key, value]) => [key, key === "calls" ? value : Math.round(value)])),
     packBy: Object.fromEntries(Object.entries(globalThis.__pk ?? {}).map(([k,v]) => [k, Math.round(v)]).sort((a,b)=>b[1]-a[1])),
     // What the fold left on the device, and in what - the totals alone cannot
     // say which tensor to attack. See src/runtime/device-memory.js.

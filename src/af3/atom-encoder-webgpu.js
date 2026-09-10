@@ -36,6 +36,8 @@ import { deviceTuning } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
+import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
+import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 
 /**
  * Which labels in a caller's `staticCache` already hold their contents.
@@ -513,6 +515,29 @@ ${perBlockPair
  * 16 and 22, tile 8 gives 20 and 26. A real protein has thousands of atoms and
  * wants the larger tile.
  */
+/**
+ * The workgroup target this device's row tiles should aim at.
+ *
+ * 🔴 THE MEASUREMENT MAY ONLY MAKE THE TILE SMALLER, NEVER LARGER, and the
+ * mechanism is why: the rule exists because a WIDE device is left idle by the
+ * shipped 256, so more workgroups - a smaller tile - is what it argues for.
+ * Letting a narrow device raise the target instead picks a BIGGER tile than
+ * ships today, which the mechanism says nothing about.
+ *
+ * That is not hypothetical. Simulated with `--occupancy=16`, the atom tile goes
+ * from the shipped 4 to 8 at 1632 rows, and the whole fold measures 4735 ms
+ * against the default's 6040 - so on THIS hardware the bigger tile is fine. But
+ * that arm is an A100 running a narrow device's CONFIGURATION, not a narrow
+ * device: the simulation validates the choice and cannot validate the outcome.
+ * Clamping to the shipped target makes a narrow device no worse than today by
+ * construction, which is the only guarantee available without one to measure.
+ */
+export function derivedWorkgroupTarget(device) {
+  if (!deviceDerivationsAllowed(device)) return undefined;
+  const measured = deviceSaturationWorkgroups(device);
+  return measured === null ? undefined : Math.max(256, measured);
+}
+
 export function outputRowTileFor(queryRows, target = 256) {
   for (const tile of [8, 4, 2]) {
     if (queryRows / tile >= target) return tile;
@@ -535,9 +560,17 @@ export function createAtomBlockShaders(common, shape) {
   // makes this name tiles rather than a target.
   const queryRows = shape.subsets * shape.queries;
   const rowRule = shape.atomRowTile;
+  // 🔴 AND WHERE NOTHING NAMES A TILE, THE TARGET IS THIS DEVICE'S OWN WIDTH.
+  // The 256 above is an M2's; `workgroupTarget` carries what
+  // src/runtime/occupancy.js measured, so the same rule that picks a tile of
+  // four at 1632 rows for a small card picks ONE for a wide one - which is
+  // exactly what this A100's prior asks for below its crossover, arrived at
+  // from the mechanism rather than from the table. Priced with
+  // `--no-prior=atomRowTile` against the derived baseline: 2858 ms of sampler
+  // to 2433, the largest single piece left once the K split is derived.
   const outputRowTile = shape.outputRowTile
     ?? (rowRule === undefined
-      ? outputRowTileFor(queryRows)
+      ? outputRowTileFor(queryRows, shape.workgroupTarget ?? 256)
       : (queryRows < rowRule.crossover ? rowRule.below : rowRule.atOrAbove));
   const { channels, keys } = shape;
   // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
@@ -1315,6 +1348,7 @@ export class Af3AtomEncoderGpu {
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
       perBlockPair, keyMaskedAtomAttention: keyMasked,
       atomRowTile: deviceTuning(this.device).atomRowTile ?? undefined,
+      workgroupTarget: derivedWorkgroupTarget(this.device),
     };
     const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`

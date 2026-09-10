@@ -140,12 +140,48 @@ try {
   // page's template literal and one would end it, which it just did.
   const priorArg = ${JSON.stringify(moduleArgs)}.find((a) => a === "--no-prior" || a.startsWith("--no-prior="));
   if (priorArg !== undefined) {
-    const { ignoreDevicePrior } = await import("/src/runtime/device-profile.js");
+    const { ignoreDevicePrior, deviceTuning: deviceTuningOf }
+      = await import("/src/runtime/device-profile.js");
     const keep = priorArg.includes("=")
       ? priorArg.slice("--no-prior=".length).split(",").filter(Boolean) : [];
     ignoreDevicePrior(device, keep);
     console.log("[gpu-chrome] device priors ignored"
       + (keep.length === 0 ? "" : ", keeping " + keep.join(" ")));
+    // 🔴 AND AN UNRECOGNISED DEVICE MEASURES ITS OWN WIDTH, which is half of
+    // what this arm is for. requestAlphaFoldDevice starts that only where the
+    // tuning has no diffusion rule, and at the moment it ran this device still
+    // had its prior - so without this the arm would report what an unrecognised
+    // device gets MINUS the measurement it would have made. Awaited, because a
+    // tool folds immediately where a page has a download to hide it behind.
+    if (deviceTuningOf(device).diffusionSplitK === null
+        && !${JSON.stringify(moduleArgs)}.some((a) => a.startsWith("--occupancy="))) {
+      const { measureDeviceOccupancy, deviceOccupancyDetail }
+        = await import("/src/runtime/occupancy.js");
+      const width = await measureDeviceOccupancy(device);
+      console.log("[gpu-chrome] measured saturation: " + width + " workgroups  "
+        + JSON.stringify(deviceOccupancyDetail(device)));
+    }
+  }
+  // --default-tuning strips the CAPABILITY layer as well as the prior, which
+  // is the only way to measure what DEFAULT_TUNING alone is worth now that a
+  // device with matrix units gets them without a prior. --no-prior is the
+  // other question: an unrecognised device with whatever units it has.
+  if (${JSON.stringify(moduleArgs)}.includes("--default-tuning")) {
+    const { ignoreDevicePrior, ignoreDeviceCapabilities }
+      = await import("/src/runtime/device-profile.js");
+    ignoreDevicePrior(device, []);
+    ignoreDeviceCapabilities(device);
+    console.log("[gpu-chrome] prior AND capability tuning ignored");
+  }
+  // 🔴 --occupancy=<n> ANSWERS AS A DEVICE OF THAT WIDTH. The width-driven
+  // derivations are the default for every GPU with no prior, and one machine
+  // can only measure its own; this is how it asks what a narrower one gets.
+  const occupancyArg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--occupancy="));
+  if (occupancyArg !== undefined) {
+    const { setDeviceOccupancy } = await import("/src/runtime/occupancy.js");
+    setDeviceOccupancy(device, Number(occupancyArg.slice("--occupancy=".length)));
+    console.log("[gpu-chrome] answering as a device of "
+      + occupancyArg.slice("--occupancy=".length) + " workgroups");
   }
   const f16Arg = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--f16="));
   if (f16Arg !== undefined) {

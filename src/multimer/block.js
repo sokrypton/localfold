@@ -83,6 +83,7 @@ import {
 } from "../evoformer/block.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../triangle/shaders.js";
+import { shaderSourceSet } from "../runtime/shader-source-cache.js";
 import {
   createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
   createTriangleProjectOutMatrixShaders, triangleContractMatrixDispatch,
@@ -228,8 +229,14 @@ async function encodeTransition(
   // rows: correct, and redundant by the ratio. It measured as a 3.2x regression
   // on the transitions before this line existed. See docs/A100.md.
   const tileRows = linearKernelRows({ tile, matrix });
-  const shaders = createTransitionShaders(
-    descriptor, packedOffsets, tile, precision, weightPrecision, "f32", matrix ?? null);
+  // Generated once per device, not once a block a recycle; see
+  // src/runtime/shader-source-cache.js and the monomer path's note.
+  const shaders = shaderSourceSet(execution.device,
+    `multimer:transition:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`
+    + `:${descriptor.rows}:${descriptor.channels}:${descriptor.hiddenChannels}`
+    + `:${descriptor.epsilon}:${JSON.stringify(packedOffsets)}`,
+    () => createTransitionShaders(
+      descriptor, packedOffsets, tile, precision, weightPrecision, "f32", matrix ?? null));
   // 🔴 THE RESIDUAL SHADER IS THE LAST OF FOUR, NOT OF THREE. createTransitionShaders
   // grew a separate FIRST pass when the hidden activation learned to be packed,
   // and this path still asked for index 2 - which is now the plain second pass.
@@ -374,23 +381,23 @@ async function encodeAttention(
   const [normalize, project, pairProject, outputProject] = await Promise.all([
     execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
     projectMatrixFits
-      ? execution.pipelines.get(
+      ? execution.shaderPipeline(
         `block:attention:project-matrix:${options.channels}:${options.heads}`
         + `:f32f32:${JSON.stringify(projectMatrix)}`,
-        createAttentionProjectMatrixShader(
+        () => createAttentionProjectMatrixShader(
           { channels: options.channels, heads: options.heads },
           { source: "f32", weight: "f32", output: "f32" }, projectMatrix))
       : execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
     // ...the HEAD COUNT is in the key because the shader unrolls it; see
     // createAttentionPairBiasShader.
-    execution.pipelines.get(`block:attention:pair-bias:${options.heads}`,
-      createAttentionPairBiasShader("f32", options.heads)),
+    execution.shaderPipeline(`block:attention:pair-bias:${options.heads}`,
+      () => createAttentionPairBiasShader("f32", options.heads)),
     projectMatrixFits
-      ? execution.pipelines.get(
+      ? execution.shaderPipeline(
         `block:attention:output-matrix:${options.channels}:f32`
         + `:${options.transpose === true}:${options.residualTarget !== undefined}`
         + `:${JSON.stringify(projectMatrix)}`,
-        createAttentionOutputMatrixShader(
+        () => createAttentionOutputMatrixShader(
           { channels: options.channels, transpose: options.transpose === true },
           { source: "f32", weight: "f32" }, projectMatrix,
           options.residualTarget !== undefined))
@@ -713,22 +720,30 @@ async function encodeTriangleMultiplication(
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
   const projectTile = deviceTuning(execution.device).trianglePairProjectTile ?? undefined;
-  const shaders = createTriangleShaders(
-    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile);
+  const sourceKey = `multimer:triangle:${direction}:${JSON.stringify(shape)}`
+    + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
+  const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(
+    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile));
   // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
   // replacement on the finished WGSL; when the kernel's writeback was rewritten
   // the pattern stopped matching, and a replacement that matches nothing throws
   // nothing - the block would have OVERWRITTEN the pair representation instead
   // of adding to it, on the shipped AF2 path only.
-  const residualShaders = createTriangleShaders(
-    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true);
+  const residualShaders = shaderSourceSet(execution.device, `${sourceKey}:residual`,
+    () => createTriangleShaders(
+      shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
   const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
     + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
   const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
-  const outMatrixSources = matrixFits ? createTriangleProjectOutMatrixShaders(
-    { cZ: input.cZ, cHidden: input.triangleHidden },
-    { normalized: "f32", hidden: "f32", gate: "f32", weight: "f32" },
-    triangleMatrix) : null;
+  const outMatrixSources = matrixFits
+    ? shaderSourceSet(execution.device,
+      `multimer:triangle:out-matrix:${input.cZ}:${input.triangleHidden}`
+      + `:${JSON.stringify(triangleMatrix)}`,
+      () => createTriangleProjectOutMatrixShaders(
+        { cZ: input.cZ, cHidden: input.triangleHidden },
+        { normalized: "f32", hidden: "f32", gate: "f32", weight: "f32" },
+        triangleMatrix))
+    : null;
   const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput, projectOutGate]
     = await Promise.all([
       execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),

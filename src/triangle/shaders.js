@@ -13,6 +13,16 @@ function prelude(shape, precision, offsets, epsilon, weightPrecision = precision
 const L: u32 = ${shape.length}u;
 const CZ: u32 = ${shape.cZ}u;
 const CH: u32 = ${shape.cHidden}u;
+// 🔴 THE NORMALISED BUFFERS ARE STORED IN PAIRS, SO THEIR ROW STRIDE ROUNDS UP.
+// A lane owns both channels of a word, which is what lets one shader serve the
+// packed f16 store and the f32 one; an ODD channel count has a half-used last
+// word, and the row stride is the rounded-up count and not the count. Reading
+// them at row * CZ instead cost the OpenFold fixture - cZ 7 - its last
+// channel AND aligned every row one channel early: 8.26e-2 against a 1e-5
+// bound, on a kernel three AlphaFold fixtures at cZ 128 passed. Every shipped
+// width is even, where these are equal and the shader is unchanged.
+const CZ_STRIDE: u32 = ${2 * Math.ceil(shape.cZ / 2)}u;
+const CH_STRIDE: u32 = ${2 * Math.ceil(shape.cHidden / 2)}u;
 const PAIRS: u32 = L * L;
 const LINEAR_GRID_WIDTH: u32 = ${LINEAR_GRID_WIDTH}u;
 // 🔴 THE PROJECTIONS' OWN, BECAUSE IT HAS TO BE FORCEABLE. Exceeding 65535 row
@@ -190,6 +200,7 @@ export function createTriangleShaders(
   // produced by the same dispatch; walking WORDS rather than channels puts
   // them in the same INVOCATION, which is what makes it a store and not a
   // read-modify-write race. See src/runtime/storage.js.
+  const countOf = (axis) => (axis === "CZ" ? shape.cZ : shape.cHidden);
   const stagedLayerNorm = (count, load, scale, offset, sourceMajor = "row",
                            outputStorage = "f32") => `
 var<workgroup> tile: array<f32, ${NORMALIZE_ROWS} * ${shape[count === "CZ" ? "cZ" : "cHidden"]}>;
@@ -260,9 +271,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
   workgroupBarrier();
 
-  // A lane owns a PAIR of channels, so it owns the whole word they share. The
-  // channel count is even in every caller; the pair loop is the assertion.
-  const PAIR_COUNT: u32 = ${count} / 2u;
+  // A lane owns a PAIR of channels, so it owns the whole word they share - and
+  // an ODD count leaves the last word half used rather than dropping it. The
+  // comment here used to say the count was even in every caller and call the
+  // loop the assertion; a WGSL loop asserts nothing, and at cZ 7 this wrote
+  // three words a row where the readers expected four.
+  const PAIR_COUNT: u32 = ${Math.ceil(countOf(count) / 2)}u;
   for (var word = local; word < NORMALIZE_ROWS * PAIR_COUNT; word += 64u) {
     let slot_of = word / PAIR_COUNT;
     let row = base_row + slot_of;
@@ -274,9 +288,14 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     let low = (tile[index] - centre) * scaled
       * ${readWeight(`weights[W_${scale} + channel]`)}
       + ${readWeight(`weights[W_${offset} + channel]`)};
-    let high = (tile[index + 1u] - centre) * scaled
+    // ...and where the count is ODD the last word's high half is past the end,
+    // and contributes nothing - which is what an absent channel is worth. The
+    // guard is emitted ONLY there, so every even width generates the shader it
+    // generated before and pays no select in the normalize loop.
+    let high = ${countOf(count) % 2 === 0 ? "" : "select(0.0, "}(tile[index + 1u] - centre) * scaled
       * ${readWeight(`weights[W_${scale} + channel + 1u]`)}
-      + ${readWeight(`weights[W_${offset} + channel + 1u]`)};
+      + ${readWeight(`weights[W_${offset} + channel + 1u]`)}${
+  countOf(count) % 2 === 0 ? "" : `, channel + 1u < ${count})`};
     let pair_word = row * PAIR_COUNT + (word % PAIR_COUNT);
     ${storedPair(outputStorage, "normalized", "pair_word", "low", "high")}
   }
@@ -443,7 +462,7 @@ fn main(
     ${overRows((r) => `{
         let row = row0 + ${r}u * 8u;
         var value = 0.0;
-        if (row < PAIRS && source_c < CZ) { value = ${storedElement(normalizedStorage, "z", "row * CZ + source_c")}; }
+        if (row < PAIRS && source_c < CZ) { value = ${storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_c")}; }
         ${rowAt("staged", r)} = ${accNarrow("value")};
       }`)}
     tile_source[tile_index] = staged;
@@ -683,8 +702,8 @@ fn main(
         let row = row0 + ${r}u * 8u;
         var x_value = 0.0;
         var z_value = 0.0;
-        if (row < PAIRS && source_k < CH) { x_value = ${storedElement(hiddenStorage, "x", "row * CH + source_k")}; }
-        if (row < PAIRS && source_k < CZ) { z_value = ${storedElement(normalizedStorage, "z", "row * CZ + source_k")}; }
+        if (row < PAIRS && source_k < CH) { x_value = ${storedElement(hiddenStorage, "x", "row * CH_STRIDE + source_k")}; }
+        if (row < PAIRS && source_k < CZ) { z_value = ${storedElement(normalizedStorage, "z", "row * CZ_STRIDE + source_k")}; }
         ${rowAt("staged_x", r)} = ${accNarrow("x_value")};
         ${rowAt("staged_z", r)} = ${accNarrow("z_value")};
       }`)}

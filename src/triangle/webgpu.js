@@ -84,13 +84,16 @@ class TriangleMultiplicationGpu {
       const mask = keep(this.allocator.upload("triangle.mask", input.mask, storage));
       const weights = keep(this.allocator.upload("triangle.weights", packedWeights.data, storage));
       const zNormalized = keep(this.allocator.allocate(
-        "triangle.z-normalized", pairCount * cZ * 4, storage,
+        // 🔴 THE PAIRED STORE ROUNDS THE ROW STRIDE UP; see CZ_STRIDE in
+        // src/triangle/shaders.js. At an odd width this is one channel a row
+        // more than the tensor, and sizing it at cZ truncated the last row.
+        "triangle.z-normalized", pairCount * 2 * Math.ceil(cZ / 2) * 4, storage,
       ));
       const a = keep(this.allocator.allocate("triangle.a", pairCount * cHidden * 4, storage));
       const b = keep(this.allocator.allocate("triangle.b", pairCount * cHidden * 4, storage));
       const contracted = keep(this.allocator.allocate("triangle.contracted", pairCount * cHidden * 4, storage));
       const xNormalized = keep(this.allocator.allocate(
-        "triangle.x-normalized", pairCount * cHidden * 4, storage,
+        "triangle.x-normalized", pairCount * 2 * Math.ceil(cHidden / 2) * 4, storage,
       ));
       const output = keep(this.allocator.allocate(
         "triangle.output", pairCount * cZ * 4, storage | GPUBufferUsage.COPY_SRC,

@@ -17,7 +17,8 @@
 import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
-import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
+import { foldBatch, toPdb, atomName, uniformFrom, warmTrunkPipelines }
+  from "../src/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
   structuralRefinerWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
@@ -145,6 +146,55 @@ const weightsPromises = new Map();
  * manifest and died before asking for a single shard, which is a failure about
  * metadata wearing the costume of a failure about weights.
  */
+/**
+ * The store, as soon as it exists, rather than when its weights are decoded.
+ *
+ * 🔴 THE PAGE NEVER WARMED ITS PIPELINES AND THE TOOL ALWAYS DID. `fold-opendde.js`
+ * starts `warmTrunkPipelines` the moment `prefetch` is running, so the shader
+ * compilation happens while the shards are still arriving; measured with
+ * `--no-warm` beside it, that is 2533 ms against 2839 - about 300 ms. The page
+ * had no equivalent: `loadAf3Weights` resolves only once every tensor is
+ * decoded, so nothing downstream could reach the store while there was still
+ * download to hide behind.
+ *
+ * This resolves at `prefetch` time instead, so a caller can warm against the
+ * store while the weights are still coming down. It is the STORE and not the
+ * weights on purpose: `warmTrunkPipelines` compiles against a shapes-only
+ * stand-in and never reads a value.
+ */
+const storeGates = new Map();
+
+function storeGate(family) {
+  let gate = storeGates.get(family);
+  if (gate === undefined) {
+    let resolve;
+    const promise = new Promise((settle) => { resolve = settle; });
+    gate = { promise, resolve };
+    storeGates.set(family, gate);
+  }
+  return gate;
+}
+
+/**
+ * Compile the trunk's pipelines while the weights are still downloading.
+ *
+ * 🔴 SPECULATIVE BY CONSTRUCTION, AND THE ONLY FAILURE IS WASTE. The stack
+ * still asks the pipeline cache for its own keys, so a token count that turns
+ * out wrong compiles shaders nobody uses and costs nothing else - which is why
+ * this takes the residue count the page knows before featurising rather than
+ * waiting for a batch it cannot have yet. See warmTrunkPipelines.
+ *
+ * Never awaited and never allowed to raise: a warm that fails is a fold that is
+ * merely slower.
+ */
+export function warmAf3Pipelines(family, tokens, device) {
+  if (!AF3_FAMILIES.includes(family)) return Promise.resolve();
+  if (!Number.isSafeInteger(tokens) || tokens < 1) return Promise.resolve();
+  return storeGate(family).promise
+    .then((store) => warmTrunkPipelines(device, store, tokens))
+    .catch(() => {});
+}
+
 export function loadAf3Weights(onProgress, family = "af3") {
   if (!AF3_FAMILIES.includes(family)) {
     throw new Error(`${family} is not an AlphaFold 3-graph family; `
@@ -160,6 +210,9 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // and idles through every dequantisation. See HttpTensorStore.prefetch.
       // This path reads the whole model, so there is nothing to be careful about.
       store.prefetch();
+      // ...and anything waiting to warm against it can start now, with the
+      // shards still arriving. See warmAf3Pipelines.
+      storeGate(family).resolve(store);
       const trunk = await trunkWeights(store, 48, 4);
       // 🔴 OpenDDE HAS TWO STACKS THE OTHER TWO DO NOT, AND LACKS ONE THEY
       // HAVE. It re-tokenises between the trunk and the diffusion, so it needs

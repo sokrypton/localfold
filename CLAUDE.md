@@ -18,17 +18,54 @@ It serves the repo over HTTP, drives headless Chrome, and calls the module's
 `export async function main(device, args)`. Whatever `main` returns is printed
 as JSON. Anything under `tools/gpu/` is written to that shape.
 
-🔴 **`npm run test:gpu` DOES NOT WORK ON THIS MACHINE AND NEVER HAS.** The Dawn
-node binding fails to load - *"built for macOS 26.0 which is newer than running
-OS"* - so every `test/*.gpu.test.js` is unrunnable locally. That is the whole
-reason `tools/gpu-chrome.mjs` exists. `npm test` (the CPU suite) does run, and
-must pass.
+🔴 **`npm run test:gpu` NEEDS A DAWN BUILT FOR THIS GLIBC, AND THE SHIPPED ONE
+IS NOT.** `webgpu@0.6.0`'s `linux-x64` binary wants `GLIBC_2.38`; this box has
+2.35, so `import("webgpu")` throws and every `test/*.gpu.test.js` was
+unrunnable. That is the whole reason `tools/gpu-chrome.mjs` exists - and it is
+NOT the reason the note here used to give, which was a macOS message from the
+other machine.
 
-🔴 **AND ONE `.gpu.test.js` NAMES A FIXTURE THAT IS NOT IN THE REPOSITORY.**
-`test/evoformer-attention.gpu.test.js` wants
-`test/fixtures/evoformer/model1-query-59-block0`, which does not exist; only
-`model1-query-59-stack` does. So checking an attention change against official
-values means the whole-stack checker, not that file.
+**`webgpu@0.4.0`'s Linux binary wants only `GLIBC_2.34` and loads here**, on the
+real adapter: `nvidia / ampere / nvidia-a100-sxm4-40gb`, with
+`chromium-experimental-subgroup-matrix` and four matrix configurations.
+
+```
+npm i webgpu@0.4.0 --no-save     # not the pin: macOS wants 0.6.0
+XDG_RUNTIME_DIR=/tmp/xdg npm run test:gpu
+```
+
+🔴 **AND ITS ADAPTER HAS NO `shader-f16`, WHERE CHROME'S DOES.** That is where
+this file's old claim that neither machine has the feature came from - it was
+measured through Dawn. Chrome on this same card reports `shader-f16` on both the
+adapter and the device, and the fold uses it: the f16 paths run here and always
+have. Two suites skip their f16 arms under Dawn and must be run through
+`tools/gpu-chrome.mjs` instead.
+
+`npm test` (the CPU suite) does run, and must pass.
+
+🔴 **AND IT NEEDS `--js-float16array` ON A NODE THAT LACKS `Float16Array`.**
+Twelve tests did not FAIL on node 22, they never RAN - `ReferenceError:
+Float16Array is not defined` out of `float16.test.js`, `int5-tensor.test.js` and
+their neighbours, reported as twelve known failures for long enough to become
+folklore. V8 has the type behind a flag, and with it the suite is **971 pass, 0
+fail**. `npm test` asks for the flag only when this node lacks the type and its
+V8 lists the flag, so a node that already ships it and a node too old to know it
+both run unchanged. Do not polyfill it: `float16.test.js` exists to check this
+repository's conversion against the platform's own.
+
+🔴 **AND MOST OF THAT SUITE NAMES FIXTURES THAT ARE NOT IN THE REPOSITORY.**
+Run for the first time on this box: 42 tests, 3 pass, 25 fail. **24 of the 25
+are `ENOENT`** - `test/fixtures/evoformer/model1-query-59-block0` and
+`model1-a3m-59-stack` are absent whole, and ten `*_haiku_*.f32.bin` weights are
+missing from the `model1-query-59-stack` that IS present. So checking an
+attention change against official values still means the whole-stack checker,
+not `test/evoformer-attention.gpu.test.js`. Two more failures are the missing
+`shader-f16` above.
+
+🔴 **THE TWENTY-FIFTH WAS A REAL KERNEL BUG, NINE MONTHS OLD AND NEVER RUN.**
+See the triangle rows below: `TriangleMultiplicationOutgoing` missed its
+OpenFold reference by 8.26e-2 against a 1e-5 bound while three AlphaFold
+fixtures passed, because the fixture is **cZ 7 and every shipped width is even**.
 
 ## The tools, by what they answer
 
@@ -53,6 +90,9 @@ values means the whole-stack checker, not that file.
 | Does AF2 still fold the SAME structure? | `tools/gpu/fold-af2.js` - and it FAILS now if the chain is not a chain, which is the gate a collapsed 825-residue fold walked through for a whole campaign |
 | **Does the MULTIMER still fold, and what does a repeat cost?** | `tools/gpu/fold-af2.js --family=multimer --chains=30,29 --repeat=3` - the repeat is the only number that prices weight residency, because a first fold is mostly pipeline compilation (1485 ms against 214 for a repeat), and every repeat is held to the first fold's atom checksum. The bundle is `af2-multimer/` in the registry and needs a manifest.json generated from src/reference/manifests/multimer.js |
 | ...and does forcing an AF2 knob still fold the same one? | `tools/gpu/fold-af2.js --tune=key=value`, the same flag `fold.js` carries. A knob no gate enters is a knob nobody has checked |
+| **Does the device's nearest-centre search agree with the host loop?** | `tools/gpu/check-nearest-centres.js` - bar ZERO differing assignments over seven cases in one submit, because the assignment picks which cluster an extra row joins and so decides the prediction. 🔴 One arm DUPLICATES centres so whole groups tie, since the host keeps the FIRST at an equal score and a join that broke the other way agrees on every random alignment and disagrees on every real one. Two degenerate arms assert centre 0 outright, so the distinctness control cannot pass them by accident. Flipping the tie rule fails six of seven, 512/512 on the duplicate arm |
+| ...and does the FOLD agree, not just the kernel? | `tools/gpu/fold-af2.js --host-features` is the control arm. Same checksum both ways - 26706680 at 825 residues, -1725774 at 59 - which is the only thing that settles it, because the assignment reaches the answer through the cluster profile |
+| Where does preparing an alignment actually go? | `featureMilliseconds` on `fold-af2.js`, from `featureStats` in src/input/a3m-features.js. At 825 residues with 512 clusters, 1024 extras and two recycles: nearest-centre 645 ms of 1072, then the 49-channel block at 204, the cluster profile at 81, and nothing else above 55. The search is 43 ms on the device |
 | Does AF2's distogram head agree with AF2's structure? | `tools/gpu/probe-af2-contacts.js` |
 | Which register tile does AF2's dense projection want? | `tools/gpu/bench-evoformer-linear.js` |
 | What does AF2's column attention cost alone? | `tools/gpu/bench-msa-attention.js` |
@@ -114,10 +154,18 @@ values means the whole-stack checker, not that file.
 | Does AF2-multimer's template term match its reference? | `tools/gpu/check-multimer-template.js` |
 | ...and AF2-MONOMER's? | `tools/gpu/check-monomer-template.js` |
 | Does an AF2 kernel still compute AF2? | `tools/gpu/check-evoformer-{transition,opm,attention}.js`, `check-triangle-residual.js` |
+| **Does the triangle multiplication match a reference that is NOT AlphaFold's?** | `tools/gpu/check-triangle.js` - OpenFold's recorded output at cZ 7, and this repository's own CPU path. It is the Chrome-lane twin of `test/triangle-multiplication-outgoing.gpu.test.js` and it is the ONLY independent reference this kernel has. 🔴 It was failing at 8.26e-2 against 1e-5 and is not in any gate list, so nothing ran it - on this branch and at `c881283` alike |
+| ...and at which WIDTHS? | `tools/gpu/check-triangle-shapes.js` - the sweep that named it. Every ODD `cZ` was wrong and every even one right: the staged LayerNorm stores in PAIRS and took `count / 2u` words a row, so at cZ 7 it wrote three where the projection read four, dropping the last channel AND aligning every row one channel early. `CZ_STRIDE`/`CH_STRIDE` are the rounded-up row stride now, the tail guard is emitted only where the count is odd, and the two normalised buffers are sized to it |
+| **Would the derived tuning be WORSE on a narrower GPU?** | `--occupancy=<n> --no-prior` on any GPU tool answers as a device of that width. Swept on AF3: default 6032 ms, width 16 **5030**, 64 4291, 256 3723, 2048 3446, the real measurement 3365, the prior 3406 - monotone, and no width slower than today. 🔴 It validates the CHOICE and not the OUTCOME: that arm is an A100 running a narrow device's configuration, which is why the atom tile's target is clamped never to fall below the shipped 256 |
+| **How many workgroups does this device run at once?** | `tools/gpu/probe-occupancy.js` - the unknown behind `diffusionSplitK`, `atomRowTile` and `transitionThreadTarget`, which every geometry prior is a hand-estimate of. 4542 workgroups here by the plateau edge and 4432 by the slope past it, ~290,000 lanes. 🔴 Its own two traps: at a short chain every count below 1024 measures the submit round trip and the edge is invisible, and ONE workgroup is not the floor - it is 1.4 ms where 2 through 4542 are all 2.3 |
 | What is this device's actual ceiling? | `tools/gpu/probe-alu.js` (raise `--iterations` on anything faster than an M2) |
 | ...and is its VECTOR ceiling real, or dead lanes? | `tools/gpu/probe-alu-lanes.js` |
 | Which per-device kernel knobs does THIS device want? | `tools/gpu/probe-tuning.js` |
-| What does a GPU with NO prior get? | `--no-prior` on any GPU tool - `PRIORS` has two entries and every other GPU takes `DEFAULT_TUNING`, which costs **1.5x** on AF2 and ESMFold2. Neither machine that runs this repository could measure that without the switch, because both have priors |
+| What does a GPU with NO prior get? | `--no-prior` on any GPU tool - and it means an unrecognised device WITH whatever units it has, since the capability layer below sits under the priors. `--default-tuning` is the older question: neither prior nor capability, which is what DEFAULT_TUNING alone is worth. AF2's warm repeat on this card: **416 ms with the prior, 406 with capability alone, 643 with neither** |
+| ...and WHICH knobs is a prior actually worth? | `--no-prior=<knob>` restores one at a time from the prior. AF2's 218 ms splits `matrixLinear` 95, `attentionMatrix` 51, `attentionProjectMatrix` 39, `attentionGroup` 18, `opmMatrixContract` 12, `stagedMatrixPrefetch` 7, and `linearTallTile`/`triangleProjectMatrix`/`opmProjectOutputPairs` **zero**. Every significant one is "does this device have matrix units", which the API answers - see `matrixCapabilityTuning` |
+| ...and does an unmeasured GPU get AF3's geometry now? | **97% of it.** `sample-start` on an unrecognised device: **4510** with every layer off, then 2784 / 2437 / 2252 / 2129 / **1952** as the K split, atom row tile, batched gate, token tile and weight retention are each derived - against the prior's **1874**, and a whole fold of 3398 ms against 3392. Five mechanisms, no new table: the device's measured WIDTH for the K split, the atom tile and the token tile; its memory BUDGET for the batched gate and for keeping weights between folds. 🔴 `--no-prior` KEEPS the derivations, because measuring is what an unrecognised device does; `--default-tuning` suppresses them, and without that switch the DEFAULT_TUNING arm silently drifted 4525 -> 3765 and was measuring something with no name |
+| ...and how? | `derivedSplitRule` in src/af3/diffusion-transformer-webgpu.js asks the device's measured width whether the unsplit dispatch already fills it, so `crossover` - a token count in the prior - falls out of arithmetic instead. `sample-start` on an unrecognised device: 4500 before, **2784** derived, against the prior's 1877 and 2732 for the prior's own rule forced by hand. `fold.js --split-k=<json>` is how the rule is set by hand; `--no-prior` now measures, because an unrecognised device would |
+| ...and is AF3's the same shape? | **No, and that is the finding.** `fold.js --folds=2 --no-prior=<knob>`: `sample-start` is 1867 ms with the prior and 4517 without, split `diffusionSplitK` 1792, `diffusionTokenTile` 1103, `diffusionBatchedGates` 700, `diffusionNormSplit` 526, `atomRowTile` 316 - tiles and split counts, none of which a capability states. The capability layer is worth 0 on AF3 (6014 ms against 6015) and that is expected |
 | ...and does forcing one still fold the SAME structure? | `tools/gpu/fold.js --tune=key=value` (a knob no gate enters is a knob nobody has checked) |
 | ...and the PER-KERNEL tiles and splits, which `--tune` cannot reach? | `fold.js --attn-tile= --out-tile= --attn-splits= --norm-splits=` (they live inside `diffusionSplitK` and `--tune` splits its argument on commas) |
 | Is a conditioning projection still inside the block loop? | it should not be - see `packZeroGateWeights`, and `--tune=diffusionBatchedGates=false` is the arm without it |
@@ -126,6 +174,7 @@ values means the whole-stack checker, not that file.
 | What does the host-device bus cost, each way? | `tools/gpu/probe-bus.js` (**free on an M2, not on a discrete GPU**) |
 | How fast can this browser read a weight shard at all? | `tools/gpu/probe-shard-read.js --bundle=` - **371 MB/s**, and `arrayBuffer()` and the store's streamed read measure the SAME, so the chunk loop the progress dial needs costs nothing. Python reads the same shards from the same server at 2129 MB/s: the cap is six HTTP/1.1 connections |
 | ...and how much of a first fold is it? | `weightSeconds` on `fold-af2.js`, `fold-esmfold2.js` and `fold-opendde.js` - **the fold's own clock starts after the weights are loaded and a user's does not.** OpenDDE 1.73 s, AF2 0.88, ESMFold2 0.35 |
+| 🔴 ...and are those a USER's seconds? | **No, they are the dev server's, and they are 5-12x optimistic.** Every local timing above reads shards over `tools/serve.py` on loopback. Measured to the real remote from this machine: **one OpenDDE shard at 56 MB/s, all twelve in parallel at 78 MB/s aggregate** - Hugging Face serves HTTP/2, so the six-connection cap does not apply and the constraint is bandwidth, which twelve connections improve by 1.4x and not by twelve. docs/HOSTING.md's own remote measurement is 27.9-30.1 MiB/s. So OpenDDE's 472 MiB is 1.7 s here and about **6 s** over the wire, and a bundle's SIZE matters where its shard COUNT no longer does. One machine's network, one sample - but the direction is not in doubt |
 | What is `grid.attend` alone, without the copies? | `tools/gpu/bench-grid-attend-passes.js` |
 | Where does the HOST memory go? | `tools/gpu/probe-memory.js` |
 | How long does a fold take, by shape? | `tools/gpu/bench-runtime.js` (fits `src/runtime/cost-model.js`) |
@@ -208,6 +257,53 @@ second bundle's widths, which is exactly where a second bundle breaks - see
 docs/OPENDDE.md, where a dispatch sized for 128 against kernels compiled for
 384 left two thirds of every pair row unprocessed and every per-kernel checker
 passing.
+
+## 🔴 THIS BRANCH CHANGES FAR MORE ON AN M2 THAN ON THE A100 - VALIDATE THERE
+
+The capability layer and the five derivations both sit UNDER the priors, so on
+the A100 - whose prior sets thirty knobs - almost nothing they decide is ever
+used, and every number in docs/A100.md for them was taken with `--no-prior`.
+
+**`metal-3`'s prior sets exactly ONE knob**, `opmMatrixContract`, because
+"NOTHING FOR apple ON PURPOSE - its measurements ARE the defaults above". So an
+Apple part is, for every other knob, precisely the unrecognised device these
+layers were built for, and **ten of them newly take effect there**:
+
+| newly set on an M2 | by |
+|---|---|
+| `matrixLinear`, `attentionMatrix`, `attentionProjectMatrix`, `stagedMatrixPrefetch` | the capability layer, from `chromium-experimental-subgroup-matrix` + `shader-f16` + an f16 configuration |
+| `diffusionSplitK`, `atomRowTile`, `diffusionTokenTile` | the measured occupancy width |
+| `diffusionBatchedGates`, `keepTrunkWeights`, `keepSamplerWeights` | the memory budget |
+
+Three things to check there, in this order:
+
+🔴 **MEMORY FIRST, BECAUSE IT IS THE ONE THAT CAN HURT.**
+`keepResidentAffordable` returns true for a device with NO budget, and a tool
+run sets none - so an M2 will now hold ~561 MiB of trunk weights and ~325 MiB
+of sampler weights between folds where it used to release them. That is
+affordable against 40 GB and is a different proposition on a laptop, where this
+file's own warning is that Metal "takes buffers well past the point where macOS
+starts paging". Run `fold.js --budget=0` and read the peak before and after;
+if it pages, the fix is a budget, not a revert - `budgetForDevice()` exists and
+`requestAlphaFoldDevice` takes it.
+
+🔴 **THEN ACCURACY, because four f16 matrix paths turn on at once.** On the
+A100 `attentionProjectMatrix` alone moved mean pLDDT 57.28 -> 57.29 and the
+first alpha carbon 0.13 A. Run the differential gates rather than a fold:
+`check-attention-variants.js`, `check-evoformer-{transition,opm,attention}.js`,
+`check-af3-block-any.js --resident`, `check-triangle.js` - whose f16 arms an M2
+can actually run - and `check-difftx-splits.js`.
+
+🔴 **THEN THE OCCUPANCY PROBE ITSELF, whose failure mode is a plausible small
+number.** It read **4 workgroups** on a card the tool measures at 4542 before it
+grew a warm-up and two rounds. Run `probe-occupancy.js` and check the plateau
+edge and the slope estimate agree - `agrees: true` in its output. If they do
+not, the three width-driven derivations are being fed a wrong number and
+`--default-tuning` is the arm that switches all of this off.
+
+A whole fold is the wrong instrument for any of the three: it mixes them, and
+the M2 should be FASTER overall, which hides an accuracy change and a memory
+one equally well.
 
 ## The traps that repeat
 

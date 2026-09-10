@@ -12,7 +12,8 @@
  * adapter's, not one equal to it.
  */
 import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
-import { recordAdapter } from "./device-profile.js";
+import { recordAdapter, deviceTuning } from "./device-profile.js";
+import { measureDeviceOccupancy } from "./occupancy.js";
 
 const RAISED_LIMITS = [
   // The MSA activations at a large complex: rows x residues x channels x 4.
@@ -84,6 +85,20 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
   // has been given a ceiling, which is this.
   if ("memoryBudgetBytes" in options) {
     setMemoryBudget(device, options.memoryBudgetBytes ?? budgetForDevice());
+  }
+  // 🔴 AND WHERE NO PRIOR SETS THE DIFFUSION GEOMETRY, MEASURE THE ONE NUMBER
+  // IT NEEDS. `diffusionSplitK` is worth 1792 ms of an AF3 sampler on this card
+  // and a GPU nobody has run gets none of it; what cannot be tabled is whether
+  // splitting pays at all, which is "is the unsplit dispatch already as wide as
+  // the device". See src/runtime/occupancy.js and derivedSplitRule.
+  //
+  // 🔴 STARTED, NOT AWAITED, and only where there is nothing better. It is six
+  // dispatches beside a weight download that is seconds long, so it costs
+  // nothing a user sees; in front of one it would cost more than it sets. Every
+  // consumer reads "not measured yet" as "use the default", so a fold that
+  // starts before it finishes is simply the fold that would have run anyway.
+  if (deviceTuning(device).diffusionSplitK === null && options.measureOccupancy !== false) {
+    void measureDeviceOccupancy(device).catch(() => {});
   }
   return device;
 }

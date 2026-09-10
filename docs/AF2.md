@@ -1322,6 +1322,64 @@ different one, and its own sweep prices it at **no measurable time** for
 limit that changes the algorithm is a bug; a limit that changes the loop
 structure at no cost is a measured trade.
 
+## The nearest-centre search, on the device
+
+🔴 **PREPARING AN ALIGNMENT IS 59% ONE LOOP, AND IT IS SERIAL WITH THE FOLD.**
+The section below took the whole of featurisation from 525 ms to 75 on a
+59-residue query and stopped there, because the fold's own clock calls all of
+it "features" and nothing said which loop. `featureStats` says. At 825
+residues, 512 clusters, 1024 extras and two recycles:
+
+| phase | host | on the device |
+|---|---:|---:|
+| **nearest-centre search** | **645 ms** | **43** |
+| the 49-channel MSA block | 204 | 196 |
+| the cluster profile | 81 | 79 |
+| extra rows | 54 | 50 |
+| encode | 44 | 46 |
+| BERT masking | 25 | 26 |
+| the alignment profile | 10 | 10 |
+| **featurisation** | **1072** | **450** |
+| the fold | 23859 | **23254** |
+
+**15x on the loop and 2.5% of the fold**, and at 59 residues 57 ms to 31 with
+the repeat going 441/445 to 418/415. The checksum is **identical on both arms**
+at both sizes - 26706680 and -1725774 - which is the only thing that settles
+it, because the assignment reaches the answer through the cluster profile
+rather than directly.
+
+It is a reduction over residues and an argmax over centres, so it is a kernel:
+one workgroup an extra row, the centres split across 64 lanes, a tree join.
+`src/input/nearest-centres-webgpu.js`.
+
+🔴 **THE TIE RULE IS THE WHOLE RISK AND IT IS IN THE PACK, NOT IN A
+COMPARISON.** The host keeps the FIRST centre at an equal score. The join packs
+`(score << 16) | (0xffff - centre)` into one u32 and takes the MAX, so the tie
+breaks towards the lower index by construction - there is no comparison for
+somebody to get backwards later. An empty lane's candidate is 0, which loses to
+every real one because a real candidate carries at least `0xffff - centre` in
+its low half.
+
+`tools/gpu/check-nearest-centres.js` holds it to zero differing assignments
+over seven cases, and one of them DUPLICATES centres so whole groups tie -
+without it the check passes on random alignments and fails on real ones, where
+near-identical sequences are the normal case. Flipping the pack to break ties
+the other way fails six of the seven, 512 of 512 on the duplicate arm.
+
+🔴 **AND THE LOOP WAS SPLIT SO THE RECYCLES BATCH.** Nothing in a recycle's plan
+- its shuffling and its BERT masking - depends on an assignment, and no recycle
+depends on another. `planA3mFeatures` produces every plan, one submit runs every
+search, `finishRecycle` completes every recycle. Four searches, one round trip.
+The host path runs the same two functions with the same loop in between, so the
+arms cannot drift: they are literally the same code either side of the argmax.
+
+Not taken from upstream, though they got there first and by the same
+measurement: their host loop was 3.2 s of a 3.4 s featurisation where ours was
+645 ms of 1072, because the alignment-prep work below had already made this
+loop word-parallel. Their kernel is 28x and 45 ms at the same shape; ours is
+15x and 43 ms. The remaining 400 ms is the 49-channel block and the cluster
+profile, which is where they went next.
+
 ## Preparing the alignment
 
 🔴 **PREPARING AN AF2 ALIGNMENT WAS 525 ms OF MAIN-THREAD JAVASCRIPT AND

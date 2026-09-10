@@ -9,6 +9,7 @@ import {
 import { deviceTuning } from "./device-profile.js";
 import { pipelineCacheForDevice } from "./pipeline-cache.js";
 import { storageBytes, storageWords } from "./storage.js";
+import { shaderSource } from "./shader-source-cache.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
@@ -480,6 +481,22 @@ export class WebGpuExecution {
     } finally {
       pending.querySet.destroy();
     }
+  }
+
+  /**
+   * A pipeline whose WGSL is generated at most once per device.
+   *
+   * 🔴 `pipelines.get` TAKES A FINISHED SOURCE AND DISCARDS IT ON A HIT, and a
+   * block asks for the same pipelines on every block of every recycle. A
+   * 59-residue AF2 fold generated 26.9 MiB of WGSL for 2,795 hits before this
+   * existed - see src/runtime/shader-source-cache.js, which also carries the
+   * verification that replaces the collision check the memo makes vacuous.
+   *
+   * The key must name everything the source depends on, which is the same rule
+   * the pipeline key already lives under.
+   */
+  shaderPipeline(key, build, entryPoint = "main") {
+    return this.pipelines.get(key, shaderSource(this.device, key, build), entryPoint);
   }
 
   checkpoint() { return this.#allocations.length; }

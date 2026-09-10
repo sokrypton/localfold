@@ -833,6 +833,83 @@ export function setDeviceTuning(device, tuning) {
  * @returns {{vendor: string, architecture: string, software: boolean,
  *            tuning: Tuning}}
  */
+/**
+ * The knobs a device's own CAPABILITIES answer, for a device no prior names.
+ *
+ * 🔴 THE PRIORS TABLE WAS DOING TWO DIFFERENT JOBS AND ONLY ONE OF THEM IS A
+ * TABLE. Measured with `--no-prior=<knob>`, which restores one knob at a time
+ * from the prior, on this A100. An AF2 fold's warm repeat is 421 ms with the
+ * prior and 639 without, and the 218 ms splits like this:
+ *
+ *   matrixLinear             95 ms      attentionGroup            18
+ *   attentionMatrix          51         opmMatrixContract         12
+ *   attentionProjectMatrix   39         stagedMatrixPrefetch       7
+ *   linearTallTile, triangleProjectMatrix, opmProjectOutputPairs:  0
+ *
+ * Every significant one is the same question - "does this device have subgroup
+ * matrix units, and can this kernel feed them" - which the API ANSWERS. It is
+ * not an architecture secret and it never needed a table.
+ *
+ * 🔴 AND AF3's SIDE IS NOT LIKE THAT, WHICH IS WHY THIS STOPS HERE. The same
+ * sweep on an AF3 fold: `sample-start` is 1867 ms with the prior and 4517
+ * without, and the 2650 ms is `diffusionSplitK` 1792, `diffusionTokenTile`
+ * 1103, `diffusionBatchedGates` 700, `diffusionNormSplit` 526, `atomRowTile`
+ * 316 - tiles and split counts, every one of them a measurement about how many
+ * workgroups fill this card and how many registers a kernel may hold. No
+ * capability states those, and guessing them from a limit would be a table
+ * again with worse provenance. They stay a prior, and they are where a runtime
+ * calibration would have to go.
+ *
+ * So a GPU nobody has measured now gets the matrix paths and not the
+ * geometries, which is most of AF2's gap and none of AF3's.
+ *
+ * 🔴 THE KERNELS STILL CHECK THEIR OWN FIT. `deviceMatrixConfig` returns null
+ * where there is no configuration of the right element type, and each caller
+ * refuses a geometry past the device's workgroup storage or invocation limit.
+ * So this switch says "try", not "assume": a device advertising the feature it
+ * cannot actually feed declines per kernel exactly as it did before.
+ */
+export function matrixCapabilityTuning(device, matrixConfigs = []) {
+  if (device?.features?.has?.("chromium-experimental-subgroup-matrix") !== true) return {};
+  if (device?.features?.has?.("shader-f16") !== true) return {};
+  if (!matrixConfigs.some((c) => c.componentType === "f16")) return {};
+  return {
+    matrixLinear: true,
+    attentionMatrix: true,
+    attentionProjectMatrix: true,
+    opmMatrixContract: true,
+    stagedMatrixPrefetch: true,
+  };
+}
+
+/**
+ * Devices that must answer as if they had no matrix units at all.
+ *
+ * `--default-tuning` on any GPU tool reaches it, and it is the ONLY way to
+ * measure what DEFAULT_TUNING alone is worth now that a capability layer sits
+ * above it. `--no-prior` is a different question - an unrecognised device WITH
+ * whatever units it has, which is what most users actually are.
+ */
+const CAPABILITY_REFUSED = new WeakSet();
+
+/**
+ * Whether this device may answer a knob from a MEASUREMENT rather than a table.
+ *
+ * 🔴 A DERIVATION IS NOT A PRIOR AND `--no-prior` MUST NOT SILENCE IT, because
+ * measuring is exactly what an unrecognised device does. But `--default-tuning`
+ * has to silence it, or the arm that prices DEFAULT_TUNING alone stops being
+ * reproducible - it read 4525 ms before the derivations existed and 3765 after,
+ * measuring something that no longer had a name.
+ */
+export const deviceDerivationsAllowed = (device) => !CAPABILITY_REFUSED.has(device);
+
+/** Answer as a device with no usable matrix units. See CAPABILITY_REFUSED. */
+export function ignoreDeviceCapabilities(device) {
+  CAPABILITY_REFUSED.add(device);
+  CACHE.delete(device);
+  return device;
+}
+
 export function deviceProfile(device) {
   const cached = CACHE.get(device);
   if (cached !== undefined) return cached;
@@ -844,6 +921,8 @@ export function deviceProfile(device) {
   const software = vendor === "google" || architecture === "swiftshader"
     || architecture === "software" || vendor === "mesa";
   const measured = PRIORS.get(architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
+  const capability = CAPABILITY_REFUSED.has(device)
+    ? {} : matrixCapabilityTuning(device, matrixConfigs);
   const kept = KEPT.get(device);
   const prior = !UNRECOGNISED.has(device) ? measured
     : Object.fromEntries(Object.entries(measured).filter(([key]) => kept?.has(key)));
@@ -854,6 +933,10 @@ export function deviceProfile(device) {
     matrixConfigs: Object.freeze(matrixConfigs),
     tuning: Object.freeze({
       ...DEFAULT_TUNING,
+      // 🔴 CAPABILITY UNDER PRIOR, so a measured architecture always wins. The
+      // capability layer is what a device NOBODY has measured gets; a prior is
+      // what a device somebody has.
+      ...(software ? {} : capability),
       ...(software ? {} : prior),
       ...(OVERRIDES.get(device) ?? {}),
     }),

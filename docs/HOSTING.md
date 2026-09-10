@@ -33,6 +33,42 @@ passes:
 | `af3-int5` | 8 | 27.9 / 30.1 | **5.30 / 4.52 s** |
 | `esmc-600m-int3` | 54 | 24.0 / 28.1 | **1.70 / 0.62 s** |
 
+🔴 **AND THE LOCAL NUMBER IS NOT THE USER'S NUMBER, BY 5-12x.** Every timing
+taken through `tools/serve.py` reads shards over loopback, where
+`probe-shard-read.js` measures 371 MB/s and the cap is six HTTP/1.1
+connections. To the real remote from the A100 box: one OpenDDE shard at
+**56 MB/s**, and all twelve in parallel at **78 MB/s aggregate** - Hugging Face
+serves HTTP/2, so the connection cap does not apply at all and the constraint
+is bandwidth, which twelve connections improve by 1.4x rather than by twelve.
+The table above, taken from a different machine, says 27.9-30.1 MiB/s.
+
+So `fold-opendde.js`'s `weightSeconds` of 1.73 is about **6 s** for a user, and
+the conclusion below - that a bundle wants more shards than connections - is
+about the IDLE TAIL and not about throughput. Where the wire is the limit,
+shard count buys nothing and only the byte count does.
+
+### So the next thing worth doing to a bundle is making it SMALLER
+
+Not re-sharding it. At 56-78 MB/s, OpenDDE's 472 MiB is about **6 s of a ~7 s
+first experience** - the fold behind it is 2.5 s and the shader compilation now
+hides under the download entirely. Nothing else on the page is within an order
+of magnitude of that, and every millisecond of kernel work is now competing for
+the small half of a user's wait.
+
+It was not attempted here and the reason is mechanical: **the float32 exports
+are not on this box**, and `quantize_af3.py` needs them - the bundles here are
+already int5. It also ends in a re-publish to the Hugging Face repository the
+manifests pin, which is a different kind of decision from a kernel change.
+
+What a serious attempt would have to hold, all of which already exist:
+`fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865),
+`probe-nucleic.js` for bond lengths, which RMSD cannot see and where OpenDDE is
+already 15% short, `check-opendde-confidence.js`, and
+`check-bundle-device-decode.js` for whatever codec comes out. 🔴 And the group
+size is not a free parameter: OpenDDE at `--group 128` folds 6MRR into a 3283 A
+explosion at pLDDT 46.69, so the knob to move is the BIT DEPTH at group 32, one
+tensor class at a time, against those gates.
+
 🔴 **EIGHT SHARDS ON EIGHT CONNECTIONS IS NO PACKING AT ALL.** Every connection
 takes one shard, the first to finish has nothing else to do, and the load ends
 when the single SLOWEST shard does - which is half the download running

@@ -522,6 +522,12 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+        # 🔴 THE STATUS LINE ROUNDS TO WHOLE SECONDS, which is a fine thing to
+        # show a reader and useless for measuring a change: a 300 ms speedup on
+        # a 4 s fold moves nothing on it. __foldClickedAt is stamped just before
+        # the click for --timeline, so the same stamp gives the fold's own wall.
+        print("elapsedMs:", cdp.evaluate(ws,
+            "Math.round(performance.now() - (window.__foldClickedAt || 0))"))
         if args.dev_report:
             # 🔴 THROUGH THE BUTTON, NOT THE MODULE. The panel is built the
             # first time it is opened, so calling devReport() directly would

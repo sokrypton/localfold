@@ -36,7 +36,7 @@ import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
 import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
-  loadAf3Weights, toPoints } from "./af3-model.js";
+  loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
@@ -2813,6 +2813,23 @@ async function fold(event) {
     // ...and started, not awaited. The templates and the alignment below are
     // network work of their own; this runs beside them.
     const modelLoad = startModelPreload(family, signal);
+    // 🔴 AND THE SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. The tools have
+    // done this since the warm existed - fold-opendde.js measures 2533 ms
+    // against 2839 with `--no-warm` - and the page never did, because
+    // `loadAf3Weights` resolves only once every tensor is decoded and nothing
+    // could reach the store before that. It can now; see warmAf3Pipelines.
+    //
+    // 🔴 THE RESIDUE COUNT, NOT THE TOKEN COUNT, and that is a deliberate
+    // approximation: the tokens are known only once the batch is featurised,
+    // which happens inside foldAf3 after the weights are awaited - by which
+    // time there is nothing left to hide behind. A ligand or a modified residue
+    // makes the real count larger, so the warm compiles a subset and the fold
+    // compiles the rest, which is slower than a perfect warm and faster than
+    // none. A speculative warm cannot give a wrong ANSWER, only waste.
+    if (isAf3Family(family)) {
+      void getDevice().then((device) =>
+        warmAf3Pipelines(family, chains.join("").length, device)).catch(() => {});
+    }
     // 🔴 FETCHED HERE AND NOT INSIDE THE FOLD, so a structure that cannot be
     // reached stops the run with its own message rather than surfacing as a
     // fold that scored badly. AF3 only: AF2's drivers take a template through
