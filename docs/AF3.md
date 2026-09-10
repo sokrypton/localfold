@@ -1828,3 +1828,34 @@ The ceiling is worth stating before anyone starts: eliminating the pass entirely
 is 2% of the trunk, because `grid.attend` is 30% of the GPU time and is already
 on the matrix units with 16,384 workgroups a pass - well fed, and the reason the
 trunk looks the way it does.
+
+### 🔴 And `pairTransitionChunkBytes` never reached this track at all
+
+Chasing that starved dispatch found the reason a knob could not move it.
+`pairformer-block-webgpu.js` and `msa-stack-webgpu.js` both put
+`pairTransitionChunkBytes` into the options they hand `encodePairTrack`, and
+`pair-track-gpu.js` - the only caller of `transitionSplitChunkRows` - never read
+it, so the rule fell back to its own 64 MiB default. **Every AF3 and OpenDDE arm
+ever measured with that knob was measured at 64 MiB**, which is why the first
+sweep of 64, 128 and 256 moved the group count not at all and the pass by 0.4 ms
+of 77.5. The same shape as `matrixLinear: false` falling through into the matrix
+path: a knob with no off position, and a knob with no effect, are both worse than
+no knob.
+
+Wired through, it does what it says and still does not pay:
+
+| chunk | down | groups | wide | groups | whole trunk | peak |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 MiB | 77.12 ms | 256 | 94.08 | 2048 | 3717 ms | 1284 MiB |
+| 256 | 66.72 | 1024 | 121.95 | 8192 | 3671 | 1500 |
+| 512 | **63.04** | 2048 | **120.52** | 16384 | 3741 | 1788 |
+
+The starved pass gets its workgroups - 256 to 2048, and 1.22x - and the `wide`
+pass loses 27 ms, more than `down` gains. `wide` was never starved at 2048
+groups, so a bigger chunk buys it nothing and costs it locality: the widened
+buffer it streams grows with the chunk. The trunk is 3717 / 3671 / 3741, a wash,
+for up to 504 MiB of extra peak.
+
+So the default stays at 64 MiB and the fix is the plumbing, not the value. It
+matches what docs/PERF.md already records for the ESMFold2 trunk - "a 6% GPU win
+and a 1% WALL loss for 144 MiB" - reached there by a different route.

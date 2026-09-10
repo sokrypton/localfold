@@ -375,6 +375,16 @@ export async function compilePairTrack(cache, options) {
     pipelines.transitionSplit = {
       tiles: split.tiles,
       chunkRows: transitionSplitChunkRows(pairs, channels, transitionFactor, {
+        // 🔴 THE KNOB WAS PLUMBED IN AND NEVER READ. `pairTransitionChunkBytes`
+        // is put into these options by pairformer-block-webgpu.js and by
+        // msa-stack-webgpu.js, and this call - the only caller of
+        // transitionSplitChunkRows - did not pass it, so the rule fell back to
+        // its own 64 MiB default. Every AF3 and OpenDDE arm ever measured with
+        // that knob was measured at 64 MiB, and a sweep of 64, 128 and 256
+        // moved the `down` pass by 0.4 ms of 77.5 and its group count not at
+        // all. Same shape as the `matrixLinear: false` that fell through into
+        // the matrix path: a knob with no effect is worse than no knob.
+        targetBytes: options.pairTransitionChunkBytes ?? undefined,
         maxStorageBufferBindingSize: options.maxStorageBufferBindingSize,
         minStorageBufferOffsetAlignment: options.minStorageBufferOffsetAlignment,
         blockRows: split.tiles.blockRows,
