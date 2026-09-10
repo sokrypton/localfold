@@ -1026,6 +1026,21 @@ The only thing that moves this number is a smaller bundle, which is where
 docs/HOSTING.md already points and which needs the float32 exports and a
 re-publish.
 
+### Creating the GPU device early: measured, already overlapped, not taken
+
+`getDevice` memoises one promise and its first caller used to be the fold, so
+the natural next move after the weight preload and the shader warm was to create
+the device at page load too. Measured on a cold page, the first `getDevice()` is
+**148 ms** and every call after it is 0.
+
+It buys nothing. Alternating arms, three pairs on the monomer page: 3148 / 3399
+/ 3151 ms with the device created at load against 3361 / 3424 / 3147 without -
+the spread inside each arm is larger than the difference between them. The
+reason is that the shader warm above already calls `getDevice()` at click time,
+concurrently with the weight download, so for every AF3-family model the 148 ms
+was already hidden the moment that landed. Reverted rather than kept as a
+plausible-looking three lines that move nothing.
+
 Two things this does NOT say. It is one browser on one machine, and a shader
 cache is a heuristic with an eviction policy nobody here controls. And
 `--keep-profile` must never become the default for a checker: the whole reason
