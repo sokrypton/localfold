@@ -121,8 +121,19 @@ def chrome_flags():
     return headless + LINUX_FLAGS + ["--enable-unsafe-webgpu", "--disable-gpu-sandbox"]
 
 
-def launch(port, profile):
-    shutil.rmtree(profile, ignore_errors=True)
+def launch(port, profile, keep=False):
+    """Start Chrome on `profile`, wiping it first unless `keep`.
+
+    🔴 WIPING IT IS WHY EVERY PAGE TIMING HERE IS A FIRST VISIT. A fresh
+    user-data-dir has no HTTP cache and no shader cache, so a run pays the
+    whole weight download AND compiles every pipeline - which is the right
+    default for a checker (CLAUDE.md's note about a cached ES module looking
+    exactly like a broken feature is about the other direction). It also means
+    nothing here has ever measured what a RETURNING user pays, and Chrome
+    caches compiled pipelines on disk.
+    """
+    if not keep:
+        shutil.rmtree(profile, ignore_errors=True)
     p = subprocess.Popen([chrome_binary()] + chrome_flags() + [
         "--user-data-dir=" + profile, "--no-first-run",
         "--hide-scrollbars", "--remote-debugging-port=%d" % port, "about:blank"],

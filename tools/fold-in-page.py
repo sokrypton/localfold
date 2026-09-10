@@ -154,6 +154,13 @@ def main():
                              " because each run starts a fresh profile with an"
                              " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--keep-profile", action="store_true",
+                        help="reuse the Chrome profile instead of wiping it, so"
+                             " the HTTP cache and the SHADER cache survive - the"
+                             " second visit a real user makes, which nothing"
+                             " here had ever measured. The status line is the"
+                             " fold alone and `elapsedMs` includes the weights,"
+                             " so the two together say which cache paid.")
     # 🔴 SINGLE SEQUENCE BY DEFAULT, because this tool is a wiring check and a
     # search is a minute of somebody else's server. `--msa-mode search` is
     # needed for `--template auto`, which has nothing to draw on without one.
@@ -222,7 +229,7 @@ def main():
     args = parser.parse_args()
 
     httpd = serve(local_weights=args.url is None and not args.remote_weights)
-    proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile")
+    proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
         ws.call("Page.navigate",
