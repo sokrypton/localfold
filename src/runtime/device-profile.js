@@ -915,7 +915,37 @@ const CAPABILITY_REFUSED = new WeakSet();
  * reproducible - it read 4525 ms before the derivations existed and 3765 after,
  * measuring something that no longer had a name.
  */
-export const deviceDerivationsAllowed = (device) => !CAPABILITY_REFUSED.has(device);
+/**
+ * Vendors whose measurements ARE `DEFAULT_TUNING`, and which therefore have
+ * nothing to derive.
+ *
+ * 🔴 THE DERIVATION LAYER READS SILENCE AS "NOBODY MEASURED THIS DEVICE", AND
+ * FOR EXACTLY ONE VENDOR THAT IS BACKWARDS. See VENDOR_PRIORS: there is no
+ * `apple` entry ON PURPOSE, because this repository was tuned on an M2 and its
+ * answers are the defaults themselves - so a knob metal-3 does not name is not
+ * an unanswered question, it is an answered one whose answer lives upstairs.
+ * Deriving over it replaces a measurement with an estimate.
+ *
+ * Priced on that M2, AF3 at 68 tokens and 200 steps, warm fold and peak:
+ * 4.01 s and 476 MiB with the derivations suppressed, 5.60 s and 978 MiB with
+ * them - 1.40x slower for 2.05x the memory, and the resident weights alone go
+ * 13.9 MiB to 874. The same mechanism is 6032 -> 3365 ms on an A100, where the
+ * silence it reads is real.
+ *
+ * 🔴 AND `--no-prior` MUST STILL DERIVE. That switch asks what an UNRECOGNISED
+ * device gets, and measuring is precisely what such a device does - so this
+ * yields to it rather than compounding with it.
+ */
+const DEFAULTS_ARE_MEASUREMENTS = new Set(["apple"]);
+
+const measurementsAreDefaults = (device) => {
+  if (UNRECOGNISED.has(device)) return false;
+  const { vendor = "" } = RECORDED.get(device) ?? {};
+  return DEFAULTS_ARE_MEASUREMENTS.has(vendor);
+};
+
+export const deviceDerivationsAllowed = (device) =>
+  !CAPABILITY_REFUSED.has(device) && !measurementsAreDefaults(device);
 
 /** Answer as a device with no usable matrix units. See CAPABILITY_REFUSED. */
 export function ignoreDeviceCapabilities(device) {
