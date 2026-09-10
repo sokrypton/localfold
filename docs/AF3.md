@@ -1779,3 +1779,52 @@ parameter had even been read, because it was called beside the Fold button's
 enabling - which runs EARLIER in the file. It waits for that specific string
 now. `of3` is deliberately not an alias for `openbind`.
 
+## The trunk at 512 tokens, which nothing had profiled
+
+The AF3 priors were fitted at 200 tokens. AF2's were fitted at 400 and one of
+them moved 2% when re-swept at 825 (docs/AF2.md), so the same question is worth
+asking here. `bench-trunk.js --model=/model-af3-int5/manifest.json --tokens=512
+--msa=128 --passes=2 --profile`, steady pass:
+
+| stage | ms |
+|---|---:|
+| pairformer | 1896 |
+| msa-stack | 628 |
+| embedder | 514 |
+| template | 409 |
+| distogram | 213 |
+| **whole** | **3724** |
+
+🔴 **AND THE PAIRFORMER IS GPU-BOUND HERE, WHICH IS WORTH KNOWING BEFORE
+OPTIMISING ANYTHING ELSE.** `pairformerSplit` reports encode **22.8 ms**, wait
+**1644.7**, release 0 - the host finishes encoding in a fortieth of the time the
+GPU takes, so nothing on the host side of this stage is worth moving.
+
+The GPU passes, 1374 ms over 2048 dispatches:
+
+| pass | ms | share | groups a pass |
+|---|---:|---:|---:|
+| `grid.attend` | 397.1 | 30.6% | 16384 |
+| `tri.contract` | 167.3 | 12.9% | 5837 |
+| `tri.project` | 107.9 | 8.3% | 11878 |
+| `pair-transition.wide` | 94.3 | 7.3% | **2048** |
+| `grid.project` | 94.0 | 7.2% | 15974 |
+| `pair-transition.down` | 77.5 | 6.0% | **256** |
+| `tri.project-out` | 66.6 | 5.1% | 6656 |
+
+🔴 **`pair-transition.down` LAUNCHES 256 WORKGROUPS ON A CARD THAT FITS 4542.**
+That is 6% of the trunk's GPU time in a kernel using about a twentieth of the
+device, and it is the clearest starved dispatch anywhere in this port -
+`probe-occupancy.js` is what makes it legible as one rather than as a number.
+`pair-transition.wide` at 2048 is short of the same mark by half.
+
+It is NOT a knob. `pairTransitionChunkBytes` at 64, 128 and 256 MiB leaves the
+group count at exactly 256 and the pass at 77.5 / 77.48 / 77.87 ms - the
+transition is not chunked at this shape, so the chunk target never binds and the
+count comes from the split kernel's own tiling. Fixing it means changing that
+tiling, which is kernel work and wants its own differential.
+
+The ceiling is worth stating before anyone starts: eliminating the pass entirely
+is 2% of the trunk, because `grid.attend` is 30% of the GPU time and is already
+on the matrix units with 16,384 workgroups a pass - well fed, and the reason the
+trunk looks the way it does.
