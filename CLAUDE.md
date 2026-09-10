@@ -111,6 +111,7 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | Where does an OpenDDE FOLD's time go, and is it even GPU? | `tools/gpu/fold-opendde.js --profile --buffers --repeat=2` - the trunk phase is **96.3% GPU-idle**, and the second fold is the row a user sees |
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | ...and ALL of it, not the top twenty? | the same, `--top=200` - a block's transitions alone are fifty labels, one a chunk, and 15 ms of pair bias hid under them |
+| 🔴 ...and were these knobs swept at the LENGTH that matters? | Mostly not - the priors were fitted at 400 residues and below. Re-swept at 825 with 512 sequences, one in four moved: `opmPairBlockBytes` 64 -> 256 MiB is **2.2% of a block and 180 ms of a fold for 193 MiB**, bit-identical because blocking reorders no sum. Flat: `attentionMatrixTile` (4x32 still right), `opmProjectOutputPairs`, `stagedMatrixBlock`, `transitionThreadTarget` over an eightfold range. See docs/AF2.md |
 | ...and which value of an AF2 knob does this block want? | `profile-af2-block.js --sweep=opmProjectOutputPairs=1,2,4 --watch=opm.project-output` - arms interleaved, two rounds, minimum per arm, weights loaded once |
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |

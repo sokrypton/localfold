@@ -1446,7 +1446,23 @@ checksum is -67537339 and pLDDT 25.628 on both arms; check-opm-paths.js holds
 the blocked arm to relRMS EXACTLY 0 because a pair's contraction is untouched
 and only where it lands in the intermediate moves.
 
-Two knobs swept at the same shape that do NOT move, recorded so nobody sweeps
-them again: `attentionMatrixTile` (above) and `opmProjectOutputPairs`, which is
-9.153 / 9.170 / 9.155 / 9.157 ms at 1, 2, 4 and 8 - flat to the third digit,
-because the matrix output projection does not read it.
+🔴 **AND FOUR KNOBS SWEPT AT THE SAME SHAPE DO NOT MOVE, WHICH IS THREE
+QUARTERS OF THE SWEEPS.** Recorded so nobody runs them again:
+
+| knob | at 825, 512 sequences | why |
+|---|---|---|
+| `attentionMatrixTile` | 4x32 **199.66** ms, 2x32 206.14, 4x16 205.98, 6x16 214.81 | the shipped tile is right at this length too |
+| `opmProjectOutputPairs` | 9.153 / 9.170 / 9.155 / 9.157 ms at 1, 2, 4, 8 | the MATRIX output projection does not read it |
+| `stagedMatrixBlock` | block 195.50 / 195.46 / 195.53 / 195.46 over four geometries | AF2's triangle contraction has its own geometry and never asks |
+| `transitionThreadTarget` | block 195.44 / 195.28 / 195.47 / 195.64 at 50k, 100k, 200k, 400k | flat across an eightfold range |
+
+The last is worth a second look because it contradicts an expectation rather
+than confirming one: `probe-occupancy.js` measures this card at ~290,000 lanes
+and the target is 100,000, so raising it looked overdue. It is flat, which says
+the transition is not thread-starved at 825 in the first place - the shape has
+enough rows to fill the card at any of these targets, and the knob only bites
+where it does not.
+
+**One sweep in four paid.** That is the honest rate, and it is still worth
+doing: the one that paid was 2% of every block on a long protein, and long
+proteins are where the seconds are.
