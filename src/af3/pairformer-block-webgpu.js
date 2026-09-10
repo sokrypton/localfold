@@ -457,7 +457,18 @@ export class Af3PairformerStackGpu {
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
-      into(`single:${name}`, `${base}:single:${weightPrecision}:${singleTuning.singleProjectLanes ?? 64}:${singleTuning.singleProjectOutLanes ?? 64}:${name}`, source);
+      // 🔴 THE SPLIT COUNT IS IN THE SHADER AND WAS NOT IN THE KEY.
+      // `projectSplits` is derived from `singleProjectWorkgroupTarget` and
+      // `singleProjectMaxSplits`, baked into the source, and multiplied into
+      // the dispatch two lines above - so two different targets generate two
+      // different kernels under one name. `--tune=singleProjectWorkgroupTarget`
+      // at either 220 or 55 died on the collision check; the arm had never been
+      // run. Named the RESOLVED value and not the knobs, because that is what
+      // the shader contains - the same reason block.js keys on
+      // `shaders.projectTile` rather than on the tuning that chose it.
+      into(`single:${name}`, `${base}:single:${weightPrecision}`
+        + `:${singleTuning.singleProjectLanes ?? 64}`
+        + `:${singleTuning.singleProjectOutLanes ?? 64}:s${projectSplits}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
       createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,

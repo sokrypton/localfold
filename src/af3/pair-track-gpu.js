@@ -189,6 +189,9 @@ export async function compilePairTrack(cache, options) {
   const compileInto = (slot, key, source) => {
     pending.push(cache.get(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
   };
+  // The offsets are a small flat object of name to index; naming them in full
+  // costs a few dozen characters and cannot alias the way a hash could.
+  const offsetKey = JSON.stringify(triangleOffsets);
   for (const direction of ["outgoing", "incoming"]) {
     // 🔴 THE RESIDUAL FORM, so project-out adds into the pair representation
     // rather than writing a delta for a separate add pass to fold in. All five
@@ -223,9 +226,20 @@ export async function compilePairTrack(cache, options) {
       // one replaces it, because its weights are no longer in the buffer.
       if (["projectAB", "projectOutput", "contract"].includes(name)
           && projectMatrix !== false) continue;
+      // 🔴 THE PACK'S OFFSETS ARE IN THE SHADER, SO THEY BELONG IN THE KEY.
+      // The triangle's weights are packed INTERLEAVED where the matrix
+      // projection runs and separately where it does not - `linearABWeight`
+      // against `linearAPWeight` and its three siblings - and every offset is a
+      // `const W_*` in the WGSL. The key named the direction, the precisions
+      // and the scratch storages and not this, so two calls that disagreed
+      // about the layout collided: with `--tune=triangleProjectMatrix=false`,
+      // AF3 died at "cache key collision ... line 27: const W_LINEARABWEIGHT
+      // against const W_LINEARAPWEIGHT". The collision check did its job and
+      // the arm had simply never been run - it is one of the differentials
+      // CLAUDE.md lists. src/evoformer/block.js learned this at the same seam.
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
-                  + `:${scratchStorage.join("")}:${name}`,
+                  + `:${scratchStorage.join("")}:${offsetKey}:${name}`,
                   source);
     }
     if (projectMatrix !== false) {

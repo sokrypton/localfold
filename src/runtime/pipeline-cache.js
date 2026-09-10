@@ -55,7 +55,20 @@ export class ComputePipelineCache {
       row.hits += 1;
       row.bytes += wasted;
       if (cached.code !== code || cached.entryPoint !== entryPoint) {
-        throw new Error(`WebGPU pipeline cache key collision for ${key}`);
+        // 🔴 A COLLISION IS A KEY THAT DOES NOT NAME ITS SHADER, AND THE NEXT
+        // QUESTION IS ALWAYS "WHICH PART". Saying only the key leaves that to a
+        // bisect; the first differing line usually names the constant that
+        // moved - a weight offset, a tile, a channel count - and is what turns
+        // this from an afternoon into a minute.
+        const was = cached.code.split("\n");
+        const now = String(code).split("\n");
+        let at = 0;
+        while (at < Math.max(was.length, now.length) && was[at] === now[at]) at += 1;
+        const detail = cached.entryPoint !== entryPoint
+          ? `entry point ${cached.entryPoint} against ${entryPoint}`
+          : `line ${at + 1} of ${now.length}: ${JSON.stringify((was[at] ?? "").trim().slice(0, 90))}`
+            + ` against ${JSON.stringify((now[at] ?? "").trim().slice(0, 90))}`;
+        throw new Error(`WebGPU pipeline cache key collision for ${key} - ${detail}`);
       }
       return cached.pipeline;
     }
