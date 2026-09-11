@@ -1997,10 +1997,13 @@ in its own pass and `extra.msa-column-global-attention.output` does
 `staged[c] = normalized[...]` - one load, one multiply-add. The per-iteration
 cost their fold removes is not there to remove.
 
-And the pass cannot be dropped by folding, because `normalized` is shared: the
-query, kv and flash kernels all read it. Folding into the gate's weight alone
-would save the gate's arithmetic - which is already one load - and leave the
-tensor exactly where it is.
+And the pass cannot be dropped by folding, because `normalized` is shared.
+Checked in `encodeGlobalAttention` rather than assumed - an earlier draft of this
+paragraph said "the query, kv and flash kernels", and the FLASH kernel does not
+read it, it reads query, keys and values. The three that bind it are
+`kvPipeline`, `queryPipeline` and the gate itself. Folding into the gate's
+weight alone would save the gate's arithmetic - already one load - and leave the
+tensor exactly where it is for the other two.
 
 The numbers, `profile-af2-block.js --stack=extra --length=825 --sequences=1024`,
 a 189 ms block over 200 kernels:

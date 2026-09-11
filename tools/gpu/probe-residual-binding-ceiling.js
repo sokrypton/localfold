@@ -49,6 +49,7 @@ export async function main(device, args) {
     const bytes = elements * 4;
     const execution = new WebGpuExecution(device);
     let outcome;
+    let values;
     try {
       const base = execution.allocate("probe.pair", elements);
       const update = execution.allocate("probe.update", elements);
@@ -62,12 +63,53 @@ export async function main(device, args) {
     } catch (error) {
       outcome = `THREW: ${String(error.message ?? error).split("\n")[0]}`;
     }
+    // 🔴 "ACCEPTED" IS NOT "CORRECT". The first version of this probe checked
+    // only that the dispatch validated, which a windowed add can do while
+    // computing the wrong thing - a window that starts at the wrong offset, or
+    // a last workgroup that runs into the next window, both validate. So the
+    // VALUES are checked at the boundaries that windowing creates: the first
+    // element, the last of window 0, the first of window 1 and the last of all.
+    if (outcome === "ok") {
+      try {
+        const perBinding = Math.floor(limit / 4);
+        const w = Math.floor(perBinding / 64) * 64;
+        const marks = [...new Set([0, w - 1, w, elements - 1]
+          .filter((at) => at >= 0 && at < elements))].sort((a, b) => a - b);
+        const rw = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+        const base = execution.allocate("probe.check.base", elements, rw);
+        const update = execution.allocate("probe.check.update", elements, rw);
+        // base = 10 at every mark, update = 1 everywhere those marks live.
+        const one = new Float32Array([1]);
+        const ten = new Float32Array([10]);
+        for (const at of marks) {
+          device.queue.writeBuffer(base.allocation.buffer, at * 4, ten);
+          device.queue.writeBuffer(update.allocation.buffer, at * 4, one);
+        }
+        const encoder = device.createCommandEncoder({ label: "probe.check" });
+        await execution.addInPlace(encoder, base, update, "probe.check");
+        execution.endComputePass(encoder);
+        const readback = device.createBuffer({
+          size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        marks.forEach((at, index) =>
+          encoder.copyBufferToBuffer(base.allocation.buffer, at * 4, readback, index * 4, 4));
+        device.queue.submit([encoder.finish()]);
+        await readback.mapAsync(GPUMapMode.READ);
+        const got = [...new Float32Array(readback.getMappedRange().slice(0, marks.length * 4))];
+        readback.unmap(); readback.destroy();
+        const wrong = marks.map((at, index) => [at, got[index]]).filter(([, v]) => v !== 11);
+        values = { marks, got, correct: wrong.length === 0,
+                   ...(wrong.length === 0 ? {} : { wrong }) };
+      } catch (error) {
+        values = { error: String(error.message ?? error).split("\n")[0] };
+      }
+    }
     execution.destroy?.();
     const perBinding = Math.floor(limit / 4);
     const windowElements = Math.floor(perBinding / 64) * 64;
     results.push({ residues, gibibytes: Math.round(bytes / 2 ** 30 * 100) / 100,
                    windows: Math.ceil(elements / windowElements),
-                   expect, outcome });
+                   expect, outcome, values });
   }
 
   return {
