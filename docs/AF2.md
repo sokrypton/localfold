@@ -1575,3 +1575,47 @@ and whether those are as clean has not been checked - a wrong answer is worse
 than 2%. The alternative is a padded sequence STRIDE on `left` and `right`
 alone, which is the `CZ_STRIDE` fix's shape and touches the most
 performance-critical kernel in AF2.
+
+## 🔴 The monomer alignment is never deduplicated, and the query is in it twice
+
+Asked directly: when the search finds only the query itself, do we dedupe? No.
+
+`extractMmseqs2A3m` joins two database blocks - `uniref.a3m` and
+`bfd.mgnify30.metaeuk30.smag30.a3m` - and `queryBlock` returns each block WHOLE,
+starting with its own `>101` query row. Run against a result that contains
+nothing but the query:
+
+```
+environmental=true   depth=2  distinct=1  rows=["101","101"]
+environmental=false  depth=1  distinct=1  rows=["101"]
+```
+
+The environmental database is the default, so **every monomer fold carries the
+query twice**, and every sequence found in both databases twice with it.
+
+On `tools/fixtures/test.a3m`, parsed by this repository's own `parseA3m` so the
+comparison is on the aligned columns rather than the raw text: **8076 rows, 7663
+distinct, 413 duplicates - 5.1%**. At the page's default 128:256 that is about
+**20 of 384 rows** spent on sequences the model has already seen.
+
+🔴 **AND THE CODEBASE ALREADY ARGUES THIS, ONE FILE OVER.**
+`deduplicateUnpairedAgainstPaired` in src/input/chains.js does exactly this for
+the multimer's paired and unpaired blocks, with the reasoning written out - "it
+is not a tidiness pass, it is the MSA budget... a duplicate does not merely add
+nothing, it evicts a sequence that would have added something" - and with the
+note that the comparison has to be on the aligned columns because AlphaFold
+hashes the featurised row. `concatenateA3mBlocks` in the same file skips the
+second block's query row for the same reason (`for (let row = 1; ...)`). The
+monomer's two-database join does neither.
+
+AlphaFold's own `make_msa_features` keeps a `seen_sequences` set and skips a
+sequence it has already taken, across all MSAs - so this is a divergence from
+the reference, not only a waste. (From knowledge of that pipeline; there is no
+checked-in copy here to point at.)
+
+**NOT FIXED, deliberately.** Deduplicating changes which rows survive the
+cluster budget, so it changes the clustering, so it changes the prediction and
+every checksum in this repository - including the three the M2 handoff is
+verifying against. It is a correctness change with an accuracy argument behind
+it and it wants its own measurement (does pLDDT move, and which way, on the
+targets in docs/AF2.md), not a quiet landing in the middle of a merge.
