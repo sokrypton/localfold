@@ -1946,6 +1946,31 @@ tops out at **2,896** residues however it is bound. Windowing cannot help that;
 packing the pair to f16 or sharding it across buffers would, which is what
 upstream's packing work does.
 
+🔴 **AND THE FOLD'S OWN CEILING IS STILL 2,047, BECAUSE addInPlace WAS NOT THE
+ONLY SITE.** An earlier version of this section said a complex past 2,047
+residues folds now. It does not: `tools/gpu/probe-binding-ceiling.js` runs the
+fold at two lengths, takes each labelled dispatch's growth exponent, and
+extrapolates where its largest binding meets the limit. Over 89 labels in an AF2
+fold:
+
+| label | exponent | crosses at |
+|---|---:|---:|
+| `opm.contract`, `opm.project-output` | 2 | **724** - known and HANDLED, the tiled path takes over here |
+| `pair-transition.first` / `.second`, and the extra stack's | 2 | 1,448 - handled, `transitionChunkRows` windows them |
+| `triangle.outgoing.*`, `triangle.incoming.*` | 2 | **2,047 - NOT handled** |
+
+`src/triangle/webgpu.js` has no chunking, no views and no windowing, so the
+triangle binds the pair whole exactly as `addInPlace` did. Windowing the
+residual removed one wall of several and the fold still stops in the same place.
+What the fix is worth is that the residual is no longer the FIRST thing to fail,
+and what it is not worth is a longer complex - not yet.
+
+🔴 **AND TWO LENGTHS ARE NEEDED TO SEE ANY OF THIS.** A binding that grows as `L`
+and one that grows as `L^2` are indistinguishable in a single run and give out at
+completely different lengths. The exponent column is what separates "already
+windowed" - the 724 and 1,448 rows, both of which the code handles - from a real
+ceiling.
+
 🔴 **AND THEY FOUND OUR RACE FROM THE OTHER SIDE.** The same commit says "the f32
 shader gets the bounds check its packed siblings always had. It relied on the
 WebGPU bounds clamp, which the native path turns off." That is the identical

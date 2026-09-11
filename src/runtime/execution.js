@@ -493,6 +493,16 @@ export class WebGpuExecution {
     // 🔴 AND A WINDOW STARTS ON 256 BYTES, which is 64 f32 elements, because
     // that is what a bound range must be aligned to - see the check in
     // `dispatch`. Rounding DOWN keeps every window inside the limit.
+    // 🔴 FOUR BYTES AN ELEMENT, ASSERTED RATHER THAN ASSUMED. The kernel
+    // declares `array<f32>`, so a packed tensor would already be wrong here -
+    // but the WINDOW size is computed from that four, so an f16 caller would
+    // also silently window at twice the right length. All eight callers pass
+    // the f32 pair today; this is what makes a ninth fail loudly.
+    for (const tensor of [base, update]) {
+      if ((tensor.storage ?? "f32") !== "f32") {
+        throw new RangeError(`addInPlace takes f32 tensors; got ${tensor.storage}`);
+      }
+    }
     const perBinding = Math.floor(this.device.limits.maxStorageBufferBindingSize / 4);
     const windowElements = Math.floor(perBinding / 64) * 64;
     if (base.elements <= windowElements) {
