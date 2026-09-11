@@ -1901,9 +1901,19 @@ each - and the default checksum moves to **-121844157**.
 ## Reading alphafold2-webgpu again: the residual add could not fold a big complex
 
 Forty commits landed upstream between 2026-09-09 and 09-11, nearly all from
-**@milot-mirdita**. Read for the ideas only - that repository carries no LICENCE
-and is marked `"private": true`, so nothing is copied from it and everything
-below was re-derived and measured here.
+**@milot-mirdita**.
+
+🔴 **THE REPOSITORY IS PUBLIC, AND UNLICENSED, AND THOSE ARE DIFFERENT THINGS.**
+An earlier note here said it was marked `"private": true` in a way that read as
+"the repository is private". It is not: the API reports `private: false`,
+`visibility: "public"`. The `"private": true` is in `package.json` and means
+only "do not publish this to npm". What IS true is `license: null` and no
+LICENCE file at the root - so it is readable and forkable on GitHub and carries
+no copyright grant to copy source into another project. Everything below was
+read for the idea and re-derived and measured here.
+
+🔴 **AND THEIR CLAIMS WERE CHECKED, NOT QUOTED.** Two of the three that could be
+tested here behaved differently than reading them suggested; see the table.
 
 ### Taken: windowing the residual add
 
@@ -1948,7 +1958,27 @@ bug, and the WGSL specification permits all three.
 
 | upstream | what it is | why not here, yet |
 |---|---|---|
-| `Make a bind group once for what it binds` | 5,157 bind groups a recycle at 59 residues, 70% rebuilding an identical one; cached by pipeline and by what they bind, bounded at 8,192 | **Confirmed here independently** - `probe-submits.js` counts **5,436** for AF2 and 9,463 for AF3 - but that is 31 ms and 48 ms of host time, and docs/PERF.md's host-side survey says a fold is GPU and waiting, not CPU. Worth taking; worth measuring first |
-| `Fold the query normalization into the global gate's weight` | the normalisation is affine per channel and the gate contracts over channels, so scale x weight is one tensor and offset x weight sums into the bias | The best idea of the forty: algebraic, not a tile. Needs its own derivation and a differential gate here |
+| `Make a bind group once for what it binds` | 5,157 bind groups a recycle at 59 residues, **70%** rebuilding an identical one | 🔴 **THE COUNT TRANSFERS AND THE RATE DOES NOT.** `probe-submits.js` counts 5,436 for AF2, close to their 5,157 - but keyed on what each one actually binds (buffer object, offset, size) only **20%** repeat here, 1,078 of 5,436, and 23% for AF3. That is 6 ms of 32. Their blocks are handed the same pooled scratch and differ only in uniforms; ours bind a different weight buffer per block. **Not worth taking here** |
+| `Fold the query normalization into the global gate's weight` | the normalisation is affine per channel and the gate contracts over channels, so scale x weight is one tensor and offset x weight sums into the bias | **Algebra verified here**: the folded form matches the direct one to 1.01e-6, and the per-iteration work goes from four loads and four operations to two and two. Still to do - it needs a differential gate. See the row below for the part worth reading twice |
 | `Give the triangle contraction twice the output rows a workgroup` | halves the weight staging | Priced upstream at 1.7% of a 3,300-residue recycle and **0.6%** at 825 - below what this box can resolve without many paired runs |
 | `Report the ceiling a device's binding count sets` | `maxStorageBuffersPerShaderStage`, 8 on this card | Already respected here: several shaders sit at exactly 8 and the atom encoder packs ten gathers into one buffer citing "the eight-buffer guarantee". Not a gap |
+
+🔴 **AND THE BEST LINE IN THE FORTY IS A NEGATIVE RESULT, AGAIN.** The same
+commit adds that "the mean stays inside the sum rather than being factored out
+against a column sum, which keeps the arithmetic as stable as the form it
+replaces". Factoring is the obvious next step - `sum_c (x_c - mean) * W_cj`
+becomes `dot - mean * colsum`, one pass instead of a subtraction an iteration -
+and it is a trap. Simulated in f32 against an f64 reference, 256 channels:
+
+| row mean | mean kept inside | factored against a column sum |
+|---:|---:|---:|
+| ~0 | 2.12e-5 | 3.78e-5 |
+| ~10 | 3.99e-7 | 5.37e-5 |
+| ~1,000 | 2.71e-7 | 7.68e-4 |
+| ~100,000 | 1.37e-6 | **2.54e+0** |
+
+At a large mean the two terms nearly cancel and the factored form loses the
+answer entirely. Random test data does not show this - it needs a row whose mean
+is large against its spread - which is exactly why the caution is worth having
+written down rather than rediscovered. Same shape as their f16-accumulator
+warning: the negative result travels further than the optimisation.

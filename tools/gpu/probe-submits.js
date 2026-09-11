@@ -116,13 +116,49 @@ export function instrumentSubmits(device) {
   // thousands of dispatches and each builds a descriptor object and a native
   // object behind it; none of it is in a compute pass, so neither profiler
   // here can see a millisecond of it.
+  // 🔴 AND HOW MANY OF THEM BIND SOMETHING ALREADY BOUND. @milot-mirdita
+  // measures 5,157 bind groups a recycle at 59 residues upstream with 70%
+  // rebuilding an identical one, because a block's scratch goes back to the
+  // pool and the next block is handed the same buffers. Checked here rather
+  // than taken: a group is the same group only if the LAYOUT and every entry's
+  // buffer OBJECT, offset and size match.
   const groups = { count: 0, ms: 0 };
+  const seenGroups = new Map();
+  const bufferIds = new WeakMap();
+  let nextBufferId = 0;
+  const idOf = (buffer) => {
+    let id = bufferIds.get(buffer);
+    if (id === undefined) { id = (nextBufferId += 1); bufferIds.set(buffer, id); }
+    return id;
+  };
+  const layoutIds = new WeakMap();
+  let nextLayoutId = 0;
+  const layoutOf = (layout) => {
+    let id = layoutIds.get(layout);
+    if (id === undefined) { id = (nextLayoutId += 1); layoutIds.set(layout, id); }
+    return id;
+  };
   const makeGroup = device.createBindGroup.bind(device);
   device.createBindGroup = (descriptor) => {
     const at = performance.now();
     const built = makeGroup(descriptor);
     groups.count += 1;
     groups.ms += performance.now() - at;
+    try {
+      // 🔴 NOT KEYED ON THE LAYOUT OBJECT. `pipeline.getBindGroupLayout(0)`
+      // returns a FRESH wrapper on every call, so including it made every key
+      // unique and reported 5,436 of 5,436 distinct - a clean-looking zero that
+      // was the instrument, not the port. The claim under test is about the
+      // buffers, offsets and sizes, so that is what the key is.
+      const key = (descriptor.entries ?? [])
+        .map((entry) => {
+          const resource = entry.resource;
+          const buffer = resource?.buffer;
+          return buffer === undefined ? `${entry.binding}:?`
+            : `${entry.binding}:${idOf(buffer)}:${resource.offset ?? 0}:${resource.size ?? "all"}`;
+        }).join(",");
+      seenGroups.set(key, (seenGroups.get(key) ?? 0) + 1);
+    } catch { /* a descriptor shape this does not model is simply not counted */ }
     return built;
   };
 
@@ -304,6 +340,11 @@ export function instrumentSubmits(device) {
       gapMs: round(gapMs),
       bindGroups: groups.count,
       bindGroupMs: round(groups.ms),
+      // Distinct (layout, buffers, offsets, sizes) against the total built.
+      bindGroupsDistinct: seenGroups.size,
+      bindGroupsRebuilt: groups.count - seenGroups.size,
+      bindGroupRebuiltShare: groups.count === 0 ? 0
+        : Math.round((groups.count - seenGroups.size) / groups.count * 100) / 100,
       // 🔴 THE GAPS THEMSELVES, LARGEST FIRST. `gapMs` as a total says the host
       // is not keeping ahead of the device; this says WHERE it stopped, and a
       // handful of long gaps is a different bug from ten thousand short ones.
