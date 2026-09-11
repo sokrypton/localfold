@@ -27,7 +27,17 @@ import { join } from "node:path";
 
 import { WebGpuExecution } from "../src/runtime/execution.js";
 
-const FOLDED = /let\s+(\w+)\s*=\s*id\.x\s*\+\s*id\.y\s*\*\s*GRID_WIDTH\s*\*\s*64u\s*;/;
+// Every way this repository folds a dispatch into y. `linearGrid` folds an
+// INVOCATION index with the workgroup size in the stride - 64 everywhere but the
+// diffusion transformer, which templates it - and `rowGrid` folds a WORKGROUP
+// index with no stride at all. The optional paren is not cosmetic either: a tile
+// grid writes `let base_row = (group.x + group.y * GRID_WIDTH) * ROWS;`.
+//
+// 🔴 THIS PATTERN WAS TOO NARROW TWICE WHILE IT WAS BEING WRITTEN - first
+// matching only the invocation convention, then matching 23 of the 48 workgroup
+// folds because of that paren. A scan that silently covers half the code is the
+// exact failure this file exists to prevent, which is what the floor below is for.
+const FOLDED = /let\s+(\w+)\s*=\s*\(?\s*(\w+)\.x\s*\+\s*\2\.y\s*\*\s*[^;]*GRID_WIDTH[^;]*;/;
 
 const sourceFiles = (directory) => readdirSync(directory).flatMap((entry) => {
   const path = join(directory, entry);
@@ -80,20 +90,36 @@ describe("every shader that folds its index", () => {
     for (const [at, line] of lines.entries()) {
       const match = FOLDED.exec(line);
       if (match === null) continue;
-      const name = match[1];
-      // 🔴 GUARDED BEFORE ITS FIRST USE, not merely on the next line. Several of
-      // these bind the bound to a `let` first - `let elements = ...; if (index
-      // >= elements)` - and a rule that only reads the next line calls three
-      // correct shaders broken. What actually matters is the order: the compare
-      // has to come before anything subscripts a buffer with it.
-      const bound = new RegExp(`\\b${name}\\b\\s*(>=|<)`);
-      const subscript = new RegExp(`\\[[^\\]]*\\b${name}\\b`);
+      // 🔴 THE BOUND IS OFTEN ON A DERIVED NAME, NOT ON THE INDEX. A tile grid
+      // reads `let tile = group.x + group.y * GRID_WIDTH; let first = tile * ROWS;
+      // if (first >= PAIRS)`, and shaders like that look unguarded to a rule that
+      // only watches the index itself. So follow the derivation: a compare against
+      // anything computed from the folded index counts, and what fails is reaching
+      // a buffer subscript without having compared any of them.
+      const tainted = new Set([match[1]]);
+      const touches = (text) => [...tainted].some((n) => new RegExp(`\\b${n}\\b`).test(text));
       let bounded = false;
-      for (const line of lines.slice(at + 1, at + 9)) {
-        const text = line.trim();
-        if (text === "" || text.startsWith("//")) continue;
-        if (bound.test(text)) { bounded = true; break; }
-        if (subscript.test(text)) break;
+      let settled = false;
+      for (const line of lines.slice(at + 1, at + 12)) {
+        if (settled) break;
+        for (const statement of line.split(";")) {
+          const text = statement.trim();
+          if (text === "" || text.startsWith("//")) continue;
+          if (!touches(text)) continue;
+          // 🔴 AND WITHIN ONE STATEMENT THE ORDER STILL DECIDES. The confidence
+          // head writes `if (index < arrayLength(&source)) { output[index] = ... }`
+          // - guard and subscript on one line - so asking "does this subscript?"
+          // before "does it compare?" calls a correct shader broken.
+          const subscript = text.search(
+            new RegExp(`\\[[^\\]]*\\b(${[...tainted].join("|")})\\b`));
+          const compare = text.search(/(>=|<)/);
+          if (compare >= 0 && (subscript < 0 || compare < subscript)) {
+            bounded = true; settled = true; break;
+          }
+          if (subscript >= 0) { settled = true; break; }
+          const assigned = /^(?:let|var)\s+(\w+)\s*=/.exec(text);
+          if (assigned !== null) tainted.add(assigned[1]);
+        }
       }
       (bounded ? guarded : unguarded).push(`${path}:${at + 1}`);
     }
@@ -105,7 +131,8 @@ describe("every shader that folds its index", () => {
 
   // 🔴 A GATE THAT CANNOT FAIL IS NOT A GATE. If the regex stops matching the
   // shaders - a rename, a reformat - the check above passes by finding nothing.
-  it("found the shaders at all", () => {
-    assert.ok(guarded.length >= 40, `only ${guarded.length} folded indices found`);
+  it("found all three folding conventions, not just one", () => {
+    // 122 today: 79 invocation folds, 41 workgroup folds, 2 templated-lane ones.
+    assert.ok(guarded.length >= 120, `only ${guarded.length} folded indices found`);
   });
 });
