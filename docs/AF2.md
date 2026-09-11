@@ -1746,7 +1746,8 @@ reporting 256. The stride is the row's bit pattern now and the tool ASSERTS
 distinctness rather than arguing for it.
 
 That is what moved the three AF2 baselines - AF2 **-1287025**, the 30,29
-multimer **315591**, `bench-af2-warm` **-36457799** - and not the deduplication:
+multimer **315591**, and `bench-af2-warm` -36457799 at the time - **-121844157**
+now that its own generator is fixed too - and not the deduplication:
 `--no-dedupe` gives -1287025 as well.
 
 ## The 160-residue race is not reproducible on the A100
@@ -1759,6 +1760,13 @@ sweep on this A100, `--rows=128`:
 | length | 59 | 80 | 100 | 128 | 160 | 200 | 400 | 825 |
 |---|---|---|---|---|---|---|---|---|
 | | ok | ok | ok | ok | **ok** | **ok** | **ok** | ok |
+
+🔴 **AND UNCHANGED AFTER THE GUARD LANDED, BYTE FOR BYTE.** The same sweep
+against the fix returns the same eight checksums - -354741, -4156549, -2580429,
+-2891643, -9869845, -704434, -15124842, -36457799 - which is what a guard never
+reached on this backend has to do. Both SHAPES are deterministic too, now that
+`--rows` selects one: at 160 and 400 residues, six passes each, the one-call
+fold and the forty-nine-call fold each agree with themselves.
 
 Then the three failing lengths pressed harder - `--passes=8`, so 28 pairs a run
 to disagree on rather than 3, four rounds each: **twelve runs, all agreeing**,
@@ -1866,3 +1874,26 @@ recycle instead of once**, which is the deeper exposure and is exactly the
 shallow-alignment case a novel protein hits. All seven share the one shader, so
 one guard covers every one of them - including the two an M2 with only the
 monomer bundle cannot fold.
+
+🔴 **AND THE RACE GATE ITSELF WAS ALWAYS IN THE 49-CALL SHAPE, WHATEVER `--rows`
+SAID.** The count above is `fold-af2.js`, whose generator had already been
+fixed. `bench-af2-warm.js` still carried the degenerate one - gap stride
+`row % 11 + 3`, so rows 1, 12 and 23 identical - and its alignment was **12
+distinct sequences at every `--rows`**, which the featuriser's deduplication
+then collapsed it to. Twelve is below 32, so the outer-first path was never
+taken and the OPM residual always fired. Counted on the device with
+`tools/gpu/probe-add-in-place.js` at 160 residues:
+
+| `--rows` | dispatches | |
+|---:|---:|---|
+| 128 | **53** | 48 main-stack + 4 extra-stack OPM residuals, 1 template |
+| 16 | **53** | identical - the alignment is the same twelve rows either way |
+
+Every one over the pair tensor at 3,276,800 elements with **917,504**
+invocations past the end. So the race was found in the worst shape available,
+which is lucky, and the gate could not have tested the one-call shape at all.
+
+With the generator fixed here too, `--rows` selects it: **1** dispatch at 128
+rows and **49** at 16, reproducing the table above in the gate. Both shapes are
+deterministic on the A100 after the guard - 160 and 400 residues, six passes
+each - and the default checksum moves to **-121844157**.

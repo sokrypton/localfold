@@ -544,10 +544,13 @@ equally well.
 
 🔴 **THE THREE AF2 BASELINES MOVED, AND HERE IS EXACTLY WHY.** They are now
 AF2 **-1287025**, the 30,29 multimer **315591**, `bench-af2-warm`
-**-36457799**. Nothing about a kernel changed: `fold-af2.js`'s SYNTHETIC
-alignment used to vary its gap stride by `row % 11`, so rows 1, 12, 23 and so
+**-121844157**. Nothing about a kernel changed: the SYNTHETIC alignment both
+tools build used to vary its gap stride by `row % 11`, so rows 1, 12, 23 and so
 on were identical and `--rows=128 --extra-rows=128` was 256 rows carrying
-**12** sequences. The rows are distinct now and the tool asserts it. Confirmed
+**12** sequences. The rows are distinct now and both tools assert it.
+`fold-af2.js` was fixed first (-1846490 -> -1287025) and `bench-af2-warm.js`
+after (-67537339 -> -36457799 -> **-121844157**), which is why that one moved
+twice. Confirmed
 to be that and not the deduplication landing beside it: `--no-dedupe` gives
 -1287025 too. AF3, OpenDDE and ESMFold2 are untouched.
 

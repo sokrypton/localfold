@@ -90,7 +90,26 @@ export async function main(device, args) {
   for (let row = 1; row < rows + extraRows; row += 1) {
     lines.push(`>synthetic${row}`);
     lines.push([...sequence].map((code, column) =>
-      (column % (row % 11 + 3) === 0 ? "-" : code)).join(""));
+      (((row >> (column % 24)) & 1) === 1 ? "-" : code)).join(""));
+  }
+  // 🔴 `--rows` WAS INERT HERE, AND IT MISLED TWO AGENTS. The stride used to be
+  // `row % 11 + 3`, so rows 1, 12, 23 were identical and this alignment carried
+  // **12** distinct sequences whatever `--rows` said - which the featuriser's
+  // deduplication then collapsed it to. Twelve is below `cOuter`, so
+  // `useOuterFirstContraction` was always false and the outer product mean's
+  // residual always fired: measured with tools/gpu/probe-add-in-place.js, this
+  // gate issued **53** addInPlace dispatches at BOTH --rows=128 and --rows=16.
+  //
+  // That mattered while `addInPlace` had no bounds check under a folded grid:
+  // the gate was exercising 53 corrupted adds a pass and reporting the depth as
+  // whatever was asked for. With distinct rows `--rows` selects the shape -
+  // below 32 the residual fires 48 times a recycle, at or above it once - so
+  // both can be tested on purpose. fold-af2.js took the same fix earlier.
+  const distinct = new Set(lines.filter((_, index) => index % 2 === 1)).size;
+  if (distinct !== rows + extraRows) {
+    throw new Error(`the synthetic alignment has ${distinct} distinct rows of `
+      + `${rows + extraRows}: a ${sequence.length}-residue sequence cannot express `
+      + "enough gap patterns");
   }
   const a3m = `${lines.join("\n")}\n`;
 
