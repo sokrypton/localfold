@@ -415,6 +415,31 @@ pair tensor is `L * L * 128` elements, i.e. `2 * L * L` workgroups, which crosse
 
 **Every length that raced has an excess and every length that passed has none.**
 
+🔴 **BOTH SIDES ARE NOW MEASURED IN ISOLATION, NOT ARGUED.**
+`probe-grid-overdispatch.js` drives the add-in-place kernel over a deliberately
+over-dispatched grid and reads the last in-range element, which should be exactly
+1 after one `+=` each. At the 160-residue shape, 917,504 invocations past the end:
+
+| | tail across three runs |
+|---|---|
+| A100, Dawn over Vulkan | 1, 1, 1 - **discards** |
+| M2, Metal, guard stripped | **876, 326, 948** - clamps, and unstable |
+| M2, the shipped kernel | 1, 1, 1 - the guard holds |
+
+The M2 row is the bug on its own, with no fold around it: a different value every
+run because hundreds of thousands of non-atomic read-modify-writes land on one
+address. It is far below 917,504 because most of them read the same stale value,
+which is what a lost update looks like.
+
+🔴 **AND THE PROBE HAD TO BE FIXED TO SAY THAT.** Written against the unguarded
+kernel, it imported the shipped text - so once the bounds check landed it
+reported "discards out-of-range writes" ON THE M2, the machine whose clamping
+caused the race. It was measuring the GUARD and calling it the backend. It runs
+two arms now: the shipped kernel, whose tail must be 1 everywhere, and the same
+text with the guard line stripped, which is the only arm that can still see the
+GPU. The strip is asserted, because a `replace` that matches nothing returns the
+string unchanged and would quietly make both arms the same arm.
+
 🔴 **AND THE TWO MACHINES DISAGREEING IS THE SPECIFICATION, NOT A SCHEDULER.**
 WGSL leaves an out-of-bounds write either discarded or clamped into the buffer,
 and backends pick differently: Vulkan discards through `robustBufferAccess`,
