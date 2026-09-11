@@ -1495,11 +1495,42 @@ residue. At 400 residues with the ampere prior's 256 MiB block the second block
 starts at residue **163**, and 163 × 32 × 37 × 4 is byte **771968**, 128 past a
 boundary.
 
-🔴 **AND IT IS REACHABLE FROM A REAL ALIGNMENT.** `a3m-features.js` sets
-`maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth)`, so an
-alignment shallower than 508 passes its ACTUAL depth - and half of those are
-odd. The deep case is safe only because 508 happens to be even. This is the
-novel-protein case: few homologs, and a coin flip whether the fold runs.
+### Which folds it actually reached, traced
+
+Three things have to hold at once, and the third is why it was never seen on a
+gate: **the matrix contraction, an odd depth, and more than one pair block.**
+
+**The matrix path.** At depth 1 the contraction is refused - K is too small for
+a tile - and the vector kernel binds `left` whole with no view. So a
+single-sequence fold of a 400-residue chain is safe, and gives −24505515 under
+either rule. That is why "fold with no MSA" never showed it.
+
+**An odd depth, and BOTH stacks have one.** The page's dial is the only thing
+that sets the cap, and every preset is even - 512 (which becomes 508), 256,
+128, 64, 32, 16, with **128:256 the default, not 512:1024**. Then:
+
+| stack | depth it runs at | odd when |
+|---|---|---|
+| main | `min(cap, depth)`, and `centers.length` is exactly that | the alignment is SHALLOWER than the cap and odd |
+| extra | `min(maxExtra, depth - maxMsa)` | the alignment's own depth is odd, since `maxMsa` is even |
+
+So the extra stack is the wide one. At the default preset an alignment of
+129-383 sequences runs the extra stack at `depth - 128` - odd whenever the
+alignment is - and that is an ordinary depth for an ordinary protein, not an
+edge case. Confirmed directly: `--rows=128 --extra-rows=73` died under the old
+rule and `--extra-rows=72` folded to −9616646, which is the checksum the fixed
+tree still gives.
+
+**And more than one pair block**, which is a length question: at 400 residues
+with the ampere prior's 256 MiB budget there are three, starting at residues 0,
+163 and 326. A 59-residue fold has one block at offset 0 and cannot show it,
+which is what every AF2 gate in this repository runs.
+
+🔴 **THE 512 -> 508 IS NOT A ROUNDING STEP, WHICH IS EASY TO MISREAD.** AF2's
+config spends four of its 512 rows on templates, so the CAP is 508 - and
+`msaSequences` is `centers.length`, with no template rows added back. The
+evenness of every cap is a coincidence of the presets, not a guarantee anything
+enforces.
 
 🔴 **AND WEBGPU NAMED THE WRONG TENSOR, WHICH IS WHY IT SURVIVED.** The error
 reads `Offset (771968) of [Buffer "opm.left"]` in one place and
