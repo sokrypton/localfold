@@ -134,3 +134,75 @@ already refuses to publish them without `LOCALFOLD_ACCEPT_MODEL_TERMS`. On
 Hugging Face the equivalent is a **gated repository**, which is a better fit
 than a CI variable because it asks each downloader rather than the deployer.
 
+
+## A first visit, measured on a throttled link at last
+
+Every weight number in this repository was taken over `tools/serve.py` on
+loopback at 371 MB/s. `tools/fold-in-page.py --throttle=<MB/s>` shapes the whole
+page through CDP's `Network.emulateNetworkConditions`, so a user's link can be
+asked directly rather than argued about. Hugging Face measures 8 MB/s from this
+machine; `--latency` sets the round trip and defaults to 30 ms.
+
+An AF3 first visit at 8 MB/s, 58 residues, 4 sampler steps:
+
+| | ms |
+|---|---:|
+| whole page, click to structure | **39320** |
+| of which the trunk WEIGHT phase | 35491 |
+| diffusion, confidence, atomReference, targetFeat weights | 22 / 5 / 1 / 1 |
+| the fold itself, as the status line reports it | ~2000 |
+
+265 MiB at 8 MB/s is 33 s, so **a first visit is bytes and almost nothing else**.
+The four loaders after the trunk cost 29 ms between them because their shards
+have already arrived by the time they are asked.
+
+### 🔴 The biggest-shard-first prefetch order is worth nothing, and now we know
+
+`HttpTensorStore.prefetch` sorts shards longest-first, on the makespan argument
+that the last shard to start decides when the load ends - and its own comment
+says the case it protects "cannot be measured from here". It can now. Against
+manifest order, two rounds each at 8 MB/s:
+
+| | run 1 | run 2 |
+|---|---:|---:|
+| biggest first | 39457 | 39442 |
+| manifest order | 39378 | 39398 |
+
+**No difference**, and manifest order is nominally the faster of the two. With
+eight connections sharing one 8 MB/s pipe every shard finishes at about the same
+time whatever order they start in; the tail can only bind when a single
+connection is fast enough that one 40 MiB shard's serial time exceeds what the
+others have left. The ordering is three lines and harmless, so it stays - but it
+is not a lever, and nobody should reach for it again.
+
+### 🔴 And overlapping the download with the fold cannot beat the bytes either
+
+The tempting next move is to start folding once the TRUNK's weights are in and
+stream the diffusion head's behind it. Two measurements say how little that
+buys.
+
+The bundles are not laid out by stage. Shards were packed in tensor order, so
+trunk tensors are spread through nearly all of them - **AF3 needs 224 of its 265
+MiB before its trunk can start, and OpenDDE 432 of 472**. Only one shard per
+model is purely diffusion (AF3's `weights-01`, 40.5 MiB; OpenDDE's `weights-02`,
+40.5).
+
+| | trunk | diffusion head | confidence |
+|---|---:|---:|---:|
+| AF3 | 41.0% | 55.2% | 3.5% |
+| OpenDDE | 58.8% | 31.0% | 4.7% |
+
+And even with a stage-grouped re-export, the win is bounded by the trunk's own
+COMPUTE time, because the link is slower than the arithmetic: at 58 residues the
+trunk is about 2 s against 33 s of download, so overlapping perfectly would hide
+2 s of 39. It grows with the protein - a 300-token trunk is worth more - but it
+is never the download.
+
+**Fewer bytes is the only lever, and quantisation is already at its frontier**:
+`tools/quantize_af3.py`'s own header prices int4 g32 with a per-group range
+search at 219.6 MiB against int5's 263.5, for RMSD 0.76 against 0.66 and TM
+0.942 against 0.953. That is a 17% smaller bundle for a real loss, and it is a
+product decision rather than a free win. The search is implemented in
+`tools/analyse_quantisation.py` and NOT in the exporter, which is fine for int5
+- the same file measures the search at 3-4% of the error - and is what int4
+would need first.
