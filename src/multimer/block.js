@@ -80,6 +80,7 @@ import { SOURCES } from "../reference/alphafold-fixture.js";
 import { WebGpuExecution } from "../runtime/execution.js";
 import { shapedKnob } from "../runtime/device-profile.js";
 import {
+  GLOBAL_ATTENTION_FLASH_SHADER, GLOBAL_ATTENTION_KV_SHADER,
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
 import { deviceTuning } from "../runtime/device-profile.js";
@@ -95,76 +96,14 @@ import {
 import { packWeights as packTriangleWeights, trianglePackOrder }
   from "../triangle/weights.js";
 
-const GLOBAL_ATTENTION_COMMON = `
-struct Parameters {
-  length: u32, sequences: u32, channels: u32, heads: u32, head_dim: u32,
-  query_weight: u32, key_weight: u32, value_weight: u32, gating_weight: u32,
-  gating_bias: u32, output_weight: u32, output_bias: u32,
-};
-// The same 32768 execution.linearGrid and execution.rowGrid fold at.
-const GRID_WIDTH: u32 = 32768u;
-`;
-
-const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> normalized: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<uniform> p: Parameters;
-@group(0) @binding(3) var<storage, read_write> keys: array<f32>;
-@group(0) @binding(4) var<storage, read_write> values: array<f32>;
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  // 🔴 THE y TERM. This is the monomer's kernel copied, and it carried the
-  // monomer's bug: execution.linearGrid folds past 32768 workgroups and reading
-  // id.x alone stops the kernel dead at 2,097,152 elements, leaving the keys
-  // and values beyond it as whatever the recycled scratch held. See the note in
-  // src/evoformer/block.js and the collapse it cost in docs/AF2.md.
-  let index = id.x + id.y * GRID_WIDTH * 64u;
-  if (index >= p.length * p.sequences * p.head_dim) { return; }
-  let d = index % p.head_dim; let row = index / p.head_dim;
-  var key = 0.0; var value = 0.0;
-  for (var c = 0u; c < p.channels; c += 1u) {
-    let x = normalized[row * p.channels + c];
-    key += x * weights[p.key_weight + c * p.head_dim + d];
-    value += x * weights[p.value_weight + c * p.head_dim + d];
-  }
-  keys[index] = key; values[index] = value;
-}`;
-
-const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
-@group(0) @binding(0) var<storage, read> query: array<f32>;
-@group(0) @binding(1) var<storage, read> keys: array<f32>;
-@group(0) @binding(2) var<storage, read> values: array<f32>;
-@group(0) @binding(3) var<storage, read> mask: array<f32>;
-@group(0) @binding(4) var<uniform> p: Parameters;
-@group(0) @binding(5) var<storage, read_write> output: array<f32>;
-@compute @workgroup_size(1)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let column = id.x; let head = id.y;
-  if (column >= p.length || head >= p.heads) { return; }
-  var maximum = -1e30; var denominator = 0.0;
-  var accumulated: array<f32, 32>;
-  for (var d = 0u; d < p.head_dim; d += 1u) { accumulated[d] = 0.0; }
-  for (var sequence = 0u; sequence < p.sequences; sequence += 1u) {
-    var logit = 0.0;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      logit += query[(column * p.heads + head) * p.head_dim + d]
-        * keys[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    if (mask[sequence * p.length + column] == 0.0) { logit = -1e9; }
-    let next_maximum = max(maximum, logit);
-    let previous_scale = exp(maximum - next_maximum);
-    let weight = exp(logit - next_maximum);
-    denominator = denominator * previous_scale + weight;
-    for (var d = 0u; d < p.head_dim; d += 1u) {
-      accumulated[d] = accumulated[d] * previous_scale
-        + weight * values[(column * p.sequences + sequence) * p.head_dim + d];
-    }
-    maximum = next_maximum;
-  }
-  for (var d = 0u; d < p.head_dim; d += 1u) {
-    output[(column * p.heads + head) * p.head_dim + d] = accumulated[d] / denominator;
-  }
-}`;
+// 🔴 THE GLOBAL ATTENTION KERNELS COME FROM THE EVOFORMER, AND USED TO BE
+// COPIED. This file held its own GLOBAL_ATTENTION_COMMON, _KV_SHADER and
+// _FLASH_SHADER, byte-identical in CODE to the monomer's and different in
+// COMMENTS - and registered them under the monomer's keys. A multimer fold
+// reaches both, so the second registration hit
+// `WebGPU pipeline cache key collision for block:global-attention:kv`, the
+// check doing exactly its job: one key, two texts. Matching the comments
+// would have silenced it and left the next edit to re-break it.
 
 // 🔴 THE GLOBAL ATTENTION'S QUERY AND OUTPUT KERNELS COME FROM THE MONOMER'S
 // FILE, because they were a verbatim copy of it and both had the same fault:

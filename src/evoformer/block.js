@@ -91,7 +91,7 @@ struct Parameters {
 const GRID_WIDTH: u32 = 32768u;
 `;
 
-const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
+export const GLOBAL_ATTENTION_KV_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> normalized: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
 @group(0) @binding(2) var<uniform> p: Parameters;
@@ -200,7 +200,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 }`;
 }
 
-const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
+export const GLOBAL_ATTENTION_FLASH_SHADER = `${GLOBAL_ATTENTION_COMMON}
 @group(0) @binding(0) var<storage, read> query: array<f32>;
 @group(0) @binding(1) var<storage, read> keys: array<f32>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
