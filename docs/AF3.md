@@ -1916,3 +1916,20 @@ pLDDT 84.26493204096884 against 84.26493426067073.
 **ampere only.** `singleProjectSplits`' own table shows 6 splits LOSING on an M2
 at every n it was measured at, which is why these were left as parameters in the
 first place - see DEFAULTS_ARE_MEASUREMENTS.
+
+🔴 **AND EVERY NUMBER ABOVE IS A TRUNK NUMBER, NOT A FOLD NUMBER.** The trunk's
+GPU time is about 104 ms of a 1.18 s warm AF3 fold at 68 tokens - 9% - so 11 ms
+off it is **1%**, and that is what a whole fold shows:
+
+| | first | warm |
+|---|---:|---:|
+| AF3 68 tokens, new | 2.159 / 2.153 / 2.177 s | **1.166 / 1.159 / 1.219** |
+| AF3 68 tokens, old | 2.142 / 2.156 s | 1.184 / 1.169 |
+| OpenDDE 6mrr, new | | **2423 / 2420 ms** |
+| OpenDDE 6mrr, old | | 2432 / 2493 ms |
+
+Consistently in the right direction and consistently about 1%, with the first
+fold unmoved because it is compilation and weights. Take the change - it is
+free, and it is a kernel running at four times its old rate - but do not quote
+the trunk figure as a fold figure. This is the distinction docs/PERF.md keeps
+making about `--profile`: a share of a stage is not a share of a wall.
