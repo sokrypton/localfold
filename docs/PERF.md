@@ -1379,8 +1379,9 @@ is worth most of a morning if the first number is believed. Use `--repeats`.
   3469 ms looks alarming, and 370 come from `src/runtime/validation.js` - which
   is the DeferredValidation class, whose whole point is that the pops are held
   and settled together at a boundary that already synchronises. They resolve
-  concurrently; the sum is not a wall. The 12 sites that DO await one are 175 ms
-  between them.
+  concurrently; the sum is not a wall. The other **58 calls come from 11 sites
+  that DO await one, and they are 175 ms between them** - the largest the atom
+  decoder's 32 calls at 62 ms.
 - **Encoding and submitting are not the cost.** Under 30 ms in every model, with
   bind groups another 18-48. The command building is free relative to the fold.
 - **Uploads by label are not the cost.** The largest is `expand.projection` at
