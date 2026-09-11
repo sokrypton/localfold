@@ -167,6 +167,29 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
   // decides how wide it may be. Halving until it divides lands on 64 - exactly
   // what every caller had before the knob existed - so the unreachable case
   // resolves to today's behaviour rather than to a surprise.
+  //
+  // 🔴 WHY HALVE AND NOT PAD, which is the obvious other answer. The outputs
+  // are STRIDED - `out0 + b * lanes` - so `perThread = ceil(perSplit / lanes)`
+  // with a guard on the tail `b` would work, and generating the guard only for
+  // the ragged iteration is what src/triangle/shaders.js already does for an
+  // odd `cZ`. Two reasons it is not worth it, and the second is measured.
+  //
+  // The guard would sit INSIDE the CHANNELS loop, beside an
+  // `array<f32, perThread>` subscripted by the loop variable. Those are the two
+  // constructs this repository has measured 4x cliffs from - a runtime loop
+  // bound is 26.2 -> 113 ms in `opm.project-output`, and a dynamic index that
+  // stops a small array living in registers is 26.2 -> 103.2. A guard that
+  // breaks the unroll turns a 25% occupancy gain into a 4x loss, and the two
+  // are indistinguishable in review.
+  //
+  // And it would buy nothing where it applies. The ragged shape happens only
+  // for n in [1024, 2047], and by 1024 this kernel is no longer starved:
+  // `single.project` is **3.92 ms of a 3502 ms trunk, 0.11%**. Removing the
+  // raggedness altogether - splits 3, perSplit 128, no padding needed - takes
+  // it to 3.10 and leaves the trunk at 3499.3 / 3503.2 against 3502.1 / 3502.3.
+  // So the whole prize is 0.8 ms of 3502, and padding at 75% lane utilisation
+  // would get less of it than that clean arm did. The starvation this knob
+  // exists for is at SHORT chains, which are never ragged.
   let projectLanes = requestedLanes;
   while (projectLanes > 1 && perSplit % projectLanes !== 0) projectLanes /= 2;
   if (perSplit % projectLanes !== 0) {
