@@ -287,10 +287,10 @@ Written from the A100 side. The first two rounds already happened and found
 real bugs there - the matrix attention crashing on 8x8 units, the derivations
 overriding Apple's measured defaults, and then the 160-residue race below.
 
-🔴 **THE MERGE IS NOT THE QUESTION ANY MORE.** `main` is at `005bb16`, live and
-verified, and `a100` is ONE commit ahead of it - the race investigation. So this
-section is no longer a pre-merge checklist; it is the open thread and the
-instruments for it.
+🔴 **THE RACE IS FOUND, FIXED AND GATED; SEE BELOW.** It was a missing bounds
+check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
+section is the record of the hunt and the instruments it produced, not an open
+thread.
 
 🔴 **WHY AN APPLE PART IS THE INTERESTING ONE.** The capability layer and the
 five derivations sit UNDER the priors, and `metal-3`'s prior sets three knobs.
@@ -587,13 +587,27 @@ to be that and not the deduplication landing beside it: `--no-dedupe` gives
 
 ### And the merge itself
 
-`a100` into `main` is NOT a fast-forward - main took two of this branch's
-commits separately plus the phone lane. Two conflicts, `CLAUDE.md` and
-`tools/gpu/fold-af2.js`, both resolving to **ours**: main's side of each hunk is
-simply the absence of this branch's additions. Verified from here that the
-merged tree's `src/` and `web/` are byte-identical to `a100`, so the merge ships
-no code beyond what is already on the branch - it brings in one doc and one dev
-harness file.
+That round is merged. The round after it - the race fix - **is** a
+fast-forward: `main` is an ancestor of `a100`, no conflicts.
+
+🔴 **AND ITS SHIPPING SURFACE IS THREE LINES.** `git diff main..a100 -- src web`
+is three files, and ignoring comments the whole of it is two bounds checks and
+one `export`:
+
+```
++  if (index >= arrayLength(&base)) { return; }      execution.js
++  if (index >= arrayLength(&output)) { return; }    elementwise.js
+-const ADD_IN_PLACE_SHADER = `
++export const ADD_IN_PLACE_SHADER = `
+```
+
+plus `setBufferPooling` in allocator.js, which is a diagnostic that DEFAULTS TO
+OFF - `poolingDisabled` starts false and only `bench-af2-warm.js --no-pool` sets
+it, so the shipped path is untouched. Everything else in the merge is docs, two
+probes, a test and the race gate's alignment generator.
+
+Verified on the M2 that the guard is inert where nothing over-dispatches:
+`fold-af2.js` at 59 residues is **-1282976 on both branches**, byte for byte.
 
 ## The traps that repeat
 
@@ -619,6 +633,22 @@ against `fetch('/src/af3/fold.js?v=' + Date.now())`. If they disagree, it is the
 cache. ⌘⇧R clears it. `tools/fold-in-page.py` never sees this because it
 launches a fresh Chrome profile, which is why it can pass while the browser in
 front of you does not.
+
+🔴 **AND THE STANDING RACE GATE NO LONGER FITS THE DEFAULT TIMEOUT ON AN M2.**
+`gpu-chrome.mjs` gives a module 600 s and reports "timed out after 600000 ms",
+which reads exactly like a hang. `bench-af2-warm.js` at its default
+825/512/1024 now takes **770 s** there - 291 cold and 238/241 warm - because
+`cd366b6` made its alignment generator produce DISTINCT rows: the shape used to
+collapse to twelve sequences under deduplication and is now a genuine 1536-row
+one, about 1.45x the work. Raise the budget rather than doubting the fold:
+
+```
+LOCALFOLD_GPU_TIMEOUT_MS=2400000 node tools/gpu-chrome.mjs tools/gpu/bench-af2-warm.js
+```
+
+It passes there - deterministic, checksum **-123086553** on an M2 against the
+A100's -121844157, which is the usual cross-machine difference and not a
+disagreement. The A100 is fast enough that the default still fits.
 
 🔴 **AND `node tools/gpu-chrome.mjs` SOMETIMES DOES NOT EXIT.** The results file
 is complete and correct and the node process sits there with a headless Chrome
