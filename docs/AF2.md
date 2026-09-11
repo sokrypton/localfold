@@ -1897,3 +1897,58 @@ With the generator fixed here too, `--rows` selects it: **1** dispatch at 128
 rows and **49** at 16, reproducing the table above in the gate. Both shapes are
 deterministic on the A100 after the guard - 160 and 400 residues, six passes
 each - and the default checksum moves to **-121844157**.
+
+## Reading alphafold2-webgpu again: the residual add could not fold a big complex
+
+Forty commits landed upstream between 2026-09-09 and 09-11, nearly all from
+**@milot-mirdita**. Read for the ideas only - that repository carries no LICENCE
+and is marked `"private": true`, so nothing is copied from it and everything
+below was re-derived and measured here.
+
+### Taken: windowing the residual add
+
+`Window the residual add, so a complex past 2,896 residues runs at all` says
+`addInPlace` bound both tensors whole, and an ordinary tetramer therefore died
+planning 13.1 GB on a 97 GB card - because the limit is not memory, it is
+`maxStorageBufferBindingSize`, which is Vulkan's `maxStorageBufferRange` and no
+request raises.
+
+**We had the same gap, at a LOWER ceiling.** Their pair is packed f16 at two
+bytes a channel, so theirs is `sqrt(2 GiB / 256)` = 2,896 residues; ours is f32,
+so ours is `sqrt(2 GiB / 512)` = **2,047**. Demonstrated rather than computed, by
+`tools/gpu/probe-residual-binding-ceiling.js` on a card with 40 GB free:
+
+| residues | pair | before | after |
+|---:|---:|---|---|
+| 2,047 | 2.00 GiB | ok | ok, one window |
+| 2,048 | 2.00 GiB | **REFUSED** - "Binding size (2147483648) is larger than the maximum storage buffer binding size (2147483644)" | ok, two windows |
+| 2,896 | 4.00 GiB | refused | **ok**, two windows |
+
+The add is elementwise, so it windows: each dispatch binds a range that fits,
+and the guard reads `arrayLength(&base)`, which is the WINDOW's length - so the
+last workgroup of a window stops at the window instead of running into the next.
+Below the ceiling the single-dispatch path is untouched and every checksum is
+unchanged.
+
+🔴 **AND THE NEXT WALL IS A DIFFERENT ONE.** At 3,300 residues the buffer fails
+before the binding does: `maxBufferSize` is 4 GiB here, so a single f32 pair
+tops out at **2,896** residues however it is bound. Windowing cannot help that;
+packing the pair to f16 or sharding it across buffers would, which is what
+upstream's packing work does.
+
+🔴 **AND THEY FOUND OUR RACE FROM THE OTHER SIDE.** The same commit says "the f32
+shader gets the bounds check its packed siblings always had. It relied on the
+WebGPU bounds clamp, which the native path turns off." That is the identical
+missing guard the M2 found here, reached by a third route: for them a native
+wgpu path with robustness off, for us Metal clamping onto the last element, and
+for this A100 a backend that discards and hid it entirely. Three exposures, one
+bug, and the WGSL specification permits all three.
+
+### Read and not taken, with their numbers
+
+| upstream | what it is | why not here, yet |
+|---|---|---|
+| `Make a bind group once for what it binds` | 5,157 bind groups a recycle at 59 residues, 70% rebuilding an identical one; cached by pipeline and by what they bind, bounded at 8,192 | **Confirmed here independently** - `probe-submits.js` counts **5,436** for AF2 and 9,463 for AF3 - but that is 31 ms and 48 ms of host time, and docs/PERF.md's host-side survey says a fold is GPU and waiting, not CPU. Worth taking; worth measuring first |
+| `Fold the query normalization into the global gate's weight` | the normalisation is affine per channel and the gate contracts over channels, so scale x weight is one tensor and offset x weight sums into the bias | The best idea of the forty: algebraic, not a tile. Needs its own derivation and a differential gate here |
+| `Give the triangle contraction twice the output rows a workgroup` | halves the weight staging | Priced upstream at 1.7% of a 3,300-residue recycle and **0.6%** at 825 - below what this box can resolve without many paired runs |
+| `Report the ceiling a device's binding count sets` | `maxStorageBuffersPerShaderStage`, 8 on this card | Already respected here: several shaders sit at exactly 8 and the atom encoder packs ten gathers into one buffer citing "the eight-buffer guarantee". Not a gap |

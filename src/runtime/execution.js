@@ -465,8 +465,48 @@ export class WebGpuExecution {
   async addInPlace(encoder, base, update, label) {
     if (base.elements !== update.elements) throw new RangeError("residual tensors must have equal sizes");
     const pipeline = await this.pipelines.get("runtime:add-in-place", ADD_IN_PLACE_SHADER);
-    const grid = this.linearGrid(base.elements);
-    this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
+    if (base.elements !== update.elements) {
+      throw new RangeError(`addInPlace over ${base.elements} and ${update.elements} elements`);
+    }
+    // 🔴 THE PAIR OUTGROWS A BINDING BEFORE IT OUTGROWS THE CARD. Both tensors
+    // were bound WHOLE, and the pair is `L * L * channels * 4` bytes against
+    // `maxStorageBufferBindingSize` - 2 GiB on this A100 and on most cards,
+    // which no request raises because it is Vulkan's `maxStorageBufferRange`.
+    // So the ceiling was `sqrt(2 GiB / 512)` = **2047 residues** at 128
+    // channels, whatever memory the device had: measured, 2047 binds and 2048
+    // is refused outright on a card with 40 GB free. A large complex simply
+    // could not fold.
+    //
+    // The add is elementwise, so it windows: each dispatch binds a range that
+    // fits and the guard in the shader reads `arrayLength(&base)`, which is the
+    // WINDOW's length - so the last workgroup of a window stops at the window
+    // rather than running into the next one. The trunk already shards this same
+    // tensor; only this path bound it whole.
+    //
+    // 🔴 CREDIT: @milot-mirdita found this in martin-steinegger/alphafold2-webgpu
+    // ("Window the residual add, so a complex past 2,896 residues runs at all"),
+    // where an ordinary tetramer died planning 13.1 GB on a 97 GB card. Their
+    // ceiling is 2,896 because their pair is packed f16 at two bytes a channel;
+    // ours is f32, so ours is lower. Their repository carries no licence -
+    // the idea was read, the code was not.
+    //
+    // 🔴 AND A WINDOW STARTS ON 256 BYTES, which is 64 f32 elements, because
+    // that is what a bound range must be aligned to - see the check in
+    // `dispatch`. Rounding DOWN keeps every window inside the limit.
+    const perBinding = Math.floor(this.device.limits.maxStorageBufferBindingSize / 4);
+    const windowElements = Math.floor(perBinding / 64) * 64;
+    if (base.elements <= windowElements) {
+      const grid = this.linearGrid(base.elements);
+      this.dispatch(encoder, pipeline, [base, update], grid[0], grid[1], 1, label);
+      return;
+    }
+    for (let at = 0; at < base.elements; at += windowElements) {
+      const count = Math.min(windowElements, base.elements - at);
+      const grid = this.linearGrid(count);
+      this.dispatch(encoder, pipeline,
+                    [this.view(base, at, count), this.view(update, at, count)],
+                    grid[0], grid[1], 1, label);
+    }
   }
 
   createReadback(label, tensor, encoder) {
