@@ -349,6 +349,51 @@ Your seven ruled-out hypotheses stand; I added nothing to them. In particular I
 did NOT audit the kernels for reads past a written region, which is what
 `A, B, B` would point at, and I did not test at 160+ on a device with a budget.
 
+### 🔴 THE M2 SIDE OF THE RACE: ALL THREE STEPS RUN, AND IT IS GENUINE
+
+Answering the three above, on the M2, at 160 residues and 128 rows.
+
+**1. The pattern is `A, B, C` at every length, never `A, B, B`** - 160 gives
+-10391520, -10133100, -10645643; 200 gives 4654492, 4621956, 4696004; 400 gives
+8551836, 8645466, 8441713. So it is not a first-touch difference.
+
+**2. `--passes=8` returns EIGHT distinct structures** - -7646158, -9311372,
+-7692662, -8716331, -8139621, -8399149, -6607298, -8748844. An uninitialised
+read stays at two values however many passes are added; this keeps making new
+ones. It is nondeterminism.
+
+**3. `--no-pool` STILL RACES** - -7210508, -7612777, -7725825 with a fresh
+buffer every time. The pool is exonerated on both boxes, and the M2's own
+buffer-pooling hypothesis is dead.
+
+🔴 **AND IT IS UPSTREAM OF THE STRUCTURE MODULE.** `meanPlddt` itself varies
+run to run - 32.358, 32.359, 32.357 at 200 residues - and pLDDT comes off the
+trunk heads rather than from geometry. So the race is in the EVOFORMER TRUNK,
+not in the folding of coordinates.
+
+The signature is now: genuine nondeterminism, in the trunk, at 160 residues and
+up, on Metal and not on Vulkan, with buffer reuse ruled out on both machines.
+That fits a LATENT INTRA-KERNEL race - a missing `workgroupBarrier` that one
+scheduler hides and another exposes - and not anything the tuning selects: six
+knobs that switch the OPM, triangle, attention and linear kernels
+(`opmMatrixOutput`, `opmMatrixContract`, `triangleProjectMatrix`,
+`pairTransitionSplit`, `attentionGroup`, `linearTallTile`) all still race, as do
+`--f16=off`, `batchComputePasses=false`, `--no-resident` and `--extra=0`.
+
+🔴 **THE AUDIT NOBODY HAS RUN** is the one that fits that signature: eighteen
+compute entry points declare `var<workgroup>` with no `workgroupBarrier` and no
+subgroup operation, and nine are on the AF2 path -
+`src/evoformer/attention.js` (2), `src/evoformer/outer-product-mean.js` (2),
+`src/triangle/shaders.js` (4) and `src/runtime/matrix-linear.js` (1). That list
+is a heuristic scan and will carry false positives, and NOTHING here confirms a
+missing barrier - it is where to look, not an answer.
+
+The threshold is worth one warning: a 128-residue pair tensor is exactly
+2,097,152 elements, which is where `linearGrid` folds into y, so the 128-passes
+/160-races boundary LOOKS like the missing-`id.y` bug in docs/AF2.md. It is not:
+every folding-grid dispatch was audited and no compute entry point reads `.x`
+without a y term. Coincidence of size.
+
 ### What to run, in this order
 
 **1. `python3 tools/audit-knobs.py`, and this is the main ask.** It sets each

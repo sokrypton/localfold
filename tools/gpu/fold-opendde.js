@@ -15,7 +15,7 @@ import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
   from "../../src/af3/fold.js";
 import { structuralLayout } from "../../src/af3/structural-tokens.js";
 import { STRUCTURAL_REFINER } from "../../src/af3/weights.js";
-import { assertChainGeometry } from "./chain-geometry.js";
+import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { profileDevice } from "./profile.js";
@@ -229,6 +229,21 @@ export async function main(device, args) {
   };
   const frames = [];
   const unmapped = [];
+  const frameGeometry = [];
+  // One pass over the atom names, reused by every frame.
+  const caSlots = batch.refAtomNameChars === undefined ? null
+    : Array.from({ length: batch.tokens }, (unused, token) => {
+      for (let s2 = 0; s2 < batch.dense; s2 += 1) {
+        const base = (token * batch.dense + s2) * 4;
+        const name = [0, 1, 2, 3].map((c) => {
+          const v = batch.refAtomNameChars[base + c];
+          return v > 0 ? String.fromCharCode(v + 32) : "";
+        }).join("");
+        if (name === "CA") return s2;
+      }
+      return -1;
+    });
+
   let lastStage = null;
   const timings = {};
   // 🔴 THE FOLD'S CLOCK STARTS AFTER THE WEIGHTS ARE LOADED, AND A USER'S DOES
@@ -270,6 +285,28 @@ export async function main(device, args) {
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     mode: option(args, "mode", "diffusion"),
     onStep: ({ step, denoised, structuralDenoised }) => {
+      // 🔴 THE GEOMETRY OF THE FRAME, NOT JUST ITS SIZE. `frameGyration` says a
+      // frame is protein-SIZED, which is what caught the token-space bug - and
+      // a radius of gyration cannot see a broken bond. This is the same alpha
+      // carbon walk the final structure is gated on, applied to what the page
+      // actually draws, so "the atoms look broken during diffusion" becomes a
+      // number per step instead of an impression.
+      if (caSlots !== null) {
+        const spacings = [];
+        for (let token = 1; token < batch.tokens; token += 1) {
+          const a = caSlots[token - 1];
+          const b = caSlots[token];
+          if (a < 0 || b < 0) continue;
+          const i = ((token - 1) * batch.dense + a) * 3;
+          const j = (token * batch.dense + b) * 3;
+          spacings.push(Math.hypot(denoised[j] - denoised[i],
+                                   denoised[j + 1] - denoised[i + 1],
+                                   denoised[j + 2] - denoised[i + 2]));
+        }
+        const g = chainGeometryOf(spacings);
+        frameGeometry.push({ step, caca: Number(g.caca.toFixed(3)),
+                             worst: Number(g.worstCaca.toFixed(3)) });
+      }
       // 🔴 THE CONTROL: the SAME frame read the way the page read it before -
       // structural-layout coordinates indexed by the residue mask. It has the
       // right atom count and the wrong atoms.
@@ -490,6 +527,7 @@ export async function main(device, args) {
       .map((r) => ({ label: r.label, MiB: Number((r.bytes / 2 ** 20).toFixed(1)),
                      count: r.count })),
     geometry,
+    frameGeometry,
     frameGyration: frames.filter((f, i) => i % 6 === 0 || i === frames.length - 1),
     frameGyrationUnmapped: unmapped.filter((f, i) => i % 6 === 0 || i === unmapped.length - 1),
     scored: scored && { rmsd: Number(scored.rmsd.toFixed(3)),
