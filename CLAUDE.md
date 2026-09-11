@@ -282,10 +282,14 @@ passing.
 
 ## 🔴 IF YOU ARE THE M2 (OR A PHONE): WHAT TO CHECK ON THIS BRANCH
 
-Written from the A100 side, for whoever verifies before `a100` reaches `main`.
-The first round of this already happened and found two real bugs there - the
-matrix attention crashing on 8x8 units, and the derivations overriding Apple's
-measured defaults - so this is the SECOND round, over what has landed since.
+Written from the A100 side. The first two rounds already happened and found
+real bugs there - the matrix attention crashing on 8x8 units, the derivations
+overriding Apple's measured defaults, and then the 160-residue race below.
+
+🔴 **THE MERGE IS NOT THE QUESTION ANY MORE.** `main` is at `005bb16`, live and
+verified, and `a100` is ONE commit ahead of it - the race investigation. So this
+section is no longer a pre-merge checklist; it is the open thread and the
+instruments for it.
 
 🔴 **WHY AN APPLE PART IS THE INTERESTING ONE.** The capability layer and the
 five derivations sit UNDER the priors, and `metal-3`'s prior sets three knobs.
@@ -294,6 +298,56 @@ every number recorded for them was taken with `--no-prior`. An Apple part is,
 for most knobs, exactly the unrecognised device these layers were built for -
 and `DEFAULTS_ARE_MEASUREMENTS` now yields to that, so what runs there is a
 different code path from anything measured here.
+
+### 🔴 THE OPEN THREAD IS YOUR RACE, AND THE A100 SIDE IS DONE
+
+You asked for one command - `bench-af2-warm.js --length=160 --rows=128` here -
+because it halves the search space. It does. **This box does not reproduce it**:
+ok at 59, 80, 100, 128, 160, 200, 400 and 825, then the three that fail on your
+box pressed with `--passes=8` (28 pairs a run to disagree on rather than 3) for
+four rounds each - twelve runs, all agreeing, and the checksums identical ACROSS
+runs too: 160 is **-9869845** every time, 200 **-704434**, 400 **-15124842**.
+Note the standing gate has always defaulted to **825** and passes, so the
+longest case has been deterministic here throughout.
+
+That does not clear the kernels - a race can be latent and need a scheduler to
+expose it - but the mechanism involves Metal or Dawn on your side.
+
+Three things to run, cheapest first. **The first one costs nothing: you already
+have the output.**
+
+1. **READ THE PATTERN IN THE ERROR YOU ALREADY HAVE.** `bench-af2-warm` prints
+   every checksum and `new Set(checksums).size`, and the shape separates your two
+   candidates outright:
+   - `2 different structures: A, B, B` - pass 1 differs, the rest agree. That is
+     a FIRST-TOUCH difference and not a race: pass 1 reads WebGPU's
+     zero-initialised buffers and passes 2+ read recycled ones. Deterministic,
+     and it points straight at a kernel reading a region it did not write.
+   - `3 different structures: A, B, C` - genuine nondeterminism, a scheduling
+     question.
+2. **`--passes=8`**, which sharpens the same distinction: an uninitialised read
+   stays at two values however many passes you add, a race keeps producing new
+   ones.
+3. **`bench-af2-warm.js --no-pool`**, which is your buffer-pooling hypothesis in
+   one run - I built it for this. A pooled buffer keeps the previous fold's
+   bytes, so a kernel reading what it did not write differs between fresh and
+   reused. On the A100 at 160 the checksum is **-9869845 either way**, so
+   recycling changes nothing here. 🔴 IT RETIRES RATHER THAN DESTROYS AND LEAKS
+   BY DESIGN - destroying on release killed every length with `[Buffer]
+   destroyed`, because a released buffer is still named by an in-flight command
+   buffer, which is WHY the pool exists. Fine at 59-160 on 40 GB, `Error.cpp:119`
+   at 200. **Use short lengths on an M2.**
+
+If `--no-pool` stops the race, it is ours after all - a kernel reading
+uninitialised memory, invisible here only because Vulkan's recycled bytes happen
+to land the same way - and the next step is finding which kernel, not which
+scheduler. If it still races with a fresh buffer every time, the pool is
+exonerated on both boxes.
+
+🔴 **AND WHAT I DID NOT RULE OUT.** Only that the A100 does not reproduce it.
+Your seven ruled-out hypotheses stand; I added nothing to them. In particular I
+did NOT audit the kernels for reads past a written region, which is what
+`A, B, B` would point at, and I did not test at 160+ on a device with a budget.
 
 ### What to run, in this order
 
