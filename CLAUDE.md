@@ -427,7 +427,11 @@ times proved nothing about the kernels, and no amount of pressing it would have.
 
 It lands upstream of the trunk: src/model/monomer.js applies the template
 residual through `addInPlace` once per recycle, unconditionally, on
-`pairWithoutTemplates`. One corrupted cell - `pair[L-1][L-1][127]` - reaches
+`pairWithoutTemplates`. 🔴 AND BELOW 32 MSA ROWS IT IS 48 TIMES A RECYCLE
+INSTEAD OF ONCE - the outer product mean writes straight into the pair tensor and
+skips its own `addInPlace` only while `sequences >= cOuter`, so a SHALLOW
+alignment puts the same unguarded read-modify-write in every block. Counted on
+the device: 1 call at 128 rows, 49 at 16. See docs/AF2.md. One corrupted cell - `pair[L-1][L-1][127]` - reaches
 everything within two blocks, because the triangle multiplications mix every
 `(i, j)` through every `k`. That is why `meanPlddt` ITSELF varied. Two more call
 sites on the same tensor: src/multimer/model.js (templates only) and

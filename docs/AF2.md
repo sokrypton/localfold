@@ -1840,11 +1840,29 @@ So the missing guard was invisible here rather than absent, and "it does not
 reproduce on the A100" was luck of the backend, not evidence about the code.
 WebGPU permits either behaviour; neither is a guarantee to lean on.
 
-🔴 **AND IT IS SEVEN CALL SITES, NOT THREE.** `addInPlace` is used by
-monomer.js, multimer/model.js and query-only.js for the TEMPLATE residual - once
-a fold - and by evoformer/block.js and multimer/block.js for the OUTER PRODUCT
-MEAN residual, twice in the main stack and three times in the extra one, **every
-block**. That is the dominant exposure and it is why `--extra=0` still raced:
-the main stack's own residual is `evoformer/block.js:1255`. All seven share the
-one shader, so one guard covers all of them - including the two an M2 with only
-the monomer bundle cannot fold.
+🔴 **SEVEN CALL SITES EXIST; HOW MANY RUN DEPENDS ON THE MSA DEPTH, AND AT
+THE BENCHMARK'S DEPTH IT IS ONE.** `addInPlace` serves the TEMPLATE residual in
+monomer.js, multimer/model.js and query-only.js - once a fold - and the OUTER
+PRODUCT MEAN residual in evoformer/block.js and multimer/block.js. The OPM ones
+are CONDITIONAL: `encodeOuterProductMean` writes straight into the pair tensor
+and returns it whenever the outer-first path is taken, and the caller is
+`if (update !== pair)`. `useOuterFirstContraction` is
+`sequences >= cOuter && bytesPerPair <= limit`, so the branch turns on the
+alignment's depth against **32**.
+
+Counted on the device rather than read off the source, `fold-af2.js --length=160
+--extra-rows=64`:
+
+| clustered rows | `addInPlace` calls in a fold |
+|---:|---|
+| 128 | 1 - `monomer.template-residual-0`, and nothing else |
+| 16 | **49** - the template residual, plus `outer-product-mean.residual` **48 times**, once per main-stack block |
+
+So at any normal depth the exposure is the template residual alone, and
+`--extra=0` still raced because THAT is unconditional - not because of
+`evoformer/block.js:1255`, which does not fire at 128 rows. **Below 32 rows in a
+stack the same unguarded read-modify-write lands on the pair tensor 48 times a
+recycle instead of once**, which is the deeper exposure and is exactly the
+shallow-alignment case a novel protein hits. All seven share the one shader, so
+one guard covers every one of them - including the two an M2 with only the
+monomer bundle cannot fold.
