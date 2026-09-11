@@ -1959,7 +1959,7 @@ bug, and the WGSL specification permits all three.
 | upstream | what it is | why not here, yet |
 |---|---|---|
 | `Make a bind group once for what it binds` | 5,157 bind groups a recycle at 59 residues, **70%** rebuilding an identical one | 🔴 **THE COUNT TRANSFERS AND THE RATE DOES NOT.** `probe-submits.js` counts 5,436 for AF2, close to their 5,157 - but keyed on what each one actually binds (buffer object, offset, size) only **20%** repeat here, 1,078 of 5,436, and 23% for AF3. That is 6 ms of 32. Their blocks are handed the same pooled scratch and differ only in uniforms; ours bind a different weight buffer per block. **Not worth taking here** |
-| `Fold the query normalization into the global gate's weight` | the normalisation is affine per channel and the gate contracts over channels, so scale x weight is one tensor and offset x weight sums into the bias | **Algebra verified here**: the folded form matches the direct one to 1.01e-6, and the per-iteration work goes from four loads and four operations to two and two. Still to do - it needs a differential gate. See the row below for the part worth reading twice |
+| `Fold the query normalization into the global gate's weight` | the normalisation is affine per channel and the gate contracts over channels, so scale x weight is one tensor and offset x weight sums into the bias | **Algebra verified here** (1.01e-6) and then **NOT TAKEN, because this port already hoisted it another way** - see below |
 | `Give the triangle contraction twice the output rows a workgroup` | halves the weight staging | Priced upstream at 1.7% of a 3,300-residue recycle and **0.6%** at 825 - below what this box can resolve without many paired runs |
 | `Report the ceiling a device's binding count sets` | `maxStorageBuffersPerShaderStage`, 8 on this card | Already respected here: several shaders sit at exactly 8 and the atom encoder packs ten gathers into one buffer citing "the eight-buffer guarantee". Not a gap |
 
@@ -1982,3 +1982,40 @@ answer entirely. Random test data does not show this - it needs a row whose mean
 is large against its spread - which is exactly why the caution is worth having
 written down rather than rediscovered. Same shape as their f16-accumulator
 warning: the negative result travels further than the optimisation.
+
+### And the gate fold does not transfer, because we fixed this kernel already
+
+Their gate "normalized every value as it read it: subtract the mean, scale by
+the inverse deviation, then a per-channel scale and offset, which is four loads
+and four operations an iteration for one multiply-add of actual work", and they
+call that loop the largest cost in their extra-MSA block after the outer product
+and the flash kernel. Folding the affine part into the weight removes it.
+
+**Here the gate reads a tensor that is already normalised.**
+`ATTENTION_NORMALIZE_SHADER` materialises `(x - mean) * invStd * scale + offset`
+in its own pass and `extra.msa-column-global-attention.output` does
+`staged[c] = normalized[...]` - one load, one multiply-add. The per-iteration
+cost their fold removes is not there to remove.
+
+And the pass cannot be dropped by folding, because `normalized` is shared: the
+query, kv and flash kernels all read it. Folding into the gate's weight alone
+would save the gate's arithmetic - which is already one load - and leave the
+tensor exactly where it is.
+
+The numbers, `profile-af2-block.js --stack=extra --length=825 --sequences=1024`,
+a 189 ms block over 200 kernels:
+
+| kernel | ms | share |
+|---|---:|---:|
+| `extra.msa-column-global-attention.flash` | 5.77 | 3.08% |
+| **`...global-attention.output`** - the gate their fold targets | **3.08** | **1.64%** |
+| `...global-attention.normalize` | 1.11 | 0.59% |
+| `...global-attention.kv` / `.query` | 0.71 / 0.61 | 0.38% / 0.33% |
+
+🔴 **AND THE REASON IT IS 1.64% IS THAT THIS FILE ALREADY FIXED THE BIG
+VERSION.** The note further up records the same kernel recomputing the gate once
+per output channel - 33x the arithmetic, **289.93 ms of a 681.61 ms extra-MSA
+block, 42.5%, the largest kernel in the whole fold**. A workgroup owns a row
+now. Their fold and that fix attack the same kernel from different sides, and
+having done the larger one leaves 3 ms where they had hundreds. Two ports, the
+same hot spot, two different roads out of it.
