@@ -480,6 +480,24 @@ passes by finding nothing.
 These are M2 checksums and are NOT comparable with the A100's: the two machines
 resolve different kernels. What is comparable is the count in the third column.
 
+🔴 **AND EVERY ROW OF THAT TABLE WAS RUN IN THE 53-CALL SHAPE, WHICH IS THE
+WORST ONE.** It was taken before `cd366b6` fixed this gate's own alignment
+generator, so `--rows` was inert and the alignment carried twelve distinct
+sequences however deep it claimed to be - below `cOuter`, so the outer product
+mean's residual fired in every block. The checksums above are therefore stale
+against the current generator, and the determinism they report is STRONGER than
+it looked: 53 corrupted adds a pass rather than one. Re-measured at 160 residues
+with distinct rows, both shapes, eight passes:
+
+| shape | `addInPlace` dispatches | distinct structures | checksum |
+|---|---:|---:|---:|
+| `--rows=128` (outer-first, one call) | 1 | 1 of 8 | -8240180 |
+| `--rows=16` (shallow, 48 + 1) | 49 | 1 of 8 | -5662210 |
+
+The A100's count reproduces here exactly - 1 and 49, each over-dispatching by
+917,504 - which is `tools/gpu/probe-add-in-place.js` doing the job that reading
+the source twice did not.
+
 ### What to run, in this order
 
 **1. `python3 tools/audit-knobs.py`, and this is the main ask.** It sets each
