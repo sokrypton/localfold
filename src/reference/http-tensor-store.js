@@ -310,8 +310,16 @@ export class HttpTensorStore {
     // 3.27 against 3.44 and 3.28, which is noise. A cold load here is bytes
     // over bandwidth - 265 MB at 9.4 MB/s is 28 s - and the tail is 41 MiB at
     // 9 MB/s, under five. The tail only binds when the link is fast enough for
-    // the first term to fall below the second, which is exactly the case this
-    // ordering protects and the case that cannot be measured from here.
+    // the first term to fall below the second.
+    //
+    // 🔴 AND THAT CASE HAS NOW BEEN MEASURED, WHICH THIS COMMENT USED TO SAY
+    // COULD NOT BE DONE FROM HERE. `tools/fold-in-page.py --throttle=8` shapes
+    // the whole page through CDP at Hugging Face's own 8 MB/s. Against manifest
+    // order, two rounds of a whole AF3 first visit: **39457 and 39442 ms
+    // against 39378 and 39398** - no difference, and manifest order nominally
+    // ahead. Eight connections sharing one pipe finish together whatever order
+    // they start in. Three harmless lines that are not a lever; do not reach
+    // for them again. See docs/HOSTING.md.
     const order = [...new Set(Object.values(this.manifest.tensors).map((record) => record.file))]
       .sort((left, right) =>
         (this.#fileByteLengths.get(right) ?? 0) - (this.#fileByteLengths.get(left) ?? 0));
