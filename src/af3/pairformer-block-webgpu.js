@@ -38,6 +38,7 @@ import {
 } from "../triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 
 /**
  * The matrix configuration a split transition wants, or false.
@@ -392,7 +393,7 @@ export class Af3PairformerStackGpu {
     }
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
-      triangleProjectTile: deviceTuning(this.device).trianglePairProjectTile ?? undefined,
+      triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       // 🔴 THE HEAD WIDTH IS THIS BUNDLE'S, NOT AF3's. OpenDDE runs this same
       // pairformer at its own widths, and a geometry the device cannot hold at
       // one of them resolves to false rather than throwing.
@@ -457,7 +458,18 @@ export class Af3PairformerStackGpu {
     // ...the dispatch multiplies by this; see the note on PROJECT_SPLITS.
     pipelines.singleProjectSplits = projectSplits;
     for (const [name, source] of Object.entries(singleSources)) {
-      into(`single:${name}`, `${base}:single:${weightPrecision}:${singleTuning.singleProjectLanes ?? 64}:${singleTuning.singleProjectOutLanes ?? 64}:${name}`, source);
+      // 🔴 THE SPLIT COUNT IS IN THE SHADER AND WAS NOT IN THE KEY.
+      // `projectSplits` is derived from `singleProjectWorkgroupTarget` and
+      // `singleProjectMaxSplits`, baked into the source, and multiplied into
+      // the dispatch two lines above - so two different targets generate two
+      // different kernels under one name. `--tune=singleProjectWorkgroupTarget`
+      // at either 220 or 55 died on the collision check; the arm had never been
+      // run. Named the RESOLVED value and not the knobs, because that is what
+      // the shader contains - the same reason block.js keys on
+      // `shaders.projectTile` rather than on the tuning that chose it.
+      into(`single:${name}`, `${base}:single:${weightPrecision}`
+        + `:${singleTuning.singleProjectLanes ?? 64}`
+        + `:${singleTuning.singleProjectOutLanes ?? 64}:s${projectSplits}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
       createPairLogitsShader(n, pairChannels, heads, logitsOffsets, epsilon, variance,
@@ -556,7 +568,7 @@ export class Af3PairformerStackGpu {
       // stack refilling; past sixteen the curve is flat and the remaining
       // waits are cheap insurance against an unbounded queue.
       const submissionWindow = options.submissionWindow
-        ?? deviceTuning(this.device).pairformerSubmissionWindow ?? 16;
+        ?? shapedKnob(deviceTuning(this.device).pairformerSubmissionWindow) ?? 16;
       const validation = new DeferredValidation(this.device, "AF3 pairformer stack");
       const start = performance.now();
       // 🔴 WHERE THE STACK'S WALL TIME ACTUALLY GOES, REPORTED RATHER THAN

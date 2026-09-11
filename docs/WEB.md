@@ -964,3 +964,85 @@ assertion, since "the row is hidden" was true even while the bug was there.
 
     forget:       {"hiddenAfter": true, "keysLeft": []}
     after forget: {"offered": false, "text": ""}
+
+## Every page timing here is a FIRST visit, and a returning one is much cheaper
+
+🔴 **`cdp.launch` WIPES THE CHROME PROFILE ON EVERY RUN**, which is the right
+default for a checker - CLAUDE.md's trap about a cached ES module looking
+exactly like a broken feature is about the other direction - and it means
+nothing in this repository had ever measured what a RETURNING user pays. A
+fresh user-data-dir has no HTTP cache and no SHADER cache, so every number
+recorded for the page includes downloading the whole bundle and compiling every
+pipeline.
+
+`fold-in-page.py --keep-profile` reuses it. Same machine, same fold, back to
+back:
+
+| | first visit | second | third |
+|---|---:|---:|---:|
+| OpenDDE, whole page | 7123 ms | **5896** | 5862 |
+| ...its status line, the fold alone | in 4 s | in 3 s | in 3 s |
+| AlphaFold 3, whole page | 4901 | **4215** | 4262 |
+
+**1.26 s off OpenDDE and 0.66 off AF3**, and the split matters: the status line
+is the fold's own clock, which starts after the weights are loaded, and it drops
+a whole second on OpenDDE. So a large part of what a second visit saves is
+Chrome serving the 269 compiled pipelines out of its shader cache, not merely
+the weights out of its HTTP cache. The status line rounds to whole seconds, so
+that is a direction and not a split.
+
+🔴 **WHICH REFRAMES THE COMPILE WORK.** OpenDDE's 1.3-1.8 s of shader
+compilation - `busyMs` in probe-compiles.js, against a 2.5 s fold - is a
+FIRST-VISIT cost, not a standing tax. It is worth reducing for a first
+impression and it is not what a returning user waits for. The weight download
+does not get cheaper in the same proportion, which leaves it the dominant term
+in both cases and puts bundle SIZE where docs/HOSTING.md already says it is.
+
+### And where the load itself goes, which is one phase
+
+`af3LoadMilliseconds` times each half of `loadAf3Weights`, read back by
+`fold-in-page.py` as `weightPhases`. OpenDDE:
+
+| phase | first visit | returning |
+|---|---:|---:|
+| open the store | 9 ms | 9 |
+| **trunk** | **1780** | **747** |
+| diffusion | 25 | 24 |
+| the structural expander | 63 | 62 |
+| atomReference, targetFeat, refiner, confidence | 8 | 8 |
+| **total** | **1884** | **849** |
+| ...of which host tensor decode | - | **95** (138 calls) |
+
+The whole load is the trunk phase, and on a returning visit it is 747 ms of
+which only 95 is decoding: the other ~650 is moving 472 MiB out of Chrome's
+disk cache and onto the GPU, which is about 725 MB/s and close to what that
+path can do. `--timeline` reports `model: null` on that visit, so none of it is
+network.
+
+🔴 **SO A RETURNING VISITOR'S LOAD IS ALREADY NEAR ITS FLOOR, AND THE FLOOR IS
+THE BYTE COUNT.** 472 MiB costs 650 ms even from local disk. Nothing in the
+decode path is worth attacking - 95 ms - and the download is already cached.
+The only thing that moves this number is a smaller bundle, which is where
+docs/HOSTING.md already points and which needs the float32 exports and a
+re-publish.
+
+### Creating the GPU device early: measured, already overlapped, not taken
+
+`getDevice` memoises one promise and its first caller used to be the fold, so
+the natural next move after the weight preload and the shader warm was to create
+the device at page load too. Measured on a cold page, the first `getDevice()` is
+**148 ms** and every call after it is 0.
+
+It buys nothing. Alternating arms, three pairs on the monomer page: 3148 / 3399
+/ 3151 ms with the device created at load against 3361 / 3424 / 3147 without -
+the spread inside each arm is larger than the difference between them. The
+reason is that the shader warm above already calls `getDevice()` at click time,
+concurrently with the weight download, so for every AF3-family model the 148 ms
+was already hidden the moment that landed. Reverted rather than kept as a
+plausible-looking three lines that move nothing.
+
+Two things this does NOT say. It is one browser on one machine, and a shader
+cache is a heuristic with an eviction policy nobody here controls. And
+`--keep-profile` must never become the default for a checker: the whole reason
+the wipe exists is that a stale module is indistinguishable from a broken
+feature, and this file is the wrong place to learn that again.

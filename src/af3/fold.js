@@ -57,6 +57,8 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
  * keeps saying so.
  */
 import { ALPHAFOLD3 } from "./dialect.js";
+import { keepResidentAffordable } from "../runtime/device-memory.js";
+import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 
 export const DIALECT = ALPHAFOLD3;
 
@@ -924,7 +926,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // tools/gpu/profile.js saw 144 ms of a 1300 ms fold and the rest looked like
   // nothing. `keepTrunkWeights` is a per-device prior, null everywhere the
   // trade has not been measured.
-  if (deviceTuning(device).keepTrunkWeights !== true) releaseResidentWeights(device, "w.");
+  if ((deviceTuning(device).keepTrunkWeights
+    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) releaseResidentWeights(device, "w.");
 
   // 🔴 OpenDDE RE-TOKENISES BETWEEN THE TRUNK AND THE DIFFUSION, AND THIS IS
   // WHERE. Every other model here folds one token space end to end; OpenDDE
@@ -1017,7 +1020,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // int5-upload passes are still re-done every fold, and the host waits for
   // them on the queue rather than in any compute pass. `keepSamplerWeights` is
   // the same shape of prior as `keepTrunkWeights` and null for the same reason.
-  if (deviceTuning(device).keepSamplerWeights !== true) {
+  // ...and where no prior says, the budget does; see keepResidentAffordable.
+  if ((deviceTuning(device).keepSamplerWeights
+    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) {
     releaseResidentWeights(device, "difftx.");
     // ...and the diffusion conditioning's, which are resident for the same
     // reason and dead at the same moment.
@@ -1138,7 +1143,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // second fold began with 52 blocks' weights on the device where the first
   // began with 48. They are the same prefix and the same policy: the trunk's
   // are given back every fold, so these are too.
-  if (deviceTuning(device).keepTrunkWeights !== true) releaseResidentWeights(device, "w.");
+  if ((deviceTuning(device).keepTrunkWeights
+    ?? (deviceDerivationsAllowed(device) && keepResidentAffordable(device))) !== true) releaseResidentWeights(device, "w.");
 
   // 🔴 EVERYTHING BELOW IS THE CONFIDENCE HEAD'S, SO IT IS ABSENT WHERE THE
   // HEAD IS. A model without one returns no pLDDT, no pTM and no per-chain

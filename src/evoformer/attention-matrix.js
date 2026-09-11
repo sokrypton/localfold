@@ -54,6 +54,7 @@
  */
 
 import { allowsAttentionSubgroupSize } from "./attention.js";
+import { deviceProfile } from "../runtime/device-profile.js";
 
 /** Lanes a subgroup, which every index here assumes. */
 export const ATTENTION_MATRIX_SUBGROUP_SIZE = 32;
@@ -178,7 +179,23 @@ export function supportsAttentionMatrix(device, headDim, geometry) {
   // defaulting it to zero refuses every device including this one - silently,
   // as an unsupported kernel rather than an error. src/evoformer/attention.js
   // already had `allowsAttentionSubgroupSize` reading the right place.
-  return allowsAttentionSubgroupSize(device, ATTENTION_MATRIX_SUBGROUP_SIZE);
+  if (!allowsAttentionSubgroupSize(device, ATTENTION_MATRIX_SUBGROUP_SIZE)) return false;
+  // 🔴 AND THE UNITS MUST BE THE SHAPE THIS SHADER DECLARES, WHICH HAVING THEM
+  // AT ALL DOES NOT SAY. Every matrix in here is `<f16, 16, 16>` - UNIT is not
+  // a tunable - and Metal supports 8x8 ONLY. So an M2 passes every check above,
+  // announcing `chromium-experimental-subgroup-matrix`, `shader-f16`,
+  // `subgroups` and a 32-lane subgroup, and then fails at pipeline creation
+  // with "the MSL backend only supports 8x8 subgroup matrices" - a
+  // GPUPipelineError out of a function whose whole contract is that a device
+  // which will never compile this kernel is refused here instead.
+  //
+  // It became reachable when `matrixCapabilityTuning` started answering
+  // `attentionMatrix` from the feature list, because the feature list says the
+  // units exist and never says how big they are: AF2 and the multimer stopped
+  // folding on this M2 entirely. The configs are the only place the shape is
+  // written down.
+  return deviceProfile(device).matrixConfigs.some(
+    (c) => c.componentType === "f16" && c.M === UNIT && c.N === UNIT && c.K === UNIT);
 }
 
 const COMMON = `

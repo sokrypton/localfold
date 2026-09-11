@@ -3,6 +3,7 @@ import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { memoryTotals } from "../runtime/device-memory.js";
 import { deviceTuning, halfPrecisionAvailable, deviceMatrixConfig } from "../runtime/device-profile.js";
 import { createStagedMatrixShader, stagedMatrixStorage } from "../runtime/matrix-linear.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 
 const GRID_WIDTH = 32_768;
 
@@ -724,7 +725,7 @@ export function opmContractPrecision(device) {
 }
 
 export function opmProjectOutputPairs(device) {
-  return deviceTuning(device).opmProjectOutputPairs ?? OPM_PROJECT_OUTPUT_PAIRS;
+  return shapedKnob(deviceTuning(device).opmProjectOutputPairs) ?? OPM_PROJECT_OUTPUT_PAIRS;
 }
 
 /**
@@ -978,7 +979,7 @@ export function opmMatrixContract(device, input) {
     // at the operand, and an f16 accumulator would put them back outside it.
     // So `contractResult` carries the device's own answer through to the
     // contraction whatever the knob says. Same rule as the triangle's.
-    result: deviceTuning(device).stagedMatrixResult ?? config.resultComponentType,
+    result: shapedKnob(deviceTuning(device).stagedMatrixResult) ?? config.resultComponentType,
     contractResult: config.resultComponentType,
     prefetch: deviceTuning(device).stagedMatrixPrefetch === true,
     matrixElement: config.componentType,

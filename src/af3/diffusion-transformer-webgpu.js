@@ -38,12 +38,16 @@ import { SOURCES } from "./weights.js";
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
-import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed }
+import { GpuMemoryBudgetError, noteResidencyRefused, residencyAllowed,
+  memoryBudgetBytes, memoryTotals }
   from "../runtime/device-memory.js";
 import { releaseResidentWeights, residentWeightBuffer } from "../runtime/resident.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { releaseWeights } from "./weights.js";
+import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
+import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 /**
  * How much a schedule may hold in cached pair attention biases.
  *
@@ -1800,6 +1804,82 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
            widePartialFloats: kSplits > 1 ? kSplits * 2 * rows * intermediate : 0 };
 }
 
+/**
+ * The diffusion transformer's token tile, from the device's measured width.
+ *
+ * A tile of `t` turns `rows` into `ceil(rows / t)` workgroups, so the largest
+ * tile that still fills the device is the one that amortises the most weight
+ * traffic without leaving cores idle. `null` for the width - nothing measured
+ * yet - keeps the model's own `min(4, fits(channels))`, which is that same
+ * sentence answered for a device with a handful of cores.
+ *
+ * 🔴 IT AGREES WITH THE PRIOR BELOW THE CROSSOVER AND NOT ABOVE IT, exactly as
+ * the atom row tile does, and for the same reason: past the point where the
+ * kernel fills the device by itself the trade stops being occupancy and becomes
+ * weight traffic, and this rule only knows about the first half. This card's
+ * prior says tile 1 below 175 tokens and 2 above; the fill rule says 1 at 68
+ * and does not reach 2 until the rows reach twice the measured width. Below the
+ * crossover - which is every fold the page runs - they are the same answer.
+ */
+export function derivedTokenTile({ measuredWidth, rows, cap }) {
+  if (measuredWidth === null || measuredWidth === undefined) return cap;
+  for (const tile of [4, 2]) {
+    if (tile <= cap && Math.ceil(rows / tile) >= measuredWidth) return tile;
+  }
+  return 1;
+}
+
+/**
+ * Whether the batched zero gate's duplicate fits on this device.
+ *
+ * 🔴 IT IS A PURE WIN WHEREVER IT FITS AND A REFUSAL WHERE IT DOES NOT, which
+ * is why this asks the budget and not the device's width. Under the budget
+ * fallback the blocks are uploaded and released per call, and a duplicate of
+ * weights that are NOT being kept is exactly the trade that fallback exists to
+ * refuse - so `allowed` is a veto and not a term.
+ *
+ * The headroom is three times the estimate rather than one, because the
+ * estimate is taken before the sampler's own scratch exists and a guard that
+ * errs towards declining costs 283 ms where one that errs the other way costs
+ * the fold.
+ */
+export function batchedGatesAffordable({ allowed, budgetBytes, residentBytes, bytes }) {
+  if (!allowed) return false;
+  if (budgetBytes === undefined || budgetBytes === null) return true;
+  return budgetBytes - residentBytes > bytes * 3;
+}
+
+/**
+ * The K split a device with no prior should use, from its measured width.
+ *
+ * The unsplit attention projection launches `ceil(rows / tile) * (width /
+ * lanes)` workgroups. Splitting K multiplies that by `splits` and adds a
+ * reduction pass, so it pays only while the unsplit count is short of the
+ * device. `null` is "already wide enough - do not split, and do not take the
+ * bigger tile the split exists to pay for".
+ *
+ * The secondary numbers - the tiles and the three other kernels' split counts -
+ * are this A100's measured values and are NOT derived from anything. They are
+ * here because a device that wants a K split at all wants the tile the split
+ * pays for; a second measured device may well want different ones, and the
+ * honest thing is to say so rather than to dress a table as a rule.
+ */
+export function derivedSplitRule({ measuredWidth, rows, channels, width, lanes, tile }) {
+  const unsplit = Math.max(1, Math.ceil(rows / Math.max(1, tile)) * Math.max(1, width / lanes));
+  if (unsplit >= measuredWidth) return null;
+  const want = measuredWidth / unsplit;
+  // The plateau is 8 to 32, so this picks inside it rather than at its edge -
+  // the largest of 8, 16, 32 that divides the channels and that the device has
+  // room for, and 8 where there is room for less than that.
+  let splits = 0;
+  for (const candidate of [8, 16, 32]) {
+    if (channels % candidate === 0 && candidate <= Math.max(8, want)) splits = candidate;
+  }
+  if (splits === 0) return null;
+  return { splits, tile: 4, crossover: Number.MAX_SAFE_INTEGER,
+           outSplits: 4, attnSplits: 4, attnTile: 2, normSplits: 4 };
+}
+
 export class Af3DiffusionTransformerGpu {
   /**
    * The normalised pair conditioning, kept across calls.
@@ -2096,16 +2176,54 @@ export class Af3DiffusionTransformerGpu {
     // OR THE OTHER. The tile trades weight traffic - proportional to
     // tokens/tile - against workgroups, and which side binds depends on how
     // many tokens there are. See the sweep in src/runtime/device-profile.js.
-    const wantedTile = deviceTile === null ? Math.min(4, fits(channels))
-      : tokens < deviceTile.crossover ? deviceTile.below : deviceTile.atOrAbove;
+    const measuredWidth = deviceDerivationsAllowed(this.device)
+      ? deviceSaturationWorkgroups(this.device) : null;
+    // 🔴 AND WHERE NO PRIOR NAMES ONE, THE MEASURED WIDTH PICKS IT. The knob's
+    // note in device-profile.js already says what the rule should be - "the
+    // ceiling was never what bound this, occupancy was, which is exactly why
+    // the answer inverts on a machine with ten times the cores. A smaller tile
+    // is more workgroups." The model's own `min(4, fits(channels))` is that
+    // sentence answered for a device with a handful of cores. Worth 235 ms of
+    // an AF3 sampler on a device with no prior.
+    const wantedTile = deviceTile !== null
+      ? (tokens < deviceTile.crossover ? deviceTile.below : deviceTile.atOrAbove)
+      : derivedTokenTile({ measuredWidth, rows: tokens, cap: Math.min(4, fits(channels)) });
     // 🔴 SPLITTING K AND THE TOKEN TILE ARE ONE DECISION. Below the crossover
     // the tile alone loses - it halves the workgroups and this device has 108
     // multiprocessors to fill - so the split is what makes a bigger tile
     // affordable, and asking for one without the other is asking for the
     // slower of the two arms. Above it the tile stands on its own and the
     // split's partial traffic is pure cost.
-    const splitRule = weights.splitK === undefined
+    const tunedRule = weights.splitK === undefined
       ? deviceTuning(this.device).diffusionSplitK : weights.splitK;
+    // 🔴 AND WHERE NO PRIOR SETS ONE, THE MEASUREMENT DOES. Priced with
+    // `--no-prior=diffusionSplitK` on this card, the sampler is 1869 ms with
+    // the prior and 4524 without, and this rule alone is 1792 of the 2655 - the
+    // single largest thing a GPU nobody has measured is missing.
+    //
+    // 🔴 `splits` IS A PLATEAU AND NOT A PEAK, WHICH IS WHY IT NEED NOT BE
+    // DERIVED. Swept on an unrecognised device with everything else held:
+    // 4 -> 2857 ms, 8 -> 2754, 16 -> 2780, 32 -> 2816, 48 -> 2978. Anything
+    // from 8 to 32 is within 2%, and the prior's own 16 sits in the middle of
+    // it rather than on a knife edge.
+    //
+    // 🔴 WHAT IS NOT PORTABLE IS *WHETHER* TO SPLIT AT ALL, and that is exactly
+    // what the occupancy measurement answers. The split exists because a small
+    // token count leaves the device idle; on a card a fiftieth of this one's
+    // width the same token count already fills it and the partial traffic plus
+    // the reduce pass are pure cost. So the crossover is not a token count that
+    // can be tabled - it is "until the unsplit dispatch is as wide as the
+    // device", which is a measurement, and the token count falls out of it.
+
+    const splitRule = tunedRule ?? (measuredWidth === null ? null
+      // ...`tokens` and not `samples * tokens`, which is the same blindness the
+      // prior's `crossover` has and for the same reason: the split is baked
+      // into the shader and #compile is keyed on the token count alone, so the
+      // sample count is not knowable here. A multi-sample run is WIDER than
+      // this assumes, so the derivation can split where it need not - the
+      // sweep above prices that mistake at a few per cent, not a regression.
+      : derivedSplitRule({ measuredWidth, rows: tokens, channels,
+        width, lanes: weights.lanes ?? 256, tile: wantedTile }));
     const splitting = splitRule !== null && splitRule !== undefined
       && tokens < splitRule.crossover && channels % splitRule.splits === 0;
     const kSplits = splitting ? splitRule.splits : 1;
@@ -2174,8 +2292,30 @@ export class Af3DiffusionTransformerGpu {
     // the weights object. Under the budget fallback the blocks are uploaded and
     // released per call, and a duplicate of weights that are NOT being kept is
     // exactly the trade that fallback exists to refuse.
+    // 🔴 AND WHERE NO PRIOR DECIDES, THE MEMORY BUDGET DOES. This is worth
+    // 283 ms of an AF3 sampler on a device with no prior - the second largest
+    // thing left once the K split and the atom tile are derived - and unlike
+    // those two it is not a geometry question at all: the gate is a pure win
+    // wherever the duplicate FITS, and a refusal wherever it does not. So the
+    // derivation asks the budget rather than the width.
+    //
+    // The cost is the concatenated gate weights plus four scratch buffers over
+    // the blocks, all of which are sized from numbers already in hand. The
+    // weight term is deliberately about twice the measured 14 MiB at f16: a
+    // guard that errs towards declining costs 283 ms, and one that errs the
+    // other way costs a fold.
+    const batchedBlocks = weights.superBlocks
+      .reduce((total, group) => total + group.blocks.length, 0);
+    const batchedBytes = batchedBlocks
+      * (condChannels * channels * 4 + tokens * channels * 4 * 6);
+    const affordable = deviceDerivationsAllowed(this.device)
+      && batchedGatesAffordable({
+        allowed: residencyAllowed(this.device),
+        budgetBytes: memoryBudgetBytes(this.device),
+        residentBytes: memoryTotals(this.device).residentBytes,
+        bytes: batchedBytes });
     const batchedGates = (weights.batchedGates
-      ?? deviceTuning(this.device).diffusionBatchedGates) === true;
+      ?? deviceTuning(this.device).diffusionBatchedGates ?? affordable) === true;
     // See the note in the shader factory: this kernel wants the OPPOSITE of
     // what every other kernel here wants, because the block axis already fills
     // the device and weight bandwidth is what binds it.
@@ -2185,7 +2325,7 @@ export class Af3DiffusionTransformerGpu {
     // pipeline creation rather than running slowly. `fits` is the same helper
     // the other tiles use.
     const wantedGateTile = weights.gateTile
-      ?? deviceTuning(this.device).diffusionGateTile ?? 8;
+      ?? shapedKnob(deviceTuning(this.device).diffusionGateTile) ?? 8;
     const gateTileRoom = fits(condChannels);
     const gateTile = Math.max(1, Math.min(wantedGateTile, gateTileRoom >= 4
       ? gateTileRoom - (gateTileRoom % 4) : (gateTileRoom >= 2 ? 2 : 1)));
@@ -2221,7 +2361,7 @@ export class Af3DiffusionTransformerGpu {
                     // A bigger chunk is fewer staging barriers AND more lanes in
                     // the key dot loop, against fewer workgroups resident.
                     attendKeyChunk: weights.attendKeyChunk
-                      ?? deviceTuning(this.device).diffusionAttendKeyChunk ?? undefined,
+                      ?? shapedKnob(deviceTuning(this.device).diffusionAttendKeyChunk),
                     attendStageKeys: weights.attendStageKeys
                       ?? deviceTuning(this.device).diffusionAttendStageKeys ?? undefined,
                     factor: weights.transitionFactor,
@@ -2229,7 +2369,7 @@ export class Af3DiffusionTransformerGpu {
                     // 256 is another number chosen on a device with a handful of
                     // cores. It sets the output split (range / lanes) and so the
                     // workgroup count, which is what has been binding all day.
-                    lanes: weights.lanes ?? deviceTuning(this.device).diffusionLanes ?? undefined,
+                    lanes: weights.lanes ?? shapedKnob(deviceTuning(this.device).diffusionLanes),
                     tile, splits, outTile, outChunk, weightPrecision, kSplits, qkvgTile,
                     wideTile, outKSplits, attnKSplits, normKSplits, batchedGates, gateTile,
                     attnOutTile, channelChunk: weights.channelChunk };

@@ -101,6 +101,29 @@ export const DEFAULT_TUNING = Object.freeze({
   // `profileDevice` sets it false, because one pass a dispatch is the only
   // shape profile.js can attribute; the profiled number is the slower one.
   batchComputePasses: true,
+  // 🔴 THE ALIGNMENT SIZE AT WHICH THE NEAREST-CENTRE SEARCH IS WORTH A
+  // DISPATCH, in bytes of a3m text - which is rows x length to within the
+  // headers, and costs nothing to ask where counting the rows would cost a
+  // parse. The device path is FLAT and the host path is LINEAR in depth, so
+  // this is a crossover and not a preference. Measured on an M2 at 59
+  // residues, the `features` phase of a fold:
+  //
+  //     rows    device    host
+  //      128    0.060 s   0.010 s
+  //      512    0.080     0.020
+  //     1024    0.080     0.050
+  //     2048    0.040     0.140
+  //
+  // - host by 50 ms at the shipped default and device by 100 ms at 2048, which
+  // puts the crossover near 100,000 cells. That agrees with the other datum
+  // there is: src/model/monomer.js records the device path saving 640 ms of
+  // 1072 at 825 residues, and 825 x 128 is 105,600 - the same side of the line.
+  // Both paths return the SAME features, checksum for checksum at every size
+  // measured, so this only ever chooses what it costs.
+  //
+  // null routes everything to the device, which is what this branch did before
+  // the rule existed.
+  deviceFeaturisationMinBytes: 100000,
   // 🔴 A DEVICE PACK THAT REFUSES STOPS THE FOLD, unless this says otherwise.
   // The alternative is what it used to do: fall back to packing on the host,
   // which is correct, silent, and 300 ms slower - a bug with no symptom but a
@@ -696,6 +719,23 @@ const PRIORS = new Map([
     // ...and the outer product mean's contraction, which is the biggest kernel
     // in an AF2 block and the deepest K in the model. See opmMatrixContract.
     opmMatrixContract: true,
+    // 🔴 THE OUTER PRODUCT MEAN'S WORKING SET, RAISED FROM THE SHIPPED 64 MiB.
+    // It is a working set and not a limit - the path runs at every length
+    // whatever this says, and the number only decides how many blocks it takes
+    // - so a card with room should hold more pairs at once and dispatch fewer
+    // times. Swept in situ at 825 residues and 512 sequences, which is where
+    // the blocking actually bites, block milliseconds and `opm.contract`:
+    //
+    //    32 MiB  211.20  24.809      256 MiB  195.43  17.972
+    //    64      199.81  19.436      512      194.01  17.527
+    //   128      198.25  18.571     1024      193.53  17.196
+    //
+    // 256 is the knee: 64 -> 256 is 2.2% of a whole block and 1.08x on the
+    // contraction, and 256 -> 1024 buys 1.9 ms more for four times the memory.
+    // 🔴 AND IT REORDERS NO SUM, so this is free of any accuracy question:
+    // check-opm-paths.js holds the blocked arm to relRMS EXACTLY 0 because a
+    // pair's contraction is untouched and only where it lands moves.
+    opmPairBlockBytes: 256 * 1024 * 1024,
     // 🔴 FOUR PAIRS AN OUTPUT WORKGROUP, AGAINST THE M2'S TWO. The kernel is
     // bound by a weight read every pair in the workgroup shares, and what
     // limits P is workgroup storage: 4 KiB a pair against 32 KiB on an M2 and
@@ -724,6 +764,33 @@ const PRIORS = new Map([
   // outer product mean's contraction is the one kernel whose shape suits them
   // at that size.
   ["metal-3", {
+    // 🔴 THE CAPABILITY LAYER'S ANSWER IS WRONG ON 8x8 UNITS, AND A PRIOR IS
+    // WHERE THAT GETS SAID. `matrixCapabilityTuning` turns this on for any
+    // device announcing subgroup matrices with an f16 configuration, which is
+    // true of this M2 - and AF2's q/k/v/gate projection on 8x8 units is a LOSS
+    // here where it is 1.53x on the A100's 16x16. Measured on a 59-residue
+    // fold, two rounds, the block stack: 1.37/1.38 s with it against 1.19/1.18
+    // without, and it is the WHOLE of the capability layer's cost on this part
+    // - `matrixLinear` and `stagedMatrixPrefetch` move neither the time nor the
+    // checksum at this shape, so neither is named here.
+    //
+    // It also changes the arithmetic, which is how it was isolated: on it the
+    // fold is -1876396 and pLDDT 57.249, off it -1848346 and 57.213, which is
+    // this repository's answer before the capability layer existed.
+    attentionProjectMatrix: false,
+    // 🔴 AND THE TRANSITION'S PROJECTIONS FOR THE SAME REASON. The capability
+    // layer turns `matrixLinear` on for any device announcing an f16 matrix
+    // configuration, and src/evoformer/transition.js then DERIVES the block
+    // from this part's 8x8x8 tile rather than assuming 16x16x16 - so it runs,
+    // correctly, and slower. It is the whole of AF2's regression on this M2:
+    // warm folds 1198-1226 ms with it against 1124-1133 without, which is what
+    // this repository folded before the capability layer existed, at the same
+    // checksum -1848346.
+    //
+    // It took seven wrong hypotheses to find because the knob had no OFF: the
+    // gate tested only null and undefined, so every arm measured with
+    // `matrixLinear=false` was measured with it ON. Fixed at that gate too.
+    matrixLinear: false,
     // 🔴 SWEPT IN SITU WITH tools/gpu/profile-af2-block.js --sweep, WHICH
     // INTERLEAVES ITS ARMS - this machine drifts up to 3.2x between runs and a
     // sweep is exactly the shape that hides it. Block milliseconds, false
@@ -833,6 +900,113 @@ export function setDeviceTuning(device, tuning) {
  * @returns {{vendor: string, architecture: string, software: boolean,
  *            tuning: Tuning}}
  */
+/**
+ * The knobs a device's own CAPABILITIES answer, for a device no prior names.
+ *
+ * 🔴 THE PRIORS TABLE WAS DOING TWO DIFFERENT JOBS AND ONLY ONE OF THEM IS A
+ * TABLE. Measured with `--no-prior=<knob>`, which restores one knob at a time
+ * from the prior, on this A100. An AF2 fold's warm repeat is 421 ms with the
+ * prior and 639 without, and the 218 ms splits like this:
+ *
+ *   matrixLinear             95 ms      attentionGroup            18
+ *   attentionMatrix          51         opmMatrixContract         12
+ *   attentionProjectMatrix   39         stagedMatrixPrefetch       7
+ *   linearTallTile, triangleProjectMatrix, opmProjectOutputPairs:  0
+ *
+ * Every significant one is the same question - "does this device have subgroup
+ * matrix units, and can this kernel feed them" - which the API ANSWERS. It is
+ * not an architecture secret and it never needed a table.
+ *
+ * 🔴 AND AF3's SIDE IS NOT LIKE THAT, WHICH IS WHY THIS STOPS HERE. The same
+ * sweep on an AF3 fold: `sample-start` is 1867 ms with the prior and 4517
+ * without, and the 2650 ms is `diffusionSplitK` 1792, `diffusionTokenTile`
+ * 1103, `diffusionBatchedGates` 700, `diffusionNormSplit` 526, `atomRowTile`
+ * 316 - tiles and split counts, every one of them a measurement about how many
+ * workgroups fill this card and how many registers a kernel may hold. No
+ * capability states those, and guessing them from a limit would be a table
+ * again with worse provenance. They stay a prior, and they are where a runtime
+ * calibration would have to go.
+ *
+ * So a GPU nobody has measured now gets the matrix paths and not the
+ * geometries, which is most of AF2's gap and none of AF3's.
+ *
+ * 🔴 THE KERNELS STILL CHECK THEIR OWN FIT. `deviceMatrixConfig` returns null
+ * where there is no configuration of the right element type, and each caller
+ * refuses a geometry past the device's workgroup storage or invocation limit.
+ * So this switch says "try", not "assume": a device advertising the feature it
+ * cannot actually feed declines per kernel exactly as it did before.
+ */
+export function matrixCapabilityTuning(device, matrixConfigs = []) {
+  if (device?.features?.has?.("chromium-experimental-subgroup-matrix") !== true) return {};
+  if (device?.features?.has?.("shader-f16") !== true) return {};
+  if (!matrixConfigs.some((c) => c.componentType === "f16")) return {};
+  return {
+    matrixLinear: true,
+    attentionMatrix: true,
+    attentionProjectMatrix: true,
+    opmMatrixContract: true,
+    stagedMatrixPrefetch: true,
+  };
+}
+
+/**
+ * Devices that must answer as if they had no matrix units at all.
+ *
+ * `--default-tuning` on any GPU tool reaches it, and it is the ONLY way to
+ * measure what DEFAULT_TUNING alone is worth now that a capability layer sits
+ * above it. `--no-prior` is a different question - an unrecognised device WITH
+ * whatever units it has, which is what most users actually are.
+ */
+const CAPABILITY_REFUSED = new WeakSet();
+
+/**
+ * Whether this device may answer a knob from a MEASUREMENT rather than a table.
+ *
+ * 🔴 A DERIVATION IS NOT A PRIOR AND `--no-prior` MUST NOT SILENCE IT, because
+ * measuring is exactly what an unrecognised device does. But `--default-tuning`
+ * has to silence it, or the arm that prices DEFAULT_TUNING alone stops being
+ * reproducible - it read 4525 ms before the derivations existed and 3765 after,
+ * measuring something that no longer had a name.
+ */
+/**
+ * Vendors whose measurements ARE `DEFAULT_TUNING`, and which therefore have
+ * nothing to derive.
+ *
+ * 🔴 THE DERIVATION LAYER READS SILENCE AS "NOBODY MEASURED THIS DEVICE", AND
+ * FOR EXACTLY ONE VENDOR THAT IS BACKWARDS. See VENDOR_PRIORS: there is no
+ * `apple` entry ON PURPOSE, because this repository was tuned on an M2 and its
+ * answers are the defaults themselves - so a knob metal-3 does not name is not
+ * an unanswered question, it is an answered one whose answer lives upstairs.
+ * Deriving over it replaces a measurement with an estimate.
+ *
+ * Priced on that M2, AF3 at 68 tokens and 200 steps, warm fold and peak:
+ * 4.01 s and 476 MiB with the derivations suppressed, 5.60 s and 978 MiB with
+ * them - 1.40x slower for 2.05x the memory, and the resident weights alone go
+ * 13.9 MiB to 874. The same mechanism is 6032 -> 3365 ms on an A100, where the
+ * silence it reads is real.
+ *
+ * 🔴 AND `--no-prior` MUST STILL DERIVE. That switch asks what an UNRECOGNISED
+ * device gets, and measuring is precisely what such a device does - so this
+ * yields to it rather than compounding with it.
+ */
+const DEFAULTS_ARE_MEASUREMENTS = new Set(["apple"]);
+
+const measurementsAreDefaults = (device) => {
+  if (UNRECOGNISED.has(device)) return false;
+  const { vendor = "" } = RECORDED.get(device) ?? {};
+  return DEFAULTS_ARE_MEASUREMENTS.has(vendor);
+};
+
+export const deviceDerivationsAllowed = (device) =>
+  !CAPABILITY_REFUSED.has(device) && !measurementsAreDefaults(device);
+
+/** Answer as a device with no usable matrix units. See CAPABILITY_REFUSED. */
+export function ignoreDeviceCapabilities(device) {
+  CAPABILITY_REFUSED.add(device);
+  CACHE.delete(device);
+  return device;
+}
+
 export function deviceProfile(device) {
   const cached = CACHE.get(device);
   if (cached !== undefined) return cached;
@@ -844,6 +1018,8 @@ export function deviceProfile(device) {
   const software = vendor === "google" || architecture === "swiftshader"
     || architecture === "software" || vendor === "mesa";
   const measured = PRIORS.get(architecture) ?? VENDOR_PRIORS.get(vendor) ?? {};
+  const capability = CAPABILITY_REFUSED.has(device)
+    ? {} : matrixCapabilityTuning(device, matrixConfigs);
   const kept = KEPT.get(device);
   const prior = !UNRECOGNISED.has(device) ? measured
     : Object.fromEntries(Object.entries(measured).filter(([key]) => kept?.has(key)));
@@ -854,6 +1030,10 @@ export function deviceProfile(device) {
     matrixConfigs: Object.freeze(matrixConfigs),
     tuning: Object.freeze({
       ...DEFAULT_TUNING,
+      // 🔴 CAPABILITY UNDER PRIOR, so a measured architecture always wins. The
+      // capability layer is what a device NOBODY has measured gets; a prior is
+      // what a device somebody has.
+      ...(software ? {} : capability),
       ...(software ? {} : prior),
       ...(OVERRIDES.get(device) ?? {}),
     }),
@@ -861,6 +1041,27 @@ export function deviceProfile(device) {
   CACHE.set(device, profile);
   return profile;
 }
+
+/**
+ * A knob's value where `false` means "unset", for a knob that takes a SHAPE.
+ *
+ * 🔴 `?? undefined` DOES NOT TREAT `false` AS OFF, AND THAT HAS BITTEN TWICE.
+ * `matrixLinear: false` fell straight through into the matrix path, so every
+ * arm ever measured with that knob off was measured ON; and
+ * `trianglePairProjectTile: false` reaches the tile resolver as a boolean,
+ * where `false.rows` is undefined and AF2 dies with "projectTile
+ * undefinedxundefined is not a multiple of the 8x8 workgroup" - an error that
+ * names the symptom and not the cause. Both were found by
+ * tools/audit-knobs.py, which could not express either knob until --tune-json
+ * existed.
+ *
+ * A knob whose value is a tile, an object or a count has no meaningful `false`,
+ * so this reads it as "nobody set one". A BOOLEAN knob is the opposite -
+ * `attentionMatrix: false` means do not use the matrix kernel - and must not go
+ * through here.
+ */
+export const shapedKnob = (value) =>
+  (value === false || value === null ? undefined : value);
 
 /** Shorthand, because every caller wants one knob and not the object. */
 export const deviceTuning = (device) => deviceProfile(device).tuning;

@@ -1,5 +1,7 @@
 import { parseA3m } from "./a3m.js";
 import { makeQueryOnlyFeatures } from "./query-only-features.js";
+import { assignNearestCentres } from "./nearest-centres-webgpu.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 
 /**
  * @typedef {object} A3mFeatureOptions
@@ -68,6 +70,27 @@ function deletionValue(value) { return Math.atan(value / 3) * 2 / Math.PI; }
  * 59-residue protein, which is where a smaller `max_extra_msa` is least likely
  * to bite; a deep alignment of a large protein is where it would.
  */
+/**
+ * Where preparing an alignment spends its time, by phase.
+ *
+ * 🔴 THE FOLD'S OWN CLOCK CALLS ALL OF THIS "features" AND STOPS THERE. It is
+ * 1.08 s of a 23.9 s fold at 825 residues and about 7% of a 59-residue one, it
+ * is SERIAL with the stack rather than overlapped, and nothing said which of
+ * the four loops it is. Upstream moved theirs to the GPU on the strength of
+ * exactly this measurement and found the nearest-centre search was 3.2 s of
+ * 3.4; ours has been word-parallel since the alignment-prep work, so the split
+ * here had to be measured rather than assumed.
+ */
+export const featureStats = {
+  calls: 0, encodeMs: 0, profileMs: 0, maskMs: 0,
+  nearestMs: 0, clusterProfileMs: 0, msaFeatureMs: 0, extraMs: 0,
+};
+
+/** Zero every phase, so a caller can measure one fold rather than a process. */
+export function resetFeatureStats() {
+  for (const key of Object.keys(featureStats)) featureStats[key] = 0;
+}
+
 const MAX_MSA_CLUSTERS = 508;
 const MAX_EXTRA_SEQUENCES = 1024;
 
@@ -103,7 +126,14 @@ const MAX_EXTRA_SEQUENCES = 1024;
  * bytes and gives the identical answer to the scalar loop, 3.8x faster - and
  * 6.8x against the loop it replaced.
  */
-function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
+/**
+ * The two padded, word-aligned code blocks the comparison reads.
+ *
+ * 🔴 SHARED WITH THE GPU PATH ON PURPOSE. src/input/nearest-centres-webgpu.js
+ * has to compare the SAME bytes for its answer to be the same answer, and a
+ * second copy of this padding is a second chance to get 255-against-254 wrong.
+ */
+export function paddedCodeWords(centerCodes, encoded, extras, centreCount, length) {
   const stride = Math.ceil(length / 4) * 4;
   const words = stride / 4;
   const centrePadded = new Uint8Array(centreCount * stride).fill(255);
@@ -121,8 +151,16 @@ function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
       extraPadded[index * stride + residue] = encoded[from + residue];
     }
   }
-  const centreWords = new Uint32Array(centrePadded.buffer);
-  const extraWords = new Uint32Array(extraPadded.buffer);
+  return {
+    centreWords: new Uint32Array(centrePadded.buffer),
+    extraWords: new Uint32Array(extraPadded.buffer),
+    words, rows,
+  };
+}
+
+function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
+  const { centreWords, extraWords, words, rows } =
+    paddedCodeWords(centerCodes, encoded, extras, centreCount, length);
 
   const assignments = new Uint16Array(rows);
   for (let index = 0; index < rows; index += 1) {
@@ -148,8 +186,20 @@ function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
 }
 
 /** CPU feature preprocessing for A3M text. Neural inference remains entirely on WebGPU. */
-export function makeA3mFeatures(a3mText, tables,
-  options = {}) {
+/**
+ * A recycle's shuffling, its BERT masking, and everything that does not depend
+ * on which centre an extra row joins.
+ *
+ * 🔴 PLANNED FIRST, ASSIGNED SECOND, FINISHED THIRD. Nothing in a plan depends
+ * on an assignment and no recycle depends on another, so every recycle can be
+ * planned, then every nearest-centre search run, then every recycle finished.
+ * The host path still runs one search per plan; the device path sends all of
+ * them in ONE submit, which is where the round trips go. Splitting the loop is
+ * the whole reason src/input/nearest-centres-webgpu.js can batch.
+ */
+function planA3mFeatures(a3mText, tables, options) {
+  featureStats.calls += 1;
+  let mark = performance.now();
   const alignment = parseA3m(a3mText);
   const length = alignment.length; const depth = alignment.depth;
   const encoded = new Uint8Array(depth * length);
@@ -161,6 +211,7 @@ export function makeA3mFeatures(a3mText, tables,
       encoded[base + residue] = code < 128 ? CODE_OF_CHARACTER[code] : 20;
     }
   }
+  featureStats.encodeMs += performance.now() - mark; mark = performance.now();
   const base = makeQueryOnlyFeatures(alignment.query, tables, {
     recycles: 0, chainLengths: options.chainLengths,
     chainAware: options.chainAware, chainSequences: options.chainSequences,
@@ -180,6 +231,7 @@ export function makeA3mFeatures(a3mText, tables,
   for (let residue = 0; residue < length; residue += 1) {
     for (let code = 0; code < 23; code += 1) msaProfile[residue * 23 + code] /= depth;
   }
+  featureStats.profileMs += performance.now() - mark;
   /** Draw a residue code from the alignment's profile at this position. */
   const sampleProfile = (residue, uniform) => {
     let cumulative = 0;
@@ -193,8 +245,9 @@ export function makeA3mFeatures(a3mText, tables,
   const recycles = options.recycles ?? 3;
   const maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth);
   const maxExtra = options.maxExtraSequences ?? MAX_EXTRA_SEQUENCES;
-  const results = [];
+  const plans = [];
   for (let recycle = 0; recycle <= recycles; recycle += 1) {
+    mark = performance.now();
     const random = generator(((options.randomSeed ?? 0) ^ Math.imul(recycle + 1, 0x9e3779b9)) >>> 0);
     const remainder = Array.from({ length: depth - 1 }, (_, index) => index + 1); shuffle(remainder, random);
     const centers = [0, ...remainder.slice(0, Math.max(0, maxMsa - 1))];
@@ -217,7 +270,20 @@ export function makeA3mFeatures(a3mText, tables,
       else if (draw < 0.9) centerCodes[index] = original;
       else centerCodes[index] = Math.floor(random() * 20);
     }
-    const assignments = nearestCentres(centerCodes, encoded, extras, centers.length, length);
+    featureStats.maskMs += performance.now() - mark; mark = performance.now();
+    plans.push({ centers, extras, centerCodes });
+  }
+  return { plans, context: { alignment, encoded, base, length, options } };
+}
+
+/**
+ * The half of a recycle that follows its assignment: the cluster profile, the
+ * 49-channel MSA block, and the extra rows.
+ */
+function finishRecycle(plan, assignments, context) {
+  const { alignment, encoded, base, length, options } = context;
+  const { centers, extras, centerCodes } = plan;
+  let mark = performance.now();
     const profile = new Float32Array(centers.length * length * 23);
     const deletionSums = new Float32Array(centers.length * length);
     const counts = new Float32Array(centers.length * length).fill(1 + 1e-6);
@@ -241,6 +307,7 @@ export function makeA3mFeatures(a3mText, tables,
     // where a one-hot is what you want; AF-Multimer's own create_msa_feat reads
     // cluster_profile, exactly as the monomer does. So this switch exists for
     // that case and is not something multimer should be run with.
+    featureStats.clusterProfileMs += performance.now() - mark; mark = performance.now();
     const useClusterProfile = options.clusterProfile !== false;
     const msaFeatures = new Float32Array(centers.length * length * 49);
     for (let center = 0; center < centers.length; center += 1) for (let residue = 0; residue < length; residue += 1) {
@@ -256,6 +323,7 @@ export function makeA3mFeatures(a3mText, tables,
         msaFeatures[output + 48] = deletionValue(deletion);
       }
     }
+    featureStats.msaFeatureMs += performance.now() - mark; mark = performance.now();
     const extraSequences = Math.max(1, extras.length);
     const extraMsa = new Float32Array(extraSequences * length);
     const extraHasDeletion = new Float32Array(extraSequences * length);
@@ -267,7 +335,8 @@ export function makeA3mFeatures(a3mText, tables,
       extraMsa[slot] = encoded[row * length + residue]; extraHasDeletion[slot] = Math.min(deletion, 1);
       extraDeletionValue[slot] = deletionValue(deletion); extraMsaMask[slot] = 1;
     }
-    results.push({
+    featureStats.extraMs += performance.now() - mark;
+    return {
       targetFeatures: base.targetFeatures.slice(), msaFeatures, msaMask: new Float32Array(centers.length * length).fill(1),
       extraMsa, extraHasDeletion, extraDeletionValue, extraMsaMask,
       residueIndex: base.residueIndex.slice(), aatype: base.aatype.slice(), seqMask: base.seqMask.slice(),
@@ -278,10 +347,42 @@ export function makeA3mFeatures(a3mText, tables,
         asymId: base.asymId.slice(), entityId: base.entityId.slice(), symId: base.symId.slice(),
       }),
       msaSequences: centers.length, extraSequences, targetChannels: 22, msaFeatureChannels: 49,
-    });
-  }
-  return results;
+    };
 }
+
+/** CPU feature preprocessing for A3M text, with the search on the host. */
+export function makeA3mFeatures(a3mText, tables, options = {}) {
+  const { plans, context } = planA3mFeatures(a3mText, tables, options);
+  return plans.map((plan) => {
+    const mark = performance.now();
+    const assignments = nearestCentres(plan.centerCodes, context.encoded, plan.extras,
+      plan.centers.length, context.length);
+    featureStats.nearestMs += performance.now() - mark;
+    return finishRecycle(plan, assignments, context);
+  });
+}
+
+/**
+ * The same features, with the nearest-centre search on the device.
+ *
+ * 🔴 THE ONLY DIFFERENCE IS WHERE THE ARGMAX RAN, and it is held to zero
+ * differing assignments by tools/gpu/check-nearest-centres.js. Everything else
+ * - the shuffling, the masking, the profile, the 49 channels - is the same
+ * code as the host path, because they are literally the same two functions.
+ */
+export async function makeA3mFeaturesOnDevice(device, a3mText, tables, options = {}) {
+  const { plans, context } = planA3mFeatures(a3mText, tables, options);
+  const mark = performance.now();
+  const searches = plans.map((plan) => ({
+    ...paddedCodeWords(plan.centerCodes, context.encoded, plan.extras,
+      plan.centers.length, context.length),
+    centres: plan.centers.length,
+  }));
+  const assignments = await assignNearestCentres(device, searches);
+  featureStats.nearestMs += performance.now() - mark;
+  return plans.map((plan, index) => finishRecycle(plan, assignments[index], context));
+}
+
 
 const GAP_CODE = 21;
 const MSA_CHANNELS = 49;
@@ -300,3 +401,29 @@ function writeGapSegment(msaFeatures, row, offset, span, width) {
   }
 }
 
+
+/**
+ * The features, by whichever route is cheaper for THIS alignment.
+ *
+ * 🔴 ONE PLACE, BECAUSE THE SEAM HAS TWO CALLERS. src/model/monomer.js and
+ * src/multimer/model.js both chose between the two paths with the same
+ * expression, and this file's own history is what says not to leave a rule in
+ * two homes - see the allow-list that went stale at exactly this seam and took
+ * the contact overlay off the shipped page with it.
+ *
+ * The device path is flat in alignment depth and the host path is linear, so
+ * below `deviceFeaturisationMinBytes` the dispatch costs more than the search;
+ * see that knob for the table. Both return the same features.
+ *
+ * 🔴 `options.hostFeaturisation` STILL FORCES THE HOST, and still means what it
+ * meant: the control arm for a differential, not a fallback. A device that
+ * cannot run the kernel raises - this routes on SIZE, and never on failure.
+ */
+export async function makeA3mFeaturesFor(device, a3mText, tables, options = {}) {
+  const minBytes = deviceTuning(device).deviceFeaturisationMinBytes;
+  const small = typeof minBytes === "number"
+    && typeof a3mText === "string" && a3mText.length < minBytes;
+  return options.hostFeaturisation === true || small
+    ? makeA3mFeatures(a3mText, tables, options)
+    : await makeA3mFeaturesOnDevice(device, a3mText, tables, options);
+}

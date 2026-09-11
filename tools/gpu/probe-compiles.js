@@ -26,9 +26,30 @@ const option = (args, name, fallback) => {
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
 };
 
+/** A stable 32-bit digest of a string, for comparing two runs' behaviour. */
+function digestOf(text) {
+  let hash = 2166136261;
+  for (let at = 0; at < text.length; at += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(at), 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 export function instrumentCompiles(device) {
   const intervals = [];
-  const modules = { count: 0, ms: 0, bytes: 0 };
+  // 🔴 WHAT THE FOLD ACTUALLY COMPILED AND DISPATCHED, AS TWO NUMBERS. A knob
+  // that changes neither changed no kernel and no grid, which is the question
+  // tools/audit-knobs.py asks of every knob in DEFAULT_TUNING - three of them
+  // turned out to be doing nothing at all, each found by accident while looking
+  // at something else. Sorted before hashing, because the ORDER two runs
+  // compile in is scheduling and not behaviour.
+  const shaders = new Map();
+  const dispatches = new Map();
+  // 🔴 AND WHETHER THE SAME WGSL IS COMPILED TWICE. One module is made per
+  // pipeline, and two cache keys that happen to generate identical source pay
+  // for it twice - which nothing measured, because the source memo added in
+  // this branch keys on the pipeline key and so cannot see across keys.
+  const modules = { count: 0, ms: 0, bytes: 0, sizes: [], hashes: new Map() };
   const sync = { count: 0, ms: 0 };
   const makeModule = device.createShaderModule.bind(device);
   device.createShaderModule = (descriptor) => {
@@ -36,6 +57,16 @@ export function instrumentCompiles(device) {
     const built = makeModule(descriptor);
     modules.count += 1;
     modules.ms += performance.now() - at;
+    const code = typeof descriptor.code === "string" ? descriptor.code : "";
+    // A cheap content hash; a collision here would only merge two rows of a
+    // diagnostic, never change a shader.
+    let hash = 2166136261;
+    for (let at2 = 0; at2 < code.length; at2 += 1) {
+      hash = Math.imul(hash ^ code.charCodeAt(at2), 16777619);
+    }
+    modules.hashes.set(hash, (modules.hashes.get(hash) ?? 0) + 1);
+    modules.sizes.push([descriptor.label ?? "?", code.length]);
+    shaders.set(String(descriptor.label ?? "?"), (hash >>> 0).toString(16));
     // 🔴 HOW MUCH WGSL THIS FOLD WROTE. Generating a shader's SOURCE is host
     // work on the critical path and no profiler here can see it: it happens in
     // a template literal before `createShaderModule` is called. The byte count
@@ -101,7 +132,40 @@ export function instrumentCompiles(device) {
       return pipeline;
     });
   };
-  return { intervals, modules, sync, buffers, writes, syncs, groups };
+  // 🔴 THE GRID AS WELL AS THE KERNEL, because a knob can leave every shader
+  // identical and change how many workgroups run it - which is most of what the
+  // geometry knobs do, and exactly what a shader-only digest would miss.
+  const makePass = device.createCommandEncoder.bind(device);
+  device.createCommandEncoder = (descriptor) => {
+    const encoder = makePass(descriptor);
+    const begin = encoder.beginComputePass.bind(encoder);
+    encoder.beginComputePass = (passDescriptor) => {
+      const pass = begin(passDescriptor);
+      let label = String(passDescriptor?.label ?? descriptor?.label ?? "?");
+      const setPipeline = pass.setPipeline.bind(pass);
+      pass.setPipeline = (pipeline) => {
+        if (pipeline?.label) label = String(pipeline.label);
+        return setPipeline(pipeline);
+      };
+      const dispatch = pass.dispatchWorkgroups.bind(pass);
+      pass.dispatchWorkgroups = (x, y = 1, z = 1) => {
+        const key = `${label}|${x}x${y}x${z}`;
+        dispatches.set(key, (dispatches.get(key) ?? 0) + 1);
+        return dispatch(x, y, z);
+      };
+      return pass;
+    };
+    return encoder;
+  };
+  const digests = () => ({
+    shaderDigest: digestOf([...shaders.entries()].sort()
+      .map(([label, hash]) => `${label}=${hash}`).join("\n")),
+    dispatchDigest: digestOf([...dispatches.entries()].sort()
+      .map(([key, count]) => `${key}x${count}`).join("\n")),
+    shaderCount: shaders.size,
+    dispatchShapes: dispatches.size,
+  });
+  return { intervals, modules, sync, buffers, writes, syncs, groups, digests };
 }
 
 /** Span, sum and peak concurrency over a set of [start, end] intervals. */
@@ -215,6 +279,7 @@ export async function main(device, args) {
     // that were used. `wastedSourceMiB` is what was generated for a pipeline
     // that already existed.
     pipelineCache: { hits: pipelineCacheStats.hits, misses: pipelineCacheStats.misses,
+                     shared: pipelineCacheStats.shared,
                      wastedSourceMiB:
                        Math.round(pipelineCacheStats.hitSourceBytes / 1048576 * 10) / 10,
                      byKey: [...pipelineCacheStats.byKey.entries()]
@@ -228,7 +293,14 @@ export async function main(device, args) {
                         ms: Math.round(shaderSourceStats.ms),
                         builtMiB: Math.round(shaderSourceStats.bytes / 1048576 * 100) / 100,
                         reusedMiB: Math.round(shaderSourceStats.hitBytes / 1048576 * 10) / 10 },
+    ...instrument.digests(),
     shaderModules: instrument.modules.count,
+    // Distinct WGSL texts against modules made: the gap is source compiled twice.
+    distinctSources: instrument.modules.hashes.size,
+    duplicateModules: instrument.modules.count - instrument.modules.hashes.size,
+    largestSources: instrument.modules.sizes
+      .sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([label, bytes]) => [String(label).slice(0, 58), bytes]),
     shaderModuleMs: Math.round(instrument.modules.ms * 10) / 10,
     shaderSourceMiB: Math.round(instrument.modules.bytes / 1048576 * 100) / 100,
     synchronousPipelines: instrument.sync.count,

@@ -861,3 +861,53 @@ and 1QYS are both DESIGNED proteins - idealised and canonical, which
 docs/EF2FAST.md records as the reason they fold well from a single sequence
 where ubiquitin does not. Read the TM scores as "the trunk is assembled
 correctly", not as a benchmark.
+
+## Why the pairformer compiles twice, and why that is not worth removing
+
+OpenDDE re-tokenises between the trunk and the diffusion - 68 residues become
+130 structural tokens - so its pairformer is compiled at two token counts.
+After identical sources are shared (see docs/PERF.md), `af3-block` is still 65
+of a fold's 191 pipelines and **88% of the compile work**: 35.1 s of 39.6 s of
+`sumMs`, against 41 ms a kernel for the atom stack.
+
+`tools/gpu/probe-token-specialisation.js` warms the stack at both counts,
+captures every WGSL text, lines the two up by label and diffs them:
+
+| | kernels | bytes |
+|---|---:|---:|
+| differ only in a NUMBER | 28 | 154 KiB |
+| differ STRUCTURALLY | 2 | 47 KiB |
+| built at one count only | 14 | - |
+
+The two structural ones are the triangle contractions, 934 and 915 differing
+lines of 1009 - the unroll itself changes with the count, and nothing can share
+those. The other 28 look like the prize. They are not, for two reasons.
+
+🔴 **THE CONSTANTS ARE MOSTLY INDEX ARITHMETIC, NOT BOUNDS.** The tool prints
+the differing lines. Some are a bare `const L: u32 = 68u;`, but the largest are
+inside the transposed grid projection:
+
+    vec4<f32>(source[(((r % 68u) * 68u + r / 68u) * parameters.inner + k) / ...
+    let at = ((row % 68u) * 68u + row / 68u) * parameters.columns + column;
+
+A division and a modulo by a compile-time constant become a multiply and a
+shift. By a uniform they become integer division, in the inner loop of the
+largest pass in the stack. docs/AF2.md prices the neighbouring mistake - a
+runtime loop bound in a hot WGSL loop - at **4.3x**, and a dynamic vector index
+at 4x, both for the same reason: what the compiler cannot see, it cannot fold.
+
+🔴 **AND `override` DOES NOT ESCAPE IT, WHICH IS THE GENERAL POINT.** A
+pipeline-overridable constant is known at pipeline creation, so the backend
+still folds it - and still compiles once per value. The parse is what gets
+shared, and `shaderModuleMs` is 3.3 ms for 95 modules. **The specialisation IS
+the compile cost**: you cannot keep the constant folding and pay for one
+compile, and every kernel here is fast because of that folding.
+
+Which leaves only "run the pairformer at one token count". Bucketing the counts
+so both land in one bucket means the trunk doing 256-token work for a 68-residue
+protein - the pair track is quadratic, so 14x - and that is far more than the
+compile costs. Not taken.
+
+The probe stays because the survey is the useful part: it says which kernels
+would be shareable if anyone finds a way, and it is the instrument to re-run
+before believing that any of them is.

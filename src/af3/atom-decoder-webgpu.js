@@ -19,12 +19,12 @@
  * The blocks are src/af3/atom-encoder-webgpu.js's, with the decoder's weights.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
-import { deviceTuning } from "../runtime/device-profile.js";
+import { deviceTuning, shapedKnob } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import {
-  createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
+  derivedWorkgroupTarget, createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
 } from "./atom-encoder-webgpu.js";
 
 /** Which labels in a caller's `staticCache` already hold their contents. */
@@ -220,7 +220,8 @@ export class Af3AtomDecoderGpu {
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
       blocks: weights.blocks.length,
-      atomRowTile: deviceTuning(this.device).atomRowTile ?? undefined,
+      atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
+      workgroupTarget: derivedWorkgroupTarget(this.device),
     };
     const sources = createAtomDecoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`

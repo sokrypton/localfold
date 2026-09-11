@@ -17,7 +17,8 @@
 import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3MsaFromA3m } from "../src/af3/msa-features.js";
-import { foldBatch, toPdb, atomName, uniformFrom } from "../src/af3/fold.js";
+import { foldBatch, toPdb, atomName, uniformFrom, warmTrunkPipelines }
+  from "../src/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
   structuralRefinerWeights, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
@@ -145,6 +146,69 @@ const weightsPromises = new Map();
  * manifest and died before asking for a single shard, which is a failure about
  * metadata wearing the costume of a failure about weights.
  */
+/**
+ * The store, as soon as it exists, rather than when its weights are decoded.
+ *
+ * 🔴 THE PAGE NEVER WARMED ITS PIPELINES AND THE TOOL ALWAYS DID. `fold-opendde.js`
+ * starts `warmTrunkPipelines` the moment `prefetch` is running, so the shader
+ * compilation happens while the shards are still arriving; measured with
+ * `--no-warm` beside it, that is 2533 ms against 2839 - about 300 ms. The page
+ * had no equivalent: `loadAf3Weights` resolves only once every tensor is
+ * decoded, so nothing downstream could reach the store while there was still
+ * download to hide behind.
+ *
+ * This resolves at `prefetch` time instead, so a caller can warm against the
+ * store while the weights are still coming down. It is the STORE and not the
+ * weights on purpose: `warmTrunkPipelines` compiles against a shapes-only
+ * stand-in and never reads a value.
+ */
+/**
+ * Where a page's weight load goes, by phase.
+ *
+ * 🔴 A RETURNING VISITOR PAYS 2.8 s BEFORE THE FOLD'S CLOCK STARTS, AND
+ * NOTHING SAID WHAT OF. `fold-in-page.py --keep-profile` measures OpenDDE at
+ * 5.86 s whole against a status line of 3 s, and `--timeline` reports
+ * `model: null` - no shard touched the wire, so none of that gap is download.
+ * The fold tools cannot see it either: their `weightSeconds` is one number over
+ * the whole load, taken against a local server that is not a disk cache.
+ *
+ * Read from the page by `fold-in-page.py`, which prints it as `weightPhases`.
+ */
+export const af3LoadMilliseconds = {};
+
+const storeGates = new Map();
+
+function storeGate(family) {
+  let gate = storeGates.get(family);
+  if (gate === undefined) {
+    let resolve;
+    const promise = new Promise((settle) => { resolve = settle; });
+    gate = { promise, resolve };
+    storeGates.set(family, gate);
+  }
+  return gate;
+}
+
+/**
+ * Compile the trunk's pipelines while the weights are still downloading.
+ *
+ * 🔴 SPECULATIVE BY CONSTRUCTION, AND THE ONLY FAILURE IS WASTE. The stack
+ * still asks the pipeline cache for its own keys, so a token count that turns
+ * out wrong compiles shaders nobody uses and costs nothing else - which is why
+ * this takes the residue count the page knows before featurising rather than
+ * waiting for a batch it cannot have yet. See warmTrunkPipelines.
+ *
+ * Never awaited and never allowed to raise: a warm that fails is a fold that is
+ * merely slower.
+ */
+export function warmAf3Pipelines(family, tokens, device) {
+  if (!AF3_FAMILIES.includes(family)) return Promise.resolve();
+  if (!Number.isSafeInteger(tokens) || tokens < 1) return Promise.resolve();
+  return storeGate(family).promise
+    .then((store) => warmTrunkPipelines(device, store, tokens))
+    .catch(() => {});
+}
+
 export function loadAf3Weights(onProgress, family = "af3") {
   if (!AF3_FAMILIES.includes(family)) {
     throw new Error(`${family} is not an AlphaFold 3-graph family; `
@@ -153,14 +217,32 @@ export function loadAf3Weights(onProgress, family = "af3") {
   let promise = weightsPromises.get(family);
   if (promise === undefined) {
     promise = (async () => {
+      const started = performance.now();
+      let mark = started;
+      /** Time one awaited phase, by name. */
+      const after = async (name, run) => {
+        const value = await run();
+        af3LoadMilliseconds[name] = Math.round(performance.now() - mark);
+        mark = performance.now();
+        return value;
+      };
+      const phase = (name) => {
+        af3LoadMilliseconds[name] = Math.round(performance.now() - mark);
+        mark = performance.now();
+      };
       const store = await HttpTensorStore.fromManifest(
         bundleBaseUrl(family), await loadManifest(family), onProgress);
+      phase("open");
       // 🔴 EVERY SHARD AT ONCE, because the loaders below walk tensors in order
       // and await each one - so without this the network runs one shard at a time
       // and idles through every dequantisation. See HttpTensorStore.prefetch.
       // This path reads the whole model, so there is nothing to be careful about.
       store.prefetch();
+      // ...and anything waiting to warm against it can start now, with the
+      // shards still arriving. See warmAf3Pipelines.
+      storeGate(family).resolve(store);
       const trunk = await trunkWeights(store, 48, 4);
+      phase("trunk");
       // 🔴 OpenDDE HAS TWO STACKS THE OTHER TWO DO NOT, AND LACKS ONE THEY
       // HAVE. It re-tokenises between the trunk and the diffusion, so it needs
       // the structural-token expander and the four-block refiner; and its
@@ -169,22 +251,26 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // one. The fold returns no pLDDT and no PAE, which the page already
       // handles for EF2-fast.
       const structural = trunk.dialect.structuralTokens;
-      return {
+      const built = {
         trunk,
-        diffusion: await diffusionWeights(store),
+        diffusion: await after("diffusion", () => diffusionWeights(store)),
         // 🔴 AlphaFold 3's HEAD, WHERE THERE IS ONE. OpenDDE's is a different
         // parametrisation entirely and loads through openddeConfidenceWeights
         // below; `confidenceWeights` REFUSES this bundle rather than loading a
         // partial one.
-        confidence: structural ? undefined : await confidenceWeights(store),
-        atomReference: await atomReference(store),
-        targetFeat: await targetFeatureWeights(store),
+        confidence: structural ? undefined
+          : await after("confidence", () => confidenceWeights(store)),
+        atomReference: await after("atomReference", () => atomReference(store)),
+        targetFeat: await after("targetFeat", () => targetFeatureWeights(store)),
         ...(structural ? {
-          expander: await structuralExpanderWeights(store),
-          refiner: await structuralRefinerWeights(store),
-          openddeConfidence: await openddeConfidenceWeights(store),
+          expander: await after("expander", () => structuralExpanderWeights(store)),
+          refiner: await after("refiner", () => structuralRefinerWeights(store)),
+          openddeConfidence:
+            await after("openddeConfidence", () => openddeConfidenceWeights(store)),
         } : {}),
       };
+      af3LoadMilliseconds.total = Math.round(performance.now() - started);
+      return built;
     })();
     weightsPromises.set(family, promise);
   }

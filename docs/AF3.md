@@ -1779,3 +1779,83 @@ parameter had even been read, because it was called beside the Fold button's
 enabling - which runs EARLIER in the file. It waits for that specific string
 now. `of3` is deliberately not an alias for `openbind`.
 
+## The trunk at 512 tokens, which nothing had profiled
+
+The AF3 priors were fitted at 200 tokens. AF2's were fitted at 400 and one of
+them moved 2% when re-swept at 825 (docs/AF2.md), so the same question is worth
+asking here. `bench-trunk.js --model=/model-af3-int5/manifest.json --tokens=512
+--msa=128 --passes=2 --profile`, steady pass:
+
+| stage | ms |
+|---|---:|
+| pairformer | 1896 |
+| msa-stack | 628 |
+| embedder | 514 |
+| template | 409 |
+| distogram | 213 |
+| **whole** | **3724** |
+
+🔴 **AND THE PAIRFORMER IS GPU-BOUND HERE, WHICH IS WORTH KNOWING BEFORE
+OPTIMISING ANYTHING ELSE.** `pairformerSplit` reports encode **22.8 ms**, wait
+**1644.7**, release 0 - the host finishes encoding in a fortieth of the time the
+GPU takes, so nothing on the host side of this stage is worth moving.
+
+The GPU passes, 1374 ms over 2048 dispatches:
+
+| pass | ms | share | groups a pass |
+|---|---:|---:|---:|
+| `grid.attend` | 397.1 | 30.6% | 16384 |
+| `tri.contract` | 167.3 | 12.9% | 5837 |
+| `tri.project` | 107.9 | 8.3% | 11878 |
+| `pair-transition.wide` | 94.3 | 7.3% | **2048** |
+| `grid.project` | 94.0 | 7.2% | 15974 |
+| `pair-transition.down` | 77.5 | 6.0% | **256** |
+| `tri.project-out` | 66.6 | 5.1% | 6656 |
+
+🔴 **`pair-transition.down` LAUNCHES 256 WORKGROUPS ON A CARD THAT FITS 4542.**
+That is 6% of the trunk's GPU time in a kernel using about a twentieth of the
+device, and it is the clearest starved dispatch anywhere in this port -
+`probe-occupancy.js` is what makes it legible as one rather than as a number.
+`pair-transition.wide` at 2048 is short of the same mark by half.
+
+It is NOT a knob. `pairTransitionChunkBytes` at 64, 128 and 256 MiB leaves the
+group count at exactly 256 and the pass at 77.5 / 77.48 / 77.87 ms - the
+transition is not chunked at this shape, so the chunk target never binds and the
+count comes from the split kernel's own tiling. Fixing it means changing that
+tiling, which is kernel work and wants its own differential.
+
+The ceiling is worth stating before anyone starts: eliminating the pass entirely
+is 2% of the trunk, because `grid.attend` is 30% of the GPU time and is already
+on the matrix units with 16,384 workgroups a pass - well fed, and the reason the
+trunk looks the way it does.
+
+### 🔴 And `pairTransitionChunkBytes` never reached this track at all
+
+Chasing that starved dispatch found the reason a knob could not move it.
+`pairformer-block-webgpu.js` and `msa-stack-webgpu.js` both put
+`pairTransitionChunkBytes` into the options they hand `encodePairTrack`, and
+`pair-track-gpu.js` - the only caller of `transitionSplitChunkRows` - never read
+it, so the rule fell back to its own 64 MiB default. **Every AF3 and OpenDDE arm
+ever measured with that knob was measured at 64 MiB**, which is why the first
+sweep of 64, 128 and 256 moved the group count not at all and the pass by 0.4 ms
+of 77.5. The same shape as `matrixLinear: false` falling through into the matrix
+path: a knob with no off position, and a knob with no effect, are both worse than
+no knob.
+
+Wired through, it does what it says and still does not pay:
+
+| chunk | down | groups | wide | groups | whole trunk | peak |
+|---|---:|---:|---:|---:|---:|---:|
+| 64 MiB | 77.12 ms | 256 | 94.08 | 2048 | 3717 ms | 1284 MiB |
+| 256 | 66.72 | 1024 | 121.95 | 8192 | 3671 | 1500 |
+| 512 | **63.04** | 2048 | **120.52** | 16384 | 3741 | 1788 |
+
+The starved pass gets its workgroups - 256 to 2048, and 1.22x - and the `wide`
+pass loses 27 ms, more than `down` gains. `wide` was never starved at 2048
+groups, so a bigger chunk buys it nothing and costs it locality: the widened
+buffer it streams grows with the chunk. The trunk is 3717 / 3671 / 3741, a wash,
+for up to 504 MiB of extra peak.
+
+So the default stays at 64 MiB and the fix is the plumbing, not the value. It
+matches what docs/PERF.md already records for the ESMFold2 trunk - "a 6% GPU win
+and a 1% WALL loss for 144 MiB" - reached there by a different route.

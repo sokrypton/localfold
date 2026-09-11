@@ -173,6 +173,29 @@ export function residencyAllowed(device) {
   return !refusedResidency.has(device);
 }
 
+/**
+ * Whether this device can afford to KEEP its resident weights between folds.
+ *
+ * 🔴 THE TRADE IS MEASURED AND THE ONLY UNKNOWN IS ROOM. Releasing them costs
+ * a later fold 561 MiB of trunk weights in 1341 writeBuffer calls and 325 MiB
+ * of sampler weights in 24 int5 upload passes, waited for on the queue rather
+ * than inside any compute pass - which is why profile.js saw 144 ms of a 1300
+ * ms fold and the rest looked like nothing. `keepTrunkWeights` and
+ * `keepSamplerWeights` are per-device priors saying "this card has room", and
+ * a card nobody has measured is told nothing at all.
+ *
+ * A device with no ceiling is a desktop or a server and has room by
+ * construction. A device WITH one gets the same question the batched gate
+ * gets: is what is already resident small enough against the ceiling that
+ * holding it still leaves the fold two thirds of its budget.
+ */
+export function keepResidentAffordable(device) {
+  if (!residencyAllowed(device)) return false;
+  const { residentBytes, budgetBytes } = memoryTotals(device);
+  if (budgetBytes === undefined || budgetBytes === null) return true;
+  return residentBytes * 3 < budgetBytes;
+}
+
 /** The ceiling this device was given, or undefined if it has none. */
 export function memoryBudgetBytes(device) {
   return accountFor(device).budgetBytes;

@@ -22,7 +22,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "../model/recycle-convergence.js";
 
-import { makeA3mFeatures } from "../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../input/a3m-features.js";
 import { MONOMER_POSITION_SCALE } from "./geometry.js";
 import { encodeTemplateEmbedding, hasTemplateEmbedder } from "./template.js";
 
@@ -67,8 +67,10 @@ export class AlphaFoldUnifiedGpu {
     // raised. An allow-list of options is a list that goes stale every time one
     // is added; the extra feature-building keys predict() does not read are
     // harmless.
-    return this.predict(makeA3mFeatures(a3mText, featureTables, options), weights, paeBreaks,
-      onRecycle, onProgress, options);
+    // The nearest-centre search on the device; see the monomer's note.
+    const features = await makeA3mFeaturesFor(
+      this.device, a3mText, featureTables, options);
+    return this.predict(features, weights, paeBreaks, onRecycle, onProgress, options);
   }
   /**
    * @param {(p: {completed: number, total: number, waiting: boolean}) => void} [onProgress]

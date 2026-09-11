@@ -13,7 +13,7 @@ import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
 } from "./recycle-convergence.js";
 
-import { makeA3mFeatures } from "../input/a3m-features.js";
+import { makeA3mFeaturesFor } from "../input/a3m-features.js";
 
 /**
  * @typedef {import("../structure/module.js").StructureModuleResult} StructureModuleResult
@@ -50,7 +50,13 @@ export class AlphaFoldMonomerGpu {
     // 🔴 THE ALIGNMENT PREP IS TIMED TOO, because it is main-thread JavaScript
     // outside every GPU clock and docs/AF2.md has already had to rewrite it once.
     const featureStart = performance.now();
-    const features = makeA3mFeatures(a3mText, featureTables, options);
+    // 🔴 THE NEAREST-CENTRE SEARCH GOES TO THE DEVICE. It is 59% of preparing
+    // an alignment - 640 ms of 1072 at 825 residues with two recycles - and it
+    // is serial with the fold, so it is main-thread time the GPU sits out.
+    // `options.hostFeaturisation` is the control arm, not a fallback: a device
+    // that cannot run the kernel raises rather than quietly reverting.
+    const features = await makeA3mFeaturesFor(
+      this.device, a3mText, featureTables, options);
     const featureMilliseconds = performance.now() - featureStart;
     // 🔴 FORWARD THE WHOLE OPTIONS OBJECT, for the reason src/multimer/model.js
     // gives at the same seam and this one had to learn separately. The

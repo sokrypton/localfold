@@ -189,6 +189,9 @@ export async function compilePairTrack(cache, options) {
   const compileInto = (slot, key, source) => {
     pending.push(cache.get(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
   };
+  // The offsets are a small flat object of name to index; naming them in full
+  // costs a few dozen characters and cannot alias the way a hash could.
+  const offsetKey = JSON.stringify(triangleOffsets);
   for (const direction of ["outgoing", "incoming"]) {
     // 🔴 THE RESIDUAL FORM, so project-out adds into the pair representation
     // rather than writing a delta for a separate add pass to fold in. All five
@@ -223,9 +226,20 @@ export async function compilePairTrack(cache, options) {
       // one replaces it, because its weights are no longer in the buffer.
       if (["projectAB", "projectOutput", "contract"].includes(name)
           && projectMatrix !== false) continue;
+      // 🔴 THE PACK'S OFFSETS ARE IN THE SHADER, SO THEY BELONG IN THE KEY.
+      // The triangle's weights are packed INTERLEAVED where the matrix
+      // projection runs and separately where it does not - `linearABWeight`
+      // against `linearAPWeight` and its three siblings - and every offset is a
+      // `const W_*` in the WGSL. The key named the direction, the precisions
+      // and the scratch storages and not this, so two calls that disagreed
+      // about the layout collided: with `--tune=triangleProjectMatrix=false`,
+      // AF3 died at "cache key collision ... line 27: const W_LINEARABWEIGHT
+      // against const W_LINEARAPWEIGHT". The collision check did its job and
+      // the arm had simply never been run - it is one of the differentials
+      // CLAUDE.md lists. src/evoformer/block.js learned this at the same seam.
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
-                  + `:${scratchStorage.join("")}:${name}`,
+                  + `:${scratchStorage.join("")}:${offsetKey}:${name}`,
                   source);
     }
     if (projectMatrix !== false) {
@@ -375,6 +389,16 @@ export async function compilePairTrack(cache, options) {
     pipelines.transitionSplit = {
       tiles: split.tiles,
       chunkRows: transitionSplitChunkRows(pairs, channels, transitionFactor, {
+        // 🔴 THE KNOB WAS PLUMBED IN AND NEVER READ. `pairTransitionChunkBytes`
+        // is put into these options by pairformer-block-webgpu.js and by
+        // msa-stack-webgpu.js, and this call - the only caller of
+        // transitionSplitChunkRows - did not pass it, so the rule fell back to
+        // its own 64 MiB default. Every AF3 and OpenDDE arm ever measured with
+        // that knob was measured at 64 MiB, and a sweep of 64, 128 and 256
+        // moved the `down` pass by 0.4 ms of 77.5 and its group count not at
+        // all. Same shape as the `matrixLinear: false` that fell through into
+        // the matrix path: a knob with no effect is worse than no knob.
+        targetBytes: options.pairTransitionChunkBytes ?? undefined,
         maxStorageBufferBindingSize: options.maxStorageBufferBindingSize,
         minStorageBufferOffsetAlignment: options.minStorageBufferOffsetAlignment,
         blockRows: split.tiles.blockRows,

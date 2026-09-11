@@ -1322,6 +1322,64 @@ different one, and its own sweep prices it at **no measurable time** for
 limit that changes the algorithm is a bug; a limit that changes the loop
 structure at no cost is a measured trade.
 
+## The nearest-centre search, on the device
+
+🔴 **PREPARING AN ALIGNMENT IS 59% ONE LOOP, AND IT IS SERIAL WITH THE FOLD.**
+The section below took the whole of featurisation from 525 ms to 75 on a
+59-residue query and stopped there, because the fold's own clock calls all of
+it "features" and nothing said which loop. `featureStats` says. At 825
+residues, 512 clusters, 1024 extras and two recycles:
+
+| phase | host | on the device |
+|---|---:|---:|
+| **nearest-centre search** | **645 ms** | **43** |
+| the 49-channel MSA block | 204 | 196 |
+| the cluster profile | 81 | 79 |
+| extra rows | 54 | 50 |
+| encode | 44 | 46 |
+| BERT masking | 25 | 26 |
+| the alignment profile | 10 | 10 |
+| **featurisation** | **1072** | **450** |
+| the fold | 23859 | **23254** |
+
+**15x on the loop and 2.5% of the fold**, and at 59 residues 57 ms to 31 with
+the repeat going 441/445 to 418/415. The checksum is **identical on both arms**
+at both sizes - 26706680 and -1725774 - which is the only thing that settles
+it, because the assignment reaches the answer through the cluster profile
+rather than directly.
+
+It is a reduction over residues and an argmax over centres, so it is a kernel:
+one workgroup an extra row, the centres split across 64 lanes, a tree join.
+`src/input/nearest-centres-webgpu.js`.
+
+🔴 **THE TIE RULE IS THE WHOLE RISK AND IT IS IN THE PACK, NOT IN A
+COMPARISON.** The host keeps the FIRST centre at an equal score. The join packs
+`(score << 16) | (0xffff - centre)` into one u32 and takes the MAX, so the tie
+breaks towards the lower index by construction - there is no comparison for
+somebody to get backwards later. An empty lane's candidate is 0, which loses to
+every real one because a real candidate carries at least `0xffff - centre` in
+its low half.
+
+`tools/gpu/check-nearest-centres.js` holds it to zero differing assignments
+over seven cases, and one of them DUPLICATES centres so whole groups tie -
+without it the check passes on random alignments and fails on real ones, where
+near-identical sequences are the normal case. Flipping the pack to break ties
+the other way fails six of the seven, 512 of 512 on the duplicate arm.
+
+🔴 **AND THE LOOP WAS SPLIT SO THE RECYCLES BATCH.** Nothing in a recycle's plan
+- its shuffling and its BERT masking - depends on an assignment, and no recycle
+depends on another. `planA3mFeatures` produces every plan, one submit runs every
+search, `finishRecycle` completes every recycle. Four searches, one round trip.
+The host path runs the same two functions with the same loop in between, so the
+arms cannot drift: they are literally the same code either side of the argmax.
+
+Not taken from upstream, though they got there first and by the same
+measurement: their host loop was 3.2 s of a 3.4 s featurisation where ours was
+645 ms of 1072, because the alignment-prep work below had already made this
+loop word-parallel. Their kernel is 28x and 45 ms at the same shape; ours is
+15x and 43 ms. The remaining 400 ms is the 49-channel block and the cluster
+profile, which is where they went next.
+
 ## Preparing the alignment
 
 🔴 **PREPARING AN AF2 ALIGNMENT WAS 525 ms OF MAIN-THREAD JAVASCRIPT AND
@@ -1348,3 +1406,63 @@ checksum from 195329 to 199057 - a wrong answer that still looks like a
 histogram. `~(((x & 0x7f7f7f7f) + 0x7f7f7f7f) | x) & 0x80808080` has no borrow
 between bytes.
 
+## The outer product mean's working set was an M2's, and it costs 2% at 825
+
+🔴 **THE PRIORS WERE SWEPT AT 400 RESIDUES AND BELOW, AND ONE OF THEM MOVES.**
+A block at 825 residues and 512 sequences is 192.81 ms and the four flash
+attentions are 35.8% of it - already on the matrix units, and `attentionMatrix`'s
+tile is confirmed right there too (4x32 gives 199.66 ms against 2x32's 206.14,
+4x16's 205.98 and 6x16's 214.81). The outer product mean is the next family at
+16.3%, and its WORKING SET was not swept at this length.
+
+`opmPairBlockBytes` decides how many pairs the fast path holds at once. It is
+not a limit - the path runs at every length whatever it says - so it trades
+dispatch count against occupancy, which is a length question. Swept in situ,
+block milliseconds and `opm.contract`:
+
+| MiB | block | contract | | MiB | block | contract |
+|---:|---:|---:|---|---:|---:|---:|
+| 32 | 211.20 | 24.809 | | 256 | **195.43** | **17.972** |
+| 64 (shipped) | 199.81 | 19.436 | | 512 | 194.01 | 17.527 |
+| 128 | 198.25 | 18.571 | | 1024 | 193.53 | 17.196 |
+
+**256 is the knee.** 64 -> 256 is 2.2% of a whole block and 1.08x on the
+contraction; 256 -> 1024 buys 1.9 ms more for four times the memory.
+
+In a fold at 825 residues, 512 clusters and 1024 extras, two pairs alternating:
+
+| | main stack | whole fold | peak |
+|---|---:|---:|---:|
+| 64 MiB | 9.53 / 9.53 s | 12220 / 12236 ms | 6610.1 MiB |
+| **256 MiB** | **9.36 / 9.36** | **12048 / 12039** | 6803.4 |
+
+**180 ms for 193 MiB**, which is the working set exactly as predicted and 0.5%
+of this card. At 59 residues it is inert - 966/947 ms against 971/952, repeat
+415/421 against 416/417 - because the whole pair tensor is smaller than either
+value there.
+
+🔴 **AND IT REORDERS NO SUM, so there is no accuracy question to ask.** The fold
+checksum is -67537339 and pLDDT 25.628 on both arms; check-opm-paths.js holds
+the blocked arm to relRMS EXACTLY 0 because a pair's contraction is untouched
+and only where it lands in the intermediate moves.
+
+🔴 **AND FOUR KNOBS SWEPT AT THE SAME SHAPE DO NOT MOVE, WHICH IS THREE
+QUARTERS OF THE SWEEPS.** Recorded so nobody runs them again:
+
+| knob | at 825, 512 sequences | why |
+|---|---|---|
+| `attentionMatrixTile` | 4x32 **199.66** ms, 2x32 206.14, 4x16 205.98, 6x16 214.81 | the shipped tile is right at this length too |
+| `opmProjectOutputPairs` | 9.153 / 9.170 / 9.155 / 9.157 ms at 1, 2, 4, 8 | the MATRIX output projection does not read it |
+| `stagedMatrixBlock` | block 195.50 / 195.46 / 195.53 / 195.46 over four geometries | AF2's triangle contraction has its own geometry and never asks |
+| `transitionThreadTarget` | block 195.44 / 195.28 / 195.47 / 195.64 at 50k, 100k, 200k, 400k | flat across an eightfold range |
+
+The last is worth a second look because it contradicts an expectation rather
+than confirming one: `probe-occupancy.js` measures this card at ~290,000 lanes
+and the target is 100,000, so raising it looked overdue. It is flat, which says
+the transition is not thread-starved at 825 in the first place - the shape has
+enough rows to fill the card at any of these targets, and the knob only bites
+where it does not.
+
+**One sweep in four paid.** That is the honest rate, and it is still worth
+doing: the one that paid was 2% of every block on a long protein, and long
+proteins are where the seconds are.

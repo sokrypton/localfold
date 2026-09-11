@@ -78,6 +78,7 @@ import {
 } from "../evoformer/transition.js";
 import { SOURCES } from "../reference/alphafold-fixture.js";
 import { WebGpuExecution } from "../runtime/execution.js";
+import { shapedKnob } from "../runtime/device-profile.js";
 import {
   createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
 } from "../evoformer/block.js";
@@ -719,7 +720,7 @@ async function encodeTriangleMultiplication(
   // was taking src/triangle/shaders.js's default on every device while the
   // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
   // so a device with no prior is unchanged.
-  const projectTile = deviceTuning(execution.device).trianglePairProjectTile ?? undefined;
+  const projectTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
   const sourceKey = `multimer:triangle:${direction}:${JSON.stringify(shape)}`
     + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
   const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(

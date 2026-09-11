@@ -154,6 +154,13 @@ def main():
                              " because each run starts a fresh profile with an"
                              " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--keep-profile", action="store_true",
+                        help="reuse the Chrome profile instead of wiping it, so"
+                             " the HTTP cache and the SHADER cache survive - the"
+                             " second visit a real user makes, which nothing"
+                             " here had ever measured. The status line is the"
+                             " fold alone and `elapsedMs` includes the weights,"
+                             " so the two together say which cache paid.")
     # 🔴 SINGLE SEQUENCE BY DEFAULT, because this tool is a wiring check and a
     # search is a minute of somebody else's server. `--msa-mode search` is
     # needed for `--template auto`, which has nothing to draw on without one.
@@ -222,7 +229,7 @@ def main():
     args = parser.parse_args()
 
     httpd = serve(local_weights=args.url is None and not args.remote_weights)
-    proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile")
+    proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
         ws.call("Page.navigate",
@@ -522,6 +529,24 @@ def main():
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))
+        # 🔴 THE STATUS LINE ROUNDS TO WHOLE SECONDS, which is a fine thing to
+        # show a reader and useless for measuring a change: a 300 ms speedup on
+        # a 4 s fold moves nothing on it. __foldClickedAt is stamped just before
+        # the click for --timeline, so the same stamp gives the fold's own wall.
+        print("elapsedMs:", cdp.evaluate(ws,
+            "Math.round(performance.now() - (window.__foldClickedAt || 0))"))
+        # 🔴 WHERE THE WEIGHT LOAD WENT, which on a RETURNING visit is the whole
+        # gap between the click and the fold's own clock - 2.8 s of an OpenDDE
+        # page with no shard on the wire. See af3LoadMilliseconds.
+        print("weightPhases:", cdp.evaluate(ws, """(async () => {
+          try {
+            const m = await import('/web/af3-model.js');
+            const s = await import('/src/reference/http-tensor-store.js');
+            const d = s.tensorDecodeStats || {};
+            return JSON.stringify({ ...(m.af3LoadMilliseconds || {}),
+              hostDecodeMs: Math.round(d.ms || 0), hostDecodeCalls: d.calls || 0 });
+          } catch (error) { return 'unavailable: ' + error.message; }
+        })()""", await_promise=True))
         if args.dev_report:
             # 🔴 THROUGH THE BUTTON, NOT THE MODULE. The panel is built the
             # first time it is opened, so calling devReport() directly would
