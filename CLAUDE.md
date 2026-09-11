@@ -266,52 +266,108 @@ docs/OPENDDE.md, where a dispatch sized for 128 against kernels compiled for
 384 left two thirds of every pair row unprocessed and every per-kernel checker
 passing.
 
-## 🔴 THIS BRANCH CHANGES FAR MORE ON AN M2 THAN ON THE A100 - VALIDATE THERE
+## 🔴 IF YOU ARE THE M2 (OR A PHONE): WHAT TO CHECK ON THIS BRANCH
 
-The capability layer and the five derivations both sit UNDER the priors, so on
-the A100 - whose prior sets thirty knobs - almost nothing they decide is ever
-used, and every number in docs/A100.md for them was taken with `--no-prior`.
+Written from the A100 side, for whoever verifies before `a100` reaches `main`.
+The first round of this already happened and found two real bugs there - the
+matrix attention crashing on 8x8 units, and the derivations overriding Apple's
+measured defaults - so this is the SECOND round, over what has landed since.
 
-**`metal-3`'s prior sets exactly ONE knob**, `opmMatrixContract`, because
-"NOTHING FOR apple ON PURPOSE - its measurements ARE the defaults above". So an
-Apple part is, for every other knob, precisely the unrecognised device these
-layers were built for, and **ten of them newly take effect there**:
+🔴 **WHY AN APPLE PART IS THE INTERESTING ONE.** The capability layer and the
+five derivations sit UNDER the priors, and `metal-3`'s prior sets three knobs.
+On the A100, whose prior sets thirty, almost nothing they decide is ever used and
+every number recorded for them was taken with `--no-prior`. An Apple part is,
+for most knobs, exactly the unrecognised device these layers were built for -
+and `DEFAULTS_ARE_MEASUREMENTS` now yields to that, so what runs there is a
+different code path from anything measured here.
 
-| newly set on an M2 | by |
+### What to run, in this order
+
+**1. `python3 tools/audit-knobs.py`, and this is the main ask.** It sets each
+knob to a value the device does not resolve today and compares two digests -
+every shader by label and content, every dispatch by label and grid. On the
+A100 it found five bugs and every one was in an arm nobody had run. Roughly half
+its "unmoved" rows here are knobs an A100 fold reaches and an M2 configuration
+may not, so this covers different ground rather than repeating it.
+
+```
+node tools/gpu-chrome.mjs tools/gpu/probe-tuning.js 2>&1 | grep -v '^\[gpu-chrome\]' \
+  | python3 -c 'import json,sys;t=sys.stdin.read();print(json.dumps(json.loads(t[t.index("{"):])["currentTuning"]))' \
+  > /tmp/tuning.json
+python3 tools/audit-knobs.py --tool=fold-af2 --tuning=/tmp/tuning.json
+python3 tools/audit-knobs.py --tool=fold --args=--model=/model-af3-int5/manifest.json --tuning=/tmp/tuning.json
+```
+
+Read the FAILED column first: on this box two of those were pipeline key
+collisions in arms that had never been run. "Moved nothing" is suspicious and
+not dead - a diffusion knob cannot move anything in an AF2 fold, and
+`keepTrunkWeights`, `batchComputePasses` and `deviceFeaturisationMinBytes` are
+all alive and invisible to a shader digest by construction.
+
+**2. Memory, because it is the one that can hurt.** `keepResidentAffordable`
+returns true for a device with NO budget, and a tool run sets none - so an M2
+holds ~561 MiB of trunk and ~325 MiB of sampler weights between folds. That is
+nothing against 40 GB and a different proposition on a laptop, where this file's
+own warning is that Metal "takes buffers well past the point where macOS starts
+paging". `fold.js --budget=0` prints the peak. If it pages, the fix is a budget,
+not a revert.
+
+**3. `tools/gpu-chrome.mjs`, which has taken changes from both sides.** Your
+`LOCALFOLD_GPU_ANDROID` lane plus `--occupancy`, `--default-tuning` and
+`--tune-json` from here. It is the harness every gate runs through; one gate
+through it is the smoke test. `--tune-json` in particular is new and untested
+there, and step 1 depends on it.
+
+**4. `probe-occupancy.js`, whose failure mode is a plausible small number.** It
+read **4 workgroups** on a card the tool measures at 4542 before it grew a
+warm-up and two rounds. Check `agrees: true`. If it disagrees, the three
+width-driven derivations are being fed a wrong number and `--default-tuning`
+switches all of them off.
+
+**5. Re-measure your own residual.** The ~90 ms attributed to three extra
+speculative pipelines may be gone: the pipeline cache now shares kernels built
+from identical WGSL, which is 96 -> 73 pipelines on AF2 here and 269 -> 191 on
+OpenDDE.
+
+A whole fold is the wrong instrument for any of these. It mixes them, and an M2
+should be FASTER overall, which hides an accuracy change and a memory one
+equally well.
+
+### What landed here since your last look
+
+| | |
 |---|---|
-| `matrixLinear`, `attentionMatrix`, `attentionProjectMatrix`, `stagedMatrixPrefetch` | the capability layer, from `chromium-experimental-subgroup-matrix` + `shader-f16` + an f16 configuration |
-| `diffusionSplitK`, `atomRowTile`, `diffusionTokenTile` | the measured occupancy width |
-| `diffusionBatchedGates`, `keepTrunkWeights`, `keepSamplerWeights` | the memory budget |
+| pipeline cache shares kernels built from identical WGSL | 269 -> 191 pipelines on OpenDDE, ~160 ms |
+| `opmPairBlockBytes` 64 -> 256 MiB, **ampere prior only** | 2% of a block at 825 residues, +193 MiB |
+| two pipeline keys that did not name their shader | `triangleProjectMatrix=false` and `singleProjectWorkgroupTarget=` both used to crash AF3 |
+| `shapedKnob` over thirteen sites | `false` now means "unset" for a knob that takes a shape, never for a boolean one |
+| `--tune-json`, `--occupancy`, `--split-k`, `--keep-profile`, `elapsedMs` | the arms and instruments the above needed |
 
-Three things to check there, in this order:
+Every fold checksum is unchanged throughout: AF2 -1846490, the 30,29 multimer
+1040677, `bench-af2-warm` -67537339.
 
-🔴 **MEMORY FIRST, BECAUSE IT IS THE ONE THAT CAN HURT.**
-`keepResidentAffordable` returns true for a device with NO budget, and a tool
-run sets none - so an M2 will now hold ~561 MiB of trunk weights and ~325 MiB
-of sampler weights between folds where it used to release them. That is
-affordable against 40 GB and is a different proposition on a laptop, where this
-file's own warning is that Metal "takes buffers well past the point where macOS
-starts paging". Run `fold.js --budget=0` and read the peak before and after;
-if it pages, the fix is a budget, not a revert - `budgetForDevice()` exists and
-`requestAlphaFoldDevice` takes it.
+### Known open, so you do not chase them
 
-🔴 **THEN ACCURACY, because four f16 matrix paths turn on at once.** On the
-A100 `attentionProjectMatrix` alone moved mean pLDDT 57.28 -> 57.29 and the
-first alpha carbon 0.13 A. Run the differential gates rather than a fold:
-`check-attention-variants.js`, `check-evoformer-{transition,opm,attention}.js`,
-`check-af3-block-any.js --resident`, `check-triangle.js` - whose f16 arms an M2
-can actually run - and `check-difftx-splits.js`.
+- 24 of the Dawn suite's failures are `ENOENT` for fixtures not in the
+  repository; two more are Dawn's adapter lacking `shader-f16`.
+- `probe-sidechains.js` 404s on the float32 bundle, which is not on the A100 box.
+- Measured and DECLINED with numbers, all in docs: upstream's LayerNorm
+  rearrangement (1.3% here), the featurisation tail (needs `atan` on the GPU,
+  where WGSL permits 4096 ULP), the two structural triangle contractions, and
+  retiling `pair-transition.down` (feeding it more workgroups is achievable and
+  still does not help - `wide` loses more than `down` gains).
+- **Bundle size is the only lever left worth seconds** and needs the float32
+  exports plus a re-publish; see docs/HOSTING.md.
 
-🔴 **THEN THE OCCUPANCY PROBE ITSELF, whose failure mode is a plausible small
-number.** It read **4 workgroups** on a card the tool measures at 4542 before it
-grew a warm-up and two rounds. Run `probe-occupancy.js` and check the plateau
-edge and the slope estimate agree - `agrees: true` in its output. If they do
-not, the three width-driven derivations are being fed a wrong number and
-`--default-tuning` is the arm that switches all of this off.
+### And the merge itself
 
-A whole fold is the wrong instrument for any of the three: it mixes them, and
-the M2 should be FASTER overall, which hides an accuracy change and a memory
-one equally well.
+`a100` into `main` is NOT a fast-forward - main took two of this branch's
+commits separately plus the phone lane. Two conflicts, `CLAUDE.md` and
+`tools/gpu/fold-af2.js`, both resolving to **ours**: main's side of each hunk is
+simply the absence of this branch's additions. Verified from here that the
+merged tree's `src/` and `web/` are byte-identical to `a100`, so the merge ships
+no code beyond what is already on the branch - it brings in one doc and one dev
+harness file.
 
 ## The traps that repeat
 
