@@ -122,7 +122,32 @@ def sweep():
     subprocess.run(["pkill", "-9", "-f", "gpu-chrome-"], capture_output=True)
 
 
-def run(tool, extra, tune):
+def run(tool, extra, tune, attempts=2):
+    """One arm, retried once.
+
+    🔴 A TRANSIENT HARNESS HANG IS INDISTINGUISHABLE FROM A BROKEN KNOB, and
+    this script's whole value is that a FAILED row means somebody has to look.
+    An AF2 audit reported `opmContractPrecision=f16` and
+    `opmPairBlockBytes=134217728` as failures; both fold correctly to
+    checksum -1846490 when run by hand, and the cause was gpu-chrome.mjs not
+    exiting - the trap two comments down. Two false alarms in one run is enough
+    to teach a reader to skim the column, which is worse than not printing it.
+    So an arm that fails is run again, and only a repeatable failure is
+    reported.
+    """
+    for attempt in range(attempts):
+        try:
+            result = run_once(tool, extra, tune)
+        except subprocess.TimeoutExpired:
+            if attempt + 1 == attempts:
+                raise
+            continue
+        if result is not None or attempt + 1 == attempts:
+            return result
+    return None
+
+
+def run_once(tool, extra, tune):
     args = ["node", "tools/gpu-chrome.mjs", "tools/gpu/probe-compiles.js", "--tool=" + tool]
     args += [a for a in extra if a]
     if tune is not None:
