@@ -1753,3 +1753,46 @@ PATTERN separates the two mechanisms:
 
 `--passes=8` sharpens it: an uninitialised read stays two values however many
 passes are added, a race keeps producing new ones.
+
+## Why the A100 was clean, measured rather than assumed
+
+The M2 found it: `ADD_IN_PLACE_SHADER` indexes a folded grid with no bounds
+check, `linearGrid` rounds a dispatch up to whole workgroups and then to whole
+rows of y, and on Metal the out-of-range invocations CLAMP onto the last
+element - hundreds of thousands of non-atomic `+=` on one address. The
+arithmetic, over the pair tensor at 128 channels:
+
+| n | elements | grid | over-dispatch |
+|---|---:|---|---:|
+| 59 | 445,568 | 6962x1 | **0** |
+| 100 | 1,280,000 | 20000x1 | **0** |
+| 128 | 2,097,152 | 32768x1 | **0** |
+| 160 | 3,276,800 | 32768x2 | **917,504** |
+| 200 | 5,120,000 | 32768x3 | 1,171,456 |
+| 400 | 20,480,000 | 32768x10 | 491,520 |
+| 825 | 87,120,000 | 32768x42 | 960,384 |
+
+Zero up to 128 because 128*128*128 is exactly `GRID_WIDTH * 64`, one full row -
+which is where the M2's threshold is, and 917,504 is the figure it reported.
+
+🔴 **AND THE REASON THIS BOX NEVER SAW IT IS THE BACKEND, WHICH IS NOW
+MEASURED.** `tools/gpu/probe-grid-overdispatch.js` drives the SHIPPED shader
+over a deliberately over-dispatched grid and reads the last in-range element,
+which should be exactly 1 after one `+= 1` each. On this A100 at the 160-residue
+shape - over-dispatch 917,504 - it is **1, 1, 1** across three runs: Dawn over
+Vulkan DISCARDS an out-of-range write where Metal folds it onto the tail. The
+128 control reports that nothing over-dispatched, so the probe cannot pass by
+accident.
+
+So the missing guard was invisible here rather than absent, and "it does not
+reproduce on the A100" was luck of the backend, not evidence about the code.
+WebGPU permits either behaviour; neither is a guarantee to lean on.
+
+🔴 **AND IT IS SEVEN CALL SITES, NOT THREE.** `addInPlace` is used by
+monomer.js, multimer/model.js and query-only.js for the TEMPLATE residual - once
+a fold - and by evoformer/block.js and multimer/block.js for the OUTER PRODUCT
+MEAN residual, twice in the main stack and three times in the extra one, **every
+block**. That is the dominant exposure and it is why `--extra=0` still raced:
+the main stack's own residual is `evoformer/block.js:1255`. All seven share the
+one shader, so one guard covers all of them - including the two an M2 with only
+the monomer bundle cannot fold.

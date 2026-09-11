@@ -13,7 +13,14 @@ import { shaderSource } from "./shader-source-cache.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
-const ADD_IN_PLACE_SHADER = `
+/**
+ * 🔴 EXPORTED SO A PROBE CAN DRIVE THE SHIPPED TEXT AND NOT A COPY OF IT, which
+ * is check-quantised-upload.js's rule. See tools/gpu/probe-grid-overdispatch.js:
+ * this kernel indexes a FOLDED grid, `linearGrid` rounds the dispatch up to
+ * whole workgroups and whole rows of y, and what the out-of-range invocations
+ * then do is a property of the BACKEND rather than of this repository.
+ */
+export const ADD_IN_PLACE_SHADER = `
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read_write> base: array<f32>;
 @group(0) @binding(1) var<storage, read> update: array<f32>;
