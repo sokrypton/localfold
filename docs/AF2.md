@@ -1143,6 +1143,58 @@ only the monomer bundle: `--family=multimer` cannot load its weights here.
   truncate silently. The one exception, the global attention's query kernel,
   dispatches `x = length` and is bounded by that throw.
 
+### 🔴 THE SAME FOLD, A SECOND BUG, AND THE AUDIT ABOVE ASKED THE WRONG QUESTION
+
+Nine months later a nondeterministic AF2 trunk was hunted on an M2 - a different
+structure every pass at 160, 200 and 400 residues, deterministic at 128 and
+below, and not reproducible on an A100 at any length. It was pursued as a latent
+missing `workgroupBarrier` for a week. It was a second folded-grid bug in
+`ADD_IN_PLACE_SHADER`, and **the audit above would never have found it, because
+that audit asked whether a shader READS `id.y`. This one does.**
+
+```wgsl
+let index = id.x + id.y * GRID_WIDTH * 64u;   // correct
+base[index] += update[index];                  // and no bounds check
+```
+
+`linearGrid` rounds twice - elements up to a whole workgroup, then workgroups up
+to a whole row of GRID_WIDTH - so past the fold the dispatch is a MULTIPLE of
+32,768 workgroups and almost never the count wanted. The pair tensor is
+`L * L * 128` elements, `2 * L * L` workgroups, which crosses 32,768 at **exactly
+L = 128**. At 160 residues that is 65,536 workgroups dispatched for 51,200 needed:
+**917,504 invocations past the end**, and at 129 residues 2,064,256.
+
+🔴 **AND THE BACKENDS DISAGREEING IS THE SPECIFICATION.** WGSL leaves an
+out-of-bounds write either discarded or clamped into the buffer. Vulkan discards
+through `robustBufferAccess`; Metal has no hardware robustness and takes an
+explicit index clamp. Clamped, every excess invocation executes
+`base[last] += update[last]` on ONE address, non-atomically - a random multiple
+of `update[last]`, new every pass. **So "the other machine does not reproduce it"
+is evidence FOR this bug class, not against ours**, and twelve clean A100 runs
+said nothing about the kernels. That inference cost most of the hunt.
+
+It enters upstream of the trunk: `monomer.js` applies the template residual
+through `addInPlace` once per recycle, unconditionally, so `pair[L-1][L-1][127]`
+is corrupt before the first block and the triangle multiplications spread it
+through every `(i, j)` within two. Hence `meanPlddt` itself varying - 32.358,
+32.359, 32.357 at 200 residues - rather than only the coordinates, which is what
+located it in the trunk rather than the structure module.
+
+The whole fix is `if (index >= arrayLength(&base)) { return; }`. `arrayLength` is
+exact because `dispatch` binds the tensor's own range, not the whole buffer.
+`src/runtime/elementwise.js` had the identical hole and is harmless only because
+its excess invocations all store the SAME value, which a `+=` does not.
+
+**The rule that replaces the old audit** is in `test/folded-grid-guard.test.js`,
+and it is structural rather than numeric: every index built from
+`id.x + id.y * GRID_WIDTH * 64u` must be compared against a bound BEFORE anything
+subscripts a buffer with it. Three shaders bind the bound to a `let` first
+(`let elements = ...; if (index >= elements)`), so a rule reading only the next
+line calls three correct shaders broken - it is the ORDER that matters, not the
+line. The test asserts it found at least forty such shaders, because a pattern
+that silently stops matching passes by finding nothing, which is the failure the
+first version of the `id.y` audit had too.
+
 ### And the gate that would have caught it had been broken by an optimisation
 
 `tools/gpu/probe-af2-contacts.js` scores the distogram head against the

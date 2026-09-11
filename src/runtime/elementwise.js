@@ -9,6 +9,10 @@ const GRID_WIDTH: u32 = 32768u;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
+  // The same overrun ADD_IN_PLACE_SHADER guards against; see the note there.
+  // Harmless here only because every excess invocation stores the SAME value to
+  // the clamped address, which a read-modify-write does not.
+  if (index >= arrayLength(&output)) { return; }
   output[index] = left[index] + right[index];
 }`;
 

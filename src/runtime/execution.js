@@ -13,6 +13,32 @@ import { shaderSource } from "./shader-source-cache.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
+// 🔴 THE GUARD IS THE WHOLE POINT, AND WITHOUT IT THIS RACED. `linearGrid`
+// rounds twice - elements up to a whole workgroup, then workgroups up to a whole
+// row of GRID_WIDTH - so past 32,768 workgroups the dispatch is a MULTIPLE of
+// 32,768 and almost never the count that was wanted. The pair tensor is
+// `L * L * 128` elements, which is `2 * L * L` workgroups, so the fold engages
+// at exactly **L = 128**: 160 residues dispatches 65,536 workgroups for 51,200,
+// and 917,504 invocations run with an index past the end.
+//
+// WGSL leaves an out-of-bounds write either discarded or clamped into the
+// buffer, and the two choices are made by different backends - MEASURED both
+// ways, which is the only reason that sentence is here rather than a guess:
+// probe-grid-overdispatch.js reads 1 on Dawn over Vulkan, which discards, and an
+// M2 folds the write onto the tail. Clamped, every one of those invocations
+// executes `base[last] += update[last]` on ONE address, non-atomically - a
+// random multiple of `update[last]`, new on every pass.
+//
+// That is the 160-residue AF2 race: nondeterministic, in the trunk, past 128
+// residues and not at 128, on Metal and not on Vulkan, and untouched by buffer
+// pooling or any kernel knob. It looked like a missing barrier for a week. It was
+// a missing bounds check - and it is the one bug class the specification
+// GUARANTEES may reproduce on one backend and not the other, so a second machine
+// agreeing proves nothing about the code.
+//
+// `arrayLength` is exact because dispatch() binds the tensor's own range rather
+// than the whole buffer; see the note there.
+//
 /**
  * 🔴 EXPORTED SO A PROBE CAN DRIVE THE SHIPPED TEXT AND NOT A COPY OF IT, which
  * is check-quantised-upload.js's rule. See tools/gpu/probe-grid-overdispatch.js:
@@ -27,6 +53,7 @@ const GRID_WIDTH: u32 = 32768u;
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= arrayLength(&base)) { return; }
   base[index] += update[index];
 }`;
 

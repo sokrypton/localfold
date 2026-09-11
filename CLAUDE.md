@@ -300,7 +300,11 @@ for most knobs, exactly the unrecognised device these layers were built for -
 and `DEFAULTS_ARE_MEASUREMENTS` now yields to that, so what runs there is a
 different code path from anything measured here.
 
-### 🔴 THE OPEN THREAD IS YOUR RACE, AND THE A100 SIDE IS DONE
+### 🔴 THE RACE, AS IT WAS HUNTED - AND THE A100 SIDE
+
+**Answered below; this is the record of the hunt, kept because the dead ends
+are most of its value.** The two sections that follow are what each machine
+ran; the third is what it turned out to be.
 
 You asked for one command - `bench-af2-warm.js --length=160 --rows=128` here -
 because it halves the search space. It does. **This box does not reproduce it**:
@@ -381,19 +385,72 @@ knobs that switch the OPM, triangle, attention and linear kernels
 `pairTransitionSplit`, `attentionGroup`, `linearTallTile`) all still race, as do
 `--f16=off`, `batchComputePasses=false`, `--no-resident` and `--extra=0`.
 
-🔴 **THE AUDIT NOBODY HAS RUN** is the one that fits that signature: eighteen
-compute entry points declare `var<workgroup>` with no `workgroupBarrier` and no
-subgroup operation, and nine are on the AF2 path -
-`src/evoformer/attention.js` (2), `src/evoformer/outer-product-mean.js` (2),
-`src/triangle/shaders.js` (4) and `src/runtime/matrix-linear.js` (1). That list
-is a heuristic scan and will carry false positives, and NOTHING here confirms a
-missing barrier - it is where to look, not an answer.
+### 🔴 FOUND, AND IT WAS NOT A BARRIER. IT WAS A MISSING BOUNDS CHECK
 
-The threshold is worth one warning: a 128-residue pair tensor is exactly
-2,097,152 elements, which is where `linearGrid` folds into y, so the 128-passes
-/160-races boundary LOOKS like the missing-`id.y` bug in docs/AF2.md. It is not:
-every folding-grid dispatch was audited and no compute entry point reads `.x`
-without a y term. Coincidence of size.
+`ADD_IN_PLACE_SHADER` in src/runtime/execution.js, the only compute entry point
+in the repository that indexed a FOLDED grid with no guard and a
+read-modify-write:
+
+```wgsl
+let index = id.x + id.y * GRID_WIDTH * 64u;
+base[index] += update[index];        // no bounds check
+```
+
+`linearGrid` rounds TWICE - elements up to a whole workgroup, then workgroups up
+to a whole row of GRID_WIDTH - so once the y fold engages the dispatch is a
+MULTIPLE of 32,768 workgroups and almost never the count that was wanted. The
+pair tensor is `L * L * 128` elements, i.e. `2 * L * L` workgroups, which crosses
+32,768 at **exactly L = 128**:
+
+| L | elements | groups wanted | dispatched | excess invocations |
+|---:|---:|---:|---:|---:|
+| 59 | 445,568 | 6,962 | 6,962 | **0** |
+| 100 | 1,280,000 | 20,000 | 20,000 | **0** |
+| 128 | 2,097,152 | 32,768 | 32,768 | **0** |
+| 129 | 2,130,048 | 33,282 | 65,536 | 2,064,256 |
+| 160 | 3,276,800 | 51,200 | 65,536 | 917,504 |
+| 200 | 5,120,000 | 80,000 | 98,304 | 1,171,456 |
+| 400 | 20,480,000 | 320,000 | 327,680 | 491,520 |
+| 825 | 87,120,000 | 1,361,250 | 1,376,256 | 960,384 |
+
+**Every length that raced has an excess and every length that passed has none.**
+
+🔴 **AND THE TWO MACHINES DISAGREEING IS THE SPECIFICATION, NOT A SCHEDULER.**
+WGSL leaves an out-of-bounds write either discarded or clamped into the buffer,
+and backends pick differently: Vulkan discards through `robustBufferAccess`,
+Metal - which has no hardware robustness - takes an explicit index clamp. Clamped,
+those 917,504 invocations all execute `base[last] += update[last]` on ONE address,
+non-atomically: a random multiple of `update[last]` between 1x and 917,504x, new
+on every pass. Discarded, nothing happens. So the A100 agreeing with itself twelve
+times proved nothing about the kernels, and no amount of pressing it would have.
+**A backend difference is EVIDENCE OF THIS BUG CLASS, not evidence against ours.**
+
+It lands upstream of the trunk: src/model/monomer.js applies the template
+residual through `addInPlace` once per recycle, unconditionally, on
+`pairWithoutTemplates`. One corrupted cell - `pair[L-1][L-1][127]` - reaches
+everything within two blocks, because the triangle multiplications mix every
+`(i, j)` through every `k`. That is why `meanPlddt` ITSELF varied. Two more call
+sites on the same tensor: src/multimer/model.js (templates only) and
+src/model/query-only.js.
+
+Fixed with `if (index >= arrayLength(&base)) { return; }` - exact, because
+`dispatch` binds the tensor's own range and not the whole buffer.
+src/runtime/elementwise.js had the same hole and is harmless only because every
+excess invocation stores the SAME value, which a `+=` does not.
+
+🔴 **AND THE 2,097,152 WAS NOT A COINCIDENCE AFTER ALL.** This file said it
+was: "every folding-grid dispatch was audited and no compute entry point reads
+`.x` without a y term". True, and the wrong question. The audit asked whether the
+shader reads `id.y` - this one does - and never asked whether it GUARDS the
+folded index. The `var<workgroup>` scan that replaced it was nine false
+positives: all nine AF2-path kernels stage, barrier, read and barrier correctly,
+including the WAR barrier at the top of each staging loop.
+
+`test/folded-grid-guard.test.js` is the gate, and it is structural rather than
+numeric: every folded index must be compared against a bound BEFORE anything
+subscripts a buffer with it. It was verified to fail on the unfixed line. It also
+asserts it found at least 40 such shaders, because a rule that stops matching
+passes by finding nothing.
 
 ### What to run, in this order
 
