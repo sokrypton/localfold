@@ -452,6 +452,30 @@ subscripts a buffer with it. It was verified to fail on the unfixed line. It als
 asserts it found at least 40 such shaders, because a rule that stops matching
 passes by finding nothing.
 
+🔴 **AND IT IS MEASURED ON THE M2, INCLUDING THE ARM THAT PUTS IT BACK.**
+`bench-af2-warm.js --rows=128 --passes=8`, every length that was ever reported:
+
+| L | excess invocations | distinct structures | checksum |
+|---:|---:|---:|---:|
+| 128 | 0 | 1 of 8 | -2863903 |
+| 129 | 2,064,256 | 1 of 8 | -3940524 |
+| 160 | 917,504 | 1 of 8 | -9429913 |
+| 200 | 1,171,456 | 1 of 8 | -737980 |
+| 400 | 491,520 | 1 of 8 | -15147920 |
+| 825 (the standing gate, `--passes=3`) | 960,384 | 1 of 3 | -36459566 |
+
+160 returned EIGHT distinct structures before this. Two controls, both run:
+
+- **The guard deleted again, on the GPU.** 160 races immediately - -8031822,
+  -8047564, -7540637, -8782252, -9914993, -7897802, -6635619, -7995441 - so it is
+  the guard that fixed it and not something that moved beside it.
+- **128 with the guard and without it is the SAME fold**, -2863903 and pLDDT
+  39.72 both ways. The guard is inert where nothing over-dispatches, which is what
+  the excess column predicts and the only reason to believe the table.
+
+These are M2 checksums and are NOT comparable with the A100's: the two machines
+resolve different kernels. What is comparable is the count in the third column.
+
 ### What to run, in this order
 
 **1. `python3 tools/audit-knobs.py`, and this is the main ask.** It sets each
