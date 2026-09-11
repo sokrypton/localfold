@@ -518,7 +518,9 @@ export async function main(device, args) {
   // 🔴 IT IS RESET AT THE LAST FOLD, so `--folds=2 --profile` profiles the
   // WARM one - the pipelines and the resident weights are cached for the life
   // of the device, and a cold process is not the fold the page shows twice.
-  const profile = args.includes("--profile") ? profileDevice(device) : null;
+  const profile = args.includes("--profile") || args.includes("--profile-batched")
+    ? profileDevice(device, { batched: args.includes("--profile-batched") })
+    : null;
   // 🔴 --buffers ANSWERS THE QUESTION --profile CANNOT. profile.js wraps
   // beginComputePass, which at 68 tokens is 10% of a fold; the other 90% is
   // byte-proportional work outside every compute pass (forcing f32 adds 2.87 s

@@ -241,7 +241,9 @@ export async function main(device, args) {
   // turned out to be host arithmetic. The query set holds 2048 passes, so a
   // whole fold overflows it - read `gpuDropped`, and drop the step count to
   // profile the sampler.
-  const profile = args.includes("--profile") ? profileDevice(device) : null;
+  const profile = args.includes("--profile") || args.includes("--profile-batched")
+    ? profileDevice(device, { batched: args.includes("--profile-batched") })
+    : null;
   // 🔴 AND `--buffers` ANSWERS WHAT `--profile` CANNOT: how much of the wall is
   // the host on the bus or waiting on a drain. An OpenDDE fold's pairformer is
   // 4.4 seconds of wall against a few hundred milliseconds of labelled compute,

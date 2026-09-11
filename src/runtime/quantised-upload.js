@@ -410,6 +410,12 @@ export const blockUploadStats = {
   calls: 0, tensors: 0, submits: 0, buffers: 0,
   stagingBytes: 0, stagingMs: 0, totalMs: 0,
   pipelineMs: 0, uniformMs: 0, encodeMs: 0, submitMs: 0,
+  chunks: 0,
+  // 🔴 THE TWO HALVES OF `stagingMs`, WHICH USED TO BE ONE NUMBER. It timed the
+  // whole assembly, so a change that trades a host memcpy for a driver call
+  // moved neither and looked like it had done nothing. `copyMs` is the memcpy
+  // into the shared scratch; `writeCallMs` is `writeBuffer` itself.
+  copyMs: 0, writeCallMs: 0,
 };
 
 /**
@@ -505,10 +511,15 @@ export async function runBlockUpload(device, plan, destination) {
     if (size === 0 || chunks.length === 0) return;
     const bytes = Math.ceil(size / 4) * 4;
     const staged = stagingArray(bytes);
+    const copyAt = performance.now();
     for (const chunk of chunks) {
+      blockUploadStats.chunks += 1;
       staged.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), chunk.at);
     }
+    blockUploadStats.copyMs += performance.now() - copyAt;
+    const writeAt = performance.now();
     device.queue.writeBuffer(target, 0, staged, 0, bytes);
+    blockUploadStats.writeCallMs += performance.now() - writeAt;
   };
   const stagingAt = performance.now();
   assemble(codes, plan.codeChunks, plan.codeBytes);

@@ -1230,3 +1230,106 @@ generate the same text under two keys. Deduplicating them here is a cure for the
 symptom that costs nothing; making the key honest would be a cure for the cause,
 and would need each kernel checked for whether the count is a loop bound - which
 docs/AF2.md prices at 4.3x when it becomes a runtime one.
+
+## The weight upload is `writeBuffer`-bound, and both ways round it lose
+
+A first fold moves the whole bundle through `device.queue.writeBuffer`, and
+nothing had ever measured that call. `blockUploadStats.stagingMs` timed the
+staging assembly and the upload TOGETHER, so it could not: a change that traded
+one for the other moved neither number. Split into `copyMs` (the memcpy into
+the shared scratch) and `writeCallMs` (the driver call), on a two-fold run:
+
+| | bytes staged | `copyMs` | `writeCallMs` |
+|---|---:|---:|---:|
+| OpenDDE | 536 MiB | 57 | **251** |
+| ESMFold2 | 350 MiB | 31 | **179** |
+| AF2 | 92 MiB | 8 | **48** |
+
+So the host memcpy the code is written around is a fifth of the cost and
+`writeBuffer` is the rest - about 3.0 GB/s, and 250 ms of an OpenDDE first fold,
+which is more than every shader compile in it.
+
+🔴 **AND `writeBuffer` IS THE SLOWEST ROUTE THIS DEVICE OFFERS.**
+`tools/gpu/probe-upload-path.js` moves 64 MiB into a storage buffer and waits
+for it to land, arms interleaved, minimum of five:
+
+| route | GB/s |
+|---|---:|
+| pooled `MAP_WRITE` buffer, 1 MiB at a time, copied on the device | **6.85** |
+| `writeBuffer`, 1 MiB at a time | 2.15 |
+| `writeBuffer`, all 64 MiB in one call | 1.22 |
+| a fresh `mappedAtCreation` buffer each time | 1.07 |
+
+Two things there are worth keeping even though what follows failed. A big
+`writeBuffer` is **slower than the same bytes in 1 MiB pieces** - the opposite
+of the usual advice - and the mapped route is genuinely 3-5x.
+
+### 🔴 BUT A POOL THAT RECYCLES ON DEVICE COMPLETION CANNOT FEED A LOOP THAT RUNS AHEAD OF THE DEVICE
+
+Wired into `runBlockUpload` behind a rule that can never add a wait - use a
+mapped buffer only if one is already mapped, else take the old path - it fired
+**19 times out of 487**. The upload loop submits hundreds of packs without
+draining, which is deliberate and is what makes it fast; a buffer returns to the
+pool only after the submit that read it completes, so the pool is empty for the
+whole of the phase it exists to serve. 62 of 536 MiB went through it and the
+wall did not move.
+
+Raising the pool to 128 per size class and 768 MiB made it work - **391 of 487
+uploads, 431 MiB, `writeCallMs` 251 -> 60** - and the fold got **417 ms
+SLOWER**, 5428 against 5011. Allocating four hundred mapped buffers costs more
+than the copy it saves. The 191 ms is real and unreachable: it is paid back at
+the allocator either way.
+
+### And writing the big chunks straight from the shard is an exact wash
+
+The other way round: skip `sharedStaging` for any chunk over 64 KiB and
+`writeBuffer` it directly out of the shard's own ArrayBuffer, rounding the
+length up to four (the pad the packer already leaves, and `chunk.at` is always
+four-aligned). The bytes are concentrated in big chunks - OpenDDE 88% of them in
+35% of the chunks, ESMFold2 92% in 35% - so this removes most of the memcpy.
+
+| | `copyMs` | `writeCallMs` | wall |
+|---|---:|---:|---:|
+| OpenDDE staged | 60 | 257 | 4980 |
+| OpenDDE direct | **7** | **311** | 4958 |
+| ESMFold2 staged | 30 | 179 | 3033 |
+| ESMFold2 direct | **2** | 179 | 3020 |
+
+The copy went away exactly as intended and `writeBuffer` grew by the same
+amount: 2608 extra driver calls at about **21 microseconds each**. A `writeBuffer`
+call and 170 KiB of memcpy cost the same thing on this box, which is the number
+to remember. Reverted; only the `copyMs`/`writeCallMs` split was kept, because
+without it none of the above is visible.
+
+## 🔴 A truncated profile reads exactly like a fast fold
+
+`tools/gpu/profile.js` caps at 2048 passes - `createQuerySet` will not take
+more than 4096 timestamps - and it turns `batchComputePasses` OFF to get one row
+per label, which multiplies the pass count by about seven. An OpenDDE fold under
+`--profile` reports **exactly 2048 passes**, which is the cap: everything after
+it was dropped, and the `gpuTotalMs`, `idleMs` and `idleShare` printed beside it
+describe a prefix of a fold rather than a fold.
+
+`summary()` reports `dropped` now, and it is the first thing to read. And
+`--profile-batched` on `fold.js` and `fold-opendde.js` keeps the batching, so a
+whole fold fits and the GPU-busy total is the truth about the wall - at the cost
+of per-kernel attribution, which is the other question and needs the other flag.
+
+## What a fold's submits are, and which loop issues them
+
+`tools/gpu/probe-submits.js` wraps another tool the way `probe-compiles.js`
+does, and groups every `queue.submit` by the label of the encoder behind it. It
+changes no tuning, so unlike `--profile` it describes the fold that ships.
+
+| | submits | dispatches | bind groups | encode | submit | 
+|---|---:|---:|---:|---:|---:|
+| AF2 | 602 | 9254 | 5436 | 3.7 ms | 7.6 ms |
+| OpenDDE | 883 | 16238 | 6643 | 7.7 | 10.8 |
+| AF3 | 1447 | 36738 | 9463 | 14.4 | 15.8 |
+| ESMFold2 | 726 | 11915 | 4815 | 17.5 | 8.2 |
+
+Encoding and submitting together are **under 30 ms** in every model, and bind
+groups another 25-48, so the host's own command building is not where a fold
+goes - which is worth knowing before optimising it. The top submitter in all
+four is `int5-upload`, at 422 of AF2's 602 and 443 of OpenDDE's 883, one per
+weight pack; see above for why leaving it alone is right.

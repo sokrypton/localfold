@@ -36,7 +36,15 @@ export function profileDevice(device, options = {}) {
   // off gives every dispatch its own pass, and costs about 2.5% on the
   // diffusion transformer. That is on top of the 2-4% a trunk pass pays for the
   // timestamps themselves and the 45% a denoiser call pays; see docs/A100.md.
-  setDeviceTuning(device, { batchComputePasses: false });
+  //
+  // 🔴 AND `batched: true` IS HOW TO ASK WHETHER A FOLD IS GPU-BOUND AT ALL.
+  // Unbatching multiplies the pass count - an OpenDDE fold goes to 2048, which
+  // is EXACTLY the query set's capacity, so its profile was a truncated prefix
+  // and every "GPU idle share" read off one described part of a fold. Batched,
+  // a whole fold fits in a few hundred passes and `summary()` is the truth
+  // about the wall; what is lost is per-kernel attribution, which is the other
+  // question.
+  if (options.batched !== true) setDeviceTuning(device, { batchComputePasses: false });
   // 🔴 4096 IS A DEVICE MAXIMUM, NOT A CHOICE. createQuerySet rejects anything
   // larger, and the rejection is an uncaptured device error rather than a
   // throw - so a bench that asked for more simply died with no stack. A stack
@@ -151,6 +159,9 @@ export function profileDevice(device, options = {}) {
       const spanNs = first === null ? 0 : Number(last - first);
       return {
         passes: counted,
+        // 🔴 NON-ZERO MEANS THIS IS A PREFIX OF A FOLD AND NOT A FOLD. Read it
+        // before anything else in this object.
+        dropped,
         submits,
         sumMs: Number((sum / 1e6).toFixed(2)),
         spanMs: Number((spanNs / 1e6).toFixed(2)),

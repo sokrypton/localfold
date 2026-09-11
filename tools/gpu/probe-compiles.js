@@ -242,7 +242,8 @@ export async function main(device, args) {
   if (tool === undefined) throw new Error("probe-compiles needs --tool=<module under tools/gpu>");
   const rest = args.filter((a) => !a.startsWith("--tool="));
   const instrument = instrumentCompiles(device);
-  const uploadsBefore = { ...blockUploadStats };
+  const uploadsBefore = Object.fromEntries(Object.entries(blockUploadStats)
+    .map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]));
   const module = await import(`./${tool}.js`);
   const started = performance.now();
   const result = await module.main(device, rest);
@@ -252,7 +253,9 @@ export async function main(device, args) {
     // What the on-device weight decode cost the host over the same run; see
     // blockUploadStats, and note that none of it is inside a compute pass.
     weightDecode: Object.fromEntries(Object.entries(blockUploadStats)
-      .map(([key, value]) => [key, Math.round((value - uploadsBefore[key]) * 10) / 10])),
+      .map(([key, value]) => [key, Array.isArray(value)
+        ? value.map((n, at) => n - (uploadsBefore[key]?.[at] ?? 0))
+        : Math.round((value - uploadsBefore[key]) * 10) / 10])),
     buffers: instrument.buffers.count,
     bufferMiB: Math.round(instrument.buffers.bytes / 1048576 * 10) / 10,
     bufferMs: Math.round(instrument.buffers.ms * 10) / 10,
