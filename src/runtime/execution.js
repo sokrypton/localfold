@@ -387,14 +387,29 @@ export class WebGpuExecution {
       // ...THE TENSOR'S RANGE, not the whole buffer. Without an explicit offset
       // and size a view would bind everything behind it and the shader would
       // index from the wrong place.
-      entries: tensors.map((tensor, binding) => ({
-        binding,
-        resource: {
-          buffer: tensor.allocation.buffer,
-          offset: storageWords(tensor.offsetElements ?? 0, tensor.storage ?? "f32") * 4,
-          size: storageBytes(tensor.elements, tensor.storage ?? "f32"),
-        },
-      })),
+      entries: tensors.map((tensor, binding) => {
+        const offset = storageWords(tensor.offsetElements ?? 0, tensor.storage ?? "f32") * 4;
+        // 🔴 A BOUND RANGE MUST START ON 256 BYTES, AND WEBGPU'S OWN MESSAGE
+        // NAMES THE WRONG TENSOR. The allocator pools buffers by size and a
+        // pooled buffer keeps the LABEL it was created with, so the validation
+        // error reads "Offset (771968) of [Buffer opm.left]" for a binding that
+        // has nothing to do with the outer product mean - which is most of an
+        // afternoon. An odd MSA depth used to produce exactly that, from
+        // block.js's OPM view; see the note on `residueMultiple` there.
+        if (offset % 256 !== 0) {
+          throw new RangeError(`${label ?? "a compute pass"} binding ${binding} starts at `
+            + `byte ${offset}, which is not a multiple of 256: a view's element offset `
+            + `must land on a 256-byte boundary. Pad the stride the view steps by.`);
+        }
+        return {
+          binding,
+          resource: {
+            buffer: tensor.allocation.buffer,
+            offset,
+            size: storageBytes(tensor.elements, tensor.storage ?? "f32"),
+          },
+        };
+      }),
     }));
     pass.dispatchWorkgroups(x, y, z);
     if (reusable) {

@@ -871,10 +871,31 @@ async function encodeOuterProductMean(
   // 🔴 A BLOCK OF PAIRS, NOT ALL OF THEM. The intermediate is sized by
   // outerFirstPairBlocks and no longer by the protein - which is what lets the
   // fast path run at 825 residues on a device that cannot bind its 2.79 GB.
+  // 🔴 AN ODD MSA DEPTH USED TO KILL EVERY FOLD LONG ENOUGH TO BLOCK. The
+  // matrix contraction binds `left` as a view starting at this block's first
+  // residue - `first = residuesBefore * cOuter * sequences` elements - and a
+  // bound range must start on 256 bytes. With cOuter 32 that offset is
+  // `residuesBefore * 128 * sequences` bytes, which is a multiple of 256 only
+  // when `sequences` is EVEN. Measured on a 400-residue chain: depths 38, 40,
+  // 64, 126, 128, 510 and 512 fold; 37, 39 and 61 die inside WebGPU naming a
+  // buffer they have nothing to do with. The cluster count is
+  // `min(508, depth)`, so any alignment with an odd number of rows reached it -
+  // half of all shallow ones, which is the case a novel protein hits.
+  //
+  // The block already has to be a whole number of `i` rows for the kernel's
+  // local row index; it now has to be a whole number of ALIGNED ones. `k` is
+  // how many residues it takes for the offset to come back to 256, which is 1
+  // whenever the depth is even and 2 when it is odd - so this costs nothing on
+  // every alignment that worked before.
+  // `left` is allocated without a storage argument, so it is f32 and a residue
+  // row of it is `cOuter * sequences` words.
+  const rowBytes = input.cOuter * input.sequences * 4;
+  const commonFactor = (a, b) => (b === 0 ? a : commonFactor(b, a % b));
+  const residueMultiple = 256 / commonFactor(rowBytes % 256 === 0 ? 256 : rowBytes % 256, 256);
   const pairBlocks = outerFirstPairBlocks(
     descriptor, outerFirstLimitBytes(execution.device),
     deviceTuning(execution.device).opmPairBlockBytes,
-    matrixContract === null ? 1 : input.length);
+    matrixContract === null ? 1 : input.length * residueMultiple);
   const intermediateElements = outerFirst
     ? pairBlocks[0][1] * input.cOuter * input.cOuter
     : tileCapacity * input.length * input.cOuter * input.cZ;

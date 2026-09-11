@@ -1466,3 +1466,81 @@ where it does not.
 **One sweep in four paid.** That is the honest rate, and it is still worth
 doing: the one that paid was 2% of every block on a long protein, and long
 proteins are where the seconds are.
+
+## 🔴 AN ODD MSA DEPTH KILLED EVERY FOLD LONG ENOUGH TO BLOCK
+
+Found by asking a different question - "where else would padding help?" - and
+sweeping the divisibility gates. `tools/gpu/fold-af2.js` on a 400-residue chain:
+
+| rows | |
+|---|---|
+| 37 | **dies** in WebGPU validation |
+| 38 | folds, checksum −12062221 |
+| 39 | **dies** |
+| 40 | folds, checksum −14998047 |
+| 61 | **dies** |
+| 126, 128, 510, 512 | fold |
+
+**Odd depths die.** The matrix outer product mean binds `left` as a view
+starting at the block's first residue,
+
+```js
+const first = (offset / input.length) * input.cOuter * input.sequences;
+```
+
+and a bound range must start on a 256-byte boundary. With `cOuter` 32 that
+offset is `residuesBefore * 128 * sequences` bytes, which is a multiple of 256
+only when `sequences` is even - or when the block happens to start on an even
+residue. At 400 residues with the ampere prior's 256 MiB block the second block
+starts at residue **163**, and 163 × 32 × 37 × 4 is byte **771968**, 128 past a
+boundary.
+
+🔴 **AND IT IS REACHABLE FROM A REAL ALIGNMENT.** `a3m-features.js` sets
+`maxMsa = Math.min(options.maxMsaSequences ?? MAX_MSA_CLUSTERS, depth)`, so an
+alignment shallower than 508 passes its ACTUAL depth - and half of those are
+odd. The deep case is safe only because 508 happens to be even. This is the
+novel-protein case: few homologs, and a coin flip whether the fold runs.
+
+🔴 **AND WEBGPU NAMED THE WRONG TENSOR, WHICH IS WHY IT SURVIVED.** The error
+reads `Offset (771968) of [Buffer "opm.left"]` in one place and
+`[Buffer "extra.msa-row-attention.normalized"]` in another, for the same bug.
+The allocator pools buffers by `${byteLength}:${usage}` and a pooled buffer
+keeps the label it was CREATED with, so the name in a validation error is
+whatever tensor first happened to want that size. `execution.js` checks the
+offset itself now and throws naming the pass, the binding and the byte.
+
+**The fix is the block boundary, not the depth.** `outerFirstPairsPerBlock`
+already had to cut on a whole number of `i` rows; it now cuts on a whole number
+of ALIGNED ones - two residues when the depth is odd, one when it is even. So
+every alignment that worked before is byte-identical (38 → −12062221 and
+40 → −14998047, unchanged), and the odd ones fold. `test/opm-pair-block-
+alignment.test.js` sweeps length, depth and budget, and carries an arm that
+asserts the OLD rule still produces byte 771968 - a gate that cannot fail is
+not a gate.
+
+### And the slower half of the same question, which is still open
+
+Even when it does not crash, a depth that is not a multiple of FOUR loses the
+vec4 read on two kernels: `vectorStaging` in outer-product-mean.js is gated on
+`input.sequences % 4 === 0`. Interleaved, 400 residues, reproducible to
+0.005 ms:
+
+| depth | `opm.contract` | `opm.project-output` | whole block |
+|---|---:|---:|---:|
+| 512 | **3.872 / 3.875** | 1.608 / 1.609 | **59.48 / 59.49** |
+| 510 | 4.755 / 4.759 | 1.890 / 1.892 | 60.64 / 60.65 |
+| 128 | **1.432 / 1.434** | 1.627 / 1.623 | **30.39 / 30.39** |
+| 126 | 1.647 / 1.647 | 1.906 / 1.902 | 30.85 / 30.83 |
+
+**+23% on the contraction and +2.0% on the block**, and note that 512 does MORE
+work than 510 and is still faster - the padded arm wins outright.
+
+Padding the alignment depth up to a multiple of four with masked rows would
+take it, and it is provably safe for the OPM: the denominator is
+`sum(mask[i] * mask[j])` over sequences, so a zero-mask row contributes nothing
+to the numerator or the denominator. It is NOT taken here because the padded
+rows also flow through row attention, column attention and the MSA transitions,
+and whether those are as clean has not been checked - a wrong answer is worse
+than 2%. The alternative is a padded sequence STRIDE on `left` and `right`
+alone, which is the `CZ_STRIDE` fix's shape and touches the most
+performance-critical kernel in AF2.
