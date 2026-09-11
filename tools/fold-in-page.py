@@ -154,6 +154,11 @@ def main():
                              " because each run starts a fresh profile with an"
                              " empty cache.")
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--throttle", type=float, default=0,
+                        help="shape the page's network to this many MB/s "
+                             "(0 = unthrottled); Hugging Face measures 8")
+    parser.add_argument("--latency", type=float, default=30,
+                        help="added round-trip latency in ms, with --throttle")
     parser.add_argument("--keep-profile", action="store_true",
                         help="reuse the Chrome profile instead of wiping it, so"
                              " the HTTP cache and the SHADER cache survive - the"
@@ -232,6 +237,19 @@ def main():
     proc, ws = cdp.launch(DBG, "/tmp/_cdp_fold_profile", keep=args.keep_profile)
     try:
         ws.call("Page.enable")
+        # 🔴 THE DEV SERVER IS 371 MB/s AND HUGGING FACE IS 8, SO EVERY WEIGHT
+        # NUMBER TAKEN HERE IS 5-12x OPTIMISTIC - which docs/PERF.md records and
+        # nothing could act on, because there was no way to ask this harness for
+        # a user's link. `--throttle=<MB/s>` shapes the whole page's network
+        # through CDP, which is the only place a first visit can be measured at
+        # all: it is the largest single cost a user pays and the one no local
+        # timing can see.
+        if args.throttle:
+            ws.call("Network.enable")
+            ws.call("Network.emulateNetworkConditions",
+                    offline=False, latency=float(args.latency),
+                    downloadThroughput=float(args.throttle) * 1000 * 1000,
+                    uploadThroughput=float(args.throttle) * 1000 * 1000)
         ws.call("Page.navigate",
                 url=args.url or ("http://127.0.0.1:%d/index.html" % PORT))
         cdp.wait_for(ws, "typeof window.processFiles === 'function'"
