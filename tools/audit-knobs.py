@@ -59,6 +59,19 @@ NAMED = {
     "attentionMatrixTile": ["2x32", "4x16"],
     "gridAttendMatrixTile": ["2x16", "4x16"],
     "stagedMatrixBlock": ["128x128x32x2x4", "64x128x32x1x8"],
+    # 🔴 LANE COUNTS, BECAUSE `None -> [True]` HANDS A COUNT A BOOLEAN. The
+    # generic rule probes an unset knob with `true`, which is right for a
+    # boolean and nonsense for a width: all three of these failed the AF3 audit
+    # with "is not a power of two", the kernel validating its input exactly as
+    # it should. An A100's prior sets them, so its audit never takes the None
+    # branch and never sees this - it is the sparse-prior devices, the ones
+    # these layers exist for, that get the invalid arm.
+    #
+    # 32 rather than 128: the constraint is that the width DIVIDES the split,
+    # so halving the 64 default is safe wherever 64 was.
+    "singleProjectLanes": [32],
+    "singleProjectOutLanes": [32],
+    "diffusionLanes": [32],
     "halfPrecision": [False],
     "matrixLinear": [False],
     "trianglePairProjectTile": [False],
@@ -72,7 +85,16 @@ NAMED = {
 def alternatives(name, value):
     """Values worth trying for a knob currently resolved to `value`."""
     if name in NAMED:
-        return [v for v in NAMED[name] if v != value]
+        named = [v for v in NAMED[name] if v != value]
+        # 🔴 AN EMPTY NAMED LIST IS NOT "NOTHING TO TRY", IT IS THIS DEVICE
+        # ALREADY SITTING ON THE ONE VALUE NAMED. `matrixLinear` is listed as
+        # [False] because an A100 resolves it true; an M2 whose prior pins it
+        # false filtered that to nothing, tried NO arm, and was reported under
+        # "changed NOTHING" - a clean bill for the knob that had just cost AF2
+        # 6% here. Fall through to the generic rules, which for a boolean give
+        # the other pole.
+        if named:
+            return named
     if name in PRECISIONS and not isinstance(value, bool):
         return ["f16", "f32"] if name != "opmMatrixOutput" else [not bool(value)]
     if isinstance(value, bool):
@@ -88,6 +110,18 @@ def alternatives(name, value):
     return None                # object-valued: --tune cannot express it
 
 
+ARM_TIMEOUT = int(os.environ.get("AUDIT_ARM_TIMEOUT", "420"))
+
+
+def sweep():
+    """Kill any headless Chrome this harness left behind, and its profile.
+
+    `gpu-chrome-` matches the temporary profile directory and nothing else, so
+    this never touches a browser the user is running.
+    """
+    subprocess.run(["pkill", "-9", "-f", "gpu-chrome-"], capture_output=True)
+
+
 def run(tool, extra, tune):
     args = ["node", "tools/gpu-chrome.mjs", "tools/gpu/probe-compiles.js", "--tool=" + tool]
     args += [a for a in extra if a]
@@ -97,7 +131,20 @@ def run(tool, extra, tune):
         name, _, value = tune.partition("=")
         args.append(f"--tune-json={json.dumps({name: json.loads(value)})}"
                     if name in NAMED else "--tune=" + tune)
-    done = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=1800)
+    # 🔴 BOUND THE ARM AND SWEEP AFTER IT, because gpu-chrome.mjs SOMETIMES
+    # DOES NOT EXIT - CLAUDE.md's own trap - and a batch that does not carry a
+    # kill stalls every arm behind the first one that hangs. This audit ran
+    # forty arms and then sat 1800 seconds on `singleProjectLanes=true`, which
+    # takes 1.9 s standalone and fails cleanly: the arm was fine, the harness
+    # was not, and the whole AF3 run died with it.
+    try:
+        done = subprocess.run(args, cwd=REPO, capture_output=True, text=True,
+                              timeout=ARM_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        sweep()
+        raise
+    finally:
+        sweep()
     text = "\n".join(l for l in done.stdout.split("\n") if not l.startswith("[gpu-chrome]"))
     at = text.find("\n{")
     body = text[at + 1:] if at >= 0 else text[text.find("{"):]
