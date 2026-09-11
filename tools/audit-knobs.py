@@ -72,6 +72,17 @@ NAMED = {
     "singleProjectLanes": [32],
     "singleProjectOutLanes": [32],
     "diffusionLanes": [32],
+    # 🔴 AND THE SAME BUG, TWICE MORE, FOUND BY AN AF3 AUDIT. `None -> [True]`
+    # hands a BYTE COUNT and a KEY COUNT a boolean, and both fail - twice each,
+    # through the retry, so they were not the harness. They were the only two
+    # knobs an AF3 audit could not reach, which means neither has ever been
+    # checked for doing anything at all.
+    #
+    # 128 MiB because docs/AF3.md sweeps this at 64, 128 and 256 and the
+    # default resolves inside that range; 64 keys because device-profile.js
+    # prices the chunk at 64 against 128 and 32 in the diffusion attention.
+    "pairTransitionChunkBytes": [128 * 1024 * 1024],
+    "diffusionAttendKeyChunk": [64],
     "halfPrecision": [False],
     "matrixLinear": [False],
     "trianglePairProjectTile": [False],
