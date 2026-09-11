@@ -1333,3 +1333,55 @@ groups another 25-48, so the host's own command building is not where a fold
 goes - which is worth knowing before optimising it. The top submitter in all
 four is `int5-upload`, at 422 of AF2's 602 and 443 of OpenDDE's 883, one per
 weight pack; see above for why leaving it alone is right.
+
+## Where a fold's HOST time goes, and why it is not the lever
+
+`probe-submits.js` grew three things that make the question answerable:
+`--repeats=<n>` for a median, the run's start-up charged to nothing, and the
+gap split into what the CPU DID against what it WAITED for.
+
+🔴 **THE FIRST SUBMIT'S GAP IS NOT A GAP.** Everything before it - the shards
+over the network, the page's own start-up - was being charged to whichever
+encoder happened to submit first, which on an OpenDDE fold is 1562 ms landing on
+`af3-atom-encoder`, whose own stage measures 78. It is `startupMs` now.
+
+🔴 **AND A GAP IS NOT HOST WORK UNTIL THE WAITING IS TAKEN OUT.** Every
+`mapAsync`, `onSubmittedWorkDone` and `popErrorScope` is recorded as an interval,
+merged into a union - not summed, since a fold holds hundreds of unawaited
+completion promises at once - and subtracted. The column that is left is the
+only one a host-side change can move.
+
+Median of five first folds of OpenDDE at 68 tokens, 16 steps: 2681 ms wall, 967
+of it start-up, and **638 ms of host work in the 1715 that remain**:
+
+| encoder | hostMs | gapMs | submits |
+|---|---:|---:|---:|
+| `int5-upload` | 338 | 805 | 443 |
+| `opendde-confidence-pair-init` | 95 | 107 | 1 |
+| `af3-embedder` | 74 | 120 | 1 |
+| `af3-diffusion-conditioning` | 59 | 344 | 17 |
+| `af3-atom-decoder` | 37 | 57 | 16 |
+
+`int5-upload`'s 338 is the weight decode, and the section above shows that is at
+its floor. Everything else together is 300 ms of a 1715 ms fold, spread over
+five modules. **There is no host-side lever here**, and that is the finding: a
+fold is GPU and waiting, not CPU.
+
+🔴 **AND ONE RUN OF THIS TABLE IS NOT A MEASUREMENT.** The same 300-token AF3
+fold put **760 ms on `af3-confidence-embed` in one run and 47 in the next** -
+the module's own internal marks total 47 - and the whole fold went 5723 to 4528
+between them. That is this file's 3.2x drift showing up in a host table, and it
+is worth most of a morning if the first number is believed. Use `--repeats`.
+
+### Ruled out with numbers
+
+- **`popErrorScope` is not a stall.** 428 of them in an OpenDDE fold summing to
+  3469 ms looks alarming, and 370 come from `src/runtime/validation.js` - which
+  is the DeferredValidation class, whose whole point is that the pops are held
+  and settled together at a boundary that already synchronises. They resolve
+  concurrently; the sum is not a wall. The 12 sites that DO await one are 175 ms
+  between them.
+- **Encoding and submitting are not the cost.** Under 30 ms in every model, with
+  bind groups another 18-48. The command building is free relative to the fold.
+- **Uploads by label are not the cost.** The largest is `expand.projection` at
+  29 ms for 55 MiB; everything else is under 8.
