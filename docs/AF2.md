@@ -1696,3 +1696,60 @@ distinctness rather than arguing for it.
 That is what moved the three AF2 baselines - AF2 **-1287025**, the 30,29
 multimer **315591**, `bench-af2-warm` **-36457799** - and not the deduplication:
 `--no-dedupe` gives -1287025 as well.
+
+## The 160-residue race is not reproducible on the A100
+
+An M2 reports `bench-af2-warm.js` - the race gate, three passes of one graph
+over one input in one process - throwing at 160, 200 and 400 residues and
+passing at 59, 80, 100 and 128, on `main` and on this branch alike. The same
+sweep on this A100, `--rows=128`:
+
+| length | 59 | 80 | 100 | 128 | 160 | 200 | 400 | 825 |
+|---|---|---|---|---|---|---|---|---|
+| | ok | ok | ok | ok | **ok** | **ok** | **ok** | ok |
+
+Then the three failing lengths pressed harder - `--passes=8`, so 28 pairs a run
+to disagree on rather than 3, four rounds each: **twelve runs, all agreeing**,
+and the checksums identical ACROSS runs too (160 is -9869845 every time, 200
+-704434, 400 -15124842). The standing gate has always run 825 and passes.
+
+So the code is deterministic on Dawn over Vulkan on an A100 at every length the
+M2 fails. That does not prove the kernels are correct - a race can be latent and
+need a scheduler to expose it - but it does say the mechanism involves the other
+backend, which is the half of the search space the question was asked to remove.
+
+### 🔴 `--no-pool`, which tests the leading hypothesis in one run
+
+The M2's remaining lead was buffer recycling: the allocator pools by
+`${byteLength}:${usage}`, a pooled buffer keeps the previous fold's bytes, and
+any kernel READING a region it did not WRITE gives one answer on a fresh buffer
+and another on a reused one. That looks exactly like a race and is not one - it
+is deterministic given the pool's state and appears only from the second fold
+onwards, which is precisely what this gate compares.
+
+`bench-af2-warm.js --no-pool` answers it. On the A100 at 160 residues the
+checksum is **-9869845 either way** - pooled and unpooled - so recycling changes
+nothing here.
+
+🔴 **AND IT RETIRES RATHER THAN DESTROYS, WHICH IS WHY THE POOL EXISTS.** The
+first version destroyed on release and every length died with `extra-MSA block
+0: [Buffer] destroyed`: a released buffer is still named by an encoded or
+in-flight command buffer, and the pool keeps it alive by accident of holding it.
+Retiring keeps it alive on purpose and frees nothing until teardown, so it
+**leaks by design** - fine at 59-160 on a 40 GB card, and `Error.cpp:119` at 200.
+Use it at short lengths.
+
+### And the cheapest diagnostic is already in the error message
+
+`bench-af2-warm` prints every checksum and `new Set(checksums).size`, and the
+PATTERN separates the two mechanisms:
+
+- `2 different structures: A, B, B` - the first pass differs and the rest agree.
+  That is a first-touch difference, not a race: pass 1 reads WebGPU's
+  zero-initialised buffers and passes 2+ read recycled ones. Deterministic, and
+  it points straight at a kernel reading what it did not write.
+- `3 different structures: A, B, C` - genuinely nondeterministic, and a
+  scheduling question.
+
+`--passes=8` sharpens it: an uninitialised read stays two values however many
+passes are added, a race keeps producing new ones.

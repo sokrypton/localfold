@@ -29,6 +29,7 @@
  * with no `--passes` at all, which is 0 recycles and the three repetitions its
  * loop always does; that is what this tool's default matches.
  */
+import { setBufferPooling } from "../../src/runtime/allocator.js";
 import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
 import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
@@ -43,6 +44,13 @@ const option = (args, name, fallback) => {
 const QUERY = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
 
 export async function main(device, args) {
+  // 🔴 `--no-pool` ANSWERS "IS IT THE BUFFER POOL?" IN ONE RUN. A recycled
+  // buffer carries the previous fold's bytes, so a kernel reading a region it
+  // did not write differs between a fresh buffer and a reused one - which looks
+  // like a race and is not. Off, every allocation is fresh and zero-filled: a
+  // difference that survives is a real race, one that vanishes is an
+  // uninitialised read. See setBufferPooling.
+  setBufferPooling(!args.includes("--no-pool"));
   const length = Number(option(args, "length", "825"));
   const rows = Number(option(args, "rows", "512"));
   const extraRows = Number(option(args, "extra", "1024"));

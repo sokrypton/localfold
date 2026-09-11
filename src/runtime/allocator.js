@@ -21,6 +21,37 @@ export class AllocatedGpuBuffer {
   }
 }
 
+/**
+ * 🔴 A SWITCH FOR ONE QUESTION: DOES RECYCLING A BUFFER CHANGE THE ANSWER?
+ *
+ * A pooled buffer keeps the previous fold's bytes, so any kernel that READS a
+ * region it did not WRITE - a padded tail, a masked row, a chunk boundary -
+ * gives one answer on a fresh buffer and another on a recycled one. That looks
+ * exactly like a race and is not one: it is deterministic given the pool's
+ * state, and it appears only from the second fold in a process onwards, which
+ * is precisely what `bench-af2-warm.js` compares.
+ *
+ * With pooling off, every allocation is a fresh zero-initialised buffer, so a
+ * difference that survives is a real race and one that vanishes is an
+ * uninitialised read.
+ *
+ * 🔴 IT RETIRES RATHER THAN DESTROYS, AND IT THEREFORE LEAKS ON PURPOSE. The
+ * first version destroyed on release and every length died with "extra-MSA
+ * block 0: [Buffer] destroyed" - which is WHY the pool exists: a released
+ * buffer is still named by an encoded or in-flight command buffer, and the pool
+ * keeps it alive by accident of holding it. Retiring keeps it alive on purpose,
+ * hands it to nobody, and frees nothing until the allocator is torn down. So
+ * this is a DIAGNOSTIC and never a mode: memory grows with the fold, and a long
+ * chain will exhaust a small device.
+ *
+ * This exists because an M2 reports `bench-af2-warm.js` throwing at 160, 200
+ * and 400 residues where this A100 does not, and buffer recycling was the
+ * leading hypothesis with no cheap way to test it. See docs/AF2.md.
+ */
+let poolingDisabled = false;
+export function setBufferPooling(enabled) { poolingDisabled = enabled === false; }
+export function bufferPoolingEnabled() { return !poolingDisabled; }
+
 export class GpuBufferAllocator {
   device;
   #currentBytes = 0;
@@ -28,6 +59,7 @@ export class GpuBufferAllocator {
   #allocationCount = 0;
   #pooling;
   #pool = new Map();
+  #retired = [];
 
   constructor(device, pooling = false) {
     this.device = device;
@@ -40,7 +72,7 @@ export class GpuBufferAllocator {
     }
     const byteLength = Math.ceil(requestedBytes / 4) * 4;
     const key = `${byteLength}:${usage}`;
-    const pooled = this.#pool.get(key);
+    const pooled = poolingDisabled ? undefined : this.#pool.get(key);
     let buffer = pooled?.pop();
     if (buffer === undefined) {
       // ...counted before it is created, so a refusal costs nothing and the
@@ -86,7 +118,10 @@ export class GpuBufferAllocator {
   noteRelease(buffer, byteLength, usage) {
     this.#currentBytes -= byteLength;
     if (this.#currentBytes < 0) throw new Error("GPU allocator accounting underflow");
-    if (this.#pooling) {
+    if (poolingDisabled) {
+      // Kept alive and never handed back; see setBufferPooling.
+      this.#retired.push(buffer);
+    } else if (this.#pooling) {
       const key = `${byteLength}:${usage}`;
       const pooled = this.#pool.get(key) ?? [];
       pooled.push(buffer);
@@ -96,6 +131,9 @@ export class GpuBufferAllocator {
       noteDestroy(this.device, byteLength, buffer.label);
     }
   }
+
+  /** Everything `setBufferPooling(false)` has held onto, for the report. */
+  retiredCount() { return this.#retired.length; }
 
   destroyPooled() {
     for (const [key, buffers] of this.#pool.entries()) {
