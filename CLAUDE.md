@@ -293,6 +293,37 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
+### 🔴 WHAT IS NEW AND WANTS AN M2 BEFORE IT MERGES
+
+`addInPlace` - the same shader - now **windows** its bindings. It bound both
+tensors whole, and the pair is `L*L*channels*4` against
+`maxStorageBufferBindingSize`: 2 GiB on the A100, unraisable because it is
+Vulkan's `maxStorageBufferRange`, so the ceiling was **2,047 residues** whatever
+memory the card had. Measured there: 2,047 bound, 2,048 was REFUSED outright,
+2,896 folds in two windows now. Below the ceiling the single-dispatch path is
+untouched and every A100 checksum is unchanged. Found by @milot-mirdita upstream
+- their packed-f16 pair put their ceiling at 2,896 where our f32 put ours at
+2,047.
+
+Three things worth an Apple part specifically:
+
+1. **That a normal fold still takes the single-dispatch path there.** The
+   threshold is `maxStorageBufferBindingSize / 4` rounded down to 64 elements,
+   and Metal may report a different limit - a lower one would start windowing at
+   a length the A100 never does, which is a behaviour change nobody has seen.
+   Any AF2 checksum moving at an ordinary length means that happened.
+2. **The guard and the windowing together, on the backend that CLAMPS.** A
+   windowed dispatch's last workgroup runs past its window, and on Metal an
+   unguarded one would clamp onto the window's last element rather than the
+   buffer's - the same corruption as the race, at a new boundary. The guard
+   reads `arrayLength(&base)`, which is the WINDOW's length, so it should hold;
+   the A100 cannot check that, because it discards instead of clamping.
+3. **`tools/gpu/probe-grid-overdispatch.js`**, whose `backend` arm strips the
+   guard and is the only thing that still sees what a GPU does with an
+   out-of-range write. On the A100 it says `discards`. On an M2 it should say
+   **CLAMPS** - and if it does not, this port's whole account of the race is
+   wrong.
+
 🔴 **WHY AN APPLE PART IS THE INTERESTING ONE.** The capability layer and the
 five derivations sit UNDER the priors, and `metal-3`'s prior sets three knobs.
 On the A100, whose prior sets thirty, almost nothing they decide is ever used and
