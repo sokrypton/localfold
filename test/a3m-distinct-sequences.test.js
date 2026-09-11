@@ -15,7 +15,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { distinctSequenceCount, foundOnlyTheQuery, parseA3m } from "../src/input/a3m.js";
+import { distinctSequenceCount, foldsAsSingleSequence, foundOnlyTheQuery, parseA3m }
+  from "../src/input/a3m.js";
 
 const QUERY = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ";
 const HIT = "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVA";
@@ -56,4 +57,27 @@ test("a gapped homolog is a distinct sequence", () => {
   const gapped = `${HIT.slice(0, 10)}-${HIT.slice(11)}`;
   assert.equal(distinctSequenceCount(a3m(QUERY, gapped)), 2);
   assert.ok(!foundOnlyTheQuery(a3m(QUERY, gapped)));
+});
+
+test("a pasted alignment folds as a single sequence only when it is OUR sequence", () => {
+  // 🔴 AN A3M's OWN QUERY WINS OVER THE SEQUENCE BOX, deliberately, so routing
+  // a one-sequence alignment to the query-only path would fold a different
+  // protein than the one the reader pasted. Paste-and-upload are the two paths
+  // where the two can differ; a searched alignment cannot.
+  const other = "MSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTT";
+  assert.ok(foldsAsSingleSequence(a3m(QUERY), QUERY));
+  assert.ok(foldsAsSingleSequence(a3m(QUERY, QUERY), QUERY));
+  // Same alignment, a different protein in the box: keep the alignment.
+  assert.ok(!foldsAsSingleSequence(a3m(QUERY), other));
+  assert.ok(!foldsAsSingleSequence(a3m(QUERY, QUERY), other));
+  // And a real homolog is never a single-sequence fold, matching query or not.
+  assert.ok(!foldsAsSingleSequence(a3m(QUERY, HIT), QUERY));
+});
+
+test("a complex's concatenated query is what has to match", () => {
+  const a = "MKTAYIAKQRQISFVKSHFSRQ";
+  const b = "GWSTELEKHREELKEFLKKEGI";
+  const merged = a3m(a + b, a + b);
+  assert.ok(foldsAsSingleSequence(merged, a + b));
+  assert.ok(!foldsAsSingleSequence(merged, a));
 });

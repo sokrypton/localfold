@@ -1650,14 +1650,31 @@ single-sequence one. Plain, the second copy of the query moves pTM by 4.6% - a
 number the page shows a user. Every monomer fold with the environmental
 database carried that second copy.
 
-### And a search that finds nothing is a single-sequence fold now
+### And an alignment carrying only the query is a single-sequence fold now
 
-`web/app.js`'s search branch counts DISTINCT rows and, at one, returns the
-query-only shape - `text: null` - which is the state "Single Sequence" mode
-already produces and every consumer below already handles. The template hits
-are kept: a protein with no homologs may still have a structure to lean on. The
-status line says so, and the fold's own summary says "single sequence" rather
-than "2 MSA rows".
+All four ways an alignment reaches a fold - **searched, pasted, uploaded as an
+A3M, uploaded as an archive** - go through `singleSequenceIfOnlyQuery`, which
+counts DISTINCT rows and at one returns the query-only shape, `text: null`.
+That is the state "Single Sequence" mode already produces, so every consumer
+below already handles it; the search path keeps its template hits, because a
+protein with no homologs may still have a structure to lean on. The status line
+says which input it was, and the fold's own summary then says "single sequence"
+rather than "2 MSA rows".
+
+🔴 **AND FOR A PASTED OR UPLOADED ONE IT ALSO CHECKS WHOSE QUERY IT IS.** An
+A3M's own first record WINS over the sequence box, deliberately, so that a
+reader can paste an alignment and fold what it describes - and `text: null`
+throws that away. `foldsAsSingleSequence` therefore requires the alignment's
+query to BE the sequence about to be folded; where they differ the alignment is
+kept and folds the protein it names, exactly as before. A searched alignment
+cannot differ, since `generateMmseqs2Msa` already refuses an A3M whose query is
+not what it asked about - so the guard costs the search path nothing and
+protects the two paths a reader controls.
+
+The decision is `foldsAsSingleSequence` in src/input/a3m.js rather than inline
+in web/app.js, because node cannot import that file - it wants a DOM - and
+`test/a3m-distinct-sequences.test.js` covers the query-mismatch case, the
+complex's concatenated query, insertions, and gaps.
 
 🔴 **THERE IS NO SPEEDUP IN IT, WHICH IS WORTH SAYING.** `elapsedMilliseconds`
 over the three arms above: **855, 840, 843** - the same. A homolog-free search

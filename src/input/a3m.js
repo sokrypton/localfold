@@ -134,3 +134,23 @@ export function distinctSequenceCount(a3mText) {
 export function foundOnlyTheQuery(a3mText) {
   return distinctSequenceCount(a3mText) <= 1;
 }
+
+/**
+ * Whether this alignment should simply be folded as a single sequence.
+ *
+ * 🔴 THE SECOND CONDITION IS NOT DECORATION. An A3M's own first record WINS
+ * over the sequence in the box - deliberately, so a reader can paste an
+ * alignment and fold what it describes - and routing to the query-only path
+ * throws that away. So a pasted or uploaded alignment carrying one sequence is
+ * only folded as a single sequence when that sequence is the one being folded;
+ * otherwise it keeps the alignment and folds the protein it names, exactly as
+ * before. A searched alignment cannot differ - generateMmseqs2Msa refuses an
+ * A3M whose query is not the sequence it asked about - so this costs the search
+ * path nothing and protects the two paths a reader controls.
+ *
+ * @param {string} a3mText the alignment
+ * @param {string} sequence the chains about to be folded, concatenated
+ */
+export function foldsAsSingleSequence(a3mText, sequence) {
+  return foundOnlyTheQuery(a3mText) && parseA3m(a3mText).query === sequence;
+}

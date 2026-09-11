@@ -23,7 +23,7 @@
  */
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
-import { foundOnlyTheQuery, parseA3m } from "../src/input/a3m.js";
+import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
@@ -821,13 +821,39 @@ function progress(fraction) {
  * takes the per-chain alignments so clustering, subsampling and masking run
  * separately for each copy. Merging first makes repeated chains identical.
  */
+/**
+ * An alignment that carries nothing but its own query, as a single-sequence
+ * fold - or null when it carries more and should be folded as an alignment.
+ *
+ * 🔴 `depth` COUNTS ROWS. A search that matched nothing returns TWO of them,
+ * because extractMmseqs2A3m joins the uniref and environmental blocks and each
+ * begins with its own `>101`; a pasted or uploaded A3M can say the same thing
+ * in one row or in ten. Folding that is not an alignment: it is the query
+ * repeated, and the repetition moves the answer - pTM 0.3965 -> 0.4148 on the
+ * 59-mer. `text: null` is the state "Single Sequence" mode already produces, so
+ * every consumer below already handles it.
+ *
+ * 🔴 AND FOR A PASTED OR UPLOADED ONE, ONLY WHEN ITS QUERY IS WHAT WE ARE
+ * FOLDING. An A3M's own first record WINS over the sequence box further down -
+ * that is deliberate, so a reader can paste an alignment and fold what it
+ * describes - and returning `text: null` throws that away. If the two differ,
+ * the alignment is left alone and folds the protein it names, exactly as
+ * before. The search path cannot reach this: generateMmseqs2Msa already refuses
+ * an A3M whose query is not the sequence it asked about.
+ */
+function singleSequenceIfOnlyQuery(text, chains, where, extra = {}) {
+  if (!foldsAsSingleSequence(text, chains.join(""))) return null;
+  status(`${where} · folding the single sequence`);
+  return { text: null, blocks: null, ...extra };
+}
+
 async function alignmentText(chains, signal, family) {
   switch (msaMode()) {
     case "single": return null;
     case "paste": {
       const text = element("msa-text").value.trim();
       if (text.length === 0) throw new Error("Paste an A3M, or switch the alignment back to none");
-      return text;
+      return singleSequenceIfOnlyQuery(text, chains, "The pasted alignment") ?? text;
     }
     case "upload": {
       // 🔴 AN ARCHIVE RESTORES THE BLOCKS; A BARE a3m NEVER HAD THEM. This is
@@ -851,10 +877,11 @@ async function alignmentText(chains, signal, family) {
             + `${chains.length === 1 ? "" : "s"}`);
         }
         status(`Alignment from the archive · ${uploadedMsas.chains} chains`);
-        return { text: merged.a3m, blocks: merged.blocks };
+        return singleSequenceIfOnlyQuery(merged.a3m, chains, "The uploaded archive")
+          ?? { text: merged.a3m, blocks: merged.blocks };
       }
       if (uploadedA3m.length === 0) throw new Error("Choose an A3M file, or switch the alignment back to none");
-      return uploadedA3m;
+      return singleSequenceIfOnlyQuery(uploadedA3m, chains, "The uploaded alignment") ?? uploadedA3m;
     }
     case "search": {
       // 🔴 THE ONE REQUEST THIS PAGE MAKES OFF THE MACHINE. Everything else runs
@@ -944,10 +971,11 @@ async function alignmentText(chains, signal, family) {
       // a state every consumer below already handles. The template hits are
       // kept: a protein with no homologs may still have a structure to lean on,
       // and they came out of the same tar.
-      if (foundOnlyTheQuery(searched.a3m)) {
-        status(`MSA search found only the query (${searched.depth} rows, 1 distinct) · folding the single sequence`);
-        return { text: null, blocks: null, templateHits: searched.templateHits };
-      }
+      const onlyQuery = singleSequenceIfOnlyQuery(
+        searched.a3m, chains,
+        `MSA search found only the query (${searched.depth} rows, 1 distinct)`,
+        { templateHits: searched.templateHits });
+      if (onlyQuery !== null) return onlyQuery;
       // ...and the template hits, which came out of the same tar and cost
       // nothing. See extractMmseqs2TemplateHits.
       return { text: searched.a3m, blocks: searched.blocks ?? { unpaired: searched.a3m },
