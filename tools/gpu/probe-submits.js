@@ -251,12 +251,6 @@ export function instrumentSubmits(device) {
   };
 
   const summary = (wallMs) => {
-    // 🔴 THE SECOND HALF OF THE RUN IS THE WARM FOLD, and it is a different
-    // animal: the first is weights, compiles and a cold allocator, so a table
-    // over the whole run describes a fold nobody waits for twice. With
-    // `--repeat=2` the halves are close enough to the two folds to read.
-    const halfAt = submits.length === 0 ? 0
-      : submits[submits.length - 1].atMs / 2;
     // 🔴 THE UNION OF THE STALLS, not their sum: a fold holds hundreds of
     // `onSubmittedWorkDone` promises at once - the block-progress ones are
     // deliberately not awaited - so the sum is many times the wall and means
@@ -323,28 +317,14 @@ export function instrumentSubmits(device) {
         return into.filter((b) => b.count > 0);
       })(),
       slowestGaps: [...submits].sort((a, b) => b.gapMs - a.gapMs).slice(0, 10),
-      // 🔴 THE ACTIONABLE TABLE. Sorted by submits, because the question this
-      // probe exists to answer is which loop is issuing them.
-      warmByEncoder: (() => {
-        const into = new Map();
-        let previous = halfAt;
-        for (const row of submits) {
-          if (row.atMs < halfAt) continue;
-          const found = into.get(row.label) ?? { submits: 0, dispatches: 0, gapMs: 0 };
-          found.submits += 1;
-          found.dispatches += row.dispatches;
-          found.gapMs += Math.min(row.gapMs, row.atMs - previous);
-          into.set(row.label, found);
-          previous = row.atMs;
-        }
-        return [...into.entries()]
-          .map(([label, row]) => ({ label, submits: row.submits,
-            dispatches: row.dispatches, gapMs: round(row.gapMs) }))
-          .sort((a, b) => b.gapMs - a.gapMs).slice(0, 14);
-      })(),
+      // 🔴 THE ACTIONABLE TABLE, AND THE ONLY ONE. An earlier version had a
+      // second over the run's second half, on the theory that the warm fold is
+      // the interesting one - but it charged the raw gap without subtracting
+      // the waits, so its rows said the opposite of this one's for the same
+      // encoder. Two tables that disagree are worse than the weaker of them:
+      // `--repeats` is how to ask about a repeated fold now.
       byEncoder: (() => {
         const into = new Map();
-        let previous = 0;
         for (const row of submits) {
           const found = into.get(row.label)
             ?? { submits: 0, dispatches: 0, gapMs: 0, hostMs: 0 };
@@ -353,7 +333,6 @@ export function instrumentSubmits(device) {
           found.gapMs += row.gapMs;
           found.hostMs += Math.max(0, row.gapMs - waitingBetween(row.at - row.gapMs, row.at));
           into.set(row.label, found);
-          previous = row.at;
         }
         return [...into.entries()]
           .map(([label, row]) => ({ label, submits: row.submits,
