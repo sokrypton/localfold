@@ -1613,9 +1613,69 @@ sequence it has already taken, across all MSAs - so this is a divergence from
 the reference, not only a waste. (From knowledge of that pipeline; there is no
 checked-in copy here to point at.)
 
-**NOT FIXED, deliberately.** Deduplicating changes which rows survive the
-cluster budget, so it changes the clustering, so it changes the prediction and
-every checksum in this repository - including the three the M2 handoff is
-verifying against. It is a correctness change with an accuracy argument behind
-it and it wants its own measurement (does pLDDT move, and which way, on the
-targets in docs/AF2.md), not a quiet landing in the middle of a merge.
+### Fixed, and what it does to pLDDT: nothing measurable, and one thing that matters
+
+`planA3mFeatures` drops a row whose ALIGNED sequence it has already taken,
+keeping the first - so the query stays row 0. `--no-dedupe` on fold-af2.js is
+the control arm.
+
+**On a deep alignment it is worth nothing.** `tools/fixtures/test.a3m`, paired
+by seed because the seed drives which rows the budget draws:
+
+| budget | seeds | delta pLDDT | delta pTM | seeds favouring dedupe |
+|---|---:|---|---|---|
+| 128:256 (the page default) | 8 | **-0.005 ± 0.288** | +0.0008 ± 0.0039 | 5/8 |
+| 508:1024 | 6 | **-0.036 ± 0.129** | -0.0008 ± 0.0019 | 2/6 |
+
+The paired delta's standard deviation is sixty times its mean at the default
+budget. Against the captured AlphaFold reference of 96.625 the deduplicated arm
+is nominally closer - mean |error| 0.118 against 0.155 - and that is inside the
+noise too. 413 of 8076 rows are dropped, and ~20 of the 384 the budget draws;
+the alignment is 8076 deep against a 384-row budget, so a few more distinct
+rows change nothing. **The MSA budget is not the binding constraint at this
+depth.**
+
+🔴 **BUT ON A QUERY-ONLY SEARCH IT CHANGES THE ANSWER, AND THAT IS THE CASE
+THAT MATTERS.** Folding the query alone against the query duplicated - which is
+literally what `extractMmseqs2A3m` returns when nothing is found:
+
+| A3M | arm | pLDDT | pTM | checksum |
+|---|---|---:|---:|---:|
+| query once | either | 59.974 | 0.3965 | -459839 |
+| query TWICE | **deduplicated** | **59.974** | **0.3965** | **-459839** |
+| query twice | plain | 60.079 | **0.4148** | -426577 |
+
+Deduplicated, a duplicate row is a no-op and the fold is bit-identical to the
+single-sequence one. Plain, the second copy of the query moves pTM by 4.6% - a
+number the page shows a user. Every monomer fold with the environmental
+database carried that second copy.
+
+### And a search that finds nothing is a single-sequence fold now
+
+`web/app.js`'s search branch counts DISTINCT rows and, at one, returns the
+query-only shape - `text: null` - which is the state "Single Sequence" mode
+already produces and every consumer below already handles. The template hits
+are kept: a protein with no homologs may still have a structure to lean on. The
+status line says so, and the fold's own summary says "single sequence" rather
+than "2 MSA rows".
+
+🔴 **THERE IS NO SPEEDUP IN IT, WHICH IS WORTH SAYING.** `elapsedMilliseconds`
+over the three arms above: **855, 840, 843** - the same. A homolog-free search
+already yields a two-row alignment, `maxExtra` collapses to `max(1, 0) = 1`
+either way, and web/app.js already funnels single-sequence mode through the
+same `predictA3m` with a one-row A3M (`alignment === null ? ">query\n..."`).
+The change is correctness and honesty, not time.
+
+### 🔴 And it exposed that the synthetic alignment had twelve distinct rows
+
+`fold-af2.js` built its rows with a gap stride of `row % 11 + 3`, so rows 1, 12,
+23 and so on were IDENTICAL: `--rows=128 --extra-rows=128` was 256 rows carrying
+**12** sequences. Harmless while nothing read what a row SAID - the work is the
+same, so every timing in this file stands - and fatal beside deduplication,
+which would have collapsed every AF2 gate to a depth-12 fold while still
+reporting 256. The stride is the row's bit pattern now and the tool ASSERTS
+distinctness rather than arguing for it.
+
+That is what moved the three AF2 baselines - AF2 **-1287025**, the 30,29
+multimer **315591**, `bench-af2-warm` **-36457799** - and not the deduplication:
+`--no-dedupe` gives -1287025 as well.

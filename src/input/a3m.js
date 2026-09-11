@@ -111,3 +111,26 @@ export function parseA3m(text) {
     length,
   };
 }
+
+/**
+ * How many DISTINCT sequences an alignment carries, which is not its depth.
+ *
+ * 🔴 `depth` COUNTS ROWS, AND A SEARCH THAT FOUND NOTHING RETURNS TWO OF THEM.
+ * `extractMmseqs2A3m` joins the uniref block and the environmental block and
+ * returns each WHOLE, so both begin with their own `>101` - a query with no
+ * homologs comes back as depth 2 carrying one sequence. Folding that is not an
+ * alignment of two; it is the query twice, and the second copy moves pTM from
+ * 0.3965 to 0.4148 on the 59-mer. See docs/AF2.md.
+ *
+ * On the ALIGNED columns, because `parseA3m` has already dropped the lowercase
+ * insertions into the deletion matrix and two rows differing only there are the
+ * same row to the model - which is what AlphaFold hashes.
+ */
+export function distinctSequenceCount(a3mText) {
+  return new Set(parseA3m(a3mText).sequences).size;
+}
+
+/** Whether a search returned nothing but the query, however many rows it used. */
+export function foundOnlyTheQuery(a3mText) {
+  return distinctSequenceCount(a3mText) <= 1;
+}

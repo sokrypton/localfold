@@ -23,7 +23,7 @@
  */
 import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
-import { parseA3m } from "../src/input/a3m.js";
+import { foundOnlyTheQuery, parseA3m } from "../src/input/a3m.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
 // AND more than one chain, so a first fold never reaches it - and stopping a
@@ -930,6 +930,24 @@ async function alignmentText(chains, signal, family) {
       // paired construction, one search speaking for every copy, so `paired` is
       // null and AF3 does what it does with none. Pairing is a second search
       // and it only happens for distinct sequences.
+      // 🔴 A SEARCH THAT FINDS ONLY THE QUERY IS A SINGLE-SEQUENCE FOLD, AND
+      // SAYING SO IS THE HONEST ANSWER AS WELL AS THE FAST ONE. `depth` counts
+      // ROWS, and `extractMmseqs2A3m` returns the uniref block and the
+      // environmental block WHOLE - each starting with its own `>101` - so a
+      // search that matched nothing comes back as depth 2 carrying one
+      // sequence. Folding that is not "an alignment of two": it is the query,
+      // twice, and the second copy measurably moves the answer (pTM 0.3965 ->
+      // 0.4148 on the 59-mer). Counting DISTINCT rows is the only honest depth.
+      //
+      // Routing it to the query-only path is what the "Single Sequence" mode
+      // already does, so this is not a new code path - `alignment === null` is
+      // a state every consumer below already handles. The template hits are
+      // kept: a protein with no homologs may still have a structure to lean on,
+      // and they came out of the same tar.
+      if (foundOnlyTheQuery(searched.a3m)) {
+        status(`MSA search found only the query (${searched.depth} rows, 1 distinct) · folding the single sequence`);
+        return { text: null, blocks: null, templateHits: searched.templateHits };
+      }
       // ...and the template hits, which came out of the same tar and cost
       // nothing. See extractMmseqs2TemplateHits.
       return { text: searched.a3m, blocks: searched.blocks ?? { unpaired: searched.a3m },

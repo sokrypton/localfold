@@ -214,17 +214,48 @@ export async function main(device, args) {
   };
   const loadMs = Math.round(performance.now() - loadStart);
 
+  // 🔴 A REAL ALIGNMENT, BECAUSE THE SYNTHETIC ONE HAS TWELVE DISTINCT ROWS.
+  // The generator below varies the gap stride by `row % 11`, so rows 1, 12, 23
+  // and so on are IDENTICAL: `--rows=128 --extra-rows=128` is 256 rows carrying
+  // 12 sequences. That is fine for timing - the work is the same - and useless
+  // for anything that depends on what the rows SAY, which is clustering,
+  // profiles and deduplication. `--a3m=<path>` folds a real one.
+  const a3mPath = option(args, "a3m", "");
+  const a3mFromFile = a3mPath === "" ? null
+    : await (await fetch(a3mPath.startsWith("/") ? a3mPath : `/${a3mPath}`)).text();
+
   const lines = [">query", sequence];
   // 🔴 DEEP ENOUGH FOR BOTH CAPS, NOT THE LARGER OF THEM. The clusters are
   // taken first and the extra rows come out of what is left, so a
   // max(512, 1024) = 1024-row alignment at 512 clusters leaves only 512 extra -
   // half the extra stack's work, while the report still says 1024.
+  // 🔴 AND EVERY ROW DISTINCT, WHICH IT WAS NOT. The stride used to be
+  // `row % 11 + 3`, so rows 1, 12, 23 and so on were IDENTICAL and
+  // `--rows=128 --extra-rows=128` was 256 rows carrying **12** sequences. That
+  // never mattered while nothing looked at what a row SAID - the work is the
+  // same either way, so every timing here stands - but the featuriser drops
+  // duplicate rows now, and a degenerate alignment would have collapsed every
+  // AF2 gate to a depth-12 fold while still reporting 256.
+  //
+  // The gap pattern is the row's bit pattern, so two rows agree only if they
+  // agree in every bit the columns reach; the assertion below is what says so
+  // rather than the argument.
   for (let row = 1; row < rows + extraRows; row += 1) {
     lines.push(`>synthetic${row}`);
     lines.push([...sequence].map((code, column) =>
-      (column % (row % 11 + 3) === 0 ? "-" : code)).join(""));
+      (((row >> (column % 24)) & 1) === 1 ? "-" : code)).join(""));
   }
-  const a3m = `${lines.join("\n")}\n`;
+  // 🔴 A GENERATOR THAT SILENTLY REPEATS ITSELF IS THE BUG THIS REPLACES, so
+  // it is checked rather than reasoned about. A short sequence cannot express
+  // enough bits, and that has to fail loudly rather than quietly shrink the
+  // alignment.
+  const distinct = new Set(lines.filter((_, index) => index % 2 === 1)).size;
+  if (a3mPath === "" && distinct !== rows + extraRows) {
+    throw new Error(`the synthetic alignment has ${distinct} distinct rows of `
+      + `${rows + extraRows}: a ${sequence.length}-residue sequence cannot express `
+      + "enough gap patterns. Use --a3m= with a real alignment.");
+  }
+  const a3m = a3mFromFile ?? `${lines.join("\n")}\n`;
 
   const chains = chainLengths.length > 0 ? chainLengths : [sequence.length];
   if (chains.reduce((sum, value) => sum + value, 0) !== sequence.length) {
@@ -254,6 +285,9 @@ export async function main(device, args) {
     .predictA3m(
       a3m, weights, featureTables,
       { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
+        // ...the arm for measuring what deduplication is worth; see
+        // planA3mFeatures. Default on, matching AlphaFold's make_msa_features.
+        deduplicateMsa: !args.includes("--no-dedupe"),
         chainLengths: chains, ...regime },
       paeBreaks, undefined, onProgress,
     );
@@ -279,6 +313,7 @@ export async function main(device, args) {
       .predictA3m(
         a3m, weights, featureTables,
         { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
+          deduplicateMsa: !args.includes("--no-dedupe"),
           chainLengths: chains, ...regime },
         paeBreaks, undefined, undefined,
       );

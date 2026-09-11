@@ -84,6 +84,8 @@ function deletionValue(value) { return Math.atan(value / 3) * 2 / Math.PI; }
 export const featureStats = {
   calls: 0, encodeMs: 0, profileMs: 0, maskMs: 0,
   nearestMs: 0, clusterProfileMs: 0, msaFeatureMs: 0, extraMs: 0,
+  // Rows dropped because the model had already been given that sequence.
+  duplicateRows: 0,
 };
 
 /** Zero every phase, so a caller can measure one fold rather than a process. */
@@ -200,7 +202,44 @@ function nearestCentres(centerCodes, encoded, extras, centreCount, length) {
 function planA3mFeatures(a3mText, tables, options) {
   featureStats.calls += 1;
   let mark = performance.now();
-  const alignment = parseA3m(a3mText);
+  const parsed = parseA3m(a3mText);
+  // 🔴 EVERY ROW THE MODEL HAS ALREADY SEEN IS A ROW IT DOES NOT GET, which is
+  // the argument src/input/chains.js already makes for the multimer's paired
+  // and unpaired blocks and which nothing applied here. AlphaFold's own
+  // `make_msa_features` keeps a `seen_sequences` set across all MSAs and skips
+  // a repeat; this is that.
+  //
+  // 🔴 IT MATTERS MOST FOR THE QUERY. `extractMmseqs2A3m` joins `uniref.a3m`
+  // and the environmental A3M and returns each block WHOLE, so both start with
+  // their own `>101` - a search that finds nothing but the query comes back as
+  // depth 2, distinct 1, and every monomer fold carries the query twice.
+  //
+  // 🔴 AND ON THE ALIGNED COLUMNS, NOT THE RAW ROW. Featurisation has already
+  // dropped the lowercase insertions into the deletion matrix, so two rows
+  // differing only in their insertions are the same row to the model - which is
+  // what AlphaFold hashes. Comparing the raw A3M text keeps duplicates it
+  // removes; see the note on deduplicateUnpairedAgainstPaired.
+  //
+  // The FIRST occurrence is kept, so the query stays row 0.
+  const alignment = options.deduplicateMsa === false ? parsed : (() => {
+    const seen = new Set();
+    const keep = [];
+    for (let row = 0; row < parsed.depth; row += 1) {
+      if (seen.has(parsed.sequences[row])) continue;
+      seen.add(parsed.sequences[row]);
+      keep.push(row);
+    }
+    featureStats.duplicateRows += parsed.depth - keep.length;
+    if (keep.length === parsed.depth) return parsed;
+    return {
+      ...parsed,
+      sequences: keep.map((row) => parsed.sequences[row]),
+      deletionMatrix: keep.map((row) => parsed.deletionMatrix[row]),
+      descriptions: keep.map((row) => parsed.descriptions[row]),
+      rawSequences: keep.map((row) => parsed.rawSequences[row]),
+      depth: keep.length,
+    };
+  })();
   const length = alignment.length; const depth = alignment.depth;
   const encoded = new Uint8Array(depth * length);
   for (let row = 0; row < depth; row += 1) {
