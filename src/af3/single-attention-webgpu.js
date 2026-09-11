@@ -145,14 +145,30 @@ export function createSingleAttentionShaders(shape, offsets, epsilon, variance) 
   // `perThread` deep, so its width has to DIVIDE `perSplit`; `project_out`
   // strides bounded loops and takes any width. They are resolved separately so
   // the constraint on one does not cap the other.
-  const projectLanes = shape.projectLanes ?? 64;
+  const requestedLanes = shape.projectLanes ?? 64;
   const projectOutLanes = shape.projectOutLanes ?? 64;
-  for (const [name, lanes] of [["projectLanes", projectLanes],
+  for (const [name, lanes] of [["projectLanes", requestedLanes],
                                ["projectOutLanes", projectOutLanes]]) {
     if (!Number.isInteger(lanes) || lanes < 1 || (lanes & (lanes - 1)) !== 0) {
       throw new RangeError(`${name} ${lanes} is not a power of two`);
     }
   }
+  // 🔴 A LANE WIDTH IS A DEVICE PREFERENCE MEETING A SHAPE CONSTRAINT, SO IT IS
+  // RESOLVED AND NOT ASSERTED. `perSplit` is `width / splits` and the split
+  // count is itself derived from the token count, so a width that divides it at
+  // one length does not at another: at AF3's 384 the splits rule picks 3 for
+  // every n below 1024 - perSplit 128, which 128 lanes divide exactly - and 2
+  // from 1024 to 2047, where perSplit is 192 and 128 does not. A prior asking
+  // for 128 lanes would therefore fold every chain up to a thousand tokens and
+  // throw on the next one, which is a crash a device table cannot see.
+  //
+  // This is `transitionWidth`'s pattern, not a fallback hiding an error: the
+  // knob names how wide the device would LIKE the workgroup, and the shape
+  // decides how wide it may be. Halving until it divides lands on 64 - exactly
+  // what every caller had before the knob existed - so the unreachable case
+  // resolves to today's behaviour rather than to a surprise.
+  let projectLanes = requestedLanes;
+  while (projectLanes > 1 && perSplit % projectLanes !== 0) projectLanes /= 2;
   if (perSplit % projectLanes !== 0) {
     throw new Error(`the projection's ${perSplit} outputs a split do not divide`
       + ` into ${projectLanes} lanes`);

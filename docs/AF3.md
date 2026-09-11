@@ -1859,3 +1859,60 @@ for up to 504 MiB of extra peak.
 So the default stays at 64 MiB and the fix is the plumbing, not the value. It
 matches what docs/PERF.md already records for the ESMFold2 trunk - "a 6% GPU win
 and a 1% WALL loss for 144 MiB" - reached there by a different route.
+
+## The single projection was running an M2's constant, and it is 4x
+
+`single.project` is one workgroup per token and per split. At 68 tokens that is
+136 workgroups on a card that holds 4542, and it was **15.0 ms of a 104.3 ms
+trunk** - more than any kernel in the model except `grid.attend`, for a track
+that is O(n) where the pair track is O(n²).
+
+Two knobs fix it and **neither works alone**, which is why two earlier attempts
+found nothing. `bench-trunk.js --profile`, reading `gpuTotalMs` (every pass, not
+the listed rows), three rounds an arm, arms interleaved:
+
+| n=68 | trunk GPU | `single.project` | groups |
+|---|---:|---:|---:|
+| shipped (target 110, 64 lanes) | 104.3 / 104.3 / 104.3 | 15.00 | 136 |
+| target 2048 alone | 96.9 / 96.8 / 96.8 | 7.48 | 204 |
+| **target 2048 + 128 lanes** | **93.0 / 92.8 / 93.1** | **3.69** | 204 |
+
+| n=300 | trunk GPU | `single.project` | groups |
+|---|---:|---:|---:|
+| shipped | 607.8 / 609.3 / 608.4 | 15.67 | 300 |
+| target 2048 alone | 601.1 / 601.3 / 601.3 | 7.86 | 900 |
+| **target 2048 + 128 lanes** | **599.0 / 597.7 / 596.9** | **4.99** | 900 |
+
+Across four sizes, whole-trunk GPU: **68 tokens −10.8%, 150 −6.0%, 300 −1.7%,
+512 −0.5%**, and the kernel itself 4.05x, 3.97x, 3.13x, 2.22x. The win is
+largest at the SHORT chains, which is what a page mostly folds, because the
+starvation is: fewer tokens, fewer workgroups, same fixed cost.
+
+🔴 **WHY NEITHER KNOB PAYS ALONE, AND BOTH TOGETHER DO.** 128 lanes over the
+unsplit 384-wide output leaves each lane three outputs deep and buys nothing -
+measured at 15.48 -> **16.24**, worse, which reproduces docs' earlier
+"`project` at 128 lanes is WORSE (15.60 -> 16.09)" exactly. Split three ways the
+output is 128 wide, one lane an output, and the two compose. The earlier split
+sweep used `maxSplits` 6, whose `perSplit` is 64 and which therefore cannot use
+a wider lane at all. **Sweeping one axis of a pair says the pair does not pay.**
+
+🔴 **AND A LANE WIDTH IS A REQUEST, NOT A VALUE.** `perSplit` is `width /
+splits` and the split count is derived from the token count, so 128 divides it
+at one length and not at another: at AF3's 384 the rule picks 3 splits for every
+n below 1024 - `perSplit` 128 - and **2 from 1024 to 2047, where `perSplit` is
+192**. A prior naming 128 outright would have folded every chain up to a
+thousand tokens and thrown on the next one. `createSingleAttentionShaders`
+halves the request until it divides, landing on the 64 every caller had before
+the knob existed; and the pipeline key names the RESOLVED width, not the
+request, because that is what the shader contains.
+
+🔴 **IT IS A REORDERING.** Three workgroups normalise the row where one did and
+128 lanes reduce it in a different tree, so `check-af3-block-any`'s single
+residual moves in the eighth figure (2.0899e-4 either way) and its pair not at
+all. On a fold: **max |dx| 0.001 A, 531 of 574 atoms identical** - the same
+class as `attnSplits` 1 -> 4, which the ampere prior already ships at 541/574.
+pLDDT 84.26493204096884 against 84.26493426067073.
+
+**ampere only.** `singleProjectSplits`' own table shows 6 splits LOSING on an M2
+at every n it was measured at, which is why these were left as parameters in the
+first place - see DEFAULTS_ARE_MEASUREMENTS.

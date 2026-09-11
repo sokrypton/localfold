@@ -89,6 +89,7 @@ export async function main(device, args) {
   }
 
   // --profile times every compute pass by label; see tools/gpu/profile.js.
+  const topRows = Number(option(args, "top", "18"));
   const profile = args.includes("--profile") ? profileDevice(device) : null;
   // --no-resident uploads each block's weights per pass instead of keeping
   // them on the device, which is the 562 MiB half of what a fold holds.
@@ -144,7 +145,11 @@ export async function main(device, args) {
     pairformerSplit: trunkGpu.lastPairformerSplit,
     tokens, msaRows: rows, blocks, residentWeights, budgetMiB, perPass,
     deviceMemory: memorySnapshot(device),
-    ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, 18),
+    // 🔴 EIGHTEEN ROWS HID AN IMPROVEMENT. A knob that made `single.project`
+    // FASTER dropped it out of the list, and the sweep read as "the kernel
+    // vanished" - which is indistinguishable from the arm having broken it.
+    // `--top=<n>` is profile-af2-block.js's flag and the same lesson.
+    ...(passes_ === undefined ? {} : { gpuPasses: passes_.slice(0, topRows),
       gpuTotalMs: Number(passes_.reduce((t, e) => t + e.ms, 0).toFixed(1)),
       gpuLabels: passes_.length,
       gpuDispatches: passes_.reduce((t, e) => t + e.passes, 0) }),

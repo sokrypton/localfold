@@ -434,14 +434,33 @@ const PRIORS = new Map([
   //                    knob across the range its caller varies, not at one
   //                    shape.
   //
-  //   singleProject...Target/MaxSplits  NOT TAKEN. bench-single-project.js
-  //                    measures 1.46x-2.50x for a 1200-workgroup target
-  //                    against the rule's M2-sized 110, and
-  //                    `singleProjectSplits` duly returns 6 where it returned
-  //                    1 - but `single.project` in a real trunk does not move
-  //                    by 0.3 ms either way. The bench's kernel is not the
-  //                    pipeline's. The rule keeps its new parameters so the
-  //                    axis stays expressible.
+  //   singleProject...Target/MaxSplits  🔴 TAKEN AFTER ALL, AND THIS ENTRY WAS
+  //                    WRONG. It said "single.project in a real trunk does not
+  //                    move by 0.3 ms either way". It moves by 11.3 ms of a
+  //                    104.3 ms trunk. bench-trunk.js --profile, gpuTotalMs
+  //                    (every pass, not the listed rows), three rounds an arm:
+  //
+  //                      n=68    old 104.3 104.3 104.3   new 93.0 92.8 93.1
+  //                      n=300   old 607.8 609.3 608.4   new 599.0 597.7 596.9
+  //
+  //                    and `single.project` itself 15.00 -> 3.69 at 68 tokens,
+  //                    15.67 -> 4.99 at 300. The rounds agree to 0.3 ms.
+  //
+  //                    🔴 WHY BOTH EARLIER READINGS SAID NO: EACH KNOB WAS
+  //                    SWEPT ALONE, AND ALONE NEITHER PAYS. The entry below
+  //                    measured lanes at the DEFAULT split and found 128 WORSE
+  //                    - which reproduces exactly here, 15.48 -> 16.24 - and
+  //                    this entry measured the split with maxSplits 6, whose
+  //                    perSplit is 64 and which therefore cannot use a wider
+  //                    lane at all. The two compose and nothing else does:
+  //                    split three ways the output is 128 wide, one lane an
+  //                    output, and 7.49 becomes 3.69. A sweep of either axis on
+  //                    its own says the knob does not pay.
+  //
+  //                    Which leaves one number unexplained: the split ALONE is
+  //                    7.5 ms of 104.3 here and was read as 0.3 there. Recorded
+  //                    as a disagreement rather than resolved - the metric
+  //                    above is named exactly so the next person can repeat it.
   //
   //   singleProject...Lanes  THE REWRITE, AND IT MOSTLY DID NOT PAY. The three
   //                    single-attention shaders hardcoded workgroup_size(64)
@@ -716,6 +735,43 @@ const PRIORS = new Map([
     keepTrunkWeights: true,
     keepSamplerWeights: true,
     transitionThreadTarget: 100000,
+    // 🔴 THE SINGLE PROJECTION WAS RUNNING AN M2's CONSTANT, AND IT IS 4x.
+    // singleProjectSplits' own comment says "110 is an M2's number, and the
+    // shape of the rule is not... an A100 wants about 1200", gives a
+    // standalone bench table showing 1.46x-2.50x, and leaves both as
+    // parameters for a device to set. No device ever set them. Measured in the
+    // TRUNK, which is where the answer counts, at 2 passes and msa 128, two
+    // rounds agreeing to 0.1 ms:
+    //
+    //     n     single.project        trunk GPU total
+    //     68    15.00 -> 3.70  4.05x  104.3 -> 93.0   -10.8%
+    //     150   15.78 -> 3.98  3.97x  196.1 -> 184.3   -6.0%
+    //     300   15.50 -> 4.98  3.11x  608.4 -> 598.6   -1.6%
+    //     512   11.47 -> 5.16  2.22x  1374  -> 1367    -0.5%
+    //
+    // The win is largest at the SHORT chains a page actually folds, because
+    // the starvation is: `project` runs one workgroup a token and a split, so
+    // 68 tokens is 136 workgroups on a card that holds 4542.
+    //
+    // 🔴 AND THE TWO KNOBS ONLY WORK TOGETHER. The target alone is 7.87 ms at
+    // n=300 and the lanes alone are 16.24 - WORSE than the 15.50 default -
+    // because 128 lanes over the unsplit 384-wide output leaves each lane
+    // three outputs deep and adds nothing. Split three ways the output is 128
+    // wide, one lane an output, and the two compose: 4.98. A sweep of either
+    // on its own says the knob does not pay.
+    //
+    // 🔴 AND IT IS A REORDERING, NOT A REPACKING. Three workgroups normalise
+    // the same row where one did, and 128 lanes reduce it in a different tree,
+    // so `check-af3-block-any` moves its single residual 2.0899e-4 -> 2.0899e-4
+    // in the eighth figure and the pair not at all. On a fold: max |dx| 0.001 A
+    // with 531 of 574 atoms identical - the same class as `attnSplits` 1 -> 4,
+    // which this prior already ships at 541 of 574.
+    //
+    // 🔴 ampere ONLY. The table in singleProjectSplits shows 6 splits LOSING on
+    // an M2 at every n it was measured at, which is the whole reason these were
+    // left as parameters. DEFAULTS_ARE_MEASUREMENTS.
+    singleProjectWorkgroupTarget: 2048,
+    singleProjectLanes: 128,
     // ...and the outer product mean's contraction, which is the biggest kernel
     // in an AF2 block and the deepest K in the model. See opmMatrixContract.
     opmMatrixContract: true,

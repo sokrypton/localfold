@@ -446,7 +446,7 @@ export class Af3PairformerStackGpu {
     // 🔴 EVERY NON-SHADER FIELD HAS TO COME OUT OF THIS REST, because the loop
     // below compiles whatever is left. Adding `projectLanes` to the factory's
     // return handed CreateShaderModule the number 64 as a shader.
-    const { projectSplits, projectLanes: _lanes, projectOutLanes: _outLanes,
+    const { projectSplits, projectLanes: resolvedLanes, projectOutLanes: _outLanes,
       ...singleSources } = createSingleAttentionShaders(
       { n, channels: singleChannels, heads, dimension: singleDimension,
         weightPrecision,
@@ -467,8 +467,15 @@ export class Af3PairformerStackGpu {
       // run. Named the RESOLVED value and not the knobs, because that is what
       // the shader contains - the same reason block.js keys on
       // `shaders.projectTile` rather than on the tuning that chose it.
+      // 🔴 AND THE LANE WIDTH IS THE RESOLVED ONE, FOR THE SAME REASON. It is a
+      // request now, halved until it divides `perSplit` - see the note in
+      // createSingleAttentionShaders - so a prior asking for 128 gets 128 at
+      // one token count and 64 at another, and naming the REQUEST would put
+      // two different kernels under one name. `base` carries `n` so nothing
+      // could reach it today, which is exactly how the split count survived
+      // until an audit ran the arm.
       into(`single:${name}`, `${base}:single:${weightPrecision}`
-        + `:${singleTuning.singleProjectLanes ?? 64}`
+        + `:${resolvedLanes}`
         + `:${singleTuning.singleProjectOutLanes ?? 64}:s${projectSplits}:${name}`, source);
     }
     into("pairLogits", `${base}:pair-logits`,
