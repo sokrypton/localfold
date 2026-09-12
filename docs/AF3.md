@@ -90,6 +90,38 @@ stack pair **2.97e-6** where it read 3.93e-3, and all four heads pass: pLDDT
 201x, PAE **7.0x**, PDE **7.3x**, resolved 62.9x. The trunk keeps its matrix
 kernels and its speed.
 
+🔴 **AND THE TRUNK KEEPS THEM, BECAUSE THE APPROXIMATION IS THE POINT.** The
+four are worth **14% of a trunk pass** (911/946 ms against 1046/1044) and 27% of
+the pairformer (452/458 against 579/582), and running some of this port in f16
+to go faster is a deliberate trade. What was wrong was not the kernels but the
+BOUND, which priced only the three precision axes and so reported an accepted
+trade as a defect on every run. `check-af3-trunk` takes `--matrix=off` now and
+its pair bound follows the KERNEL, which is what check-evoformer-attention.js
+already does for the same reason:
+
+| arm | pair | contact | logits |
+|---|---:|---:|---:|
+| shipped: f16 axes + matrix | 1.12e-4 | 5.09e-3 | 7.21e-5 |
+| `--matrix=off` | 1.85e-5 | 3.76e-4 | 1.18e-5 |
+| `--matrix=off` + f32 axes | **6.66e-7** | 1.10e-4 | 4.90e-7 |
+
+🔴 **AND THE LAST ROW IS THE ONE THAT MATTERS, BECAUSE IT COULD NOT BE REACHED
+BEFORE.** Asking for `--staged=f32 --weights=f32 --accumulate=f32` used to
+return **1.12e-4, the same number as the f16 default** - the request reached
+none of the four kernels, so the f32 path was not being checked at all and had
+not been for as long as the prior has set them. It reaches 6.66e-7, 5.1x the
+rounding envelope, which is the evidence that the port's arithmetic is right and
+the 1.12e-4 is approximation rather than error. Without an arm that genuinely
+gets f32 there is no way to tell those two apart.
+
+🔴 **AND THE TRUNK HAS THREE PAIR TRACKS, WHICH IS WHY THE FIRST PIN DID
+NOTHING.** `pairMatrixKernels` wired into `pairformer-block-webgpu.js` alone
+moved an f32 request from 1.12e-4 to 1.11e-4: the MSA stack and the template
+embedder compile their own `compilePairTrack` and kept theirs. All three take
+the option now, and both of the other two had to learn to read it from the
+CONSTRUCTOR, because `Af3TrunkGpu` pins there while passing its run-time options
+to only two of the three `run`s.
+
 🔴 **BUT THE TRUNK'S OWN 5334x IS NOW AN OPEN QUESTION AND NOT A CLOSED ONE.**
 Nothing here says 2.03e-2 a block is acceptable over 48 of them; it says the
 confidence head could not afford it. `check-af3-trunk` holds 4e-5 and cannot

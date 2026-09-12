@@ -270,6 +270,11 @@ export class Af3TemplateEmbedderGpu {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    // 🔴 KEPT, BECAUSE THE TRUNK PINS THROUGH THE CONSTRUCTOR. Af3TrunkGpu
+    // hands `this.options` to all three stacks' constructors and its run-time
+    // options to two of their `run`s, so a stack reading only `run`'s could not
+    // see `pairMatrixKernels` set the way the pairformer sees it.
+    this.options = options;
     // The same default and the same escape the pairformer takes.
     this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
@@ -327,7 +332,11 @@ export class Af3TemplateEmbedderGpu {
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
       // ...the same pair track, so the same kernel choice. Four of an AF3
       // trunk's 108 `grid.project` passes are this stack's.
-      gridProjectMatrix: gridProjectMatrixConfig(this.device),
+      // 🔴 THE MATRIX PAIR KERNEL IS A PRECISION AXIS; see the note in
+      // pairformer-block-webgpu.js. This stack has only the one of the four.
+      gridProjectMatrix:
+        (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false
+        && gridProjectMatrixConfig(this.device),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
     });
     const gridProjectMatrix = trackPipelines.gridProjectMatrix === undefined ? undefined

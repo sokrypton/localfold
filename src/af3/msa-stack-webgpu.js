@@ -44,6 +44,11 @@ export class Af3MsaStackGpu {
     this.device = device;
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
+    // 🔴 KEPT, BECAUSE THE TRUNK PINS THROUGH THE CONSTRUCTOR. Af3TrunkGpu
+    // hands `this.options` to all three stacks' constructors and its run-time
+    // options to two of their `run`s, so a stack reading only `run`'s could not
+    // see `pairMatrixKernels` set the way the pairformer sees it.
+    this.options = options;
     // The same default and the same escape the pairformer takes.
     this.residentWeights = (options.residentWeights ?? true) && residencyAllowed(device);
   }
@@ -110,10 +115,17 @@ export class Af3MsaStackGpu {
 
     const base = `af3-msa:${n}:${sequences}:${msaChannels}:${pairChannels}:${epsilon}:${variance}`
       + `:${dialect.swapTransposedBias}`;
+    // 🔴 THE MATRIX PAIR KERNELS ARE A PRECISION AXIS - see the note in
+    // pairformer-block-webgpu.js. The trunk has THREE pair tracks and a pin
+    // wired into one of them moves almost nothing: asking check-af3-trunk for
+    // f32 with only the pairformer pinned read 1.11e-4 against the f16 path's
+    // 1.12e-4, because this stack and the template embedder kept theirs.
+    const pairMatrixKernels =
+      (options.pairMatrixKernels ?? this.options?.pairMatrixKernels) !== false;
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
-      attendMatrix: resolveGridAttendMatrix(
+      attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, sample.pairAttention1.dimension, deviceTuning(this.device)),
       scratchStorage: UNPACKED_PAIR_SCRATCH,
       // 🔴 THE TRACK'S WIDTH IS THIS STACK'S, NOT compilePairTrack's DEFAULT.
@@ -126,12 +138,13 @@ export class Af3MsaStackGpu {
       // 8 MSA and 4 template - so a knob wired only into the pairformer leaves
       // an eighth of that kernel on the vector path for no reason. It costs no
       // memory and reads the layout this pack already writes.
-      gridProjectMatrix: gridProjectMatrixConfig(this.device),
+      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device),
       // 🔴 AND THE SPLIT TRANSITION, WHICH THIS STACK ALSO NEVER HAD. Four of
       // an AF3 trunk's `pair-transition` passes are this stack's, and at
       // OpenDDE's 384 channels the fused kernel loses to the split by 3.71x -
       // the whole reason the pairformer takes it. Same width rule, same knob.
-      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels),
+      pairTransitionSplit: pairMatrixKernels
+        && splitTransitionConfig(this.device, pairChannels),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
