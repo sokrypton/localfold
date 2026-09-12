@@ -385,7 +385,14 @@ export class Af3PairformerStackGpu {
     // It is still offered, because "this device cannot hold the model" is a
     // real state that --budget already exists for, and 38 MiB is 38 MiB when
     // the alternative is not folding.
-    const pairWeightPrecision = this.options?.pairWeightPrecision ?? "f32";
+    // 🔴 AND IT IS CLAMPED BY THE DEVICE, because the only caller that sets it
+    // reads the BUNDLE - `opendde-confidence.js` passes `weights.weightPrecision`
+    // - and a bundle's storage is not a statement about the GPU. It is missing
+    // from the throw below, so an f16 asked for here reached `enable f16` in the
+    // triangle's normalizeInput and **OpenDDE did not fold at all** on a stock
+    // Chrome, which has no `shader-f16` on any NVIDIA GPU.
+    const pairWeightPrecision =
+      (this.options?.pairWeightPrecision ?? "f32") === "f16" && hasF16 ? "f16" : "f32";
     // The triangle projection's accumulators; see the note in pair-track-gpu.js.
     const accumulatePrecision = this.options?.accumulatePrecision ?? (hasF16 ? "f16" : "f32");
     if ((weightPrecision === "f16" || stagedPrecision === "f16") && !hasF16) {

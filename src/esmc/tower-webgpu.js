@@ -29,6 +29,7 @@ import {
   noteResidencyRefused, residencyAllowed,
 } from "../runtime/device-memory.js";
 import { float32ToFloat16Array } from "../runtime/float16.js";
+import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
 import {
@@ -223,7 +224,15 @@ export class EsmcTowerGpu {
     // back byte-identical - which looked like f16 costing nothing and was two
     // code paths having drifted. Same hazard as a checker that builds its own
     // kernel: what is measured has to be what runs.
-    const weightPrecision = options.weightPrecision ?? "f16";
+    // 🔴 AND THE DEFAULT IS A CAPABILITY, NOT A PREFERENCE. It was a bare
+    // "f16", and a stock Chrome has no `shader-f16` on ANY NVIDIA GPU - Dawn
+    // gates it vendor-wide, see docs/A100.md - so `esmc-linear` emitted
+    // `enable f16` onto a device that refuses the extension and **ESMFold2 did
+    // not fold at all for those visitors**. It failed as a WGSL parse error
+    // with no key attached, which is why it went unseen: the harness passes
+    // the flag that hides it.
+    const weightPrecision = options.weightPrecision
+      ?? (halfPrecisionAvailable(this.device) ? "f16" : "f32");
     // 🔴 AN ALREADY-NARROW ARRAY PASSES THROUGH, WHICH IS HOW A CALLER SKIPS A
     // WHOLE PASS OVER THE WEIGHTS. Decoding int3 to float32 and narrowing
     // afterwards reads and writes 573 M elements twice; a caller that asks its

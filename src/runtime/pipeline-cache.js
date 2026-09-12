@@ -80,6 +80,18 @@ export class ComputePipelineCache {
       return shared;
     }
     pipelineCacheStats.misses += 1;
+    // 🔴 A SHADER THAT ASKS FOR f16 ON A DEVICE WITHOUT IT FAILS AS A WGSL PARSE
+    // ERROR WITH NO KEY, WHICH IS HOURS. Dawn reports "extension 'f16' is not
+    // allowed in the current environment" against an uncaptured device error,
+    // and nothing in it says which of the twelve shader factories emitted the
+    // `enable f16`. It is a real shipped state and not a hypothetical: a stock
+    // Chrome has no `shader-f16` on ANY NVIDIA GPU (see docs/A100.md), and two
+    // of the four models were reaching here with it. Name the key instead.
+    if (code.startsWith("enable f16;") && !this.device.features.has("shader-f16")) {
+      throw new Error(`${key} enables f16 on a device without shader-f16. `
+        + "The caller must gate its precision on the feature - "
+        + "halfPrecisionAvailable(device) in src/runtime/device-profile.js.");
+    }
     const pipeline = this.device.createComputePipelineAsync({
         label: key,
         layout: "auto",

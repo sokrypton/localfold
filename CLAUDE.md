@@ -10,6 +10,16 @@ gate cannot see an error inside one of them.
 
 ## Running anything that needs a GPU
 
+🔴 **AND `LOCALFOLD_STOCK_FLAGS=1` IS A GATE, NOT A CURIOSITY: TWO OF THE FOUR
+MODELS DID NOT FOLD WITHOUT THE FLAGS.** OpenDDE and ESMFold2 both died on
+`extension 'f16' is not allowed in the current environment` - a precision chosen
+from the CHECKPOINT and from the BUNDLE rather than from the device - so they
+were broken for every visitor on an NVIDIA GPU, and no gate could see it because
+every harness here passes the flag that hides it. Fixed; all four fold both
+ways. `ComputePipelineCache` now throws with the shader KEY when a source
+enables f16 on a device without it, because Dawn's own error names nothing. See
+docs/A100.md.
+
 🔴 **AND A KNOB'S WORTH IS A PROPERTY OF THE CONFIGURATION.** Swept under
 `LOCALFOLD_STOCK_FLAGS=1`, `linearTallTile` is **1.31x** (379.58 ms against
 497.03 on a block) where docs/A100.md's `--no-prior` split prices it at ZERO,
