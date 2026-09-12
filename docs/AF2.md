@@ -857,6 +857,10 @@ word in WGSL.
 
 ## Where AF2 stands now
 
+🔴 **BOTH PORTS RE-MEASURED AT `94d3902`, INTERLEAVED IN ONE BROWSER - see "Both
+ports, re-measured" at the end of this file. 15.74 -> 11.02 s here and
+14.21 -> 13.15 there. The table below is the older measurement.**
+
 One trunk pass, 825 residues, 512 clusters / 1024 extra, 0 recycles, same A100:
 
 | | one pass | vs JAX | vs the other port |
@@ -2130,3 +2134,73 @@ block, 42.5%, the largest kernel in the whole fold**. A workgroup owns a row
 now. Their fold and that fix attack the same kernel from different sides, and
 having done the larger one leaves 3 ms where they had hundreds. Two ports, the
 same hot spot, two different roads out of it.
+
+## Both ports, re-measured: 11.02 s against 13.15
+
+The three-way table above had not been re-run in a long campaign, and
+`martin-steinegger/alphafold2-webgpu` had landed a run of performance commits
+the day this was taken - its HEAD is `a7e02ed`, dated 2026-09-11. So both sides
+were re-measured, **in one page, in one Chrome, interleaved pass by pass**,
+which is the only arrangement this box's 3.2x drift allows.
+
+825 residues, 512 clusters / 1024 extra, one trunk pass, features included,
+weights already loaded. Warm is the minimum of two repeats after a cold one:
+
+| | cold | warm | recorded before |
+|---|---:|---:|---:|
+| alphafold2-webgpu at `a7e02ed` | 14.60 s | **13.15** | 14.21 |
+| **LocalFold at `94d3902`** | 11.72 | **11.02** | 15.74 |
+
+**1.19x**, where this file last recorded 10.5x the other way. Both fold the same
+structure: pLDDT 26.448 theirs and 26.317 ours, which is the low-confidence
+read of a 14x tandem repeat both ports agree on. Against the JAX baseline **as
+recorded earlier on this card** (5.27 s, not re-run), ours is 2.09x native.
+
+LocalFold on its own harness at the same shape reads **11.23 s** warm against
+11.02 here, so the harness is not the difference - which had to be shown rather
+than assumed, and see below for why.
+
+By shape, `fold-af2.js --recycles=0 --repeat=3`:
+
+| | cold | warm | recorded before |
+|---|---:|---:|---:|
+| 59 residues, 128/256 | 0.764 s | **0.196** | - |
+| 400 residues, 512/1024 | 4.055 | **3.500** | 5.129 |
+| 825 residues, 512/1024 | 11.892 | **11.230** | 15.74 |
+
+The cold-warm delta stays flat in the shape - 0.568, 0.555 and 0.662 s over a
+14x range of length - where theirs was 0.920 to 4.100 and grew with it.
+
+### How to run theirs, and the three traps that make the number wrong
+
+Their `tools/benchmark-a3m-model.ts` cannot run from a clone: it opens
+`test/fixtures/evoformer/model1-a3m-59-stack/manifest.json`, which their own
+`.gitignore` excludes as a "local development asset", and it imports the
+`webgpu` node binding, which is this box's GLIBC 2.38 wall. What works is their
+BROWSER harness - playwright against their vite dev server, with a spec that
+imports their monomer through vite's `/@fs/` route and folds against their
+published q8 bundle at `martin-steinegger.github.io`. Their `predict-a3m.ts`
+already reads `AFWEBGPU_MANIFEST` for exactly that bundle.
+
+🔴 **THREE THINGS EACH COST A FACTOR AND EACH LOOKS LIKE A RESULT.** Every one
+was caught by checking the machine rather than the output:
+
+| | | |
+|---|---|---|
+| **their playwright config is `headless: true`** | headless Chrome cannot bring up Vulkan here - it wants `VK_EXT_headless_surface`, which the NVIDIA driver lacks - so it silently takes the software adapter | Chrome's GPU process at **1179% CPU with the card at 0%**. `--headed` under `DISPLAY=:99`. This is the same discovery `gpu-chrome.mjs` is built around |
+| **no `--enable-dawn-features=vulkan_enable_f16_on_nvidia`** | Dawn refuses `shader-f16` on every NVIDIA GPU without it, so **BOTH ports lose their f16 path** and the comparison measures neither | theirs 23.20 -> **13.15**; ours 25.03 -> 23.61 with the third trap still in place |
+| **a hand-rolled `requiredLimits` for our arm** | our kernels pick their shape from `device.limits`, so a device asked for differently is a differently-configured port | ours 23.61 -> **11.02**. `requestAlphaFoldDevice(adapter)` is what `gpu-chrome.mjs` and the page both call; use it |
+
+Their side needs one thing of its own: their native harness fits a scratch
+budget to host memory, which a browser cannot ask for and which their README
+prices at a third of the speed on a long chain. Passing this card's 36 GiB to
+their own `fitScratchBudgetScale` picks scale 16 and takes them from 33.95 s to
+22.11 without f16 - so the arm above is their FAST path, not a browser
+handicap.
+
+🔴 **AND THE ORDER OF THOSE THREE IS THE LESSON.** Each one produced a plausible
+number: 33.95, 23.20, 23.61. Any of them could have been written down as "the
+other port is 3x slower" or "ours is 2x slower", and all three were wrong for
+reasons nothing in the output said. The card's own utilisation - `nvidia-smi`
+next to the run - is what caught the first, and the first is what made the other
+two visible.
