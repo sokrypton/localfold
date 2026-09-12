@@ -1384,16 +1384,18 @@ function openBlankFold(stem, keep = []) {
         renderer.addFrame(frame, stem);
       } catch { break; }
     }
-    // 🔴 AND THIS OBJECT ALONE IS SHOWN. `shownObjects` is a SET of names once
-    // anything has toggled object visibility, and addObject ADDS to it - so
-    // every previous fold stayed in the set and kept drawing alongside the new
-    // one. Two structures in one viewer, coloured by two different folds'
-    // confidence, is what "the old run bleeding into this one" looks like.
-    // Null is py2Dmol's resting state, where only the current object draws;
-    // narrowing the set to this name is the same thing said explicitly.
-    if (renderer.shownObjects instanceof Set) {
-      renderer.shownObjects = new Set([stem]);
-    }
+    // 🔴 AND NOTHING HERE TOUCHES THE SHOWN SET. It used to be narrowed to
+    // `new Set([stem])`, because every previous fold stayed in it and kept
+    // drawing alongside the new one - which was a symptom of py2Dmol's
+    // `clearAllObjects` leaving an EMPTY SET where the resting state is null,
+    // and an empty set is Multi with everything switched off, so `addObject`
+    // joined each later fold to it. Fixed upstream; see the shown-set entry in
+    // ../py2Dmol/CLAUDE.md.
+    //
+    // Narrowing it was also wrong where it did reach: a reader who presses
+    // Multi has asked to see several, and a new fold joining them is the rule
+    // rather than the bug. It wrote the field directly, past
+    // `setShownObjects`, which is what keeps `_framedObjects` in step.
     // 🔴 SWITCHING TO THE OBJECT ALREADY ON SCREEN RESETS THE CAMERA, so a
     // rewind must not ask for it. _switchToObject restores the target's saved
     // viewerState, and that is only ever SAVED when switching away from an
