@@ -7,6 +7,71 @@ inventory: what LocalFold's own differential suite covers, what it cannot
 currently execute, and what the reference now offers that this repository does
 not.
 
+## 2026-09-12: NINETEEN OF TWENTY-ONE NOW RUN, AND FOUR OF THEM FOUND THINGS
+
+The section below is kept as written, because the shape of that failure is the
+point. What follows is what it took to make the suite able to fail.
+
+| | then | now |
+|---|---:|---:|
+| comparing anything at all | 2 | **19** |
+| passing | 2 | 18 |
+| genuinely failing | 0 (invisible) | 1 |
+| blocked, comparing nothing | 19 | 0 |
+
+**Three causes, and only one of them was a missing input.**
+
+1. **A bundle nobody had.** Eleven wanted `/model-af3-full-f32/`, which is not
+   published - and the AF3 weights were on the box the whole time. The exporter
+   would not run because ColabDesign2 had RENAMED `af3.alphafold3` to
+   `af3.alphafold`, which reads as a missing dependency and was a moved one.
+
+2. **Hand-built dialects.** Six raised instead of comparing because a checker
+   typed a partial dialect - `check-af3-trunk` had one flag of thirteen, the
+   embedder and the four atom checkers had none. The stacks refuse to default
+   these, correctly: AF3 takes the outer product off the pre-update MSA where
+   OpenDDE takes it off the updated one, and guessing runs a different model.
+   All of them read the dialect from the bundle now, and take `--model=`, so
+   they check the model in front of them rather than asserting AF3's over it.
+
+3. **A dump nothing produced.** Four wanted `af3-oracle-atom-f32.json`, and the
+   only producer needed ColabDesign2's runner, installed on neither machine.
+   `tools/oracle/dump_af3_atom.py` builds it from af3-any-model in 39 KB, with
+   no forward pass, no weights and no GPU - the four checkers consume nine
+   FEATURISATION arrays, not activations. See its header for why the layout
+   cannot be synthesised.
+
+🔴 **AND THE SUITE IMMEDIATELY FOUND A CLASS OF BUG NOTHING ELSE COULD: A BOUND
+WRITTEN FOR ONE ARITHMETIC WHILE THE DEVICE RAN ANOTHER.** Four matrix kernels -
+`triangleProjectMatrix`, `gridProjectMatrix`, `gridAttendMatrix` and
+`pairTransitionSplit` - issue on f16 matrix units, and no precision option
+reaches them. Three separate checkers were affected:
+
+- **`check-af3-confidence`**, all four heads failing at 522-3718x their
+  envelope. The head pinned `stagedPrecision`, `weightPrecision` and
+  `accumulatePrecision` to f32 because pLDDT and PAE are what the page shows,
+  and the matrix kernels are a FOURTH axis it did not pin. Fixed; all four pass.
+- **`check-af3-trunk`**, 1.12e-4 against 4e-5. Here the kernels stay - they are
+  worth 14% of a trunk pass and running f16 for speed is deliberate - and the
+  BOUND follows the kernel instead.
+- **`check-af3-template`**, where a 2.25e-5 miss on the FIRST of five arms threw
+  and the other four never ran, the two cross-chain ones included. Those are the
+  point of that file: a permissive template mask once scored relRMS 1.09 against
+  AF3. All five run and pass both ways now.
+
+**The one real failure left** is `check-af3-msa-block`'s vector arm at 1.18e-5,
+35.8x an envelope this file had to be given. It is fully f32, no knob moves it,
+`--no-prior` does not move it, the outer product mean alone reads 5.88e-7 at
+that shape and the MSA track reads 4.65e-6 - so it is the pair composition. It
+saturates with MSA depth (2.30e-6 / 1.18e-5 / 1.11e-5 at 4 / 16 / 64) and has
+drifted 1.65x from the 7.16e-6 docs/PERF.md records. Left failing on purpose.
+
+**Method worth keeping, from the reference's own week:** their 14 regressed
+cells were each recorded OK by their own gate, because each scales by
+`rms(native)`. What caught it was diffing the audit CLASSIFICATIONS between
+runs. Every argument for `gate_applies.py` below is now also an argument from
+our own experience.
+
 ## 🔴 NINETEEN OF TWENTY-ONE AF3 CHECKERS DO NOT RUN ON THIS BOX
 
 Run at `a8a6e70`, each through `tools/gpu-chrome.mjs`, with no arguments:
