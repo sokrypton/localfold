@@ -174,6 +174,20 @@ export async function main(device, args) {
     cpu = msaBlock({ ...cpu, pairMask, msaMask, sequences, tokens: n }, weights, dialect);
   }
 
+  // 🔴 AND ITS CONDITIONING ENVELOPE, WHICH THIS CHECKER ALONE HAD NO WAY TO
+  // REPORT. Every other stack checker here perturbs its input by one kernel's
+  // worth of rounding (1e-7) and runs the CPU reference against ITSELF, because
+  // a fixed bound cannot say whether a number it rejects is a fault or the
+  // arithmetic's own resolution. This one held a bare 1e-5 and so said only
+  // "1.18e-5 is bigger than 1e-5", which is not a finding either way.
+  const nudged = Float32Array.from(state.pair);
+  for (let i = 0; i < nudged.length; i += 1) nudged[i] += state.pair[i] * 1e-7;
+  let control = { pair: nudged, msa: state.msa };
+  for (const weights of blocks) {
+    control = msaBlock({ ...control, pairMask, msaMask, sequences, tokens: n }, weights, dialect);
+  }
+  const envelope = relativeRms(control.pair, cpu.pair);
+
   // 🔴 TWO ARMS, BECAUSE THIS STACK HAS TWO ARITHMETICS AND ONE BOUND WOULD
   // STOP CHECKING THE TIGHTER ONE. Three device-profile knobs move the pair
   // track's kernels onto the SUBGROUP MATRIX UNITS, which multiply in f16
@@ -216,6 +230,25 @@ export async function main(device, args) {
   // ...and each bound follows the BUNDLE as well as the arm, for the reason
   // check-af3-template.js records: an int5 bundle's residue against a float32
   // reference is not a float32 bundle's.
+  // 🔴 THE VECTOR ARM IS OVER ITS BOUND AND THE BOUND IS NOT BEING RAISED.
+  // 1.18e-5 against 1e-5, and everything that would excuse it has been ruled
+  // out with a number: it is fully f32 (compilePairTrack defaults staged and
+  // accumulate to f32 and this stack never overrides them), `--f16=off` does
+  // not move it, and NO device knob does either - not the four matrix ones this
+  // checker already nulls, not the eight `opm*` ones, not `--no-prior`. The
+  // outer product mean alone reads 5.88e-7 at this very shape and the MSA track
+  // reads 4.65e-6, so it is the pair COMPOSITION, the same shape of finding as
+  // the pairformer's in docs/AF3.md: every kernel clean, the block not.
+  //
+  //   sequences=4    pair 2.30e-6    12.1x envelope   ok
+  //   sequences=16   pair 1.18e-5    35.8x            over
+  //   sequences=64   pair 1.11e-5    12.4x            over
+  //
+  // It saturates with MSA depth while the envelope keeps growing, which is what
+  // a fixed-size effect in a sum over sequences looks like. docs/PERF.md
+  // records 7.16e-6 here, so it has also drifted 1.65x since, unexplained.
+  // Left FAILING on purpose: widening a bound is how a real residue becomes
+  // folklore, and this one is on the arm where nothing is approximating.
   const int5 = model !== MANIFEST;
   const bounds = {
     false: Number(option(args, "bound", int5 ? "1e-4" : "1e-5")),
@@ -230,6 +263,7 @@ export async function main(device, args) {
       + `\tpair ${arm.pairRms.toExponential(2)}`
       + `\tmsa ${arm.msaRms.toExponential(2)}`
       + `\tbound ${arm.bound}\t${arm.ok ? "ok" : "FAILED"}`
+      + `\t${(arm.pairRms / Math.max(envelope, 1e-30)).toFixed(1)}x envelope`
       + `\t${arm.milliseconds} ms\t${arm.peakMiB} MiB`);
   }
   if (failed > 0) {
@@ -237,5 +271,5 @@ export async function main(device, args) {
       + arms.filter((a) => !a.ok).map((a) => `${a.matrix ? "matrix" : "vector"} `
         + `${Math.max(a.pairRms, a.msaRms).toExponential(2)}`).join(", "));
   }
-  return { n, sequences, blocks: count, model, arms };
+  return { n, sequences, blocks: count, model, envelope, arms };
 }
