@@ -1986,6 +1986,24 @@ residues**: the thirteenth member of the tie refuses at the same length. The
 whole group has to move together, and the destination is 2,896 whatever route is
 taken, because that is the allocation wall.
 
+🔴 **AND 2,047 IS THIS CARD'S NUMBER, NOT THE PORT'S.** Measured on both boxes
+with `probe-limits.js`:
+
+| | M2 | A100 |
+|---|---:|---:|
+| `maxStorageBufferBindingSize` | **4 GiB** | 2 GiB |
+| `maxBufferSize` | 4 GiB | 4 GiB |
+| where an f32 pair stops BINDING | **2,896** | 2,047 |
+| where an f32 pair stops ALLOCATING | 2,896 | 2,896 |
+
+The ceiling is `sqrt(maxStorageBufferBindingSize / (cZ * 4))`, and the A100's
+binding limit is Vulkan's `maxStorageBufferRange` at exactly half the M2's -
+hence exactly `sqrt(2)` between the two lengths. **So on Apple silicon the two
+walls coincide and there is nothing to window at all:** the 28-label tie sits on
+the allocation wall, which no windowing passes. The twenty-eight windowings
+would buy a length only on the card where the binding limit is the smaller of
+the two, and even there only up to where the other one stops it.
+
 🔴 **AND THE CHEAP ROUTE TO 2,896 IS THE ELEMENT, NOT THE WINDOW.** A packed f16
 pair is two bytes a channel, so its bindings cross 2 GiB at 2,896 - exactly the
 allocation wall - and it needs no windowing anywhere. That is why upstream's
