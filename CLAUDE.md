@@ -324,6 +324,52 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
+### 🔴 ROUND FOUR, ANSWERED FROM THE M2: NO VISITOR HAS THE MATRIX UNITS
+
+**The flags question first, because it is the one that changes something.**
+Measured with `LOCALFOLD_STOCK_FLAGS=1`, which on macOS drops exactly one flag -
+`--enable-unsafe-webgpu`, since `PLATFORM_FLAGS` is empty off Linux:
+
+| on an M2, stock Chrome | |
+|---|---|
+| `shader-f16` | **yes** - the README's claim, now measured rather than inferred |
+| `chromium-experimental-subgroup-matrix` | **NO** |
+| `subgroups` | yes |
+| kernel chosen | `attention:flash-registers-32-chunk16`, flags or not |
+
+🔴 **SO THE MATRIX UNITS NEED `--enable-unsafe-webgpu` ON BOTH PLATFORMS, AND
+NOBODY VISITING THE PAGE HAS THEM.** That is the consequence round four asked
+for and it is the larger one: every matrix-unit knob this repository has measured
+- `attentionMatrix`, `matrixLinear`, `opmMatrixContract`, `triangleProjectMatrix`,
+`gridAttendMatrix`, the staged matrix GEMM family - is a DEVELOPER-FLAG path. The
+A100's 218 ms prior split, of which "every significant one is does this device
+have matrix units", is a number no visitor can reach. It does not make any of it
+wrong; it makes it a measurement of a configuration the site does not ship, and
+the honest place for those numbers is beside a note saying so.
+
+It costs an Apple part nothing either way: 8x8x8 units are refused by a kernel
+declaring `<f16, 16, 16>`, so the register kernel is chosen with the flag and
+without it.
+
+**And the rest of round four is inert here, confirmed.** All four new knobs are
+`null` in `DEFAULT_TUNING` and set in the ampere prior only, and the call sites
+take the constant through `?? undefined` and `?? CONSTANT`. Measured on this tip
+against this box's own previous values - never against the A100's:
+
+| | before | round four |
+|---|---|---|
+| `fold-af2.js` | -1282976 | **-1282976** |
+| peak device bytes | 405,716,280 | **405,716,280** |
+| AF3 | 85.83089054918456 | **85.83089054918456** |
+| OpenDDE | 92.05056924853176 | **92.05056924853176** |
+
+`npm test` 1014/0.
+
+**Not run here: the `opmBlockI` crossover.** It wants a trunk profile at 400
+tokens, and the question - whether this part's memory system turns over where
+that card's does - deserves its own round rather than a number taken beside five
+other folds on a machine that drifts 3.2x.
+
 ### 🔴 ROUND FOUR: WHAT WANTS AN M2 NOW
 
 Thirteen commits since round three, three of them touching `src/`. All three are
