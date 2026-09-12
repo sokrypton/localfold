@@ -2518,8 +2518,10 @@ export class Af3DiffusionTransformerGpu {
       // PAIR_LOGITS_CACHE_BYTES worth of them buys that fraction of the time
       // for a bounded amount of memory: every block at 208 tokens or fewer,
       // a quarter of them at 400.
+      const cacheBytes = Number(deviceTuning(this.device).pairLogitsCacheBytes
+        ?? PAIR_LOGITS_CACHE_BYTES);
       const cached = Math.max(0,
-        Math.min(blockCount, Math.floor(PAIR_LOGITS_CACHE_BYTES / logitsBytes)));
+        Math.min(blockCount, Math.floor(cacheBytes / logitsBytes)));
       const buildPairLogits = buildPairNorm
         || this.#pairLogits?.ready !== true
         || this.#pairLogits.bytes !== logitsBytes

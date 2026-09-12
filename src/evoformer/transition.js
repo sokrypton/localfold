@@ -337,13 +337,17 @@ export function transitionChunkRows(
   maxStorageBufferBindingSize,
   minStorageBufferOffsetAlignment = 256,
   tileRows = TRANSITION_TILE_ROWS,
+  // 🔴 A KNOB, BECAUSE THE KNEE BELOW WAS MEASURED AT 59 RESIDUES. It is a
+  // memory trade there and a dispatch-count trade at 825, and those are not the
+  // same question - see `transitionChunkBytes` in device-profile.js.
+  targetBytes = TRANSITION_CHUNK_TARGET_BYTES,
 ) {
   if (![rows, channels, hiddenChannels, maxStorageBufferBindingSize, minStorageBufferOffsetAlignment]
     .every((value) => Number.isSafeInteger(value) && value > 0)) {
     throw new RangeError("transition chunk dimensions and limits must be positive safe integers");
   }
   const rowBytes = Math.max(channels, hiddenChannels) * Float32Array.BYTES_PER_ELEMENT;
-  const ceiling = Math.min(maxStorageBufferBindingSize, TRANSITION_CHUNK_TARGET_BYTES);
+  const ceiling = Math.min(maxStorageBufferBindingSize, targetBytes);
   if (rows * rowBytes <= ceiling) return rows;
   const capacity = Math.floor(ceiling / rowBytes);
   if (capacity < 1) throw new RangeError("WebGPU storage binding is too small for one transition row");

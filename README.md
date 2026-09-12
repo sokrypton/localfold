@@ -54,6 +54,37 @@ seconds on an M2, and a few hundred residues takes minutes.
 
 Nothing is installed.
 
+### On Linux with an NVIDIA GPU, two Chrome flags are worth about 2x
+
+Chrome does not give a page WebGPU's `shader-f16` on **any** NVIDIA GPU unless
+asked: Dawn gates it vendor-wide pending a conformance investigation
+([crbug.com/42251215](https://crbug.com/42251215)). The subgroup matrix units
+this port uses are experimental and behind a second flag. Measured here on an
+A100 with Chrome 152, the same 825-residue fold takes **21.0 s** with a stock
+browser and **10.8 s** with both flags — and folds correctly either way.
+
+Chrome on this machine also needed to be pointed at Vulkan before it would
+offer a WebGPU adapter at all, which is common on headless and server installs
+and unnecessary on many desktops. The whole set, in a **separate profile** so
+your everyday browser keeps its defaults:
+
+```bash
+google-chrome \
+  --user-data-dir=/tmp/localfold-chrome \
+  --enable-unsafe-webgpu \
+  --enable-dawn-features=vulkan_enable_f16_on_nvidia \
+  --use-angle=vulkan --use-vulkan=native --enable-features=Vulkan \
+  http://127.0.0.1:4173/
+```
+
+`chrome://gpu` in that window should list WebGPU as hardware accelerated. Drop
+the two Vulkan lines first if your desktop already provides an adapter; keep
+the two flags above them, which are the ones worth the time.
+
+These are developer flags and the f16 one turns off a gate Chrome set for a
+reason, so use the separate profile rather than making it your default browser.
+Neither is needed on Apple silicon, where `shader-f16` is available as shipped.
+
 ## Running it yourself
 
 The site is static files with no build step, so a plain file server is enough:
@@ -99,3 +130,10 @@ redistributed here.
 deployment notes. `AGENTS.md` is the engineering invariants, `CLAUDE.md` is how
 to run things in this checkout, and `docs/AF3.md` is the state of the
 AlphaFold 3 port.
+
+## License
+
+[Beerware](LICENSE) (Revision 42) for the code. The model parameters are not
+covered by it: the AlphaFold weights remain under DeepMind's
+[CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE),
+and the ESM-C, ESMFold2 and OpenDDE checkpoints under their own.

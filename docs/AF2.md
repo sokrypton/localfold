@@ -857,6 +857,10 @@ word in WGSL.
 
 ## Where AF2 stands now
 
+🔴 **BOTH PORTS RE-MEASURED AT `94d3902`, INTERLEAVED IN ONE BROWSER - see "Both
+ports, re-measured" at the end of this file. 15.74 -> 11.02 s here and
+14.21 -> 13.15 there. The table below is the older measurement.**
+
 One trunk pass, 825 residues, 512 clusters / 1024 extra, 0 recycles, same A100:
 
 | | one pass | vs JAX | vs the other port |
@@ -1986,6 +1990,24 @@ residues**: the thirteenth member of the tie refuses at the same length. The
 whole group has to move together, and the destination is 2,896 whatever route is
 taken, because that is the allocation wall.
 
+🔴 **AND 2,047 IS THIS CARD'S NUMBER, NOT THE PORT'S.** Measured on both boxes
+with `probe-limits.js`:
+
+| | M2 | A100 |
+|---|---:|---:|
+| `maxStorageBufferBindingSize` | **4 GiB** | 2 GiB |
+| `maxBufferSize` | 4 GiB | 4 GiB |
+| where an f32 pair stops BINDING | **2,896** | 2,047 |
+| where an f32 pair stops ALLOCATING | 2,896 | 2,896 |
+
+The ceiling is `sqrt(maxStorageBufferBindingSize / (cZ * 4))`, and the A100's
+binding limit is Vulkan's `maxStorageBufferRange` at exactly half the M2's -
+hence exactly `sqrt(2)` between the two lengths. **So on Apple silicon the two
+walls coincide and there is nothing to window at all:** the 28-label tie sits on
+the allocation wall, which no windowing passes. The twenty-eight windowings
+would buy a length only on the card where the binding limit is the smaller of
+the two, and even there only up to where the other one stops it.
+
 🔴 **AND THE CHEAP ROUTE TO 2,896 IS THE ELEMENT, NOT THE WINDOW.** A packed f16
 pair is two bytes a channel, so its bindings cross 2 GiB at 2,896 - exactly the
 allocation wall - and it needs no windowing anywhere. That is why upstream's
@@ -2112,3 +2134,257 @@ block, 42.5%, the largest kernel in the whole fold**. A workgroup owns a row
 now. Their fold and that fix attack the same kernel from different sides, and
 having done the larger one leaves 3 ms where they had hundreds. Two ports, the
 same hot spot, two different roads out of it.
+
+## Both ports, re-measured: 11.02 s against 13.15
+
+The three-way table above had not been re-run in a long campaign, and
+`martin-steinegger/alphafold2-webgpu` had landed a run of performance commits
+the day this was taken - its HEAD is `a7e02ed`, dated 2026-09-11. So both sides
+were re-measured, **in one page, in one Chrome, interleaved pass by pass**,
+which is the only arrangement this box's 3.2x drift allows.
+
+825 residues, 512 clusters / 1024 extra, one trunk pass, features included,
+weights already loaded. Warm is the minimum of two repeats after a cold one:
+
+| | cold | warm | recorded before |
+|---|---:|---:|---:|
+| alphafold2-webgpu at `a7e02ed` | 14.60 s | **13.15** | 14.21 |
+| **LocalFold at `94d3902`** | 11.72 | **11.02** | 15.74 |
+
+**1.19x**, where this file last recorded 10.5x the other way. Both fold the same
+structure: pLDDT 26.448 theirs and 26.317 ours, which is the low-confidence
+read of a 14x tandem repeat both ports agree on. Against the JAX baseline **as
+recorded earlier on this card** (5.27 s, not re-run), ours is 2.09x native.
+
+LocalFold on its own harness at the same shape reads **11.23 s** warm against
+11.02 here, so the harness is not the difference - which had to be shown rather
+than assumed, and see below for why.
+
+By shape, `fold-af2.js --recycles=0 --repeat=3`:
+
+| | cold | warm | recorded before |
+|---|---:|---:|---:|
+| 59 residues, 128/256 | 0.764 s | **0.196** | - |
+| 400 residues, 512/1024 | 4.055 | **3.500** | 5.129 |
+| 825 residues, 512/1024 | 11.892 | **11.230** | 15.74 |
+
+The cold-warm delta stays flat in the shape - 0.568, 0.555 and 0.662 s over a
+14x range of length - where theirs was 0.920 to 4.100 and grew with it.
+
+### How to run theirs, and the three traps that make the number wrong
+
+Their `tools/benchmark-a3m-model.ts` cannot run from a clone: it opens
+`test/fixtures/evoformer/model1-a3m-59-stack/manifest.json`, which their own
+`.gitignore` excludes as a "local development asset", and it imports the
+`webgpu` node binding, which is this box's GLIBC 2.38 wall. What works is their
+BROWSER harness - playwright against their vite dev server, with a spec that
+imports their monomer through vite's `/@fs/` route and folds against their
+published q8 bundle at `martin-steinegger.github.io`. Their `predict-a3m.ts`
+already reads `AFWEBGPU_MANIFEST` for exactly that bundle.
+
+🔴 **THREE THINGS EACH COST A FACTOR AND EACH LOOKS LIKE A RESULT.** Every one
+was caught by checking the machine rather than the output:
+
+| | | |
+|---|---|---|
+| **their playwright config is `headless: true`** | headless Chrome cannot bring up Vulkan here - it wants `VK_EXT_headless_surface`, which the NVIDIA driver lacks - so it silently takes the software adapter | Chrome's GPU process at **1179% CPU with the card at 0%**. `--headed` under `DISPLAY=:99`. This is the same discovery `gpu-chrome.mjs` is built around |
+| **no `--enable-dawn-features=vulkan_enable_f16_on_nvidia`** | Dawn refuses `shader-f16` on every NVIDIA GPU without it, so **BOTH ports lose their f16 path** and the comparison measures neither | theirs 23.20 -> **13.15**; ours 25.03 -> 23.61 with the third trap still in place |
+| **a hand-rolled `requiredLimits` for our arm** | our kernels pick their shape from `device.limits`, so a device asked for differently is a differently-configured port | ours 23.61 -> **11.02**. `requestAlphaFoldDevice(adapter)` is what `gpu-chrome.mjs` and the page both call; use it |
+
+Their side needs one thing of its own: their native harness fits a scratch
+budget to host memory, which a browser cannot ask for and which their README
+prices at a third of the speed on a long chain. Passing this card's 36 GiB to
+their own `fitScratchBudgetScale` picks scale 16 and takes them from 33.95 s to
+22.11 without f16 - so the arm above is their FAST path, not a browser
+handicap.
+
+🔴 **AND THE ORDER OF THOSE THREE IS THE LESSON.** Each one produced a plausible
+number: 33.95, 23.20, 23.61. Any of them could have been written down as "the
+other port is 3x slower" or "ours is 2x slower", and all three were wrong for
+reasons nothing in the output said. The card's own utilisation - `nvidia-smi`
+next to the run - is what caught the first, and the first is what made the other
+two visible.
+
+## What is left between here and JAX, priced
+
+11.02 s against the recorded 5.27 is **2.09x**, and the question is where it
+lives. Two measurements answer it.
+
+**It is the main stack, and nothing else is worth attacking.** A fold at
+825/512/1024 splits: main stack 9.22 s (77.6%), extra stack 0.84, confidence
+0.41, template 0.33, embedder 0.32, structure 0.27, features 0.26, warm 0.18,
+trunk readback 0.04. Everything that is not the 48 main blocks is **2.66 s
+together**, so a fold that did all of it instantly is still 9.22 s and 1.75x
+JAX. There is no host-side or stage-level lever left; there is one loop.
+
+**Inside the block, the gap is arithmetic rate, and the block contains its own
+control.** At 825 residues and 512 rows, by GFLOP over measured milliseconds:
+
+| kernel | ms | GFLOP | TFLOP/s |
+|---|---:|---:|---:|
+| `opm.contract` | 17.98 | 713.7 | **39.7** |
+| `msa-row-attention.project` | 8.45 | 221.5 | 26.2 |
+| `msa-column-attention.project` | 8.47 | 221.5 | 26.1 |
+| `triangle.outgoing.contract` | 6.73 | 143.7 | 21.3 |
+| `triangle.incoming.contract` | 7.22 | 143.7 | 19.9 |
+| `msa-column-attention.flash` | 11.20 | 221.5 | 19.8 |
+| `triangle-attention-starting.flash` | 17.81 | 287.5 | **16.1** |
+| `triangle-attention-ending.flash` | 17.97 | 287.5 | **16.0** |
+| `msa-row-attention.flash` | 22.26 | 356.8 | **16.0** |
+| these nine | 118.10 | 2597.4 | 22.0 |
+
+They are 60% of a 195.6 ms block. **The four flash attentions are 69.2 ms of it
+- 35% of the block - at 16 to 20 TFLOP/s, against 39.7 for the outer product
+mean's contraction in the same block on the same units.** That 39.7 is also the
+best this card has ever given a real kernel here (docs/A100.md's staged GEMM
+reaches 39.3), so it is a rate this port is known to be able to hit, not an
+aspiration.
+
+Priced: if all nine ran at 39.7 they would take 65.4 ms instead of 118.1, which
+is 27% off the block - main stack 9.22 -> 6.7 s and a fold of about **8.5 s,
+1.61x JAX**. So the largest single identified gap is the flash attention's
+efficiency, and closing it completely does not reach JAX.
+
+🔴 **AND THE REMAINDER IS PRECISION - BUT NOT AS AN ACTIVATION-PACKING JOB, AND
+THE PARAGRAPH THAT USED TO STAND HERE WAS WRONG TWICE.** It said all 79
+activation allocations in `src/evoformer/`, `src/model/` and `src/multimer/` are
+f32 because "a grep for a storage argument returns zero". The grep matched a
+LITERAL `"f16"`, and the storage is passed as a variable: parsing the calls
+instead, **16 of 102 pass a storage argument**, and they are the ones that
+matter - `attention.query`/`key`/`value`/`gate` are already f16 through
+`projectedStorage`, and so are the attention's normalised input and the
+transition's hidden. The packing this port could cheaply take, it took.
+
+And the rest would not buy speed, which is the second error. **None of the
+block's large kernels is anywhere near bandwidth-bound.** Bytes moved over
+measured milliseconds, against this card's ~1555 GB/s:
+
+| kernel | ms | GB | GB/s | of HBM |
+|---|---:|---:|---:|---:|
+| `triangle.outgoing.contract` | 6.73 | 1.05 | 155 | 10.0% |
+| `msa-row-attention.project` | 8.45 | 1.30 | 154 | 9.9% |
+| `msa-column-attention.flash` | 11.20 | 1.08 | 97 | 6.2% |
+| `opm.contract` | 17.98 | 1.19 | 66 | 4.3% |
+| `msa-row-attention.flash` | 22.26 | 1.10 | 50 | 3.2% |
+| `triangle-attention-starting.flash` | 17.81 | 0.88 | 50 | 3.2% |
+
+The heaviest reaches a tenth of the bus and the flash attentions a thirtieth, so
+**halving an operand's bytes cannot move a kernel that is not waiting on
+them.** The flash attentions sit at 16 TFLOP/s for the reason docs/A100.md
+already gives - occupancy capped by workgroup memory - and that is a tile and
+register problem, not a storage one.
+
+🔴 **AND THE TRIANGLE'S SCRATCH IS THE ONE PLACE PACKING IS ALREADY MEASURED,
+AS A LOSS.** `createTriangleShaders` takes `{normalized, hidden, ab}` and AF2's
+block passes none of it, which reads like an omission. It is not:
+docs/PERF.md's bisection of the SAME shaders in AF3 has `a` and `b` costing
+**3x** the error - they are multiplied against each other, so their rounding
+squares - `normalized` 1.6x, and `hidden` nothing measurable. That is why
+`PAIR_SCRATCH_STORAGE` is exported and unused and all four AF3 stacks take
+`UNPACKED_PAIR_SCRATCH`. AF2 would be repeating a measured experiment.
+
+What activation packing WOULD buy here is memory and reach, not time: the fold's
+peak is 6803 MiB at 825 residues, and a packed pair is what moves the
+28-label binding ceiling from 2,047 residues to 2,896. That is a capacity
+argument and belongs with the ceiling section, not this one.
+
+So the honest remainder against JAX is arithmetic: 39.7 TFLOP/s is 13% of the
+310.9 this card's units issue at, JAX runs bf16 tensor cores end to end, and the
+largest single kernel family here is occupancy-bound at 16.
+
+Caveat on the ratio itself: **the 5.27 s is the recorded JAX number and was not
+re-run** - the AF2-vendored branch it came from is not on this box. It is a
+bf16, Triton-flash-attention, whole-graph-XLA run of the same model.
+
+## The transition chunk was a 59-residue memory trade, and at 825 it costs 5.4%
+
+`TRANSITION_CHUNK_TARGET_BYTES` is 32 MiB and the note above it prices the knee
+on a **59-residue** fold at 512 MSA rows, as device peak against wall: no cap
+681 MiB / 5256 ms, 32 MiB 573 / 5294, 16 MiB 553 / 5354. That is a memory
+question. At 825 residues it is a different one - the transitions are **263 of a
+block's 339 dispatches** - and nobody had asked it.
+
+`transitionChunkBytes` is the knob now (null takes the constant). Swept in
+situ at 825 residues and 512 rows, interleaved, two rounds, minimum per arm:
+
+| MiB | block | | MiB | block |
+|---:|---:|---|---:|---:|
+| 16 | 202.95 | | 256 | **181.71** |
+| 32 (the constant) | 192.12 | | 512 | 181.18 |
+| 64 | 188.56 | | 1024 | 180.51 |
+| 128 | 184.24 | | 2047 | 180.04 |
+
+**256 MiB is the knee**, the same value `opmPairBlockBytes` landed on: 32 -> 256
+is **5.4% of a block**, and eight times the memory past it buys 0.9% more.
+
+End to end, `fold-af2.js --recycles=0 --repeat=2`, warm and device peak:
+
+| | warm | peak | checksum |
+|---|---:|---:|---:|
+| 825 residues, 512/1024, 32 MiB | 11195 ms | 6803.4 MiB | -121844157 |
+| ...256 MiB | **10742** | 6971.4 | **-121844157** |
+| 59 residues, 512/1024, 32 MiB | 414 | 540.0 | -329598 |
+| ...256 MiB | **398** | 575.0 | **-329598** |
+| the 30,29 multimer | 210 / 213 | 442.8 both | 315591 both |
+
+**4.0% of a fold for 168 MiB, and bit-identical** - chunking splits ROWS and
+reorders no sum, so there is no accuracy question to ask. The multimer is inert
+because at 59 residues and 128 rows nothing chunks at either value. Set in the
+**ampere prior only**, like `opmPairBlockBytes`: the cost is memory and a laptop
+keeps the constant.
+
+🔴 **AND `audit-knobs.py` CALLS IT DEAD UNLESS THE WORKLOAD CHUNKS.** On the
+default `fold-af2` shape - 59 residues, 128 rows - the MSA transition is 30.9 MB
+and nothing chunks at any value, so the dispatch digest cannot move; even at
+`--rows=512 --extra-rows=1024` it is 123.7 MB and the audit's candidates
+(512 and 128 MiB) are both above it. At 825 residues it reads **moved**. This is
+the caveat CLAUDE.md already gives - "the workload matters" - with a second
+instance: a knob whose threshold the workload never crosses is indistinguishable
+from a knob that does nothing.
+
+## What else was fitted at the wrong length: the audit, and two more negatives
+
+The transition chunk hid because the 825-residue re-sweep could only see
+**knobs**, and it was a module CONSTANT - and `audit-knobs.py` cannot see it
+either, since that iterates `DEFAULT_TUNING`. So both populations were swept.
+
+**Constants whose own comment justifies them only at a short length** (parsed
+out of `src/`, comment block above each `export const`):
+
+| | cited at | |
+|---|---|---|
+| `TRANSITION_CHUNK_TARGET_BYTES` | 59 residues | **fixed** - see above |
+| `PAIR_LOGITS_CACHE_BYTES` (AF3) | 200 tokens | 🔴 the same SHAPE as the bug above |
+| `OPM_CELL_CHUNK` (AF3) | 150 tokens | |
+| `OPM_BLOCK_I` (AF3) | 59 and 150 tokens | |
+| `TRANSITION_SPLIT_MIN_CHANNELS` (AF3) | 400 tokens | a channel threshold, not a length one |
+| `PAIR_SCRATCH_STORAGE` | 200 and 300 tokens | exported and unused, so moot |
+
+`PAIR_LOGITS_CACHE_BYTES` is the one to look at: its own note says the cache is
+`64 x tokens^2` bytes a block, so the 64 MiB cap keeps **all twenty-four blocks
+at 208 tokens or fewer and six at 400** - and about three at 512. It was
+measured at 200 tokens, where it covered everything, and is worth 4% of a fold
+there. That is exactly the transition chunk's shape: a byte cap fitted where it
+covered the whole workload. Not measured here; AF3, not AF2.
+
+**Knobs the ampere prior sets that had never been re-swept at 825.** Of its 34,
+six had been. Twelve of the rest are AF2-reachable, and ten of those are
+booleans of the form "does this device have matrix units", which the API answers
+and a length does not change. The two that carry a SHAPE were swept:
+
+| | arms | verdict |
+|---|---|---|
+| `attentionGroup` | 1, 2, 4, 8 | **flat** - 181.72 / 181.61 / 181.74 / 181.51 ms, 0.13% |
+| `trianglePairProjectTile` | 32x32, 32x16, 16x32, 16x16 | **flat** - 181.76 / 181.70 / 181.70 / 181.77, 0.04% |
+
+`attentionGroup` is inert because AF2 resolves the MATRIX flash kernel here and
+the grouping belongs to the vector one; the triangle projections are 3.26 and
+1.76 ms of a 181.7 ms block, so there is nothing there to win either.
+
+🔴 **AND `--sweep` COULD NOT EXPRESS A SHAPED KNOB AT ALL, WHICH IS WHY ONE OF
+THOSE HAD NEVER BEEN SWEPT.** It split its values on every comma, and thirteen
+knobs take `{"rows":32,"columns":32}` - so the two fragments reached
+`shapedKnob`, which read them as unset, and AF2 died with **"projectTile
+undefinedxundefined"**. That is the third appearance of that trap in CLAUDE.md
+and the first where the instrument rather than the caller was what could not
+say it. The split respects braces now.

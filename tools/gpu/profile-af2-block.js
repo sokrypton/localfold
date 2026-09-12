@@ -223,9 +223,26 @@ export async function main(device, args) {
     const at = sweep.indexOf("=");
     if (at < 0) throw new Error(`--sweep wants knob=v1,v2,..., got ${sweep}`);
     const knob = sweep.slice(0, at);
-    const values = sweep.slice(at + 1).split(",").map((raw) => {
-      try { return JSON.parse(raw); } catch { return raw; }
-    });
+    // 🔴 NOT A NAIVE COMMA SPLIT. Thirteen knobs take a SHAPE, and
+    // `{"rows":32,"columns":32}` has a comma in it - so splitting on every comma
+    // handed `shapedKnob` two fragments, which it read as unset, and AF2 died
+    // with "projectTile undefinedxundefined". That is the third appearance of
+    // that trap in CLAUDE.md, and the first where the SWEEP was what could not
+    // express the value. Commas inside braces or brackets are not separators.
+    const values = [];
+    let depth = 0;
+    let start = at + 1;
+    const text = sweep;
+    for (let i = at + 1; i <= text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{" || ch === "[") depth += 1;
+      else if (ch === "}" || ch === "]") depth -= 1;
+      if (i === text.length || (ch === "," && depth === 0)) {
+        const raw = text.slice(start, i);
+        try { values.push(JSON.parse(raw)); } catch { values.push(raw); }
+        start = i + 1;
+      }
+    }
     const watch = option(args, "watch", "opm.contract,opm.project-output")
       .split(",").filter(Boolean);
     const best = new Map();

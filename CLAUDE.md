@@ -10,6 +10,16 @@ gate cannot see an error inside one of them.
 
 ## Running anything that needs a GPU
 
+🔴 **AND EVERY NUMBER THIS HARNESS PRODUCES IS BEHIND TWO DEVELOPER FLAGS WORTH
+1.95x.** `gpu-chrome.mjs` and `tools/cdp.py` both pass
+`--enable-dawn-features=vulkan_enable_f16_on_nvidia` and `--enable-unsafe-webgpu`;
+on this A100 with Chrome 152 the first is the only reason `shader-f16` exists
+and the second the only reason `chromium-experimental-subgroup-matrix` does. A
+stock Chrome has **neither**, and the same 825-residue fold is **10767 ms with
+them and 21000 without**. `LOCALFOLD_STOCK_FLAGS=1` drops both and is how to ask
+what an NVIDIA visitor actually gets. See docs/A100.md.
+
+
 ```
 node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]
 ```
@@ -33,6 +43,25 @@ real adapter: `nvidia / ampere / nvidia-a100-sxm4-40gb`, with
 npm i webgpu@0.4.0 --no-save     # not the pin: macOS wants 0.6.0
 XDG_RUNTIME_DIR=/tmp/xdg npm run test:gpu
 ```
+
+🔴 **AND ITS ADAPTER HAS NO `shader-f16` UNTIL YOU ASK - WHICH IS A MISSING
+TOGGLE AND NOT A PROPERTY OF DAWN.** Every one of the 25 `create(...)` calls in
+`test/*.gpu.test.js` passes `[]`, and measured here on webgpu@0.4.0:
+
+```
+create([])                                                  f16 no   matrix no   18 features
+create(["enable-dawn-features=vulkan_enable_f16_on_nvidia"]) f16 YES  matrix no   19
+create(["enable-dawn-features=vulkan_enable_f16_on_nvidia,allow_unsafe_apis"])
+                                                            f16 YES  matrix YES  21
+```
+
+Note no leading `--`, and that a second toggle goes after a COMMA rather than in
+a second array element, which throws "Flags expected argument format is
+`<key>=<value>`". So the Dawn lane can run the f16 AND the subgroup-matrix arms
+that the paragraph below says it cannot; those 25 call sites want one shared
+helper. **AND THIS IS WHY A NODE LIBRARY IS THE ONE PLACE THIS PORT CAN
+GUARANTEE ITS OWN FAST PATH**: in a browser the two capabilities need flags the
+visitor must pass, and in Node the process sets them itself.
 
 🔴 **AND ITS ADAPTER HAS NO `shader-f16`, WHERE CHROME'S DOES.** That is where
 this file's old claim that neither machine has the feature came from - it was
@@ -85,7 +114,7 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | Do recycles help a complex? | `tools/gpu/probe-recycles-on-complexes.js` |
 | Does MSA depth help a complex? | `tools/gpu/probe-msa-depth-on-complexes.js` (**goes to the network**) |
 | Does the sampler setting matter on a real binder? | `tools/gpu/probe-designed-binder-sampler.js` (**network**) |
-| **Where does a fold stop BINDING, and which dispatch decides?** | `tools/gpu/probe-binding-ceiling.js --tool=fold-af2 --lengths=59,118` - it runs the wrapped tool at TWO lengths, because a binding that grows as `L` and one that grows as `L^2` are indistinguishable in one run and give out at completely different lengths. Each label gets a growth exponent and an extrapolated ceiling. On AF2, 86 labels: `opm.contract` at **724** (handled - the tiled path takes over), the pair transitions at **1,448** (handled - `transitionChunkRows`), then **2,047 with TWENTY-EIGHT labels on it** (the MULTIMER's is 42) and 2,896 with 22. 🔴 RUN IT AT LENGTHS WHERE BOTH SAMPLES ARE ABOVE EVERY CHUNK THRESHOLD, or a handled label reads as a ceiling: at 59/118 the pair transitions read 1,448 and the multimer's 1,023, and at 200/400 they are absent from the ranking entirely because chunking has started. `sampleFraction` and `caveat` say when the extrapolation is a guess - at 59/118 it is 2.7% of the limit. 🔴 READ `lowestCeilingGroup.labels` BEFORE THE NAME. This returned one label once and it was read as a to-do list; the triangle is simply first in a sorted list, and windowing its twelve moves the fold's ceiling by ZERO because the thirteenth member of the tie refuses at the same residue. Every dispatch binding an `L^2 * cZ` f32 tensor is in that group. 🔴 AND READ THE EXPONENT COLUMN: a fractional one means the label already steps against a budget and the ceiling is not a prediction. The idea is @milot-mirdita's; the tool is not |
+| **Where does a fold stop BINDING, and which dispatch decides?** | `tools/gpu/probe-binding-ceiling.js --tool=fold-af2 --lengths=59,118` - it runs the wrapped tool at TWO lengths, because a binding that grows as `L` and one that grows as `L^2` are indistinguishable in one run and give out at completely different lengths. Each label gets a growth exponent and an extrapolated ceiling. On AF2, 86 labels: `opm.contract` at **724** (handled - the tiled path takes over), the pair transitions at **1,448** (handled - `transitionChunkRows`), then **2,047 with TWENTY-EIGHT labels on it** (the MULTIMER's is 42) and 2,896 with 22. 🔴 AND 2,047 IS THIS CARD'S: the ceiling is `sqrt(maxStorageBufferBindingSize / (cZ * 4))`, which is 2 GiB here and **4 GiB on an M2**, where it is 2,896 and coincides with the allocation wall - so on that part there is nothing to window at all. 🔴 RUN IT AT LENGTHS WHERE BOTH SAMPLES ARE ABOVE EVERY CHUNK THRESHOLD, or a handled label reads as a ceiling: at 59/118 the pair transitions read 1,448 and the multimer's 1,023, and at 200/400 they are absent from the ranking entirely because chunking has started. `sampleFraction` and `caveat` say when the extrapolation is a guess - at 59/118 it is 2.7% of the limit. 🔴 READ `lowestCeilingGroup.labels` BEFORE THE NAME. This returned one label once and it was read as a to-do list; the triangle is simply first in a sorted list, and windowing its twelve moves the fold's ceiling by ZERO because the thirteenth member of the tie refuses at the same residue. Every dispatch binding an `L^2 * cZ` f32 tensor is in that group. 🔴 AND READ THE EXPONENT COLUMN: a fractional one means the label already steps against a budget and the ceiling is not a prediction. The idea is @milot-mirdita's; the tool is not |
 | **Does one dispatch bind the same buffer range twice?** | `tools/gpu/probe-dispatch-aliasing.js --tool=fold-af2` - the allocator pools whole buffers by `byteLength:usage` and a stack RELEASES a block's allocations so the next block can reuse them, which is deliberate and is where the memory saving comes from. Reuse across dispatches is fine; two tensors of ONE dispatch on one buffer is not, when one is the output - workgroups then read what other workgroups write, which is a race whose symptom is a fold that differs run to run and whose cause is nowhere near the shader that shows it. An AF2 fold: **0 of 2,296**. Written to rule that out with a measurement rather than an argument |
 | **How long a chain can the residual add still BIND?** | `tools/gpu/probe-residual-binding-ceiling.js` - `addInPlace` bound both tensors whole, and the pair is `L*L*channels*4` against `maxStorageBufferBindingSize`, 2 GiB here and unraisable because it is Vulkan's `maxStorageBufferRange`. The ceiling was **2,047 residues** on a card with 40 GB free: 2,047 binds, 2,048 was REFUSED outright. It windows now - the residual add alone reaches 2,896 in two windows - and below the ceiling the single-dispatch path is untouched. 🔴 BUT THE FOLD STILL STOPS AT 2,047, AND NO ONE WINDOWING MOVES IT: `probe-binding-ceiling.js` puts **28 labels** on that exact residue - the ten triangle multiplication passes and two gates, both triangle attentions' normalize and output in both stacks, both MSA row attentions' pair-normalize and pair-bias, two pair-transition normalize, `template.output` and the template residual. They all bind `L^2 * cZ` f32, so they give out together. The residual is no longer the FIRST thing to fail; it is not a longer complex. 🔴 THE NEXT WALL IS `maxBufferSize` at 4 GiB, so one f32 pair tops out at 2,896 however it is bound - which is also where a packed f16 pair's BINDINGS land, so 2,896 is the destination by either route and the cheap route is the element, not twenty-eight windows. And the price of arriving is minutes: `profile-af2-block.js --length=2040` is 1,260 ms a block, 60.5 s a recycle for the stack, on an O(L^3) contraction. Found by **@milot-mirdita** upstream, whose packed-f16 pair put their ceiling at 2,896 where our f32 put ours at 2,047. See docs/AF2.md |
 | 🔴 **Does the fold survive an ODD MSA depth?** | It did not. `fold-af2.js --sequence=<400 residues> --rows=37` died in WebGPU validation and `--rows=38` folded; 39 died, 40 folded, 61 died. The matrix outer product mean binds `left` at `residuesBefore * cOuter * sequences` elements and a bound range must start on **256 bytes** - with cOuter 32 that is a multiple of 256 only when the depth is EVEN. Three things must hold: the MATRIX contraction (refused at depth 1, which is why a single-sequence fold is safe and why no gate showed it), an ODD depth, and MORE THAN ONE pair block (59 residues has one; 400 has three). Both stacks have a depth: the main one is `min(cap, depth)` and every preset cap is even, so it needs a shallow odd alignment - but the EXTRA stack runs at `min(maxExtra, depth - maxMsa)`, which is odd whenever the alignment's own depth is, so at the default 128:256 preset any alignment of 129-383 sequences with an odd count reached it. 🔴 AND WEBGPU NAMED THE WRONG TENSOR: the allocator pools by size and a pooled buffer keeps its CREATION label, so the same bug blamed `opm.left` once and `extra.msa-row-attention.normalized` the next time. `execution.js` checks the offset itself now and names the pass, the binding and the byte. Fixed by cutting the pair block on an ALIGNED number of residues, so every depth that worked is byte-identical. See docs/AF2.md |
@@ -125,7 +154,7 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | Where does an OpenDDE FOLD's time go, and is it even GPU? | `tools/gpu/fold-opendde.js --profile --buffers --repeat=2` - the trunk phase is **96.3% GPU-idle**, and the second fold is the row a user sees |
 | Where does an AF2 block's time go? | `tools/gpu/profile-af2-block.js --sequences=512` |
 | ...and ALL of it, not the top twenty? | the same, `--top=200` - a block's transitions alone are fifty labels, one a chunk, and 15 ms of pair bias hid under them |
-| 🔴 ...and were these knobs swept at the LENGTH that matters? | Mostly not - the priors were fitted at 400 residues and below. Re-swept at 825 with 512 sequences, one in four moved: `opmPairBlockBytes` 64 -> 256 MiB is **2.2% of a block and 180 ms of a fold for 193 MiB**, bit-identical because blocking reorders no sum. Flat: `attentionMatrixTile` (4x32 still right), `opmProjectOutputPairs`, `stagedMatrixBlock`, `transitionThreadTarget` over an eightfold range. See docs/AF2.md |
+| 🔴 ...and were these knobs swept at the LENGTH that matters? | Mostly not - the priors were fitted at 400 residues and below. Re-swept at 825 with 512 sequences, one in four moved: `opmPairBlockBytes` 64 -> 256 MiB is **2.2% of a block and 180 ms of a fold for 193 MiB**, bit-identical because blocking reorders no sum. **`transitionChunkBytes` 32 -> 256 MiB is 5.4% of a block and 4.0% of a fold for 168 MiB**, also ampere-only and also bit-identical - its 32 MiB knee had been measured on a 59-residue fold as a MEMORY trade, and at 825 the transitions are 263 of a block's 339 dispatches. Flat: `attentionMatrixTile` (4x32 still right, and 8x32/6x32/4x64 are all WORSE), `opmProjectOutputPairs`, `stagedMatrixBlock`, `transitionThreadTarget` over an eightfold range. 🔴 `audit-knobs.py` calls `transitionChunkBytes` dead on its default workload, because at 59 residues nothing chunks at any candidate value - a knob whose threshold the workload never crosses looks exactly like a dead one. See docs/AF2.md |
 | ...and which value of an AF2 knob does this block want? | `profile-af2-block.js --sweep=opmProjectOutputPairs=1,2,4 --watch=opm.project-output` - arms interleaved, two rounds, minimum per arm, weights loaded once |
 | Just the transformer, in 3 seconds? | `tools/gpu/bench-diffusion-transformer.js` |
 | Which attention kernel does this device get? | `tools/gpu/probe-kernel.js` |
@@ -295,7 +324,101 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
-### 🔴 ROUND THREE: WHAT WANTS AN M2 NOW
+### 🔴 ROUND FOUR, ANSWERED FROM THE M2: NO VISITOR HAS THE MATRIX UNITS
+
+**The flags question first, because it is the one that changes something.**
+Measured with `LOCALFOLD_STOCK_FLAGS=1`, which on macOS drops exactly one flag -
+`--enable-unsafe-webgpu`, since `PLATFORM_FLAGS` is empty off Linux:
+
+| on an M2, stock Chrome | |
+|---|---|
+| `shader-f16` | **yes** - the README's claim, now measured rather than inferred |
+| `chromium-experimental-subgroup-matrix` | **NO** |
+| `subgroups` | yes |
+| kernel chosen | `attention:flash-registers-32-chunk16`, flags or not |
+
+🔴 **SO THE MATRIX UNITS NEED `--enable-unsafe-webgpu` ON BOTH PLATFORMS, AND
+NOBODY VISITING THE PAGE HAS THEM.** That is the consequence round four asked
+for and it is the larger one: every matrix-unit knob this repository has measured
+- `attentionMatrix`, `matrixLinear`, `opmMatrixContract`, `triangleProjectMatrix`,
+`gridAttendMatrix`, the staged matrix GEMM family - is a DEVELOPER-FLAG path. The
+A100's 218 ms prior split, of which "every significant one is does this device
+have matrix units", is a number no visitor can reach. It does not make any of it
+wrong; it makes it a measurement of a configuration the site does not ship, and
+the honest place for those numbers is beside a note saying so.
+
+It costs an Apple part nothing either way: 8x8x8 units are refused by a kernel
+declaring `<f16, 16, 16>`, so the register kernel is chosen with the flag and
+without it.
+
+**And the rest of round four is inert here, confirmed.** All four new knobs are
+`null` in `DEFAULT_TUNING` and set in the ampere prior only, and the call sites
+take the constant through `?? undefined` and `?? CONSTANT`. Measured on this tip
+against this box's own previous values - never against the A100's:
+
+| | before | round four |
+|---|---|---|
+| `fold-af2.js` | -1282976 | **-1282976** |
+| peak device bytes | 405,716,280 | **405,716,280** |
+| AF3 | 85.83089054918456 | **85.83089054918456** |
+| OpenDDE | 92.05056924853176 | **92.05056924853176** |
+
+`npm test` 1014/0.
+
+**Not run here: the `opmBlockI` crossover.** It wants a trunk profile at 400
+tokens, and the question - whether this part's memory system turns over where
+that card's does - deserves its own round rather than a number taken beside five
+other folds on a machine that drifts 3.2x.
+
+### 🔴 ROUND FOUR: WHAT WANTS AN M2 NOW
+
+Thirteen commits since round three, three of them touching `src/`. All three are
+performance settings found the same way - by asking which constants and knobs
+were fitted at a length nobody folds - and all three are **ampere-prior only**,
+so an Apple part should see NO change from any of them. That is the first thing
+to check and it is one command: `fold.js --model=` and `fold-af2.js` checksums
+against your own previous run, not against this box's.
+
+**1. `opmBlockITokens`, and this is the real ask.** Past 256 tokens AF3's outer
+product mean takes a block of ONE instead of two, worth **8.1% of a trunk pass**
+at 400 tokens here - `opm.contract` 245.7 -> 147.8 ms, the second-largest kernel
+in the trunk. The full curve is in docs/AF3.md and it is not monotone: one wins
+at 59, two wins at 150 and 256, one wins from 300 up, at both 512 and 1024 MSA
+rows. 🔴 **I shipped that as a DERIVATION for every device first, and that was
+wrong** - 256 tokens is where THIS card's memory system turns over, not
+something a device reports - so it is a prior now and your part keeps the block
+of two. What would be worth knowing is whether the crossover exists there at
+all: `bench-trunk.js --profile --model= --tokens=400 --msa=512
+--tune-json={"opmBlockI":1}` against the default.
+
+**2. `transitionChunkBytes` and `pairLogitsCacheBytes`, both 256 MiB, both
+ampere.** The first is 5.4% of an AF2 block and 4.0% of a fold for 168 MiB; the
+second is 8.7% of an AF3 denoiser call for 166 MiB. Both bit-identical here.
+They are memory trades, which is exactly the axis a laptop cares about and this
+card does not, so the interesting question is whether they are worth taking on
+Metal at all - and `fold.js --budget=0` is what says.
+
+**3. The flags, which may be the most important thing in this round and are not
+a code change.** Every number this repository has ever published from the A100
+was taken behind `--enable-dawn-features=vulkan_enable_f16_on_nvidia` and
+`--enable-unsafe-webgpu`, and a stock Chrome on NVIDIA has NEITHER: the same
+fold is 10767 ms with them and **21000 without**. `LOCALFOLD_STOCK_FLAGS=1`
+drops both. Two things only an Apple part can answer:
+   - does a stock Chrome there report `shader-f16`? The README now tells Linux
+     users to pass a flag and says Apple needs none, on the strength of your
+     round-three reply rather than a measurement.
+   - does `chromium-experimental-subgroup-matrix` appear without
+     `--enable-unsafe-webgpu`? If it needs the flag there too, then the matrix
+     kernel is unreachable for every visitor on every platform, which changes
+     what `attentionMatrix` is worth rather than how fast it is.
+
+**4. And the Dawn lane can run its f16 arms after all**, which this file said it
+could not. `create([])` in all 25 `test/*.gpu.test.js` call sites is why:
+`create(["enable-dawn-features=vulkan_enable_f16_on_nvidia,allow_unsafe_apis"])`
+gives f16 AND the matrix units on the node binding here. Whether Metal's Dawn
+wants a different toggle is open.
+
+### 🔴 ROUND THREE: WHAT WANTED AN M2, AND WAS ANSWERED
 
 Newest first. Round two's ask - the windowing - is the section after this one
 and still stands; nothing below replaces it.
@@ -320,8 +443,11 @@ node tools/gpu-chrome.mjs tools/gpu/probe-kernel.js
 node tools/gpu-chrome.mjs tools/gpu/fold-af2.js --tune=attentionMatrixPrefetch=true
 ```
 
-The fold's checksum must not move, because the kernel the knob rewrites is not
-the one being run. 🔴 **IF `probe-kernel.js` DOES pick the matrix variant** - a
+The fold's checksum must not move **against that same box's other arm**. 🔴 NOT
+against -1287025, which is what this asked for and was wrong: the M2 folds that
+gate at **-1282976** because the two boxes resolve different attention kernels,
+and on the first run the comparison would have read as a failure. A checksum
+travels between machines no better than a timing does. 🔴 **IF `probe-kernel.js` DOES pick the matrix variant** - a
 newer Dawn, a newer part - then this arm is live on the backend that CLAMPS
 rather than discards, and it wants `bench-af2-warm.js --passes=8` on both arms
 before anyone trusts it.
@@ -349,6 +475,16 @@ a ceiling; `caveat` in the output says when that is happening.
 and `maxBufferSize` on the M2. Every ceiling in docs/AF2.md is 2 GiB and 4 GiB,
 which is this card, and the windowing threshold is derived from the first - a
 smaller one would start windowing at a length the A100 never reaches.
+
+🔴 **ANSWERED, AND IT RUNS THE OTHER WAY: 4 GiB, TWICE THIS CARD'S.** See the
+M2's reply below. The consequence it does not draw is the useful one: on that
+part the binding wall and the ALLOCATION wall are the same 4 GiB, so both land
+on 2,896 together and **there is nothing to window on Apple silicon at all** -
+the 28-label tie sits exactly on the wall no windowing can pass. `addInPlace`'s
+windowed path is therefore unreachable there below the length where the pair
+cannot be allocated either, which answers round two's first ask by making it
+moot rather than by testing it. 2,047 is this A100's number; the port's is
+`sqrt(maxStorageBufferBindingSize / (cZ * 4))`.
 
 ### 🔴 ROUND THREE, ANSWERED FROM THE M2
 
@@ -871,6 +1007,21 @@ find /tmp -maxdepth 1 -name 'gpu-chrome-*' -type d -mmin +5 -print0 | xargs -0 -
 
 `-mmin +5` is what keeps it from deleting a profile a running browser is still
 using.
+
+🔴 **AND A CHECKSUM DOES NOT TRAVEL BETWEEN MACHINES, SO NEVER HAND ONE ACROSS
+AS A BAR.** The A100 folds `fold-af2.js` at **-1287025** and the M2 at
+**-1282976**, over the same code and the same input, because the two resolve
+different attention kernels - `attention:flash-matrix-32-...-4x32` here and
+`attention:flash-registers-32-chunk16` there, the M2 offering `8x8x8` units and
+nothing else against a kernel that declares `<f16, 16, 16>`. Both folds are
+correct.
+
+This file already said so, buried in the race section - "these are M2 checksums
+and are NOT comparable with the A100's" - and a checklist written for the M2
+still told them "the checksum they must not move is -1287025", which on their
+first run would have read as a failure. **An arm is compared against the same
+box's other arm.** What travels is the COUNT of distinct structures, the
+relative residual, and whether two arms on one machine agree - never the value.
 
 🔴 **AND `meanPlddt` IS NOT A BIT-EXACTNESS GATE, however many digits it
 prints.** A night of kernel work reported it identical to SIXTEEN DIGITS -

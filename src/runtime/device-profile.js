@@ -283,6 +283,29 @@ export const DEFAULT_TUNING = Object.freeze({
   // this as reverted on AF2 for a race; the race was in the BISECTION - see
   // src/evoformer/attention-matrix.js on why the staging loop's trip count is
   // not uniform at a head of eight.
+  // 🔴 HOW MANY BYTES ONE TRANSITION CHUNK MAY BIND, overriding
+  // TRANSITION_CHUNK_TARGET_BYTES. That constant's 32 MiB knee was measured on a
+  // 59-RESIDUE fold as a memory trade - device peak against wall - and the
+  // transitions are 263 of an 825-residue block's 339 dispatches, which is a
+  // different question. null takes the constant.
+  transitionChunkBytes: null,
+  // 🔴 HOW MANY BYTES OF CACHED PAIR ATTENTION BIAS A SCHEDULE MAY HOLD,
+  // overriding PAIR_LOGITS_CACHE_BYTES. That constant's 64 MiB was measured at
+  // 200 TOKENS, where it covers all twenty-four blocks; the cache is
+  // `64 * tokens^2` bytes a block, so it covers six at 400 and about three at
+  // 512 - the same shape as transitionChunkBytes, a cap fitted where it
+  // happened to cover the whole workload. null takes the constant.
+  pairLogitsCacheBytes: null,
+  // 🔴 AF3's OUTER PRODUCT MEAN, whose OPM_BLOCK_I and OPM_CELL_CHUNK were both
+  // measured at 59 and 150 TOKENS. The block's own note says "the workgroup
+  // count still wins at these sizes", which is a claim about a SIZE - see
+  // docs/AF3.md. null takes the constants.
+  opmBlockI: null,
+  opmCellChunk: null,
+  // Above this many tokens the outer product mean takes a block of ONE. null
+  // means "never" - see OPM_BLOCK_I_TOKENS for why this is a prior and not a
+  // derivation.
+  opmBlockITokens: null,
   attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
@@ -549,6 +572,29 @@ const PRIORS = new Map([
     // before trusting it on another part; see src/evoformer/attention-matrix.js.
     attentionMatrix: true,
     attentionMatrixTile: "4x32",
+    // 🔴 THE TRANSITION CHUNK, RE-SWEPT AT 825 RESIDUES. TRANSITION_CHUNK_TARGET_BYTES
+    // is 32 MiB and its knee was measured on a 59-residue fold as a MEMORY
+    // trade. At 825 with 512 rows the transitions are 263 of a block's 339
+    // dispatches, and the same sweep as time is monotone: 16 MiB 202.95 ms,
+    // 32 192.12, 64 188.56, 128 184.24, **256 181.71**, then 512 181.18, 1024
+    // 180.51 and 2047 180.04 - so 256 takes 5.4% of the block and eight times
+    // the memory past it takes 0.9% more. A fold at 825/512/1024: warm
+    // 11195 -> 10742 ms for 6803 -> 6971 MiB, and at 59 residues 414 -> 398 for
+    // 540 -> 575. **Bit-identical at both** (-121844157 and -329598), because
+    // chunking splits rows and reorders no sum. Ampere only: the cost is 168 MiB
+    // and a laptop keeps the 32 MiB constant.
+    transitionChunkBytes: 256 * 1024 * 1024,
+    // 🔴 THE PAIR-LOGITS CACHE, RE-FITTED AT 400 TOKENS. PAIR_LOGITS_CACHE_BYTES
+    // is 64 MiB and was measured at 200 tokens, where it covers all twenty-four
+    // blocks; the cache is `64 * tokens^2` a block, so it covers six at 400.
+    // A denoiser call at 400 tokens, median of eight steady calls, two rounds:
+    // 64 MiB 51.5 and 51.5 ms, 128 MiB 50.0 and 50.5, **256 MiB 47.0 and 47.5**,
+    // 512 MiB 47.0 and 47.0 - 256 caches all twenty-four at this length and 512
+    // is the same arm. **8.7% of a denoiser call for 166 MiB.** Ampere only,
+    // like the two above it.
+    pairLogitsCacheBytes: 256 * 1024 * 1024,
+    // See OPM_BLOCK_I_TOKENS: measured on THIS card, so only this card takes it.
+    opmBlockITokens: 256,
     // 🔴 AND AF3's `grid.attend` ON THE SAME UNITS, SWEPT IN THE TRUNK. It is
     // the largest pass in the pairformer and the only cubic one; measured as
     // GPU pass time over eight blocks, at 32 MSA rows, medians reproducible

@@ -207,6 +207,7 @@ async function encodeTransition(
     rows, channels, hiddenChannels, execution.transitionBufferLimit,
     execution.device.limits.minStorageBufferOffsetAlignment,
     tileRows,
+    deviceTuning(execution.device).transitionChunkBytes ?? undefined,
   );
 
   if (chunkRows === rows) {

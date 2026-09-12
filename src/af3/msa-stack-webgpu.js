@@ -156,15 +156,37 @@ export class Af3MsaStackGpu {
       compiling.push(compile(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
     };
 
+    const opmTuning = deviceTuning(this.device);
+    // See OPM_BLOCK_I_TOKENS: the shipped block of two is 1.5x SLOWER past 256
+    // tokens, on the trunk's second-largest kernel.
+    //
+    // 🔴 AND IT IS THE PRIOR'S TO SET, NOT A DERIVATION'S. This shipped for one
+    // commit as `deviceDerivationsAllowed(device) && n > OPM_BLOCK_I_TOKENS`,
+    // which applied a threshold measured on ONE card to every device including
+    // parts nobody has run it on. The five derivations this repository has all
+    // read something the DEVICE reports - its measured width, its memory budget
+    // - and 256 tokens is not that: it is where this A100's memory system turns
+    // over. `opmBlockITokens` is null everywhere but the ampere prior, so
+    // another part keeps the measured block of two until someone measures it
+    // there.
+    const blockITokens = opmTuning.opmBlockITokens;
+    const opmBlockI = opmTuning.opmBlockI
+      ?? (blockITokens != null && n > blockITokens ? 1 : null);
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
-                       pairChannels };
+                       pairChannels,
+                       ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
+                       ...(opmTuning.opmCellChunk == null
+                         ? {} : { cellChunk: opmTuning.opmCellChunk }) };
     const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
       opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
     // ...the contraction's dispatch is one workgroup per (i, j) block of token
     // pairs; see the note on its kernel.
     pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
     for (const [name, source] of Object.entries(opmSources)) {
-      into(`opm:${name}`, `${base}:opm:${name}`, source);
+      // 🔴 THE BLOCK AND THE CHUNK ARE IN THE KEY. Both change the generated
+      // WGSL and the dispatch, which is the collision docs/AF2.md records twice.
+      into(`opm:${name}`, `${base}:opm:${name}`
+        + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,
