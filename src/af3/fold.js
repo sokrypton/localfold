@@ -840,7 +840,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const firstPass = reused === undefined ? 0 : reused.recycles + 1;
   /** Per pass: how far the single and pair moved from the pass before it. */
   const recycleDeltas = [];
-  // Dimensionless; 0 disables. See src/model/feature-convergence.js.
+  // 🔴 ANGSTROMS, AND ZERO EVERYWHERE THAT IS NOT A PROBE. The page has a
+  // `tolerance` control and it is AF2's: `foldBatch`'s option list here does not
+  // name `recycleTolerance`, so a page fold never sets one. Wiring that control
+  // through would be a one-line change and would silently start dropping AF3
+  // recycles - see docs/AF3.md, where six sequences say the threshold is not
+  // calibrated yet. Do it on purpose or not at all.
   const featureTolerance = options.recycleTolerance ?? 0;
   // A resumed fold brings a real previous; a fresh one brings a zero seed.
   let hasPrevious = reused !== undefined;
