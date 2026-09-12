@@ -537,6 +537,84 @@ def main():
             hasColorBy: typeof v.colorBy === 'function',
           });
         })()"""))
+        # 🔴 AND THE PIXELS, BECAUSE THE TWO PROBES ABOVE CANNOT SEE THE
+        # COLOUR. `bfactor` says the values parsed and `colour` says the mode
+        # the renderer holds; neither says what reached the canvas, and the
+        # note above records this being reported with both of them passing.
+        # A pLDDT ramp over a real fold is a SPREAD - blue where the model is
+        # sure, orange where it is not - so what is asked is that the drawn
+        # colours VARY, and that the frame the page lands on is the one with
+        # the confidence head's answer on it.
+        print("drawn :", cdp.evaluate(ws, """(() => {
+          const reg = window.py2dmol_viewers || {};
+          const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+          if (!v) return 'no viewer';
+          const cv = v.canvas;
+          const c2 = document.createElement('canvas');
+          c2.width = cv.width; c2.height = cv.height;
+          c2.getContext('2d').drawImage(cv, 0, 0);
+          const d = c2.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+          const seen = new Map();
+          for (let i = 0; i < d.length; i += 4) {
+            if (d[i] > 240 && d[i + 1] > 240 && d[i + 2] > 240) continue;
+            const key = (d[i] >> 4) + ',' + (d[i + 1] >> 4) + ',' + (d[i + 2] >> 4);
+            seen.set(key, (seen.get(key) || 0) + 1);
+          }
+          const frames = v.objectsData[v.currentObjectName].frames;
+          const at = v.currentFrame;
+          const bs = Array.from(frames[at]?.plddts || []);
+          // 🔴 AND THE RAMP IS FOLLOWING THE VALUES, WHICH A COLOUR COUNT
+          // CANNOT SAY. Shading and outlines make hundreds of buckets out of
+          // ONE scheme, so "many colours" is not "coloured by pLDDT". What
+          // separates them is that the second-to-last frame is UNMEASURED -
+          // written with a zero B-factor on purpose - so under a pLDDT ramp it
+          // must not look like the finished structure, whose pLDDT here spans
+          // 57 to 81. Under chain colours the two are identical.
+          // 🔴 THE CANVAS TRAILS THE RENDER, so one read after one render is
+          // not the picture. Measured with CDP screenshots on py2Dmol's own
+          // page: stepping 15 -> 14 -> 15, the third capture returns the
+          // SECOND frame's bytes while the palette is provably right at every
+          // step - so a synchronous read reports the previous frame's colours
+          // and "the colour did not change" is indistinguishable from "I read
+          // too early". This reads, waits a frame, reads again and keeps the
+          // second, which is the settled one.
+          const sample = () => {
+            const cv2 = v.canvas;
+            const t = document.createElement('canvas');
+            t.width = cv2.width; t.height = cv2.height;
+            t.getContext('2d').drawImage(cv2, 0, 0);
+            const q = t.getContext('2d').getImageData(0, 0, cv2.width, cv2.height).data;
+            let r = 0, g = 0, b = 0, n = 0;
+            for (let i = 0; i < q.length; i += 4) {
+              if (q[i] > 240 && q[i + 1] > 240 && q[i + 2] > 240) continue;
+              r += q[i]; g += q[i + 1]; b += q[i + 2]; n += 1;
+            }
+            return n === 0 ? null : [Math.round(r / n), Math.round(g / n), Math.round(b / n), n];
+          };
+          const mean = () => { sample(); return sample(); };
+          const last = frames.length - 1;
+          v.setFrame(last); v.render('probe-last');
+          const inkLast = mean();
+          v.setFrame(Math.max(0, last - 1)); v.render('probe-prev');
+          const inkPrev = mean();
+          v.setFrame(last); v.render('probe-back');
+          const prevB = Array.from(frames[Math.max(0, last - 1)]?.plddts || []);
+          return JSON.stringify({
+            frame: at, lastFrame: last,
+            onLast: at === last,
+            plddtOfDrawnFrame: bs.length === 0 ? 'missing'
+              : {min: Math.min(...bs).toFixed(1), max: Math.max(...bs).toFixed(1)},
+            plddtOfPrev: prevB.length === 0 ? 'missing'
+              : {min: Math.min(...prevB).toFixed(1), max: Math.max(...prevB).toFixed(1)},
+            inkedBuckets: seen.size,
+            meanInkLast: inkLast, meanInkPrev: inkPrev,
+            // the unmeasured frame and the finished one must not paint the same
+            followsPlddt: !(inkLast && inkPrev
+              && Math.abs(inkLast[0] - inkPrev[0]) < 6
+              && Math.abs(inkLast[1] - inkPrev[1]) < 6
+              && Math.abs(inkLast[2] - inkPrev[2]) < 6),
+          });
+        })()"""))
         print("panel :", cdp.evaluate(ws, """(() => {
           const c = document.getElementById('heatmapContainer');
           return JSON.stringify({
@@ -850,6 +928,86 @@ def main():
             # (a merge of two objects has no PAE by construction). Fixed in
             # py2Dmol's clearAllObjects; asserted here because this is the only
             # place that restores a real session in a real browser.
+            # 🔴 AND THE RESTORED STRUCTURE IS STILL COLOURED BY ITS pLDDT.
+            # The frames come back with their B-factors, but what a reader sees
+            # is the SCHEME applied to the frame the page lands on - and the
+            # restored prediction's own `confidence.plddt` is recovered from
+            # the frames by `matricesFromFrames`, which walked them forwards
+            # and so took frame 0's deliberate zeros. Reported as the pLDDT not
+            # being saved on the last frame.
+            print("redrawn:", cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+              if (!v) return 'no viewer';
+              const frames = v.objectsData[v.currentObjectName].frames;
+              const last = frames.length - 1;
+              const bs = Array.from(frames[last]?.plddts || []);
+              // see the note on `mean` in the fold probe above: the canvas
+              // trails the render, so the read is taken twice and the second
+              // one is the answer.
+              const sample = () => {
+                const cv = v.canvas;
+                const t = document.createElement('canvas');
+                t.width = cv.width; t.height = cv.height;
+                t.getContext('2d').drawImage(cv, 0, 0);
+                const q = t.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+                let r = 0, g = 0, b = 0, n = 0;
+                for (let i = 0; i < q.length; i += 4) {
+                  if (q[i] > 240 && q[i + 1] > 240 && q[i + 2] > 240) continue;
+                  r += q[i]; g += q[i + 1]; b += q[i + 2]; n += 1;
+                }
+                return n === 0 ? null : [Math.round(r / n), Math.round(g / n), Math.round(b / n), n];
+              };
+              const mean = () => { sample(); return sample(); };
+              const trace = [];
+              const step = (to, tag) => {
+                v.setFrame(to);
+                trace.push(tag + ' plddtNeedUpdate=' + v.plddtColorsNeedUpdate
+                  + ' rendererPlddt=' + (v.plddts && v.plddts.length
+                      ? Math.min(...v.plddts).toFixed(0) + '-' + Math.max(...v.plddts).toFixed(0)
+                      : 'none')
+                  + ' segs=' + (v.segmentIndices || []).length
+                  + ' palette=' + (v.plddtColors ? v.plddtColors.length : 'none'));
+                v.render('restored-' + tag);
+                return mean();
+              };
+              const extra = {isPlaying: v.isPlaying, useGPU: !!v.useGPU,
+                             merged: !!v.multiState?.enabled};
+              const inkLast = step(last, 'last');
+              const inkPrev = step(Math.max(0, last - 1), 'prev');
+              // 🔴 WHICH STAGE IS STUCK. If marking the palette stale by hand
+              // makes the picture follow, the invalidation is what the restore
+              // lost; if only a mesh invalidate does it, the palette upload is.
+              v.plddtColorsNeedUpdate = true;
+              v.render('forced-palette');
+              const inkForcedPalette = mean();
+              if (window.py2dmolCartoonGPU) window.py2dmolCartoonGPU.invalidate();
+              v.render('forced-mesh');
+              const inkForcedMesh = mean();
+              step(last, 'back');
+              return JSON.stringify({
+                frames: frames.length, colorMode: v.colorMode,
+                // ...per FRAME, because "the last frame kept its values" says
+                // nothing about whether the frames still differ from each
+                // other - and identical ink with different values is a colour
+                // that is not being recomputed, which is a different fault
+                // from a value that was lost.
+                perFrame: frames.map((f, i) => {
+                  const a = Array.from(f.plddts || []);
+                  return a.length === 0 ? i + ':none'
+                    : i + ':' + Math.min(...a).toFixed(0) + '-' + Math.max(...a).toFixed(0);
+                }).join(' '),
+                plddtOfLast: bs.length === 0 ? 'missing'
+                  : {min: Math.min(...bs).toFixed(1), max: Math.max(...bs).toFixed(1)},
+                meanInkLast: inkLast, meanInkPrev: inkPrev,
+                inkForcedPalette, inkForcedMesh,
+                extra, trace,
+                followsPlddt: !(inkLast && inkPrev
+                  && Math.abs(inkLast[0] - inkPrev[0]) < 6
+                  && Math.abs(inkLast[1] - inkPrev[1]) < 6
+                  && Math.abs(inkLast[2] - inkPrev[2]) < 6),
+              });
+            })()"""))
             shown_back = (back.get("heat") or {}).get("shown")
             if shown_back != "null":
                 print("FAIL: a restored session came back with an explicit"

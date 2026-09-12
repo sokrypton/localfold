@@ -3963,8 +3963,30 @@ function matricesFromFrames(renderer) {
     if (out.contactProbs === undefined && frame.maps?.contact !== undefined) {
       out.contactProbs = decode(frame.maps.contact);
     }
-    if (out.plddt === undefined && frame.plddts?.length > 0) {
-      out.plddt = Float32Array.from(frame.plddts);
+  }
+  // 🔴 THE pLDDT IS THE LAST FRAME'S, AND WALKING FORWARDS TOOK THE FIRST
+  // FRAME'S ZEROS. The confidence head runs ONCE, on the finished structure,
+  // so every frame before it is unmeasured and is written with a ZERO
+  // B-factor on purpose (see the note in af3-model.js: "a frame whose
+  // confidence is not known is coloured as zero"). Those zeros are a
+  // full-length array, so `plddts?.length > 0` was satisfied by frame 0 and
+  // the loop above never reached the answer.
+  //
+  // Measured on a real AF3 fold: frame `flow_0` is 58 values all 0.0 and
+  // `final` spans 56.9 to 80.6, so a restored prediction's pLDDT was 58 zeros
+  // - which makes `fraction_disordered` 1.0 in the archive it writes back
+  // (the threshold is 50) and gives `fullDataJson` an all-zero `atom_plddts`
+  // to choose on.
+  //
+  // The maps above are the opposite case and stay as they are: the contact map
+  // is carried ONCE, on frame 0, and the PAE is on the first and the last and
+  // is the same matrix either way - so for those the first match IS the
+  // answer. This one has a direction because the quantity does.
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const plddts = frames[index]?.plddts;
+    if (plddts?.length > 0) {
+      out.plddt = Float32Array.from(plddts);
+      break;
     }
   }
   return out;
