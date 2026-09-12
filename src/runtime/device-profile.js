@@ -289,6 +289,13 @@ export const DEFAULT_TUNING = Object.freeze({
   // transitions are 263 of an 825-residue block's 339 dispatches, which is a
   // different question. null takes the constant.
   transitionChunkBytes: null,
+  // 🔴 HOW MANY BYTES OF CACHED PAIR ATTENTION BIAS A SCHEDULE MAY HOLD,
+  // overriding PAIR_LOGITS_CACHE_BYTES. That constant's 64 MiB was measured at
+  // 200 TOKENS, where it covers all twenty-four blocks; the cache is
+  // `64 * tokens^2` bytes a block, so it covers six at 400 and about three at
+  // 512 - the same shape as transitionChunkBytes, a cap fitted where it
+  // happened to cover the whole workload. null takes the constant.
+  pairLogitsCacheBytes: null,
   attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
@@ -567,6 +574,15 @@ const PRIORS = new Map([
     // chunking splits rows and reorders no sum. Ampere only: the cost is 168 MiB
     // and a laptop keeps the 32 MiB constant.
     transitionChunkBytes: 256 * 1024 * 1024,
+    // 🔴 THE PAIR-LOGITS CACHE, RE-FITTED AT 400 TOKENS. PAIR_LOGITS_CACHE_BYTES
+    // is 64 MiB and was measured at 200 tokens, where it covers all twenty-four
+    // blocks; the cache is `64 * tokens^2` a block, so it covers six at 400.
+    // A denoiser call at 400 tokens, median of eight steady calls, two rounds:
+    // 64 MiB 51.5 and 51.5 ms, 128 MiB 50.0 and 50.5, **256 MiB 47.0 and 47.5**,
+    // 512 MiB 47.0 and 47.0 - 256 caches all twenty-four at this length and 512
+    // is the same arm. **8.7% of a denoiser call for 166 MiB.** Ampere only,
+    // like the two above it.
+    pairLogitsCacheBytes: 256 * 1024 * 1024,
     // 🔴 AND AF3's `grid.attend` ON THE SAME UNITS, SWEPT IN THE TRUNK. It is
     // the largest pass in the pairformer and the only cubic one; measured as
     // GPU pass time over eight blocks, at 32 MSA rows, medians reproducible

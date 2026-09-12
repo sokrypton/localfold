@@ -1933,3 +1933,44 @@ fold unmoved because it is compilation and weights. Take the change - it is
 free, and it is a kernel running at four times its old rate - but do not quote
 the trunk figure as a fold figure. This is the distinction docs/PERF.md keeps
 making about `--profile`: a share of a stage is not a share of a wall.
+
+## The pair-logits cache was fitted at 200 tokens, and covers a quarter at 400
+
+`PAIR_LOGITS_CACHE_BYTES` is 64 MiB and its own note says the cache is
+`64 x tokens^2` bytes a block - so at the 200 tokens it was measured at it
+covers **all twenty-four blocks**, and at 400 it covers **six**. That is the
+same shape as AF2's `TRANSITION_CHUNK_TARGET_BYTES` (docs/AF2.md): a byte cap
+fitted where it happened to cover the whole workload, found by parsing every
+`export const` in `src/` for a comment that cites only a short length.
+
+`pairLogitsCacheBytes` is the knob now, null taking the constant.
+`bench-head.js --tokens=400 --calls=9 --model=/model-af3-int5/manifest.json`,
+median of the eight steady calls, two rounds:
+
+| | round 1 | round 2 |
+|---|---:|---:|
+| 64 MiB (the constant) | 51.5 ms | 51.5 |
+| 128 MiB | 50.0 | 50.5 |
+| **256 MiB** | **47.0** | **47.5** |
+| 512 MiB | 47.0 | 47.0 |
+
+**8.7% of a denoiser call**, and 256 is the knee because 24 blocks of 10.24 MiB
+is 246 MiB - 512 buys nothing because it caches the same twenty-four.
+
+🔴 **AND AT THE PAGE'S DEFAULT IT IS WORTH ABOUT 1.5%, WHICH IS THE HONEST
+NUMBER.** `AF3_COUNTS.flow` prefers **16** steps, so the sampler is about 0.8 s
+of a 4.5 s fold and a whole fold reads **4.5 s on both arms** - the saving is
+under the resolution of that clock. It is the diffusion mode, whose dial reaches
+**200** steps because that is what AF3 was trained with, where 8.7% of a call
+becomes about 0.9 s. Peak goes **1457.7 -> 1623.8 MiB** at 400 tokens.
+
+Set in the **ampere prior only**, beside `opmPairBlockBytes` and
+`transitionChunkBytes`, which is now three 256 MiB caps on a 40 GB card.
+
+**Bit-exact, and checked with the right instrument.** A cache of a recomputed
+value cannot change an answer unless it goes stale, and
+`tools/diff-fold-coords.py --b='--tune-json={"pairLogitsCacheBytes":67108864}'`
+says so: **574/574 atoms identical, max |dx| 0.000000 A**. 🔴 The first attempt
+to check it compared two PDB captures that were both EMPTY - `fold.js --folds=1`
+prints JSON and the grep matched nothing - and reported "STRUCTURE IDENTICAL",
+which is this repository's "a gate that cannot fail is not a gate" in one line.
