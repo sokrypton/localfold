@@ -283,6 +283,9 @@ export async function main(device, args) {
     residentWeights: args.includes("--no-resident") ? false
       : args.includes("--resident") ? true : undefined,
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
+    // OpenDDE runs src/af3/fold.js, so it inherits the trunk-only convergence
+    // criterion; 0 is off. See src/model/feature-convergence.js.
+    recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
     onStep: ({ step, denoised, structuralDenoised }) => {
       // 🔴 THE GEOMETRY OF THE FRAME, NOT JUST ITS SIZE. `frameGyration` says a

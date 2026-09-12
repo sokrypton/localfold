@@ -2011,3 +2011,85 @@ the 59-token case, where one wins by 1.9 ms. A trunk pass at 400 tokens is
 (`opm.contract` 39.08 ms, the block-of-two path). Bit-exact where it fires:
 `diff-fold-coords.py --sequence=<400> --b='--tune-json={"opmBlockI":2}'` gives
 **3046/3046 atoms identical, max |dx| 0.000000 A**.
+
+## A recycle criterion for a trunk that returns no structure
+
+AF2 stops recycling on ColabFold's `compute_tol` - the RMS change of every
+C-alpha pair distance - and `src/model/recycle-convergence.js` implements it.
+**AF3 has no early stop at all**, and the reason is structural rather than an
+oversight: `src/af3/fold.js`'s recycle loop is a bare `for (let pass = firstPass;
+pass <= recycles; pass += 1)` because AF2 recycles a STRUCTURE and AF3 recycles
+the single and pair representations alone, running the sampler once at the end.
+There are no coordinates to compare until every recycle is already paid for.
+OpenDDE runs the same fold; ESMFold2 has its own recycle path and does not.
+
+So the only signal is the representation. `src/model/feature-convergence.js` is
+the metric - relative RMS change, `||b - a|| / ||b||`, dimensionless so it can
+be compared across models and token counts - and it costs nothing: the loop
+already holds `previousPair` and `previousSingle` as HOST arrays, because the
+pairformer reads them back each pass. No kernel, no readback, no device memory.
+
+`recycleDeltas` reports it per pass and `--recycle-tolerance` acts on it, **0 and
+off by default**. On the 68-token default input:
+
+| pass | pair | single |
+|---:|---:|---:|
+| 0 | 1 (the zero seed) | 1 |
+| 1 | 0.0725 | 0.0554 |
+| 2 | 0.0159 | 0.0070 |
+| 3 | 0.0045 | 0.0023 |
+
+Monotone, and decaying about 4x a pass. `--recycles=3 --recycle-tolerance=0.02`
+runs three passes instead of four, 2.243 s -> 2.067 s.
+
+🔴 **AND THE OBVIOUS WAY TO CALIBRATE IT DOES NOT WORK, WHICH IS THE FINDING.**
+The natural experiment is to fold at 0, 1, 2 and 3 recycles and see where the
+STRUCTURE stops moving. Done that way the 68-token input reads 0.551, 0.120,
+0.076 and 0 A against the deepest fold, which looks like convergence by recycle
+1. It is not a measurement of the trunk. **The sampler is stochastic, so the
+control is to vary the seed and hold the recycles fixed** - and superposed, at
+three recycles:
+
+| | sampler noise, same trunk | recycle 2 vs 3 |
+|---|---|---|
+| 68 tokens, pLDDT 87.5 | **0.133 - 0.294 A** | **0.023 A** |
+| 250 tokens, pLDDT 42 | **4.580 - 12.702 A** | 3.265 A |
+
+**At both confidence levels the recycle-to-recycle difference is at or below the
+sampler's own noise**, by an order of magnitude at high confidence. A structure
+RMSD cannot resolve one recycle count from another on a diffusion model, so it
+cannot calibrate a criterion either, and the reading that suggested it could was
+noise.
+
+🔴 **AND THE FIRST VERSION OF THAT CONTROL WAS WRONG TOO, IN THE OTHER
+DIRECTION.** Unsuperposed, the seed-to-seed numbers are 7.4 to 15.1 A at
+pLDDT 87.5, which reads as chaos. Two folds of the same molecule are in
+arbitrary rigid-body poses: different seeds start from different noise and there
+is no canonical frame. Same-SEED comparisons share one, which is why the recycle
+sweep gave small numbers without alignment and why mixing the two designs is a
+trap. Kabsch first, always, unless the seed is held.
+
+pLDDT is better behaved but not clean either - its own seed spread is 0.520 at
+68 tokens and 1.146 at 250, against recycle spreads of 1.707 and 7.747. Usable
+at 3-7x the noise, and not a fine instrument.
+
+**What IS deterministic is the trunk.** The pair delta reads 0.0479 on all three
+seeds of the 250-token input, to four figures, because only the sampler is
+stochastic. That is the whole argument for measuring convergence on the
+representation rather than on what comes out of it.
+
+🔴 **AND THE FIRST PASS'S SEED IS NOT THE RIGHT SHAPE, WHICH THE GATE CAUGHT.**
+The loop seeds `previousPair` with `tokens^2 * 128` zeros - AF3's pair width -
+and OpenDDE's pair is 384 wide, so the two differ by exactly 3x and a strict
+comparison raised `feature convergence over 591872 and 1775616 elements` on a
+model that had folded a moment earlier. The strictness is worth keeping for the
+passes that DO compare, so pass 0 is reported as 1 rather than measured: it has
+no previous by construction, which the zero seed was only ever standing in for.
+
+🔴 **SO THE TOLERANCE IS NOT CALIBRATED AND SHIPS AT ZERO.** What a number means
+has been measured on two inputs, one of which is a synthetic repeat the model
+never converges on - and the quantity that would calibrate it is unusable. The
+next instrument is the DISTOGRAM: it is computed per pass from the pair
+representation, it is deterministic, and every pass already has one. Comparing
+distograms across passes measures what the trunk did without asking the sampler
+anything.

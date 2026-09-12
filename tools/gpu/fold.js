@@ -558,6 +558,10 @@ export async function main(device, args) {
     accumulatePrecision: option(args, "accumulate", undefined),
     mode: samplerMode,
     recycles: Number(option(args, "recycles", "0")),
+    // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE. 0 is off; see
+    // src/model/feature-convergence.js and docs/AF3.md for what a number here
+    // has been measured to mean, which is two inputs' worth and not a corpus.
+    recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {
@@ -776,6 +780,14 @@ export async function main(device, args) {
       .sort((a, b) => b[1] - a[1])),
     sequence: batch.sequence, tokens: batch.tokens, steps,
     denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
+    // Per recycle, how far the trunk's single and pair moved from the pass
+    // before. A trunk-only recycle produces no coordinates, so this is the only
+    // convergence signal there is - see src/model/feature-convergence.js.
+    recycleDeltas: result.recycleDeltas?.map((d) => ({
+      pass: d.pass,
+      pair: Number(d.pair.toExponential(3)),
+      single: Number(d.single.toExponential(3)),
+    })),
     meanPlddt: result.meanPlddt,
     ptm: result.ptm,
     iptm: Number.isNaN(result.iptm) ? null : result.iptm,

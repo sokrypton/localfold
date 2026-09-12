@@ -26,6 +26,8 @@
  * were made with.
  */
 import { ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { relativeChange, shouldStopRecycling }
+  from "../model/feature-convergence.js";
 import { af3ContactClasses } from "./contact-classes.js";
 import { perAtomConditioning } from "./atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
@@ -836,6 +838,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
   let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
   let previousSingle = trunk?.single ?? new Float32Array(tokens * 384);
   const firstPass = reused === undefined ? 0 : reused.recycles + 1;
+  /** Per pass: how far the single and pair moved from the pass before it. */
+  const recycleDeltas = [];
+  // Dimensionless; 0 disables. See src/model/feature-convergence.js.
+  const featureTolerance = options.recycleTolerance ?? 0;
+  // A resumed fold brings a real previous; a fresh one brings a zero seed.
+  let hasPrevious = reused !== undefined;
   for (let pass = firstPass; pass <= recycles; pass += 1) {
     await stage("recycle", { pass, passes: recycles + 1 });
     // 🔴 THE WHOLE ALIGNMENT, NOT ITS FIRST ROW. This passed `sequences: 1` and
@@ -892,8 +900,40 @@ export async function foldBatch(device, batch, weights, options = {}) {
       onPairformerBlockDone: (completed, total) =>
         stage("pairformer-block-done", { completed, total, pass, passes: recycles + 1 }),
     });
+    // 🔴 THE ONLY CONVERGENCE SIGNAL THIS MODEL HAS. AF2 recycles a STRUCTURE
+    // and stops on ColabFold's C-alpha metric (src/model/recycle-convergence.js);
+    // AF3, OpenDDE and ESMFold2 recycle the trunk alone and produce no
+    // coordinates until the sampler runs once at the end, so the single and
+    // pair representations are all there is to ask. Both are already host
+    // arrays here - the pairformer reads them back each pass - so this costs
+    // arithmetic and no kernel, no readback and no extra device memory.
+    //
+    // Reported, not acted on: what a tolerance should be is a measurement, and
+    // `recycleDeltas` is how it gets taken.
+    // 🔴 PASS 0 HAS NO PREVIOUS, AND ITS SEED IS NOT EVEN THE RIGHT SHAPE. The
+    // loop seeds `previousPair` with `tokens^2 * 128` zeros, which is AF3's
+    // pair width - OpenDDE's is 384, so the two differ by exactly 3x and a
+    // strict comparison raises. That strictness is worth keeping for the
+    // passes that DO compare, so the first pass is reported as 1 - everything
+    // changed - rather than measured.
+    const comparable = hasPrevious && previousPair.length === trunk.pair.length
+      && previousSingle.length === trunk.single.length;
+    recycleDeltas.push({
+      pass,
+      pair: comparable ? relativeChange(previousPair, trunk.pair) : 1,
+      single: comparable ? relativeChange(previousSingle, trunk.single) : 1,
+    });
+    hasPrevious = true;
     previousPair = trunk.pair;
     previousSingle = trunk.single;
+    // 🔴 OFF UNLESS ASKED, like AF2's. A tolerance that fires is a fold with
+    // fewer trunk passes than the caller requested, and what the right number
+    // is has been measured on two inputs and not on a corpus - see docs/AF3.md.
+    if (shouldStopRecycling(pass, recycleDeltas[recycleDeltas.length - 1],
+                            featureTolerance)) {
+      await stage("recycle-converged", { pass, passes: recycles + 1 });
+      break;
+    }
     // 🔴 EVERY PASS HAS ITS OWN DISTOGRAM, so the contact map can be shown
     // while the trunk is still recycling rather than only at the end. The
     // head runs per pass regardless - this only hands the result up. A page
@@ -1210,6 +1250,10 @@ export async function foldBatch(device, batch, weights, options = {}) {
 
   return {
     positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
+    // Per pass, how far the single and pair moved from the pass before. The
+    // only convergence signal a trunk-only recycle has - see
+    // src/model/feature-convergence.js.
+    recycleDeltas,
     // ...the representative coordinates the confidence head was given. Returned
     // because anything comparing a per-pair prediction against the PAE needs
     // the SAME points the PAE is about, and recomputing them is a second
