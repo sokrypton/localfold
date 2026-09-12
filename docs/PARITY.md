@@ -14,9 +14,9 @@ point. What follows is what it took to make the suite able to fail.
 
 | | then | now |
 |---|---:|---:|
-| comparing anything at all | 2 | **19** |
-| passing | 2 | 18 |
-| genuinely failing | 0 (invisible) | 1 |
+| comparing anything at all | 2 | **20** |
+| passing | 2 | **20** |
+| genuinely failing | 0 (invisible) | 0 |
 | blocked, comparing nothing | 19 | 0 |
 
 **Three causes, and only one of them was a missing input.**
@@ -59,12 +59,25 @@ reaches them. Three separate checkers were affected:
   point of that file: a permissive template mask once scored relRMS 1.09 against
   AF3. All five run and pass both ways now.
 
-**The one real failure left** is `check-af3-msa-block`'s vector arm at 1.18e-5,
-35.8x an envelope this file had to be given. It is fully f32, no knob moves it,
-`--no-prior` does not move it, the outer product mean alone reads 5.88e-7 at
-that shape and the MSA track reads 4.65e-6 - so it is the pair composition. It
-saturates with MSA depth (2.30e-6 / 1.18e-5 / 1.11e-5 at 4 / 16 / 64) and has
-drifted 1.65x from the 7.16e-6 docs/PERF.md records. Left failing on purpose.
+🔴 **AND THE LAST FAILURE WAS MY OWN ENVELOPE, NOT THE PORT.**
+`check-af3-msa-block`'s vector arm read 1.18e-5 against a bare 1e-5, and the
+first envelope I gave it perturbed the INPUT pair only - which prices ONE error
+injection where the block has SIX pair writes. The giveaway was that the ratio
+moved with the probe: 35.8x at a 1e-7 nudge, 19.7x at 6e-7. A ratio that depends
+on the instrument is an artefact of the instrument.
+
+With a control that injects at each sub-update - the trap check-af3-confidence
+had already documented - the same 1.18e-5 is **3.3x its envelope**: the ratio
+the pairformer's clean block reads, and better than the trunk's f32 arm at 5.1x.
+Every kernel in the block measures ~5e-7 alone (`probe-confidence-kernels.js
+--stack=msa`) and the outer product mean 5.88e-7, so six of those through one
+block IS 1.18e-5. The bound follows the envelope now, by check-af3-block's own
+f32 rule, with the absolute floor kept.
+
+So the suite is **20 of 20**. The honest reading of the day is that one of the
+five failures it surfaced was the checker's own resolution and four were real -
+and that telling those apart needed the envelope to be built correctly, not the
+bound to be argued about.
 
 **Method worth keeping, from the reference's own week:** their 14 regressed
 cells were each recorded OK by their own gate, because each scales by

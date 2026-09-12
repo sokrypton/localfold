@@ -36,7 +36,7 @@ import {
 import { Af3TransitionGpu } from "../../src/af3/transition-webgpu.js";
 import { Af3PairformerStackGpu } from "../../src/af3/pairformer-block-webgpu.js";
 import {
-  af3Dialect, confidenceWeights, openAf3Store, pairformerBlockWeights,
+  af3Dialect, confidenceWeights, msaBlockWeights, openAf3Store, pairformerBlockWeights,
 } from "../../src/af3/weights.js";
 
 const option = (args, name, fallback) => {
@@ -81,8 +81,15 @@ export async function main(device, args) {
   const dialect = option(args, "dialect", "checker") === "store"
     ? af3Dialect(store) : { swapTransposedBias: false };
 
+  // 🔴 THREE STACKS RUN THIS PAIR TRACK AND THEY ARE NOT INTERCHANGEABLE. The
+  // MSA arm exists because check-af3-msa-block's VECTOR arm - fully f32, no
+  // knob and no `--no-prior` moving it - reads 1.18e-5 at 35.8x its envelope
+  // while its MSA track reads 4.65e-6 and the outer product mean alone reads
+  // 5.88e-7. Same question as the confidence head's: is any one kernel wrong,
+  // or is it the composition?
   const block = which === "confidence"
     ? (await confidenceWeights(store)).blocks[at]
+    : which === "msa" ? await msaBlockWeights(store, at)
     : await pairformerBlockWeights(store, at);
   const channels = block.pairChannels;
   const pairs = n * n;
@@ -149,7 +156,8 @@ export async function main(device, args) {
   // composition is the remaining suspect and this is the arm that says so:
   // one GPU block against the reference's own block, on the SAME real weights
   // the stack runs, rather than the hand-built dict check-af3-block.js types in.
-  if (option(args, "level", "both") !== "kernel" && singleChannels !== undefined) {
+  if (option(args, "level", "both") !== "kernel" && singleChannels !== undefined
+      && block.singleAttention !== undefined) {
     const single = deterministic(n * singleChannels, 11);
     const state = { pair, single, pairMask: mask, seqMask, tokens: n };
     const expected = pairformerBlock(state, block, dialect);
