@@ -113,6 +113,14 @@ export async function main(device, args) {
   const blockWeights = async (index) => {
     const at = (leaf) => blockSlice(leaf, index);
     return {
+      // 🔴 PER-BLOCK DIALECT FLAGS, WHICH diffusion-weights.js SETS AND A
+      // HAND-BUILT DICT MUST TOO. `crossAttentionBlock` refuses to default
+      // either: AF3 normalises the raw activation on both sides where OpenDDE
+      // CHAINS them, and AF3 leaves padded keys to the mask where OpenDDE
+      // excludes them from the offset validity. Both are false for the two
+      // dialects these checkers sweep; only OPENDDE sets them true.
+      chainedAtomLayerNorm: false,
+      keyMaskedAtomAttention: false,
       qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
       qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
       qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
@@ -159,6 +167,14 @@ export async function main(device, args) {
     embedTrunkPairCond: await T(`${HEAD}/diffusion_embed_trunk_pair_cond/weights`),
     atomPositionsToFeatures: await T(`${HEAD}/diffusion_atom_positions_to_features/weights`),
     projectAtomFeaturesForAggr: await T(`${HEAD}/diffusion_project_atom_features_for_aggr/weights`),
+    // 🔴 THE FLAG IS THE DIALECT'S, AND OMITTING IT STOPPED THE CHECKER DEAD.
+    // `atomPairLogits` refuses to default `pairNormPerBlock` - AF3 normalises
+    // the atom-pair conditioning ONCE for the stack and OpenDDE once per block,
+    // and defaulting would silently run AF3's shape on an OpenDDE bundle, which
+    // is a plausible encoder. Both dialects this file sweeps have it false;
+    // only OPENDDE sets it true. A hand-built weight dict has to carry it the
+    // way diffusion-weights.js does.
+    pairNormPerBlock: false,
     blocks: [await blockWeights(0), await blockWeights(1), await blockWeights(2)],
   };
 
