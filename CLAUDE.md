@@ -1314,4 +1314,5 @@ because the numbers are the point - a claim here without one is a guess.
 | `docs/OPENDDE.md` | the OpenDDE port, and the place to START on it: two token spaces, its own confidence head, the gates it must hold, and what is open |
 | `docs/HOSTING.md` | the weights are on Hugging Face, not Pages: how a bundle names its remote, and why a bundle wants more shards than connections |
 | `docs/DEVELOPING.md` | the older orientation notes |
+| `docs/PARITY.md` | 🔴 **NINETEEN OF TWENTY-ONE AF3 CHECKERS DO NOT RUN ON THIS BOX** - they 404 on a bundle or a dump rather than compare anything, so a suite run reads as twenty-one things that did not object. Also the reference's level matrix (L0-L6), the two ideas worth copying from it, and the eighteen models it runs against this port's four |
 | `docs/HANDOFF.md` | the pLDDT-from-distogram attempt whose code was deleted, kept so the next attempt does not repeat it |
