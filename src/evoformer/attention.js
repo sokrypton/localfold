@@ -1621,12 +1621,18 @@ export function selectAttentionFlashKernel(
     const input = storage.input ?? "f32";
     const output = storage.output ?? "f32";
     const value = storage.value ?? input;
+    // 🔴 THE PREFETCH IS IN THE KEY. It changes the generated WGSL and nothing
+    // else about the dispatch, which is exactly the shape of collision
+    // docs/AF2.md records twice - a key that names only the head width and the
+    // tile would hand a sweep's second arm the first arm's pipeline.
+    const prefetch = tuning.attentionMatrixPrefetch === true;
     const matrixKey = `attention:flash-matrix-${headDim}-${input}${value}${output}`
-      + `-${matrixTile.subgroups}x${matrixTile.keyTile}`;
+      + `-${matrixTile.subgroups}x${matrixTile.keyTile}${prefetch ? "-prefetch" : ""}`;
     return {
       cacheKey: matrixKey,
       shader: shaderSource(device, matrixKey,
-        () => createAttentionMatrixFlashShader(headDim, { input, value, output }, matrixTile)),
+        () => createAttentionMatrixFlashShader(headDim, { input, value, output }, matrixTile,
+          { prefetch })),
       queryTile: matrixTile.rows,
       variant: "matrix",
       packedStorageSupported: true,

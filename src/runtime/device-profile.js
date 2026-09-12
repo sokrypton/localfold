@@ -276,6 +276,14 @@ export const DEFAULT_TUNING = Object.freeze({
   // Subgroups a workgroup and keys a tile for that kernel; null takes its
   // default. Both are fixed costs the tile amortises - see attention-matrix.js.
   attentionMatrixTile: null,
+  // 🔴 THE KEY TILE'S GLOBAL READS AHEAD OF THE BARRIER, so a tile's memory
+  // latency sits underneath the tail of the previous tile's compute instead of
+  // in front of its own. The reads go to registers, the barrier moves between
+  // the read and the write, and nothing else changes. docs/A100.md recorded
+  // this as reverted on AF2 for a race; the race was in the BISECTION - see
+  // src/evoformer/attention-matrix.js on why the staging loop's trip count is
+  // not uniform at a head of eight.
+  attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
   // CUBIC one, so it leads by more on every longer chain; OpenDDE runs the same

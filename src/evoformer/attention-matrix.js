@@ -213,7 +213,8 @@ struct Parameters {
  * @param {{input?: "f32"|"f16", value?: "f32"|"f16", output?: "f32"|"f16"}} [storage]
  *   how the projected tensors are held; the same three the register kernel takes.
  */
-export function createAttentionMatrixFlashShader(headDim, storage = {}, geometry) {
+export function createAttentionMatrixFlashShader(headDim, storage = {}, geometry,
+                                                 options = {}) {
   if (!Number.isSafeInteger(headDim) || headDim % 4 !== 0 || headDim > 32 || headDim < 4) {
     throw new RangeError(`matrix attention takes a head of 4 to 32 channels; got ${headDim}`);
   }
@@ -263,30 +264,62 @@ export function createAttentionMatrixFlashShader(headDim, storage = {}, geometry
   const own = "workgroupBarrier();";
   const lines = (n, body) => Array.from({ length: n }, (_, i) => body(i)).join("\n");
 
+  // 🔴 THE STAGING LOOP'S TRIP COUNT IS NOT UNIFORM, AND THAT HAS COST A
+  // MEASUREMENT ONCE ALREADY. `KEYS * HD4` is 256 at a head of 32 and 128 at a
+  // head of 16 - two whole passes and one, for every one of the ${LANES} lanes
+  // - but an AF2 fold also compiles this kernel at a head of EIGHT, where it is
+  // 64 and only the first half of the workgroup enters the loop at all. So:
+  //   - a `workgroupBarrier()` inside this loop is in NON-UNIFORM control flow,
+  //     which is undefined behaviour and not a slow path;
+  //   - and unrolling it to a fixed two iterations without the guard writes
+  //     `ki` up to 63 into arrays that hold KEYS = ${KEYS}.
+  // docs/A100.md records "AF2's matrix flash attention has a race" from a
+  // bisection that did the second of those. Both reproduce as a fold that
+  // differs run to run, and neither is a race in the shipped kernel.
+  const steps = Math.ceil((KEYS * vectors) / LANES);
+  const stageGuard = (n, body) => `    {
+      let i = local + ${n * LANES}u;
+${KEYS * vectors <= n * LANES + LANES && KEYS * vectors % LANES === 0
+    ? `      {
+${body}
+      }` : `      if (i < KEYS * HD4) {
+${body}
+      }`}
+    }`;
+  // Reading the tile into registers BEFORE the barrier puts its memory latency
+  // underneath the tail of the previous tile's compute; the barrier still
+  // stands between the read and the workgroup write it has to protect, and it
+  // stands at the tile body's top level, where every lane reaches it.
+  const prefetch = options.prefetch === true;
+  const readTile = (checked) => lines(steps, (n) => stageGuard(n, `        let ki = i / HD4;
+        let c4 = i % HD4;
+        let k_index = k0 + ki;
+        ${checked ? "if (k_index < p.queries) {" : "{"}
+          let at = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + c4;
+          kv[${n}u] = ${read4("key", "at")};
+          vv[${n}u] = ${readValue("at")};
+        }`));
+  const writeTile = () => lines(steps, (n) => stageGuard(n, `        let ki = i / HD4;
+        let c4 = i % HD4;
+        // The key goes in transposed and the value does not.
+        staged_kt[(c4 * 4u + 0u) * S_KEY + ki] = f16(kv[${n}u].x);
+        staged_kt[(c4 * 4u + 1u) * S_KEY + ki] = f16(kv[${n}u].y);
+        staged_kt[(c4 * 4u + 2u) * S_KEY + ki] = f16(kv[${n}u].z);
+        staged_kt[(c4 * 4u + 3u) * S_KEY + ki] = f16(kv[${n}u].w);
+        staged_v[ki * S_HEAD + c4 * 4u + 0u] = f16(vv[${n}u].x);
+        staged_v[ki * S_HEAD + c4 * 4u + 1u] = f16(vv[${n}u].y);
+        staged_v[ki * S_HEAD + c4 * 4u + 2u] = f16(vv[${n}u].z);
+        staged_v[ki * S_HEAD + c4 * 4u + 3u] = f16(vv[${n}u].w);`));
+
   // One pass over KEYS keys. The checked form is the last, partial tile; every
   // other one knows its keys are real, which is worth three instructions a key.
-  const tileBody = (checked) => `    workgroupBarrier();
-    for (var i = local; i < KEYS * HD4; i += ${LANES}u) {
-      let ki = i / HD4;
-      let c4 = i % HD4;
-      let k_index = k0 + ki;
-      var kv = vec4<f32>(0.0);
-      var vv = vec4<f32>(0.0);
-      ${checked ? "if (k_index < p.queries) {" : "{"}
-        let at = ((batch_index * p.queries + k_index) * p.heads + head) * HD4 + c4;
-        kv = ${read4("key", "at")};
-        vv = ${readValue("at")};
-      }
-      // The key goes in transposed and the value does not.
-      staged_kt[(c4 * 4u + 0u) * S_KEY + ki] = f16(kv.x);
-      staged_kt[(c4 * 4u + 1u) * S_KEY + ki] = f16(kv.y);
-      staged_kt[(c4 * 4u + 2u) * S_KEY + ki] = f16(kv.z);
-      staged_kt[(c4 * 4u + 3u) * S_KEY + ki] = f16(kv.w);
-      staged_v[ki * S_HEAD + c4 * 4u + 0u] = f16(vv.x);
-      staged_v[ki * S_HEAD + c4 * 4u + 1u] = f16(vv.y);
-      staged_v[ki * S_HEAD + c4 * 4u + 2u] = f16(vv.z);
-      staged_v[ki * S_HEAD + c4 * 4u + 3u] = f16(vv.w);
+  const tileBody = (checked) => `    for (var n = 0u; n < ${steps}u; n += 1u) {
+      kv[n] = vec4<f32>(0.0); vv[n] = vec4<f32>(0.0);
     }
+${prefetch ? "" : "    workgroupBarrier();"}
+${readTile(checked)}
+${prefetch ? "    workgroupBarrier();" : ""}
+${writeTile()}
     // 🔴 THE MASK IS PER KEY AND WAS BEING READ PER QUERY ROW. Every one of the
     // ${ROWS} rows in this workgroup read the same global float for the same
     // key, and turned it into the same additive term. Stage it once: ${KEYS}
@@ -496,6 +529,11 @@ ${HEAD === headDim ? "" : `  // ...and the padding past the head, which the cont
   // used to hand each other through the score array: 8 bytes a key a lane of
   // workgroup traffic, for a value that never leaves the lane that made it.
   var logits: array<f32, ${perHalf}>;
+  // ...and the key tile on its way from global memory into workgroup memory.
+  // The step count is a constant, so these unroll into registers; see the note
+  // above on why the loop they replace could not simply be unrolled.
+  var kv: array<vec4<f32>, ${steps}>;
+  var vv: array<vec4<f32>, ${steps}>;
 
   // 🔴 EVERYTHING THAT DOES NOT DEPEND ON THE KEY COMES OUT OF THE KEY LOOP.
   // The pair bias index was (head * queries + q) * queries + k, computed once a
