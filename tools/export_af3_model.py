@@ -48,6 +48,13 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
+# 🔴 THE REFERENCE IS af3-any-model, NOT ColabDesign2. `colabdesign2.af3.*`
+# is being replaced by sokrypton/alphafold3 on the `af3-any-model` branch, so
+# that is what the frozen constants below are read from; ColabDesign2 remains a
+# fallback only while both exist, and its path moved once already
+# (`af3.alphafold3` -> `af3.alphafold`), which is why this looks for several.
+AF3_REFERENCE = os.path.expanduser(
+    os.environ.get("LOCALFOLD_AF3_REFERENCE", "~/alphafold3"))
 COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # One blob per model, each obtained from source and checked against the graph's
 # own jax.eval_shape table before use.
@@ -270,9 +277,35 @@ def stock_fourier_constants():
     """
     if COLABDESIGN2 not in sys.path:
         sys.path.insert(0, COLABDESIGN2)
-    from colabdesign2.af3.alphafold3.model.network import (  # noqa: E402
-        noise_level_embeddings,
-    )
+    # 🔴 THE PACKAGE PATH MOVED AND THIS WENT STALE: ColabDesign2 renamed
+    # `af3.alphafold3` to `af3.alphafold`, so the exporter raised
+    # ModuleNotFoundError on a box that HAS the package - which reads as "the
+    # dependency is missing" and is "the dependency moved". Both are tried, and
+    # the error names both rather than whichever was attempted last.
+    noise_level_embeddings = None
+    attempted = []
+    # af3-any-model first: it is the reference. Its package is `alphafold3`
+    # under src/, so the checkout root goes on the path with /src appended.
+    for root in (os.path.join(AF3_REFERENCE, "src"), AF3_REFERENCE, COLABDESIGN2):
+        if root and os.path.isdir(root) and root not in sys.path:
+            sys.path.insert(0, root)
+    for module in ("alphafold3.model.network",
+                   "colabdesign2.af3.alphafold.model.network",
+                   "colabdesign2.af3.alphafold3.model.network"):
+        attempted.append(module)
+        try:
+            noise_level_embeddings = __import__(
+                f"{module}.noise_level_embeddings", fromlist=["noise_level_embeddings"])
+            break
+        except ModuleNotFoundError:
+            continue
+    if noise_level_embeddings is None:
+        raise ModuleNotFoundError(
+            "the noise-level Fourier constants are in none of "
+            + ", ".join(attempted)
+            + f" - looked under {AF3_REFERENCE} and {COLABDESIGN2}. Set "
+            "LOCALFOLD_AF3_REFERENCE to an af3-any-model checkout. See the note "
+            "above: they must come from the real source rather than be regenerated.")
     return (np.asarray(noise_level_embeddings._WEIGHT, dtype=np.float32),
             np.asarray(noise_level_embeddings._BIAS, dtype=np.float32))
 
