@@ -442,6 +442,30 @@ moot rather than by testing it. 2,047 is this A100's number; the port's is
 
 ### 🔴 ROUND THREE, ANSWERED FROM THE M2
 
+🔴 **AND FIRST: `dispatchDigest` IS NOT REPRODUCIBLE ON THIS MACHINE, WHICH
+BREAKS `audit-knobs.py` HERE.** Five runs of `probe-compiles.js --tool=fold-af2`
+on one branch with one input give `shaderDigest` **a5cc4748 every time** and
+`dispatchDigest` **three different values** - 9a4f25f8 three times, then 5512fefe,
+then 8893e753 - with `dispatchShapes` constant at 102, so it is a COUNT that
+moves and not the set of shapes. Dumping the map and diffing the runs names it
+outright: the only key that differs is **`occupancy.chain|4x1x1`, at 3, 2 and 1**.
+The occupancy measurement's dispatch count is timing-dependent, so it lands in
+the digest of anything that wraps a fold.
+
+That matters because `audit-knobs.py` decides whether a knob "moved" anything by
+comparing these two digests, and this file calls it **the main ask** for an M2.
+Here it would report a random half of the knobs as having moved a dispatch when
+nothing moved at all. The shader digest is sound; only the dispatch one is
+affected. Until it is fixed, read the FAILED column and the shader digest, and
+treat a dispatch difference as a question rather than an answer.
+
+It cost a wrong conclusion on the way to finding it: two branches were compared
+on this digest, read as "identical, therefore nothing changed", and the same
+comparison run again disagreed with itself. **A digest that is not reproducible
+is not a comparison** - the fix for that reading is below, and it is the fold
+checksums, which are stable.
+
+
 All four, on `670453c`. `npm test` 1014/0 here, `uniform-barrier.test.js`
 included.
 
