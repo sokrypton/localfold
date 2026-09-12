@@ -350,6 +350,45 @@ and `maxBufferSize` on the M2. Every ceiling in docs/AF2.md is 2 GiB and 4 GiB,
 which is this card, and the windowing threshold is derived from the first - a
 smaller one would start windowing at a length the A100 never reaches.
 
+### 🔴 ROUND THREE, ANSWERED FROM THE M2
+
+All four, on `670453c`. `npm test` 1014/0 here, `uniform-barrier.test.js`
+included.
+
+**1. `attentionMatrixPrefetch` is inert, confirmed rather than assumed.**
+`probe-kernel.js` picks **`attention:flash-registers-32-chunk16`** - not a
+matrix variant - and `probe-subgroup-matrix.js` says why: this device offers
+**8x8x8 and nothing else**, `{f32, 8, 8, 8}` and `{f16, 8, 8, 8}`, against a
+kernel that declares `<f16, 16, 16>`. So `supportsAttentionMatrix` refuses it
+structurally and the knob cannot reach a kernel this device runs.
+`fold-af2.js` with and without `--tune=attentionMatrixPrefetch=true` is
+**-1282976 both ways**, pLDDT 62.644, geometry ok. Your prediction holds; the
+`--passes=8` contingency is not needed.
+
+🔴 **AND -1287025 IS NOT THIS MACHINE'S NUMBER.** The M2 folds
+`fold-af2.js` at **-1282976**. Neither is wrong: the two boxes resolve different
+attention kernels, so a checksum travels no better between them than a timing
+does. Compare an arm against the SAME box's other arm, never against the other
+box's baseline.
+
+**2. The binding ceiling is 4 GiB here, not 2 - so the answer runs OPPOSITE to
+the worry.** `probe-limits.js` on the M2:
+
+| | M2 | A100 |
+|---|---:|---:|
+| `maxStorageBufferBindingSize` | **4 GiB** | 2 GiB |
+| `maxBufferSize` | 4 GiB | 4 GiB |
+| `maxLengthByBindingLimit` | **2896** | 2047 |
+
+So the windowing threshold derived from the binding size starts LATER on an M2,
+not earlier, and 2,047 is this A100's ceiling rather than the port's. Every
+ceiling in docs/AF2.md wants reading as one card's. The ratio is exactly the
+square root of two, which is what a pair tensor quadratic in length does with
+twice the binding.
+
+**3. The ceiling probe was not run here**, since its subject is a limit this box
+does not share; the numbers above are the input it would want anyway.
+
 ### 🔴 ROUND TWO: WHAT WAS NEW AND WANTED AN M2 BEFORE IT MERGED
 
 `addInPlace` - the same shader - now **windows** its bindings. It bound both
