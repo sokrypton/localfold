@@ -130,3 +130,10 @@ redistributed here.
 deployment notes. `AGENTS.md` is the engineering invariants, `CLAUDE.md` is how
 to run things in this checkout, and `docs/AF3.md` is the state of the
 AlphaFold 3 port.
+
+## License
+
+[Beerware](LICENSE) (Revision 42) for the code. The model parameters are not
+covered by it: the AlphaFold weights remain under DeepMind's
+[CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE),
+and the ESM-C, ESMFold2 and OpenDDE checkpoints under their own.

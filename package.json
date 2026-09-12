@@ -1,9 +1,36 @@
 {
   "name": "localfold",
   "version": "0.1.0",
-  "private": true,
+  "license": "Beerware",
   "type": "module",
   "description": "Differentially tested WebGPU kernels for AlphaFold 2 inference",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./src/*": "./src/*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sokrypton/localfold.git"
+  },
+  "homepage": "https://localfold.org",
+  "bugs": {
+    "url": "https://github.com/sokrypton/localfold/issues"
+  },
+  "keywords": [
+    "alphafold",
+    "protein-structure",
+    "webgpu",
+    "esmfold",
+    "protein-folding"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "//": "Nothing here is required to run the demo or the CPU tests - see README. This file exists for `type: module` and for the two optional lanes below, which genuinely need packages: headless GPU tests (Dawn) and browser tests (Playwright).",
   "scripts": {
     "//test": "--js-float16array is asked for ONLY when this node lacks Float16Array and its V8 lists the flag, so a node that already ships the type and a node too old to know the flag both run unchanged. Without it twelve tests do not fail, they never RUN - see CLAUDE.md.",
@@ -20,9 +47,6 @@
     "bench:a3m-stack": "node tools/benchmark-a3m-stack.js",
     "bench:a3m-model": "node tools/benchmark-a3m-model.js",
     "deploy": "python3 tools/deploy.py"
-  },
-  "engines": {
-    "node": ">=22"
   },
   "optionalDependencies": {},
   "devDependencies": {

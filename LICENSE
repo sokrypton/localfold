@@ -1,0 +1,15 @@
+----------------------------------------------------------------------------
+"THE BEER-WARE LICENSE" (Revision 42):
+
+Sergey Ovchinnikov <https://github.com/sokrypton> wrote this. As long as you
+retain this notice you can do whatever you want with this stuff. If we meet
+some day, and you think this stuff is worth it, you can buy me a beer in
+return.
+----------------------------------------------------------------------------
+
+This covers the CODE in this repository only.
+
+The AlphaFold model parameters this software downloads and runs are not covered
+by it and remain subject to their own terms - DeepMind's CC BY 4.0 parameters
+licence for AlphaFold, and the respective licences of the ESM-C, ESMFold2 and
+OpenDDE checkpoints. See the README.
