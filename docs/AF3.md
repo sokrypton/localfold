@@ -70,6 +70,35 @@ unrecognised flag is silently ignored by every tool in this repository**, so an
 arm that changes nothing wants the flag checked before the knob is believed
 inert.
 
+🔴 **AND THERE ARE FOUR MATRIX KERNELS IN THE PAIR TRACK, NOT THREE.** Fifteen
+single-knob arms all read 84.4x before the answer came from printing what
+`compilePairTrack` actually RESOLVES under each configuration, which named it in
+one run. The four, every one carrying `matrixElement: "f16"`:
+
+    triangleProjectMatrix   gridProjectMatrix   gridAttendMatrix   pairTransitionSplit
+
+`pairTransitionSplit` is the last 84x to 3.3x, and it is not a knob anyone would
+look at for accuracy - its name and its documentation are both about SPEED (1.13x
+on AF3's 128 channels, 3.71x on OpenDDE's 384). **Print the resolved
+configuration before naming knobs.**
+
+🔴 **FIXED FOR THE CONFIDENCE HEAD, AND DELIBERATELY NOT FOR THE TRUNK.**
+`Af3PairformerStackGpu` takes `pairMatrixKernels: false`, and
+`Af3ConfidenceHeadGpu` sets it beside the three precision axes it already
+pinned - it had pinned three of four. On the SHIPPED tuning the head now reads
+stack pair **2.97e-6** where it read 3.93e-3, and all four heads pass: pLDDT
+201x, PAE **7.0x**, PDE **7.3x**, resolved 62.9x. The trunk keeps its matrix
+kernels and its speed.
+
+🔴 **BUT THE TRUNK'S OWN 5334x IS NOW AN OPEN QUESTION AND NOT A CLOSED ONE.**
+Nothing here says 2.03e-2 a block is acceptable over 48 of them; it says the
+confidence head could not afford it. `check-af3-trunk` holds 4e-5 and cannot
+currently run - it wants `dialect.msaUpdateBeforeOuterProduct` named - so the
+trunk's matrix path has no oracle check at all. A fold moves little
+(meanPlddt 85.8300957 shipped, 85.8303909 with the head pinned, 85.8337307 with
+the whole prior off), which is evidence about the MEAN and not about the pair
+representation those kernels actually compute.
+
 🔴 **AND THE KERNEL'S OWN CHECKER REPORTS IT AND PASSES.**
 `check-grid-attend-matrix.js` prints `matrixVsReference: 1.34e-3` beside
 `scalarVsReference: 1.51e-6` and returns `"ok": true`, because its bar is the

@@ -398,26 +398,45 @@ export class Af3PairformerStackGpu {
     if ((weightPrecision === "f16" || stagedPrecision === "f16") && !hasF16) {
       throw new Error("f16 weights and staged tiles require the shader-f16 feature");
     }
+    // 🔴 THE MATRIX PAIR KERNELS ARE A PRECISION AXIS, AND A CALLER MAY PIN IT.
+    // They issue on f16 matrix units, so the projections they replace lose
+    // about three orders: one block of the trunk on real weights reads 2.03e-2
+    // against a 3.80e-6 rounding envelope with them and 1.24e-5 without, and
+    // check-af3-confidence fails all four heads with them and passes all four
+    // without. A caller that already pins `stagedPrecision`, `weightPrecision`
+    // and `accumulatePrecision` to f32 - the confidence head does, because
+    // pLDDT and PAE are what the page shows - was pinning three axes of four.
+    // 🔴 AND THERE ARE FOUR OF THEM, NOT THREE. `pairTransitionSplit` resolves
+    // to a config carrying `matrixElement: "f16"` exactly as the three
+    // projections do, and it is the last 84x to 3.3x - a pin covering only the
+    // three named ones leaves the block at 3.21e-4 where the full four reach
+    // 1.24e-5. The way to find the fourth was to print what `compilePairTrack`
+    // actually resolves under each configuration rather than to keep naming
+    // knobs: fifteen single-knob arms all read 84.4x before the dump named it.
+    // See docs/AF3.md. The trunk leaves this alone and keeps the speed.
+    const pairMatrixKernels = this.options?.pairMatrixKernels !== false;
     const pipelines = await compilePairTrack(this.pipelines, {
       // The device's answer, or undefined for the shared default.
       triangleProjectTile: shapedKnob(deviceTuning(this.device).trianglePairProjectTile),
       // 🔴 THE HEAD WIDTH IS THIS BUNDLE'S, NOT AF3's. OpenDDE runs this same
       // pairformer at its own widths, and a geometry the device cannot hold at
       // one of them resolves to false rather than throwing.
-      attendMatrix: resolveGridAttendMatrix(
+      attendMatrix: pairMatrixKernels && resolveGridAttendMatrix(
         this.device, blocks[0].pairAttention1.dimension, deviceTuning(this.device)),
       // 🔴 THE SPLIT TRANSITION'S VALUE IS THIS BUNDLE'S CHANNEL WIDTH. AF3's
       // 128 gets 1.13x and OpenDDE's 384 gets 3.71x from the same knob, because
       // the fused kernel's row tile halves as the widened row grows. See
       // src/af3/transition-webgpu.js.
-      pairTransitionSplit: splitTransitionConfig(this.device, pairChannels),
+      pairTransitionSplit: pairMatrixKernels
+        && splitTransitionConfig(this.device, pairChannels),
       pairTransitionChunkBytes: deviceTuning(this.device).pairTransitionChunkBytes,
       // ...and the triangle projection, which has no width rule because it
       // costs no memory. See src/triangle/project-matrix.js.
-      triangleProjectMatrix: projectMatrixConfig(this.device, pairChannels),
+      triangleProjectMatrix: pairMatrixKernels
+        && projectMatrixConfig(this.device, pairChannels),
       // ...and grid attention's projection, which has no width rule: it costs
       // no memory and reads the layout the vector kernel already packs.
-      gridProjectMatrix: gridProjectMatrixConfig(this.device),
+      gridProjectMatrix: pairMatrixKernels && gridProjectMatrixConfig(this.device),
       maxComputeWorkgroupStorageSize: this.device.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: this.device.limits.maxStorageBufferBindingSize,
       minStorageBufferOffsetAlignment: this.device.limits.minStorageBufferOffsetAlignment,

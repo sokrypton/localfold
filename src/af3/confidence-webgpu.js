@@ -486,8 +486,20 @@ export class Af3ConfidenceHeadGpu {
     // almost nothing and keeps the two user-facing numbers checked at the
     // tolerance the f32 arithmetic actually reaches. A caller that wants the
     // memory can still ask.
+    //
+    // 🔴 AND THE MATRIX PAIR KERNELS ARE THE FOURTH AXIS, WHICH THIS PINNED
+    // THREE OF FOR A YEAR. `triangleProjectMatrix`, `gridProjectMatrix` and
+    // `gridAttendMatrix` replace the pair track's projections with kernels that
+    // issue on f16 matrix units, and no precision option above reaches them -
+    // so a head that had declared itself f32 was running three of its six
+    // updates in f16 whenever the device prior turned them on. Measured on
+    // check-af3-confidence: all four heads FAIL with them (pLDDT 1902x, PAE
+    // 3463x, PDE 3718x, resolved 522x their conditioning envelope) and all four
+    // pass without (7.0x and 7.3x on PAE and PDE). The trunk keeps them and
+    // keeps the speed; see docs/AF3.md for the block-level ladder.
     this.options = {
-      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32", ...options,
+      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+      pairMatrixKernels: false, ...options,
     };
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
