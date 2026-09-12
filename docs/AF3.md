@@ -5,6 +5,68 @@ got wrong once. Written to be read before touching any of it.
 
 `AGENTS.md` holds the invariants; this holds the state.
 
+
+## 🔴 THE MATRIX PAIR TRACK COSTS THREE ORDERS IN THE BLOCK, AND TWO CHECKERS PASS IT
+
+`check-af3-confidence.js` fails all four heads - pLDDT 1902x, PAE 3463x, PDE
+3718x, resolved 522x their envelope. It is not precision: `--f16=off` returns
+byte-identical numbers, and the head already pins `stagedPrecision`,
+`weightPrecision` and `accumulatePrecision` to f32.
+
+**It is not any one kernel either.** `tools/gpu/probe-confidence-kernels.js`
+runs the six updates of a block one at a time against the reference, on the
+bundle's REAL weights, and every one is clean on both stacks - at an all-ones
+mask and at the checker's 80% one, at input scale 1 and at the 177 the pair
+actually reaches:
+
+    triangle.outgoing 4.6e-7   grid.1 6.4e-7   pair-transition   4.8e-7
+    triangle.incoming 4.5e-7   grid.2 6.6e-7   single-transition 7.3e-7
+
+**The COMPOSED block is where it appears, and the trunk has it worse than the
+confidence head.** One block, real weights, f32 accumulators, against the
+reference's own `pairformerBlock`:
+
+| stack | GPU vs reference | 1e-7 rounding envelope | ratio |
+|---|---:|---:|---:|
+| confidence | 4.55e-3 | 1.02e-6 | **4469x** |
+| trunk | 2.03e-2 | 3.80e-6 | **5334x** |
+
+🔴 **AND IT IS THE DEVICE TUNING, NOT THE PORT'S ARITHMETIC.** The same block
+with `--no-prior` or `--default-tuning` reads **1.24e-5, 3.3x its envelope**.
+The ampere prior is what turns on `gridAttendMatrix`, `gridAttendMatrixTile`,
+`gridProjectMatrix` and `triangleProjectMatrix`; the capability layer leaves
+`gridAttendMatrix` null. Restoring `gridAttendMatrix` alone onto an empty prior
+takes 1.24e-5 to 2.8e-3, so it is the largest single contributor - but removing
+any one knob from the FULL prior leaves 2.03e-2 unchanged, so the rest is a
+combination that is not yet named. 🔴 AND `--tune=<knob>=false` DID NOT MOVE
+THIS PATH AT ALL where `--default-tuning` did, which is either a knob that does
+not reach `deviceTuning` or a flag that does not reach the probe; it wants
+running down before the bisection above is trusted past its first step.
+
+🔴 **AND THE KERNEL'S OWN CHECKER REPORTS IT AND PASSES.**
+`check-grid-attend-matrix.js` prints `matrixVsReference: 1.34e-3` beside
+`scalarVsReference: 1.51e-6` and returns `"ok": true`, because its bar is the
+f16 one (~1e-3) the matrix units warrant. That is defensible for the kernel and
+is not defensible for the CONFIDENCE head, which pins three precision axes to
+f32 precisely because pLDDT and PAE amplify - and `gridAttendMatrix` is a
+FOURTH axis it does not pin, so f16 matrix units run inside a head that
+believes it is in f32.
+
+🔴 **AND `check-af3-block.js` READS 3.93e-2 AT 68x ITS OWN ENVELOPE AND
+PASSES.** Its bound is `envelope * 300` when the accumulators are f16, and its
+envelope is 5.74e-4 because it builds its weight dict BY HAND: on random
+weights a pairformer block is chaotic and one kernel's worth of rounding grows
+560x over four blocks. On the bundle's real weights the same perturbation grows
+~3x. So the checker with synthetic weights has an envelope three orders too
+wide to see this, which is the whole reason a real-weights probe was needed.
+
+**What it costs a fold is small, and that is the last piece rather than the
+reassurance.** AF3 at int5, shipped against `--no-prior`: meanPlddt
+**85.8300957** and **85.8337307**. The trunk's 48 blocks do not amplify it the
+way the confidence head's tight envelopes do - but pLDDT and PAE are per residue
+and per pair on the page, and those differ at 1e-3 while their mean does not.
+
+
 ## What works
 
 A protein chain typed into `index.html` folds with AlphaFold 3 entirely in the
