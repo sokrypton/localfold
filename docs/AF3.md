@@ -33,15 +33,42 @@ reference's own `pairformerBlock`:
 
 🔴 **AND IT IS THE DEVICE TUNING, NOT THE PORT'S ARITHMETIC.** The same block
 with `--no-prior` or `--default-tuning` reads **1.24e-5, 3.3x its envelope**.
-The ampere prior is what turns on `gridAttendMatrix`, `gridAttendMatrixTile`,
-`gridProjectMatrix` and `triangleProjectMatrix`; the capability layer leaves
-`gridAttendMatrix` null. Restoring `gridAttendMatrix` alone onto an empty prior
-takes 1.24e-5 to 2.8e-3, so it is the largest single contributor - but removing
-any one knob from the FULL prior leaves 2.03e-2 unchanged, so the rest is a
-combination that is not yet named. 🔴 AND `--tune=<knob>=false` DID NOT MOVE
-THIS PATH AT ALL where `--default-tuning` did, which is either a knob that does
-not reach `deviceTuning` or a flag that does not reach the probe; it wants
-running down before the bisection above is trusted past its first step.
+The ampere prior is what turns on the matrix kernels; the capability layer
+leaves `gridAttendMatrix` null. Removing them from the SHIPPED configuration,
+one at a time and then together:
+
+| trunk block, one block, real weights | BLOCK.pair | xEnvelope |
+|---|---:|---:|
+| shipped | 2.03e-2 | **5334x** |
+| minus `triangleProjectMatrix` | 3.74e-3 | 985x |
+| minus that and `gridProjectMatrix` | 2.82e-3 | 743x |
+| ...and `gridAttendMatrix` | 3.21e-4 | 84x |
+| the whole prior off | 1.24e-5 | 3.3x |
+
+🔴 **NO ONE KNOB OWNS IT - THEY COMPOUND, AND THAT IS WHY BISECTING FROM THE
+EMPTY SIDE LIED.** Restoring `gridAttendMatrix` alone onto an empty prior reads
+737x, which named it the culprit; removing it from the full prior changes
+5334x to 5334x. Both measurements are right and the first conclusion was wrong.
+`triangleProjectMatrix` is the largest single term from the full side (5.4x),
+and the last 84x to 3.3x survives every remaining knob tried individually -
+`matrixLinear`, `stagedMatrixBlock`, `attentionMatrix`, `attentionMatrixTile`,
+`attentionVectorScore`, `trianglePairProjectTile`, `transitionChunkBytes`,
+`attentionGroup`, `linearTallTile`, `pairTransitionSplitMinChannels` - and
+`--f16=off` does not move it either. **Subtract from the shipped configuration,
+never add to an empty one**, and expect a residue that only the whole prior
+explains.
+
+🔴 **AND `--tune=` IS NOT A HARNESS FLAG, WHICH COST THE FIRST BISECTION.**
+`gpu-chrome.mjs` handles `--tune-json=`, `--f16=`, `--occupancy`,
+`--default-tuning` and `--no-prior`; `--tune=key=value` is parsed by the eleven
+TOOLS that implement it (`fold.js`, `fold-af2.js`, `profile-af2-block.js` and
+friends), not by the runner. A tool that does not implement it - such as this
+probe when it was written - takes the flag, ignores it silently, and every arm
+reads identical. That is indistinguishable from a knob that does nothing, and
+it produced five such rows here before `--tune-json=` was used instead. **An
+unrecognised flag is silently ignored by every tool in this repository**, so an
+arm that changes nothing wants the flag checked before the knob is believed
+inert.
 
 🔴 **AND THE KERNEL'S OWN CHECKER REPORTS IT AND PASSES.**
 `check-grid-attend-matrix.js` prints `matrixVsReference: 1.34e-3` beside
