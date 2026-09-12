@@ -1,6 +1,6 @@
 {
   "name": "localfold",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "license": "Beerware",
   "type": "module",
   "description": "WebGPU protein structure prediction in the browser - AlphaFold 2 (monomer and multimer), AlphaFold 3, ESMFold2 and OpenDDE",

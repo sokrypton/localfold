@@ -111,8 +111,8 @@ on a machine that has them. `webgpu` is an optional peer dependency - if its
 prebuilt binary wants a newer GLIBC than you have, `npm i webgpu@0.4.0`.
 
 The API is the kernels (`EvoformerStackGpu` and 48 others, all taking a
-`GPUDevice`), and it is early: treat it as unstable until a single
-sequence-in-structure-out entry point exists.
+`GPUDevice`), and the `0.0.x` version is meant literally: treat it as unstable
+until a single sequence-in-structure-out entry point exists.
 
 ## Running it yourself
 
