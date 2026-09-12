@@ -296,6 +296,12 @@ export const DEFAULT_TUNING = Object.freeze({
   // 512 - the same shape as transitionChunkBytes, a cap fitted where it
   // happened to cover the whole workload. null takes the constant.
   pairLogitsCacheBytes: null,
+  // 🔴 AF3's OUTER PRODUCT MEAN, whose OPM_BLOCK_I and OPM_CELL_CHUNK were both
+  // measured at 59 and 150 TOKENS. The block's own note says "the workgroup
+  // count still wins at these sizes", which is a claim about a SIZE - see
+  // docs/AF3.md. null takes the constants.
+  opmBlockI: null,
+  opmCellChunk: null,
   attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only

@@ -15,7 +15,8 @@
  * The five pair updates are shared with the pairformer stack; see
  * src/af3/pair-track-gpu.js.
  */
-import { deviceTuning, shapedKnob } from "../runtime/device-profile.js";
+import { deviceDerivationsAllowed, deviceTuning, shapedKnob }
+  from "../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
@@ -29,7 +30,7 @@ import {
 import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
 import { residentPackedOnDevice } from "./device-weights.js";
 import {
-  createOuterProductMeanShaders, packOuterProductMeanWeights,
+  OPM_BLOCK_I_TOKENS, createOuterProductMeanShaders, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
 import { createMsaAttentionShaders, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
@@ -156,15 +157,26 @@ export class Af3MsaStackGpu {
       compiling.push(compile(key, source).then((pipeline) => { pipelines[slot] = pipeline; }));
     };
 
+    const opmTuning = deviceTuning(this.device);
+    // See OPM_BLOCK_I_TOKENS: the shipped block of two is 1.5x SLOWER past 256
+    // tokens, on the trunk's second-largest kernel.
+    const opmBlockI = opmTuning.opmBlockI
+      ?? (deviceDerivationsAllowed(this.device) && n > OPM_BLOCK_I_TOKENS ? 1 : null);
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
-                       pairChannels };
+                       pairChannels,
+                       ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
+                       ...(opmTuning.opmCellChunk == null
+                         ? {} : { cellChunk: opmTuning.opmCellChunk }) };
     const { blockI, blockJ, blocksPerRow, ...opmSources } = createOuterProductMeanShaders(
       opmShape, packOuterProductMeanWeights(sample.outerProductMean).offsets, epsilon, variance);
     // ...the contraction's dispatch is one workgroup per (i, j) block of token
     // pairs; see the note on its kernel.
     pipelines.opmBlocks = Math.ceil(n / blockI) * blocksPerRow;
     for (const [name, source] of Object.entries(opmSources)) {
-      into(`opm:${name}`, `${base}:opm:${name}`, source);
+      // 🔴 THE BLOCK AND THE CHUNK ARE IN THE KEY. Both change the generated
+      // WGSL and the dispatch, which is the collision docs/AF2.md records twice.
+      into(`opm:${name}`, `${base}:opm:${name}`
+        + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,

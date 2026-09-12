@@ -48,6 +48,32 @@ const GRID_WIDTH = 32_768;
  * workgroups are what fill the machine.
  */
 export const OPM_BLOCK_I = 2;
+
+/**
+ * Past this many tokens the block of two LOSES, and by more than it ever wins.
+ *
+ * 🔴 THE NOTE ABOVE WAS FITTED AT 59 AND 150 TOKENS AND DOES NOT HOLD AT 400.
+ * `opm.contract` is the second-largest kernel in an AF3 trunk at 400 tokens -
+ * 245.9 ms against `grid.attend`'s 259.4 - and the block that wins there is the
+ * one that note measured as WORST. `bench-trunk.js --profile --msa=512`, two
+ * rounds where the boundary is:
+ *
+ *     tokens      59     150     256     300     350     400
+ *     blockI 1   3.67   19.21   53.51   75.67  108.61  147.76
+ *     blockI 2   5.53   14.41   38.81  111.52  178.05  245.69
+ *
+ * Two wins only in a band, and it is not a depth effect - at 1024 rows the
+ * ordering is the same (59: 6.92 against 11.06, 150: 39.01 against 33.15, 256:
+ * 121.60 against 84.26, 400: 325.20 against 499.72). The cliff is between 256
+ * and 300 and it is sharp: blockI 2 goes superlinear there while blockI 1 stays
+ * smooth in the pair count.
+ *
+ * So the derivation is one-sided and conservative: above this, take 1. The band
+ * where two wins is left exactly as measured, and so is the 59-token case,
+ * where one wins by 1.9 ms and nothing else in a fold that size would notice.
+ * `opmBlockI` overrides it and `--default-tuning` suppresses it.
+ */
+export const OPM_BLOCK_I_TOKENS = 256;
 export const OPM_BLOCK_J = 4;
 
 /**
