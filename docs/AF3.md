@@ -2000,8 +2000,12 @@ mechanism is not established and the L2 working set does not explain it, since
 `opmCellChunk` swept beside it stays at 256: 128 is 247.8, 256 is 147.9, 512 is
 150.7, 1024 is 173.2. Only the block moves.
 
-**Derived, one-sided and conservative** - `OPM_BLOCK_I_TOKENS`, above which the
-stack takes 1. The band where two wins is left exactly as measured, and so is
+**A PRIOR, one-sided and conservative** - `opmBlockITokens`, above which the
+stack takes 1. 🔴 It shipped for one commit as a DERIVATION applying to every
+device, which was wrong: the five derivations this repository has all read
+something the device reports - its measured width, its memory budget - and 256
+tokens is not that, it is where this A100's memory system turns over. Another
+part keeps the measured block of two until someone measures it there. The band where two wins is left exactly as measured, and so is
 the 59-token case, where one wins by 1.9 ms. A trunk pass at 400 tokens is
 **1244.4 -> 1143.6 ms, 8.1%**, and a fold at 200 tokens is untouched
 (`opm.contract` 39.08 ms, the block-of-two path). Bit-exact where it fires:

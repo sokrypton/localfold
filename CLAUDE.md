@@ -324,7 +324,55 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
-### 🔴 ROUND THREE: WHAT WANTS AN M2 NOW
+### 🔴 ROUND FOUR: WHAT WANTS AN M2 NOW
+
+Thirteen commits since round three, three of them touching `src/`. All three are
+performance settings found the same way - by asking which constants and knobs
+were fitted at a length nobody folds - and all three are **ampere-prior only**,
+so an Apple part should see NO change from any of them. That is the first thing
+to check and it is one command: `fold.js --model=` and `fold-af2.js` checksums
+against your own previous run, not against this box's.
+
+**1. `opmBlockITokens`, and this is the real ask.** Past 256 tokens AF3's outer
+product mean takes a block of ONE instead of two, worth **8.1% of a trunk pass**
+at 400 tokens here - `opm.contract` 245.7 -> 147.8 ms, the second-largest kernel
+in the trunk. The full curve is in docs/AF3.md and it is not monotone: one wins
+at 59, two wins at 150 and 256, one wins from 300 up, at both 512 and 1024 MSA
+rows. 🔴 **I shipped that as a DERIVATION for every device first, and that was
+wrong** - 256 tokens is where THIS card's memory system turns over, not
+something a device reports - so it is a prior now and your part keeps the block
+of two. What would be worth knowing is whether the crossover exists there at
+all: `bench-trunk.js --profile --model= --tokens=400 --msa=512
+--tune-json={"opmBlockI":1}` against the default.
+
+**2. `transitionChunkBytes` and `pairLogitsCacheBytes`, both 256 MiB, both
+ampere.** The first is 5.4% of an AF2 block and 4.0% of a fold for 168 MiB; the
+second is 8.7% of an AF3 denoiser call for 166 MiB. Both bit-identical here.
+They are memory trades, which is exactly the axis a laptop cares about and this
+card does not, so the interesting question is whether they are worth taking on
+Metal at all - and `fold.js --budget=0` is what says.
+
+**3. The flags, which may be the most important thing in this round and are not
+a code change.** Every number this repository has ever published from the A100
+was taken behind `--enable-dawn-features=vulkan_enable_f16_on_nvidia` and
+`--enable-unsafe-webgpu`, and a stock Chrome on NVIDIA has NEITHER: the same
+fold is 10767 ms with them and **21000 without**. `LOCALFOLD_STOCK_FLAGS=1`
+drops both. Two things only an Apple part can answer:
+   - does a stock Chrome there report `shader-f16`? The README now tells Linux
+     users to pass a flag and says Apple needs none, on the strength of your
+     round-three reply rather than a measurement.
+   - does `chromium-experimental-subgroup-matrix` appear without
+     `--enable-unsafe-webgpu`? If it needs the flag there too, then the matrix
+     kernel is unreachable for every visitor on every platform, which changes
+     what `attentionMatrix` is worth rather than how fast it is.
+
+**4. And the Dawn lane can run its f16 arms after all**, which this file said it
+could not. `create([])` in all 25 `test/*.gpu.test.js` call sites is why:
+`create(["enable-dawn-features=vulkan_enable_f16_on_nvidia,allow_unsafe_apis"])`
+gives f16 AND the matrix units on the node binding here. Whether Metal's Dawn
+wants a different toggle is open.
+
+### 🔴 ROUND THREE: WHAT WANTED AN M2, AND WAS ANSWERED
 
 Newest first. Round two's ask - the windowing - is the section after this one
 and still stands; nothing below replaces it.

@@ -15,8 +15,7 @@
  * The five pair updates are shared with the pairformer stack; see
  * src/af3/pair-track-gpu.js.
  */
-import { deviceDerivationsAllowed, deviceTuning, shapedKnob }
-  from "../runtime/device-profile.js";
+import { deviceTuning, shapedKnob } from "../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
@@ -30,7 +29,7 @@ import {
 import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
 import { residentPackedOnDevice } from "./device-weights.js";
 import {
-  OPM_BLOCK_I_TOKENS, createOuterProductMeanShaders, packOuterProductMeanWeights,
+  createOuterProductMeanShaders, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
 import { createMsaAttentionShaders, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
@@ -160,8 +159,19 @@ export class Af3MsaStackGpu {
     const opmTuning = deviceTuning(this.device);
     // See OPM_BLOCK_I_TOKENS: the shipped block of two is 1.5x SLOWER past 256
     // tokens, on the trunk's second-largest kernel.
+    //
+    // 🔴 AND IT IS THE PRIOR'S TO SET, NOT A DERIVATION'S. This shipped for one
+    // commit as `deviceDerivationsAllowed(device) && n > OPM_BLOCK_I_TOKENS`,
+    // which applied a threshold measured on ONE card to every device including
+    // parts nobody has run it on. The five derivations this repository has all
+    // read something the DEVICE reports - its measured width, its memory budget
+    // - and 256 tokens is not that: it is where this A100's memory system turns
+    // over. `opmBlockITokens` is null everywhere but the ampere prior, so
+    // another part keeps the measured block of two until someone measures it
+    // there.
+    const blockITokens = opmTuning.opmBlockITokens;
     const opmBlockI = opmTuning.opmBlockI
-      ?? (deviceDerivationsAllowed(this.device) && n > OPM_BLOCK_I_TOKENS ? 1 : null);
+      ?? (blockITokens != null && n > blockITokens ? 1 : null);
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
                        pairChannels,
                        ...(opmBlockI == null ? {} : { blockI: opmBlockI }),

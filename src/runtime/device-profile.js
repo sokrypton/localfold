@@ -302,6 +302,10 @@ export const DEFAULT_TUNING = Object.freeze({
   // docs/AF3.md. null takes the constants.
   opmBlockI: null,
   opmCellChunk: null,
+  // Above this many tokens the outer product mean takes a block of ONE. null
+  // means "never" - see OPM_BLOCK_I_TOKENS for why this is a prior and not a
+  // derivation.
+  opmBlockITokens: null,
   attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
@@ -589,6 +593,8 @@ const PRIORS = new Map([
     // is the same arm. **8.7% of a denoiser call for 166 MiB.** Ampere only,
     // like the two above it.
     pairLogitsCacheBytes: 256 * 1024 * 1024,
+    // See OPM_BLOCK_I_TOKENS: measured on THIS card, so only this card takes it.
+    opmBlockITokens: 256,
     // 🔴 AND AF3's `grid.attend` ON THE SAME UNITS, SWEPT IN THE TRUNK. It is
     // the largest pass in the pairformer and the only cubic one; measured as
     // GPU pass time over eight blocks, at 32 MSA rows, medians reproducible
