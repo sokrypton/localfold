@@ -1959,11 +1959,51 @@ fold:
 | `pair-transition.first` / `.second`, and the extra stack's | 2 | 1,448 - handled, `transitionChunkRows` windows them |
 | `triangle.outgoing.*`, `triangle.incoming.*` | 2 | **2,047 - NOT handled** |
 
-`src/triangle/webgpu.js` has no chunking, no views and no windowing, so the
-triangle binds the pair whole exactly as `addInPlace` did. Windowing the
-residual removed one wall of several and the fold still stops in the same place.
-What the fix is worth is that the residual is no longer the FIRST thing to fail,
-and what it is not worth is a longer complex - not yet.
+Windowing the residual removed one wall of several and the fold still stops in
+the same place. What the fix is worth is that the residual is no longer the
+FIRST thing to fail, and what it is not worth is a longer complex.
+
+🔴 **AND WINDOWING THE TRIANGLE WOULD BE WORTH NOTHING, BECAUSE 2,047 IS A TIE
+OF TWENTY-EIGHT.** The table above names the triangle because the probe returned
+the first row of a sorted list, and reading it that way is how a session came to
+be spent asking whether `src/triangle/webgpu.js` could bind ranges. It cannot,
+and it does not matter twice over: that module is the STANDALONE kernel that
+`check-triangle.js` drives, and the fold's triangle is `src/evoformer/block.js`
+and its multimer twin, which dispatch through `execution.view()`-capable
+tensors and could be windowed. The reason not to is the count. Every dispatch
+binding an `L^2 * cZ` f32 tensor crosses 2 GiB at the same residue, and there
+are twenty-eight of them:
+
+| ceiling | labels | what they are |
+|---:|---:|---|
+| 724 | 2 | `opm.*` - handled, the tiled path takes over |
+| 1,448 | 4 | the four pair transitions - handled, `transitionChunkRows` |
+| **2,047** | **28** | ten triangle multiplication passes and two gates; both triangle attentions' `normalize` and `output`, in both stacks; both MSA row attentions' `pair-normalize` and `pair-bias`; two pair-transition `normalize`; `template.output`; `monomer.template-residual-0` |
+| 2,896 | 22 | the half-width bindings - the template stack, whose cZ is 64, and both triangle attentions' `pair-bias`/`project`/`flash`. Also where a 4 GiB `maxBufferSize` stops an f32 pair being ALLOCATED at all |
+
+So windowing the twelve triangle labels moves the fold's ceiling by **zero
+residues**: the thirteenth member of the tie refuses at the same length. The
+whole group has to move together, and the destination is 2,896 whatever route is
+taken, because that is the allocation wall.
+
+🔴 **AND THE CHEAP ROUTE TO 2,896 IS THE ELEMENT, NOT THE WINDOW.** A packed f16
+pair is two bytes a channel, so its bindings cross 2 GiB at 2,896 - exactly the
+allocation wall - and it needs no windowing anywhere. That is why upstream's
+number is 2,896 and ours is 2,047: the difference is the element size, not the
+windowing. Ours is f32 across the pair track (`createAttentionPairBiasShader` is
+the one AF2 shader that takes an f16 pair today), so that route is a port and
+not a patch. Twenty-eight windowings reach the same place.
+
+🔴 **AND THE PRICE OF ARRIVING IS MINUTES.** `profile-af2-block.js --length=2040
+--sequences=8` runs on this card today: one main-stack block is **1,260 ms**, so
+the 48-block stack is **60.5 s per recycle** before the extra stack, the
+featurisation or the structure module. The contraction is O(L^3), so 2,896 is
+about 3x that a block. A 2,896-residue monomer is a ten-minute fold in a browser
+tab, which is the other half of why this is recorded rather than built.
+
+`probe-binding-ceiling.js` returns `lowestCeilingGroup` and `ceilingGroups` for
+exactly this reason now. A one-label fix is worth something only where
+`lowestCeilingGroup.labels` is 1.
 
 🔴 **AND TWO LENGTHS ARE NEEDED TO SEE ANY OF THIS.** A binding that grows as `L`
 and one that grows as `L^2` are indistinguishable in a single run and give out at

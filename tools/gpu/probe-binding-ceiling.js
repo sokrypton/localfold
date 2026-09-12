@@ -22,7 +22,9 @@
  * It is an ESTIMATE and says so: a binding whose size steps rather than scales
  * smoothly - anything already chunked against a budget - will be reported with
  * a fractional exponent and should be read as "already windowed", not as a
- * prediction. What it is for is finding the label with the LOWEST ceiling.
+ * prediction. What it is for is finding the lowest ceiling and HOW MANY labels
+ * sit on it - `lowestCeilingGroup`. A ceiling shared by twenty-eight dispatches
+ * is not a bug in whichever one gets named first.
  *
  * The idea of computing what a prediction binds and checking it against a
  * device is @milot-mirdita's, from martin-steinegger/alphafold2-webgpu; that
@@ -89,12 +91,35 @@ export async function main(device, args) {
   }
   rows.sort((a, b) => (a.ceilingResidues ?? Infinity) - (b.ceilingResidues ?? Infinity));
   const binding = rows.find((row) => row.ceilingResidues !== null);
+  // 🔴 THE COUNT IS THE POINT, NOT THE NAME. This used to return one label and
+  // that is how it read as "window the triangle and the fold gets longer": the
+  // triangle is simply first alphabetically among the dispatches that bind a
+  // pair-shaped tensor, and on AF2 **twenty-eight labels reach the limit at the
+  // same length**, because they all bind `L^2 * cZ` f32. Windowing any subset
+  // of a tie moves the fold's ceiling by nothing - the next member of the group
+  // refuses at the same residue count. So the groups are reported.
+  const groups = new Map();
+  for (const row of rows) {
+    if (row.ceilingResidues === null) continue;
+    const found = groups.get(row.ceilingResidues) ?? [];
+    found.push(row.label);
+    groups.set(row.ceilingResidues, found);
+  }
   return {
     tool, lengths, maxStorageBufferBindingSize: limit,
     // The label that gives out first, and at what length.
     lowestCeiling: binding === undefined ? null
       : { label: binding.label, residues: binding.ceilingResidues },
+    // ...and everything that gives out WITH it. A one-label fix is worth
+    // something only where `labels` here is 1.
+    lowestCeilingGroup: binding === undefined ? null
+      : { residues: binding.ceilingResidues,
+          labels: groups.get(binding.ceilingResidues).length,
+          members: groups.get(binding.ceilingResidues) },
+    ceilingGroups: [...groups.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([residues, members]) => ({ residues, labels: members.length, members })),
     labels: rows.length,
-    tightest: rows.slice(0, 12),
+    tightest: rows.slice(0, 40),
   };
 }
