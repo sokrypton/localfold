@@ -25,6 +25,7 @@
 import { embed } from "../../src/af3/embedder-reference.js";
 import { Af3EmbedderGpu } from "../../src/af3/embedder-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";
@@ -71,10 +72,17 @@ export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "48"));
   const sequences = Number(option(args, "sequences", "8"));
   const chains = Number(option(args, "chains", "3"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  const store = await HttpTensorStore.open(option(args, "model", MANIFEST));
   const T = async (name) => store.tensor(`${EVO}/${name}`);
 
   const weights = {
+    // 🔴 THE DIALECT IS THE BUNDLE'S. Omitting it is why this checker did not
+    // run: `embed` refuses to default `pairInitFromSingle`, because stock AF3
+    // builds the pair from target_feat (left_single is [447, 128]) and OpenDDE
+    // from s_init ([384, 384]), and guessing would multiply a 447-wide feature
+    // by a 384-wide matrix. The reference reads the flag AND the shape for that
+    // reason; a hand-built dict that names neither simply stopped the checker.
+    dialect: af3Dialect(store),
     pairChannels: PAIR_CHANNELS, singleChannels: SINGLE_CHANNELS,
     msaChannels: MSA_CHANNELS, targetFeatWidth: FEATURE_WIDTH,
     relativeWidth: 139,

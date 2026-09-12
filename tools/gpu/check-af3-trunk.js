@@ -18,10 +18,22 @@ import { runTrunk } from "../../src/af3/trunk-reference.js";
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { binEdges as binEdgesOf } from "../../src/af3/trunk-webgpu.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { CLASS_PROTEIN } from "../../src/heads/contact-threshold.js";
 
-const DIALECT = { swapTransposedBias: false };
+// 🔴 THE DIALECT IS THE BUNDLE'S, NOT A CONSTANT TYPED IN HERE. This was
+// `{ swapTransposedBias: false }` - one flag of thirteen - and the trunk has
+// refused to run for exactly that reason: `Af3MsaStackGpu` will not default
+// `msaUpdateBeforeOuterProduct`, because AF3 takes the outer product off the
+// PRE-update MSA and OpenDDE off the updated one, and guessing either would be
+// silently running a different model. So this checker did not compare anything
+// at all, which is the failure docs/PARITY.md records across the whole suite.
+//
+// Reading it from the manifest fixes both halves: the flag is named, and the
+// checker stops being pinned to AlphaFold 3 - point it at an OpenDDE or
+// openbind0 bundle with `--model=` and it checks that model's conventions
+// instead of asserting AF3's over them.
+const dialectFor = (store) => af3Dialect(store);
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -101,8 +113,11 @@ export async function main(device, args) {
   const tokens = Number(option(args, "n", "24"));
   const sequences = Number(option(args, "sequences", "8"));
   const blocks = Number(option(args, "blocks", "4"));
-  const store = await openAf3Store();
+  // --model= so a second bundle's conventions can be checked, not AF3's
+  // asserted over them; the dialect follows the bundle either way.
+  const store = await openAf3Store(option(args, "model", undefined));
   const weights = await trunkWeights(store, blocks, 4);
+  const DIALECT = dialectFor(store);
   const input = buildInput(tokens, sequences, 3);
 
   // 🔴 THE STAGED WORKGROUP BLOCKS' PRECISION IS AN AXIS HERE TOO. The pair
