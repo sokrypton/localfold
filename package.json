@@ -3,21 +3,13 @@
   "version": "0.1.0",
   "license": "Beerware",
   "type": "module",
-  "description": "Differentially tested WebGPU kernels for AlphaFold 2 inference",
-  "files": [
-    "src",
-    "README.md",
-    "LICENSE"
-  ],
-  "exports": {
-    ".": "./src/index.js",
-    "./src/*": "./src/*"
-  },
+  "description": "WebGPU protein structure prediction in the browser - AlphaFold 2 (monomer and multimer), AlphaFold 3, ESMFold2 and OpenDDE",
+  "//": "A published package AND this repository's dev manifest. Nothing here is needed to open the page or run the CPU tests: `files` ships src/ only, and everything under devDependencies belongs to one of the optional lanes below.",
+  "homepage": "https://localfold.org",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sokrypton/localfold.git"
   },
-  "homepage": "https://localfold.org",
   "bugs": {
     "url": "https://github.com/sokrypton/localfold/issues"
   },
@@ -31,24 +23,45 @@
   "engines": {
     "node": ">=22"
   },
-  "//": "Nothing here is required to run the demo or the CPU tests - see README. This file exists for `type: module` and for the two optional lanes below, which genuinely need packages: headless GPU tests (Dawn) and browser tests (Playwright).",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./node": "./src/node.js",
+    "./src/*": "./src/*"
+  },
+  "peerDependencies": {
+    "webgpu": "*"
+  },
+  "//peerDependencies": "Dawn's node binding, for `localfold/node` only - a browser caller brings its own GPUDevice and needs nothing installed. 0.6.0's linux-x64 prebuilt wants GLIBC 2.38; use 0.4.0 below that.",
+  "peerDependenciesMeta": {
+    "webgpu": {
+      "optional": true
+    }
+  },
   "scripts": {
     "//test": "--js-float16array is asked for ONLY when this node lacks Float16Array and its V8 lists the flag, so a node that already ships the type and a node too old to know the flag both run unchanged. Without it twelve tests do not fail, they never RUN - see CLAUDE.md.",
     "test": "node $(node --v8-options 2>/dev/null | grep -qe '--js-float16array' && node -e 'process.exit(typeof Float16Array === \"undefined\" ? 0 : 1)' && echo --js-float16array) --test --test-concurrency=1 $(ls test/*.test.js | grep -v '\\.gpu\\.')",
+    "//test:gpu": "Needs a Dawn that loads on this glibc AND the fixtures under test/fixtures/evoformer/, which are gitignored - 24 of them are ENOENT on a fresh checkout. tools/gpu-chrome.mjs is the lane that works here; see CLAUDE.md, including the create() toggles these 25 call sites do not pass.",
     "test:gpu": "LOCALFOLD_GPU_TESTS=1 node --test --test-concurrency=1 test/*.gpu.test.js",
+    "//test:browser": "There is no playwright.config.ts in this repository, so this runs against playwright's defaults, and it needs a browser: `npx playwright install chromium`. Without one it is 4 failed on 'Executable doesn't exist'.",
     "test:browser": "playwright test",
+    "//typecheck": "ADVISORY, not a gate: 1075 errors on this tree. It checks JS against @webgpu/types and most of what it reports is missing DOM and window augmentation rather than anything a fold would notice.",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm test",
     "serve": "python3 -m http.server 4173",
     "build:site": "python3 tools/build_site.py",
     "export:web-model": "node tools/export-web-model.js",
     "export:js-weights": "python3 tools/export-js-weights.py",
-    "typecheck": "tsc -p tsconfig.json",
     "bench": "node tools/benchmark-triangle.js",
     "bench:attention": "node tools/benchmark-attention.js",
     "bench:a3m-stack": "node tools/benchmark-a3m-stack.js",
     "bench:a3m-model": "node tools/benchmark-a3m-model.js",
     "deploy": "python3 tools/deploy.py"
   },
-  "optionalDependencies": {},
   "devDependencies": {
     "@playwright/test": "1.62.1",
     "@webgpu/types": "0.1.72",

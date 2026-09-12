@@ -83,7 +83,36 @@ the two flags above them, which are the ones worth the time.
 
 These are developer flags and the f16 one turns off a gate Chrome set for a
 reason, so use the separate profile rather than making it your default browser.
-Neither is needed on Apple silicon, where `shader-f16` is available as shipped.
+On Apple silicon `shader-f16` is available as shipped, so only
+`--enable-unsafe-webgpu` changes anything there — and measured on an M2 it
+changes nothing, because this port's matrix kernel wants 16x16 units and Apple
+offers 8x8x8, so the register kernel is chosen either way.
+
+`--enable-unsafe-webgpu` is what gates the subgroup matrix units, on **both**
+platforms. No visitor to a page has them without it. On Apple that costs
+nothing; on NVIDIA it is part of the ~2x above.
+
+### As a library
+
+```bash
+npm install localfold webgpu
+```
+
+```js
+import { createNodeDevice } from "localfold/node";
+const { device } = await createNodeDevice();   // Dawn, with the toggles below
+```
+
+🔴 **AND NODE IS THE ONLY PLACE THE FAST PATH IS REACHABLE WITHOUT ASKING THE
+USER FOR ANYTHING.** The two capabilities above are browser flags a visitor does
+not have; Dawn's node binding takes them as arguments, so `createNodeDevice`
+turns them on for itself and reports `shader-f16` and the subgroup matrix units
+on a machine that has them. `webgpu` is an optional peer dependency - if its
+prebuilt binary wants a newer GLIBC than you have, `npm i webgpu@0.4.0`.
+
+The API is the kernels (`EvoformerStackGpu` and 48 others, all taking a
+`GPUDevice`), and it is early: treat it as unstable until a single
+sequence-in-structure-out entry point exists.
 
 ## Running it yourself
 
