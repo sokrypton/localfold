@@ -957,6 +957,33 @@ Verified on the M2 that the guard is inert where nothing over-dispatches:
 
 ## The traps that repeat
 
+🔴 **AND `gh` TALKS TO THE OTHER PORT BY DEFAULT, WHICH LOOKS LIKE A QUIET
+DEPLOY HISTORY.** This checkout has two remotes - `origin` is
+sokrypton/localfold and `upstream` is martin-steinegger/alphafold2-webgpu, which
+21 commits here compare against - and with more than one remote `gh` picks for
+itself. It picked UPSTREAM: `gh run list` returned that port's runs, with that
+port's commit titles, and the newest was a day old, which read as "nothing
+deployed today" while four deploys had in fact succeeded. Nothing errors; the
+answer is just about a different repository.
+
+```
+gh repo set-default sokrypton/localfold     # once per checkout
+```
+
+It writes `remote.origin.gh-resolved` into `.git/config`, which is NOT committed,
+so every machine does it once - and until it is done, pass `-R
+sokrypton/localfold` explicitly. Check with `gh repo view --json nameWithOwner`
+before believing anything `gh` says about this repository.
+
+🔴 **AND PUSHING TO `main` IS THE DEPLOY; `tools/deploy.py` IS THE VERIFY.**
+The "Deploy WebGPU demo" workflow runs on PUSH, so every commit that reaches
+`main` publishes itself within a couple of minutes. `deploy.py` dispatches the
+workflow AGAIN and then polls `build.json` until the commit it pushed is the one
+being served - which is why a run it starts shows up twice, once for the push
+and once for the dispatch. Its value is the POLL: it is how "live" becomes a
+fact rather than an impression. But a push that nobody followed with the script
+is deployed all the same, and asking `deploy.py --verify` is the way to find out.
+
 🔴 **SO USE `python3 tools/serve.py` AND NOT `python3 -m http.server`.** It
 sends `Cache-Control: no-store` on everything a developer edits and a year's
 `max-age` on the weight shards, which are the one thing that must still cache -
