@@ -26,6 +26,18 @@
  * sit on it - `lowestCeilingGroup`. A ceiling shared by twenty-eight dispatches
  * is not a bug in whichever one gets named first.
  *
+ * 🔴 AND BOTH SAMPLED LENGTHS MUST SIT ABOVE EVERY CHUNK THRESHOLD, OR A
+ * HANDLED LABEL IS REPORTED AS A CEILING. A transition chunks against
+ * `TRANSITION_CHUNK_TARGET_BYTES` (32 MiB) and the outer product mean against
+ * its pair block, so below those a label grows as `L^2` with a clean exponent
+ * of 2 and the extrapolation sails straight through a threshold it cannot see.
+ * At 59 and 118 residues the four pair transitions read a ceiling of 1,448 and
+ * the multimer's read 1,023; at 200 and 400, where they have started chunking,
+ * they drop out of the ranking entirely. `sampleFraction` is how far the
+ * largest sample actually is from the limit - a row extrapolating from under a
+ * sixteenth of it is a guess across more than an order of magnitude, and
+ * `caveat` says so.
+ *
  * The idea of computing what a prediction binds and checking it against a
  * device is @milot-mirdita's, from martin-steinegger/alphafold2-webgpu; that
  * repository is public and unlicensed, so this was written here rather than
@@ -87,6 +99,10 @@ export async function main(device, args) {
     rows.push({ label,
                 bytesAt: { [lengths[0]]: small, [lengths[1]]: big },
                 exponent: Math.round(exponent * 100) / 100,
+                // How far the LARGEST sample is from the limit. A small number
+                // means the ceiling below is extrapolated across orders of
+                // magnitude, and any budget in between is invisible.
+                sampleFraction: Math.round((big / limit) * 1000) / 1000,
                 ceilingResidues: Number.isFinite(ceiling) ? Math.floor(ceiling) : null });
   }
   rows.sort((a, b) => (a.ceilingResidues ?? Infinity) - (b.ceilingResidues ?? Infinity));
@@ -120,6 +136,12 @@ export async function main(device, args) {
       .sort((a, b) => a[0] - b[0])
       .map(([residues, members]) => ({ residues, labels: members.length, members })),
     labels: rows.length,
+    // Named rather than left to be noticed: the lowest group is only a finding
+    // if its largest sample is within reach of the limit.
+    caveat: binding === undefined || binding.sampleFraction >= 1 / 16 ? null
+      : `the lowest group extrapolates from ${Math.round(binding.sampleFraction * 1000) / 10}% `
+        + `of the limit; re-run at lengths where it is closer, or a label that CHUNKS `
+        + `above ${lengths[1]} residues will read as a ceiling`,
     tightest: rows.slice(0, 40),
   };
 }

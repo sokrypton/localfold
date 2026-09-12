@@ -2005,6 +2005,31 @@ tab, which is the other half of why this is recorded rather than built.
 exactly this reason now. A one-label fix is worth something only where
 `lowestCeilingGroup.labels` is 1.
 
+🔴 **AND THE MULTIMER'S TIE IS FORTY-TWO, NOT TWENTY-EIGHT.** The table above is
+the monomer. Run against `--family=multimer`, the same 2,047 carries 42 labels -
+the same twelve triangle passes plus the TEMPLATE stack's own triangle
+multiplication, its two pair transitions, `template.input` and `template.output`
+- against 82 labels in the fold. Same conclusion, more of it.
+
+🔴 **AND BOTH SAMPLED LENGTHS HAVE TO SIT ABOVE EVERY CHUNK THRESHOLD.** This is
+the probe's own trap and it fired twice before it was noticed. A transition
+chunks against `TRANSITION_CHUNK_TARGET_BYTES` (32 MiB), so below that it grows
+as a clean `L^2` and the extrapolation sails through a threshold it cannot see:
+
+| sampled at | what the pair transitions read |
+|---|---|
+| 59 and 118 (monomer) | a ceiling of **1,448** |
+| 60 and 120 (multimer) | a ceiling of **1,023** |
+| 200 and 400 | **absent from the ranking** - chunking has started, the exponent is ~0 |
+
+All three describe the same handled code. `sampleFraction` is the largest
+sample as a fraction of the limit and `caveat` says it out loud: at 59/118 the
+lowest group extrapolates from **2.7%** of the limit, which is a guess across
+more than an order of magnitude. At 200/400 the transitions and the outer
+product mean both drop out and the 2,047 tie stands on its own - 26 labels
+there against 28, the difference being two template labels those lengths do not
+reach.
+
 🔴 **AND TWO LENGTHS ARE NEEDED TO SEE ANY OF THIS.** A binding that grows as `L`
 and one that grows as `L^2` are indistinguishable in a single run and give out at
 completely different lengths. The exponent column is what separates "already
