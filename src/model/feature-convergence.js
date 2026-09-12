@@ -51,41 +51,53 @@ export function relativeChange(previous, current) {
  *
  * 🔴 THE TOLERANCE IS IN ANGSTROMS, AND THAT IS THE POINT. The pair and single
  * deltas beside it are dimensionless, so a threshold on them means something
- * different for every model and token count and can only be fitted per shape.
- * `distanceAngstroms` is the RMS change of the distances the DISTOGRAM predicts
- * - the same quantity ColabFold's `compute_tol` takes over a structure, whose
- * default tolerance is 0.5 A - so AF2's criterion and this one are finally the
- * same measurement in the same unit, one taken from coordinates and one from
- * the trunk.
+ * different for every model and token count. `distanceAngstroms` is the RMS
+ * change of the distances the DISTOGRAM predicts - the same quantity
+ * ColabFold's `compute_tol` takes over a structure, whose default tolerance is
+ * 0.5 A - so AF2's criterion and this one are the same measurement in the same
+ * unit, one from coordinates and one from the trunk.
  *
- * 🔴 AND IT IS THE ONLY ONE OF THE THREE A SAMPLED STRUCTURE CANNOT CONTRADICT.
- * Measured on a 250-token input at three seeds, the distogram change reads
- * 0.4195, 0.2602 and 0.2289 A on every one of them, bit for bit, while the
- * structures those same folds produced differ by 4.6 to 12.7 A. The trunk is
- * deterministic; only the sampler is not. See docs/AF3.md.
+ * 🔴 AND IT NEEDS TWO PASSES UNDER THE TOLERANCE, NOT ONE, BECAUSE THE TRUNK
+ * DOES NOT SETTLE MONOTONICALLY. Measured over six real sequences at three
+ * recycles, the per-pass change in angstroms:
  *
- * PASS 0 NEVER STOPS: it has no previous pass to compare against, so its delta
- * carries no `distanceAngstroms` at all.
+ *     1qys (Top7)   1.329  0.715  1.240      villin HP36  2.842  0.611  0.134
+ *     6mrr          0.386  0.122  0.140      ubiquitin    1.684  2.418  0.336
+ *     GB1           0.488  1.092  0.394      lysozyme     0.329  0.132  0.095
  *
- * @param {number} pass
- * @param {{distanceAngstroms?: number}} delta
+ * **GB1 dips under 0.5 at pass 1 and then moves 1.092 A at pass 2.** A rule
+ * that stops at the first crossing throws that pass away; requiring two in a
+ * row is safe on all six and still stops 6mrr and lysozyme a pass early. Two
+ * inputs measured before this corpus were both monotone, which is exactly how
+ * the single-crossing rule looked sound. See docs/AF3.md.
+ *
+ * PASS 0 NEVER STOPS: it has no previous pass, so it carries no
+ * `distanceAngstroms` at all, and an absent one is NOT converged.
+ *
+ * @param {{distanceAngstroms?: number}[]} deltas every pass so far, in order
  * @param {number} tolerance angstroms; 0 disables early stopping
+ * @param {number} [passes] consecutive passes required under the tolerance
  */
-export function shouldStopRecycling(pass, delta, tolerance) {
+export function shouldStopRecycling(deltas, tolerance, passes = 2) {
   if (typeof tolerance !== "number" || !Number.isFinite(tolerance) || tolerance < 0) {
     throw new RangeError("recycle tolerance must be finite and non-negative");
   }
-  if (!Number.isSafeInteger(pass) || pass < 0) {
-    throw new RangeError("pass must be a non-negative integer");
+  if (!Number.isSafeInteger(passes) || passes < 1) {
+    throw new RangeError("the consecutive pass count must be a positive integer");
   }
-  const change = delta?.distanceAngstroms;
-  // 🔴 ABSENT IS NOT CONVERGED. A pass with no distogram - the first, or a
-  // model whose head this fold did not run - must not read as zero and stop.
-  if (change === undefined) return false;
-  if (typeof change !== "number" || !Number.isFinite(change) || change < 0) {
-    throw new RangeError("the distogram change must be finite and non-negative");
+  if (!Array.isArray(deltas)) throw new TypeError("shouldStopRecycling takes the delta history");
+  if (tolerance === 0 || deltas.length < passes) return false;
+  for (const delta of deltas.slice(-passes)) {
+    const change = delta?.distanceAngstroms;
+    // Absent is not converged: the first pass has no previous to compare with,
+    // and a model whose distogram this fold did not run has nothing to say.
+    if (change === undefined) return false;
+    if (typeof change !== "number" || !Number.isFinite(change) || change < 0) {
+      throw new RangeError("the distogram change must be finite and non-negative");
+    }
+    if (!(change < tolerance)) return false;
   }
-  return pass > 0 && tolerance > 0 && change < tolerance;
+  return true;
 }
 
 

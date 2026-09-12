@@ -943,8 +943,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // the distogram's predicted distances, which is the quantity ColabFold's
     // compute_tol takes over a structure. What the right number is has been
     // measured on two inputs and not on a corpus - see docs/AF3.md.
-    if (shouldStopRecycling(pass, recycleDeltas[recycleDeltas.length - 1],
-                            featureTolerance)) {
+    if (shouldStopRecycling(recycleDeltas, featureTolerance)) {
       await stage("recycle-converged", { pass, passes: recycles + 1 });
       break;
     }

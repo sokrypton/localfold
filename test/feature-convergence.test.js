@@ -82,32 +82,48 @@ describe("distanceChange", () => {
 });
 
 describe("shouldStopRecycling", () => {
-  const settled = { distanceAngstroms: 0.1 };
+  const under = { distanceAngstroms: 0.1 };
+  const over = { distanceAngstroms: 0.9 };
+  const first = { pair: 1, single: 1 };   // pass 0 carries no distance
 
-  it("never stops at pass 0", () => {
-    assert.equal(shouldStopRecycling(0, settled, 0.5), false);
+  it("never stops on one pass alone, however settled it looks", () => {
+    assert.equal(shouldStopRecycling([first, under], 0.5), false);
+  });
+
+  it("stops once two consecutive passes are under the tolerance", () => {
+    assert.equal(shouldStopRecycling([first, under, under], 0.5), true);
   });
 
   it("never stops when the tolerance is zero, which is the default", () => {
-    assert.equal(shouldStopRecycling(3, settled, 0), false);
+    assert.equal(shouldStopRecycling([first, under, under], 0), false);
   });
 
-  it("stops when the predicted distances have settled below the tolerance", () => {
-    assert.equal(shouldStopRecycling(1, settled, 0.5), true);
-    assert.equal(shouldStopRecycling(1, { distanceAngstroms: 0.9 }, 0.5), false);
+  it("🔴 is not fooled by GB1, where the trunk dips and then moves again", () => {
+    // 0.488 under 0.5, then 1.092 - measured, and the reason one crossing is
+    // not enough. See src/model/feature-convergence.js.
+    const gb1 = [first, { distanceAngstroms: 0.488 }, { distanceAngstroms: 1.092 },
+                 { distanceAngstroms: 0.394 }];
+    assert.equal(shouldStopRecycling(gb1.slice(0, 2), 0.5), false, "one crossing is not enough");
+    assert.equal(shouldStopRecycling(gb1.slice(0, 3), 0.5), false, "the pass after it is over");
+    assert.equal(shouldStopRecycling(gb1, 0.5), false, "and it never gets two in a row");
+  });
+
+  it("stops 6mrr at the pass the corpus says", () => {
+    const mrr = [first, { distanceAngstroms: 0.386 }, { distanceAngstroms: 0.122 }];
+    assert.equal(shouldStopRecycling(mrr.slice(0, 2), 0.5), false);
+    assert.equal(shouldStopRecycling(mrr, 0.5), true);
   });
 
   it("🔴 treats an ABSENT distogram as not converged, never as zero", () => {
-    // The first pass carries no distanceAngstroms, and neither would a model
-    // whose head this fold did not run. Reading that as 0 would stop instantly.
-    assert.equal(shouldStopRecycling(1, {}, 0.5), false);
-    assert.equal(shouldStopRecycling(1, { pair: 0, single: 0 }, 0.5), false);
-    assert.equal(shouldStopRecycling(1, undefined, 0.5), false);
+    assert.equal(shouldStopRecycling([first, {}, {}], 0.5), false);
+    assert.equal(shouldStopRecycling([first, under, {}], 0.5), false);
   });
 
-  it("refuses a tolerance or a change it cannot compare", () => {
-    assert.throws(() => shouldStopRecycling(1, settled, -1), RangeError);
-    assert.throws(() => shouldStopRecycling(1, { distanceAngstroms: Number.NaN }, 0.5), RangeError);
-    assert.throws(() => shouldStopRecycling(-1, settled, 0.5), RangeError);
+  it("refuses a tolerance, a pass count or a change it cannot compare", () => {
+    assert.throws(() => shouldStopRecycling([first, under, under], -1), RangeError);
+    assert.throws(() => shouldStopRecycling([first, under, under], 0.5, 0), RangeError);
+    assert.throws(() => shouldStopRecycling(
+      [under, { distanceAngstroms: Number.NaN }], 0.5), RangeError);
+    assert.throws(() => shouldStopRecycling(undefined, 0.5), TypeError);
   });
 });

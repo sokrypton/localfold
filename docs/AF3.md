@@ -2123,10 +2123,38 @@ At 0.5 A the default input runs **two passes instead of four**, 2.301 s ->
 1.944 s, for a pLDDT change of 0.126 - smaller than that fold's own seed spread
 of 0.520.
 
-🔴 **IT STILL SHIPS AT ZERO.** Two inputs are not a corpus, the harder one is a
-synthetic repeat, and both of them converge under 0.5 A by the first pass, which
-is exactly the regime where a criterion is least tested: nothing here has
-measured an input that legitimately needs its fourth recycle. What has been
-established is the instrument and its unit, not the threshold. The next step is
-a corpus, and `recycleDeltas` reports all three numbers on every fold so one can
-be gathered from runs people were doing anyway.
+🔴 **AND SIX REAL SEQUENCES KILLED THE ONE-CROSSING RULE.** The two inputs above
+both settle monotonically, which is exactly what made a first-crossing threshold
+look sound. Folded at three recycles, the per-pass change in angstroms:
+
+| | tokens | pLDDT | pass 1 | pass 2 | pass 3 |
+|---|---:|---:|---:|---:|---:|
+| 1qys (Top7, de novo) | 91 | 81.64 | 1.329 | 0.715 | 1.240 |
+| 6mrr | 71 | 70.20 | 0.386 | 0.122 | 0.140 |
+| **GB1** | 56 | 74.13 | **0.488** | **1.092** | 0.394 |
+| lysozyme C | 129 | 36.23 | 0.329 | 0.132 | 0.095 |
+| ubiquitin | 76 | 90.43 | 1.684 | 2.418 | 0.336 |
+| villin HP36 | 36 | 90.55 | 2.842 | 0.611 | 0.134 |
+
+**The trunk does not settle monotonically.** GB1 dips under 0.5 A at pass 1 and
+then moves **1.092 A** at pass 2; ubiquitin rises from 1.684 to 2.418 before
+falling; 1qys never settles at all. A rule that stops at the first crossing
+throws GB1's second pass away.
+
+**Two consecutive passes under the tolerance is safe on all six** and still
+stops 6mrr and lysozyme a pass early. It is not fitted to these numbers - one
+step under a threshold is the textbook thing not to trust - but GB1 is why it is
+there, and `test/feature-convergence.test.js` pins that sequence by name so the
+rule cannot be simplified back. At 0.5 A the default input then runs three
+passes instead of four, 2.255 -> 2.131 s, for a pLDDT change of 0.084 against
+its own seed spread of 0.520.
+
+🔴 **IT STILL SHIPS AT ZERO.** Six sequences are a corpus in the sense that they
+falsified a rule, and not in the sense that they calibrate one: four of the six
+never reach two consecutive passes under 0.5 A within three recycles, so what
+the tolerance buys on a real workload is two folds' worth of evidence. The
+saving where it does fire is one pass of four. What is established is the
+instrument, its unit and the shape of the rule; the threshold is not, and a
+default that silently drops a recycle should be worth more than that before it
+is one. `recycleDeltas` reports all three numbers on every fold, so the corpus
+can keep growing from runs people were doing anyway.
