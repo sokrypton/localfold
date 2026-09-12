@@ -2295,3 +2295,49 @@ largest single kernel family here is occupancy-bound at 16.
 Caveat on the ratio itself: **the 5.27 s is the recorded JAX number and was not
 re-run** - the AF2-vendored branch it came from is not on this box. It is a
 bf16, Triton-flash-attention, whole-graph-XLA run of the same model.
+
+## The transition chunk was a 59-residue memory trade, and at 825 it costs 5.4%
+
+`TRANSITION_CHUNK_TARGET_BYTES` is 32 MiB and the note above it prices the knee
+on a **59-residue** fold at 512 MSA rows, as device peak against wall: no cap
+681 MiB / 5256 ms, 32 MiB 573 / 5294, 16 MiB 553 / 5354. That is a memory
+question. At 825 residues it is a different one - the transitions are **263 of a
+block's 339 dispatches** - and nobody had asked it.
+
+`transitionChunkBytes` is the knob now (null takes the constant). Swept in
+situ at 825 residues and 512 rows, interleaved, two rounds, minimum per arm:
+
+| MiB | block | | MiB | block |
+|---:|---:|---|---:|---:|
+| 16 | 202.95 | | 256 | **181.71** |
+| 32 (the constant) | 192.12 | | 512 | 181.18 |
+| 64 | 188.56 | | 1024 | 180.51 |
+| 128 | 184.24 | | 2047 | 180.04 |
+
+**256 MiB is the knee**, the same value `opmPairBlockBytes` landed on: 32 -> 256
+is **5.4% of a block**, and eight times the memory past it buys 0.9% more.
+
+End to end, `fold-af2.js --recycles=0 --repeat=2`, warm and device peak:
+
+| | warm | peak | checksum |
+|---|---:|---:|---:|
+| 825 residues, 512/1024, 32 MiB | 11195 ms | 6803.4 MiB | -121844157 |
+| ...256 MiB | **10742** | 6971.4 | **-121844157** |
+| 59 residues, 512/1024, 32 MiB | 414 | 540.0 | -329598 |
+| ...256 MiB | **398** | 575.0 | **-329598** |
+| the 30,29 multimer | 210 / 213 | 442.8 both | 315591 both |
+
+**4.0% of a fold for 168 MiB, and bit-identical** - chunking splits ROWS and
+reorders no sum, so there is no accuracy question to ask. The multimer is inert
+because at 59 residues and 128 rows nothing chunks at either value. Set in the
+**ampere prior only**, like `opmPairBlockBytes`: the cost is memory and a laptop
+keeps the constant.
+
+🔴 **AND `audit-knobs.py` CALLS IT DEAD UNLESS THE WORKLOAD CHUNKS.** On the
+default `fold-af2` shape - 59 residues, 128 rows - the MSA transition is 30.9 MB
+and nothing chunks at any value, so the dispatch digest cannot move; even at
+`--rows=512 --extra-rows=1024` it is 123.7 MB and the audit's candidates
+(512 and 128 MiB) are both above it. At 825 residues it reads **moved**. This is
+the caveat CLAUDE.md already gives - "the workload matters" - with a second
+instance: a knob whose threshold the workload never crosses is indistinguishable
+from a knob that does nothing.

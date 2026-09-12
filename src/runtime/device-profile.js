@@ -283,6 +283,12 @@ export const DEFAULT_TUNING = Object.freeze({
   // this as reverted on AF2 for a race; the race was in the BISECTION - see
   // src/evoformer/attention-matrix.js on why the staging loop's trip count is
   // not uniform at a head of eight.
+  // 🔴 HOW MANY BYTES ONE TRANSITION CHUNK MAY BIND, overriding
+  // TRANSITION_CHUNK_TARGET_BYTES. That constant's 32 MiB knee was measured on a
+  // 59-RESIDUE fold as a memory trade - device peak against wall - and the
+  // transitions are 263 of an 825-residue block's 339 dispatches, which is a
+  // different question. null takes the constant.
+  transitionChunkBytes: null,
   attentionMatrixPrefetch: null,
   // 🔴 AND THE SAME UNITS ON AF3's `grid.attend`, WHICH IS A DIFFERENT KERNEL
   // AND A DIFFERENT KNOB. It is the largest pass in the pairformer and the only
@@ -549,6 +555,18 @@ const PRIORS = new Map([
     // before trusting it on another part; see src/evoformer/attention-matrix.js.
     attentionMatrix: true,
     attentionMatrixTile: "4x32",
+    // 🔴 THE TRANSITION CHUNK, RE-SWEPT AT 825 RESIDUES. TRANSITION_CHUNK_TARGET_BYTES
+    // is 32 MiB and its knee was measured on a 59-residue fold as a MEMORY
+    // trade. At 825 with 512 rows the transitions are 263 of a block's 339
+    // dispatches, and the same sweep as time is monotone: 16 MiB 202.95 ms,
+    // 32 192.12, 64 188.56, 128 184.24, **256 181.71**, then 512 181.18, 1024
+    // 180.51 and 2047 180.04 - so 256 takes 5.4% of the block and eight times
+    // the memory past it takes 0.9% more. A fold at 825/512/1024: warm
+    // 11195 -> 10742 ms for 6803 -> 6971 MiB, and at 59 residues 414 -> 398 for
+    // 540 -> 575. **Bit-identical at both** (-121844157 and -329598), because
+    // chunking splits rows and reorders no sum. Ampere only: the cost is 168 MiB
+    // and a laptop keeps the 32 MiB constant.
+    transitionChunkBytes: 256 * 1024 * 1024,
     // 🔴 AND AF3's `grid.attend` ON THE SAME UNITS, SWEPT IN THE TRUNK. It is
     // the largest pass in the pairformer and the only cubic one; measured as
     // GPU pass time over eight blocks, at 32 MSA rows, medians reproducible
