@@ -10,6 +10,16 @@ gate cannot see an error inside one of them.
 
 ## Running anything that needs a GPU
 
+🔴 **AND EVERY NUMBER THIS HARNESS PRODUCES IS BEHIND TWO DEVELOPER FLAGS WORTH
+1.95x.** `gpu-chrome.mjs` and `tools/cdp.py` both pass
+`--enable-dawn-features=vulkan_enable_f16_on_nvidia` and `--enable-unsafe-webgpu`;
+on this A100 with Chrome 152 the first is the only reason `shader-f16` exists
+and the second the only reason `chromium-experimental-subgroup-matrix` does. A
+stock Chrome has **neither**, and the same 825-residue fold is **10767 ms with
+them and 21000 without**. `LOCALFOLD_STOCK_FLAGS=1` drops both and is how to ask
+what an NVIDIA visitor actually gets. See docs/A100.md.
+
+
 ```
 node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]
 ```

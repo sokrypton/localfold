@@ -105,10 +105,25 @@ const LINUX_HEADLESS = process.env.LOCALFOLD_HEADLESS === "1";
 // Dawn's own caveat: they turned it off because f16 CTS tests were failing.
 // docs/A100.md records what this repository's differential checkers say
 // about that, which is the only evidence here that bears on it.
+//
+// 🔴 AND TWO OF THESE ARE DEVELOPER FLAGS A USER'S CHROME DOES NOT HAVE, WHICH
+// MAKES EVERY NUMBER TAKEN HERE A CONFIGURATION AND NOT A DELIVERY. Measured on
+// this card, Chrome 152, by asking the adapter with each flag removed:
+//
+//   both flags                     shader-f16 YES  subgroup-matrix YES  25 features
+//   without the dawn f16 toggle    shader-f16 NO   subgroup-matrix YES  24
+//   without --enable-unsafe-webgpu shader-f16 YES  subgroup-matrix NO   20
+//   without either                 shader-f16 NO   subgroup-matrix NO   19
+//
+// So on an NVIDIA GPU a stock Chrome gives this port neither its f16 storage
+// nor its matrix units. `LOCALFOLD_STOCK_FLAGS=1` drops both, which is how to
+// ask what a visitor actually gets rather than what this box can be made to do.
+// tools/cdp.py carries the same two flags, so the PAGE numbers are no different.
+const STOCK_FLAGS = process.env.LOCALFOLD_STOCK_FLAGS === "1";
 const PLATFORM_FLAGS = process.platform === "linux"
   ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
      "--ignore-gpu-blocklist", "--no-sandbox",
-     "--enable-dawn-features=vulkan_enable_f16_on_nvidia"]
+     ...(STOCK_FLAGS ? [] : ["--enable-dawn-features=vulkan_enable_f16_on_nvidia"])]
   : [];
 const TYPES = {
   ".js": "text/javascript", ".mjs": "text/javascript", ".html": "text/html",
@@ -309,7 +324,7 @@ async function main() {
     : join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
   const chrome = ANDROID ? null : spawn(CHROME, [
     ...(process.platform === "linux" && !LINUX_HEADLESS ? [] : ["--headless=new"]),
-    "--enable-unsafe-webgpu", "--disable-gpu-sandbox",
+    ...(STOCK_FLAGS ? [] : ["--enable-unsafe-webgpu"]), "--disable-gpu-sandbox",
     ...PLATFORM_FLAGS,
     // performance.memory rounds to 100 KiB without this, which is too coarse to
     // see a tensor cache being dropped. It affects nothing else.
