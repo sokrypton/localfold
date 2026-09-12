@@ -2341,3 +2341,50 @@ and nothing chunks at any value, so the dispatch digest cannot move; even at
 the caveat CLAUDE.md already gives - "the workload matters" - with a second
 instance: a knob whose threshold the workload never crosses is indistinguishable
 from a knob that does nothing.
+
+## What else was fitted at the wrong length: the audit, and two more negatives
+
+The transition chunk hid because the 825-residue re-sweep could only see
+**knobs**, and it was a module CONSTANT - and `audit-knobs.py` cannot see it
+either, since that iterates `DEFAULT_TUNING`. So both populations were swept.
+
+**Constants whose own comment justifies them only at a short length** (parsed
+out of `src/`, comment block above each `export const`):
+
+| | cited at | |
+|---|---|---|
+| `TRANSITION_CHUNK_TARGET_BYTES` | 59 residues | **fixed** - see above |
+| `PAIR_LOGITS_CACHE_BYTES` (AF3) | 200 tokens | 🔴 the same SHAPE as the bug above |
+| `OPM_CELL_CHUNK` (AF3) | 150 tokens | |
+| `OPM_BLOCK_I` (AF3) | 59 and 150 tokens | |
+| `TRANSITION_SPLIT_MIN_CHANNELS` (AF3) | 400 tokens | a channel threshold, not a length one |
+| `PAIR_SCRATCH_STORAGE` | 200 and 300 tokens | exported and unused, so moot |
+
+`PAIR_LOGITS_CACHE_BYTES` is the one to look at: its own note says the cache is
+`64 x tokens^2` bytes a block, so the 64 MiB cap keeps **all twenty-four blocks
+at 208 tokens or fewer and six at 400** - and about three at 512. It was
+measured at 200 tokens, where it covered everything, and is worth 4% of a fold
+there. That is exactly the transition chunk's shape: a byte cap fitted where it
+covered the whole workload. Not measured here; AF3, not AF2.
+
+**Knobs the ampere prior sets that had never been re-swept at 825.** Of its 34,
+six had been. Twelve of the rest are AF2-reachable, and ten of those are
+booleans of the form "does this device have matrix units", which the API answers
+and a length does not change. The two that carry a SHAPE were swept:
+
+| | arms | verdict |
+|---|---|---|
+| `attentionGroup` | 1, 2, 4, 8 | **flat** - 181.72 / 181.61 / 181.74 / 181.51 ms, 0.13% |
+| `trianglePairProjectTile` | 32x32, 32x16, 16x32, 16x16 | **flat** - 181.76 / 181.70 / 181.70 / 181.77, 0.04% |
+
+`attentionGroup` is inert because AF2 resolves the MATRIX flash kernel here and
+the grouping belongs to the vector one; the triangle projections are 3.26 and
+1.76 ms of a 181.7 ms block, so there is nothing there to win either.
+
+🔴 **AND `--sweep` COULD NOT EXPRESS A SHAPED KNOB AT ALL, WHICH IS WHY ONE OF
+THOSE HAD NEVER BEEN SWEPT.** It split its values on every comma, and thirteen
+knobs take `{"rows":32,"columns":32}` - so the two fragments reached
+`shapedKnob`, which read them as unset, and AF2 died with **"projectTile
+undefinedxundefined"**. That is the third appearance of that trap in CLAUDE.md
+and the first where the instrument rather than the caller was what could not
+say it. The split respects braces now.
