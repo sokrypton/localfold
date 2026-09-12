@@ -558,9 +558,11 @@ export async function main(device, args) {
     accumulatePrecision: option(args, "accumulate", undefined),
     mode: samplerMode,
     recycles: Number(option(args, "recycles", "0")),
-    // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE. 0 is off; see
-    // src/model/feature-convergence.js and docs/AF3.md for what a number here
-    // has been measured to mean, which is two inputs' worth and not a corpus.
+    // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE, in ANGSTROMS, on
+    // the distances the distogram predicts - the same quantity and unit as
+    // AF2's, whose ColabFold default is 0.5. 0 is off; see
+    // src/model/feature-convergence.js and docs/AF3.md for what has actually
+    // been measured, which is two inputs' worth and not a corpus.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
@@ -787,6 +789,8 @@ export async function main(device, args) {
       pass: d.pass,
       pair: Number(d.pair.toExponential(3)),
       single: Number(d.single.toExponential(3)),
+      ...(d.distanceAngstroms === undefined
+        ? {} : { distanceAngstroms: Number(d.distanceAngstroms.toFixed(4)) }),
     })),
     meanPlddt: result.meanPlddt,
     ptm: result.ptm,

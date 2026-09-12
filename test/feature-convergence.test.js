@@ -9,7 +9,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { relativeChange, shouldStopRecycling } from "../src/model/feature-convergence.js";
+import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
+  from "../src/model/feature-convergence.js";
 
 describe("relativeChange", () => {
   it("is zero for a representation that did not move", () => {
@@ -44,31 +45,69 @@ describe("relativeChange", () => {
   });
 });
 
-describe("shouldStopRecycling", () => {
-  const settled = { pair: 1e-3, single: 1e-3 };
+describe("expectedDistances", () => {
+  // Two bins from one break: centres are the break itself at both ends.
+  const breaks = new Float32Array([10]);
 
-  it("never stops at pass 0, however settled it looks", () => {
-    assert.equal(shouldStopRecycling(0, settled, 0.02), false);
+  it("reads the centre of the bin all the mass is in", () => {
+    const certainlyNear = new Float32Array([50, 0]);
+    const certainlyFar = new Float32Array([0, 50]);
+    assert.ok(Math.abs(expectedDistances(certainlyNear, breaks)[0] - 10) < 1e-3);
+    assert.ok(Math.abs(expectedDistances(certainlyFar, breaks)[0] - 10) < 1e-3);
+  });
+
+  it("is a real expectation over the bins, not an argmax", () => {
+    // Three bins from breaks [6, 12], so centres are 6, 9 and 12 - the open
+    // first and last take the break itself. Uniform logits give their mean.
+    const out = expectedDistances(new Float32Array([0, 0, 0]), new Float32Array([6, 12]));
+    assert.ok(Math.abs(out[0] - 9) < 1e-4, `expected 9, got ${out[0]}`);
+  });
+
+  it("refuses logits that are not a whole number of rows", () => {
+    assert.throws(() => expectedDistances(new Float32Array(3), breaks), RangeError);
+  });
+});
+
+describe("distanceChange", () => {
+  it("is zero for a matrix that did not move, and RMS otherwise", () => {
+    const a = new Float32Array([1, 2, 3, 4]);
+    assert.equal(distanceChange(a, new Float32Array(a)), 0);
+    assert.equal(distanceChange(new Float32Array([0, 0]), new Float32Array([3, 4])),
+                 Math.sqrt((9 + 16) / 2));
+  });
+
+  it("refuses mismatched maps", () => {
+    assert.throws(() => distanceChange(new Float32Array(1), new Float32Array(2)), RangeError);
+  });
+});
+
+describe("shouldStopRecycling", () => {
+  const settled = { distanceAngstroms: 0.1 };
+
+  it("never stops at pass 0", () => {
+    assert.equal(shouldStopRecycling(0, settled, 0.5), false);
   });
 
   it("never stops when the tolerance is zero, which is the default", () => {
     assert.equal(shouldStopRecycling(3, settled, 0), false);
   });
 
-  it("stops when both tensors are under the tolerance", () => {
-    assert.equal(shouldStopRecycling(1, settled, 0.02), true);
+  it("stops when the predicted distances have settled below the tolerance", () => {
+    assert.equal(shouldStopRecycling(1, settled, 0.5), true);
+    assert.equal(shouldStopRecycling(1, { distanceAngstroms: 0.9 }, 0.5), false);
   });
 
-  it("needs BOTH: either one still moving means the trunk has not settled", () => {
-    assert.equal(shouldStopRecycling(1, { pair: 0.5, single: 1e-3 }, 0.02), false);
-    assert.equal(shouldStopRecycling(1, { pair: 1e-3, single: 0.5 }, 0.02), false);
+  it("🔴 treats an ABSENT distogram as not converged, never as zero", () => {
+    // The first pass carries no distanceAngstroms, and neither would a model
+    // whose head this fold did not run. Reading that as 0 would stop instantly.
+    assert.equal(shouldStopRecycling(1, {}, 0.5), false);
+    assert.equal(shouldStopRecycling(1, { pair: 0, single: 0 }, 0.5), false);
+    assert.equal(shouldStopRecycling(1, undefined, 0.5), false);
   });
 
-  it("refuses a delta or tolerance it cannot compare", () => {
+  it("refuses a tolerance or a change it cannot compare", () => {
     assert.throws(() => shouldStopRecycling(1, settled, -1), RangeError);
-    assert.throws(() => shouldStopRecycling(1, settled, Number.NaN), RangeError);
-    assert.throws(() => shouldStopRecycling(1, { pair: Number.NaN, single: 0 }, 0.02), RangeError);
-    assert.throws(() => shouldStopRecycling(1, undefined, 0.02), RangeError);
-    assert.throws(() => shouldStopRecycling(-1, settled, 0.02), RangeError);
+    assert.throws(() => shouldStopRecycling(1, { distanceAngstroms: Number.NaN }, 0.5), RangeError);
+    assert.throws(() => shouldStopRecycling(-1, settled, 0.5), RangeError);
   });
 });

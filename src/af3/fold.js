@@ -26,7 +26,7 @@
  * were made with.
  */
 import { ELEMENT_SYMBOLS } from "./ccd-component.js";
-import { relativeChange, shouldStopRecycling }
+import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
   from "../model/feature-convergence.js";
 import { af3ContactClasses } from "./contact-classes.js";
 import { perAtomConditioning } from "./atom-conditioning-reference.js";
@@ -844,6 +844,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
   const featureTolerance = options.recycleTolerance ?? 0;
   // A resumed fold brings a real previous; a fresh one brings a zero seed.
   let hasPrevious = reused !== undefined;
+  /** The previous pass's predicted distance matrix, for the angstrom metric. */
+  let previousDistances;
   for (let pass = firstPass; pass <= recycles; pass += 1) {
     await stage("recycle", { pass, passes: recycles + 1 });
     // 🔴 THE WHOLE ALIGNMENT, NOT ITS FIRST ROW. This passed `sequences: 1` and
@@ -918,17 +920,29 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // changed - rather than measured.
     const comparable = hasPrevious && previousPair.length === trunk.pair.length
       && previousSingle.length === trunk.single.length;
+    // 🔴 AND THE DISTOGRAM, WHICH IS THE ONE IN ANGSTROMS. Every pass computes
+    // one already - the contact map is shown while the trunk is still
+    // recycling - so the expectation over its bins is a predicted distance
+    // matrix for free, and its RMS change is the quantity AF2 stops on. See
+    // src/model/feature-convergence.js.
+    const distances = trunk.logits === undefined ? undefined
+      : expectedDistances(trunk.logits, trunk.binEdges);
     recycleDeltas.push({
       pass,
       pair: comparable ? relativeChange(previousPair, trunk.pair) : 1,
       single: comparable ? relativeChange(previousSingle, trunk.single) : 1,
+      ...(distances === undefined || previousDistances === undefined
+        || previousDistances.length !== distances.length
+        ? {} : { distanceAngstroms: distanceChange(previousDistances, distances) }),
     });
+    previousDistances = distances;
     hasPrevious = true;
     previousPair = trunk.pair;
     previousSingle = trunk.single;
-    // 🔴 OFF UNLESS ASKED, like AF2's. A tolerance that fires is a fold with
-    // fewer trunk passes than the caller requested, and what the right number
-    // is has been measured on two inputs and not on a corpus - see docs/AF3.md.
+    // 🔴 OFF UNLESS ASKED, like AF2's, and in ANGSTROMS like AF2's - it reads
+    // the distogram's predicted distances, which is the quantity ColabFold's
+    // compute_tol takes over a structure. What the right number is has been
+    // measured on two inputs and not on a corpus - see docs/AF3.md.
     if (shouldStopRecycling(pass, recycleDeltas[recycleDeltas.length - 1],
                             featureTolerance)) {
       await stage("recycle-converged", { pass, passes: recycles + 1 });

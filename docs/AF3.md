@@ -2086,10 +2086,47 @@ model that had folded a moment earlier. The strictness is worth keeping for the
 passes that DO compare, so pass 0 is reported as 1 rather than measured: it has
 no previous by construction, which the zero seed was only ever standing in for.
 
-🔴 **SO THE TOLERANCE IS NOT CALIBRATED AND SHIPS AT ZERO.** What a number means
-has been measured on two inputs, one of which is a synthetic repeat the model
-never converges on - and the quantity that would calibrate it is unusable. The
-next instrument is the DISTOGRAM: it is computed per pass from the pair
-representation, it is deterministic, and every pass already has one. Comparing
-distograms across passes measures what the trunk did without asking the sampler
-anything.
+🔴 **SO THE CRITERION READS THE DISTOGRAM, WHICH IS THE ONE TRUNK QUANTITY IN
+ANGSTROMS.** Every pass computes one already, to draw the contact map while the
+trunk is still recycling, so the expectation over its 64 bins is a predicted
+distance matrix for free - and the RMS change of that matrix is exactly what
+ColabFold's `compute_tol` takes over a structure. AF2's criterion and this one
+are the same measurement in the same unit, one from coordinates and one from
+the trunk. `expectedDistances` and `distanceChange` in
+src/model/feature-convergence.js; the tolerance is angstroms and ColabFold's
+default for the analogous number is 0.5.
+
+| pass | pair | single | **distogram** |
+|---:|---:|---:|---:|
+| 68 tokens, 1 | 0.0725 | 0.0554 | **0.1244 A** |
+| 2 | 0.0159 | 0.0070 | **0.0393** |
+| 3 | 0.0045 | 0.0023 | **0.0184** |
+| 250 tokens, 1 | 0.0970 | 0.0373 | **0.4195** |
+| 2 | 0.0705 | 0.0115 | **0.2602** |
+| 3 | 0.0479 | 0.0084 | **0.2289** |
+
+🔴 **AND IT IS BIT-IDENTICAL ACROSS SAMPLER SEEDS** - 0.4195, 0.2602 and 0.2289
+on every seed of the 250-token input, to four figures, while the structures
+those same folds produced differ by 4.6 to 12.7 A. That is the whole argument
+for the instrument: the trunk is deterministic and only the sampler is not, so
+this is the one number a stochastic structure cannot contradict.
+
+**And it resolves the 250-token puzzle.** That input looked unconverged because
+its structures moved 3.3 A between recycle counts. Its TRUNK was converging the
+whole time - 0.42 to 0.26 to 0.23 A, under ColabFold's tolerance from the first
+pass - and every angstrom of that structural variation was the sampler on a
+pLDDT-42 input. Low confidence does not mean the trunk is still moving; it means
+the sampler cannot commit, which is a different thing and the structure cannot
+tell them apart.
+
+At 0.5 A the default input runs **two passes instead of four**, 2.301 s ->
+1.944 s, for a pLDDT change of 0.126 - smaller than that fold's own seed spread
+of 0.520.
+
+🔴 **IT STILL SHIPS AT ZERO.** Two inputs are not a corpus, the harder one is a
+synthetic repeat, and both of them converge under 0.5 A by the first pass, which
+is exactly the regime where a criterion is least tested: nothing here has
+measured an input that legitimately needs its fourth recycle. What has been
+established is the instrument and its unit, not the threshold. The next step is
+a corpus, and `recycleDeltas` reports all three numbers on every fold so one can
+be gathered from runs people were doing anyway.
