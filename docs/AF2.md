@@ -2245,15 +2245,52 @@ is 27% off the block - main stack 9.22 -> 6.7 s and a fold of about **8.5 s,
 1.61x JAX**. So the largest single identified gap is the flash attention's
 efficiency, and closing it completely does not reach JAX.
 
-🔴 **AND THE REMAINDER IS PRECISION, WHICH THIS PORT HAS NEVER SPENT.** All
-**79** activation allocations in `src/evoformer/`, `src/model/` and
-`src/multimer/` are f32 - `grep` for a storage argument returns zero. AF3's pair
-track passes `"f16"`, the ESM-C tower does, the AF2 transition does for its
-weights; the AF2 activation path does not, anywhere. The other WebGPU port
-defaults three of its storages to f16 and JAX runs bf16 tensor cores end to end,
-which is why 39.7 TFLOP/s is 13% of the 310.9 this card's units issue at. That
-is the structural difference, and docs/AF2.md has recorded it as "the cheapest
-thing to try first" without it being tried.
+🔴 **AND THE REMAINDER IS PRECISION - BUT NOT AS AN ACTIVATION-PACKING JOB, AND
+THE PARAGRAPH THAT USED TO STAND HERE WAS WRONG TWICE.** It said all 79
+activation allocations in `src/evoformer/`, `src/model/` and `src/multimer/` are
+f32 because "a grep for a storage argument returns zero". The grep matched a
+LITERAL `"f16"`, and the storage is passed as a variable: parsing the calls
+instead, **16 of 102 pass a storage argument**, and they are the ones that
+matter - `attention.query`/`key`/`value`/`gate` are already f16 through
+`projectedStorage`, and so are the attention's normalised input and the
+transition's hidden. The packing this port could cheaply take, it took.
+
+And the rest would not buy speed, which is the second error. **None of the
+block's large kernels is anywhere near bandwidth-bound.** Bytes moved over
+measured milliseconds, against this card's ~1555 GB/s:
+
+| kernel | ms | GB | GB/s | of HBM |
+|---|---:|---:|---:|---:|
+| `triangle.outgoing.contract` | 6.73 | 1.05 | 155 | 10.0% |
+| `msa-row-attention.project` | 8.45 | 1.30 | 154 | 9.9% |
+| `msa-column-attention.flash` | 11.20 | 1.08 | 97 | 6.2% |
+| `opm.contract` | 17.98 | 1.19 | 66 | 4.3% |
+| `msa-row-attention.flash` | 22.26 | 1.10 | 50 | 3.2% |
+| `triangle-attention-starting.flash` | 17.81 | 0.88 | 50 | 3.2% |
+
+The heaviest reaches a tenth of the bus and the flash attentions a thirtieth, so
+**halving an operand's bytes cannot move a kernel that is not waiting on
+them.** The flash attentions sit at 16 TFLOP/s for the reason docs/A100.md
+already gives - occupancy capped by workgroup memory - and that is a tile and
+register problem, not a storage one.
+
+🔴 **AND THE TRIANGLE'S SCRATCH IS THE ONE PLACE PACKING IS ALREADY MEASURED,
+AS A LOSS.** `createTriangleShaders` takes `{normalized, hidden, ab}` and AF2's
+block passes none of it, which reads like an omission. It is not:
+docs/PERF.md's bisection of the SAME shaders in AF3 has `a` and `b` costing
+**3x** the error - they are multiplied against each other, so their rounding
+squares - `normalized` 1.6x, and `hidden` nothing measurable. That is why
+`PAIR_SCRATCH_STORAGE` is exported and unused and all four AF3 stacks take
+`UNPACKED_PAIR_SCRATCH`. AF2 would be repeating a measured experiment.
+
+What activation packing WOULD buy here is memory and reach, not time: the fold's
+peak is 6803 MiB at 825 residues, and a packed pair is what moves the
+28-label binding ceiling from 2,047 residues to 2,896. That is a capacity
+argument and belongs with the ceiling section, not this one.
+
+So the honest remainder against JAX is arithmetic: 39.7 TFLOP/s is 13% of the
+310.9 this card's units issue at, JAX runs bf16 tensor cores end to end, and the
+largest single kernel family here is occupancy-bound at 16.
 
 Caveat on the ratio itself: **the 5.27 s is the recorded JAX number and was not
 re-run** - the AF2-vendored branch it came from is not on this box. It is a
