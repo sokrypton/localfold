@@ -44,6 +44,25 @@ npm i webgpu@0.4.0 --no-save     # not the pin: macOS wants 0.6.0
 XDG_RUNTIME_DIR=/tmp/xdg npm run test:gpu
 ```
 
+🔴 **AND ITS ADAPTER HAS NO `shader-f16` UNTIL YOU ASK - WHICH IS A MISSING
+TOGGLE AND NOT A PROPERTY OF DAWN.** Every one of the 25 `create(...)` calls in
+`test/*.gpu.test.js` passes `[]`, and measured here on webgpu@0.4.0:
+
+```
+create([])                                                  f16 no   matrix no   18 features
+create(["enable-dawn-features=vulkan_enable_f16_on_nvidia"]) f16 YES  matrix no   19
+create(["enable-dawn-features=vulkan_enable_f16_on_nvidia,allow_unsafe_apis"])
+                                                            f16 YES  matrix YES  21
+```
+
+Note no leading `--`, and that a second toggle goes after a COMMA rather than in
+a second array element, which throws "Flags expected argument format is
+`<key>=<value>`". So the Dawn lane can run the f16 AND the subgroup-matrix arms
+that the paragraph below says it cannot; those 25 call sites want one shared
+helper. **AND THIS IS WHY A NODE LIBRARY IS THE ONE PLACE THIS PORT CAN
+GUARANTEE ITS OWN FAST PATH**: in a browser the two capabilities need flags the
+visitor must pass, and in Node the process sets them itself.
+
 🔴 **AND ITS ADAPTER HAS NO `shader-f16`, WHERE CHROME'S DOES.** That is where
 this file's old claim that neither machine has the feature came from - it was
 measured through Dawn. Chrome on this same card reports `shader-f16` on both the
