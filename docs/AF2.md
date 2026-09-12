@@ -2204,3 +2204,57 @@ other port is 3x slower" or "ours is 2x slower", and all three were wrong for
 reasons nothing in the output said. The card's own utilisation - `nvidia-smi`
 next to the run - is what caught the first, and the first is what made the other
 two visible.
+
+## What is left between here and JAX, priced
+
+11.02 s against the recorded 5.27 is **2.09x**, and the question is where it
+lives. Two measurements answer it.
+
+**It is the main stack, and nothing else is worth attacking.** A fold at
+825/512/1024 splits: main stack 9.22 s (77.6%), extra stack 0.84, confidence
+0.41, template 0.33, embedder 0.32, structure 0.27, features 0.26, warm 0.18,
+trunk readback 0.04. Everything that is not the 48 main blocks is **2.66 s
+together**, so a fold that did all of it instantly is still 9.22 s and 1.75x
+JAX. There is no host-side or stage-level lever left; there is one loop.
+
+**Inside the block, the gap is arithmetic rate, and the block contains its own
+control.** At 825 residues and 512 rows, by GFLOP over measured milliseconds:
+
+| kernel | ms | GFLOP | TFLOP/s |
+|---|---:|---:|---:|
+| `opm.contract` | 17.98 | 713.7 | **39.7** |
+| `msa-row-attention.project` | 8.45 | 221.5 | 26.2 |
+| `msa-column-attention.project` | 8.47 | 221.5 | 26.1 |
+| `triangle.outgoing.contract` | 6.73 | 143.7 | 21.3 |
+| `triangle.incoming.contract` | 7.22 | 143.7 | 19.9 |
+| `msa-column-attention.flash` | 11.20 | 221.5 | 19.8 |
+| `triangle-attention-starting.flash` | 17.81 | 287.5 | **16.1** |
+| `triangle-attention-ending.flash` | 17.97 | 287.5 | **16.0** |
+| `msa-row-attention.flash` | 22.26 | 356.8 | **16.0** |
+| these nine | 118.10 | 2597.4 | 22.0 |
+
+They are 60% of a 195.6 ms block. **The four flash attentions are 69.2 ms of it
+- 35% of the block - at 16 to 20 TFLOP/s, against 39.7 for the outer product
+mean's contraction in the same block on the same units.** That 39.7 is also the
+best this card has ever given a real kernel here (docs/A100.md's staged GEMM
+reaches 39.3), so it is a rate this port is known to be able to hit, not an
+aspiration.
+
+Priced: if all nine ran at 39.7 they would take 65.4 ms instead of 118.1, which
+is 27% off the block - main stack 9.22 -> 6.7 s and a fold of about **8.5 s,
+1.61x JAX**. So the largest single identified gap is the flash attention's
+efficiency, and closing it completely does not reach JAX.
+
+🔴 **AND THE REMAINDER IS PRECISION, WHICH THIS PORT HAS NEVER SPENT.** All
+**79** activation allocations in `src/evoformer/`, `src/model/` and
+`src/multimer/` are f32 - `grep` for a storage argument returns zero. AF3's pair
+track passes `"f16"`, the ESM-C tower does, the AF2 transition does for its
+weights; the AF2 activation path does not, anywhere. The other WebGPU port
+defaults three of its storages to f16 and JAX runs bf16 tensor cores end to end,
+which is why 39.7 TFLOP/s is 13% of the 310.9 this card's units issue at. That
+is the structural difference, and docs/AF2.md has recorded it as "the cheapest
+thing to try first" without it being tried.
+
+Caveat on the ratio itself: **the 5.27 s is the recorded JAX number and was not
+re-run** - the AF2-vendored branch it came from is not on this box. It is a
+bf16, Triton-flash-attention, whole-graph-XLA run of the same model.
