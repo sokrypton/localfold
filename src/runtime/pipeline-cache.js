@@ -7,6 +7,20 @@
  * `shaderSourceMiB` in probe-compiles.js counts what reaches
  * `createShaderModule`, which is exactly the sources that were NOT wasted.
  */
+/**
+ * The WGSL extensions this repository emits, and the feature each one needs.
+ *
+ * 🔴 A SHADER THAT ENABLES ONE WITHOUT THE FEATURE FAILS AS A WGSL PARSE ERROR
+ * NAMING NO KEY, which cost a whole search: OpenDDE and ESMFold2 both did it and
+ * neither folded on a stock Chrome. See docs/A100.md.
+ */
+export const EXTENSION_FEATURES = [
+  ["f16", "shader-f16"],
+  ["subgroups", "subgroups"],
+  ["subgroup_size_control", "subgroup-size-control"],
+  ["chromium_experimental_subgroup_matrix", "chromium-experimental-subgroup-matrix"],
+];
+
 export const pipelineCacheStats = {
   hits: 0, misses: 0, shared: 0, hitSourceBytes: 0, byKey: new Map(),
 };
@@ -87,10 +101,21 @@ export class ComputePipelineCache {
     // `enable f16`. It is a real shipped state and not a hypothetical: a stock
     // Chrome has no `shader-f16` on ANY NVIDIA GPU (see docs/A100.md), and two
     // of the four models were reaching here with it. Name the key instead.
-    if (code.startsWith("enable f16;") && !this.device.features.has("shader-f16")) {
-      throw new Error(`${key} enables f16 on a device without shader-f16. `
-        + "The caller must gate its precision on the feature - "
-        + "halfPrecisionAvailable(device) in src/runtime/device-profile.js.");
+    // 🔴 EVERY EXTENSION, NOT JUST f16, AND NOT ONLY THE FIRST LINE. The first
+    // version of this read `code.startsWith("enable f16;")`, which is true of
+    // the sources that happened to put f16 first and silently false of any that
+    // do not - a guard with a false negative built in. WGSL requires every
+    // `enable` before the first declaration, so scanning the leading directives
+    // is exact, and the three extensions this repository emits each map to a
+    // feature a device may not have.
+    for (const [extension, feature] of EXTENSION_FEATURES) {
+      if (!new RegExp(`(^|\\n)\\s*enable\\s+${extension}\\s*;`).test(code)) continue;
+      if (this.device.features.has(feature)) continue;
+      throw new Error(`${key} enables ${extension} on a device without `
+        + `${feature}. The caller must gate on the feature - see `
+        + "halfPrecisionAvailable and deviceProfile in src/runtime/device-profile.js. "
+        + "A stock Chrome has neither shader-f16 nor the subgroup matrix units on "
+        + "NVIDIA; see docs/A100.md.");
     }
     const pipeline = this.device.createComputePipelineAsync({
         label: key,
