@@ -295,7 +295,62 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
-### 🔴 WHAT IS NEW AND WANTS AN M2 BEFORE IT MERGES
+### 🔴 ROUND THREE: WHAT WANTS AN M2 NOW
+
+Newest first. Round two's ask - the windowing - is the section after this one
+and still stands; nothing below replaces it.
+
+**The whole `src/` surface of `main..a100` is four files**, and three of them are
+this round: `attention-matrix.js`, `attention.js` and one knob in
+`device-profile.js`. The fourth is round two's `execution.js`. `main` is an
+ancestor, so the merge is a fast-forward.
+
+**1. `attentionMatrixPrefetch`, and the honest position is that it has never run
+off this card.** It reads the flash kernel's key tile into registers before the
+barrier and moves the barrier between the read and the write. On the A100 both
+arms are bit-identical (`bench-af2-warm` -121844157 either way) and it is worth
+**0.05%**, so it ships OFF and the ampere prior does not set it.
+
+On an M2 `supportsAttentionMatrix` should refuse this kernel outright - it
+declares `<f16, 16, 16>` and Metal supports 8x8 only - so the knob should be
+**inert**, and that is the thing to confirm rather than assume:
+
+```
+node tools/gpu-chrome.mjs tools/gpu/probe-kernel.js
+node tools/gpu-chrome.mjs tools/gpu/fold-af2.js --tune=attentionMatrixPrefetch=true
+```
+
+The fold's checksum must not move, because the kernel the knob rewrites is not
+the one being run. 🔴 **IF `probe-kernel.js` DOES pick the matrix variant** - a
+newer Dawn, a newer part - then this arm is live on the backend that CLAMPS
+rather than discards, and it wants `bench-af2-warm.js --passes=8` on both arms
+before anyone trusts it.
+
+**2. Why that kernel is the interesting one on your machine specifically.** Its
+staging loop is `for (var i = local; i < KEYS * HD4; i += LANES)`, and an AF2
+fold compiles it at heads of 8, 16 and 32 - so the count is 64, 128 and 256
+against 128 lanes and at a head of EIGHT only half the workgroup enters. That
+non-uniformity is what made a bisection's "pure reordering" write out of bounds
+and read as a race in the shipped kernel for a whole campaign. It never was
+one; docs/A100.md has the correction and the reproduction both ways.
+`test/uniform-barrier.test.js` gates the barrier half of it and runs in
+`npm test`, so it runs there without a GPU. The unroll half is not gated and
+cannot easily be - keep the guard.
+
+**3. Nothing else this round touches a kernel.** The binding-ceiling work is a
+probe and documentation: `tools/gpu/probe-binding-ceiling.js` now reports how
+many labels share the lowest ceiling (28 on the monomer, **42 on the multimer**)
+rather than naming one, because windowing any subset of a tie moves the fold by
+zero residues. If you run it, run it at two lengths that both sit ABOVE every
+chunk threshold - `--lengths=200,400`, not 59,118 - or a handled label reads as
+a ceiling; `caveat` in the output says when that is happening.
+
+**4. Worth a number from your side if it is cheap:** `maxStorageBufferBindingSize`
+and `maxBufferSize` on the M2. Every ceiling in docs/AF2.md is 2 GiB and 4 GiB,
+which is this card, and the windowing threshold is derived from the first - a
+smaller one would start windowing at a length the A100 never reaches.
+
+### 🔴 ROUND TWO: WHAT WAS NEW AND WANTED AN M2 BEFORE IT MERGED
 
 `addInPlace` - the same shader - now **windows** its bindings. It bound both
 tensors whole, and the pair is `L*L*channels*4` against
@@ -648,8 +703,21 @@ to be that and not the deduplication landing beside it: `--no-dedupe` gives
 
 ### And the merge itself
 
-That round is merged. The round after it - the race fix - **is** a
-fast-forward: `main` is an ancestor of `a100`, no conflicts.
+Still a fast-forward: `main` is an ancestor of `a100`, no conflicts. Two rounds
+are queued on it now - the windowing and this one.
+
+🔴 **AND THE SHIPPING SURFACE IS FOUR FILES.** `git diff main..a100 -- src web`:
+
+```
+ src/evoformer/attention-matrix.js  | the staging restructure, behind the knob
+ src/evoformer/attention.js         | the knob in the pipeline key
+ src/runtime/device-profile.js      | the knob, declared and defaulting to null
+ src/runtime/execution.js           | addInPlace windows its bindings
+```
+
+Everything else in the merge is docs, probes and tests. The knob is `null`
+in `DEFAULT_TUNING` and set by no prior, so the shipped path on every device is
+the arm that measured bit-identical here.
 
 🔴 **AND ITS SHIPPING SURFACE IS THREE LINES.** `git diff main..a100 -- src web`
 is three files, and ignoring comments the whole of it is two bounds checks and
