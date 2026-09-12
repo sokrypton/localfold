@@ -594,46 +594,50 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                              Multi puts every object on screen at once; the
                              eyes decide what is drawn and the picker still
                              decides which one you are editing. -->
-                        <!-- OBJECTS: ONE AT A TIME, OR SEVERAL.
-                             The picker in the sequence header chooses the
-                             object - one on screen, the one being edited,
-                             which is how this viewer has always worked.
-                             Multi is the other mode: the picker greys out,
-                             every object gets a row with an eye, and the
-                             eyes decide what is drawn. It opens on the
-                             object the picker was showing, so pressing it
-                             changes nothing until an eye is clicked. -->
+                        <!-- OBJECTS: ONE AT A TIME, WHICH ON THIS PAGE IS THE
+                             ONLY HONEST MODE.
+                             The picker chooses which prediction run is on
+                             screen and being edited. py2Dmol also has MULTI -
+                             a button that opens a list of eyes and draws
+                             several objects merged into one array - and it is
+                             deliberately NOT MOUNTED here.
+
+                             🔴 EVERYTHING ELSE ON THIS PAGE DESCRIBES ONE
+                             FOLD. The scores card is `lastPrediction`'s, the
+                             heatmap panel is `viewerObject`'s, and both
+                             download buttons write the archive of a single
+                             run - so with two runs merged the card states one
+                             fold's pLDDT over a picture of two, and the panel
+                             goes altogether, because a merge of two objects
+                             has no PAE by construction (see _mergeObjects).
+                             Multi is a mode this page's own chrome cannot
+                             describe, and comparing two runs is what the
+                             picker is for.
+
+                             REMOVED, NOT HIDDEN, so there is no state to get
+                             wrong - the same choice py2Dmol's own render.html
+                             makes about the toolbar buttons it cannot honour.
+                             Every consumer in src/app/objects.js already
+                             guards on the button being absent
+                             (`if (!btn || !list ...) return`), so what is lost
+                             is the feature and not the page. -->
                         <div id="objectRow" class="toggle-item object-row">
-                            <!-- THE LIST, EXPANDED. Three stacked lines: the one
-                                 object on screen opening into all of them. It
-                                 read "Multi", which names a mode rather than
-                                 what the button does, and spent a fifth of a
-                                 narrow row saying it. The accessible name still
-                                 says it in words. -->
-                            <button id="objectListButton" type="button"
-                                class="object-list-btn" aria-pressed="false"
-                                aria-controls="objectList" aria-label="Expand to several objects"
-                                title="Expand: show several objects at once"><i
-                                class="fa-solid fa-bars" aria-hidden="true"></i></button>
-                            <!-- WHICH OBJECT: the picker, and the ordinary way to
-                                 choose one. It names the object on screen AND the one
-                                 being edited, which are the same object until Multi is
-                                 pressed - there it greys out, because with several on
-                                 screen the eyes decide what is drawn and clicking in
-                                 the strip decides what is edited (adoptObjectOfSelection).
-                                 Every other path drives the current object through this
-                                 select: the renderer's change listener, the prev/next
-                                 buttons, a restored session. -->
+                            <!-- WHICH OBJECT: the picker, and the only way to
+                                 choose one here. It names the object on screen AND
+                                 the one being edited, which on this page are always
+                                 the same object. Every other path drives the current
+                                 object through this select: the renderer's change
+                                 listener, the prev/next buttons, a restored session.
+                                 With the Multi button gone this is all the row holds,
+                                 so py2Dmol hides the row itself until there is more
+                                 than one object to pick - which is what a page with a
+                                 single prediction should show. -->
                             <select id="objectSelect" class="object-picker"
                                 title="Which object to show and edit"
                                 style="min-width: 110px; height: 28px; font-size: 12px; padding: 0 8px;">
                                 <!-- Initially empty -->
                             </select>
                         </div>
-                        <!-- Rows are built in src/app/objects.js from the objects that
-                             exist: an eye and a name, and the whole row is
-                             the switch. Only in Multi. -->
-                        <div id="objectList" class="object-list" hidden></div>
 
                         <style>
                             /* Inline display:flex on the style rows outranks the UA [hidden]
