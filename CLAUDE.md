@@ -10,6 +10,13 @@ gate cannot see an error inside one of them.
 
 ## Running anything that needs a GPU
 
+🔴 **AND A KNOB'S WORTH IS A PROPERTY OF THE CONFIGURATION.** Swept under
+`LOCALFOLD_STOCK_FLAGS=1`, `linearTallTile` is **1.31x** (379.58 ms against
+497.03 on a block) where docs/A100.md's `--no-prior` split prices it at ZERO,
+and `attentionGroup` moves 5.4% where it moved 0.13% - both because the matrix
+kernels replace the vector ones the knobs belong to. Every prior number in these
+docs was taken with the flags on. See docs/AF2.md.
+
 🔴 **AND EVERY NUMBER THIS HARNESS PRODUCES IS BEHIND TWO DEVELOPER FLAGS WORTH
 1.95x.** `gpu-chrome.mjs` and `tools/cdp.py` both pass
 `--enable-dawn-features=vulkan_enable_f16_on_nvidia` and `--enable-unsafe-webgpu`;

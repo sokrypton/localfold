@@ -2388,3 +2388,76 @@ knobs take `{"rows":32,"columns":32}` - so the two fragments reached
 undefinedxundefined"**. That is the third appearance of that trap in CLAUDE.md
 and the first where the instrument rather than the caller was what could not
 say it. The split respects braces now.
+
+## The f32 vector path, which nothing had ever profiled
+
+Every optimisation in this file was measured with `shader-f16` and the subgroup
+matrix units on, and docs/A100.md now records that **no visitor has either** -
+they are developer flags on both platforms. So the configuration the site
+actually ships had never been profiled. `LOCALFOLD_STOCK_FLAGS=1` drops both
+flags; a block at 825 residues and 512 rows:
+
+| | stock (f32 vector) | flagged | |
+|---|---:|---:|---:|
+| a block | **378.67 ms** | 181.7 | 2.08x |
+| `opm.contract` | 65.27 | 18.01 | 3.6x |
+| `opm.project-output` | 24.31 | 6.53 | 3.7x |
+| `msa-row-attention.project` | 22.48 | 8.45 | 2.7x |
+| `msa-row-attention.flash` | 30.93 | 21.22 | 1.5x |
+
+The ranking is not the flagged one: the outer product mean is **23.6%** of this
+block against 12.5% of that one, and the flash attentions degrade least because
+the register kernel never used the units anyway.
+
+🔴 **AND THE BUDGET IS 1.32x, WHICH IS THE FINDING.** docs/A100.md measures this
+card's f32 ceiling at **18.1 TFLOP/s**. The eight largest kernels - 59% of the
+block - against it:
+
+| kernel | ms | GFLOP | TFLOP/s | of 18.1 |
+|---|---:|---:|---:|---:|
+| `msa-column-attention.flash` | 18.81 | 221.5 | 11.8 | 65% |
+| `msa-row-attention.flash` | 30.93 | 356.8 | 11.5 | 64% |
+| `triangle-attention-*.flash` | 24.84 | 287.5 | 11.6 | 64% |
+| `opm.contract` | 65.27 | 713.7 | 10.9 | 60% |
+| `triangle.outgoing.contract` | 13.24 | 143.7 | 10.9 | 60% |
+| `msa-*-attention.project` | 22.48 / 22.28 | 221.5 | 9.9 | 54% |
+| **`opm.project-output`** | 24.31 | 178.4 | **7.3** | **41%** |
+| all eight | 222.17 | 2344.6 | 10.6 | **58%** |
+
+**Already at 58% of what this card can do in f32.** Perfect kernels take the
+block from 378.67 to **286.0** - 1.32x, as an unreachable limit. The 2.08x to
+the flagged path is f32 ALUs at 18.1 TFLOP/s against tensor cores at 310, and no
+tuning closes it.
+
+**And every knob that applies is already at its optimum**, swept in this
+configuration for the first time:
+
+| knob | arms | |
+|---|---|---|
+| `opmProjectOutputPairs` | 1 / 2 / **4** / 8 | 427.49 / 396.04 / **379.78** / 379.32 |
+| `opmPairBlockBytes` | 64 / **256** / 1024 MiB | 382.47 / **378.80** / 379.32 |
+| `attentionGroup` | 1 / 2 / **4** / 8 | 400.16 / 391.97 / **379.52** / 392.30 |
+| `attentionVectorScore` | **true** / false | 380.37 / 383.98 |
+| `linearTallTile` | **true** / false | 379.58 / **497.03** |
+
+Two of those rows say something the flagged sweeps could not:
+
+🔴 **`linearTallTile` IS WORTH 1.31x HERE AND ZERO THERE.** docs/A100.md's
+`--no-prior=<knob>` split lists it beside `triangleProjectMatrix` and
+`opmProjectOutputPairs` as worth **nothing** - measured with the matrix linear
+kernel on, which replaces the tall-tile one entirely. In the configuration every
+visitor runs it is the most valuable knob in the ampere prior by a wide margin,
+379.58 against 497.03. A knob's worth is a property of the CONFIGURATION, not of
+the knob.
+
+🔴 **AND `attentionGroup` MOVES 5.4% HERE WHERE IT WAS FLAT THERE** - 400.16 to
+379.52 across its arms, against a 0.13% spread in the flagged path, because AF2
+resolves the matrix flash kernel there and the grouping belongs to the vector
+one. The shipped 4 wins either way; what changed is whether the sweep meant
+anything.
+
+**So there is no tuning win in the visitor's path**, and the one place the
+arithmetic still points is `opm.project-output` at 41% of ceiling where every
+sibling is 54-65% - 24.31 ms that would be about 16 at its neighbours' rate,
+which is 2% of a block. That is the whole of what is left, and it is a kernel
+rewrite rather than a setting.
