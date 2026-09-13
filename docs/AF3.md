@@ -219,9 +219,23 @@ weights became the only thing left.
 | family | page | CLI |
 |---|---:|---:|
 | alphafold3 | 90.9 | 90.9 |
+| openbind0 | 88.1 | 88.1 |
 | boltz2 | 96.1 | 96.1 |
 | protenix2 | 92.5 | 92.5 |
 | opendde | 94.6 | 94.609 |
+
+🔴 **AND openbind0 TOOK TWO TRIES TO ASK PROPERLY, BOTH TIMES BY COMPARING TWO
+BUNDLES.** `fold-in-page.py` STRIPS every `remote:` line so the page reads
+shards off disk, and this box has `model-openbind0-f32/` and no
+`model-openbind0-int5/` - so the page died at "failed to load tensor
+.../single_transition/transition2/weights: 404" and it read as a broken family
+on the live site. It is not: the published `weights-02.int5.bin` at the pinned
+sha hashes to exactly the digest committed in the manifest module. Then
+`--remote-weights` gave the page 88.1 against the CLI's 89.6 - which is not a
+parity gap either, because the CLI was on the f32 bundle. Pointed at the SAME
+remote int5 manifest the CLI gives **88.1**. Two numbers that differ because
+they name different weights say nothing about the code between them; both
+comparisons had to be made same-bundle before either meant anything.
 
 🔴 **AND OPENDDE HAD NO CLI FOLD THAT TOOK AN MSA AT ALL** until this - every
 OpenDDE number in these docs is a single-sequence fold, so the page's alignment
