@@ -27,18 +27,36 @@ for e in ("/home/ubuntu/alphafold3/src","/home/ubuntu/alphafold3","/home/ubuntu/
     sys.path.insert(0, e)
 import numpy as np, haiku as hk, jax, jax.numpy as jnp
 import fold_check
+from alphafold3.model.network import featurization as _feat
 from alphafold3.model import feat_batch, model as af3_model
 from alphafold3.model import params as afp
 from alphafold3.model.network import evoformer as ev
 from alphafold3.model.components import utils
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "boltz2"
+# 🔴 THE MSA SUBSAMPLE IS A DRAW, AND A DRAW IS NOT COMPARABLE. The Evoformer
+# gumbel-shuffles the alignment and keeps the first `num_msa` rows, so on a
+# 16384-row batch native and this port see different SEQUENCES and their MSA
+# stages cannot be compared at all. With this on, the shuffle is the identity
+# and both sides take the alignment's first 1024 rows - which is what
+# `foldBatch`'s own cap does. Off by default, so a dump without it is still the
+# model as it runs.
+if os.environ.get("DETERMINISTIC_MSA"):
+    _feat.shuffle_msa = lambda key, msa: (msa, key)
 PASSES = int(os.environ.get("PASSES", "1"))
 seq, _ = fold_check.parse_ca(os.path.expanduser("~/6MRR.pdb"))
 batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, None)
 # 🔴 fp32, NOT the fold path's bfloat16. A port compared against a bfloat16
 # reference is being held to the reference's rounding as well as its model.
 cfg.global_config.bfloat16 = "none"
+# 🔴 BLOCKS= TRUNCATES THE PAIRFORMER ON BOTH SIDES, which is how a divergence
+# that grows with depth is separated from one that is already there at block
+# one. `layer_stack` takes its trip count from the config and its weights from
+# the array's leading axis, so the params are sliced to match below.
+BLOCKS = int(os.environ.get("BLOCKS", "0")) or cfg.evoformer.pairformer.num_layer
+cfg.evoformer.pairformer.num_layer = BLOCKS
+MSA_BLOCKS = int(os.environ.get("MSA_BLOCKS", "0")) or cfg.evoformer.msa_stack.num_layer
+cfg.evoformer.msa_stack.num_layer = MSA_BLOCKS
 
 
 @hk.transform
@@ -67,9 +85,28 @@ params = afp.get_model_haiku_params(model_dir=model_dir)
 params = {("~" if k == "diffuser"
            else k[len("diffuser/"):] if k.startswith("diffuser/") else k): v
           for k, v in params.items()}
-out, target = fwd.apply(params, jax.random.PRNGKey(0), b)
+# Slice every stacked weight whose depth the config just changed. Asserted
+# rather than inferred: a tensor whose leading axis merely happens to be 48 and
+# is not a block stack would be silently truncated.
+init = fwd.init(jax.random.PRNGKey(0), b)
+sliced, cut, _cut_names = {}, 0, []
+for scope, leaves in params.items():
+    sliced[scope] = {}
+    for leaf, value in leaves.items():
+        value = np.asarray(value)
+        want = np.asarray(init.get(scope, {}).get(leaf, value)).shape
+        if value.shape != want and value.shape[1:] == want[1:] and want[0] <= value.shape[0]:
+            _cut_names.append("%s/%s %s -> %s" % (scope, leaf, value.shape, want))
+            value = value[:want[0]]
+            cut += 1
+        sliced[scope][leaf] = value
+if cut:
+    print("  sliced %d stacked tensors to %d blocks" % (cut, BLOCKS))
+    for name in _cut_names[:6]:
+        print("    ", name)
+out, target = fwd.apply(sliced, jax.random.PRNGKey(0), b)
 taps = {k: [np.asarray(x, np.float32) for x in v] for k, v in ev.ESM_TRUNK_TAPS.items()}
-print(MODEL, "passes", PASSES, "| emb", sorted(out.keys()),
+print(MODEL, "passes", PASSES, "blocks", BLOCKS, "msa", MSA_BLOCKS, "| emb", sorted(out.keys()),
       "| taps", {k: len(v) for k, v in taps.items()})
 
 record = {}
@@ -84,6 +121,7 @@ for name, values in taps.items():
     put("tap.%s" % name, values[-1])       # the LAST pass; the dump keeps one cycle
 for name in ("single", "pair"):
     if name in out: put(name, out[name])
-p = "/tmp/af3-oracle-trunk-%s.json" % MODEL
+p = ("/tmp/af3-oracle-trunk-%s.json" % MODEL if BLOCKS == 48
+     else "/tmp/af3-oracle-trunk-%s-b%d.json" % (MODEL, BLOCKS))
 open(p, "w").write(json.dumps({"model": MODEL, "passes": PASSES, "stages": record}))
 print("wrote", p, "%.1f MB" % (os.path.getsize(p) / 2 ** 20))

@@ -21,7 +21,8 @@ import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
+  from "../../src/af3/weights.js";
 import { warmTrunkPipelines } from "../../src/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
@@ -135,7 +136,11 @@ export async function main(device, args) {
   const steps = Number(option(args, "steps", "50"));
   // Named here rather than inline at the fold, because the guard below reads it.
   const samplerMode = option(args, "mode", "diffusion");
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE DEPTH IS THE BUNDLE'S, NOT 48. boltz2's pairformer is 64 blocks and
+  // every other model's is 48, and a typed-in 48 ran three quarters of its
+  // trunk with no complaint - the weights for blocks 48..63 were downloaded and
+  // never read. `--blocks=` still overrides, for a bisect.
+  const blocksOption = option(args, "blocks", "");
   const sequenceArg = option(args, "sequence", "");
   // 🔴 A LIGAND IS THE CASE THE CONTACT MAP'S THRESHOLD IS ABOUT, and until
   // this flag existed there was no way to fold one through AF3 from a shell -
@@ -205,6 +210,25 @@ export async function main(device, args) {
         }
         return response.json();
       })();
+  const compareToOracle = (label, ours) => {
+    const entry = trunkOracle?.stages?.[label];
+    if (entry === undefined || ours === undefined) return;
+    const expected = Float32Array.from(entry.data);
+    if (expected.length !== ours.length) {
+      console.log(`  native ${label}\tLENGTH ${ours.length} vs ${expected.length}`);
+      return;
+    }
+    let error = 0, scale = 0;
+    for (let i = 0; i < expected.length; i += 1) {
+      const d = ours[i] - expected[i];
+      error += d * d; scale += expected[i] * expected[i];
+    }
+    const mine = Math.sqrt(ours.reduce((t, v) => t + v * v, 0) / ours.length);
+    console.log(`  native ${label}\t`
+      + `${Math.sqrt(error / Math.max(scale, 1e-30)).toExponential(2)}`
+      + `\tours rms ${mine.toFixed(4)}\tnative rms ${entry.rms.toFixed(4)}`);
+  };
+
   const batch = sequenceArg !== ""
     ? featuriseProtein(sequenceArg,
       { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
@@ -219,7 +243,8 @@ export async function main(device, args) {
   }
   console.log(`${batch.sequence.length} residues, ${batch.tokens} tokens,`
     + ` ${batch.atomCount} atoms, ${batch.subsets} atom subsets,`
-    + ` ${blocks} pairformer blocks, ${steps} diffusion steps`);
+    + ` ${blocksOption === "" ? "the bundle's" : blocksOption} pairformer blocks,`
+    + ` ${steps} diffusion steps`);
   console.log(sequenceArg !== ""
     ? "featurised in JavaScript from the sequence"
     : "featurised by AF3, read from the dump");
@@ -268,6 +293,11 @@ export async function main(device, args) {
   // most of the connection idle most of the time. Measured on the ESMFold2
   // tool, which had the same hole: a fold 2.25 s -> 1.75.
   store.prefetch();
+  // ...now that the bundle is open, the trunk's own depth. `--blocks=` wins,
+  // for a bisect against a truncated oracle.
+  const depths = trunkDepths(store);
+  const blocks = blocksOption === "" ? depths.pairformerBlocks : Number(blocksOption);
+  console.log(`trunk ${blocks} pairformer blocks, ${depths.msaBlocks} MSA blocks`);
   // 🔴 THE PAIRFORMER'S SHADERS, WHILE THE SHARDS ARE STILL ARRIVING. A fold's
   // compilation is 0.80 s of AF3's 2.47 and 1.23 of OpenDDE's 2.93, the
   // compiler pool is saturated while it runs, and the weight load in front of
@@ -277,7 +307,7 @@ export async function main(device, args) {
     void warmTrunkPipelines(device, store, batch.tokens).catch(() => {});
   }
   const weights = {
-    trunk: await trunkWeights(store, blocks, 4),
+    trunk: await trunkWeights(store, blocks, depths.msaBlocks),
     diffusion: await diffusionWeights(store),
     // 🔴 A SECOND MODEL MAY HAVE A DIFFERENT CONFIDENCE HEAD ENTIRELY, and a
     // fold's product is the STRUCTURE. boltz2 rebuilds its pair under a
@@ -595,6 +625,10 @@ export async function main(device, args) {
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
+    // The trunk's intermediate seams, compared as they are produced.
+    ...(trunkOracle === null ? {} : {
+      onSeam: (name, value) => compareToOracle(name, value),
+    }),
     onStage: (name, detail) => {
       // 🔴 THE TRUNK AGAINST af3-any-model's OWN, ON THIS BATCH. Every trunk
       // gate here compares the GPU against this port's CPU reference, so both
@@ -603,28 +637,10 @@ export async function main(device, args) {
       // FED is wrong. `dump_af3_trunk_taps.py` records the reference's own
       // seams on this same batch; `--trunk-oracle=` compares them.
       if (trunkOracle !== null && (name === "trunk-done" || name === "target-feat")) {
-        const want = trunkOracle.stages;
         const arms = name === "target-feat"
           ? [["target_feat", detail.targetFeat]]
           : [["single", detail.trunk?.single], ["pair", detail.trunk?.pair]];
-        for (const [label, ours] of arms) {
-          const entry = want[label];
-          if (entry === undefined || ours === undefined) continue;
-          const expected = Float32Array.from(entry.data);
-          if (expected.length !== ours.length) {
-            console.log(`  native ${label}\tLENGTH ${ours.length} vs ${expected.length}`);
-            continue;
-          }
-          let error = 0, scale = 0;
-          for (let i = 0; i < expected.length; i += 1) {
-            const d = ours[i] - expected[i];
-            error += d * d; scale += expected[i] * expected[i];
-          }
-          const mine = Math.sqrt(ours.reduce((t, v) => t + v * v, 0) / ours.length);
-          console.log(`  native ${label}\t`
-            + `${Math.sqrt(error / Math.max(scale, 1e-30)).toExponential(2)}`
-            + `\tours rms ${mine.toFixed(4)}\tnative rms ${entry.rms.toFixed(4)}`);
-        }
+        for (const [label, ours] of arms) compareToOracle(label, ours);
       }
       // 🔴 EVERY STAGE'S OWN MILLISECONDS, WHICH THIS TOOL PRINTED FOR THE
       // TRUNK AND NOTHING ELSE. A caller's clock attributes the gap between two
@@ -687,7 +703,7 @@ export async function main(device, args) {
             .map((key) => dump.outputs[key]).pop();
         const pair = lastCapture("diffuser/evoformer/__call__:pair");
         const single = lastCapture("diffuser/evoformer/__call__:single");
-        if (pair && blocks === 48) {
+        if (pair && blocks === depths.pairformerBlocks) {
           console.log(`pair   vs AF3  relRMS`
             + ` ${relativeRms(detail.trunk.pair, floats(pair.data)).toExponential(2)}`);
           console.log(`single vs AF3  relRMS`
@@ -848,7 +864,10 @@ export async function main(device, args) {
       .map(([k, v]) => [k, Math.round(v)]).filter(([, v]) => v > 0)
       .sort((a, b) => b[1] - a[1])),
     sequence: batch.sequence, tokens: batch.tokens, steps,
-    denoisedPdb: toPdb(batch, lastDenoised, result.scores.plddt),
+    // 🔴 `--no-confidence` MEANS THERE ARE NO SCORES. A model whose head this
+    // loader cannot read still folds, and reading `result.scores.plddt` threw
+    // AFTER the geometry report - the most expensive place to lose a fold.
+    denoisedPdb: toPdb(batch, lastDenoised, result.scores?.plddt),
     // Per recycle, how far the trunk's single and pair moved from the pass
     // before. A trunk-only recycle produces no coordinates, so this is the only
     // convergence signal there is - see src/model/feature-convergence.js.

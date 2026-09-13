@@ -677,6 +677,29 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // truncation shows up in every run rather than in a fold that is merely
   // disappointing. The page's status line reports the depth that was
   // FEATURISED, which is not the same claim.
+  // 🔴 THE MSA IS CAPPED AT num_msa AND WE WERE RUNNING THE WHOLE ALIGNMENT.
+  // AF3's Evoformer subsamples to `config.num_msa` - 1024 in every checkpoint
+  // of this lineage - before the MSA stack sees a row. boltz2's featurised
+  // 6MRR batch is 16384 rows deep, so this port was running SIXTEEN TIMES the
+  // rows the model was trained to take: a different model, 3.2 GiB of
+  // `af3-msa.msa-scratch`, and 1.5 s of a 3.3 s trunk.
+  //
+  // 🔴 AND THE FIRST num_msa ROWS ARE NOT AF3's num_msa ROWS. AF3 gumbel-
+  // shuffles first, so which rows survive is a draw from a PRNG this port
+  // cannot reproduce - and on a deep alignment the query itself survives only
+  // with probability num_msa/depth. Taking the prefix keeps the query (it is
+  // row 0 of an a3m) and keeps the alignment's own order, which is
+  // `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s. It is a
+  // coverage limit, named here rather than left as a silent depth difference,
+  // and `AF3_DETERMINISTIC_MSA=1` on the oracle side is how the two are
+  // compared.
+  const msaCap = options.numMsa ?? 1024;
+  if (batch.sequences > msaCap) {
+    batch = { ...batch, sequences: msaCap,
+              msa: batch.msa.subarray(0, msaCap * tokens),
+              msaMask: batch.msaMask.subarray(0, msaCap * tokens),
+              deletionMatrix: batch.deletionMatrix.subarray(0, msaCap * tokens) };
+  }
   await stage("msa-depth", { sequences: batch.sequences, tokens });
   // 🔴 A RECYCLE'S STATE IS THE TRUNK ITSELF, which is what makes asking for
   // more of them cheap. The loop feeds `previousPair`/`previousSingle` back in,
@@ -912,6 +935,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
+      // The trunk's own seams, for a caller holding the reference's taps.
+      ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
       // large protein each is seconds. See af3TrunkStageSpans.

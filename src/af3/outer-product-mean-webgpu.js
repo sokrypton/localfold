@@ -107,6 +107,13 @@ export function packOuterProductMeanWeights(weights) {
 }
 
 export function createOuterProductMeanShaders(shape, offsets, epsilon, variance) {
+  // 🔴 boltz2 DIVIDES BEFORE IT ADDS THE BIAS, AND CLAMPS RATHER THAN NUDGES:
+  // `product @ W / max(count, 1) + b` against AF3's `(product @ W + b) /
+  // (1e-3 + count)`. The difference is `(1 - 1/n) * b`, a per-channel CONSTANT
+  // on every pair - zero at MSA depth 1 and 15/16 of the bias at depth 16 - so
+  // a single-sequence gate cannot see it and boltz2's 16384-row batch is 3.16e-1
+  // from af3-any-model without it. See model_config.OPM_BIAS_AFTER_NORM.
+  const biasAfterNorm = shape.opmBiasAfterNorm === true;
   const { sequences, tokens, msaChannels, outerChannels, pairChannels } = shape;
   const rows = sequences * tokens;
   const products = outerChannels * outerChannels;
@@ -288,7 +295,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   let f = local;
   let has_f = f < C_Z;
-  ${overI((i) => `var totals${i} = ${jVector}(weights[W_OUT_BIAS + select(0u, f, has_f)]);`)}
+  ${overI((i) => `var totals${i} = ${jVector}(${biasAfterNorm ? "0.0"
+    : "weights[W_OUT_BIAS + select(0u, f, has_f)]"});`)}
 
   for (var chunk0 = 0u; chunk0 < PRODUCTS; chunk0 += CELL_CHUNK) {
     // ...before overwriting the chunk the previous iteration is still reading.
@@ -323,8 +331,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
       let slot = i${i} * TOKENS + j${j};
       if (base_i + ${i}u < TOKENS && base_j + ${j}u < TOKENS) {
         // ...scaled after the projection, so the bias is scaled with it.
-        output[slot * C_Z + f] = ${jAt(`totals${i}`, j)}
-          / (NORM_EPSILON + counts[slot]);
+        output[slot * C_Z + f] = ${biasAfterNorm
+          ? `${jAt(`totals${i}`, j)} / max(counts[slot], 1.0)
+          + weights[W_OUT_BIAS + select(0u, f, has_f)]`
+          : `${jAt(`totals${i}`, j)} / (NORM_EPSILON + counts[slot])`};
       }
     }`))}
   }

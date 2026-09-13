@@ -187,6 +187,9 @@ export class Af3MsaStackGpu {
       ?? (blockITokens != null && n > blockITokens ? 1 : null);
     const opmShape = { sequences, tokens: n, msaChannels, outerChannels,
                        pairChannels,
+                       // boltz2 divides before it adds the bias; see the note
+                       // in outer-product-mean-webgpu.js.
+                       opmBiasAfterNorm: dialect.opmBiasAfterNorm === true,
                        ...(opmBlockI == null ? {} : { blockI: opmBlockI }),
                        ...(opmTuning.opmCellChunk == null
                          ? {} : { cellChunk: opmTuning.opmCellChunk }) };
@@ -199,7 +202,8 @@ export class Af3MsaStackGpu {
       // 🔴 THE BLOCK AND THE CHUNK ARE IN THE KEY. Both change the generated
       // WGSL and the dispatch, which is the collision docs/AF2.md records twice.
       into(`opm:${name}`, `${base}:opm:${name}`
-        + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`, source);
+        + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`
+        + `:ban${opmShape.opmBiasAfterNorm}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,

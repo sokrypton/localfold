@@ -40,6 +40,15 @@
 export const ALPHAFOLD3 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
@@ -86,6 +95,15 @@ export const ALPHAFOLD3 = Object.freeze({
 export const OPENBIND0 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
@@ -150,6 +168,15 @@ export const OPENBIND0 = Object.freeze({
 export const OPENDDE = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
@@ -242,6 +269,15 @@ export const OPENDDE = Object.freeze({
 export const PROTENIX2 = Object.freeze({
   preTrunkQuery: false,
   sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -412,6 +448,15 @@ export const BOLTZ2 = Object.freeze({
     gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901, stepScale: 1.638,
     rho: 8.0, sigmaMin: 0.0004, sigmaMax: 160.0,
   }),
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: true,
   targetFeatAtomOnly: true,
   emptyTemplateRestypeColumns: [],
   templateStackOuterResidual: true,

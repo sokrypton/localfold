@@ -456,6 +456,19 @@ export async function embedderWeights(store) {
     // shipped bundle and read by nothing, so every fold downloaded it and
     // multiplied it by no ligand bonds at all. See embedder-webgpu.js.
     bondEmbedding: await T("bond_embedding/weights"),
+    // 🔴 boltz2's z-INIT CARRIES TWO MORE TERMS AND BOTH CONTRIBUTE ON EVERY
+    // INPUT. `token_bonds_type_embed` is an nn.Embedding over bond ORDER whose
+    // row 0 - "no bond" - is a learned NONZERO vector, and
+    // `contact_conditioning` is boltz's distance-restraint encoder whose
+    // UNSPECIFIED class is a learned constant. Without them the pair came out
+    // at relRMS 2.29e-1 from af3-any-model's before a single pairformer block
+    // had run, and the fold was a 5.9 A ball. Absent from every other bundle.
+    ...(store.manifest?.tensors?.[`${EVO}/token_bonds_type_embed/weights`]
+      === undefined ? {} : {
+      tokenBondsTypeEmbed: await T("token_bonds_type_embed/weights"),
+      contactEncodingUnspecified: await T("contact_encoding_unspecified"),
+      contactEncodingUnselected: await T("contact_encoding_unselected"),
+    }),
     msaActivations: await T("msa_activations/weights"),
     extraMsaTargetFeat: await T("extra_msa_target_feat/weights"),
     singleActivations: await T("single_activations/weights"),
@@ -854,6 +867,24 @@ export async function structuralRefinerWeights(store, blocks = 4) {
 }
 
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
+/**
+ * How many blocks this bundle's trunk stacks actually carry.
+ *
+ * 🔴 boltz2's PAIRFORMER IS 64 BLOCKS AND EVERY OTHER MODEL'S IS 48, and this
+ * was a default typed into `trunkWeights` and into `fold.js`. So a boltz2 fold
+ * ran three quarters of its trunk and nothing objected: the weights for blocks
+ * 48..63 were downloaded and never read, and the stage-by-stage comparison
+ * against af3-any-model agreed to 1.55e-4 at every depth it was asked about
+ * because it was asked about depths BOTH sides truncated to. Read from the
+ * stack's own leading axis; a caller may still override to bisect.
+ */
+export function trunkDepths(store) {
+  return {
+    pairformerBlocks: dims(store, `${PAIRFORMER}/single_attention_q_projection/bias`)[0],
+    msaBlocks: dims(store, `${MSA_STACK}/outer_product_mean/output_b`)[0],
+  };
+}
+
 export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
   const msa = [];
   for (let index = 0; index < msaBlocks; index += 1) msa.push(await msaBlockWeights(store, index));

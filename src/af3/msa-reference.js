@@ -70,7 +70,15 @@ function softmaxRows(values, rows, width) {
  * @returns {Float32Array} tokens * tokens * pairChannels
  */
 export function outerProductMean(msa, msaMask, sequences, tokens, msaChannels,
-                                 pairChannels, weights) {
+                                 pairChannels, weights, dialect) {
+  // 🔴 boltz2 DIVIDES BEFORE IT ADDS THE BIAS, AND CLAMPS RATHER THAN NUDGES.
+  // AF3 is `(product @ W + b) / (1e-3 + count)`; boltz2 is
+  // `product @ W / max(count, 1) + b`. The difference is worth exactly
+  // `(1 - 1/n) * b` - a per-channel CONSTANT on every pair - so it is invisible
+  // at MSA depth 1, where `(1 - 1/1) * b` is zero, and worth 15/16 of the bias
+  // at depth 16. boltz2's 6MRR batch is 16384 rows deep, which is why the MSA
+  // stage read 3.16e-1 from af3-any-model's with the z-init exact at 5.05e-8.
+  const biasAfterNorm = dialect?.opmBiasAfterNorm === true;
   const outer = weights.outerChannels;
   const rows = sequences * tokens;
   const normalised = layerNorm(msa, rows, msaChannels, weights.layerNormInputScale,
@@ -112,15 +120,16 @@ export function outerProductMean(msa, msaMask, sequences, tokens, msaChannels,
       // 1e-3 + the number of sequences covering BOTH tokens - not the sequence
       // count. Dividing earlier, or by `sequences`, differs on any MSA with a
       // gap and agrees on every toy input that has none.
-      const scale = 1 / (1e-3 + norm);
+      const scale = biasAfterNorm ? 1 / Math.max(norm, 1) : 1 / (1e-3 + norm);
       for (let f = 0; f < pairChannels; f += 1) {
-        let total = weights.outputB[f];
+        let total = biasAfterNorm ? 0 : weights.outputB[f];
         for (let c = 0; c < outer; c += 1) {
           for (let e = 0; e < outer; e += 1) {
             total += product[c * outer + e] * weights.outputW[(c * outer + e) * pairChannels + f];
           }
         }
-        output[outputBase + f] = total * scale;
+        output[outputBase + f] = biasAfterNorm
+          ? total * scale + weights.outputB[f] : total * scale;
       }
     }
   }
@@ -225,7 +234,7 @@ export function msaBlock(state, weights, dialect) {
   // plausible representation, and the difference compounds over the blocks.
   const outerProduct = () => addPair(
     outerProductMean(msa, msaMask, sequences, tokens, msaChannels, pairChannels,
-                     weights.outerProductMean));
+                     weights.outerProductMean, dialect));
   // Upstream keeps the transition inside `_msa_update`, so it moves with the
   // attention rather than staying put between the two halves.
   const updateMsa = () => {

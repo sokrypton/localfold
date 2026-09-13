@@ -39,6 +39,10 @@ const MAX_RELATIVE_IDX = 32;
 const MAX_RELATIVE_CHAIN = 2;
 const POSITION_BINS = 2 * MAX_RELATIVE_IDX + 2;   // 66
 const RELATIVE_WIDTH = POSITION_BINS * 2 + 1 + (2 * MAX_RELATIVE_CHAIN + 2);  // 139
+// 🔴 34 FOR EVERY MODEL BUT boltz2, WHOSE MSA FEATURE APPENDS `is_paired`.
+// Its `msa_activations` is [35, 64]; reading 34 columns off it is a silent
+// prefix, and on a single-sequence batch the column it drops is the whole of
+// what the MSA stack was given. The width comes off the WEIGHT now.
 const MSA_FEATURE_WIDTH = 34;
 
 const ORDER = [
@@ -57,22 +61,37 @@ const ORDER = [
   "bondEmbedding",
 ];
 
+/**
+ * 🔴 boltz2's TWO EXTRA z-INIT TERMS, AND THEY ARE A SHADER VARIANT. An
+ * nn.Embedding over bond ORDER whose row 0 is a learned nonzero vector, plus
+ * the UNSPECIFIED constant of boltz's distance-restraint encoder. Neither is a
+ * zero a stock bundle could carry harmlessly, because both add on EVERY pair -
+ * so the weight's presence chooses the order, the source and the key together.
+ * See embedder-reference.js, which this mirrors.
+ */
+const embedderOrder = (bondTypes) =>
+  (bondTypes ? [...ORDER, "tokenBondsTypeEmbed", "contactEncodingUnspecified"] : ORDER);
+export const hasBondTypes = (weights) => weights?.tokenBondsTypeEmbed != null;
+
 export function packEmbedderWeights(weights) {
+  const order = embedderOrder(hasBondTypes(weights));
   const offsets = {};
   let total = 0;
-  for (const name of ORDER) {
+  for (const name of order) {
     if (weights[name] === undefined) throw new Error(`embedder weights missing ${name}`);
     offsets[name] = total;
     total += weights[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of ORDER) data.set(weights[name], offsets[name]);
+  for (const name of order) data.set(weights[name], offsets[name]);
   return { data, offsets };
 }
 
 export function createEmbedderShaders(shape, offsets, epsilon, variance,
                                       relative = "gather") {
   const { tokens, sequences, featureWidth, pairChannels, singleChannels, msaChannels } = shape;
+  // See MSA_FEATURE_WIDTH: the weight states this, not a constant.
+  const msaFeatureWidth = shape.msaFeatureWidth ?? MSA_FEATURE_WIDTH;
   // Stock AF3 builds the pair from target_feat; OpenDDE from the single
   // embedding. See `projectTokens`.
   const pairSourceWidth = shape.pairInitFromSingle ? singleChannels : featureWidth;
@@ -104,6 +123,8 @@ const W_PREV_SINGLE_SCALE: u32 = ${offsets.prevSingleEmbeddingNormScale}u;
 const W_PREV_SINGLE_OFFSET: u32 = ${offsets.prevSingleEmbeddingNormOffset}u;
 const W_PREV_SINGLE: u32 = ${offsets.prevSingleEmbedding}u;
 const W_BOND: u32 = ${offsets.bondEmbedding}u;
+${offsets.tokenBondsTypeEmbed === undefined ? "" : `const W_BOND_TYPE: u32 = ${offsets.tokenBondsTypeEmbed}u;
+const W_CONTACT_UNSPECIFIED: u32 = ${offsets.contactEncodingUnspecified}u;`}
 
 fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
 `;
@@ -308,7 +329,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // term above: a "nothing to add yet" fast path is how a real term goes
     // missing, and here it went missing for every ligand ever folded.
     pair[base + c] = left[i * C_Z + c] + right[j * C_Z + c] + recycled + relative_total
-      + bonds[row] * weights[W_BOND + c];
+      + bonds[row] * weights[W_BOND + c]
+${offsets.tokenBondsTypeEmbed === undefined ? "" : `      + weights[W_BOND_TYPE
+          + u32(clamp(i32(bonds[PAIRS + row]), 0, 6)) * C_Z + c]
+      + weights[W_CONTACT_UNSPECIFIED + c]`};
   }
 }`;
 
@@ -336,6 +360,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (code >= 0 && code < 32) {
       total += weights[W_MSA + u32(code) * C_M + c];
     }
+${msaFeatureWidth > 34 ? `    // boltz2's paired flag: column 34, 1 on the query row and 0 elsewhere.
+    // See msaFeatures in embedder-reference.js.
+    if (row < TOKENS) { total += weights[W_MSA + 34u * C_M + c]; }` : ""}
     msa[row * C_M + c] = total + msa_from_target[token * C_M + c];
   }
 }`;
@@ -464,12 +491,16 @@ export class Af3EmbedderGpu {
     const pairInitFromSingle = weights.dialect.pairInitFromSingle;
     const packed = packEmbedderWeights(weights);
     const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels,
-                    msaChannels, pairInitFromSingle };
+                    msaChannels, pairInitFromSingle,
+                    msaFeatureWidth: weights.msaActivations.length / msaChannels };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`
       + `:${singleChannels}:${msaChannels}:${epsilon}:${variance}`
-      + `:${options.relative ?? "gather"}:${pairInitFromSingle}`;
+      + `:${options.relative ?? "gather"}:${pairInitFromSingle}`
+      // boltz2's two extra z-init terms change the generated source and no
+      // dimension above can see it; see `embedderOrder`.
+      + `:bt${hasBondTypes(weights)}:mw${shape.msaFeatureWidth}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${key}:${name}`, source);
@@ -503,8 +534,20 @@ export class Af3EmbedderGpu {
       // adds exactly zero - so there is nothing to gain from a branch and one
       // more place for the term to go missing. featurise.js only allocates the
       // matrix when some ligand has bonds, hence the fallback here.
-      const bondMatrix = keep(this.allocator.upload("af3-embed.bonds",
-        input.bondMatrix ?? new Float32Array(pairs), storage));
+      // 🔴 TWO PLANES IN ONE BINDING WHERE THE MODEL HAS BOND TYPES: the
+      // contact flag first, then the bond ORDER. boltz2's z-init reads both
+      // and every other model reads only the first, so a seventh binding would
+      // exist for one dialect - and the second plane is PAIRS floats, which is
+      // the same upload the first already is.
+      const bondTypes = hasBondTypes(weights);
+      const bondMatrix = keep(this.allocator.upload("af3-embed.bonds", (() => {
+        const contact = input.bondMatrix ?? new Float32Array(pairs);
+        if (!bondTypes) return contact;
+        const packed = new Float32Array(pairs * 2);
+        packed.set(contact, 0);
+        if (input.bondOrderMatrix !== undefined) packed.set(input.bondOrderMatrix, pairs);
+        return packed;
+      })(), storage));
       const previousSingle = keep(this.allocator.upload("af3-embed.previous-single",
         input.previousSingle ?? new Float32Array(tokens * singleChannels), storage));
 
