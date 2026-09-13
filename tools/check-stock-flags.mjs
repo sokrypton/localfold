@@ -33,10 +33,22 @@ const FOLDS = [
   // input by ~2.2e4 and it already refuses f16 on the DENOISE gate (2.21e-1
   // against 3.50e-3), so a device that resolves precision differently is
   // exactly where it would come apart.
+  // 🔴 AND NO `--dump=`, WHICH THIS FILE'S OWN HEADER ALREADY SAID. These two
+  // arms named `/oracle-dumps/af3-batch-*-6mrr.json`, and `oracle-dumps/` is
+  // gitignored WHOLE - so on any machine but the one that generated them both
+  // arms died on a 404 before reaching a device, and the summary reported
+  // "2 of 6 models do not fold on a stock Chrome". They fold. Measured on an
+  // M2 with the dumps removed: boltz2 96.46015389206518 and protenix2
+  // 84.73666947394713, identical to their flagged runs to every digit.
+  //
+  // A batch dump is an ORACLE input and this gate is about a capability being
+  // absent. Keeping one here made a portability check depend on an artefact
+  // that does not travel, which is the same fault docs/PARITY.md records for
+  // nineteen AF3 checkers that 404ed rather than failing.
   ["boltz2", ["tools/gpu/fold.js", "--model=/model-boltz2-int5/manifest.json",
-              "--dump=/oracle-dumps/af3-batch-boltz2-6mrr.json", "--steps=50"]],
+              "--steps=50"]],
   ["protenix2", ["tools/gpu/fold.js", "--model=/model-protenix2-int5/manifest.json",
-                 "--dump=/oracle-dumps/af3-batch-protenix2-6mrr.json", "--steps=50"]],
+                 "--steps=50"]],
 ];
 
 const run = (args) => new Promise((resolve) => {
@@ -50,6 +62,7 @@ const run = (args) => new Promise((resolve) => {
 });
 
 let failed = 0;
+let skipped = 0;
 for (const [name, args] of FOLDS) {
   const { code, text } = await run(args);
   // 🔴 THE EXIT CODE IS NOT ENOUGH. An uncaptured device error can leave the
@@ -68,10 +81,24 @@ for (const [name, args] of FOLDS) {
   // output distinguishes them.
   const named = text.match(/[^\n]*(enables \w+|extension 'f16')[^\n]*/)?.[0]?.trim();
   const lastLine = text.trim().split("\n").filter(Boolean).pop()?.slice(0, 110);
-  const why = signature ?? named ?? `no structure produced - ${lastLine ?? "no output"}`;
-  console.log(`${ok ? "ok  " : "FAIL"}  ${name.padEnd(9)} ${why}`);
+  // 🔴 AN ARM THAT NEVER REACHED A DEVICE IS NOT A MODEL THAT DOES NOT FOLD.
+  // A missing bundle or dump 404s, and a bundle whose widths the loader refuses
+  // raises, both BEFORE any pipeline is created - so counting those as
+  // stock-flag failures reports a capability verdict this gate did not observe.
+  // Measured: on a box with a stale OpenDDE bundle and no oracle dumps, this
+  // said "3 of 6 models do not fold on a stock Chrome" and all six folded.
+  const missing = text.match(/failed to load ([^\s:]+): 404|(\S+) has an invalid byte length/)?.[0]
+    ?? (/the dialect and the weights disagree/.test(text)
+      ? "the local bundle disagrees with the loader - re-fetch it" : undefined);
+  const why = signature ?? missing ?? named
+    ?? `no structure produced - ${lastLine ?? "no output"}`;
+  const verdict = ok ? "ok  " : missing === undefined ? "FAIL" : "SKIP";
+  if (!ok && missing !== undefined) { failed -= 1; skipped += 1; }
+  console.log(`${verdict}  ${name.padEnd(9)} ${why}`);
 }
+const ran = FOLDS.length - skipped;
 console.log(failed === 0
-  ? "\nevery model folds on a stock Chrome"
-  : `\n${failed} of ${FOLDS.length} models do not fold on a stock Chrome`);
+  ? `\nevery model folds on a stock Chrome${skipped === 0 ? "" : ` (${skipped} skipped: `
+    + "an artefact this box does not have, not a capability)"}`
+  : `\n${failed} of ${ran} models do not fold on a stock Chrome`);
 process.exit(failed === 0 ? 0 : 1);

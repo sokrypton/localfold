@@ -112,6 +112,49 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_OPENDDE_MODEL",
     load: () => import("./opendde.js"),
   },
+  // Boltz-2, an AlphaFold 3-lineage model with its own conditioning and its own
+  // confidence module.
+  //
+  // 🔴 ITS WIDTHS ARE WHERE AlphaFold 3 HID A DISTINCTION. Its trunk single
+  // is 384 and its diffusion single conditioning projects to 768, where
+  // AlphaFold 3's are both 384 - so `seqChannels + targetFeatWidth` read as the
+  // input width for one model and gave 1152 against a LayerNorm of 768 for
+  // this one. `trunkSingleChannels` is derived from
+  // `single_activations/weights` now rather than assumed; see
+  // src/af3/diffusion-weights.js.
+  //
+  // 🔴 AND ITS CONFIDENCE HEAD IS A DIFFERENT MODULE IN FRONT OF THE SAME
+  // PAIRFORMER - `~_boltz2_reembed` rather than `~_embed_features`, and EIGHT
+  // blocks where every other model has four. `confidenceWeights` detects that
+  // from the tensors rather than from the family name, which is why this entry
+  // needs no branch of its own.
+  //
+  // 442 tensors at int5 in eight shards, 364 MiB.
+  boltz2: {
+    model: "boltz2",
+    directory: "./model-boltz2-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/boltz2-int5/",
+    release: "boltz2-int5",
+    variable: "LOCALFOLD_INCLUDE_BOLTZ2_MODEL",
+    load: () => import("./boltz2.js"),
+  },
+  // Protenix-v2, the other AlphaFold 3-lineage model in this round.
+  //
+  // 🔴 ITS TEMPLATE TERM CONCATENATES WHERE AlphaFold 3 PROJECTS. AF3 runs
+  // nine separate feature projections (`template_pair_embedding_0..8`); this
+  // one and boltz2 concatenate the features and apply a single `a_proj`. That
+  // is read from the bundle rather than typed in - see
+  // `src/af3/template-webgpu.js`.
+  //
+  // 404 tensors at int5 in eight shards, 334 MiB.
+  protenix2: {
+    model: "protenix2",
+    directory: "./model-protenix2-int5/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/068c905dfb0f8cf9b9432eef80d2220ef3ff697f/protenix2-int5/",
+    release: "protenix2-int5",
+    variable: "LOCALFOLD_INCLUDE_PROTENIX2_MODEL",
+    load: () => import("./protenix2.js"),
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -203,8 +246,8 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * That exact mistake is recorded in CLAUDE.md for the AF3/OpenBind split; this
  * is the same mistake one model later.
  */
-export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "ef2-fast-600m",
-                                  "ef2-fast-300m"];
+export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
+                                  "protenix2", "ef2-fast-600m", "ef2-fast-300m"];
 
 /**
  * The families that predict a structure and nothing about it.
@@ -234,7 +277,7 @@ export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
  * AlphaFold 2 branch at each of them, which is not a failure that announces
  * itself.
  */
-export const AF3_FAMILIES = ["af3", "openbind0", "opendde"];
+export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 

@@ -5,6 +5,8 @@ import {
   searchCacheEntry,
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
+import { AF3_FAMILIES, FOLDING_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
+  from "../src/reference/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "../src/input/chains.js";
 
@@ -318,6 +320,34 @@ describe("re-merging a search for another model", () => {
   it("refuses a model it has no merge for", () => {
     expect(() => mergeSearchedChains({ sequences, chainA3ms, model: "nonesuch" }))
       .toThrow(/unknown model/);
+  });
+
+  // 🔴 EVERY FOLDING FAMILY HAS ONE, AND THIS IS THE GATE THAT WAS MISSING.
+  // CHAIN_MERGES was four names typed out and `opendde` was never added, so
+  // asking for TWO COPIES of a chain under it threw "unknown model opendde:
+  // expected monomer, multimer, af3, openbind0" - a message naming a
+  // capability that model has. It shipped that way, and boltz2 and protenix2
+  // arrived the same way. The table is derived from AF3_FAMILIES now; this
+  // fails if a family is ever added that nothing can merge for.
+  it("has a merge for every family that can fold a complex", () => {
+    for (const family of FOLDING_FAMILIES) {
+      if (SINGLE_SEQUENCE_FAMILIES.includes(family)) continue;
+      // ...the family in the assertion rather than beside it: this harness's
+      // `expect` takes no message, so a bare not.toThrow() names nothing.
+      let thrown;
+      try { mergeSearchedChains({ sequences, chainA3ms, pairedA3ms, model: family }); }
+      catch (error) { thrown = `${family}: ${error.message}`; }
+      expect(thrown).toBe(undefined);
+    }
+  });
+
+  // ...and the AF3 lineage all merge the SAME way, which is why deriving the
+  // table from the family list is sound rather than merely convenient.
+  it("merges every AlphaFold 3-lineage family the way AlphaFold 3 does", () => {
+    const rows = (model) => parseA3m(mergeSearchedChains(
+      { sequences, chainA3ms, pairedA3ms, model }).a3m).sequences;
+    const af3 = rows("af3");
+    for (const family of AF3_FAMILIES) expect(rows(family)).toEqual(af3);
   });
 
   it("drops the paired block for the monomer even when one was searched", () => {

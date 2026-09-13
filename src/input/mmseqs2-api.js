@@ -1,4 +1,5 @@
 import { parseA3m } from "./a3m.js";
+import { AF3_FAMILIES } from "../reference/manifests/index.js";
 import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "./chains.js";
 
@@ -8,11 +9,22 @@ import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired,
 // it, so OpenBind reads its MSA exactly as AlphaFold 3 does. Absent here, a
 // fold with it raises rather than quietly picking somebody's merge - which is
 // why this throws on an unknown name instead of defaulting.
+// 🔴 DERIVED FOR THE AF3 LINEAGE, NOT LISTED. This was four names typed out,
+// and it is the allow-list trap CLAUDE.md already records twice: `opendde`
+// was never added when it shipped, so asking for TWO COPIES of a chain under
+// it threw "unknown model opendde: expected monomer, multimer, af3,
+// openbind0" - a message naming a capability the model has. boltz2 and
+// protenix2 would have arrived the same way, and did.
+//
+// Every model that builds AlphaFold 3's graph merges row-aligned, because that
+// is a property of the GRAPH - merge_msa_features pads to the deepest
+// alignment and concatenates along the token axis, entity or not - so the
+// families list is the right source and a fifth AF3-lineage bundle needs no
+// edit here. AlphaFold 2's two are their own, and stay named.
 const CHAIN_MERGES = {
   monomer: mergeUnpairedChainA3ms,
   multimer: mergeChainA3ms,
-  af3: mergeRowAlignedChainA3ms,
-  openbind0: mergeRowAlignedChainA3ms,
+  ...Object.fromEntries(AF3_FAMILIES.map((family) => [family, mergeRowAlignedChainA3ms])),
 };
 
 const DEFAULT_API_URL = "https://api.colabfold.com";

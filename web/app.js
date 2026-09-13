@@ -253,7 +253,15 @@ function rememberTermsAccepted() {
 const MODEL_ALIASES = { openbind: "openbind0", ob: "openbind0", ob0: "openbind0",
                         af2: "monomer", mono: "monomer", multi: "multimer",
                         // ...the name this model shipped under first.
-                        esmfold2: "ef2-fast-600m", ef2: "ef2-fast-600m" };
+                        esmfold2: "ef2-fast-600m", ef2: "ef2-fast-600m",
+                        // 🔴 THE VERSION IS PART OF THE NAME, for the same
+                        // reason OpenFold3's preview is not an alias for
+                        // OpenBind above: Boltz-1 and Boltz-2 are different
+                        // models, as are Protenix and Protenix-v2, so the bare
+                        // family name resolves to the release this page
+                        // actually carries rather than standing for whatever
+                        // the name means next.
+                        boltz: "boltz2", protenix: "protenix2" };
 
 function applyModelFromUrl() {
   let asked;
@@ -369,6 +377,8 @@ const MODEL_STEMS = {
   af3: "af3",
   openbind0: "openbind0",
   opendde: "opendde",
+  boltz2: "boltz2",
+  protenix2: "protenix2",
   monomer: "af2",
   multimer: "af2_multimer",
   "ef2-fast-600m": "ef2_fast_600m",
@@ -382,6 +392,11 @@ const MODEL_LABELS = {
   // number is not decoration.
   openbind0: "OpenBind-0",
   opendde: "OpenDDE",
+  // Upstream's own names, for the reason OpenBind-0 keeps its number: the
+  // release is what the weights are, and a shortened label would name a family
+  // that has more than one member.
+  boltz2: "Boltz-2",
+  protenix2: "Protenix-v2",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
   // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
