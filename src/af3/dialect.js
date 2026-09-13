@@ -38,6 +38,9 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   swapTransposedBias: false,
   symmetriseBonds: false,
   maskPaddedKeys: false,
@@ -69,6 +72,9 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   swapTransposedBias: false,
   symmetriseBonds: true,
   maskPaddedKeys: true,
@@ -118,6 +124,9 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   // Upstream `TRANSPOSED_COLUMN_PAIR_BIAS`: a column attention's pair bias is
   // `Linear(z[k, q])`, the pair transposed BEFORE the projection.
   swapTransposedBias: true,
@@ -162,7 +171,95 @@ export const OPENDDE = Object.freeze({
   structuralTokens: true,
 });
 
+/**
+ * Protenix-v2 (ByteDance, Apache 2.0). Best-A 0.703 in the reference's table -
+ * the strongest model this port can legally serve.
+ *
+ * 🔴 IT IS OPENDDE'S DIALECT WITH FOUR FLIPS, AND THAT IS THE WHOLE PORT.
+ * Protenix-v2 sits in OPENFOLD3_LINEAGE exactly as OpenDDE does, so the lineage
+ * branches - bond symmetrisation, the element index shift, trained Fourier
+ * weights - are already here. Against OpenDDE its convention membership differs
+ * in four places and only four:
+ *
+ *     msaUpdateBeforeOuterProduct    opendde true,  protenix2 FALSE
+ *     splitPairConditioning          opendde true,  protenix2 true (see below)
+ *     preSymmetrisedPde              opendde false, protenix2 TRUE
+ *     templateMeanOverAllSlots       opendde false, protenix2 TRUE
+ *
+ * ...plus `structuralTokens`, OpenDDE's one difference that is not a flag at
+ * all, which this model does not have.
+ *
+ * 🔴 AND `pairInitFromSingle` WAS SETTLED BY THE TENSOR, NOT BY THE TABLE.
+ * OpenDDE builds the pair from `s_init` and its `left_single` is [384, 384];
+ * this bundle's is **[447, 256]**, a target_feat-wide input, so it builds the
+ * pair AlphaFold 3's way. The reference has no convention list for this - the
+ * shape is the statement - which is why src/af3/embedder-reference.js reads the
+ * flag AND the shape and refuses to default either.
+ *
+ * Every width is the tensor's and none is written down here: 48 trunk blocks of
+ * 8 triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four
+ * MSA blocks at c_m 128 with value_dim 8, and a 64-bin distogram whose
+ * half-logit projection carries a bias. All of it matches the reference's
+ * PROTENIX2_SETTINGS, which is the check that the derivation works rather than
+ * a table this file has to keep in step.
+ */
+export const PROTENIX2 = Object.freeze({
+  // TRANSPOSED_COLUMN_PAIR_BIAS.
+  swapTransposedBias: true,
+  // OPENFOLD3_LINEAGE.
+  symmetriseBonds: true,
+  maskPaddedKeys: true,
+  // 🔴 PADDED_SINGLE_COND, AND UNLIKE OpenDDE. Copied from OpenDDE's false and
+  // the loader caught it in one run: "single conditioning is 831 channels but
+  // its LayerNorm scale is 833". protenix2 carries the two unknown-DNA columns
+  // where OpenDDE does not, which is why this is a flag and not a lineage
+  // property - both models are OPENFOLD3_LINEAGE.
+  padSingleCondUnknownDna: true,
+  // 🔴 THE TENSOR SAYS SO: left_single is [447, 256], not [384, 384].
+  pairInitFromSingle: false,
+  // NOT in MSA_UPDATE_BEFORE_OPM - the outer product comes off the PRE-update
+  // MSA, AlphaFold 3's way and not OpenDDE's.
+  msaUpdateBeforeOuterProduct: false,
+  // distogram_head/half_logits carries a bias.
+  distogramBias: true,
+  keyMaskedAtomAttention: true,
+  perBlockPairLayerNorm: true,
+  perBlockAtomPairLayerNorm: true,
+  // "The opendde/protenix CHAINED form applies a norm TWICE, and composition
+  // does not commute away" - the reference's own note.
+  chainedAtomLayerNorm: true,
+  // 🔴 NOT `splitPairConditioning`, AND THE GUARD IS WHAT SAID SO. Reading the
+  // reference's DIFFUSION_PROJECTED_RELPOS membership, this was set true and
+  // diffusion-weights.js threw at once: "this bundle does not carry
+  // z_trunk_projection and its dialect says otherwise". There are THREE
+  // conditioning shapes here, not two, and the tensors spell them out:
+  //
+  //     AF3        raw 139 relpos, trunk pair passed through   [267, 128]
+  //     OpenDDE    BOTH projected (z_trunk_projection)         [256, 128]
+  //     protenix2  relpe projected, trunk pair passed through  [512, 256]
+  //
+  // 512 is 256 + 256: `relpe_projection` is [139, 256] and there is no
+  // `z_trunk_projection` at all. So `splitPairConditioning` is OpenDDE's
+  // both-projected case and this is its own flag.
+  splitPairConditioning: false,
+  projectedRelpos: true,
+  // No structural-token expansion; the diffusion runs on the trunk's tokens.
+  structuralTokens: false,
+  // 🔴 THESE TWO ARE DECLARED AND NOT YET IMPLEMENTED, and saying so is the
+  // point. `preSymmetrisedPde` symmetrises the PDE logits BEFORE the head
+  // rather than after - the reference found it with confidence_parity.py
+  // reading pde corr 0.87 while pae, plddt and resolved were all at parity, and
+  // records that NO FOLD CAUGHT IT, because a symmetric plausibly-scaled error
+  // metric stays symmetric and plausible. `templateMeanOverAllSlots` divides
+  // the template term by every slot rather than the occupied ones. Until the
+  // confidence head and the template embedder read them, a protenix2 fold is
+  // right in its trunk and wrong in those two places.
+  preSymmetrisedPde: true,
+  templateMeanOverAllSlots: true,
+});
+
 export const DIALECTS = Object.freeze({
+  protenix2: PROTENIX2,
   alphafold3: ALPHAFOLD3,
   openbind0: OPENBIND0,
   opendde: OPENDDE,

@@ -268,6 +268,28 @@ export async function conditioningWeights(store, dialect) {
     throw new Error(`this bundle ${hasSplit ? "carries" : "does not carry"} `
       + "z_trunk_projection and its dialect says otherwise");
   }
+  // 🔴 AND THERE IS A THIRD SHAPE, WHICH IS protenix2's. It projects the
+  // relative encoding to the pair width and passes the trunk pair through at
+  // ITS width, so the initial projection folds [z_trunk(c_z), relpe(c_z)]:
+  //
+  //     AF3        raw 139 relpos, trunk pair through   [267, 128]
+  //     OpenDDE    both projected (z_trunk_projection)  [256, 128]
+  //     protenix2  relpe projected, trunk pair through  [512, 256]
+  //
+  // Reading DIFFUSION_PROJECTED_RELPOS as `splitPairConditioning` put a true
+  // here and the guard above caught it in one run, which is the whole reason
+  // that guard exists.
+  const projectedRelpos = dialect.projectedRelpos;
+  if (projectedRelpos === undefined) {
+    throw new Error("dialect.projectedRelpos has no default: AF3 concatenates "
+      + "the RAW 139 relative-position features and protenix2 projects them to "
+      + "the pair width first");
+  }
+  const hasRelpe = store.manifest?.tensors?.[`${HEAD}/relpe_projection/weights`] !== undefined;
+  if (hasRelpe !== (splitPair || projectedRelpos)) {
+    throw new Error(`this bundle ${hasRelpe ? "carries" : "does not carry"} `
+      + "relpe_projection and its dialect says otherwise");
+  }
   return {
     // 🔴 EVERY WIDTH HERE IS THE TENSOR'S. `pair_cond_initial_projection` is
     // [267, 128] under AlphaFold 3 and [256, 128] under OpenDDE, because the
@@ -278,7 +300,12 @@ export async function conditioningWeights(store, dialect) {
     targetFeatWidth: 447, relativeWidth: 139,
     trunkPairChannels: splitPair
       ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
-      : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
+      // ...and where only the RELPOS is projected, the concatenation is two
+      // equal halves, so the trunk pair's width is what relpe was projected TO.
+      : projectedRelpos
+        ? dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0]
+          - dims(store, `${HEAD}/relpe_projection/weights`)[1]
+        : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
     pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
     pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
     // OpenDDE's two separate compressions; absent under AlphaFold 3, and the
@@ -286,6 +313,8 @@ export async function conditioningWeights(store, dialect) {
     ...(splitPair ? {
       zTrunkNormScale: await T("z_trunk_norm/scale"),
       zTrunkProjection: await T("z_trunk_projection/weights"),
+      relpeProjection: await T("relpe_projection/weights"),
+    } : projectedRelpos ? {
       relpeProjection: await T("relpe_projection/weights"),
     } : {}),
     pairTransitions: [await transition("pair_transition_0"),

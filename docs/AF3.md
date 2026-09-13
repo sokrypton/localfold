@@ -2308,3 +2308,69 @@ instrument, its unit and the shape of the rule; the threshold is not, and a
 default that silently drops a recycle should be worth more than that before it
 is one. `recycleDeltas` reports all three numbers on every fold, so the corpus
 can keep growing from runs people were doing anyway.
+
+## PROTENIX-V2: OPENDDE'S DIALECT WITH FOUR FLIPS, AND THREE THINGS THE TENSORS SETTLED
+
+Protenix-v2 (ByteDance, **Apache 2.0**, best-A **0.703** in the reference's
+table - the strongest model this port can legally serve). Added as a `BLOBS`
+entry and a dialect, with **no exporter change at all**: the trunk exported on
+the first attempt at 207 tensors, and the full bundle is 404 tensors /
+464.7 M parameters / 1773 MiB. That is `export_af3_model.py`'s own claim - "a
+second model becomes a different `--blob`, not a second exporter" - holding.
+
+**Its widths are the tensors' and none is written down.** 48 trunk blocks of 8
+triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four MSA
+blocks at c_m 128 with value_dim 8, a 64-bin distogram with a biased half-logit
+projection. Every one matches the reference's `PROTENIX2_SETTINGS`, which is
+what says `src/af3/weights.js`'s derivation works rather than a table here
+having to keep step.
+
+### What the assertions caught, one run each
+
+🔴 **`splitPairConditioning` WAS WRONG, AND THERE ARE THREE SHAPES NOT TWO.**
+Read off the reference's `DIFFUSION_PROJECTED_RELPOS` membership it looked like
+a `true`; `diffusion-weights.js` threw at once - *"this bundle does not carry
+z_trunk_projection and its dialect says otherwise"*. The tensors:
+
+| | relpos | trunk pair | `pair_cond_initial_projection` |
+|---|---|---|---|
+| AF3 | raw 139 | passed through | [267, 128] |
+| OpenDDE | projected | **also** projected | [256, 128] |
+| **protenix2** | projected | passed through | **[512, 256]** |
+
+512 is 256 + 256, `relpe_projection` is [139, 256] and there is no
+`z_trunk_projection`. So `splitPairConditioning` is OpenDDE's BOTH-projected
+case and protenix2 wanted a new `projectedRelpos`. The reference's list is about
+the featurisation; LocalFold's flag was about the tensor layout. They are not
+the same question and the guard is the only reason that took one run.
+
+🔴 **`padSingleCondUnknownDna` WAS WRONG TOO, COPIED FROM OpenDDE.** *"single
+conditioning is 831 channels but its LayerNorm scale is 833"*. protenix2 carries
+the two unknown-DNA columns where OpenDDE does not - both being
+OPENFOLD3_LINEAGE, which is exactly why this is a flag and not a lineage
+property.
+
+🔴 **AND `pairInitFromSingle` WAS SETTLED BY A SHAPE BEFORE ANYTHING RAN.**
+OpenDDE's `left_single` is [384, 384] and builds the pair from `s_init`; this
+bundle's is **[447, 256]**, so it builds it AlphaFold 3's way. The reference has
+no convention list for this - the shape is the statement - and
+`check-af3-embedder` passing is the confirmation.
+
+### Where it stands
+
+| | |
+|---|---|
+| `check-af3-block-any` | **PASS** - the pairformer computes its reference at protenix2's widths |
+| `check-af3-embedder` | **PASS** |
+| `check-af3-diffusion-conditioning` | **PASS** - initialPair 3.20e-7, widths 256/256/384 derived |
+| `check-af3-msa-block` | `fused weight has 131072 elements; expected 32768` - exactly 4x, which is c_m 128 against 64 times 8 heads against 4. A fused MSA weight is still sized from AlphaFold 3's constants |
+| `check-af3-trunk`, `check-af3-template` | `missing tensor .../single_template_embedding/query_embedding` - protenix2's template embedder has a different module tree (43 tensors), not just different widths |
+
+🔴 **AND TWO DECLARED FLAGS ARE NOT IMPLEMENTED, WHICH IS WHY A FOLD WOULD BE
+WRONG IN TWO PLACES THAT NO FOLD CAN SEE.** `preSymmetrisedPde` symmetrises the
+PDE logits before the head rather than after - the reference found it with
+`confidence_parity.py` reading pde corr **0.87** while pae, plddt and resolved
+were all at parity, and records that **no fold caught it**, because a symmetric
+plausibly-scaled error metric stays symmetric and plausible.
+`templateMeanOverAllSlots` divides the template term by every slot rather than
+the occupied ones. Both are in `PROTENIX2` and nothing reads them yet.

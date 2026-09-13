@@ -113,11 +113,31 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # `confidence_head/pairformer_stack` with none of AlphaFold 3's names. So the
 # trunk and the distogram head are exported and the rest is not yet; see
 # docs/OPENDDE.md.
+# 🔴 protenix2 IS OPENDDE'S DIALECT WITH FOUR FLIPS, WHICH IS WHY IT IS CHEAP.
+# Protenix-v2 (Apache 2.0, best-A 0.703 in the reference's table) sits in
+# OPENFOLD3_LINEAGE exactly as OpenDDE does, so the lineage branches - bond
+# symmetrisation, the element index shift, trained Fourier weights - are already
+# built. Against OpenDDE its convention membership differs in four places, and
+# only four:
+#
+#     MSA_UPDATE_BEFORE_OPM          opendde yes, protenix2 NO
+#     DIFFUSION_PROJECTED_RELPOS     opendde no,  protenix2 YES
+#     PRE_SYMMETRISED_PDE            opendde no,  protenix2 YES
+#     TEMPLATE_MEAN_OVER_ALL_SLOTS   opendde no,  protenix2 YES
+#
+# ...and it does NOT expand structural tokens, which is OpenDDE's one difference
+# that is not a flag. Its widths are its own (c_z 256, c_m 128, 8 trunk triangle
+# heads, 2 template, msa value_dim 8) and src/af3/weights.js derives every one
+# from the tensor that states it, so they need no table here.
+#
+#     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/\
+#       protenix/protenix2.bin.zst
 BLOBS = {
     "alphafold3": "~/af3_official_weights/af3.bin.zst",
     "openfold3": "~/af3_converted_cd2/of3_ported_weights.bin.zst",
     "openbind0": "~/af3_ported/openbind.bin.zst",
     "opendde": "~/af3_ported/opendde.bin.zst",
+    "protenix2": "~/af3_ported/protenix2.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs
