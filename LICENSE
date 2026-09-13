@@ -11,5 +11,5 @@ This covers the CODE in this repository only.
 
 The AlphaFold model parameters this software downloads and runs are not covered
 by it and remain subject to their own terms - DeepMind's CC BY 4.0 parameters
-licence for AlphaFold, and the respective licences of the ESM-C, ESMFold2 and
-OpenDDE checkpoints. See the README.
+licence for AlphaFold, and the respective licences of the ESM-C, ESMFold2,
+OpenBind-0, OpenDDE, Boltz-2 and Protenix-v2 checkpoints. See the README.

@@ -165,4 +165,7 @@ AlphaFold 3 port.
 [Beerware](LICENSE) (Revision 42) for the code. The model parameters are not
 covered by it: the AlphaFold weights remain under DeepMind's
 [CC BY 4.0 parameters license](https://github.com/google-deepmind/alphafold/blob/main/WEIGHTS_LICENSE),
-and the ESM-C, ESMFold2 and OpenDDE checkpoints under their own.
+and the ESM-C, ESMFold2, OpenBind-0, OpenDDE, Boltz-2 and Protenix-v2
+checkpoints under their own. Each is published by its own authors and this
+repository redistributes none of them: a bundle names the Hugging Face revision
+it fetches from, and the weights travel from there rather than with the site.

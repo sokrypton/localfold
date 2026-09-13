@@ -172,6 +172,17 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        a structure and a contact map with no pLDDT or PAE - the
                        same shape as EF2-fast. See docs/OPENDDE.md. -->
                   <option value="opendde">OpenDDE</option>
+                  <!-- 🔴 AlphaFold 3's GRAPH AT TWO OTHER MODELS' WIDTHS. Both
+                       are AF3-lineage and neither is AlphaFold 3: Boltz-2's
+                       diffusion single conditioning projects to 768 where
+                       AF3's is 384, and its confidence head is eight
+                       pairformer blocks behind its own re-embedding module;
+                       Protenix-v2 concatenates its template features and
+                       applies one projection where AF3 runs nine. Both are
+                       read from the bundle rather than typed in - see
+                       src/af3/dialect.js and docs/AF3.md. -->
+                  <option value="boltz2">Boltz-2</option>
+                  <option value="protenix2">Protenix-v2</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                   <!-- 🔴 NO ALIGNMENT AND NO TEMPLATE, WHICH IS THE POINT.
