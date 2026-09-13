@@ -139,11 +139,30 @@ STATUS_LINE = """(() => {
 })()"""
 
 
+def page_models():
+    """The values the page's #model-family select offers, read from index.html.
+
+    🔴 READ, NOT TYPED. The help text here said "monomer, multimer, af3 or
+    openbind0" three models after it stopped being true, and nothing checked
+    the value either: `--model` is written into the select, so a name the page
+    does not offer left the select where it was and this folded THAT model
+    under a label naming another. It is the allow-list trap CLAUDE.md records,
+    in the one tool that drives the page - so the list comes from the page.
+    """
+    with open(os.path.join(REPO, "index.html"), encoding="utf-8") as handle:
+        html = handle.read()
+    start = html.index('id="model-family"')
+    block = html[start:html.index("</select>", start)]
+    return re.findall(r'<option value="([^"]+)"', block)
+
+
 def main():
+    models = page_models()
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence", default=DEFAULT)
-    parser.add_argument("--model", default="monomer",
-                        help="the value of the #model select: monomer, multimer, af3 or openbind0")
+    parser.add_argument("--model", default="monomer", choices=models,
+                        help="the value of the #model-family select, read from index.html: "
+                        + ", ".join(models))
     parser.add_argument("--recycles", default="1")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--url", default=None,
