@@ -11,6 +11,8 @@
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
 import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { loadTrunkOracle, trunkOracleComparer } from "./trunk-oracle.js";
+import { batchFromDump } from "./fold.js";
 import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
   from "../../src/af3/fold.js";
 import { structuralLayout } from "../../src/af3/structural-tokens.js";
@@ -146,6 +148,7 @@ export async function main(device, args) {
   const steps = Number(option(args, "steps", "200"));
   const recycles = Number(option(args, "recycles", "0"));
   const manifest = option(args, "model", "/model-opendde-int5/manifest.json");
+  const trunkOracle = await loadTrunkOracle(option(args, "trunk-oracle", ""));
 
   // 🔴 AN MSA, WHICH THE PAGE GIVES OPENDDE AND THIS TOOL COULD NOT. Every
   // OpenDDE number in these docs is a SINGLE-SEQUENCE fold, so the page's
@@ -161,10 +164,27 @@ export async function main(device, args) {
       return response.text();
     }))).join("\n"),
   };
-  const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
-    maxSequences: Number(option(args, "max-msa", "512")),
-    seed: Number(option(args, "seed", "20260831")),
-  });
+  // 🔴 AND THE REFERENCE'S OWN BATCH, WHICH IS THE ONLY WAY TO MEASURE THE
+  // MODEL RATHER THAN THE FEATURISER. This port ships ONE idealised reference
+  // conformer set shared by every family, and it is not the CCD geometry
+  // af3-any-model featurises from - a deliberate choice, and it puts a FLOOR
+  // under every sequence-featurised oracle comparison: openbind0's target_feat
+  // reads 2.89e-2 from a sequence and 4.93e-8 from the reference's batch, over
+  // the same weights and the same code. `--dump=` removes the featuriser from
+  // the comparison so the trunk's own residual is visible.
+  const dumpPath = option(args, "dump", "");
+  const dump = dumpPath === "" ? null
+    : await (async () => {
+        const response = await fetch(dumpPath);
+        if (!response.ok) throw new Error(`failed to load ${dumpPath}: ${response.status}`);
+        return response.json();
+      })();
+  const { batch, rows } = dump !== null
+    ? { batch: batchFromDump(dump), rows: { depth: dump.numMsa ?? 1, unpairedFrom: 0 } }
+    : af3BatchFromA3m(sequence, alignment, {
+      maxSequences: Number(option(args, "max-msa", "512")),
+      seed: Number(option(args, "seed", "20260831")),
+    });
   if (rows.depth > 1) console.log(`MSA ${rows.depth} rows`);
   const openedAt = performance.now();
   const store = await openAf3Store(manifest);
@@ -295,7 +315,18 @@ export async function main(device, args) {
   // structural-token stage is a branch inside foldBatch gated on the dialect,
   // not a second driver - so the recycles, the contact map, the trunk cache
   // and the stage callbacks are shared rather than reproduced.
+  // 🔴 THE TRUNK AGAINST af3-any-model's OWN, WHICH OPENDDE NEVER HAD. Every
+  // OpenDDE trunk gate compares the GPU against this port's CPU reference, so
+  // the two agree and neither is held to the model - the same hole that let
+  // boltz2's `target_feat` sit at relRMS 1.00e+0 while `check-af3-trunk` read
+  // 2.74e-5. `tools/oracle/dump_af3_trunk_taps.py opendde` records the
+  // reference's seams; the comparator is shared with fold.js.
+  const oracle = trunkOracleComparer(trunkOracle,
+    Number(option(args, "trunk-oracle-bound", "1e-2")));
   const fold = await foldBatch(device, batch, weights, {
+    ...(trunkOracle === null ? {} : {
+      onSeam: (name, value) => oracle.compare(name, value),
+    }),
     // The resident trunk weights' element; see the measurement in docs.
     weightPrecision: option(args, "weights", undefined),
     pairWeightPrecision: option(args, "pair-weights", undefined),
@@ -373,7 +404,13 @@ export async function main(device, args) {
     },
     // 🔴 foldBatch's `onStage` NOTIFIES, it does not time - so the clock is
     // here. Each stage's cost is the gap between its announcement and the next.
-    onStage: (name) => {
+    onStage: (name, detail) => {
+      if (trunkOracle !== null && (name === "trunk-done" || name === "target-feat")) {
+        const arms = name === "target-feat"
+          ? [["target_feat", detail?.targetFeat]]
+          : [["single", detail?.trunk?.single], ["pair", detail?.trunk?.pair]];
+        for (const [label, ours] of arms) oracle.compare(label, ours);
+      }
       const now = performance.now();
       if (lastStage !== null) {
         timings[lastStage.name] = (timings[lastStage.name] ?? 0)
@@ -519,8 +556,24 @@ export async function main(device, args) {
     buffers.restore();
   }
 
+  // 🔴 A GATE THAT CANNOT FAIL IS NOT A GATE. The comparator counts what it
+  // actually matched, so a renamed seam - which used to report NOTHING and read
+  // exactly like agreement - throws here instead.
+  if (trunkOracle !== null) {
+    const summary = oracle.summary();
+    if (!summary.agrees) {
+      throw new Error(`the trunk disagrees with af3-any-model: worst`
+        + ` ${summary.worst?.label} at ${summary.worst?.relRms.toExponential(2)}`
+        + ` against a bound of ${summary.bound}`);
+    }
+    if (summary.offeredButUnmatched.length > 0) {
+      throw new Error(`nothing to compare for ${summary.offeredButUnmatched.join(", ")}`);
+    }
+  }
+
   return {
     target, sequence: sequence.length,
+    ...(trunkOracle === null ? {} : { trunkOracle: oracle.summary() }),
     ...(profiled === undefined ? {} : {
       gpuSummary,
       gpuTotalMs: Number(profiled.reduce((t, e) => t + e.ms, 0).toFixed(1)),

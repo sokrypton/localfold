@@ -99,6 +99,31 @@ export function batchFromDump(dump) {
     asymId: ints(raw("asym_id")),
     deletionMatrix: floats(raw("deletion_matrix")),
     seqMask: floats(raw("seq_mask")),
+    // 🔴 AND WHICH RESIDUE EACH TOKEN BELONGS TO, which the featuriser records
+    // and this path did not. OpenDDE's structural layout reads it to decide a
+    // token's molecule kind, so `fold-opendde.js --dump=` died in
+    // `kindOfToken` reading undefined - a batch that is complete for AF3 and
+    // incomplete for the family that re-tokenises. Derived from the dump's own
+    // (asym_id, residue_index) pairs: a new pair starts a new residue, which is
+    // exactly the grouping the featuriser builds.
+    ...(() => {
+      const asym = ints(raw("asym_id"));
+      const residueIndex = ints(raw("residue_index"));
+      const residueOfToken = new Int32Array(tokens).fill(-1);
+      const chainOfResidue = [];
+      const chains = new Map();
+      let residue = -1, lastKey = null;
+      for (let token = 0; token < tokens; token += 1) {
+        const key = `${asym[token]}:${residueIndex[token]}`;
+        if (key !== lastKey) {
+          residue += 1; lastKey = key;
+          if (!chains.has(asym[token])) chains.set(asym[token], chains.size);
+          chainOfResidue.push(chains.get(asym[token]));
+        }
+        residueOfToken[token] = residue;
+      }
+      return { residueOfToken, chainOfResidue };
+    })(),
     refPos: floats(raw("ref_pos")), refMask,
     refElement: ints(raw("ref_element")), refCharge: floats(raw("ref_charge")),
     refAtomNameChars: ints(raw("ref_atom_name_chars")),

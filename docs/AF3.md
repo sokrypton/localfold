@@ -2936,12 +2936,88 @@ absorbed it. The stale bundle folded silently at target_feat 445 instead of 447.
 It comes off `single_activations` now, which states 447 outright, and the stale
 bundle raises.
 
-🔴 **OpenDDE's TRUNK AND CONFIDENCE ARE STILL UNMEASURED AGAINST AN ORACLE.**
-Its confidence is its own module (`opendde_confidence.OpenDDEConfidenceHead`),
-which `dump_af3_confidence.py` does not build, and its trunk runs through
-`fold-opendde.js`, which has no `--trunk-oracle=`. Both are reachable - the
-reference's `confidence_parity.ours_opendde` is the entry point for one and the
-taps already work for the other - and neither has been done.
+### 🔴 OpenDDE's TRUNK AND CONFIDENCE, MEASURED AT LAST - AND THE TEMPLATE STAGE IS WRONG
+
+Both gates now exist. `fold-opendde.js --trunk-oracle=` (the comparator is
+shared with fold.js, in tools/gpu/trunk-oracle.js) and
+`tools/gpu/check-opendde-confidence-oracle.js`, whose dump needed a new script:
+`dump_af3_confidence.py` indexes
+`confidence_head/~_embed_features/left_target_feat_project` and OpenDDE has no
+such tensor, so it died with a KeyError. `tools/oracle/dump_af3_opendde_confidence.py`
+drives the reference's own `OpenDDEConfidenceHead` with 0 unmapped scopes.
+
+🔴 **AND THE FIRST THING BOTH GATES NEEDED WAS THE REFERENCE'S OWN BATCH,
+BECAUSE THIS PORT'S CONFORMERS ARE NOT AF3'S AND THAT IS DELIBERATE.** LocalFold
+ships ONE idealised reference conformer set shared by every family; the
+reference featurises CCD geometry per input. Measured, same weights and same
+code, on 6MRR:
+
+| openbind0 `target_feat` | from a SEQUENCE | from the reference's batch |
+|---|---:|---:|
+| | **2.89e-2** | **4.93e-8** |
+
+So every number in the table above is a `--dump=` number - the MODEL, with the
+featuriser taken out - and a sequence-featurised oracle run has a floor of about
+3e-2 that is the conformer choice and not a defect. That is worth knowing before
+reading any oracle residual: `fold-opendde.js --dump=` exists for the same
+reason, and needed `batchFromDump` to carry `residueOfToken`, which the
+featuriser records and that path did not (OpenDDE re-tokenises and reads it, so
+it died in `kindOfToken` on a batch that is complete for AF3).
+
+**OpenDDE's trunk, on the reference's batch:**
+
+| seam | relRMS |
+|---|---:|
+| `target_feat` | **3.14e-8** |
+| `tap.z_init_generic` | **4.70e-8** |
+| `tap.trunk_in_single` | **2.78e-7** |
+| `tap.z_after_template` | **2.07e-2** |
+| `tap.z_after_msa` | 5.91e-2 |
+| `tap.trunk_out_pair` / `pair` | 1.08e-1 |
+| `single` | 1.88e-2 |
+
+**Exact into the trunk and wrong from the template stage on.** Everything after
+inherits it, so there is one defect here and not four - and 6MRR carries NO
+template, which makes it the empty-template path. openbind0's same seam reads
+4.07e-6, so it is OpenDDE's, not the module's.
+
+🔴 **THE FIX IS NOT WRITTEN AND THE GATE THAT WOULD LOCALISE IT DOES NOT EXIST
+EITHER.** `check-af3-template-fused.js` is an oracle check for the FUSED
+embedder (boltz2, protenix2); OpenDDE uses AF3's nine-projection one, whose only
+gate here - `check-af3-template.js` - is differential against our own CPU. The
+dump is ready (`EMPTY=1 dump_af3_template.py opendde`, in
+oracle-dumps/af3-oracle-template-opendde-empty.json: 76 tokens, c_z 384, the
+five features and the output), and what it needs is a checker at the same seam
+the fused one uses - features IN, output compared - which means
+`templateEmbedding` must accept precomputed features instead of deriving them
+from slots. That is the next piece of work.
+
+**OpenDDE's confidence head**, on the reference's own seeded inputs:
+
+| readout | relRMS |
+|---|---:|
+| `predicted_lddt` | 1.42e-4 |
+| `predicted_experimentally_resolved` | 1.94e-4 |
+| `full_pae` | **4.68e-3** |
+| `full_pde` | **7.50e-3** |
+
+Identical with `--f16=off`, so not arithmetic precision. The split is the clue:
+the two readouts taken off the SINGLE are ~30x tighter than the two taken off
+the PAIR, so what diverges is the pair path - the z init from `s_inputs`, the
+distance embedding, or the four-block pairformer. openbind0's whole head reads
+4.26e-4 and boltz2's 1.44e-6, so this is an order worse than any other model and
+it is an open finding rather than a tolerance. The checker's bound is 1e-2,
+which catches a regression and does not pretend this is agreement.
+
+🔴 **AND THE ENCODER BISECT CAUGHT ITS OWN AUTHOR FIRST.**
+`check-opendde-encoder-oracle.js` reported the per-atom conditioning at 1.19 -
+near-orthogonal to the reference - while `target_feat` was exact in 439 of its
+447 columns. Both cannot be true, and that contradiction is what found the bug:
+the checker passed `atomReference(store)`, the DIFFUSION head's reference table,
+where `buildTargetFeat` reads `targetFeatureWeights(store).reference`. With the
+right weights the conditioning came back to 0.26 and then, on the reference's
+batch, to exact. **A residual that is impossible given another residual is
+evidence about the checker, not about the port.**
 
 ### What the two new models COST, and the 5.4x that was hiding in a presence test
 

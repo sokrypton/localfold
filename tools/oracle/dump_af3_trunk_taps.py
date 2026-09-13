@@ -104,7 +104,39 @@ if cut:
     print("  sliced %d stacked tensors to %d blocks" % (cut, BLOCKS))
     for name in _cut_names[:6]:
         print("    ", name)
-out, target = fwd.apply(sliced, jax.random.PRNGKey(0), b)
+# 🔴 AND EVERY MODULE INSIDE THE TARGET-FEAT ENCODER, ON DEMAND. OpenDDE's
+# `target_feat` reads 9.65e-2 against this dump at f32 with a bundle that agrees
+# with the reference's params 481 of 481 - so the disagreement is in the port's
+# code, in 8 of 384 channels, and a whole-tensor residual names none of them.
+# `dump_af3_scopes.py` cannot reach these: its forward pass is the denoiser's
+# and never runs the trunk's encoder. CAPTURE is a regex over module names,
+# e.g. CAPTURE=evoformer_conditioning.
+SCOPES = {}
+_seen = {}
+def _tracer(next_f, targs, tkwargs, context):
+    value = next_f(*targs, **tkwargs)
+    try:
+        name = context.module.module_name
+        if hasattr(value, "shape"):
+            a = np.asarray(value, np.float32)
+            _seen[name] = _seen.get(name, 0) + 1
+            # Keyed by name and overwritten so the LAST write - the apply pass -
+            # wins over hk.init's random one; `calls` keeps a module genuinely
+            # called twice from hiding behind that.
+            SCOPES[name] = {"shape": list(a.shape),
+                            "rms": float(np.sqrt((a.astype(np.float64) ** 2).mean())),
+                            "calls": _seen[name], "data": a.ravel().tolist()}
+    except Exception:
+        pass
+    return value
+
+CAPTURE = os.environ.get("CAPTURE")
+if CAPTURE:
+    import re as _re
+    with hk.intercept_methods(_tracer):
+        out, target = fwd.apply(sliced, jax.random.PRNGKey(0), b)
+else:
+    out, target = fwd.apply(sliced, jax.random.PRNGKey(0), b)
 taps = {k: [np.asarray(x, np.float32) for x in v] for k, v in ev.ESM_TRUNK_TAPS.items()}
 print(MODEL, "passes", PASSES, "blocks", BLOCKS, "msa", MSA_BLOCKS, "| emb", sorted(out.keys()),
       "| taps", {k: len(v) for k, v in taps.items()})
@@ -121,6 +153,17 @@ for name, values in taps.items():
     put("tap.%s" % name, values[-1])       # the LAST pass; the dump keeps one cycle
 for name in ("single", "pair"):
     if name in out: put(name, out[name])
+if CAPTURE:
+    kept = 0
+    for _name, _entry in SCOPES.items():
+        if _re.search(CAPTURE, _name):
+            record["scope.%s" % _name] = _entry
+            kept += 1
+            print("  scope.%-44s %-18s rms %9.4f  calls %d"
+                  % (_name, _entry["shape"], _entry["rms"], _entry["calls"]))
+    # A capture that matches nothing is a typo, not agreement.
+    assert kept, "CAPTURE=%r matched none of %d modules" % (CAPTURE, len(SCOPES))
+
 p = ("/tmp/af3-oracle-trunk-%s.json" % MODEL if BLOCKS == 48
      else "/tmp/af3-oracle-trunk-%s-b%d.json" % (MODEL, BLOCKS))
 open(p, "w").write(json.dumps({"model": MODEL, "passes": PASSES, "stages": record}))
