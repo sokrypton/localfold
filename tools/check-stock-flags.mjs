@@ -26,6 +26,17 @@ const FOLDS = [
   ["AF3", ["tools/gpu/fold.js", "--model=/model-af3-int5/manifest.json"]],
   ["OpenDDE", ["tools/gpu/fold-opendde.js", "--target=6mrr", "--steps=16"]],
   ["ESMFold2", ["tools/gpu/fold-esmfold2.js", "--bundle=/model-esmfold2-int5"]],
+  // 🔴 THE TWO NEWEST MODELS WERE NOT IN THIS LIST, which is the whole failure
+  // this file exists for: every other harness here passes the two developer
+  // flags, so a model that needs them folds everywhere except on a visitor's
+  // browser. boltz2 is the one to watch - its token transformer amplifies its
+  // input by ~2.2e4 and it already refuses f16 on the DENOISE gate (2.21e-1
+  // against 3.50e-3), so a device that resolves precision differently is
+  // exactly where it would come apart.
+  ["boltz2", ["tools/gpu/fold.js", "--model=/model-boltz2-int5/manifest.json",
+              "--dump=/oracle-dumps/af3-batch-boltz2-6mrr.json", "--steps=50"]],
+  ["protenix2", ["tools/gpu/fold.js", "--model=/model-protenix2-int5/manifest.json",
+                 "--dump=/oracle-dumps/af3-batch-protenix2-6mrr.json", "--steps=50"]],
 ];
 
 const run = (args) => new Promise((resolve) => {

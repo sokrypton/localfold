@@ -38,8 +38,9 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { singleCondPadding, singleCondPaddingWgsl } from "./dialect.js";
-import { createTransitionShader, packTransitionWeights, transitionRowTile }
+import { createTransitionShader, packTransitionWeights, transitionRowTile, transitionWidth }
   from "./transition-webgpu.js";
 
 /**
@@ -727,9 +728,24 @@ export class Af3DiffusionConditioningGpu {
         : await this.pipelines.get(`${base}:pair-transition:${index}`,
             createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
                                    prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
+      // 🔴 THE SINGLE TRANSITION IS `tokens` ROWS AND THE KERNEL DISPATCHES
+      // ROWS ONLY, so at 68 tokens it runs 68 workgroups of the default 128
+      // threads - 8,704 on a device that holds 221,184. `transitionThreadTarget`
+      // is the rule that widens it, and device-profile.js prices it at 4.19x on
+      // the TRUNK's single transition, which is the same shape. This call site
+      // never asked for it: boltz2's two conditioning transitions were 44% of
+      // its whole denoiser call's GPU time, 8.4 ms of 21.4, because its seq
+      // channel is 768 where AlphaFold 3's is 384 and the row's arithmetic goes
+      // as the square.
+      //
+      // The width is BAKED into the shader, so it is in the key.
+      const singleWidth_ = transitionWidth(
+        tokens, transitionRowTile(tokens, seqChannels),
+        deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2);
       transitionPipelines.single.push(await this.pipelines.get(
-        `${base}:single-transition:${index}`,
-        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2 },
+        `${base}:single-transition:${index}:w${singleWidth_}`,
+        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2,
+                                 width: singleWidth_ },
                                prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
     }
     return { shape, base, compiled, transitionPipelines };

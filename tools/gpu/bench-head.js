@@ -28,9 +28,15 @@ import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
 import { normalFrom } from "../../src/af3/fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
+import { af3Dialect } from "../../src/af3/weights.js";
 import { profileDevice } from "./profile.js";
 import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+// 🔴 THE BUNDLE'S DIALECT, NOT AlphaFold 3's. This bench pinned ALPHAFOLD3, so
+// pointing it at protenix2 built its single conditioning 831 wide against an
+// 833 LayerNorm - and the two only differ by two zero columns, so before the
+// width assertion could fire it produced a NUMBER for the wrong model. Same
+// fault docs/PARITY.md records across the checkers, and the same one
+// bench-trunk.js had.
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -103,6 +109,7 @@ export async function main(device, args) {
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const loadStart = performance.now();
   const weights = await diffusionWeights(store);
+  const dialect = af3Dialect(store);
   const reference = await atomReference(store);
   const loadMs = Math.round(performance.now() - loadStart);
 
@@ -115,13 +122,14 @@ export async function main(device, args) {
 
   const input = {
     shape: batch.shape,
-    dialect: ALPHAFOLD3,
+    dialect,
     conditioning: perAtomConditioning({
       positions: batch.refPos, mask: batch.refMask, element: batch.refElement,
       charge: batch.refCharge, atomNameChars: batch.refAtomNameChars,
     }, tokens, dense, reference),
     atomMask: batch.predDenseAtomMask, seqMask: batch.seqMask, features: batch.features,
-    targetFeat: fill(tokens * 447),
+    // ...at the WEIGHTS' width, not 447: boltz2's is 384.
+    targetFeat: fill(tokens * weights.conditioning.targetFeatWidth),
     refPos: batch.refPos, refSpaceUid: batch.refSpaceUid,
     tokenAtomsToQueries: batch.tokenAtomsToQueries, queriesToKeys: batch.queriesToKeys,
     queriesToTokenAtoms: batch.queriesToTokenAtoms,
