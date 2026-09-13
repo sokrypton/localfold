@@ -16,6 +16,7 @@ import {
 } from "../../src/af3/pairformer-reference.js";
 import { Af3MsaStackGpu } from "../../src/af3/msa-stack-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights.js";
 import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
@@ -31,6 +32,16 @@ const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";
 // doing by omission. AF3's answer here; `--msa-update-before-opm=false` is
 // OpenDDE's, and it is the arm that makes this checker reach that bundle.
 const DIALECT = { swapTransposedBias: false, msaUpdateBeforeOuterProduct: false };
+// 🔴 THESE WERE AlphaFold 3's CONSTANTS TYPED IN, WHICH IS THE BLINDNESS
+// CLAUDE.md WARNS ABOUT: "the whole differential suite is blind to a second
+// bundle's widths, which is exactly where a second bundle breaks". On
+// protenix2 (c_z 256, c_m 128) this checker did not report a mismatch, it threw
+// out of a KERNEL - "fused weight has 131072 elements; expected 32768", which
+// is channels^2*2 at 256 against the 128 typed here - and read like a broken
+// triangle multiplication rather than a checker asking the wrong question.
+// They are the bundle's now, derived the way msaBlockWeights already derives
+// them, and these stay only as the fallback shapes for a bundle that states
+// neither.
 const MSA_CHANNELS = 64;
 const PAIR_CHANNELS = 128;
 
@@ -68,16 +79,26 @@ export async function main(device, args) {
   const sequences = Number(option(args, "sequences", "16"));
   const count = Number(option(args, "blocks", "1"));
   const model = option(args, "model", MANIFEST);
-  const dialect = {
-    ...DIALECT,
-    msaUpdateBeforeOuterProduct:
-      option(args, "msa-update-before-opm", "false") !== "false",
-  };
   // The device's own answers, so the matrix arm runs what SHIPS rather than a
   // set this file names - the fault CLAUDE.md records about a checker that
   // spells out the shipped settings and then agrees with itself.
   const shipped = { ...deviceTuning(device) };
   const store = await HttpTensorStore.open(model);
+  // 🔴 THE DIALECT IS THE BUNDLE'S, AND THE FLAG IS NOW ONLY AN OVERRIDE. This
+  // was a hand-built object with `msaUpdateBeforeOuterProduct` off a command
+  // line switch DEFAULTING TO FALSE - so running it against OpenDDE, which
+  // takes the outer product off the UPDATED MSA, silently compared the two
+  // orderings and read pair 4.97e-1. That is not a precision number, it is a
+  // different model, and it looked like a broken MSA stack. `--msa-update-
+  // before-opm=` still forces it, because the differential between the two
+  // orderings is worth being able to ask for.
+  const bundleDialect = af3Dialect(store);
+  const forced = args.find((a) => a.startsWith("--msa-update-before-opm="));
+  const dialect = {
+    ...DIALECT, ...bundleDialect,
+    ...(forced === undefined ? {}
+      : { msaUpdateBeforeOuterProduct: forced.split("=")[1] !== "false" }),
+  };
 
   const layer = async (leaf, index) => {
     const name = `${STACK}/${leaf}`;
@@ -86,6 +107,7 @@ export async function main(device, args) {
     return whole.subarray(index * stride, (index + 1) * stride);
   };
 
+  const shapeOf = (leaf) => store.shape(`${STACK}/${leaf}`);
   const blockWeights = async (index) => {
     const at = (leaf) => layer(leaf, index);
     const triangle = async (direction) => ({
@@ -99,7 +121,13 @@ export async function main(device, args) {
       gatingLinear: await at(`triangle_multiplication_${direction}/gating_linear/weights`),
     });
     const grid = async (which) => ({
-      heads: 4, dimension: 32,
+      // 🔴 AlphaFold 3's 4 HEADS WERE TYPED IN, AND THAT IS THE WHOLE 1.8e-1.
+      // The GPU reads the bundle's weights and the CPU reference was told 4
+      // heads whatever the bundle carried - protenix2 runs 8 and OpenDDE 12 -
+      // so the two sides computed different models and the checker reported it
+      // as a precision failure. k_projection is (blocks, heads, dim, channels).
+      heads: shapeOf(`pair_attention${which}/k_projection/weights`)?.[1] ?? 4,
+      dimension: shapeOf(`pair_attention${which}/k_projection/weights`)?.[2] ?? 32,
       actNormScale: await at(`pair_attention${which}/act_norm/scale`),
       actNormOffset: await at(`pair_attention${which}/act_norm/offset`),
       pairBiasProjection: await at(`pair_attention${which}/pair_bias_projection/weights`),
@@ -109,10 +137,16 @@ export async function main(device, args) {
       gatingQuery: await at(`pair_attention${which}/gating_query/weights`),
       outputProjection: await at(`pair_attention${which}/output_projection/weights`),
     });
+    // The pair track's width is what its own attention projects from, and the
+    // MSA's is what the outer product mean reads - both stated by a tensor.
+    const blockPairChannels = shapeOf("msa_attention1/pair_logits/weights")?.[1];
+    const blockMsaChannels = shapeOf("outer_product_mean/left_projection/weights")?.[1];
+    const blockOuterChannels = shapeOf("outer_product_mean/output_w")?.[2];
     return {
-      pairChannels: PAIR_CHANNELS, msaChannels: MSA_CHANNELS,
+      pairChannels: blockPairChannels ?? PAIR_CHANNELS,
+      msaChannels: blockMsaChannels ?? MSA_CHANNELS,
       outerProductMean: {
-        outerChannels: 32,
+        outerChannels: blockOuterChannels ?? 32,
         layerNormInputScale: await at("outer_product_mean/layer_norm_input/scale"),
         layerNormInputOffset: await at("outer_product_mean/layer_norm_input/offset"),
         leftProjection: await at("outer_product_mean/left_projection/weights"),
@@ -121,7 +155,10 @@ export async function main(device, args) {
         outputB: await at("outer_product_mean/output_b"),
       },
       msaAttention1: {
-        heads: 8, dimension: 8,
+        // ...and the same for the MSA attention: v_projection is
+        // (blocks, c_m, heads, valueDim).
+        heads: shapeOf("msa_attention1/v_projection/weights")?.[2] ?? 8,
+        dimension: shapeOf("msa_attention1/v_projection/weights")?.[3] ?? 8,
         actNormScale: await at("msa_attention1/act_norm/scale"),
         actNormOffset: await at("msa_attention1/act_norm/offset"),
         pairNormScale: await at("msa_attention1/pair_norm/scale"),
@@ -165,10 +202,16 @@ export async function main(device, args) {
       msaMask[s * n + t] = sequence[t] > 0 && ((s * 7 + t * 3) % 11) < 8 ? 1 : 0;
     }
   }
+  // ...and so are the INPUTS, which is the other half of the same mistake: the
+  // weights were derived and the tensors they multiply were still AF3-wide, so
+  // protenix2 moved from one shape error straight into another ("msa has 24576
+  // elements; expected 49152" - 24*16*64 against 24*16*128).
+  const pairChannels = blocks[0].pairChannels;
+  const msaChannels = blocks[0].msaChannels;
   const state = {
     tokens: n, sequences,
-    pair: deterministic(n * n * PAIR_CHANNELS, 313 + n),
-    msa: deterministic(sequences * n * MSA_CHANNELS, 727 + n),
+    pair: deterministic(n * n * pairChannels, 313 + n),
+    msa: deterministic(sequences * n * msaChannels, 727 + n),
     pairMask, msaMask,
   };
 

@@ -102,3 +102,4 @@ natives
 
 # tools/gpu/bench-jaxjs-matmul.js wants @jax-js/jax's dist copied here.
 /.jaxjs-tmp
+.ipynb_checkpoints/

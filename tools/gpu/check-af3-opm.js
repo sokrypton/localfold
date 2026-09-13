@@ -15,6 +15,11 @@ import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";
+// 🔴 AlphaFold 3's WIDTHS, KEPT ONLY AS A FALLBACK. Typed in, this checker had
+// never run the outer product mean at any width but AF3's - and the OPM is the
+// one kernel that writes the pair FROM the MSA, so it is exactly where a second
+// bundle's c_m -> c_z mapping breaks. OpenDDE is 128 -> 384 and protenix2
+// 128 -> 256 against AF3's 64 -> 128. `--model=` and derived widths now.
 const MSA_CHANNELS = 64;
 const PAIR_CHANNELS = 128;
 const OUTER_CHANNELS = 32;
@@ -52,7 +57,13 @@ export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "24"));
   const sequences = Number(option(args, "sequences", "16"));
   const block = Number(option(args, "block", "0"));
-  const store = await HttpTensorStore.open(MANIFEST);
+  const store = await HttpTensorStore.open(option(args, "model", MANIFEST));
+  // Every width is a tensor's: left_projection is (c_m, outer), output_w is
+  // (outer, outer, c_z).
+  const shapeOf = (leaf) => store.shape(`${STACK}/outer_product_mean/${leaf}`);
+  const msaChannels = shapeOf("left_projection/weights")?.[1] ?? MSA_CHANNELS;
+  const outerChannels = shapeOf("left_projection/weights")?.[2] ?? OUTER_CHANNELS;
+  const pairChannels = shapeOf("output_w")?.[3] ?? PAIR_CHANNELS;
 
   const layer = async (leaf) => {
     const name = `${STACK}/outer_product_mean/${leaf}`;
@@ -62,7 +73,7 @@ export async function main(device, args) {
   };
 
   const weights = {
-    outerChannels: OUTER_CHANNELS,
+    outerChannels,
     layerNormInputScale: await layer("layer_norm_input/scale"),
     layerNormInputOffset: await layer("layer_norm_input/offset"),
     leftProjection: await layer("left_projection/weights"),
@@ -71,7 +82,7 @@ export async function main(device, args) {
     outputB: await layer("output_b"),
   };
 
-  const msa = deterministic(sequences * tokens * MSA_CHANNELS, 1234 + tokens);
+  const msa = deterministic(sequences * tokens * msaChannels, 1234 + tokens);
   // Ragged in a different place per sequence - see the note above.
   const msaMask = new Float32Array(sequences * tokens);
   for (let s = 0; s < sequences; s += 1) {
@@ -80,11 +91,10 @@ export async function main(device, args) {
     }
   }
 
-  const expected = outerProductMean(msa, msaMask, sequences, tokens, MSA_CHANNELS,
-                                    PAIR_CHANNELS, weights);
+  const expected = outerProductMean(msa, msaMask, sequences, tokens, msaChannels,
+                                    pairChannels, weights);
   const { output, elapsedMilliseconds, memory } = await new Af3OuterProductMeanGpu(device)
-    .run(msa, msaMask, { sequences, tokens, msaChannels: MSA_CHANNELS,
-                         pairChannels: PAIR_CHANNELS }, weights);
+    .run(msa, msaMask, { sequences, tokens, msaChannels, pairChannels }, weights);
   const relRms = relativeRms(output, expected);
   console.log(`opm\ttokens=${tokens} sequences=${sequences}`
     + `\trelRMS ${relRms.toExponential(2)}`
@@ -93,5 +103,6 @@ export async function main(device, args) {
   const bound = 1e-5;
   if (relRms > bound) throw new Error(`relRMS ${relRms.toExponential(2)} exceeds ${bound}`);
   return { tokens, sequences, block, relRms,
+    widths: { msaChannels, outerChannels, pairChannels },
            ms: elapsedMilliseconds, peakMiB: memory.peakBytes / 2 ** 20 };
 }
