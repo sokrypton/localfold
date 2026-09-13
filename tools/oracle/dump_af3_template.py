@@ -37,7 +37,16 @@ from alphafold3.model.network import template_modules as T
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "protenix2"
 seq, tmpl = TP._self_template(os.path.expanduser("~/5K9P.cif"), "A")
-batch, cfg, model_dir = fold_check._fold_setup(MODEL, seq, None, templates=[tmpl])
+# EMPTY=1 records the NO-TEMPLATE case, which is the one every de novo fold
+# actually runs and the one nothing gated. It is not an all-zero comparison:
+# protenix keeps a z-DEPENDENT half (z_proj(z_norm(z)), summed over the padded
+# slots and divided by the SLOT count), so the term is live with no template at
+# all - dropping it cost protenix1 9 A on ubiquitin there. What differs per
+# vendor is the empty slot's RESTYPE, which is why this is dumped and not
+# assumed.
+EMPTY = bool(os.environ.get("EMPTY"))
+batch, cfg, model_dir = fold_check._fold_setup(
+    MODEL, seq, None, **({} if EMPTY else {"templates": [tmpl]}))
 fb = feat_batch.Batch.from_data_dict(batch)
 templates = fb.templates
 n_tok = int(np.asarray(fb.token_features.mask).shape[0])
@@ -78,6 +87,7 @@ out["output"] = {"shape": list(got.shape), "dtype": str(got.dtype),
                  "data": got.astype(np.float32).ravel().tolist()}
 out["slots"] = 1
 
-path = "/tmp/af3-oracle-template-%s.json" % MODEL
+out["empty"] = EMPTY
+path = "/tmp/af3-oracle-template-%s%s.json" % (MODEL, "-empty" if EMPTY else "")
 open(path, "w").write(json.dumps(out))
 print("wrote", path, "%.1f MB" % (os.path.getsize(path) / 2**20))
