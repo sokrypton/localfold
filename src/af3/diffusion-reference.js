@@ -353,7 +353,8 @@ export function diffusionConditioning(input, weights, onStage) {
   const single = linear(layerNormSlow(features1d, tokens, singleWidth,
                                       weights.singleCondInitialNormScale, null),
                         tokens, singleWidth, seqChannels,
-                        weights.singleCondInitialProjection);
+                        weights.singleCondInitialProjection,
+                        weights.singleCondInitialProjectionBias ?? null);
 
   onStage?.("conditioning.singleInitial", single);
   // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG. The weight and

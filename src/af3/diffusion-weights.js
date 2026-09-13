@@ -418,6 +418,14 @@ export async function conditioningWeights(store, dialect) {
                       await transition("pair_transition_1")],
     singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
     singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
+    // 🔴 boltz2's PROJECTION CARRIES A BIAS AND NOBODY ELSE'S DOES. An absent
+    // bias is not a zero one here only because nothing read it: the single
+    // conditioning came out 8.19e-1 from af3-any-model's while the PAIR half
+    // was 2.69e-7, which is the signature of a missing additive term rather
+    // than a wrong width.
+    singleCondInitialProjectionBias:
+      store.manifest?.tensors?.[`${HEAD}/single_cond_initial_projection/bias`] === undefined
+        ? null : await T("single_cond_initial_projection/bias"),
     singleTransitions: [await transition("single_transition_0"),
                         await transition("single_transition_1")],
     fourierWeight: await T("fourier_embedding_weight"),
@@ -549,13 +557,18 @@ export async function diffusionWeights(store, superBlocks = 6) {
     });
   }
 
+  // Loaded before the table below so the transformer can take its conditioning
+  // width from it rather than from a constant.
+  const conditioning = await conditioningWeights(store, dialect);
   return {
     dialect: af3Dialect(store),
-    seqChannels: 384, perTokenChannels: 768,
+    // ...and the head's own single width is the conditioning's too: boltz2
+    // embeds 768 where AlphaFold 3 embeds 384.
+    seqChannels: conditioning.seqChannels, perTokenChannels: 768,
     singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),
     outputNormScale: await T("output_norm/scale"),
-    conditioning: await conditioningWeights(store, dialect),
+    conditioning: conditioning,
     transformer: {
       // 🔴 `pairChannels: 128` WAS TYPED IN AND IT IS THE MODEL'S, NOT AF3's.
       // The token transformer reads the diffusion conditioning's PAIR, and
@@ -565,7 +578,14 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // [6, 4, 128, 16] - so the stack was reading a 256-wide pair through a
       // 128-wide stride, and every stage ran without complaint on a fold whose
       // backbone bonds came out at 0.96 A against an ideal 1.46.
-      channels: 768, condChannels: 384,
+      // 🔴 `condChannels: 384` WAS TYPED IN AND IT IS THE CONDITIONING'S OUTPUT
+      // WIDTH. AlphaFold 3's single_cond_initial_projection is [831, 384] and
+      // boltz2's is [768, 768], so the token transformer's conditioning buffer
+      // was allocated at half the size it needed: "Write range (size: 208896)
+      // does not fit in [Buffer difftx.cond] size (104448)" - exactly 2x, and a
+      // validation error rather than a wrong answer only because the shapes
+      // happened to be checkable.
+      channels: 768, condChannels: conditioning.seqChannels,
       pairChannels: txPairChannels(store, perBlockPair),
       heads: 16, dimension: 48,
       transitionFactor: 2, blocksPerSuperBlock: 4,

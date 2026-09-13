@@ -258,7 +258,15 @@ export async function main(device, args) {
   const weights = {
     trunk: await trunkWeights(store, blocks, 4),
     diffusion: await diffusionWeights(store),
-    confidence: await confidenceWeights(store),
+    // 🔴 A SECOND MODEL MAY HAVE A DIFFERENT CONFIDENCE HEAD ENTIRELY, and a
+    // fold's product is the STRUCTURE. boltz2 rebuilds its pair under a
+    // `~_boltz2_reembed` scope and carries no head LayerNorms, so this loader
+    // cannot read it - and blocking the whole fold on a reported number would
+    // hide whether its trunk and diffusion are right. `--no-confidence` folds
+    // without it and says so; the head is still missing, and the flag is how
+    // that is stated rather than worked around.
+    confidence: args.includes("--no-confidence") ? undefined
+      : await confidenceWeights(store),
     atomReference: await atomReference(store),
     targetFeat: await targetFeatureWeights(store),
   };
@@ -669,9 +677,17 @@ export async function main(device, args) {
   }
 
   console.log(`diffusion done in ${((performance.now() - diffusionStarted) / 1000).toFixed(1)} s`);
-  console.log(`mean pLDDT ${result.meanPlddt.toFixed(1)} over ${result.atoms} atoms`
-    + `   pTM ${result.ptm.toFixed(3)}`
-    + `   ipTM ${Number.isNaN(result.iptm) ? "n/a (one chain)" : result.iptm.toFixed(3)}`);
+  // 🔴 A FOLD WITHOUT A CONFIDENCE HEAD STILL HAS COORDINATES, and it says so
+  // rather than printing a zero that reads as a very bad prediction. See
+  // --no-confidence: boltz2's head is a different module and is not written.
+  if (result.meanPlddt === undefined) {
+    console.log(`no confidence head for this model: ${result.atoms} atoms, no `
+      + "pLDDT, pTM or ipTM. The geometry check below is the whole gate.");
+  } else {
+    console.log(`mean pLDDT ${result.meanPlddt.toFixed(1)} over ${result.atoms} atoms`
+      + `   pTM ${result.ptm.toFixed(3)}`
+      + `   ipTM ${Number.isNaN(result.iptm) ? "n/a (one chain)" : result.iptm.toFixed(3)}`);
+  }
 
   // 🔴 GEOMETRY IS THE CHECK THAT MATTERS HERE, not pLDDT - see the note on
   // backboneGeometry.

@@ -353,7 +353,7 @@ export async function buildTargetFeat(batch, weights, device) {
     positions: batch.refPos, mask: batch.refMask,
     element: batch.refElement, charge: batch.refCharge,
     atomNameChars: batch.refAtomNameChars,
-  }, batch.tokens, batch.dense, weights.reference);
+  }, batch.tokens, batch.dense, weights.reference, weights.dialect);
 
   const shared = {
     shape: batch.shape, dialect: weights.dialect,
@@ -380,7 +380,7 @@ export async function buildTargetFeat(batch, weights, device) {
   return targetFeatures({
     aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,
     atomFeatures: atomFeatures.tokenAct,
-  }, batch.tokens);
+  }, batch.tokens, weights.dialect ?? weights.encoder?.dialect);
 }
 
 /**
@@ -1198,8 +1198,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // PREDICTION, so unlike AlphaFold 3's it cannot run before the sampler - and
   // it runs on the structural token set, so its pLDDT is per structural atom
   // and comes back through the same gather the coordinates do.
-  const scores = structural === undefined ? await confidenceFor()
-    : await openddeScores();
+  // ...and with no confidence weights the fold still produces coordinates; the
+  // scores are reported as absent rather than invented.
+  // 🔴 THE STRUCTURAL PATH IS TESTED FIRST, because OpenDDE scores through its
+  // OWN head and carries no `weights.confidence` at all - checking that first
+  // silently dropped its pLDDT while its fold stayed correct.
+  const scores = structural !== undefined ? await openddeScores()
+    : weights.confidence === undefined ? undefined
+      : await confidenceFor();
   // 🔴 AND THE REFINED PAIR GOES BACK HERE, not when the refiner returned. It
   // is the confidence head's last input and the head runs after the sampler, so
   // this is the one point at which nothing can still read it. At 384 structural

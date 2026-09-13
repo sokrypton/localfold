@@ -35,7 +35,7 @@ import { linear } from "./pairformer-reference.js";
  * @param {object} weights
  * @returns {Float32Array} tokens * dense * channels
  */
-export function perAtomConditioning(reference, tokens, dense, weights) {
+export function perAtomConditioning(reference, tokens, dense, weights, dialect) {
   const channels = weights.channels;
   const rows = tokens * dense;
 
@@ -73,8 +73,15 @@ export function perAtomConditioning(reference, tokens, dense, weights) {
   // 🔴 arcsinh, NOT the charge. See the note at the top: identical at zero, so
   // no protein-only check can catch this.
   const charge = new Float32Array(rows);
+  // 🔴 AlphaFold 3 SQUASHES THE CHARGE AND boltz2 DOES NOT. `asinh` is a
+  // compression - it barely moves a charge of 0 or 1 and pulls in the tails -
+  // so on a protein, where almost every formal charge is zero, the two agree
+  // almost everywhere and differ just enough to be invisible in a fold and
+  // plain in a denoise step. RAW_REF_CHARGE covers boltz2, chai1, rosettafold3
+  // and the ESMFold2 family.
+  const raw = dialect?.rawRefCharge === true;
   for (let index = 0; index < rows; index += 1) {
-    charge[index] = Math.asinh(reference.charge[index]);
+    charge[index] = raw ? reference.charge[index] : Math.asinh(reference.charge[index]);
   }
   add(linear(charge, rows, 1, channels, weights.embedRefCharge));
 

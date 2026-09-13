@@ -38,6 +38,8 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  sampler: null,
+  targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -81,6 +83,8 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  sampler: null,
+  targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -142,6 +146,8 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  sampler: null,
+  targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -231,6 +237,8 @@ export const OPENDDE = Object.freeze({
  * a table this file has to keep in step.
  */
 export const PROTENIX2 = Object.freeze({
+  sampler: null,
+  targetFeatAtomOnly: false,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
   noHeadNorm: false,
@@ -379,6 +387,28 @@ export const BOLTZ2 = Object.freeze({
   // GAP, opendde fills all four, intellifold2 deliberately uses 0", and boltz2
   // is with the last - and it is measurable rather than inferable, which is why
   // it is a dialect entry and not a rule.
+  // 🔴 ITS s_inputs IS THE ATOM ENCODER'S 384 COLUMNS AND NOTHING ELSE, where
+  // every other model here prepends a restype one-hot, a profile and a deletion
+  // mean for 447. The reference states it plainly - "s_trunk is concatenated
+  // with it, not with a 449-channel target_feat" - and the shape says the same:
+  // boltz2's single conditioning reads 768 = 384 + 384 where AF3's reads
+  // 831 = 447 + 384.
+  // 🔴 ITS OWN EDM SCHEDULE, AND NOTHING ERRORS IF IT IS NOT USED. The
+  // reference keeps these per model and says why: "running them on AF3's
+  // constants would anneal on the wrong schedule ... nothing errors, it just
+  // anneals differently and returns a plausible structure". boltz2's are not
+  // small differences - gamma_0 0.605 against 0.8, step_scale 1.638 against
+  // 1.5, rho 8 against 7 - and on AF3's the fold comes out with 9.6 A backbone
+  // bonds against an ideal 1.46.
+  //
+  // 🔴 AND THIS IS NOT A DIALECT BRANCH. It is a table of constants that rides
+  // here because the dialect is what a bundle already resolves to; the sampler
+  // reads it and the forward graph never sees it.
+  sampler: Object.freeze({
+    gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901, stepScale: 1.638,
+    rho: 8.0, sigmaMin: 0.0004, sigmaMax: 160.0,
+  }),
+  targetFeatAtomOnly: true,
   emptyTemplateRestypeColumns: [],
   templateStackOuterResidual: true,
   templateVisibilityByCoverage: true,

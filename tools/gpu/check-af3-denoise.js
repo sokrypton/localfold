@@ -103,7 +103,7 @@ export async function main(device, args) {
     // ...and the diffusion head's OWN reference-embedding weights, which are a
     // separate scope from the encoder's blocks: `diffusion_embed_ref_*` under
     // the head rather than `evoformer_conditioning_embed_ref_*`.
-  }, tokens, dense, await atomReference(store));
+  }, tokens, dense, await atomReference(store), dialect);
 
   const input = {
     tokens, dense, dialect, conditioning,

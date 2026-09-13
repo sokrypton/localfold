@@ -27,6 +27,14 @@ idx = np.concatenate([384 + np.asarray(_remap), 416 + np.asarray(_remap), [448],
 s449 = (rng.normal(size=(n_tok, 449)) * 0.5).astype(np.float32)
 s449[:, np.setdiff1d(np.arange(449), idx)] = 0.0
 s447 = s449[:, idx]
+# 🔴 boltz2's s_inputs IS seq_channel WIDE, NOT 447. It concatenates s_trunk
+# with a seq_channel-wide array rather than with a 449-channel target_feat, so
+# its single_cond_initial_norm is 768 = 384 + 384 where AF3's is 831 = 447 +
+# 384. denoise_parity's own main does this; without it haiku refuses the load
+# with "retrieved shape (768,) does not match shape=(831,)".
+if MODEL == "boltz2":
+    _w = cfg.evoformer.seq_channel
+    s449 = s447 = (rng.normal(size=(n_tok, _w)) * 0.5).astype(np.float32)
 pos_dense = (rng.normal(size=(n_tok, max_atoms, 3)) * NOISE).astype(np.float32) * feats['mask'][..., None]
 x_got = np.asarray(DP.ours(MODEL, cfg, model_dir, fb, pos_dense, NOISE, s447, s, z))
 print("tokens", n_tok, "max_atoms", max_atoms, "c_s", c_s, "c_z", c_z,

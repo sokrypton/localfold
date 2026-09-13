@@ -550,8 +550,16 @@ export function atomCrossAttentionEncoder(input, weights) {
  *          deletionMean: ArrayLike<number>, atomFeatures: Float32Array}} input
  * @param {number} tokens
  */
-export function targetFeatures(input, tokens) {
+export function targetFeatures(input, tokens, dialect) {
+  // 🔴 boltz2's IS THE ATOM ENCODER'S COLUMNS ALONE. Everything else here
+  // prepends a restype one-hot, a profile and a deletion mean - 31 + 31 + 1 -
+  // for 447; boltz2 takes the 384 and concatenates s_trunk with THAT. Built
+  // AF3's way it is 447 wide and the fold reads "targetFeat has 30396 elements;
+  // expected 26112".
   const restypes = 31;
+  if (dialect?.targetFeatAtomOnly === true) {
+    return Float32Array.from(input.atomFeatures.subarray(0, tokens * 384));
+  }
   const width = restypes * 2 + 1 + 384;
   const output = new Float32Array(tokens * width);
   for (let token = 0; token < tokens; token += 1) {

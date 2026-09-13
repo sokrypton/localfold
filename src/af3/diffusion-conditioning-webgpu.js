@@ -116,7 +116,7 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 
 export function createConditioningShaders(shape, offsets) {
   const { tokens, pairChannels, seqChannels, trunkSingleChannels, targetFeatWidth, noiseChannels,
-          padding, split = false, projectedRelpos = false,
+          padding, split = false, projectedRelpos = false, singleBias = false,
           trunkPairChannels = pairChannels } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
@@ -215,6 +215,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const singleInitial = `
 const TOKENS: u32 = ${tokens}u;
 const C_SEQ: u32 = ${seqChannels}u;
+// 🔴 THE SINGLE THIS READS AND THE ONE IT WRITES ARE TWO WIDTHS. AlphaFold 3
+// projects [831 -> 384] and its trunk single is also 384, so C_SEQ served as
+// both the input boundary in feature() and the output extent below. boltz2
+// projects [768 -> 768] from a trunk single of 384: read as one number,
+// feature() takes 768 columns from a 384-wide row and the conditioning came
+// out 8.2e-1 against af3-any-model.
+const C_TRUNK_SEQ: u32 = ${trunkSingleChannels}u;
 const TARGET_WIDTH: u32 = ${targetFeatWidth}u;
 const WIDTH: u32 = ${singleWidth}u;
 const NOISE_CHANNELS: u32 = ${noiseChannels}u;
@@ -258,9 +265,9 @@ fn reduce_sum(local: u32, value: f32) -> f32 {
  * below is generated from the same list the CPU reference walks.
  */
 fn feature(token: u32, index: u32) -> f32 {
-  if (index < C_SEQ) { return trunk_single[token * C_SEQ + index]; }
+  if (index < C_TRUNK_SEQ) { return trunk_single[token * C_TRUNK_SEQ + index]; }
   var source = index;
-${singleCondPaddingWgsl(padding)}  return target_feat[token * TARGET_WIDTH + source - C_SEQ];
+${singleCondPaddingWgsl(padding)}  return target_feat[token * TARGET_WIDTH + source - C_TRUNK_SEQ];
 }
 
 @compute @workgroup_size(64)
@@ -312,6 +319,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var c = 0u; c < NOISE_CHANNELS; c += 1u) {
       value += noise_norm[c] * noise_weights[W_NOISE_PROJECT + c * C_SEQ + out];
     }
+${singleBias ? "    value += projection[C_SEQ * WIDTH + out];" : ""}
     single[token * C_SEQ + out] = value;
   }
 }`;
@@ -622,8 +630,12 @@ export class Af3DiffusionConditioningGpu {
     // split one - it is the first half of the concatenation either way.
     const trunkPairChannels = (split || projectedRelpos)
       ? (weights.trunkPairChannels ?? pairChannels) : pairChannels;
+    // 🔴 boltz2's SINGLE PROJECTION CARRIES A BIAS AND NOBODY ELSE'S DOES, so
+    // it is appended to that buffer and read past its matrix - which keeps the
+    // binding count the same for every model.
+    const singleBias = weights.singleCondInitialProjectionBias != null;
     const shape = { tokens, pairChannels, seqChannels, trunkSingleChannels,
-                    targetFeatWidth, noiseChannels,
+                    targetFeatWidth, noiseChannels, singleBias,
                     padding, split, projectedRelpos, trunkPairChannels };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
@@ -632,7 +644,8 @@ export class Af3DiffusionConditioningGpu {
       // alone would hand one caller the other's - the collision this repository
       // has now paid for four times.
       + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`
-      + `:${projectedRelpos ? `pr${trunkPairChannels}` : ""}`;
+      + `:${projectedRelpos ? `pr${trunkPairChannels}` : ""}`
+      + `:ts${trunkSingleChannels}${singleBias ? ":sb" : ""}`;
     const compiled = {
       pairInitial: reusePair !== undefined ? undefined
         : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
@@ -751,8 +764,15 @@ export class Af3DiffusionConditioningGpu {
         : undefined;
       const singleScale = resident("cond.single-scale",
         () => weights.singleCondInitialNormScale);
-      const singleProjection = resident("cond.single-projection",
-        () => weights.singleCondInitialProjection);
+      const singleProjection = resident("cond.single-projection", () => {
+        const matrix = weights.singleCondInitialProjection;
+        const bias = weights.singleCondInitialProjectionBias;
+        if (bias == null) return matrix;
+        const packed = new Float32Array(matrix.length + bias.length);
+        packed.set(matrix, 0);
+        packed.set(bias, matrix.length);
+        return packed;
+      });
       const noise = up("cond.noise", embedded);
       const noiseWeights = resident("cond.noise-weights", () => noisePacked.data);
 
