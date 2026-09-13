@@ -2531,3 +2531,41 @@ Seven conventions are declared and unimplemented - `opmRowCountNorm`,
 term is `(1 - 1/1) * b = 0` and the two normalisers agree, which is why the
 reference's boltz2 single-sequence fold was exact while its MSA module was not.
 A single-sequence gate cannot see that one.
+
+### 🔴 A CHECKER PASSED BECAUSE BOTH SIDES WERE WRONG THE SAME WAY
+
+`check-af3-diffusion-conditioning` read **3.20e-7 on protenix2** and that number
+meant nothing. There are THREE pair-conditioning shapes and the code knew two:
+
+| | relpos | trunk pair | concatenation |
+|---|---|---|---|
+| AF3 | raw 139 | passed through | `trunkPair + 139` |
+| OpenDDE | projected | **also** projected | `2 * c_z`, on `z_trunk_projection` |
+| protenix2, boltz2 | **projected** | passed through | `trunkPair + c_z` |
+
+The third has `relpe_projection` and no `z_trunk_projection`, so `split` is false
+and it fell into AF3's raw-139 arm:
+
+    protenix2   256 + 139 = 395   against a norm of 512
+    boltz2      128 + 139 = 267   against a norm of 256
+
+🔴 **AND ONLY boltz2 WAS LOUD ABOUT IT.** Its 267 is LONGER than its scale, so
+the LayerNorm read past the end and all 73728 elements came out NaN - on BOTH
+sides, which is what made it obvious. protenix2's 395 is SHORTER than its 512,
+so it read a prefix, stayed finite, and the GPU made the identical mistake. Two
+wrong computations agreeing to 3.20e-7.
+
+With the reference corrected, the same arm reads **1.01 on protenix2** - order
+one, the GPU computing a different function - while AF3 stays at 2.10e-7 and
+OpenDDE at 3.78e-7. The defect was there from the moment protenix2 was added and
+the suite reported it as a pass.
+
+**The only reason it surfaced is that a second model rounded the other way.** A
+differential that compares two implementations of the same misunderstanding is
+worth nothing, and nothing in its output says so - this one printed a number
+four orders inside its bound. Adding a second model to a dialect is worth more
+as a test of the FIRST one than the numbers suggest.
+
+The reference and the checker carry the third branch now. The GPU does not: its
+`pairWidth` is `pairChannels + RELATIVE_WIDTH` with a `split` flag and no third
+mode, so protenix2 reads 1.01 and boltz2 NaN until it is written.

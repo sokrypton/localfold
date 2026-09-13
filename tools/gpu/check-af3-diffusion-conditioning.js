@@ -136,9 +136,28 @@ export async function main(device, args) {
     // diffusion-reference.js: OpenDDE LayerNorms the trunk pair on its own
     // width, projects it to the pair width, projects the relative encoding
     // separately, and concatenates THOSE.
-    const width = split ? 2 * PAIR_CHANNELS : TRUNK_PAIR_CHANNELS + 139;
+    // ...and the third shape, which protenix2 and boltz2 both take; see the
+    // note in src/af3/diffusion-reference.js for how this arm passing at
+    // 3.20e-7 on protenix2 was two wrong computations agreeing.
+    const projectedRelpos = !split && weights.relpeProjection !== undefined;
+    const width = split ? 2 * PAIR_CHANNELS
+      : projectedRelpos ? TRUNK_PAIR_CHANNELS + PAIR_CHANNELS
+      : TRUNK_PAIR_CHANNELS + 139;
     const features2d = new Float32Array(pairs * width);
-    if (split) {
+    if (projectedRelpos) {
+      const compressedRelative = linear(relative, pairs, 139, PAIR_CHANNELS,
+                                        weights.relpeProjection);
+      for (let index = 0; index < pairs; index += 1) {
+        for (let c = 0; c < TRUNK_PAIR_CHANNELS; c += 1) {
+          features2d[index * width + c] =
+            input.trunkPair[index * TRUNK_PAIR_CHANNELS + c];
+        }
+        for (let c = 0; c < PAIR_CHANNELS; c += 1) {
+          features2d[index * width + TRUNK_PAIR_CHANNELS + c] =
+            compressedRelative[index * PAIR_CHANNELS + c];
+        }
+      }
+    } else if (split) {
       const compressedTrunk = linear(
         layerNormSlow(input.trunkPair, pairs, TRUNK_PAIR_CHANNELS,
                       weights.zTrunkNormScale, null),

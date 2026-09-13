@@ -251,11 +251,42 @@ export function diffusionConditioning(input, weights, onStage) {
   // OpenDDE the trunk pair arriving here is 384 wide, which no fixed 128 would
   // survive.
   const relative = relativeEncoding(tokens, input.features);
+  // 🔴 AND THERE IS A THIRD SHAPE, WHICH protenix2 AND boltz2 BOTH TAKE: the
+  // relative encoding is PROJECTED to the pair width and concatenated with the
+  // RAW trunk pair. `relpe_projection` is present and `z_trunk_projection` is
+  // not, so `split` is false and this used to fall into AF3's raw-139 arm:
+  //
+  //     protenix2  256 + 139 = 395  against a norm of 512
+  //     boltz2     128 + 139 = 267  against a norm of 256
+  //
+  // 🔴 AND ONLY boltz2 WAS LOUD ABOUT IT. Its 267 is LONGER than its scale, so
+  // the LayerNorm read past the end and every one of 73728 elements came out
+  // NaN. protenix2's 395 is SHORTER than its 512, so it read a prefix, stayed
+  // finite, and the GPU made the identical mistake - so check-af3-diffusion-
+  // conditioning compared two wrong computations and passed at 3.20e-7. A
+  // checker agreeing with itself is the failure this repository keeps finding,
+  // and the only reason it surfaced is that a second model rounded the other
+  // way.
   const split = weights.zTrunkProjection !== undefined;
+  const projectedRelpos = !split && weights.relpeProjection !== undefined;
   const trunkPairChannels = weights.trunkPairChannels ?? pairChannels;
-  const width = split ? 2 * pairChannels : trunkPairChannels + weights.relativeWidth;
+  const width = split ? 2 * pairChannels
+    : projectedRelpos ? trunkPairChannels + pairChannels
+    : trunkPairChannels + weights.relativeWidth;
   const features2d = new Float32Array(pairs * width);
-  if (split) {
+  if (projectedRelpos) {
+    const compressedRelative = linear(
+      relative, pairs, weights.relativeWidth, pairChannels, weights.relpeProjection);
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < trunkPairChannels; c += 1) {
+        features2d[index * width + c] = trunkPair[index * trunkPairChannels + c];
+      }
+      for (let c = 0; c < pairChannels; c += 1) {
+        features2d[index * width + trunkPairChannels + c] =
+          compressedRelative[index * pairChannels + c];
+      }
+    }
+  } else if (split) {
     const compressedTrunk = linear(
       layerNormSlow(trunkPair, pairs, trunkPairChannels, weights.zTrunkNormScale, null),
       pairs, trunkPairChannels, pairChannels, weights.zTrunkProjection);
