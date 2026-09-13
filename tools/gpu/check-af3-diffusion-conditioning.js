@@ -91,6 +91,12 @@ export async function main(device, args) {
   const PAIR_CHANNELS = weights.pairChannels;
   const SEQ_CHANNELS = weights.seqChannels;
   const TARGET_WIDTH = weights.targetFeatWidth;
+  // 🔴 THE TRUNK SINGLE IS NOT THE CONDITIONING'S OUTPUT WIDTH. AF3's
+  // projection is [831, 384] and its trunk single is also 384, so one constant
+  // served both; boltz2's is [768, 768] - 768 out, 384 in - and building the
+  // input at 768 gave "single conditioning is 1152 channels" against a
+  // LayerNorm of 768.
+  const TRUNK_SINGLE = weights.trunkSingleChannels ?? SEQ_CHANNELS;
   const TRUNK_PAIR_CHANNELS = weights.trunkPairChannels;
   const split = weights.zTrunkProjection !== undefined;
 
@@ -115,7 +121,7 @@ export async function main(device, args) {
     // this arm exists to isolate had run at all. The sweep overrides it per arm.
     tokens, noiseLevel, dialect: dialectOfBundle,
     trunkPair: deterministic(tokens * tokens * TRUNK_PAIR_CHANNELS, 71 + tokens),
-    trunkSingle: deterministic(tokens * SEQ_CHANNELS, 72 + tokens),
+    trunkSingle: deterministic(tokens * TRUNK_SINGLE, 72 + tokens),
     targetFeat: deterministic(tokens * TARGET_WIDTH, 73 + tokens),
     features: { residueIndex, tokenIndex: residueIndex, asymId, entityId, symId },
   };
@@ -207,8 +213,14 @@ export async function main(device, args) {
   for (const [label, dialect] of [["alphafold3", ALPHAFOLD3], ["openbind0", OPENBIND0]]) {
     const arm = { ...input, dialect };
     const armWeights = retargetWeights(
-      weights, singleCondPadding(dialectOfBundle, SEQ_CHANNELS),
-      singleCondPadding(dialect, SEQ_CHANNELS), SEQ_CHANNELS, TARGET_WIDTH);
+      // 🔴 THE PADDED COLUMNS SIT AFTER THE TRUNK SINGLE, NOT AFTER THE
+      // CONDITIONING'S OUTPUT WIDTH. The concatenation is [trunkSingle,
+      // targetFeat] and the restype block is inside targetFeat, so both the
+      // offsets and the widths here are the trunk single's. AF3 makes the two
+      // equal at 384 and hid it; boltz2's are 384 and 768, and this arm built a
+      // 1152-wide splice against a 768-wide LayerNorm.
+      weights, singleCondPadding(dialectOfBundle, TRUNK_SINGLE),
+      singleCondPadding(dialect, TRUNK_SINGLE), TRUNK_SINGLE, TARGET_WIDTH);
     const expected = diffusionConditioning(arm, armWeights);
     const gpu = await new Af3DiffusionConditioningGpu(device).run(arm, armWeights);
     singles[label] = expected.single;

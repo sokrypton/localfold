@@ -323,8 +323,15 @@ export function diffusionConditioning(input, weights, onStage) {
   // ...and the trunk single with target_feat. 384 + 447, or 384 + 449 where the
   // dialect re-inserts OpenFold3's two unknown-DNA columns - see
   // singleCondPadding, and the scale length that asserts the two agree.
-  const padding = singleCondPadding(input.dialect, seqChannels);
-  const singleWidth = seqChannels + weights.targetFeatWidth + padding.length;
+  // 🔴 AND THE SINGLE IT READS IS NOT THE WIDTH IT WRITES. AF3's projection is
+  // [831, 384] and its trunk single is also 384, so `seqChannels` served as
+  // both and this line was right by coincidence. boltz2's is [768, 768] - 768
+  // out, 384 in - and reading one number for two gave 1152 against a LayerNorm
+  // of 768. The padded columns sit after the TRUNK SINGLE block too, for the
+  // same reason: the concatenation is [trunkSingle, targetFeat].
+  const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
+  const padding = singleCondPadding(input.dialect, trunkSingleChannels);
+  const singleWidth = trunkSingleChannels + weights.targetFeatWidth + padding.length;
   if (weights.singleCondInitialNormScale.length !== singleWidth) {
     throw new Error(`single conditioning is ${singleWidth} channels but its `
       + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
@@ -332,14 +339,15 @@ export function diffusionConditioning(input, weights, onStage) {
   }
   const features1d = new Float32Array(tokens * singleWidth);
   for (let token = 0; token < tokens; token += 1) {
-    for (let c = 0; c < seqChannels; c += 1) {
-      features1d[token * singleWidth + c] = trunkSingle[token * seqChannels + c];
+    for (let c = 0; c < trunkSingleChannels; c += 1) {
+      features1d[token * singleWidth + c] =
+        trunkSingle[token * trunkSingleChannels + c];
     }
-    for (let c = seqChannels; c < singleWidth; c += 1) {
+    for (let c = trunkSingleChannels; c < singleWidth; c += 1) {
       const source = singleCondSource(padding, c);
       if (source < 0) continue;
       features1d[token * singleWidth + c] =
-        targetFeat[token * weights.targetFeatWidth + source - seqChannels];
+        targetFeat[token * weights.targetFeatWidth + source - trunkSingleChannels];
     }
   }
   const single = linear(layerNormSlow(features1d, tokens, singleWidth,

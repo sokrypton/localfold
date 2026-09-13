@@ -70,6 +70,8 @@ function prepareWeights(weights) {
   // OpenDDE's pair conditioning normalises each term separately; see the
   // `split` branch of createConditioningShaders.
   const split = weights.zTrunkProjection !== undefined;
+  // ...and the third shape, where only the relpos is projected.
+  const projectedRelpos = !split && weights.relpeProjection !== undefined;
   const prepared = {
     columnSums: split ? new Float32Array(weights.pairChannels)
       : relativeColumnSums(weights.pairCondInitialNormScale,
@@ -114,7 +116,8 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 
 export function createConditioningShaders(shape, offsets) {
   const { tokens, pairChannels, seqChannels, trunkSingleChannels, targetFeatWidth, noiseChannels,
-          padding, split = false, trunkPairChannels = pairChannels } = shape;
+          padding, split = false, projectedRelpos = false,
+          trunkPairChannels = pairChannels } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
   const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
@@ -462,7 +465,67 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { pairInitial: split ? pairInitialSplit : pairInitial, singleInitial };
+  // 🔴 THE THIRD SHAPE: THE RELPOS PROJECTED, THE TRUNK PAIR PASSED THROUGH.
+  // protenix2 and boltz2 both take it, and with only `split` and the joint arm
+  // to choose from they fell into AlphaFold 3's raw-139 one - which read a
+  // PREFIX of protenix2's 512-long scale and quietly agreed with an equally
+  // wrong reference, and read PAST the end of boltz2's 256-long one and made
+  // 73728 NaNs. See the note in src/af3/diffusion-reference.js.
+  //
+  // It is the split kernel with the trunk compression replaced by a copy: no
+  // z_norm, no z_projection, and WIDTH is C_TRUNK + C_PAIR rather than
+  // 2 * C_PAIR. Derived from that text rather than written beside it, so the
+  // two cannot drift - the joint LayerNorm and the output projection below the
+  // concatenation are the same lines in both.
+  const pairInitialProjectedRelpos = pairInitialSplit
+    .replace(`const WIDTH: u32 = ${2 * pairChannels}u;`,
+             `const WIDTH: u32 = ${trunkPairChannels + pairChannels}u;`)
+    .replace(`@group(0) @binding(2) var<storage, read> z_scale: array<f32>;
+@group(0) @binding(3) var<storage, read> z_projection: array<f32>;
+@group(0) @binding(4) var<storage, read> relpe_projection: array<f32>;
+@group(0) @binding(5) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read> projection: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pair: array<f32>;`,
+             `@group(0) @binding(2) var<storage, read> relpe_projection: array<f32>;
+@group(0) @binding(3) var<storage, read> scale: array<f32>;
+@group(0) @binding(4) var<storage, read> projection: array<f32>;
+@group(0) @binding(5) var<storage, read_write> pair: array<f32>;`)
+    .replace(`  // LayerNorm over the trunk pair's own width.
+  var partial = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) { partial += trunk_pair[base + c]; }
+  let mean = total_of(lane, partial) / f32(C_TRUNK);
+  workgroupBarrier();
+  var squares = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) {
+    let d = trunk_pair[base + c] - mean;
+    squares += d * d;
+  }
+  let inverse_std = inverseSqrt(total_of(lane, squares) / f32(C_TRUNK) + EPSILON);
+  workgroupBarrier();
+
+  // ...projected to the pair width, into the first half of the concatenation.
+  for (var out = lane; out < C_PAIR; out += LANES) {
+    var value = 0.0;
+    for (var c = 0u; c < C_TRUNK; c += 1u) {
+      value += (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        * z_projection[c * C_PAIR + out];
+    }
+    concatenated[out] = value;
+  }`,
+             `  // The trunk pair, copied in RAW: no LayerNorm of its own and no
+  // projection. The joint LayerNorm below is the only one it sees.
+  for (var c = lane; c < C_TRUNK; c += LANES) {
+    concatenated[c] = trunk_pair[base + c];
+  }`)
+    .replace(`    concatenated[C_PAIR + out] = value;`,
+             `    concatenated[C_TRUNK + out] = value;`);
+  if (projectedRelpos && pairInitialProjectedRelpos === pairInitialSplit) {
+    throw new Error("the projected-relpos shader derivation matched nothing: "
+      + "the split kernel's text moved and the two have drifted apart");
+  }
+
+  return { pairInitial: projectedRelpos ? pairInitialProjectedRelpos
+             : split ? pairInitialSplit : pairInitial, singleInitial };
 }
 
 /**
@@ -549,19 +612,27 @@ export class Af3DiffusionConditioningGpu {
     const noiseChannels = weights.fourierWeight.length;
     const prepared = prepareWeights(weights);
     const noisePacked = prepared.noisePacked;
-    const padding = singleCondPadding(dialect, seqChannels);
+    const padding = singleCondPadding(dialect, trunkSingleChannels);
     // 🔴 THE TRUNK PAIR'S WIDTH IS NOT THE CONDITIONING'S under the split
     // dialect - OpenDDE hands 384 channels to a 128-channel conditioning - so
     // the two are separate here and the cache key carries both.
     const split = weights.zTrunkProjection !== undefined;
-    const trunkPairChannels = split
+    const projectedRelpos = !split && weights.relpeProjection !== undefined;
+    // 🔴 THE TRUNK PAIR'S WIDTH MATTERS IN BOTH PROJECTED SHAPES, not only the
+    // split one - it is the first half of the concatenation either way.
+    const trunkPairChannels = (split || projectedRelpos)
       ? (weights.trunkPairChannels ?? pairChannels) : pairChannels;
     const shape = { tokens, pairChannels, seqChannels, trunkSingleChannels,
                     targetFeatWidth, noiseChannels,
-                    padding, split, trunkPairChannels };
+                    padding, split, projectedRelpos, trunkPairChannels };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
-      + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`;
+      // 🔴 THE MODE IS IN THE KEY. Two of the three shapes can produce the same
+      // dimensions with different kernels, and a cache indexed on dimensions
+      // alone would hand one caller the other's - the collision this repository
+      // has now paid for four times.
+      + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`
+      + `:${projectedRelpos ? `pr${trunkPairChannels}` : ""}`;
     const compiled = {
       pairInitial: reusePair !== undefined ? undefined
         : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
@@ -618,7 +689,7 @@ export class Af3DiffusionConditioningGpu {
     // 🔴 THE PADDING IS PART OF THE CACHE KEY, because it changes the generated
     // `feature()` body while every dimension in the key stays put - the one
     // shape a shader cache cannot see.
-    const padding = singleCondPadding(input.dialect, seqChannels);
+    const padding = singleCondPadding(input.dialect, trunkSingleChannels);
     const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
     if (weights.singleCondInitialNormScale.length !== singleWidth) {
       throw new Error(`single conditioning is ${singleWidth} channels but its `
@@ -628,7 +699,9 @@ export class Af3DiffusionConditioningGpu {
 
     const { shape, base, compiled, transitionPipelines } =
       await this.#compileFor(tokens, weights, input.dialect, reusePair);
-    const { split } = shape;
+    // ...and the third mode, carried on the shape with it so `run` and the
+    // shader factory cannot disagree about which kernel is compiled.
+    const { split, projectedRelpos } = shape;
     const featureData = new Int32Array(5 * tokens);
     ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"].forEach((name, index) => {
       const source = input.features[name];
@@ -673,7 +746,7 @@ export class Af3DiffusionConditioningGpu {
       const zProjection = split
         ? onlyIfNew(() => resident("cond.z-projection", () => weights.zTrunkProjection))
         : undefined;
-      const relpeProjection = split
+      const relpeProjection = (split || projectedRelpos)
         ? onlyIfNew(() => resident("cond.relpe-projection", () => weights.relpeProjection))
         : undefined;
       const singleScale = resident("cond.single-scale",
@@ -743,13 +816,18 @@ export class Af3DiffusionConditioningGpu {
       // and it is read at the top of this method, because the uploads and the
       // allocations above it are pair-track work too.
       // The split kernel is a workgroup per pair row; the joint one is a lane.
-      const pairLinear = spread(split ? pairs : Math.ceil(pairs / 64));
+      // The two projected kernels are a workgroup per pair row; the joint one is
+      // a lane.
+      const pairLinear = spread((split || projectedRelpos) ? pairs
+        : Math.ceil(pairs / 64));
       if (reusePair === undefined) {
         run("pair-initial", compiled.pairInitial,
             split
               ? [trunkPair, features, zScale, zProjection, relpeProjection,
                  pairScale, pairProjection, pair]
-              : [trunkPair, features, pairScale, pairProjection, sums, pair],
+              : projectedRelpos
+                ? [trunkPair, features, relpeProjection, pairScale, pairProjection, pair]
+                : [trunkPair, features, pairScale, pairProjection, sums, pair],
             pairLinear[0], pairLinear[1]);
       }
       run("single-initial", compiled.singleInitial,
