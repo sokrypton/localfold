@@ -778,7 +778,8 @@ export async function diffusionWeights(store, superBlocks = 6) {
  * else gets AlphaFold 3's.
  */
 export async function foldWeights(store, options = {}) {
-  const trunk = await trunkWeights(store, options.blocks ?? 48, options.msaBlocks ?? 4);
+  const trunk = await trunkWeights(store, options.blocks, options.msaBlocks,
+    { allowPrefix: true });
   return {
     trunk,
     targetFeat: await targetFeatureWeights(store),

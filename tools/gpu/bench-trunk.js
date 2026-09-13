@@ -61,13 +61,17 @@ export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "59"));
   const rows = Number(option(args, "msa", "32"));
   const passes = Number(option(args, "passes", "3"));
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
   const sequence = Array.from({ length: tokens },
     (_, index) => ALPHABET[index % ALPHABET.length]).join("");
 
   const batch = featuriseProtein(sequence, {});
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
-  const weights = { trunk: await trunkWeights(store, blocks, 4),
+  const weights = { trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
                     targetFeat: await targetFeatureWeights(store) };
   const targetFeat = await buildTargetFeat(batch, weights.targetFeat, device);
 
@@ -149,7 +153,7 @@ export async function main(device, args) {
   };
   return {
     pairformerSplit: trunkGpu.lastPairformerSplit,
-    tokens, msaRows: rows, blocks, residentWeights, budgetMiB, perPass,
+    tokens, msaRows: rows, blocks: weights.trunk.pairformerBlocks.length, residentWeights, budgetMiB, perPass,
     deviceMemory: memorySnapshot(device),
     // 🔴 EIGHTEEN ROWS HID AN IMPROVEMENT. A knob that made `single.project`
     // FASTER dropped it out of the list, and the sweep read as "the kernel

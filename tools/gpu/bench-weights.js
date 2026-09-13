@@ -66,7 +66,7 @@ export async function main(device, args) {
   // what the page ends up doing and is the number the dequantiser moves.
   const loaders = family === "" || family === "af3"
     ? Object.fromEntries([
-      await timed("trunk", () => trunkWeights(store, 48, 4)),
+      await timed("trunk", () => trunkWeights(store)),
       await timed("diffusion", () => diffusionWeights(store)),
       await timed("confidence", () => confidenceWeights(store)),
       await timed("atomReference", () => atomReference(store)),

@@ -13,11 +13,11 @@
  * against the dump, and the geometry report. The pipeline itself is shared with
  * the page, because the page has to run what was measured.
  */
-import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";import { featuriseProtein } from "../../src/af3/featurise.js";
+import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
 import { af3ContactClasses } from "../../src/af3/contact-classes.js";
 import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
-import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
+import { af3BatchFromA3m } from "../../src/af3/batch.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
@@ -193,10 +193,9 @@ export async function main(device, args) {
   const pairedTexts = await chainTexts(option(args, "paired-a3m", ""));
   const mergeFor = (texts) => (texts === null ? null
     : (texts.length === 1 ? texts[0] : mergeRowAlignedChainA3ms(texts)));
-  const rows = unpairedTexts === null && pairedTexts === null
-    ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
-    : af3MsaFromA3m({ paired: mergeFor(pairedTexts), unpaired: mergeFor(unpairedTexts) },
-                    { maxSequences: Number(option(args, "max-msa", "512")) });
+  const alignment = unpairedTexts === null && pairedTexts === null
+    ? null
+    : { paired: mergeFor(pairedTexts), unpaired: mergeFor(unpairedTexts) };
 
   const ligands = [];
   for (const code of ligandCodes) {
@@ -229,12 +228,22 @@ export async function main(device, args) {
       + `\tours rms ${mine.toFixed(4)}\tnative rms ${entry.rms.toFixed(4)}`);
   };
 
-  const batch = sequenceArg !== ""
-    ? featuriseProtein(sequenceArg,
-      { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
-        ...(ligands.length === 0 ? {} : { ligands }),
-        ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }) })
-    : batchFromDump(dump);
+  // 🔴 THE SAME BUILDER THE PAGE USES, because this tool's whole claim is that
+  // "a fold run here is the fold the page runs" and for two features it was
+  // not: it passed no profile rows (profiling the CROPPED msa where the page
+  // profiles the whole file) and no seeded row choice (taking the alignment's
+  // prefix where the page takes a seeded subset). `--prefix-rows` restores the
+  // second for comparing against a baseline recorded before this.
+  const built = sequenceArg !== ""
+    ? af3BatchFromA3m(sequenceArg, alignment, {
+      maxSequences: Number(option(args, "max-msa", "512")),
+      seed: Number(option(args, "seed", "20260831")),
+      prefixRows: args.includes("--prefix-rows"),
+      ...(ligands.length === 0 ? {} : { ligands }),
+      ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }),
+    })
+    : { batch: batchFromDump(dump), rows: { msa: [], depth: 1, unpairedFrom: 0 } };
+  const { batch, rows } = built;
   if (rows.depth > 1) {
     console.log(`MSA ${rows.depth} rows, unpaired block starts at ${rows.unpairedFrom}`);
   }
@@ -307,7 +316,7 @@ export async function main(device, args) {
     void warmTrunkPipelines(device, store, batch.tokens).catch(() => {});
   }
   const weights = {
-    trunk: await trunkWeights(store, blocks, depths.msaBlocks),
+    trunk: await trunkWeights(store, blocks, depths.msaBlocks, { allowPrefix: true }),
     diffusion: await diffusionWeights(store),
     // 🔴 A SECOND MODEL MAY HAVE A DIFFERENT CONFIDENCE HEAD ENTIRELY, and a
     // fold's product is the STRUCTURE. boltz2 rebuilds its pair under a

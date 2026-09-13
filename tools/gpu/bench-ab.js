@@ -25,7 +25,7 @@ export async function main(device, args) {
   const rounds = Number((args.find((a) => a.startsWith("--rounds=")) ?? "--rounds=7").slice(9));
 
   const store = await openAf3Store("/model-af3-int5/manifest.json");
-  const weights = await trunkWeights(store, 48, 4);
+  const weights = await trunkWeights(store);
   const batch = featuriseProtein("A".repeat(LENGTH));
   const targetFeat = await buildTargetFeat(batch, await targetFeatureWeights(store), device);
   const input = {

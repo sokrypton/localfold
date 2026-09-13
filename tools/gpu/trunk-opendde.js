@@ -108,7 +108,11 @@ export async function main(device, args) {
   const crystal = readChain(crystalText, option(args, "chain", "A"));
   const sequence = option(args, "sequence", crystal.sequence);
   const rows = Number(option(args, "msa", "1"));
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
   const passes = Number(option(args, "recycles", "1"));
   const manifest = option(args, "model", "/model-opendde-trunk-int5/manifest.json");
 
@@ -136,7 +140,7 @@ export async function main(device, args) {
     }
     dialect = Object.freeze(changed);
   }
-  const weights = { trunk: await trunkWeights(store, blocks, 4),
+  const weights = { trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
                     targetFeat: await targetFeatureWeights(store) };
   // The embedder carries its own copy (it is the one stage that reads the
   // dialect off the weights rather than from the caller), so an ablation has to
@@ -248,7 +252,8 @@ export async function main(device, args) {
   return {
     scored,
     model: dialect === undefined ? "?" : manifest,
-    tokens, sequence: sequence.length, msaRows: rows, blocks, recycles: passes,
+    tokens, sequence: sequence.length, msaRows: rows,
+    blocks: weights.trunk.pairformerBlocks.length, recycles: passes,
     widths: { pairChannels, singleChannels, bins,
               gridHeads: weights.trunk.pairformerBlocks[0].pairAttention1.heads,
               msaChannels: weights.trunk.msaBlocks[0].msaChannels },

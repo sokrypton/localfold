@@ -41,7 +41,11 @@ async function heap() {
 }
 
 export async function main(device, args) {
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
   const manifestUrl = option(args, "model", "/model-af3-full-f32/manifest.json");
   const stages = [];
   const note = async (label, extra = {}) => {
@@ -63,7 +67,7 @@ export async function main(device, args) {
     (sum, record) => sum + record.shape.reduce((a, b) => a * b, 1) * 4, 0);
   await note("manifest open");
 
-  const weights = { trunk: await trunkWeights(store, blocks, 4),
+  const weights = { trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
                     targetFeat: await targetFeatureWeights(store) };
   await note("trunk weights");
   // ...and the rest of what a fold needs, so the page's heap can be attributed

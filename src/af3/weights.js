@@ -961,7 +961,32 @@ export function trunkDepths(store) {
   };
 }
 
-export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
+export async function trunkWeights(store, pairformerBlocks, msaBlocks, options = {}) {
+  // 🔴 THE BUNDLE'S DEPTH DECIDES, AND A DISAGREEMENT IS AN ERROR. This used to
+  // default to AlphaFold 3's 48 and 4 and take whatever a caller typed, and a
+  // stack is ONE stacked tensor - so asking for 48 blocks of boltz2's 64 loads
+  // the first 48 slices, runs them, and returns a trunk that never finished.
+  // Nothing fails. web/af3-model.js had `trunkWeights(store, 48, 4)` typed in
+  // and boltz2 folded its 128-row alignment to pLDDT 72.4 against the 96.1 the
+  // same batch reaches with all 64, which reads as "the MSA is not being used"
+  // and is a truncated trunk. Absent, the depths are read; present, they are
+  // CHECKED, because a tool that means to walk a prefix should say so and a
+  // tool that guessed should hear about it.
+  const bundle = trunkDepths(store);
+  for (const [what, asked, has] of [
+    ["pairformer", pairformerBlocks, bundle.pairformerBlocks],
+    ["MSA", msaBlocks, bundle.msaBlocks],
+  ]) {
+    if (asked !== undefined && asked !== has && !(options.allowPrefix && asked < has)) {
+      throw new Error(`this bundle has ${has} ${what} blocks, not ${asked}`
+        + " - a stacked weight will happily give you a prefix of itself and the"
+        + " fold that comes out is silently wrong. Pass no count to take the"
+        + " bundle's own, or { allowPrefix: true } if a short stack is the"
+        + " point - which it is for a bench and never for a fold.");
+    }
+  }
+  pairformerBlocks = pairformerBlocks ?? bundle.pairformerBlocks;
+  msaBlocks = msaBlocks ?? bundle.msaBlocks;
   const msa = [];
   for (let index = 0; index < msaBlocks; index += 1) msa.push(await msaBlockWeights(store, index));
   const pairformer = [];

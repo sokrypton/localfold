@@ -304,6 +304,8 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | ...and is the tower right at more than one length? | `check-esmc-tower.js --dump=/oracle-dumps/esmc-{59,128,180}.json` |
 
 | **Why does OpenDDE compile its pairformer twice, and can it stop?** | `tools/gpu/probe-token-specialisation.js` - it warms the stack at both token counts, diffs every WGSL text and sorts by bytes. 28 kernels of 44 differ only in a NUMBER (154 KiB) and 2 differ structurally (the triangle contractions, 934 of 1009 lines). 🔴 It is still not worth removing: the largest constants are `(row % 68u) * 68u + row / 68u` index arithmetic, which a uniform turns into integer division in the inner loop - the 4.3x class - and `override` does not help because the backend compiles once per value anyway. **The specialisation IS the compile cost.** See docs/OPENDDE.md |
+| **Do the page and the CLI fold the SAME fold?** | they build the batch through one function now - `af3BatchFromA3m` in src/af3/batch.js - and the four families agree on 6MRR with a 128-row search: af3 90.9/90.9, boltz2 96.1/96.1, protenix2 92.5/92.5, opendde 94.6/94.609. 🔴 Before it they did not, and the divergence hid a page-only bug for a day. See docs/AF3.md |
+| **Does OpenDDE fold WITH AN ALIGNMENT?** | `tools/gpu/fold-opendde.js --a3m=<path>` - new, and until it existed **every OpenDDE number in these docs was a single-sequence fold**, so the page's alignment path through that family had nothing to check against. `tools/gpu/fold.js` still cannot fold OpenDDE (it wants the structural-token expander and AF3's confidence head), which is why both tools exist |
 | **Does OpenDDE fold?** | `tools/gpu/fold-opendde.js --target=6mrr` (RMSD 1.68 A, TM 0.865) - and its bundle wants **`export_af3_model.py --include diffuser`**, because the default is trunk plus distogram head and this tool needs `structural_token_expander`. 🔴 **AND ITS DEFAULT IS 200 STEPS WHERE THE PAGE RUNS 16** - `OPENDDE_COUNTS` prefers 16 and docs/OPENDDE.md shows more steps are WORSE - so a timing taken with the default is 4 s of sampler a user never waits for: `--steps=16` is the page's path (a warm fold 4.09 s -> 1.26) |
 | Does its structural-token expansion conserve the atoms? | `tools/gpu/check-opendde-expander.js` |
 | Does its CONFIDENCE head still compute its PAE and PDE? | `tools/gpu/check-opendde-confidence.js` - the head's only gate, and a fold's geometry check cannot see a confidence number |
@@ -1103,6 +1105,32 @@ is complete and correct and the node process sits there with a headless Chrome
 still running, which in a `for` loop stalls every arm behind it. `pkill -9 -f
 "gpu-chrome-"` matches the temporary profile directory and nothing else - not
 the browser you are using. A batch of checkers should carry one between arms.
+
+🔴 **AND THE PAGE AND THE CLI BUILT THE BATCH BY HAND, EACH DROPPING SOMETHING
+THE OTHER PASSED.** `web/af3-model.js` and `tools/gpu/fold.js` both called
+`af3MsaFromA3m` and then `featuriseProtein`, and the CLI passed no
+`profileMsa` (profiling the 127 CROPPED rows where the page profiles all 8076 -
+a different feature, and it feeds `target_feat` too) and no seeded row choice
+(taking the alignment's prefix where the page takes a seeded subset). So every
+`--a3m` gate here was measuring a fold the site does not run, and the one bug
+only the page had could not be reproduced by the tool written to reproduce the
+page. **Both call `af3BatchFromA3m` in src/af3/batch.js now.** `--prefix-rows`
+is the control arm for a baseline recorded before this.
+
+🔴 **AND THE PAGE RAN 48 OF BOLTZ2'S 64 TRUNK BLOCKS FOR A DAY, WHICH READS AS
+"THE MSA IS NOT REACHING THE MODEL".** `trunkWeights(store, 48, 4)` with both
+depths typed in is right for four of the five AF3-lineage families; boltz2's
+trunk pairformer is **64**. A stack is one stacked tensor, so asking for 48 of
+64 loads the first 48 slices, runs them, and returns a trunk that never
+finished - no error, no wrong shape, a plausible structure. Page pLDDT **72.1
+with no MSA, 72.4 with 128 rows, 96.1 after the fix**, which is the CLI's number
+on the identical batch. `trunkWeights` RAISES on a disagreeing count now
+(`{ allowPrefix: true }` for a bench that means it) and
+`test/trunk-depth-from-bundle.test.js` gates that no fold path passes a literal.
+See docs/AF3.md. **A constant that is right for the model you developed against
+is a silent wrong answer for the next one** - the dialect system takes a second
+checkpoint's CONVENTIONS off its weights, and its DEPTHS were still coming off
+AlphaFold 3's.
 
 🔴 **AND A BUNDLE THE CLI LIKES CAN BE ONE THE PAGE CANNOT LOAD.** The command
 tools read the `manifest.json` sitting next to the shards; the PAGE reads the

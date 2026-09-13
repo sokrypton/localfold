@@ -94,11 +94,15 @@ export async function main(device, args) {
   const rowSweep = numbers(option(args, "msa", "1,128,512"));
   const rowsForTokenSweep = Number(option(args, "rows", "32"));
   const tokensForRowSweep = Number(option(args, "row-tokens", "128"));
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
 
   const store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
   const weights = {
-    trunk: await trunkWeights(store, blocks, 4),
+    trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
     targetFeat: await targetFeatureWeights(store),
     diffusion: await diffusionWeights(store),
     reference: await atomReference(store),
@@ -250,7 +254,7 @@ export async function main(device, args) {
 
   return {
     machine: "whatever ran this; the SHAPE is what transfers, not the milliseconds",
-    rowsForTokenSweep, tokensForRowSweep, blocks,
+    rowsForTokenSweep, tokensForRowSweep, blocks: blocks ?? "the bundle's",
     trunkByTokens, trunkByRows, denoiser, af2ByTokens, af2ByRows,
   };
 }

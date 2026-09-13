@@ -91,7 +91,7 @@ export async function main(device, args) {
   };
 
   const af3Store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
-  const af3Weights = await trunkWeights(af3Store, 48, 4);
+  const af3Weights = await trunkWeights(af3Store);
   const batch = featuriseProtein("A".repeat(LENGTH));
   const targetFeat = await buildTargetFeat(batch, await targetFeatureWeights(af3Store), device);
   const af3Input = {

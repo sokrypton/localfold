@@ -155,6 +155,86 @@ way the confidence head's tight envelopes do - but pLDDT and PAE are per residue
 and per pair on the page, and those differ at 1e-3 while their mean does not.
 
 
+## 🔴 THE PAGE RAN 48 OF BOLTZ2'S 64 TRUNK BLOCKS, AND IT LOOKED LIKE A DEAD MSA
+
+Reported as "boltz2 is not using the MSA - results similar to single sequence
+input". It was not the MSA. `web/af3-model.js` loaded the trunk as
+
+```js
+const trunk = await trunkWeights(store, 48, 4);
+```
+
+with both depths typed in. That is right for four of the five AF3-lineage
+families and wrong for boltz2, whose trunk pairformer is **64 blocks**. A stack
+is ONE stacked tensor, so asking for 48 of 64 reads the first 48 slices, runs
+them, and returns a trunk that never finished. Nothing raises, nothing is the
+wrong shape, and the structure that comes out is a plausible one.
+
+On 6MRR's 59 residues with a 128-row search, through the page:
+
+| | pLDDT |
+|---|---:|
+| boltz2, page, no MSA | 72.1 |
+| boltz2, page, 128-row MSA | **72.4** |
+| boltz2, CLI, same batch | **96.1** |
+| boltz2, page, after the fix | **96.1** |
+
+An alignment that moves the answer by 0.3 reads exactly like an alignment that
+is not reaching the model. What it actually meant was that sixteen blocks of
+trunk were missing, and the MSA's contribution - which enters at the FRONT of
+the trunk and is refined all the way through it - is what a truncated stack
+loses first.
+
+🔴 **AND THE TOOL WRITTEN TO REPRODUCE THE PAGE COULD NOT REPRODUCE IT**, for
+two reasons that had nothing to do with the bug and everything to do with why it
+survived. `tools/gpu/fold.js` and `web/af3-model.js` each built the batch by
+hand, and each dropped something the other passed:
+
+- the CLI never passed `profileMsa`/`profileDeletionMatrix`, so it profiled the
+  **127 cropped rows** where the page profiles all **8076**. That is a different
+  feature, not a different sample of one, and it feeds `target_feat` as well as
+  the profile - `profile#` and `tf#` both differ in the batch.
+- the CLI never seeded the row subsample, so it took the alignment's **prefix**
+  where the page takes a **seeded random subset** of the whole file.
+
+So every `--a3m` gate in this repository was measuring a fold the site does not
+run. Both call `af3BatchFromA3m` in src/af3/batch.js now, and with the two
+batches made identical field by field the CLI reproduced 72.4 - which is how the
+weights became the only thing left.
+
+**The fix is three parts, and only the first one is the bug:**
+
+1. `web/af3-model.js` passes no counts; `trunkWeights(store)` reads them.
+2. `trunkWeights` RAISES on a count that disagrees with the bundle rather than
+   silently handing back a prefix. A bench that means to walk a short stack
+   passes `{ allowPrefix: true }` and says so at the call site.
+3. `test/trunk-depth-from-bundle.test.js` gates both halves: boltz2 is still 64
+   in the pinned manifest, the families do not all agree on one depth (a rule
+   that stops discriminating passes by finding nothing), and no fold path
+   anywhere under `src/`, `web/` or `tools/gpu/` passes a literal count. Verified
+   to fail with the old line put back.
+
+**Parity after it, page against CLI on one sequence and one alignment:**
+
+| family | page | CLI |
+|---|---:|---:|
+| alphafold3 | 90.9 | 90.9 |
+| boltz2 | 96.1 | 96.1 |
+| protenix2 | 92.5 | 92.5 |
+| opendde | 94.6 | 94.609 |
+
+🔴 **AND OPENDDE HAD NO CLI FOLD THAT TOOK AN MSA AT ALL** until this - every
+OpenDDE number in these docs is a single-sequence fold, so the page's alignment
+path through that family had nothing to be checked against. `fold-opendde.js
+--a3m=` closes it, through the same builder. `tools/gpu/fold.js` still cannot
+fold OpenDDE (it wants the structural-token expander and AF3's confidence head),
+which is why the two tools both exist.
+
+**The lesson is the one this file keeps relearning in a new place: a constant
+that is right for the model you developed against is a silent wrong answer for
+the next one.** The dialect system exists so a second checkpoint's CONVENTIONS
+come off its weights; its DEPTHS were still coming off AlphaFold 3's.
+
 ## What works
 
 A protein chain typed into `index.html` folds with AlphaFold 3 entirely in the

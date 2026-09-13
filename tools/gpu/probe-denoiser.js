@@ -83,7 +83,7 @@ export async function main(device, args) {
   const { tokens, dense } = batch;
   const store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
   const weights = {
-    trunk: await trunkWeights(store, 48, 4),
+    trunk: await trunkWeights(store),
     diffusion: await diffusionWeights(store),
     atomReference: await atomReference(store),
     targetFeat: await targetFeatureWeights(store),

@@ -76,7 +76,7 @@ export async function main(device, args) {
 
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = {
-    trunk: await trunkWeights(store, 48, 4), diffusion: await diffusionWeights(store),
+    trunk: await trunkWeights(store), diffusion: await diffusionWeights(store),
     confidence: await confidenceWeights(store), atomReference: await atomReference(store),
     targetFeat: await targetFeatureWeights(store),
   };

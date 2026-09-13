@@ -31,7 +31,11 @@ const MiB = 1048576;
 export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "384"));
   const rows = Number(option(args, "msa", "128"));
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
 
   // What the PAGE would use on this machine, which is the number that matters.
   const reported = typeof navigator.deviceMemory === "number" ? navigator.deviceMemory : null;
@@ -39,7 +43,7 @@ export async function main(device, args) {
 
   const store = await openAf3Store(option(args, "model", "/model-af3-int5/manifest.json"));
   const weights = {
-    trunk: await trunkWeights(store, blocks, 4),
+    trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
     targetFeat: await targetFeatureWeights(store),
   };
   const sequence = Array.from({ length: tokens },
@@ -104,7 +108,7 @@ export async function main(device, args) {
   setMemoryBudget(device, undefined);
 
   return {
-    tokens, msaRows: rows, blocks,
+    tokens, msaRows: rows, blocks: weights.trunk.pairformerBlocks.length,
     navigatorDeviceMemoryGiB: reported,
     pageBudgetMiB: Number((pageBudget / MiB).toFixed(0)),
     results,

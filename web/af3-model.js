@@ -14,13 +14,12 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { featuriseProtein } from "../src/af3/featurise.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
-import { af3MsaFromA3m } from "../src/af3/msa-features.js";
-import { foldBatch, toPdb, atomName, uniformFrom, warmTrunkPipelines }
+import { af3BatchFromA3m } from "../src/af3/batch.js";
+import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../src/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
-  structuralRefinerWeights, trunkWeights } from "../src/af3/weights.js";
+  structuralRefinerWeights, trunkDepths, trunkWeights } from "../src/af3/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../src/af3/diffusion-weights.js";
 import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
@@ -241,7 +240,17 @@ export function loadAf3Weights(onProgress, family = "af3") {
       // ...and anything waiting to warm against it can start now, with the
       // shards still arriving. See warmAf3Pipelines.
       storeGate(family).resolve(store);
-      const trunk = await trunkWeights(store, 48, 4);
+      // 🔴 THE DEPTHS COME FROM THE BUNDLE, NOT FROM AlphaFold 3'S. This read
+      // `trunkWeights(store, 48, 4)` with both counts typed in, which is right
+      // for four of the five families and WRONG for boltz2, whose trunk
+      // pairformer is 64 blocks. Truncating a 64-block trunk to 48 does not
+      // fail: the stack is one stacked tensor, so the first 48 slices load and
+      // run, and what comes out is a trunk that never finished. It cost boltz2
+      // its whole alignment - pLDDT 72.4 with a 128-row MSA against 72.1 with
+      // none, where the same batch through the CLI (which reads the depths)
+      // gives 96.1. A hardcoded depth is a silent wrong answer, never an error.
+      const depths = trunkDepths(store);
+      const trunk = await trunkWeights(store);
       phase("trunk");
       // 🔴 OpenDDE HAS TWO STACKS THE OTHER TWO DO NOT, AND LACKS ONE THEY
       // HAVE. It re-tokenises between the trunk and the diffusion, so it needs
@@ -413,16 +422,6 @@ export async function foldAf3(options) {
   // shape: the MSA stack's pipelines are keyed on the row count, so a fold that
   // discovers its depth later would compile a second set of them.
   const alignment = options.alignment ?? null;
-  const rows = alignment === null
-    ? { msa: [], deletionMatrix: [], depth: 1, unpairedFrom: 0 }
-    : af3MsaFromA3m(alignment, {
-      maxSequences: options.maxMsaSequences,
-      // 🔴 SEEDED FROM THE FOLD'S OWN SEED, so a subsample is part of what a
-      // seed names. AF3 draws its shuffle from the same key that drives the
-      // rest of the model; here two seeds are two alignments as well as two
-      // starting draws, and one seed is reproducible.
-      random: uniformFrom(options.seed ?? 0),
-    });
   // 🔴 THE LIGAND DICTIONARY IS FETCHED, NOT BUNDLED. AF3's own featuriser
   // reads a 515 MB CCD pickle; a fold touches only the components its ligands
   // name, and the PDB serves each as one small mmCIF. The 21 polymer components
@@ -465,7 +464,9 @@ export async function foldAf3(options) {
     ligands.push(componentCache.get(code));
   }
 
-  const batch = featuriseProtein(sequence, {
+  const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
+    maxSequences: options.maxMsaSequences,
+    seed: options.seed ?? 0,
     ligands,
     modifications,
     // 🔴 THE BOND MATRIX IS PART OF THE MODEL, NOT OF THE MOLECULE. AF3 sets
@@ -477,14 +478,6 @@ export async function foldAf3(options) {
     // What each chain's letters mean. Absent, every chain is protein, which is
     // what every caller before nucleic acids meant.
     chainKinds: options.chainKinds,
-    msa: rows.msa,
-    deletionMatrix: rows.deletionMatrix,
-    unpairedFrom: rows.unpairedFrom,
-    // The profile's rows, which are not the MSA's: AF3 computes the profile
-    // before deduplicating the unpaired block against the paired one and before
-    // cropping either. See af3MsaFromA3m.
-    profileMsa: rows.profileMsa,
-    profileDeletionMatrix: rows.profileDeletionMatrix,
   });
   // 🔴 ONLY THE PASSES THAT WILL ACTUALLY RUN, or the bar spends a share of
   // itself waiting for work that never happens and then jumps. A reused trunk

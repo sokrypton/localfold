@@ -94,12 +94,16 @@ export async function main(device, args = []) {
   const recycles = Number(option(args, "recycles", "0"));
   const seed = Number(option(args, "seed", "20260831"));
   const model = option(args, "model", "/model-af3-int5/manifest.json");
-  const blocks = Number(option(args, "blocks", "48"));
+  // 🔴 THE BUNDLE'S OWN DEPTH, NOT AlphaFold 3'S. Defaulting to 48 measures a
+  // 48-block PREFIX of boltz2's 64-block trunk - a timing for a stack no fold
+  // runs - and says nothing about it. `--blocks=N` is still the short arm.
+  const blocksArg = option(args, "blocks", "");
+  const blocks = blocksArg === "" ? undefined : Number(blocksArg);
 
   const batch = featuriseProtein(sequence, {});
   const store = await openAf3Store(model, null);
   const weights = {
-    trunk: await trunkWeights(store, blocks, 4),
+    trunk: await trunkWeights(store, blocks, undefined, { allowPrefix: true }),
     diffusion: await diffusionWeights(store),
     confidence: await confidenceWeights(store),
     atomReference: await atomReference(store),

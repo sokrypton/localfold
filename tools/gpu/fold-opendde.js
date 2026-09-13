@@ -10,7 +10,7 @@
  * cloud at the wrong scale, and RMSD alone would not say which. The sequence
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { af3BatchFromA3m } from "../../src/af3/batch.js";
 import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
   from "../../src/af3/fold.js";
 import { structuralLayout } from "../../src/af3/structural-tokens.js";
@@ -147,7 +147,25 @@ export async function main(device, args) {
   const recycles = Number(option(args, "recycles", "0"));
   const manifest = option(args, "model", "/model-opendde-int5/manifest.json");
 
-  const batch = featuriseProtein(sequence, {});
+  // 🔴 AN MSA, WHICH THE PAGE GIVES OPENDDE AND THIS TOOL COULD NOT. Every
+  // OpenDDE number in these docs is a SINGLE-SEQUENCE fold, so the page's
+  // alignment path through this family had no CLI to be checked against - and
+  // that is exactly the gap boltz2's truncated trunk lived in for a day.
+  // `--a3m=` takes one path per chain, and the batch is built by the same
+  // function web/af3-model.js builds it with.
+  const a3mSpec = option(args, "a3m", "");
+  const alignment = a3mSpec === "" ? null : {
+    unpaired: (await Promise.all(a3mSpec.split(",").map(async (path) => {
+      const response = await fetch(path.trim());
+      if (!response.ok) throw new Error(`failed to load ${path}: ${response.status}`);
+      return response.text();
+    }))).join("\n"),
+  };
+  const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
+    maxSequences: Number(option(args, "max-msa", "512")),
+    seed: Number(option(args, "seed", "20260831")),
+  });
+  if (rows.depth > 1) console.log(`MSA ${rows.depth} rows`);
   const openedAt = performance.now();
   const store = await openAf3Store(manifest);
   // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
@@ -178,7 +196,9 @@ export async function main(device, args) {
     }),
   ]).catch(() => {});
   const storeMs = Math.round(performance.now() - openedAt);
-  const trunk = await trunkWeights(store, Number(option(args, "blocks", "48")), 4);
+  const blocksArg = option(args, "blocks", "");
+  const trunk = await trunkWeights(store,
+    blocksArg === "" ? undefined : Number(blocksArg), undefined, { allowPrefix: true });
   const trunkMs = Math.round(performance.now() - openedAt) - storeMs;
   const weights = {
     trunk,

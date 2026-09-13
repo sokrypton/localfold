@@ -129,7 +129,7 @@ export async function main(device, args) {
   // --model= so a second bundle's conventions can be checked, not AF3's
   // asserted over them; the dialect follows the bundle either way.
   const store = await openAf3Store(option(args, "model", undefined));
-  const weights = await trunkWeights(store, blocks, 4);
+  const weights = await trunkWeights(store, blocks, undefined, { allowPrefix: true });
   const DIALECT = dialectFor(store);
   const input = buildInput(tokens, sequences, 3, weights.embedder);
 
