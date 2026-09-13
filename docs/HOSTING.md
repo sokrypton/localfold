@@ -206,3 +206,46 @@ product decision rather than a free win. The search is implemented in
 `tools/analyse_quantisation.py` and NOT in the exporter, which is fine for int5
 - the same file measures the search at 3-4% of the error - and is what int4
 would need first.
+
+## The quantised shard geometry, as it stands
+
+| bundle | shards | total | a shard |
+|---|---:|---:|---:|
+| af3-int5 | 8 | 264.6 MiB | 33.1 |
+| **boltz2-int5** | 8 | 364.4 | 45.5 |
+| **protenix2-int5** | 8 | 333.9 | 41.7 |
+| opendde-int5 | 12 | 472.5 | 39.4 |
+| ef2-fast-600m (esmfold2-int5) | 8 | 122.5 | 15.3 |
+| esmc-600m-int3 | 16 | 223.6 | 14.0 |
+| af2-multimer | 8 | 97.4 | 12.2 |
+
+Eight is the shape of the shipped set; OpenDDE's twelve and ESM-C's sixteen are
+the two exceptions and both are the bigger bundle held at ~40 and ~14 MiB a
+shard respectively.
+
+🔴 **boltz2 AND protenix2 HAD NO QUANTISED BUNDLE AT ALL.** Nine families are
+published and neither is among them: both existed only as a local float32
+export of 1.9 and 1.8 GiB, which is not a thing a browser can be handed. They
+are int5 group 32 now, 5.31x, and they fold:
+
+| | pLDDT | RMSD to 6MRR | TM | against the f32 bundle |
+|---|---:|---:|---:|---|
+| boltz2 int5 | 96.37 | **0.542 A** | 0.972 | 0.537 A, so quantisation costs 0.005 |
+| protenix2 int5 | 84.76 | 1.723 | 0.917 | 1.564 A, so it costs 0.16 |
+
+Group 32, not 128: docs/EF2FAST.md records OpenDDE at group 128 folding 6MRR
+into a 3283 A explosion at pLDDT 46.69, and 128 is ESM-C's alone.
+
+🔴 **NEITHER IS IN THE REGISTRY AND NEITHER IS PUBLISHED.**
+`src/reference/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
+cannot load either however good the bundle is - and a bundle the CLI likes can
+still be one the page cannot, because the page reads the manifest baked into the
+module and pinned to a commit. Publishing them is a `tools/build_site.py` and a
+Hugging Face upload away; the bundles exist and are gated.
+
+🔴 **AND THREE PUBLISHED BUNDLES ARE NOW STALE.** `opendde-int5` and
+`opendde-full-f32` were re-exported here (the 833-channel single conditioning
+and eight zeroed encoder tensors), and `boltz2-f32`'s four negated
+`embed_pair_offsets` were corrected in place. The loader REFUSES the old OpenDDE
+rather than folding at the wrong width, so the published one is not merely
+worse, it no longer loads. See docs/AF3.md.
