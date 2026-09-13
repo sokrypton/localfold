@@ -46,6 +46,10 @@ const DGRAM_MIN = 3.25;
 const DGRAM_MAX = 50.75;
 
 const EMBED_ORDER = ["leftTargetFeatProject", "rightTargetFeatProject", "distogramFeatProject"];
+// 🔴 protenix2 ADDS A SECOND, UNBINNED DISTANCE TERM and normalises the trunk
+// single before any use. Both are chosen by the tensors being there.
+const embedOrderFor = (weights) => (weights.distanceFeatProject === undefined
+  ? EMBED_ORDER : [...EMBED_ORDER, "distanceFeatProject"]);
 // 🔴 boltz2 REBUILDS z RATHER THAN ADDING TO IT, from nine terms under its own
 // scope. See `boltz2Reembed` in confidence-reference.js, which this mirrors.
 const REEMBED_ORDER = [
@@ -104,6 +108,41 @@ function errorBinCentres() {
   for (let bin = 0; bin < NUM_BINS - 1; bin += 1) centres[bin] = bin * step + step / 2;
   centres[NUM_BINS - 1] = centres[NUM_BINS - 2] + step;
   return centres;
+}
+
+/**
+ * protenix2's trunk single, clamped and LayerNormed before ANY use.
+ *
+ * 🔴 ON THE HOST, DELIBERATELY. It is tokens x 384 - 26k values at 68 tokens,
+ * 115k at 300 - and it is the only thing between the trunk and the confidence
+ * pairformer, which is a 4-block stack. A dispatch for it would cost a pass and
+ * a readback to save a loop that does not appear in any profile. Every other
+ * model gets the trunk's single unchanged, which is what `undefined` means.
+ */
+function normalisedTrunkSingle(input, weights, tokens) {
+  const single = asFloats(input.single);
+  if (weights.inputSingleNormScale === undefined) return single;
+  const channels = weights.singleChannels;
+  const output = new Float32Array(single.length);
+  for (let token = 0; token < tokens; token += 1) {
+    const base = token * channels;
+    let total = 0;
+    for (let c = 0; c < channels; c += 1) {
+      total += Math.min(512, Math.max(-512, single[base + c]));
+    }
+    const mean = total / channels;
+    let variance = 0;
+    for (let c = 0; c < channels; c += 1) {
+      const d = Math.min(512, Math.max(-512, single[base + c])) - mean;
+      variance += d * d;
+    }
+    const inverse = 1 / Math.sqrt(variance / channels + 1e-5);
+    for (let c = 0; c < channels; c += 1) {
+      output[base + c] = (Math.min(512, Math.max(-512, single[base + c])) - mean) * inverse
+        * weights.inputSingleNormScale[c] + weights.inputSingleNormOffset[c];
+    }
+  }
+  return output;
 }
 
 export function createConfidenceShaders(shape, embedOffsets, headOffsets, epsilon, variance,
@@ -195,6 +234,8 @@ const LOWER = array<f32, ${DGRAM_BINS}>(${lower.join(", ")});
 const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
 const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 const W_DGRAM: u32 = ${embedOffsets.distogramFeatProject}u;
+${embedOffsets.distanceFeatProject === undefined ? ""
+  : `const W_DISTANCE: u32 = ${embedOffsets.distanceFeatProject}u;`}
 
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> pseudo_beta: array<f32>;
@@ -234,6 +275,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (bin >= 0) {
       value += keep * weights[W_DGRAM + u32(bin) * C_Z + c];
     }
+${embedOffsets.distanceFeatProject === undefined ? ""
+  : `    // protenix2's second, UNBINNED distance term - and it is not masked,
+    // exactly as the binned one above is.
+    value += sqrt(squared + 1.0e-10) * weights[W_DISTANCE + c];`}
     pair[row * C_Z + c] = value;
   }
 }`;
@@ -877,7 +922,7 @@ export class Af3ConfidenceHeadGpu {
     const reembedding = weights.reembed !== undefined;
     const embedPacked = reembedding
       ? pack(weights.reembed, REEMBED_ORDER, "confidence re-embed")
-      : pack(weights, EMBED_ORDER, "confidence embed");
+      : pack(weights, embedOrderFor(weights), "confidence embed");
     const headPacked = pack(weights, headOrderFor(weights), "confidence head");
     const shape = { tokens, pairChannels, singleChannels, targetFeatWidth, dense,
                     preSymmetrisedPde: dialect?.preSymmetrisedPde === true };
@@ -1022,7 +1067,8 @@ export class Af3ConfidenceHeadGpu {
 
     // The four confidence pairformer blocks: the same stack the trunk runs.
     const stack = await new Af3PairformerStackGpu(this.device, this.options).run(
-      { pair: embeddedPair, single: embeddedSingle ?? asFloats(input.single),
+      { pair: embeddedPair,
+        single: embeddedSingle ?? normalisedTrunkSingle(input, weights, tokens),
         pairMask, seqMask, tokens }, weights.blocks, dialect, options);
 
     return { ...(await this.#heads(stack, pairMask, input, weights, headPacked, compiled)),

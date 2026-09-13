@@ -692,8 +692,14 @@ export async function confidenceWeights(store) {
   const [singleChannels] = dims(store, reembedScope
     ? `${CONFIDENCE}/~_boltz2_reembed/s_norm/scale`
     : `${CONFIDENCE}/plddt_logits_ln/scale`);
+  // 🔴 boltz2's CONFIDENCE PAIRFORMER IS 8 BLOCKS AND EVERY OTHER MODEL'S IS 4,
+  // and this was a 4 typed into the loop - the same hardcode that ran three
+  // quarters of its TRUNK. Its head then ran half its stack while every term of
+  // its re-embedding was exact, which is the shape of error a per-term
+  // comparison cannot see: the inputs agree and the depth does not.
+  const [stackBlocks] = dims(store, `${CONFIDENCE_STACK}/single_attention_q_projection/bias`);
   const blocks = [];
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < stackBlocks; index += 1) {
     const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
     blocks.push(await bind(store, {
       pairChannels: stackPairChannels, singleChannels: stackSingleChannels,
@@ -758,7 +764,23 @@ export async function confidenceWeights(store) {
       leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
       rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
       distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
+      // 🔴 protenix2 ADDS A SECOND DISTANCE TERM, unbinned: a bias-free Linear
+      // on the RAW distance, carrying the sub-bin resolution the one-hot throws
+      // away. Its binning is otherwise AF3's exactly, so nothing about the
+      // shapes says it is there.
+      ...(has("~_embed_features/distance_feat_project/weights") ? {
+        distanceFeatProject: await T("~_embed_features/distance_feat_project/weights"),
+      } : {}),
     }),
+    // 🔴 protenix2 LayerNormS THE TRUNK SINGLE BEFORE ANY USE, clamped to
+    // +/-512 first - the confidence pairformer and every head see the
+    // normalised one where AF3 uses it raw. Ours entered the head at std 211,
+    // which is the same class of gate-invisible divergence as a missing global
+    // norm: every output plausible, none of them right.
+    ...(has("input_single_norm/scale") ? {
+      inputSingleNormScale: await T("input_single_norm/scale"),
+      inputSingleNormOffset: await T("input_single_norm/offset"),
+    } : {}),
     // 🔴 THE HEAD LayerNormS ARE ABSENT, NOT IDENTITY. A LayerNorm with scale 1
     // and offset 0 still re-centres and rescales, so a bundle without them is a
     // head that does not normalise - which cannot be expressed as a weight and

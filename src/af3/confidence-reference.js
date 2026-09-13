@@ -139,7 +139,8 @@ function expectation(logits, rows, bins, centres) {
  * input, not an approximation of it; the coverage limit is that this featuriser
  * has no restraint field to carry.
  */
-function boltz2Reembed(input, weights, tokens, pairChannels, singleChannels, pairMask) {
+function boltz2Reembed(input, weights, tokens, pairChannels, singleChannels, pairMask,
+                       onStage) {
   const w = weights.reembed;
   const pairs = tokens * tokens;
   const sInputs = layerNorm(input.targetFeat, tokens, weights.targetFeatWidth,
@@ -148,6 +149,9 @@ function boltz2Reembed(input, weights, tokens, pairChannels, singleChannels, pai
                            w.sNormScale, w.sNormOffset);
   const fromInputs = linear(sInputs, tokens, weights.targetFeatWidth, singleChannels,
                             w.sInputToS);
+  onStage?.("reembed.sInputsNorm", sInputs);
+  onStage?.("reembed.sNorm", Float32Array.from(single));
+  onStage?.("reembed.sInputToS", fromInputs);
   for (let index = 0; index < single.length; index += 1) single[index] += fromInputs[index];
 
   const pair = layerNorm(input.pair, pairs, pairChannels, w.zNormScale, w.zNormOffset);
@@ -165,7 +169,18 @@ function boltz2Reembed(input, weights, tokens, pairChannels, singleChannels, pai
   const dgram = boltz2DistogramFeatures(input.pseudoBeta, pairMask, tokens);
   const embedded = linear(dgram, pairs, BOLTZ2_DGRAM_BINS, pairChannels,
                           w.distogramFeatProject);
+  onStage?.("reembed.zNorm", Float32Array.from(pair));
+  onStage?.("reembed.relPos", positioned);
+  onStage?.("reembed.left", left);
+  onStage?.("reembed.right", right);
+  onStage?.("reembed.prod1", prodIn1);
+  onStage?.("reembed.prod2", prodIn2);
+  onStage?.("reembed.dgram", embedded);
   const product = new Float32Array(pairChannels);
+  const traceProdOut = onStage === undefined
+    ? null : new Float32Array(pairs * pairChannels);
+  const traceBondType = onStage === undefined
+    ? null : new Float32Array(pairs * pairChannels);
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) {
       const index = i * tokens + j;
@@ -183,13 +198,21 @@ function boltz2Reembed(input, weights, tokens, pairChannels, singleChannels, pai
           + w.tokenBondsTypeEmbed[bondRow + c]
           + w.contactEncodingUnspecified[c]
           + right[i * pairChannels + c] + left[j * pairChannels + c];
+        let prodOut = 0;
         for (let e = 0; e < pairChannels; e += 1) {
-          total += product[e] * w.sToZProdOut[e * pairChannels + c];
+          prodOut += product[e] * w.sToZProdOut[e * pairChannels + c];
         }
-        pair[base + c] += total;
+        if (traceProdOut !== null) {
+          traceProdOut[base + c] = prodOut;
+          traceBondType[base + c] = w.tokenBondsTypeEmbed[bondRow + c];
+        }
+        pair[base + c] += total + prodOut;
       }
     }
   }
+  onStage?.("reembed.prodOut", traceProdOut);
+  onStage?.("reembed.bondType", traceBondType);
+  onStage?.("reembed.pair", pair);
   return { pair, single };
 }
 
@@ -240,12 +263,13 @@ export function confidenceHead(input, weights, block, dialect) {
   let single;
   if (dialect?.reembedConfidencePair === true) {
     const rebuilt = boltz2Reembed(input, weights, tokens, pairChannels,
-                                  singleChannels, pairMask);
+                                  singleChannels, pairMask, input.onStage);
     pair = rebuilt.pair;
     single = rebuilt.single;
   } else {
     // ...the target features, once along each axis. See the note at the top about
     // which of "left" and "right" is which.
+    // (protenix2's second, unbinned distance term is added below.)
     const left = linear(input.targetFeat, tokens, weights.targetFeatWidth, pairChannels,
                         weights.leftTargetFeatProject);
     const right = linear(input.targetFeat, tokens, weights.targetFeatWidth, pairChannels,
@@ -258,13 +282,34 @@ export function confidenceHead(input, weights, block, dialect) {
     for (let i = 0; i < tokens; i += 1) {
       for (let j = 0; j < tokens; j += 1) {
         const base = (i * tokens + j) * pairChannels;
+        // 🔴 protenix2's SECOND distance term: a bias-free Linear on the RAW
+        // distance, alongside the binned one. Unbinned, so it carries the
+        // sub-bin resolution the one-hot throws away.
+        let distance = 0;
+        if (weights.distanceFeatProject !== undefined) {
+          let squared = 1e-10;
+          for (let axis = 0; axis < 3; axis += 1) {
+            const d = input.pseudoBeta[i * 3 + axis] - input.pseudoBeta[j * 3 + axis];
+            squared += d * d;
+          }
+          distance = Math.sqrt(squared);
+        }
         for (let c = 0; c < pairChannels; c += 1) {
           pair[base + c] += left[j * pairChannels + c] + right[i * pairChannels + c]
-            + embedded[base + c];
+            + embedded[base + c]
+            + (weights.distanceFeatProject === undefined
+              ? 0 : distance * weights.distanceFeatProject[c]);
         }
       }
     }
-    single = Float32Array.from(input.single);
+    // 🔴 AND THE TRUNK SINGLE IS NORMALISED BEFORE ANY USE, clamped first; see
+    // `inputSingleNormScale` in weights.js. Both the pairformer and every head
+    // read the normalised one.
+    single = weights.inputSingleNormScale === undefined
+      ? Float32Array.from(input.single)
+      : layerNorm(Float32Array.from(input.single, (v) => Math.min(512, Math.max(-512, v))),
+                  tokens, singleChannels,
+                  weights.inputSingleNormScale, weights.inputSingleNormOffset);
   }
   for (let index = 0; index < weights.blocks.length; index += 1) {
     const next = block({ pair, single, pairMask, seqMask, tokens },
