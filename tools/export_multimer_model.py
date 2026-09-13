@@ -112,9 +112,18 @@ def export(params_path: Path, monomer_dir: Path, out_dir: Path) -> int:
     params = dict(raw)
     params.update(convert_multimer_params(raw))
 
-    reference = json.loads((Path(__file__).resolve().parent.parent
-                            / "src" / "reference" / "manifest.js").read_text()
-                           .split("=", 1)[1].rsplit(";", 1)[0].strip())
+    # 🔴 THE MANIFESTS MOVED AND THIS TEXT-PARSE BROKE SILENTLY-ISH.
+    # `src/reference/manifest.js` is now a one-line RE-EXPORT shim - the tables
+    # live in `manifests/<family>.js`, one generated module each - so splitting
+    # it on "=" found the import statement and `rsplit(";")` threw
+    # `IndexError: list index out of range` from inside json.loads' argument,
+    # naming neither the file nor the reason. Read the generated module, and
+    # take the text after the FIRST "=" following its `MANIFEST` declaration so
+    # a leading comment block cannot be mistaken for the table.
+    source = (Path(__file__).resolve().parent.parent
+              / "src" / "reference" / "manifests" / "monomer.js").read_text()
+    marker = source.index("MANIFEST")
+    reference = json.loads(source[source.index("=", marker) + 1:].rsplit(";", 1)[0].strip())
 
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = ShardWriter(out_dir)
