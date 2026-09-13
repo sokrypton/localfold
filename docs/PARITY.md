@@ -7,6 +7,49 @@ inventory: what LocalFold's own differential suite covers, what it cannot
 currently execute, and what the reference now offers that this repository does
 not.
 
+## OUTPUT PARITY: OpenDDE ON 6MRR, AGAINST af3-any-model ON ITS OWN GPU
+
+Per-module checking says our kernels compute the reference's kernels. It says
+nothing about whether the two FOLD the same. This is the other question, and it
+needs no float32 bundle agreement at all - just the same target, the same model
+and the same sampler.
+
+    reference:  PYTHONPATH=src:. SEEDS=0,1,2 python dev/oracles/fold_check.py opendde
+    LocalFold:  fold-opendde.js --target=6mrr --steps=200 --seed=N \
+                  --model=/model-opendde-full-f32/manifest.json
+
+| | n | best | mean | low basin | high basin |
+|---|---:|---:|---:|---|---|
+| LocalFold f32 | 8 | 0.877 | 1.465 | 1/8 at **0.877** | 7/8 at **1.549** |
+| af3-any-model | 15 | 0.731 | 1.310 | 5/15 at **0.844** | 10/15 at **1.543** |
+
+🔴 **BOTH FIND THE SAME TWO BASINS, AT THE SAME PLACES.** The high basin agrees
+to 0.006 A (1.549 against 1.543) and the low one to 0.03 A. The difference in
+the MEANS is entirely how often each drew the low basin - 1 in 8 against 5 in 15
+- which is sampling, not the port.
+
+🔴 **AND READING best-of-N WOULD HAVE GOT THIS EXACTLY WRONG.** 0.877 against
+0.731 looks like a 20% deficit; the reference's own samples group strictly by
+SEED (seed 0 gives 0.844 mean, seeds 1 and 2 give 1.551 and 1.536), so its
+best-of-15 is one lucky basin draw reported five times. A single-seed comparison
+of this model is a coin flip with a 0.7 A spread.
+
+**Two confounders had to come off first, and both were measured rather than
+assumed:**
+
+| | mean CA-RMSD |
+|---|---:|
+| int5 weights, 16 steps | 1.462 |
+| float32 weights, 16 steps | 1.391 |
+| float32 weights, 200 steps | 1.564 |
+
+Quantisation is worth **0.07 A** - small, and worth knowing before blaming it.
+The step count is the bigger one and runs BACKWARDS: `_SAMPLER_CONSTANTS` in the
+reference's model_registry.py has no `opendde` entry, so it keeps AF3's default
+of 200, and matching it makes LocalFold WORSE - which is docs/OPENDDE.md's
+finding that more steps hurt this model, now confirmed at float32 and against
+the reference's own sampler. The page's 16 steps are both faster and better.
+
 ## 🔴 WHY THE SUITE COULD NOT BE DOWNLOADED: ITS DEFAULT REFERENCE IS UNPUBLISHABLE
 
 Both Hugging Face repositories are complete, and neither holds what the checkers
