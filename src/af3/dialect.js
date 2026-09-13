@@ -38,6 +38,7 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
   templateMeanOverAllSlots: false,
@@ -72,6 +73,7 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
   templateMeanOverAllSlots: false,
@@ -124,6 +126,7 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
   templateMeanOverAllSlots: false,
@@ -256,6 +259,13 @@ export const PROTENIX2 = Object.freeze({
   // right in its trunk and wrong in those two places.
   preSymmetrisedPde: true,
   templateMeanOverAllSlots: true,
+  // 🔴 AND THE TEMPLATE EMBEDDER IS A DIFFERENT MODULE, NOT DIFFERENT WIDTHS.
+  // protenix2 runs boltz2's fused form: `v = z_proj(z_norm(z)) + a_proj(a)`,
+  // two pairformer blocks, `v_norm`, aggregate over slots, `u_proj(relu(u))`.
+  // AF3's nine `template_pair_embedding_*` become one `a_proj` over a 108-wide
+  // concatenation. See docs/AF3.md for the feature order, which has a trap in
+  // it worth reading before implementing.
+  fusedTemplateEmbedder: true,
 });
 
 export const DIALECTS = Object.freeze({

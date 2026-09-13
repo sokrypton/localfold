@@ -2374,3 +2374,70 @@ were all at parity, and records that **no fold caught it**, because a symmetric
 plausibly-scaled error metric stays symmetric and plausible.
 `templateMeanOverAllSlots` divides the template term by every slot rather than
 the occupied ones. Both are in `PROTENIX2` and nothing reads them yet.
+
+### protenix2's template embedder is a different MODULE, and here is all of it
+
+`check-af3-trunk` and `check-af3-template` stop at
+`missing tensor .../single_template_embedding/query_embedding`, and the reason
+is not widths. protenix2 runs **boltz2's fused template module**, and the pieces
+correspond to AF3's one for one:
+
+| AF3 / OpenDDE | protenix2 | |
+|---|---|---|
+| `query_embedding_norm` + `template_pair_embedding_8` | `z_norm` + `z_proj` | renamed |
+| `output_layer_norm` + `output_linear` | `v_norm` + `u_proj` | renamed |
+| `template_pair_embedding_0..7`, nine projections summed | **`a_proj` [108, 64]**, one projection of the concatenation | **fused** |
+| `single_template_embedding/template_embedding_iteration` | `__layer_stack_no_per_layer/tmpl_pairformer` | renamed, one level up |
+
+A sum of projections of the parts IS one projection of their concatenation, so
+this is packing and naming, not a different model - which is what the
+reference's own note means by "its Protenix-specific bits are the CONVERTER's
+naming/feature conventions, not forward-graph shape".
+
+**The forward:**
+
+    v = z_proj(z_norm(z)) + a_proj(a_tij)
+    v = v + pairformer(v)   x2
+    v = v_norm(v)
+    aggregate over templates
+    u = u_proj(relu(u))
+
+**The 108-wide feature, in order** - `[disto(39), pb_ch(1), rt_j(32), rt_i(32),
+uvec(3), bb_ch(1)]`:
+
+- `disto` 39 bins, one-hot of CB-CB squared distance against
+  `linspace(3.25, 50.75, 39)**2` with the last upper edge at 1e8, masked by
+  `pb2d * asym_mask_2d`.
+- the frame is **Boltz's, not AF3's**: `e1 = norm(C - CA)`,
+  `e2 = norm((N - CA) - e1 ((N - CA).e1))`, `e3 = e1 x e2`, rot columns
+  `[e1, e2, e3]`; `uvec = R_i^T (ca_j - ca_i)`, normalised, masked by
+  `fr2d * asym_mask_2d`. N/CA/C come from rigid-group 0, whose atom order is
+  **[C, CA, N]** and not [N, CA, C].
+- restypes are **32**-class, not AF3's 31, through
+  `_AF3_TO_OF3 = range(21) + (31,) + (21,22,23,24) + (26,27,28,29) + (25,)`.
+
+🔴 **AND `rt_j` COMES BEFORE `rt_i`, WHICH IS NOT A TYPO.** protenix appends
+`expand_at_dim(aatype, -3)` then `expand_at_dim(aatype, -2)`, and the first
+inserts the new axis first, leaving the tensor varying along **j**. `a_proj` is
+converted with no column permutation, so the order has to be native's exactly.
+The reference records having these the other way round as worth **corr 0.9985
+against 0.999998**, unnoticed until `template_parity.py` existed.
+
+🔴 **AND THE DISTOGRAM IS MASKED BY THE MULTICHAIN MASK IN THE FORWARD, NOT
+ONLY BY pb2d IN THE FEATURISER.** Missing that half is invisible on a monomer
+and actively harmful on a complex: a distogram one-hot is nonzero for EVERY
+pair, so unmasked cross-chain entries are not zeros but confident FABRICATED
+inter-chain distances. Measured there: a template made a 146+74 heterodimer
+WORSE, interface 31.76 -> 46.76 A, while the same template rescues four other
+ports to 1-2 A.
+
+🔴 **WHAT IS DONE HERE, AND WHY THE FORWARD IS NOT.** `templateWeights` takes
+the dialect and loads either shape, guarded against the bundle
+(`fusedTemplateEmbedder` against `a_proj`'s presence), so protenix2's template
+weights load. The forward is deliberately NOT written yet: LocalFold's
+`check-af3-template` compares a GPU path against this repository's own CPU
+reference, so writing both halves from this specification would produce two
+pieces of new code agreeing with each other and a checker that cannot fail.
+That is the trap CLAUDE.md names - "verify against the oracle, not against our
+own reference" - and the ladder is the reference's `template_parity.py`, which
+is what found the `rt_j`/`rt_i` order above. Dump it first.

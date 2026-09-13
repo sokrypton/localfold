@@ -20,6 +20,15 @@ const CONFIDENCE = "diffuser/confidence_head";
 const CONFIDENCE_STACK = `${CONFIDENCE}/__layer_stack_no_per_layer/confidence_pairformer`;
 const TEMPLATE_STACK =
   `${TEMPLATE_SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
+// 🔴 THE FUSED TEMPLATE EMBEDDER LIVES UNDER DIFFERENT SCOPES ENTIRELY.
+// protenix2 and boltz2 run the same module, and the tensors sit one level up
+// with names of their own - `template_embedding/__layer_stack_no_per_layer/
+// tmpl_pairformer` rather than `.../single_template_embedding/...
+// template_embedding_iteration`. There is no `single_template_embedding` node
+// at all, which is why the AF3 loader's first read raised "missing tensor
+// .../single_template_embedding/query_embedding".
+const TEMPLATE_FUSED_STACK =
+  `${TEMPLATE}/__layer_stack_no_per_layer/tmpl_pairformer`;
 
 /**
  * Quantise-dequantise a tensor in place, so the model runs at a storage
@@ -441,8 +450,45 @@ export async function embedderWeights(store) {
   };
 }
 
-export async function templateWeights(store) {
+export async function templateWeights(store, dialect = undefined) {
   const T = (name) => store.tensor(name);
+  // 🔴 TWO TEMPLATE EMBEDDERS, AND THE DIALECT PICKS. AF3 and OpenDDE sum NINE
+  // separate feature projections (`template_pair_embedding_0..8`); protenix2
+  // and boltz2 concatenate the features and apply ONE (`a_proj`), with the
+  // query and output paths renamed to `z_norm`/`z_proj` and `v_norm`/`u_proj`.
+  // A sum of projections of the parts IS one projection of the concatenation,
+  // so this is a packing and a naming difference rather than a different model
+  // - but nothing about the names says so, and the AF3 loader simply cannot
+  // find its tensors. See docs/AF3.md for the forward and the feature order.
+  const fused = dialect?.fusedTemplateEmbedder;
+  if (fused === undefined) {
+    throw new Error("dialect.fusedTemplateEmbedder has no default: AF3 sums "
+      + "nine template feature projections and protenix2 applies one to their "
+      + "concatenation, under different tensor names");
+  }
+  const hasFused = store.manifest?.tensors?.[`${TEMPLATE}/a_proj/weights`] !== undefined;
+  if (hasFused !== fused) {
+    throw new Error(`this bundle ${hasFused ? "carries" : "does not carry"} `
+      + "template a_proj and its dialect says otherwise");
+  }
+  if (fused) {
+    const [queryChannels] = dims(store, `${TEMPLATE}/z_norm/scale`);
+    const [featureWidth] = dims(store, `${TEMPLATE}/a_proj/weights`);
+    return {
+      fused: true, queryChannels, featureWidth,
+      blocks: [await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 0)),
+               await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 1))],
+      // v = z_proj(z_norm(z)) + a_proj(a_tij)
+      queryEmbeddingNormScale: await T(`${TEMPLATE}/z_norm/scale`),
+      queryEmbeddingNormOffset: await T(`${TEMPLATE}/z_norm/offset`),
+      zProjection: await T(`${TEMPLATE}/z_proj/weights`),
+      aProjection: await T(`${TEMPLATE}/a_proj/weights`),
+      // ...then v_norm after the stack, and u_proj(relu(u)) out.
+      outputLayerNormScale: await T(`${TEMPLATE}/v_norm/scale`),
+      outputLayerNormOffset: await T(`${TEMPLATE}/v_norm/offset`),
+      outputLinear: await T(`${TEMPLATE}/u_proj/weights`),
+    };
+  }
   // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS NARROWER THAN THE TRUNK'S, and
   // by a different factor in every checkpoint: AF3's is 4 heads of 16 against
   // the trunk's 4 of 32, and OpenDDE's is 2 of 32 against the trunk's 12 of 32.
@@ -457,7 +503,7 @@ export async function templateWeights(store) {
   // the one tensor that states the input width on its own.
   const [queryChannels] = dims(store, `${TEMPLATE_SINGLE}/query_embedding_norm/scale`);
   return {
-    queryChannels, blocks,
+    fused: false, queryChannels, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
@@ -806,7 +852,7 @@ export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) 
   return {
     dialect,
     embedder: { ...await embedderWeights(store), dialect },
-    template: await templateWeights(store),
+    template: await templateWeights(store, dialect),
     msaBlocks: msa,
     pairformerBlocks: pairformer,
     distogram: await distogramWeights(store, dialect),
