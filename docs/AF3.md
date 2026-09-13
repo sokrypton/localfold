@@ -2441,3 +2441,36 @@ pieces of new code agreeing with each other and a checker that cannot fail.
 That is the trap CLAUDE.md names - "verify against the oracle, not against our
 own reference" - and the ladder is the reference's `template_parity.py`, which
 is what found the `rt_j`/`rt_i` order above. Dump it first.
+
+### ...and the forward, written against the oracle, at 1.52e-7
+
+`tools/oracle/dump_af3_template.py` records af3-any-model's own
+`template_parity.ours` - that gate's entry point, real protenix2 weights, 34
+scopes mapped and 0 unmapped - as
+`oracle-dumps/af3-oracle-template-protenix2.json`: 76 tokens, the 108 feature
+columns and the module's output separately. `fusedTemplateEmbedding` in
+src/af3/template-reference.js is held to it by
+`tools/gpu/check-af3-template-fused.js` at **relRMS 1.52e-7**, ours rms 12.4434
+against native's 12.4434.
+
+🔴 **AND THE ORACLE EARNED ITS KEEP ON THE FIRST RUN.** The specification above
+says protenix concatenates the "j-varying block FIRST", and the reference
+records the other order as worth corr 0.9985 against 0.999998. Read literally
+that gives `restype_j` then `restype_i`, and that scores **5.77e-2** - which IS
+corr 0.9985. The right order against `our_features`' output is `restype_i` then
+`restype_j`, for 1.52e-7.
+
+Both statements are true. The reference is describing NATIVE's tensor naming,
+where a name says which index the tensor varies along; the feature dict has
+already resolved it. **A specification read off someone else's source cannot
+settle which convention its words are in** - and the failure landed on the exact
+number that source had written down for this mistake, which is what a correct
+oracle looks like when you are wrong.
+
+Had the forward been written from the specification and checked against a CPU
+reference written the same way, both halves would have carried the same swap and
+agreed at 1e-7.
+
+**Still not written: the featuriser.** The 108 columns go in from the dump. The
+frame convention, the bin edges, the 32-class remap and the multichain masking
+are all specified above and none of them is gated yet.

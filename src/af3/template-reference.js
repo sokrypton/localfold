@@ -70,6 +70,81 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
  * @param {{swapTransposedBias: boolean}} dialect
  * @returns {Float32Array} tokens * tokens * pairChannels
  */
+/**
+ * The FUSED template embedder - boltz2's module, which protenix2 also runs.
+ *
+ *     v = z_proj(z_norm(z)) + a_proj(a)
+ *     v = v + pairformer(v)   x2
+ *     v = v_norm(v);  mean over slots;  u_proj(relu(u))
+ *
+ * 🔴 IT TAKES THE 108 FEATURE COLUMNS, IT DOES NOT BUILD THEM. That is the seam
+ * the reference's own template_parity.py uses, and its docstring is explicit
+ * about why: the featuriser and the forward are separate jobs, so a gate that
+ * derives features on both sides cannot tell a wrong projection from a wrong
+ * frame convention. `oracle-dumps/af3-oracle-template-protenix2.json` carries
+ * both halves separately for the same reason. The featuriser is NOT written
+ * here; docs/AF3.md has its specification, including the two traps the
+ * reference paid for.
+ *
+ * 🔴 AND A SUM OF PROJECTIONS IS ONE PROJECTION OF THE CONCATENATION, which is
+ * why this is the same model as AF3's nine `template_pair_embedding_*` and not
+ * a second one. The packing differs; the arithmetic does not.
+ */
+export function fusedTemplateEmbedding(input, weights, dialect) {
+  const { tokens, pair, pairMask, templates } = input;
+  const pairs = tokens * tokens;
+  const features = input.templateFeatures;
+  if (features === undefined) {
+    throw new Error("the fused template embedder needs `templateFeatures`: the "
+      + "108 concatenated columns per pair, which this module projects rather "
+      + "than derives. See docs/AF3.md for their order.");
+  }
+  const width = weights.featureWidth;
+  if (features.length !== pairs * width) {
+    throw new Error(`templateFeatures has ${features.length} elements; `
+      + `expected ${pairs * width} (${pairs} pairs x ${width})`);
+  }
+
+  // v = z_proj(z_norm(z)) + a_proj(a). The query half does not depend on the
+  // slot, so it is computed once - as in AF3's, and for the same reason.
+  const normalised = layerNorm(pair, pairs, weights.queryChannels,
+                               weights.queryEmbeddingNormScale,
+                               weights.queryEmbeddingNormOffset);
+  const queryTerm = linear(normalised, pairs, weights.queryChannels, CHANNELS,
+                           weights.zProjection);
+  const featureTerm = linear(features, pairs, width, CHANNELS, weights.aProjection);
+
+  const summed = new Float32Array(pairs * CHANNELS);
+  for (let slot = 0; slot < templates; slot += 1) {
+    let act = new Float32Array(pairs * CHANNELS);
+    for (let index = 0; index < act.length; index += 1) {
+      act[index] = queryTerm[index] + featureTerm[index];
+    }
+    for (let index = 0; index < weights.blocks.length; index += 1) {
+      act = templateBlock(act, pairMask, tokens, weights.blocks[index], dialect);
+    }
+    act = layerNorm(act, pairs, CHANNELS, weights.outputLayerNormScale,
+                    weights.outputLayerNormOffset);
+    input.onSlot?.(slot, act);
+    for (let index = 0; index < summed.length; index += 1) summed[index] += act[index];
+  }
+
+  // 🔴 DIVIDED BY THE SLOT COUNT, which is `templateMeanOverAllSlots` and is
+  // what AF3's own path already does - see the note at the bottom of
+  // templateEmbedding. So that dialect flag describes LocalFold's existing
+  // arithmetic rather than asking for new arithmetic.
+  const scale = 1 / (1e-7 + templates);
+  const output = new Float32Array(pairs * weights.queryChannels);
+  const relu = new Float32Array(pairs * CHANNELS);
+  for (let index = 0; index < summed.length; index += 1) {
+    relu[index] = Math.max(0, summed[index] * scale);
+  }
+  const projected = linear(relu, pairs, CHANNELS, weights.queryChannels,
+                           weights.outputLinear);
+  output.set(projected);
+  return output;
+}
+
 export function templateEmbedding(input, weights, dialect) {
   const { tokens, pair, pairMask, templates } = input;
   const pairs = tokens * tokens;
