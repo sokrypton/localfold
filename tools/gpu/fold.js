@@ -147,6 +147,16 @@ export function batchFromDump(dump) {
     tokensToQueries: gather("tokens_to_queries"),
     tokensToKeys: gather("tokens_to_keys"),
     tokenAtomsToPseudoBeta: gather("token_atoms_to_pseudo_beta"),
+    // 🔴 AND AT THE TOP LEVEL TOO, WHICH IS WHERE THE READERS LOOK. The
+    // featuriser returns `residueIndex, tokenIndex, asymId, entityId, symId` as
+    // fields of the batch; this path had them ONLY under `features`, so
+    // `structural-tokens.js` read `batch.entityId` as undefined and
+    // `fold-opendde.js --dump=` crashed AFTER the trunk comparison had already
+    // printed - which reads as a broken tool rather than a missing field. Same
+    // class as `residueOfToken` above: a batch that is complete for AF3 and
+    // incomplete for the family that re-tokenises.
+    residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
+    entityId: ints(raw("entity_id")), symId: ints(raw("sym_id")),
     features: {
       residueIndex: ints(raw("residue_index")), tokenIndex: ints(raw("token_index")),
       asymId: ints(raw("asym_id")), entityId: ints(raw("entity_id")),

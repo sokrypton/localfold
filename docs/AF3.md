@@ -2992,22 +2992,51 @@ the fused one uses - features IN, output compared - which means
 `templateEmbedding` must accept precomputed features instead of deriving them
 from slots. That is the next piece of work.
 
-**OpenDDE's confidence head**, on the reference's own seeded inputs:
+**OpenDDE's confidence head**, on the reference's own seeded inputs - FOUND
+WRONG, FIXED BY THE M2 IN 8dbb8cd, AND CONFIRMED HERE:
 
-| readout | relRMS |
+| readout | before | after (A100) | after (M2) |
+|---|---:|---:|---:|
+| `predicted_lddt` | 1.42e-4 | **1.14e-7** | 1.18e-7 |
+| `predicted_experimentally_resolved` | 1.94e-4 | **9.53e-8** | - |
+| `full_pae` | 4.68e-3 | **8.46e-7** | 9.11e-7 |
+| `full_pde` | 7.50e-3 | **9.73e-7** | 1.20e-6 |
+
+The head ran at the TRUNK's precision: `Af3ConfidenceHeadGpu` pins f32 staging,
+f32 weights, f32 accumulation and the matrix pair kernels OFF, because pLDDT and
+PAE are softmaxes over 50 and 64 bins - the most amplifying thing the model
+emits - and this stack took only the bundle's weight precision. Four orders.
+
+🔴 **AND I CALLED IT "NOT PRECISION" ON THE STRENGTH OF A CONTROL THAT COULD NOT
+VARY PRECISION.** The arm was `--f16=off`, which **cannot reach the matrix
+kernels**: on a device with matrix units the flag moves nothing, so an unchanged
+residual reads as proof that precision is not the cause and is proof of nothing
+at all. The M2 - which has no matrix units at these widths - saw the same flag
+remove the whole error. **A control arm that cannot vary the thing under test is
+not a control**, and "identical with the flag off" must be read as "the flag
+reached this code path" first. The checker's bound is 1e-5 now, verified to fail
+with the pins removed; leaving it at the defect's own 1e-2 would have let the
+defect back in silently.
+
+**And OpenDDE's target-feat atom encoder is exact**, which is what isolates the
+trunk defect to the template stage alone. `check-opendde-encoder-oracle.js
+--dump=`, masked to the atoms both sides call real:
+
+| seam | relRMS |
 |---|---:|
-| `predicted_lddt` | 1.42e-4 |
-| `predicted_experimentally_resolved` | 1.94e-4 |
-| `full_pae` | **4.68e-3** |
-| `full_pde` | **7.50e-3** |
+| per-atom conditioning (5 embeds summed) | 3.90e-8 |
+| `pair_mlp_3` | **0** |
+| `atom_transformer_encoder` | 1.18e-7 |
+| `project_atom_features_for_aggr` | 1.79e-7 |
 
-Identical with `--f16=off`, so not arithmetic precision. The split is the clue:
-the two readouts taken off the SINGLE are ~30x tighter than the two taken off
-the PAIR, so what diverges is the pair path - the z init from `s_inputs`, the
-distance embedding, or the four-block pairformer. openbind0's whole head reads
-4.26e-4 and boltz2's 1.44e-6, so this is an order worse than any other model and
-it is an open finding rather than a tolerance. The checker's bound is 1e-2,
-which catches a regression and does not pretend this is agreement.
+🔴 **THE MASK IS NOT A TOLERANCE, IT IS THE COMPARISON.** Unmasked, those arms
+read 0.466 and 0.137 while `project_atom_features_for_aggr` - DOWNSTREAM of both
+- read 1.79e-7, which cannot be true. The reference's per-atom embeddings are
+nonzero on all 1632 dense slots (`embed_ref_element` and `embed_ref_atom_name`
+embed index-0 one-hots, which are real vectors) and this port zeroes them; both
+are masked out at `mask_mean`, so the fold is identical and the unmasked residual
+is dominated by rows neither model reads. That is the second impossible pair of
+residuals in this one checker, and both times the checker was at fault.
 
 🔴 **AND THE ENCODER BISECT CAUGHT ITS OWN AUTHOR FIRST.**
 `check-opendde-encoder-oracle.js` reported the per-atom conditioning at 1.19 -

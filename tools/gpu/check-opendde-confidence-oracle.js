@@ -14,21 +14,23 @@
  * here is `tools/oracle/dump_af3_opendde_confidence.py`, which drives the
  * reference's `OpenDDEConfidenceHead` with 0 unmapped scopes.
  *
- * 🔴 WHAT IT MEASURES TODAY, and the bound is set to catch a REGRESSION rather
- * than to declare agreement:
+ * 🔴 WHAT IT MEASURES, on both machines, with the precision pins in place
+ * (8dbb8cd):
  *
- *     predicted_lddt                     1.42e-4
- *     predicted_experimentally_resolved  1.94e-4
- *     full_pae                           4.68e-3
- *     full_pde                           7.50e-3
+ *                                        A100       M2
+ *     predicted_lddt                     1.14e-7    1.18e-7
+ *     predicted_experimentally_resolved  9.53e-8    -
+ *     full_pae                           8.46e-7    9.11e-7
+ *     full_pde                           9.73e-7    1.20e-6
  *
- * Identical with `--f16=off`, so it is NOT arithmetic precision. The split is
- * the informative part: the two readouts taken off the SINGLE are ~30x tighter
- * than the two taken off the PAIR, so whatever diverges is in the pair path -
- * the z init from s_inputs, the distance embedding, or the four-block
- * pairformer. For scale, openbind0's whole confidence head reads 4.26e-4 and
- * boltz2's 1.44e-6, so the pair readouts here are an order worse than any other
- * model's and that is an open finding, not a tolerance.
+ * 🔴 AND THE BOUND WAS 1e-2 BECAUSE THIS FIRST READ 4.7e-3 AND I CALLED IT "NOT
+ * PRECISION". It was precision. The control was `--f16=off`, which CANNOT REACH
+ * THE MATRIX KERNELS - so on a device with matrix units the flag moves nothing
+ * and an unchanged number reads as proof that precision is not the cause. It is
+ * proof of nothing at all. The M2, which has no matrix units at these widths,
+ * saw the same flag remove the whole error; pinning the four settings AF3's
+ * confidence head already carried took the A100 from 4.68e-3 to 8.46e-7.
+ * **A control arm that cannot vary the thing under test is not a control.**
  *
  * 🔴 AND IT TAKES THE REFERENCE'S OWN INPUTS. The head's s/z/s_inputs are
  * seeded and its atom layout synthesised, both recorded in the dump - so this
@@ -105,7 +107,10 @@ export async function main(device, args) {
     }
     arms.push({ stage: native, relRms: relRms(ours, expected), length: expected.length });
   }
-  const bound = Number(option(args, "bound", "1e-2"));
+  // 1e-5, which is two orders above what both machines measure and two below
+  // what the unpinned head read. A bound left at the defect's own magnitude
+  // would have let the defect back in silently.
+  const bound = Number(option(args, "bound", "1e-5"));
   const worst = arms.filter((a) => a.relRms !== undefined)
     .reduce((w, a) => (w === null || a.relRms > w.relRms ? a : w), null);
   const result = {

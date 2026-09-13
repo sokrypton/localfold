@@ -17,6 +17,7 @@
  * because its forward pass is the denoiser's and never runs this encoder.
  */
 import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { batchFromDump } from "./fold.js";
 import { openAf3Store } from "../../src/af3/weights.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
@@ -25,6 +26,29 @@ import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
   return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+};
+
+// 🔴 MASKED, BECAUSE THE PADDED SLOTS ARE NOT THE SAME TENSOR AND ARE NOT
+// SUPPOSED TO BE. The reference's per-atom embeddings are NONZERO on every one
+// of the 1632 dense slots - `embed_ref_element` and `embed_ref_atom_name` embed
+// index-0 one-hots, which are real vectors - and this port zeroes them. Both
+// are then masked out at `mask_mean`, so the fold is identical and an unmasked
+// relRMS over the whole tensor is dominated by rows neither model reads. It
+// reported 0.466 on the conditioning and 0.137 on the stack while the two
+// comparable seams were 0 and 1.79e-7, which cannot both be true and is the
+// second time in this file that an impossible pair of residuals was the
+// checker's fault rather than the port's.
+const maskedRelRms = (ours, expected, rowMask, channels) => {
+  let error = 0, scale = 0;
+  for (let row = 0; row < rowMask.length; row += 1) {
+    if (rowMask[row] === 0) continue;
+    for (let c = 0; c < channels; c += 1) {
+      const at = row * channels + c;
+      const d = ours[at] - expected[at];
+      error += d * d; scale += expected[at] * expected[at];
+    }
+  }
+  return Math.sqrt(error / Math.max(scale, 1e-30));
 };
 
 const relRms = (ours, expected) => {
@@ -61,7 +85,24 @@ export async function main(device, args) {
   // which cannot both be true and is what caught it.
   const targetFeat = await targetFeatureWeights(store);
   const weights = { reference: targetFeat.reference, targetFeat };
-  const { batch } = af3BatchFromA3m(sequence, null, {});
+  // 🔴 THE REFERENCE'S OWN BATCH, OR THIS CHECK CANNOT ANSWER. Two reasons, and
+  // both make a sequence-featurised run meaningless here:
+  //   - this port ships one idealised conformer set and the reference
+  //     featurises CCD geometry, so `embed_ref_pos` disagrees by construction
+  //     and drags the whole conditioning with it (0.26 on the real atoms);
+  //   - the featuriser sizes its subsets from the REAL atom count (18 subsets,
+  //     576 rows) where the reference keeps the dense grid (51 subsets, 1632),
+  //     so `stackOut` and `projectForAggr` could only report a length mismatch.
+  // `batchFromDump` pads to the dense grid deliberately, so `--dump=` fixes
+  // both at once and what is left is the encoder's arithmetic.
+  const dumpBatchPath = option(args, "dump", "");
+  const batch = dumpBatchPath === ""
+    ? af3BatchFromA3m(sequence, null, {}).batch
+    : batchFromDump(await (async () => {
+        const r = await fetch(dumpBatchPath);
+        if (!r.ok) throw new Error(`failed to load ${dumpBatchPath}: ${r.status}`);
+        return r.json();
+      })());
   const encoderWeights = weights.targetFeat.encoder;
   const dialect = weights.targetFeat.dialect ?? encoderWeights?.dialect;
 
@@ -90,8 +131,9 @@ export async function main(device, args) {
     for (let i = 0; i < summed.length; i += 1) summed[i] += term[i];
   }
   const rms = (a) => Math.sqrt(a.reduce((t, v) => t + v * v, 0) / a.length);
-  arms.push({ stage: "perAtomConditioning (5 embeds summed)",
-              relRms: relRms(conditioning, summed),
+  arms.push({ stage: "perAtomConditioning (5 embeds summed), MASKED",
+              relRms: maskedRelRms(conditioning, summed, batch.refMask, 128),
+              unmaskedRelRms: Number(relRms(conditioning, summed).toExponential(2)),
               oursRms: Number(rms(conditioning).toFixed(5)),
               nativeRms: Number(rms(summed).toFixed(5)),
               // 🔴 HOW MANY ROWS ARE NONZERO ON EACH SIDE. A padded slot the
@@ -173,7 +215,21 @@ export async function main(device, args) {
       arms.push({ stage: ours, lengthMismatch: [mine.length, theirs.data.length] });
       continue;
     }
-    arms.push({ stage: ours, relRms: relRms(mine, theirs.data), shape: theirs.shape });
+    // The stack's rows are QUERIES, so its mask is the atom mask gathered
+    // through `tokenAtomsToQueries` - the same convert the encoder does.
+    const channels = theirs.data.length / (theirs.shape[0] * theirs.shape[1]);
+    const rows = mine.length / channels;
+    const queryMask = new Float32Array(rows);
+    for (let q = 0; q < rows && q < batch.tokenAtomsToQueries.indices.length; q += 1) {
+      const at = batch.tokenAtomsToQueries.indices[q];
+      queryMask[q] = (batch.tokenAtomsToQueries.mask?.[q] ?? 1) === 0 ? 0
+        : (batch.refMask[at] ?? 0);
+    }
+    arms.push({ stage: `${ours}, MASKED`,
+                relRms: maskedRelRms(mine, theirs.data, queryMask, channels),
+                unmaskedRelRms: Number(relRms(mine, theirs.data).toExponential(2)),
+                rowsCompared: queryMask.reduce((t, v) => t + (v !== 0 ? 1 : 0), 0),
+                shape: theirs.shape });
   }
   const worst = arms.filter((a) => a.relRms !== undefined)
     .reduce((w, a) => (w === null || a.relRms > w.relRms ? a : w), null);
