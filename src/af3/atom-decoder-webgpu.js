@@ -214,19 +214,48 @@ export class Af3AtomDecoderGpu {
     const pairPacked = packCached(weights, "dec.pair", () => packDecoderPairWeights(weights));
     const blockPacked = weights.blocks.map(
       (block) => packCached(block, "dec.block", () => packAtomBlockWeights(block)));
+    // 🔴 THE DECODER'S BLOCKS TOOK AlphaFold 3's CONVENTIONS WHATEVER THE MODEL.
+    // `createAtomBlockShaders` is shared with the encoder, which passes
+    // `perBlockPair` and `keyMaskedAtomAttention` into it; this shape passed
+    // NEITHER, so every per-block or key-masked model compiled its decoder
+    // blocks as stock AF3. It runs, it produces a plausible structure, and it
+    // is a different model - measured on protenix2 as 1.21e-2 against this
+    // port's own CPU decoder where AlphaFold 3 reads 4.66e-7, compounding to
+    // 4.5e-1 over a denoise step and to a fold with 0.73x bonds.
+    //
+    // 🔴 AND OpenDDE SETS BOTH FLAGS TOO, so its decoder has had this since it
+    // was ported. Nothing measured a denoiser against a reference until
+    // check-af3-denoise.js existed.
+    if (weights.pairNormPerBlock === undefined) {
+      throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+        + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+    }
+    const keyMasked = weights.blocks[0]?.keyMaskedAtomAttention;
+    if (keyMasked === undefined) {
+      throw new Error("atom decoder blocks carry no keyMaskedAtomAttention");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels: weights.perTokenChannels,
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
       blocks: weights.blocks.length,
+      perBlockPair: weights.pairNormPerBlock, keyMaskedAtomAttention: keyMasked,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
     };
     const sources = createAtomDecoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:rt${shape.outputRowTile ?? "d"}`
-      + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`;
+      + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`
+      // 🔴 AND THE TRUNK PAIR'S WIDTH IS IN THE KEY. It is baked into the
+      // generated WGSL and every other dimension here can match while it
+      // differs, so two models would have shared one compiled kernel - the
+      // collision this repository has paid for five times now.
+      + `:tp${shape.trunkPairChannels}`
+      // ...and the two conventions, for the reason the encoder's key names
+      // them: the arms index one buffer differently and produce one shape.
+      + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];

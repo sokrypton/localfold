@@ -140,7 +140,9 @@ async function atomPairNorm(store, stackRoot, perBlock, blocks = 3) {
     const projection = await store.tensor(projectionName);
     return { perBlock: false,
              scale: Array.from({ length: blocks }, () => scale),
-             projection: Array.from({ length: blocks }, () => projection) };
+             projection: Array.from({ length: blocks }, () => projection),
+             // Already [C_PAIR, BLOCKS, HEADS]; the shader wants exactly this.
+             packedProjection: projection };
   }
   const scale = [];
   const projection = [];
@@ -148,7 +150,57 @@ async function atomPairNorm(store, stackRoot, perBlock, blocks = 3) {
     scale.push(await layer(store, scaleName, index));
     projection.push(await layer(store, projectionName, index));
   }
-  return { perBlock: true, scale, projection };
+  // 🔴 THE PER-BLOCK SCALE IS FOLDED INTO THE PER-BLOCK PROJECTION, and the
+  // shared scale becomes ones - exactly what foldPerBlockPairNorm does for the
+  // token transformer, and for the same reason.
+  //
+  // The atom DECODER's shader reads the projection per block
+  // (`c * BLOCKS * HEADS + block * HEADS + head`) and the LayerNorm scale as a
+  // SINGLE shared vector, so on a per-block model it applied BLOCK 0's scale to
+  // every block. AF3 never noticed because its scale is shared already; on
+  // protenix2 the GPU decoder read 1.87e-2 against its own CPU decoder's answer
+  // where AlphaFold 3's reads 4.66e-7, and that compounded to 4.48e-1 over a
+  // whole denoise step and to a fold whose bonds came out at 0.73x ideal.
+  //
+  // 🔴 AND OpenDDE HAS THE SAME FLAG, so it had the same defect and its fold
+  // has been slightly wrong for as long as it has existed - nothing measured
+  // its denoiser against a reference until now.
+  //
+  // The fold is exact: `sum_c n[c] * scale_b[c] * proj_b[c, h]` is
+  // `sum_c n[c] * (scale_b[c] * proj_b[c, h])`. The CPU reference reads the
+  // same arrays, so it sees ones and the folded projection and agrees by
+  // construction rather than by a second implementation.
+  const heads = projection[0].length / scale[0].length;
+  const folded = projection.map((weights, index) => {
+    const out = Float32Array.from(weights);
+    for (let c = 0; c < scale[index].length; c += 1) {
+      for (let h = 0; h < heads; h += 1) out[c * heads + h] *= scale[index][c];
+    }
+    return out;
+  });
+  // 🔴 AND THE SINGULAR `projection` MUST BE PACKED THE WAY THE DECODER'S
+  // SHADER READS IT, WHICH IS NOT HOW A PER-BLOCK CHECKPOINT STORES IT.
+  //
+  //     AlphaFold 3   pair_logits_projection  [C_PAIR, BLOCKS, HEADS]   (16, 3, 4)
+  //     protenix2     the same leaf           [BLOCKS, C_PAIR, HEADS]   (3, 16, 4)
+  //
+  // The shader indexes `c * BLOCKS * HEADS + block * HEADS + head`, so AF3's
+  // whole tensor is already in its layout and `projection[0]` - which for a
+  // SHARED norm is that whole tensor - is right by construction. On a per-block
+  // model `projection[0]` is one block's [C_PAIR, HEADS], sixty-four of the
+  // hundred and ninety-two floats the shader reads, and the other two blocks
+  // read whatever follows. Repacked here, so the singular field means the same
+  // thing for both.
+  const packed = new Float32Array(scale[0].length * blocks * heads);
+  for (let c = 0; c < scale[0].length; c += 1) {
+    for (let b = 0; b < blocks; b += 1) {
+      for (let h = 0; h < heads; h += 1) {
+        packed[(c * blocks + b) * heads + h] = folded[b][c * heads + h];
+      }
+    }
+  }
+  return { perBlock: true, projection: folded, packedProjection: packed,
+           scale: scale.map((one) => new Float32Array(one.length).fill(1)) };
 }
 
 async function atomBlockWith(store, stack, index, dialect) {
@@ -217,7 +269,7 @@ export async function targetFeatureWeights(store) {
       // that ignores it gets AlphaFold 3's behaviour on an OpenDDE bundle -
       // which is a plausible encoder, so the encoder asserts on the flag.
       pairInputLayerNormScale: pairNorm.scale[0],
-      pairLogitsProjection: pairNorm.projection[0],
+      pairLogitsProjection: pairNorm.packedProjection ?? pairNorm.projection[0],
       pairNormPerBlock: pairNorm.perBlock,
       pairInputLayerNormScales: pairNorm.scale,
       pairLogitsProjections: pairNorm.projection,
@@ -558,7 +610,7 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // Shared under AlphaFold 3, per block under OpenDDE - and under OpenDDE
       // the tensors live INSIDE the stack, which is why the root moves too.
       pairInputLayerNormScale: encoderPairNorm.scale[0],
-      pairLogitsProjection: encoderPairNorm.projection[0],
+      pairLogitsProjection: encoderPairNorm.packedProjection ?? encoderPairNorm.projection[0],
       pairInputLayerNormScales: encoderPairNorm.scale,
       pairLogitsProjections: encoderPairNorm.projection,
       pairNormPerBlock: encoderPairNorm.perBlock,
@@ -577,7 +629,7 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // Shared under AlphaFold 3, per block under OpenDDE - and under OpenDDE
       // the tensors live INSIDE the stack, which is why the root moves too.
       pairInputLayerNormScale: decoderPairNorm.scale[0],
-      pairLogitsProjection: decoderPairNorm.projection[0],
+      pairLogitsProjection: decoderPairNorm.packedProjection ?? decoderPairNorm.projection[0],
       pairInputLayerNormScales: decoderPairNorm.scale,
       pairLogitsProjections: decoderPairNorm.projection,
       pairNormPerBlock: decoderPairNorm.perBlock,
