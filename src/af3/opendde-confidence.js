@@ -125,8 +125,30 @@ export async function openddeConfidence(device, input, weights, dialect, options
   // `tokens^2 x 384` tensor is neither read back nor uploaded. The per-TOKEN
   // projections stay on the host: they are n and not n^2, which is what the
   // note above this function meant and is true of them.
-  const stack = new Af3PairformerStackGpu(
-    device, { pairWeightPrecision: weights.weightPrecision });
+  // 🔴 THE FOUR PINS AlphaFold 3's HEAD CARRIES, WHICH THIS ONE NEVER HAD.
+  // `Af3ConfidenceHeadGpu` runs its four blocks in f32 and with the matrix pair
+  // kernels off, because pLDDT and PAE are softmaxes over 50 and 64 bins - the
+  // most amplifying thing the model emits - and it measured all four outputs
+  // FAILING with those kernels on. This stack took only the bundle's weight
+  // precision, so OpenDDE's confidence ran at the trunk's defaults: f16 staging
+  // wherever the device has it, and f16 matrix kernels wherever it has matrix
+  // units, which no precision option reaches.
+  //
+  // Against af3-any-model on 6MRR (check-opendde-confidence-oracle.js), M2:
+  //
+  //                 pLDDT      PAE        PDE
+  //   before        4.57e-4    1.04e-2    1.43e-2
+  //   pinned        1.18e-7    9.11e-7    1.20e-6
+  //
+  // The A100 read 4.68e-3 on PAE "identical with --f16=off" and concluded it
+  // was not precision. It was: --f16=off cannot reach the matrix kernels, so on
+  // a device with matrix units the flag changes nothing, and on the M2 - which
+  // has none at these widths - the same flag removed all of it.
+  const stack = new Af3PairformerStackGpu(device, {
+    pairWeightPrecision: weights.weightPrecision,
+    stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+    pairMatrixKernels: false,
+  });
   const onHost = options.hostReadouts === true;
   const built = onHost ? undefined : await openddePairInit(device, {
     tokens, channels: c, pair: input.pair, pairBuffer: input.pairBuffer,

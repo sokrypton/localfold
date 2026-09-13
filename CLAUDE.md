@@ -351,6 +351,48 @@ check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
 
+### 🔴 OPENDDE'S ORACLES, RUN ON THE M2: THE CONFIDENCE HEAD WAS PRECISION AFTER ALL
+
+All four references were generated HERE from `~/af3_ported/opendde.bin.zst` and
+the af3-any-model checkout, with the float32 bundle exported locally (481
+tensors, 655.8 M parameters - the same counts as yours).
+
+**The trunk reproduces your finding to three figures**, on independent hardware
+and an independently generated reference: target_feat 5.63e-8, z_after_template
+**2.07e-2**, z_after_msa 5.91e-2, trunk_out_pair 1.08e-1. The template stage is
+wrong. Not fixed here.
+
+🔴 **BUT THE CONFIDENCE HEAD WAS NOT "NOT PRECISION".** `openddeConfidence` built
+its four-block stack with `pairWeightPrecision` alone, where
+`Af3ConfidenceHeadGpu` pins f32 staging, weights and accumulation AND
+`pairMatrixKernels: false` - measured there as all four outputs failing without.
+OpenDDE's head ran at the trunk's defaults, on the page, through `fold.js`.
+
+| confidence vs af3-any-model | pLDDT | PAE | PDE |
+|---|---:|---:|---:|
+| M2, shipped | 4.57e-4 | 1.04e-2 | 1.43e-2 |
+| M2, `--f16=off` | 1.18e-7 | 9.11e-7 | 1.20e-6 |
+| M2, pinned, f16 ON | **1.18e-7** | **9.11e-7** | **1.20e-6** |
+| A100, shipped, either flag | 1.42e-4 | 4.68e-3 | 7.50e-3 |
+
+Your "identical with --f16=off" was true and the inference from it was not:
+`--f16=off` cannot reach the matrix pair kernels, so on a device with matrix
+units it changes nothing, while the M2 - which has none at these widths - lost
+the whole residual to the same flag. Fixed by giving the stack the four pins;
+`test/confidence-precision-pins.test.js` holds both heads to them. The fold's
+pLDDT on 6MRR moves 92.0506 -> 92.0500. **Worth re-running the oracle on the
+A100**, where the matrix kernels were the part the flag could not see.
+
+🔴 **AND TWO OF THE THREE GATES CANNOT RUN AS WRITTEN ON A SECOND MACHINE:**
+- `fold-opendde.js --dump=` completes the trunk comparison and then dies in
+  `structuralBatch`: `batchFromDump` carries no `entityId`, the first per-token
+  field the structural re-tokenisation takes. Possibly not the last.
+- `check-opendde-encoder-oracle.js` featurises from `--sequence` and has no
+  `--dump=`, so it runs our conformer set - 576 atoms - against the reference's
+  dense 68 x 24 = 1632, and every stage past the embeddings is a LENGTH
+  mismatch at exactly 1632/576 = 2.833x. Its 5.21e-1 on the summed embeddings is
+  the conformer floor your commit describes, not the encoder.
+
 ### 🔴 ROUND FIVE: TWO NEW MODELS, AND THE THREE QUESTIONS ALREADY ANSWERED HERE
 
 **boltz2 and protenix2 are ported and exact**, so the panel is six models rather
