@@ -76,14 +76,20 @@ export async function main(device, args) {
     ["feat:template_unit_vector", 3],
     ["feat:template_backbone_frame_mask", 1],
   ];
+  const skipOracleEarly = option(args, "oracle", "on") === "off";
   const width = parts.reduce((sum, [, w]) => sum + w, 0);
-  if (width !== weights.featureWidth) {
+  // 🔴 THE ORACLE'S COLUMNS ARE protenix2's AND THE GPU ARM DOES NOT NEED THEM.
+  // boltz2 runs the same module on 109 columns in a different order, so this
+  // construction refuses there - correctly - and `--oracle=off` runs the
+  // internal GPU-against-CPU arm, which builds its own empty features from the
+  // dialect and needs no dump at all.
+  if (!skipOracleEarly && width !== weights.featureWidth) {
     throw new Error(`built ${width} feature columns and a_proj wants `
       + `${weights.featureWidth}`);
   }
   const features = new Float32Array(pairs * width);
   let offset = 0;
-  for (const [name, w] of parts) {
+  for (const [name, w] of (skipOracleEarly ? [] : parts)) {
     const source = raw(name);
     if (source.length !== pairs * w) {
       throw new Error(`${name} has ${source.length} elements; expected ${pairs * w}`);
@@ -96,14 +102,16 @@ export async function main(device, args) {
     offset += w;
   }
 
-  const got = fusedTemplateEmbedding({
+  const got = skipOracleEarly ? new Float32Array(0) : fusedTemplateEmbedding({
     tokens, pair: raw("pair"), pairMask: raw("pairMask"),
     templates: dump.slots, templateFeatures: features,
   }, weights, dialect);
-  const expected = Float32Array.from(dump.output.data);
-  const relRms = relativeRms(got, expected);
+  const expected = skipOracleEarly ? new Float32Array(0)
+    : Float32Array.from(dump.output.data);
+  const skipOracle = option(args, 'oracle', 'on') === 'off';
+  const relRms = skipOracle ? 0 : relativeRms(got, expected);
   const rms = (a) => Math.sqrt(a.reduce((s, v) => s + v * v, 0) / a.length);
-  console.log(`fused template\ttokens=${tokens} slots=${dump.slots}`
+  if (!skipOracleEarly) console.log(`fused template\ttokens=${tokens} slots=${dump.slots}`
     + `\trelRMS ${relRms.toExponential(2)}`
     + `\tours rms ${rms(got).toFixed(4)}\tnative rms ${rms(expected).toFixed(4)}`);
 
@@ -111,11 +119,11 @@ export async function main(device, args) {
   // against an all-zero reference and this module is genuinely inert without a
   // template. Native's rms is 12.44 here; a comparison where either side is
   // flat is not a comparison.
-  if (!(rms(expected) > 1e-3) || !(rms(got) > 1e-3)) {
+  if (!skipOracle && (!(rms(expected) > 1e-3) || !(rms(got) > 1e-3))) {
     throw new Error(`one side is flat: ours ${rms(got)}, native ${rms(expected)}`);
   }
   const bound = Number(option(args, "bound", "2e-3"));
-  if (!(relRms < bound)) {
+  if (!skipOracle && !(relRms < bound)) {
     throw new Error(`fused template relRMS ${relRms.toExponential(3)} exceeds `
       + `${bound.toExponential(0)}`);
   }
@@ -127,7 +135,7 @@ export async function main(device, args) {
   // builder the fold uses, so a wrong constant shows up here rather than as a
   // broken chain three stages later.
   const slots = Number(option(args, "slots", "4"));
-  const emptyFeatures = emptyFusedFeatures(undefined, tokens, weights.featureWidth);
+  const emptyFeatures = emptyFusedFeatures(undefined, tokens, weights.featureWidth, dialect);
   const pairMaskOnes = new Float32Array(pairs).fill(1);
   const cpuEmpty = fusedTemplateEmbedding({
     tokens, pair: raw("pair"), pairMask: pairMaskOnes,

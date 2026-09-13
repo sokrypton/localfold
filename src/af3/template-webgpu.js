@@ -34,6 +34,7 @@
  * The two template blocks are the shared pair track at 64 channels with a
  * factor-2 transition; see src/af3/pair-track-gpu.js.
  */
+import { templateTransitionFactor } from "./template-reference.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residencyAllowed } from "../runtime/device-memory.js";
@@ -95,23 +96,29 @@ const FUSED_ORDER = [
  * in docs/AF3.md and gated by nothing yet. Building it from that specification
  * and checking it against a reference built the same way would prove nothing.
  */
-export function emptyFusedFeatures(template, tokens, width) {
+export function emptyFusedFeatures(template, tokens, width, dialect) {
   if (template !== undefined && template !== null) {
     throw new Error("the fused template embedder has no featuriser yet: a "
       + "supplied template needs the 108 columns built, and docs/AF3.md has "
       + "their specification. Fold without templates, or write it against "
       + "tools/oracle/dump_af3_template.py.");
   }
+  // 🔴 WHICH COLUMNS AN EMPTY SLOT SETS IS THE DIALECT'S, AND THE TWO FUSED
+  // MODELS DISAGREE. protenix2's 108 columns carry GAP in both restype blocks;
+  // boltz2's 109 are all zero. Its whole feature ORDER is different too -
+  // distogram 38 against 39, restypes 33 against 32 - which is why `a_proj`
+  // refused a 108-wide build with "wants 109" rather than folding something
+  // plausible.
+  const columns = dialect?.emptyTemplateRestypeColumns;
+  if (columns === undefined || columns === null) {
+    throw new Error("dialect.emptyTemplateRestypeColumns has no default: an "
+      + "empty template slot carries GAP under protenix2 and zeros under "
+      + "boltz2, and guessing either is a different model");
+  }
   const pairs = tokens * tokens;
   const features = new Float32Array(pairs * width);
-  // [disto(39), pseudo-beta mask(1), restype_i(32), restype_j(32), uvec(3),
-  // frame mask(1)] - so the two one-hot columns are at 40 + 31 and 72 + 31.
-  const GAP = 31;
-  const restypeI = 39 + 1 + GAP;
-  const restypeJ = 39 + 1 + 32 + GAP;
   for (let index = 0; index < pairs; index += 1) {
-    features[index * width + restypeI] = 1;
-    features[index * width + restypeJ] = 1;
+    for (const column of columns) features[index * width + column] = 1;
   }
   return features;
 }
@@ -256,6 +263,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   // four empty slots and false the moment one carries a template. The
   // LayerNorm and the summation are per slot; the scale, the relu and the
   // projection happen once, on the sum.
+  // 🔴 AND boltz2 WRAPS THE WHOLE STACK IN A RESIDUAL. `before` is the
+  // activation as it entered the two pairformer blocks, added back here rather
+  // than in a pass of its own: this shader already reads `act` row by row, so
+  // the add is free and needs no second dispatch. Under every other dialect the
+  // binding is absent and not a line of this changes.
+  const outerResidual = shape.templateStackOuterResidual === true;
   const accumulate = `${common}
 @group(0) @binding(0) var<storage, read> act: array<f32>;
 @group(0) @binding(1) var<storage, read> weights: array<f32>;
@@ -264,6 +277,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 // the SAME embedding, so running four of them is four times the work for an
 // answer that is one of them times four. See the note in run().
 @group(0) @binding(3) var<storage, read> repeat: array<f32>;
+${outerResidual ? "@group(0) @binding(4) var<storage, read> before: array<f32>;" : ""}
+
+fn value_at(index: u32) -> f32 {
+${outerResidual ? "  return act[index] + before[index];" : "  return act[index];"}
+}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -274,16 +292,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   var total = 0.0;
   var squares = 0.0;
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    let value = act[base + c];
+    let value = value_at(base + c);
     total += value;
     squares += value * value;
   }
   let mean = total / f32(CHANNELS);
-  ${varianceCode("CHANNELS", "act[base + c]")}
+  ${varianceCode("CHANNELS", "value_at(base + c)")}
   let inverse_std = inverseSqrt(variance + EPSILON);
 
   for (var c = 0u; c < CHANNELS; c += 1u) {
-    summed[base + c] += ((act[base + c] - mean) * inverse_std * weights[W_OUT_SCALE + c]
+    summed[base + c] += ((value_at(base + c) - mean) * inverse_std * weights[W_OUT_SCALE + c]
       + weights[W_OUT_OFFSET + c]) * repeat[0];
   }
 }`;
@@ -425,12 +443,14 @@ export class Af3TemplateEmbedderGpu {
     // those alone would hand one model the other's kernel.
     const fused = weights.fused === true;
     const featureWidth = fused ? weights.featureWidth : 0;
+    const outerResidual = dialect.templateStackOuterResidual === true;
     const sources = createTemplateShaders(
-      { tokens, queryChannels, templates, fused, featureWidth },
+      { tokens, queryChannels, templates, fused, featureWidth,
+        templateStackOuterResidual: outerResidual },
       packed.offsets, epsilon, variance);
     const base = `af3-template:${tokens}:${queryChannels}:${templates}:${epsilon}`
       + `:${variance}:${dialect.swapTransposedBias}`
-      + `:${fused ? `fused${featureWidth}` : ""}`;
+      + `:${fused ? `fused${featureWidth}` : ""}${outerResidual ? ":or" : ""}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
@@ -441,7 +461,10 @@ export class Af3TemplateEmbedderGpu {
     const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
     const trackPipelines = await compilePairTrack(this.pipelines, {
       scratchStorage: UNPACKED_PAIR_SCRATCH,
-      n: tokens, channels: CHANNELS, transitionFactor: 2,
+      // ...derived, not 2: boltz2's template transition is a factor of 4. See
+      // templateTransitionFactor in template-reference.js.
+      n: tokens, channels: CHANNELS,
+      transitionFactor: templateTransitionFactor(weights.blocks[0].pairTransition),
       weightPrecision: pairWeightPrecision,
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
       // ...the same pair track, so the same kernel choice. Four of an AF3
@@ -537,9 +560,17 @@ export class Af3TemplateEmbedderGpu {
         if (template !== undefined && template !== null) {
           for (let t = 0; t < tokens; t += 1) aatypeData[t] = template.aatype[t];
         }
+        // 🔴 AN EMPTY SLOT'S WEIGHT IS ZERO UNDER TEMPLATE_VISIBILITY_BY_COVERAGE.
+        // `repeat` already scales a slot's contribution into the sum, so the
+        // convention costs no branch and no pass: boltz2 masks by what the
+        // template covers, and with none supplied its whole term is zero -
+        // af3-any-model returns rms 0.0000 there.
+        const covered = !(dialect.templateVisibilityByCoverage === true
+          && (template === undefined || template === null));
         slotBuffers.push({
           repeat: keep(this.allocator.upload(
-            `af3-template.repeat.${slot}`, Float32Array.from([repeat]), storage)),
+            `af3-template.repeat.${slot}`,
+            Float32Array.from([covered ? repeat : 0]), storage)),
           aatype: keep(this.allocator.upload(
             `af3-template.aatype.${slot}`, aatypeData, storage)),
           // ...and an empty slot's geometry is zeros, which the shader reads as
@@ -561,11 +592,13 @@ export class Af3TemplateEmbedderGpu {
           // gated by nothing, so this refuses rather than guessing.
           features: fused ? keep(this.allocator.upload(
             `af3-template.features.${slot}`,
-            emptyFusedFeatures(template, tokens, featureWidth), storage)) : undefined,
+            emptyFusedFeatures(template, tokens, featureWidth, dialect), storage)) : undefined,
         });
       }
 
-      const act = keep(this.allocator.allocate("af3-template.act", pairs * CHANNELS * 4, storage));
+      // ...COPY_SRC only where the residual needs to snapshot it; see below.
+      const act = keep(this.allocator.allocate("af3-template.act", pairs * CHANNELS * 4,
+        outerResidual ? storage | GPUBufferUsage.COPY_SRC : storage));
       // The running sum over slots, which the projection reads once at the end.
       const summed = keep(this.allocator.allocate(
         "af3-template.summed", pairs * CHANNELS * 4, storage | GPUBufferUsage.COPY_DST));
@@ -664,12 +697,23 @@ export class Af3TemplateEmbedderGpu {
         });
       }
 
+      // 🔴 THE STACK'S INPUT, KEPT FOR THE RESIDUAL. A copy rather than a
+      // second `act`: the pair track writes `act` in place across both blocks,
+      // so the only way to add the input back afterwards is to have kept it.
+      const beforeStack = outerResidual
+        ? keep(this.allocator.allocate("af3-template.before", pairs * CHANNELS * 4,
+                                       storage | GPUBufferUsage.COPY_DST))
+        : undefined;
       for (let slot = 0; slot < slotBuffers.length; slot += 1) {
         run(`template.embed.${slot}`, compiled.embed,
             fused
               ? [pair, slotBuffers[slot].features, weightBuffer, act]
               : [pair, slotBuffers[slot].aatype, weightBuffer, act,
                  slotBuffers[slot].geometry], linear[0], linear[1]);
+        if (outerResidual) {
+          encoder.copyBufferToBuffer(act.buffer, 0, beforeStack.buffer, 0,
+                                     pairs * CHANNELS * 4);
+        }
         for (let index = 0; index < blockWeights.length; index += 1) {
           encodePairTrack({
             run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
@@ -678,7 +722,10 @@ export class Af3TemplateEmbedderGpu {
           });
         }
         run(`template.accumulate.${slot}`, compiled.accumulate,
-            [act, weightBuffer, summed, slotBuffers[slot].repeat], linear[0], linear[1]);
+            outerResidual
+              ? [act, weightBuffer, summed, slotBuffers[slot].repeat, beforeStack]
+              : [act, weightBuffer, summed, slotBuffers[slot].repeat],
+            linear[0], linear[1]);
       }
       const start = performance.now();
       this.device.queue.submit([encoder.finish()]);

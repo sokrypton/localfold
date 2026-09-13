@@ -38,6 +38,7 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
   noHeadNorm: false,
@@ -80,6 +81,7 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
   noHeadNorm: false,
@@ -140,6 +142,7 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
   noHeadNorm: false,
@@ -287,6 +290,14 @@ export const PROTENIX2 = Object.freeze({
   // right in its trunk and wrong in those two places.
   preSymmetrisedPde: true,
   templateMeanOverAllSlots: true,
+  // 🔴 AN EMPTY SLOT'S 108 COLUMNS ARE ZERO EXCEPT TWO, MEASURED NOT ASSUMED.
+  // `EMPTY=1 tools/oracle/dump_af3_template.py protenix2` reads every geometry
+  // feature at exactly zero and both restype blocks one-hot at column 31 - GAP,
+  // where _AF3_TO_OF3 sends AlphaFold 3's index 21. The blocks begin at 40 and
+  // 72 in this model's order [disto(39), pb(1), restype_i(32), restype_j(32),
+  // uvec(3), frame(1)]. boltz2's are all zero and its order is its own; see
+  // BOLTZ2.
+  emptyTemplateRestypeColumns: [40 + 31, 72 + 31],
   // 🔴 AND THE TEMPLATE EMBEDDER IS A DIFFERENT MODULE, NOT DIFFERENT WIDTHS.
   // protenix2 runs boltz2's fused form: `v = z_proj(z_norm(z)) + a_proj(a)`,
   // two pairformer blocks, `v_norm`, aggregate over slots, `u_proj(relu(u))`.
@@ -363,6 +374,12 @@ export const BOLTZ2 = Object.freeze({
   preSymmetrisedPde: true,
   templateMeanOverAllSlots: false,
   fusedTemplateEmbedder: true,
+  // 🔴 AN EMPTY SLOT'S 109 COLUMNS ARE ALL ZERO HERE, where protenix2's carry
+  // GAP. The reference records the split - "protenix fills the first slot with
+  // GAP, opendde fills all four, intellifold2 deliberately uses 0", and boltz2
+  // is with the last - and it is measurable rather than inferable, which is why
+  // it is a dialect entry and not a rule.
+  emptyTemplateRestypeColumns: [],
   templateStackOuterResidual: true,
   templateVisibilityByCoverage: true,
   noHeadNorm: true,

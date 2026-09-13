@@ -38,6 +38,16 @@ const RESTYPES = 31;
 const CHANNELS = 64;
 
 /** One block of the template stack: the pair half of a pairformer block. */
+/** `transition1` is [CHANNELS, CHANNELS * factor * 2]; the gated form doubles. */
+export function templateTransitionFactor(pairTransition) {
+  const factor = pairTransition.transition1.length / (CHANNELS * CHANNELS * 2);
+  if (!Number.isInteger(factor) || factor < 1) {
+    throw new Error(`a template transition1 of ${pairTransition.transition1.length} `
+      + `is not CHANNELS * CHANNELS * 2 * factor for CHANNELS ${CHANNELS}`);
+  }
+  return factor;
+}
+
 function templateBlock(pair, pairMask, tokens, weights, dialect) {
   let act = Float32Array.from(pair);
   const add = (delta) => {
@@ -53,7 +63,15 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
                         weights.pairAttention2, dialect));
   // ...factor 2 here, against the trunk's 4. See transition() in
   // pairformer-reference.js.
-  add(transition(act, tokens * tokens, CHANNELS, weights.pairTransition, 2));
+  // 🔴 THE FACTOR IS THE TENSOR'S, NOT A CONSTANT. AlphaFold 3 and protenix2
+  // run a factor of 2 here against the trunk's 4; boltz2 runs 4, and its
+  // transition1 is [64, 512] where theirs is [64, 256]. Typed in, both this and
+  // the GPU path read a 512-wide gate as though it were 256 - each in its own
+  // way, which is why they disagreed by 9e-1 rather than agreeing on a wrong
+  // answer. `transition1` is [channels, channels * factor * 2]: the gated form
+  // doubles it.
+  add(transition(act, tokens * tokens, CHANNELS, weights.pairTransition,
+                 templateTransitionFactor(weights.pairTransition)));
   return act;
 }
 
@@ -114,14 +132,41 @@ export function fusedTemplateEmbedding(input, weights, dialect) {
                            weights.zProjection);
   const featureTerm = linear(features, pairs, width, CHANNELS, weights.aProjection);
 
+  // 🔴 boltz2 MASKS BY WHAT THE TEMPLATE COVERS, SO AN EMPTY SLOT CONTRIBUTES
+  // EXACTLY NOTHING. Measured, not inferred: af3-any-model's own module returns
+  // rms 0.0000 for boltz2 with no template supplied, where protenix2's returns
+  // 12.46 and AlphaFold 3's is also live. Both of ours produced ~1.0 and ~1.6 -
+  // the z-dependent half that the other dialects keep - and disagreed with each
+  // other because they build it differently, which is why this looked like a
+  // GPU bug for a while and is a missing convention.
+  const visibility = dialect?.templateVisibilityByCoverage === true;
   const summed = new Float32Array(pairs * CHANNELS);
   for (let slot = 0; slot < templates; slot += 1) {
+    const here = input.slots?.[slot];
+    if (visibility && (here === undefined || here === null)) continue;
     let act = new Float32Array(pairs * CHANNELS);
     for (let index = 0; index < act.length; index += 1) {
       act[index] = queryTerm[index] + featureTerm[index];
     }
+    // 🔴 boltz2 WRAPS THE WHOLE STACK IN A RESIDUAL AND protenix2 DOES NOT,
+    // though protenix2 inherited the rest of this module from it. The
+    // reference's note is the one to keep: "protenix inherited the shared
+    // forward and got the wrong convention; rf3 escaped by not inheriting it.
+    // Either a per-vendor convention is named -- as it now is here -- or the
+    // next subclass gets whichever behaviour its parent happened to have."
+    // Worth 1.62e-2 on boltz2's whole trunk, where the pairformer, the MSA
+    // stack and the embedder all pass on their own.
+    if (dialect?.templateStackOuterResidual === undefined) {
+      throw new Error("dialect.templateStackOuterResidual has no default: boltz2 "
+        + "adds the stack's input back to its output and protenix2 does not");
+    }
+    const before = dialect.templateStackOuterResidual
+      ? Float32Array.from(act) : undefined;
     for (let index = 0; index < weights.blocks.length; index += 1) {
       act = templateBlock(act, pairMask, tokens, weights.blocks[index], dialect);
+    }
+    if (before !== undefined) {
+      for (let index = 0; index < act.length; index += 1) act[index] += before[index];
     }
     act = layerNorm(act, pairs, CHANNELS, weights.outputLayerNormScale,
                     weights.outputLayerNormOffset);

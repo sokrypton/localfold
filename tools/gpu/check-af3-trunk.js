@@ -194,7 +194,7 @@ export async function main(device, args) {
     ? fusedTemplateEmbedding(
       { pair, pairMask: input.pairMask, tokens, templates: 4,
         templateFeatures: emptyFusedFeatures(undefined, tokens,
-                                             weights.template.featureWidth) },
+                                             weights.template.featureWidth, DIALECT) },
       weights.template, DIALECT)
     : templateEmbedding(
       { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },

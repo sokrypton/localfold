@@ -90,8 +90,19 @@ describe("the dialect table", () => {
   });
 
   it("leaves stock AlphaFold 3 with none of them", () => {
+    // 🔴 NOT EVERY ENTRY IS A BRANCH. Most are booleans and stock AF3 must have
+    // every one off. A few carry a VALUE instead - which columns an empty
+    // template slot sets, say - and for those "off" is null, because the models
+    // that have them disagree about the value rather than about whether the
+    // branch runs. The rule this protects is that no branch is on for stock
+    // AF3, so a value-carrying flag is held to null and a boolean to false;
+    // coercing the first to `false` would make its type a lie at the use site.
     for (const [flag, value] of Object.entries(ALPHAFOLD3)) {
-      assert.equal(value, false, `${flag} is not false for stock AF3`);
+      if (typeof value === "boolean") {
+        assert.equal(value, false, `${flag} is not false for stock AF3`);
+      } else {
+        assert.equal(value, null, `${flag} carries a value for stock AF3`);
+      }
     }
   });
 
