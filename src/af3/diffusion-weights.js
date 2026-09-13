@@ -290,14 +290,28 @@ export async function targetFeatureWeights(store) {
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
-      // 🔴 THE _1 SUFFIX IS PART OF THE NAME. Four of these also exist under
-      // the unsuffixed name with IDENTICAL shapes, so dropping the suffix loads
-      // clean and gives the wrong target_feat. embed_pair_offsets_valid is the
-      // one with no _1 form, which makes the set look like a typo and is not.
-      singleToPairCondRow: await W("single_to_pair_cond_row_1"),
-      singleToPairCondCol: await W("single_to_pair_cond_col_1"),
-      embedPairOffsets: await W("embed_pair_offsets_1"),
-      embedPairDistances: await W("embed_pair_distances_1"),
+      // 🔴 NOT THE `_1` FORM, AND THIS FILE SAID THE OPPOSITE FOR A YEAR. Four
+      // of these exist twice, unsuffixed and `_1`, with identical shapes -
+      // haiku numbers a module the second time its constructor runs, and both
+      // instantiations are created during `init`. Only the FIRST is called at
+      // inference: tracing af3-any-model's whole fold with
+      // `hk.intercept_methods` shows `diffusion_single_to_pair_cond_row` and
+      // `evoformer_conditioning_single_to_pair_cond_row` firing twice each and
+      // neither `_1` firing at all.
+      //
+      // 🔴 AND FOR ALPHAFOLD 3 THE TWO ARE DIFFERENT TRAINED TENSORS - rms
+      // 0.088 against 0.406 for the row projection, 0.576 against 0.014 for the
+      // offsets - so this was not a naming preference, it was another model.
+      // Every PORTED bundle writes one tensor into both names, which is why
+      // protenix2 and boltz2 could be exact throughout while AF3's own denoise
+      // step read relRMS 4.19e-1 and nothing here could see it: the gate that
+      // would have is an ORACLE, and the per-module checkers all build their
+      // weight dict the same wrong way. `embed_pair_offsets_valid` is the one
+      // with no `_1` form, which is what made the set look like a typo.
+      singleToPairCondRow: await W("single_to_pair_cond_row"),
+      singleToPairCondCol: await W("single_to_pair_cond_col"),
+      embedPairOffsets: await W("embed_pair_offsets"),
+      embedPairDistances: await W("embed_pair_distances"),
       embedPairOffsetsValid: await W("embed_pair_offsets_valid"),
       pairMlp1: await W("pair_mlp_1"),
       pairMlp2: await W("pair_mlp_2"),
@@ -456,9 +470,14 @@ export async function conditioningWeights(store, dialect) {
     //     af3        831 - 0 - 384 = 447
     //     protenix2  833 - 2 - 384 = 447
     //     boltz2     768 - 0 - 384 = 384
-    targetFeatWidth: dims(store, `${HEAD}/single_cond_initial_norm/scale`)[0]
-      - (dialect.padSingleCondUnknownDna ? 2 : 0)
-      - dims(store, "diffuser/evoformer/single_activations/weights")[1],
+    // 🔴 FROM THE TENSOR THAT STATES IT, NOT FROM THE NORM THIS IS CHECKED
+    // AGAINST. Deriving it as `scale - pad - trunkSingle` made the width
+    // assertion in the reference VACUOUS: whatever the scale was, the derived
+    // width absorbed it and the two could never disagree. A stale OpenDDE
+    // bundle with an 831 scale then folded silently at target_feat 445 instead
+    // of 447 - the exact shape of error that assertion exists to catch.
+    // `single_activations` is [447, 384] and says 447 outright.
+    targetFeatWidth: dims(store, "diffuser/evoformer/single_activations/weights")[0],
     relativeWidth: 139,
     trunkPairChannels: splitPair
       ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
@@ -693,10 +712,11 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // 0.102 relRMS against AF3 on the head's own output, side chains about 8%
       // compressed, and nothing caught it because the only checker that reaches
       // the head builds its weights by hand.
-      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row_1/weights"),
-      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col_1/weights"),
-      embedPairOffsets: await T("diffusion_embed_pair_offsets_1/weights"),
-      embedPairDistances: await T("diffusion_embed_pair_distances_1/weights"),
+      // Not the `_1` form; see the note in `targetFeatureWeights`.
+      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row/weights"),
+      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col/weights"),
+      embedPairOffsets: await T("diffusion_embed_pair_offsets/weights"),
+      embedPairDistances: await T("diffusion_embed_pair_distances/weights"),
       // ...and this one has no _1 form, which makes the set look like a typo.
       embedPairOffsetsValid: await T("diffusion_embed_pair_offsets_valid/weights"),
       pairMlp1: await T("diffusion_pair_mlp_1/weights"),

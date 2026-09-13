@@ -197,7 +197,17 @@ export const OPENDDE = Object.freeze({
   symmetriseBonds: true,
   maskPaddedKeys: true,
   // ...but NOT this one; see the note above.
-  padSingleCondUnknownDna: false,
+  // 🔴 IT JOINED THE PADDED LIST, AND THE BUNDLE HAD TO BE RE-EXPORTED FOR IT.
+  // OpenDDE's diffusion single conditioning normalises over the vendor's 833
+  // channels, not AF3's 831 - the two residue classes AF3 lacks are re-inserted
+  // as ZERO columns before `single_cond_initial_norm`, and a LayerNorm maps a
+  // zero input to -mean/std, so they are not free the way a zero column into a
+  // bias-free Linear is. Worth a uniform 1 - sqrt(831/833) = 0.12% on the whole
+  // single conditioning, which is exactly what the denoise oracle measured
+  // (ours 2.8959 against 2.8994) before this. The converter emits the padded
+  // 833-row scale and projection; a bundle exported before 2026-09-10 carries
+  // 831 and the width assertion below is what says so.
+  padSingleCondUnknownDna: true,
   // The pair track is initialised from the single embedding `s_init` rather
   // than from `target_feat`, so `single_activations` is computed BEFORE the
   // pair init instead of after the MSA stack, and left/right_single are

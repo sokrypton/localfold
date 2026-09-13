@@ -2673,3 +2673,137 @@ not throw, because every tensor is the right shape and only the ANSWER is wrong.
 `denoise_parity.py` in the reference runs one whole denoise step - conditioning,
 atom encoder, token transformer, atom decoder and the EDM scaling at once - and
 that is what localises a wrong answer with correct shapes.
+
+---
+
+## boltz2 AND protenix2 ARE FINISHED, AND THE GATES THAT FINISHED THEM
+
+The section above ends with "the next step is an L3 oracle, not more widths."
+That was right, and it was not enough: an L3 oracle localises the DENOISER. Two
+more instruments were needed, and between them they found nine defects nothing
+here could see.
+
+| | RMSD to the 6MRR crystal | TM | pLDDT | pTM | N-CA | CA-C | CA-CA |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **boltz2** | **0.537 A** | **0.973** | 96.2 | 0.798 | 1.46 | 1.52 | 3.80 |
+| alphafold3 | 0.643 | 0.956 | 84.3 | 0.741 | 1.44 | 1.53 | 3.82 |
+| OpenDDE | 1.525 | - | 92.1 | - | - | - | - |
+| **protenix2** | **1.564** | **0.929** | 86.5 | 0.858 | 1.46 | 1.52 | 3.75 |
+| ideal | | | | | 1.46 | 1.52 | 3.80 |
+
+boltz2 is the best of the four here, which is what the reference's own table
+says it should be.
+
+### 🔴 THE ONE LESSON: A CHECKER THAT FEEDS ONE BUNDLE TO BOTH SIDES CANNOT SEE A CONVENTION
+
+Every AF3 gate in this repository compares **the GPU against this port's own CPU
+reference**. That catches a kernel, and it is structurally incapable of catching
+a convention, a depth or a weight - because both sides read the same bundle and
+are wrong together. Measured: at the moment boltz2's whole trunk was 1.34e+0
+from af3-any-model's, `check-af3-trunk` read 2.74e-5 and `check-af3-confidence`
+read 9.56e-5. Both passed. Both had passed all week.
+
+Three oracles now close that, and each one found defects on its first run:
+
+| | what it compares | what it found |
+|---|---|---|
+| `tools/oracle/dump_af3_denoise_stages.py` + `dump_af3_scopes.py` | af3-any-model's four denoiser seams, and every one of its 124 hk.Module outputs | ten affine LayerNorms, the transition up-gate, a negated weight in the bundle |
+| `tools/oracle/dump_af3_trunk_taps.py` + `fold.js --trunk-oracle=` | its Evoformer's z at each stage, on the REAL batch | target_feat as a sum, two z-init terms, the MSA feature's 35th column, the MSA double-add, a 64-block pairformer |
+| `tools/oracle/dump_af3_confidence.py` + `check-af3-confidence-oracle.js` | its ConfidenceHead on a real atom layout, module by module | protenix2's two missing terms, boltz2's 8-block stack |
+| `tools/check-bundle-vs-params.py` | the BUNDLE against the params the reference loads | four `embed_pair_offsets` tensors negated by a converter fix that landed after the export |
+
+### 🔴 AND THREE OF THE NINE WERE A DEPTH OR A WIDTH TYPED INTO A LOOP
+
+| | boltz2 | everyone else | what it cost |
+|---|---:|---:|---|
+| trunk pairformer | **64** | 48 | ran three quarters of the trunk |
+| confidence pairformer | **8** | 4 | ran half the head on inputs exact term for term |
+| MSA feature width | **35** | 34 | dropped `is_paired`, which on a single-sequence batch is the whole alignment |
+
+None of them throws. A stacked tensor with 64 blocks read 48 times is a valid
+read; a 34-wide prefix of a [35, 64] matrix has correct strides. `trunkDepths`
+and the confidence loader read both depths off the stack's leading axis now, and
+the MSA width off `msa_activations`.
+
+🔴 **AND THE DEPTH BISECT COULD NOT SEE THE FIRST ONE**, which is the part worth
+remembering. Truncating BOTH sides to 1, 4, 16, 32, 36, 40 and 44 blocks agreed
+to 1.55e-4 at every one of them - because every arm truncated to a depth under
+48, where the two configurations are the same model. The cliff was between 44
+and 48 and it was not chaos: at 48 the reference used blocks 48..63 and this
+port had never loaded them.
+
+### The conventions, in the order they were found
+
+**In the diffusion head.** Ten of boltz2's LayerNorms are AFFINE where AF3's are
+scale-only; the offsets are read from the BUNDLE (the converter has already
+decided by emitting the tensor) rather than from a model-name table, and a zero
+offset IS the scale-only LayerNorm, so no shader variant is needed. Its
+conditioned transition has a THIRD projection - `SwiGLU(a) * a_to_b(a)` in four
+stacks - and that one IS a shader variant, because a zero multiplier is not the
+identity but a dead block.
+
+**In the trunk.** `target_feat` is a SUM of seven terms, not AF3's
+concatenation: the atom encoder's token activation plus six bias-free
+projections, four of which are constant on an ordinary monomer and all six
+trained NON-ZERO. z-init carries two more constant terms
+(`token_bonds_type_embed` row 0 and `contact_encoding_unspecified`). The MSA
+module ADDS ITS INPUT PAIR TWICE - its MSAModule returns the updated z and its
+caller adds z to that. And its OPM divides before adding the bias, clamping
+rather than nudging, which is worth `(1 - 1/n) * b` and therefore nothing at
+depth 1.
+
+**In the confidence head.** It rebuilds z and s from nine terms under
+`~_boltz2_reembed`, normalises before no logit head, and splits both pair heads
+into intra- and inter-chain halves - which on a monomer never fire, so a
+single-chain gate cannot see whether they exist.
+
+**And protenix2's head was wrong all along**: it needed `distance_feat_project`
+(a second, UNBINNED distance term) and `input_single_norm` (the trunk single
+LayerNormed and clamped to +/-512 before ANY use). Its fold went pLDDT 59.1 ->
+86.5 on unchanged coordinates. `preSymmetrisedPde` had been declared in the
+dialect and read by nothing; it is implemented now, on both models.
+
+### 🔴 boltz2 WILL NOT RUN ITS TOKEN TRANSFORMER AT f16
+
+| `--f16` | one denoise step against af3-any-model |
+|---|---:|
+| off | **3.50e-3** |
+| on | 2.21e-1 |
+
+Its 24-block token transformer amplifies its input by about **2.2e4**, measured
+and LINEAR - half the input gap gives half the output gap (1.18e-2 against
+2.29e-2). That is a property of the up-gate: no other model here does it. The
+same amplification is why this repository's f64 CPU reference reads 2.20e-2
+where the f32 GPU reads 3.50e-3 - the GPU accumulates the way the oracle does.
+`check-af3-denoise.js` holds the GPU to the oracle and the CPU to the GPU for
+exactly that reason, and prices the model's own arithmetic envelope beside both.
+
+The fold is unchanged either way at 200 steps, so this is recorded rather than
+acted on; a per-dialect precision floor is the fix if a longer chain shows it.
+
+### The MSA is capped at num_msa now, and it was not
+
+AF3's Evoformer subsamples to `config.num_msa` (1024 in every checkpoint of this
+lineage) before the MSA stack sees a row. This port ran the whole array, which
+for a featurised batch padded to 16384 rows was sixteen times the rows the model
+takes: **3.2 GiB of `af3-msa.msa-scratch` and 1.5 s of a 3.3 s trunk**, now 280
+MiB and 515 ms.
+
+🔴 **AND THE FIRST num_msa ROWS ARE NOT AF3's num_msa ROWS.** It gumbel-shuffles
+first, so which rows survive is a draw from a PRNG this port cannot reproduce -
+and on a deep alignment the query itself survives only with probability
+`num_msa/depth`. Taking the prefix keeps the query and keeps the alignment's own
+order, which is `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s.
+A coverage limit, named; `DETERMINISTIC_MSA=1` on the oracle side makes the two
+comparable.
+
+### What is still open
+
+- The bundles are LOCAL. `model-boltz2-f32` was corrected in place by
+  `tools/negate-bundle-tensors.py` after `check-bundle-vs-params.py` named the
+  four tensors; a published bundle must be re-exported from a converter at or
+  after the fix (`~/ported/boltz2/boltz2.bin.zst`, 2026-09-09 or later).
+- boltz2's `templateStackOuterResidual` and `templateVisibilityByCoverage` are
+  implemented and have never been exercised: 6MRR folds with no template.
+- The inter-chain confidence heads and `opmRowCountNorm` both need a COMPLEX and
+  an MSA of depth > 1 respectively. Neither can be seen on this target.
