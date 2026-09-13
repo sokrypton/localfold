@@ -227,6 +227,23 @@ async function atomBlockWith(store, stack, index, dialect) {
 
 export async function targetFeatureWeights(store) {
   const root = "diffuser/evoformer_conditioning";
+  // 🔴 boltz2's `target_feat` IS A SUM OF SEVEN TERMS, NOT A CONCATENATION.
+  // Everything else here lays out [restype 31 | profile 31 | deletion 1 |
+  // atoms 384]; boltz2's InputEmbedder ADDS six bias-free projections onto the
+  // atom encoder's token activation, all at seq_channel. Taking the atom half
+  // alone - which is what `targetFeatAtomOnly` used to mean - put `target_feat`
+  // at relRMS 1.00e+0 against af3-any-model with 0.39x its magnitude, and since
+  // every other thing the trunk builds is a function of it, the fold came out a
+  // 5.9 A ball while the denoise step was exact.
+  const sum = store.manifest?.tensors?.["diffuser/boltz2_res_type_encoding/weights"]
+    === undefined ? null : {
+      resType: await store.tensor("diffuser/boltz2_res_type_encoding/weights"),
+      msaProfile: await store.tensor("diffuser/boltz2_msa_profile_encoding/weights"),
+      molType: await store.tensor("diffuser/boltz2_mol_type_conditioning/weights"),
+      cyclic: await store.tensor("diffuser/boltz2_cyclic_conditioning/weights"),
+      method: await store.tensor("diffuser/boltz2_method_conditioning/weights"),
+      modified: await store.tensor("diffuser/boltz2_modified_conditioning/weights"),
+    };
   const encoder = `${root}_atom_transformer_encoder`;
   const dialect = af3Dialect(store);
   // 🔴 THE PAIR LAYERNORM IS SHARED OR PER BLOCK, AND THE STACK'S NAME SAYS
@@ -308,6 +325,7 @@ export async function targetFeatureWeights(store) {
       // Checked at relRMS 8e-8 against the CPU reference by
       // tools/gpu/check-af3-target-feat-gpu.js, which is also where the 33x
       // comes from.
+      targetFeatSum: sum,
       trunkSingleChannels: 384,
       trunkPairChannels: 128,
       lnormTrunkSingleCondScale: new Float32Array(384),

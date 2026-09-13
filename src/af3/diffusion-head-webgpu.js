@@ -26,7 +26,8 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { Af3DiffusionConditioningGpu } from "./diffusion-conditioning-webgpu.js";
+import { Af3DiffusionConditioningGpu, packNormWeights }
+  from "./diffusion-conditioning-webgpu.js";
 import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
 import { Af3AtomDecoderGpu } from "./atom-decoder-webgpu.js";
 import { Af3DiffusionTransformerGpu } from "./diffusion-transformer-webgpu.js";
@@ -50,6 +51,13 @@ export function scalings(noiseLevel) {
  * layerNormSlow(x, scale, null) then a projection - used twice, for the single
  * conditioning going into the transformer and for the transformer's output.
  */
+/**
+ * 🔴 `scale` IS [scale | offset], ALWAYS. Ten of boltz2's diffusion LayerNorms
+ * carry a trained offset where AlphaFold 3's carry none, and a zero offset IS
+ * the scale-only LayerNorm - so both this and the two shaders below read the
+ * second half unconditionally and no caller has to know which bundle it has.
+ * `packNormWeights` builds it.
+ */
 function normaliseAndProject(input, rows, channels, outChannels, scale, projection) {
   const output = new Float32Array(rows * (projection === null ? channels : outChannels));
   for (let row = 0; row < rows; row += 1) {
@@ -65,14 +73,16 @@ function normaliseAndProject(input, rows, channels, outChannels, scale, projecti
     const inverse = 1 / Math.sqrt(variance / channels + 1e-5);
     if (projection === null) {
       for (let c = 0; c < channels; c += 1) {
-        output[base + c] = (input[base + c] - mean) * inverse * scale[c];
+        output[base + c] = (input[base + c] - mean) * inverse * scale[c]
+          + scale[channels + c];
       }
       continue;
     }
     for (let out = 0; out < outChannels; out += 1) {
       let value = 0;
       for (let c = 0; c < channels; c += 1) {
-        value += (input[base + c] - mean) * inverse * scale[c] * projection[c * outChannels + out];
+        value += ((input[base + c] - mean) * inverse * scale[c] + scale[channels + c])
+          * projection[c * outChannels + out];
       }
       output[row * outChannels + out] = value;
     }
@@ -82,7 +92,8 @@ function normaliseAndProject(input, rows, channels, outChannels, scale, projecti
 
 
 /**
- * LayerNorm with a scale and no offset, then a projection. One workgroup a row.
+ * LayerNorm - scale AND offset, packed into one binding - then a projection.
+ * One workgroup a row.
  *
  * 🔴 THIS WAS 58 MS OF A 204 MS DENOISER CALL, IN JAVASCRIPT. The single
  * conditioning is 384 wide and the token transformer wants 768, so this is a
@@ -135,7 +146,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C_IN) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < C_IN; c += LANES) {
-    normalised[c] = (input[base + c] - mean) * inverse * scale[c];
+    normalised[c] = (input[base + c] - mean) * inverse * scale[c] + scale[C_IN + c];
   }
   workgroupBarrier();
 
@@ -199,7 +210,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse = inverseSqrt(reduce_sum(local, centred) / f32(C) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < C; c += LANES) {
-    output[base + c] = (input[base + c] - mean) * inverse * scale[c];
+    output[base + c] = (input[base + c] - mean) * inverse * scale[c] + scale[C + c];
   }
 }`;
 
@@ -712,7 +723,9 @@ export class Af3DiffusionHeadGpu {
     const projected = await stage("single-projection", () => this.#normaliseAndProject(
       chained ? chain.condSingle : cond.single,
       tokens, weights.seqChannels, weights.perTokenChannels,
-      weights.singleCondEmbeddingNormScale, weights.singleCondEmbeddingProjection,
+      packNormWeights(weights.singleCondEmbeddingNormScale,
+                      weights.singleCondEmbeddingNormOffset),
+      weights.singleCondEmbeddingProjection,
       chained ? { into: chain.act, validation: deferred } : {}));
     let act;
     if (chained) {
@@ -744,10 +757,12 @@ export class Af3DiffusionHeadGpu {
       if (!chained) {
         return normaliseAndProject(
           transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
-          weights.outputNormScale, null);
+          packNormWeights(weights.outputNormScale, weights.outputNormOffset), null);
       }
       await this.#normaliseOnly(transformed.outputBuffer, chain.normalised, tokens,
-                                weights.perTokenChannels, weights.outputNormScale, deferred);
+                                weights.perTokenChannels,
+                                packNormWeights(weights.outputNormScale,
+                                                weights.outputNormOffset), deferred);
       return undefined;
     });
 

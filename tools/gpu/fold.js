@@ -103,6 +103,18 @@ export function batchFromDump(dump) {
     refAtomNameChars: ints(raw("ref_atom_name_chars")),
     refSpaceUid: ints(raw("ref_space_uid")),
     predDenseAtomMask: floats(raw("pred_dense_atom_mask")),
+    // 🔴 boltz2's `target_feat` READS ALL FOUR OF THESE and every other model
+    // reads none of them, so they were in the dump and not in the batch. Its
+    // InputEmbedder projects a mol_type one-hot and a modified flag onto the
+    // single track; see `targetFeatures`.
+    // Each independently, because a dump written for one model carries a
+    // different subset - `af3-6mrr.json` has is_dna and no is_modified, and
+    // reading them as a group threw inside `raw` on a fold that never needed
+    // any of them.
+    ...Object.fromEntries([["isDna", "is_dna"], ["isRna", "is_rna"],
+                           ["isLigand", "is_ligand"], ["isModified", "is_modified"]]
+      .filter(([, name]) => dump.inputs[name] !== undefined)
+      .map(([field, name]) => [field, ints(raw(name))])),
     tokenAtomsToQueries: gather("token_atoms_to_queries"),
     queriesToKeys: gather("queries_to_keys"),
     queriesToTokenAtoms: gather("queries_to_token_atoms"),
@@ -119,6 +131,7 @@ export function batchFromDump(dump) {
 
 export async function main(device, args) {
   const dumpPath = option(args, "dump", "/oracle-dumps/af3-6mrr.json");
+  const trunkOraclePath = option(args, "trunk-oracle", "");
   const steps = Number(option(args, "steps", "50"));
   // Named here rather than inline at the fold, because the guard below reads it.
   const samplerMode = option(args, "mode", "diffusion");
@@ -184,6 +197,14 @@ export async function main(device, args) {
   for (const code of ligandCodes) {
     ligands.push(parseCcdComponent(await (await fetch(ccdUrl(code))).text()));
   }
+  const trunkOracle = trunkOraclePath === "" ? null
+    : await (async () => {
+        const response = await fetch(trunkOraclePath);
+        if (!response.ok) {
+          throw new Error(`failed to load ${trunkOraclePath}: ${response.status}`);
+        }
+        return response.json();
+      })();
   const batch = sequenceArg !== ""
     ? featuriseProtein(sequenceArg,
       { msa: rows.msa, deletionMatrix: rows.deletionMatrix, unpairedFrom: rows.unpairedFrom,
@@ -575,6 +596,36 @@ export async function main(device, args) {
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
     seed: Number(option(args, "seed", "20260831")),
     onStage: (name, detail) => {
+      // 🔴 THE TRUNK AGAINST af3-any-model's OWN, ON THIS BATCH. Every trunk
+      // gate here compares the GPU against this port's CPU reference, so both
+      // can be wrong together - and boltz2's denoise step is exact while its
+      // fold is a 6.1 A ball, which is only possible if what the denoiser is
+      // FED is wrong. `dump_af3_trunk_taps.py` records the reference's own
+      // seams on this same batch; `--trunk-oracle=` compares them.
+      if (trunkOracle !== null && (name === "trunk-done" || name === "target-feat")) {
+        const want = trunkOracle.stages;
+        const arms = name === "target-feat"
+          ? [["target_feat", detail.targetFeat]]
+          : [["single", detail.trunk?.single], ["pair", detail.trunk?.pair]];
+        for (const [label, ours] of arms) {
+          const entry = want[label];
+          if (entry === undefined || ours === undefined) continue;
+          const expected = Float32Array.from(entry.data);
+          if (expected.length !== ours.length) {
+            console.log(`  native ${label}\tLENGTH ${ours.length} vs ${expected.length}`);
+            continue;
+          }
+          let error = 0, scale = 0;
+          for (let i = 0; i < expected.length; i += 1) {
+            const d = ours[i] - expected[i];
+            error += d * d; scale += expected[i] * expected[i];
+          }
+          const mine = Math.sqrt(ours.reduce((t, v) => t + v * v, 0) / ours.length);
+          console.log(`  native ${label}\t`
+            + `${Math.sqrt(error / Math.max(scale, 1e-30)).toExponential(2)}`
+            + `\tours rms ${mine.toFixed(4)}\tnative rms ${entry.rms.toFixed(4)}`);
+        }
+      }
       // 🔴 EVERY STAGE'S OWN MILLISECONDS, WHICH THIS TOOL PRINTED FOR THE
       // TRUNK AND NOTHING ELSE. A caller's clock attributes the gap between two
       // stages to the EARLIER one, so a fold whose named stages stop at

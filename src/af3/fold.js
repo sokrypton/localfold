@@ -380,6 +380,11 @@ export async function buildTargetFeat(batch, weights, device) {
   return targetFeatures({
     aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,
     atomFeatures: atomFeatures.tokenAct,
+    // boltz2's six extra summands and the features they read; null elsewhere,
+    // and `targetFeatures` returns the atom half alone then.
+    sum: weights.encoder?.targetFeatSum ?? null,
+    isDna: batch.isDna, isRna: batch.isRna, isLigand: batch.isLigand,
+    isModified: batch.isModified, cyclicPeriod: batch.cyclicPeriod,
   }, batch.tokens, weights.dialect ?? weights.encoder?.dialect);
 }
 

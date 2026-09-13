@@ -25,6 +25,7 @@ import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import {
   derivedWorkgroupTarget, createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
+  blockHasUpGate,
 } from "./atom-encoder-webgpu.js";
 
 /** Which labels in a caller's `staticCache` already hold their contents. */
@@ -34,20 +35,28 @@ const GRID_WIDTH = 32_768;
 
 const PAIR_ORDER = [
   "pairInputLayerNormScale", "pairLogitsProjection",
-  "projectTokenFeaturesForBroadcast", "atomFeaturesLayerNormScale",
+  "projectTokenFeaturesForBroadcast",
+  // ...and its offset, zeros where the bundle carries none; see PAIR_ORDER in
+  // atom-encoder-webgpu.js.
+  "atomFeaturesLayerNormScale", "atomFeaturesLayerNormOffset",
   "atomFeaturesToPositionUpdate",
 ];
 
 export function packDecoderPairWeights(weights) {
   const offsets = {};
   let total = 0;
+  let source = weights;
   for (const name of PAIR_ORDER) {
-    if (weights[name] === undefined) throw new Error(`atom decoder missing ${name}`);
+    if (source[name] == null && name === "atomFeaturesLayerNormOffset") {
+      source = { ...source,
+                 [name]: new Float32Array(source.atomFeaturesLayerNormScale.length) };
+    }
+    if (source[name] === undefined) throw new Error(`atom decoder missing ${name}`);
     offsets[name] = total;
-    total += weights[name].length;
+    total += source[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of PAIR_ORDER) data.set(weights[name], offsets[name]);
+  for (const name of PAIR_ORDER) data.set(source[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -171,7 +180,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var value = 0.0;
     for (var c = 0u; c < C; c += 1u) {
       value += ((act[row * C + c] * queries_mask[row] - mean) * inverse
-        * weights[P_atomFeaturesLayerNormScale + c])
+        * weights[P_atomFeaturesLayerNormScale + c]
+        + weights[P_atomFeaturesLayerNormOffset + c])
         * weights[P_atomFeaturesToPositionUpdate + c * 3u + axis];
     }
     update[slot * 3u + axis] = value;
@@ -250,13 +260,18 @@ export class Af3AtomDecoderGpu {
     if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
       throw new Error("this atom decoder's blocks disagree about chainedAtomLayerNorm");
     }
+    // boltz2's transition up-gate; see `blockOrderFor` in the encoder.
+    const upGate = blockHasUpGate(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
+      throw new Error("this atom decoder's blocks disagree about ffwAToB");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels: weights.perTokenChannels,
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
       blocks: weights.blocks.length,
-      perBlockPair: weights.pairNormPerBlock, keyMaskedAtomAttention: keyMasked,
+      perBlockPair: weights.pairNormPerBlock, keyMaskedAtomAttention: keyMasked, upGate,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
     };
@@ -272,7 +287,7 @@ export class Af3AtomDecoderGpu {
       // ...and the two conventions, for the reason the encoder's key names
       // them: the arms index one buffer differently and produce one shape.
       + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`
-      + `${chainedNorm ? "cn" : ""}`;
+      + `${chainedNorm ? "cn" : ""}${upGate ? "ug" : ""}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];

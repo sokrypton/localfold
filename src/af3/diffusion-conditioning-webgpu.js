@@ -61,9 +61,10 @@ function prepareWeights(weights) {
   if (cached !== undefined) return cached;
   const scale = weights.noiseEmbeddingInitialNormScale;
   const projection = weights.noiseEmbeddingInitialProjection;
-  const noiseData = new Float32Array(scale.length + projection.length);
-  noiseData.set(scale, 0);
-  noiseData.set(projection, scale.length);
+  const norm = packNormWeights(scale, weights.noiseEmbeddingInitialNormOffset);
+  const noiseData = new Float32Array(norm.length + projection.length);
+  noiseData.set(norm, 0);
+  noiseData.set(projection, norm.length);
   // 🔴 THE CLOSED FORM IS A PROPERTY OF THE JOINT LayerNorm, SO THE SPLIT
   // DIALECT HAS NO USE FOR IT - and asking for it there reads `scale[128+c]`
   // off the end of a 256-long norm and hands the shader a buffer of NaN.
@@ -73,14 +74,28 @@ function prepareWeights(weights) {
   // ...and the third shape, where only the relpos is projected.
   const projectedRelpos = !split && weights.relpeProjection !== undefined;
   const prepared = {
-    columnSums: split ? new Float32Array(weights.pairChannels)
-      : relativeColumnSums(weights.pairCondInitialNormScale,
-                           weights.pairCondInitialProjection,
-                           weights.pairChannels, weights.pairChannels),
+    // Two vectors: the closed form's S[o], then the LayerNorm OFFSET's own
+    // constant contribution over the same 139 columns. Zero where the bundle
+    // carries no offset, which is every model but boltz2's family.
+    columnSums: split ? new Float32Array(2 * weights.pairChannels)
+      : (() => {
+        const sums = relativeColumnSums(weights.pairCondInitialNormScale,
+                                        weights.pairCondInitialProjection,
+                                        weights.pairChannels, weights.pairChannels);
+        const offsets = weights.pairCondInitialNormOffset == null
+          ? new Float32Array(weights.pairChannels)
+          : relativeOffsetSums(weights.pairCondInitialNormOffset,
+                               weights.pairCondInitialProjection,
+                               weights.pairChannels, weights.pairChannels);
+        const packed = new Float32Array(sums.length + offsets.length);
+        packed.set(sums, 0); packed.set(offsets, sums.length);
+        return packed;
+      })(),
     noisePacked: {
       data: noiseData,
       offsets: { noiseEmbeddingInitialNormScale: 0,
-                 noiseEmbeddingInitialProjection: scale.length },
+                 noiseEmbeddingInitialNormOffset: scale.length,
+                 noiseEmbeddingInitialProjection: norm.length },
     },
     pairTransitions: weights.pairTransitions.map(
       (w) => packTransitionWeights(asTransitionWeights(w))),
@@ -89,6 +104,29 @@ function prepareWeights(weights) {
   };
   PREPARED_WEIGHTS.set(weights, prepared);
   return prepared;
+}
+
+/**
+ * A LayerNorm's weights as one buffer: the scale, then the offset.
+ *
+ * 🔴 ALWAYS BOTH, WITH ZEROS WHERE THE BUNDLE CARRIES NO OFFSET. An offset of
+ * zero IS the scale-only LayerNorm - it is not a fallback, it is the identity -
+ * so this needs no shader variant and no dialect flag, and a second bundle that
+ * turns out to be affine cannot silently read the scale alone. Ten of boltz2's
+ * diffusion LayerNorms are affine where AlphaFold 3's are scale-only; see
+ * `offsetOf` in diffusion-weights.js.
+ */
+export function packNormWeights(scale, offset) {
+  const packed = new Float32Array(scale.length * 2);
+  packed.set(scale, 0);
+  if (offset != null) {
+    if (offset.length !== scale.length) {
+      throw new Error(`LayerNorm offset is ${offset.length} channels and its `
+        + `scale is ${scale.length}`);
+    }
+    packed.set(offset, scale.length);
+  }
+  return packed;
 }
 
 const GRID_WIDTH = 32_768;
@@ -102,6 +140,24 @@ const RELATIVE_WIDTH = POSITION_BINS * 2 + 1 + (2 * MAX_RELATIVE_CHAIN + 2);
  * S[o] = sum over all 139 relative columns of scale[c] * W[c][o]. A constant of
  * the weights, so it is computed once here rather than per pair on the GPU.
  */
+/**
+ * O[o] = sum over the 139 relative columns of offset[c] * W[c][o].
+ *
+ * The LayerNorm offset is added AFTER the rescale, so its contribution through
+ * the projection is a constant vector - no mean, no inverse-std. That is why it
+ * folds here where the scale needs the closed form's two terms.
+ */
+export function relativeOffsetSums(offset, projection, pairChannels, outChannels) {
+  const sums = new Float32Array(outChannels);
+  for (let c = 0; c < RELATIVE_WIDTH; c += 1) {
+    const row = pairChannels + c;
+    for (let out = 0; out < outChannels; out += 1) {
+      sums[out] += offset[row] * projection[row * outChannels + out];
+    }
+  }
+  return sums;
+}
+
 export function relativeColumnSums(scale, projection, pairChannels, outChannels) {
   const sums = new Float32Array(outChannels);
   for (let c = 0; c < RELATIVE_WIDTH; c += 1) {
@@ -138,6 +194,12 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(1) var<storage, read> features: array<i32>;
 @group(0) @binding(2) var<storage, read> scale: array<f32>;
 @group(0) @binding(3) var<storage, read> projection: array<f32>;
+// 🔴 TWO VECTORS IN ONE BINDING: the closed form's S[o] in the first C_PAIR
+// slots, then the contribution of the LayerNorm OFFSET over the 139 relative
+// columns in the next - a constant of the weights exactly as S is. The
+// trunk-pair half's offset stays in the loop below, where its projection row is
+// read anyway. (No backticks in this comment: it is inside a JS template
+// literal, and one would end the string.)
 @group(0) @binding(4) var<storage, read> column_sums: array<f32>;
 @group(0) @binding(5) var<storage, read_write> pair: array<f32>;
 
@@ -197,8 +259,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var out = 0u; out < C_PAIR; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_PAIR; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse_std * scale[c]
-        * projection[c * C_PAIR + out];
+      value += ((trunk_pair[base + c] - mean) * inverse_std * scale[c]
+        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
     }
     // The set bins, minus the mean times every column's contribution.
     var gathered = scale[row_a] * projection[row_a * C_PAIR + out]
@@ -207,7 +269,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (same_entity) {
       gathered += scale[row_entity] * projection[row_entity * C_PAIR + out];
     }
-    value += inverse_std * (gathered - mean * column_sums[out]);
+    value += inverse_std * (gathered - mean * column_sums[out])
+      + column_sums[C_PAIR + out];
     pair[row * C_PAIR + out] = value;
   }
 }`;
@@ -227,6 +290,7 @@ const WIDTH: u32 = ${singleWidth}u;
 const NOISE_CHANNELS: u32 = ${noiseChannels}u;
 const EPSILON: f32 = 1.0e-5;
 const W_NOISE_SCALE: u32 = ${offsets.noiseEmbeddingInitialNormScale}u;
+const W_NOISE_OFFSET: u32 = ${offsets.noiseEmbeddingInitialNormOffset}u;
 const W_NOISE_PROJECT: u32 = ${offsets.noiseEmbeddingInitialProjection}u;
 
 @group(0) @binding(0) var<storage, read> trunk_single: array<f32>;
@@ -289,7 +353,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse_std = inverseSqrt(reduce_sum(local, centred) / f32(WIDTH) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < WIDTH; c += 64u) {
-    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c];
+    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c] + scale[WIDTH + c];
   }
 
   // The noise embedding is one row, shared by every token: normalise and
@@ -307,7 +371,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     / f32(NOISE_CHANNELS) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < NOISE_CHANNELS; c += 64u) {
-    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse * noise_weights[W_NOISE_SCALE + c];
+    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse
+      * noise_weights[W_NOISE_SCALE + c] + noise_weights[W_NOISE_OFFSET + c];
   }
   workgroupBarrier();
 
@@ -411,8 +476,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
-        * z_projection[c * C_PAIR + out];
+      value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
     }
     concatenated[out] = value;
   }
@@ -466,8 +531,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < WIDTH; c += 1u) {
-      value += (concatenated[c] - joint_mean) * joint_inverse * scale[c]
-        * projection[c * C_PAIR + out];
+      value += ((concatenated[c] - joint_mean) * joint_inverse * scale[c]
+        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
     }
     pair[row * C_PAIR + out] = value;
   }
@@ -515,8 +580,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
-        * z_projection[c * C_PAIR + out];
+      value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
     }
     concatenated[out] = value;
   }`,
@@ -749,12 +814,14 @@ export class Af3DiffusionConditioningGpu {
       const resident = (label, build) =>
         ({ buffer: residentWeightBuffer(this.device, weights, label, build) });
       const pairScale = onlyIfNew(() => resident("cond.pair-scale",
-        () => weights.pairCondInitialNormScale));
+        () => packNormWeights(weights.pairCondInitialNormScale,
+                              weights.pairCondInitialNormOffset)));
       const pairProjection = onlyIfNew(() => resident("cond.pair-projection",
         () => weights.pairCondInitialProjection));
       const sums = onlyIfNew(() => resident("cond.column-sums", () => columnSums));
       const zScale = split
-        ? onlyIfNew(() => resident("cond.z-scale", () => weights.zTrunkNormScale))
+        ? onlyIfNew(() => resident("cond.z-scale",
+            () => packNormWeights(weights.zTrunkNormScale, weights.zTrunkNormOffset)))
         : undefined;
       const zProjection = split
         ? onlyIfNew(() => resident("cond.z-projection", () => weights.zTrunkProjection))
@@ -763,7 +830,8 @@ export class Af3DiffusionConditioningGpu {
         ? onlyIfNew(() => resident("cond.relpe-projection", () => weights.relpeProjection))
         : undefined;
       const singleScale = resident("cond.single-scale",
-        () => weights.singleCondInitialNormScale);
+        () => packNormWeights(weights.singleCondInitialNormScale,
+                              weights.singleCondInitialNormOffset));
       const singleProjection = resident("cond.single-projection", () => {
         const matrix = weights.singleCondInitialProjection;
         const bias = weights.singleCondInitialProjectionBias;

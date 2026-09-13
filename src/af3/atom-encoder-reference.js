@@ -601,6 +601,14 @@ export function atomCrossAttentionEncoder(input, weights, onStage) {
            queriesCond, keysCond, pairCond: pair };
 }
 
+/** boltz2's mol_type class: protein 0, DNA 1, RNA 2, ligand 3. */
+function molTypeOf(input, token) {
+  if (input.isLigand?.[token]) return 3;
+  if (input.isRna?.[token]) return 2;
+  if (input.isDna?.[token]) return 1;
+  return 0;
+}
+
 /**
  * `target_feat`: the 447 columns everything in the trunk is built from.
  *
@@ -622,7 +630,46 @@ export function targetFeatures(input, tokens, dialect) {
   // expected 26112".
   const restypes = 31;
   if (dialect?.targetFeatAtomOnly === true) {
-    return Float32Array.from(input.atomFeatures.subarray(0, tokens * 384));
+    const output = Float32Array.from(input.atomFeatures.subarray(0, tokens * 384));
+    const sum = input.sum;
+    if (sum == null) return output;
+    // 🔴 SIX MORE TERMS, ADDED. boltz2's InputEmbedder is a SUM at
+    // seq_channel, not a concatenation: the atom encoder's token activation
+    // plus six bias-free projections. Four of them are constant on an ordinary
+    // monomer and are trained NON-ZERO - the method row alone is a learned
+    // 384-vector added to every token - so leaving them out is not "omitting a
+    // feature nothing uses". Measured: target_feat 1.00e+0 against
+    // af3-any-model without them.
+    const channels = 384;
+    const add = (weights, width, value) => {
+      for (let token = 0; token < tokens; token += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          let total = 0;
+          for (let k = 0; k < width; k += 1) {
+            const v = value(token, k);
+            if (v !== 0) total += v * weights[k * channels + c];
+          }
+          output[token * channels + c] += total;
+        }
+      }
+    };
+    // restype one-hot, 31 classes
+    add(sum.resType, restypes, (token, k) => (input.aatype[token] === k ? 1 : 0));
+    // [profile (31) | deletion mean (1)]
+    add(sum.msaProfile, restypes + 1, (token, k) => (k < restypes
+      ? input.profile[token * restypes + k] : input.deletionMean[token]));
+    // mol_type: protein 0, DNA 1, RNA 2, ligand 3
+    add(sum.molType, 4, (token, k) => (molTypeOf(input, token) === k ? 1 : 0));
+    // the cyclic flag: PRESENT or absent, not the period. Zero on every
+    // ordinary input, so the trained weight only ever acts on a cyclic one.
+    add(sum.cyclic, 1, (token) => Math.min(1, Math.max(0, input.cyclicPeriod?.[token] ?? 0)));
+    // `method` is the experimental method the prediction asks for, and the
+    // default is x-ray diffraction: class 1 of 12, the same for every token.
+    add(sum.method, 12, (_token, k) => (k === 1 ? 1 : 0));
+    // `modified` marks the tokens of a modified residue; row 0 is a learned
+    // non-zero vector, so this term is present even when nothing is modified.
+    add(sum.modified, 2, (token, k) => ((input.isModified?.[token] ? 1 : 0) === k ? 1 : 0));
+    return output;
   }
   const width = restypes * 2 + 1 + 384;
   const output = new Float32Array(tokens * width);
