@@ -39,6 +39,7 @@ import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 import { shapedKnob } from "../runtime/device-profile.js";
+import { SOURCES } from "../runtime/weight-sources.js";
 
 /**
  * Which labels in a caller's `staticCache` already hold their contents.
@@ -73,7 +74,14 @@ const BLOCK_ORDER = [
  */
 export const blockOrderFor = (upGate) =>
   (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
-export const blockHasUpGate = (block) => block?.ffwAToB != null;
+/**
+ * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate`. A bound block's fields
+ * decode when read, so asking the VALUE whether it exists unpacks it.
+ */
+export const blockHasUpGate = (block) => {
+  const sources = block?.[SOURCES];
+  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
+};
 
 
 /**

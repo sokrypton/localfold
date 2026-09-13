@@ -33,6 +33,7 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
+import { SOURCES } from "../runtime/weight-sources.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_RELATIVE_IDX = 32;
@@ -71,7 +72,15 @@ const ORDER = [
  */
 const embedderOrder = (bondTypes) =>
   (bondTypes ? [...ORDER, "tokenBondsTypeEmbed", "contactEncodingUnspecified"] : ORDER);
-export const hasBondTypes = (weights) => weights?.tokenBondsTypeEmbed != null;
+/**
+ * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate` in
+ * diffusion-transformer-webgpu.js. Reading a bound field decodes it.
+ */
+export const hasBondTypes = (weights) => {
+  const sources = weights?.[SOURCES];
+  return sources === undefined
+    ? weights?.tokenBondsTypeEmbed != null : sources.tokenBondsTypeEmbed != null;
+};
 
 export function packEmbedderWeights(weights) {
   const order = embedderOrder(hasBondTypes(weights));

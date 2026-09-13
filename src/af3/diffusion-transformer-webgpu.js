@@ -84,7 +84,19 @@ export const BLOCK_ORDER = [
  */
 export const txBlockOrder = (upGate) =>
   (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
-export const txHasUpGate = (block) => block?.ffwAToB != null;
+/**
+ * 🔴 ASKED OF THE THUNK, NOT OF THE VALUE. A bound block's fields are getters
+ * that DECODE when read, so `block.ffwAToB != null` materialises a 768x1536
+ * tensor out of int5 just to find out whether it exists - and this is asked
+ * once per block per sampler step. A 200-step boltz2 fold spent 9.1 s of its
+ * 10.2 s in the token transformer STAGE with the GPU idle, against AlphaFold
+ * 3's 0.28 s, and none of it was arithmetic. Same trap CLAUDE.md records for
+ * `blockWeightOffsets` reading `.length`.
+ */
+export const txHasUpGate = (block) => {
+  const sources = block?.[SOURCES];
+  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
+};
 
 /**
  * 🔴 THE UPLOAD WAS THE FLOOR, NOT THE ARITHMETIC. A block is ~26 MB, so the

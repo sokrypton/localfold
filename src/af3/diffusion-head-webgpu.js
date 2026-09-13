@@ -52,6 +52,31 @@ export function scalings(noiseLevel) {
  * conditioning going into the transformer and for the transformer's output.
  */
 /**
+ * The head's two packed LayerNorms, once per weight bundle.
+ *
+ * 🔴 `residentWeightBuffer` KEYS ON THE ARRAY'S IDENTITY, so building the
+ * packed [scale | offset] at the call site handed it a NEW key every step: a
+ * fresh resident buffer per sampler step, never reused and never freed. A
+ * 200-step boltz2 fold spent 37.6 s in its sampler against AlphaFold 3's 2.7
+ * with the GPU 92% IDLE - the arithmetic was never the problem. The bundle is
+ * held for a fold's whole life, which is what makes it the right key.
+ */
+const HEAD_NORMS = new WeakMap();
+
+function headNorms(weights) {
+  let packed = HEAD_NORMS.get(weights);
+  if (packed === undefined) {
+    packed = {
+      singleCondEmbedding: packNormWeights(weights.singleCondEmbeddingNormScale,
+                                           weights.singleCondEmbeddingNormOffset),
+      output: packNormWeights(weights.outputNormScale, weights.outputNormOffset),
+    };
+    HEAD_NORMS.set(weights, packed);
+  }
+  return packed;
+}
+
+/**
  * 🔴 `scale` IS [scale | offset], ALWAYS. Ten of boltz2's diffusion LayerNorms
  * carry a trained offset where AlphaFold 3's carry none, and a zero offset IS
  * the scale-only LayerNorm - so both this and the two shaders below read the
@@ -620,6 +645,7 @@ export class Af3DiffusionHeadGpu {
     // is the host array the encoder's and the transformer's own caches are
     // keyed on. That call is one step in two hundred.
     const chained = cachedPair !== undefined;
+
     const { subsets, queries } = input.shape;
     const queryRows = subsets * queries;
     const shapeKey = `${tokens}:${dense}:${queryRows}:${weights.encoder.channels}`
@@ -723,8 +749,7 @@ export class Af3DiffusionHeadGpu {
     const projected = await stage("single-projection", () => this.#normaliseAndProject(
       chained ? chain.condSingle : cond.single,
       tokens, weights.seqChannels, weights.perTokenChannels,
-      packNormWeights(weights.singleCondEmbeddingNormScale,
-                      weights.singleCondEmbeddingNormOffset),
+      headNorms(weights).singleCondEmbedding,
       weights.singleCondEmbeddingProjection,
       chained ? { into: chain.act, validation: deferred } : {}));
     let act;
@@ -757,12 +782,11 @@ export class Af3DiffusionHeadGpu {
       if (!chained) {
         return normaliseAndProject(
           transformed.output, tokens, weights.perTokenChannels, weights.perTokenChannels,
-          packNormWeights(weights.outputNormScale, weights.outputNormOffset), null);
+          headNorms(weights).output, null);
       }
       await this.#normaliseOnly(transformed.outputBuffer, chain.normalised, tokens,
                                 weights.perTokenChannels,
-                                packNormWeights(weights.outputNormScale,
-                                                weights.outputNormOffset), deferred);
+                                headNorms(weights).output, deferred);
       return undefined;
     });
 

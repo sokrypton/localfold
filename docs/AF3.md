@@ -2848,3 +2848,47 @@ which `dump_af3_confidence.py` does not build, and its trunk runs through
 `fold-opendde.js`, which has no `--trunk-oracle=`. Both are reachable - the
 reference's `confidence_parity.ours_opendde` is the entry point for one and the
 taps already work for the other - and neither has been done.
+
+### What the two new models COST, and the 5.4x that was hiding in a presence test
+
+68 tokens, int5 bundles, 200 diffusion steps, warm fold (the second of two):
+
+| | trunk | diffusion | total | peak device | trunk at 256 tokens |
+|---|---:|---:|---:|---:|---:|
+| alphafold3 | 0.3 s | 2.7 s | **3.1 s** | 983 MiB | 917 ms |
+| **boltz2** | 0.4 | 4.7 | **5.2** | **1535** | 1044 |
+| **protenix2** | 0.6 | 2.8 | **3.5** | 1297 | 1962 |
+
+boltz2 is 1.7x AlphaFold 3 for 1.6x the device memory, which is what its shape
+costs: 64 pairformer blocks against 48, an 8-block confidence stack against 4,
+and a token transformer carrying a third projection per block. Its peak is 513
+MiB of resident diffusion-transformer blocks, 270 of trunk single transitions
+and 204 of MSA scratch. protenix2's trunk is 2.1x AF3's at 256 tokens - its pair
+track is 256 channels wide against 128 - while its diffusion is the same.
+
+🔴 **AND boltz2's SAMPLER WAS 193 ms A STEP BEFORE THIS, AGAINST AlphaFold 3's
+13.** Not a leak - flat from 25 steps to 200 - and not arithmetic: the GPU was
+**92% IDLE** through a denoiser call, 21 ms of work in a 267 ms span, with the
+same ten submits and the same 309 passes AF3 has. The head's own stage timers
+put 9.1 s of a 10.2 s 50-step fold in the TOKEN TRANSFORMER stage, whose GPU
+kernels are under 2 ms.
+
+It was the presence test for the up-gate. `txHasUpGate(block)` read
+`block.ffwAToB != null` - and a bound block's fields are THUNKS that decode when
+read, so asking whether the tensor exists unpacked a 768x1536 int5 tensor, once
+per block per sampler step. Asking the SOURCES map instead is the same answer
+for free:
+
+    boltz2, 50 steps    diffusion 10.2 s -> 1.9 s
+    boltz2, 200 steps   diffusion 38.6 s -> 4.7 s
+
+Three tests in this session had the same shape - `blockHasUpGate` in the atom
+stacks and `hasBondTypes` in the embedder - and all three now ask the thunk.
+It is CLAUDE.md's own note about `blockWeightOffsets` reading `.length`, one
+convention later: **a bound weight field is not a value, and `!= null` on one is
+a decode.**
+
+🔴 **AND `bench-trunk.js` COULD NOT MEASURE EITHER MODEL** until this: it passed
+the imported `DIALECT` constant rather than the bundle's, so pointing it at
+boltz2 or protenix2 died in `emptyFusedFeatures` before producing a number. Same
+fault docs/PARITY.md records across the checkers.

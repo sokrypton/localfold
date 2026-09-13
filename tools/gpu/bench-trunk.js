@@ -33,7 +33,7 @@ import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { profileDevice } from "./profile.js";
 import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
 
@@ -124,7 +124,13 @@ export async function main(device, args) {
       // passed any, so every run of it died in #distogram before reaching a
       // number. All-protein is what a single chain of amino acids is.
       contactClasses: new Int32Array(tokens),
-    }, weights.trunk, DIALECT, { onStage: (name, ms) => { timings[name] = Math.round(ms); } });
+      // 🔴 THE BUNDLE'S DIALECT, NOT AlphaFold 3's. This passed the imported
+      // `DIALECT` constant, so pointing it at boltz2 or protenix2 died in
+      // `emptyFusedFeatures` - "emptyTemplateRestypeColumns has no default" -
+      // and no trunk timing for either model could be taken at all. Same fault
+      // docs/PARITY.md records across the checkers: a tool pinned to one
+      // model's constants cannot measure a second.
+    }, weights.trunk, af3Dialect(store), { onStage: (name, ms) => { timings[name] = Math.round(ms); } });
     previousPair = trunk.pair;
     previousSingle = trunk.single;
     perPass.push({ pass, whole: Math.round(performance.now() - started), ...timings });
