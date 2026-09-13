@@ -1335,6 +1335,9 @@ export class Af3AtomEncoderGpu {
     if (keyMasked === undefined) {
       throw new Error("atom blocks carry no keyMaskedAtomAttention");
     }
+    // 🔴 boltz2 QUERIES ON THE PER-ATOM FEATURES BEFORE s_trunk. AF3 uses one
+    // array for the query activation and the conditioning; this splits them.
+    const preTrunkQuery = input.dialect?.preTrunkQuery === true;
     const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
     if (chainedNorm === undefined) {
       throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
@@ -1355,7 +1358,7 @@ export class Af3AtomEncoderGpu {
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:rt${shape.outputRowTile ?? "d"}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
-      + `:${perBlockPair}:${chainedNorm}:${keyMasked}`;
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}:${preTrunkQuery}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -1586,6 +1589,14 @@ export class Af3AtomEncoderGpu {
       // Only where the dialect chains; see the note at the dispatch.
       const normalisedQueries = chainedNorm
         ? alloc("atom.normalised-queries", queryRows * channels * 4) : null;
+      const queriesPre = preTrunkQuery
+        ? alloc("atom.q-pre", queryRows * channels * 4) : null;
+      const queriesPreMask = preTrunkQuery
+        ? alloc("atom.q-pre-mask", queryRows * 4) : null;
+      const trunkZero = preTrunkQuery
+        ? keep(this.allocator.upload("atom.trunk-zero",
+                                     new Float32Array(tokens * channels), storage))
+        : null;
       const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
@@ -1680,8 +1691,19 @@ export class Af3AtomEncoderGpu {
         run("pair-logits", compiled.pairLogits, [pair, pairWeights, logits], pr[0], pr[1]);
       }
       // ...and this one reads the noisy positions, so it runs every time.
+      // 🔴 THE SAME SHADER WITH A ZEROED TRUNK TERM, rather than a second one.
+      // `build-queries` is conditioning + token_to_atom(s_trunk); running it
+      // against zeros gives exactly the per-atom half, which is what boltz2's
+      // queries read. One extra pass over queryRows, and only where the dialect
+      // asks - AF3 never allocates either buffer.
+      if (preTrunkQuery) {
+        run("build-queries-pre", compiled.buildQueries,
+            [conditioning, atomMask, gatherBuffer, trunkZero, queriesPre,
+             queriesPreMask], qr[0], qr[1]);
+      }
       run("build-act", compiled.buildAct,
-          [queriesCond, queriesMask, positions, gatherBuffer, pairWeights, act], qr[0], qr[1]);
+          [preTrunkQuery ? queriesPre : queriesCond, queriesMask, positions,
+           gatherBuffer, pairWeights, act], qr[0], qr[1]);
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];

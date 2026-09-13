@@ -45,6 +45,16 @@ export function perAtomConditioning(reference, tokens, dense, weights, dialect) 
     for (let index = 0; index < act.length; index += 1) act[index] += contribution[index];
   };
 
+  // 🔴 ...and boltz2's single bias over the whole concatenation, added once.
+  // Its features go through ONE Linear where AF3 sums five bias-free ones, so
+  // this term has no per-feature home: it is a constant vector on every atom.
+  if (weights.embedAtomFeaturesBias != null) {
+    const bias = weights.embedAtomFeaturesBias;
+    for (let index = 0; index < rows; index += 1) {
+      for (let c = 0; c < channels; c += 1) act[index * channels + c] += bias[c];
+    }
+  }
+
   const maskColumn = new Float32Array(rows);
   for (let index = 0; index < rows; index += 1) maskColumn[index] = reference.mask[index];
   add(linear(maskColumn, rows, 1, channels, weights.embedRefMask));

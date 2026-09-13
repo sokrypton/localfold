@@ -103,3 +103,6 @@ natives
 # tools/gpu/bench-jaxjs-matmul.js wants @jax-js/jax's dist copied here.
 /.jaxjs-tmp
 .ipynb_checkpoints/
+
+# Exported weight bundles: gigabytes of generated tensors, never repository content.
+model-*/

@@ -129,9 +129,118 @@ export async function main(device, args) {
 
   const expected = Float32Array.from(dump.output.data);
   const rms = (a) => Math.sqrt(a.reduce((s, v) => s + v * v, 0) / a.length);
+  // 🔴 THE REFERENCE'S OWN SEAMS, when a stage dump is beside the answer.
+  // Every per-stage arm below this is a GPU-against-CPU differential - it says
+  // the port agrees with ITSELF and cannot say where it stops agreeing with the
+  // reference, which is useless exactly when the whole step is uncorrelated.
+  // `dump_af3_denoise_stages.py` traces af3-any-model's four seams; with it,
+  // the FIRST stage over bound is the defect and everything after it is that
+  // stage's error carried forward.
+  const stagePath = option(args, "stage-dump",
+    `/oracle-dumps/af3-oracle-stages-${option(args, "name", "protenix2")}.json`);
+  const stageResponse = await fetch(stagePath);
+  const native = stageResponse.ok ? (await stageResponse.json()).stages : null;
+  if (native === null) console.log(`  (no stage dump at ${stagePath})`);
+  // 🔴 AND THE MODULES INSIDE A SEAM, when a scope dump is beside it.
+  // `dump_af3_scopes.py` traces every hk.Module output, so a conditioning that
+  // is 1.65x too large can be attributed to its initial projection, its noise
+  // embedding or one of its two transitions rather than to "the conditioning".
+  // The map is here rather than in the reference because the reference's stage
+  // names are this port's and the scope names are haiku's.
+  const scopePath = option(args, "scope-dump",
+    `/oracle-dumps/af3-oracle-scopes-${option(args, "name", "protenix2")}.json`);
+  const scopeResponse = await fetch(scopePath);
+  const scopes = scopeResponse.ok ? (await scopeResponse.json()).scopes : null;
+  const SCOPE_OF = {
+    "conditioning.pairInitial": "diffusion_head/pair_cond_initial_projection",
+    "conditioning.singleInitial": "diffusion_head/single_cond_initial_projection",
+    "encoder.pairCondRow": "diffusion_head/diffusion_single_to_pair_cond_row",
+    "encoder.pairCondCol": "diffusion_head/diffusion_single_to_pair_cond_col",
+    "encoder.trunkPair": "diffusion_head/diffusion_embed_trunk_pair_cond",
+    "encoder.pairMlp3": "diffusion_head/diffusion_pair_mlp_3",
+    "encoder.projectForAggr": "diffusion_head/diffusion_project_atom_features_for_aggr",
+    "encoder.embedPairOffsets": "diffusion_head/diffusion_embed_pair_offsets",
+    "encoder.embedPairDistances": "diffusion_head/diffusion_embed_pair_distances",
+    "encoder.embedPairOffsetsValid": "diffusion_head/diffusion_embed_pair_offsets_valid",
+    "encoder.pairMlp1": "diffusion_head/diffusion_pair_mlp_1",
+    "encoder.pairMlp2": "diffusion_head/diffusion_pair_mlp_2",
+    "encoder.pairLogits":
+      "diffusion_head/diffusion_atom_transformer_encoder/pair_logits_projection",
+    "encoder.stackOut": "diffusion_head/diffusion_atom_transformer_encoder",
+    "encoder.tokenAct": "encoder.tokenAct",
+    "encoder.skipConnection": "encoder.skipConnection",
+  };
+  const against = (label, ours) => {
+    const entry = native?.[label] ?? scopes?.[SCOPE_OF[label] ?? label];
+    if (entry === undefined || ours === undefined) return;
+    if (entry.data === undefined) {
+      // 🔴 rms ALONE WHERE THE TENSOR WAS NOT CAPTURED. Weak - two different
+      // tensors can share an rms - but it costs nothing and the scope dump
+      // records it for all ~124 modules, so a term that is the wrong SIZE is
+      // named without a second 40 MB round trip.
+      console.log(`  native ${label}\t(rms only)\tours ${rms(ours).toFixed(4)}`
+        + `\tnative ${entry.rms.toFixed(4)}`);
+      return;
+    }
+    const want = Float32Array.from(entry.data);
+    if (want.length !== ours.length) {
+      console.log(`  native ${label}\tLENGTH ${ours.length} vs ${want.length}`);
+      return;
+    }
+    const score = relativeRms(ours, want);
+    let extra = "";
+    // 🔴 WHERE THE ERROR SITS, NOT ONLY HOW BIG IT IS. An rms that matches to
+    // four decimals beside a relRMS of 4.5e-3 is a MISPLACED tensor, not a
+    // rescaled one - so a checker that prints only the ratio cannot tell a
+    // gather index from a rounding mode. `spread` is the fraction of elements
+    // carrying a tenth of the worst difference: near 1 is diffuse (arithmetic),
+    // near 0 is a handful of entries (an index, a mask, a layout).
+    if (score > 1e-5) {
+      let worst = 0;
+      for (let i = 0; i < want.length; i += 1) {
+        const d = Math.abs(ours[i] - want[i]); if (d > worst) worst = d;
+      }
+      let hot = 0;
+      for (let i = 0; i < want.length; i += 1) {
+        if (Math.abs(ours[i] - want[i]) > worst * 0.1) hot += 1;
+      }
+      extra = `\tmax|d| ${worst.toExponential(2)} spread ${(hot / want.length).toExponential(1)}`;
+      // 🔴 AND WHICH ROWS, when the error is concentrated. A `spread` of 1.2e-2
+      // over a (tokens, channels) tensor is one token's worth of elements, and
+      // "one token" and "every token a little" are completely different faults.
+      if (hot / want.length < 0.2 && want.length % tokens === 0) {
+        const width = want.length / tokens;
+        const rows = [];
+        for (let t = 0; t < tokens; t += 1) {
+          let row = 0;
+          for (let c = 0; c < width; c += 1) {
+            const d = Math.abs(ours[t * width + c] - want[t * width + c]);
+            if (d > row) row = d;
+          }
+          if (row > worst * 0.1) rows.push(t);
+        }
+        extra += `\trows ${rows.length}${rows.length <= 8 ? ` [${rows}]` : ""}`;
+      }
+    }
+    console.log(`  native ${label}\t${score.toExponential(2)}`
+      + `\tours rms ${rms(ours).toFixed(4)}\tnative rms ${rms(want).toFixed(4)}${extra}`);
+  };
+
+
   const results = {};
+  // Our own `act` at the transformer's input, kept so the arms below can
+  // interpolate between it and the reference's.
+  let cpuAct = null;
   if (option(args, "cpu", "on") !== "off") {
-    const cpu = diffusionHead(input, weights, encodeCpu);
+    // 🔴 THE STAGES COME OUT OF THE SHIPPED HEAD, NOT OUT OF A COPY OF IT. The
+    // per-stage arms used to rebuild the pipeline here, and the rebuild fed the
+    // atom encoder the RAW trunk pair where the head feeds it the CONDITIONING
+    // pair - so `encoder.trunkPair` read 1.13e+0 on a model whose encoder is
+    // right, and would have read the same on one whose encoder is wrong.
+    const cpu = diffusionHead(input, weights, encodeCpu, (label, value) => {
+      if (label === "transformer.act") cpuAct = Float32Array.from(value);
+      against(label, value);
+    });
     results.cpu = relativeRms(cpu, expected);
     console.log(`denoise CPU\ttokens=${tokens} noise=${dump.noise}`
       + `\trelRMS ${results.cpu.toExponential(2)}`
@@ -155,7 +264,10 @@ export async function main(device, args) {
       trunkSingleCond: input.trunkSingle,
       trunkPairCond: raw("pair"),
     };
-    const cpuEnc = encodeCpu(shared, weights.encoder);
+    const cpuEnc = encodeCpu(shared, weights.encoder,
+      (label, value) => against(label, value));
+    against("encoder.tokenAct", cpuEnc.tokenAct);
+    against("encoder.skipConnection", cpuEnc.skipConnection);
     const gpuEnc = await new Af3AtomEncoderGpu(device).run(shared, weights.encoder, {});
     for (const key of ["tokenAct", "skipConnection"]) {
       if (cpuEnc[key] === undefined || gpuEnc[key] === undefined) continue;
@@ -165,7 +277,8 @@ export async function main(device, args) {
 
     // ...and the TOKEN TRANSFORMER, which is the first stage that reads the
     // conditioning pair at this model's own width (256 here, 128 under AF3).
-    const cond = diffusionConditioning(input, weights.conditioning);
+    const cond = diffusionConditioning(input, weights.conditioning,
+      (label, value) => against(label, value));
     // 🔴 THE REAL ACTIVATION, NOT A SYNTHETIC ONE. A made-up `act` made this arm
     // useless: AlphaFold 3 scored 3.83e-2 on it while its whole head agrees to
     // 9.87e-4, so the number said nothing about either. This is what the head
@@ -178,8 +291,12 @@ export async function main(device, args) {
       weights.singleCondEmbeddingProjection);
     const act = Float32Array.from(cpuEnc.tokenAct);
     for (let i = 0; i < act.length; i += 1) act[i] += projected[i];
+    against("conditioning.single", cond.single);
+    against("conditioning.pair", cond.pair);
+    against("transformer.act", act);
     const cpuTx = diffusionTransformer(act, cond.single, cond.pair, input.seqMask,
                                        tokens, weights.transformer);
+    against("transformer.out", cpuTx);
     const gpuTx = await new Af3DiffusionTransformerGpu(device).run(
       act, cond.single, cond.pair, input.seqMask, tokens, weights.transformer, {});
     console.log(`  token-transformer\t`
@@ -196,6 +313,8 @@ export async function main(device, args) {
                          blocks: weights.decoder.blocks.slice(0, decBlocks) };
     const cpuDec = atomDecoder(cpuTx, cpuEnc, { ...shared, shape: input.shape },
                                decWeights);
+    against("decoder.update", ArrayBuffer.isView(cpuDec) ? cpuDec
+            : (cpuDec?.output ?? cpuDec?.positions ?? cpuDec?.update));
     const gpuDec = await new Af3AtomDecoderGpu(device).run(
       cpuTx, cpuEnc, { ...shared, shape: input.shape }, decWeights, {});
     const pick = (v) => (ArrayBuffer.isView(v) ? v : (v?.output ?? v?.positions ?? v?.update));
@@ -222,6 +341,56 @@ export async function main(device, args) {
       .run(input, weights.conditioning, {});
     console.log(`  conditioning pair\t${relativeRms(gpuCond.pair, cpuCond.pair).toExponential(2)}`
       + `\tsingle ${relativeRms(gpuCond.single, cpuCond.single).toExponential(2)}`);
+  }
+
+  // 🔴 THE TOKEN TRANSFORMER FED THE REFERENCE'S OWN INPUT. A deep residual
+  // stack AMPLIFIES whatever it is handed - boltz2 enters it at 1.87e-4 and
+  // leaves at 2.15e-1, and both numbers are consistent with a transformer that
+  // is exactly right and a 1.33x-per-block growth. Re-running it on native's
+  // `transformer.act` separates the two readings in one arm: still 2e-1 means
+  // the blocks are wrong, ~1e-5 means everything after the atom encoder is
+  // right and the defect is upstream.
+  if (native?.["transformer.act"] !== undefined
+      && native?.["transformer.out"] !== undefined
+      && option(args, "tx-from-native", "on") !== "off") {
+    const cond = diffusionConditioning(input, weights.conditioning);
+    const theirAct = Float32Array.from(native["transformer.act"].data);
+    const ours = diffusionTransformer(theirAct, cond.single, cond.pair, input.seqMask,
+                                      tokens, weights.transformer);
+    const want = Float32Array.from(native["transformer.out"].data);
+    console.log(`  transformer from native act\t${relativeRms(ours, want).toExponential(2)}`
+      + `\tours rms ${rms(ours).toFixed(4)}\tnative rms ${rms(want).toFixed(4)}`);
+    // 🔴 AND THE ENVELOPE THAT SAYS WHAT THAT NUMBER IS WORTH. A deep residual
+    // stack with no normalisation between blocks amplifies its input, and how
+    // much is a property of the WEIGHTS - so "the transformer disagrees by X"
+    // is meaningless without knowing what a float32 rounding of its input is
+    // worth at its output. The same act perturbed by 1e-6 relative, run against
+    // itself: our reference accumulates in doubles and the oracle in float32,
+    // so an agreement at or below this envelope is as close as the two
+    // arithmetics can come.
+    const probe = Float32Array.from(theirAct);
+    let seed = 1;
+    for (let i = 0; i < probe.length; i += 1) {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      probe[i] += theirAct[i] * 1e-6 * ((seed / 0x7fffffff) * 2 - 1);
+    }
+    const shaken = diffusionTransformer(probe, cond.single, cond.pair, input.seqMask,
+                                        tokens, weights.transformer);
+    // ...and whether the gap is LINEAR in that perturbation, which separates an
+    // ill-conditioned map from a discrete decision taken differently. Half the
+    // actual input difference should give half the output difference if the
+    // stack is merely amplifying; anything else is a branch.
+    if (cpuAct !== null) {
+      const half = Float32Array.from(theirAct);
+      for (let i = 0; i < half.length; i += 1) half[i] += 0.5 * (cpuAct[i] - theirAct[i]);
+      const halfway = diffusionTransformer(half, cond.single, cond.pair, input.seqMask,
+                                           tokens, weights.transformer);
+      console.log(`  transformer half-step\t${relativeRms(halfway, ours).toExponential(2)}`
+        + `  (half the input gap; linear amplification halves the output gap)`);
+    }
+    console.log(`  transformer 1e-6 envelope\t`
+      + `${relativeRms(shaken, ours).toExponential(2)}`
+      + `  (what one float32 ulp on its input is worth at its output)`);
   }
 
   // 🔴 AND THE PURE INTERNAL DIFFERENTIAL, WHICH NEEDS NO ORACLE AT ALL. The

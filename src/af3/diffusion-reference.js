@@ -97,6 +97,16 @@ export function conditionedTransition(x, cond, rows, channels, factor, weights,
         * wide[row * intermediate * 2 + intermediate + i];
     }
   }
+  // 🔴 boltz2's EXTRA UP-GATE, and it is gated on `cond` as well as on the
+  // weight: boltz2's plain Transition - the one the diffusion conditioning's
+  // four transitions use - has NO up-gate, and only its adaLN-conditioned
+  // ConditionedTransitionBlock does. `cond === null` is exactly that
+  // distinction, which is why the branch sits above the unconditioned return.
+  if (cond !== null && weights[`${prefix}ffwAToB`]) {
+    const upGate = linear(normalised, rows, channels, intermediate,
+                          weights[`${prefix}ffwAToB`]);
+    for (let index = 0; index < gated.length; index += 1) gated[index] *= upGate[index];
+  }
   if (cond === null) {
     return linear(gated, rows, intermediate, channels,
                   weights[`${prefix}ffwTransition2`]);
@@ -288,7 +298,8 @@ export function diffusionConditioning(input, weights, onStage) {
     }
   } else if (split) {
     const compressedTrunk = linear(
-      layerNormSlow(trunkPair, pairs, trunkPairChannels, weights.zTrunkNormScale, null),
+      layerNormSlow(trunkPair, pairs, trunkPairChannels, weights.zTrunkNormScale,
+                    weights.zTrunkNormOffset ?? null),
       pairs, trunkPairChannels, pairChannels, weights.zTrunkProjection);
     const compressedRelative = linear(
       relative, pairs, weights.relativeWidth, pairChannels, weights.relpeProjection);
@@ -311,7 +322,8 @@ export function diffusionConditioning(input, weights, onStage) {
     }
   }
   let pair = linear(layerNormSlow(features2d, pairs, width,
-                                  weights.pairCondInitialNormScale, null),
+                                  weights.pairCondInitialNormScale,
+                                  weights.pairCondInitialNormOffset ?? null),
                     pairs, width, pairChannels, weights.pairCondInitialProjection);
   onStage?.("conditioning.pairInitial", pair);
   for (let index = 0; index < 2; index += 1) {
@@ -351,7 +363,8 @@ export function diffusionConditioning(input, weights, onStage) {
     }
   }
   const single = linear(layerNormSlow(features1d, tokens, singleWidth,
-                                      weights.singleCondInitialNormScale, null),
+                                      weights.singleCondInitialNormScale,
+                                      weights.singleCondInitialNormOffset ?? null),
                         tokens, singleWidth, seqChannels,
                         weights.singleCondInitialProjection,
                         weights.singleCondInitialProjectionBias ?? null);
@@ -364,7 +377,8 @@ export function diffusionConditioning(input, weights, onStage) {
                                   weights.fourierWeight, weights.fourierBias);
   const noiseChannels = embedded.length;
   const projected = linear(layerNormSlow(embedded, 1, noiseChannels,
-                                         weights.noiseEmbeddingInitialNormScale, null),
+                                         weights.noiseEmbeddingInitialNormScale,
+                                         weights.noiseEmbeddingInitialNormOffset ?? null),
                            1, noiseChannels, seqChannels,
                            weights.noiseEmbeddingInitialProjection);
   for (let token = 0; token < tokens; token += 1) {
@@ -455,7 +469,8 @@ export function atomDecoder(tokenAct, encoded, input, weights) {
     for (let c = 0; c < channels; c += 1) current[row * channels + c] *= encoded.queriesMask[row];
   }
   const normalised = layerNormSlow(current, queryRows, channels,
-                                   weights.atomFeaturesLayerNormScale, null);
+                                   weights.atomFeaturesLayerNormScale,
+                                   weights.atomFeaturesLayerNormOffset ?? null);
   const update = linear(normalised, queryRows, channels, 3,
                         weights.atomFeaturesToPositionUpdate);
   // ...and back to the token-atom layout the caller's coordinates live in.
@@ -533,7 +548,7 @@ export function diffusionHead(input, weights, encode, onStage) {
     // different tensors and AF3 uses both.
     trunkSingleCond: input.trunkSingle,
     trunkPairCond: cond.pair,
-  }, weights.encoder);
+  }, weights.encoder, onStage);
 
   onStage?.("scaled positions", scaled);
   onStage?.("encoder.tokenAct", encoded.tokenAct);
@@ -548,20 +563,25 @@ export function diffusionHead(input, weights, encode, onStage) {
   let act = encoded.tokenAct;
   const projected = linear(
     layerNormSlow(cond.single, tokens, weights.seqChannels,
-                  weights.singleCondEmbeddingNormScale, null),
+                  weights.singleCondEmbeddingNormScale,
+                  weights.singleCondEmbeddingNormOffset ?? null),
     tokens, weights.seqChannels, weights.perTokenChannels,
     weights.singleCondEmbeddingProjection);
   for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
 
   onStage?.("after single projection", act);
+  onStage?.("transformer.act", act);
   act = diffusionTransformer(act, cond.single, cond.pair, input.seqMask, tokens,
                              weights.transformer);
   onStage?.("transformer", act);
+  onStage?.("transformer.out", act);
   act = layerNormSlow(act, tokens, weights.perTokenChannels,
-                      weights.outputNormScale, null);
+                      weights.outputNormScale, weights.outputNormOffset ?? null);
 
+  onStage?.("output-norm", act);
   const update = atomDecoder(act, encoded, input, weights.decoder);
   onStage?.("decoder", update);
+  onStage?.("decoder.update", update);
 
   // 🔴 A BLEND, NOT A PREDICTION. See the note at the top of this file.
   const output = new Float32Array(input.positionsNoisy.length);

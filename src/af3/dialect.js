@@ -38,6 +38,7 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  preTrunkQuery: false,
   sampler: null,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
@@ -83,6 +84,7 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  preTrunkQuery: false,
   sampler: null,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
@@ -146,6 +148,7 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  preTrunkQuery: false,
   sampler: null,
   targetFeatAtomOnly: false,
   emptyTemplateRestypeColumns: null,
@@ -237,6 +240,7 @@ export const OPENDDE = Object.freeze({
  * a table this file has to keep in step.
  */
 export const PROTENIX2 = Object.freeze({
+  preTrunkQuery: false,
   sampler: null,
   targetFeatAtomOnly: false,
   templateStackOuterResidual: false,
@@ -417,6 +421,11 @@ export const BOLTZ2 = Object.freeze({
   opmRowCountNorm: true,
   reembedConfidencePair: true,
   rawRefCharge: true,
+  // 🔴 ITS QUERIES ARE THE PER-ATOM FEATURES BEFORE s_trunk, WHILE ITS
+  // CONDITIONING IS AFTER. AlphaFold 3 uses one array for both - the query
+  // activation starts as a copy of the conditioning - and boltz2, rosettafold3
+  // and chai1 need them split: q reads `a`, c reads `a + token_to_atom(s_trunk)`.
+  preTrunkQuery: true,
 });
 
 export const DIALECTS = Object.freeze({

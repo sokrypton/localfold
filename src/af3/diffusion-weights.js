@@ -6,7 +6,7 @@
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
 import {
-  af3Dialect, bind, dims, layer, stacked,
+  af3Dialect, bind, dims, layer, stacked, stackedIfPresent,
   trunkWeights, confidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights,
 } from "./weights.js";
@@ -71,6 +71,7 @@ const txStackFor = (perBlockPair) => {
  */
 function atomBlock(store, root, index) {
   const at = (leaf) => stacked(store, `${root}${leaf}`, index);
+  const maybe = (leaf) => stackedIfPresent(store, `${root}${leaf}`, index);
   return {
     qSingleCondLayerNormScale: at("qsingle_cond_layer_norm/scale"),
     qSingleCondScaleWeights: at("qsingle_cond_scale/weights"),
@@ -93,6 +94,16 @@ function atomBlock(store, root, index) {
     ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
     ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
     ffwTransition1: at("ffw_transition1/weights"),
+    // 🔴 boltz2's CONDITIONED TRANSITION HAS A THIRD PROJECTION. Its
+    // ConditionedTransitionBlock is `SwiGLU(a) * a_to_b(a)` where every other
+    // family here is `SwiGLU(a)` alone, so the up-gate multiplies the whole
+    // intermediate before the down-projection. Four stacks carry it - the
+    // trunk's atom encoder, the diffusion atom encoder and decoder, and the
+    // token transformer - and without it boltz2's atom stack came out at
+    // relRMS 8.18e-1 against af3-any-model with its pair logits exact to
+    // 9.11e-4, which is the signature of a term missing INSIDE the block.
+    // Null everywhere else, and `conditionedTransition` skips it then.
+    ffwAToB: maybe("ffw_a_to_b/weights"),
     ffwTransition2: at("ffw_transition2/weights"),
     ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
     ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
@@ -249,6 +260,16 @@ export async function targetFeatureWeights(store) {
       embedRefElement: await W("embed_ref_element"),
       embedRefCharge: await W("embed_ref_charge"),
       embedRefAtomName: await W("embed_ref_atom_name"),
+      // 🔴 boltz2 BUILDS THIS AS ONE Linear OVER THE CONCATENATED ATOM FEATURE
+      // VECTOR, and a plain Linear at that - so it carries a bias that AF3's
+      // per-feature bias-free Linears have no slot for. The reference measured
+      // dropping it: a constant 128-vector of std 0.134 off EVERY atom's
+      // embedding, about a quarter of the conditioning's own std, taking
+      // per-atom corr to 0.912 with byte-identical inputs and carrying into
+      // everything downstream.
+      embedAtomFeaturesBias:
+        store.manifest?.tensors?.[`${root}_embed_atom_features_bias`] === undefined
+          ? null : await store.tensor(`${root}_embed_atom_features_bias`),
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
@@ -298,9 +319,30 @@ export async function targetFeatureWeights(store) {
   };
 }
 
+/**
+ * A LayerNorm's trained OFFSET, where this bundle carries one.
+ *
+ * 🔴 TEN OF boltz2'S DIFFUSION LayerNorms ARE AFFINE AND AlphaFold 3's ARE
+ * SCALE-ONLY, and reading the scale alone put boltz2's whole score model at
+ * relRMS 1.60 - two uncorrelated tensors - with the very first thing built, the
+ * pair conditioning's initial projection, already at 1.45e-1. An offset is a
+ * per-channel constant added after the rescale, so dropping it is not a small
+ * error anywhere it feeds an adaLN.
+ *
+ * 🔴 AND IT IS READ FROM THE BUNDLE, NOT FROM A TABLE. af3-any-model states the
+ * ten scopes per model in `AFFINE_LAYER_NORMS`; here the converter has already
+ * answered the same question by emitting the tensor or not, so asking the store
+ * cannot drift from the weights the way a second list can. AF3's own bundle
+ * carries offsets on the transitions and the trunk norms and is unaffected -
+ * those call sites already read them.
+ */
+const offsetOf = async (store, name) =>
+  (store.manifest?.tensors?.[name] === undefined ? null : await store.tensor(name));
+
 /** The five reference embeddings the atom conditioning sums. */
 export async function atomReference(store) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   return {
     channels: 128,
     embedRefPos: await T("diffusion_embed_ref_pos/weights"),
@@ -308,6 +350,10 @@ export async function atomReference(store) {
     embedRefElement: await T("diffusion_embed_ref_element/weights"),
     embedRefCharge: await T("diffusion_embed_ref_charge/weights"),
     embedRefAtomName: await T("diffusion_embed_ref_atom_name/weights"),
+    // ...and the diffusion head's own copy of it; see targetFeatureWeights.
+    embedAtomFeaturesBias:
+      store.manifest?.tensors?.[`${HEAD}/diffusion_embed_atom_features_bias`] === undefined
+        ? null : await T("diffusion_embed_atom_features_bias"),
   };
 }
 
@@ -328,6 +374,7 @@ export async function atomReference(store) {
  */
 export async function conditioningWeights(store, dialect) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   const transition = async (prefix) => ({
     ffwLayerNormScale: await T(`${prefix}ffw_layer_norm/scale`),
     ffwLayerNormOffset: await T(`${prefix}ffw_layer_norm/offset`),
@@ -404,11 +451,13 @@ export async function conditioningWeights(store, dialect) {
           - dims(store, `${HEAD}/relpe_projection/weights`)[1]
         : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
     pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
+    pairCondInitialNormOffset: await O("pair_cond_initial_norm/offset"),
     pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
     // OpenDDE's two separate compressions; absent under AlphaFold 3, and the
     // reference branches on their presence.
     ...(splitPair ? {
       zTrunkNormScale: await T("z_trunk_norm/scale"),
+      zTrunkNormOffset: await O("z_trunk_norm/offset"),
       zTrunkProjection: await T("z_trunk_projection/weights"),
       relpeProjection: await T("relpe_projection/weights"),
     } : projectedRelpos ? {
@@ -417,6 +466,7 @@ export async function conditioningWeights(store, dialect) {
     pairTransitions: [await transition("pair_transition_0"),
                       await transition("pair_transition_1")],
     singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
+    singleCondInitialNormOffset: await O("single_cond_initial_norm/offset"),
     singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
     // 🔴 boltz2's PROJECTION CARRIES A BIAS AND NOBODY ELSE'S DOES. An absent
     // bias is not a zero one here only because nothing read it: the single
@@ -431,12 +481,14 @@ export async function conditioningWeights(store, dialect) {
     fourierWeight: await T("fourier_embedding_weight"),
     fourierBias: await T("fourier_embedding_bias"),
     noiseEmbeddingInitialNormScale: await T("noise_embedding_initial_norm/scale"),
+    noiseEmbeddingInitialNormOffset: await O("noise_embedding_initial_norm/offset"),
     noiseEmbeddingInitialProjection: await T("noise_embedding_initial_projection/weights"),
   };
 }
 
 export async function diffusionWeights(store, superBlocks = 6) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   // The atom stacks' dialect flags; see `atomBlockWith`.
   const dialect = af3Dialect(store);
   const transition = async (prefix) => ({
@@ -545,6 +597,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
         ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
         ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
         ffwTransition1: at("ffw_transition1/weights"),
+        // See `atomBlock`: boltz2's transition up-gate, nested two deep here.
+        ffwAToB: stackedIfPresent(store,
+          `${txStackFor(perBlockPair)}ffw_a_to_b/weights`, s * 4 + inner, 2),
         ffwTransition2: at("ffw_transition2/weights"),
         ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
         ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
@@ -566,8 +621,10 @@ export async function diffusionWeights(store, superBlocks = 6) {
     // embeds 768 where AlphaFold 3 embeds 384.
     seqChannels: conditioning.seqChannels, perTokenChannels: 768,
     singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
+    singleCondEmbeddingNormOffset: await O("single_cond_embedding_norm/offset"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),
     outputNormScale: await T("output_norm/scale"),
+    outputNormOffset: await O("output_norm/offset"),
     conditioning: conditioning,
     transformer: {
       // 🔴 `pairChannels: 128` WAS TYPED IN AND IT IS THE MODEL'S, NOT AF3's.
@@ -635,8 +692,10 @@ export async function diffusionWeights(store, superBlocks = 6) {
       pairLogitsProjections: encoderPairNorm.projection,
       pairNormPerBlock: encoderPairNorm.perBlock,
       lnormTrunkSingleCondScale: await T("diffusion_lnorm_trunk_single_cond/scale"),
+      lnormTrunkSingleCondOffset: await O("diffusion_lnorm_trunk_single_cond/offset"),
       embedTrunkSingleCond: await T("diffusion_embed_trunk_single_cond/weights"),
       lnormTrunkPairCondScale: await T("diffusion_lnorm_trunk_pair_cond/scale"),
+      lnormTrunkPairCondOffset: await O("diffusion_lnorm_trunk_pair_cond/offset"),
       embedTrunkPairCond: await T("diffusion_embed_trunk_pair_cond/weights"),
       atomPositionsToFeatures: await T("diffusion_atom_positions_to_features/weights"),
       projectAtomFeaturesForAggr: await T("diffusion_project_atom_features_for_aggr/weights"),
@@ -656,6 +715,7 @@ export async function diffusionWeights(store, superBlocks = 6) {
       projectTokenFeaturesForBroadcast:
         await T("diffusion_project_token_features_for_broadcast/weights"),
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),
+      atomFeaturesLayerNormOffset: await O("diffusion_atom_features_layer_norm/offset"),
       atomFeaturesToPositionUpdate: await T("diffusion_atom_features_to_position_update/weights"),
       blocks: [await atomBlockWith(store, decoderStackFor(atomPerBlock), 0, dialect),
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 1, dialect),

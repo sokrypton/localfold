@@ -169,6 +169,21 @@ export function stacked(store, name, index, dims = 1) {
   return thunk;
 }
 
+/**
+ * `stacked`, but null where the bundle does not carry the tensor at all.
+ *
+ * 🔴 FOR A CONVENTION A SECOND MODEL ADDS AND AlphaFold 3 HAS NO NAME FOR.
+ * boltz2's conditioned transition carries an extra up-gate (`ffw_a_to_b`) that
+ * every other family lacks, and asking `stacked` for it throws inside
+ * `store.shape`. Gating on the WEIGHT rather than on a model name is the same
+ * rule the LayerNorm offsets follow: the converter has already decided, and a
+ * second list of model names is a second thing to keep in step.
+ */
+export function stackedIfPresent(store, name, index, dims = 1) {
+  return store.manifest?.tensors?.[name] === undefined
+    ? null : stacked(store, name, index, dims);
+}
+
 /** Every tensor a descriptor will read, so their shards can be opened at once. */
 function fieldNames(fields, into = []) {
   for (const value of Object.values(fields)) {
