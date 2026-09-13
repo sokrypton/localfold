@@ -7,6 +7,54 @@ inventory: what LocalFold's own differential suite covers, what it cannot
 currently execute, and what the reference now offers that this repository does
 not.
 
+## 🔴 WHY THE SUITE COULD NOT BE DOWNLOADED: ITS DEFAULT REFERENCE IS UNPUBLISHABLE
+
+Both Hugging Face repositories are complete, and neither holds what the checkers
+open. They are different artefacts:
+
+| | what it holds | families |
+|---|---|---:|
+| `sokrypton/af3-any-model` | the reference's converted **blobs** (`.bin.zst`, AF3 graph format) - what `export_af3_model.py` READS | 9 |
+| `sokrypton/localfold` | LocalFold's browser **bundles** - and every one is int5, int3 or a plain AF2 export | 9 |
+
+**No float32 bundle is published in either.** `model-af3-full-f32`,
+`model-opendde-full-f32`, `model-esmc-600m-f32`, `model-multimer-f32` and
+`model.f32-backup` exist only on whichever machine last ran an exporter. That is
+the whole reason fifteen checkers answered 404 rather than comparing, and it is
+not neglect:
+
+🔴 **`openAf3Store()` DEFAULTS TO `/model-af3-full-f32/manifest.json`**
+(src/af3/weights.js:13), and **fourteen of the twenty AF3 checkers take no
+`--model=` at all**, so they open that constant and nothing else. Only six are
+model-aware.
+
+🔴 **AND THAT PARTICULAR BUNDLE CAN NEVER BE PUBLISHED.** DeepMind's AF3
+parameters carry a Prohibited Use Policy and terms forbidding redistribution -
+see docs/HOSTING.md and tools/oracle/dump_af3_trunk.py. So the suite's default
+reference is an artefact that legally cannot be downloaded, by anyone, ever. It
+has to be exported locally from weights each person obtains themselves, which is
+exactly how it was obtained here.
+
+**The way out is the six, not the fourteen.** Where a checker takes `--model=`
+and holds a bound that follows the bundle, the PUBLISHED int5 weights give a
+real comparison - looser, and real. Measured:
+
+    check-af3-block-any   PASS      check-af3-msa-block   PASS   (1.7x envelope)
+    check-af3-embedder    PASS      check-af3-template    PASS
+    check-af3-trunk       PASS      check-af3-diffusion-conditioning  404
+
+Five of six. So making the other fourteen take `--model=` - the fix CLAUDE.md
+already prescribes for a different reason, that they are "pinned to AlphaFold
+3's CONSTANTS" - would make parity reproducible on a fresh machine with nothing
+but the published bundles, and keep the f32 arm as the tighter check for anyone
+holding the weights.
+
+🔴 **AND THE OTHER THREE f32 BUNDLES HAVE NO SUCH RESTRICTION.** OpenDDE's come
+from aurekaresearch, ESM-C's are MIT, AF2-multimer's are DeepMind's public
+parameters already redistributed as `af2-multimer/` in the localfold repo. Those
+three - 2502, 2190 and 356 MiB - could be published beside the int5 ones, and
+five checkers stop needing a local export. Only AF3's cannot.
+
 ## 2026-09-12: NINETEEN OF TWENTY-ONE NOW RUN, AND FOUR OF THEM FOUND THINGS
 
 The section below is kept as written, because the shape of that failure is the
