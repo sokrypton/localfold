@@ -460,14 +460,17 @@ export async function templateWeights(store, dialect = undefined) {
   // so this is a packing and a naming difference rather than a different model
   // - but nothing about the names says so, and the AF3 loader simply cannot
   // find its tensors. See docs/AF3.md for the forward and the feature order.
-  const fused = dialect?.fusedTemplateEmbedder;
-  if (fused === undefined) {
-    throw new Error("dialect.fusedTemplateEmbedder has no default: AF3 sums "
-      + "nine template feature projections and protenix2 applies one to their "
-      + "concatenation, under different tensor names");
-  }
+  // 🔴 THE BUNDLE STATES WHICH, AND THE DIALECT IS CHECKED AGAINST IT RATHER
+  // THAN ASKED FIRST. `a_proj` exists or it does not; unlike
+  // `msaUpdateBeforeOuterProduct`, where both orderings load the same tensors
+  // and only the dialect can say, there is nothing to guess here. So a caller
+  // with no dialect - the weight-dimension tests build a synthetic store and
+  // have none - reads the module the tensors describe, and a caller WITH one
+  // still has it verified. Demanding the dialect outright broke three CPU
+  // tests that had no business carrying one.
   const hasFused = store.manifest?.tensors?.[`${TEMPLATE}/a_proj/weights`] !== undefined;
-  if (hasFused !== fused) {
+  const fused = dialect?.fusedTemplateEmbedder ?? hasFused;
+  if (dialect?.fusedTemplateEmbedder !== undefined && hasFused !== fused) {
     throw new Error(`this bundle ${hasFused ? "carries" : "does not carry"} `
       + "template a_proj and its dialect says otherwise");
   }
