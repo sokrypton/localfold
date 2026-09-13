@@ -5,6 +5,156 @@ got wrong once. Written to be read before touching any of it.
 
 `AGENTS.md` holds the invariants; this holds the state.
 
+
+## 🔴 THE MATRIX PAIR TRACK COSTS THREE ORDERS IN THE BLOCK, AND TWO CHECKERS PASS IT
+
+`check-af3-confidence.js` fails all four heads - pLDDT 1902x, PAE 3463x, PDE
+3718x, resolved 522x their envelope. It is not precision: `--f16=off` returns
+byte-identical numbers, and the head already pins `stagedPrecision`,
+`weightPrecision` and `accumulatePrecision` to f32.
+
+**It is not any one kernel either.** `tools/gpu/probe-confidence-kernels.js`
+runs the six updates of a block one at a time against the reference, on the
+bundle's REAL weights, and every one is clean on both stacks - at an all-ones
+mask and at the checker's 80% one, at input scale 1 and at the 177 the pair
+actually reaches:
+
+    triangle.outgoing 4.6e-7   grid.1 6.4e-7   pair-transition   4.8e-7
+    triangle.incoming 4.5e-7   grid.2 6.6e-7   single-transition 7.3e-7
+
+**The COMPOSED block is where it appears, and the trunk has it worse than the
+confidence head.** One block, real weights, f32 accumulators, against the
+reference's own `pairformerBlock`:
+
+| stack | GPU vs reference | 1e-7 rounding envelope | ratio |
+|---|---:|---:|---:|
+| confidence | 4.55e-3 | 1.02e-6 | **4469x** |
+| trunk | 2.03e-2 | 3.80e-6 | **5334x** |
+
+🔴 **AND IT IS THE DEVICE TUNING, NOT THE PORT'S ARITHMETIC.** The same block
+with `--no-prior` or `--default-tuning` reads **1.24e-5, 3.3x its envelope**.
+The ampere prior is what turns on the matrix kernels; the capability layer
+leaves `gridAttendMatrix` null. Removing them from the SHIPPED configuration,
+one at a time and then together:
+
+| trunk block, one block, real weights | BLOCK.pair | xEnvelope |
+|---|---:|---:|
+| shipped | 2.03e-2 | **5334x** |
+| minus `triangleProjectMatrix` | 3.74e-3 | 985x |
+| minus that and `gridProjectMatrix` | 2.82e-3 | 743x |
+| ...and `gridAttendMatrix` | 3.21e-4 | 84x |
+| the whole prior off | 1.24e-5 | 3.3x |
+
+🔴 **NO ONE KNOB OWNS IT - THEY COMPOUND, AND THAT IS WHY BISECTING FROM THE
+EMPTY SIDE LIED.** Restoring `gridAttendMatrix` alone onto an empty prior reads
+737x, which named it the culprit; removing it from the full prior changes
+5334x to 5334x. Both measurements are right and the first conclusion was wrong.
+`triangleProjectMatrix` is the largest single term from the full side (5.4x),
+and the last 84x to 3.3x survives every remaining knob tried individually -
+`matrixLinear`, `stagedMatrixBlock`, `attentionMatrix`, `attentionMatrixTile`,
+`attentionVectorScore`, `trianglePairProjectTile`, `transitionChunkBytes`,
+`attentionGroup`, `linearTallTile`, `pairTransitionSplitMinChannels` - and
+`--f16=off` does not move it either. **Subtract from the shipped configuration,
+never add to an empty one**, and expect a residue that only the whole prior
+explains.
+
+🔴 **AND `--tune=` IS NOT A HARNESS FLAG, WHICH COST THE FIRST BISECTION.**
+`gpu-chrome.mjs` handles `--tune-json=`, `--f16=`, `--occupancy`,
+`--default-tuning` and `--no-prior`; `--tune=key=value` is parsed by the eleven
+TOOLS that implement it (`fold.js`, `fold-af2.js`, `profile-af2-block.js` and
+friends), not by the runner. A tool that does not implement it - such as this
+probe when it was written - takes the flag, ignores it silently, and every arm
+reads identical. That is indistinguishable from a knob that does nothing, and
+it produced five such rows here before `--tune-json=` was used instead. **An
+unrecognised flag is silently ignored by every tool in this repository**, so an
+arm that changes nothing wants the flag checked before the knob is believed
+inert.
+
+🔴 **AND THERE ARE FOUR MATRIX KERNELS IN THE PAIR TRACK, NOT THREE.** Fifteen
+single-knob arms all read 84.4x before the answer came from printing what
+`compilePairTrack` actually RESOLVES under each configuration, which named it in
+one run. The four, every one carrying `matrixElement: "f16"`:
+
+    triangleProjectMatrix   gridProjectMatrix   gridAttendMatrix   pairTransitionSplit
+
+`pairTransitionSplit` is the last 84x to 3.3x, and it is not a knob anyone would
+look at for accuracy - its name and its documentation are both about SPEED (1.13x
+on AF3's 128 channels, 3.71x on OpenDDE's 384). **Print the resolved
+configuration before naming knobs.**
+
+🔴 **FIXED FOR THE CONFIDENCE HEAD, AND DELIBERATELY NOT FOR THE TRUNK.**
+`Af3PairformerStackGpu` takes `pairMatrixKernels: false`, and
+`Af3ConfidenceHeadGpu` sets it beside the three precision axes it already
+pinned - it had pinned three of four. On the SHIPPED tuning the head now reads
+stack pair **2.97e-6** where it read 3.93e-3, and all four heads pass: pLDDT
+201x, PAE **7.0x**, PDE **7.3x**, resolved 62.9x. The trunk keeps its matrix
+kernels and its speed.
+
+🔴 **AND THE TRUNK KEEPS THEM, BECAUSE THE APPROXIMATION IS THE POINT.** The
+four are worth **14% of a trunk pass** (911/946 ms against 1046/1044) and 27% of
+the pairformer (452/458 against 579/582), and running some of this port in f16
+to go faster is a deliberate trade. What was wrong was not the kernels but the
+BOUND, which priced only the three precision axes and so reported an accepted
+trade as a defect on every run. `check-af3-trunk` takes `--matrix=off` now and
+its pair bound follows the KERNEL, which is what check-evoformer-attention.js
+already does for the same reason:
+
+| arm | pair | contact | logits |
+|---|---:|---:|---:|
+| shipped: f16 axes + matrix | 1.12e-4 | 5.09e-3 | 7.21e-5 |
+| `--matrix=off` | 1.85e-5 | 3.76e-4 | 1.18e-5 |
+| `--matrix=off` + f32 axes | **6.66e-7** | 1.10e-4 | 4.90e-7 |
+
+🔴 **AND THE LAST ROW IS THE ONE THAT MATTERS, BECAUSE IT COULD NOT BE REACHED
+BEFORE.** Asking for `--staged=f32 --weights=f32 --accumulate=f32` used to
+return **1.12e-4, the same number as the f16 default** - the request reached
+none of the four kernels, so the f32 path was not being checked at all and had
+not been for as long as the prior has set them. It reaches 6.66e-7, 5.1x the
+rounding envelope, which is the evidence that the port's arithmetic is right and
+the 1.12e-4 is approximation rather than error. Without an arm that genuinely
+gets f32 there is no way to tell those two apart.
+
+🔴 **AND THE TRUNK HAS THREE PAIR TRACKS, WHICH IS WHY THE FIRST PIN DID
+NOTHING.** `pairMatrixKernels` wired into `pairformer-block-webgpu.js` alone
+moved an f32 request from 1.12e-4 to 1.11e-4: the MSA stack and the template
+embedder compile their own `compilePairTrack` and kept theirs. All three take
+the option now, and both of the other two had to learn to read it from the
+CONSTRUCTOR, because `Af3TrunkGpu` pins there while passing its run-time options
+to only two of the three `run`s.
+
+🔴 **BUT THE TRUNK'S OWN 5334x IS NOW AN OPEN QUESTION AND NOT A CLOSED ONE.**
+Nothing here says 2.03e-2 a block is acceptable over 48 of them; it says the
+confidence head could not afford it. `check-af3-trunk` holds 4e-5 and cannot
+currently run - it wants `dialect.msaUpdateBeforeOuterProduct` named - so the
+trunk's matrix path has no oracle check at all. A fold moves little
+(meanPlddt 85.8300957 shipped, 85.8303909 with the head pinned, 85.8337307 with
+the whole prior off), which is evidence about the MEAN and not about the pair
+representation those kernels actually compute.
+
+🔴 **AND THE KERNEL'S OWN CHECKER REPORTS IT AND PASSES.**
+`check-grid-attend-matrix.js` prints `matrixVsReference: 1.34e-3` beside
+`scalarVsReference: 1.51e-6` and returns `"ok": true`, because its bar is the
+f16 one (~1e-3) the matrix units warrant. That is defensible for the kernel and
+is not defensible for the CONFIDENCE head, which pins three precision axes to
+f32 precisely because pLDDT and PAE amplify - and `gridAttendMatrix` is a
+FOURTH axis it does not pin, so f16 matrix units run inside a head that
+believes it is in f32.
+
+🔴 **AND `check-af3-block.js` READS 3.93e-2 AT 68x ITS OWN ENVELOPE AND
+PASSES.** Its bound is `envelope * 300` when the accumulators are f16, and its
+envelope is 5.74e-4 because it builds its weight dict BY HAND: on random
+weights a pairformer block is chaotic and one kernel's worth of rounding grows
+560x over four blocks. On the bundle's real weights the same perturbation grows
+~3x. So the checker with synthetic weights has an envelope three orders too
+wide to see this, which is the whole reason a real-weights probe was needed.
+
+**What it costs a fold is small, and that is the last piece rather than the
+reassurance.** AF3 at int5, shipped against `--no-prior`: meanPlddt
+**85.8300957** and **85.8337307**. The trunk's 48 blocks do not amplify it the
+way the confidence head's tight envelopes do - but pLDDT and PAE are per residue
+and per pair on the page, and those differ at 1e-3 while their mean does not.
+
+
 ## What works
 
 A protein chain typed into `index.html` folds with AlphaFold 3 entirely in the
@@ -2158,3 +2308,587 @@ instrument, its unit and the shape of the rule; the threshold is not, and a
 default that silently drops a recycle should be worth more than that before it
 is one. `recycleDeltas` reports all three numbers on every fold, so the corpus
 can keep growing from runs people were doing anyway.
+
+## PROTENIX-V2: OPENDDE'S DIALECT WITH FOUR FLIPS, AND THREE THINGS THE TENSORS SETTLED
+
+Protenix-v2 (ByteDance, **Apache 2.0**, best-A **0.703** in the reference's
+table - the strongest model this port can legally serve). Added as a `BLOBS`
+entry and a dialect, with **no exporter change at all**: the trunk exported on
+the first attempt at 207 tensors, and the full bundle is 404 tensors /
+464.7 M parameters / 1773 MiB. That is `export_af3_model.py`'s own claim - "a
+second model becomes a different `--blob`, not a second exporter" - holding.
+
+**Its widths are the tensors' and none is written down.** 48 trunk blocks of 8
+triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four MSA
+blocks at c_m 128 with value_dim 8, a 64-bin distogram with a biased half-logit
+projection. Every one matches the reference's `PROTENIX2_SETTINGS`, which is
+what says `src/af3/weights.js`'s derivation works rather than a table here
+having to keep step.
+
+### What the assertions caught, one run each
+
+🔴 **`splitPairConditioning` WAS WRONG, AND THERE ARE THREE SHAPES NOT TWO.**
+Read off the reference's `DIFFUSION_PROJECTED_RELPOS` membership it looked like
+a `true`; `diffusion-weights.js` threw at once - *"this bundle does not carry
+z_trunk_projection and its dialect says otherwise"*. The tensors:
+
+| | relpos | trunk pair | `pair_cond_initial_projection` |
+|---|---|---|---|
+| AF3 | raw 139 | passed through | [267, 128] |
+| OpenDDE | projected | **also** projected | [256, 128] |
+| **protenix2** | projected | passed through | **[512, 256]** |
+
+512 is 256 + 256, `relpe_projection` is [139, 256] and there is no
+`z_trunk_projection`. So `splitPairConditioning` is OpenDDE's BOTH-projected
+case and protenix2 wanted a new `projectedRelpos`. The reference's list is about
+the featurisation; LocalFold's flag was about the tensor layout. They are not
+the same question and the guard is the only reason that took one run.
+
+🔴 **`padSingleCondUnknownDna` WAS WRONG TOO, COPIED FROM OpenDDE.** *"single
+conditioning is 831 channels but its LayerNorm scale is 833"*. protenix2 carries
+the two unknown-DNA columns where OpenDDE does not - both being
+OPENFOLD3_LINEAGE, which is exactly why this is a flag and not a lineage
+property.
+
+🔴 **AND `pairInitFromSingle` WAS SETTLED BY A SHAPE BEFORE ANYTHING RAN.**
+OpenDDE's `left_single` is [384, 384] and builds the pair from `s_init`; this
+bundle's is **[447, 256]**, so it builds it AlphaFold 3's way. The reference has
+no convention list for this - the shape is the statement - and
+`check-af3-embedder` passing is the confirmation.
+
+### Where it stands
+
+| | |
+|---|---|
+| `check-af3-block-any` | **PASS** - the pairformer computes its reference at protenix2's widths |
+| `check-af3-embedder` | **PASS** |
+| `check-af3-diffusion-conditioning` | **PASS** - initialPair 3.20e-7, widths 256/256/384 derived |
+| `check-af3-msa-block` | `fused weight has 131072 elements; expected 32768` - exactly 4x, which is c_m 128 against 64 times 8 heads against 4. A fused MSA weight is still sized from AlphaFold 3's constants |
+| `check-af3-trunk`, `check-af3-template` | `missing tensor .../single_template_embedding/query_embedding` - protenix2's template embedder has a different module tree (43 tensors), not just different widths |
+
+🔴 **AND TWO DECLARED FLAGS ARE NOT IMPLEMENTED, WHICH IS WHY A FOLD WOULD BE
+WRONG IN TWO PLACES THAT NO FOLD CAN SEE.** `preSymmetrisedPde` symmetrises the
+PDE logits before the head rather than after - the reference found it with
+`confidence_parity.py` reading pde corr **0.87** while pae, plddt and resolved
+were all at parity, and records that **no fold caught it**, because a symmetric
+plausibly-scaled error metric stays symmetric and plausible.
+`templateMeanOverAllSlots` divides the template term by every slot rather than
+the occupied ones. Both are in `PROTENIX2` and nothing reads them yet.
+
+### protenix2's template embedder is a different MODULE, and here is all of it
+
+`check-af3-trunk` and `check-af3-template` stop at
+`missing tensor .../single_template_embedding/query_embedding`, and the reason
+is not widths. protenix2 runs **boltz2's fused template module**, and the pieces
+correspond to AF3's one for one:
+
+| AF3 / OpenDDE | protenix2 | |
+|---|---|---|
+| `query_embedding_norm` + `template_pair_embedding_8` | `z_norm` + `z_proj` | renamed |
+| `output_layer_norm` + `output_linear` | `v_norm` + `u_proj` | renamed |
+| `template_pair_embedding_0..7`, nine projections summed | **`a_proj` [108, 64]**, one projection of the concatenation | **fused** |
+| `single_template_embedding/template_embedding_iteration` | `__layer_stack_no_per_layer/tmpl_pairformer` | renamed, one level up |
+
+A sum of projections of the parts IS one projection of their concatenation, so
+this is packing and naming, not a different model - which is what the
+reference's own note means by "its Protenix-specific bits are the CONVERTER's
+naming/feature conventions, not forward-graph shape".
+
+**The forward:**
+
+    v = z_proj(z_norm(z)) + a_proj(a_tij)
+    v = v + pairformer(v)   x2
+    v = v_norm(v)
+    aggregate over templates
+    u = u_proj(relu(u))
+
+**The 108-wide feature, in order** - `[disto(39), pb_ch(1), rt_j(32), rt_i(32),
+uvec(3), bb_ch(1)]`:
+
+- `disto` 39 bins, one-hot of CB-CB squared distance against
+  `linspace(3.25, 50.75, 39)**2` with the last upper edge at 1e8, masked by
+  `pb2d * asym_mask_2d`.
+- the frame is **Boltz's, not AF3's**: `e1 = norm(C - CA)`,
+  `e2 = norm((N - CA) - e1 ((N - CA).e1))`, `e3 = e1 x e2`, rot columns
+  `[e1, e2, e3]`; `uvec = R_i^T (ca_j - ca_i)`, normalised, masked by
+  `fr2d * asym_mask_2d`. N/CA/C come from rigid-group 0, whose atom order is
+  **[C, CA, N]** and not [N, CA, C].
+- restypes are **32**-class, not AF3's 31, through
+  `_AF3_TO_OF3 = range(21) + (31,) + (21,22,23,24) + (26,27,28,29) + (25,)`.
+
+🔴 **AND `rt_j` COMES BEFORE `rt_i`, WHICH IS NOT A TYPO.** protenix appends
+`expand_at_dim(aatype, -3)` then `expand_at_dim(aatype, -2)`, and the first
+inserts the new axis first, leaving the tensor varying along **j**. `a_proj` is
+converted with no column permutation, so the order has to be native's exactly.
+The reference records having these the other way round as worth **corr 0.9985
+against 0.999998**, unnoticed until `template_parity.py` existed.
+
+🔴 **AND THE DISTOGRAM IS MASKED BY THE MULTICHAIN MASK IN THE FORWARD, NOT
+ONLY BY pb2d IN THE FEATURISER.** Missing that half is invisible on a monomer
+and actively harmful on a complex: a distogram one-hot is nonzero for EVERY
+pair, so unmasked cross-chain entries are not zeros but confident FABRICATED
+inter-chain distances. Measured there: a template made a 146+74 heterodimer
+WORSE, interface 31.76 -> 46.76 A, while the same template rescues four other
+ports to 1-2 A.
+
+🔴 **WHAT IS DONE HERE, AND WHY THE FORWARD IS NOT.** `templateWeights` takes
+the dialect and loads either shape, guarded against the bundle
+(`fusedTemplateEmbedder` against `a_proj`'s presence), so protenix2's template
+weights load. The forward is deliberately NOT written yet: LocalFold's
+`check-af3-template` compares a GPU path against this repository's own CPU
+reference, so writing both halves from this specification would produce two
+pieces of new code agreeing with each other and a checker that cannot fail.
+That is the trap CLAUDE.md names - "verify against the oracle, not against our
+own reference" - and the ladder is the reference's `template_parity.py`, which
+is what found the `rt_j`/`rt_i` order above. Dump it first.
+
+### ...and the forward, written against the oracle, at 1.52e-7
+
+`tools/oracle/dump_af3_template.py` records af3-any-model's own
+`template_parity.ours` - that gate's entry point, real protenix2 weights, 34
+scopes mapped and 0 unmapped - as
+`oracle-dumps/af3-oracle-template-protenix2.json`: 76 tokens, the 108 feature
+columns and the module's output separately. `fusedTemplateEmbedding` in
+src/af3/template-reference.js is held to it by
+`tools/gpu/check-af3-template-fused.js` at **relRMS 1.52e-7**, ours rms 12.4434
+against native's 12.4434.
+
+🔴 **AND THE ORACLE EARNED ITS KEEP ON THE FIRST RUN.** The specification above
+says protenix concatenates the "j-varying block FIRST", and the reference
+records the other order as worth corr 0.9985 against 0.999998. Read literally
+that gives `restype_j` then `restype_i`, and that scores **5.77e-2** - which IS
+corr 0.9985. The right order against `our_features`' output is `restype_i` then
+`restype_j`, for 1.52e-7.
+
+Both statements are true. The reference is describing NATIVE's tensor naming,
+where a name says which index the tensor varies along; the feature dict has
+already resolved it. **A specification read off someone else's source cannot
+settle which convention its words are in** - and the failure landed on the exact
+number that source had written down for this mistake, which is what a correct
+oracle looks like when you are wrong.
+
+Had the forward been written from the specification and checked against a CPU
+reference written the same way, both halves would have carried the same swap and
+agreed at 1e-7.
+
+**Still not written: the featuriser.** The 108 columns go in from the dump. The
+frame convention, the bin edges, the 32-class remap and the multichain masking
+are all specified above and none of them is gated yet.
+
+## BOLTZ-2: THREE CHECKERS ON THE FIRST EXPORT, AND TWO WIDTHS AF3 HID
+
+Boltz-2 (MIT, best-A **0.430** in the reference's table - the strongest model in
+it). A `BLOBS` entry and a dialect, no exporter change: **442 tensors, 507.5 M
+parameters, 1936 MiB**. `check-af3-block-any`, `check-af3-embedder` and
+`check-af3-msa-block` all passed on the first run at its widths.
+
+**It is a bigger port than protenix2 - seven new conventions against three** -
+but it shares protenix2's hardest piece: both run the FUSED template embedder,
+already written and held to an oracle at 1.52e-7. What boltz2 adds there is an
+OUTER residual around the stack (`templateStackOuterResidual`), which protenix2
+does not have, and the reference's note on that is worth keeping: *"protenix
+inherited the shared forward and got the wrong convention; rf3 escaped by not
+inheriting it. Either a per-vendor convention is named or the next subclass gets
+whichever behaviour its parent happened to have."*
+
+### Two widths that were constants because AlphaFold 3 makes them coincide
+
+🔴 **`targetFeatWidth: 447` WAS TYPED IN, UNDER A COMMENT NAMING THAT EXACT
+FAULT.** boltz2's target_feat is **384**, and the checkers read "targetFeat has
+10728 elements; expected 9216". It was always derivable - the single
+conditioning's LayerNorm states its INPUT width, less the trunk single, less the
+two unknown-DNA columns where the dialect pads:
+
+    af3        831 - 0 - 384 = 447
+    protenix2  833 - 2 - 384 = 447
+    boltz2     768 - 0 - 384 = 384
+
+🔴 **AND THE CONDITIONING'S OUTPUT WIDTH IS NOT THE SINGLE IT READS.** AF3's
+`single_cond_initial_projection` is [831, 384] - 384 out, and the trunk single
+it concatenates is also 384 - so `seqChannels + targetFeatWidth` happened to be
+the input width and one variable served both. boltz2's is **[768, 768]**: 768
+out, 384 in. Read as one number that gives 1152 against a LayerNorm of 768.
+`trunkSingleChannels` is its own field now.
+
+Both are the same shape of fault and neither is visible on AF3, OpenDDE or
+protenix2, because all three have output == trunk single == 384. **A constant
+that three models agree on is still a constant.**
+
+### Where it stops
+
+`check-af3-diffusion-conditioning` reads *"the pair conditioning's initial
+projection is NaN against its own reference"* - a real signal and correctly
+caught, where the same checker once passed an all-NaN OpenDDE arm because
+`NaN > 1e-5` is false. boltz2's pair path is 128 wide with `relpe_projection`
+[139, 128] and `pair_cond_initial_projection` [256, 128], so 256 = 128 + 128 and
+`projectedRelpos` derives the trunk pair at 128 correctly; the NaN is downstream
+of the widths.
+
+Seven conventions are declared and unimplemented - `opmRowCountNorm`,
+`opmBiasAfterNorm`, `noHeadNorm`, `reembedConfidencePair`,
+`templateVisibilityByCoverage`, `rawRefCharge`, `templateStackOuterResidual`.
+🔴 **AND `opmRowCountNorm` NEEDS MSA DEPTH > 1 TO BITE**: at depth 1 its bias
+term is `(1 - 1/1) * b = 0` and the two normalisers agree, which is why the
+reference's boltz2 single-sequence fold was exact while its MSA module was not.
+A single-sequence gate cannot see that one.
+
+### 🔴 A CHECKER PASSED BECAUSE BOTH SIDES WERE WRONG THE SAME WAY
+
+`check-af3-diffusion-conditioning` read **3.20e-7 on protenix2** and that number
+meant nothing. There are THREE pair-conditioning shapes and the code knew two:
+
+| | relpos | trunk pair | concatenation |
+|---|---|---|---|
+| AF3 | raw 139 | passed through | `trunkPair + 139` |
+| OpenDDE | projected | **also** projected | `2 * c_z`, on `z_trunk_projection` |
+| protenix2, boltz2 | **projected** | passed through | `trunkPair + c_z` |
+
+The third has `relpe_projection` and no `z_trunk_projection`, so `split` is false
+and it fell into AF3's raw-139 arm:
+
+    protenix2   256 + 139 = 395   against a norm of 512
+    boltz2      128 + 139 = 267   against a norm of 256
+
+🔴 **AND ONLY boltz2 WAS LOUD ABOUT IT.** Its 267 is LONGER than its scale, so
+the LayerNorm read past the end and all 73728 elements came out NaN - on BOTH
+sides, which is what made it obvious. protenix2's 395 is SHORTER than its 512,
+so it read a prefix, stayed finite, and the GPU made the identical mistake. Two
+wrong computations agreeing to 3.20e-7.
+
+With the reference corrected, the same arm reads **1.01 on protenix2** - order
+one, the GPU computing a different function - while AF3 stays at 2.10e-7 and
+OpenDDE at 3.78e-7. The defect was there from the moment protenix2 was added and
+the suite reported it as a pass.
+
+**The only reason it surfaced is that a second model rounded the other way.** A
+differential that compares two implementations of the same misunderstanding is
+worth nothing, and nothing in its output says so - this one printed a number
+four orders inside its bound. Adding a second model to a dialect is worth more
+as a test of the FIRST one than the numbers suggest.
+
+The reference and the checker carry the third branch now. The GPU does not: its
+`pairWidth` is `pairChannels + RELATIVE_WIDTH` with a `split` flag and no third
+mode, so protenix2 reads 1.01 and boltz2 NaN until it is written.
+
+## THE FUSED TEMPLATE ON THE GPU, AND WHY protenix2 STILL DOES NOT FOLD
+
+`Af3TemplateEmbedderGpu` takes the fused embedder now - a second `embed` shader
+(`v = z_proj(z_norm(z)) + a_proj(a)`), a second weight ORDER, the mode in the
+cache key, and the 108 columns as a per-pair buffer. Everything after the input
+stage is the same code, because the fused module differs only in how the stack's
+input is built.
+
+`emptyFusedFeatures` builds a de novo fold's columns and **refuses a template**,
+because the featuriser is not written and building it from docs/AF3.md's
+specification would be unverifiable. The empty columns are measured, not
+assumed: zero everywhere except restype_i and restype_j one-hot at column 31.
+
+`check-af3-template-fused.js` now holds both halves: the CPU forward against
+af3-any-model (1.52e-7 templated, 1.58e-7 empty) and **the GPU shader against
+that CPU forward on the empty slots a fold actually builds (3.09e-5)**. The
+shader had no check at all before, which is the only reason it was worth
+suspecting when the fold came out wrong.
+
+### Three hardcoded widths, and the one that is still open
+
+🔴 **`check-af3-trunk` SEEDED `previousPair` AT `tokens^2 * 128`** - AlphaFold
+3's c_z, typed in - so protenix2 at 256 read a recycling buffer half the length
+its trunk expects and the WHOLE TRUNK came out NaN, envelope included. **An
+envelope that is NaN is the tell**: it is a CPU reference disagreeing with
+itself, which cannot be a port difference and has to be a malformed input.
+Derived from the bundle, protenix2's trunk reads **pair 6.31e-5 at 1011x its
+envelope**, beside AlphaFold 3's 855.9x.
+
+`src/af3/fold.js` had the same constant in two places, under a comment that
+already recorded OpenDDE's being 384 and "the two differ by exactly 3x". Fixed,
+though it changed nothing here.
+
+🔴 **AND protenix2 STILL FOLDS TO A BROKEN CHAIN** - 0.96 A backbone bonds
+against an ideal 1.46, consecutive CA 6.5 A against 3.8 - with every stage
+running and nothing erroring. The trunk is right (6.31e-5), the conditioning is
+right (1.89e-7), the template is right on both paths. What is NOT checked is the
+diffusion half: **75 tensors exist only in protenix2 and 74 only in AlphaFold
+3**, because its atom transformer sits under `__layer_stack_no_per_layer` with
+differently-concatenated leaf names.
+
+🔴 **AND `check-af3-diffusion-transformer` "PASSED" FOR protenix2, WHICH MEANT
+NOTHING.** It takes no `--model=`, so it opened AlphaFold 3's bundle and
+reported on AlphaFold 3. The same is true of `check-af3-atom-encoder`,
+`-atom-decoder`, `-diffusion-head` and `-sampler-gpu`: fourteen of the twenty
+AF3 checkers are pinned, so a second model's diffusion path has no coverage at
+all and a suite run says so only if you read which bundle each one opened.
+
+**The control that proved it is protenix2's and not the harness's:** AlphaFold 3
+folded from the SAME dumper's batch, the same 12-residue sequence and the same
+tool reads N-CA **1.46** against an ideal 1.46, CA-C 1.53 against 1.52, CA-CA
+3.81 against 3.80, pLDDT 89.7. The dumper, the sequence and `fold.js` are all
+sound.
+
+## protenix2 FOLDS A CHAIN NOW, AND THE LAST 0.73x IS THE ATOM DECODER'S
+
+Two more AlphaFold 3 constants, both in `diffusionWeights`:
+
+🔴 **`transformer: { pairChannels: 128 }` WAS TYPED IN.** The token transformer
+reads the diffusion conditioning's PAIR, and PROTENIX2_SETTINGS widens
+`heads.diffusion.conditioning.pair_channel` with the trunk - so protenix2's
+`pair_logits_projection` is [6, 4, **256**, 16] where AF3's is [6, 128, 4, 16].
+The stack was reading a 256-wide pair through a 128-wide stride.
+
+🔴 **AND THE TWO LAYOUTS NEST AND ORDER DIFFERENTLY**, so one expression cannot
+read both: AF3 is singly nested with the width at axis 1, protenix2 doubly
+nested with it at axis 2. `txStackFor` cannot be reused either - it appends a
+trailing `/transformer` because most leaves in that stack are named
+`transformer<leaf>` CONCATENATED, and this one is not.
+
+`encoder.trunkPairChannels: 128` was the same, and `diffusion_embed_trunk_pair_
+cond` states it: [128, 16] under AF3 and [256, 16] here.
+
+**What that bought, on 6MRR at 68 residues:**
+
+| | N-CA | CA-C | CA-CA | radius of gyration |
+|---|---:|---:|---:|---:|
+| before | 0.96 | 1.02 | 6.52 | 4.0 A |
+| after | 1.08 | 1.09 | **3.55** | **11.2 A** |
+| AF3, same dumper and target | 1.46 | 1.52 | 3.79 | 11.1 A |
+| ideal | 1.46 | 1.52 | 3.80 | 11-12 for a 68-mer |
+
+So the topology is right - a compact 68-mer with pTM **0.908** where it was a
+4 A ball - and the geometry gate passes. **It is not finished:** every bond is
+still about **0.73x** ideal.
+
+🔴 **AND THE SHAPE OF THAT ERROR NAMES THE STAGE.** Intra-residue bonds are
+0.73x while CA-CA - between token centres - is 0.93x. A uniform scale would move
+both equally. Per-atom offsets from the token centre being compressed while the
+centres stay put is the ATOM DECODER's output, not the trunk's and not the token
+transformer's.
+
+**Everything upstream is verified:** trunk 6.31e-5, conditioning 1.89e-7,
+template 1.52e-7 (CPU) and 3.09e-5 (GPU), embedder, msa-block and pairformer
+block all at their own widths. And the reference folds protenix2 on this target
+to **best 1.009 A, mean 1.391 A**, so ~1 A is what a correct port should reach.
+
+🔴 **THE NEXT STEP IS AN L3 ORACLE, NOT MORE WIDTHS.** Four of the five hardcoded
+constants found today were caught by a shape mismatch that threw; this one does
+not throw, because every tensor is the right shape and only the ANSWER is wrong.
+`denoise_parity.py` in the reference runs one whole denoise step - conditioning,
+atom encoder, token transformer, atom decoder and the EDM scaling at once - and
+that is what localises a wrong answer with correct shapes.
+
+---
+
+## boltz2 AND protenix2 ARE FINISHED, AND THE GATES THAT FINISHED THEM
+
+The section above ends with "the next step is an L3 oracle, not more widths."
+That was right, and it was not enough: an L3 oracle localises the DENOISER. Two
+more instruments were needed, and between them they found nine defects nothing
+here could see.
+
+| | RMSD to the 6MRR crystal | TM | pLDDT | pTM | N-CA | CA-C | CA-CA |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **boltz2** | **0.537 A** | **0.973** | 96.2 | 0.798 | 1.46 | 1.52 | 3.80 |
+| alphafold3 | 0.643 | 0.956 | 84.3 | 0.741 | 1.44 | 1.53 | 3.82 |
+| OpenDDE | 1.525 | - | 92.1 | - | - | - | - |
+| **protenix2** | **1.564** | **0.929** | 86.5 | 0.858 | 1.46 | 1.52 | 3.75 |
+| ideal | | | | | 1.46 | 1.52 | 3.80 |
+
+boltz2 is the best of the four here, which is what the reference's own table
+says it should be.
+
+### 🔴 THE ONE LESSON: A CHECKER THAT FEEDS ONE BUNDLE TO BOTH SIDES CANNOT SEE A CONVENTION
+
+Every AF3 gate in this repository compares **the GPU against this port's own CPU
+reference**. That catches a kernel, and it is structurally incapable of catching
+a convention, a depth or a weight - because both sides read the same bundle and
+are wrong together. Measured: at the moment boltz2's whole trunk was 1.34e+0
+from af3-any-model's, `check-af3-trunk` read 2.74e-5 and `check-af3-confidence`
+read 9.56e-5. Both passed. Both had passed all week.
+
+Three oracles now close that, and each one found defects on its first run:
+
+| | what it compares | what it found |
+|---|---|---|
+| `tools/oracle/dump_af3_denoise_stages.py` + `dump_af3_scopes.py` | af3-any-model's four denoiser seams, and every one of its 124 hk.Module outputs | ten affine LayerNorms, the transition up-gate, a negated weight in the bundle |
+| `tools/oracle/dump_af3_trunk_taps.py` + `fold.js --trunk-oracle=` | its Evoformer's z at each stage, on the REAL batch | target_feat as a sum, two z-init terms, the MSA feature's 35th column, the MSA double-add, a 64-block pairformer |
+| `tools/oracle/dump_af3_confidence.py` + `check-af3-confidence-oracle.js` | its ConfidenceHead on a real atom layout, module by module | protenix2's two missing terms, boltz2's 8-block stack |
+| `tools/check-bundle-vs-params.py` | the BUNDLE against the params the reference loads | four `embed_pair_offsets` tensors negated by a converter fix that landed after the export |
+
+### 🔴 AND THREE OF THE NINE WERE A DEPTH OR A WIDTH TYPED INTO A LOOP
+
+| | boltz2 | everyone else | what it cost |
+|---|---:|---:|---|
+| trunk pairformer | **64** | 48 | ran three quarters of the trunk |
+| confidence pairformer | **8** | 4 | ran half the head on inputs exact term for term |
+| MSA feature width | **35** | 34 | dropped `is_paired`, which on a single-sequence batch is the whole alignment |
+
+None of them throws. A stacked tensor with 64 blocks read 48 times is a valid
+read; a 34-wide prefix of a [35, 64] matrix has correct strides. `trunkDepths`
+and the confidence loader read both depths off the stack's leading axis now, and
+the MSA width off `msa_activations`.
+
+🔴 **AND THE DEPTH BISECT COULD NOT SEE THE FIRST ONE**, which is the part worth
+remembering. Truncating BOTH sides to 1, 4, 16, 32, 36, 40 and 44 blocks agreed
+to 1.55e-4 at every one of them - because every arm truncated to a depth under
+48, where the two configurations are the same model. The cliff was between 44
+and 48 and it was not chaos: at 48 the reference used blocks 48..63 and this
+port had never loaded them.
+
+### The conventions, in the order they were found
+
+**In the diffusion head.** Ten of boltz2's LayerNorms are AFFINE where AF3's are
+scale-only; the offsets are read from the BUNDLE (the converter has already
+decided by emitting the tensor) rather than from a model-name table, and a zero
+offset IS the scale-only LayerNorm, so no shader variant is needed. Its
+conditioned transition has a THIRD projection - `SwiGLU(a) * a_to_b(a)` in four
+stacks - and that one IS a shader variant, because a zero multiplier is not the
+identity but a dead block.
+
+**In the trunk.** `target_feat` is a SUM of seven terms, not AF3's
+concatenation: the atom encoder's token activation plus six bias-free
+projections, four of which are constant on an ordinary monomer and all six
+trained NON-ZERO. z-init carries two more constant terms
+(`token_bonds_type_embed` row 0 and `contact_encoding_unspecified`). The MSA
+module ADDS ITS INPUT PAIR TWICE - its MSAModule returns the updated z and its
+caller adds z to that. And its OPM divides before adding the bias, clamping
+rather than nudging, which is worth `(1 - 1/n) * b` and therefore nothing at
+depth 1.
+
+**In the confidence head.** It rebuilds z and s from nine terms under
+`~_boltz2_reembed`, normalises before no logit head, and splits both pair heads
+into intra- and inter-chain halves - which on a monomer never fire, so a
+single-chain gate cannot see whether they exist.
+
+**And protenix2's head was wrong all along**: it needed `distance_feat_project`
+(a second, UNBINNED distance term) and `input_single_norm` (the trunk single
+LayerNormed and clamped to +/-512 before ANY use). Its fold went pLDDT 59.1 ->
+86.5 on unchanged coordinates. `preSymmetrisedPde` had been declared in the
+dialect and read by nothing; it is implemented now, on both models.
+
+### 🔴 boltz2 WILL NOT RUN ITS TOKEN TRANSFORMER AT f16
+
+| `--f16` | one denoise step against af3-any-model |
+|---|---:|
+| off | **3.50e-3** |
+| on | 2.21e-1 |
+
+Its 24-block token transformer amplifies its input by about **2.2e4**, measured
+and LINEAR - half the input gap gives half the output gap (1.18e-2 against
+2.29e-2). That is a property of the up-gate: no other model here does it. The
+same amplification is why this repository's f64 CPU reference reads 2.20e-2
+where the f32 GPU reads 3.50e-3 - the GPU accumulates the way the oracle does.
+`check-af3-denoise.js` holds the GPU to the oracle and the CPU to the GPU for
+exactly that reason, and prices the model's own arithmetic envelope beside both.
+
+The fold is unchanged either way at 200 steps, so this is recorded rather than
+acted on; a per-dialect precision floor is the fix if a longer chain shows it.
+
+### The MSA is capped at num_msa now, and it was not
+
+AF3's Evoformer subsamples to `config.num_msa` (1024 in every checkpoint of this
+lineage) before the MSA stack sees a row. This port ran the whole array, which
+for a featurised batch padded to 16384 rows was sixteen times the rows the model
+takes: **3.2 GiB of `af3-msa.msa-scratch` and 1.5 s of a 3.3 s trunk**, now 280
+MiB and 515 ms.
+
+🔴 **AND THE FIRST num_msa ROWS ARE NOT AF3's num_msa ROWS.** It gumbel-shuffles
+first, so which rows survive is a draw from a PRNG this port cannot reproduce -
+and on a deep alignment the query itself survives only with probability
+`num_msa/depth`. Taking the prefix keeps the query and keeps the alignment's own
+order, which is `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s.
+A coverage limit, named; `DETERMINISTIC_MSA=1` on the oracle side makes the two
+comparable.
+
+### What is still open
+
+- The bundles are LOCAL. `model-boltz2-f32` was corrected in place by
+  `tools/negate-bundle-tensors.py` after `check-bundle-vs-params.py` named the
+  four tensors; a published bundle must be re-exported from a converter at or
+  after the fix (`~/ported/boltz2/boltz2.bin.zst`, 2026-09-09 or later).
+- boltz2's `templateStackOuterResidual` and `templateVisibilityByCoverage` are
+  implemented and have never been exercised: 6MRR folds with no template.
+- The inter-chain confidence heads and `opmRowCountNorm` both need a COMPLEX and
+  an MSA of depth > 1 respectively. Neither can be seen on this target.
+
+### OpenDDE AND OpenBind-0, MEASURED AGAINST THE ORACLE FOR THE FIRST TIME
+
+| | one denoise step | trunk pair | confidence pLDDT | RMSD to 6MRR | TM |
+|---|---:|---:|---:|---:|---:|
+| alphafold3 | 1.55e-5 | 2.96e-4 | 3.46e-5 | 0.643 A | 0.956 |
+| **boltz2** | 3.50e-3 | 3.49e-4 | 1.44e-6 | **0.537** | **0.973** |
+| openbind0 | 8.22e-5 | 4.27e-4 | 4.26e-4 | 1.732 | 0.904 |
+| opendde | 9.79e-7 | - | - | 1.525 | 0.933 |
+| protenix2 | 1.92e-6 | - | 1.47e-7 | 1.564 | 0.929 |
+
+**openbind0 needed nothing.** It was already right, at every level, and this is
+the first time anything measured it: its trunk's `target_feat` reads 4.93e-8,
+its pair 4.27e-4, its confidence head 4.26e-4, and its bundle agrees with the
+reference's params 406 of 406.
+
+**OpenDDE was not**, and both causes were in the BUNDLE:
+
+  * it joined `PADDED_SINGLE_COND` upstream on 2026-09-10 and this export
+    predates it - its diffusion single conditioning normalises over 833
+    channels, not 831, and the two re-inserted zero columns are not free
+    because a LayerNorm maps a zero to -mean/std. A uniform 0.12%, exactly
+    `1 - sqrt(831/833)`.
+  * eight base-name encoder tensors were ZERO in the export where the reference
+    has values.
+
+Re-exported, both bundles agree 481 of 481 and the denoise step is 9.79e-7.
+
+🔴 **AND THE WIDTH ASSERTION THAT SHOULD HAVE CAUGHT THE FIRST ONE COULD NOT
+FIRE.** `targetFeatWidth` was derived as `scale - pad - trunkSingle`, i.e. FROM
+the tensor it was checked against, so whatever the scale said the derived width
+absorbed it. The stale bundle folded silently at target_feat 445 instead of 447.
+It comes off `single_activations` now, which states 447 outright, and the stale
+bundle raises.
+
+🔴 **OpenDDE's TRUNK AND CONFIDENCE ARE STILL UNMEASURED AGAINST AN ORACLE.**
+Its confidence is its own module (`opendde_confidence.OpenDDEConfidenceHead`),
+which `dump_af3_confidence.py` does not build, and its trunk runs through
+`fold-opendde.js`, which has no `--trunk-oracle=`. Both are reachable - the
+reference's `confidence_parity.ours_opendde` is the entry point for one and the
+taps already work for the other - and neither has been done.
+
+### What the two new models COST, and the 5.4x that was hiding in a presence test
+
+68 tokens, int5 bundles, 200 diffusion steps, warm fold (the second of two):
+
+| | trunk | diffusion | total | peak device | trunk at 256 tokens |
+|---|---:|---:|---:|---:|---:|
+| alphafold3 | 0.3 s | 2.7 s | **3.1 s** | 983 MiB | 917 ms |
+| **boltz2** | 0.4 | 4.7 | **5.2** | **1535** | 1044 |
+| **protenix2** | 0.6 | 2.8 | **3.5** | 1297 | 1962 |
+
+boltz2 is 1.7x AlphaFold 3 for 1.6x the device memory, which is what its shape
+costs: 64 pairformer blocks against 48, an 8-block confidence stack against 4,
+and a token transformer carrying a third projection per block. Its peak is 513
+MiB of resident diffusion-transformer blocks, 270 of trunk single transitions
+and 204 of MSA scratch. protenix2's trunk is 2.1x AF3's at 256 tokens - its pair
+track is 256 channels wide against 128 - while its diffusion is the same.
+
+🔴 **AND boltz2's SAMPLER WAS 193 ms A STEP BEFORE THIS, AGAINST AlphaFold 3's
+13.** Not a leak - flat from 25 steps to 200 - and not arithmetic: the GPU was
+**92% IDLE** through a denoiser call, 21 ms of work in a 267 ms span, with the
+same ten submits and the same 309 passes AF3 has. The head's own stage timers
+put 9.1 s of a 10.2 s 50-step fold in the TOKEN TRANSFORMER stage, whose GPU
+kernels are under 2 ms.
+
+It was the presence test for the up-gate. `txHasUpGate(block)` read
+`block.ffwAToB != null` - and a bound block's fields are THUNKS that decode when
+read, so asking whether the tensor exists unpacked a 768x1536 int5 tensor, once
+per block per sampler step. Asking the SOURCES map instead is the same answer
+for free:
+
+    boltz2, 50 steps    diffusion 10.2 s -> 1.9 s
+    boltz2, 200 steps   diffusion 38.6 s -> 4.7 s
+
+Three tests in this session had the same shape - `blockHasUpGate` in the atom
+stacks and `hasBondTypes` in the embedder - and all three now ask the thunk.
+It is CLAUDE.md's own note about `blockWeightOffsets` reading `.length`, one
+convention later: **a bound weight field is not a value, and `!= null` on one is
+a decode.**
+
+🔴 **AND `bench-trunk.js` COULD NOT MEASURE EITHER MODEL** until this: it passed
+the imported `DIALECT` constant rather than the bundle's, so pointing it at
+boltz2 or protenix2 died in `emptyFusedFeatures` before producing a number. Same
+fault docs/PARITY.md records across the checkers.

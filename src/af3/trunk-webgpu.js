@@ -170,8 +170,19 @@ export class Af3TrunkGpu {
       return value;
     };
 
+    // 🔴 THE SEAMS, FOR A CHECKER THAT HAS THE REFERENCE'S OWN. Every trunk gate
+    // here compares the GPU against this port's CPU reference, so the two can be
+    // wrong together - which is how boltz2's `target_feat` stayed 1.00e+0 from
+    // af3-any-model's while every checker passed. `onSeam` is off unless a
+    // caller asks, and costs a readback when it is on; see `fold.js
+    // --trunk-oracle=` and tools/oracle/dump_af3_trunk_taps.py, whose tap names
+    // these match.
+    const seam = (name, value) => options.onSeam?.(name, value);
+
     const embedded = await stage("embedder",
       () => new Af3EmbedderGpu(this.device).run(input, weights.embedder, options));
+    seam("tap.z_init_generic", embedded.pair);
+    seam("tap.trunk_in_single", embedded.single);
 
     // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
     const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device, this.options).run(
@@ -196,11 +207,20 @@ export class Af3TrunkGpu {
     // the add in place.
     const pair = embedded.pair;
     for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
+    seam("tap.z_after_template", pair);
 
     const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
       { pair, msa: embedded.msa, pairMask: input.pairMask, msaMask: input.msaMask,
         tokens, sequences: input.sequences },
       weights.msaBlocks, dialect, options));
+
+    // 🔴 boltz2 ADDS THE PRE-MSA PAIR BACK. See `msaDoubleAddPair` in
+    // dialect.js: its MSAModule returns the updated z and its caller adds z to
+    // that, so what reaches the pairformer is `2 * z_in + delta`.
+    if (dialect.msaDoubleAddPair === true) {
+      for (let index = 0; index < msa.pair.length; index += 1) msa.pair[index] += pair[index];
+    }
+    seam("tap.z_after_msa", msa.pair);
 
     // 🔴 THE ONLY STAGE WORTH A PROGRESS BAR. The pairformer is 48 blocks and
     // the bulk of the trunk; the other four stages are each a fraction of it,
@@ -223,6 +243,7 @@ export class Af3TrunkGpu {
     // The pairformer's own encode/wait split, carried out so a bench can report
     // where the stack's wall time went without re-instrumenting it.
     this.lastPairformerSplit = pairformer.split;
+    seam("tap.trunk_out_pair", pairformer.pair);
 
     const head = await stage("distogram",
       () => this.#distogram(pairformer.pair, input.pairMask, tokens,

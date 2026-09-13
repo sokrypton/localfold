@@ -39,6 +39,7 @@ import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 import { shapedKnob } from "../runtime/device-profile.js";
+import { SOURCES } from "../runtime/weight-sources.js";
 
 /**
  * Which labels in a caller's `staticCache` already hold their contents.
@@ -61,6 +62,26 @@ const BLOCK_ORDER = [
   "ffwSingleCondBias", "ffwTransition1", "ffwTransition2",
   "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
 ];
+
+/**
+ * 🔴 boltz2's TRANSITION UP-GATE IS A SHADER VARIANT, NOT A ZERO WEIGHT. Its
+ * ConditionedTransitionBlock is `SwiGLU(a) * a_to_b(a)`; every other family
+ * here is `SwiGLU(a)` alone. The LayerNorm offsets beside it pack as zeros
+ * because a zero offset is the identity - a zero MULTIPLIER is not, it is a
+ * dead block - so this one enters the block order and the pipeline key
+ * together, and a bundle without the weight compiles the kernel that never
+ * reads it.
+ */
+export const blockOrderFor = (upGate) =>
+  (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
+/**
+ * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate`. A bound block's fields
+ * decode when read, so asking the VALUE whether it exists unpacks it.
+ */
+export const blockHasUpGate = (block) => {
+  const sources = block?.[SOURCES];
+  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
+};
 
 
 /**
@@ -87,15 +108,16 @@ export function packCached(key, label, pack) {
 }
 
 export function packAtomBlockWeights(block) {
+  const order = blockOrderFor(blockHasUpGate(block));
   const offsets = {};
   let total = 0;
-  for (const name of BLOCK_ORDER) {
+  for (const name of order) {
     if (block[name] === undefined) throw new Error(`atom block missing ${name}`);
     offsets[name] = total;
     total += block[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of BLOCK_ORDER) data.set(block[name], offsets[name]);
+  for (const name of order) data.set(block[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -103,8 +125,12 @@ const PAIR_ORDER = [
   "singleToPairCondRow", "singleToPairCondCol", "embedPairOffsets",
   "embedPairDistances", "embedPairOffsetsValid", "pairMlp1", "pairMlp2", "pairMlp3",
   "pairInputLayerNormScale", "pairLogitsProjection",
-  "lnormTrunkSingleCondScale", "embedTrunkSingleCond",
-  "lnormTrunkPairCondScale", "embedTrunkPairCond",
+  // 🔴 THE TWO TRUNK NORMS CARRY AN OFFSET IN SOME BUNDLES. Zeros where they
+  // do not, which IS the scale-only LayerNorm - no shader variant, no dialect
+  // flag, and no way for an affine bundle to read the scale alone. See
+  // `offsetOf` in diffusion-weights.js.
+  "lnormTrunkSingleCondScale", "lnormTrunkSingleCondOffset", "embedTrunkSingleCond",
+  "lnormTrunkPairCondScale", "lnormTrunkPairCondOffset", "embedTrunkPairCond",
   "atomPositionsToFeatures", "projectAtomFeaturesForAggr",
 ];
 
@@ -121,7 +147,7 @@ export function packAtomPairWeights(weights) {
   // LayerNorm scale and a projection across the atom stack; OpenDDE trains one
   // of each PER BLOCK. Packing the three back to back keeps one buffer and one
   // binding, and the shader indexes them by block - see `pairLogits`.
-  const source = weights.pairNormPerBlock
+  let source = weights.pairNormPerBlock
     ? { ...weights,
         pairInputLayerNormScale: concatenate(weights.pairInputLayerNormScales),
         pairLogitsProjection: concatenate(weights.pairLogitsProjections) }
@@ -129,6 +155,12 @@ export function packAtomPairWeights(weights) {
   const offsets = {};
   let total = 0;
   for (const name of PAIR_ORDER) {
+    // The LayerNorm offsets are the one entry a bundle may legitimately lack;
+    // everything else missing is a loader bug and must still throw.
+    if (source[name] == null && name.endsWith("CondOffset")) {
+      source = { ...source,
+                 [name]: new Float32Array(source[name.replace("Offset", "Scale")].length) };
+    }
     if (source[name] === undefined) throw new Error(`atom encoder missing ${name}`);
     offsets[name] = total;
     total += source[name].length;
@@ -245,8 +277,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var out = 0u; out < C; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
-      value += (trunk_single[base + c] - mean) * inverse
+      value += ((trunk_single[base + c] - mean) * inverse
         * weights[P_lnormTrunkSingleCondScale + c]
+        + weights[P_lnormTrunkSingleCondOffset + c])
         * weights[P_embedTrunkSingleCond + c * C + out];
     }
     projected[token * C + out] = value;
@@ -276,8 +309,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var out = 0u; out < C_PAIR; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse
+      value += ((trunk_pair[base + c] - mean) * inverse
         * weights[P_lnormTrunkPairCondScale + c]
+        + weights[P_lnormTrunkPairCondOffset + c])
         * weights[P_embedTrunkPairCond + c * C_PAIR + out];
     }
     projected[row * C_PAIR + out] = value;
@@ -577,6 +611,11 @@ export function createAtomBlockShaders(common, shape) {
   // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
   // OpenDDE. See the note at `attendFor`.
   const keyMasked = shape.keyMaskedAtomAttention === true;
+  // boltz2's transition up-gate; see `blockOrderFor`. It must reach the
+  // pipeline KEY as well as the source - a shader compiled without it and one
+  // compiled with it differ only inside the transition, which no dimension in
+  // the key can see.
+  const upGate = shape.upGate === true;
   const intermediate = channels * 2;
   const rowWidth = Math.min(4, outputRowTile);
   const rowGroups = outputRowTile / rowWidth;
@@ -1174,18 +1213,22 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var i = local; i < INTERMEDIATE; i += 64u) {
     ${overRowGroups((g) => `var gate_value${g} = ${rowVector}(0.0);
     var value${g} = ${rowVector}(0.0);`)}
+    ${upGate ? overRowGroups((g) => `var up${g} = ${rowVector}(0.0);`) : ""}
     for (var c = 0u; c < C; c += 1u) {
       let column = W_ffwTransition1 + c * doubled;
       let wg = weights[column + i];
       let wv = weights[column + INTERMEDIATE + i];
+      ${upGate ? "let wu = weights[W_ffwAToB + c * INTERMEDIATE + i];" : ""}
       ${overRowGroups((g) => `{
         let xc = x[${g}u * C + c];
         gate_value${g} += xc * wg;
         value${g} += xc * wv;
+        ${upGate ? `up${g} += xc * wu;` : ""}
       }`)}
     }
     ${overRowGroups((g) => `wide[${g}u * INTERMEDIATE + i] =
-      gate_value${g} / (${rowVector}(1.0) + exp(-gate_value${g})) * value${g};`)}
+      gate_value${g} / (${rowVector}(1.0) + exp(-gate_value${g})) * value${g}`
+      + (upGate ? ` * up${g}` : "") + ";")}
   }
   workgroupBarrier();
 
@@ -1335,6 +1378,9 @@ export class Af3AtomEncoderGpu {
     if (keyMasked === undefined) {
       throw new Error("atom blocks carry no keyMaskedAtomAttention");
     }
+    // 🔴 boltz2 QUERIES ON THE PER-ATOM FEATURES BEFORE s_trunk. AF3 uses one
+    // array for the query activation and the conditioning; this splits them.
+    const preTrunkQuery = input.dialect?.preTrunkQuery === true;
     const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
     if (chainedNorm === undefined) {
       throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
@@ -1343,11 +1389,16 @@ export class Af3AtomEncoderGpu {
     if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
       throw new Error("this atom stack's blocks disagree about chainedAtomLayerNorm");
     }
+    // boltz2's transition up-gate, read off the WEIGHTS; see `blockOrderFor`.
+    const upGate = blockHasUpGate(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
+      throw new Error("this atom stack's blocks disagree about ffwAToB");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
-      perBlockPair, keyMaskedAtomAttention: keyMasked,
+      perBlockPair, keyMaskedAtomAttention: keyMasked, upGate,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
     };
@@ -1355,7 +1406,7 @@ export class Af3AtomEncoderGpu {
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:rt${shape.outputRowTile ?? "d"}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
-      + `:${perBlockPair}:${chainedNorm}:${keyMasked}`;
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}:${preTrunkQuery}:ug${upGate}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -1586,6 +1637,14 @@ export class Af3AtomEncoderGpu {
       // Only where the dialect chains; see the note at the dispatch.
       const normalisedQueries = chainedNorm
         ? alloc("atom.normalised-queries", queryRows * channels * 4) : null;
+      const queriesPre = preTrunkQuery
+        ? alloc("atom.q-pre", queryRows * channels * 4) : null;
+      const queriesPreMask = preTrunkQuery
+        ? alloc("atom.q-pre-mask", queryRows * 4) : null;
+      const trunkZero = preTrunkQuery
+        ? keep(this.allocator.upload("atom.trunk-zero",
+                                     new Float32Array(tokens * channels), storage))
+        : null;
       const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
       const gate = alloc("atom.gate", queryRows * width * 4);
@@ -1680,8 +1739,19 @@ export class Af3AtomEncoderGpu {
         run("pair-logits", compiled.pairLogits, [pair, pairWeights, logits], pr[0], pr[1]);
       }
       // ...and this one reads the noisy positions, so it runs every time.
+      // 🔴 THE SAME SHADER WITH A ZEROED TRUNK TERM, rather than a second one.
+      // `build-queries` is conditioning + token_to_atom(s_trunk); running it
+      // against zeros gives exactly the per-atom half, which is what boltz2's
+      // queries read. One extra pass over queryRows, and only where the dialect
+      // asks - AF3 never allocates either buffer.
+      if (preTrunkQuery) {
+        run("build-queries-pre", compiled.buildQueries,
+            [conditioning, atomMask, gatherBuffer, trunkZero, queriesPre,
+             queriesPreMask], qr[0], qr[1]);
+      }
       run("build-act", compiled.buildAct,
-          [queriesCond, queriesMask, positions, gatherBuffer, pairWeights, act], qr[0], qr[1]);
+          [preTrunkQuery ? queriesPre : queriesCond, queriesMask, positions,
+           gatherBuffer, pairWeights, act], qr[0], qr[1]);
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];

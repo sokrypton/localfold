@@ -206,3 +206,157 @@ product decision rather than a free win. The search is implemented in
 `tools/analyse_quantisation.py` and NOT in the exporter, which is fine for int5
 - the same file measures the search at 3-4% of the error - and is what int4
 would need first.
+
+## The quantised shard geometry, as it stands
+
+| bundle | shards | total | a shard |
+|---|---:|---:|---:|
+| af3-int5 | 8 | 264.6 MiB | 33.1 |
+| **boltz2-int5** | 8 | 364.4 | 45.5 |
+| **protenix2-int5** | 8 | 333.9 | 41.7 |
+| opendde-int5 | 12 | 472.5 | 39.4 |
+| ef2-fast-600m (esmfold2-int5) | 8 | 122.5 | 15.3 |
+| esmc-600m-int3 | 16 | 223.6 | 14.0 |
+| af2-multimer | 8 | 97.4 | 12.2 |
+
+Eight is the shape of the shipped set; OpenDDE's twelve and ESM-C's sixteen are
+the two exceptions and both are the bigger bundle held at ~40 and ~14 MiB a
+shard respectively.
+
+🔴 **boltz2 AND protenix2 HAD NO QUANTISED BUNDLE AT ALL.** Nine families are
+published and neither is among them: both existed only as a local float32
+export of 1.9 and 1.8 GiB, which is not a thing a browser can be handed. They
+are int5 group 32 now, 5.31x, and they fold:
+
+| | pLDDT | RMSD to 6MRR | TM | against the f32 bundle |
+|---|---:|---:|---:|---|
+| boltz2 int5 | 96.37 | **0.542 A** | 0.972 | 0.537 A |
+| protenix2 int5 | 84.76 | 1.723 | 0.917 | 1.564 A |
+
+🔴 **AND "SO QUANTISATION COSTS 0.16 A" WAS ONE SEED OF NOISE.** That is what
+this table said, and three seeds say otherwise:
+
+| | seed 20260831 | 7 | 99 | spread |
+|---|---:|---:|---:|---:|
+| protenix2 f32 | 1.564 | 1.642 | 0.607 | **1.03 A** |
+| protenix2 int5 | 1.723 | 1.173 | 0.676 | 1.05 |
+| boltz2 int5 | 0.542 | 0.556 | 0.486 | **0.07** |
+| af3 int5 | 0.657 | 0.844 | 0.664 | 0.19 |
+
+int5 is indistinguishable from float32 for every model - AlphaFold 3's int5 fold
+is BETTER than its float32 one at the shared seed (0.657 against 0.698), which
+is the same statement. What the table does show is that **protenix2's sampler
+has a 1 A seed spread on this target where boltz2's has 0.07**, so a
+single-seed comparison of protenix2 means nothing and this file made one.
+
+Group 32, not 128: docs/EF2FAST.md records OpenDDE at group 128 folding 6MRR
+into a 3283 A explosion at pLDDT 46.69, and 128 is ESM-C's alone.
+
+🔴 **NEITHER IS IN THE REGISTRY AND NEITHER IS PUBLISHED.**
+`src/reference/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
+cannot load either however good the bundle is - and a bundle the CLI likes can
+still be one the page cannot, because the page reads the manifest baked into the
+module and pinned to a commit. Publishing them is a `tools/build_site.py` and a
+Hugging Face upload away; the bundles exist and are gated.
+
+🔴 **AND THREE PUBLISHED BUNDLES ARE NOW STALE.** `opendde-int5` and
+`opendde-full-f32` were re-exported here (the 833-channel single conditioning
+and eight zeroed encoder tensors), and `boltz2-f32`'s four negated
+`embed_pair_offsets` were corrected in place. The loader REFUSES the old OpenDDE
+rather than folding at the wrong width, so the published one is not merely
+worse, it no longer loads. See docs/AF3.md.
+
+## THE THREE int5 BUNDLES ARE PUBLISHED, AND opendde WAS THE ONE THAT HAD TO BE
+
+Uploaded to `sokrypton/localfold` at commit
+**`068c905dfb0f8cf9b9432eef80d2220ef3ff697f`**: `opendde-int5/` (re-export),
+`boltz2-int5/` and `protenix2-int5/` (new). Eleven directories there now.
+`check_remote_bundle.py` reads all twelve OpenDDE shards and all eight of
+AlphaFold 3's back from the remote.
+
+`src/reference/manifests/opendde.js` is regenerated from the uploaded bundle and
+its `remote:` re-pinned to that commit;
+`boltz2.js` and `protenix2.js` are new modules.
+`test/registry-manifest-widths.test.js` is GREEN, which is the signal the deploy
+blocker below is cleared - it covers all five AF3-lineage families now.
+
+🔴 **AND THE TWO NEW MODELS ARE NOT IN `MODEL_BUNDLES` YET.** Their manifests
+exist and their weights are hosted, so nothing about them can 404 - and nothing
+LOADS them either, because the registry has no entry. That is deliberate: the
+upload is reversible in effect (an unreferenced directory costs storage and
+nothing else) and adding a family to the page is a product decision, not a
+porting one.
+
+### What the state WAS, before the upload
+
+**No weights had been uploaded and nothing pushed to git.** There was no HF
+token on this box, and the branch was 47 commits ahead of `origin/a100` and 38
+ahead of `origin/main`.
+
+| bundle | local state | published state | consequence |
+|---|---|---|---|
+| **opendde-int5** | re-exported (833 scale, eight tensors filled) | 831 scale, eight ZEROS | 🔴 **the loader RAISES on the published one** |
+| opendde-full-f32 | re-exported | not published | none |
+| boltz2-f32 | four tensors corrected in place | not published | none |
+| **boltz2-int5** | new | **not published, not in the registry** | the page cannot load it |
+| **protenix2-int5** | new | **not published, not in the registry** | the page cannot load it |
+| af3-int5 | unchanged | unchanged, and 404 of 404 tensors agree with the reference | none |
+| openbind0-int5 | unchanged | unchanged, 406 of 406 agree | none |
+
+🔴 **THE FIRST ROW IS A DEPLOY BLOCKER AND NOT A DEGRADATION.** OpenDDE joined
+`PADDED_SINGLE_COND` upstream, so its diffusion single conditioning is 833
+channels; the published bundle carries an 831-wide
+`single_cond_initial_norm/scale` and the loader RAISES rather than folding at
+the wrong width. That is the right behaviour - the alternative is a silent
+target_feat of 445 - and it means **pushing this branch to `main` takes OpenDDE
+off the live site until the bundle is re-uploaded.** Pushing to `main` IS the
+deploy; see CLAUDE.md.
+
+`test/registry-manifest-widths.test.js` is the gate, and it is RED on purpose:
+it reads the committed manifest module and derives the width the same code
+derives, so it names the bundle and the numbers without a GPU or the network.
+It should stay red until the upload happens.
+
+🔴 **AND DO NOT "FIX" IT BY REGENERATING THE MANIFEST MODULE.** The module
+carries byteOffsets and shardDigests, and its `remote:` still pins the OLD
+Hugging Face commit - so a locally regenerated manifest against unchanged remote
+shards is strictly worse than the raise: the page would fetch the old bytes at
+the new offsets. Upload first, then re-pin.
+
+### What publishing takes
+
+    python3 tools/quantize_af3.py --source model-opendde-full-f32 \
+      --out model-opendde-int5 --bits 5 --group 32 --shards 12   # done, local
+    # upload model-opendde-int5/, model-boltz2-int5/, model-protenix2-int5/
+    #   to huggingface.co/sokrypton/localfold
+    python3 tools/write_manifest_module.py opendde                # re-pin the sha
+    #   ...and NEW modules for boltz2 and protenix2, plus registry entries
+    python3 tools/deploy.py                                        # push and verify
+
+The shard counts are already the registry's: twelve for OpenDDE, eight for the
+two new ones.
+
+### 🔴 int5 IS THE ONLY THING PUBLISHED, AND THE ORACLES WERE RUN ON float32
+
+Every parity number in docs/AF3.md is from an f32 bundle. The float32 exports
+are the QUANTISER'S SOURCE and are never published, so the artefact a visitor
+gets had not been held to an oracle at all. Run on the int5 bundles:
+
+| one denoise step against af3-any-model | f32 bundle | int5 bundle |
+|---|---:|---:|
+| alphafold3 | 1.62e-5 | **3.77e-1** |
+| protenix2 | 1.91e-6 | 2.39e-1 |
+| boltz2 | 3.31e-3 | 8.22e-1 |
+
+🔴 **AND THE FOLDS ARE UNAFFECTED**, which is the finding rather than a
+reassurance: a single denoise step is enormously sensitive to weight
+quantisation and the 200-step sampler averages it away. **relRMS on one step is
+not a proxy for fold quality once the weights are quantised**, in either
+direction - so `check-af3-denoise.js` must be pointed at the float32 bundle, or
+it measures the quantiser instead of the port. Its 2e-2 bound is an f32 bound.
+
+The chain that does cover the shipped artefact is:
+`check-bundle-vs-params.py` on the f32 source (481 of 481 for opendde, 442 of
+442 for boltz2, 404 of 404 for af3), then the quantiser, which has its own gates
+in `check-quantised-upload.js` and `check-bundle-device-decode.js`, then the
+fold.

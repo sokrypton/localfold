@@ -108,8 +108,19 @@ export function runTrunk(input, weights, dialect, onBlock) {
     if (onBlock) onBlock("msa", index, msaState);
   }
 
+  // 🔴 boltz2 ADDS THE PRE-MSA PAIR BACK; see `msaDoubleAddPair` in dialect.js.
+  // Its MSAModule returns the updated z and its caller adds z to that, so what
+  // reaches the pairformer is `2 * z_in + delta`.
+  let afterMsa = msaState.pair;
+  if (dialect?.msaDoubleAddPair === true) {
+    afterMsa = Float32Array.from(afterMsa);
+    for (let index = 0; index < afterMsa.length; index += 1) {
+      afterMsa[index] += embedded.pair[index];
+    }
+  }
+
   let state = {
-    pair: msaState.pair, single: embedded.single, pairMask, seqMask, tokens,
+    pair: afterMsa, single: embedded.single, pairMask, seqMask, tokens,
   };
   for (let index = 0; index < weights.pairformerBlocks.length; index += 1) {
     const next = pairformerBlock(state, weights.pairformerBlocks[index], dialect);

@@ -195,10 +195,20 @@ export function packTransitionWeights(weights, precision = "f32") {
  * anything else rather than trusting a caller. Whatever the reduction assumes,
  * it assumes it of a power of two.
  */
-export function transitionWidth(rows, tile, threadTarget, width = DEFAULT_WORKGROUP) {
+export function transitionWidth(rows, tile, threadTarget, width = DEFAULT_WORKGROUP,
+                                intermediate = undefined) {
   if (!threadTarget) return width;
   const groups = Math.max(1, Math.ceil(rows / tile));
   for (const candidate of [512, 256]) {
+    // 🔴 AND A WIDTH THE CHUNK CANNOT DIVIDE IS NOT A CHOICE. `transitionChunk`
+    // falls back to the whole intermediate when its preferred chunk does not
+    // divide it, and the kernel then refuses: "chunk 768 is not a multiple of
+    // the workgroup 512". AlphaFold 3's intermediate is 768 and 512 does not
+    // divide it, where boltz2's 1536 does - so widening the diffusion
+    // conditioning's transition worked for one model and threw for the other.
+    // A caller that names its intermediate gets only widths that fit; one that
+    // does not behaves exactly as before.
+    if (intermediate !== undefined && intermediate % candidate !== 0) continue;
     if (groups * candidate <= threadTarget * 2) return candidate;
   }
   return width;

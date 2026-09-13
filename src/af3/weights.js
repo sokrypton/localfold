@@ -20,6 +20,15 @@ const CONFIDENCE = "diffuser/confidence_head";
 const CONFIDENCE_STACK = `${CONFIDENCE}/__layer_stack_no_per_layer/confidence_pairformer`;
 const TEMPLATE_STACK =
   `${TEMPLATE_SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
+// 🔴 THE FUSED TEMPLATE EMBEDDER LIVES UNDER DIFFERENT SCOPES ENTIRELY.
+// protenix2 and boltz2 run the same module, and the tensors sit one level up
+// with names of their own - `template_embedding/__layer_stack_no_per_layer/
+// tmpl_pairformer` rather than `.../single_template_embedding/...
+// template_embedding_iteration`. There is no `single_template_embedding` node
+// at all, which is why the AF3 loader's first read raised "missing tensor
+// .../single_template_embedding/query_embedding".
+const TEMPLATE_FUSED_STACK =
+  `${TEMPLATE}/__layer_stack_no_per_layer/tmpl_pairformer`;
 
 /**
  * Quantise-dequantise a tensor in place, so the model runs at a storage
@@ -158,6 +167,21 @@ export function stacked(store, name, index, dims = 1) {
   thunk.first = index * stride;
   thunk.count = stride;
   return thunk;
+}
+
+/**
+ * `stacked`, but null where the bundle does not carry the tensor at all.
+ *
+ * 🔴 FOR A CONVENTION A SECOND MODEL ADDS AND AlphaFold 3 HAS NO NAME FOR.
+ * boltz2's conditioned transition carries an extra up-gate (`ffw_a_to_b`) that
+ * every other family lacks, and asking `stacked` for it throws inside
+ * `store.shape`. Gating on the WEIGHT rather than on a model name is the same
+ * rule the LayerNorm offsets follow: the converter has already decided, and a
+ * second list of model names is a second thing to keep in step.
+ */
+export function stackedIfPresent(store, name, index, dims = 1) {
+  return store.manifest?.tensors?.[name] === undefined
+    ? null : stacked(store, name, index, dims);
 }
 
 /** Every tensor a descriptor will read, so their shards can be opened at once. */
@@ -432,6 +456,19 @@ export async function embedderWeights(store) {
     // shipped bundle and read by nothing, so every fold downloaded it and
     // multiplied it by no ligand bonds at all. See embedder-webgpu.js.
     bondEmbedding: await T("bond_embedding/weights"),
+    // 🔴 boltz2's z-INIT CARRIES TWO MORE TERMS AND BOTH CONTRIBUTE ON EVERY
+    // INPUT. `token_bonds_type_embed` is an nn.Embedding over bond ORDER whose
+    // row 0 - "no bond" - is a learned NONZERO vector, and
+    // `contact_conditioning` is boltz's distance-restraint encoder whose
+    // UNSPECIFIED class is a learned constant. Without them the pair came out
+    // at relRMS 2.29e-1 from af3-any-model's before a single pairformer block
+    // had run, and the fold was a 5.9 A ball. Absent from every other bundle.
+    ...(store.manifest?.tensors?.[`${EVO}/token_bonds_type_embed/weights`]
+      === undefined ? {} : {
+      tokenBondsTypeEmbed: await T("token_bonds_type_embed/weights"),
+      contactEncodingUnspecified: await T("contact_encoding_unspecified"),
+      contactEncodingUnselected: await T("contact_encoding_unselected"),
+    }),
     msaActivations: await T("msa_activations/weights"),
     extraMsaTargetFeat: await T("extra_msa_target_feat/weights"),
     singleActivations: await T("single_activations/weights"),
@@ -441,8 +478,48 @@ export async function embedderWeights(store) {
   };
 }
 
-export async function templateWeights(store) {
+export async function templateWeights(store, dialect = undefined) {
   const T = (name) => store.tensor(name);
+  // 🔴 TWO TEMPLATE EMBEDDERS, AND THE DIALECT PICKS. AF3 and OpenDDE sum NINE
+  // separate feature projections (`template_pair_embedding_0..8`); protenix2
+  // and boltz2 concatenate the features and apply ONE (`a_proj`), with the
+  // query and output paths renamed to `z_norm`/`z_proj` and `v_norm`/`u_proj`.
+  // A sum of projections of the parts IS one projection of the concatenation,
+  // so this is a packing and a naming difference rather than a different model
+  // - but nothing about the names says so, and the AF3 loader simply cannot
+  // find its tensors. See docs/AF3.md for the forward and the feature order.
+  // 🔴 THE BUNDLE STATES WHICH, AND THE DIALECT IS CHECKED AGAINST IT RATHER
+  // THAN ASKED FIRST. `a_proj` exists or it does not; unlike
+  // `msaUpdateBeforeOuterProduct`, where both orderings load the same tensors
+  // and only the dialect can say, there is nothing to guess here. So a caller
+  // with no dialect - the weight-dimension tests build a synthetic store and
+  // have none - reads the module the tensors describe, and a caller WITH one
+  // still has it verified. Demanding the dialect outright broke three CPU
+  // tests that had no business carrying one.
+  const hasFused = store.manifest?.tensors?.[`${TEMPLATE}/a_proj/weights`] !== undefined;
+  const fused = dialect?.fusedTemplateEmbedder ?? hasFused;
+  if (dialect?.fusedTemplateEmbedder !== undefined && hasFused !== fused) {
+    throw new Error(`this bundle ${hasFused ? "carries" : "does not carry"} `
+      + "template a_proj and its dialect says otherwise");
+  }
+  if (fused) {
+    const [queryChannels] = dims(store, `${TEMPLATE}/z_norm/scale`);
+    const [featureWidth] = dims(store, `${TEMPLATE}/a_proj/weights`);
+    return {
+      fused: true, queryChannels, featureWidth,
+      blocks: [await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 0)),
+               await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 1))],
+      // v = z_proj(z_norm(z)) + a_proj(a_tij)
+      queryEmbeddingNormScale: await T(`${TEMPLATE}/z_norm/scale`),
+      queryEmbeddingNormOffset: await T(`${TEMPLATE}/z_norm/offset`),
+      zProjection: await T(`${TEMPLATE}/z_proj/weights`),
+      aProjection: await T(`${TEMPLATE}/a_proj/weights`),
+      // ...then v_norm after the stack, and u_proj(relu(u)) out.
+      outputLayerNormScale: await T(`${TEMPLATE}/v_norm/scale`),
+      outputLayerNormOffset: await T(`${TEMPLATE}/v_norm/offset`),
+      outputLinear: await T(`${TEMPLATE}/u_proj/weights`),
+    };
+  }
   // 🔴 THE TEMPLATE STACK'S GRID ATTENTION IS NARROWER THAN THE TRUNK'S, and
   // by a different factor in every checkpoint: AF3's is 4 heads of 16 against
   // the trunk's 4 of 32, and OpenDDE's is 2 of 32 against the trunk's 12 of 32.
@@ -457,7 +534,7 @@ export async function templateWeights(store) {
   // the one tensor that states the input width on its own.
   const [queryChannels] = dims(store, `${TEMPLATE_SINGLE}/query_embedding_norm/scale`);
   return {
-    queryChannels, blocks,
+    fused: false, queryChannels, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
@@ -603,11 +680,26 @@ export async function confidenceWeights(store) {
   const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
   const [stackPairChannels, stackSingleChannels, stackSingleHeads, stackSingleDimension] =
     singleAttentionDims(store, CONFIDENCE_STACK);
-  const [targetFeatWidth, pairChannels] =
-    dims(store, `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
-  const [singleChannels] = dims(store, `${CONFIDENCE}/plddt_logits_ln/scale`);
+  // 🔴 THE SCOPE THAT STATES THESE DEPENDS ON WHICH HEAD THIS IS. boltz2 has no
+  // `~_embed_features` at all - it rebuilds z under `~_boltz2_reembed` - and no
+  // `plddt_logits_ln`, because it normalises before no head. Both widths still
+  // come off a tensor rather than a constant; only which tensor moves.
+  const reembedScope = store.manifest?.tensors?.[
+    `${CONFIDENCE}/~_boltz2_reembed/left_target_feat_project/weights`] !== undefined;
+  const [targetFeatWidth, pairChannels] = dims(store, reembedScope
+    ? `${CONFIDENCE}/~_boltz2_reembed/left_target_feat_project/weights`
+    : `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
+  const [singleChannels] = dims(store, reembedScope
+    ? `${CONFIDENCE}/~_boltz2_reembed/s_norm/scale`
+    : `${CONFIDENCE}/plddt_logits_ln/scale`);
+  // 🔴 boltz2's CONFIDENCE PAIRFORMER IS 8 BLOCKS AND EVERY OTHER MODEL'S IS 4,
+  // and this was a 4 typed into the loop - the same hardcode that ran three
+  // quarters of its TRUNK. Its head then ran half its stack while every term of
+  // its re-embedding was exact, which is the shape of error a per-term
+  // comparison cannot see: the inputs agree and the depth does not.
+  const [stackBlocks] = dims(store, `${CONFIDENCE_STACK}/single_attention_q_projection/bias`);
   const blocks = [];
-  for (let index = 0; index < 4; index += 1) {
+  for (let index = 0; index < stackBlocks; index += 1) {
     const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
     blocks.push(await bind(store, {
       pairChannels: stackPairChannels, singleChannels: stackSingleChannels,
@@ -634,23 +726,84 @@ export async function confidenceWeights(store) {
       },
     }));
   }
+  // 🔴 boltz2's HEAD IS A DIFFERENT MODULE IN FRONT OF THE SAME PAIRFORMER. It
+  // REBUILDS z and s from the trunk's outputs under a `~_boltz2_reembed` scope -
+  // nine terms, not AF3's two - carries no LayerNorm before any logit head
+  // (`NO_HEAD_NORM`), and splits its PDE and PAE into intra- and inter-chain
+  // heads. So three groups of tensors are conditional, and which ones a bundle
+  // has is what says which head it is.
+  const has = (name) =>
+    store.manifest?.tensors?.[`${CONFIDENCE}/${name}`] !== undefined;
+  const reembed = has("~_boltz2_reembed/z_norm/scale");
+  const headNorm = has("logits_ln/scale");
   return {
     dialect: af3Dialect(store),
     pairChannels, singleChannels, targetFeatWidth, blocks,
-    leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
-    rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
-    distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
-    logitsLnScale: await T("logits_ln/scale"),
-    logitsLnOffset: await T("logits_ln/offset"),
+    ...(reembed ? {
+      reembed: {
+        sInputsNormScale: await T("~_boltz2_reembed/s_inputs_norm/scale"),
+        sInputsNormOffset: await T("~_boltz2_reembed/s_inputs_norm/offset"),
+        sNormScale: await T("~_boltz2_reembed/s_norm/scale"),
+        sNormOffset: await T("~_boltz2_reembed/s_norm/offset"),
+        sInputToS: await T("~_boltz2_reembed/s_input_to_s/weights"),
+        zNormScale: await T("~_boltz2_reembed/z_norm/scale"),
+        zNormOffset: await T("~_boltz2_reembed/z_norm/offset"),
+        relPosProject: await T("~_boltz2_reembed/rel_pos_project/weights"),
+        tokenBondsProject: await T("~_boltz2_reembed/token_bonds_project/weights"),
+        tokenBondsTypeEmbed: await T("~_boltz2_reembed/token_bonds_type_embed/weights"),
+        contactEncodingUnspecified: await T("contact_encoding_unspecified"),
+        contactEncodingUnselected: await T("contact_encoding_unselected"),
+        leftTargetFeatProject: await T("~_boltz2_reembed/left_target_feat_project/weights"),
+        rightTargetFeatProject: await T("~_boltz2_reembed/right_target_feat_project/weights"),
+        sToZProdIn1: await T("~_boltz2_reembed/s_to_z_prod_in1/weights"),
+        sToZProdIn2: await T("~_boltz2_reembed/s_to_z_prod_in2/weights"),
+        sToZProdOut: await T("~_boltz2_reembed/s_to_z_prod_out/weights"),
+        distogramFeatProject: await T("~_boltz2_reembed/distogram_feat_project/weights"),
+      },
+    } : {
+      leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
+      rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
+      distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
+      // 🔴 protenix2 ADDS A SECOND DISTANCE TERM, unbinned: a bias-free Linear
+      // on the RAW distance, carrying the sub-bin resolution the one-hot throws
+      // away. Its binning is otherwise AF3's exactly, so nothing about the
+      // shapes says it is there.
+      ...(has("~_embed_features/distance_feat_project/weights") ? {
+        distanceFeatProject: await T("~_embed_features/distance_feat_project/weights"),
+      } : {}),
+    }),
+    // 🔴 protenix2 LayerNormS THE TRUNK SINGLE BEFORE ANY USE, clamped to
+    // +/-512 first - the confidence pairformer and every head see the
+    // normalised one where AF3 uses it raw. Ours entered the head at std 211,
+    // which is the same class of gate-invisible divergence as a missing global
+    // norm: every output plausible, none of them right.
+    ...(has("input_single_norm/scale") ? {
+      inputSingleNormScale: await T("input_single_norm/scale"),
+      inputSingleNormOffset: await T("input_single_norm/offset"),
+    } : {}),
+    // 🔴 THE HEAD LayerNormS ARE ABSENT, NOT IDENTITY. A LayerNorm with scale 1
+    // and offset 0 still re-centres and rescales, so a bundle without them is a
+    // head that does not normalise - which cannot be expressed as a weight and
+    // is why those six tensors have no source in boltz2's checkpoint.
+    ...(headNorm ? {
+      logitsLnScale: await T("logits_ln/scale"),
+      logitsLnOffset: await T("logits_ln/offset"),
+      paeLogitsLnScale: await T("pae_logits_ln/scale"),
+      paeLogitsLnOffset: await T("pae_logits_ln/offset"),
+      plddtLnScale: await T("plddt_logits_ln/scale"),
+      plddtLnOffset: await T("plddt_logits_ln/offset"),
+      resolvedLnScale: await T("experimentally_resolved_ln/scale"),
+      resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
+    } : {}),
     leftHalfDistanceLogits: await T("left_half_distance_logits/weights"),
-    paeLogitsLnScale: await T("pae_logits_ln/scale"),
-    paeLogitsLnOffset: await T("pae_logits_ln/offset"),
     paeLogits: await T("pae_logits/weights"),
-    plddtLnScale: await T("plddt_logits_ln/scale"),
-    plddtLnOffset: await T("plddt_logits_ln/offset"),
+    // ...and the inter-chain halves, which on a MONOMER never fire: the two are
+    // disjoint hard masks, so a single-chain gate cannot see them at all.
+    ...(has("inter_half_distance_logits/weights") ? {
+      interHalfDistanceLogits: await T("inter_half_distance_logits/weights"),
+      paeInterLogits: await T("pae_inter_logits/weights"),
+    } : {}),
     plddtLogits: await T("plddt_logits/weights"),
-    resolvedLnScale: await T("experimentally_resolved_ln/scale"),
-    resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
     experimentallyResolvedLogits: await T("experimentally_resolved_logits/weights"),
   };
 }
@@ -790,6 +943,24 @@ export async function structuralRefinerWeights(store, blocks = 4) {
 }
 
 /** Everything the trunk needs. `pairformerBlocks` is capped for quick checks. */
+/**
+ * How many blocks this bundle's trunk stacks actually carry.
+ *
+ * 🔴 boltz2's PAIRFORMER IS 64 BLOCKS AND EVERY OTHER MODEL'S IS 48, and this
+ * was a default typed into `trunkWeights` and into `fold.js`. So a boltz2 fold
+ * ran three quarters of its trunk and nothing objected: the weights for blocks
+ * 48..63 were downloaded and never read, and the stage-by-stage comparison
+ * against af3-any-model agreed to 1.55e-4 at every depth it was asked about
+ * because it was asked about depths BOTH sides truncated to. Read from the
+ * stack's own leading axis; a caller may still override to bisect.
+ */
+export function trunkDepths(store) {
+  return {
+    pairformerBlocks: dims(store, `${PAIRFORMER}/single_attention_q_projection/bias`)[0],
+    msaBlocks: dims(store, `${MSA_STACK}/outer_product_mean/output_b`)[0],
+  };
+}
+
 export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) {
   const msa = [];
   for (let index = 0; index < msaBlocks; index += 1) msa.push(await msaBlockWeights(store, index));
@@ -806,7 +977,7 @@ export async function trunkWeights(store, pairformerBlocks = 48, msaBlocks = 4) 
   return {
     dialect,
     embedder: { ...await embedderWeights(store), dialect },
-    template: await templateWeights(store),
+    template: await templateWeights(store, dialect),
     msaBlocks: msa,
     pairformerBlocks: pairformer,
     distogram: await distogramWeights(store, dialect),

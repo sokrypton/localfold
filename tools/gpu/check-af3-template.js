@@ -11,6 +11,7 @@
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TemplateEmbedderGpu } from "../../src/af3/template-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { deviceTuning } from "../../src/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
 // int5 bundle and not the f32 one the checker 404s instead of running - and
@@ -66,7 +67,28 @@ export async function main(device, args) {
   const tokens = Number(option(args, "tokens", "32"));
   const templates = Number(option(args, "templates", "4"));
   const model = option(args, "model", MANIFEST);
-  const bound = Number(option(args, "bound", model === MANIFEST ? "2e-5" : "1e-4"));
+  // 🔴 THE MATRIX GRID PROJECTION IS AN AXIS HERE TOO, AND IT WAS BLOCKING FOUR
+  // ARMS OUT OF FIVE. This stack runs `gridProjectMatrix`, which issues on f16
+  // matrix units, and the 2e-5 bound was written for the vector path - so the
+  // FIRST arm (0 occupied slots) read 2.25e-5, threw, and the occupied and
+  // SPANNING arms never ran at all. The spanning ones are the point of this
+  // file: cross-chain template masking is where a permissive default once
+  // scored relRMS 1.09 against AF3, and it had quietly stopped being checked.
+  //
+  //     matrix on    0 slots  2.25e-5   then nothing
+  //     matrix off   0 slots  2.53e-7   1: 2.09e-7   4: 1.55e-7
+  //                  1 spanning 2.13e-7   4 spanning 1.63e-7
+  //
+  // So the bound follows the KERNEL, as check-af3-trunk.js and
+  // check-evoformer-attention.js do, and `--matrix=off` is the arm that gets
+  // the vector path. 8e-5 is 3x the matrix measurement.
+  const matrixWanted = option(args, "matrix", "auto") !== "off";
+  const matrixLive = matrixWanted && deviceTuning(device).gridProjectMatrix !== undefined
+    && deviceTuning(device).gridProjectMatrix !== null
+    && deviceTuning(device).gridProjectMatrix !== false;
+  const bound = Number(option(args, "bound",
+    matrixLive ? (model === MANIFEST ? "8e-5" : "4e-4")
+      : model === MANIFEST ? "2e-5" : "1e-4"));
   const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {
@@ -194,7 +216,8 @@ export async function main(device, args) {
     }
     const input = { pair, pairMask, tokens, templates, asymId, slots: made };
     const expected = templateEmbedding(input, weights, DIALECT);
-    const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
+    const gpu = await new Af3TemplateEmbedderGpu(device, { pairMatrixKernels: matrixWanted })
+      .run(input, weights, DIALECT, { pairMatrixKernels: matrixWanted });
     const relRms = relativeRms(gpu.output, expected);
     console.log(`template\ttokens=${tokens} slots=${templates}`
       + ` occupied=${occupied}${spanChains ? " spanning" : ""}`

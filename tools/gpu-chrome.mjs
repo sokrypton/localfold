@@ -166,7 +166,16 @@ try {
   // diffusion transformer picks its token tile that way - would then be
   // measured in one configuration and shipped in another.
   const { requestAlphaFoldDevice } = await import("/src/runtime/device.js");
-  const device = await requestAlphaFoldDevice(adapter);
+  // 🔴 LOCALFOLD_PORTABLE_LIMITS ASKS THIS CARD TO BEHAVE AS THE WEAKEST ONE.
+  // See PORTABLE_CEILINGS: this A100 offers 48 KiB of workgroup storage and
+  // Metal offers 32, so a kernel that takes a bigger tile compiles here and
+  // refuses there. The limits twin of LOCALFOLD_STOCK_FLAGS.
+  const device = await requestAlphaFoldDevice(adapter,
+    { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1")} });
+  if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1")}) {
+    console.log("[gpu-chrome] portable limits: workgroup storage "
+      + device.limits.maxComputeWorkgroupStorageSize);
+  }
   device.addEventListener("uncapturederror", (event) => {
     post({ ok: false, error: "uncaptured: " + event.error.message, logs });
   });

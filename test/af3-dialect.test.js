@@ -57,18 +57,28 @@ describe("the dialect table", () => {
 
   /**
    * 🔴 OpenDDE's LINEAGE DOES NOT PREDICT ITS CONVENTIONS, AND THE TWO
-   * DISAGREEMENTS WITH OpenBind-0 POINT IN OPPOSITE DIRECTIONS. Both models are
-   * OpenFold3-lineage. Upstream's `TRANSPOSED_COLUMN_PAIR_BIAS` lists opendde
-   * and omits openbind, so the transposed pair bias is ON here and OFF there;
-   * and OpenDDE's native single conditioning is 833 wide exactly as
-   * OpenFold3's is, but its converter collapses it to 831 by remapping the
-   * 32-class vocabulary rather than padding it, so the padding is OFF here and
-   * ON there. Deriving either flag from the lineage gets one of them wrong.
+   * DISAGREEMENTS WITH OpenBind-0 STILL POINT IN OPPOSITE DIRECTIONS, on ONE
+   * flag rather than two. Both models are OpenFold3-lineage, and upstream's
+   * `TRANSPOSED_COLUMN_PAIR_BIAS` lists opendde and omits openbind, so the
+   * transposed pair bias is ON here and OFF there. Deriving it from the lineage
+   * gets it wrong.
+   *
+   * 🔴 THE PADDING USED TO BE THE SECOND HALF OF THAT PAIR AND IS NOT ANY MORE.
+   * This file said OpenDDE's converter "collapses it to 831 by remapping the
+   * 32-class vocabulary rather than padding it", which was true of the
+   * converter that produced the bundle in front of it. Upstream moved opendde
+   * into `PADDED_SINGLE_COND` on 2026-09-10 and its converter now emits the
+   * 833-row scale and projection. Measured on the re-exported bundle: the
+   * diffusion single conditioning was a uniform 0.12% small - exactly
+   * 1 - sqrt(831/833), because a LayerNorm maps a zero column to -mean/std and
+   * so normalises over the wider vector - and is now 3.48e-7 against
+   * af3-any-model's own.
    */
-  it("disagrees with OpenBind-0 in both directions, which is the point", () => {
+  it("disagrees with OpenBind-0 on the transposed bias, which is the point", () => {
     assert.equal(OPENDDE.swapTransposedBias, true);
     assert.equal(OPENBIND0.swapTransposedBias, false);
-    assert.equal(OPENDDE.padSingleCondUnknownDna, false);
+    // ...and agrees with it on the padding, which it did not used to.
+    assert.equal(OPENDDE.padSingleCondUnknownDna, true);
     assert.equal(OPENBIND0.padSingleCondUnknownDna, true);
   });
 
@@ -79,6 +89,7 @@ describe("the dialect table", () => {
       "keyMaskedAtomAttention",
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",
+      "padSingleCondUnknownDna",
       "pairInitFromSingle",
       "perBlockAtomPairLayerNorm",
       "perBlockPairLayerNorm",
@@ -90,8 +101,19 @@ describe("the dialect table", () => {
   });
 
   it("leaves stock AlphaFold 3 with none of them", () => {
+    // 🔴 NOT EVERY ENTRY IS A BRANCH. Most are booleans and stock AF3 must have
+    // every one off. A few carry a VALUE instead - which columns an empty
+    // template slot sets, say - and for those "off" is null, because the models
+    // that have them disagree about the value rather than about whether the
+    // branch runs. The rule this protects is that no branch is on for stock
+    // AF3, so a value-carrying flag is held to null and a boolean to false;
+    // coercing the first to `false` would make its type a lie at the use site.
     for (const [flag, value] of Object.entries(ALPHAFOLD3)) {
-      assert.equal(value, false, `${flag} is not false for stock AF3`);
+      if (typeof value === "boolean") {
+        assert.equal(value, false, `${flag} is not false for stock AF3`);
+      } else {
+        assert.equal(value, null, `${flag} carries a value for stock AF3`);
+      }
     }
   });
 

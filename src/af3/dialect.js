@@ -38,6 +38,30 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  preTrunkQuery: false,
+  sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
+  targetFeatAtomOnly: false,
+  emptyTemplateRestypeColumns: null,
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
+  fusedTemplateEmbedder: false,
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   swapTransposedBias: false,
   symmetriseBonds: false,
   maskPaddedKeys: false,
@@ -69,6 +93,30 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  preTrunkQuery: false,
+  sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
+  targetFeatAtomOnly: false,
+  emptyTemplateRestypeColumns: null,
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
+  fusedTemplateEmbedder: false,
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   swapTransposedBias: false,
   symmetriseBonds: true,
   maskPaddedKeys: true,
@@ -118,6 +166,30 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  preTrunkQuery: false,
+  sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
+  targetFeatAtomOnly: false,
+  emptyTemplateRestypeColumns: null,
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
+  fusedTemplateEmbedder: false,
+  projectedRelpos: false,
+  preSymmetrisedPde: false,
+  templateMeanOverAllSlots: false,
   // Upstream `TRANSPOSED_COLUMN_PAIR_BIAS`: a column attention's pair bias is
   // `Linear(z[k, q])`, the pair transposed BEFORE the projection.
   swapTransposedBias: true,
@@ -125,7 +197,17 @@ export const OPENDDE = Object.freeze({
   symmetriseBonds: true,
   maskPaddedKeys: true,
   // ...but NOT this one; see the note above.
-  padSingleCondUnknownDna: false,
+  // 🔴 IT JOINED THE PADDED LIST, AND THE BUNDLE HAD TO BE RE-EXPORTED FOR IT.
+  // OpenDDE's diffusion single conditioning normalises over the vendor's 833
+  // channels, not AF3's 831 - the two residue classes AF3 lacks are re-inserted
+  // as ZERO columns before `single_cond_initial_norm`, and a LayerNorm maps a
+  // zero input to -mean/std, so they are not free the way a zero column into a
+  // bias-free Linear is. Worth a uniform 1 - sqrt(831/833) = 0.12% on the whole
+  // single conditioning, which is exactly what the denoise oracle measured
+  // (ours 2.8959 against 2.8994) before this. The converter emits the padded
+  // 833-row scale and projection; a bundle exported before 2026-09-10 carries
+  // 831 and the width assertion below is what says so.
+  padSingleCondUnknownDna: true,
   // The pair track is initialised from the single embedding `s_init` rather
   // than from `target_feat`, so `single_activations` is computed BEFORE the
   // pair init instead of after the MSA stack, and left/right_single are
@@ -162,7 +244,248 @@ export const OPENDDE = Object.freeze({
   structuralTokens: true,
 });
 
+/**
+ * Protenix-v2 (ByteDance, Apache 2.0). Best-A 0.703 in the reference's table -
+ * the strongest model this port can legally serve.
+ *
+ * 🔴 IT IS OPENDDE'S DIALECT WITH FOUR FLIPS, AND THAT IS THE WHOLE PORT.
+ * Protenix-v2 sits in OPENFOLD3_LINEAGE exactly as OpenDDE does, so the lineage
+ * branches - bond symmetrisation, the element index shift, trained Fourier
+ * weights - are already here. Against OpenDDE its convention membership differs
+ * in four places and only four:
+ *
+ *     msaUpdateBeforeOuterProduct    opendde true,  protenix2 FALSE
+ *     splitPairConditioning          opendde true,  protenix2 true (see below)
+ *     preSymmetrisedPde              opendde false, protenix2 TRUE
+ *     templateMeanOverAllSlots       opendde false, protenix2 TRUE
+ *
+ * ...plus `structuralTokens`, OpenDDE's one difference that is not a flag at
+ * all, which this model does not have.
+ *
+ * 🔴 AND `pairInitFromSingle` WAS SETTLED BY THE TENSOR, NOT BY THE TABLE.
+ * OpenDDE builds the pair from `s_init` and its `left_single` is [384, 384];
+ * this bundle's is **[447, 256]**, a target_feat-wide input, so it builds the
+ * pair AlphaFold 3's way. The reference has no convention list for this - the
+ * shape is the statement - which is why src/af3/embedder-reference.js reads the
+ * flag AND the shape and refuses to default either.
+ *
+ * Every width is the tensor's and none is written down here: 48 trunk blocks of
+ * 8 triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four
+ * MSA blocks at c_m 128 with value_dim 8, and a 64-bin distogram whose
+ * half-logit projection carries a bias. All of it matches the reference's
+ * PROTENIX2_SETTINGS, which is the check that the derivation works rather than
+ * a table this file has to keep in step.
+ */
+export const PROTENIX2 = Object.freeze({
+  preTrunkQuery: false,
+  sampler: null,
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: false,
+  targetFeatAtomOnly: false,
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
+  // TRANSPOSED_COLUMN_PAIR_BIAS.
+  swapTransposedBias: true,
+  // OPENFOLD3_LINEAGE.
+  symmetriseBonds: true,
+  maskPaddedKeys: true,
+  // 🔴 PADDED_SINGLE_COND, AND UNLIKE OpenDDE. Copied from OpenDDE's false and
+  // the loader caught it in one run: "single conditioning is 831 channels but
+  // its LayerNorm scale is 833". protenix2 carries the two unknown-DNA columns
+  // where OpenDDE does not, which is why this is a flag and not a lineage
+  // property - both models are OPENFOLD3_LINEAGE.
+  padSingleCondUnknownDna: true,
+  // 🔴 THE TENSOR SAYS SO: left_single is [447, 256], not [384, 384].
+  pairInitFromSingle: false,
+  // NOT in MSA_UPDATE_BEFORE_OPM - the outer product comes off the PRE-update
+  // MSA, AlphaFold 3's way and not OpenDDE's.
+  msaUpdateBeforeOuterProduct: false,
+  // distogram_head/half_logits carries a bias.
+  distogramBias: true,
+  keyMaskedAtomAttention: true,
+  perBlockPairLayerNorm: true,
+  perBlockAtomPairLayerNorm: true,
+  // "The opendde/protenix CHAINED form applies a norm TWICE, and composition
+  // does not commute away" - the reference's own note.
+  chainedAtomLayerNorm: true,
+  // 🔴 NOT `splitPairConditioning`, AND THE GUARD IS WHAT SAID SO. Reading the
+  // reference's DIFFUSION_PROJECTED_RELPOS membership, this was set true and
+  // diffusion-weights.js threw at once: "this bundle does not carry
+  // z_trunk_projection and its dialect says otherwise". There are THREE
+  // conditioning shapes here, not two, and the tensors spell them out:
+  //
+  //     AF3        raw 139 relpos, trunk pair passed through   [267, 128]
+  //     OpenDDE    BOTH projected (z_trunk_projection)         [256, 128]
+  //     protenix2  relpe projected, trunk pair passed through  [512, 256]
+  //
+  // 512 is 256 + 256: `relpe_projection` is [139, 256] and there is no
+  // `z_trunk_projection` at all. So `splitPairConditioning` is OpenDDE's
+  // both-projected case and this is its own flag.
+  splitPairConditioning: false,
+  projectedRelpos: true,
+  // No structural-token expansion; the diffusion runs on the trunk's tokens.
+  structuralTokens: false,
+  // 🔴 THESE TWO ARE DECLARED AND NOT YET IMPLEMENTED, and saying so is the
+  // point. `preSymmetrisedPde` symmetrises the PDE logits BEFORE the head
+  // rather than after - the reference found it with confidence_parity.py
+  // reading pde corr 0.87 while pae, plddt and resolved were all at parity, and
+  // records that NO FOLD CAUGHT IT, because a symmetric plausibly-scaled error
+  // metric stays symmetric and plausible. `templateMeanOverAllSlots` divides
+  // the template term by every slot rather than the occupied ones. Until the
+  // confidence head and the template embedder read them, a protenix2 fold is
+  // right in its trunk and wrong in those two places.
+  preSymmetrisedPde: true,
+  templateMeanOverAllSlots: true,
+  // 🔴 AN EMPTY SLOT'S 108 COLUMNS ARE ZERO EXCEPT TWO, MEASURED NOT ASSUMED.
+  // `EMPTY=1 tools/oracle/dump_af3_template.py protenix2` reads every geometry
+  // feature at exactly zero and both restype blocks one-hot at column 31 - GAP,
+  // where _AF3_TO_OF3 sends AlphaFold 3's index 21. The blocks begin at 40 and
+  // 72 in this model's order [disto(39), pb(1), restype_i(32), restype_j(32),
+  // uvec(3), frame(1)]. boltz2's are all zero and its order is its own; see
+  // BOLTZ2.
+  emptyTemplateRestypeColumns: [40 + 31, 72 + 31],
+  // 🔴 AND THE TEMPLATE EMBEDDER IS A DIFFERENT MODULE, NOT DIFFERENT WIDTHS.
+  // protenix2 runs boltz2's fused form: `v = z_proj(z_norm(z)) + a_proj(a)`,
+  // two pairformer blocks, `v_norm`, aggregate over slots, `u_proj(relu(u))`.
+  // AF3's nine `template_pair_embedding_*` become one `a_proj` over a 108-wide
+  // concatenation. See docs/AF3.md for the feature order, which has a trap in
+  // it worth reading before implementing.
+  fusedTemplateEmbedder: true,
+});
+
+/**
+ * Boltz-2 (MIT). Best-A **0.430** in the reference's table - the strongest model
+ * in it, and the reason this port was worth doing at all.
+ *
+ * 🔴 IT IS A BIGGER PORT THAN protenix2 AND SHARES ITS HARDEST PIECE. Both run
+ * the FUSED template embedder - boltz2's own module, which protenix2 inherited -
+ * so `fusedTemplateEmbedding` is already written and held to an oracle at
+ * 1.52e-7. What boltz2 adds on top is an OUTER residual around that stack, which
+ * protenix2 does not have, and the reference's note on it is worth repeating:
+ * "protenix inherited the shared forward and got the wrong convention; rf3
+ * escaped by not inheriting it. Either a per-vendor convention is named -- as it
+ * now is here -- or the next subclass gets whichever behaviour its parent
+ * happened to have."
+ *
+ * 🔴 SEVEN CONVENTIONS HERE ARE DECLARED AND NOT IMPLEMENTED. Listing them is
+ * the point: a flag nothing reads is documentation, and a flag something reads
+ * WRONGLY is a silent wrong model.
+ *
+ *   `opmRowCountNorm`   the outer product mean divides by the row COUNT.
+ *                       🔴 IT NEEDS MSA DEPTH > 1 TO BITE: at depth 1 the bias
+ *                       term is (1 - 1/1) * b = 0 and the two normalisers agree,
+ *                       which is why boltz2's single-sequence 6MRR fold was
+ *                       exact while its MSA module was not. A single-sequence
+ *                       gate cannot see this one.
+ *   `opmBiasAfterNorm`  where that bias enters, which is a separate question
+ *                       from what the divisor counts.
+ *   `noHeadNorm`        no LayerNorm before ANY confidence head.
+ *   `reembedConfidencePair`  the confidence head REBUILDS its pair rather than
+ *                       reading the trunk's: z_norm(z) + relpos + bonds + row,
+ *                       column and outer product of s_inputs, plus a distance
+ *                       embedding of the PREDICTED coordinates.
+ *   `templateVisibilityByCoverage`  templates are masked by what the template
+ *                       COVERS rather than by chain.
+ *   `rawRefCharge`      the reference charge is not normalised.
+ *   `templateStackOuterResidual`  above.
+ *
+ * And its sampler is its own - gamma_0 0.605, gamma_min 1.107, noise_scale
+ * 0.901, step_scale 1.638, rho 8, sigma 0.0004..160 - which is NOT a dialect
+ * flag and belongs with the sampler; see docs/AF3.md. Running it on AF3's
+ * constants anneals on the wrong schedule and nothing errors.
+ */
+export const BOLTZ2 = Object.freeze({
+  swapTransposedBias: true,
+  symmetriseBonds: true,
+  maskPaddedKeys: true,
+  padSingleCondUnknownDna: false,
+  // Settled by the tensors at export, as protenix2's was.
+  pairInitFromSingle: false,
+  // MSA_UPDATE_BEFORE_OPM, as OpenDDE.
+  msaUpdateBeforeOuterProduct: true,
+  distogramBias: true,
+  keyMaskedAtomAttention: true,
+  perBlockPairLayerNorm: true,
+  // ...but NOT the atom-pair one, where OpenDDE and protenix2 both have it.
+  perBlockAtomPairLayerNorm: false,
+  // 🔴 NO CHAINED FORM, AND THE REFERENCE EXPLAINS WHY IT NEEDS NO BRANCH:
+  // boltz2 gathers the ALREADY NORMALISED queries and carries one `adaln` per
+  // layer, and adaptive LayerNorm is POINTWISE per atom - so gathering before
+  // or after it is the same computation. The opendde/protenix chained form is
+  // different precisely because it applies a norm TWICE.
+  chainedAtomLayerNorm: false,
+  splitPairConditioning: false,
+  projectedRelpos: true,
+  structuralTokens: false,
+  preSymmetrisedPde: true,
+  templateMeanOverAllSlots: false,
+  fusedTemplateEmbedder: true,
+  // 🔴 AN EMPTY SLOT'S 109 COLUMNS ARE ALL ZERO HERE, where protenix2's carry
+  // GAP. The reference records the split - "protenix fills the first slot with
+  // GAP, opendde fills all four, intellifold2 deliberately uses 0", and boltz2
+  // is with the last - and it is measurable rather than inferable, which is why
+  // it is a dialect entry and not a rule.
+  // 🔴 ITS s_inputs IS THE ATOM ENCODER'S 384 COLUMNS AND NOTHING ELSE, where
+  // every other model here prepends a restype one-hot, a profile and a deletion
+  // mean for 447. The reference states it plainly - "s_trunk is concatenated
+  // with it, not with a 449-channel target_feat" - and the shape says the same:
+  // boltz2's single conditioning reads 768 = 384 + 384 where AF3's reads
+  // 831 = 447 + 384.
+  // 🔴 ITS OWN EDM SCHEDULE, AND NOTHING ERRORS IF IT IS NOT USED. The
+  // reference keeps these per model and says why: "running them on AF3's
+  // constants would anneal on the wrong schedule ... nothing errors, it just
+  // anneals differently and returns a plausible structure". boltz2's are not
+  // small differences - gamma_0 0.605 against 0.8, step_scale 1.638 against
+  // 1.5, rho 8 against 7 - and on AF3's the fold comes out with 9.6 A backbone
+  // bonds against an ideal 1.46.
+  //
+  // 🔴 AND THIS IS NOT A DIALECT BRANCH. It is a table of constants that rides
+  // here because the dialect is what a bundle already resolves to; the sampler
+  // reads it and the forward graph never sees it.
+  sampler: Object.freeze({
+    gamma0: 0.605, gammaMin: 1.107, noiseScale: 0.901, stepScale: 1.638,
+    rho: 8.0, sigmaMin: 0.0004, sigmaMax: 160.0,
+  }),
+  // 🔴 THE MSA MODULE ADDS ITS INPUT PAIR TWICE. boltz2's MSAModule RETURNS the
+  // updated z - every MSALayer residual-updates it in place - and its caller
+  // then does `z = z + msa_module(z, ...)`, so what reaches the pairformer is
+  // `2 * z_in + delta` where AF3's is `z_in + delta`. Whether upstream meant it
+  // does not matter: the weights were trained with it. Measured here as the MSA
+  // stage reading 3.23e-1 from af3-any-model with the z-init exact at 5.05e-8,
+  // and ours 14.13 against native's 20.38 - almost exactly one z_init of 6.59
+  // short.
+  msaDoubleAddPair: true,
+  targetFeatAtomOnly: true,
+  emptyTemplateRestypeColumns: [],
+  templateStackOuterResidual: true,
+  templateVisibilityByCoverage: true,
+  noHeadNorm: true,
+  opmBiasAfterNorm: true,
+  opmRowCountNorm: true,
+  reembedConfidencePair: true,
+  rawRefCharge: true,
+  // 🔴 ITS QUERIES ARE THE PER-ATOM FEATURES BEFORE s_trunk, WHILE ITS
+  // CONDITIONING IS AFTER. AlphaFold 3 uses one array for both - the query
+  // activation starts as a copy of the conditioning - and boltz2, rosettafold3
+  // and chai1 need them split: q reads `a`, c reads `a + token_to_atom(s_trunk)`.
+  preTrunkQuery: true,
+});
+
 export const DIALECTS = Object.freeze({
+  protenix2: PROTENIX2,
+  boltz2: BOLTZ2,
   alphafold3: ALPHAFOLD3,
   openbind0: OPENBIND0,
   opendde: OPENDDE,

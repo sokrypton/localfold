@@ -73,6 +73,32 @@ export const BLOCK_ORDER = [
 ];
 
 /**
+ * 🔴 boltz2's TRANSITION UP-GATE, AND IT IS A SHADER VARIANT. Its
+ * ConditionedTransitionBlock is `SwiGLU(a) * a_to_b(a)`; AF3, OpenFold3,
+ * protenix and OpenDDE are `SwiGLU(a)` alone. A zero weight would not stand in
+ * for its absence - it would kill the block - so the weight's presence chooses
+ * the block order, the source and the pipeline key together.
+ *
+ * The up-gate is LINEAR in the activation, so it splits over K exactly as the
+ * gate and value halves do: three partials a part rather than two.
+ */
+export const txBlockOrder = (upGate) =>
+  (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
+/**
+ * 🔴 ASKED OF THE THUNK, NOT OF THE VALUE. A bound block's fields are getters
+ * that DECODE when read, so `block.ffwAToB != null` materialises a 768x1536
+ * tensor out of int5 just to find out whether it exists - and this is asked
+ * once per block per sampler step. A 200-step boltz2 fold spent 9.1 s of its
+ * 10.2 s in the token transformer STAGE with the GPU idle, against AlphaFold
+ * 3's 0.28 s, and none of it was arithmetic. Same trap CLAUDE.md records for
+ * `blockWeightOffsets` reading `.length`.
+ */
+export const txHasUpGate = (block) => {
+  const sources = block?.[SOURCES];
+  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
+};
+
+/**
  * 🔴 THE UPLOAD WAS THE FLOOR, NOT THE ARITHMETIC. A block is ~26 MB, so the
  * loop wrote ~630 MB to the device per call - and at eight tokens, where the
  * matmuls are nothing, twenty-four blocks still cost 174 ms, which is that
@@ -100,7 +126,7 @@ function residentBlockBuffer(device, block, pack, variant = "") {
 function residentBlockOnDevice(device, block, precision) {
   if (precision !== "f16") return Promise.resolve(undefined);
   return residentPackedOnDevice(device, {
-    key: block, label: "difftx.block.resident", order: BLOCK_ORDER,
+    key: block, label: "difftx.block.resident", order: txBlockOrder(txHasUpGate(block)),
     weights: block, variant: precision,
   });
 }
@@ -213,7 +239,7 @@ export function blockWeightOffsets(block) {
   const sources = block[SOURCES];
   const offsets = {};
   let total = 0;
-  for (const name of BLOCK_ORDER) {
+  for (const name of txBlockOrder(txHasUpGate(block))) {
     const thunk = sources?.[name];
     const length = Number.isInteger(thunk?.count) ? thunk.count : block[name]?.length;
     if (length === undefined) throw new Error(`diffusion block missing ${name}`);
@@ -224,15 +250,16 @@ export function blockWeightOffsets(block) {
 }
 
 export function packBlockWeights(block, precision = "f32") {
+  const order = txBlockOrder(txHasUpGate(block));
   const offsets = {};
   let total = 0;
-  for (const name of BLOCK_ORDER) {
+  for (const name of order) {
     if (block[name] === undefined) throw new Error(`diffusion block missing ${name}`);
     offsets[name] = total;
     total += block[name].length;
   }
   const data = concatenateAs(precision, total, (target) => {
-    for (const name of BLOCK_ORDER) writeInto(target, block[name], offsets[name]);
+    for (const name of order) writeInto(target, block[name], offsets[name]);
   });
   return { data, offsets };
 }
@@ -273,6 +300,9 @@ export function createDiffusionTransformerShaders(shape, offsets) {
   // a final pass over `lanes / subgroupSize` values. Narrowing the workgroup
   // instead does nothing - 64 and 128 lanes measure exactly what 256 does -
   // which is what says the cost is the barriers and not the idle lanes.
+  // boltz2's transition up-gate; see `txBlockOrder`. It changes only the body
+  // of the two ffw-wide kernels, so it must reach the pipeline key too.
+  const upGate = shape.upGate === true;
   const subgroups = shape.attendSubgroups === true;
   // The same capability, asked for separately: a device can be good at one
   // kernel's reductions and not another's, and these are measured apart.
@@ -1502,6 +1532,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   ${overGroups((g) => `var gate_acc${g} = ${tileLanes}(0.0);
   var value_acc${g} = ${tileLanes}(0.0);`)}
+  ${upGate ? overGroups((g) => `var up_acc${g} = ${tileLanes}(0.0);`) : ""}
 
   ${kSplits > 1 ? `let k_start = group.z * ${kSpan}u;
   let k_stop = k_start + ${kSpan}u;` : ""}
@@ -1514,10 +1545,12 @@ ${stageChunk}
       let column = W_ffwTransition1 + (c0 + cc) * wide;
       let wg = ${wf(`weights[column + i]`)};
       let wv = ${wf(`weights[column + INTERMEDIATE + i]`)};
+      ${upGate ? `let wu = ${wf(`weights[W_ffwAToB + (c0 + cc) * INTERMEDIATE + i]`)};` : ""}
       ${overGroups((g) => `{
         let x = xt[${g}u * CHANNEL_CHUNK + cc];
         gate_acc${g} += x * wg;
         value_acc${g} += x * wv;
+        ${upGate ? `up_acc${g} += x * wu;` : ""}
       }`)}
     }
   }
@@ -1528,13 +1561,15 @@ ${kSplits > 1
     if (token < ${ROWS}) {
       let index = token * INTERMEDIATE + i;
       let stride = ${rows}u * INTERMEDIATE;
-      let slot = (group.z * 2u) * stride + index;
+      let slot = (group.z * ${upGate ? 3 : 2}u) * stride + index;
       partials[slot] = gate_acc${group(t)}${lane(t)};
       partials[slot + stride] = value_acc${group(t)}${lane(t)};
+      ${upGate ? `partials[slot + stride * 2u] = up_acc${group(t)}${lane(t)};` : ""}
     }
   }`)}`
   : `  ${overGroups((g) => `let swished${g} = gate_acc${g}
-    / (${tileLanes}(1.0) + exp(-gate_acc${g})) * value_acc${g};`)}
+    / (${tileLanes}(1.0) + exp(-gate_acc${g})) * value_acc${g}`
+      + (upGate ? ` * up_acc${g}` : "") + ";")}
   ${overTile((t) => `{
     let token = base_token + ${t}u;
     if (token < ${ROWS}) {
@@ -1555,12 +1590,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let stride = ${rows}u * INTERMEDIATE;
   var g = 0.0;
   var v = 0.0;
+  ${upGate ? "var u = 0.0;" : ""}
   for (var part = 0u; part < ${kSplits}u; part = part + 1u) {
-    let slot = (part * 2u) * stride + index;
+    let slot = (part * ${upGate ? 3 : 2}u) * stride + index;
     g = g + partials[slot];
     v = v + partials[slot + stride];
+    ${upGate ? "u = u + partials[slot + stride * 2u];" : ""}
   }
-  gated[index] = g / (1.0 + exp(-g)) * v;
+  gated[index] = g / (1.0 + exp(-g)) * v${upGate ? " * u" : ""};
 }`;
 
   // ...and the way back, INTERMEDIATE -> C, gated by the zero-init conditioning
@@ -1801,7 +1838,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
            // sample. See packZeroGateWeights.
            zeroGateFloats: batchedGates ? tokens * channels : 0,
            qkvgPartialFloats: kSplits > 1 ? kSplits * 4 * rows * width : 0,
-           widePartialFloats: kSplits > 1 ? kSplits * 2 * rows * intermediate : 0 };
+           // Three parts a split where the up-gate is present; see txBlockOrder.
+           widePartialFloats:
+             kSplits > 1 ? kSplits * (upGate ? 3 : 2) * rows * intermediate : 0 };
 }
 
 /**
@@ -2372,7 +2411,10 @@ export class Af3DiffusionTransformerGpu {
                     lanes: weights.lanes ?? shapedKnob(deviceTuning(this.device).diffusionLanes),
                     tile, splits, outTile, outChunk, weightPrecision, kSplits, qkvgTile,
                     wideTile, outKSplits, attnKSplits, normKSplits, batchedGates, gateTile,
-                    attnOutTile, channelChunk: weights.channelChunk };
+                    attnOutTile, channelChunk: weights.channelChunk,
+                    // boltz2's transition up-gate, read off the weights; see
+                    // `txBlockOrder`.
+                    upGate: txHasUpGate(weights.superBlocks?.[0]?.blocks?.[0]) };
     const sources = createDiffusionTransformerShaders(shape, sampleOffsets);
     // 🔴 THE LANE COUNT IS PART OF THE KEY. It is baked into every one of these
     // sources as a workgroup size, so a cache that ignored it would hand a
@@ -2385,7 +2427,8 @@ export class Af3DiffusionTransformerGpu {
       // later run the pipeline compiled for a different one. Harmless across
       // processes, which is how every sweep here was taken; a collision waiting
       // for two configurations in one.
-      + `:ok${outKSplits}:ak${attnKSplits}:nk${normKSplits}:s${samples}:bg${batchedGates}:gt${gateTile ?? "d"}:aot${attnOutTile}`;
+      + `:ok${outKSplits}:ak${attnKSplits}:nk${normKSplits}:s${samples}:bg${batchedGates}:gt${gateTile ?? "d"}:aot${attnOutTile}`
+      + `:ug${shape.upGate}`;
     // 🔴 AWAITED TOGETHER, NOT ONE AT A TIME. `createComputePipelineAsync`
     // compiles off the main thread, so a loop that awaits each one in turn
     // serialises eleven compilations that could overlap - and this stack's

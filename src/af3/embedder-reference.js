@@ -81,8 +81,17 @@ export function relativeEncoding(tokens, features, maxRelativeIdx = 32,
  * @param {Int32Array|Float32Array} rows      sequences * tokens, residue codes
  * @param {Float32Array} deletionMatrix       sequences * tokens
  */
-export function msaFeatures(rows, deletionMatrix, sequences, tokens) {
-  const width = 34;
+/**
+ * 🔴 boltz2's MSA FEATURE IS 35 WIDE, NOT 34: it appends `is_paired`, which for
+ * an unpaired alignment is 1 on the QUERY ROW and 0 everywhere else. Its
+ * `msa_activations` is [35, 64] where every other model's is [34, 64], and
+ * because this file built 34 columns the extra one was simply never read - a
+ * silent prefix of the matrix, correct in its strides and missing a term. On a
+ * single-sequence batch the query row IS the whole alignment, so the missing
+ * term is the whole of what the MSA stack was given: `z_after_msa` read 3.16e-1
+ * from af3-any-model's with the z-init exact at 5.05e-8.
+ */
+export function msaFeatures(rows, deletionMatrix, sequences, tokens, width = 34) {
   const output = new Float32Array(sequences * tokens * width);
   for (let index = 0; index < sequences * tokens; index += 1) {
     const base = index * width;
@@ -93,6 +102,8 @@ export function msaFeatures(rows, deletionMatrix, sequences, tokens) {
     // ...arctan-squashed rather than clipped, so a column with many deletions
     // stays distinguishable from one with a few instead of saturating.
     output[base + 33] = Math.atan(deletions / 3) * (2 / Math.PI);
+    // The paired flag, where the model has one. Row 0 is the query.
+    if (width > 34 && index < tokens) output[base + 34] = 1;
   }
   return output;
 }
@@ -170,6 +181,34 @@ export function embed(input, weights) {
     for (let index = 0; index < pair.length; index += 1) pair[index] += bonds[index];
   }
 
+  // 🔴 boltz2's TWO EXTRA z-INIT TERMS, BOTH CONSTANT ON AN UNCONSTRAINED
+  // INPUT AND BOTH TRAINED NONZERO.
+  //
+  //   `token_bonds_type_embed` is an nn.Embedding over bond ORDER, and boltz
+  //   numbers them 0 = no bond, 2 = single, 3 = double... So row 0 is a learned
+  //   vector on every unbonded pair, which on a protein monomer is every pair.
+  //   Applying row 0 EVERYWHERE is exact for a bond-free input and wrong by up
+  //   to 8.1 on a bonded one, so the orders come from the bond matrix where
+  //   there is one.
+  //
+  //   `contact_conditioning` is boltz's distance-restraint encoder. With no
+  //   restraints the one-hot is the UNSPECIFIED class, `selected` is 1, and the
+  //   encoder term is multiplied by zero: what is left is the learned constant
+  //   `contact_encoding_unspecified`. That is not an approximation of the
+  //   module - it is what the module computes on this input - but it IS a
+  //   coverage limit, because this featuriser has no restraint field to carry.
+  if (weights.tokenBondsTypeEmbed !== undefined) {
+    const orders = input.bondOrderMatrix;
+    for (let index = 0; index < pairs; index += 1) {
+      const order = orders === undefined ? 0 : (orders[index] | 0);
+      const row = (order >= 0 && order < 7 ? order : 0) * pairChannels;
+      for (let c = 0; c < pairChannels; c += 1) {
+        pair[index * pairChannels + c] += weights.tokenBondsTypeEmbed[row + c]
+          + weights.contactEncodingUnspecified[c];
+      }
+    }
+  }
+
   // ...and the template embedding, which reads the pair AS IT IS AT THIS POINT
   // - after the relative encoding and the bonds, before anything else. Passing
   // a function rather than an array is how src/af3/template-reference.js gets
@@ -185,8 +224,12 @@ export function embed(input, weights) {
   for (let index = 0; index < pair.length; index += 1) pair[index] += template[index];
 
   const rows = sequences * tokens;
-  const features = msaFeatures(input.msaRows, input.deletionMatrix, sequences, tokens);
-  const msa = linear(features, rows, 34, msaChannels, weights.msaActivations);
+  // The width is the WEIGHT's, not a constant: boltz2's is 35 and everyone
+  // else's is 34, and reading 34 off a [35, 64] matrix is a silent prefix.
+  const msaFeatureWidth = weights.msaActivations.length / msaChannels;
+  const features = msaFeatures(input.msaRows, input.deletionMatrix, sequences, tokens,
+                               msaFeatureWidth);
+  const msa = linear(features, rows, msaFeatureWidth, msaChannels, weights.msaActivations);
   const fromTarget = linear(targetFeat, tokens, featureWidth, msaChannels,
                             weights.extraMsaTargetFeat);
   for (let s = 0; s < sequences; s += 1) {

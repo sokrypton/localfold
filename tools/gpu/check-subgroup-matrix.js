@@ -15,6 +15,26 @@ export async function main(device) {
   if (!device.features.has("chromium-experimental-subgroup-matrix")) {
     return { skipped: "no chromium-experimental-subgroup-matrix" };
   }
+  // 🔴 8x8x8 IS THE M2's ONLY SHAPE AND THIS DEVICE MAY NOT HAVE IT AT ALL.
+  // The header above says "the only shape this device offers", which was true
+  // of the machine it was written on and is false here: an A100 reports TEN
+  // configurations, every one M=16, with no 8x8x8 and no f32 component type.
+  // Declaring <f32, 8, 8> there does not fail a comparison, it fails to
+  // COMPILE - "Subgroup matrix usage found which is not supported by the
+  // device" - which reads like a broken kernel rather than a checker asking
+  // for a shape the hardware has never had. Skip, and name the tool that does
+  // cover this device.
+  const configs = device.adapterInfo?.subgroupMatrixConfigs
+    ?? device.subgroupMatrixConfigs ?? [];
+  const has888 = [...configs].some((c) => c.M === N && c.N === N && c.K === N
+    && String(c.componentType).startsWith("f"));
+  if (configs.length > 0 && !has888) {
+    return { skipped: `this device offers no ${N}x${N}x${N} float configuration`,
+             configurations: [...configs].map((c) =>
+               `${c.componentType}->${c.resultComponentType} ${c.M}x${c.N}x${c.K}`),
+             seeInstead: "tools/gpu/check-subgroup-matrix-shapes.js, which sweeps "
+               + "the configurations the device actually reports" };
+  }
   // Deliberately asymmetric, so a transpose cannot agree by accident.
   const a = new Float32Array(N * N);
   const b = new Float32Array(N * N);

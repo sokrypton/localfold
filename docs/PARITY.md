@@ -7,6 +7,175 @@ inventory: what LocalFold's own differential suite covers, what it cannot
 currently execute, and what the reference now offers that this repository does
 not.
 
+## OUTPUT PARITY: OpenDDE ON 6MRR, AGAINST af3-any-model ON ITS OWN GPU
+
+Per-module checking says our kernels compute the reference's kernels. It says
+nothing about whether the two FOLD the same. This is the other question, and it
+needs no float32 bundle agreement at all - just the same target, the same model
+and the same sampler.
+
+    reference:  PYTHONPATH=src:. SEEDS=0,1,2 python dev/oracles/fold_check.py opendde
+    LocalFold:  fold-opendde.js --target=6mrr --steps=200 --seed=N \
+                  --model=/model-opendde-full-f32/manifest.json
+
+| | n | best | mean | low basin | high basin |
+|---|---:|---:|---:|---|---|
+| LocalFold f32 | 8 | 0.877 | 1.465 | 1/8 at **0.877** | 7/8 at **1.549** |
+| af3-any-model | 15 | 0.731 | 1.310 | 5/15 at **0.844** | 10/15 at **1.543** |
+
+🔴 **BOTH FIND THE SAME TWO BASINS, AT THE SAME PLACES.** The high basin agrees
+to 0.006 A (1.549 against 1.543) and the low one to 0.03 A. The difference in
+the MEANS is entirely how often each drew the low basin - 1 in 8 against 5 in 15
+- which is sampling, not the port.
+
+🔴 **AND READING best-of-N WOULD HAVE GOT THIS EXACTLY WRONG.** 0.877 against
+0.731 looks like a 20% deficit; the reference's own samples group strictly by
+SEED (seed 0 gives 0.844 mean, seeds 1 and 2 give 1.551 and 1.536), so its
+best-of-15 is one lucky basin draw reported five times. A single-seed comparison
+of this model is a coin flip with a 0.7 A spread.
+
+**Two confounders had to come off first, and both were measured rather than
+assumed:**
+
+| | mean CA-RMSD |
+|---|---:|
+| int5 weights, 16 steps | 1.462 |
+| float32 weights, 16 steps | 1.391 |
+| float32 weights, 200 steps | 1.564 |
+
+Quantisation is worth **0.07 A** - small, and worth knowing before blaming it.
+The step count is the bigger one and runs BACKWARDS: `_SAMPLER_CONSTANTS` in the
+reference's model_registry.py has no `opendde` entry, so it keeps AF3's default
+of 200, and matching it makes LocalFold WORSE - which is docs/OPENDDE.md's
+finding that more steps hurt this model, now confirmed at float32 and against
+the reference's own sampler. The page's 16 steps are both faster and better.
+
+## 🔴 WHY THE SUITE COULD NOT BE DOWNLOADED: ITS DEFAULT REFERENCE IS UNPUBLISHABLE
+
+Both Hugging Face repositories are complete, and neither holds what the checkers
+open. They are different artefacts:
+
+| | what it holds | families |
+|---|---|---:|
+| `sokrypton/af3-any-model` | the reference's converted **blobs** (`.bin.zst`, AF3 graph format) - what `export_af3_model.py` READS | 9 |
+| `sokrypton/localfold` | LocalFold's browser **bundles** - and every one is int5, int3 or a plain AF2 export | 9 |
+
+**No float32 bundle is published in either.** `model-af3-full-f32`,
+`model-opendde-full-f32`, `model-esmc-600m-f32`, `model-multimer-f32` and
+`model.f32-backup` exist only on whichever machine last ran an exporter. That is
+the whole reason fifteen checkers answered 404 rather than comparing, and it is
+not neglect:
+
+🔴 **`openAf3Store()` DEFAULTS TO `/model-af3-full-f32/manifest.json`**
+(src/af3/weights.js:13), and **fourteen of the twenty AF3 checkers take no
+`--model=` at all**, so they open that constant and nothing else. Only six are
+model-aware.
+
+🔴 **AND THAT PARTICULAR BUNDLE CAN NEVER BE PUBLISHED.** DeepMind's AF3
+parameters carry a Prohibited Use Policy and terms forbidding redistribution -
+see docs/HOSTING.md and tools/oracle/dump_af3_trunk.py. So the suite's default
+reference is an artefact that legally cannot be downloaded, by anyone, ever. It
+has to be exported locally from weights each person obtains themselves, which is
+exactly how it was obtained here.
+
+**The way out is the six, not the fourteen.** Where a checker takes `--model=`
+and holds a bound that follows the bundle, the PUBLISHED int5 weights give a
+real comparison - looser, and real. Measured:
+
+    check-af3-block-any   PASS      check-af3-msa-block   PASS   (1.7x envelope)
+    check-af3-embedder    PASS      check-af3-template    PASS
+    check-af3-trunk       PASS      check-af3-diffusion-conditioning  404
+
+Five of six. So making the other fourteen take `--model=` - the fix CLAUDE.md
+already prescribes for a different reason, that they are "pinned to AlphaFold
+3's CONSTANTS" - would make parity reproducible on a fresh machine with nothing
+but the published bundles, and keep the f32 arm as the tighter check for anyone
+holding the weights.
+
+🔴 **AND THE OTHER THREE f32 BUNDLES HAVE NO SUCH RESTRICTION.** OpenDDE's come
+from aurekaresearch, ESM-C's are MIT, AF2-multimer's are DeepMind's public
+parameters already redistributed as `af2-multimer/` in the localfold repo. Those
+three - 2502, 2190 and 356 MiB - could be published beside the int5 ones, and
+five checkers stop needing a local export. Only AF3's cannot.
+
+## 2026-09-12: NINETEEN OF TWENTY-ONE NOW RUN, AND FOUR OF THEM FOUND THINGS
+
+The section below is kept as written, because the shape of that failure is the
+point. What follows is what it took to make the suite able to fail.
+
+| | then | now |
+|---|---:|---:|
+| comparing anything at all | 2 | **20** |
+| passing | 2 | **20** |
+| genuinely failing | 0 (invisible) | 0 |
+| blocked, comparing nothing | 19 | 0 |
+
+**Three causes, and only one of them was a missing input.**
+
+1. **A bundle nobody had.** Eleven wanted `/model-af3-full-f32/`, which is not
+   published - and the AF3 weights were on the box the whole time. The exporter
+   would not run because ColabDesign2 had RENAMED `af3.alphafold3` to
+   `af3.alphafold`, which reads as a missing dependency and was a moved one.
+
+2. **Hand-built dialects.** Six raised instead of comparing because a checker
+   typed a partial dialect - `check-af3-trunk` had one flag of thirteen, the
+   embedder and the four atom checkers had none. The stacks refuse to default
+   these, correctly: AF3 takes the outer product off the pre-update MSA where
+   OpenDDE takes it off the updated one, and guessing runs a different model.
+   All of them read the dialect from the bundle now, and take `--model=`, so
+   they check the model in front of them rather than asserting AF3's over it.
+
+3. **A dump nothing produced.** Four wanted `af3-oracle-atom-f32.json`, and the
+   only producer needed ColabDesign2's runner, installed on neither machine.
+   `tools/oracle/dump_af3_atom.py` builds it from af3-any-model in 39 KB, with
+   no forward pass, no weights and no GPU - the four checkers consume nine
+   FEATURISATION arrays, not activations. See its header for why the layout
+   cannot be synthesised.
+
+🔴 **AND THE SUITE IMMEDIATELY FOUND A CLASS OF BUG NOTHING ELSE COULD: A BOUND
+WRITTEN FOR ONE ARITHMETIC WHILE THE DEVICE RAN ANOTHER.** Four matrix kernels -
+`triangleProjectMatrix`, `gridProjectMatrix`, `gridAttendMatrix` and
+`pairTransitionSplit` - issue on f16 matrix units, and no precision option
+reaches them. Three separate checkers were affected:
+
+- **`check-af3-confidence`**, all four heads failing at 522-3718x their
+  envelope. The head pinned `stagedPrecision`, `weightPrecision` and
+  `accumulatePrecision` to f32 because pLDDT and PAE are what the page shows,
+  and the matrix kernels are a FOURTH axis it did not pin. Fixed; all four pass.
+- **`check-af3-trunk`**, 1.12e-4 against 4e-5. Here the kernels stay - they are
+  worth 14% of a trunk pass and running f16 for speed is deliberate - and the
+  BOUND follows the kernel instead.
+- **`check-af3-template`**, where a 2.25e-5 miss on the FIRST of five arms threw
+  and the other four never ran, the two cross-chain ones included. Those are the
+  point of that file: a permissive template mask once scored relRMS 1.09 against
+  AF3. All five run and pass both ways now.
+
+🔴 **AND THE LAST FAILURE WAS MY OWN ENVELOPE, NOT THE PORT.**
+`check-af3-msa-block`'s vector arm read 1.18e-5 against a bare 1e-5, and the
+first envelope I gave it perturbed the INPUT pair only - which prices ONE error
+injection where the block has SIX pair writes. The giveaway was that the ratio
+moved with the probe: 35.8x at a 1e-7 nudge, 19.7x at 6e-7. A ratio that depends
+on the instrument is an artefact of the instrument.
+
+With a control that injects at each sub-update - the trap check-af3-confidence
+had already documented - the same 1.18e-5 is **3.3x its envelope**: the ratio
+the pairformer's clean block reads, and better than the trunk's f32 arm at 5.1x.
+Every kernel in the block measures ~5e-7 alone (`probe-confidence-kernels.js
+--stack=msa`) and the outer product mean 5.88e-7, so six of those through one
+block IS 1.18e-5. The bound follows the envelope now, by check-af3-block's own
+f32 rule, with the absolute floor kept.
+
+So the suite is **20 of 20**. The honest reading of the day is that one of the
+five failures it surfaced was the checker's own resolution and four were real -
+and that telling those apart needed the envelope to be built correctly, not the
+bound to be argued about.
+
+**Method worth keeping, from the reference's own week:** their 14 regressed
+cells were each recorded OK by their own gate, because each scales by
+`rms(native)`. What caught it was diffing the audit CLASSIFICATIONS between
+runs. Every argument for `gate_applies.py` below is now also an argument from
+our own experience.
+
 ## 🔴 NINETEEN OF TWENTY-ONE AF3 CHECKERS DO NOT RUN ON THIS BOX
 
 Run at `a8a6e70`, each through `tools/gpu-chrome.mjs`, with no arguments:

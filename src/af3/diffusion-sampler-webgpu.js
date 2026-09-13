@@ -31,12 +31,21 @@ export async function sampleOnGpu(device, input, weights, options) {
   // high noise, which is only useful if what you read out is `denoised` rather
   // than the returned sample.
   const stopAfter = Math.min(options.stopAfter ?? steps, steps);
-  const gamma0 = options.gamma0 ?? 0.8;
-  const gammaMin = options.gammaMin ?? 1.0;
-  const noiseScale = options.noiseScale ?? 1.003;
-  const stepScale = options.stepScale ?? 1.5;
+  // 🔴 THE MODEL'S OWN EDM CONSTANTS, WHERE IT HAS ANY. A caller's explicit
+  // option still wins; the dialect fills in behind it and AlphaFold 3's
+  // defaults fill in behind that. boltz2 is the first model here with its own
+  // and the difference is not small - gamma_0 0.605 against 0.8, step_scale
+  // 1.638 against 1.5, rho 8 against 7 - and NOTHING ERRORS on the wrong one:
+  // the walk simply anneals differently and returns a plausible structure. On
+  // AF3's constants boltz2's backbone bonds come out at 9.6 A against an ideal
+  // 1.46.
+  const model = input.dialect?.sampler ?? {};
+  const gamma0 = options.gamma0 ?? model.gamma0 ?? 0.8;
+  const gammaMin = options.gammaMin ?? model.gammaMin ?? 1.0;
+  const noiseScale = options.noiseScale ?? model.noiseScale ?? 1.003;
+  const stepScale = options.stepScale ?? model.stepScale ?? 1.5;
   const atoms = input.shape.tokens * input.shape.dense;
-  const levels = noiseLevels(steps, options);
+  const levels = noiseLevels(steps, { ...model, ...options });
   // 🔴 A CALLER MAY OWN THE HEAD, AND THEN IT KEEPS IT. Building one compiles
   // its pipelines - measured 730 ms, flat in the shape - so a caller that
   // denoises repeatedly (fold.js previews one step per recycle) would pay that

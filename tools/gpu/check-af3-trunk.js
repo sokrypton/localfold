@@ -15,13 +15,29 @@
  * differing by 1e-7 at the input diverge to ~6e-4. See tools/gpu/check-af3-block.js.
  */
 import { runTrunk } from "../../src/af3/trunk-reference.js";
-import { templateEmbedding } from "../../src/af3/template-reference.js";
+import {
+  fusedTemplateEmbedding, templateEmbedding,
+} from "../../src/af3/template-reference.js";
+import { emptyFusedFeatures } from "../../src/af3/template-webgpu.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { binEdges as binEdgesOf } from "../../src/af3/trunk-webgpu.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { deviceTuning } from "../../src/runtime/device-profile.js";
 import { CLASS_PROTEIN } from "../../src/heads/contact-threshold.js";
 
-const DIALECT = { swapTransposedBias: false };
+// 🔴 THE DIALECT IS THE BUNDLE'S, NOT A CONSTANT TYPED IN HERE. This was
+// `{ swapTransposedBias: false }` - one flag of thirteen - and the trunk has
+// refused to run for exactly that reason: `Af3MsaStackGpu` will not default
+// `msaUpdateBeforeOuterProduct`, because AF3 takes the outer product off the
+// PRE-update MSA and OpenDDE off the updated one, and guessing either would be
+// silently running a different model. So this checker did not compare anything
+// at all, which is the failure docs/PARITY.md records across the whole suite.
+//
+// Reading it from the manifest fixes both halves: the flag is named, and the
+// checker stops being pinned to AlphaFold 3 - point it at an OpenDDE or
+// openbind0 bundle with `--model=` and it checks that model's conventions
+// instead of asserting AF3's over them.
+const dialectFor = (store) => af3Dialect(store);
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -52,7 +68,16 @@ function relativeRms(actual, expected) {
   return Math.sqrt(error / Math.max(scale, 1e-30));
 }
 
-function buildInput(tokens, sequences, chains) {
+// 🔴 THE WIDTHS ARE THE BUNDLE'S. `previousPair` was `tokens * tokens * 128`
+// and `targetFeat` was `tokens * 447` - AlphaFold 3's, typed in - so on
+// protenix2 (c_z 256) the recycling input was HALF the size the trunk reads and
+// the whole trunk came out NaN, envelope included. An envelope that is NaN is a
+// CPU reference disagreeing with itself, which is the tell: it is not a port
+// difference, it is a malformed input.
+function buildInput(tokens, sequences, chains, widths = {}) {
+  const pairChannels = widths.pairChannels ?? 128;
+  const singleChannels = widths.singleChannels ?? 384;
+  const targetFeatWidth = widths.targetFeatWidth ?? 447;
   const perChain = Math.ceil(tokens / chains);
   const residueIndex = new Int32Array(tokens);
   const asymId = new Int32Array(tokens);
@@ -89,11 +114,11 @@ function buildInput(tokens, sequences, chains) {
   }
   return {
     tokens, sequences, templates: 4,
-    targetFeat: deterministic(tokens * 447, 11 + tokens),
+    targetFeat: deterministic(tokens * targetFeatWidth, 11 + tokens),
     features: { residueIndex, tokenIndex: residueIndex, asymId, entityId, symId },
     msaRows, deletionMatrix, msaMask, pairMask, seqMask, contactClasses,
-    previousPair: new Float32Array(tokens * tokens * 128),
-    previousSingle: new Float32Array(tokens * 384),
+    previousPair: new Float32Array(tokens * tokens * pairChannels),
+    previousSingle: new Float32Array(tokens * singleChannels),
   };
 }
 
@@ -101,9 +126,12 @@ export async function main(device, args) {
   const tokens = Number(option(args, "n", "24"));
   const sequences = Number(option(args, "sequences", "8"));
   const blocks = Number(option(args, "blocks", "4"));
-  const store = await openAf3Store();
+  // --model= so a second bundle's conventions can be checked, not AF3's
+  // asserted over them; the dialect follows the bundle either way.
+  const store = await openAf3Store(option(args, "model", undefined));
   const weights = await trunkWeights(store, blocks, 4);
-  const input = buildInput(tokens, sequences, 3);
+  const DIALECT = dialectFor(store);
+  const input = buildInput(tokens, sequences, 3, weights.embedder);
 
   // 🔴 THE STAGED WORKGROUP BLOCKS' PRECISION IS AN AXIS HERE TOO. The pair
   // track stages grid attention's key and value and the transition's two blocks
@@ -122,9 +150,33 @@ export async function main(device, args) {
   const accumulatePrecision = option(args, "accumulate", hasF16 ? "f16" : "f32");
   const staged16 = stagedPrecision === "f16";
   const weight16 = weightPrecision === "f16";
+  // 🔴 THE MATRIX PAIR KERNELS ARE A FOURTH AXIS, AND THE BOUND FOLLOWS THE
+  // KERNEL RATHER THAN THE REQUESTED STORAGE. `triangleProjectMatrix`,
+  // `gridProjectMatrix`, `gridAttendMatrix` and `pairTransitionSplit` issue on
+  // f16 matrix units and no precision option above reaches them, so this
+  // checker asked for f32 on all three of its axes and read 1.12e-4 - the SAME
+  // number as the f16 default. That is not a defect to fix but a trade the port
+  // takes deliberately: measured here, they are worth 14% of a trunk pass and
+  // 27% of the pairformer. What was wrong was the BOUND pretending they were
+  // not running. check-evoformer-attention.js already does this - where the
+  // device picks the matrix kernel its f32 arm runs a second time with the
+  // matrix path off, because otherwise the f32 path stops being checked at all.
+  //
+  //   f16 axes + matrix   1.12e-4      f16 axes, matrix off   1.85e-5
+  //   f32 axes + matrix   1.12e-4      f32 axes, matrix off   6.66e-7
+  //
+  // `--matrix=off` is the arm that actually gets f32, and it is the one held to
+  // the envelope rule.
+  const tuning = deviceTuning(device);
+  const matrixWanted = option(args, "matrix", "auto") !== "off";
+  const matrixLive = matrixWanted && [tuning.triangleProjectMatrix, tuning.gridProjectMatrix,
+    tuning.gridAttendMatrix, tuning.pairTransitionSplit].some((v) => v !== undefined
+      && v !== null && v !== false);
   const gpu = await new Af3TrunkGpu(
-    device, { stagedPrecision, weightPrecision, accumulatePrecision })
+    device, { stagedPrecision, weightPrecision, accumulatePrecision,
+              pairMatrixKernels: matrixWanted })
     .run(input, weights, DIALECT, {
+    pairMatrixKernels: matrixWanted,
     onStage: (name, ms) => console.log(`  ${name}\t${ms.toFixed(0)} ms`),
   });
 
@@ -134,11 +186,23 @@ export async function main(device, args) {
     return { tokens, blocks, timings: gpu.timings };
   }
 
+  // 🔴 TWO TEMPLATE EMBEDDERS, AND THE BUNDLE SAYS WHICH. protenix2 and boltz2
+  // run the fused module, whose tensors this function cannot find - the checker
+  // died at `Cannot read properties of undefined` inside `linear`, which names
+  // neither the module nor the model.
+  const embedTemplate = (pair) => (weights.template.fused
+    ? fusedTemplateEmbedding(
+      { pair, pairMask: input.pairMask, tokens, templates: 4,
+        templateFeatures: emptyFusedFeatures(undefined, tokens,
+                                             weights.template.featureWidth, DIALECT) },
+      weights.template, DIALECT)
+    : templateEmbedding(
+      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
+      weights.template, DIALECT));
+
   // The reference, with the template embedder wired the same way round.
   const cpu = runTrunk({ ...input,
-    templateEmbedding: (pair) => templateEmbedding(
-      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
-      weights.template, DIALECT),
+    templateEmbedding: (pair) => embedTemplate(pair),
   }, weights, DIALECT);
 
   // The conditioning envelope, as in check-af3-block.js.
@@ -148,9 +212,7 @@ export async function main(device, args) {
     perturbed.targetFeat[index] += input.targetFeat[index] * perturbation;
   }
   const control = runTrunk({ ...perturbed,
-    templateEmbedding: (pair) => templateEmbedding(
-      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
-      weights.template, DIALECT),
+    templateEmbedding: (pair) => embedTemplate(pair),
   }, weights, DIALECT);
   const envelope = relativeRms(control.pair, cpu.pair);
   // 🔴 THE SOFTMAX HEADS GET THEIR OWN ENVELOPE. contactProbs is a softmax
@@ -243,8 +305,12 @@ export async function main(device, args) {
   // rather than by a factor. The f32 arm keeps its envelope rule and still
   // measures 1.0x it.
   const accumulate16 = accumulatePrecision === "f16";
-  const pairBound = (staged16 || weight16 || accumulate16)
-    ? 4e-5 : Math.max(1e-5, envelope * 10);
+  // 🔴 AND THE MATRIX ARM GETS ITS OWN, 3x THE MEASUREMENT, exactly as the f16
+  // row does. 4e-4 against a measured 1.12e-4. A wrong kernel still misses this
+  // by orders; what it stops doing is reporting an accepted trade as a defect
+  // every run, which is how a gate becomes something people ignore.
+  const pairBound = matrixLive ? 4e-4
+    : (staged16 || weight16 || accumulate16) ? 4e-5 : Math.max(1e-5, envelope * 10);
   if (pairRms > pairBound) {
     throw new Error(`pair relRMS ${pairRms.toExponential(2)} exceeds ${pairBound.toExponential(2)}`);
   }

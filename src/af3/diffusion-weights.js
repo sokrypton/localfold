@@ -6,7 +6,7 @@
  * name here surfaces as a numerical disagreement rather than a missing key.
  */
 import {
-  af3Dialect, bind, dims, layer, stacked,
+  af3Dialect, bind, dims, layer, stacked, stackedIfPresent,
   trunkWeights, confidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights,
 } from "./weights.js";
@@ -36,8 +36,31 @@ const TX = `${HEAD}/transformer`;
  * whether it carries per-layer inputs and OpenDDE's does not. See
  * `diffusionWeights`.
  */
+/**
+ * The token transformer's pair width, off the tensor that states it.
+ *
+ * 🔴 THE TWO LAYOUTS NEST DIFFERENTLY AND ORDER THEIR AXES DIFFERENTLY, so one
+ * expression cannot read both:
+ *
+ *     AF3        .../__layer_stack_with_per_layer/pair_logits_projection   [6, 128, 4, 16]
+ *     protenix2  .../__layer_stack_no_per_layer/__layer_stack_no_per_layer/...  [6, 4, 256, 16]
+ *
+ * singly nested with the pair width at axis 1, against doubly nested with it at
+ * axis 2. `txStackFor` cannot be reused either: it appends a trailing
+ * `/transformer` because most leaves in that stack are named `transformer<leaf>`
+ * CONCATENATED, and this one is not.
+ */
+const txPairChannels = (store, perBlockPair) => {
+  const name = txStackName(perBlockPair);
+  return perBlockPair
+    ? dims(store, `${TX}/${name}/${name}/pair_logits_projection/weights`)[2]
+    : dims(store, `${TX}/${name}/pair_logits_projection/weights`)[1];
+};
+
+const txStackName = (perBlockPair) =>
+  perBlockPair ? "__layer_stack_no_per_layer" : "__layer_stack_with_per_layer";
 const txStackFor = (perBlockPair) => {
-  const name = perBlockPair ? "__layer_stack_no_per_layer" : "__layer_stack_with_per_layer";
+  const name = txStackName(perBlockPair);
   return `${TX}/${name}/${name}/transformer`;
 };
 
@@ -48,6 +71,7 @@ const txStackFor = (perBlockPair) => {
  */
 function atomBlock(store, root, index) {
   const at = (leaf) => stacked(store, `${root}${leaf}`, index);
+  const maybe = (leaf) => stackedIfPresent(store, `${root}${leaf}`, index);
   return {
     qSingleCondLayerNormScale: at("qsingle_cond_layer_norm/scale"),
     qSingleCondScaleWeights: at("qsingle_cond_scale/weights"),
@@ -70,6 +94,16 @@ function atomBlock(store, root, index) {
     ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
     ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
     ffwTransition1: at("ffw_transition1/weights"),
+    // 🔴 boltz2's CONDITIONED TRANSITION HAS A THIRD PROJECTION. Its
+    // ConditionedTransitionBlock is `SwiGLU(a) * a_to_b(a)` where every other
+    // family here is `SwiGLU(a)` alone, so the up-gate multiplies the whole
+    // intermediate before the down-projection. Four stacks carry it - the
+    // trunk's atom encoder, the diffusion atom encoder and decoder, and the
+    // token transformer - and without it boltz2's atom stack came out at
+    // relRMS 8.18e-1 against af3-any-model with its pair logits exact to
+    // 9.11e-4, which is the signature of a term missing INSIDE the block.
+    // Null everywhere else, and `conditionedTransition` skips it then.
+    ffwAToB: maybe("ffw_a_to_b/weights"),
     ffwTransition2: at("ffw_transition2/weights"),
     ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
     ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
@@ -117,7 +151,9 @@ async function atomPairNorm(store, stackRoot, perBlock, blocks = 3) {
     const projection = await store.tensor(projectionName);
     return { perBlock: false,
              scale: Array.from({ length: blocks }, () => scale),
-             projection: Array.from({ length: blocks }, () => projection) };
+             projection: Array.from({ length: blocks }, () => projection),
+             // Already [C_PAIR, BLOCKS, HEADS]; the shader wants exactly this.
+             packedProjection: projection };
   }
   const scale = [];
   const projection = [];
@@ -125,7 +161,57 @@ async function atomPairNorm(store, stackRoot, perBlock, blocks = 3) {
     scale.push(await layer(store, scaleName, index));
     projection.push(await layer(store, projectionName, index));
   }
-  return { perBlock: true, scale, projection };
+  // 🔴 THE PER-BLOCK SCALE IS FOLDED INTO THE PER-BLOCK PROJECTION, and the
+  // shared scale becomes ones - exactly what foldPerBlockPairNorm does for the
+  // token transformer, and for the same reason.
+  //
+  // The atom DECODER's shader reads the projection per block
+  // (`c * BLOCKS * HEADS + block * HEADS + head`) and the LayerNorm scale as a
+  // SINGLE shared vector, so on a per-block model it applied BLOCK 0's scale to
+  // every block. AF3 never noticed because its scale is shared already; on
+  // protenix2 the GPU decoder read 1.87e-2 against its own CPU decoder's answer
+  // where AlphaFold 3's reads 4.66e-7, and that compounded to 4.48e-1 over a
+  // whole denoise step and to a fold whose bonds came out at 0.73x ideal.
+  //
+  // 🔴 AND OpenDDE HAS THE SAME FLAG, so it had the same defect and its fold
+  // has been slightly wrong for as long as it has existed - nothing measured
+  // its denoiser against a reference until now.
+  //
+  // The fold is exact: `sum_c n[c] * scale_b[c] * proj_b[c, h]` is
+  // `sum_c n[c] * (scale_b[c] * proj_b[c, h])`. The CPU reference reads the
+  // same arrays, so it sees ones and the folded projection and agrees by
+  // construction rather than by a second implementation.
+  const heads = projection[0].length / scale[0].length;
+  const folded = projection.map((weights, index) => {
+    const out = Float32Array.from(weights);
+    for (let c = 0; c < scale[index].length; c += 1) {
+      for (let h = 0; h < heads; h += 1) out[c * heads + h] *= scale[index][c];
+    }
+    return out;
+  });
+  // 🔴 AND THE SINGULAR `projection` MUST BE PACKED THE WAY THE DECODER'S
+  // SHADER READS IT, WHICH IS NOT HOW A PER-BLOCK CHECKPOINT STORES IT.
+  //
+  //     AlphaFold 3   pair_logits_projection  [C_PAIR, BLOCKS, HEADS]   (16, 3, 4)
+  //     protenix2     the same leaf           [BLOCKS, C_PAIR, HEADS]   (3, 16, 4)
+  //
+  // The shader indexes `c * BLOCKS * HEADS + block * HEADS + head`, so AF3's
+  // whole tensor is already in its layout and `projection[0]` - which for a
+  // SHARED norm is that whole tensor - is right by construction. On a per-block
+  // model `projection[0]` is one block's [C_PAIR, HEADS], sixty-four of the
+  // hundred and ninety-two floats the shader reads, and the other two blocks
+  // read whatever follows. Repacked here, so the singular field means the same
+  // thing for both.
+  const packed = new Float32Array(scale[0].length * blocks * heads);
+  for (let c = 0; c < scale[0].length; c += 1) {
+    for (let b = 0; b < blocks; b += 1) {
+      for (let h = 0; h < heads; h += 1) {
+        packed[(c * blocks + b) * heads + h] = folded[b][c * heads + h];
+      }
+    }
+  }
+  return { perBlock: true, projection: folded, packedProjection: packed,
+           scale: scale.map((one) => new Float32Array(one.length).fill(1)) };
 }
 
 async function atomBlockWith(store, stack, index, dialect) {
@@ -141,6 +227,23 @@ async function atomBlockWith(store, stack, index, dialect) {
 
 export async function targetFeatureWeights(store) {
   const root = "diffuser/evoformer_conditioning";
+  // 🔴 boltz2's `target_feat` IS A SUM OF SEVEN TERMS, NOT A CONCATENATION.
+  // Everything else here lays out [restype 31 | profile 31 | deletion 1 |
+  // atoms 384]; boltz2's InputEmbedder ADDS six bias-free projections onto the
+  // atom encoder's token activation, all at seq_channel. Taking the atom half
+  // alone - which is what `targetFeatAtomOnly` used to mean - put `target_feat`
+  // at relRMS 1.00e+0 against af3-any-model with 0.39x its magnitude, and since
+  // every other thing the trunk builds is a function of it, the fold came out a
+  // 5.9 A ball while the denoise step was exact.
+  const sum = store.manifest?.tensors?.["diffuser/boltz2_res_type_encoding/weights"]
+    === undefined ? null : {
+      resType: await store.tensor("diffuser/boltz2_res_type_encoding/weights"),
+      msaProfile: await store.tensor("diffuser/boltz2_msa_profile_encoding/weights"),
+      molType: await store.tensor("diffuser/boltz2_mol_type_conditioning/weights"),
+      cyclic: await store.tensor("diffuser/boltz2_cyclic_conditioning/weights"),
+      method: await store.tensor("diffuser/boltz2_method_conditioning/weights"),
+      modified: await store.tensor("diffuser/boltz2_modified_conditioning/weights"),
+    };
   const encoder = `${root}_atom_transformer_encoder`;
   const dialect = af3Dialect(store);
   // 🔴 THE PAIR LAYERNORM IS SHARED OR PER BLOCK, AND THE STACK'S NAME SAYS
@@ -174,17 +277,41 @@ export async function targetFeatureWeights(store) {
       embedRefElement: await W("embed_ref_element"),
       embedRefCharge: await W("embed_ref_charge"),
       embedRefAtomName: await W("embed_ref_atom_name"),
+      // 🔴 boltz2 BUILDS THIS AS ONE Linear OVER THE CONCATENATED ATOM FEATURE
+      // VECTOR, and a plain Linear at that - so it carries a bias that AF3's
+      // per-feature bias-free Linears have no slot for. The reference measured
+      // dropping it: a constant 128-vector of std 0.134 off EVERY atom's
+      // embedding, about a quarter of the conditioning's own std, taking
+      // per-atom corr to 0.912 with byte-identical inputs and carrying into
+      // everything downstream.
+      embedAtomFeaturesBias:
+        store.manifest?.tensors?.[`${root}_embed_atom_features_bias`] === undefined
+          ? null : await store.tensor(`${root}_embed_atom_features_bias`),
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
-      // 🔴 THE _1 SUFFIX IS PART OF THE NAME. Four of these also exist under
-      // the unsuffixed name with IDENTICAL shapes, so dropping the suffix loads
-      // clean and gives the wrong target_feat. embed_pair_offsets_valid is the
-      // one with no _1 form, which makes the set look like a typo and is not.
-      singleToPairCondRow: await W("single_to_pair_cond_row_1"),
-      singleToPairCondCol: await W("single_to_pair_cond_col_1"),
-      embedPairOffsets: await W("embed_pair_offsets_1"),
-      embedPairDistances: await W("embed_pair_distances_1"),
+      // 🔴 NOT THE `_1` FORM, AND THIS FILE SAID THE OPPOSITE FOR A YEAR. Four
+      // of these exist twice, unsuffixed and `_1`, with identical shapes -
+      // haiku numbers a module the second time its constructor runs, and both
+      // instantiations are created during `init`. Only the FIRST is called at
+      // inference: tracing af3-any-model's whole fold with
+      // `hk.intercept_methods` shows `diffusion_single_to_pair_cond_row` and
+      // `evoformer_conditioning_single_to_pair_cond_row` firing twice each and
+      // neither `_1` firing at all.
+      //
+      // 🔴 AND FOR ALPHAFOLD 3 THE TWO ARE DIFFERENT TRAINED TENSORS - rms
+      // 0.088 against 0.406 for the row projection, 0.576 against 0.014 for the
+      // offsets - so this was not a naming preference, it was another model.
+      // Every PORTED bundle writes one tensor into both names, which is why
+      // protenix2 and boltz2 could be exact throughout while AF3's own denoise
+      // step read relRMS 4.19e-1 and nothing here could see it: the gate that
+      // would have is an ORACLE, and the per-module checkers all build their
+      // weight dict the same wrong way. `embed_pair_offsets_valid` is the one
+      // with no `_1` form, which is what made the set look like a typo.
+      singleToPairCondRow: await W("single_to_pair_cond_row"),
+      singleToPairCondCol: await W("single_to_pair_cond_col"),
+      embedPairOffsets: await W("embed_pair_offsets"),
+      embedPairDistances: await W("embed_pair_distances"),
       embedPairOffsetsValid: await W("embed_pair_offsets_valid"),
       pairMlp1: await W("pair_mlp_1"),
       pairMlp2: await W("pair_mlp_2"),
@@ -194,7 +321,7 @@ export async function targetFeatureWeights(store) {
       // that ignores it gets AlphaFold 3's behaviour on an OpenDDE bundle -
       // which is a plausible encoder, so the encoder asserts on the flag.
       pairInputLayerNormScale: pairNorm.scale[0],
-      pairLogitsProjection: pairNorm.projection[0],
+      pairLogitsProjection: pairNorm.packedProjection ?? pairNorm.projection[0],
       pairNormPerBlock: pairNorm.perBlock,
       pairInputLayerNormScales: pairNorm.scale,
       pairLogitsProjections: pairNorm.projection,
@@ -212,6 +339,7 @@ export async function targetFeatureWeights(store) {
       // Checked at relRMS 8e-8 against the CPU reference by
       // tools/gpu/check-af3-target-feat-gpu.js, which is also where the 33x
       // comes from.
+      targetFeatSum: sum,
       trunkSingleChannels: 384,
       trunkPairChannels: 128,
       lnormTrunkSingleCondScale: new Float32Array(384),
@@ -223,9 +351,30 @@ export async function targetFeatureWeights(store) {
   };
 }
 
+/**
+ * A LayerNorm's trained OFFSET, where this bundle carries one.
+ *
+ * 🔴 TEN OF boltz2'S DIFFUSION LayerNorms ARE AFFINE AND AlphaFold 3's ARE
+ * SCALE-ONLY, and reading the scale alone put boltz2's whole score model at
+ * relRMS 1.60 - two uncorrelated tensors - with the very first thing built, the
+ * pair conditioning's initial projection, already at 1.45e-1. An offset is a
+ * per-channel constant added after the rescale, so dropping it is not a small
+ * error anywhere it feeds an adaLN.
+ *
+ * 🔴 AND IT IS READ FROM THE BUNDLE, NOT FROM A TABLE. af3-any-model states the
+ * ten scopes per model in `AFFINE_LAYER_NORMS`; here the converter has already
+ * answered the same question by emitting the tensor or not, so asking the store
+ * cannot drift from the weights the way a second list can. AF3's own bundle
+ * carries offsets on the transitions and the trunk norms and is unaffected -
+ * those call sites already read them.
+ */
+const offsetOf = async (store, name) =>
+  (store.manifest?.tensors?.[name] === undefined ? null : await store.tensor(name));
+
 /** The five reference embeddings the atom conditioning sums. */
 export async function atomReference(store) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   return {
     channels: 128,
     embedRefPos: await T("diffusion_embed_ref_pos/weights"),
@@ -233,6 +382,10 @@ export async function atomReference(store) {
     embedRefElement: await T("diffusion_embed_ref_element/weights"),
     embedRefCharge: await T("diffusion_embed_ref_charge/weights"),
     embedRefAtomName: await T("diffusion_embed_ref_atom_name/weights"),
+    // ...and the diffusion head's own copy of it; see targetFeatureWeights.
+    embedAtomFeaturesBias:
+      store.manifest?.tensors?.[`${HEAD}/diffusion_embed_atom_features_bias`] === undefined
+        ? null : await T("diffusion_embed_atom_features_bias"),
   };
 }
 
@@ -253,6 +406,7 @@ export async function atomReference(store) {
  */
 export async function conditioningWeights(store, dialect) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   const transition = async (prefix) => ({
     ffwLayerNormScale: await T(`${prefix}ffw_layer_norm/scale`),
     ffwLayerNormOffset: await T(`${prefix}ffw_layer_norm/offset`),
@@ -268,6 +422,28 @@ export async function conditioningWeights(store, dialect) {
     throw new Error(`this bundle ${hasSplit ? "carries" : "does not carry"} `
       + "z_trunk_projection and its dialect says otherwise");
   }
+  // 🔴 AND THERE IS A THIRD SHAPE, WHICH IS protenix2's. It projects the
+  // relative encoding to the pair width and passes the trunk pair through at
+  // ITS width, so the initial projection folds [z_trunk(c_z), relpe(c_z)]:
+  //
+  //     AF3        raw 139 relpos, trunk pair through   [267, 128]
+  //     OpenDDE    both projected (z_trunk_projection)  [256, 128]
+  //     protenix2  relpe projected, trunk pair through  [512, 256]
+  //
+  // Reading DIFFUSION_PROJECTED_RELPOS as `splitPairConditioning` put a true
+  // here and the guard above caught it in one run, which is the whole reason
+  // that guard exists.
+  const projectedRelpos = dialect.projectedRelpos;
+  if (projectedRelpos === undefined) {
+    throw new Error("dialect.projectedRelpos has no default: AF3 concatenates "
+      + "the RAW 139 relative-position features and protenix2 projects them to "
+      + "the pair width first");
+  }
+  const hasRelpe = store.manifest?.tensors?.[`${HEAD}/relpe_projection/weights`] !== undefined;
+  if (hasRelpe !== (splitPair || projectedRelpos)) {
+    throw new Error(`this bundle ${hasRelpe ? "carries" : "does not carry"} `
+      + "relpe_projection and its dialect says otherwise");
+  }
   return {
     // 🔴 EVERY WIDTH HERE IS THE TENSOR'S. `pair_cond_initial_projection` is
     // [267, 128] under AlphaFold 3 and [256, 128] under OpenDDE, because the
@@ -275,34 +451,81 @@ export async function conditioningWeights(store, dialect) {
     // and OpenDDE's trunk pair arriving here is 384 wide, not 128.
     pairChannels: dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[1],
     seqChannels: dims(store, `${HEAD}/single_cond_initial_projection/weights`)[1],
-    targetFeatWidth: 447, relativeWidth: 139,
+    // 🔴 THE CONDITIONING'S OUTPUT WIDTH AND THE SINGLE IT READS ARE TWO
+    // NUMBERS, and AlphaFold 3 hides that by having them equal. Its projection
+    // is [831, 384] - 384 out, and the trunk single it concatenates is also
+    // 384 - so `seqChannels + targetFeatWidth` happened to be the input width.
+    // boltz2's is [768, 768]: 768 out, 384 in. Read as one number that gives
+    // 1152 against a LayerNorm of 768.
+    trunkSingleChannels:
+      dims(store, "diffuser/evoformer/single_activations/weights")[1],
+    // 🔴 447 WAS TYPED IN, UNDER A COMMENT NAMING THAT EXACT FAULT. boltz2's
+    // target_feat is 384 wide, not AlphaFold 3's 447, and the checkers read
+    // "targetFeat has 10728 elements; expected 9216" - 447 against 384 over 24
+    // tokens. It is derivable and never had to be a constant: the single
+    // conditioning's LayerNorm states its INPUT width, which is the target
+    // features plus the trunk single, plus two more where the dialect pads the
+    // unknown-DNA columns.
+    //
+    //     af3        831 - 0 - 384 = 447
+    //     protenix2  833 - 2 - 384 = 447
+    //     boltz2     768 - 0 - 384 = 384
+    // 🔴 FROM THE TENSOR THAT STATES IT, NOT FROM THE NORM THIS IS CHECKED
+    // AGAINST. Deriving it as `scale - pad - trunkSingle` made the width
+    // assertion in the reference VACUOUS: whatever the scale was, the derived
+    // width absorbed it and the two could never disagree. A stale OpenDDE
+    // bundle with an 831 scale then folded silently at target_feat 445 instead
+    // of 447 - the exact shape of error that assertion exists to catch.
+    // `single_activations` is [447, 384] and says 447 outright.
+    targetFeatWidth: dims(store, "diffuser/evoformer/single_activations/weights")[0],
+    relativeWidth: 139,
     trunkPairChannels: splitPair
       ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
-      : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
+      // ...and where only the RELPOS is projected, the concatenation is two
+      // equal halves, so the trunk pair's width is what relpe was projected TO.
+      : projectedRelpos
+        ? dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0]
+          - dims(store, `${HEAD}/relpe_projection/weights`)[1]
+        : dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[0] - 139,
     pairCondInitialNormScale: await T("pair_cond_initial_norm/scale"),
+    pairCondInitialNormOffset: await O("pair_cond_initial_norm/offset"),
     pairCondInitialProjection: await T("pair_cond_initial_projection/weights"),
     // OpenDDE's two separate compressions; absent under AlphaFold 3, and the
     // reference branches on their presence.
     ...(splitPair ? {
       zTrunkNormScale: await T("z_trunk_norm/scale"),
+      zTrunkNormOffset: await O("z_trunk_norm/offset"),
       zTrunkProjection: await T("z_trunk_projection/weights"),
+      relpeProjection: await T("relpe_projection/weights"),
+    } : projectedRelpos ? {
       relpeProjection: await T("relpe_projection/weights"),
     } : {}),
     pairTransitions: [await transition("pair_transition_0"),
                       await transition("pair_transition_1")],
     singleCondInitialNormScale: await T("single_cond_initial_norm/scale"),
+    singleCondInitialNormOffset: await O("single_cond_initial_norm/offset"),
     singleCondInitialProjection: await T("single_cond_initial_projection/weights"),
+    // 🔴 boltz2's PROJECTION CARRIES A BIAS AND NOBODY ELSE'S DOES. An absent
+    // bias is not a zero one here only because nothing read it: the single
+    // conditioning came out 8.19e-1 from af3-any-model's while the PAIR half
+    // was 2.69e-7, which is the signature of a missing additive term rather
+    // than a wrong width.
+    singleCondInitialProjectionBias:
+      store.manifest?.tensors?.[`${HEAD}/single_cond_initial_projection/bias`] === undefined
+        ? null : await T("single_cond_initial_projection/bias"),
     singleTransitions: [await transition("single_transition_0"),
                         await transition("single_transition_1")],
     fourierWeight: await T("fourier_embedding_weight"),
     fourierBias: await T("fourier_embedding_bias"),
     noiseEmbeddingInitialNormScale: await T("noise_embedding_initial_norm/scale"),
+    noiseEmbeddingInitialNormOffset: await O("noise_embedding_initial_norm/offset"),
     noiseEmbeddingInitialProjection: await T("noise_embedding_initial_projection/weights"),
   };
 }
 
 export async function diffusionWeights(store, superBlocks = 6) {
   const T = (name) => store.tensor(`${HEAD}/${name}`);
+  const O = (name) => offsetOf(store, `${HEAD}/${name}`);
   // The atom stacks' dialect flags; see `atomBlockWith`.
   const dialect = af3Dialect(store);
   const transition = async (prefix) => ({
@@ -411,6 +634,9 @@ export async function diffusionWeights(store, superBlocks = 6) {
         ffwSingleCondScaleBias: at("ffw_single_cond_scale/bias"),
         ffwSingleCondBias: at("ffw_single_cond_bias/weights"),
         ffwTransition1: at("ffw_transition1/weights"),
+        // See `atomBlock`: boltz2's transition up-gate, nested two deep here.
+        ffwAToB: stackedIfPresent(store,
+          `${txStackFor(perBlockPair)}ffw_a_to_b/weights`, s * 4 + inner, 2),
         ffwTransition2: at("ffw_transition2/weights"),
         ffwAdaptiveZeroCondWeights: at("ffw_adaptive_zero_cond/weights"),
         ffwAdaptiveZeroCondBias: at("ffw_adaptive_zero_cond/bias"),
@@ -423,15 +649,39 @@ export async function diffusionWeights(store, superBlocks = 6) {
     });
   }
 
+  // Loaded before the table below so the transformer can take its conditioning
+  // width from it rather than from a constant.
+  const conditioning = await conditioningWeights(store, dialect);
   return {
     dialect: af3Dialect(store),
-    seqChannels: 384, perTokenChannels: 768,
+    // ...and the head's own single width is the conditioning's too: boltz2
+    // embeds 768 where AlphaFold 3 embeds 384.
+    seqChannels: conditioning.seqChannels, perTokenChannels: 768,
     singleCondEmbeddingNormScale: await T("single_cond_embedding_norm/scale"),
+    singleCondEmbeddingNormOffset: await O("single_cond_embedding_norm/offset"),
     singleCondEmbeddingProjection: await T("single_cond_embedding_projection/weights"),
     outputNormScale: await T("output_norm/scale"),
-    conditioning: await conditioningWeights(store, dialect),
+    outputNormOffset: await O("output_norm/offset"),
+    conditioning: conditioning,
     transformer: {
-      channels: 768, condChannels: 384, pairChannels: 128, heads: 16, dimension: 48,
+      // 🔴 `pairChannels: 128` WAS TYPED IN AND IT IS THE MODEL'S, NOT AF3's.
+      // The token transformer reads the diffusion conditioning's PAIR, and
+      // protenix2 widens that to 256 (PROTENIX2_SETTINGS widens
+      // heads.diffusion.conditioning.pair_channel with the trunk). Its
+      // `pair_logits_projection` is [6, 4, 256, 16] where AF3's is
+      // [6, 4, 128, 16] - so the stack was reading a 256-wide pair through a
+      // 128-wide stride, and every stage ran without complaint on a fold whose
+      // backbone bonds came out at 0.96 A against an ideal 1.46.
+      // 🔴 `condChannels: 384` WAS TYPED IN AND IT IS THE CONDITIONING'S OUTPUT
+      // WIDTH. AlphaFold 3's single_cond_initial_projection is [831, 384] and
+      // boltz2's is [768, 768], so the token transformer's conditioning buffer
+      // was allocated at half the size it needed: "Write range (size: 208896)
+      // does not fit in [Buffer difftx.cond] size (104448)" - exactly 2x, and a
+      // validation error rather than a wrong answer only because the shapes
+      // happened to be checkable.
+      channels: 768, condChannels: conditioning.seqChannels,
+      pairChannels: txPairChannels(store, perBlockPair),
+      heads: 16, dimension: 48,
       transitionFactor: 2, blocksPerSuperBlock: 4,
       // Shared under AlphaFold 3 and per block under OpenDDE, where the scale
       // lives inside the doubly-nested stack at [6, 4, 128].
@@ -446,7 +696,11 @@ export async function diffusionWeights(store, superBlocks = 6) {
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32,
-      perTokenChannels: 768, trunkSingleChannels: 384, trunkPairChannels: 128,
+      perTokenChannels: 768, trunkSingleChannels: 384,
+      // ...and the atom encoder's trunk pair, stated by the tensor that embeds
+      // it: [128, 16] under AF3 and [256, 16] under protenix2.
+      trunkPairChannels:
+        dims(store, `${HEAD}/diffusion_embed_trunk_pair_cond/weights`)[0],
       // 🔴 THE _1 SUFFIX IS PART OF THE NAME, HERE TOO. The same four tensors
       // exist unsuffixed, at IDENTICAL shapes, and belong to the pair
       // conditioning computed over a token's own 24 dense atom slots - AF3
@@ -458,10 +712,11 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // 0.102 relRMS against AF3 on the head's own output, side chains about 8%
       // compressed, and nothing caught it because the only checker that reaches
       // the head builds its weights by hand.
-      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row_1/weights"),
-      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col_1/weights"),
-      embedPairOffsets: await T("diffusion_embed_pair_offsets_1/weights"),
-      embedPairDistances: await T("diffusion_embed_pair_distances_1/weights"),
+      // Not the `_1` form; see the note in `targetFeatureWeights`.
+      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row/weights"),
+      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col/weights"),
+      embedPairOffsets: await T("diffusion_embed_pair_offsets/weights"),
+      embedPairDistances: await T("diffusion_embed_pair_distances/weights"),
       // ...and this one has no _1 form, which makes the set look like a typo.
       embedPairOffsetsValid: await T("diffusion_embed_pair_offsets_valid/weights"),
       pairMlp1: await T("diffusion_pair_mlp_1/weights"),
@@ -470,13 +725,15 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // Shared under AlphaFold 3, per block under OpenDDE - and under OpenDDE
       // the tensors live INSIDE the stack, which is why the root moves too.
       pairInputLayerNormScale: encoderPairNorm.scale[0],
-      pairLogitsProjection: encoderPairNorm.projection[0],
+      pairLogitsProjection: encoderPairNorm.packedProjection ?? encoderPairNorm.projection[0],
       pairInputLayerNormScales: encoderPairNorm.scale,
       pairLogitsProjections: encoderPairNorm.projection,
       pairNormPerBlock: encoderPairNorm.perBlock,
       lnormTrunkSingleCondScale: await T("diffusion_lnorm_trunk_single_cond/scale"),
+      lnormTrunkSingleCondOffset: await O("diffusion_lnorm_trunk_single_cond/offset"),
       embedTrunkSingleCond: await T("diffusion_embed_trunk_single_cond/weights"),
       lnormTrunkPairCondScale: await T("diffusion_lnorm_trunk_pair_cond/scale"),
+      lnormTrunkPairCondOffset: await O("diffusion_lnorm_trunk_pair_cond/offset"),
       embedTrunkPairCond: await T("diffusion_embed_trunk_pair_cond/weights"),
       atomPositionsToFeatures: await T("diffusion_atom_positions_to_features/weights"),
       projectAtomFeaturesForAggr: await T("diffusion_project_atom_features_for_aggr/weights"),
@@ -489,13 +746,14 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // Shared under AlphaFold 3, per block under OpenDDE - and under OpenDDE
       // the tensors live INSIDE the stack, which is why the root moves too.
       pairInputLayerNormScale: decoderPairNorm.scale[0],
-      pairLogitsProjection: decoderPairNorm.projection[0],
+      pairLogitsProjection: decoderPairNorm.packedProjection ?? decoderPairNorm.projection[0],
       pairInputLayerNormScales: decoderPairNorm.scale,
       pairLogitsProjections: decoderPairNorm.projection,
       pairNormPerBlock: decoderPairNorm.perBlock,
       projectTokenFeaturesForBroadcast:
         await T("diffusion_project_token_features_for_broadcast/weights"),
       atomFeaturesLayerNormScale: await T("diffusion_atom_features_layer_norm/scale"),
+      atomFeaturesLayerNormOffset: await O("diffusion_atom_features_layer_norm/offset"),
       atomFeaturesToPositionUpdate: await T("diffusion_atom_features_to_position_update/weights"),
       blocks: [await atomBlockWith(store, decoderStackFor(atomPerBlock), 0, dialect),
                await atomBlockWith(store, decoderStackFor(atomPerBlock), 1, dialect),

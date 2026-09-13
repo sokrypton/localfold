@@ -25,6 +25,7 @@ import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import {
   derivedWorkgroupTarget, createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
+  blockHasUpGate,
 } from "./atom-encoder-webgpu.js";
 
 /** Which labels in a caller's `staticCache` already hold their contents. */
@@ -34,20 +35,28 @@ const GRID_WIDTH = 32_768;
 
 const PAIR_ORDER = [
   "pairInputLayerNormScale", "pairLogitsProjection",
-  "projectTokenFeaturesForBroadcast", "atomFeaturesLayerNormScale",
+  "projectTokenFeaturesForBroadcast",
+  // ...and its offset, zeros where the bundle carries none; see PAIR_ORDER in
+  // atom-encoder-webgpu.js.
+  "atomFeaturesLayerNormScale", "atomFeaturesLayerNormOffset",
   "atomFeaturesToPositionUpdate",
 ];
 
 export function packDecoderPairWeights(weights) {
   const offsets = {};
   let total = 0;
+  let source = weights;
   for (const name of PAIR_ORDER) {
-    if (weights[name] === undefined) throw new Error(`atom decoder missing ${name}`);
+    if (source[name] == null && name === "atomFeaturesLayerNormOffset") {
+      source = { ...source,
+                 [name]: new Float32Array(source.atomFeaturesLayerNormScale.length) };
+    }
+    if (source[name] === undefined) throw new Error(`atom decoder missing ${name}`);
     offsets[name] = total;
-    total += weights[name].length;
+    total += source[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of PAIR_ORDER) data.set(weights[name], offsets[name]);
+  for (const name of PAIR_ORDER) data.set(source[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -171,7 +180,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var value = 0.0;
     for (var c = 0u; c < C; c += 1u) {
       value += ((act[row * C + c] * queries_mask[row] - mean) * inverse
-        * weights[P_atomFeaturesLayerNormScale + c])
+        * weights[P_atomFeaturesLayerNormScale + c]
+        + weights[P_atomFeaturesLayerNormOffset + c])
         * weights[P_atomFeaturesToPositionUpdate + c * 3u + axis];
     }
     update[slot * 3u + axis] = value;
@@ -180,10 +190,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // Only the four block passes; the encoder's masking and aggregation are its
   // own, and `aggregate` reads a weight this bundle does not carry.
-  const { project, projectKeys, projectKeysAtoms, expandKeys, attendFor, output,
-          outputRowTile } = createAtomBlockShaders(common, shape);
-  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms, expandKeys,
-           attendFor, output, outputRowTile };
+  const { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
+          attendFor, output, outputRowTile } = createAtomBlockShaders(common, shape);
+  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms,
+           normaliseQueries, expandKeys, attendFor, output, outputRowTile };
 }
 
 export class Af3AtomDecoderGpu {
@@ -214,19 +224,70 @@ export class Af3AtomDecoderGpu {
     const pairPacked = packCached(weights, "dec.pair", () => packDecoderPairWeights(weights));
     const blockPacked = weights.blocks.map(
       (block) => packCached(block, "dec.block", () => packAtomBlockWeights(block)));
+    // 🔴 THE DECODER'S BLOCKS TOOK AlphaFold 3's CONVENTIONS WHATEVER THE MODEL.
+    // `createAtomBlockShaders` is shared with the encoder, which passes
+    // `perBlockPair` and `keyMaskedAtomAttention` into it; this shape passed
+    // NEITHER, so every per-block or key-masked model compiled its decoder
+    // blocks as stock AF3. It runs, it produces a plausible structure, and it
+    // is a different model - measured on protenix2 as 1.21e-2 against this
+    // port's own CPU decoder where AlphaFold 3 reads 4.66e-7, compounding to
+    // 4.5e-1 over a denoise step and to a fold with 0.73x bonds.
+    //
+    // 🔴 AND OpenDDE SETS BOTH FLAGS TOO, so its decoder has had this since it
+    // was ported. Nothing measured a denoiser against a reference until
+    // check-af3-denoise.js existed.
+    if (weights.pairNormPerBlock === undefined) {
+      throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+        + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+    }
+    const keyMasked = weights.blocks[0]?.keyMaskedAtomAttention;
+    if (keyMasked === undefined) {
+      throw new Error("atom decoder blocks carry no keyMaskedAtomAttention");
+    }
+    // 🔴 THE DECODER NEVER CHAINED ITS ADAPTIVE LayerNormS, AND ITS BLOCKS ARE
+    // THE ENCODER'S. Under protenix2, OpenDDE and boltz2's parents the keys
+    // normalise the ALREADY NORMALISED queries rather than the raw activation -
+    // a norm applied twice, which does not commute away. The encoder runs an
+    // extra `normalise-queries` pass for it; this stack ran none, so every one
+    // of its three blocks used the stock-AF3 form. Measured: the decoder's
+    // error GREW with block count - 3.81e-3, 4.73e-3, 1.21e-2 for one, two and
+    // three blocks - which is what a per-block convention looks like.
+    const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
+    if (chainedNorm === undefined) {
+      throw new Error("atom decoder blocks carry no chainedAtomLayerNorm: AF3 "
+        + "normalises the raw activation on both sides, OpenDDE chains them");
+    }
+    if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
+      throw new Error("this atom decoder's blocks disagree about chainedAtomLayerNorm");
+    }
+    // boltz2's transition up-gate; see `blockOrderFor` in the encoder.
+    const upGate = blockHasUpGate(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
+      throw new Error("this atom decoder's blocks disagree about ffwAToB");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels: weights.perTokenChannels,
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
       blocks: weights.blocks.length,
+      perBlockPair: weights.pairNormPerBlock, keyMaskedAtomAttention: keyMasked, upGate,
       atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
       workgroupTarget: derivedWorkgroupTarget(this.device),
     };
     const sources = createAtomDecoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
     const base = `af3-atom-dec:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:rt${shape.outputRowTile ?? "d"}`
-      + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`;
+      + `:${channels}:${pairChannels}:${heads}:${dimension}:${weights.perTokenChannels}`
+      // 🔴 AND THE TRUNK PAIR'S WIDTH IS IN THE KEY. It is baked into the
+      // generated WGSL and every other dimension here can match while it
+      // differs, so two models would have shared one compiled kernel - the
+      // collision this repository has paid for five times now.
+      + `:tp${shape.trunkPairChannels}`
+      // ...and the two conventions, for the reason the encoder's key names
+      // them: the arms index one buffer differently and produce one shape.
+      + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`
+      + `${chainedNorm ? "cn" : ""}${upGate ? "ug" : ""}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -360,6 +421,9 @@ export class Af3AtomDecoderGpu {
       const q = alloc("dec.q", queryRows * width * 4);
       const k = alloc("dec.k", keyRows * width * 4);
       const v = alloc("dec.v", keyRows * width * 4);
+      // Only where the dialect chains; see the note at the dispatch.
+      const normalisedQueries = chainedNorm
+        ? alloc("dec.normalised-queries", queryRows * channels * 4) : null;
       const kAtoms = alloc("dec.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("dec.v-atoms", queryRows * width * 4);
       const gate = alloc("dec.gate", queryRows * width * 4);
@@ -398,8 +462,19 @@ export class Af3AtomDecoderGpu {
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
             perOutput[0], perOutput[1]);
+        // 🔴 CHAINED, SO THE KEYS NORMALISE THE NORMALISED QUERIES. Under stock
+        // AF3 both sides read `act`, this pass does not run, and that path is
+        // unchanged - which is why AlphaFold 3 stays at 4.66e-7 through this.
+        let keySource = act;
+        if (chainedNorm) {
+          const perQueryRow = spread(queryRows);
+          run(`normalise-queries-${index}`, compiled.normaliseQueries,
+              [act, queriesCond, w, normalisedQueries],
+              perQueryRow[0], perQueryRow[1]);
+          keySource = normalisedQueries;
+        }
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
+            [keySource, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);

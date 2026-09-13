@@ -244,6 +244,14 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
         * wide[row * intermediate * 2 + intermediate + i];
     }
   }
+  // 🔴 boltz2's EXTRA UP-GATE. `SwiGLU(a) * a_to_b(a)`, reading the SAME
+  // adaptive-LayerNorm output the SwiGLU reads - not the block input. Present
+  // only where the bundle carries the weight; see `atomBlock`.
+  if (weights.ffwAToB !== undefined && weights.ffwAToB !== null) {
+    const upGate = linear(normalised, queryRows, channels, intermediate,
+                          weights.ffwAToB);
+    for (let index = 0; index < gated.length; index += 1) gated[index] *= upGate[index];
+  }
   const projected = linear(gated, queryRows, intermediate, channels,
                            weights.ffwTransition2);
   const transitionGate = linear(queriesCond, queryRows, channels, channels,
@@ -273,7 +281,7 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
  * matrix a block reads. That makes it invisible to every shape check and to any
  * test that runs one block.
  */
-export function atomPairLogits(pair, shape, weights) {
+export function atomPairLogits(pair, shape, weights, onStage) {
   const { subsets, queries, keys, pairChannels, heads, blocks } = shape;
   const pairRows = subsets * queries * keys;
   if (weights.pairNormPerBlock === undefined) {
@@ -304,6 +312,10 @@ export function atomPairLogits(pair, shape, weights) {
     flat = linear(normalised, pairRows, pairChannels, blocks * heads,
                   weights.pairLogitsProjection);
   }
+  // In [subsets, queries, keys, blocks, heads] order, which is the reference's
+  // own `pair_logits_projection` layout - so a checker can compare it without
+  // a transpose it could get wrong.
+  onStage?.("encoder.pairLogits", flat);
   const output = [];
   for (let block = 0; block < blocks; block += 1) {
     const perBlock = new Float32Array(subsets * heads * queries * keys);
@@ -328,7 +340,7 @@ export function atomPairLogits(pair, shape, weights) {
  *
  * @returns {Float32Array} tokens * perTokenChannels
  */
-export function atomCrossAttentionEncoder(input, weights) {
+export function atomCrossAttentionEncoder(input, weights, onStage) {
   const { tokens, dense, subsets, queries, keys } = input.shape;
   // 🔴 THE DIALECT RIDES IN THE INPUT, because this encoder is INJECTED into
   // the diffusion head as a bare function value (see diffusion-reference.js)
@@ -351,10 +363,17 @@ export function atomCrossAttentionEncoder(input, weights) {
   // and it goes in BEFORE the keys are gathered - so every key sees it too.
   // Only the diffusion head passes it; the trunk's own encoder has no trunk to
   // condition on yet.
+  // 🔴 THE QUERY ACTIVATION AND THE CONDITIONING ARE ONE ARRAY UNDER AF3 AND
+  // TWO UNDER boltz2. Snapshotted here, before the trunk single goes in: under
+  // `preTrunkQuery` the queries read the per-atom features alone while every
+  // adaptive LayerNorm below still reads the full conditioning.
+  const preTrunkQuery = input.dialect?.preTrunkQuery === true;
+  const queriesBeforeTrunk = preTrunkQuery ? Float32Array.from(queriesCond) : null;
   if (input.trunkSingleCond !== undefined) {
     const projected = linear(
       layerNormSlow(input.trunkSingleCond, tokens, weights.trunkSingleChannels,
-                    weights.lnormTrunkSingleCondScale, null),
+                    weights.lnormTrunkSingleCondScale,
+                    weights.lnormTrunkSingleCondOffset ?? null),
       tokens, weights.trunkSingleChannels, channels, weights.embedTrunkSingleCond);
     const perQuery = convert(input.tokensToQueries, projected, channels);
     for (let index = 0; index < queriesCond.length; index += 1) {
@@ -378,7 +397,15 @@ export function atomCrossAttentionEncoder(input, weights) {
   // ...the query starts as the conditioning, and the diffusion head then adds
   // the NOISY POSITIONS to it. The trunk's encoder has no positions to add, so
   // its query is the conditioning alone.
-  const queriesAct = Float32Array.from(queriesCond);
+  const queriesAct = Float32Array.from(queriesBeforeTrunk ?? queriesCond);
+  if (queriesBeforeTrunk !== null) {
+    // ...masked the same way the conditioning was, for the same reason.
+    for (let row = 0; row < queryRows; row += 1) {
+      for (let c = 0; c < channels; c += 1) {
+        queriesAct[row * channels + c] *= queriesMask[row];
+      }
+    }
+  }
   if (input.tokenAtomsAct !== undefined) {
     const gatheredPositions = convert(input.tokenAtomsToQueries, input.tokenAtomsAct, 3);
     const positional = linear(gatheredPositions, queryRows, 3, channels,
@@ -396,6 +423,9 @@ export function atomCrossAttentionEncoder(input, weights) {
                      weights.singleToPairCondRow);
   const column = linear(rectifiedKeys, keyRows, channels, pairChannels,
                         weights.singleToPairCondCol);
+  onStage?.("encoder.queriesCond", queriesCond);
+  onStage?.("encoder.pairCondRow", row);
+  onStage?.("encoder.pairCondCol", column);
 
   // ...the trunk pair conditioning, projected once and then gathered per atom
   // pair below.
@@ -405,9 +435,11 @@ export function atomCrossAttentionEncoder(input, weights) {
   if (input.trunkPairCond !== undefined) {
     trunkPair = linear(
       layerNormSlow(input.trunkPairCond, tokens * tokens, weights.trunkPairChannels,
-                    weights.lnormTrunkPairCondScale, null),
+                    weights.lnormTrunkPairCondScale,
+                    weights.lnormTrunkPairCondOffset ?? null),
       tokens * tokens, weights.trunkPairChannels, pairChannels,
       weights.embedTrunkPairCond);
+    onStage?.("encoder.trunkPair", trunkPair);
     // 🔴 tokens_to_keys IS IN THE BATCH; DO NOT DERIVE IT. Carrying
     // tokens_to_queries through the queries-to-keys gather looks equivalent and
     // is a second source of truth for something the featuriser already
@@ -423,6 +455,16 @@ export function atomCrossAttentionEncoder(input, weights) {
   const keysSpaceUid = convert(input.queriesToKeys, queriesSpaceUid, 1);
 
   const pair = new Float32Array(subsets * queries * keys * pairChannels);
+  // 🔴 THE THREE PAIR TERMS UNMASKED, because the reference records each Linear's
+  // output BEFORE multiplying it by `offsets_valid` - so a checker comparing the
+  // masked sum cannot say which of the three moved. Built only when a caller
+  // asks; `pairTerms` is null otherwise and the loop below skips the stores.
+  const pairTerms = onStage === undefined ? null : {
+    offsets: new Float32Array(subsets * queries * keys * pairChannels),
+    distances: new Float32Array(subsets * queries * keys * pairChannels),
+    valid: new Float32Array(subsets * queries * keys * pairChannels),
+    validFlag: new Float32Array(subsets * queries * keys),
+  };
   const offsets = new Float32Array(3);
   for (let subset = 0; subset < subsets; subset += 1) {
     for (let query = 0; query < queries; query += 1) {
@@ -461,6 +503,12 @@ export function atomCrossAttentionEncoder(input, weights) {
           for (let axis = 0; axis < 3; axis += 1) {
             offsetTerm += offsets[axis] * weights.embedPairOffsets[axis * pairChannels + c];
           }
+          if (pairTerms !== null) {
+            pairTerms.validFlag[queryIndex * keys + key] = valid;
+            pairTerms.offsets[base + c] = offsetTerm;
+            pairTerms.distances[base + c] = weights.embedPairDistances[c] / (1 + squared);
+            pairTerms.valid[base + c] = weights.embedPairOffsetsValid[c];
+          }
           pair[base + c] += valid * (offsetTerm
             + weights.embedPairDistances[c] / (1 + squared))
             // ...and the validity flag itself, which is NOT gated by validity:
@@ -481,18 +529,32 @@ export function atomCrossAttentionEncoder(input, weights) {
     }
   }
 
+  if (pairTerms !== null) {
+    onStage?.("encoder.pairValid", pairTerms.validFlag);
+    onStage?.("encoder.queriesMask", queriesMask);
+    onStage?.("encoder.keysMask", keysMask);
+    onStage?.("encoder.queriesUid", Float32Array.from(queriesSpaceUid));
+    onStage?.("encoder.keysUid", Float32Array.from(keysSpaceUid));
+    onStage?.("encoder.embedPairOffsets", pairTerms.offsets);
+    onStage?.("encoder.embedPairDistances", pairTerms.distances);
+    onStage?.("encoder.embedPairOffsetsValid", pairTerms.valid);
+    onStage?.("encoder.pairBeforeMlp", pair);
+  }
   const pairRows = subsets * queries * keys;
   const relu = (values) => Float32Array.from(values, (v) => (v > 0 ? v : 0));
   let hidden = linear(relu(pair), pairRows, pairChannels, pairChannels, weights.pairMlp1);
+  onStage?.("encoder.pairMlp1", hidden);
   hidden = linear(relu(hidden), pairRows, pairChannels, pairChannels, weights.pairMlp2);
+  onStage?.("encoder.pairMlp2", hidden);
   const residual = linear(relu(hidden), pairRows, pairChannels, pairChannels,
                           weights.pairMlp3);
+  onStage?.("encoder.pairMlp3", residual);
   for (let index = 0; index < pair.length; index += 1) pair[index] += residual[index];
 
   const heads = weights.heads;
   const pairLogits = atomPairLogits(pair, { subsets, queries, keys, pairChannels,
                                             heads, blocks: weights.blocks.length },
-                                    weights);
+                                    weights, onStage);
 
   const shape = { subsets, queries, keys, channels, heads,
                   dimension: weights.dimension };
@@ -506,6 +568,7 @@ export function atomCrossAttentionEncoder(input, weights) {
   for (let index = 0; index < queryRows; index += 1) {
     for (let c = 0; c < channels; c += 1) act[index * channels + c] *= queriesMask[index];
   }
+  onStage?.("encoder.stackOut", act);
   const skipConnection = Float32Array.from(act);
 
   // ...back to token-atom layout, rectified, and averaged over each token's
@@ -513,6 +576,7 @@ export function atomCrossAttentionEncoder(input, weights) {
   const perToken = weights.perTokenChannels;
   const projected = linear(act, queryRows, channels, perToken,
                            weights.projectAtomFeaturesForAggr);
+  onStage?.("encoder.projectForAggr", projected);
   const tokenAtoms = convert(input.queriesToTokenAtoms, projected, perToken);
   const output = new Float32Array(tokens * perToken);
   for (let token = 0; token < tokens; token += 1) {
@@ -537,6 +601,14 @@ export function atomCrossAttentionEncoder(input, weights) {
            queriesCond, keysCond, pairCond: pair };
 }
 
+/** boltz2's mol_type class: protein 0, DNA 1, RNA 2, ligand 3. */
+function molTypeOf(input, token) {
+  if (input.isLigand?.[token]) return 3;
+  if (input.isRna?.[token]) return 2;
+  if (input.isDna?.[token]) return 1;
+  return 0;
+}
+
 /**
  * `target_feat`: the 447 columns everything in the trunk is built from.
  *
@@ -550,8 +622,55 @@ export function atomCrossAttentionEncoder(input, weights) {
  *          deletionMean: ArrayLike<number>, atomFeatures: Float32Array}} input
  * @param {number} tokens
  */
-export function targetFeatures(input, tokens) {
+export function targetFeatures(input, tokens, dialect) {
+  // 🔴 boltz2's IS THE ATOM ENCODER'S COLUMNS ALONE. Everything else here
+  // prepends a restype one-hot, a profile and a deletion mean - 31 + 31 + 1 -
+  // for 447; boltz2 takes the 384 and concatenates s_trunk with THAT. Built
+  // AF3's way it is 447 wide and the fold reads "targetFeat has 30396 elements;
+  // expected 26112".
   const restypes = 31;
+  if (dialect?.targetFeatAtomOnly === true) {
+    const output = Float32Array.from(input.atomFeatures.subarray(0, tokens * 384));
+    const sum = input.sum;
+    if (sum == null) return output;
+    // 🔴 SIX MORE TERMS, ADDED. boltz2's InputEmbedder is a SUM at
+    // seq_channel, not a concatenation: the atom encoder's token activation
+    // plus six bias-free projections. Four of them are constant on an ordinary
+    // monomer and are trained NON-ZERO - the method row alone is a learned
+    // 384-vector added to every token - so leaving them out is not "omitting a
+    // feature nothing uses". Measured: target_feat 1.00e+0 against
+    // af3-any-model without them.
+    const channels = 384;
+    const add = (weights, width, value) => {
+      for (let token = 0; token < tokens; token += 1) {
+        for (let c = 0; c < channels; c += 1) {
+          let total = 0;
+          for (let k = 0; k < width; k += 1) {
+            const v = value(token, k);
+            if (v !== 0) total += v * weights[k * channels + c];
+          }
+          output[token * channels + c] += total;
+        }
+      }
+    };
+    // restype one-hot, 31 classes
+    add(sum.resType, restypes, (token, k) => (input.aatype[token] === k ? 1 : 0));
+    // [profile (31) | deletion mean (1)]
+    add(sum.msaProfile, restypes + 1, (token, k) => (k < restypes
+      ? input.profile[token * restypes + k] : input.deletionMean[token]));
+    // mol_type: protein 0, DNA 1, RNA 2, ligand 3
+    add(sum.molType, 4, (token, k) => (molTypeOf(input, token) === k ? 1 : 0));
+    // the cyclic flag: PRESENT or absent, not the period. Zero on every
+    // ordinary input, so the trained weight only ever acts on a cyclic one.
+    add(sum.cyclic, 1, (token) => Math.min(1, Math.max(0, input.cyclicPeriod?.[token] ?? 0)));
+    // `method` is the experimental method the prediction asks for, and the
+    // default is x-ray diffraction: class 1 of 12, the same for every token.
+    add(sum.method, 12, (_token, k) => (k === 1 ? 1 : 0));
+    // `modified` marks the tokens of a modified residue; row 0 is a learned
+    // non-zero vector, so this term is present even when nothing is modified.
+    add(sum.modified, 2, (token, k) => ((input.isModified?.[token] ? 1 : 0) === k ? 1 : 0));
+    return output;
+  }
   const width = restypes * 2 + 1 + 384;
   const output = new Float32Array(tokens * width);
   for (let token = 0; token < tokens; token += 1) {

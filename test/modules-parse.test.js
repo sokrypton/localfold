@@ -25,6 +25,14 @@ const SOURCE = join(ROOT, "src");
 function javascriptFiles(directory) {
   const found = [];
   for (const entry of readdirSync(directory)) {
+    // 🔴 SKIP HIDDEN DIRECTORIES, BECAUSE AN EDITOR'S ARTEFACT IS NOT A MODULE.
+    // A `src/af3/.ipynb_checkpoints/diffusion-weights-checkpoint.js` appeared
+    // while that file was being edited - a stale snapshot, untracked, which
+    // this sweep imported and failed the whole CPU suite on. The failure named
+    // the checkpoint, but "every module under src/ loads" going red reads as a
+    // broken source tree, and the source tree was fine. Nothing shipped here
+    // lives in a dot-directory.
+    if (entry.startsWith(".")) continue;
     const path = join(directory, entry);
     if (statSync(path).isDirectory()) found.push(...javascriptFiles(path));
     else if (entry.endsWith(".js")) found.push(path);

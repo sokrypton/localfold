@@ -46,6 +46,31 @@ const RAISED_LIMITS = [
  *   may hold, in bytes. Omitted, the device is only counted, not bounded;
  *   `null` asks for the default guess from budgetForDevice.
  */
+/**
+ * The ceiling every adapter is known to offer, for the limits this port RAISES.
+ *
+ * 🔴 A RAISED LIMIT IS A PREDICTION ABOUT THE NEXT MACHINE, and this one is
+ * wrong on Apple silicon. `maxComputeWorkgroupStorageSize` is 49152 on this
+ * A100 and **32768 on Metal**, which is also what RAISED_LIMITS' own comment
+ * says "every adapter tested reports" - so a kernel that takes a 40 KiB tile
+ * compiles here, measures well here, and fails to create its pipeline there,
+ * with an error naming a shader rather than a limit.
+ *
+ * Capping to these on THIS device is how that is asked before the handoff:
+ * `LOCALFOLD_PORTABLE_LIMITS=1` folds every model as a device at the portable
+ * ceiling, and anything that refuses here refuses there. It is the limits twin
+ * of `LOCALFOLD_STOCK_FLAGS`, which asks the same question about FEATURES.
+ *
+ * Only limits that can be LOWERED on this adapter are useful here; the M2's
+ * 4 GiB `maxStorageBufferBindingSize` is twice this card's and cannot be
+ * simulated by asking for less.
+ */
+export const PORTABLE_CEILINGS = Object.freeze({
+  maxComputeWorkgroupStorageSize: 32768,
+  maxComputeInvocationsPerWorkgroup: 1024,
+  maxComputeWorkgroupSizeX: 1024,
+});
+
 export async function requestAlphaFoldDevice(adapter, options = {}) {
   // subgroup-size-control is shipping ahead of the current @webgpu/types union.
   //
@@ -65,10 +90,14 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
     (feature) => adapter.features.has(feature),
   );
   const requiredLimits = {};
+  // `portableLimits` caps what is asked for at PORTABLE_CEILINGS, so this
+  // machine can be made to refuse what a weaker conforming one would.
+  const ceiling = options.portableLimits === true ? PORTABLE_CEILINGS : {};
   for (const name of RAISED_LIMITS) {
     const available = adapter.limits?.[name];
     if (typeof available === "number" && Number.isFinite(available)) {
-      requiredLimits[name] = available;
+      requiredLimits[name] = ceiling[name] === undefined
+        ? available : Math.min(available, ceiling[name]);
     }
   }
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });

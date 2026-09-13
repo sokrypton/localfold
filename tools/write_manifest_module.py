@@ -94,6 +94,32 @@ BUNDLES = {
         "module": "src/reference/manifests/opendde.js",
         "model": "opendde",
     },
+    # Boltz-2 (MIT), whole: trunk, diffusion and its own confidence head, at
+    # int5 group 32. 364 MiB in eight shards, and the strongest model in the
+    # reference's table - it folds 6MRR at RMSD 0.542 A / TM 0.972 against
+    # AlphaFold 3's 0.657, with a seed spread of 0.07 A where protenix2's is
+    # 1.03. See docs/AF3.md.
+    #
+    # 🔴 ITS SHAPE IS NOT AlphaFold 3's, and three constants in this port were
+    # typed to AF3's: 64 pairformer blocks against 48, an 8-block confidence
+    # stack against 4, and a 35-column MSA feature against 34. All three are
+    # read off the weights now.
+    "boltz2": {
+        "export": "model-boltz2-int5",
+        "module": "src/reference/manifests/boltz2.js",
+        "model": "boltz2",
+    },
+    # Protenix-v2, whole, at int5 group 32. 334 MiB in eight shards.
+    #
+    # 🔴 ITS SAMPLER HAS A ONE-ANGSTROM SEED SPREAD ON 6MRR - 0.607 to 1.642 A
+    # over three seeds, where boltz2 spans 0.07 - so a single-seed comparison of
+    # this model means nothing. That is a property of the model and not of the
+    # port; docs/HOSTING.md has the table and the retraction it cost.
+    "protenix2": {
+        "export": "model-protenix2-int5",
+        "module": "src/reference/manifests/protenix2.js",
+        "model": "protenix2",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

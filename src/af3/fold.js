@@ -353,7 +353,7 @@ export async function buildTargetFeat(batch, weights, device) {
     positions: batch.refPos, mask: batch.refMask,
     element: batch.refElement, charge: batch.refCharge,
     atomNameChars: batch.refAtomNameChars,
-  }, batch.tokens, batch.dense, weights.reference);
+  }, batch.tokens, batch.dense, weights.reference, weights.dialect);
 
   const shared = {
     shape: batch.shape, dialect: weights.dialect,
@@ -380,7 +380,12 @@ export async function buildTargetFeat(batch, weights, device) {
   return targetFeatures({
     aatype: batch.aatype, profile: batch.profile, deletionMean: batch.deletionMean,
     atomFeatures: atomFeatures.tokenAct,
-  }, batch.tokens);
+    // boltz2's six extra summands and the features they read; null elsewhere,
+    // and `targetFeatures` returns the atom half alone then.
+    sum: weights.encoder?.targetFeatSum ?? null,
+    isDna: batch.isDna, isRna: batch.isRna, isLigand: batch.isLigand,
+    isModified: batch.isModified, cyclicPeriod: batch.cyclicPeriod,
+  }, batch.tokens, weights.dialect ?? weights.encoder?.dialect);
 }
 
 /**
@@ -672,6 +677,29 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // truncation shows up in every run rather than in a fold that is merely
   // disappointing. The page's status line reports the depth that was
   // FEATURISED, which is not the same claim.
+  // 🔴 THE MSA IS CAPPED AT num_msa AND WE WERE RUNNING THE WHOLE ALIGNMENT.
+  // AF3's Evoformer subsamples to `config.num_msa` - 1024 in every checkpoint
+  // of this lineage - before the MSA stack sees a row. boltz2's featurised
+  // 6MRR batch is 16384 rows deep, so this port was running SIXTEEN TIMES the
+  // rows the model was trained to take: a different model, 3.2 GiB of
+  // `af3-msa.msa-scratch`, and 1.5 s of a 3.3 s trunk.
+  //
+  // 🔴 AND THE FIRST num_msa ROWS ARE NOT AF3's num_msa ROWS. AF3 gumbel-
+  // shuffles first, so which rows survive is a draw from a PRNG this port
+  // cannot reproduce - and on a deep alignment the query itself survives only
+  // with probability num_msa/depth. Taking the prefix keeps the query (it is
+  // row 0 of an a3m) and keeps the alignment's own order, which is
+  // `subsample_msa_keep_query`'s rule rather than `shuffle_msa`'s. It is a
+  // coverage limit, named here rather than left as a silent depth difference,
+  // and `AF3_DETERMINISTIC_MSA=1` on the oracle side is how the two are
+  // compared.
+  const msaCap = options.numMsa ?? 1024;
+  if (batch.sequences > msaCap) {
+    batch = { ...batch, sequences: msaCap,
+              msa: batch.msa.subarray(0, msaCap * tokens),
+              msaMask: batch.msaMask.subarray(0, msaCap * tokens),
+              deletionMatrix: batch.deletionMatrix.subarray(0, msaCap * tokens) };
+  }
   await stage("msa-depth", { sequences: batch.sequences, tokens });
   // 🔴 A RECYCLE'S STATE IS THE TRUNK ITSELF, which is what makes asking for
   // more of them cheap. The loop feeds `previousPair`/`previousSingle` back in,
@@ -834,9 +862,23 @@ export async function foldBatch(device, batch, weights, options = {}) {
     ? structuralLayout(batch).tokens : tokens;
   head?.warm(warmTokens, weights.diffusion, weights.diffusion.dialect).catch(() => {});
 
-  let trunk = reused?.trunk;
-  let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
-  let previousSingle = trunk?.single ?? new Float32Array(tokens * 384);
+  const reusedTrunk = reused?.trunk;
+  // 🔴 THE SEED IS THE BUNDLE'S PAIR WIDTH, NOT AlphaFold 3's 128. The note
+  // below already recorded that OpenDDE's is 384 and that the two "differ by
+  // exactly 3x" - and then seeded 128 anyway, because OpenDDE reaches its trunk
+  // through a path that reshapes. protenix2 does not: at c_z 256 the first pass
+  // read a recycling buffer HALF the length its trunk expects, and every stage
+  // ran without complaint on a structure that came out with 0.96 A backbone
+  // bonds against an ideal 1.46 and consecutive CA at 6.5 A against 3.8.
+  //
+  // Nothing errored anywhere. The fold was wrong from its very first tensor.
+  const trunkPairChannels = weights.trunk.embedder?.pairChannels ?? 128;
+  const trunkSingleChannels = weights.trunk.embedder?.singleChannels ?? 384;
+  let trunk = reusedTrunk;
+  let previousPair = trunk?.pair
+    ?? new Float32Array(tokens * tokens * trunkPairChannels);
+  let previousSingle = trunk?.single
+    ?? new Float32Array(tokens * trunkSingleChannels);
   const firstPass = reused === undefined ? 0 : reused.recycles + 1;
   /** Per pass: how far the single and pair moved from the pass before it. */
   const recycleDeltas = [];
@@ -893,6 +935,8 @@ export async function foldBatch(device, batch, weights, options = {}) {
       contactClasses: af3ContactClasses(batch, tokens),
     }, weights.trunk, weights.trunk.dialect, {
       onStage: (name, ms) => stage("trunk", { name, ms }),
+      // The trunk's own seams, for a caller holding the reference's taps.
+      ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
       // large protein each is seconds. See af3TrunkStageSpans.
@@ -1108,6 +1152,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // 🔴 boltz2's HEAD REBUILDS z, so it needs what the EMBEDDER needed:
+      // relative positions, the bond matrix and its orders. AF3's reads none of
+      // them and the field is simply absent there.
+      features: batch.features, bondMatrix: batch.bondMatrix,
+      bondOrderMatrix: batch.bondOrderMatrix,
     }, weights.confidence, weights.confidence.dialect);
   };
 
@@ -1184,8 +1233,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // PREDICTION, so unlike AlphaFold 3's it cannot run before the sampler - and
   // it runs on the structural token set, so its pLDDT is per structural atom
   // and comes back through the same gather the coordinates do.
-  const scores = structural === undefined ? await confidenceFor()
-    : await openddeScores();
+  // ...and with no confidence weights the fold still produces coordinates; the
+  // scores are reported as absent rather than invented.
+  // 🔴 THE STRUCTURAL PATH IS TESTED FIRST, because OpenDDE scores through its
+  // OWN head and carries no `weights.confidence` at all - checking that first
+  // silently dropped its pLDDT while its fold stayed correct.
+  const scores = structural !== undefined ? await openddeScores()
+    : weights.confidence === undefined ? undefined
+      : await confidenceFor();
   // 🔴 AND THE REFINED PAIR GOES BACK HERE, not when the refiner returned. It
   // is the confidence head's last input and the head runs after the sampler, so
   // this is the one point at which nothing can still read it. At 384 structural

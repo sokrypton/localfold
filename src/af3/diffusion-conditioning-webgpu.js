@@ -38,8 +38,9 @@
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
+import { deviceTuning } from "../runtime/device-profile.js";
 import { singleCondPadding, singleCondPaddingWgsl } from "./dialect.js";
-import { createTransitionShader, packTransitionWeights, transitionRowTile }
+import { createTransitionShader, packTransitionWeights, transitionRowTile, transitionWidth }
   from "./transition-webgpu.js";
 
 /**
@@ -61,24 +62,41 @@ function prepareWeights(weights) {
   if (cached !== undefined) return cached;
   const scale = weights.noiseEmbeddingInitialNormScale;
   const projection = weights.noiseEmbeddingInitialProjection;
-  const noiseData = new Float32Array(scale.length + projection.length);
-  noiseData.set(scale, 0);
-  noiseData.set(projection, scale.length);
+  const norm = packNormWeights(scale, weights.noiseEmbeddingInitialNormOffset);
+  const noiseData = new Float32Array(norm.length + projection.length);
+  noiseData.set(norm, 0);
+  noiseData.set(projection, norm.length);
   // 🔴 THE CLOSED FORM IS A PROPERTY OF THE JOINT LayerNorm, SO THE SPLIT
   // DIALECT HAS NO USE FOR IT - and asking for it there reads `scale[128+c]`
   // off the end of a 256-long norm and hands the shader a buffer of NaN.
   // OpenDDE's pair conditioning normalises each term separately; see the
   // `split` branch of createConditioningShaders.
   const split = weights.zTrunkProjection !== undefined;
+  // ...and the third shape, where only the relpos is projected.
+  const projectedRelpos = !split && weights.relpeProjection !== undefined;
   const prepared = {
-    columnSums: split ? new Float32Array(weights.pairChannels)
-      : relativeColumnSums(weights.pairCondInitialNormScale,
-                           weights.pairCondInitialProjection,
-                           weights.pairChannels, weights.pairChannels),
+    // Two vectors: the closed form's S[o], then the LayerNorm OFFSET's own
+    // constant contribution over the same 139 columns. Zero where the bundle
+    // carries no offset, which is every model but boltz2's family.
+    columnSums: split ? new Float32Array(2 * weights.pairChannels)
+      : (() => {
+        const sums = relativeColumnSums(weights.pairCondInitialNormScale,
+                                        weights.pairCondInitialProjection,
+                                        weights.pairChannels, weights.pairChannels);
+        const offsets = weights.pairCondInitialNormOffset == null
+          ? new Float32Array(weights.pairChannels)
+          : relativeOffsetSums(weights.pairCondInitialNormOffset,
+                               weights.pairCondInitialProjection,
+                               weights.pairChannels, weights.pairChannels);
+        const packed = new Float32Array(sums.length + offsets.length);
+        packed.set(sums, 0); packed.set(offsets, sums.length);
+        return packed;
+      })(),
     noisePacked: {
       data: noiseData,
       offsets: { noiseEmbeddingInitialNormScale: 0,
-                 noiseEmbeddingInitialProjection: scale.length },
+                 noiseEmbeddingInitialNormOffset: scale.length,
+                 noiseEmbeddingInitialProjection: norm.length },
     },
     pairTransitions: weights.pairTransitions.map(
       (w) => packTransitionWeights(asTransitionWeights(w))),
@@ -87,6 +105,29 @@ function prepareWeights(weights) {
   };
   PREPARED_WEIGHTS.set(weights, prepared);
   return prepared;
+}
+
+/**
+ * A LayerNorm's weights as one buffer: the scale, then the offset.
+ *
+ * 🔴 ALWAYS BOTH, WITH ZEROS WHERE THE BUNDLE CARRIES NO OFFSET. An offset of
+ * zero IS the scale-only LayerNorm - it is not a fallback, it is the identity -
+ * so this needs no shader variant and no dialect flag, and a second bundle that
+ * turns out to be affine cannot silently read the scale alone. Ten of boltz2's
+ * diffusion LayerNorms are affine where AlphaFold 3's are scale-only; see
+ * `offsetOf` in diffusion-weights.js.
+ */
+export function packNormWeights(scale, offset) {
+  const packed = new Float32Array(scale.length * 2);
+  packed.set(scale, 0);
+  if (offset != null) {
+    if (offset.length !== scale.length) {
+      throw new Error(`LayerNorm offset is ${offset.length} channels and its `
+        + `scale is ${scale.length}`);
+    }
+    packed.set(offset, scale.length);
+  }
+  return packed;
 }
 
 const GRID_WIDTH = 32_768;
@@ -100,6 +141,24 @@ const RELATIVE_WIDTH = POSITION_BINS * 2 + 1 + (2 * MAX_RELATIVE_CHAIN + 2);
  * S[o] = sum over all 139 relative columns of scale[c] * W[c][o]. A constant of
  * the weights, so it is computed once here rather than per pair on the GPU.
  */
+/**
+ * O[o] = sum over the 139 relative columns of offset[c] * W[c][o].
+ *
+ * The LayerNorm offset is added AFTER the rescale, so its contribution through
+ * the projection is a constant vector - no mean, no inverse-std. That is why it
+ * folds here where the scale needs the closed form's two terms.
+ */
+export function relativeOffsetSums(offset, projection, pairChannels, outChannels) {
+  const sums = new Float32Array(outChannels);
+  for (let c = 0; c < RELATIVE_WIDTH; c += 1) {
+    const row = pairChannels + c;
+    for (let out = 0; out < outChannels; out += 1) {
+      sums[out] += offset[row] * projection[row * outChannels + out];
+    }
+  }
+  return sums;
+}
+
 export function relativeColumnSums(scale, projection, pairChannels, outChannels) {
   const sums = new Float32Array(outChannels);
   for (let c = 0; c < RELATIVE_WIDTH; c += 1) {
@@ -113,11 +172,12 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 }
 
 export function createConditioningShaders(shape, offsets) {
-  const { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
-          padding, split = false, trunkPairChannels = pairChannels } = shape;
+  const { tokens, pairChannels, seqChannels, trunkSingleChannels, targetFeatWidth, noiseChannels,
+          padding, split = false, projectedRelpos = false, singleBias = false,
+          trunkPairChannels = pairChannels } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
-  const singleWidth = seqChannels + targetFeatWidth + padding.length;
+  const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
 
   const pairInitial = `
 const TOKENS: u32 = ${tokens}u;
@@ -135,6 +195,12 @@ const EPSILON: f32 = 1.0e-5;
 @group(0) @binding(1) var<storage, read> features: array<i32>;
 @group(0) @binding(2) var<storage, read> scale: array<f32>;
 @group(0) @binding(3) var<storage, read> projection: array<f32>;
+// 🔴 TWO VECTORS IN ONE BINDING: the closed form's S[o] in the first C_PAIR
+// slots, then the contribution of the LayerNorm OFFSET over the 139 relative
+// columns in the next - a constant of the weights exactly as S is. The
+// trunk-pair half's offset stays in the loop below, where its projection row is
+// read anyway. (No backticks in this comment: it is inside a JS template
+// literal, and one would end the string.)
 @group(0) @binding(4) var<storage, read> column_sums: array<f32>;
 @group(0) @binding(5) var<storage, read_write> pair: array<f32>;
 
@@ -194,8 +260,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   for (var out = 0u; out < C_PAIR; out += 1u) {
     var value = 0.0;
     for (var c = 0u; c < C_PAIR; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse_std * scale[c]
-        * projection[c * C_PAIR + out];
+      value += ((trunk_pair[base + c] - mean) * inverse_std * scale[c]
+        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
     }
     // The set bins, minus the mean times every column's contribution.
     var gathered = scale[row_a] * projection[row_a * C_PAIR + out]
@@ -204,7 +270,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (same_entity) {
       gathered += scale[row_entity] * projection[row_entity * C_PAIR + out];
     }
-    value += inverse_std * (gathered - mean * column_sums[out]);
+    value += inverse_std * (gathered - mean * column_sums[out])
+      + column_sums[C_PAIR + out];
     pair[row * C_PAIR + out] = value;
   }
 }`;
@@ -212,11 +279,19 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const singleInitial = `
 const TOKENS: u32 = ${tokens}u;
 const C_SEQ: u32 = ${seqChannels}u;
+// 🔴 THE SINGLE THIS READS AND THE ONE IT WRITES ARE TWO WIDTHS. AlphaFold 3
+// projects [831 -> 384] and its trunk single is also 384, so C_SEQ served as
+// both the input boundary in feature() and the output extent below. boltz2
+// projects [768 -> 768] from a trunk single of 384: read as one number,
+// feature() takes 768 columns from a 384-wide row and the conditioning came
+// out 8.2e-1 against af3-any-model.
+const C_TRUNK_SEQ: u32 = ${trunkSingleChannels}u;
 const TARGET_WIDTH: u32 = ${targetFeatWidth}u;
 const WIDTH: u32 = ${singleWidth}u;
 const NOISE_CHANNELS: u32 = ${noiseChannels}u;
 const EPSILON: f32 = 1.0e-5;
 const W_NOISE_SCALE: u32 = ${offsets.noiseEmbeddingInitialNormScale}u;
+const W_NOISE_OFFSET: u32 = ${offsets.noiseEmbeddingInitialNormOffset}u;
 const W_NOISE_PROJECT: u32 = ${offsets.noiseEmbeddingInitialProjection}u;
 
 @group(0) @binding(0) var<storage, read> trunk_single: array<f32>;
@@ -255,9 +330,9 @@ fn reduce_sum(local: u32, value: f32) -> f32 {
  * below is generated from the same list the CPU reference walks.
  */
 fn feature(token: u32, index: u32) -> f32 {
-  if (index < C_SEQ) { return trunk_single[token * C_SEQ + index]; }
+  if (index < C_TRUNK_SEQ) { return trunk_single[token * C_TRUNK_SEQ + index]; }
   var source = index;
-${singleCondPaddingWgsl(padding)}  return target_feat[token * TARGET_WIDTH + source - C_SEQ];
+${singleCondPaddingWgsl(padding)}  return target_feat[token * TARGET_WIDTH + source - C_TRUNK_SEQ];
 }
 
 @compute @workgroup_size(64)
@@ -279,7 +354,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse_std = inverseSqrt(reduce_sum(local, centred) / f32(WIDTH) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < WIDTH; c += 64u) {
-    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c];
+    normalised[c] = (feature(token, c) - mean) * inverse_std * scale[c] + scale[WIDTH + c];
   }
 
   // The noise embedding is one row, shared by every token: normalise and
@@ -297,7 +372,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     / f32(NOISE_CHANNELS) + EPSILON);
   workgroupBarrier();
   for (var c = local; c < NOISE_CHANNELS; c += 64u) {
-    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse * noise_weights[W_NOISE_SCALE + c];
+    noise_norm[c] = (noise[c] - noise_mean) * noise_inverse
+      * noise_weights[W_NOISE_SCALE + c] + noise_weights[W_NOISE_OFFSET + c];
   }
   workgroupBarrier();
 
@@ -309,6 +385,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     for (var c = 0u; c < NOISE_CHANNELS; c += 1u) {
       value += noise_norm[c] * noise_weights[W_NOISE_PROJECT + c * C_SEQ + out];
     }
+${singleBias ? "    value += projection[C_SEQ * WIDTH + out];" : ""}
     single[token * C_SEQ + out] = value;
   }
 }`;
@@ -400,8 +477,8 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < C_TRUNK; c += 1u) {
-      value += (trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
-        * z_projection[c * C_PAIR + out];
+      value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
     }
     concatenated[out] = value;
   }
@@ -455,14 +532,74 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   for (var out = lane; out < C_PAIR; out += LANES) {
     var value = 0.0;
     for (var c = 0u; c < WIDTH; c += 1u) {
-      value += (concatenated[c] - joint_mean) * joint_inverse * scale[c]
-        * projection[c * C_PAIR + out];
+      value += ((concatenated[c] - joint_mean) * joint_inverse * scale[c]
+        + scale[WIDTH + c]) * projection[c * C_PAIR + out];
     }
     pair[row * C_PAIR + out] = value;
   }
 }`;
 
-  return { pairInitial: split ? pairInitialSplit : pairInitial, singleInitial };
+  // 🔴 THE THIRD SHAPE: THE RELPOS PROJECTED, THE TRUNK PAIR PASSED THROUGH.
+  // protenix2 and boltz2 both take it, and with only `split` and the joint arm
+  // to choose from they fell into AlphaFold 3's raw-139 one - which read a
+  // PREFIX of protenix2's 512-long scale and quietly agreed with an equally
+  // wrong reference, and read PAST the end of boltz2's 256-long one and made
+  // 73728 NaNs. See the note in src/af3/diffusion-reference.js.
+  //
+  // It is the split kernel with the trunk compression replaced by a copy: no
+  // z_norm, no z_projection, and WIDTH is C_TRUNK + C_PAIR rather than
+  // 2 * C_PAIR. Derived from that text rather than written beside it, so the
+  // two cannot drift - the joint LayerNorm and the output projection below the
+  // concatenation are the same lines in both.
+  const pairInitialProjectedRelpos = pairInitialSplit
+    .replace(`const WIDTH: u32 = ${2 * pairChannels}u;`,
+             `const WIDTH: u32 = ${trunkPairChannels + pairChannels}u;`)
+    .replace(`@group(0) @binding(2) var<storage, read> z_scale: array<f32>;
+@group(0) @binding(3) var<storage, read> z_projection: array<f32>;
+@group(0) @binding(4) var<storage, read> relpe_projection: array<f32>;
+@group(0) @binding(5) var<storage, read> scale: array<f32>;
+@group(0) @binding(6) var<storage, read> projection: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pair: array<f32>;`,
+             `@group(0) @binding(2) var<storage, read> relpe_projection: array<f32>;
+@group(0) @binding(3) var<storage, read> scale: array<f32>;
+@group(0) @binding(4) var<storage, read> projection: array<f32>;
+@group(0) @binding(5) var<storage, read_write> pair: array<f32>;`)
+    .replace(`  // LayerNorm over the trunk pair's own width.
+  var partial = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) { partial += trunk_pair[base + c]; }
+  let mean = total_of(lane, partial) / f32(C_TRUNK);
+  workgroupBarrier();
+  var squares = 0.0;
+  for (var c = lane; c < C_TRUNK; c += LANES) {
+    let d = trunk_pair[base + c] - mean;
+    squares += d * d;
+  }
+  let inverse_std = inverseSqrt(total_of(lane, squares) / f32(C_TRUNK) + EPSILON);
+  workgroupBarrier();
+
+  // ...projected to the pair width, into the first half of the concatenation.
+  for (var out = lane; out < C_PAIR; out += LANES) {
+    var value = 0.0;
+    for (var c = 0u; c < C_TRUNK; c += 1u) {
+      value += ((trunk_pair[base + c] - mean) * inverse_std * z_scale[c]
+        + z_scale[C_TRUNK + c]) * z_projection[c * C_PAIR + out];
+    }
+    concatenated[out] = value;
+  }`,
+             `  // The trunk pair, copied in RAW: no LayerNorm of its own and no
+  // projection. The joint LayerNorm below is the only one it sees.
+  for (var c = lane; c < C_TRUNK; c += LANES) {
+    concatenated[c] = trunk_pair[base + c];
+  }`)
+    .replace(`    concatenated[C_PAIR + out] = value;`,
+             `    concatenated[C_TRUNK + out] = value;`);
+  if (projectedRelpos && pairInitialProjectedRelpos === pairInitialSplit) {
+    throw new Error("the projected-relpos shader derivation matched nothing: "
+      + "the split kernel's text moved and the two have drifted apart");
+  }
+
+  return { pairInitial: projectedRelpos ? pairInitialProjectedRelpos
+             : split ? pairInitialSplit : pairInitial, singleInitial };
 }
 
 /**
@@ -543,22 +680,38 @@ export class Af3DiffusionConditioningGpu {
     const pairs = tokens * tokens;
     const pairChannels = weights.pairChannels;
     const seqChannels = weights.seqChannels;
+    // ...and the single it READS, which is a different number under boltz2.
+    const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
     const targetFeatWidth = weights.targetFeatWidth;
     const noiseChannels = weights.fourierWeight.length;
     const prepared = prepareWeights(weights);
     const noisePacked = prepared.noisePacked;
-    const padding = singleCondPadding(dialect, seqChannels);
+    const padding = singleCondPadding(dialect, trunkSingleChannels);
     // 🔴 THE TRUNK PAIR'S WIDTH IS NOT THE CONDITIONING'S under the split
     // dialect - OpenDDE hands 384 channels to a 128-channel conditioning - so
     // the two are separate here and the cache key carries both.
     const split = weights.zTrunkProjection !== undefined;
-    const trunkPairChannels = split
+    const projectedRelpos = !split && weights.relpeProjection !== undefined;
+    // 🔴 THE TRUNK PAIR'S WIDTH MATTERS IN BOTH PROJECTED SHAPES, not only the
+    // split one - it is the first half of the concatenation either way.
+    const trunkPairChannels = (split || projectedRelpos)
       ? (weights.trunkPairChannels ?? pairChannels) : pairChannels;
-    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
-                    padding, split, trunkPairChannels };
+    // 🔴 boltz2's SINGLE PROJECTION CARRIES A BIAS AND NOBODY ELSE'S DOES, so
+    // it is appended to that buffer and read past its matrix - which keeps the
+    // binding count the same for every model.
+    const singleBias = weights.singleCondInitialProjectionBias != null;
+    const shape = { tokens, pairChannels, seqChannels, trunkSingleChannels,
+                    targetFeatWidth, noiseChannels, singleBias,
+                    padding, split, projectedRelpos, trunkPairChannels };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
-      + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`;
+      // 🔴 THE MODE IS IN THE KEY. Two of the three shapes can produce the same
+      // dimensions with different kernels, and a cache indexed on dimensions
+      // alone would hand one caller the other's - the collision this repository
+      // has now paid for four times.
+      + `:${noiseChannels}:${padding.join(",")}:${split ? trunkPairChannels : 0}`
+      + `:${projectedRelpos ? `pr${trunkPairChannels}` : ""}`
+      + `:ts${trunkSingleChannels}${singleBias ? ":sb" : ""}`;
     const compiled = {
       pairInitial: reusePair !== undefined ? undefined
         : await this.pipelines.get(`${base}:pair-initial`, sources.pairInitial),
@@ -575,9 +728,24 @@ export class Af3DiffusionConditioningGpu {
         : await this.pipelines.get(`${base}:pair-transition:${index}`,
             createTransitionShader({ rows: pairs, channels: pairChannels, factor: 2 },
                                    prepared.pairTransitions[index].offsets, 1e-5, "two-pass")));
+      // 🔴 THE SINGLE TRANSITION IS `tokens` ROWS AND THE KERNEL DISPATCHES
+      // ROWS ONLY, so at 68 tokens it runs 68 workgroups of the default 128
+      // threads - 8,704 on a device that holds 221,184. `transitionThreadTarget`
+      // is the rule that widens it, and device-profile.js prices it at 4.19x on
+      // the TRUNK's single transition, which is the same shape. This call site
+      // never asked for it: boltz2's two conditioning transitions were 44% of
+      // its whole denoiser call's GPU time, 8.4 ms of 21.4, because its seq
+      // channel is 768 where AlphaFold 3's is 384 and the row's arithmetic goes
+      // as the square.
+      //
+      // The width is BAKED into the shader, so it is in the key.
+      const singleWidth_ = transitionWidth(
+        tokens, transitionRowTile(tokens, seqChannels),
+        deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2);
       transitionPipelines.single.push(await this.pipelines.get(
-        `${base}:single-transition:${index}`,
-        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2 },
+        `${base}:single-transition:${index}:w${singleWidth_}`,
+        createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2,
+                                 width: singleWidth_ },
                                prepared.singleTransitions[index].offsets, 1e-5, "two-pass")));
     }
     return { shape, base, compiled, transitionPipelines };
@@ -593,6 +761,8 @@ export class Af3DiffusionConditioningGpu {
     const pairs = tokens * tokens;
     const pairChannels = weights.pairChannels;
     const seqChannels = weights.seqChannels;
+    // ...and the single it READS, which is a different number under boltz2.
+    const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
     const targetFeatWidth = weights.targetFeatWidth;
     const noiseChannels = weights.fourierWeight.length;
 
@@ -613,8 +783,8 @@ export class Af3DiffusionConditioningGpu {
     // 🔴 THE PADDING IS PART OF THE CACHE KEY, because it changes the generated
     // `feature()` body while every dimension in the key stays put - the one
     // shape a shader cache cannot see.
-    const padding = singleCondPadding(input.dialect, seqChannels);
-    const singleWidth = seqChannels + targetFeatWidth + padding.length;
+    const padding = singleCondPadding(input.dialect, trunkSingleChannels);
+    const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
     if (weights.singleCondInitialNormScale.length !== singleWidth) {
       throw new Error(`single conditioning is ${singleWidth} channels but its `
         + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
@@ -623,7 +793,9 @@ export class Af3DiffusionConditioningGpu {
 
     const { shape, base, compiled, transitionPipelines } =
       await this.#compileFor(tokens, weights, input.dialect, reusePair);
-    const { split } = shape;
+    // ...and the third mode, carried on the shape with it so `run` and the
+    // shader factory cannot disagree about which kernel is compiled.
+    const { split, projectedRelpos } = shape;
     const featureData = new Int32Array(5 * tokens);
     ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"].forEach((name, index) => {
       const source = input.features[name];
@@ -658,23 +830,33 @@ export class Af3DiffusionConditioningGpu {
       const resident = (label, build) =>
         ({ buffer: residentWeightBuffer(this.device, weights, label, build) });
       const pairScale = onlyIfNew(() => resident("cond.pair-scale",
-        () => weights.pairCondInitialNormScale));
+        () => packNormWeights(weights.pairCondInitialNormScale,
+                              weights.pairCondInitialNormOffset)));
       const pairProjection = onlyIfNew(() => resident("cond.pair-projection",
         () => weights.pairCondInitialProjection));
       const sums = onlyIfNew(() => resident("cond.column-sums", () => columnSums));
       const zScale = split
-        ? onlyIfNew(() => resident("cond.z-scale", () => weights.zTrunkNormScale))
+        ? onlyIfNew(() => resident("cond.z-scale",
+            () => packNormWeights(weights.zTrunkNormScale, weights.zTrunkNormOffset)))
         : undefined;
       const zProjection = split
         ? onlyIfNew(() => resident("cond.z-projection", () => weights.zTrunkProjection))
         : undefined;
-      const relpeProjection = split
+      const relpeProjection = (split || projectedRelpos)
         ? onlyIfNew(() => resident("cond.relpe-projection", () => weights.relpeProjection))
         : undefined;
       const singleScale = resident("cond.single-scale",
-        () => weights.singleCondInitialNormScale);
-      const singleProjection = resident("cond.single-projection",
-        () => weights.singleCondInitialProjection);
+        () => packNormWeights(weights.singleCondInitialNormScale,
+                              weights.singleCondInitialNormOffset));
+      const singleProjection = resident("cond.single-projection", () => {
+        const matrix = weights.singleCondInitialProjection;
+        const bias = weights.singleCondInitialProjectionBias;
+        if (bias == null) return matrix;
+        const packed = new Float32Array(matrix.length + bias.length);
+        packed.set(matrix, 0);
+        packed.set(bias, matrix.length);
+        return packed;
+      });
       const noise = up("cond.noise", embedded);
       const noiseWeights = resident("cond.noise-weights", () => noisePacked.data);
 
@@ -738,13 +920,18 @@ export class Af3DiffusionConditioningGpu {
       // and it is read at the top of this method, because the uploads and the
       // allocations above it are pair-track work too.
       // The split kernel is a workgroup per pair row; the joint one is a lane.
-      const pairLinear = spread(split ? pairs : Math.ceil(pairs / 64));
+      // The two projected kernels are a workgroup per pair row; the joint one is
+      // a lane.
+      const pairLinear = spread((split || projectedRelpos) ? pairs
+        : Math.ceil(pairs / 64));
       if (reusePair === undefined) {
         run("pair-initial", compiled.pairInitial,
             split
               ? [trunkPair, features, zScale, zProjection, relpeProjection,
                  pairScale, pairProjection, pair]
-              : [trunkPair, features, pairScale, pairProjection, sums, pair],
+              : projectedRelpos
+                ? [trunkPair, features, relpeProjection, pairScale, pairProjection, pair]
+                : [trunkPair, features, pairScale, pairProjection, sums, pair],
             pairLinear[0], pairLinear[1]);
       }
       run("single-initial", compiled.singleInitial,

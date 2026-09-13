@@ -46,11 +46,46 @@ const DGRAM_MIN = 3.25;
 const DGRAM_MAX = 50.75;
 
 const EMBED_ORDER = ["leftTargetFeatProject", "rightTargetFeatProject", "distogramFeatProject"];
+// 🔴 protenix2 ADDS A SECOND, UNBINNED DISTANCE TERM and normalises the trunk
+// single before any use. Both are chosen by the tensors being there.
+const embedOrderFor = (weights) => (weights.distanceFeatProject === undefined
+  ? EMBED_ORDER : [...EMBED_ORDER, "distanceFeatProject"]);
+// 🔴 boltz2 REBUILDS z RATHER THAN ADDING TO IT, from nine terms under its own
+// scope. See `boltz2Reembed` in confidence-reference.js, which this mirrors.
+const REEMBED_ORDER = [
+  "sInputsNormScale", "sInputsNormOffset", "sNormScale", "sNormOffset", "sInputToS",
+  "zNormScale", "zNormOffset", "relPosProject", "tokenBondsProject",
+  "tokenBondsTypeEmbed", "contactEncodingUnspecified",
+  "leftTargetFeatProject", "rightTargetFeatProject",
+  "sToZProdIn1", "sToZProdIn2", "sToZProdOut", "distogramFeatProject",
+];
+const BOLTZ2_DGRAM_BINS = 64;
+const MAX_RELATIVE_IDX = 32;
+const MAX_RELATIVE_CHAIN = 2;
+const POSITION_BINS = 2 * MAX_RELATIVE_IDX + 2;
 const HEAD_ORDER = [
   "logitsLnScale", "logitsLnOffset", "leftHalfDistanceLogits",
   "paeLogitsLnScale", "paeLogitsLnOffset", "paeLogits",
   "plddtLnScale", "plddtLnOffset", "plddtLogits",
   "resolvedLnScale", "resolvedLnOffset", "experimentallyResolvedLogits",
+];
+/**
+ * 🔴 A HEAD LayerNorm A BUNDLE DOES NOT CARRY IS NO LayerNorm, not one at scale
+ * one: normalising still re-centres and rescales. boltz2 calls every logit head
+ * directly on z and s, which is why those six tensors have no source in its
+ * checkpoint - and why this cannot be a zero weight.
+ *
+ * 🔴 AND IT SPLITS EACH PAIR HEAD IN TWO, intra-chain and inter-chain, masked
+ * hard rather than blended. On a MONOMER the inter head never fires, so a
+ * single-chain gate cannot see whether it is implemented at all.
+ */
+const headOrderFor = (weights) => [
+  ...(weights.logitsLnScale === undefined
+    ? ["leftHalfDistanceLogits", "paeLogits", "plddtLogits",
+       "experimentallyResolvedLogits"]
+    : HEAD_ORDER),
+  ...(weights.interHalfDistanceLogits === undefined
+    ? [] : ["interHalfDistanceLogits", "paeInterLogits"]),
 ];
 
 function pack(weights, order, label) {
@@ -75,7 +110,47 @@ function errorBinCentres() {
   return centres;
 }
 
-export function createConfidenceShaders(shape, embedOffsets, headOffsets, epsilon, variance) {
+/**
+ * protenix2's trunk single, clamped and LayerNormed before ANY use.
+ *
+ * 🔴 ON THE HOST, DELIBERATELY. It is tokens x 384 - 26k values at 68 tokens,
+ * 115k at 300 - and it is the only thing between the trunk and the confidence
+ * pairformer, which is a 4-block stack. A dispatch for it would cost a pass and
+ * a readback to save a loop that does not appear in any profile. Every other
+ * model gets the trunk's single unchanged, which is what `undefined` means.
+ */
+function normalisedTrunkSingle(input, weights, tokens) {
+  const single = asFloats(input.single);
+  if (weights.inputSingleNormScale === undefined) return single;
+  const channels = weights.singleChannels;
+  const output = new Float32Array(single.length);
+  for (let token = 0; token < tokens; token += 1) {
+    const base = token * channels;
+    let total = 0;
+    for (let c = 0; c < channels; c += 1) {
+      total += Math.min(512, Math.max(-512, single[base + c]));
+    }
+    const mean = total / channels;
+    let variance = 0;
+    for (let c = 0; c < channels; c += 1) {
+      const d = Math.min(512, Math.max(-512, single[base + c])) - mean;
+      variance += d * d;
+    }
+    const inverse = 1 / Math.sqrt(variance / channels + 1e-5);
+    for (let c = 0; c < channels; c += 1) {
+      output[base + c] = (Math.min(512, Math.max(-512, single[base + c])) - mean) * inverse
+        * weights.inputSingleNormScale[c] + weights.inputSingleNormOffset[c];
+    }
+  }
+  return output;
+}
+
+export function createConfidenceShaders(shape, embedOffsets, headOffsets, epsilon, variance,
+                                        reembedOffsets = null) {
+  // Which of the three head shapes this bundle asks for; see `headOrderFor`.
+  const headNorm = headOffsets.logitsLnScale !== undefined;
+  const splitHeads = headOffsets.interHalfDistanceLogits !== undefined;
+  const preSymmetrised = shape.preSymmetrisedPde === true;
   const { tokens, pairChannels, singleChannels, targetFeatWidth, dense } = shape;
   const pairs = tokens * tokens;
   const centres = errorBinCentres();
@@ -159,6 +234,8 @@ const LOWER = array<f32, ${DGRAM_BINS}>(${lower.join(", ")});
 const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
 const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 const W_DGRAM: u32 = ${embedOffsets.distogramFeatProject}u;
+${embedOffsets.distanceFeatProject === undefined ? ""
+  : `const W_DISTANCE: u32 = ${embedOffsets.distanceFeatProject}u;`}
 
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> pseudo_beta: array<f32>;
@@ -198,7 +275,260 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (bin >= 0) {
       value += keep * weights[W_DGRAM + u32(bin) * C_Z + c];
     }
+${embedOffsets.distanceFeatProject === undefined ? ""
+  : `    // protenix2's second, UNBINNED distance term - and it is not masked,
+    // exactly as the binned one above is.
+    value += sqrt(squared + 1.0e-10) * weights[W_DISTANCE + c];`}
     pair[row * C_Z + c] = value;
+  }
+}`;
+
+  // 🔴 boltz2's RE-EMBEDDING, IN TWO PASSES FOR THE REASON `embedProject` GIVES.
+  // Five of its nine terms are per-TOKEN projections of one LayerNormed
+  // s_inputs; computing them per PAIR would redo each of them TOKENS times, and
+  // the outer-product term would redo two of them twice over. This pass writes
+  // s_inputs, the two pair-axis projections, the two outer-product factors and
+  // the rebuilt single; the pair pass below reads them.
+  const reembedProject = reembedOffsets === null ? null : `${common}
+const W_SI_SCALE: u32 = ${reembedOffsets.sInputsNormScale}u;
+const W_SI_OFFSET: u32 = ${reembedOffsets.sInputsNormOffset}u;
+const W_S_SCALE: u32 = ${reembedOffsets.sNormScale}u;
+const W_S_OFFSET: u32 = ${reembedOffsets.sNormOffset}u;
+const W_S_IN_TO_S: u32 = ${reembedOffsets.sInputToS}u;
+const W_LEFT: u32 = ${reembedOffsets.leftTargetFeatProject}u;
+const W_RIGHT: u32 = ${reembedOffsets.rightTargetFeatProject}u;
+const W_PROD1: u32 = ${reembedOffsets.sToZProdIn1}u;
+const W_PROD2: u32 = ${reembedOffsets.sToZProdIn2}u;
+
+@group(0) @binding(0) var<storage, read> target_feat: array<f32>;
+@group(0) @binding(1) var<storage, read> trunk_single: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+// 🔴 FOUR PLANES IN ONE BINDING, because WebGPU's default limit is EIGHT
+// storage buffers a stage and the pair pass below needs eleven things. Four of
+// them are the same shape and are written together here, so one buffer of
+// 4 * TOKENS * C_Z costs nothing and takes the pair pass to exactly eight.
+@group(0) @binding(3) var<storage, read_write> projections: array<f32>;
+@group(0) @binding(4) var<storage, read_write> single: array<f32>;
+
+var<workgroup> s_inputs: array<f32, ${targetFeatWidth}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let token = group.x;
+  if (token >= TOKENS) { return; }
+  let local = local_id.x;
+
+  var total = 0.0;
+  var squares = 0.0;
+  for (var f = local; f < TARGET_WIDTH; f += 64u) {
+    let value = target_feat[token * TARGET_WIDTH + f];
+    total += value;
+    squares += value * value;
+  }
+  reduce_a[local] = total;
+  reduce_b[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(TARGET_WIDTH);
+  let variance = reduce_b[0] / f32(TARGET_WIDTH) - mean * mean;
+  let inverse = inverseSqrt(variance + EPSILON);
+  workgroupBarrier();
+  for (var f = local; f < TARGET_WIDTH; f += 64u) {
+    s_inputs[f] = (target_feat[token * TARGET_WIDTH + f] - mean) * inverse
+      * weights[W_SI_SCALE + f] + weights[W_SI_OFFSET + f];
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C_Z; c += 64u) {
+    var l = 0.0; var r = 0.0; var p1 = 0.0; var p2 = 0.0;
+    for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+      let value = s_inputs[f];
+      l += value * weights[W_LEFT + f * C_Z + c];
+      r += value * weights[W_RIGHT + f * C_Z + c];
+      p1 += value * weights[W_PROD1 + f * C_Z + c];
+      p2 += value * weights[W_PROD2 + f * C_Z + c];
+    }
+    let plane = TOKENS * C_Z;
+    projections[token * C_Z + c] = l;
+    projections[plane + token * C_Z + c] = r;
+    projections[2u * plane + token * C_Z + c] = p1;
+    projections[3u * plane + token * C_Z + c] = p2;
+  }
+
+  // ...and the single track: its own LayerNorm plus a projection of s_inputs.
+  var s_total = 0.0;
+  var s_squares = 0.0;
+  for (var c = local; c < C_S; c += 64u) {
+    let value = trunk_single[token * C_S + c];
+    s_total += value;
+    s_squares += value * value;
+  }
+  workgroupBarrier();
+  reduce_a[local] = s_total;
+  reduce_b[local] = s_squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let s_mean = reduce_a[0] / f32(C_S);
+  let s_variance = reduce_b[0] / f32(C_S) - s_mean * s_mean;
+  let s_inverse = inverseSqrt(s_variance + EPSILON);
+  for (var c = local; c < C_S; c += 64u) {
+    var value = (trunk_single[token * C_S + c] - s_mean) * s_inverse
+      * weights[W_S_SCALE + c] + weights[W_S_OFFSET + c];
+    for (var f = 0u; f < TARGET_WIDTH; f += 1u) {
+      value += s_inputs[f] * weights[W_S_IN_TO_S + f * C_S + c];
+    }
+    single[token * C_S + c] = value;
+  }
+}`;
+
+  // The pair half: z_norm(trunk z) plus eight terms. One workgroup per pair row,
+  // because the outer-product term contracts C_Z into C_Z and is the only thing
+  // here that is not a gather or a broadcast.
+  const reembedPair = reembedOffsets === null ? null : `${common}
+const W_Z_SCALE: u32 = ${reembedOffsets.zNormScale}u;
+const W_Z_OFFSET: u32 = ${reembedOffsets.zNormOffset}u;
+const W_RELPOS: u32 = ${reembedOffsets.relPosProject}u;
+const W_BOND: u32 = ${reembedOffsets.tokenBondsProject}u;
+const W_BOND_TYPE: u32 = ${reembedOffsets.tokenBondsTypeEmbed}u;
+const W_CONTACT: u32 = ${reembedOffsets.contactEncodingUnspecified}u;
+const W_PROD_OUT: u32 = ${reembedOffsets.sToZProdOut}u;
+const W_DGRAM: u32 = ${reembedOffsets.distogramFeatProject}u;
+const MAX_RELATIVE_IDX: i32 = ${MAX_RELATIVE_IDX};
+const MAX_RELATIVE_CHAIN: i32 = ${MAX_RELATIVE_CHAIN};
+const POSITION_BINS: u32 = ${POSITION_BINS}u;
+const DGRAM64: u32 = ${BOLTZ2_DGRAM_BINS}u;
+
+@group(0) @binding(0) var<storage, read> pair_in: array<f32>;
+// The four per-token projections, in planes; see the pass above.
+@group(0) @binding(1) var<storage, read> projections: array<f32>;
+@group(0) @binding(2) var<storage, read> features: array<i32>;
+@group(0) @binding(3) var<storage, read> bonds: array<f32>;
+@group(0) @binding(4) var<storage, read> pseudo_beta: array<f32>;
+@group(0) @binding(5) var<storage, read> pair_mask: array<f32>;
+@group(0) @binding(6) var<storage, read> weights: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pair_out: array<f32>;
+const PLANE: u32 = ${tokens * pairChannels}u;
+fn left_at(t: u32, c: u32) -> f32 { return projections[t * C_Z + c]; }
+fn right_at(t: u32, c: u32) -> f32 { return projections[PLANE + t * C_Z + c]; }
+fn prod1_at(t: u32, c: u32) -> f32 { return projections[2u * PLANE + t * C_Z + c]; }
+fn prod2_at(t: u32, c: u32) -> f32 { return projections[3u * PLANE + t * C_Z + c]; }
+
+fn residue_index(t: u32) -> i32 { return features[t]; }
+fn token_index(t: u32) -> i32 { return features[TOKENS + t]; }
+fn asym_id(t: u32) -> i32 { return features[2u * TOKENS + t]; }
+fn entity_id(t: u32) -> i32 { return features[3u * TOKENS + t]; }
+fn sym_id(t: u32) -> i32 { return features[4u * TOKENS + t]; }
+fn clamp_bin(value: i32, high: i32) -> i32 { return min(max(value, 0), high); }
+
+var<workgroup> product: array<f32, ${pairChannels}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= PAIRS) { return; }
+  let i = row / TOKENS;
+  let j = row % TOKENS;
+  let local = local_id.x;
+
+  var total = 0.0;
+  var squares = 0.0;
+  for (var c = local; c < C_Z; c += 64u) {
+    let value = pair_in[row * C_Z + c];
+    total += value;
+    squares += value * value;
+  }
+  reduce_a[local] = total;
+  reduce_b[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C_Z);
+  let variance = reduce_b[0] / f32(C_Z) - mean * mean;
+  let inverse = inverseSqrt(variance + EPSILON);
+  workgroupBarrier();
+
+  for (var c = local; c < C_Z; c += 64u) {
+    product[c] = prod1_at(i, c) * prod2_at(j, c);
+  }
+  workgroupBarrier();
+
+  // The relative encoding's four active columns, the same buckets the embedder
+  // resolves - one-hot, so the projection is a gather of rows.
+  let same_chain = asym_id(i) == asym_id(j);
+  let same_entity = entity_id(i) == entity_id(j);
+  var bin_a = u32(2 * MAX_RELATIVE_IDX + 1);
+  if (same_chain) {
+    bin_a = u32(clamp_bin(residue_index(i) - residue_index(j) + MAX_RELATIVE_IDX,
+                          2 * MAX_RELATIVE_IDX));
+  }
+  var bin_b = u32(2 * MAX_RELATIVE_IDX + 1);
+  if (same_chain && residue_index(i) == residue_index(j)) {
+    bin_b = u32(clamp_bin(token_index(i) - token_index(j) + MAX_RELATIVE_IDX,
+                          2 * MAX_RELATIVE_IDX));
+  }
+  var bin_c = u32(2 * MAX_RELATIVE_CHAIN + 1);
+  if (same_entity) {
+    bin_c = u32(clamp_bin(sym_id(i) - sym_id(j) + MAX_RELATIVE_CHAIN,
+                          2 * MAX_RELATIVE_CHAIN));
+  }
+  let row_b = POSITION_BINS + bin_b;
+  let row_entity = POSITION_BINS * 2u;
+  let row_c = POSITION_BINS * 2u + 1u + bin_c;
+
+  // boltz2's own 64-bin distance embedding: 63 edges evenly over 2..22 A.
+  var squared = 1.0e-10;
+  for (var axis = 0u; axis < 3u; axis += 1u) {
+    let difference = pseudo_beta[i * 3u + axis] - pseudo_beta[j * 3u + axis];
+    squared += difference * difference;
+  }
+  let distance = sqrt(squared);
+  var dbin = 0u;
+  for (var edge = 0u; edge + 1u < DGRAM64; edge += 1u) {
+    if (distance > 2.0 + 20.0 * f32(edge) / f32(DGRAM64 - 2u)) { dbin += 1u; }
+  }
+  let keep = pair_mask[row];
+  let bond = bonds[row];
+  let bond_row = u32(clamp(i32(bonds[PAIRS + row]), 0, 6));
+
+  for (var c = local; c < C_Z; c += 64u) {
+    var value = (pair_in[row * C_Z + c] - mean) * inverse * weights[W_Z_SCALE + c]
+      + weights[W_Z_OFFSET + c]
+      + weights[W_RELPOS + bin_a * C_Z + c]
+      + weights[W_RELPOS + row_b * C_Z + c]
+      + weights[W_RELPOS + row_c * C_Z + c]
+      + bond * weights[W_BOND + c]
+      + weights[W_BOND_TYPE + bond_row * C_Z + c]
+      + weights[W_CONTACT + c]
+      + right_at(i, c) + left_at(j, c)
+      + keep * weights[W_DGRAM + dbin * C_Z + c];
+    if (same_entity) { value += weights[W_RELPOS + row_entity * C_Z + c]; }
+    for (var e = 0u; e < C_Z; e += 1u) {
+      value += product[e] * weights[W_PROD_OUT + e * C_Z + c];
+    }
+    pair_out[row * C_Z + c] = value;
   }
 }`;
 
@@ -226,12 +556,14 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   const pairHeads = `${common}
 const CENTRES = array<f32, ${NUM_BINS}>(${centreList});
 const TM_PER_BIN = array<f32, ${NUM_BINS}>(${tmList});
-const W_LN_SCALE: u32 = ${headOffsets.logitsLnScale}u;
+${headNorm ? `const W_LN_SCALE: u32 = ${headOffsets.logitsLnScale}u;
 const W_LN_OFFSET: u32 = ${headOffsets.logitsLnOffset}u;
-const W_HALF: u32 = ${headOffsets.leftHalfDistanceLogits}u;
 const W_PAE_SCALE: u32 = ${headOffsets.paeLogitsLnScale}u;
-const W_PAE_OFFSET: u32 = ${headOffsets.paeLogitsLnOffset}u;
+const W_PAE_OFFSET: u32 = ${headOffsets.paeLogitsLnOffset}u;` : ""}
+const W_HALF: u32 = ${headOffsets.leftHalfDistanceLogits}u;
 const W_PAE: u32 = ${headOffsets.paeLogits}u;
+${splitHeads ? `const W_HALF_INTER: u32 = ${headOffsets.interHalfDistanceLogits}u;
+const W_PAE_INTER: u32 = ${headOffsets.paeInterLogits}u;` : ""}
 
 @group(0) @binding(0) var<storage, read> pair: array<f32>;
 @group(0) @binding(1) var<storage, read> pair_mask: array<f32>;
@@ -243,6 +575,9 @@ const W_PAE: u32 = ${headOffsets.paeLogits}u;
 // alone. Reading the logits back would be tokens^2 * 64 floats; the term they
 // reduce to is tokens^2, which is 64x smaller and is all either score wants.
 @group(0) @binding(5) var<storage, read_write> tm_adjusted: array<f32>;
+${splitHeads ? `// The chain identity, for the intra/inter split. Five rows of TOKENS, the
+// layout the embedder uses; only asym_id is read here.
+@group(0) @binding(6) var<storage, read> features: array<i32>;` : ""}
 
 // The row's normalised activations, staged once: the PDE's own normalisation of
 // this row and of its transpose, and the PAE's of this row.
@@ -253,6 +588,32 @@ var<workgroup> distance: array<f32, ${NUM_BINS}>;
 var<workgroup> aligned: array<f32, ${NUM_BINS}>;
 var<workgroup> reduce_a: array<f32, 64>;
 var<workgroup> reduce_b: array<f32, 64>;
+
+/** The same, over a row already staged in workgroup memory. */
+fn row_statistics_of(values: ptr<workgroup, array<f32, ${pairChannels}>>,
+                     local: u32) -> vec2<f32> {
+  var total = 0.0;
+  var squares = 0.0;
+  for (var c = local; c < C_Z; c += 64u) {
+    let value = (*values)[c];
+    total += value;
+    squares += value * value;
+  }
+  reduce_a[local] = total;
+  reduce_b[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C_Z);
+  let variance = reduce_b[0] / f32(C_Z) - mean * mean;
+  workgroupBarrier();
+  return vec2<f32>(mean, inverseSqrt(variance + EPSILON));
+}
 
 /** Mean and inverse standard deviation of one pair row, cooperatively. */
 fn row_statistics(base: u32, local: u32) -> vec2<f32> {
@@ -293,30 +654,54 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let transposed = j * TOKENS + i;
   let local = local_id.x;
 
-  let own = row_statistics(row * C_Z, local);
-  let other = row_statistics(transposed * C_Z, local);
+${preSymmetrised ? `  // 🔴 SYMMETRISED BEFORE THE HEAD, NOT AFTER IT. protenix2 and boltz2 add the
+  // transpose to the ACTIVATION and project once; AF3 projects once and adds the
+  // transpose of the RESULT. The two agree only where the projection is the same
+  // on both halves, which under split heads it is not.
   for (var c = local; c < C_Z; c += 64u) {
-    let centred = (pair[row * C_Z + c] - own.x) * own.y;
+    norm_row[c] = pair[row * C_Z + c] + pair[transposed * C_Z + c];
+    norm_pae[c] = pair[row * C_Z + c];
+  }
+  workgroupBarrier();
+${headNorm ? `  let sym = row_statistics_of(&norm_row, local);
+  let own = row_statistics(row * C_Z, local);
+  for (var c = local; c < C_Z; c += 64u) {
+    norm_row[c] = (norm_row[c] - sym.x) * sym.y * weights[W_LN_SCALE + c]
+      + weights[W_LN_OFFSET + c];
+    norm_pae[c] = (pair[row * C_Z + c] - own.x) * own.y * weights[W_PAE_SCALE + c]
+      + weights[W_PAE_OFFSET + c];
+  }
+  workgroupBarrier();` : ""}` : `  ${headNorm ? `let own = row_statistics(row * C_Z, local);
+  let other = row_statistics(transposed * C_Z, local);` : ""}
+  for (var c = local; c < C_Z; c += 64u) {
+${headNorm ? `    let centred = (pair[row * C_Z + c] - own.x) * own.y;
     norm_row[c] = centred * weights[W_LN_SCALE + c] + weights[W_LN_OFFSET + c];
     norm_transposed[c] = (pair[transposed * C_Z + c] - other.x) * other.y
       * weights[W_LN_SCALE + c] + weights[W_LN_OFFSET + c];
     // ...the PAE normalises the SAME row with its own scale and offset, so the
     // centred value is shared and only the affine part differs.
-    norm_pae[c] = centred * weights[W_PAE_SCALE + c] + weights[W_PAE_OFFSET + c];
+    norm_pae[c] = centred * weights[W_PAE_SCALE + c] + weights[W_PAE_OFFSET + c];`
+  : `    norm_row[c] = pair[row * C_Z + c];
+    norm_transposed[c] = pair[transposed * C_Z + c];
+    norm_pae[c] = pair[row * C_Z + c];`}
   }
-  workgroupBarrier();
+  workgroupBarrier();`}
 
+${splitHeads ? `  let same_chain = features[2u * TOKENS + i] == features[2u * TOKENS + j];` : ""}
   // A lane to a bin. The two halves of the PDE keep their own sums and are
   // added at the end, which is the order half_logit produced them in.
   for (var b = local; b < BINS; b += 64u) {
     var half_own = 0.0;
     var half_other = 0.0;
     var pae_total = 0.0;
+${splitHeads ? `    var half_pick = W_HALF;
+    var pae_pick = W_PAE;
+    if (!same_chain) { half_pick = W_HALF_INTER; pae_pick = W_PAE_INTER; }` : ""}
     for (var c = 0u; c < C_Z; c += 1u) {
-      let half_weight = weights[W_HALF + c * BINS + b];
+      let half_weight = weights[${splitHeads ? "half_pick" : "W_HALF"} + c * BINS + b];
       half_own += norm_row[c] * half_weight;
-      half_other += norm_transposed[c] * half_weight;
-      pae_total += norm_pae[c] * weights[W_PAE + c * BINS + b];
+${preSymmetrised ? "" : "      half_other += norm_transposed[c] * half_weight;"}
+      pae_total += norm_pae[c] * weights[${splitHeads ? "pae_pick" : "W_PAE"} + c * BINS + b];
     }
     distance[b] = half_own + half_other;
     aligned[b] = pae_total;
@@ -365,11 +750,11 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
 
   const singleHeads = `${common}
 const PLDDT_CENTRES = array<f32, ${PLDDT_BINS}>(${plddtCentres.join(", ")});
-const W_PLDDT_SCALE: u32 = ${headOffsets.plddtLnScale}u;
+${headNorm ? `const W_PLDDT_SCALE: u32 = ${headOffsets.plddtLnScale}u;
 const W_PLDDT_OFFSET: u32 = ${headOffsets.plddtLnOffset}u;
-const W_PLDDT: u32 = ${headOffsets.plddtLogits}u;
 const W_RESOLVED_SCALE: u32 = ${headOffsets.resolvedLnScale}u;
-const W_RESOLVED_OFFSET: u32 = ${headOffsets.resolvedLnOffset}u;
+const W_RESOLVED_OFFSET: u32 = ${headOffsets.resolvedLnOffset}u;` : ""}
+const W_PLDDT: u32 = ${headOffsets.plddtLogits}u;
 const W_RESOLVED: u32 = ${headOffsets.experimentallyResolvedLogits}u;
 
 @group(0) @binding(0) var<storage, read> single: array<f32>;
@@ -432,9 +817,12 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   let inverse_std = inverseSqrt(variance + EPSILON);
   workgroupBarrier();
   for (var c = local; c < C_S; c += 64u) {
-    let centered = (single[base + c] - mean) * inverse_std;
+${headNorm ? `    let centered = (single[base + c] - mean) * inverse_std;
     plddt_norm[c] = centered * weights[W_PLDDT_SCALE + c] + weights[W_PLDDT_OFFSET + c];
-    resolved_norm[c] = centered * weights[W_RESOLVED_SCALE + c] + weights[W_RESOLVED_OFFSET + c];
+    resolved_norm[c] = centered * weights[W_RESOLVED_SCALE + c] + weights[W_RESOLVED_OFFSET + c];`
+  : `    // boltz2 calls both heads directly on s; see headOrderFor.
+    plddt_norm[c] = single[base + c];
+    resolved_norm[c] = single[base + c];`}
   }
   workgroupBarrier();
 
@@ -469,7 +857,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  return { embedProject, embed, pairHeads, singleHeads };
+  return { ...(reembedOffsets === null ? { embedProject, embed }
+    : { reembedProject, reembedPair }),
+    pairHeads, singleHeads };
 }
 
 export class Af3ConfidenceHeadGpu {
@@ -486,8 +876,20 @@ export class Af3ConfidenceHeadGpu {
     // almost nothing and keeps the two user-facing numbers checked at the
     // tolerance the f32 arithmetic actually reaches. A caller that wants the
     // memory can still ask.
+    //
+    // 🔴 AND THE MATRIX PAIR KERNELS ARE THE FOURTH AXIS, WHICH THIS PINNED
+    // THREE OF FOR A YEAR. `triangleProjectMatrix`, `gridProjectMatrix` and
+    // `gridAttendMatrix` replace the pair track's projections with kernels that
+    // issue on f16 matrix units, and no precision option above reaches them -
+    // so a head that had declared itself f32 was running three of its six
+    // updates in f16 whenever the device prior turned them on. Measured on
+    // check-af3-confidence: all four heads FAIL with them (pLDDT 1902x, PAE
+    // 3463x, PDE 3718x, resolved 522x their conditioning envelope) and all four
+    // pass without (7.0x and 7.3x on PAE and PDE). The trunk keeps them and
+    // keeps the speed; see docs/AF3.md for the block-level ladder.
     this.options = {
-      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32", ...options,
+      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+      pairMatrixKernels: false, ...options,
     };
     this.allocator = new GpuBufferAllocator(device);
     this.pipelines = pipelineCacheForDevice(device);
@@ -513,12 +915,24 @@ export class Af3ConfidenceHeadGpu {
       for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
     }
 
-    const embedPacked = pack(weights, EMBED_ORDER, "confidence embed");
-    const headPacked = pack(weights, HEAD_ORDER, "confidence head");
-    const shape = { tokens, pairChannels, singleChannels, targetFeatWidth, dense };
+    // 🔴 THE HEAD'S SHAPE IS THE BUNDLE'S. boltz2 rebuilds z under its own scope,
+    // normalises before no logit head, and splits both pair heads by chain; each
+    // of the three is chosen by whether the tensors are there, and each changes
+    // the generated WGSL, so all three are in the pipeline key.
+    const reembedding = weights.reembed !== undefined;
+    const embedPacked = reembedding
+      ? pack(weights.reembed, REEMBED_ORDER, "confidence re-embed")
+      : pack(weights, embedOrderFor(weights), "confidence embed");
+    const headPacked = pack(weights, headOrderFor(weights), "confidence head");
+    const shape = { tokens, pairChannels, singleChannels, targetFeatWidth, dense,
+                    preSymmetrisedPde: dialect?.preSymmetrisedPde === true };
     const sources = createConfidenceShaders(
-      shape, embedPacked.offsets, headPacked.offsets, epsilon, variance);
-    const base = `af3-confidence:${tokens}:${dense}:${epsilon}:${variance}`;
+      shape, reembedding ? {} : embedPacked.offsets, headPacked.offsets, epsilon, variance,
+      reembedding ? embedPacked.offsets : null);
+    const base = `af3-confidence:${tokens}:${dense}:${epsilon}:${variance}`
+      + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
+      + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
+      + `:ps${shape.preSymmetrisedPde}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
@@ -528,6 +942,9 @@ export class Af3ConfidenceHeadGpu {
     const allocations = [];
     const keep = (allocation) => { allocations.push(allocation); return allocation; };
     let embeddedPair;
+    // boltz2 rebuilds the SINGLE as well as the pair; undefined elsewhere, and
+    // the stack is then fed the trunk's own.
+    let embeddedSingle;
     try {
       // 🔴 COPIED ONLY IF IT IS NOT ALREADY THE RIGHT ARRAY. `upload` writes
       // through queue.writeBuffer and does not mutate what it is given, so a
@@ -550,6 +967,71 @@ export class Af3ConfidenceHeadGpu {
       const right = keep(this.allocator.allocate(
         "af3-conf.right", tokens * pairChannels * 4, storage));
       const encoder = this.device.createCommandEncoder({ label: "af3-confidence-embed" });
+      if (reembedding) {
+        // boltz2's two passes: the per-token projections, then the pair.
+        const projections = keep(this.allocator.allocate(
+          "af3-conf.projections", 4 * tokens * pairChannels * 4, storage));
+        const trunkSingle = keep(this.allocator.upload(
+          "af3-conf.trunk-single", asFloats(input.single), storage));
+        const rebuiltSingle = keep(this.allocator.allocate(
+          "af3-conf.re-single", tokens * singleChannels * 4,
+          storage | GPUBufferUsage.COPY_SRC));
+        const featureData = new Int32Array(5 * tokens);
+        ["residueIndex", "tokenIndex", "asymId", "entityId", "symId"]
+          .forEach((name, index) => {
+            const source = input.features?.[name];
+            if (source === undefined) {
+              throw new Error(`the boltz2 confidence re-embedding needs features.${name}`);
+            }
+            for (let t = 0; t < tokens; t += 1) featureData[index * tokens + t] = source[t];
+          });
+        const features = keep(this.allocator.upload("af3-conf.features", featureData, storage));
+        // Two planes: the contact flag, then the bond ORDER - the same layout
+        // the embedder's binding uses.
+        const bondData = new Float32Array(pairs * 2);
+        if (input.bondMatrix !== undefined) bondData.set(input.bondMatrix, 0);
+        if (input.bondOrderMatrix !== undefined) bondData.set(input.bondOrderMatrix, pairs);
+        const bonds = keep(this.allocator.upload("af3-conf.bonds", bondData, storage));
+        const rebuiltPair = keep(this.allocator.allocate(
+          "af3-conf.re-pair", pairs * pairChannels * 4,
+          storage | GPUBufferUsage.COPY_SRC));
+        const singleReadback = keep(this.allocator.allocate(
+          "af3-conf.rb-single", tokens * singleChannels * 4,
+          GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST));
+        const tokenPass = encoder.beginComputePass({ label: "reembed-project" });
+        tokenPass.setPipeline(compiled.reembedProject);
+        tokenPass.setBindGroup(0, this.device.createBindGroup({
+          layout: compiled.reembedProject.getBindGroupLayout(0),
+          entries: [targetFeat, trunkSingle, embedWeights, projections, rebuiltSingle].map(
+            (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
+        }));
+        tokenPass.dispatchWorkgroups(tokens);
+        tokenPass.end();
+        const pairPass = encoder.beginComputePass({ label: "reembed-pair" });
+        pairPass.setPipeline(compiled.reembedPair);
+        pairPass.setBindGroup(0, this.device.createBindGroup({
+          layout: compiled.reembedPair.getBindGroupLayout(0),
+          entries: [pair, projections, features, bonds, pseudoBeta,
+                    maskBuffer, embedWeights, rebuiltPair].map(
+            (allocation, binding) => ({ binding, resource: { buffer: allocation.buffer } })),
+        }));
+        pairPass.dispatchWorkgroups(
+          Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
+        pairPass.end();
+        encoder.copyBufferToBuffer(rebuiltPair.buffer, 0, readback.buffer, 0,
+                                   pairs * pairChannels * 4);
+        encoder.copyBufferToBuffer(rebuiltSingle.buffer, 0, singleReadback.buffer, 0,
+                                   tokens * singleChannels * 4);
+        this.device.queue.submit([encoder.finish()]);
+        const failure = await this.device.popErrorScope();
+        if (failure !== null) throw new Error(`WebGPU validation failed: ${failure.message}`);
+        await readback.buffer.mapAsync(GPUMapMode.READ);
+        embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
+        readback.buffer.unmap();
+        await singleReadback.buffer.mapAsync(GPUMapMode.READ);
+        embeddedSingle = new Float32Array(singleReadback.buffer.getMappedRange().slice(0));
+        singleReadback.buffer.unmap();
+      } else {
       const project = encoder.beginComputePass({ label: "embed-project" });
       project.setPipeline(compiled.embedProject);
       project.setBindGroup(0, this.device.createBindGroup({
@@ -578,13 +1060,15 @@ export class Af3ConfidenceHeadGpu {
       await readback.buffer.mapAsync(GPUMapMode.READ);
       embeddedPair = new Float32Array(readback.buffer.getMappedRange().slice(0));
       readback.buffer.unmap();
+      }
     } finally {
       for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
     }
 
     // The four confidence pairformer blocks: the same stack the trunk runs.
     const stack = await new Af3PairformerStackGpu(this.device, this.options).run(
-      { pair: embeddedPair, single: asFloats(input.single),
+      { pair: embeddedPair,
+        single: embeddedSingle ?? normalisedTrunkSingle(input, weights, tokens),
         pairMask, seqMask, tokens }, weights.blocks, dialect, options);
 
     return { ...(await this.#heads(stack, pairMask, input, weights, headPacked, compiled)),
@@ -640,7 +1124,21 @@ export class Af3ConfidenceHeadGpu {
       // it now stages the row once and gives a lane to each bin, so the
       // dispatch counts rows. Folded through x and y as every pair grid here
       // is - 300 tokens is 90,000 of them.
-      run("pair-heads", compiled.pairHeads, [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted],
+      // ...and the chain identity where the heads split by it; a seventh
+      // binding the other dialects' shader does not declare.
+      const splitHeads = headPacked.offsets.interHalfDistanceLogits !== undefined;
+      const headFeatures = splitHeads ? (() => {
+        const data = new Int32Array(5 * tokens);
+        const asymId = input.features?.asymId;
+        if (asymId === undefined) {
+          throw new Error("the boltz2 confidence heads split by chain and need features.asymId");
+        }
+        for (let t = 0; t < tokens; t += 1) data[2 * tokens + t] = asymId[t];
+        return keep(this.allocator.upload("af3-conf.h-features", data, storage));
+      })() : null;
+      run("pair-heads", compiled.pairHeads,
+          [pair, maskBuffer, weightBuffer, pde, pae, tmAdjusted,
+           ...(splitHeads ? [headFeatures] : [])],
           Math.min(pairs, GRID_WIDTH), Math.ceil(pairs / GRID_WIDTH));
       run("single-heads", compiled.singleHeads, [single, weightBuffer, plddt, resolved], tokens);
       for (const { allocation, source, bytes } of Object.values(readbacks)) {

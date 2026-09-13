@@ -117,6 +117,10 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 
 | Question | Tool |
 |---|---|
+| **Does a whole DENOISE STEP match af3-any-model's own?** | `tools/gpu/check-af3-denoise.js --model= --name=` - L3, the level that subsumes the diffusion side. 🔴 It holds the GPU to the ORACLE and the CPU to the GPU, because boltz2's token transformer amplifies its input by ~2.2e4 and this f64 reference cannot agree with an f32 oracle to better than 1e-2 however right the port is. `--stages=on` compares every seam against `dump_af3_denoise_stages.py`; without a stage dump the per-stage arms are GPU-against-CPU and say only that the port agrees with ITSELF |
+| **Does the TRUNK match it, stage by stage, on a real batch?** | `tools/gpu/fold.js --trunk-oracle=` with `tools/oracle/dump_af3_trunk_taps.py`. It found boltz2's `target_feat` at relRMS 1.00e+0 while `check-af3-trunk` read 2.74e-5 - the difference between an oracle and a self-comparison. `BLOCKS=` truncates BOTH sides, which is how a convention is separated from an accumulation |
+| **Does the CONFIDENCE head?** | `tools/gpu/check-af3-confidence-oracle.js --model= --name=` with `tools/oracle/dump_af3_confidence.py`. Every module inside the head is traced, so a pair that is a sum of nine terms is attributable. It found protenix2 at 3.21e-1 and boltz2 at 8.26e-2 while `check-af3-confidence` passed at 9.56e-5 |
+| **Is this bundle the weights the reference LOADS?** | `python3 tools/check-bundle-vs-params.py --bundle= --digest=` with `tools/oracle/dump_af3_params_digest.py`. 🔴 THE ONE QUESTION EVERY OTHER CHECKER ASSUMES: they all feed ONE bundle to both sides, so a tensor that is the wrong SIGN or the wrong WIDTH is invisible to all of them. It found four negated tensors in boltz2's export and ten stale ones in OpenDDE's |
 | Does the GPU diffusion conditioning match the reference, at THIS bundle's widths? | `tools/gpu/check-af3-diffusion-conditioning.js --model=` - it passes on af3, openbind0 and opendde now, at 1e-5 with a separation control of 1232-2362x. 🔴 It passed for as long as OpenDDE's bundle existed WITHOUT COMPUTING ANYTHING, because `NaN > 1e-5` is FALSE; every comparison written `if (x > bound) throw` here has the same hole. 🔴 AND IT SWEEPS TWO DIALECTS OVER ONE BUNDLE, so it must re-cut the weights BOTH ways - it could only splice the openfold3 columns in, never strip them, and an openbind0 bundle's own 833 columns then tripped the LayerNorm assertion inside the kernel it was there to measure |
 | Does the AF3 head still match AF3? | `tools/gpu/probe-head-vs-af3-steps.js --dump=/af3-rings20.json` |
 | Is a fold still the same fold? | `tools/gpu/probe-sidechains.js --steps=8` |
@@ -264,6 +268,7 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | ...and a MODIFIED residue? | `tools/fold-in-page.py --model af3 --modify SEP@3` |
 | **Does the archive describe the job it wrote?** | `tools/fold-in-page.py --job-round-trip` (folds, WIPES the rows, drops the zip back) |
 | Which of AlphaFold 3's own example jobs load here? | `node --test test/af3-example-jobs.test.js` (8 of 14; the other 6 name their field) |
+| **Would a WEAKER DEVICE refuse a kernel?** | `npm run test:portable` (`tools/check-portable-limits.mjs`) - it caps this device at `PORTABLE_CEILINGS` and folds all six models. 🔴 **A RAISED LIMIT IS A PREDICTION ABOUT THE NEXT MACHINE**, and one of them is wrong on Apple silicon: `maxComputeWorkgroupStorageSize` is 49152 here and **32768 on Metal**, so a kernel taking a 40 KiB tile compiles here and fails to create its pipeline there, with an error naming a shader rather than a limit. It cannot simulate a LARGER limit, so the M2's 4 GiB binding size is out of reach |
 | **Does every model fold on the browser a VISITOR has?** | `npm run test:stock` (`tools/check-stock-flags.mjs`) - the four folds with `LOCALFOLD_STOCK_FLAGS=1`, which drops the two developer flags every other gate here passes. 🔴 **TWO OF THE FOUR DID NOT FOLD THAT WAY** and nothing could see it, because the configuration every gate checks is not the one the site ships. It asserts a SIGNATURE - a checksum, an atom checksum or a pLDDT - rather than an absence of errors, since an uncaptured device error leaves the harness reporting success. Needs `DISPLAY=:99 XDG_RUNTIME_DIR=/tmp/xdg` like every GPU lane, and says so when they are missing instead of blaming the models |
 | **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
 | Is a fold from ANY of the four models actually a chain? | they all assert on it now - `tools/gpu/chain-geometry.js` holds the one band, `--allow-broken-geometry` is the escape hatch, and `test/chain-geometry.test.js` gates the rule where the weights are not |
@@ -341,6 +346,76 @@ overriding Apple's measured defaults, and then the 160-residue race below.
 check in `ADD_IN_PLACE_SHADER` under a folded grid, not a missing barrier. This
 section is the record of the hunt and the instruments it produced, not an open
 thread.
+
+### 🔴 ROUND FIVE: TWO NEW MODELS, AND THE THREE QUESTIONS ALREADY ANSWERED HERE
+
+**boltz2 and protenix2 are ported and exact**, so the panel is six models rather
+than four. The whole AF3-lineage side is now held to af3-any-model's own
+numbers rather than to this port's CPU - see docs/AF3.md, which is where the
+nine defects that found are written up.
+
+🔴 **THREE OF THE FOUR THINGS AN M2 WOULD HAVE BEEN ASKED ARE ALREADY MEASURED
+HERE**, and none of them needs an Apple part after all:
+
+| | how it was asked from this machine | answer |
+|---|---|---|
+| do the new models fold on a STOCK browser? | `npm run test:stock`, which now covers all six | all six fold |
+| would a smaller LIMIT refuse a kernel? | `npm run test:portable` - a new gate that CAPS this device at the portable ceiling | all six fold |
+| does f16 cost the new models anything? | `--f16=off` against the default, whole fold | **nothing**: boltz2 0.542 A both ways, protenix2 1.722/1.723 |
+
+`test:portable` is the one worth knowing about. This port ASKS its adapter for
+the most it will give on five limits, and one of them differs by a factor this
+card hides: `maxComputeWorkgroupStorageSize` is **49152 here and 32768 on
+Metal**. A kernel taking a 40 KiB tile compiles here, measures well here, and
+fails to create its pipeline there with an error naming a shader rather than a
+limit. `LOCALFOLD_PORTABLE_LIMITS=1` caps the request at `PORTABLE_CEILINGS`
+(src/runtime/device.js), so that refusal happens HERE. It is the limits twin of
+`LOCALFOLD_STOCK_FLAGS`, which asks the same question about features.
+
+🔴 **IT CANNOT SIMULATE A LARGER LIMIT, AND ONE OF YOURS IS LARGER.** The M2's
+`maxStorageBufferBindingSize` is 4 GiB against this card's 2, so your binding
+ceiling is LOOSER and nothing here can ask about it. Round three has that half.
+
+**What is actually left for an Apple part, in order:**
+
+1. **Metal CLAMPS an out-of-range write where Vulkan discards, and this session
+   wrote new shaders.** Two whole kernels (`reembedProject`, `reembedPair` in
+   confidence-webgpu.js), a `build-queries-pre` pass, and up-gate branches in
+   three more. `test/folded-grid-guard.test.js` passes and is structural, so the
+   guards are THERE - but the guard test cannot see a clamp, and
+   `probe-grid-overdispatch.js` is the only thing that can. Run it; it should
+   still say CLAMPS.
+
+2. **MEMORY, which is the one where a laptop and a 40 GB card genuinely
+   differ.** boltz2 peaks at **1535 MiB** of device memory against AlphaFold 3's
+   983 - 513 of resident diffusion-transformer blocks, 270 of trunk single
+   transitions, 204 of MSA scratch. It folds unchanged under `--budget=800`
+   here, but this file's own warning is that Metal takes buffers well past the
+   point where macOS starts paging, and `keepResidentAffordable` returns true
+   for a device with no budget. `fold.js --budget=0` prints the peak.
+
+3. **The transition width, which is a DEVICE-WIDTH rule and yours is narrower.**
+   The diffusion conditioning's single transition dispatches `tokens` workgroups
+   and nothing else, so at 68 tokens it ran 68 groups of 128 threads - 44% of
+   boltz2's whole denoiser call on this card. It now takes
+   `transitionThreadTarget` and widens to 512 where the intermediate divides by
+   it: boltz2's denoiser GPU 21.4 -> 14.2 ms, its 200-step diffusion 4.7 -> 3.2
+   s, AF3 and protenix2 unmoved. **On a part with a hundredth of the width that
+   trade may invert**, and `transitionThreadTarget` is ampere-prior only, so an
+   M2 should see NO change from it - which is the thing to confirm rather than
+   assume.
+
+4. **The two new models are not in the registry**, so the PAGE cannot load them
+   whatever a fold tool says. docs/HOSTING.md has that, with the three published
+   bundles this session made stale.
+
+🔴 **AND ONE TRAP THAT COST 7x AND WOULD HAVE COST IT THERE TOO.** A bound
+weight field is a THUNK that decodes when read, so `block.ffwAToB != null` -
+a presence test choosing a shader variant - unpacked a 768x1536 int5 tensor once
+per block per sampler step. boltz2's fold was **38.5 s** and is 3.7. The GPU was
+92% idle and the arithmetic was never the problem. Ask `block[SOURCES]`, never
+the value; it is CLAUDE.md's existing note about `blockWeightOffsets` reading
+`.length`, one convention later.
 
 ### 🔴 ROUND FOUR, ANSWERED FROM THE M2: NO VISITOR HAS THE MATRIX UNITS
 
