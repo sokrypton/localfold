@@ -249,3 +249,52 @@ and eight zeroed encoder tensors), and `boltz2-f32`'s four negated
 `embed_pair_offsets` were corrected in place. The loader REFUSES the old OpenDDE
 rather than folding at the wrong width, so the published one is not merely
 worse, it no longer loads. See docs/AF3.md.
+
+## 🔴 NOTHING IN THIS SESSION HAS BEEN PUBLISHED, AND ONE BUNDLE MUST BE
+
+State, plainly: **no weights have been uploaded to Hugging Face and nothing has
+been pushed to git.** There is no HF token on this box, and the branch is 47
+commits ahead of `origin/a100` and 38 ahead of `origin/main`.
+
+| bundle | local state | published state | consequence |
+|---|---|---|---|
+| **opendde-int5** | re-exported (833 scale, eight tensors filled) | 831 scale, eight ZEROS | 🔴 **the loader RAISES on the published one** |
+| opendde-full-f32 | re-exported | not published | none |
+| boltz2-f32 | four tensors corrected in place | not published | none |
+| **boltz2-int5** | new | **not published, not in the registry** | the page cannot load it |
+| **protenix2-int5** | new | **not published, not in the registry** | the page cannot load it |
+| af3-int5 | unchanged | unchanged, and 404 of 404 tensors agree with the reference | none |
+| openbind0-int5 | unchanged | unchanged, 406 of 406 agree | none |
+
+🔴 **THE FIRST ROW IS A DEPLOY BLOCKER AND NOT A DEGRADATION.** OpenDDE joined
+`PADDED_SINGLE_COND` upstream, so its diffusion single conditioning is 833
+channels; the published bundle carries an 831-wide
+`single_cond_initial_norm/scale` and the loader RAISES rather than folding at
+the wrong width. That is the right behaviour - the alternative is a silent
+target_feat of 445 - and it means **pushing this branch to `main` takes OpenDDE
+off the live site until the bundle is re-uploaded.** Pushing to `main` IS the
+deploy; see CLAUDE.md.
+
+`test/registry-manifest-widths.test.js` is the gate, and it is RED on purpose:
+it reads the committed manifest module and derives the width the same code
+derives, so it names the bundle and the numbers without a GPU or the network.
+It should stay red until the upload happens.
+
+🔴 **AND DO NOT "FIX" IT BY REGENERATING THE MANIFEST MODULE.** The module
+carries byteOffsets and shardDigests, and its `remote:` still pins the OLD
+Hugging Face commit - so a locally regenerated manifest against unchanged remote
+shards is strictly worse than the raise: the page would fetch the old bytes at
+the new offsets. Upload first, then re-pin.
+
+### What publishing takes
+
+    python3 tools/quantize_af3.py --source model-opendde-full-f32 \
+      --out model-opendde-int5 --bits 5 --group 32 --shards 12   # done, local
+    # upload model-opendde-int5/, model-boltz2-int5/, model-protenix2-int5/
+    #   to huggingface.co/sokrypton/localfold
+    python3 tools/write_manifest_module.py opendde                # re-pin the sha
+    #   ...and NEW modules for boltz2 and protenix2, plus registry entries
+    python3 tools/deploy.py                                        # push and verify
+
+The shard counts are already the registry's: twelve for OpenDDE, eight for the
+two new ones.
