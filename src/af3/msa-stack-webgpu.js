@@ -258,6 +258,10 @@ export class Af3MsaStackGpu {
       const start = performance.now();
       for (let index = 0; index < blocks.length; index += 1) {
         await this.#encodeBlock({
+          // ...the pair track skipped on the LAST block only, so `--stop-after-opm`
+          // with one block is that block's first half and with four is three
+          // whole blocks plus the fourth's first half.
+          stopAfterOpm: options.stopAfterOpm === true && index === blocks.length - 1,
           block: blocks[index], n, sequences, rows, pairs, msaChannels, msaHeads, gridHeads,
           pairChannels, msaUpdateBeforeOuterProduct, pairWeightPrecision,
           pipelines, storage, pair, msa, pairMask, msaMask, scratch, biasBuffer,
@@ -454,7 +458,26 @@ export class Af3MsaStackGpu {
       updateMsa();
     }
 
-    encodePairTrack({
+    // 🔴 THE PAIR AFTER THE MSA UPDATE AND THE OUTER PRODUCT, BEFORE THE PAIR
+    // TRACK. `z_after_msa` is the whole stack, so a wrong OPM and a wrong
+    // triangle were the same number; the reference records the same seam under
+    // `msa_block_post_opm` (an io_callback tap, because inside layer_stack the
+    // value is a tracer).
+    // 🔴 A STOP POINT, NOT A READBACK. `stopAfterOpm` ends the stack here so
+    // the pair the loop already reads back IS this seam - the alternative is a
+    // mid-encode submit and a second MAP_READ buffer, for a diagnostic. The
+    // reference records the same point as `msa_block_post_opm` (an io_callback
+    // tap, because inside layer_stack the value is a tracer).
+    // 🔴 SKIP THE PAIR TRACK, NOT THE SUBMIT. Written as an early `return` this
+    // skipped `queue.submit` two lines below and threw the WHOLE block away -
+    // the OPM included - so the stopped pair came back identical to
+    // `z_after_template` and read as "our outer product mean contributes
+    // exactly zero". It matched the reference's own z_after_template-vs-post_opm
+    // distance to three digits, which is what made it convincing. The control
+    // that broke it: the same arm on the sequence path, where the MSA plainly
+    // works (pLDDT 87.3 with none against 94.9 with 128 rows) and the stopped
+    // pair was ALSO unchanged.
+    if (!context.stopAfterOpm) encodePairTrack({
       run, pipelines, n, channels: pairChannels, gridHeads, pair, pairMask,
       scratch, biasBuffer, gridProjectMatrix, transitionSplit,
       weights: pairTrackWeights,

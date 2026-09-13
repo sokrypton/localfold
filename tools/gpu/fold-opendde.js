@@ -186,6 +186,14 @@ export async function main(device, args) {
       seed: Number(option(args, "seed", "20260831")),
     });
   if (rows.depth > 1) console.log(`MSA ${rows.depth} rows`);
+  if (args.includes("--probe-msa")) {
+    const sum = (a) => (a === undefined ? "absent"
+      : Array.prototype.reduce.call(a, (t, v) => t + v, 0));
+    console.log(`  [msa] sequences=${batch.sequences} tokens=${batch.tokens}`
+      + ` maskLen=${batch.msaMask?.length} maskSum=${sum(batch.msaMask)}`
+      + ` msaLen=${batch.msa?.length} msaSum=${sum(batch.msa)}`
+      + ` delLen=${batch.deletionMatrix?.length}`);
+  }
   const openedAt = performance.now();
   const store = await openAf3Store(manifest);
   // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
@@ -217,8 +225,14 @@ export async function main(device, args) {
   ]).catch(() => {});
   const storeMs = Math.round(performance.now() - openedAt);
   const blocksArg = option(args, "blocks", "");
+  // 🔴 AND THE MSA STACK'S DEPTH, so the four blocks can be bisected against
+  // the oracle's `MSA_BLOCKS=`. A whole-stack residual says the stack is wrong
+  // and not which block, and the two counts must be set together or the
+  // comparison is between different models.
+  const msaBlocksArg = option(args, "msa-blocks", "");
   const trunk = await trunkWeights(store,
-    blocksArg === "" ? undefined : Number(blocksArg), undefined, { allowPrefix: true });
+    blocksArg === "" ? undefined : Number(blocksArg),
+    msaBlocksArg === "" ? undefined : Number(msaBlocksArg), { allowPrefix: true });
   const trunkMs = Math.round(performance.now() - openedAt) - storeMs;
   const weights = {
     trunk,
@@ -343,6 +357,8 @@ export async function main(device, args) {
     // reference's OpenDDE config says num_msa 1280, so a deep alignment reaches
     // its MSA stack 256 rows short and the difference appears at
     // `z_after_msa` and nowhere earlier.
+    // The MSA stack's first half alone; see msa-stack-webgpu.js.
+    stopAfterOpm: args.includes("--stop-after-opm"),
     ...(option(args, "num-msa", "") === "" ? {}
       : { numMsa: Number(option(args, "num-msa", "")) }),
     onStep: ({ step, denoised, structuralDenoised }) => {
@@ -413,7 +429,10 @@ export async function main(device, args) {
     // here. Each stage's cost is the gap between its announcement and the next.
     onStage: (name, detail) => {
       if (trunkOracle !== null && (name === "trunk-done" || name === "target-feat")) {
-        const arms = name === "target-feat"
+        if (name === "msa-depth") {
+        console.log(`  [msa] rows=${detail?.sequences} tokens=${detail?.tokens}`);
+      }
+      const arms = name === "target-feat"
           ? [["target_feat", detail?.targetFeat]]
           : [["single", detail?.trunk?.single], ["pair", detail?.trunk?.pair]];
         for (const [label, ours] of arms) oracle.compare(label, ours);

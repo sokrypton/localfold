@@ -937,6 +937,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
       onStage: (name, ms) => stage("trunk", { name, ms }),
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
+      // ...the MSA stack's first-half stop point, for bisecting one block
+      // against the oracle. See src/af3/msa-stack-webgpu.js.
+      ...(options.stopAfterOpm === true ? { stopAfterOpm: true } : {}),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
       // large protein each is seconds. See af3TrunkStageSpans.

@@ -153,6 +153,15 @@ for name, values in taps.items():
     put("tap.%s" % name, values[-1])       # the LAST pass; the dump keeps one cycle
 for name in ("single", "pair"):
     if name in out: put(name, out[name])
+# 🔴 AND `CAPTURE=LIST` MUST COME AFTER THE FORWARD PASS. Placed at the first
+# `CAPTURE = ...`, which is BEFORE it, `SCOPES` is empty and the listing prints
+# nothing and exits 0 - a tool that answers "there are no modules" when it means
+# "I ran too early".
+if CAPTURE == "LIST":
+    for _name in sorted(SCOPES):
+        print("  %-64s %s" % (_name, SCOPES[_name]["shape"]))
+    print("%d modules" % len(SCOPES))
+    raise SystemExit(0)
 if CAPTURE:
     kept = 0
     for _name, _entry in SCOPES.items():

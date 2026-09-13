@@ -3009,12 +3009,49 @@ CPU reference alone read 1.32e-7 while the fold still read 2.07e-2, which is
 what named the second half. The pass splits now, and only where a dialect
 supplies a gap - elsewhere it is the one pass it always was.
 
-🔴 **AND UNDERNEATH IT IS A SECOND, SEPARATE DEFECT.** With the template stage
-exact, `z_after_msa` reads **6.01e-2** and `trunk_out_pair` 7.10e-2. Ruled out:
+🔴 **AND UNDERNEATH IT IS A SECOND, SEPARATE DEFECT: THE OUTER PRODUCT MEAN.**
+With the template stage exact, `z_after_msa` reads **6.01e-2**. Bisected to one
+module, and here is the whole ladder - each step is a seam that had to be built:
+
+| | ours | native | |
+|---|---:|---:|---|
+| `msa_activations` (row 0) | | | **3.04e-8** - the MSA embedding is exact |
+| `msa_block_msa_act` | 23.7728 | 23.7728 | the MSA UPDATE is exact |
+| `msa_block_post_opm` | 18.1631 | 18.2943 | **2.83e-2 - the OPM** |
+| `z_after_msa`, 1 block | 19.9398 | 20.2244 | 2.91e-2, inherited |
+
+`z_after_template` is 18.1622, so the reference's outer product moves the pair
+by ~0.13 of rms and ours by ~0.001 - **about a hundredth of the contribution**,
+on a batch whose mask makes only 2 of its rows real. Invariant in depth (2, 16,
+128 and 1280 rows all give 2.83e-2), so it is not the padding. Ruled out too:
 the MSA subsample (a `DETERMINISTIC_MSA=1` dump is statistically identical), the
-depth (the reference's `num_msa` is 1280 against our 1024 cap, and forcing 1280
-moves nothing), and a missing convention list - OpenDDE is in nine of
-af3-any-model's and this port implements all nine. Open.
+cap (the reference's `num_msa` is 1280 against our 1024, and forcing 1280 moves
+nothing), the block ordering (`MSA_UPDATE_BEFORE_OPM` matches on both the CPU
+and the GPU path), and a missing convention - OpenDDE is in nine of
+af3-any-model's lists and this port implements all nine. **Open, and now one
+module wide.**
+
+🔴 **THE INSTRUMENTS THIS NEEDED, AND THE TWO THAT LIED FIRST.** The MSA stack
+is a `hk.experimental.layer_stack`, so `hk.intercept_methods` sees NOTHING
+inside it - 29 modules traced in the whole trunk and not one of them in the
+stack. Two things were needed:
+
+  * an **io_callback** tap in the reference's `EvoformerIteration`
+    (`AF3_MSA_BLOCK_TAPS=1`), because a direct record inside the stack raises
+    `TracerArrayConversionError`; it exposes `msa_block_post_opm` and
+    `msa_block_msa_act`.
+  * `--stop-after-opm` here, which ends the stack after the OPM so the pair the
+    loop already reads back IS that seam.
+
+🔴 **AND `--stop-after-opm` WAS AN EARLY `return` THAT SKIPPED `queue.submit`,
+SO IT THREW THE WHOLE BLOCK AWAY.** The stopped pair came back identical to
+`z_after_template` and read as "our outer product mean contributes EXACTLY
+zero" - which matched the reference's own z_after_template-vs-post_opm distance
+to three digits (4.873e-2 against 4.87e-2), and that coincidence is what made it
+convincing. The control that broke it: the same arm on the SEQUENCE path, where
+the MSA plainly works (pLDDT 87.3 with none against 94.9 with 128 rows) and the
+stopped pair was also unchanged. **A number that agrees with a prediction to
+three digits is still worth one control.**
 
 ### 🔴 AND THE CONFORMERS ARE NOT CENTRED, WHICH IS FIVE OF THE SIX FAMILIES
 

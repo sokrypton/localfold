@@ -40,11 +40,41 @@ export function trunkOracleComparer(dump, bound = 1e-2) {
   const compare = (label, ours) => {
     const entry = dump?.stages?.[label];
     if (dump === null) return;
-    if (entry === undefined) { missing.push(`${label} (not in the dump)`); return; }
+    if (entry === undefined) {
+      // 🔴 PRINT IT ANYWAY. A seam the dump does not carry is still worth its
+      // own rms and length: that is how a row COUNT is checked without a
+      // tensor to compare against, and a silent skip is what let
+      // `tap.msa_activations` sit unexamined.
+      const rms = ours === undefined ? NaN
+        : Math.sqrt(ours.reduce((t, v) => t + v * v, 0) / ours.length);
+      console.log(`  native ${label}\t(not in the dump)\tours rms ${rms.toFixed(4)}`
+        + `\tlength ${ours?.length ?? 0}`);
+      missing.push(`${label} (not in the dump)`);
+      return;
+    }
     if (ours === undefined) { missing.push(`${label} (we produced nothing)`); return; }
     const expected = Float32Array.from(entry.data);
+    // 🔴 A SHORTER ENTRY IS A ROW SLICE, NOT A MISMATCH. A 1280-row MSA
+    // activation is 200 MB of JSON; its FIRST ROW is 8704 numbers and answers
+    // the same question, so a dump may carry a prefix and this compares against
+    // it rather than refusing. Only an exact multiple, so a genuinely wrong
+    // shape still reports.
+    if (expected.length < ours.length && ours.length % expected.length === 0) {
+      let error = 0, scale = 0;
+      for (let i = 0; i < expected.length; i += 1) {
+        const d = ours[i] - expected[i];
+        error += d * d; scale += expected[i] * expected[i];
+      }
+      const relRms = Math.sqrt(error / Math.max(scale, 1e-30));
+      console.log(`  native ${label}\t${relRms.toExponential(2)}`
+        + `\t(first ${expected.length} of ${ours.length})`);
+      compared.push({ label, relRms, prefix: expected.length });
+      return;
+    }
     if (expected.length !== ours.length) {
-      console.log(`  native ${label}\tLENGTH ${ours.length} vs ${expected.length}`);
+      const rms = Math.sqrt(ours.reduce((t, v) => t + v * v, 0) / ours.length);
+      console.log(`  native ${label}\tLENGTH ${ours.length} vs ${expected.length}`
+        + `\tours rms ${rms.toFixed(4)}`);
       compared.push({ label, relRms: Number.POSITIVE_INFINITY, lengthMismatch: true });
       return;
     }

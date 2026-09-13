@@ -209,10 +209,16 @@ export class Af3TrunkGpu {
     for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
     seam("tap.z_after_template", pair);
 
+    // 🔴 THE MSA EMBEDDING, BEFORE THE STACK TOUCHES IT. `z_after_msa` is the
+    // only MSA seam there was, so a wrong FEATURE and a wrong STACK were the
+    // same number. The reference records `evoformer/msa_activations` at exactly
+    // this point.
+    seam("tap.msa_activations", embedded.msa);
     const msa = await stage("msa-stack", () => new Af3MsaStackGpu(this.device, this.options).run(
       { pair, msa: embedded.msa, pairMask: input.pairMask, msaMask: input.msaMask,
         tokens, sequences: input.sequences },
-      weights.msaBlocks, dialect, options));
+      weights.msaBlocks, dialect,
+      { ...options, stopAfterOpm: options.stopAfterOpm === true }));
 
     // 🔴 boltz2 ADDS THE PRE-MSA PAIR BACK. See `msaDoubleAddPair` in
     // dialect.js: its MSAModule returns the updated z and its caller adds z to
@@ -220,6 +226,10 @@ export class Af3TrunkGpu {
     if (dialect.msaDoubleAddPair === true) {
       for (let index = 0; index < msa.pair.length; index += 1) msa.pair[index] += pair[index];
     }
+    // ...and the MSA tensor the stack produced, which the reference taps as
+    // `msa_block_msa_act`. With one block it is that block's updated MSA, and
+    // it is what separates a wrong MSA update from a wrong outer product.
+    seam("tap.msa_block_msa_act", msa.msa);
     seam("tap.z_after_msa", msa.pair);
 
     // 🔴 THE ONLY STAGE WORTH A PROGRESS BAR. The pairformer is 48 blocks and
