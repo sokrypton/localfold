@@ -188,10 +188,16 @@ export async function main(device, args) {
     // ...and the ATOM DECODER, the last stage and the one the fold's geometry
     // already pointed at: per-atom offsets compressed to 0.73x while the token
     // centres they hang off stayed at 0.93x.
+    // --dec-blocks= truncates the decoder stack on BOTH sides: if the error
+    // grows with depth its cross-attention blocks own it, and if it is flat the
+    // pair logits, the broadcast projection or the position update do.
+    const decBlocks = Number(option(args, "dec-blocks", String(weights.decoder.blocks.length)));
+    const decWeights = { ...weights.decoder,
+                         blocks: weights.decoder.blocks.slice(0, decBlocks) };
     const cpuDec = atomDecoder(cpuTx, cpuEnc, { ...shared, shape: input.shape },
-                               weights.decoder);
+                               decWeights);
     const gpuDec = await new Af3AtomDecoderGpu(device).run(
-      cpuTx, cpuEnc, { ...shared, shape: input.shape }, weights.decoder, {});
+      cpuTx, cpuEnc, { ...shared, shape: input.shape }, decWeights, {});
     const pick = (v) => (ArrayBuffer.isView(v) ? v : (v?.output ?? v?.positions ?? v?.update));
     const g = pick(gpuDec); const c = pick(cpuDec);
     if (!ArrayBuffer.isView(g) || !ArrayBuffer.isView(c)) {

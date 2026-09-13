@@ -180,10 +180,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
   // Only the four block passes; the encoder's masking and aggregation are its
   // own, and `aggregate` reads a weight this bundle does not carry.
-  const { project, projectKeys, projectKeysAtoms, expandKeys, attendFor, output,
-          outputRowTile } = createAtomBlockShaders(common, shape);
-  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms, expandKeys,
-           attendFor, output, outputRowTile };
+  const { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
+          attendFor, output, outputRowTile } = createAtomBlockShaders(common, shape);
+  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms,
+           normaliseQueries, expandKeys, attendFor, output, outputRowTile };
 }
 
 export class Af3AtomDecoderGpu {
@@ -234,6 +234,22 @@ export class Af3AtomDecoderGpu {
     if (keyMasked === undefined) {
       throw new Error("atom decoder blocks carry no keyMaskedAtomAttention");
     }
+    // 🔴 THE DECODER NEVER CHAINED ITS ADAPTIVE LayerNormS, AND ITS BLOCKS ARE
+    // THE ENCODER'S. Under protenix2, OpenDDE and boltz2's parents the keys
+    // normalise the ALREADY NORMALISED queries rather than the raw activation -
+    // a norm applied twice, which does not commute away. The encoder runs an
+    // extra `normalise-queries` pass for it; this stack ran none, so every one
+    // of its three blocks used the stock-AF3 form. Measured: the decoder's
+    // error GREW with block count - 3.81e-3, 4.73e-3, 1.21e-2 for one, two and
+    // three blocks - which is what a per-block convention looks like.
+    const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
+    if (chainedNorm === undefined) {
+      throw new Error("atom decoder blocks carry no chainedAtomLayerNorm: AF3 "
+        + "normalises the raw activation on both sides, OpenDDE chains them");
+    }
+    if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
+      throw new Error("this atom decoder's blocks disagree about chainedAtomLayerNorm");
+    }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
       perTokenChannels: weights.perTokenChannels,
@@ -255,7 +271,8 @@ export class Af3AtomDecoderGpu {
       + `:tp${shape.trunkPairChannels}`
       // ...and the two conventions, for the reason the encoder's key names
       // them: the arms index one buffer differently and produce one shape.
-      + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`;
+      + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`
+      + `${chainedNorm ? "cn" : ""}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -389,6 +406,9 @@ export class Af3AtomDecoderGpu {
       const q = alloc("dec.q", queryRows * width * 4);
       const k = alloc("dec.k", keyRows * width * 4);
       const v = alloc("dec.v", keyRows * width * 4);
+      // Only where the dialect chains; see the note at the dispatch.
+      const normalisedQueries = chainedNorm
+        ? alloc("dec.normalised-queries", queryRows * channels * 4) : null;
       const kAtoms = alloc("dec.k-atoms", queryRows * width * 4);
       const vAtoms = alloc("dec.v-atoms", queryRows * width * 4);
       const gate = alloc("dec.gate", queryRows * width * 4);
@@ -427,8 +447,19 @@ export class Af3AtomDecoderGpu {
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
             perOutput[0], perOutput[1]);
+        // 🔴 CHAINED, SO THE KEYS NORMALISE THE NORMALISED QUERIES. Under stock
+        // AF3 both sides read `act`, this pass does not run, and that path is
+        // unchanged - which is why AlphaFold 3 stays at 4.66e-7 through this.
+        let keySource = act;
+        if (chainedNorm) {
+          const perQueryRow = spread(queryRows);
+          run(`normalise-queries-${index}`, compiled.normaliseQueries,
+              [act, queriesCond, w, normalisedQueries],
+              perQueryRow[0], perQueryRow[1]);
+          keySource = normalisedQueries;
+        }
         run(`project-keys-${index}`, compiled.projectKeysAtoms,
-            [act, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
+            [keySource, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
