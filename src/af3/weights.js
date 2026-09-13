@@ -680,9 +680,18 @@ export async function confidenceWeights(store) {
   const T = (name) => store.tensor(`${CONFIDENCE}/${name}`);
   const [stackPairChannels, stackSingleChannels, stackSingleHeads, stackSingleDimension] =
     singleAttentionDims(store, CONFIDENCE_STACK);
-  const [targetFeatWidth, pairChannels] =
-    dims(store, `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
-  const [singleChannels] = dims(store, `${CONFIDENCE}/plddt_logits_ln/scale`);
+  // 🔴 THE SCOPE THAT STATES THESE DEPENDS ON WHICH HEAD THIS IS. boltz2 has no
+  // `~_embed_features` at all - it rebuilds z under `~_boltz2_reembed` - and no
+  // `plddt_logits_ln`, because it normalises before no head. Both widths still
+  // come off a tensor rather than a constant; only which tensor moves.
+  const reembedScope = store.manifest?.tensors?.[
+    `${CONFIDENCE}/~_boltz2_reembed/left_target_feat_project/weights`] !== undefined;
+  const [targetFeatWidth, pairChannels] = dims(store, reembedScope
+    ? `${CONFIDENCE}/~_boltz2_reembed/left_target_feat_project/weights`
+    : `${CONFIDENCE}/~_embed_features/left_target_feat_project/weights`);
+  const [singleChannels] = dims(store, reembedScope
+    ? `${CONFIDENCE}/~_boltz2_reembed/s_norm/scale`
+    : `${CONFIDENCE}/plddt_logits_ln/scale`);
   const blocks = [];
   for (let index = 0; index < 4; index += 1) {
     const at = (leaf) => stacked(store, `${CONFIDENCE_STACK}/${leaf}`, index);
@@ -711,23 +720,68 @@ export async function confidenceWeights(store) {
       },
     }));
   }
+  // 🔴 boltz2's HEAD IS A DIFFERENT MODULE IN FRONT OF THE SAME PAIRFORMER. It
+  // REBUILDS z and s from the trunk's outputs under a `~_boltz2_reembed` scope -
+  // nine terms, not AF3's two - carries no LayerNorm before any logit head
+  // (`NO_HEAD_NORM`), and splits its PDE and PAE into intra- and inter-chain
+  // heads. So three groups of tensors are conditional, and which ones a bundle
+  // has is what says which head it is.
+  const has = (name) =>
+    store.manifest?.tensors?.[`${CONFIDENCE}/${name}`] !== undefined;
+  const reembed = has("~_boltz2_reembed/z_norm/scale");
+  const headNorm = has("logits_ln/scale");
   return {
     dialect: af3Dialect(store),
     pairChannels, singleChannels, targetFeatWidth, blocks,
-    leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
-    rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
-    distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
-    logitsLnScale: await T("logits_ln/scale"),
-    logitsLnOffset: await T("logits_ln/offset"),
+    ...(reembed ? {
+      reembed: {
+        sInputsNormScale: await T("~_boltz2_reembed/s_inputs_norm/scale"),
+        sInputsNormOffset: await T("~_boltz2_reembed/s_inputs_norm/offset"),
+        sNormScale: await T("~_boltz2_reembed/s_norm/scale"),
+        sNormOffset: await T("~_boltz2_reembed/s_norm/offset"),
+        sInputToS: await T("~_boltz2_reembed/s_input_to_s/weights"),
+        zNormScale: await T("~_boltz2_reembed/z_norm/scale"),
+        zNormOffset: await T("~_boltz2_reembed/z_norm/offset"),
+        relPosProject: await T("~_boltz2_reembed/rel_pos_project/weights"),
+        tokenBondsProject: await T("~_boltz2_reembed/token_bonds_project/weights"),
+        tokenBondsTypeEmbed: await T("~_boltz2_reembed/token_bonds_type_embed/weights"),
+        contactEncodingUnspecified: await T("contact_encoding_unspecified"),
+        contactEncodingUnselected: await T("contact_encoding_unselected"),
+        leftTargetFeatProject: await T("~_boltz2_reembed/left_target_feat_project/weights"),
+        rightTargetFeatProject: await T("~_boltz2_reembed/right_target_feat_project/weights"),
+        sToZProdIn1: await T("~_boltz2_reembed/s_to_z_prod_in1/weights"),
+        sToZProdIn2: await T("~_boltz2_reembed/s_to_z_prod_in2/weights"),
+        sToZProdOut: await T("~_boltz2_reembed/s_to_z_prod_out/weights"),
+        distogramFeatProject: await T("~_boltz2_reembed/distogram_feat_project/weights"),
+      },
+    } : {
+      leftTargetFeatProject: await T("~_embed_features/left_target_feat_project/weights"),
+      rightTargetFeatProject: await T("~_embed_features/right_target_feat_project/weights"),
+      distogramFeatProject: await T("~_embed_features/distogram_feat_project/weights"),
+    }),
+    // 🔴 THE HEAD LayerNormS ARE ABSENT, NOT IDENTITY. A LayerNorm with scale 1
+    // and offset 0 still re-centres and rescales, so a bundle without them is a
+    // head that does not normalise - which cannot be expressed as a weight and
+    // is why those six tensors have no source in boltz2's checkpoint.
+    ...(headNorm ? {
+      logitsLnScale: await T("logits_ln/scale"),
+      logitsLnOffset: await T("logits_ln/offset"),
+      paeLogitsLnScale: await T("pae_logits_ln/scale"),
+      paeLogitsLnOffset: await T("pae_logits_ln/offset"),
+      plddtLnScale: await T("plddt_logits_ln/scale"),
+      plddtLnOffset: await T("plddt_logits_ln/offset"),
+      resolvedLnScale: await T("experimentally_resolved_ln/scale"),
+      resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
+    } : {}),
     leftHalfDistanceLogits: await T("left_half_distance_logits/weights"),
-    paeLogitsLnScale: await T("pae_logits_ln/scale"),
-    paeLogitsLnOffset: await T("pae_logits_ln/offset"),
     paeLogits: await T("pae_logits/weights"),
-    plddtLnScale: await T("plddt_logits_ln/scale"),
-    plddtLnOffset: await T("plddt_logits_ln/offset"),
+    // ...and the inter-chain halves, which on a MONOMER never fire: the two are
+    // disjoint hard masks, so a single-chain gate cannot see them at all.
+    ...(has("inter_half_distance_logits/weights") ? {
+      interHalfDistanceLogits: await T("inter_half_distance_logits/weights"),
+      paeInterLogits: await T("pae_inter_logits/weights"),
+    } : {}),
     plddtLogits: await T("plddt_logits/weights"),
-    resolvedLnScale: await T("experimentally_resolved_ln/scale"),
-    resolvedLnOffset: await T("experimentally_resolved_ln/offset"),
     experimentallyResolvedLogits: await T("experimentally_resolved_logits/weights"),
   };
 }

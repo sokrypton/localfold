@@ -1152,6 +1152,11 @@ export async function foldBatch(device, batch, weights, options = {}) {
     }
     return new Af3ConfidenceHeadGpu(device, options.confidencePrecision ?? {}).run({
       tokens, dense, seqMask, pair: trunk.pair, single: trunk.single, targetFeat, pseudoBeta,
+      // 🔴 boltz2's HEAD REBUILDS z, so it needs what the EMBEDDER needed:
+      // relative positions, the bond matrix and its orders. AF3's reads none of
+      // them and the field is simply absent there.
+      features: batch.features, bondMatrix: batch.bondMatrix,
+      bondOrderMatrix: batch.bondOrderMatrix,
     }, weights.confidence, weights.confidence.dialect);
   };
 
