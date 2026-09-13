@@ -249,11 +249,26 @@ export function templateEmbedding(input, weights, dialect) {
     const act = Float32Array.from(queryTerm);
 
     // Features 2 and 3: the TEMPLATE's aatype, once along each axis. An empty
-    // slot carries type 0 - ALA - so these contribute row 0 of each weight
-    // rather than nothing, which is half of why an empty slot is not a no-op.
+    // slot still contributes a row of each weight rather than nothing, which is
+    // half of why an empty slot is not a no-op.
+    //
+    // 🔴 AND WHICH ROW IS THE DIALECT'S, AND ONLY THE FIRST EMPTY SLOT GETS IT.
+    // OpenDDE and protenix2 take protenix's featuriser, which "fills its one
+    // empty template with the GAP restype and zero-pads the rest": on a query
+    // with NO template their `template_aatype` is 21 across slot 0 and 0 across
+    // slots 1..3, which the reference's own batch dumps show exactly. Writing 0
+    // everywhere put row 0 (ALA) where row 21 belongs and was worth 2.83e-1 on
+    // the module and 2.07e-2 on the trunk's `z_after_template` seam - a defect
+    // that needed no template to appear, and the last open one in OpenDDE's
+    // trunk. AlphaFold 3, openbind0 and boltz2 write 0 in every slot.
+    const gap = dialect?.emptyTemplateAatype ?? null;
+    // The first EMPTY slot, not slot zero: with a real template in slot 0 the
+    // featuriser's "one empty template" is the first unoccupied one.
+    const firstEmpty = slots.filter(Boolean).length;
+    const emptyCode = gap !== null && slot === firstEmpty ? gap : 0;
     const oneHot = new Float32Array(tokens * RESTYPES);
     for (let token = 0; token < tokens; token += 1) {
-      const code = template ? template.aatype[token] : 0;
+      const code = template ? template.aatype[token] : emptyCode;
       if (code >= 0 && code < RESTYPES) oneHot[token * RESTYPES + code] = 1;
     }
     const row = linear(oneHot, tokens, RESTYPES, CHANNELS,

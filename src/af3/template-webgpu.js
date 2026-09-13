@@ -548,15 +548,33 @@ export class Af3TemplateEmbedderGpu {
         if (slots[slot] === undefined || slots[slot] === null) emptySlots += 1;
         else passes.push({ template: slots[slot], repeat: 1 });
       }
-      if (emptySlots > 0) passes.push({ template: undefined, repeat: emptySlots });
+      // 🔴 AND THE EMPTY SLOTS ARE NOT ALL THE SAME SLOT UNDER EVERY DIALECT,
+      // WHICH IS WHAT BROKE THE COLLAPSE ABOVE. OpenDDE and protenix2 take
+      // protenix's featuriser, which fills its ONE empty template with the GAP
+      // restype and zero-pads the rest - so `template_aatype` on a query with
+      // no template is 21 across slot 0 and 0 across slots 1..3, and the four
+      // empty slots are two distinct embeddings, not one. Folding them into a
+      // single pass with repeat 4 put row 0 (ALA) where row 21 belongs and was
+      // the whole of OpenDDE's `z_after_template` 2.07e-2 - a trunk defect that
+      // needed no template to appear. Where there is no gap the split does not
+      // happen and this is the one pass it always was.
+      const gap = dialect.emptyTemplateAatype ?? null;
+      if (emptySlots > 0 && gap !== null) {
+        passes.push({ template: undefined, repeat: 1, emptyAatype: gap });
+        if (emptySlots > 1) {
+          passes.push({ template: undefined, repeat: emptySlots - 1, emptyAatype: 0 });
+        }
+      } else if (emptySlots > 0) {
+        passes.push({ template: undefined, repeat: emptySlots, emptyAatype: 0 });
+      }
 
       const slotBuffers = [];
-      for (const { template, repeat } of passes) {
+      for (const { template, repeat, emptyAatype } of passes) {
         const slot = slotBuffers.length;
-        const aatypeData = new Int32Array(tokens);
-        // An empty slot carries type 0 - ALA - which contributes ROW 0 of each
-        // aatype weight rather than nothing. That is half of why an empty slot
-        // is not a no-op; see the note at the top of this file.
+        // An empty slot contributes a ROW of each aatype weight rather than
+        // nothing - that is half of why an empty slot is not a no-op - and
+        // WHICH row is the dialect's. See the note on `gap` above.
+        const aatypeData = new Int32Array(tokens).fill(emptyAatype ?? 0);
         if (template !== undefined && template !== null) {
           for (let t = 0; t < tokens; t += 1) aatypeData[t] = template.aatype[t];
         }

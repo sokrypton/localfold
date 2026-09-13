@@ -2981,16 +2981,57 @@ inherits it, so there is one defect here and not four - and 6MRR carries NO
 template, which makes it the empty-template path. openbind0's same seam reads
 4.07e-6, so it is OpenDDE's, not the module's.
 
-🔴 **THE FIX IS NOT WRITTEN AND THE GATE THAT WOULD LOCALISE IT DOES NOT EXIST
-EITHER.** `check-af3-template-fused.js` is an oracle check for the FUSED
-embedder (boltz2, protenix2); OpenDDE uses AF3's nine-projection one, whose only
-gate here - `check-af3-template.js` - is differential against our own CPU. The
-dump is ready (`EMPTY=1 dump_af3_template.py opendde`, in
-oracle-dumps/af3-oracle-template-opendde-empty.json: 76 tokens, c_z 384, the
-five features and the output), and what it needs is a checker at the same seam
-the fused one uses - features IN, output compared - which means
-`templateEmbedding` must accept precomputed features instead of deriving them
-from slots. That is the next piece of work.
+🔴 **FIXED, AND IT WAS THE EMPTY TEMPLATE SLOT'S RESTYPE.** OpenDDE takes
+protenix's featuriser, which "fills its one empty template with the GAP restype
+and zero-pads the rest" - so on a query with NO template its `template_aatype`
+is **21 across slot 0 and 0 across slots 1..3**, which the reference's own batch
+dump shows exactly (protenix2 the same; AlphaFold 3, openbind0 and boltz2 write
+0 in every slot). This port wrote 0 everywhere, and an empty slot is not a
+no-op: the aatype one-hot picks a row out of `template_pair_embedding_2`/`_3`,
+so row 0 (ALA) went in where row 21 belongs.
+
+| | before | after |
+|---|---:|---:|
+| the template module alone | 2.83e-1 | **1.32e-7** |
+| the trunk seam `z_after_template` | 2.07e-2 | **3.80e-6** |
+| `trunk_out_pair` | 1.08e-1 | 7.10e-2 |
+
+AlphaFold 3 (1.17e-4 / 2.96e-4) and openbind0 (4.07e-6 / 4.27e-4) are unchanged
+to every digit, and boltz2 and protenix2 still fold 6MRR at pLDDT 96.1 and 92.5,
+because the flag is the dialect's.
+
+🔴 **AND THE GPU PATH NEEDED THE SAME FIX FOR A DIFFERENT REASON: IT COLLAPSES
+THE EMPTY SLOTS.** `Af3TemplateEmbedderGpu` runs all the empty slots as ONE pass
+with a repeat count, on the argument that they "produce the same embedding by
+construction - same all-ALA aatype". Under this convention they do not: slot 0
+carries the gap and the rest carry 0, so they are two distinct embeddings. The
+CPU reference alone read 1.32e-7 while the fold still read 2.07e-2, which is
+what named the second half. The pass splits now, and only where a dialect
+supplies a gap - elsewhere it is the one pass it always was.
+
+🔴 **AND UNDERNEATH IT IS A SECOND, SEPARATE DEFECT.** With the template stage
+exact, `z_after_msa` reads **6.01e-2** and `trunk_out_pair` 7.10e-2. Ruled out:
+the MSA subsample (a `DETERMINISTIC_MSA=1` dump is statistically identical), the
+depth (the reference's `num_msa` is 1280 against our 1024 cap, and forcing 1280
+moves nothing), and a missing convention list - OpenDDE is in nine of
+af3-any-model's and this port implements all nine. Open.
+
+### 🔴 AND THE CONFORMERS ARE NOT CENTRED, WHICH IS FIVE OF THE SIX FAMILIES
+
+Found while chasing the above. `CENTRE_REF_CONFORMERS` in af3-any-model is
+`('boltz2', 'openfold3', 'openbind0', protenix*, 'opendde')` - everything except
+stock AlphaFold 3, which is the reference implementation, and intellifold2,
+which passes `centering=False`. Each of their featurisers subtracts the group
+mean per `ref_space_uid`; this port did not. Measured: glycine's four atoms mean
+to exactly (0, 0, 0) in the reference's batch and to (1.31, -0.02, 0.58) here.
+
+It moves the RAW `ref_pos` channel only - the atom encoder also reads a
+translation-invariant pairwise difference - which is why half the module could
+not see it. What it was worth, on openbind0's sequence-featurised `target_feat`:
+**2.89e-2 -> 2.47e-2**. So it is real and it is NOT most of the conformer floor;
+the shared idealised geometry is. Folds are unchanged within the seed spread
+(boltz2 6MRR 0.507 A / TM 0.976 against 0.537 / 0.973; opendde 1.542 / 0.920
+against 1.525 / 0.933).
 
 **OpenDDE's confidence head**, on the reference's own seeded inputs - FOUND
 WRONG, FIXED BY THE M2 IN 8dbb8cd, AND CONFIRMED HERE:

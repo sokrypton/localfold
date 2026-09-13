@@ -27,6 +27,7 @@ import { warmTrunkPipelines } from "../../src/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
+import { dialectFor } from "../../src/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
 import { setDeviceTuning, deviceTuning, DEFAULT_TUNING }
@@ -269,11 +270,25 @@ export async function main(device, args) {
   // profiles the whole file) and no seeded row choice (taking the alignment's
   // prefix where the page takes a seeded subset). `--prefix-rows` restores the
   // second for comparing against a baseline recorded before this.
+  // 🔴 THE DIALECT BEFORE THE STORE, because the batch is built here and the
+  // weights are not loaded until later - and `weights?.trunk?.dialect?...`
+  // written at this line would be `undefined` forever, which is a convention
+  // silently OFF rather than an error. The manifest names the model; that is
+  // all `dialectFor` needs.
+  const batchDialect = await (async () => {
+    const path = option(args, "model", "/model-af3-full-f32/manifest.json");
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(`failed to load ${path}: ${response.status}`);
+    const name = (await response.json())?.model?.name;
+    if (name === undefined) throw new Error(`${path} names no model`);
+    return dialectFor(name);
+  })();
   const built = sequenceArg !== ""
     ? af3BatchFromA3m(sequenceArg, alignment, {
       maxSequences: Number(option(args, "max-msa", "512")),
       seed: Number(option(args, "seed", "20260831")),
       prefixRows: args.includes("--prefix-rows"),
+      centreRefConformers: batchDialect?.centreRefConformers,
       ...(ligands.length === 0 ? {} : { ligands }),
       ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }),
     })

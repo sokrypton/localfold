@@ -50,6 +50,16 @@ export const ALPHAFOLD3 = Object.freeze({
   // short.
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
+  // 🔴 THE RESTYPE AN EMPTY TEMPLATE SLOT CARRIES, in the NINE-PROJECTION
+  // embedder. Null means zero, which is this model's featuriser. See OPENDDE.
+  // 🔴 CENTRE_REF_CONFORMERS: the reference conformers are centred per
+  // `ref_space_uid` by every family's featuriser except stock AlphaFold 3's,
+  // which is the reference implementation and keeps the uncentred CCD
+  // ideals. It moves the RAW ref_pos channel only - the atom encoder also
+  // reads a translation-invariant pairwise difference - which is why it
+  // hid. See src/af3/featurise.js.
+  centreRefConformers: false,
+  emptyTemplateAatype: null,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -105,6 +115,16 @@ export const OPENBIND0 = Object.freeze({
   // short.
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
+  // 🔴 THE RESTYPE AN EMPTY TEMPLATE SLOT CARRIES, in the NINE-PROJECTION
+  // embedder. Null means zero, which is this model's featuriser. See OPENDDE.
+  // 🔴 CENTRE_REF_CONFORMERS: the reference conformers are centred per
+  // `ref_space_uid` by every family's featuriser except stock AlphaFold 3's,
+  // which is the reference implementation and keeps the uncentred CCD
+  // ideals. It moves the RAW ref_pos channel only - the atom encoder also
+  // reads a translation-invariant pairwise difference - which is why it
+  // hid. See src/af3/featurise.js.
+  centreRefConformers: true,
+  emptyTemplateAatype: null,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -178,6 +198,27 @@ export const OPENDDE = Object.freeze({
   // short.
   msaDoubleAddPair: false,
   targetFeatAtomOnly: false,
+  // 🔴 AN EMPTY TEMPLATE SLOT CARRIES THE GAP RESTYPE, AND ONLY THE FIRST ONE.
+  // OpenDDE takes protenix's featuriser, which "fills its one empty template
+  // with the GAP restype and zero-pads the rest" - so `template_aatype` on a
+  // query with NO template is 21 across slot 0 and 0 across slots 1..3, which
+  // the reference's own batch dump shows exactly. Ours wrote 0 everywhere, and
+  // an empty slot is NOT a no-op: the aatype one-hot picks a row out of
+  // `template_pair_embedding_2`/`_3`, so row 0 (ALA) went in where row 21
+  // belongs. Measured against af3-any-model on 6MRR, a query with no template
+  // at all: the template module alone 2.83e-1 -> 1.32e-7, and the trunk seam
+  // `z_after_template` 2.07e-2 -> exact, which was the last open OpenDDE
+  // defect. AlphaFold 3, openbind0 and boltz2 write 0 in every slot; protenix2
+  // shares this convention and already had it on the FUSED path as
+  // `emptyTemplateRestypeColumns`.
+  // 🔴 CENTRE_REF_CONFORMERS: the reference conformers are centred per
+  // `ref_space_uid` by every family's featuriser except stock AlphaFold 3's,
+  // which is the reference implementation and keeps the uncentred CCD
+  // ideals. It moves the RAW ref_pos channel only - the atom encoder also
+  // reads a translation-invariant pairwise difference - which is why it
+  // hid. See src/af3/featurise.js.
+  centreRefConformers: true,
+  emptyTemplateAatype: 21,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -355,6 +396,17 @@ export const PROTENIX2 = Object.freeze({
   // 72 in this model's order [disto(39), pb(1), restype_i(32), restype_j(32),
   // uvec(3), frame(1)]. boltz2's are all zero and its order is its own; see
   // BOLTZ2.
+  // The FUSED embedder is this model's path and reads
+  // `emptyTemplateRestypeColumns`; this is the same convention for the
+  // nine-projection one, stated so the two cannot drift apart.
+  // 🔴 CENTRE_REF_CONFORMERS: the reference conformers are centred per
+  // `ref_space_uid` by every family's featuriser except stock AlphaFold 3's,
+  // which is the reference implementation and keeps the uncentred CCD
+  // ideals. It moves the RAW ref_pos channel only - the atom encoder also
+  // reads a translation-invariant pairwise difference - which is why it
+  // hid. See src/af3/featurise.js.
+  centreRefConformers: true,
+  emptyTemplateAatype: 21,
   emptyTemplateRestypeColumns: [40 + 31, 72 + 31],
   // 🔴 AND THE TEMPLATE EMBEDDER IS A DIFFERENT MODULE, NOT DIFFERENT WIDTHS.
   // protenix2 runs boltz2's fused form: `v = z_proj(z_norm(z)) + a_proj(a)`,
@@ -468,6 +520,17 @@ export const BOLTZ2 = Object.freeze({
   // short.
   msaDoubleAddPair: true,
   targetFeatAtomOnly: true,
+  // The FUSED embedder is this model's path and reads
+  // `emptyTemplateRestypeColumns`; this is the same convention for the
+  // nine-projection one, stated so the two cannot drift apart.
+  // 🔴 CENTRE_REF_CONFORMERS: the reference conformers are centred per
+  // `ref_space_uid` by every family's featuriser except stock AlphaFold 3's,
+  // which is the reference implementation and keeps the uncentred CCD
+  // ideals. It moves the RAW ref_pos channel only - the atom encoder also
+  // reads a translation-invariant pairwise difference - which is why it
+  // hid. See src/af3/featurise.js.
+  centreRefConformers: true,
+  emptyTemplateAatype: null,
   emptyTemplateRestypeColumns: [],
   templateStackOuterResidual: true,
   templateVisibilityByCoverage: true,

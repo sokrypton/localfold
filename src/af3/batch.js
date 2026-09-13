@@ -57,6 +57,10 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     ...(options.symmetriseBonds === undefined
       ? {} : { symmetriseBonds: options.symmetriseBonds }),
     ...(options.chainKinds === undefined ? {} : { chainKinds: options.chainKinds }),
+    // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 expects the
+    // reference conformers centred per ref_space_uid. See featurise.js.
+    ...(options.centreRefConformers === undefined
+      ? {} : { centreRefConformers: options.centreRefConformers }),
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

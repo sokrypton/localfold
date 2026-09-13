@@ -475,6 +475,8 @@ export async function foldAf3(options) {
     // wrong one comes apart (upstream measures ATP's ribose C-C at ~2.0 A
     // against ~1.5). The weights say which - see af3Dialect.
     symmetriseBonds: options.weights.trunk.dialect.symmetriseBonds,
+    // CENTRE_REF_CONFORMERS - see src/af3/featurise.js.
+    centreRefConformers: options.weights.trunk.dialect.centreRefConformers,
     // What each chain's letters mean. Absent, every chain is protein, which is
     // what every caller before nucleic acids meant.
     chainKinds: options.chainKinds,

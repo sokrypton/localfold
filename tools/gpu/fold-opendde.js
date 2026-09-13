@@ -338,6 +338,13 @@ export async function main(device, args) {
     // criterion; 0 is off. See src/model/feature-convergence.js.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
+    // 🔴 THE MSA DEPTH THE MODEL WAS CONFIGURED WITH, WHICH IS NOT 1024 FOR
+    // EVERY FAMILY. `foldBatch` caps at `options.numMsa ?? 1024`; the
+    // reference's OpenDDE config says num_msa 1280, so a deep alignment reaches
+    // its MSA stack 256 rows short and the difference appears at
+    // `z_after_msa` and nowhere earlier.
+    ...(option(args, "num-msa", "") === "" ? {}
+      : { numMsa: Number(option(args, "num-msa", "")) }),
     onStep: ({ step, denoised, structuralDenoised }) => {
       // 🔴 THE GEOMETRY OF THE FRAME, NOT JUST ITS SIZE. `frameGyration` says a
       // frame is protein-SIZED, which is what caught the token-space bug - and

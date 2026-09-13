@@ -52,7 +52,12 @@ describe("the dialect table", () => {
 
   it("turns on exactly the three branches OpenBind-0 needs", () => {
     assert.deepEqual(on(OPENBIND0),
-      ["maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
+      [
+      // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
+      // its reference conformers per `ref_space_uid`. Missing here, it was
+      // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
+      // `target_feat` against af3-any-model. See src/af3/featurise.js.
+      "centreRefConformers","maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
   });
 
   /**
@@ -84,8 +89,19 @@ describe("the dialect table", () => {
 
   it("turns on the branches OpenDDE needs, and no others", () => {
     assert.deepEqual(on(OPENDDE), [
+      // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
+      // its reference conformers per `ref_space_uid`. Missing here, it was
+      // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
+      // `target_feat` against af3-any-model. See src/af3/featurise.js.
+      "centreRefConformers",
       "chainedAtomLayerNorm",
       "distogramBias",
+      // 🔴 THE GAP RESTYPE IN ITS ONE EMPTY TEMPLATE SLOT, which is a VALUE
+      // (21) and not a boolean. OpenDDE takes protenix's featuriser, so a query
+      // with NO template still carries `template_aatype` 21 in slot 0 and 0 in
+      // the rest - and writing 0 everywhere was worth 2.07e-2 on the trunk's
+      // `z_after_template` seam against af3-any-model. See docs/AF3.md.
+      "emptyTemplateAatype",
       "keyMaskedAtomAttention",
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",

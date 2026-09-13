@@ -673,6 +673,46 @@ export function featuriseProtein(sequence, options = {}) {
     if (nucleicToken[token]) profile[token * RESTYPES + aatype[token]] = 1;
   }
 
+  // 🔴 THE REFERENCE CONFORMERS ARE CENTRED PER `ref_space_uid`, AND FIVE OF
+  // THE SIX FAMILIES EXPECT IT. `CENTRE_REF_CONFORMERS` in af3-any-model is
+  // ('boltz2', 'openfold3', 'openbind0', protenix*, 'opendde') - everything but
+  // stock AlphaFold 3, which is the reference implementation, and intellifold2,
+  // which passes centering=False. Their featurisers all subtract the group mean
+  // (boltz2 `centering=True` per ref_space_uid; openbind0
+  // `pos_centered = xl - mean_xl`; protenix/opendde `random_transform(
+  // centralize=True)`), and this port did not - measured, glycine's four atoms
+  // mean to exactly (0,0,0) in the reference's batch and to (1.31, -0.02, 0.58)
+  // here.
+  //
+  // 🔴 IT IS THE RAW `ref_pos` CHANNEL ONLY, and that is why it hid: the atom
+  // encoder reads the positions BOTH raw and through a translation-invariant
+  // pairwise difference, so half the module cannot see a translation at all.
+  // What it cost is the floor under every sequence-featurised oracle
+  // comparison - openbind0's `target_feat` 2.89e-2 from a sequence against
+  // 4.93e-8 from the reference's own batch.
+  //
+  // Centring is applied to every family here rather than behind a dialect flag
+  // ONLY IF the dialect says so; stock AF3 must keep its uncentred CCD ideals.
+  if (options.centreRefConformers === true) {
+    const sums = new Map();
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const uid = refSpaceUid[slot];
+      const entry = sums.get(uid) ?? [0, 0, 0, 0];
+      entry[0] += refPos[slot * 3]; entry[1] += refPos[slot * 3 + 1];
+      entry[2] += refPos[slot * 3 + 2]; entry[3] += 1;
+      sums.set(uid, entry);
+    }
+    for (let slot = 0; slot < tokens * DENSE; slot += 1) {
+      if (refMask[slot] === 0) continue;
+      const entry = sums.get(refSpaceUid[slot]);
+      if (entry === undefined || entry[3] === 0) continue;
+      refPos[slot * 3] -= entry[0] / entry[3];
+      refPos[slot * 3 + 1] -= entry[1] / entry[3];
+      refPos[slot * 3 + 2] -= entry[2] / entry[3];
+    }
+  }
+
   return {
     sequence: joined, chains, chainLengths,
     tokens, dense: DENSE, subsets, atomCount, sequences,
