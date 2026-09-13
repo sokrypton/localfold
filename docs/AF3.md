@@ -2474,3 +2474,60 @@ agreed at 1e-7.
 **Still not written: the featuriser.** The 108 columns go in from the dump. The
 frame convention, the bin edges, the 32-class remap and the multichain masking
 are all specified above and none of them is gated yet.
+
+## BOLTZ-2: THREE CHECKERS ON THE FIRST EXPORT, AND TWO WIDTHS AF3 HID
+
+Boltz-2 (MIT, best-A **0.430** in the reference's table - the strongest model in
+it). A `BLOBS` entry and a dialect, no exporter change: **442 tensors, 507.5 M
+parameters, 1936 MiB**. `check-af3-block-any`, `check-af3-embedder` and
+`check-af3-msa-block` all passed on the first run at its widths.
+
+**It is a bigger port than protenix2 - seven new conventions against three** -
+but it shares protenix2's hardest piece: both run the FUSED template embedder,
+already written and held to an oracle at 1.52e-7. What boltz2 adds there is an
+OUTER residual around the stack (`templateStackOuterResidual`), which protenix2
+does not have, and the reference's note on that is worth keeping: *"protenix
+inherited the shared forward and got the wrong convention; rf3 escaped by not
+inheriting it. Either a per-vendor convention is named or the next subclass gets
+whichever behaviour its parent happened to have."*
+
+### Two widths that were constants because AlphaFold 3 makes them coincide
+
+🔴 **`targetFeatWidth: 447` WAS TYPED IN, UNDER A COMMENT NAMING THAT EXACT
+FAULT.** boltz2's target_feat is **384**, and the checkers read "targetFeat has
+10728 elements; expected 9216". It was always derivable - the single
+conditioning's LayerNorm states its INPUT width, less the trunk single, less the
+two unknown-DNA columns where the dialect pads:
+
+    af3        831 - 0 - 384 = 447
+    protenix2  833 - 2 - 384 = 447
+    boltz2     768 - 0 - 384 = 384
+
+🔴 **AND THE CONDITIONING'S OUTPUT WIDTH IS NOT THE SINGLE IT READS.** AF3's
+`single_cond_initial_projection` is [831, 384] - 384 out, and the trunk single
+it concatenates is also 384 - so `seqChannels + targetFeatWidth` happened to be
+the input width and one variable served both. boltz2's is **[768, 768]**: 768
+out, 384 in. Read as one number that gives 1152 against a LayerNorm of 768.
+`trunkSingleChannels` is its own field now.
+
+Both are the same shape of fault and neither is visible on AF3, OpenDDE or
+protenix2, because all three have output == trunk single == 384. **A constant
+that three models agree on is still a constant.**
+
+### Where it stops
+
+`check-af3-diffusion-conditioning` reads *"the pair conditioning's initial
+projection is NaN against its own reference"* - a real signal and correctly
+caught, where the same checker once passed an all-NaN OpenDDE arm because
+`NaN > 1e-5` is false. boltz2's pair path is 128 wide with `relpe_projection`
+[139, 128] and `pair_cond_initial_projection` [256, 128], so 256 = 128 + 128 and
+`projectedRelpos` derives the trunk pair at 128 correctly; the NaN is downstream
+of the widths.
+
+Seven conventions are declared and unimplemented - `opmRowCountNorm`,
+`opmBiasAfterNorm`, `noHeadNorm`, `reembedConfidencePair`,
+`templateVisibilityByCoverage`, `rawRefCharge`, `templateStackOuterResidual`.
+🔴 **AND `opmRowCountNorm` NEEDS MSA DEPTH > 1 TO BITE**: at depth 1 its bias
+term is `(1 - 1/1) * b = 0` and the two normalisers agree, which is why the
+reference's boltz2 single-sequence fold was exact while its MSA module was not.
+A single-sequence gate cannot see that one.

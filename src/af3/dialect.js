@@ -38,6 +38,13 @@
 
 /** Stock AlphaFold 3, DeepMind's own parameters. */
 export const ALPHAFOLD3 = Object.freeze({
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
   fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
@@ -73,6 +80,13 @@ export const ALPHAFOLD3 = Object.freeze({
  * ambiguity should be allowed to live.
  */
 export const OPENBIND0 = Object.freeze({
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
   fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
@@ -126,6 +140,13 @@ export const OPENBIND0 = Object.freeze({
  * shader cache.
  */
 export const OPENDDE = Object.freeze({
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
   fusedTemplateEmbedder: false,
   projectedRelpos: false,
   preSymmetrisedPde: false,
@@ -207,6 +228,13 @@ export const OPENDDE = Object.freeze({
  * a table this file has to keep in step.
  */
 export const PROTENIX2 = Object.freeze({
+  templateStackOuterResidual: false,
+  templateVisibilityByCoverage: false,
+  noHeadNorm: false,
+  opmBiasAfterNorm: false,
+  opmRowCountNorm: false,
+  reembedConfidencePair: false,
+  rawRefCharge: false,
   // TRANSPOSED_COLUMN_PAIR_BIAS.
   swapTransposedBias: true,
   // OPENFOLD3_LINEAGE.
@@ -268,8 +296,85 @@ export const PROTENIX2 = Object.freeze({
   fusedTemplateEmbedder: true,
 });
 
+/**
+ * Boltz-2 (MIT). Best-A **0.430** in the reference's table - the strongest model
+ * in it, and the reason this port was worth doing at all.
+ *
+ * 🔴 IT IS A BIGGER PORT THAN protenix2 AND SHARES ITS HARDEST PIECE. Both run
+ * the FUSED template embedder - boltz2's own module, which protenix2 inherited -
+ * so `fusedTemplateEmbedding` is already written and held to an oracle at
+ * 1.52e-7. What boltz2 adds on top is an OUTER residual around that stack, which
+ * protenix2 does not have, and the reference's note on it is worth repeating:
+ * "protenix inherited the shared forward and got the wrong convention; rf3
+ * escaped by not inheriting it. Either a per-vendor convention is named -- as it
+ * now is here -- or the next subclass gets whichever behaviour its parent
+ * happened to have."
+ *
+ * 🔴 SEVEN CONVENTIONS HERE ARE DECLARED AND NOT IMPLEMENTED. Listing them is
+ * the point: a flag nothing reads is documentation, and a flag something reads
+ * WRONGLY is a silent wrong model.
+ *
+ *   `opmRowCountNorm`   the outer product mean divides by the row COUNT.
+ *                       🔴 IT NEEDS MSA DEPTH > 1 TO BITE: at depth 1 the bias
+ *                       term is (1 - 1/1) * b = 0 and the two normalisers agree,
+ *                       which is why boltz2's single-sequence 6MRR fold was
+ *                       exact while its MSA module was not. A single-sequence
+ *                       gate cannot see this one.
+ *   `opmBiasAfterNorm`  where that bias enters, which is a separate question
+ *                       from what the divisor counts.
+ *   `noHeadNorm`        no LayerNorm before ANY confidence head.
+ *   `reembedConfidencePair`  the confidence head REBUILDS its pair rather than
+ *                       reading the trunk's: z_norm(z) + relpos + bonds + row,
+ *                       column and outer product of s_inputs, plus a distance
+ *                       embedding of the PREDICTED coordinates.
+ *   `templateVisibilityByCoverage`  templates are masked by what the template
+ *                       COVERS rather than by chain.
+ *   `rawRefCharge`      the reference charge is not normalised.
+ *   `templateStackOuterResidual`  above.
+ *
+ * And its sampler is its own - gamma_0 0.605, gamma_min 1.107, noise_scale
+ * 0.901, step_scale 1.638, rho 8, sigma 0.0004..160 - which is NOT a dialect
+ * flag and belongs with the sampler; see docs/AF3.md. Running it on AF3's
+ * constants anneals on the wrong schedule and nothing errors.
+ */
+export const BOLTZ2 = Object.freeze({
+  swapTransposedBias: true,
+  symmetriseBonds: true,
+  maskPaddedKeys: true,
+  padSingleCondUnknownDna: false,
+  // Settled by the tensors at export, as protenix2's was.
+  pairInitFromSingle: false,
+  // MSA_UPDATE_BEFORE_OPM, as OpenDDE.
+  msaUpdateBeforeOuterProduct: true,
+  distogramBias: true,
+  keyMaskedAtomAttention: true,
+  perBlockPairLayerNorm: true,
+  // ...but NOT the atom-pair one, where OpenDDE and protenix2 both have it.
+  perBlockAtomPairLayerNorm: false,
+  // 🔴 NO CHAINED FORM, AND THE REFERENCE EXPLAINS WHY IT NEEDS NO BRANCH:
+  // boltz2 gathers the ALREADY NORMALISED queries and carries one `adaln` per
+  // layer, and adaptive LayerNorm is POINTWISE per atom - so gathering before
+  // or after it is the same computation. The opendde/protenix chained form is
+  // different precisely because it applies a norm TWICE.
+  chainedAtomLayerNorm: false,
+  splitPairConditioning: false,
+  projectedRelpos: true,
+  structuralTokens: false,
+  preSymmetrisedPde: true,
+  templateMeanOverAllSlots: false,
+  fusedTemplateEmbedder: true,
+  templateStackOuterResidual: true,
+  templateVisibilityByCoverage: true,
+  noHeadNorm: true,
+  opmBiasAfterNorm: true,
+  opmRowCountNorm: true,
+  reembedConfidencePair: true,
+  rawRefCharge: true,
+});
+
 export const DIALECTS = Object.freeze({
   protenix2: PROTENIX2,
+  boltz2: BOLTZ2,
   alphafold3: ALPHAFOLD3,
   openbind0: OPENBIND0,
   opendde: OPENDDE,

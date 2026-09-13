@@ -138,6 +138,10 @@ BLOBS = {
     "openbind0": "~/af3_ported/openbind.bin.zst",
     "opendde": "~/af3_ported/opendde.bin.zst",
     "protenix2": "~/af3_ported/protenix2.bin.zst",
+    # Boltz-2, MIT, best-A 0.430 - the strongest model in the reference's table.
+    #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/\
+    #       boltz2/boltz2.bin.zst
+    "boltz2": "~/af3_ported/boltz2.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs

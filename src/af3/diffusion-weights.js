@@ -297,7 +297,29 @@ export async function conditioningWeights(store, dialect) {
     // and OpenDDE's trunk pair arriving here is 384 wide, not 128.
     pairChannels: dims(store, `${HEAD}/pair_cond_initial_projection/weights`)[1],
     seqChannels: dims(store, `${HEAD}/single_cond_initial_projection/weights`)[1],
-    targetFeatWidth: 447, relativeWidth: 139,
+    // 🔴 THE CONDITIONING'S OUTPUT WIDTH AND THE SINGLE IT READS ARE TWO
+    // NUMBERS, and AlphaFold 3 hides that by having them equal. Its projection
+    // is [831, 384] - 384 out, and the trunk single it concatenates is also
+    // 384 - so `seqChannels + targetFeatWidth` happened to be the input width.
+    // boltz2's is [768, 768]: 768 out, 384 in. Read as one number that gives
+    // 1152 against a LayerNorm of 768.
+    trunkSingleChannels:
+      dims(store, "diffuser/evoformer/single_activations/weights")[1],
+    // 🔴 447 WAS TYPED IN, UNDER A COMMENT NAMING THAT EXACT FAULT. boltz2's
+    // target_feat is 384 wide, not AlphaFold 3's 447, and the checkers read
+    // "targetFeat has 10728 elements; expected 9216" - 447 against 384 over 24
+    // tokens. It is derivable and never had to be a constant: the single
+    // conditioning's LayerNorm states its INPUT width, which is the target
+    // features plus the trunk single, plus two more where the dialect pads the
+    // unknown-DNA columns.
+    //
+    //     af3        831 - 0 - 384 = 447
+    //     protenix2  833 - 2 - 384 = 447
+    //     boltz2     768 - 0 - 384 = 384
+    targetFeatWidth: dims(store, `${HEAD}/single_cond_initial_norm/scale`)[0]
+      - (dialect.padSingleCondUnknownDna ? 2 : 0)
+      - dims(store, "diffuser/evoformer/single_activations/weights")[1],
+    relativeWidth: 139,
     trunkPairChannels: splitPair
       ? dims(store, `${HEAD}/z_trunk_projection/weights`)[0]
       // ...and where only the RELPOS is projected, the concatenation is two

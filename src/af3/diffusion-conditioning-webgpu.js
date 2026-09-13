@@ -113,11 +113,11 @@ export function relativeColumnSums(scale, projection, pairChannels, outChannels)
 }
 
 export function createConditioningShaders(shape, offsets) {
-  const { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
+  const { tokens, pairChannels, seqChannels, trunkSingleChannels, targetFeatWidth, noiseChannels,
           padding, split = false, trunkPairChannels = pairChannels } = shape;
   const pairs = tokens * tokens;
   const pairWidth = pairChannels + RELATIVE_WIDTH;
-  const singleWidth = seqChannels + targetFeatWidth + padding.length;
+  const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
 
   const pairInitial = `
 const TOKENS: u32 = ${tokens}u;
@@ -543,6 +543,8 @@ export class Af3DiffusionConditioningGpu {
     const pairs = tokens * tokens;
     const pairChannels = weights.pairChannels;
     const seqChannels = weights.seqChannels;
+    // ...and the single it READS, which is a different number under boltz2.
+    const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
     const targetFeatWidth = weights.targetFeatWidth;
     const noiseChannels = weights.fourierWeight.length;
     const prepared = prepareWeights(weights);
@@ -554,7 +556,8 @@ export class Af3DiffusionConditioningGpu {
     const split = weights.zTrunkProjection !== undefined;
     const trunkPairChannels = split
       ? (weights.trunkPairChannels ?? pairChannels) : pairChannels;
-    const shape = { tokens, pairChannels, seqChannels, targetFeatWidth, noiseChannels,
+    const shape = { tokens, pairChannels, seqChannels, trunkSingleChannels,
+                    targetFeatWidth, noiseChannels,
                     padding, split, trunkPairChannels };
     const sources = createConditioningShaders(shape, noisePacked.offsets);
     const base = `af3-diffcond:${tokens}:${pairChannels}:${seqChannels}:${targetFeatWidth}`
@@ -593,6 +596,8 @@ export class Af3DiffusionConditioningGpu {
     const pairs = tokens * tokens;
     const pairChannels = weights.pairChannels;
     const seqChannels = weights.seqChannels;
+    // ...and the single it READS, which is a different number under boltz2.
+    const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
     const targetFeatWidth = weights.targetFeatWidth;
     const noiseChannels = weights.fourierWeight.length;
 
@@ -614,7 +619,7 @@ export class Af3DiffusionConditioningGpu {
     // `feature()` body while every dimension in the key stays put - the one
     // shape a shader cache cannot see.
     const padding = singleCondPadding(input.dialect, seqChannels);
-    const singleWidth = seqChannels + targetFeatWidth + padding.length;
+    const singleWidth = trunkSingleChannels + targetFeatWidth + padding.length;
     if (weights.singleCondInitialNormScale.length !== singleWidth) {
       throw new Error(`single conditioning is ${singleWidth} channels but its `
         + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
