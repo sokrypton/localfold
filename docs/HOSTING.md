@@ -266,11 +266,32 @@ and eight zeroed encoder tensors), and `boltz2-f32`'s four negated
 rather than folding at the wrong width, so the published one is not merely
 worse, it no longer loads. See docs/AF3.md.
 
-## 🔴 NOTHING IN THIS SESSION HAS BEEN PUBLISHED, AND ONE BUNDLE MUST BE
+## THE THREE int5 BUNDLES ARE PUBLISHED, AND opendde WAS THE ONE THAT HAD TO BE
 
-State, plainly: **no weights have been uploaded to Hugging Face and nothing has
-been pushed to git.** There is no HF token on this box, and the branch is 47
-commits ahead of `origin/a100` and 38 ahead of `origin/main`.
+Uploaded to `sokrypton/localfold` at commit
+**`068c905dfb0f8cf9b9432eef80d2220ef3ff697f`**: `opendde-int5/` (re-export),
+`boltz2-int5/` and `protenix2-int5/` (new). Eleven directories there now.
+`check_remote_bundle.py` reads all twelve OpenDDE shards and all eight of
+AlphaFold 3's back from the remote.
+
+`src/reference/manifests/opendde.js` is regenerated from the uploaded bundle and
+its `remote:` re-pinned to that commit;
+`boltz2.js` and `protenix2.js` are new modules.
+`test/registry-manifest-widths.test.js` is GREEN, which is the signal the deploy
+blocker below is cleared - it covers all five AF3-lineage families now.
+
+🔴 **AND THE TWO NEW MODELS ARE NOT IN `MODEL_BUNDLES` YET.** Their manifests
+exist and their weights are hosted, so nothing about them can 404 - and nothing
+LOADS them either, because the registry has no entry. That is deliberate: the
+upload is reversible in effect (an unreferenced directory costs storage and
+nothing else) and adding a family to the page is a product decision, not a
+porting one.
+
+### What the state WAS, before the upload
+
+**No weights had been uploaded and nothing pushed to git.** There was no HF
+token on this box, and the branch was 47 commits ahead of `origin/a100` and 38
+ahead of `origin/main`.
 
 | bundle | local state | published state | consequence |
 |---|---|---|---|
