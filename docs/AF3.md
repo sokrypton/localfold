@@ -2807,3 +2807,44 @@ comparable.
   implemented and have never been exercised: 6MRR folds with no template.
 - The inter-chain confidence heads and `opmRowCountNorm` both need a COMPLEX and
   an MSA of depth > 1 respectively. Neither can be seen on this target.
+
+### OpenDDE AND OpenBind-0, MEASURED AGAINST THE ORACLE FOR THE FIRST TIME
+
+| | one denoise step | trunk pair | confidence pLDDT | RMSD to 6MRR | TM |
+|---|---:|---:|---:|---:|---:|
+| alphafold3 | 1.55e-5 | 2.96e-4 | 3.46e-5 | 0.643 A | 0.956 |
+| **boltz2** | 3.50e-3 | 3.49e-4 | 1.44e-6 | **0.537** | **0.973** |
+| openbind0 | 8.22e-5 | 4.27e-4 | 4.26e-4 | 1.732 | 0.904 |
+| opendde | 9.79e-7 | - | - | 1.525 | 0.933 |
+| protenix2 | 1.92e-6 | - | 1.47e-7 | 1.564 | 0.929 |
+
+**openbind0 needed nothing.** It was already right, at every level, and this is
+the first time anything measured it: its trunk's `target_feat` reads 4.93e-8,
+its pair 4.27e-4, its confidence head 4.26e-4, and its bundle agrees with the
+reference's params 406 of 406.
+
+**OpenDDE was not**, and both causes were in the BUNDLE:
+
+  * it joined `PADDED_SINGLE_COND` upstream on 2026-09-10 and this export
+    predates it - its diffusion single conditioning normalises over 833
+    channels, not 831, and the two re-inserted zero columns are not free
+    because a LayerNorm maps a zero to -mean/std. A uniform 0.12%, exactly
+    `1 - sqrt(831/833)`.
+  * eight base-name encoder tensors were ZERO in the export where the reference
+    has values.
+
+Re-exported, both bundles agree 481 of 481 and the denoise step is 9.79e-7.
+
+🔴 **AND THE WIDTH ASSERTION THAT SHOULD HAVE CAUGHT THE FIRST ONE COULD NOT
+FIRE.** `targetFeatWidth` was derived as `scale - pad - trunkSingle`, i.e. FROM
+the tensor it was checked against, so whatever the scale said the derived width
+absorbed it. The stale bundle folded silently at target_feat 445 instead of 447.
+It comes off `single_activations` now, which states 447 outright, and the stale
+bundle raises.
+
+🔴 **OpenDDE's TRUNK AND CONFIDENCE ARE STILL UNMEASURED AGAINST AN ORACLE.**
+Its confidence is its own module (`opendde_confidence.OpenDDEConfidenceHead`),
+which `dump_af3_confidence.py` does not build, and its trunk runs through
+`fold-opendde.js`, which has no `--trunk-oracle=`. Both are reachable - the
+reference's `confidence_parity.ours_opendde` is the entry point for one and the
+taps already work for the other - and neither has been done.
