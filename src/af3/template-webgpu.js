@@ -68,21 +68,71 @@ const ORDER = [
   "outputLayerNormScale", "outputLayerNormOffset", "outputLinear",
 ];
 
+// 🔴 THE FUSED EMBEDDER'S TENSORS, WHICH ARE A DIFFERENT SET AND NOT A SUBSET.
+// protenix2 and boltz2 run boltz2's module: one `a_proj` over the 108
+// concatenated feature columns where AF3 sums nine projections, and `z_norm` /
+// `z_proj` where AF3 has `query_embedding_norm` / `template_pair_embedding_8`.
+// weights.js maps the last two onto the AF3 names already, and maps `v_norm` /
+// `u_proj` onto the output pair - so only the INPUT stage differs here.
+const FUSED_ORDER = [
+  "queryEmbeddingNormScale", "queryEmbeddingNormOffset",
+  "zProjection", "aProjection",
+  "outputLayerNormScale", "outputLayerNormOffset", "outputLinear",
+];
+
+/**
+ * The fused embedder's 108 feature columns for ONE slot.
+ *
+ * 🔴 EMPTY SLOTS ONLY, AND IT SAYS SO RATHER THAN GUESSING. A de novo fold has
+ * four empty slots and their columns are constant: every geometry feature is
+ * exactly zero and both restype blocks are one-hot at GAP. That is measured -
+ * `EMPTY=1 tools/oracle/dump_af3_template.py protenix2` - not inferred from the
+ * featuriser, whose empty-slot convention differs per vendor (protenix fills the
+ * first slot with GAP, opendde all four, intellifold2 deliberately uses 0).
+ *
+ * A slot WITH a template needs the real featuriser: Boltz's frame convention,
+ * the 39 bin edges, the 32-class remap and the multichain masking, all specified
+ * in docs/AF3.md and gated by nothing yet. Building it from that specification
+ * and checking it against a reference built the same way would prove nothing.
+ */
+export function emptyFusedFeatures(template, tokens, width) {
+  if (template !== undefined && template !== null) {
+    throw new Error("the fused template embedder has no featuriser yet: a "
+      + "supplied template needs the 108 columns built, and docs/AF3.md has "
+      + "their specification. Fold without templates, or write it against "
+      + "tools/oracle/dump_af3_template.py.");
+  }
+  const pairs = tokens * tokens;
+  const features = new Float32Array(pairs * width);
+  // [disto(39), pseudo-beta mask(1), restype_i(32), restype_j(32), uvec(3),
+  // frame mask(1)] - so the two one-hot columns are at 40 + 31 and 72 + 31.
+  const GAP = 31;
+  const restypeI = 39 + 1 + GAP;
+  const restypeJ = 39 + 1 + 32 + GAP;
+  for (let index = 0; index < pairs; index += 1) {
+    features[index * width + restypeI] = 1;
+    features[index * width + restypeJ] = 1;
+  }
+  return features;
+}
+
 export function packTemplateWeights(weights) {
   const offsets = {};
   let total = 0;
-  for (const name of ORDER) {
+  for (const name of (weights.fused ? FUSED_ORDER : ORDER)) {
     if (weights[name] === undefined) throw new Error(`template weights missing ${name}`);
     offsets[name] = total;
     total += weights[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of ORDER) data.set(weights[name], offsets[name]);
+  for (const name of (weights.fused ? FUSED_ORDER : ORDER)) {
+    data.set(weights[name], offsets[name]);
+  }
   return { data, offsets };
 }
 
 export function createTemplateShaders(shape, offsets, epsilon, variance) {
-  const { tokens, queryChannels, templates } = shape;
+  const { tokens, queryChannels, templates, fused = false, featureWidth = 0 } = shape;
   const pairs = tokens * tokens;
 
   const common = `
@@ -106,21 +156,21 @@ const EPSILON: f32 = ${epsilon};
 // produce the same embedding and the division puts it back, so the module
 // behaves as though there were exactly one template whatever the slot count.
 const TEMPLATE_SCALE: f32 = ${1 / (1e-7 + templates)};
-const W_QUERY_SCALE: u32 = ${offsets.queryEmbeddingNormScale}u;
-const W_QUERY_OFFSET: u32 = ${offsets.queryEmbeddingNormOffset}u;
-const W_EMBED8: u32 = ${offsets.templatePairEmbedding8}u;
-const W_EMBED2: u32 = ${offsets.templatePairEmbedding2}u;
-const W_EMBED3: u32 = ${offsets.templatePairEmbedding3}u;
-const W_EMBED0: u32 = ${offsets.templatePairEmbedding0}u;
-const W_EMBED1: u32 = ${offsets.templatePairEmbedding1}u;
-const W_EMBED4: u32 = ${offsets.templatePairEmbedding4}u;
-const W_EMBED5: u32 = ${offsets.templatePairEmbedding5}u;
-const W_EMBED6: u32 = ${offsets.templatePairEmbedding6}u;
-const W_EMBED7: u32 = ${offsets.templatePairEmbedding7}u;
+const W_QUERY_SCALE: u32 = ${offsets.queryEmbeddingNormScale ?? 0}u;
+const W_QUERY_OFFSET: u32 = ${offsets.queryEmbeddingNormOffset ?? 0}u;
+const W_EMBED8: u32 = ${offsets.templatePairEmbedding8 ?? 0}u;
+const W_EMBED2: u32 = ${offsets.templatePairEmbedding2 ?? 0}u;
+const W_EMBED3: u32 = ${offsets.templatePairEmbedding3 ?? 0}u;
+const W_EMBED0: u32 = ${offsets.templatePairEmbedding0 ?? 0}u;
+const W_EMBED1: u32 = ${offsets.templatePairEmbedding1 ?? 0}u;
+const W_EMBED4: u32 = ${offsets.templatePairEmbedding4 ?? 0}u;
+const W_EMBED5: u32 = ${offsets.templatePairEmbedding5 ?? 0}u;
+const W_EMBED6: u32 = ${offsets.templatePairEmbedding6 ?? 0}u;
+const W_EMBED7: u32 = ${offsets.templatePairEmbedding7 ?? 0}u;
 const GEOMETRY_STRIDE: u32 = ${GEOMETRY_STRIDE}u;
-const W_OUT_SCALE: u32 = ${offsets.outputLayerNormScale}u;
-const W_OUT_OFFSET: u32 = ${offsets.outputLayerNormOffset}u;
-const W_OUT: u32 = ${offsets.outputLinear}u;
+const W_OUT_SCALE: u32 = ${offsets.outputLayerNormScale ?? 0}u;
+const W_OUT_OFFSET: u32 = ${offsets.outputLayerNormOffset ?? 0}u;
+const W_OUT: u32 = ${offsets.outputLinear ?? 0}u;
 `;
 
   const varianceCode = (count, read) => variance === "fast"
@@ -262,7 +312,64 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  return { embed, accumulate, output };
+  // 🔴 THE FUSED INPUT STAGE. `v = z_proj(z_norm(z)) + a_proj(a)`, where `a` is
+  // the 108 concatenated feature columns per pair. Everything after it - the two
+  // pairformer blocks, the accumulate and the output projection - is the same
+  // code, because the fused module differs only in how the stack's input is
+  // built. See docs/AF3.md and src/af3/template-reference.js, which this
+  // mirrors and which is held to af3-any-model at 1.5e-7 on both a templated
+  // and a templateless dump.
+  //
+  // 🔴 THE FEATURES ARE PER PAIR AND THE HOST BUILDS THEM. For a de novo fold
+  // every slot is empty and the 108 columns are CONSTANT - measured, not
+  // assumed: zero everywhere except restype_i and restype_j one-hot at column
+  // 31, which is GAP. The buffer is therefore mostly zeros and could be one
+  // vector; it is per pair so the shape does not have to change when the
+  // featuriser lands.
+  const fusedEmbed = `${common}
+const FEATURE_WIDTH: u32 = ${featureWidth}u;
+const W_Z_PROJECTION: u32 = ${offsets.zProjection ?? 0}u;
+const W_A_PROJECTION: u32 = ${offsets.aProjection ?? 0}u;
+
+@group(0) @binding(0) var<storage, read> pair: array<f32>;
+@group(0) @binding(1) var<storage, read> features: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> act: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= PAIRS) { return; }
+  let base = row * QUERY_CHANNELS;
+  let feature_base = row * FEATURE_WIDTH;
+
+  var total = 0.0;
+  var squares = 0.0;
+  for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
+    let value = pair[base + c];
+    total += value;
+    squares += value * value;
+  }
+  let mean = total / f32(QUERY_CHANNELS);
+  ${varianceCode("QUERY_CHANNELS", "pair[base + c]")}
+  let inverse_std = inverseSqrt(variance + EPSILON);
+
+  for (var e = 0u; e < CHANNELS; e += 1u) {
+    var value = 0.0;
+    for (var c = 0u; c < QUERY_CHANNELS; c += 1u) {
+      let normalized = (pair[base + c] - mean) * inverse_std * weights[W_QUERY_SCALE + c]
+        + weights[W_QUERY_OFFSET + c];
+      value += normalized * weights[W_Z_PROJECTION + c * CHANNELS + e];
+    }
+    for (var c = 0u; c < FEATURE_WIDTH; c += 1u) {
+      let f = features[feature_base + c];
+      if (f != 0.0) { value += f * weights[W_A_PROJECTION + c * CHANNELS + e]; }
+    }
+    act[row * CHANNELS + e] = value;
+  }
+}`;
+
+  return { embed: fused ? fusedEmbed : embed, accumulate, output };
 }
 
 export class Af3TemplateEmbedderGpu {
@@ -313,10 +420,17 @@ export class Af3TemplateEmbedderGpu {
     const variance = options.variance ?? "fast";
 
     const packed = packTemplateWeights(weights);
+    // 🔴 THE FUSED EMBEDDER IS A DIFFERENT INPUT STAGE, AND THE KEY SAYS SO.
+    // Its dimensions are otherwise identical to AF3's, so a cache indexed on
+    // those alone would hand one model the other's kernel.
+    const fused = weights.fused === true;
+    const featureWidth = fused ? weights.featureWidth : 0;
     const sources = createTemplateShaders(
-      { tokens, queryChannels, templates }, packed.offsets, epsilon, variance);
+      { tokens, queryChannels, templates, fused, featureWidth },
+      packed.offsets, epsilon, variance);
     const base = `af3-template:${tokens}:${queryChannels}:${templates}:${epsilon}`
-      + `:${variance}:${dialect.swapTransposedBias}`;
+      + `:${variance}:${dialect.swapTransposedBias}`
+      + `:${fused ? `fused${featureWidth}` : ""}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
@@ -437,6 +551,17 @@ export class Af3TemplateEmbedderGpu {
                 templateGeometry(template, chainMaskFor(template), tokens), tokens)
               : empty,
             storage)),
+          // 🔴 THE FUSED EMBEDDER'S 108 COLUMNS. For an EMPTY slot they are
+          // measured rather than assumed - zero everywhere except restype_i and
+          // restype_j one-hot at column 31, which is GAP; see
+          // oracle-dumps/af3-oracle-template-protenix2-empty.json and the note
+          // in template-reference.js. A slot WITH a template needs the
+          // featuriser, which is not written: the frame convention, the bin
+          // edges and the multichain masking are specified in docs/AF3.md and
+          // gated by nothing, so this refuses rather than guessing.
+          features: fused ? keep(this.allocator.upload(
+            `af3-template.features.${slot}`,
+            emptyFusedFeatures(template, tokens, featureWidth), storage)) : undefined,
         });
       }
 
@@ -541,8 +666,10 @@ export class Af3TemplateEmbedderGpu {
 
       for (let slot = 0; slot < slotBuffers.length; slot += 1) {
         run(`template.embed.${slot}`, compiled.embed,
-            [pair, slotBuffers[slot].aatype, weightBuffer, act,
-             slotBuffers[slot].geometry], linear[0], linear[1]);
+            fused
+              ? [pair, slotBuffers[slot].features, weightBuffer, act]
+              : [pair, slotBuffers[slot].aatype, weightBuffer, act,
+                 slotBuffers[slot].geometry], linear[0], linear[1]);
         for (let index = 0; index < blockWeights.length; index += 1) {
           encodePairTrack({
             run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,

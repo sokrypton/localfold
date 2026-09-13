@@ -20,6 +20,7 @@
  * docs/AF3.md has its specification.
  */
 import { fusedTemplateEmbedding } from "../../src/af3/template-reference.js";
+import { Af3TemplateEmbedderGpu, emptyFusedFeatures } from "../../src/af3/template-webgpu.js";
 import { openAf3Store, templateWeights, af3Dialect } from "../../src/af3/weights.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-template-protenix2.json";
@@ -118,6 +119,34 @@ export async function main(device, args) {
     throw new Error(`fused template relRMS ${relRms.toExponential(3)} exceeds `
       + `${bound.toExponential(0)}`);
   }
-  return { tokens, slots: dump.slots, relRms, bound,
+  // 🔴 AND THE GPU PATH, WHICH NOTHING ELSE REACHES. The arm above holds the
+  // CPU forward to af3-any-model; the SHADER that a fold actually runs had no
+  // check at all, and a protenix2 fold came out scrambled with every stage
+  // "working". This compares them on the EMPTY slots a de novo fold builds,
+  // which is the configuration that folds - and the features are the same
+  // builder the fold uses, so a wrong constant shows up here rather than as a
+  // broken chain three stages later.
+  const slots = Number(option(args, "slots", "4"));
+  const emptyFeatures = emptyFusedFeatures(undefined, tokens, weights.featureWidth);
+  const pairMaskOnes = new Float32Array(pairs).fill(1);
+  const cpuEmpty = fusedTemplateEmbedding({
+    tokens, pair: raw("pair"), pairMask: pairMaskOnes,
+    templates: slots, templateFeatures: emptyFeatures,
+  }, weights, dialect);
+  const gpuEmpty = await new Af3TemplateEmbedderGpu(device).run(
+    { pair: raw("pair"), pairMask: pairMaskOnes, tokens, templates: slots,
+      slots: undefined, asymId: new Int32Array(tokens).fill(1) },
+    weights, dialect);
+  const gpuRms = relativeRms(gpuEmpty.output, cpuEmpty);
+  console.log(`fused template GPU	slots=${slots}	relRMS ${gpuRms.toExponential(2)}`
+    + `	gpu rms ${rms(gpuEmpty.output).toFixed(4)}	cpu rms ${rms(cpuEmpty).toFixed(4)}`);
+  if (!(rms(cpuEmpty) > 1e-3)) throw new Error("the empty-slot reference is flat");
+  const gpuBound = Number(option(args, "gpu-bound", "2e-3"));
+  if (!(gpuRms < gpuBound)) {
+    throw new Error(`the fused template GPU path differs from its own reference by `
+      + `${gpuRms.toExponential(3)}, over ${gpuBound.toExponential(0)}`);
+  }
+
+  return { tokens, slots: dump.slots, relRms, bound, gpuRms,
            oursRms: rms(got), nativeRms: rms(expected) };
 }

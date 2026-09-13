@@ -15,7 +15,10 @@
  * differing by 1e-7 at the input diverge to ~6e-4. See tools/gpu/check-af3-block.js.
  */
 import { runTrunk } from "../../src/af3/trunk-reference.js";
-import { templateEmbedding } from "../../src/af3/template-reference.js";
+import {
+  fusedTemplateEmbedding, templateEmbedding,
+} from "../../src/af3/template-reference.js";
+import { emptyFusedFeatures } from "../../src/af3/template-webgpu.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
 import { binEdges as binEdgesOf } from "../../src/af3/trunk-webgpu.js";
 import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
@@ -65,7 +68,16 @@ function relativeRms(actual, expected) {
   return Math.sqrt(error / Math.max(scale, 1e-30));
 }
 
-function buildInput(tokens, sequences, chains) {
+// 🔴 THE WIDTHS ARE THE BUNDLE'S. `previousPair` was `tokens * tokens * 128`
+// and `targetFeat` was `tokens * 447` - AlphaFold 3's, typed in - so on
+// protenix2 (c_z 256) the recycling input was HALF the size the trunk reads and
+// the whole trunk came out NaN, envelope included. An envelope that is NaN is a
+// CPU reference disagreeing with itself, which is the tell: it is not a port
+// difference, it is a malformed input.
+function buildInput(tokens, sequences, chains, widths = {}) {
+  const pairChannels = widths.pairChannels ?? 128;
+  const singleChannels = widths.singleChannels ?? 384;
+  const targetFeatWidth = widths.targetFeatWidth ?? 447;
   const perChain = Math.ceil(tokens / chains);
   const residueIndex = new Int32Array(tokens);
   const asymId = new Int32Array(tokens);
@@ -102,11 +114,11 @@ function buildInput(tokens, sequences, chains) {
   }
   return {
     tokens, sequences, templates: 4,
-    targetFeat: deterministic(tokens * 447, 11 + tokens),
+    targetFeat: deterministic(tokens * targetFeatWidth, 11 + tokens),
     features: { residueIndex, tokenIndex: residueIndex, asymId, entityId, symId },
     msaRows, deletionMatrix, msaMask, pairMask, seqMask, contactClasses,
-    previousPair: new Float32Array(tokens * tokens * 128),
-    previousSingle: new Float32Array(tokens * 384),
+    previousPair: new Float32Array(tokens * tokens * pairChannels),
+    previousSingle: new Float32Array(tokens * singleChannels),
   };
 }
 
@@ -119,7 +131,7 @@ export async function main(device, args) {
   const store = await openAf3Store(option(args, "model", undefined));
   const weights = await trunkWeights(store, blocks, 4);
   const DIALECT = dialectFor(store);
-  const input = buildInput(tokens, sequences, 3);
+  const input = buildInput(tokens, sequences, 3, weights.embedder);
 
   // 🔴 THE STAGED WORKGROUP BLOCKS' PRECISION IS AN AXIS HERE TOO. The pair
   // track stages grid attention's key and value and the transition's two blocks
@@ -174,11 +186,23 @@ export async function main(device, args) {
     return { tokens, blocks, timings: gpu.timings };
   }
 
+  // 🔴 TWO TEMPLATE EMBEDDERS, AND THE BUNDLE SAYS WHICH. protenix2 and boltz2
+  // run the fused module, whose tensors this function cannot find - the checker
+  // died at `Cannot read properties of undefined` inside `linear`, which names
+  // neither the module nor the model.
+  const embedTemplate = (pair) => (weights.template.fused
+    ? fusedTemplateEmbedding(
+      { pair, pairMask: input.pairMask, tokens, templates: 4,
+        templateFeatures: emptyFusedFeatures(undefined, tokens,
+                                             weights.template.featureWidth) },
+      weights.template, DIALECT)
+    : templateEmbedding(
+      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
+      weights.template, DIALECT));
+
   // The reference, with the template embedder wired the same way round.
   const cpu = runTrunk({ ...input,
-    templateEmbedding: (pair) => templateEmbedding(
-      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
-      weights.template, DIALECT),
+    templateEmbedding: (pair) => embedTemplate(pair),
   }, weights, DIALECT);
 
   // The conditioning envelope, as in check-af3-block.js.
@@ -188,9 +212,7 @@ export async function main(device, args) {
     perturbed.targetFeat[index] += input.targetFeat[index] * perturbation;
   }
   const control = runTrunk({ ...perturbed,
-    templateEmbedding: (pair) => templateEmbedding(
-      { pair, pairMask: input.pairMask, tokens, templates: 4, templateOccupied: false },
-      weights.template, DIALECT),
+    templateEmbedding: (pair) => embedTemplate(pair),
   }, weights, DIALECT);
   const envelope = relativeRms(control.pair, cpu.pair);
   // 🔴 THE SOFTMAX HEADS GET THEIR OWN ENVELOPE. contactProbs is a softmax

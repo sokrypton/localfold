@@ -2569,3 +2569,57 @@ as a test of the FIRST one than the numbers suggest.
 The reference and the checker carry the third branch now. The GPU does not: its
 `pairWidth` is `pairChannels + RELATIVE_WIDTH` with a `split` flag and no third
 mode, so protenix2 reads 1.01 and boltz2 NaN until it is written.
+
+## THE FUSED TEMPLATE ON THE GPU, AND WHY protenix2 STILL DOES NOT FOLD
+
+`Af3TemplateEmbedderGpu` takes the fused embedder now - a second `embed` shader
+(`v = z_proj(z_norm(z)) + a_proj(a)`), a second weight ORDER, the mode in the
+cache key, and the 108 columns as a per-pair buffer. Everything after the input
+stage is the same code, because the fused module differs only in how the stack's
+input is built.
+
+`emptyFusedFeatures` builds a de novo fold's columns and **refuses a template**,
+because the featuriser is not written and building it from docs/AF3.md's
+specification would be unverifiable. The empty columns are measured, not
+assumed: zero everywhere except restype_i and restype_j one-hot at column 31.
+
+`check-af3-template-fused.js` now holds both halves: the CPU forward against
+af3-any-model (1.52e-7 templated, 1.58e-7 empty) and **the GPU shader against
+that CPU forward on the empty slots a fold actually builds (3.09e-5)**. The
+shader had no check at all before, which is the only reason it was worth
+suspecting when the fold came out wrong.
+
+### Three hardcoded widths, and the one that is still open
+
+🔴 **`check-af3-trunk` SEEDED `previousPair` AT `tokens^2 * 128`** - AlphaFold
+3's c_z, typed in - so protenix2 at 256 read a recycling buffer half the length
+its trunk expects and the WHOLE TRUNK came out NaN, envelope included. **An
+envelope that is NaN is the tell**: it is a CPU reference disagreeing with
+itself, which cannot be a port difference and has to be a malformed input.
+Derived from the bundle, protenix2's trunk reads **pair 6.31e-5 at 1011x its
+envelope**, beside AlphaFold 3's 855.9x.
+
+`src/af3/fold.js` had the same constant in two places, under a comment that
+already recorded OpenDDE's being 384 and "the two differ by exactly 3x". Fixed,
+though it changed nothing here.
+
+🔴 **AND protenix2 STILL FOLDS TO A BROKEN CHAIN** - 0.96 A backbone bonds
+against an ideal 1.46, consecutive CA 6.5 A against 3.8 - with every stage
+running and nothing erroring. The trunk is right (6.31e-5), the conditioning is
+right (1.89e-7), the template is right on both paths. What is NOT checked is the
+diffusion half: **75 tensors exist only in protenix2 and 74 only in AlphaFold
+3**, because its atom transformer sits under `__layer_stack_no_per_layer` with
+differently-concatenated leaf names.
+
+🔴 **AND `check-af3-diffusion-transformer` "PASSED" FOR protenix2, WHICH MEANT
+NOTHING.** It takes no `--model=`, so it opened AlphaFold 3's bundle and
+reported on AlphaFold 3. The same is true of `check-af3-atom-encoder`,
+`-atom-decoder`, `-diffusion-head` and `-sampler-gpu`: fourteen of the twenty
+AF3 checkers are pinned, so a second model's diffusion path has no coverage at
+all and a suite run says so only if you read which bundle each one opened.
+
+**The control that proved it is protenix2's and not the harness's:** AlphaFold 3
+folded from the SAME dumper's batch, the same 12-residue sequence and the same
+tool reads N-CA **1.46** against an ideal 1.46, CA-C 1.53 against 1.52, CA-CA
+3.81 against 3.80, pLDDT 89.7. The dumper, the sequence and `fold.js` are all
+sound.

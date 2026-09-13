@@ -834,9 +834,23 @@ export async function foldBatch(device, batch, weights, options = {}) {
     ? structuralLayout(batch).tokens : tokens;
   head?.warm(warmTokens, weights.diffusion, weights.diffusion.dialect).catch(() => {});
 
-  let trunk = reused?.trunk;
-  let previousPair = trunk?.pair ?? new Float32Array(tokens * tokens * 128);
-  let previousSingle = trunk?.single ?? new Float32Array(tokens * 384);
+  const reusedTrunk = reused?.trunk;
+  // 🔴 THE SEED IS THE BUNDLE'S PAIR WIDTH, NOT AlphaFold 3's 128. The note
+  // below already recorded that OpenDDE's is 384 and that the two "differ by
+  // exactly 3x" - and then seeded 128 anyway, because OpenDDE reaches its trunk
+  // through a path that reshapes. protenix2 does not: at c_z 256 the first pass
+  // read a recycling buffer HALF the length its trunk expects, and every stage
+  // ran without complaint on a structure that came out with 0.96 A backbone
+  // bonds against an ideal 1.46 and consecutive CA at 6.5 A against 3.8.
+  //
+  // Nothing errored anywhere. The fold was wrong from its very first tensor.
+  const trunkPairChannels = weights.trunk.embedder?.pairChannels ?? 128;
+  const trunkSingleChannels = weights.trunk.embedder?.singleChannels ?? 384;
+  let trunk = reusedTrunk;
+  let previousPair = trunk?.pair
+    ?? new Float32Array(tokens * tokens * trunkPairChannels);
+  let previousSingle = trunk?.single
+    ?? new Float32Array(tokens * trunkSingleChannels);
   const firstPass = reused === undefined ? 0 : reused.recycles + 1;
   /** Per pass: how far the single and pair moved from the pass before it. */
   const recycleDeltas = [];
