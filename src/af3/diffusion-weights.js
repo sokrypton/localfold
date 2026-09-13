@@ -36,8 +36,31 @@ const TX = `${HEAD}/transformer`;
  * whether it carries per-layer inputs and OpenDDE's does not. See
  * `diffusionWeights`.
  */
+/**
+ * The token transformer's pair width, off the tensor that states it.
+ *
+ * 🔴 THE TWO LAYOUTS NEST DIFFERENTLY AND ORDER THEIR AXES DIFFERENTLY, so one
+ * expression cannot read both:
+ *
+ *     AF3        .../__layer_stack_with_per_layer/pair_logits_projection   [6, 128, 4, 16]
+ *     protenix2  .../__layer_stack_no_per_layer/__layer_stack_no_per_layer/...  [6, 4, 256, 16]
+ *
+ * singly nested with the pair width at axis 1, against doubly nested with it at
+ * axis 2. `txStackFor` cannot be reused either: it appends a trailing
+ * `/transformer` because most leaves in that stack are named `transformer<leaf>`
+ * CONCATENATED, and this one is not.
+ */
+const txPairChannels = (store, perBlockPair) => {
+  const name = txStackName(perBlockPair);
+  return perBlockPair
+    ? dims(store, `${TX}/${name}/${name}/pair_logits_projection/weights`)[2]
+    : dims(store, `${TX}/${name}/pair_logits_projection/weights`)[1];
+};
+
+const txStackName = (perBlockPair) =>
+  perBlockPair ? "__layer_stack_no_per_layer" : "__layer_stack_with_per_layer";
 const txStackFor = (perBlockPair) => {
-  const name = perBlockPair ? "__layer_stack_no_per_layer" : "__layer_stack_with_per_layer";
+  const name = txStackName(perBlockPair);
   return `${TX}/${name}/${name}/transformer`;
 };
 
@@ -482,7 +505,17 @@ export async function diffusionWeights(store, superBlocks = 6) {
     outputNormScale: await T("output_norm/scale"),
     conditioning: await conditioningWeights(store, dialect),
     transformer: {
-      channels: 768, condChannels: 384, pairChannels: 128, heads: 16, dimension: 48,
+      // 🔴 `pairChannels: 128` WAS TYPED IN AND IT IS THE MODEL'S, NOT AF3's.
+      // The token transformer reads the diffusion conditioning's PAIR, and
+      // protenix2 widens that to 256 (PROTENIX2_SETTINGS widens
+      // heads.diffusion.conditioning.pair_channel with the trunk). Its
+      // `pair_logits_projection` is [6, 4, 256, 16] where AF3's is
+      // [6, 4, 128, 16] - so the stack was reading a 256-wide pair through a
+      // 128-wide stride, and every stage ran without complaint on a fold whose
+      // backbone bonds came out at 0.96 A against an ideal 1.46.
+      channels: 768, condChannels: 384,
+      pairChannels: txPairChannels(store, perBlockPair),
+      heads: 16, dimension: 48,
       transitionFactor: 2, blocksPerSuperBlock: 4,
       // Shared under AlphaFold 3 and per block under OpenDDE, where the scale
       // lives inside the doubly-nested stack at [6, 4, 128].
@@ -497,7 +530,11 @@ export async function diffusionWeights(store, superBlocks = 6) {
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32,
-      perTokenChannels: 768, trunkSingleChannels: 384, trunkPairChannels: 128,
+      perTokenChannels: 768, trunkSingleChannels: 384,
+      // ...and the atom encoder's trunk pair, stated by the tensor that embeds
+      // it: [128, 16] under AF3 and [256, 16] under protenix2.
+      trunkPairChannels:
+        dims(store, `${HEAD}/diffusion_embed_trunk_pair_cond/weights`)[0],
       // 🔴 THE _1 SUFFIX IS PART OF THE NAME, HERE TOO. The same four tensors
       // exist unsuffixed, at IDENTICAL shapes, and belong to the pair
       // conditioning computed over a token's own 24 dense atom slots - AF3

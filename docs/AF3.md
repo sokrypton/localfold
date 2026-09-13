@@ -2623,3 +2623,53 @@ folded from the SAME dumper's batch, the same 12-residue sequence and the same
 tool reads N-CA **1.46** against an ideal 1.46, CA-C 1.53 against 1.52, CA-CA
 3.81 against 3.80, pLDDT 89.7. The dumper, the sequence and `fold.js` are all
 sound.
+
+## protenix2 FOLDS A CHAIN NOW, AND THE LAST 0.73x IS THE ATOM DECODER'S
+
+Two more AlphaFold 3 constants, both in `diffusionWeights`:
+
+🔴 **`transformer: { pairChannels: 128 }` WAS TYPED IN.** The token transformer
+reads the diffusion conditioning's PAIR, and PROTENIX2_SETTINGS widens
+`heads.diffusion.conditioning.pair_channel` with the trunk - so protenix2's
+`pair_logits_projection` is [6, 4, **256**, 16] where AF3's is [6, 128, 4, 16].
+The stack was reading a 256-wide pair through a 128-wide stride.
+
+🔴 **AND THE TWO LAYOUTS NEST AND ORDER DIFFERENTLY**, so one expression cannot
+read both: AF3 is singly nested with the width at axis 1, protenix2 doubly
+nested with it at axis 2. `txStackFor` cannot be reused either - it appends a
+trailing `/transformer` because most leaves in that stack are named
+`transformer<leaf>` CONCATENATED, and this one is not.
+
+`encoder.trunkPairChannels: 128` was the same, and `diffusion_embed_trunk_pair_
+cond` states it: [128, 16] under AF3 and [256, 16] here.
+
+**What that bought, on 6MRR at 68 residues:**
+
+| | N-CA | CA-C | CA-CA | radius of gyration |
+|---|---:|---:|---:|---:|
+| before | 0.96 | 1.02 | 6.52 | 4.0 A |
+| after | 1.08 | 1.09 | **3.55** | **11.2 A** |
+| AF3, same dumper and target | 1.46 | 1.52 | 3.79 | 11.1 A |
+| ideal | 1.46 | 1.52 | 3.80 | 11-12 for a 68-mer |
+
+So the topology is right - a compact 68-mer with pTM **0.908** where it was a
+4 A ball - and the geometry gate passes. **It is not finished:** every bond is
+still about **0.73x** ideal.
+
+🔴 **AND THE SHAPE OF THAT ERROR NAMES THE STAGE.** Intra-residue bonds are
+0.73x while CA-CA - between token centres - is 0.93x. A uniform scale would move
+both equally. Per-atom offsets from the token centre being compressed while the
+centres stay put is the ATOM DECODER's output, not the trunk's and not the token
+transformer's.
+
+**Everything upstream is verified:** trunk 6.31e-5, conditioning 1.89e-7,
+template 1.52e-7 (CPU) and 3.09e-5 (GPU), embedder, msa-block and pairformer
+block all at their own widths. And the reference folds protenix2 on this target
+to **best 1.009 A, mean 1.391 A**, so ~1 A is what a correct port should reach.
+
+🔴 **THE NEXT STEP IS AN L3 ORACLE, NOT MORE WIDTHS.** Four of the five hardcoded
+constants found today were caught by a shape mismatch that threw; this one does
+not throw, because every tensor is the right shape and only the ANSWER is wrong.
+`denoise_parity.py` in the reference runs one whole denoise step - conditioning,
+atom encoder, token transformer, atom decoder and the EDM scaling at once - and
+that is what localises a wrong answer with correct shapes.
