@@ -1,26 +1,32 @@
 # OpenDDE in LocalFold
 
-🔴 **EVERY NUMBER IN THIS FILE FROM BEFORE 2026-09-14 WAS MEASURED ON A BROKEN
-MSA STACK.** The outer product mean's contract kernel gave one lane to each
-channel with no loop - `@compute @workgroup_size(256)` and `let f = local` - so
-on OpenDDE's 384-wide MSA pair a THIRD of the output was never computed. Every
-other model is 128 or 256 wide and none of them could see it. Fixed; measured
-against af3-any-model, OpenDDE's trunk went from `z_after_msa` 6.01e-2 and pair
-1.08e-1 to **2.68e-5 and 7.65e-4**, which is its first exact trunk.
+🔴 **THE OUTER PRODUCT MEAN COMPUTED 256 CHANNELS AND OPENDDE'S PAIR IS 384**,
+so a third of its MSA pair output was never written. Every other model is 128 or
+256 wide and none of them could see it. Fixed 2026-09-14; against af3-any-model
+OpenDDE's trunk went from `z_after_msa` 6.01e-2 and pair 1.08e-1 to **2.68e-5
+and 7.65e-4**, its first exact trunk.
 
-What moved, at the commands this file quotes:
+🔴 **AND THE FOLDS BARELY MOVED, WHICH IS THE POINT WORTH KEEPING.** Measured by
+putting the bug back and taking both arms on the same input:
 
-| | before | after |
+| | with the bug | fixed |
 |---|---:|---:|
-| `fold-opendde.js --target=6mrr` | 1.680 A / TM 0.865 | **1.501 / 0.934** |
-| the same, `--steps=16 --mode=flow` | 1.525 | **1.545** |
-| 6MRR with a 128-row MSA | pLDDT 94.88 | **91.26**, RMSD 1.647 |
+| 6MRR, `--target=6mrr` | 1.492 A / TM 0.9342 / pLDDT 92.086 | 1.501 / 0.9343 / 92.120 |
+| a 59-residue chain with a 128-row MSA | pLDDT 94.884 | 94.879 |
 
-🔴 **AND BEING RIGHT COST IT 3.6 pLDDT.** The model was CONFIDENT with a third of
-its MSA pair missing, which is what a confidence head does when it is fed a
-distribution it was not trained on - and the reason pLDDT is not a correctness
-gate. Read every table below with that in mind; the RMSDs and the timings are
-still indicative and the exact digits are not.
+**A third of the MSA stack's pair output was missing and the structure moved by
+0.01 A.** So this fix is not a quality improvement and must not be sold as one;
+what it buys is a trunk that agrees with the reference, and the right to trust
+the next measurement taken through it.
+
+🔴 **AND TWO CLAIMS PUBLISHED EARLIER TODAY WERE WRONG, BOTH BY COMPARING THINGS
+THAT WERE NOT COMPARABLE.** "Being right cost OpenDDE 3.6 pLDDT" compared a
+59-residue chain (94.88) against 6MRR (91.26) - two different proteins - and on
+one input the answer is 94.884 against 94.879. And 1.680 -> 1.501 on
+`--target=6mrr` was attributed to this fix; with the bug put back the same
+command gives 1.492, so the 1.680 in the tables below is stale for other
+reasons. Every number in this file from before 2026-09-14 should be read as
+indicative.
 
 OpenDDE (Aureka Research, Apache-2.0) is an independent PyTorch
 reimplementation in the AlphaFold 3 family - its own pairformer and its own

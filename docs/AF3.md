@@ -3042,13 +3042,20 @@ io_callback tap in the reference, a `--stop-after-opm` stop point, `--msa-blocks
 a row-slice comparator - ended at a differential checker that was already
 written. **Run every gate against every bundle before building an instrument.**
 
-🔴 **AND IT COST OpenDDE 3.6 pLDDT TO BE RIGHT.** With the MSA it now folds
-6MRR at pLDDT 91.26 against 94.88 before, RMSD 1.647; 6MRR without an alignment
-is 1.545 against 1.542. A third of the MSA stack's pair output was missing and
-the model was CONFIDENT with it - which is what a confidence head trained on a
-different distribution does, and the reason pLDDT is not a correctness gate.
-Every OpenDDE number recorded before this commit was measured on the broken
-stack.
+🔴 **AND THE FOLDS BARELY MOVED - RETRACTING WHAT THIS PARAGRAPH FIRST SAID.**
+It claimed the fix "cost OpenDDE 3.6 pLDDT", comparing 94.88 against 91.26. Those
+are two different proteins: 94.88 is a 59-residue chain and 91.26 is 6MRR. Taken
+properly, by putting the bug back and running both arms on one input:
+
+| | with the bug | fixed |
+|---|---:|---:|
+| 6MRR, `--target=6mrr` | 1.492 A / TM 0.9342 / pLDDT 92.086 | 1.501 / 0.9343 / 92.120 |
+| a 59-residue chain, 128-row MSA | pLDDT 94.884 | 94.879 |
+
+**A third of the MSA stack's pair output was missing and the structure moved by
+0.01 A.** The defect is three orders against the oracle and invisible in the
+fold, and neither number is evidence about the other. This fix buys a trunk that
+agrees with the reference, not a better prediction.
 
 🔴 **THE INSTRUMENTS THIS NEEDED, AND THE TWO THAT LIED FIRST.** The MSA stack
 is a `hk.experimental.layer_stack`, so `hk.intercept_methods` sees NOTHING
