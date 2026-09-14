@@ -93,7 +93,15 @@ export async function main(device, args) {
     // about the kernels that ship, and boltz2's 5CAJ fold with a template lands
     // at 2.2 A where protenix2 and AF3 reach 0.2.
     const { Af3TemplateEmbedderGpu } = await import("../../src/af3/template-webgpu.js");
-    const gpuOut = await new Af3TemplateEmbedderGpu(device).run(
+    // 🔴 THE PINS GO THROUGH THE CONSTRUCTOR, NOT `--tune`. This checker builds
+    // the embedder itself, so a `--tune=` on the command line reaches nothing
+    // here - three arms of it read the identical 5.11e-4 and said only that
+    // they had not run. `--pins` sets the four the confidence head carries.
+    const pins = args.includes("--pins")
+      ? { stagedPrecision: "f32", weightPrecision: "f32",
+          accumulatePrecision: "f32", pairMatrixKernels: false }
+      : {};
+    const gpuOut = await new Af3TemplateEmbedderGpu(device, pins).run(
       { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
         slots: [{ aatype: Int32Array.from(aatypeRaw.data),
                   atomPositions: positions.data, atomMask: atomMask.data }],
@@ -118,7 +126,7 @@ export async function main(device, args) {
     // The residual and the output LayerNorm are held off on the CPU side so the
     // two are the same quantity.
     const flat = { ...dialect, templateStackOuterResidual: false };
-    const cpuEmbedOut = await new Af3TemplateEmbedderGpu(device).run(
+    const cpuEmbedOut = await new Af3TemplateEmbedderGpu(device, pins).run(
       { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
         slots: [{ aatype: Int32Array.from(aatypeRaw.data),
                   atomPositions: positions.data, atomMask: atomMask.data }],
@@ -142,7 +150,7 @@ export async function main(device, args) {
       slots: [{ aatype: Int32Array.from(aatypeRaw.data),
                 atomPositions: positions.data, atomMask: atomMask.data }],
     }, weights, without);
-    const gpuNoResidualOut = await new Af3TemplateEmbedderGpu(device).run(
+    const gpuNoResidualOut = await new Af3TemplateEmbedderGpu(device, pins).run(
       { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
         slots: [{ aatype: Int32Array.from(aatypeRaw.data),
                   atomPositions: positions.data, atomMask: atomMask.data }],

@@ -3145,6 +3145,24 @@ the outer residual (forced off on BOTH sides the GPU still disagreed by 0.756),
 the head count (`gridHeads` is read off `blocks[0].pairAttention1.heads`), and
 the pipeline key (it already carries `fused<width>` and `:or`).
 
+🔴 **AND THE 5.11e-4 THAT REMAINED IS PRECISION, MEASURED THROUGH AN ARM THAT
+COULD ACTUALLY REACH IT.** With the four pins AlphaFold 3's confidence head
+carries - f32 staging, f32 weights, f32 accumulation, matrix pair kernels off -
+boltz2's fused template reads **9.11e-7** against its CPU reference instead of
+5.11e-4.
+
+**Both arms used to rule precision out first were inert**, which is the third
+time today: `--f16=off` cannot reach the matrix kernels, and `--tune=` reaches
+nothing at all in a checker that constructs `Af3TemplateEmbedderGpu` itself -
+three `--tune` arms read the identical 5.11e-4 and said only that they had not
+run. The pins go through the CONSTRUCTOR, which is what `--pins` on
+`check-fused-template-features.js` now sets.
+
+**Not shipped, on the numbers.** boltz2's whole trunk pair is 3.49e-4, so a
+template term at 5.11e-4 is not what limits it, and pinning four settings across
+every model's template stage has a cost nobody has measured. The finding is that
+it IS precision and where the switch is, not that the switch should be thrown.
+
 🔴 **AND THE SAME LINE IS IN THE TRUNK, WHERE IT IS LATENT.**
 `pairformer-block-webgpu.js` sizes its scratch by `pairChannels` too, and every
 trunk shipped here has `heads * dimension == channels`, so it has never been
