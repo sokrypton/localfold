@@ -3088,8 +3088,53 @@ the one row of this table with no exception in it.
    every other family's, on the model this port was written against first. The
    template stage HALVES the relative error (1.17e-4) because it roughly doubles
    the pair's magnitude while adding an exact term, which says the error is
-   entirely in the z init and nothing downstream adds to it. Small, and the only
-   entry in this table that stock AlphaFold 3 owns. Open.
+   entirely in the z init and nothing downstream adds to it. **Localised to one
+   term and NOT yet explained; see below.**
+
+#### 🔴 AF3's z_init IS THE RELATIVE ENCODING, AND EVERY TEST SAYS OUR SIDE IS RIGHT
+
+`tools/gpu/check-af3-embedder-terms.js`. The pair init is four summands and
+three of them are exact:
+
+| term | relRMS |
+|---|---:|
+| `single_activations` | 4.61e-8 |
+| `left_single` | 4.96e-8 |
+| `right_single` | 4.56e-8 |
+| **`position_activations`** | **1.26e-3** |
+| `bond_embedding` | rms 0.0000 on both sides - a protein has no covalent links |
+
+So it is the relative encoding alone. What has been ruled out, each with a
+measurement rather than a reading:
+
+  * **Not the formulas.** `featurization.relative_encoding_segments` clips
+    `offset + 32` to [0, 64] with 65 for a different chain, the token block the
+    same with 65 off-residue, the chain block keyed on ENTITY (AF3 is not in
+    `CHAIN_BUCKET_ON_SAME_CHAIN`, which is ESMFold2's), and `same_entity` as one
+    scalar column - 66 + 66 + 1 + 6 = 139, in that order. This port's
+    `relativeEncoding` is the same arithmetic in the same order.
+  * **Not the indices.** Subtracting the entity and chain rows from the NATIVE
+    tensor and brute-forcing which (pos, token) rows explain the remainder
+    recovers exactly the indices we pick, on every pair tried.
+  * **Not our projection.** The reference's own `_RelativeEncodingProjection` is
+    `w_pos[i] + w_token[j] + entity * w_entity + w_chain[k]`, and our value
+    equals that four-row gather at relRMS **0**.
+  * **Not the weight.** `check-bundle-vs-params.py` agrees 404 of 404.
+  * **Not a bias.** The bundle carries no `position_activations/bias`, and the
+    module takes none.
+  * **Not bfloat16**, which the magnitude suggested: the dumper sets
+    `bfloat16 = "none"`, and rounding the weights, the output, or the running
+    sum all score WORSE than plain f32 (1.26e-3 f32; 1.26e-3, 2.09e-3, 2.12e-3).
+
+What is left is a per-element residual of **0.0025 to 0.0066** on a tensor of rms
+2.54 that no combination of the 139 rows accounts for. **The reference's
+`position_activations` output is not the gather its own code describes**, and
+until that is explained this cell should not be read as a defect in this port.
+The next step is the reference's OTHER implementation: `create_relative_encoding`
+builds the one-hot and contracts it with `hm.Linear`, the chai branch of
+`_relative_encoding` calls that one with `use_bias=True`, and the two paths have
+a test that compares them - dumping the one-hot path beside the gather path on
+the same input says which of them the captured scope is.
 
 `z_after_template` is 5.05e-8 for boltz2 because its whole empty-template term
 is ZERO under `templateVisibilityByCoverage` - the seam equals `z_init`, so that
