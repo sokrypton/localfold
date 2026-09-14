@@ -187,6 +187,10 @@ export async function main(device, args) {
       seed: Number(option(args, "seed", "20260831")),
     });
   if (rows.depth > 1) console.log(`MSA ${rows.depth} rows`);
+  // 🔴 `--probe-msa` PRINTS WHAT THE STACK IS ACTUALLY HANDED. The row count,
+  // the mask SUM and the tensor lengths, before `foldBatch` caps the depth - the
+  // batch dump's msa_mask sums to 136 on 6MRR, which is TWO real rows out of
+  // 16384, and a comparison that assumes a deep alignment is measuring padding.
   if (args.includes("--probe-msa")) {
     const sum = (a) => (a === undefined ? "absent"
       : Array.prototype.reduce.call(a, (t, v) => t + v, 0));
