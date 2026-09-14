@@ -3242,15 +3242,31 @@ the one row of this table with no exception in it.
 
 1. **OpenDDE's outer product mean, 6.01e-2.** Bisected to that one module above;
    the MSA embedding and the MSA update either side of it are exact.
-2. **protenix2's template stage, 3.89e-3** - measured here for the FIRST time,
-   because protenix2 had no trunk dump until now. Its `target_feat`, `z_init`
-   and `trunk_in_single` are 1e-8, and the template seam is three orders worse
-   than boltz2's or openbind0's; everything after it (msa 3.42e-3, pair
-   3.98e-3) is that error carried forward and nothing new. protenix2 runs the
-   FUSED embedder and already has the gap convention as
-   `emptyTemplateRestypeColumns`, so this is NOT the defect OpenDDE had - it is
-   its own, and `check-af3-template-fused.js` is the gate that should localise
-   it. Open.
+2. ~~**protenix2's template stage, 3.89e-3**~~ - **FIXED: a padded template
+   slot carries restype ZERO, and a one-hot of zero is a ONE.** protenix2's
+   featuriser fills its one empty template with the GAP restype and zero-pads
+   the rest - and `template_aatype = 0` is zero-padding of the AATYPE, not of
+   the feature: `one_hot(0, 32)` sets restype column 0. So the four slots the
+   trunk runs are `[gap, restype-0, restype-0, restype-0]`, not four gaps and
+   not `[gap, 0, 0, 0]`. Measured against af3-any-model's own
+   `evoformer/template_embedding` on 6MRR, which has no template:
+
+   | four empty slots built as | template term | `z_after_template` |
+   |---|---:|---:|
+   | four gaps (shipped) | 7.39e-3 | 3.89e-3 |
+   | gap then all-ZERO (tried first) | worse | 4.55e-3 |
+   | **gap then restype-0** | **5.26e-6** | **2.76e-6** |
+
+   protenix2's whole trunk follows: `z_after_msa` 3.42e-3 -> **5.38e-5** and the
+   pair 3.98e-3 -> **1.39e-3**. The other four are unmoved to every digit, and
+   `--template` on 5CAJ still reads 0.165 A.
+
+   🔴 **AND IT WAS BUILT WRONG TWICE BEFORE THE BATCH WAS READ CAREFULLY
+   ENOUGH.** Gating the gap to the first slot was the obvious symmetry with
+   OpenDDE's fix, it made the seam WORSE, and that was recorded as evidence the
+   fused featuriser sets the gap everywhere. It was evidence of nothing except
+   that all-zero is not what a padded slot holds.
+
 3. ~~**AlphaFold 3's own `z_init_generic`, 2.20e-4**~~ - **NOT A DEFECT IN THIS
    PORT; it is the dump.** See below: the reference's own two implementations,
    run fresh, agree with this port at relRMS 0 and differ from the captured

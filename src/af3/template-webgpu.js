@@ -177,8 +177,23 @@ export function fusedTemplateFeatures(template, tokens, width, dialect,
   // protenix's own featuriser builds, and those are not the same array. Left as
   // it is, on the measurement rather than on the symmetry. `useGap` is kept as
   // the arm for re-running that comparison.
-  const columns = useGap ? dialect?.emptyTemplateRestypeColumns : [];
-  if (!useGap) return new Float32Array(tokens * tokens * width);
+  // 🔴 AND A PADDED SLOT IS NOT AN EMPTY ONE. protenix2's featuriser fills its
+  // ONE empty template with the GAP restype and zero-pads the rest - but
+  // `template_aatype = 0` is zero-padding of the AATYPE, and `one_hot(0, 32)`
+  // is NOT a zero row: it sets restype column 0. So the four slots the trunk
+  // runs are [gap, restype-0, restype-0, restype-0], not [gap, 0, 0, 0] and
+  // not four gaps.
+  //
+  // All four measured against af3-any-model's own `evoformer/template_embedding`
+  // on 6MRR, which has no template: four gaps read 7.39e-3, gap-then-ZERO read
+  // worse still, and this reads what is below. Written the wrong way twice
+  // before the batch dump was read carefully enough to notice that a one-hot of
+  // zero is a one.
+  const layout = dialect?.fusedTemplateLayout;
+  const gapColumns = dialect?.emptyTemplateRestypeColumns;
+  const columns = useGap ? gapColumns
+    : (layout === undefined || layout === null || gapColumns === null ? []
+      : [layout.distogramBins + 1, layout.distogramBins + 1 + layout.restypes]);
   if (columns === undefined || columns === null) {
     throw new Error("dialect.emptyTemplateRestypeColumns has no default: an "
       + "empty template slot carries GAP under protenix2 and zeros under "
@@ -681,7 +696,8 @@ export class Af3TemplateEmbedderGpu {
             `af3-template.features.${slot}`,
             fusedTemplateFeatures(template, tokens, featureWidth, dialect,
                                   template === undefined || template === null
-                                    ? undefined : chainMaskFor(template)),
+                                    ? undefined : chainMaskFor(template),
+                                  (emptyAatype ?? 0) !== 0),
             storage)) : undefined,
         });
       }
