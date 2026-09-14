@@ -462,3 +462,111 @@ export function packTemplateGeometry(geometry, tokens) {
   }
   return packed;
 }
+
+/**
+ * Boltz-2's 109 template channels, which are NOT AlphaFold 3's 108.
+ *
+ * 🔴 THE TWO FUSED MODELS DO NOT SHARE A FEATURE SET. protenix2's 108 are
+ * AF3's own six features concatenated - 39 distogram + 1 pseudo-beta mask + 32
+ * restype_i + 32 restype_j + 3 unit vector + 1 frame mask - and every one of
+ * them is something `templateGeometry` already computes. Boltz-2's 109 are a
+ * different construction at four points, and each one is load-bearing:
+ *
+ *   - **38 distogram bins, not 39**, over CB-CB with edges `linspace(3.25,
+ *     50.75, 37)` and the index the COUNT of edges the distance exceeds.
+ *   - **the unit vector is a SIGN, not a unit vector.** Boltz normalises with
+ *     `torch.norm(v, dim=-1)` where `v` is `(..., 3, 1)`, so `dim=-1` is the
+ *     SIZE-1 axis and the division is by `abs()` per component - the feature is
+ *     the element-wise sign of `R_j^T (ca_i - t_j)`, in {-1, 0, 1}. The trained
+ *     weights depend on it, so it is replicated rather than corrected.
+ *   - **the restype token is `aatype + 2`**, over 33 classes, and 0 wherever the
+ *     residue has no atoms - Boltz's vocabulary, not AF3's.
+ *   - **`restype_i` varies along i here**, where protenix2's varies along j.
+ *     The two conventions are opposite and the tensors are named the same.
+ *
+ * The frame is Boltz's `compute_frame(N, CA, C)`: `e1 = norm(C - CA)`, `e2 =
+ * norm(N - CA orthogonalised against e1)`, `e3 = e1 x e2`, translation CA -
+ * read out of the SIDE-CHAIN table's group 0, whose atom order is (C, CA, N).
+ * That is the same table and the same swap `BACKBONE_SLOTS` documents above.
+ *
+ * @param {{aatype: ArrayLike<number>, atomPositions: ArrayLike<number>,
+ *          atomMask: ArrayLike<number>}} template
+ * @param {ArrayLike<number>} asymMask2d [tokens * tokens]
+ * @param {number} tokens
+ * @returns {Float32Array} tokens * tokens * 109
+ */
+export function boltz2TemplateFeatures(template, asymMask2d, tokens) {
+  const { aatype, atomPositions, atomMask } = template;
+  const slots = NUM_DENSE;
+  const BINS = 38, RESTYPES = 33, WIDTH = BINS + 1 + 3 + 1 + RESTYPES * 2;
+  const { positions: cb, mask: cbMask } = pseudoBeta(aatype, atomPositions, atomMask, tokens);
+
+  // The per-residue frame and whether it exists.
+  const rotation = new Float32Array(tokens * 9);
+  const translation = new Float32Array(tokens * 3);
+  const frameMask = new Float32Array(tokens);
+  const covered = new Float32Array(tokens);
+  const ca = new Float32Array(tokens * 3);
+  for (let token = 0; token < tokens; token += 1) {
+    let any = 0;
+    for (let slot = 0; slot < slots; slot += 1) any += atomMask[token * slots + slot];
+    covered[token] = any > 0 ? 1 : 0;
+    const bb = slotOf(BACKBONE_SLOTS, aatype[token]);       // (C, CA, N)
+    const at = (slot, axis) => atomPositions[(token * slots + slot) * 3 + axis];
+    frameMask[token] = atomMask[token * slots + bb[0]] * atomMask[token * slots + bb[1]]
+      * atomMask[token * slots + bb[2]];
+    const v1 = [0, 1, 2].map((axis) => at(bb[0], axis) - at(bb[1], axis));   // C - CA
+    const v2 = [0, 1, 2].map((axis) => at(bb[2], axis) - at(bb[1], axis));   // N - CA
+    const norm = (v) => Math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) + 1e-10;
+    const e1 = v1.map((x) => x / norm(v1));
+    const dot = e1[0] * v2[0] + e1[1] * v2[1] + e1[2] * v2[2];
+    const u2 = v2.map((x, axis) => x - e1[axis] * dot);
+    const e2 = u2.map((x) => x / norm(u2));
+    const e3 = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0]];
+    // rot[:, d, k] = e_k[d] - the columns are e1, e2, e3.
+    for (let d = 0; d < 3; d += 1) {
+      rotation[token * 9 + d * 3] = e1[d];
+      rotation[token * 9 + d * 3 + 1] = e2[d];
+      rotation[token * 9 + d * 3 + 2] = e3[d];
+    }
+    for (let axis = 0; axis < 3; axis += 1) {
+      translation[token * 3 + axis] = at(bb[1], axis);
+      ca[token * 3 + axis] = at(bb[1], axis);
+    }
+  }
+
+  const edges = Array.from({ length: 37 }, (_, i) => 3.25 + (50.75 - 3.25) * i / 36);
+  const features = new Float32Array(tokens * tokens * WIDTH);
+  const restypeAt = BINS + 1 + 3 + 1;
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      const pair = i * tokens + j;
+      const base = pair * WIDTH;
+      const asym = asymMask2d[pair];
+      let squared = 1e-10;
+      for (let axis = 0; axis < 3; axis += 1) {
+        squared += (cb[i * 3 + axis] - cb[j * 3 + axis]) ** 2;
+      }
+      const distance = Math.sqrt(squared);
+      let bin = 0;
+      for (const edge of edges) if (distance > edge) bin += 1;
+      features[base + bin] = asym;
+      features[base + BINS] = cbMask[i] * cbMask[j] * asym;
+      // R_j^T (ca_i - t_j), then its element-wise SIGN. See the note above.
+      for (let k = 0; k < 3; k += 1) {
+        let value = 0;
+        for (let d = 0; d < 3; d += 1) {
+          value += rotation[j * 9 + d * 3 + k] * (ca[i * 3 + d] - translation[j * 3 + d]);
+        }
+        features[base + BINS + 1 + k] = Math.sign(value) * asym;
+      }
+      features[base + BINS + 4] = frameMask[i] * frameMask[j] * asym;
+      const ti = covered[i] ? aatype[i] + 2 : 0;
+      const tj = covered[j] ? aatype[j] + 2 : 0;
+      if (ti >= 0 && ti < RESTYPES) features[base + restypeAt + ti] = 1;
+      if (tj >= 0 && tj < RESTYPES) features[base + restypeAt + RESTYPES + tj] = 1;
+    }
+  }
+  return features;
+}

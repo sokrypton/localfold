@@ -71,6 +71,15 @@ def put(name, a):
                            "data": a.astype(np.float32).ravel().tolist()}
 put("pair", z); put("pairMask", pair_mask); put("asymId", asym.astype(np.float32))
 put("multichainMask2d", multichain)
+# 🔴 THE TEMPLATE ITSELF, WHICH THIS DID NOT RECORD. Without it the dump can
+# only check the FORWARD - hand it the 108 columns and compare the output - and
+# that is exactly the half that was already right: boltz2 and protenix2 score
+# 1.5e-7 there and CANNOT TAKE A TEMPLATE AT ALL, because the featuriser that
+# builds those columns from a structure was never written. A featuriser needs
+# its input recorded beside its output to be checkable.
+put("template_aatype", np.asarray(single.aatype).astype(np.float32))
+put("template_atom_positions", np.asarray(single.atom_positions))
+put("template_atom_mask", np.asarray(single.atom_mask))
 for k, v in feats.items():
     if isinstance(v, (np.ndarray, jax.Array)) and np.asarray(v).ndim > 0:
         put("feat:" + k, v)

@@ -48,7 +48,9 @@ import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
-  GEOMETRY_STRIDE, coverageOf, multichainMaskFor, packTemplateGeometry, templateGeometry,
+  DGRAM_BINS, GEOMETRY_STRIDE, boltz2TemplateFeatures, coverageOf, multichainMaskFor,
+  packTemplateGeometry,
+  templateGeometry,
 } from "./template-features.js";
 
 // ...re-exported from where they used to live, because the packing is shared
@@ -96,12 +98,69 @@ const FUSED_ORDER = [
  * in docs/AF3.md and gated by nothing yet. Building it from that specification
  * and checking it against a reference built the same way would prove nothing.
  */
-export function emptyFusedFeatures(template, tokens, width, dialect, useGap = true) {
+export function fusedTemplateFeatures(template, tokens, width, dialect,
+                                      multichainMask2d = undefined, useGap = true) {
   if (template !== undefined && template !== null) {
-    throw new Error("the fused template embedder has no featuriser yet: a "
-      + "supplied template needs the 108 columns built, and docs/AF3.md has "
-      + "their specification. Fold without templates, or write it against "
-      + "tools/oracle/dump_af3_template.py.");
+    // 🔴 THE 108 COLUMNS ARE THE NINE-PROJECTION EMBEDDER'S OWN FEATURES,
+    // CONCATENATED. 39 distogram + 1 pseudo-beta mask + 32 restype_i + 32
+    // restype_j + 3 unit vector + 1 backbone frame mask = 108, and
+    // `templateGeometry` already computes four of the six for AF3's path -
+    // measured against af3-any-model's `our_features`, the distogram and both
+    // masks are EXACT and the unit vector is 3.64e-7. So this is a
+    // concatenation of things this port has had all along, which is why the
+    // refusal that stood here was costing more than it protected: boltz2 and
+    // protenix2 could not take a template at all while their forward scored
+    // 1.52e-7 against the oracle.
+    //
+    // 🔴 AND `restype_i` VARIES ALONG j, `restype_j` ALONG i. The name says
+    // which index the tensor varies along in the reference's own naming, not
+    // which one selects its value; built the other way both columns score 1.36
+    // and the fold is plausible. The aatype needs NO remap - the table
+    // recovered from the dump is the identity - which is worth stating because
+    // docs/AF3.md's "32-class remap" reads as though it does.
+    // See tools/gpu/check-fused-template-features.js.
+    // 🔴 BOLTZ-2's 109 ARE A DIFFERENT CONSTRUCTION, NOT WIDER ONES. 38 bins on
+    // different edges, a unit vector that is a SIGN, a restype vocabulary
+    // shifted by two over 33 classes, and `restype_i` varying along i where
+    // protenix2's varies along j. See boltz2TemplateFeatures.
+    if (dialect?.boltz2TemplateFeatures === true) {
+      return boltz2TemplateFeatures(template, multichainMask2d, tokens);
+    }
+    const columnsFor = dialect?.fusedTemplateLayout;
+    if (columnsFor === undefined || columnsFor === null) {
+      throw new Error("dialect.fusedTemplateLayout has no default: protenix2's"
+        + " 108 columns are 39/1/32/32/3/1 and boltz2's 109 are not the same"
+        + " widths, and guessing the bin count is guessing the model");
+    }
+    const { distogramBins, restypes } = columnsFor;
+    const geometry = templateGeometry(template, multichainMask2d, tokens);
+    if (distogramBins !== DGRAM_BINS) {
+      throw new Error(`this dialect wants ${distogramBins} distogram bins and`
+        + ` templateGeometry computes ${DGRAM_BINS}: the bin edges are not the`
+        + " same feature and nothing here has measured the other set");
+    }
+    const features = new Float32Array(tokens * tokens * width);
+    const restypeI = distogramBins + 1;
+    const restypeJ = restypeI + restypes;
+    const vectorAt = restypeJ + restypes;
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        const pair = i * tokens + j;
+        const base = pair * width;
+        for (let bin = 0; bin < distogramBins; bin += 1) {
+          features[base + bin] = geometry.distogram[pair * distogramBins + bin];
+        }
+        features[base + distogramBins] = geometry.pseudoBetaMask2d[pair];
+        const ci = template.aatype[j], cj = template.aatype[i];
+        if (ci >= 0 && ci < restypes) features[base + restypeI + ci] = 1;
+        if (cj >= 0 && cj < restypes) features[base + restypeJ + cj] = 1;
+        for (let axis = 0; axis < 3; axis += 1) {
+          features[base + vectorAt + axis] = geometry.unitVector[pair * 3 + axis];
+        }
+        features[base + vectorAt + 3] = geometry.backboneMask2d[pair];
+      }
+    }
+    return features;
   }
   // 🔴 WHICH COLUMNS AN EMPTY SLOT SETS IS THE DIALECT'S, AND THE TWO FUSED
   // MODELS DISAGREE. protenix2's 108 columns carry GAP in both restype blocks;
@@ -620,7 +679,10 @@ export class Af3TemplateEmbedderGpu {
           // gated by nothing, so this refuses rather than guessing.
           features: fused ? keep(this.allocator.upload(
             `af3-template.features.${slot}`,
-            emptyFusedFeatures(template, tokens, featureWidth, dialect), storage)) : undefined,
+            fusedTemplateFeatures(template, tokens, featureWidth, dialect,
+                                  template === undefined || template === null
+                                    ? undefined : chainMaskFor(template)),
+            storage)) : undefined,
         });
       }
 
@@ -808,3 +870,12 @@ export class Af3TemplateEmbedderGpu {
     }
   }
 }
+
+/**
+ * The old name, kept because three tools import it.
+ *
+ * 🔴 IT IS NO LONGER ONLY THE EMPTY CASE. `fusedTemplateFeatures` builds a
+ * SUPPLIED template's 108 columns now - see the note on it - and the name
+ * `emptyFusedFeatures` described the limitation rather than the job.
+ */
+export const emptyFusedFeatures = fusedTemplateFeatures;

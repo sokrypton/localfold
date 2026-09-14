@@ -3053,7 +3053,66 @@ the MSA plainly works (pLDDT 87.3 with none against 94.9 with 128 rows) and the
 stopped pair was also unchanged. **A number that agrees with a prediction to
 three digits is still worth one control.**
 
-### 🔴 DO TEMPLATES ACTUALLY WORK? TWO OF THE FIVE THROW
+### 🔴 TEMPLATES ON A TARGET THAT NEEDS THEM: 19 A TO 0.2 A
+
+6MRR was the wrong test. A 68-residue designed protein folds to 0.5-1.7 A from
+its sequence alone, so a perfect template has almost nothing to add and the
+whole experiment fits inside the noise. **5CAJ, 255 residues, a natural
+protein**, is the test: single-sequence fails outright and the template has to
+carry the fold. `fold-opendde.js --target=5caj --chain=A --steps=16
+--template=/tools/fixtures/5caj-crystal.pdb:A`, no MSA:
+
+| model | no MSA, no template | + self-template |
+|---|---:|---:|
+| alphafold3 | 16.792 A / TM 0.258 | **0.288 / 0.998** |
+| protenix2 | 19.212 / TM 0.184 | **0.216 / 0.999** |
+| boltz2 | 18.165 / TM 0.199 | 3.859 / 0.849 |
+
+**That is what a working template looks like** - a fold that is not a fold at
+all (TM 0.18-0.26) becoming the crystal. And it is the gate 6MRR could not be:
+on 6MRR every one of these lands between 0.47 and 0.53 whether the featuriser
+is right or wrong, which is exactly how boltz2's shipped without one.
+
+🔴 **boltz2 IS THE ONE THAT IS STILL WRONG, AND ONLY THIS TARGET SAYS SO.** It
+reads 0.490 A on 6MRR - better than its own 0.507 baseline, indistinguishable
+from correct - and 3.859 on 5CAJ where the other two reach 0.2 and the
+reference's own note reports 0.72 for this model. Its 109 channels are built
+now and they are not yet right.
+
+### 🔴 THE FUSED TEMPLATE FEATURISER, WHICH DID NOT EXIST
+
+Both fused models used to throw on a supplied template: "the fused template
+embedder has no featuriser yet". Two featurisers, because **the two models do
+not share a feature set**:
+
+  * **protenix2's 108 are AlphaFold 3's own six features concatenated** - 39
+    distogram + 1 pseudo-beta mask + 32 restype_i + 32 restype_j + 3 unit
+    vector + 1 frame mask - and `templateGeometry` already computed four of
+    them for the nine-projection path. Checked against af3-any-model's
+    `our_features` by `tools/gpu/check-fused-template-features.js`: distogram
+    **0**, both masks **0**, unit vector 3.64e-7, both restypes **0**.
+  * **boltz2's 109 are a different construction**: 38 distogram bins on
+    `linspace(3.25, 50.75, 37)`, a unit vector that is the element-wise SIGN of
+    `R_j^T (ca_i - t_j)` (Boltz normalises along a size-1 axis, so the division
+    is by `abs()` per component - a quirk the trained weights depend on), a
+    restype vocabulary shifted by two over 33 classes, and its own frame from
+    the side-chain table's group 0.
+
+🔴 **AND `restype_i` VARIES ALONG j IN protenix2 AND ALONG i IN boltz2.** The
+name says which index the tensor varies along in each vendor's own naming, not
+which one selects its value. Built the other way protenix2's two restype
+columns score **1.36** and the fold still looks plausible. The aatype needs no
+remap for protenix2 - the table recovered from the dump is the identity, which
+is worth stating because docs/AF3.md's "32-class remap" reads as though it does.
+
+🔴 **AND THE DUMP DID NOT RECORD ITS OWN INPUT.** `dump_af3_template.py` wrote
+the 108 columns and the module's output and not the STRUCTURE they came from, so
+the only thing checkable was the forward - which is the half that was already
+right. It records `template_aatype`, `template_atom_positions` and
+`template_atom_mask` now. **A featuriser needs its input recorded beside its
+output to be checkable at all.**
+
+### 🔴 DO TEMPLATES ACTUALLY WORK? TWO OF THE FIVE THREW
 
 The sharpest functional test there is, and nothing had ever run it: fold the
 target from its OWN crystal as a template, with NO alignment. If templates work

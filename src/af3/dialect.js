@@ -60,6 +60,20 @@ export const ALPHAFOLD3 = Object.freeze({
   // hid. See src/af3/featurise.js.
   centreRefConformers: false,
   emptyTemplateAatype: null,
+  // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
+  // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
+  // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
+  // one of them a feature `templateGeometry` already computes for the
+  // nine-projection path. boltz2's are 109 with 38 bins and 33 restypes - a
+  // DIFFERENT feature set whose bin edges nothing here has measured - so it is
+  // null and a supplied template refuses rather than guessing.
+  // 🔴 BOLTZ-2 BUILDS ITS OWN 109 CHANNELS and they are not AF3's six
+  // concatenated: 38 distogram bins on different edges, a unit vector that is
+  // the element-wise SIGN of R_j^T (ca_i - t_j), a restype vocabulary shifted
+  // by two over 33 classes, and restype_i varying along i where protenix2's
+  // varies along j. See boltz2TemplateFeatures in template-features.js.
+  boltz2TemplateFeatures: false,
+  fusedTemplateLayout: null,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -125,6 +139,20 @@ export const OPENBIND0 = Object.freeze({
   // hid. See src/af3/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: null,
+  // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
+  // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
+  // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
+  // one of them a feature `templateGeometry` already computes for the
+  // nine-projection path. boltz2's are 109 with 38 bins and 33 restypes - a
+  // DIFFERENT feature set whose bin edges nothing here has measured - so it is
+  // null and a supplied template refuses rather than guessing.
+  // 🔴 BOLTZ-2 BUILDS ITS OWN 109 CHANNELS and they are not AF3's six
+  // concatenated: 38 distogram bins on different edges, a unit vector that is
+  // the element-wise SIGN of R_j^T (ca_i - t_j), a restype vocabulary shifted
+  // by two over 33 classes, and restype_i varying along i where protenix2's
+  // varies along j. See boltz2TemplateFeatures in template-features.js.
+  boltz2TemplateFeatures: false,
+  fusedTemplateLayout: null,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -219,6 +247,20 @@ export const OPENDDE = Object.freeze({
   // hid. See src/af3/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: 21,
+  // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
+  // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
+  // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
+  // one of them a feature `templateGeometry` already computes for the
+  // nine-projection path. boltz2's are 109 with 38 bins and 33 restypes - a
+  // DIFFERENT feature set whose bin edges nothing here has measured - so it is
+  // null and a supplied template refuses rather than guessing.
+  // 🔴 BOLTZ-2 BUILDS ITS OWN 109 CHANNELS and they are not AF3's six
+  // concatenated: 38 distogram bins on different edges, a unit vector that is
+  // the element-wise SIGN of R_j^T (ca_i - t_j), a restype vocabulary shifted
+  // by two over 33 classes, and restype_i varying along i where protenix2's
+  // varies along j. See boltz2TemplateFeatures in template-features.js.
+  boltz2TemplateFeatures: false,
+  fusedTemplateLayout: null,
   emptyTemplateRestypeColumns: null,
   templateStackOuterResidual: false,
   templateVisibilityByCoverage: false,
@@ -407,6 +449,20 @@ export const PROTENIX2 = Object.freeze({
   // hid. See src/af3/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: 21,
+  // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
+  // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
+  // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
+  // one of them a feature `templateGeometry` already computes for the
+  // nine-projection path. boltz2's are 109 with 38 bins and 33 restypes - a
+  // DIFFERENT feature set whose bin edges nothing here has measured - so it is
+  // null and a supplied template refuses rather than guessing.
+  // 🔴 BOLTZ-2 BUILDS ITS OWN 109 CHANNELS and they are not AF3's six
+  // concatenated: 38 distogram bins on different edges, a unit vector that is
+  // the element-wise SIGN of R_j^T (ca_i - t_j), a restype vocabulary shifted
+  // by two over 33 classes, and restype_i varying along i where protenix2's
+  // varies along j. See boltz2TemplateFeatures in template-features.js.
+  boltz2TemplateFeatures: false,
+  fusedTemplateLayout: { distogramBins: 39, restypes: 32 },
   emptyTemplateRestypeColumns: [40 + 31, 72 + 31],
   // 🔴 AND THE TEMPLATE EMBEDDER IS A DIFFERENT MODULE, NOT DIFFERENT WIDTHS.
   // protenix2 runs boltz2's fused form: `v = z_proj(z_norm(z)) + a_proj(a)`,
@@ -531,6 +587,20 @@ export const BOLTZ2 = Object.freeze({
   // hid. See src/af3/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: null,
+  // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
+  // embedder. protenix2's 108 columns are 39 distogram + 1 pseudo-beta mask +
+  // 32 restype_i + 32 restype_j + 3 unit vector + 1 backbone frame mask, every
+  // one of them a feature `templateGeometry` already computes for the
+  // nine-projection path. boltz2's are 109 with 38 bins and 33 restypes - a
+  // DIFFERENT feature set whose bin edges nothing here has measured - so it is
+  // null and a supplied template refuses rather than guessing.
+  // 🔴 BOLTZ-2 BUILDS ITS OWN 109 CHANNELS and they are not AF3's six
+  // concatenated: 38 distogram bins on different edges, a unit vector that is
+  // the element-wise SIGN of R_j^T (ca_i - t_j), a restype vocabulary shifted
+  // by two over 33 classes, and restype_i varying along i where protenix2's
+  // varies along j. See boltz2TemplateFeatures in template-features.js.
+  boltz2TemplateFeatures: true,
+  fusedTemplateLayout: null,
   emptyTemplateRestypeColumns: [],
   templateStackOuterResidual: true,
   templateVisibilityByCoverage: true,
