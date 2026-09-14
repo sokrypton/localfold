@@ -209,6 +209,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
   const jVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[blockJ];
   if (jVector === undefined) throw new Error(`blockJ ${blockJ} is not 1, 2 or 4`);
+  // 🔴 ONE THREAD PER CHANNEL WAS A CEILING OF 256, AND OpenDDE'S MSA PAIR IS
+  // 384. The contract staged its cell products in workgroup memory and then
+  // gave channel `f` to lane `f` - with `has_f = f < C_Z` guarding the SHORT
+  // case and nothing at all covering the long one, so channels 256..383 were
+  // never computed and never written. Every other stack in every model is
+  // 128 or 256 wide, which is why four models read 1e-6 on
+  // `check-af3-msa-block.js` and OpenDDE read **4.94e-1** - a third of its MSA
+  // stack's pair output, missing, on a gate that existed and had never been
+  // pointed at this bundle.
+  //
+  // Each lane now takes every 256th channel. `product` is shared and is staged
+  // ONCE per chunk however many groups there are, so the extra cost is the
+  // epilogue and not the contraction.
+  const channelGroups = Math.ceil(pairChannels / 256);
+  const overG = (body) => Array.from({ length: channelGroups }, (_, g) => body(g)).join("\n      ");
   const overI = (body) => Array.from({ length: blockI }, (_, i) => body(i)).join("\n      ");
   const overJ = (body) => Array.from({ length: blockJ }, (_, j) => body(j)).join("\n      ");
   const jAt = (name, j) => blockJ === 1 ? name : `${name}.${"xyzw"[j]}`;
@@ -293,10 +308,10 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   ${overI((i) => `let i${i} = min(base_i + ${i}u, TOKENS - 1u);`)}
   ${overJ((j) => `let j${j} = min(base_j + ${j}u, TOKENS - 1u);`)}
 
-  let f = local;
-  let has_f = f < C_Z;
-  ${overI((i) => `var totals${i} = ${jVector}(${biasAfterNorm ? "0.0"
-    : "weights[W_OUT_BIAS + select(0u, f, has_f)]"});`)}
+  ${overG((g) => `let f${g} = local + ${g}u * 256u;
+  let has_f${g} = f${g} < C_Z;`)}
+  ${overG((g) => overI((i) => `var totals${i}_${g} = ${jVector}(${biasAfterNorm ? "0.0"
+    : `weights[W_OUT_BIAS + select(0u, f${g}, has_f${g})]`});`))}
 
   for (var chunk0 = 0u; chunk0 < PRODUCTS; chunk0 += CELL_CHUNK) {
     // ...before overwriting the chunk the previous iteration is still reading.
@@ -318,26 +333,26 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     workgroupBarrier();
 
-    if (has_f) {
+    ${overG((g) => `if (has_f${g}) {
       for (var t = 0u; t < CELL_CHUNK; t += 1u) {
-        let w = weights[W_OUT + (chunk0 + t) * C_Z + f];
-        ${overI((i) => `totals${i} += product[${i}u * CELL_CHUNK + t] * w;`)}
+        let w = weights[W_OUT + (chunk0 + t) * C_Z + f${g}];
+        ${overI((i) => `totals${i}_${g} += product[${i}u * CELL_CHUNK + t] * w;`)}
       }
-    }
+    }`)}
   }
 
-  if (has_f) {
+  ${overG((g) => `if (has_f${g}) {
     ${overI((i) => overJ((j) => `{
       let slot = i${i} * TOKENS + j${j};
       if (base_i + ${i}u < TOKENS && base_j + ${j}u < TOKENS) {
         // ...scaled after the projection, so the bias is scaled with it.
-        output[slot * C_Z + f] = ${biasAfterNorm
-          ? `${jAt(`totals${i}`, j)} / max(counts[slot], 1.0)
-          + weights[W_OUT_BIAS + select(0u, f, has_f)]`
-          : `${jAt(`totals${i}`, j)} / (NORM_EPSILON + counts[slot])`};
+        output[slot * C_Z + f${g}] = ${biasAfterNorm
+          ? `${jAt(`totals${i}_${g}`, j)} / max(counts[slot], 1.0)
+          + weights[W_OUT_BIAS + select(0u, f${g}, has_f${g})]`
+          : `${jAt(`totals${i}_${g}`, j)} / (NORM_EPSILON + counts[slot])`};
       }
     }`))}
-  }
+  }`)}
 }`;
 
   return { project, counts, contract, blockI, blockJ, blocksPerRow };

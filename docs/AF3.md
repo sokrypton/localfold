@@ -3009,27 +3009,46 @@ CPU reference alone read 1.32e-7 while the fold still read 2.07e-2, which is
 what named the second half. The pass splits now, and only where a dialect
 supplies a gap - elsewhere it is the one pass it always was.
 
-🔴 **AND UNDERNEATH IT IS A SECOND, SEPARATE DEFECT: THE OUTER PRODUCT MEAN.**
-With the template stage exact, `z_after_msa` reads **6.01e-2**. Bisected to one
-module, and here is the whole ladder - each step is a seam that had to be built:
+### 🔴 FIXED: THE OUTER PRODUCT MEAN COMPUTED 256 CHANNELS AND OpenDDE'S PAIR IS 384
 
-| | ours | native | |
-|---|---:|---:|---|
-| `msa_activations` (row 0) | | | **3.04e-8** - the MSA embedding is exact |
-| `msa_block_msa_act` | 23.7728 | 23.7728 | the MSA UPDATE is exact |
-| `msa_block_post_opm` | 18.1631 | 18.2943 | **2.83e-2 - the OPM** |
-| `z_after_msa`, 1 block | 19.9398 | 20.2244 | 2.91e-2, inherited |
+`@compute @workgroup_size(256)` and `let f = local` - **one lane per channel,
+with no loop.** `has_f = f < C_Z` guards the SHORT case and nothing covered the
+long one, so on a pair track wider than 256 the top channels were never computed
+and never written. Every other stack in every model is 128 or 256 wide:
 
-`z_after_template` is 18.1622, so the reference's outer product moves the pair
-by ~0.13 of rms and ours by ~0.001 - **about a hundredth of the contribution**,
-on a batch whose mask makes only 2 of its rows real. Invariant in depth (2, 16,
-128 and 1280 rows all give 2.83e-2), so it is not the padding. Ruled out too:
-the MSA subsample (a `DETERMINISTIC_MSA=1` dump is statistically identical), the
-cap (the reference's `num_msa` is 1280 against our 1024, and forcing 1280 moves
-nothing), the block ordering (`MSA_UPDATE_BEFORE_OPM` matches on both the CPU
-and the GPU path), and a missing convention - OpenDDE is in nine of
-af3-any-model's lists and this port implements all nine. **Open, and now one
-module wide.**
+| MSA stack | pair channels | |
+|---|---:|---|
+| alphafold3 | 128 | fits |
+| openbind0 | 128 | fits |
+| boltz2 | 128 | fits |
+| protenix2 | 256 | fits exactly |
+| **opendde** | **384** | **a third of it missing** |
+
+| | before | after |
+|---|---:|---:|
+| `check-af3-msa-block.js --model=opendde` | **4.94e-1** | **3.29e-7** |
+| trunk `tap.z_after_msa` | 6.01e-2 | **2.68e-5** |
+| trunk `tap.trunk_out_pair` / `pair` | 1.08e-1 | **7.65e-4** |
+
+**OpenDDE's trunk is now exact end to end** - 3.14e-8, 4.70e-8, 2.78e-7,
+3.80e-6, 2.68e-5, 7.65e-4 - and that last number is in line with AlphaFold 3's
+own 2.96e-4, openbind0's 4.27e-4 and boltz2's 3.49e-4. The other four are
+unmoved to every digit.
+
+🔴 **AND THE GATE EXISTED AND HAD NEVER BEEN POINTED AT THIS BUNDLE.**
+`check-af3-msa-block.js` takes `--model=` and runs in nine milliseconds; four
+models read 1e-6 on it and OpenDDE read 4.94e-1. This whole hunt - an
+io_callback tap in the reference, a `--stop-after-opm` stop point, `--msa-blocks`,
+a row-slice comparator - ended at a differential checker that was already
+written. **Run every gate against every bundle before building an instrument.**
+
+🔴 **AND IT COST OpenDDE 3.6 pLDDT TO BE RIGHT.** With the MSA it now folds
+6MRR at pLDDT 91.26 against 94.88 before, RMSD 1.647; 6MRR without an alignment
+is 1.545 against 1.542. A third of the MSA stack's pair output was missing and
+the model was CONFIDENT with it - which is what a confidence head trained on a
+different distribution does, and the reason pLDDT is not a correctness gate.
+Every OpenDDE number recorded before this commit was measured on the broken
+stack.
 
 🔴 **THE INSTRUMENTS THIS NEEDED, AND THE TWO THAT LIED FIRST.** The MSA stack
 is a `hk.experimental.layer_stack`, so `hk.intercept_methods` sees NOTHING
