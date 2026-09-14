@@ -3165,10 +3165,26 @@ three `--tune` arms read the identical 5.11e-4 and said only that they had not
 run. The pins go through the CONSTRUCTOR, which is what `--pins` on
 `check-fused-template-features.js` now sets.
 
-**Not shipped, on the numbers.** boltz2's whole trunk pair is 3.49e-4, so a
-template term at 5.11e-4 is not what limits it, and pinning four settings across
-every model's template stage has a cost nobody has measured. The finding is that
-it IS precision and where the switch is, not that the switch should be thrown.
+🔴 **SHIPPED, ONCE THE COST WAS MEASURED INSTEAD OF ASSUMED.** "Pinning four
+settings across every model's template stage has a cost nobody has measured" was
+the reason not to - so it was measured, interleaved at 256 tokens over four
+runs: the stage is **8.0 ms either way** against a 468 ms trunk, no arm above
+8.1. It is 1.7% of a trunk and its output is added to z, so it is paid once and
+inherited by all 48 pairformer blocks.
+
+And it was worth more than boltz2. Every model's template seam against
+af3-any-model:
+
+| `z_after_template` | before the pins | after |
+|---|---:|---:|
+| openbind0 | 4.07e-6 | **1.24e-7** |
+| protenix2 | 2.76e-6 | **9.68e-8** |
+| opendde | 3.80e-6 | **8.60e-8** |
+| alphafold3 | 1.17e-4 | 1.17e-4 (its own dump's bf16 - see above) |
+| boltz2 | 5.05e-8 | 5.05e-8 (inert: its empty term is zero) |
+
+Thirty-fold on three of the five, for nothing measurable. **A cost nobody has
+measured is not a reason; it is a measurement nobody has taken.**
 
 🔴 **AND THE SAME LINE IS IN THE TRUNK, WHERE IT IS LATENT.**
 `pairformer-block-webgpu.js` sizes its scratch by `pairChannels` too, and every

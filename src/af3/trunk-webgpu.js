@@ -190,7 +190,23 @@ export class Af3TrunkGpu {
     seam("tap.trunk_in_single", embedded.single);
 
     // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
-    const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device, this.options).run(
+    // 🔴 THE FOUR PINS AlphaFold 3's CONFIDENCE HEAD CARRIES, AND FOR THE SAME
+    // REASON: this stage is 1.7% of a trunk and its output is added to z, so it
+    // is paid for once and inherited by all 48 pairformer blocks. boltz2's
+    // fused embedder reads 5.11e-4 against its own CPU reference with the
+    // shipped precision and **9.11e-7** with these - three orders - and
+    // measured interleaved at 256 tokens the stage is 8.0 ms either way against
+    // a 468 ms trunk, four runs, no arm above 8.1. Correctness that costs
+    // nothing measurable is not a trade.
+    //
+    // 🔴 AND `--f16=off` AND `--tune=` CANNOT REACH THEM. The pins go through
+    // the CONSTRUCTOR; three `--tune` arms read an identical 5.11e-4 and said
+    // only that they had not run. See docs/AF3.md.
+    const template = await stage("template", () => new Af3TemplateEmbedderGpu(this.device, {
+      ...this.options,
+      stagedPrecision: "f32", weightPrecision: "f32", accumulatePrecision: "f32",
+      pairMatrixKernels: false,
+    }).run(
       { pair: embedded.pair, pairMask: input.pairMask, tokens,
         templates: input.templates ?? 4,
         // Absent, every slot is empty - which is what a de novo fold has, and
