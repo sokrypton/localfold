@@ -171,8 +171,10 @@ try {
   // Metal offers 32, so a kernel that takes a bigger tile compiles here and
   // refuses there. The limits twin of LOCALFOLD_STOCK_FLAGS.
   const device = await requestAlphaFoldDevice(adapter,
-    { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1")} });
-  if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1")}) {
+    { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_SPEC_FLOOR === "1" ? "spec"
+      : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")} });
+  if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1"
+      || process.env.LOCALFOLD_SPEC_FLOOR === "1")}) {
     console.log("[gpu-chrome] portable limits: workgroup storage "
       + device.limits.maxComputeWorkgroupStorageSize);
   }

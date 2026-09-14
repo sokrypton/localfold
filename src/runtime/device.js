@@ -65,6 +65,28 @@ const RAISED_LIMITS = [
  * 4 GiB `maxStorageBufferBindingSize` is twice this card's and cannot be
  * simulated by asking for less.
  */
+/**
+ * WebGPU's own GUARANTEED minimums for the limits this port raises.
+ *
+ * 🔴 PORTABLE_CEILINGS IS WHAT THE MACHINES WE HAVE REPORT, NOT WHAT THE SPEC
+ * PROMISES. It caps invocations and the X extent at 1024, which is an M2's
+ * number and an A100's; the spec guarantees **256**. Measured with these
+ * instead, **four of the six models do not fold**: AlphaFold 3, boltz2 and
+ * protenix2 ask for `workgroup_size(512)` and OpenDDE for 384. So the port
+ * depends on a raised limit that most desktop parts grant and the standard does
+ * not, and a conforming device reporting the minimum refuses those pipelines
+ * outright with "exceeds the maximum allowed (256, 256, 64)".
+ *
+ * Not a fallback and not a bug to hide: `LOCALFOLD_SPEC_FLOOR=1` is how the
+ * question gets asked, and what to do about it is a decision with a cost - the
+ * kernels concerned are one thread per channel by design.
+ */
+export const SPEC_FLOOR_CEILINGS = Object.freeze({
+  maxComputeWorkgroupStorageSize: 16384,
+  maxComputeInvocationsPerWorkgroup: 256,
+  maxComputeWorkgroupSizeX: 256,
+});
+
 export const PORTABLE_CEILINGS = Object.freeze({
   maxComputeWorkgroupStorageSize: 32768,
   maxComputeInvocationsPerWorkgroup: 1024,
@@ -92,7 +114,12 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
   const requiredLimits = {};
   // `portableLimits` caps what is asked for at PORTABLE_CEILINGS, so this
   // machine can be made to refuse what a weaker conforming one would.
-  const ceiling = options.portableLimits === true ? PORTABLE_CEILINGS : {};
+  // 🔴 THREE ANSWERS, NOT TWO. `portableLimits` asks what the weakest machine
+  // anyone has MEASURED would do; `"spec"` asks what the STANDARD guarantees,
+  // which is lower and which four of the six models do not survive. See
+  // SPEC_FLOOR_CEILINGS.
+  const ceiling = options.portableLimits === "spec" ? SPEC_FLOOR_CEILINGS
+    : options.portableLimits === true ? PORTABLE_CEILINGS : {};
   for (const name of RAISED_LIMITS) {
     const available = adapter.limits?.[name];
     if (typeof available === "number" && Number.isFinite(available)) {

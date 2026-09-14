@@ -28,12 +28,19 @@ import { runFolds } from "./gate-folds.mjs";
 // The fold list and the verdict are shared with check-stock-flags.mjs - see
 // gate-folds.mjs for why there is one copy.
 await runFolds({
-  env: { LOCALFOLD_PORTABLE_LIMITS: "1" },
-  question: "at the portable limit ceiling",
+  // 🔴 `--spec-floor` ASKS THE STANDARD'S QUESTION, NOT THIS SESSION'S.
+  // PORTABLE_CEILINGS is what the machines we have report; WebGPU guarantees
+  // 256 invocations and a 256 X extent where that says 1024. Four of six models
+  // fail there - see SPEC_FLOOR_CEILINGS.
+  env: process.argv.includes("--spec-floor")
+    ? { LOCALFOLD_SPEC_FLOOR: "1" } : { LOCALFOLD_PORTABLE_LIMITS: "1" },
+  question: process.argv.includes("--spec-floor")
+    ? "at WebGPU's guaranteed minimum limits" : "at the portable limit ceiling",
   broke: /"error"|Error:|uncaptured|exceeds the maximum/,
   // 🔴 THE CEILING MUST HAVE BEEN APPLIED. Without this a run where the
   // environment did not reach the page reports six passes and asks nothing -
   // and that is a failure of the gate, never a skip.
-  precondition: (text) => (/portable limits: workgroup storage 32768/.test(text)
+  precondition: (text) => (new RegExp(`portable limits: workgroup storage ${
+    process.argv.includes("--spec-floor") ? 16384 : 32768}`).test(text)
     ? undefined : "the ceiling never reached the page"),
 });
