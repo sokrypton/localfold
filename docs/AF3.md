@@ -3084,7 +3084,10 @@ the one row of this table with no exception in it.
    `emptyTemplateRestypeColumns`, so this is NOT the defect OpenDDE had - it is
    its own, and `check-af3-template-fused.js` is the gate that should localise
    it. Open.
-3. **AlphaFold 3's own `z_init_generic`, 2.20e-4** - four orders worse than
+3. ~~**AlphaFold 3's own `z_init_generic`, 2.20e-4**~~ - **NOT A DEFECT IN THIS
+   PORT; it is the dump.** See below: the reference's own two implementations,
+   run fresh, agree with this port at relRMS 0 and differ from the captured
+   scope by the same 1.255e-3. Originally read as - four orders worse than
    every other family's, on the model this port was written against first. The
    template stage HALVES the relative error (1.17e-4) because it roughly doubles
    the pair's magnitude while adding an exact term, which says the error is
@@ -3126,15 +3129,35 @@ measurement rather than a reading:
     `bfloat16 = "none"`, and rounding the weights, the output, or the running
     sum all score WORSE than plain f32 (1.26e-3 f32; 1.26e-3, 2.09e-3, 2.12e-3).
 
-What is left is a per-element residual of **0.0025 to 0.0066** on a tensor of rms
-2.54 that no combination of the 139 rows accounts for. **The reference's
-`position_activations` output is not the gather its own code describes**, and
-until that is explained this cell should not be read as a defect in this port.
-The next step is the reference's OTHER implementation: `create_relative_encoding`
-builds the one-hot and contracts it with `hm.Linear`, the chai branch of
-`_relative_encoding` calls that one with `use_bias=True`, and the two paths have
-a test that compares them - dumping the one-hot path beside the gather path on
-the same input says which of them the captured scope is.
+🔴 **ANSWERED: IT IS THE DUMP, NOT THE PORT.** The reference has TWO
+implementations - `create_relative_encoding` builds the (L, L, 139) one-hot and
+contracts it, `relative_encoding_segments` returns indices for a gather - and
+run fresh from the checkpoint on this batch they agree with each OTHER at
+relRMS **0** and land on rms **2.542316**, which is THIS PORT's value. The
+captured scope is rms 2.542363, and the reference's own code differs from its
+own captured scope by **1.255e-3** - the same number this port scores. So:
+
+| | rms | vs the captured scope |
+|---|---:|---:|
+| af3-any-model, one-hot path, fresh | 2.542316 | 1.255e-3 |
+| af3-any-model, gather path, fresh | 2.542316 | 1.255e-3 |
+| this port | 2.542316 | 1.255e-3 |
+
+**The port agrees with the reference's code exactly and the DUMP is the
+outlier.** No precision explains the dump either - casting the weight to
+bfloat16, float16 or float32 all leave it at 1.255e-3, and casting the output
+makes it worse. So AF3's `z_init_generic` 2.20e-4, and the 1.17e-4 / 1.16e-4 /
+2.96e-4 that follow from it in the sweep above, are a property of that dump and
+NOT of this port; AF3's true trunk residual is unmeasured and smaller. The
+mechanism inside the dump is still open - the scope tracer records `calls 1`
+for this module where the `z_*` taps record 2, so the captured value may be from
+a pass the fresh call does not reproduce.
+
+**The lesson is the one this file keeps paying for: an oracle is a measurement
+too.** Three of the four "not exact" cells found this session turned out to be
+the instrument - two of my own checkers and now the reference's own dump - and
+each was found the same way, by a residual that could not be true alongside
+another one.
 
 `z_after_template` is 5.05e-8 for boltz2 because its whole empty-template term
 is ZERO under `templateVisibilityByCoverage` - the seam equals `z_init`, so that
