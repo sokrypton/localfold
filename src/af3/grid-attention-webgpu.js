@@ -36,6 +36,20 @@ import { createGridAttendMatrixShader, gridAttendMatrixGeometry }
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
+/**
+ * How many lanes the grid PROJECTION runs: its width, clamped to what WebGPU
+ * guarantees.
+ *
+ * The projection stages one gated element per lane, so the workgroup used to be
+ * as wide as the attention - 4 heads of 32 for AlphaFold 3's template, 12 of 32
+ * for OpenDDE's trunk. The standard promises only 256 invocations, so OpenDDE's
+ * 384 could not create its pipeline on a conforming minimum device while every
+ * other model (128 or 256 wide) never came near it. Clamped here and strided in
+ * the kernel; at 256 or below nothing changes.
+ */
+const projectLanesFor = (width) => Math.min(width, 256);
+
+
 const GRID_WIDTH = 32_768;
 
 /**
@@ -753,7 +767,15 @@ const OUT_ROWS: u32 = ${OUT_ROWS}u;
 // OUT_ROWS gated rows, so one read of the output matrix serves all of them.
 var<workgroup> gated: array<f32, ${width} * ${OUT_ROWS}>;
 
-@compute @workgroup_size(${width})
+// ONE LANE PER WIDTH ELEMENT WAS A CEILING, AND OpenDDE'S WIDTH IS 384.
+// This asked for as many invocations as the attention is wide - 4 heads of 32
+// for AlphaFold 3's template, 12 of 32 for OpenDDE's trunk - and WebGPU
+// guarantees only 256. So OpenDDE's pipeline could not be created at all on a
+// conforming minimum device: workgroup_size(384) exceeds the maximum allowed
+// (256, 256, 64). Every other model is 128 or 256 wide. The staging loop
+// strides now, exactly as the channel loop below always did, and where the
+// width already fits the lane count this is the kernel it was.
+@compute @workgroup_size(${projectLanesFor(width)})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let first = (group.x + group.y * GRID_WIDTH) * OUT_ROWS;
@@ -765,14 +787,16 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   // memory would reach real rows sharing the tile.
   for (var r = 0u; r < OUT_ROWS; r += 1u) {
     let row = first + r;
-    let index = select(0u, row * WIDTH + local, row < PAIRS);
-    gated[r * ${width}u + local] =
-      select(0.0, ${storedElement(gatheredStorage, "gathered", "index")}
-        * logistic(${storedElement(store4.gate, "gate", "index")}), row < PAIRS);
+    for (var w = local; w < WIDTH; w += ${projectLanesFor(width)}u) {
+      let index = select(0u, row * WIDTH + w, row < PAIRS);
+      gated[r * ${width}u + w] =
+        select(0.0, ${storedElement(gatheredStorage, "gathered", "index")}
+          * logistic(${storedElement(store4.gate, "gate", "index")}), row < PAIRS);
+    }
   }
   workgroupBarrier();
 
-  for (var c = local; c < CHANNELS; c += WIDTH) {
+  for (var c = local; c < CHANNELS; c += ${projectLanesFor(width)}u) {
 ${overOutRows((r) => `    var sum${r} = 0.0;`)}
     for (var w = 0u; w < WIDTH; w += 1u) {
       // Consecutive threads read consecutive channels, and this one load is

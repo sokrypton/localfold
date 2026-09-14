@@ -787,10 +787,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   }
 }`;
 
-  const geometry = {
-    blockRows: 128, blockColumns: 128, blockInner: 32,
-    subgroupRows: 2, subgroupColumns: 4, ...matrix,
-  };
+  const geometry = { ...SPLIT_TRANSITION_GEOMETRY, ...matrix };
   // The right operand is read out of the weight buffer without staging where
   // the geometry asks and the shape allows - see directWeightsAllowed. The two
   // passes contract DIFFERENT extents, so they answer separately.
@@ -946,6 +943,18 @@ export function allocateTransitionSplit(allocator, shape, keep = (a) => a) {
  * `pairTransitionSplitMinChannels` is what a device that has re-measured it
  * says instead.
  */
+/**
+ * The split transition's block geometry, before a caller's `matrix` overrides.
+ *
+ * Named because the CHOOSER has to price it: `splitTransitionConfig` decides
+ * whether to split at all, and it cannot ask how many bytes the answer stages
+ * without knowing the geometry the shaders would be built from.
+ */
+export const SPLIT_TRANSITION_GEOMETRY = Object.freeze({
+  blockRows: 128, blockColumns: 128, blockInner: 32,
+  subgroupRows: 2, subgroupColumns: 4,
+});
+
 export function splitTransitionConfig(device, channels) {
   const tuning = deviceTuning(device);
   if (tuning.pairTransitionSplit !== true) return false;
@@ -954,7 +963,7 @@ export function splitTransitionConfig(device, channels) {
   }
   const config = deviceMatrixConfig(device, { element: "f16" });
   if (config === null) return false;
-  return {
+  const answer = {
     result: tuning.stagedMatrixResult ?? config.resultComponentType,
     contractResult: config.resultComponentType,
     matrixElement: config.componentType,
@@ -962,4 +971,16 @@ export function splitTransitionConfig(device, channels) {
     prefetch: tuning.stagedMatrixPrefetch === true,
     directWeights: tuning.stagedMatrixDirectWeights === true,
   };
+  // 🔴 AND WHETHER THIS DEVICE CAN STAGE IT, which this asked about the matrix
+  // units and the channel width and not about MEMORY. `compilePairTrack` prices
+  // the answer and RAISES - "a split transition stages 32768 B, over the limit"
+  // - so a device with WebGPU's guaranteed 16 KiB of workgroup storage did not
+  // fold at all where one with 32 KiB did, and `check-portable-limits.mjs
+  // --spec-floor` is the only thing that could see it. `resolveGridAttendMatrix`
+  // beside this already answers the same question the same way: a geometry the
+  // device cannot hold resolves to FALSE rather than throwing. The raise stays,
+  // for a caller that names a geometry by hand.
+  const bytes = stagedMatrixStorage({ ...SPLIT_TRANSITION_GEOMETRY, ...answer });
+  if (bytes > device.limits.maxComputeWorkgroupStorageSize) return false;
+  return answer;
 }

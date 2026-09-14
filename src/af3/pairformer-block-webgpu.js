@@ -34,7 +34,8 @@ import {
 } from "../runtime/device-profile.js";
 import { resolveGridAttendMatrix } from "./grid-attention-matrix.js";
 import {
-  allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
+  allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
+  TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS, triangleProjectMatrixFits,
 } from "../triangle/project-matrix.js";
 import { packWeights as packTriangleWeights } from "../triangle/weights.js";
 import { af3TriangleWeights } from "./triangle-webgpu.js";
@@ -81,7 +82,20 @@ function projectMatrixConfig(device, channels) {
   if (deviceTuning(device).triangleProjectMatrix !== true) return false;
   if (channels < (deviceTuning(device).triangleProjectMatrixMinChannels
     ?? TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS)) return false;
-  return matrixTile(device) ?? false;
+  const tile = matrixTile(device) ?? false;
+  if (tile === false) return false;
+  // 🔴 AND WHETHER THIS DEVICE CAN STAGE IT. `compilePairTrack` prices the
+  // answer and RAISES - "the matrix triangle projection does not fit this
+  // device" - so a device with WebGPU's guaranteed 16 KiB of workgroup storage
+  // did not fold where one with 32 KiB did. Same shape as the split
+  // transition's and as `resolveGridAttendMatrix`'s: the chooser prices it and
+  // resolves to FALSE, the raise stays for a caller that names a geometry by
+  // hand. See check-portable-limits.mjs --spec-floor.
+  if (!triangleProjectMatrixFits({ ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...tile },
+                                 device.limits.maxComputeWorkgroupStorageSize)) {
+    return false;
+  }
+  return tile;
 }
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
@@ -464,7 +478,10 @@ export class Af3PairformerStackGpu {
       createTransitionShader({ rows: n, channels: singleChannels, factor: 4, weightPrecision,
                                // The single track is `n` rows, not n^2 - the
                                // shortest dispatch in the trunk.
-                               threadTarget: deviceTuning(this.device).transitionThreadTarget },
+                               threadTarget: deviceTuning(this.device).transitionThreadTarget,
+                               // ...and never wider than this device will run;
+                               // see transitionWidth.
+                               maxWorkgroup: this.device.limits.maxComputeWorkgroupSizeX },
                              singleTransitionOffsets, epsilon, variance));
     // 🔴 THE SPLIT COUNT IS AN OCCUPANCY CHOICE, SO THE DEVICE MAKES IT.
     const singleTuning = deviceTuning(this.device);
