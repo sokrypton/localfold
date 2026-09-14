@@ -54,7 +54,11 @@ export async function main(device, args) {
   // 109 channels from RAW geometry - so for it the only check is the FORWARD:
   // build the features, run the embedder, compare the output the dump recorded
   // with real weights.
-  if (dump.inputs["feat:restype_i"] === undefined) {
+  // `--forward` takes the forward branch for a model whose dump DOES carry the
+  // columns, so the same GPU invocation can be run as a control. A GPU arm that
+  // disagrees for one model and not another is a model bug; one that disagrees
+  // for both is this checker.
+  if (dump.inputs["feat:restype_i"] === undefined || args.includes("--forward")) {
     const { boltz2TemplateFeatures } = await import("../../src/af3/template-features.js");
     const { openAf3Store, templateWeights, af3Dialect } =
       await import("../../src/af3/weights.js");
@@ -63,17 +67,73 @@ export async function main(device, args) {
     store.prefetch();
     const dialect = af3Dialect(store);
     const weights = await templateWeights(store, dialect);
-    const built = boltz2TemplateFeatures({
+    const { fusedTemplateFeatures } = await import("../../src/af3/template-webgpu.js");
+    const templateForFeatures = {
       aatype: Int32Array.from(aatypeRaw.data),
       atomPositions: positions.data, atomMask: atomMask.data,
-    }, multichain, tokens);
+    };
+    const built = dialect.boltz2TemplateFeatures === true
+      ? boltz2TemplateFeatures(templateForFeatures, multichain, tokens)
+      : fusedTemplateFeatures(templateForFeatures, tokens, weights.featureWidth,
+                              dialect, multichain);
     const got = fusedTemplateEmbedding({
       tokens, pair: of("pair").data, pairMask: of("pairMask").data,
       templates: 1, templateFeatures: built,
+      // 🔴 boltz2 SKIPS A SLOT IT CANNOT SEE. `templateVisibilityByCoverage`
+      // drops any slot whose `input.slots[slot]` is absent, so a checker that
+      // passes the features and not the slot gets rms 0.0000 out - which reads
+      // as "our forward computes nothing" and is the checker forgetting to say
+      // the template is there.
+      slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                atomPositions: positions.data, atomMask: atomMask.data }],
     }, weights, dialect);
     const native = of("output");
+    // 🔴 AND THE GPU PATH, WHICH IS WHAT A FOLD RUNS. The CPU reference being
+    // exact says the featuriser and the arithmetic are right; it says nothing
+    // about the kernels that ship, and boltz2's 5CAJ fold with a template lands
+    // at 2.2 A where protenix2 and AF3 reach 0.2.
+    const { Af3TemplateEmbedderGpu } = await import("../../src/af3/template-webgpu.js");
+    const gpuOut = await new Af3TemplateEmbedderGpu(device).run(
+      { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
+        slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                  atomPositions: positions.data, atomMask: atomMask.data }],
+        asymId: new Int32Array(tokens).fill(1) },
+      weights, dialect);
+    // ...the runner returns an object on this path; the pair is the field.
+    const gpu = gpuOut instanceof Float32Array ? gpuOut
+      : (gpuOut.pair ?? gpuOut.output ?? gpuOut.act);
+    if (gpu === undefined) {
+      return { model, gpuShape: Object.keys(gpuOut),
+               note: "the GPU runner returned no recognised field" };
+    }
+    // 🔴 THE RESIDUAL, HELD ON BOTH SIDES. boltz2's GPU arm is 0.748 where
+    // protenix2's is 3.9e-5 on the same invocation, and `templateStackOuterResidual`
+    // is the one convention boltz2 has and protenix2 does not. Forcing it OFF in
+    // BOTH says whether it is the residual or something else that differs: if
+    // the two agree without it, the residual is the defect; if they still
+    // disagree, it is not.
+    const without = { ...dialect, templateStackOuterResidual: false };
+    const cpuNoResidual = fusedTemplateEmbedding({
+      tokens, pair: of("pair").data, pairMask: of("pairMask").data,
+      templates: 1, templateFeatures: built,
+      slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                atomPositions: positions.data, atomMask: atomMask.data }],
+    }, weights, without);
+    const gpuNoResidualOut = await new Af3TemplateEmbedderGpu(device).run(
+      { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
+        slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                  atomPositions: positions.data, atomMask: atomMask.data }],
+        asymId: new Int32Array(tokens).fill(1) },
+      weights, without);
+    const gpuNoResidual = gpuNoResidualOut instanceof Float32Array ? gpuNoResidualOut
+      : (gpuNoResidualOut.pair ?? gpuNoResidualOut.output ?? gpuNoResidualOut.act);
     return { model, tokens, slots, width: built.length / (tokens * tokens),
              forwardRelRms: Number(relRms(got, native.data).toExponential(2)),
+             gpuVsCpuWithoutResidual:
+               Number(relRms(gpuNoResidual, cpuNoResidual).toExponential(2)),
+             gpuVsNative: Number(relRms(gpu, native.data).toExponential(2)),
+             gpuVsCpu: Number(relRms(gpu, got).toExponential(2)),
+             gpuRms: Math.sqrt(gpu.reduce((t, v) => t + v * v, 0) / gpu.length),
              oursRms: Math.sqrt(got.reduce((t, v) => t + v * v, 0) / got.length),
              nativeRms: Math.sqrt(native.data.reduce((t, v) => t + v * v, 0)
                                   / native.data.length) };

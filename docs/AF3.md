@@ -3075,9 +3075,29 @@ is right or wrong, which is exactly how boltz2's shipped without one.
 
 🔴 **boltz2 IS THE ONE THAT IS STILL WRONG, AND ONLY THIS TARGET SAYS SO.** It
 reads 0.490 A on 6MRR - better than its own 0.507 baseline, indistinguishable
-from correct - and 3.859 on 5CAJ where the other two reach 0.2 and the
-reference's own note reports 0.72 for this model. Its 109 channels are built
-now and they are not yet right.
+from correct - and 3.859 on 5CAJ where the other two reach 0.2 (2.246 with
+`--recycles=3`, pLDDT 91.9, TM 0.96) against the reference's own note of 0.72.
+
+**And it is NOT the featuriser: it is the GPU path.** Its 109 channels, built
+here from the raw structure and pushed through this port's CPU forward, score
+**8.25e-7** against af3-any-model's own module output. The same inputs through
+`Af3TemplateEmbedderGpu` score **0.748**. protenix2 on the identical invocation
+is 1.54e-7 on the CPU and **3.9e-5** on the GPU, so the checker and the call are
+sound and the defect is boltz2's kernels.
+
+Ruled out so far, each measured:
+
+  * **the outer residual**, which is the one convention boltz2 has here and
+    protenix2 does not: forced OFF on BOTH sides the GPU still disagrees with
+    the CPU by 0.756, and the accumulate shader takes its LayerNorm statistics
+    from the residual-added value as the reference does;
+  * **the head count** - boltz2's template stack is 4 heads where protenix2's is
+    2, and `gridHeads` is read off `blocks[0].pairAttention1.heads` rather than
+    derived from the channel width;
+  * **the pipeline key**, which carries `fused<width>` and `:or`.
+
+`tools/gpu/check-fused-template-features.js --name=boltz2` is the gate, and
+`--forward` runs the same arm for protenix2 as the control.
 
 ### 🔴 THE FUSED TEMPLATE FEATURISER, WHICH DID NOT EXIST
 
