@@ -182,6 +182,11 @@ export class Af3TrunkGpu {
     const embedded = await stage("embedder",
       () => new Af3EmbedderGpu(this.device).run(input, weights.embedder, options));
     seam("tap.z_init_generic", embedded.pair);
+    // 🔴 A SNAPSHOT, because the template stage adds INTO this same array. The
+    // difference `pair - embedded.pair` taken afterwards is the array minus
+    // itself - it read rms 0.0000 - and the seam above only works because the
+    // comparator consumes it before the mutation.
+    const zInitSnapshot = options.onSeam === undefined ? null : embedded.pair.slice();
     seam("tap.trunk_in_single", embedded.single);
 
     // 🔴 ON THE PART-BUILT PAIR - see the note at the top.
@@ -208,6 +213,17 @@ export class Af3TrunkGpu {
     const pair = embedded.pair;
     for (let index = 0; index < pair.length; index += 1) pair[index] += template.output[index];
     seam("tap.z_after_template", pair);
+    // ...and the template module's OWN output, which is what the reference
+    // traces as `evoformer/template_embedding`. `z_after_template` is
+    // `z_init + term`, so with an exact z_init the two say the same thing -
+    // but only the difference can be compared against the module's scope, and
+    // a term that is 4e-3 wrong inside a sum that is 3.9e-3 wrong is worth
+    // stating as itself.
+    if (options.onSeam !== undefined) {
+      const term = new Float32Array(pair.length);
+      for (let i = 0; i < term.length; i += 1) term[i] = pair[i] - zInitSnapshot[i];
+      seam("tap.template_term", term);
+    }
 
     // 🔴 THE MSA EMBEDDING, BEFORE THE STACK TOUCHES IT. `z_after_msa` is the
     // only MSA seam there was, so a wrong FEATURE and a wrong STACK were the

@@ -287,6 +287,9 @@ export async function main(device, args) {
     ? af3BatchFromA3m(sequenceArg, alignment, {
       maxSequences: Number(option(args, "max-msa", "512")),
       seed: Number(option(args, "seed", "20260831")),
+    // The padded template slot count; see src/af3/fold.js.
+    ...(option(args, "templates", "") === "" ? {}
+      : { templates: Number(option(args, "templates", "")) }),
       prefixRows: args.includes("--prefix-rows"),
       centreRefConformers: batchDialect?.centreRefConformers,
       ...(ligands.length === 0 ? {} : { ligands }),

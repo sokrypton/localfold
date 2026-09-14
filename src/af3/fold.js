@@ -907,7 +907,12 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // reports the depth that was featurised. What never happened is the MSA
     // stack seeing more than the query, which is most of what an MSA is for.
     trunk = await trunkGpu.run({
-      tokens, sequences: batch.sequences, templates: 4, targetFeat,
+      tokens, sequences: batch.sequences,
+      // 🔴 FOUR, TYPED IN - and a padded slot count is a FEATURISER's, not a
+      // constant. Under `templateMeanOverAllSlots` this number is the divisor,
+      // so it decides the term's magnitude and not just how much work is done.
+      templates: options.templates ?? 4,
+      targetFeat,
       features: batch.features,
       msaRows: batch.msa,
       deletionMatrix: batch.deletionMatrix,

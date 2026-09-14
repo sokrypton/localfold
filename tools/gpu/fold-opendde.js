@@ -13,6 +13,7 @@
 import { af3BatchFromA3m } from "../../src/af3/batch.js";
 import { loadTrunkOracle, trunkOracleComparer } from "./trunk-oracle.js";
 import { batchFromDump } from "./fold.js";
+import { buildTemplate } from "../../web/template-source.js";
 import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
   from "../../src/af3/fold.js";
 import { structuralLayout } from "../../src/af3/structural-tokens.js";
@@ -209,6 +210,36 @@ export async function main(device, args) {
   // s of weight load in front of it. It runs the stack at TWO token counts -
   // the residues and the structural tokens the expander produces - so both are
   // warmed. Not awaited; see warmTrunkPipelines.
+  // 🔴 A TEMPLATE, WHICH NO CLI GATE HAS EVER SUPPLIED. Every template number
+  // in these docs is an EMPTY slot: `fold-in-page.py --template` drives the
+  // page and reports pLDDT, and pLDDT is not a correctness gate. This takes a
+  // PDB and builds the slot through `buildTemplate` - the SAME function the
+  // page uses - so a self-template (the target's own crystal) can be folded
+  // with no MSA, which is the sharpest functional test there is: if templates
+  // work at all, that fold must land on the crystal.
+  const templatePath = option(args, "template", "");
+  const templateSlots = templatePath === "" ? undefined : await (async () => {
+    const [path, chain] = templatePath.split(":");
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(`failed to load ${path}: ${response.status}`);
+    const built = buildTemplate({
+      text: await response.text(), chain: chain ?? "A", query: sequence,
+      tokens: batch.tokens, minConfidence: 0, spanChains: false,
+      // One token per residue for a plain protein chain, which is what this
+      // tool folds; a ligand or a modified residue would need the batch's own
+      // residue-to-token map and this refuses to guess it.
+      tokenOf: (residue) => residue,
+    });
+    // `coverage` is an OBJECT ({residues, of, ...}), not a fraction - printing
+    // it as one gave "coverage NaN%", which is a report that cannot be wrong
+    // because it says nothing.
+    const { residues = 0, of = 0 } = built.coverage ?? {};
+    console.log(`  [template] ${path} chain ${chain ?? "A"}`
+      + ` covers ${residues}/${of} residues`
+      + ` (${of === 0 ? 0 : Math.round((residues / of) * 100)}%)`);
+    return [built.slot];
+  })();
+
   const structuralTokens = structuralLayout(batch).tokens;
   // 🔴 `--no-warm` IS THE ARM. A warm with no control beside it is a warm
   // nobody has priced, and this one is speculative by construction: it compiles
@@ -359,6 +390,7 @@ export async function main(device, args) {
     // `z_after_msa` and nowhere earlier.
     // The MSA stack's first half alone; see msa-stack-webgpu.js.
     stopAfterOpm: args.includes("--stop-after-opm"),
+    ...(templateSlots === undefined ? {} : { templateSlots }),
     ...(option(args, "num-msa", "") === "" ? {}
       : { numMsa: Number(option(args, "num-msa", "")) }),
     onStep: ({ step, denoised, structuralDenoised }) => {

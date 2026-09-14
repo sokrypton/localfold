@@ -3053,6 +3053,40 @@ the MSA plainly works (pLDDT 87.3 with none against 94.9 with 128 rows) and the
 stopped pair was also unchanged. **A number that agrees with a prediction to
 three digits is still worth one control.**
 
+### 🔴 DO TEMPLATES ACTUALLY WORK? TWO OF THE FIVE THROW
+
+The sharpest functional test there is, and nothing had ever run it: fold the
+target from its OWN crystal as a template, with NO alignment. If templates work
+at all, that fold must land on the crystal. 6MRR, 16 flow steps, int5 (openbind0
+f32, the only one on this box), `fold-opendde.js --target=6mrr --template=`:
+
+| model | no MSA, no template | + self-template | |
+|---|---:|---:|---|
+| alphafold3 | 0.72 A | **0.50** | works |
+| opendde | 1.542 | **0.531** | works - the largest gain of the five |
+| openbind0 | 1.743 | 1.579 | **barely moves**, on the same nine-projection embedder |
+| boltz2 | 0.507 | **THROWS** | not implemented |
+| protenix2 | 0.714 | **THROWS** | not implemented |
+
+🔴 **boltz2 AND protenix2 CANNOT TAKE A TEMPLATE AT ALL**: "the fused template
+embedder has no featuriser yet: a supplied template needs the 108 columns
+built". The fused embedder's FORWARD is exact - `check-af3-template-fused.js`
+reads 1.52e-7 with a real template, because the dump hands it the 108 columns -
+and the featuriser that would build them from a structure was never written. So
+the gate that exists passes and the feature does not exist, which is the
+cleanest example in this repository of a checker measuring the half that works.
+
+🔴 **AND NO CLI GATE HAD EVER SUPPLIED A TEMPLATE.** Every template number in
+these docs before this one is an EMPTY slot; `fold-in-page.py --template` drives
+the page and reports pLDDT, which is not a correctness gate. `fold-opendde.js
+--template=<pdb>:<chain>` builds the slot through `buildTemplate`, the same
+function the page uses, and reports RMSD against the crystal.
+
+**openbind0 is the open question of the three that run.** Its embedder is
+AlphaFold 3's, its empty-template seam is exact (4.07e-6), and a 100%-coverage
+self-template moves it from 1.743 to 1.579 where AF3 goes 0.72 to 0.50 and
+OpenDDE 1.542 to 0.531. A template that good should dominate the prediction.
+
 ### 🔴 THE WHOLE TRUNK, ALL FIVE FAMILIES, ON EACH ONE'S OWN REFERENCE BATCH
 
 The sweep that answers "what else is not exact". `fold.js --dump= --trunk-oracle=`

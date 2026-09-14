@@ -96,7 +96,7 @@ const FUSED_ORDER = [
  * in docs/AF3.md and gated by nothing yet. Building it from that specification
  * and checking it against a reference built the same way would prove nothing.
  */
-export function emptyFusedFeatures(template, tokens, width, dialect) {
+export function emptyFusedFeatures(template, tokens, width, dialect, useGap = true) {
   if (template !== undefined && template !== null) {
     throw new Error("the fused template embedder has no featuriser yet: a "
       + "supplied template needs the 108 columns built, and docs/AF3.md has "
@@ -109,7 +109,17 @@ export function emptyFusedFeatures(template, tokens, width, dialect) {
   // distogram 38 against 39, restypes 33 against 32 - which is why `a_proj`
   // refused a 108-wide build with "wants 109" rather than folding something
   // plausible.
-  const columns = dialect?.emptyTemplateRestypeColumns;
+  // 🔴 AND THE GAP GOES IN EVERY EMPTY SLOT HERE, NOT ONLY THE FIRST - WHICH IS
+  // THE OPPOSITE OF THE NINE-PROJECTION PATH. protenix2's `template_aatype` is
+  // 21 in slot 0 and 0 in slots 1..3, exactly like OpenDDE's, so gating the gap
+  // to the first empty slot is the obvious symmetry - and MEASURED it makes the
+  // trunk's `z_after_template` seam WORSE, 3.89e-3 to 4.55e-3. The fused
+  // embedder does not consume `template_aatype`; it consumes 108 columns that
+  // protenix's own featuriser builds, and those are not the same array. Left as
+  // it is, on the measurement rather than on the symmetry. `useGap` is kept as
+  // the arm for re-running that comparison.
+  const columns = useGap ? dialect?.emptyTemplateRestypeColumns : [];
+  if (!useGap) return new Float32Array(tokens * tokens * width);
   if (columns === undefined || columns === null) {
     throw new Error("dialect.emptyTemplateRestypeColumns has no default: an "
       + "empty template slot carries GAP under protenix2 and zeros under "
