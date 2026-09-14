@@ -3270,16 +3270,32 @@ graph:
 
 | family | `target_feat` | `z_init` | `z_after_template` | `z_after_msa` | `pair` |
 |---|---:|---:|---:|---:|---:|
-| alphafold3 | 5.76e-8 | **2.20e-4** | 1.17e-4 | 1.16e-4 | 2.96e-4 |
-| openbind0 | 4.93e-8 | 3.65e-8 | 4.07e-6 | 6.08e-5 | 4.27e-4 |
+| alphafold3 | 5.76e-8 | 2.20e-4 * | 1.17e-4 * | 1.16e-4 | 2.98e-4 |
+| openbind0 | 4.93e-8 | 3.65e-8 | 1.24e-7 | 6.03e-5 | 4.20e-4 |
 | boltz2 | 9.71e-8 | 5.05e-8 | 5.05e-8 | 4.55e-5 | 3.49e-4 |
-| protenix2 | 2.37e-8 | 1.89e-8 | **3.89e-3** | 3.42e-3 | 3.98e-3 |
-| opendde | 3.14e-8 | 4.70e-8 | 3.80e-6 | **6.01e-2** | 7.10e-2 |
+| protenix2 | 2.37e-8 | 1.89e-8 | 9.68e-8 | 5.40e-5 | 1.38e-3 |
+| opendde | 3.14e-8 | 4.70e-8 | 8.60e-8 | 2.65e-5 | 7.71e-4 |
+
+\* AlphaFold 3's two are its DUMP's bfloat16, not this port's - see below; every
+other cell is the port's.
+
+🔴 **RE-MEASURED 2026-09-14, AND THE FIRST VERSION OF THIS TABLE IS WHY.** As
+first published it read protenix2's template seam at 3.89e-3 and OpenDDE's MSA
+at 6.01e-2, and both were fixed the same day - a padded template slot carrying
+restype ZERO and the outer product mean computing 256 of 384 channels - along
+with a template precision pin worth thirty-fold on three of the five. **A table
+of measurements is stale the moment the thing it measures is fixed**, and this
+one sat wrong for several commits inside the same document that described the
+fixes.
 
 **Every atom encoder is exact** - `target_feat` is 1e-8 for all five, which is
 the one row of this table with no exception in it.
 
-**Three things are not.** In order of size:
+**And nothing is left above 1.4e-3.** All three of the things this section
+originally listed are closed - OpenDDE's outer product mean, protenix2's template
+stage, and AlphaFold 3's `z_init`, which turned out to be the oracle's own
+precision rather than this port's. What follows is the record of each; the
+ordering below is the state on the morning of 2026-09-14, not now:
 
 1. **OpenDDE's outer product mean, 6.01e-2.** Bisected to that one module above;
    the MSA embedding and the MSA update either side of it are exact.
