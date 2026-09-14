@@ -3066,38 +3066,59 @@ carry the fold. `fold-opendde.js --target=5caj --chain=A --steps=16
 |---|---:|---:|
 | alphafold3 | 16.792 A / TM 0.258 | **0.288 / 0.998** |
 | protenix2 | 19.212 / TM 0.184 | **0.216 / 0.999** |
-| boltz2 | 18.165 / TM 0.199 | 3.859 / 0.849 |
+| boltz2 | 18.165 / TM 0.199 | **1.411 / 0.971**, and **0.470 / 0.994** at `--recycles=3` |
 
 **That is what a working template looks like** - a fold that is not a fold at
 all (TM 0.18-0.26) becoming the crystal. And it is the gate 6MRR could not be:
 on 6MRR every one of these lands between 0.47 and 0.53 whether the featuriser
 is right or wrong, which is exactly how boltz2's shipped without one.
 
-🔴 **boltz2 IS THE ONE THAT IS STILL WRONG, AND ONLY THIS TARGET SAYS SO.** It
-reads 0.490 A on 6MRR - better than its own 0.507 baseline, indistinguishable
-from correct - and 3.859 on 5CAJ where the other two reach 0.2 (2.246 with
-`--recycles=3`, pLDDT 91.9, TM 0.96) against the reference's own note of 0.72.
+### 🔴 boltz2's TEMPLATE SCRATCH WAS HALF THE WIDTH ITS ATTENTION WRITES
 
-**And it is NOT the featuriser: it is the GPU path.** Its 109 channels, built
-here from the raw structure and pushed through this port's CPU forward, score
-**8.25e-7** against af3-any-model's own module output. The same inputs through
-`Af3TemplateEmbedderGpu` score **0.748**. protenix2 on the identical invocation
-is 1.54e-7 on the CPU and **3.9e-5** on the GPU, so the checker and the call are
-sound and the defect is boltz2's kernels.
+Found by the target above and by nothing else. boltz2's self-template fold of
+5CAJ read **3.859 A** where AF3 and protenix2 reached 0.2, and on 6MRR it read
+0.490 against its own 0.507 baseline - indistinguishable from correct.
 
-Ruled out so far, each measured:
+**The grid projection writes `heads * dimension` per pair per role, and the
+template stack sized its scratch by the CHANNEL count.** In every other stack in
+every model those are the same number:
 
-  * **the outer residual**, which is the one convention boltz2 has here and
-    protenix2 does not: forced OFF on BOTH sides the GPU still disagrees with
-    the CPU by 0.756, and the accumulate shader takes its LayerNorm statistics
-    from the residual-added value as the reference does;
-  * **the head count** - boltz2's template stack is 4 heads where protenix2's is
-    2, and `gridHeads` is read off `blocks[0].pairAttention1.heads` rather than
-    derived from the channel width;
-  * **the pipeline key**, which carries `fused<width>` and `:or`.
+| stack | heads x dim | channels | |
+|---|---|---|---|
+| AF3 trunk | 4 x 32 = 128 | 128 | equal |
+| boltz2 trunk | 4 x 32 = 128 | 128 | equal |
+| protenix2 trunk | 8 x 32 = 256 | 256 | equal |
+| OpenDDE trunk | 12 x 32 = 384 | 384 | equal |
+| AF3 template | 4 x 16 = 64 | 64 | equal |
+| protenix2 template | 2 x 32 = 64 | 64 | equal |
+| **boltz2 template** | **4 x 32 = 128** | **64** | **WIDER** |
 
-`tools/gpu/check-fused-template-features.js --name=boltz2` is the gate, and
-`--forward` runs the same arm for protenix2 as the control.
+boltz2's template attention is the only place anywhere that the two differ, so
+the buffer held half of what the projection wrote and the kernel's own bounds
+check dropped the tail. Nothing raises; the fold is plausible.
+
+The bisect, each step a seam that had to be built:
+
+| | boltz2 | protenix2 (control) |
+|---|---:|---:|
+| the 109/108 columns, CPU forward vs the oracle | 8.25e-7 | 1.54e-7 |
+| the EMBED alone, GPU vs CPU | 2.2e-7 | 1.6e-7 |
+| the whole module, GPU vs CPU | **0.748** | 3.9e-5 |
+| ...after sizing scratch by the attention width | **5.11e-4** | 3.9e-5 |
+
+The embed being exact either side is what said it was the two pairformer blocks
+and not the projection or the features. Ruled out on the way, each measured:
+the outer residual (forced off on BOTH sides the GPU still disagreed by 0.756),
+the head count (`gridHeads` is read off `blocks[0].pairAttention1.heads`), and
+the pipeline key (it already carries `fused<width>` and `:or`).
+
+🔴 **AND THE SAME LINE IS IN THE TRUNK, WHERE IT IS LATENT.**
+`pairformer-block-webgpu.js` sizes its scratch by `pairChannels` too, and every
+trunk shipped here has `heads * dimension == channels`, so it has never been
+wrong. Written the same way now, so the next checkpoint does not pay for it
+twice.
+
+
 
 ### 🔴 THE FUSED TEMPLATE FEATURISER, WHICH DID NOT EXIST
 

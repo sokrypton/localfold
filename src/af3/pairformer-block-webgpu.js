@@ -562,11 +562,23 @@ export class Af3PairformerStackGpu {
           offsets: packTransitionWeights(blocks[0].pairTransition).offsets,
           label: "af3-block.transition",
         }, keep);
+      // 🔴 THE ATTENTION'S WIDTH, NOT THE CHANNEL COUNT - the same rule the
+      // template stack needed. The grid projection writes `heads * dimension`
+      // per pair per role, and in every TRUNK shipped here that equals the
+      // channel width (AF3 4 x 32 = 128, boltz2 4 x 32 = 128, protenix2
+      // 8 x 32 = 256, OpenDDE 12 x 32 = 384), so this line has never been
+      // wrong. It was wrong in template-webgpu.js the moment a stack arrived
+      // whose attention is WIDER than its channels - boltz2's template, 4 x 32
+      // out of 64 - and cost that model 0.748 against its own CPU reference
+      // and 3.4 A on a self-templated fold. Latent here; written the same way
+      // so the next checkpoint does not pay for it twice.
+      const attentionWidth = Math.max(pairChannels,
+        gridHeads * (blocks[0]?.pairAttention1?.dimension ?? 0));
       const scratch = [];
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-block.scratch${index}`,
-          storageBytes(pairs * pairChannels, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       // Uploaded once for the stack, not per block: it is the same tensor for
       // all four of the refiner's blocks.

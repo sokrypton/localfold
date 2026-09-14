@@ -698,11 +698,27 @@ export class Af3TemplateEmbedderGpu {
       // peak. The allocation and the shaders read the same array, because a
       // buffer that disagrees with a shader about its element is not something
       // WebGPU can catch.
+      // 🔴 SIZED BY THE ATTENTION'S WIDTH, NOT BY THE CHANNEL COUNT. The grid
+      // projection writes `heads * dimension` per pair per role, and in every
+      // other stack in every model that equals the channel width - AF3's trunk
+      // is 4 x 32 = 128 channels, OpenDDE's 12 x 32 = 384, protenix2's template
+      // 2 x 32 = 64, AF3's template 4 x 16 = 64. **boltz2's TEMPLATE stack is
+      // 4 x 32 = 128 out of 64 channels**, the only place anywhere the two
+      // differ, so scratch sized by CHANNELS held half of what the projection
+      // wrote. Nothing raises: the buffer is simply too short and the kernel's
+      // own bounds check drops the tail.
+      //
+      // Measured: the whole fused path 0.748 from its own CPU reference where
+      // protenix2's was 3.9e-5, with the EMBED exact at 2.2e-7 either side - so
+      // it was always the two pairformer blocks - and boltz2's self-template
+      // fold of 5CAJ at 3.859 A where AF3 and protenix2 reach 0.2.
+      const attentionWidth = Math.max(CHANNELS,
+        gridHeads * (weights.blocks[0]?.pairAttention1?.dimension ?? 0));
       const scratch = [];
       for (let index = 0; index < PAIR_SCRATCH_COUNT; index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `af3-template.scratch${index}`,
-          storageBytes(pairs * CHANNELS, UNPACKED_PAIR_SCRATCH[index]), storage)));
+          storageBytes(pairs * attentionWidth, UNPACKED_PAIR_SCRATCH[index]), storage)));
       }
       const biasBuffer = keep(this.allocator.allocate(
         "af3-template.bias", gridHeads * pairs * 4, storage));
@@ -804,7 +820,13 @@ export class Af3TemplateEmbedderGpu {
           encoder.copyBufferToBuffer(act.buffer, 0, beforeStack.buffer, 0,
                                      pairs * CHANNELS * 4);
         }
+        // 🔴 A STOP POINT, so the EMBED can be compared on its own. boltz2's
+        // whole fused path is 0.748 from its own CPU reference where
+        // protenix2's is 3.9e-5, and `act` here - `z_proj(z_norm(z)) +
+        // a_proj(a)`, before the two pairformer blocks touch it - is the one
+        // seam that separates a wrong projection from a wrong pair track.
         for (let index = 0; index < blockWeights.length; index += 1) {
+          if (options?.stopAfterEmbed === true) break;
           encodePairTrack({
             run, pipelines: trackPipelines, n: tokens, channels: CHANNELS, gridHeads,
             pair: act, pairMask, scratch, biasBuffer, weights: blockWeights[index],

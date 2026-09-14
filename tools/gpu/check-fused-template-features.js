@@ -112,6 +112,29 @@ export async function main(device, args) {
     // BOTH says whether it is the residual or something else that differs: if
     // the two agree without it, the residual is the defect; if they still
     // disagree, it is not.
+    // 🔴 THE EMBED ALONE, both sides. `z_proj(z_norm(z)) + a_proj(a)` before the
+    // pairformer blocks: if the GPU already differs here it is the projection
+    // or the features reaching it, and if it does not it is the pair track.
+    // The residual and the output LayerNorm are held off on the CPU side so the
+    // two are the same quantity.
+    const flat = { ...dialect, templateStackOuterResidual: false };
+    const cpuEmbedOut = await new Af3TemplateEmbedderGpu(device).run(
+      { pair: of("pair").data, pairMask: of("pairMask").data, tokens, templates: 1,
+        slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                  atomPositions: positions.data, atomMask: atomMask.data }],
+        asymId: new Int32Array(tokens).fill(1) },
+      weights, flat, { stopAfterEmbed: true });
+    const gpuEmbed = cpuEmbedOut instanceof Float32Array ? cpuEmbedOut
+      : (cpuEmbedOut.pair ?? cpuEmbedOut.output ?? cpuEmbedOut.act);
+    // ...and the CPU's same quantity: the whole module with NO pairformer
+    // blocks, which is what `stopAfterEmbed` leaves the GPU doing.
+    const cpuEmbed = fusedTemplateEmbedding({
+      tokens, pair: of("pair").data, pairMask: of("pairMask").data,
+      templates: 1, templateFeatures: built,
+      slots: [{ aatype: Int32Array.from(aatypeRaw.data),
+                atomPositions: positions.data, atomMask: atomMask.data }],
+    }, { ...weights, blocks: [] }, flat);
+
     const without = { ...dialect, templateStackOuterResidual: false };
     const cpuNoResidual = fusedTemplateEmbedding({
       tokens, pair: of("pair").data, pairMask: of("pairMask").data,
@@ -129,6 +152,9 @@ export async function main(device, args) {
       : (gpuNoResidualOut.pair ?? gpuNoResidualOut.output ?? gpuNoResidualOut.act);
     return { model, tokens, slots, width: built.length / (tokens * tokens),
              forwardRelRms: Number(relRms(got, native.data).toExponential(2)),
+             embedGpuVsCpu: Number(relRms(gpuEmbed, cpuEmbed).toExponential(2)),
+             gpuEmbedRms: Math.sqrt(gpuEmbed.reduce((t, v) => t + v * v, 0) / gpuEmbed.length),
+             cpuEmbedRms: Math.sqrt(cpuEmbed.reduce((t, v) => t + v * v, 0) / cpuEmbed.length),
              gpuVsCpuWithoutResidual:
                Number(relRms(gpuNoResidual, cpuNoResidual).toExponential(2)),
              gpuVsNative: Number(relRms(gpu, native.data).toExponential(2)),
