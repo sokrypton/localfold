@@ -1,4 +1,26 @@
-# OpenDDE: two token spaces, and a fold
+# OpenDDE in LocalFold
+
+🔴 **EVERY NUMBER IN THIS FILE FROM BEFORE 2026-09-14 WAS MEASURED ON A BROKEN
+MSA STACK.** The outer product mean's contract kernel gave one lane to each
+channel with no loop - `@compute @workgroup_size(256)` and `let f = local` - so
+on OpenDDE's 384-wide MSA pair a THIRD of the output was never computed. Every
+other model is 128 or 256 wide and none of them could see it. Fixed; measured
+against af3-any-model, OpenDDE's trunk went from `z_after_msa` 6.01e-2 and pair
+1.08e-1 to **2.68e-5 and 7.65e-4**, which is its first exact trunk.
+
+What moved, at the commands this file quotes:
+
+| | before | after |
+|---|---:|---:|
+| `fold-opendde.js --target=6mrr` | 1.680 A / TM 0.865 | **1.501 / 0.934** |
+| the same, `--steps=16 --mode=flow` | 1.525 | **1.545** |
+| 6MRR with a 128-row MSA | pLDDT 94.88 | **91.26**, RMSD 1.647 |
+
+🔴 **AND BEING RIGHT COST IT 3.6 pLDDT.** The model was CONFIDENT with a third of
+its MSA pair missing, which is what a confidence head does when it is fed a
+distribution it was not trained on - and the reason pLDDT is not a correctness
+gate. Read every table below with that in mind; the RMSDs and the timings are
+still indicative and the exact digits are not.
 
 OpenDDE (Aureka Research, Apache-2.0) is an independent PyTorch
 reimplementation in the AlphaFold 3 family - its own pairformer and its own

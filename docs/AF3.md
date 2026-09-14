@@ -2909,7 +2909,7 @@ comparable.
 | alphafold3 | 1.55e-5 | 2.96e-4 | 3.46e-5 | 0.643 A | 0.956 |
 | **boltz2** | 3.50e-3 | 3.49e-4 | 1.44e-6 | **0.537** | **0.973** |
 | openbind0 | 8.22e-5 | 4.27e-4 | 4.26e-4 | 1.732 | 0.904 |
-| opendde | 9.79e-7 | - | - | 1.525 | 0.933 |
+| opendde | 9.79e-7 | 7.65e-4 | ~1e-6 | 1.545 | 0.921 |
 | protenix2 | 1.92e-6 | - | 1.47e-7 | 1.564 | 0.929 |
 
 **openbind0 needed nothing.** It was already right, at every level, and this is
