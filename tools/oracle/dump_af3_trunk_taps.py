@@ -157,6 +157,50 @@ for name in ("single", "pair"):
 # `CAPTURE = ...`, which is BEFORE it, `SCOPES` is empty and the listing prints
 # nothing and exits 0 - a tool that answers "there are no modules" when it means
 # "I ran too early".
+# 🔴 IN-PROCESS: does the CAPTURED relative encoding match a fresh one? The
+# dumped scope and a fresh call disagree by 1.255e-3 and this port matches the
+# FRESH one exactly, so either the capture is not what it says or the file is.
+# `RELENC=1` removes the file, the JSON round trip and the BLOCKS slicing from
+# the comparison by doing it here.
+if os.environ.get("RELENC"):
+    from alphafold3.model.network import featurization as _f
+    # `b` is the raw feature dict here; the typed view is what has
+    # token_features.
+    _tf = feat_batch.Batch.from_data_dict(b).token_features
+    _W = np.asarray(params["evoformer/~_relative_encoding/position_activations"]
+                    ["weights"], np.float32).astype(np.float64)
+    (_p, _n), (_t, _), _e, (_c, _nc) = _f.relative_encoding_segments(
+        seq_features=_tf, max_relative_idx=cfg.evoformer.max_relative_idx,
+        max_relative_chain=cfg.evoformer.max_relative_chain,
+        chain_bucket_on_same_chain=False)
+    _fresh = (_W[:_n][np.asarray(_p)] + _W[_n:2*_n][np.asarray(_t)]
+              + np.asarray(_e)[..., None] * _W[2*_n] + _W[2*_n+1:][np.asarray(_c)])
+    _key = "evoformer/~_relative_encoding/position_activations"
+    _cap = SCOPES.get(_key)
+    if _cap is None:
+        print("RELENC: the scope was not captured; CAPTURE must match it too")
+    else:
+        _c2 = np.asarray(_cap["data"], np.float64).reshape(_fresh.shape)
+        _rel = float(np.sqrt(((_c2 - _fresh) ** 2).sum() / (_fresh ** 2).sum()))
+        print("RELENC captured rms %.6f  fresh rms %.6f  relRMS %.3e"
+              % (float(np.sqrt((_c2 ** 2).mean())),
+                 float(np.sqrt((_fresh ** 2).mean())), _rel))
+        print("RELENC calls seen for that module:", _cap.get("calls"))
+        # ...and the numbers, because a norm cannot tell a scale from a shift
+        # from a permutation.
+        print("RELENC captured[0,1,:6]", np.round(_c2[0, 1, :6], 6).tolist())
+        print("RELENC fresh   [0,1,:6]", np.round(_fresh[0, 1, :6], 6).tolist())
+        _d = _c2 - _fresh
+        print("RELENC diff rms %.6f  max|d| %.6f  diff constant across pairs: %s"
+              % (float(np.sqrt((_d ** 2).mean())), float(np.abs(_d).max()),
+                 bool(np.allclose(_d, _d[0, 0], atol=1e-6))))
+        # is the captured value the fresh one in a LOWER precision?
+        for _name, _dt in (("bfloat16", jnp.bfloat16), ("float16", jnp.float16)):
+            _r = np.asarray(jnp.asarray(_fresh.astype(np.float32)).astype(_dt)
+                            .astype(jnp.float32), np.float64)
+            print("RELENC fresh cast to %-9s vs captured relRMS %.3e"
+                  % (_name, float(np.sqrt(((_r - _c2) ** 2).sum() / (_c2 ** 2).sum()))))
+
 if CAPTURE == "LIST":
     for _name in sorted(SCOPES):
         print("  %-64s %s" % (_name, SCOPES[_name]["shape"]))

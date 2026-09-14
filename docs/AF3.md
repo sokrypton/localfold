@@ -3345,14 +3345,27 @@ own captured scope by **1.255e-3** - the same number this port scores. So:
 | this port | 2.542316 | 1.255e-3 |
 
 **The port agrees with the reference's code exactly and the DUMP is the
-outlier.** No precision explains the dump either - casting the weight to
-bfloat16, float16 or float32 all leave it at 1.255e-3, and casting the output
-makes it worse. So AF3's `z_init_generic` 2.20e-4, and the 1.17e-4 / 1.16e-4 /
+outlier.** So AF3's `z_init_generic` 2.20e-4, and the 1.17e-4 / 1.16e-4 /
 2.96e-4 that follow from it in the sweep above, are a property of that dump and
-NOT of this port; AF3's true trunk residual is unmeasured and smaller. The
-mechanism inside the dump is still open - the scope tracer records `calls 1`
-for this module where the `z_*` taps record 2, so the captured value may be from
-a pass the fresh call does not reproduce.
+NOT of this port; AF3's true trunk residual is unmeasured and smaller.
+
+🔴 **AND IT IS NOT THE FILE.** `RELENC=1` on `dump_af3_trunk_taps.py` does the
+comparison IN ONE PROCESS - the captured scope against a fresh gather of the
+same parameters, with the JSON round trip, the file and the `BLOCKS=` slicing
+all removed. Still **1.255e-3**, `calls 1`. What is left is arithmetic inside
+af3-any-model's own module:
+
+  * the checkpoint's `position_activations` is **bfloat16** (139 x 128), and a
+    fresh gather upcasts it and sums in f64;
+  * the captured values and the fresh ones both sit on a 2^-10 grid and differ
+    by a few ULPs - `1.720703` against `1.717773`, max |d| 0.03125;
+  * casting the fresh result to float16 scores **1.268e-3** against the observed
+    1.255e-3, within one percent, and bfloat16 scores 2.09e-3.
+
+So the captured scope is that gather at reduced precision, and this port
+computes it at f32 and matches the exact one. **The remaining question is about
+the reference's internals and not about anything this port ships**, which is
+where it is being left.
 
 **The lesson is the one this file keeps paying for: an oracle is a measurement
 too.** Three of the four "not exact" cells found this session turned out to be
