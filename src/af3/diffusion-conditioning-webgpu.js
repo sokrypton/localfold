@@ -741,7 +741,9 @@ export class Af3DiffusionConditioningGpu {
       // The width is BAKED into the shader, so it is in the key.
       const singleWidth_ = transitionWidth(
         tokens, transitionRowTile(tokens, seqChannels),
-        deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2);
+        deviceTuning(this.device).transitionThreadTarget, undefined, seqChannels * 2,
+        // ...and never wider than this device will run. See transitionWidth.
+        this.device.limits.maxComputeWorkgroupSizeX);
       transitionPipelines.single.push(await this.pipelines.get(
         `${base}:single-transition:${index}:w${singleWidth_}`,
         createTransitionShader({ rows: tokens, channels: seqChannels, factor: 2,

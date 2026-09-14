@@ -196,10 +196,20 @@ export function packTransitionWeights(weights, precision = "f32") {
  * it assumes it of a power of two.
  */
 export function transitionWidth(rows, tile, threadTarget, width = DEFAULT_WORKGROUP,
-                                intermediate = undefined) {
+                                intermediate = undefined, maxWorkgroup = Infinity) {
   if (!threadTarget) return width;
   const groups = Math.max(1, Math.ceil(rows / tile));
   for (const candidate of [512, 256]) {
+    // 🔴 AND A WIDTH THE DEVICE WILL NOT RUN IS NOT A CHOICE EITHER. 512 is a
+    // PERFORMANCE pick from the ampere prior, and WebGPU guarantees only 256
+    // invocations and a 256 X extent - so on a conforming device reporting the
+    // minimum this kernel refused to compile at all and AlphaFold 3, boltz2 and
+    // protenix2 did not fold. Measured with `check-portable-limits.mjs
+    // --spec-floor`, which is the only thing that could see it: PORTABLE_CEILINGS
+    // caps at 1024, which is what an A100 and an M2 report. Clamping here is not
+    // a fallback - the narrower width is one of the two the tuner was already
+    // choosing between.
+    if (candidate > maxWorkgroup) continue;
     // 🔴 AND A WIDTH THE CHUNK CANNOT DIVIDE IS NOT A CHOICE. `transitionChunk`
     // falls back to the whole intermediate when its preferred chunk does not
     // divide it, and the kernel then refuses: "chunk 768 is not a multiple of
@@ -219,7 +229,8 @@ export function createTransitionShader(shape, offsets, epsilon, variance) {
   const intermediate = channels * factor;
   const tile = shape.tile ?? transitionRowTile(rows, channels);
   const WORKGROUP = shape.width
-    ?? transitionWidth(rows, tile, shape.threadTarget);
+    ?? transitionWidth(rows, tile, shape.threadTarget, undefined, undefined,
+                       shape.maxWorkgroup ?? Infinity);
   // 🔴 A POWER OF TWO OR NOTHING - see transitionWidth. 768 compiles, runs, and
   // returns relRMS 0.55.
   if ((WORKGROUP & (WORKGROUP - 1)) !== 0) {
