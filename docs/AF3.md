@@ -3062,11 +3062,25 @@ protein**, is the test: single-sequence fails outright and the template has to
 carry the fold. `fold-opendde.js --target=5caj --chain=A --steps=16
 --template=/tools/fixtures/5caj-crystal.pdb:A`, no MSA:
 
-| model | no MSA, no template | + self-template |
+**All five, matched settings** - 16 flow steps, `--recycles=3`, no MSA:
+
+| model | no template | + self-template |
 |---|---:|---:|
-| alphafold3 | 16.792 A / TM 0.258 | **0.288 / 0.998** |
-| protenix2 | 19.212 / TM 0.184 | **0.216 / 0.999** |
-| boltz2 | 18.165 / TM 0.199 | **1.411 / 0.971**, and **0.470 / 0.994** at `--recycles=3` |
+| alphafold3 | 16.523 A / TM 0.258 | **0.258 / 0.998** |
+| openbind0 | 29.606 / TM 0.079 | **0.224 / 0.999** |
+| boltz2 | 17.461 / TM 0.239 | **0.470 / 0.994** |
+| protenix2 | 19.192 / TM 0.198 | **0.164 / 0.999** |
+| opendde | 20.496 / TM 0.156 | **0.317 / 0.997** |
+
+**Every model now takes a template and every one of them lands on the crystal**,
+from folds that are not folds at all (TM 0.08-0.26). Two of the five could not
+take one at the start of this session and a third was silently corrupt.
+
+🔴 **AND openbind0's "TEMPLATES BARELY HELP" WAS THE TARGET, NOT A DEFECT.** On
+6MRR it reads 1.743 -> 1.579 and looked like the weak one of the three that ran;
+on 5CAJ it is 29.606 -> 0.224, the largest rescue of the five. A 68-residue
+designed protein cannot distinguish a working template embedder from a broken
+one, and it was about to be written up as a suspect.
 
 **That is what a working template looks like** - a fold that is not a fold at
 all (TM 0.18-0.26) becoming the crystal. And it is the gate 6MRR could not be:
