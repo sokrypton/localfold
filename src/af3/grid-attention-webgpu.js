@@ -471,9 +471,19 @@ ${vectorHeads ? `  ${Array.from({ length: heads / 4 }, (_, h) =>
   const ROWS = projectRows;
   const overRows = (body) => Array.from({ length: ROWS }, (_, r) => body(r)).join("\n");
   const projectLanes = packQkvg ? width / 2 : width;
+  // 🔴 THE LOGICAL LANE COUNT AND THE WORKGROUP SIZE ARE NOT THE SAME NUMBER.
+  // `LANES` is a LAYOUT stride - the packed word index is `row * LANES + lane` -
+  // and it was also the workgroup size, so the workgroup was as wide as the
+  // attention. OpenDDE's is 12 heads of 32 and WebGPU guarantees 256
+  // invocations, so its pipeline could not be created on a conforming minimum
+  // device. The layout keeps LANES; the workgroup takes WG and every
+  // lane-strided loop strides by it. At 256 or below the two are equal and this
+  // is the kernel it was.
+  const projectWorkgroup = Math.min(projectLanes, 256);
   const project = `${common}
 const ROWS: u32 = ${ROWS}u;
 const LANES: u32 = ${projectLanes}u;
+const WG: u32 = ${projectWorkgroup}u;
 @group(0) @binding(0) var<storage, read> normalized: array<${storageArray(normalizedStorage)}>;
 // 🔴 THE ONLY KERNEL HERE THAT READS THE WEIGHTS AS vec4, and it can because it
 // reads nothing but the interleaved q/k/v/gate block. The other three passes
@@ -503,7 +513,7 @@ const LANES: u32 = ${projectLanes}u;
 // channel does. Do not transpose the activation tile.
 var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
 
-@compute @workgroup_size(${projectLanes})
+@compute @workgroup_size(${projectWorkgroup})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(local_invocation_id) local_id: vec3<u32>) {
   let tile = group.x + group.y * GRID_WIDTH;
@@ -517,7 +527,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     // and a thread that reads uninitialised workgroup memory for the last tile
     // would write NaN into q, k, v and the gate for real rows in the same tile.
     let source = select(0u, ${sourceRow.replace("row", "row")}, row < PAIRS);
-    for (var c = local; c < CHANNELS; c += LANES) {
+    for (var c = local; c < CHANNELS; c += WG) {
       act[r * CHANNELS + c] = select(
         0.0, ${storedElement(normalizedStorage, "normalized", "source * CHANNELS + c")}, row < PAIRS);
     }
@@ -525,7 +535,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   workgroupBarrier();
 
 ${packQkvg ? `  // Two accumulators a row: this lane's pair of adjacent channels.
-  let c0 = local * 2u;
+  // One iteration where WG == LANES, which is every width up to 512 packed.
+  for (var lane = local; lane < LANES; lane += WG) {
+  let c0 = lane * 2u;
 ${overRows((r) => `  var lo${r} = vec4<f32>(0.0);
   var hi${r} = vec4<f32>(0.0);`)}
 
@@ -547,26 +559,30 @@ ${overRows((r) => {
     // A packed pair shares one word and this lane owns both halves of it; an
     // unpacked one is the same two values written where they always were,
     // since word * 2 is the channel c0 this lane owns.
-    let word${r} = (first + ${r}u) * LANES + local;
+    let word${r} = (first + ${r}u) * LANES + lane;
 ${[["q", "x"], ["k", "y"], ["v", "z"], ["gate", "w"]].map(emit).join("\n")}
   }`;
-  })}` : `  // One accumulator a row, holding (q, k, v, gate).
+  })}
+  }` : `  // One accumulator a row, holding (q, k, v, gate).
+  // One iteration where WG == WIDTH, which is every model but OpenDDE.
+  for (var out = local; out < WIDTH; out += WG) {
 ${overRows((r) => `  var acc${r} = vec4<f32>(0.0);`)}
 
   for (var c = 0u; c < CHANNELS; c += 1u) {
     // (channels, out, 4) - see packGridAttentionWeights - so consecutive
     // threads read consecutive vec4s, and this one load is used ROWS times.
-    let w = weights[W_QKVG + c * WIDTH + local];
+    let w = weights[W_QKVG + c * WIDTH + out];
 ${overRows((r) => `    acc${r} += act[${r}u * CHANNELS + c] * w;`)}
   }
 
 ${overRows((r) => `  if (first + ${r}u < PAIRS) {
-    let index${r} = (first + ${r}u) * WIDTH + local;
+    let index${r} = (first + ${r}u) * WIDTH + out;
     q[index${r}] = acc${r}.x;
     k[index${r}] = acc${r}.y;
     v[index${r}] = acc${r}.z;
     gate[index${r}] = acc${r}.w;
-  }`)}`}
+  }`)}
+  }`}
 }`;
 
   // 🔴 AF2'S ATTENTION KERNEL, REWRITTEN AGAINST AF3'S OWN BINDINGS. AlphaFold

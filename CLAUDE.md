@@ -277,23 +277,28 @@ fixtures passed, because the fixture is **cZ 7 and every shipped width is even**
 | ...and a MODIFIED residue? | `tools/fold-in-page.py --model af3 --modify SEP@3` |
 | **Does the archive describe the job it wrote?** | `tools/fold-in-page.py --job-round-trip` (folds, WIPES the rows, drops the zip back) |
 | Which of AlphaFold 3's own example jobs load here? | `node --test test/af3-example-jobs.test.js` (8 of 14; the other 6 name their field) |
-| 🔴 **Would a device at WebGPU'S GUARANTEED MINIMUM refuse a kernel?** | `node tools/check-portable-limits.mjs --spec-floor` - and **FOUR OF SIX MODELS DO NOT FOLD**. AlphaFold 3, boltz2 and protenix2 ask for `workgroup_size(512)` and OpenDDE for 384; the standard promises **256** invocations and a 256 X extent. `PORTABLE_CEILINGS` caps at 1024, which is what an A100 and an M2 report - **it is the weakest machine anyone here has MEASURED, not the weakest a conforming browser may be**, so `npm run test:portable` passes all six and cannot see this. 🔴 **AND FIVE OF THE SIX FOLD THERE NOW, AT NO COST ANYWHERE ELSE.** Three
-blockers, all of them a performance choice that never asked what the device
-would run: `transitionWidth` picked 512 lanes over 256 on a speed knob;
+| 🔴 **Would a device at WebGPU'S GUARANTEED MINIMUM refuse a kernel?** | `node tools/check-portable-limits.mjs --spec-floor` - and **FOUR OF SIX MODELS DO NOT FOLD**. AlphaFold 3, boltz2 and protenix2 ask for `workgroup_size(512)` and OpenDDE for 384; the standard promises **256** invocations and a 256 X extent. `PORTABLE_CEILINGS` caps at 1024, which is what an A100 and an M2 report - **it is the weakest machine anyone here has MEASURED, not the weakest a conforming browser may be**, so `npm run test:portable` passes all six and cannot see this. 🔴 **AND ALL SIX FOLD THERE NOW, AT NO COST ANYWHERE ELSE.** Four blockers,
+every one a performance choice that never asked what the device would run:
+`transitionWidth` picked 512 lanes over 256 on a speed knob;
 `splitTransitionConfig` and `projectMatrixConfig` chose matrix geometries
 without pricing the workgroup STORAGE their shaders stage, where
 `resolveGridAttendMatrix` beside them already resolved to false rather than
-throwing; and the grid PROJECTION staged one gated element per lane, so its
-workgroup was as wide as the attention. All four now clamp to the device, the
-raises stay for a caller that names a geometry by hand, and on every real part
-(A100 and M2 both report 1024 and 32 KiB) nothing moves: `test:portable` and
-`test:stock` pass all six, 6MRR is 0.72 / 0.507 / 0.715 / 1.545, `npm test`
-1053/0. At the floor the answers are the same too - AF3 83.131 against 83.128,
-boltz2 96.4579 against 96.4592. **The one left is OpenDDE's q/k/v/gate
-projection**, whose lanes map to output positions (`c0 = local * 2u`) rather than
-striding, so narrowing it is a restructure of a hot kernel and not a clamp.
-AF2's checksum MOVES at the floor (-1294937 against -1287025) because 16 KiB of
-workgroup storage picks a different tile |
+throwing; and TWO kernels sized their workgroup by the attention's WIDTH - the
+grid projection staged one gated element per lane, and the q/k/v/gate projection
+used `LANES` as both the workgroup size and a LAYOUT stride, which is why it
+looked unclampable. Separating those two meanings was the whole fix: `LANES`
+keeps the layout, `WG` is the workgroup, every lane-strided loop strides by WG,
+and at 256 or below they are equal and it is the kernel it was.
+
+Nothing moves anywhere it has been measured - both projections are BIT-IDENTICAL
+(OpenDDE's block 0.013922382574382865 before and after, AF3's
+0.03350964165137652, boltz2's 0.009853641554639692), `test:portable` and
+`test:stock` pass all six, 6MRR is 0.72 / 0.507 / 0.715 / 1.545, OpenDDE's trunk
+oracle is 7.65e-4 and its 5CAJ self-template 0.279 A, `npm test` 1053/0. At the
+floor the answers agree too: AF3 83.131 against 83.128, OpenDDE 92.1193 against
+92.1202, boltz2 96.4579 against 96.4592. AF2's checksum MOVES there
+(-1294937 against -1287025) because 16 KiB of workgroup storage picks a
+different tile |
 | **Would a WEAKER DEVICE refuse a kernel?** | `npm run test:portable` (`tools/check-portable-limits.mjs`) - it caps this device at `PORTABLE_CEILINGS` and folds all six models. 🔴 **A RAISED LIMIT IS A PREDICTION ABOUT THE NEXT MACHINE**, and one of them is wrong on Apple silicon: `maxComputeWorkgroupStorageSize` is 49152 here and **32768 on Metal**, so a kernel taking a 40 KiB tile compiles here and fails to create its pipeline there, with an error naming a shader rather than a limit. It cannot simulate a LARGER limit, so the M2's 4 GiB binding size is out of reach |
 | **Does every model fold on the browser a VISITOR has?** | `npm run test:stock` (`tools/check-stock-flags.mjs`) - the four folds with `LOCALFOLD_STOCK_FLAGS=1`, which drops the two developer flags every other gate here passes. 🔴 **TWO OF THE FOUR DID NOT FOLD THAT WAY** and nothing could see it, because the configuration every gate checks is not the one the site ships. It asserts a SIGNATURE - a checksum, an atom checksum or a pLDDT - rather than an absence of errors, since an uncaptured device error leaves the harness reporting success. Needs `DISPLAY=:99 XDG_RUNTIME_DIR=/tmp/xdg` like every GPU lane, and says so when they are missing instead of blaming the models |
 | **Does the port fold at all?** | `node tools/fold-esmfold2.js` (6.5 min, writes a PDB) |
