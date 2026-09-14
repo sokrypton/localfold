@@ -3053,6 +3053,49 @@ the MSA plainly works (pLDDT 87.3 with none against 94.9 with 128 rows) and the
 stopped pair was also unchanged. **A number that agrees with a prediction to
 three digits is still worth one control.**
 
+### 🔴 THE WHOLE TRUNK, ALL FIVE FAMILIES, ON EACH ONE'S OWN REFERENCE BATCH
+
+The sweep that answers "what else is not exact". `fold.js --dump= --trunk-oracle=`
+(and `fold-opendde.js` for OpenDDE), f32 bundles, 6MRR, one pass, so the
+featuriser and the conformers are out of the comparison and what is left is the
+graph:
+
+| family | `target_feat` | `z_init` | `z_after_template` | `z_after_msa` | `pair` |
+|---|---:|---:|---:|---:|---:|
+| alphafold3 | 5.76e-8 | **2.20e-4** | 1.17e-4 | 1.16e-4 | 2.96e-4 |
+| openbind0 | 4.93e-8 | 3.65e-8 | 4.07e-6 | 6.08e-5 | 4.27e-4 |
+| boltz2 | 9.71e-8 | 5.05e-8 | 5.05e-8 | 4.55e-5 | 3.49e-4 |
+| protenix2 | 2.37e-8 | 1.89e-8 | **3.89e-3** | 3.42e-3 | 3.98e-3 |
+| opendde | 3.14e-8 | 4.70e-8 | 3.80e-6 | **6.01e-2** | 7.10e-2 |
+
+**Every atom encoder is exact** - `target_feat` is 1e-8 for all five, which is
+the one row of this table with no exception in it.
+
+**Three things are not.** In order of size:
+
+1. **OpenDDE's outer product mean, 6.01e-2.** Bisected to that one module above;
+   the MSA embedding and the MSA update either side of it are exact.
+2. **protenix2's template stage, 3.89e-3** - measured here for the FIRST time,
+   because protenix2 had no trunk dump until now. Its `target_feat`, `z_init`
+   and `trunk_in_single` are 1e-8, and the template seam is three orders worse
+   than boltz2's or openbind0's; everything after it (msa 3.42e-3, pair
+   3.98e-3) is that error carried forward and nothing new. protenix2 runs the
+   FUSED embedder and already has the gap convention as
+   `emptyTemplateRestypeColumns`, so this is NOT the defect OpenDDE had - it is
+   its own, and `check-af3-template-fused.js` is the gate that should localise
+   it. Open.
+3. **AlphaFold 3's own `z_init_generic`, 2.20e-4** - four orders worse than
+   every other family's, on the model this port was written against first. The
+   template stage HALVES the relative error (1.17e-4) because it roughly doubles
+   the pair's magnitude while adding an exact term, which says the error is
+   entirely in the z init and nothing downstream adds to it. Small, and the only
+   entry in this table that stock AlphaFold 3 owns. Open.
+
+`z_after_template` is 5.05e-8 for boltz2 because its whole empty-template term
+is ZERO under `templateVisibilityByCoverage` - the seam equals `z_init`, so that
+cell is not evidence its template embedder is right, only that it is inert with
+no template supplied.
+
 ### 🔴 AND THE CONFORMERS ARE NOT CENTRED, WHICH IS FIVE OF THE SIX FAMILIES
 
 Found while chasing the above. `CENTRE_REF_CONFORMERS` in af3-any-model is
