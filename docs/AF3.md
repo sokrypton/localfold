@@ -4635,9 +4635,69 @@ AlphaFold 3 Server job, carrying its predicted mmCIF, its MSAs and its templates
 **So there is a defect in AlphaFold 3's side-chain geometry in this port**, worth
 about 0.23 A of bond error on every side chain, invisible to every gate here:
 RMSD is dominated by the backbone, `chain-geometry.js` steps over side chains by
-design, and pLDDT reads 83 to 87 straight through it. Not fixed here. The atom
-decoder and `atomReference`'s per-atom offsets are where to start, and
-rosettafold3's path is the working comparison beside it.
+design, and pLDDT reads 83 to 87 straight through it.
+
+### 🔴 LOCALISED TO THE DENOISER BELOW sigma 1, AND NOT FIXED
+
+**The shape of it.** Side-chain atoms are contracted toward CA, progressively
+with distance, while the mainchain is untouched. One ARG, |CA-x| as a fraction
+of the ideal conformer's:
+
+| | N | C | O | CB | CG | CD | NE | CZ | NH1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **alphafold3** | 0.99 | 0.99 | 0.99 | **0.80** | **0.64** | **0.64** | 0.70 | **0.60** | **0.48** |
+| rosettafold3 | 0.97 | 1.01 | 0.99 | 1.03 | 1.02 | 1.02 | 0.93 | 0.94 | 0.89 |
+
+**Where in the trajectory.** Scoring BOTH of the sampler's coordinate sets at
+every step - the sample and the denoised prediction - the two models diverge in
+the last few steps and nowhere else:
+
+| sigma | af3 denoised side | rf3 denoised side |
+|---:|---:|---:|
+| 2014 | 0.703 | 0.396 |
+| 68.4 | 0.588 | 0.419 |
+| 11.4 | 0.517 | 0.400 |
+| 1.017 | 0.479 | 0.351 |
+| **0.025** | **0.345** | **0.067** |
+
+Both are blurry at high noise, which is what a denoiser's expectation IS at high
+noise. **rosettafold3 resolves its side chains between sigma 1 and sigma 0.025
+and AlphaFold 3 does not.** Mainchain resolves in both (af3 0.513 -> 0.074).
+
+**Seven things it is NOT, each with a measurement rather than an argument:**
+
+| candidate | measurement |
+|---|---|
+| the sampler loop | returns `positions`, the SAMPLE, not the denoised expectation - and rosettafold3 runs the identical loop |
+| undersampling | 0.344 / 0.372 / 0.428 at 25 / 100 / 200 steps |
+| a poor fold for want of an alignment | the server's own 1805-row MSA, pLDDT **86.56**, side chains still **0.279** |
+| the bundle's quantisation | float32 **0.335** against int5's 0.345 |
+| the EDM preconditioning | standard, `sigmaData` 16, one code path for every model |
+| `keyMaskedAtomAttention` | flipped to true: 0.345, unchanged - inert at this window size, as its own comment says |
+| `refPos` | byte-identical between alphafold3 and rosettafold3, so it cannot explain a difference between them |
+
+🔴 **AND FOUR DIALECT FLAGS COULD NOT BE TESTED BY FLIPPING**, which is worth
+knowing before someone tries: `perBlockPairLayerNorm`,
+`perBlockAtomPairLayerNorm`, `diffusionNoResidual` and `chainedAtomLayerNorm`
+select a different WEIGHT LAYOUT, so flipping one on a bundle exported without
+those tensors throws rather than folding. Testing them means an export, not a
+flag.
+
+🔴 **AND THE EXISTING ORACLE CANNOT SEE IT, WHICH IS WHY NOTHING CAUGHT IT.**
+`check-af3-denoise.js` holds AlphaFold 3's denoise step to af3-any-model at
+**1.55e-5** - and that dump is at **sigma 16**, exactly where both models are
+blurry and indistinguishable. Nothing in this repository compares the denoiser
+below sigma 1, which is the only place side chains are decided.
+
+**What would settle it**, and it needs the reference environment which is not on
+this box: a denoise dump at low sigma. `dump_af3_denoise.py` already takes
+`NOISE` from the environment - but it builds its input as `rng.normal(...) *
+NOISE`, PURE noise scaled, so at `NOISE=0.5` it hands the model a 0.5 A random
+cloud rather than a nearly-correct structure with a little noise on it. At that
+input the skip weight is ~1 and the model correctly returns the cloud, which
+says nothing. **The dumper needs its noisy input built as `structure + NOISE *
+randn` for the low-sigma arm to mean anything** - one line, in an environment
+this box does not have.
 
 ## rosettafold3 has no flow sampler, and the page defaulted to one
 
