@@ -28,12 +28,90 @@ import { describe, expect, it } from "./harness.js";
  * and are full of `f32(` and `min(`.
  */
 function stripCommentsAndStrings(source) {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ")
-    .replace(/`(?:\\.|[^`\\])*`/g, " ")
-    .replace(/'(?:\\.|[^'\\\n])*'/g, " ")
-    .replace(/"(?:\\.|[^"\\\n])*"/g, " ");
+  // 🔴 A SCANNER, NOT FIVE REGEXES, BECAUSE A NESTED TEMPLATE LITERAL HID A
+  // LIVE BUG. The regex version paired backticks strictly in order, so one
+  // template inside another - `${ok ? `a` : `b`}` - put the rest of the file
+  // out of step: stretches of real CODE read as string content and were blanked.
+  // web/app.js had such a template at line 3172, and at line 3418 it called
+  // `chainGeometryVerdict` without importing it. The regex stripper removed the
+  // call, this check passed, and every AlphaFold 2 fold on the live page ended in
+  // "chainGeometryVerdict is not defined". It hid real calls in
+  // src/af3/trunk/trunk-webgpu.js too.
+  //
+  // What this keeps that the regexes did not: CODE INSIDE `${...}`. A template's
+  // literal text is prose or WGSL and is blanked; its expressions are JavaScript
+  // and can call an unimported name like any other line.
+  const chars = source.split("");
+  const n = source.length;
+  const blank = (from, to) => {
+    for (let k = from; k < Math.min(to, n); k += 1) if (chars[k] !== "\n") chars[k] = " ";
+  };
+  const templates = []; // one brace depth per open `${`
+  let i = 0;
+  // A `/` starts a regex literal after an operator, an opening bracket or a
+  // keyword, and is division after a value. Getting it wrong either way lets a
+  // quote or backtick inside a regex open a phantom string.
+  const regexCanStart = () => {
+    let j = i - 1;
+    while (j >= 0 && (chars[j] === " " || chars[j] === "\t" || chars[j] === "\n" || chars[j] === "\r")) j -= 1;
+    if (j < 0) return true;
+    if ("(,=:[!&|?{};+-*%<>~^".includes(source[j])) return true;
+    const word = source.slice(Math.max(0, j - 10), j + 1).match(/[A-Za-z_$]+$/)?.[0];
+    return ["return", "typeof", "case", "in", "of", "void", "delete", "throw"].includes(word);
+  };
+  // Scan a template's literal text from `i`, blanking from `start`, up to its
+  // closing backtick or its next `${`.
+  const readTemplate = (start) => {
+    while (i < n) {
+      if (source[i] === "\\") { i += 2; continue; }
+      if (source[i] === "`") { blank(start, i + 1); i += 1; return; }
+      if (source[i] === "$" && source[i + 1] === "{") { blank(start, i); i += 2; templates.push(0); return; }
+      i += 1;
+    }
+    blank(start, n);
+  };
+  while (i < n) {
+    const c = source[i];
+    const d = source[i + 1];
+    if (c === "/" && d === "/") {
+      const newline = source.indexOf("\n", i);
+      const stop = newline === -1 ? n : newline;
+      blank(i, stop); i = stop; continue;
+    }
+    if (c === "/" && d === "*") {
+      const close = source.indexOf("*/", i + 2);
+      const stop = close === -1 ? n : close + 2;
+      blank(i, stop); i = stop; continue;
+    }
+    if (c === "'" || c === "\"") {
+      const begin = i; i += 1;
+      while (i < n && source[i] !== c && source[i] !== "\n") i += source[i] === "\\" ? 2 : 1;
+      blank(begin, i + 1); i += 1; continue;
+    }
+    if (c === "`") { const begin = i; i += 1; readTemplate(begin); continue; }
+    if (c === "/" && regexCanStart()) {
+      const begin = i; i += 1;
+      let inClass = false;
+      while (i < n && source[i] !== "\n") {
+        const ch = source[i];
+        if (ch === "\\") { i += 2; continue; }
+        if (ch === "[") inClass = true;
+        else if (ch === "]") inClass = false;
+        else if (ch === "/" && !inClass) break;
+        i += 1;
+      }
+      blank(begin, i + 1); i += 1; continue;
+    }
+    if (templates.length > 0) {
+      if (c === "{") templates[templates.length - 1] += 1;
+      else if (c === "}") {
+        if (templates[templates.length - 1] === 0) { templates.pop(); i += 1; readTemplate(i); continue; }
+        templates[templates.length - 1] -= 1;
+      }
+    }
+    i += 1;
+  }
+  return chars.join("");
 }
 
 /**
@@ -92,6 +170,40 @@ function visibleNames(source) {
   }
   return names;
 }
+
+describe("the comment and string stripper", () => {
+  const calls = (source, name) =>
+    new RegExp(`(^|[^.\\w$])${name}\\s*\\(`, "m").test(stripCommentsAndStrings(source));
+
+  // 🔴 THE SHAPE OF THE BUG THAT SHIPPED: a nested template, then a call.
+  it("still sees a call after a template literal nested inside another", () => {
+    const source = [
+      "const label = `outer ${ready ? `inner` : \"x\"} tail`;",
+      "const chain = chainGeometryVerdict(result.geometry);",
+    ].join("\n");
+    expect(calls(source, "chainGeometryVerdict")).toBe(true);
+  });
+
+  it("keeps code inside ${...} and blanks the template's prose", () => {
+    const source = "const text = `see describeThing( in prose ${formatValue(1)} and more`;";
+    expect(calls(source, "formatValue")).toBe(true);
+    expect(calls(source, "describeThing")).toBe(false);
+  });
+
+  it("blanks comments, strings and regex literals that look like calls", () => {
+    const source = [
+      "// commentCall(1)",
+      "/* blockCall(2) */",
+      "const a = 'quotedCall(3)';",
+      "const b = /regexCall\\(4\\)'`/;",
+      "realCall(5);",
+    ].join("\n");
+    for (const name of ["commentCall", "blockCall", "quotedCall", "regexCall"]) {
+      expect(calls(source, name)).toBe(false);
+    }
+    expect(calls(source, "realCall")).toBe(true);
+  });
+});
 
 describe("module references", () => {
   it("calls no exported name the file cannot see", () => {
