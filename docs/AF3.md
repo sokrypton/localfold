@@ -4598,12 +4598,46 @@ steps is 0.344, 0.372 and 0.428, flat to slightly WORSE - so more sampling does
 not converge it. Mainchain is fine in both (1.9x and 2.2x the crystal); it is
 specifically the side chains, and specifically AlphaFold 3.
 
-**What this does NOT establish**: whether af3-any-model's own AlphaFold 3 does
-the same. If the reference also puts side chains 0.34 A out then this is the
-checkpoint and there is nothing to fix; if it does not, this is a port defect in
-the atom decoder that every gate here has been blind to, because RMSD is
-dominated by the backbone and pLDDT reads 83 through it.
-`check-af3-denoise.js --stages=on` is where that question gets answered.
+### 🔴 CHECKED AGAINST THE ORACLE: IT IS THIS PORT, NOT THE CHECKPOINT
+
+`tools/check-oracle-bonds.js`. The reference's own prediction:
+
+| | mainchain | sidechain | peptide |
+|---|---:|---:|---:|
+| **AlphaFold 3 Server** | **0.035** | **0.044** | 0.009 |
+| deposited crystals | 0.033 | 0.046 | 0.005 |
+| our rosettafold3 | 0.062 | 0.067 | 0.066 |
+| **our alphafold3** | 0.074 | **0.344** | 0.093 |
+| ...same sequence, its own MSA | 0.055 | **0.279** | 0.076 |
+
+AlphaFold 3's real output is **indistinguishable from a crystal** - 0.044 against
+0.046 - and its worst bond is the same carboxylate C-O the crystals show, which
+is the reference conformer averaging both resonance forms rather than anything
+wrong. **Ours is 7.8x that.**
+
+🔴 **AND EVERY CONFOUND WAS CLOSED, ONE RUN EACH.** Different protein? Folded the
+server's own 146-residue chain A: 0.276. Ours had no alignment where the server
+had one, so a bad fold might explain sloppy side chains? Folded it again with the
+server's OWN 1805-row MSA out of the archive - **pLDDT 86.56, a confident fold,
+and side chains still 0.279**. Not undersampling: 0.344 / 0.372 / 0.428 at 25 /
+100 / 200 steps. And **rosettafold3 reads 0.067 through the same atom decoder**,
+so the port is capable of near-ideal geometry and this is specific to AlphaFold 3.
+
+🔴 **AND THE OBVIOUS INSTRUMENT CANNOT ANSWER IT, WHICH IS WORTH RECORDING.**
+`oracle-dumps/af3-oracle-denoise-<model>.json` carries the reference's own
+`output`, so scoring that looks like the direct test. It is one step from **sigma
+16 A**: the output's N-CA is 15.2 A against the noisy input's 19.9, because the
+denoiser's estimate at that noise is a blur and not a structure. Scored anyway it
+gives every model 8-22 A "bond errors" and would have read as the reference being
+broken too. What answers it is `tools/fixtures/fold_2026_09_01_10_17.zip` - a real
+AlphaFold 3 Server job, carrying its predicted mmCIF, its MSAs and its templates.
+
+**So there is a defect in AlphaFold 3's side-chain geometry in this port**, worth
+about 0.23 A of bond error on every side chain, invisible to every gate here:
+RMSD is dominated by the backbone, `chain-geometry.js` steps over side chains by
+design, and pLDDT reads 83 to 87 straight through it. Not fixed here. The atom
+decoder and `atomReference`'s per-atom offsets are where to start, and
+rosettafold3's path is the working comparison beside it.
 
 ## rosettafold3 has no flow sampler, and the page defaulted to one
 
