@@ -4621,6 +4621,47 @@ is identical to AF3's - measured below) or the step count.
 collapses from 3.07 to 2.12. Three separate step counts, three wrecks, one
 confident number.
 
+🔴 **RE-MEASURED 2026-09-15, AND THE RADIUS OF GYRATION SAYS IT BETTER THAN THE
+CA MEDIAN DOES.** The fixed point is not merely "tight", it is a POINT:
+
+| steps | CA-CA | worst | N-CA | **Rg** | pLDDT |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 4.54 | 79.74 | 6.30 | **19.0** | 81.54 |
+| 60 | 3.19 | 10.31 | 6.76 | **7.7** | 81.47 |
+| 200 | 2.10 | 0.67 | 10.87 | **2.2** | 81.37 |
+| *diffusion, 16* | *3.82* | *3.72* | *1.42* | ***11.2*** | *81.53* |
+
+68 residues inside a radius of **2.2 A** at 200 steps. The CA median at 200
+reproduces the row above it to three digits - 2.10 against 2.122, pLDDT 81.37
+against 81.38 - so the FIXED POINT is stable across everything that has landed
+since. What moved is the early trajectory: at 16 steps it now EXPANDS first
+(Rg 19.0, worst CA-CA 79.7) where it used to already be collapsing (worst 0.23).
+It passes through a disordered state on its way to the point.
+
+🔴 **AND IT IS NOT A BAD FIRST DRAW, WHICH HAD TO BE CHECKED** because this
+session retracted a structurally identical "flow returns no chain" claim that
+turned out to be one measurement on a dirty tree, and because `db4b74f` found
+flow's risk elsewhere IS the first draw. Four seeds, 16 steps, 6MRR:
+
+| seed | flow N-CA / CA-C / CA-CA / Rg | diffusion |
+|---|---|---|
+| 1 | 5.94 / 3.19 / 4.59 / 16.0 | 1.42 / 1.53 / 3.80 / 11.1 |
+| 7 | 6.22 / 3.02 / 3.70 / 13.7 | 1.42 / 1.51 / 3.81 / 11.2 |
+| 21 | 5.86 / 3.01 / 4.31 / 19.4 | 1.42 / 1.51 / 3.80 / 11.1 |
+| 20260831 | 6.30 / 2.89 / 4.54 / 19.0 | 1.42 / 1.53 / 3.82 / 11.2 |
+
+Four of four broken under flow, four of four clean under diffusion, and pLDDT
+**81.51 to 81.56 in BOTH COLUMNS** - a range of 0.05 across folds that are a
+chain and folds that are not. Deterministic, so there is no seed to find.
+
+🔴 **AND THE SIGNATURE IS INTRA-RESIDUE, WHICH IS A LEAD NOBODY HAS FOLLOWED.**
+N-CA is 4.2x its ideal and CA-C 2.0x, while CA-CA is only 1.2x - the alpha
+carbons are roughly where they should be and the backbone N and C around them
+are not. A uniform output-scale error would move all three by one factor. This
+one does not, so "the SCALE of the denoiser's output" above is too coarse: it
+points at the per-atom offsets the ATOM DECODER adds to a token position rather
+than at the token walk. Untested.
+
 What is settled is the shipping question: the failure is loud (`foldBatch`
 throws), the page cannot ask for it, and the diffusion path is measured good.
 
