@@ -4654,7 +4654,55 @@ Four of four broken under flow, four of four clean under diffusion, and pLDDT
 **81.51 to 81.56 in BOTH COLUMNS** - a range of 0.05 across folds that are a
 chain and folds that are not. Deterministic, so there is no seed to find.
 
-🔴 **AND THE SIGNATURE IS INTRA-RESIDUE, WHICH IS A LEAD NOBODY HAS FOLLOWED.**
+### 🔴 HYPOTHESIS 3, AND IT IS THE RIGHT ONE: THE START IS TEN TIMES TOO HIGH
+
+Suggested as "maybe flow needs calibrating, the way sigma0 was calibrated for
+AF3" - and that is exactly what it was. `probe-sigma0.js --model=` sweeps the
+flow's starting sigma against the CRYSTAL, which is the instrument that settled
+160 for AlphaFold 3. Pointed at rosettafold3, flow 8, four seeds, 6MRR:
+
+| sigma0 | mean RMSD | range | TM | CA-CA |
+|---:|---:|---|---:|---:|
+| 2560 | 9.443 | [5.67-17.69] | 0.249 | 4.31 |
+| 640 | 9.376 | [5.60-13.82] | 0.248 | 4.44 |
+| **160, the shipped value** | **5.813** | [4.69-7.48] | 0.323 | 4.27 |
+| 40 | 3.482 | [3.23-3.77] | 0.516 | 4.75 |
+| **16** | **1.783** | **[1.31-2.12]** | **0.829** | **3.57** |
+| 8 | 3.872 | [1.79-6.91] | 0.582 | 3.56 |
+| 4 | 8.807 | [7.43-9.32] | 0.159 | 2.71 |
+
+against DIFFUSION's 1.693 A and TM 0.9071. A clean unimodal curve with a sharp
+optimum an order of magnitude below the default. **rosettafold3's flow walk is
+not broken; it was being started ten times too high.**
+
+And through the real fold path at sigma0 = 16, flow 8, it is a CHAIN - the
+geometry gate passes, which it never does at 160:
+
+| | N-CA | CA-C | CA-CA | worst | Rg |
+|---|---:|---:|---:|---:|---:|
+| seed 1 | 1.35 | 1.42 | 3.65 | 1.30 | 11.5 |
+| seed 20260831 | 1.31 | 1.47 | 3.70 | 1.42 | 11.9 |
+| *ideal / diffusion* | *1.46* | *1.52* | *3.80* | - | *11.2* |
+
+🔴 **BUT THE CALIBRATION IS TWO-DIMENSIONAL, AND THAT IS THE CATCH.** The SAME
+sigma0 at SIXTEEN steps is refused - CA median 5.097 and 5.008 - because the
+descent keeps walking after it has arrived, which is the contraction above seen
+from the other side. So it is not "rf3 wants sigma0 16"; it is "rf3 wants
+sigma0 16 AT eight steps", and the page's flow preset is sixteen cycles.
+
+🔴 **AND 16 CANNOT BE THE GLOBAL DEFAULT**, which is why this is a dialect field
+and not a constant change: the note in diffusion-sampler-webgpu.js records that
+sigma0 = 16 COLLAPSES AlphaFold 3's protein, and probe-ligand-flow.js chose 160
+as the value safe for protein and ligand together. Two checkpoints, two optima.
+
+**What it would take to ship**: a per-dialect `flowSigmaMax` (rosettafold3 1,
+everyone else 10), a per-model flow step count, `noFlowSampler` becoming
+conditional rather than absolute, and gates for both. **What it buys**: a
+working fast sampler for rosettafold3 at 1.783 A against diffusion's 1.693 and
+TM 0.829 against 0.907 - a real option, and still the worse one. Not taken here;
+the numbers are recorded so the decision is a decision.
+
+🔴 **AND THE SIGNATURE IS INTRA-RESIDUE, WHICH WAS A LEAD AND IS NOW EXPLAINED.**
 N-CA is 4.2x its ideal and CA-C 2.0x, while CA-CA is only 1.2x - the alpha
 carbons are roughly where they should be and the backbone N and C around them
 are not. A uniform output-scale error would move all three by one factor. This
