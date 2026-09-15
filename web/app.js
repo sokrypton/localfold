@@ -43,6 +43,7 @@ import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunne
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
+import { chainGeometryOf, chainGeometryVerdict } from "../src/af3/chain-geometry.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
@@ -2405,6 +2406,15 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // computing it and every probe that judges a fold still prints it. But "3.81"
   // means nothing to somebody who wanted a structure, and a status line that
   // ends in a diagnostic reads as a diagnostic. It belongs to the tools.
+  //
+  // 🔴 BUT A BROKEN CHAIN IS SAID OUT LOUD, which the page claimed to do and did
+  // not: the check meant for this fold was written against `result.geometry`
+  // and placed in the AlphaFold 2 path, where no `result` exists, so no AF3-
+  // lineage fold was ever checked. The number stays with the tools; the WARNING
+  // appears only when `chainGeometryVerdict` refuses the fold - IntelliFold-2 in
+  // Flow returns one such fold in six at pLDDT 83.
+  const chain = chainGeometryVerdict(result.geometry ?? {}, { plddt: result.meanPlddt });
+  if (!chain.ok) detail.push("🔴 NOT A CHAIN - the backbone is broken, and pLDDT does not measure that");
   status(`${modelName} · ${what.join(" + ")} · ${detail.join(" · ")}`);
 }
 
@@ -3415,7 +3425,30 @@ async function fold(event) {
     // visitor who asked for a fast sampler is entitled to see what it made, and
     // hiding it would be worse than labelling it. What is not acceptable is
     // showing it as though the number were the whole story.
-    const chain = chainGeometryVerdict(result.geometry ?? {},
+    //
+    // 🔴 AND IT IS MEASURED HERE, FROM THIS FOLD'S OWN atom37. The first version
+    // of this line read `result.geometry` - the AlphaFold 3 path's result, which
+    // does not exist in this function - and never imported the verdict, so every
+    // AlphaFold 2 fold on the page finished and then threw `ReferenceError`
+    // where its "Done" line belonged. AF2 has no `backboneGeometry`; the spacing
+    // below is tools/gpu/fold-af2.js's, which has gated every AF2 fold for
+    // months: consecutive alpha carbons (atom 1 of 37), skipping the join
+    // between two chains, where a complex's chains sit wherever they fold.
+    const atom37 = best.structure?.atom37;
+    const spacings = [];
+    if (atom37 !== undefined) {
+      const joins = new Set();
+      let boundary = 0;
+      for (const length of chainLengths.slice(0, -1)) { boundary += length; joins.add(boundary - 1); }
+      for (let residue = 0; residue + 1 < sequence.length; residue += 1) {
+        if (joins.has(residue)) continue;
+        const a = (residue * 37 + 1) * 3;
+        const b = ((residue + 1) * 37 + 1) * 3;
+        spacings.push(Math.hypot(
+          atom37[a] - atom37[b], atom37[a + 1] - atom37[b + 1], atom37[a + 2] - atom37[b + 2]));
+      }
+    }
+    const chain = chainGeometryVerdict(chainGeometryOf(spacings),
       { plddt: best.confidence.meanPlddt });
     const broken = chain.ok ? "" : " · 🔴 NOT A CHAIN - the backbone is broken,"
       + " and pLDDT does not measure that";
