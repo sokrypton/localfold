@@ -45,6 +45,7 @@
  * alignment is needed and none is done, which keeps this from quietly scoring a
  * shifted register as a good fit.
  */
+import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
 import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { atomName, foldBatch } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
@@ -173,6 +174,7 @@ export function rmsdAndTm(a, b) {
 export async function main(device, args) {
   const sigmas = option(args, "sigmas", "2560,160").split(",").map(Number);
   const steps = Number(option(args, "steps", "8"));
+  const mode = option(args, "mode", "flow");
   const seeds = option(args, "seeds", "1,2,3,4").split(",").map(Number);
   const only = option(args, "targets", "6MRR,1QYS").split(",");
 
@@ -183,21 +185,33 @@ export async function main(device, args) {
     targetFeat: await targetFeatureWeights(store),
   };
 
+  const dialect = weights.trunk?.dialect ?? dialectFor(weights);
   const rows = [];
   for (const name of only) {
     const response = await fetch(`https://files.rcsb.org/download/${name}.pdb`);
     if (!response.ok) throw new Error(`could not fetch ${name}: ${response.status}`);
     const { sequence, alphaCarbons: crystal } = crystalChain(await response.text());
-    const batch = featuriseProtein(sequence, {});
+    // 🔴 THE MODEL'S OWN CONVENTIONS, NOT AlphaFold 3's. This read
+    // `featuriseProtein(sequence, {})` while taking a `--model=`, which is the
+    // fault docs/AF3.md records for probe-nucleic.js one tool over: every
+    // number it produced for a non-AF3 checkpoint was that checkpoint's WEIGHTS
+    // fed AlphaFold 3's FEATURISATION. `dropTerminalAtoms` and `paddedAtomKeys`
+    // both reach a plain protein, so this was not inert.
+    const batch = featuriseProtein(sequence, { ...featuriserDialect(dialect) });
     for (const sigma0 of sigmas) {
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights, {
-          mode: "flow", steps, recycles: 0, seed,
+          // 🔴 `--mode=diffusion` IS THE CONTROL AND IT WAS NOT REACHABLE. A
+          // sigma0 column saying 17 A on every value can mean the walk fails or
+          // it can mean the TARGET needs a template - 5CAJ from sequence alone
+          // is 17-30 A for every model and every sampler - and without the
+          // control arm those two read identically.
+          mode, steps, recycles: 0, seed,
           schedule: { sigmaMax: sigma0 / SIGMA_DATA },
         });
         const scored = rmsdAndTm(predictedAlphaCarbons(batch, result.positions), crystal);
         rows.push({
-          target: name, sigma0, seed,
+          target: name, mode, sigma0, seed,
           rmsd: Number(scored.rmsd.toFixed(3)), tm: Number(scored.tm.toFixed(3)),
           residues: scored.residues,
           caca: Number(result.geometry.caca.toFixed(2)),

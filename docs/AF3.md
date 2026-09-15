@@ -4684,6 +4684,43 @@ geometry gate passes, which it never does at 160:
 | seed 20260831 | 1.31 | 1.47 | 3.70 | 1.42 | 11.9 |
 | *ideal / diffusion* | *1.46* | *1.52* | *3.80* | - | *11.2* |
 
+🔴 **AND IT HOLDS ON A SECOND TARGET, WHICH IS WHERE A ONE-TARGET OPTIMUM
+USUALLY DIES.** Four targets, four seeds, flow 8, with rf3's OWN featurisation
+(see below - the probe was using AlphaFold 3's), mean RMSD and TM:
+
+| sigma0 | 6MRR (68) | 1QYS (92) | 5CAJ (261) | 1BRS (108) |
+|---:|---|---|---|---|
+| 160 | 6.00 (0.328) | 8.20 (0.363) | 16.98 (0.173) | 12.85 (0.145) |
+| 40 | 3.48 (0.517) | 3.05 (0.622) | 18.03 (0.162) | 11.70 (0.168) |
+| **16** | **1.78 (0.829)** | **1.23 (0.897)** | 17.59 (0.159) | 12.18 (0.147) |
+| 8 | 3.88 (0.581) | 5.66 (0.503) | 17.94 (0.153) | 12.98 (0.124) |
+
+🔴 **AND THE 17 A COLUMNS ARE NOT FLOW FAILING - DIFFUSION IS THERE TOO.** That
+had to be checked, because a column flat at 17 A reads exactly like a walk that
+cannot fold and is in fact a target that needs a template: this file already
+records 5CAJ at 17-30 A from sequence alone for every model. The control, same
+targets, same seeds, diffusion at 25 steps:
+
+| target | res | flow at its best sigma0 | diffusion 25 |
+|---|---:|---|---|
+| 6MRR | 68 | 1.78 (TM 0.829) at 16 | **1.46 (TM 0.907)** |
+| 1QYS | 92 | 1.23 (TM 0.897) at 16 | **0.96 (TM 0.938)** |
+| 5CAJ | 261 | 16.98 (TM 0.173) at 160 | **17.67 (TM 0.184)** |
+| 1BRS | 108 | 11.70 (TM 0.168) at 40 | **12.18 (TM 0.178)** |
+
+Diffusion is 17.67 on 5CAJ and 12.18 on 1BRS - flow is marginally BETTER on both,
+which is two ways of saying neither sampler folds a target that needs a template.
+**So the sweep can only be run on the two targets rosettafold3 folds from
+sequence alone, and on two of two the optimum is 16 and it is sharp.** Testing it
+at length would need a templated arm, which `probe-sigma0.js` does not have.
+
+🔴 **AND THE PROBE WAS FEATURISING EVERY MODEL AS AlphaFold 3** - it took a
+`--model=` and called `featuriseProtein(sequence, {})` with no dialect, which is
+the fault this file records for probe-nucleic.js one tool over. `dropTerminalAtoms`
+and `paddedAtomKeys` both reach a plain protein, so it was not inert. It passes
+`featuriserDialect(dialect)` now, and takes `--mode=` so it can produce the
+control above instead of leaving it to be argued.
+
 🔴 **BUT THE CALIBRATION IS TWO-DIMENSIONAL, AND THAT IS THE CATCH.** The SAME
 sigma0 at SIXTEEN steps is refused - CA median 5.097 and 5.008 - because the
 descent keeps walking after it has arrived, which is the contraction above seen
