@@ -21,10 +21,10 @@ import { describe, it } from "node:test";
 import {
   confidenceWeights, distogramWeights, embedderWeights,
   msaBlockWeights, pairformerBlockWeights, templateWeights,
-} from "../src/af3/weights.js";
-import { MANIFEST as AF3 } from "../src/reference/manifests/af3.js";
-import { MANIFEST as OPENBIND0 } from "../src/reference/manifests/openbind0.js";
-import { MANIFEST as OPENDDE } from "../src/reference/manifests/opendde.js";
+} from "../src/af3/weights/weights.js";
+import { MANIFEST as AF3 } from "../src/bundles/manifests/af3.js";
+import { MANIFEST as OPENBIND0 } from "../src/bundles/manifests/openbind0.js";
+import { MANIFEST as OPENDDE } from "../src/bundles/manifests/opendde.js";
 
 /**
  * A store that answers shapes truthfully and tensors with zeros.

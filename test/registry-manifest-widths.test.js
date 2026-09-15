@@ -2,7 +2,7 @@
  * Do the PINNED registry manifests still describe weights this loader can read?
  *
  * 🔴 PUSHING TO `main` IS THE DEPLOY, AND THE WEIGHTS DO NOT TRAVEL WITH IT.
- * `src/reference/manifests/*.js` is a committed copy of a manifest pinned to a
+ * `src/bundles/manifests/*.js` is a committed copy of a manifest pinned to a
  * Hugging Face commit; the shards live there and are updated by hand. So a
  * change to what the LOADER reads can be correct, gated, and reviewed - and
  * still take the live site down, because the bundle it now needs is not the one
@@ -21,7 +21,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 
-const DIR = new URL("../src/reference/manifests/", import.meta.url);
+const DIR = new URL("../src/bundles/manifests/", import.meta.url);
 const HEAD = "diffuser/~/diffusion_head";
 
 /** Every registry module that carries an AF3-lineage tensor table. */
@@ -56,7 +56,7 @@ describe("the pinned registry manifests", () => {
 
   for (const [name, manifest] of found) {
     it(`${name} carries a single conditioning this loader can read`, async () => {
-      const { dialectFor } = await import("../../localfold/src/af3/dialect.js");
+      const { dialectFor } = await import("../src/af3/dialect.js");
       const model = manifest.model?.name;
       assert.ok(typeof model === "string", `${name} names no model`);
       const dialect = dialectFor(model);

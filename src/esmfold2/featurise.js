@@ -4,7 +4,7 @@
  * 🔴 THIS IS AN ADAPTER, NOT A SECOND FEATURISER, AND THAT IS THE WHOLE POINT.
  * ESMFold2 uses AF3's all-atom representation term for term - `ref_pos`,
  * `ref_element`, `ref_charge`, `ref_atom_name_chars`, `ref_space_uid`,
- * `atom_to_token`, `token_bonds` - so src/af3/featurise.js already knows how to
+ * `atom_to_token`, `token_bonds` - so src/af3/featurise/featurise.js already knows how to
  * tokenise a complex, a nucleic chain, a ligand at one token per heavy atom and
  * a modified residue at one token per atom. Writing that again for this model
  * would be a thousand lines and a second place for a CCD component to be read
@@ -32,7 +32,7 @@
  * biases make its response to a zero state non-zero. `lmZeroTokens` is the list
  * of tokens that need that constant instead of a tower output.
  */
-import { featuriseProtein } from "../af3/featurise.js";
+import { featuriseProtein } from "../af3/featurise/featurise.js";
 
 /** ESM-C's alphabet, which is what the language model is tokenised in. */
 export const ESM_ALPHABET = ["<cls>", "<pad>", "<eos>", "<unk>",

@@ -14,7 +14,7 @@
  * all four pins, and dropping any one fails it.
  */
 import { strict as assert } from "node:assert";
-import { readFileSync } from "node:fs";
+import { af3Source } from "./helpers/af3-source.js";
 import { describe, it } from "node:test";
 
 const PINS = [
@@ -25,14 +25,14 @@ const PINS = [
 ];
 
 const HEADS = {
-  "AlphaFold 3 (and its lineage)": "../src/af3/confidence-webgpu.js",
-  OpenDDE: "../src/af3/opendde-confidence.js",
+  "AlphaFold 3 (and its lineage)": "confidence-webgpu.js",
+  OpenDDE: "opendde-confidence.js",
 };
 
 describe("the confidence heads' pairformer precision", () => {
   for (const [name, path] of Object.entries(HEADS)) {
     it(`pins all four axes for ${name}`, () => {
-      const source = readFileSync(new URL(path, import.meta.url), "utf8");
+      const source = af3Source(path);
       for (const pin of PINS) assert.match(source, pin, `${name} is missing ${pin}`);
     });
   }

@@ -1,6 +1,6 @@
 /**
  * AF3's template embedder (empty-template path): GPU against
- * src/af3/template-reference.js.
+ * src/af3/trunk/template-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-template.js
  *
@@ -8,10 +8,10 @@
  * number is the argument for the module existing at all: with four EMPTY slots
  * this is not a small residual correction.
  */
-import { templateEmbedding } from "../../src/af3/template-reference.js";
-import { Af3TemplateEmbedderGpu } from "../../src/af3/template-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { af3Dialect } from "../../src/af3/weights.js";
+import { templateEmbedding } from "../../src/af3/trunk/template-reference.js";
+import { Af3TemplateEmbedderGpu } from "../../src/af3/trunk/template-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights/weights.js";
 import { deviceTuning } from "../../src/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
@@ -101,7 +101,7 @@ export async function main(device, args) {
   // port, not the width. Scaled by sqrt of the ratio, which is what a sum of
   // independent roundings does, and it is not a licence to raise the bound
   // further: the SHIPPED trunk pins `pairMatrixKernels: false` on this stage
-  // for exactly this reason (see src/af3/trunk-webgpu.js).
+  // for exactly this reason (see src/af3/trunk/trunk-webgpu.js).
   const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {

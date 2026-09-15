@@ -1,5 +1,5 @@
 /**
- * AF3's embedder: GPU against src/af3/embedder-reference.js.
+ * AF3's embedder: GPU against src/af3/trunk/embedder-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-embedder.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-embedder.js --chains=3
@@ -22,10 +22,10 @@
  * WHERE the term is added, not that it is zero - AF3's template embedder
  * contributes std 13.1 even with four empty slots.
  */
-import { embed } from "../../src/af3/embedder-reference.js";
-import { Af3EmbedderGpu } from "../../src/af3/embedder-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { af3Dialect } from "../../src/af3/weights.js";
+import { embed } from "../../src/af3/trunk/embedder-reference.js";
+import { Af3EmbedderGpu } from "../../src/af3/trunk/embedder-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights/weights.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";

@@ -21,11 +21,11 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
-import { featuriseProtein } from "../../src/af3/featurise.js";
-import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
-import { nucleicConformers } from "../../src/af3/reference-conformers-nucleic.js";
-import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
+import { nucleicConformers } from "../../src/af3/featurise/reference-conformers-nucleic.js";
+import { af3MsaFromA3m } from "../../src/af3/featurise/msa-features.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
 import { deduplicateUnpairedAgainstPaired, mergeChainA3ms, mergeRowAlignedChainA3ms }
   from "../../src/input/chains.js";
 
@@ -204,7 +204,7 @@ exact("ref_element", batch.refElement, input("ref_element"));
 // 🔴 CHARGE IS EXACT FOR POLYMERS AND EXPLAINED FOR LIGANDS. AF3 takes a
 // ligand atom's charge from RDKit's PERCEIVED formal charge, not from the
 // dictionary column, so heme's four -1 atoms come back as 0 - see
-// src/af3/ccd-component.js. Splitting the comparison keeps the polymer half
+// src/af3/featurise/ccd-component.js. Splitting the comparison keeps the polymer half
 // strict rather than loosening the whole of it around a known difference.
 {
   // The polymer tokens are everything before the ligand block, counted from

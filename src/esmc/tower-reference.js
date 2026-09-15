@@ -31,7 +31,7 @@
 // test/module-references.test.js guards against calling an exported name a file
 // cannot see, and it builds ONE set of exported names across all of src/ - so
 // exporting `block` made every function that takes a `block` PARAMETER look
-// like it was calling ours. `src/af3/confidence-reference.js` takes exactly
+// like it was calling ours. `src/af3/confidence/confidence-reference.js` takes exactly
 // that parameter. The guard is right and the export name was wrong.
 
 // ESM-C's alphabet, in id order. 0/1/2/32 are BOS/PAD/EOS/MASK.
@@ -78,7 +78,7 @@ export function layerNorm(values, rows, channels, scale, offset, eps = 1e-5) {
  *
  * 🔴 THIS IS NOT torch's LAYOUT AND THE EXPORT TRANSPOSES INTO IT. torch stores
  * a Linear as (out, in) and computes x @ W.T; the tiled kernel this port uses on
- * the GPU - src/evoformer/transition.js, measured at 1140-1550 GFLOP/s - indexes
+ * the GPU - src/kernels/transition.js, measured at 1140-1550 GFLOP/s - indexes
  * `weights[k * columns + column]`, which is (in, out). One layout for the
  * bundle, the reference and the shader, decided at export; the alternative is a
  * transpose per fold or a second kernel.

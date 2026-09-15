@@ -12,7 +12,7 @@
  * evoformer would have OVERWRITTEN the pair representation where it meant to
  * add to it. Neither the shape nor the types would have moved.
  */
-import { createTriangleShaders } from "../src/triangle/shaders.js";
+import { createTriangleShaders } from "../src/kernels/triangle/shaders.js";
 import { describe, expect, it } from "./harness.js";
 
 const NAMES = [

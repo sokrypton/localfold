@@ -19,6 +19,24 @@
  * loaders memoise - `loadAf3Weights` in web/af3-model.js by module state, and
  * `loadDesigner` per MPNN family, which is also why switching the picker back
  * and forth costs nothing after the first read of each.
+ *
+ * 🔴 AND proteinhunter.html, THE PAGE THAT LOADS THIS, IS HELD OUT of the
+ * repository.
+ *
+ * 🔴 NOTHING IN THE CHECKOUT LOADS IT, AND THAT IS DELIBERATE RATHER THAN DEAD.
+ * `.gitignore` holds `single.html` and `proteinhunter.html` back until they are
+ * fixed against the model row that moved under them (b0dc258); the pages stay on
+ * their author's disk, `tools/build_site.py`'s OPTIONAL list copies them when
+ * they exist and `tools/mobile-layout.py` skips a page it cannot find.
+ *
+ * Of `web/`'s 25 modules, 19 are reachable from `index.html` or `dev.html`,
+ * FIVE only from those two withheld pages - `main.js`, `hunter.js`, `viewer.js`,
+ * `mutate.js`, `hydrophobicity.js` - and `plddt.js` from neither, having had no
+ * importer at any tracked revision. `mutate.js` and `hydrophobicity.js` are held
+ * by `test/mutate.test.js`, `test/hydrophobicity.test.js` and
+ * `test/browser/webgpu.spec.js`; **the four with no page and no test are
+ * `main.js`, `hunter.js`, `viewer.js` and `plddt.js`**, which is why this note is
+ * in those four. Deleting any of them is a page that does not come back.
  */
 import { getDevice } from "./model.js";
 import { createStructureViewer } from "./viewer.js";
@@ -27,7 +45,7 @@ import { runDesign } from "../src/design/hunter-loop.js";
 import { designChain, loadDesigner } from "../src/design/mpnn-bridge.js";
 import { DESIGNERS, DESIGNER_NAMES, chooseDesigner } from "../src/design/designers.js";
 import { createEntityList } from "./entity-ui.js";
-import { superposeCycle } from "../src/design/superpose-pdb.js";
+import { superposeCycle } from "../src/heads/superpose-pdb.js";
 import { followActiveFrame, updateScoresCard } from "./scores-card.js";
 import { NUCLEIC_TYPES, entitiesProblem, expandEntities,
   templateKind } from "./entities.js";
@@ -186,7 +204,7 @@ function syncDesignerNote() {
  * 🔴 AND EACH FRAME IS SUPERPOSED ONTO THE FIRST BEFORE IT GOES IN. AF3's
  * sampler randomly re-orients every fold, and `addFrame`'s own alignment needs
  * two frames with equal position counts - which a redesigned chain never has.
- * See src/design/superpose-pdb.js.
+ * See src/heads/superpose-pdb.js.
  */
 let referencePdb;
 

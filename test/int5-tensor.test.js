@@ -10,7 +10,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { readTensor, tensorByteLength } from "../src/reference/dtype.js";
+import { readTensor, tensorByteLength } from "../src/weights/dtype.js";
 
 const GROUP = 32;
 const GROUP_BYTES = 20;

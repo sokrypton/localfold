@@ -1,7 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
   alphaCarbons, coordinateAtoms, rewriteCoordinates, superposeCycle, superposePdb,
-} from "../src/design/superpose-pdb.js";
+} from "../src/heads/superpose-pdb.js";
 
 /**
  * One coordinate line, built by COLUMN rather than by concatenation.

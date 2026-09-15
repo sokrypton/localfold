@@ -1,8 +1,21 @@
+/**
+ * One Evoformer stack over a real 59-residue A3M fixture, timed and checked
+ * against the fixture's own expected output.
+ *
+ *     npm run bench:a3m-stack
+ *
+ * 🔴 IT NEEDS `test/fixtures/evoformer/model1-a3m-59-stack`, WHICH IS NOT IN THE
+ * REPOSITORY AT ALL. CLAUDE.md's Dawn-suite note is the same finding from the
+ * other side: 24 of that suite's 25 failures are ENOENT on this fixture and its
+ * neighbour. Regenerate it with `tools/capture_alphafold_single_sequence.py`
+ * and friends in a ColabFold environment, or use the whole-stack checker
+ * (`tools/gpu/check-evoformer-stack.js`) instead.
+ */
 import { create, globals } from "webgpu";
-import { EvoformerStackGpu } from "../src/evoformer/stack.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { EvoformerStackGpu } from "../src/af2/evoformer/stack.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";

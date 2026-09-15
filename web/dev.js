@@ -6,9 +6,9 @@
 // the browser tests assert against, and it is the only coverage that runs a
 // real kernel in a real browser. So it moved rather than went away.
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../src/triangle/cpu-reference.js";
-import { errorMetrics } from "../src/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
+import { triangleMultiplicationOutgoingReference } from "../src/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../src/kernels/triangle/webgpu.js";
 
 const element = (id) => {
   const value = document.getElementById(id);

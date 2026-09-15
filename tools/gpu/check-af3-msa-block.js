@@ -1,5 +1,5 @@
 /**
- * AF3's MSA blocks on the GPU, against src/af3/msa-reference.js.
+ * AF3's MSA blocks on the GPU, against src/af3/trunk/msa-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-msa-block.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-msa-block.js --blocks=4
@@ -10,13 +10,13 @@
  * MSA track first and the pair track second, or the reverse, runs and returns
  * both representations.
  */
-import { msaAttention, msaBlock, outerProductMean } from "../../src/af3/msa-reference.js";
+import { msaAttention, msaBlock, outerProductMean } from "../../src/af3/trunk/msa-reference.js";
 import {
   gridSelfAttention, transition, triangleMultiplication,
-} from "../../src/af3/pairformer-reference.js";
-import { Af3MsaStackGpu } from "../../src/af3/msa-stack-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { af3Dialect } from "../../src/af3/weights.js";
+} from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3MsaStackGpu } from "../../src/af3/trunk/msa-stack-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights/weights.js";
 import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the

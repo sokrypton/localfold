@@ -1,35 +1,35 @@
-export { TriangleMultiplicationIncomingGpu, TriangleMultiplicationOutgoingGpu } from "./triangle/webgpu.js";
-export { TransitionGpu } from "./evoformer/transition.js";
+export { TriangleMultiplicationIncomingGpu, TriangleMultiplicationOutgoingGpu } from "./kernels/triangle/webgpu.js";
+export { TransitionGpu } from "./kernels/transition.js";
 
-export { OuterProductMeanGpu } from "./evoformer/outer-product-mean.js";
+export { OuterProductMeanGpu } from "./kernels/outer-product-mean.js";
 
-export { AttentionGpu } from "./evoformer/attention.js";
+export { AttentionGpu } from "./kernels/attention.js";
 
-export { EvoformerBlockGpu } from "./evoformer/block.js";
+export { EvoformerBlockGpu } from "./af2/evoformer/block.js";
 
-export { EvoformerStackGpu, ExtraMsaPairStackGpu, ExtraMsaStackGpu } from "./evoformer/stack.js";
+export { EvoformerStackGpu, ExtraMsaPairStackGpu, ExtraMsaStackGpu } from "./af2/evoformer/stack.js";
 
-export { InputEmbedderGpu } from "./evoformer/input-embedder.js";
+export { InputEmbedderGpu } from "./af2/evoformer/input-embedder.js";
 
-export { QueryOnlyTemplateGpu } from "./evoformer/template.js";
+export { QueryOnlyTemplateGpu } from "./af2/evoformer/template.js";
 
 export { ElementwiseAddGpu } from "./runtime/elementwise.js";
 export { requestAlphaFoldDevice } from "./runtime/device.js";
 export { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "./runtime/abort.js";
 export { DeferredValidation } from "./runtime/validation.js";
-export { InvariantPointAttentionGpu } from "./structure/ipa.js";
+export { InvariantPointAttentionGpu } from "./af2/structure/ipa.js";
 
-export { StructurePostAttentionGpu } from "./structure/iteration.js";
+export { StructurePostAttentionGpu } from "./af2/structure/iteration.js";
 
-export { StructureCoreGpu } from "./structure/core.js";
+export { StructureCoreGpu } from "./af2/structure/core.js";
 
-export { StructureInitializeGpu } from "./structure/initialize.js";
+export { StructureInitializeGpu } from "./af2/structure/initialize.js";
 
-export { SidechainAnglesGpu } from "./structure/sidechain.js";
+export { SidechainAnglesGpu } from "./af2/structure/sidechain.js";
 
-export { AtomGeometryGpu } from "./structure/geometry.js";
+export { AtomGeometryGpu } from "./af2/structure/geometry.js";
 
-export { StructureModuleGpu } from "./structure/module.js";
+export { StructureModuleGpu } from "./af2/structure/module.js";
 
 export { ConfidenceHeadsGpu, predictedTmScore } from "./heads/confidence.js";
 
@@ -46,16 +46,16 @@ export {
 
 export { generateMmseqs2ComplexMsa, generateMmseqs2Msa } from "./input/mmseqs2-api.js";
 
-export { AlphaFoldFixture } from "./reference/alphafold-fixture.js";
+export { AlphaFoldFixture } from "./bundles/alphafold-fixture.js";
 
-export { HttpTensorStore } from "./reference/http-tensor-store.js";
-export { DEFAULT_MANIFEST } from "./reference/manifest.js";
-export { AlphaFoldQueryOnlyGpu } from "./model/query-only.js";
+export { HttpTensorStore } from "./bundles/http-tensor-store.js";
+export { DEFAULT_MANIFEST } from "./bundles/manifest.js";
+export { AlphaFoldQueryOnlyGpu } from "./af2/model/query-only.js";
 
-export { AlphaFoldMonomerGpu } from "./model/monomer.js";
+export { AlphaFoldMonomerGpu } from "./af2/model/monomer.js";
 export {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
-} from "./model/recycle-convergence.js";
+} from "./af2/model/recycle-convergence.js";
 
-export { triangleMultiplicationOutgoingReference } from "./triangle/cpu-reference.js";
-export { errorMetrics, validateTriangleInput } from "./triangle/types.js";
+export { triangleMultiplicationOutgoingReference } from "./kernels/triangle/cpu-reference.js";
+export { errorMetrics, validateTriangleInput } from "./kernels/triangle/types.js";

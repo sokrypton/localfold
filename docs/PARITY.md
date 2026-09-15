@@ -67,7 +67,7 @@ the whole reason fifteen checkers answered 404 rather than comparing, and it is
 not neglect:
 
 🔴 **`openAf3Store()` DEFAULTS TO `/model-af3-full-f32/manifest.json`**
-(src/af3/weights.js:13), and **fourteen of the twenty AF3 checkers take no
+(src/af3/weights/weights.js:13), and **fourteen of the twenty AF3 checkers take no
 `--model=` at all**, so they open that constant and nothing else. Only six are
 model-aware.
 

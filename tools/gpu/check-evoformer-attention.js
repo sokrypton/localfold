@@ -16,7 +16,7 @@
  * rather than imported, because a reference sharing code with the thing it
  * checks tests nothing.
  */
-import { AttentionGpu, selectAttentionFlashKernel } from "../../src/evoformer/attention.js";
+import { AttentionGpu, selectAttentionFlashKernel } from "../../src/kernels/attention.js";
 import { deviceTuning, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {

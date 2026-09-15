@@ -17,10 +17,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/reference/dtype.js";
+import { readTensor } from "../src/weights/dtype.js";
 import { denoiseStep, diffusionConditioning, tokenTransformer }
   from "../src/esmfold2/diffusion-reference.js";
-import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
+import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 // 🔴 POSITIONAL ARGUMENTS SKIP FLAGS, because `--steps=2` in argv[2] was read

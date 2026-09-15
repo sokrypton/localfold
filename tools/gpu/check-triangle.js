@@ -14,10 +14,10 @@
  * Every AF3 kernel gets a sibling of this file, comparing against its
  * src/af3/*-reference.js counterpart.
  */
-import { loadTriangleReferenceBundle } from "../../src/reference/bundle.js";
-import { triangleMultiplicationOutgoingReference } from "../../src/triangle/cpu-reference.js";
-import { errorMetrics } from "../../src/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../../src/triangle/webgpu.js";
+import { loadTriangleReferenceBundle } from "../../src/bundles/bundle.js";
+import { triangleMultiplicationOutgoingReference } from "../../src/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../../src/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../../src/kernels/triangle/webgpu.js";
 
 // 🔴 ABSOLUTE, because the loader resolves each tensor with
 // `new URL(file, manifestUrl)` and a bare path is not a valid base.

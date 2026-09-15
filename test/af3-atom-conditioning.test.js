@@ -11,8 +11,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { perAtomConditioning } from "../src/af3/atom-conditioning-reference.js";
-import { linear } from "../src/af3/pairformer-reference.js";
+import { perAtomConditioning } from "../src/af3/diffusion/atom-conditioning-reference.js";
+import { linear } from "../src/af3/trunk/pairformer-reference.js";
 
 /** One atom, one channel, so each embedding's contribution is a single number. */
 function oneAtom(overrides = {}) {

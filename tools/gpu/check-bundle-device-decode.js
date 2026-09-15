@@ -16,11 +16,11 @@
  *
  * 🔴 AND THE BAR IS ZERO DIFFERING HALVES. Both sides produce f16; the host
  * computes `code * scale + zero` in f64 and narrows, the shader in f32. The
- * claim in src/runtime/quantised-upload.js is that they agree exactly, and
+ * claim in src/weights/quantised-upload.js is that they agree exactly, and
  * anything else is a finding rather than a tolerance.
  */
-import { planBlockUpload, runBlockUpload } from "../../src/runtime/quantised-upload.js";
-import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
+import { planBlockUpload, runBlockUpload } from "../../src/weights/quantised-upload.js";
+import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

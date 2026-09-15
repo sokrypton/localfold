@@ -16,12 +16,12 @@
  * opendde`, reduced to these scopes - `dump_af3_scopes.py` CANNOT produce them,
  * because its forward pass is the denoiser's and never runs this encoder.
  */
-import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
 import { batchFromDump } from "./fold.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

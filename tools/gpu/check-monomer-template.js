@@ -17,10 +17,10 @@
  * comparing it against float32 parameters reports quantisation as a fault -
  * which cost an hour on the multimer side before its manifest was read.
  */
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { QueryOnlyTemplateGpu } from "../../src/evoformer/template.js";
-import { AF2_ATOM37_MONOMER } from "../../src/af3/template-features.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { QueryOnlyTemplateGpu } from "../../src/af2/evoformer/template.js";
+import { AF2_ATOM37_MONOMER } from "../../src/af3/featurise/template-features.js";
 
 async function load(name) {
   const response = await fetch(`/${name}`);

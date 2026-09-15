@@ -21,7 +21,7 @@
  * schedule, so a wrong schedule endpoint or a missing step_scale shows up here
  * rather than as a slightly worse structure.
  */
-import { noiseLevels, samplerStep } from "../../src/af3/diffusion-sampler-reference.js";
+import { noiseLevels, samplerStep } from "../../src/af3/diffusion/diffusion-sampler-reference.js";
 import { captures, loadDump, report } from "./af3-bundle.js";
 
 const HEAD = "diffuser/~/diffusion_head";

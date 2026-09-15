@@ -1,7 +1,19 @@
+/**
+ * A whole AF2 monomer fold over the 59-residue A3M fixture, timed per recycle.
+ *
+ *     npm run bench:a3m-model
+ *
+ * 🔴 IT NEEDS `test/fixtures/evoformer/model1-a3m-59-stack` AND
+ * `model1-query-59-stack`'s WEIGHTS, AND NEITHER IS IN THE REPOSITORY. The a3m
+ * stack is absent whole; the query stack is present and declares **530 tensors
+ * of which 26 are on disk** - twenty input features and six geometry tables,
+ * no weight of any kind. `tools/gpu/fold-af2.js` is the fold gate that does run
+ * here.
+ */
 import { create, globals } from "webgpu";
-import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 Object.assign(globalThis, globals);

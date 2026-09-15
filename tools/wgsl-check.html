@@ -23,12 +23,12 @@ const log = (s) => { out.textContent += s + "\n"; };
 const bust = `?v=${Date.now()}`;
 const src = (path) => import(`../${path}${bust}`);
 
-const geometry = await src('src/multimer/geometry.js');
+const geometry = await src('src/af2/multimer/geometry.js');
 const modules = Object.assign({},
-  await src('src/evoformer/outer-product-mean.js'),
-  await src('src/evoformer/attention.js'),
-  await src('src/multimer/input-embedder.js'),
-  await src('src/multimer/template.js'),
+  await src('src/kernels/outer-product-mean.js'),
+  await src('src/kernels/attention.js'),
+  await src('src/af2/multimer/input-embedder.js'),
+  await src('src/af2/multimer/template.js'),
   geometry,
   // the atom14 shader is generated per position_scale; compile both
   { ATOM14_SHADER_monomer: geometry.createAtom14Shader(geometry.MONOMER_POSITION_SCALE),

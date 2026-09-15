@@ -251,7 +251,7 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    quietly ignored. -->
               <div class="fetch-option-group" id="af3ModeGroup" hidden>
                 <span class="fetch-option-title">Sampler</span>
-                <select id="af3-mode" title="Diffusion: AlphaFold 3's own sampler, noise injected at every step - the default, and ahead on almost every target measured. Flow: one draw at the top, then a deterministic walk that replaces the state with each prediction - close behind at the same price, and weaker past about 400 residues.">
+                <select id="af3-mode" title="Diffusion: AlphaFold 3's own sampler, noise injected at every step - the default, and ahead on almost every target measured. Flow: one draw at the top, then a deterministic walk that replaces the state with each prediction - close behind at the same price on average, but it cannot recover from a bad first draw, so a minority of seeds come out far worse. Diffusion re-noises at every step and does not.">
                   <option value="flow">Flow</option>
                   <option value="diffusion" selected>Diffusion</option>
                 </select>

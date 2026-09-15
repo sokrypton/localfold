@@ -11,7 +11,7 @@
  *     (a file)  whatever was dropped
  *
  * 🔴 THE LEGACY PDB FORMAT IS ASKED FOR FIRST, WHICH IS A REAL LIMIT AND NOT AN
- * OVERSIGHT. src/af3/template-input.js reads fixed columns, and an entry too
+ * OVERSIGHT. src/af3/featurise/template-input.js reads fixed columns, and an entry too
  * large for them - more than 62 chains or 99999 atoms - has no `.pdb` at the
  * RCSB and falls through to the mmCIF this cannot parse. That is rare for a
  * single template chain and the error says so rather than producing a template
@@ -25,7 +25,7 @@
 import { alignPositions } from "./align.js";
 import {
   chainResidues, filterByConfidence, identityMap, templateSlot,
-} from "../src/af3/template-input.js";
+} from "../src/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
 
@@ -223,7 +223,7 @@ export function buildTemplate(options) {
  */
 export function residuesFromCif(text, chain) {
   // 🔴 MSE IS A HETATM AND IS A RESIDUE. See HETERO_RESIDUES in
-  // src/af3/template-input.js: dropping every heteroatom takes a
+  // src/af3/featurise/template-input.js: dropping every heteroatom takes a
   // selenomethionine out of the middle of a chain, and keeping every one makes
   // the waters into residues.
   const atoms = parseCIFAtoms(text).filter((atom) =>

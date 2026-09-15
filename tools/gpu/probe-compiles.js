@@ -15,9 +15,9 @@
  * The wrapped tool's own result is returned under `tool`, so a gate does not
  * stop being a gate when it is measured.
  */
-import { blockUploadStats } from "../../src/runtime/quantised-upload.js";
+import { blockUploadStats } from "../../src/weights/quantised-upload.js";
 import { residentPackStats } from "../../src/runtime/resident.js";
-import { tensorDecodeStats } from "../../src/reference/http-tensor-store.js";
+import { tensorDecodeStats } from "../../src/bundles/http-tensor-store.js";
 import { pipelineCacheStats } from "../../src/runtime/pipeline-cache.js";
 import { shaderSourceStats } from "../../src/runtime/shader-source-cache.js";
 

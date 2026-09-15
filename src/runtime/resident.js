@@ -58,7 +58,7 @@ const heldByDevice = new WeakMap();
  * 🔴 THE SIBLING OF residentWeightBuffer, FOR WEIGHTS THAT NEVER TOUCH THE
  * HOST. That one takes a `pack` returning bytes to upload; this one takes a
  * size and a `fill` handed the buffer, so an int5 decode can run as a compute
- * pass instead of a JavaScript loop - see src/runtime/quantised-upload.js. The
+ * pass instead of a JavaScript loop - see src/weights/quantised-upload.js. The
  * caching, the labelling and the accounting are the same, and so is the rule
  * about `variant`.
  *

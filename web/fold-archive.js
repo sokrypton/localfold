@@ -35,7 +35,7 @@
  */
 import { CHAIN_IDS, paeMatrix, safeJobName } from "./prediction-results.js";
 import { jobRequestJson } from "./job-json.js";
-import { coordinateAtoms } from "../src/design/superpose-pdb.js";
+import { coordinateAtoms } from "../src/heads/superpose-pdb.js";
 
 /**
  * 🔴 TWO DECIMALS, WHICH IS WHAT THE SERVER WRITES. Not cosmetic: `full_data`

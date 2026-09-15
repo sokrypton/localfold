@@ -16,9 +16,9 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { featuriseProtein } from "../src/af3/featurise.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
-import { nucleicAatypeFor } from "../src/af3/reference-conformers-nucleic.js";
+import { nucleicAatypeFor } from "../src/af3/featurise/reference-conformers-nucleic.js";
 
 const blank = (batch) => new Float32Array(batch.tokens * batch.dense * 3);
 

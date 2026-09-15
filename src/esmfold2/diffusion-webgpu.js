@@ -31,7 +31,7 @@
 import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { GRID_WIDTH, LANES, createLayerNormShader, createLinearShader,
          createSwigluShader, linearGrid, swigluGrid } from "../esmc/block-webgpu.js";
-import { float32ToFloat16Array } from "../runtime/float16.js";
+import { float32ToFloat16Array } from "../weights/float16.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residentTensorOnDevice, residentPairOnDevice, elementsOf }
   from "./device-weights.js";
@@ -43,7 +43,7 @@ import {
   atomStackScratch, atomWindows, compileAtomStack, createBroadcastShader,
   createPoolShader, encodeAtomStack, tokenRanges, widestWindow,
 } from "./atom-transformer-webgpu.js";
-import { buildRope } from "./atom-encoder-reference.js";
+import { buildRope } from "./atom-transformer-reference.js";
 
 const sigmoid = (x) => 1 / (1 + Math.exp(-x));
 
@@ -173,18 +173,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /** `a += b`, elementwise. */
-export function createAddShader(elements) {
-  return `
-@group(0) @binding(0) var<storage, read> delta: array<f32>;
-@group(0) @binding(1) var<storage, read_write> accumulator: array<f32>;
-
-@compute @workgroup_size(${LANES})
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-  let i = id.x + id.y * ${GRID_WIDTH * LANES}u;
-  if (i >= ${elements}u) { return; }
-  accumulator[i] += delta[i];
-}`;
-}
+// 🔴 THIS FILE USED TO DEFINE ITS OWN, WITH THE BINDINGS THE OTHER WAY ROUND
+// - `0 = delta, 1 = accumulator` against AF3's `0 = accumulator, 1 = delta`.
+// Same name, same eleven lines otherwise, both compile, and a pipeline from
+// one with a bind group from the other writes the sum into the delta. One
+// definition now, in src/runtime/execution.js; the two bind sites below moved
+// to its order. ESM-C's LANES is 64 and its GRID_WIDTH 32768, so the text is
+// otherwise identical.
+import { createAddShader } from "../runtime/execution.js";
+export { createAddShader };
 
 /** `out = a * sigmoid(gate)`, elementwise. */
 export function createSigmoidGateShader(elements) {
@@ -937,7 +934,7 @@ export class Esmfold2DenoiserGpu {
     const narrow = (values) => this.#narrow(values);
     // 🔴 THE ATOM STACKS ARE f32 ON THE DEVICE and the token blocks are f16, so
     // the two take different destinations from the same decoder. See
-    // src/runtime/quantised-upload.js: an f32 element is a whole word, which is
+    // src/weights/quantised-upload.js: an f32 element is a whole word, which is
     // why only that mode may stride and why it needs no even offsets.
     const stack = async (blocks, label) => {
       const out = [];
@@ -1084,7 +1081,7 @@ export class Esmfold2DenoiserGpu {
                      ...elementwise(rows * pairChannels * multiplier)]);
         passes.push(["z-out", p.narrow, [scratchG, block.outProjection, scratchD],
                      ...linearGrid(rows, pairChannels)]);
-        passes.push(["z-add", p.add, [scratchD, outCond],
+        passes.push(["z-add", p.add, [outCond, scratchD],
                      ...elementwise(rows * pairChannels)]);
       }
       await this.#now("esmfold2.diff.pair-conditioning", passes);
@@ -1198,7 +1195,7 @@ export class Esmfold2DenoiserGpu {
              ...elementwise(tokens * hidden));
       record("esmfold2.diff.s-out", pipelines.narrow, [b.wideG, block.outProjection, b.delta],
              ...linearGrid(tokens, tokenChannels));
-      record("esmfold2.diff.s-add", pipelines.addSingle, [b.delta, b.single],
+      record("esmfold2.diff.s-add", pipelines.addSingle, [b.single, b.delta],
              ...elementwise(tokens * tokenChannels));
     }
 

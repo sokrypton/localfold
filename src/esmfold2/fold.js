@@ -33,12 +33,12 @@ import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { yieldToBrowser } from "../runtime/yield.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { Esmfold2TrunkGpu } from "./trunk-webgpu.js";
-import { Esmfold2DenoiserGpu, atomConditioning, createAddShader } from "./diffusion-webgpu.js";
-import { buildRope } from "./atom-encoder-reference.js";
+import { Esmfold2DenoiserGpu, atomConditioning } from "./diffusion-webgpu.js";
+import { buildRope } from "./atom-transformer-reference.js";
 import { runInputsEmbedder } from "./atom-transformer-webgpu.js";
 import { encodeLanguagePair } from "./language-pair-webgpu.js";
 import { encodeContactMap, partnerKeys } from "./distogram-webgpu.js";
-import { linear } from "./featuriser-reference.js";
+import { linear } from "./pair-features-reference.js";
 import { alignedErrorFromDistogram } from "./aligned-error.js";
 import {
   createBondShader, createRelativePositionShader, createZInitShader,
@@ -494,7 +494,10 @@ export async function foldEsmfold2(device, options) {
 
     // ---- z_init's other four terms.
     const layout = relativeLayout();
-    const [relative, bond, zInitShader, recycleNorm, recycleProject, addPair] =
+    // 🔴 THE PAIR ADD USED TO BE COMPILED HERE AND NEVER USED. It was the
+    // sixth entry of this destructure and `addPair` appeared nowhere else in
+    // the file - a pipeline built, cached and thrown away on every fold.
+    const [relative, bond, zInitShader, recycleNorm, recycleProject] =
       await Promise.all([
         cache.get(`esmfold2-rel:${pairs}:${channels}`,
           createRelativePositionShader({ pairs, channels, entityBase: layout.entityBase })),
@@ -508,8 +511,6 @@ export async function foldEsmfold2(device, options) {
         cache.get(`esmfold2-recycle-project:${Math.min(RECYCLE_CHUNK, pairs)}:${channels}`,
           createLinearShader(
             { rows: Math.min(RECYCLE_CHUNK, pairs), inner: channels, outer: channels }, true)),
-        cache.get(`esmfold2-pair-add:${pairs * channels}`,
-          createAddShader(pairs * channels)),
       ]);
 
     // 🔴 THE RELATIVE-POSITION ENCODING IS RECOMPUTED AFTER THE TRUNK, NOT

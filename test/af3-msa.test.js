@@ -15,7 +15,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { outerProductMean } from "../src/af3/msa-reference.js";
+import { outerProductMean } from "../src/af3/trunk/msa-reference.js";
 
 /**
  * An OPM whose LayerNorm and projections are pinned to the identity, so the

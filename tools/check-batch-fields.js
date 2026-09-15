@@ -62,7 +62,7 @@
  * elsewhere (AF3 6MRR 83.084 -> 83.169); it does not have it in this gate.
  *
  * 🔴 AND IT GOES THROUGH `af3BatchFromA3m`, NOT STRAIGHT INTO THE
- * FEATURISER. src/af3/batch.js forwards the dialect to `featuriseProtein` field
+ * FEATURISER. src/af3/featurise/batch.js forwards the dialect to `featuriseProtein` field
  * by field, and the first version of this tool skipped that step - so a
  * convention dropped from THAT list would have left this gate green while the
  * page and every fold tool silently featurised with another model's
@@ -77,10 +77,10 @@
  * convention nothing can see is a convention nobody is checking.
  */
 import { readFileSync } from "node:fs";
-import { af3BatchFromA3m } from "../src/af3/batch.js";
-import { parseCcdComponent } from "../src/af3/ccd-component.js";
+import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
+import { parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
 import { dialectFor, DIALECTS, featuriserDialect } from "../src/af3/dialect.js";
-import { structuralBatch, structuralLayout } from "../src/af3/structural-tokens.js";
+import { structuralBatch, structuralLayout } from "../src/af3/featurise/structural-tokens.js";
 
 const MODELS = ["alphafold3", "openbind0", "opendde", "boltz2", "protenix2",
                 "intellifold2", "rosettafold3"];
@@ -196,7 +196,7 @@ function batchFor(dialect, target) {
   // 🔴 THROUGH `af3BatchFromA3m` AND `featuriserDialect`, NOT STRAIGHT INTO THE
   // FEATURISER. This called `featuriseProtein` with a hand-picked option list
   // at first, and that is the same allow-list shape it was written to catch:
-  // src/af3/batch.js forwards the dialect to the featuriser field by field, and
+  // src/af3/featurise/batch.js forwards the dialect to the featuriser field by field, and
   // a gate that skips it would stay green while the PAGE and every fold tool
   // silently dropped a convention. The one path the shipped fold takes is the
   // one to measure.
@@ -373,7 +373,7 @@ for (const target of Object.keys(TARGETS)) {
     }
   }
   // 🔴 OpenDDE's SECOND TOKEN SPACE, which this port builds in
-  // src/af3/structural-tokens.js and which nothing compared for as long as it
+  // src/af3/featurise/structural-tokens.js and which nothing compared for as long as it
   // existed. `structbook/*` is the mapping that DEFINES the space - which
   // parent residue each subtoken belongs to, its role, its twin - so if it is
   // wrong every stage after it is wrong on a shipped model.

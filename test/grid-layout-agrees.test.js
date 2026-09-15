@@ -23,9 +23,9 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { packGridAttentionWeights } from "../src/af3/grid-attention-webgpu.js";
-import { gridResidentEntries } from "../src/af3/pair-track-device-weights.js";
-import { SOURCES } from "../src/runtime/weight-sources.js";
+import { packGridAttentionWeights } from "../src/af3/trunk/grid-attention-webgpu.js";
+import { gridResidentEntries } from "../src/af3/weights/pair-track-device-weights.js";
+import { SOURCES } from "../src/weights/weight-sources.js";
 
 const HEADS = 2;
 const DIMENSION = 4;
@@ -158,8 +158,8 @@ describe("the triangle pack's host and device layouts agree", () => {
 
   for (const abLayout of ["blocked", "interleaved"]) {
     it(`the ${abLayout} layout`, async () => {
-      const { packWeights } = await import("../src/triangle/weights.js");
-      const { triangleLayout } = await import("../src/af3/pair-track-device-weights.js");
+      const { packWeights } = await import("../src/kernels/triangle/weights.js");
+      const { triangleLayout } = await import("../src/af3/weights/pair-track-device-weights.js");
       const host = packWeights(hostTriangle(), "f32",
         abLayout === "interleaved"
           ? { abLayout: "interleaved", cHidden: C, cZ: C } : {});

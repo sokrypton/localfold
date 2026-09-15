@@ -1,3 +1,20 @@
+/**
+ * Turn a fixture manifest and its loose `.f32.bin` files into the single-file
+ * layout a browser fetches.
+ *
+ *     npm run export:web-model -- <manifest.json> <output directory>
+ *
+ * Defaults to `test/fixtures/evoformer/model1-query-59-stack/manifest.json` into
+ * `model/`. This is the ORIGINAL AF2 export path and predates the bundle
+ * pipeline: a shipped model bundle today comes from `tools/export_af3_model.py`
+ * then `tools/quantize_af3.py`, and `tools/repack_shards.py` lays out its
+ * shards. Kept because the AF2 fixtures still use this layout.
+ *
+ * 🔴 AND ITS OWN DEFAULT ARGUMENT DOES NOT WORK ON A FRESH CHECKOUT. That
+ * manifest declares **530 tensors and 26 are on disk**, so the run dies
+ * `ENOENT ... stack_haiku_0024.f32.bin` - measured, not inferred. Point it at a
+ * fixture that has its weights.
+ */
 import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 

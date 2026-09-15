@@ -8,13 +8,13 @@
  * needs a host: the codes are already in memory and the arithmetic is
  * `code * scale + zero`.
  *
- * This is `src/af3/device-weights.js` for one tensor at a time, because the
+ * This is `src/af3/weights/device-weights.js` for one tensor at a time, because the
  * denoiser's buffers are one tensor each rather than one packed block. It
  * returns undefined for anything it cannot take - an f32 bundle, a reader with
  * no sources, a codec the planner refuses - and the caller narrows on the host
  * as it always did.
  */
-import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
+import { planBlockUpload, runBlockUpload } from "../weights/quantised-upload.js";
 import { residentWeightBufferFilled } from "../runtime/resident.js";
 
 /** How many elements a manifest record holds. */
@@ -32,7 +32,7 @@ export async function residentTensorOnDevice(device, options) {
   const elements = elementsOf(source.record);
   if (!(elements > 0)) return undefined;
   // A thunk in the shape planBlockUpload reads: it never calls it, it only
-  // wants the store, the name and the range. See src/af3/weights.js.
+  // wants the store, the name and the range. See src/af3/weights/weights.js.
   const thunk = () => { throw new Error("the device decoder does not call the thunk"); };
   thunk.store = { tensorSource: () => source };
   thunk.tensorName = label;
@@ -58,7 +58,7 @@ export async function residentTensorOnDevice(device, options) {
  * source A's row i followed by source B's row i, so the parts alternate in runs
  * of `columns` rather than element by element - which is the same mapping the
  * four-role interleave uses with a run of one. See
- * src/runtime/quantised-upload.js.
+ * src/weights/quantised-upload.js.
  *
  * @param {object} options key, label, variant, sources (two), columns, destination
  */

@@ -20,12 +20,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/reference/dtype.js";
-import { transition, triangleMultiplication } from "../src/af3/pairformer-reference.js";
+import { readTensor } from "../src/weights/dtype.js";
+import { transition, triangleMultiplication } from "../src/af3/trunk/pairformer-reference.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../src/esmfold2/featuriser-reference.js";
-import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
+} from "../src/esmfold2/pair-features-reference.js";
+import { atomDecoder, inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
 import { denoiseStep } from "../src/esmfold2/diffusion-reference.js";
 import { centreRandomAugmentation, churnFactors, gaussians, noiseLevels, noiseSchedule,
          samplerStep, weightedRigidAlign } from "../src/esmfold2/sampler-reference.js";

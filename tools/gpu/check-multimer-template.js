@@ -18,13 +18,13 @@
  * implementation with no geometry at all agrees to machine precision. The real
  * arm is the one that means anything about the six features, and it is new.
  */
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
 import { WebGpuExecution } from "../../src/runtime/execution.js";
 import {
   TEMPLATE_CHANNELS, encodeTemplateEmbedding, templateAatypeTerms, templateConstantTerm,
-} from "../../src/multimer/template.js";
-import { AF2_ATOM37 } from "../../src/af3/template-features.js";
+} from "../../src/af2/multimer/template.js";
+import { AF2_ATOM37 } from "../../src/af3/featurise/template-features.js";
 
 const PAIR_CHANNELS = 128;
 

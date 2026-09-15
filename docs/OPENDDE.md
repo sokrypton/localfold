@@ -35,7 +35,7 @@ what runs, what it is worth, and what is deliberately absent.
 
 **It folds.** The trunk runs on residues; between the trunk and the diffusion
 each standard residue is re-tokenised into a backbone and a sidechain token,
-and the diffusion runs on those. `src/af3/fold-opendde.js` is that driver and
+and the diffusion runs on those. `tools/gpu/fold-opendde.js` is that driver and
 `tools/gpu/fold-opendde.js` runs it.
 
     node tools/gpu-chrome.mjs tools/gpu/fold-opendde.js --target=6mrr
@@ -101,7 +101,7 @@ reported numbers. Both now come from one file. The altLoc rule matters too:
 
 ## The widths, which are the whole reason the loader changed
 
-Every width in `src/af3/weights.js` used to be a number typed next to the
+Every width in `src/af3/weights/weights.js` used to be a number typed next to the
 tensor it describes. A declared width is right for exactly one checkpoint and
 silent for every other: this bundle loads through `pairChannels: 128` without
 complaint and dispatches every kernel over a third of its own tensor.
@@ -266,7 +266,7 @@ template embedder share every name and differ only in width; the diffusion
 shares 51 of 53; the confidence head shares nothing usable.
 
 So the port is a second token space threaded through the atom layouts, which
-is what `src/af3/structural-tokens.js` and `src/af3/fold-opendde.js` are. The
+is what `src/af3/featurise/structural-tokens.js` and `tools/gpu/fold-opendde.js` are. The
 bundle is the whole model: 481 tensors, 655.8 M parameters, upstream's own
 published `parameter_count` exactly.
 
@@ -669,7 +669,7 @@ shapes. To get it back:
 on RMSD and TM cannot see a bond length.
 
 **The other three models must stay bit-identical**, and are the gate on any
-change to `src/af3/featurise.js`, which all of them share:
+change to `src/af3/featurise/featurise.js`, which all of them share:
 
 | | |
 |---|---|

@@ -20,13 +20,13 @@ import {
   ATTENTION_OUTPUT_TILE, ATTENTION_PROJECT_TILE, attentionOutputTileColumns,
   attentionOutputTileRows, createAttentionOutputShader, createAttentionProjectShader,
   packAttentionWeights,
-} from "../../src/evoformer/attention.js";
+} from "../../src/kernels/attention.js";
 import {
   attentionOutputMatrixDispatch, attentionProjectMatrixDispatch,
   attentionProjectMatrixFits, createAttentionOutputMatrixShader,
   createAttentionProjectMatrixShader,
-} from "../../src/evoformer/attention-project-matrix.js";
-import { stagedMatrixBlock } from "../../src/runtime/matrix-linear.js";
+} from "../../src/kernels/attention-project-matrix.js";
+import { stagedMatrixBlock } from "../../src/kernels/matrix-linear.js";
 import { deviceMatrixConfig, deviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {

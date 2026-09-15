@@ -20,13 +20,13 @@
  * upload again. `wallPerStep - headRun` is what the loop costs AROUND the
  * denoiser and `headRun - gpu` is what the round trip costs inside it.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
 import { normalFrom } from "../../src/af3/fold.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
-import { noiseLevels, randomAugmentation, samplerStep } from "../../src/af3/diffusion-sampler-reference.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { diffusionWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
+import { noiseLevels, randomAugmentation, samplerStep } from "../../src/af3/diffusion/diffusion-sampler-reference.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {

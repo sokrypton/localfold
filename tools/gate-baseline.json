@@ -1,0 +1,36 @@
+{
+  "adapter": "nvidia / ampere",
+  "arms": {
+    "stock": {
+      "AF2": "\"checksum\": -1281569",
+      "AF3": "\"meanPlddt\": 83.09989005431065",
+      "OpenDDE": "\"meanPlddt\": 92.03821103830371",
+      "ESMFold2": "\"atomChecksum\": -61003",
+      "boltz2": "\"meanPlddt\": 96.45960561240592",
+      "protenix2": "\"meanPlddt\": 84.65288238658307",
+      "intellifold2": "\"meanPlddt\": 83.22311492573736",
+      "rosettafold3": "\"meanPlddt\": 81.53424395815864"
+    },
+    "portable": {
+      "AF2": "\"checksum\": -1287025",
+      "AF3": "\"meanPlddt\": 83.12952683611614",
+      "OpenDDE": "\"meanPlddt\": 92.03958192353464",
+      "ESMFold2": "\"atomChecksum\": -128226",
+      "boltz2": "\"meanPlddt\": 96.45921661961785",
+      "protenix2": "\"meanPlddt\": 84.67090797424316",
+      "intellifold2": "\"meanPlddt\": 83.22122278929173",
+      "rosettafold3": "\"meanPlddt\": 81.53339809397752"
+    },
+    "spec-floor": {
+      "AF2": "\"checksum\": -1294937",
+      "AF3": "\"meanPlddt\": 83.13280757545179",
+      "OpenDDE": "\"meanPlddt\": 92.04126292903248",
+      "ESMFold2": "\"atomChecksum\": -128226",
+      "boltz2": "\"meanPlddt\": 96.45788437314981",
+      "protenix2": "\"meanPlddt\": 84.66979283322856",
+      "intellifold2": "\"meanPlddt\": 83.21916867134667",
+      "rosettafold3": "\"meanPlddt\": 81.53200262046401"
+    }
+  },
+  "recorded": "2026-09-15"
+}

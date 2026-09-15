@@ -21,9 +21,9 @@
  * ignored, because a search that runs and is discarded is a minute of somebody
  * else's server for no reason.
  */
-import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
-import { readTensor } from "../src/reference/dtype.js";
-import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
+import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+import { readTensor } from "../src/weights/dtype.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
 import {
   atomDecoderWeights, atomEncoderWeights, denoiserWeights, featuriserWeights,
   trunkBlockWeights,

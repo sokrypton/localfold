@@ -35,7 +35,7 @@
  */
 import {
   readTensor, readTensorAsFloat16, tensorByteLength,
-} from "../../src/reference/dtype.js";
+} from "../../src/weights/dtype.js";
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 import { foldEsmfold2 } from "../../src/esmfold2/fold.js";

@@ -193,7 +193,7 @@ def main():
     parser.add_argument("--template", action="append", metavar="PATH[:CHAIN]",
                         help="a PDB file to show the query as a TEMPLATE."
                              " 🔴 THE MODULE THIS EXISTS FOR IS THE ONE NOBODY"
-                             " CHECKS: src/af3/template-reference.js implements"
+                             " CHECKS: src/af3/trunk/template-reference.js implements"
                              " only the empty-template path and says so,"
                              " because with no template the six geometry"
                              " features are identically zero and nothing here"

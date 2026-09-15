@@ -22,9 +22,9 @@ const bust = `?v=${Date.now()}`;
 // asks for /src/... - which is what it did when it sat at the root.
 const src = (path) => import(`../${path}${bust}`);
 const { getDevice } = await src('web/model.js');
-const { HttpTensorStore } = await src('src/reference/http-tensor-store.js');
-const { AlphaFoldFixture } = await src('src/reference/alphafold-fixture.js');
-const { AlphaFoldUnifiedGpu } = await src('src/multimer/model.js');
+const { HttpTensorStore } = await src('src/bundles/http-tensor-store.js');
+const { AlphaFoldFixture } = await src('src/bundles/alphafold-fixture.js');
+const { AlphaFoldUnifiedGpu } = await src('src/af2/multimer/model.js');
 
 try {
   const q = new URLSearchParams(location.search);
@@ -87,7 +87,7 @@ try {
   // disk right now, including a re-export nobody has regenerated for yet. It is
   // cache-busted because pairing a stale manifest with fresh shards fails as
   // "invalid byte length", which names neither half.
-  const { loadManifest } = await src('src/reference/manifests/index.js');
+  const { loadManifest } = await src('src/bundles/manifests/index.js');
   const manifest = family === 'monomer' ? await loadManifest('monomer')
     : await fetch(`${dir}manifest.json?v=${Date.now()}`).then((r) => r.json());
   const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(dir, manifest));

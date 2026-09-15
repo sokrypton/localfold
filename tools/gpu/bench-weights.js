@@ -13,11 +13,11 @@
  * bytes, turning them into the tensors the loaders ask for (which for an int5
  * bundle means dequantising), and the loaders' own assembly.
  */
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { MODEL_BUNDLES, loadManifest } from "../../src/reference/manifests/index.js";
-import { confidenceWeights, trunkWeights } from "../../src/af3/weights.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { MODEL_BUNDLES, loadManifest } from "../../src/bundles/manifests/index.js";
+import { confidenceWeights, trunkWeights } from "../../src/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

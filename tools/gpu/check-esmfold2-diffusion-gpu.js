@@ -19,7 +19,7 @@
 // downcast off, which should make the answer WORSE against this dump - that is
 // the control, and it is what says the narrowing is the model rather than a
 // concession.
-import { readTensor } from "../../src/reference/dtype.js";
+import { readTensor } from "../../src/weights/dtype.js";
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../src/runtime/pipeline-cache.js";
 import { Esmfold2DenoiserGpu } from "../../src/esmfold2/diffusion-webgpu.js";

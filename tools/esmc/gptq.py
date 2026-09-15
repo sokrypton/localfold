@@ -15,7 +15,7 @@ OUTPUT on real protein sequences" - and they differ in how far they take it:
   full `H = 2 XᵀX`, and it is the method that made 3- and 4-bit LLMs usable.
 
 🔴 NEITHER CHANGES THE STORAGE FORMAT, WHICH IS THE POINT. Both emit exactly
-what `tools/quantize_af3.py` emits and `src/runtime/quantised-upload.js`
+what `tools/quantize_af3.py` emits and `src/weights/quantised-upload.js`
 decodes - asymmetric codes, one float16 scale and one float16 zero per group of
 32 - because a scheme that needs a new shader is a scheme that needs a new
 shader. GPTQ's group axis lines up for free: LocalFold groups 32 CONSECUTIVE

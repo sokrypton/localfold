@@ -5,7 +5,7 @@
  *       --steps=200 --model=/model-af3-int5/manifest.json
  *     node tools/gpu-chrome.mjs tools/gpu/fold.js --dump=/oracle-dumps/af3-6mrr.json
  *
- * --sequence folds what you type, through src/af3/featurise.js. --dump folds
+ * --sequence folds what you type, through src/af3/featurise/featurise.js. --dump folds
  * AF3's own batch and reports the disagreement at every point where the two can
  * be compared, which is the only way the trunk can be checked against AF3's.
  *
@@ -14,19 +14,19 @@
  * the page, because the page has to run what was measured.
  */
 import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
-import { af3ContactClasses } from "../../src/af3/contact-classes.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+import { af3ContactClasses } from "../../src/af3/featurise/contact-classes.js";
 import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
-import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
 import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
-  from "../../src/af3/weights.js";
+  from "../../src/af3/weights/weights.js";
 import { warmTrunkPipelines } from "../../src/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
+  from "../../src/af3/weights/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
 import { dialectFor , featuriserDialect } from "../../src/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
@@ -53,7 +53,7 @@ function relativeRms(actual, expected) {
 }
 
 /**
- * AF3's own batch, in the shape src/af3/featurise.js produces, so the fold reads
+ * AF3's own batch, in the shape src/af3/featurise/featurise.js produces, so the fold reads
  * one object either way and the two paths cannot silently diverge in what they
  * supply.
  */
@@ -195,7 +195,7 @@ export async function main(device, args) {
   // and prints an N-CA of 27 A next to an ideal of 1.46, which reads as
   // corrupted weights rather than as the wrong flag. The flow reaches a
   // structure in eight because it is a different walk - see
-  // src/af3/diffusion-sampler-webgpu.js - so say so rather than let the
+  // src/af3/diffusion/diffusion-sampler-webgpu.js - so say so rather than let the
   // geometry report take the blame.
   if (samplerMode === "diffusion" && steps < 50) {
     console.log(`🔴 ${steps} steps of the DIFFUSION sampler will not converge -`
@@ -692,7 +692,7 @@ export async function main(device, args) {
     // 🔴 THE ONLY EARLY STOP A TRUNK-ONLY RECYCLE CAN HAVE, in ANGSTROMS, on
     // the distances the distogram predicts - the same quantity and unit as
     // AF2's, whose ColabFold default is 0.5. 0 is off; see
-    // src/model/feature-convergence.js and docs/AF3.md for what has actually
+    // src/af3/feature-convergence.js and docs/AF3.md for what has actually
     // been measured, which is two inputs' worth and not a corpus.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     steps, stopAfter: Number(option(args, "truncate", String(steps))),
@@ -942,7 +942,7 @@ export async function main(device, args) {
     denoisedPdb: toPdb(batch, lastDenoised, result.scores?.plddt),
     // Per recycle, how far the trunk's single and pair moved from the pass
     // before. A trunk-only recycle produces no coordinates, so this is the only
-    // convergence signal there is - see src/model/feature-convergence.js.
+    // convergence signal there is - see src/af3/feature-convergence.js.
     recycleDeltas: result.recycleDeltas?.map((d) => ({
       pass: d.pass,
       pair: Number(d.pair.toExponential(3)),

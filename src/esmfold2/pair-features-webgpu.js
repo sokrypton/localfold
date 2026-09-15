@@ -5,7 +5,7 @@
  * is a row lookup or a broadcast - `relativePositionEncoding` adds four weight
  * rows a pair and `zInitFromInputs` broadcasts two per-token projections - so
  * the arithmetic is trivial and there is 90,000 of it at 300 tokens, four times
- * over if the recycle runs on the host as well. src/esmfold2/featuriser-reference.js
+ * over if the recycle runs on the host as well. src/esmfold2/pair-features-reference.js
  * is the specification and the oracle; this is the same arithmetic in a shader.
  *
  * 🔴 AND `rel_pos` IS NEEDED TWICE, WHICH IS WHY IT IS A BUFFER AND NOT A PASS.
@@ -13,7 +13,7 @@
  * onto the trunk's pair - so it outlives the trunk and is kept.
  */
 import { GRID_WIDTH, LANES } from "../esmc/block-webgpu.js";
-import { relativePositionBins } from "./featuriser-reference.js";
+import { relativePositionBins } from "./pair-features-reference.js";
 
 /**
  * The four relative-position blocks, gathered from their bins.

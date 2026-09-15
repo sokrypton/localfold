@@ -1,5 +1,5 @@
 /**
- * AF3's diffusion head, whole: GPU against src/af3/diffusion-reference.js.
+ * AF3's diffusion head, whole: GPU against src/af3/diffusion/diffusion-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-diffusion-head.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-diffusion-head.js --noise=160
@@ -15,11 +15,11 @@
  * at sigma = 16 (SIGMA_DATA) skip and out are both 1/2 - so a swapped pair of
  * scalings is invisible there and nowhere else.
  */
-import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
-import { diffusionHead } from "../../src/af3/diffusion-reference.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
-import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/atom-encoder-reference.js";
-import { openAf3Store } from "../../src/af3/weights.js";
+import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { diffusionHead } from "../../src/af3/diffusion/diffusion-reference.js";
+import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
+import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";

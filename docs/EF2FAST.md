@@ -8,7 +8,7 @@ fold from a single sequence in a browser. Everything before that is the port.
 
 🔴 **IT IS AF3's PAIRFORMER BLOCK WITH THE GRID ATTENTIONS AND THE SINGLE TRACK
 REMOVED, AND THAT IS MEASURED.** `tools/check-esmfold2-trunk.js` composes
-`src/af3/pairformer-reference.js`'s three surviving pieces 24 times and scores
+`src/af3/trunk/pairformer-reference.js`'s three surviving pieces 24 times and scores
 them against the values the native model recorded going into and coming out of
 its trunk at each of its four recycles: **relRMS 1.4e-6** against a 2e-4 bound.
 So the port needed no new arithmetic, only the weights in AF3's shapes -
@@ -119,7 +119,7 @@ self-attention** over atoms, half-window 64, whose only positional signal is a
 raw index, the diagonal is always allowed, the blocks are adaLN-Zero with
 **affine-free RMSNorm**, and q/k take a second affine-free RMSNorm before the
 rotation. Nothing in the shapes says any of this: both are "an atom transformer
-at 128 channels". `src/esmfold2/atom-encoder-reference.js`.
+at 128 channels". `src/af3/diffusion/atom-encoder-reference.js`.
 
 🔴 **THE DIFFUSION MODULE IS `structure_head`, AND ITS CONDITIONING IS PORTED.**
 345 tensors, and the shape of it: conditioning, then the SAME SWA atom encoder
@@ -2537,7 +2537,7 @@ own 0.99 / 7.06, and its median crystal RMSD is 2.53 against float32's 2.52.
 `tools/quantize_af3.py` records int5 group-32 asymmetric costing AF3 nothing
 either (0.66 A against float32's 0.69, inside the spread between diffusion
 seeds). Two models, two graphs, one packer, the same verdict - and LocalFold
-already has the GPU decoder for it (`src/runtime/quantised-upload.js`).
+already has the GPU decoder for it (`src/weights/quantised-upload.js`).
 
 🔴 **int4 IS THE EDGE AND int3 IS OVER IT**, which is again where AF3 lands.
 int4's worst case (13.17 A) is nearly twice the worst the sampler produces on
@@ -2785,7 +2785,7 @@ writes ONE shared table for the whole tower - 1024 entries of 4 float16 is
 **8 KB** - so decoding a weight is an index into it and a multiply by the
 group's scale, against int5's shift-mask-across-a-byte-boundary. LocalFold
 already expands quantised weights into a dense float16 buffer in one dispatch
-(`src/runtime/quantised-upload.js`); this is that same dispatch with a simpler
+(`src/weights/quantised-upload.js`); this is that same dispatch with a simpler
 body. It is not the same shader, but it is not a harder one.
 
 🔴 **AND THE ROTATION - QuIP#'s OTHER HALF - IS NOT WORTH IT HERE.** Multiplying
@@ -2860,7 +2860,7 @@ than for an error nothing will make. Five passes per block instead of one, and
 the whole 573M tower takes **70 seconds on an A100**.
 
 🔴 **AND NEITHER METHOD CHANGES THE STORAGE FORMAT, WHICH IS WHY THESE TWO AND
-NOT THE OTHERS.** Both emit exactly what `src/runtime/quantised-upload.js`
+NOT THE OTHERS.** Both emit exactly what `src/weights/quantised-upload.js`
 already decodes: asymmetric codes, one float16 scale and one float16 zero per
 group of 32. GPTQ's group axis lines up for free - LocalFold groups 32
 CONSECUTIVE elements of a row-major `(out, in)` tensor, which is 32 consecutive

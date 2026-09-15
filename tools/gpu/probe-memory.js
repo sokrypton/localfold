@@ -13,11 +13,11 @@
  * This walks the load in stages and reports usedJSHeapSize after each, so the
  * cost of each retention can be named rather than guessed at.
  */
-import { openAf3Store, trunkWeights, confidenceWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights, diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { openAf3Store, trunkWeights, confidenceWeights } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights, diffusionWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 
 const option = (args, name, fallback) => {

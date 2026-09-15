@@ -28,10 +28,10 @@ import {
   GpuMemoryBudgetError, memoryBudgetBytes, noteAllocation, noteDestroy,
   noteResidencyRefused, residencyAllowed,
 } from "../runtime/device-memory.js";
-import { float32ToFloat16Array } from "../runtime/float16.js";
+import { float32ToFloat16Array } from "../weights/float16.js";
 import { halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
+import { planBlockUpload, runBlockUpload } from "../weights/quantised-upload.js";
 import {
   GRID_WIDTH, LANES, createAttentionShader, createLayerNormShader,
   createLinearShader, createPrepareShader, createSwigluShader, linearGrid,
@@ -170,7 +170,7 @@ function residentBlocks(device, key) {
 async function decodeIntoOnDevice(device, source, elements, destination) {
   if (source === undefined || source === null) return false;
   // A thunk in the shape planBlockUpload reads: it never calls it, it only
-  // wants the store, the name and the range. See src/af3/weights.js.
+  // wants the store, the name and the range. See src/af3/weights/weights.js.
   const thunk = () => { throw new Error("the device decoder does not call the thunk"); };
   thunk.store = { tensorSource: () => source };
   thunk.tensorName = "tower";
@@ -181,7 +181,7 @@ async function decodeIntoOnDevice(device, source, elements, destination) {
   const release = await runBlockUpload(device, planned.gpu, destination);
   // 🔴 NOT AWAITED. The staging goes when the queue says so; waiting here would
   // put a host-device synchronisation inside the block loop, which is the one
-  // thing this loop is written to avoid. See src/af3/device-weights.js.
+  // thing this loop is written to avoid. See src/af3/weights/device-weights.js.
   void device.queue.onSubmittedWorkDone().then(release);
   return true;
 }

@@ -21,10 +21,10 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { packOuterProductMeanWeights } from "../src/af3/outer-product-mean-webgpu.js";
-import { packGridAttentionWeights } from "../src/af3/grid-attention-webgpu.js";
-import { packTransitionWeights } from "../src/af3/transition-webgpu.js";
-import { packNamedWeights } from "../src/runtime/weight-pack.js";
+import { packOuterProductMeanWeights } from "../src/af3/trunk/outer-product-mean-webgpu.js";
+import { packGridAttentionWeights } from "../src/af3/trunk/grid-attention-webgpu.js";
+import { packTransitionWeights } from "../src/af3/trunk/transition-webgpu.js";
+import { packNamedWeights } from "../src/weights/weight-pack.js";
 
 /**
  * A tensor whose every element is distinct and non-zero, tagged by `mark`, so a
@@ -174,7 +174,7 @@ describe("packNamedWeights", () => {
 
 describe("carriesTensor, the presence rule that cost 7x", () => {
   it("asks the SOURCES map and never touches the value", async () => {
-    const { SOURCES, carriesTensor } = await import("../src/runtime/weight-sources.js");
+    const { SOURCES, carriesTensor } = await import("../src/weights/weight-sources.js");
     let decodes = 0;
     const weights = {
       [SOURCES]: { present: { count: 4 }, absent: null },
@@ -189,7 +189,7 @@ describe("carriesTensor, the presence rule that cost 7x", () => {
   });
 
   it("falls back to the value when there is no SOURCES map", async () => {
-    const { carriesTensor } = await import("../src/runtime/weight-sources.js");
+    const { carriesTensor } = await import("../src/weights/weight-sources.js");
     assert.equal(carriesTensor({ a: new Float32Array(2) }, "a"), true);
     assert.equal(carriesTensor({ a: undefined }, "a"), false);
     // 🔴 `null` IS HOW THE LOADER SAYS ABSENT. A strict `!== undefined` here is
@@ -200,11 +200,11 @@ describe("carriesTensor, the presence rule that cost 7x", () => {
 
   it("is what the five former predicates now call", async () => {
     const { blockHasUpGate, blockHasKqNorm } =
-      await import("../src/af3/atom-encoder-webgpu.js");
+      await import("../src/af3/diffusion/atom-encoder-webgpu.js");
     const { txHasUpGate, txHasKqNorm } =
-      await import("../src/af3/diffusion-transformer-webgpu.js");
-    const { hasBondTypes } = await import("../src/af3/embedder-webgpu.js");
-    const { SOURCES } = await import("../src/runtime/weight-sources.js");
+      await import("../src/af3/diffusion/diffusion-transformer-webgpu.js");
+    const { hasBondTypes } = await import("../src/af3/trunk/embedder-webgpu.js");
+    const { SOURCES } = await import("../src/weights/weight-sources.js");
     const block = { [SOURCES]: { ffwAToB: { count: 1 }, queryLayerNormScale: null } };
     assert.equal(blockHasUpGate(block), true);
     assert.equal(txHasUpGate(block), true);

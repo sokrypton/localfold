@@ -27,9 +27,9 @@
  * download besides. It makes the numbers meaningless as biology and perfectly
  * good as a fingerprint, which is what a regression needs.
  *
- * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. src/multimer/block.js
+ * 🔴 MULTIMER SHARES EVERY KERNEL AND HAD NO GATE AT ALL. src/af2/multimer/block.js
  * builds its blocks from the same attention, transition and outer-product-mean
- * shaders src/evoformer/block.js does, with its own dispatches - so a tile
+ * shaders src/af2/evoformer/block.js does, with its own dispatches - so a tile
  * changed in one and not threaded through the other is a bug that only a
  * multimer fold can see. `--family=multimer` runs that path, through
  * AlphaFoldUnifiedGpu and the multimer regime the page passes (outer product
@@ -44,10 +44,10 @@
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { noteResidencyRefused, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../../src/multimer/model.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../../src/af2/multimer/model.js";
 import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
 import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js";
 
@@ -183,7 +183,7 @@ export async function main(device, args) {
   // ...the LOCAL bundle, by directory rather than through web/model.js's
   // loadModel: that resolves the monomer family to its remote base, and this
   // machine should not pull 227 MB to run a regression.
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES[family].directory, await loadManifest(family));
   // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in

@@ -1,12 +1,23 @@
+/**
+ * Every attention kernel variant over one real fixture, timed and held to the
+ * fixture's expected output.
+ *
+ *     npm run bench:attention
+ *
+ * 🔴 IT NEEDS `test/fixtures/evoformer/model1-a3m-59-stack`, WHICH IS NOT IN THE
+ * REPOSITORY. `tools/gpu/check-attention-variants.js` asks the same question
+ * through the Chrome lane and builds its own input, so it runs here;
+ * `tools/gpu/bench-msa-attention.js` is the timing half.
+ */
 import { create, globals } from "webgpu";
 import {
   AttentionGpu,
 
-} from "../src/evoformer/attention.js";
+} from "../src/kernels/attention.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 
 const MANIFEST = "test/fixtures/evoformer/model1-a3m-59-stack/manifest.json";
 const VARIANTS = [

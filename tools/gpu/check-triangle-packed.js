@@ -13,8 +13,8 @@
  * then runs the contraction on each and compares that. Whichever comparison is
  * the first to blow up is the kernel at fault.
  */
-import { createTriangleShaders } from "../../src/triangle/shaders.js";
-import { packWeights } from "../../src/triangle/weights.js";
+import { createTriangleShaders } from "../../src/kernels/triangle/shaders.js";
+import { packWeights } from "../../src/kernels/triangle/weights.js";
 import { unpackHalfWords } from "../../src/runtime/storage.js";
 
 const option = (args, name, fallback) => {

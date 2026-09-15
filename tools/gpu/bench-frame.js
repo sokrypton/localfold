@@ -24,7 +24,7 @@
  * paint. "Looks" is doing real work in that sentence: to settle it, instrument
  * onFrame in web/app.js and read the numbers off a real fold.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { toPdb, normalFrom } from "../../src/af3/fold.js";
 import { yieldToBrowser } from "../../src/runtime/yield.js";
 

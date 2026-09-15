@@ -19,7 +19,7 @@
  * not. Whether that ever changes the f16 result is an empirical question about
  * the numbers a real model holds.
  */
-import { readTensorRange } from "../../src/reference/dtype.js";
+import { readTensorRange } from "../../src/weights/dtype.js";
 
 const GROUP = 32;
 const GROUP_BYTES = 20;

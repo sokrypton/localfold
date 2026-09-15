@@ -28,8 +28,8 @@
  * when the scalar work in its body changed, with each 5-6% worse at the
  * other's tile.
  */
-import { Af3GridSelfAttentionGpu } from "../../src/af3/grid-attention-webgpu.js";
-import { supportsGridAttendMatrix } from "../../src/af3/grid-attention-matrix.js";
+import { Af3GridSelfAttentionGpu } from "../../src/af3/trunk/grid-attention-webgpu.js";
+import { supportsGridAttendMatrix } from "../../src/af3/trunk/grid-attention-matrix.js";
 import { profileDevice } from "./profile.js";
 
 const DIALECT = { swapTransposedBias: false };

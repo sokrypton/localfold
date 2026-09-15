@@ -54,11 +54,11 @@
  * sigma0 = 160 is the setting that is defensible for both: 0.047 against 0.168
  * on the ligand at sixteen steps, for 0.025 A of backbone RMSD on 1QYS.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { foldWeights } from "../../src/af3/diffusion-weights.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 /** sigmaMax is in units of sigmaData, so the walk starts at sigmaData*sigmaMax. */
 const SIGMA_DATA = 16;

@@ -14,12 +14,12 @@
  * no bound would catch. If this ever reports a difference, the GPU path is
  * wrong; there is no acceptable non-zero here.
  */
-import { openAf3Store, SOURCES } from "../../src/af3/weights.js";
-import { diffusionWeights } from "../../src/af3/diffusion-weights.js";
+import { openAf3Store, SOURCES } from "../../src/af3/weights/weights.js";
+import { diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
 import { BLOCK_ORDER, packBlockWeights }
-  from "../../src/af3/diffusion-transformer-webgpu.js";
-import { planBlockUpload, runBlockUpload } from "../../src/runtime/quantised-upload.js";
-import { writeInto } from "../../src/runtime/float16.js";
+  from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
+import { planBlockUpload, runBlockUpload } from "../../src/weights/quantised-upload.js";
+import { writeInto } from "../../src/weights/float16.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

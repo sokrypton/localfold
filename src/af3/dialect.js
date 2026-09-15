@@ -57,7 +57,7 @@ export const ALPHAFOLD3 = Object.freeze({
   // which is the reference implementation and keeps the uncentred CCD
   // ideals. It moves the RAW ref_pos channel only - the atom encoder also
   // reads a translation-invariant pairwise difference - which is why it
-  // hid. See src/af3/featurise.js.
+  // hid. See src/af3/featurise/featurise.js.
   centreRefConformers: false,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
@@ -198,7 +198,7 @@ export const ALPHAFOLD3 = Object.freeze({
   // frames, distograms all are - so the gradient of the improper-dihedral error
   // is the only thing that prefers an L amino acid to a D one, and upstream
   // records it asserting the L enantiomer over eleven D residues. See
-  // `chiralCentres` for the rule and src/af3/chiral-gradient.js for the term.
+  // `chiralCentres` for the rule and src/af3/diffusion/chiral-gradient.js for the term.
   chiralCentres: false,
   confidenceCaDgram: false,
   // 🔴 WITH NO ALIGNMENT, THIS FAMILY GETS THE QUERY ONCE AND AlphaFold 3 GETS
@@ -241,7 +241,7 @@ export const ALPHAFOLD3 = Object.freeze({
   // 🔴 RoseTTAFold3 SCALES THE TRIANGLE CONTRACTION BY 1/L, and it is
   // observable ONLY because the centre LayerNorm's epsilon does not commute
   // with a scale - which is also why it cannot be folded into a weight. See
-  // src/triangle/shaders.js for where the GPU applies it and why there rather
+  // src/kernels/triangle/shaders.js for where the GPU applies it and why there rather
   // than in the contraction.
   triangleMulDivideByLength: false,
   structuralTokens: false,
@@ -282,7 +282,7 @@ export const OPENBIND0 = Object.freeze({
   // which is the reference implementation and keeps the uncentred CCD
   // ideals. It moves the RAW ref_pos channel only - the atom encoder also
   // reads a translation-invariant pairwise difference - which is why it
-  // hid. See src/af3/featurise.js.
+  // hid. See src/af3/featurise/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
@@ -352,7 +352,7 @@ export const OPENBIND0 = Object.freeze({
  * primitives rather than DeepMind's.
  *
  * 🔴 IT IS THE FIRST BUNDLE HERE WHOSE WIDTHS ARE NOT AlphaFold 3's, which is
- * why `src/af3/weights.js` derives every width from the tensor that states it
+ * why `src/af3/weights/weights.js` derives every width from the tensor that states it
  * rather than declaring it. The pair track is 384 channels against AF3's 128,
  * the MSA 128 against 64, the triangle attention 12 heads against 4 (and 2 in
  * the template stack against 4), and the distogram 96 bins against 64. Every
@@ -409,7 +409,7 @@ export const OPENDDE = Object.freeze({
   // which is the reference implementation and keeps the uncentred CCD
   // ideals. It moves the RAW ref_pos channel only - the atom encoder also
   // reads a translation-invariant pairwise difference - which is why it
-  // hid. See src/af3/featurise.js.
+  // hid. See src/af3/featurise/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
@@ -490,7 +490,7 @@ export const OPENDDE = Object.freeze({
   // backbone token and a sidechain one, glycine staying single - and runs the
   // diffusion and its confidence head on those. That is a second token space
   // threaded through the atom layouts, not a flag, so this says only that the
-  // bundle wants one. See `src/af3/structural-tokens.js`.
+  // bundle wants one. See `src/af3/featurise/structural-tokens.js`.
   confidenceGlobalNorm: false,
   chiralCentres: false,
   confidenceCaDgram: false,
@@ -533,7 +533,7 @@ export const OPENDDE = Object.freeze({
  * OpenDDE builds the pair from `s_init` and its `left_single` is [384, 384];
  * this bundle's is **[447, 256]**, a target_feat-wide input, so it builds the
  * pair AlphaFold 3's way. The reference has no convention list for this - the
- * shape is the statement - which is why src/af3/embedder-reference.js reads the
+ * shape is the statement - which is why src/af3/trunk/embedder-reference.js reads the
  * flag AND the shape and refuses to default either.
  *
  * Every width is the tensor's and none is written down here: 48 trunk blocks of
@@ -647,7 +647,7 @@ export const PROTENIX2 = Object.freeze({
   // which is the reference implementation and keeps the uncentred CCD
   // ideals. It moves the RAW ref_pos channel only - the atom encoder also
   // reads a translation-invariant pairwise difference - which is why it
-  // hid. See src/af3/featurise.js.
+  // hid. See src/af3/featurise/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: 21,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
@@ -809,7 +809,7 @@ export const BOLTZ2 = Object.freeze({
   // which is the reference implementation and keeps the uncentred CCD
   // ideals. It moves the RAW ref_pos channel only - the atom encoder also
   // reads a translation-invariant pairwise difference - which is why it
-  // hid. See src/af3/featurise.js.
+  // hid. See src/af3/featurise/featurise.js.
   centreRefConformers: true,
   emptyTemplateAatype: null,
   // 🔴 THE FUSED EMBEDDER'S FEATURE LAYOUT, for the models that HAVE a fused
@@ -959,7 +959,7 @@ export const INTELLIFOLD2 = Object.freeze({
  * IMPLEMENTED HERE:
  *
  *   triangleMulDivideByLength  the contraction is scaled by 1/L. See the flag's
- *                       note on ALPHAFOLD3 and src/triangle/shaders.js.
+ *                       note on ALPHAFOLD3 and src/kernels/triangle/shaders.js.
  *
  * DECLARED AND NOT IMPLEMENTED - every one of these is a real difference:
  *
@@ -1155,7 +1155,7 @@ export const DIALECTS = Object.freeze({
  * `dropTerminalAtoms` and `dedupeSelfMsa` by name - which is the allow-list
  * shape CLAUDE.md already records twice, once for `predictA3m` dropping
  * `pairHost` and taking the contact overlay off the shipped page, and once for
- * src/multimer/model.js dropping the whole multimer regime. Both were fixed by
+ * src/af2/multimer/model.js dropping the whole multimer regime. Both were fixed by
  * forwarding the object. This is that fix, before the third instance costs
  * anything: a convention added to the table reaches every caller, and a caller
  * that wants a subset can still spread and override.

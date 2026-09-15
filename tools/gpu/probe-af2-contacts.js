@@ -37,9 +37,9 @@
  * folded or not, so scoring them inflates every number and would hide exactly
  * the failure this is looking for. |i - j| >= 6, the usual short-range cut.
  */
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
 import { distogramContactProbabilities } from "../../src/heads/distogram.js";
 
 const option = (args, name, fallback) => {
@@ -82,7 +82,7 @@ export async function main(device, args) {
   // be asked about at all.
   const extraRows = Number(option(args, "extra", String(rows)));
 
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"));
   const fixture = AlphaFoldFixture.fromStore(store);

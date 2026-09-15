@@ -28,16 +28,16 @@
  * checker at all. `check-af3-single-attention.js` exists but is pinned to the
  * trunk's 384 with its own hand-built weights.
  */
-import { af3TriangleMultiplication } from "../../src/af3/triangle-webgpu.js";
-import { Af3GridSelfAttentionGpu } from "../../src/af3/grid-attention-webgpu.js";
+import { af3TriangleMultiplication } from "../../src/af3/trunk/triangle-webgpu.js";
+import { Af3GridSelfAttentionGpu } from "../../src/af3/trunk/grid-attention-webgpu.js";
 import {
   gridSelfAttention, pairformerBlock, transition, triangleMultiplication,
-} from "../../src/af3/pairformer-reference.js";
-import { Af3TransitionGpu } from "../../src/af3/transition-webgpu.js";
-import { Af3PairformerStackGpu } from "../../src/af3/pairformer-block-webgpu.js";
+} from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3TransitionGpu } from "../../src/af3/trunk/transition-webgpu.js";
+import { Af3PairformerStackGpu } from "../../src/af3/trunk/pairformer-block-webgpu.js";
 import {
   af3Dialect, confidenceWeights, msaBlockWeights, openAf3Store, pairformerBlockWeights,
-} from "../../src/af3/weights.js";
+} from "../../src/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

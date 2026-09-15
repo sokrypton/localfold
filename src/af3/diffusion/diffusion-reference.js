@@ -1,0 +1,596 @@
+/**
+ * AF3's diffusion head: the part that produces coordinates.
+ *
+ * The trunk predicts a distogram; this predicts atoms. It is a DENOISER, not a
+ * generator: given noisy positions and the noise level they carry, it returns
+ * its estimate of the clean structure, and the sampler in
+ * diffusion-sampler-reference.js calls it two hundred times down a noise
+ * schedule.
+ *
+ *     conditioning   trunk single + target_feat -> 384,  trunk pair + relative
+ *                    encoding -> 128, plus a Fourier embedding of the noise
+ *     encoder        the noisy positions, through the SAME atom cross-attention
+ *                    encoder the trunk uses, now with the trunk conditioning
+ *     transformer    24 blocks over tokens at 768 channels
+ *     decoder        back down to atoms, and out as a position update
+ *
+ * 🔴 THE 203 M PARAMETERS ARE NOT 203 M OF NEW IDEAS. 198 M of them - 98% - are
+ * the 24-block transformer, which is the AdaLN-conditioned attention already
+ * written for the atom stack at different widths. Its atom encoder and decoder
+ * are 0.9 M each and are literally atom-encoder-reference.js with other
+ * weights. What is genuinely new here is the conditioning and the scaling.
+ *
+ * 🔴 THE OUTPUT IS A BLEND, NOT A PREDICTION. AF3 returns
+ * `skip * positions_noisy + out * update`, where the two coefficients depend on
+ * the noise level: at high noise the update dominates, at low noise the input
+ * does. Returning the update alone type-checks, runs, and produces a structure
+ * that is wrong in a way that looks like a bad model rather than a bug.
+ */
+import { adaptiveLayerNorm, adaptiveZeroInit, atomPairLogits, convert,
+         crossAttentionBlock, layerNormSlow } from "./atom-encoder-reference.js";
+import { linear } from "../trunk/pairformer-reference.js";
+import { relativeEncoding } from "../trunk/embedder-reference.js";
+import { singleCondPadding, singleCondSource } from "../dialect.js";
+
+/** AF3's assumed data scale, in angstroms. Every noise level is relative to it. */
+export const SIGMA_DATA = 16.0;
+
+/**
+ * The Fourier embedding of a noise level: cos(2*pi * (log(sigma_scaled)/4 * w + b)).
+ *
+ * 🔴 THE WEIGHT AND BIAS COME FROM THE MODEL, ALWAYS, AND THERE IS NO DEFAULT.
+ * Stock AF3 keeps them as frozen constants in its SOURCE rather than its
+ * checkpoint, while every ported model of the lineage trained its own - so a
+ * table compiled in here would be correct for exactly one checkpoint and would
+ * silently apply somebody else's random projection to the rest.
+ * tools/export_af3_model.py resolves that at export time: it writes AF3's
+ * constants under the same tensor names a ported model already uses, so one
+ * loader reads either and this function needs no opinion.
+ *
+ * @param {number} scaledNoiseLevel  the noise level ALREADY divided by SIGMA_DATA
+ * @param {Float32Array} weight      fourier_embedding_weight, from the model
+ * @param {Float32Array} bias        fourier_embedding_bias, from the model
+ */
+export function noiseEmbedding(scaledNoiseLevel, weight, bias) {
+  if (weight === undefined || bias === undefined) {
+    throw new Error("the Fourier embedding's weight and bias must come from the"
+      + " model: AF3 keeps them in its source and ported models train their own,"
+      + " so there is no correct default");
+  }
+  const transformed = 0.25 * Math.log(scaledNoiseLevel);
+  const output = new Float32Array(weight.length);
+  for (let index = 0; index < weight.length; index += 1) {
+    output[index] = Math.cos(2 * Math.PI * (transformed * weight[index] + bias[index]));
+  }
+  return output;
+}
+
+const sigmoid = (value) => 1 / (1 + Math.exp(-value));
+const swish = (value) => value * sigmoid(value);
+
+/**
+ * A transition block with AdaLN conditioning, or none.
+ *
+ * The trunk's transitions have a learned LayerNorm and no conditioning; these
+ * take both their scale and their shift from `cond`, and gate the result. With
+ * `cond` null it degrades to the plain form, which is what the two conditioning
+ * transitions in _conditioning use.
+ */
+export function conditionedTransition(x, cond, rows, channels, factor, weights,
+                                      prefix, condChannels = channels) {
+  const intermediate = channels * factor;
+  // 🔴 THE KEY NAMES FOLLOW adaptiveLayerNorm'S, which prefixes with "ffw" and
+  // then capitalises the leaf - so a conditioned transition reads
+  // `ffwTransition1`, not `FfwTransition1`. Getting it wrong hands `linear` an
+  // undefined weight, which at least throws; the danger is "fixing" it by
+  // renaming here and silently splitting the convention in two.
+  const normalised = cond === null
+    ? layerNormSlow(x, rows, channels, weights[`${prefix}ffwLayerNormScale`],
+                    weights[`${prefix}ffwLayerNormOffset`])
+    : adaptiveLayerNorm(x, cond, rows, channels, weights, `${prefix}ffw`, condChannels);
+  const wide = linear(normalised, rows, channels, intermediate * 2,
+                      weights[`${prefix}ffwTransition1`]);
+  const gated = new Float32Array(rows * intermediate);
+  for (let row = 0; row < rows; row += 1) {
+    for (let i = 0; i < intermediate; i += 1) {
+      gated[row * intermediate + i] = swish(wide[row * intermediate * 2 + i])
+        * wide[row * intermediate * 2 + intermediate + i];
+    }
+  }
+  // 🔴 boltz2's EXTRA UP-GATE, and it is gated on `cond` as well as on the
+  // weight: boltz2's plain Transition - the one the diffusion conditioning's
+  // four transitions use - has NO up-gate, and only its adaLN-conditioned
+  // ConditionedTransitionBlock does. `cond === null` is exactly that
+  // distinction, which is why the branch sits above the unconditioned return.
+  if (cond !== null && weights[`${prefix}ffwAToB`]) {
+    const upGate = linear(normalised, rows, channels, intermediate,
+                          weights[`${prefix}ffwAToB`]);
+    for (let index = 0; index < gated.length; index += 1) gated[index] *= upGate[index];
+  }
+  if (cond === null) {
+    return linear(gated, rows, intermediate, channels,
+                  weights[`${prefix}ffwTransition2`]);
+  }
+  return adaptiveZeroInit(gated, cond, rows, channels, weights, `${prefix}ffw`,
+                          condChannels, intermediate);
+}
+
+/**
+ * Self-attention over tokens, conditioned by AdaLN and biased by the pair.
+ *
+ * @param {Float32Array} act        tokens * channels
+ * @param {Float32Array} cond       tokens * condChannels
+ * @param {Float32Array} pairLogits heads * tokens * tokens
+ * @param {Float32Array} mask       tokens
+ */
+export function conditionedSelfAttention(act, cond, pairLogits, mask, shape, weights) {
+  const { tokens, channels, condChannels, heads, dimension } = shape;
+  // 🔴 A MISSING HEAD COUNT IS NOT AN ERROR IN JAVASCRIPT, IT IS A ZERO. This
+  // read `weights.heads` while the head count lives on the transformer config
+  // rather than the per-block weights, so the loop below ran zero times and the
+  // whole attention branch returned an array of zeros - no exception, no NaN,
+  // just a residual stream missing half its updates. It cost a bisection down
+  // to the block to find, past four stages that were all exact.
+  if (!Number.isInteger(heads) || !Number.isInteger(dimension)) {
+    throw new Error(`conditionedSelfAttention needs heads and dimension,`
+      + ` got ${heads} and ${dimension}`);
+  }
+  const width = heads * dimension;
+  // 🔴 THE SCALE IS THE PER-HEAD DIMENSION, taken AFTER the division by the
+  // head count - AF3 writes `key_dim = key_dim // num_head` and only then
+  // `key_dim ** -0.5`. Using the full 768 instead of 48 is a factor of four on
+  // every logit, which softmax turns into a much flatter attention.
+  const scale = 1 / Math.sqrt(dimension);
+  const x = adaptiveLayerNorm(act, cond, tokens, channels, weights, "", condChannels);
+  const q = linear(x, tokens, channels, width, weights.qProjection, weights.qBias);
+  const k = linear(x, tokens, channels, width, weights.kProjection);
+  const v = linear(x, tokens, channels, width, weights.vProjection);
+
+  const gathered = new Float32Array(tokens * width);
+  const logits = new Float32Array(tokens);
+  for (let head = 0; head < heads; head += 1) {
+    for (let i = 0; i < tokens; i += 1) {
+      for (let j = 0; j < tokens; j += 1) {
+        let dot = 0;
+        for (let d = 0; d < dimension; d += 1) {
+          dot += q[i * width + head * dimension + d] * k[j * width + head * dimension + d];
+        }
+        logits[j] = dot * scale + 1e9 * (mask[j] - 1)
+          + pairLogits[(head * tokens + i) * tokens + j];
+      }
+      let largest = -Infinity;
+      for (let j = 0; j < tokens; j += 1) if (logits[j] > largest) largest = logits[j];
+      let total = 0;
+      for (let j = 0; j < tokens; j += 1) {
+        logits[j] = Math.exp(logits[j] - largest);
+        total += logits[j];
+      }
+      for (let d = 0; d < dimension; d += 1) {
+        let sum = 0;
+        for (let j = 0; j < tokens; j += 1) {
+          sum += logits[j] * v[j * width + head * dimension + d];
+        }
+        gathered[i * width + head * dimension + d] = sum / total;
+      }
+    }
+  }
+
+  const gate = linear(x, tokens, channels, width, weights.gatingQuery);
+  for (let index = 0; index < gathered.length; index += 1) {
+    gathered[index] *= sigmoid(gate[index]);
+  }
+  return adaptiveZeroInit(gathered, cond, tokens, channels, weights, "",
+                          condChannels, width);
+}
+
+/**
+ * The 24-block token transformer.
+ *
+ * 🔴 THE BLOCKS ARE NESTED SIX BY FOUR, AND THE PAIR LOGITS FOLLOW THAT NESTING.
+ * The LayerNorm over the pair conditioning is computed ONCE and shared, but each
+ * of the six SUPER-BLOCKS then projects it to its own four blocks' worth of
+ * head biases. So there are six projections, not one and not twenty-four, and a
+ * flat reading of the stack indexes the wrong weights for every block after the
+ * fourth.
+ */
+export function diffusionTransformer(act, cond, pairCond, mask, tokens, weights) {
+  const channels = weights.channels;
+  const condChannels = weights.condChannels;
+  const heads = weights.heads;
+  const perSuper = weights.blocksPerSuperBlock;
+  const pairs = tokens * tokens;
+
+  const normalisedPair = layerNormSlow(pairCond, pairs, weights.pairChannels,
+                                       weights.pairInputLayerNormScale, null);
+  let current = act;
+  for (let superBlock = 0; superBlock < weights.superBlocks.length; superBlock += 1) {
+    const group = weights.superBlocks[superBlock];
+    const flat = linear(normalisedPair, pairs, weights.pairChannels, perSuper * heads,
+                        group.pairLogitsProjection);
+    for (let inner = 0; inner < perSuper; inner += 1) {
+      const pairLogits = new Float32Array(heads * pairs);
+      for (let i = 0; i < tokens; i += 1) {
+        for (let j = 0; j < tokens; j += 1) {
+          const source = (i * tokens + j) * perSuper * heads + inner * heads;
+          for (let head = 0; head < heads; head += 1) {
+            pairLogits[(head * tokens + i) * tokens + j] = flat[source + head];
+          }
+        }
+      }
+      const block = group.blocks[inner];
+      const attention = conditionedSelfAttention(current, cond, pairLogits, mask,
+                                                 { tokens, channels, condChannels,
+                                                   heads, dimension: weights.dimension },
+                                                 block);
+      const afterAttention = new Float32Array(current.length);
+      for (let index = 0; index < current.length; index += 1) {
+        afterAttention[index] = current[index] + attention[index];
+      }
+      const transitioned = conditionedTransition(afterAttention, cond, tokens, channels,
+                                                 weights.transitionFactor, block, "",
+                                                 condChannels);
+      const next = new Float32Array(current.length);
+      for (let index = 0; index < current.length; index += 1) {
+        next[index] = afterAttention[index] + transitioned[index];
+      }
+      current = next;
+    }
+  }
+  return current;
+}
+
+/**
+ * The diffusion head's conditioning: what the denoiser knows besides the atoms.
+ *
+ * @returns {{single: Float32Array, pair: Float32Array}}
+ */
+export function diffusionConditioning(input, weights, onStage) {
+  const { tokens, trunkSingle, trunkPair, targetFeat, noiseLevel } = input;
+  const pairs = tokens * tokens;
+  const pairChannels = weights.pairChannels;
+  const seqChannels = weights.seqChannels;
+
+  // 🔴 THE PAIR CONDITIONING IS ONE CONCATENATION OR TWO COMPRESSIONS, AND
+  // THE NORM'S LENGTH SAYS WHICH. AlphaFold 3 concatenates the trunk pair with
+  // the RAW relative encoding and normalises the lot: 128 + 139 = 267, which is
+  // what `pair_cond_initial_norm` is there. OpenDDE compresses each to the pair
+  // width SEPARATELY - `z_trunk_projection` [384, 128] and `relpe_projection`
+  // [139, 128] - and concatenates those: 128 + 128 = 256, which is what its
+  // norm is. The joint LayerNorm over the widened concatenation couples the two
+  // terms, so this is a different function and not a re-association; and under
+  // OpenDDE the trunk pair arriving here is 384 wide, which no fixed 128 would
+  // survive.
+  const relative = relativeEncoding(tokens, input.features);
+  // 🔴 AND THERE IS A THIRD SHAPE, WHICH protenix2 AND boltz2 BOTH TAKE: the
+  // relative encoding is PROJECTED to the pair width and concatenated with the
+  // RAW trunk pair. `relpe_projection` is present and `z_trunk_projection` is
+  // not, so `split` is false and this used to fall into AF3's raw-139 arm:
+  //
+  //     protenix2  256 + 139 = 395  against a norm of 512
+  //     boltz2     128 + 139 = 267  against a norm of 256
+  //
+  // 🔴 AND ONLY boltz2 WAS LOUD ABOUT IT. Its 267 is LONGER than its scale, so
+  // the LayerNorm read past the end and every one of 73728 elements came out
+  // NaN. protenix2's 395 is SHORTER than its 512, so it read a prefix, stayed
+  // finite, and the GPU made the identical mistake - so check-af3-diffusion-
+  // conditioning compared two wrong computations and passed at 3.20e-7. A
+  // checker agreeing with itself is the failure this repository keeps finding,
+  // and the only reason it surfaced is that a second model rounded the other
+  // way.
+  const split = weights.zTrunkProjection !== undefined;
+  const projectedRelpos = !split && weights.relpeProjection !== undefined;
+  const trunkPairChannels = weights.trunkPairChannels ?? pairChannels;
+  const width = split ? 2 * pairChannels
+    : projectedRelpos ? trunkPairChannels + pairChannels
+    : trunkPairChannels + weights.relativeWidth;
+  const features2d = new Float32Array(pairs * width);
+  if (projectedRelpos) {
+    const compressedRelative = linear(
+      relative, pairs, weights.relativeWidth, pairChannels, weights.relpeProjection);
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < trunkPairChannels; c += 1) {
+        features2d[index * width + c] = trunkPair[index * trunkPairChannels + c];
+      }
+      for (let c = 0; c < pairChannels; c += 1) {
+        features2d[index * width + trunkPairChannels + c] =
+          compressedRelative[index * pairChannels + c];
+      }
+    }
+  } else if (split) {
+    const compressedTrunk = linear(
+      layerNormSlow(trunkPair, pairs, trunkPairChannels, weights.zTrunkNormScale,
+                    weights.zTrunkNormOffset ?? null),
+      pairs, trunkPairChannels, pairChannels, weights.zTrunkProjection);
+    const compressedRelative = linear(
+      relative, pairs, weights.relativeWidth, pairChannels, weights.relpeProjection);
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < pairChannels; c += 1) {
+        features2d[index * width + c] = compressedTrunk[index * pairChannels + c];
+        features2d[index * width + pairChannels + c] =
+          compressedRelative[index * pairChannels + c];
+      }
+    }
+  } else {
+    for (let index = 0; index < pairs; index += 1) {
+      for (let c = 0; c < trunkPairChannels; c += 1) {
+        features2d[index * width + c] = trunkPair[index * trunkPairChannels + c];
+      }
+      for (let c = 0; c < weights.relativeWidth; c += 1) {
+        features2d[index * width + trunkPairChannels + c] =
+          relative[index * weights.relativeWidth + c];
+      }
+    }
+  }
+  let pair = linear(layerNormSlow(features2d, pairs, width,
+                                  weights.pairCondInitialNormScale,
+                                  weights.pairCondInitialNormOffset ?? null),
+                    pairs, width, pairChannels, weights.pairCondInitialProjection);
+  onStage?.("conditioning.pairInitial", pair);
+  for (let index = 0; index < 2; index += 1) {
+    const delta = conditionedTransition(pair, null, pairs, pairChannels, 2,
+                                        weights.pairTransitions[index], "");
+    for (let i = 0; i < pair.length; i += 1) pair[i] += delta[i];
+  }
+
+  // ...and the trunk single with target_feat. 384 + 447, or 384 + 449 where the
+  // dialect re-inserts OpenFold3's two unknown-DNA columns - see
+  // singleCondPadding, and the scale length that asserts the two agree.
+  // 🔴 AND THE SINGLE IT READS IS NOT THE WIDTH IT WRITES. AF3's projection is
+  // [831, 384] and its trunk single is also 384, so `seqChannels` served as
+  // both and this line was right by coincidence. boltz2's is [768, 768] - 768
+  // out, 384 in - and reading one number for two gave 1152 against a LayerNorm
+  // of 768. The padded columns sit after the TRUNK SINGLE block too, for the
+  // same reason: the concatenation is [trunkSingle, targetFeat].
+  const trunkSingleChannels = weights.trunkSingleChannels ?? seqChannels;
+  const padding = singleCondPadding(input.dialect, trunkSingleChannels);
+  const singleWidth = trunkSingleChannels + weights.targetFeatWidth + padding.length;
+  if (weights.singleCondInitialNormScale.length !== singleWidth) {
+    throw new Error(`single conditioning is ${singleWidth} channels but its `
+      + `LayerNorm scale is ${weights.singleCondInitialNormScale.length}; `
+      + "the dialect and the weights disagree about the unknown-DNA columns");
+  }
+  const features1d = new Float32Array(tokens * singleWidth);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let c = 0; c < trunkSingleChannels; c += 1) {
+      features1d[token * singleWidth + c] =
+        trunkSingle[token * trunkSingleChannels + c];
+    }
+    for (let c = trunkSingleChannels; c < singleWidth; c += 1) {
+      const source = singleCondSource(padding, c);
+      if (source < 0) continue;
+      features1d[token * singleWidth + c] =
+        targetFeat[token * weights.targetFeatWidth + source - trunkSingleChannels];
+    }
+  }
+  const single = linear(layerNormSlow(features1d, tokens, singleWidth,
+                                      weights.singleCondInitialNormScale,
+                                      weights.singleCondInitialNormOffset ?? null),
+                        tokens, singleWidth, seqChannels,
+                        weights.singleCondInitialProjection,
+                        weights.singleCondInitialProjectionBias ?? null);
+
+  onStage?.("conditioning.singleInitial", single);
+  // 🔴 THE NOISE LEVEL IS SCALED BY SIGMA_DATA BEFORE THE LOG. The weight and
+  // bias come from the model - see noiseEmbedding above - so this is the same
+  // line whether they were trained or baked in at export.
+  const embedded = noiseEmbedding(noiseLevel / SIGMA_DATA,
+                                  weights.fourierWeight, weights.fourierBias);
+  const noiseChannels = embedded.length;
+  const projected = linear(layerNormSlow(embedded, 1, noiseChannels,
+                                         weights.noiseEmbeddingInitialNormScale,
+                                         weights.noiseEmbeddingInitialNormOffset ?? null),
+                           1, noiseChannels, seqChannels,
+                           weights.noiseEmbeddingInitialProjection);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let c = 0; c < seqChannels; c += 1) {
+      single[token * seqChannels + c] += projected[c];
+    }
+  }
+  for (let index = 0; index < 2; index += 1) {
+    const delta = conditionedTransition(single, null, tokens, seqChannels, 2,
+                                        weights.singleTransitions[index], "");
+    for (let i = 0; i < single.length; i += 1) single[i] += delta[i];
+  }
+
+  return { single, pair };
+}
+
+/**
+ * The two coefficients that turn a network output into a denoised structure.
+ *
+ * At a noise level far above SIGMA_DATA the skip term vanishes and the update
+ * carries everything; far below, the reverse. This is what makes the same
+ * network usable at every step of the schedule.
+ */
+export function scalings(noiseLevel) {
+  const denominator = noiseLevel * noiseLevel + SIGMA_DATA * SIGMA_DATA;
+  return {
+    skip: SIGMA_DATA * SIGMA_DATA / denominator,
+    out: noiseLevel * SIGMA_DATA / Math.sqrt(denominator),
+    // ...and what the network's INPUT is divided by, so its scale is O(1)
+    // whatever the noise level.
+    input: 1 / Math.sqrt(denominator),
+  };
+}
+
+/**
+ * The atom decoder: token features back down to a per-atom position update.
+ *
+ * 🔴 THE SKIP CONNECTION IS THE ENCODER'S OUTPUT, NOT ITS INPUT. AF3 broadcasts
+ * the token activation to every atom and then ADDS what the encoder's own
+ * transformer produced, so the decoder starts from a representation that has
+ * already seen the atoms. Skipping it leaves the decoder guessing the local
+ * geometry from a token average.
+ *
+ * @param {Float32Array} tokenAct  tokens * perTokenChannels
+ * @param {object} encoded         what atomCrossAttentionEncoder returned
+ */
+export function atomDecoder(tokenAct, encoded, input, weights) {
+  const { tokens, dense, subsets, queries, keys } = input.shape;
+  const channels = weights.channels;
+  const queryRows = subsets * queries;
+
+  const projected = linear(tokenAct, tokens, weights.perTokenChannels, channels,
+                           weights.projectTokenFeaturesForBroadcast);
+  // ...broadcast to every atom slot of the token, then into queries layout.
+  const perAtom = new Float32Array(tokens * dense * channels);
+  for (let token = 0; token < tokens; token += 1) {
+    for (let atom = 0; atom < dense; atom += 1) {
+      perAtom.set(projected.subarray(token * channels, (token + 1) * channels),
+                  (token * dense + atom) * channels);
+    }
+  }
+  const act = convert(input.tokenAtomsToQueries, perAtom, channels);
+  for (let row = 0; row < queryRows; row += 1) {
+    for (let c = 0; c < channels; c += 1) {
+      act[row * channels + c] = (act[row * channels + c]
+        + encoded.skipConnection[row * channels + c]) * encoded.queriesMask[row];
+    }
+  }
+
+  // ...the decoder has its OWN pair LayerNorm and projection, but reads the
+  // ENCODER's pair conditioning: the atom geometry did not change between them.
+  const pairLogits = atomPairLogits(encoded.pairCond,
+                                    { subsets, queries, keys,
+                                      pairChannels: weights.pairChannels,
+                                      heads: weights.heads,
+                                      blocks: weights.blocks.length }, weights);
+  let current = act;
+  for (let block = 0; block < weights.blocks.length; block += 1) {
+    current = crossAttentionBlock(current, {
+      queriesToKeys: input.queriesToKeys,
+      queriesMask: encoded.queriesMask, keysMask: encoded.keysMask,
+      queriesCond: encoded.queriesCond, keysCond: encoded.keysCond,
+      pairLogits: pairLogits[block],
+    }, { subsets, queries, keys, channels, heads: weights.heads,
+         dimension: weights.dimension }, weights.blocks[block]);
+  }
+  for (let row = 0; row < queryRows; row += 1) {
+    for (let c = 0; c < channels; c += 1) current[row * channels + c] *= encoded.queriesMask[row];
+  }
+  const normalised = layerNormSlow(current, queryRows, channels,
+                                   weights.atomFeaturesLayerNormScale,
+                                   weights.atomFeaturesLayerNormOffset ?? null);
+  const update = linear(normalised, queryRows, channels, 3,
+                        weights.atomFeaturesToPositionUpdate);
+  // ...and back to the token-atom layout the caller's coordinates live in.
+  return convert(input.queriesToTokenAtoms, update, 3);
+}
+
+/**
+ * One denoising step: noisy positions in, the model's estimate of clean ones out.
+ *
+ * @param {{positionsNoisy: Float32Array, noiseLevel: number, atomMask: Float32Array,
+ *          seqMask: Float32Array, trunkSingle: Float32Array, trunkPair: Float32Array,
+ *          targetFeat: Float32Array, shape: object, features: object,
+ *          tokenAtomsToQueries: object, queriesToKeys: object,
+ *          queriesToTokenAtoms: object, tokensToQueries: object,
+ *          conditioning: Float32Array, refPos: Float32Array,
+ *          refSpaceUid: Float32Array}} input
+ * @param {object} weights
+ * @param {(input: object, weights: object) => object} encode
+ *   atomCrossAttentionEncoder, injected so this file does not import the atom
+ *   stack's whole surface just to call it once.
+ */
+/**
+ * @param {(stage: string, values: ArrayLike<number>) => void} [onStage] called
+ *   with each intermediate, in order. The denoiser is five stages deep and a
+ *   NaN anywhere in it reaches the caller as a NaN coordinate with nothing to
+ *   say which stage produced it; this is how that question gets answered
+ *   without a second implementation of the pipeline in the checker.
+ */
+export function diffusionHead(input, weights, encode, onStage) {
+  const { tokens, dense } = input.shape;
+  const { noiseLevel } = input;
+  const scale = scalings(noiseLevel);
+
+  const cond = diffusionConditioning({
+    tokens,
+    dialect: input.dialect,
+    trunkSingle: input.trunkSingle,
+    trunkPair: input.trunkPair,
+    targetFeat: input.targetFeat,
+    noiseLevel,
+    features: input.features,
+  }, weights.conditioning, onStage);
+
+  onStage?.("conditioning.single", cond.single);
+  onStage?.("conditioning.pair", cond.pair);
+
+  // 🔴 THE POSITIONS ARE MASKED AND THEN RESCALED BY THE NOISE LEVEL, so the
+  // encoder always sees something of order one however far down the schedule it
+  // is. Feeding raw angstroms works at low noise and saturates at high.
+  const scaled = new Float32Array(tokens * dense * 3);
+  for (let atom = 0; atom < tokens * dense; atom += 1) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      scaled[atom * 3 + axis] =
+        input.positionsNoisy[atom * 3 + axis] * input.atomMask[atom] * scale.input;
+    }
+  }
+
+  const encoded = encode({
+    shape: input.shape,
+    // The encoder is injected as a function value, so its dialect travels in
+    // its input rather than as an argument - see atomCrossAttentionEncoder.
+    dialect: input.dialect,
+    conditioning: input.conditioning,
+    atomMask: input.atomMask,
+    refPos: input.refPos,
+    refSpaceUid: input.refSpaceUid,
+    tokenAtomsToQueries: input.tokenAtomsToQueries,
+    queriesToKeys: input.queriesToKeys,
+    queriesToTokenAtoms: input.queriesToTokenAtoms,
+    tokensToQueries: input.tokensToQueries,
+    tokensToKeys: input.tokensToKeys,
+    tokenAtomsAct: scaled,
+    // ...the TRUNK's single representation conditions the atoms, while the
+    // conditioning computed above conditions the token transformer. They are
+    // different tensors and AF3 uses both.
+    trunkSingleCond: input.trunkSingle,
+    trunkPairCond: cond.pair,
+  }, weights.encoder, onStage);
+
+  onStage?.("scaled positions", scaled);
+  onStage?.("encoder.tokenAct", encoded.tokenAct);
+  // The decoder reads more of the encoder than tokenAct, and a NaN in any of
+  // these reaches the coordinates without ever touching tokenAct.
+  onStage?.("encoder.skipConnection", encoded.skipConnection);
+  onStage?.("encoder.pairCond", encoded.pairCond);
+  onStage?.("encoder.queriesCond", encoded.queriesCond);
+  onStage?.("encoder.keysCond", encoded.keysCond);
+  onStage?.("encoder.queriesMask", encoded.queriesMask);
+  onStage?.("encoder.keysMask", encoded.keysMask);
+  let act = encoded.tokenAct;
+  const projected = linear(
+    layerNormSlow(cond.single, tokens, weights.seqChannels,
+                  weights.singleCondEmbeddingNormScale,
+                  weights.singleCondEmbeddingNormOffset ?? null),
+    tokens, weights.seqChannels, weights.perTokenChannels,
+    weights.singleCondEmbeddingProjection);
+  for (let index = 0; index < act.length; index += 1) act[index] += projected[index];
+
+  onStage?.("after single projection", act);
+  onStage?.("transformer.act", act);
+  act = diffusionTransformer(act, cond.single, cond.pair, input.seqMask, tokens,
+                             weights.transformer);
+  onStage?.("transformer", act);
+  onStage?.("transformer.out", act);
+  act = layerNormSlow(act, tokens, weights.perTokenChannels,
+                      weights.outputNormScale, weights.outputNormOffset ?? null);
+
+  onStage?.("output-norm", act);
+  const update = atomDecoder(act, encoded, input, weights.decoder);
+  onStage?.("decoder", update);
+  onStage?.("decoder.update", update);
+
+  // 🔴 A BLEND, NOT A PREDICTION. See the note at the top of this file.
+  const output = new Float32Array(input.positionsNoisy.length);
+  for (let atom = 0; atom < tokens * dense; atom += 1) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      const index = atom * 3 + axis;
+      output[index] = (scale.skip * input.positionsNoisy[index]
+        + scale.out * update[index]) * input.atomMask[atom];
+    }
+  }
+  return output;
+}

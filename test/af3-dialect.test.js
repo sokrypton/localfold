@@ -22,8 +22,8 @@ import {
   ALPHAFOLD3, DIALECTS, OPENBIND0, OPENDDE, dialectFor, featuriserDialect,
   singleCondPadding, singleCondPaddingWgsl, singleCondSource,
 } from "../src/af3/dialect.js";
-import { af3Dialect } from "../src/af3/weights.js";
-import { featuriseProtein } from "../src/af3/featurise.js";
+import { af3Dialect } from "../src/af3/weights/weights.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 
 const LIGAND = {
   code: "TST",
@@ -56,7 +56,7 @@ describe("the dialect table", () => {
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
-      // `target_feat` against af3-any-model. See src/af3/featurise.js.
+      // `target_feat` against af3-any-model. See src/af3/featurise/featurise.js.
       "centreRefConformers",
       // 🔴 NO TERMINAL OXT AND NO 5' OP3, which is not an OpenFold-lineage
       // question - protenix and opendde are in that lineage and deliberately
@@ -100,7 +100,7 @@ describe("the dialect table", () => {
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
-      // `target_feat` against af3-any-model. See src/af3/featurise.js.
+      // `target_feat` against af3-any-model. See src/af3/featurise/featurise.js.
       "centreRefConformers",
       "chainedAtomLayerNorm",
       "distogramBias",
@@ -118,7 +118,7 @@ describe("the dialect table", () => {
       // SLOTS ARE MASKED - `maskPaddedKeys` above is the second question. This
       // family CLAMPS the window and masks what falls outside; AlphaFold 3
       // slides it bodily in bounds. af3-any-model measured its own version of
-      // this at 6MRR 0.767 -> 0.737 here. See src/af3/featurise.js.
+      // this at 6MRR 0.767 -> 0.737 here. See src/af3/featurise/featurise.js.
       "paddedAtomKeys",
       "pairInitFromSingle",
       "perBlockAtomPairLayerNorm",

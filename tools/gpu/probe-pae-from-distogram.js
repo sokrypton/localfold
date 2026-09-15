@@ -28,10 +28,10 @@
  * This dumps per-pair features beside the true PAE rather than deciding
  * anything, so the analysis can be iterated without re-folding.
  */
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
-import { featuriseProtein } from "../../src/af3/featurise.js";
+  from "../../src/af3/weights/diffusion-weights.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
 
 const option = (args, name, fallback) => {

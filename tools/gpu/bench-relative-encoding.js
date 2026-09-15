@@ -16,8 +16,8 @@
  * 🔴 THE ARMS ARE INTERLEAVED, not run in two batches. Run-to-run drift on this
  * machine is several-fold, so two consecutive batches compare the drift.
  */
-import { Af3EmbedderGpu } from "../../src/af3/embedder-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { Af3EmbedderGpu } from "../../src/af3/trunk/embedder-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const EVO = "diffuser/evoformer";

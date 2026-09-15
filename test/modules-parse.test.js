@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
  * EVERY SHIPPING MODULE PARSES.
  *
  * 🔴 THIS EXISTS BECAUSE A BROKEN MODULE WAS COMMITTED AND PUSHED. A comment in
- * src/triangle/shaders.js said `var<workgroup>` with backticks around it, and
+ * src/kernels/triangle/shaders.js said `var<workgroup>` with backticks around it, and
  * the comment lives inside a JS template literal holding WGSL - so the
  * backticks closed the literal and the file stopped parsing. The whole suite
  * stayed green, because no test outside the GPU ones imports that file: the

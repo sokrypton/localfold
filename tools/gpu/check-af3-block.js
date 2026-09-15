@@ -1,5 +1,5 @@
 /**
- * AF3 pairformer blocks on the GPU, against src/af3/pairformer-reference.js.
+ * AF3 pairformer blocks on the GPU, against src/af3/trunk/pairformer-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-block.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-block.js --n=64 --blocks=8
@@ -14,9 +14,9 @@
  * (1.4e-7 at block 8 against 4.3e-7 at block 47), and the GPU should behave the
  * same way.
  */
-import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
-import { Af3PairformerStackGpu } from "../../src/af3/pairformer-block-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { pairformerBlock } from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3PairformerStackGpu } from "../../src/af3/trunk/pairformer-block-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";
@@ -126,7 +126,7 @@ export async function main(device, args) {
   // input" for the single-track residual recorded in check-af3-confidence.js.
   const blocks = [];
   if (option(args, "stack", "trunk") === "confidence") {
-    const { confidenceWeights } = await import("../../src/af3/weights.js");
+    const { confidenceWeights } = await import("../../src/af3/weights/weights.js");
     const confidence = await confidenceWeights(store);
     for (let index = 0; index < Math.min(count, 4); index += 1) blocks.push(confidence.blocks[index]);
   } else {

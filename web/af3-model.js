@@ -14,18 +14,18 @@
  * no alignment the MSA is the query alone, which is what AF3 itself produces
  * for a single-sequence input rather than a stub.
  */
-import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
-import { af3BatchFromA3m } from "../src/af3/batch.js";
+import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
 import { featuriserDialect } from "../src/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../src/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
-  structuralRefinerWeights, trunkDepths, trunkWeights } from "../src/af3/weights.js";
+  structuralRefinerWeights, trunkDepths, trunkWeights } from "../src/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../src/af3/diffusion-weights.js";
-import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
+  from "../src/af3/weights/diffusion-weights.js";
+import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
 import { AF3_FAMILIES, bundleBaseUrl, loadManifest }
-  from "../src/reference/manifests/index.js";
+  from "../src/bundles/manifests/index.js";
 import { throwIfAborted } from "../src/runtime/abort.js";
 import { buildTemplate } from "./template-source.js";
 import { yieldToBrowser } from "../src/runtime/yield.js";
@@ -68,6 +68,20 @@ export const AF3_COUNTS = {
   // and a diffusion step discretises it, and a reader seeing 16 in one mode and
   // 200 in the other has no way to know that from the word. "Cycles" beside
   // "Recycles" was the earlier objection and these avoid it too.
+  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
+  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
+  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
+  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
+  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
+  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
+  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
+  //
+  // The two failing seeds fail under every template configuration - merged,
+  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
+  // Flow takes one and walks down deterministically, so it never escapes a bad
+  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
+  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
+  // a good fold's 93.
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
   // 🔴 THERE IS NO "ODE" ROW, AND THERE WAS. The flow walk's step can be an
   // integration step - `x <- D + (sigma_next/sigma)(x - D)` rather than
@@ -153,6 +167,20 @@ export const samplerModeFor = (family, asked) =>
     ? OPENDDE_SAMPLER_MODE : asked);
 
 export const OPENDDE_COUNTS = {
+  // 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and this row used to say
+  // length. Measured on 1TIM A:B (494 residues) with a self-template: boltz2
+  // under Flow is 17.7 / 1.04 / 19.6 / 1.01 / 1.06 across five seeds - two
+  // catastrophic - while DIFFUSION at the same seeds is 1.01-1.11 and af3 under
+  // Flow is 0.943-0.992 on all five. So it is not "Flow past 400 residues":
+  // af3's Flow is fine there and boltz2's Flow is fine on a LONGER target
+  // (5CAJ A:B, 522, four seeds, 0.57-0.85).
+  //
+  // The two failing seeds fail under every template configuration - merged,
+  // cross-chain masked, per-chain, and none at all - so it is the initial draw.
+  // Flow takes one and walks down deterministically, so it never escapes a bad
+  // one; diffusion re-noises at every step and does. 🔴 AND NEITHER FAILURE IS
+  // VISIBLE: both pass the chain-geometry gate, and one reads pLDDT 85 against
+  // a good fold's 93.
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
   diffusion: { label: "Diffusion", values: [16, 25, 50, 100, 200], preferred: 16 },
 };

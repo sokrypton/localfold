@@ -18,11 +18,11 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/reference/dtype.js";
+import { readTensor } from "../src/weights/dtype.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../src/esmfold2/featuriser-reference.js";
-import { inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
+} from "../src/esmfold2/pair-features-reference.js";
+import { inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");

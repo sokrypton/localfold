@@ -21,7 +21,7 @@
  * standing at the base value, which is what a writeback the dispatch skipped
  * would look like.
  */
-import { createTriangleShaders } from "../../src/triangle/shaders.js";
+import { createTriangleShaders } from "../../src/kernels/triangle/shaders.js";
 
 const OFFSET_ORDER = [
   ["layerNormInWeight", (c) => c.cZ], ["layerNormInBias", (c) => c.cZ],

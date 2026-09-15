@@ -34,18 +34,18 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # 🔴 THE ONE PLACE A MODEL BUNDLE IS DESCRIBED, on the Python side. Its twin is
-# MODEL_BUNDLES in src/reference/manifests/index.js, and the two are checked
+# MODEL_BUNDLES in src/bundles/manifests/index.js, and the two are checked
 # against each other by tools/build_site.py - a family added to one and not the
 # other is a build failure rather than a page that half works.
 BUNDLES = {
     "monomer": {
         "export": "model",
-        "module": "src/reference/manifests/monomer.js",
+        "module": "src/bundles/manifests/monomer.js",
         "model": "model_1_ptm",
     },
     "multimer": {
         "export": "model-multimer",
-        "module": "src/reference/manifests/multimer.js",
+        "module": "src/bundles/manifests/multimer.js",
         "model": "model_1_multimer_v3",
     },
     # The whole AF3 diffuser - trunk, diffusion head and confidence head - at
@@ -57,7 +57,7 @@ BUNDLES = {
     # without LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3.
     "af3": {
         "export": "model-af3-int5",
-        "module": "src/reference/manifests/af3.js",
+        "module": "src/bundles/manifests/af3.js",
         "model": "alphafold3",
     },
     # ...and the Apache-2.0 one, which is the same graph and the same 265 MiB.
@@ -67,7 +67,7 @@ BUNDLES = {
     # this one: its weights carry no prohibited-use policy.
     "openbind0": {
         "export": "model-openbind0-int5",
-        "module": "src/reference/manifests/openbind0.js",
+        "module": "src/bundles/manifests/openbind0.js",
         "model": "openbind0",
     },
     # OpenDDE, whole: the trunk, the distogram head, the structural-token
@@ -91,7 +91,7 @@ BUNDLES = {
     # distogram is what this bundle answers with. See docs/OPENDDE.md.
     "opendde": {
         "export": "model-opendde-int5",
-        "module": "src/reference/manifests/opendde.js",
+        "module": "src/bundles/manifests/opendde.js",
         "model": "opendde",
     },
     # Boltz-2 (MIT), whole: trunk, diffusion and its own confidence head, at
@@ -106,7 +106,7 @@ BUNDLES = {
     # read off the weights now.
     "boltz2": {
         "export": "model-boltz2-int5",
-        "module": "src/reference/manifests/boltz2.js",
+        "module": "src/bundles/manifests/boltz2.js",
         "model": "boltz2",
     },
     # Protenix-v2, whole, at int5 group 32. 334 MiB in eight shards.
@@ -117,7 +117,7 @@ BUNDLES = {
     # port; docs/HOSTING.md has the table and the retraction it cost.
     "protenix2": {
         "export": "model-protenix2-int5",
-        "module": "src/reference/manifests/protenix2.js",
+        "module": "src/bundles/manifests/protenix2.js",
         "model": "protenix2",
     },
     # IntelliFold-2, whole, at int5 group 32. 612 MiB in twelve shards.
@@ -129,7 +129,7 @@ BUNDLES = {
     # 256-channel template stack against AF3's 128 and 64. See docs/AF3.md.
     "intellifold2": {
         "export": "model-intellifold2-int5",
-        "module": "src/reference/manifests/intellifold2.js",
+        "module": "src/bundles/manifests/intellifold2.js",
         "model": "intellifold2",
     },
     # RoseTTAFold3, whole, at int5 group 32. 266 MiB in six shards.
@@ -140,7 +140,7 @@ BUNDLES = {
     # nothing sets that. See docs/AF3.md for what is left.
     "rosettafold3": {
         "export": "model-rosettafold3-int5",
-        "module": "src/reference/manifests/rosettafold3.js",
+        "module": "src/bundles/manifests/rosettafold3.js",
         "model": "rosettafold3",
     },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
@@ -157,7 +157,7 @@ BUNDLES = {
     # not the model's name, and renaming it would move 366 MiB for nothing.
     "ef2-fast-600m": {
         "export": "model-esmfold2-int5",
-        "module": "src/reference/manifests/esmfold2.js",
+        "module": "src/bundles/manifests/esmfold2.js",
         "model": "esmfold2-trunk",
     },
     # ESM-C 600M at int3 group 128, plus the shim that turns its 37 hidden
@@ -166,19 +166,19 @@ BUNDLES = {
     # against zero - see docs/EF2FAST.md.
     "esmc": {
         "export": "model-esmc-600m-int3",
-        "module": "src/reference/manifests/esmc.js",
+        "module": "src/bundles/manifests/esmc.js",
         "model": "esmc",
     },
     # The same folding model against ESM-C 300M - a SEPARATE checkpoint, since
     # its shim is trained for 30 layers x 960 against the 600M's 36 x 1152.
     "ef2-fast-300m": {
         "export": "model-ef2-fast-300m-int5",
-        "module": "src/reference/manifests/ef2-fast-300m.js",
+        "module": "src/bundles/manifests/ef2-fast-300m.js",
         "model": "esmfold2-trunk",
     },
     "esmc-300m": {
         "export": "model-esmc-300m-int3",
-        "module": "src/reference/manifests/esmc-300m.js",
+        "module": "src/bundles/manifests/esmc-300m.js",
         "model": "esmc",
     },
 }

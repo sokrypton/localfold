@@ -6,7 +6,7 @@ AF3's shapes, with the attention zeroed. ../alphafold3 measured that identity at
 corr 1.00000000, relerr 4.5e-07.
 
 🔴 THE TRIANGLE'S DOUBLE WIDTH IS INTERLEAVED AND THE TRANSITION'S IS BLOCKED,
-IN THE SAME BLOCK. src/af3/pairformer-reference.js spells both out because
+IN THE SAME BLOCK. src/af3/trunk/pairformer-reference.js spells both out because
 getting either backwards costs no error and no NaN - it permutes channels and
 returns a plausible tensor. ESMFold2 stores BOTH blocked:
 

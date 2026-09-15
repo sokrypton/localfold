@@ -12,11 +12,11 @@
  */
 import { join } from "node:path";
 
-import { confidenceHead, errorBinCentres } from "../../src/af3/confidence-reference.js";
+import { confidenceHead, errorBinCentres } from "../../src/af3/confidence/confidence-reference.js";
 import { interfaceTokenCounts, predictedTmScores, tmAdjustedPae }
-  from "../../src/af3/ptm-reference.js";
-import { convert } from "../../src/af3/atom-encoder-reference.js";
-import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
+  from "../../src/af3/confidence/ptm-reference.js";
+import { convert } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { pairformerBlock } from "../../src/af3/trunk/pairformer-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const HEAD = "diffuser/confidence_head";

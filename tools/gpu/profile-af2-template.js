@@ -9,9 +9,9 @@
  * channels should be about a fifth of what a 128-channel Evoformer block's pair
  * half costs, and it is not - so this is the caller the profiler needed.
  */
-import { QueryOnlyTemplateGpu } from "../../src/evoformer/template.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { QueryOnlyTemplateGpu } from "../../src/af2/evoformer/template.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -21,7 +21,7 @@ const option = (args, name, fallback) => {
 export async function main(device, args) {
   const length = Number(option(args, "length", "825"));
   const top = Number(option(args, "top", "20"));
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
   const fixture = AlphaFoldFixture.fromStore(await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer")));
   const weights = await fixture.templateWeights();

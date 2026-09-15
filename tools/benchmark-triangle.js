@@ -1,6 +1,17 @@
+/**
+ * TriangleMultiplicationOutgoing alone, swept over length, through the Node
+ * WebGPU binding.
+ *
+ *     npm run bench -- --lengths=128,256,512 --cz=128 --hidden=128
+ *
+ * It builds its own input (`createDeterministicTriangleInput`) and so needs no
+ * fixture - the one benchmark here that runs on a fresh checkout. It DOES need
+ * a Dawn that loads on this glibc: see CLAUDE.md, where `webgpu@0.6.0` wants
+ * GLIBC_2.38 and `webgpu@0.4.0` is what loads on this box.
+ */
 import { create, globals } from "webgpu";
 import { createDeterministicTriangleInput } from "../src/testing/deterministic-input.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
+import { TriangleMultiplicationOutgoingGpu } from "../src/kernels/triangle/webgpu.js";
 
 function option(name, fallback) {
   const prefix = `--${name}=`;

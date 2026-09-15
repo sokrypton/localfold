@@ -8,7 +8,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { readTensor } from "../../src/reference/dtype.js";
+import { readTensor } from "../../src/weights/dtype.js";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 

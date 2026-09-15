@@ -29,9 +29,9 @@
  * and is not compared.
  */
 import { readFileSync } from "node:fs";
-import { featuriseProtein } from "../src/af3/featurise.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 import { dialectFor, DIALECTS } from "../src/af3/dialect.js";
-import { chiralCentres } from "../src/af3/template-features.js";
+import { chiralCentres } from "../src/af3/featurise/template-features.js";
 
 const DUMPS = {
   alphafold3: "af3-batch-alphafold3-6mrr.json",

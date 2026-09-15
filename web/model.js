@@ -15,10 +15,10 @@
  * NO DOM IN HERE. Progress arrives as a callback, because the two pages report
  * it differently and neither one's markup belongs in a module about weights.
  */
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../src/reference/http-tensor-store.js";
-import { ScriptTensorStore } from "../src/reference/script-tensor-store.js";
-import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/reference/manifests/index.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+import { ScriptTensorStore } from "../src/bundles/script-tensor-store.js";
+import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../src/runtime/abort.js";
@@ -32,7 +32,7 @@ const stores = new Map();
  * the multimer FETCHED one, so they failed differently: a site without multimer
  * weights 404ed on model-multimer/manifest.json and died there, before a single
  * shard was asked for. Both tables are now modules - see
- * src/reference/manifests/ - so neither can 404, and the first thing that can
+ * src/bundles/manifests/ - so neither can 404, and the first thing that can
  * fail is a shard, which is a failure about weights rather than about metadata.
  *
  * Over http the shards are fetched directly. On a file:// page fetch does not
@@ -55,7 +55,7 @@ const stores = new Map();
  * value with a slash in it, or one ending in `.json`. A bare family name is the
  * other reader's.
  *
- * @param {import("../src/reference/manifests/index.js").ModelFamily} family
+ * @param {import("../src/bundles/manifests/index.js").ModelFamily} family
  */
 export function openStore(onProgress, family = "monomer") {
   const bundle = MODEL_BUNDLES[family];
@@ -129,7 +129,7 @@ const loaded = new Map();
  * 🔴 NOTHING IS QUANTISED OR ROUNDED HERE. The shards arrive as int8 with a
  * float16 scale per 64-weight block wherever that is safe - see
  * tools/quantize_model.py, which keeps the structure module and the geometry
- * tables at float32 and records what each format costs - and src/reference/
+ * tables at float32 and records what each format costs - and src/bundles/
  * dtype.js dequantises them on the way in. The values that reach this function
  * are the ones the page used to spend most of a fold computing.
  *

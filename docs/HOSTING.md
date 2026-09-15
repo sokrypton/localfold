@@ -5,7 +5,7 @@ GitHub Pages publishes at most a gigabyte, and the weights are most of it: AF2
 monomer 227 MB, AF3 150 MB, before a third model exists. A page meaning to offer
 five keeps its parameters elsewhere.
 
-Everything a bundle needs is one field. In `src/reference/manifests/index.js`:
+Everything a bundle needs is one field. In `src/bundles/manifests/index.js`:
 
 ```js
 af3: {
@@ -90,6 +90,184 @@ and the shipped layout already isolates them: tensors per shard reads
 `[1, 1, 65, 66, 66, 68, 69, 70]`. Re-sharding to sixteen produces the same two
 40.5 MiB shards and gains nothing, which is why it was not done. **Its 4.5-5.3 s
 idle tail is those two tensors.**
+
+### 🔴 STREAMING THE FOLD AS THE WEIGHTS ARRIVE: DECLINED, AND THE ARITHMETIC IS THE REASON
+
+"Run the model module by module as it downloads" is the obvious answer to a
+first visit being almost all bytes. Three measurements say it cannot pay, and
+the third is the one that settles it.
+
+**1. The bundle is not in execution order, so today the answer is 0%.**
+AlphaFold 3's shards 2-7 each carry diffusion, confidence, MSA, trunk, embedder
+and template tensors mixed together - the packer packs longest-first into even
+shards, which destroys stage order by construction. The page says the same from
+the other side: loading IntelliFold-2 from Hugging Face, `weightPhases` is
+**trunk 8991 ms and diffusion 49 ms**. The "trunk" phase is pulling essentially
+the whole bundle, and by the time the diffusion head wants its weights they have
+already arrived. Nothing can start early because nothing arrives early.
+
+**2. Even with perfect stage ordering, first compute starts most of the way in.**
+The trunk-side weights - embedder, MSA, template, pairformer - are:
+
+| | trunk-side | diffusion | confidence | earliest compute |
+|---|---:|---:|---:|---:|
+| AlphaFold 3 | 41% | 55% | 4% | **41% of the download** |
+| RoseTTAFold3 | 41% | 55% | 3% | 41% |
+| OpenDDE | 64% | 31% | 5% | 64% |
+| IntelliFold-2 | 70% | 24% | 6% | **70%** |
+
+So the overlappable window is the LAST 59% to 30% of the transfer, and it is
+smallest for the biggest bundle.
+
+**3. The saving is `min(download, compute)`, and compute is a second.** Warm
+folds at 25 steps are **af3 0.64 s** and **if2 1.39 s**; the trunk's share is
+less. Against that:
+
+| | download | trunk compute that could fill the window | saving |
+|---|---:|---:|---:|
+| if2, from HF at ~68 MB/s | 8991 ms | ~1.3 s | **~10%** |
+| af3, throttled to the 8 MB/s a visitor sees | 35.5 s | ~0.5 s | **~1.3%** |
+
+🔴 **AND THAT IS THE WHOLE ARGUMENT: THE SAVING IS CAPPED BY COMPUTE, SO IT IS A
+FIXED HALF-SECOND HOWEVER SLOW THE NETWORK IS.** Streaming helps the visitor on
+a fast connection, who does not need it, and vanishes for the visitor on a slow
+one, who does. That is the opposite of the shape you want from a latency fix.
+
+**And the structure fights it twice more.** The page runs the trunk for TWO
+recycles, so pass 2 needs all 48 blocks and only pass 1 could ever overlap; the
+diffusion head runs 25 steps over the same 24 transformer blocks, so they must
+all be resident by the end of step 1. Incremental residency is also where
+CLAUDE.md already records the eviction path being wrong under a budget.
+
+**A weaker version of this was already tried and measured at nothing**: the
+biggest-shard-first prefetch order, whose own comment says it cannot be measured
+from here, measures as zero.
+
+🔴 **THE ONE VARIANT THAT IS NOT DOMINATED IS PERCEIVED LATENCY, AND IT IS
+UNMEASURED.** The contact map is a TRUNK output. With stage ordering AlphaFold 3
+could draw one at 41% of the download rather than at 100% - not a second saved,
+but a first picture at fourteen seconds instead of thirty-five on a throttled
+link. That is a different claim from throughput, nobody here has measured
+whether it changes how the wait feels, and it would still want the export
+reordered. Recorded so it is not confused with the throughput case, which is
+declined.
+
+**What the same arithmetic says IS worth it: fewer bytes.** Which is the section
+above, and the cheap lever there does not pay either.
+
+
+### 🔴 CAN THE BUNDLES BE SMALLER? MEASURED, AND THE CHEAP LEVER DOES NOT PAY
+
+`int5` is **6.02 bits a parameter**, not 5: the scheme is asymmetric per-group at
+group 32 with a **float16 scale AND a float16 zero** per group, so 5 + 32/32, and
+those four bytes per group of thirty-two are 20% of every bundle. The obvious
+move is to widen the group. Measured end to end rather than argued.
+
+**The weight error first**, from `tools/analyse_quantisation.py`, which now takes
+`--model` because it was pinned to AF3 and the answer is not a property of the
+scheme. Six biggest tensors, four checkpoints, relative RMS:
+
+| scheme | bits/w | saving | af3 | opendde | boltz2 | protenix2 |
+|---|---:|---:|---:|---:|---:|---:|
+| **int5 asym g32** (shipped) | 6.00 | - | 0.0435 | 0.0411 | 0.0420 | 0.0425 |
+| int5 asym g64 | 5.50 | 8.3% | 0.0526 | 0.0517 | 0.0506 | 0.0556 |
+| int5 asym g128 | 5.25 | 12.5% | 0.0630 | 0.0639 | 0.0594 | 0.0723 |
+| int4 asym g32 | 5.00 | 16.7% | 0.0903 | 0.0848 | 0.0869 | 0.0877 |
+
+g128 is already known to fold OpenDDE into a 3283 A explosion at pLDDT 46.69, and
+int4 g32 doubles the error, so **int5 g64 is the only candidate worth a fold.**
+
+**Then the fold, which is the only thing that settles it.** Exported both at
+group 64 - OpenDDE 2501.7 -> **433.4 MiB** against the shipped 472, AlphaFold 3
+1405.3 -> **242.6** against 265, both 8.2% as predicted:
+
+| 6MRR, 4 seeds, 25 steps | g32 RMSD | g64 RMSD | g32 pLDDT | g64 pLDDT |
+|---|---:|---:|---:|---:|
+| seed 1 | 0.650 | 0.646 | 83.050 | 81.699 |
+| seed 7 | 0.662 | **0.814** | 83.739 | 82.408 |
+| seed 21 | 0.620 | **0.755** | 83.634 | 81.876 |
+| seed 20260831 | 0.706 | **0.881** | 83.524 | 83.506 |
+| **mean (sd)** | **0.660 (0.037)** | **0.774 (0.099)** | **83.49 (0.30)** | **82.37 (0.86)** |
+
+🔴 **SO IT IS A REAL LOSS AND NOT A SEED, WHICH IS THE ONLY REASON FOUR SEEDS
+WERE RUN.** One seed would have shown 0.706 -> 0.881 and been inside the 1 A band
+this repository measures elsewhere. Four show AlphaFold 3's RMSD **17% worse on
+the mean with 2.7x the spread**, worse on three seeds of four, and pLDDT lower on
+**four of four**. OpenDDE barely moves at one seed (1.518 -> 1.527, TM 0.9304 ->
+0.9278) - so the cost is per checkpoint, and it lands on the default model.
+
+**8.3% of a bundle is about 0.65 s of a first visit at the 78 MB/s this machine
+measures to Hugging Face. It is not worth a fifth of AlphaFold 3's accuracy.**
+
+🔴 **AND THE ONE OPTION THAT LOOKS BETTER CANNOT BE BUILT TODAY.** `int5
+SYMMETRIC g32` is also 5.50 bits - the same 8.3% - and on two of the four
+checkpoints it beats asymmetric g64 outright and comes close to the shipped
+scheme: **opendde 0.0434 and protenix2 0.0452**, against asym g64's 0.0517 and
+0.0556 and shipped asym g32's 0.0411 and 0.0425. On af3 and boltz2 the ranking
+INVERTS and asym g64 wins. Neither can be tried: `quantize_af3.py` emits
+asymmetric only, and `codecOf` in src/weights/quantised-upload.js ties symmetry
+to width - `signed: bits === 8` - so a symmetric five-bit code has no
+representation. Adding one is a codec, a packer flag and a gate arm, for 8.3% on
+two models of seven. Written down so the next person costs it rather than
+rediscovers it.
+
+**What did change:** `readTensorRange`'s int5 branch refused any group but 32,
+and the general path beside it had always been able to read them - the refusal
+dated from when the unrolled 20-byte loop was the only int5 reader. int5 at any
+group now takes the general path, held to the DEVICE decoder at **zero differing
+elements for 5:32, 5:64, 5:128 and 4:32** by `check-quantised-upload.js`. Every
+shipped bundle is group 32 and still takes the unrolled fast path, so nothing
+moves: af3 folds 83.16921495311351, unchanged to the last digit.
+
+
+### Every bundle's shard count, and why none of them wants repacking
+
+Counted on 2026-09-15 from the manifest module the PAGE loads, against the
+bundle on disk. The two counts agree for all ten present; three bundles are
+hosted but not on this box.
+
+| family | shards | on disk | MiB | shard sizes | the largest shard is |
+|---|---:|---:|---:|---|---|
+| monomer | 8 | 8 | 97 | 12.1-12.4 | |
+| multimer | 8 | 8 | 97 | 12.1-12.4 | |
+| af3 | 8 | 8 | 265 | 30.6-40.5 | **one tensor** |
+| boltz2 | 8 | 8 | 364 | 44.3-54.0 | **one tensor** |
+| protenix2 | 8 | 8 | 334 | 41.7-41.7 | **one tensor** |
+| ef2-fast-600m | 8 | 8 | 122 | 15.3-15.3 | packing |
+| opendde | 12 | 12 | 472 | 39.0-40.5 | **one tensor** |
+| esmc (600m) | 16 | 16 | 224 | 13.9-14.1 | packing |
+| **rosettafold3** | 16 | 16 | 265 | 12.0-**40.5** | **one tensor** |
+| **intellifold2** | 40 | 40 | 611 | 10.3-**72.0** | **one tensor** |
+| openbind0 | 8 | - | - | | not on this box |
+| ef2-fast-300m | 8 | - | - | | not on this box |
+| esmc-300m | 8 | - | - | | not on this box |
+
+🔴 **AND EVERY RAGGED BUNDLE IS AT ITS FLOOR, WHICH IS WORTH KNOWING BEFORE
+SOMEBODY "FIXES" ONE.** IntelliFold-2's spread is **86%** - 10.3 MiB against 72.0
+- and RoseTTAFold3's is 70%, which reads as a packing failure and is not. The
+section above says af3's makespan floor is a TENSOR and not a layout, because a
+tensor is contiguous within one file; measured across the panel, that is true of
+**every AF3-lineage bundle**, and the biggest shard is exactly one tensor in each:
+
+| | largest shard | and it is |
+|---|---:|---|
+| af3 | 40.5 MiB | `trunk_pairformer/single_transition/transition1/weights` |
+| boltz2 | 54.0 | the same tensor, 64 blocks deep instead of 48 |
+| rosettafold3 | 40.5 | the same tensor |
+| **intellifold2** | **72.0** | `trunk_pairformer/**pair**_transition/transition1/weights` |
+
+IntelliFold-2's is the PAIR transition rather than the single one, which is the
+512-channel pair track again - the same width that makes it the heaviest model in
+the panel at 2229 MiB of device memory. **72 MiB on one connection is its floor
+in any sharding**, so `repack_shards.py` would move bytes and change nothing that
+matters, exactly as re-sharding af3 to sixteen was measured to gain nothing.
+
+The only two bundles whose largest shard is NOT a single tensor are
+`ef2-fast-600m` and `esmc`, and those are the two the quantiser's own packer has
+already laid out - 15.3 MiB x8 and 13.9-14.1 x16, spreads of 0% and 1%.
+
+**So the two unpublished bundles need no work before they go up.** They are
+ragged because their biggest tensors are big.
 
 🔴 **AND af2-monomer's `.js` SHARDS ARE GONE, 129.8 MiB OF THEM.**
 `tools/export-js-weights.py` writes a base64-in-JavaScript copy of every shard
@@ -253,7 +431,7 @@ Group 32, not 128: docs/EF2FAST.md records OpenDDE at group 128 folding 6MRR
 into a 3283 A explosion at pLDDT 46.69, and 128 is ESM-C's alone.
 
 🔴 **NEITHER IS IN THE REGISTRY AND NEITHER IS PUBLISHED.**
-`src/reference/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
+`src/bundles/manifests/` has no `boltz2.js` or `protenix2.js`, so the page
 cannot load either however good the bundle is - and a bundle the CLI likes can
 still be one the page cannot, because the page reads the manifest baked into the
 module and pinned to a commit. Publishing them is a `tools/build_site.py` and a
@@ -274,7 +452,7 @@ Uploaded to `sokrypton/localfold` at commit
 `check_remote_bundle.py` reads all twelve OpenDDE shards and all eight of
 AlphaFold 3's back from the remote.
 
-`src/reference/manifests/opendde.js` is regenerated from the uploaded bundle and
+`src/bundles/manifests/opendde.js` is regenerated from the uploaded bundle and
 its `remote:` re-pinned to that commit;
 `boltz2.js` and `protenix2.js` are new modules.
 `test/registry-manifest-widths.test.js` is GREEN, which is the signal the deploy

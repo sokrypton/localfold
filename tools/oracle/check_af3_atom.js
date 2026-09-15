@@ -18,8 +18,8 @@
 import { join } from "node:path";
 
 import { perAtomConditioning, perAtomPairConditioning }
-  from "../../src/af3/atom-conditioning-reference.js";
-import { linear } from "../../src/af3/pairformer-reference.js";
+  from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { linear } from "../../src/af3/trunk/pairformer-reference.js";
 import { ROOT, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const model = process.argv.includes("--model")

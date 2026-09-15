@@ -20,7 +20,7 @@
  * that is a multiple of 64 exercise none of its bounds checks. The defaults are
  * primes.
  */
-import { TransitionGpu } from "../../src/evoformer/transition.js";
+import { TransitionGpu } from "../../src/kernels/transition.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

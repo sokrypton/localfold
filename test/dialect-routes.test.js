@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { af3Sources } from "./helpers/af3-source.js";
 import { DIALECTS } from "../src/af3/dialect.js";
 
 /**
@@ -23,10 +23,7 @@ import { DIALECTS } from "../src/af3/dialect.js";
  * reachable from one process without a bundle - and the failure it guards is a
  * new read site added against a new source, which is a property of the text.
  */
-const DIR = new URL("../src/af3/", import.meta.url);
-const FILES = readdirSync(DIR).filter((name) => name.endsWith(".js"));
-const SOURCE = new Map(FILES.map((name) =>
-  [name, readFileSync(new URL(name, DIR), "utf8")]));
+const SOURCE = af3Sources();
 
 /**
  * The flags the weight loader copies onto every atom block, read out of the
@@ -88,21 +85,28 @@ test("how a dialect flag reaches code", async (t) => {
         "diffusion-weights.js:block",
       ], `${flag} no longer takes one route`);
     }
-    // 🔴 AND ONE TAKES TWO, WHICH IS THE WHOLE FINDING. The atom encoder reads
-    // `diffusionNoResidual` off `input.dialect` while the decoder and the CPU
-    // reference read the copy on the block - one convention, two sources, and
-    // they agree only because the loader writes the dialect's value onto every
-    // block. Nothing else in this table does that.
+    // 🔴 AND `diffusionNoResidual` USED TO TAKE TWO, WHICH WAS THE FINDING THAT
+    // PRODUCED THIS FILE. The atom encoder read it off `input.dialect` while
+    // the decoder and the CPU reference read the copy on the block - one
+    // convention, two sources, agreeing only because the loader writes the
+    // dialect's value onto every block. It reads off the block now, so every
+    // copied flag takes exactly one route. The loader keeps its own
+    // `dialect.` read, which is the assignment and its undefined guard.
     assert.deepEqual(routesOf("diffusionNoResidual"), [
       "atom-decoder-webgpu.js:block",
       "atom-encoder-reference.js:block",
-      "atom-encoder-webgpu.js:dialect",
+      "atom-encoder-webgpu.js:block",
       "diffusion-weights.js:block",
       "diffusion-weights.js:dialect",
     ]);
-    const sources = (flag) => new Set(routesOf(flag).map((r) => r.split(":")[1]));
-    assert.deepEqual([...sources("diffusionNoResidual")].sort(), ["block", "dialect"]);
-    assert.deepEqual([...sources("maskAtomActPerBlock")], ["block"]);
+    // 🔴 THE RULE, RATHER THAN THE LIST: outside the loader, a copied flag is
+    // read off the BLOCK and never off a dialect. That is what makes a fifth
+    // read site against a new source fail, whatever it is called.
+    for (const flag of copied) {
+      const outside = routesOf(flag).filter((r) => !r.startsWith("diffusion-weights.js"));
+      assert.deepEqual([...new Set(outside.map((r) => r.split(":")[1]))], ["block"],
+                       `${flag} is read off something other than the block: ${outside}`);
+    }
   });
 
   // 🔴 AND THE ONE THAT WOULD ACTUALLY BITE: the decoder reads block ZERO, the

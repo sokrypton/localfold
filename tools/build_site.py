@@ -16,7 +16,7 @@ is written out below rather than derived, because a derived rule ("everything
 but test/") silently ships the next directory somebody adds.
 
 THE LAYOUT IS PRESERVED, exactly. The pages at the top, web/ and src/ beside
-them, because index.html says ./web/main.js and main.js says ../src/model/... -
+them, because index.html says ./web/app.js and app.js says ../src/af2/model/... -
 flattening any of that would mean rewriting import paths, and rewriting import
 paths is the build step this repository just got rid of.
 """
@@ -49,7 +49,18 @@ OPTIONAL = ["single.html", "proteinhunter.html"]
 DIRECTORIES = ["web", "src"]
 
 # ...and never these, wherever they appear.
-IGNORE = shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map")
+# 🔴 `.ipynb_checkpoints` IS IN HERE BECAUSE THE SITE WAS SHIPPING THEM. A
+# jupyter-lab running against this checkout writes
+# `<dir>/.ipynb_checkpoints/<name>-checkpoint.js` beside every file it saves,
+# and `copytree` took them: dist/src carried 188 files against src/'s 180 -
+# eight stale snapshots of real modules, published. Nothing imports them, so
+# nothing broke; they were simply somebody's editor state on a public site.
+#
+# The unresolved-import CHECK below learned to skip them the same day and this
+# did not, which is the lesson: a rule applied to the inspection and not to the
+# COPY leaves the artefact in the artefact.
+IGNORE = shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map",
+                                ".ipynb_checkpoints")
 
 
 
@@ -57,11 +68,12 @@ IGNORE = shutil.ignore_patterns("*.pyc", "__pycache__", ".DS_Store", "*.map")
 #
 # 🔴 A DEPLOY ONCE 404'd ON TWO MODULES THAT EVERY CHECKOUT HAD. .gitignore said
 # `model/` for the exported weights, and an unanchored pattern matches a
-# directory of that name at ANY depth - so src/model/ was silently untracked,
-# the files existed locally, the site built, and the published page failed to
-# load web/app.js with no error anyone would see. Copying is not enough: a
-# build has to answer "does what I just assembled actually load", and for ES
-# modules that means every relative specifier resolving to a file in dist/.
+# directory of that name at ANY depth - so the `model/` directory under `src/`
+# was silently untracked, the files existed locally, the site built, and the
+# published page failed to load web/app.js with no error anyone would see.
+# Copying is not enough: a build has to answer "does what I just assembled
+# actually load", and for ES modules that means every relative specifier
+# resolving to a file in dist/.
 IMPORT = re.compile(
     r"""(?:^|[\s;}])(?:import|export)\s+(?:[^'"]*?\sfrom\s+)?["']([^"']+)["']""",
     re.MULTILINE,
@@ -131,7 +143,7 @@ def registry_mismatches() -> list[str]:
     one is read by a build and the other by a browser; they are checked here so
     that being two files cannot mean being two answers.
     """
-    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     # ...a key is quoted when it is not a bare identifier, which
     # `ef2-fast-600m` is not. Matching only unquoted keys made this check
     # report a family as MISSING from the file it is defined in.
@@ -140,9 +152,9 @@ def registry_mismatches() -> list[str]:
     problems = []
     for family in sorted(in_py - in_js):
         problems.append(f"{family}: in tools/write_manifest_module.py but not in"
-                        " src/reference/manifests/index.js")
+                        " src/bundles/manifests/index.js")
     for family in sorted(in_js - in_py):
-        problems.append(f"{family}: in src/reference/manifests/index.js but not in"
+        problems.append(f"{family}: in src/bundles/manifests/index.js but not in"
                         " tools/write_manifest_module.py")
     for family in sorted(in_py & in_js):
         module = ROOT / BUNDLES[family]["module"]
@@ -163,7 +175,7 @@ def unpublished_families() -> set[str]:
     skipped instead, and the skip is PRINTED, because a bundle silently missing
     from a site is the failure mode this whole file exists to stop.
     """
-    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     families = set()
     family = None
     for line in index.splitlines():
@@ -190,7 +202,7 @@ def remote_families() -> set[str]:
     Read out of index.js rather than duplicated here, for the reason
     registry_mismatches gives: two files may not mean two answers.
     """
-    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
     families = set()
     family = None
     for line in index.splitlines():
@@ -208,6 +220,37 @@ def remote_families() -> set[str]:
         elif line == "  },":
             family = None
     return families
+
+
+def unreachable_offers() -> list[str]:
+    """Families the PAGE offers whose shards no visitor can fetch.
+
+    🔴 A MODEL IN `index.html` WITH NO `remote:` IS A 404 FOR EVERY VISITOR, AND
+    NOTHING SAID SO. `bundleBaseUrl` is `bundle.remote ?? bundle.directory`, and
+    the directory - `./model-intellifold2-int5/` - is a LOCAL export that this
+    build deliberately never copies, because GitHub Pages caps a site at a
+    gigabyte and IntelliFold-2 alone is 612 MiB. So a family wired into the
+    picker before its bundle is published resolves to a path that is not on the
+    site: the option appears, the visitor chooses it, and the fold dies fetching
+    shard zero.
+
+    It has been latent rather than shipped only because the deploy is behind:
+    the live commit does not carry those two options and HEAD does. That is the
+    worst shape for a defect - correct in the tree, correct on the site, broken
+    the moment the two meet - and it is CLAUDE.md's own "a bundle the CLI likes
+    can be one the PAGE cannot load", one turn further out.
+
+    Local directories ARE legitimate for a developer, which is why this asks
+    what the OPTION list offers rather than what the registry contains.
+    """
+    offered = set(re.findall(r'<option value="([\w-]+)"',
+                             (ROOT / "index.html").read_text(encoding="utf-8")))
+    hosted = remote_families()
+    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text(encoding="utf-8")
+    known = set(re.findall(r'^  "?([\w-]+)"?: \{$', index, re.MULTILINE))
+    # An <option> that is not a model family at all - a sampler, a preset - is
+    # not this check's business.
+    return sorted(family for family in offered & known if family not in hosted)
 
 
 def restricted_terms(module: Path) -> str | None:
@@ -291,7 +334,7 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
         # because int5 was the only packed dtype when it was written, and the
         # ESM-C bundle ships int3 - so a correct manifest was rejected with
         # "unknown dtype 'int3'" and advice to regenerate it, which would have
-        # produced the identical file. src/reference/dtype.js has decoded int1
+        # produced the identical file. src/weights/dtype.js has decoded int1
         # through int7 the whole time; this is the second place that knew about
         # one width, after `BYTES` in that same file.
         packed = re.fullmatch(r"int([1-7])", dtype or "")
@@ -337,7 +380,20 @@ def manifest_mismatches(model: Path, module: Path) -> list[str]:
 def unresolved_imports(root: Path) -> list[str]:
     """Every relative import under root that does not point at a file."""
     problems = []
-    sources = list(root.rglob("*.js")) + list(root.glob("*.html"))
+    # 🔴 AN EDITOR'S SNAPSHOT IS NOT A SOURCE FILE, AND THIS WALKED THEM INTO
+    # THE DEPLOY CHECK. A jupyter-lab running against this checkout writes
+    # `<dir>/.ipynb_checkpoints/<name>-checkpoint.js` whenever a file is saved -
+    # stale copies whose imports are whatever that file said when it was last
+    # snapshotted. After the src/ reorganisation those paths stopped resolving
+    # and this function failed the whole build on two files nobody wrote, with
+    # advice ("check .gitignore is not swallowing a source directory") that
+    # points away from the cause. They ARE gitignored; they simply are not
+    # source. The JS side shares one walker for this rule -
+    # test/helpers/source-files.js - and this is the Python copy, which cannot
+    # import it. If that rule changes, change it here too.
+    sources = [p for p in root.rglob("*.js")
+               if not any(part.startswith(".") for part in p.parts)]
+    sources += list(root.glob("*.html"))
     for path in sources:
         text = path.read_text(encoding="utf-8", errors="replace")
         specifiers = IMPORT.findall(text)
@@ -481,6 +537,57 @@ def build(include_model: bool) -> int:
             print("--model was given but no export directory exists;"
                   " run `node tools/export-web-model.js <manifest>` first", file=sys.stderr)
             return 1
+
+    # 🔴 THE PUBLISHED TREE MUST BE THE SOURCE TREE, FILE FOR FILE. dist/src
+    # carried 188 .js against src/'s 180 and nobody noticed: eight
+    # `.ipynb_checkpoints` snapshots, copied straight onto a public site by
+    # `copytree`. Nothing imported them so nothing broke, and that is exactly
+    # why it needs asserting rather than watching - a stray file in the deploy
+    # has no symptom until it is somebody's stale code on the internet.
+    published = {p.relative_to(OUT / "src") for p in (OUT / "src").rglob("*.js")}
+    authored = {p.relative_to(ROOT / "src") for p in (ROOT / "src").rglob("*.js")
+                if not any(part.startswith(".") for part in p.parts)}
+    if published != authored:
+        extra = sorted(str(p) for p in published - authored)
+        missing = sorted(str(p) for p in authored - published)
+        for p in extra:
+            print(f"dist/src carries {p}, which is not a source file", file=sys.stderr)
+        for p in missing:
+            print(f"dist/src is missing {p}", file=sys.stderr)
+        return 1
+
+    # 🔴 AND THE PAGE MUST NOT OFFER A MODEL THE SITE CANNOT SERVE, so the BUILD
+    # takes the option out rather than a person remembering to. See
+    # unreachable_offers: every other check here asks whether what was copied is
+    # right, and this one asks whether what was NOT copied is still advertised.
+    #
+    # Dropped from dist/ and never from the checkout: a developer with the local
+    # export in place is exactly who those options are for, and `tools/serve.py`
+    # serves them. Publishing the bundle and re-pinning its `remote` makes the
+    # option come back with no edit here or in index.html - the registry decides,
+    # which is the point.
+    #
+    # 🔴 AND IT SAYS SO EVERY BUILD, because a silent drop is the same bug one
+    # step quieter: a model that vanishes from the picker with no line of output
+    # looks exactly like a model nobody ported.
+    unreachable = unreachable_offers()
+    if unreachable:
+        page = (OUT / "index.html").read_text(encoding="utf-8")
+        for family in unreachable:
+            pattern = re.compile(rf'[ \t]*<option value="{re.escape(family)}"[^>]*>'
+                                 r'[^<]*</option>\n?')
+            page, count = pattern.subn("", page)
+            if count != 1:
+                print(f"expected one <option> for {family}, matched {count}",
+                      file=sys.stderr)
+                return 1
+        (OUT / "index.html").write_text(page, encoding="utf-8")
+        print(f"dropped {len(unreachable)} model option(s) the site cannot serve:"
+              f" {', '.join(unreachable)}")
+        print("  their `remote` is null, so bundleBaseUrl would fall back to a local"
+              " directory this build does not publish.")
+        print("  Publish the bundle and re-pin the remote (docs/HOSTING.md) and the"
+              " option returns by itself.")
 
     problems = unresolved_imports(OUT)
     if problems:

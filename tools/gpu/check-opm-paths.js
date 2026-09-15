@@ -15,7 +15,7 @@
  * that matters for a phone, where the cap is 128 MiB and every real protein
  * takes several blocks.
  */
-import { OuterProductMeanGpu } from "../../src/evoformer/outer-product-mean.js";
+import { OuterProductMeanGpu } from "../../src/kernels/outer-product-mean.js";
 import { relativeRms } from "./relative-rms.js";
 
 const option = (args, name, fallback) => {

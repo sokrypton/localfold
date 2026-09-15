@@ -9,7 +9,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { ccdUrl, parseCcdComponent, polymerResidue } from "../src/af3/ccd-component.js";
+import { ccdUrl, parseCcdComponent, polymerResidue } from "../src/af3/featurise/ccd-component.js";
 
 // GOL, as files.rcsb.org serves it. Hydrogens kept in, so the test can show
 // they are dropped; one atom name quoted, as components with primes are.

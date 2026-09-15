@@ -1,5 +1,5 @@
 /**
- * AF3's diffusion token transformer: GPU against src/af3/diffusion-reference.js.
+ * AF3's diffusion token transformer: GPU against src/af3/diffusion/diffusion-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-diffusion-transformer.js
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-diffusion-transformer.js --supers=6
@@ -9,9 +9,9 @@
  * blocks and wrong for every block after, so a one-super-block check passes on
  * an implementation that ignores the nesting entirely.
  */
-import { diffusionTransformer } from "../../src/af3/diffusion-reference.js";
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights.js";
+import { diffusionTransformer } from "../../src/af3/diffusion/diffusion-reference.js";
+import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
 
 const TX = "diffuser/~/diffusion_head/transformer";
 const STACK = `${TX}/__layer_stack_with_per_layer/__layer_stack_with_per_layer/transformer`;

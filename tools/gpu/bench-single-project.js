@@ -11,7 +11,7 @@
  * LayerNorm each split repeats. Arms are the number of workgroups per token.
  */
 import { createSingleAttentionShaders, packSingleAttentionWeights }
-  from "../../src/af3/single-attention-webgpu.js";
+  from "../../src/af3/trunk/single-attention-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

@@ -266,7 +266,7 @@ def report_unconverted(params: dict) -> list[str]:
         "and none of it is built. This is the largest piece left.")
     notes.append(
         "chain identity (asym/entity/sym) is built by src/input/chains.js but does not yet reach "
-        "the model: src/multimer/model.js takes no chainLengths.")
+        "the model: src/af2/multimer/model.js takes no chainLengths.")
     notes.append("run with outerProductMeanFirst: true and positionScale: 20 - both already exist.")
     notes.append(
         f"{sum(1 for name in params if 'template' in name)} template modules are architecturally "

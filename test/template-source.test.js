@@ -3,8 +3,8 @@ import {
   buildTemplate, describeCoverage, fetchStructure, mapToQuery, parseSource,
   residuesFromCif,
 } from "../web/template-source.js";
-import { chainResidues } from "../src/af3/template-input.js";
-import { GAP_AATYPE } from "../src/af3/template-input.js";
+import { chainResidues } from "../src/af3/featurise/template-input.js";
+import { GAP_AATYPE } from "../src/af3/featurise/template-input.js";
 
 function line(serial, name, resName, chain, resSeq, x, y, z, bFactor) {
   const out = new Array(60).fill(" ");

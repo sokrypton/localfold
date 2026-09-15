@@ -372,7 +372,7 @@ tile is 4,672 bytes and fits anything, which is why a constant nobody priced
 survived five models.
 
 🔴 **AND IT IS IN TWO FILES, WHICH MADE THE FIRST HALF OF THE FIX LOOK LIKE NO
-FIX AT ALL.** `grid-attention-webgpu.js` and `src/triangle/shaders.js` each
+FIX AT ALL.** `grid-attention-webgpu.js` and `src/kernels/triangle/shaders.js` each
 carry their own copy of that LayerNorm, and both come to **exactly** 16,960
 bytes at 512 channels - so fixing one left the error byte-for-byte identical and
 read as "the flag is not reaching the kernel". docs/ARCHITECTURE.md lists this
@@ -403,6 +403,93 @@ the fifth digit, which is what AF2's checksum already does there.
 Its no-budget peak is **2229 MiB**, against boltz2's 1535 and AlphaFold 3's 983
 - the trunk pair is 512 channels where AF3's is 128, so every resident trunk
 weight is four times the size:
+
+### 🔴 WHY IT IS LARGE: 4x THE PAIR WIDTH IS 16x THE PAIR WEIGHTS, AND NOTHING ELSE CHANGED
+
+"The trunk pair is 512 channels where AF3's is 128" is the cause and it
+understates the effect by a factor of four, because **a pair weight is
+`C x kC`** - both of its dimensions carry the pair width - so the width enters
+squared. Counted out of the two bundles' own manifests:
+
+| | AlphaFold 3 | IntelliFold-2 | |
+|---|---:|---:|---|
+| parameters | 368.4 M | **851.0 M** | 2.31x |
+| bundle | 265 MiB | **611 MiB** | 2.31x - int5 costs 6.02 bits/param in both |
+| tensors | 406 | 406 | the same tensors, **191 of them the same size** |
+
+and by module:
+
+| | AF3 | IF2 | |
+|---|---:|---:|---|
+| diffusion head | 204.3 M | 207.7 M | **1.02x - untouched** |
+| trunk pairformer | 147.4 | 549.4 | 3.73x |
+| confidence head | 12.9 | 46.8 | 3.63x |
+| MSA stack | 3.0 | 41.8 | **13.9x** |
+| template stack | 0.3 | 4.0 | 13.3x |
+
+🔴 **AND "int5" IS 6.02 BITS A PARAMETER, NOT 5 - A FIFTH MORE THAN THE NAME.**
+The scheme is `asymmetric-per-group`, **5 bits, group 32, a float16 scale AND a
+float16 zero per group**, so a quantised parameter costs `5 + 32/32` = **6.0
+bits** and the two extra bytes per group of thirty-two are 20% of the bundle.
+Both bundles also keep **151 of their 406 tensors in float32** - the layer norms
+and biases, 0.7 M of IntelliFold-2's 851.0 M parameters, 0.08% - which rounds
+the whole-checkpoint figure to 6.02.
+
+That model predicts the artefacts exactly rather than approximately:
+
+| | parameters | predicted | on disk | float32 would be |
+|---|---:|---:|---:|---:|
+| AlphaFold 3 | 368.4 M | **265 MiB** | 265 | 1405 MiB (5.31x) |
+| IntelliFold-2 | 851.0 M | **611 MiB** | 611 | 3246 MiB (5.31x) |
+
+🔴 **AND IT BUYS NOTHING ON THE DEVICE.** Measured on the A100, the int5 bundle
+and the float32 bundle both peak at **954.1 MiB** on AlphaFold 3 - identical to
+the tenth of a MiB - because what is resident is the DECODED tensor and a
+decoded tensor has one width. int5 is 5.31x on the download and 1.86 s against
+3.47 on the cold fold, and zero in memory. See docs/A100.md.
+
+🔴 **THE 3.73x AND THE 13.9x ARE THE SAME NUMBER SEEN THROUGH DIFFERENT
+MIXTURES.** Split the pairformer by which track a weight belongs to:
+
+| trunk pairformer | AF3 | IF2 | |
+|---|---:|---:|---|
+| single track | 120.5 M | 120.9 M | **unchanged** |
+| pair track | **26.9** | **428.6** | **15.9x** |
+
+There it is: 4x the channels, **15.9x the weights**, and the single track beside
+it identical. AlphaFold 3's pair track is only 18% of its own pairformer and 7%
+of the whole checkpoint, which is why quadrupling it multiplies the MODEL by
+2.31 rather than by 16 - and why the MSA stack, which is nearly all pair-width
+weights, shows the raw 13.9x almost undiluted.
+
+The individual tensors say the same thing. The extra 482.6 M parameters are
+half accounted for by eight tensor classes, every one of them `C x kC`:
+
+| | AF3 | IF2 | share of the delta |
+|---|---:|---:|---:|
+| `pair_transition/transition1/weights` | 6.3 M | **100.7 M** | 20% |
+| `pair_transition/transition2/weights` | 3.1 | 50.3 | 10% |
+| the four `triangle_multiplication_*/{gate,projection}` | 1.6 each | 25.2 each | 20% |
+| `pair_attention1/{gating_query,k_projection}` | 0.8 each | 12.6 each | 4% |
+
+`[48, 128, 1024] -> [48, 512, 4096]` is the first of those, and 16x exactly.
+**The stack is not deeper** - 48 trunk blocks, 4 MSA blocks and 4 confidence
+blocks in both - and **the diffusion head is not wider**, because it works on the
+single and atom tracks at 384 channels in both. IntelliFold-2 is one wide track
+in an otherwise ordinary AlphaFold 3.
+
+Which is also the whole device-memory story: the two rows at the top of its 2229
+MiB peak are `w.grid` 567 MiB and `w.pair-transition` 384, and both are the same
+`C x kC` weights resident in decoded form.
+
+🔴 **AND THE 2229 IS THE ONE FIGURE IN THIS DOCUMENT'S MEMORY TABLES THAT
+REPRODUCES EXACTLY** - re-measured on the A100 on 2026-09-15 at **2229.1 MiB**,
+where boltz2's 1535 comes back 1399.1 and AlphaFold 3's 983 comes back 992.6.
+And the panel in docs/A100.md adds the half a single length cannot show: this
+2.34x memory multiple is **flat in length** (2.31x at 255 tokens, because a
+weight does not grow with the protein) while the TIME multiple is not - 1.87x at
+68 tokens and **2.66x at 255**.
+
 
 | held, no budget | |
 |---|---:|
@@ -806,7 +893,7 @@ hand, and each dropped something the other passed:
   where the page takes a **seeded random subset** of the whole file.
 
 So every `--a3m` gate in this repository was measuring a fold the site does not
-run. Both call `af3BatchFromA3m` in src/af3/batch.js now, and with the two
+run. Both call `af3BatchFromA3m` in src/af3/featurise/batch.js now, and with the two
 batches made identical field by field the CLI reproduced 72.4 - which is how the
 weights became the only thing left.
 
@@ -863,7 +950,7 @@ A protein chain typed into `index.html` folds with AlphaFold 3 entirely in the
 browser: featurisation, trunk, diffusion and confidence, no server. Pick **AF3**
 in the Model dropdown.
 
-- **From a sequence, not a dump.** `src/af3/featurise.js` builds AF3's whole
+- **From a sequence, not a dump.** `src/af3/featurise/featurise.js` builds AF3's whole
   batch in JavaScript. Checked array-by-array against AF3's own batch for 6MRR
   and for a three-chain complex: `node tools/oracle/check_af3_featurise.js`.
 - **Complexes**, chains separated by `:`. Chain identity comes from
@@ -885,14 +972,14 @@ in the Model dropdown.
   array-by-array against AF3 for protein+DNA, protein+RNA and a three-chain
   complex; folded geometry checked by `tools/gpu/probe-nucleic.js` (bond ratio
   1.013 DNA, 1.009 RNA, against 1.017 for the protein control). Their reference
-  conformers are `src/af3/reference-conformers-nucleic.js`, generated from the
+  conformers are `src/af3/featurise/reference-conformers-nucleic.js`, generated from the
   oracle rather than typed. No MSA: AF3 searches an RNA database this page has
   no server for, and DNA gets none in AF3 either.
 - **Modified residues** on protein chains; modified BASES are refused, since the
   modified-residue path resolves parents through the amino-acid table.
 - **Recycles** for AF3 as well as AF2.
 - **MSAs**, through the page's own alignment controls - search, paste or upload,
-  shared with both AlphaFold 2 models. `src/af3/msa-features.js` is the whole of
+  shared with both AlphaFold 2 models. `src/af3/featurise/msa-features.js` is the whole of
   the adapter. On the 59-residue demo sequence a 512-row alignment moves pLDDT
   55.8 -> 65.7 and costs about 2 s (the MSA stack goes from nothing to 239 ms at
   512 rows).
@@ -981,12 +1068,12 @@ precision the buffer ends up in. Dropping to f32 weights would save 178 ms of
 
 🔴 **AND IT IS A COMPUTE PASS NOW, NOT HOST WORK AT ALL.** Hiding it behind the
 trunk was considered and would have cost 378 MiB; decoding it on the GPU costs
-nothing and is 3.7x faster. `src/runtime/quantised-upload.js` uploads the int5
+nothing and is 3.7x faster. `src/weights/quantised-upload.js` uploads the int5
 CODES - about an eighth of the bytes - and decodes them straight into the
 resident buffer. Over the 24 blocks, both arms cold: **437 ms on the host
 against 119 on the device**, and 0 of 198 million elements differ.
 
-The same helper (`src/af3/device-weights.js`) took the trunk's two f16 labels,
+The same helper (`src/af3/weights/device-weights.js`) took the trunk's two f16 labels,
 which were the next largest:
 
 | packer | MiB | host, cold |
@@ -1355,7 +1442,7 @@ What did **not** work, measured, so it is not retried:
   the up-front burst serialises ahead of all compute.
 - **Caching bind groups**: exactly zero, 636-639 either way, though ~1,680 are
   created per stack.
-- **f16 weights for the triangle, for SPEED.** `src/triangle/` has had a
+- **f16 weights for the triangle, for SPEED.** `src/kernels/triangle/` has had a
   precision option since before this port and `bench-triangle.js` reports 1.40x
   for it at L=128, which reads exactly like an unclaimed win. Wired through to
   the pairformer it measured **377 ms against 378**. The bench's 1.40x is its
@@ -1385,7 +1472,7 @@ What did **not** work, measured, so it is not retried:
   trunk's own traffic for exactly what it saves. It is the same finding as the
   up-front weight burst above, in a new place.
 - **Anything that adds registers to the flash attention kernel.** See
-  src/evoformer/attention.js: a vec4 q.k accumulator is worth exactly zero
+  src/kernels/attention.js: a vec4 q.k accumulator is worth exactly zero
   (the compiler already does it), grouping the keys to amortise the softmax
   rescale is 2.3x SLOWER, and two queries a lane is 4.7x slower. The query and
   the accumulators are already 64 registers a lane and that is the ceiling.
@@ -1543,7 +1630,7 @@ measurements is in each file.
   checkers compare against at 1e-6, which is a tolerance nobody chose. What is
   left is ~4 ms of genuine dense work and is no longer worth a kernel.
 - ~~**Templates raise** rather than compute.~~ Closed on the CPU 2026-09-04:
-  `src/af3/template-features.js` computes all six geometry features and
+  `src/af3/featurise/template-features.js` computes all six geometry features and
   `template-reference.js` loops over real slots. Against AF3 on a 16-residue
   query with Top7 in slot 0 of four:
 
@@ -1907,7 +1994,7 @@ but the exponent has not changed and it will lead again on a longer chain.
 Anything further should be measured at 150, not at 59.
 
 🔴 **AND ON A DEVICE WITH MATRIX UNITS THIS KERNEL IS NOW A DIFFERENT ONE.**
-`src/af3/grid-attention-matrix.js` is the same online-softmax flash attention
+`src/af3/trunk/grid-attention-matrix.js` is the same online-softmax flash attention
 AF2 runs, and it is 1.40x to 1.53x over the staged scalar kernel below across
 200 to 640 tokens on an A100 - the whole measurement, and the AF2 tile rule that
 does NOT transfer to it, are in docs/A100.md. It is off unless
@@ -2352,7 +2439,7 @@ working well. The binder's length is passed in now.
 `tools/oracle/dump_af3_trunk.py --template <pdb>[:CHAIN]` folds a query with a
 real structure as its template and captures the module's inputs and its
 per-slot outputs. That answers the objection at the top of
-`src/af3/template-reference.js` - "with no template the six geometry features
+`src/af3/trunk/template-reference.js` - "with no template the six geometry features
 are identically zero, so nothing here can tell a correct implementation of them
 from a wrong one" - which was true and is the reason only the empty-slot path
 exists. See docs/AF3.md's template entry for the numbers.
@@ -2585,7 +2672,7 @@ DeepMind's checkpoint" - so a second AF3-graph family took the AlphaFold 2
 branch at each. Three of them were CAPABILITY guards, and they refused ligands,
 modified residues and nucleic chains under OpenBind with a message naming a
 capability the model has: *"Ligands need AlphaFold 3; the model is set to
-openbind"*. `AF3_FAMILIES` in `src/reference/manifests/index.js` is the list;
+openbind"*. `AF3_FAMILIES` in `src/bundles/manifests/index.js` is the list;
 `isAf3Family` is the test.
 
 🔴 **AND THE DIALOG SAYS "NOT AVAILABLE FOR COMMERCIAL USE" AND NOT "ACADEMIC
@@ -2874,7 +2961,7 @@ the 59-token case, where one wins by 1.9 ms. A trunk pass at 400 tokens is
 ## A recycle criterion for a trunk that returns no structure
 
 AF2 stops recycling on ColabFold's `compute_tol` - the RMS change of every
-C-alpha pair distance - and `src/model/recycle-convergence.js` implements it.
+C-alpha pair distance - and `src/af2/model/recycle-convergence.js` implements it.
 **AF3 has no early stop at all**, and the reason is structural rather than an
 oversight: `src/af3/fold.js`'s recycle loop is a bare `for (let pass = firstPass;
 pass <= recycles; pass += 1)` because AF2 recycles a STRUCTURE and AF3 recycles
@@ -2882,7 +2969,7 @@ the single and pair representations alone, running the sampler once at the end.
 There are no coordinates to compare until every recycle is already paid for.
 OpenDDE runs the same fold; ESMFold2 has its own recycle path and does not.
 
-So the only signal is the representation. `src/model/feature-convergence.js` is
+So the only signal is the representation. `src/af3/feature-convergence.js` is
 the metric - relative RMS change, `||b - a|| / ||b||`, dimensionless so it can
 be compared across models and token counts - and it costs nothing: the loop
 already holds `previousPair` and `previousSingle` as HOST arrays, because the
@@ -2952,7 +3039,7 @@ distance matrix for free - and the RMS change of that matrix is exactly what
 ColabFold's `compute_tol` takes over a structure. AF2's criterion and this one
 are the same measurement in the same unit, one from coordinates and one from
 the trunk. `expectedDistances` and `distanceChange` in
-src/model/feature-convergence.js; the tolerance is angstroms and ColabFold's
+src/af3/feature-convergence.js; the tolerance is angstroms and ColabFold's
 default for the analogous number is 0.5.
 
 | pass | pair | single | **distogram** |
@@ -3031,7 +3118,7 @@ second model becomes a different `--blob`, not a second exporter" - holding.
 triangle heads at c_z 256, a 2-block template stack of 2 heads at 64, four MSA
 blocks at c_m 128 with value_dim 8, a 64-bin distogram with a biased half-logit
 projection. Every one matches the reference's `PROTENIX2_SETTINGS`, which is
-what says `src/af3/weights.js`'s derivation works rather than a table here
+what says `src/af3/weights/weights.js`'s derivation works rather than a table here
 having to keep step.
 
 ### What the assertions caught, one run each
@@ -3158,7 +3245,7 @@ is what found the `rt_j`/`rt_i` order above. Dump it first.
 scopes mapped and 0 unmapped - as
 `oracle-dumps/af3-oracle-template-protenix2.json`: 76 tokens, the 108 feature
 columns and the module's output separately. `fusedTemplateEmbedding` in
-src/af3/template-reference.js is held to it by
+src/af3/trunk/template-reference.js is held to it by
 `tools/gpu/check-af3-template-fused.js` at **relRMS 1.52e-7**, ours rms 12.4434
 against native's 12.4434.
 
@@ -4115,6 +4202,20 @@ evidence about the checker, not about the port.**
 | **boltz2** | 0.4 | 4.7 | **5.2** | **1535** | 1044 |
 | **protenix2** | 0.6 | 2.8 | **3.5** | 1297 | 1962 |
 
+🔴 **AND THIS TABLE DOES NOT SAY WHICH MACHINE, WHICH IS ITS DEFECT - THE boltz2
+ROW IS NOT THE A100'S.** Re-measured there on 2026-09-15 at `4df2b99`, the
+commit this table was written in, AND at HEAD 127 commits later, identical at
+both: alphafold3 **992.6 MiB / 3.138 s**, boltz2 **1399.1 / 3.69**, protenix2
+**1220.3 / 3.357**. So nothing drifted - AlphaFold 3's row is essentially that
+box (983 against 992.6, 3.1 against 3.138) and boltz2's is 9.7% under on memory
+and 41% under on time. Its breakdown below names "204 of MSA scratch" as the
+third row; on the A100 the third row is `difftx.zerogate.resident` at 162 MiB in
+**every** arm that can be run - from a sequence, from the dump, at 50 steps, at
+200, and with a real 8076-row alignment. A memory figure is a property of the
+machine exactly as a checksum is. **The whole panel, measured in one sitting on
+the A100 with the controls for what does and does not move a peak, is in
+docs/A100.md.**
+
 boltz2 is 1.7x AlphaFold 3 for 1.6x the device memory, which is what its shape
 costs: 64 pairformer blocks against 48, an 8-block confidence stack against 4,
 and a token transformer carrying a third projection per block. Its peak is 513
@@ -4248,7 +4349,7 @@ became observable, which it had not been.
 
 ### 🔴 And it goes through `af3BatchFromA3m`, which is the half that catches a caller
 
-src/af3/batch.js forwards the dialect to `featuriseProtein` **field by field**.
+src/af3/featurise/batch.js forwards the dialect to `featuriseProtein` **field by field**.
 A gate that calls the featuriser directly would stay green while the page and
 every fold tool silently dropped a convention. Verified by deleting
 `atomizedBackboneBonds` from that forwarding: the gate goes red with "4 bonds
@@ -4271,7 +4372,7 @@ featuriser has no business with `noResidual`.
   the reference, so `msa` is not compared. Its evidence is elsewhere (AF3 6MRR
   83.084 -> 83.169).
 - **opendde's second token space** - 65 `struct/` and `structbook/` fields that
-  this port DOES build, in src/af3/structural-tokens.js, and that nothing
+  this port DOES build, in src/af3/featurise/structural-tokens.js, and that nothing
   compares against the reference. Named in the output rather than silently
   absent.
 
@@ -4630,7 +4731,7 @@ what a visitor is getting is not a measurement of it.
 drives the real page in a real browser rather than a fold tool. This is the
 check CLAUDE.md's own trap demands - "a bundle the CLI likes can be one the PAGE
 cannot load", because the page reads the manifest baked into
-`src/reference/manifests/<family>.js` and not the JSON beside the shards, and
+`src/bundles/manifests/<family>.js` and not the JSON beside the shards, and
 opendde once died at 122/472 MiB with every CLI gate passing.
 
     IntelliFold-2 · 58 residues · in 5 s · single sequence · 2 passes · pLDDT 54.5
@@ -4749,7 +4850,7 @@ single-sequence wall 5CAJ shows for a monomer.
 The page builds one template SLOT PER CHAIN, which is AF3's convention.
 `multichainMaskFor` opens a cross-chain pair only where a slot covers BOTH ends,
 so per-chain slots contribute nothing across the boundary however `spanChains`
-is set - each covers one end. `mergeTemplateSlots` (src/af3/template-input.js)
+is set - each covers one end. `mergeTemplateSlots` (src/af3/featurise/template-input.js)
 folds them into ONE slot that does; `--per-chain-templates` is the arm without
 it, and `--no-span-chains` is the same MERGED slot with the cross-chain block
 masked.
@@ -5165,3 +5266,51 @@ stale-allow-list trap CLAUDE.md already records twice. `test/sampler-options.tes
 runs it both ways (no option without a row, no row without an option), asserts
 the marked-up default is `diffusion`, and was verified to fail in each
 direction. The unguarded reading is guarded.
+
+### 🔴 FLOW'S RISK IS A BAD FIRST DRAW, NOT LENGTH - and the earlier claim here was wrong
+
+The 1TIM section above says the sampler comparison is about length, and the
+page's tooltip said Flow is "weaker past about 400 residues". **That is not what
+is happening.** Five seeds each, 1TIM A:B, 494 residues, merged self-template:
+
+| | seeds 20260831 / 7 / 21 / 42 / 99 |
+|---|---|
+| **boltz2, flow** | **17.706** / 1.042 / **19.598** / 1.013 / 1.058 |
+| boltz2, diffusion | 1.027 / 1.090 / - / 1.113 / 1.076 |
+| af3, flow | 0.980 / 0.992 / 0.968 / 0.959 / 0.943 |
+| intellifold2, flow | 1.058 / - / 1.086 / - / - |
+
+**af3's Flow is clean on all five at that length**, so "Flow past 400 residues"
+is false. And boltz2's Flow is clean on a LONGER target - 5CAJ A:B at 522
+residues, four seeds, 0.566-0.842 alone with pLDDT 90.5-94.4 - so it is not
+boltz2's Flow at length either.
+
+🔴 **IT IS THE SEED, AND THE TEMPLATE IS EXONERATED.** The two failing seeds
+fail under **every** template configuration:
+
+| boltz2 flow, 1TIM | merged | cross-chain masked | per-chain slots | no template |
+|---|---:|---:|---:|---:|
+| seed 20260831 | 17.706 | 17.585 | 17.008 | 19.452 |
+| seed 21 | 19.598 | 17.909 | 7.783 | 23.191 |
+
+So the merged cross-chain block - which is the feature this session added, and
+the obvious suspect - is not the cause. What is left is the initial draw: **Flow
+takes one at the top of the schedule and walks down deterministically, so it
+never escapes a bad one, where diffusion re-noises at every step and does.**
+That explains the shape exactly - intermittent, locked to the seed, and never
+seen in diffusion.
+
+Two failure modes from that one cause: seed 20260831 folds both chains
+correctly (1.1 A each) and puts them 17.7 A apart with **zero** of the 101
+native contacts; seed 21 folds them wrongly (16.8 A each) into a mass that
+touches everywhere.
+
+🔴 **AND NEITHER IS VISIBLE TO ANYTHING THE PAGE SHOWS.** Both pass the
+chain-geometry gate - CA-CA 3.784 and 3.788 - and seed 20260831's pLDDT is
+**85.11** against a good fold's 93. The tooltip says what is true now: Flow is
+close behind on average and cannot recover from a bad first draw, so a minority
+of seeds come out far worse. Diffusion stays the default.
+
+**Why boltz2 and not af3 is not established.** Five seeds on one target for one
+model is where this stops; the honest claim is the mechanism and the
+measurement, not a rule about which checkpoints are susceptible.

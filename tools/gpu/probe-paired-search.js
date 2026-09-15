@@ -14,7 +14,7 @@
  * whether the two halves line up.
  */
 import { generateMmseqs2ComplexMsa } from "../../src/input/mmseqs2-api.js";
-import { af3MsaFromA3m } from "../../src/af3/msa-features.js";
+import { af3MsaFromA3m } from "../../src/af3/featurise/msa-features.js";
 
 const VHH = "EVQLVESGGGLVQPGGSLRLSCAASGDTSFIIAMAWYRQAPGKGRELVAGLNRLTSSISYADSVKG"
   + "RFTISRDNAKNTLYLQMNSLRPEDTAVYYCAAARVLGGTTERAWGQGTLVTVSS";

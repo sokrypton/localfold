@@ -20,7 +20,7 @@
  * where the constants sit, and every candidate still has to be read.
  */
 import { warmTrunkPipelines } from "../../src/af3/fold.js";
-import { openAf3Store, STRUCTURAL_REFINER } from "../../src/af3/weights.js";
+import { openAf3Store, STRUCTURAL_REFINER } from "../../src/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

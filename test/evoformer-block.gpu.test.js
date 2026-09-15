@@ -3,10 +3,10 @@ import { create, globals } from "webgpu";
 import {
   EvoformerBlockGpu,
 
-} from "../src/evoformer/block.js";
+} from "../src/af2/evoformer/block.js";
 
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-block0/manifest.json";

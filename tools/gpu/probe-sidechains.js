@@ -25,7 +25,7 @@
  *     this port      0.927  0.908   1.122 1.099 1.287 1.198 1.164 1.303
  *
  * 🔴 THE CAUSE WAS A WEIGHT NAME, AND THIS PROBE IS WHAT MADE IT VISIBLE.
- * src/af3/diffusion-weights.js loaded four of the atom encoder's pair tensors
+ * src/af3/weights/diffusion-weights.js loaded four of the atom encoder's pair tensors
  * under their unsuffixed names, which exist at identical shapes and belong to a
  * different module - see docs/AF3.md, "Fixed: the side chains were compressed". The
  * port now scores 1.015 / 1.017 with textbook aromatic rings. The numbers above
@@ -44,11 +44,11 @@
  * little large" from "two atoms are swapped and it is a bowtie". The ring pairs
  * are named and printed together for the aromatic types.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { atomName, foldBatch } from "../../src/af3/fold.js";
-import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { foldWeights } from "../../src/af3/diffusion-weights.js";
+import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

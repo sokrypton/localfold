@@ -16,7 +16,7 @@
  * a CONCATENATION of things this port has had all along, not new geometry. That
  * is the claim this checker exists to test rather than assert.
  */
-import { templateGeometry, DGRAM_BINS } from "../../src/af3/template-features.js";
+import { templateGeometry, DGRAM_BINS } from "../../src/af3/featurise/template-features.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -59,15 +59,15 @@ export async function main(device, args) {
   // disagrees for one model and not another is a model bug; one that disagrees
   // for both is this checker.
   if (dump.inputs["feat:restype_i"] === undefined || args.includes("--forward")) {
-    const { boltz2TemplateFeatures } = await import("../../src/af3/template-features.js");
+    const { boltz2TemplateFeatures } = await import("../../src/af3/featurise/template-features.js");
     const { openAf3Store, templateWeights, af3Dialect } =
-      await import("../../src/af3/weights.js");
-    const { fusedTemplateEmbedding } = await import("../../src/af3/template-reference.js");
+      await import("../../src/af3/weights/weights.js");
+    const { fusedTemplateEmbedding } = await import("../../src/af3/trunk/template-reference.js");
     const store = await openAf3Store(option(args, "model", `/model-${model}-f32/manifest.json`));
     store.prefetch();
     const dialect = af3Dialect(store);
     const weights = await templateWeights(store, dialect);
-    const { fusedTemplateFeatures } = await import("../../src/af3/template-webgpu.js");
+    const { fusedTemplateFeatures } = await import("../../src/af3/trunk/template-webgpu.js");
     const templateForFeatures = {
       aatype: Int32Array.from(aatypeRaw.data),
       atomPositions: positions.data, atomMask: atomMask.data,
@@ -92,7 +92,7 @@ export async function main(device, args) {
     // exact says the featuriser and the arithmetic are right; it says nothing
     // about the kernels that ship, and boltz2's 5CAJ fold with a template lands
     // at 2.2 A where protenix2 and AF3 reach 0.2.
-    const { Af3TemplateEmbedderGpu } = await import("../../src/af3/template-webgpu.js");
+    const { Af3TemplateEmbedderGpu } = await import("../../src/af3/trunk/template-webgpu.js");
     // 🔴 THE PINS GO THROUGH THE CONSTRUCTOR, NOT `--tune`. This checker builds
     // the embedder itself, so a `--tune=` on the command line reaches nothing
     // here - three arms of it read the identical 5.11e-4 and said only that

@@ -34,7 +34,7 @@
  * same shape as check-evoformer-attention.js's and deliberately a second
  * writing of it.
  */
-import { AttentionGpu } from "../../src/evoformer/attention.js";
+import { AttentionGpu } from "../../src/kernels/attention.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

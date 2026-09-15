@@ -20,7 +20,7 @@
  * lanes consecutive channels, so neither half of a packed word is owned by the
  * lane that would write it. The packed form gives a lane a PAIR of adjacent
  * channels - half the lanes, twice the accumulators - and twice the
- * accumulators is exactly where src/evoformer/attention.js records an AF2 tile
+ * accumulators is exactly where src/kernels/attention.js records an AF2 tile
  * getting SLOWER, because sixteen vec4 spill. That is the question this arm
  * exists to answer:
  *
@@ -30,7 +30,7 @@
  * 1e-3, which is half precision and not a fault. A tile that leaves rows
  * unwritten shows up far larger; that is still what the column is for.
  */
-import { createGridAttentionShaders } from "../../src/af3/grid-attention-webgpu.js";
+import { createGridAttentionShaders } from "../../src/af3/trunk/grid-attention-webgpu.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 
 const option = (args, name, fallback) => {

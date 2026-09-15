@@ -12,7 +12,7 @@ import { describe, it } from "node:test";
 
 import {
   noiseLevels, noiseSchedule, randomAugmentation, randomRotation, sample, samplerStep,
-} from "../src/af3/diffusion-sampler-reference.js";
+} from "../src/af3/diffusion/diffusion-sampler-reference.js";
 
 /** A deterministic gaussian, so a failure is reproducible. */
 function gaussians(seed = 1) {

@@ -12,7 +12,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP } from "../src/af3/msa-features.js";
+import { af3MsaFromA3m, AF3_MSA_CODES, AF3_MSA_GAP } from "../src/af3/featurise/msa-features.js";
 
 const QUERY = "ACDEFGHIKL";
 const a3m = (...rows) => rows.map((row, index) => `>seq${index}\n${row}`).join("\n") + "\n";

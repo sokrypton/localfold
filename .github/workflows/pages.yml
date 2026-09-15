@@ -34,7 +34,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
-          # in src/reference/manifests/index.js is fetched by the browser from
+          # in src/bundles/manifests/index.js is fetched by the browser from
           # there, so publishing a copy here would spend the Pages allowance on
           # bytes nothing loads. Asking build_site.py keeps one answer.
           if python3 tools/build_site.py --is-remote monomer; then
@@ -55,7 +55,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
-          # in src/reference/manifests/index.js is fetched by the browser from
+          # in src/bundles/manifests/index.js is fetched by the browser from
           # there, so publishing a copy here would spend the Pages allowance on
           # bytes nothing loads. Asking build_site.py keeps one answer.
           if python3 tools/build_site.py --is-remote multimer; then
@@ -90,7 +90,7 @@ jobs:
                exit 1 ;;
           esac
           # 🔴 THE REGISTRY DECIDES, NOT THIS FILE. A bundle with a `remote`
-          # in src/reference/manifests/index.js is fetched by the browser from
+          # in src/bundles/manifests/index.js is fetched by the browser from
           # there, so publishing a copy here would spend the Pages allowance on
           # bytes nothing loads. Asking build_site.py keeps one answer.
           if python3 tools/build_site.py --is-remote af3; then

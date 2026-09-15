@@ -39,6 +39,8 @@ import time
 import urllib.error
 import urllib.request
 
+# The workflow's DISPLAY NAME, which is what the API matches on. The file is
+# .github/workflows/pages.yml, named here so a rename is findable from either end.
 WORKFLOW = "Deploy WebGPU demo"
 BRANCH = "main"
 # Pages serves from a CDN that holds a build briefly after it is published.

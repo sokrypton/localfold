@@ -18,7 +18,7 @@
  */
 import { join } from "node:path";
 
-import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
+import { pairformerBlock } from "../../src/af3/trunk/pairformer-reference.js";
 import { ROOT, captures, compare, layer, loadDump, loadTensors } from "./af3-bundle.js";
 
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";

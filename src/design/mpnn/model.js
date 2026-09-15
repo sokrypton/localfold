@@ -76,7 +76,11 @@ export const AR = {
    * position (argmax agreeing 96%), and the single pass sits 0.10-0.11 nats
    * from either -- the same kind of number, about twice as large, for 1/L of
    * the work. It also errs high (mean NLL 1.33 vs 1.29 on ubiquitin), so it
-   * does not flatter a sequence. See `test/pseudolikelihood.mjs`.
+   * does not flatter a sequence. 🔴 THE SCRIPT THAT MEASURED THOSE NUMBERS IS
+   * NOT IN THE REPOSITORY: this used to cite a `pseudolikelihood` script under
+   * `test/`, which has never existed in this history, so the figures above
+   * cannot be re-run from here. Treat them as a recorded observation rather
+   * than a gate.
    */
   ALL_BUT_SELF: "all-but-self",
 };

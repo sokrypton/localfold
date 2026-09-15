@@ -50,12 +50,19 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = ROOT / "model-af3-full-f32"
+
+# 🔴 `--model` EXISTS BECAUSE THE ANSWER IS NOT A PROPERTY OF THE SCHEME. This
+# file was pinned to `model-af3-full-f32` and its header's frontier is AF3's
+# weights alone - which is exactly the shape of assumption the rest of this
+# repository keeps paying for. OpenDDE folds 6MRR into a 3283 A explosion at
+# `--group 128` where AF3 does not, so the schemes rank differently per
+# checkpoint and a table taken on one is a guess about the next.
+DEFAULT_MODEL = "model-af3-full-f32"
 
 
-def load(tensors, name):
+def load(model, tensors, name):
     record = tensors[name]
-    return np.fromfile(MODEL / record["file"], dtype="<f4",
+    return np.fromfile(model / record["file"], dtype="<f4",
                        count=int(np.prod(record["shape"])),
                        offset=record.get("byteOffset", 0))
 
@@ -123,6 +130,8 @@ def with_outliers(rows, bits, count):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="a FLOAT32 export directory to study")
     parser.add_argument("--tensors", type=int, default=6,
                         help="how many of the biggest tensors to average over")
     parser.add_argument("--bits", default="4,5,6,8")
@@ -130,12 +139,21 @@ def main():
                         help="groups sampled per tensor")
     arguments = parser.parse_args()
 
-    tensors = json.loads((MODEL / "manifest.json").read_text())["tensors"]
+    model = ROOT / arguments.model
+    if not (model / "manifest.json").exists():
+        raise SystemExit(f"{arguments.model}/manifest.json does not exist -"
+                         " this wants a FLOAT32 export, not a quantised bundle")
+    tensors = json.loads((model / "manifest.json").read_text())["tensors"]
+    quantised = [n for n, r in tensors.items() if r.get("dtype") not in (None, "float32")]
+    if quantised:
+        raise SystemExit(f"{arguments.model} is already quantised"
+                         f" ({len(quantised)} of {len(tensors)} tensors) - quantising"
+                         " a quantisation measures the wrong thing")
     biggest = [name for _, name in sorted(
         ((int(np.prod(record["shape"])), name) for name, record in tensors.items()),
         reverse=True)[:arguments.tensors]]
     rng = np.random.default_rng(0)
-    samples = {name: {group: grouped(load(tensors, name), group, arguments.cap, rng)
+    samples = {name: {group: grouped(load(model, tensors, name), group, arguments.cap, rng)
                       for group in (16, 32, 64, 128)} for name in biggest}
     grid = np.round(np.arange(0.5, 1.0001, 0.02), 3)
 

@@ -1,5 +1,5 @@
 /**
- * AF3's atom decoder: GPU against src/af3/diffusion-reference.js.
+ * AF3's atom decoder: GPU against src/af3/diffusion/diffusion-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-atom-decoder.js
  *
@@ -27,11 +27,11 @@
  * padding. The mask bias being a PRODUCT rather than a sum does have a control:
  * summing scores 4.3e-4 and 7.3e-4, 312x and 249x the envelope.
  */
-import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
+import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
-import { atomDecoder } from "../../src/af3/diffusion-reference.js";
-import { Af3AtomDecoderGpu } from "../../src/af3/atom-decoder-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights.js";
+import { atomDecoder } from "../../src/af3/diffusion/diffusion-reference.js";
+import { Af3AtomDecoderGpu } from "../../src/af3/diffusion/atom-decoder-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";

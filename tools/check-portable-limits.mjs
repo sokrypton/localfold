@@ -34,6 +34,8 @@ await runFolds({
   // fail there - see SPEC_FLOOR_CEILINGS.
   env: process.argv.includes("--spec-floor")
     ? { LOCALFOLD_SPEC_FLOOR: "1" } : { LOCALFOLD_PORTABLE_LIMITS: "1" },
+  // The two ceilings are different questions and so are different baselines.
+  arm: process.argv.includes("--spec-floor") ? "spec-floor" : "portable",
   question: process.argv.includes("--spec-floor")
     ? "at WebGPU's guaranteed minimum limits" : "at the portable limit ceiling",
   broke: /"error"|Error:|uncaptured|exceeds the maximum/,

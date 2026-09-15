@@ -4,7 +4,7 @@
         --esmfold2 esmfold2-fast-600m --out model-esmc-600m-f32
 
 Writes `manifest.json` plus `weights-NN.f32.bin` shards, which is exactly what
-`tools/quantize_af3.py` consumes and `src/reference/http-tensor-store.js` fetches
+`tools/quantize_af3.py` consumes and `src/bundles/http-tensor-store.js` fetches
 - so the int5 packing, the sharding limits and the shard cache all work on this
 without knowing what ESM-C is.
 
@@ -46,7 +46,7 @@ SHARD_LIMIT = 48 * 1024 * 1024
 
 # 🔴 THE PROJECTIONS ARE TRANSPOSED ON THE WAY OUT, INTO (inner, columns).
 # torch stores a Linear as (out_features, in_features) and computes x @ W.T;
-# src/evoformer/transition.js's tiled kernel - the one CLAUDE.md measures at
+# src/kernels/transition.js's tiled kernel - the one CLAUDE.md measures at
 # 1140-1550 GFLOP/s - indexes `weights[k * columns + column]`, which is
 # (in_features, out_features). Transposing here is one pass at export time;
 # transposing per fold would be 573 M elements a fold on the main thread, and

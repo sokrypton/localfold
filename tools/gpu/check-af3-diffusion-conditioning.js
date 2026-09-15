@@ -1,5 +1,5 @@
 /**
- * AF3's diffusion conditioning: GPU against src/af3/diffusion-reference.js.
+ * AF3's diffusion conditioning: GPU against src/af3/diffusion/diffusion-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-diffusion-conditioning.js
  *
@@ -30,13 +30,13 @@
  * headroom, and would fail on a correct implementation at a different token
  * count.
  */
-import { diffusionConditioning } from "../../src/af3/diffusion-reference.js";
-import { Af3DiffusionConditioningGpu } from "../../src/af3/diffusion-conditioning-webgpu.js";
-import { relativeEncoding } from "../../src/af3/embedder-reference.js";
-import { layerNormSlow } from "../../src/af3/atom-encoder-reference.js";
-import { linear } from "../../src/af3/pairformer-reference.js";
-import { openAf3Store, af3Dialect } from "../../src/af3/weights.js";
-import { conditioningWeights } from "../../src/af3/diffusion-weights.js";
+import { diffusionConditioning } from "../../src/af3/diffusion/diffusion-reference.js";
+import { Af3DiffusionConditioningGpu } from "../../src/af3/diffusion/diffusion-conditioning-webgpu.js";
+import { relativeEncoding } from "../../src/af3/trunk/embedder-reference.js";
+import { layerNormSlow } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { linear } from "../../src/af3/trunk/pairformer-reference.js";
+import { openAf3Store, af3Dialect } from "../../src/af3/weights/weights.js";
+import { conditioningWeights } from "../../src/af3/weights/diffusion-weights.js";
 import { ALPHAFOLD3, OPENBIND0, singleCondPadding } from "../../src/af3/dialect.js";
 
 // 🔴 NOT CONSTANTS ANY MORE, AND THAT WAS THE WHOLE BUG. These were
@@ -143,7 +143,7 @@ export async function main(device, args) {
     // width, projects it to the pair width, projects the relative encoding
     // separately, and concatenates THOSE.
     // ...and the third shape, which protenix2 and boltz2 both take; see the
-    // note in src/af3/diffusion-reference.js for how this arm passing at
+    // note in src/af3/diffusion/diffusion-reference.js for how this arm passing at
     // 3.20e-7 on protenix2 was two wrong computations agreeing.
     const projectedRelpos = !split && weights.relpeProjection !== undefined;
     const width = split ? 2 * PAIR_CHANNELS
@@ -297,7 +297,7 @@ export async function main(device, args) {
  * and the other arm is OpenFold3's; it is not enough the other way round, and
  * an openbind0 bundle took the stock arm's 831-wide dialect with its own
  * 833-wide tensors and tripped the LayerNorm-scale assertion in
- * src/af3/diffusion-conditioning-webgpu.js. That looked like a broken kernel
+ * src/af3/diffusion/diffusion-conditioning-webgpu.js. That looked like a broken kernel
  * and was a checker that could only count upwards.
  *
  * So both directions go through the bare 831: strip whatever the bundle

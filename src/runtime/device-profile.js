@@ -116,7 +116,7 @@ export const DEFAULT_TUNING = Object.freeze({
   //
   // - host by 50 ms at the shipped default and device by 100 ms at 2048, which
   // puts the crossover near 100,000 cells. That agrees with the other datum
-  // there is: src/model/monomer.js records the device path saving 640 ms of
+  // there is: src/af2/model/monomer.js records the device path saving 640 ms of
   // 1072 at 825 residues, and 825 x 128 is 105,600 - the same side of the line.
   // Both paths return the SAME features, checksum for checksum at every size
   // measured, so this only ever chooses what it costs.
@@ -136,6 +136,27 @@ export const DEFAULT_TUNING = Object.freeze({
   attentionGroup: 1,
   attentionVectorScore: false,
   // One query per invocation.
+  //
+  // 🔴 DECLARED, MEASURED, AND NOT WIRED - which is why `attention.js` now
+  // REFUSES any value but 1 rather than ignoring it. Nothing reads this knob:
+  // `createAttentionRegisterFlashShader` takes `options.queriesPerLane`
+  // (attention.js:866) and no call site ever filled it from tuning, so
+  // `--tune=attentionQueriesPerLane=2` silently did nothing and
+  // `audit-knobs.py` could only report it "moved nothing" - indistinguishable
+  // from a knob that is merely inert on the workload.
+  //
+  // It is NOT deleted, because it has numbers: the spread recorded further down
+  // this file is M2 **0.21x**, M4 Pro **0.45x**, GB10 **1.17-1.42x**, so it is a
+  // real win on at least one part and a rout on another. A GB10 prior would
+  // want it.
+  //
+  // Wiring it is a multi-site change, which is the other half of why it is not
+  // wired yet: the value bakes constants into the WGSL (`group.x *
+  // ${64 * queriesPerLane}u`, and `perQuery` unrolls the body) AND changes the
+  // dispatch through `attentionFlashQueriesPerGroup`, while `registerKey`
+  // (attention.js:1757) names neither. Connecting it without extending the key
+  // is exactly the pipeline collision that killed AF3 twice - once for
+  // `triangleProjectMatrix=false`, once for `singleProjectWorkgroupTarget=`.
   attentionQueriesPerLane: 1,
   // 🔴 THE DIFFUSION TRANSFORMER'S TOKEN TILE, null MEANING "the model's own
   // rule". That rule is `min(4, fits(channels))` and its comment records the
@@ -236,7 +257,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // device.
   singleProjectWorkgroupTarget: 110,
   singleProjectMaxSplits: 3,
-  // 🔴 THE TRIANGLE'S PROJECTION TILE, null meaning src/triangle/shaders.js's
+  // 🔴 THE TRIANGLE'S PROJECTION TILE, null meaning src/kernels/triangle/shaders.js's
   // 32x16. Note this one goes the OTHER way from the diffusion token tile: it
   // wants a BIGGER tile, because its dispatch already has tens of thousands of
   // workgroups and occupancy is long since saturated, so what is left to win
@@ -269,7 +290,7 @@ export const DEFAULT_TUNING = Object.freeze({
   opmProjectOutputPairs: null,
   // 🔴 FLASH ATTENTION ON THE MATRIX UNITS. The four flash kernels are 38% of an
   // AF2 block at 825 residues and the units do the query-key reduction in
-  // hardware. See src/evoformer/attention-matrix.js - and note that a GEMM
+  // hardware. See src/kernels/attention-matrix.js - and note that a GEMM
   // benchmark at K = head_dim predicts the opposite and asks a different
   // question: a flash attention's reuse is in its loop, not in K.
   attentionMatrix: null,
@@ -281,7 +302,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // in front of its own. The reads go to registers, the barrier moves between
   // the read and the write, and nothing else changes. docs/A100.md recorded
   // this as reverted on AF2 for a race; the race was in the BISECTION - see
-  // src/evoformer/attention-matrix.js on why the staging loop's trip count is
+  // src/kernels/attention-matrix.js on why the staging loop's trip count is
   // not uniform at a head of eight.
   // 🔴 HOW MANY BYTES ONE TRANSITION CHUNK MAY BIND, overriding
   // TRANSITION_CHUNK_TARGET_BYTES. That constant's 32 MiB knee was measured on a
@@ -313,7 +334,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // track and gets it too. Separate from `attentionMatrix` because the two
   // bodies differ - no gate, no uniform, a bias that is always present - and
   // because the geometry that suits one is 5-6% wrong for the other. See
-  // src/af3/grid-attention-matrix.js.
+  // src/af3/trunk/grid-attention-matrix.js.
   gridAttendMatrix: null,
   // Its geometry, "subgroupsXkeys"; null takes GRID_ATTEND_MATRIX_DEFAULT_TILE.
   gridAttendMatrixTile: null,
@@ -324,7 +345,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // fused kernel's own best tile - 1.13x at AF3's 128 channels, 2.77x at
   // ESMFold2's 256, 3.71x at OpenDDE's 384. It brings back the widened tensor
   // the fusion exists to avoid, chunked over rows. See
-  // src/af3/transition-webgpu.js.
+  // src/af3/trunk/transition-webgpu.js.
   pairTransitionSplit: null,
   // 🔴 HOW BIG THE SPLIT TRANSITION'S WIDENED ACTIVATION MAY GET, in MiB; null
   // is 64. It is a SPEED knob as well as a memory one - a chunk is its own
@@ -336,7 +357,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // Unlike the transition it needs no new memory: its source and both its
   // outputs are pair-sized scratch the track already holds. It does need the
   // four projection matrices interleaved, which is a reshape at pack time and
-  // costs no bytes. See src/triangle/project-matrix.js.
+  // costs no bytes. See src/kernels/triangle/project-matrix.js.
   triangleProjectMatrix: null,
   // 🔴 THE BLOCK THE STAGED MATRIX GEMMs SHARE, "BMxBNxBKxSRxSC"; null is
   // 128x128x32x2x4. Four kernels use it now - the transition's two halves and
@@ -353,7 +374,7 @@ export const DEFAULT_TUNING = Object.freeze({
   // tools/gpu/probe-staged-gemm-parts.js prices the staging loop at 3.10 ms of
   // a 4.58 ms kernel. It needs the weight BUFFER to hold halves, so it comes
   // with `weightPrecision: "f16"` or it does nothing at all - see
-  // directWeightsAllowed in src/runtime/matrix-linear.js, which is what turns
+  // directWeightsAllowed in src/kernels/matrix-linear.js, which is what turns
   // this request into an answer per kernel.
   stagedMatrixDirectWeights: null,
   // 🔴 THE ACCUMULATOR'S WIDTH, null meaning the device config's own. It is not
@@ -387,14 +408,14 @@ export const DEFAULT_TUNING = Object.freeze({
   // ALREADY interleaved [k][4w + role], because the vector kernel wanted one
   // vec4 a cell; so this is a shader and not a layout migration. It refuses a
   // PACKED q/k/v/gate, which is two channels to a word and needs the vector
-  // kernel's ownership rule. See src/af3/grid-project-matrix.js.
+  // kernel's ownership rule. See src/af3/trunk/grid-project-matrix.js.
   gridProjectMatrix: null,
   // 🔴 AF2's q/k/v/gate PROJECTION ON THE UNITS. It is 20% of an evoformer
   // block at 400 residues and 512 sequences - 12.73 ms of 78.01, the largest
   // thing in the block still on the vector path - and as one packed GEMM the
   // same work prices at 3.659 ms against 6.364. It reaches the four matrices
   // through `weightIndex` rather than a repack, because that buffer is bound by
-  // five shaders. See src/evoformer/attention-project-matrix.js.
+  // five shaders. See src/kernels/attention-project-matrix.js.
   attentionProjectMatrix: null,
   // 🔴 THE OUTER PRODUCT MEAN'S CONTRACTION IN f16, null meaning f32. Only the
   // STAGED TILE and a per-chunk accumulator narrow; the running total stays
@@ -569,7 +590,7 @@ const PRIORS = new Map([
     // 310.9 -> 263.5 (1.18x). The tile is a joint optimum between the scalar
     // softmax per key and the workgroup bytes per lane, and it MOVED when the
     // softmax got cheaper - 6x16 before the hoists, 4x32 after. Re-sweep it
-    // before trusting it on another part; see src/evoformer/attention-matrix.js.
+    // before trusting it on another part; see src/kernels/attention-matrix.js.
     attentionMatrix: true,
     attentionMatrixTile: "4x32",
     // 🔴 THE TRANSITION CHUNK, RE-SWEPT AT 825 RESIDUES. TRANSITION_CHUNK_TARGET_BYTES
@@ -824,7 +845,38 @@ const PRIORS = new Map([
     // 🔴 ampere ONLY. The table in singleProjectSplits shows 6 splits LOSING on
     // an M2 at every n it was measured at, which is the whole reason these were
     // left as parameters. DEFAULTS_ARE_MEASUREMENTS.
-    singleProjectWorkgroupTarget: 2048,
+    // 🔴 THE TARGET AND THE SPLIT CEILING ARE A PAIR, AND ONLY ONE WAS EVER SET.
+    // This prior carried `singleProjectWorkgroupTarget: 2048` and left
+    // `singleProjectMaxSplits` at its module default of 3, so
+    // `singleProjectSplits`' candidate list `[1,2,3,6].filter(<= 3)` could never
+    // reach the 6 the comment beside it says an A100 wants - and at 2048 the
+    // "reaches the target" loop never fires at a realistic token count either,
+    // so every fold fell through to "take the most workgroups available" and
+    // got 3, at every length.
+    //
+    // Re-measured on bench-single-project.js at 31 rounds and 64 iterations,
+    // reproducible across two reps (width 384, heads 16 x 24):
+    //
+    //     n      splits 1   2        3        6
+    //     59     0.1422   0.1422   0.0906   0.0578   <- 6, and 3 was shipping
+    //     128    0.1422   0.1594   0.0922   0.0594   <- 6
+    //     200    0.1563   0.1578   0.1078   0.0734   <- 6
+    //     400    0.1578   0.1578   0.1078   0.1578   <- 3
+    //     512    0.1578   0.1594   0.1422   0.2094   <- 3
+    //
+    // 1200 with a ceiling of 6 picks the best arm at all five; 2048 WITH 6 would
+    // pick 6 at 400 and 512 and be 46% worse there, which is why the target
+    // moves with the ceiling rather than the ceiling alone.
+    // 🔴 AND THE BENCH'S DEFAULT 11 ROUNDS OF 16 CANNOT SEE THIS: every arm
+    // reads 0.15-0.22 there and 3 looks like the winner everywhere, which is a
+    // false negative that nearly kept the bug.
+    // 🔴 AND IT IS 4.1% OF THE TRUNK'S GPU TIME, NOT A FOLD'S. Profiled at 68
+    // tokens: `single.project` is 3.79 ms of 93.1, so 1.57x on it is ~2.3% of
+    // the trunk and the wall clock does not move (68 tokens: 190/191 ms before,
+    // 194/184 after). Taken because the prior should express its own
+    // measurement, not because a fold gets faster.
+    singleProjectWorkgroupTarget: 1200,
+    singleProjectMaxSplits: 6,
     singleProjectLanes: 128,
     // ...and the outer product mean's contraction, which is the biggest kernel
     // in an AF2 block and the deepest K in the model. See opmMatrixContract.
@@ -890,7 +942,7 @@ const PRIORS = new Map([
     attentionProjectMatrix: false,
     // 🔴 AND THE TRANSITION'S PROJECTIONS FOR THE SAME REASON. The capability
     // layer turns `matrixLinear` on for any device announcing an f16 matrix
-    // configuration, and src/evoformer/transition.js then DERIVES the block
+    // configuration, and src/kernels/transition.js then DERIVES the block
     // from this part's 8x8x8 tile rather than assuming 16x16x16 - so it runs,
     // correctly, and slower. It is the whole of AF2's regression on this M2:
     // warm folds 1198-1226 ms with it against 1124-1133 without, which is what
@@ -1148,6 +1200,25 @@ export function deviceProfile(device) {
       ...(OVERRIDES.get(device) ?? {}),
     }),
   });
+  // 🔴 A KNOB NOTHING READS MUST REFUSE, NOT BE IGNORED - AND THE REFUSAL GOES
+  // HERE, NOT AT A KERNEL. The first attempt put this in `attention.js` beside
+  // the other two attention knobs, which is where it looks like it belongs and
+  // is a place this A100 never reaches: it resolves the MATRIX flash kernel, so
+  // the register selector's destructure never runs and
+  // `--tune=attentionQueriesPerLane=2` folded to the usual -1287025 with the
+  // guard in place. A guard in an unreached path is not a guard, which is this
+  // repository's own rule about control arms pointed at itself.
+  //
+  // Every caller resolves tuning through here, whatever kernel it then picks.
+  const perLane = profile.tuning.attentionQueriesPerLane;
+  if (perLane !== undefined && perLane !== null && perLane !== 1) {
+    throw new RangeError("attentionQueriesPerLane is declared but NOT WIRED:"
+      + " nothing reads it, so setting it would silently change nothing. The"
+      + " kernel parameter it names is real (attention.js's"
+      + " `options.queriesPerLane`) and the knob has numbers - M2 0.21x, M4 Pro"
+      + " 0.45x, GB10 1.17-1.42x - but connecting them needs the pipeline KEY"
+      + " and the DISPATCH too, and `registerKey` names neither.");
+  }
   CACHE.set(device, profile);
   return profile;
 }

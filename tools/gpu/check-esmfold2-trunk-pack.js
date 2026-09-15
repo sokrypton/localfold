@@ -21,7 +21,7 @@
  * be a second random pair representation.
  */
 import { Esmfold2TrunkGpu } from "../../src/esmfold2/trunk-webgpu.js";
-import { blockUploadStats } from "../../src/runtime/quantised-upload.js";
+import { blockUploadStats } from "../../src/weights/quantised-upload.js";
 import { reader } from "./fold-esmfold2.js";
 import { trunkBlockWeights } from "../../src/esmfold2/weights.js";
 

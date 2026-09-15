@@ -24,7 +24,7 @@ track a few hundred rows at a time. The grid attention takes it happily - q, k,
 v and the gate are indexed `((row * N + i) * HEADS + head)`, row outermost, so
 a row chunk is a contiguous byte range and binding that SLICE makes the
 existing indexing address it with **no kernel change at all**. `run` in
-src/af3/pairformer-block-webgpu.js accepts a slice for this, and
+src/af3/trunk/pairformer-block-webgpu.js accepts a slice for this, and
 `encodePairTrack` has a `rowChunk` that defaults to the whole track.
 
 🔴 **AND IT STOPS AT THE TRIANGLE, FOR TWO REASONS.** Its intermediates are
@@ -435,11 +435,11 @@ archive is 28 ms for a 2 MB alignment.
 
 🔴 **QUANTISED WEIGHTS CAN BE DECODED ON THE GPU, AND IT IS 3.7x.** The path to
 a resident f16 buffer used to be: decode int5 into float32 on the main thread,
-narrow the lot into a Float16Array, upload. `src/runtime/quantised-upload.js`
+narrow the lot into a Float16Array, upload. `src/weights/quantised-upload.js`
 uploads the CODES instead - an eighth of the bytes - and decodes them into the
 destination with one dispatch per tensor. 437 ms of host packing becomes 119 of
 compute for the diffusion transformer's 24 blocks, and a real page fold went
-**3.31 s to 2.30**. `src/af3/device-weights.js` is the shared entry point;
+**3.31 s to 2.30**. `src/af3/weights/device-weights.js` is the shared entry point;
 docs/AF3.md has the per-packer table.
 
 🔴 **AND BIT-IDENTITY WAS THE FIRST THING MEASURED, NOT THE LAST.** JavaScript
@@ -459,7 +459,7 @@ the host arm WARM and flattered the GPU by 234 ms of work it had itself caused.
 
 🔴 **AND `Float16Array.set` FROM A Float32Array IS NOT A MEMMOVE.** 8M elements
 measure 9.4 ms through `set`, 6.1 through a plain loop and 4.4 unrolled eight
-ways - bit-identical. `writeInto` in src/runtime/float16.js is that loop, and
+ways - bit-identical. `writeInto` in src/weights/float16.js is that loop, and
 it leaves same-element copies to `set`, which really is a memmove. On real
 shapes it is 26% of the narrowing rather than 52%: a block is forty tensors
 averaging 200k elements, so per-call overhead is a much larger share than the
@@ -497,8 +497,8 @@ new one is its output. The previous is read exactly once, into
 `embed.previous-msa-normalized`, by the first dispatch of the encoder; every
 later dispatch writes the new one. So they could be one buffer, ordered within
 the encoder, for 29.5 MiB of 365. It is not taken because it is an ownership
-change through TWO recycle loops (`src/evoformer/input-embedder.js` and
-`src/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
+change through TWO recycle loops (`src/af2/evoformer/input-embedder.js` and
+`src/af2/multimer/input-embedder.js`) for 8%, and `fold-af2.js`'s checksum
 (-2047044 at 512 rows and one recycle) is what would have to gate it.
 
 🔴 **SO THE EF2 RESULT DOES NOT GENERALISE, AND THE REASON IS INSTRUCTIVE.**

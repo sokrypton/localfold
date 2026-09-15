@@ -1,5 +1,5 @@
 /**
- * AF3 triangle (grid) self-attention: GPU against src/af3/pairformer-reference.js.
+ * AF3 triangle (grid) self-attention: GPU against src/af3/trunk/pairformer-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-grid-attention.js
  *
@@ -9,9 +9,9 @@
  * are, and it is checked with a RAGGED MASK so that a kernel using the query's
  * mask instead of the key's fails here rather than in a fold.
  */
-import { gridSelfAttention } from "../../src/af3/pairformer-reference.js";
-import { Af3GridSelfAttentionGpu } from "../../src/af3/grid-attention-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { gridSelfAttention } from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3GridSelfAttentionGpu } from "../../src/af3/trunk/grid-attention-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";

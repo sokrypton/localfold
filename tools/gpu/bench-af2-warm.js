@@ -30,10 +30,10 @@
  * loop always does; that is what this tool's default matches.
  */
 import { setBufferPooling } from "../../src/runtime/allocator.js";
-import { AlphaFoldMonomerGpu } from "../../src/model/monomer.js";
+import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
 import { makeA3mFeatures } from "../../src/input/a3m-features.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 import { DEFAULT_TUNING, setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
@@ -68,7 +68,7 @@ export async function main(device, args) {
   }
 
   const sequence = QUERY.repeat(Math.ceil(length / QUERY.length)).slice(0, length);
-  const { MODEL_BUNDLES, loadManifest } = await import("../../src/reference/manifests/index.js");
+  const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
   const store = await HttpTensorStore.fromManifest(
     MODEL_BUNDLES.monomer.directory, await loadManifest("monomer"));
   const fixture = AlphaFoldFixture.fromStore(store);

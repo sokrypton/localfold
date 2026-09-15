@@ -101,7 +101,7 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 # template tensor has AlphaFold 3's name and a different WIDTH - the pair track
 # is 384 channels rather than 128, the MSA 128 rather than 64, the triangle
 # attention 12 heads rather than 4 (2 rather than 4 in the template stack) and
-# the distogram 96 bins rather than 64. That is why src/af3/weights.js derives
+# the distogram 96 bins rather than 64. That is why src/af3/weights/weights.js derives
 # every width from the tensor that states it: this bundle loads through
 # AlphaFold 3's declared widths without complaint and dispatches every kernel
 # over a third of its own tensor.
@@ -127,7 +127,7 @@ COLABDESIGN2 = os.path.expanduser("~/Documents/GitHub/ColabDesign2")
 #
 # ...and it does NOT expand structural tokens, which is OpenDDE's one difference
 # that is not a flag. Its widths are its own (c_z 256, c_m 128, 8 trunk triangle
-# heads, 2 template, msa value_dim 8) and src/af3/weights.js derives every one
+# heads, 2 template, msa value_dim 8) and src/af3/weights/weights.js derives every one
 # from the tensor that states it, so they need no table here.
 #
 #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/\

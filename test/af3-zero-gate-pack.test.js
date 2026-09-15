@@ -11,7 +11,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { packZeroGateWeights } from "../src/af3/diffusion-transformer-webgpu.js";
+import { packZeroGateWeights } from "../src/af3/diffusion/diffusion-transformer-webgpu.js";
 
 const C_COND = 4;
 const C = 3;
@@ -122,7 +122,7 @@ test("rejects an empty block list instead of packing nothing", () => {
  * thinks each tensor starts.
  */
 test("the emitted kernel's ZG_* constants index the packer's layout", async () => {
-  const mod = await import("../src/af3/diffusion-transformer-webgpu.js");
+  const mod = await import("../src/af3/diffusion/diffusion-transformer-webgpu.js");
   const C_COND = 384;
   const C = 768;
   const shape = {

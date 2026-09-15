@@ -14,13 +14,13 @@
  * the fold did: finished at full speed, finished after giving up weight
  * residency (slower, and by how much), or refused with the tensor named.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
+import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
 import { memorySnapshot, setMemoryBudget, budgetForDevice }
   from "../../src/runtime/device-memory.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

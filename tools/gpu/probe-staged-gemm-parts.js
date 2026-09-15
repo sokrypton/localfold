@@ -17,7 +17,7 @@
  *  - `noStage`    multiply out of uninitialised workgroup memory. Isolates the
  *                 matrix issue from the memory that feeds it.
  */
-import { createStagedMatrixShader } from "./gemm-matrix-staged.js";
+import { createStagedMatrixShader } from "../../src/kernels/matrix-linear.js";
 import { deviceMatrixConfig } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {

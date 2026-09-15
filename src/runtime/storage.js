@@ -1,4 +1,4 @@
-import { float32ToFloat16Array } from "./float16.js";
+import { float32ToFloat16Array } from "../weights/float16.js";
 
 /**
  * How an activation tensor is stored on the device.

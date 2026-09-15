@@ -32,10 +32,10 @@
 import {
   createTransitionShader, createTransitionSplitShaders, packTransitionWeights,
   transitionRowTile, transitionSplitChunkRows,
-} from "../../src/af3/transition-webgpu.js";
-import { stagedMatrixStorage } from "../../src/runtime/matrix-linear.js";
+} from "../../src/af3/trunk/transition-webgpu.js";
+import { stagedMatrixStorage } from "../../src/kernels/matrix-linear.js";
 import { deviceMatrixConfig, deviceTuning } from "../../src/runtime/device-profile.js";
-import { stagedMatrixBlock } from "../../src/runtime/matrix-linear.js";
+import { stagedMatrixBlock } from "../../src/kernels/matrix-linear.js";
 
 const GRID_WIDTH = 32_768;
 

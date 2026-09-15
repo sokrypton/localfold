@@ -4,7 +4,7 @@
 🔴 ITS PAIR BLOCKS ARE WRONG. USE tools/oracle/dump_multimer_template.py.
 Measured against AF2 itself, captured through hk.intercept_methods: this file
 reproduces the module to relRMS 1.0e-2 with the templates masked and 2.5e-1
-with a real template, while src/multimer/template.js reproduces it to 6.5e-5
+with a real template, while src/af2/multimer/template.js reproduces it to 6.5e-5
 and 3.0e-4. The disagreement is entirely after `construct_input` - the input
 term here agrees with the GPU to 2.15e-7 - and is somewhere in the transcribed
 triangle multiplication, triangle attention or transition below. It has never
@@ -94,7 +94,7 @@ def geometry_features(aatype, positions, atom_mask, multichain_mask_2d):
 
     Transcribed from `construct_input` in AF2's modules_multimer.py. The same
     six AF3 computes, in a different atom layout - see the note at the top of
-    src/af3/template-features.js, which is the implementation these check.
+    src/af3/featurise/template-features.js, which is the implementation these check.
     """
     L = len(aatype)
     N, CA, C, CB = 0, 1, 2, 3
@@ -248,7 +248,7 @@ def main() -> int:
                              " cross-chain mask is exercised")
     parser.add_argument("--span-chains", action="store_true",
                         help="let one template speak across chains, which AF2"
-                             " never does - see src/af3/template-features.js")
+                             " never does - see src/af3/featurise/template-features.js")
     parser.add_argument("--out", default="oracle-dumps/toy-template.json")
     arguments = parser.parse_args()
 

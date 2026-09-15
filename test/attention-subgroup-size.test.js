@@ -13,7 +13,7 @@ import { describe, expect, it } from "./harness.js";
 import {
   allowsAttentionSubgroupSize, buildAttentionFlashKernel, selectAttentionFlashKernel,
   supportsAttentionSubgroups,
-} from "../src/evoformer/attention.js";
+} from "../src/kernels/attention.js";
 
 const deviceWith = (subgroupMinSize, subgroupMaxSize, features = ["subgroups", "subgroup-size-control"]) => ({
   features: new Set(features),

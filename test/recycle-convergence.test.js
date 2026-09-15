@@ -1,7 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
   recycleConvergenceDistance, shouldStopAfterRecycle, validatedRecycleTolerance,
-} from "../src/model/recycle-convergence.js";
+} from "../src/af2/model/recycle-convergence.js";
 
 function positions(caCoordinates) {
   const result = new Float32Array(caCoordinates.length * 37 * 3);

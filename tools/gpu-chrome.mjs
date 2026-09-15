@@ -402,6 +402,18 @@ async function main() {
     try { rmSync(profile, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 
+  // 🔴 THE ADAPTER IS PRINTED BECAUSE A NUMBER WITHOUT ONE CANNOT BE COMPARED.
+  // This harness has always COLLECTED `adapter.info` and always thrown it away,
+  // so every figure any gate here has ever produced was machine-anonymous -
+  // which is exactly why "a checksum does not travel between machines" had to
+  // live in CLAUDE.md as a warning instead of in the output as a fact. It is
+  // one line, it is filtered by every consumer's `grep -v '^\[gpu-chrome\]'`,
+  // and `tools/gate-baseline.json` keys on it.
+  if (result.adapter !== undefined) {
+    const { vendor, architecture, description } = result.adapter;
+    console.log(`[gpu-chrome] adapter: ${[vendor, architecture, description]
+      .filter((part) => part !== undefined && part !== "").join(" / ") || "unidentified"}`);
+  }
   for (const line of result.logs ?? []) console.log(line);
   if (!result.ok) {
     console.error(result.error);

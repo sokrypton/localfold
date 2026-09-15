@@ -28,11 +28,11 @@
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 
-import { templateEmbedding } from "../../src/af3/template-reference.js";
-import { chainResidues, identityMap, templateSlot } from "../../src/af3/template-input.js";
+import { templateEmbedding } from "../../src/af3/trunk/template-reference.js";
+import { chainResidues, identityMap, templateSlot } from "../../src/af3/featurise/template-input.js";
 import {
   coverageOf, multichainMaskFor, templateGeometry,
-} from "../../src/af3/template-features.js";
+} from "../../src/af3/featurise/template-features.js";
 import * as B from "./af3-bundle.js";
 
 const dump = await B.loadDump("af3-oracle-template-f32.json");
@@ -135,7 +135,7 @@ console.log(`${slotCount} slots, ${slots.filter(Boolean).length} occupied`
 // 🔴 AND THE FEATURISATION ITSELF, AGAINST AF3'S OWN. Everything above takes
 // the template arrays FROM the dump, so it checks the embedder and not the
 // thing that will actually build those arrays in the browser. This reads the
-// same PDB the dump was made from and holds src/af3/template-input.js to
+// same PDB the dump was made from and holds src/af3/featurise/template-input.js to
 // AF3's featuriser element for element - the dense slot each atom landed in,
 // the aatype at a covered position and at an uncovered one.
 if (process.env.TEMPLATE_PDB) {

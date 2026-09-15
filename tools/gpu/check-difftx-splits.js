@@ -126,9 +126,9 @@
  * Each knob is tested ALONE and then in combination, because they are set
  * together in one rule object and a combined arm cannot say which one broke.
  */
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { diffusionWeights } from "../../src/af3/diffusion-weights.js";
+import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
 import { relativeRms } from "./relative-rms.js";
 
 const option = (args, name, fallback) => {

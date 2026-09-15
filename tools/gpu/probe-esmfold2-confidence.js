@@ -29,7 +29,7 @@
 // that is a reason to test it, not a reason to assume it.
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
-import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
+import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
 import { foldEsmfold2 } from "../../src/esmfold2/fold.js";
 import { CONTACT_ANGSTROMS, CONTACT_EDGES } from "../../src/esmfold2/distogram-webgpu.js";
 import {

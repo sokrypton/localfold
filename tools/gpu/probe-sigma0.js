@@ -45,11 +45,11 @@
  * alignment is needed and none is done, which keeps this from quietly scoring a
  * shifted register as a good fit.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { atomName, foldBatch } from "../../src/af3/fold.js";
-import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

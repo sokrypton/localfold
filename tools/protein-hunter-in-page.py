@@ -18,7 +18,7 @@ still contains X the design step did nothing; if it equals cycle 0's the
 structure never reached MPNN.
 
 🔴 THE WEIGHTS COME OFF THE DISK BY DEFAULT, WHICH IS NOT THE PAGE'S OWN
-BEHAVIOUR. src/reference/manifests/index.js gives the af3 bundle a `remote`,
+BEHAVIOUR. src/bundles/manifests/index.js gives the af3 bundle a `remote`,
 and a deployed page is right to use it - but a check that runs on demand
 should not spend 150 MB of somebody's connection every time. The local server
 below rewrites that ONE FILE as it serves it, dropping the `remote:` line so
@@ -41,7 +41,7 @@ import cdp                                                   # noqa: E402
 
 PORT, DBG = 9668, 9231
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-MANIFESTS = "/src/reference/manifests/index.js"
+MANIFESTS = "/src/bundles/manifests/index.js"
 REMOTE_LINE = re.compile(rb'^\s*remote:\s*"[^"]*",\s*$', re.MULTILINE)
 
 

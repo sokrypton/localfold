@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, expect, it } from "./harness.js";
 
-import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
-import { AlphaFoldQueryOnlyGpu } from "../src/model/query-only.js";
+import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
+import { AlphaFoldQueryOnlyGpu } from "../src/af2/model/query-only.js";
 import { isAbortError, predictionAbortError, throwIfAborted, withAbort } from "../src/runtime/abort.js";
-import { StructureCoreGpu } from "../src/structure/core.js";
-import { StructureModuleGpu } from "../src/structure/module.js";
+import { StructureCoreGpu } from "../src/af2/structure/core.js";
+import { StructureModuleGpu } from "../src/af2/structure/module.js";
 
 describe("prediction abort and cancellation", () => {
   it("creates errors with the standard AbortError identity", () => {

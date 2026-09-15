@@ -22,10 +22,10 @@
  * 🔴 THE BAR IS ZERO DIFFERING ELEMENTS, NOT A relRMS. JavaScript computes
  * `code * scale + zero` in f64 and WGSL has no f64, so this could differ in the
  * last bit and the point of the check is that it does not - see the note in
- * src/runtime/quantised-upload.js. Anything but zero is a finding.
+ * src/weights/quantised-upload.js. Anything but zero is a finding.
  */
-import { planBlockUpload, runBlockUpload } from "../../src/runtime/quantised-upload.js";
-import { readTensorRange } from "../../src/reference/dtype.js";
+import { planBlockUpload, runBlockUpload } from "../../src/weights/quantised-upload.js";
+import { readTensorRange } from "../../src/weights/dtype.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -87,7 +87,7 @@ export async function main(device, args) {
   // bundle. int5 at any group but 32 is deliberately absent: the HOST decoder's
   // int5 fast path reads a 20-byte group and now says so rather than decoding a
   // plausible wrong tensor - which is what this checker found, at 104,170 of
-  // 131,072 elements differing. See src/reference/dtype.js.
+  // 131,072 elements differing. See src/weights/dtype.js.
   const codecs = option(args, "codecs", "5:32,3:128,3:32,2:64,4:32,6:64").split(",");
   const elements = Number(option(args, "elements", "131072"));
   const rows = [];

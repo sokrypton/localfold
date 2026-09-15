@@ -1,7 +1,7 @@
 import { describe, expect, it } from "./harness.js";
 import {
   transitionChunkRows, TRANSITION_CHUNK_TARGET_BYTES, TRANSITION_TILE_ROWS,
-} from "../src/evoformer/transition.js";
+} from "../src/kernels/transition.js";
 
 /**
  * WHY A TENSOR THAT FITS CAN STILL NOT BE BOUND.

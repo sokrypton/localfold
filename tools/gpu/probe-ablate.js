@@ -18,11 +18,11 @@
  * did not arrive". This sweeps across the boundary so the rule can be seen
  * rather than argued.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { Af3AtomEncoderGpu } from "../../src/af3/atom-encoder-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { Af3AtomEncoderGpu } from "../../src/af3/diffusion/atom-encoder-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
 import { ALPHAFOLD3, OPENBIND0 } from "../../src/af3/dialect.js";
 import { asDiffusionShapedWeights } from "./check-af3-target-feat-gpu.js";
 

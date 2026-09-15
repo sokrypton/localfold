@@ -1,9 +1,9 @@
-import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../evoformer/attention.js";
+import { ATTENTION_NORMALIZE_SHADER, createAttentionNormParameters } from "../kernels/attention.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore, softmaxExpectations,
   tmPerBinFor, tmScoreD0, tmTermFromLogits } from "./tm-score.js";
 import {
   createTransitionShaders, TRANSITION_TILE_COLUMNS, TRANSITION_TILE_ROWS,
-} from "../evoformer/transition.js";
+} from "../kernels/transition.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { throwIfAborted, withAbort } from "../runtime/abort.js";
@@ -220,7 +220,7 @@ export class ConfidenceHeadsGpu {
   ) {
     throwIfAborted(signal);
     const structureChannels = structureRepresentation.length / length;
-    // 🔴 A DEVICE TENSOR OR A HOST ARRAY; see the note in src/structure/ipa.js.
+    // 🔴 A DEVICE TENSOR OR A HOST ARRAY; see the note in src/af2/structure/ipa.js.
     const pairTensor = pairRepresentation?.allocation === undefined ? undefined : pairRepresentation;
     const pairChannels = (pairTensor === undefined
       ? pairRepresentation.length : pairTensor.elements) / (length * length);

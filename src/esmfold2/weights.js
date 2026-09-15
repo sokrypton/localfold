@@ -22,10 +22,10 @@ const SWA_LEAVES = ["adaln", "qkv", "attnGate", "attnOut", "ffnUp", "ffnDown"];
  * byte accounting, for one - and a string key here would look like another
  * tensor to all of them.
  */
-// One symbol for every loader; see src/runtime/weight-sources.js for what two
+// One symbol for every loader; see src/weights/weight-sources.js for what two
 // of them cost. Imported AND re-exported, because a bare `export ... from`
 // does not bind the name in this module and every use here is local.
-import { SOURCES } from "../runtime/weight-sources.js";
+import { SOURCES } from "../weights/weight-sources.js";
 
 export { SOURCES };
 
@@ -51,7 +51,7 @@ const gather = async (read, entries) => {
     // never calls the entry, so hanging those four off the source object is
     // enough to let AF3's pair-track packer take an ESMFold2 block - which is
     // 828 ms of `trunk 0` against 32 for the same block warm. See
-    // src/runtime/weight-sources.js.
+    // src/weights/weight-sources.js.
     const source = await read.source(path);
     source.store = { tensorSource: () => source };
     source.tensorName = path;
@@ -128,7 +128,7 @@ const TRIANGLE = ["leftNormInputScale", "leftNormInputOffset", "centerNormScale"
 const TRANSITION = ["inputLayerNormScale", "inputLayerNormOffset",
   "transition1", "transition2"];
 
-/** One trunk block, in the shapes src/af3/pair-track-gpu.js wants. */
+/** One trunk block, in the shapes src/af3/trunk/pair-track-gpu.js wants. */
 export async function trunkBlockWeights(read, layer) {
   const group = (name, leaves) =>
     gather(read, leaves.map((leaf) => [leaf, `blocks/${layer}/${name}/${leaf}`]));

@@ -86,7 +86,7 @@ function visibleNames(source) {
   }
   // 🔴 CLASS METHODS COUNT AS DECLARATIONS. `async tensor(name) {` is a method
   // definition, and without this the scanner reads it as a call to an import
-  // that is not there - which is every store in src/reference/.
+  // that is not there - which is every store in src/bundles/.
   for (const match of source.matchAll(/^\s*(?:static\s+)?(?:async\s+)?#?([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{/gm)) {
     names.add(match[1]);
   }

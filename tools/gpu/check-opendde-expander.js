@@ -16,17 +16,17 @@
  * which is what catches a loader reading a [49, 384, 384] projection at the
  * wrong stride.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import {
   structuralBatch, structuralLayout, atomNameAt, NO_TWIN,
-} from "../../src/af3/structural-tokens.js";
+} from "../../src/af3/featurise/structural-tokens.js";
 import {
   expandStructural, structuralPairFeatures,
-} from "../../src/af3/structural-expander-reference.js";
-import { Af3StructuralExpanderGpu } from "../../src/af3/structural-expander-webgpu.js";
+} from "../../src/af3/structure/structural-expander-reference.js";
+import { Af3StructuralExpanderGpu } from "../../src/af3/structure/structural-expander-webgpu.js";
 import {
   openAf3Store, structuralExpanderWeights, structuralRefinerWeights,
-} from "../../src/af3/weights.js";
+} from "../../src/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

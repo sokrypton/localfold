@@ -1,0 +1,2166 @@
+/**
+ * AF3's atom cross-attention encoder on the GPU.
+ *
+ * Atoms are attended in WINDOWS, not globally: 32 queries attend over 128 keys
+ * within each of `subsets` overlapping subsets, which is what keeps an
+ * atom-level model from being quadratic in atoms. Five gathers, all precomputed
+ * by the featuriser, move between the three layouts (token-atoms, queries,
+ * keys).
+ *
+ * 🔴 THE ORDER OF MASK AND GATHER IS LOAD-BEARING. The queries' conditioning is
+ * masked BEFORE the keys are gathered from it. That is a no-op for the trunk's
+ * own encoder, whose per-atom conditioning is already masked, and it is NOT a
+ * no-op once the trunk single conditioning is added - that puts non-zero values
+ * into padded atom slots, and gathering first carries them into the keys, where
+ * two thirds of the slots are padding. Measured at 8.4e-2 on the encoder's
+ * output when it was the wrong way round: a subtly wrong kernel, not a crash.
+ *
+ * 🔴 THE ATTENTION MASK BIAS IS A PRODUCT, NOT A SUM. `1e9 * (qmask-1) *
+ * (kmask-1)` penalises a pair only when the query AND the key are padded, so a
+ * real query can still attend to a padded key. Adding the two terms instead is
+ * an OR, and the difference is large in a mostly-empty window. (RoseTTAFold3
+ * does add them.)
+ *
+ * 🔴 PAIR VALIDITY IS "SAME REFERENCE SPACE", NOT "BOTH ATOMS REAL". Two atoms
+ * only have a meaningful offset if they came from the same reference conformer.
+ * And the validity FLAG itself is added ungated - "these two atoms are
+ * unrelated" is information the model uses.
+ *
+ * 🔴 tokens_to_keys COMES FROM THE BATCH. Deriving it by carrying
+ * tokens_to_queries through the queries-to-keys gather looks equivalent, but
+ * its MASK is not: a derived one folds in the query's mask where AF3's is the
+ * key's own.
+ */
+import { GpuBufferAllocator } from "../../runtime/allocator.js";
+import { packNamedWeights } from "../../weights/weight-pack.js";
+import { deviceTuning } from "../../runtime/device-profile.js";
+import { pipelineCacheForDevice } from "../../runtime/pipeline-cache.js";
+import { residentWeightBuffer } from "../../runtime/resident.js";
+import { noteAllocation, noteDestroy } from "../../runtime/device-memory.js";
+import { deviceSaturationWorkgroups } from "../../runtime/occupancy.js";
+import { deviceDerivationsAllowed } from "../../runtime/device-profile.js";
+import { shapedKnob } from "../../runtime/device-profile.js";
+import { SOURCES, carriesTensor } from "../../weights/weight-sources.js";
+
+/**
+ * Which labels in a caller's `staticCache` already hold their contents.
+ *
+ * Kept beside the cache rather than in it: the head owns that object and
+ * destroys every VALUE in it when a fold ends, so a bookkeeping set stored
+ * there would be asked to destroy itself.
+ */
+const STATIC_UPLOADS = new WeakMap();
+
+const GRID_WIDTH = 32_768;
+
+const BLOCK_ORDER = [
+  "qSingleCondLayerNormScale", "qSingleCondScaleWeights", "qSingleCondScaleBias",
+  "qSingleCondBias", "kSingleCondLayerNormScale", "kSingleCondScaleWeights",
+  "kSingleCondScaleBias", "kSingleCondBias",
+  "qProjection", "qBias", "kProjection", "vProjection", "gatingQuery",
+  "Transition2", "AdaptiveZeroCondWeights", "AdaptiveZeroCondBias",
+  "ffwSingleCondLayerNormScale", "ffwSingleCondScaleWeights", "ffwSingleCondScaleBias",
+  "ffwSingleCondBias", "ffwTransition1", "ffwTransition2",
+  "ffwAdaptiveZeroCondWeights", "ffwAdaptiveZeroCondBias",
+];
+
+/**
+ * 🔴 boltz2's TRANSITION UP-GATE IS A SHADER VARIANT, NOT A ZERO WEIGHT. Its
+ * ConditionedTransitionBlock is `SwiGLU(a) * a_to_b(a)`; every other family
+ * here is `SwiGLU(a)` alone. The LayerNorm offsets beside it pack as zeros
+ * because a zero offset is the identity - a zero MULTIPLIER is not, it is a
+ * dead block - so this one enters the block order and the pipeline key
+ * together, and a bundle without the weight compiles the kernel that never
+ * reads it.
+ */
+/**
+ * 🔴 rosettafold3's kq_norm, THE SAME SHAPE OF VARIANT. Four more tensors and a
+ * pass; no other checkpoint carries them. See the token transformer's
+ * `TX_KQ_NORM`, which is this list under different names for the same reason.
+ */
+export const ATOM_KQ_NORM = [
+  "queryLayerNormScale", "queryLayerNormOffset",
+  "keyLayerNormScale", "keyLayerNormOffset",
+];
+export const blockHasKqNorm = (block) => carriesTensor(block, "queryLayerNormScale");
+export const blockOrderFor = (upGate, kqNorm = false) => [
+  ...BLOCK_ORDER,
+  ...(upGate ? ["ffwAToB"] : []),
+  ...(kqNorm ? ATOM_KQ_NORM : []),
+];
+/** 🔴 THE THUNK, NOT THE VALUE - `carriesTensor` is where that rule lives. */
+export const blockHasUpGate = (block) => carriesTensor(block, "ffwAToB");
+
+
+/**
+ * 🔴 PACKED ONCE PER WEIGHT OBJECT, NOT ONCE PER CALL. Packing allocates and
+ * memcpies the whole bundle, and a 200-step sampler ran this two hundred times
+ * over weights that never change. The offsets are still needed on every call,
+ * because the shader sources are generated from them, so the whole result is
+ * cached rather than only the data.
+ */
+const packedOnce = new WeakMap();
+
+export function packCached(key, label, pack) {
+  let forKey = packedOnce.get(key);
+  if (forKey === undefined) {
+    forKey = new Map();
+    packedOnce.set(key, forKey);
+  }
+  let found = forKey.get(label);
+  if (found === undefined) {
+    found = pack();
+    forKey.set(label, found);
+  }
+  return found;
+}
+
+export function packAtomBlockWeights(block) {
+  // The order is COMPUTED from what the bundle carries - see `blockOrderFor`
+  // and the note on asking the SOURCES map rather than the value - so every
+  // name in it is required by construction and there is no optional list.
+  return packNamedWeights(block, {
+    label: "atom block",
+    order: blockOrderFor(blockHasUpGate(block), blockHasKqNorm(block)),
+  });
+}
+
+const PAIR_ORDER = [
+  "singleToPairCondRow", "singleToPairCondCol", "embedPairOffsets",
+  "embedPairDistances", "embedPairOffsetsValid", "pairMlp1", "pairMlp2", "pairMlp3",
+  "pairInputLayerNormScale", "pairLogitsProjection",
+  // 🔴 THE TWO TRUNK NORMS CARRY AN OFFSET IN SOME BUNDLES. Zeros where they
+  // do not, which IS the scale-only LayerNorm - no shader variant, no dialect
+  // flag, and no way for an affine bundle to read the scale alone. See
+  // `offsetOf` in diffusion-weights.js.
+  "lnormTrunkSingleCondScale", "lnormTrunkSingleCondOffset", "embedTrunkSingleCond",
+  "lnormTrunkPairCondScale", "lnormTrunkPairCondOffset", "embedTrunkPairCond",
+  "atomPositionsToFeatures", "projectAtomFeaturesForAggr",
+];
+
+/** rosettafold3's chirality projection, which only its bundle carries. */
+const OPTIONAL_PAIR = ["atomChiralToFeatures"];
+
+/** One Float32Array from several, in order. */
+function concatenate(parts) {
+  const out = new Float32Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
+}
+
+export function packAtomPairWeights(weights) {
+  // 🔴 THE TWO PAIR-NORM ENTRIES ARE ONE TENSOR OR THREE. AlphaFold 3 shares a
+  // LayerNorm scale and a projection across the atom stack; OpenDDE trains one
+  // of each PER BLOCK. Packing the three back to back keeps one buffer and one
+  // binding, and the shader indexes them by block - see `pairLogits`.
+  let source = weights.pairNormPerBlock
+    ? { ...weights,
+        pairInputLayerNormScale: concatenate(weights.pairInputLayerNormScales),
+        pairLogitsProjection: concatenate(weights.pairLogitsProjections) }
+    : weights;
+  const offsets = {};
+  let total = 0;
+  // 🔴 ONE LIST FOR THE OFFSETS AND FOR THE BYTES, which the outer product
+  // mean's version of this got wrong tonight - reserving over one list and
+  // writing over another points the shader at zeros and is bit-identical to
+  // having no term.
+  const packing = [...PAIR_ORDER,
+                   ...OPTIONAL_PAIR.filter((name) => source[name] != null)];
+  for (const name of packing) {
+    // The LayerNorm offsets are the one entry a bundle may legitimately lack;
+    // everything else missing is a loader bug and must still throw.
+    if (source[name] == null && name.endsWith("CondOffset")) {
+      source = { ...source,
+                 [name]: new Float32Array(source[name.replace("Offset", "Scale")].length) };
+    }
+    if (source[name] === undefined) throw new Error(`atom encoder missing ${name}`);
+    offsets[name] = total;
+    total += source[name].length;
+  }
+  const data = new Float32Array(total);
+  for (const name of packing) data.set(source[name], offsets[name]);
+  return { data, offsets };
+}
+
+/**
+ * The constant preamble every atom shader shares. Exported because the DECODER
+ * runs the same cross-attention blocks over the same layout - only its weights
+ * and its two end passes differ.
+ */
+export function createAtomCommon(shape, pairOffsets, blockOffsets) {
+  const { tokens, dense, subsets, queries, keys, channels, pairChannels,
+          heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
+          blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
+  const width = heads * dimension;
+  const queryRows = subsets * queries;
+  const keyRows = subsets * keys;
+  const pairRows = subsets * queries * keys;
+  const intermediate = channels * 2;
+
+  return `
+const TOKENS: u32 = ${tokens}u;
+const DENSE: u32 = ${dense}u;
+const SUBSETS: u32 = ${subsets}u;
+const QUERIES: u32 = ${queries}u;
+const KEYS: u32 = ${keys}u;
+const QUERY_ROWS: u32 = ${queryRows}u;
+const KEY_ROWS: u32 = ${keyRows}u;
+const PAIR_ROWS: u32 = ${pairRows}u;
+const C: u32 = ${channels}u;
+const C_PAIR: u32 = ${pairChannels}u;
+const C_TOKEN: u32 = ${perTokenChannels}u;
+const C_TRUNK_SINGLE: u32 = ${trunkSingleChannels}u;
+const C_TRUNK_PAIR: u32 = ${trunkPairChannels}u;
+const HEADS: u32 = ${heads}u;
+const DIMENSION: u32 = ${dimension}u;
+const WIDTH: u32 = ${width}u;
+const INTERMEDIATE: u32 = ${intermediate}u;
+const BLOCKS: u32 = ${blocks}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+const EPSILON: f32 = 1.0e-5;
+const SCALE: f32 = ${1 / Math.sqrt(dimension)};
+${Object.entries(pairOffsets).map(([n, v]) => `const P_${n}: u32 = ${v}u;`).join("\n")}
+${Object.entries(blockOffsets).map(([n, v]) => `const W_${n}: u32 = ${v}u;`).join("\n")}
+
+fn logistic(v: f32) -> f32 { return 1.0 / (1.0 + exp(-v)); }
+fn swish(v: f32) -> f32 { return v / (1.0 + exp(-v)); }
+fn relu(v: f32) -> f32 { return max(v, 0.0); }
+
+// 🔴 EVERY GATHER IN ONE BUFFER, because WebGPU only GUARANTEES eight storage
+// buffers per stage and this pass wanted nine. The adapter here allows ten,
+// which is exactly the kind of headroom that makes a kernel work on the machine
+// it was written on and fail elsewhere.
+const G_TA_IDX: u32 = 0u;
+const G_TA_MASK: u32 = ${queryRows}u;
+const G_TQ_IDX: u32 = ${2 * queryRows}u;
+const G_TQ_MASK: u32 = ${3 * queryRows}u;
+const G_QK_IDX: u32 = ${4 * queryRows}u;
+const G_QK_MASK: u32 = ${4 * queryRows + keyRows}u;
+const G_TK_IDX: u32 = ${4 * queryRows + 2 * keyRows}u;
+const G_TK_MASK: u32 = ${4 * queryRows + 3 * keyRows}u;
+const G_QTA_IDX: u32 = ${4 * queryRows + 4 * keyRows}u;
+const G_QTA_MASK: u32 = ${4 * queryRows + 4 * keyRows + tokens * dense}u;
+const G_QSPACE: u32 = ${4 * queryRows + 4 * keyRows + 2 * tokens * dense}u;
+const G_KSPACE: u32 = ${5 * queryRows + 4 * keyRows + 2 * tokens * dense}u;
+`;
+}
+
+export function createAtomEncoderShaders(shape, pairOffsets, blockOffsets) {
+  const { tokens, dense, subsets, queries, keys, channels, pairChannels,
+          heads, dimension, perTokenChannels, trunkSingleChannels, trunkPairChannels,
+          blocks } = shape;
+  // Whether the atom-pair LayerNorm and its projection are per block; see
+  // `pairLogits` below and src/af3/dialect.js.
+  const perBlockPair = shape.perBlockPair === true;
+  // The atom attention's mask bias: a product under AF3, a sum under OpenDDE.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
+  const width = heads * dimension;
+  const queryRows = subsets * queries;
+  const keyRows = subsets * keys;
+  const pairRows = subsets * queries * keys;
+  const intermediate = channels * 2;
+  const common = createAtomCommon(shape, pairOffsets, blockOffsets);
+
+  // The trunk's single conditioning, per token: LayerNorm then project to 128.
+  const trunkSingle = `${common}
+@group(0) @binding(0) var<storage, read> trunk_single: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> projected: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let token = id.x;
+  if (token >= TOKENS) { return; }
+  let base = token * C_TRUNK_SINGLE;
+  var total = 0.0;
+  for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) { total += trunk_single[base + c]; }
+  let mean = total / f32(C_TRUNK_SINGLE);
+  var variance = 0.0;
+  for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
+    let d = trunk_single[base + c] - mean;
+    variance += d * d;
+  }
+  let inverse = inverseSqrt(variance / f32(C_TRUNK_SINGLE) + EPSILON);
+  for (var out = 0u; out < C; out += 1u) {
+    var value = 0.0;
+    for (var c = 0u; c < C_TRUNK_SINGLE; c += 1u) {
+      value += ((trunk_single[base + c] - mean) * inverse
+        * weights[P_lnormTrunkSingleCondScale + c]
+        + weights[P_lnormTrunkSingleCondOffset + c])
+        * weights[P_embedTrunkSingleCond + c * C + out];
+    }
+    projected[token * C + out] = value;
+  }
+}`;
+
+  // The trunk's pair conditioning, per token pair: LayerNorm then project to 16.
+  const trunkPair = `${common}
+@group(0) @binding(0) var<storage, read> trunk_pair: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> projected: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= TOKENS * TOKENS) { return; }
+  let base = row * C_TRUNK_PAIR;
+  var total = 0.0;
+  for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) { total += trunk_pair[base + c]; }
+  let mean = total / f32(C_TRUNK_PAIR);
+  var variance = 0.0;
+  for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
+    let d = trunk_pair[base + c] - mean;
+    variance += d * d;
+  }
+  let inverse = inverseSqrt(variance / f32(C_TRUNK_PAIR) + EPSILON);
+  for (var out = 0u; out < C_PAIR; out += 1u) {
+    var value = 0.0;
+    for (var c = 0u; c < C_TRUNK_PAIR; c += 1u) {
+      value += ((trunk_pair[base + c] - mean) * inverse
+        * weights[P_lnormTrunkPairCondScale + c]
+        + weights[P_lnormTrunkPairCondOffset + c])
+        * weights[P_embedTrunkPairCond + c * C_PAIR + out];
+    }
+    projected[row * C_PAIR + out] = value;
+  }
+}`;
+
+  // queriesCond, queriesMask, queriesAct - and the masking BEFORE the keys are
+  // gathered from it.
+  const buildQueries = `${common}
+@group(0) @binding(0) var<storage, read> conditioning: array<f32>;
+@group(0) @binding(1) var<storage, read> atom_mask: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read> trunk_projected: array<f32>;
+@group(0) @binding(4) var<storage, read_write> queries_cond: array<f32>;
+@group(0) @binding(5) var<storage, read_write> queries_mask: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= QUERY_ROWS) { return; }
+  let atom_live = gathers[G_TA_MASK + row] != 0;
+  let atom_from = u32(max(gathers[G_TA_IDX + row], 0));
+  let token_live = gathers[G_TQ_MASK + row] != 0;
+  let token_from = u32(max(gathers[G_TQ_IDX + row], 0));
+
+  var mask_value = 0.0;
+  if (atom_live) { mask_value = atom_mask[atom_from]; }
+  queries_mask[row] = mask_value;
+
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (atom_live) { value = conditioning[atom_from * C + c]; }
+    // The trunk's single conditioning, broadcast per token.
+    if (token_live) { value += trunk_projected[token_from * C + c]; }
+    // 🔴 MASKED HERE, before the keys gather from it.
+    queries_cond[row * C + c] = value * mask_value;
+  }
+}`;
+
+  const buildKeys = `${common}
+@group(0) @binding(0) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read_write> keys_cond: array<f32>;
+@group(0) @binding(4) var<storage, read_write> keys_mask: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= KEY_ROWS) { return; }
+  let live = gathers[G_QK_MASK + row] != 0;
+  let source = u32(max(gathers[G_QK_IDX + row], 0));
+  var mask_value = 0.0;
+  if (live) { mask_value = queries_mask[source]; }
+  keys_mask[row] = mask_value;
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (live) { value = queries_cond[source * C + c]; }
+    keys_cond[row * C + c] = value;
+  }
+}`;
+
+  // The query activation: the conditioning plus the projected noisy positions.
+  const buildAct = `${common}
+@group(0) @binding(0) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(2) var<storage, read> positions: array<f32>;
+@group(0) @binding(3) var<storage, read> gathers: array<i32>;
+@group(0) @binding(4) var<storage, read> weights: array<f32>;
+@group(0) @binding(5) var<storage, read_write> act: array<f32>;
+${shape.chiralGradients !== true ? "" : `// ...and the chirality gradient, in the SAME per-token-atom indexing the
+// positions use, so one gather serves both.
+@group(0) @binding(6) var<storage, read> chiral_grads: array<f32>;`}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= QUERY_ROWS) { return; }
+  var gathered = array<f32, 3>(0.0, 0.0, 0.0);
+  if (gathers[G_TA_MASK + row] != 0) {
+    let source = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
+    gathered[0] = positions[source];
+    gathered[1] = positions[source + 1u];
+    gathered[2] = positions[source + 2u];
+  }
+${shape.chiralGradients !== true ? "" : `  // 🔴 rosettafold3's CHIRALITY TERM, gathered exactly as the position is,
+  // because the gradient buffer shares the position buffer's indexing: both
+  // are per token-atom. It is the ONLY reflection-asymmetric signal the network
+  // has - see src/af3/diffusion/chiral-gradient.js.
+  var chiral = array<f32, 3>(0.0, 0.0, 0.0);
+  if (gathers[G_TA_MASK + row] != 0) {
+    // ...\`at\`, because \`from\` is a WGSL RESERVED KEYWORD and the parser says
+    // so at a line number in generated source, which is the least helpful place
+    // to read an error. Third time tonight a WGSL lexical rule bit a name or a
+    // comment that read perfectly as JavaScript.
+    let at = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
+    chiral[0] = chiral_grads[at];
+    chiral[1] = chiral_grads[at + 1u];
+    chiral[2] = chiral_grads[at + 2u];
+  }`}
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    for (var axis = 0u; axis < 3u; axis += 1u) {
+      value += gathered[axis] * weights[P_atomPositionsToFeatures + axis * C + c];
+${shape.chiralGradients !== true ? "" : `      value += chiral[axis] * weights[P_atomChiralToFeatures + axis * C + c];`}
+    }
+    act[row * C + c] = queries_cond[row * C + c] + value * queries_mask[row];
+  }
+}`;
+
+  // 🔴 rosettafold3's CHIRALITY GRADIENT, ONE THREAD PER ATOM AND NO ATOMICS.
+  // The natural shape is a thread per CENTRE, and it needs an atomic add
+  // because four centres share an atom - WGSL has no f32 atomic. Inverting the
+  // index on the host instead gives each atom the (centre, corner) pairs it
+  // appears in, so a thread owns its three components outright. The index does
+  // not depend on the coordinates, so it is built once per fold and this kernel
+  // runs once per sampler step.
+  //
+  // 🔴 AND IT IS A CENTRAL DIFFERENCE, DELIBERATELY. The analytic derivative of
+  // an atan2 of two cross products is where rf3 spends 150 lines and the
+  // reference spends a `jax.grad`; a centre costs about 1,000 flops this way
+  // and 6MRR's 213 of them cost 200k, against a denoiser step measured in tens
+  // of millions. See src/af3/diffusion/chiral-gradient.js, whose CPU twin this is.
+  const chiralGrad = shape.chiralGradients !== true ? null : `${common}
+const CHIRAL_STEP: f32 = 1.0e-4;
+@group(0) @binding(0) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> centers: array<i32>;
+@group(0) @binding(2) var<storage, read> angles: array<f32>;
+@group(0) @binding(3) var<storage, read> entry_offsets: array<u32>;
+@group(0) @binding(4) var<storage, read> entries: array<u32>;
+@group(0) @binding(5) var<storage, read_write> gradients: array<f32>;
+
+fn point_of(index: i32) -> vec3<f32> {
+  let at = u32(max(index, 0)) * 3u;
+  return vec3<f32>(positions[at], positions[at + 1u], positions[at + 2u]);
+}
+
+// The improper dihedral, spelled exactly as the reference spells it.
+fn improper(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>) -> f32 {
+  let eps = 1.0e-6;
+  let b0 = a - b;
+  let b1 = c - b;
+  let b2 = d - c;
+  let b1n = b1 / (length(b1) + eps);
+  let v = b0 - dot(b0, b1n) * b1n;
+  let w = b2 - dot(b2, b1n) * b1n;
+  // eps on BOTH arguments, as the reference has it - it moves the angle by
+  // about 1e-6 and the ideal it is differenced against is not moved with it.
+  return atan2(dot(cross(b1n, v), w) + eps, dot(v, w) + eps);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let atom = id.x + id.y * GRID_WIDTH * 64u;
+  if (atom >= arrayLength(&entry_offsets) - 1u) { return; }
+  var total = vec3<f32>(0.0);
+  for (var e = entry_offsets[atom]; e < entry_offsets[atom + 1u]; e = e + 1u) {
+    let packed = entries[e];
+    let centre = packed >> 2u;
+    let corner = packed & 3u;
+    let ideal = angles[centre];
+    if (ideal == 0.0) { continue; }
+    var p = array<vec3<f32>, 4>(
+      point_of(centers[centre * 4u]), point_of(centers[centre * 4u + 1u]),
+      point_of(centers[centre * 4u + 2u]), point_of(centers[centre * 4u + 3u]));
+    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
+      let keep = p[corner][axis];
+      p[corner][axis] = keep + CHIRAL_STEP;
+      let up = improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][axis] = keep - CHIRAL_STEP;
+      let down = improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][axis] = keep;
+      let derivative = (up * up - down * down) / (2.0 * CHIRAL_STEP);
+      // A non-finite difference is a degenerate centre and contributes nothing,
+      // which is the reference's own nan_to_num.
+      if (derivative == derivative) { total[axis] = total[axis] + derivative; }
+    }
+  }
+  gradients[atom * 3u] = total.x;
+  gradients[atom * 3u + 1u] = total.y;
+  gradients[atom * 3u + 2u] = total.z;
+}`;
+
+  // The atom pair representation: row + column, the reference-conformer offset
+  // terms, the trunk pair, and then a three-layer MLP with a residual.
+  const buildPair = `${common}
+@group(0) @binding(0) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(1) var<storage, read> keys_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> queries_ref: array<f32>;
+@group(0) @binding(3) var<storage, read> keys_ref: array<f32>;
+@group(0) @binding(4) var<storage, read> gathers: array<i32>;
+@group(0) @binding(5) var<storage, read> trunk_pair: array<f32>;
+@group(0) @binding(6) var<storage, read> weights: array<f32>;
+@group(0) @binding(7) var<storage, read_write> pair: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= PAIR_ROWS) { return; }
+  let key = row % KEYS;
+  let query_index = row / KEYS;
+  let subset = query_index / QUERIES;
+  let key_index = subset * KEYS + key;
+
+  // 🔴 SAME REFERENCE SPACE, not "both real".
+  var valid = 0.0;
+  if (gathers[G_QSPACE + query_index] == gathers[G_KSPACE + key_index]) { valid = 1.0; }
+  var offsets = array<f32, 3>(0.0, 0.0, 0.0);
+  var squared = 0.0;
+  for (var axis = 0u; axis < 3u; axis += 1u) {
+    let d = queries_ref[query_index * 3u + axis] - keys_ref[key_index * 3u + axis];
+    offsets[axis] = d;
+    squared += d * d;
+  }
+
+  let use_trunk = gathers[G_TQ_MASK + query_index] != 0 && gathers[G_TK_MASK + key_index] != 0;
+  var trunk_base = 0u;
+  if (use_trunk) {
+    trunk_base = (u32(max(gathers[G_TQ_IDX + query_index], 0)) * TOKENS
+      + u32(max(gathers[G_TK_IDX + key_index], 0))) * C_PAIR;
+  }
+
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    var value = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      value += relu(queries_cond[query_index * C + d])
+        * weights[P_singleToPairCondRow + d * C_PAIR + c];
+      value += relu(keys_cond[key_index * C + d])
+        * weights[P_singleToPairCondCol + d * C_PAIR + c];
+    }
+    var offset_term = 0.0;
+    for (var axis = 0u; axis < 3u; axis += 1u) {
+      offset_term += offsets[axis] * weights[P_embedPairOffsets + axis * C_PAIR + c];
+    }
+    value += valid * (offset_term + weights[P_embedPairDistances + c] / (1.0 + squared))
+      + valid * weights[P_embedPairOffsetsValid + c];
+    if (use_trunk) { value += trunk_pair[trunk_base + c]; }
+    pair[row * C_PAIR + c] = value;
+  }
+
+  // The three-layer MLP, on a relu of the value just written, plus a residual.
+  var hidden1 = array<f32, ${pairChannels}>();
+  var hidden2 = array<f32, ${pairChannels}>();
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    var value = 0.0;
+    for (var d = 0u; d < C_PAIR; d += 1u) {
+      value += relu(pair[row * C_PAIR + d]) * weights[P_pairMlp1 + d * C_PAIR + c];
+    }
+    hidden1[c] = value;
+  }
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    var value = 0.0;
+    for (var d = 0u; d < C_PAIR; d += 1u) {
+      value += relu(hidden1[d]) * weights[P_pairMlp2 + d * C_PAIR + c];
+    }
+    hidden2[c] = value;
+  }
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    var value = 0.0;
+    for (var d = 0u; d < C_PAIR; d += 1u) {
+      value += relu(hidden2[d]) * weights[P_pairMlp3 + d * C_PAIR + c];
+    }
+    pair[row * C_PAIR + c] = pair[row * C_PAIR + c] + value;
+  }
+}`;
+
+  // Per-block head biases from the atom pair representation.
+  const pairLogits = `${common}
+@group(0) @binding(0) var<storage, read> pair: array<f32>;
+@group(0) @binding(1) var<storage, read> weights: array<f32>;
+@group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let row = id.x + id.y * GRID_WIDTH * 64u;
+  if (row >= PAIR_ROWS) { return; }
+  let base = row * C_PAIR;
+  var total = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) { total += pair[base + c]; }
+  let mean = total / f32(C_PAIR);
+  var variance = 0.0;
+  for (var c = 0u; c < C_PAIR; c += 1u) {
+    let d = pair[base + c] - mean;
+    variance += d * d;
+  }
+  let inverse = inverseSqrt(variance / f32(C_PAIR) + EPSILON);
+
+  let key = row % KEYS;
+  let query_index = row / KEYS;
+  let subset = query_index / QUERIES;
+  let query = query_index % QUERIES;
+  for (var block = 0u; block < BLOCKS; block += 1u) {
+    for (var head = 0u; head < HEADS; head += 1u) {
+      var value = 0.0;
+      for (var c = 0u; c < C_PAIR; c += 1u) {
+        // 🔴 THE SCALE AND THE MATRIX ARE PER BLOCK UNDER OpenDDE. The mean and
+        // the variance are not - they come from the pair, which does not change
+        // - so the whole difference is these two indices, and both arms read
+        // the same buffer.
+        value += (pair[base + c] - mean) * inverse
+${perBlockPair
+  ? `          * weights[P_pairInputLayerNormScale + block * C_PAIR + c]
+          * weights[P_pairLogitsProjection + (block * C_PAIR + c) * HEADS + head];`
+  : `          * weights[P_pairInputLayerNormScale + c]
+          * weights[P_pairLogitsProjection + c * BLOCKS * HEADS + block * HEADS + head];`}
+      }
+      let out = ((block * SUBSETS + subset) * HEADS + head) * QUERIES * KEYS
+        + query * KEYS + key;
+      logits[out] = value;
+    }
+  }
+}`;
+
+  return { trunkSingle, trunkPair, buildQueries, buildKeys, buildAct, buildPair, pairLogits,
+           chiralGrad, ...createAtomBlockShaders(common, shape) };
+}
+
+/** The three cross-attention blocks. */
+/**
+ * How many query rows one `output` workgroup carries, given how many there are.
+ *
+ * 🔴 A FUNCTION OF THE ROW COUNT, LIKE EVERY OTHER TILE HERE. It divides the
+ * 655 KB of weights each workgroup reads - see the note on the kernel - and it
+ * multiplies nothing else, so the only thing pulling the other way is the
+ * workgroup count: this kernel is 64 lanes wide, so a 68-mer's 576 query rows
+ * are only 9,216 invocations at a tile of four. Measured on a denoiser call at
+ * that size: tile 2 gives 15 ms of atom encoder and 21 of decoder, tile 4 gives
+ * 16 and 22, tile 8 gives 20 and 26. A real protein has thousands of atoms and
+ * wants the larger tile.
+ */
+/**
+ * The workgroup target this device's row tiles should aim at.
+ *
+ * 🔴 THE MEASUREMENT MAY ONLY MAKE THE TILE SMALLER, NEVER LARGER, and the
+ * mechanism is why: the rule exists because a WIDE device is left idle by the
+ * shipped 256, so more workgroups - a smaller tile - is what it argues for.
+ * Letting a narrow device raise the target instead picks a BIGGER tile than
+ * ships today, which the mechanism says nothing about.
+ *
+ * That is not hypothetical. Simulated with `--occupancy=16`, the atom tile goes
+ * from the shipped 4 to 8 at 1632 rows, and the whole fold measures 4735 ms
+ * against the default's 6040 - so on THIS hardware the bigger tile is fine. But
+ * that arm is an A100 running a narrow device's CONFIGURATION, not a narrow
+ * device: the simulation validates the choice and cannot validate the outcome.
+ * Clamping to the shipped target makes a narrow device no worse than today by
+ * construction, which is the only guarantee available without one to measure.
+ */
+export function derivedWorkgroupTarget(device) {
+  if (!deviceDerivationsAllowed(device)) return undefined;
+  const measured = deviceSaturationWorkgroups(device);
+  return measured === null ? undefined : Math.max(256, measured);
+}
+
+export function outputRowTileFor(queryRows, target = 256) {
+  for (const tile of [8, 4, 2]) {
+    if (queryRows / tile >= target) return tile;
+  }
+  return 1;
+}
+
+export function createAtomBlockShaders(common, shape) {
+  // 🔴 THE 256 IS A WORKGROUP TARGET AND IT IS AN M2'S. This rule takes the
+  // largest row tile that still leaves 256 workgroups, which is the right
+  // number for a device with a handful of cores and not for one with 108: at
+  // 1632 atoms it picks a tile of four, 408 workgroups of 64 lanes, 26k threads
+  // against ~221k slots. `workgroupTarget` is the same rule with the number
+  // named, so a device prior can raise it. See src/runtime/device-profile.js.
+  // 🔴 A DIRECT TILE WITH A CROSSOVER, WHERE A DEVICE ASKS FOR ONE. The default
+  // rule below takes the largest tile leaving 256 workgroups, which is right
+  // for a device with a handful of cores. An A100 wants tile 1 on a small
+  // structure and tile 8 on a large one, and no workgroup target expresses
+  // both - see src/runtime/device-profile.js, including the tile-4 cliff that
+  // makes this name tiles rather than a target.
+  const queryRows = shape.subsets * shape.queries;
+  const rowRule = shape.atomRowTile;
+  // 🔴 AND WHERE NOTHING NAMES A TILE, THE TARGET IS THIS DEVICE'S OWN WIDTH.
+  // The 256 above is an M2's; `workgroupTarget` carries what
+  // src/runtime/occupancy.js measured, so the same rule that picks a tile of
+  // four at 1632 rows for a small card picks ONE for a wide one - which is
+  // exactly what this A100's prior asks for below its crossover, arrived at
+  // from the mechanism rather than from the table. Priced with
+  // `--no-prior=atomRowTile` against the derived baseline: 2858 ms of sampler
+  // to 2433, the largest single piece left once the K split is derived.
+  const outputRowTile = shape.outputRowTile
+    ?? (rowRule === undefined
+      ? outputRowTileFor(queryRows, shape.workgroupTarget ?? 256)
+      : (queryRows < rowRule.crossover ? rowRule.below : rowRule.atOrAbove));
+  const { channels, keys } = shape;
+  // The atom attention's mask bias: a product under AlphaFold 3 and a sum under
+  // OpenDDE. See the note at `attendFor`.
+  const keyMasked = shape.keyMaskedAtomAttention === true;
+  // boltz2's transition up-gate; see `blockOrderFor`. It must reach the
+  // pipeline KEY as well as the source - a shader compiled without it and one
+  // compiled with it differ only inside the transition, which no dimension in
+  // the key can see.
+  const upGate = shape.upGate === true;
+  const intermediate = channels * 2;
+  const rowWidth = Math.min(4, outputRowTile);
+  const rowGroups = outputRowTile / rowWidth;
+  const rowVector = { 1: "f32", 2: "vec2<f32>", 4: "vec4<f32>" }[rowWidth];
+  if (rowVector === undefined || !Number.isInteger(rowGroups)) {
+    throw new Error(`outputRowTile ${outputRowTile} is not 1, 2 or a multiple of 4`);
+  }
+  const rowLane = (t) => rowWidth === 1 ? "" : `.${"xyzw"[t % rowWidth]}`;
+  const rowGroup = (t) => Math.floor(t / rowWidth);
+  const overRows = (body) =>
+    Array.from({ length: outputRowTile }, (_, t) => body(t)).join("\n    ");
+  const overRowGroups = (body) =>
+    Array.from({ length: rowGroups }, (_, g) => body(g)).join("\n    ");
+  /** A per-row quantity gathered into the tile's vectors. */
+  const gather = (name, expression) => `${overRowGroups((g) => `var ${name}${g} = ${rowVector}(0.0);`)}
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      ${name}${rowGroup(t)}${rowLane(t)} = ${expression};
+    }`)}`;
+
+  /**
+   * AdaLN on a row's activation, conditioned by that row's own conditioning,
+   * then two projections of the result. The query side and the atom-wise key
+   * side are the same operation with different weights and different outputs,
+   * so they are generated from here.
+   *
+   * 🔴 A TILE OF ROWS, for the reason the `output` kernel gives: with one
+   * workgroup a row each of the four matrices is read whole to produce a single
+   * row - 262 KB of weights for 128 output values.
+   */
+  const conditionedProject = (prefix, options) => `${common}
+const ROW_TILE: u32 = ${outputRowTile}u;
+${options.bindings}
+
+// 🔴 EACH HOLDS ITS RAW TENSOR FIRST AND ITS NORMALISED ONE AFTER, IN PLACE.
+// act and queries_cond were both read from GLOBAL memory in four loops -
+// the two passes of a shared LayerNorm and the two normalisations - and two of
+// those run over every channel on EVERY lane rather than a strided share, so a
+// workgroup of 64 issued tens of thousands of loads for 2 * C * ROW_TILE
+// distinct values. Staged once they are that many loads and the rest are
+// workgroup reads, and the loops collapse from ROW_TILE scalar operations to
+// ROW_TILE/4 vector ones.
+//
+// 🔴 IN PLACE AND NOT IN TWO MORE ARRAYS, WHICH IS THE DIFFERENCE FROM THE
+// output KERNEL. That one already held 24 of the device's 32 KiB, so a fifth
+// array cost no residency; this one holds 8, and two more would take it to 16 -
+// halving how many workgroups a core can keep. Neither raw tensor is wanted
+// after its own normalisation, so each is overwritten where it lies. The
+// barrier below is what makes that safe.
+var<workgroup> xq: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> qcond: array<${rowVector}, ${rowGroups * channels}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let base_row = (group.x + group.y * GRID_WIDTH) * ROW_TILE;
+  if (base_row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+
+  // ...a row past the end is clamped rather than skipped: every lane reaches
+  // the barriers, and its lane of each vector is dropped at the write.
+  for (var c = local; c < C; c += 64u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      xq[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c];
+      qcond[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    }`)}
+  }
+  workgroupBarrier();
+
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);
+  var cond_total${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `total${g} += xq[${g}u * C + c];
+    cond_total${g} += qcond[${g}u * C + c];`)}
+  }
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));
+  let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));
+  var variance${g} = ${rowVector}(0.0);
+  var cond_variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `{
+      let d = xq[${g}u * C + c] - mean${g};
+      variance${g} += d * d;
+      let e = qcond[${g}u * C + c] - cond_mean${g};
+      cond_variance${g} += e * e;
+    }`)}
+  }
+  ${overRowGroups((g) => `let inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));
+  let cond_inverse${g} =
+    inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
+
+  // ...the two loops above read every slot on every lane, so nothing may be
+  // overwritten until all of them are past it.
+  workgroupBarrier();
+  for (var c = local; c < C; c += 64u) {
+    let scale = weights[W_${prefix}SingleCondLayerNormScale + c];
+    ${overRowGroups((g) => `qcond[${g}u * C + c] =
+      (qcond[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
+  }
+  workgroupBarrier();
+  for (var c = local; c < C; c += 64u) {
+    ${overRowGroups((g) =>
+      `var scale_value${g} = ${rowVector}(weights[W_${prefix}SingleCondScaleBias + c]);
+    var shift${g} = ${rowVector}(0.0);`)}
+    for (var d = 0u; d < C; d += 1u) {
+      let ws = weights[W_${prefix}SingleCondScaleWeights + d * C + c];
+      let wb = weights[W_${prefix}SingleCondBias + d * C + c];
+      ${overRowGroups((g) => `{
+        let cn = qcond[${g}u * C + d];
+        scale_value${g} += cn * ws;
+        shift${g} += cn * wb;
+      }`)}
+    }
+    // ...written out rather than through logistic(), which takes an f32; this
+    // is its definition applied to the whole vector, so the arithmetic is the
+    // same one. The output kernel above spells it the same way.
+    ${overRowGroups((g) => `xq[${g}u * C + c] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
+      * ((xq[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < WIDTH; out += 64u) {
+    ${overRowGroups((g) =>
+      `var a${g} = ${rowVector}(${options.biasA ? `weights[${options.biasA} + out]` : "0.0"});
+    var b${g} = ${rowVector}(0.0);`)}
+    for (var c = 0u; c < C; c += 1u) {
+      // ...read once, used by every row of the tile.
+      let wa = weights[${options.weightA} + c * WIDTH + out];
+      let wb = weights[${options.weightB} + c * WIDTH + out];
+      ${overRowGroups((g) => `{
+        let x = xq[${g}u * C + c];
+        a${g} += x * wa;
+        b${g} += x * wb;
+      }`)}
+    }
+    ${overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        ${options.outA}[row * WIDTH + out] = a${rowGroup(t)}${rowLane(t)};
+        ${options.outB}[row * WIDTH + out] = b${rowGroup(t)}${rowLane(t)};
+      }
+    }`)}
+  }
+}`;
+
+  const project = conditionedProject("q", {
+    bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> q: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gate: array<f32>;`,
+    weightA: "W_qProjection", biasA: "W_qBias", outA: "q",
+    weightB: "W_gatingQuery", outB: "gate",
+  });
+
+  // The key side is a separate dispatch because there are more key rows than
+  // query rows, and they gather the activation through queries_to_keys.
+  const projectKeys = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> keys_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<storage, read_write> k: array<f32>;
+@group(0) @binding(5) var<storage, read_write> v: array<f32>;
+
+var<workgroup> xk: array<f32, ${channels}>;
+var<workgroup> kcond: array<f32, ${channels}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= KEY_ROWS) { return; }
+  let local = local_id.x;
+  let live = gathers[G_QK_MASK + row] != 0;
+  let source = u32(max(gathers[G_QK_IDX + row], 0));
+
+  var total = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    total += value;
+  }
+  let mean = total / f32(C);
+  var variance = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    let d = value - mean;
+    variance += d * d;
+  }
+  let inverse = inverseSqrt(variance / f32(C) + EPSILON);
+
+  var cond_total = 0.0;
+  for (var c = 0u; c < C; c += 1u) { cond_total += keys_cond[row * C + c]; }
+  let cond_mean = cond_total / f32(C);
+  var cond_variance = 0.0;
+  for (var c = 0u; c < C; c += 1u) {
+    let d = keys_cond[row * C + c] - cond_mean;
+    cond_variance += d * d;
+  }
+  let cond_inverse = inverseSqrt(cond_variance / f32(C) + EPSILON);
+  for (var c = local; c < C; c += 64u) {
+    kcond[c] = (keys_cond[row * C + c] - cond_mean) * cond_inverse
+      * weights[W_kSingleCondLayerNormScale + c];
+  }
+  workgroupBarrier();
+  for (var c = local; c < C; c += 64u) {
+    var scale_value = weights[W_kSingleCondScaleBias + c];
+    var shift = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      scale_value += kcond[d] * weights[W_kSingleCondScaleWeights + d * C + c];
+      shift += kcond[d] * weights[W_kSingleCondBias + d * C + c];
+    }
+    var value = 0.0;
+    if (live) { value = act[source * C + c]; }
+    xk[c] = logistic(scale_value) * ((value - mean) * inverse) + shift;
+  }
+  workgroupBarrier();
+
+  for (var out = local; out < WIDTH; out += 64u) {
+    var k_total = 0.0;
+    var v_total = 0.0;
+    for (var c = 0u; c < C; c += 1u) {
+      k_total += xk[c] * weights[W_kProjection + c * WIDTH + out];
+      v_total += xk[c] * weights[W_vProjection + c * WIDTH + out];
+    }
+    k[row * WIDTH + out] = k_total;
+    v[row * WIDTH + out] = v_total;
+  }
+}`;
+  // 🔴 OpenDDE CHAINS THE TWO ADAPTIVE LAYERNORMS, AND THIS IS THE FIRST HALF
+  // WRITTEN OUT. AlphaFold 3 normalises the RAW activation once per side;
+  // OpenDDE's `AttentionPairBias` reassigns - `a = layernorm_a(a, s)` then
+  // `kv = layernorm_kv(a, s)` reading the ALREADY-NORMALISED a. The key
+  // projection below fuses its own normalisation into itself, so the way to
+  // chain without touching it is to hand it a pre-normalised activation: this
+  // kernel writes `adaLN_q(act)` and the caller binds that in place of `act`.
+  // The QUERY projection still reads the raw one, which is what makes it a
+  // chain rather than a substitution.
+  //
+  // Written one workgroup per row rather than over a tile like its fused
+  // sibling: it runs once per block on the query rows alone, and a shape this
+  // simple is one that can be read against the reference.
+  const normaliseQueries = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> normalised: array<f32>;
+
+var<workgroup> cond: array<f32, ${channels}>;
+var<workgroup> reduce_a: array<f32, 64>;
+var<workgroup> reduce_b: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * GRID_WIDTH;
+  if (row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+  let base = row * C;
+
+  // The activation's own mean and variance, and the conditioning's.
+  var sum_a = 0.0;
+  var sum_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    sum_a += act[base + c];
+    sum_b += queries_cond[base + c];
+  }
+  reduce_a[local] = sum_a;
+  reduce_b[local] = sum_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let mean = reduce_a[0] / f32(C);
+  let cond_mean = reduce_b[0] / f32(C);
+  workgroupBarrier();
+
+  var var_a = 0.0;
+  var var_b = 0.0;
+  for (var c = local; c < C; c += 64u) {
+    let d = act[base + c] - mean;
+    let e = queries_cond[base + c] - cond_mean;
+    var_a += d * d;
+    var_b += e * e;
+  }
+  reduce_a[local] = var_a;
+  reduce_b[local] = var_b;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) {
+      reduce_a[local] += reduce_a[local + stride];
+      reduce_b[local] += reduce_b[local + stride];
+    }
+    workgroupBarrier();
+  }
+  let inverse = inverseSqrt(reduce_a[0] / f32(C) + EPSILON);
+  let cond_inverse = inverseSqrt(reduce_b[0] / f32(C) + EPSILON);
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    cond[c] = (queries_cond[base + c] - cond_mean) * cond_inverse
+      * weights[W_qSingleCondLayerNormScale + c];
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    var scale_value = weights[W_qSingleCondScaleBias + c];
+    var shift = 0.0;
+    for (var d = 0u; d < C; d += 1u) {
+      scale_value += cond[d] * weights[W_qSingleCondScaleWeights + d * C + c];
+      shift += cond[d] * weights[W_qSingleCondBias + d * C + c];
+    }
+    normalised[base + c] = 1.0 / (1.0 + exp(-scale_value))
+      * ((act[base + c] - mean) * inverse) + shift;
+  }
+}`;
+
+  const projectKeysAtoms = conditionedProject("k", {
+    bindings: `@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+@group(0) @binding(3) var<storage, read_write> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;`,
+    weightA: "W_kProjection", outA: "k",
+    weightB: "W_vProjection", outB: "v",
+  });
+
+  // 🔴 THE KEY ROWS ARE A GATHER OF THE QUERY ROWS, SO THEIR PROJECTION IS ONE
+  // TOO. queries_to_keys maps 45x128 key slots onto 1440 atoms - about four
+  // slots an atom - and projectKeys recomputed the identical LayerNorm, AdaLN
+  // and k/v projection for every one of them. Everything it reads for a key row
+  // is a function of that row's SOURCE atom: keys_cond is built as a gather of
+  // queries_cond, and the activation is read through the same index. So the
+  // projection runs once per atom and this expands it: a quarter of the work
+  // for the same numbers.
+  //
+  // 🔴 AND A DEAD SLOT MUST WRITE ZERO, not the atom it happens to point at.
+  // The old kernel got that from `live` gating its reads; here the mask lives
+  // in the expansion, and dropping it would feed the attention real keys where
+  // it expects padding.
+  const expandKeys = `${common}
+@group(0) @binding(0) var<storage, read> k_atoms: array<f32>;
+@group(0) @binding(1) var<storage, read> v_atoms: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read_write> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= KEY_ROWS * WIDTH) { return; }
+  let row = slot / WIDTH;
+  let out = slot % WIDTH;
+  var k_value = 0.0;
+  var v_value = 0.0;
+  if (gathers[G_QK_MASK + row] != 0) {
+    let source = u32(max(gathers[G_QK_IDX + row], 0));
+    k_value = k_atoms[source * WIDTH + out];
+    v_value = v_atoms[source * WIDTH + out];
+  }
+  k[slot] = k_value;
+  v[slot] = v_value;
+}`;
+
+  const attendFor = (block) => `${common}
+const BLOCK: u32 = ${block}u;
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> k: array<f32>;
+@group(0) @binding(2) var<storage, read> v: array<f32>;
+@group(0) @binding(3) var<storage, read> pair_logits: array<f32>;
+@group(0) @binding(4) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(5) var<storage, read> keys_mask: array<f32>;
+@group(0) @binding(6) var<storage, read_write> gathered: array<f32>;
+
+var<workgroup> logits: array<f32, ${keys}>;
+var<workgroup> reduce: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let slot = group.x + group.y * GRID_WIDTH;
+  if (slot >= QUERY_ROWS * HEADS) { return; }
+  let head = slot % HEADS;
+  let query_index = slot / HEADS;
+  let subset = query_index / QUERIES;
+  let query = query_index % QUERIES;
+  let local = local_id.x;
+  let query_base = query_index * WIDTH + head * DIMENSION;
+
+  for (var key = local; key < KEYS; key += 64u) {
+    let key_index = subset * KEYS + key;
+    var dot = 0.0;
+    for (var d = 0u; d < DIMENSION; d += 1u) {
+      dot += q[query_base + d] * k[key_index * WIDTH + head * DIMENSION + d];
+    }
+    // 🔴 A PRODUCT, NOT A SUM: only a padded query AND a padded key is penalised.
+    // A product under AlphaFold 3 and a SUM under OpenDDE; see the note in
+    // atom-encoder-reference.js for which models take which and why it is
+    // inert on every batch this featuriser produces.
+${keyMasked
+  ? "    let bias = -1.0e9 * ((1.0 - queries_mask[query_index]) + (1.0 - keys_mask[key_index]));"
+  : "    let bias = 1.0e9 * (queries_mask[query_index] - 1.0) * (keys_mask[key_index] - 1.0);"}
+    logits[key] = dot * SCALE + bias
+      + pair_logits[(((BLOCK * SUBSETS + subset) * HEADS + head) * QUERIES + query) * KEYS + key];
+  }
+  workgroupBarrier();
+
+  var local_max = -3.0e38;
+  for (var key = local; key < KEYS; key += 64u) { local_max = max(local_max, logits[key]); }
+  reduce[local] = local_max;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce[local] = max(reduce[local], reduce[local + stride]); }
+    workgroupBarrier();
+  }
+  let largest = reduce[0];
+  workgroupBarrier();
+
+  var local_sum = 0.0;
+  for (var key = local; key < KEYS; key += 64u) {
+    let value = exp(logits[key] - largest);
+    logits[key] = value;
+    local_sum += value;
+  }
+  reduce[local] = local_sum;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { reduce[local] += reduce[local + stride]; }
+    workgroupBarrier();
+  }
+  let total = reduce[0];
+  workgroupBarrier();
+
+  for (var d = local; d < DIMENSION; d += 64u) {
+    var sum = 0.0;
+    for (var key = 0u; key < KEYS; key += 1u) {
+      sum += logits[key] * v[(subset * KEYS + key) * WIDTH + head * DIMENSION + d];
+    }
+    gathered[query_index * WIDTH + head * DIMENSION + d] = sum / total;
+  }
+}`;
+
+  // The zero-init gate, the residual, and the conditioned transition - all of
+  // which read the query conditioning RAW rather than normalised.
+  //
+  // 🔴 A TILE OF QUERY ROWS, BECAUSE ONE WORKGROUP A ROW READ 655 KB OF WEIGHTS
+  // TO PRODUCE ONE. This kernel fuses five matmuls - the attention's output
+  // projection, the zero-init gate, the conditioned scale and shift, the
+  // widening and the way back - and with a workgroup per row every one of them
+  // read its whole matrix for a single row: 377 MB a block, and the three
+  // blocks of a decoder call were 10.5 ms of 24. The rows share every weight
+  // and share nothing else, so a tile of them is exactly the vector: one read,
+  // one vector multiply-add, four rows.
+  // rosettafold3 reads the PRE-attention activation here; everyone else the
+  // post-attention one. One name, three read sites, so they cannot disagree.
+  const transitionInput = shape.noResidual === true ? "before" : "after";
+  const output = `${common}
+const ROW_TILE: u32 = ${outputRowTile}u;
+@group(0) @binding(0) var<storage, read> gathered: array<f32>;
+@group(0) @binding(1) var<storage, read> gate: array<f32>;
+@group(0) @binding(2) var<storage, read> queries_cond: array<f32>;
+@group(0) @binding(3) var<storage, read> weights: array<f32>;
+@group(0) @binding(4) var<storage, read_write> act: array<f32>;
+
+var<workgroup> gated: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> after: array<${rowVector}, ${rowGroups * channels}>;
+${shape.noResidual !== true ? "" : `// 🔴 rosettafold3's no_residual: the PRE-attention activation, staged in the
+// tile's own layout so the transition can read it. AF3's block is
+// \`act += attn\` then \`act += transition(act)\`; rf3's is
+// \`act + attn + transition(act)\`, one residual and a transition that never
+// sees the attention. It is the same kernel with three reads moved, and it
+// costs \${rowGroups * channels} more floats of workgroup memory.
+var<workgroup> before: array<${rowVector}, ${rowGroups * channels}>;`}
+// 🔴 THE RAW CONDITIONING, STAGED ONCE, AND IT IS NOT cond_norm. It is read
+// in FIVE places - the two adaptive-zero projections, the two passes of its own
+// LayerNorm, and the normalisation itself - and it was read from GLOBAL memory
+// in every one, once per row of the tile. Two of those loops run over every
+// channel on EVERY lane rather than a strided share, so a workgroup of 64 was
+// issuing tens of thousands of global loads for the C * ROW_TILE distinct
+// values it needed. Staged, that is C * ROW_TILE loads and the rest are
+// workgroup reads - and because the stage is a vector over the tile's rows, the
+// loops reading it collapse from ROW_TILE scalar operations to ROW_TILE/4
+// vector ones.
+//
+// 🔴 IT CANNOT SHARE cond_norm's SLOTS, which is the first thing to try and
+// is wrong. The SECOND adaptive-zero projection reads the RAW conditioning -
+// see the note where it does - and it runs after the normalised form has been
+// written. Normalising in place would feed it the wrong tensor silently, and
+// nothing here would fail. It costs 4 KiB and no residency: this kernel already
+// holds 24 of the device's 32 KiB, so it is one workgroup a core either way.
+var<workgroup> cond_raw: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> cond_norm: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> x: array<${rowVector}, ${rowGroups * channels}>;
+var<workgroup> wide: array<${rowVector}, ${rowGroups * intermediate}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let base_row = (group.x + group.y * GRID_WIDTH) * ROW_TILE;
+  if (base_row >= QUERY_ROWS) { return; }
+  let local = local_id.x;
+
+  // ...a row past the end is clamped rather than skipped: every lane reaches
+  // the barriers, and its lane of each vector is dropped at the write.
+  for (var w = local; w < WIDTH; w += 64u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      gated[${rowGroup(t)}u * WIDTH + w]${rowLane(t)} =
+        gathered[row * WIDTH + w] * logistic(gate[row * WIDTH + w]);
+    }`)}
+  }
+  for (var c = local; c < C; c += 64u) {
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+      cond_raw[${rowGroup(t)}u * C + c]${rowLane(t)} = queries_cond[row * C + c];
+    }`)}
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    ${overRowGroups((g) => `var projected${g} = ${rowVector}(0.0);`)}
+    for (var w = 0u; w < WIDTH; w += 1u) {
+      // ...read once, used by every row of the tile.
+      let weight = weights[W_Transition2 + w * C + c];
+      ${overRowGroups((g) => `projected${g} += gated[${g}u * WIDTH + w] * weight;`)}
+    }
+    ${overRowGroups((g) => `var zero${g} = ${rowVector}(weights[W_AdaptiveZeroCondBias + c]);`)}
+    for (var d = 0u; d < C; d += 1u) {
+      let weight = weights[W_AdaptiveZeroCondWeights + d * C + c];
+      ${overRowGroups((g) => `zero${g} += cond_raw[${g}u * C + d] * weight;`)}
+    }
+    ${overRows((t) => `{
+      let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c];`}
+      after[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c]
+        + projected${rowGroup(t)}${rowLane(t)} * logistic(zero${rowGroup(t)}${rowLane(t)});
+    }`)}
+  }
+  workgroupBarrier();
+
+  // The transition reads the POST-attention activation - except under
+  // rosettafold3, where it reads the PRE-attention one and the two share a
+  // single residual. See the staged copy above.
+  ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `total${g} += ${transitionInput}[${g}u * C + c];`)}
+  }
+  ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));`)}
+  ${overRowGroups((g) => `var variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `{
+      let d = ${transitionInput}[${g}u * C + c] - mean${g};
+      variance${g} += d * d;
+    }`)}
+  }
+  ${overRowGroups((g) => `let inverse${g} =
+    inverseSqrt(variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
+
+  ${overRowGroups((g) => `var cond_total${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `cond_total${g} += cond_raw[${g}u * C + c];`)}
+  }
+  ${overRowGroups((g) => `let cond_mean${g} = cond_total${g} / ${rowVector}(f32(C));`)}
+  ${overRowGroups((g) => `var cond_variance${g} = ${rowVector}(0.0);`)}
+  for (var c = 0u; c < C; c += 1u) {
+    ${overRowGroups((g) => `{
+      let d = cond_raw[${g}u * C + c] - cond_mean${g};
+      cond_variance${g} += d * d;
+    }`)}
+  }
+  ${overRowGroups((g) => `let cond_inverse${g} =
+    inverseSqrt(cond_variance${g} / ${rowVector}(f32(C)) + ${rowVector}(EPSILON));`)}
+  for (var c = local; c < C; c += 64u) {
+    let scale = weights[W_ffwSingleCondLayerNormScale + c];
+    ${overRowGroups((g) => `cond_norm[${g}u * C + c] =
+      (cond_raw[${g}u * C + c] - cond_mean${g}) * cond_inverse${g} * scale;`)}
+  }
+  workgroupBarrier();
+  for (var c = local; c < C; c += 64u) {
+    ${overRowGroups((g) =>
+      `var scale_value${g} = ${rowVector}(weights[W_ffwSingleCondScaleBias + c]);
+    var shift${g} = ${rowVector}(0.0);`)}
+    for (var d = 0u; d < C; d += 1u) {
+      let ws = weights[W_ffwSingleCondScaleWeights + d * C + c];
+      let wb = weights[W_ffwSingleCondBias + d * C + c];
+      ${overRowGroups((g) => `{
+        let cn = cond_norm[${g}u * C + d];
+        scale_value${g} += cn * ws;
+        shift${g} += cn * wb;
+      }`)}
+    }
+    ${overRowGroups((g) => `x[${g}u * C + c] =
+      ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
+      * ((${transitionInput}[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
+  }
+  workgroupBarrier();
+
+  let doubled = INTERMEDIATE * 2u;
+  for (var i = local; i < INTERMEDIATE; i += 64u) {
+    ${overRowGroups((g) => `var gate_value${g} = ${rowVector}(0.0);
+    var value${g} = ${rowVector}(0.0);`)}
+    ${upGate ? overRowGroups((g) => `var up${g} = ${rowVector}(0.0);`) : ""}
+    for (var c = 0u; c < C; c += 1u) {
+      let column = W_ffwTransition1 + c * doubled;
+      let wg = weights[column + i];
+      let wv = weights[column + INTERMEDIATE + i];
+      ${upGate ? "let wu = weights[W_ffwAToB + c * INTERMEDIATE + i];" : ""}
+      ${overRowGroups((g) => `{
+        let xc = x[${g}u * C + c];
+        gate_value${g} += xc * wg;
+        value${g} += xc * wv;
+        ${upGate ? `up${g} += xc * wu;` : ""}
+      }`)}
+    }
+    ${overRowGroups((g) => `wide[${g}u * INTERMEDIATE + i] =
+      gate_value${g} / (${rowVector}(1.0) + exp(-gate_value${g})) * value${g}`
+      + (upGate ? ` * up${g}` : "") + ";")}
+  }
+  workgroupBarrier();
+
+  for (var c = local; c < C; c += 64u) {
+    ${overRowGroups((g) => `var projected${g} = ${rowVector}(0.0);`)}
+    for (var i = 0u; i < INTERMEDIATE; i += 1u) {
+      let weight = weights[W_ffwTransition2 + i * C + c];
+      ${overRowGroups((g) => `projected${g} += wide[${g}u * INTERMEDIATE + i] * weight;`)}
+    }
+    ${overRowGroups((g) =>
+      `var zero${g} = ${rowVector}(weights[W_ffwAdaptiveZeroCondBias + c]);`)}
+    for (var d = 0u; d < C; d += 1u) {
+      let weight = weights[W_ffwAdaptiveZeroCondWeights + d * C + c];
+      ${overRowGroups((g) => `zero${g} += cond_raw[${g}u * C + d] * weight;`)}
+    }
+    ${overRows((t) => `{
+      let row = base_row + ${t}u;
+      if (row < QUERY_ROWS) {
+        act[row * C + c] = after[${rowGroup(t)}u * C + c]${rowLane(t)}
+          + projected${rowGroup(t)}${rowLane(t)}
+            * logistic(zero${rowGroup(t)}${rowLane(t)});
+      }
+    }`)}
+  }
+}`;
+
+  // 🔴 THE ACTIVATION IS MASKED AFTER THE BLOCKS AND BEFORE THE SKIP CONNECTION.
+  // The decoder reads that skip connection, so a padded row carrying a value
+  // here is not a cosmetic difference - it re-enters the model downstream.
+  const maskAct = `${common}
+@group(0) @binding(0) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(1) var<storage, read_write> act: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= QUERY_ROWS * C) { return; }
+  act[index] = act[index] * queries_mask[index / C];
+}`;
+
+  // Project to the token width, gather back to token-atom layout, relu,
+  // and average over each token's REAL atoms only.
+  const aggregate = `${common}
+@group(0) @binding(0) var<storage, read> act: array<f32>;
+@group(0) @binding(1) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(2) var<storage, read> gathers: array<i32>;
+@group(0) @binding(3) var<storage, read> atom_mask: array<f32>;
+@group(0) @binding(4) var<storage, read> weights: array<f32>;
+@group(0) @binding(5) var<storage, read_write> token_act: array<f32>;
+
+// 🔴 ONE THREAD PER (TOKEN, CHANNEL), NOT PER TOKEN. This used to dispatch
+// ceil(TOKENS/64) workgroups with a thread to a token - ONE workgroup for a
+// 59-residue protein - and each of those threads then walked 768 output
+// channels x 24 atoms x 128 input channels, 2.4M multiply-adds on a single
+// lane. It was 43 ms of the atom encoder's 82: more than the three
+// cross-attention blocks put together, in the pass that only pools their
+// output. Splitting the channel loop across the grid gives 45k work items
+// where there were 59, and consecutive threads read consecutive weight
+// columns, so the reads coalesce as well.
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let slot = id.x + id.y * GRID_WIDTH * 64u;
+  if (slot >= TOKENS * C_TOKEN) { return; }
+  let token = slot / C_TOKEN;
+  let c = slot % C_TOKEN;
+  var count = 0.0;
+  for (var atom = 0u; atom < DENSE; atom += 1u) { count += atom_mask[token * DENSE + atom]; }
+
+  {
+    var total = 0.0;
+    for (var atom = 0u; atom < DENSE; atom += 1u) {
+      let dense_slot = token * DENSE + atom;
+      if (atom_mask[dense_slot] == 0.0) { continue; }
+      if (gathers[G_QTA_MASK + dense_slot] == 0) { continue; }
+      let source = u32(max(gathers[G_QTA_IDX + dense_slot], 0));
+      var value = 0.0;
+      for (var d = 0u; d < C; d += 1u) {
+        value += act[source * C + d] * queries_mask[source]
+          * weights[P_projectAtomFeaturesForAggr + d * C_TOKEN + c];
+      }
+      total += relu(value);
+    }
+    var scaled = 0.0;
+    if (count > 0.0) { scaled = total / count; }
+    token_act[token * C_TOKEN + c] = scaled;
+  }
+}`;
+
+  // 🔴 rosettafold3's kq_norm IN THE ATOM STACKS. Same LayerNorm as the token
+  // transformer's - flattened head axis, two-pass, scale and offset, after the
+  // projection and before the key_dim scaling - and both tensors in ONE
+  // dispatch, because q and k have DIFFERENT row counts here (QUERY_ROWS
+  // against KEY_ROWS, the gathered window being wider than the query block).
+  // The row space is their sum and the first QUERY_ROWS rows are q.
+  //
+  // 🔴 AND IT NORMALISES `k` AFTER `expand-keys`, not `kAtoms` before it. The
+  // gather duplicates an atom's k into every window that reaches it, so the two
+  // are the same arithmetic on real atoms - and NOT on the padded slots the
+  // gather zeroes, which the reference normalises along with the rest because
+  // its `x_k` is already in keys layout.
+  const kqNorm = shape.kqNorm !== true ? null : `${common}
+@group(0) @binding(0) var<storage, read_write> q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> k: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+
+var<workgroup> partial_sum: array<f32, 64>;
+var<workgroup> partial_squares: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let slot = group.x + group.y * GRID_WIDTH;
+  if (slot >= QUERY_ROWS + KEY_ROWS) { return; }
+  let local = local_id.x;
+  let is_query = slot < QUERY_ROWS;
+  let row = select(slot - QUERY_ROWS, slot, is_query);
+  let base = row * WIDTH;
+  let w_scale = select(W_keyLayerNormScale, W_queryLayerNormScale, is_query);
+  let w_offset = select(W_keyLayerNormOffset, W_queryLayerNormOffset, is_query);
+
+  var total = 0.0;
+  for (var w = local; w < WIDTH; w += 64u) {
+    total += select(k[base + w], q[base + w], is_query);
+  }
+  partial_sum[local] = total;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { partial_sum[local] += partial_sum[local + stride]; }
+    workgroupBarrier();
+  }
+  let mean = partial_sum[0] / f32(WIDTH);
+  workgroupBarrier();
+  var squares = 0.0;
+  for (var w = local; w < WIDTH; w += 64u) {
+    let d = select(k[base + w], q[base + w], is_query) - mean;
+    squares += d * d;
+  }
+  partial_squares[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { partial_squares[local] += partial_squares[local + stride]; }
+    workgroupBarrier();
+  }
+  let inverse_std = inverseSqrt(partial_squares[0] / f32(WIDTH) + EPSILON);
+  workgroupBarrier();
+  for (var w = local; w < WIDTH; w += 64u) {
+    let value = (select(k[base + w], q[base + w], is_query) - mean) * inverse_std
+      * weights[w_scale + w] + weights[w_offset + w];
+    if (is_query) { q[base + w] = value; } else { k[base + w] = value; }
+  }
+}`;
+
+  return { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
+           attendFor, output, maskAct, aggregate, kqNorm, outputRowTile };
+}
+
+export class Af3AtomEncoderGpu {
+  constructor(device, options = {}) {
+    this.device = device;
+    // 🔴 POOLED WHEN THE CALLER TAKES THE RESULT WITHOUT WAITING. See the
+    // note on Af3DiffusionConditioningGpu's constructor: release() DESTROYS
+    // where the allocator does not pool, and a device-chained caller returns
+    // while the work is still in flight.
+    this.allocator = new GpuBufferAllocator(device, options.pool ?? false);
+    this.pipelines = pipelineCacheForDevice(device);
+  }
+
+  /**
+   * @param {object} input shape, dialect, conditioning, atomMask, refPos,
+   *   refSpaceUid, the five gathers, tokenAtomsAct, trunkSingleCond,
+   *   trunkPairCond
+   * @param {object} weights the pair tensors plus `blocks`
+   */
+  async run(input, weights, options = {}) {
+    const { tokens, dense, subsets, queries, keys } = input.shape;
+    // 🔴 IN THE INPUT AND NOT AN ARGUMENT, to match the CPU reference this is
+    // checked against - which is injected as a bare function value and so has
+    // nowhere else to put it. No default; see the sentinel below.
+    const dialect = input.dialect;
+    if (dialect?.maskPaddedKeys === undefined) {
+      throw new Error("input.dialect.maskPaddedKeys has no default: stock AF3 "
+        + "is false, the openfold3 lineage true");
+    }
+    const channels = weights.channels;
+    const pairChannels = weights.pairChannels;
+    const heads = weights.heads;
+    const dimension = weights.dimension;
+    const width = heads * dimension;
+    const queryRows = subsets * queries;
+    const keyRows = subsets * keys;
+    const pairRows = subsets * queries * keys;
+    const perTokenChannels = weights.perTokenChannels;
+
+    const pairPacked = packCached(weights, "atom.pair", () => packAtomPairWeights(weights));
+    const blockPacked = weights.blocks.map(
+      (block) => packCached(block, "atom.block", () => packAtomBlockWeights(block)));
+    // 🔴 A PER-BLOCK PAIR NORM GENERATES A DIFFERENT KERNEL, SO IT IS IN THE
+    // KEY. The two arms index the same buffer differently and produce the same
+    // shapes; a key that could not tell them apart would hand an OpenDDE
+    // encoder AlphaFold 3's shader, which runs.
+    if (weights.pairNormPerBlock === undefined) {
+      throw new Error("weights.pairNormPerBlock has no default: AF3 normalises "
+        + "the atom-pair conditioning once for the stack, OpenDDE once per block");
+    }
+    const perBlockPair = weights.pairNormPerBlock;
+    // 🔴 THE CHAINING IS THE BLOCK'S, AND EVERY BLOCK IN A STACK AGREES. It is
+    // read off block 0 and asserted across the rest, because a stack whose
+    // blocks disagreed would be a bundle assembled from two dialects - which
+    // nothing else here would notice.
+    const keyMasked = weights.blocks[0]?.keyMaskedAtomAttention;
+    if (keyMasked === undefined) {
+      throw new Error("atom blocks carry no keyMaskedAtomAttention");
+    }
+    // 🔴 boltz2 QUERIES ON THE PER-ATOM FEATURES BEFORE s_trunk. AF3 uses one
+    // array for the query activation and the conditioning; this splits them.
+    const preTrunkQuery = input.dialect?.preTrunkQuery === true;
+    const chainedNorm = weights.blocks[0]?.chainedAtomLayerNorm;
+    if (chainedNorm === undefined) {
+      throw new Error("atom blocks carry no chainedAtomLayerNorm: AF3 "
+        + "normalises the raw activation on both sides, OpenDDE chains them");
+    }
+    if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
+      throw new Error("this atom stack's blocks disagree about chainedAtomLayerNorm");
+    }
+    // 🔴 IntelliFold-2 AND chai-1 START EVERY BLOCK FROM A FRESHLY ZEROED
+    // PADDING. It reuses the mask-act kernel that already runs once after the
+    // stack, so the arithmetic is the same one and only its POSITION differs -
+    // and under every other dialect the extra dispatches do not exist at all.
+    const maskPerBlock = weights.blocks[0]?.maskAtomActPerBlock;
+    if (maskPerBlock === undefined) {
+      throw new Error("atom blocks carry no maskAtomActPerBlock: AF3 pads the "
+        + "flat atom axis once, intellifold2 and chai1 inside every block");
+    }
+    if (weights.blocks.some((b) => b.maskAtomActPerBlock !== maskPerBlock)) {
+      throw new Error("this atom stack's blocks disagree about maskAtomActPerBlock");
+    }
+    // boltz2's transition up-gate, read off the WEIGHTS; see `blockOrderFor`.
+    const upGate = blockHasUpGate(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
+      throw new Error("this atom stack's blocks disagree about ffwAToB");
+    }
+    const kqNorm = blockHasKqNorm(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasKqNorm(b) !== kqNorm)) {
+      throw new Error("this atom stack's blocks disagree about kq_norm");
+    }
+    // 🔴 rosettafold3's CHIRALITY TERM, AND THE DIFFUSION ENCODER'S ALONE. The
+    // trunk's input embedder hands this class no coordinates, so there is
+    // nothing to take a gradient of and the weight is not in that scope either
+    // - `atomChiralToFeatures` is null unless BOTH the bundle carries it and
+    // the caller supplied positions.
+    // 🔴 AND A BATCH WITH NO CENTRES IS NOT A BATCH WITH A ZERO-LENGTH BUFFER.
+    // A ligand-only fold of GLYCEROL has no stereocentre at all, so `centers`
+    // is empty and `allocator.upload` refuses it outright - "invalid allocation
+    // size 0 for atom.chiral.centers", which killed rf3 in
+    // probe-ligand-flow.js while af3 and if2 folded. The term contributes
+    // exactly nothing with no centres, so the kernel, its five buffers and the
+    // extra binding on build-act are not built. This is not a fallback hiding
+    // an error: an empty sum is zero, and the arm that WOULD hide an error -
+    // a bundle carrying the weight while the featuriser hands over no
+    // `chirals` at all - still leaves the term off and is the caller's bug.
+    const chiralWanted = weights.atomChiralToFeatures != null
+      && input.tokenAtomsAct !== undefined && input.chirals !== undefined
+      && input.chirals.count > 0;
+    const shape = {
+      chiralGradients: chiralWanted,
+      tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
+      // rosettafold3's q/k LayerNorm; see the kernel. Off the WEIGHTS, so it
+      // decides whether the kernel is generated at all.
+      kqNorm,
+      // ...and its block wiring, which is a DIALECT question rather than a
+      // weight one - there is no tensor whose presence says so.
+      //
+      // 🔴 OFF THE BLOCK, LIKE THE DECODER AND THE CPU REFERENCE. This read
+      // used to be `input.dialect?.diffusionNoResidual`, which made this the
+      // ONE copied flag with two sources - the other three
+      // (`maskAtomActPerBlock`, `chainedAtomLayerNorm`,
+      // `keyMaskedAtomAttention`) are read off the block everywhere. They
+      // agreed only because the loader writes the dialect's value onto every
+      // block, and nothing said so. 🔴 AND THE BLOCK ROUTE IS THE BETTER
+      // GUARDED ONE: `atomBlockWith` in diffusion-weights.js THROWS on a block
+      // that carries no `diffusionNoResidual`, where `input.dialect?.X === true`
+      // reads a missing dialect as false - which is exactly the silent-AF3
+      // default the convention rule exists to prevent.
+      // Gated by test/dialect-routes.test.js.
+      noResidual: weights.blocks[0]?.diffusionNoResidual === true,
+      perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
+      trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
+      perBlockPair, keyMaskedAtomAttention: keyMasked, upGate,
+      atomRowTile: shapedKnob(deviceTuning(this.device).atomRowTile),
+      workgroupTarget: derivedWorkgroupTarget(this.device),
+    };
+    const sources = createAtomEncoderShaders(shape, pairPacked.offsets, blockPacked[0].offsets);
+    const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
+      + `:rt${shape.outputRowTile ?? "d"}`
+      + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}:${preTrunkQuery}:ug${upGate}`
+      // ...and rosettafold3's two, both of which shift the block's weight
+      // offsets and so appear as `const W_*` in EVERY source in this stack.
+      + `:kq${kqNorm}:mp${maskPerBlock}:nr${shape.noResidual}`
+      // ...and the chirality term, which adds a BINDING to build-act as well as
+      // a term, so a shared pipeline would fail its bind group rather than
+      // quietly compute the wrong thing.
+      + `:cg${shape.chiralGradients}`;
+    const compiled = {};
+    // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
+    const compiling = [];
+    for (const [name, source] of Object.entries(sources)) {
+      // ...the factory also returns the row tile the dispatch needs, which is a
+      // number rather than a shader.
+      if (name === "attendFor" || typeof source !== "string") continue;
+      compiling.push(this.pipelines.get(`${base}:${name}`, source)
+        .then((pipeline) => { compiled[name] = pipeline; }));
+    }
+    // 🔴 ONE attend PIPELINE PER BLOCK. All three blocks' head biases live in
+    // one buffer, and the block index selects a slice - baked in, because the
+    // pipeline cache takes no override constants.
+    compiled.attend = [];
+    for (let index = 0; index < weights.blocks.length; index += 1) {
+      const at = index;
+      compiling.push(this.pipelines.get(`${base}:attend:${at}`, sources.attendFor(at))
+        .then((pipeline) => { compiled.attend[at] = pipeline; }));
+    }
+    await Promise.all(compiling);
+
+    const storage = GPUBufferUsage.STORAGE;
+    const allocations = [];
+    const keep = (a) => { allocations.push(a); return a; };
+    const up = (label, data) => keep(this.allocator.upload(label, data, storage));
+    const alloc = (label, bytes, extra = 0) =>
+      keep(this.allocator.allocate(label, bytes, storage | extra));
+    // 🔴 THE STATIC HALF OF THIS ENCODER SURVIVES THE CALL, WHEN THE CALLER
+    // ASKS. Everything built from the reference conformers, the gathers and the
+    // trunk - the projected trunk tensors, the query and key conditioning and
+    // their masks, the atom pair conditioning and its logits - has nothing to
+    // do with the noisy positions or the noise level, and a sampler calls this
+    // two hundred times down one schedule. `build-pair` alone measured 14.6 ms
+    // of a 147 ms denoiser call, rebuilding the identical tensor every time.
+    //
+    // These are created OUTSIDE the pooled allocator, because a pooled buffer
+    // is recycled at the end of the run that made it, and released only when
+    // the cache is dropped.
+    const staticCache = options.staticCache;
+    // 🔴 BUILD IF ANY OF THEM HAD TO BE CREATED, not if the last one was. They
+    // are created together, so a partially populated cache means a shape
+    // changed underneath it - and skipping the build then would run the blocks
+    // against one molecule's conditioning and another's gathers.
+    let buildStatic = staticCache === undefined;
+    const persistent = (label, bytes, extra = 0) => {
+      if (staticCache === undefined) return alloc(label, bytes, extra);
+      const size = Math.ceil(bytes / 4) * 4;
+      const found = staticCache[label];
+      if (found !== undefined && found.size === size) return { buffer: found };
+      if (found !== undefined) { found.destroy(); noteDestroy(this.device, found.size, label); }
+      buildStatic = true;
+      noteAllocation(this.device, label, size);
+      const buffer = this.device.createBuffer({
+        label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
+      });
+      staticCache[label] = buffer;
+      return { buffer };
+    };
+    // 🔴 AND THE CONTENTS ARE STATIC TOO, NOT ONLY THE BUFFER. `persistent`
+    // keeps a tensor the blocks WRITE; this keeps one they READ. The per-atom
+    // conditioning, the reference conformer, the ten gathers and the trunk's
+    // two conditioned tensors are functions of the FOLD and not of the step,
+    // and they were rebuilt on the host and written across the bus once per
+    // sampler step - 2.6 MB a step at 59 tokens, growing as tokens^2 through
+    // `atom.trunk-pair`, into buffers already holding the identical bytes.
+    //
+    // The build closure is not called on a hit, so the host-side gathering
+    // above it - which walks every query and key row - does not run either.
+    const uploaded = staticCache === undefined ? undefined
+      : (STATIC_UPLOADS.get(staticCache) ?? new Set());
+    if (staticCache !== undefined) STATIC_UPLOADS.set(staticCache, uploaded);
+    const persistentUpload = (label, build, extra = 0) => {
+      if (staticCache === undefined) return up(label, build());
+      const found = staticCache[label];
+      if (found !== undefined && uploaded.has(label)) return { buffer: found };
+      const data = build();
+      const size = Math.ceil(data.byteLength / 4) * 4;
+      let buffer = found;
+      if (buffer !== undefined && buffer.size !== size) {
+        buffer.destroy();
+        noteDestroy(this.device, buffer.size, label);
+        buffer = undefined;
+      }
+      if (buffer === undefined) {
+        // A shape that moved under the cache invalidates the computed statics
+        // as well; see the note on buildStatic.
+        buildStatic = true;
+        noteAllocation(this.device, label, size);
+        buffer = this.device.createBuffer({
+          label, size, usage: storage | extra | GPUBufferUsage.COPY_DST,
+        });
+        staticCache[label] = buffer;
+      }
+      this.device.queue.writeBuffer(buffer, 0, data.buffer, data.byteOffset, data.byteLength);
+      uploaded.add(label);
+      return { buffer };
+    };
+    const ints = (source) => Int32Array.from(source, (v) => Number(v));
+    const floats = (source) => Float32Array.from(source, (v) => Number(v));
+
+    try {
+      const conditioning = persistentUpload("atom.cond", () => input.conditioning);
+      const atomMask = persistentUpload("atom.mask", () => floats(input.atomMask));
+      const pairWeights = { buffer: residentWeightBuffer(this.device, weights,
+        "atom.pair-weights", () => pairPacked.data) };
+      const trunkSingleCond = persistentUpload("atom.trunk-single",
+        () => input.trunkSingleCond);
+      const trunkPairCond = persistentUpload("atom.trunk-pair", () => input.trunkPairCond);
+      // 🔴 THE ONE INPUT THAT MOVES. Everything else this encoder reads is the
+      // molecule or the trunk; the noisy coordinates are the step.
+      const positions = up("atom.positions", input.tokenAtomsAct);
+      // 🔴 THE INVERTED INDEX IS BUILT ONCE, because it is a function of the
+      // TOPOLOGY and not of the coordinates - which is what lets the gradient
+      // kernel run one thread per atom with no atomic add. See `chiralGrad`.
+      const chiral = !chiralWanted ? undefined : (() => {
+        const { centers, angles } = input.chirals;
+        const atoms = tokens * dense;
+        const counts = new Uint32Array(atoms + 1);
+        for (let at = 0; at < centers.length; at += 1) counts[centers[at] + 1] += 1;
+        for (let at = 0; at < atoms; at += 1) counts[at + 1] += counts[at];
+        const offsets = Uint32Array.from(counts);
+        const entries = new Uint32Array(centers.length);
+        const cursor = Uint32Array.from(counts);
+        for (let centre = 0; centre < angles.length; centre += 1) {
+          for (let corner = 0; corner < 4; corner += 1) {
+            const atom = centers[centre * 4 + corner];
+            entries[cursor[atom]] = (centre << 2) | corner;
+            cursor[atom] += 1;
+          }
+        }
+        return {
+          atoms,
+          centers: up("atom.chiral.centers", Int32Array.from(centers)),
+          angles: up("atom.chiral.angles", Float32Array.from(angles)),
+          offsets: up("atom.chiral.offsets", offsets),
+          entries: up("atom.chiral.entries", entries),
+          gradients: keep(this.allocator.allocate("atom.chiral.grad", atoms * 3 * 4, storage)),
+        };
+      })();
+      const refPos = persistentUpload("atom.ref-pos", () => floats(input.refPos));
+      const refSpaceUid = persistentUpload("atom.ref-space", () => ints(input.refSpaceUid));
+
+      // Every gather, and the two reference-space columns, in one i32 buffer -
+      // see the note in the shader preamble about the eight-buffer guarantee.
+      const queriesSpace = new Int32Array(queryRows);
+      const keysSpace = new Int32Array(keyRows);
+      // 🔴 A MASKED SLOT'S REFERENCE SPACE IS ZERO, NOT A SENTINEL, UNDER THE
+      // STOCK DIALECT. AF3 gathers with a zero-filling convert, so two PADDED
+      // atoms both read 0, compare equal, and are treated as sharing a
+      // reference conformer - which makes their offset term live. Using -1 and
+      // -2 here to mark them "unrelated" is the tidier choice and a different
+      // model; it cost 3.1e-2 on the atom pair representation.
+      //
+      // 🔴 AND THAT IS EXACTLY WHAT `maskPaddedKeys` TURNS ON, FOR THE KEYS
+      // ALONE. OpenFold3 trained with `offsets_valid &= keys_mask`, so a padded
+      // KEY is never a valid neighbour of anything. A sentinel expresses it
+      // with no shader change and no ninth binding: real reference spaces are
+      // uid counters and never negative, so a key at -1 fails the equality test
+      // against every query, which is `(q == k) && keys_mask` exactly.
+      //
+      // 🔴 THE QUERIES ARE DELIBERATELY LEFT AT ZERO. Upstream gates on
+      // `keys_mask` only - the padded QUERY rows are discarded downstream - and
+      // masking both would be the tidier-looking choice that is a third model
+      // again. See ../alphafold3 `atom_cross_attention.py`.
+      const buildQueriesSpace = () => {
+        const flatSpace = ints(input.refSpaceUid);
+        const flatAtomMask = floats(input.atomMask);
+        for (let index = 0; index < queryRows; index += 1) {
+          queriesSpace[index] = input.tokenAtomsToQueries.mask[index]
+            ? flatSpace[Number(input.tokenAtomsToQueries.indices[index])] : 0;
+        }
+        for (let index = 0; index < keyRows; index += 1) {
+          keysSpace[index] = input.queriesToKeys.mask[index]
+            ? queriesSpace[Number(input.queriesToKeys.indices[index])] : 0;
+        }
+        if (!dialect.maskPaddedKeys) return;
+        // keysMask, built the way the reference builds it: the queries-to-keys
+        // gather's own mask, gated by whether the query it points at is a real
+        // atom.
+        for (let index = 0; index < keyRows; index += 1) {
+          const query = Number(input.queriesToKeys.indices[index]);
+          const live = input.queriesToKeys.mask[index]
+            && input.tokenAtomsToQueries.mask[query]
+            && flatAtomMask[Number(input.tokenAtomsToQueries.indices[query])] !== 0;
+          if (!live) keysSpace[index] = -1;
+        }
+      };
+      const gatherBuffer = persistentUpload("atom.gathers", () => {
+        buildQueriesSpace();
+        const gathers = new Int32Array(5 * queryRows + 5 * keyRows + 2 * tokens * dense);
+        let at = 0;
+        const place = (source) => { gathers.set(ints(source), at); at += source.length; };
+        place(input.tokenAtomsToQueries.indices);
+        place(input.tokenAtomsToQueries.mask);
+        place(input.tokensToQueries.indices);
+        place(input.tokensToQueries.mask);
+        place(input.queriesToKeys.indices);
+        place(input.queriesToKeys.mask);
+        place(input.tokensToKeys.indices);
+        place(input.tokensToKeys.mask);
+        place(input.queriesToTokenAtoms.indices);
+        place(input.queriesToTokenAtoms.mask);
+        gathers.set(queriesSpace, at); at += queryRows;
+        gathers.set(keysSpace, at);
+        return gathers;
+      });
+
+      // The reference positions in query and key layout, gathered on the host:
+      // three floats each, and the gathers are integer indirection the GPU has
+      // no reason to redo. Built once per fold - the key layout depends on the
+      // molecule and the query one on nothing else either.
+      let referenceLayouts;
+      const layouts = () => {
+        if (referenceLayouts !== undefined) return referenceLayouts;
+        const queriesRef = new Float32Array(queryRows * 3);
+        const keysRef = new Float32Array(keyRows * 3);
+        const flatRef = floats(input.refPos);
+        for (let index = 0; index < queryRows; index += 1) {
+          if (!input.tokenAtomsToQueries.mask[index]) continue;
+          const from = Number(input.tokenAtomsToQueries.indices[index]) * 3;
+          for (let axis = 0; axis < 3; axis += 1) {
+            queriesRef[index * 3 + axis] = flatRef[from + axis];
+          }
+        }
+        for (let index = 0; index < keyRows; index += 1) {
+          if (!input.queriesToKeys.mask[index]) continue;
+          const from = Number(input.queriesToKeys.indices[index]) * 3;
+          for (let axis = 0; axis < 3; axis += 1) {
+            keysRef[index * 3 + axis] = queriesRef[from + axis];
+          }
+        }
+        referenceLayouts = { queriesRef, keysRef };
+        return referenceLayouts;
+      };
+      const queriesRefBuffer = persistentUpload("atom.q-ref", () => layouts().queriesRef);
+      const keysRefBuffer = persistentUpload("atom.k-ref", () => layouts().keysRef);
+
+      const trunkSingleProjected = persistent("atom.trunk-single-p", tokens * channels * 4);
+      const trunkPairProjected = persistent("atom.trunk-pair-p",
+        tokens * tokens * pairChannels * 4);
+      const queriesCond = persistent("atom.q-cond", queryRows * channels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const queriesMask = persistent("atom.q-mask", queryRows * 4, GPUBufferUsage.COPY_SRC);
+      const keysCond = persistent("atom.k-cond", keyRows * channels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const keysMask = persistent("atom.k-mask", keyRows * 4, GPUBufferUsage.COPY_SRC);
+      const act = alloc("atom.act", queryRows * channels * 4, GPUBufferUsage.COPY_SRC);
+      const pair = persistent("atom.pair", pairRows * pairChannels * 4,
+        GPUBufferUsage.COPY_SRC);
+      const logits = persistent("atom.logits", weights.blocks.length * subsets * heads
+        * queries * keys * 4);
+      const q = alloc("atom.q", queryRows * width * 4);
+      const k = alloc("atom.k", keyRows * width * 4);
+      const v = alloc("atom.v", keyRows * width * 4);
+      // ...one row an ATOM, expanded into the key layout below.
+      // Only where the dialect chains; see the note at the dispatch.
+      const normalisedQueries = chainedNorm
+        ? alloc("atom.normalised-queries", queryRows * channels * 4) : null;
+      const queriesPre = preTrunkQuery
+        ? alloc("atom.q-pre", queryRows * channels * 4) : null;
+      const queriesPreMask = preTrunkQuery
+        ? alloc("atom.q-pre-mask", queryRows * 4) : null;
+      const trunkZero = preTrunkQuery
+        ? keep(this.allocator.upload("atom.trunk-zero",
+                                     new Float32Array(tokens * channels), storage))
+        : null;
+      const kAtoms = alloc("atom.k-atoms", queryRows * width * 4);
+      const vAtoms = alloc("atom.v-atoms", queryRows * width * 4);
+      const gate = alloc("atom.gate", queryRows * width * 4);
+      const gathered = alloc("atom.gathered", queryRows * width * 4);
+      const tokenAct = alloc("atom.token-act", tokens * perTokenChannels * 4,
+        GPUBufferUsage.COPY_SRC);
+
+      // 🔴 READ BEFORE THE READBACKS ARE SIZED, NOT AFTER THE PASSES ARE
+      // ENCODED: it decides which of them exist at all.
+      const reuseStatic = options.reuseStatic;
+      // 🔴 AND `outputs` DECIDES WHETHER THE OTHER TWO EXIST. `tokenAct` and
+      // the skip connection are the encoder's only per-step results, and both
+      // are read by the next stage on the DEVICE - the transformer's input and
+      // the decoder's. A sampler was draining the pipeline once a step to copy
+      // them to the host and write them straight back.
+      const outputs = options.outputs;
+      // The five static readbacks exist only when a host caller has no other
+      // way to see them: not when the head still holds them, and not when it
+      // is taking the device buffers directly.
+      const wantHostStatics = reuseStatic === undefined && outputs === undefined;
+      const readbacks = {
+        tokenAct: outputs !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-token", tokens * perTokenChannels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        skipConnection: outputs !== undefined ? undefined
+          : keep(this.allocator.allocate("atom.rb-skip", queryRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        // 🔴 ALLOCATED ONLY WHEN THEY ARE COPIED INTO. The five below are the
+        // static ones; with `reuseStatic` nothing writes them, and
+        // `atom.rb-pair` alone is 12.8 MiB standing in a sampler's peak for
+        // the length of a call that never touches it.
+        pairCond: !wantHostStatics ? undefined
+          : keep(this.allocator.allocate("atom.rb-pair", pairRows * pairChannels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        // The decoder reads all four of these, so the head can chain the two
+        // without a second encoder run.
+        queriesCond: !wantHostStatics ? undefined
+          : keep(this.allocator.allocate("atom.rb-qcond", queryRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysCond: !wantHostStatics ? undefined
+          : keep(this.allocator.allocate("atom.rb-kcond", keyRows * channels * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        queriesMask: !wantHostStatics ? undefined
+          : keep(this.allocator.allocate("atom.rb-qmask", queryRows * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+        keysMask: !wantHostStatics ? undefined
+          : keep(this.allocator.allocate("atom.rb-kmask", keyRows * 4,
+              GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST)),
+      };
+
+      const blockBuffers = weights.blocks.map((block, index) => ({
+        buffer: residentWeightBuffer(this.device, block, "atom.block",
+                                     () => blockPacked[index].data),
+      }));
+
+      const deferred = outputs === undefined ? undefined : options.validation;
+      if (deferred === undefined) this.device.pushErrorScope("validation");
+      else deferred.begin();
+      const encoder = this.device.createCommandEncoder({ label: "af3-atom-encoder" });
+      const run = (label, pipeline, buffers, x, y = 1) => {
+        const pass = encoder.beginComputePass({ label });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: buffers.map((a, binding) => ({ binding, resource: { buffer: a.buffer } })),
+        }));
+        pass.dispatchWorkgroups(x, y);
+        pass.end();
+      };
+      const spread = (groups) => [Math.min(groups, GRID_WIDTH), Math.ceil(groups / GRID_WIDTH)];
+      const lin = (count) => spread(Math.ceil(count / 64));
+
+      const qr = lin(queryRows);
+      const pr = lin(pairRows);
+      // 🔴 EVERYTHING HERE EXCEPT build-act IS THE SAME ON EVERY CALL. See
+      // `persistent` above: with a staticCache these run once per fold.
+      if (buildStatic) {
+        run("trunk-single", compiled.trunkSingle,
+            [trunkSingleCond, pairWeights, trunkSingleProjected], Math.ceil(tokens / 64));
+        const tp = lin(tokens * tokens);
+        run("trunk-pair", compiled.trunkPair,
+            [trunkPairCond, pairWeights, trunkPairProjected], tp[0], tp[1]);
+        run("build-queries", compiled.buildQueries,
+            [conditioning, atomMask, gatherBuffer, trunkSingleProjected, queriesCond,
+             queriesMask], qr[0], qr[1]);
+        const kr = lin(keyRows);
+        run("build-keys", compiled.buildKeys,
+            [queriesCond, queriesMask, gatherBuffer, keysCond, keysMask], kr[0], kr[1]);
+        run("build-pair", compiled.buildPair,
+            [queriesCond, keysCond, queriesRefBuffer, keysRefBuffer, gatherBuffer,
+             trunkPairProjected, pairWeights, pair], pr[0], pr[1]);
+        run("pair-logits", compiled.pairLogits, [pair, pairWeights, logits], pr[0], pr[1]);
+      }
+      // ...and this one reads the noisy positions, so it runs every time.
+      // 🔴 THE SAME SHADER WITH A ZEROED TRUNK TERM, rather than a second one.
+      // `build-queries` is conditioning + token_to_atom(s_trunk); running it
+      // against zeros gives exactly the per-atom half, which is what boltz2's
+      // queries read. One extra pass over queryRows, and only where the dialect
+      // asks - AF3 never allocates either buffer.
+      if (preTrunkQuery) {
+        run("build-queries-pre", compiled.buildQueries,
+            [conditioning, atomMask, gatherBuffer, trunkZero, queriesPre,
+             queriesPreMask], qr[0], qr[1]);
+      }
+      // 🔴 rosettafold3's CHIRALITY GRADIENT, RECOMPUTED EVERY STEP because it
+      // is a function of the noisy coordinates. The index it walks is not, so
+      // that is built once; see `chiralIndex`.
+      if (chiral !== undefined) {
+        const perAtom = lin(chiral.atoms);
+        run("chiral-grad", compiled.chiralGrad,
+            [positions, chiral.centers, chiral.angles, chiral.offsets,
+             chiral.entries, chiral.gradients], perAtom[0], perAtom[1]);
+      }
+      run("build-act", compiled.buildAct,
+          [preTrunkQuery ? queriesPre : queriesCond, queriesMask, positions,
+           gatherBuffer, pairWeights, act,
+           ...(chiral === undefined ? [] : [chiral.gradients])], qr[0], qr[1]);
+
+      const maskGroups = lin(queryRows * channels);
+      for (let index = 0; index < weights.blocks.length; index += 1) {
+        const w = blockBuffers[index];
+        // See maskPerBlock above: the padding is re-zeroed BEFORE the block's
+        // projections, which is where `pad_at_dim(..., value=0.)` sits.
+        if (maskPerBlock) {
+          run(`mask-act-${index}`, compiled.maskAct, [queriesMask, act],
+              maskGroups[0], maskGroups[1]);
+        }
+        // ...one workgroup per TILE of query rows; see the note on `output`.
+        const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
+        run(`project-${index}`, compiled.project,
+            [act, queriesCond, w, q, gate], perOutput[0], perOutput[1]);
+        // 🔴 CHAINED, SO THE KEYS NORMALISE THE NORMALISED QUERIES. Under stock
+        // AF3 both sides read `act` and this extra pass does not run at all,
+        // which is what keeps that path unchanged.
+        let keySource = act;
+        if (chainedNorm) {
+          const perQueryRow = spread(queryRows);
+          run(`normalise-queries-${index}`, compiled.normaliseQueries,
+              [act, queriesCond, w, normalisedQueries],
+              perQueryRow[0], perQueryRow[1]);
+          keySource = normalisedQueries;
+        }
+        run(`project-keys-${index}`, compiled.projectKeysAtoms,
+            [keySource, queriesCond, w, kAtoms, vAtoms], perOutput[0], perOutput[1]);
+        const expand = lin(keyRows * width);
+        run(`expand-keys-${index}`, compiled.expandKeys,
+            [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
+        if (kqNorm) {
+          // One workgroup a row over q and k together; see the kernel.
+          const kqRows = spread(queryRows + keyRows);
+          run(`kq-norm-${index}`, compiled.kqNorm, [q, k, w], kqRows[0], kqRows[1]);
+        }
+        // The per-block slice of the logits.
+        const slots = spread(queryRows * heads);
+        run(`attend-${index}`, compiled.attend[index],
+            [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);
+        run(`output-${index}`, compiled.output,
+            [gathered, gate, queriesCond, w, act], perOutput[0], perOutput[1]);
+      }
+
+      run("mask-act", compiled.maskAct, [queriesMask, act], maskGroups[0], maskGroups[1]);
+      const aggregateGroups = lin(tokens * perTokenChannels);
+      run("aggregate", compiled.aggregate,
+          [act, queriesMask, gatherBuffer, atomMask, pairWeights, tokenAct],
+          aggregateGroups[0], aggregateGroups[1]);
+
+      encoder.copyBufferToBuffer(
+        tokenAct.buffer, 0,
+        outputs === undefined ? readbacks.tokenAct.buffer : outputs.tokenAct, 0,
+        tokens * perTokenChannels * 4);
+      encoder.copyBufferToBuffer(
+        act.buffer, 0,
+        outputs === undefined ? readbacks.skipConnection.buffer : outputs.skipConnection, 0,
+        queryRows * channels * 4);
+      // 🔴 FIVE OF THE SEVEN READBACKS ARE THE SAME EVERY CALL. pairCond,
+      // queriesCond, keysCond and the two masks are built from the reference
+      // conformers, the gathers and the trunk - not from the noisy positions
+      // and not from the noise level - so a 200-step sampler copied ~14 MB back
+      // from the device two hundred times to get identical arrays, and handed
+      // them straight back to the decoder. `reuseStatic` is the head saying it
+      // still has them, and `outputs` is the head saying it would rather have
+      // the DEVICE buffers. The GPU still COMPUTES them, because the attention
+      // blocks below read the buffers; only the copy back is skipped.
+      if (wantHostStatics) {
+        encoder.copyBufferToBuffer(pair.buffer, 0, readbacks.pairCond.buffer, 0,
+                                   pairRows * pairChannels * 4);
+        encoder.copyBufferToBuffer(queriesCond.buffer, 0, readbacks.queriesCond.buffer, 0,
+                                   queryRows * channels * 4);
+        encoder.copyBufferToBuffer(keysCond.buffer, 0, readbacks.keysCond.buffer, 0,
+                                   keyRows * channels * 4);
+        encoder.copyBufferToBuffer(queriesMask.buffer, 0, readbacks.queriesMask.buffer, 0,
+                                   queryRows * 4);
+        encoder.copyBufferToBuffer(keysMask.buffer, 0, readbacks.keysMask.buffer, 0, keyRows * 4);
+      }
+
+      const start = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      if (deferred !== undefined) {
+        deferred.end("atom encoder");
+        return {
+          tokenAct: undefined, skipConnection: undefined,
+          pairCond: reuseStatic?.pairCond, queriesCond: reuseStatic?.queriesCond,
+          keysCond: reuseStatic?.keysCond, queriesMask: reuseStatic?.queriesMask,
+          keysMask: reuseStatic?.keysMask,
+          deviceStatics: {
+            pairCond: pair.buffer, queriesCond: queriesCond.buffer,
+            keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
+            keysMask: keysMask.buffer,
+          },
+          elapsedMilliseconds: performance.now() - start,
+          memory: this.allocator.snapshot(),
+        };
+      }
+      const error = await this.device.popErrorScope();
+      if (error !== null) throw new Error(`WebGPU validation failed: ${error.message}`);
+      const read = async (a) => {
+        await a.buffer.mapAsync(GPUMapMode.READ);
+        const copy = new Float32Array(a.buffer.getMappedRange().slice(0));
+        a.buffer.unmap();
+        return copy;
+      };
+      return {
+        tokenAct: await read(readbacks.tokenAct),
+        skipConnection: await read(readbacks.skipConnection),
+        pairCond: reuseStatic?.pairCond ?? await read(readbacks.pairCond),
+        queriesCond: reuseStatic?.queriesCond ?? await read(readbacks.queriesCond),
+        keysCond: reuseStatic?.keysCond ?? await read(readbacks.keysCond),
+        queriesMask: reuseStatic?.queriesMask ?? await read(readbacks.queriesMask),
+        keysMask: reuseStatic?.keysMask ?? await read(readbacks.keysMask),
+        // 🔴 THE SAME FIVE TENSORS, AS DEVICE BUFFERS. They are already on the
+        // GPU and the decoder's next act was to upload its own copy of them -
+        // 17 MiB of a 59-residue fold held twice, and read back across the bus
+        // once to make the second copy. Offered only when a staticCache keeps
+        // them alive past this call; without one they belong to the pooled
+        // allocator and are recycled the moment this returns.
+        deviceStatics: staticCache === undefined ? undefined : {
+          pairCond: pair.buffer, queriesCond: queriesCond.buffer,
+          keysCond: keysCond.buffer, queriesMask: queriesMask.buffer,
+          keysMask: keysMask.buffer,
+        },
+        elapsedMilliseconds: performance.now() - start,
+        memory: this.allocator.snapshot(),
+      };
+    } finally {
+      for (let index = allocations.length - 1; index >= 0; index -= 1) allocations[index].release();
+    }
+  }
+}

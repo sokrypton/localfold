@@ -24,7 +24,7 @@
  * equal - a different chunk reassociates the online softmax - so the report
  * carries relRMS and a rounding envelope rather than an equality.
  */
-import { createAttentionRegisterFlashShader } from "../../src/evoformer/attention.js";
+import { createAttentionRegisterFlashShader } from "../../src/kernels/attention.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

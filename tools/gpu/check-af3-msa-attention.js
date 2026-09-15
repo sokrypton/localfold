@@ -1,5 +1,5 @@
 /**
- * AF3's MSA attention: GPU against src/af3/msa-reference.js.
+ * AF3's MSA attention: GPU against src/af3/trunk/msa-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-msa-attention.js
  *
@@ -8,9 +8,9 @@
  * depth-maximum key mask) and more than one sequence (or the sharing is
  * untested).
  */
-import { msaAttention } from "../../src/af3/msa-reference.js";
-import { Af3MsaAttentionGpu } from "../../src/af3/msa-attention-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { msaAttention } from "../../src/af3/trunk/msa-reference.js";
+import { Af3MsaAttentionGpu } from "../../src/af3/trunk/msa-attention-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";

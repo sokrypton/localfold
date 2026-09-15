@@ -444,8 +444,8 @@ function writeGapSegment(msaFeatures, row, offset, span, width) {
 /**
  * The features, by whichever route is cheaper for THIS alignment.
  *
- * 🔴 ONE PLACE, BECAUSE THE SEAM HAS TWO CALLERS. src/model/monomer.js and
- * src/multimer/model.js both chose between the two paths with the same
+ * 🔴 ONE PLACE, BECAUSE THE SEAM HAS TWO CALLERS. src/af2/model/monomer.js and
+ * src/af2/multimer/model.js both chose between the two paths with the same
  * expression, and this file's own history is what says not to leave a rule in
  * two homes - see the allow-list that went stale at exactly this seam and took
  * the contact overlay off the shipped page with it.

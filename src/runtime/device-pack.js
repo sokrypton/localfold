@@ -8,7 +8,7 @@
  * bind is another 370 inside the fold. Neither needs a host: the codes are in
  * memory and the arithmetic is `code * scale`.
  *
- * This is `src/af3/pair-track-device-weights.js` generalised to "an ordered
+ * This is `src/af3/weights/pair-track-device-weights.js` generalised to "an ordered
  * list of a descriptor's properties", which is the shape every AF2 packer has -
  * `packTransitionWeights` and `packAttentionWeights` both build a list and
  * concatenate it, and the offsets are the running sum of the lengths.
@@ -17,7 +17,7 @@
  * `tensorSource`, a float32 bundle, a codec the planner refuses - and the
  * caller packs on the host as it always did.
  */
-import { planBlockUpload, runBlockUpload } from "./quantised-upload.js";
+import { planBlockUpload, runBlockUpload } from "../weights/quantised-upload.js";
 import { residentWeightBufferFilled } from "./resident.js";
 
 /**
@@ -67,7 +67,7 @@ export function packedBytesOf(order, sources, precision) {
  * four projection matrices as ONE interleaved block - the four roles of channel
  * `h` as columns `4h..4h+3` - so a `names` entry names up to four sources and
  * the decoder alternates between them element by element. See `partRun` in
- * src/runtime/quantised-upload.js.
+ * src/weights/quantised-upload.js.
  */
 function sourcesOfItem(item, sources) {
   if (typeof item === "string") return [sources?.[item]];

@@ -6,7 +6,7 @@
 //
 // ESMFold2's trunk block is AF3's pairformer block with the two grid attentions
 // and the single track removed, so this composes the three pieces that remain
-// out of src/af3/pairformer-reference.js and runs 24 of them:
+// out of src/af3/trunk/pairformer-reference.js and runs 24 of them:
 //
 //     pair += triangleMultiplication(pair, "outgoing")
 //     pair += triangleMultiplication(pair, "incoming")
@@ -28,8 +28,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/reference/dtype.js";
-import { transition, triangleMultiplication } from "../src/af3/pairformer-reference.js";
+import { readTensor } from "../src/weights/dtype.js";
+import { transition, triangleMultiplication } from "../src/af3/trunk/pairformer-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
 const bundleDirectory = process.argv[2] ?? join(ROOT, "model-esmfold2-trunk-f32");

@@ -85,7 +85,7 @@ def pack(codes, bits=BITS):
 
     One trailing byte of slack, so a reader may always take two bytes for a
     code that ends on the final one without walking off the buffer - which is
-    why the width is capped at nine in src/reference/dtype.js.
+    why the width is capped at nine in src/weights/dtype.js.
 
     🔴 THE GROUP MUST PACK INTO WHOLE BYTES. 32 codes of 5 bits is exactly 20,
     of 3 bits exactly 12, of 6 bits exactly 24 - but 32 of 7 is 28 exactly too,

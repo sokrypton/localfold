@@ -32,7 +32,7 @@ INT5_GROUP_BYTES = 20
 
 
 def tensor_byte_length(record: dict) -> int:
-    """The bytes one tensor occupies, matching src/reference/dtype.js."""
+    """The bytes one tensor occupies, matching src/weights/dtype.js."""
     width = WIDTHS[record["dtype"]]
     elements = 1
     for size in record["shape"]:
@@ -47,7 +47,7 @@ def tensor_byte_length(record: dict) -> int:
 
 def bundle_base(family: str) -> str:
     """The `remote` (or `directory`) the JS registry gives this family."""
-    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text("utf-8")
+    index = (ROOT / "src" / "bundles" / "manifests" / "index.js").read_text("utf-8")
     current = None
     fields: dict[str, dict[str, str]] = {}
     for line in index.splitlines():
@@ -62,7 +62,7 @@ def bundle_base(family: str) -> str:
             elif line == "  },":
                 current = None
     if family not in fields:
-        raise SystemExit(f"no bundle named {family} in src/reference/manifests/index.js")
+        raise SystemExit(f"no bundle named {family} in src/bundles/manifests/index.js")
     entry = fields[family]
     base = entry.get("remote") or entry["directory"]
     return base if base.endswith("/") else base + "/"
@@ -70,7 +70,7 @@ def bundle_base(family: str) -> str:
 
 def compiled_manifest(family: str) -> dict:
     """The manifest as the page compiles it in, read out of the JS module."""
-    module = ROOT / "src" / "reference" / "manifests" / f"{family}.js"
+    module = ROOT / "src" / "bundles" / "manifests" / f"{family}.js"
     text = module.read_text("utf-8")
     start = text.index("{", text.index("export const MANIFEST"))
     depth = 0

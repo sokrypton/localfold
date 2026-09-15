@@ -22,7 +22,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { outerFirstPairBlocks } from "../src/evoformer/outer-product-mean.js";
+import { outerFirstPairBlocks } from "../src/kernels/outer-product-mean.js";
 
 /** The rule block.js applies, restated here so the test fails if it changes. */
 function residueMultiple(cOuter, sequences) {

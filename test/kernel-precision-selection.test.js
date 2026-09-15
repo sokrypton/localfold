@@ -18,12 +18,12 @@
 import { describe, expect, it } from "./harness.js";
 import {
   chooseLinearKernel, LINEAR_TILE, LINEAR_TILE_WIDE,
-} from "../src/evoformer/transition.js";
+} from "../src/kernels/transition.js";
 import {
   selectAttentionProjectKernel, selectAttentionOutputKernel, selectAttentionFlashKernel,
   ATTENTION_PROJECT_TILE, ATTENTION_PROJECT_TILE_F16,
   ATTENTION_OUTPUT_TILE, ATTENTION_OUTPUT_TILE_F16,
-} from "../src/evoformer/attention.js";
+} from "../src/kernels/attention.js";
 
 const withF16 = { features: new Set(["shader-f16"]), limits: {}, adapterInfo: {} };
 const withoutF16 = { features: new Set(), limits: {}, adapterInfo: {} };

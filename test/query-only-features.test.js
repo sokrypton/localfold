@@ -1,8 +1,8 @@
 import { describe, expect, it } from "./harness.js";
 import { makeQueryOnlyFeatures } from "../src/input/query-only-features.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";
 const SEQUENCE = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";

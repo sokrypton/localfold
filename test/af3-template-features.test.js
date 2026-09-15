@@ -3,7 +3,7 @@ import {
   AF2_ATOM37, AF3_DENSE, BACKBONE_SLOTS, DGRAM_BINS, NUM_DENSE, PSEUDO_BETA_SLOT,
   backboneFrames, coverageOf, distogram, multichainMaskFor, pseudoBeta,
   templateGeometry,
-} from "../src/af3/template-features.js";
+} from "../src/af3/featurise/template-features.js";
 
 /**
  * These are the geometry features the template embedder used to refuse to

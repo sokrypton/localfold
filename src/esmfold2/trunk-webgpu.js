@@ -38,20 +38,20 @@
 import {
   deviceMatrixConfig, deviceTuning, halfPrecisionAvailable,
 } from "../runtime/device-profile.js";
-import { stagedMatrixBlock } from "../runtime/matrix-linear.js";
+import { stagedMatrixBlock } from "../kernels/matrix-linear.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
 import { residencyAllowed } from "../runtime/device-memory.js";
 import {
   allocateTransitionSplit, packTransitionWeights, TRANSITION_SPLIT_MIN_CHANNELS,
   TRANSITION_ORDER,
-} from "../af3/transition-webgpu.js";
+} from "../af3/trunk/transition-webgpu.js";
 import {
   allocateTriangleProjectMatrix, TRIANGLE_PROJECT_MATRIX_MIN_CHANNELS,
-} from "../triangle/project-matrix.js";
-import { packWeights as packTriangleWeights } from "../triangle/weights.js";
-import { residentPairTrackOnDevice } from "../af3/pair-track-device-weights.js";
-import { residentPackedOnDevice } from "../af3/device-weights.js";
-import { af3TriangleWeights } from "../af3/triangle-webgpu.js";
+} from "../kernels/triangle/project-matrix.js";
+import { packWeights as packTriangleWeights } from "../kernels/triangle/weights.js";
+import { residentPairTrackOnDevice } from "../af3/weights/pair-track-device-weights.js";
+import { residentPackedOnDevice } from "../af3/weights/device-weights.js";
+import { af3TriangleWeights } from "../af3/trunk/triangle-webgpu.js";
 import { DeferredValidation } from "../runtime/validation.js";
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
@@ -59,7 +59,7 @@ import { storageBytes } from "../runtime/storage.js";
 import {
   pairScratchCount, UNPACKED_PAIR_SCRATCH,
   compilePairTrack, encodePairTrack, packPairTrackWeights,
-} from "../af3/pair-track-gpu.js";
+} from "../af3/trunk/pair-track-gpu.js";
 
 /** ESMFold2-Experimental-Fast's `d_pair`. */
 export const PAIR_CHANNELS = 256;
@@ -177,7 +177,7 @@ export class Esmfold2TrunkGpu {
     // 🔴 THE SPLIT TRANSITION IS WHERE THIS TRUNK'S TIME IS. `pair-transition`
     // is 419.88 ms of a 743.8 ms trunk at 300 tokens - 56.5%, more than the
     // other five kernels together - and at this track's 256 channels the fused
-    // kernel loses to the split by 2.89x. See src/af3/transition-webgpu.js.
+    // kernel loses to the split by 2.89x. See src/af3/trunk/transition-webgpu.js.
     const transitionFactor = options.transitionFactor ?? 4;
     const tuning = deviceTuning(this.device);
     const splitConfig = deviceMatrixConfig(this.device, { element: "f16" });
@@ -209,7 +209,7 @@ export class Esmfold2TrunkGpu {
       ? {} : { result: tuning.stagedMatrixResult,
                contractResult: splitConfig?.resultComponentType };
     // 🔴 ITS OWN KNOB, not derived from the transition's - see the note on
-    // projectMatrixConfig in src/af3/pairformer-block-webgpu.js - and its own
+    // projectMatrixConfig in src/af3/trunk/pairformer-block-webgpu.js - and its own
     // width rule, which is about precision rather than memory.
     const triangleProjectMatrix = tuning.triangleProjectMatrix === true && splitConfig !== null
       && channels >= (tuning.triangleProjectMatrixMinChannels
@@ -254,7 +254,7 @@ export class Esmfold2TrunkGpu {
         "esmfold2-trunk.pair-mask", state.pairMask, storage));
       const scratch = [];
       // ...four of them without the grid attention, not five; see
-      // pairScratchCount in src/af3/pair-track-gpu.js.
+      // pairScratchCount in src/af3/trunk/pair-track-gpu.js.
       for (let index = 0; index < pairScratchCount(gridAttention); index += 1) {
         scratch.push(keep(this.allocator.allocate(
           `esmfold2-trunk.scratch${index}`,
@@ -328,7 +328,7 @@ export class Esmfold2TrunkGpu {
       await validation.settle();
 
       // ...allocated after the scratch is released, not beside it. See the
-      // note in src/af3/pairformer-block-webgpu.js: this allocator does not
+      // note in src/af3/trunk/pairformer-block-webgpu.js: this allocator does not
       // pool, so releasing DESTROYS and the peak actually moves.
       for (const allocation of scratch) allocation.release();
       biasBuffer?.release();
@@ -387,7 +387,7 @@ export class Esmfold2TrunkGpu {
     // the ~168 MB of writeBuffer behind it was the rest.
     //
     // 🔴 RESIDENT IS A TRADE AND THE BUDGET ANSWERS IT, not a guess made in
-    // advance - see the long note in src/af3/pairformer-block-webgpu.js. A
+    // advance - see the long note in src/af3/trunk/pairformer-block-webgpu.js. A
     // device with no budget set never takes this path.
     const resident = this.residentWeights
       ? (label, pack, variant) => ({

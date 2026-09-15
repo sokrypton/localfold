@@ -49,12 +49,12 @@
  * recycling helps the CHAINS while hurting their arrangement, and a combined
  * score would average exactly that away.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { foldBatch } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights }
-  from "../../src/af3/weights.js";
+  from "../../src/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

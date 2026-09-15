@@ -4,9 +4,9 @@ import {
   AttentionGpu,
   supportsAttentionSubgroup64x64,
 
-} from "../src/evoformer/attention.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+} from "../src/kernels/attention.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";

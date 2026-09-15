@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "./harness.js";
 import { create, globals } from "webgpu";
-import { EvoformerStackGpu } from "../src/evoformer/stack.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { EvoformerStackGpu } from "../src/af2/evoformer/stack.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 import { requestAlphaFoldDevice } from "../src/runtime/device.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";

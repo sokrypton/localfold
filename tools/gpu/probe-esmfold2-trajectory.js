@@ -15,7 +15,7 @@
 // what says whether a viewer must fit them.
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
-import { readTensor, readTensorAsFloat16 } from "../../src/reference/dtype.js";
+import { readTensor, readTensorAsFloat16 } from "../../src/weights/dtype.js";
 import { foldEsmfold2 } from "../../src/esmfold2/fold.js";
 import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
 import {

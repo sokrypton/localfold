@@ -19,7 +19,7 @@
 // RMSD after superposition.
 import {
   readTensor, readTensorAsFloat16, tensorByteLength,
-} from "../../src/reference/dtype.js";
+} from "../../src/weights/dtype.js";
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { EsmcTowerGpu } from "../../src/esmc/tower-webgpu.js";
 import { foldEsmfold2, SAMPLER_PRESETS } from "../../src/esmfold2/fold.js";
@@ -29,7 +29,7 @@ import {
 } from "../../src/esmfold2/weights.js";
 import { SHIM_PAIR_TENSORS } from "../../src/esmfold2/language-pair-webgpu.js";
 import { weightedRigidAlign } from "../../src/esmfold2/sampler-reference.js";
-import { ccdUrl, parseCcdComponent } from "../../src/af3/ccd-component.js";
+import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
 import { toDensePositions } from "../../src/esmfold2/featurise.js";
 import { toPdb } from "../../src/af3/fold.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";

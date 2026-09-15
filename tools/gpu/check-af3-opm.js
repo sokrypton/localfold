@@ -1,5 +1,5 @@
 /**
- * AF3's outer product mean: GPU against src/af3/msa-reference.js.
+ * AF3's outer product mean: GPU against src/af3/trunk/msa-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-opm.js
  *
@@ -9,9 +9,9 @@
  * depth - so all three spellings agree and a wrong one passes. Gaps in
  * different places in different sequences are what separates them.
  */
-import { outerProductMean } from "../../src/af3/msa-reference.js";
-import { Af3OuterProductMeanGpu } from "../../src/af3/outer-product-mean-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { outerProductMean } from "../../src/af3/trunk/msa-reference.js";
+import { Af3OuterProductMeanGpu } from "../../src/af3/trunk/outer-product-mean-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";

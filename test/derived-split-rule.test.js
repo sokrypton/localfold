@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { derivedSplitRule } from "../src/af3/diffusion-transformer-webgpu.js";
+import { derivedSplitRule } from "../src/af3/diffusion/diffusion-transformer-webgpu.js";
 
 // AF3's diffusion transformer at the shape a small fold runs: 768 channels,
 // 16 heads of 48, 256 lanes, a token tile of 4.
@@ -49,7 +49,7 @@ test("the split stays inside the measured plateau", () => {
 
 // ---------------------------------------------------------------------------
 
-import { batchedGatesAffordable } from "../src/af3/diffusion-transformer-webgpu.js";
+import { batchedGatesAffordable } from "../src/af3/diffusion/diffusion-transformer-webgpu.js";
 
 const gates = (over) => ({ allowed: true, budgetBytes: undefined,
                            residentBytes: 0, bytes: 60e6, ...over });
@@ -86,7 +86,7 @@ test("headroom is a multiple, not a fit", () => {
 
 // ---------------------------------------------------------------------------
 
-import { derivedTokenTile } from "../src/af3/diffusion-transformer-webgpu.js";
+import { derivedTokenTile } from "../src/af3/diffusion/diffusion-transformer-webgpu.js";
 
 test("nothing measured keeps the model's own tile", () => {
   assert.equal(derivedTokenTile({ measuredWidth: null, rows: 68, cap: 4 }), 4);
@@ -121,7 +121,7 @@ test("the cap is never exceeded", () => {
 
 // ---------------------------------------------------------------------------
 
-import { outputRowTileFor } from "../src/af3/atom-encoder-webgpu.js";
+import { outputRowTileFor } from "../src/af3/diffusion/atom-encoder-webgpu.js";
 
 // 🔴 THE CLAMP, AS A PROPERTY. The measurement may only make the tile smaller,
 // because "this device is left idle by the shipped 256" is the only thing the

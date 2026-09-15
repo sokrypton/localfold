@@ -50,7 +50,7 @@ export const NUCLEIC_TYPES = ["dna", "rna"];
  * magnesium, an EF-hand's calcium: these are the second thing anyone tries
  * after a protein, and they are the entries most likely to be typed wrong,
  * being one or two letters. They also did not work until the CCD reader learned
- * that a lone atom has no conformer - see src/af3/ccd-component.js.
+ * that a lone atom has no conformer - see src/af3/featurise/ccd-component.js.
  *
  * The set follows what AlphaFold Server offers. That list is not published in a
  * form worth citing, so this is the commonly reported one; it is one array, and

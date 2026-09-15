@@ -9,7 +9,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { distogramFeatures } from "../src/af3/confidence-reference.js";
+import { distogramFeatures } from "../src/af3/confidence/confidence-reference.js";
 
 describe("AF3 confidence distogram", () => {
   const tokens = 3;

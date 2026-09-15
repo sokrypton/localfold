@@ -15,7 +15,7 @@
  * parameter absent entirely, and requires them identical character for
  * character.
  */
-import { createDiffusionTransformerShaders } from "../../src/af3/diffusion-transformer-webgpu.js";
+import { createDiffusionTransformerShaders } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
 
 const NAMES = ["adaln", "qkvg", "qkvgReduce", "attend", "attentionOutput",
   "attentionOutputReduce", "ffwAdaln", "ffwWide", "ffwWideReduce", "ffwOut",

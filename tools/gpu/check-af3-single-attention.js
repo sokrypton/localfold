@@ -1,5 +1,5 @@
 /**
- * AF3 single-track attention: GPU against src/af3/pairformer-reference.js.
+ * AF3 single-track attention: GPU against src/af3/trunk/pairformer-reference.js.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-af3-single-attention.js
  *
@@ -7,9 +7,9 @@
  * the logits are an input to this module, built by the block from the pair
  * representation, so feeding real ones would be testing the block instead.
  */
-import { singleAttention } from "../../src/af3/pairformer-reference.js";
-import { Af3SingleAttentionGpu } from "../../src/af3/single-attention-webgpu.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { singleAttention } from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3SingleAttentionGpu } from "../../src/af3/trunk/single-attention-webgpu.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
 
 const MANIFEST = "/model-af3-full-f32/manifest.json";
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer_1/trunk_pairformer";

@@ -19,11 +19,11 @@
  */
 import { join } from "node:path";
 
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures }
-  from "../../src/af3/atom-encoder-reference.js";
-import { templateEmbedding } from "../../src/af3/template-reference.js";
-import { runTrunk } from "../../src/af3/trunk-reference.js";
+  from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { templateEmbedding } from "../../src/af3/trunk/template-reference.js";
+import { runTrunk } from "../../src/af3/trunk/trunk-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 import { CLASS_PROTEIN } from "../../src/heads/contact-threshold.js";
@@ -178,7 +178,7 @@ function buildTargetFeat(tensors, dump, tokens) {
   // 🔴 DERIVED, NOT 9. This was a constant, right for the 12-token dump and
   // wrong for every other: a 59-residue chain needs 45 subsets, and passing 9
   // truncates the atom gathers so target_feat is built from a fraction of the
-  // atoms. src/af3/featurise.js computes ceil(tokens * 24 / 32) and has always
+  // atoms. src/af3/featurise/featurise.js computes ceil(tokens * 24 / 32) and has always
   // been right; only this file was wrong, which is why the trunk appeared to
   // diverge at 59 tokens while the browser folded correctly.
   const subsets = dump.inputs["queries_to_keys:gather_idxs"].data.length / 128;

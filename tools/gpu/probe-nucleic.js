@@ -29,13 +29,13 @@
  * matters more here than anywhere - a nucleotide has a C4 AND a C4', a C2 and a
  * C2', and the primes are the part a reader drops.
  */
-import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
 import { featuriserDialect } from "../../src/af3/dialect.js";
 import { foldBatch, atomName } from "../../src/af3/fold.js";
-import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
-import { nucleicConformers } from "../../src/af3/reference-conformers-nucleic.js";
-import { openAf3Store } from "../../src/af3/weights.js";
-import { foldWeights } from "../../src/af3/diffusion-weights.js";
+import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
+import { nucleicConformers } from "../../src/af3/featurise/reference-conformers-nucleic.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { foldWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

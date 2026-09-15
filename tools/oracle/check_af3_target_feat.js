@@ -12,9 +12,9 @@
  */
 import { join } from "node:path";
 
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
 import { atomCrossAttentionEncoder, targetFeatures }
-  from "../../src/af3/atom-encoder-reference.js";
+  from "../../src/af3/diffusion/atom-encoder-reference.js";
 import * as B from "./af3-bundle.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 

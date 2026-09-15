@@ -15,7 +15,7 @@
  * through every variant the device supports, and reports both the disagreement
  * against the default and the time.
  */
-import { AttentionGpu, selectAttentionFlashKernel } from "../../src/evoformer/attention.js";
+import { AttentionGpu, selectAttentionFlashKernel } from "../../src/kernels/attention.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
@@ -26,7 +26,7 @@ const option = (args, name, fallback) => {
 // 🔴 "matrix" IS IN THE LIST NOW, and it is the one variant whose ARITHMETIC
 // differs: the units multiply in f16 with an f32 accumulator where every other
 // variant multiplies in f32, so it is held to the f16 bar and not to the 1e-6
-// the reassociating ones agree to. See src/evoformer/attention-matrix.js.
+// the reassociating ones agree to. See src/kernels/attention-matrix.js.
 const VARIANTS = ["portable", "subgroup-4x8", "subgroup-key32", "subgroup-8x64",
                   "subgroup-16x64", "subgroup-32x64", "subgroup-64x64", "matrix"];
 

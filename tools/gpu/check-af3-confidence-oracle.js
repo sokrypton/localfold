@@ -15,10 +15,10 @@
  * batch - both heads consume one, and it cannot be synthesised. See
  * tools/oracle/dump_af3_confidence.py.
  */
-import { confidenceHead } from "../../src/af3/confidence-reference.js";
-import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence-webgpu.js";
-import { pairformerBlock } from "../../src/af3/pairformer-reference.js";
-import { af3Dialect, confidenceWeights, openAf3Store } from "../../src/af3/weights.js";
+import { confidenceHead } from "../../src/af3/confidence/confidence-reference.js";
+import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence/confidence-webgpu.js";
+import { pairformerBlock } from "../../src/af3/trunk/pairformer-reference.js";
+import { af3Dialect, confidenceWeights, openAf3Store } from "../../src/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

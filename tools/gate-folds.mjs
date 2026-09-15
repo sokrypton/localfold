@@ -18,6 +18,11 @@
  * and a precondition - the portable gate must see its ceiling reach the page.
  */
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const BASELINE = join(dirname(fileURLToPath(import.meta.url)), "gate-baseline.json");
 
 /** 6MRR's chain A, which is what every other row in this table folds. */
 const SIX_MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
@@ -76,11 +81,14 @@ const SIGNATURE = /"checksum": -?\d+|"atomChecksum": -?\d+|"meanPlddt": [\d.]+/;
  *   reason when the gate's own setup did not take, which is a FAIL of the
  *   harness and never a skip.
  */
-export async function runFolds({ env, question, broke, precondition }) {
+export async function runFolds({ env, question, broke, precondition, arm }) {
   let failed = 0;
   let skipped = 0;
+  const measured = {};
+  let adapter;
   for (const [name, args] of FOLDS) {
     const { code, text } = await run(args, env);
+    adapter ??= text.match(/^\[gpu-chrome\] adapter: (.+)$/m)?.[1];
     const unmet = precondition?.(text);
     const signature = text.match(SIGNATURE)?.[0];
     const ok = code === 0 && unmet === undefined && !broke.test(text) && signature !== undefined;
@@ -100,12 +108,112 @@ export async function runFolds({ env, question, broke, precondition }) {
     const why = unmet ?? signature ?? missing ?? named
       ?? `no structure produced - ${lastLine ?? "no output"}`;
     if (skip) skipped += 1; else if (!ok) failed += 1;
+    if (ok && signature !== undefined) measured[name] = signature;
     console.log(`${ok ? "ok  " : skip ? "SKIP" : "FAIL"}  ${name.padEnd(9)} ${why}`);
   }
+  const drifted = arm === undefined ? 0 : checkBaseline(arm, adapter, measured);
   const ran = FOLDS.length - skipped;
   console.log(failed === 0
     ? `\nevery model folds ${question}${skipped === 0 ? "" : ` (${skipped} skipped: `
       + "an artefact this box does not have, not a capability)"}`
     : `\n${failed} of ${ran} models do not fold ${question}`);
-  process.exit(failed === 0 ? 0 : 1);
+  process.exit(failed === 0 && drifted === 0 ? 0 : 1);
+}
+
+/**
+ * 🔴 WHAT THIS IS FOR: A RECORDED NUMBER THAT NOBODY RE-RUNS IS A BASELINE FOR
+ * EXACTLY AS LONG AS IT TAKES SOMEBODY TO BELIEVE IT.
+ *
+ * docs/A100.md recorded this gate's four figures on 2026-09-12. Three days
+ * later two of them were wrong - AF3 85.8348 against 83.0999 and OpenDDE
+ * 92.0489 against 92.0382 - and CLAUDE.md's spec-floor line carried a THIRD
+ * OpenDDE value, 92.1193, from a fourth day. Bisected, each move is one commit
+ * and both are correctness fixes whose own messages state the new figure:
+ *
+ *   28b3965  AF3's diffusion atom encoder read the `_1` pair tensors where the
+ *            reference's graph calls the base form - denoise 4.19e-1 -> 1.55e-5,
+ *            pLDDT 85.8301 -> 83.1276. "The old numbers were computed with
+ *            weights the model does not use, so they were never a baseline."
+ *   7c13e05  the template stage's precision pin: 83.1276 -> 83.1295.
+ *   9b2cd37  singleProjectMaxSplits, which regroups a sum: 1.3e-7.
+ *   8dba05f  three models folded a single sequence one MSA row short - OpenDDE
+ *            92.1200 -> 92.0396 and RMSD 1.527 -> 1.518, stated in the commit.
+ *
+ * So nothing was broken and nothing was hidden. What failed is that the figures
+ * lived in PROSE, in three documents, and the only thing that re-ran them was
+ * somebody deciding to. This file is where they live now: one machine-readable
+ * record, re-checked on every run, and a legitimate improvement has to update
+ * it deliberately instead of silently diverging.
+ *
+ * 🔴 AND IT IS KEYED ON THE ADAPTER, because a checksum does not travel between
+ * machines - the A100 folds fold-af2.js at -1287025 and an M2 at -1282976, both
+ * correct. A baseline recorded on another box is REPORTED and not enforced;
+ * only the box that wrote it can be held to it. That is also why
+ * `tools/gpu-chrome.mjs` prints the adapter at all: it always collected
+ * `adapter.info` and always threw it away, so every figure this repository has
+ * ever published was machine-anonymous.
+ *
+ * `--write-baseline` records the current run. Read the diff before you do.
+ */
+function checkBaseline(arm, adapter, measured) {
+  const write = process.argv.includes("--write-baseline");
+  const stored = existsSync(BASELINE)
+    ? JSON.parse(readFileSync(BASELINE, "utf8")) : { adapter: null, arms: {} };
+
+  if (write) {
+    stored.adapter = adapter ?? stored.adapter;
+    stored.recorded = new Date().toISOString().slice(0, 10);
+    stored.arms = { ...stored.arms, [arm]: measured };
+    writeFileSync(BASELINE, `${JSON.stringify(stored, null, 2)}\n`);
+    console.log(`\nwrote ${Object.keys(measured).length} signatures for "${arm}"`
+      + ` to tools/gate-baseline.json (${stored.adapter})`);
+    return 0;
+  }
+
+  const { lines, enforced } = compareBaseline({ arm, adapter, measured, stored });
+  for (const line of lines) console.log(line);
+  return enforced;
+}
+
+/**
+ * The comparison on its own, with no file and no argv, so `npm test` can watch
+ * it fail without a GPU - `test/gate-baseline.test.js`. A check whose only
+ * proof of working is a twenty-minute fold is a check nobody falsifies.
+ *
+ * @returns {{ lines: string[], enforced: number }} `enforced` is what the gate
+ *   exits non-zero on, and is 0 on another machine's baseline however many
+ *   signatures differ.
+ */
+export function compareBaseline({ arm, adapter, measured, stored }) {
+  const recorded = stored.arms?.[arm];
+  if (recorded === undefined) {
+    return { lines: [`\nno baseline for "${arm}" - record one with --write-baseline`],
+      enforced: 0 };
+  }
+  const differs = Object.entries(measured)
+    .filter(([name, value]) => recorded[name] !== undefined && recorded[name] !== value)
+    .map(([name, value]) => `  ${name.padEnd(9)} ${recorded[name]}  ->  ${value}`);
+  if (differs.length === 0) {
+    const same = Object.keys(measured).filter((name) => recorded[name] !== undefined).length;
+    return { lines: [`baseline: ${same} of ${Object.keys(recorded).length} signatures`
+      + ` unchanged since ${stored.recorded}`], enforced: 0 };
+  }
+  // 🔴 A BASELINE FROM ANOTHER BOX IS EVIDENCE, NOT A BAR. The A100 folds
+  // fold-af2.js at -1287025 and an M2 at -1282976 over the same code and the
+  // same input, because the two resolve different attention kernels. Both are
+  // correct, and a gate that failed on that would be a gate everyone disables.
+  const mine = stored.adapter === null || stored.adapter === adapter;
+  const lines = [`\n${mine ? "🔴 " : ""}${differs.length} signature(s) differ from the`
+    + ` baseline recorded ${stored.recorded}${mine ? "" : ` on ${stored.adapter}`}:`, ...differs];
+  if (!mine) {
+    lines.push(`  ...reported and NOT failed: this is ${adapter ?? "an unidentified adapter"}`
+      + " and a signature does not travel between machines.");
+    return { lines, enforced: 0 };
+  }
+  const script = { stock: "test:stock", portable: "test:portable",
+    "spec-floor": "test:spec-floor" }[arm] ?? "test:portable";
+  lines.push("  If the change is intended, say so in the commit and re-record with"
+    + `\n      npm run ${script} -- --write-baseline`
+    + "\n  A figure that moves with nobody noticing is what this check exists to stop.");
+  return { lines, enforced: differs.length };
 }

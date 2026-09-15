@@ -7,7 +7,7 @@
  * sliding-window self-attention whose only positional signal is a rotary
  * embedding built from the REFERENCE CONFORMER's coordinates. Both are "an
  * atom transformer at 128 channels", so nothing in the shapes says so - see
- * src/esmfold2/atom-encoder-reference.js, which is what this is checked
+ * src/esmfold2/atom-transformer-reference.js, which is what this is checked
  * against.
  *
  * 🔴 EVERYTHING THAT IS A PLAIN PROJECTION COMES FROM src/esmc/block-webgpu.js.

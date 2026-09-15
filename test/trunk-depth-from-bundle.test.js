@@ -21,7 +21,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 
-const MANIFESTS = new URL("../src/reference/manifests/", import.meta.url);
+const MANIFESTS = new URL("../src/bundles/manifests/", import.meta.url);
 const PAIRFORMER = "diffuser/evoformer/__layer_stack_no_per_layer_1"
   + "/trunk_pairformer/single_attention_q_projection/bias";
 const MSA = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack"

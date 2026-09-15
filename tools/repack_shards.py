@@ -60,7 +60,7 @@ def pack(spans: list[tuple[str, int]], files: int) -> list[list[str]]:
 
 
 def read_compiled_manifest(module: pathlib.Path) -> dict:
-    """The MANIFEST object out of src/reference/manifests/<family>.js."""
+    """The MANIFEST object out of src/bundles/manifests/<family>.js."""
     text = module.read_text("utf-8")
     start = text.index("{", text.index("export const MANIFEST"))
     depth = 0

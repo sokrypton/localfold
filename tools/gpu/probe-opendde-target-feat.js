@@ -12,9 +12,9 @@
  * same. This reports the residual per column so the slice can be named.
  */
 import { loadTrunkOracle } from "./trunk-oracle.js";
-import { af3BatchFromA3m } from "../../src/af3/batch.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights, atomReference } from "../../src/af3/diffusion-weights.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
 import { foldBatch } from "../../src/af3/fold.js";
 
 const option = (args, name, fallback) => {

@@ -9,11 +9,11 @@
  * has to be thrown out. A and B alternate here inside a single process, and the
  * medians are what is reported.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { targetFeatureWeights } from "../../src/af3/diffusion-weights.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 const LENGTH = 59;
 const FLAGS = ["TRICONTRACT", "TRIPROJECT", "TRIOUT", "TRINORM", "GNORM", "GBIAS",

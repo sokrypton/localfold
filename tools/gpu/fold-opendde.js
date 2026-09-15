@@ -12,14 +12,14 @@
  */
 import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
 import { superpose, modelAlphaCarbons } from "./superpose.js";
-import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
 import { loadTrunkOracle, trunkOracleComparer } from "./trunk-oracle.js";
 import { batchFromDump } from "./fold.js";
 import { buildTemplate } from "../../web/template-source.js";
 import { foldBatch, toPdb, backboneGeometry, warmTrunkPipelines }
   from "../../src/af3/fold.js";
-import { structuralLayout } from "../../src/af3/structural-tokens.js";
-import { STRUCTURAL_REFINER } from "../../src/af3/weights.js";
+import { structuralLayout } from "../../src/af3/featurise/structural-tokens.js";
+import { STRUCTURAL_REFINER } from "../../src/af3/weights/weights.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
 import { memorySnapshot } from "../../src/runtime/device-memory.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
@@ -29,9 +29,9 @@ import { setMemoryBudget } from "../../src/runtime/device-memory.js";
 import {
   confidenceWeights, openAf3Store, openddeConfidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, trunkWeights,
-} from "../../src/af3/weights.js";
+} from "../../src/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -345,7 +345,7 @@ export async function main(device, args) {
       : args.includes("--resident") ? true : undefined,
     steps, recycles, seed: Number(option(args, "seed", "20260831")),
     // OpenDDE runs src/af3/fold.js, so it inherits the trunk-only convergence
-    // criterion; 0 is off. See src/model/feature-convergence.js.
+    // criterion; 0 is off. See src/af3/feature-convergence.js.
     recycleTolerance: Number(option(args, "recycle-tolerance", "0")),
     mode: option(args, "mode", "diffusion"),
     // 🔴 THE MSA DEPTH THE MODEL WAS CONFIGURED WITH, WHICH IS NOT 1024 FOR

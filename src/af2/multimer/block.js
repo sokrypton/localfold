@@ -1,0 +1,1070 @@
+/*
+ * THE AF2-MULTIMER GRAPH, being built alongside the monomer one rather than on
+ * top of it.
+ *
+ * 🔴 THIS IS A COPY ON PURPOSE, AND IT IS TEMPORARY. The end state is one graph
+ * - multimer's, with monomer as its single-chain case, which is where
+ * ColabDesign2's merge landed (../ColabDesign2/colabdesign2/af2/MERGE_NOTES.md).
+ * But the changes that get there touch the pair embedder's shader, and that
+ * shader is on the monomer path too: a mistake in it would break a fold that
+ * works today, silently, on a machine whose GPU tests cannot run.
+ *
+ * So the work happens here until the multimer graph reproduces the monomer one
+ * with its switch off. Then these files replace src/af2/evoformer/, and this notice
+ * goes with them.
+ *
+ * Everything not listed below is imported from src/af2/evoformer/ unchanged - the
+ * two graphs genuinely share their attention, triangle, transition and
+ * outer-product-mean kernels.
+ *
+ * WHAT DIFFERS HERE: the evoformer block, with the outer product mean able to run first.
+ */
+import {
+  ATTENTION_NORMALIZE_SHADER,
+  attentionOutputTileColumns,
+  attentionProjectTileColumns,
+  attentionProjectTileRows,
+  attentionOutputTileRows,
+  createAttentionPairBiasShader,
+  selectAttentionProjectKernel,
+  selectAttentionOutputKernel,
+  createAttentionNormParameters,
+  createAttentionParameters,
+  attentionPackOrder,
+  packAttentionWeights,
+  buildAttentionFlashKernel,
+  selectAttentionFlashKernel,
+
+} from "../../kernels/attention.js";
+import {
+  attentionOutputMatrixDispatch, attentionProjectMatrixConfig,
+  attentionProjectMatrixDispatch, attentionProjectMatrixFits,
+  createAttentionOutputMatrixShader, createAttentionProjectMatrixShader,
+} from "../../kernels/attention-project-matrix.js";
+import {
+  createOuterProductMeanParameters,
+  OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER,
+  OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER,
+  OUTER_PRODUCT_MEAN_FINALIZE_SHADER,
+  createOuterProductMeanContractShader,
+  outerProductMeanTileCapacity,
+  createOuterProductMeanProjectOutputShader,
+  OUTER_PRODUCT_MEAN_NORMALIZE_SHADER,
+  OUTER_PRODUCT_MEAN_PROJECT_SHADER,
+  opmProjectOutputPairs,
+  opmContractPrecision,
+  opmProjectTileRows,
+  opmProjectTileColumns,
+  packOuterProductMeanWeights,
+  OUTER_PRODUCT_MEAN_PACK_ORDER,
+  useOuterFirstContraction,
+  outerFirstLimitBytes,
+  outerFirstPairBlocks,
+
+} from "../../kernels/outer-product-mean.js";
+import {
+  createTransitionNormalizeParameters,
+  createTransitionShaders,
+  chooseLinearKernel,
+  linearKernelRows,
+  linearKernelColumns,
+  linearTileColumns,
+  linearTileRows,
+  packTransitionWeights,
+  TRANSITION_PACK_ORDER,
+  transitionChunkRows,
+  TRANSITION_TILE_ROWS,
+
+} from "../../kernels/transition.js";
+import { SOURCES } from "../../bundles/alphafold-fixture.js";
+import { WebGpuExecution } from "../../runtime/execution.js";
+import { shapedKnob } from "../../runtime/device-profile.js";
+import {
+  GLOBAL_ATTENTION_FLASH_SHADER, GLOBAL_ATTENTION_KV_SHADER,
+  createGlobalAttentionOutputShader, createGlobalAttentionQueryShader, staged,
+} from "../evoformer/block.js";
+import { deviceTuning } from "../../runtime/device-profile.js";
+import { LINEAR_GRID_WIDTH, createTriangleShaders } from "../../kernels/triangle/shaders.js";
+import { shaderSourceSet } from "../../runtime/shader-source-cache.js";
+import {
+  createTriangleContractMatrixShader, createTriangleProjectMatrixShader,
+  createTriangleProjectOutMatrixShaders, triangleContractMatrixDispatch,
+  triangleProjectMatrixConfig, triangleProjectMatrixDispatch, triangleProjectMatrixFits,
+  triangleProjectOutMatrixDispatch, TRIANGLE_PROJECT_MATRIX_GEOMETRY,
+} from "../../kernels/triangle/project-matrix.js";
+
+import { packWeights as packTriangleWeights, trianglePackOrder }
+  from "../../kernels/triangle/weights.js";
+
+// 🔴 THE GLOBAL ATTENTION KERNELS COME FROM THE EVOFORMER, AND USED TO BE
+// COPIED. This file held its own GLOBAL_ATTENTION_COMMON, _KV_SHADER and
+// _FLASH_SHADER, byte-identical in CODE to the monomer's and different in
+// COMMENTS - and registered them under the monomer's keys. A multimer fold
+// reaches both, so the second registration hit
+// `WebGPU pipeline cache key collision for block:global-attention:kv`, the
+// check doing exactly its job: one key, two texts. Matching the comments
+// would have silenced it and left the next edit to re-break it.
+
+// 🔴 THE GLOBAL ATTENTION'S QUERY AND OUTPUT KERNELS COME FROM THE MONOMER'S
+// FILE, because they were a verbatim copy of it and both had the same fault:
+// each recomputed a per-column or per-row reduction once for every head or
+// output channel that wanted it. AGENTS.md's warning is that a change threaded
+// through one of these two files and not the other is a bug only a multimer
+// fold can see - and this pair had already been copied once, so the copy is
+// gone rather than fixed twice.
+function uniform(execution, label, data) {
+  return execution.upload(label, data, GPUBufferUsage.UNIFORM);
+}
+
+async function encodeTransition(
+  execution,
+  encoder,
+  source,
+  rows,
+  channels,
+  weightsValue,
+  label,
+  residualTarget,
+) {
+  const hiddenChannels = weightsValue.firstBias.length;
+  const descriptor = {
+    activations: new Float32Array(0), rows, channels, hiddenChannels, weights: weightsValue,
+  };
+  // 🔴 THE TILE IS PART OF THE CACHE KEY, because it is part of the shader. The
+  // deep MSA transitions want the wide tile and a 59-residue structure module
+  // wants the narrow one, and a key that named neither would hand the second
+  // shape the first shape's pipeline - dispatched with the wrong column stride,
+  // which leaves columns unprojected and reads as a speedup.
+  // 🔴 THE TILE AND THE PRECISION ARE ONE CHOICE - see chooseLinearKernel.
+  const { tile, precision, weightPrecision, matrix } = chooseLinearKernel({
+    rows,
+    columns: Math.max(channels, hiddenChannels),
+    inner: Math.min(channels, hiddenChannels),
+    device: execution.device,
+  });
+  // Packed once and left on the device; see uploadResident. The monomer's twin
+  // of this function does the same - see the note at encodeAttention above.
+  const { weights, offsets: packedOffsets } = await execution.uploadResidentPacked(
+    `${label}.weights`, descriptor.weights,
+    () => packTransitionWeights(descriptor, weightPrecision), weightPrecision,
+    { sources: descriptor.weights[SOURCES], order: TRANSITION_PACK_ORDER,
+      precision: weightPrecision });
+  // The geometry is part of the shader, so it is part of the key - a matrix
+  // pipeline handed to a vector dispatch is the corruption the note below is
+  // about.
+  const geometryKey = matrix
+    ? `m${matrix.blockRows}x${matrix.blockColumns}x${matrix.blockInner}`
+      + `x${matrix.subgroupRows}x${matrix.subgroupColumns}${matrix.vectorStaging ? "v" : ""}`
+    : "t";
+  // 🔴 THE GRID IS THE CHOSEN KERNEL'S, NOT THE TILE'S. The matrix path owns a
+  // 128x128 region per workgroup and has no lane tile at all, so reading the
+  // grid off `tile` would dispatch a 128-wide kernel four times per 32 columns
+  // - which recomputes rather than corrupts, and so reads as a slowdown with
+  // every checker still passing. Same mistake as the row count below.
+  const tileColumns = linearKernelColumns({ tile, matrix });
+  // 🔴 AND THE ROW COUNT IS THE TILE'S TOO. This was TRANSITION_TILE_ROWS, a
+  // module constant equal to LINEAR_TILE's 32 - safe only because both shipped
+  // tiles had 32 rows, which the comment beside it said outright. A taller tile
+  // under that constant is dispatched ceil(rows/32) times and recomputes its own
+  // rows: correct, and redundant by the ratio. It measured as a 3.2x regression
+  // on the transitions before this line existed. See docs/A100.md.
+  const tileRows = linearKernelRows({ tile, matrix });
+  // Generated once per device, not once a block a recycle; see
+  // src/runtime/shader-source-cache.js and the monomer path's note.
+  const shaders = shaderSourceSet(execution.device,
+    `multimer:transition:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`
+    + `:${descriptor.rows}:${descriptor.channels}:${descriptor.hiddenChannels}`
+    + `:${descriptor.epsilon}:${JSON.stringify(packedOffsets)}`,
+    () => createTransitionShaders(
+      descriptor, packedOffsets, tile, precision, weightPrecision, "f32", matrix ?? null));
+  // 🔴 THE RESIDUAL SHADER IS THE LAST OF FOUR, NOT OF THREE. createTransitionShaders
+  // grew a separate FIRST pass when the hidden activation learned to be packed,
+  // and this path still asked for index 2 - which is now the plain second pass.
+  // It would have stored where it should have accumulated: a transition whose
+  // residual silently vanishes, with every shape still agreeing. The monomer
+  // path packs its hidden activation and this one does not yet, so all four
+  // shaders here are the f32 ones.
+  const [normalize, linear, linearResidual] = await Promise.all([
+    execution.pipelines.get(`block:transition:normalize:${weightPrecision}`, shaders[0]),
+    execution.pipelines.get(
+      `block:transition:linear:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`, shaders[1]),
+    execution.pipelines.get(
+      `block:transition:linear-residual:${precision}:${weightPrecision}:${tileColumns}:${geometryKey}`,
+      shaders[3]),
+  ]);
+  // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
+  // operation's PIPELINES built and nothing encoded - see Execution.warm, and
+  // the 95 compiles AF2's first fold used to serialise behind its own progress.
+  // Everything above is pure derivation plus the resident weight upload, which
+  // is cached and needed either way; everything below touches the encoder.
+  if (execution.warming) return undefined;
+
+  const output = residualTarget ?? execution.allocate(`${label}.output`, rows * channels);
+  // ...HOW MANY ROWS FIT IN ONE BINDING. Returns `rows` whenever everything
+  // already binds, which is every short input, so the single-dispatch path
+  // below is byte for byte the one that was there before chunking existed.
+  const chunkRows = transitionChunkRows(
+    rows, channels, hiddenChannels, execution.transitionBufferLimit,
+    execution.device.limits.minStorageBufferOffsetAlignment,
+    tileRows,
+    deviceTuning(execution.device).transitionChunkBytes ?? undefined,
+  );
+
+  if (chunkRows === rows) {
+    const normalizeParams = uniform(execution, `${label}.normalize-parameters`,
+      createTransitionNormalizeParameters(descriptor, packedOffsets));
+    const firstParams = uniform(execution, `${label}.first-parameters`, new Uint32Array([
+      rows, channels, hiddenChannels, packedOffsets[2], packedOffsets[3], 1, 0, 0,
+    ]));
+    const secondParams = uniform(execution, `${label}.second-parameters`, new Uint32Array([
+      rows, hiddenChannels, channels, packedOffsets[4], packedOffsets[5], 0, 0, 0,
+    ]));
+    const normalized = execution.allocate(`${label}.normalized`, rows * channels);
+    const hidden = execution.allocate(`${label}.hidden`, rows * hiddenChannels);
+    const transitionNormGrid = execution.rowGrid(rows);
+    execution.dispatch(encoder, normalize, [source, weights, normalizeParams, normalized],
+      transitionNormGrid[0], transitionNormGrid[1], 1, `${label}.normalize`);
+    execution.dispatch(encoder, linear, [normalized, weights, firstParams, hidden],
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(rows / tileRows), 1,
+      `${label}.first`);
+    execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
+      [hidden, weights, secondParams, output],
+      Math.ceil(channels / tileColumns), Math.ceil(rows / tileRows), 1,
+      `${label}.second`);
+    return output;
+  }
+
+  // 🔴 ONE SCRATCH PAIR FOR THE WHOLE LOOP, viewed per chunk rather than
+  // reallocated. The scratch is sized for a chunk, and what changes each time
+  // round is which rows of the SOURCE and the OUTPUT are bound - so the big
+  // tensors are never bound whole and never need to be bindable whole.
+  const normalized = execution.allocate(`${label}.normalized-chunk`, chunkRows * channels);
+  const hidden = execution.allocate(`${label}.hidden-chunk`, chunkRows * hiddenChannels);
+  for (let rowOffset = 0; rowOffset < rows; rowOffset += chunkRows) {
+    const count = Math.min(chunkRows, rows - rowOffset);
+    // ...the row count in the uniforms is the CHUNK's, not the tensor's: the
+    // shaders bound-check against it, and the last chunk is usually short.
+    const chunkDescriptor = { ...descriptor, rows: count };
+    const normalizeParams = uniform(execution, `${label}.normalize-parameters-${rowOffset}`,
+      createTransitionNormalizeParameters(chunkDescriptor, packedOffsets));
+    const firstParams = uniform(execution, `${label}.first-parameters-${rowOffset}`, new Uint32Array([
+      count, channels, hiddenChannels, packedOffsets[2], packedOffsets[3], 1, 0, 0,
+    ]));
+    const secondParams = uniform(execution, `${label}.second-parameters-${rowOffset}`, new Uint32Array([
+      count, hiddenChannels, channels, packedOffsets[4], packedOffsets[5], 0, 0, 0,
+    ]));
+    const sourceChunk = execution.view(source, rowOffset * channels, count * channels);
+    const outputChunk = execution.view(output, rowOffset * channels, count * channels);
+    const normalizedChunk = execution.view(normalized, 0, count * channels);
+    const hiddenChunk = execution.view(hidden, 0, count * hiddenChannels);
+    const chunkNormGrid = execution.rowGrid(count);
+    execution.dispatch(encoder, normalize, [sourceChunk, weights, normalizeParams, normalizedChunk],
+      chunkNormGrid[0], chunkNormGrid[1], 1, `${label}.normalize-${rowOffset}`);
+    execution.dispatch(encoder, linear, [normalizedChunk, weights, firstParams, hiddenChunk],
+      Math.ceil(hiddenChannels / tileColumns), Math.ceil(count / tileRows), 1,
+      `${label}.first-${rowOffset}`);
+    execution.dispatch(encoder, residualTarget === undefined ? linear : linearResidual,
+      [hiddenChunk, weights, secondParams, outputChunk],
+      Math.ceil(channels / tileColumns), Math.ceil(count / tileRows), 1,
+      `${label}.second-${rowOffset}`);
+  }
+  return output;
+}
+
+async function encodeAttention(
+  execution,
+  encoder,
+  options,
+) {
+  const descriptor = {
+    activations: new Float32Array(0), mask: new Float32Array(0), batch: options.batch,
+    queryLength: options.queries, channels: options.channels, heads: options.heads,
+    transpose: options.transpose, weights: options.weights,
+    ...(options.pairBias === undefined ? {} : { pairBias: options.pairBias }),
+  };
+  // 🔴 THE SAME THREE THINGS THE MONOMER'S BLOCK GOT, and this file is why they
+  // had to be done twice: src/af2/evoformer/block.js and this one share every
+  // SHADER and diverge in the dispatch, which docs/AF2.md records as the hazard
+  // in the other direction. A win wired into one of them is a win the other
+  // does not have - measured here as 4317 ms against the monomer's equivalent.
+  //
+  // Packed once and left on the device; see uploadResident.
+  const { weights, offsets: packedOffsets } = await execution.uploadResidentPacked(
+    `${options.label}.weights`, descriptor.weights,
+    () => packAttentionWeights(descriptor), "",
+    { order: attentionPackOrder(descriptor, (holder) => holder?.[SOURCES]),
+      precision: "f32" });
+  // 🔴 BUILT SEPARATELY SO A REFUSED SUBGROUP PIPELINE CAN FALL BACK. See
+  // buildAttentionFlashKernel: a device can carry both subgroup features and
+  // still reject `@subgroup_size(32)`, and inside a Promise.all that rejection
+  // is just a failed fold.
+  const built = await buildAttentionFlashKernel(
+    execution, execution.device, options.channels / options.heads);
+  const flashKernel = built.kernel;
+  const flash = built.pipeline;
+  // 🔴 THE PROJECTION'S TILE TRAVELS WITH ITS SHADER, because the dispatch
+  // below divides by it and the two shapes differ by precision - see
+  // selectAttentionProjectKernel.
+  const projectKernel = selectAttentionProjectKernel(
+    execution.device, options.projectPrecision ?? "auto");
+  const outputKernel = selectAttentionOutputKernel(
+    execution.device, options.residualTarget !== undefined,
+    options.outputPrecision ?? "auto");
+  // 🔴 AND THE MULTIMER'S TARGETS ARE ALL f32, which is the SIMPLER of the two
+  // matrix-projection paths - the monomer's flash kernel reads q/k/v/gate
+  // packed and needs the eight-column group that owns both halves of a word.
+  // Here `projectedStorage` never became a thing, so the four-column group and
+  // the plain store are what run.
+  const projectMatrix = attentionProjectMatrixConfig(execution.device);
+  const projectMatrixFits = projectMatrix !== false
+    && attentionProjectMatrixFits(projectMatrix,
+      execution.device.limits?.maxComputeWorkgroupStorageSize ?? 49152);
+  const [normalize, project, pairProject, outputProject] = await Promise.all([
+    execution.pipelines.get("block:attention:normalize", ATTENTION_NORMALIZE_SHADER),
+    projectMatrixFits
+      ? execution.shaderPipeline(
+        `block:attention:project-matrix:${options.channels}:${options.heads}`
+        + `:f32f32:${JSON.stringify(projectMatrix)}`,
+        () => createAttentionProjectMatrixShader(
+          { channels: options.channels, heads: options.heads },
+          { source: "f32", weight: "f32", output: "f32" }, projectMatrix))
+      : execution.pipelines.get(projectKernel.cacheKey, projectKernel.shader),
+    // ...the HEAD COUNT is in the key because the shader unrolls it; see
+    // createAttentionPairBiasShader.
+    execution.shaderPipeline(`block:attention:pair-bias:${options.heads}`,
+      () => createAttentionPairBiasShader("f32", options.heads)),
+    projectMatrixFits
+      ? execution.shaderPipeline(
+        `block:attention:output-matrix:${options.channels}:f32`
+        + `:${options.transpose === true}:${options.residualTarget !== undefined}`
+        + `:${JSON.stringify(projectMatrix)}`,
+        () => createAttentionOutputMatrixShader(
+          { channels: options.channels, transpose: options.transpose === true },
+          { source: "f32", weight: "f32" }, projectMatrix,
+          options.residualTarget !== undefined))
+      : execution.pipelines.get(outputKernel.cacheKey, outputKernel.shader),
+  ]);
+  // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
+  // operation's PIPELINES built and nothing encoded - see Execution.warm, and
+  // the 95 compiles AF2's first fold used to serialise behind its own progress.
+  // Everything above is pure derivation plus the resident weight upload, which
+  // is cached and needed either way; everything below touches the encoder.
+  if (execution.warming) return undefined;
+  const rows = options.batch * options.queries;
+  const elements = rows * options.channels;
+  const params = uniform(execution, `${options.label}.parameters`,
+    createAttentionParameters(descriptor, packedOffsets));
+  const projectMatrixParams = !projectMatrixFits ? undefined
+    : uniform(execution, `${options.label}.project-matrix-parameters`, new Uint32Array([
+      rows, options.channels, 4 * options.channels,
+      packedOffsets[2], packedOffsets[6], 0, 0, 0,
+    ]));
+  const outputMatrixParams = !projectMatrixFits ? undefined
+    : uniform(execution, `${options.label}.output-matrix-parameters`, new Uint32Array([
+      rows, options.channels, options.channels,
+      packedOffsets[7], packedOffsets[8], 0, options.queries, options.batch,
+    ]));
+  const normParams = uniform(execution, `${options.label}.norm-parameters`, createAttentionNormParameters(
+    rows, options.channels, packedOffsets[0], packedOffsets[1], options.transpose,
+    options.batch, options.queries, 1e-5,
+  ));
+  const normalized = execution.allocate(`${options.label}.normalized`, elements);
+  const query = execution.allocate(`${options.label}.query`, elements);
+  const key = execution.allocate(`${options.label}.key`, elements);
+  const value = execution.allocate(`${options.label}.value`, elements);
+  const gate = execution.allocate(`${options.label}.gate`, elements);
+  const weighted = execution.allocate(`${options.label}.weighted`, elements);
+  const output = options.residualTarget ?? execution.allocate(`${options.label}.output`, elements);
+  const attentionNormGrid = execution.rowGrid(rows);
+  execution.dispatch(encoder, normalize, [options.source, weights, normParams, normalized],
+    attentionNormGrid[0], attentionNormGrid[1], 1,
+    `${options.label}.normalize`);
+
+  let normalizedPair = normalized;
+  if (options.pairBias?.source === "separate") {
+    if (options.pairSource === undefined) throw new Error("separate attention pair bias requires a GPU source");
+    normalizedPair = execution.allocate(
+      `${options.label}.pair-normalized`, options.queries * options.queries * options.pairBias.channels,
+    );
+    const pairNormParams = uniform(execution, `${options.label}.pair-norm-parameters`,
+      createAttentionNormParameters(
+        options.queries * options.queries, options.pairBias.channels, packedOffsets[9], packedOffsets[10],
+        false, 1, options.queries * options.queries, 1e-5,
+      ));
+    const pairNormGrid = execution.rowGrid(options.queries * options.queries);
+    execution.dispatch(encoder, normalize, [options.pairSource, weights, pairNormParams, normalizedPair],
+      pairNormGrid[0], pairNormGrid[1], 1, `${options.label}.pair-normalize`);
+  }
+  const pairBiasElements = options.pairBias === undefined ? 1 : options.heads * options.queries * options.queries;
+  const pairBias = execution.allocate(`${options.label}.pair-bias`, pairBiasElements);
+  if (options.pairBias !== undefined) {
+    const grid = execution.linearGrid(pairBiasElements);
+    execution.dispatch(encoder, pairProject, [normalizedPair, weights, params, pairBias],
+      grid[0], grid[1], 1, `${options.label}.pair-bias`);
+  }
+  if (projectMatrixFits) {
+    const dispatch = attentionProjectMatrixDispatch(
+      { rows, channels: options.channels }, projectMatrix);
+    execution.dispatch(encoder, project,
+      [normalized, weights, projectMatrixParams, query, key, value, gate],
+      dispatch.x, dispatch.y, 1, `${options.label}.project`);
+  } else {
+    execution.dispatch(encoder, project, [normalized, weights, params, query, key, value, gate],
+      Math.ceil(options.channels / attentionProjectTileColumns(projectKernel.tile)),
+      Math.ceil(rows / attentionProjectTileRows(projectKernel.tile)), 1,
+      `${options.label}.project`);
+  }
+  execution.dispatch(encoder, flash, [query, key, value, gate, options.mask, pairBias, params, weighted],
+    Math.ceil(options.queries / flashKernel.queryTile),
+    options.batch, options.heads, `${options.label}.flash`);
+  if (projectMatrixFits) {
+    const dispatch = attentionOutputMatrixDispatch(
+      { rows, channels: options.channels }, projectMatrix);
+    execution.dispatch(encoder, outputProject,
+      [weighted, weights, outputMatrixParams, output],
+      dispatch.x, dispatch.y, 1, `${options.label}.output`);
+  } else {
+    execution.dispatch(encoder, outputProject, [weighted, weights, params, output],
+      Math.ceil(options.channels / attentionOutputTileColumns(outputKernel.tile)),
+      Math.ceil(rows / attentionOutputTileRows(outputKernel.tile)), 1,
+      `${options.label}.output`);
+  }
+  return output;
+}
+
+async function encodeGlobalAttention(
+  execution,
+  encoder,
+  source,
+  mask,
+  shape,
+  weightsValue,
+  label,
+  residualTarget,
+) {
+  const w = weightsValue;
+  const tensors = [w.queryNormScale, w.queryNormOffset, w.queryWeight, w.keyWeight, w.valueWeight,
+    w.gatingWeight, w.gatingBias, w.outputWeight, w.outputBias];
+  const offsets = [];
+  let size = 0;
+  for (const tensor of tensors) { offsets.push(size); size += tensor.length; }
+  const packed = new Float32Array(size);
+  tensors.forEach((tensor, index) => packed.set(tensor, offsets[index]));
+  const headDim = w.gatingBias.length / w.heads;
+  const params = new Uint32Array([
+    shape.length, shape.sequences, shape.cM, w.heads, headDim,
+    offsets[2], offsets[3], offsets[4], offsets[5], offsets[6], offsets[7], offsets[8],
+  ]);
+  const [normalize, kvPipeline, queryPipeline, flashPipeline, outputPipeline] = await Promise.all([
+    execution.pipelines.get("block:global-attention:normalize", ATTENTION_NORMALIZE_SHADER),
+    execution.pipelines.get("block:global-attention:kv", GLOBAL_ATTENTION_KV_SHADER),
+    execution.pipelines.get(`block:global-attention:query:${shape.cM}:${w.heads}:${headDim}`,
+      createGlobalAttentionQueryShader(shape.cM, w.heads, headDim)),
+    execution.pipelines.get("block:global-attention:flash", GLOBAL_ATTENTION_FLASH_SHADER),
+    execution.pipelines.get(
+      `block:global-attention:output${residualTarget === undefined ? "" : "-residual"}`
+        + `:${shape.cM}:${w.heads}:${headDim}`,
+      createGlobalAttentionOutputShader(shape.cM, w.heads, headDim, residualTarget !== undefined),
+    ),
+  ]);
+  // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
+  // operation's PIPELINES built and nothing encoded - see Execution.warm, and
+  // the 95 compiles AF2's first fold used to serialise behind its own progress.
+  // Everything above is pure derivation plus the resident weight upload, which
+  // is cached and needed either way; everything below touches the encoder.
+  if (execution.warming) return undefined;
+  const weights = execution.upload(`${label}.weights`, packed);
+  const parameters = uniform(execution, `${label}.parameters`, params);
+  const normParameters = uniform(execution, `${label}.norm-parameters`, createAttentionNormParameters(
+    shape.length * shape.sequences, shape.cM, offsets[0], offsets[1], true,
+    shape.length, shape.sequences, 1e-5,
+  ));
+  const normalized = execution.allocate(`${label}.normalized`, shape.length * shape.sequences * shape.cM);
+  const keys = execution.allocate(`${label}.keys`, shape.length * shape.sequences * headDim);
+  const values = execution.allocate(`${label}.values`, shape.length * shape.sequences * headDim);
+  const query = execution.allocate(`${label}.query`, shape.length * w.heads * headDim);
+  const attended = execution.allocate(`${label}.attended`, shape.length * w.heads * headDim);
+  const output = residualTarget ?? execution.allocate(`${label}.output`, shape.sequences * shape.length * shape.cM);
+  const globalNormGrid = execution.rowGrid(shape.length * shape.sequences);
+  execution.dispatch(encoder, normalize, [source, weights, normParameters, normalized],
+    globalNormGrid[0], globalNormGrid[1], 1, `${label}.normalize`);
+  let grid = execution.linearGrid(shape.length * shape.sequences * headDim);
+  execution.dispatch(encoder, kvPipeline, [normalized, weights, parameters, keys, values],
+    grid[0], grid[1], 1, `${label}.kv`);
+  // ...ONE WORKGROUP A COLUMN, and one a row for the output; see the two
+  // generators in src/af2/evoformer/block.js.
+  execution.dispatch(encoder, queryPipeline, [normalized, mask, weights, parameters, query],
+    shape.length, 1, 1, `${label}.query`);
+  execution.dispatch(encoder, flashPipeline, [query, keys, values, mask, parameters, attended],
+    shape.length, w.heads, 1, `${label}.flash`);
+  const outputGrid = execution.rowGrid(shape.sequences * shape.length);
+  execution.dispatch(encoder, outputPipeline, [normalized, attended, weights, parameters, output],
+    outputGrid[0], outputGrid[1], 1, `${label}.output`);
+  return output;
+}
+
+async function encodeOuterProductMean(
+  execution,
+  encoder,
+  msa,
+  msaMask,
+  input,
+  weightsValue,
+  residualTarget,
+) {
+  const descriptor = {
+    activations: new Float32Array(0), mask: new Float32Array(0), sequences: input.sequences,
+    length: input.length, cM: input.cM, cOuter: input.cOuter, cZ: input.cZ,
+    weights: weightsValue,
+  };
+  // Packed once and left on the device, and DECODED there - the outer product
+  // mean's eight tensors are 22 ms of a first fold across the two stacks and
+  // not one of them is reshaped, so the pack is the order and nothing else.
+  const { weights, offsets: packedOffsets } = await execution.uploadResidentPacked(
+    "opm.weights", descriptor.weights, () => packOuterProductMeanWeights(descriptor), "",
+    { sources: descriptor.weights[SOURCES], order: OUTER_PRODUCT_MEAN_PACK_ORDER,
+      precision: "f32" });
+  // ...against what THIS device will bind, not a 64 MiB constant; see the
+  // note in outer-product-mean.js. Worth 6.8x on a block at 400 residues.
+  const outerFirst = useOuterFirstContraction(
+    descriptor, outerFirstLimitBytes(execution.device));
+  const outputPairs = opmProjectOutputPairs(execution.device);
+  const contractPrecision = opmContractPrecision(execution.device);
+  const [normalize, project, intermediatePipeline, accumulatePipeline, finalizePipeline,
+    contractPipeline, projectOutputPipeline] = await Promise.all([
+    execution.pipelines.get("block:opm:normalize", OUTER_PRODUCT_MEAN_NORMALIZE_SHADER),
+    execution.pipelines.get("block:opm:project", OUTER_PRODUCT_MEAN_PROJECT_SHADER),
+    execution.pipelines.get("block:opm:tile-intermediate", OUTER_PRODUCT_MEAN_TILE_INTERMEDIATE_SHADER),
+    execution.pipelines.get("block:opm:tile-accumulate", OUTER_PRODUCT_MEAN_TILE_ACCUMULATE_SHADER),
+    execution.pipelines.get("block:opm:finalize", OUTER_PRODUCT_MEAN_FINALIZE_SHADER),
+    execution.pipelines.get(`block:opm:contract:${input.cOuter}:${contractPrecision}`,
+      createOuterProductMeanContractShader(input.cOuter, contractPrecision)),
+    execution.pipelines.get(
+      outerFirst && residualTarget !== undefined
+        ? `block:opm:project-output-residual:${input.cOuter}:${outputPairs}`
+        : `block:opm:project-output:${input.cOuter}:${outputPairs}`,
+      createOuterProductMeanProjectOutputShader(
+        input.cOuter, outerFirst && residualTarget !== undefined, outputPairs),
+    ),
+  ]);
+  // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
+  // operation's PIPELINES built and nothing encoded - see Execution.warm.
+  if (execution.warming) return undefined;
+  const rows = input.sequences * input.length;
+  const pairElements = input.length * input.length * input.cZ;
+
+  const params = uniform(execution, "opm.parameters", createOuterProductMeanParameters(descriptor, packedOffsets));
+  const normalized = execution.allocate("opm.normalized", rows * input.cM);
+  const left = execution.allocate("opm.left", rows * input.cOuter);
+  const right = execution.allocate("opm.right", rows * input.cOuter);
+  const tileCapacity = outerProductMeanTileCapacity(
+    input, execution.device.limits.maxStorageBufferBindingSize);
+  // 🔴 A BLOCK OF PAIRS, NOT ALL OF THEM. The intermediate is sized by
+  // outerFirstPairBlocks and no longer by the protein - which is what lets the
+  // fast path run at 825 residues on a device that cannot bind its 2.79 GB.
+  const pairBlocks = outerFirstPairBlocks(
+    descriptor, outerFirstLimitBytes(execution.device),
+    deviceTuning(execution.device).opmPairBlockBytes);
+  const intermediateElements = outerFirst
+    ? pairBlocks[0][1] * input.cOuter * input.cOuter
+    : tileCapacity * input.length * input.cOuter * input.cZ;
+  const intermediate = execution.allocate("opm.intermediate", intermediateElements);
+  const output = outerFirst && residualTarget !== undefined ? residualTarget
+    : execution.allocate("opm.output", pairElements, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const opmNormGrid = execution.rowGrid(rows);
+  execution.dispatch(encoder, normalize, [msa, weights, params, normalized],
+    opmNormGrid[0], opmNormGrid[1], 1, "opm.normalize");
+  // 🔴 A TILE GRID, NOT A THREAD GRID. The projection used to give one thread
+  // each (row, channel); it now gives one WORKGROUP a tile of both, so the
+  // dispatch counts tiles. Row tiles are folded through x and y for the same
+  // reason every other row grid here is - a row per sequence and residue passes
+  // 32,768 at any real MSA depth - and the channel tile is z.
+  const projectRowTiles = Math.ceil(rows / opmProjectTileRows());
+  let grid = execution.rowGrid(projectRowTiles);
+  execution.dispatch(encoder, project, [normalized, msaMask, weights, params, left, right],
+    grid[0], grid[1], Math.ceil(input.cOuter / opmProjectTileColumns()),
+    "opm.project");
+  const outputGrid = execution.linearGrid(pairElements);
+  if (outerFirst) {
+    for (const [offset, count] of pairBlocks) {
+      const blk = uniform(execution, `opm.pair-block-${offset}`,
+        new Uint32Array([offset, count, 0, 0]));
+      // ...both are one workgroup per PAIR; see outer-product-mean.js.
+      const pairGrid = execution.linearGrid(count * 64);
+      execution.dispatch(encoder, contractPipeline, [left, right, params, intermediate, blk],
+        pairGrid[0], pairGrid[1], 1, "opm.contract");
+      // ...its OWN grid, because it carries several pairs a workgroup where the
+      // contraction carries one; they shared `pairGrid` when both were one.
+      const projectOutputGrid = execution.linearGrid(
+        Math.ceil(count / outputPairs) * 64);
+      execution.dispatch(encoder, projectOutputPipeline,
+        [intermediate, msaMask, weights, params, output, blk],
+        projectOutputGrid[0], projectOutputGrid[1], 1, "opm.project-output");
+    }
+  } else {
+    execution.endComputePass(encoder);
+    encoder.clearBuffer(output.allocation.buffer);
+    for (let offset = 0; offset < input.sequences; offset += tileCapacity) {
+      const count = Math.min(tileCapacity, input.sequences - offset);
+      const tileParams = uniform(execution, `opm.tile-${offset}`, new Uint32Array([offset, count, 0, 0]));
+      grid = execution.linearGrid(count * input.length * input.cOuter * input.cZ);
+      execution.dispatch(encoder, intermediatePipeline, [left, weights, params, tileParams, intermediate],
+        grid[0], grid[1], 1, `opm.intermediate-${offset}`);
+      execution.dispatch(encoder, accumulatePipeline,
+        [right, intermediate, params, tileParams, output],
+        outputGrid[0], outputGrid[1], 1, `opm.accumulate-${offset}`);
+    }
+    execution.dispatch(encoder, finalizePipeline, [msaMask, weights, params, output],
+      outputGrid[0], outputGrid[1], 1, "opm.finalize");
+  }
+  return output;
+}
+
+async function encodeTriangleMultiplication(
+  execution,
+  encoder,
+  pair,
+  pairMask,
+  input,
+  weightsValue,
+  direction,
+  residualTarget,
+) {
+  const shape = { length: input.length, cZ: input.cZ, cHidden: input.triangleHidden };
+  // 🔴 THE SAME THREE MATRIX KERNELS THE MONOMER'S TRIANGLE TAKES. src/kernels/triangle/
+  // is one module and this file is the second dispatch of it; see the note at
+  // encodeAttention. Same interleaved pack, same four uniforms, same gate
+  // buffer for the output projection.
+  const triangleMatrix = triangleProjectMatrixConfig(execution.device, input.cZ);
+  const matrixFits = triangleMatrix !== false && triangleProjectMatrixFits(
+    { ...TRIANGLE_PROJECT_MATRIX_GEOMETRY, ...triangleMatrix },
+    execution.device.limits?.maxComputeWorkgroupStorageSize ?? 49152);
+  const layout = matrixFits
+    ? { abLayout: "interleaved", zgLayout: "transposed",
+        cHidden: input.triangleHidden, cZ: input.cZ }
+    : {};
+  // ...and DECODED on the device when the fixture can hand over the codes: this
+  // pack is 87 ms of a first fold across the two stacks' 96 triangle
+  // multiplications, all of it `code * scale` the GPU is idle for. The
+  // interleave and both transposes are the decoder's mapping now; see
+  // trianglePackOrder, where three of them cancel.
+  const { weights, offsets: packedOffsets } = await execution.uploadResidentPacked(
+    `triangle.${direction}.weights`, weightsValue,
+    () => packTriangleWeights(weightsValue, "f32", layout),
+    matrixFits ? "interleaved" : "blocked",
+    { sources: weightsValue[SOURCES], order: trianglePackOrder(layout),
+      precision: "f32", named: true });
+  // 🔴 THE PROJECTION TILE IS THE DEVICE'S, WHICH AF3 HAS ASKED FOR SINCE THE
+  // KNOB EXISTED AND AF2 NEVER DID. It is an occupancy choice - the same two
+  // kernels, the same arithmetic in the same order, relRMS 0 - and this path
+  // was taking src/kernels/triangle/shaders.js's default on every device while the
+  // pairformer beside it took Ampere's 32x32. `undefined` keeps that default,
+  // so a device with no prior is unchanged.
+  const projectTile = shapedKnob(deviceTuning(execution.device).trianglePairProjectTile);
+  const sourceKey = `multimer:triangle:${direction}:${JSON.stringify(shape)}`
+    + `:${JSON.stringify(projectTile ?? null)}:${JSON.stringify(packedOffsets)}`;
+  const shaders = shaderSourceSet(execution.device, sourceKey, () => createTriangleShaders(
+    shape, "f32", packedOffsets, 1e-5, direction, "two-pass", projectTile));
+  // 🔴 THE RESIDUAL FORM IS GENERATED, NOT PATCHED. It used to be a string
+  // replacement on the finished WGSL; when the kernel's writeback was rewritten
+  // the pattern stopped matching, and a replacement that matches nothing throws
+  // nothing - the block would have OVERWRITTEN the pair representation instead
+  // of adding to it, on the shipped AF2 path only.
+  const residualShaders = shaderSourceSet(execution.device, `${sourceKey}:residual`,
+    () => createTriangleShaders(
+      shape, "f32", packedOffsets, 1e-5, direction, "two-pass", shaders.projectTile, true));
+  const pipelineKey = `block:triangle:${direction}:${input.length}:${input.cZ}:${input.triangleHidden}`
+    + `:${shaders.projectTile.rows}x${shaders.projectTile.columns}`;
+  const matrixKey = `${pipelineKey}:matrix:${JSON.stringify(triangleMatrix)}`;
+  const outMatrixSources = matrixFits
+    ? shaderSourceSet(execution.device,
+      `multimer:triangle:out-matrix:${input.cZ}:${input.triangleHidden}`
+      + `:${JSON.stringify(triangleMatrix)}`,
+      () => createTriangleProjectOutMatrixShaders(
+        { cZ: input.cZ, cHidden: input.triangleHidden },
+        { normalized: "f32", hidden: "f32", gate: "f32", weight: "f32" },
+        triangleMatrix))
+    : null;
+  const [normalizeInput, projectAB, contract, normalizeHidden, projectOutput, projectOutGate]
+    = await Promise.all([
+      execution.pipelines.get(`${pipelineKey}:normalize-input`, shaders.normalizeInput),
+      matrixFits
+        ? execution.pipelines.get(`${matrixKey}:project-ab`,
+          createTriangleProjectMatrixShader(
+            { cZ: input.cZ, cHidden: input.triangleHidden },
+            { normalized: "f32", ab: "f32", weight: "f32" }, triangleMatrix))
+        : execution.pipelines.get(`${pipelineKey}:project-ab`, shaders.projectAB),
+      matrixFits
+        ? execution.pipelines.get(`${matrixKey}:contract:${direction}`,
+          createTriangleContractMatrixShader(
+            { length: input.length, channels: input.triangleHidden }, direction,
+            { ab: "f32" }, triangleMatrix))
+        : execution.pipelines.get(`${pipelineKey}:contract`, shaders.contract),
+      execution.pipelines.get(`${pipelineKey}:normalize-hidden`, shaders.normalizeHidden),
+      matrixFits
+        ? execution.pipelines.get(`${matrixKey}:project-out`, outMatrixSources.project)
+        : execution.pipelines.get(
+          `${pipelineKey}:project-output${residualTarget === undefined ? "" : "-residual"}`,
+          residualTarget === undefined ? shaders.projectOutput : residualShaders.projectOutput),
+      matrixFits
+        ? execution.pipelines.get(`${matrixKey}:project-out-gate`, outMatrixSources.gate)
+        : Promise.resolve(null),
+    ]);
+  // 🔴 A WARM STOPS HERE. `execution.warming` means the caller wants this
+  // operation's PIPELINES built and nothing encoded - see Execution.warm, and
+  // the 95 compiles AF2's first fold used to serialise behind its own progress.
+  // Everything above is pure derivation plus the resident weight upload, which
+  // is cached and needed either way; everything below touches the encoder.
+  if (execution.warming) return undefined;
+  const pairs = input.length * input.length;
+  const normalized = execution.allocate(`triangle.${direction}.normalized`, pairs * input.cZ);
+  const a = execution.allocate(`triangle.${direction}.a`, pairs * input.triangleHidden);
+  const b = execution.allocate(`triangle.${direction}.b`, pairs * input.triangleHidden);
+  const contracted = execution.allocate(`triangle.${direction}.contracted`, pairs * input.triangleHidden);
+  const hiddenNormalized = execution.allocate(`triangle.${direction}.hidden-normalized`, pairs * input.triangleHidden);
+  const output = residualTarget ?? execution.allocate(`triangle.${direction}.output`, pairs * input.cZ);
+  const projectParams = !matrixFits ? undefined
+    : uniform(execution, `triangle.${direction}.project-parameters`, new Uint32Array([
+      pairs, input.cZ, 4 * input.triangleHidden,
+      packedOffsets.linearABWeight, packedOffsets.linearABBias, 0, 0, 0,
+    ]));
+  const contractParams = !matrixFits ? undefined
+    : uniform(execution, `triangle.${direction}.contract-parameters`,
+      new Uint32Array([input.length, input.length, input.length, 0, 0, 0, 0, 0]));
+  const outGateParams = !matrixFits ? undefined
+    : uniform(execution, `triangle.${direction}.out-gate-parameters`, new Uint32Array([
+      pairs, input.cZ, input.cZ,
+      packedOffsets.linearGWeight, packedOffsets.linearGBias, 0, 0, 0,
+    ]));
+  const outProjectParams = !matrixFits ? undefined
+    : uniform(execution, `triangle.${direction}.out-project-parameters`, new Uint32Array([
+      pairs, input.triangleHidden, input.cZ,
+      packedOffsets.linearZWeight, packedOffsets.linearZBias, 0, 0, 0,
+    ]));
+  // 🔴 FOLDED OVER x AND y, for the same reason the projection below is folded
+  // over y and z: there are n^2 pair rows and `ceil(pairs / normalizeRows)`
+  // passes 65535 at 825 residues. The kernel reads
+  // `base_row = (group.x + group.y * LINEAR_GRID_WIDTH) * NORMALIZE_ROWS`, and
+  // rowGrid's width is that same 32768.
+  const normalizeGrid = execution.rowGrid(Math.ceil(pairs / shaders.normalizeRows));
+  execution.dispatch(encoder, normalizeInput, [pair, weights, normalized],
+    normalizeGrid[0], normalizeGrid[1], 1,
+    `triangle.${direction}.normalize-input`);
+  let grid = execution.linearGrid(pairs * input.triangleHidden);
+  // ...rows over y AND z: x is the channel tile, so there is nowhere else for
+  // n^2 pair rows to go, and past ~1450 residues the quotient is over the
+  // 65535 a dimension allows. See the note in src/kernels/triangle/shaders.js.
+  const projectWidth = shaders.projectGridWidth ?? LINEAR_GRID_WIDTH;
+  const projectTiles = Math.ceil(pairs / shaders.projectTile.rows);
+  const projectRows = [Math.min(projectTiles, projectWidth),
+                       Math.ceil(projectTiles / projectWidth)];
+  if (matrixFits) {
+    const project = triangleProjectMatrixDispatch(
+      { rows: pairs, cHidden: input.triangleHidden }, triangleMatrix);
+    execution.dispatch(encoder, projectAB,
+      [normalized, weights, projectParams, a, pairMask, b],
+      project.x, project.y, 1, `triangle.${direction}.project`);
+    // a is the LEFT operand outgoing and the RIGHT one incoming; the shader
+    // transposes whichever of the two it has to.
+    const swap = direction === "incoming";
+    const c = triangleContractMatrixDispatch(
+      { length: input.length, channels: input.triangleHidden }, triangleMatrix);
+    execution.dispatch(encoder, contract,
+      [swap ? b : a, swap ? a : b, contractParams, contracted],
+      c.x, c.y, c.z, `triangle.${direction}.contract`);
+  } else {
+    execution.dispatch(encoder, projectAB, [normalized, pairMask, weights, a, b],
+      Math.ceil(input.triangleHidden / shaders.projectTile.columns),
+      projectRows[0], projectRows[1],
+      `triangle.${direction}.project`);
+    execution.dispatch(encoder, contract, [a, b, contracted],
+      Math.ceil(input.length / shaders.contractTile.columns),
+      Math.ceil(input.length / shaders.contractTile.rows),
+      input.triangleHidden, `triangle.${direction}.contract`);
+  }
+  execution.dispatch(encoder, normalizeHidden, [contracted, weights, hiddenNormalized],
+    normalizeGrid[0], normalizeGrid[1], 1, `triangle.${direction}.normalize-hidden`);
+  if (matrixFits) {
+    // The gate is its own pass and the projection reads it; `a` is dead by here
+    // - the contraction was its last reader. The projection always adds into
+    // its target, so a caller with no residual gets a cleared one.
+    if (residualTarget === undefined) encoder.clearBuffer(output.allocation.buffer);
+    const out = triangleProjectOutMatrixDispatch({ rows: pairs, cZ: input.cZ }, triangleMatrix);
+    execution.dispatch(encoder, projectOutGate, [normalized, weights, outGateParams, a],
+      out.x, out.y, 1, `triangle.${direction}.output.gate`);
+    execution.dispatch(encoder, projectOutput,
+      [hiddenNormalized, weights, outProjectParams, output, a],
+      out.x, out.y, 1, `triangle.${direction}.output`);
+  } else {
+    execution.dispatch(encoder, projectOutput, [normalized, hiddenNormalized, weights, output],
+      Math.ceil(input.cZ / shaders.projectTile.columns),
+      projectRows[0], projectRows[1],
+      `triangle.${direction}.output`);
+  }
+  return output;
+}
+
+export async function encodeEvoformerBlock(
+  execution,
+  encoder,
+  input,
+  msa,
+  pair,
+  msaMask,
+  pairMask,
+) {
+  // 🔴 WHERE THE OUTER PRODUCT MEAN SITS IS A PER-MODEL FACT, not a style. AF2
+  // multimer runs it at the TOP of the block, monomer after the MSA transition,
+  // and the weights were trained for their own ordering - so this cannot be
+  // padded around the way a width can. It is the only structural difference
+  // between the two evoformer blocks; everything else here is shared.
+  const outerProductMeanFirst = input.outerProductMeanFirst === true;
+  const outerProductMean = async() => {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, input, input.weights.outerProductMean, pair,
+    );
+    // ...and a warm returns nothing, because it encoded nothing.
+    if (!execution.warming && update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+  };
+  if (outerProductMeanFirst) await outerProductMean();
+
+  const row = input.weights.msaRowAttention;
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: msa, mask: msaMask, pairSource: pair, batch: input.sequences, queries: input.length,
+    channels: input.cM, heads: row.heads, transpose: false, weights: row.attention,
+    pairBias: Object.assign(Object.create(row.pairBias), {
+      source: "separate", activations: new Float32Array(0), channels: input.cZ,
+    }),
+    label: "msa-row-attention", residualTarget: msa,
+  }));
+
+  const column = input.weights.msaColumnAttention;
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: msa, mask: msaMask, batch: input.length, queries: input.sequences,
+    channels: input.cM, heads: column.heads, transpose: true, weights: column.attention,
+    label: "msa-column-attention", residualTarget: msa,
+  }));
+
+  await staged(execution, () => encodeTransition(
+    execution, encoder, msa, input.sequences * input.length, input.cM,
+    input.weights.msaTransition, "msa-transition", msa,
+  ));
+
+  if (!outerProductMeanFirst) await outerProductMean();
+
+  await staged(execution, () => encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
+  ));
+  await staged(execution, () => encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationIncoming, "incoming", pair,
+  ));
+
+  const starting = input.weights.triangleAttentionStarting;
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: pair, mask: pairMask, batch: input.length, queries: input.length,
+    channels: input.cZ, heads: starting.heads, transpose: false, weights: starting.attention,
+    pairBias: Object.assign(Object.create(starting.pairBias), { source: "normalized-input" }),
+    label: "triangle-attention-starting", residualTarget: pair,
+  }));
+
+  const ending = input.weights.triangleAttentionEnding;
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: pair, mask: pairMask, batch: input.length, queries: input.length,
+    channels: input.cZ, heads: ending.heads, transpose: true, weights: ending.attention,
+    pairBias: Object.assign(Object.create(ending.pairBias), { source: "normalized-input" }),
+    label: "triangle-attention-ending", residualTarget: pair,
+  }));
+
+  await staged(execution, () => encodeTransition(
+    execution, encoder, pair, input.length * input.length, input.cZ,
+    input.weights.pairTransition, "pair-transition", pair,
+  ));
+}
+
+export async function encodeEvoformerPairBlock(
+  execution,
+  encoder,
+  shape,
+  weights,
+  msa,
+  pair,
+  msaMask,
+  pairMask,
+) {
+  // ...unless the caller already ran it. AF2-multimer puts the outer product
+  // mean at the TOP of an extra-MSA block, before the row attention, where this
+  // has it after the MSA transition - the monomer order. Lifting it out is the
+  // only way to honour that, since this function owns the pair half of the
+  // block and the MSA half sits above it.
+  if (shape.outerProductMeanDone !== true) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    );
+    // ...and a warm returns nothing, because it encoded nothing.
+    if (!execution.warming && update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
+  await staged(execution, () => encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
+  ));
+  await staged(execution, () => encodeTriangleMultiplication(
+    execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
+  ));
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+    channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
+    weights: weights.triangleAttentionStarting.attention,
+    pairBias: Object.assign(Object.create(weights.triangleAttentionStarting.pairBias),
+      { source: "normalized-input" }),
+    label: "extra.triangle-attention-starting", residualTarget: pair,
+  }));
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+    channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
+    weights: weights.triangleAttentionEnding.attention,
+    pairBias: Object.assign(Object.create(weights.triangleAttentionEnding.pairBias),
+      { source: "normalized-input" }),
+    label: "extra.triangle-attention-ending", residualTarget: pair,
+  }));
+  await staged(execution, () => encodeTransition(
+    execution, encoder, pair, shape.length * shape.length, shape.cZ,
+    weights.pairTransition, "extra.pair-transition", pair,
+  ));
+}
+
+export async function encodeExtraMsaBlock(
+  execution,
+  encoder,
+  shape,
+  weights,
+  msa,
+  pair,
+  msaMask,
+  pairMask,
+) {
+  // 🔴 MULTIMER RUNS THE OUTER PRODUCT MEAN FIRST HERE TOO. Only the main
+  // evoformer honoured the flag before; this stack read it and did nothing,
+  // which left every multimer fold running one of its two stacks in the monomer
+  // order.
+  const outerProductMeanFirst = shape.outerProductMeanFirst === true;
+  if (outerProductMeanFirst) {
+    const update = await encodeOuterProductMean(
+      execution, encoder, msa, msaMask, shape, weights.outerProductMean, pair,
+    );
+    // ...and a warm returns nothing, because it encoded nothing.
+    if (!execution.warming && update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+  }
+
+  const row = weights.msaRowAttention;
+  await staged(execution, () => encodeAttention(execution, encoder, {
+    source: msa, mask: msaMask, pairSource: pair, batch: shape.sequences, queries: shape.length,
+    channels: shape.cM, heads: row.heads, transpose: false, weights: row.attention,
+    pairBias: Object.assign(Object.create(row.pairBias), {
+      source: "separate", activations: new Float32Array(0), channels: shape.cZ,
+    }),
+    label: "extra.msa-row-attention", residualTarget: msa,
+  }));
+  await staged(execution, () => encodeGlobalAttention(
+    execution, encoder, msa, msaMask, shape, weights.msaColumnGlobalAttention,
+    "extra.msa-column-global-attention", msa,
+  ));
+  await staged(execution, () => encodeTransition(
+    execution, encoder, msa, shape.sequences * shape.length, shape.cM, weights.msaTransition,
+    "extra.msa-transition", msa,
+  ));
+  await encodeEvoformerPairBlock(execution, encoder,
+    { ...shape, outerProductMeanDone: outerProductMeanFirst },
+    weights, msa, pair, msaMask, pairMask);
+}
+
+export async function encodeTemplatePairBlock(
+  execution,
+  encoder,
+  shape,
+  weights,
+  pair,
+  pairMask,
+) {
+  // 🔴 THE TWO TEMPLATE STACKS RUN THEIR OPS IN DIFFERENT ORDERS. AF2 monomer's
+  // TemplatePairStack attends first and multiplies second; multimer's
+  // TemplateEmbeddingIteration multiplies first. Same five operations, same
+  // weights, different sequence - and running one order with the other's
+  // weights is the kind of mistake that produces a plausible number.
+  const multiplyFirst = shape.templateOrder === "multimer";
+  const multiplications = async() => {
+    await staged(execution, () => encodeTriangleMultiplication(
+      execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
+    ));
+    await staged(execution, () => encodeTriangleMultiplication(
+      execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
+    ));
+  };
+  const attentions = async() => {
+    await staged(execution, () => encodeAttention(execution, encoder, {
+      source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+      channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
+      weights: weights.triangleAttentionStarting.attention,
+      pairBias: Object.assign(Object.create(weights.triangleAttentionStarting.pairBias),
+        { source: "normalized-input" }),
+      label: "template.triangle-attention-starting", residualTarget: pair,
+    }));
+    await staged(execution, () => encodeAttention(execution, encoder, {
+      source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
+      channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
+      weights: weights.triangleAttentionEnding.attention,
+      pairBias: Object.assign(Object.create(weights.triangleAttentionEnding.pairBias),
+        { source: "normalized-input" }),
+      label: "template.triangle-attention-ending", residualTarget: pair,
+    }));
+  };
+
+  if (multiplyFirst) { await multiplications(); await attentions(); }
+  else { await attentions(); await multiplications(); }
+
+  await staged(execution, () => encodeTransition(
+    execution, encoder, pair, shape.length * shape.length, shape.cZ,
+    weights.pairTransition, "template.pair-transition", pair,
+  ));
+}
+
+export class EvoformerBlockGpu {
+  device;
+
+  constructor(device) { this.device = device; }
+
+  async run(input) {
+    const execution = new WebGpuExecution(this.device);
+    try {
+      const msaElements = input.sequences * input.length * input.cM;
+      const pairElements = input.length * input.length * input.cZ;
+      if (input.msa.length !== msaElements || input.pair.length !== pairElements) {
+        throw new RangeError("Evoformer block activation shape mismatch");
+      }
+      const msa = execution.upload("block.msa", input.msa, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const pair = execution.upload("block.pair", input.pair, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const msaMask = execution.upload("block.msa-mask", input.msaMask);
+      const pairMask = execution.upload("block.pair-mask", input.pairMask);
+      const encoder = this.device.createCommandEncoder({ label: "evoformer-block" });
+      this.device.pushErrorScope("validation");
+
+      await encodeEvoformerBlock(execution, encoder, input, msa, pair, msaMask, pairMask);
+
+      const msaReadback = execution.createReadback("block.msa-readback", msa, encoder);
+      const pairReadback = execution.createReadback("block.pair-readback", pair, encoder);
+      const start = performance.now();
+      this.device.queue.submit([encoder.finish()]);
+      const validationError = await this.device.popErrorScope();
+      if (validationError !== null) throw new Error(`WebGPU validation failed: ${validationError.message}`);
+      const [msaOutput, pairOutput] = await Promise.all([
+        execution.mapFloat32(msaReadback), execution.mapFloat32(pairReadback),
+      ]);
+      return {
+        msa: msaOutput,
+        pair: pairOutput,
+        elapsedMilliseconds: performance.now() - start,
+        memory: execution.snapshot(),
+      };
+    } finally {
+      execution.release();
+    }
+  }
+}

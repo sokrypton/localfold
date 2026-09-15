@@ -14,7 +14,7 @@
  * Arms are `i x j` of the pair block, optionally `@cells` for the chunk of
  * products held in workgroup memory. Every arm is checked against the first.
  */
-import { createOuterProductMeanShaders } from "../../src/af3/outer-product-mean-webgpu.js";
+import { createOuterProductMeanShaders } from "../../src/af3/trunk/outer-product-mean-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

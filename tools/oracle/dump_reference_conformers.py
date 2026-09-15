@@ -198,7 +198,7 @@ def write_nucleic_module(tables):
             parts.append("    rigid: [%s] }," % rigid)
         parts.append("};")
     parts.append((here / "js_tail.txt").read_text().rstrip())
-    target = ROOT / "src" / "af3" / "reference-conformers-nucleic.js"
+    target = ROOT / "src" / "af3" / "featurise" / "reference-conformers-nucleic.js"
     target.write_text("\n".join(parts) + "\n")
     print("%s  %.0f KiB" % (target.relative_to(ROOT), target.stat().st_size / 1024))
 

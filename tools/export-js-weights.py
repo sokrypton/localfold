@@ -44,7 +44,7 @@ def build(model: pathlib.Path, check: bool) -> int:
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text())
     else:
-        ref_path = pathlib.Path(__file__).resolve().parent.parent / "src" / "reference" / "manifest.js"
+        ref_path = pathlib.Path(__file__).resolve().parent.parent / "src" / "bundles" / "manifest.js"
         if not ref_path.is_file():
             print(f"no manifest found at {manifest_path} or {ref_path}", file=sys.stderr)
             return 1

@@ -16,7 +16,7 @@
  */
 import { join } from "node:path";
 
-import { msaBlock } from "../../src/af3/msa-reference.js";
+import { msaBlock } from "../../src/af3/trunk/msa-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 
 const STACK = "diffuser/evoformer/__layer_stack_no_per_layer/msa_stack";

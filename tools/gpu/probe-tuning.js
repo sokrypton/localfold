@@ -26,8 +26,8 @@
  * it - but "measured on one device" is what this file exists to widen.
  */
 import { createLinearShader, LINEAR_TILE_WIDE, LINEAR_TILE_TALL,
-  linearTileRows, linearTileColumns } from "../../src/evoformer/transition.js";
-import { createAttentionRegisterFlashShader } from "../../src/evoformer/attention.js";
+  linearTileRows, linearTileColumns } from "../../src/kernels/transition.js";
+import { createAttentionRegisterFlashShader } from "../../src/kernels/attention.js";
 import { deviceProfile } from "../../src/runtime/device-profile.js";
 
 const option = (args, name, fallback) => {
@@ -137,7 +137,7 @@ async function attentionArms(device, rounds, iterations) {
   device.queue.writeBuffer(mask, 0, new Float32Array(batch * queries).fill(1));
   const bias = device.createBuffer({ size: 4 * heads * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(bias, 0, new Float32Array(4 * heads));
-  // The `Parameters` struct in src/evoformer/attention.js is sixteen u32.
+  // The `Parameters` struct in src/kernels/attention.js is sixteen u32.
   const params = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const parameterValues = new Uint32Array(16);
   parameterValues.set([batch, queries, channels, heads, headDim, 0, 0]);

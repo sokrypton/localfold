@@ -18,7 +18,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES }
-  from "../src/reference/manifests/index.js";
+  from "../src/bundles/manifests/index.js";
 
 const app = readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
 const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");

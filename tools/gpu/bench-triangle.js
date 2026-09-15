@@ -14,7 +14,7 @@
  * kernel answers the AF3 question before any AF3 code exists.
  */
 import { createDeterministicTriangleInput } from "../../src/testing/deterministic-input.js";
-import { TriangleMultiplicationOutgoingGpu } from "../../src/triangle/webgpu.js";
+import { TriangleMultiplicationOutgoingGpu } from "../../src/kernels/triangle/webgpu.js";
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;

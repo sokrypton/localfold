@@ -175,7 +175,7 @@ export function weightedRigidAlign(x, target, weights, atoms) {
   // because "small" means nothing on its own when a structure's coordinates can
   // be 1 or 1e4.
   //
-  // This routine is py2Dmol's `svd3` (src/io/math.js) in this file's idiom: the
+  // This routine is py2Dmol's `svd3` (that project's own `io/math.js`) in this file's idiom: the
   // same Jacobi-on-H^T-H, the same eigenvalue floor, the same unit-vector
   // verification and orthonormal completion. A flat or linear point cloud is
   // exactly what a structure viewer meets constantly and what a diffusion

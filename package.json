@@ -49,7 +49,7 @@
     "test:gpu": "LOCALFOLD_GPU_TESTS=1 node --test --test-concurrency=1 test/*.gpu.test.js",
     "//test:stock": "The configuration a VISITOR has: no shader-f16 and no subgroup matrix units, which is every NVIDIA Chrome. Two of the four models did not fold here at all - see docs/A100.md. Needs the bundles, like the other GPU lanes.",
     "test:stock": "node tools/check-stock-flags.mjs",
-    "//test:browser": "There is no playwright.config.ts in this repository, so this runs against playwright's defaults, and it needs a browser: `npx playwright install chromium`. Without one it is 4 failed on 'Executable doesn't exist'.",
+    "//test:browser": "playwright.config.js is the config - testDir test/browser, and it starts `python3 -m http.server 4173` itself. It still needs a browser: `npx playwright install chromium`. Without one it is 4 failed on 'Executable doesn't exist'.",
     "test:browser": "playwright test",
     "//typecheck": "ADVISORY, not a gate: 1075 errors on this tree. It checks JS against @webgpu/types and most of what it reports is missing DOM and window augmentation rather than anything a fold would notice.",
     "typecheck": "tsc -p tsconfig.json",
@@ -68,7 +68,11 @@
     "test:batch": "node tools/check-atom-windows.js && node tools/check-batch-fields.js",
     "test:ligand": "node tools/check-ligand-path.mjs",
     "//test:template": "Every model's TEMPLATE moves its fold, on a target that needs one. Both oracle checkers for this stage drive the module with templates: 1 where a FOLD pads to four, so a wrong denominator is exact in every module check and a quarter strength in every fold - which is what rosettafold3 was. 5CAJ chain A, with and without.",
-    "test:template": "node tools/check-template-path.mjs"
+    "test:template": "node tools/check-template-path.mjs",
+    "//test:site": "Assembles dist/ and runs build_site.py's own unresolved-import check. 🔴 THE ONLY GATE THAT SEES A CONSTRUCTED PATH. The src/ reorganisation broke five python tools that build paths from segments - (ROOT / \"src\" / \"reference\" / \"manifests\" / \"index.js\") - where no literal path exists for any pattern to match, and test/imports-resolve.test.js found none of them. Run this after any move under src/.",
+    "test:site": "python3 tools/build_site.py",
+    "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. 🔴 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
+    "test:tools": "python3 tools/index-tools.py"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "./harness.js";
-import { DEFAULT_MANIFEST } from "../src/reference/manifest.js";
+import { DEFAULT_MANIFEST } from "../src/bundles/manifest.js";
 
 describe("DEFAULT_MANIFEST", () => {
   it("defines the expected AlphaFold model_1_ptm metadata", () => {

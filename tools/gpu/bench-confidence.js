@@ -20,8 +20,8 @@
  * the cost depends on the shapes and not on the values, and loading a trunk
  * first would cost more than the thing being measured.
  */
-import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence-webgpu.js";
-import { confidenceWeights, openAf3Store } from "../../src/af3/weights.js";
+import { Af3ConfidenceHeadGpu } from "../../src/af3/confidence/confidence-webgpu.js";
+import { confidenceWeights, openAf3Store } from "../../src/af3/weights/weights.js";
 import { profileDevice } from "./profile.js";
 
 const DIALECT = { swapTransposedBias: false };

@@ -11,7 +11,7 @@
  * seconds, which is the difference between measuring every change and guessing
  * at most of them. bench-head.js is the one that runs all four stages.
  */
-import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
+import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
 import { profileDevice } from "./profile.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 

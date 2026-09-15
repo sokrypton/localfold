@@ -46,6 +46,43 @@ const MAX_WORKGROUPS_PER_DIMENSION = 65_535;
  * whole workgroups and whole rows of y, and what the out-of-range invocations
  * then do is a property of the BACKEND rather than of this repository.
  */
+/**
+ * `accumulator += delta`, elementwise, with the count baked in.
+ *
+ * 🔴 ONE DEFINITION, BECAUSE THERE WERE FOUR AND TWO OF THEM DISAGREED. The
+ * same eleven lines were written in `af3/trunk/pair-track-gpu.js`,
+ * `af3/diffusion/diffusion-head-webgpu.js`,
+ * `af3/diffusion/diffusion-conditioning-webgpu.js` and
+ * `esmfold2/diffusion-webgpu.js` - and the last bound them THE OTHER WAY ROUND,
+ * `0 = delta, 1 = accumulator`. Both compile. A pipeline from one with a bind
+ * group built for the other writes the sum into the DELTA and leaves the
+ * accumulator untouched, silently, which is the shape of bug that shows up as a
+ * wrong fold a long way from its cause.
+ *
+ * The order here is the majority one and the readable one: the thing being
+ * ADDED TO comes first, as it does in `addInPlace` above.
+ *
+ * 🔴 AND IT IS NOT `ADD_IN_PLACE_SHADER`. That one reads `arrayLength(&base)`
+ * and WINDOWS its bindings past `maxStorageBufferBindingSize`; this one bakes
+ * the count, which is what lets a caller dispatch it without a binding range.
+ * Whether the AF3 stacks should move to the windowed one is a separate and
+ * measured question - see docs/AF2.md on the 28-label tie, where windowing the
+ * add alone moved the ceiling by zero.
+ */
+export function createAddShader(elements) {
+  return `
+const ELEMENTS: u32 = ${elements}u;
+const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
+@group(0) @binding(0) var<storage, read_write> accumulator: array<f32>;
+@group(0) @binding(1) var<storage, read> delta: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= ELEMENTS) { return; }
+  accumulator[index] = accumulator[index] + delta[index];
+}`;
+}
+
 export const ADD_IN_PLACE_SHADER = `
 const GRID_WIDTH: u32 = 32768u;
 @group(0) @binding(0) var<storage, read_write> base: array<f32>;

@@ -18,7 +18,7 @@
 // shape; see src/esmc/tower-reference.js, where the alternatives are measured at
 // 1.2e-1 and 2.8e-1 against 5.9e-7 for these.
 import { GpuBufferAllocator } from "../runtime/allocator.js";
-import { float32ToFloat16Array } from "../runtime/float16.js";
+import { float32ToFloat16Array } from "../weights/float16.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 export const LANES = 64;

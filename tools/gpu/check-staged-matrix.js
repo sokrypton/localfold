@@ -16,7 +16,7 @@
  * the units multiply in f16 whatever the buffers hold; what is being checked is
  * the indexing and the epilogue, not the arithmetic width.
  */
-import { createStagedMatrixShader, stagedMatrixFits, stagedMatrixStorage } from "./gemm-matrix-staged.js";
+import { createStagedMatrixShader, stagedMatrixFits, stagedMatrixStorage } from "../../src/kernels/matrix-linear.js";
 import { deviceMatrixConfig, recordAdapter } from "../../src/runtime/device-profile.js";
 
 const half = (value) => {

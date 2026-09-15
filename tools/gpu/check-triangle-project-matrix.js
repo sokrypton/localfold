@@ -30,16 +30,16 @@
  * columns and the epilogue groups four columns; a pair count divisible by 128
  * checks none of the edges. `--tokens=` defaults to a set that is not.
  */
-import { createTriangleShaders } from "../../src/triangle/shaders.js";
-import { packWeights } from "../../src/triangle/weights.js";
+import { createTriangleShaders } from "../../src/kernels/triangle/shaders.js";
+import { packWeights } from "../../src/kernels/triangle/weights.js";
 import {
   createTriangleProjectMatrixShader, createTriangleProjectOutMatrixShaders,
   createTriangleContractMatrixShader, triangleContractMatrixDispatch,
   triangleProjectMatrixDispatch, triangleProjectOutMatrixDispatch,
   TRIANGLE_PROJECT_MATRIX_GEOMETRY, triangleProjectMatrixFits,
-} from "../../src/triangle/project-matrix.js";
+} from "../../src/kernels/triangle/project-matrix.js";
 import { deviceMatrixConfig, deviceTuning } from "../../src/runtime/device-profile.js";
-import { stagedMatrixBlock } from "../../src/runtime/matrix-linear.js";
+import { stagedMatrixBlock } from "../../src/kernels/matrix-linear.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

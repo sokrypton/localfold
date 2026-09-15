@@ -35,7 +35,7 @@ def theirs(residue_index, asym, entity, sym):
     return feat @ W + B
 
 def ours(residue_index, asym, entity, sym):
-    """A mirror of src/multimer/input-embedder.js PAIR_SHADER's three lookups."""
+    """A mirror of src/af2/multimer/input-embedder.js PAIR_SHADER's three lookups."""
     n = len(residue_index)
     out = np.empty((n, n, W.shape[1]), np.float64)
     for i in range(n):

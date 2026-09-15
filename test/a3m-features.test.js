@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "./harness.js";
 import { makeA3mFeatures } from "../src/input/a3m-features.js";
-import { AlphaFoldFixture } from "../src/reference/alphafold-fixture.js";
-import { FileTensorStore } from "../src/reference/tensor-store.js";
+import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
 
 describe("A3M model feature preprocessing", () => {
   it("threads physical-chain offsets into monomer-model A3M features", async() => {

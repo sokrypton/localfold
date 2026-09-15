@@ -19,8 +19,8 @@
  * four-slot arithmetic is checked in the fold, by
  * `fold-opendde.js --trunk-oracle=`.
  */
-import { templateEmbedding } from "../../src/af3/template-reference.js";
-import { openAf3Store, templateWeights, af3Dialect } from "../../src/af3/weights.js";
+import { templateEmbedding } from "../../src/af3/trunk/template-reference.js";
+import { openAf3Store, templateWeights, af3Dialect } from "../../src/af3/weights/weights.js";
 const option = (a,n,f) => a.find(x=>x.startsWith(`--${n}=`))?.slice(n.length+3) ?? f;
 export async function main(device, args) {
   const r = await fetch("/oracle-dumps/af3-oracle-template-opendde-empty.json");

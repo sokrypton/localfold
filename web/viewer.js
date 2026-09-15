@@ -11,6 +11,24 @@
  * frames cannot be shared between folds and the viewer has to be made again.
  * Everything below that looks like bookkeeping - the kept camera, the
  * generation counter - exists because of that one fact.
+ *
+ * 🔴 AND "BOTH PAGES" ARE single.html AND proteinhunter.html, BOTH HELD OUT of
+ * the repository. index.html does not use this module.
+ *
+ * 🔴 NOTHING IN THE CHECKOUT LOADS IT, AND THAT IS DELIBERATE RATHER THAN DEAD.
+ * `.gitignore` holds `single.html` and `proteinhunter.html` back until they are
+ * fixed against the model row that moved under them (b0dc258); the pages stay on
+ * their author's disk, `tools/build_site.py`'s OPTIONAL list copies them when
+ * they exist and `tools/mobile-layout.py` skips a page it cannot find.
+ *
+ * Of `web/`'s 25 modules, 19 are reachable from `index.html` or `dev.html`,
+ * FIVE only from those two withheld pages - `main.js`, `hunter.js`, `viewer.js`,
+ * `mutate.js`, `hydrophobicity.js` - and `plddt.js` from neither, having had no
+ * importer at any tracked revision. `mutate.js` and `hydrophobicity.js` are held
+ * by `test/mutate.test.js`, `test/hydrophobicity.test.js` and
+ * `test/browser/webgpu.spec.js`; **the four with no page and no test are
+ * `main.js`, `hunter.js`, `viewer.js` and `plddt.js`**, which is why this note is
+ * in those four. Deleting any of them is a page that does not come back.
  */
 
 /**

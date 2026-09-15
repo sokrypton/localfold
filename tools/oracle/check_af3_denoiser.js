@@ -19,9 +19,9 @@
  */
 import { join } from "node:path";
 
-import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { diffusionHead } from "../../src/af3/diffusion-reference.js";
+import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { diffusionHead } from "../../src/af3/diffusion/diffusion-reference.js";
 import { ROOT, captures, layer, loadDump, loadTensors, report } from "./af3-bundle.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 

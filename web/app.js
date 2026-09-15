@@ -21,8 +21,8 @@
  * keep working. What the reader downloads is separate and explicit - see the
  * two buttons at the foot of this file, which write what the model produced.
  */
-import { AlphaFoldMonomerGpu } from "../src/model/monomer.js";
-import { AlphaFoldUnifiedGpu } from "../src/multimer/model.js";
+import { AlphaFoldMonomerGpu } from "../src/af2/model/monomer.js";
+import { AlphaFoldUnifiedGpu } from "../src/af2/multimer/model.js";
 import { foldsAsSingleSequence, parseA3m } from "../src/input/a3m.js";
 // 🔴 mergeSearchedChains IS USED ONLY WHEN A SEARCH IS REUSED, which is why it
 // shipped missing from this list. That path needs a cache from an earlier fold
@@ -43,12 +43,12 @@ import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunne
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../src/esmfold2/fold.js";
 import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js";
 import { toPdb } from "../src/af3/fold.js";
-import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
+import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODELS_WITHOUT_CONFIDENCE,
   SINGLE_SEQUENCE_FAMILIES }
-  from "../src/reference/manifests/index.js";
+  from "../src/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
 import { correspondence } from "./align.js";
@@ -3217,7 +3217,7 @@ async function fold(event) {
       }
     };
     // 🔴 THE UNITS ARE COSTS, NOT COUNTS, and that is what makes a clock
-    // possible. src/model/*.js weight every step by what the cost model says it
+    // possible. src/af2/model/*.js weight every step by what the cost model says it
     // costs, so `completed / total` is a fraction of the WORK - and the ratio
     // of elapsed time to work done is this machine's speed, whatever it is.
     // RuntimeEstimator holds that reasoning; a plan of one stage is enough for
@@ -3261,7 +3261,7 @@ async function fold(event) {
       ? { outerProductMeanFirst: true, positionScale: 20,
         chainAware: true, chainSequences: chains }
       : {};
-    // ...?graph=unified runs the MONOMER weights through src/multimer/ instead.
+    // ...?graph=unified runs the MONOMER weights through src/af2/multimer/ instead.
     // With its switches off that graph reproduces the monomer one bit for bit,
     // which is the check that the superset is right; a difference is a graph
     // bug rather than a weights bug.

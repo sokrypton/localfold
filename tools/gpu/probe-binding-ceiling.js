@@ -44,6 +44,70 @@
  * taken.
  */
 import { WebGpuExecution } from "../../src/runtime/execution.js";
+import { setDeviceTuning } from "../../src/runtime/device-profile.js";
+
+/**
+ * The largest BINDING each labelled compute pass makes, watched at the WebGPU
+ * objects rather than at a repository helper.
+ *
+ * 🔴 BECAUSE `WebGpuExecution.prototype.dispatch` IS AF2's SEAM AND NOT AF3's.
+ * The AF3 stacks call `dispatchWorkgroups` from six of their own modules, so
+ * the dispatch watcher below recorded ZERO labels for `--tool=fold` and the
+ * probe returned `lowestCeiling: null` - which reads as "nothing is near the
+ * limit" and means "the instrument was pointed elsewhere".
+ *
+ * Patching `createBindGroup` and `beginComputePass` catches every caller in
+ * either family, because they are the API and not a convention. And the
+ * quantity is the BINDING's size - `resource.size`, or the buffer's remainder
+ * past `resource.offset` - which is what `maxStorageBufferBindingSize` limits,
+ * not the buffer's whole length.
+ *
+ * 🔴 IT NEEDS `batchComputePasses` OFF, for the reason profile.js needs it: a
+ * batched pass is one label over many dispatches, so the largest binding in it
+ * would be attributed to whichever kernel happens to name the pass, and the
+ * whole point here is WHICH label sits at the bottom.
+ */
+function watchBindings(device) {
+  const sizes = new WeakMap();
+  const largest = new Map();
+  const createBindGroup = device.createBindGroup.bind(device);
+  const createCommandEncoder = device.createCommandEncoder.bind(device);
+  device.createBindGroup = (descriptor) => {
+    const group = createBindGroup(descriptor);
+    let most = 0;
+    for (const entry of descriptor?.entries ?? []) {
+      const resource = entry?.resource;
+      if (resource?.buffer === undefined) continue;
+      const bytes = resource.size ?? (resource.buffer.size - (resource.offset ?? 0));
+      if (bytes > most) most = bytes;
+    }
+    sizes.set(group, most);
+    return group;
+  };
+  device.createCommandEncoder = (descriptor) => {
+    const encoder = createCommandEncoder(descriptor);
+    const begin = encoder.beginComputePass.bind(encoder);
+    encoder.beginComputePass = (pass = {}) => {
+      const label = pass.label ?? "(unlabelled)";
+      const actual = begin(pass);
+      const setBindGroup = actual.setBindGroup.bind(actual);
+      actual.setBindGroup = (index, group, ...rest) => {
+        const bytes = sizes.get(group) ?? 0;
+        if (bytes > (largest.get(label) ?? 0)) largest.set(label, bytes);
+        return setBindGroup(index, group, ...rest);
+      };
+      return actual;
+    };
+    return encoder;
+  };
+  return {
+    largest,
+    stop() {
+      device.createBindGroup = createBindGroup;
+      device.createCommandEncoder = createCommandEncoder;
+    },
+  };
+}
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -66,6 +130,8 @@ export async function main(device, args) {
   // The largest byte size each labelled dispatch ever bound, per length.
   const seen = lengths.map(() => new Map());
   const original = WebGpuExecution.prototype.dispatch;
+  // One label per pass, so a binding is attributed to the kernel that made it.
+  setDeviceTuning(device, { batchComputePasses: false });
   const ALPHABET = "PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK";
   try {
     for (let at = 0; at < lengths.length; at += 1) {
@@ -81,10 +147,40 @@ export async function main(device, args) {
       };
       const sequence = Array.from({ length: lengths[at] },
         (_, index) => ALPHABET[index % ALPHABET.length]).join("");
-      await module.main(device, [...rest, `--sequence=${sequence}`]);
+      // 🔴 BOTH SEAMS, MERGED. AF2 goes through `WebGpuExecution.dispatch` and
+      // AF3 does not; whichever the wrapped tool uses, the larger number for a
+      // label wins. A family that uses both is counted once.
+      const bindings = watchBindings(device);
+      try {
+        await module.main(device, [...rest, `--sequence=${sequence}`]);
+      } finally {
+        bindings.stop();
+      }
+      for (const [name, bytes] of bindings.largest) {
+        if (bytes > (into.get(name) ?? 0)) into.set(name, bytes);
+      }
     }
   } finally {
     WebGpuExecution.prototype.dispatch = original;
+  }
+
+  // 🔴 A PROBE THAT SAW NOTHING MUST SAY SO, NOT RETURN A CLEAN BILL. This
+  // patches `WebGpuExecution.prototype.dispatch`, which is AF2's seam and NOT
+  // AF3's: the AF3 stacks call `dispatchWorkgroups` from six of their own
+  // modules, so `--tool=fold` recorded **zero** labels and returned
+  // `lowestCeiling: null` with an empty `labels` list. Read quickly that is
+  // "no label is near the limit"; it actually means the instrument was pointed
+  // at the wrong place. Same shape as this repository's `NaN > bound` and its
+  // unguarded relRMS over a non-array - a comparison over nothing that passes.
+  //
+  // Extending it to AF3 means watching the BIND GROUP rather than the dispatch,
+  // because AF3 has no single dispatch seam. Until someone does, this refuses.
+  const watched = seen.reduce((sum, into) => sum + into.size, 0);
+  if (watched === 0) {
+    throw new Error(`${tool} issued no dispatch this probe could see: it patches`
+      + " WebGpuExecution.prototype.dispatch, which the AF2 path uses and the AF3"
+      + " stacks do not - they call dispatchWorkgroups directly. A ceiling"
+      + " computed from no observations is not a ceiling. See the note above.");
   }
 
   const ratio = lengths[1] / lengths[0];

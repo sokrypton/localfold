@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "./harness.js";
 import { resolve } from "node:path";
 import { create, globals } from "webgpu";
-import { loadTriangleReferenceBundleFromFiles } from "../src/reference/node.js";
-import { errorMetrics } from "../src/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../src/triangle/webgpu.js";
+import { loadTriangleReferenceBundleFromFiles } from "../src/bundles/node.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../src/kernels/triangle/webgpu.js";
 import { ALPHAFOLD_REFERENCE_MANIFESTS } from "./alphafold-references.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";

@@ -26,7 +26,7 @@
 // 🔴 AND THE ZEROED WEIGHTS ARE SYNTHESISED HERE, NOT SHIPPED. Five c x c
 // matrices a block over 24 blocks is 37.7 MiB of zeros; a bundle carrying them
 // would be paying to say something this checker says for free.
-import { readTensor } from "../../src/reference/dtype.js";
+import { readTensor } from "../../src/weights/dtype.js";
 import { Esmfold2TrunkGpu } from "../../src/esmfold2/trunk-webgpu.js";
 import { setDeviceTuning } from "../../src/runtime/device-profile.js";
 

@@ -36,7 +36,7 @@ BLOCK_NAMES = {
 
 
 def _decode(record, blob):
-    """One tensor, dequantised. Mirrors src/reference/dtype.js."""
+    """One tensor, dequantised. Mirrors src/weights/dtype.js."""
     shape = tuple(record['shape'])
     count = int(np.prod(shape))
     start = record.get('byteOffset', 0)

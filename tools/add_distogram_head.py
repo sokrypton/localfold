@@ -20,7 +20,7 @@ and the earlier ones are untouched: only that shard and the manifest change,
 and an upload transfers only what changed.
 
 🔴 THE ORDER OF OPERATIONS IS NOT OPTIONAL, and getting it wrong breaks every
-AF2 fold. The manifests are COMPILED INTO the page (src/reference/manifests/)
+AF2 fold. The manifests are COMPILED INTO the page (src/bundles/manifests/)
 while the shards are fetched from a PINNED remote, so a manifest that
 references bytes the pinned commit does not have makes every load ask for a
 range that is not there. Upload the bundle first, re-pin the commit, and only
@@ -28,7 +28,7 @@ then regenerate the manifest module:
 
     python3 tools/add_distogram_head.py --model model --params ...
     hf upload USER/REPO model af2-monomer --repo-type=model
-    # ...pin the new sha in src/reference/manifests/index.js
+    # ...pin the new sha in src/bundles/manifests/index.js
     python3 tools/write_manifest_module.py monomer
     python3 tools/check_remote_bundle.py monomer
 

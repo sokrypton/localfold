@@ -37,9 +37,9 @@
  * compares the FORWARD and nothing else. Deriving the inputs on both sides
  * would let a shared featurisation error pass.
  */
-import { openddeConfidence } from "../../src/af3/opendde-confidence.js";
+import { openddeConfidence } from "../../src/af3/confidence/opendde-confidence.js";
 import { openAf3Store, openddeConfidenceWeights, af3Dialect }
-  from "../../src/af3/weights.js";
+  from "../../src/af3/weights/weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

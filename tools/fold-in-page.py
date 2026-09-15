@@ -39,7 +39,7 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DEFAULT = "GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK"
 
 
-MANIFESTS = "/src/reference/manifests/index.js"
+MANIFESTS = "/src/bundles/manifests/index.js"
 REMOTE_LINE = re.compile(rb'^\s*remote:\s*"[^"]*",\s*$', re.MULTILINE)
 
 
@@ -68,6 +68,18 @@ def serve(local_weights=True):
             if local_weights and self.path.split("?")[0] == MANIFESTS:
                 source = open(os.path.join(REPO, MANIFESTS.lstrip("/")), "rb").read()
                 body = REMOTE_LINE.sub(b"", source)
+                # 🔴 AND IT RAISES RATHER THAN SERVING THE MODULE UNCHANGED. The
+                # src/ reorganisation moved this file to src/bundles/ and left
+                # MANIFESTS naming the old path, so this branch simply stopped
+                # matching: no error, no missing page, just 150 MB off Hugging
+                # Face on every run of a check that exists to avoid it. The
+                # request path moving is caught by the assertion in serve(); a
+                # `remote:` line that stops matching REMOTE_LINE would not be,
+                # and is the same failure.
+                if body == source:
+                    raise RuntimeError(
+                        f"{MANIFESTS} has no remote: line for REMOTE_LINE to strip - "
+                        "--local-weights would fetch the bundle from the network")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript")
                 self.send_header("Content-Length", str(len(body)))
@@ -75,6 +87,12 @@ def serve(local_weights=True):
                 self.wfile.write(body)
                 return
             super().do_GET()
+
+    # 🔴 THE MODULE MUST BE WHERE MANIFESTS SAYS, CHECKED BEFORE A BROWSER
+    # STARTS. A path that no longer resolves makes the rewrite above inert
+    # rather than loud, and the symptom is a slow run rather than a failure.
+    if local_weights and not os.path.exists(os.path.join(REPO, MANIFESTS.lstrip("/"))):
+        raise SystemExit(f"{MANIFESTS} does not exist - MANIFESTS is stale")
 
     socketserver.ThreadingTCPServer.allow_reuse_address = True
     httpd = socketserver.ThreadingTCPServer(("127.0.0.1", PORT), Handler)
@@ -656,7 +674,7 @@ def main():
         print("weightPhases:", cdp.evaluate(ws, """(async () => {
           try {
             const m = await import('/web/af3-model.js');
-            const s = await import('/src/reference/http-tensor-store.js');
+            const s = await import('/src/bundles/http-tensor-store.js');
             const d = s.tensorDecodeStats || {};
             return JSON.stringify({ ...(m.af3LoadMilliseconds || {}),
               hostDecodeMs: Math.round(d.ms || 0), hostDecodeCalls: d.calls || 0 });

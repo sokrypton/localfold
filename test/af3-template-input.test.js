@@ -1,9 +1,9 @@
 import { describe, expect, it } from "./harness.js";
 import {
   GAP_AATYPE, chainResidues, filterByConfidence, identityMap, templateSlot,
-} from "../src/af3/template-input.js";
-import { NUM_DENSE } from "../src/af3/template-features.js";
-import { aatypeFor } from "../src/af3/reference-conformers.js";
+} from "../src/af3/featurise/template-input.js";
+import { NUM_DENSE } from "../src/af3/featurise/template-features.js";
+import { aatypeFor } from "../src/af3/featurise/reference-conformers.js";
 
 /**
  * `tools/oracle/check_af3_template_geometry.js` holds this to AF3 itself -

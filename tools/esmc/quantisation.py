@@ -96,7 +96,7 @@ def nm_sparse(values, n, m, bits, group, importance=None):
     a weight at 1:8 against the entropy bound's 0.544.
 
     🔴 AND IT COSTS NO KERNEL. LocalFold already expands quantised weights into
-    a dense float16 buffer in one dispatch (src/runtime/quantised-upload.js);
+    a dense float16 buffer in one dispatch (src/weights/quantised-upload.js);
     a mask is the same shape of operation, so nothing downstream has to know
     the weights were ever sparse. That is the difference between this and the
     rotation a codebook scheme wants.

@@ -43,18 +43,18 @@
  * still good enough is tools/gpu/probe-progress-bar.js, which measures the bar
  * against the clock rather than the model against a bench.
  */
-import { EvoformerStackGpu } from "../../src/evoformer/stack.js";
-import { AlphaFoldFixture } from "../../src/reference/alphafold-fixture.js";
-import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
-import { MODEL_BUNDLES, loadManifest } from "../../src/reference/manifests/index.js";
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { EvoformerStackGpu } from "../../src/af2/evoformer/stack.js";
+import { AlphaFoldFixture } from "../../src/bundles/alphafold-fixture.js";
+import { HttpTensorStore } from "../../src/bundles/http-tensor-store.js";
+import { MODEL_BUNDLES, loadManifest } from "../../src/bundles/manifests/index.js";
+import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { buildTargetFeat, DIALECT } from "../../src/af3/fold.js";
-import { Af3TrunkGpu } from "../../src/af3/trunk-webgpu.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
+import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
+import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
 import { targetFeatureWeights, diffusionWeights, atomReference }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

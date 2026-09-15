@@ -8,7 +8,7 @@
  * the fold dies on a 404 naming a path that looks almost right.
  */
 import { describe, expect, it } from "./harness.js";
-import { MODEL_BUNDLES, bundleBaseUrl } from "../src/reference/manifests/index.js";
+import { MODEL_BUNDLES, bundleBaseUrl } from "../src/bundles/manifests/index.js";
 
 const shardUrl = (family, file) =>
   new URL(file, new URL(bundleBaseUrl(family), "https://localfold.org/index.html")).href;

@@ -211,7 +211,7 @@ def main():
 
     # 🔴 THE INPUTS EMBEDDER, WHICH IS NOT AF3'S ATOM ENCODER. Sliding-window
     # self-attention over atoms with a 3D rotary embedding built from the
-    # reference conformer - see src/esmfold2/atom-encoder-reference.js. Reusing
+    # reference conformer - see src/af3/diffusion/atom-encoder-reference.js. Reusing
     # AF3's windowed pair-biased encoder would have been the obvious wrong move;
     # nothing in the shapes says they differ.
     atom = 'inputs_embedder.atom_attention_encoder'

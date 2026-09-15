@@ -7,7 +7,7 @@
 🔴 IT EXISTS BECAUSE TWO UNVALIDATED IMPLEMENTATIONS DISAGREED AND NEITHER WAS
 AN ORACLE. `tools/oracle/template_reference.py` is a hand-written numpy
 transcription of this module and nothing ever checked IT; the GPU path is
-`src/multimer/template.js` and nothing ever checked that either - the reference
+`src/af2/multimer/template.js` and nothing ever checked that either - the reference
 wrote `oracle-dumps/toy-template.json` and no JavaScript read it. Compared at last they
 differ by relRMS 1.2e-1 after the first pair block, which says only that one of
 them is wrong.

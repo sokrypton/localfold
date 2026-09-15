@@ -12,7 +12,7 @@
 // INSTANCE, so bond lengths and angles agree and torsions do not.
 //
 // 🔴 AND THE FEATURISER IS AF3's, WITH AN ADAPTER. src/esmfold2/featurise.js is
-// three differences from src/af3/featurise.js - a ragged atom layout, two
+// three differences from src/af3/featurise/featurise.js - a ragged atom layout, two
 // different residue alphabets, and no terminal atom - so what this really
 // checks is that those three are the only ones. A second featuriser written
 // from scratch would pass this and would still be a second place for a CCD

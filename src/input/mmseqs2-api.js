@@ -1,5 +1,5 @@
 import { parseA3m } from "./a3m.js";
-import { AF3_FAMILIES } from "../reference/manifests/index.js";
+import { AF3_FAMILIES } from "../bundles/manifests/index.js";
 import { concatenateA3mBlocks, mergeChainA3ms, deduplicateUnpairedAgainstPaired, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "./chains.js";
 

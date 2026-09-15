@@ -19,12 +19,12 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { featuriseProtein } from "../src/af3/featurise.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
 import {
   structuralLayout, structuralBatch, structuralToResidue, atomNameAt,
   ROLE_ATOM, ROLE_PROTEIN_BB, ROLE_PROTEIN_SC,
   ROLE_DNA_BB, ROLE_DNA_BASE, ROLE_RNA_BB, ROLE_RNA_BASE, NO_TWIN,
-} from "../src/af3/structural-tokens.js";
+} from "../src/af3/featurise/structural-tokens.js";
 
 /** Glycerol, as the featuriser wants a ligand: heavy atoms and their bonds. */
 const GLYCEROL = {

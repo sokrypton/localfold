@@ -14,7 +14,7 @@ export async function main(device) {
     wasmThreadsAtomics: threads,
     sharedArrayBuffer: typeof SharedArrayBuffer !== "undefined",
     crossOriginIsolated: globalThis.crossOriginIsolated ?? null,
-    // 🔴 NATIVE HALF PRECISION IN JAVASCRIPT. src/runtime/float16.js hand-rolls
+    // 🔴 NATIVE HALF PRECISION IN JAVASCRIPT. src/weights/float16.js hand-rolls
     // the conversion; where this exists the engine does it.
     float16Array: typeof Float16Array !== "undefined",
     mathF16round: typeof Math.f16round === "function",

@@ -19,12 +19,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 
-import { readTensor } from "../src/reference/dtype.js";
-import { transition, triangleMultiplication } from "../src/af3/pairformer-reference.js";
+import { readTensor } from "../src/weights/dtype.js";
+import { transition, triangleMultiplication } from "../src/af3/trunk/pairformer-reference.js";
 import {
   recycleProjection, relativePositionEncoding, tokenBondEncoding, zInitFromInputs,
-} from "../src/esmfold2/featuriser-reference.js";
-import { inputsEmbedder } from "../src/esmfold2/atom-encoder-reference.js";
+} from "../src/esmfold2/pair-features-reference.js";
+import { inputsEmbedder } from "../src/esmfold2/atom-transformer-reference.js";
 import { distogramLogits } from "../src/esmfold2/distogram-reference.js";
 
 const ROOT = new URL("..", import.meta.url).pathname;
@@ -99,7 +99,7 @@ const shape = {
   // bfloat16; reproducing that would match the dump more closely and compute a
   // WORSE answer, and torch's bf16 accumulation is not reproducible here in any
   // case. The rope TABLE is still bf16, because that one is exact - see
-  // src/esmfold2/atom-encoder-reference.js.
+  // src/esmfold2/atom-transformer-reference.js.
   attentionPrecision: "f32",
 };
 const atomBlocks = [];

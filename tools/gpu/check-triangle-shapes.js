@@ -6,9 +6,9 @@
  * pass. This sweeps the three extents to say which one the kernel is wrong in.
  */
 import { createDeterministicTriangleInput } from "../../src/testing/deterministic-input.js";
-import { triangleMultiplicationOutgoingReference } from "../../src/triangle/cpu-reference.js";
-import { errorMetrics } from "../../src/triangle/types.js";
-import { TriangleMultiplicationOutgoingGpu } from "../../src/triangle/webgpu.js";
+import { triangleMultiplicationOutgoingReference } from "../../src/kernels/triangle/cpu-reference.js";
+import { errorMetrics } from "../../src/kernels/triangle/types.js";
+import { TriangleMultiplicationOutgoingGpu } from "../../src/kernels/triangle/webgpu.js";
 
 export async function main(device, args = []) {
   const runner = new TriangleMultiplicationOutgoingGpu(device);

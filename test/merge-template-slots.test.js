@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mergeTemplateSlots, GAP_AATYPE } from "../src/af3/template-input.js";
-import { NUM_DENSE, multichainMaskFor } from "../src/af3/template-features.js";
+import { mergeTemplateSlots, GAP_AATYPE } from "../src/af3/featurise/template-input.js";
+import { NUM_DENSE, multichainMaskFor } from "../src/af3/featurise/template-features.js";
 
 /** A slot covering one token range, one atom per covered token. */
 function slotOver(tokens, from, count, aatype) {

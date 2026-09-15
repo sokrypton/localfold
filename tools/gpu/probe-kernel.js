@@ -17,7 +17,7 @@
  * refusal at build time instead.
  */
 import { selectAttentionFlashKernel, supportsAttentionSubgroups, allowsAttentionSubgroupSize }
-  from "../../src/evoformer/attention.js";
+  from "../../src/kernels/attention.js";
 
 export async function main(device) {
   const info = device.adapterInfo ?? device.info ?? {};

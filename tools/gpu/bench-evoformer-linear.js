@@ -23,11 +23,11 @@
  * Every arm is checked against the first, because a tile the dispatch does not
  * match leaves rows unprojected and reads as a speedup.
  */
-import { createLinearShader } from "../../src/evoformer/transition.js";
+import { createLinearShader } from "../../src/kernels/transition.js";
 import { createMatrixLinearShader, matrixLinearFits } from "./gemm-matrix.js";
 import { deviceMatrixConfig } from "../../src/runtime/device-profile.js";
-import { createStagedMatrixShader, stagedMatrixFits, stagedMatrixStorage } from "./gemm-matrix-staged.js";
-import { float32ToFloat16Array } from "../../src/runtime/float16.js";
+import { createStagedMatrixShader, stagedMatrixFits, stagedMatrixStorage } from "../../src/kernels/matrix-linear.js";
+import { float32ToFloat16Array } from "../../src/weights/float16.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -196,7 +196,7 @@ const SHAPES = {
   //     staged128x64x32x2x2@f16             5.963       9286
   //     staged256x128x32x2x4@f16            6.363       8702
   //
-  // The 28.2 TFLOP/s in src/runtime/matrix-linear.js is at a WIDER N. At 256
+  // The 28.2 TFLOP/s in src/kernels/matrix-linear.js is at a WIDER N. At 256
   // columns a 128-wide block leaves two column blocks to fill an SM with and
   // the staged form never gets its panel amortised. The shipped projection
   // beats all of these anyway: it fuses all four matrices over ONE source read
@@ -325,7 +325,7 @@ export async function main(device, args) {
     if (tileSpec.startsWith("staged")) {
       // `staged128x128x32` is blockRows x blockColumns x blockInner, with the
       // subgroup grid appended: `staged128x128x32x2x4` is eight subgroups as
-      // two down by four across. See gemm-matrix-staged.js.
+      // two down by four across. See src/kernels/matrix-linear.js.
       if (!device.features.has("chromium-experimental-subgroup-matrix")) {
         results.push({ arm: spec, skipped: "no chromium-experimental-subgroup-matrix" });
         continue;

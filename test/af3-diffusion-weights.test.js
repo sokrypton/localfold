@@ -12,13 +12,23 @@
  * weights by hand rather than through this loader.
  */
 import { describe, expect, it } from "./harness.js";
-import { diffusionWeights, targetFeatureWeights } from "../src/af3/diffusion-weights.js";
+import { diffusionWeights, targetFeatureWeights } from "../src/af3/weights/diffusion-weights.js";
 
 /** A store that answers every request with zeros and remembers what was asked. */
 function recordingStore(asked) {
+  const TX = "diffuser/~/diffusion_head/transformer/__layer_stack_with_per_layer";
   const shapes = new Map([
-    ["diffuser/~/diffusion_head/transformer/__layer_stack_with_per_layer"
-      + "/pair_logits_projection/weights", [6, 128, 4, 16]],
+    [`${TX}/pair_logits_projection/weights`, [6, 128, 4, 16]],
+    // 🔴 THE TOKEN TRANSFORMER'S SHAPE COMES OFF THESE TWO NOW, so a stub that
+    // answers `[24]` for everything makes `txShape` raise - which is the
+    // derivation working, and is why the stub has to state them. AlphaFold 3's
+    // real values: q_projection is
+    // [superBlocks, blocksPerSuperBlock, channels, heads, dimension] and the
+    // SwiGLU transition's last axis is `channels * factor * 2`.
+    [`${TX}/${"__layer_stack_with_per_layer"}/transformerq_projection/weights`,
+      [6, 4, 768, 16, 48]],
+    [`${TX}/${"__layer_stack_with_per_layer"}/transformerffw_transition1/weights`,
+      [6, 4, 768, 3072]],
   ]);
   return {
     // A bundle names the graph it was converted for, and the loaders read it -

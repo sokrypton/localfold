@@ -7,7 +7,7 @@
 // twelve token blocks and two atom stacks at once - which says "somewhere in
 // three hundred dispatches" and cannot separate the attention from the
 // modulation from the pooling. The reference is
-// src/esmfold2/atom-encoder-reference.js, which is itself checked against the
+// src/esmfold2/atom-transformer-reference.js, which is itself checked against the
 // native module at 7.0e-8 with the attention in float32.
 //
 // 🔴 IT SYNTHESISES ITS OWN WEIGHTS AND ITS OWN MOLECULE, DELIBERATELY. What is
@@ -23,7 +23,7 @@
 // downcast has stopped reaching the kernel and no bound would say so.
 import { GpuBufferAllocator } from "../../src/runtime/allocator.js";
 import { pipelineCacheForDevice } from "../../src/runtime/pipeline-cache.js";
-import { buildRope, swaBlock } from "../../src/esmfold2/atom-encoder-reference.js";
+import { buildRope, swaBlock } from "../../src/esmfold2/atom-transformer-reference.js";
 import {
   atomStackScratch, atomWindows, compileAtomStack, encodeAtomStack, widestWindow,
 } from "../../src/esmfold2/atom-transformer-webgpu.js";

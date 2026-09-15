@@ -25,31 +25,31 @@
  * see the loop below - and default to none, which is what the oracle dumps
  * were made with.
  */
-import { ELEMENT_SYMBOLS } from "./ccd-component.js";
+import { ELEMENT_SYMBOLS } from "./featurise/ccd-component.js";
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
-  from "../model/feature-convergence.js";
-import { af3ContactClasses } from "./contact-classes.js";
-import { perAtomConditioning } from "./atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder, targetFeatures } from "./atom-encoder-reference.js";
-import { Af3AtomEncoderGpu } from "./atom-encoder-webgpu.js";
-import { Af3TrunkGpu } from "./trunk-webgpu.js";
-import { Af3ConfidenceHeadGpu } from "./confidence-webgpu.js";
-import { Af3PairformerStackGpu } from "./pairformer-block-webgpu.js";
-import { af3Dialect, pairformerBlockWeights } from "./weights.js";
-import { Af3StructuralExpanderGpu } from "./structural-expander-webgpu.js";
+  from "./feature-convergence.js";
+import { af3ContactClasses } from "./featurise/contact-classes.js";
+import { perAtomConditioning } from "./diffusion/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder, targetFeatures } from "./diffusion/atom-encoder-reference.js";
+import { Af3AtomEncoderGpu } from "./diffusion/atom-encoder-webgpu.js";
+import { Af3TrunkGpu } from "./trunk/trunk-webgpu.js";
+import { Af3ConfidenceHeadGpu } from "./confidence/confidence-webgpu.js";
+import { Af3PairformerStackGpu } from "./trunk/pairformer-block-webgpu.js";
+import { af3Dialect, pairformerBlockWeights } from "./weights/weights.js";
+import { Af3StructuralExpanderGpu } from "./structure/structural-expander-webgpu.js";
 import { structuralAttentionBias, structuralPairFeatures }
-  from "./structural-expander-reference.js";
+  from "./structure/structural-expander-reference.js";
 import { structuralBatch, structuralLayout, structuralToResidue }
-  from "./structural-tokens.js";
-import { Af3DiffusionConditioningGpu } from "./diffusion-conditioning-webgpu.js";
-import { openddeConfidence } from "./opendde-confidence.js";
+  from "./featurise/structural-tokens.js";
+import { Af3DiffusionConditioningGpu } from "./diffusion/diffusion-conditioning-webgpu.js";
+import { openddeConfidence } from "./confidence/opendde-confidence.js";
 import { releaseResidentWeights } from "../runtime/resident.js";
 import { memoryBudgetBytes, residencyAllowed } from "../runtime/device-memory.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { chainPairTmScores, perChainTmScores, reduceTmScore }
   from "../heads/tm-score.js";
-import { sampleOnGpu, flowOnGpu } from "./diffusion-sampler-webgpu.js";
-import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
+import { sampleOnGpu, flowOnGpu } from "./diffusion/diffusion-sampler-webgpu.js";
+import { Af3DiffusionHeadGpu } from "./diffusion/diffusion-head-webgpu.js";
 
 /**
  * 🔴 THE DIALECT IS NOT A PREFERENCE. A ported checkpoint turns on branches
@@ -59,7 +59,7 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
  * keeps saying so.
  */
 import { ALPHAFOLD3 } from "./dialect.js";
-import { chiralCentres } from "./template-features.js";
+import { chiralCentres } from "./featurise/template-features.js";
 import { keepResidentAffordable } from "../runtime/device-memory.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 
@@ -960,7 +960,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // The trunk's own seams, for a caller holding the reference's taps.
       ...(options.onSeam === undefined ? {} : { onSeam: options.onSeam }),
       // ...the MSA stack's first-half stop point, for bisecting one block
-      // against the oracle. See src/af3/msa-stack-webgpu.js.
+      // against the oracle. See src/af3/trunk/msa-stack-webgpu.js.
       ...(options.stopAfterOpm === true ? { stopAfterOpm: true } : {}),
       // 🔴 THE ONE THE BAR NEEDS, because `trunk` fires when a stage is OVER.
       // Four of the trunk's five stages report nothing while they run, and on a
@@ -977,7 +977,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
         stage("pairformer-block-done", { completed, total, pass, passes: recycles + 1 }),
     });
     // 🔴 THE ONLY CONVERGENCE SIGNAL THIS MODEL HAS. AF2 recycles a STRUCTURE
-    // and stops on ColabFold's C-alpha metric (src/model/recycle-convergence.js);
+    // and stops on ColabFold's C-alpha metric (src/af2/model/recycle-convergence.js);
     // AF3, OpenDDE and ESMFold2 recycle the trunk alone and produce no
     // coordinates until the sampler runs once at the end, so the single and
     // pair representations are all there is to ask. Both are already host
@@ -998,7 +998,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     // one already - the contact map is shown while the trunk is still
     // recycling - so the expectation over its bins is a predicted distance
     // matrix for free, and its RMS change is the quantity AF2 stops on. See
-    // src/model/feature-convergence.js.
+    // src/af3/feature-convergence.js.
     const distances = trunk.logits === undefined ? undefined
       : expectedDistances(trunk.logits, trunk.binEdges);
     recycleDeltas.push({
@@ -1409,7 +1409,7 @@ export async function foldBatch(device, batch, weights, options = {}) {
     positions, trunk, targetFeat, scores, ptm, iptm, chainPairIptm,
     // Per pass, how far the single and pair moved from the pass before. The
     // only convergence signal a trunk-only recycle has - see
-    // src/model/feature-convergence.js.
+    // src/af3/feature-convergence.js.
     recycleDeltas,
     // ...the representative coordinates the confidence head was given. Returned
     // because anything comparing a per-pair prediction against the PAE needs

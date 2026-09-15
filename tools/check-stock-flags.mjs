@@ -27,4 +27,5 @@ await runFolds({
   env: { LOCALFOLD_STOCK_FLAGS: "1" },
   question: "on a stock Chrome",
   broke: /enables (f16|subgroups|subgroup_size_control|chromium_experimental)|"error"|Error:|uncaptured/,
+  arm: "stock",
 });

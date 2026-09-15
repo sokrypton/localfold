@@ -10,9 +10,9 @@
  * first denoiser call still pays after one - which is every OTHER stage's
  * compile, since those build their pipelines inside their own run().
  */
-import { openAf3Store } from "../../src/af3/weights.js";
-import { diffusionWeights, atomReference } from "../../src/af3/diffusion-weights.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
+import { diffusionWeights, atomReference } from "../../src/af3/weights/diffusion-weights.js";
+import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

@@ -4,13 +4,13 @@
  * 🔴 IT EXISTS BECAUSE AF2's DOES NOT TRANSFER. `recycleConvergenceDistance`
  * compares C-alpha positions, and AF3, OpenDDE and ESMFold2 produce none until
  * the sampler runs once at the end - so for them the single and pair
- * representations are the only signal. See src/model/feature-convergence.js.
+ * representations are the only signal. See src/af3/feature-convergence.js.
  */
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import { distanceChange, expectedDistances, relativeChange, shouldStopRecycling }
-  from "../src/model/feature-convergence.js";
+  from "../src/af3/feature-convergence.js";
 
 describe("relativeChange", () => {
   it("is zero for a representation that did not move", () => {
@@ -100,7 +100,7 @@ describe("shouldStopRecycling", () => {
 
   it("🔴 is not fooled by GB1, where the trunk dips and then moves again", () => {
     // 0.488 under 0.5, then 1.092 - measured, and the reason one crossing is
-    // not enough. See src/model/feature-convergence.js.
+    // not enough. See src/af3/feature-convergence.js.
     const gb1 = [first, { distanceAngstroms: 0.488 }, { distanceAngstroms: 1.092 },
                  { distanceAngstroms: 0.394 }];
     assert.equal(shouldStopRecycling(gb1.slice(0, 2), 0.5), false, "one crossing is not enough");

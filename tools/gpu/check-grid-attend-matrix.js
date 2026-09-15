@@ -28,9 +28,9 @@
  * into a relative weight error, and uniform noise makes worse-conditioned
  * logits than a pair representation ever does.
  */
-import { gridSelfAttention } from "../../src/af3/pairformer-reference.js";
-import { Af3GridSelfAttentionGpu } from "../../src/af3/grid-attention-webgpu.js";
-import { supportsGridAttendMatrix } from "../../src/af3/grid-attention-matrix.js";
+import { gridSelfAttention } from "../../src/af3/trunk/pairformer-reference.js";
+import { Af3GridSelfAttentionGpu } from "../../src/af3/trunk/grid-attention-webgpu.js";
+import { supportsGridAttendMatrix } from "../../src/af3/trunk/grid-attention-matrix.js";
 
 const DIALECT = { swapTransposedBias: false };
 

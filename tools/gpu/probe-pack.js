@@ -29,14 +29,14 @@
  * - and either way it is 378 MiB bought with 494 ms. Measured here so that the
  * trade can be made deliberately rather than discovered.
  */
-import { openAf3Store, trunkWeights } from "../../src/af3/weights.js";
-import { diffusionWeights } from "../../src/af3/diffusion-weights.js";
-import { packBlockWeights } from "../../src/af3/diffusion-transformer-webgpu.js";
-import { packTransitionWeights } from "../../src/af3/transition-webgpu.js";
-import { packWeights as packTriangleWeights } from "../../src/triangle/weights.js";
-import { af3TriangleWeights } from "../../src/af3/triangle-webgpu.js";
-import { packGridAttentionWeights } from "../../src/af3/grid-attention-webgpu.js";
-import { packSingleAttentionWeights } from "../../src/af3/single-attention-webgpu.js";
+import { openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
+import { diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { packBlockWeights } from "../../src/af3/diffusion/diffusion-transformer-webgpu.js";
+import { packTransitionWeights } from "../../src/af3/trunk/transition-webgpu.js";
+import { packWeights as packTriangleWeights } from "../../src/kernels/triangle/weights.js";
+import { af3TriangleWeights } from "../../src/af3/trunk/triangle-webgpu.js";
+import { packGridAttentionWeights } from "../../src/af3/trunk/grid-attention-webgpu.js";
+import { packSingleAttentionWeights } from "../../src/af3/trunk/single-attention-webgpu.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;

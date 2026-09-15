@@ -29,13 +29,13 @@
 import { batchFromDump } from "./fold.js";
 import { sidechainGeometry } from "./sidechain-geometry.js";
 import { normalFrom } from "../../src/af3/fold.js";
-import { perAtomConditioning } from "../../src/af3/atom-conditioning-reference.js";
-import { atomCrossAttentionEncoder } from "../../src/af3/atom-encoder-reference.js";
-import { diffusionHead } from "../../src/af3/diffusion-reference.js";
-import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion-head-webgpu.js";
-import { openAf3Store } from "../../src/af3/weights.js";
+import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
+import { diffusionHead } from "../../src/af3/diffusion/diffusion-reference.js";
+import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
+import { openAf3Store } from "../../src/af3/weights/weights.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
-  from "../../src/af3/diffusion-weights.js";
+  from "../../src/af3/weights/diffusion-weights.js";
 import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {

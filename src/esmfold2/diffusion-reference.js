@@ -344,7 +344,7 @@ export { layerNorm, linear, constant };
  * `conditioning` back in to skip the pair half; see the note there.
  */
 // 🔴 NAMED `denoiseStep`, NOT `denoise`, AND NOT FOR TASTE. `denoise` is a
-// PARAMETER of src/af3/diffusion-sampler-reference.js's `sample`, and
+// PARAMETER of src/af3/diffusion/diffusion-sampler-reference.js's `sample`, and
 // test/module-references.test.js checks the whole project's exported names
 // against every file's free identifiers - so exporting it here makes that
 // parameter look like a reference to this function. Second time in this

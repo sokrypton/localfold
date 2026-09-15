@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "./harness.js";
 import { create, globals } from "webgpu";
 
-import { QueryOnlyTemplateGpu } from "../src/evoformer/template.js";
+import { QueryOnlyTemplateGpu } from "../src/af2/evoformer/template.js";
 
-import { FileTensorStore } from "../src/reference/tensor-store.js";
-import { errorMetrics } from "../src/triangle/types.js";
+import { FileTensorStore } from "../src/bundles/tensor-store.js";
+import { errorMetrics } from "../src/kernels/triangle/types.js";
 
 const enabled = process.env.LOCALFOLD_GPU_TESTS === "1";
 const MANIFEST = "test/fixtures/evoformer/model1-query-59-stack/manifest.json";

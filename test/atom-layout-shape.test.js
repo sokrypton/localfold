@@ -16,8 +16,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
-import { featuriseProtein } from "../src/af3/featurise.js";
-import { structuralBatch } from "../src/af3/structural-tokens.js";
+import { featuriseProtein } from "../src/af3/featurise/featurise.js";
+import { structuralBatch } from "../src/af3/featurise/structural-tokens.js";
 
 const QUERIES = 32;
 const KEYS = 128;

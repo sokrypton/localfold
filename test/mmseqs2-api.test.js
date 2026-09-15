@@ -6,7 +6,7 @@ import {
 } from "../src/input/mmseqs2-api.js";
 import { parseA3m } from "../src/input/a3m.js";
 import { AF3_FAMILIES, FOLDING_FAMILIES, SINGLE_SEQUENCE_FAMILIES }
-  from "../src/reference/manifests/index.js";
+  from "../src/bundles/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "../src/input/chains.js";
 

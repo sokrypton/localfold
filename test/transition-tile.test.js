@@ -8,7 +8,7 @@
 // generalised from the row count to the channel count to fix ESMFold2's trunk,
 // and the point of the generalisation is that only that row moves.
 import { describe, expect, it } from "./harness.js";
-import { transitionChunk, transitionRowTile } from "../src/af3/transition-webgpu.js";
+import { transitionChunk, transitionRowTile } from "../src/af3/trunk/transition-webgpu.js";
 
 // stack, rows, channels, factor, expected tile, expected chunk
 const SHAPES = [
