@@ -80,3 +80,55 @@ describe("the chain geometry gate", () => {
       { medianLow: 3.4, medianHigh: 4.2, worstFrom38: 2.8 });
   });
 });
+
+// 🔴 THE RULE LIVES IN src/ NOW, BECAUSE THE PAGE COULD NOT REACH tools/.
+// Every command-line fold gated on this and the SITE ran no geometry check at
+// all - the same shape as LOCALFOLD_STOCK_FLAGS, where the configuration every
+// gate checks was not the one that ships. Measured: intellifold2 in Flow
+// returns a fold this rule REFUSES on 1 seed in 6 (CA median 4.255 A against
+// 3.80) with pLDDT 83.30 beside it.
+describe("one rule, reachable from both the tools and the page", () => {
+  it("the tools' wrapper and src/ agree, because there is one implementation",
+    async () => {
+      const shared = await import("../src/af3/chain-geometry.js");
+      const tool = await import("../tools/gpu/chain-geometry.js");
+      assert.equal(tool.chainGeometryVerdict, shared.chainGeometryVerdict,
+        "the tools re-export the rule rather than carrying a second copy");
+      assert.deepEqual(tool.CHAIN_GEOMETRY_BANDS, shared.CHAIN_GEOMETRY_BANDS);
+    });
+
+  it("refuses the intellifold2 flow fold that the page used to draw", async () => {
+    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const verdict = chainGeometryVerdict({ caca: 4.255, worstCaca: 4.70 },
+      { plddt: 83.30 });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /not a chain/);
+    // ...and it names the pLDDT, because that is the number that said otherwise.
+    assert.match(verdict.reason, /83\.30/);
+  });
+
+  it("...and rosettafold3's flow fold, which is the collapsed kind", async () => {
+    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    assert.equal(chainGeometryVerdict({ caca: 3.071, worstCaca: 0.23 }).ok, false);
+  });
+
+  it("passes the diffusion folds those two models actually ship", async () => {
+    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    for (const good of [{ caca: 3.81, worstCaca: 3.85 },
+                        { caca: 3.76, worstCaca: 3.69 },
+                        { caca: 3.88, worstCaca: 4.08 }]) {
+      assert.equal(chainGeometryVerdict(good).ok, true, JSON.stringify(good));
+    }
+  });
+
+  // 🔴 ONLY THE TOOLS' WRAPPER MENTIONS A FLAG. "Pass --allow-broken-geometry"
+  // is advice for a terminal; the page shows the same verdict without it.
+  it("the CLI hint is the wrapper's, not the rule's", async () => {
+    const { chainGeometryVerdict } = await import("../src/af3/chain-geometry.js");
+    const { assertChainGeometry } = await import("../tools/gpu/chain-geometry.js");
+    const bare = chainGeometryVerdict({ caca: 1.0, worstCaca: 1.0 });
+    assert.ok(!bare.reason.includes("--allow-broken-geometry"));
+    const thrown = assertChainGeometry({ caca: 1.0, worstCaca: 1.0 }, { allow: true });
+    assert.match(thrown.reason, /--allow-broken-geometry/);
+  });
+});

@@ -26,7 +26,8 @@ const page = readFileSync(new URL("../index.html", import.meta.url), "utf8");
 describe("the AlphaFold 3 families", () => {
   it("lists every bundle that builds that graph, and only those", () => {
     assert.deepEqual([...AF3_FAMILIES].sort(),
-                     ["af3", "boltz2", "openbind0", "opendde", "protenix2"]);
+                     ["af3", "boltz2", "intellifold2", "openbind0", "opendde",
+                      "protenix2", "rosettafold3"]);
     for (const family of AF3_FAMILIES) {
       assert.ok(family in MODEL_BUNDLES, `${family} has no bundle`);
     }

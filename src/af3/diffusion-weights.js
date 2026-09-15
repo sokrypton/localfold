@@ -86,6 +86,14 @@ function atomBlock(store, root, index) {
     kProjection: at("k_projection/weights"),
     vProjection: at("v_projection/weights"),
     gatingQuery: at("gating_query/weights"),
+    // rosettafold3's kq_norm in the ATOM stacks - see the token transformer's.
+    // Their tensors sit under the same root the rest of the block uses, because
+    // rf3 is in PER_BLOCK_ATOM_PAIR_LAYER_NORM and so takes the
+    // `__layer_stack_no_per_layer` name either way.
+    queryLayerNormScale: maybe("query_layer_norm/scale"),
+    queryLayerNormOffset: maybe("query_layer_norm/offset"),
+    keyLayerNormScale: maybe("key_layer_norm/scale"),
+    keyLayerNormOffset: maybe("key_layer_norm/offset"),
     Transition2: at("transition2/weights"),
     AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
     AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
@@ -214,12 +222,47 @@ async function atomPairNorm(store, stackRoot, perBlock, blocks = 3) {
            scale: scale.map((one) => new Float32Array(one.length).fill(1)) };
 }
 
+/**
+ * The one constant vector added to every atom's embedding, under either name.
+ *
+ * boltz2 calls it `embed_atom_features_bias` (its features go through ONE
+ * biased Linear where AF3 sums five bias-free ones) and rosettafold3
+ * `conformer_embedding_bias` (a collapsed MLP subtree whose input is zero and
+ * whose output is not). No checkpoint carries both, and a checkpoint carrying
+ * NEITHER - which is AF3, openbind0, opendde, protenix2 and intellifold2 - gets
+ * null and the term does not exist.
+ */
+async function constantAtomBias(store, ...names) {
+  const found = names.filter((name) => store.manifest?.tensors?.[name] !== undefined);
+  if (found.length > 1) {
+    throw new Error(`this bundle carries ${found.join(" and ")}; they are the `
+      + "same term and a checkpoint with both is a converter bug, not a sum");
+  }
+  return found.length === 0 ? null : store.tensor(found[0]);
+}
+
 async function atomBlockWith(store, stack, index, dialect) {
   const block = await bind(store, atomBlock(store, stack, index));
   block.chainedAtomLayerNorm = dialect.chainedAtomLayerNorm;
   block.keyMaskedAtomAttention = dialect.keyMaskedAtomAttention;
+  // 🔴 CHAI-1 AND IntelliFold-2 RE-ZERO THE PADDED ATOM SLOTS AT THE TOP OF
+  // EVERY BLOCK, because they pad the flat atom axis INSIDE each attention
+  // call rather than once for the stack. Carried per block, like the other
+  // two, so the DECODER - which sees no dialect object - reads it off its
+  // weights the same way.
+  block.maskAtomActPerBlock = dialect.maskAtomActPerBlock;
+  // 🔴 rosettafold3's ATOM blocks take the same no_residual wiring its TOKEN
+  // transformer does, and only the dialect says so - there is no tensor whose
+  // presence marks it. Carried per block so the DECODER, which sees no dialect
+  // object, reads it the way it reads the other three.
+  block.diffusionNoResidual = dialect.diffusionNoResidual;
+  if (block.diffusionNoResidual === undefined) {
+    throw new Error("an atom block carries no diffusionNoResidual: AF3 adds the "
+      + "attention and the transition through two residuals, rosettafold3 one");
+  }
   if (block.chainedAtomLayerNorm === undefined
-      || block.keyMaskedAtomAttention === undefined) {
+      || block.keyMaskedAtomAttention === undefined
+      || block.maskAtomActPerBlock === undefined) {
     throw new Error("an atom block's dialect flags have no defaults");
   }
   return block;
@@ -284,9 +327,19 @@ export async function targetFeatureWeights(store) {
       // embedding, about a quarter of the conditioning's own std, taking
       // per-atom corr to 0.912 with byte-identical inputs and carrying into
       // everything downstream.
-      embedAtomFeaturesBias:
-        store.manifest?.tensors?.[`${root}_embed_atom_features_bias`] === undefined
-          ? null : await store.tensor(`${root}_embed_atom_features_bias`),
+      // 🔴 AND RoseTTAFold3 REACHES THE SAME SHAPE BY A DIFFERENT ROUTE, under
+      // a different name. Its atom single rep also takes
+      // `process_atom_level_embedding(f['atom_level_embedding'])`, and without
+      // conformer embeddings that input is all ZEROS - but the MLP has biases
+      // and its tail is a LayerNorm, so it emits a fixed NONZERO vector, the
+      // same for every atom and two thirds the magnitude of the ref-feature
+      // embedding. A zero feature is not a zero contribution. The reference's
+      // converter collapses that subtree to one [128] constant, exactly as
+      // boltz2's Linear bias is one, so the two share this field and the
+      // forward needs no second branch.
+      embedAtomFeaturesBias: await constantAtomBias(
+        store, `${root}_embed_atom_features_bias`,
+        `${root}_conformer_embedding_bias`),
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
@@ -383,9 +436,9 @@ export async function atomReference(store) {
     embedRefCharge: await T("diffusion_embed_ref_charge/weights"),
     embedRefAtomName: await T("diffusion_embed_ref_atom_name/weights"),
     // ...and the diffusion head's own copy of it; see targetFeatureWeights.
-    embedAtomFeaturesBias:
-      store.manifest?.tensors?.[`${HEAD}/diffusion_embed_atom_features_bias`] === undefined
-        ? null : await T("diffusion_embed_atom_features_bias"),
+    embedAtomFeaturesBias: await constantAtomBias(
+      store, `${HEAD}/diffusion_embed_atom_features_bias`,
+      `${HEAD}/diffusion_conformer_embedding_bias`),
   };
 }
 
@@ -611,6 +664,8 @@ export async function diffusionWeights(store, superBlocks = 6) {
   };
   const folded = perBlockPair ? await foldPerBlockPairNorm() : null;
   const projections = folded === null ? rawProjections : folded.projections;
+  const maybeTx = (leaf, index) =>
+    stackedIfPresent(store, `${txStackFor(perBlockPair)}${leaf}`, index, 2);
   const groups = [];
   for (let s = 0; s < superBlocks; s += 1) {
     const blocks = [];
@@ -626,6 +681,17 @@ export async function diffusionWeights(store, superBlocks = 6) {
         kProjection: at("k_projection/weights"),
         vProjection: at("v_projection/weights"),
         gatingQuery: at("gating_query/weights"),
+        // 🔴 rosettafold3's kq_norm: A TRAINED LayerNorm ON q AND k, over the
+        // FLATTENED num_head * key_dim axis rather than per head, applied after
+        // the projection and before the key_dim scaling. Only the diffusion
+        // score-model transformers set it - the trunk and confidence
+        // pairformers call the same reference function with it off - and no
+        // other checkpoint carries the tensors, so `maybe` returns null and the
+        // kernel is generated without the term.
+        queryLayerNormScale: maybeTx("query_layer_norm/scale", s * 4 + inner),
+        queryLayerNormOffset: maybeTx("query_layer_norm/offset", s * 4 + inner),
+        keyLayerNormScale: maybeTx("key_layer_norm/scale", s * 4 + inner),
+        keyLayerNormOffset: maybeTx("key_layer_norm/offset", s * 4 + inner),
         Transition2: at("transition2/weights"),
         AdaptiveZeroCondWeights: at("adaptive_zero_cond/weights"),
         AdaptiveZeroCondBias: at("adaptive_zero_cond/bias"),
@@ -689,6 +755,11 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // the per-block projections above - see foldPerBlockPairNorm. The
       // LayerNorm itself still runs; only its affine has moved.
       pairNormPerBlock: perBlockPair,
+      // 🔴 rosettafold3's BLOCK WIRING. Carried on the weights rather than
+      // passed as a dialect, because that is how every other structural flag
+      // reaches these stacks - see `chainedAtomLayerNorm`. False everywhere
+      // else, and the encoder generates the kernels it always did.
+      noResidual: dialect.diffusionNoResidual === true,
       pairInputLayerNormScale: perBlockPair
         ? new Float32Array(folded.channels).fill(1)
         : await store.tensor(`${TX}/pair_input_layer_norm/scale`),
@@ -736,6 +807,14 @@ export async function diffusionWeights(store, superBlocks = 6) {
       lnormTrunkPairCondOffset: await O("diffusion_lnorm_trunk_pair_cond/offset"),
       embedTrunkPairCond: await T("diffusion_embed_trunk_pair_cond/weights"),
       atomPositionsToFeatures: await T("diffusion_atom_positions_to_features/weights"),
+      // 🔴 rosettafold3's CHIRALITY PROJECTION, and the DIFFUSION encoder's
+      // alone. The trunk's input embedder passes no coordinates
+      // (`token_atoms_act=None` there), so the term has nowhere to enter; only
+      // this stack sees the noisy structure. [3, 128], beside the positions
+      // projection it is added to. See src/af3/chiral-gradient.js.
+      atomChiralToFeatures:
+        store.manifest?.tensors?.[`${HEAD}/diffusion_atom_chiral_to_features/weights`]
+          === undefined ? null : await T("diffusion_atom_chiral_to_features/weights"),
       projectAtomFeaturesForAggr: await T("diffusion_project_atom_features_for_aggr/weights"),
       blocks: [await atomBlockWith(store, encoderStackFor(atomPerBlock), 0, dialect),
                await atomBlockWith(store, encoderStackFor(atomPerBlock), 1, dialect),

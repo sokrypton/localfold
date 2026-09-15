@@ -29,7 +29,8 @@
  * matters more here than anywhere - a nucleotide has a C4 AND a C4', a C2 and a
  * C2', and the primes are the part a reader drops.
  */
-import { featuriseProtein } from "../../src/af3/featurise.js";
+import { af3BatchFromA3m } from "../../src/af3/batch.js";
+import { featuriserDialect } from "../../src/af3/dialect.js";
 import { foldBatch, atomName } from "../../src/af3/fold.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/reference-conformers.js";
 import { nucleicConformers } from "../../src/af3/reference-conformers-nucleic.js";
@@ -71,7 +72,20 @@ export async function main(device, args) {
   const store = await openAf3Store(option(args, "model", "/model-af3-full-f32/manifest.json"));
   const weights = await foldWeights(store);
 
-  const batch = featuriseProtein(chains.join(":"), { chainKinds });
+  // 🔴 THE BUNDLE'S OWN FEATURISER CONVENTIONS, WHICH THIS PROBE DID NOT PASS.
+  // It called `featuriseProtein` directly with nothing but `chainKinds`, so
+  // every nucleic number this repository has recorded - including "OpenDDE is
+  // 15% short" - was AlphaFold 3's featurisation fed to another model's
+  // weights. That is the same fault `fold-opendde.js` had, where fixing it
+  // moved 6MRR from 1.527 to 1.518 and every published OpenDDE figure with it.
+  //
+  // 🔴 AND IT MATTERS MORE ON A NUCLEIC CHAIN THAN ANYWHERE. `dropTerminalAtoms`
+  // removes the 5' OP3, and the flat atom axis is built from the live atoms -
+  // so getting it wrong shifts EVERY atom index in the chain, not one slot.
+  // Four families drop it and four do not.
+  const batchDialect = weights.trunk?.dialect ?? weights.dialect;
+  const batch = af3BatchFromA3m(chains.join(":"), null,
+    { ...featuriserDialect(batchDialect), chainKinds }).batch;
   const result = await foldBatch(device, batch, weights, {
     mode, steps, recycles: Number(option(args, "recycles", "3")), seed: 1,
   });

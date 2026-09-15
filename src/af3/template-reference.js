@@ -35,11 +35,33 @@ import {
 } from "./template-features.js";
 
 const RESTYPES = 31;
-const CHANNELS = 64;
+
+/**
+ * The template stack's own channel width, off the weights.
+ *
+ * 🔴 IT IS 64 IN FIVE CHECKPOINTS AND 256 IN IntelliFold-2, and it was a
+ * `const CHANNELS = 64` here and in template-webgpu.js. `templateWeights`
+ * reads it from the norm after the stack - `output_layer_norm/scale` for the
+ * nine-projection embedder and `v_norm/scale` for the fused one - which is the
+ * one tensor both forms carry that states it. Required rather than defaulted:
+ * a caller handing weights from an older loader gets an error, not AF3's 64
+ * silently applied to a wider stack.
+ */
+function stackChannels(weights) {
+  const channels = weights.channels;
+  if (!Number.isInteger(channels) || channels < 1) {
+    throw new Error("template weights carry no `channels`: it is read from "
+      + "output_layer_norm/scale (or v_norm/scale), never assumed to be 64");
+  }
+  return channels;
+}
 
 /** One block of the template stack: the pair half of a pairformer block. */
 /** `transition1` is [CHANNELS, CHANNELS * factor * 2]; the gated form doubles. */
-export function templateTransitionFactor(pairTransition) {
+export function templateTransitionFactor(pairTransition, CHANNELS) {
+  if (!Number.isInteger(CHANNELS)) {
+    throw new Error("templateTransitionFactor needs the stack's channel width");
+  }
   const factor = pairTransition.transition1.length / (CHANNELS * CHANNELS * 2);
   if (!Number.isInteger(factor) || factor < 1) {
     throw new Error(`a template transition1 of ${pairTransition.transition1.length} `
@@ -48,15 +70,15 @@ export function templateTransitionFactor(pairTransition) {
   return factor;
 }
 
-function templateBlock(pair, pairMask, tokens, weights, dialect) {
+function templateBlock(pair, pairMask, tokens, weights, dialect, CHANNELS) {
   let act = Float32Array.from(pair);
   const add = (delta) => {
     for (let index = 0; index < act.length; index += 1) act[index] += delta[index];
   };
   add(triangleMultiplication(act, pairMask, tokens, CHANNELS, "outgoing",
-                             weights.triangleMultiplicationOutgoing));
+                             weights.triangleMultiplicationOutgoing, dialect));
   add(triangleMultiplication(act, pairMask, tokens, CHANNELS, "incoming",
-                             weights.triangleMultiplicationIncoming));
+                             weights.triangleMultiplicationIncoming, dialect));
   add(gridSelfAttention(act, pairMask, tokens, CHANNELS, false,
                         weights.pairAttention1, dialect));
   add(gridSelfAttention(act, pairMask, tokens, CHANNELS, true,
@@ -71,7 +93,7 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
   // answer. `transition1` is [channels, channels * factor * 2]: the gated form
   // doubles it.
   add(transition(act, tokens * tokens, CHANNELS, weights.pairTransition,
-                 templateTransitionFactor(weights.pairTransition)));
+                 templateTransitionFactor(weights.pairTransition, CHANNELS)));
   return act;
 }
 
@@ -109,6 +131,7 @@ function templateBlock(pair, pairMask, tokens, weights, dialect) {
  * a second one. The packing differs; the arithmetic does not.
  */
 export function fusedTemplateEmbedding(input, weights, dialect) {
+  const CHANNELS = stackChannels(weights);
   const { tokens, pair, pairMask, templates } = input;
   const pairs = tokens * tokens;
   const features = input.templateFeatures;
@@ -163,7 +186,7 @@ export function fusedTemplateEmbedding(input, weights, dialect) {
     const before = dialect.templateStackOuterResidual
       ? Float32Array.from(act) : undefined;
     for (let index = 0; index < weights.blocks.length; index += 1) {
-      act = templateBlock(act, pairMask, tokens, weights.blocks[index], dialect);
+      act = templateBlock(act, pairMask, tokens, weights.blocks[index], dialect, CHANNELS);
     }
     if (before !== undefined) {
       for (let index = 0; index < act.length; index += 1) act[index] += before[index];
@@ -191,6 +214,7 @@ export function fusedTemplateEmbedding(input, weights, dialect) {
 }
 
 export function templateEmbedding(input, weights, dialect) {
+  const CHANNELS = stackChannels(weights);
   const { tokens, pair, pairMask, templates } = input;
   const pairs = tokens * tokens;
   const slots = input.slots ?? [];
@@ -324,7 +348,8 @@ export function templateEmbedding(input, weights, dialect) {
 
     let embedded = act;
     for (let index = 0; index < weights.blocks.length; index += 1) {
-      embedded = templateBlock(embedded, pairMask, tokens, weights.blocks[index], dialect);
+      embedded = templateBlock(embedded, pairMask, tokens, weights.blocks[index], dialect,
+                               CHANNELS);
     }
     embedded = layerNorm(embedded, pairs, CHANNELS, weights.outputLayerNormScale,
                          weights.outputLayerNormOffset);

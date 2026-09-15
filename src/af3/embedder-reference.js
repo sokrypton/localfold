@@ -91,7 +91,8 @@ export function relativeEncoding(tokens, features, maxRelativeIdx = 32,
  * term is the whole of what the MSA stack was given: `z_after_msa` read 3.16e-1
  * from af3-any-model's with the z-init exact at 5.05e-8.
  */
-export function msaFeatures(rows, deletionMatrix, sequences, tokens, width = 34) {
+export function msaFeatures(rows, deletionMatrix, sequences, tokens, width = 34,
+                            pairedQueryRow = false) {
   const output = new Float32Array(sequences * tokens * width);
   for (let index = 0; index < sequences * tokens; index += 1) {
     const base = index * width;
@@ -102,8 +103,10 @@ export function msaFeatures(rows, deletionMatrix, sequences, tokens, width = 34)
     // ...arctan-squashed rather than clipped, so a column with many deletions
     // stays distinguishable from one with a few instead of saturating.
     output[base + 33] = Math.atan(deletions / 3) * (2 / Math.PI);
-    // The paired flag, where the model has one. Row 0 is the query.
-    if (width > 34 && index < tokens) output[base + 34] = 1;
+    // The paired flag, where the model has one AND its convention puts the
+    // query row in it. Row 0 is the query. rosettafold3 carries the column and
+    // leaves it identically zero - see `msaPairedQueryRow` in dialect.js.
+    if (width > 34 && pairedQueryRow && index < tokens) output[base + 34] = 1;
   }
   return output;
 }
@@ -227,8 +230,16 @@ export function embed(input, weights) {
   // The width is the WEIGHT's, not a constant: boltz2's is 35 and everyone
   // else's is 34, and reading 34 off a [35, 64] matrix is a silent prefix.
   const msaFeatureWidth = weights.msaActivations.length / msaChannels;
+  // ...and where that column exists, whether the QUERY ROW carries it. boltz2
+  // says yes and rosettafold3 says no; see `msaPairedQueryRow` in dialect.js.
+  if (msaFeatureWidth > 34 && weights.dialect?.msaPairedQueryRow === undefined) {
+    throw new Error("weights.dialect.msaPairedQueryRow has no default: this "
+      + "bundle carries an is_paired column and only the dialect says whether "
+      + "the query row is in it");
+  }
   const features = msaFeatures(input.msaRows, input.deletionMatrix, sequences, tokens,
-                               msaFeatureWidth);
+                               msaFeatureWidth,
+                               weights.dialect?.msaPairedQueryRow === true);
   const msa = linear(features, rows, msaFeatureWidth, msaChannels, weights.msaActivations);
   const fromTarget = linear(targetFeat, tokens, featureWidth, msaChannels,
                             weights.extraMsaTargetFeat);

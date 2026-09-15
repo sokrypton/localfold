@@ -185,7 +185,8 @@ export function transition(input, rows, channels, weights, factor = 4) {
  * @param {"outgoing"|"incoming"} direction
  * @param {object} weights
  */
-export function triangleMultiplication(pair, mask, n, channels, direction, weights) {
+export function triangleMultiplication(pair, mask, n, channels, direction, weights,
+                                       dialect = undefined) {
   const pairs = n * n;
   const normalised = layerNorm(pair, pairs, channels, weights.leftNormInputScale,
                                weights.leftNormInputOffset);
@@ -224,7 +225,21 @@ export function triangleMultiplication(pair, mask, n, channels, direction, weigh
             total += a[plane + k * n + j] * b[plane + k * n + i];
           }
         }
-        product[plane + i * n + j] = total;
+        // 🔴 RoseTTAFold3 DIVIDES BY THE SEQUENCE LENGTH BEFORE THE CENTRE
+        // LAYERNORM, and a LayerNorm is scale-invariant, so this looks like it
+        // cannot matter. It matters because of the norm's EPSILON: dividing by
+        // L shrinks the variance by L^2 - 4624 at 68 tokens - and once the pair
+        // track decays with depth, `var` stops dominating `var + eps` and the
+        // normalisation lands somewhere else. rf3 writes
+        // `einsum(left, right / float(L))` in both directions; of3, protenix,
+        // if2, opendde and boltz2 all write the plain einsum, so this is a
+        // per-model branch and not a change to the shared path.
+        //
+        // 🔴 AND IT IS NOT A WEIGHT FOLD. Folding 1/L into the projection would
+        // reproduce the pre-norm tensor, and a LayerNorm's eps does not commute
+        // with a scale - which is the only reason the term is observable.
+        product[plane + i * n + j] = dialect?.triangleMulDivideByLength === true
+          ? total / n : total;
       }
     }
   }
@@ -354,11 +369,28 @@ export function gridSelfAttention(pair, mask, n, channels, transpose, weights, d
     }
   }
 
+  // 🔴 RoseTTAFold3's GATE AND OUTPUT PROJECTION CARRY TRAINED BIASES, and the
+  // GATE's is the one that matters. Its `to_g.bias` initialises to 1.0 against
+  // a ZERO-initialised weight, so the gate is bias-DOMINATED: dropping it
+  // roughly halves the gate, and this runs 96 times in an rf3 trunk. No other
+  // checkpoint has a slot for either, and null means the term does not exist.
   const gate = linear(act, pairs, channels, width, weights.gatingQuery, null, true);
+  const gateBias = weights.gatingQueryBias;
+  if (gateBias != null) {
+    for (let row = 0; row < pairs; row += 1) {
+      for (let w = 0; w < width; w += 1) gate[row * width + w] += gateBias[w];
+    }
+  }
   for (let index = 0; index < gathered.length; index += 1) {
     gathered[index] *= sigmoid(gate[index]);
   }
   const projected = linear(gathered, pairs, width, channels, weights.outputProjection);
+  const outBias = weights.outputProjectionBias;
+  if (outBias != null) {
+    for (let row = 0; row < pairs; row += 1) {
+      for (let c = 0; c < channels; c += 1) projected[row * channels + c] += outBias[c];
+    }
+  }
 
   if (!transpose) return projected;
   // ...and back, so the residual lands on the orientation it came from.
@@ -446,9 +478,9 @@ export function pairformerBlock(state, weights, dialect, extraPairBias = undefin
   };
 
   addPair(triangleMultiplication(pair, pairMask, tokens, pairChannels, "outgoing",
-                                 weights.triangleMultiplicationOutgoing));
+                                 weights.triangleMultiplicationOutgoing, dialect));
   addPair(triangleMultiplication(pair, pairMask, tokens, pairChannels, "incoming",
-                                 weights.triangleMultiplicationIncoming));
+                                 weights.triangleMultiplicationIncoming, dialect));
   addPair(gridSelfAttention(pair, pairMask, tokens, pairChannels, false,
                             weights.pairAttention1, dialect));
   addPair(gridSelfAttention(pair, pairMask, tokens, pairChannels, true,

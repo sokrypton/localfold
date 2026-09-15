@@ -1,4 +1,4 @@
-import { concatenateAs, writeInto } from "../runtime/float16.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
 
 const ORDER = [
   "layerNormInWeight", "layerNormInBias",
@@ -145,18 +145,12 @@ export function trianglePackOrder(options = {}) {
   return order;
 }
 
+// 🔴 THIS FUNCTION IS WHERE THE SHARED HELPER CAME FROM. The triangle solved
+// the six-copies problem locally and correctly - one list, both loops - which
+// is exactly why nothing here ever had the outer product mean's bug. Promoted
+// to src/runtime/weight-pack.js rather than reinvented; see its header.
 function packOrder(weights, order, precision) {
-  const offsets = {};
-  let elementCount = 0;
-  for (const name of order) {
-    if (weights[name] === undefined) throw new Error(`triangle weights missing ${name}`);
-    offsets[name] = elementCount;
-    elementCount += weights[name].length;
-  }
-  const data = concatenateAs(precision, elementCount, (target) => {
-    for (const name of order) writeInto(target, weights[name], offsets[name]);
-  });
-  return { data, offsets };
+  return packNamedWeights(weights, { label: "triangle weights", order, precision });
 }
 
 

@@ -35,6 +35,100 @@ const PLDDT_BINS = 50;
 const DGRAM_BINS = 39;
 const DGRAM_MIN = 3.25;
 const DGRAM_MAX = 50.75;
+/**
+ * 🔴 RoseTTAFold3 BINS THE SAME RANGE ONE MORE TIME AND COUNTS DIFFERENTLY.
+ * AF3 has 39 EDGES and a bin per edge, the last catching everything past
+ * 50.75; rf3 has 39 BOUNDARIES and 40 bins, the index being how many of them
+ * the distance exceeds - so it has a bin BELOW 3.25 that AF3 has no equivalent
+ * of, and its top bin starts one boundary later. The two are not a
+ * reparameterisation of each other and the bundle says which: rf3's
+ * `distogram_feat_project` is [40, 128] against [39, 128].
+ */
+const CA_DGRAM_BINS = 40;
+
+/**
+ * RoseTTAFold3's s_inputs width, where this port's `target_feat` is 447.
+ *
+ * The two missing columns are residue-vocabulary classes our alphabet does not
+ * carry. They are zero on every input built here, which a PER-FEATURE norm
+ * would not care about - but `maskedGlobalNorm` reduces ACROSS the feature
+ * axis, so each of them still contributes `mean^2` to the variance sum, once
+ * per real token. Upstream measured the correction at pae max|d| 0.047 -> 0.022.
+ */
+export const RF3_S_INPUTS_WIDTH = 449;
+
+/**
+ * A parameter-free LayerNorm over a WHOLE tensor, real tokens only.
+ *
+ * 🔴 THE MASK IS WHY THIS IS NOT A ONE-LINER. A statistic that reduces over
+ * more than the feature axis is padding-sensitive in a way a per-feature one is
+ * not: upstream measured a 76-residue chain padded into a 128-token bucket at
+ * PAE ~28 A everywhere and pTM 0.04 against 0.89 for the same fold, purely from
+ * counting the padding into the mean.
+ *
+ * @param {Float32Array} values `rows * channels`
+ * @param {Float32Array} mask   one per ROW, broadcast over the channels
+ * @param {number} vendorWidth  the width to normalise OVER, where it is wider
+ *   than `channels`; the extra columns are assumed zero and so contribute
+ *   `mean^2` apiece.
+ */
+export function maskedGlobalNorm(values, mask, rows, channels,
+                                 vendorWidth = channels) {
+  let live = 0;
+  let total = 0;
+  for (let row = 0; row < rows; row += 1) {
+    if (!(mask[row] > 0)) continue;
+    live += 1;
+    const base = row * channels;
+    for (let c = 0; c < channels; c += 1) total += values[base + c];
+  }
+  const count = Math.max(live * vendorWidth, 1);
+  const mean = total / count;
+  let variance = 0;
+  for (let row = 0; row < rows; row += 1) {
+    if (!(mask[row] > 0)) continue;
+    const base = row * channels;
+    for (let c = 0; c < channels; c += 1) {
+      const d = values[base + c] - mean;
+      variance += d * d;
+    }
+  }
+  // ...each dropped column is zero, so it contributes mean^2, once per real row.
+  variance += (vendorWidth - channels) * live * mean * mean;
+  const inverse = 1 / Math.sqrt(variance / count + 1e-5);
+  const output = new Float32Array(values.length);
+  for (let index = 0; index < values.length; index += 1) {
+    output[index] = (values[index] - mean) * inverse;
+  }
+  return output;
+}
+
+/** rf3's boundaries, and the bin is how many of them the distance is past. */
+export function caDistogramFeatures(positions, pairMask, tokens) {
+  const bounds = new Float64Array(CA_DGRAM_BINS - 1);
+  for (let at = 0; at < CA_DGRAM_BINS - 1; at += 1) {
+    bounds[at] = DGRAM_MIN + at * ((DGRAM_MAX - DGRAM_MIN) / (CA_DGRAM_BINS - 1));
+  }
+  const output = new Float32Array(tokens * tokens * CA_DGRAM_BINS);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      // ...the reference takes a real square root here and adds 1e-10 under it,
+      // rather than comparing squares as AF3's does. Kept, because the boundary
+      // arithmetic is what decides a bin and squaring the bounds moves the
+      // comparison by an ulp at the edges.
+      let squared = 1e-10;
+      for (let axis = 0; axis < 3; axis += 1) {
+        const difference = positions[i * 3 + axis] - positions[j * 3 + axis];
+        squared += difference * difference;
+      }
+      const distance = Math.sqrt(squared);
+      let bin = 0;
+      for (let at = 0; at < bounds.length; at += 1) if (distance > bounds[at]) bin += 1;
+      output[(i * tokens + j) * CA_DGRAM_BINS + bin] = pairMask[i * tokens + j];
+    }
+  }
+  return output;
+}
 
 /**
  * A one-hot distogram of the predicted structure, 39 bins from 3.25 to 50.75 A.
@@ -258,6 +352,21 @@ export function confidenceHead(input, weights, block, dialect) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
   }
 
+  // 🔴 RoseTTAFold3 NORMALISES EVERY DETACHED TRUNK INPUT OVER THE WHOLE TENSOR
+  // FIRST. Parameter-free, over REAL TOKENS ONLY, and it runs before anything
+  // else here reads them. See `maskedGlobalNorm` and the flag's note in
+  // dialect.js.
+  let { pair: pairIn, single: singleIn, targetFeat } = input;
+  if (dialect?.confidenceGlobalNorm === true) {
+    pairIn = maskedGlobalNorm(pairIn, pairMask, pairs, pairChannels);
+    singleIn = maskedGlobalNorm(singleIn, seqMask, tokens, singleChannels);
+    // ...and target_feat over the VENDOR's width, which is two columns wider
+    // than ours. See the flag's note.
+    targetFeat = maskedGlobalNorm(targetFeat, seqMask, tokens,
+                                  weights.targetFeatWidth, RF3_S_INPUTS_WIDTH);
+  }
+  input = { ...input, pair: pairIn, single: singleIn, targetFeat };
+
   // 🔴 ONE DIALECT REBUILDS z RATHER THAN ADDING TO IT; see `boltz2Reembed`.
   let pair;
   let single;
@@ -274,8 +383,19 @@ export function confidenceHead(input, weights, block, dialect) {
                         weights.leftTargetFeatProject);
     const right = linear(input.targetFeat, tokens, weights.targetFeatWidth, pairChannels,
                          weights.rightTargetFeatProject);
-    const dgram = distogramFeatures(input.pseudoBeta, pairMask, tokens);
-    const embedded = linear(dgram, pairs, DGRAM_BINS, pairChannels,
+    // 🔴 THE BIN COUNT IS THE WEIGHT'S, so a bundle that disagrees with the
+    // dialect is a shape error rather than a silent prefix. See
+    // caDistogramFeatures for what rf3's forty bins are.
+    const caDgram = dialect?.confidenceCaDgram === true;
+    const dgramBins = weights.distogramFeatProject.length / pairChannels;
+    if (dgramBins !== (caDgram ? CA_DGRAM_BINS : DGRAM_BINS)) {
+      throw new Error(`this bundle's distogram_feat_project has ${dgramBins} bins `
+        + `and its dialect asks for ${caDgram ? CA_DGRAM_BINS : DGRAM_BINS}`);
+    }
+    const dgram = caDgram
+      ? caDistogramFeatures(input.pseudoBeta, pairMask, tokens)
+      : distogramFeatures(input.pseudoBeta, pairMask, tokens);
+    const embedded = linear(dgram, pairs, dgramBins, pairChannels,
                             weights.distogramFeatProject);
 
     pair = Float32Array.from(input.pair);

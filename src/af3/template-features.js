@@ -495,6 +495,100 @@ export function packTemplateGeometry(geometry, tokens) {
  * @param {number} tokens
  * @returns {Float32Array} tokens * tokens * 109
  */
+/**
+ * RoseTTAFold3's template features: 66 columns, and NOT a geometry embedding.
+ *
+ * 🔴 IT IS DISTANCE-DISTRIBUTION CONDITIONING, NOT A TEMPLATE IN THE OTHER
+ * MODELS' SENSE. boltz2's 109 columns and protenix2's 108 carry a distogram,
+ * restype one-hots, a unit vector and a frame mask; rf3's 66 are a CA-CA
+ * distance histogram, a coverage flag and a noise level, and nothing else. It
+ * rides the same fused forward and the same weight scopes - `z_proj`, `a_proj`,
+ * two `tmpl_pairformer` blocks, `v_norm`, `u_proj` - which is exactly why a
+ * shape check cannot tell the three apart: only `a_proj`'s first dimension can,
+ * and it is 66 here against 108 and 109.
+ *
+ * 🔴 AND ITS BINS ARE TWO ARITHMETIC SEQUENCES, NOT ONE. `DEFAULT_DISTOGRAM_BINS`
+ * is `concat(arange(1.0, 4.0, 0.1), arange(4.0, 20.5, 0.5))` - 30 boundaries at
+ * 0.1 A resolution from 1.0 to 3.9, then 33 at 0.5 A from 4.0 to 20.0, 63 in all
+ * and so 64 bins. That is a CLOSE range: everything past 20 A lands in the last
+ * bin, where AlphaFold 3's distogram runs to 50.75. The bin is the COUNT of
+ * boundaries the distance exceeds, so a NaN maps to the last bin by mapping the
+ * distance to a large number first.
+ *
+ * 🔴 AND THE NOISE LEVEL IS A CONSTANT HERE. `af3_noise_scale_to_noise_level(t)`
+ * is `(log(t / 16) + 1.2) / 1.5`, and an EXACT template has noise_scale 0 - so
+ * the reference feeds an epsilon, and the column is masked by `has_condition`
+ * anyway. It exists because rf3 can also condition on a NOISED template, which
+ * nothing here builds.
+ *
+ * @param {{aatype: ArrayLike<number>, atomPositions: ArrayLike<number>,
+ *          atomMask: ArrayLike<number>}} template
+ * @param {ArrayLike<number>} asymMask2d [tokens * tokens], 1 within a chain
+ * @param {number} tokens
+ * @returns {Float32Array} tokens * tokens * 66
+ */
+export const RF3_TEMPLATE_BINS = 64;
+export const RF3_TEMPLATE_WIDTH = RF3_TEMPLATE_BINS + 2;
+
+/** The 63 boundaries, in the reference's own two pieces. */
+export function rosettafold3DistanceBoundaries() {
+  const bounds = [];
+  // arange(1.0, 4.0, 0.1) - thirty of them, and built by INDEX rather than by
+  // repeated addition, which drifts: 1.0 + 0.1 * 29 is not the same float as
+  // adding 0.1 twenty-nine times, and a boundary is a comparison.
+  for (let at = 0; at < 30; at += 1) bounds.push(1.0 + at * 0.1);
+  // arange(4.0, 20.5, 0.5) - thirty-three.
+  for (let at = 0; at < 33; at += 1) bounds.push(4.0 + at * 0.5);
+  return bounds;
+}
+
+export function rosettafold3TemplateFeatures(template, asymMask2d, tokens) {
+  const { aatype, atomPositions, atomMask } = template;
+  const slots = NUM_DENSE;
+  const width = RF3_TEMPLATE_WIDTH;
+  const bounds = rosettafold3DistanceBoundaries();
+
+  // The token centre is CA, which is entry 1 of the backbone triple (C, CA, N).
+  const ca = new Float32Array(tokens * 3);
+  const caMask = new Float32Array(tokens);
+  for (let token = 0; token < tokens; token += 1) {
+    const bb = slotOf(BACKBONE_SLOTS, aatype[token]);
+    const slot = bb[1];
+    caMask[token] = atomMask[token * slots + slot];
+    for (let axis = 0; axis < 3; axis += 1) {
+      ca[token * 3 + axis] = atomPositions[(token * slots + slot) * 3 + axis];
+    }
+  }
+
+  // ...and the noise level, which is one number for the whole tensor.
+  const noiseLevel = (Math.log(1e-4 / 16) + 1.2) / 1.5;
+
+  const output = new Float32Array(tokens * tokens * width);
+  for (let i = 0; i < tokens; i += 1) {
+    for (let j = 0; j < tokens; j += 1) {
+      // 🔴 INTRA-CHAIN ONLY, AND THE FLAG MASKS THE WHOLE FEATURE. `has_cond`
+      // is both a column and the multiplier on every other column, so an
+      // uncovered pair contributes exactly nothing - which is what lets the
+      // forward run unconditionally with no template at all.
+      const has = caMask[i] * caMask[j] * asymMask2d[i * tokens + j];
+      const base = (i * tokens + j) * width;
+      if (!(has > 0)) continue;
+      let squared = 1e-10;
+      for (let axis = 0; axis < 3; axis += 1) {
+        const d = ca[i * 3 + axis] - ca[j * 3 + axis];
+        squared += d * d;
+      }
+      const distance = Number.isFinite(squared) ? Math.sqrt(squared) : 1e9;
+      let bin = 0;
+      for (let at = 0; at < bounds.length; at += 1) if (distance > bounds[at]) bin += 1;
+      output[base + bin] = has;
+      output[base + RF3_TEMPLATE_BINS] = has;
+      output[base + RF3_TEMPLATE_BINS + 1] = noiseLevel * has;
+    }
+  }
+  return output;
+}
+
 export function boltz2TemplateFeatures(template, asymMask2d, tokens) {
   const { aatype, atomPositions, atomMask } = template;
   const slots = NUM_DENSE;
@@ -569,4 +663,60 @@ export function boltz2TemplateFeatures(template, asymMask2d, tokens) {
     }
   }
   return features;
+}
+
+/**
+ * RoseTTAFold3's chiral centres, and the improper dihedral each one wants.
+ *
+ * 🔴 IT IS THE ONLY REFLECTION-ASYMMETRIC SIGNAL IN THE NETWORK, and on a plain
+ * protein it is not a no-op: 6MRR's 68 residues carry **213** centres in
+ * af3-any-model's own batch. Everything else the model sees is invariant under
+ * a mirror, so without this a D-amino acid is as good an answer as an L one -
+ * upstream's own note records it asserting the L enantiomer over eleven D
+ * residues.
+ *
+ * 🔴 AND THE RULE IS TWO CLASSES AND A FIXED QUADRUPLE, not CCD stereochemistry.
+ * Read off the reference's batch rather than derived: every centre is a PIVOT
+ * with three substituents emitted in three permutations,
+ *
+ *     (pivot, x, y, z) -> +T     (pivot, x, z, y) -> -T     (pivot, y, z, x) -> +T
+ *
+ * with `T = asin(1 / sqrt(3))`, and there are exactly two pivots:
+ *
+ *   - CA, substituents (N, C, CB) - every residue that HAS a CB, i.e. every
+ *     one but glycine;
+ *   - CB, substituents (CA, slot 5, slot 6) - ISOLEUCINE and THREONINE only,
+ *     the two standard residues whose CB is itself a stereocentre.
+ *
+ * 62 non-glycines x 3 plus 9 (five ILE, four THR) x 3 = 213, which is the
+ * count in the dump exactly.
+ *
+ * @returns {{centers: Int32Array, angles: Float32Array, count: number}}
+ *   `centers` is [count * 4] FLAT atom indices into the dense (token, slot)
+ *   grid, which is what the gradient consumes.
+ */
+export const CHIRAL_ANGLE = Math.asin(1 / Math.sqrt(3));
+/** ILE and THR, whose CB carries a second stereocentre. See the note above. */
+const CB_STEREOCENTRE_AATYPES = new Set([9, 16]);
+
+export function chiralCentres(aatype, atomMask, tokens, dense = NUM_DENSE) {
+  const centers = [];
+  const angles = [];
+  const emit = (base, pivot, x, y, z) => {
+    // 🔴 EVERY ATOM OF THE QUADRUPLE HAS TO BE REAL. A centre naming a slot the
+    // residue does not fill would take its gradient against a zero coordinate,
+    // which is a force toward the origin rather than a missing term.
+    for (const slot of [pivot, x, y, z]) if (!(atomMask[base + slot] > 0)) return;
+    for (const [a, b, c, sign] of [[x, y, z, 1], [x, z, y, -1], [y, z, x, 1]]) {
+      centers.push(base + pivot, base + a, base + b, base + c);
+      angles.push(sign * CHIRAL_ANGLE);
+    }
+  };
+  for (let token = 0; token < tokens; token += 1) {
+    const base = token * dense;
+    emit(base, 1, 0, 2, 4);                     // CA: (N, C, CB)
+    if (CB_STEREOCENTRE_AATYPES.has(aatype[token])) emit(base, 4, 1, 5, 6);
+  }
+  return { centers: Int32Array.from(centers), angles: Float32Array.from(angles),
+           count: angles.length };
 }

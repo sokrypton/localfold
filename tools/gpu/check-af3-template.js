@@ -11,6 +11,7 @@
 import { templateEmbedding } from "../../src/af3/template-reference.js";
 import { Af3TemplateEmbedderGpu } from "../../src/af3/template-webgpu.js";
 import { HttpTensorStore } from "../../src/reference/http-tensor-store.js";
+import { af3Dialect } from "../../src/af3/weights.js";
 import { deviceTuning } from "../../src/runtime/device-profile.js";
 
 // 🔴 A DEFAULT, NOT A CONSTANT. This was hardcoded, so on a box that has the
@@ -22,8 +23,12 @@ const MANIFEST = "/model-af3-full-f32/manifest.json";
 const ROOT = "diffuser/evoformer/template_embedding";
 const SINGLE = `${ROOT}/single_template_embedding`;
 const STACK = `${SINGLE}/__layer_stack_no_per_layer/template_embedding_iteration`;
-const DIALECT = { swapTransposedBias: false };
-const QUERY_CHANNELS = 128;
+// 🔴 THE DIALECT IS THE BUNDLE'S, NOT A LITERAL. This file pinned
+// `swapTransposedBias: false`, which is AlphaFold 3's - so on an OpenDDE
+// bundle, whose column pair bias IS transposed, it compared two different
+// models and read NaN, and on IntelliFold-2 it read 1.65e-1. Every other
+// `--model=` checker derives it from `manifest.model.name`; this one now does
+// too. See `af3Dialect`.
 
 function option(args, name, fallback) {
   const prefix = `--${name}=`;
@@ -89,6 +94,14 @@ export async function main(device, args) {
   const bound = Number(option(args, "bound",
     matrixLive ? (model === MANIFEST ? "8e-5" : "4e-4")
       : model === MANIFEST ? "2e-5" : "1e-4"));
+  // 🔴 AND THE MATRIX ARM'S BOUND FOLLOWS THE STACK'S WIDTH. It is an f16
+  // accumulation over the channel axis, so a 256-channel stack accumulates
+  // four times the terms a 64-channel one does: IntelliFold-2 reads 5.72e-4
+  // where OpenDDE reads 8.08e-5, and with `--matrix=off` if2 is 3.80e-7 - the
+  // port, not the width. Scaled by sqrt of the ratio, which is what a sum of
+  // independent roundings does, and it is not a licence to raise the bound
+  // further: the SHIPPED trunk pins `pairMatrixKernels: false` on this stage
+  // for exactly this reason (see src/af3/trunk-webgpu.js).
   const store = await HttpTensorStore.open(model);
 
   const layer = async (leaf, index) => {
@@ -109,8 +122,17 @@ export async function main(device, args) {
       outputProjection: await at(`triangle_multiplication_${direction}/output_projection/weights`),
       gatingLinear: await at(`triangle_multiplication_${direction}/gating_linear/weights`),
     });
+    // 🔴 THE HEAD COUNT AND THE HEAD WIDTH ARE THE TENSOR'S, NOT AlphaFold 3's.
+    // `heads: 4, dimension: 16` was typed in here - AF3's template stack - and
+    // it is 2 x 32 under OpenDDE and 8 x 32 under IntelliFold-2, both of which
+    // this checker then compared against a graph built for 4 x 16. OpenDDE read
+    // NaN and IntelliFold-2 1.65e-1, and neither was the port: `q_projection`
+    // is [blocks, heads, dimension, channels] and says so. This is CLAUDE.md's
+    // standing note about hand-built weight dicts, one file later.
+    const gridShape = (which) =>
+      store.shape(`${STACK}/pair_attention${which}/q_projection/weights`);
     const grid = async (which) => ({
-      heads: 4, dimension: 16,
+      heads: gridShape(which)[1], dimension: gridShape(which)[2],
       actNormScale: await at(`pair_attention${which}/act_norm/scale`),
       actNormOffset: await at(`pair_attention${which}/act_norm/offset`),
       pairBiasProjection: await at(`pair_attention${which}/pair_bias_projection/weights`),
@@ -135,8 +157,19 @@ export async function main(device, args) {
   };
 
   const T = (name) => store.tensor(name);
+  // 🔴 BOTH WIDTHS OFF THE BUNDLE, NOT OFF AlphaFold 3. `QUERY_CHANNELS = 128`
+  // was typed in here and the stack's own width was a constant inside
+  // template-webgpu.js; OpenDDE's query is 384 and IntelliFold-2's stack is
+  // 256. This checker builds its weight dict by hand rather than through
+  // `templateWeights` - the trap CLAUDE.md names - so it has to read them
+  // itself, and these are the two tensors that state them.
+  const dialect = af3Dialect(store);
+  const queryChannels = (await T(`${SINGLE}/query_embedding_norm/scale`)).length;
+  const channels = (await T(`${SINGLE}/output_layer_norm/scale`)).length;
+  const widthScale = matrixLive && !args.some((a) => a.startsWith("--bound="))
+    ? Math.max(1, Math.sqrt(channels / 64)) : 1;
   const weights = {
-    queryChannels: QUERY_CHANNELS,
+    queryChannels, channels,
     queryEmbeddingNormScale: await T(`${SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${SINGLE}/query_embedding_norm/offset`),
     outputLayerNormScale: await T(`${SINGLE}/output_layer_norm/scale`),
@@ -157,7 +190,7 @@ export async function main(device, args) {
   for (let i = 0; i < tokens; i += 1) {
     for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = sequence[i] * sequence[j];
   }
-  const pair = deterministic(tokens * tokens * QUERY_CHANNELS, 555 + tokens);
+  const pair = deterministic(tokens * tokens * queryChannels, 555 + tokens);
 
   // 🔴 TWO ARMS, BECAUSE THE EMPTY ONE REACHES THREE OF NINE FEATURES. With
   // every slot empty the six geometry projections multiply zero, so this
@@ -215,9 +248,9 @@ export async function main(device, args) {
       for (const slot of made) if (slot) slot.spanChains = true;
     }
     const input = { pair, pairMask, tokens, templates, asymId, slots: made };
-    const expected = templateEmbedding(input, weights, DIALECT);
+    const expected = templateEmbedding(input, weights, dialect);
     const gpu = await new Af3TemplateEmbedderGpu(device, { pairMatrixKernels: matrixWanted })
-      .run(input, weights, DIALECT, { pairMatrixKernels: matrixWanted });
+      .run(input, weights, dialect, { pairMatrixKernels: matrixWanted });
     const relRms = relativeRms(gpu.output, expected);
     console.log(`template\ttokens=${tokens} slots=${templates}`
       + ` occupied=${occupied}${spanChains ? " spanning" : ""}`
@@ -229,7 +262,7 @@ export async function main(device, args) {
     // 0 occupied slots it reads 2.41e-5 - larger for a reason that has nothing
     // to do with this kernel. `--bound=` is what says so, rather than a number
     // raised until both pass, which would stop checking the f32 one.
-    if (!(relRms < bound)) {
+    if (!(relRms < bound * widthScale)) {
       throw new Error(`template with ${occupied} occupied slots`
         + `${spanChains ? " spanning" : ""}: relRMS ${relRms}`);
     }
@@ -238,7 +271,7 @@ export async function main(device, args) {
     // arm that agrees with its masked twin means the mask never opened.
     if (spanChains) {
       const masked = templateEmbedding(
-        { ...input, slots: slotsFor(occupied) }, weights, DIALECT);
+        { ...input, slots: slotsFor(occupied) }, weights, dialect);
       const moved = relativeRms(expected, masked);
       console.log(`  spanning moves the output by relRMS ${moved.toExponential(2)}`);
       if (!(moved > 1e-3)) {
@@ -247,7 +280,7 @@ export async function main(device, args) {
     }
   }
   const input = { pair, pairMask, tokens, templates, asymId };
-  const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, DIALECT);
+  const gpu = await new Af3TemplateEmbedderGpu(device).run(input, weights, dialect);
   // The argument for the module existing: this is not a small correction.
   console.log(`output std ${standardDeviation(gpu.output).toFixed(2)}`
     + ` against an input pair std of ${standardDeviation(pair).toFixed(2)}`

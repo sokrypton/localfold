@@ -120,6 +120,29 @@ BUNDLES = {
         "module": "src/reference/manifests/protenix2.js",
         "model": "protenix2",
     },
+    # IntelliFold-2, whole, at int5 group 32. 612 MiB in twelve shards.
+    #
+    # 🔴 THE SMALLEST DIALECT IN THE FAMILY AND THE WIDEST BUNDLE. Its module
+    # tree is stock AlphaFold 3's - the nine-projection template embedder, AF3's
+    # MSA stack and confidence head - and only two conventions differ; what it
+    # does not share is its SHAPES, with a 512-channel trunk pair and a
+    # 256-channel template stack against AF3's 128 and 64. See docs/AF3.md.
+    "intellifold2": {
+        "export": "model-intellifold2-int5",
+        "module": "src/reference/manifests/intellifold2.js",
+        "model": "intellifold2",
+    },
+    # RoseTTAFold3, whole, at int5 group 32. 266 MiB in six shards.
+    #
+    # 🔴 ITS TRUNK IS AT THE FAMILY'S BAND AND ITS FOLD IS NOT A CHAIN YET, so
+    # this entry exists for the CLI and the gates rather than for the page -
+    # MODEL_BUNDLES gates it behind LOCALFOLD_INCLUDE_ROSETTAFOLD3_MODEL and
+    # nothing sets that. See docs/AF3.md for what is left.
+    "rosettafold3": {
+        "export": "model-rosettafold3-int5",
+        "module": "src/reference/manifests/rosettafold3.js",
+        "model": "rosettafold3",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

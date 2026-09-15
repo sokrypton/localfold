@@ -61,6 +61,44 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
     // reference conformers centred per ref_space_uid. See featurise.js.
     ...(options.centreRefConformers === undefined
       ? {} : { centreRefConformers: options.centreRefConformers }),
+    // 🔴 PADDED_KEYS: rf3, opendde and protenix CLAMP the atom key window and
+    // mask its out-of-range slots where AlphaFold 3 slides it in bounds. See
+    // `paddedAtomKeys` in dialect.js.
+    ...(options.paddedAtomKeys === undefined
+      ? {} : { paddedAtomKeys: options.paddedAtomKeys }),
+    ...(options.qblockAtomKeys === undefined
+      ? {} : { qblockAtomKeys: options.qblockAtomKeys }),
+    // 🔴 THE ATOMISED-TOKEN CONVENTIONS, all four inert until a batch has a
+    // MODIFIED RESIDUE or a LIGAND in it - which is exactly why they went
+    // unnoticed, and why tools/check-batch-fields.js grew a second target.
+    // `atomizedElementNames` renames an atomised atom to its element symbol
+    // (rf3); `atomizedUnknownRestype` gives an atomised token the UNKNOWN
+    // restype (boltz2 and rf3); `atomizedUnknownMsa` carries that into the
+    // alignment too (rf3 alone - boltz2 keeps the parent residue there);
+    // `atomizedBackboneBonds` bonds an atomised residue back into the chain
+    // (rf3 alone).
+    ...(options.atomizedElementNames === undefined
+      ? {} : { atomizedElementNames: options.atomizedElementNames }),
+    ...(options.atomizedUnknownRestype === undefined
+      ? {} : { atomizedUnknownRestype: options.atomizedUnknownRestype }),
+    ...(options.atomizedUnknownMsa === undefined
+      ? {} : { atomizedUnknownMsa: options.atomizedUnknownMsa }),
+    ...(options.atomizedBackboneBonds === undefined
+      ? {} : { atomizedBackboneBonds: options.atomizedBackboneBonds }),
+    // 🔴 DROP_ATOMS: four families carry no terminal OXT and no 5' OP3. The
+    // featuriser's switch is `terminalAtoms`, which ESMFold2 already used; this
+    // is the same knob under the dialect's name. See dialect.js.
+    ...(options.dropTerminalAtoms === true ? { terminalAtoms: false } : {}),
+    // 🔴 AND THE QUERY TWICE, for the three families whose paired and unpaired
+    // blocks each contribute it. Only where the alignment is empty; see
+    // `duplicateQueryRow` in dialect.js.
+    // 🔴 THE INVERSION HAPPENS HERE AND NOWHERE ELSE. The dialect names the
+    // reference's convention (`dedupeSelfMsa`, which stock AlphaFold 3 does
+    // NOT do) and the featuriser names the behaviour (`duplicateQueryRow`), so
+    // one of them has to read the other way round; doing it once, at the
+    // boundary, is what stops a caller getting it backwards.
+    ...(options.dedupeSelfMsa === undefined
+      ? {} : { duplicateQueryRow: options.dedupeSelfMsa === false }),
     msa: rows.msa,
     deletionMatrix: rows.deletionMatrix,
     unpairedFrom: rows.unpairedFrom,

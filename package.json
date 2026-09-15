@@ -64,7 +64,11 @@
     "bench:a3m-model": "node tools/benchmark-a3m-model.js",
     "deploy": "python3 tools/deploy.py",
     "test:portable": "node tools/check-portable-limits.mjs",
-    "test:spec-floor": "node tools/check-portable-limits.mjs --spec-floor"
+    "test:spec-floor": "node tools/check-portable-limits.mjs --spec-floor",
+    "test:batch": "node tools/check-atom-windows.js && node tools/check-batch-fields.js",
+    "test:ligand": "node tools/check-ligand-path.mjs",
+    "//test:template": "Every model's TEMPLATE moves its fold, on a target that needs one. Both oracle checkers for this stage drive the module with templates: 1 where a FOLD pads to four, so a wrong denominator is exact in every module check and a quarter strength in every fold - which is what rosettafold3 was. 5CAJ chain A, with and without.",
+    "test:template": "node tools/check-template-path.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",

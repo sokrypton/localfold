@@ -33,7 +33,7 @@
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
-import { SOURCES } from "../runtime/weight-sources.js";
+import { SOURCES, carriesTensor } from "../runtime/weight-sources.js";
 
 const GRID_WIDTH = 32_768;
 const MAX_RELATIVE_IDX = 32;
@@ -76,11 +76,7 @@ const embedderOrder = (bondTypes) =>
  * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate` in
  * diffusion-transformer-webgpu.js. Reading a bound field decodes it.
  */
-export const hasBondTypes = (weights) => {
-  const sources = weights?.[SOURCES];
-  return sources === undefined
-    ? weights?.tokenBondsTypeEmbed != null : sources.tokenBondsTypeEmbed != null;
-};
+export const hasBondTypes = (weights) => carriesTensor(weights, "tokenBondsTypeEmbed");
 
 export function packEmbedderWeights(weights) {
   const order = embedderOrder(hasBondTypes(weights));
@@ -101,6 +97,15 @@ export function createEmbedderShaders(shape, offsets, epsilon, variance,
   const { tokens, sequences, featureWidth, pairChannels, singleChannels, msaChannels } = shape;
   // See MSA_FEATURE_WIDTH: the weight states this, not a constant.
   const msaFeatureWidth = shape.msaFeatureWidth ?? MSA_FEATURE_WIDTH;
+  // ...and whether the QUERY ROW carries the paired flag where the column
+  // exists. boltz2 says yes, rosettafold3 no; see msaPairedQueryRow in
+  // dialect.js. Required rather than defaulted: a wrong answer here is a
+  // constant bias on every MSA embedding and nothing raises.
+  const pairedQueryRow = shape.msaPairedQueryRow;
+  if (msaFeatureWidth > 34 && typeof pairedQueryRow !== "boolean") {
+    throw new Error("shape.msaPairedQueryRow has no default: this bundle "
+      + "carries an is_paired column and only the dialect says whose it is");
+  }
   // Stock AF3 builds the pair from target_feat; OpenDDE from the single
   // embedding. See `projectTokens`.
   const pairSourceWidth = shape.pairInitFromSingle ? singleChannels : featureWidth;
@@ -369,7 +374,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (code >= 0 && code < 32) {
       total += weights[W_MSA + u32(code) * C_M + c];
     }
-${msaFeatureWidth > 34 ? `    // boltz2's paired flag: column 34, 1 on the query row and 0 elsewhere.
+${msaFeatureWidth > 34 && pairedQueryRow ? `    // boltz2's paired flag: column 34, 1 on the query row and 0 elsewhere.
+    // rosettafold3 has the column and leaves it ZERO, so this term is absent
+    // there and the kernel is byte-identical to a 34-column one.
     // See msaFeatures in embedder-reference.js.
     if (row < TOKENS) { total += weights[W_MSA + 34u * C_M + c]; }` : ""}
     msa[row * C_M + c] = total + msa_from_target[token * C_M + c];
@@ -501,7 +508,8 @@ export class Af3EmbedderGpu {
     const packed = packEmbedderWeights(weights);
     const shape = { tokens, sequences, featureWidth, pairChannels, singleChannels,
                     msaChannels, pairInitFromSingle,
-                    msaFeatureWidth: weights.msaActivations.length / msaChannels };
+                    msaFeatureWidth: weights.msaActivations.length / msaChannels,
+                    msaPairedQueryRow: weights.dialect.msaPairedQueryRow };
     const sources = createEmbedderShaders(shape, packed.offsets, epsilon, variance,
                                           options.relative ?? "gather");
     const key = `af3-embed:${tokens}:${sequences}:${featureWidth}:${pairChannels}`
@@ -509,7 +517,9 @@ export class Af3EmbedderGpu {
       + `:${options.relative ?? "gather"}:${pairInitFromSingle}`
       // boltz2's two extra z-init terms change the generated source and no
       // dimension above can see it; see `embedderOrder`.
-      + `:bt${hasBondTypes(weights)}:mw${shape.msaFeatureWidth}`;
+      + `:bt${hasBondTypes(weights)}:mw${shape.msaFeatureWidth}`
+      // ...and the paired column's VALUE, which is a term in the source.
+      + `:pq${shape.msaPairedQueryRow}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${key}:${name}`, source);

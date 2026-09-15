@@ -174,7 +174,31 @@ export async function flowOnGpu(device, input, weights, options) {
       const noiseLevel = levels[cycle - 1];
       const denoised = await head.run({ ...input, noiseLevel, positionsNoisy: positions },
                                       weights);
-      positions = denoised.positions;
+      // 🔴 AN ODE STEP, NOT A REPLACEMENT - see the per-model table in
+      // docs/AF3.md. `positions = denoised` hands the model
+      // its own previous clean prediction while telling it the input carries
+      // sigma_k of noise; that is iterated denoising, and it returned a fold
+      // that is NOT A CHAIN for AlphaFold 3 on 1QYS across four seeds. Keeping
+      // the state's distance from the prediction, scaled by the schedule, is
+      // the step this walk always meant.
+      //
+      // 🔴 WHICH WALK IS THE USER'S CHOICE, NOT THE CHECKPOINT'S. Both are
+      // offered by name - "Flow" is the original replacement rule and "ODE" is
+      // this one - because a mode that means different things for different
+      // models is a mode nobody can reason about. Measured preferences are in
+      // docs/AF3.md; two checkpoints do better under Flow.
+      if (options.step === "replace") {
+        positions = denoised.positions;
+      } else {
+        const nextLevel = levels[cycle] ?? 0;
+        const ratio = noiseLevel > 0 ? nextLevel / noiseLevel : 0;
+        const predicted = denoised.positions;
+        const stepped = new Float32Array(predicted.length);
+        for (let at = 0; at < predicted.length; at += 1) {
+          stepped[at] = predicted[at] + ratio * (positions[at] - predicted[at]);
+        }
+        positions = stepped;
+      }
       // The same shape sampleOnGpu reports, so a caller animates either the
       // same way. Here the two tracks ARE the same array - there is no separate
       // walk - and no frame needs superposing, because nothing was ever

@@ -142,6 +142,12 @@ BLOBS = {
     #     curl -sSLO https://huggingface.co/sokrypton/af3-any-model/resolve/main/\
     #       boltz2/boltz2.bin.zst
     "boltz2": "~/af3_ported/boltz2.bin.zst",
+    # IntelliFold-2 and RoseTTAFold3, the two AF3-lineage checkpoints the
+    # reference supports that this port had not read. On the oracle box they
+    # live under ~/ported/<model>/; both are converted the same way and the
+    # exporter does not care which vendor wrote them.
+    "intellifold2": "~/ported/intellifold2/intellifold2.bin.zst",
+    "rosettafold3": "~/ported/rosettafold3/rosettafold3.bin.zst",
 }
 
 # The trunk: the evoformer stacks, the conditioning that builds their inputs

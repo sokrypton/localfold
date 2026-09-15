@@ -39,7 +39,7 @@ export async function main(device, args) {
 
   let ours;
   await foldBatch(device, batch, weights, {
-    steps: 0, recycles: 0, seed: 0,
+    mode: "diffusion", steps: 0, recycles: 0, seed: 0,
     onStage: (name, detail) => {
       if (name === "target-feat") ours = detail?.targetFeat;
     },

@@ -183,6 +183,25 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        src/af3/dialect.js and docs/AF3.md. -->
                   <option value="boltz2">Boltz-2</option>
                   <option value="protenix2">Protenix-v2</option>
+                  <!-- 🔴 THE SMALLEST DIALECT AND THE WIDEST BUNDLE. Its module
+                       tree is stock AlphaFold 3's - the nine-projection
+                       template embedder and AF3's MSA stack - and the reference
+                       names it in exactly two convention tuples; what differs
+                       is its SHAPES, a 512-channel trunk pair against AF3's 128
+                       and a 256-channel template stack against 64. It is 612
+                       MiB, the largest bundle here, and its 5CAJ self-template
+                       is 0.256 A. -->
+                  <option value="intellifold2">IntelliFold-2</option>
+                  <!-- 🔴 STOCK AF3 SHAPES AND EIGHT FORWARD BRANCHES. c_z 128
+                       and four triangle-attention heads, so no widening - and
+                       then a 1/L in the triangle multiplication, a q/k
+                       LayerNorm in every diffusion attention, a block that
+                       shares one residual between attention and transition,
+                       biased grid and outer-product projections, and a
+                       confidence head that normalises its inputs over the whole
+                       tensor. It is the smallest bundle of the AF3 family at
+                       266 MiB. -->
+                  <option value="rosettafold3">RoseTTAFold3</option>
                   <option value="monomer">AF2-mono</option>
                   <option value="multimer">AF2-multi</option>
                   <!-- 🔴 NO ALIGNMENT AND NO TEMPLATE, WHICH IS THE POINT.
@@ -232,9 +251,9 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                    quietly ignored. -->
               <div class="fetch-option-group" id="af3ModeGroup" hidden>
                 <span class="fetch-option-title">Sampler</span>
-                <select id="af3-mode" title="Flow: one draw at the top of the schedule, then a deterministic walk down it - about 8 calls. Diffusion: AF3's own sampler, noise injected at every step.">
-                  <option value="flow" selected>Flow</option>
-                  <option value="diffusion">Diffusion</option>
+                <select id="af3-mode" title="Diffusion: AlphaFold 3's own sampler, noise injected at every step - the default, and ahead on almost every target measured. Flow: one draw at the top, then a deterministic walk that replaces the state with each prediction - close behind at the same price, and weaker past about 400 residues.">
+                  <option value="flow">Flow</option>
+                  <option value="diffusion" selected>Diffusion</option>
                 </select>
               </div>
               <div class="fetch-option-group" id="af3CountGroup" hidden>

@@ -19,6 +19,9 @@
  */
 import { spawn } from "node:child_process";
 
+/** 6MRR's chain A, which is what every other row in this table folds. */
+const SIX_MRR = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
+
 export const FOLDS = [
   ["AF2", ["tools/gpu/fold-af2.js", "--repeat=2"]],
   ["AF3", ["tools/gpu/fold.js", "--model=/model-af3-int5/manifest.json"]],
@@ -34,6 +37,22 @@ export const FOLDS = [
   // nineteen AF3 checkers that 404ed rather than failing.
   ["boltz2", ["tools/gpu/fold.js", "--model=/model-boltz2-int5/manifest.json", "--steps=50"]],
   ["protenix2", ["tools/gpu/fold.js", "--model=/model-protenix2-int5/manifest.json", "--steps=50"]],
+  // 🔴 THE TWO WIDEST SHAPES IN THE PANEL, WHICH IS WHY THEY BELONG HERE.
+  // IntelliFold-2's trunk pair is 512 channels against AlphaFold 3's 128 and
+  // its template stack 256 against 64, so every workgroup-storage decision in
+  // the port is being asked a question no other model asks - and this gate
+  // exists precisely because `maxComputeWorkgroupStorageSize` is 49152 here and
+  // 32768 on Metal. A tile that fits at 128 channels and not at 512 would fail
+  // on an Apple part first and on nothing here.
+  //
+  // 🔴 AND THEY FOLD FROM THE SEQUENCE, NOT FROM A DUMP - `--sequence=` rather
+  // than `--target=` alone, which folds AlphaFold 3's own featurised batch
+  // through whatever `--model=` names and would test neither model's
+  // featuriser. 6MRR's sequence, the same one every other row uses.
+  ["intellifold2", ["tools/gpu/fold.js", "--model=/model-intellifold2-int5/manifest.json",
+                    `--sequence=${SIX_MRR}`, "--steps=50"]],
+  ["rosettafold3", ["tools/gpu/fold.js", "--model=/model-rosettafold3-int5/manifest.json",
+                    `--sequence=${SIX_MRR}`, "--steps=50"]],
 ];
 
 const run = (args, env) => new Promise((resolve) => {

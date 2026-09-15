@@ -179,7 +179,38 @@ export function structuralLayout(batch) {
   // The chain-adjacent parents, which the expander turns into a pair feature.
   const prevParent = new Int32Array(tokens).fill(-1);
   const nextParent = new Int32Array(tokens).fill(-1);
-  const chainOf = (token) => batch.chainOfResidue?.[batch.residueOfToken[token]] ?? 0;
+  // 🔴 A TOKEN THAT IS NOT A POLYMER RESIDUE HAS NO CHAIN, AND `?? 0` SAID IT
+  // WAS IN THE FIRST ONE. `residueOfToken` is -1 for a LIGAND atom, so
+  // `chainOfResidue[-1]` is undefined and the fallback made it chain 0 - the
+  // same value a chain-0 polymer residue gives. The guard then compared 0
+  // against 0 and linked a ligand's subtoken to the last residue of the protein
+  // as its chain neighbour, where af3-any-model's `structbook` says -1.
+  //
+  // Measured on 6MRR + GOL + SEP@3: `prev_parent_residue_idx` wrong in 1 of 144
+  // and `next_parent_residue_idx` in 2, all three at the polymer/ligand
+  // boundary. Invisible on a plain protein, which is every fold gate here, and
+  // opendde is a shipped model. It is the same shape as the `== null` note
+  // elsewhere in this port: an ABSENT thing collapsed onto a VALID value.
+  // 🔴 `asym_id`, THE PER-TOKEN CHAIN, NOT `chainOfResidue`. This read
+  // `batch.chainOfResidue[batch.residueOfToken[token]] ?? 0`, and
+  // `residueOfToken` is **-1 for a LIGAND atom** - so the lookup was
+  // `undefined` and the fallback made every ligand token chain 0, the same
+  // value a chain-0 polymer residue gives. The guard compared 0 against 0 and
+  // linked the ligand's first atom to the protein's last residue as its chain
+  // neighbour, where the reference says -1.
+  //
+  // 🔴 AND A LIGAND'S ATOMS ARE LINKED TO EACH OTHER, which is why the first
+  // repair was worse than the bug: treating "not a residue" as "no chain at
+  // all" broke 77->78->...->82 as well, turning 3 wrong links into 10.
+  // af3-any-model links WITHIN the ligand and refuses only ACROSS the
+  // polymer/ligand boundary - which is exactly what a per-token chain id says,
+  // and `asymId` is one the featuriser already sets for every token including
+  // a ligand's.
+  //
+  // Measured on 6MRR + GOL + SEP@3: 3 links wrong before, 10 after the first
+  // repair, 0 with this. Invisible on a plain protein, which is every fold gate
+  // in this repository, and opendde is a shipped model.
+  const chainOf = (token) => batch.asymId[token];
   for (let index = 0; index < tokens; index += 1) {
     const token = parent[index];
     if (token - 1 >= 0 && chainOf(token - 1) === chainOf(token)) prevParent[index] = token - 1;
@@ -289,7 +320,16 @@ export function structuralBatch(batch, layout = structuralLayout(batch)) {
   // residue and inherits its position in the chain.
   const take = (source) => Int32Array.from(layout.parent, (from) => source[from]);
   const residueIndex = take(batch.residueIndex);
-  const tokenIndex = Int32Array.from({ length: tokens }, (_, index) => index);
+  // 🔴 ONE-BASED, LIKE THE MAIN BATCH AND LIKE THE REFERENCE. This was
+  // `index`, i.e. zero-based, where featurise.js writes `token + 1` and
+  // af3-any-model's `struct/token_index` is 1..160 - so this port disagreed
+  // with the reference AND with itself, in the same field, on the second token
+  // space only. Inert as it stands, because `token_index` reaches the model
+  // only through the relative position encoding as a DIFFERENCE and a uniform
+  // shift cancels there - which is exactly why nothing caught it. Measured:
+  // opendde's 6MRR fold is unchanged. Aligned anyway, because the next reader
+  // of this field has no reason to expect two conventions.
+  const tokenIndex = Int32Array.from({ length: tokens }, (_, index) => index + 1);
   const asymId = take(batch.asymId);
   const entityId = take(batch.entityId);
   const symId = take(batch.symId);

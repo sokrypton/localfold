@@ -203,7 +203,10 @@ export class Af3MsaStackGpu {
       // WGSL and the dispatch, which is the collision docs/AF2.md records twice.
       into(`opm:${name}`, `${base}:opm:${name}`
         + `:${blockI}x${blockJ}:${opmTuning.opmCellChunk ?? "d"}`
-        + `:ban${opmShape.opmBiasAfterNorm}`, source);
+        + `:ban${opmShape.opmBiasAfterNorm}`
+        // ...and rosettafold3's biased projections, which add two `const W_*`
+        // to the source and a term to its inner loop.
+        + `:lrb${sample.outerProductMean.leftProjectionBias != null}`, source);
     }
     const attentionSources = createMsaAttentionShaders(
       { sequences, tokens: n, msaChannels, pairChannels,

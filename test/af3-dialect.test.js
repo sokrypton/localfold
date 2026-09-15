@@ -19,7 +19,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 
 import {
-  ALPHAFOLD3, DIALECTS, OPENBIND0, OPENDDE, dialectFor,
+  ALPHAFOLD3, DIALECTS, OPENBIND0, OPENDDE, dialectFor, featuriserDialect,
   singleCondPadding, singleCondPaddingWgsl, singleCondSource,
 } from "../src/af3/dialect.js";
 import { af3Dialect } from "../src/af3/weights.js";
@@ -50,14 +50,22 @@ describe("the dialect table", () => {
   const on = (dialect) => Object.entries(dialect)
     .filter(([, value]) => value).map(([flag]) => flag).sort();
 
-  it("turns on exactly the three branches OpenBind-0 needs", () => {
+  it("turns on exactly the branches OpenBind-0 needs", () => {
     assert.deepEqual(on(OPENBIND0),
       [
       // 🔴 CENTRE_REF_CONFORMERS: every family but stock AlphaFold 3 centres
       // its reference conformers per `ref_space_uid`. Missing here, it was
       // worth 2.89e-2 -> 2.47e-2 on openbind0's sequence-featurised
       // `target_feat` against af3-any-model. See src/af3/featurise.js.
-      "centreRefConformers","maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
+      "centreRefConformers",
+      // 🔴 NO TERMINAL OXT AND NO 5' OP3, which is not an OpenFold-lineage
+      // question - protenix and opendde are in that lineage and deliberately
+      // KEEP the OXT. Carrying it put openbind0's last two atom windows 128
+      // indices each away from the reference's own gather, because a sliding
+      // window's edge is the atom COUNT. `tools/check-atom-windows.js` is the
+      // gate and all seven models are exact on it.
+      "dropTerminalAtoms",
+      "maskPaddedKeys", "padSingleCondUnknownDna", "symmetriseBonds"]);
   });
 
   /**
@@ -106,6 +114,12 @@ describe("the dialect table", () => {
       "maskPaddedKeys",
       "msaUpdateBeforeOuterProduct",
       "padSingleCondUnknownDna",
+      // 🔴 WHERE THE ATOM KEY WINDOW SITS, WHICH IS NOT WHETHER ITS PADDED
+      // SLOTS ARE MASKED - `maskPaddedKeys` above is the second question. This
+      // family CLAMPS the window and masks what falls outside; AlphaFold 3
+      // slides it bodily in bounds. af3-any-model measured its own version of
+      // this at 6MRR 0.767 -> 0.737 here. See src/af3/featurise.js.
+      "paddedAtomKeys",
       "pairInitFromSingle",
       "perBlockAtomPairLayerNorm",
       "perBlockPairLayerNorm",
@@ -276,4 +290,88 @@ describe("the token bond matrix", () => {
       assert.equal(ligandMatrix(flag).batch.bondMatrix[0], 0);
     }
   });
+});
+
+// 🔴 THE ATOMISED-TOKEN CONVENTIONS, AND THE POINT IS THAT NO FOLD GATE CAN SEE
+// THEM. All four are inert unless a batch carries a MODIFIED RESIDUE or a
+// LIGAND, and every fold gate in this repository folds a plain protein - so
+// they were absent from four dialects for as long as those dialects existed and
+// nothing objected. tools/check-batch-fields.js --target=gol-sep3 is what
+// measures them against the reference; this asserts the TABLE, which is the
+// half that needs no dump.
+it("the atomised-token conventions are the four the references show", () => {
+  const expected = {
+    alphafold3:   [false, false, false, false],
+    openbind0:    [false, false, false, false],
+    opendde:      [false, false, false, false],
+    protenix2:    [false, false, false, false],
+    // boltz2 gives an atomised token the unknown restype and leaves the
+    // ALIGNMENT holding the parent residue; rf3 moves both.
+    boltz2:       [false, true,  false, false],
+    intellifold2: [false, false, false, false],
+    rosettafold3: [true,  true,  true,  true],
+  };
+  for (const [model, want] of Object.entries(expected)) {
+    const dialect = dialectFor(model);
+    assert.deepEqual([dialect.atomizedElementNames, dialect.atomizedUnknownRestype,
+                      dialect.atomizedUnknownMsa, dialect.atomizedBackboneBonds],
+                     want, `${model}'s atomised-token conventions`);
+  }
+});
+
+// 🔴 AND THE FEATURISER'S VIEW OF A DIALECT IS ONE OBJECT, NOT A LIST THREE
+// CALL SITES COPY. `featuriserDialect` exists because tools/gpu/fold.js,
+// tools/gpu/fold-opendde.js and web/af3-model.js each named the fields by hand,
+// which is the allow-list shape CLAUDE.md records twice as having shipped a
+// bug. This asserts it carries every featuriser convention the table has, so
+// adding one to the table cannot leave a caller behind.
+it("featuriserDialect carries every featuriser convention", () => {
+  const carried = Object.keys(featuriserDialect(dialectFor("rosettafold3")));
+  for (const field of ["symmetriseBonds", "centreRefConformers", "paddedAtomKeys",
+                       "qblockAtomKeys", "dropTerminalAtoms", "dedupeSelfMsa",
+                       "atomizedElementNames", "atomizedUnknownRestype",
+                       "atomizedUnknownMsa", "atomizedBackboneBonds"]) {
+    assert.ok(carried.includes(field), `featuriserDialect drops ${field}`);
+  }
+  // ...and NOT the graph conventions: a featuriser has no business with a
+  // kernel flag, and sweeping the whole dialect in would make every future
+  // graph flag silently change a batch.
+  for (const field of ["noResidual", "chiralCentres", "distogramBins65"]) {
+    assert.ok(!carried.includes(field), `featuriserDialect should not carry ${field}`);
+  }
+  assert.deepEqual(featuriserDialect(undefined), {});
+});
+
+// 🔴 THE SAMPLER A CHECKPOINT ACTUALLY HAS, which the page was not asking
+// about. rosettafold3 has no working flow walk - `--mode=flow` gives N-CA
+// 6.94 A against 1.46 and consecutive CA collapsing to 0.23 A, a fold the
+// geometry gate refuses - while pLDDT reads 81.47 against the good fold's
+// 81.53. The page's sampler select defaults to Flow, so that is what a visitor
+// picking this model would have got, with a confidence number saying nothing
+// was wrong. Every other family folds in flow (af3 CA-CA 3.58, if2 3.88).
+it("only rosettafold3 declares that it has no flow sampler", () => {
+  for (const [model, dialect] of Object.entries(DIALECTS)) {
+    assert.equal(dialect.noFlowSampler, model === "rosettafold3",
+      `${model}'s noFlowSampler`);
+  }
+});
+
+// ...and the PAGE must agree with the table, or the guard in `foldBatch` throws
+// at a visitor instead of the page never asking.
+it("the page forces diffusion for exactly those families", async () => {
+  const { NO_FLOW_SAMPLER_FAMILIES, samplerModeFor } =
+    await import("../web/af3-model.js");
+  const declared = Object.entries(DIALECTS)
+    .filter(([, dialect]) => dialect.noFlowSampler === true).map(([model]) => model);
+  for (const model of declared) {
+    assert.ok(NO_FLOW_SAMPLER_FAMILIES.includes(model),
+      `${model} has no flow sampler and the page still offers one`);
+    assert.equal(samplerModeFor(model, "flow"), "diffusion");
+  }
+  // ...and it does not force it on a model that is fine, which would silently
+  // make every other fold slower and different.
+  assert.equal(samplerModeFor("alphafold3", "flow"), "flow");
+  assert.equal(samplerModeFor("intellifold2", "flow"), "flow");
+  // OpenDDE is forced for its own, measured, different reason.
+  assert.equal(samplerModeFor("opendde", "flow"), "diffusion");
 });

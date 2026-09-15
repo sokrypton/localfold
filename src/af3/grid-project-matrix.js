@@ -79,12 +79,16 @@ export function createGridProjectMatrixShader(shape, storage = {}, matrix = {}) 
     sourcePrecision: storage.normalized ?? "f32",
     weightPrecision,
     outputPrecision: qkvg,
-    // 🔴 NO BIAS. The four grid projections have none - the gate's bias, which
-    // AF2's equivalent kernel carries in the w lane, does not exist here - and
-    // a kernel that added one would read the NEXT tensor in the packed block.
+    // 🔴 NO GENERIC BIAS, EVER: it would add one vector to all FOUR roles. Only
+    // RoseTTAFold3's GATE is biased - q, k and v are bias-free in every
+    // checkpoint - so it rides in lane 3 through `laneBias`, which is the same
+    // mechanism AF2's q/k/v/gate projection uses for the same reason. Where the
+    // bundle has none the generated WGSL is exactly what it was.
     bias: false,
     ...(transpose ? { sourceRowIndex: `($row % ${n}u) * ${n}u + $row / ${n}u` } : {}),
-    outputGroup: { size: 4, stores: [0, 1, 2, 3] },
+    outputGroup: { size: 4, stores: [0, 1, 2, 3],
+                   ...(shape.gateBias === true
+                     ? { laneBias: { 3: "parameters.bias_offset + $channel" } } : {}) },
     outputIndex: `row * ${width}u + channel`,
   });
 }
@@ -123,7 +127,10 @@ export function createGridProjectOutMatrixShader(shape, storage = {}, matrix = {
     sourceModulatePrecision: storage.gate ?? "f32",
     weightPrecision,
     outputPrecision: "f32",
-    bias: false,
+    // ...and here the bias IS the generic one: this projection has a single
+    // output per channel, so rosettafold3's `output_projection.bias` is exactly
+    // what `bias_offset` addresses. Absent everywhere else.
+    bias: shape.outputBias === true,
     residual,
     outputIndex: transpose
       ? `((row % ${n}u) * ${n}u + row / ${n}u) * parameters.columns + column`
@@ -169,16 +176,21 @@ export function gridProjectMatrixDispatch(shape, matrix = {}) {
  * the offsets are the stack's. `encodePairTrack` has no allocator.
  */
 export function allocateGridProjectMatrix(allocator, shape, keep = (a) => a) {
-  const { rows, channels, width, weightOffset, outWeightOffset, label = "grid-project" } = shape;
+  // 🔴 THE TWO BIAS OFFSETS ARE ELEMENT OFFSETS INTO THE SAME PACKED BLOCK, and
+  // 0 is a valid one - so they are passed only where the shader was generated
+  // with the term, and the shader is generated only where the tensor exists.
+  // See packGridAttentionWeights' OPTIONAL_GRID.
+  const { rows, channels, width, weightOffset, outWeightOffset,
+          gateBiasOffset = 0, outputBiasOffset = 0, label = "grid-project" } = shape;
   return {
     project: keep(allocator.upload(`${label}.parameters`, new Uint32Array([
-      rows, channels, 4 * width, weightOffset, 0, 0, 0, 0,
+      rows, channels, 4 * width, weightOffset, gateBiasOffset, 0, 0, 0,
     ]), GPUBufferUsage.UNIFORM)),
     // ...and the output projection's, which contracts the WIDTH and produces
     // the channels - the other way round from the one above, which is exactly
     // the kind of pair this repository has swapped before.
     out: keep(allocator.upload(`${label}.out-parameters`, new Uint32Array([
-      rows, width, channels, outWeightOffset, 0, 0, 0, 0,
+      rows, width, channels, outWeightOffset, outputBiasOffset, 0, 0, 0,
     ]), GPUBufferUsage.UNIFORM)),
   };
 }

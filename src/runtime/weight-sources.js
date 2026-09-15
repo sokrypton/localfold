@@ -33,3 +33,28 @@ export function bindable(entry) {
     && Number.isInteger(entry.count)
     && typeof entry.store?.tensorSource === "function";
 }
+
+/**
+ * Does this weight object carry `name` - asked of the THUNK, never of the value.
+ *
+ * 🔴 THIS RULE COST 7x WHEN IT WAS FORGOTTEN ONCE, AND IT WAS WRITTEN OUT FIVE
+ * TIMES. A bound weight field is a getter that DECODES when read, so
+ * `block.ffwAToB != null` - a presence test choosing a shader variant -
+ * unpacked a 768x1536 int5 tensor once per block per sampler step. boltz2's
+ * fold was 38.5 s and is 3.7; the GPU was 92% idle and the arithmetic was never
+ * the problem. Asking the SOURCES map instead is the same answer for free.
+ *
+ * 🔴 AND `!= null`, NOT `!== undefined`. The loader writes NULL for a tensor a
+ * bundle does not carry, and that null reaches the SOURCES map - so a strict
+ * check falls through and the caller reads `.count` off it, which killed boltz2
+ * in a path added for a model boltz2 does not share.
+ *
+ * It was `blockHasUpGate`, `blockHasKqNorm`, `txHasUpGate`, `txHasKqNorm` and
+ * `hasBondTypes`: five copies of four lines, each with the rule restated as a
+ * comment above it. One function is one place to get it right, and a sixth
+ * caller inherits both halves rather than re-deriving them.
+ */
+export function carriesTensor(weights, name) {
+  const sources = weights?.[SOURCES];
+  return (sources === undefined ? weights?.[name] : sources[name]) != null;
+}

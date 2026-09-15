@@ -1,4 +1,4 @@
-import { concatenateAs, writeInto } from "../runtime/float16.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
 /**
  * AF3's transition block on the GPU: LayerNorm, then SwiGLU, then a projection
  * back down.
@@ -154,17 +154,8 @@ const ORDER = TRANSITION_ORDER;
  *   error - which is why `createTransitionShader` takes the same word.
  */
 export function packTransitionWeights(weights, precision = "f32") {
-  const offsets = {};
-  let total = 0;
-  for (const name of ORDER) {
-    if (weights[name] === undefined) throw new Error(`transition weights missing ${name}`);
-    offsets[name] = total;
-    total += weights[name].length;
-  }
-  const data = concatenateAs(precision, total, (target) => {
-    for (const name of ORDER) writeInto(target, weights[name], offsets[name]);
-  });
-  return { data, offsets };
+  return packNamedWeights(weights,
+    { label: "transition weights", order: ORDER, precision });
 }
 
 /**

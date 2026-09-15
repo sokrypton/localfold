@@ -10,6 +10,8 @@
  * cloud at the wrong scale, and RMSD alone would not say which. The sequence
  * and the geometry come from the SAME deposition so they cannot disagree.
  */
+import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
+import { superpose, modelAlphaCarbons } from "./superpose.js";
 import { af3BatchFromA3m } from "../../src/af3/batch.js";
 import { loadTrunkOracle, trunkOracleComparer } from "./trunk-oracle.js";
 import { batchFromDump } from "./fold.js";
@@ -64,61 +66,6 @@ function readChain(text, wanted) {
            alphaCarbons: ordered.map((r) => r.ca) };
 }
 
-/** Kabsch RMSD after superposition, and a TM-score. */
-function superpose(model, truth) {
-  const pairs = model.map((p, i) => [p, truth[i]]).filter(([a, b]) => a && b);
-  const n = pairs.length;
-  const centre = (which) => {
-    const c = [0, 0, 0];
-    for (const pair of pairs) for (let d = 0; d < 3; d += 1) c[d] += pair[which][d] / n;
-    return c;
-  };
-  const cm = centre(0);
-  const ct = centre(1);
-  const covariance = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (const [a, b] of pairs) {
-    for (let i = 0; i < 3; i += 1) {
-      for (let j = 0; j < 3; j += 1) covariance[i][j] += (a[i] - cm[i]) * (b[j] - ct[j]);
-    }
-  }
-  // Rotation by iterative polar decomposition - enough for a score, and it
-  // avoids a second SVD in the tree.
-  let rotation = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-  const multiply = (x, y) => x.map((row, i) => y[0].map((_, j) =>
-    row.reduce((s, v, k) => s + v * y[k][j], 0)));
-  const transpose = (m) => m[0].map((_, j) => m.map((row) => row[j]));
-  const inverse3 = (m) => {
-    const det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-      - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-      + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    const c = (i, j) => {
-      const rows = [0, 1, 2].filter((r) => r !== i);
-      const cols = [0, 1, 2].filter((cc) => cc !== j);
-      return ((i + j) % 2 ? -1 : 1)
-        * (m[rows[0]][cols[0]] * m[rows[1]][cols[1]] - m[rows[0]][cols[1]] * m[rows[1]][cols[0]]);
-    };
-    return [0, 1, 2].map((i) => [0, 1, 2].map((j) => c(j, i) / det));
-  };
-  rotation = covariance;
-  for (let iteration = 0; iteration < 40; iteration += 1) {
-    const next = transpose(inverse3(rotation)).map((row, i) => row.map((v, j) =>
-      0.5 * (rotation[i][j] + v)));
-    rotation = next;
-  }
-  let squared = 0;
-  const d0 = 1.24 * Math.cbrt(Math.max(n - 15, 1)) - 1.8;
-  let tm = 0;
-  const deviations = [];
-  for (const [a, b] of pairs) {
-    const moved = [0, 1, 2].map((i) =>
-      [0, 1, 2].reduce((s, k) => s + (a[k] - cm[k]) * rotation[k][i], 0) + ct[i]);
-    const d2 = [0, 1, 2].reduce((s, i) => s + (moved[i] - b[i]) ** 2, 0);
-    squared += d2;
-    deviations.push(Math.sqrt(d2));
-    tm += 1 / (1 + d2 / (d0 * d0));
-  }
-  return { rmsd: Math.sqrt(squared / n), tm: tm / n, pairs: n, deviations };
-}
 
 export async function main(device, args) {
   // 🔴 `--tune=key=value`, THE SAME FLAG fold.js CARRIES. A knob no gate enters
@@ -173,6 +120,17 @@ export async function main(device, args) {
   // reads 2.89e-2 from a sequence and 4.93e-8 from the reference's batch, over
   // the same weights and the same code. `--dump=` removes the featuriser from
   // the comparison so the trunk's own residual is visible.
+  // 🔴 THE BATCH DIALECT, READ BEFORE THE BATCH IS BUILT - AND IT WAS NOT BEING
+  // READ AT ALL. This tool passed `af3BatchFromA3m` nothing but `max-msa` and
+  // `seed`, so **every OpenDDE number in these docs was featurised with
+  // AlphaFold 3's conventions**: uncentred reference conformers, a SLIDING atom
+  // key window where OpenDDE clamps and masks, and the query once where it
+  // wants it twice. `tools/gpu/fold.js` has passed them since the batch was
+  // extracted; this tool never did, and `fold.js` cannot fold OpenDDE, so
+  // nothing compared the two.
+  const manifestForDialect = await (await fetch(manifest)).json();
+  const batchDialect = dialectFor(manifestForDialect?.model?.name
+    ?? manifestForDialect?.bundle?.model);
   const dumpPath = option(args, "dump", "");
   const dump = dumpPath === "" ? null
     : await (async () => {
@@ -185,6 +143,9 @@ export async function main(device, args) {
     : af3BatchFromA3m(sequence, alignment, {
       maxSequences: Number(option(args, "max-msa", "512")),
       seed: Number(option(args, "seed", "20260831")),
+      // See `batchDialect`: every one of these was missing here.
+      // One object, not a list that goes stale - see `featuriserDialect`.
+      ...featuriserDialect(batchDialect),
     });
   if (rows.depth > 1) console.log(`MSA ${rows.depth} rows`);
   // 🔴 `--probe-msa` PRINTS WHAT THE STACK IS ACTUALLY HANDED. The row count,
@@ -541,22 +502,7 @@ export async function main(device, args) {
     allow: args.includes("--allow-broken-geometry"),
   });
   // The model's alpha carbons, in residue order.
-  const modelCa = [];
-  for (let token = 0; token < batch.tokens; token += 1) {
-    let slot = -1;
-    for (let s = 0; s < batch.dense; s += 1) {
-      const base = (token * batch.dense + s) * 4;
-      const name = [0, 1, 2, 3].map((c) => {
-        const v = batch.refAtomNameChars[base + c];
-        return v > 0 ? String.fromCharCode(v + 32) : "";
-      }).join("");
-      if (name === "CA") { slot = s; break; }
-    }
-    modelCa.push(slot < 0 ? null : [
-      fold.positions[(token * batch.dense + slot) * 3],
-      fold.positions[(token * batch.dense + slot) * 3 + 1],
-      fold.positions[(token * batch.dense + slot) * 3 + 2]]);
-  }
+  const modelCa = modelAlphaCarbons(batch, fold.positions);
   const scored = sequence === crystal.sequence
     ? superpose(modelCa, crystal.alphaCarbons) : undefined;
 

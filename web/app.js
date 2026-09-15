@@ -35,7 +35,8 @@ import { isAbortError, throwIfAborted } from "../src/runtime/abort.js";
 import { distogramContactProbabilities } from "../src/heads/distogram.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../src/runtime/device-memory.js";
-import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
+import { AF3_COUNTS, OPENDDE_COUNTS, OPENDDE_SAMPLER_MODE, NO_FLOW_SAMPLER_FAMILIES,
+  samplerModeFor, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
   loadAf3Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
@@ -379,6 +380,8 @@ const MODEL_STEMS = {
   opendde: "opendde",
   boltz2: "boltz2",
   protenix2: "protenix2",
+  intellifold2: "intellifold2",
+  rosettafold3: "rosettafold3",
   monomer: "af2",
   multimer: "af2_multimer",
   "ef2-fast-600m": "ef2_fast_600m",
@@ -397,6 +400,8 @@ const MODEL_LABELS = {
   // that has more than one member.
   boltz2: "Boltz-2",
   protenix2: "Protenix-v2",
+  intellifold2: "IntelliFold-2",
+  rosettafold3: "RoseTTAFold3",
   monomer: "AlphaFold 2",
   multimer: "AlphaFold 2",
   // 🔴 THE NAME IS THE CHECKPOINT'S, NOT THE FAMILY'S. `ESMFold2` alone read as
@@ -1625,8 +1630,15 @@ function syncModelControls() {
   // two seeds each and no overlap. Its sampler re-noises every step, which is
   // what a flow arm exists to escape, and escaping it here loses the structure
   // rather than buying time. See OPENDDE_SAMPLER_MODE.
+  // 🔴 AND rosettafold3 HIDES IT BECAUSE FLOW BREAKS THE STRUCTURE, which is a
+  // different reason from OpenDDE's "measurably worse": N-CA 6.94 A against
+  // 1.46 and a collapsed backbone, with pLDDT reading 81.47 as if fine. See
+  // NO_FLOW_SAMPLER_FAMILIES.
   const modeNode = document.getElementById("af3ModeGroup");
-  if (modeNode !== null) modeNode.hidden = !af3 || family === "opendde";
+  if (modeNode !== null) {
+    modeNode.hidden = !af3 || family === "opendde"
+      || NO_FLOW_SAMPLER_FAMILIES.includes(family);
+  }
   // 🔴 AND A MODEL WITH NO ALIGNMENT HIDES THE MSA ROW RATHER THAN IGNORING IT.
   // `disable_msa_features` is true in ESMFold2's checkpoint; a search left on
   // screen would run, take a minute of somebody else's server, and be
@@ -1694,7 +1706,8 @@ function syncMaxMsa() {
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
 function syncAf3Count() {
-  const mode = document.getElementById("af3-mode")?.value ?? "flow";
+  const mode = samplerModeFor(chosenFamily(),
+    document.getElementById("af3-mode")?.value ?? "diffusion");
   // ...and ESMFold2's table has one mode, so the shared select cannot pick a
   // row that is not there.
   const ef2 = SINGLE_SEQUENCE_FAMILIES.includes(chosenFamily());
@@ -1898,11 +1911,23 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   // row, which is the trap docs/EF2FAST.md records for that model an hour
   // after hiding its own.
   const opendde = chosenFamily() === "opendde";
-  const mode = opendde ? OPENDDE_SAMPLER_MODE
-    : (document.getElementById("af3-mode")?.value ?? "flow");
+  // 🔴 FORCED FOR rosettafold3 TOO, and for a worse reason than OpenDDE's - see
+  // `samplerModeFor`. Hiding the row does not change the select's value, which
+  // is the trap the comment above records.
+  const mode = samplerModeFor(chosenFamily(),
+    document.getElementById("af3-mode")?.value ?? "diffusion");
   const counts = opendde ? OPENDDE_COUNTS : AF3_COUNTS;
+  // 🔴 THE SAME FALLBACK AS `syncAf3Count`, AND IT WAS MISSING HERE. That
+  // function reads `table[mode] ?? table.flow ?? table.diffusion`; this one
+  // subscripted the table and took `.preferred` off whatever came back, so a
+  // mode with no row - a stale select value, a removed option, a family whose
+  // table is narrower than AF3's - threw "cannot read properties of undefined"
+  // in the middle of starting a fold rather than falling back. Two readings of
+  // one table, one of them guarded, is this file's own stale-allow-list trap.
+  // `test/sampler-options.test.js` gates the two lists against each other.
+  const row = counts[mode] ?? counts.diffusion ?? counts.flow;
   const asked = Number(document.getElementById("af3-count")?.value)
-    || counts[mode].preferred;
+    || row.preferred;
   // 🔴 SIXTEEN IS THE FLOOR AND THE DIAL NO LONGER OFFERS LESS, so this is
   // insurance rather than policy - a stale stored value or a hand-edited option
   // is the only way below it now. AF3_COUNTS carries the measurements and the
@@ -3378,8 +3403,25 @@ async function fold(event) {
     // sitting on the last pass while the download is a different one.
     const ranked = bestIndex !== alignedRecycles.length - 1
       ? ` · saved pass ${bestIndex + 1} of ${alignedRecycles.length}` : "";
+    // 🔴 AND SAY SO WHEN THE FOLD IS NOT A CHAIN, WHICH THIS PAGE NEVER DID.
+    // Every command-line fold in this repository gates on `chainGeometryVerdict`
+    // and the one path a visitor takes did not - the same shape as
+    // LOCALFOLD_STOCK_FLAGS, where the configuration every gate checks was not
+    // the one that ships. Measured: intellifold2 in Flow returns a fold this
+    // rule REFUSES on 1 seed in 6 (CA median 4.255 A against 3.80) with pLDDT
+    // 83.30, and the page drew it with a confident number beside it.
+    //
+    // It WARNS rather than refusing: the structure is still shown, because a
+    // visitor who asked for a fast sampler is entitled to see what it made, and
+    // hiding it would be worse than labelling it. What is not acceptable is
+    // showing it as though the number were the whole story.
+    const chain = chainGeometryVerdict(result.geometry ?? {},
+      { plddt: best.confidence.meanPlddt });
+    const broken = chain.ok ? "" : " · 🔴 NOT A CHAIN - the backbone is broken,"
+      + " and pLDDT does not measure that";
     status(`Done in ${took} s · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
-      + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`);
+      + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
+      + broken);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");

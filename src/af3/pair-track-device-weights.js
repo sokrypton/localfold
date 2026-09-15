@@ -31,6 +31,8 @@
  * are the identity, and the packed buffer holds the bundle's own bytes.
  */
 import { SOURCES, bindable } from "../runtime/weight-sources.js";
+import { GRID_ORDER, OPTIONAL_GRID, QKVG, TRANSPOSED }
+  from "./grid-attention-webgpu.js";
 import { residentWeightBufferFilled } from "../runtime/resident.js";
 import { planBlockUpload, runBlockUpload } from "../runtime/quantised-upload.js";
 import { writeInto } from "../runtime/float16.js";
@@ -80,7 +82,7 @@ const zeros = (length) => ({ length, zero: true });
  *
  * @param {"blocked"|"interleaved"} abLayout
  */
-function triangleLayout(channels, abLayout) {
+export function triangleLayout(channels, abLayout) {
   const C = channels;
   const norms = [
     ["layerNormInWeight", copy("leftNormInputScale", C)],
@@ -222,11 +224,26 @@ export async function residentTriangleOnDevice(device, options) {
  *
  * @returns {Promise<GPUBuffer | undefined>}
  */
-export async function residentGridOnDevice(device, options) {
-  const { grid, label, variant = "" } = options;
-  const sources = grid?.[SOURCES];
-  if (sources === undefined) return undefined;
-  const width = grid.heads * grid.dimension;
+/**
+ * The grid pack's LAYOUT, described from the SOURCES map alone.
+ *
+ * 🔴 EXTRACTED SO IT CAN BE COMPARED, BECAUSE THIS IS A HAND-WRITTEN MIRROR OF
+ * `packGridAttentionWeights` AND THE TWO MUST AGREE TO THE ELEMENT. A term
+ * added there and not here does not drop the term - it points the shader's
+ * `W_GATE_BIAS` INSIDE the output projection, a wrong answer rather than a
+ * missing one, and only on the resident weight path. That happened once and it
+ * was caught by READING, not by a gate: docs/ARCHITECTURE.md records it as the
+ * second of the three bugs this duplication produced.
+ *
+ * It is still two descriptions of one layout, which is the thing that wants
+ * collapsing. This makes the disagreement VISIBLE first, because collapsing a
+ * layout with nothing checking it is how the wrong one wins silently.
+ * test/grid-layout-agrees.test.js is the comparison.
+ *
+ * @returns {{ entries: object[], total: number } | undefined}
+ */
+export function gridResidentEntries(sources, width) {
+  if (sources === undefined || sources === null) return undefined;
 
   // `packGridAttentionWeights`'s ORDER, and its lengths - which come from the
   // tensors rather than from a formula, because a bundle's widths are its own.
@@ -234,9 +251,18 @@ export async function residentGridOnDevice(device, options) {
     const thunk = sources[name];
     return bindable(thunk) ? thunk.count : undefined;
   };
-  const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
-  const TRANSPOSED = new Set(["qProjection", "kProjection", "gatingQuery"]);
-  const plain = ["actNormScale", "actNormOffset", "pairBiasProjection"];
+  // 🔴 THE HOST PACKER'S OWN LISTS, IMPORTED - NOT RETYPED. These were four
+  // local copies of `GRID_ORDER`, `QKVG`, `TRANSPOSED` and `OPTIONAL_GRID`, and
+  // a term added to grid-attention-webgpu.js and not to them does not drop the
+  // term: it points the shader's `W_GATE_BIAS` INSIDE the output projection, a
+  // wrong answer on the resident path only. test/grid-layout-agrees.test.js is
+  // the differential that made this safe to collapse - it was built FIRST, for
+  // exactly that reason.
+  //
+  // `plain` is still derived rather than imported, because the device pack
+  // needs the names BEFORE the composed `qkvgProjection` slot and the host's
+  // ORDER interleaves it; taking everything up to that slot is that statement.
+  const plain = GRID_ORDER.slice(0, GRID_ORDER.indexOf("qkvgProjection"));
   for (const name of [...plain, ...QKVG, "outputProjection"]) {
     if (lengthOf(name) === undefined) return undefined;
   }
@@ -267,14 +293,36 @@ export async function residentGridOnDevice(device, options) {
                    ...mapped });
   });
   total += qkvgLength;
-  {
-    const thunk = sources.outputProjection;
-    entries.push({ name: "outputProjection", offset: total, length: thunk.count, destStride: 1,
+  // 🔴 AND THE TWO OPTIONAL BIASES, IN packGridAttentionWeights' ORDER. This
+  // pack is a hand-written mirror of that function's layout, so a term added
+  // there and not here would put the shader's `W_GATE_BIAS` inside the output
+  // projection - a wrong answer, not a missing one, and only on the resident
+  // path. rosettafold3 is the only checkpoint that has them.
+  for (const name of ["outputProjection", ...OPTIONAL_GRID]) {
+    // 🔴 `== null` AND NOT `=== undefined`: the loader sets an absent optional
+    // to NULL, and that null reaches the SOURCES map, so a strict check falls
+    // through and reads `.count` off it. boltz2 died on exactly that.
+    const thunk = sources[name];
+    if (thunk == null) {
+      if (name === "outputProjection") return undefined;
+      continue;
+    }
+    entries.push({ name, offset: total, length: thunk.count, destStride: 1,
                    sources: [{ store: thunk.store, tensorName: thunk.tensorName,
                                first: thunk.first, count: thunk.count, bias: thunk.first }],
                    inner: thunk.count, innerStride: 1, outerStride: 0 });
     total += thunk.count;
   }
+  return { entries, total };
+}
+
+export async function residentGridOnDevice(device, options) {
+  const { grid, label, variant = "" } = options;
+  const sources = grid?.[SOURCES];
+  if (sources === undefined) return undefined;
+  const laid = gridResidentEntries(sources, grid.heads * grid.dimension);
+  if (laid === undefined) return undefined;
+  const { entries, total } = laid;
 
   const planned = planBlockUpload(entries, "f32");
   if (planned === undefined) return undefined;

@@ -152,6 +152,31 @@ def registry_mismatches() -> list[str]:
     return problems
 
 
+def unpublished_families() -> set[str]:
+    """The families whose shards are not published ANYWHERE yet.
+
+    🔴 `remote: null` IS NOT `remote: "..."` AND IS NOT A LOCAL BUNDLE EITHER.
+    A model that is ported but whose weights have not been uploaded has neither,
+    and `remote_families` - which matches a quoted URL - reads it as local and
+    would publish 612 MiB of it into a Pages allowance of one gigabyte, from
+    whatever export directory happens to be lying around in the checkout. It is
+    skipped instead, and the skip is PRINTED, because a bundle silently missing
+    from a site is the failure mode this whole file exists to stop.
+    """
+    index = (ROOT / "src" / "reference" / "manifests" / "index.js").read_text(encoding="utf-8")
+    families = set()
+    family = None
+    for line in index.splitlines():
+        opened = re.match(r'^  "?([\w-]+)"?: \{$', line)
+        if opened:
+            family = opened.group(1)
+        elif family is not None and re.match(r"^\s*remote:\s*null\s*,\s*$", line):
+            families.add(family)
+        elif line == "  },":
+            family = None
+    return families
+
+
 def remote_families() -> set[str]:
     """The families whose shards are fetched from somewhere else.
 
@@ -389,6 +414,7 @@ def build(include_model: bool) -> int:
             print(f"  {problem}", file=sys.stderr)
         return 1
     remote = remote_families()
+    unpublished = unpublished_families()
     for family, bundle in sorted(BUNDLES.items()):
         model = ROOT / bundle["export"]
         if not model.is_dir():
@@ -420,6 +446,9 @@ def build(include_model: bool) -> int:
                 continue
             if family in remote:
                 print(f"{bundle['export']}/ is hosted remotely; not publishing it")
+                continue
+            if family in unpublished:
+                print(f"{bundle['export']}/ has no remote yet; not publishing it")
                 continue
             # ...the .bin shards only. A served page reads those through fetch,
             # and the base64 scripts beside them are a third larger and exist

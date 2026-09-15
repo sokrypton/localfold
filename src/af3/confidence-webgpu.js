@@ -37,6 +37,11 @@ import { GRID_WIDTH } from "./pair-track-gpu.js";
 const asFloats = (values) =>
   (values instanceof Float32Array ? values : Float32Array.from(values));
 import { tmPerBinFor, tmScoreD0 } from "../heads/tm-score.js";
+// 🔴 THE ONE THING THIS FILE SHARES WITH THE CPU REFERENCE, and it is a
+// STATISTIC rather than a kernel: rf3's confidence inputs are normalised on the
+// host before any of this runs. Sharing a kernel would make the differential
+// agree with itself; sharing a mean and a variance cannot.
+import { maskedGlobalNorm, RF3_S_INPUTS_WIDTH } from "./confidence-reference.js";
 
 const NUM_BINS = 64;
 const MAX_ERROR_BIN = 31.0;
@@ -158,11 +163,25 @@ export function createConfidenceShaders(shape, embedOffsets, headOffsets, epsilo
   for (let bin = 0; bin < PLDDT_BINS; bin += 1) {
     plddtCentres.push((0.5 / PLDDT_BINS + bin / PLDDT_BINS).toString());
   }
+  // 🔴 TWO BINNINGS, AND THE BIN COUNT COMES OFF THE WEIGHT. AlphaFold 3 has 39
+  // EDGES and a bin per edge, the last catching everything past 50.75; rf3 has
+  // 39 BOUNDARIES and 40 bins, the index being how many of them the distance
+  // exceeds - so it has a bin BELOW 3.25 that AF3 has no equivalent of. See
+  // caDistogramFeatures in confidence-reference.js.
+  const caDgram = shape.confidenceCaDgram === true;
+  const dgramBins = caDgram ? 40 : DGRAM_BINS;
   // Squared lower edges, which is AF3's own spelling and avoids a square root.
   const lower = [];
   for (let bin = 0; bin < DGRAM_BINS; bin += 1) {
     const edge = DGRAM_MIN + (DGRAM_MAX - DGRAM_MIN) * bin / (DGRAM_BINS - 1);
     lower.push((edge * edge).toString());
+  }
+  // ...and rf3's, squared the same way. Its boundaries divide by 39 where AF3's
+  // divide by 38, so they are NOT a prefix of the table above.
+  const caBounds = [];
+  for (let at = 0; at < dgramBins - 1; at += 1) {
+    const edge = DGRAM_MIN + at * ((DGRAM_MAX - DGRAM_MIN) / (dgramBins - 1));
+    caBounds.push((edge * edge).toString());
   }
 
   const common = `
@@ -174,7 +193,7 @@ const TARGET_WIDTH: u32 = ${targetFeatWidth}u;
 const DENSE: u32 = ${dense}u;
 const BINS: u32 = ${NUM_BINS}u;
 const PLDDT_BINS: u32 = ${PLDDT_BINS}u;
-const DGRAM_BINS: u32 = ${DGRAM_BINS}u;
+const DGRAM_BINS: u32 = ${dgramBins}u;
 const GRID_WIDTH: u32 = ${GRID_WIDTH}u;
 const EPSILON: f32 = ${epsilon};
 `;
@@ -230,7 +249,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }`;
 
   const embed = `${common}
-const LOWER = array<f32, ${DGRAM_BINS}>(${lower.join(", ")});
+${caDgram
+  ? `const CA_BOUNDS = array<f32, ${caBounds.length}>(${caBounds.join(", ")});`
+  : `const LOWER = array<f32, ${DGRAM_BINS}>(${lower.join(", ")});`}
 const W_LEFT: u32 = ${embedOffsets.leftTargetFeatProject}u;
 const W_RIGHT: u32 = ${embedOffsets.rightTargetFeatProject}u;
 const W_DGRAM: u32 = ${embedOffsets.distogramFeatProject}u;
@@ -260,13 +281,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let difference = pseudo_beta[i * 3u + axis] - pseudo_beta[j * 3u + axis];
     squared += difference * difference;
   }
-  var bin = -1;
+${caDgram ? `  // rf3: the bin is how many boundaries the distance is past, so EVERY pair
+  // lands in one - there is no -1 here and no top-bin special case.
+  var bin = 0;
+  for (var b = 0u; b < DGRAM_BINS - 1u; b += 1u) {
+    if (squared > CA_BOUNDS[b]) { bin += 1; }
+  }` : `  var bin = -1;
   for (var b = 0u; b < DGRAM_BINS; b += 1u) {
     // The final bin's top is 1e8, so everything past 50.75 A lands in it.
     var upper = 1.0e8;
     if (b + 1u < DGRAM_BINS) { upper = LOWER[b + 1u]; }
     if (squared > LOWER[b] && squared < upper) { bin = i32(b); }
-  }
+  }`}
   let keep = pair_mask[row];
 
   for (var c = 0u; c < C_Z; c += 1u) {
@@ -915,6 +941,23 @@ export class Af3ConfidenceHeadGpu {
       for (let j = 0; j < tokens; j += 1) pairMask[i * tokens + j] = seqMask[i] * seqMask[j];
     }
 
+    // 🔴 RoseTTAFold3's GLOBAL NORM, ON THE HOST, AND DELIBERATELY. It reduces
+    // the WHOLE tensor to two scalars - one mean and one variance across every
+    // token and every channel - so a GPU version is a full reduction, a
+    // readback and a second pass, three dispatches to save an O(n) loop the
+    // host runs once per FOLD rather than once per block. The pair is the big
+    // one at `tokens^2 * 128`, which is 590k floats on a 68-mer: about a
+    // millisecond here, against a denoiser that is seconds. Reuses the CPU
+    // reference's own function, which is the one place this port and its
+    // differential are allowed to share code - it is a statistic, not a kernel.
+    if (dialect?.confidenceGlobalNorm === true) {
+      input = { ...input,
+                pair: maskedGlobalNorm(input.pair, pairMask, pairs, pairChannels),
+                single: maskedGlobalNorm(input.single, seqMask, tokens, singleChannels),
+                targetFeat: maskedGlobalNorm(input.targetFeat, seqMask, tokens,
+                                             targetFeatWidth, RF3_S_INPUTS_WIDTH) };
+    }
+
     // 🔴 THE HEAD'S SHAPE IS THE BUNDLE'S. boltz2 rebuilds z under its own scope,
     // normalises before no logit head, and splits both pair heads by chain; each
     // of the three is chosen by whether the tensors are there, and each changes
@@ -925,14 +968,16 @@ export class Af3ConfidenceHeadGpu {
       : pack(weights, embedOrderFor(weights), "confidence embed");
     const headPacked = pack(weights, headOrderFor(weights), "confidence head");
     const shape = { tokens, pairChannels, singleChannels, targetFeatWidth, dense,
-                    preSymmetrisedPde: dialect?.preSymmetrisedPde === true };
+                    preSymmetrisedPde: dialect?.preSymmetrisedPde === true,
+                    // rf3's 40-bin CA-CA embedding; see caDistogramFeatures.
+                    confidenceCaDgram: dialect?.confidenceCaDgram === true };
     const sources = createConfidenceShaders(
       shape, reembedding ? {} : embedPacked.offsets, headPacked.offsets, epsilon, variance,
       reembedding ? embedPacked.offsets : null);
     const base = `af3-confidence:${tokens}:${dense}:${epsilon}:${variance}`
       + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
       + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
-      + `:ps${shape.preSymmetrisedPde}`;
+      + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);

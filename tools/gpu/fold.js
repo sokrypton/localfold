@@ -27,7 +27,7 @@ import { warmTrunkPipelines } from "../../src/af3/fold.js";
 import { diffusionWeights, atomReference, targetFeatureWeights }
   from "../../src/af3/diffusion-weights.js";
 import { Af3DiffusionTransformerGpu } from "../../src/af3/diffusion-transformer-webgpu.js";
-import { dialectFor } from "../../src/af3/dialect.js";
+import { dialectFor , featuriserDialect } from "../../src/af3/dialect.js";
 import { profileDevice } from "./profile.js";
 import { profileBuffers } from "./buffer-profile.js";
 import { setDeviceTuning, deviceTuning, DEFAULT_TUNING }
@@ -291,7 +291,10 @@ export async function main(device, args) {
     ...(option(args, "templates", "") === "" ? {}
       : { templates: Number(option(args, "templates", "")) }),
       prefixRows: args.includes("--prefix-rows"),
-      centreRefConformers: batchDialect?.centreRefConformers,
+      // Every featuriser convention the dialect names, forwarded as one - see
+      // `featuriserDialect`. Listing them here is how the atomised-token four
+      // would have reached the checker and not the fold.
+      ...featuriserDialect(batchDialect),
       ...(ligands.length === 0 ? {} : { ligands }),
       ...(chainKinds === "" ? {} : { chainKinds: chainKinds.split(",") }),
     })
@@ -300,8 +303,15 @@ export async function main(device, args) {
   if (rows.depth > 1) {
     console.log(`MSA ${rows.depth} rows, unpaired block starts at ${rows.unpairedFrom}`);
   }
-  if (batch.sequences !== rows.depth) {
-    console.log(`🔴 the batch carries ${batch.sequences} MSA rows, not ${rows.depth}`);
+  // 🔴 AND THE QUERY'S SECOND COPY IS NOT A DISAGREEMENT. Three families
+  // contribute the query to BOTH the paired and the unpaired block, so a
+  // no-alignment batch is legitimately two rows deep where the alignment is one
+  // - see `dedupeSelfMsa`. Without this the fix for that convention printed a
+  // red warning on every AlphaFold 3 single-sequence fold.
+  const expectedDepth = rows.depth
+    + (rows.depth === 1 && batchDialect?.dedupeSelfMsa === false ? 1 : 0);
+  if (batch.sequences !== expectedDepth) {
+    console.log(`🔴 the batch carries ${batch.sequences} MSA rows, not ${expectedDepth}`);
   }
   console.log(`${batch.sequence.length} residues, ${batch.tokens} tokens,`
     + ` ${batch.atomCount} atoms, ${batch.subsets} atom subsets,`

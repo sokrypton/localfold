@@ -496,8 +496,16 @@ export function createStagedMatrixShader(options = {}) {
       // The channel this group of ${outputGroup.size} columns is.
       let channel = column / ${outputGroup.size}u;
   ${Array.from({ length: outputGroup.size }, (_, r) => `    let v${r} = f32(scratch[sg * ${M * flushWidth}u + i + ${r}u])`
+      // 🔴 A LANE BIAS READS THE WEIGHT BUFFER, SO IT FOLLOWS THAT BINDING.
+      // It was emitted as a SCALAR subscript while the generic `bias` two lines
+      // below already had both forms - so with `vectorStaging.weights` on, where
+      // the buffer is bound as vec4, `weights[i]` is a whole vec4 and the shader
+      // does not compile. AF2's caller happens never to reach that combination;
+      // AF3's grid projection does.
       + (outputGroup.laneBias?.[r] === undefined ? ""
-        : ` + f32(weights[${outputGroup.laneBias[r].replaceAll("$channel", "channel")}])`)
+        : ` + f32(${((at) => (weightVector
+            ? `weights[(${at}) / 4u][(${at}) % 4u]` : `weights[${at}]`))(
+              outputGroup.laneBias[r].replaceAll("$channel", "channel"))})`)
       + (bias ? ` + f32(${weightVector
       ? `weights[(parameters.bias_offset + column + ${r}u) / 4u][(parameters.bias_offset + column + ${r}u) % 4u]`
       : `weights[parameters.bias_offset + column + ${r}u]`})` : "") + ";").join("\n")}

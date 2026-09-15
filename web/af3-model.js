@@ -16,6 +16,7 @@
  */
 import { ccdUrl, parseCcdComponent } from "../src/af3/ccd-component.js";
 import { af3BatchFromA3m } from "../src/af3/batch.js";
+import { featuriserDialect } from "../src/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
   from "../src/af3/fold.js";
 import { confidenceWeights, openddeConfidenceWeights, structuralExpanderWeights,
@@ -68,6 +69,25 @@ export const AF3_COUNTS = {
   // 200 in the other has no way to know that from the word. "Cycles" beside
   // "Recycles" was the earlier objection and these avoid it too.
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
+  // 🔴 THERE IS NO "ODE" ROW, AND THERE WAS. The flow walk's step can be an
+  // integration step - `x <- D + (sigma_next/sigma)(x - D)` rather than
+  // `x <- D` - and it shipped here as a third named sampler on the strength of
+  // "the only step that folds 1QYS for AlphaFold 3". That measurement was taken
+  // on a hand-reverted tree and does not reproduce; see the retraction in
+  // docs/AF3.md.
+  //
+  // Measured against DIFFUSION rather than against a Flow that was never
+  // broken, it wins **1 of 12** model/target pairs - intellifold2 on 6MRR,
+  // 0.769 against 1.549 - and loses the other eleven, by 2.3x on af3's own
+  // 6MRR. Its one win does not survive length either: the same model at 494
+  // residues is 1.665 against 1.058 and 1.065. And it breaks outright past ~400
+  // (494 residues: 6.62 mean against 0.958, the interface collapsing from fnat
+  // 0.87 to 0.26).
+  //
+  // A third option that is never the right pick is a way for a visitor to get a
+  // worse fold, so the page does not offer it. The STEP is still there and
+  // still reachable - `--mode=ode` on any fold tool - because the intellifold2
+  // square is real and worth understanding. See src/af3/fold.js.
   // 🔴 AND 200 IS ON THE DIAL BECAUSE IT IS WHAT AF3 WAS TRAINED WITH. The
   // powers-of-two ladder (20, 40, 80, 160, 320) never landed on it, so the
   // model's own setting was the one number the page could not select. 25 keeps
@@ -97,14 +117,40 @@ export const AF3_COUNTS = {
 /**
  * 🔴 OpenDDE TAKES THE DIFFUSION SAMPLER, AND THE FLOW ARM IS A LOSS AT THE
  * SAME PRICE. On 6MRR at sixteen steps, two seeds each: diffusion TM 0.9044
- * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s. AlphaFold 3
- * prefers flow because its diffusion default is 200 steps and flow-16 reaches
- * it in a twelfth of the calls; OpenDDE's sampler is already best at sixteen,
+ * and 0.9169 against flow's 0.8307 and 0.8601, both arms 16.1 s.
+ * 🔴 THE SENTENCE THAT USED TO FOLLOW - "AlphaFold 3 prefers flow because its
+ * diffusion default is 200 steps and flow-16 reaches it in a twelfth of the
+ * calls" - was stale twice over. The page's diffusion preset is **25**, not
+ * 200 (see AF3_COUNTS), so the ratio was 16 against 25 rather than a twelfth;
+ * and AlphaFold 3 does not prefer flow any more, because flow returned a fold
+ * that is NOT A CHAIN on 1QYS across four seeds while diffusion gave 1.072 A.
+ * Diffusion is the page default now. OpenDDE's sampler is already best at
+ * sixteen,
  * so there is nothing for a flow arm to escape and escaping it loses the
  * structure. The mode row is hidden for this family AND the value forced, so a
  * stale select cannot reintroduce it.
  */
 export const OPENDDE_SAMPLER_MODE = "diffusion";
+
+/**
+ * Families whose CHECKPOINT has no working flow walk, so the page must not
+ * offer one.
+ *
+ * 🔴 THIS IS NOT A PREFERENCE LIKE OpenDDE'S, IT IS A BROKEN STRUCTURE. OpenDDE
+ * hides the row because flow is measurably WORSE for it; rosettafold3 hides it
+ * because flow gives N-CA **6.94 A** against 1.46 and consecutive CA collapsing
+ * to 0.23 A - a fold the geometry gate refuses - while pLDDT reads 81.47
+ * against the good fold's 81.53. The page defaulted to Flow, so this was what a
+ * visitor picking rosettafold3 would have got, with a confidence number saying
+ * nothing was wrong.
+ *
+ * `foldBatch` throws for these rather than switching silently; the page's job
+ * is to not ask. See `noFlowSampler` in src/af3/dialect.js.
+ */
+export const NO_FLOW_SAMPLER_FAMILIES = ["rosettafold3"];
+export const samplerModeFor = (family, asked) =>
+  (family === "opendde" || NO_FLOW_SAMPLER_FAMILIES.includes(family)
+    ? OPENDDE_SAMPLER_MODE : asked);
 
 export const OPENDDE_COUNTS = {
   flow: { label: "Flow", values: [16, 32, 64], preferred: 16 },
@@ -474,9 +520,11 @@ export async function foldAf3(options) {
     // trained with both directions set, and a ring ligand folded through the
     // wrong one comes apart (upstream measures ATP's ribose C-C at ~2.0 A
     // against ~1.5). The weights say which - see af3Dialect.
-    symmetriseBonds: options.weights.trunk.dialect.symmetriseBonds,
-    // CENTRE_REF_CONFORMERS - see src/af3/featurise.js.
-    centreRefConformers: options.weights.trunk.dialect.centreRefConformers,
+    // 🔴 EVERY FEATURISER CONVENTION THE DIALECT NAMES, AS ONE OBJECT. This was
+    // six fields listed by hand, and the page is the call site where a missing
+    // one is least visible - a fold still happens, with another model's
+    // conventions. See `featuriserDialect`.
+    ...featuriserDialect(options.weights.trunk.dialect),
     // What each chain's letters mean. Absent, every chain is protein, which is
     // what every caller before nucleic acids meant.
     chainKinds: options.chainKinds,

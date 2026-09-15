@@ -48,7 +48,8 @@ import { residentPairTrackOnDevice } from "./pair-track-device-weights.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
-  DGRAM_BINS, GEOMETRY_STRIDE, boltz2TemplateFeatures, coverageOf, multichainMaskFor,
+  DGRAM_BINS, GEOMETRY_STRIDE, boltz2TemplateFeatures, rosettafold3TemplateFeatures,
+  coverageOf, multichainMaskFor,
   packTemplateGeometry,
   templateGeometry,
 } from "./template-features.js";
@@ -57,7 +58,6 @@ import {
 // with AF2 now and the geometry module is where both models reach for it.
 export { GEOMETRY_STRIDE, packTemplateGeometry };
 
-const CHANNELS = 64;
 const RESTYPES = 31;
 
 const ORDER = [
@@ -125,6 +125,15 @@ export function fusedTemplateFeatures(template, tokens, width, dialect,
     // protenix2's varies along j. See boltz2TemplateFeatures.
     if (dialect?.boltz2TemplateFeatures === true) {
       return boltz2TemplateFeatures(template, multichainMask2d, tokens);
+    }
+    // 🔴 AND RoseTTAFold3's 66 ARE NOT A TEMPLATE IN THE OTHER TWO'S SENSE.
+    // They are a CA-CA distance histogram, a coverage flag and a noise level -
+    // distance-distribution conditioning rather than a geometry embedding -
+    // riding the identical weight scopes, which is why only `a_proj`'s first
+    // dimension tells the three apart: 66 against 108 and 109. See
+    // rosettafold3TemplateFeatures.
+    if (dialect?.rosettafold3TemplateFeatures === true) {
+      return rosettafold3TemplateFeatures(template, multichainMask2d, tokens);
     }
     const columnsFor = dialect?.fusedTemplateLayout;
     if (columnsFor === undefined || columnsFor === null) {
@@ -223,7 +232,14 @@ export function packTemplateWeights(weights) {
 }
 
 export function createTemplateShaders(shape, offsets, epsilon, variance) {
-  const { tokens, queryChannels, templates, fused = false, featureWidth = 0 } = shape;
+  // 🔴 `channels` IS THE STACK'S OWN WIDTH AND IS NOT 64. See stackChannels in
+  // template-reference.js: five checkpoints say 64 and IntelliFold-2 says 256.
+  const { tokens, queryChannels, templates, channels: CHANNELS,
+          fused = false, featureWidth = 0 } = shape;
+  if (!Number.isInteger(CHANNELS)) {
+    throw new Error("createTemplateShaders needs shape.channels, the template "
+      + "stack's own width, which is read off the bundle rather than assumed");
+  }
   const pairs = tokens * tokens;
 
   const common = `
@@ -528,18 +544,30 @@ export class Af3TemplateEmbedderGpu {
     const fused = weights.fused === true;
     const featureWidth = fused ? weights.featureWidth : 0;
     const outerResidual = dialect.templateStackOuterResidual === true;
+    // 🔴 THE STACK'S WIDTH, OFF THE BUNDLE. It was a module constant of 64,
+    // which is right for five checkpoints and wrong for IntelliFold-2's 256 -
+    // and the failure was not a wrong answer but `splitInterleaved` refusing
+    // the triangle weights, because the pack's width and the shader's are the
+    // same number in two places. See stackChannels in template-reference.js.
+    const CHANNELS = weights.channels;
+    if (!Number.isInteger(CHANNELS)) {
+      throw new Error("template weights carry no `channels`: the stack's width "
+        + "is read from output_layer_norm/scale (or v_norm/scale), not assumed");
+    }
     const sources = createTemplateShaders(
-      { tokens, queryChannels, templates, fused, featureWidth,
+      { tokens, queryChannels, templates, channels: CHANNELS, fused, featureWidth,
         templateStackOuterResidual: outerResidual },
       packed.offsets, epsilon, variance);
+    // ...and it is in the KEY, because two bundles differing only in the stack
+    // width would otherwise share every one of these pipelines.
     const base = `af3-template:${tokens}:${queryChannels}:${templates}:${epsilon}`
-      + `:${variance}:${dialect.swapTransposedBias}`
+      + `:${variance}:${dialect.swapTransposedBias}:c${CHANNELS}`
       + `:${fused ? `fused${featureWidth}` : ""}${outerResidual ? ":or" : ""}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${base}:${name}`, source);
     }
-    // The template stack: the shared pair track at 64 channels, factor 2.
+    // The template stack: the shared pair track at the stack's own width.
     // ...one variable for the shader and the packing; see the note in
     // msa-stack-webgpu.js for what their disagreeing costs.
     const pairWeightPrecision = options.pairWeightPrecision ?? "f32";
@@ -548,7 +576,8 @@ export class Af3TemplateEmbedderGpu {
       // ...derived, not 2: boltz2's template transition is a factor of 4. See
       // templateTransitionFactor in template-reference.js.
       n: tokens, channels: CHANNELS,
-      transitionFactor: templateTransitionFactor(weights.blocks[0].pairTransition),
+      transitionFactor: templateTransitionFactor(weights.blocks[0].pairTransition,
+                                                 CHANNELS),
       weightPrecision: pairWeightPrecision,
       sample: weights.blocks[0], epsilon, variance, dialect, base: `${base}:track`,
       // ...the same pair track, so the same kernel choice. Four of an AF3
@@ -627,6 +656,63 @@ export class Af3TemplateEmbedderGpu {
       // shader multiplies by it. A fold with no templates runs one pass, which
       // is what it always did.
       const passes = [];
+      // 🔴 RoseTTAFold3 AVERAGES THE FEATURES AND RUNS ONE PASS, WHERE EVERY
+      // OTHER FAMILY RUNS A PASS PER SLOT AND AVERAGES THE OUTPUTS. Its
+      // reference is explicit - `a_tij = einsum('t,tijc->ijc', present, feats)
+      // / clip(present.sum(), 1)` and then a single forward with "no
+      // per-template loop and no template gating". Diluting one real template
+      // over four SLOTS instead of dividing by the one PRESENT template makes
+      // its whole term a quarter of what the checkpoint expects, and a quarter
+      // of a distance-distribution conditioning is a template that does almost
+      // nothing.
+      //
+      // 🔴 AND NO MODULE CHECK COULD SEE IT: `check-fused-template-features.js`
+      // passes `templates: 1`, where a slot mean and a present mean are the
+      // same number, so rf3 read 0.061 there (inside its int5 bundle's floor -
+      // boltz2's int5 reads 0.167 where its f32 reads 8.25e-7) while a FOLD
+      // with a perfect self-template moved 17.949 A to 17.771. AlphaFold 3 and
+      // IntelliFold-2 take the identical input to 0.281 and 0.254.
+      // The empty case is untouched, which is why rf3's trunk seam was exact.
+      if (dialect.templateFeatureMeanOnePass === true) {
+        if (!fused) {
+          throw new Error("templateFeatureMeanOnePass is a FUSED convention:"
+            + " the nine-projection path has no single feature tensor to average");
+        }
+        // Present is "this slot has an atom", the reference's own test - not
+        // "a slot object was passed", because a covered-nothing slot is absent
+        // to the reference and present to a null check.
+        const present = [];
+        for (let slot = 0; slot < templates; slot += 1) {
+          const here = slots[slot];
+          if (here === undefined || here === null) continue;
+          if (here.atomMask.some === undefined
+            ? Array.prototype.some.call(here.atomMask, (v) => v > 0)
+            : here.atomMask.some((v) => v > 0)) present.push(here);
+        }
+        let features;
+        if (present.length === 0) {
+          // Zero features, one pass - byte-identical to the empty path below,
+          // which is what kept rf3's no-template trunk seam exact.
+          features = fusedTemplateFeatures(undefined, tokens, featureWidth, dialect,
+                                           undefined, false);
+        } else {
+          features = fusedTemplateFeatures(present[0], tokens, featureWidth, dialect,
+                                           chainMaskFor(present[0]), false);
+          for (let extra = 1; extra < present.length; extra += 1) {
+            const more = fusedTemplateFeatures(present[extra], tokens, featureWidth,
+                                               dialect, chainMaskFor(present[extra]), false);
+            for (let index = 0; index < features.length; index += 1) features[index] += more[index];
+          }
+          if (present.length > 1) {
+            for (let index = 0; index < features.length; index += 1) {
+              features[index] /= present.length;
+            }
+          }
+        }
+        // `repeat` cancels TEMPLATE_SCALE, which is 1/slots: this module
+        // contributes its one forward at full strength, whatever the slot count.
+        passes.push({ template: undefined, repeat: templates, features });
+      } else {
       let emptySlots = 0;
       for (let slot = 0; slot < templates; slot += 1) {
         if (slots[slot] === undefined || slots[slot] === null) emptySlots += 1;
@@ -651,9 +737,10 @@ export class Af3TemplateEmbedderGpu {
       } else if (emptySlots > 0) {
         passes.push({ template: undefined, repeat: emptySlots, emptyAatype: 0 });
       }
+      }
 
       const slotBuffers = [];
-      for (const { template, repeat, emptyAatype } of passes) {
+      for (const { template, repeat, emptyAatype, features: given } of passes) {
         const slot = slotBuffers.length;
         // An empty slot contributes a ROW of each aatype weight rather than
         // nothing - that is half of why an empty slot is not a no-op - and
@@ -694,7 +781,7 @@ export class Af3TemplateEmbedderGpu {
           // gated by nothing, so this refuses rather than guessing.
           features: fused ? keep(this.allocator.upload(
             `af3-template.features.${slot}`,
-            fusedTemplateFeatures(template, tokens, featureWidth, dialect,
+            given ?? fusedTemplateFeatures(template, tokens, featureWidth, dialect,
                                   template === undefined || template === null
                                     ? undefined : chainMaskFor(template),
                                   (emptyAatype ?? 0) !== 0),

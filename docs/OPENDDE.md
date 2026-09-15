@@ -476,7 +476,14 @@ IS FOR AlphaFold 3.** On 6MRR at sixteen steps, two seeds each:
 | **diffusion-16** | **0.9044, 0.9169** | 1.498, 1.399 | 16.1 s |
 | flow-16 | 0.8307, 0.8601 | 1.828, 1.641 | 16.1 s |
 
-AlphaFold 3 prefers flow because its diffusion default is 200 steps and flow-16
+🔴 STALE, AND CORRECTED IN web/af3-model.js: the page's diffusion preset is 25,
+not 200, so the ratio is 16 against 25 rather than a twelfth, and AlphaFold 3 no
+longer prefers flow - diffusion is ahead of it on every target measured, though
+narrowly (1QYS 0.918 against 0.936-0.999). 🔴 THE STRONGER REASON THIS LINE USED
+TO GIVE - "flow returns a fold that is not a chain on 1QYS across four seeds" -
+IS RETRACTED: it does not reproduce, at HEAD or at the commit that recorded it.
+See CLAUDE.md. The original sentence read: AlphaFold 3
+prefers flow because its diffusion default is 200 steps and flow-16
 reaches it in a twelfth of the calls. OpenDDE's sampler is already best at
 SIXTEEN, so a flow arm has nothing to escape from - and escaping the re-noising
 is what loses the structure. The mode row is hidden for this family and the
@@ -939,3 +946,64 @@ compile costs. Not taken.
 The probe stays because the survey is the useful part: it says which kernels
 would be shareable if anyone finds a way, and it is the instrument to re-run
 before believing that any of them is.
+
+## The second token space, gated at last - and it had two defects
+
+`npm run test:batch` compares **109 fields** for opendde now: the residue batch
+and the `struct/` + `structbook/` second tokenisation together, on two targets
+(6MRR, and 6MRR + glycerol + phosphoserine). Both exact.
+
+Until this it compared **none** of the second space. `check-batch-fields.js`
+printed a note on every run saying so - "built by structural-tokens.js and NOT
+compared here" - and `structbook` is the mapping that DEFINES the space: which
+parent residue each subtoken belongs to, its role, its twin, its chain
+neighbours. A wrong entry there is wrong for every stage after it.
+
+### 🔴 The polymer/ligand chain link, and `?? 0` is why
+
+`structuralLayout` keyed its neighbour test on
+
+    batch.chainOfResidue[batch.residueOfToken[token]] ?? 0
+
+and `residueOfToken` is **-1 for a ligand atom**. So the lookup was `undefined`,
+the fallback made every ligand token chain **0**, and that is exactly what a
+chain-0 polymer residue gives. The guard compared 0 against 0 and linked the
+glycerol's first atom to the protein's last residue as its chain neighbour,
+where af3-any-model's `structbook` says -1. Three links wrong on
+6MRR + GOL + SEP@3.
+
+It is the same shape as the `== null` trap elsewhere in this port: an **absent**
+thing collapsed onto a **valid** value, by a fallback that reads as defensive.
+
+### 🔴 And the first repair made it worse: 3 wrong links became 10
+
+Reading "a ligand token has no chain" and skipping those entries also broke the
+links a ligand's atoms have to **each other**. The reference links
+77 -> 78 -> ... -> 82 within the glycerol and refuses only **across** the
+boundary. That is what a per-token chain id says and what `chainOfResidue`
+structurally cannot: `chainOf` is `batch.asymId[token]` now, which the
+featuriser already sets for every token including a ligand's. 3 wrong, then 10,
+then 0.
+
+### 🔴 And `struct/token_index` was zero-based
+
+`featurise.js` writes `token + 1` and the reference's `struct/token_index` is
+1..160, so this port disagreed with af3-any-model **and with itself**, in the
+same field, on the second token space only. Inert - `token_index` reaches the
+model through the relative position encoding as a DIFFERENCE, and a uniform
+shift cancels there, which is exactly why nothing caught it. Aligned anyway.
+
+### Two things the comparison had to get right to say any of that
+
+- **The reference PADS to a bucket.** 130 real subtokens against a batch
+  bucketed to 160, with `struct/seq_mask` zero across the tail. Comparing whole
+  arrays reports thirty tokens of padding as a disagreement.
+- **`ref_space_uid` is a PARTITION, not an array.** It answers "are these two
+  atoms in the same space", so the labels are arbitrary: this port numbers
+  densely from zero and the reference skips a number. Elementwise that is
+  **3116 of 3120 slots differing** and reads as a serious defect. As a
+  partition, both give **68 spaces holding exactly the same atoms** - exact.
+
+Nothing shipped moved: opendde's 6MRR fold is byte-identical either way, pLDDT
+92.03958276090722, RMSD 1.518, TM 0.9304, because a single-chain protein has a
+constant `asymId` where it had a constant 0.

@@ -106,6 +106,39 @@ const CONTRACT_TILE_DEFAULT = { rows: 32, columns: 32 };
  */
 export const LINEAR_GRID_WIDTH = 32_768;
 
+/**
+ * The largest of a tile's candidates whose workgroup storage FITS this device.
+ *
+ * 🔴 EVERY ROW TILE HERE IS A CONSTANT THAT NEVER ASKED THE DEVICE, and at
+ * AlphaFold 3's 128 channels none of them had to: `grid.normalize` stages
+ * `rows * channels` floats, which is 4,640 bytes at 8 rows and fits anything.
+ * IntelliFold-2's pair is **512 channels**, and the same tile is
+ * `8 * 512 * 4 + 512 + 64` = **16,960 bytes against WebGPU's guaranteed 16,384**
+ * - so if2 folds on this A100, folds at `PORTABLE_CEILINGS`, and cannot create
+ * that pipeline on a device at the standard's minimum. The error names a shader
+ * and a byte count and no limit, which is the hardest kind to read from another
+ * machine.
+ *
+ * 🔴 AND IT IS THE FIFTH OF EXACTLY THIS BUG. `transitionWidth`,
+ * `splitTransitionConfig`, `projectMatrixConfig` and two projection workgroups
+ * were all performance choices that never priced the storage they stage; see
+ * the spec-floor row in CLAUDE.md. The pattern is always the same - a constant
+ * fitted at one model's width, correct until a wider model arrives - and it is
+ * the same pattern docs/ARCHITECTURE.md names as the thing to design out.
+ *
+ * Halving the tile costs weight traffic and nothing else: the kernel is the
+ * kernel, only fewer rows share a staging pass. On this device the limit is
+ * 49152 and every model keeps the tile it had.
+ */
+export function tileThatFits(candidates, bytesFor, limitBytes) {
+  for (const rows of candidates) if (bytesFor(rows) <= limitBytes) return rows;
+  // 🔴 THE SMALLEST CANDIDATE, NOT A THROW. One row is the least this kernel
+  // can stage, and a device that cannot hold one row of the pair has no
+  // business here - the pipeline creation will say so, naming the shader,
+  // which is more use than a message from this helper.
+  return candidates[candidates.length - 1];
+}
+
 export function createTriangleShaders(
   shape,
   precision,
@@ -132,6 +165,18 @@ export function createTriangleShaders(
     ab: abStorage = "f32",
   } = typeof storage === "string" ? { normalized: storage } : storage;
   const packAB = abStorage === "f16";
+  // 🔴 RoseTTAFold3 DIVIDES THE CONTRACTION BY THE CHAIN LENGTH, AND IT IS
+  // OBSERVABLE ONLY BECAUSE A LayerNorm's EPSILON DOES NOT COMMUTE WITH A
+  // SCALE. Its triangle multiplication is
+  // `out = einsum("bikd,bjkd->bijd", left, right / float(L))` followed by the
+  // centre norm - so the mean and the variance are 1/L and 1/L^2 of ours while
+  // EPSILON is not, and the normalised result differs by a factor that depends
+  // on the row. Applied at THIS pass's input rather than at the contraction's
+  // output because they are the same number and this pass already reads every
+  // element once: the contraction is the most expensive kernel in the track and
+  // does not need a multiply in its inner loop. Divided rather than multiplied
+  // by a reciprocal, so it is the CPU reference's `total / n` to the last bit.
+  const divideByLength = shape.triangleMulDivideByLength === true;
   if (variance !== "two-pass" && variance !== "fast") {
     throw new Error(`variance must be "two-pass" or "fast", not ${variance}`);
   }
@@ -182,7 +227,17 @@ export function createTriangleShaders(
   //
   // NORMALIZE_ROWS rows a workgroup of 64, so eight lanes share a row's
   // reduction and the staging tile is NORMALIZE_ROWS * channels floats.
-  const NORMALIZE_ROWS = 8;
+  // 🔴 PRICED AGAINST THE DEVICE, NOT TYPED IN - AND THIS IS THE SECOND COPY OF
+  // THIS TILE. `grid-attention-webgpu.js` has the same eight-row staged
+  // LayerNorm and the same arithmetic; both stage `rows * channels` floats plus
+  // two 64-lane reductions and two per-row scalars, and both come to EXACTLY
+  // 16,960 bytes at IntelliFold-2's 512 channels against WebGPU's guaranteed
+  // 16,384. Fixing one and not the other left the error byte-for-byte
+  // identical, which reads as "the fix did not take". docs/ARCHITECTURE.md
+  // lists this LayerNorm among the things written four times.
+  const NORMALIZE_ROWS = tileThatFits([8, 4, 2, 1],
+    (rows) => rows * Math.max(shape.cZ, shape.cHidden) * 4 + 64 * 4 * 2 + rows * 4 * 2,
+    shape.maxComputeWorkgroupStorageSize ?? 49152);
   const LANES_PER_ROW = 64 / NORMALIZE_ROWS;
 
   /**
@@ -634,7 +689,9 @@ fn main(
 // transpose in a pass that already touches every element once is free next to
 // a dedicated one, and staging it through workgroup memory is what lets BOTH
 // sides be read and written along their own major axis.
-${stagedLayerNorm("CH", (row, channel) => `source[${channel} * PAIRS + ${row}]`,
+${stagedLayerNorm("CH", (row, channel) => divideByLength
+                    ? `(source[${channel} * PAIRS + ${row}] / f32(L))`
+                    : `source[${channel} * PAIRS + ${row}]`,
                   "LAYERNORMOUTWEIGHT", "LAYERNORMOUTBIAS", "channel", hiddenStorage)}`;
 
   const projectOutput = `${common}

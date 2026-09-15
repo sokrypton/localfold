@@ -32,6 +32,7 @@
  * after triangle multiplication, and it runs four times rather than 48.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 
 const GRID_WIDTH = 32_768;
@@ -93,17 +94,21 @@ const ORDER = [
   "leftProjection", "rightProjection", "outputW", "outputB",
 ];
 
+// 🔴 RoseTTAFold3 ONLY, AND ABSENT MEANS ABSENT. Its two projections are
+// biased where every other checkpoint's are bias-free; a bundle without them
+// packs nothing extra and generates the same WGSL it always did.
+const OPTIONAL = ["leftProjectionBias", "rightProjectionBias"];
+
 export function packOuterProductMeanWeights(weights) {
-  const offsets = {};
-  let total = 0;
-  for (const name of ORDER) {
-    if (weights[name] === undefined) throw new Error(`outer product mean missing ${name}`);
-    offsets[name] = total;
-    total += weights[name].length;
-  }
-  const data = new Float32Array(total);
-  for (const name of ORDER) data.set(weights[name], offsets[name]);
-  return { data, offsets };
+  // 🔴 ONE LIST FOR BOTH LOOPS, and it is `packNamedWeights` that guarantees it
+  // rather than care taken here. This function is where reserving offsets over
+  // ORDER + OPTIONAL and WRITING over ORDER alone left rosettafold3's bias
+  // pointing at a region of zeros - present in the source, present in the
+  // offsets, absent from the buffer, and the fold bit-identical to one with no
+  // bias at all. See src/runtime/weight-pack.js and test/weight-pack.test.js,
+  // which fails on exactly that line when it is put back.
+  return packNamedWeights(weights,
+    { label: "outer product mean", order: ORDER, optional: OPTIONAL });
 }
 
 export function createOuterProductMeanShaders(shape, offsets, epsilon, variance) {
@@ -135,6 +140,8 @@ const W_LEFT: u32 = ${offsets.leftProjection}u;
 const W_RIGHT: u32 = ${offsets.rightProjection}u;
 const W_OUT: u32 = ${offsets.outputW}u;
 const W_OUT_BIAS: u32 = ${offsets.outputB}u;
+${offsets.leftProjectionBias === undefined ? "" : `const W_LEFT_BIAS: u32 = ${offsets.leftProjectionBias}u;
+const W_RIGHT_BIAS: u32 = ${offsets.rightProjectionBias}u;`}
 `;
 
   // LayerNorm and both projections, masked on the way out.
@@ -177,6 +184,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
       left_total += value * weights[W_LEFT + c * C_OUTER + o];
       right_total += value * weights[W_RIGHT + c * C_OUTER + o];
     }
+${offsets.leftProjectionBias === undefined ? "" : `    // rosettafold3's biased projections. BEFORE the mask, because the
+    // reference is `+"`mask * Linear(act)`"+` - a masked row still contributes
+    // nothing, and an unmasked one gains the two cross terms of the bilinear
+    // product. See the note in weights.js.
+    left_total += weights[W_LEFT_BIAS + o];
+    right_total += weights[W_RIGHT_BIAS + o];`}
     // ...masked here, after the projection, on both sides.
     left[row * C_OUTER + o] = keep * left_total;
     right[row * C_OUTER + o] = keep * right_total;

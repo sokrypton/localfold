@@ -142,6 +142,13 @@ export async function compilePairTrack(cache, options) {
   const accumulatePrecision = options.accumulatePrecision ?? "f32";
   const shape = {
     length: n, cZ: channels, cHidden: channels, weightPrecision, accumulatePrecision,
+    // 🔴 THE DEVICE'S OWN LIMIT, because the staged LayerNorm's row tile is
+    // `rows * channels` floats and at 512 channels the shipped eight-row tile
+    // is 16,960 bytes against WebGPU's guaranteed 16,384. See `tileThatFits`.
+    maxComputeWorkgroupStorageSize: options.maxComputeWorkgroupStorageSize,
+    // RoseTTAFold3's `right / float(L)` inside the contraction - see the note
+    // in src/triangle/shaders.js for why it is applied at the centre norm.
+    triangleMulDivideByLength: dialect?.triangleMulDivideByLength === true,
   };
   // 🔴 A STACK WITHOUT THE GRID ATTENTION IS THIS TRACK MINUS TWO OF ITS FIVE
   // UPDATES, AND THAT IS ESMFold2's TRUNK EXACTLY. Its block is a pairformer
@@ -239,7 +246,11 @@ export async function compilePairTrack(cache, options) {
       // CLAUDE.md lists. src/evoformer/block.js learned this at the same seam.
       compileInto(`tri:${direction}:${name}`,
                   `${base}:tri:${direction}:${weightPrecision}:${accumulatePrecision}`
-                  + `:${scratchStorage.join("")}:${offsetKey}:${name}`,
+                  + `:${scratchStorage.join("")}:${offsetKey}`
+                  // ...and the 1/L, which is a `const`-free difference INSIDE
+                  // normalize-hidden's source: two dialects sharing a base
+                  // would otherwise collide on it.
+                  + `:dl${shape.triangleMulDivideByLength}:nr${normalizeRows}:${name}`,
                   source);
     }
     if (projectMatrix !== false) {
@@ -293,7 +304,12 @@ export async function compilePairTrack(cache, options) {
         // first. Off unless the caller asks; the device profile decides, and
         // the geometry is swept per kernel and never inherited. See
         // src/af3/grid-attention-matrix.js.
-        attendMatrix: options.attendMatrix ?? false },
+        attendMatrix: options.attendMatrix ?? false,
+        // 🔴 THE DEVICE'S OWN LIMIT, because `grid.normalize`'s row tile stages
+        // `rows * channels` floats and IntelliFold-2's 512 channels put the
+        // shipped eight-row tile at 16,960 bytes against WebGPU's guaranteed
+        // 16,384. See `tileThatFits`.
+        maxComputeWorkgroupStorageSize: options.maxComputeWorkgroupStorageSize },
       gridOffsets, epsilon, variance, dialect,
       // 🔴 THE ATTENTION WRITES BACK INTO `normalized`. See encodePairTrack:
       // `grid.project` is the last pass that reads scratch[0], and it runs
@@ -317,6 +333,15 @@ export async function compilePairTrack(cache, options) {
       if (!gridProjectMatrixFits(geometry, options.maxComputeWorkgroupStorageSize ?? 49152)) {
         throw new RangeError("the matrix grid projection does not fit this device");
       }
+      // 🔴 rosettafold3's TWO BIASES REACH THE MATRIX PATH TOO, and they had
+      // to: refusing here would have left the only model that has them on the
+      // vector kernel, and dropping them would have silently halved a gate
+      // whose weight initialises to ZERO. The gate's rides in lane 3 through
+      // `laneBias` because the generic bias would add it to q, k and v as
+      // well; the output projection's IS the generic one. Both are absent from
+      // the source where the bundle has no tensor.
+      const gateBias = gridOffsets.gatingQueryBias !== undefined;
+      const outputBias = gridOffsets.outputProjectionBias !== undefined;
       pipelines.gridProjectMatrix = {
         ...gridProjectMatrixDispatch({ rows: n * n, width }, geometry),
         out: gridProjectOutMatrixDispatch({ rows: n * n, channels }, geometry),
@@ -325,21 +350,25 @@ export async function compilePairTrack(cache, options) {
         rows: n * n, channels, width,
         weightOffset: gridOffsets.qkvgProjection,
         outWeightOffset: gridOffsets.outputProjection,
+        ...(gateBias ? { gateBiasOffset: gridOffsets.gatingQueryBias } : {}),
+        ...(outputBias ? { outputBiasOffset: gridOffsets.outputProjectionBias } : {}),
       };
       compileInto(`grid:${key}:projectOutMatrix`,
                   `${base}:grid:${key}:${stagedPrecision}:${scratchStorage.join("")}`
-                  + `:project-out-matrix:${JSON.stringify(geometry)}:${transpose}`,
+                  + `:project-out-matrix:${JSON.stringify(geometry)}:${transpose}`
+                  + `:ob${outputBias}`,
                   createGridProjectOutMatrixShader(
-                    { n, channels, width, transpose },
+                    { n, channels, width, transpose, outputBias },
                     // ...f32 for the same reason - see the note above.
                     { gathered: scratchStorage[0], gate: scratchStorage[4],
                       weight: "f32" },
                     geometry, true));
       compileInto(`grid:${key}:projectMatrix`,
                   `${base}:grid:${key}:${stagedPrecision}:${scratchStorage.join("")}`
-                  + `:project-matrix:${JSON.stringify(geometry)}:${transpose}`,
+                  + `:project-matrix:${JSON.stringify(geometry)}:${transpose}`
+                  + `:gb${gateBias}`,
                   createGridProjectMatrixShader(
-                    { n, channels, width, transpose },
+                    { n, channels, width, transpose, gateBias },
                     // 🔴 f32 AND NOT `weightPrecision`, BECAUSE THIS PACK HAS
                     // NO PRECISION. packGridAttentionWeights takes a shape and
                     // nothing else and always writes a Float32Array, where
@@ -353,7 +382,15 @@ export async function compilePairTrack(cache, options) {
     for (const [name, source] of Object.entries(sources)) {
       compileInto(`grid:${key}:${name}`,
                   `${base}:grid:${key}:${stagedPrecision}`
-                  + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}:${name}`,
+                  + `:${scratchStorage.join("")}:m${options.attendMatrix ?? 0}`
+                  // ...and every row tile, which the device's storage limit
+                  // now chooses. They are baked into the source AND divide the
+                  // dispatch, which is the collision this file records twice.
+                  + `:t${tiles.projectRows}x${tiles.projectOutRows}x${tiles.normalizeRows}`
+                  // ...and rosettafold3's two biases, which are terms in the
+                  // source and `const W_*` lines above it.
+                  + `:gb${gridOffsets.gatingQueryBias !== undefined}`
+                  + `:ob${gridOffsets.outputProjectionBias !== undefined}:${name}`,
                   source);
     }
   }

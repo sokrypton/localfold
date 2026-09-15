@@ -717,6 +717,12 @@ export class Af3DiffusionHeadGpu {
         tokensToQueries: input.tokensToQueries,
         tokensToKeys: input.tokensToKeys,
         tokenAtomsAct: scaled,
+        // 🔴 rosettafold3's CHIRAL CENTRES, forwarded from the batch. Absent
+        // for every other model, and the encoder then generates no term and
+        // binds no buffer. They are a function of the SEQUENCE, so they are
+        // built once by the featuriser and read here every step against the
+        // step's own coordinates.
+        chirals: input.chirals,
         // 🔴 THE TRUNK'S single, not the conditioning module's.
         trunkSingleCond: input.trunkSingle,
         trunkPairCond: cond.pair,

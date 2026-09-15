@@ -418,6 +418,16 @@ function pairTrack(store, root, index) {
     vProjection: at(`pair_attention${which}/v_projection/weights`),
     gatingQuery: at(`pair_attention${which}/gating_query/weights`),
     outputProjection: at(`pair_attention${which}/output_projection/weights`),
+    // 🔴 RoseTTAFold3 ONLY: both of these are biased there and bias-free
+    // everywhere else. Off the TENSORS rather than off the dialect, because a
+    // checkpoint either carries them or does not - and null means the term
+    // does not exist rather than "assume zero". See pairformer-reference.js
+    // for why the GATE's bias is the one that matters.
+    gatingQueryBias: has(store, `${root}/pair_attention${which}/gating_query/bias`)
+      ? at(`pair_attention${which}/gating_query/bias`) : null,
+    outputProjectionBias:
+      has(store, `${root}/pair_attention${which}/output_projection/bias`)
+        ? at(`pair_attention${which}/output_projection/bias`) : null,
   });
   return {
     triangleMultiplicationOutgoing: triangle("outgoing"),
@@ -505,8 +515,15 @@ export async function templateWeights(store, dialect = undefined) {
   if (fused) {
     const [queryChannels] = dims(store, `${TEMPLATE}/z_norm/scale`);
     const [featureWidth] = dims(store, `${TEMPLATE}/a_proj/weights`);
+    // 🔴 THE STACK'S OWN WIDTH IS 64 IN FIVE CHECKPOINTS AND 256 IN
+    // IntelliFold-2, and it was a `const CHANNELS = 64` in two files. Both
+    // embedders carry ONE tensor that states it - the norm after the stack -
+    // so it is read rather than typed, the way `queryChannels` above already
+    // is. A wrong value here does not misfold: `splitInterleaved` refuses the
+    // triangle weights outright, which is how if2's 256 was found.
+    const [channels] = dims(store, `${TEMPLATE}/v_norm/scale`);
     return {
-      fused: true, queryChannels, featureWidth,
+      fused: true, queryChannels, featureWidth, channels,
       blocks: [await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 0)),
                await bind(store, pairTrack(store, TEMPLATE_FUSED_STACK, 1))],
       // v = z_proj(z_norm(z)) + a_proj(a_tij)
@@ -533,8 +550,10 @@ export async function templateWeights(store, dialect = undefined) {
   // while the stack it feeds stays 64 in both. `query_embedding_norm/scale` is
   // the one tensor that states the input width on its own.
   const [queryChannels] = dims(store, `${TEMPLATE_SINGLE}/query_embedding_norm/scale`);
+  // ...and the stack's own width; see the note on the fused branch above.
+  const [channels] = dims(store, `${TEMPLATE_SINGLE}/output_layer_norm/scale`);
   return {
-    fused: false, queryChannels, blocks,
+    fused: false, queryChannels, channels, blocks,
     queryEmbeddingNormScale: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/scale`),
     queryEmbeddingNormOffset: await T(`${TEMPLATE_SINGLE}/query_embedding_norm/offset`),
     templatePairEmbedding8: await T(`${TEMPLATE_SINGLE}/template_pair_embedding_8/weights`),
@@ -559,6 +578,11 @@ export async function templateWeights(store, dialect = undefined) {
   };
 }
 
+/** Whether a bundle carries a tensor at all - for a term only some models have. */
+function has(store, name) {
+  return store.manifest?.tensors?.[name] !== undefined;
+}
+
 export async function msaBlockWeights(store, index) {
   const at = (leaf) => stacked(store, `${MSA_STACK}/${leaf}`, index);
   // `pair_logits/weights` is [blocks, pairChannels, heads] and `v_projection`
@@ -578,6 +602,19 @@ export async function msaBlockWeights(store, index) {
       layerNormInputOffset: at("outer_product_mean/layer_norm_input/offset"),
       leftProjection: at("outer_product_mean/left_projection/weights"),
       rightProjection: at("outer_product_mean/right_projection/weights"),
+      // 🔴 RoseTTAFold3's TWO PROJECTIONS ARE BIASED AND NOBODY ELSE'S ARE.
+      // `proj_left`/`proj_right` are nn.Linear there, and both are trained away
+      // from their zero init. Dropping them is NOT a constant offset on the
+      // pair: the outer product is bilinear, so the two cross terms
+      // `b_l (x) W_r x` and `W_l x (x) b_r` go with them. Upstream measured the
+      // MSA module's outer product at corr 0.924 against native with otherwise
+      // near-exact inputs. Off the TENSORS, because a checkpoint either carries
+      // them or does not, and null means the term does not exist.
+      leftProjectionBias: has(store, `${MSA_STACK}/outer_product_mean/left_projection/bias`)
+        ? at("outer_product_mean/left_projection/bias") : null,
+      rightProjectionBias:
+        has(store, `${MSA_STACK}/outer_product_mean/right_projection/bias`)
+          ? at("outer_product_mean/right_projection/bias") : null,
       outputW: at("outer_product_mean/output_w"),
       outputB: at("outer_product_mean/output_b"),
     },

@@ -85,6 +85,24 @@ export function outerProductMean(msa, msaMask, sequences, tokens, msaChannels,
                                weights.layerNormInputOffset);
   const left = linear(normalised, rows, msaChannels, outer, weights.leftProjection);
   const right = linear(normalised, rows, msaChannels, outer, weights.rightProjection);
+  // 🔴 ...AND RoseTTAFold3's TWO PROJECTIONS CARRY BIASES, ADDED BEFORE THE
+  // MASK. Its `proj_left`/`proj_right` are nn.Linear and the reference writes
+  // `mask * Linear(act)`, so a masked row still contributes nothing - but an
+  // unmasked one gains two cross terms in the bilinear product, which is why
+  // dropping them is not a constant offset. No other checkpoint has them and
+  // `null` means the term does not exist. See weights.js.
+  const addBias = (rowsOut, bias) => {
+    if (bias == null) return;
+    if (bias.length !== outer) {
+      throw new Error(`an outer product projection bias of ${bias.length} is `
+        + `not the ${outer} outer channels`);
+    }
+    for (let row = 0; row < rows; row += 1) {
+      for (let c = 0; c < outer; c += 1) rowsOut[row * outer + c] += bias[c];
+    }
+  };
+  addBias(left, weights.leftProjectionBias);
+  addBias(right, weights.rightProjectionBias);
   // ...masked AFTER the projection, on both sides. The product is bilinear, so
   // a masked row contributes nothing to either factor.
   for (let row = 0; row < rows; row += 1) {
@@ -256,9 +274,9 @@ export function msaBlock(state, weights, dialect) {
   }
 
   addPair(triangleMultiplication(pair, pairMask, tokens, pairChannels, "outgoing",
-                                 weights.triangleMultiplicationOutgoing));
+                                 weights.triangleMultiplicationOutgoing, dialect));
   addPair(triangleMultiplication(pair, pairMask, tokens, pairChannels, "incoming",
-                                 weights.triangleMultiplicationIncoming));
+                                 weights.triangleMultiplicationIncoming, dialect));
   addPair(gridSelfAttention(pair, pairMask, tokens, pairChannels, false,
                             weights.pairAttention1, dialect));
   addPair(gridSelfAttention(pair, pairMask, tokens, pairChannels, true,

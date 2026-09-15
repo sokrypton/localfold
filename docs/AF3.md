@@ -1,5 +1,613 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 TWO NEW MODELS: IntelliFold-2 AND RoseTTAFold3
+
+Both are in af3-any-model's `ALL_MODELS`, so both are dialect ports rather than
+new graphs, and the two are almost opposite in size. **Read the convention set
+before the code**: the reference's `model_config.py` tuples are the authority,
+and `PYTHONPATH=src ~/venv/bin/python` on the reference node with a script that
+imports the module and introspects every uppercase tuple is how to get it - a
+regex over the source MISSES the ones built from other tuples and misses
+`TRIANGLE_MUL_DIVIDE_BY_LENGTH`, which is written as a conditional expression.
+
+### IntelliFold-2: two conventions, and it folds
+
+The reference names it in exactly two tuples - `KEY_MASKED_ATOM_ATTENTION` and
+`MASK_ATOM_ACT_PER_BLOCK` - and it is deliberately NOT in `OPENFOLD3_LINEAGE`:
+it forks boltz's FEATURISER, not OpenFold's network. Only the second was new
+here, and the reference records that the two are one bug between them: with the
+atom key window aligned and the key-side mask wrong, block 1 reads 9.5e-03 and
+blocks 2-3 blow up on windows 16 and 17 alone.
+
+`maskAtomActPerBlock` re-zeroes the padded atom slots at the TOP of every atom
+block, because if2 pads the flat atom axis INSIDE each attention call
+(`pad_at_dim(a_row, ..., value=0.)`). It reuses the mask-act kernel that already
+ran once after the stack, so only its POSITION differs, and it is carried on
+each atom block - like `chainedAtomLayerNorm` - so the DECODER, which sees no
+dialect object, reads it off its weights the same way.
+
+**It folds 6MRR at pLDDT 83.5, pTM 0.684, N-CA 1.44, CA-C 1.51, CA-CA 3.81,
+radius of gyration 11.2 A**, and its trunk on its own reference batch sits
+INSIDE the family's int5 band on every seam:
+
+| seam, `--dump=` reference batch, int5 | intellifold2 | boltz2 | protenix2 |
+|---|---:|---:|---:|
+| `target_feat` | **2.41e-2** | 3.68e-2 | 5.51e-2 |
+| `z_init` | **1.68e-2** | 1.64e-2 | 2.07e-2 |
+| `z_after_template` | **9.51e-3** | 1.64e-2 | 1.30e-2 |
+| `z_after_msa` | **9.14e-3** | 4.32e-2 | 4.64e-2 |
+| `trunk_out_pair` | **4.54e-2** | 4.56e-2 | 7.15e-2 |
+
+🔴 **THOSE ARE int5 NUMBERS AND THE SWEEP BELOW IS f32'S.** The 1e-8 column in
+the older table was taken on float32 bundles; an int5 bundle's residue against
+an f32 oracle is 1e-2 for every model, and the only useful reading is one model
+against another on the same route. if2 is at or below boltz2 on all five.
+
+🔴 **AND ITS FEATURISER IS WORTH 6x AT `target_feat`.** Featurised from the
+sequence rather than read from the reference's batch, if2 reads **1.45e-1**
+against 2.41e-2 - the shared-ideal-conformer floor plus three boltz-forked
+conventions this port does not implement: `qblock_keys` (the atom key window's
+edge is the atom count rounded UP to a whole 32-atom query block, so on 6MRR its
+last two blocks take keys 448..575 where AF3's slide gives 446..573),
+`dedupe_self_msa` (a chain with no alignments gets a DEPTH-1 MSA where AF3 hands
+the query twice) and `drop_atoms` (no terminal OXT, no 5' OP3). All three are
+open.
+
+### RoseTTAFold3: ten tuples, eleven more branches, and the trunk is done
+
+Its SHAPES are stock AF3's - c_z 128, four triangle-attention heads - so unlike
+protenix2 there is no widening. Two config divergences (a 65-bin distogram and
+an MSA module that holds ONE set of weights and runs it four times, which the
+converter replicates so this port sees four blocks) and then a long list of
+forward branches, most of them gated on the model NAME in the reference rather
+than on a convention tuple. `src/af3/dialect.js`'s ROSETTAFOLD3 lists every one,
+implemented or not; four are done and they are worth an order of magnitude:
+
+| rf3 trunk, `--dump=` reference batch, int5 | start | +conformer bias | +is_paired | +OPM bias | +grid bias |
+|---|---:|---:|---:|---:|---:|
+| `target_feat` | 1.40e+0 | 7.00e-2 | 7.00e-2 | 7.00e-2 | **7.00e-2** |
+| `z_init` | 6.61e-1 | 3.97e-2 | 3.97e-2 | 3.97e-2 | **3.97e-2** |
+| `z_after_template` | 2.53e-1 | 2.63e-2 | 2.63e-2 | 2.63e-2 | **2.01e-2** |
+| `z_after_msa` | 2.83e-1 | 1.36e-1 | 1.15e-1 | 6.14e-2 | **6.29e-2** |
+| `trunk_out_pair` | 7.28e-1 | 1.68e-1 | 1.49e-1 | 1.29e-1 | **4.90e-2** |
+| `single` | 4.00e-1 | 1.24e-1 | 2.82e-2 | 2.89e-2 | **1.47e-2** |
+
+**4.90e-2 is boltz2's 4.56e-2**, on the same route with the same quantisation,
+so rf3's TRUNK is at the family's band. Its diffusion side is not: `kq_norm`,
+the `no_residual` block wiring, the chirality query term and two confidence-head
+branches are declared and unimplemented, and the reference's own converter says
+"WIP: converter trunk+heads+diffusion(cond+token) done; atom path + branches
+next" - so an rf3 oracle dump can be trusted through the trunk and the token
+transformer and NOT through the atom encoder or decoder.
+
+**IT FOLDS.** 6MRR at **RMSD 1.68 A, TM 0.911**, which is inside af3-any-model's
+own five-sample spread for rf3 (0.967 / 1.621 / 1.676 / 1.694 / 1.772, mean
+1.546). Six branches took it there and no single one of them did; the table is
+worth keeping because two of the six moved it and did NOT fix it, which is
+exactly the state in which a correct change looks like a wrong one:
+
+| rf3, 6MRR, each arm on top of the one above | Rg over 68 CA | CA-CA | N-CA | CA-C |
+|---|---:|---:|---:|---:|
+| trunk conventions only | 3.3 A | 1.32 | 0.28 | 0.43 |
+| + `diffusionNoResidual`, token transformer | 3.0 | 1.50 | 0.34 | 0.48 |
+| + `kq_norm`, token transformer | **10.6** | **3.29** | 0.79 | 0.97 |
+| + `kq_norm`, both atom stacks | 10.7 | 3.31 | 0.87 | 1.03 |
+| + `diffusionNoResidual` in the ATOM stacks, `paddedAtomKeys`, `dropTerminalAtoms` | **11.1** | **3.81** | **1.42** | **1.52** |
+| (a compact 68-mer / ideal) | 11-12 | 3.80 | 1.46 | 1.52 |
+
+The middle two rows are the lesson. `diffusionNoResidual` in the token
+transformer moved the fold by almost nothing and was correct; `kq_norm` in the
+atom stacks moved it by almost nothing and was correct. Judging either on the
+fold alone would have backed it out.
+
+`kq_norm` is a TRAINED LayerNorm on q and k over the FLATTENED
+`num_head * key_dim` axis - not per head, so one mean and one variance serve
+every head of a row - applied after the projection and before the key_dim
+scaling, with two-pass variance and both a scale and an offset. Its tensors are
+`transformer{query,key}_layer_norm` [6, 4, 768] in the token transformer and
+[3, 128] in each atom stack, all under `__layer_stack_no_per_layer`, which for
+the atom stacks is the same root their other weights take because rf3 is in
+`PER_BLOCK_ATOM_PAIR_LAYER_NORM`. In the token transformer it is one workgroup
+a token row between `qkvg` and `attend`; in the atom stacks q and k have
+DIFFERENT row counts, so one dispatch covers `QUERY_ROWS + KEY_ROWS` and the
+first `QUERY_ROWS` of them are q. It normalises `k` AFTER `expand-keys`, because
+the reference's `x_k` is already in keys layout and the gather zeroes the padded
+slots the reference normalises along with the rest.
+
+🔴 **AND THE REFERENCE'S rf3 IS FINE. I SAID IT WAS WIP AND THAT WAS WRONG.**
+This section previously read the note in af3-any-model's `model_registry.py` -
+"WIP: converter trunk+heads+diffusion(cond+token) done; atom path + branches
+next" - as a live caveat and concluded an rf3 oracle dump could not be trusted
+past the token transformer. **That note is STALE**, and their own PARITY.md
+contradicts it in the same checkout: rf3 is `✓` at L0, L1 pairformer, L3
+denoise, L4 confidence, L5 fold and L6 modality, `~` at L2 in exactly the way
+protenix2 and openbind0 are, and its own L5 log from today reads
+
+    rosettafold3: 68 residues from 6MRR.pdb
+      5 samples, CA-RMSD: 1.772 1.621 1.676 0.967 1.694   best 0.967  mean 1.546
+
+**So every rf3 oracle number here is trustworthy and the collapse is OURS.**
+Reading one file's comment as the state of a port, when the repository ships a
+parity matrix and a dated log per level, was the error - and it pointed the
+search at the wrong repository for an afternoon.
+
+🔴 **AND ITS CONFIDENCE HEAD READ 53.8 pLDDT FOR THAT 1.68 A STRUCTURE.** The
+last branch is `confidenceGlobalNorm`: a parameter-free LayerNorm over the WHOLE
+tensor - not along the feature axis - applied to each detached trunk input
+before the head reads it. **pLDDT 53.8 -> 81.5 and pTM 0.175 -> 0.843**, and
+AlphaFold 3's control is unmoved at 83.08.
+
+Three things about it are worth keeping:
+
+  * **the statistics are over REAL TOKENS ONLY, and that is the whole
+    difficulty.** A per-feature norm cannot see padding; one that reduces across
+    the feature axis can. Upstream measured a 76-residue chain padded into a
+    128-token bucket at PAE ~28 A everywhere and pTM 0.04 against 0.89, for the
+    same fold.
+  * **`target_feat` is normalised over 449 columns where this port has 447.**
+    The two missing ones are residue-vocabulary classes our alphabet does not
+    carry; they are zero on every input built here, which a per-feature norm
+    would not care about, and each still contributes `mean^2` to the variance.
+  * **it runs on the HOST, deliberately.** It reduces the whole tensor to two
+    scalars, so a GPU version is a full reduction, a readback and a second pass
+    - three dispatches to save an O(n) loop that runs once per FOLD. The pair is
+    590k floats on a 68-mer, about a millisecond, against a denoiser measured in
+    seconds. It is the one thing the GPU path and the CPU reference share, and
+    it is allowed because it is a STATISTIC and not a kernel.
+
+🔴 **AND `weights.confidence.dialect` NEVER EXISTED.** The head is called
+`run(input, weights, dialect)` and the fold passed `weights.confidence.dialect`,
+which `confidenceWeights` has never set - so the argument has been `undefined`
+for every model since the head was written, and every branch behind it ran ONLY
+in `check-af3-confidence-oracle.js`, which passes a real one. That is
+protenix2's and boltz2's `preSymmetrisedPde` as well as rf3's two: measured by
+the checker, never reached by a fold. It passes `weights.trunk.dialect` now.
+
+🔴 **AND "IDENTICAL TO FOUR FIGURES" WAS THE PRINTER, NOT THE WIRING.** The
+CA-CA dgram appeared to change nothing - pLDDT 53.8 before and after - and that
+was read here as a flag not reaching the kernel, on the strength of the
+outer-product packing bug earlier the same night. It was live: 53.814360520
+against 53.814360514, and pTM 0.17502894 against 0.17499594. The console rounds
+to one decimal. **Ask for the digits before concluding a change is inert.**
+
+**What is left, and PARITY.md names most of it.** Its "FIFTEEN PORT BUGS" table
+is a list of the conventions an AF3-lineage atom path gets wrong, and two of its
+rf3 rows are ours now:
+
+  * **`slid the key window where it CLAMPS AND MASKS`** - rf3's atom attention
+    clamps its key window and masks the out-of-range slots
+    (`Cs = arange(nq)*32 + 16`, `patchk = arange(128) - 64` -> keys
+    32i-48 .. 32i+79, then `clamp(indices, 0, L-1)` and `-1e9 * (maskQ|maskK)`),
+    where this port slides the window bodily in bounds. Same convention as
+    opendde and protenix; upstream missed it too, and its note says why - rf3
+    was already in `KEY_MASKED_ATOM_ATTENTION` and that list is about the MASK,
+    not about where the window SITS.
+  * **the chirality query term** - the gradient of the chiral-centre dihedral
+    error w.r.t. the noisy coordinates, added to the diffusion atom encoder's
+    query. The reference HAS it (their own oracle-bug table records a gate that
+    had it switched off); we do not. It is the only reflection-asymmetric signal
+    in the network and a NO-OP on a batch with no chiral centres, which 6MRR is,
+    so nothing measured here can see it yet.
+
+Both of the confidence-head branches landed; see above.
+
+🔴 **AND THE OPM DIVISOR IS ALREADY RIGHT, WHICH IS WORTH RECORDING BECAUSE THE
+PARITY LINE READS THE OTHER WAY.** "OPM applies its output bias BEFORE the
+divide" describes the BUG they fixed, not the convention: `OPM_BIAS_AFTER_NORM`
+contains rosettafold3, the forward is `act / max(norm, 1) + output_b`, and that
+is boltz2's branch, which is what `opmBiasAfterNorm: true` already gives us.
+Their own note adds that rf3's source divides `right` by `float(N)` before the
+einsum, which equals the pairwise count on an unmasked MSA and does not on a
+masked one - so the reference is knowingly approximating there and so are we,
+identically.
+
+rf3 is also absent from the reference's `_SAMPLER_CONSTANTS`, which its own
+comment calls "the honest state for one nobody has checked" - so it runs
+AlphaFold 3's EDM schedule on both sides. That is a shared unknown rather than a
+divergence, and their fold is a chain under it, so it is NOT the explanation for
+ours being short.
+
+The four that landed, in the order they were worth:
+
+1. **`conformer_embedding_bias`, one [128] tensor, and it was 20x at
+   `target_feat` on its own.** rf3's atom single rep takes
+   `process_atom_level_embedding(f['atom_level_embedding'])`, whose input is all
+   ZEROS here - but the MLP has biases and a LayerNorm tail, so it emits a fixed
+   NONZERO vector, the same for every atom and two thirds the magnitude of the
+   ref-feature embedding. **A zero feature is not a zero contribution.** The
+   converter collapses that subtree to one constant, exactly as boltz2's Linear
+   bias is one, so the two share `embedAtomFeaturesBias` and the forward needs
+   no second branch - `constantAtomBias` in diffusion-weights.js reads either
+   name and refuses a bundle carrying both.
+2. **The MSA `is_paired` column, ZERO on the query row.** rf3's
+   `msa_activations` is [35, 64] like boltz2's, and this port already built the
+   35th column - with boltz2's meaning. boltz2 marks the QUERY row paired; rf3's
+   `add_residue_is_paired_feature` marks rows PAIRED ACROSS CHAINS, which an
+   unpaired alignment never has, so it is 0 everywhere INCLUDING the query.
+   `msaPairedQueryRow` decides the VALUE; the column's existence still comes off
+   the weight's width. Worth 1.24e-1 -> 2.82e-2 on `single`.
+3. **The outer product mean's `left_projection`/`right_projection` biases**, worth
+   `z_after_msa` 1.15e-1 -> 6.14e-2. Added BEFORE the mask, because the
+   reference writes `mask * Linear(act)` - a masked row still contributes
+   nothing, and an unmasked one gains two cross terms, since the outer product
+   is bilinear and dropping a bias is therefore NOT a constant offset.
+4. **The grid attention's `gating_query`/`output_projection` biases**, worth
+   `trunk_out_pair` 1.29e-1 -> **4.90e-2** - the largest of the four. The gate's
+   bias initialises to 1.0 against a ZERO-initialised weight, so the gate is
+   bias-DOMINATED, and this runs 96 times in an rf3 trunk. It reaches the MATRIX
+   projection too: the gate's rides in lane 3 through `laneBias` (the generic
+   bias would add it to q, k and v as well) and the output projection's is the
+   generic one. Vector and matrix agree at 4.91e-2 and 4.90e-2.
+
+🔴 **AND THE OPM BIAS WAS BIT-IDENTICAL TO HAVING NO BIAS FOR AN HOUR.**
+`packOuterProductMeanWeights` reserved the offsets over `ORDER + OPTIONAL` and
+WROTE over `ORDER` alone, so the shader read a region of zeros: the term was
+present in the source, present in the offsets, and absent from the buffer. Every
+seam matched the previous run to the last digit, which reads exactly like "this
+convention does not matter here". The grid pack had the same two loops and was
+written with one list from the start because of it. **When a change moves
+nothing at all, suspect the bytes before the convention.**
+
+🔴 **AND `=== undefined` IS THE WRONG PRESENCE TEST FOR AN OPTIONAL WEIGHT.** The
+loader sets an absent one to `null`, and that null reaches the SOURCES map, so
+`residentGridOnDevice`'s strict check fell through and read `.count` off it -
+killing boltz2, a model with none of these tensors, in a code path added for a
+model that has them.
+
+## 🔴 THREE MODELS WERE FOLDING A SINGLE SEQUENCE ONE MSA ROW SHORT
+
+Counted in af3-any-model's own batches on 6MRR, by summing `msa_mask`:
+
+| live MSA rows, no alignment | |
+|---|---|
+| **two** (the query twice) | alphafold3, openbind0, opendde |
+| **one** | boltz2, protenix2, intellifold2, rosettafold3 |
+
+This port gave all seven ONE. AlphaFold 3 concatenates a PAIRED and an UNPAIRED
+block, so a chain with no homologs contributes its own sequence to each; boltz's
+featuriser - which protenix, IntelliFold-2 and RoseTTAFold3 all fork or match -
+emits a depth-1 `dummy_msa` and finds nothing to pair.
+
+**It is not cosmetic.** The outer product mean over two identical rows is
+unchanged, but the pair-weighted averaging and the row transition are
+DEPTH-sensitive; upstream measured the same convention at 4.3% of esmfold2's MSA
+injection. AlphaFold 3's 6MRR fold from the sequence goes **83.084 -> 83.169**.
+
+The flag is `dedupeSelfMsa`, named the reference's way round so stock AlphaFold 3
+stays the all-false baseline this table's own test asserts, and inverted once in
+`af3BatchFromA3m` where it meets the featuriser's `duplicateQueryRow`.
+
+🔴 **AND FINDING IT EXPOSED THAT `fold-opendde.js` PASSED NO DIALECT AT ALL.**
+That tool handed `af3BatchFromA3m` nothing but `max-msa` and `seed`, so **every
+OpenDDE number in these docs was featurised with AlphaFold 3's conventions** -
+uncentred reference conformers, a sliding atom key window where OpenDDE clamps
+and masks, and the query once where it wants it twice. `tools/gpu/fold.js` has
+passed them since the batch was extracted and `fold.js` CANNOT fold OpenDDE, so
+the two tools were never compared. With its own conventions OpenDDE's 6MRR goes
+**1.527 -> 1.518 A** and its portable-gate pLDDT 92.1200 -> **92.0396**.
+
+🔴 **THE SHAPE OF THIS IS THE NIGHT'S RECURRING ONE.** A convention applied
+UNIFORMLY where the reference splits, plus a second tool that never got the
+split at all. It is the same shape as the atom key window, the terminal OXT and
+the confidence head's missing dialect - four in one night - and every one of
+them was found by comparing against the reference's own batch rather than by any
+fold looking wrong.
+
+## 🔴 THE ATOM KEY WINDOW WAS WRONG IN FOUR OF SEVEN MODELS, AND NOTHING ASKED
+
+`tools/check-atom-windows.js` compares this port's `queries_to_keys` against the
+one in each `oracle-dumps/af3-batch-<model>-6mrr.json` - the reference's OWN
+gather, integer for integer. It did not exist until 2026-09-14 and no other gate
+here asks the question: `check-af3-denoise.js` reads the reference's windows out
+of the dump precisely so it can compare score models rather than featurisers, so
+the window itself was compared to nothing.
+
+Three conventions were living in that gap, and there are three of them, not two:
+
+| rule | who | the last window starts at |
+|---|---|---|
+| **SLIDE** | alphafold3 | `atoms - keys`, shifted bodily in bounds |
+| **CLAMP and mask** | opendde, protenix2, boltz2, rosettafold3 | `32i + 16 - keys/2`, out-of-range slots masked |
+| **SLIDE against a PADDED edge** | intellifold2 | `ceil(atoms / 32) * 32 - keys` |
+
+and a fourth thing that is not a window rule at all:
+
+| | who |
+|---|---|
+| **no terminal OXT and no 5' OP3** | openbind0, boltz2, intellifold2, rosettafold3 |
+
+Before: 3 of 7 exact. After: **7 of 7 exact**, zero index differences anywhere.
+
+**How each was found, because the order matters.** Setting CLAMP for the three
+families the reference lists took opendde and protenix2 to exact and left four
+models differing - and every difference was in subsets 16 and 17 alone, the last
+two, which is the signature of an END effect. Printing the first differing slot
+named the rest in one line each: boltz2 and rf3 read `ours idx 573 mask 1,
+theirs idx 573 mask 0` (an atom we have and they do not), openbind0 `ours 446,
+theirs 445` (a SLIDING window whose edge is the atom COUNT, off by that same
+atom), and intellifold2 `ours 446, theirs 448` (off by two the other way, which
+is `ceil(573/32) * 32 - 128`). One atom explained three of the four.
+
+That atom is the C-terminal OXT. boltz's canonical table does not list one
+(`const.ref_atoms["GLU"]` ends at OE2) and its CCD mol flags OXT
+`leaving_atom: True`; IntelliFold-2 forks that table whole; rf3 calls atomworks'
+`remove_protein_terminal_oxygen`; OpenFold3 and OpenBind-0 drop both it and OP3.
+**protenix and opendde deliberately KEEP it**, so this is not an OpenFold-lineage
+question and could not have been derived from one.
+
+🔴 **AND THE NUCLEIC HALF IS THE WORSE HALF.** OP3 is the FIRST atom of residue
+1, so carrying it shifts the ENTIRE flat atom axis of a nucleic chain by one,
+where OXT only displaces a protein chain's tail. On 6MRR this was one atom in
+574; on a nucleic chain it is every index.
+
+🔴 **AND A FOLD CANNOT SETTLE ANY OF IT.** The clamp moved opendde's 6MRR by
+0.026 A - inside a seed band this repository has measured at 1 A - so RMSD said
+nothing and the gather said everything. From the sequence, after:
+
+| `fold.js --sequence=<6MRR>` | atoms | pLDDT | CA-CA |
+|---|---:|---:|---:|
+| af3 (keeps OXT) | 574 | 83.1 | 3.73 |
+| boltz2 | **573** | 96.5 | 3.80 |
+| protenix2 (keeps OXT) | 574 | 84.7 | 3.74 |
+| intellifold2 | **573** | 83.2 | 3.81 |
+
+🔴 **AND THE FIRST FOUR RUNS OF THAT TABLE MEASURED NOTHING.** `fold.js
+--target=6mrr` WITHOUT `--sequence=` folds `oracle-dumps/af3-6mrr.json` -
+AlphaFold 3's own featurised batch - through whichever model `--model=` names.
+Every one reported 574 atoms and 51 atom subsets after the change, which reads
+exactly like "the flag is not wired". 51 is the reference's DENSE subset grid
+where this port compacts to 18, and that number is the tell.
+
+### 🔴 IntelliFold-2 DID NOT FOLD AT WebGPU's GUARANTEED MINIMUM, AND ONLY ADDING IT TO THE GATE FOUND THAT
+
+`test:portable` and `test:spec-floor` covered six models. Adding the two new
+ones took ten minutes and immediately failed:
+
+    GPUPipelineError: The total use of workgroup storage (16960 bytes) is
+    larger than the maximum allowed (16384 bytes).
+
+**16,960 is `8 * 512 * 4 + 64 * 4 * 2 + 8 * 4 * 2` exactly** - an eight-row
+staged LayerNorm at IntelliFold-2's 512 channels. At AlphaFold 3's 128 the same
+tile is 4,672 bytes and fits anything, which is why a constant nobody priced
+survived five models.
+
+🔴 **AND IT IS IN TWO FILES, WHICH MADE THE FIRST HALF OF THE FIX LOOK LIKE NO
+FIX AT ALL.** `grid-attention-webgpu.js` and `src/triangle/shaders.js` each
+carry their own copy of that LayerNorm, and both come to **exactly** 16,960
+bytes at 512 channels - so fixing one left the error byte-for-byte identical and
+read as "the flag is not reaching the kernel". docs/ARCHITECTURE.md lists this
+LayerNorm among the things written four times, and this is what that costs.
+
+`tileThatFits` now takes the largest of [8, 4, 2, 1] whose storage fits
+`maxComputeWorkgroupStorageSize`, and it lives in the LOWER module because af3
+depends on triangle and not the reverse. It is the FIFTH instance of this exact
+bug - `transitionWidth`, `splitTransitionConfig`, `projectMatrixConfig` and two
+projection workgroups were the first four - and every one was a performance
+choice that never asked what the device would run.
+
+| | channels | tile | bytes |
+|---|---:|---:|---:|
+| AF3, at the floor | 128 | 8 | 4,672 |
+| **if2, at the floor** | 512 | **4** | **8,736** |
+| if2, on this A100 | 512 | 8 | 16,960 |
+
+Nothing moves where the limit is not binding: if2 unrestricted is
+83.22122296904186 before and after, to every digit, and AF3 83.08440884314348.
+At the floor if2 is 83.2191685848003 - the tile changes, so the answer moves in
+the fifth digit, which is what AF2's checksum already does there.
+
+**All eight now pass all three gates.**
+
+### 🔴 IntelliFold-2 IS THE HEAVIEST MODEL HERE, AND IT FOLDS ON 800 MiB
+
+Its no-budget peak is **2229 MiB**, against boltz2's 1535 and AlphaFold 3's 983
+- the trunk pair is 512 channels where AF3's is 128, so every resident trunk
+weight is four times the size:
+
+| held, no budget | |
+|---|---:|
+| `w.grid` (116 buffers) | 567.2 MiB |
+| `w.pair-transition` (56) | 384.1 |
+| `difftx.block.resident` (24) | 378.2 |
+| `w.tri.out` / `w.tri.in` (58 each) | 195.6 each |
+| `w.single-transition` (52) | 189.1 |
+
+**A budget takes all of it and the fold does not move**: pLDDT 83.5, CA-CA 3.81
+A, the same structure at `--budget=800` as at no budget, peaking at **139 MiB**.
+What it costs is the second fold, which is the row a user sees:
+
+| `fold.js --model=/model-intellifold2-int5/manifest.json` | trunk, first | trunk, warm | peak |
+|---|---:|---:|---:|
+| no budget | 2.4 s | **0.7 s** | 2229 MiB |
+| `--budget=1200` | 11.4 | 7.2 | 804 |
+| `--budget=800` | 11.4 | - | 139 |
+
+So the residency trade is doing exactly what it is for, and the number to quote
+for a laptop is 139 MiB and 11 s rather than 2229 MiB and 0.7 s. Nothing here
+needed changing; this is the measurement, not a fix.
+
+### 🔴 THE TRANSITION SPLIT IS 3.6x ON IntelliFold-2's TRUNK, AND NOBODY TUNED IT
+
+`pairTransitionSplit` was fitted on AlphaFold 3 (worth 1.8%) and on ESMFold2
+(1.51x), and it turns itself on above `TRANSITION_SPLIT_MIN_CHANNELS`, which is
+192. IntelliFold-2's pair is 512, and at that width:
+
+| if2 trunk, 150 tokens, 128 MSA rows | GPU total | the transition |
+|---|---:|---:|
+| split (the default at 512 channels) | **1072.5 ms** | 112.29 + 84.95 = 197.2 |
+| `--tune=pairTransitionSplit=false` | 3854.2 | **2998.67** |
+
+**15.2x on the kernel and 3.6x on the trunk.** The fused kernel holds the
+WIDENED row in workgroup memory, so its row tile halves as the channels double
+and at 512 it is holding almost nothing per workgroup - 11,042 groups a pass
+doing very little each.
+
+Nothing needed changing, and that is the finding: a THRESHOLD picked the right
+answer for a model nobody swept. It is the counterexample to "reoptimize for
+each model" in docs/ARCHITECTURE.md - a rule derived from a width transfers
+where a fitted constant does not.
+
+The rest of if2's trunk at that shape: `tri.project` 137.1 ms (3755 groups a
+pass), `grid.project` 127.5 (5528), `grid.attend` 115.0 (3600), then
+`pair-transition.wide` 112.3 (1877) and `pair-transition.down` **85.0 at 235
+groups a pass**, which is the same starved dispatch CLAUDE.md records for AF3
+and the same one docs record as retiled, measured and DECLINED - `wide` loses
+more than `down` gains. At 235 groups it is 8% of the trunk and it is the price
+of the 15.2x above, not a missed opportunity.
+
+### Templates: IntelliFold-2 is the best of the seven, rf3 refuses
+
+`fold-opendde.js --target=5caj --chain=A --template=tools/fixtures/5caj-crystal.pdb:A`,
+which is the gate 6MRR cannot answer:
+
+| 5CAJ, 255 residues, no MSA | without a template | with |
+|---|---:|---:|
+| af3 | 16.523 | 0.258 |
+| openbind0 | 29.606 | 0.224 |
+| boltz2 | 17.461 | 0.470 |
+| protenix2 | 19.192 | 0.164 |
+| opendde | 20.496 | 0.317 |
+| **intellifold2** | **17.794** | **0.256** |
+| **rosettafold3** | 17.858 | **17.041** |
+
+🔴 **AND rf3's IS NOT THE SAME KIND OF THING, WHICH THAT ROW IS THE EVIDENCE
+FOR.** Its 66 columns are a CA-CA distance HISTOGRAM, a coverage flag and a
+noise level - distance-distribution conditioning rather than a geometry
+embedding - and the reference's own docstring calls it "a flexible hint (define
+the target without pinning exact coordinates)". Measured here, that is exactly
+what it behaves like:
+
+| rf3 with a self-template | without | with |
+|---|---:|---:|
+| 5CAJ, 255 residues | 17.858 A, TM 0.176 | 17.041, **TM 0.251** |
+| 6MRR, 68 residues | 1.680 A, TM 0.911 | 1.684, TM 0.908 |
+
+🔴 **AND THE PARAGRAPH THAT STOOD HERE WAS WRONG.** It read "this is the model's
+behaviour rather than the port's", on the strength of rf3's own docstring
+calling its template "a flexible hint", and flagged the reference comparison as
+the thing to do before believing it. That comparison has now been run, and it
+says the opposite:
+
+| af3-any-model's OWN rosettafold3, 5K9P chain A, five samples | best | mean |
+|---|---:|---:|
+| no template | 1.603 A | 1.706 |
+| **self-template** | **0.125 A** | **0.131** |
+
+**Thirteen times, and it pins the structure exactly as the other five do.** So
+rf3's template is not a weak hint, and the gap on our side is a defect
+downstream of the features - which are themselves exact:
+`distogram_condition` and `has_distogram_condition` both read relRMS
+**0.000e+0** against af3-any-model's own tensors, element for element, and the
+noise column matches the reference's own constant (the dump's `feat:noise_scale`
+is a different, per-token quantity the module does not read).
+
+**The lesson is the one this file keeps recording.** A vendor's own prose
+described the module accurately and still supported the wrong conclusion about
+OUR output, because "a flexible hint" is a statement about the ARCHITECTURE and
+17.041 A was a statement about a fold. Nothing but running the reference on the
+same target could separate them, and it took twenty minutes.
+
+🔴 **AND THEN THE RETRACTION WAS ITSELF TOO STRONG.** "The gap is a defect
+downstream of the features" was written before our rf3 had been run on the same
+target, and on 5K9P it is not a defect at all:
+
+| 5K9P chain A, self-template, one seed through `fold-opendde.js` | without | with |
+|---|---:|---:|
+| **our rosettafold3** | 10.164 A, TM 0.246 | **1.431 A, TM 0.901** |
+| our alphafold3, same harness, same target | - | 1.520 A, TM 0.925 |
+| af3-any-model's rosettafold3, best of five | 1.603 | 0.125 |
+
+**Our rf3's template works - seven times on RMSD - and lands slightly AHEAD of
+our own AlphaFold 3 on the same target through the same harness.** What is left
+is a HARNESS gap that is not rf3's: we reach 1.4-1.5 A on 5K9P where the
+reference reaches 0.125, for AF3 as much as for rf3, and the reference takes the
+best of five samples where this tool folds one.
+
+So the size dependence was real after all, and it is the one thing all three
+measurements agree on:
+
+| rf3 self-template | residues | without | with | ratio |
+|---|---:|---:|---:|---:|
+| 5K9P | 76 | 10.164 | 1.431 | **7.1x** |
+| 6MRR | 68 | 1.680 | 1.684 | 1.0x (already folded) |
+| 5CAJ | 255 | 17.858 | 17.041 | 1.05x |
+
+rf3's bins stop at 20 A. At 76 residues they see the whole fold; at 255 almost
+every pair lands in the last bin and the conditioning carries nothing. **What is
+NOT measured is whether af3-any-model's rf3 has the same size dependence** - its
+own template loader refuses 5CAJ, which has two polymer chains - so that is the
+remaining open question, and it is a question about the MODEL rather than about
+this port.
+
+🔴 **THE SEQUENCE OF WRONG READINGS IS THE POINT.** First "a flexible hint, so
+this is the model" (from the vendor's prose, and wrong). Then "a defect
+downstream of the features" (from the reference's 13x, and also wrong). The
+truth needed THREE measurements - their model on their target, our model on
+their target, and our AF3 on their target as a control - and no two of them
+would have found it. **A vendor's prose is not a measurement, and one
+measurement against a different target is not a comparison.**
+
+🔴 **AND ITS BINS STOP AT 20 A** where every other distogram in this port runs
+to 50.75: `concat(arange(1, 4, 0.1), arange(4, 20.5, 0.5))`, 63 boundaries, 30 of
+them at 0.1 A resolution inside 4 A. It is a CLOSE-range histogram, so on a
+255-residue chain most pairs land in the last bin and carry nothing.
+
+if2 needed nothing for this: it runs AlphaFold 3's nine-projection embedder, so
+the whole template path transfers. rf3's `a_proj` is [66, 64] where protenix2's
+is [108, 64] and boltz2's [109, 64] - its 66 columns are a 64-bin CA-CA distance
+DISTRIBUTION plus has_condition and noise_level, not the distogram, restype
+one-hots, unit vector and frame mask the other two concatenate. `a_proj`'s first
+dimension is the ONLY thing that separates the three, because all of them ride
+the same scopes. It is built now; see the template section.
+
+### The template stack's width was a constant, and IntelliFold-2's is 256
+
+`const CHANNELS = 64` sat in BOTH template-reference.js and template-webgpu.js.
+It is 64 in five checkpoints and **256 in if2**, whose template grid attention is
+8 heads of 32 against AF3's 4 of 16. `templateWeights` reads it now from the norm
+after the stack - `output_layer_norm/scale` for the nine-projection embedder and
+`v_norm/scale` for the fused one - which is the one tensor both forms carry that
+states it, and both consumers require it rather than defaulting.
+
+The failure was loud rather than silent, which is the only reason it was cheap:
+`splitInterleaved` refused the triangle weights outright with "fused weight has
+131072 elements; expected 8192".
+
+🔴 **AND `check-af3-template.js` HAD THREE OF AlphaFold 3's CONSTANTS TYPED
+INTO IT**, which is CLAUDE.md's standing note about hand-built weight dicts, one
+file later. `QUERY_CHANNELS = 128` (OpenDDE's is 384) and `heads: 4,
+dimension: 16` (OpenDDE's template stack is 2 x 32, if2's 8 x 32), plus a pinned
+`{ swapTransposedBias: false }` where every other `--model=` checker derives the
+dialect from `manifest.model.name`. **OpenDDE read NaN on this checker and
+IntelliFold-2 1.65e-1, and neither was the port.** With all three off the bundle:
+
+| `check-af3-template.js --model=` | 0 slots | 1 | 4 | 1 spanning | 4 spanning |
+|---|---:|---:|---:|---:|---:|
+| af3 | 2.77e-5 | 2.38e-5 | 2.75e-5 | 2.48e-5 | 2.98e-5 |
+| opendde (was **NaN**) | 2.21e-5 | 5.92e-5 | 8.08e-5 | 9.40e-5 | 1.21e-4 |
+| intellifold2 (was **1.65e-1**) | 5.72e-4 | | | | |
+| intellifold2 `--matrix=off` | **3.80e-7** | 3.45e-7 | 3.16e-7 | 3.65e-7 | 3.37e-7 |
+
+That last row is the finding: if2's template embedder is EXACT, and its 5.72e-4
+is entirely the matrix pair kernels accumulating over a 256-channel stack rather
+than a 64-channel one. The shipped trunk already pins `pairMatrixKernels: false`
+on this stage, so nothing a user runs sees it; the checker's matrix bound now
+scales by `sqrt(channels / 64)`, which is what a sum of independent roundings
+does, and it is not a licence to raise it further.
+
+### `triangleMulDivideByLength`, and why it is applied at the centre norm
+
+rf3 computes `out = einsum("bikd,bjkd->bijd", left, right / float(L))` and then
+the centre LayerNorm. It is observable ONLY because a LayerNorm's epsilon does
+not commute with a scale - which is also why it cannot be folded into a weight,
+and the reference says so. On the GPU the scale is applied at the CENTRE NORM's
+INPUT rather than at the contraction's output: the two are the same number, that
+pass already reads every element once, and the contraction is the most expensive
+kernel in the track and does not need a multiply in its inner loop. Divided
+rather than multiplied by a reciprocal, so it is the CPU reference's `total / n`
+to the last bit.
+
+
 Where the AF3 port stands, what it costs, and the things that have already been
 got wrong once. Written to be read before touching any of it.
 
@@ -260,9 +868,16 @@ in the Model dropdown.
   and for a three-chain complex: `node tools/oracle/check_af3_featurise.js`.
 - **Complexes**, chains separated by `:`. Chain identity comes from
   `src/input/chains.js` - the same `chainIdentity()` AlphaFold-multimer uses.
-- **Two samplers.** *Flow* (default) draws once at the top of the schedule and
-  walks it down deterministically, ~8 calls. *Diffusion* is AF3's own stochastic
-  sampler, 20+ steps. Both are seeded.
+- **Two samplers.** *Diffusion* (**the default**) is AF3's own stochastic
+  sampler, 25 steps on the page. *Flow* draws once at the top of the schedule
+  and walks it down deterministically, 16 cycles. Both are seeded. Diffusion is
+  the default because it wins or ties nearly everywhere measured - 1QYS 0.918
+  against flow's 0.936-0.999, 6MRR 0.650 against 0.687, 1TIM A:B 0.958 against
+  0.975 - and it is the sampler af3-any-model verified. Flow is a close second
+  everywhere and costs the same (25 steps against 16 cycles). 🔴 THE REASON
+  THIS ROW USED TO GIVE - "flow returns a fold that is NOT A CHAIN on 1QYS
+  across four seeds" - IS RETRACTED; it does not reproduce, not even at the
+  commit that recorded it. See the retraction at the end of this file.
 - **DNA and RNA chains**, as their own entity types. A standard nucleotide is
   ONE TOKEN PER RESIDUE, so this needed no tokeniser change - only teaching the
   featuriser that a chain has a KIND, because `ACGT` is a valid protein as well
@@ -3533,3 +4148,1020 @@ a decode.**
 the imported `DIALECT` constant rather than the bundle's, so pointing it at
 boltz2 or protenix2 died in `emptyFusedFeatures` before producing a number. Same
 fault docs/PARITY.md records across the checkers.
+
+## The batch, all of it, against the reference's - and the four conventions no plain protein reaches
+
+`npm run test:batch`. Previously `check-atom-windows.js` compared two fields of
+the reference's sixty - `queries_to_keys` and rf3's chiral centres - and those
+two alone found the atom key window wrong in four of seven models, the terminal
+OXT/OP3 carried by four families that drop it, and a chirality term twice
+recorded here as a no-op. The other fifty-eight were being reasoned about.
+
+`tools/check-batch-fields.js` compares 43 of them (108 for opendde, which
+carries its own second token space) for every dumped model. **14 model/target
+pairs exact**: every gather, `aatype`, `profile`, `ref_element`, `ref_charge`,
+`ref_atom_name_chars`, `ref_space_uid`, the masks and the bond sets.
+
+### 🔴 The four conventions 6MRR cannot see, and all four were missing
+
+6MRR is a plain 68-residue protein. It has no ligand and no modified residue, so
+four entries in the dialect table were inert in **every measurement this port
+has ever taken** - and four of them had never been implemented. Two belong to
+models that ship.
+
+`tools/oracle/dump_af3_batch.py --ligand GOL --ptm SEP@3` builds the target that
+can: 83 tokens, the phosphoserine contributing ten and the glycerol six, through
+`_fold_setup(chains=...)` so the conventions still come from the reference.
+
+| convention | who | what |
+|---|---|---|
+| `atomizedElementNames` | rf3 | an atomised atom is renamed to its ELEMENT. "CA", "CB", "OG", "O1P" become "C", "C", "O", "O"; glycerol's "C1" becomes "C" |
+| `atomizedUnknownRestype` | boltz2, rf3 | an atomised token's aatype is UNKNOWN (20), not the parent residue's (15, serine) |
+| `atomizedUnknownMsa` | **rf3 alone** | ...and that carries into the ALIGNMENT, and so into the profile |
+| `atomizedBackboneBonds` | **rf3 alone** | the atomised residue is bonded back into the chain |
+
+**The third exists because the gate refused the second.** Implemented as one
+flag, boltz2's profile came out 20 where the reference has 15. The references'
+own MSA query rows at the phosphoserine's tokens settle it:
+
+    alphafold3    15 15 15 ...    aatype 15
+    boltz2        15 15 15 ...    aatype 20
+    rosettafold3  20 20 20 ...    aatype 20
+
+boltz2 moves the restype and leaves the alignment holding the parent; rf3 moves
+both. One tuple in the reference, two behaviours here.
+
+**The fourth is rf3's alone, and counting is what showed it.** The reference
+lists **14** bonded token pairs for six families and **18** for rf3. The four
+extra are `1-2 2-1 6-12 12-6` - the peptide bonds either side of the
+phosphoserine, each way round, where the nine internal SEP bonds appear once
+each. featurise.js's own comment said backbone connectivity is "left implicit in
+residue_index, exactly as for an unmodified chain", which is right for AF3 and
+six others and wrong for the seventh: without them the modified residue is a
+ligand floating beside the chain as far as the pair track is concerned.
+
+**All four are provably inert on a plain protein**, which is why nothing that
+shipped moves: featurising 6MRR with them on and off, for all seven models,
+gives **0 differing elements across 20 array fields**. That is a stronger
+statement than a fold comparison on a box that drifts 3.2x.
+
+### 🔴 Three things the gate had to be corrected on before it could say any of that
+
+**1. Per-atom fields are compared only where `ref_mask` is live on BOTH sides.**
+The first run reported `ref_element` differing in one slot of 1632 in exactly
+the four families with `dropTerminalAtoms`, and `ref_atom_name_chars` in three
+of 6528 - one atom's name. It reads as a defect in four shipped models. It is
+the C-terminal OXT: the reference drops it by MASKING it while leaving its
+element (8), its name and its CCD position, where this port never creates the
+atom and leaves the slot zeroed. Both then compute a per-atom conditioning row
+for it - `rows = tokens * dense`, and the element embedding indexes its weight
+table by atomic number with no mask, so we add row 0 where they add row 8 - and
+**no gather on either side references that slot with a live mask**, checked for
+all four. A padded slot the reference fills and this port zeroes: the same shape
+as docs/OPENDDE.md's `mask_mean` note and the encoder checker corrected before
+it. **Third occurrence.**
+
+**2. `ref_pos` is reported, never failed**, or the gate is red forever and
+nobody reads it. It is the shared ideal conformer set, which is a deliberate
+decision, and 485 live slots of 1722 differ by up to 9.66 A. That number is
+partly meaningless - an idealised conformer has an ARBITRARY rigid frame - so
+the frame-free arm asks the other half. Intra-token pairwise distances, which
+are invariant to rotation and translation:
+
+    rms 0.6483-0.6517 A, worst 3.7679 A, on token 18 of 6MRR - a LYSINE
+
+The longest, most flexible side chain in the sequence. So the two sets are the
+same molecules in a different **rotamer** and a different frame, not wrong
+geometry. Neither number says that alone, and the elementwise one stays in the
+output because it is what `embed_ref_pos` actually consumes.
+
+**3. The bond comparison was wrong twice.** First it asked "does this port build
+this field" and answered no for all seven, because the reference carries bonds
+as a pair list and this port as a dense matrix - representation, not content,
+and six of the seven had every bond. Then it compared UNDIRECTED edges, which
+throws away `symmetriseBonds`, the convention the field exists for. Measured:
+AlphaFold 3's **directed** set is this port's exactly, 14 against 14 with
+nothing either way, and each symmetrising dialect has exactly 14 more, one per
+internal bond reversed. The expectation is therefore the reference's own pairs
+plus their reverses where the dialect symmetrises - exact, and `symmetriseBonds`
+became observable, which it had not been.
+
+### 🔴 And it goes through `af3BatchFromA3m`, which is the half that catches a caller
+
+src/af3/batch.js forwards the dialect to `featuriseProtein` **field by field**.
+A gate that calls the featuriser directly would stay green while the page and
+every fold tool silently dropped a convention. Verified by deleting
+`atomizedBackboneBonds` from that forwarding: the gate goes red with "4 bonds
+the reference has and this port does not".
+
+Which is why `featuriserDialect(dialect)` exists now. `tools/gpu/fold.js`,
+`tools/gpu/fold-opendde.js` and `web/af3-model.js` each listed those fields by
+hand - the allow-list shape CLAUDE.md records twice as having shipped a bug,
+once taking the contact overlay off the page and once running multimer weights
+on the monomer graph. Adding four conventions would have made it four places to
+forget. All three forward the object; `test/af3-dialect.test.js` asserts it
+carries every featuriser convention and none of the graph ones, because a
+featuriser has no business with `noResidual`.
+
+### What it can still not see
+
+- **`dedupeSelfMsa`**, the tenth convention, is the one `--falsify` leaves
+  green. It decides whether the query appears twice in the alignment, and the
+  alignment is the one input this port takes from its caller rather than from
+  the reference, so `msa` is not compared. Its evidence is elsewhere (AF3 6MRR
+  83.084 -> 83.169).
+- **opendde's second token space** - 65 `struct/` and `structbook/` fields that
+  this port DOES build, in src/af3/structural-tokens.js, and that nothing
+  compares against the reference. Named in the output rather than silently
+  absent.
+
+### 🔴 `restype_alignment`: declared by rosettafold3, and measured INERT in the reference
+
+The last of rf3's named featuriser conventions, and the reason this port matches
+the reference without implementing it is not that it does not matter - it is
+that **the reference's own implementation cannot fire on a batch it produces.**
+
+What it is meant to do (`chiral_features.apply_restype_alignment_on_atomized`,
+rf3 only): find every token with no alignment of its own and replace its
+`profile` with a one-hot of its restype and its `msa` column with that restype.
+Their docstring is emphatic about why it matters - `profile` is 31 of the 449
+columns of rf3's `s_inputs`, which feeds `to_s_init`, both z-init projections
+and the MSA embedder - and about the predicate:
+
+> BOTH channels use the SAME test: a column is rewritten only when EVERY
+> alignment row in it is a gap, which cannot happen for a polymer because row 0
+> is the query sequence itself.
+
+The earlier, weaker test was `profile.argmax != aatype`, which fired on real
+polymer columns and cost "~4 A of backbone accuracy" on 1STP with a 2144-row
+alignment, making rf3 **worse** with an MSA than without one. So the current
+predicate is a deliberate fix.
+
+**And the fix is unreachable.** The batch's MSA is padded to 16384 rows, and the
+padding value is **0**, not the gap index 21. `(msa == 21).all(axis=0)` is
+therefore false for every column of every batch. Measured on three of the
+reference's own dumps:
+
+| dump | rows | columns that are GAP in every row |
+|---|---:|---:|
+| rosettafold3 6MRR | 16384 | **0** |
+| rosettafold3 6MRR + GOL + SEP@3 | 16384 | **0** |
+| boltz2 6MRR + GOL + SEP@3 | 16384 | **0** |
+
+And the consequence is visible in the dump directly rather than inferred: at a
+LIGAND token, which is exactly what the convention is for, rf3's own batch has
+`profile` one-hot at column **21** (gap) with `aatype` **20** (unknown). Had the
+rewrite fired, the profile would be one-hot at 20. `gap_idx = 21` confirmed
+against `residue_names.POLYMER_TYPES_ORDER_WITH_UNKNOWN_AND_GAP` on the
+reference itself.
+
+**So this port does not implement it, and that is why the batch is exact.**
+Implementing the INTENDED behaviour would diverge from the reference this port
+is held to. What would change that: the reference padding its MSA with the gap
+index, or testing the predicate against `msa_mask` rather than every padded row.
+If either happens, rf3 needs this and `tools/check-batch-fields.js` will say so
+the moment a re-dumped batch disagrees.
+
+🔴 **AND THIS GATE COULD NOT HAVE FOUND IT ANYWAY**, which is the second entry
+in its "cannot see" list beside `dedupeSelfMsa` and for the same reason: the
+convention only bites when there IS an alignment, and the alignment is the one
+input this port takes from its caller rather than from the reference, so `msa`
+is not compared. It was found by reading the reference after the gate had run
+out of things to say - not by the gate.
+
+## The ligand path: nothing was running it, and it was broken in three ways
+
+`npm run test:ligand`. A 68-residue protein plus GLYCEROL through all six
+AF3-lineage models, asserting the ligand's own five bond lengths.
+
+Every other fold gate in this repository folds a plain protein. So the whole
+atomised-token half of the featuriser - four dialect conventions, the bond
+matrix, the bond orders and the atom names - was exercised by nothing, and three
+separate defects were sitting in it. Two of the three are in models that ship.
+
+| | | |
+|---|---|---|
+| **boltz2 tore the ligand apart** | bond rms **3.602 A**, C1-O1 at **6.97** against a 1.43 ideal | pLDDT read **92.38** |
+| **rosettafold3 died outright** | `RangeError: invalid allocation size 0 for atom.chiral.centers` | glycerol has no stereocentre |
+| **rf3's PDB had six atoms named C, O, C, O, C, O in one residue** | `atomizedElementNames` reached the output as well as the model | not unique, which the format does not allow |
+
+### boltz2's was two halves, and neither showed alone
+
+boltz2's z-init reads TWO planes - the contact flag and the bond ORDER - and it
+is the only family with `tokenBondsTypeEmbed`, so it is the only one that
+notices a missing one.
+
+**Half one**: the featuriser never built `bondOrderMatrix`. Five consumers read
+it - `embedder-webgpu`, `embedder-reference`, `confidence-webgpu`,
+`confidence-reference`, and `fold.js` forwarding it to the confidence head - and
+nothing produced it. The order is in the component's own bond table and
+`parseCcdComponent` has always returned it: a channel parsed, forwarded, and
+never filled.
+
+**Half two**: `fold.js`'s embedder-input literal did not name it. So fixing the
+featuriser alone changed the fold by **exactly nothing** - byte-identical bond
+lengths, 6.97 and 2.14 and 6.41 again - because the plane was still arriving as
+zeros from the caller.
+
+🔴 **And the comment two lines above that literal is about this exact trap:**
+
+    // 🔴 NAMED, BECAUSE THIS OBJECT IS BUILT FIELD BY FIELD. A key the batch
+    // carries and this literal does not name is a key thrown away here, and
+    // the embedder cannot tell that from a fold with no ligand: both arrive
+    // as `undefined` and both fall back to zeros. That is how the whole bond
+    // feature came to be computed, shipped and never applied.
+
+It is about `bondMatrix`, which was fixed. `bondOrderMatrix` was added to the
+consumers beside it and never to this list. Fourth instance of the shape in one
+session, after the three `featuriserDialect` call sites, and the first where the
+warning was already written at the site.
+
+    boltz2   bond rms 3.602 -> 0.062 A   C1-O1 6.97 -> 1.43   pLDDT 92.38 -> 92.63
+
+All six now: af3 0.050, protenix2 0.044, if2 0.055, openbind0 0.058, boltz2
+0.062, rf3 0.069.
+
+### Why the gate has the shape it has
+
+- **It asserts bond LENGTHS, because nothing else can see them.** The fold's
+  RMSD is dominated by 68 residues of protein; `meanPlddt` said 92 on a ligand
+  6 A out; and `tools/gpu/chain-geometry.js` measures the protein BACKBONE and
+  steps over a ligand by design. A ligand that comes apart is invisible to all
+  three.
+- **It measures by atom ORDER, not by name.** rf3 renames an atomised atom to
+  its element symbol, so a checker keying on "C1" finds nothing and reports the
+  ligand MISSING - which is what the first version did, and the convention
+  working correctly read as a dropped ligand.
+- **It asserts the names are unique within the residue**, which is a property of
+  the FILE rather than of the fold, and is the third defect above.
+- **A bundle this box does not have is a SKIP.** openbind0 is f32 here and the
+  rest are int5; hard-coding the suffix reported a 404 as a failure.
+
+## rosettafold3 has no flow sampler, and the page defaulted to one
+
+Found by running `probe-nucleic.js` on the two new models, which nothing had
+done. The finding is not about nucleic acids.
+
+**6MRR, `--mode=flow`:**
+
+    N-CA 6.94 A (ideal 1.46)   CA-C 3.76 A (ideal 1.52)
+    consecutive CA 3.07 A median, worst 0.23 A   <- collapsed
+    pLDDT 81.47
+
+against `--mode=diffusion`'s **1.693 A** and a clean backbone. AlphaFold 3
+(CA-CA 3.58) and intellifold2 (3.88) both fold in flow, so it is the checkpoint
+and not the sampler.
+
+🔴 **AND pLDDT IS 81.47 AGAINST THE GOOD FOLD'S 81.53.** Four tenths. Whatever
+number the page puts on screen says nothing is wrong. This is the same lesson as
+the collapsed 825-residue AF2 fold whose pLDDT *rose* to 69.31, and the only
+thing that catches it is `chain-geometry.js`.
+
+🔴 **AND `index.html` HAS `<option value="flow" selected>`.** The page's sampler
+select defaulted to Flow at the time and `web/app.js` forced diffusion for
+OpenDDE alone, so
+a visitor choosing rosettafold3 would have got that fold. **No standing gate
+could see it**: they all go through `fold.js`, whose default is `diffusion`.
+
+Three changes, and the middle one is the point:
+
+* `noFlowSampler` in the dialect, inverse polarity like `dedupeSelfMsa` so stock
+  AlphaFold 3 stays all-false.
+* **`foldBatch` throws** rather than switching quietly, with the measurement in
+  the message. A fold that silently ran a different sampler than the caller
+  asked for is the kind of thing that gets measured for a week.
+* the page hides the row *and* forces the mode through `samplerModeFor` -
+  hiding a control does not change its value, which is the trap already
+  recorded at that line for OpenDDE and ESMFold2.
+
+🔴 **AND THE FIRST GUARD DID NOTHING.** It read `weights.dialect`, the name
+`buildTargetFeat` uses on a different object, where `foldBatch`'s is
+`weights.trunk.dialect`. So it was `undefined`, the check was a no-op, and the
+broken fold reached the geometry gate exactly as before - which is how it was
+noticed. **A guard that reads the wrong field is a guard that is not there**,
+and that is the third time in one session a check quietly did not run.
+
+### And the nucleic numbers it started from were the probe's fault
+
+`probe-nucleic.js` called `featuriseProtein` with nothing but `chainKinds` and
+**no dialect**, so every nucleic number this repository has recorded was
+AlphaFold 3's featurisation fed to another model's weights - the same fault
+`fold-opendde.js` had, where fixing it moved every published OpenDDE figure. It
+matters more on a nucleic chain than anywhere: `dropTerminalAtoms` removes the
+5' OP3 and the flat atom axis is built from the live atoms, so getting it wrong
+shifts every index in the chain rather than one slot.
+
+With each bundle's own conventions, DNA `ACGTACGT`, intra-residue bond ratio
+against the baked conformer:
+
+| model | ratio | worst pair |
+|---|---:|---|
+| af3 | 0.980 | G7 P-OP2 0.751 |
+| opendde | **0.997** | T8 P-OP2 0.828 |
+| intellifold2 | 0.989 | T4 C4'-C1' 1.191 |
+| rosettafold3 (diffusion) | 0.997 | - |
+
+**So "OpenDDE is 15% short", which CLAUDE.md carried as an open defect, was the
+probe.** It is 0.3% short and the best of the four.
+
+🔴 **AND I THEN READ rf3's 3.271 AS "BROKEN ON DNA", WHICH WAS ALSO WRONG.** Its
+PROTEIN scores 2.976 in the same probe and **1.004** at `--mode=diffusion`: the
+probe's default mode is `flow` where `fold.js`'s is `diffusion`, and that was
+the whole difference. The reference's own rosettafold3 folds the 1LMB DNA duplex
+at **2.18 / 2.13 A** C1' RMSD, so the model is fine on DNA. Two wrong readings
+of one number before the control arm was right.
+
+### And the schedule is NOT why - measured, so the next person need not check
+
+The obvious explanation for rosettafold3's flow walk failing is a different
+noise schedule, which would also mean this port's DIFFUSION fold was running on
+a wrong constant. It is not that. Read off the reference's own configs:
+
+    alphafold3     gamma_0 0.8  gamma_min 1.0  noise_scale 1.003  rho 7.0
+                   sigma_max 160.0  sigma_min 0.0004  step_scale 1.5  steps 200
+    rosettafold3   identical
+    intellifold2   identical
+
+So the eval schedule is shared, and rf3's diffusion fold is not paying for a
+wrong sigma - which is consistent with it landing at 1.693 A inside the
+reference's own 0.967-1.772 spread.
+
+🔴 **WHY IT FAILS: TWO HYPOTHESES TESTED, BOTH DEAD, AND A MECHANISM LEFT.**
+The flow walk is THIS PORT's shortcut - one draw at the top of the schedule then
+a deterministic descent, about 8 calls instead of 200 - and not something the
+reference has, so there is no oracle for it.
+
+**Hypothesis 1, `diffusionNoResidual`: not supported.** rf3's transformer is
+`act + attn + transition(act)` rather than the usual residual chain, it is the
+ONLY family carrying that flag, and it is the only family without a flow walk -
+a perfect correlation over seven models. Forced OFF as a diagnostic, rf3's flow
+fold is still not a chain and is WORSE: N-CA 14.97 A against the flagged run's
+6.94, CA median 5.136. Caveat, stated because it matters: the diagnostic also
+makes the network compute something its weights were not trained for, so a
+recovery could in principle be masked. Suggestive against, not decisive.
+
+**Hypothesis 2, undersampling: refuted decisively.** If a deterministic descent
+merely needed a finer discretisation, more steps would help. They make it
+monotonically WORSE, on the unmodified model:
+
+| steps | CA median | worst | pLDDT |
+|---:|---:|---:|---:|
+| 16 | 3.071 | 0.23 | 81.47 |
+| 60 | 2.656 | 0.75 | 81.46 |
+| 200 | **2.122** | 0.67 | 81.38 |
+
+against 3.80 expected. **The walk CONTRACTS**: every extra step pulls the chain
+tighter toward a point, so its fixed point for this checkpoint is a collapsed
+structure rather than a fold it has not reached yet. That is a mechanism, and it
+points at the SCALE of the denoiser's output rather than at the schedule (which
+is identical to AF3's - measured below) or the step count.
+
+🔴 **AND pLDDT SITS AT 81.4 THROUGH ALL OF IT**, moving 0.09 while the chain
+collapses from 3.07 to 2.12. Three separate step counts, three wrecks, one
+confident number.
+
+What is settled is the shipping question: the failure is loud (`foldBatch`
+throws), the page cannot ask for it, and the diffusion path is measured good.
+
+### intellifold2 in flow: worse, but not broken - so the control STAYS
+
+Measured after rosettafold3's, because the same question applies to the other
+new model. 6MRR through `fold-opendde.js`, three seeds:
+
+| seed | flow | diffusion |
+|---|---|---|
+| default | 1.822 A / TM 0.8589 | 1.579 A / TM 0.9241 |
+| 7 | *(no result - see below)* | 1.605 A / TM 0.9240 |
+| 21 | 1.962 A / TM 0.8383 | 1.553 A / TM 0.9219 |
+
+Flow's TM is 0.838-0.859 against diffusion's 0.922-0.924, **no overlap** - the
+same shape as the OpenDDE measurement that got its mode row hidden (0.831/0.860
+against 0.904/0.917).
+
+🔴 **AND THE CONTROL STAYS ANYWAY, WHICH IS THE OPPOSITE CALL FROM rf3's.**
+Three cases, three answers:
+
+* **rosettafold3**: flow is a BROKEN STRUCTURE - N-CA 6.94 A, collapsed
+  backbone, refused by the geometry gate. The page must not offer it, and
+  `foldBatch` throws.
+* **OpenDDE**: flow is worse AND costs the same 16.1 s at sixteen steps, so
+  there is nothing to trade. Row hidden.
+* **intellifold2**: flow is worse and much FASTER - about 8 denoiser calls
+  against 200. That is a trade a visitor is entitled to make, and the sampler
+  select exists to let them. Hiding it would take away a real choice on the
+  strength of a quality number alone.
+
+So this is recorded rather than acted on. A user picking Flow for intellifold2
+gets a worse fold, knowingly; a user picking it for rosettafold3 got a wreck
+with a confident pLDDT, which is why only that one is refused.
+
+🔴 **THE MISSING ARM WAS RUN, AND IT REVERSES THE PARAGRAPH ABOVE.**
+`--mode=flow --seed=7` returned nothing in the sweep because **the fold is not a
+chain**:
+
+    consecutive CA median 4.255 A, worst 4.70 A, against 3.80 expected
+    pLDDT says 83.30
+
+Six seeds of flow on 6MRR: 1.822, **refused**, 1.962, 2.142, 1.988, 2.203 -
+against diffusion's 1.579, 1.605, 1.553. So flow is not "worse but not broken"
+for intellifold2; it is broken **one seed in six**, and the conclusion written
+above with that arm missing was wrong. Waiting for it would have cost one fold.
+
+**The control still stays, but for a reason that survives the arm.** Flow is
+about 8 denoiser calls against 200, the failure is occasional rather than
+certain, and - see below - the page now SAYS when it happened. rosettafold3
+stays refused outright, because its flow fold is broken every time.
+
+## The page ran no geometry check at all, for any model
+
+The larger finding, and it is not about intellifold2. `chainGeometryVerdict`
+lived in `tools/gpu/`, so **every command-line fold in this repository gated on
+it and the one path a visitor takes did not.** Same shape as
+`LOCALFOLD_STOCK_FLAGS`: the configuration every gate checks was not the one
+that ships. A visitor folding if2 in Flow would have been handed that seed-7
+structure with "pLDDT 83.3" beside it and nothing else.
+
+* the rule is `src/af3/chain-geometry.js` now, one implementation;
+* `tools/gpu/chain-geometry.js` keeps the terminal's half - the throw and the
+  "--allow-broken-geometry" advice, which is not advice for a browser - and
+  re-exports the rest. A test compares the function IDENTITIES, so a second copy
+  cannot appear;
+* `web/app.js` appends **"🔴 NOT A CHAIN - the backbone is broken, and pLDDT
+  does not measure that"** to the status line.
+
+🔴 **IT WARNS RATHER THAN REFUSING, DELIBERATELY.** The structure is still
+drawn: a visitor who chose a fast sampler is entitled to see what it made, and
+hiding it is worse than labelling it. What is not acceptable is showing it as
+though the confidence number were the whole story - this repository's oldest
+lesson, from the 825-residue AF2 fold that collapsed into a ball while pLDDT
+ROSE to 69.31.
+
+### Is the flow sampler safe for the models that already SHIP? Yes - measured
+
+rosettafold3's flow fold is broken every time and intellifold2's one seed in
+six, and the page defaulted to Flow at the time - so the obvious next question
+was whether any
+model already published has the same problem. It does not. Twelve folds of 6MRR
+in `--mode=flow`, three seeds each, verdict by `chainGeometryVerdict`:
+
+| model | seeds 1 / 7 / 21 | chains |
+|---|---|---|
+| af3 | pLDDT 77.79 / 78.04 / 78.55 | **3/3** |
+| boltz2 (published) | 96.48 / 96.15 / 96.42 | **3/3** |
+| protenix2 (published) | 84.67 / 84.68 / 84.68 | **3/3** |
+| openbind0 | 82.22 / 82.29 / 79.50 | **3/3** |
+| intellifold2 | - | 5/6, one refused |
+| rosettafold3 | - | broken every time |
+
+So the Flow default is sound for everything on Hugging Face today, and the
+exposure is confined to the two models this session ported - which are not
+published yet, and one of which now refuses flow outright while the other warns.
+
+🔴 **THIS IS A NEGATIVE RESULT AND IT IS WORTH THE FORTY MINUTES.** "The
+published models are probably fine" was the assumption; the reason to spend
+twelve folds on it is that the page's default had just been shown to produce a
+wrecked structure for one model with a confident pLDDT beside it, and the same
+default has been live for boltz2 and protenix2 for weeks. An assumption about
+what a visitor is getting is not a measurement of it.
+
+### Both new models fold THROUGH THE PAGE, and the sampler fix is visible there
+
+`tools/fold-in-page.py --model intellifold2` and `--model rosettafold3`, which
+drives the real page in a real browser rather than a fold tool. This is the
+check CLAUDE.md's own trap demands - "a bundle the CLI likes can be one the PAGE
+cannot load", because the page reads the manifest baked into
+`src/reference/manifests/<family>.js` and not the JSON beside the shards, and
+opendde once died at 122/472 MiB with every CLI gate passing.
+
+    IntelliFold-2 · 58 residues · in 5 s · single sequence · 2 passes · pLDDT 54.5
+    RoseTTAFold3  · 58 residues · in 4 s · single sequence · 2 passes · pLDDT 72.1
+
+Both load, fold, draw, colour by pLDDT and populate the PAE and contact panels.
+Neither status line carries the new "NOT A CHAIN" warning, which is the other
+half of the check: the warning exists and stayed quiet on a good fold.
+
+🔴 **AND THE FRAME NAMES PROVE THE SAMPLER DECISION, WHICH IS THE POINT:**
+
+    rosettafold3   "diffusion_0" ... 25 frames   <- the page FORCED it
+    intellifold2   "flow_0"      ... 16 frames   <- its control was kept
+
+Before `noFlowSampler`, rosettafold3 on that page would have run the flow walk
+and drawn the wreck - N-CA 6.94 A, collapsed backbone, pLDDT 81.47 beside it.
+The two models get the two different decisions this session argued for, on the
+one path a visitor actually takes, and nothing else moved.
+
+
+## Harder problems: the first COMPLEX this side has ever scored
+
+Every AF3-lineage number above this line is a single chain of 68 to 92
+residues. `fold-opendde.js` reads ONE chain out of a crystal and folds its
+sequence alone, so "does the sampler matter" had been decided on 6MRR - which
+CLAUDE.md's own table calls too easy to discriminate ("a 68-residue designed
+protein folds to 0.5 A from its sequence alone, so a correct template embedder
+and a corrupt one land in the same place"). `tools/gpu/fold-complex.js` is the
+missing instrument:
+
+```
+node tools/gpu-chrome.mjs tools/gpu/fold-complex.js --target=1brs --chains=A,D \
+  --model=/model-af3-int5/manifest.json --mode=diffusion \
+  --template=/tools/fixtures/1brs-crystal.pdb
+```
+
+🔴 **ONE SUPERPOSITION OVER EVERY CHAIN, AND THREE NUMBERS BESIDE IT.** Fitting
+each chain separately reports two perfect chains that are nowhere near each
+other as a perfect answer, which is the only failure mode a complex has that a
+monomer does not. So the fit is over all chains together (`complex`), and then:
+
+- each chain gets `inComplex` - itself in that shared frame - beside `alone`,
+  re-fitted by itself. Good alone and bad in complex is a **placement** failure;
+  bad both ways did not **fold**, and they want different fixes.
+- `interface.fnat` is the fraction of the crystal's inter-chain alpha-carbon
+  contacts (under 8 A) the model also makes. It needs no superposition at all,
+  so it says nothing about the fit and everything about the interface.
+- the score is taken over the best relabelling of INTERCHANGEABLE chains
+  (`chainAssignments`, gated by test/chain-assignments.test.js), because a
+  homodimer's two chains are the same molecule and a perfect prediction with the
+  labels the other way round superposes as a total failure. AlphaFold 3 does
+  this itself and calls it chain permutation alignment. `asLabelled` is the
+  unpermuted score, so the difference is visible rather than hidden in a
+  minimum.
+
+### 🔴 THE FIRST TARGET WAS THE WRONG ONE, AND `nativeContacts` IS WHY THAT IS NOW LOUD
+
+5CAJ was the obvious choice - it is already a fixture, it is 522 residues over
+two chains, and this file records it as the target that separates a working
+template embedder from a broken one. It produced **9.1 / 23.7 / 19.6 A across
+three seeds while each chain folded to 0.28-0.50 A alone**, which reads exactly
+like a placement defect, and was written up as one.
+
+It is not. **5CAJ's A and B are two independent copies in the asymmetric unit.**
+Measured on the deposition: the closest inter-chain alpha carbons are **11.08 A**
+apart, there are **ZERO contacts under 8 A** (12 under 12 A, out of 68,121
+pairs) and the centroids are **44.2 A** apart. Their relative placement is
+crystal packing. No model in this panel predicts crystal packing, none should,
+and an RMSD over the pair measures nothing - the 15 A of seed spread was the
+scorer asking an unanswerable question three times.
+
+The chain permutation was not the explanation either, and that was checked
+rather than assumed: 5CAJ's dimer is near-C2, so the swapped labelling scores
+**9.109 against 9.113**. Two candidate stories for a 9 A number and neither was
+it.
+
+**`interface.nativeContacts` is in the report so this cannot happen quietly
+again.** Zero native contacts means the target is the wrong question, and the
+tool's header says so.
+
+### 1BRS A:D - barnase and barstar, an actual heterodimer
+
+`tools/fixtures/1brs-crystal.pdb`, chains A (barnase, 108 residues) and D
+(barstar, 87). Closest inter-chain CA **4.83 A**, **36 contacts under 8 A**. 195
+residues, so a fold is five seconds.
+
+| af3-int5, seed 20260831 | complex | TM | fnat | A `alone` | D `alone` | pLDDT |
+|---|---:|---:|---:|---:|---:|---:|
+| no template | 16.666 | 0.1563 | **0.000** | 13.562 | 12.923 | 38.76 |
+| merged template slot | **0.475** | 0.9928 | **0.944** | 0.221 | 0.641 | 92.99 |
+| one slot per chain | 0.488 | 0.9923 | 0.972 | 0.229 | 0.645 | 93.22 |
+
+And the whole panel with a merged self-template, 25 diffusion steps:
+
+| model | complex | TM | fnat | pLDDT |
+|---|---:|---:|---:|---:|
+| **rosettafold3** | **0.137 / 0.118** | 0.9993 | 0.917 / 0.944 | 80.90 |
+| protenix2 | 0.452 | 0.9936 | 0.972 | 95.49 |
+| intellifold2 | 0.455 | 0.9936 | **1.000** | 96.26 |
+| alphafold3 | 0.475 | 0.9928 | 0.944 | 92.99 |
+| boltz2 | 0.517 | 0.9921 | 0.972 | 96.87 |
+
+rf3 is first here and it was **12.189 A with fnat 0.222** when this panel was
+first run - see the template defect below, which is what the complex scorer
+found on its first honest target.
+
+**The complex path works end to end**: the ":"-joined sequence, the per-chain
+`asymId`, the per-chain template token offsets, the shared-frame scoring. With a
+template AlphaFold 3 puts barnase and barstar together to under half an
+angstrom and recovers 34 of the 36 native contacts. Without one - no MSA either
+- it does not even fold the chains (13 A each, pLDDT 38.8), which is the same
+single-sequence wall 5CAJ shows for a monomer.
+
+### The merged template slot: worth nothing to five models and 1.7x to one
+
+The page builds one template SLOT PER CHAIN, which is AF3's convention.
+`multichainMaskFor` opens a cross-chain pair only where a slot covers BOTH ends,
+so per-chain slots contribute nothing across the boundary however `spanChains`
+is set - each covers one end. `mergeTemplateSlots` (src/af3/template-input.js)
+folds them into ONE slot that does; `--per-chain-templates` is the arm without
+it, and `--no-span-chains` is the same MERGED slot with the cross-chain block
+masked.
+
+🔴 **THE MASK REALLY OPENS, AND THE TOOL COUNTS IT.** 1BRS A:D: 18,792 of the
+18,792 cross-chain pairs open on the merged slot, 0 on the per-chain arm and 0
+under `--no-span-chains`. A `spanChains` that failed to reach `chainMaskFor`
+would have produced the per-chain answer while the report said "merged", which
+is the whole reason the count is printed.
+
+🔴 **AND `--no-span-chains` IS THE ARM THAT ISOLATES THE INTERFACE**, because
+merged against per-chain confounds two things at once under rf3's dialect: the
+merged slot both opens the cross-chain block AND carries full intra-chain
+weight, where two per-chain slots each carry HALF - `templateFeatureMeanOnePass`
+divides by the number of PRESENT templates, so two half-covering templates are
+two present ones. Same single slot, only the cross-chain block differing:
+
+| 1BRS A:D, seed 20260831 | complex | fnat | cross pairs open |
+|---|---:|---:|---:|
+| rosettafold3, chains open | **0.137** | 0.917 | 18,792 |
+| rosettafold3, chains masked | 0.227 | 0.917 | 0 |
+| alphafold3, chains open | 0.475 | 0.944 | 18,792 |
+| alphafold3, chains masked | 0.478 | 0.972 | 0 |
+
+**The interface is worth 1.7x to rosettafold3 and nothing to AlphaFold 3**, and
+the reason is what the feature IS. rf3's 66 columns are a CA-CA distance
+distribution with a coverage flag - distance conditioning, which a cross-chain
+distance is exactly an instance of. AlphaFold 3's featuriser cannot produce a
+cross-chain template feature at all (`evoformer.py:519` builds
+`asym_id[:, None] == asym_id[None, :]` with no option beside it), so for that
+checkpoint the block is out of distribution and reads as noise it has learnt to
+ignore. boltz2, the family whose reference masks templates by COVERAGE rather
+than by chain (`TEMPLATE_VISIBILITY_BY_COVERAGE`, whose comment says "a row that
+covers two chains makes their cross-chain block visible"), was the one expected
+to gain and did not: 21.065 / 22.557 merged against 21.162 per-chain on 5CAJ,
+with the chains folding slightly WORSE under the merged slot.
+
+🔴 **AND DO NOT READ rf3's 0.137 AGAINST 0.676 AS THE INTERFACE.** Its per-chain
+arm is 0.676 and its merged arm 0.137, a 5x gap - and the table above says only
+0.227 to 0.137 of that is the cross-chain block. The rest is the denominator:
+under `templateFeatureMeanOnePass` two per-chain templates halve each other's
+intra-chain weight. Two mechanisms in one comparison, and the arm that separates
+them was one flag.
+
+### The sampler on a real complex, and ODE loses on both hard targets
+
+1BRS A:D, merged self-template, everything else held:
+
+| sampler | complex | fnat | pLDDT |
+|---|---|---|---|
+| diffusion, 3 seeds | **0.448 / 0.475 / 0.491** | 0.944 / 0.944 / 0.944 | 92.8-93.0 |
+| flow, 2 seeds | 0.465 / 0.503 | 0.944 / 0.917 | 91.9-92.3 |
+| **ode**, 2 seeds | **0.549 / 0.661** | 0.889 / 0.917 | 91.2-91.6 |
+
+And on 5CAJ at 522 residues, where the complex number is meaningless but the
+per-chain one is not:
+
+| sampler | chain A `alone` | chain B `alone` | pLDDT |
+|---|---:|---:|---:|
+| diffusion, 3 seeds | 0.504 / 0.343 / 0.352 | 0.469 / 0.279 / 0.306 | 86.2-86.9 |
+| flow | 0.356 | 0.324 | 85.85 |
+| **ode**, 2 seeds | **11.098 / 3.998** | **10.048 / 5.592** | **61.1 / 63.0** |
+
+🔴 **THE 68-RESIDUE SAMPLER PREFERENCE DOES NOT SURVIVE TO 195, LET ALONE 522.**
+Two sections up, ODE was said to be the step that made AlphaFold 3's 1QYS a
+chain again while Flow returned none - and that claim is RETRACTED below. Here ODE is last on a 195-residue
+heterodimer by a margin larger than the seed spread of either other arm, and at
+522 residues it **collapses the chains themselves** - 4 to 11 A where diffusion
+and flow are both under 0.51, with pLDDT dropping to 61 from 86.
+
+Both findings are real and they are about different lengths. That is the
+argument for ODE being a named option a user picks rather than a per-model
+default this port picks for them, and the honest guidance is: **ODE for short
+chains, Diffusion for anything long.** The page defaults to Diffusion.
+
+🔴 **AND READ THE `alone` COLUMN ON 5CAJ, NOT THE COMPLEX ONE.** The complex
+score there is placement over two chains that do not touch, and its seed spread
+within one sampler (9.1 to 23.7) is larger than any difference between samplers.
+A sampler winner read off that column would be noise.
+
+### 1TIM A:B - a LARGE complex where every number is trustworthy
+
+`tools/fixtures/1tim-crystal.pdb`, chains A and B: triosephosphate isomerase,
+**494 residues, an actual biological homodimer** with closest inter-chain CA
+3.26 A and **101 contacts under 8 A** - nearly three times 1BRS's interface, on
+two and a half times the residues. This is the target that answers "larger
+complexes": big, real, and with a metric that means something.
+
+af3-int5, merged self-template, 25 diffusion steps:
+
+| | complex | TM | fnat | pLDDT |
+|---|---:|---:|---:|---:|
+| no template | 10.569 | 0.4619 | 0.139 | 52.51 |
+| **merged template** | **0.957** | 0.9866 | **0.871** | 91.30 |
+| merged, cross-chain block MASKED | 1.293 | 0.9781 | 0.713 | 88.14 |
+
+and the panel, all with the merged self-template:
+
+| model | complex | TM | fnat | pLDDT | seconds |
+|---|---:|---:|---:|---:|---:|
+| **rosettafold3** | **0.151** | 0.9996 | **1.000 (101/101)** | 79.15 | 24 |
+| af3 | 0.957 | 0.9866 | 0.871 | 91.30 | 20 |
+| boltz2 | 1.027 | 0.9849 | 0.901 | 93.08 | 29 |
+| protenix2 | 1.047 | 0.9840 | 0.832 | 90.05 | 42 |
+| intellifold2 | 1.065 | 0.9839 | 0.891 | 94.67 | 91 |
+
+🔴 **AND HERE THE CROSS-CHAIN TEMPLATE BLOCK PAYS FOR AlphaFold 3 TOO**, which
+1BRS said it did not: 1.293 to **0.957** and fnat 0.713 to **0.871**, sixteen
+more native contacts. rosettafold3 goes 0.403 to **0.151** with fnat 0.950 to
+1.000. So `spanChains` is worth nothing on a 195-residue heterodimer with 36
+contacts and worth 1.35x (af3) and 2.7x (rf3) on a 494-residue dimer with 101 -
+the finding is about the SIZE of the interface, and the earlier "worth nothing"
+was one target's answer read as the rule.
+
+🔴 **AND THE SAMPLER ANSWER IS UNAMBIGUOUS AT THIS LENGTH.** Same target, same
+template, af3-int5, four seeds each, arms interleaved in one batch:
+
+| sampler | complex, 4 seeds | mean | fnat | pLDDT | seconds |
+|---|---|---:|---|---:|---:|
+| diffusion, 25 steps | 0.957 / 0.934 / 0.931 / 1.010 | **0.958** | 88 / 88 / 89 / 88 of 101 | 91.2-91.7 | 20.5 |
+| flow, 16 cycles | 0.980 / 0.992 / 0.968 / 0.959 | **0.975** | 88 / 89 / 90 / 88 | 92.2-92.6 | 19.8 |
+| **ode**, 16 cycles (2 seeds) | **7.853 / 5.394** | 6.62 | **26 / 38** | **70.3 / 75.1** | 19.8 |
+
+🔴 **FLOW AND DIFFUSION ARE NOT DISTINGUISHABLE HERE, AND THE SEED SPREAD SAYS
+SO RATHER THAN THE MEANS**: flow's whole range (0.959-0.992) sits INSIDE
+diffusion's (0.931-1.010), the two differ by 0.017 A on a per-seed spread of
+0.079 and 0.033, and their interface counts overlap seed for seed. Flow's pLDDT
+is consistently about one point higher, which is not a correctness statement.
+
+**So ODE's collapse is the STEP and not the WALK.** Flow and ODE are the same
+schedule, the same 16 cycles and the same code path, differing only in
+`x <- D` against `x <- D + (sigma_next/sigma)(x - D)` - and one of them is
+0.975 while the other is 6.62.
+
+🔴 **AND FLOW IS NOT MEANINGFULLY CHEAPER AT THIS SIZE, WHICH IS WORTH SAYING
+BECAUSE 16 AGAINST 25 STEPS LOOKS LIKE IT SHOULD BE.** 19.8 s against 20.5, a
+3% difference: at 494 tokens with 3 recycles the fold is the TRUNK, and the
+sampler is a sliver of it. The step-count saving is real at 68 tokens and gone
+by 494.
+
+🔴 **AND MORE FLOW CYCLES ARE WORSE, NOT BETTER.** At 25 cycles instead of 16 -
+matching diffusion's budget exactly - flow reads **0.999 / 1.020 with pLDDT
+89.13 / 89.45**, against 16 cycles' 0.980 / 0.992 at 92.6. So the walk's length
+is not a quality dial, which is the same shape docs/OPENDDE.md records for
+OpenDDE ("more steps are WORSE") and the reason `AF3_COUNTS` prefers 16. Put beside the 68-residue result where ODE was the only step that
+folded 1QYS at all, the shape of the whole finding is now clear:
+
+| residues | ODE against diffusion |
+|---|---|
+| 68-92 (1QYS/6MRR, af3) | ODE **loses** - 1QYS diffusion 0.918, flow 0.936-0.999, **ODE 1.215**; 6MRR 0.650 / 0.687 / **1.488**. The "Flow is not a chain here" that made ODE look like a rescue is retracted below |
+| 195 (1BRS A:D) | ODE mildly worse - 0.549/0.661 against 0.448-0.491 |
+| 494 (1TIM A:B) | ODE **breaks** - 6.62 mean against 0.958 (diffusion) and 0.975 (flow), fnat 0.87 to 0.26 |
+| 522 (5CAJ A:B) | ODE wrecks the CHAINS - 4 to 11 A alone, pLDDT 61 against 86 |
+
+**ODE degrades with length and it is not subtle.** The page defaults to
+Diffusion, ODE is opt-in, and its tooltip now says so.
+
+### 🔴 AND IT FOUND A DEFECT: RoseTTAFold3's TEMPLATE WAS A QUARTER STRENGTH
+
+The complex panel put rf3 at **12.189 A on 1BRS A:D** where the other five are
+0.45 to 0.52. Two folds separate a complex failure from a fold failure and it
+was neither: **rf3 on ONE chain of barnase, with a full self-template, was
+13.215 A** where AlphaFold 3 on the identical input is 0.231.
+
+The established instrument on the established target says it plainly. 5CAJ chain
+A, self-template, 25 diffusion steps, every model int5:
+
+| | with a self-template | without | pLDDT |
+|---|---:|---:|---:|
+| intellifold2 | 0.254 | - | 94.76 |
+| alphafold3 | 0.281 | 17.624 | 92.12 |
+| **rosettafold3, before** | **17.771** | 17.949 | 63.73 |
+| **rosettafold3, after** | **0.137** | 17.949 | 79.16 |
+
+0.137 A is the best of the seven.
+
+**What it was.** rf3's reference has its own template forward, and the part that
+matters is the DENOMINATOR:
+
+```python
+a_tij = (jnp.einsum('t,tijc->ijc', present, feats)
+         / jnp.clip(present.sum(), 1.0, None))     # mean over PRESENT templates
+...                                                # then ONE forward pass
+```
+
+against every other family, which runs a forward PER SLOT and averages the
+outputs over the slot count. A fold pads the template slots to **four**
+(`templates: options.templates ?? 4` in fold.js) and `TEMPLATE_SCALE` is
+`1/slots`, so one real template reached rf3's trunk as **a quarter of itself**,
+mixed with three quarters of an empty-slot pass. A quarter of a
+distance-distribution conditioning is a template that does almost nothing -
+which is exactly what 17.949 to 17.771 looks like.
+
+`templateFeatureMeanOnePass` in dialect.js is the convention, true for
+rosettafold3 and false for the other six.
+
+🔴 **AND NO MODULE CHECKER COULD SEE IT, BECAUSE ALL OF THEM PASS `templates:
+1`.** At one slot a slot mean and a present mean are the same number. The
+checker that exists reads **0.061** for rf3 - and that is not the defect either:
+it is the int5 bundle, which the control names outright, **boltz2 int5 0.167
+against boltz2 f32 8.25e-7**. So the module check was green, the number that
+looked bad was quantisation, and the real fault only existed at a slot count no
+checker used.
+
+🔴 **THE UNTOUCHED ARMS, SHOWN UNTOUCHED** rather than argued from the diff:
+rf3's 6MRR with no template is `meanPlddt` **81.53041400210395** and 1.649 A
+before and after, identical to sixteen digits - which is the empty path, and the
+whole reason rf3's trunk seam stayed exact through the bug. boltz2's 5CAJ
+self-template is 0.837 both ways. `npm test` 1103/0.
+
+🔴 **AND THE GATE THAT WOULD HAVE CAUGHT IT NOW EXISTS**: `npm run
+test:template` (`tools/check-template-path.mjs`) folds 5CAJ chain A through
+every AF3-lineage bundle **twice** - with the self-template and without - and
+fails unless the templated fold lands on the crystal AND the control does not.
+Both arms, because "0.14 A with a template" is evidence only if the same model
+is 17 A without one; a checkpoint that had memorised the target would otherwise
+pass. This is the template twin of `npm run test:ligand`, and the same sentence
+applies to both: **every other fold gate here folds a plain protein with no
+template, so the stage went unexercised.**
+
+The whole panel, which is the first time these seven have been measured side by
+side on a template:
+
+```
+ok    alphafold3    with a template   0.281 A   without  17.624 A   pLDDT  92.12
+ok    openbind0     with a template   0.384 A   without  19.273 A   pLDDT  93.63
+ok    boltz2        with a template   0.837 A   without  16.990 A   pLDDT  91.57
+ok    protenix2     with a template   0.249 A   without  18.994 A   pLDDT  94.32
+ok    opendde       with a template   0.233 A   without  17.159 A   pLDDT  91.30
+ok    intellifold2  with a template   0.254 A   without  17.919 A   pLDDT  94.76
+ok    rosettafold3  with a template   0.137 A   without  17.949 A   pLDDT  79.16
+```
+
+🔴 **AND IT WAS VERIFIED TO FAIL**, because a gate that cannot is not one:
+with `templateFeatureMeanOnePass` put back to false the rosettafold3 row reads
+`FAIL ... with a template 17.771 A   without 17.949 A   pLDDT 63.73` and the
+run exits 1.
+
+### What the complex work leaves open
+
+Each of these is a run rather than an argument, and none of them is blocking:
+
+- **An MSA on a complex.** Every number in this section is single-sequence with
+  a self-template, and the interface is exactly the part co-evolution is for.
+  `af3BatchFromA3m` already takes `{paired, unpaired, unpairedProfile}`, so the
+  path exists; what is missing is a paired alignment to feed it, which means the
+  network and a pairing mode. Until then "no template, no MSA" is the floor
+  every complex number here is measured against, and it is a harsh one -
+  af3 is 10.569 A on 1TIM and 16.666 on 1BRS that way.
+- **A self-template is not a template.** The whole panel lands between 0.15 and
+  1.07 A because it is being handed the answer. A homolog at 40% identity is the
+  question a user actually asks, and nothing here has asked it.
+- **Three or more chains.** `chainAssignments` enumerates up to 720 relabellings
+  and is tested to six identical chains, but no fold has run past two. A
+  homotrimer would exercise both the permutation and the featuriser's chain
+  numbering at once.
+- **Whether the page should offer the merged slot.** It is worth 1.35x to
+  AlphaFold 3 on a 494-residue dimer and nothing on a 195-residue one, and it is
+  out of AF3's training distribution either way - `evoformer.py:519` cannot
+  produce a cross-chain template feature. The page's template UI is per-chain by
+  construction and stays that way until someone decides that trade.
+
+## 🔴 RETRACTED: "AlphaFold 3 with Flow returns no chain on 1QYS"
+
+This file and CLAUDE.md both carried it, the page's default sampler was changed
+on it, and the whole ODE option was justified by it. **It is false.**
+
+The recorded finding: af3 + Flow + 1QYS, "not a chain on four seeds out of
+four - CA median 4.267 / 4.367 / 4.861 / 4.886 A against 3.80, worst up to
+26.02, pLDDT 68.79", against diffusion's 1.072 A.
+
+Re-measured, four seeds, through BOTH fold tools:
+
+| af3, 1QYS, 16 cycles | CA-CA median | worst | RMSD | pLDDT |
+|---|---:|---:|---:|---:|
+| flow, seed 1 | 3.801 | 4.04 | 0.956 | 79.09 |
+| flow, seed 7 | 3.787 | 3.50 | 0.944 | 79.65 |
+| flow, seed 21 | 3.794 | 4.06 | 0.936 | 79.74 |
+| flow, seed 20260831 | 3.790 | 4.01 | 0.999 | 79.49 |
+| diffusion, seed 1 | 3.806 | 4.02 | **0.918** | 79.61 |
+
+`fold.js --sequence=` and `fold-opendde.js --target=1qys` agree to the digit
+(both 3.801 and 79.09 at seed 1), so it is not a tool difference.
+
+🔴 **AND IT IS NOT A FIX THAT LANDED SINCE, WHICH IS THE CHECK THAT SETTLES IT.**
+A worktree at **`9cc43d7` - the commit that recorded the claim** - run on the
+same GPU with the same bundle gives **CA-CA 3.801 / 3.787 / 3.794 and pLDDT
+79.09 / 79.65 / 79.74**, identical to HEAD. The code at the commit that reported
+a wreck does not produce one.
+
+🔴 **THE TELL WAS IN THE NUMBERS ALL ALONG: THE CONTROL MOVED TOO.** Diffusion
+was recorded at 1.072 A and measures 0.918; pLDDT was recorded at 68.79 and
+measures 79.5. **A difference that appears in both arms is a difference in the
+CONFIGURATION, not in the thing under test** - this file's own rule about
+control arms, pointed the other way round.
+
+🔴 **AND THE SCRATCHPAD LINE ABOVE THOSE NUMBERS READS `(clean = diagnostics
+reverted)`.** The run was taken on a tree that had been edited and hand-reverted
+during a debugging session. **A revert you performed is not the same as `git
+status`, and a measurement taken on a modified tree is not a measurement** - it
+produced four internally consistent broken folds, which is exactly what makes it
+convincing and exactly why four seeds agreeing is not evidence of anything on
+its own.
+
+**What survives.** Diffusion is still the right page default, for the reason
+that holds up rather than the one that did not: it wins or ties nearly
+everywhere - 1QYS 0.918 against flow's 0.936-0.999, 6MRR 0.650 against 0.687,
+1TIM A:B 0.958 against 0.975 over four seeds - and it is the sampler
+af3-any-model verified. Flow is a close second at the same price everywhere it
+has been measured, and rosettafold3's `noFlowSampler` is unaffected: that
+collapse was measured on a clean tree, reproduces, and is a different finding.
+
+### And what it does to ODE
+
+ODE's headline was "the only step that folds 1QYS for AlphaFold 3", on a target
+that never needed rescuing. Measured against DIFFUSION rather than against a
+broken Flow - one seed, 68 and 92 residues, the lengths ODE is supposed to suit:
+
+| model | target | diffusion 25 | flow 16 | **ode 16** |
+|---|---|---:|---:|---:|
+| af3 | 6MRR | **0.650** | 0.687 | 1.488 |
+| boltz2 | 6MRR | **0.476** | 0.541 | 0.509 |
+| protenix2 | 6MRR | **0.693** | 0.733 | 1.223 |
+| intellifold2 | 6MRR | 1.549 | 1.565 | **0.769** |
+| af3 | 1QYS | **0.918** | 0.956 | 1.215 |
+| boltz2 | 1QYS | **0.838** | 0.928 | 1.012 |
+| protenix2 | 1QYS | 1.017 | **0.837** | 1.082 |
+| intellifold2 | 1QYS | 1.585 | **1.136** | 1.851 |
+
+**ODE wins 1 of 8 here and 1 of 9 counting 1TIM** - intellifold2 on 6MRR, where
+it is genuinely twice as good (0.769 against 1.549) - and loses everywhere else,
+by 2.3x on af3's 6MRR. Add 195 residues (0.549/0.661 against 0.448-0.491), 494
+(6.62 mean against 0.958) and 522 (it wrecks the chains), and there is no length
+and no model where it is the right pick except that one square.
+
+The earlier per-model table that made ODE look good - "af3, boltz2 and
+intellifold2 are better under ODE" - compared ODE against **Flow**, never
+against Diffusion, on one target. That was the gap.
+
+### The samplers on 1TIM, per model - and two findings bigger than the ODE question
+
+1TIM A:B, 494 residues, merged self-template, seed 20260831 unless noted.
+
+| model | diffusion 25 | flow 16 | **ode 16** |
+|---|---:|---:|---:|
+| af3 | **0.958** (4 seeds) | 0.975 (4 seeds) | 6.62 (2 seeds) |
+| boltz2 | **1.027 / 1.090** | **17.706 / 1.042 / 19.598** | 20.256 |
+| protenix2 | **1.047** | 1.269 (fnat 0.653) | 4.819 |
+| intellifold2 | 1.065 | **1.058** | 1.665 |
+
+🔴 **ODE'S ONE WIN DOES NOT SURVIVE THE LENGTH.** intellifold2 on 6MRR is the
+single square where ODE beats everything (0.769 against 1.549) - and at 494
+residues it is **1.665 against flow's 1.058 and diffusion's 1.065**, the worst of
+the three for that model too. So the win is a property of 68 residues, not of
+the checkpoint. Counting 1TIM, **ODE wins 1 of 12 measured model/target pairs**
+and loses every other one.
+
+🔴 **AND FLOW HAS A FAILURE OF ITS OWN AT LENGTH, WHICH IS boltz2's.** Three
+seeds on 1TIM: **17.706, 1.042, 19.598**. Two of three are catastrophic, and
+they fail in two DIFFERENT ways - which the precision column is what separates:
+
+| boltz2, flow, 1TIM | complex | recall | precision | predicted / native | chains `alone` | pLDDT |
+|---|---:|---:|---:|---:|---|---:|
+| seed 20260831 | 17.706 | 0.000 | 0.000 | 51 / 101 | 1.118 / 1.071 | 85.11 |
+| seed 7 | **1.042** | 0.881 | 0.840 | 106 / 101 | 1.023 / 0.939 | 93.00 |
+| seed 21 | 19.598 | 0.901 | **0.192** | **474** / 101 | 16.785 / 16.576 | 73.26 |
+| diffusion, control | 1.027 | 0.901 | 0.843 | 108 / 101 | 0.976 / 1.039 | 93.08 |
+
+Seed 20260831 folds both chains correctly (1.1 A each) and puts them in the
+wrong place - **zero of the 101 native contacts**. Seed 21 folds them wrongly
+(16.8 A each) into a mass that touches everywhere. It is a length effect and not
+a boltz2 property: the same model in flow on **1BRS A:D (195 residues) is 0.499
+against diffusion's 0.517**, and one chain of 1TIM alone (247) is 1.592.
+
+🔴 **AND NOTHING THE PAGE SHOWS WOULD TELL A USER.** Both bad seeds **PASS the
+chain-geometry gate** - CA-CA 3.784 and 3.788, worst 3.64 and 4.47, which is a
+healthy backbone - and seed 20260831's pLDDT is **85.11**, three points off a
+good fold's. The gate measures whether the backbone is a chain; two chains that
+are each a chain and are 17 A from where they belong is not a question it asks.
+`interface.fnat` and `interface.precision` are the only things here that can see
+it, and they exist because of this run.
+
+🔴 **AND `fnat` ALONE WAS FOOLED WITHIN AN HOUR OF BEING WRITTEN.** Seed 21 reads
+**recall 0.901** - 91 of the crystal's 101 contacts recovered - on a fold whose
+chains are 16.8 A out of shape, because a model that puts everything close to
+everything recovers every contact by accident. It made **474** inter-chain
+contacts where the crystal has 101. Recall is not an interface score without
+precision beside it; both are reported now, and a healthy fold is ~104-108
+predicted against 101 native at precision 0.84.
+
+### ODE is removed from the page, and the step is kept for the CLI
+
+Decided on the twelve pairs above: **ODE wins 1 of 12** - intellifold2 on 6MRR,
+0.769 against 1.549 - and loses the other eleven, including the same model's own
+1TIM row (1.665 against 1.058 and 1.065), so the win is a property of 68
+residues rather than of a checkpoint. Past ~400 residues it breaks outright.
+**A third option that is never the right pick is a way for a visitor to get a
+worse fold**, so `index.html` no longer offers it and `AF3_COUNTS` has no row.
+
+What stays: `--mode=ode` on any fold tool, and the step in
+`diffusion-sampler-webgpu.js`. The intellifold2 square is real and nobody has
+explained it, so removing the code would throw away the question along with the
+option. `foldBatch` still validates the three modes and still throws on a
+fourth.
+
+🔴 **AND THE TWO LISTS ARE GATED AGAINST EACH OTHER NOW**, because they live in
+different files: the `<option>`s in index.html, `AF3_COUNTS` in
+web/af3-model.js, and `web/app.js` subscripting the table with the select's
+value. **One of app.js's two readings had a `?? table.flow` fallback and the
+other did not**, so removing a mode from one file and not the other is a "cannot
+read properties of undefined" in the middle of starting a fold - the
+stale-allow-list trap CLAUDE.md already records twice. `test/sampler-options.test.js`
+runs it both ways (no option without a row, no row without an option), asserts
+the marked-up default is `diffusion`, and was verified to fail in each
+direction. The unguarded reading is guarded.

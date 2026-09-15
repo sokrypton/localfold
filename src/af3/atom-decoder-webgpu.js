@@ -25,7 +25,7 @@ import { residentWeightBuffer } from "../runtime/resident.js";
 import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import {
   derivedWorkgroupTarget, createAtomBlockShaders, createAtomCommon, packAtomBlockWeights, packCached,
-  blockHasUpGate,
+  blockHasUpGate, blockHasKqNorm,
 } from "./atom-encoder-webgpu.js";
 
 /** Which labels in a caller's `staticCache` already hold their contents. */
@@ -188,12 +188,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
-  // Only the four block passes; the encoder's masking and aggregation are its
-  // own, and `aggregate` reads a weight this bundle does not carry.
+  // 🔴 THE PADDING, RE-ZEROED BETWEEN BLOCKS - intellifold2 and chai1 only.
+  // `start` already masks once, and under every other dialect that is the only
+  // masking this stack needs, because a padded row's own output is discarded.
+  // It is not discarded here: the NEXT block gathers it as a key.
+  const maskAct = `${common}
+@group(0) @binding(0) var<storage, read> queries_mask: array<f32>;
+@group(0) @binding(1) var<storage, read_write> act: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= QUERY_ROWS * C) { return; }
+  act[index] = act[index] * queries_mask[index / C];
+}`;
+
+  // Only the four block passes; the encoder's aggregation is its own, and
+  // `aggregate` reads a weight this bundle does not carry.
   const { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
-          attendFor, output, outputRowTile } = createAtomBlockShaders(common, shape);
-  return { pairLogits, start, finish, project, projectKeys, projectKeysAtoms,
-           normaliseQueries, expandKeys, attendFor, output, outputRowTile };
+          attendFor, output, kqNorm, outputRowTile } = createAtomBlockShaders(common, shape);
+  return { pairLogits, start, finish, maskAct, project, projectKeys, projectKeysAtoms,
+           normaliseQueries, expandKeys, attendFor, output, kqNorm, outputRowTile };
 }
 
 export class Af3AtomDecoderGpu {
@@ -260,6 +275,18 @@ export class Af3AtomDecoderGpu {
     if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
       throw new Error("this atom decoder's blocks disagree about chainedAtomLayerNorm");
     }
+    const kqNorm = blockHasKqNorm(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasKqNorm(b) !== kqNorm)) {
+      throw new Error("this atom decoder's blocks disagree about kq_norm");
+    }
+    const maskPerBlock = weights.blocks[0]?.maskAtomActPerBlock;
+    if (maskPerBlock === undefined) {
+      throw new Error("atom decoder blocks carry no maskAtomActPerBlock: AF3 "
+        + "pads the flat atom axis once, intellifold2 and chai1 per block");
+    }
+    if (weights.blocks.some((b) => b.maskAtomActPerBlock !== maskPerBlock)) {
+      throw new Error("this atom decoder's blocks disagree about maskAtomActPerBlock");
+    }
     // boltz2's transition up-gate; see `blockOrderFor` in the encoder.
     const upGate = blockHasUpGate(weights.blocks[0]);
     if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
@@ -267,6 +294,11 @@ export class Af3AtomDecoderGpu {
     }
     const shape = {
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
+      // rosettafold3's q/k LayerNorm; see the kernel in atom-encoder-webgpu.js.
+      kqNorm,
+      // ...and its block wiring, off the weights because this stack sees no
+      // dialect object. See `atomBlockWith`.
+      noResidual: weights.blocks[0]?.diffusionNoResidual === true,
       perTokenChannels: weights.perTokenChannels,
       trunkSingleChannels: weights.trunkSingleChannels ?? 384,
       trunkPairChannels: weights.trunkPairChannels ?? 128,
@@ -287,7 +319,8 @@ export class Af3AtomDecoderGpu {
       // ...and the two conventions, for the reason the encoder's key names
       // them: the arms index one buffer differently and produce one shape.
       + `:${shape.perBlockPair ? "pb" : ""}${shape.keyMaskedAtomAttention ? "km" : ""}`
-      + `${chainedNorm ? "cn" : ""}${upGate ? "ug" : ""}`;
+      + `${chainedNorm ? "cn" : ""}${upGate ? "ug" : ""}`
+      + `:kq${kqNorm}:mp${maskPerBlock}:nr${shape.noResidual}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -458,6 +491,12 @@ export class Af3AtomDecoderGpu {
 
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
+        // See maskPerBlock above. `start` has already masked, so block 0's
+        // dispatch is a no-op and runs anyway - the alternative is a branch
+        // that makes block 0 a different kernel sequence from block 1.
+        if (maskPerBlock) {
+          run(`mask-act-${index}`, compiled.maskAct, [queriesMask, act], qr[0], qr[1]);
+        }
         // ...one workgroup per TILE of query rows; see the note on `output`.
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project, [act, queriesCond, w, q, gate],
@@ -478,6 +517,10 @@ export class Af3AtomDecoderGpu {
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
+        if (kqNorm) {
+          const kqRows = spread(queryRows + keyRows);
+          run(`kq-norm-${index}`, compiled.kqNorm, [q, k, w], kqRows[0], kqRows[1]);
+        }
         const slots = spread(queryRows * heads);
         run(`attend-${index}`, compiled.attend[index],
             [q, k, v, logits, queriesMask, keysMask, gathered], slots[0], slots[1]);

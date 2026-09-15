@@ -52,6 +52,18 @@ def main():
     parser.add_argument("--sequence", default=SEQUENCE)
     parser.add_argument("--reference", default=REFERENCE)
     parser.add_argument("--out", default=None)
+    # 🔴 THE CONVENTIONS A PLAIN PROTEIN CANNOT EXERCISE. 6MRR has no
+    # ligand and no modified residue, so `symmetriseBonds`,
+    # `atomized_element_names`, `atomized_backbone_bonds` and
+    # `atomized_unknown_restype` are all inert on it - and a featuriser gate
+    # built on that target reports them green by never reaching them.
+    # `--ligand GOL` adds a ligand chain and `--ptm SEP@3` a modified residue,
+    # both through `_fold_setup(chains=...)`, so every per-model convention
+    # still comes from the reference rather than from this script.
+    parser.add_argument("--ligand", default=None,
+                        help="CCD code of a ligand chain to add, e.g. GOL")
+    parser.add_argument("--ptm", default=None,
+                        help="modified residue as CODE@POSITION, e.g. SEP@3 (1-based)")
     arguments = parser.parse_args()
     for entry in (os.path.join(arguments.reference, "src"), arguments.reference,
                   os.path.join(arguments.reference, "dev", "oracles")):
@@ -62,7 +74,23 @@ def main():
     from fold_check import _fold_setup
     from alphafold3.model import feat_batch
 
-    batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence)
+    chains = None
+    if arguments.ligand is not None or arguments.ptm is not None:
+        from alphafold3.common import folding_input
+        # `ptms` is a sequence of (CODE, 1-based position) tuples and a ligand
+        # is `folding_input.Ligand`, not a "LigandChain" - checked against the
+        # reference's own signatures rather than guessed.
+        ptms = []
+        if arguments.ptm is not None:
+            code, _, position = arguments.ptm.partition("@")
+            ptms = [(code.strip().upper(), int(position))]
+        chains = [folding_input.ProteinChain(
+            id="A", sequence=arguments.sequence, ptms=ptms,
+            unpaired_msa="", paired_msa="", templates=[])]
+        if arguments.ligand is not None:
+            chains.append(folding_input.Ligand(
+                id="B", ccd_ids=[arguments.ligand.strip().upper()]))
+    batch, _cfg, _dir = _fold_setup(arguments.model, arguments.sequence, chains=chains)
     features = feat_batch.Batch.from_data_dict(batch)
     inputs = {}
     for name, value in arrays(batch):
@@ -91,7 +119,12 @@ def main():
                 "data": array.astype(np.float32).ravel().tolist()}
 
     tokens = int(np.asarray(features.token_features.mask).shape[0])
-    out = arguments.out or "/tmp/af3-batch-%s.json" % arguments.model
+    suffix = ""
+    if arguments.ligand is not None:
+        suffix += "-%s" % arguments.ligand.strip().lower()
+    if arguments.ptm is not None:
+        suffix += "-%s" % arguments.ptm.strip().lower().replace("@", "")
+    out = arguments.out or "/tmp/af3-batch-%s%s.json" % (arguments.model, suffix)
     with open(out, "w") as handle:
         json.dump({"model": arguments.model, "sequence": arguments.sequence,
                    "tokens": tokens,

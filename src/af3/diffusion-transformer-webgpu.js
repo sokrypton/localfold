@@ -1,4 +1,6 @@
 import { concatenateAs, writeInto } from "../runtime/float16.js";
+import { carriesTensor } from "../runtime/weight-sources.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
 import { deviceTuning, halfPrecisionAvailable } from "../runtime/device-profile.js";
 import { residentPackedOnDevice } from "./device-weights.js";
 import { SOURCES } from "./weights.js";
@@ -82,8 +84,23 @@ export const BLOCK_ORDER = [
  * The up-gate is LINEAR in the activation, so it splits over K exactly as the
  * gate and value halves do: three partials a part rather than two.
  */
-export const txBlockOrder = (upGate) =>
-  (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
+/**
+ * 🔴 rosettafold3's kq_norm IS FOUR MORE TENSORS AND A SHADER VARIANT, for the
+ * same reason. A LayerNorm on q and k over the flattened num_head * key_dim
+ * axis, after the projection and before the key_dim scaling; no other
+ * checkpoint carries the tensors, and their absence is `null` rather than a
+ * zero that could stand in.
+ */
+export const TX_KQ_NORM = [
+  "queryLayerNormScale", "queryLayerNormOffset",
+  "keyLayerNormScale", "keyLayerNormOffset",
+];
+export const txHasKqNorm = (block) => carriesTensor(block, "queryLayerNormScale");
+export const txBlockOrder = (upGate, kqNorm = false) => [
+  ...BLOCK_ORDER,
+  ...(upGate ? ["ffwAToB"] : []),
+  ...(kqNorm ? TX_KQ_NORM : []),
+];
 /**
  * 🔴 ASKED OF THE THUNK, NOT OF THE VALUE. A bound block's fields are getters
  * that DECODE when read, so `block.ffwAToB != null` materialises a 768x1536
@@ -93,10 +110,7 @@ export const txBlockOrder = (upGate) =>
  * 3's 0.28 s, and none of it was arithmetic. Same trap CLAUDE.md records for
  * `blockWeightOffsets` reading `.length`.
  */
-export const txHasUpGate = (block) => {
-  const sources = block?.[SOURCES];
-  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
-};
+export const txHasUpGate = (block) => carriesTensor(block, "ffwAToB");
 
 /**
  * 🔴 THE UPLOAD WAS THE FLOOR, NOT THE ARITHMETIC. A block is ~26 MB, so the
@@ -126,7 +140,8 @@ function residentBlockBuffer(device, block, pack, variant = "") {
 function residentBlockOnDevice(device, block, precision) {
   if (precision !== "f16") return Promise.resolve(undefined);
   return residentPackedOnDevice(device, {
-    key: block, label: "difftx.block.resident", order: txBlockOrder(txHasUpGate(block)),
+    key: block, label: "difftx.block.resident",
+    order: txBlockOrder(txHasUpGate(block), txHasKqNorm(block)),
     weights: block, variant: precision,
   });
 }
@@ -239,7 +254,7 @@ export function blockWeightOffsets(block) {
   const sources = block[SOURCES];
   const offsets = {};
   let total = 0;
-  for (const name of txBlockOrder(txHasUpGate(block))) {
+  for (const name of txBlockOrder(txHasUpGate(block), txHasKqNorm(block))) {
     const thunk = sources?.[name];
     const length = Number.isInteger(thunk?.count) ? thunk.count : block[name]?.length;
     if (length === undefined) throw new Error(`diffusion block missing ${name}`);
@@ -250,18 +265,10 @@ export function blockWeightOffsets(block) {
 }
 
 export function packBlockWeights(block, precision = "f32") {
-  const order = txBlockOrder(txHasUpGate(block));
-  const offsets = {};
-  let total = 0;
-  for (const name of order) {
-    if (block[name] === undefined) throw new Error(`diffusion block missing ${name}`);
-    offsets[name] = total;
-    total += block[name].length;
-  }
-  const data = concatenateAs(precision, total, (target) => {
-    for (const name of order) writeInto(target, block[name], offsets[name]);
+  return packNamedWeights(block, {
+    label: "diffusion block", precision,
+    order: txBlockOrder(txHasUpGate(block), txHasKqNorm(block)),
   });
-  return { data, offsets };
 }
 
 /**
@@ -1788,6 +1795,86 @@ ${mode === "split" ? "" : `${batchedGates ? `  // 🔴 ALREADY COMPUTED, FOR EVE
   }`)}
 `}
 }`;
+  // 🔴 THE PRE-ATTENTION ACTIVATION, SAVED - rosettafold3 only. Its block is
+  // `act + attn + transition(act)`: attention and the transition share ONE
+  // residual and the transition reads the activation the attention has NOT
+  // been added to. Everything else here is unchanged, so the whole branch is
+  // this copy plus which buffer `ffw-adaln` is handed. `copyBufferToBuffer`
+  // would be cheaper and cannot be used: it is not a compute pass, and the
+  // stack batches a super-block's passes into one.
+  // 🔴 rosettafold3's kq_norm - A TRAINED LayerNorm ON q AND k, OVER THE
+  // FLATTENED HEAD AXIS. Not per head: the reference reshapes
+  // (..., num_head, key_dim) to (..., num_head * key_dim), normalises, and
+  // reshapes back, so one mean and one variance serve every head of a token.
+  // Two-pass (`use_fast_variance=False`), with both a scale and an offset, and
+  // it runs AFTER the projection and BEFORE the key_dim scaling - which this
+  // port applies inside `attend`, so a pass between qkvg and attend is exactly
+  // the right seam. One workgroup a token row, both tensors in one dispatch.
+  const kqNorm = shape.kqNorm !== true ? null : `${common}
+@group(0) @binding(0) var<storage, read_write> q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> k: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<${weightPrecision}>;
+
+var<workgroup> partial_sum: array<f32, ${lanes}>;
+var<workgroup> partial_squares: array<f32, ${lanes}>;
+
+@compute @workgroup_size(${lanes})
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let row = group.x + group.y * ${GRID_WIDTH}u;
+  if (row >= ${ROWS}) { return; }
+  let local = local_id.x;
+  let base = row * WIDTH;
+${["q", "k"].map((side) => {
+    const S = side === "q" ? "W_queryLayerNormScale" : "W_keyLayerNormScale";
+    const O = side === "q" ? "W_queryLayerNormOffset" : "W_keyLayerNormOffset";
+    return `  {
+    var total = 0.0;
+    for (var w = local; w < WIDTH; w += ${lanes}u) { total += ${side}[base + w]; }
+    partial_sum[local] = total;
+    workgroupBarrier();
+    for (var stride = ${lanes >> 1}u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { partial_sum[local] += partial_sum[local + stride]; }
+      workgroupBarrier();
+    }
+    let mean = partial_sum[0] / f32(WIDTH);
+    workgroupBarrier();
+    // Two-pass, because \`use_fast_variance=False\`: the sum of squares form is
+    // a different number in float32 and this LayerNorm's output feeds a
+    // softmax's logits.
+    var squares = 0.0;
+    for (var w = local; w < WIDTH; w += ${lanes}u) {
+      let d = ${side}[base + w] - mean;
+      squares += d * d;
+    }
+    partial_squares[local] = squares;
+    workgroupBarrier();
+    for (var stride = ${lanes >> 1}u; stride > 0u; stride >>= 1u) {
+      if (local < stride) { partial_squares[local] += partial_squares[local + stride]; }
+      workgroupBarrier();
+    }
+    let inverse_std = inverseSqrt(partial_squares[0] / f32(WIDTH) + EPSILON);
+    workgroupBarrier();
+    for (var w = local; w < WIDTH; w += ${lanes}u) {
+      ${side}[base + w] = (${side}[base + w] - mean) * inverse_std
+        * f32(weights[${S} + w]) + f32(weights[${O} + w]);
+    }
+    workgroupBarrier();
+  }`;
+  }).join("\n")}
+}`;
+
+  const copyAct = shape.noResidual !== true ? null : `${common}
+@group(0) @binding(0) var<storage, read> source: array<f32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<f32>;
+
+@compute @workgroup_size(${lanes})
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * ${GRID_WIDTH}u * ${lanes}u;
+  if (index >= ${ROWS} * C) { return; }
+  destination[index] = source[index];
+}`;
+
   const ffwOut = ffwOutFor(outKSplits > 1 ? "split" : "fused");
   const ffwOutReduce = outKSplits > 1 ? ffwOutFor("reduce") : null;
 
@@ -1829,7 +1916,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
            normPartialFloats: normKSplits > 1 ? normKSplits * 2 * rows * channels : 0,
            attentionOutputReduce, attnKSplits,
            attnPartialFloats: attnKSplits > 1 ? attnKSplits * rows * channels : 0,
-           ffwAdaln, ffwWide, ffwWideReduce, ffwOut, ffwOutReduce,
+           ffwAdaln, ffwWide, ffwWideReduce, ffwOut, ffwOutReduce, copyAct, kqNorm,
            qkvgSplits, wideSplits, outSplits, outKSplits,
            outPartialFloats: outKSplits > 1 ? outKSplits * rows * channels : 0,
            kSplits, normSplits,
@@ -2404,6 +2491,13 @@ export class Af3DiffusionTransformerGpu {
                     attendStageKeys: weights.attendStageKeys
                       ?? deviceTuning(this.device).diffusionAttendStageKeys ?? undefined,
                     factor: weights.transitionFactor,
+                    // rosettafold3's block wiring; see `copyAct`. It decides
+                    // whether that kernel is generated at all.
+                    noResidual: weights.noResidual === true,
+                    // ...and its q/k LayerNorm, off the WEIGHTS rather than the
+                    // dialect, the way the up-gate is: the tensors exist or they
+                    // do not. See `txHasKqNorm`.
+                    kqNorm: txHasKqNorm(weights.superBlocks?.[0]?.blocks?.[0]),
                     // 🔴 THE WORKGROUP WIDTH FOR EVERY KERNEL IN THIS STACK, and
                     // 256 is another number chosen on a device with a handful of
                     // cores. It sets the output split (range / lanes) and so the
@@ -2428,7 +2522,11 @@ export class Af3DiffusionTransformerGpu {
       // processes, which is how every sweep here was taken; a collision waiting
       // for two configurations in one.
       + `:ok${outKSplits}:ak${attnKSplits}:nk${normKSplits}:s${samples}:bg${batchedGates}:gt${gateTile ?? "d"}:aot${attnOutTile}`
-      + `:ug${shape.upGate}`;
+      + `:ug${shape.upGate}`
+      // ...and rosettafold3's two: the block wiring adds a kernel and the q/k
+      // LayerNorm adds a kernel AND four `const W_*` to every other source in
+      // this stack, because the offsets shift behind it.
+      + `:nr${shape.noResidual}:kq${shape.kqNorm}`;
     // 🔴 AWAITED TOGETHER, NOT ONE AT A TIME. `createComputePipelineAsync`
     // compiles off the main thread, so a loop that awaits each one in turn
     // serialises eleven compilations that could overlap - and this stack's
@@ -2588,6 +2686,11 @@ export class Af3DiffusionTransformerGpu {
         (at < cached ? { buffer: this.#pairLogits.buffers[at] } : spare);
       // The AdaLN pass hands the projection its input through this.
       const xBuffer = scratch("difftx.x", rows * channels * 4);
+      // rosettafold3's saved pre-attention activation; see `copyAct`. Not
+      // allocated at all under every other dialect.
+      const noResidual = weights.noResidual === true;
+      const preBuffer = noResidual
+        ? scratch("difftx.pre", rows * channels * 4) : undefined;
       const gatedBuffer = scratch("difftx.gated",
         rows * channels * weights.transitionFactor * 4);
       const q = scratch("difftx.q", rows * width * 4);
@@ -2921,6 +3024,11 @@ export class Af3DiffusionTransformerGpu {
           const runBlock = (label, pipeline, buffers, x, y = 1, z = 1) =>
             run(label, pipeline, buffers, x, y, `${label}:${at}`, z);
           const logits = logitsFor(at);
+          if (noResidual) {
+            const copyGroups = Math.ceil((rows * channels) / (shape.lanes ?? 256));
+            runBlock("copy-act", compiled.copyAct, [actBuffer, preBuffer],
+                Math.min(copyGroups, GRID_WIDTH), Math.ceil(copyGroups / GRID_WIDTH));
+          }
           if (buildPairLogits || at >= cached) {
             const pairGroups = Math.ceil(pairs / 64);
             runBlock("pair-logits", compiled.pairLogits[inner],
@@ -2954,6 +3062,13 @@ export class Af3DiffusionTransformerGpu {
             runBlock("qkvg", compiled.qkvg, [xBuffer, blockWeights, q, k, v, gate],
                 Math.ceil(rows / tile), sources.qkvgSplits);
           }
+          if (compiled.kqNorm !== undefined) {
+            // One workgroup a token row; see the kernel. It rewrites q and k in
+            // place, so it sits between the projection and the attention and
+            // nothing downstream changes.
+            runBlock("kq-norm", compiled.kqNorm, [q, k, blockWeights],
+                Math.min(rows, GRID_WIDTH), Math.ceil(rows / GRID_WIDTH));
+          }
           const slots = rows * heads;
           runBlock("attend", compiled.attend, [q, k, v, logits, maskBuffer, gathered],
               Math.min(slots, GRID_WIDTH), Math.ceil(slots / GRID_WIDTH));
@@ -2979,13 +3094,18 @@ export class Af3DiffusionTransformerGpu {
             runBlock("ffw-adaln", compiled.ffwAdaln, [condNormalised, blockWeights, normPartials],
                 Math.ceil(rows / tile), sources.normSplits, normKSplits);
             runBlock("ffw-adaln-reduce", compiled.ffwAdalnReduce,
-                [actBuffer, blockWeights, normPartials, xBuffer],
+                [noResidual ? preBuffer : actBuffer, blockWeights, normPartials, xBuffer],
                 Math.ceil(rows / tile), sources.normSplits);
           } else {
+            // 🔴 THE TRANSITION'S INPUT IS THE PRE-ATTENTION ACTIVATION under
+            // rosettafold3, and the ONLY difference the block wiring makes.
+            // `ffw-out` still adds into `actBuffer`, which by then holds
+            // `act + attn` - so the store is `act + attn + transition(act)`.
+            const ffwSource = noResidual ? preBuffer : actBuffer;
             runBlock("ffw-adaln", compiled.ffwAdaln,
                 batchedGates
-                  ? [actBuffer, ffwAdalnSlice(at), xBuffer]
-                  : [condNormalised, blockWeights, actBuffer, xBuffer],
+                  ? [ffwSource, ffwAdalnSlice(at), xBuffer]
+                  : [condNormalised, blockWeights, ffwSource, xBuffer],
                 Math.ceil(rows / tile), sources.normSplits);
           }
           if (kSplits > 1) {

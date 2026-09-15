@@ -155,6 +155,42 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_PROTENIX2_MODEL",
     load: () => import("./protenix2.js"),
   },
+  // IntelliFold-2 (intelligenAI, Apache 2.0) - the smallest dialect in the
+  // family and the widest bundle.
+  //
+  // 🔴 ITS SHAPES ARE ITS OWN AND ITS CONVENTIONS ARE ALMOST AlphaFold 3's. The
+  // trunk pair is 512 channels against AF3's 128 and the template stack 256
+  // against 64, while the reference names it in exactly two convention tuples -
+  // so everything that reads a width off the bundle transfers and everything
+  // that had one typed in did not. That is how `const CHANNELS = 64` in the
+  // template embedder was found. See docs/AF3.md.
+  //
+  // 406 tensors at int5 in forty shards, 612 MiB.
+  intellifold2: {
+    model: "intellifold2",
+    directory: "./model-intellifold2-int5/",
+    remote: null,
+    release: "intellifold2-int5",
+    variable: "LOCALFOLD_INCLUDE_INTELLIFOLD2_MODEL",
+    load: () => import("./intellifold2.js"),
+  },
+  // RoseTTAFold3 (Baker lab / RosettaCommons foundry, BSD 3-Clause).
+  //
+  // 🔴 IT TOOK EIGHT BRANCHES AND TWO OF THEM MOVED THE FOLD BY ALMOST NOTHING
+  // WHILE BEING CORRECT. 6MRR at 1.68 A / TM 0.911, inside af3-any-model's own
+  // five-sample spread, with pLDDT 81.5 and pTM 0.843 - and the confidence head
+  // read 53.8 / 0.175 for that same structure until its global norm landed. See
+  // the arm table in docs/AF3.md.
+  //
+  // 446 tensors at int5 in sixteen shards, 266 MiB.
+  rosettafold3: {
+    model: "rosettafold3",
+    directory: "./model-rosettafold3-int5/",
+    remote: null,
+    release: "rosettafold3-int5",
+    variable: "LOCALFOLD_INCLUDE_ROSETTAFOLD3_MODEL",
+    load: () => import("./rosettafold3.js"),
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -247,7 +283,8 @@ export const FOLDING_FAMILIES = Object.entries(MODEL_BUNDLES)
  * is the same mistake one model later.
  */
 export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
-                                  "protenix2", "ef2-fast-600m", "ef2-fast-300m"];
+                                  "protenix2", "intellifold2", "rosettafold3",
+                                  "ef2-fast-600m", "ef2-fast-300m"];
 
 /**
  * The families that predict a structure and nothing about it.
@@ -277,7 +314,8 @@ export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];
  * AlphaFold 2 branch at each of them, which is not a failure that announces
  * itself.
  */
-export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2"];
+export const AF3_FAMILIES = ["af3", "openbind0", "opendde", "boltz2", "protenix2",
+                             "intellifold2", "rosettafold3"];
 
 /** @typedef {keyof typeof MODEL_BUNDLES} ModelFamily */
 

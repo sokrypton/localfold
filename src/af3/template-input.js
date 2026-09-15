@@ -213,3 +213,66 @@ export function filterByConfidence(map, structure, minimum, confidenceOf) {
   }
   return kept;
 }
+
+/**
+ * Fold several per-chain slots into ONE slot covering all of them.
+ *
+ * 🔴 BECAUSE A PER-CHAIN TEMPLATE CANNOT CARRY AN INTERFACE, AND AN INTERFACE
+ * IS THE ONLY THING A COMPLEX HAS THAT A MONOMER DOES NOT. `multichainMaskFor`
+ * opens a cross-chain pair only where `spanChains` is set AND the slot covers
+ * BOTH ends, so two slots each holding one chain contribute nothing across the
+ * boundary however the flag is set - each one covers one end and not the other.
+ * A single slot holding both chains, in their deposited relative placement, is
+ * the arm that tells the model where they sit.
+ *
+ * The slots must cover DISJOINT tokens, which is what per-chain slots built
+ * from one batch do; an overlap is a caller error and raises rather than
+ * letting the later slot win silently.
+ *
+ * @param {Array<{aatype: Int32Array, atomPositions: Float32Array,
+ *                atomMask: Float32Array, covered: number, atoms: number}>} slots
+ * @returns {object} one slot of the same shape
+ */
+export function mergeTemplateSlots(slots) {
+  if (slots.length === 0) throw new Error("no template slots to merge");
+  if (slots.length === 1) return slots[0];
+  const tokens = slots[0].aatype.length;
+  const merged = {
+    aatype: new Int32Array(tokens).fill(GAP_AATYPE),
+    atomPositions: new Float32Array(tokens * NUM_DENSE * 3),
+    atomMask: new Float32Array(tokens * NUM_DENSE),
+    covered: 0,
+    atoms: 0,
+  };
+  const taken = new Uint8Array(tokens);
+  for (const slot of slots) {
+    if (slot.aatype.length !== tokens) {
+      throw new Error(`template slots disagree on token count: ${slot.aatype.length}`
+        + ` against ${tokens}`);
+    }
+    for (let token = 0; token < tokens; token += 1) {
+      // A token this slot does not cover contributes nothing - and "covers" is
+      // the ATOM MASK and not the aatype, because a residue whose atoms were
+      // all dropped is uncovered however it is typed.
+      let any = false;
+      for (let slotIndex = 0; slotIndex < NUM_DENSE; slotIndex += 1) {
+        if (slot.atomMask[token * NUM_DENSE + slotIndex] > 0) { any = true; break; }
+      }
+      if (!any) continue;
+      if (taken[token]) throw new Error(`two template slots both cover token ${token}`);
+      taken[token] = 1;
+      merged.aatype[token] = slot.aatype[token];
+      for (let slotIndex = 0; slotIndex < NUM_DENSE; slotIndex += 1) {
+        const at = token * NUM_DENSE + slotIndex;
+        merged.atomMask[at] = slot.atomMask[at];
+        for (let axis = 0; axis < 3; axis += 1) {
+          merged.atomPositions[at * 3 + axis] = slot.atomPositions[at * 3 + axis];
+        }
+      }
+      merged.covered += 1;
+      merged.atoms += slot.atomMask.slice(token * NUM_DENSE, (token + 1) * NUM_DENSE)
+        .reduce((sum, v) => sum + (v > 0 ? 1 : 0), 0);
+    }
+  }
+  return merged;
+}

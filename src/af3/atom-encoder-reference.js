@@ -227,12 +227,23 @@ export function crossAttentionBlock(queriesAct, state, shape, weights) {
 
   // ...the transition reads the POST-attention activation, threaded rather than
   // parallel. (chai-1 reads the block input for both branches instead.)
+  //
+  // 🔴 AND rosettafold3 IS PARALLEL TOO: its
+  // `no_residual_connection_between_attention_and_transition` hands the
+  // transition the PRE-attention activation and adds both through ONE residual.
+  // The two are not a reordering - the transition sees a different tensor - and
+  // it is worth the atom encoder's whole skip connection.
+  if (weights.diffusionNoResidual === undefined) {
+    throw new Error("an atom block carries no diffusionNoResidual: AF3 adds the "
+      + "attention and the transition through two residuals, rosettafold3 one");
+  }
   const afterAttention = new Float32Array(queriesAct.length);
   for (let index = 0; index < queriesAct.length; index += 1) {
     afterAttention[index] = queriesAct[index] + attention[index];
   }
 
-  const normalised = adaptiveLayerNorm(afterAttention, queriesCond, queryRows,
+  const transitionInput = weights.diffusionNoResidual ? queriesAct : afterAttention;
+  const normalised = adaptiveLayerNorm(transitionInput, queriesCond, queryRows,
                                        channels, weights, "ffw");
   const intermediate = channels * 2;
   const wide = linear(normalised, queryRows, channels, intermediate * 2,
@@ -559,7 +570,25 @@ export function atomCrossAttentionEncoder(input, weights, onStage) {
   const shape = { subsets, queries, keys, channels, heads,
                   dimension: weights.dimension };
   let act = queriesAct;
+  // 🔴 intellifold2 AND chai1 PAD THE FLAT ATOM AXIS INSIDE EVERY ATTENTION
+  // CALL, so a block starts from a freshly zeroed padding rather than from
+  // whatever the previous block's residual left there. See the flag's note in
+  // src/af3/dialect.js; the mask below is the same one this function already
+  // applies AFTER the stack.
+  const maskPerBlock = weights.blocks[0]?.maskAtomActPerBlock;
+  if (maskPerBlock === undefined) {
+    throw new Error("weights.blocks[].maskAtomActPerBlock has no default: AF3 "
+      + "pads the flat atom axis once, intellifold2 and chai1 per block");
+  }
+  const zeroPadding = (rows) => {
+    for (let index = 0; index < queryRows; index += 1) {
+      if (queriesMask[index] !== 0) continue;
+      for (let c = 0; c < channels; c += 1) rows[index * channels + c] = 0;
+    }
+    return rows;
+  };
   for (let block = 0; block < weights.blocks.length; block += 1) {
+    if (maskPerBlock) act = zeroPadding(Float32Array.from(act));
     act = crossAttentionBlock(act, {
       queriesToKeys: input.queriesToKeys, queriesMask, keysMask,
       queriesCond, keysCond, pairLogits: pairLogits[block],

@@ -1,4 +1,11 @@
 import { storageArray, storedElement, storedPair } from "../runtime/storage.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
+// 🔴 ONE COPY, IN THE LOWER MODULE. This file and src/triangle/shaders.js each
+// stage the same eight-row LayerNorm, and both come to EXACTLY 16,960 bytes at
+// 512 channels - so fixing one left the error byte-for-byte identical and read
+// as no fix at all. af3 depends on triangle and not the other way round, so the
+// helper lives there.
+import { tileThatFits } from "../triangle/shaders.js";
 /**
  * AF3's triangle ("grid") self-attention on the GPU.
  *
@@ -78,6 +85,8 @@ export const PACKED_PROJECT_ROWS = 4;
  */
 export const PROJECT_OUT_ROWS = 8;
 
+
+
 /**
  * 🔴 THE ATTENTION IS CUBIC IN N AND EVERYTHING AROUND IT IS QUADRATIC, so
  * which kernel is worth attacking depends on the protein. At 59 tokens
@@ -104,10 +113,17 @@ export const PROJECT_OUT_ROWS = 8;
  * replaces are still what the checkpoint calls them, and packing is where they
  * meet.
  */
-const ORDER = [
+export const GRID_ORDER = [
   "actNormScale", "actNormOffset", "pairBiasProjection",
   "qkvgProjection", "outputProjection",
 ];
+
+// 🔴 RoseTTAFold3 ONLY. Its `gating_query` and `output_projection` are
+// nn.Linear where every other checkpoint's are bias-free, and the GATE's bias
+// initialises to 1.0 against a zero-initialised weight, so the gate is
+// bias-dominated. A bundle without them packs nothing extra and generates the
+// WGSL it always did.
+export const OPTIONAL_GRID = ["gatingQueryBias", "outputProjectionBias"];
 
 /**
  * How many keys the attention stages in workgroup memory at once.
@@ -144,7 +160,7 @@ export function attendKeyChunk(dimension) {
 }
 
 /** The four, in the vec4 lane order the shader reads them in. */
-const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
+export const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
 
 /**
  * 🔴 q, k AND THE GATE ARE TRANSPOSED INTO v'S LAYOUT WHEN THEY ARE PACKED, and
@@ -159,7 +175,7 @@ const QKVG = ["qProjection", "kProjection", "vProjection", "gatingQuery"];
  * is the AF2 habit of packing weights in the layout the kernel wants rather
  * than the layout the checkpoint happens to use.
  */
-const TRANSPOSED = new Set(["qProjection", "kProjection", "gatingQuery"]);
+export const TRANSPOSED = new Set(["qProjection", "kProjection", "gatingQuery"]);
 
 function transposeOutChannels(values, channels, width) {
   const out = new Float32Array(values.length);
@@ -174,16 +190,9 @@ export function packGridAttentionWeights(weights, shape = undefined) {
   const sizeOf = (name) => name === "qkvgProjection"
     ? QKVG.reduce((total, part) => total + weights[part].length, 0)
     : weights[name].length;
-  for (const name of [...ORDER.filter((n) => n !== "qkvgProjection"), ...QKVG]) {
+  for (const name of [...GRID_ORDER.filter((n) => n !== "qkvgProjection"), ...QKVG]) {
     if (weights[name] === undefined) throw new Error(`grid attention weights missing ${name}`);
   }
-  const offsets = {};
-  let total = 0;
-  for (const name of ORDER) {
-    offsets[name] = total;
-    total += sizeOf(name);
-  }
-  const data = new Float32Array(total);
   const laid = (name) => {
     const values = weights[name];
     const channels = values.length / width;
@@ -191,19 +200,28 @@ export function packGridAttentionWeights(weights, shape = undefined) {
       ? transposeOutChannels(values, channels, width)
       : values;
   };
-  for (const name of ORDER) {
-    if (name !== "qkvgProjection") { data.set(laid(name), offsets[name]); continue; }
-    // ...(channels, out) for each, interleaved into (channels, out, 4).
-    const parts = QKVG.map(laid);
-    const base = offsets[name];
-    for (let lane = 0; lane < 4; lane += 1) {
-      const values = parts[lane];
-      for (let index = 0; index < values.length; index += 1) {
-        data[base + index * 4 + lane] = values[index];
+  // 🔴 ONE LIST FOR THE OFFSETS AND FOR THE BYTES, and `packNamedWeights` is
+  // what makes that structural: reserving an offset the write loop never fills
+  // points the shader at zeros, and the result is bit-identical to having no
+  // term at all - which is how the outer product mean's version of this hid for
+  // an hour. This pack was one optional tensor away from the same thing.
+  return packNamedWeights(weights, {
+    label: "grid attention weights", order: GRID_ORDER, optional: OPTIONAL_GRID, sizeOf,
+    // `qkvgProjection` is four tensors in one region; the loop above already
+    // checked the four, and `write` composes them.
+    composed: new Set(["qkvgProjection"]),
+    write: (data, name, offset) => {
+      if (name !== "qkvgProjection") { data.set(laid(name), offset); return; }
+      // ...(channels, out) for each, interleaved into (channels, out, 4).
+      const parts = QKVG.map(laid);
+      for (let lane = 0; lane < 4; lane += 1) {
+        const values = parts[lane];
+        for (let index = 0; index < values.length; index += 1) {
+          data[offset + index * 4 + lane] = values[index];
+        }
       }
-    }
-  }
-  return { data, offsets };
+    },
+  });
 }
 
 /**
@@ -295,6 +313,8 @@ const W_BIAS: u32 = ${offsets.pairBiasProjection}u;
 // ...as a vec4 index, which is why the packed offset must be a multiple of 4.
 const W_QKVG: u32 = ${offsets.qkvgProjection / 4}u;
 const W_OUT: u32 = ${offsets.outputProjection}u;
+${offsets.gatingQueryBias === undefined ? "" : `const W_GATE_BIAS: u32 = ${offsets.gatingQueryBias}u;`}
+${offsets.outputProjectionBias === undefined ? "" : `const W_OUT_BIAS: u32 = ${offsets.outputProjectionBias}u;`}
 
 fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
 `;
@@ -311,7 +331,13 @@ fn logistic(value: f32) -> f32 { return 1.0 / (1.0 + exp(-value)); }
   // address, and the reduction then runs over the staged copy. The same change
   // took the triangle stack's input normalisation down by 36%; see the note in
   // src/triangle/shaders.js.
-  const NORMALIZE_ROWS = 8;
+  // 🔴 PRICED AGAINST THE DEVICE, NOT TYPED IN. See `tileThatFits`: at 512
+  // channels the eight-row tile is 16,960 bytes and WebGPU guarantees 16,384.
+  // The two reductions and the two per-row scalars are counted with it, because
+  // 16,384 of activation would fit on its own and the kernel does not.
+  const NORMALIZE_ROWS = tileThatFits([8, 4, 2, 1],
+    (rows) => rows * channels * 4 + 64 * 4 * 2 + rows * 4 * 2,
+    shape.maxComputeWorkgroupStorageSize ?? 49152);
   const LANES_PER_ROW = 64 / NORMALIZE_ROWS;
   const normalize = `${common}
 const NORMALIZE_ROWS: u32 = ${NORMALIZE_ROWS}u;
@@ -512,6 +538,18 @@ const WG: u32 = ${projectWorkgroup}u;
 // and the instruction count does not govern it - the one global weight read a
 // channel does. Do not transpose the activation tile.
 var<workgroup> act: array<f32, ${channels} * ${ROWS}>;
+${offsets.gatingQueryBias === undefined ? "" : `
+// 🔴 ONE SCALAR OUT OF A vec4-BOUND ARRAY, WITHOUT A DYNAMIC SUBSCRIPT. This
+// kernel binds the weights as vec4 - it is the only one that does - so
+// rosettafold3's gate bias, a flat run of f32, has to be addressed through the
+// vector. \`w[m]\` with a computed m puts the pair in addressable memory and
+// costs 4x in a hot loop (see CLAUDE.md); this is read once per output channel,
+// outside the channel loop, and selects instead.
+fn gate_bias(at: u32) -> f32 {
+  let w = weights[at >> 2u];
+  let m = at & 3u;
+  return select(select(w.x, w.y, m == 1u), select(w.z, w.w, m == 3u), m >= 2u);
+}`}
 
 @compute @workgroup_size(${projectWorkgroup})
 fn main(@builtin(workgroup_id) group: vec3<u32>,
@@ -549,6 +587,10 @@ ${overRows((r) => `    let a${r} = act[${r}u * CHANNELS + c];
     lo${r} += a${r} * wlo;
     hi${r} += a${r} * whi;`)}
   }
+${offsets.gatingQueryBias === undefined ? "" : `  // rosettafold3's gate bias, on the GATE lane of both halves of this
+  // lane's word. See the note on OPTIONAL_GRID.
+${overRows((r) => `  lo${r}.w += gate_bias(W_GATE_BIAS + c0);
+  hi${r}.w += gate_bias(W_GATE_BIAS + c0 + 1u);`)}`}
 
 ${overRows((r) => {
     const emit = ([name, lane]) => (store4[name] === "f16"
@@ -580,7 +622,9 @@ ${overRows((r) => `  if (first + ${r}u < PAIRS) {
     q[index${r}] = acc${r}.x;
     k[index${r}] = acc${r}.y;
     v[index${r}] = acc${r}.z;
-    gate[index${r}] = acc${r}.w;
+    // rosettafold3's gate bias, on the GATE lane alone. See the note on
+    // OPTIONAL_GRID; the logistic is applied downstream in project_out.
+    gate[index${r}] = acc${r}.w${offsets.gatingQueryBias === undefined ? "" : " + gate_bias(W_GATE_BIAS + out)"};
   }`)}
   }`}
 }`;
@@ -820,6 +864,10 @@ ${overOutRows((r) => `    var sum${r} = 0.0;`)}
       let weight = weights[W_OUT + w * CHANNELS + c];
 ${overOutRows((r) => `      sum${r} += gated[${r}u * ${width}u + w] * weight;`)}
     }
+${offsets.outputProjectionBias === undefined ? "" : `    // rosettafold3's output-projection bias. Added to the SUM rather than to
+    // the destination, so a residual write adds it once and not once per
+    // accumulation. See the note on OPTIONAL_GRID.
+${overOutRows((r) => `    sum${r} += weights[W_OUT_BIAS + c];`)}`}
 ${overOutRows((r) => `    if (first + ${r}u < PAIRS) {
       let row${r} = first + ${r}u;
       let destination${r} = ${transpose ? `(row${r} % N) * N + row${r} / N` : `row${r}`};

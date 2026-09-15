@@ -32,6 +32,7 @@
  * key's own.
  */
 import { GpuBufferAllocator } from "../runtime/allocator.js";
+import { packNamedWeights } from "../runtime/weight-pack.js";
 import { deviceTuning } from "../runtime/device-profile.js";
 import { pipelineCacheForDevice } from "../runtime/pipeline-cache.js";
 import { residentWeightBuffer } from "../runtime/resident.js";
@@ -39,7 +40,7 @@ import { noteAllocation, noteDestroy } from "../runtime/device-memory.js";
 import { deviceSaturationWorkgroups } from "../runtime/occupancy.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 import { shapedKnob } from "../runtime/device-profile.js";
-import { SOURCES } from "../runtime/weight-sources.js";
+import { SOURCES, carriesTensor } from "../runtime/weight-sources.js";
 
 /**
  * Which labels in a caller's `staticCache` already hold their contents.
@@ -72,16 +73,23 @@ const BLOCK_ORDER = [
  * together, and a bundle without the weight compiles the kernel that never
  * reads it.
  */
-export const blockOrderFor = (upGate) =>
-  (upGate ? [...BLOCK_ORDER, "ffwAToB"] : BLOCK_ORDER);
 /**
- * 🔴 THE THUNK, NOT THE VALUE - see `txHasUpGate`. A bound block's fields
- * decode when read, so asking the VALUE whether it exists unpacks it.
+ * 🔴 rosettafold3's kq_norm, THE SAME SHAPE OF VARIANT. Four more tensors and a
+ * pass; no other checkpoint carries them. See the token transformer's
+ * `TX_KQ_NORM`, which is this list under different names for the same reason.
  */
-export const blockHasUpGate = (block) => {
-  const sources = block?.[SOURCES];
-  return sources === undefined ? block?.ffwAToB != null : sources.ffwAToB != null;
-};
+export const ATOM_KQ_NORM = [
+  "queryLayerNormScale", "queryLayerNormOffset",
+  "keyLayerNormScale", "keyLayerNormOffset",
+];
+export const blockHasKqNorm = (block) => carriesTensor(block, "queryLayerNormScale");
+export const blockOrderFor = (upGate, kqNorm = false) => [
+  ...BLOCK_ORDER,
+  ...(upGate ? ["ffwAToB"] : []),
+  ...(kqNorm ? ATOM_KQ_NORM : []),
+];
+/** 🔴 THE THUNK, NOT THE VALUE - `carriesTensor` is where that rule lives. */
+export const blockHasUpGate = (block) => carriesTensor(block, "ffwAToB");
 
 
 /**
@@ -108,17 +116,13 @@ export function packCached(key, label, pack) {
 }
 
 export function packAtomBlockWeights(block) {
-  const order = blockOrderFor(blockHasUpGate(block));
-  const offsets = {};
-  let total = 0;
-  for (const name of order) {
-    if (block[name] === undefined) throw new Error(`atom block missing ${name}`);
-    offsets[name] = total;
-    total += block[name].length;
-  }
-  const data = new Float32Array(total);
-  for (const name of order) data.set(block[name], offsets[name]);
-  return { data, offsets };
+  // The order is COMPUTED from what the bundle carries - see `blockOrderFor`
+  // and the note on asking the SOURCES map rather than the value - so every
+  // name in it is required by construction and there is no optional list.
+  return packNamedWeights(block, {
+    label: "atom block",
+    order: blockOrderFor(blockHasUpGate(block), blockHasKqNorm(block)),
+  });
 }
 
 const PAIR_ORDER = [
@@ -133,6 +137,9 @@ const PAIR_ORDER = [
   "lnormTrunkPairCondScale", "lnormTrunkPairCondOffset", "embedTrunkPairCond",
   "atomPositionsToFeatures", "projectAtomFeaturesForAggr",
 ];
+
+/** rosettafold3's chirality projection, which only its bundle carries. */
+const OPTIONAL_PAIR = ["atomChiralToFeatures"];
 
 /** One Float32Array from several, in order. */
 function concatenate(parts) {
@@ -154,7 +161,13 @@ export function packAtomPairWeights(weights) {
     : weights;
   const offsets = {};
   let total = 0;
-  for (const name of PAIR_ORDER) {
+  // 🔴 ONE LIST FOR THE OFFSETS AND FOR THE BYTES, which the outer product
+  // mean's version of this got wrong tonight - reserving over one list and
+  // writing over another points the shader at zeros and is bit-identical to
+  // having no term.
+  const packing = [...PAIR_ORDER,
+                   ...OPTIONAL_PAIR.filter((name) => source[name] != null)];
+  for (const name of packing) {
     // The LayerNorm offsets are the one entry a bundle may legitimately lack;
     // everything else missing is a loader bug and must still throw.
     if (source[name] == null && name.endsWith("CondOffset")) {
@@ -166,7 +179,7 @@ export function packAtomPairWeights(weights) {
     total += source[name].length;
   }
   const data = new Float32Array(total);
-  for (const name of PAIR_ORDER) data.set(source[name], offsets[name]);
+  for (const name of packing) data.set(source[name], offsets[name]);
   return { data, offsets };
 }
 
@@ -382,6 +395,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 @group(0) @binding(3) var<storage, read> gathers: array<i32>;
 @group(0) @binding(4) var<storage, read> weights: array<f32>;
 @group(0) @binding(5) var<storage, read_write> act: array<f32>;
+${shape.chiralGradients !== true ? "" : `// ...and the chirality gradient, in the SAME per-token-atom indexing the
+// positions use, so one gather serves both.
+@group(0) @binding(6) var<storage, read> chiral_grads: array<f32>;`}
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -394,13 +410,102 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     gathered[1] = positions[source + 1u];
     gathered[2] = positions[source + 2u];
   }
+${shape.chiralGradients !== true ? "" : `  // 🔴 rosettafold3's CHIRALITY TERM, gathered exactly as the position is,
+  // because the gradient buffer shares the position buffer's indexing: both
+  // are per token-atom. It is the ONLY reflection-asymmetric signal the network
+  // has - see src/af3/chiral-gradient.js.
+  var chiral = array<f32, 3>(0.0, 0.0, 0.0);
+  if (gathers[G_TA_MASK + row] != 0) {
+    // ...\`at\`, because \`from\` is a WGSL RESERVED KEYWORD and the parser says
+    // so at a line number in generated source, which is the least helpful place
+    // to read an error. Third time tonight a WGSL lexical rule bit a name or a
+    // comment that read perfectly as JavaScript.
+    let at = u32(max(gathers[G_TA_IDX + row], 0)) * 3u;
+    chiral[0] = chiral_grads[at];
+    chiral[1] = chiral_grads[at + 1u];
+    chiral[2] = chiral_grads[at + 2u];
+  }`}
   for (var c = 0u; c < C; c += 1u) {
     var value = 0.0;
     for (var axis = 0u; axis < 3u; axis += 1u) {
       value += gathered[axis] * weights[P_atomPositionsToFeatures + axis * C + c];
+${shape.chiralGradients !== true ? "" : `      value += chiral[axis] * weights[P_atomChiralToFeatures + axis * C + c];`}
     }
     act[row * C + c] = queries_cond[row * C + c] + value * queries_mask[row];
   }
+}`;
+
+  // 🔴 rosettafold3's CHIRALITY GRADIENT, ONE THREAD PER ATOM AND NO ATOMICS.
+  // The natural shape is a thread per CENTRE, and it needs an atomic add
+  // because four centres share an atom - WGSL has no f32 atomic. Inverting the
+  // index on the host instead gives each atom the (centre, corner) pairs it
+  // appears in, so a thread owns its three components outright. The index does
+  // not depend on the coordinates, so it is built once per fold and this kernel
+  // runs once per sampler step.
+  //
+  // 🔴 AND IT IS A CENTRAL DIFFERENCE, DELIBERATELY. The analytic derivative of
+  // an atan2 of two cross products is where rf3 spends 150 lines and the
+  // reference spends a `jax.grad`; a centre costs about 1,000 flops this way
+  // and 6MRR's 213 of them cost 200k, against a denoiser step measured in tens
+  // of millions. See src/af3/chiral-gradient.js, whose CPU twin this is.
+  const chiralGrad = shape.chiralGradients !== true ? null : `${common}
+const CHIRAL_STEP: f32 = 1.0e-4;
+@group(0) @binding(0) var<storage, read> positions: array<f32>;
+@group(0) @binding(1) var<storage, read> centers: array<i32>;
+@group(0) @binding(2) var<storage, read> angles: array<f32>;
+@group(0) @binding(3) var<storage, read> entry_offsets: array<u32>;
+@group(0) @binding(4) var<storage, read> entries: array<u32>;
+@group(0) @binding(5) var<storage, read_write> gradients: array<f32>;
+
+fn point_of(index: i32) -> vec3<f32> {
+  let at = u32(max(index, 0)) * 3u;
+  return vec3<f32>(positions[at], positions[at + 1u], positions[at + 2u]);
+}
+
+// The improper dihedral, spelled exactly as the reference spells it.
+fn improper(a: vec3<f32>, b: vec3<f32>, c: vec3<f32>, d: vec3<f32>) -> f32 {
+  let eps = 1.0e-6;
+  let b0 = a - b;
+  let b1 = c - b;
+  let b2 = d - c;
+  let b1n = b1 / (length(b1) + eps);
+  let v = b0 - dot(b0, b1n) * b1n;
+  let w = b2 - dot(b2, b1n) * b1n;
+  // eps on BOTH arguments, as the reference has it - it moves the angle by
+  // about 1e-6 and the ideal it is differenced against is not moved with it.
+  return atan2(dot(cross(b1n, v), w) + eps, dot(v, w) + eps);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let atom = id.x + id.y * GRID_WIDTH * 64u;
+  if (atom >= arrayLength(&entry_offsets) - 1u) { return; }
+  var total = vec3<f32>(0.0);
+  for (var e = entry_offsets[atom]; e < entry_offsets[atom + 1u]; e = e + 1u) {
+    let packed = entries[e];
+    let centre = packed >> 2u;
+    let corner = packed & 3u;
+    let ideal = angles[centre];
+    if (ideal == 0.0) { continue; }
+    var p = array<vec3<f32>, 4>(
+      point_of(centers[centre * 4u]), point_of(centers[centre * 4u + 1u]),
+      point_of(centers[centre * 4u + 2u]), point_of(centers[centre * 4u + 3u]));
+    for (var axis = 0u; axis < 3u; axis = axis + 1u) {
+      let keep = p[corner][axis];
+      p[corner][axis] = keep + CHIRAL_STEP;
+      let up = improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][axis] = keep - CHIRAL_STEP;
+      let down = improper(p[0], p[1], p[2], p[3]) - ideal;
+      p[corner][axis] = keep;
+      let derivative = (up * up - down * down) / (2.0 * CHIRAL_STEP);
+      // A non-finite difference is a degenerate centre and contributes nothing,
+      // which is the reference's own nan_to_num.
+      if (derivative == derivative) { total[axis] = total[axis] + derivative; }
+    }
+  }
+  gradients[atom * 3u] = total.x;
+  gradients[atom * 3u + 1u] = total.y;
+  gradients[atom * 3u + 2u] = total.z;
 }`;
 
   // The atom pair representation: row + column, the reference-conformer offset
@@ -534,7 +639,7 @@ ${perBlockPair
 }`;
 
   return { trunkSingle, trunkPair, buildQueries, buildKeys, buildAct, buildPair, pairLogits,
-           ...createAtomBlockShaders(common, shape) };
+           chiralGrad, ...createAtomBlockShaders(common, shape) };
 }
 
 /** The three cross-attention blocks. */
@@ -1078,6 +1183,9 @@ ${keyMasked
   // blocks of a decoder call were 10.5 ms of 24. The rows share every weight
   // and share nothing else, so a tile of them is exactly the vector: one read,
   // one vector multiply-add, four rows.
+  // rosettafold3 reads the PRE-attention activation here; everyone else the
+  // post-attention one. One name, three read sites, so they cannot disagree.
+  const transitionInput = shape.noResidual === true ? "before" : "after";
   const output = `${common}
 const ROW_TILE: u32 = ${outputRowTile}u;
 @group(0) @binding(0) var<storage, read> gathered: array<f32>;
@@ -1088,6 +1196,13 @@ const ROW_TILE: u32 = ${outputRowTile}u;
 
 var<workgroup> gated: array<${rowVector}, ${rowGroups * channels}>;
 var<workgroup> after: array<${rowVector}, ${rowGroups * channels}>;
+${shape.noResidual !== true ? "" : `// 🔴 rosettafold3's no_residual: the PRE-attention activation, staged in the
+// tile's own layout so the transition can read it. AF3's block is
+// \`act += attn\` then \`act += transition(act)\`; rf3's is
+// \`act + attn + transition(act)\`, one residual and a transition that never
+// sees the attention. It is the same kernel with three reads moved, and it
+// costs \${rowGroups * channels} more floats of workgroup memory.
+var<workgroup> before: array<${rowVector}, ${rowGroups * channels}>;`}
 // 🔴 THE RAW CONDITIONING, STAGED ONCE, AND IT IS NOT cond_norm. It is read
 // in FIVE places - the two adaptive-zero projections, the two passes of its own
 // LayerNorm, and the normalisation itself - and it was read from GLOBAL memory
@@ -1148,22 +1263,25 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     ${overRows((t) => `{
       let row = min(base_row + ${t}u, QUERY_ROWS - 1u);
+${shape.noResidual !== true ? "" : `      before[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c];`}
       after[${rowGroup(t)}u * C + c]${rowLane(t)} = act[row * C + c]
         + projected${rowGroup(t)}${rowLane(t)} * logistic(zero${rowGroup(t)}${rowLane(t)});
     }`)}
   }
   workgroupBarrier();
 
-  // The transition reads the POST-attention activation.
+  // The transition reads the POST-attention activation - except under
+  // rosettafold3, where it reads the PRE-attention one and the two share a
+  // single residual. See the staged copy above.
   ${overRowGroups((g) => `var total${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
-    ${overRowGroups((g) => `total${g} += after[${g}u * C + c];`)}
+    ${overRowGroups((g) => `total${g} += ${transitionInput}[${g}u * C + c];`)}
   }
   ${overRowGroups((g) => `let mean${g} = total${g} / ${rowVector}(f32(C));`)}
   ${overRowGroups((g) => `var variance${g} = ${rowVector}(0.0);`)}
   for (var c = 0u; c < C; c += 1u) {
     ${overRowGroups((g) => `{
-      let d = after[${g}u * C + c] - mean${g};
+      let d = ${transitionInput}[${g}u * C + c] - mean${g};
       variance${g} += d * d;
     }`)}
   }
@@ -1205,7 +1323,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
     }
     ${overRowGroups((g) => `x[${g}u * C + c] =
       ${rowVector}(1.0) / (${rowVector}(1.0) + exp(-scale_value${g}))
-      * ((after[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
+      * ((${transitionInput}[${g}u * C + c] - mean${g}) * inverse${g}) + shift${g};`)}
   }
   workgroupBarrier();
 
@@ -1317,8 +1435,72 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }`;
 
+  // 🔴 rosettafold3's kq_norm IN THE ATOM STACKS. Same LayerNorm as the token
+  // transformer's - flattened head axis, two-pass, scale and offset, after the
+  // projection and before the key_dim scaling - and both tensors in ONE
+  // dispatch, because q and k have DIFFERENT row counts here (QUERY_ROWS
+  // against KEY_ROWS, the gathered window being wider than the query block).
+  // The row space is their sum and the first QUERY_ROWS rows are q.
+  //
+  // 🔴 AND IT NORMALISES `k` AFTER `expand-keys`, not `kAtoms` before it. The
+  // gather duplicates an atom's k into every window that reaches it, so the two
+  // are the same arithmetic on real atoms - and NOT on the padded slots the
+  // gather zeroes, which the reference normalises along with the rest because
+  // its `x_k` is already in keys layout.
+  const kqNorm = shape.kqNorm !== true ? null : `${common}
+@group(0) @binding(0) var<storage, read_write> q: array<f32>;
+@group(0) @binding(1) var<storage, read_write> k: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: array<f32>;
+
+var<workgroup> partial_sum: array<f32, 64>;
+var<workgroup> partial_squares: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) group: vec3<u32>,
+        @builtin(local_invocation_id) local_id: vec3<u32>) {
+  let slot = group.x + group.y * GRID_WIDTH;
+  if (slot >= QUERY_ROWS + KEY_ROWS) { return; }
+  let local = local_id.x;
+  let is_query = slot < QUERY_ROWS;
+  let row = select(slot - QUERY_ROWS, slot, is_query);
+  let base = row * WIDTH;
+  let w_scale = select(W_keyLayerNormScale, W_queryLayerNormScale, is_query);
+  let w_offset = select(W_keyLayerNormOffset, W_queryLayerNormOffset, is_query);
+
+  var total = 0.0;
+  for (var w = local; w < WIDTH; w += 64u) {
+    total += select(k[base + w], q[base + w], is_query);
+  }
+  partial_sum[local] = total;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { partial_sum[local] += partial_sum[local + stride]; }
+    workgroupBarrier();
+  }
+  let mean = partial_sum[0] / f32(WIDTH);
+  workgroupBarrier();
+  var squares = 0.0;
+  for (var w = local; w < WIDTH; w += 64u) {
+    let d = select(k[base + w], q[base + w], is_query) - mean;
+    squares += d * d;
+  }
+  partial_squares[local] = squares;
+  workgroupBarrier();
+  for (var stride = 32u; stride > 0u; stride >>= 1u) {
+    if (local < stride) { partial_squares[local] += partial_squares[local + stride]; }
+    workgroupBarrier();
+  }
+  let inverse_std = inverseSqrt(partial_squares[0] / f32(WIDTH) + EPSILON);
+  workgroupBarrier();
+  for (var w = local; w < WIDTH; w += 64u) {
+    let value = (select(k[base + w], q[base + w], is_query) - mean) * inverse_std
+      * weights[w_scale + w] + weights[w_offset + w];
+    if (is_query) { q[base + w] = value; } else { k[base + w] = value; }
+  }
+}`;
+
   return { project, projectKeys, projectKeysAtoms, normaliseQueries, expandKeys,
-           attendFor, output, maskAct, aggregate, outputRowTile };
+           attendFor, output, maskAct, aggregate, kqNorm, outputRowTile };
 }
 
 export class Af3AtomEncoderGpu {
@@ -1389,13 +1571,54 @@ export class Af3AtomEncoderGpu {
     if (weights.blocks.some((b) => b.chainedAtomLayerNorm !== chainedNorm)) {
       throw new Error("this atom stack's blocks disagree about chainedAtomLayerNorm");
     }
+    // 🔴 IntelliFold-2 AND chai-1 START EVERY BLOCK FROM A FRESHLY ZEROED
+    // PADDING. It reuses the mask-act kernel that already runs once after the
+    // stack, so the arithmetic is the same one and only its POSITION differs -
+    // and under every other dialect the extra dispatches do not exist at all.
+    const maskPerBlock = weights.blocks[0]?.maskAtomActPerBlock;
+    if (maskPerBlock === undefined) {
+      throw new Error("atom blocks carry no maskAtomActPerBlock: AF3 pads the "
+        + "flat atom axis once, intellifold2 and chai1 inside every block");
+    }
+    if (weights.blocks.some((b) => b.maskAtomActPerBlock !== maskPerBlock)) {
+      throw new Error("this atom stack's blocks disagree about maskAtomActPerBlock");
+    }
     // boltz2's transition up-gate, read off the WEIGHTS; see `blockOrderFor`.
     const upGate = blockHasUpGate(weights.blocks[0]);
     if (weights.blocks.some((b) => blockHasUpGate(b) !== upGate)) {
       throw new Error("this atom stack's blocks disagree about ffwAToB");
     }
+    const kqNorm = blockHasKqNorm(weights.blocks[0]);
+    if (weights.blocks.some((b) => blockHasKqNorm(b) !== kqNorm)) {
+      throw new Error("this atom stack's blocks disagree about kq_norm");
+    }
+    // 🔴 rosettafold3's CHIRALITY TERM, AND THE DIFFUSION ENCODER'S ALONE. The
+    // trunk's input embedder hands this class no coordinates, so there is
+    // nothing to take a gradient of and the weight is not in that scope either
+    // - `atomChiralToFeatures` is null unless BOTH the bundle carries it and
+    // the caller supplied positions.
+    // 🔴 AND A BATCH WITH NO CENTRES IS NOT A BATCH WITH A ZERO-LENGTH BUFFER.
+    // A ligand-only fold of GLYCEROL has no stereocentre at all, so `centers`
+    // is empty and `allocator.upload` refuses it outright - "invalid allocation
+    // size 0 for atom.chiral.centers", which killed rf3 in
+    // probe-ligand-flow.js while af3 and if2 folded. The term contributes
+    // exactly nothing with no centres, so the kernel, its five buffers and the
+    // extra binding on build-act are not built. This is not a fallback hiding
+    // an error: an empty sum is zero, and the arm that WOULD hide an error -
+    // a bundle carrying the weight while the featuriser hands over no
+    // `chirals` at all - still leaves the term off and is the caller's bug.
+    const chiralWanted = weights.atomChiralToFeatures != null
+      && input.tokenAtomsAct !== undefined && input.chirals !== undefined
+      && input.chirals.count > 0;
     const shape = {
+      chiralGradients: chiralWanted,
       tokens, dense, subsets, queries, keys, channels, pairChannels, heads, dimension,
+      // rosettafold3's q/k LayerNorm; see the kernel. Off the WEIGHTS, so it
+      // decides whether the kernel is generated at all.
+      kqNorm,
+      // ...and its block wiring, which is a DIALECT question rather than a
+      // weight one - there is no tensor whose presence says so.
+      noResidual: input.dialect?.diffusionNoResidual === true,
       perTokenChannels, trunkSingleChannels: weights.trunkSingleChannels,
       trunkPairChannels: weights.trunkPairChannels, blocks: weights.blocks.length,
       perBlockPair, keyMaskedAtomAttention: keyMasked, upGate,
@@ -1406,7 +1629,14 @@ export class Af3AtomEncoderGpu {
     const base = `af3-atom:${tokens}:${dense}:${subsets}:${queries}:${keys}`
       + `:rt${shape.outputRowTile ?? "d"}`
       + `:${channels}:${pairChannels}:${heads}:${dimension}:${perTokenChannels}`
-      + `:${perBlockPair}:${chainedNorm}:${keyMasked}:${preTrunkQuery}:ug${upGate}`;
+      + `:${perBlockPair}:${chainedNorm}:${keyMasked}:${preTrunkQuery}:ug${upGate}`
+      // ...and rosettafold3's two, both of which shift the block's weight
+      // offsets and so appear as `const W_*` in EVERY source in this stack.
+      + `:kq${kqNorm}:mp${maskPerBlock}:nr${shape.noResidual}`
+      // ...and the chirality term, which adds a BINDING to build-act as well as
+      // a term, so a shared pipeline would fail its bind group rather than
+      // quietly compute the wrong thing.
+      + `:cg${shape.chiralGradients}`;
     const compiled = {};
     // 🔴 COMPILED CONCURRENTLY - see the note in pair-track-gpu.js.
     const compiling = [];
@@ -1518,6 +1748,34 @@ export class Af3AtomEncoderGpu {
       // 🔴 THE ONE INPUT THAT MOVES. Everything else this encoder reads is the
       // molecule or the trunk; the noisy coordinates are the step.
       const positions = up("atom.positions", input.tokenAtomsAct);
+      // 🔴 THE INVERTED INDEX IS BUILT ONCE, because it is a function of the
+      // TOPOLOGY and not of the coordinates - which is what lets the gradient
+      // kernel run one thread per atom with no atomic add. See `chiralGrad`.
+      const chiral = !chiralWanted ? undefined : (() => {
+        const { centers, angles } = input.chirals;
+        const atoms = tokens * dense;
+        const counts = new Uint32Array(atoms + 1);
+        for (let at = 0; at < centers.length; at += 1) counts[centers[at] + 1] += 1;
+        for (let at = 0; at < atoms; at += 1) counts[at + 1] += counts[at];
+        const offsets = Uint32Array.from(counts);
+        const entries = new Uint32Array(centers.length);
+        const cursor = Uint32Array.from(counts);
+        for (let centre = 0; centre < angles.length; centre += 1) {
+          for (let corner = 0; corner < 4; corner += 1) {
+            const atom = centers[centre * 4 + corner];
+            entries[cursor[atom]] = (centre << 2) | corner;
+            cursor[atom] += 1;
+          }
+        }
+        return {
+          atoms,
+          centers: up("atom.chiral.centers", Int32Array.from(centers)),
+          angles: up("atom.chiral.angles", Float32Array.from(angles)),
+          offsets: up("atom.chiral.offsets", offsets),
+          entries: up("atom.chiral.entries", entries),
+          gradients: keep(this.allocator.allocate("atom.chiral.grad", atoms * 3 * 4, storage)),
+        };
+      })();
       const refPos = persistentUpload("atom.ref-pos", () => floats(input.refPos));
       const refSpaceUid = persistentUpload("atom.ref-space", () => ints(input.refSpaceUid));
 
@@ -1749,12 +2007,29 @@ export class Af3AtomEncoderGpu {
             [conditioning, atomMask, gatherBuffer, trunkZero, queriesPre,
              queriesPreMask], qr[0], qr[1]);
       }
+      // 🔴 rosettafold3's CHIRALITY GRADIENT, RECOMPUTED EVERY STEP because it
+      // is a function of the noisy coordinates. The index it walks is not, so
+      // that is built once; see `chiralIndex`.
+      if (chiral !== undefined) {
+        const perAtom = lin(chiral.atoms);
+        run("chiral-grad", compiled.chiralGrad,
+            [positions, chiral.centers, chiral.angles, chiral.offsets,
+             chiral.entries, chiral.gradients], perAtom[0], perAtom[1]);
+      }
       run("build-act", compiled.buildAct,
           [preTrunkQuery ? queriesPre : queriesCond, queriesMask, positions,
-           gatherBuffer, pairWeights, act], qr[0], qr[1]);
+           gatherBuffer, pairWeights, act,
+           ...(chiral === undefined ? [] : [chiral.gradients])], qr[0], qr[1]);
 
+      const maskGroups = lin(queryRows * channels);
       for (let index = 0; index < weights.blocks.length; index += 1) {
         const w = blockBuffers[index];
+        // See maskPerBlock above: the padding is re-zeroed BEFORE the block's
+        // projections, which is where `pad_at_dim(..., value=0.)` sits.
+        if (maskPerBlock) {
+          run(`mask-act-${index}`, compiled.maskAct, [queriesMask, act],
+              maskGroups[0], maskGroups[1]);
+        }
         // ...one workgroup per TILE of query rows; see the note on `output`.
         const perOutput = spread(Math.ceil(queryRows / sources.outputRowTile));
         run(`project-${index}`, compiled.project,
@@ -1775,6 +2050,11 @@ export class Af3AtomEncoderGpu {
         const expand = lin(keyRows * width);
         run(`expand-keys-${index}`, compiled.expandKeys,
             [kAtoms, vAtoms, gatherBuffer, k, v], expand[0], expand[1]);
+        if (kqNorm) {
+          // One workgroup a row over q and k together; see the kernel.
+          const kqRows = spread(queryRows + keyRows);
+          run(`kq-norm-${index}`, compiled.kqNorm, [q, k, w], kqRows[0], kqRows[1]);
+        }
         // The per-block slice of the logits.
         const slots = spread(queryRows * heads);
         run(`attend-${index}`, compiled.attend[index],
@@ -1783,7 +2063,6 @@ export class Af3AtomEncoderGpu {
             [gathered, gate, queriesCond, w, act], perOutput[0], perOutput[1]);
       }
 
-      const maskGroups = lin(queryRows * channels);
       run("mask-act", compiled.maskAct, [queriesMask, act], maskGroups[0], maskGroups[1]);
       const aggregateGroups = lin(tokens * perTokenChannels);
       run("aggregate", compiled.aggregate,

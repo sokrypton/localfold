@@ -2,7 +2,7 @@
  * One AF3 fold, from a featurised batch to coordinates and a pLDDT.
  *
  *     const batch = featuriseProtein("GWSTELEK...");
- *     const result = await foldBatch(device, batch, weights, { steps: 200 });
+ *     const result = await foldBatch(device, batch, weights, { mode: "diffusion", steps: 25 });
  *
  *     embedder -> template -> 4 x MSA block -> 48 x pairformer -> distogram
  *     -> N-step diffusion sampler around the GPU denoiser
@@ -59,6 +59,7 @@ import { Af3DiffusionHeadGpu } from "./diffusion-head-webgpu.js";
  * keeps saying so.
  */
 import { ALPHAFOLD3 } from "./dialect.js";
+import { chiralCentres } from "./template-features.js";
 import { keepResidentAffordable } from "../runtime/device-memory.js";
 import { deviceDerivationsAllowed } from "../runtime/device-profile.js";
 
@@ -186,7 +187,7 @@ export function toPdb(batch, positions, plddt) {
       const slot = token * dense + atom;
       if (!batch.predDenseAtomMask[slot]) continue;
       if (ligandCode !== undefined && atom === 0) serialOfToken.set(token, serial);
-      const name = atomName(batch.refAtomNameChars, slot);
+      const name = atomName(batch.displayAtomNameChars ?? batch.refAtomNameChars, slot);
       const confidence = plddt ? plddt[slot] : 0;
       lines.push(
         (ligandCode === undefined ? "ATOM  " : "HETATM")
@@ -269,7 +270,7 @@ export function backboneGeometry(batch, positions) {
     for (let atom = 0; atom < dense; atom += 1) {
       const slot = token * dense + atom;
       if (!batch.predDenseAtomMask[slot]) continue;
-      atoms[atomName(batch.refAtomNameChars, slot)] = slot;
+      atoms[atomName(batch.displayAtomNameChars ?? batch.refAtomNameChars, slot)] = slot;
     }
     slotOf.push(atoms);
   }
@@ -412,7 +413,7 @@ export function normalFrom(seed) {
 /**
  * @param {object} batch from featuriseProtein or an AF3 dump
  * @param {{trunk, diffusion, confidence, atomReference, targetFeat}} weights
- * @param {{mode?: "flow"|"diffusion", steps?: number, recycles?: number,
+ * @param {{mode: "flow"|"ode"|"diffusion", steps?: number, recycles?: number,
  *          seed?: number, blocks?: number,
  *          schedule?: {sigmaData?: number, sigmaMin?: number, sigmaMax?: number,
  *                      rho?: number},
@@ -815,6 +816,13 @@ export async function foldBatch(device, batch, weights, options = {}) {
     queriesToTokenAtoms: batch.queriesToTokenAtoms,
     tokensToQueries: batch.tokensToQueries,
     tokensToKeys: batch.tokensToKeys,
+    // 🔴 rosettafold3's CHIRAL CENTRES. Built by the featuriser because they
+    // are a function of the sequence, and read every sampler step against that
+    // step's own coordinates - they are the only reflection-asymmetric signal
+    // the network has. `undefined` for every other model.
+    ...(weights.trunk.dialect.chiralCentres === true
+      ? { chirals: chiralCentres(batch.aatype, batch.predDenseAtomMask, batch.tokens) }
+      : {}),
   };
   // 🔴 THERE ARE NO STRUCTURES DURING THE TRUNK ANY MORE. Each recycle used to
   // be followed by a two-cycle flow against that pass's trunk - a real
@@ -923,6 +931,15 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // as `undefined` and both fall back to zeros. That is how the whole bond
       // feature came to be computed, shipped and never applied.
       bondMatrix: batch.bondMatrix,
+      // 🔴 ...AND ITS ORDERS, WHICH THIS LITERAL DID NOT NAME - the fourth time
+      // the trap in the comment above has been paid for. boltz2's z-init reads
+      // TWO planes, the contact flag and the bond ORDER, and it is the only
+      // family with `tokenBondsTypeEmbed`, so it was the only one that noticed:
+      // its glycerol came apart at bond rms 3.602 A while every other family
+      // was under 0.07. The featuriser did not build the orders either, so
+      // fixing that alone changed the fold by exactly nothing - the second
+      // plane was still arriving as zeros from HERE.
+      bondOrderMatrix: batch.bondOrderMatrix,
       // ...and the chain ids, which the template embedder masks its geometry
       // by. See the note at its call site in trunk-webgpu.js.
       asymId: batch.asymId,
@@ -1093,6 +1110,42 @@ export async function foldBatch(device, batch, weights, options = {}) {
   // OpenDDE fold at 6MRR is 23.5 s and its named stages sum to 7.2. Measured by
   // dropping the step count, only 2.9 s of the rest is the sampler - 200 steps
   // at 14.5 ms - and the other ten seconds had no name at all.
+  // 🔴 A CHECKPOINT WITH NO FLOW WALK MUST REFUSE, NOT PRODUCE A WRECK.
+  // rosettafold3 in flow mode gives N-CA 6.94 A against 1.46 and consecutive CA
+  // collapsing to 0.23 A - and pLDDT 81.47, four tenths from the good fold's
+  // 81.53, so the number a page shows says nothing is wrong. The PAGE's sampler
+  // select defaults to Flow, so this was what a visitor would have got.
+  //
+  // It throws rather than quietly switching: a fold that silently ran a
+  // different sampler than it was asked for is the kind of thing that gets
+  // measured for a week. The caller chooses - `web/app.js` picks Diffusion for
+  // these checkpoints and says so in the UI.
+  // 🔴 `weights.trunk.dialect`, WHICH IS WHERE IT LIVES IN THIS FUNCTION. The
+  // first version of this read `weights.dialect` - the name `buildTargetFeat`
+  // uses, on a different object - so it was `undefined`, the check quietly did
+  // nothing, and the broken fold reached the geometry gate exactly as before.
+  // A guard that reads the wrong field is a guard that is not there.
+  // 🔴 AN UNRECOGNISED MODE MUST NOT FALL INTO THE FLOW BRANCH. The two tests
+  // below are `=== "diffusion"` and `=== "ode"`, so ANY other string - a typo, a
+  // stale select value, a mode a future checkpoint names - ran the flow walk
+  // with the replacement step and reported itself as whatever it was asked for.
+  // That is the shape of bug this repository keeps paying for: a fold that
+  // silently ran a different sampler than the one on its label.
+  const MODES = ["diffusion", "flow", "ode"];
+  if (!MODES.includes(options.mode)) {
+    throw new Error(`unknown sampler mode ${JSON.stringify(options.mode)};`
+      + ` this fold takes one of ${MODES.join(", ")}`);
+  }
+  const foldDialect = weights.trunk?.dialect ?? weights.dialect;
+  // 🔴 "ode" AND "flow" ARE THE SAME WALK WITH DIFFERENT STEPS, and a
+  // checkpoint with no working walk refuses BOTH - rosettafold3 collapses at
+  // CA 3.07 under flow and explodes to 5.88 under the ODE step.
+  if (options.mode !== "diffusion" && foldDialect?.noFlowSampler === true) {
+    throw new Error("this checkpoint has no working flow sampler: its walk gives"
+      + " N-CA 6.94 A against 1.46 and a collapsed backbone, while pLDDT reads"
+      + " 81.47 as if nothing were wrong. Pass mode: \"diffusion\"."
+      + " See `noFlowSampler` in src/af3/dialect.js.");
+  }
   stage("sample-start", { steps: options.steps });
   const sampled = options.mode === "diffusion"
     ? await sampleOnGpu(device, headInput, weights.diffusion, {
@@ -1103,6 +1156,9 @@ export async function foldBatch(device, batch, weights, options = {}) {
       })
     : await flowOnGpu(device, headInput, weights.diffusion, {
         cycles: steps, head, normal: normalFrom(options.seed ?? 20260831),
+        // "flow" keeps the original straight replacement; "ode" takes the step
+        // that made AlphaFold 3's 1QYS a chain again. See the sampler.
+        step: options.mode === "ode" ? "ode" : "replace",
         onStep,
         // The schedule reaches noiseLevels through here, and both samplers
         // already forward their options to it.
@@ -1149,9 +1205,22 @@ export async function foldBatch(device, batch, weights, options = {}) {
 
   stage("sample-done", { tokens });
   const confidenceFor = async () => {
+    // 🔴 RoseTTAFold3's CONFIDENCE HEAD READS THE TOKEN-CENTRE CA, NOT THE
+    // PSEUDO-BETA. `pseudo_beta` gathers CB for a residue that has one; rf3
+    // takes dense atom index 1, which is CA for every polymer residue. Same
+    // buffer, a different gather - and then a different binning; see
+    // caDistogramFeatures.
+    const caDgram = weights.trunk.dialect.confidenceCaDgram === true;
     const gather = batch.tokenAtomsToPseudoBeta;
     const pseudoBeta = new Float32Array(tokens * 3);
     for (let token = 0; token < tokens; token += 1) {
+      if (caDgram) {
+        const from = (token * dense + 1) * 3;
+        for (let axis = 0; axis < 3; axis += 1) {
+          pseudoBeta[token * 3 + axis] = positions[from + axis];
+        }
+        continue;
+      }
       if (!gather.mask[token]) continue;
       const from = Number(gather.indices[token]) * 3;
       for (let axis = 0; axis < 3; axis += 1) {
@@ -1165,7 +1234,14 @@ export async function foldBatch(device, batch, weights, options = {}) {
       // them and the field is simply absent there.
       features: batch.features, bondMatrix: batch.bondMatrix,
       bondOrderMatrix: batch.bondOrderMatrix,
-    }, weights.confidence, weights.confidence.dialect);
+      // 🔴 THE TRUNK'S DIALECT, BECAUSE `weights.confidence.dialect` DOES NOT
+      // EXIST. `confidenceWeights` never set one, so this argument has been
+      // `undefined` for every model since the head was written - and every
+      // branch behind it has therefore run only in
+      // `check-af3-confidence-oracle.js`, which passes a real dialect. That is
+      // protenix2's and boltz2's `preSymmetrisedPde` and rosettafold3's 40-bin
+      // CA-CA embedding: measured by the checker, never reached by a FOLD.
+    }, weights.confidence, weights.trunk.dialect);
   };
 
   /**
