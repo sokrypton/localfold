@@ -4498,6 +4498,113 @@ All six now: af3 0.050, protenix2 0.044, if2 0.055, openbind0 0.058, boltz2
 - **A bundle this box does not have is a SKIP.** openbind0 is f32 here and the
   rest are int5; hard-coding the suffix reported a 404 as a failure.
 
+## 🔴 BOND GEOMETRY AS THE METRIC, AND IT REVERSES THE SIGMA0 ANSWER
+
+Asked for a benchmark set of proteins with little or no alignment, scored on
+whether the BONDS survive - mainchain, sidechain and ligand - rather than on
+RMSD. `tools/gpu/bond-geometry.js` scores the four classes separately and
+`tools/gpu/bench-sampler-bonds.js` sweeps a sampler over the set.
+
+**Why the classes are separate**: they fail separately. rosettafold3's flow walk
+breaks N-CA by 4.2x while leaving CA-CA within 1.2x, so a mainchain-only score
+calls that a 4x failure and a whole-structure score dilutes it away. And a
+ligand has no backbone to hide behind: `chain-geometry.js` steps over one by
+design, which is how a glycerol at 6.97 A scored pLDDT 92.38.
+
+**Why the ideals are not typed in**: they are measured from
+`tools/oracle/reference-conformers.json`, the geometry the featuriser already
+hands the model, so the bar cannot drift from the port. A pair is bonded if the
+ideal conformer puts it within 1.95 A - a covalent bond is 1.2-1.8 and the next
+contact is past 2.1, so it is not a close call. **And no crystal is needed**,
+which is what lets the set be chosen for MSA depth rather than for having a
+deposited structure.
+
+🔴 **THE BASELINE, WITHOUT WHICH NONE OF THE NUMBERS BELOW MEAN ANYTHING.**
+Deposited crystals, scored by the same function:
+
+| | mainchain | sidechain | peptide |
+|---|---:|---:|---:|
+| 6MRR | 0.032 | 0.049 | 0.005 |
+| 1QYS | 0.034 | 0.046 | 0.003 |
+| 5CAJ | 0.034 | 0.046 | 0.006 |
+
+Their worst offenders are carboxylate C-O bonds - `ASP CG-OD2` at 1.238 against
+a 1.404 ideal - which is the reference conformer averaging both resonance forms
+and not a scorer fault. **0.046 is what "right" looks like.**
+
+### The set, chosen for having no alignment
+
+Measured through the MMseqs2 API: **6MRR returns 3 rows and 1QYS 6**, against
+5CAJ's 7907 and 1BRS's 8341. Flow is the fast option and the fast option is what
+a visitor picks when there is no alignment to wait for, so the set is
+single-sequence: 6MRR, 1QYS, and 6MRR carrying a GLYCEROL.
+
+### AlphaFold 3: the shipped sigma0 survives a metric it was never chosen on
+
+Flow 8, three seeds, no MSA, bond rms in angstroms:
+
+| sigma0 | 6MRR sidechain | 1QYS sidechain | GOL ligand |
+|---:|---:|---:|---:|
+| 2560 | 0.438 | 0.255 | **0.652** |
+| **160, shipped** | 0.327 | **0.244** | 0.080 |
+| 40 | 0.337 | 0.256 | 0.048 |
+| 16 | **0.320** | 0.406 | **0.033** |
+| 8 | 0.610 | 0.784 | 0.092 |
+| *diffusion 25* | *0.379* | *0.261* | *0.026* |
+
+8 is a floor, worst everywhere with pLDDT collapsing to 51-75. **2560 destroys
+the ligand at 0.652 against 160's 0.080**, which reproduces probe-ligand-flow's
+HEM finding and sharpens it eightfold. The optimum is target-dependent - 1QYS
+wants 160 and 16 is 1.7x worse there, while 6MRR and the ligand want 16 - and
+**160 is at or near best on every row but the ligand**. The calibration chosen
+on RMSD and pLDDT holds up under bonds.
+
+### rosettafold3: bonds REVERSE what RMSD said, and the guard stays
+
+The RMSD sweep above found rf3's flow optimum at sigma0 16 and read it as a
+working sampler - 1.78 A against diffusion's 1.46. Bonds disagree:
+
+| rf3, 6MRR | mainchain | sidechain | peptide | pLDDT |
+|---:|---:|---:|---:|---:|
+| 160 | **2.325** | **2.345** | 0.936 | 81.5 |
+| 40 | 1.405 | 1.180 | 0.845 | 81.5 |
+| 16 | 0.285 | 0.427 | 0.433 | 81.5 |
+| 8 | 0.165 | 0.295 | 0.251 | 81.5 |
+| **diffusion 25** | **0.062** | **0.067** | **0.066** | 81.5 |
+
+Flow improves all the way down to 8 and **never gets within 4x of rf3's own
+diffusion on any class**. So "sigma0 16 makes rf3's flow work" was an RMSD
+conclusion: the fold lands in roughly the right place with its chemistry still
+wrong. **`noFlowSampler` stays**, and this is the measurement that says so.
+
+🔴 **AND pLDDT IS 81.5 ON EVERY ROW OF THAT TABLE** while mainchain goes 2.325
+to 0.062 - a 37-fold change in bond error under a confidence number that does
+not move in the first decimal. This is the sharpest demonstration of that point
+the repository has.
+
+### 🔴 AND THE LARGER FINDING: AlphaFold 3's SIDE CHAINS ARE 5x rosettafold3's
+
+Under DIFFUSION, the verified sampler, on the same port and the same code:
+
+| | mainchain | sidechain | ligand |
+|---|---:|---:|---:|
+| crystal | 0.033 | **0.046** | - |
+| rosettafold3 | 0.062 | **0.067** | 0.272 |
+| **alphafold3** | 0.074 | **0.344** | 0.026 |
+
+rosettafold3 is near the crystal and AlphaFold 3 is seven times off it.
+**It is not undersampling** - af3's sidechain rms at 25, 100 and 200 diffusion
+steps is 0.344, 0.372 and 0.428, flat to slightly WORSE - so more sampling does
+not converge it. Mainchain is fine in both (1.9x and 2.2x the crystal); it is
+specifically the side chains, and specifically AlphaFold 3.
+
+**What this does NOT establish**: whether af3-any-model's own AlphaFold 3 does
+the same. If the reference also puts side chains 0.34 A out then this is the
+checkpoint and there is nothing to fix; if it does not, this is a port defect in
+the atom decoder that every gate here has been blind to, because RMSD is
+dominated by the backbone and pLDDT reads 83 through it.
+`check-af3-denoise.js --stages=on` is where that question gets answered.
+
 ## rosettafold3 has no flow sampler, and the page defaulted to one
 
 Found by running `probe-nucleic.js` on the two new models, which nothing had

@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-304 tools. `tools/fixtures/` is data and is not listed.
+306 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (180)
+## `tools/gpu/` - the WebGPU lane (182)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -39,6 +39,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-relative-encoding.js`** - Is the gather actually faster than the dense projection?
 - **`bench-row-normalize.js`** - Row LayerNorm, three arrangements, at the shapes an AF2 block normalises.
 - **`bench-runtime.js`** - How long a fold takes, as a function of what was asked for.
+- **`bench-sampler-bonds.js`** - Which sampler setting keeps a structure's BONDS, on proteins with little or no alignment?
 - **`bench-single-project.js`** - The single track's q/k/v/gate projection, at several splits of its width.
 - **`bench-transition.js`** - The pair transition alone, at several row tiles, interleaved in one process.
 - **`bench-triangle-project.js`** - The two triangle projection kernels alone, at several register blocks.
@@ -47,6 +48,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-webgl2-matmul.js`** - What WebGL2 can ACTUALLY do for a matmul on this device.
 - **`bench-webgl2-tf-matmul.js`** - A WebGL2 matmul through TRANSFORM FEEDBACK, which has four times the fragment path's output budget.
 - **`bench-weights.js`** - How long the AF3 checkpoint takes to reach usable Float32Arrays, and why.
+- **`bond-geometry.js`** - Are a predicted structure's BONDS the right length - mainchain, sidechain, peptide and ligand, scored separately?
 - **`buffer-profile.js`** - Where a fold's time goes when it is NOT in a compute pass.
 - **`chain-geometry.js`** - The chain-geometry gate for the COMMAND-LINE tools.
 - **`check-af3-atom-decoder.js`** - AF3's atom decoder: GPU against src/af3/diffusion/diffusion-reference.js.

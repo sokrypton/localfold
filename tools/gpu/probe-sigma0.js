@@ -46,6 +46,8 @@
  * shifted register as a good fit.
  */
 import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { generateMmseqs2Msa } from "../../src/input/mmseqs2-api.js";
 import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { atomName, foldBatch } from "../../src/af3/fold.js";
 import { confidenceWeights, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
@@ -175,6 +177,23 @@ export async function main(device, args) {
   const sigmas = option(args, "sigmas", "2560,160").split(",").map(Number);
   const steps = Number(option(args, "steps", "8"));
   const mode = option(args, "mode", "flow");
+  const msa = args.includes("--msa");
+  const maxMsa = Number(option(args, "max-msa", "512"));
+  // One search per TARGET, memoised, because the sweep folds each target
+  // sigmas x seeds times and the alignment does not depend on either.
+  const searched = new Map();
+  const searchOnce = async (name, sequence) => {
+    if (!searched.has(name)) {
+      const started = performance.now();
+      const found = await generateMmseqs2Msa(sequence);
+      const text = typeof found === "string" ? found : found.a3m ?? found.msa ?? found.text;
+      const depth = (text.match(/^>/gm) ?? []).length;
+      console.log(`[sigma0] ${name}: ${depth} rows in`
+        + ` ${Math.round((performance.now() - started) / 1000)} s`);
+      searched.set(name, text);
+    }
+    return searched.get(name);
+  };
   const seeds = option(args, "seeds", "1,2,3,4").split(",").map(Number);
   const only = option(args, "targets", "6MRR,1QYS").split(",");
 
@@ -197,7 +216,24 @@ export async function main(device, args) {
     // number it produced for a non-AF3 checkpoint was that checkpoint's WEIGHTS
     // fed AlphaFold 3's FEATURISATION. `dropTerminalAtoms` and `paddedAtomKeys`
     // both reach a plain protein, so this was not inert.
-    const batch = featuriseProtein(sequence, { ...featuriserDialect(dialect) });
+    // 🔴 AND WITH `--msa`, THROUGH THE SHARED BATCH BUILDER. A sigma0 swept on
+    // a target the model cannot fold measures the TARGET: 5CAJ and 1BRS sit at
+    // 17 A and 12 A from sequence alone under BOTH samplers, so every sigma0
+    // looks alike there and the sweep was confined to two small monomers. One
+    // MMseqs2 search per target, so the cost is four searches and not four per
+    // arm, and `af3BatchFromA3m` is the function the page and the CLI share -
+    // this file building its own batch is how the two used to disagree.
+    const alignment = msa ? await searchOnce(name, sequence) : null;
+    const batch = alignment === null
+      ? featuriseProtein(sequence, { ...featuriserDialect(dialect) })
+      // 🔴 NO `seed` HERE, ON PURPOSE. af3BatchFromA3m subsamples the alignment
+      // from the fold's seed, so passing one would make every seed a different
+      // ALIGNMENT as well as a different draw - two variables where this sweep
+      // is asking about one. Omitted, it is seed 0 for every arm: the alignment
+      // is held and only sigma0 and the starting draw move.
+      // ...and it returns `{ batch, rows }`, not a batch.
+      : af3BatchFromA3m(sequence, alignment,
+        { ...featuriserDialect(dialect), maxSequences: maxMsa }).batch;
     for (const sigma0 of sigmas) {
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights, {
@@ -211,7 +247,7 @@ export async function main(device, args) {
         });
         const scored = rmsdAndTm(predictedAlphaCarbons(batch, result.positions), crystal);
         rows.push({
-          target: name, mode, sigma0, seed,
+          target: name, mode, sigma0, seed, msa: msa ? maxMsa : 0,
           rmsd: Number(scored.rmsd.toFixed(3)), tm: Number(scored.tm.toFixed(3)),
           residues: scored.residues,
           caca: Number(result.geometry.caca.toFixed(2)),
