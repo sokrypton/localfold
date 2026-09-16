@@ -4725,6 +4725,55 @@ one module over, for the same reason. `test/dialect-routes.test.js` went red on
 it, correctly: it discovers the list by parsing the source and the list had
 moved. It parses `atomBlockDialect` now.
 
+### 🔴 ALL THREE DIFFUSION-PATH DIFFERENTIALS WERE DEAD, WITH ONE ROT
+
+Not one checker: `check-af3-atom-decoder.js`, `check-af3-atom-encoder.js` and
+`check-af3-diffusion-head.js` ALL threw `maskAtomActPerBlock has no default` on
+every run, all for the same reason - each hand-builds a weight dict and each
+listed the per-block dialect flags by hand. **Every differential this port has
+for the AlphaFold 3 diffusion path had been dead for as long as that flag has
+existed.** All three take `atomBlockDialect(ALPHAFOLD3)` now, and all three pass:
+
+| | relRMS |
+|---|---:|
+| atom decoder, GPU against the CPU reference | 3.01e-7 |
+| atom encoder, every term | ~3e-7 |
+| whole denoiser, sigma 56 | 1.28e-4 (bound 4e-4) |
+
+🔴 **AND GPU AGREES WITH CPU AT EVERY NOISE LEVEL, INCLUDING THE ONE THAT
+MATTERS.** `check-af3-diffusion-head.js --noise=` was never swept; it defaults to
+56. Across the range: **1.28e-4 at 56, 1.43e-4 at 2, 7.43e-5 at 0.2 and 8.27e-6
+at 0.02** - it gets BETTER as the noise falls. So there is no kernel bug at any
+sigma, and the contraction is in what both implementations agree on.
+
+🔴 **AND THAT IS THE SYSTEMIC BLIND SPOT, STATED PLAINLY.** Every instrument this
+port has for the diffusion head was calibrated at HIGH noise - the oracle dump at
+sigma 16, the head checker defaulting to 56 - and side chains are decided below
+sigma 1. The GPU-against-CPU half of that is now closed by the sweep above. The
+ORACLE half is not, and cannot be from this box.
+
+**`ref_pos` IS CLEAN, verified for the first time.** It is the last untested
+surface in the atom path and the docs call it "a reported floor, never a
+failure", explaining its 3.6 A same-slot displacement from the reference as "the
+same molecule in a different rotamer and frame". That explanation is testable,
+because a rotamer changes torsions and not BOND LENGTHS - and it holds: scored by
+`bond-geometry.js`, af3-any-model's own `ref_pos` reads mainchain **0.0191** and
+side chain **0.0186**, ours **0.0030** and **0.0037**. Both sets have correct
+chemistry and differ only in pose. An assertion became a measurement.
+
+🔴 **AND THE FIRST VERSION OF THAT TEST SAID OUR `ref_pos` WAS 1.26 A WRONG**,
+which would have been an enormous finding and was my own indexing: `refPos` is
+the DENSE `[tokens, 24, 3]` grid, the same shape the reference dumps, and I had
+walked it as a compacted per-residue array. The tell was an earlier probe of the
+same array reading a constant 1.79 A for every distal atom. **Believe the checker
+is wrong before the port** - this file's own rule, and it was right again.
+
+**The eight duplicated tensors are chosen consistently.** AlphaFold 3's bundle
+carries eight names in both an unsuffixed and a `_1` form - the four pair
+projections, in each of the two conditioning stacks - which is the shape of the
+defect `28b3965` fixed. Both stacks read the unsuffixed form, which is what the
+reference's own trace fires. No partial fix there.
+
 **What would settle the defect itself**, and it needs the reference environment
 which is not on this box: a denoise dump at low sigma. `dump_af3_denoise.py` already takes
 `NOISE` from the environment - but it builds its input as `rng.normal(...) *

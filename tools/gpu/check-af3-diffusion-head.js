@@ -20,7 +20,7 @@ import { diffusionHead } from "../../src/af3/diffusion/diffusion-reference.js";
 import { Af3DiffusionHeadGpu } from "../../src/af3/diffusion/diffusion-head-webgpu.js";
 import { atomCrossAttentionEncoder as encodeCpu } from "../../src/af3/diffusion/atom-encoder-reference.js";
 import { openAf3Store } from "../../src/af3/weights/weights.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3, atomBlockDialect } from "../../src/af3/dialect.js";
 
 const DUMP = "/oracle-dumps/af3-oracle-atom-f32.json";
 const HEAD = "diffuser/~/diffusion_head";
@@ -93,8 +93,7 @@ export async function main(device, args) {
       // CHAINS them, and AF3 leaves padded keys to the mask where OpenDDE
       // excludes them from the offset validity. Both are false for the two
       // dialects these checkers sweep; only OPENDDE sets them true.
-      chainedAtomLayerNorm: false,
-      keyMaskedAtomAttention: false,
+      ...atomBlockDialect(ALPHAFOLD3),
       qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
       qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
       qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
@@ -182,8 +181,7 @@ export async function main(device, args) {
   const decoderBlock = async (index) => {
     const at = (leaf) => decoderSlice(leaf, index);
     return {
-      chainedAtomLayerNorm: false,
-      keyMaskedAtomAttention: false,
+      ...atomBlockDialect(ALPHAFOLD3),
       qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
       qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
       qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
