@@ -231,6 +231,13 @@ def main():
                         help="save the session, reload, restore it, read the panels back")
     parser.add_argument("--download", action="store_true",
                         help="press Download all and report the zip it wrote")
+    parser.add_argument("--download-pdb", action="store_true",
+                        help="press the PDB button and read the file it wrote"
+                             " BACK. 🔴 THE OTHER BUTTON NOTHING PRESSES: it"
+                             " writes `pred.pdb` straight out of the prediction,"
+                             " so a model whose B-factor column is not a pLDDT,"
+                             " or whose header names the wrong model, fails here"
+                             " and in the archive and nowhere else.")
     parser.add_argument("--bar", action="store_true",
                         help="print every value the progress bar took, with the"
                              " clock beside it - a bar that stops short is a"
@@ -835,6 +842,60 @@ def main():
               return JSON.stringify(out);
             })()""", await_promise=True))
             print("archive:", archive)
+        # 🔴 AND THE PDB BUTTON IS THE OTHER HALF OF "SAVE". It shares no code
+        # with the archive past `lastPrediction.pdb`, so the two can disagree -
+        # and the bytes are the only thing that says what the B-factor column
+        # holds, which is a pLDDT for a scored model and something else for one
+        # with no confidence head.
+        if args.download_pdb:
+            saved = json.loads(cdp.evaluate(ws, """(async () => {
+              // The anchor carries the FILENAME and the blob carries the bytes,
+              // so both are intercepted: "a file was offered" is not "the fold
+              // is in it", the same distinction --download draws for the zip.
+              const blobs = [];
+              const names = [];
+              const made = URL.createObjectURL;
+              URL.createObjectURL = (blob) => { blobs.push(blob); return made.call(URL, blob); };
+              const clicked = HTMLAnchorElement.prototype.click;
+              HTMLAnchorElement.prototype.click = function () {
+                if (this.download) names.push(this.download);
+                return clicked.call(this);
+              };
+              const before = document.getElementById('status')?.textContent ?? '';
+              document.getElementById('download-pdb').click();
+              await new Promise((done) => setTimeout(done, 1500));
+              URL.createObjectURL = made;
+              HTMLAnchorElement.prototype.click = clicked;
+              const after = document.getElementById('status')?.textContent ?? '';
+              const out = { name: names[names.length - 1] ?? null,
+                            size: blobs[0]?.size ?? null,
+                            changed: before !== after ? after : null };
+              if (blobs[0] !== undefined) {
+                const text = await blobs[0].text();
+                const lines = text.split('\\n');
+                out.head = lines.filter((l) => l.startsWith('REMARK')).slice(0, 4);
+                out.models = lines.filter((l) => l.startsWith('MODEL')).length;
+                out.ends = lines.some((l) => l.trimEnd() === 'END');
+                const atoms = lines.filter((l) => l.startsWith('ATOM') || l.startsWith('HETATM'));
+                out.atoms = atoms.length;
+                out.hetatm = lines.filter((l) => l.startsWith('HETATM')).length;
+                const chains = new Set();
+                const residues = new Set();
+                let low = Infinity;
+                let high = -Infinity;
+                for (const line of atoms) {
+                  chains.add(line.slice(21, 22));
+                  residues.add(line.slice(21, 26));
+                  const b = Number(line.slice(60, 66));
+                  if (Number.isFinite(b)) { low = Math.min(low, b); high = Math.max(high, b); }
+                }
+                out.chains = [...chains];
+                out.residues = residues.size;
+                out.bfactor = Number.isFinite(low) ? [low, high] : null;
+              }
+              return JSON.stringify(out);
+            })()""", await_promise=True))
+            print("saved pdb:", saved)
         # 🔴 INDEXEDDB AND py2Dmol'S SESSION EXIST ONLY IN A BROWSER, so this
         # is the whole gate on saving one: fold, read the record back out of
         # the real database, RELOAD, and restore it. "A record was written" is
