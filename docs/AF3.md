@@ -1,5 +1,131 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 ALPHAFOLD 3's SIDE CHAINS WERE 28% SHORT, AND THE ORACLE THAT SHOULD HAVE SEEN IT IS FED NOISE
+
+6MRR, side-chain bond rms against the ideal conformer:
+
+| | mainchain | side chain | peptide | mean signed | short | pLDDT | CA-RMSD |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| deposited 6MRR crystal | 0.033 | 0.049 | 0.005 | +0.002 | 29% | | |
+| AF3 Server's own prediction | 0.035 | 0.044 | 0.009 | | | | |
+| `run_alphafold.py`, seed 1 | | **0.051** | | +0.003 | 28% | | 0.637 |
+| **this port, before** | 0.073 | **0.339** | 0.087 | **-0.311** | **100%** | 83.11 | 0.660 |
+| **this port, after** | 0.043 | **0.059** | 0.036 | -0.002 | 39% | 85.70 | 0.583 |
+
+🔴 **EVERY SIDE-CHAIN BOND WAS SHORT - ALL 307 OF THEM - AND DEEPER WAS WORSE.**
+Mean distance from a residue's own CA, by side-chain depth, against
+`run_alphafold.py`'s:
+
+| depth | n | correct | this port, before | ratio |
+|---|---:|---:|---:|---:|
+| CB | 62 | 1.531 | 1.244 | 0.813 |
+| CG | 75 | 2.535 | 1.786 | 0.705 |
+| CD | 70 | 3.549 | 2.472 | 0.696 |
+| CE | 57 | 4.383 | 3.136 | 0.715 |
+| CZ | 21 | 5.721 | 4.104 | 0.717 |
+| CH | 16 | 6.173 | 4.570 | 0.740 |
+
+A near-uniform 0.72x of the side chain about CA, with the backbone untouched.
+
+### What it was: two haiku modules, one name
+
+Four tensors exist **twice** in AlphaFold 3's own checkpoint - unsuffixed and
+`_1`, at identical shapes - in the diffusion head and again in the evoformer
+conditioning, eight in all. That is not a converter artefact. Haiku numbers a
+module the second time its constructor runs, and `atom_cross_attention.py`
+builds a Linear named `<root>_single_to_pair_cond_row` at **two** call sites:
+inside `_per_atom_conditioning`, over a token's own 24 dense atom slots, and
+again in the encoder, in the queries-keys layout. The unsuffixed set is the
+first call's; `_1` is the encoder's, and the encoder is what this port runs.
+
+It was reading the unsuffixed set. For AlphaFold 3 the two are different trained
+tensors - rms 0.088 against 0.406 for the row projection, 0.576 against 0.014
+for the offsets - so it was a different model, loading clean and folding a
+protein. `embed_pair_offsets_valid` is the one with no `_1` form, which is
+exactly what made the set look like a typo.
+
+🔴 **AND THE ARGUMENT FOR THE WRONG ONE WAS A TRACE OF A REGRESSED REFERENCE.**
+`hk.intercept_methods` over af3-any-model's whole fold showed `_1` never firing.
+True - and only because their `041ab187` ("stop computing three things the
+models then throw away") had deleted the first call, on the correct observation
+that its result is assigned to `_`. The result **is** discarded. Deleting the
+call nevertheless RENAMES the second one, which then picks up the first's
+weights. Nothing errors: same shape, same scope, a plausible fold.
+
+Bisected on the A10 over 395 commits, `run_alphafold.py` on Google's own
+`af3.bin.zst` (md5 `f12e0b4b93ff0ca0967e663ec5a285a6`, byte-identical to
+`~/af3_official_weights`), 6MRR, mean CA-CB:
+
+```
+041ab187^                                1.5315
+041ab187                                 1.2610
+041ab187, that one file reverted         1.5315
+HEAD, need_pair=False -> True            1.5314   <- the one-word fix upstream
+```
+
+🔴 **AND THE FIX IS ONE ARGUMENT, IN A CALL WHOSE RESULT IS STILL THROWN AWAY.**
+`_per_atom_conditioning(..., need_pair=True)`. Building the tensor is what
+claims the unsuffixed names; the point of the call is the naming, not the value.
+
+### Why AlphaFold 3 alone, and why that read as the opposite
+
+Every PORTED bundle's converter writes one tensor into both names, so the choice
+is inert for protenix2, boltz2, intellifold2, rosettafold3, openbind0 and
+opendde - measured after the change at 0.059, 0.064, 0.062, 0.059, and both the
+ligand and template gates green. AlphaFold 3 is the only checkpoint that trained
+the two separately.
+
+So the lineage table read: AlphaFold 3 **0.344**, and five reimplementations of
+AlphaFold 3's own architecture at 0.062-0.070. That asymmetry was the whole
+clue and it was read backwards - as "our AF3 path is uniquely broken" rather
+than as "AF3 is the only checkpoint where this choice can matter".
+
+### 🔴 Why nothing here could see it
+
+- **CA-RMSD moves 0.660 -> 0.583** and the crystal is 0.637 away from native's
+  own answer, so the fold gate cannot resolve it.
+- **pLDDT moves 83.11 -> 85.70** and rose in the wrong direction for a year.
+- `chain-geometry.js` measures the BACKBONE by design, and the backbone was
+  fine (0.073 against a crystal's 0.033).
+- the ligand gate folds a GLYCEROL, which has no side chain.
+- `check-af3-denoise.js` compared against a dump from the regressed reference,
+  so agreeing with it at 1.55e-5 was agreeing with the defect.
+
+🔴 **AND THE FLAGSHIP DENOISE ORACLE HAS NEVER SEEN A STRUCTURE.**
+`dump_af3_denoise.py` builds `pos_dense = rng.normal(...) * NOISE` and `s`, `z`,
+`s_inputs` as `rng.normal(...) * 0.5`. It is a wiring test. This port passed it
+at relRMS **1.30e-5 at sigma 16, 9.85e-6 at 0.2 and 1.14e-5 at 0.02** while
+folding side chains at 6.7x the reference's bond error, because both sides were
+reading the same wrong tensor and neither needed real geometry to agree about
+it. `dump_af3_real_denoise.py` (on the A10) fixes that: real trunk conditioning
+captured out of a real fold, and a real structure to re-noise.
+
+### The instruments this took
+
+| | |
+|---|---|
+| `tools/gpu/bond-geometry.js` | bonds as chemistry, mainchain / side chain / peptide / ligand apart. The ONLY thing here that can see this class |
+| `denseBondGeometry` in the same file | the same rule over AF3's dense `[tokens, 24, 3]` grid against the batch's own `ref_pos`, so an oracle dump is scored with no PDB in between |
+| `fold.js --bond-trajectory` | the denoiser's own answer, scored at every noise level. 🔴 **Read the whole column, never its last row**: at the final sigma the EDM skip term is 0.99996, so D IS the input and scoring it scores the walk. D's side chains never beat 0.293 at any sigma while its mainchain reached 0.053 - which is what exonerated the sampler |
+| `check-af3-denoise.js --bonds` | clean input, noisy input, native's D and ours, side by side |
+| `tools/check-oracle-bonds.js` | the AF3 Server archive, which is the only reference here that is neither this port nor af3-any-model |
+
+### Eliminated on the way, each with a measurement
+
+| | |
+|---|---|
+| the featuriser | AF3's OWN dumped batch folds to 0.339 against our 0.345 |
+| `centreRefConformers` | flipped true for AF3 alone: 0.348 against 0.345 |
+| recycles | 0 / 3 / 10 at 200 steps: 0.413 / 0.391 / 0.392 |
+| bucket padding | native at 68 tokens and at 256: 0.3296 vs 0.3292, per sample |
+| a dialect flag | no flag in dialect.js differs between AF3 and all six others |
+| `trained_fourier` | false for AF3 in BOTH harnesses - the constants, not params |
+| the sampler | D itself is collapsed at every sigma; more steps is WORSE (0.344 / 0.413 at 25 / 200), which is the tell that the walk is not the author |
+| quantisation | f32 0.335 against int5 0.345 |
+| GPU vs CPU | 1.28e-4 at sigma 56 down to 8.27e-6 at 0.02 |
+
+---
+
 ## 🔴 TWO NEW MODELS: IntelliFold-2 AND RoseTTAFold3
 
 Both are in af3-any-model's `ALL_MODELS`, so both are dialect ports rather than
