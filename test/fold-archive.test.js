@@ -214,6 +214,34 @@ describe("the fold archive", () => {
     }).chainIds).toHaveLength(9);
   });
 
+  // 🔴 A LIGAND IS A CHAIN THE SCORES COUNT AND `chainLengths` DOES NOT.
+  // `chainLengths` is the POLYMER chains - web/app.js builds it as
+  // `chains.map((chain) => chain.length)` - while the confidence scores are
+  // keyed by asym id, and AF3 gives a ligand its own. So a protein folded with
+  // GOL has one chain length and two asym ids, `asymOrder` finds the counts
+  // disagree, falls back to the plain index, and every per-chain lookup misses:
+  // the archive wrote `chain_ptm: [null]` for a fold whose own `chain_ids`
+  // names A and B, and never reported the protein-ligand contact at all.
+  // Measured on the page before this test existed, with `ptm` 0.43 and
+  // `mean_plddt` 72.61 correct beside it - the scalars are fine, which is why
+  // nothing looked wrong.
+  it("scores the chain a ligand added, which chainLengths does not count", () => {
+    const summary = JSON.parse(summaryConfidencesJson({
+      confidence: {
+        ...prediction().confidence,
+        chainPtm: { 1: 0.9012, 2: 0.4011 },
+        chainIptm: { 1: 0.5567, 2: 0.5567 },
+        chainPairIptm: { "1|2": 0.6012 },
+      },
+      // One polymer chain of two residues, plus two ligand tokens in chain B.
+      chainLengths: [2],
+      tokenChainIds: ["A", "A", "B", "B"],
+      tokenResIds: [1, 2, 1, 1],
+    }));
+    expect(summary.chain_ptm).toEqual([0.9, 0.4]);
+    expect(summary.chain_pair_iptm).toEqual([[null, 0.6], [0.6, null]]);
+  });
+
   it("refuses to name more chains than it can spell", () => {
     expect(() => buildFoldArchive({
       stem: "x", entities, prediction: prediction(Array(27).fill(1)),

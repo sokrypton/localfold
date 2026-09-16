@@ -265,7 +265,22 @@ export function chainPairMaxContact(contactProbs, tokenChainIds, tokenResIds, ch
 
 export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds,
                                          tokenResIds }) {
-  const chains = chainLengths.map((_, index) => chainLetter(index));
+  // 🔴 THE CHAINS ARE THE TOKENS' CHAINS, NOT THE POLYMER COUNT. `chainLengths`
+  // is built as `chains.map((chain) => chain.length)` over the SEQUENCE rows, so
+  // it counts polymers and nothing else - while the scores are keyed by asym id
+  // and AlphaFold 3 gives a ligand one of its own. A protein folded with GOL
+  // therefore arrived here as one chain against two scored asym ids, `asymOrder`
+  // found the counts disagreed, fell back to the plain index, and every
+  // per-chain lookup missed: `chain_ptm: [null]` for a fold whose own
+  // `chain_ids` names A and B, and no protein-ligand entry in
+  // `chain_pair_max_contact` at all. The token chain ids are what the rest of
+  // this file already writes, so they are what the chain list comes from.
+  const lettered = [];
+  for (const letter of tokenChainIds ?? []) {
+    if (!lettered.includes(letter)) lettered.push(letter);
+  }
+  const chains = lettered.length > 0
+    ? lettered : chainLengths.map((_, index) => chainLetter(index));
   const asym = asymOrder(confidence, chains.length);
   const summary = { chain_ids: tokenChainIds };
 
