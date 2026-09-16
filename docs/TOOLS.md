@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-309 tools. `tools/fixtures/` is data and is not listed.
+310 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (182)
+## `tools/gpu/` - the WebGPU lane (183)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -106,6 +106,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-opendde-encoder-oracle.js`** - OpenDDE's target-feat ATOM ENCODER, module by module, against af3-any-model.
 - **`check-opendde-expander.js`** - OpenDDE's structural-token expansion, end to end on real weights.
 - **`check-opm-paths.js`** - The outer product mean's two paths, on ONE input, compared against each other.
+- **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
 - **`check-staged-matrix.js`** - Does the staged matrix projection compute what createLinearShader computes, in every buffer precision, with and without the residual, on ragged shapes?

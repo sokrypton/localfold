@@ -31,7 +31,7 @@ import { residentPackedOnDevice } from "../weights/device-weights.js";
 import {
   createOuterProductMeanShaders, packOuterProductMeanWeights,
 } from "./outer-product-mean-webgpu.js";
-import { createMsaAttentionShaders, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
+import { createMsaAttentionShaders, msaAttentionKeyPart, packMsaAttentionWeights } from "./msa-attention-webgpu.js";
 import { allocateGridProjectMatrix, gridProjectMatrixConfig }
   from "./grid-project-matrix.js";
 import {
@@ -213,7 +213,16 @@ export class Af3MsaStackGpu {
         heads: msaHeads, dimension: msaDimension },
       packMsaAttentionWeights(sample.msaAttention1).offsets, epsilon, variance);
     for (const [name, source] of Object.entries(attentionSources)) {
-      into(`msa:${name}`, `${base}:msa:${name}`, source);
+      // 🔴 THE HEAD SHAPE IS IN THE KEY, and leaving it out was a real
+      // collision: every kernel in msa-attention-webgpu.js shares one `common`
+      // preamble, so all of them embed HEADS and DIMENSION - even `keyMask`,
+      // which reads neither. AlphaFold 3 and RoseTTAFold3 are both msaChannels
+      // 64 with 8 heads, of dimension 8 and 32, and `base` names the channels
+      // and not the heads, so the two produced the SAME key for DIFFERENT text.
+      // The OPM loop above already appends its own discriminators; this one
+      // appended nothing.
+      into(`msa:${name}`, `${base}:msa:${name}:${msaAttentionKeyPart(
+        { heads: msaHeads, dimension: msaDimension })}`, source);
     }
     into("msaTransition", `${base}:msa-transition`,
       createTransitionShader({ rows, channels: msaChannels, factor: 4 },

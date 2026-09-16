@@ -40,6 +40,29 @@ export function packMsaAttentionWeights(weights) {
   return { data, offsets };
 }
 
+/**
+ * The part of a pipeline key that the shaders above actually vary on.
+ *
+ * 🔴 EVERY KERNEL HERE SHARES `common`, SO EVERY KERNEL EMBEDS `HEADS`,
+ * `DIMENSION` AND `WIDTH` - including `keyMask`, which is thirteen lines that
+ * read only `TOKENS` and `SEQUENCES`. A caller that keys on the channel widths
+ * alone therefore collides the moment two models share `msaChannels` and differ
+ * in the head shape, and AlphaFold 3 and RoseTTAFold3 do exactly that: both are
+ * msaChannels 64 with 8 heads, of dimension **8** and **32**. openbind0 sits
+ * with AF3 and boltz2 with rf3, so any process that runs one family and then
+ * the other at the same token count and depth hits it - which is a model switch
+ * on the page, and is why no single-model CLI run ever showed it.
+ *
+ * Reported as `af3-msa:59:128:64:128:0.00001:fast:false:msa:keyMask - line 8 of
+ * 35: "const DIMENSION: u32 = 8u;" against "const DIMENSION: u32 = 32u;"`.
+ * Line 8 of 35 is `common`'s seventh constant: the cache indexes by SOURCE as
+ * well as by key, so it refused rather than handing rosettafold3 AlphaFold 3's
+ * kernel. A key is not a summary of the call, it is a promise about the text.
+ */
+export function msaAttentionKeyPart({ heads, dimension }) {
+  return `${heads}x${dimension}`;
+}
+
 export function createMsaAttentionShaders(shape, offsets, epsilon, variance) {
   const { sequences, tokens, msaChannels, pairChannels, heads, dimension } = shape;
   const width = heads * dimension;
@@ -320,8 +343,10 @@ export class Af3MsaAttentionGpu {
     const packed = packMsaAttentionWeights(weights);
     const full = { sequences, tokens, msaChannels, pairChannels, heads, dimension };
     const sources = createMsaAttentionShaders(full, packed.offsets, epsilon, variance);
+    // This site already named the head shape; `msaAttentionKeyPart` is the
+    // same statement in one place, so the stack cannot drift from it again.
     const key = `af3-msa-attn:${sequences}:${tokens}:${msaChannels}:${pairChannels}`
-      + `:${heads}:${dimension}:${epsilon}:${variance}`;
+      + `:${msaAttentionKeyPart(full)}:${epsilon}:${variance}`;
     const compiled = {};
     for (const [name, source] of Object.entries(sources)) {
       compiled[name] = await this.pipelines.get(`${key}:${name}`, source);
