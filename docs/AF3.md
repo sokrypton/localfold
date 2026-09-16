@@ -4774,8 +4774,60 @@ projections, in each of the two conditioning stacks - which is the shape of the
 defect `28b3965` fixed. Both stacks read the unsuffixed form, which is what the
 reference's own trace fires. No partial fix there.
 
-**What would settle the defect itself**, and it needs the reference environment
-which is not on this box: a denoise dump at low sigma. `dump_af3_denoise.py` already takes
+### 🔴 THE REFERENCE ENVIRONMENT IS THE A10 NODE, AND IT HAS EVERYTHING
+
+`ssh -i ~/temp2.pem ubuntu@129.153.135.26` - `~/alphafold3/src` and
+`~/alphafold3/dev/oracles/denoise_parity.py`, `~/venv` with JAX 0.10.1 on a CUDA
+device, `~/ported/alphafold3`, and **native AlphaFold 3 folds of 6MRR already on
+disk** under `~/af3_native_bench/out/6mrr/`. Every "needs the reference
+environment" note above was written while looking at the wrong machine.
+
+**Native AlphaFold 3 on the SAME SEQUENCE we fold**, scored by the same function:
+
+| 6MRR | mainchain | sidechain | peptide |
+|---|---:|---:|---:|
+| native af3, seed 1 | 0.034 | **0.051** | 0.007 |
+| native af3, seed 2 | 0.032 | **0.051** | 0.008 |
+| native af3, seed 3 | 0.033 | **0.051** | 0.007 |
+| **ours** | 0.075 | **0.345** | 0.093 |
+
+Three seeds, 578 bonds each, a spread of 0.000. **6.8x**, on the same 68-residue
+sequence rather than the server's different protein - the last thing the earlier
+comparison could be argued about.
+
+### 🔴 AND AF3 IS THE ONLY MODEL IN THE LINEAGE THAT DOES THIS
+
+Same port, same code, diffusion 25, seed 1, no alignment:
+
+| | mainchain | sidechain |
+|---|---:|---:|
+| **alphafold3** | 0.075 | **0.345** |
+| protenix2 | 0.034 | 0.062 |
+| boltz2 | 0.037 | 0.067 |
+| intellifold2 | 0.048 | 0.070 |
+| rosettafold3 | 0.055 | 0.063 |
+
+**protenix2 and boltz2 are reimplementations of AlphaFold 3's own architecture**
+and both land near the crystal, so the architecture as this port reads it is
+right. It is AlphaFold 3's own path or its weights, and nothing shared.
+
+### 🔴 AND THE DENOISE PARITY TEST HAS NEVER SEEN A STRUCTURE
+
+Reading `dump_af3_denoise.py` to set up a low-sigma run: `pos_dense =
+rng.normal(...) * NOISE`, pure noise - **and `s`, `z` and `s447` are
+`rng.normal * 0.5` as well.** The flagship AlphaFold 3 oracle compares our
+arithmetic against the reference's on ENTIRELY RANDOM inputs: no trunk output,
+no conditioning, no structure anywhere in it.
+
+That is why it can read 1.55e-5 while the model returns contracted side chains.
+It is a wiring test. It would catch a transposed tensor or a wrong weight - it
+did, at `28b3965` - and it cannot catch "the network's output is systematically
+contracted on real conditioning", because it never supplies any. Re-run from the
+A10 at three noise levels, sigma 16 reproduces at **1.30e-5**.
+
+**So the next experiment is a dump with a REAL structure and REAL trunk
+conditioning** - `pos_dense = structure + NOISE * randn`, with `s`/`z` from an
+actual trunk pass rather than a generator. Everything it needs is on the A10. `dump_af3_denoise.py` already takes
 `NOISE` from the environment - but it builds its input as `rng.normal(...) *
 NOISE`, PURE noise scaled, so at `NOISE=0.5` it hands the model a 0.5 A random
 cloud rather than a nearly-correct structure with a little noise on it. At that
