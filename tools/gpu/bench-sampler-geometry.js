@@ -33,7 +33,12 @@ import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
 import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { foldBatch, toPdb } from "../../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
-import { bondGeometry } from "./bond-geometry.js";
+import { bondGeometry, parsePdbResidues } from "./bond-geometry.js";
+// 🔴 A NON-CHAIN IS NOT A BOND-LENGTH QUESTION and would pass every column
+// above: this repository has measured intellifold2 in flow returning a fold
+// the chain rule REFUSES on 1 seed in 6 while pLDDT read 83.30. A default
+// cannot be chosen without counting those.
+import { chainGeometryOf, chainGeometryVerdict } from "./chain-geometry.js";
 
 const PROTEIN = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE";
 
@@ -153,8 +158,18 @@ export async function main(device, args) {
       for (const seed of seeds) {
         const result = await foldBatch(device, batch, weights,
           { mode, steps, recycles: 0, seed });
-        const scored = bondGeometry(toPdb(batch, result.positions), conformers,
-          { components });
+        const pdb = toPdb(batch, result.positions);
+        const scored = bondGeometry(pdb, conformers, { components });
+        // 🔴 `chainGeometryOf` TAKES SPACINGS, NOT A PDB - it is the shared rule
+        // for a tool that already has the distances. Passing the text returned
+        // `caca: null` and a cheerful `notAChain: false`, which is the "a gate
+        // that cannot fail" shape: a wrong argument read as a clean fold.
+        const alphas = parsePdbResidues(pdb)
+          .map((r) => r.atoms.get("CA")).filter(Boolean);
+        const spacings = alphas.slice(1).map((p2, i) =>
+          Math.hypot(p2[0] - alphas[i][0], p2[1] - alphas[i][1], p2[2] - alphas[i][2]));
+        const chain = chainGeometryOf(spacings);
+        const verdict = chainGeometryVerdict(chain);
         rows.push({
           target: target.name, arm: `${mode}${steps}`, seed,
           plddt: Number((result.meanPlddt ?? 0).toFixed(2)),
@@ -162,6 +177,8 @@ export async function main(device, args) {
           peptide: round(scored.peptide.rms), nucleic: round(scored.nucleic.rms),
           ligand: round(scored.ligand.rms),
           bonds: scored.all.bonds, worst: scored.worst[0],
+          caca: Number((chain?.caca ?? NaN).toFixed(3)),
+          notAChain: verdict?.ok === false,
         });
       }
     }

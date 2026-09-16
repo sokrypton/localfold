@@ -1,5 +1,53 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 FLOW 16 AS THE PAGE DEFAULT: MEASURED AND DECLINED
+
+Proposed after the matched-budget result, and the matched-budget result is not
+what decides it. A DEFAULT is not a per-call choice: it is `flow16` against
+`diffusion25`, the two settings the page actually offers, and diffusion having
+1.6x the calls is part of that comparison rather than a confound in it.
+
+Seven systems, four models, **six seeds**, every fold also scored by the chain
+rule. d25 against f16, by bond class:
+
+```
+  mainchain   d 13   F  1   tie 6
+  sidechain   d 11   F  1   tie 8
+  peptide     d 19   F  1   tie 0
+  nucleic     d  3   F  4   tie 5
+  ligand      d  6   F  3   tie 3
+```
+
+**Diffusion 52, flow 10, tie 22.** The peptide bond is the most consistent thing
+in the table - 19 cells to 1 - and it is systematic rather than noisy: flow's
+C-N sits at 0.054-0.074 where diffusion's is 0.034-0.055, on every model and
+almost every system.
+
+🔴 **AND THE LIGAND COLUMN, WHICH WAS THE WHOLE CASE FOR THE SWITCH, GOES TO
+DIFFUSION 6-3 HERE.** The earlier 6-6 was two ligands at two seeds; nine
+molecules at six seeds do not reproduce it. Flow still wins two cells by a lot -
+af3's SEP 0.161 against 0.076 and if2's GOL 0.081 against 0.036 - and loses
+others by as much, which is what a tie made of large swings looks like.
+
+🔴 **AND THE RECORDED "intellifold2 IN FLOW IS NOT A CHAIN ON 1 SEED IN 6" DID
+NOT REPRODUCE: 0 of 120 flow folds**, across four models and six seeds, by the
+same `chainGeometryVerdict` the page uses. That is a negative result on this
+target and not a retraction - the recorded case was a different one - but the
+risk that argued against flow is not visible here either.
+
+**So diffusion 25 stays the page default, and flow stays an option.** The two
+findings are consistent once the question is stated precisely: flow is better
+PER CALL and is the only sampler that works below 16 calls, and at the counts
+the page actually offers diffusion is better. Flow earns its place as the fast
+option, not as the default.
+
+🔴 **AND THE IMPROVEMENT ACTUALLY AVAILABLE IS NOT A SAMPLER AT ALL.** Raising
+the step count is worth 2x to 7x on ligands and modified residues - rf3's ATP
+0.3201 to 0.0469, if2's 0.3196 to 0.0476 - where switching sampler is worth
+hundredths. That is where a default should change.
+
+---
+
 ## 🔴 FLOW EARNS ITS PLACE ON SMALL MOLECULES, AND ONLY AT A SMALL BUDGET
 
 The reason flow was added was that it should need FEWER denoiser calls than
