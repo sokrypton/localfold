@@ -231,6 +231,7 @@ export const ALPHAFOLD3 = Object.freeze({
   atomizedUnknownRestype: false,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: false,
@@ -334,6 +335,7 @@ export const OPENBIND0 = Object.freeze({
   atomizedUnknownRestype: false,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: false,
@@ -500,6 +502,7 @@ export const OPENDDE = Object.freeze({
   atomizedUnknownRestype: false,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: false,
@@ -612,6 +615,7 @@ export const PROTENIX2 = Object.freeze({
   atomizedUnknownRestype: false,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: false,
@@ -749,6 +753,19 @@ export const BOLTZ2 = Object.freeze({
   atomizedUnknownRestype: true,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  // 🔴 A MODIFIED RESIDUE IS **ONE TOKEN** HERE, NOT ONE PER ATOM, AND IT IS
+  // THE ONLY FAMILY THAT WANTS THAT. Every other AF3-lineage model atomises a
+  // phosphoserine into ten tokens carrying one atom each; boltz2 keeps one
+  // token holding all ten, carrying the UNKNOWN restype and the modified flag -
+  // `modified_as_one_token` in af3-any-model's registry, set for boltz2 alone.
+  //
+  // 🔴 AND ATOMISING IT INSTEAD TEARS THE RESIDUE APART. Measured on SEP at
+  // position 3: the residue's own bonds come out at ratio 1.813 where every
+  // other model is 0.73-1.16 and genuine Boltz-2 2.2.1 is 0.986-1.011. The
+  // batch is otherwise identical across models - 9 bonded pairs, 9 bond-order
+  // entries, one ref_space_uid, 6.924 A across the residue - so the token
+  // count is the whole of it. See docs/BOLTZ2_PTM.md.
+  modifiedAsOneToken: true,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: false,
@@ -928,6 +945,7 @@ export const INTELLIFOLD2 = Object.freeze({
   atomizedUnknownRestype: false,
   atomizedUnknownMsa: false,
   atomizedBackboneBonds: false,
+  modifiedAsOneToken: false,
   // Every other checkpoint's flow walk reaches a structure; see rosettafold3's.
   noFlowSampler: false,
   qblockAtomKeys: true,
@@ -1104,6 +1122,7 @@ export const ROSETTAFOLD3 = Object.freeze({
   atomizedUnknownRestype: true,
   atomizedUnknownMsa: true,
   atomizedBackboneBonds: true,
+  modifiedAsOneToken: false,
   // 🔴 THIS CHECKPOINT HAS NO WORKING FLOW WALK, AND THE PAGE DEFAULTED TO ONE.
   // Measured on 6MRR: `--mode=flow` gives N-CA **6.94 A** against 1.46 and
   // consecutive CA collapsing to 0.23 A at worst - the geometry gate refuses it
@@ -1206,6 +1225,7 @@ export function featuriserDialect(dialect) {
     atomizedUnknownRestype: dialect.atomizedUnknownRestype,
     atomizedUnknownMsa: dialect.atomizedUnknownMsa,
     atomizedBackboneBonds: dialect.atomizedBackboneBonds,
+    modifiedAsOneToken: dialect.modifiedAsOneToken,
   };
 }
 

@@ -225,7 +225,18 @@ export function polymerResidue(component, isCTerminal) {
   }
   return {
     code: component.code,
-    atoms: component.atoms.filter((_, index) => keep[index]),
+    // 🔴 EACH KEPT ATOM REMEMBERS ITS INDEX IN THE COMPONENT, because a
+    // one-token modified residue is laid out by that index and NOT compacted.
+    // AF3 leaves the removed atom's dense slot EMPTY: a phosphoserine in the
+    // middle of a chain reads N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6
+    // where its OXT was. Compacting puts P in slot 6 and shifts every atom
+    // after it, which is one wrong element and four wrong name characters
+    // against the reference's batch - and, in the model, a phosphate whose
+    // atoms are in the wrong places.
+    atoms: component.atoms.filter((_, index) => keep[index])
+      .map((atom, kept) => ({ ...atom,
+        componentSlot: keep.reduce((at, k, index) =>
+          (at >= 0 ? at : (k && renumbered[index] === kept ? index : -1)), -1) })),
     bonds: component.bonds
       .filter((bond) => renumbered[bond.from] >= 0 && renumbered[bond.to] >= 0)
       .map((bond) => ({ ...bond, from: renumbered[bond.from], to: renumbered[bond.to] })),

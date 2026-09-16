@@ -85,6 +85,13 @@ export function af3BatchFromA3m(sequence, alignment, options = {}) {
       ? {} : { atomizedUnknownMsa: options.atomizedUnknownMsa }),
     ...(options.atomizedBackboneBonds === undefined
       ? {} : { atomizedBackboneBonds: options.atomizedBackboneBonds }),
+    // 🔴 AND `modifiedAsOneToken`, WHICH THIS LIST NOT NAMING IS THE WHOLE BUG
+    // THIS COMMENT BLOCK EXISTS TO WARN ABOUT. boltz2 keeps a modified residue
+    // in ONE token; adding the flag to the dialect and to `featuriserDialect`
+    // and not here left `check-batch-fields.js` building 83 tokens against the
+    // reference's 74 - the featuriser had the branch and never saw the flag.
+    ...(options.modifiedAsOneToken === undefined
+      ? {} : { modifiedAsOneToken: options.modifiedAsOneToken }),
     // 🔴 DROP_ATOMS: four families carry no terminal OXT and no 5' OP3. The
     // featuriser's switch is `terminalAtoms`, which ESMFold2 already used; this
     // is the same knob under the dialect's name. See dialect.js.

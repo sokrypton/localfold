@@ -287,7 +287,12 @@ export function featuriseProtein(sequence, options = {}) {
             ? at === chain.length - 1
             : at === 0),
         modification,
-        tokens: modification === null ? 1 : modification.atoms.length,
+        // 🔴 boltz2 KEEPS A MODIFIED RESIDUE IN ONE TOKEN. Every other family
+        // atomises it - one token per atom - and giving boltz2 the atomised
+        // form tears the residue apart: SEP's own bonds at ratio 1.813 where
+        // the others are 0.73-1.16. See `modifiedAsOneToken` in dialect.js.
+        tokens: modification === null || options.modifiedAsOneToken === true
+          ? 1 : modification.atoms.length,
       });
       chainOfResidue.push(chainIndex);
     }
@@ -460,6 +465,60 @@ export function featuriseProtein(sequence, options = {}) {
     // encoder that the phosphate may not be compared with the backbone.
     const uid = space;
     space += 1;
+    // 🔴 boltz2's SINGLE TOKEN, WHICH IS A DIFFERENT SHAPE AND NOT A SPECIAL
+    // CASE OF THE LOOP BELOW: all of the residue's atoms go into ONE token's
+    // dense slots, where the atomised form puts each in slot zero of its own
+    // token. The restype is the UNKNOWN one (`atomizedUnknownRestype`, already
+    // true for boltz2) and `modifiedSpans` still describes the residue so a
+    // writer names it - it is one token wide now rather than ten.
+    if (options.modifiedAsOneToken === true) {
+      modifiedSpans.push({ from: token, count: 1, code: modification.code,
+                           residue, atoms: modification.atoms,
+                           bonds: modification.bonds, oneToken: true });
+      aatype[token] = options.atomizedUnknownRestype === true
+        ? UNK_AATYPE : aatypeFor(code);
+      residueIndex[token] = number;
+      tokenIndex[token] = token + 1;
+      asymId[token] = asym;
+      entityId[token] = entity;
+      symId[token] = sym;
+      seqMask[token] = 1;
+      residueOfToken[token] = residue;
+      for (let atom = 0; atom < modification.atoms.length; atom += 1) {
+        const source = modification.atoms[atom];
+        // 🔴 THE COMPONENT'S OWN SLOT, NOT A COMPACTED ONE. A removed leaving
+        // atom leaves its dense slot EMPTY - a mid-chain phosphoserine is
+        // N,CA,CB,OG,C,O,_,P,O1P,O2P,O3P with a hole at 6 where the OXT was -
+        // and compacting shifts the phosphate and its three oxygens down one.
+        const flat = token * DENSE + (source.componentSlot ?? atom);
+        refMask[flat] = 1;
+        refElement[flat] = source.element;
+        refCharge[flat] = source.charge;
+        refPos[flat * 3] = source.x;
+        refPos[flat * 3 + 1] = source.y;
+        refPos[flat * 3 + 2] = source.z;
+        writeAtomName(refAtomNameChars, flat, source.name, source.element,
+                      options.atomizedElementNames);
+        realAtoms.push(flat);
+      }
+      // 🔴 THE PSEUDO-BETA IS CB, THE SAME RULE A STANDARD RESIDUE TAKES - and
+      // slot zero was wrong. A one-token modified residue is a residue, so its
+      // representative atom is its beta carbon (its alpha carbon if it has
+      // none), not whichever atom the dictionary happens to list first, which
+      // for a phosphoserine is N. Caught by `check-batch-fields.js` against the
+      // reference's own gather: token 2 wants slot 2 (CB) where this wrote 0.
+      const slotOfName = (name) => {
+        const found = modification.atoms.find((a) => a.name === name);
+        return found === undefined ? -1
+          : (found.componentSlot ?? modification.atoms.indexOf(found));
+      };
+      const betaAt = slotOfName("CB");
+      const alphaAt = slotOfName("CA");
+      pseudoBetaSlot[token] = betaAt >= 0 ? betaAt : (alphaAt >= 0 ? alphaAt : 0);
+      for (let slot = 0; slot < DENSE; slot += 1) refSpaceUid[token * DENSE + slot] = uid;
+      token += 1;
+      continue;
+    }
     modifiedSpans.push({ from: token, count: modification.atoms.length,
                          code: modification.code, residue,
                          atoms: modification.atoms, bonds: modification.bonds });
@@ -586,7 +645,15 @@ export function featuriseProtein(sequence, options = {}) {
   // following residue, each way round. Without them the phosphoserine is a
   // ligand floating beside the chain as far as the pair track is concerned.
   const bondedGroups = [
-    ...modifiedSpans.map((span) => ({ base: span.from, bonds: span.bonds })),
+    // 🔴 A ONE-TOKEN MODIFIED RESIDUE CONTRIBUTES NO TOKEN-TOKEN BONDS. Its
+    // bonds are INSIDE the token, and `base + bond.from` only means a token
+    // while each atom is its own; under boltz2's convention it walks off the
+    // residue and bonds the neighbours instead - measured as 18 pairs the
+    // reference does not have, `2-3 3-2 3-4 3-6 4-3 4-5`, where 2 is the
+    // phosphoserine and 3 and 4 are the residues after it. The atoms are still
+    // bonded to each other; the pair track just is not where that is said.
+    ...modifiedSpans.filter((span) => span.oneToken !== true)
+      .map((span) => ({ base: span.from, bonds: span.bonds })),
     ...ligands.map((ligand, index) => ({
       base: polymerTokens + ligands.slice(0, index)
         .reduce((sum, earlier) => sum + earlier.atoms.length, 0),

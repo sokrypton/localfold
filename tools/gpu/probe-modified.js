@@ -31,6 +31,7 @@
  * being asked.
  */
 import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
+import { featuriserDialect } from "../../src/af3/dialect.js";
 import { foldBatch, atomName } from "../../src/af3/fold.js";
 import { ccdUrl, parseCcdComponent, polymerResidue } from "../../src/af3/featurise/ccd-component.js";
 import { REFERENCE_CONFORMERS } from "../../src/af3/featurise/reference-conformers.js";
@@ -61,7 +62,17 @@ export async function main(device, args) {
   const response = await fetch(ccdUrl(code));
   if (!response.ok) throw new Error(`could not fetch ${code}: ${response.status}`);
   const component = parseCcdComponent(await response.text());
+  // 🔴 THE BUNDLE'S OWN CONVENTIONS, NOT AlphaFold 3's. This passed
+  // `modifications` and nothing else, so every number this probe has ever
+  // produced was AF3's featurisation fed to another model's weights - the same
+  // fault docs/AF3.md records for `probe-nucleic.js`, in the same words, and it
+  // matters most here: `modifiedAsOneToken` decides whether a modified residue
+  // is ONE token or one per atom, and boltz2 is the only family that wants one.
+  // Without the dialect boltz2 was always folded atomised, so this probe could
+  // not see the fix that gave it a single token.
+  const batchDialect = weights.trunk?.dialect ?? weights.dialect;
   const batch = featuriseProtein(sequence, {
+    ...featuriserDialect(batchDialect),
     modifications: [{ chain: 0, position: at, ...component }],
   });
   const result = await foldBatch(device, batch, weights, {
@@ -85,11 +96,25 @@ export async function main(device, args) {
 
   const span = batch.modifiedSpans[0];
   if (span === undefined) throw new Error("no modified residue in the batch");
-  // Each of its tokens holds one atom, in slot zero.
+  // 🔴 BY THE COMPONENT'S OWN ATOM ORDER, NOT BY NAME, because two conventions
+  // break a name lookup and both ship. `atomizedElementNames` (rosettafold3)
+  // renames an atomised atom to its ELEMENT, so "OG" is not there to find and
+  // this read 5.082 on a model whose residue is fine; `modifiedAsOneToken`
+  // (boltz2) puts every atom in ONE token, so the one-atom-per-token walk below
+  // found nothing at all and reported a ratio of 0 - a broken residue and a
+  // perfect one both scoring as "no bonds".
+  //
+  // The layout is known either way: one token holding each atom at its
+  // `componentSlot`, or one token per atom with each in slot zero.
+  const oneToken = span.oneToken === true;
   const modifiedSlots = new Map();
-  for (let index = 0; index < span.count; index += 1) {
-    const slot = (span.from + index) * dense;
-    modifiedSlots.set(nameOf(slot), slot);
+  for (let index = 0; index < span.atoms.length; index += 1) {
+    const atom = span.atoms[index];
+    const slot = oneToken
+      ? span.from * dense + (atom.componentSlot ?? index)
+      : (span.from + index) * dense;
+    if (!oneToken && index >= span.count) break;
+    modifiedSlots.set(atom.name, slot);
   }
 
   // --- 1. the modified residue's own chemistry, against the dictionary -------

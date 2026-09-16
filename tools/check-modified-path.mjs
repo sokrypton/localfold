@@ -16,33 +16,18 @@
  * 2.007 against 1.469, CA-C 3.485 against 1.506 - while every other model is
  * within 6% and its own control residues are at 0.995.
  *
- * 🔴 AND IT IS NOT THIS PORT'S BUG, WHICH IS WHY boltz2 IS AN EXPECTED FAILURE
- * HERE RATHER THAN A RED GATE - BUT IT IS SOMEBODY'S, AND THE THIRD REFERENCE
- * SAYS WHOSE. Three folds of one target:
+ * 🔴 IT WAS AN EXPECTED FAILURE AND IT IS FIXED, SO THE ENTRY IS GONE. What it
+ * was: boltz2 keeps a modified residue in ONE token where every other family
+ * atomises it into one token per atom, and this port atomised it for everyone.
+ * `modifiedAsOneToken` in dialect.js is the convention, set for boltz2 alone.
+ * Measured on SEP at position 3, boltz2's own bonds: **1.813 -> 0.938**,
+ * against genuine Boltz-2 2.2.1 at 0.986-1.011.
  *
- *     genuine Boltz-2 2.2.1, single sequence   0.986 / 0.996 / 1.011
- *     af3-any-model's boltz2                   2.705   (bond rms 2.99 A)
- *     this port                                1.813
- *
- * **The real Boltz-2 places a phosphoserine correctly** - `pip install boltz`,
- * no MSA, three diffusion samples, bond rms 0.043-0.076 A - so this is a defect
- * in af3-any-model's boltz2 PORT that LocalFold inherits, and not something
- * Boltz-2 cannot do. Its AlphaFold 3 on the identical target through the
- * identical harness is 0.988 and 0.143 A, so the harness is not the cause
- * either. `tools/oracle/probe_af3_ptm_bonds.py` is the af3-any-model side and
- * `tools/oracle/score_modified_cif.py` scores any predicted mmCIF against the
- * RCSB dictionary - a THIRD scorer, written separately from the other two, and
- * it agrees with them on the models they share. Three things are already
- * excluded on this side: the bond matrix and the bond-order plane are
- * byte-identical across models (9 pairs, 9 entries), `ref_pos` is identical
- * (10 slots, one space, 6.924 A across the residue), and the `_1` weight-name
- * change is a proven no-op for boltz2 (4 of 4 tensors byte-identical, where
- * only AlphaFold 3's differ).
- *
- * 🔴 SO THE EXCEPTION ASSERTS IT STAYS BROKEN, and says what retires it. A
- * silent improvement is as much a surprise as a silent regression: if boltz2
- * comes back inside the band, upstream fixed it or this port changed, and
- * either way the entry and its evidence should go.
+ * 🔴 AND THE REFERENCE HAD A SECOND FAULT THAT DOES NOT APPLY HERE.
+ * af3-any-model was 2.705 because it also dropped O3P - a SIDECHAIN atom of a
+ * phosphoserine - under a `drop_atoms` guard whose predicate a later convention
+ * falsified. This port has no by-name drop list, so it had one of the two
+ * faults and read 1.813 where the reference read 2.705.
  *
  * 🔴 AND IT MUST BE FOLDED AT A CONVERGED SETTING OR IT MEASURES NOTHING. Run
  * at `probe-modified.js`'s default eight steps in DIFFUSION mode, every model
@@ -69,10 +54,7 @@ const MODELS = [
   // converged rather than the page's 25.
   { name: "rosettafold3", bundle: "model-rosettafold3-int5",
     arm: ["--mode=diffusion", "--steps=200"] },
-  { name: "boltz2", bundle: "model-boltz2-int5",
-    expected: [1.5, 2.4],
-    why: "af3-any-model's boltz2 is 2.705 here and GENUINE Boltz-2 2.2.1 is "
-       + "0.986-1.011, so it is that port's defect and this one inherits it" },
+  { name: "boltz2", bundle: "model-boltz2-int5" },
 ];
 
 const FLOW = ["--mode=flow", "--steps=16"];
