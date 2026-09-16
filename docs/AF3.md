@@ -100,6 +100,55 @@ reading the same wrong tensor and neither needed real geometry to agree about
 it. `dump_af3_real_denoise.py` (on the A10) fixes that: real trunk conditioning
 captured out of a real fold, and a real structure to re-noise.
 
+### 🔴 AND THE ORACLE THAT CONFIRMS IT MUST BE RUN ON THE FLOAT32 BUNDLE
+
+After the fix, `check-af3-denoise.js --name=alphafold3` against a dump
+regenerated from the corrected reference:
+
+| bundle | relRMS | ours rms | native rms |
+|---|---:|---:|---:|
+| `model-af3-full-f32` | **9.92e-4** | 9.2053 | 9.2057 |
+| `model-af3-int5` (what ships) | 3.71e-1 | 9.3457 | 9.2057 |
+
+**9.92e-4 is the port; 3.71e-1 is the quantisation**, and reading the int5 arm
+as a defect cost an hour here. It is the same control the template row already
+records from the other end (boltz2 int5 0.167 against f32 8.25e-7), and this
+file's own rule - "a residual taken on a quantised bundle is not comparable with
+one taken on a float32 one" - was written before this and not followed.
+
+What it costs in the fold is small and worth knowing, because int5 is what a
+visitor loads. 6MRR, same seed:
+
+| | mainchain | side chain | peptide | pLDDT | CA-RMSD |
+|---|---:|---:|---:|---:|---:|
+| `run_alphafold.py` | 0.035 | 0.051 | 0.009 | | 0.637 |
+| ours, float32 bundle | 0.034 | **0.051** | 0.011 | 85.96 | 0.572 |
+| ours, int5 bundle | 0.043 | **0.059** | 0.036 | 85.70 | 0.583 |
+
+At float32 this port is indistinguishable from AlphaFold 3's own answer on every
+bond class.
+
+🔴 **AND THE TEMPTING EXPLANATION FOR THE int5 ARM IS MEASURED AND WRONG.**
+`quantise` pads a partial tail group with ZEROS and takes `low`/`high` over the
+padding, so a 16-element tensor in a group of 32 looks like it should spend half
+its levels on filler - and `diffusion_embed_pair_distances_1` is exactly
+[1, 16]. Measured, zero padding against padding with the group's own mean:
+
+```
+                                        n    pad   zero-pad   mean-pad
+diffusion_single_to_pair_cond_row     2048     0   3.404e-2   3.404e-2
+diffusion_single_to_pair_cond_row_1   2048     0   4.645e-2   4.645e-2
+diffusion_embed_pair_offsets_1          48    16   3.284e-2   3.284e-2
+diffusion_embed_pair_distances_1        16    16   3.130e-2   3.130e-2
+```
+
+**Identical**, because these weights already straddle zero, so the padding never
+widens the range. And the two largest contributors are 2048 elements with NO
+partial group at all - the residual is ordinary int5 cost spread over
+everything, not a tail-group artefact. 15 tensors of 406 have a partial tail
+group and 9 are smaller than one group; exempting all of them would move this
+by nothing. Do not retry it.
+
 ### The instruments this took
 
 | | |
