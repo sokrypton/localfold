@@ -263,6 +263,24 @@ null]]`. The B diagonal stays null by design - a ligand's atoms share a residue
 number, so the within-six-residues rule drops its self-block. Gated by
 `test/fold-archive.test.js`, verified to fail first.
 
+🔴 **AND THE CHAIN-PAIR DIAGONAL WAS null WHERE THE SERVER WRITES A NUMBER.**
+`chain_pair_iptm[i][i]` is the chain against itself, which is that chain's own
+pTM - `tools/fixtures/fold_2026_09_01_10_17.zip` has
+`[[0.9, 0.91], [0.91, 0.86]]` beside `chain_ptm` `[0.9, 0.86]` - and this wrote
+null there, on the reasoning that an unscored interface must be null rather than
+zero. Sound reasoning, applied to the one cell that is not an interface. The
+same file read the same convention CORRECTLY one function down, where
+`chain_pair_pae_min`'s own test cites the server's real diagonal.
+
+🔴 **AND THIS IS THE LIMIT OF A KEY-FOR-KEY COMPARISON.** The check recorded
+above - "nine of ten keys", `has_clash` omitted - passes a wrong VALUE inside a
+key that is present, which is what this was for however long it stood. The
+fixture is in the repository and was never read back for values. Fixed; the
+diagonal carries the chain's own pTM, and stays null only where the fold has no
+per-chain pTM at all - absent, not invented, which is the rule everywhere else
+in that file. Gated by `test/fold-archive.test.js` against the fixture's own
+numbers, verified to fail first.
+
 🔴 **AND AN AF3-GRAPH PDB SAID NOTHING ABOUT ITSELF.** `toPdb` opened with
 `const lines = []` and pushed no REMARK, so a file saved from the page named
 neither the model that produced it nor the quantity in its B-factor column -

@@ -3184,12 +3184,29 @@ PARAMETERS that are restricted.
 🔴 **THE LICENCE DIALOG ASKS THE PERSON FOLDING, NOT THE DEPLOYER.**
 `build_site.py` already refuses to publish DeepMind's parameters without
 `LOCALFOLD_ACCEPT_MODEL_TERMS`; the page's `#model-terms` dialog gates the first
-AF3 fold and remembers the answer in `localStorage`. It offers OpenBind as the
-alternative rather than only an "I agree", because a dialog with one button
-teaches people to click it. `tools/model-terms.py` is the check - it drives the
-real page and asserts the dialog opens, remembers, switches the model row, and
+AF3 fold and remembers the answer in `localStorage`. It offers somewhere else to
+go rather than only an "I agree", because a dialog with one button teaches
+people to click it. `tools/model-terms.py` is the check - it drives the real
+page and asserts the dialog opens, remembers, switches the model row, and
 **still opens for `?model=af3`**, since a URL must not be able to accept
 somebody else's terms.
+
+🔴 **AND "SOMEWHERE ELSE" USED TO MEAN ONE PLACE: OpenBind-0.** The model row
+offers ten models and the dialog named exactly one, so anybody who would rather
+fold with Boltz-2 or EF2-fast had to dismiss it, find the row and set it
+themselves - the state this page is otherwise careful never to leave people in.
+It is a `<select>` now, and the list is **cloned from `#model-family` when the
+dialog opens**, never written out a second time: a model added to the page
+appears in it, and one `build_site.py` drops from `dist/index.html` for an
+unservable bundle never does. OpenBind-0 is still what it starts on - it runs
+this same graph under Apache 2.0, which makes it the nearest model to the one
+being declined. 🔴 **AND THE GATED FAMILY IS NOT IN ITS OWN LIST**, or the
+dialog would hand back AlphaFold 3 without the acceptance it exists to record.
+The switch button's value is `switch` rather than a family name, because a
+button reading "openbind0" while the chooser reads Boltz-2 is a returnValue the
+handler would have to ignore. Measured through the probe: the chooser offered
+`opendde`, and pressing switch moved the model row to **opendde**, which is what
+a wiring to a literal cannot do.
 
 🔴 **AND A `<dialog>` IS NEVER LAID OUT UNTIL IT IS OPENED**, which is the load
 dial's blind spot again: `tools/mobile-layout.py` cannot see it. `model-terms.py`
