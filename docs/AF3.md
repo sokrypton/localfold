@@ -1,5 +1,68 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 FLOW EARNS ITS PLACE ON SMALL MOLECULES, AND ONLY AT A SMALL BUDGET
+
+The reason flow was added was that it should need FEWER denoiser calls than
+diffusion to get a small molecule right. Tested the way that claim has to be
+tested - **matched budgets**, flow at N calls against diffusion at N calls, five
+ligands spanning tiny-and-rigid to large-and-flexible, three models, two seeds,
+`diffusion200` as the floor. Ligand bond rms in angstroms:
+
+```
+af3        d8       f8       d16      f16      d32      f32      d64      f64      d200
+EDO        22.02    0.506    0.473    0.033    0.044    0.030    0.046    0.047    0.044
+GOL        32.83    0.082    0.033    0.030    0.026    0.024    0.016    0.036    0.026
+BEN        35.27    0.038    0.270    0.028    0.026    0.025    0.026    0.023    0.024
+ATP        28.94    0.065    0.077    0.051    0.047    0.048    0.052    0.050    0.039
+HEM        27.84    0.092    0.069    0.040    0.036    0.042    0.036    0.039    0.030
+
+boltz2     d8       f8       d16      f16      d32      f32      d64      f64      d200
+EDO        18.87    0.079    0.043    0.061    0.020    0.070    0.023    0.060    0.021
+GOL        31.94    0.179    0.167    0.070    0.063    0.065    0.027    0.063    0.029
+ATP        26.23    0.340    0.060    0.077    0.057    0.071    0.056    0.072    0.046
+
+if2        d8       f8       d16      f16      d32      f32      d64      f64      d200
+GOL        36.14    0.566    0.214    0.029    0.057    0.022    0.056    0.026    0.039
+ATP        28.51    0.426    0.204    0.296    0.055    0.051    0.049    0.070    0.048
+```
+
+🔴 **AT EIGHT CALLS DIFFUSION IS NOT SLIGHTLY WORSE, IT IS UNUSABLE: 18.9 to
+37.4 A on every model and every ligand**, against flow's 0.038 to 0.857. That is
+a factor of five hundred, and it is the documented behaviour of the stochastic
+sampler seen from the ligand's side - eight steps leaves the walk at high noise
+and the molecule has not condensed at all.
+
+**At sixteen, flow is at or near the `diffusion200` floor and diffusion is
+erratic**: af3's EDO is 0.473 at d16 against 0.033 at f16, its BEN 0.270 against
+0.028, if2's GOL 0.214 against 0.029. By thirty-two the two are equivalent and
+from there diffusion is generally the better of the two.
+
+Over every (model, ligand, budget) cell at MATCHED budgets:
+
+```
+  diffusion better 25   flow better 32   tie (<0.002 A) 3
+```
+
+🔴 **AND THIS REVERSES WHAT THE PAGE-SETTINGS COMPARISON SAID, BECAUSE THAT ONE
+WAS NOT MATCHED.** The row above this section reports flow16 against diffusion25
+and concludes flow does not win a bond class - true, and diffusion had **1.6x
+the calls**. Comparing a sampler at 16 against a sampler at 25 measures the
+budget, not the sampler, and the claim under test was explicitly about the
+budget. At equal calls flow is ahead overall and overwhelmingly ahead below 16.
+
+**So flow is not a redundant second option: it is the only one that works at a
+small budget**, which is exactly the case it was added for and exactly the case
+a visitor with no alignment picks. The page offering flow at 16 and diffusion at
+a minimum of 25 is, on this evidence, the right pair of defaults.
+
+🔴 **WHAT IS STILL NOT MEASURED: THE PROTEIN CLASSES AT MATCHED BUDGETS.** The
+mainchain, side-chain and peptide columns that favoured diffusion 13-3, 9-2 and
+18-2 were also taken at flow16 against diffusion25, so they carry the same 1.6x
+confound and none of them should be quoted as a sampler result until they are
+re-run at equal calls.
+
+---
+
 ## 🔴 SAMPLER AND STEP COUNT, SCORED AS GEOMETRY ACROSS LIGANDS AND NUCLEIC ACIDS
 
 `tools/gpu/bench-sampler-geometry.js`: five models x seven systems x four arms x

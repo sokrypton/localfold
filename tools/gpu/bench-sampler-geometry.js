@@ -54,6 +54,20 @@ const SET = [
 // the sampler and how much is the truncation.
 const ARMS = [["diffusion", 25], ["diffusion", 200], ["flow", 16], ["flow", 32]];
 
+/**
+ * Matched budgets: the same number of denoiser calls to each sampler.
+ *
+ * 🔴 THE PAGE'S TWO SETTINGS ARE NOT A FAIR COMPARISON AND CANNOT TEST THE
+ * CLAIM FLOW WAS ADDED FOR. Flow is offered at 16 cycles and diffusion at 25
+ * steps, so "flow16 beats diffusion25" confounds the sampler with a 1.6x
+ * budget - and the hope was that flow needs FEWER calls than diffusion to get a
+ * small molecule right, which is a statement about the CURVE and not about one
+ * pair of points. A denoiser call costs the same either way, so equal calls is
+ * the honest axis and `--budgets=8,16,32,64` is how to ask.
+ */
+const matchedBudgets = (counts) =>
+  counts.flatMap((n) => [["diffusion", n], ["flow", n]]);
+
 const option = (args, name, fallback) => {
   const hit = args.find((a) => a.startsWith(`--${name}=`));
   return hit === undefined ? fallback : hit.slice(name.length + 3);
@@ -63,7 +77,27 @@ const round = (value) => (value === null ? null : Number(value.toFixed(4)));
 export async function main(device, args) {
   const seeds = option(args, "seeds", "1,2").split(",").map(Number);
   const only = option(args, "targets", "").split(",").filter(Boolean);
+  // 🔴 `--ligands=` REPLACES THE SET WITH ONE ROW PER SMALL MOLECULE, because
+  // two of them cannot answer "is a sampler better for ligands": the full set's
+  // ligand column came out 6-6 over GOL and ATP alone, which is four coin
+  // flips. The codes are CCD codes and are fetched, so any molecule with a
+  // dictionary entry can be in the sweep.
+  const ligandSweep = option(args, "ligands", "").split(",").filter(Boolean);
+  if (ligandSweep.length > 0) {
+    SET.length = 0;
+    for (const code of ligandSweep) {
+      SET.push({ name: `protein+${code}`, sequence: PROTEIN, ligands: [code] });
+    }
+  }
   const armsWanted = option(args, "arms", "").split(",").filter(Boolean);
+  const budgets = option(args, "budgets", "").split(",").filter(Boolean).map(Number);
+  if (budgets.length > 0) {
+    ARMS.length = 0;
+    for (const arm of matchedBudgets(budgets)) ARMS.push(arm);
+    // ...and the converged reference last, so a curve has a floor to be read
+    // against rather than only against the other sampler.
+    ARMS.push(["diffusion", 200]);
+  }
   const store = await openAf3Store(
     option(args, "model", "/model-af3-int5/manifest.json"));
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();
