@@ -128,10 +128,22 @@ export function atomName(nameChars, slot) {
 /**
  * A PDB from the dense atom layout, with pLDDT in the B-factor column so the
  * viewer can colour by it.
+ *
+ * 🔴 AND A HEADER ONLY WHERE ONE IS PASSED, WHICH IS WHAT MAKES IT SAFE TO ADD.
+ * This wrote no REMARK at all, so a file saved from the page named neither the
+ * model that produced it nor the quantity in its B-factor column - seven
+ * families share this writer, and the AlphaFold 2 path beside it has carried a
+ * provenance REMARK since it was written. The header is a CALLER's, because the
+ * caller that knows which checkpoint ran is the page, and because three tests
+ * and several tools read this output in file order: emitting a line they did
+ * not ask for would change what every one of them parses.
  */
-export function toPdb(batch, positions, plddt) {
+export function toPdb(batch, positions, plddt, options = {}) {
   const { tokens, dense, sequence } = batch;
   const lines = [];
+  // ...first, before any coordinate record: a reader that stops at the first
+  // ATOM never sees anything written after one, and most readers do.
+  for (const text of options.remark ?? []) lines.push(`REMARK   1 ${text}`);
   let serial = 1;
   // 🔴 ONE LETTER PER CHAIN, NOT "A" FOR EVERYTHING. A complex written as one
   // chain is a single 126-residue protein as far as any viewer or scoring tool

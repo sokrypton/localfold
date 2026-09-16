@@ -395,11 +395,11 @@ export const toPoints = (positions, count) => Array.from(
  * 🔴 FITTED TO THE FIRST FRAME, NOT THE LAST, because the frames are shown as
  * they are computed and there is no last one yet.
  */
-export function fittedPdb(batch, positions, reference, slots, plddt) {
+export function fittedPdb(batch, positions, reference, slots, plddt, options = {}) {
   const api = window.py2Dmol;
   const count = batch.tokens * batch.dense;
   if (api?.superpose === undefined || reference === null) {
-    return toPdb(batch, positions, plddt);
+    return toPdb(batch, positions, plddt, options);
   }
   const moved = api.superpose(toPoints(positions, count), reference,
                               { from: slots, to: slots });
@@ -409,7 +409,7 @@ export function fittedPdb(batch, positions, reference, slots, plddt) {
     fitted[index * 3 + 1] = moved[index][1];
     fitted[index * 3 + 2] = moved[index][2];
   }
-  return toPdb(batch, fitted, plddt);
+  return toPdb(batch, fitted, plddt, options);
 }
 
 /**
@@ -853,8 +853,22 @@ export async function foldAf3(options) {
     (positions) => fittedPdb(batch, positions, reference, slots, null));
   // ...and the finished structure keeps the REAL pLDDT, which is the one
   // number here that is a claim about the prediction rather than a colour.
+  // 🔴 THE HEADER GOES ON THE FILE THAT GETS SAVED, AND ON NOTHING ELSE. The
+  // two calls above build the TRAJECTORY, which the viewer ingests frame by
+  // frame and nobody downloads; a REMARK on each of them would be 25 copies of
+  // a provenance line inside one animation. This is the structure the save
+  // buttons write, so this is the one that has to say what produced it.
+  //
+  // 🔴 AND THE B-FACTOR LINE IS ADDED HERE, NOT BY THE CALLER, BECAUSE ONLY
+  // THIS KNOWS. `result.scores` is undefined for a family on this graph with no
+  // confidence head, and the column is then zeros - so a caller-supplied
+  // "B-FACTOR IS pLDDT" would put the word on a file that has none, which is
+  // the mislabelling EF2-fast's own REMARK exists to prevent.
   const finalPdb = fittedPdb(batch, result.positions, reference, slots,
-                             result.scores?.plddt ?? null);
+                             result.scores?.plddt ?? null,
+                             { remark: [...(options.remark ?? []),
+                                        ...(result.scores?.plddt === undefined
+                                          ? [] : ["B-FACTOR IS pLDDT (0-100)."])] });
 
   return {
     batch,

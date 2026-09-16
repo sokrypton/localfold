@@ -2075,6 +2075,18 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
     sequence, mode, calls, recycles, weights, device, signal,
     alignment: alignmentBlocks, maxMsaSequences, ligandCodes, modifications,
     chainKinds, reuse,
+    // 🔴 WHAT PRODUCED THE FILE, BECAUSE THE FILE DID NOT SAY. A saved PDB from
+    // this path carried no REMARK at all - no model, nothing about the B-factor
+    // column - while the AlphaFold 2 path beside it has always written one and
+    // EF2-fast writes two. Seven families share the AF3 writer, so "AlphaFold 3"
+    // here is `modelName` and not a literal: an OpenBind-0 fold that claimed to
+    // be AlphaFold 3 would be worse than an anonymous file.
+    //
+    // Only the provenance is ours to state. Whether the B-factor column holds a
+    // pLDDT depends on whether this family has a confidence head, which is not
+    // known until the fold returns - so af3-model.js adds that line, where
+    // `result.scores` can be read.
+    remark: [`${modelName} PREDICTION BY LOCALFOLD (https://localfold.org)`],
     // 🔴 TEXT AND A CHAIN, NOT A SLOT. foldAf3 places them, because a slot is
     // indexed by TOKEN and a modified residue is several tokens - so a chain's
     // first token is not the sum of the preceding chains' residue counts, and
