@@ -411,14 +411,43 @@ export async function targetFeatureWeights(store) {
       // af3.bin.zst folds 6MRR with mean CA-CB 1.5315 at 041ab187^ and 1.2610
       // at 041ab187, and reverting that one file alone restores 1.5315.
       //
-      // 🔴 AND FOR ALPHAFOLD 3 THE TWO ARE DIFFERENT TRAINED TENSORS - rms
-      // 0.088 against 0.406 for the row projection, 0.576 against 0.014 for the
-      // offsets - so this was never a naming preference, it was another model.
+      // 🔴 AND THE UNSUFFIXED SET IS NOT A SECOND TRAINED TENSOR, IT IS
+      // UNTRAINED. Its output is discarded, so it never receives a gradient and
+      // was serialised at its random initialisation. Against haiku's
+      // `VarianceScaling(1.0, fan_in)`, whose std is `sqrt(1/fan_in)`, at three
+      // fan-ins two orders apart: row [128,16] init 0.0884 against an actual
+      // 0.0877, offsets [3,16] init 0.5774 against 0.5657, distances [1,16]
+      // init 1.0 against 0.7953 (one sample standard error low for sixteen
+      // draws). Their `_1` twins are 0.4063, 0.0137 and 0.1548 - nowhere near
+      // init. So reading the unsuffixed set fed this encoder Google's own
+      // accidental noise, which is why side chains came out at 0.72x their
+      // extent with the backbone intact: an untrained atom pair bias is one
+      // term among several and the token transformer still carries the fold.
+      //
       // Every PORTED bundle writes one tensor into both names, which is why
-      // protenix2, boltz2, if2 and rf3 were unaffected either way and only
-      // AlphaFold 3 - the one checkpoint that trained them separately - folded
-      // side chains at 0.72x their extent. `embed_pair_offsets_valid` is the
-      // one with no `_1` form, which is what made the set look like a typo.
+      // protenix2, boltz2, if2 and rf3 were unaffected either way - verified by
+      // hashing the shard bytes, 4 of 4 identical for rf3 and if2 and 4 of 4
+      // different for af3. `embed_pair_offsets_valid` is the one with no `_1`
+      // form, which is what made the set look like a typo.
+      //
+      // 🔴 THE DEAD BRANCH IS ALPHAFOLD 3's OWN, AND THIS PORT DOES NOT COPY
+      // IT. Verified against google-deepmind/alphafold3's unmodified
+      // `network/atom_cross_attention.py`: line 141 is
+      // `token_atoms_single_cond, _ = _per_atom_conditioning(...)` with no
+      // `need_pair` parameter at all, and the same four names are built at
+      // 78/81/88/102 and again at 207/215/293/301. So AF3 really does build a
+      // (tokens, 24, 24, c) tensor inside the denoiser - once per sampling step
+      // per sample, ~1000 times in a 200-step 5-sample fold - and throw it
+      // away. Reading `_1` here gets AF3's ANSWER without AF3's waste, because
+      // nothing on this side ever builds the discarded half.
+      //
+      // Left exactly as it is on purpose. If upstream ever does want the waste
+      // gone, deleting the call is the one thing that cannot work: a haiku
+      // module's NAME is allocated by construction order, so the dead code is
+      // load-bearing for the naming and removing it renames this encoder's
+      // Linears onto the untrained tensors. Construct the four Linears and skip
+      // only the einsums, or give every one of them an explicit name that does
+      // not depend on what ran before it.
       singleToPairCondRow: await W("single_to_pair_cond_row_1"),
       singleToPairCondCol: await W("single_to_pair_cond_col_1"),
       embedPairOffsets: await W("embed_pair_offsets_1"),

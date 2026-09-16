@@ -100,6 +100,21 @@ That is also why the damage was a 0.72x contraction rather than an explosion: an
 untrained atom pair bias is one term among several, and the token transformer
 still carries the fold.
 
+🔴 **AND IT IS NOT A CORRECTNESS BUG IN ALPHAFOLD 3 - CHECKED AGAINST THEIR
+SOURCE, NOT THE FORK.** google-deepmind/alphafold3's unmodified
+`network/atom_cross_attention.py`: line 141 is
+`token_atoms_single_cond, _ = _per_atom_conditioning(config, batch, name)`,
+with no `need_pair` parameter at all, and the same four names are built at
+78/81/88/102 and again at 207/215/293/301 - while `embed_pair_offsets_valid`
+appears once, at 308, which is why it has no `_1`. Both halves are theirs.
+
+AF3's own answer is unaffected: the discarded tensor reaches nothing, and the
+names were allocated the same way during training, so the trained `_1` weights
+are exactly the ones its encoder reads at inference. What AF3 carries is dead
+compute (that tensor, ~1000 times in a default fold), four dead parameters, and
+a trap. **Kept as it is here on purpose** - this port reads `_1` directly and
+never builds the discarded half, so it gets AF3's answer without AF3's waste.
+
 🔴 **AND THE LESSON IS ABOUT HAIKU, NOT ABOUT ALPHAFOLD.** A module's NAME is
 allocated as a side effect of construction order, so "stop computing something
 whose result is discarded" is not a safe refactor whenever a later module
@@ -107,6 +122,13 @@ requests the same name: the dead code is load-bearing for the naming. The
 optimisation was right that the tensor is thrown away, and it was still wrong.
 The cheap way to have caught it is a parameter census - four names that used to
 be read and no longer are, and four that were never read and now are.
+
+**If upstream ever does want the waste gone**, the safe forms are to construct
+the four Linears and skip only the einsums, or to give every pair Linear in that
+file an explicit name that does not depend on what ran before it - then the
+naming is stated rather than inherited, and deleting work cannot move a weight.
+An annotated patch carrying that reasoning is at `~/af3-need-pair-fix.patch` on
+the A10; their tree is left clean.
 
 ### Why AlphaFold 3 alone, and why that read as the opposite
 
