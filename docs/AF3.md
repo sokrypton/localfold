@@ -67,6 +67,47 @@ HEAD, need_pair=False -> True            1.5314   <- the one-word fix upstream
 `_per_atom_conditioning(..., need_pair=True)`. Building the tensor is what
 claims the unsuffixed names; the point of the call is the naming, not the value.
 
+### 🔴 WHY THE REFERENCE HAD THIS AT ALL: THE UNSUFFIXED SET IS UNTRAINED
+
+Not inherited from AlphaFold 3 - INTRODUCED by removing something AlphaFold 3
+wastes. But the thing it wasted is real, and it is stranger than it looks.
+
+`_per_atom_conditioning`'s pair half is computed and discarded by AF3's OWN
+inference code. So those four Linears are created at init, never receive a
+gradient, and are serialised into the shipped checkpoint at their random initial
+values. Measured against haiku's `VarianceScaling(1.0, fan_in)`, whose std is
+`sqrt(1/fan_in)`, across three different fan-ins:
+
+| tensor | shape | fan_in | init std | actual | |
+|---|---|---:|---:|---:|---|
+| `single_to_pair_cond_row` | [128,16] | 128 | 0.0884 | **0.0877** | at init |
+| `single_to_pair_cond_row_1` | [128,16] | 128 | 0.0884 | 0.4063 | trained, 4.60x |
+| `single_to_pair_cond_col` | [128,16] | 128 | 0.0884 | **0.0881** | at init |
+| `single_to_pair_cond_col_1` | [128,16] | 128 | 0.0884 | 0.1859 | trained, 2.10x |
+| `embed_pair_offsets` | [3,16] | 3 | 0.5774 | **0.5657** | at init |
+| `embed_pair_offsets_1` | [3,16] | 3 | 0.5774 | 0.0137 | trained, 0.02x |
+| `embed_pair_distances` | [1,16] | 1 | 1.0000 | **0.7953** | at init |
+| `embed_pair_distances_1` | [1,16] | 1 | 1.0000 | 0.1548 | trained, 0.15x |
+
+Three fan-ins two orders apart, and every unsuffixed tensor lands on its own
+`sqrt(1/fan_in)`. The [1,16] row reads 0.80x, which is one sample standard error
+low for sixteen draws (relative SE is `1/sqrt(2(n-1))` = 18%) and is init too;
+its `_1` twin at 0.15x is not close to anything.
+
+**So AlphaFold 3 ships four dead parameter tensors, and the defect swapped the
+encoder's trained weights for Google's own accidental random initialisation.**
+That is also why the damage was a 0.72x contraction rather than an explosion: an
+untrained atom pair bias is one term among several, and the token transformer
+still carries the fold.
+
+🔴 **AND THE LESSON IS ABOUT HAIKU, NOT ABOUT ALPHAFOLD.** A module's NAME is
+allocated as a side effect of construction order, so "stop computing something
+whose result is discarded" is not a safe refactor whenever a later module
+requests the same name: the dead code is load-bearing for the naming. The
+optimisation was right that the tensor is thrown away, and it was still wrong.
+The cheap way to have caught it is a parameter census - four names that used to
+be read and no longer are, and four that were never read and now are.
+
 ### Why AlphaFold 3 alone, and why that read as the opposite
 
 Every PORTED bundle's converter writes one tensor into both names, so the choice
