@@ -38,8 +38,10 @@ import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
 import { buildTargetFeat, foldBatch } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
 import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
-import { af3Dialect, confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
-  from "../../src/af3/weights/weights.js";
+import {
+  af3Dialect, confidenceWeights, openAf3Store, openddeConfidenceWeights,
+  structuralExpanderWeights, structuralRefinerWeights, trunkDepths, trunkWeights,
+} from "../../src/af3/weights/weights.js";
 import { atomReference, diffusionWeights, targetFeatureWeights }
   from "../../src/af3/weights/diffusion-weights.js";
 import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
@@ -103,26 +105,48 @@ async function foldPass(device, model, sequence, steps) {
   const batch = af3BatchFromA3m(sequence, null,
     { ...featuriserDialect(dialectFor(dialect.model ?? dialect.name ?? "alphafold3")) }).batch;
   const depths = await trunkDepths(store);
+  const trunk = await trunkWeights(store, depths.pairformerBlocks, depths.msaBlocks,
+                                   { allowPrefix: true });
   const weights = {
-    trunk: await trunkWeights(store, depths.pairformerBlocks, depths.msaBlocks,
-                              { allowPrefix: true }),
+    trunk,
     diffusion: await diffusionWeights(store),
-    // A head this loader cannot read is not this gate's subject: boltz2 keeps
-    // its confidence under its own scope. Skipping it loses that stack's
-    // kernels and keeps every other one, which is better than losing the model.
-    confidence: await confidenceWeights(store).catch(() => undefined),
     atomReference: await atomReference(store),
     targetFeat: await targetFeatureWeights(store),
+    // 🔴 OpenDDE's SECOND TOKEN SPACE, WITHOUT WHICH IT CANNOT BE SWEPT AT ALL.
+    // It runs a structural-token expander and refiner and its OWN confidence
+    // head, so `foldBatch` with AF3's weight set dies before compiling any of
+    // them - which is why the first version of this gate covered opendde at
+    // `--stage=trunk` only and left its diffusion and confidence stacks
+    // unswept. The dialect says which set a bundle wants; AF3 and OpenBind-0
+    // take the other branch and are the control that this branch is not simply
+    // never taken.
+    ...(trunk.dialect.structuralTokens
+      ? { expander: await structuralExpanderWeights(store),
+          refiner: await structuralRefinerWeights(store),
+          openddeConfidence: await openddeConfidenceWeights(store) }
+      // 🔴 NO `.catch`. This was written to tolerate a head the loader cannot
+      // read, on the strength of a note about boltz2 keeping its confidence
+      // under its own scope - and boltz2 loads here and scores, so the
+      // tolerance was protecting nothing while silently turning a missing head
+      // into an unswept one. A bundle whose head will not load should fail.
+      : { confidence: await confidenceWeights(store) }),
   };
-  const sample = weights.trunk.msaBlocks[0];
+  const sample = trunk.msaBlocks[0];
   // 🔴 DIFFUSION, NOT FLOW: rosettafold3 REFUSES flow outright - see
   // `noFlowSampler` - and this gate must run every checkpoint. Four steps
   // will not converge and does not need to: a pipeline is compiled on the
   // first one, and nothing here reads the structure.
-  await foldBatch(device, batch, weights, { steps, mode: "diffusion", recycles: 0 });
+  const result = await foldBatch(device, batch, weights,
+                                 { steps, mode: "diffusion", recycles: 0 });
   return { msaHeads: sample.msaAttention1.heads,
            msaDimension: sample.msaAttention1.dimension,
-           pairChannels: sample.pairAttention1.heads * sample.pairAttention1.dimension };
+           pairChannels: sample.pairAttention1.heads * sample.pairAttention1.dimension,
+           // 🔴 REPORTED SO THE COVERAGE IS STATED AND NOT IMPLIED. `structural`
+           // says the expander, refiner and OpenDDE's OWN confidence head were
+           // the stacks that ran; `scored` says a head produced a number, which
+           // is how a silently skipped head is told from a swept one.
+           structural: trunk.dialect.structuralTokens === true,
+           scored: Number.isFinite(result.meanPlddt) };
 }
 
 export async function main(device, args) {
@@ -138,6 +162,7 @@ export async function main(device, args) {
     "/model-intellifold2-int5/manifest.json",
     "/model-rosettafold3-int5/manifest.json",
     "/model-openbind0-f32/manifest.json",
+    "/model-opendde-int5/manifest.json",
   ].join(",")).split(",").map((m) => m.trim()).filter((m) => m !== "");
   const models = [];
   for (const model of requested) {
@@ -180,11 +205,28 @@ export async function main(device, args) {
       throw error;
     }
   }
+  // 🔴 A STACK THAT DID NOT RUN IS NOT SWEPT, AND THAT REGRESSES SILENTLY.
+  // `foldBatch` skips a head whose weights are absent and returns a structure
+  // all the same, which is exactly how OpenDDE's diffusion and confidence sat
+  // outside this gate: its weight set needs an expander, a refiner and its own
+  // head, and without them the fold still finished. So the fold arm insists
+  // every model produced a confidence number.
+  if (stage === "fold") {
+    const silent = Object.entries(shapes).filter(([, s]) => !s.scored).map(([n]) => n);
+    if (silent.length > 0) {
+      throw new Error(`no confidence number from ${silent.join(", ")} - that head did `
+        + `not run, so its pipelines were never compiled and nothing here swept them`);
+    }
+  }
   console.log(`${models.length} models, both orders, one pipeline cache, `
     + `stage=${stage}: no collision`);
   for (const [name, s] of Object.entries(shapes)) {
     console.log(`  ${name.padEnd(24)} msa ${s.msaHeads}x${s.msaDimension}`
-      + `  pair ${s.pairChannels}`);
+      + `  pair ${String(s.pairChannels).padEnd(4)}`
+      + (stage === "fold"
+        ? `  ${s.structural ? "structural + own confidence" : "af3 confidence   "}`
+          + `  ${s.scored ? "scored" : "NO SCORE"}`
+        : ""));
   }
   return { models, tokens, rows, stage, shapes, collision: null };
 }
