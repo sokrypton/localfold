@@ -245,6 +245,41 @@ pLDDT appears nowhere for that model, and the key would have undone it in the
 one file a reader is most likely to parse. It is `atom_certainty` there, and the
 PAE is omitted rather than written from an absent matrix.
 
+🔴 **AND A LIGAND IS A CHAIN THE SCORES COUNT AND `chainLengths` DOES NOT.**
+`web/app.js` builds `chainLengths` as `chains.map((chain) => chain.length)` -
+the POLYMER rows - while the confidence scores are keyed by asym id, and
+AlphaFold 3 gives a ligand one of its own. So a 58-residue protein folded with
+GOL reached `summaryConfidencesJson` as ONE chain against TWO scored asym ids,
+`asymOrder` found the counts disagreed, fell back to the plain index, and every
+per-chain lookup missed. Measured on the page: `chain_ptm: [null]` and
+`chain_pair_max_contact: [[0.73]]` for a fold whose own `chain_ids` names A and
+B - so the protein's pTM was written as a null and the protein-ligand contact,
+the one number somebody folding with a ligand is looking for, was never written
+at all. 🔴 **AND THE SCALARS BESIDE THEM WERE RIGHT**, `ptm` 0.43 and
+`mean_plddt` 72.61, which is why nothing looked wrong. The chain list comes off
+the TOKEN chain ids now, which is what the rest of that file already writes:
+`chain_ptm: [0.44, 0.87]`, `chain_pair_max_contact: [[0.73, 0.17], [0.17,
+null]]`. The B diagonal stays null by design - a ligand's atoms share a residue
+number, so the within-six-residues rule drops its self-block. Gated by
+`test/fold-archive.test.js`, verified to fail first.
+
+🔴 **AND AN AF3-GRAPH PDB SAID NOTHING ABOUT ITSELF.** `toPdb` opened with
+`const lines = []` and pushed no REMARK, so a file saved from the page named
+neither the model that produced it nor the quantity in its B-factor column -
+measured as ZERO header lines in a downloaded `af3_1.pdb`, against the
+AlphaFold 2 path's `REMARK   1 ALPHAFOLD2 WEBGPU PREDICTION` and EF2-fast's two.
+Seven families share that writer, so all seven wrote an anonymous file with a
+pLDDT-shaped column nothing labelled. 🔴 **THE HEADER IS A CALLER'S, AND IN TWO
+PARTS FOR A REASON**: the page supplies the model - `modelName`, never a
+literal, since an OpenBind-0 fold claiming to be AlphaFold 3 is worse than an
+anonymous one - and `web/af3-model.js` adds the B-factor line only where
+`result.scores.plddt` exists, because a family on this graph with no confidence
+head writes zeros there and the word would be the mislabelling EF2-fast's own
+REMARK exists to prevent. `toPdb` emits nothing unless asked, which is what
+keeps three tests and several tools reading the output they already parse.
+`tools/fold-in-page.py --download-pdb` presses the button and reads the bytes
+BACK - it is the other half of `--download`, and nothing had ever pressed it.
+
 🔴 **AND `chain_pair_max_contact` IS THE ONE SCORE A MODEL WITH NO CONFIDENCE
 HEAD CAN STILL GIVE.** AlphaFold 3 splits intra- from cross-chain too, but only
 through ipTM - `iptm_ichain` and `iptm_xchain` in its own code - and through the
