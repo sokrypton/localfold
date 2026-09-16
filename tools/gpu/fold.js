@@ -21,6 +21,7 @@ import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
 import { mergeRowAlignedChainA3ms } from "../../src/input/chains.js";
 import { foldBatch, toPdb, backboneGeometry } from "../../src/af3/fold.js";
 import { assertChainGeometry } from "./chain-geometry.js";
+import { bondGeometry } from "./bond-geometry.js";
 import { confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
   from "../../src/af3/weights/weights.js";
 import { warmTrunkPipelines } from "../../src/af3/fold.js";
@@ -674,6 +675,17 @@ export async function main(device, args) {
   let diffusionStarted = 0;
   const trajectory = [];
   let lastDenoised = null;
+  // 🔴 THE DENOISER'S OWN ANSWER, SCORED AS CHEMISTRY, AT EVERY NOISE LEVEL.
+  // `denoisedPdb` alone cannot separate the network from the walk: at the
+  // schedule's last sigma the preconditioner's skip term is 0.99996, so D is
+  // the input and scoring it scores the trajectory that produced it. The
+  // model's structural opinion is only visible at LARGE sigma, where the skip
+  // is 0.5 and out_scale is 11.3 - so the arm that answers "are the side
+  // chains collapsed because of the sampler or because of the head" is this
+  // whole column, not its last row.
+  const bondTrajectory = args.includes("--bond-trajectory") ? [] : null;
+  const conformers = bondTrajectory === null ? null
+    : await (await fetch("/tools/oracle/reference-conformers.json")).json();
   for (let attempt = 0; attempt < folds; attempt += 1) {
   if (profile !== null && attempt === folds - 1) profile.reset();
   if (buffers !== null && attempt === folds - 1) buffers.reset();
@@ -803,6 +815,15 @@ export async function main(device, args) {
         trajectory.push({ step, noiseLevel,
                           denoised: Array.from(denoised),
                           positions: Array.from(positions) });
+      }
+      if (bondTrajectory !== null) {
+        const score = (flat) => {
+          const r = bondGeometry(toPdb(batch, flat), conformers);
+          return { mainchain: Number((r.mainchain.rms ?? NaN).toFixed(4)),
+                   sidechain: Number((r.sidechain.rms ?? NaN).toFixed(4)) };
+        };
+        bondTrajectory.push({ step, noiseLevel: Number(noiseLevel.toFixed(4)),
+                              denoised: score(denoised), positions: score(positions) });
       }
       if (step === 1 || step % Math.ceil(steps / 5) === 0 || step === steps) {
         console.log(`  step ${String(step).padStart(3)}/${steps}  sigma`
@@ -955,6 +976,7 @@ export async function main(device, args) {
     iptm: Number.isNaN(result.iptm) ? null : result.iptm,
     geometry: { nca: { median: nca }, cac: { median: cac }, caca: { median: caca } },
     gyration, seconds: foldSeconds[foldSeconds.length - 1], pdb: result.pdb, trajectory,
+    ...(bondTrajectory === null ? {} : { bondTrajectory }),
     // What the device is holding at the end, which nothing else reports.
     memory: memorySnapshot(device),
   };

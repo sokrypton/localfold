@@ -35,6 +35,7 @@ import { layerNormSlow } from "../../src/af3/diffusion/atom-encoder-reference.js
 import { linear } from "../../src/af3/trunk/pairformer-reference.js";
 import { af3Dialect, openAf3Store } from "../../src/af3/weights/weights.js";
 import { perAtomConditioning } from "../../src/af3/diffusion/atom-conditioning-reference.js";
+import { denseBondGeometry } from "./bond-geometry.js";
 import { atomReference, diffusionWeights } from "../../src/af3/weights/diffusion-weights.js";
 
 const option = (args, name, fallback) => {
@@ -419,6 +420,39 @@ export async function main(device, args) {
   console.log(`denoise GPU\ttokens=${tokens} noise=${dump.noise}`
     + `\trelRMS ${results.gpu.toExponential(2)}`
     + `\tours rms ${rms(gpu.positions).toFixed(4)}\tnative rms ${rms(expected).toFixed(4)}`);
+
+  // 🔴 AND THE ANSWER AS CHEMISTRY, WHICH A relRMS CANNOT SEE. Two denoiser
+  // outputs agreeing to 1e-5 is a statement about the arithmetic; whether
+  // either of them is a molecule is a different question, and it is the one
+  // that separated a port folding 6MRR to 0.65 A with side-chain bonds at
+  // 0.339 A rms from a reference at 0.051 on the same sequence. The ideal
+  // length is `ref_pos`'s own, so this scores native's output and this port's
+  // by one rule. `clean` is the structure the noisy input was built from, when
+  // the dump carries one - the floor both sides are aiming at.
+  if (args.includes("--bonds")) {
+    const layout = { refPos: Float32Array.from(dump.inputs.ref_pos.data),
+                     refMask: Float32Array.from(dump.inputs.ref_mask.data),
+                     nameChars: Float32Array.from(dump.inputs.ref_atom_name_chars.data),
+                     tokens, maxAtoms: dump.maxAtoms };
+    const show = (label, flat) => {
+      const r = denseBondGeometry(flat, layout);
+      console.log(`  bonds ${label.padEnd(16)} mainchain rms ${r.mainchain.rms.toFixed(4)}`
+        + `  sidechain rms ${r.sidechain.rms.toFixed(4)}`
+        + `  mean ${r.sidechain.mean.toFixed(4)}`
+        + `  short ${(100 * r.sidechain.short / r.sidechain.bonds).toFixed(0)}%`
+        + `  (n=${r.sidechain.bonds})`);
+      return { mainchain: Number(r.mainchain.rms.toFixed(4)),
+               sidechain: Number(r.sidechain.rms.toFixed(4)),
+               sidechainMean: Number(r.sidechain.mean.toFixed(4)) };
+    };
+    results.bonds = {
+      ...(dump.inputs.clean === undefined ? {}
+        : { clean: show("clean input", Float32Array.from(dump.inputs.clean.data)) }),
+      noisy: show("noisy input", Float32Array.from(dump.inputs.posNoisy.data)),
+      native: show("native D", expected),
+      ours: show("our D", gpu.positions),
+    };
+  }
 
   // 🔴 AND THE ARITHMETIC ENVELOPE, because for one of these models a constant
   // bound is the wrong question. boltz2's 24-block token transformer amplifies

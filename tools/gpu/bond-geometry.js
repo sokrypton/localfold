@@ -170,3 +170,63 @@ export function bondReport(result) {
     : `${name} ${result[name].rms.toFixed(3)} (${result[name].bonds})`;
   return ["mainchain", "sidechain", "peptide", "ligand"].map(cell).join("  ");
 }
+
+/**
+ * The same rule over AF3's DENSE `[tokens, maxAtoms, 3]` grid, scored against
+ * the reference conformer positions the batch itself carries.
+ *
+ * 🔴 WHY A SECOND ENTRY POINT RATHER THAN A PDB. An oracle dump is a grid and a
+ * set of `ref_*` features; turning it into a PDB needs residue names, a chain
+ * map and the terminal-atom convention, and every one of those is a place for
+ * the two sides of a comparison to differ for reasons that are not the model's.
+ * Here the ideal length is `ref_pos`'s own distance - the same number the
+ * featuriser handed the model - so native's answer and this port's are scored
+ * by one rule with nothing in between.
+ *
+ * @param {Float32Array} positions [tokens * maxAtoms * 3]
+ * @param {{refPos: Float32Array, refMask: Float32Array,
+ *          nameChars: Float32Array, tokens: number, maxAtoms: number}} layout
+ */
+export function denseBondGeometry(positions, layout) {
+  const { refPos, refMask, nameChars, tokens, maxAtoms } = layout;
+  const name = (token, slot) => {
+    let text = "";
+    for (let c = 0; c < 4; c += 1) {
+      const code = nameChars[(token * maxAtoms + slot) * 4 + c];
+      if (code > 0) text += String.fromCharCode(code + 32);
+    }
+    return text.trim();
+  };
+  const at = (source, token, slot) => {
+    const base = (token * maxAtoms + slot) * 3;
+    return [source[base], source[base + 1], source[base + 2]];
+  };
+  const classes = { mainchain: [], sidechain: [] };
+  const bonds = [];
+  for (let token = 0; token < tokens; token += 1) {
+    for (let i = 0; i < maxAtoms; i += 1) {
+      if (refMask[token * maxAtoms + i] === 0) continue;
+      for (let j = i + 1; j < maxAtoms; j += 1) {
+        if (refMask[token * maxAtoms + j] === 0) continue;
+        const ideal = distance(at(refPos, token, i), at(refPos, token, j));
+        if (ideal > BONDED_ANGSTROMS || ideal === 0) continue;
+        const a = name(token, i), b = name(token, j);
+        const kind = MAINCHAIN.has(a) && MAINCHAIN.has(b) ? "mainchain" : "sidechain";
+        const seen = distance(at(positions, token, i), at(positions, token, j));
+        classes[kind].push(seen - ideal);
+        bonds.push({ token, kind, label: `${a}-${b}`, ideal, seen });
+      }
+    }
+  }
+  const rms = (v) => (v.length === 0 ? null
+    : Math.sqrt(v.reduce((s, d) => s + d * d, 0) / v.length));
+  const mean = (v) => (v.length === 0 ? null : v.reduce((s, d) => s + d, 0) / v.length);
+  return {
+    mainchain: { rms: rms(classes.mainchain), mean: mean(classes.mainchain),
+                 bonds: classes.mainchain.length },
+    sidechain: { rms: rms(classes.sidechain), mean: mean(classes.sidechain),
+                 bonds: classes.sidechain.length,
+                 short: classes.sidechain.filter((d) => d < 0).length },
+    bonds,
+  };
+}
