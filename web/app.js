@@ -179,6 +179,32 @@ async function agreeModelTerms(family) {
   // page unfoldable - the deploy-side gate still stands either way.
   if (dialog === null || typeof dialog.showModal !== "function") return family;
 
+  // 🔴 THE ALTERNATIVES ARE THE MODEL ROW'S OWN OPTIONS, READ WHEN THE DIALOG
+  // OPENS. The dialog used to name OpenBind-0 alone, so declining AlphaFold 3
+  // meant accepting one particular substitute or going and working the control
+  // yourself. Cloning the row is what keeps the two lists from drifting: a
+  // model added to the page appears here, and one build_site.py drops from
+  // dist/index.html because its bundle is unservable never does.
+  //
+  // 🔴 AND THE GATED FAMILY IS NOT AMONG THEM. Offering af3 as its own escape
+  // would hand back the model whose terms this is asking about, without the
+  // acceptance it exists to record.
+  const row = document.getElementById("model-family");
+  const chooser = document.getElementById("model-terms-alternative");
+  if (chooser !== null && row !== null) {
+    const held = chooser.value;
+    chooser.replaceChildren(...[...row.options]
+      .filter((option) => option.value !== family)
+      .map((option) => new Option(option.textContent.trim(), option.value)));
+    const offered = [...chooser.options].map((option) => option.value);
+    // ...OpenBind-0 unless somebody has already moved it: it runs this same
+    // graph under Apache 2.0, which makes it the nearest model to the one being
+    // declined rather than merely the first in the list.
+    const start = offered.includes(held) ? held
+      : (offered.includes("openbind0") ? "openbind0" : offered[0]);
+    if (start !== undefined) chooser.value = start;
+  }
+
   dialog.returnValue = "";
   dialog.showModal();
   await new Promise((resolve) => dialog.addEventListener("close", resolve, { once: true }));
@@ -187,17 +213,21 @@ async function agreeModelTerms(family) {
     rememberTermsAccepted();
     return "af3";
   }
-  if (dialog.returnValue === "openbind0") {
+  if (dialog.returnValue === "switch") {
+    const picked = chooser?.value;
+    // 🔴 NOTHING TO SWITCH TO IS NOT A FOLD. An empty chooser - no dialog
+    // markup, or a page whose model row holds only the gated family - must
+    // cancel rather than fall through to folding with the model just declined.
+    if (picked === undefined || picked === "" || picked === family) return null;
     // 🔴 THE ROW IS UPDATED, NOT JUST THE FOLD. Folding with a model the
     // control does not name is a page whose state is written nowhere on it -
     // the same fault the "Auto" model setting had before it was removed.
-    const select = document.getElementById("model-family");
-    if (select !== null) {
-      select.value = "openbind0";
+    if (row !== null) {
+      row.value = picked;
       syncModelControls();
       syncMode();
     }
-    return "openbind0";
+    return picked;
   }
   // Escape, or a click on the backdrop. Not an answer, so not a fold.
   return null;

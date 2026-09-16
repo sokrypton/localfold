@@ -1070,9 +1070,16 @@ AI Context: STANDALONE WEB APP ENTRY POINT
           These are Google DeepMind's parameters. They are not available for
           commercial use and carry a prohibited-use policy.
         </p>
+        <!-- 🔴 EVERY MODEL THE PAGE OFFERS, NOT ONE. This named OpenBind-0 and
+             nothing else, so somebody who would rather fold with Boltz-2 or
+             EF2-fast had to dismiss the dialog, find the model row and set it
+             themselves - which is the state this page is otherwise careful
+             never to leave anybody in. OpenBind-0 is still what the chooser
+             starts on: it is the one that runs this same graph under Apache
+             2.0, so it is the nearest thing to the model being declined. -->
         <p class="terms-body">
           <strong>OpenBind-0</strong> runs the same architecture under Apache 2.0.
-          It is a different model.
+          It is a different model, and so is every other choice below.
         </p>
         <p class="terms-links">
           <a href="https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md"
@@ -1090,9 +1097,23 @@ AI Context: STANDALONE WEB APP ENTRY POINT
           <a href="https://openbind.uk/news/blog-openbind-0-advancing-open-molecular-structure-prediction/"
              target="_blank" rel="noopener noreferrer">about OpenBind-0</a>
         </p>
+        <!-- 🔴 EMPTY, AND FILLED FROM THE MODEL ROW WHEN THE DIALOG OPENS. A
+             second copy of the family list here is the allow-list that goes
+             stale - this file's own recurring bug - and it would re-offer a
+             model tools/build_site.py drops from dist/index.html when its
+             bundle is not servable. The row is the one list. -->
+        <div class="terms-choice">
+          <label class="terms-choice-label" for="model-terms-alternative">Fold with</label>
+          <select id="model-terms-alternative" class="terms-select"
+                  aria-label="Which model to fold with instead"></select>
+        </div>
         <div class="terms-actions">
-          <button type="submit" value="openbind0" class="terms-button terms-button-primary"
-                  id="model-terms-switch">Use OpenBind-0 instead</button>
+          <!-- 🔴 THE VALUE IS "switch", NOT A FAMILY. A submit button's value
+               becomes the dialog's returnValue, and one that says "openbind0"
+               while the chooser says Boltz-2 is a lie the handler would have to
+               ignore. What was picked is read from the chooser. -->
+          <button type="submit" value="switch" class="terms-button terms-button-primary"
+                  id="model-terms-switch">Use this model instead</button>
           <!-- 🔴 A FILLED BUTTON TOO, because an outline beside a filled one
                reads as a cancel rather than as the other half of a choice -
                and this dialog's whole point is that there are two real

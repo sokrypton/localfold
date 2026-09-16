@@ -140,6 +140,48 @@ def main():
                      what="the model row to switch to openbind0", timeout=20)
         print("switch: model row now openbind0")
 
+        # 3b. AND TO A MODEL THAT IS NOT THE DEFAULT ONE. A switch wired to the
+        # literal "openbind0" passes step 3 forever however the chooser is
+        # wired, so the only thing that says the dialog hands back what was
+        # PICKED is picking something else. A fresh page, because step 3 started
+        # a real fold - see the note at step 4.
+        ws.call("Page.navigate", url="http://127.0.0.1:%d/index.html" % PORT)
+        cdp.wait_for(ws, "typeof window.processFiles === 'function'"
+                         " && !document.getElementById('predict').disabled",
+                     what="the page to reload before choosing an alternative")
+        setup(ws, accepted=False)
+        cdp.evaluate(ws, "document.getElementById('predict').click()")
+        cdp.wait_for(ws, "!!document.getElementById('model-terms')?.open",
+                     what="the terms dialog to open for the chooser", timeout=20)
+        chosen = cdp.evaluate(ws, """(() => {
+          const select = document.getElementById('model-terms-alternative');
+          if (!select) return 'missing';
+          const values = [...select.options].map((o) => o.value);
+          // 🔴 THE GATED MODEL MUST NOT BE ITS OWN ESCAPE HATCH.
+          if (values.includes('af3')) return 'offers the gated model itself';
+          const row = [...document.getElementById('model-family').options]
+            .map((o) => o.value).filter((v) => v !== 'af3');
+          if (values.length !== row.length) return 'does not match the model row';
+          const pick = values.find((v) => v !== 'openbind0');
+          if (pick === undefined) return 'only openbind0 is offered';
+          select.value = pick;
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+          return pick;
+        })()""")
+        print("chooser offers:", chosen)
+        if chosen in ("missing", "offers the gated model itself",
+                      "does not match the model row", "only openbind0 is offered"):
+            failures.append("the dialog's model chooser: %s" % chosen)
+        else:
+            cdp.evaluate(ws, "document.getElementById('model-terms-switch').click()")
+            try:
+                cdp.wait_for(ws,
+                             "document.getElementById('model-family').value === %r" % chosen,
+                             what="the model row to switch to %s" % chosen, timeout=20)
+                print("switch: model row now %s" % chosen)
+            except RuntimeError:
+                failures.append("choosing %s did not change the model row" % chosen)
+
         # 4a. The dialog laid out at a phone's width, which nothing else does.
         ws.call("Emulation.setDeviceMetricsOverride", width=320, height=720,
                 deviceScaleFactor=1, mobile=True)

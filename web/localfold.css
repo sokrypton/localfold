@@ -1051,6 +1051,25 @@
 .terms-links { margin: 0; font-size: 11.5px; color: #6b7280; }
 .terms-links a { color: #2563eb; }
 .terms-note { margin: 0; font-size: 11px; color: #6b7280; }
+/* The chooser: which model to fold with instead. Its options are cloned from
+   the model row when the dialog opens, so this styles a list whose longest
+   label is not known here - hence min-width: 0 on the select, without which a
+   flex item refuses to shrink below its content and pushes the dialog wider
+   than the viewport. tools/model-terms.py measures that at 320px. */
+.terms-choice { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+.terms-choice-label { font-size: 12.5px; color: #374151; }
+.terms-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+  font-size: 12.5px;
+  color: #374151;
+}
 /* 🔴 THE ALTERNATIVE READS FIRST, and it is the one styled as the primary
    action. A dialog whose only emphasis is on "I agree" is a toll gate; the
    point of this one is that there is somewhere else to go. */

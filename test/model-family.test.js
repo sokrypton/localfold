@@ -238,6 +238,37 @@ describe("the licence dialog", () => {
     assert.match(page, /id="model-terms-accept"/);
   });
 
+  // 🔴 EVERY MODEL THE PAGE OFFERS, NOT ONE OF THEM. The dialog's whole claim
+  // is that the acknowledgement is a decision with an alternative - and it
+  // named exactly one alternative, OpenBind-0, while the model row offers ten.
+  // Somebody who would rather fold with Boltz-2 or EF2-fast had to dismiss the
+  // dialog, find the row and set it themselves, which is the state this page
+  // is careful never to leave people in.
+  it("offers a choice of alternatives, not only OpenBind-0", () => {
+    const dialog = page.slice(page.indexOf('id="model-terms"'), page.indexOf("</dialog>"));
+    assert.match(dialog, /id="model-terms-alternative"/);
+    // 🔴 AND THE MARKUP CARRIES NO MODEL LIST OF ITS OWN. A second copy of the
+    // family list here is this repository's oldest recurring bug - an
+    // allow-list that goes stale - and it would also re-offer a model
+    // build_site.py drops from dist/index.html when its bundle is unservable.
+    // The list is the model row's, read when the dialog opens.
+    const chooser = dialog.slice(dialog.indexOf('id="model-terms-alternative"'));
+    assert.doesNotMatch(chooser.slice(0, chooser.indexOf("</select>")), /<option/);
+  });
+
+  it("hands back the model that was chosen, not a literal", () => {
+    const gate = app.slice(app.indexOf("async function agreeModelTerms"),
+                           app.indexOf("function termsAccepted"));
+    assert.ok(gate.length > 0, "agreeModelTerms is not where this test expects");
+    // The switch branch reads the chooser; it cannot be wired to one family.
+    assert.match(gate, /model-terms-alternative/);
+    assert.doesNotMatch(gate, /return "openbind0";/);
+    // 🔴 AND THE GATED FAMILY IS NOT AN ESCAPE FROM ITSELF. Offering af3 in the
+    // list would let the dialog hand back the model whose terms it is asking
+    // about, without the acceptance it exists to record.
+    assert.match(app, /model-terms-alternative/);
+  });
+
   it("does not call the parameters closed source, which they are not", () => {
     // 🔴 THE CODE IS OPENLY LICENSED; THE PARAMETERS ARE USE-RESTRICTED. A
     // dialog asking somebody to accept a licence must not misstate it.
