@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-311 tools. `tools/fixtures/` is data and is not listed.
+313 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (184)
 
@@ -203,7 +203,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (39)
+## `tools/oracle/` - the reference side (40)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -243,6 +243,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
 - **`dump_truncated.py`** - One evoformer block on each side, so a difference has one place to live.
 - **`embedder_reference.py`** - The embedder's pair init, computed straight from the inputs and weights.
+- **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
 - **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
@@ -272,7 +273,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (70)
+## `tools/` - everything else (71)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -301,6 +302,7 @@ go through CDP, and the deploy.
 - **`check-esmfold2-sampler.js`** - ESMFold2's EDM sampler, in the parts a port can actually be held to.
 - **`check-esmfold2-trunk.js`** - Does LocalFold's pairformer arithmetic compute ESMFold2's trunk?
 - **`check-ligand-path.mjs`** - Every AF3-lineage model folds a LIGAND, and its bonds are the right length.
+- **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
