@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-307 tools. `tools/fixtures/` is data and is not listed.
+309 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (182)
 
@@ -201,7 +201,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (37)
+## `tools/oracle/` - the reference side (39)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -229,6 +229,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_denoise_stages.py`** - The SAME denoise step as dump_af3_denoise.py, with af3-any-model's own intermediates recorded alongside the answer.
 - **`dump_af3_opendde_confidence.py`** - af3-any-model's OpenDDE ConfidenceHead, inputs and outputs.
 - **`dump_af3_params_digest.py`** - A digest of every tensor af3-any-model would load, for a bundle to be held to.
+- **`dump_af3_real_denoise.py`** - Dump one denoise step from a REAL fold: real trunk conditioning, real structure.
 - **`dump_af3_scopes.py`** - Every haiku scope's OUTPUT in one denoise step, as a summary plus (optionally) the tensor itself.
 - **`dump_af3_template.py`** - Dump a model's TEMPLATE EMBEDDER - its features, its inputs and its output.
 - **`dump_af3_trunk.py`** - Run the AF3 trunk on a toy protein, on CPU, and dump inputs and outputs.
@@ -240,6 +241,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
 - **`dump_truncated.py`** - One evoformer block on each side, so a difference has one place to live.
 - **`embedder_reference.py`** - The embedder's pair init, computed straight from the inputs and weights.
+- **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
 - **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
 - **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
