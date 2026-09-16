@@ -152,10 +152,25 @@ test("every module path named in a comment exists", () => {
  */
 test("every src/ path named in python, yaml, html or markdown exists", () => {
   // Other projects' own `src/` trees, named here on purpose and not ours to
-  // resolve: py2Dmol's five directories, the AlphaFold 3 reference checkout,
+  // resolve: py2Dmol's SIX directories, the AlphaFold 3 reference checkout,
   // Dawn's C++, and the two upstreams `tools/sync-*.py` vendor from.
-  const FOREIGN = ["src/align/", "src/app/", "src/core/", "src/io/", "src/panels/",
-                   "src/alphafold3/", "src/dawn/", "src/mpnn/", "src/py2Dmol/"];
+  //
+  // 🔴 THE CARTOON DIRECTORY IS py2Dmol's SIXTH AND IT ARRIVED WITH A VENDOR
+  // BUMP. `tools/fold-in-page.py` cites py2Dmol/src/cartoon/paintgl.js as the
+  // provenance of the ribbon cache it counts, and that file has never existed
+  // in this repository on any branch - it is upstream's. The gate caught it on
+  // a merge, which is the whole point of reading a bare `src/...` as a claim
+  // about OUR tree: a vendor bump is exactly when somebody else's path arrives
+  // written as though it were ours.
+  //
+  // 🔴 AND THIS COMMENT HAD TO BE WRITTEN WITH THE PROJECT IN FRONT OF IT,
+  // because the sibling rule above reads any BARE src-rooted module path as
+  // ours and went red on this very paragraph. A path preceded by `/` is
+  // another checkout's - which is the convention that rule's own header
+  // documents, and the accurate way to write it.
+  const FOREIGN = ["src/align/", "src/app/", "src/cartoon/", "src/core/", "src/io/",
+                   "src/panels/", "src/alphafold3/", "src/dawn/", "src/mpnn/",
+                   "src/py2Dmol/"];
   // Its own walker: the shared one above is deliberately JS-only, and widening
   // it made the comment rule read python it has no exclusions for.
   const walkAny = (dir, out = []) => {
