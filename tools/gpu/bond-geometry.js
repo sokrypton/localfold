@@ -40,6 +40,17 @@ const PEPTIDE_BROKEN = 2.5;
 
 const MAINCHAIN = new Set(["N", "CA", "C", "O", "OXT"]);
 
+/**
+ * The standard nucleotides, so a base is not reported as a ligand.
+ *
+ * 🔴 A NUCLEOTIDE IS SCORED THROUGH THE COMPONENT PATH LIKE A LIGAND AND IS NOT
+ * ONE. Both take their ideals from the CCD because `reference-conformers.json`
+ * covers only the twenty amino acids, but calling a guanine a ligand in the
+ * report makes an RNA row unreadable and hides a torn ligand in a complex that
+ * also has RNA. The class is the chemistry, not the code path.
+ */
+const NUCLEIC = new Set(["A", "C", "G", "U", "DA", "DC", "DG", "DT", "I", "DI", "N"]);
+
 const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
 /**
@@ -94,7 +105,7 @@ export function parsePdbResidues(text) {
 export function bondGeometry(pdb, conformers, options = {}) {
   const residues = parsePdbResidues(pdb);
   const cache = new Map();
-  const classes = { mainchain: [], sidechain: [], peptide: [], ligand: [] };
+  const classes = { mainchain: [], sidechain: [], peptide: [], nucleic: [], ligand: [] };
   const offenders = [];
 
   const record = (kind, label, seen, ideal) => {
@@ -110,10 +121,18 @@ export function bondGeometry(pdb, conformers, options = {}) {
       // GIVEN. Guessing them from the PREDICTION would score the fold against
       // itself and always pass - which is the shape of the `relative-rms over a
       // non-array returns 0` trap this repository already records.
-      for (const [a, b, ideal] of options.ligandBonds ?? []) {
+      // 🔴 A COMPONENT FROM THE DICTIONARY OUTRANKS A HAND-TYPED LIST, and
+      // covers what no list did: nucleotides and modified residues, not only
+      // ligands. `components` is code -> parseCcdComponent output.
+      const supplied = options.components?.get?.(residue.code);
+      const table = supplied !== undefined
+        ? componentBonds(supplied) : (options.ligandBonds ?? []);
+      for (const [a, b, ideal] of table) {
         const first = residue.atoms.get(a); const second = residue.atoms.get(b);
         if (first === undefined || second === undefined) continue;
-        record("ligand", `${residue.code} ${a}-${b}`, distance(first, second), ideal);
+        record(NUCLEIC.has(residue.code) ? "nucleic" : "ligand",
+               `${residue.code}${residue.number} ${a}-${b}`,
+               distance(first, second), ideal);
       }
       continue;
     }
@@ -144,9 +163,10 @@ export function bondGeometry(pdb, conformers, options = {}) {
     mainchain: { rms: rms(classes.mainchain), bonds: classes.mainchain.length },
     sidechain: { rms: rms(classes.sidechain), bonds: classes.sidechain.length },
     peptide: { rms: rms(classes.peptide), bonds: classes.peptide.length },
+    nucleic: { rms: rms(classes.nucleic), bonds: classes.nucleic.length },
     ligand: { rms: rms(classes.ligand), bonds: classes.ligand.length },
     all: { rms: rms([...classes.mainchain, ...classes.sidechain,
-                     ...classes.peptide, ...classes.ligand]),
+                     ...classes.peptide, ...classes.nucleic, ...classes.ligand]),
            bonds: offenders.length },
     worst: offenders.slice(0, 5).map((o) => ({
       ...o, seen: Number(o.seen.toFixed(3)), ideal: Number(o.ideal.toFixed(3)),
@@ -168,7 +188,45 @@ function oneLetter(code) {
 export function bondReport(result) {
   const cell = (name) => result[name].rms === null ? `${name} -`
     : `${name} ${result[name].rms.toFixed(3)} (${result[name].bonds})`;
-  return ["mainchain", "sidechain", "peptide", "ligand"].map(cell).join("  ");
+  return ["mainchain", "sidechain", "peptide", "nucleic", "ligand"].map(cell).join("  ");
+}
+
+
+/**
+ * The bonded pairs of a CCD component and their ideal lengths, from the
+ * dictionary's own bond list and ideal coordinates.
+ *
+ * 🔴 THIS IS WHY A LIGAND NO LONGER NEEDS A HAND-TYPED TABLE, AND WHY NUCLEIC
+ * ACIDS CAN BE SCORED AT ALL. `reference-conformers.json` is twenty amino acids
+ * and an X, so a glycerol's five bonds were typed into two files and a DA, DC,
+ * DG, DT, A, C, G or U could not be scored by anything here. The CCD is not the
+ * prediction - it is the authority the featuriser itself reads through
+ * `parseCcdComponent` - so taking ideals from it does not score a fold against
+ * itself, which is the trap `ligandBonds` existed to avoid.
+ *
+ * 🔴 AND IT USES THE DICTIONARY'S BOND LIST, NOT A DISTANCE CUTOFF. The
+ * conformer path infers a bond from `BONDED_ANGSTROMS`, which is sound for an
+ * amino acid and guesswork on a crowded ring; `_chem_comp_bond` states them,
+ * with orders. A component whose ideal coordinates are all zero - the
+ * dictionary carries some - yields no bonds rather than a table of noise.
+ */
+export function componentBonds(component) {
+  const atoms = component.atoms ?? [];
+  // 🔴 `parseCcdComponent` GIVES x/y/z, NOT A `pos` TRIPLE - the conformer set's
+  // shape. Reading `atom.pos[0]` here threw on the first component tried.
+  const at = (atom) => [atom.x, atom.y, atom.z];
+  const spread = atoms.reduce((most, atom) =>
+    Math.max(most, Math.abs(atom.x), Math.abs(atom.y), Math.abs(atom.z)), 0);
+  if (spread === 0) return [];
+  const bonds = [];
+  for (const bond of component.bonds ?? []) {
+    const from = atoms[bond.from], to = atoms[bond.to];
+    if (from === undefined || to === undefined) continue;
+    const ideal = distance(at(from), at(to));
+    if (!(ideal > 0)) continue;
+    bonds.push([from.name, to.name, ideal]);
+  }
+  return bonds;
 }
 
 /**

@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-310 tools. `tools/fixtures/` is data and is not listed.
+311 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (183)
+## `tools/gpu/` - the WebGPU lane (184)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -40,6 +40,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-row-normalize.js`** - Row LayerNorm, three arrangements, at the shapes an AF2 block normalises.
 - **`bench-runtime.js`** - How long a fold takes, as a function of what was asked for.
 - **`bench-sampler-bonds.js`** - Which sampler setting keeps a structure's BONDS, on proteins with little or no alignment?
+- **`bench-sampler-geometry.js`** - Which sampler keeps a molecule's GEOMETRY - across ligands and nucleic acids, not just protein?
 - **`bench-single-project.js`** - The single track's q/k/v/gate projection, at several splits of its width.
 - **`bench-transition.js`** - The pair transition alone, at several row tiles, interleaved in one process.
 - **`bench-triangle-project.js`** - The two triangle projection kernels alone, at several register blocks.

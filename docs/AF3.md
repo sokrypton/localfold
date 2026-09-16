@@ -1,5 +1,85 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 SAMPLER AND STEP COUNT, SCORED AS GEOMETRY ACROSS LIGANDS AND NUCLEIC ACIDS
+
+`tools/gpu/bench-sampler-geometry.js`: five models x seven systems x four arms x
+two seeds, scored on BOND GEOMETRY rather than RMSD. The systems are protein,
+protein+GOL, protein+ATP, protein+SEP, RNA, DNA and protein+DNA - every prior
+sampler comparison here was protein-only, which is why none of what follows had
+been seen.
+
+🔴 **THE IDEALS COME FROM THE CCD NOW, WHICH IS WHAT MADE THE SET POSSIBLE.**
+`reference-conformers.json` is twenty amino acids and an X, so a ligand needed
+its bonds typed in by hand (five, for glycerol, in two files) and a nucleotide
+could not be scored by anything here at all. `componentBonds` reads
+`_chem_comp_bond` and the ideal coordinates from the same dictionary the
+FEATURISER reads - stated bonds with orders, not a distance cutoff, and not the
+prediction, so a fold is still not scored against itself. Calibrated against the
+hand-typed glycerol table: 1.429 against 1.43, 1.530 against 1.52.
+
+### The step count matters far more than the sampler
+
+**`diffusion200` wins 95 of 105 (model, system, bond class) cells.** The page
+prefers **25**, and on a plain protein that is nearly free - AlphaFold 3's
+mainchain is 0.0416 at 25 against 0.0383 at 200. On anything with a ligand or a
+modified residue it is not:
+
+| | d25 | d200 | ratio |
+|---|---:|---:|---:|
+| rosettafold3, ATP | **0.3201** | 0.0469 | 6.8x |
+| intellifold2, ATP | **0.3196** | 0.0476 | 6.7x |
+| rosettafold3, SEP | **0.2802** | 0.0573 | 4.9x |
+| intellifold2, GOL | **0.1205** | 0.0388 | 3.1x |
+| rosettafold3, GOL | **0.1303** | 0.0571 | 2.3x |
+| alphafold3, SEP | **0.1260** | 0.0591 | 2.1x |
+| boltz2, GOL | 0.0799 | 0.0292 | 2.7x |
+
+A protein backbone is converged at 25 steps and a ligand is not. Every step
+count ever chosen here was chosen on a protein.
+
+### Flow, on geometry rather than RMSD
+
+The page's two settings head to head, diffusion 25 against flow 16, over every
+cell:
+
+```
+  diffusion25 better 50   flow16 better 17   tie (<0.002 A) 17
+    mainchain   d25 13  f16  3  tie 4
+    sidechain   d25  9  f16  2  tie 9
+    peptide     d25 18  f16  2  tie 0
+    ligand      d25  6  f16  6  tie 0
+    nucleic     d25  4  f16  4  tie 4
+```
+
+**Flow does not win a single bond class.** It ties on ligands and nucleic acids
+and loses the three protein classes. `flow16` is the best arm in 1 cell of 105.
+
+🔴 **AND THE OPPOSITE READING FROM ONE MODEL'S LIGAND ROWS WAS WRONG.**
+AlphaFold 3 and IntelliFold-2 both prefer flow on ligands at low step counts -
+if2's GOL is 0.1205 at d25 against 0.0287 at f16, which looks like flow
+rescuing the ligand - and boltz2 goes the other way. Across five models it is
+6-6. Two models are not a trend, and the honest summary of the ligand column is
+"the step count, not the sampler".
+
+### 🔴 AND IT FOUND A DEFECT: boltz2 TEARS APART A MODIFIED RESIDUE
+
+boltz2 with a phosphoserine at position 3, its OWN backbone bonds, every arm:
+
+| arm | SEP bond rms | worst |
+|---|---:|---|
+| diffusion25 | 0.52 / 0.68 | SEP3 N-CA **3.073** against 1.469 |
+| diffusion200 | 0.80 / **1.22** | SEP3 N-CA **4.578** against 1.469 |
+| flow16 | 0.74 / 0.64 | SEP3 N-CA 2.839 |
+| flow32 | 0.93 / 0.94 | SEP3 CA-C 3.404 |
+
+alphafold3 is 0.05-0.19 on the same target and intellifold2 0.05-0.17. This is
+**not a sampler question** - it is worse at 200 steps than at 25 - and nothing
+here covers it: `test:ligand` folds a GLYCEROL, which is not a modified residue,
+and `test:batch` compares a SEP target's batch FIELDS rather than folding it.
+Not investigated yet.
+
+---
+
 ## 🔴 ALPHAFOLD 3's SIDE CHAINS WERE 28% SHORT, AND THE ORACLE THAT SHOULD HAVE SEEN IT IS FED NOISE
 
 6MRR, side-chain bond rms against the ideal conformer:
