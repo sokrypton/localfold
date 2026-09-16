@@ -292,7 +292,21 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
   const pairs = confidence.chainPairIptm;
   if (pairs !== undefined && Object.keys(pairs).length > 0) {
     summary.chain_pair_iptm = chains.map((_, a) => chains.map((__, b) => {
-      if (a === b) return null;
+      // 🔴 THE DIAGONAL IS THE CHAIN AGAINST ITSELF, WHICH IS ITS OWN pTM, AND
+      // THE SERVER WRITES IT. tools/fixtures/fold_2026_09_01_10_17.zip carries
+      // `chain_pair_iptm` [[0.9, 0.91], [0.91, 0.86]] beside `chain_ptm`
+      // [0.9, 0.86]: the diagonal is not an interface and it is not absent.
+      // This returned null while reading the SAME convention correctly for
+      // `chain_pair_pae_min` a few lines down, and a key-for-key comparison
+      // against that archive cannot see a wrong value inside a key that is
+      // present - which is how it survived.
+      //
+      // Still null where the fold has no per-chain pTM: absent, not invented,
+      // which is what this file does everywhere else.
+      if (a === b) {
+        const own = confidence.chainPtm?.[asym[a]];
+        return own === undefined ? null : round2(own);
+      }
       const [first, second] = asym[a] < asym[b] ? [asym[a], asym[b]] : [asym[b], asym[a]];
       const value = pairs[`${first}|${second}`];
       return value === undefined ? null : round2(value);

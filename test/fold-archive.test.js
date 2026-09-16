@@ -126,7 +126,11 @@ describe("the fold archive", () => {
 
   // 🔴 AN UNSCORED INTERFACE IS null, NOT 0. Zero reads as "the model looked and
   // was sure it is bad"; the pair map simply omits a pair it could not score.
-  it("writes the chain-pair matrix with the diagonal absent", () => {
+  //
+  // ...and the DIAGONAL is null here for a different reason, which the test
+  // below is the other half of: this fold carries no per-chain pTM, so there is
+  // nothing to put there. A fold that has one gets it, as the server does.
+  it("leaves the diagonal null when the fold has no per-chain pTM", () => {
     const summary = JSON.parse(summaryConfidencesJson({
       confidence: prediction().confidence, chainLengths: [2, 2],
       tokenChainIds: ["A", "A", "B", "B"],
@@ -140,6 +144,30 @@ describe("the fold archive", () => {
     // server writes is computed here from what the model produced; `has_clash`
     // would have to be invented, and a zero reads as "checked, and clean".
     expect("has_clash" in summary).toBe(false);
+  });
+
+  // 🔴 THE DIAGONAL IS THE CHAIN AGAINST ITSELF, AND THE SERVER WRITES IT.
+  // tools/fixtures/fold_2026_09_01_10_17.zip has `chain_pair_iptm`
+  // [[0.9, 0.91], [0.91, 0.86]] beside `chain_ptm` [0.9, 0.86] - the diagonal
+  // is not an interface, it is that chain's own pTM, and it is not absent.
+  // This file read the same convention CORRECTLY one function down, for
+  // `chain_pair_pae_min`, and wrote null here.
+  //
+  // 🔴 AND A KEY-FOR-KEY COMPARISON CANNOT SEE THIS. docs/WEB.md's check
+  // against that archive was "nine of ten keys", which a wrong VALUE inside a
+  // key that is present passes untouched. The numbers below are the fixture's.
+  it("puts each chain's own pTM on the chain-pair diagonal, as the server does", () => {
+    const summary = JSON.parse(summaryConfidencesJson({
+      confidence: {
+        ...prediction().confidence,
+        chainPairIptm: { "1|2": 0.91 },
+        chainPtm: { 1: 0.9012, 2: 0.8567 },
+        chainIptm: { 1: 0.91, 2: 0.91 },
+      },
+      chainLengths: [2, 2], tokenChainIds: ["A", "A", "B", "B"],
+    }));
+    expect(summary.chain_pair_iptm).toEqual([[0.9, 0.91], [0.91, 0.86]]);
+    expect(summary.chain_ptm).toEqual([0.9, 0.86]);
   });
 
   // 🔴 A MINIMUM OVER ORDERED PAIRS, WHICH IS WHY IT IS NOT SYMMETRIC. The
@@ -176,7 +204,7 @@ describe("the fold archive", () => {
       },
       chainLengths: [2, 2], tokenChainIds: ["A", "A", "B", "B"],
     }));
-    expect(oneBased.chain_pair_iptm).toEqual([[null, 0.42], [0.42, null]]);
+    expect(oneBased.chain_pair_iptm).toEqual([[0.9, 0.42], [0.42, 0.7]]);
     expect(oneBased.chain_ptm).toEqual([0.9, 0.7]);
 
     const zeroBased = JSON.parse(summaryConfidencesJson({
@@ -239,7 +267,7 @@ describe("the fold archive", () => {
       tokenResIds: [1, 2, 1, 1],
     }));
     expect(summary.chain_ptm).toEqual([0.9, 0.4]);
-    expect(summary.chain_pair_iptm).toEqual([[null, 0.6], [0.6, null]]);
+    expect(summary.chain_pair_iptm).toEqual([[0.9, 0.6], [0.6, 0.4]]);
   });
 
   it("refuses to name more chains than it can spell", () => {
