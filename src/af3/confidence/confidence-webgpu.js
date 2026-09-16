@@ -974,7 +974,15 @@ export class Af3ConfidenceHeadGpu {
     const sources = createConfidenceShaders(
       shape, reembedding ? {} : embedPacked.offsets, headPacked.offsets, epsilon, variance,
       reembedding ? embedPacked.offsets : null);
+    // 🔴 EVERY WIDTH IN `shape` IS IN THE KEY, because every one of them is a
+    // `const` in the generated WGSL. This named `tokens` and `dense` and left
+    // out the three channel widths, and IntelliFold-2 collided with AlphaFold 3
+    // on `embedProject` at "line 4 of 39: const C_Z: u32 = 128u; against
+    // 512u" - the two agree on 59 tokens, 24 dense slots and all five flags and
+    // differ only in the pair track. It needs both models in ONE cache, which
+    // is a model switch on the page; `npm run test:cache` is the gate.
     const base = `af3-confidence:${tokens}:${dense}:${epsilon}:${variance}`
+      + `:cz${pairChannels}:cs${singleChannels}:tf${targetFeatWidth}`
       + `:re${reembedding}:hn${headPacked.offsets.logitsLnScale !== undefined}`
       + `:sh${headPacked.offsets.interHalfDistanceLogits !== undefined}`
       + `:ps${shape.preSymmetrisedPde}:cd${shape.confidenceCaDgram}`;

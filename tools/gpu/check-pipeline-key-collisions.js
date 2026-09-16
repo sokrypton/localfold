@@ -35,10 +35,14 @@
  * `test:template` and `test:ligand` are what say that.
  */
 import { featuriseProtein } from "../../src/af3/featurise/featurise.js";
-import { buildTargetFeat } from "../../src/af3/fold.js";
+import { buildTargetFeat, foldBatch } from "../../src/af3/fold.js";
 import { Af3TrunkGpu } from "../../src/af3/trunk/trunk-webgpu.js";
-import { af3Dialect, openAf3Store, trunkWeights } from "../../src/af3/weights/weights.js";
-import { targetFeatureWeights } from "../../src/af3/weights/diffusion-weights.js";
+import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
+import { af3Dialect, confidenceWeights, openAf3Store, trunkDepths, trunkWeights }
+  from "../../src/af3/weights/weights.js";
+import { atomReference, diffusionWeights, targetFeatureWeights }
+  from "../../src/af3/weights/diffusion-weights.js";
+import { dialectFor, featuriserDialect } from "../../src/af3/dialect.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -83,23 +87,90 @@ async function trunkPass(device, model, tokens, rows) {
            msaDimension: sample.msaAttention1.dimension, pairChannels };
 }
 
+/**
+ * A whole fold, which is the stage set the PAGE compiles.
+ *
+ * 🔴 THE TRUNK IS NOT THE WHOLE CACHE. `--stage=trunk` compiles the embedder,
+ * template, MSA stack, pairformer and distogram and nothing else; a page also
+ * builds the diffusion conditioning, the atom encoder and decoder, the token
+ * transformer and the confidence head, and every one of those is keyed the same
+ * way and can collide the same way. Four sampler steps is enough - a pipeline
+ * is compiled on the first one - so this costs a fold's weights, not a fold.
+ */
+async function foldPass(device, model, sequence, steps) {
+  const store = await openAf3Store(model);
+  const dialect = af3Dialect(store);
+  const batch = af3BatchFromA3m(sequence, null,
+    { ...featuriserDialect(dialectFor(dialect.model ?? dialect.name ?? "alphafold3")) }).batch;
+  const depths = await trunkDepths(store);
+  const weights = {
+    trunk: await trunkWeights(store, depths.pairformerBlocks, depths.msaBlocks,
+                              { allowPrefix: true }),
+    diffusion: await diffusionWeights(store),
+    // A head this loader cannot read is not this gate's subject: boltz2 keeps
+    // its confidence under its own scope. Skipping it loses that stack's
+    // kernels and keeps every other one, which is better than losing the model.
+    confidence: await confidenceWeights(store).catch(() => undefined),
+    atomReference: await atomReference(store),
+    targetFeat: await targetFeatureWeights(store),
+  };
+  const sample = weights.trunk.msaBlocks[0];
+  // 🔴 DIFFUSION, NOT FLOW: rosettafold3 REFUSES flow outright - see
+  // `noFlowSampler` - and this gate must run every checkpoint. Four steps
+  // will not converge and does not need to: a pipeline is compiled on the
+  // first one, and nothing here reads the structure.
+  await foldBatch(device, batch, weights, { steps, mode: "diffusion", recycles: 0 });
+  return { msaHeads: sample.msaAttention1.heads,
+           msaDimension: sample.msaAttention1.dimension,
+           pairChannels: sample.pairAttention1.heads * sample.pairAttention1.dimension };
+}
+
 export async function main(device, args) {
-  const models = option(args, "models",
-    "/model-af3-int5/manifest.json,/model-rosettafold3-int5/manifest.json")
-    .split(",").map((m) => m.trim()).filter((m) => m !== "");
+  // 🔴 THE WHOLE LINEAGE BY DEFAULT, BECAUSE A PAIR PROVES NOTHING ABOUT A
+  // THIRD. af3 and rosettafold3 alone were clean on the confidence head; adding
+  // intellifold2 found `af3-confidence:...:embedProject` at "C_Z 128 against
+  // 512". A bundle this box lacks is a SKIP and not a failure - that is
+  // test:ligand's convention, and openbind0 is float32 here.
+  const requested = option(args, "models", [
+    "/model-af3-int5/manifest.json",
+    "/model-protenix2-int5/manifest.json",
+    "/model-boltz2-int5/manifest.json",
+    "/model-intellifold2-int5/manifest.json",
+    "/model-rosettafold3-int5/manifest.json",
+    "/model-openbind0-f32/manifest.json",
+  ].join(",")).split(",").map((m) => m.trim()).filter((m) => m !== "");
+  const models = [];
+  for (const model of requested) {
+    const head = await fetch(model, { method: "GET" });
+    if (head.ok) models.push(model);
+    else console.log(`  skipped ${model} - not on this box (${head.status})`);
+  }
   const tokens = Number(option(args, "tokens", "59"));
   const rows = Number(option(args, "msa", "128"));
+  // 🔴 `fold` IS THE DEFAULT BECAUSE `trunk` CANNOT SEE HALF OF IT. The
+  // confidence collision this gate found is in a stage no trunk pass
+  // compiles: af3 and intellifold2 were clean at stage=trunk and collided
+  // on `af3-confidence:...:embedProject` at stage=fold. A gate that cannot
+  // reach the bug it was built for is not a gate. `--stage=trunk` is the
+  // fast arm for bisecting, not the one to run.
+  const stage = option(args, "stage", "fold");
+  const steps = Number(option(args, "steps", "4"));
   if (models.length < 2) {
-    throw new Error("this gate needs at least two models in ONE process; "
-      + "with one it can never see a collision and would pass by finding nothing");
+    throw new Error(`this gate needs at least two models in ONE process and this `
+      + `box has ${models.length} of ${requested.length}; with one it can never see `
+      + `a collision and would pass by finding nothing`);
   }
+  const sequence = Array.from({ length: tokens },
+    (_, i) => ALPHABET[i % ALPHABET.length]).join("");
 
   const shapes = {};
   const order = [...models, ...[...models].reverse()];
   for (const model of order) {
     const name = model.replace(/^\/model-|\/manifest\.json$/g, "");
     try {
-      shapes[name] = await trunkPass(device, model, tokens, rows);
+      shapes[name] = stage === "fold"
+        ? await foldPass(device, model, sequence, steps)
+        : await trunkPass(device, model, tokens, rows);
     } catch (error) {
       // A collision is what this is for; anything else is the run failing.
       if (String(error?.message ?? error).includes("pipeline cache key collision")) {
@@ -109,10 +180,11 @@ export async function main(device, args) {
       throw error;
     }
   }
-  console.log(`${models.length} models, both orders, one pipeline cache: no collision`);
+  console.log(`${models.length} models, both orders, one pipeline cache, `
+    + `stage=${stage}: no collision`);
   for (const [name, s] of Object.entries(shapes)) {
     console.log(`  ${name.padEnd(24)} msa ${s.msaHeads}x${s.msaDimension}`
       + `  pair ${s.pairChannels}`);
   }
-  return { models, tokens, rows, shapes, collision: null };
+  return { models, tokens, rows, stage, shapes, collision: null };
 }
