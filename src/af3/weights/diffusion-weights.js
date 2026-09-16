@@ -10,6 +10,7 @@ import {
   trunkWeights, confidenceWeights,
   structuralExpanderWeights, structuralRefinerWeights, openddeConfidenceWeights,
 } from "./weights.js";
+import { atomBlockDialect } from "../dialect.js";
 
 const HEAD = "diffuser/~/diffusion_head";
 const ENCODER = `${HEAD}/diffusion_atom_transformer_encoder`;
@@ -290,19 +291,19 @@ async function constantAtomBias(store, ...names) {
 
 async function atomBlockWith(store, stack, index, dialect) {
   const block = await bind(store, atomBlock(store, stack, index));
-  block.chainedAtomLayerNorm = dialect.chainedAtomLayerNorm;
-  block.keyMaskedAtomAttention = dialect.keyMaskedAtomAttention;
+  // 🔴 ONE LIST, IN dialect.js. Listing these here and again in every hand-built
+  // weight dict is how `maskAtomActPerBlock` reached the loader and not
+  // check-af3-atom-decoder.js, killing that differential silently.
+  Object.assign(block, atomBlockDialect(dialect));
   // 🔴 CHAI-1 AND IntelliFold-2 RE-ZERO THE PADDED ATOM SLOTS AT THE TOP OF
   // EVERY BLOCK, because they pad the flat atom axis INSIDE each attention
   // call rather than once for the stack. Carried per block, like the other
   // two, so the DECODER - which sees no dialect object - reads it off its
   // weights the same way.
-  block.maskAtomActPerBlock = dialect.maskAtomActPerBlock;
   // 🔴 rosettafold3's ATOM blocks take the same no_residual wiring its TOKEN
   // transformer does, and only the dialect says so - there is no tensor whose
   // presence marks it. Carried per block so the DECODER, which sees no dialect
   // object, reads it the way it reads the other three.
-  block.diffusionNoResidual = dialect.diffusionNoResidual;
   if (block.diffusionNoResidual === undefined) {
     throw new Error("an atom block carries no diffusionNoResidual: AF3 adds the "
       + "attention and the transition through two residuals, rosettafold3 one");

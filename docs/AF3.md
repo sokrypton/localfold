@@ -4689,8 +4689,44 @@ flag.
 blurry and indistinguishable. Nothing in this repository compares the denoiser
 below sigma 1, which is the only place side chains are decided.
 
-**What would settle it**, and it needs the reference environment which is not on
-this box: a denoise dump at low sigma. `dump_af3_denoise.py` already takes
+### 🔴 THREE MORE ELIMINATIONS, AND A DEAD DIFFERENTIAL BROUGHT BACK
+
+**It is a plateau, not late damage.** The per-step trace shows AF3's side-chain
+error dipping to 0.297 at sigma 0.202 and reading 0.351 at 0.076, which looks
+like the last steps wrecking it. They do not: 16, 20, 25 and 50 steps land at
+0.376, 0.352, 0.345 and 0.360, and only 12 steps is different (0.671, too few to
+resolve anything). **AlphaFold 3 converges to a different fixed point** and sits
+there; the bump is noise on a plateau. Truncating the schedule is not a fix.
+
+**The preconditioning is applied correctly.** `skip * positionsNoisy + out *
+update`, masked, with the standard EDM scalings off `sigmaData` 16. So the
+distortion is in `update` - the network's own output - and not in how it is
+combined.
+
+**And the GPU is not the problem: it agrees with the CPU reference at 3.01e-7.**
+`tools/gpu/check-af3-atom-decoder.js` feeds the decoder the CPU encoder's
+outputs and real gathers out of a batch. Both implementations produce the
+contracted side chains, so this is not a kernel bug - it is something both
+implement, which means a shared reading of the architecture or the weights
+behind it.
+
+🔴 **THAT CHECKER HAD BEEN DEAD, AND THE CENSUS PREDICTED IT.** It threw
+`maskAtomActPerBlock has no default` on every run. Its weight dict is
+hand-built, it listed the per-block dialect flags by hand, and when that flag was
+added the loader learned it and the checker did not - so **the one differential
+that separates the atom decoder's GPU path from its CPU reference had been dead
+for as long as the flag has existed**, and a decoder defect could not have been
+seen by the only instrument pointed at it. It is one of the 44 tools nothing
+named; being unfindable and being unrun are the same thing.
+
+The fix is `atomBlockDialect` in dialect.js - the four flags an atom block
+carries, in one place, spread by the loader and by the checker. `featuriserDialect`
+one module over, for the same reason. `test/dialect-routes.test.js` went red on
+it, correctly: it discovers the list by parsing the source and the list had
+moved. It parses `atomBlockDialect` now.
+
+**What would settle the defect itself**, and it needs the reference environment
+which is not on this box: a denoise dump at low sigma. `dump_af3_denoise.py` already takes
 `NOISE` from the environment - but it builds its input as `rng.normal(...) *
 NOISE`, PURE noise scaled, so at `NOISE=0.5` it hands the model a 0.5 A random
 cloud rather than a nearly-correct structure with a little noise on it. At that

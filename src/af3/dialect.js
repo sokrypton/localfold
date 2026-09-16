@@ -1164,6 +1164,35 @@ export const DIALECTS = Object.freeze({
  * business with `noResidual` - so adding a kernel flag to the table does not
  * silently change a batch.
  */
+/**
+ * The four dialect flags an ATOM BLOCK carries, as one object.
+ *
+ * 🔴 THE SAME LESSON AS `featuriserDialect`, ONE MODULE OVER. These were listed
+ * by hand at every site that builds an atom block - the loader in
+ * diffusion-weights.js and the hand-built weight dicts in
+ * tools/gpu/check-af3-atom-decoder.js - and when `maskAtomActPerBlock` was added
+ * the loader learned it and the checker did not. The checker then threw
+ * "maskAtomActPerBlock has no default" on every run, so the ONE differential
+ * that separates the atom decoder's GPU path from its CPU reference had been
+ * dead for as long as that flag has existed. A decoder defect could not have
+ * been seen by the only instrument pointed at it.
+ *
+ * The block carries them rather than the dialect object because the DECODER
+ * never sees a dialect - it reads what its weights carry.
+ * @param {object} dialect
+ */
+export function atomBlockDialect(dialect) {
+  if (dialect === undefined || dialect === null) {
+    throw new Error("atomBlockDialect needs a dialect: an atom block's flags have no defaults");
+  }
+  return {
+    chainedAtomLayerNorm: dialect.chainedAtomLayerNorm,
+    keyMaskedAtomAttention: dialect.keyMaskedAtomAttention,
+    maskAtomActPerBlock: dialect.maskAtomActPerBlock,
+    diffusionNoResidual: dialect.diffusionNoResidual,
+  };
+}
+
 export function featuriserDialect(dialect) {
   if (dialect === undefined || dialect === null) return {};
   return {

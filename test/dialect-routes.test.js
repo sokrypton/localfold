@@ -26,12 +26,22 @@ import { DIALECTS } from "../src/af3/dialect.js";
 const SOURCE = af3Sources();
 
 /**
- * The flags the weight loader copies onto every atom block, read out of the
- * loader itself rather than typed here - a list typed twice is the thing this
- * file exists to stop.
+ * The flags an atom block carries, read out of `atomBlockDialect` rather than
+ * typed here - a list typed twice is the thing this file exists to stop.
+ *
+ * 🔴 IT USED TO PARSE `block.X = dialect.X` OUT OF THE LOADER, and that is how
+ * this gate went red when the list moved into dialect.js. The list moved
+ * because it had ALREADY been typed twice: the loader knew
+ * `maskAtomActPerBlock` and the hand-built dict in
+ * tools/gpu/check-af3-atom-decoder.js did not, so the one differential that
+ * separates the atom decoder's GPU path from its CPU reference threw on every
+ * run and had been dead for as long as that flag existed. Following the list to
+ * its new home is the fix; typing it here would be the bug this file names.
  */
-const copied = [...SOURCE.get("diffusion-weights.js")
-  .matchAll(/^\s*block\.([A-Za-z0-9_]+) = dialect\.\1;/gm)].map((m) => m[1]);
+const copied = [...SOURCE.get("dialect.js")
+  .slice(SOURCE.get("dialect.js").indexOf("export function atomBlockDialect"))
+  .split("\n}")[0]
+  .matchAll(/^\s*([A-Za-z0-9_]+): dialect\.\1,$/gm)].map((m) => m[1]);
 
 /** Which expression a flag is read off, per file, ignoring comments. */
 function routesOf(flag) {
@@ -82,6 +92,11 @@ test("how a dialect flag reaches code", async (t) => {
         "atom-decoder-webgpu.js:block",
         "atom-encoder-reference.js:block",
         "atom-encoder-webgpu.js:block",
+        // dialect.js is `atomBlockDialect`, the one place the list lives; the
+        // loader spreads that object and keeps only its undefined guard, which
+        // still names the flag on the block - and is worth keeping, because a
+        // block that never got its flags is exactly what it catches.
+        "dialect.js:dialect",
         "diffusion-weights.js:block",
       ], `${flag} no longer takes one route`);
     }
@@ -96,14 +111,20 @@ test("how a dialect flag reaches code", async (t) => {
       "atom-decoder-webgpu.js:block",
       "atom-encoder-reference.js:block",
       "atom-encoder-webgpu.js:block",
+      "dialect.js:dialect",
       "diffusion-weights.js:block",
+      // ...and the loader's OWN `dialect.` read, which is the token
+      // transformer's - that stack takes the flag directly, not off a block.
       "diffusion-weights.js:dialect",
     ]);
     // 🔴 THE RULE, RATHER THAN THE LIST: outside the loader, a copied flag is
     // read off the BLOCK and never off a dialect. That is what makes a fifth
     // read site against a new source fail, whatever it is called.
     for (const flag of copied) {
-      const outside = routesOf(flag).filter((r) => !r.startsWith("diffusion-weights.js"));
+      // dialect.js is the list itself and diffusion-weights.js is the guard;
+      // the rule is about every OTHER site.
+      const outside = routesOf(flag).filter((r) =>
+        !r.startsWith("diffusion-weights.js") && !r.startsWith("dialect.js"));
       assert.deepEqual([...new Set(outside.map((r) => r.split(":")[1]))], ["block"],
                        `${flag} is read off something other than the block: ${outside}`);
     }

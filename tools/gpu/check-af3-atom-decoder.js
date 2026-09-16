@@ -28,7 +28,7 @@
  * summing scores 4.3e-4 and 7.3e-4, 312x and 249x the envelope.
  */
 import { atomCrossAttentionEncoder } from "../../src/af3/diffusion/atom-encoder-reference.js";
-import { ALPHAFOLD3 } from "../../src/af3/dialect.js";
+import { ALPHAFOLD3, atomBlockDialect } from "../../src/af3/dialect.js";
 import { atomDecoder } from "../../src/af3/diffusion/diffusion-reference.js";
 import { Af3AtomDecoderGpu } from "../../src/af3/diffusion/atom-decoder-webgpu.js";
 import { openAf3Store } from "../../src/af3/weights/weights.js";
@@ -104,8 +104,7 @@ export async function main(device, args) {
       // CHAINS them, and AF3 leaves padded keys to the mask where OpenDDE
       // excludes them from the offset validity. Both are false for the two
       // dialects these checkers sweep; only OPENDDE sets them true.
-      chainedAtomLayerNorm: false,
-      keyMaskedAtomAttention: false,
+      ...atomBlockDialect(ALPHAFOLD3),
       qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
       qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
       qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
@@ -194,8 +193,7 @@ export async function main(device, args) {
   const decoderBlock = async (index) => {
     const at = (leaf) => decoderSlice(leaf, index);
     return {
-      chainedAtomLayerNorm: false,
-      keyMaskedAtomAttention: false,
+      ...atomBlockDialect(ALPHAFOLD3),
       qSingleCondLayerNormScale: await at("qsingle_cond_layer_norm/scale"),
       qSingleCondScaleWeights: await at("qsingle_cond_scale/weights"),
       qSingleCondScaleBias: await at("qsingle_cond_scale/bias"),
