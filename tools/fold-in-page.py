@@ -22,6 +22,7 @@ pulls its bundle from the pinned remote unless a local model/ directory is
 served, which it is here - the server's root is the repo.
 """
 import argparse
+import base64
 import http.server
 import re
 import json
@@ -196,6 +197,13 @@ def main():
                              "(0 = unthrottled); Hugging Face measures 8")
     parser.add_argument("--latency", type=float, default=30,
                         help="added round-trip latency in ms, with --throttle")
+    parser.add_argument("--screenshot", default=None,
+                        help="save a PNG of the page after the fold. The drawn/"
+                             "colour probes read the VIEWER's 2D canvas, and once"
+                             " py2Dmol presents the GPU frame on its own canvas"
+                             " underneath, that canvas can be empty while the"
+                             " structure is on screen - only a screenshot says"
+                             " what a visitor actually sees.")
     parser.add_argument("--keep-profile", action="store_true",
                         help="reuse the Chrome profile instead of wiping it, so"
                              " the HTTP cache and the SHADER cache survive - the"
@@ -652,6 +660,55 @@ def main():
               && Math.abs(inkLast[2] - inkPrev[2]) < 6),
           });
         })()"""))
+        # 🔴 WHAT REACHED THE SCREEN, AND WHAT IT COST TO GET THERE. `drawn`
+        # samples renderer.canvas - the viewer's own 2D canvas - and py2Dmol's
+        # direct presentation draws the GPU frame on a canvas UNDER it and copies
+        # nothing, so after that change `drawn` reads one colour bucket while the
+        # structure is on screen. `present` says which layer is showing; the
+        # screenshot is the picture itself.
+        print("present:", cdp.evaluate(ws, """(() => {
+          const gpu = window.py2dmolCartoonGPU;
+          return JSON.stringify(gpu && typeof gpu.directPresent === 'function'
+            ? gpu.directPresent() : 'no direct presentation in this build');
+        })()"""))
+        # ...and how many mesh BUILDS the fold cost. py2Dmol's goal is one build
+        # per object with every later frame written onto the resident mesh, so a
+        # diffusion fold that streams 25 frames should not rebuild 25 times.
+        # __ribbonBuilds counts cache misses; __sidechainBuilds, despite its
+        # name, counts the ribbon's cache HITS (src/cartoon/paintgl.js).
+        print("rebuilds:", cdp.evaluate(ws, """(() => JSON.stringify({
+          ribbonBuilds: window.__ribbonBuilds ?? null,
+          ribbonReuses: window.__sidechainBuilds ?? null,
+          segmentBuilds: window.__segmentBuilds ?? null,
+          faceBuilds: window.__faceBuilds ?? null,
+          ssBuilds: window.__ssBuilds ?? null,
+          tubeBuilds: window.__tubeBuilds ?? null,
+          colourBuilds: window.__colourBuilds ?? null,
+          buildLog: (window.__buildLog || []).length,
+        }))()"""))
+        if args.screenshot:
+            # 🔴 THE VIEWER, NOT THE VIEWPORT. The window is a few hundred pixels
+            # tall and the viewer sits below the form, so a plain capture is the
+            # sequence box and the status line - two different renderers gave
+            # byte-for-byte the same colour count that way. Clipped to the
+            # viewer's canvas in PAGE coordinates, with the capture allowed past
+            # the viewport; direct presentation's GPU layer sits under that same
+            # rectangle, so what comes back is what a visitor sees there.
+            rect = json.loads(cdp.evaluate(ws, """(() => {
+              const reg = window.py2dmol_viewers || {};
+              const v = reg[Object.keys(reg)[0]] && reg[Object.keys(reg)[0]].renderer;
+              if (!v) return 'null';
+              const r = v.canvas.getBoundingClientRect();
+              return JSON.stringify({ x: r.left + window.scrollX, y: r.top + window.scrollY,
+                                      width: r.width, height: r.height });
+            })()"""))
+            clip = None if rect is None else {**rect, "scale": 1}
+            shot = ws.call("Page.captureScreenshot", format="png",
+                           captureBeyondViewport=True, **({"clip": clip} if clip else {}))
+            print("viewer rect:", rect)
+            with open(args.screenshot, "wb") as handle:
+                handle.write(base64.b64decode(shot["data"]))
+            print("screenshot:", args.screenshot)
         print("panel :", cdp.evaluate(ws, """(() => {
           const c = document.getElementById('heatmapContainer');
           return JSON.stringify({
