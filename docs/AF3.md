@@ -149,6 +149,28 @@ everything, not a tail-group artefact. 15 tensors of 406 have a partial tail
 group and 9 are smaller than one group; exempting all of them would move this
 by nothing. Do not retry it.
 
+### The closing measurement: a REAL denoise step, scored two ways
+
+`dump_af3_real_denoise.py` against the corrected reference, float32 bundle,
+sigma 2, native's own trunk conditioning and native's own final structure:
+
+```
+denoise GPU   tokens=68 noise=2   relRMS 4.94e-5   ours rms 3.9917  native 3.9918
+  bonds clean input   mainchain 0.0343  side chain 0.0483  mean +0.0015  short 28%
+  bonds noisy input   mainchain 3.8243  side chain 3.9432  mean +3.2859  short  3%
+  bonds native D      mainchain 0.0544  side chain 0.2152  mean -0.1107  short 64%
+  bonds our D         mainchain 0.0544  side chain 0.2152  mean -0.1108  short 64%
+```
+
+Three things in one table. The `clean` row is native AlphaFold 3's own output
+and it is a molecule again - **0.0483, mean +0.0015, 28% short**, against the
+0.3454 / -0.3200 / 100% the same row read before the fix. Our denoiser and
+native's agree to **4.94e-5 on real geometry**, which is the number the
+noise-fed oracle could never produce. And both show the same 0.2152 at sigma 2:
+D is a conditional MEAN, so a blurred side chain there is correct and is not a
+defect - which is exactly why the last row of a bond trajectory is the wrong
+place to look.
+
 ### The instruments this took
 
 | | |
