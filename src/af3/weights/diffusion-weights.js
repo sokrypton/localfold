@@ -391,28 +391,38 @@ export async function targetFeatureWeights(store) {
     },
     encoder: {
       channels: 128, pairChannels: 16, heads: 4, dimension: 32, perTokenChannels: 384,
-      // 🔴 NOT THE `_1` FORM, AND THIS FILE SAID THE OPPOSITE FOR A YEAR. Four
-      // of these exist twice, unsuffixed and `_1`, with identical shapes -
-      // haiku numbers a module the second time its constructor runs, and both
-      // instantiations are created during `init`. Only the FIRST is called at
-      // inference: tracing af3-any-model's whole fold with
-      // `hk.intercept_methods` shows `diffusion_single_to_pair_cond_row` and
-      // `evoformer_conditioning_single_to_pair_cond_row` firing twice each and
-      // neither `_1` firing at all.
+      // 🔴 THE `_1` FORM, AND THE TRACE THAT SAID OTHERWISE WAS TAKEN ON A
+      // REGRESSED REFERENCE. Four of these exist twice in AlphaFold 3's own
+      // checkpoint, unsuffixed and `_1`, at identical shapes: haiku numbers a
+      // module the second time its constructor runs, and TWO different call
+      // sites in `atom_cross_attention.py` build a Linear called
+      // `<root>_single_to_pair_cond_row`. The first is inside
+      // `_per_atom_conditioning`, over a token's own 24 dense slots; the second
+      // is this encoder's, in the QUERIES-KEYS layout. So the unsuffixed set
+      // belongs to the first and `_1` to this one.
+      //
+      // This file used to read the unsuffixed set, on the strength of an
+      // `hk.intercept_methods` trace showing `_1` never firing. That trace was
+      // taken after af3-any-model's 041ab187 ("stop computing three things the
+      // models then throw away"), which deleted the FIRST call because its
+      // result is assigned to `_`. Its result is - and deleting it renames the
+      // SECOND call, so the encoder silently claimed the first one's weights.
+      // Bisected on the A10 over 395 commits: run_alphafold.py on Google's own
+      // af3.bin.zst folds 6MRR with mean CA-CB 1.5315 at 041ab187^ and 1.2610
+      // at 041ab187, and reverting that one file alone restores 1.5315.
       //
       // 🔴 AND FOR ALPHAFOLD 3 THE TWO ARE DIFFERENT TRAINED TENSORS - rms
       // 0.088 against 0.406 for the row projection, 0.576 against 0.014 for the
-      // offsets - so this was not a naming preference, it was another model.
+      // offsets - so this was never a naming preference, it was another model.
       // Every PORTED bundle writes one tensor into both names, which is why
-      // protenix2 and boltz2 could be exact throughout while AF3's own denoise
-      // step read relRMS 4.19e-1 and nothing here could see it: the gate that
-      // would have is an ORACLE, and the per-module checkers all build their
-      // weight dict the same wrong way. `embed_pair_offsets_valid` is the one
-      // with no `_1` form, which is what made the set look like a typo.
-      singleToPairCondRow: await W("single_to_pair_cond_row"),
-      singleToPairCondCol: await W("single_to_pair_cond_col"),
-      embedPairOffsets: await W("embed_pair_offsets"),
-      embedPairDistances: await W("embed_pair_distances"),
+      // protenix2, boltz2, if2 and rf3 were unaffected either way and only
+      // AlphaFold 3 - the one checkpoint that trained them separately - folded
+      // side chains at 0.72x their extent. `embed_pair_offsets_valid` is the
+      // one with no `_1` form, which is what made the set look like a typo.
+      singleToPairCondRow: await W("single_to_pair_cond_row_1"),
+      singleToPairCondCol: await W("single_to_pair_cond_col_1"),
+      embedPairOffsets: await W("embed_pair_offsets_1"),
+      embedPairDistances: await W("embed_pair_distances_1"),
       embedPairOffsetsValid: await W("embed_pair_offsets_valid"),
       pairMlp1: await W("pair_mlp_1"),
       pairMlp2: await W("pair_mlp_2"),
@@ -837,11 +847,12 @@ export async function diffusionWeights(store, superBlocks = 6) {
       // 0.102 relRMS against AF3 on the head's own output, side chains about 8%
       // compressed, and nothing caught it because the only checker that reaches
       // the head builds its weights by hand.
-      // Not the `_1` form; see the note in `targetFeatureWeights`.
-      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row/weights"),
-      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col/weights"),
-      embedPairOffsets: await T("diffusion_embed_pair_offsets/weights"),
-      embedPairDistances: await T("diffusion_embed_pair_distances/weights"),
+      // The `_1` form, which is what the paragraph above says and what this
+      // line used to contradict. See `targetFeatureWeights` for the bisect.
+      singleToPairCondRow: await T("diffusion_single_to_pair_cond_row_1/weights"),
+      singleToPairCondCol: await T("diffusion_single_to_pair_cond_col_1/weights"),
+      embedPairOffsets: await T("diffusion_embed_pair_offsets_1/weights"),
+      embedPairDistances: await T("diffusion_embed_pair_distances_1/weights"),
       // ...and this one has no _1 form, which makes the set look like a typo.
       embedPairOffsetsValid: await T("diffusion_embed_pair_offsets_valid/weights"),
       pairMlp1: await T("diffusion_pair_mlp_1/weights"),
