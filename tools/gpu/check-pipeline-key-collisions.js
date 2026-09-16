@@ -149,6 +149,32 @@ async function foldPass(device, model, sequence, steps) {
            scored: Number.isFinite(result.meanPlddt) };
 }
 
+/**
+ * Whole TOOLS in one process, the way `probe-compiles.js` wraps one.
+ *
+ * 🔴 THIS IS HOW AF2 AND ESMFold2 GET COVERED WITHOUT REBUILDING THEM. Their
+ * setups are nothing like the AF3 lineage's - AF2 wants an `AlphaFoldFixture`,
+ * ten weight groups and an alignment; ESMFold2 wants an ESM-C tower, a shim and
+ * four more - and duplicating either here would be a second copy to keep in
+ * step, which is the failure `af3BatchFromA3m` exists to prevent. Importing the
+ * tool's own `main` runs exactly what the tool runs, and the device (and so the
+ * `ComputePipelineCache`) is shared across the calls.
+ *
+ * The families share generic kernels - `block:${kernel.cacheKey}`,
+ * `attention:pair-bias:${heads}`, the transition and triangle keys - so a
+ * cross-family collision is a real possibility and not only a within-family
+ * one. AF2's monomer and multimer are the sharpest case: they build
+ * `block:transition:normalize:${weightPrecision}` and
+ * `block:global-attention:query:...` from TWO DIFFERENT FILES, and the page
+ * offers both.
+ */
+async function toolPass(device, spec) {
+  const [tool, ...rest] = spec.split(" ").filter((s) => s !== "");
+  const module = await import(`./${tool}.js`);
+  await module.main(device, rest);
+  return { tool, args: rest.join(" ") };
+}
+
 export async function main(device, args) {
   // 🔴 THE WHOLE LINEAGE BY DEFAULT, BECAUSE A PAIR PROVES NOTHING ABOUT A
   // THIRD. af3 and rosettafold3 alone were clean on the confidence head; adding
@@ -179,6 +205,28 @@ export async function main(device, args) {
   // reach the bug it was built for is not a gate. `--stage=trunk` is the
   // fast arm for bisecting, not the one to run.
   const stage = option(args, "stage", "fold");
+  // 🔴 `--tools=` IS THE ARM FOR FAMILIES THIS GATE CANNOT FEATURISE. Entries
+  // are whole command lines separated by SEMICOLONS - not commas, because a
+  // tool's own arguments contain commas (`--chains=30,29` split into two specs
+  // and the second one failed with "--chains sums to 30, not 59"). Each runs in
+  // THIS process against THIS device, so
+  // `fold-af2;fold-af2 --family=multimer ...` puts both AF2 graphs in one
+  // cache, which is a page switch. Both orders, same as the model list.
+  //
+  // The default is the three families the MODEL arm cannot featurise - AF2's
+  // two graphs and ESMFold2 - and it runs BESIDE the model sweep rather than
+  // instead of it, so one `npm run test:cache` covers the page's whole menu.
+  // `--tools=` given explicitly replaces both arms, which is the bisecting
+  // form. `--allow-broken-geometry` on any AF3 fold here: four sampler steps do
+  // not converge and this gate does not read the structure.
+  const DEFAULT_TOOLS = [
+    "fold-af2 --length=59 --rows=16 --extra-rows=16",
+    "fold-af2 --family=multimer --chains=30,29 --length=59 --rows=16 --extra-rows=16",
+    "fold-esmfold2 --bundle=/model-esmfold2-int5 --length=40",
+  ].join(";");
+  const toolsGiven = args.some((a) => a.startsWith("--tools="));
+  const tools = option(args, "tools", DEFAULT_TOOLS).split(";")
+    .map((s) => s.trim()).filter((s) => s !== "");
   const steps = Number(option(args, "steps", "4"));
   if (models.length < 2) {
     throw new Error(`this gate needs at least two models in ONE process and this `
@@ -187,6 +235,26 @@ export async function main(device, args) {
   }
   const sequence = Array.from({ length: tokens },
     (_, i) => ALPHABET[i % ALPHABET.length]).join("");
+
+  const runTools = async () => {
+    const ran = [];
+    const both = [...tools, ...[...tools].reverse()];
+    for (const spec of both) {
+      try {
+        ran.push(await toolPass(device, spec));
+      } catch (error) {
+        if (String(error?.message ?? error).includes("pipeline cache key collision")) {
+          throw new Error(`"${spec}" collided in a cache ${both.indexOf(spec)} tool(s) `
+            + `deep: ${error.message}`);
+        }
+        throw error;
+      }
+    }
+    console.log(`${tools.length} tools, both orders, one pipeline cache: no collision`);
+    for (const spec of tools) console.log(`  ${spec}`);
+    return ran;
+  };
+  if (toolsGiven) return { tools, ran: await runTools(), collision: null };
 
   const shapes = {};
   const order = [...models, ...[...models].reverse()];
@@ -228,5 +296,11 @@ export async function main(device, args) {
           + `  ${s.scored ? "scored" : "NO SCORE"}`
         : ""));
   }
-  return { models, tokens, rows, stage, shapes, collision: null };
+  // 🔴 AND THE OTHER FAMILIES IN THE SAME CACHE, AFTER the lineage rather than
+  // instead of it - AF2 and ESMFold2 share the generic kernels
+  // (`block:${kernel.cacheKey}`, `attention:pair-bias:${heads}`, the transition
+  // and triangle keys) with everything above, so the cross-family pair is a
+  // real case and not only a within-family one.
+  const ran = await runTools();
+  return { models, tokens, rows, stage, shapes, tools, ran, collision: null };
 }
