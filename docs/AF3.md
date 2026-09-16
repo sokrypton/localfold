@@ -1,5 +1,51 @@
 # AlphaFold 3 in LocalFold
 
+## 🔴 THE PHOSPHOSERINE IS af3-any-model's boltz2 PORT, AND GENUINE Boltz-2 SAYS SO
+
+Three references on one target - `ACSEFGHIKLWY` with SEP at position 3, no
+template, no alignment - scored on the modified residue's own nine bonds:
+
+| | mean bond ratio | bond rms |
+|---|---:|---:|
+| **genuine Boltz-2 2.2.1**, three samples | **0.986 / 0.996 / 1.011** | 0.043-0.076 A |
+| af3-any-model's `boltz2` | **2.705** | 2.99 A |
+| af3-any-model's `alphafold3` | 0.988 | 0.143 A |
+| this port's boltz2 | **1.813** | - |
+| this port, every other model | 0.73-1.16 | - |
+
+**The real Boltz-2 places a phosphoserine correctly.** `pip install boltz` into
+a clean venv on the A10, `--no_kernels` because the fused triangle path wants
+`cuequivariance_torch` which is not installed by default, single sequence, three
+diffusion samples. So this is not something Boltz-2 cannot do: it is a defect in
+**af3-any-model's boltz2 port**, which this port inherits.
+
+The harness is not the cause either - af3-any-model's own AlphaFold 3 is 0.988
+on the identical target through the identical code. And three things are already
+excluded on the LocalFold side: the bond matrix and bond-order plane (9 pairs, 9
+entries, byte-identical across models), `ref_pos` (10 slots, one space, 6.924 A
+across the residue), and the `_1` weight-name change (4 of 4 byte-identical for
+boltz2 - only AlphaFold 3's differ).
+
+🔴 **AND THE FIRST RUN CARRIED A CONFOUND THAT WAS REMOVED RATHER THAN
+EXPLAINED AWAY.** It was folded with `--use_msa_server`, which the other two
+arms did not have, so "Boltz-2 is fine" could have been "Boltz-2 is fine WITH AN
+ALIGNMENT". Re-run single-sequence at three samples: 0.986, 0.996, 1.011. The
+alignment was not the reason.
+
+🔴 **AND THE SCORER IS A THIRD IMPLEMENTATION ON PURPOSE.**
+`tools/oracle/score_modified_cif.py` reads `_chem_comp_atom`'s ideal coordinates
+from the RCSB dictionary and scores a predicted mmCIF; it shares no code with
+`bond-geometry.js` or with `probe_af3_ptm_bonds.py`, and the three agree on the
+models they have in common. A single scorer used on three references would have
+made a scorer bug look like a model difference.
+
+Not chased yet: WHERE in af3-any-model's boltz2 the atomised-residue path goes
+wrong. The batch is right on this side and the weights are excluded, so it is in
+the forward - and boltz2 is the family with `tokenBondsTypeEmbed`, a second
+bond-order plane in its z-init, which is the first place to look.
+
+---
+
 ## 🔴 FLOW 16 AS THE PAGE DEFAULT: MEASURED AND DECLINED
 
 Proposed after the matched-budget result, and the matched-budget result is not
