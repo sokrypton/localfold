@@ -6292,3 +6292,141 @@ of seeds come out far worse. Diffusion stays the default.
 **Why boltz2 and not af3 is not established.** Five seeds on one target for one
 model is where this stops; the honest claim is the mechanism and the
 measurement, not a rule about which checkpoints are susceptible.
+
+## 🔴 STERIC CLASHES: NOTHING HERE COULD SEE ONE, AND THE PAGE'S DEFAULT IS NOT THE CAUSE
+
+A user reported side chains "squashed - the ends are overlapping, clashing",
+and asked whether the page has a bad default. Answering it needed an instrument
+this repository did not have. `bond-geometry.js` scores only pairs that ARE
+bonded, `chain-geometry.js` stops at the backbone by design, and
+`web/fold-archive.js` leaves out AlphaFold 3's `has_clash` under its own rule
+that a field we do not compute is left out rather than filled in. A side chain
+can have every bond at its ideal length and still be driven through its
+neighbour, and none of the three would say so.
+
+`tools/gpu/clash-geometry.js` is the complement: NON-bonded pairs, MolProbity's
+0.4 A overlap threshold, MolProbity's clashscore units (clashes per thousand
+atoms), so the number means something outside this repository.
+
+### The instrument was wrong first, and only the crystals could say so
+
+Paired with Bondi's van der Waals radii and an exclusion of three bonds, a 1.5 A
+deposited crystal reads **3.63** and a 1.2 A designed protein reads **28.06**.
+Those are statements about the instrument.
+
+| radii / hops | bondi 3 | bondi 4 | probe 3 | **probe 4** |
+|---|---:|---:|---:|---:|
+| 6MRR | 3.63 | 0 | 0 | **0** |
+| 5K9P | 5.04 | 1.68 | 0 | **0** |
+| 5CAJ | 6.32 | 2.19 | 2.19 | **0.97** |
+| 1QYS | 28.06 | 8.86 | 20.68 | **5.91** |
+| 1BRS | 18.97 | 11.00 | 13.37 | **7.33** |
+| 1TIM chain A (deposited 1976) | 143.85 | 70.59 | 131.02 | **67.38** |
+
+Two mistakes, both of them counting a distance that chemistry fixes:
+
+- **MolProbity's threshold needs MolProbity's radii.** The 0.4 A cutoff was
+  calibrated by the Richardson lab on their set, where oxygen is 1.40 A;
+  `vanDerWaalsRadius` in src/chem/geometry-tables.js is Bondi's 1.52, and it is
+  right for what it does - flooring the conformer builder's non-bonded
+  distances - so the fix is a local table in the scorer, not an edit there.
+- **A 1-4 pair is a torsion, not a collision.** The single largest class of
+  "clash" in every crystal was the trans-peptide O(i)...C(i+1) at about 2.78 A,
+  which every protein has one of per residue: 11 of 5CAJ's 26 and 82 of 1TIM's
+  269.
+
+Both are arms (`radii`, `hops`), because a reader should be able to put either
+back and see the table above.
+
+### The scale, including the one reference that is nobody's port
+
+Deposited crystals score 0 to 7.33 above. **AlphaFold 3's own SERVER scores
+2.84** on `tools/fixtures/fold_2026_09_01_10_17.zip` - the archive
+`check-oracle-bonds.js` uses, and the only structure here that is neither this
+port nor af3-any-model.
+
+### At the page's default, with the page's own alignment, every model is at crystal level
+
+Five models, five targets (5CAJ 261, 1TIM 247, 1QYS 92, 5K9P 75, 6MRR 68), the
+page's diffusion 25, each with an MSA from api.colabfold.com. Pooled clashes
+over pooled atoms:
+
+| af3 | boltz2 | intellifold2 | protenix2 | rosettafold3 |
+|---:|---:|---:|---:|---:|
+| 3.57 | 4.08 | 5.27 | 6.12 | 9.87 |
+
+**The step count is not the lever.** 5CAJ with an MSA at 25 / 50 / 200: af3
+4.75 / 5.22 / 3.32, protenix2 9.49 / 7.59 / 11.39, rosettafold3 15.19 / 15.19 /
+13.77 - no direction. With a self-template, where the fold is determined to
+0.11-0.26 A, the same: af3 2.85 at 25 steps and 5.70 at 200, rosettafold3 7.60
+both ways. So the answer to "is the default sampler setting squashing side
+chains" is **no**, and raising it would buy nothing here. (The separate case for
+raising it is docs/AF3.md's ligand-bond sweep, which is about ligands and
+stands on its own.)
+
+### What does move it is whether the fold is determined
+
+The same five models on 5CAJ from the sequence ALONE - 17-21 A RMSD, pLDDT
+29-37 - score 10.9 to 239.7 at 25 steps, and there the step count does matter:
+protenix2 239.68 / 119.60 / 67.87 at 25 / 50 / 200, rosettafold3 198.96 /
+107.31 / 99.72.
+
+🔴 **AND A LOW CLASHSCORE IS NOT A GOOD STRUCTURE.** af3's single-sequence 5CAJ
+at 200 steps reads **0.95 - below the crystal's 0.97 - at 21.5 A RMSD**, because
+a wrong fold that expands has nothing left to overlap: its radius of gyration
+goes 22.0 -> 24.4 A across the same arms. The score is evidence only beside the
+RMSD.
+
+### The clashes are not where "squashed side chains" would put them
+
+`bySeparation` bins each clash by how far apart in the chain its two residues
+are, which is what separates a badly placed ROTAMER from a fold that has driven
+two pieces of chain through each other. Over 25 arms with an MSA: **170
+clashes, of which 2 are local.** Nobody is packing a side chain into its own
+neighbourhood.
+
+They concentrate at the ENDS. Pooled over the same 25 arms, by decile of the
+chain, as a ratio to an even spread:
+
+| 0-10% | 10-20 | 20-30 | 30-40 | 40-50 | 50-60 | 60-70 | 70-80 | 80-90 | 90-100 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **1.67** | 0.62 | 0.73 | 1.11 | 1.39 | 0.93 | 0.65 | 0.59 | 1.02 | **1.27** |
+
+On a WRONG fold (single sequence, 2746 clashes) the same histogram is flat -
+0.96 at the N-terminus - so this is what a good fold's residual looks like
+rather than what a broken one does. A terminus has fewer neighbours to be
+packed against and nothing downstream holding it, and 5CAJ's first six residues
+are a `PRGSHM` expression tag, disordered in the crystal: the model has to put
+it somewhere and puts it on the surface.
+
+### It is a handful of outliers, not a systematic squeeze
+
+The whole distribution of close N...O contacts is the crystal's - median
+3.10-3.16 A against the crystal's 3.10 and AF3 Server's 3.13, fifth percentile
+2.65-2.73 against 2.77 and 2.74. What differs is the tail: 4 to 13 contacts
+under 2.5 A where the crystal has 0 and AF3 Server has 2. Compared pair by pair
+against the crystal, about a third of a fold's clashes are a real interaction
+pulled too tight (an Arg NH1 to a backbone O at 2.82 A in the crystal, 1.95 in
+rosettafold3's fold) and two thirds are a contact the crystal does not have at
+all.
+
+🔴 **AND COMPARING PAIR BY PAIR HAS A TRAP THAT LOOKS LIKE A FINDING.** 5CAJ's
+chain A is numbered **-4 to 256 with six gaps and five duplicated numbers**,
+and a fold is numbered 1..261, so pairing by residue NUMBER reports pairs that
+are 14 A apart in the crystal as 2 A in every model - which reads as a
+spectacular systematic defect and is an off-by-five. Fold residue i is the i-th
+RESOLVED crystal residue, which is what `readChain` in fold-opendde.js builds
+the sequence from.
+
+### What is left open
+
+**rosettafold3 is 2.8x af3 pooled, and 7.60 even with a perfect template**
+(0.11 A RMSD), where af3 is 2.85. That is still crystal-level, so it is not a
+shipping defect, but it is a real per-model difference at a fold quality where
+fold quality cannot explain it. Settling whether it is the checkpoint or this
+port needs af3-any-model's own rosettafold3 output on the same input, scored by
+this same function - the A10 has the reference checkout.
+
+The counts on the small targets are small enough to be noisy: one clash in 595
+atoms is 1.68, so 5K9P's rosettafold3 15.13 is nine clashes and 6MRR's
+rosettafold3 0 is none. The pooled row is the one to quote.

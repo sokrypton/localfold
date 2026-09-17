@@ -20,38 +20,98 @@
  * 🔴 THE THRESHOLD IS MolProbity'S AND THE UNITS ARE ITS CLASHSCORE, so the
  * number means something outside this repository. An overlap is
  * `(r_i + r_j) - d` on van der Waals radii, a CLASH is an overlap past 0.4 A,
- * and the score is clashes per thousand atoms. A well-refined crystal
- * structure scores in the low single digits; anything past ~20 is visibly
- * wrong.
+ * and the score is clashes per thousand atoms.
  *
- * 🔴 WHAT IT SAID WHEN IT WAS FIRST POINTED AT THE SAMPLER DEFAULT, because
- * the question that prompted it was "are the page's defaults squashing side
- * chains". 5CAJ chain A, 261 residues, diffusion at the page's 25 steps, the
- * deposited crystal scoring 6.32 for comparison:
+ * 🔴 AND THE FIRST VERSION OF THIS FILE WAS MIS-CALIBRATED, WHICH THE CRYSTALS
+ * CAUGHT AND NOTHING ELSE COULD HAVE. It paired MolProbity's 0.4 A threshold
+ * with BONDI's radii and excluded pairs within THREE bonds, and on that
+ * setting a 1.5 A deposited crystal reads 3.63 and a designed protein solved
+ * at 1.2 A reads 28.06 - numbers that say the instrument is wrong, not the
+ * structure. Both halves were the same mistake, counting a distance that
+ * chemistry fixes:
  *
- *     af3            14.7    boltz2        63.6     intellifold2  116.8
- *     rosettafold3  191.8    protenix2    246.3
+ *              radii/hops  bondi 3   bondi 4   probe 3   probe 4
+ *   6MRR                      3.63      0         0         0
+ *   5K9P                      5.04      1.68      0         0
+ *   5CAJ                      6.32      2.19      2.19      0.97
+ *   1QYS                     28.06      8.86     20.68      5.91
+ *   1BRS                     18.97     11.00     13.37      7.33
+ *   1TIM chain A (1976)     143.85     70.59    131.02     67.38
  *
- * 🔴 AND rosettafold3 READS pLDDT 64.5 THERE - the MOST confident of the five
- * - with 347 carbon-on-carbon overlaps. That is this repository's recurring
- * lesson in a new place: pLDDT is blind to it, and reads 64.5 at 25 steps and
- * 64.5 at 200 while the clashes halve.
+ * The dominant class at three hops is the trans-peptide O(i)...C(i+1) at about
+ * 2.78 A - every protein has one per residue - which is 82 of 1TIM's 269 and
+ * 11 of 5CAJ's 26. It is a bond angle. See RICHARDSON and the `hops` default
+ * below for the two fixes; both are arms, so a reader can put either back.
  *
- * 🔴 BUT THE SAMPLER DEFAULT IS NOT THE CAUSE, AND THE CONTROL IS WHAT SAYS
- * SO. Given a TEMPLATE, so the fold is determined, every model sits at the
- * crystal's level and the step count stops mattering: af3 6.2 at 25 steps and
- * 8.1 at 200, rosettafold3 11.9 and 13.3, against the crystal's 6.32. The
- * clashes track how well-determined the fold is, not how it was sampled. More
- * steps does help an UNDER-determined fold - 25 is the worst setting measured
- * for every model and 50 roughly halves it - and it does not close the gap:
- * protenix2 is still 68 at 200 steps, eleven times a crystal.
+ * 🔴 WHAT IT SAYS ABOUT THE PAGE'S DEFAULT, which is the question that
+ * prompted it - "are the page's defaults squashing side chains". The scale to
+ * read these against: deposited crystals score 0 to 7.33 above, and
+ * ALPHAFOLD 3's OWN SERVER, the one reference here that is neither this port
+ * nor af3-any-model, scores **2.84** on `tools/fixtures/fold_2026_09_01_10_17.zip`.
  *
- * 🔴 AND ONE CONFOUND IS NAMED RATHER THAN ASSUMED AWAY. On the worst case the
- * radius of gyration also grows with the step count, 22.0 A at 25 to 24.5 at
- * 200, so part of "fewer clashes" is a looser structure rather than a
- * resolved one. An 11% expansion does not explain a 23-fold drop, but it is
- * there, and a recommendation to raise the default should not rest on this one
- * target.
+ * Five models, five targets, the page's own diffusion 25, each with an MSA
+ * from api.colabfold.com - pooled clashes over pooled atoms:
+ *
+ *   af3 3.57   boltz2 4.08   intellifold2 5.27   protenix2 6.12   rosettafold3 9.87
+ *
+ * So at the page's default, with the alignment the page itself fetches, every
+ * model is at the level of a deposited crystal. **The default is not the
+ * cause**, and the step count is not the lever: on 5CAJ with an MSA, 25 / 50 /
+ * 200 gives af3 4.75 / 5.22 / 3.32, protenix2 9.49 / 7.59 / 11.39 and
+ * rosettafold3 15.19 / 15.19 / 13.77 - no direction. With a self-TEMPLATE,
+ * where the fold is determined to 0.11-0.26 A, the same is true: af3 2.85 at
+ * 25 steps and 5.70 at 200.
+ *
+ * 🔴 WHAT IS LEFT IS THE FOLD, AND A SINGLE SEQUENCE IS WHERE IT HURTS. The
+ * same five models on 5CAJ from the sequence ALONE - 17-21 A, pLDDT 29-37 -
+ * score 10.9 to 239.7 at 25 steps, and there more steps does help a lot
+ * (protenix2 239.68 / 119.60 / 67.87). It is not the sampler getting better:
+ * a wrong fold that EXPANDS has fewer overlaps, and af3's radius of gyration
+ * goes 22.0 -> 24.4 A across the same arms while its score falls to 0.95,
+ * below the crystal's, at 21.5 A RMSD. **A low clashscore is not a good
+ * structure.** It is only evidence when read beside the RMSD.
+ *
+ * 🔴 AND THE CLASHES ARE NOT WHERE "SQUASHED SIDE CHAINS" WOULD PUT THEM.
+ * `bySeparation` bins each clash by how far apart in the chain its two
+ * residues are, and that is what separates a badly placed ROTAMER from a fold
+ * that has driven two pieces of chain through each other. Over 25 arms with an
+ * MSA: 170 clashes, of which **2 are local** (a residue and its neighbour) and
+ * the rest are a turn of helix away or further. No model here packs a side
+ * chain into its own neighbourhood; what they do is put distant things in the
+ * same place.
+ *
+ * 🔴 AND THEY CONCENTRATE AT THE ENDS. Pooled over the same 25 arms, by decile
+ * of the chain, as a ratio to what an even spread would give:
+ *
+ *   1.67  0.62  0.73  1.11  1.39  0.93  0.65  0.59  1.02  1.27
+ *
+ * The first decile is 1.7x and the last 1.3x, every middle decile but two
+ * below 1. On a WRONG fold (single sequence, 2746 clashes) the same histogram
+ * is flat - 0.96 at the N-terminus - so this is what a good fold's residual
+ * looks like, not what a broken one does. A terminus has fewer neighbours to
+ * be packed against and nothing downstream to hold it, and 5CAJ's first six
+ * residues are a PRGSHM expression tag that is disordered in the crystal: the
+ * model must put it somewhere and puts it on the surface.
+ *
+ * 🔴 AND IT IS A HANDFUL OF OUTLIERS, NOT A SYSTEMATIC SQUEEZE. The whole
+ * distribution of close N...O contacts is the crystal's: median 3.10-3.16 A
+ * against the crystal's 3.10 and AF3 Server's 3.13, 5th percentile 2.65-2.73
+ * against 2.77 and 2.74. What differs is the tail - 4 to 13 contacts under
+ * 2.5 A where the crystal has 0 and AF3 Server has 2. Compared pair by pair
+ * against the crystal - fold residue i is the i-th resolved crystal residue,
+ * which is what `readChain` in fold-opendde.js builds the sequence from, and
+ * pairing by residue NUMBER instead reports a 14 A separation as a clash
+ * because 5CAJ's chain A starts at -4 - about a third of the
+ * clashes are a real interaction pulled too tight (2.82 A becoming 1.95) and
+ * two thirds are a contact the crystal does not have at all.
+ *
+ * 🔴 A RESIDUE THE CONFORMER SET DOES NOT KNOW IS SKIPPED, AND THAT BIASES A
+ * CRYSTAL LOW. `skippedResidues` counts them: 5CAJ's are 551 waters and 14
+ * SELENOMETHIONINES, and the fourteen take their atoms out of the comparison
+ * where a prediction's plain methionines stay in. Mapping MSE onto MET is not
+ * the fix - its SE would match no bond in the conformer and read as a cage of
+ * clashes, which is how the skip came to exist - so the number is reported
+ * rather than hidden.
  *
  * 🔴 AND THE EXCLUSIONS ARE THE WHOLE DIFFICULTY. A pair three bonds apart or
  * closer is held where it is by the BONDS, not by sterics - counting it would
@@ -67,6 +127,24 @@ import { vanDerWaalsRadius } from "../../src/chem/geometry-tables.js";
 
 /** Overlap past this, in angstroms, is a clash. MolProbity's cutoff. */
 const CLASH = 0.4;
+
+/**
+ * 🔴 MolProbity'S THRESHOLD NEEDS MolProbity'S RADII, AND PAIRING IT WITH
+ * BONDI'S REPORTED NORMAL PEPTIDE GEOMETRY AS A CLASH. The 0.4 A cutoff was
+ * calibrated by the Richardson lab against THEIR radius set (Word et al.
+ * 1999), where oxygen is 1.40 A; `vanDerWaalsRadius` in
+ * src/chem/geometry-tables.js is Bondi's, where it is 1.52, and that table is
+ * right for what it does - it floors the conformer builder's non-bonded
+ * distances - so the fix is a local set here, not an edit there.
+ *
+ * The 0.12 A on oxygen is the whole difference and it lands exactly on the
+ * trans-peptide O(i)...C(i+1) contact, which every protein has one of per
+ * residue at about 2.78 A: Bondi calls that an overlap of 0.44 and Richardson
+ * 0.37. It was the single largest class of "clash" in every crystal measured
+ * - 11 of 26 in 5CAJ, 82 of 269 in 1TIM - and it is a bond angle, not a
+ * collision.
+ */
+const RICHARDSON = { C: 1.75, N: 1.55, O: 1.40, S: 1.80, P: 1.80 };
 
 /**
  * 🔴 A DONOR AND AN ACCEPTOR ARE ALLOWED CLOSER, OR EVERY HELIX IS A CLASH.
@@ -195,9 +273,19 @@ function nearInBonds(neighbours, hops) {
  */
 export function clashScore(pdb, conformers, options = {}) {
   const cutoff = options.cutoff ?? CLASH;
+  // `--radii=bondi` is the control arm: the table below moves every number and
+  // a reader should be able to see by how much.
+  const radii = options.radii ?? RICHARDSON;
+  const radius = (element) => radii[element] ?? vanDerWaalsRadius(element);
   const residues = parsePdbResidues(pdb);
   const { atoms, neighbours, skipped } = atomsAndBonds(residues, conformers);
-  const near = nearInBonds(neighbours, 3);
+  // 🔴 FOUR BONDS, NOT THREE, AND THE CRYSTALS ARE WHAT SAID SO. A 1-4 pair's
+  // distance is set by the TORSION between them, not by whether the two atoms
+  // can approach: an eclipsed rotamer puts them close and that is a strained
+  // angle rather than a collision, which is bond-geometry.js's question. At
+  // three the table above reads 3.63 for a 1.5 A crystal that should read
+  // zero, all of it 1-4.
+  const near = nearInBonds(neighbours, options.hops ?? 4);
 
   const BACKBONE = new Set(["N", "CA", "C", "O", "OXT"]);
   const found = [];
@@ -211,7 +299,7 @@ export function clashScore(pdb, conformers, options = {}) {
       const dy = a.position[1] - b.position[1];
       const dz = a.position[2] - b.position[2];
       const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      const sum = vanDerWaalsRadius(a.element) + vanDerWaalsRadius(b.element);
+      const sum = radius(a.element) + radius(b.element);
       if (distance >= sum - cutoff) continue;
       if (HYDROGEN_BONDING.has(a.element) && HYDROGEN_BONDING.has(b.element)
         && distance >= HYDROGEN_BOND_FLOOR) continue;
@@ -220,6 +308,15 @@ export function clashScore(pdb, conformers, options = {}) {
         a: `${a.code}${a.number}${a.chain}:${a.name}`,
         b: `${b.code}${b.number}${b.chain}:${b.name}`,
         sidechain: !BACKBONE.has(a.name) || !BACKBONE.has(b.name),
+        // 🔴 HOW FAR APART IN THE CHAIN, WHICH IS WHAT SEPARATES THE TWO
+        // DIAGNOSES. A clash between a side chain and its own neighbour two
+        // residues away is a ROTAMER placed wrongly on a fold that may be
+        // right; a clash between residues fifty apart is two pieces of the
+        // chain driven through each other, which is the FOLD being wrong and
+        // no amount of side-chain repacking can fix it. The counts below are
+        // the only thing here that tells the two apart, and they disagree -
+        // see the table in the header.
+        separation: a.chain === b.chain ? Math.abs(a.residue - b.residue) : Infinity,
         // 🔴 A CARBON OVERLAP IS UNAMBIGUOUS AND AN N/O ONE IS NOT. Two
         // carbons at 2.9 A have no business being there; a nitrogen and an
         // oxygen at 2.9 A are a hydrogen bond, and an arginine against a
@@ -243,6 +340,14 @@ export function clashScore(pdb, conformers, options = {}) {
     skippedResidues: skipped,
     bySidechain: found.filter((one) => one.sidechain).length,
     byBackbone: found.filter((one) => !one.sidechain).length,
+    // Local packing against tertiary interpenetration. `local` is a residue
+    // and its own immediate neighbours, `near` is a turn of helix, `tertiary`
+    // is two parts of the chain that the fold has put on top of each other.
+    bySeparation: {
+      local: found.filter((one) => one.separation <= 1).length,
+      near: found.filter((one) => one.separation > 1 && one.separation <= 4).length,
+      tertiary: found.filter((one) => one.separation > 4).length,
+    },
     // The unambiguous ones: nothing a hydrogen bond could explain.
     nonPolar: found.filter((one) => !one.polar).length,
     polar: found.filter((one) => one.polar).length,
@@ -250,5 +355,8 @@ export function clashScore(pdb, conformers, options = {}) {
       ...one, overlap: Number(one.overlap.toFixed(2)),
       distance: Number(one.distance.toFixed(2)),
     })),
+    // Every clash, for a caller that wants to bin them itself. Off by
+    // default: a broken fold has thousands and the summary is the answer.
+    ...(options.all === true ? { list: found } : {}),
   };
 }

@@ -91,16 +91,35 @@ const row = (label, r) => console.log(`  ${label.padEnd(22)}`
   + `${r.peptide.toFixed(3).padStart(11)}`);
 row("AF3 Server", { mainchain: scored.mainchain.rms, sidechain: scored.sidechain.rms,
                     peptide: scored.peptide.rms });
-// Recorded by tools/gpu/bench-sampler-bonds.js and test/bond-geometry.test.js;
-// printed beside the oracle so the comparison is on one screen.
+// 🔴 THESE FOUR WERE RECORDED BEFORE THE FIX AND STAYED THERE FOR AS LONG AS
+// THE DEFECT DID. The "our alphafold3" row read 0.074 / 0.344 / 0.093 and this
+// tool exited 1 on it, printing "AlphaFold 3's side chains are 7.8x the
+// reference's in this port" - which is the BEFORE row of the table in
+// docs/AF3.md, fixed in the same session that measured it, and the number here
+// was never re-run. A gate asserting on a constant only a person updates is
+// exactly what this repository keeps finding; the command that produces the
+// row is below, so it is one line to re-measure.
+//
+//   node tools/gpu-chrome.mjs tools/gpu/fold-opendde.js --pdb --target=6mrr \
+//     --chain=A --model=/model-af3-int5/manifest.json --steps=25 --mode=diffusion
+//
+// Re-measured 2026-09-17 on the A100, int5 bundles, 6MRR, diffusion 25:
 row("deposited crystals", { mainchain: 0.033, sidechain: 0.046, peptide: 0.005 });
-row("our rosettafold3", { mainchain: 0.062, sidechain: 0.067, peptide: 0.066 });
-row("our alphafold3", { mainchain: 0.074, sidechain: 0.344, peptide: 0.093 });
-row("...same seq + its MSA", { mainchain: 0.055, sidechain: 0.279, peptide: 0.076 });
+row("our rosettafold3", { mainchain: 0.053, sidechain: 0.064, peptide: 0.065 });
+row("our alphafold3", { mainchain: 0.041, sidechain: 0.059, peptide: 0.044 });
+// ...and with the alignment, which on THIS target changes nothing: 6MRR is a
+// 68-residue designed protein that folds to 0.68 A from its sequence alone
+// (0.672 without the MSA, 0.681 with it), so the two rows agreeing is the
+// measurement rather than a copied line.
+row("...same seq + its MSA", { mainchain: 0.041, sidechain: 0.059, peptide: 0.044 });
 console.log(`\n  worst in the reference: ${scored.worst[0].label}`
   + ` ${scored.worst[0].seen} against ${scored.worst[0].ideal}`
   + " - a carboxylate, the conformer averaging both resonance forms");
 
-const ratio = scored.sidechain.rms === 0 ? Infinity : 0.344 / scored.sidechain.rms;
+// 🔴 THE PORT'S FIGURE IS THE ONE THAT MOVES, SO IT IS THE ONE ON THE LEFT.
+// At 0.344 this printed 7.8x and failed; at today's 0.059 it prints 1.3x and
+// passes, and it fails again the moment the side chains go back.
+const OUR_SIDECHAIN = 0.059;
+const ratio = scored.sidechain.rms === 0 ? Infinity : OUR_SIDECHAIN / scored.sidechain.rms;
 console.log(`\nAlphaFold 3's side chains are ${ratio.toFixed(1)}x the reference's in this port.`);
 process.exit(ratio > 3 ? 1 : 0);

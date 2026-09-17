@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-323 tools. `tools/fixtures/` is data and is not listed.
+324 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (186)
+## `tools/gpu/` - the WebGPU lane (187)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -122,6 +122,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-triangle-residual.js`** - The residual form of the triangle output projection writes base + out.
 - **`check-triangle-shapes.js`** - The triangle multiplication against its CPU reference, across SHAPES.
 - **`check-triangle.js`** - Differential-test triangle multiplication on the Chrome GPU lane.
+- **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-complex.js`** - Fold a MULTI-CHAIN target and score every chain in ONE frame.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the GPU: a sequence in, a structure out.
