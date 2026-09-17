@@ -58,7 +58,13 @@ const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
  * reference conformer. Memoised per residue type: the graph is a property of
  * the chemistry, not of the fold being scored.
  */
-function idealBonds(conformer, cache, code) {
+/**
+ * 🔴 EXPORTED SO THERE IS ONE DEFINITION OF "WHAT A BOND IS". `clash-geometry.js`
+ * needs the same graph to know which pairs sterics does NOT govern, and a
+ * second derivation there would let the two instruments disagree about a bond -
+ * one scoring it as too long while the other counts it as a clash.
+ */
+export function idealBonds(conformer, cache, code) {
   if (cache.has(code)) return cache.get(code);
   const atoms = conformer.internal ?? conformer.nTerminal ?? [];
   const bonds = [];
@@ -159,12 +165,27 @@ export function bondGeometry(pdb, conformers, options = {}) {
   const rms = (values) => values.length === 0 ? null
     : Math.sqrt(values.reduce((sum, v) => sum + v * v, 0) / values.length);
   offenders.sort((a, b) => b.error - a.error);
+  // 🔴 THE SIGN, NOT ONLY THE MAGNITUDE - AND THIS FUNCTION DID NOT REPORT IT
+  // WHILE ITS SIBLING BELOW ALWAYS HAS. An rms says how far the bonds are from
+  // ideal; the MEAN says which way, and that is what distinguishes a conformer
+  // that is merely imprecise from one that is systematically CONTRACTED. It is
+  // the signal that identified the defect docs/AF3.md records - AlphaFold 3's
+  // side chains at 0.339 A rms "with 100% of them SHORT" - and reading only the
+  // rms there would have said "noisy" where the truth was "squashed". Two
+  // functions answering the same question with different fields is how a
+  // diagnostic gets lost.
+  const meanOf = (list) => (list.length === 0 ? null
+    : list.reduce((total, error) => total + error, 0) / list.length);
+  const summary = (list) => ({
+    rms: rms(list), mean: meanOf(list), bonds: list.length,
+    short: list.filter((error) => error < 0).length,
+  });
   return {
-    mainchain: { rms: rms(classes.mainchain), bonds: classes.mainchain.length },
-    sidechain: { rms: rms(classes.sidechain), bonds: classes.sidechain.length },
-    peptide: { rms: rms(classes.peptide), bonds: classes.peptide.length },
-    nucleic: { rms: rms(classes.nucleic), bonds: classes.nucleic.length },
-    ligand: { rms: rms(classes.ligand), bonds: classes.ligand.length },
+    mainchain: summary(classes.mainchain),
+    sidechain: summary(classes.sidechain),
+    peptide: summary(classes.peptide),
+    nucleic: summary(classes.nucleic),
+    ligand: summary(classes.ligand),
     all: { rms: rms([...classes.mainchain, ...classes.sidechain,
                      ...classes.peptide, ...classes.nucleic, ...classes.ligand]),
            bonds: offenders.length },
@@ -175,7 +196,8 @@ export function bondGeometry(pdb, conformers, options = {}) {
 }
 
 /** The three-letter code as the conformer table keys it. */
-function oneLetter(code) {
+/** The one-letter code a conformer is keyed by, from a PDB's three. */
+export function oneLetter(code) {
   const table = {
     ALA: "A", ARG: "R", ASN: "N", ASP: "D", CYS: "C", GLN: "Q", GLU: "E",
     GLY: "G", HIS: "H", ILE: "I", LEU: "L", LYS: "K", MET: "M", PHE: "F",
