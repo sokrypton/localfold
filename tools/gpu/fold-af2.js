@@ -50,6 +50,9 @@ import { AlphaFoldMonomerGpu } from "../../src/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../../src/af2/multimer/model.js";
 import { setShaderSourceVerification } from "../../src/runtime/shader-source-cache.js";
 import { featureStats, resetFeatureStats } from "../../src/input/a3m-features.js";
+import { chainResidues, identityMap, templateSlotAtom37 }
+  from "../../src/af3/featurise/template-input.js";
+import { superpose } from "./superpose.js";
 
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
@@ -141,7 +144,21 @@ export async function main(device, args) {
   // checked end to end: the nearest-centre search decides the cluster profile,
   // so the two arms must agree on the fold's CHECKSUM and not merely finish.
   const hostFeaturisation = args.includes("--host-features");
-  const sequence = option(args, "sequence", DEFAULT_SEQUENCE);
+  // 🔴 THE TARGET IS READ BEFORE THE SEQUENCE, AND SUPPLIES IT. Deriving the
+  // query from the deposition by hand is how the two come to disagree:
+  // `chainResidues` counts known HETATM residues (a selenomethionine is a
+  // residue) and an ATOM-only reading of the same file does not, which is 261
+  // against 255 on 5CAJ chain A. One reader for both sides, the way
+  // `fold-opendde.js` does it.
+  const targetName = option(args, "target", "");
+  const targetChain = option(args, "chain", "A");
+  let targetStructure;
+  if (targetName !== "") {
+    const text = await (await fetch(`/tools/fixtures/${targetName}-crystal.pdb`)).text();
+    targetStructure = chainResidues(text, targetChain);
+  }
+  const sequence = option(args, "sequence",
+    targetStructure?.sequence ?? DEFAULT_SEQUENCE);
   const family = option(args, "family", "monomer");
   if (family !== "monomer" && family !== "multimer") {
     throw new RangeError(`unknown family ${family}: expected "monomer" or "multimer"`);
@@ -279,12 +296,74 @@ export async function main(device, args) {
   const onProgress = ({ completed }) => {
     stageMarks.push([performance.now(), completed]);
   };
+  // 🔴 A STRUCTURAL TEMPLATE, WHICH THIS TOOL COULD NOT PASS AND THE MONOMER
+  // DRIVER COULD NOT TAKE. `QueryOnlyTemplateGpu` has always accepted one -
+  // `input.template` builds the real geometry, its absence writes zeros and the
+  // GAP restype, which is a fully masked template - and monomer.js and
+  // query-only.js simply never forwarded the field, so no monomer fold could
+  // use one. The MULTIMER has forwarded it since it was written.
+  //
+  // 🔴 AND IT IS atom37, NOT AF3's DENSE 24. `templateSlotAtom37` indexes by
+  // atom NAME, so CB is slot 3 for everything that has one - which is what
+  // `AF2_ATOM37_MONOMER` means by `pseudoBeta: 3` and `backbone: [2, 1, 0]`.
+  // The dense builder indexes by position in each residue's OWN conformer, so
+  // handing one to the other reads the wrong atoms with no error at all.
+  const templateSpec = option(args, "template", "");
+  let templateSlot;
+  if (templateSpec !== "") {
+    const [path, wantedChain] = templateSpec.split(":");
+    const text = await (await fetch(path.startsWith("/") ? path : `/${path}`)).text();
+    const structure = chainResidues(text, wantedChain);
+    if (structure.residues.length === 0) {
+      throw new Error(`--template=${templateSpec} resolved no residues`);
+    }
+    // 🔴 THE IDENTITY MAP IS ONLY RIGHT WHILE THE SEQUENCES AGREE, and refusing
+    // is cheaper than a silently misaligned template: a homolog or a construct
+    // with a tag needs a real alignment, which is a different function with a
+    // different failure mode.
+    if (structure.sequence !== sequence) {
+      throw new Error(`--template's chain is ${structure.residues.length} residues `
+        + `reading ${structure.sequence.slice(0, 20)}... where the query is `
+        + `${sequence.length} `
+        + `reading ${sequence.slice(0, 20)}...; this tool maps them residue for `
+        + "residue and has no aligner");
+    }
+    // `length` is not in scope until after the fold; the query's own length is.
+    templateSlot = templateSlotAtom37({ structure, tokens: sequence.length,
+                                        map: identityMap(structure) });
+    // 🔴 `--template-no-sidechains` IS AF2BIND's "nosc", AND IT KEEPS C-BETA.
+    // ColabDesign's `rm_target_sc` masks `template_all_atom_mask[..., 5:]`
+    // under its own comment "remove sidechains (mask anything beyond CB)", and
+    // atom37 slots 0..4 are N, CA, C, CB, O - so CB SURVIVES. That matters for
+    // anyone scoring AF2BIND's head: the monomer's pseudo-beta is CB for
+    // everything but glycine, so the distogram the head was trained on is
+    // CB-based, and a template stripped down to the backbone would be a
+    // different feature than the one it saw.
+    //
+    // It masks rather than moves the atoms, which is what ColabDesign does: the
+    // coordinates stay and the mask decides what the geometry reads.
+    if (args.includes("--template-no-sidechains")) {
+      const slots = 37;
+      for (let token = 0; token < sequence.length; token += 1) {
+        for (let index = 5; index < slots; index += 1) {
+          templateSlot.atomMask[token * slots + index] = 0;
+        }
+      }
+    }
+  }
+
+  // The deposited alpha carbons to score against, from the chain already read.
+  const truth = targetStructure === undefined ? undefined
+    : targetStructure.residues.map((residue) => residue.atoms.get("CA"))
+      .filter((point) => point !== undefined);
+
   resetFeatureStats();
   const started = performance.now();
   const prediction = await new (multimer ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
     .predictA3m(
       a3m, weights, featureTables,
       { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
+        template: templateSlot,
         // ...the arm for measuring what deduplication is worth; see
         // planA3mFeatures. Default on, matching AlphaFold's make_msa_features.
         deduplicateMsa: !args.includes("--no-dedupe"),
@@ -313,6 +392,7 @@ export async function main(device, args) {
       .predictA3m(
         a3m, weights, featureTables,
         { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
+          template: templateSlot,
           deduplicateMsa: !args.includes("--no-dedupe"),
           chainLengths: chains, ...regime },
         paeBreaks, undefined, undefined,
@@ -328,6 +408,26 @@ export async function main(device, args) {
   const final = prediction.final;
   const length = sequence.length;
   const atom37 = final.structure.atom37;
+
+  // 🔴 SCORED AGAINST THE DEPOSITION, WHICH IS THE ONLY THING A TEMPLATE GATE
+  // CAN READ. `superpose` fits one chain onto another and returns RMSD and TM;
+  // it needs the same number of alpha carbons on both sides, so a target whose
+  // file resolves fewer residues than the query has is refused rather than
+  // scored against a silent truncation.
+  let scored;
+  if (truth !== undefined) {
+    const modelCa = [];
+    for (let residue = 0; residue < length; residue += 1) {
+      modelCa.push([atom37[(residue * 37 + 1) * 3], atom37[(residue * 37 + 1) * 3 + 1],
+                    atom37[(residue * 37 + 1) * 3 + 2]]);
+    }
+    if (truth.length !== modelCa.length) {
+      throw new Error(`--target=${targetName} resolves ${truth.length} alpha carbons `
+        + `and the fold has ${modelCa.length}; scoring them would compare `
+        + "different residues");
+    }
+    scored = superpose(modelCa, truth);
+  }
 
   // Consecutive alpha carbons, which is atom 1 of the 37.
   //
@@ -398,6 +498,17 @@ export async function main(device, args) {
       : Object.fromEntries(Object.entries(prediction.stageMilliseconds)
         .map(([name, ms]) => [name, Number((ms / 1000).toFixed(2))])),
     checksum,
+    // 🔴 A TARGET SCORE, BECAUSE A TEMPLATE GATE CANNOT BE BUILT ON pLDDT. This
+    // tool reported confidence, a checksum and chain geometry and nothing that
+    // says whether the fold is the RIGHT one - and the template question is
+    // exactly "did it land on the structure it was given". `--target=<name>`
+    // scores the alpha carbons against `tools/fixtures/<name>-crystal.pdb`,
+    // which is how `fold-opendde.js` has always answered it for the AF3 side.
+    // 🔴 UNDER `scored`, THE SHAPE `fold-opendde.js` ALREADY REPORTS, so one
+    // gate can read both tools. A second spelling of the same number is how
+    // a checker comes to read `undefined` and pass.
+    ...(scored === undefined ? {}
+      : { scored: { rmsd: round(scored.rmsd, 3), tm: round(scored.tm, 4) } }),
     // The first and last CA, so a difference has somewhere to be looked at.
     firstCa: [0, 1, 2].map((axis) => round(atom37[1 * 3 + axis], 3)),
     lastCa: [0, 1, 2].map((axis) => round(atom37[((length - 1) * 37 + 1) * 3 + axis], 3)),

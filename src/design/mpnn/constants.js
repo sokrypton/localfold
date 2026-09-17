@@ -171,11 +171,11 @@ export const SIDE_CHAIN_ATOM_TYPES = new Int32Array([
  * `atom_order`. Slots 0-4 are the backbone plus C-beta; 5-36 are the side-chain
  * atoms whose elements SIDE_CHAIN_ATOM_TYPES lists, in the same order.
  */
-export const ATOM37 = [
-  "N", "CA", "C", "CB", "O", "CG", "CG1", "CG2", "OG", "OG1", "SG", "CD", "CD1", "CD2", "ND1",
-  "ND2", "OD1", "OD2", "SD", "CE", "CE1", "CE2", "CE3", "NE", "NE1", "NE2", "OE1", "OE2", "CH2",
-  "NH1", "NH2", "OH", "CZ", "CZ2", "CZ3", "NZ", "OXT"
-];
+// 🔴 THE TABLE MOVED TO `af3/featurise/template-features.js`, BESIDE THE LAYOUT
+// THAT INDEXES IT. It is AF2's `atom_order`, not ProteinMPNN's; it was only
+// here because this is where it was first needed. AF2's template builder wants
+// it too, and importing it from here made an `af3 <-> design` cycle.
+export { ATOM37 } from "../../af3/featurise/template-features.js";
 
 /** Where the side-chain slots start in ATOM37. */
 export const SIDE_CHAIN_START = 5;

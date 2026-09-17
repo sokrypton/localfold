@@ -101,6 +101,9 @@ export class AlphaFoldQueryOnlyGpu {
     }
     const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
       length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
+      // The same two fields monomer.js forwards; see the note there.
+      template: recycleOptions.template,
+      useTemplateUnitVector: recycleOptions.useTemplateUnitVector,
     }), signal);
     throwIfAborted(signal);
     // 🔴 ONE PAIR BUFFER FOR THE WHOLE TRUNK.

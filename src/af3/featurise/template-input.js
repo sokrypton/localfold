@@ -30,8 +30,9 @@
  */
 import { ONE_LETTER } from "../fold.js";
 import { aatypeFor, conformerFor } from "./reference-conformers.js";
-import { NUM_DENSE } from "./template-features.js";
+import { ATOM37, NUM_DENSE } from "./template-features.js";
 import { coordinateAtoms } from "../../heads/superpose-pdb.js";
+
 
 /** AF3's gap residue type, which is what an uncovered query position gets. */
 export const GAP_AATYPE = 21;
@@ -162,6 +163,54 @@ export function templateSlot({ structure, tokens, map, offset = 0, tokenOf }) {
       atomPositions[base + 1] = point[1];
       atomPositions[base + 2] = point[2];
       atomMask[token * NUM_DENSE + slot] = 1;
+      atoms += 1;
+    }
+    covered += 1;
+  }
+  return { aatype, atomPositions, atomMask, covered, atoms };
+}
+
+/**
+ * The same slot, in AF2's **atom37** layout rather than AF3's dense 24.
+ *
+ * 🔴 THE TWO LAYOUTS ARE NOT INTERCHANGEABLE AND THE ARRAYS LOOK ALIKE. Dense
+ * indexes an atom by its position in that RESIDUE's own conformer, so slot 4 is
+ * whatever the fifth atom of this residue happens to be; atom37 indexes by
+ * NAME, globally, so CB is slot 3 for everything that has one. Handing a dense
+ * slot to `AF2_ATOM37_MONOMER` - whose `pseudoBeta` is 3 and whose `backbone`
+ * is [2, 1, 0], meaning C, CA, N - would read the wrong atoms with no error and
+ * produce a plausible, wrong distogram.
+ *
+ * 🔴 AND AN ATOM THE TABLE DOES NOT NAME IS DROPPED, for the reason the dense
+ * builder gives: a slot is a meaning, and the wrong one puts a side-chain atom
+ * where a backbone one belongs. A hydrogen the file kept, or an alternate
+ * naming, is not given a home.
+ *
+ * @returns {{aatype: Int32Array, atomPositions: Float32Array,
+ *            atomMask: Float32Array, covered: number, atoms: number}}
+ */
+export function templateSlotAtom37({ structure, tokens, map, offset = 0, tokenOf }) {
+  const at = tokenOf ?? ((residue) => residue + offset);
+  const slots = ATOM37.length;
+  const aatype = new Int32Array(tokens).fill(GAP_AATYPE);
+  const atomPositions = new Float32Array(tokens * slots * 3);
+  const atomMask = new Float32Array(tokens * slots);
+  let covered = 0;
+  let atoms = 0;
+
+  for (const [queryIndex, templateIndex] of map instanceof Map ? map : new Map(map)) {
+    const token = at(queryIndex);
+    const residue = structure.residues[templateIndex];
+    if (token < 0 || token >= tokens || residue === undefined) continue;
+    aatype[token] = aatypeFor(residue.code);
+    for (let slot = 0; slot < slots; slot += 1) {
+      const point = residue.atoms.get(ATOM37[slot]);
+      if (point === undefined) continue;
+      const base = (token * slots + slot) * 3;
+      atomPositions[base] = point[0];
+      atomPositions[base + 1] = point[1];
+      atomPositions[base + 2] = point[2];
+      atomMask[token * slots + slot] = 1;
       atoms += 1;
     }
     covered += 1;

@@ -69,7 +69,7 @@ import {
 } from "./fold-session.js";
 import { looksLikeZip, readZip, writeZip } from "./zip.js";
 import { createEntityList } from "./entity-ui.js";
-import { describeCoverage, fetchStructure } from "./template-source.js";
+import { buildTemplate, describeCoverage, fetchStructure } from "./template-source.js";
 import { fetchMmseqs2Templates } from "../src/input/mmseqs2-api.js";
 import { RuntimeEstimator } from "../src/runtime/cost-model.js";
 const element = (id) => {
@@ -509,9 +509,24 @@ const modelFamily = (ligandCount = 0, modificationCount = 0, nucleicCount = 0,
   // would be fetched, aligned, and silently dropped. It is the same refusal as
   // the three above and for the opposite reason: those were a capability the
   // model has and the guard denied, this is one it does not.
-  if (templateCount > 0 && !isAf3Family(choice)) {
-    throw new Error("Templates need AF3 or OpenBind-0;"
+  //
+  // 🔴 AND AlphaFold 2's MONOMER IS NOT IN THAT CLASS ANY MORE. Its term was
+  // always there and oracle-checked; the driver simply never forwarded the
+  // slot, so this refusal was right for the wrong reason. The MULTIMER stays
+  // refused here: it forwards a template in its own driver, but its embedder
+  // is a different dialect with a different feature set and nothing on this
+  // page has ever built one for it - which is exactly the gap that made the
+  // monomer's term look supported for a year.
+  if (templateCount > 0 && !isAf3Family(choice) && choice !== "monomer") {
+    throw new Error("Templates need AF3, OpenBind-0 or AlphaFold 2 monomer;"
       + ` the model is set to ${choice}`);
+  }
+  // 🔴 AND THE MONOMER'S TERM TAKES EXACTLY ONE. `QueryOnlyTemplateGpu` reads
+  // `input.template`, singular - AF3 runs a forward per slot and averages, and
+  // this one does not - so a second row would be silently dropped.
+  if (templateCount > 1 && choice === "monomer") {
+    throw new Error("AlphaFold 2's monomer takes one template;"
+      + ` ${templateCount} are set`);
   }
   return choice;
 };
@@ -2972,8 +2987,11 @@ async function fold(event) {
     }
     // 🔴 FETCHED HERE AND NOT INSIDE THE FOLD, so a structure that cannot be
     // reached stops the run with its own message rather than surfacing as a
-    // fold that scored badly. AF3 only: AF2's drivers take a template through
-    // a different path and nothing on this page builds one for them yet.
+    // fold that scored badly. Fetched for AF3 AND for AlphaFold 2's monomer -
+    // this used to say "AF3 only: AF2's drivers take a template through a
+    // different path and nothing on this page builds one for them yet", and
+    // the reason was that monomer.js never forwarded the slot. It does now.
+    // The MULTIMER is still refused upstream, in chosenFamily's guard.
     const templateSources = [];
     for (const template of request.templates ?? []) {
       const kind = templateKind(template);
@@ -3156,6 +3174,44 @@ async function fold(event) {
     const unified = multimer || new URLSearchParams(location.search).get("graph") === "unified";
     const alignmentForDriver = alignment === null ? `>query\n${sequence}\n` : alignmentForModel;
 
+    // 🔴 THE MONOMER'S TEMPLATE, BUILT BEFORE af2Key, because a trunk cached
+    // from a fold WITHOUT one is not this fold's trunk - which is what that
+    // comment below means by "everything a pass reads".
+    //
+    // 🔴 AND IT IS atom37, NOT AF3's DENSE 24. `buildTemplate` already does
+    // everything else this needs and the AF3 path uses it unchanged: it sniffs
+    // PDB against mmCIF, ALIGNS a homolog to the query (a search hit is not the
+    // query's own sequence, so the CLI tool's identity map would be wrong here)
+    // and drops low-confidence residues. The layouts differ only in which slot
+    // builder it ends on, they are the same rank, and NEITHER THROWS ON THE
+    // OTHER - so `layout` is the whole of the difference and all of the risk.
+    // See test/template-atom37-layout.test.js.
+    let af2Template;
+    if (templateSources.length > 0) {
+      // 🔴 REFUSED RATHER THAN DROPPED. `?graph=unified` runs the MULTIMER's
+      // graph over a monomer, and that embedder is a different dialect nothing
+      // here builds a slot for - so folding on would quietly ignore it, which
+      // is the failure this whole path exists to avoid.
+      if (unified) {
+        // ...and it names which of the two it is, because a session restored
+        // from a job that set both reaches here without passing chosenFamily's
+        // guard, and "drop ?graph=unified" is not advice a multimer can take.
+        throw new Error(multimer
+          ? "AlphaFold 2 multimer's template embedder is a different dialect"
+            + " and this page does not build a slot for it"
+          : "the unified graph has no monomer template embedder;"
+            + " drop ?graph=unified to fold with a template");
+      }
+      const source = templateSources[0];
+      status(`Aligning template ${source.source ?? ""}`);
+      af2Template = buildTemplate({
+        text: source.text, chain: source.chainId, query: sequence,
+        tokens: sequence.length, minConfidence: source.minConfidence ?? 0,
+        layout: "atom37",
+      });
+      throwIfAborted(signal);
+    }
+
     // 🔴 THE KEY IS EVERYTHING A PASS READS, for the reason the AF3 one gives:
     // a stale state is not a slow fold but a structure for another sequence.
     // Recycles are absent because more of them is a continuation; the tolerance
@@ -3163,6 +3219,10 @@ async function fold(event) {
     const af2Key = JSON.stringify({
       sequence, chainLengths, maxMsaSequences, maxExtraSequences, seed, tolerance,
       unified, family, alignment: cheapHash(alignmentForDriver),
+      // ...the SOURCE rather than the slot: the slot is megabytes of float and
+      // the text plus the chain is what decides every one of them.
+      template: af2Template === undefined ? null
+        : cheapHash(`${templateSources[0].text}\u0000${templateSources[0].chainId ?? ""}`),
     });
     const af2Cached = af2Cache?.key === af2Key ? af2Cache : undefined;
     const resume = af2Cached !== undefined && af2Cached.resumable.recycles < recycles
@@ -3352,7 +3412,10 @@ async function fold(event) {
         { recycles, randomSeed: seed, maxMsaSequences, maxExtraSequences, chainLengths, tolerance, signal,
         // ...and `pairHost: true` for the distogram contact overlay, which is
         // the only reader of the host copy of the pair representation.
-          resume, resumable: true, pairHost: true, ...regime },
+        // ...and the template slot, which monomer.js forwards into
+        // QueryOnlyTemplateGpu. `undefined` is a fully masked template, which
+        // is what every fold on this page was before it.
+          resume, resumable: true, pairHost: true, template: af2Template?.slot, ...regime },
         model.paeBreaks, onRecycle, runProgress);
 
     progress(null);
@@ -3494,9 +3557,22 @@ async function fold(event) {
       { plddt: best.confidence.meanPlddt });
     const broken = chain.ok ? "" : " · 🔴 NOT A CHAIN - the backbone is broken,"
       + " and pLDDT does not measure that";
+    // 🔴 THE COVERAGE GOES BACK ON THE ROW THAT ASKED FOR IT, exactly as the
+    // AF3 path does and for the same reason: a fold that LOST its template
+    // folds and scores, and the number is merely different, so this line is
+    // the only thing on screen that says one arrived.
+    let templateText = "";
+    if (af2Template !== undefined) {
+      const source = templateSources[0];
+      if (source.origin !== undefined) {
+        source.origin.status = describeCoverage(af2Template.coverage);
+      }
+      templateText = ` · template ${source.source ?? ""}`
+        + ` ${af2Template.coverage.residues}/${af2Template.coverage.of}`;
+    }
     status(`Done in ${took} s · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
       + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
-      + broken);
+      + templateText + broken);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");

@@ -179,6 +179,19 @@ export class AlphaFoldMonomerGpu {
       await withAbort(new QueryOnlyTemplateGpu(this.device).run({
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
         outputTensor: templateUpdate,
+        // 🔴 THE TEMPLATE, WHICH THIS CALL DID NOT PASS AND THE TERM HAS ALWAYS
+        // TAKEN. `QueryOnlyTemplateGpu` reads `input.template` and builds the
+        // real geometry from it; with the field absent it writes zeros and the
+        // GAP restype, which is a fully masked template and leaves exactly the
+        // embedding bias. So the monomer could not be given one though the term
+        // underneath it could, while the MULTIMER has forwarded
+        // `recycleOptions.template` since it was written. Same convention here.
+        template: recycleOptions.template,
+        // ...and the flag that decides whether columns 84..86 carry the unit
+        // vector. `use_template_unit_vector` is FALSE in every shipped monomer
+        // config, which is the default the term already takes - this is here so
+        // a checkpoint that sets it true is not silently mis-embedded.
+        useTemplateUnitVector: recycleOptions.useTemplateUnitVector,
       }), signal);
       stageMilliseconds.template = performance.now() - phaseStart;
       phaseStart = performance.now();

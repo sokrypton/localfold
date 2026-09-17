@@ -40,13 +40,31 @@ const MODELS = [
   ["model-opendde-int5", "opendde"],
   ["model-intellifold2-int5", "intellifold2"],
   ["model-rosettafold3-int5", "rosettafold3"],
+  // 🔴 AF2's MONOMER IS HERE NOW AND IT NEEDS ITS OWN BAR AND ITS OWN TOOL.
+  // `fold-opendde.js` folds the AF3 lineage; AF2 is a different graph and folds
+  // through `fold-af2.js`, which grew `--template=` and a target score for
+  // this. And the AF3 bar does not transfer: AF2's monomer template embedder is
+  // ONE Linear over 88 concatenated channels with the unit vector switched off,
+  // where the lineage sums nine projections, and this arm runs a 16-row
+  // alignment. Measured here: **21.195 A without a template and 2.371 with**,
+  // so the term is plainly working and 1.5 A is not the right question to ask
+  // of it. A bar it cannot meet would be a gate nobody could keep green.
+  ["model", "af2-monomer", {
+    tool: "tools/gpu/fold-af2.js",
+    args: ["--target=5caj", "--chain=A", "--rows=16", "--extra-rows=16"],
+    withMax: 5.0, withoutMin: 10.0,
+  }],
 ];
 
 /** One fold of 5CAJ chain A, with or without the self-template. */
-function fold(bundle, template) {
-  const args = ["tools/gpu-chrome.mjs", "tools/gpu/fold-opendde.js",
-                "--target=5caj", "--chain=A", "--steps=25", "--mode=diffusion",
-                `--model=/${bundle}/manifest.json`];
+function fold(bundle, template, entry = {}) {
+  const args = entry.tool === undefined
+    ? ["tools/gpu-chrome.mjs", "tools/gpu/fold-opendde.js",
+       "--target=5caj", "--chain=A", "--steps=25", "--mode=diffusion",
+       `--model=/${bundle}/manifest.json`]
+    // A tool of its own, with no `--model=`: AF2's bundle is chosen by
+    // `--family`, and its default IS the monomer.
+    : ["tools/gpu-chrome.mjs", entry.tool, ...entry.args];
   // A fold with no template is 17-30 A out and its backbone is not always a
   // chain; that arm is the CONTROL and not the thing under test.
   if (template) args.push(`--template=${TEMPLATE}`);
@@ -57,12 +75,12 @@ function fold(bundle, template) {
 }
 
 let failures = 0;
-for (const [bundle, name] of MODELS) {
+for (const [bundle, name, entry = {}] of MODELS) {
   let templated;
   let bare;
   try {
-    templated = fold(bundle, true);
-    bare = fold(bundle, false);
+    templated = fold(bundle, true, entry);
+    bare = fold(bundle, false, entry);
   } catch (error) {
     const message = String(error.stderr ?? error.message);
     if (/failed to load .*manifest\.json: 404/.test(message)) {
@@ -88,13 +106,15 @@ for (const [bundle, name] of MODELS) {
     failures += 1;
     continue;
   }
-  const ok = withRmsd <= WITH_MAX && withoutRmsd >= WITHOUT_MIN;
+  const withMax = entry.withMax ?? WITH_MAX;
+  const withoutMin = entry.withoutMin ?? WITHOUT_MIN;
+  const ok = withRmsd <= withMax && withoutRmsd >= withoutMin;
   if (!ok) failures += 1;
   console.log(`${ok ? "ok  " : "FAIL"}  ${name.padEnd(13)}`
     + ` with a template ${withRmsd.toFixed(3).padStart(7)} A`
     + `   without ${withoutRmsd.toFixed(3).padStart(7)} A`
     + `   pLDDT ${Number(templated.meanPlddt).toFixed(2).padStart(6)}`
-    + (withoutRmsd < WITHOUT_MIN
+    + (withoutRmsd < withoutMin
       ? "   <- the control folded it anyway; this target proves nothing here"
       : ""));
 }

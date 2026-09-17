@@ -24,7 +24,7 @@
  */
 import { alignPositions } from "./align.js";
 import {
-  chainResidues, filterByConfidence, identityMap, templateSlot,
+  chainResidues, filterByConfidence, identityMap, templateSlot, templateSlotAtom37,
 } from "../src/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../src/af3/fold.js";
 import { parseCIFAtoms } from "../src/design/mpnn/pdb.js";
@@ -165,6 +165,13 @@ export function mapToQuery(structure, query) {
  *   dropdown cannot explain in the space it has, and nothing on screen said
  *   what the default had done. A caller that wants it passes it.
  * @param {boolean} [options.spanChains]
+ * @param {"dense"|"atom37"} [options.layout] which slot layout to build.
+ *   🔴 THE TWO ARE NOT INTERCHANGEABLE AND NEITHER THROWS ON THE OTHER.
+ *   "dense" (the default) is AF3's `[tokens, 24, 3]` grid in each residue's
+ *   OWN conformer order; "atom37" is AlphaFold 2's fixed table, where slot 0
+ *   is N, 1 is CA, 2 is C, 3 is CB and 4 is O whatever the residue. They are
+ *   the same rank and similar widths, so handing one to the other reads the
+ *   wrong atoms and returns a plausible template. See AF2_ATOM37_MONOMER.
  * @returns {{slot: object, sequence: string, coverage: object}}
  */
 export function buildTemplate(options) {
@@ -185,7 +192,8 @@ export function buildTemplate(options) {
   const kept = filterByConfidence(map, structure, options.minConfidence ?? 0,
                                   (residue) => residue.confidence);
   const chainLength = (options.query ?? "").length || structure.residues.length;
-  const slot = templateSlot({
+  const buildSlot = options.layout === "atom37" ? templateSlotAtom37 : templateSlot;
+  const slot = buildSlot({
     structure, tokens: options.tokens, map: kept,
     offset: options.offset ?? 0, tokenOf: options.tokenOf,
   });

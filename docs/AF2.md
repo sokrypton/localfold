@@ -76,6 +76,119 @@ references read float32 parameters, so the same correct code scores 6e-3 on the
 input term against one and 2e-7 against the other. An hour went into that
 before the manifest was read.
 
+## 🔴 THE MONOMER TERM WAS ORACLE-CHECKED AND WIRED TO NOTHING
+
+Everything above measures `src/af2/evoformer/template.js` against AF2's own
+module. None of it asks whether a template can REACH it, and the answer for the
+monomer driver was no: `src/af2/model/monomer.js` built its
+`QueryOnlyTemplateGpu.run({...})` call from a literal that named neither
+`template` nor `useTemplateUnitVector`, so `recycleOptions.template` was
+accepted by the term, forwarded by the MULTIMER, and dropped on the floor here.
+The same literal in `src/af2/model/query-only.js`.
+
+This is CLAUDE.md's allow-list trap for the third time at this seam - `predictA3m`
+dropping `pairHost` and killing the contact overlay, `src/af2/multimer/model.js`
+dropping the whole multimer regime - and it is the same fix: **forward the
+object**, or at minimum forward every field the callee reads.
+
+Two lines each, and 5CAJ chain A with its own crystal as a self-template:
+
+| AF2 monomer, 255 residues, 16+16 rows | CA RMSD | TM |
+|---|---:|---:|
+| no template | **21.195 A** | 0.1239 |
+| self-template | **2.371 A** | 0.9162 |
+
+🔴 **AND THE GATE IS BOTH ARMS, BECAUSE ONE ARM IS NOT EVIDENCE.** 2.371 A with
+a template says nothing unless the same model is 21 A without one - a checkpoint
+that had memorised the target would pass a one-armed gate, which is the rule
+`npm run test:template` already applies to the seven AF3-lineage models.
+`tools/check-template-path.mjs` carries AF2 now as an entry with its own tool,
+its own arguments and its own two bars (`withMax: 5.0`, `withoutMin: 10.0`),
+since a 255-residue monomer at 16 rows does not land where an AF3 fold does.
+Verified failing with `template: recycleOptions.template` deleted: it returns
+**exactly** the control's 21.195 / 0.1239, which is the tell that the forward is
+the whole of what the arm varies.
+
+### The layout conversion, which is where this could have been silently wrong
+
+AF3's featuriser builds a DENSE-24 slot - per-residue conformer order, whatever
+the CCD says that residue's atoms are - and AF2's template term reads **atom37**,
+a fixed table where slot 0 is N, 1 is CA, 2 is C, 3 is CB and 4 is O. The two
+are the same length only by coincidence and the same ORDER never.
+`templateSlotAtom37` in `src/af3/featurise/template-input.js` indexes by atom
+NAME against that table and drops what the table does not name; a token no
+residue covers is left at the GAP restype with no atoms, which is what
+`AF2_ATOM37_MONOMER`'s consumers expect.
+
+`test/template-atom37-layout.test.js` pins it - width 37 and not 24,
+`ATOM37[pseudoBeta] === "CB"`, `backbone [2,1,0]` reading C/CA/N, every atom
+landing in its named slot, glycine with no CB - and was verified failing 2 of 5
+with the slot mapping perturbed. 🔴 Compare through `Math.fround`: the slot store
+is a `Float32Array` and a parsed PDB coordinate is a double, so an exact
+comparison fails on a correct conversion.
+
+🔴 **AND THE TABLE MOVED TO `src/af3/featurise/template-features.js`.** It was in
+`src/design/mpnn/constants.js`, and importing it from the featuriser is an
+`af3 <-> design` cycle. It sits beside `AF2_ATOM37_MONOMER` now - the layout and
+the dialect that describes it in one file - and mpnn re-exports it.
+
+### Stripping side chains changes NOTHING, which is the fact AF2BIND rests on
+
+AF2BIND's weights are named "nosc" because it feeds the target with side chains
+stripped. Two questions follow and both are now measured rather than assumed.
+
+**Does `rm_target_sc` keep C-beta?** Yes. ColabDesign masks
+`template_all_atom_mask[..., 5:]` under its own comment "remove sidechains (mask
+anything beyond CB)", and atom37's first five slots are N, CA, C, **CB**, O. So
+the strip begins after C-beta.
+
+**Does the strip change the monomer's features?** No, and `--template-no-sidechains`
+on `tools/gpu/fold-af2.js` is the arm that says so. The fold is byte-identical -
+rmsd **2.371**, TM **0.9162**, pLDDT **69.195** both ways.
+
+🔴 **AN IDENTICAL FOLD IS TWO HYPOTHESES, NOT ONE**: "nothing reads those slots"
+and "my flag did nothing". Separating them is the whole of the measurement. The
+flag zeroes **810** mask entries and keeps C-beta on all **246** residues that
+have one, and the packed template geometry the two arms compute is **0 of
+408,726 values apart**. So the term reads the pseudo-beta for its distogram and
+N, CA, C for its frames and nothing else - as the dialect above already said in
+prose - and a p(bind) discrepancy downstream cannot be blamed on the strip.
+
+🔴 **AND THE FIRST ANSWER WAS 339,300 OF 408,726 DIFFERING, WHICH WAS A NaN
+ARTEFACT.** `templateGeometry` takes a `tokens * tokens` chain mask and was
+handed a length-`tokens` one, so every read past the end was `undefined`, every
+comparison `NaN !== NaN`, and 83% of the tensor "changed". The tell was in the
+index: the first difference was at exactly 261, which is `n`. A mask of the
+wrong RANK does not throw, it silently poisons the comparison - and the test
+pins the correct shape with that comment on it.
+
+### And the page offers it now
+
+`chosenFamily`'s guard refused a template under any non-AF3 model, which was
+right for ESMFold2 and the multimer and wrong for the monomer. From the page,
+5CAJ chain A with its own crystal uploaded: **pLDDT 31.9 / pTM 0.215 without,
+76.0 / 0.795 with**. `buildTemplate` grew a `layout` argument and nothing else,
+because a page template is a HOMOLOG and the alignment, the format sniffing and
+the confidence filter it already did are the parts that matter. docs/WEB.md has
+that half, including the three things it refuses rather than drops.
+
+### 🔴 What was NOT re-run: the monomer template ORACLE
+
+`tools/gpu/check-monomer-template.js` was not run for this work, and nothing
+below should be read as though it had been. It wants
+`/model.f32-backup/manifest.json` - this box has only the int8 `model/`, and the
+section above records that comparing against int8 reports quantisation as a
+fault - and `oracle-dumps/toy-template-monomer-jax*.json`, whose dumper needs
+`~/Documents/GitHub/alphafold` and `params_model_1_ptm.npz`; the A10 has the
+params and not the package.
+
+The judgement, stated so it can be disagreed with: the term itself is unchanged
+by this work - the forward adds two fields to a call site and the featuriser
+writes a slot the term already knew how to read - and it was oracle-checked at
+2.7e-4 / 4.5e-4 by its author. What replaces the oracle here is the two-armed
+fold gate and the layout unit test, both of which were watched failing. An f32
+bundle and those two dumps would close it properly.
+
 ## The gates: one end-to-end, four differential
 
 🔴 **AND AF2 NOW HAS AN END-TO-END GATE, WHICH THE DIFFERENTIAL ONES ARE NOT.**

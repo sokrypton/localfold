@@ -39,6 +39,50 @@ running the PDB reader and the mmCIF reader over the same entry and comparing.
 MSE is the one heteroatom kept: selenomethionine is how a great many structures
 were phased, and dropping it puts a hole in the middle of a chain.
 
+### 🔴 AND ALPHAFOLD 2's MONOMER TAKES ONE NOW, WHICH IT WAS REFUSED FOR
+
+`chosenFamily`'s guard read "Templates need AF3 or OpenBind-0", and for the
+monomer that was right for the wrong reason: its term exists, is
+oracle-checked against AF2's own module, and was reachable from nothing,
+because `src/af2/model/monomer.js` built its template call from a literal that
+named neither `template` nor `useTemplateUnitVector`. See docs/AF2.md. With
+the driver forwarding, the page can offer it. Measured, 5CAJ chain A with its
+own crystal uploaded, one recycle, single sequence:
+
+| monomer, from the page | pLDDT | pTM |
+|---|---:|---:|
+| no template | 31.9 | 0.215 |
+| self-template, 261/261 | **76.0** | **0.795** |
+
+🔴 **AND `buildTemplate` GAINED A `layout` AND NOTHING ELSE.** Everything the
+AF3 path needs it already did - it sniffs PDB against mmCIF, ALIGNS a homolog
+to the query, drops low-confidence residues - and a page template is a homolog
+or an upload, never the query's own sequence, so `tools/gpu/fold-af2.js`'s
+identity map is exactly what does NOT work here. AF2 differs only in ending on
+`templateSlotAtom37` rather than the dense-24 builder. **The two are the same
+rank and neither throws on the other**, so that one argument is the whole
+difference and all of the risk; AF3's arm is verified unmoved through the same
+function, pLDDT 95.7 on the identical file.
+
+Three things are refused rather than dropped, which is the rule the rest of
+this section is built on:
+
+- **the MULTIMER.** Its driver has forwarded a template since it was written,
+  but its embedder is a different dialect and nothing on this page builds a
+  slot for it - which is precisely the gap that let the monomer's term look
+  supported for a year.
+- **`?graph=unified`**, which runs that same multimer graph over a monomer. A
+  template there would be ignored, so the fold stops instead.
+- **a second template.** `QueryOnlyTemplateGpu` reads `input.template`,
+  singular: AF3 runs a forward per slot and averages the outputs, and this one
+  does not.
+
+🔴 **AND THE TEMPLATE IS IN `af2Key`.** That key's own comment calls itself
+everything a pass reads, and a trunk cached from a fold WITHOUT the template is
+not this fold's trunk - so raising the recycle count would have continued from
+the wrong state. The SOURCE is hashed rather than the slot: the slot is
+megabytes of float and the text plus the chain decides every one of them.
+
 ## The phone layout, measured rather than looked at
 
 🔴 **THE PHONE LAYOUT IS MEASURED, NOT LOOKED AT, AND `--window-size` CLAMPS AT
