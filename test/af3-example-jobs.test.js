@@ -53,19 +53,26 @@ const EXPECTED = {
   "u1a_rna_hairpin.json": { loads: ["protein:101x1", "rna:21x1"] },
   "ubiquitin_monomer.json": { loads: ["protein:76x1"] },
 
-  // ...and the five this page does not fold, each naming its own reason.
+  // ...and the four this page does not fold, each naming its own reason.
   "kras_g12c_sotorasib.json": { refuses: "bondedAtomPairs" },
   "rnaseb_glycosylated.json": { refuses: "bondedAtomPairs" },
   "methylated_dna.json": { refuses: "modified bases" },
   "modified_rna.json": { refuses: "modified bases" },
-  "streptavidin_biotin_smiles.json": { refuses: "smiles" },
+  // 🔴 AND THIS ONE LOADS NOW, WHERE IT USED TO BE A REFUSAL. Biotin arrives
+  // as a structure rather than a code and src/chem/ builds it a component; see
+  // docs/SMILES.md. It is kept in the corpus precisely because it is the one
+  // example job that exercises the new path.
+  "streptavidin_biotin_smiles.json": { loads: ["protein:126x1", "smiles:1x1"] },
   // ...and the pipeline's own kitchen-sink input, which uses nearly every
   // field the format has at once. It refuses on the first one it hits.
   "alphafold_input.json": { refuses: "bondedAtomPairs" },
 };
 
 const shape = (entities) => entities.map((entity) =>
-  `${entity.type}:${entity.type === "ligand" ? entity.value : entity.value.length}`
+  // A SMILES row is summarised by its ATOM COUNT rather than its text, which
+  // would make the expectation above a second copy of the input string.
+  `${entity.type}:${entity.type === "ligand" ? entity.value
+    : entity.type === "smiles" ? 1 : entity.value.length}`
   + `x${entity.copies}`);
 
 describe("AlphaFold 3's own example jobs", () => {
@@ -113,18 +120,22 @@ describe("AlphaFold 3's own example jobs", () => {
   });
 
   /**
-   * 🔴 THE COUNT IS ASSERTED, so that "eight of fourteen fold here" is a fact
-   * somebody has to update deliberately. Bonded chemistry and modified bases
-   * are the two gaps, at two examples each, and that is the argument for which
-   * to build next.
+   * 🔴 THE COUNT IS ASSERTED, so that "nine of fourteen fold here" is a fact
+   * somebody has to update deliberately. It was EIGHT until SMILES landed, and
+   * this assertion is what made that a decision rather than a drift: the
+   * streptavidin/biotin job moved from the refusal list to the loading one and
+   * this line went red until somebody said so out loud.
+   *
+   * Bonded chemistry and modified bases are the two gaps that remain, at three
+   * and two examples, and that is the argument for which to build next.
    */
-  it("folds eight of the fourteen, and says which two gaps cost the rest", () => {
+  it("folds nine of the fourteen, and says which two gaps cost the rest", () => {
     const loads = Object.values(EXPECTED).filter((one) => one.loads !== undefined);
     const bonded = Object.values(EXPECTED)
       .filter((one) => one.refuses === "bondedAtomPairs");
     const bases = Object.values(EXPECTED)
       .filter((one) => one.refuses === "modified bases");
-    expect(loads).toHaveLength(8);
+    expect(loads).toHaveLength(9);
     // ...three, with the kitchen-sink input, which is bonded chemistry too.
     expect(bonded).toHaveLength(3);
     expect(bases).toHaveLength(2);

@@ -733,6 +733,11 @@
 
 .entity-value-protein { height: 52px; min-height: 52px; resize: vertical; }
 .entity-value-ligand { height: 34px; text-transform: uppercase; }
+/* 🔴 EXPLICITLY NOT UPPERCASED. A CCD code is case-insensitive and shown upper
+   for tidiness; a SMILES is not - `c1ccccc1` is benzene and `C1CCCCC1` is
+   cyclohexane - so this rule is stated rather than left to default, because
+   the neighbouring one is two lines away and easy to extend by accident. */
+.entity-value-smiles { height: 34px; text-transform: none; font-family: ui-monospace, monospace; }
 
 .entity-value:hover { border-color: #9ca3af; }
 .entity-value:focus { outline: none; border-color: #3b82f6; }

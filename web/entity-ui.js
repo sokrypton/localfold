@@ -16,7 +16,7 @@
  * not, and update the model in place instead.
  */
 import { COMMON_IONS, COMMON_LIGANDS, COMMON_MODIFICATIONS, ENTITY_LABELS, ENTITY_TYPES,
-  MENU_CODES, TEMPLATE_KINDS, entitiesFromText, entityProblem, newEntity,
+  MENU_CODES, POLYMER_TYPES, TEMPLATE_KINDS, entitiesFromText, entityProblem, newEntity,
   templateAsked, templateKind } from "./entities.js";
 import { cleanSequence, cleanSequenceMap, extractFastaHeader } from "./sequence.js";
 
@@ -482,6 +482,13 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     document.addEventListener("keydown", onKey);
   };
 
+  /**
+   * Which kind of thing a row holds, for deciding whether its VALUE survives a
+   * type change: the three polymers share an alphabet, a CCD code is a name,
+   * and a SMILES is a structure. Text means something different in each.
+   */
+  const categoryOf = (type) => (POLYMER_TYPES.includes(type) ? "polymer" : type);
+
   const row = (entity, index) => {
     const wrapper = document.createElement("div");
     wrapper.className = "entity-row";
@@ -498,12 +505,28 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     type.value = entity.type;
     type.addEventListener("change", () => {
       const wasProtein = entity.type === "protein";
+      const from = entity.type;
       entity.type = type.value;
       // 🔴 THE MODIFICATIONS GO WITH THE TYPE. They are amino-acid modifications
       // resolved through the amino-acid table, so carrying them onto a DNA row
       // leaves the row permanently invalid with its reason behind a button that
       // the row no longer has.
       if (wasProtein && entity.type !== "protein") entity.modifications = [];
+      // 🔴 AND THE VALUE GOES WITH IT WHEN THE ROW CHANGES CATEGORY, BECAUSE
+      // THE SAME TEXT IS A DIFFERENT MOLECULE ON THE OTHER SIDE. Switching a
+      // CCD row holding `C` to SMILES gives methane where it meant cytidine
+      // monophosphate; switching a SMILES `CCO` to CCD goes looking for a
+      // dictionary entry called CCO. Both parse, both validate, and both are
+      // silently not what was typed - which is the same failure as the
+      // archive writing a SMILES as a code, one control earlier.
+      //
+      // 🔴 BUT NOT BETWEEN THE POLYMERS, WHERE CARRYING IT IS THE POINT. This
+      // file's own note says `ACGT` is a valid protein AND a valid DNA chain
+      // and that only the row's type says which - so someone pasting a
+      // sequence and then correcting the type must not lose it. Clearing
+      // within that group would make the commonest correction on the page
+      // destructive.
+      if (categoryOf(from) !== categoryOf(entity.type)) entity.value = "";
       // The field itself changes shape with the type - a sequence wants a
       // monospace box that grows, a CCD code wants one small line - so this is
       // a structural change and the row is rebuilt.
@@ -559,7 +582,8 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       mirror.setAttribute("aria-hidden", "true");
     }
 
-    const value = entity.type === "ligand"
+    const oneLine = entity.type === "ligand" || entity.type === "smiles";
+    const value = oneLine
       ? document.createElement("input")
       : document.createElement("textarea");
     value.className = `entity-value entity-value-${entity.type}`;
@@ -568,6 +592,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
       value.type = "text";
       value.placeholder = "CCD code, e.g. HEM";
       value.setAttribute("aria-label", "Ligand CCD code");
+    } else if (entity.type === "smiles") {
+      // 🔴 ITS OWN CLASS, BECAUSE `.entity-value-ligand` IS UPPERCASED IN CSS.
+      // Borrowing the ligand's styling would DISPLAY a SMILES upper case -
+      // `c1ccccc1` shown as `C1CCCCC1` - which is a different molecule on
+      // screen from the one that would be folded.
+      value.type = "text";
+      value.placeholder = "SMILES, e.g. c1ccccc1 for benzene";
+      value.setAttribute("aria-label", "Ligand SMILES");
     } else {
       // Two lines by default, and the user can drag it taller. One line was too
       // mean for the thing this box is actually for - a sequence of a few
@@ -633,6 +665,14 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
     value.addEventListener("blur", () => {
       if (entity.type === "ligand") {
         entity.value = value.value.trim().toUpperCase();
+      } else if (entity.type === "smiles") {
+        // 🔴 TRIMMED AND NOTHING ELSE. Neither of the other two branches can
+        // touch a SMILES: upper-casing turns `c1ccccc1` into cyclohexane, and
+        // `cleanSequence` keeps only amino-acid letters, which turned benzene
+        // into `CCCCCC` - HEXANE - and stripped biotin's ring-closure digits
+        // so it no longer parsed. Both happened the moment the reader clicked
+        // away from the box, silently rewriting what they had typed.
+        entity.value = value.value.trim();
       } else {
         entity.value = cleanSequence(value.value);
       }
@@ -770,7 +810,12 @@ export function createEntityList(rowsContainer, addButton, options = {}) {
      * would be folding two different proteins at once.
      */
     setChains: (chains) => {
-      const ligands = entities.filter((entity) => entity.type === "ligand");
+      // 🔴 EVERY NON-POLYMER ROW SURVIVES, NOT JUST THE CCD ONES. This runs
+      // when an alignment's own query replaces the chain list, and filtering
+      // on `type === "ligand"` DELETED a SMILES row - so folding with an A3M
+      // silently dropped the ligand and folded the protein alone.
+      const ligands = entities.filter(
+        (entity) => entity.type === "ligand" || entity.type === "smiles");
       const proteins = [];
       for (const chain of chains) {
         const existing = proteins.find((row) => row.value === chain);

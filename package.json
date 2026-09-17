@@ -70,10 +70,13 @@
     "test:modified": "node tools/check-modified-path.mjs",
     "//test:template": "Every model's TEMPLATE moves its fold, on a target that needs one. Both oracle checkers for this stage drive the module with templates: 1 where a FOLD pads to four, so a wrong denominator is exact in every module check and a quarter strength in every fold - which is what rosettafold3 was. 5CAJ chain A, with and without.",
     "test:template": "node tools/check-template-path.mjs",
+    "test:smiles": "node tools/check-smiles-vs-rdkit.mjs && node tools/check-stereo-vs-rdkit.mjs && node tools/check-smiles-rewrites.mjs && node tools/check-smiles-conformer.mjs",
+    "test:smiles-batch": "node tools/check-smiles-batch.mjs",
+    "test:smiles-path": "node tools/check-smiles-path.mjs",
     "test:cache": "node tools/gpu-chrome.mjs tools/gpu/check-pipeline-key-collisions.js",
-    "//test:site": "Assembles dist/ and runs build_site.py's own unresolved-import check. 🔴 THE ONLY GATE THAT SEES A CONSTRUCTED PATH. The src/ reorganisation broke five python tools that build paths from segments - (ROOT / \"src\" / \"reference\" / \"manifests\" / \"index.js\") - where no literal path exists for any pattern to match, and test/imports-resolve.test.js found none of them. Run this after any move under src/.",
+    "//test:site": "Assembles dist/ and runs build_site.py's own unresolved-import check. \ud83d\udd34 THE ONLY GATE THAT SEES A CONSTRUCTED PATH. The src/ reorganisation broke five python tools that build paths from segments - (ROOT / \"src\" / \"reference\" / \"manifests\" / \"index.js\") - where no literal path exists for any pattern to match, and test/imports-resolve.test.js found none of them. Run this after any move under src/.",
     "test:site": "python3 tools/build_site.py",
-    "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. 🔴 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
+    "//test:tools": "Every tool has a header line saying what it is, and docs/TOOLS.md lists exactly the tools that exist with exactly those lines. \ud83d\udd34 44 TOOLS WERE NAMED BY NOTHING AT ALL - not CLAUDE.md's table, not docs/, not another tool - including working differential checkers. The index is DERIVED from each file's own header, so an entry cannot drift from it; regenerate with `python3 tools/index-tools.py --write`.",
     "test:tools": "python3 tools/index-tools.py"
   },
   "devDependencies": {

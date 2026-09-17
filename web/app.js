@@ -45,6 +45,7 @@ import { spreadOverAtoms, toDensePositions } from "../src/esmfold2/featurise.js"
 import { toPdb } from "../src/af3/fold.js";
 import { chainGeometryOf, chainGeometryVerdict } from "../src/af3/chain-geometry.js";
 import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../src/chem/component.js";
 import { GpuBufferAllocator } from "../src/runtime/allocator.js";
 import { getDevice, loadModel } from "./model.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, MODELS_WITHOUT_CONFIDENCE,
@@ -2414,7 +2415,14 @@ async function foldWithAf3(chains, alignment, alignmentBlocks, signal, ligandCod
   }
   // Named, because a fold that silently ignored the ligand would otherwise
   // report exactly the same line - the residue count is the same either way.
-  if (ligandCodes.length > 0) what.push(ligandCodes.join(", "));
+  // ...and a SMILES ligand names itself by its string, truncated, because the
+  // whole of a drug-like SMILES does not fit on a status line and the first
+  // twenty characters are enough to recognise the one you typed.
+  if (ligandCodes.length > 0) {
+    what.push(ligandCodes.map((entry) => (typeof entry === "string" ? entry
+      : entry.smiles.length > 24 ? `${entry.smiles.slice(0, 21)}...` : entry.smiles))
+      .join(", "));
+  }
   // ...and the same argument applies twice over to a modified residue, whose
   // residue COUNT is unchanged by definition: "59 residues" is the line either
   // way, so the only evidence the modification was applied is this.
@@ -2535,11 +2543,17 @@ async function foldWithEsmfold2(chains, chainKinds, ligandCodes, signal, modelLo
   // fold touches only the codes its ligands name and the PDB serves each as one
   // small mmCIF; the 21 polymer components stay baked.
   const ligands = [];
-  for (const code of ligandCodes) {
-    status(`${modelName} · fetching ligand ${code}`);
-    const response = await fetch(ccdUrl(code), { signal });
+  for (const entry of ligandCodes) {
+    // A structure rather than a code; see the note in web/af3-model.js.
+    if (typeof entry !== "string") {
+      status(`${modelName} · building ${entry.code ?? "ligand"}`);
+      ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+      continue;
+    }
+    status(`${modelName} · fetching ligand ${entry}`);
+    const response = await fetch(ccdUrl(entry), { signal });
     if (!response.ok) {
-      throw new Error(`No chemical component ${code} at the PDB (${response.status})`);
+      throw new Error(`No chemical component ${entry} at the PDB (${response.status})`);
     }
     ligands.push(parseCcdComponent(await response.text()));
   }

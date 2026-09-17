@@ -55,6 +55,28 @@ function specifiersOf(source) {
   return found;
 }
 
+/**
+ * 🔴 A PATH THE REPOSITORY IGNORES IS NOT THE REPOSITORY'S TO RESOLVE, and
+ * both rules below went red on a CLEAN CHECKOUT without it. They passed on the
+ * machine they were written on for the worst possible reason: the gitignored
+ * artefacts happened to exist there.
+ *
+ *   `.ipynb_checkpoints/...` - jupyter-lab's snapshot of a file being edited.
+ *     docs/ARCHITECTURE.md NAMES two of them while explaining that they are
+ *     not source, and this file's own helper says the same rule out loud, so a
+ *     gate demanding they exist asserts the opposite of the repository's
+ *     position - and is satisfied only when the thing nobody wants is present.
+ *   `.jaxjs-tmp/...` - an opt-in download whose own tool header says
+ *     "(.jaxjs-tmp is gitignored)" and tells the reader the npm command that
+ *     creates it.
+ *
+ * A leading dot on a directory is the convention for tooling state in both
+ * cases, which makes one rule enough. Verified by cloning `main` fresh: two
+ * failures there, none here, and neither introduced by the branch that found
+ * them.
+ */
+const ignoredArtefact = (path) => /(^|[\\/])\.[^\\/]+[\\/]/.test(path);
+
 test("every relative import resolves to a file that exists", () => {
   const files = AREAS.flatMap((area) => sourceFiles(join(ROOT, area)));
   // 🔴 A RULE THAT STOPS MATCHING PASSES BY FINDING NOTHING.
@@ -70,6 +92,7 @@ test("every relative import resolves to a file that exists", () => {
         : spec.startsWith("/") ? join(ROOT, spec)
           : null;
       if (target === null) continue;
+      if (ignoredArtefact(target.slice(ROOT.length))) continue;
       checked += 1;
       if (!existsSync(target)) {
         broken.push(`${file.slice(ROOT.length + 1)} -> ${spec}`);
@@ -241,6 +264,9 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
     for (const match of text.matchAll(PATH)) {
       const named_path = match[1];
       if (FOREIGN.some((prefix) => named_path.startsWith(prefix))) continue;
+      // ...and a gitignored artefact, which a document may NAME while saying
+      // it is not source; see `ignoredArtefact`.
+      if (ignoredArtefact(named_path)) continue;
       if (HISTORY.has(relative) && former(named_path)) {
         formerUsed.add(former(named_path));
         continue;
@@ -253,6 +279,7 @@ test("every src/ path named in python, yaml, html or markdown exists", () => {
     for (const match of text.matchAll(DIRECTORY)) {
       const named_path = match[1];
       if (FOREIGN.some((prefix) => `${named_path}/`.startsWith(prefix))) continue;
+      if (ignoredArtefact(`${named_path}/`)) continue;
       if (HISTORY.has(relative) && former(named_path)) {
         formerUsed.add(former(named_path));
         continue;

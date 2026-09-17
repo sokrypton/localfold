@@ -224,6 +224,93 @@ describe("reading the open-source dialect", () => {
  * the failure mode this whole file exists to prevent, and the one the archive
  * hit twice this week from the writing side.
  */
+describe("a SMILES ligand survives the archive", () => {
+  /**
+   * 🔴 THE ARCHIVE RECORDED BENZENE AS CYCLOHEXANE, AND THAT IS WHY THIS
+   * EXISTS. `jobRequestJson`'s last branch was a catch-all `else` that turned
+   * every non-polymer row into `{ligand: {ligand: value.toUpperCase()}}`, so
+   * `c1ccccc1` was written `C1CCCCC1` - a different molecule - labelled as a
+   * dictionary code. A long SMILES then throws on read-back, which is
+   * survivable. A SHORT one does not: `C` is a valid SMILES for methane AND a
+   * valid CCD code for cytidine monophosphate, so that job round-tripped
+   * silently into a nucleotide.
+   *
+   * The archive is the file a reader hands back to reproduce a fold. This
+   * file's own header says a request that lists the parent sequence alone
+   * "describes a DIFFERENT job"; so does one that lists a different molecule.
+   */
+  const roundTrip = (entities) => {
+    const back = jobFromJson(jobRequestJson({ name: "t", seed: 7, entities }));
+    const shape = (list) => list
+      .map((entity) => `${entity.type}:${entity.value}x${entity.copies}`)
+      // 🔴 SORTED, BECAUSE THE READER GROUPS POLYMERS BEFORE LIGANDS. That is
+      // pre-existing and true of the server dialect too - verified by
+      // round-tripping a protein/ligand/DNA job through the untouched path -
+      // and it reorders rather than changes anything.
+      .sort();
+    return { before: shape(entities), after: shape(back.entities) };
+  };
+
+  it("keeps the string exactly, case and all", () => {
+    const { before, after } = roundTrip([
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 1, modifications: [] },
+      { type: "smiles", value: "c1ccccc1", copies: 1, modifications: [] },
+    ]);
+    expect(after).toEqual(before);
+  });
+
+  it("keeps a one-character SMILES that is also a CCD code", () => {
+    // The silent case: upper-casing does nothing to `C`, so nothing looked
+    // wrong, and it read back as cytidine monophosphate.
+    const { before, after } = roundTrip([
+      { type: "smiles", value: "C", copies: 1, modifications: [] },
+    ]);
+    expect(after).toEqual(before);
+  });
+
+  it("keeps a whole mixed job", () => {
+    const { before, after } = roundTrip([
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 2,
+        modifications: [{ code: "SEP", position: 4 }] },
+      { type: "smiles", value: "OC(=O)CCCC[C@@H]1SC[C@@H]2NC(=O)N[C@H]12",
+        copies: 1, modifications: [] },
+      { type: "ligand", value: "ATP", copies: 2, modifications: [] },
+      { type: "dna", value: "ACGT", copies: 1, modifications: [] },
+    ]);
+    expect(after).toEqual(before);
+  });
+
+  it("writes the open dialect only when it has to", () => {
+    // 🔴 THE SERVER DIALECT IS STILL WHAT AN ORDINARY JOB GETS. It is what the
+    // archive's justification rests on and what every fixture expects; the
+    // open one is used only because the server's ligand entry takes `ligand`,
+    // `ion` and `count` and has no field for a structure at all.
+    const plain = JSON.parse(jobRequestJson({ name: "t", seed: 1, entities: [
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 1, modifications: [] },
+      { type: "ligand", value: "ATP", copies: 1, modifications: [] }] }))[0];
+    expect(plain.dialect).toBe("alphafoldserver");
+    expect(typeof plain.modelSeeds[0]).toBe("string");
+
+    const structural = JSON.parse(jobRequestJson({ name: "t", seed: 1, entities: [
+      { type: "smiles", value: "CCO", copies: 1, modifications: [] }] }))[0];
+    expect(structural.dialect).toBe("alphafold3");
+    // ...and the seeds change type with the dialect, which is upstream's rule.
+    expect(typeof structural.modelSeeds[0]).toBe("number");
+    expect(structural.sequences[0].ligand.smiles).toBe("CCO");
+  });
+
+  it("makes copies unique chain ids, not a repeated one", () => {
+    // In the open dialect `id` IS the copy count, read as the list's length -
+    // so two entities sharing a label is a different complex.
+    const job = JSON.parse(jobRequestJson({ name: "t", seed: 1, entities: [
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 2, modifications: [] },
+      { type: "smiles", value: "CCO", copies: 3, modifications: [] }] }))[0];
+    const ids = job.sequences.flatMap((entry) => Object.values(entry)[0].id);
+    expect(ids.length).toBe(5);
+    expect(new Set(ids).size).toBe(5);
+  });
+});
+
 describe("what it refuses, and what it names", () => {
   const cases = [
     ["bondedAtomPairs",
@@ -231,7 +318,11 @@ describe("what it refuses, and what it names", () => {
             { bondedAtomPairs: [[["A", 1, "CA"], ["B", 1, "CA"]]] })],
     ["userCCD", server([{ proteinChain: { sequence: "ACDEFGHIK", count: 1 } }],
                        { userCCD: "data_LIG" })],
-    ["smiles", open([{ ligand: { id: "B", smiles: "CCO" } }])],
+    // 🔴 `smiles` IS ACCEPTED NOW AND THE REFUSAL MOVED TO THE AMBIGUOUS CASE.
+    // A ligand naming itself both ways cannot be resolved: see web/job-json.js.
+    ["names itself twice", open([{ ligand: { id: "B", smiles: "CCO",
+                                             ccdCodes: ["ATP"] } }])],
+    ["ring closure", open([{ ligand: { id: "B", smiles: "C1CC" } }])],
     ["ccdCodes", open([{ protein: { id: "A", sequence: "ACDEFGHIK" } },
                        { ligand: { id: "B", ccdCodes: ["ATP", "MG"] } }])],
     ["unpairedMsaPath", open([{ protein: { id: "A", sequence: "ACDEFGHIK",

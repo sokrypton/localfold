@@ -22,8 +22,23 @@
  *     LIST meaning copies, and it can carry the alignment and the template
  *     structure inline.
  *
- * Both are read. Only the server one is written, because that is the one the
- * archive's own justification rests on.
+ * Both are read. The server one is written, because that is the one the
+ * archive's own justification rests on - EXCEPT for a job carrying a SMILES
+ * ligand, which the server dialect cannot express at all: its ligand entry
+ * takes `ligand`, `ion` and `count` and there is no field for a structure.
+ * Such a job is written in the open dialect instead.
+ *
+ * 🔴 AND THE FIRST VERSION WROTE IT AS A CCD CODE, UPPER-CASED, WHICH IS A
+ * DIFFERENT MOLECULE. The writer's last branch was a catch-all `else` that
+ * turned every non-polymer row into `{ligand: {ligand: value.toUpperCase()}}`,
+ * so a benzene folded as `c1ccccc1` was recorded in the archive as
+ * `C1CCCCC1` - CYCLOHEXANE - labelled as a dictionary code. A long SMILES then
+ * throws on read-back, which is survivable; a SHORT one does not. `C` is a
+ * valid SMILES for methane and a valid CCD code for cytidine monophosphate, so
+ * a methane fold would have round-tripped silently into a nucleotide. The
+ * archive is the file a reader hands back to reproduce a fold, and this is
+ * exactly the failure its own comments describe twice over - a request that
+ * "describes a DIFFERENT job".
  *
  * 🔴 AND WHAT THIS PAGE CANNOT RUN IS REFUSED BY NAME, NEVER IGNORED. A JSON
  * carrying `bondedAtomPairs`, a SMILES ligand or a user CCD describes a fold
@@ -32,6 +47,7 @@
  * as a modified residue that reaches the model and not the request file. The
  * error names the field, because "unsupported job" sends the reader looking.
  */
+import { parseSmiles } from "../src/chem/smiles.js";
 import { NUCLEIC_TYPES, entitiesProblem } from "./entities.js";
 
 /**
@@ -43,6 +59,14 @@ import { NUCLEIC_TYPES, entitiesProblem } from "./entities.js";
  * would come back from the server as a different job than the one that ran.
  */
 export function jobRequestJson({ name, seed, entities }) {
+  // 🔴 THE DIALECT FOLLOWS THE JOB, BECAUSE ONE OF THEM CANNOT HOLD IT. The
+  // server dialect has no SMILES field, so a job with one is written open.
+  // Everything else still writes the server dialect, which is what the
+  // archive's justification rests on and what every existing fixture expects.
+  if ((entities ?? []).some((entity) => entity.type === "smiles"
+    && (entity.value ?? "").trim() !== "")) {
+    return openDialectJson({ name, seed, entities });
+  }
   const sequences = [];
   for (const entity of entities ?? []) {
     const value = (entity.value ?? "").trim();
@@ -69,6 +93,10 @@ export function jobRequestJson({ name, seed, entities }) {
         useStructureTemplate: (entity.template?.kind ?? "none") !== "none" } });
     } else if (entity.type === "dna" || entity.type === "rna") {
       sequences.push({ [`${entity.type}Sequence`]: { sequence: value, count } });
+    } else if (entity.type === "smiles") {
+      // Unreachable: the whole file went open above. Here so that adding a
+      // row type never falls into the catch-all again.
+      refuse("a SMILES ligand cannot be written in the server dialect");
     } else {
       sequences.push({ ligand: { ligand: value.toUpperCase(), count } });
     }
@@ -81,6 +109,71 @@ export function jobRequestJson({ name, seed, entities }) {
     sequences,
     dialect: "alphafoldserver",
     version: 3,
+  }], null, 2)}\n`;
+}
+
+/**
+ * The same job in the open-source dialect, for a fold the server's cannot hold.
+ *
+ * 🔴 COPIES ARE AN `id` LIST HERE, NOT A `count`, and the ids must be unique
+ * across the whole file - they are chain labels, and two entities sharing one
+ * is a different complex. `copiesOf` reads the list's LENGTH, so a wrong
+ * length folds a monomer where a dimer was asked for.
+ */
+function openDialectJson({ name, seed, entities }) {
+  let next = 0;
+  const idsFor = (count) => {
+    const ids = [];
+    for (let copy = 0; copy < count; copy += 1) {
+      // A, B, ... Z, AA, AB - the mmCIF convention, and enough for any page fold.
+      let label = "";
+      let at = next;
+      next += 1;
+      do { label = String.fromCharCode(65 + (at % 26)) + label; at = Math.floor(at / 26) - 1; }
+      while (at >= 0);
+      ids.push(label);
+    }
+    return ids;
+  };
+
+  const sequences = [];
+  for (const entity of entities ?? []) {
+    const value = (entity.value ?? "").trim();
+    if (value === "") continue;
+    const id = idsFor(Math.max(1, Number(entity.copies) || 1));
+    if (entity.type === "protein") {
+      const modifications = (entity.modifications ?? [])
+        .filter((modification) => (modification.code ?? "").trim() !== "")
+        .map((modification) => ({
+          ptmType: modification.code.trim().toUpperCase(),
+          ptmPosition: modification.position,
+        }));
+      sequences.push({ protein: { id, sequence: value,
+        ...(modifications.length === 0 ? {} : { modifications }) } });
+    } else if (entity.type === "dna" || entity.type === "rna") {
+      sequences.push({ [entity.type]: { id, sequence: value } });
+    } else if (entity.type === "smiles") {
+      // 🔴 NOT UPPER-CASED. Case is meaning in a SMILES and this is the whole
+      // reason this branch exists.
+      sequences.push({ ligand: { id, smiles: value } });
+    } else {
+      sequences.push({ ligand: { id, ccdCodes: [value.toUpperCase()] } });
+    }
+  }
+  return `${JSON.stringify([{
+    name,
+    // 🔴 INTEGERS HERE WHERE THE SERVER DIALECT WANTS STRINGS.
+    modelSeeds: [Number(seed ?? 0)],
+    sequences,
+    // 🔴 AND THE DIALECT IS NAMED EXPLICITLY, THOUGH THE HEADER ABOVE SAYS THE
+    // OPEN ONE HAS NO `dialect` KEY. Upstream's rule - which `checkVersion`
+    // implements - is that a job carries BOTH `dialect` and `version` or
+    // NEITHER, and neither means the SERVER dialect at its version 1. So a
+    // file with `version: 1` and no dialect is not an open-dialect file at
+    // all; it is a malformed server one, and the reader says so. Written
+    // without the key this round-tripped straight into a refusal.
+    dialect: "alphafold3",
+    version: 2,
   }], null, 2)}\n`;
 }
 
@@ -283,9 +376,28 @@ function readEntry(entry, index, state) {
   const copies = copiesOf(body, where);
 
   if (type === "ligand") {
+    // 🔴 A `smiles` LIGAND IS FOLDED NOW, WHERE THIS USED TO REFUSE IT. The
+    // refusal read "`smiles` names a ligand by structure, and this page folds
+    // ligands by CCD code", which was true: a ligand reached the featuriser as
+    // `parseCcdComponent`'s output and nothing else could produce one.
+    // `src/chem/` produces one. It is its own row type rather than a flag on
+    // this one, because a CCD code is upper-cased and upper-casing a SMILES
+    // changes the molecule - `c1ccccc1` is benzene, `C1CCCCC1` is cyclohexane.
     if (body.smiles !== undefined && body.smiles !== null) {
-      refuse(`${where}: \`smiles\` names a ligand by structure, and this page`
-        + " folds ligands by CCD code");
+      if (body.ccdCodes !== undefined && body.ccdCodes !== null) {
+        refuse(`${where}: a ligand with both \`smiles\` and \`ccdCodes\` names`
+          + " itself twice, and this page cannot tell which was meant");
+      }
+      const smiles = String(body.smiles).trim();
+      if (smiles === "") refuse(`${where}: an empty \`smiles\``);
+      // Parsed here so the message names the character it could not read,
+      // rather than arriving as a failed fold.
+      try {
+        parseSmiles(smiles);
+      } catch (error) {
+        refuse(`${where}: \`smiles\` ${error.message}`);
+      }
+      return { type: "smiles", value: smiles, copies, modifications: [] };
     }
     // 🔴 THE SERVER'S OWN SPELLING CARRIES A `CCD_` PREFIX, WHICH UPSTREAM
     // STRIPS. `Ligand.from_alphafoldserver_dict` does `removeprefix('CCD_')`,

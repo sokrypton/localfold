@@ -99,10 +99,17 @@ def header_line(path: Path) -> str | None:
         return _first(match.group(1)) if match else None
 
     # .js and .mjs: a leading /** */ block, else a run of leading // lines.
-    match = re.match(r"\s*/\*\*(.*?)\*/", text, re.S)
+    #
+    # 🔴 PAST A SHEBANG, WHICH THE PYTHON BRANCH ALREADY ALLOWS AND THIS ONE
+    # DID NOT. An executable `.mjs` starts `#!/usr/bin/env node`, and an
+    # anchored match for the comment block then finds nothing and reports the
+    # tool as having no header at all - which is not true, and the advice it
+    # prints ("add a /** */ block") is advice to add the block that is already
+    # there. Every `.mjs` gate in this directory is executable.
+    match = re.match(r"\s*(?:#![^\n]*\n)?\s*/\*\*(.*?)\*/", text, re.S)
     if match:
         return _first(match.group(1), strip="*")
-    match = re.match(r"((?:[ \t]*//[^\n]*\n)+)", text)
+    match = re.match(r"(?:#![^\n]*\n)?((?:[ \t]*//[^\n]*\n)+)", text)
     if match:
         return _first(match.group(1), strip="/")
     return None

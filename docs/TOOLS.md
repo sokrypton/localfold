@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-314 tools. `tools/fixtures/` is data and is not listed.
+323 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (184)
+## `tools/gpu/` - the WebGPU lane (186)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -42,6 +42,7 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-sampler-bonds.js`** - Which sampler setting keeps a structure's BONDS, on proteins with little or no alignment?
 - **`bench-sampler-geometry.js`** - Which sampler keeps a molecule's GEOMETRY - across ligands and nucleic acids, not just protein?
 - **`bench-single-project.js`** - The single track's q/k/v/gate projection, at several splits of its width.
+- **`bench-smiles-conformer.js`** - Where does refining a conformer on the device start paying? A batch, or never.
 - **`bench-transition.js`** - The pair transition alone, at several row tiles, interleaved in one process.
 - **`bench-triangle-project.js`** - The two triangle projection kernels alone, at several register blocks.
 - **`bench-triangle.js`** - Time triangle multiplication at the sizes AF3 actually has to run.
@@ -110,6 +111,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
+- **`check-smiles-conformer-gpu.js`** - Does the device's conformer refinement compute the host's? And is it faster?
 - **`check-staged-matrix.js`** - Does the staged matrix projection compute what createLinearShader computes, in every buffer precision, with and without the residual, on ragged shapes?
 - **`check-structure-core.js`** - The eight-iteration structure core: what it computes, and what it costs.
 - **`check-subgroup-matrix-shapes.js`** - Which subgroup matrix shapes does THIS device offer, and what do the type parameters mean at a shape where the two readings differ?
@@ -203,7 +205,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 
-## `tools/oracle/` - the reference side (41)
+## `tools/oracle/` - the reference side (42)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -239,6 +241,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_tx_supers.py`** - af3-any-model's token transformer at a TRUNCATED depth, for a bisect.
 - **`dump_monomer_template.py`** - Capture AF2-MONOMER's template embedder by running AF2's own module.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.
+- **`dump_rdkit_smiles.py`** - RDKit's own answer for a corpus of SMILES, as the reference this port is held to.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
 - **`dump_truncated.py`** - One evoformer block on each side, so a difference has one place to live.
@@ -274,7 +277,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (71)
+## `tools/` - everything else (77)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -306,6 +309,12 @@ go through CDP, and the deploy.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
 - **`check-oracle-bonds.js`** - Does the REFERENCE put side chains where we do? AlphaFold 3's own output, scored by the same function.
 - **`check-portable-limits.mjs`** - Does every model fold on a device at the PORTABLE limit ceiling?
+- **`check-smiles-batch.mjs`** - A SMILES ligand featurises to the SAME BATCH its CCD code does, field by field.
+- **`check-smiles-conformer.mjs`** - Is the conformer this port builds a real molecule? Bonds, angles, rings, hands.
+- **`check-smiles-path.mjs`** - The same ligand from a CCD code and from a SMILES string folds the same way.
+- **`check-smiles-rewrites.mjs`** - The same molecule written a thousand different ways is still that molecule.
+- **`check-smiles-vs-rdkit.mjs`** - Does this port read a SMILES the way RDKit does? Formula, atoms, bonds, rings.
+- **`check-stereo-vs-rdkit.mjs`** - Does a `@` in a SMILES mean the same hand here as it does to RDKit?
 - **`check-stock-flags.mjs`** - Does every model fold on the browser a VISITOR has?
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?

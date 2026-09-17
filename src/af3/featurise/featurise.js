@@ -566,7 +566,8 @@ export function featuriseProtein(sequence, options = {}) {
   // independent ones, and giving each its own uid tells the atom encoder they
   // may not be compared, which is the opposite of true.
   let asym = chainLengths.length;
-  const entityOfCode = new Map();
+  // Keyed on what the ligand IS, not on what it is called; see below.
+  const entityOfLigand = new Map();
   const copiesOfEntity = new Map();
   let ligandToken = polymerTokens;
   // Where each ligand's tokens sit, so a writer can name them: the batch's
@@ -584,8 +585,21 @@ export function featuriseProtein(sequence, options = {}) {
                        bonds: ligand.bonds });
     // Identical codes are one entity, and each occurrence is a copy of it -
     // the same rule chainIdentity applies to repeated sequences.
-    if (!entityOfCode.has(ligand.code)) entityOfCode.set(ligand.code, entityOfCode.size);
-    const entity = entityOfCode.get(ligand.code);
+    //
+    // 🔴 AND "IDENTICAL" IS THE MOLECULE, NOT THE CODE, WHICH ONLY MATTERS
+    // SINCE A LIGAND CAN ARRIVE AS A STRUCTURE. A CCD code identifies its
+    // contents - two ATPs really are one entity - so for every fold this port
+    // has ever done the two keys agree. A SMILES ligand has no code at all and
+    // is given one, and two DIFFERENT structures in one job both arrived as
+    // `LIG`: benzene and glycerol came out sharing an entity_id, with the
+    // model told that six carbons and a glycerol are two copies of one thing.
+    // Keying on what the component IS rather than on what it is called fixes
+    // that and cannot change a dictionary fold, where the two are equivalent.
+    const identity = `${ligand.code}|${ligand.atoms.length}|`
+      + `${ligand.atoms.map((atom) => `${atom.element}:${atom.charge}`).join(",")}|`
+      + `${ligand.bonds.map((bond) => `${bond.from}-${bond.to}:${bond.order}`).join(",")}`;
+    if (!entityOfLigand.has(identity)) entityOfLigand.set(identity, entityOfLigand.size);
+    const entity = entityOfLigand.get(identity);
     const copy = (copiesOfEntity.get(entity) ?? 0) + 1;
     copiesOfEntity.set(entity, copy);
     // ...and its space continues the residues' count, not the token index. The

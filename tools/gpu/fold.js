@@ -15,6 +15,7 @@
  */
 import { memorySnapshot, setMemoryBudget } from "../../src/runtime/device-memory.js";
 import { ccdUrl, parseCcdComponent } from "../../src/af3/featurise/ccd-component.js";
+import { nameSmilesLigands, smilesComponent } from "../../src/chem/component.js";
 import { af3ContactClasses } from "../../src/af3/featurise/contact-classes.js";
 import { CLASS_LIGAND, CLASS_NUCLEIC } from "../../src/heads/contact-threshold.js";
 import { af3BatchFromA3m } from "../../src/af3/featurise/batch.js";
@@ -237,6 +238,23 @@ export async function main(device, args) {
   const ligands = [];
   for (const code of ligandCodes) {
     ligands.push(parseCcdComponent(await (await fetch(ccdUrl(code))).text()));
+  }
+  // 🔴 `--smiles=` IS THE SAME LIGAND BY THE OTHER ROUTE, AND THAT IS WHAT
+  // MAKES IT A GATE. `smilesComponent` returns what `parseCcdComponent`
+  // returns, so folding `--ligands=GOL` against `--smiles=OCC(O)CO` runs the
+  // identical model over the identical molecule described two different ways -
+  // and `tools/check-smiles-path.mjs` scores both with `bond-geometry.js`.
+  // A conformer builder that is subtly wrong shows up there as a ligand whose
+  // bonds are fine from the dictionary and torn from the string.
+  // 🔴 EACH DISTINCT STRUCTURE GETS ITS OWN NAME, and `--smiles-code` renames
+  // only the first. With one code for all of them a fold of `c1ccccc1|OCCO`
+  // wrote ten atoms into ONE residue with `C1` and `C2` appearing twice.
+  const smilesList = option(args, "smiles", "").split("|").filter((s) => s !== "");
+  const smilesNames = nameSmilesLigands(smilesList);
+  const firstName = option(args, "smiles-code", "");
+  for (let index = 0; index < smilesList.length; index += 1) {
+    const code = index === 0 && firstName !== "" ? firstName : smilesNames[index];
+    ligands.push(await smilesComponent(smilesList[index], { code }));
   }
   const trunkOracle = trunkOraclePath === "" ? null
     : await (async () => {

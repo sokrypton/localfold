@@ -22,15 +22,36 @@
  * numbers asym_id straight on from the last chain; a ligand entered first would
  * otherwise claim a chain index that the polymers still use.
  */
+import { parseSmiles } from "../src/chem/smiles.js";
+import { ligandName } from "../src/chem/component.js";
 import { cleanSequence, nucleicProblem, sequenceProblem } from "./sequence.js";
 
 /** The entity types this page can actually fold. */
-export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand"];
+/**
+ * 🔴 AND "smiles" IS A TYPE RATHER THAN A FLAG ON "ligand", BECAUSE THE VALUE
+ * IS TREATED DIFFERENTLY THE MOMENT IT IS READ. A CCD code is upper-cased -
+ * `hem` and `HEM` are the same component - and upper-casing a SMILES changes
+ * the molecule: `c1ccccc1` is benzene and `C1CCCCC1` is cyclohexane. There is
+ * no way to sniff which a row holds, since `C` is a valid SMILES and `CCO`
+ * looks like a three-letter code, so the row says.
+ */
+export const ENTITY_TYPES = ["protein", "dna", "rna", "ligand", "smiles"];
 
 /** How they are labelled, in the order the menu offers them. */
 export const ENTITY_LABELS = {
   protein: "Protein", dna: "DNA", rna: "RNA", ligand: "Ligand (CCD)",
+  smiles: "Ligand (SMILES)",
 };
+
+/**
+ * The largest SMILES ligand this page will build a conformer for.
+ *
+ * 🔴 A CAP, BECAUSE THE EMBEDDING IS O(N^3) AND THE PAGE IS SINGLE-THREADED.
+ * Triangle smoothing is the cost and it is cubic in the atom count: 60 atoms
+ * is 216,000 relaxations and a few milliseconds, 500 would be 125 million and
+ * would lock the tab. A ligand that large is not a ligand.
+ */
+export const MAX_SMILES_ATOMS = 150;
 
 /** The polymer types, which are the ones with a residue sequence. */
 export const POLYMER_TYPES = ["protein", "dna", "rna"];
@@ -268,6 +289,7 @@ export function entityProblem(entity) {
   const value = entity.value.trim();
   if (value === "") {
     if (entity.type === "ligand") return "Enter a CCD code";
+    if (entity.type === "smiles") return "Enter a SMILES string";
     return entity.type === "protein"
       ? "Enter a protein sequence" : `Enter a ${entity.type.toUpperCase()} sequence`;
   }
@@ -276,6 +298,24 @@ export function entityProblem(entity) {
     // the field is in front of the user rather than as a failed fetch later.
     if (!/^[A-Za-z0-9]{1,5}$/.test(value)) {
       return "A CCD code is 1-5 letters or digits, like HEM or ATP";
+    }
+    return null;
+  }
+  if (entity.type === "smiles") {
+    // 🔴 PARSED HERE, WITH THE PARSER'S OWN MESSAGE. Every refusal in
+    // src/chem/smiles.js names what it could not read and where - "ring
+    // closure 1 never closed", "`*` (any atom) has no element" - and those
+    // arrive while the field is in front of the reader rather than as a fold
+    // that dies two minutes in. It also means there is exactly one definition
+    // of what this page accepts, which is whatever it can actually fold.
+    try {
+      const graph = parseSmiles(value);
+      if (graph.atoms.length > MAX_SMILES_ATOMS) {
+        return `That is ${graph.atoms.length} heavy atoms; at most`
+          + ` ${MAX_SMILES_ATOMS} here`;
+      }
+    } catch (error) {
+      return error.message;
     }
     return null;
   }
@@ -346,7 +386,9 @@ export function entitiesProblem(entities) {
  * @returns {{chains: string[], ligandCodes: string[], templates: object[],
  *            sequence: string}}
  *   `sequence` is the colon-joined chains, which is what every layer below
- *   already reads; `ligandCodes` are upper-cased, in order, one per instance.
+ *   already reads; `ligandCodes` are upper-cased CCD codes, in order, one per
+ *   instance - or, for a `smiles` row, `{smiles, code}` objects, which are NOT
+ *   upper-cased because case is meaning in a SMILES.
  */
 export function expandEntities(entities) {
   const problem = entitiesProblem(entities);
@@ -364,6 +406,8 @@ export function expandEntities(entities) {
   // builds them and can never drift from it.
   const chainKinds = [];
   const templates = [];
+  /** Which name each distinct SMILES was given; see `ligandName`. */
+  const smilesCodes = new Map();
   for (const entity of entities) {
     for (let copy = 0; copy < entity.copies; copy += 1) {
       if (POLYMER_TYPES.includes(entity.type)) {
@@ -391,6 +435,20 @@ export function expandEntities(entities) {
                            origin: entity.template });
         }
         chains.push(cleanSequence(entity.value));
+      } else if (entity.type === "smiles") {
+        // 🔴 NOT UPPER-CASED, AND CARRIED AS AN OBJECT SO THE LAYER BELOW
+        // CANNOT MISTAKE IT FOR A CODE. Case is meaning in a SMILES: the
+        // lower-case letters are the aromatic atoms.
+        //
+        // 🔴 AND EACH DISTINCT STRUCTURE GETS A DISTINCT NAME. Every SMILES
+        // ligand used to be called `LIG`, so a job with a benzene and a
+        // glycerol wrote two different molecules under one residue name - a
+        // PDB a reader cannot tell apart, and tooling that filters by name
+        // silently mixing them. Identical strings still share a name, because
+        // they are the same molecule and genuinely one entity.
+        const text = entity.value.trim();
+        if (!smilesCodes.has(text)) smilesCodes.set(text, ligandName(smilesCodes.size));
+        ligandCodes.push({ smiles: text, code: smilesCodes.get(text) });
       } else ligandCodes.push(entity.value.trim().toUpperCase());
     }
   }

@@ -266,4 +266,59 @@ describe("entity templates", () => {
     expect(expanded.templates.map((template) => template.kind))
       .toEqual(["upload", "search"]);
   });
+})
+
+describe("mixed ligands in one job", () => {
+  /**
+   * 🔴 TWO DIFFERENT SMILES WERE BOTH CALLED `LIG`, AND THAT WAS TWO BUGS AT
+   * ONCE. The output PDB wrote a benzene and a glycerol under one residue
+   * name, which a reader cannot tell apart and which tooling that filters by
+   * name silently mixes - and, worse, `featuriseProtein` keys a ligand's
+   * ENTITY on its code, so the two came out sharing an `entity_id` with the
+   * model told that six carbons and a glycerol are two copies of one thing.
+   *
+   * The names are distinct now and the featuriser keys on the molecule rather
+   * than the name, which is belt and braces on purpose: either fix alone
+   * leaves the other failure reachable from a different caller.
+   */
+  it("gives each distinct structure its own residue name", () => {
+    const { ligandCodes } = expandEntities([
+      { type: "smiles", value: "c1ccccc1", copies: 1, modifications: [] },
+      { type: "smiles", value: "OCC(O)CO", copies: 1, modifications: [] },
+    ]);
+    expect(ligandCodes.map((entry) => entry.code)).toEqual(["LIG", "LG2"]);
+  });
+
+  it("gives identical structures the SAME name, because they are one entity", () => {
+    const { ligandCodes } = expandEntities([
+      { type: "smiles", value: "c1ccccc1", copies: 2, modifications: [] },
+      { type: "smiles", value: "OCC(O)CO", copies: 1, modifications: [] },
+      { type: "smiles", value: "c1ccccc1", copies: 1, modifications: [] },
+    ]);
+    expect(ligandCodes.map((entry) => entry.code)).toEqual(["LIG", "LIG", "LG2", "LIG"]);
+  });
+
+  it("keeps every name inside the PDB's three characters", () => {
+    // 🔴 `src/af3/fold.js` writes the residue name with `.padEnd(3)` into a
+    // fixed-width field, so a four-character name runs into the chain id - and
+    // `LIG2` truncated back to `LIG` would put the collision straight back.
+    const rows = [];
+    for (let index = 0; index < 40; index += 1) {
+      rows.push({ type: "smiles", value: `${"C".repeat(index + 1)}O`,
+                  copies: 1, modifications: [] });
+    }
+    const codes = expandEntities(rows).ligandCodes.map((entry) => entry.code);
+    expect(codes.every((code) => code.length === 3)).toBe(true);
+    expect(new Set(codes).size).toBe(40);
+  });
+
+  it("mixes a SMILES with a CCD code without confusing them", () => {
+    const { ligandCodes } = expandEntities([
+      { type: "protein", value: "MKTSYIAKQRQ", copies: 1, modifications: [] },
+      { type: "smiles", value: "c1ccccc1", copies: 1, modifications: [] },
+      { type: "ligand", value: "atp", copies: 1, modifications: [] },
+    ]);
+    // The CCD code is upper-cased and stays a string; the SMILES is neither.
+    expect(ligandCodes).toEqual([{ smiles: "c1ccccc1", code: "LIG" }, "ATP"]);
+  });
 });

@@ -15,6 +15,7 @@
  * for a single-sequence input rather than a stub.
  */
 import { ccdUrl, parseCcdComponent } from "../src/af3/featurise/ccd-component.js";
+import { smilesComponent } from "../src/chem/component.js";
 import { af3BatchFromA3m } from "../src/af3/featurise/batch.js";
 import { featuriserDialect } from "../src/af3/dialect.js";
 import { foldBatch, toPdb, atomName, warmTrunkPipelines }
@@ -469,7 +470,8 @@ const TRUNK_SPANS = af3TrunkStageSpans();
  * @param {{sequence: string, mode: "flow"|"diffusion", calls: number, seed: number,
  *          signal: AbortSignal, device: GPUDevice,
  *          alignment?: string|{paired?: string|null, unpaired?: string|null}|null,
- *          maxMsaSequences?: number, ligandCodes?: string[],
+ *          maxMsaSequences?: number,
+ *          ligandCodes?: (string | {smiles: string, code?: string})[],
  *          chainKinds?: ("protein"|"dna"|"rna")[],
  *          reuse?: {trunk: object, targetFeat: Float32Array},
  *          onTrunk?: (reusable: object) => void,
@@ -530,12 +532,28 @@ export async function foldAf3(options) {
     });
   }
   const ligands = [];
-  for (const code of options.ligandCodes ?? []) {
-    await component(code, "ligand");
+  for (const entry of options.ligandCodes ?? []) {
+    // 🔴 A LIGAND IS EITHER A CODE OR A STRUCTURE, AND IT SAYS WHICH RATHER
+    // THAN BEING SNIFFED. A plain string is a CCD code, as it always was; an
+    // object carrying `smiles` is a molecule drawn out. Guessing between them
+    // is not possible even in principle - `C` is a valid SMILES for methane
+    // and `CCO` looks like a three-letter code - and this page already
+    // learned that lesson with the template database menu, which stopped
+    // guessing for the same reason.
+    if (typeof entry !== "string") {
+      onStatus(`Building ${entry.code ?? "ligand"} from its structure`);
+      // 🔴 AND IT IS BUILT, NOT FETCHED, WHICH IS THE WHOLE POINT. There is no
+      // dictionary entry to look up: `smilesComponent` returns exactly what
+      // `parseCcdComponent` returns, so nothing downstream can tell which
+      // producer made it. See src/chem/component.js.
+      ligands.push(await smilesComponent(entry.smiles, { code: entry.code ?? "LIG" }));
+      continue;
+    }
+    await component(entry, "ligand");
     // Each instance is its own chain, so repeated codes are repeated entries -
     // featuriseProtein gives them one entity_id and successive sym_ids, which
     // is the same rule it applies to repeated sequences.
-    ligands.push(componentCache.get(code));
+    ligands.push(componentCache.get(entry));
   }
 
   const { batch, rows } = af3BatchFromA3m(sequence, alignment, {
