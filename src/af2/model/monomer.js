@@ -174,8 +174,16 @@ export class AlphaFoldMonomerGpu {
       // `L^2 * 128` floats, **348 MB at 825 residues** - and go up again on the
       // next line. The GPU work in the whole template embedder is 130 ms at
       // that size; the call took 1040.
-      const templateUpdate = execution.allocate(
-        "monomer.template-update", length * length * 128);
+      // 🔴 AND IT IS SKIPPED ENTIRELY BY A CHECKPOINT THAT HAS NO EMBEDDER.
+      // model_3, model_4 and model_5 are AlphaFold 2's template-FREE models:
+      // the tensors are absent from the checkpoint, so `templateWeights`
+      // returns null and there is no term to add. Skipping is not the same as
+      // passing a masked template - that leaves the embedder's own biases and
+      // layer norms in the pair, which is a term this graph must not have when
+      // the reference never built the module.
+      const templateUpdate = weights.template === null ? null
+        : execution.allocate("monomer.template-update", length * length * 128);
+      if (weights.template !== null) {
       await withAbort(new QueryOnlyTemplateGpu(this.device).run({
         length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
         outputTensor: templateUpdate,
@@ -193,6 +201,7 @@ export class AlphaFoldMonomerGpu {
         // a checkpoint that sets it true is not silently mis-embedded.
         useTemplateUnitVector: recycleOptions.useTemplateUnitVector,
       }), signal);
+      }
       stageMilliseconds.template = performance.now() - phaseStart;
       phaseStart = performance.now();
       throwIfAborted(signal);
@@ -241,9 +250,11 @@ export class AlphaFoldMonomerGpu {
           previousPositions: new Float32Array(0), length,
           msaChannels: 256, pairChannels: 128, extraMsaChannels: 64, weights: weights.embedding,
         }, previousMsa, previousPair, previousPositions);
-        await execution.addInPlace(
-          embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
-        );
+        if (templateUpdate !== null) {
+          await execution.addInPlace(
+            embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
+          );
+        }
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
         throwIfAborted(signal);
         for (const temporary of embedding.temporaries) releaseTensor(temporary);

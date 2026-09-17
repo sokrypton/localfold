@@ -413,6 +413,18 @@ export class AlphaFoldFixture {
   }
 
   async templateWeights() {
+    // 🔴 THREE OF ALPHAFOLD 2'S FIVE MODELS HAVE NO TEMPLATE EMBEDDER AT ALL.
+    // model_1_ptm and model_2_ptm carry its 67 tensors; model_3, model_4 and
+    // model_5 are the template-FREE models and their checkpoints simply do not
+    // contain them (`template.enabled` is false in their config, so the graph
+    // is never built). Demanding them here is what stopped this repository
+    // shipping more than one monomer: the fold died in a gather with
+    // "missing single_template_embedding/.../query_norm/scale", which names a
+    // tensor rather than the fact. Null says the checkpoint has no such stage;
+    // src/af2/model/monomer.js and query-only.js skip it, and the page refuses
+    // to offer a template rather than ignoring one it was given.
+    const declared = this.manifest.templateEmbedding?.parameters;
+    if (declared === undefined || Object.keys(declared).length === 0) return null;
     const p = this.manifest.templateEmbedding.parameters;
     const blocks = 2;
     const root = "single_template_embedding/template_pair_stack/__layer_stack_no_state";

@@ -201,8 +201,17 @@ export async function main(device, args) {
   // loadModel: that resolves the monomer family to its remote base, and this
   // machine should not pull 227 MB to run a regression.
   const { MODEL_BUNDLES, loadManifest } = await import("../../src/bundles/manifests/index.js");
-  const store = await HttpTensorStore.fromManifest(
-    MODEL_BUNDLES[family].directory, await loadManifest(family));
+  // 🔴 `--bundle=<directory>` READS THE manifest.json BESIDE THE SHARDS, which
+  // is the ONLY way to fold a bundle the registry does not name - and AlphaFold
+  // 2 ships five models where this repository has published one. It is the
+  // arm, not the shipping path: the page reads the manifest MODULE, so a
+  // bundle this flag likes can still be one the page cannot load (CLAUDE.md
+  // has that trap, and it cost 122 MiB of download before a fold).
+  const bundleDirectory = option(args, "bundle", "").replace(/\/$/, "");
+  const store = bundleDirectory === ""
+    ? await HttpTensorStore.fromManifest(
+      MODEL_BUNDLES[family].directory, await loadManifest(family))
+    : await HttpTensorStore.open(`${bundleDirectory}/manifest.json`);
   // 🔴 EVERY SHARD AT ONCE, WHICH IS WHAT THE PAGE DOES. `prefetch` is opt-in
   // because a bench that reads four blocks should not pull the whole manifest -
   // but this tool loads a whole model, so a run without it measures a download

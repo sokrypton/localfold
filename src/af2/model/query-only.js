@@ -99,7 +99,11 @@ export class AlphaFoldQueryOnlyGpu {
     for (let i = 0; i < length; i += 1) for (let j = 0; j < length; j += 1) {
       pairMask[i * length + j] = recycleFeatures[0] .seqMask[i] * recycleFeatures[0] .seqMask[j];
     }
-    const template = await withAbort(new QueryOnlyTemplateGpu(this.device).run({
+    // 🔴 NULL WHERE THE CHECKPOINT HAS NO EMBEDDER - model_3, model_4 and
+    // model_5 are AlphaFold 2's template-free models. See the note in
+    // src/bundles/alphafold-fixture.js; the residual below is skipped with it.
+    const template = weights.template === null ? null
+      : await withAbort(new QueryOnlyTemplateGpu(this.device).run({
       length, templateChannels: 64, pairChannels: 128, pairMask, weights: weights.template,
       // The same two fields monomer.js forwards; see the note there.
       template: recycleOptions.template,
@@ -130,7 +134,8 @@ export class AlphaFoldQueryOnlyGpu {
       // ...THE TEMPLATE UPDATE DOES NOT CHANGE BETWEEN RECYCLES. It is computed
       // once above from the sequence alone, so it is uploaded once here rather
       // than pushed up again with every pass.
-      const templateTensor = execution.upload("trunk.template-update", template.pairUpdate);
+      const templateTensor = template === null ? null
+        : execution.upload("trunk.template-update", template.pairUpdate);
       let previousMsa = new Float32Array(length * 256);
       let previousPair = new Float32Array(length * length * 128);
       let previousPositions = new Float32Array(length * 37 * 3);
@@ -208,14 +213,16 @@ export class AlphaFoldQueryOnlyGpu {
         }), signal);
         throwIfAborted(signal);
         // The template contribution, added where the pair already is.
-        const residualEncoder = this.device.createCommandEncoder({ label: "trunk.template-residual" });
-        this.device.pushErrorScope("validation");
-        await execution.addInPlace(residualEncoder, pairTensor, templateTensor, "trunk.template-residual");
-        execution.endComputePass(residualEncoder);
-        this.device.queue.submit([residualEncoder.finish()]);
-        const residualError = await this.device.popErrorScope();
-        if (residualError !== null) {
-          throw new Error(`WebGPU template residual failed: ${residualError.message}`);
+        if (templateTensor !== null) {
+          const residualEncoder = this.device.createCommandEncoder({ label: "trunk.template-residual" });
+          this.device.pushErrorScope("validation");
+          await execution.addInPlace(residualEncoder, pairTensor, templateTensor, "trunk.template-residual");
+          execution.endComputePass(residualEncoder);
+          this.device.queue.submit([residualEncoder.finish()]);
+          const residualError = await this.device.popErrorScope();
+          if (residualError !== null) {
+            throw new Error(`WebGPU template residual failed: ${residualError.message}`);
+          }
         }
         throwIfAborted(signal);
         const extra = await withAbort(new ExtraMsaPairStackGpu(this.device).run({
