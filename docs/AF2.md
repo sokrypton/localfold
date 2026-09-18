@@ -2690,7 +2690,7 @@ than dropping it, and `build_site.py` removes a number whose bundle has no
 `remote` - the same rule it already applies to a model `<option>`, one control
 further in.
 
-### How much smaller can a delta get? 43 MiB is free, and 24 is what ships
+### How much smaller can a delta get? 43 MiB, and 24 was tried and refused
 
 Asked directly - "can we compress more, could model_3 be a combination of 1 and
 2?" - and swept. Every arm folded 5CAJ chain A with a 7907-row alignment and
@@ -2775,12 +2775,29 @@ So, per model:
 
 Four models are 172 MiB at the free setting against 388 as whole bundles.
 
-🔴 **AND WHAT SHIPS IS THE 24 MiB ONE, WHICH IS A DECISION AND NOT A
-MEASUREMENT.** The download is what decides whether a page can offer five models
-at all - 96 MiB for the four against 172 - and that was judged worth the cost
-above. The cost is written down rather than rounded off: a tenth of an angstrom
-on the worst of the four, and a **reported pLDDT that reads low by a different
-amount per model** (-0.22, -0.47, -0.13, -1.61), which is enough to reorder
-them. Anyone comparing the five should read the number knowing that, and
-`--bits 3` rebuilds any bundle at the setting where every bias is inside the
-seed band. The packer's own header carries the table.
+🔴 **TWO BITS WAS CHOSEN, SHIPPED, AND TAKEN BACK WITHIN THE HOUR - BY A
+SINGLE-SEQUENCE FOLD.** Everything above is 5CAJ with a 7907-row alignment,
+where two bits costs a tenth of an angstrom and looked like a fair trade for 96
+MiB against 172. The same four bundles folding the 59-residue gate sequence with
+NO alignment:
+
+| model | its own bundle | 3-bit delta | 2-bit delta |
+|---|---:|---:|---:|
+| model_2 | 62.435 | 63.549 | 61.959 |
+| model_3 | 58.468 | 58.539 | 51.248 |
+| **model_4** | **61.866** | 58.818 | **37.923** |
+| model_5 | 63.941 | 64.705 | 57.630 |
+
+model_4 loses **twenty-four points of pLDDT**. The fold is still a chain - the
+geometry gate passes - it is simply no longer worth looking at, and nothing
+about the well-determined measurement predicted it.
+
+🔴 **AND THE REASON IS THE ONE THIS REPOSITORY KEEPS MEETING**: an alignment
+PINS the answer, so a coarser delta hardly moves it, and without one the weights
+are all there is. It is the same shape as the clash work - error surfaces where
+the fold is under-determined - and it means a compression measured only on
+deep-MSA targets is measured on the easy half of what the page does.
+
+So three bits ships, at 43 MiB, and `--bits 2` stays for anyone who folds with
+an alignment every time and wants the 24. The four are 172 MiB against 388 as
+whole bundles.

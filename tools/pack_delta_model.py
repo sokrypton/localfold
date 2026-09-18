@@ -10,9 +10,21 @@ run continued five ways, and the difference between two of them stores far
 smaller than a model does: **39 MiB at three bits**, against 97 for the whole
 thing.
 
-🔴 WHAT IT COSTS IS MEASURED ON FOLDS AND IT IS NOT FREE AT TWO BITS, WHICH WAS
-CHOSEN KNOWINGLY. 5CAJ chain A, a 7907-row alignment, three recycles, each model
-against its OWN bundle (RMSD / pLDDT):
+🔴 THREE BITS, AND TWO IS NOT ENOUGH - WHICH A WELL-DETERMINED FOLD SAYS IS FINE
+AND A SINGLE-SEQUENCE ONE REFUSES. Two bits was measured, chosen, shipped and
+taken back inside an hour, and the reason is the one this repository keeps
+meeting: an alignment PINS the answer, so a coarser delta hardly moves it, and
+without one the weights are all there is. The 59-residue gate sequence, no
+alignment, pLDDT against each model's own bundle:
+
+    model    its own bundle    3-bit delta    2-bit delta
+    model_2      62.435          63.549         61.959
+    model_3      58.468          58.539         51.248
+    model_4      61.866          58.818         37.923   <- twenty-four points
+    model_5      63.941          64.705         57.630
+
+On 5CAJ chain A with a 7907-row alignment the SAME two-bit bundles are within a
+tenth of an angstrom (RMSD / pLDDT):
 
     model    its own bundle    via a 2-bit delta    via a 3-bit delta
     model_2  1.891 / 96.182    1.895 / 95.964       1.897 / 96.133
@@ -20,10 +32,12 @@ against its OWN bundle (RMSD / pLDDT):
     model_4  1.983 / 96.418    2.049 / 96.287       1.981 / 96.437
     model_5  1.831 / 96.485    1.944 / 94.880       1.825 / 96.327
 
-Two bits is 24 MiB and three is 43, and the difference between them is a
-systematic shift rather than scatter: four seeds through both arms give
+Two bits is 24 MiB and three is 43. Even on the determined fold the difference
+is a systematic shift rather than scatter - four seeds through both arms give
 **+0.094 +/- 0.020 A with 4 of 4 moving the same way** against a seed band of
-0.163, and the confidence number moves **15x its own noise**.
+0.163 - and the single-sequence table above is what makes it a refusal rather
+than a trade. `--bits 2` is still there for anyone who wants the bytes and folds
+with an alignment every time.
 
 🔴 SO THE REPORTED pLDDT READS LOW BY A DIFFERENT AMOUNT PER MODEL, AND THAT IS
 THE THING TO KNOW WHEN RANKING THE FIVE: model_2 -0.22, model_3 -0.47, model_4
@@ -121,14 +135,14 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-family", default="monomer",
                         help="the registry family the base bundle belongs to")
-    # 🔴 TWO BITS, WHICH IS 24 MiB A MODEL AND IS NOT FREE - THE HEADER HAS THE
-    # TABLE. The download is what decides whether a page can offer five models
-    # at all, so it was taken deliberately: what it costs is a tenth of an
-    # angstrom on the worst of the four and a pLDDT that reads low by up to 1.6,
-    # unevenly across the models. `--bits 3` is 43 MiB with every bias inside
-    # the seed band.
-    parser.add_argument("--bits", type=int, default=2)
-    parser.add_argument("--group", type=int, default=256)
+    # 🔴 THREE BITS. TWO WAS TRIED, MEASURED ON A WELL-DETERMINED FOLD, SHIPPED,
+    # AND TAKEN BACK - see the header. On 5CAJ with a 7907-row alignment two
+    # bits costs a tenth of an angstrom; on the SAME models folding a 59-residue
+    # sequence with NO alignment it costs model_4 twenty-four points of pLDDT.
+    # An alignment pins the answer and the weights are all there is without one,
+    # which is where a coarser delta lands.
+    parser.add_argument("--bits", type=int, default=3)
+    parser.add_argument("--group", type=int, default=128)
     # 🔴 AND THERE IS ONE CODEC IN A BUNDLE, SO THIS IS A YES OR NO RATHER THAN
     # A SECOND BIT WIDTH. `planBlockUpload` refuses a plan whose records
     # disagree about bits or group - one plan is one shader - so the structure
@@ -141,9 +155,17 @@ def main() -> int:
     # activations, so perturbing it moves the number the page shows without
     # moving the structure it describes, which is the worst shape a saving can
     # have. `--delta-structure` is the arm; it is 35 MiB rather than 43.
-    parser.add_argument("--whole-structure", action="store_true",
-                        help="carry the structure module whole: 7 MiB more,"
-                             " and about half the pLDDT bias")
+    # 🔴 TWO SHARDS, NOT THE BASE'S EIGHT, AND THE TRADE IS TINY EITHER WAY.
+    # docs/HOSTING.md measures Hugging Face over HTTP/2 at 56 MB/s on one shard
+    # and 78 aggregate on twelve in parallel, so fewer shards is slower - by
+    # 0.43 s against 0.31 s on a 24 MiB delta. A tenth of a second buys eight
+    # files in the repository per model instead of thirty-two, and a manifest
+    # that is easier to read. The base keeps its eight: it is four times the
+    # bytes and it is the download a first visit waits on.
+    parser.add_argument("--shards", type=int, default=2)
+    parser.add_argument("--delta-structure", action="store_true",
+                        help="store the structure module as a delta too: 8 MiB less,"
+                             " and about a point of reported pLDDT")
     args = parser.parse_args()
 
     reference = reference_manifest()
@@ -169,7 +191,7 @@ def main() -> int:
             continue
         values = np.asarray(source, dtype=np.float32)
         structural = key.startswith(KEEP_SCOPE)
-        if (structural and args.whole_structure) or values.ndim < 2 \
+        if (structural and not args.delta_structure) or values.ndim < 2 \
                 or name not in held or held[name].shape != values.shape:
             writer.add(name, values)
             kept.append(name)
@@ -222,7 +244,8 @@ def main() -> int:
 
     quantise = [sys.executable, str(Path(__file__).resolve().parent / "quantize_af3.py"),
                 "--source", str(staging), "--out", str(args.out),
-                "--bits", str(args.bits), "--group", str(args.group)]
+                "--bits", str(args.bits), "--group", str(args.group),
+                "--shards", str(args.shards)]
     if subprocess.run(quantise, check=False).returncode != 0:
         return 1
     # ...and the header the quantiser does not know about.
