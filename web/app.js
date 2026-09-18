@@ -388,7 +388,11 @@ const chosenFamily = () => {
   // what keeps the weight cache, the download stem and the labels all naming
   // the model that actually folded; models 2 to 5 are a 43 MiB delta on
   // model_1's 97 (see tools/pack_delta_model.py).
-  if (chosen === "monomer") {
+  // 🔴 BOTH AF2 FAMILIES, because the multimer is five models too - and its
+  // four deltas are 44 MiB against a bundle's 74. Neither family drops the
+  // control: what differs is that the monomer's 3, 4 and 5 have no template
+  // embedder and the multimer's five all do.
+  if (chosen === "monomer" || chosen === "multimer") {
     const number = document.getElementById("af2Model")?.value ?? "1";
     return number === "1" ? chosen : `${chosen}-${number}`;
   }
@@ -437,6 +441,10 @@ const MODEL_STEMS = {
   "monomer-4": "af2_model4",
   "monomer-5": "af2_model5",
   multimer: "af2_multimer",
+  "multimer-2": "af2_multimer_model2",
+  "multimer-3": "af2_multimer_model3",
+  "multimer-4": "af2_multimer_model4",
+  "multimer-5": "af2_multimer_model5",
   "ef2-fast-600m": "ef2_fast_600m",
   "ef2-fast-300m": "ef2_fast_300m",
 };
@@ -1697,7 +1705,8 @@ function syncModelControls() {
   // produced it is circular.
   const af2Node = document.getElementById("af2ModelGroup");
   if (af2Node !== null) {
-    af2Node.hidden = (document.getElementById("model-family")?.value ?? "") !== "monomer";
+    const row = document.getElementById("model-family")?.value ?? "";
+    af2Node.hidden = row !== "monomer" && row !== "multimer";
   }
   // 🔴 THE SAMPLER ROW IS SHARED, BECAUSE IT IS THE SAME QUESTION. ESMFold2's
   // structure head is an EDM sampler with a churn factor, exactly as AF3's is,

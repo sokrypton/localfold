@@ -148,11 +148,63 @@ def npz_name_of(reference: dict) -> dict[str, str]:
     return where
 
 
+def tensors_from_export(export: Path, base_manifest: dict) -> dict[str, tuple]:
+    """Every tensor of a float32 export, as (values, is-structural) by NAME.
+
+    🔴 THE MULTIMER CANNOT BE PACKED FROM AN npz AND THIS IS WHY. A monomer
+    bundle's tensors map one-to-one onto haiku parameter paths, so the packer
+    can read `params_model_N_ptm.npz` and look each one up. The multimer's do
+    not: `convert_multimer_params.py` FUSES and SPLITS on the way in - the
+    scalar parts of an attention become one tensor, the triangle
+    multiplication's projection and gate become two - so a name in the bundle
+    may have no single array behind it. Exporting the target the same way the
+    base was exported produces the same names by construction, and then a delta
+    is a subtraction between two BUNDLES with no mapping in the middle.
+    """
+    manifest = json.loads((export / "manifest.json").read_text())
+    # The geometry tables and the PAE bin edges are residue_constants, identical
+    # in every model, so the base's copies stand and the delta carries none.
+    shared = set(manifest.get("residueGeometry", {}).get("tensors", []))
+    shared.add("confidencePaeBreaks")
+    structural = set(manifest.get("float32Tensors", [])) - shared
+    out = {}
+    shards: dict[str, bytes] = {}
+    for name, record in manifest["tensors"].items():
+        if name in shared or name not in base_manifest["tensors"]:
+            continue
+        if record["dtype"] != "float32":
+            raise SystemExit(f"{export} is not a float32 export: {name} is {record['dtype']}")
+        if record["file"] not in shards:
+            shards[record["file"]] = (export / record["file"]).read_bytes()
+        count = int(np.prod(record["shape"]))
+        values = np.frombuffer(shards[record["file"]], dtype="<f4", count=count,
+                               offset=record["byteOffset"]).reshape(record["shape"])
+        out[name] = (values.astype(np.float32), name in structural)
+    return out
+
+
+def tensors_from_npz(params_path: Path, reference: dict) -> dict[str, tuple]:
+    """The same, read from a monomer checkpoint through the name map."""
+    params = load_params(params_path)
+    out = {}
+    for name, key in npz_name_of(reference).items():
+        module, _, leaf = key.rpartition("//")
+        source = params.get(module, {}).get(leaf)
+        if source is None:
+            continue
+        out[name] = (np.asarray(source, dtype=np.float32), key.startswith(KEEP_SCOPE))
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", type=Path, default=Path("model"),
                         help="the shipped bundle the delta is added to")
-    parser.add_argument("--params", type=Path, required=True, help="the target's npz")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--params", type=Path, help="the target's npz (monomer)")
+    source.add_argument("--export", type=Path,
+                        help="the target's float32 export (multimer, or any bundle whose"
+                             " tensor names the base shares)")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-family", default="monomer",
                         help="the registry family the base bundle belongs to")
@@ -192,11 +244,14 @@ def main() -> int:
                              " and about a point of reported pLDDT")
     args = parser.parse_args()
 
-    reference = reference_manifest()
-    where = npz_name_of(reference)
     held = held_by_the_device(args.base)
-    target = load_params(args.params)
     base_manifest = json.loads((args.base / "manifest.json").read_text())
+    targets = (tensors_from_npz(args.params, reference_manifest()) if args.export is None
+               else tensors_from_export(args.export, base_manifest))
+    named = args.params.name if args.export is None else str(args.export)
+    model = (args.params.stem.replace("params_", "") if args.export is None
+             else json.loads((args.export / "manifest.json").read_text())
+             ["bundle"].get("model", "unknown"))
 
     staging = args.out.with_suffix(".delta.f32")
     staging.mkdir(parents=True, exist_ok=True)
@@ -205,18 +260,25 @@ def main() -> int:
     delta_names: list[str] = []
     structural_names: list[str] = []
     missing: list[str] = []
-    for name, key in where.items():
-        module, _, leaf = key.rpartition("//")
-        source = target.get(module, {}).get(leaf)
-        if source is None:
-            # A section this checkpoint does not have - model_3, model_4 and
-            # model_5 carry no template embedder - owes no delta either.
-            missing.append(name)
-            continue
-        values = np.asarray(source, dtype=np.float32)
-        structural = key.startswith(KEEP_SCOPE)
-        if (structural and not args.delta_structure) or values.ndim < 2 \
-                or name not in held or held[name].shape != values.shape:
+    head = base_manifest.get("distogramHead")
+    whole_anyway = set() if head is None else {head["weights"], head["bias"]}
+    # 🔴 ABSENT IS "THIS CHECKPOINT DOES NOT HAVE IT", NOT "THIS DELTA DOES NOT
+    # CARRY IT", AND CONFLATING THE TWO BREAKS THE READER. The geometry tables
+    # and the PAE bin edges are residue_constants - identical in every model, so
+    # the delta carries none and the BASE's copies stand - while the template
+    # embedder really is missing from model_3, model_4 and model_5. Listing the
+    # former as absent makes DeltaTensorStore refuse a tensor it should have
+    # passed straight through, which is a fold that dies in a gather.
+    shared = set(base_manifest.get("residueGeometry", {}).get("tensors", []))
+    shared.add("confidencePaeBreaks")
+    missing.extend(sorted(set(base_manifest["tensors"]) - set(targets) - shared))
+    for name, (values, structural) in targets.items():
+        # 🔴 THE DISTOGRAM HEAD IS CARRIED WHOLE HERE FOR THE REASON THE BASE
+        # KEEPS IT AT float32: 33 KB, not worth a codec at any width, and the
+        # one head whose output the page DRAWS rather than reports.
+        if (structural and not args.delta_structure) or name in whole_anyway \
+                or values.ndim < 2 or name not in held \
+                or held[name].shape != values.shape:
             writer.add(name, values)
             kept.append(name)
             continue
@@ -244,7 +306,7 @@ def main() -> int:
     writer.close()
     manifest = {
         "formatVersion": 1,
-        "source": f"delta of {args.params.name} against {args.base}",
+        "source": f"delta of {named} against {args.base}",
         "bundle": {"purpose": "browser-inference", "encoding": "float32-le"},
         "delta": {
             # 🔴 THE FAMILY, NOT A PATH. A delta is useless without its base and
@@ -253,7 +315,7 @@ def main() -> int:
             # one machine. `--base-family` is the escape for a base that is not
             # in the registry.
             "baseFamily": args.base_family,
-            "model": args.params.stem.replace("params_", ""),
+            "model": model,
             "baseModel": base_manifest["bundle"]["model"],
             "addTo": sorted(delta_names + structural_names),
             "whole": sorted(kept),

@@ -2872,3 +2872,36 @@ preserve.
 **Published** as `af2-monomer-int5/` and `af2-multimer-int5/` beside the four
 `af2-monomer-N/` deltas, pinned at one revision. The int8 directories stay where
 they are, so a commit pinned to them keeps resolving.
+
+### And the multimer's four, which needed a different route in
+
+The monomer's packer reads `params_model_N_ptm.npz` and looks each bundle tensor
+up by its haiku path. **The multimer's cannot**: `convert_multimer_params.py`
+FUSES and SPLITS on the way in - the scalar parts of an attention become one
+tensor, the triangle multiplication's projection and gate become two - so a name
+in the bundle may have no single array behind it.
+
+`--export` is the second front end: export the target the way the base was
+exported and the names match by construction, so a delta is a subtraction
+between two BUNDLES with no mapping in the middle. It is the more general of the
+two and would serve the monomer as well.
+
+44 MiB each against the base's 74, and free where it counts - barnase-barstar
+with a paired alignment, model_5:
+
+| | pLDDT | pTM | ipTM |
+|---|---:|---:|---:|
+| its own int5 bundle | 96.938 | 0.9312 | 0.9215 |
+| **rebuilt from its delta** | 97.124 | 0.9345 | **0.9257** |
+
+All five multimer checkpoints carry the same tensors - none drops the template
+embedder the way the monomer's 3, 4 and 5 do - so a multimer delta has no absent
+section, and the page offers the number for both families.
+
+🔴 **AND "ABSENT" NEARLY SWALLOWED THE GEOMETRY TABLES.** The first version of
+the export front end called every base tensor the target did not carry absent,
+which is true of the template embedder and false of the residue-geometry tables
+and the PAE bin edges: those are residue_constants, identical in every model, so
+the delta carries none and the BASE's copies stand. Listed as absent, the reader
+would have refused a tensor it should have passed straight through - a fold that
+dies in a gather, on a bundle that looks complete.

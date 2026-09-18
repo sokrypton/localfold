@@ -80,7 +80,7 @@ describe("the AlphaFold 3 families", () => {
     for (const family of FOLDING_FAMILIES) {
       const inRow = new RegExp(`<option value="${family}"`).test(page);
       const inVariants = table.includes(`"${family}"`);
-      const number = /^monomer-(\d+)$/.exec(family);
+      const number = /^(?:monomer|multimer)-(\d+)$/.exec(family);
       const byNumber = number !== null && af2Numbers.has(number[1])
         && /`\$\{chosen\}-\$\{number\}`/.test(app);
       assert.ok(inRow || inVariants || byNumber,

@@ -137,6 +137,66 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
     load: () => import("./multimer.js"),
   },
+  // model_2_multimer_v3 as a DELTA on model_1_multimer_v3: 44 MiB rather than
+  // 74. All five multimer checkpoints carry the same tensors - none of them
+  // drops the template embedder the way the monomer's 3, 4 and 5 do - so a
+  // multimer delta has no absent section. Packed from an EXPORT rather than an
+  // npz, because convert_multimer_params fuses and splits on the way in and a
+  // bundle tensor may have no single array behind it.
+  "multimer-2": {
+    model: "model_2_multimer_v3",
+    delta: { base: "multimer" },
+    directory: "./model-multi-2-delta/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/e960ea140c77eac0bfa325d04b87ef9d1617dc4e/af2-multimer-2/",
+    release: "model2-multimer-v3-delta",
+    variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
+    load: () => import("./multimer-2.js"),
+  },
+  // model_3_multimer_v3 as a DELTA on model_1_multimer_v3: 44 MiB rather than
+  // 74. All five multimer checkpoints carry the same tensors - none of them
+  // drops the template embedder the way the monomer's 3, 4 and 5 do - so a
+  // multimer delta has no absent section. Packed from an EXPORT rather than an
+  // npz, because convert_multimer_params fuses and splits on the way in and a
+  // bundle tensor may have no single array behind it.
+  "multimer-3": {
+    model: "model_3_multimer_v3",
+    delta: { base: "multimer" },
+    directory: "./model-multi-3-delta/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/e960ea140c77eac0bfa325d04b87ef9d1617dc4e/af2-multimer-3/",
+    release: "model3-multimer-v3-delta",
+    variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
+    load: () => import("./multimer-3.js"),
+  },
+  // model_4_multimer_v3 as a DELTA on model_1_multimer_v3: 44 MiB rather than
+  // 74. All five multimer checkpoints carry the same tensors - none of them
+  // drops the template embedder the way the monomer's 3, 4 and 5 do - so a
+  // multimer delta has no absent section. Packed from an EXPORT rather than an
+  // npz, because convert_multimer_params fuses and splits on the way in and a
+  // bundle tensor may have no single array behind it.
+  "multimer-4": {
+    model: "model_4_multimer_v3",
+    delta: { base: "multimer" },
+    directory: "./model-multi-4-delta/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/e960ea140c77eac0bfa325d04b87ef9d1617dc4e/af2-multimer-4/",
+    release: "model4-multimer-v3-delta",
+    variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
+    load: () => import("./multimer-4.js"),
+  },
+  // model_5_multimer_v3 as a DELTA on model_1_multimer_v3: 44 MiB rather than
+  // 74. All five multimer checkpoints carry the same tensors - none of them
+  // drops the template embedder the way the monomer's 3, 4 and 5 do - so a
+  // multimer delta has no absent section. Packed from an EXPORT rather than an
+  // npz, because convert_multimer_params fuses and splits on the way in and a
+  // bundle tensor may have no single array behind it.
+  "multimer-5": {
+    model: "model_5_multimer_v3",
+    delta: { base: "multimer" },
+    directory: "./model-multi-5-delta/",
+    remote: "https://huggingface.co/sokrypton/localfold/resolve/e960ea140c77eac0bfa325d04b87ef9d1617dc4e/af2-multimer-5/",
+    release: "model5-multimer-v3-delta",
+    variable: "LOCALFOLD_INCLUDE_MULTIMER_MODEL",
+    load: () => import("./multimer-5.js"),
+  },
   // The whole AF3 diffuser at int5: trunk, diffusion head, confidence head.
   // 265 MiB, and af3.html folds a sequence with it.
   //

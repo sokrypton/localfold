@@ -76,6 +76,30 @@ BUNDLES = {
         "module": "src/bundles/manifests/multimer.js",
         "model": "model_1_multimer_v3",
     },
+    # model_2_multimer_v3 as a delta on model_1 - 44 MiB against 74.
+    "multimer-2": {
+        "export": "model-multi-2-delta",
+        "module": "src/bundles/manifests/multimer-2.js",
+        "model": "model_2_multimer_v3",
+    },
+    # model_3_multimer_v3 as a delta on model_1 - 44 MiB against 74.
+    "multimer-3": {
+        "export": "model-multi-3-delta",
+        "module": "src/bundles/manifests/multimer-3.js",
+        "model": "model_3_multimer_v3",
+    },
+    # model_4_multimer_v3 as a delta on model_1 - 44 MiB against 74.
+    "multimer-4": {
+        "export": "model-multi-4-delta",
+        "module": "src/bundles/manifests/multimer-4.js",
+        "model": "model_4_multimer_v3",
+    },
+    # model_5_multimer_v3 as a delta on model_1 - 44 MiB against 74.
+    "multimer-5": {
+        "export": "model-multi-5-delta",
+        "module": "src/bundles/manifests/multimer-5.js",
+        "model": "model_5_multimer_v3",
+    },
     # The whole AF3 diffuser - trunk, diffusion head and confidence head - at
     # int5, written by tools/export_af3_model.py and packed by
     # tools/quantize_af3.py. 265 MiB, and it folds.
