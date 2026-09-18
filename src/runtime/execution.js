@@ -94,6 +94,58 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   base[index] += update[index];
 }`;
 
+/**
+ * Round every element to what an f16 STORE would keep, in place - in two passes.
+ *
+ * 🔴 THIS IS AN INSTRUMENT, NOT AN OPTIMISATION. The question it answers is
+ * "what would a packed-f16 pair track cost this fold's accuracy", and the
+ * honest way to ask it is to change the VALUES without changing the layout: a
+ * packed store rounds on write and hands back the same number on read, so an
+ * f32 buffer holding only f16-representable values is numerically identical to
+ * the packed one and needs no kernel rewritten to find out. The packing itself
+ * is 28 dispatches' worth of work and is only worth doing if this says so.
+ *
+ * 🔴 AND IT IS TWO DISPATCHES BECAUSE ONE IS COMPILED AWAY. Written the obvious
+ * way - `values[i] = unpack2x16float(pack2x16float(vec2(values[i], 0.0))).x` -
+ * Tint folds the round trip back to the identity and the kernel writes the
+ * value it read. Measured, and it is silent: over 4096 values chosen to be
+ * unrepresentable in f16, **0 changed and the worst delta was exactly 0**,
+ * while the same kernel writing a constant changed 255 of 256 and the same
+ * `pack2x16float` exposed as bits returned 11878 for 0.1, which is 0x2E66, the
+ * f16 pattern. So the pack RAN and the rounding was then discarded.
+ *
+ * A fold cannot see the difference between that and "f16 costs nothing": both
+ * arms come back byte-identical, which is the shape of every gate-that-cannot-
+ * fail in this repository. Splitting the pack and the unpack into two
+ * dispatches puts a memory write between them, which the compiler cannot look
+ * through - the buffer holds the f16 BITS in between, bitcast into f32.
+ *
+ * `pack2x16float` is core WGSL - no `shader-f16`, no extension - so this runs on
+ * a stock browser and on a device with no half type at all, which is also the
+ * argument for a packed pair being portable if it ever lands.
+ */
+export const PACK_TO_HALF_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read_write> values: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  // The folded-grid guard ADD_IN_PLACE_SHADER's note explains; this one stores
+  // the same value per invocation, but the rule is the rule.
+  if (index >= arrayLength(&values)) { return; }
+  values[index] = bitcast<f32>(pack2x16float(vec2<f32>(values[index], 0.0)));
+}`;
+
+export const UNPACK_FROM_HALF_SHADER = `
+const GRID_WIDTH: u32 = 32768u;
+@group(0) @binding(0) var<storage, read_write> values: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let index = id.x + id.y * GRID_WIDTH * 64u;
+  if (index >= arrayLength(&values)) { return; }
+  values[index] = unpack2x16float(bitcast<u32>(values[index])).x;
+}`;
+
 export class WebGpuExecution {
   device;
   allocator;
@@ -553,6 +605,40 @@ export class WebGpuExecution {
       this.dispatch(encoder, pipeline,
                     [this.view(base, at, count), this.view(update, at, count)],
                     grid[0], grid[1], 1, label);
+    }
+  }
+
+  /**
+   * Round a tensor in place to f16 precision, windowing its binding.
+   *
+   * The same window arithmetic as `addInPlace` and for the same reason: the
+   * pair is what this is used on, and the pair outgrows a binding before it
+   * outgrows the card.
+   */
+  async roundToHalf(encoder, tensor, label) {
+    if ((tensor.storage ?? "f32") !== "f32") {
+      throw new RangeError(`roundToHalf takes f32 tensors; got ${tensor.storage}`);
+    }
+    const pack = await this.pipelines.get("runtime:pack-to-half", PACK_TO_HALF_SHADER);
+    const unpack = await this.pipelines.get("runtime:unpack-from-half", UNPACK_FROM_HALF_SHADER);
+    const perBinding = Math.floor(this.device.limits.maxStorageBufferBindingSize / 4);
+    const windowElements = Math.floor(perBinding / 64) * 64;
+    // 🔴 BOTH PASSES OVER THE WHOLE TENSOR, IN ORDER, NOT PASS-PAIR PER WINDOW.
+    // Either order is correct here because every invocation touches only its
+    // own element, and WebGPU orders dispatches within a pass; this shape is
+    // simply the one whose intermediate state is easy to describe - after the
+    // first pass the buffer holds f16 bits, after the second it holds floats.
+    for (const pipeline of [pack, unpack]) {
+      if (tensor.elements <= windowElements) {
+        const grid = this.linearGrid(tensor.elements);
+        this.dispatch(encoder, pipeline, [tensor], grid[0], grid[1], 1, label);
+        continue;
+      }
+      for (let at = 0; at < tensor.elements; at += windowElements) {
+        const count = Math.min(windowElements, tensor.elements - at);
+        const grid = this.linearGrid(count);
+        this.dispatch(encoder, pipeline, [this.view(tensor, at, count)], grid[0], grid[1], 1, label);
+      }
     }
   }
 

@@ -56,9 +56,23 @@ import { superpose } from "./superpose.js";
 import { DeltaTensorStore } from "../../src/bundles/delta-tensor-store.js";
 import { MODEL_BUNDLES, graphFamily } from "../../src/bundles/manifests/index.js";
 
+/**
+ * One `--name=value` argument, or a bare `--name` as the empty string.
+ *
+ * 🔴 A BARE FLAG USED TO BE INVISIBLE HERE, AND TWO CALLERS ASK FOR ONE.
+ * `--allow-broken-geometry` is documented in CLAUDE.md and in this file as the
+ * escape hatch from the chain-geometry throw, and it is tested with
+ * `option(...) === null` - which a bare flag never satisfied, so the hatch has
+ * never opened for anyone who typed it the documented way. It cost this session
+ * a measurement too: `--pair-f16` read as absent and both arms of an accuracy
+ * comparison came back byte-identical, which reads exactly like "the change is
+ * free" and means "the change never ran". A present flag with no value is "".
+ */
 const option = (args, name, fallback) => {
   const prefix = `--${name}=`;
-  return args.find((a) => a.startsWith(prefix))?.slice(prefix.length) ?? fallback;
+  const found = args.find((a) => a.startsWith(prefix));
+  if (found !== undefined) return found.slice(prefix.length);
+  return args.includes(`--${name}`) ? "" : fallback;
 };
 
 /**
@@ -178,6 +192,15 @@ export async function main(device, args) {
   // own monomer preset is 512 clusters against 1024 extra - so a single --rows
   // could express 512/512 or 1024/1024 and not the setting anybody runs.
   const extraRows = Number(option(args, "extra-rows", String(rows)));
+  // 🔴 AN ACCURACY ARM, NOT A SPEED ONE. `--pair-f16` rounds the pair track to
+  // what an f16 store would keep after every write to it, which is numerically
+  // what a PACKED pair track would hold - and packing is what moves this card's
+  // length ceiling from 2047 residues to 2896, since the pair is what 28
+  // dispatches bind. The question that decides whether to write those kernels
+  // is what it costs the fold; AF3's own packed pair scratch cost 1200x against
+  // its confidence oracles (see PAIR_SCRATCH_STORAGE), so it is not free
+  // anywhere until it is measured here. Monomer graph.
+  const halfPair = option(args, "pair-f16", null) !== null;
   const recycles = Number(option(args, "recycles", "0"));
   const seed = Number(option(args, "seed", "0"));
   // 🔴 `--tune=key=value,...`, THE SAME FLAG tools/gpu/fold.js CARRIES, because
@@ -422,6 +445,7 @@ export async function main(device, args) {
         // ...the arm for measuring what deduplication is worth; see
         // planA3mFeatures. Default on, matching AlphaFold's make_msa_features.
         deduplicateMsa: !args.includes("--no-dedupe"),
+        halfPair,
         chainLengths: chains, ...regime },
       paeBreaks, undefined, onProgress,
     );
@@ -449,6 +473,7 @@ export async function main(device, args) {
         { recycles, randomSeed: seed, maxMsaSequences: rows, maxExtraSequences: extraRows, hostFeaturisation,
           template: templateSlot,
           deduplicateMsa: !args.includes("--no-dedupe"),
+          halfPair,
           chainLengths: chains, ...regime },
         paeBreaks, undefined, undefined,
       );

@@ -87,6 +87,12 @@ export class AlphaFoldMonomerGpu {
     if (featuresByRecycle.length === 0) throw new RangeError("at least one feature set is required");
     const length = featuresByRecycle[0] .aatype.length;
     const tolerance = validatedRecycleTolerance(recycleOptions.tolerance);
+    // 🔴 AN INSTRUMENT, AND OFF UNLESS ASKED. `halfPair` rounds the pair track
+    // to what an f16 STORE would keep after every write to it, which is what a
+    // packed pair would hold without any kernel being rewritten - the question
+    // being whether the accuracy survives, since packing is what takes this
+    // card's length ceiling from 2047 residues to 2896. See roundToHalf.
+    const halfPair = recycleOptions.halfPair === true;
     const signal = recycleOptions.signal;
     throwIfAborted(signal);
     // 🔴 THE CLOCK STARTS HERE, BEFORE THE PAIR MASK AND THE TEMPLATE. Those two
@@ -255,12 +261,22 @@ export class AlphaFoldMonomerGpu {
             embeddingEncoder, embedding.pairWithoutTemplates, templateUpdate, `monomer.template-residual-${recycle}`,
           );
         }
+        // 🔴 THE EMBEDDER'S PAIR IS A PAIR STORE TOO. A packed track would hold
+        // this one in f16 as well - it is the same buffer the blocks go on to
+        // update - so an instrument that rounded only inside the stacks would
+        // be measuring a track that is f32 for its first write and f16 for the
+        // rest, which is not a configuration anyone would ship.
+        if (halfPair) {
+          await execution.roundToHalf(
+            embeddingEncoder, embedding.pairWithoutTemplates, `monomer.embedder-pair.half-${recycle}`);
+        }
         await submit(embeddingEncoder, `embedding recycle ${recycle}`);
         throwIfAborted(signal);
         for (const temporary of embedding.temporaries) releaseTensor(temporary);
         releaseTensor(previousMsa); releaseTensor(previousPair); releaseTensor(previousPositions);
 
         const extraShape = {
+          halfPair,
           sequences: features.extraSequences, length, cM: 64, cZ: 128,
           cOuter: weights.extraStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.extraStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
@@ -272,6 +288,7 @@ export class AlphaFoldMonomerGpu {
         const mainDescriptor = {
           msa: new Float32Array(0), pair: new Float32Array(0), msaMask: new Float32Array(0),
           pairMask: new Float32Array(0), sequences: features.msaSequences, length, cM: 256, cZ: 128,
+          halfPair,
           cOuter: weights.mainStack[0] .outerProductMean.leftBias.length,
           triangleHidden: weights.mainStack[0] .triangleMultiplicationOutgoing.linearAPBias.length,
         };

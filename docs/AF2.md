@@ -3041,3 +3041,74 @@ The same derivation means a number `build_site.py` trims - a delta bundle with
 no `remote` - leaves both the tool and `af2Sweep` alone, because the sweep reads
 the `<option>` list too.
 
+### An f16 PAIR TRACK costs AlphaFold 2 nothing measurable, and is worth 2047 -> 2896 residues
+
+Asked because of FlashPairformer (anthropics/uplifting-biomolecular-modeling):
+could its fused kernels fold larger complexes here? Most of what it fuses this
+port already has - flash attention with pair bias and f32 online softmax is the
+kernel a visitor's device already picks, and the diffusion-conditioning hoist is
+`diffusionBatchedGates`. What it would add is the prologue/epilogue fusion
+around the triangle multiplication, which is **31% of a block** at 825 residues
+(the attention q/k/v/gate projections 37.3 ms, their output projections 21.9,
+the triangle projections/outputs 22.8, of 263.8) and is a SPEED change.
+
+🔴 **IT IS NOT WHAT MOVES THE LENGTH CEILING, AND NOTHING FUSED CAN BE.** The
+wall is `maxStorageBufferBindingSize` against the PAIR ITSELF - `L * L * cZ * 4`
+bytes - and 28 dispatches sit on exactly that residue (29 for AF3, 42 for the
+multimer). Removing intermediates does not remove the pair. What moves it is the
+ELEMENT: at two bytes a channel the same 2 GiB binding holds `sqrt(2)` more
+length, which is **2896**, and it is where upstream's packed-f16 pair already
+sits.
+
+So the question is what f16 costs the fold, and it is answerable without writing
+the 28 kernels: round the pair to what an f16 STORE would keep after every write
+to it and leave the layout alone. `execution.roundToHalf` does that and
+`fold-af2.js --pair-f16` turns it on. Paired arms, seed 0, monomer graph:
+
+| | pLDDT | pTM | RMSD |
+|---|---|---|---|
+| 59-mer, single sequence | 62.924 -> **62.917** | 0.3156 -> 0.3157 | |
+| 59-mer, its 8076-row alignment | 96.664 -> **96.667** | 0.7618 -> 0.7618 | |
+| 5CAJ chain A, 255 res, single sequence | 33.549 -> **33.582** | 0.2889 -> 0.2888 | 20.667 -> 20.681 |
+| 5CAJ with its own crystal as a template | 87.782 -> **87.788** | 0.8721 -> 0.8720 | **1.823 -> 1.823** |
+
+Worst move 0.033 pLDDT, and the template arm - the one that goes 21.195 A to
+1.823 and so is the most sensitive fold this tool can run - is identical to
+three decimals. Against a seed band this repository measures in angstroms, an
+f16 pair track is free on AlphaFold 2.
+
+🔴 **AND THAT DOES NOT CONTRADICT AF3's 1200x, IT LOCATES IT.**
+`PAIR_SCRATCH_STORAGE` packed the triangle's `a` and `b` - INTERMEDIATES that
+are multiplied against each other, so their rounding squares - and the bisect
+there says so outright. This rounds the pair REPRESENTATION between sub-layers
+and leaves every kernel's scratch in f32. They are different tensors and the
+measurements are not in conflict: pack the representation, not the operands.
+
+🔴 **AND THE FIRST VERSION OF THE INSTRUMENT MEASURED NOTHING, SILENTLY.**
+Written the obvious way - `values[i] = unpack2x16float(pack2x16float(vec2(v,
+0.0))).x` - **Tint folds the round trip back to the identity**: over 4096 values
+unrepresentable in f16, 0 changed and the worst delta was exactly 0, while the
+same kernel writing a constant changed 255 of 256 and the same `pack2x16float`
+exposed as bits returned 11878 for 0.1 (0x2E66, the f16 pattern). So the pack
+ran and the rounding was discarded. Every arm came back BYTE-IDENTICAL, which
+reads exactly like "f16 costs nothing" - the same conclusion the real
+measurement reaches, from no evidence at all. Splitting the pack and the unpack
+into two dispatches puts a memory write between them that the compiler cannot
+look through. `tools/gpu/probe-round-to-half.js` is the gate and it THROWS on
+`changed === 0` and on any disagreement with the platform's own `Float16Array`.
+
+🔴 **AND `--pair-f16` DID NOT REACH THE FOLD ON THE FIRST TWO RUNS EITHER**,
+for an unrelated reason with the same signature: `option()` in fold-af2.js
+matched `--name=value` only, so a bare flag was invisible and the arm silently
+ran the default. `--allow-broken-geometry` is the same helper and has therefore
+never worked as the documented bare flag. Both fixed; a present flag with no
+value is now `""`.
+
+**What is NOT measured here**: the multimer's four block copies are not
+instrumented (same kernels, same widths, but its template embedder has a pair
+track of its own), and this is the VALUES rather than the layout - the packed
+implementation is 28 dispatches that must each own both halves of a word, and
+`addInPlace` already throws on a non-f32 tensor because its window arithmetic
+assumes four bytes. The accuracy question is answered; the plumbing question is
+not.
+

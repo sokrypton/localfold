@@ -1254,14 +1254,17 @@ export async function encodeEvoformerBlock(
     );
     // ...and a warm returns nothing, because it encoded nothing.
     if (!execution.warming && update !== pair) await execution.addInPlace(encoder, pair, update, "outer-product-mean.residual");
+    await roundPair(execution, encoder, input, pair, "opm.half");
   });
 
   await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationOutgoing, "outgoing", pair,
   ));
+  await roundPair(execution, encoder, input, pair, "tri-out.half");
   await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, input, input.weights.triangleMultiplicationIncoming, "incoming", pair,
   ));
+  await roundPair(execution, encoder, input, pair, "tri-in.half");
 
   const starting = input.weights.triangleAttentionStarting;
   await staged(execution, () => encodeAttention(execution, encoder, {
@@ -1270,6 +1273,7 @@ export async function encodeEvoformerBlock(
     pairBias: Object.assign(Object.create(starting.pairBias), { source: "normalized-input" }),
     label: "triangle-attention-starting", residualTarget: pair,
   }));
+  await roundPair(execution, encoder, input, pair, "tri-att-start.half");
 
   const ending = input.weights.triangleAttentionEnding;
   await staged(execution, () => encodeAttention(execution, encoder, {
@@ -1278,11 +1282,13 @@ export async function encodeEvoformerBlock(
     pairBias: Object.assign(Object.create(ending.pairBias), { source: "normalized-input" }),
     label: "triangle-attention-ending", residualTarget: pair,
   }));
+  await roundPair(execution, encoder, input, pair, "tri-att-end.half");
 
   await staged(execution, () => encodeTransition(
     execution, encoder, pair, input.length * input.length, input.cZ,
     input.weights.pairTransition, "pair-transition", pair,
   ));
+  await roundPair(execution, encoder, input, pair, "pair-transition.half");
 }
 
 /**
@@ -1317,6 +1323,22 @@ export async function staged(execution, body) {
   try { return await body(); } finally { execution.releaseScratchSince(checkpoint); }
 }
 
+/**
+ * Round the pair to f16 precision after a sub-layer wrote it, when asked.
+ *
+ * 🔴 AFTER EVERY WRITE, NOT ONCE A BLOCK. A packed pair rounds at each store,
+ * so a simulation that rounds once a block leaves five of the six updates at
+ * full f32 and under-reports the cost by whatever the block's own sequence
+ * amplifies - which is the half of this question that matters, since the
+ * triangle multiplication's two operands are read straight back out of the
+ * pair and MULTIPLIED, so their rounding squares. See PAIR_SCRATCH_STORAGE in
+ * src/af3/trunk/pair-track-gpu.js, where exactly that cost 1200x on AF3.
+ */
+async function roundPair(execution, encoder, shape, pair, label) {
+  if (shape.halfPair !== true || execution.warming) return;
+  await execution.roundToHalf(encoder, pair, label);
+}
+
 export async function encodeEvoformerPairBlock(
   execution,
   encoder,
@@ -1333,13 +1355,16 @@ export async function encodeEvoformerPairBlock(
     );
     // ...and a warm returns nothing, because it encoded nothing.
     if (!execution.warming && update !== pair) await execution.addInPlace(encoder, pair, update, "extra.outer-product-mean.residual");
+    await roundPair(execution, encoder, shape, pair, "extra.opm.half");
   });
   await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationOutgoing, "outgoing", pair,
   ));
+  await roundPair(execution, encoder, shape, pair, "extra.tri-out.half");
   await staged(execution, () => encodeTriangleMultiplication(
     execution, encoder, pair, pairMask, shape, weights.triangleMultiplicationIncoming, "incoming", pair,
   ));
+  await roundPair(execution, encoder, shape, pair, "extra.tri-in.half");
   await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionStarting.heads, transpose: false,
@@ -1348,6 +1373,7 @@ export async function encodeEvoformerPairBlock(
       { source: "normalized-input" }),
     label: "extra.triangle-attention-starting", residualTarget: pair,
   }));
+  await roundPair(execution, encoder, shape, pair, "extra.tri-att-start.half");
   await staged(execution, () => encodeAttention(execution, encoder, {
     source: pair, mask: pairMask, batch: shape.length, queries: shape.length,
     channels: shape.cZ, heads: weights.triangleAttentionEnding.heads, transpose: true,
@@ -1356,10 +1382,12 @@ export async function encodeEvoformerPairBlock(
       { source: "normalized-input" }),
     label: "extra.triangle-attention-ending", residualTarget: pair,
   }));
+  await roundPair(execution, encoder, shape, pair, "extra.tri-att-end.half");
   await staged(execution, () => encodeTransition(
     execution, encoder, pair, shape.length * shape.length, shape.cZ,
     weights.pairTransition, "extra.pair-transition", pair,
   ));
+  await roundPair(execution, encoder, shape, pair, "extra.pair-transition.half");
 }
 
 export async function encodeExtraMsaBlock(
