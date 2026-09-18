@@ -2724,6 +2724,36 @@ against 96.49. Measured with the structure module protected it is 1.931, so the
 **trunk** is what two bits costs, not the structure module. Stopping at model_3
 would have shipped it.
 
+🔴 **AND 0.11 A IS SMALL - IT IS THE SIZE OF THE MODEL'S OWN SEED SPREAD - SO
+THE QUESTION IS WHETHER IT IS SCATTER OR A SHIFT.** Four seeds through both
+arms, interleaved so a difference between them cannot be a difference between
+runs:
+
+| seed | its own bundle | via a 2-bit delta | | pLDDT | |
+|---|---:|---:|---|---:|---:|
+| 0 | 1.831 | 1.944 | | 96.485 | 94.880 |
+| 1 | 1.822 | 1.925 | | 96.436 | 94.657 |
+| 2 | 1.972 | 2.038 | | 96.558 | 95.249 |
+| 3 | 1.809 | 1.903 | | 96.315 | 94.767 |
+
+The seed band is real and it is 1.809 to 1.972 - a range of 0.163, bigger than
+the 0.094 mean difference. But the difference is **+0.094 +/- 0.020 with 4 of 4
+seeds moving the same way**: scatter of 0.076 in one arm and 0.020 between the
+paired arms is a systematic shift sitting inside a wide band, not a sample of
+it. And pLDDT settles it outright - **-1.56 against a seed band of 0.243, which
+is 15x** - because the confidence head reads the structure module and the trunk
+that feed it.
+
+🔴 **THE REASON THAT PARTICULAR BIAS IS DISQUALIFYING IS THE FEATURE ITSELF: THE
+FIVE MODELS EXIST TO BE COMPARED.** Each delta carries its OWN bias, and at two
+bits they are model_2 -0.22, model_3 -0.47, model_4 -0.13, model_5 **-1.61** -
+so on this target model_5, the most confident of the four at 96.485, reports the
+LEAST at 94.88 and ranks last. Ranking five models by a number that is depressed
+per model is the one thing offering five of them must not do. At three bits the
+biases are -0.06, -0.05, +0.02 and -0.16, inside the 0.243 seed band, and the
+only ordering that changes is between two models 0.067 apart - which the band
+says was never an ordering.
+
 🔴 **AND DELTA'ING THE STRUCTURE MODULE MOVES THE NUMBER THE PAGE SHOWS WITHOUT
 MOVING THE STRUCTURE**, which is the worst shape a saving can have. At three
 bits model_5 folds to **1.829 A against 1.831** with it delta'd - exact - and
