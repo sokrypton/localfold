@@ -1143,3 +1143,43 @@ cache is a heuristic with an eviction policy nobody here controls. And
 `--keep-profile` must never become the default for a checker: the whole reason
 the wipe exists is that a stale module is indistinguishable from a broken
 feature, and this file is the wrong place to learn that again.
+
+
+## 🔴 THE DOWNLOAD DIAL FLICKERED FOR A DELTA MODEL, AND ONLY FOR THE FIRST ONE
+
+Reported from the page: "progress wheel is flickering if I go directly to model
+2 (and haven't tried running model 1 yet)". Both halves of that sentence are the
+diagnosis.
+
+A delta family downloads TWO bundles - 43 MiB of difference and the 73 MiB base
+it is added to - and `openStore` handed each store the caller's `onProgress`.
+They then take turns owning one arc: "4 of 43 MiB", "20 of 73", back to "6 of
+43". The parenthesis is the other half: it only happens when the base is NOT
+already cached, because a visitor who has folded with model_1 gets that store
+back from the `stores` map without a byte moving.
+
+Measured with `tools/download-dial.py`, which samples every change to
+`#model-load` and fails on either a loaded count that DECREASES or more than one
+TOTAL:
+
+| | totals offered | backwards steps |
+|---|---|---:|
+| both stores on one callback | 43 and 73 MiB | **273** |
+| reported as one stream | 116 MiB | 0 |
+
+It ends at "43 / 43 MiB" in the broken arm, because the smaller download
+finishes last and overwrites what the bigger one had reported.
+
+🔴 **AND THE FIRST FIX LEFT HALF OF IT**, which is why the second column of that
+table is not the whole check. Summing the two streams stops the numerator
+falling, and the arc still snapped back ONCE: the delta's store reports
+"0 / 43 MiB" the moment it opens, before the base has a manifest, and the next
+update says "0 / 116" - the same bytes, a third of the arc. A manifest is
+compiled in rather than fetched, so the base's total is seeded before the first
+report. Only when it is actually going to be fetched: web/esmfold2-model.js's
+rule for its language model, from the other direction.
+
+web/esmfold2-model.js has had the one-stream rule since its own 347 MiB
+download, and this is the second place to need it. They are not shared yet -
+that one must also STOP reporting when the load ends, its tower going on
+streaming through the fold, which nothing here does.

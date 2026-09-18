@@ -17,6 +17,7 @@
  */
 import { AlphaFoldFixture } from "../src/bundles/alphafold-fixture.js";
 import { HttpTensorStore } from "../src/bundles/http-tensor-store.js";
+import { tensorByteLength } from "../src/weights/dtype.js";
 import { ScriptTensorStore } from "../src/bundles/script-tensor-store.js";
 import { MODEL_BUNDLES, bundleBaseUrl, loadManifest } from "../src/bundles/manifests/index.js";
 import { DeltaTensorStore } from "../src/bundles/delta-tensor-store.js";
@@ -82,7 +83,52 @@ export function openStore(onProgress, family = "monomer") {
       // with ScriptTensorStore; pointing that at a remote would make the one
       // build that must not need the network the only one that always does.
       const base = offline ? bundle.directory : bundleBaseUrl(family);
-      const opened = await Store.fromManifest(base, manifest, onProgress);
+      // 🔴 ONE PROGRESS STREAM OVER BOTH STORES, OR THE DIAL FLICKERS. A delta
+      // family downloads TWO bundles - 43 MiB of difference and the 73 MiB base
+      // it is added to - and handing each the caller's callback lets them take
+      // turns owning the dial: it reads "4 of 43 MiB", then "20 of 73", then
+      // back, for as long as they overlap. Reported as ONE total it is a single
+      // bar over 116 MiB. It only shows when the base is NOT already cached,
+      // which is exactly the visitor who picks model 2 first, and it is the
+      // same failure web/esmfold2-model.js records for its fold bundle and its
+      // language model - the two are not shared yet because that one also has
+      // to stop reporting when the load ends, its tower going on streaming
+      // through the fold, which nothing here does.
+      const seen = new Map();
+      // 🔴 AND THE BASE'S SIZE IS SEEDED BEFORE THE FIRST REPORT, or the arc
+      // snaps back ONCE - not because the loaded count falls but because the
+      // DENOMINATOR grows. The delta's store reports "0 / 43 MiB" the moment it
+      // opens, before the base has a manifest, and the next update says
+      // "0 / 116": same bytes, a third of the arc. A manifest is compiled in
+      // rather than fetched, so the base's total is knowable up front without a
+      // byte moving.
+      // 🔴 AND ONLY WHEN THE BASE IS ACTUALLY GOING TO BE FETCHED. `stores`
+      // caches by family, so a visitor who has already folded with model_1 gets
+      // that store back with no download - and seeding its size would promise
+      // 116 MiB and stop at 43. This is web/esmfold2-model.js's rule for its
+      // language model, from the other direction: a store that never downloads
+      // has to be absent from the sum.
+      if (bundle.delta !== undefined && onProgress !== undefined
+        && !stores.has(bundle.delta.base)) {
+        const baseManifest = await loadManifest(bundle.delta.base);
+        seen.set("base", { loadedBytes: 0, totalBytes: Object.values(baseManifest.tensors)
+          .reduce((sum, record) => sum + tensorByteLength(record), 0) });
+      }
+      const report = (key) => (progress) => {
+        seen.set(key, progress);
+        let loadedBytes = 0;
+        let totalBytes = 0;
+        for (const value of seen.values()) {
+          loadedBytes += value?.loadedBytes ?? 0;
+          totalBytes += value?.totalBytes ?? 0;
+        }
+        onProgress?.({ ...progress, loadedBytes, totalBytes });
+      };
+      // ...and a bundle that is not a delta keeps the caller's callback
+      // untouched, so the one-bundle path is the function it always was.
+      const mine = bundle.delta === undefined || onProgress === undefined
+        ? onProgress : report("self");
+      const opened = await Store.fromManifest(base, manifest, mine);
       // ...every shard at once; see HttpTensorStore.prefetch. AF2's loaders read
       // the whole bundle too.
       opened.prefetch?.();
@@ -94,7 +140,14 @@ export function openStore(onProgress, family = "monomer") {
       // base is opened through this same function, which means its store is
       // SHARED with a plain model_1 fold rather than downloaded twice.
       if (bundle.delta === undefined) return opened;
-      return new DeltaTensorStore(await openStore(onProgress, bundle.delta.base), opened);
+      // 🔴 AND THE BASE'S SHARE IS ONLY IN THE SUM WHEN IT IS ACTUALLY BEING
+      // FETCHED. `openStore` caches by family, so a visitor who has already
+      // folded with model_1 gets that store back without a byte moving and the
+      // reporter never fires for it - which is what the sum has to mean, or the
+      // dial would promise 116 MiB and stop at 43.
+      return new DeltaTensorStore(
+        await openStore(mine === undefined ? undefined : report("base"), bundle.delta.base),
+        opened);
     })();
     stores.set(family, store);
   }

@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-327 tools. `tools/fixtures/` is data and is not listed.
+328 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (188)
 
@@ -279,7 +279,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (79)
+## `tools/` - everything else (80)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -324,6 +324,7 @@ go through CDP, and the deploy.
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.
 - **`diff-fold-coords.py`** - Fold twice under two configurations and compare the COORDINATES.
+- **`download-dial.py`** - Does the weight-download dial only ever go FORWARDS?
 - **`entity-popup.py`** - Measure the entity popup as the template source is changed.
 - **`export-js-weights.py`** - Re-encode the exported model shards as classic scripts, for file:// pages.
 - **`export-web-model.js`** - Turn a fixture manifest and its loose `.f32.bin` files into the single-file layout a browser fetches.
