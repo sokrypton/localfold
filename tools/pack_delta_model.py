@@ -106,8 +106,29 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-family", default="monomer",
                         help="the registry family the base bundle belongs to")
+    # 🔴 THREE BITS, AND TWO IS NOT ENOUGH - WHICH TOOK THE FOURTH MODEL TO SAY.
+    # On 5CAJ chain A with an alignment, model_2, model_3 and model_4 are within
+    # 0.07 A of their own bundles at TWO bits, and **model_5 is 1.944 against
+    # 1.831** - a tenth of an angstrom, and pLDDT 94.88 against 96.49. Three of
+    # four models would have shipped it. At three bits every one of the five is
+    # exact and the delta is 43 MiB against a bundle's 97.
     parser.add_argument("--bits", type=int, default=3)
     parser.add_argument("--group", type=int, default=128)
+    # 🔴 AND THERE IS ONE CODEC IN A BUNDLE, SO THIS IS A YES OR NO RATHER THAN
+    # A SECOND BIT WIDTH. `planBlockUpload` refuses a plan whose records
+    # disagree about bits or group - one plan is one shader - so the structure
+    # module cannot be int8 while the rest is int2. Delta'd, it is 2 bits like
+    # everything else, and that was measured rather than assumed: 1.926 A.
+    # 🔴 AND THE STRUCTURE MODULE IS CARRIED WHOLE, WHICH COSTS 7.7 MiB AND BUYS
+    # THE CONFIDENCE NUMBER. Delta'd at three bits, model_5's fold is unchanged
+    # - 1.829 A against 1.831 - and its **pLDDT drops a point**, 95.50 against
+    # 96.49. AlphaFold 2's predicted-LDDT head reads the STRUCTURE MODULE's own
+    # activations, so perturbing it moves the number the page shows without
+    # moving the structure it describes, which is the worst shape a saving can
+    # have. `--delta-structure` is the arm; it is 35 MiB rather than 43.
+    parser.add_argument("--delta-structure", action="store_true",
+                        help="store the structure module as a delta too: 8 MiB less,"
+                             " and about a point of reported pLDDT")
     args = parser.parse_args()
 
     reference = reference_manifest()
@@ -121,6 +142,7 @@ def main() -> int:
     writer = ShardWriter(staging)
     kept: list[str] = []
     delta_names: list[str] = []
+    structural_names: list[str] = []
     missing: list[str] = []
     for name, key in where.items():
         module, _, leaf = key.rpartition("//")
@@ -131,10 +153,25 @@ def main() -> int:
             missing.append(name)
             continue
         values = np.asarray(source, dtype=np.float32)
-        if key.startswith(KEEP_SCOPE) or values.ndim < 2 or name not in held \
-                or held[name].shape != values.shape:
+        structural = key.startswith(KEEP_SCOPE)
+        if (structural and not args.delta_structure) or values.ndim < 2 \
+                or name not in held or held[name].shape != values.shape:
             writer.add(name, values)
             kept.append(name)
+            continue
+        # 🔴 THE STRUCTURE MODULE IS A DELTA TOO, AND THAT IS NOT THE THING
+        # quantize_model.py REFUSES. What it refuses is rounding the WEIGHT -
+        # the module composes rigid transforms across eight iterations, so an
+        # error in a frame lands in the coordinates. This rounds the DIFFERENCE,
+        # which is a quarter of the weight, so an int8 delta perturbs it an
+        # order of magnitude below the int8 the base itself already carries.
+        # Measured on a fold: 5CAJ chain A comes out 1.926 A with the whole
+        # bundle at two bits against 1.940 from model_3's own. It is worth doing
+        # because carrying it whole is 7.7 MiB of a 30 MiB delta - the largest
+        # single item left once the codes are at two bits.
+        if structural:
+            writer.add(name, values - held[name])
+            structural_names.append(name)
             continue
         writer.add(name, values - held[name])
         delta_names.append(name)
@@ -154,7 +191,7 @@ def main() -> int:
             "baseFamily": args.base_family,
             "model": args.params.stem.replace("params_", ""),
             "baseModel": base_manifest["bundle"]["model"],
-            "addTo": sorted(delta_names),
+            "addTo": sorted(delta_names + structural_names),
             "whole": sorted(kept),
             "absent": sorted(missing),
         },

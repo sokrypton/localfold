@@ -2689,3 +2689,59 @@ name the model that folded. Models 3, 4 and 5 refuse a template by name rather
 than dropping it, and `build_site.py` removes a number whose bundle has no
 `remote` - the same rule it already applies to a model `<option>`, one control
 further in.
+
+### How much smaller can a delta get? 43 MiB is the free point
+
+Asked directly - "can we compress more, could model_3 be a combination of 1 and
+2?" - and swept. Every arm folded 5CAJ chain A with a 7907-row alignment and
+three recycles, against the model's own bundle.
+
+**The combination does not pay.** Least squares over all 90.9M shared weights:
+
+| | delta on model_1 | best mix of 1 and 2 | best mix of every earlier model |
+|---|---:|---:|---:|
+| model_3 | 0.2253 | 0.2189 | — |
+| model_4 | 0.2123 | 0.2066 | 0.1517 |
+| model_5 | 0.2570 | 0.2496 | 0.1822 |
+
+Mixing models 1 and 2 buys **3%**, because the five are two clusters and the
+mix of two points inside one cluster is still in that cluster - the best
+coefficients are the midpoint (+0.489, +0.511). Using every earlier model buys
+29%, which is half a bit, and costs a chain: model_5 would need 1, 2, 3 and 4
+resident before it could be read.
+
+**Two bits is where the fold notices, and it took the fourth model to say so.**
+
+| model_N via a 2-bit delta | RMSD | its own bundle |
+|---|---:|---:|
+| model_2 | 1.895 | 1.891 |
+| model_3 | 1.950 | 1.940 |
+| model_4 | 2.049 | 1.983 |
+| **model_5** | **1.944** | **1.831** |
+
+Three of the four are within 0.07 A and model_5 is out by 0.11 with pLDDT 94.88
+against 96.49. Measured with the structure module protected it is 1.931, so the
+**trunk** is what two bits costs, not the structure module. Stopping at model_3
+would have shipped it.
+
+🔴 **AND DELTA'ING THE STRUCTURE MODULE MOVES THE NUMBER THE PAGE SHOWS WITHOUT
+MOVING THE STRUCTURE**, which is the worst shape a saving can have. At three
+bits model_5 folds to **1.829 A against 1.831** with it delta'd - exact - and
+its **pLDDT drops to 95.50 from 96.49**. AlphaFold 2's predicted-LDDT head reads
+the structure module's own activations, so a perturbation there is reported
+confidence rather than geometry. Carrying it whole is 7.7 MiB of the 43 and buys
+the point back; `--delta-structure` is the arm for anyone who wants 35 MiB and
+knows what it costs.
+
+So, per model:
+
+| | size | RMSD | pLDDT |
+|---|---:|---|---|
+| the bundle itself | 97 MiB | — | — |
+| **3-bit delta, structure whole** | **43 MiB** | exact | within 0.16 |
+| 3-bit delta, structure delta'd | 35 MiB | exact | about a point |
+| 2-bit delta, structure whole | 31 MiB | +0.10 A | about a point |
+| 2-bit delta, structure delta'd | 24 MiB | +0.11 A | about 1.6 |
+
+Four models are 172 MiB at the free setting against 388 as whole bundles. Below
+that the axis stops being bytes and starts being the answer.
