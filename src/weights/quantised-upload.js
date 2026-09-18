@@ -238,6 +238,16 @@ ${accumulate ? `  // 🔴 READ, ADD, WRITE - AND ONE LANE STILL OWNS ONE WHOLE W
  *   an unexpected group size, or an odd destination offset.
  */
 export function planBlockUpload(entries, destination = "f16", options = {}) {
+  // 🔴 THE OPTIONS ARE THIRD AND AN OBJECT HERE IS A MISTAKE WITH NO SYMPTOM.
+  // `planBlockUpload(entries, { accumulate: true })` - which is how the branch
+  // this came from spelled it - would set the DESTINATION to an object, take
+  // the f16 path by falling through every `=== "f32"` test, and leave
+  // `accumulate` false: a delta that silently OVERWRITES the weights it was
+  // meant to add to. A plausible buffer, a wrong model, and nothing to see.
+  if (typeof destination !== "string") {
+    throw new TypeError("planBlockUpload takes the destination second and the options"
+      + " third; a delta wants planBlockUpload(entries, \"f16\", { accumulate: true })");
+  }
   const accumulate = options.accumulate === true;
   const codeChunks = [];
   const scaleChunks = [];
