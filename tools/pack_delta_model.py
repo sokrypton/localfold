@@ -176,14 +176,17 @@ def main() -> int:
     # activations, so perturbing it moves the number the page shows without
     # moving the structure it describes, which is the worst shape a saving can
     # have. `--delta-structure` is the arm; it is 35 MiB rather than 43.
-    # 🔴 TWO SHARDS, NOT THE BASE'S EIGHT, AND THE TRADE IS TINY EITHER WAY.
-    # docs/HOSTING.md measures Hugging Face over HTTP/2 at 56 MB/s on one shard
-    # and 78 aggregate on twelve in parallel, so fewer shards is slower - by
-    # 0.43 s against 0.31 s on a 24 MiB delta. A tenth of a second buys eight
-    # files in the repository per model instead of thirty-two, and a manifest
-    # that is easier to read. The base keeps its eight: it is four times the
-    # bytes and it is the download a first visit waits on.
-    parser.add_argument("--shards", type=int, default=2)
+    # 🔴 EIGHT, WHICH IS WHERE THE LINK STOPS PAYING - MEASURED, NOT INHERITED.
+    # A delta is a SWITCH, so its download is what a reader waits on between two
+    # models, and a shard is one HTTP stream. Timed against the twelve-shard
+    # bundle already on Hugging Face, three interleaved passes, median MB/s by
+    # concurrency: 1 -> 27.6, 2 -> 38.2, 4 -> 50.1, 6 -> 86.7, 8 -> 91.4,
+    # 12 -> 77.5 with a spread of 62. It climbs steeply to six and is flat after,
+    # so a 43 MiB delta is 1.2 s in two shards and 0.5 s in eight. The first
+    # version of this comment priced two shards at a tenth of a second from
+    # docs/HOSTING.md's 56 and 78 MB/s; this link gives 27.6 on one stream, so
+    # the parallelism is worth more here than that note implies.
+    parser.add_argument("--shards", type=int, default=8)
     parser.add_argument("--delta-structure", action="store_true",
                         help="store the structure module as a delta too: 8 MiB less,"
                              " and about a point of reported pLDDT")
