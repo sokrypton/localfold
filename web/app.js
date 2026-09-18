@@ -386,7 +386,7 @@ const chosenFamily = () => {
   // people run all five and compare - so the row shows one AF2-mono and a
   // number beside it, and the number picks the bundle. Resolving it here is
   // what keeps the weight cache, the download stem and the labels all naming
-  // the model that actually folded; models 2 to 5 are a 43 MiB delta on
+  // the model that actually folded; models 2 to 5 are a 24 MiB delta on
   // model_1's 97 (see tools/pack_delta_model.py).
   if (chosen === "monomer") {
     const number = document.getElementById("af2Model")?.value ?? "1";

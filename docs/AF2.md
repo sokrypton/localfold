@@ -2690,7 +2690,7 @@ than dropping it, and `build_site.py` removes a number whose bundle has no
 `remote` - the same rule it already applies to a model `<option>`, one control
 further in.
 
-### How much smaller can a delta get? 43 MiB is the free point
+### How much smaller can a delta get? 43 MiB is free, and 24 is what ships
 
 Asked directly - "can we compress more, could model_3 be a combination of 1 and
 2?" - and swept. Every arm folded 5CAJ chain A with a 7907-row alignment and
@@ -2773,5 +2773,14 @@ So, per model:
 | 2-bit delta, structure whole | 31 MiB | +0.10 A | about a point |
 | 2-bit delta, structure delta'd | 24 MiB | +0.11 A | about 1.6 |
 
-Four models are 172 MiB at the free setting against 388 as whole bundles. Below
-that the axis stops being bytes and starts being the answer.
+Four models are 172 MiB at the free setting against 388 as whole bundles.
+
+🔴 **AND WHAT SHIPS IS THE 24 MiB ONE, WHICH IS A DECISION AND NOT A
+MEASUREMENT.** The download is what decides whether a page can offer five models
+at all - 96 MiB for the four against 172 - and that was judged worth the cost
+above. The cost is written down rather than rounded off: a tenth of an angstrom
+on the worst of the four, and a **reported pLDDT that reads low by a different
+amount per model** (-0.22, -0.47, -0.13, -1.61), which is enough to reorder
+them. Anyone comparing the five should read the number knowing that, and
+`--bits 3` rebuilds any bundle at the setting where every bias is inside the
+seed band. The packer's own header carries the table.

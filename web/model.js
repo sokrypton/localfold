@@ -88,7 +88,7 @@ export function openStore(onProgress, family = "monomer") {
       opened.prefetch?.();
       // 🔴 A DELTA FAMILY IS HALF A MODEL AND OPENS THE OTHER HALF ITSELF.
       // AlphaFold 2's five models are one training run continued five ways, so
-      // models 2 to 5 ship as 43 MiB of DIFFERENCE against model_1's 97 rather
+      // models 2 to 5 ship as 24 MiB of DIFFERENCE against model_1's 97 rather
       // than as five whole bundles - and a visitor who has already folded with
       // model_1 has the base in cache, so switching costs the delta alone. The
       // base is opened through this same function, which means its store is

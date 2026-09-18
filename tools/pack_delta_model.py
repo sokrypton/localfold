@@ -10,11 +10,26 @@ run continued five ways, and the difference between two of them stores far
 smaller than a model does: **39 MiB at three bits**, against 97 for the whole
 thing.
 
-🔴 AND IT IS FREE, MEASURED ON A FOLD RATHER THAN ON A NORM. 5CAJ chain A with
-an 7907-row alignment, three recycles, model_3_ptm:
+🔴 WHAT IT COSTS IS MEASURED ON FOLDS AND IT IS NOT FREE AT TWO BITS, WHICH WAS
+CHOSEN KNOWINGLY. 5CAJ chain A, a 7907-row alignment, three recycles, each model
+against its OWN bundle (RMSD / pLDDT):
 
-    from its own bundle          pLDDT 96.294  pTM 0.9240  RMSD 1.94 A  TM 0.9665
-    rebuilt from a 3-bit delta   pLDDT 96.230  pTM 0.9245  RMSD 1.95 A  TM 0.9664
+    model    its own bundle    via a 2-bit delta    via a 3-bit delta
+    model_2  1.891 / 96.182    1.895 / 95.964       1.897 / 96.133
+    model_3  1.940 / 96.294    1.950 / 95.819       1.950 / 96.230
+    model_4  1.983 / 96.418    2.049 / 96.287       1.981 / 96.437
+    model_5  1.831 / 96.485    1.944 / 94.880       1.825 / 96.327
+
+Two bits is 24 MiB and three is 43, and the difference between them is a
+systematic shift rather than scatter: four seeds through both arms give
+**+0.094 +/- 0.020 A with 4 of 4 moving the same way** against a seed band of
+0.163, and the confidence number moves **15x its own noise**.
+
+🔴 SO THE REPORTED pLDDT READS LOW BY A DIFFERENT AMOUNT PER MODEL, AND THAT IS
+THE THING TO KNOW WHEN RANKING THE FIVE: model_2 -0.22, model_3 -0.47, model_4
+-0.13, model_5 **-1.61**. On this target that is enough to move model_5 from the
+most confident of the four to the least. `--bits 3` is the setting where every
+bias is inside the seed band (-0.06, -0.05, +0.02, -0.16), at 43 MiB.
 
 🔴 THE STRUCTURE MODULE IS NOT DELTA'D, AND SKIPPING THAT RULE COSTS 4.9 pLDDT.
 tools/quantize_model.py keeps the structure module, the residue-geometry tables
@@ -106,14 +121,14 @@ def main() -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--base-family", default="monomer",
                         help="the registry family the base bundle belongs to")
-    # 🔴 THREE BITS, AND TWO IS NOT ENOUGH - WHICH TOOK THE FOURTH MODEL TO SAY.
-    # On 5CAJ chain A with an alignment, model_2, model_3 and model_4 are within
-    # 0.07 A of their own bundles at TWO bits, and **model_5 is 1.944 against
-    # 1.831** - a tenth of an angstrom, and pLDDT 94.88 against 96.49. Three of
-    # four models would have shipped it. At three bits every one of the five is
-    # exact and the delta is 43 MiB against a bundle's 97.
-    parser.add_argument("--bits", type=int, default=3)
-    parser.add_argument("--group", type=int, default=128)
+    # 🔴 TWO BITS, WHICH IS 24 MiB A MODEL AND IS NOT FREE - THE HEADER HAS THE
+    # TABLE. The download is what decides whether a page can offer five models
+    # at all, so it was taken deliberately: what it costs is a tenth of an
+    # angstrom on the worst of the four and a pLDDT that reads low by up to 1.6,
+    # unevenly across the models. `--bits 3` is 43 MiB with every bias inside
+    # the seed band.
+    parser.add_argument("--bits", type=int, default=2)
+    parser.add_argument("--group", type=int, default=256)
     # 🔴 AND THERE IS ONE CODEC IN A BUNDLE, SO THIS IS A YES OR NO RATHER THAN
     # A SECOND BIT WIDTH. `planBlockUpload` refuses a plan whose records
     # disagree about bits or group - one plan is one shader - so the structure
@@ -126,9 +141,9 @@ def main() -> int:
     # activations, so perturbing it moves the number the page shows without
     # moving the structure it describes, which is the worst shape a saving can
     # have. `--delta-structure` is the arm; it is 35 MiB rather than 43.
-    parser.add_argument("--delta-structure", action="store_true",
-                        help="store the structure module as a delta too: 8 MiB less,"
-                             " and about a point of reported pLDDT")
+    parser.add_argument("--whole-structure", action="store_true",
+                        help="carry the structure module whole: 7 MiB more,"
+                             " and about half the pLDDT bias")
     args = parser.parse_args()
 
     reference = reference_manifest()
@@ -154,7 +169,7 @@ def main() -> int:
             continue
         values = np.asarray(source, dtype=np.float32)
         structural = key.startswith(KEEP_SCOPE)
-        if (structural and not args.delta_structure) or values.ndim < 2 \
+        if (structural and args.whole_structure) or values.ndim < 2 \
                 or name not in held or held[name].shape != values.shape:
             writer.add(name, values)
             kept.append(name)
@@ -165,10 +180,13 @@ def main() -> int:
         # error in a frame lands in the coordinates. This rounds the DIFFERENCE,
         # which is a quarter of the weight, so an int8 delta perturbs it an
         # order of magnitude below the int8 the base itself already carries.
-        # Measured on a fold: 5CAJ chain A comes out 1.926 A with the whole
-        # bundle at two bits against 1.940 from model_3's own. It is worth doing
-        # because carrying it whole is 7.7 MiB of a 30 MiB delta - the largest
-        # single item left once the codes are at two bits.
+        # 🔴 AND WHAT IT COSTS IS THE CONFIDENCE NUMBER RATHER THAN THE
+        # STRUCTURE, which is the worst shape a saving can have: AF2's
+        # predicted-LDDT head reads the structure module's own activations, so
+        # model_5 delta'd here folds to 1.829 A against its bundle's 1.831 -
+        # exact - and reports 95.50 against 96.49. It is 7.7 MiB of the 24, and
+        # `--whole-structure` keeps it for anyone who would rather have the
+        # number than the bytes.
         if structural:
             writer.add(name, values - held[name])
             structural_names.append(name)

@@ -43,8 +43,12 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer.js"),
   },
-  // model_2_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
-  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // model_2_ptm as a DELTA on model_1_ptm: 24 MiB rather than 97. 🔴 NOT
+  // free - two bits costs up to a tenth of an angstrom and a pLDDT that reads
+  // low by up to 1.6, unevenly across the models, which is worth knowing when
+  // ranking them. Taken deliberately; tools/pack_delta_model.py has the table
+  // and `--bits 3` is the 43 MiB setting where every bias is inside the seed
+  // band.
   // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
   // what `delta` means to a reader. Not a menu entry: the page offers ONE
   // AF2-mono and a model NUMBER beside it.
@@ -57,8 +61,12 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-2.js"),
   },
-  // model_3_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
-  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // model_3_ptm as a DELTA on model_1_ptm: 24 MiB rather than 97. 🔴 NOT
+  // free - two bits costs up to a tenth of an angstrom and a pLDDT that reads
+  // low by up to 1.6, unevenly across the models, which is worth knowing when
+  // ranking them. Taken deliberately; tools/pack_delta_model.py has the table
+  // and `--bits 3` is the 43 MiB setting where every bias is inside the seed
+  // band.
   // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
   // what `delta` means to a reader. Not a menu entry: the page offers ONE
   // AF2-mono and a model NUMBER beside it.
@@ -77,8 +85,12 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-3.js"),
   },
-  // model_4_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
-  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // model_4_ptm as a DELTA on model_1_ptm: 24 MiB rather than 97. 🔴 NOT
+  // free - two bits costs up to a tenth of an angstrom and a pLDDT that reads
+  // low by up to 1.6, unevenly across the models, which is worth knowing when
+  // ranking them. Taken deliberately; tools/pack_delta_model.py has the table
+  // and `--bits 3` is the 43 MiB setting where every bias is inside the seed
+  // band.
   // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
   // what `delta` means to a reader. Not a menu entry: the page offers ONE
   // AF2-mono and a model NUMBER beside it.
@@ -97,8 +109,12 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_MODEL",
     load: () => import("./monomer-4.js"),
   },
-  // model_5_ptm as a DELTA on model_1_ptm: 43 MiB rather than 97, and the
-  // same fold - 5CAJ chain A comes out within 0.01 A of the model's own bundle.
+  // model_5_ptm as a DELTA on model_1_ptm: 24 MiB rather than 97. 🔴 NOT
+  // free - two bits costs up to a tenth of an angstrom and a pLDDT that reads
+  // low by up to 1.6, unevenly across the models, which is worth knowing when
+  // ranking them. Taken deliberately; tools/pack_delta_model.py has the table
+  // and `--bits 3` is the 43 MiB setting where every bias is inside the seed
+  // band.
   // See tools/pack_delta_model.py, and src/bundles/delta-tensor-store.js for
   // what `delta` means to a reader. Not a menu entry: the page offers ONE
   // AF2-mono and a model NUMBER beside it.
