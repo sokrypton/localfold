@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-325 tools. `tools/fixtures/` is data and is not listed.
+326 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (187)
 
@@ -278,7 +278,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (78)
+## `tools/` - everything else (79)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -345,6 +345,7 @@ go through CDP, and the deploy.
 - **`mobile-layout.py`** - index.html at real phone widths: it must FIT, not merely not overflow.
 - **`model-terms.py`** - The model gate: the AlphaFold 3 terms dialog, and `?model=` in the URL.
 - **`negate-bundle-tensors.py`** - Negate NAMED tensors in a float32 bundle, in place.
+- **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?
 - **`pae-transfer.py`** - Does EF2-fast's distogram carry the same aligned-error information?
 - **`protein-hunter-in-page.py`** - Drive a REAL design run in proteinhunter.html, and check what it produced.
